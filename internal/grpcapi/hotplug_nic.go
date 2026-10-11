@@ -557,7 +557,8 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	if !strings.HasPrefix(bridge, "direct:") {
 		if rec := dec.record(vm.Name, specUUID(vm.Spec), ordinal, mac, spec); rec != nil {
 			if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); err != nil {
-				return s.failNICAttach(ctx, rb, codes.Internal, err)
+				code, cause := gateFailure(err)
+				return s.failNICAttach(ctx, rb, code, cause)
 			}
 		}
 	}

@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -87,15 +88,6 @@ func (s *Server) firewallReleaseActive() bool {
 	return s.ReleaseFeatureAvailable(capabilities.FeatureNICGuards)
 }
 
-// nicGuardsRefusal is the release gate's refusal for an explicit guard
-// setting made before the release token has latched.
-func nicGuardsRefusal(what string) error {
-	info, _ := capabilities.LookupFeature(capabilities.FeatureNICGuards)
-	return status.Errorf(codes.FailedPrecondition,
-		"the cluster upgrade must finish first (%s needs %s): %s; leave the guard settings out to create the NIC "+
-			"unguarded, as before guards", capabilities.FeatureNICGuards, info.Token, what)
-}
-
 // writeNICGuardsGranted writes recs through the release feature nic_guards,
 // its use recorded first.
 func (s *Server) writeNICGuardsGranted(ctx context.Context, recs []corrosion.NICGuardRecord) error {
@@ -123,9 +115,9 @@ const (
 	// else is a new request and needs authority to weaken (re-review I-7).
 	admitRecreate
 	// admitPeerOwner: the owner leg of a request a peer forwarded. The entry
-	// node checked authority — if it is a build that knows guards, which is
-	// what firewallReleaseActive proves; before that, explicit settings are
-	// refused rather than trusted.
+	// node checked authority — if it is a build that knows guards, which the
+	// release check every explicit setting passes proves; before that,
+	// explicit settings are refused rather than trusted.
 	admitPeerOwner
 )
 
@@ -166,6 +158,7 @@ func (d guardDecision) record(vm, uuid string, ordinal int, mac string, att *pb.
 		r := *d.carry
 		r.VMName, r.MAC, r.VMUUID, r.Network, r.Ordinal = vm, mac, uuid, att.GetName(), ordinal
 		r.SetBy, r.UpdatedAt, r.Deleted = "", "", false
+		r.Carried = true
 		if k := staticIPv6Known(att); k != nil {
 			r.Known = k
 		}
@@ -325,18 +318,20 @@ func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.N
 				"network %q: NIC guard settings cannot be recorded until failover_scope_v1 has latched on every host; "+
 					"leave them out to create the NIC (it will be unguarded until set with `lv firewall nic-guard set`)", att.GetName())
 		}
-		if !s.firewallReleaseActive() {
-			return nil, nicGuardsRefusal(fmt.Sprintf("network %q: NIC guard settings are recorded only once every host runs this release", att.GetName()))
+		// The gate's own entry check (switch review m4): it records nothing,
+		// drives this node's latch, and refuses naming the hosts that hold
+		// the release back. Leaving the settings out creates the NIC
+		// unguarded, as before guards.
+		if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureNICGuards); err != nil {
+			return nil, err
 		}
 		if !nicGuardWeakens(mode, allowed, att.GetAllowDhcpServer(), att.GetAllowRouterAdvertisement(), att.GetAllowVlanTags()) {
 			continue
 		}
 		switch how {
 		case admitPeerOwner:
-			if !s.firewallReleaseActive() {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"network %q: NIC guard settings forwarded by a peer are refused until every host runs a build that checks them", att.GetName())
-			}
+			// The release check above has passed: every host is a build that
+			// checks authority at the entry node.
 			continue
 		case admitRecreate:
 			if same != nil && guardEquals(*same, mode, allowed, att) {
@@ -427,43 +422,104 @@ func newNICGuardRecord(vm, uuid string, ordinal int, mac string, att *pb.Network
 	}
 }
 
+// defaultGuardGateBudget bounds the release gate's call for a NIC's default
+// guard (switch review I1): a first use waits for every replication
+// recipient's ack, and a create main allowed must not wait on that.
+var defaultGuardGateBudget = 3 * time.Second
+
 // writeNewNICGuards records the guards of NICs being created, through the
-// release feature nic_guards (merge checklist M8). Until the release token
-// has latched — and before failover_scope_v1 has — nothing is recorded:
-// admitNICGuards has already refused an explicit setting, so these are
-// defaults, and the NICs are created unguarded, as on main, with a warning;
-// a create main allowed is never refused for its guard. Once the token has
-// latched the gate records the feature's use before the first record. A
-// default record the gate still refuses (a host rolled back after the latch
-// holds a first use off) is left out the same way; any other record, or any
-// other failure, fails the create.
+// release feature nic_guards (merge checklist M8).
+//
+// A record a re-create carries, or one the request set explicitly
+// (admitNICGuards has passed it), is written through the gate unbounded, and
+// a refusal fails the create: a carried guard is never dropped (switch review
+// I2).
+//
+// A NIC's default guard never fails or slows a create (I1). Until the release
+// token has latched here and nic_guards is unused, it is left out without
+// asking the gate (a mid-roll create: the NIC is unguarded, as on main). Once
+// either holds — the feature already used counts, so a node whose own latch
+// lags goes through the gate, which forms the latch there (I2) — it goes
+// through the gate within defaultGuardGateBudget, and any refusal or timeout
+// leaves it out the same way, with a warning. A failure to write a granted
+// record fails the create.
 func (s *Server) writeNewNICGuards(ctx context.Context, recs []corrosion.NICGuardRecord) error {
 	if len(recs) == 0 {
 		return nil
 	}
-	if !s.db.MayWriteClusterPolicy() || !s.firewallReleaseActive() {
-		slog.Warn("NIC guard: creating NICs unguarded; guards are recorded only once every host runs this release",
+	if !s.db.MayWriteClusterPolicy() {
+		slog.Warn("NIC guard: creating NICs unguarded; guards cannot be recorded until failover_scope_v1 has latched",
 			"vm", recs[0].VMName, "nics", len(recs))
 		return nil
 	}
-	err := s.writeNICGuardsGranted(ctx, recs)
-	if err != nil && status.Code(err) == codes.FailedPrecondition && allDefaultGuards(recs) {
-		slog.Warn("NIC guard: creating NICs unguarded; the release gate refused their guards",
-			"vm", recs[0].VMName, "nics", len(recs), "error", err)
-		return nil
-	}
-	return err
-}
-
-// allDefaultGuards reports whether every record is the default a new NIC
-// gets: on, with no relaxation.
-func allDefaultGuards(recs []corrosion.NICGuardRecord) bool {
+	var must, defaults []corrosion.NICGuardRecord
 	for _, r := range recs {
-		if r.Mode != corrosion.NICGuardOn || len(r.Allowed) > 0 || r.AllowDHCPServer || r.AllowRouterAdvert || r.AllowVLANTags {
-			return false
+		if r.Carried || !isDefaultGuard(r) {
+			must = append(must, r)
+		} else {
+			defaults = append(defaults, r)
 		}
 	}
-	return true
+	if len(must) > 0 {
+		if err := s.writeNICGuardsGranted(ctx, must); err != nil {
+			return err
+		}
+	}
+	if len(defaults) == 0 {
+		return nil
+	}
+	if !s.firewallReleaseActive() && !s.nicGuardsUsed(ctx) {
+		slog.Warn("NIC guard: creating NICs unguarded; guards are recorded only once every host runs this release",
+			"vm", defaults[0].VMName, "nics", len(defaults))
+		return nil
+	}
+	gctx, cancel := context.WithTimeout(ctx, defaultGuardGateBudget)
+	defer cancel()
+	var writeErr error
+	err := s.WithReleaseFeature(gctx, capabilities.FeatureNICGuards, func(_ context.Context, g capabilities.FeatureGrant) error {
+		for _, r := range defaults {
+			if err := corrosion.PutNICGuard(ctx, s.db, g, r, callerUsername(ctx)); err != nil {
+				writeErr = fmt.Errorf("record the guard of NIC %s: %w", r.MAC, err)
+				return writeErr
+			}
+		}
+		return nil
+	})
+	switch {
+	case err == nil:
+		return nil
+	case writeErr != nil:
+		return status.Errorf(codes.Internal, "%v", writeErr)
+	}
+	slog.Warn("NIC guard: creating NICs unguarded; the release gate did not grant their default guards in time "+
+		"(see `lv cluster upgrade-status`)", "vm", defaults[0].VMName, "nics", len(defaults), "error", err)
+	return nil
+}
+
+// nicGuardsUsed reports whether nic_guards is recorded used in this node's
+// replica: a guard exists somewhere, so a create here must go through the
+// gate even while this node's own latch lags. An unreadable answer says yes:
+// the gate is then asked, within its budget.
+func (s *Server) nicGuardsUsed(ctx context.Context) bool {
+	used, err := corrosion.ReleaseFeatureUsed(ctx, s.db, capabilities.ReleaseToken, string(capabilities.FeatureNICGuards))
+	return used || err != nil
+}
+
+// gateFailure is a guard write's error as a failed operation reports it: a
+// status error's own code and message — the release gate's refusal reads as
+// itself, not as Internal around a nested rpc error (switch review m5) —
+// and Internal for anything else.
+func gateFailure(err error) (codes.Code, error) {
+	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
+		return st.Code(), errors.New(st.Message())
+	}
+	return codes.Internal, err
+}
+
+// isDefaultGuard reports whether r is the default a new NIC gets: on, with no
+// relaxation.
+func isDefaultGuard(r corrosion.NICGuardRecord) bool {
+	return r.Mode == corrosion.NICGuardOn && len(r.Allowed) == 0 && !r.AllowDHCPServer && !r.AllowRouterAdvert && !r.AllowVLANTags
 }
 
 // retireNICGuards tombstones the guard records of a workload just deleted, so
@@ -575,6 +631,10 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"NIC %s is on %s network %q, which bypasses the bridge where guards are enforced; a guard there would protect nothing",
 			tgt.nic.MAC, def.Type, tgt.nic.NetworkName)
+	}
+	// Refused here, before the gate records any use (switch review m1).
+	if _, err := corrosion.NormalizeNICGuardAddresses(req.GetAllowedAddresses()); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "allowed addresses: %v", err)
 	}
 	before, berr := corrosion.GetNICGuard(ctx, s.db, tgt.owner, tgt.nic.MAC)
 	rec := corrosion.NICGuardRecord{

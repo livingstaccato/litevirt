@@ -328,18 +328,21 @@ with the direction they mean. Observe mode keeps the inet table as it was, so
 its counters cannot show this.
 ## IPv6
 
-Rules take IPv6 CIDRs and the `icmpv6` protocol, and ip sets take IPv6
-elements, in every tier:
+Rules take IPv6 CIDRs, and ip sets take IPv6 elements, in every tier:
 
 ```
 lv firewall cluster-rule add --direction ingress --proto tcp --port 22 --cidr 2001:db8::/32 --action accept
-lv firewall cluster-rule add --direction ingress --proto icmpv6 --action accept
+lv firewall cluster-rule add --direction ingress --proto icmpv6 --cidr ::/0 --action accept
 lv firewall ipset add admins --cidr 10.0.0.0/8 --cidr 2001:db8:1::/48
 ```
 
-- An IPv6 CIDR renders as `ip6 saddr` / `ip6 daddr`. `icmp` is ICMP for IPv4
-  and `icmpv6` (or `ipv6-icmp`) is ICMPv6; a rule pairing either with the
-  other family's CIDR is refused, since it could match nothing.
+- An IPv6 CIDR renders as `ip6 saddr` / `ip6 daddr`. `icmp` is ICMP for IPv4;
+  `icmp` with an IPv6 CIDR is refused, since it could match nothing.
+- `icmpv6` (or `ipv6-icmp`) is ICMPv6 with an IPv6 CIDR or a set reference —
+  `--cidr ::/0` for any source. With no CIDR, or an IPv4 one, it is the shape
+  earlier releases accepted, and it keeps their meaning: it renders as
+  `ip protocol icmpv6`, matching IPv4 packets of protocol 58, which is to say
+  nothing a guest sends.
 - nftables sets are typed, so a set holding both families renders as the IPv4
   set `<name>` plus an IPv6 companion `<name>_v6`, and a rule referencing
   `@<name>` matches either. Do not name another set `<name>_v6`.
@@ -610,7 +613,15 @@ one until the release token has latched — every host runs this release — and
 the first one records the use first. Before that, a NIC is created unguarded
 with a warning, as before guards; a request that sets guard options, and
 `lv firewall nic-guard set`, are refused with "the cluster upgrade must finish
-first (nic_guards needs release_2026_11_v1)" rather than silently unguarded. A
+first (nic_guards needs release_2026_11_v1)", naming the hosts that hold the
+release back, rather than silently unguarded. Once a guard exists anywhere, a
+host whose own latch has not formed yet (one that just joined) asks the gate,
+which forms it there. A NIC's default guard never fails or slows a create,
+clone, import or hot-attach: its gate call is bounded at three seconds, and if
+the gate refuses it or does not answer in time (a host that does not
+acknowledge the first use), the NIC is created unguarded, as before guards,
+with a warning. A guard a re-create carries from the incarnation it replaces is
+never dropped: if the gate refuses it, the re-create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the

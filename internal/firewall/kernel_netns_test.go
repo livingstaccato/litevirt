@@ -450,6 +450,9 @@ func TestKernelChild_RulesetLoads(t *testing.T) {
 		IPSets:      []IPSet{{Name: "admins", CIDRs: []string{"10.0.0.0/8", "2001:db8::/32", "2001:db8:1::/48"}}},
 		ClusterRules: []Rule{
 			{Direction: Ingress, Proto: "icmpv6", Action: Accept},
+			// Main's shapes, rendered as main rendered them (switch review m3).
+			{Direction: Ingress, Proto: "ipv6-icmp", Action: Accept},
+			{Direction: Ingress, Proto: "icmpv6", CIDR: "10.0.0.0/8", Action: Drop},
 			{Direction: Ingress, Proto: "icmpv6", CIDR: "fd00::/8", Action: Accept},
 			{Direction: Egress, Proto: "gre", CIDR: "2001:db8::/32", Action: Drop},
 			{Direction: Ingress, Proto: "icmp", CIDR: "@admins", Action: Accept},

@@ -2,10 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -28,20 +30,52 @@ type relGate struct {
 	refuseFirstUse bool
 	// calls counts WithFeature calls: a refusal pings every lagging host.
 	calls int
+	// refuseCode is the code of a first-use refusal (FailedPrecondition when
+	// unset); a first use's ack wait that runs out is Unavailable.
+	refuseCode codes.Code
+	// block: WithFeature waits for its context to end (an ack that never
+	// comes).
+	block bool
+	// lagging: this node's own durable latch has not formed
+	// (FeatureAvailable false); WithFeature drives it, so it still grants.
+	lagging bool
+	// refusals counts FeatureRefusal calls (the non-recording entry check).
+	refusals int
 }
 
 func (g *relGate) WithFeature(ctx context.Context, f capabilities.Feature,
 	write func(context.Context, capabilities.FeatureGrant) error) error {
 	g.calls++
-	if !g.open || g.refuseFirstUse {
+	if g.block {
+		<-ctx.Done()
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	if !g.open {
 		return status.Errorf(codes.FailedPrecondition, "the cluster upgrade must finish first (%s needs %s): host old runs an older build",
+			f, capabilities.ReleaseToken)
+	}
+	if g.refuseFirstUse {
+		code := g.refuseCode
+		if code == codes.OK {
+			code = codes.FailedPrecondition
+		}
+		return status.Errorf(code, "the cluster upgrade must finish first (%s needs %s): not yet acknowledged by host-c",
 			f, capabilities.ReleaseToken)
 	}
 	g.used = append(g.used, f)
 	return write(ctx, capabilities.GrantForTest(g.t, f))
 }
 
-func (g *relGate) FeatureAvailable(capabilities.Feature) bool { return g.open }
+func (g *relGate) FeatureAvailable(capabilities.Feature) bool { return g.open && !g.lagging }
+
+func (g *relGate) FeatureRefusal(_ context.Context, f capabilities.Feature) error {
+	g.refusals++
+	if g.open {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition, "the cluster upgrade must finish first (%s needs %s): host old runs an older build",
+		f, capabilities.ReleaseToken)
+}
 
 func fwReleaseRefusal(f capabilities.Feature) string {
 	return fmt.Sprintf("the cluster upgrade must finish first (%s needs %s)", f, capabilities.ReleaseToken)
@@ -223,5 +257,211 @@ firewall:
 	}
 	if len(g.used) != 3 {
 		t.Errorf("uses recorded = %v, want firewall_ipv6 ahead of each of the three IPv6 rows", g.used)
+	}
+}
+
+func r6VM(t *testing.T, s *Server, name, mac string) []corrosion.NICGuardRecord {
+	t.Helper()
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: name, HostName: s.hostName, State: "running",
+		Spec: `{"name":"` + name + `","uuid":"u-` + name + `"}`}, []corrosion.InterfaceRecord{{VMName: name, NetworkName: "lan", MAC: mac}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	return []corrosion.NICGuardRecord{{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn, VMUUID: "u-" + name, Network: "lan"}}
+}
+
+// TestSwitchFix_DefaultGuardNeverFailsACreate (switch review I1): after the
+// latch, a default guard whose first use the gate cannot complete — any
+// refusal, Unavailable included, or an ack that never comes — leaves the NIC
+// unguarded, as main created it, within a bounded wait: the create never
+// fails or stalls for it.
+func TestSwitchFix_DefaultGuardNeverFailsACreate(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	g := guardRelease(s)
+	g.refuseFirstUse, g.refuseCode = true, codes.Unavailable
+	def := r6VM(t, s, "web", "52:54:00:00:0c:01")
+	if err := s.writeNewNICGuards(ctx, def); err != nil {
+		t.Errorf("a default guard the gate refused with Unavailable failed the create: %v", err)
+	}
+	g.refuseFirstUse, g.block = false, true
+	start := time.Now()
+	if err := s.writeNewNICGuards(ctx, def); err != nil {
+		t.Errorf("a default guard whose ack never came failed the create: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("a default guard held the create for %v; its gate call is bounded at %v", d, defaultGuardGateBudget)
+	}
+	if rec, _ := corrosion.GetNICGuard(ctx, s.db, "web", "52:54:00:00:0c:01"); rec != nil {
+		t.Errorf("a guard was recorded although the gate never granted: %+v", rec)
+	}
+}
+
+// TestSwitchFix_UsedFeatureGoesThroughTheGate (switch review I2): on a node
+// whose own release latch lags (a host that just joined, or just after the
+// roll), once nic_guards is recorded used a create goes through the gate —
+// which forms the latch there — rather than drop the guard; and a guard
+// carried by a re-create is never dropped: a gate that still refuses fails
+// the re-create.
+func TestSwitchFix_UsedFeatureGoesThroughTheGate(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	g := guardRelease(s)
+	g.lagging = true
+	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, capabilities.ReleaseToken, string(capabilities.FeatureNICGuards), "peer", false); err != nil {
+		t.Fatal(err)
+	}
+	carried := r6VM(t, s, "rebuilt", "52:54:00:00:0c:02")
+	// What a re-create's decision makes of the replaced incarnation's record.
+	d := guardDecision{carry: &carried[0]}
+	rec := d.record("rebuilt", "u-rebuilt", 0, "52:54:00:00:0c:02", &pb.NetworkAttachment{Name: "lan"})
+	if rec == nil || !rec.Carried {
+		t.Fatalf("a re-create's carried record is not marked carried: %+v", rec)
+	}
+	carried[0] = *rec
+	if err := s.writeNewNICGuards(ctx, carried); err != nil {
+		t.Fatalf("a carried guard on a lagging node: %v", err)
+	}
+	if rec, _ := corrosion.GetNICGuard(ctx, s.db, "rebuilt", "52:54:00:00:0c:02"); rec == nil || !rec.Guarded() {
+		t.Errorf("a re-create on a lagging node dropped its carried guard: %+v", rec)
+	}
+	fresh := r6VM(t, s, "fresh", "52:54:00:00:0c:03")
+	if err := s.writeNewNICGuards(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := corrosion.GetNICGuard(ctx, s.db, "fresh", "52:54:00:00:0c:03"); rec == nil {
+		t.Error("a new NIC on a lagging node in a cluster that uses guards was left unguarded")
+	}
+
+	g.refuseFirstUse = true
+	again := r6VM(t, s, "again", "52:54:00:00:0c:04")
+	again[0].Carried = true
+	if err := s.writeNewNICGuards(ctx, again); err == nil {
+		t.Error("a carried guard the gate refused was dropped silently; the re-create must fail instead")
+	}
+}
+
+// TestSwitchFix_SetValidatesBeforeTheGrant (switch review m1): a malformed
+// allowed address is refused before the gate records any use.
+func TestSwitchFix_SetValidatesBeforeTheGrant(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	g := guardRelease(s)
+	admin := adminCtxWithEngine(t, s)
+	r6VM(t, s, "web", "52:54:00:00:0c:05")
+	_, err := s.SetNICGuard(admin, &pb.SetNICGuardRequest{VmName: "web", Mac: "52:54:00:00:0c:05", Mode: "on",
+		AllowedAddresses: []string{"10.0.0.1; drop"}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a malformed allowed address: %v, want InvalidArgument", err)
+	}
+	if g.calls != 0 || len(g.used) != 0 {
+		t.Errorf("a refused request reached the gate (%d calls, uses %v)", g.calls, g.used)
+	}
+	_ = ctx
+}
+
+// TestSwitchFix_StackGatesBeforeTeardown (switch review m2, m5): a stack
+// redeploy validates every firewall row and asks the release gate for an
+// IPv6 one before it touches the stack's existing rows: a refusal leaves
+// them as they were, and its text is the gate's, not a nested rpc error. A
+// malformed row is refused before any use is recorded.
+func TestSwitchFix_StackGatesBeforeTeardown(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	g := &relGate{t: t}
+	s.SetReleaseFeatureGate(g)
+	parse := func(rules string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseBytes([]byte("name: st\nsecurity-groups:\n  web:\n    rules:\n" + rules))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	if err := s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+`)); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := corrosion.ListSecurityGroups(ctx, s.db, "st")
+	err := s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+      - {direction: ingress, proto: tcp, port: "443", cidr: "2001:db8::/32", action: accept}
+`))
+	if status.Code(err) != codes.FailedPrecondition || strings.Contains(status.Convert(err).Message(), "rpc error") ||
+		!strings.Contains(err.Error(), fwReleaseRefusal(capabilities.FeatureFirewallIPv6)) {
+		t.Errorf("an IPv6 stack row mid-roll: %v, want the gate's refusal, unnested", err)
+	}
+	after, _ := corrosion.ListSecurityGroups(ctx, s.db, "st")
+	if len(before) != 1 || len(after) != 1 || after[0].ID != before[0].ID {
+		t.Errorf("a refused redeploy changed the stack's firewall: before %+v, after %+v", before, after)
+	} else if rules, _ := corrosion.ListSGRules(ctx, s.db, after[0].ID); len(rules) != 1 {
+		t.Errorf("a refused redeploy changed the stack's rules: %+v", rules)
+	}
+	g.open = true
+	err = s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "443", cidr: "2001:db8::/32", action: accept}
+      - {direction: ingress, proto: tcp, port: "22", cidr: "2001:db8::/300", action: accept}
+`))
+	if err == nil || len(g.used) != 0 {
+		t.Errorf("a stack with a malformed row: %v (uses %v); want refused before any use", err, g.used)
+	}
+	g.open = false
+	err = stackFirewallErr(s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "443", cidr: "2001:db8::/32", action: accept}
+`)))
+	if status.Code(err) != codes.FailedPrecondition || strings.Contains(status.Convert(err).Message(), "rpc error") ||
+		!strings.HasPrefix(status.Convert(err).Message(), "firewall config: "+fwReleaseRefusal(capabilities.FeatureFirewallIPv6)) {
+		t.Errorf("the deploy's error = %v, want the gate's refusal under \"firewall config:\" with no nested rpc error", err)
+	}
+}
+
+// TestSwitchFix_MainShapesMidRoll (switch review m3): the rule shapes main
+// accepted — icmpv6 with no CIDR or an IPv4 one — are written mid-roll with
+// no gate, as on main; an IPv6 ip-set element, which main's renderer could not
+// express, stays the feature's.
+func TestSwitchFix_MainShapesMidRoll(t *testing.T) {
+	s := testServer(t)
+	g := &relGate{t: t}
+	s.SetReleaseFeatureGate(g)
+	ctx := adminCtxWithEngine(t, s)
+	for _, cidr := range []string{"", "10.0.0.0/8"} {
+		for _, proto := range []string{"icmpv6", "ipv6-icmp"} {
+			if _, err := s.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: &pb.FirewallRule{
+				Direction: "ingress", Proto: proto, Cidr: cidr, Action: "accept"}}); err != nil {
+				t.Errorf("proto %s cidr %q, a shape main accepted, mid-roll: %v", proto, cidr, err)
+			}
+		}
+	}
+	if g.calls != 0 {
+		t.Errorf("a shape main accepted went through the release gate (%d calls)", g.calls)
+	}
+	if _, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: "v6", Cidrs: []string{"2001:db8::/32"}}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("an IPv6 ip-set element mid-roll: %v, want the release refusal", err)
+	}
+}
+
+// TestSwitchFix_EntryCheckUsesTheGatesRefusal (switch review m4): the entry
+// check for an explicit guard setting is the gate's non-recording refusal
+// (it names the lagging hosts and drives the latch), not a synthesized text.
+func TestSwitchFix_EntryCheckUsesTheGatesRefusal(t *testing.T) {
+	s := guardServer(t, true)
+	g := guardRelease(s)
+	g.open = false
+	off := []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "off"}}
+	_, err := s.admitNICGuards(adminCtxWithEngine(t, s), "vm", off, admitNew)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "host old runs an older build") || g.refusals != 1 {
+		t.Errorf("explicit setting mid-roll: %v (%d FeatureRefusal calls), want the gate's refusal", err, g.refusals)
+	}
+	if len(g.used) != 0 {
+		t.Errorf("the entry check recorded a use: %v", g.used)
+	}
+}
+
+// TestSwitchFix_GateFailureKeepsItsCode (switch review m5): a guard refused
+// by the gate fails a NIC hot-attach with the gate's code and message, not
+// Internal around a nested rpc error.
+func TestSwitchFix_GateFailureKeepsItsCode(t *testing.T) {
+	code, cause := gateFailure(status.Error(codes.Unavailable, "not yet acknowledged by host-c"))
+	if code != codes.Unavailable || cause.Error() != "not yet acknowledged by host-c" {
+		t.Errorf("gateFailure = %v, %q", code, cause)
+	}
+	if code, _ := gateFailure(errors.New("disk full")); code != codes.Internal {
+		t.Errorf("a plain error: %v, want Internal", code)
 	}
 }

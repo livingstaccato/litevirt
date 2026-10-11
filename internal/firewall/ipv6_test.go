@@ -33,16 +33,28 @@ func TestRender_IPv6CIDRRendersAsIP6(t *testing.T) {
 	}
 }
 
-// TestRender_ICMPv6Proto: icmpv6 (and its /etc/protocols name ipv6-icmp) is a
-// protocol that matches IPv6 only; icmp stays IPv4's.
+// TestRender_ICMPv6Proto (switch review m3): icmpv6 (and its /etc/protocols
+// name ipv6-icmp) matches ICMPv6 only with an IPv6 CIDR or set, which only a
+// firewall_ipv6 write can make. With no CIDR, or an IPv4 one — shapes main
+// accepted — it renders byte for byte as main did (`ip protocol <proto>`), so
+// a row main wrote, or one written the same way mid-roll, means on this build
+// what it meant on main.
 func TestRender_ICMPv6Proto(t *testing.T) {
 	for _, proto := range []string{"icmpv6", "ipv6-icmp"} {
-		out, err := Render(Plan{ClusterRules: []Rule{{Direction: Ingress, Proto: proto, Action: Accept}}})
+		out, err := Render(Plan{ClusterRules: []Rule{
+			{Direction: Ingress, Proto: proto, Action: Accept},
+			{Direction: Ingress, Proto: proto, CIDR: "10.0.0.0/8", Action: Drop},
+		}})
 		if err != nil {
 			t.Fatalf("Render %s: %v", proto, err)
 		}
-		if !strings.Contains(out, "meta l4proto ipv6-icmp accept") {
-			t.Errorf("proto %s: want `meta l4proto ipv6-icmp accept`:\n%s", proto, out)
+		for _, want := range []string{"ip protocol " + proto + " accept", "ip protocol " + proto + " ip saddr 10.0.0.0/8 drop"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("proto %s: want main's `%s`:\n%s", proto, want, out)
+			}
+		}
+		if strings.Contains(out, "l4proto") {
+			t.Errorf("proto %s with no IPv6 CIDR took the IPv6 meaning:\n%s", proto, out)
 		}
 	}
 	out, err := Render(Plan{ClusterRules: []Rule{{Direction: Ingress, Proto: "icmpv6", CIDR: "fd00::/8", Action: Drop}}})
@@ -54,13 +66,13 @@ func TestRender_ICMPv6Proto(t *testing.T) {
 	}
 }
 
-// TestRender_RefusesFamilyMismatch: icmp is IPv4 and icmpv6 is IPv6, so a rule
-// that pairs either with the other family's CIDR can match nothing and nft
-// refuses it outright. Refused at validation, never emitted.
+// TestRender_RefusesFamilyMismatch: icmp is IPv4, so pairing it with an IPv6
+// CIDR can match nothing and nft refuses it outright; a malformed IPv6 CIDR
+// too. Refused at validation, never emitted. (icmpv6 with an IPv4 CIDR is a
+// shape main accepted and rendered: TestRender_ICMPv6Proto.)
 func TestRender_RefusesFamilyMismatch(t *testing.T) {
 	for _, r := range []Rule{
 		{Direction: Ingress, Proto: "icmp", CIDR: "2001:db8::/32", Action: Accept},
-		{Direction: Ingress, Proto: "icmpv6", CIDR: "10.0.0.0/8", Action: Accept},
 		{Direction: Ingress, Proto: "tcp", CIDR: "2001:db8::/300", Action: Accept},
 		{Direction: Ingress, Proto: "tcp", CIDR: "not-an-address:", Action: Accept},
 	} {

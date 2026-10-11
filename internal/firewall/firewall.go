@@ -755,7 +755,14 @@ func renderRule(r Rule, nicDev, family string) string {
 	case "icmp":
 		parts = append(parts, "ip", "protocol", "icmp")
 	case "icmpv6", "ipv6-icmp":
-		parts = append(parts, "meta", "l4proto", "ipv6-icmp")
+		if family == "ip6" {
+			// With an IPv6 CIDR or set (a firewall_ipv6 write): ICMPv6.
+			parts = append(parts, "meta", "l4proto", "ipv6-icmp")
+		} else {
+			// With no CIDR, or an IPv4 one: a shape main accepted, rendered
+			// byte for byte as main rendered it (switch review m3).
+			parts = append(parts, "ip", "protocol", proto)
+		}
 	case "", "all":
 		// no proto filter
 	default:
@@ -837,9 +844,10 @@ func validate(p Plan) error {
 			return fmt.Errorf("rule %d: action %q not supported (accept|drop|reject)", i, r.Action)
 		}
 		// An IPv6 CIDR renders with the ip6 matcher. A malformed one, or one
-		// paired with IPv4's icmp (or an IPv4 CIDR with icmpv6), would emit a
-		// line nft refuses, poisoning the whole atomic ruleset — so refuse it
-		// here. IPv4 CIDRs are passed through as they always were.
+		// paired with IPv4's icmp, would emit a line nft refuses, poisoning
+		// the whole atomic ruleset — so refuse it here. IPv4 CIDRs are passed
+		// through as they always were, icmpv6 with one included (main's
+		// shape, rendered as main rendered it).
 		if isIPv6Literal(r.CIDR) {
 			if !validAddrOrPrefix(r.CIDR, true) {
 				return fmt.Errorf("rule %d: %q is not an IPv6 address or prefix", i, r.CIDR)
@@ -847,8 +855,6 @@ func validate(p Plan) error {
 			if ruleFamily(r.Proto) == "ip" {
 				return fmt.Errorf("rule %d: proto %q is IPv4-only and cannot match IPv6 CIDR %q (use icmpv6)", i, r.Proto, r.CIDR)
 			}
-		} else if r.CIDR != "" && !strings.HasPrefix(r.CIDR, "@") && ruleFamily(r.Proto) == "ip6" {
-			return fmt.Errorf("rule %d: proto %q is IPv6-only and cannot match IPv4 CIDR %q", i, r.Proto, r.CIDR)
 		}
 		if strings.HasPrefix(r.CIDR, "@") {
 			name := strings.TrimPrefix(r.CIDR, "@")

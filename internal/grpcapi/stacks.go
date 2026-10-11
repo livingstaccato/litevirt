@@ -115,7 +115,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// groups. Re-deploy is idempotent: the stack's prior firewall rows are
 	// cleared first. A malformed block (e.g. an IPv6 CIDR) aborts the deploy.
 	if err := s.persistStackFirewall(ctx, f); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
+		return stackFirewallErr(err)
 	}
 
 	// Register the stack's backup repos (logical name → path), so a VM's
@@ -219,6 +219,19 @@ const (
 	stackStateDegraded = "degraded"
 )
 
+// stackFirewallErr is a stack's firewall failure as its deploy returns it: a
+// status error — the release gate's refusal — keeps its code and message
+// under "firewall config:", with no rpc error nested in it (switch review
+// m5); anything else is FailedPrecondition, as before.
+func stackFirewallErr(err error) error {
+	var se interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &se) {
+		st := se.GRPCStatus()
+		return status.Errorf(st.Code(), "firewall config: %s", st.Message())
+	}
+	return status.Errorf(codes.FailedPrecondition, "firewall config: %v", err)
+}
+
 // persistStackFirewall writes a compose file's distributed-firewall config to
 // Corrosion: security groups (+ rules), ip sets, cluster-tier rules, and the
 // default-deny policy. The CorrosionPlanLoader on every host then renders these
@@ -246,6 +259,41 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 				owner = "stack " + strconv.Quote(held.StackName)
 			}
 			return fmt.Errorf("security-group %q is already defined by %s (id %s); names must be unique", name, owner, held.ID)
+		}
+	}
+	// Every row is validated, and an IPv6 one cleared with the release gate's
+	// non-recording check, before the stack's rows are torn down (switch
+	// review m2): a refusal leaves them as they were, and a deploy refused for
+	// a malformed row records no use.
+	anyV6 := false
+	for name, sg := range f.SecurityGroups {
+		for _, r := range sg.Rules {
+			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			if err != nil {
+				return fmt.Errorf("security-group %q rule: %w", name, err)
+			}
+			anyV6 = anyV6 || v6
+		}
+	}
+	for name, set := range f.IPSets {
+		v6, err := corrosion.IPSetFamily(set.CIDRs)
+		if err != nil {
+			return fmt.Errorf("ipset %q: %w", name, err)
+		}
+		anyV6 = anyV6 || v6
+	}
+	if fd := f.FirewallDefaults; fd != nil {
+		for _, r := range fd.ClusterRules {
+			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			if err != nil {
+				return fmt.Errorf("cluster rule: %w", err)
+			}
+			anyV6 = anyV6 || v6
+		}
+	}
+	if anyV6 {
+		if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureFirewallIPv6); err != nil {
+			return err
 		}
 	}
 	if err := corrosion.DeleteStackFirewall(ctx, s.db, f.Name); err != nil {

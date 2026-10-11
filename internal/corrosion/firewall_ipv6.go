@@ -3,8 +3,8 @@ package corrosion
 // IPv6 firewall rules: the release feature firewall_ipv6
 // (capabilities.FeatureFirewallIPv6).
 //
-// A security-group, cluster or host rule may name an IPv6 CIDR or the icmpv6
-// protocol, and an ip set may hold IPv6 elements. They replicate in the
+// A security-group, cluster or host rule may name an IPv6 CIDR, and an ip
+// set may hold IPv6 elements. They replicate in the
 // statement shapes those tables always had, so every peer DECODES them — but a
 // peer on a build that predates IPv6 rendering refuses the whole plan when
 // one reaches its renderer, and stops applying its firewall until it is
@@ -24,15 +24,6 @@ import (
 // element without a firewall_ipv6 grant.
 var ErrFirewallIPv6GateClosed = errors.New("IPv6 firewall rules are written only through the release feature firewall_ipv6 " +
 	"(the cluster upgrade must finish first: a host on an older build cannot render them and would stop applying its firewall)")
-
-// isIPv6Proto reports whether proto is ICMPv6, which exists only in IPv6.
-func isIPv6Proto(proto string) bool {
-	switch strings.ToLower(strings.TrimSpace(proto)) {
-	case "icmpv6", "ipv6-icmp":
-		return true
-	}
-	return false
-}
 
 func looksIPv6CIDR(cidr string) bool {
 	cidr = strings.TrimSpace(cidr)
@@ -54,22 +45,23 @@ func IPSetFamily(cidrs []string) (v6 bool, err error) {
 
 // firewallRuleFamily refuses a rule this build or an older peer could not
 // render — an IPv6 CIDR that does not parse (it would stop every host's
-// renderer), IPv4's icmp with an IPv6 CIDR, icmpv6 with an IPv4 CIDR — and
-// reports whether the rule is IPv6.
+// renderer), or IPv4's icmp with an IPv6 CIDR — and reports whether the rule
+// is IPv6: one with an IPv6 CIDR, which main refused (switch review m3).
+// icmpv6 (or ipv6-icmp) with no CIDR, or with an IPv4 one, is a shape main
+// accepted and rendered; it stays an IPv4-tier rule, written with no grant
+// and rendered as main rendered it.
 func firewallRuleFamily(cidr, proto string) (v6 bool, err error) {
 	cidr = strings.TrimSpace(cidr)
-	v6cidr := looksIPv6CIDR(cidr)
-	if v6cidr {
-		if !validIPv6AddrOrPrefix(cidr) {
-			return false, fmt.Errorf("%q is not an IPv6 address or prefix", cidr)
-		}
-		if strings.EqualFold(strings.TrimSpace(proto), "icmp") {
-			return false, fmt.Errorf("proto icmp is IPv4-only and cannot match IPv6 CIDR %q; use icmpv6", cidr)
-		}
-	} else if cidr != "" && !strings.HasPrefix(cidr, "@") && isIPv6Proto(proto) {
-		return false, fmt.Errorf("proto %s is IPv6-only and cannot match IPv4 CIDR %q", proto, cidr)
+	if !looksIPv6CIDR(cidr) {
+		return false, nil
 	}
-	return v6cidr || isIPv6Proto(proto), nil
+	if !validIPv6AddrOrPrefix(cidr) {
+		return false, fmt.Errorf("%q is not an IPv6 address or prefix", cidr)
+	}
+	if strings.EqualFold(strings.TrimSpace(proto), "icmp") {
+		return false, fmt.Errorf("proto icmp is IPv4-only and cannot match IPv6 CIDR %q; use icmpv6", cidr)
+	}
+	return true, nil
 }
 
 // ipSetFamily refuses an IPv6 ip-set element that does not parse, and reports

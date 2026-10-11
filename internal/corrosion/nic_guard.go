@@ -90,6 +90,11 @@ type NICGuardRecord struct {
 
 	SetBy     string `json:"-"`
 	UpdatedAt string `json:"-"`
+
+	// Carried marks, in memory only, a record a re-create carries from the
+	// incarnation it replaces: the guard a NIC had, which a create must
+	// never drop (switch review I2). Not stored.
+	Carried bool `json:"-"`
 }
 
 // Guarded reports whether the record turns the guard on.

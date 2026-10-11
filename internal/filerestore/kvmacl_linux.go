@@ -12,10 +12,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// A restore VM's per-session uid reaches /dev/kvm through a POSIX ACL entry
-// on the device, set when the uid is handed out (allocUID) and removed when
-// it is released, or by the next daemon's startup sweep (SweepStale) when a
-// daemon died holding it. The uid is never put in the kvm group: libvirt's
+// A restore VM reaches /dev/kvm through a POSIX ACL_GROUP entry on the device
+// for its slot's group (the reserved gid equal to its uid), a supplementary
+// group of the session credential. It is set when the slot is handed out
+// (allocUID), checked again just before exec (ensureKVMGrant), and removed
+// when the slot is released, or by the next daemon's startup sweep
+// (SweepStale) when a daemon died holding it.
+//
+// A GROUP entry, not a user one: on systemd 255 (Ubuntu 24.04) /dev/kvm is
+// tagged uaccess, and udev rewrites its ACL on the change uevent every KVM VM
+// create and destroy emits, dropping every named-USER entry (seen in the lab
+// within a second of the grant). Named-group entries survive that rewrite.
+// The slot gid is in the reserved range: no account, no files, no other use.
+//
+// The VM is never put in the kvm group: libvirt's
 // qemu creates group-writable sockets as libvirt-qemu:kvm — among them the
 // pull-mode backup's NBD export of a live guest disk — and Landlock does not
 // mediate connect() to a pathname unix socket, so a restore qemu in kvm
@@ -147,21 +157,22 @@ func worldRW(path string) bool {
 	return unix.Stat(path, &st) == nil && st.Mode&aclRW == aclRW
 }
 
-// grantDeviceACL gives uid read-write on path by an ACL_USER entry.
-func grantDeviceACL(path string, uid uint32) error {
+// grantDeviceACL gives group gid read-write on path by an ACL_GROUP entry. It
+// is idempotent: calling it again re-establishes an entry something removed.
+func grantDeviceACL(path string, gid uint32) error {
 	deviceACLMu.Lock()
 	defer deviceACLMu.Unlock()
 	ents, err := readAccessACL(path)
 	if err == nil {
 		found := false
 		for i := range ents {
-			if ents[i].tag == aclUser && ents[i].id == uid {
+			if ents[i].tag == aclGroup && ents[i].id == gid {
 				ents[i].perm |= aclRW
 				found = true
 			}
 		}
 		if !found {
-			ents = append(ents, aclEntry{aclUser, aclRW, uid})
+			ents = append(ents, aclEntry{aclGroup, aclRW, gid})
 		}
 		err = writeAccessACL(path, ents)
 	}
@@ -171,8 +182,9 @@ func grantDeviceACL(path string, uid uint32) error {
 	return err
 }
 
-// revokeDeviceACL removes every ACL_USER entry of path for a uid in [lo,
-// hi), leaving the rest, and returns how many it removed. Nothing to remove
+// revokeDeviceACL removes every named entry of path, user or group, for an id
+// in [lo, hi), leaving the rest, and returns how many it removed. User
+// entries are included for the ones a daemon that granted by user left. Nothing to remove
 // writes nothing.
 func revokeDeviceACL(path string, lo, hi uint32) (int, error) {
 	deviceACLMu.Lock()
@@ -187,7 +199,7 @@ func revokeDeviceACL(path string, lo, hi uint32) (int, error) {
 	kept := ents[:0:0]
 	n := 0
 	for _, e := range ents {
-		if e.tag == aclUser && e.id >= lo && e.id < hi {
+		if (e.tag == aclUser || e.tag == aclGroup) && e.id >= lo && e.id < hi {
 			n++
 			continue
 		}

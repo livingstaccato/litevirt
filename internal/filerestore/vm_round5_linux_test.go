@@ -35,6 +35,17 @@ func aclDevice(t *testing.T) string {
 // read from the xattr itself, independently of the code under test.
 func userACL(t *testing.T, path string, uid uint32) int {
 	t.Helper()
+	return namedACL(t, path, 0x02, uid)
+}
+
+// groupACL is the same for an ACL_GROUP entry.
+func groupACL(t *testing.T, path string, gid uint32) int {
+	t.Helper()
+	return namedACL(t, path, 0x08, gid)
+}
+
+func namedACL(t *testing.T, path string, wantTag uint16, uid uint32) int {
+	t.Helper()
 	b := make([]byte, 4096)
 	n, err := unix.Getxattr(path, aclAccessXattr, b)
 	if errors.Is(err, unix.ENODATA) {
@@ -48,7 +59,7 @@ func userACL(t *testing.T, path string, uid uint32) int {
 		tag := uint16(b[off]) | uint16(b[off+1])<<8
 		perm := uint16(b[off+2]) | uint16(b[off+3])<<8
 		id := uint32(b[off+4]) | uint32(b[off+5])<<8 | uint32(b[off+6])<<16 | uint32(b[off+7])<<24
-		if tag == 0x02 && id == uid {
+		if tag == wantTag && id == uid {
 			return int(perm)
 		}
 	}
@@ -73,8 +84,8 @@ func TestSessionCredential_NoKVMGroup(t *testing.T) {
 	if c.uid != 3_800_000_004 || c.gid != 988 {
 		t.Fatalf("credential %+v", c)
 	}
-	if containsU32(c.groups, 993) || len(c.groups) != 1 || c.groups[0] != 988 {
-		t.Fatalf("a restore VM's groups are %v; want only the restore group 988, never kvm (993)", c.groups)
+	if containsU32(c.groups, 993) || len(c.groups) != 2 || c.groups[0] != 988 || c.groups[1] != 3_800_000_004 {
+		t.Fatalf("a restore VM's groups are %v; want the restore group 988 and its own slot gid, never kvm (993)", c.groups)
 	}
 }
 
@@ -89,7 +100,7 @@ func TestDeviceACL_GrantAndRevoke(t *testing.T) {
 	if err := grantDeviceACL(dev, base+3); err != nil {
 		t.Fatal(err)
 	}
-	if p := userACL(t, dev, base+3); p != 6 {
+	if p := groupACL(t, dev, base+3); p != 6 {
 		t.Fatalf("uid %d has ACL perm %d on the device, want rw (6)", base+3, p)
 	}
 	if m := modeOf(t, dev); m != 0o660 {
@@ -99,10 +110,10 @@ func TestDeviceACL_GrantAndRevoke(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("revoke: removed %d (%v), want 1", n, err)
 	}
-	if p := userACL(t, dev, base+3); p != -1 {
+	if p := groupACL(t, dev, base+3); p != -1 {
 		t.Fatalf("uid %d still has ACL perm %d after the revoke", base+3, p)
 	}
-	if p := userACL(t, dev, 12345); p != 6 {
+	if p := groupACL(t, dev, 12345); p != 6 {
 		t.Fatalf("another uid's entry was touched: perm %d", p)
 	}
 	if n, err := revokeDeviceACL(dev, 12345, 12346); err != nil || n != 1 {
@@ -130,11 +141,11 @@ func TestAllocUID_GrantsKVMUntilReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := userACL(t, l.kvmPath, uid); p != 6 {
+	if p := groupACL(t, l.kvmPath, uid); p != 6 {
 		t.Fatalf("session uid %d has ACL perm %d on KVM, want rw", uid, p)
 	}
 	rel()
-	if p := userACL(t, l.kvmPath, uid); p != -1 {
+	if p := groupACL(t, l.kvmPath, uid); p != -1 {
 		t.Fatalf("released uid %d still reaches KVM (perm %d)", uid, p)
 	}
 }
@@ -159,11 +170,11 @@ func TestSweepStale_RemovesStaleKVMGrants(t *testing.T) {
 	}
 	SweepStale(run, base, [2]uint64{})
 	for _, u := range []uint32{base + 1, base + 63, oldBase + 2} {
-		if p := userACL(t, dev, u); p != -1 {
+		if p := groupACL(t, dev, u); p != -1 {
 			t.Errorf("a stale grant to reserved uid %d survived the sweep (perm %d)", u, p)
 		}
 	}
-	if p := userACL(t, dev, 12345); p != 6 {
+	if p := groupACL(t, dev, 12345); p != 6 {
 		t.Errorf("the sweep touched an entry outside the reserved range: perm %d", p)
 	}
 }
@@ -272,5 +283,121 @@ func TestInitramfs_FwCfgMissingNamesThePackage(t *testing.T) {
 func TestNewLauncher_NetworkNamespaceWhenRoot(t *testing.T) {
 	if got, want := NewLauncher(Config{}).netns(), os.Geteuid() == 0; got != want {
 		t.Fatalf("netns %v for euid %d, want %v", got, os.Geteuid(), want)
+	}
+}
+
+// Lab 2: udev (systemd 255, /dev/kvm tagged uaccess) drops every named-USER
+// ACL entry on /dev/kvm whenever any KVM VM is created or destroyed. The
+// session's grant is a GROUP entry, which that rewrite leaves: simulate the
+// wipe between the grant and the open and the access is still there. The
+// grant never puts a user entry on the device.
+func TestAllocUID_KVMGrantSurvivesTheUdevUserEntryWipe(t *testing.T) {
+	const base = 3_800_000_000
+	l := NewLauncher(Config{UIDBase: base})
+	l.kvmPath = aclDevice(t)
+	uid, rel, err := l.allocUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rel()
+	// What a uaccess change event does: rewrite the ACL without any named user.
+	udevWipeUserEntries(t, l.kvmPath)
+	if p := groupACL(t, l.kvmPath, uid); p != 6 {
+		t.Fatalf("after udev dropped the user entries, slot group %d has ACL perm %d on KVM, want rw", uid, p)
+	}
+	if p := userACL(t, l.kvmPath, uid); p != -1 {
+		t.Fatalf("the grant put a user entry (perm %d) on the device; udev would drop it", p)
+	}
+	if m := modeOf(t, l.kvmPath); m&0o060 != 0o060 {
+		t.Fatalf("mode %o: the mask does not cover the group entry", m)
+	}
+}
+
+// The grant is re-checked immediately before exec: an entry that something
+// removed after allocUID (a flush of every named entry, say) is put back.
+func TestEnsureKVMGrant_RestoresARemovedEntry(t *testing.T) {
+	const base = 3_800_000_000
+	l := NewLauncher(Config{UIDBase: base})
+	l.kvmPath = aclDevice(t)
+	uid, rel, err := l.allocUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rel()
+	if _, err := revokeDeviceACL(l.kvmPath, base, base+UIDSlots); err != nil {
+		t.Fatal(err)
+	}
+	if p := groupACL(t, l.kvmPath, uid); p != -1 {
+		t.Fatalf("setup: entry still there (%d)", p)
+	}
+	if err := l.ensureKVMGrant(&host{perSession: true}, uid); err != nil {
+		t.Fatal(err)
+	}
+	if p := groupACL(t, l.kvmPath, uid); p != 6 {
+		t.Fatalf("after the pre-exec re-check the slot group has ACL perm %d, want rw", p)
+	}
+	// A shared credential has no slot group to grant.
+	if err := (&Launcher{kvmPath: filepath.Join(t.TempDir(), "missing")}).ensureKVMGrant(&host{}, uid); err != nil {
+		t.Fatalf("a shared credential: %v", err)
+	}
+}
+
+// Entries an older daemon granted by user are still removed by revoke and the
+// startup sweep, and one for an id outside the range is left alone.
+func TestRevokeDeviceACL_AlsoRemovesLegacyUserEntries(t *testing.T) {
+	const base = 3_800_000_000
+	dev := aclDevice(t)
+	ents, err := readAccessACL(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ents = append(ents, aclEntry{aclUser, aclRW, base + 2}, aclEntry{aclUser, aclRW, 12345})
+	if err := writeAccessACL(dev, ents); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := revokeDeviceACL(dev, base, base+UIDSlots); err != nil || n != 1 {
+		t.Fatalf("revoke: %d %v, want the one legacy user entry", n, err)
+	}
+	if userACL(t, dev, base+2) != -1 || userACL(t, dev, 12345) != 6 {
+		t.Fatal("legacy entry not removed, or an entry outside the range was")
+	}
+}
+
+// udevWipeUserEntries rewrites path's ACL without any ACL_USER entry, as
+// udev's uaccess handling does on a KVM create/destroy uevent.
+func udevWipeUserEntries(t *testing.T, path string) {
+	t.Helper()
+	ents, err := readAccessACL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []aclEntry
+	for _, e := range ents {
+		if e.tag != aclUser {
+			kept = append(kept, e)
+		}
+	}
+	if err := writeAccessACL(path, kept); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The pre-exec re-check is wired into start, ahead of the exec: a per-session
+// launch (which needs root, so no unit test can run one) re-grants the slot
+// group's /dev/kvm entry immediately before qemu opens the device.
+func TestStart_ChecksTheKVMGrantBeforeExec(t *testing.T) {
+	b, err := os.ReadFile("vm_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	i := strings.Index(src, "func (l *Launcher) start(")
+	if i < 0 {
+		t.Fatal("start not found")
+	}
+	body := src[i:]
+	g, e := strings.Index(body, "l.ensureKVMGrant(h, uid)"), strings.Index(body, "cmd.Start()")
+	if g < 0 || e < 0 || g > e {
+		t.Fatalf("start does not call ensureKVMGrant before cmd.Start (grant at %d, exec at %d)", g, e)
 	}
 }

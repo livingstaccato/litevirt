@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -111,7 +112,7 @@ func TestLab_BackupFileRestore(t *testing.T) {
 		t.Errorf("the restore VM's qemu runs as uid %d (%v), want one of the reserved per-session uids 3800000000..3800000063", uid, uidErr)
 	}
 	// R4-I1: not in kvm (whose 0775 sockets — libvirt's pull-backup export
-	// of a live disk — Landlock does not mediate); KVM is its uid's ACL entry.
+	// of a live disk — Landlock does not mediate); KVM is its slot group's ACL entry.
 	if kvmGid == "" {
 		t.Errorf("no kvm group on %s to check against", host)
 	}
@@ -121,7 +122,10 @@ func TestLab_BackupFileRestore(t *testing.T) {
 		}
 	}
 	if grants[uid] != 6 {
-		t.Errorf("/dev/kvm has no read-write ACL entry for the session's uid %d: %v", uid, grants)
+		t.Errorf("/dev/kvm has no read-write ACL group entry for the session's slot group %d: %v", uid, grants)
+	}
+	if !slices.Contains(groups, strconv.FormatUint(uid, 10)) {
+		t.Errorf("the restore VM's qemu is not in its slot group %d, so it cannot use the /dev/kvm entry: Groups: %v", uid, groups)
 	}
 	// R4-M2: a network namespace of its own.
 	if len(netns) != 2 || netns[0] == netns[1] || !strings.HasPrefix(netns[0], "net:[") {
@@ -498,8 +502,10 @@ func frReservedProcs(l *lab, host string) []string {
 	return procs
 }
 
-// frACLEntries prints the ACL_USER entries ("<uid> <perm>") of /dev/kvm's
-// access ACL, read from the xattr itself.
+// frACLEntries prints the ACL_GROUP entries ("<gid> <perm>") of /dev/kvm's
+// access ACL, read from the xattr itself. Groups, not users: udev drops every
+// named-user entry whenever a KVM VM starts or stops, so a restore VM's slot
+// group (gid == its reserved uid) is what holds its access.
 const frACLEntries = `import os, struct
 try:
     b = os.getxattr("/dev/kvm", "system.posix_acl_access")
@@ -507,7 +513,7 @@ except OSError:
     b = b""
 for i in range(4, len(b) - 7, 8):
     t, p, u = struct.unpack("<HHI", b[i:i + 8])
-    if t == 2:
+    if t == 8:
         print(u, p)
 `
 
@@ -523,7 +529,7 @@ func frPython(script string) string {
 	return "echo " + base64.StdEncoding.EncodeToString([]byte(script)) + " | base64 -d | python3 -"
 }
 
-// frKVMGrants is uid → permission of every named-user ACL entry on /dev/kvm.
+// frKVMGrants is slot gid (== the session's uid) → permission of every named-group ACL entry on /dev/kvm.
 func frKVMGrants(l *lab, host string) map[uint64]int {
 	out := l.mustSSH(host, 30*time.Second, frPython(frACLEntries))
 	g := map[uint64]int{}

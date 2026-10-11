@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // Backup compression and bandwidth limits on a real node, against a real
@@ -126,14 +128,21 @@ func TestLab_BackupCompression_NoneIsTheOldFormat(t *testing.T) {
 // the limit is a floor on the wall time.
 func TestLab_BackupBWLimit_HoldsTheRate(t *testing.T) {
 	l := newLab(t)
-	host, vm, _ := bkStoppedVM(l, "bkbw")
+	host, vm, disk := bkStoppedVM(l, "bkbw")
+	// A stopped cirros VM's disk is a ~256 KiB delta: far too little to time a
+	// limit, which made this test skip vacuously. Put 64 MiB of random data in
+	// the (stopped) VM's disk, so the backup has something to throttle.
+	rnd := fmt.Sprintf("/var/tmp/e2e-bkbw-rand-%d", time.Now().UnixNano())
+	l.onRestore(func() { _, _ = l.ssh(host, time.Minute, "rm -f "+shellQuote(rnd)) })
+	l.mustSSH(host, 2*time.Minute, "head -c 67108864 /dev/urandom > "+shellQuote(rnd)+
+		" && qemu-io -f qcow2 -c 'write -s "+rnd+" 0 64M' "+shellQuote(disk)+" | tail -3")
 	repo := bkRepo(l, host, "e2e-bkbw")
 	const rate = 4 << 20 // 4 MiB/s
 	_, covered, took := bkSnapshot(l, host, vm, repo, "--bwlimit", "4MiB")
 	floor := time.Duration(float64(covered) / rate * float64(time.Second))
 	l.saveEvidence("bkbw", fmt.Sprintf("covered=%d took=%v floor=%v", covered, took, floor))
-	if covered < 8<<20 {
-		t.Skipf("the disk backed up only %d bytes; too little to time a 4 MiB/s limit", covered)
+	if covered < 32<<20 {
+		t.Fatalf("the disk backed up only %d bytes after 64 MiB was written into it; too little to time a 4 MiB/s limit", covered)
 	}
 	if took < floor*9/10 {
 		t.Fatalf("backup of %d bytes at --bwlimit 4MiB took %v, under the %v the limit allows", covered, took, floor)
@@ -145,6 +154,13 @@ func TestLab_BackupBWLimit_HoldsTheRate(t *testing.T) {
 func TestLab_BackupCompression_DefaultIsNoneBeforeTheLatch(t *testing.T) {
 	l := newLab(t)
 	host := labUpHosts(l, 1)[0]
+	// The premise is "before the latch": once release_2026_11_v1 has latched,
+	// zstd is allowed and this test has nothing to assert.
+	for _, ln := range strings.Split(l.mustLV(host, "cluster", "upgrade-status"), "\n") {
+		if f := strings.Fields(ln); len(f) > 0 && f[0] == capabilities.ReleaseToken {
+			t.Skipf("%s has latched; the pre-latch refusal cannot be tested", capabilities.ReleaseToken)
+		}
+	}
 	repo := bkRepo(l, host, "e2e-bkdef")
 	meta := l.mustSSH(host, 30*time.Second, "cat "+shellQuote(repo+"/repo.json"))
 	if strings.Contains(meta, "zstd") || !strings.Contains(meta, `"schema_version": 1`) {

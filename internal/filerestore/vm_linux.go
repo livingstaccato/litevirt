@@ -783,7 +783,8 @@ func profileEnforcedIn(b []byte) bool {
 }
 
 // allocUID takes a free per-session uid: one no session holds and no
-// process runs as, and gives it /dev/kvm by an ACL entry; the returned func
+// process runs as, and gives its slot group (gid == uid) /dev/kvm by an ACL
+// group entry (see kvmacl_linux.go); the returned func
 // takes the entry back and frees the uid. A process left with a released uid
 // (a qemu that escaped its process group and outlived its session) would
 // otherwise share the next session's identity; it is killed, and that uid
@@ -806,7 +807,7 @@ func (l *Launcher) allocUID() (uint32, func(), error) {
 		}
 		uid := l.cfg.UIDBase + uint32(i)
 		if err := grantDeviceACL(l.kvmPath, uid); err != nil {
-			return 0, nil, unavailable("give restore VM uid %d %s (POSIX ACL entry): %v", uid, l.kvmPath, err)
+			return 0, nil, unavailable("give restore VM group %d %s (POSIX ACL group entry): %v", uid, l.kvmPath, err)
 		}
 		l.slots[i] = true
 		return uid, func() {
@@ -1135,8 +1136,25 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 // libvirt's qemu creates them libvirt-qemu:kvm, among them the pull-mode
 // backup's NBD export of a live guest disk — are pathname unix sockets,
 // which Landlock does not mediate.
+//
+// Its supplementary groups are the restore account's and its own slot's
+// reserved gid (equal to its uid), the group /dev/kvm's ACL entry names: a
+// per-user entry would be wiped by udev (kvmacl_linux.go).
 func sessionCredential(h *host, uid uint32) *qemuUser {
-	return &qemuUser{name: fmt.Sprintf("uid %d", uid), uid: uid, gid: h.account.gid, groups: []uint32{h.account.gid}}
+	return &qemuUser{name: fmt.Sprintf("uid %d", uid), uid: uid, gid: h.account.gid, groups: []uint32{h.account.gid, uid}}
+}
+
+// ensureKVMGrant re-establishes the slot group's /dev/kvm entry just before
+// the VM is exec'd, so whatever removed it since allocUID cannot make qemu's
+// open of /dev/kvm fail. A no-op for a shared credential.
+func (l *Launcher) ensureKVMGrant(h *host, uid uint32) error {
+	if !h.perSession {
+		return nil
+	}
+	if err := grantDeviceACL(l.kvmPath, uid); err != nil {
+		return unavailable("give restore VM group %d %s (POSIX ACL group entry): %v", uid, l.kvmPath, err)
+	}
+	return nil
 }
 
 // barrierSummary is what isolates a restore VM, for its audit rows, and
@@ -1319,6 +1337,9 @@ func (l *Launcher) start(s *Session, spec VMSpec, h *host, cred *qemuUser, uid u
 	}
 	cmd, err := qemuCommand(spec, cred, s.dir, vhost, s.console, &limitedBuffer{b: stderr, max: 16 << 10}, trampoline, profile, l.restorePolicy(h, s.dir, spec), l.netns())
 	if err != nil {
+		return err
+	}
+	if err := l.ensureKVMGrant(h, uid); err != nil {
 		return err
 	}
 	if err := cmd.Start(); err != nil {

@@ -248,3 +248,63 @@ func TestFleet_OperatorPromoteAndCoordinatorRecoveryNeverBothStartTheVM(t *testi
 		})
 	}
 }
+
+// Review I2: an operator's promotion whose claim was decided but which failed
+// before the VM started no longer holds the VM's recovery forever. It
+// releases its claim on the way out; b's coordinator, which learns the
+// operator's decision, asks a to abandon it, a signs (its start fence was
+// never recorded), and the coordinator recovers db at the next attempt.
+// Neither host runs db at the end.
+//
+// Mutation "no release and no coordinator path" (releaseOperatorClaim and the
+// supersedeEvidence operator branch removed) — red: the coordinator stands
+// down and db is never recovered.
+func TestFleet_AFailedOperatorPromotionLetsTheCoordinatorRecoverTheVM(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, _ := pbf1Fleet(t, clock, true)
+	cs := c.NewCoordinators(clock)
+	cs.ByNode[b.Name].Promoter = b.Server
+
+	a.Virt.FailStartDomain = func(string) error { return io.ErrUnexpectedEOF }
+	st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
+		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil || err == io.EOF {
+		t.Fatal("the operator's promotion succeeded with StartDomain failing on a")
+	}
+	a.Virt.FailStartDomain = nil
+
+	cs.Tick(ctx, b)
+
+	vm, err := corrosion.GetVM(ctx, b.DB, "db")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM on %s: %v", b.Name, err)
+	}
+	rows, err := b.DB.Query(ctx, `SELECT id, action, dest_host, claim_certificate FROM runtime_action_proofs
+		WHERE target_name = 'db' AND coordinator = ? AND deleted_at IS NULL`, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := false
+	for _, r := range rows {
+		if r.String("claim_certificate") != "" {
+			recovered = true
+		}
+	}
+	if !recovered && !runs(b) {
+		t.Fatalf("b's coordinator did not recover db after a's failed promotion (row %+v, proofs %d)", vm, len(rows))
+	}
+	if runs(a) && runs(b) {
+		t.Fatal("two hosts run db")
+	}
+	if runs(a) {
+		t.Error("a runs db, whose promotion failed")
+	}
+}

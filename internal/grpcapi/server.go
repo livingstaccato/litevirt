@@ -732,6 +732,9 @@ type Server struct {
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// operatorClaimMu makes an operator promotion's start fence and every
+	// abandonment of a proof on this host one decision (promote_serialize.go).
+	operatorClaimMu sync.Mutex
 
 	// Container id ranges (container_security.go): ranges of lxc.IDMapSize
 	// host ids from idmapBase, idmapRanges of them. idmapMu serializes this
@@ -2054,6 +2057,9 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
+	if db != nil {
+		db.SetStartedProofCheck(s.operatorStartRecorded)
+	}
 	return s
 }
 

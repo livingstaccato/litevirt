@@ -2356,8 +2356,11 @@ where it described the mechanism; this list records what changed and why.
       promote to that host whose `coordinator` is `operator@<host>`, never a
       host name, so no coordinator mistakes it for its own decision and asks
       the destination to abandon it on a fallback (`supersedeEvidence`). The
-      claim tries one ballot at round 1 (`MaxRounds` 1, no round reuse), so
-      it never outranks a coordinator that has promised a higher one.
+      claim tries a single ballot at the lowest round (`MaxRounds` 1, no
+      round reuse) and never retries above a higher promise. At an equal
+      round the ballot order's name tie-break can still rank it above a
+      coordinator's round-1 promise; that is safe, since Paxos re-proposes any
+      accepted value and the coordinator retries higher.
     - **Outcomes.** Decided for this promotion, or by an earlier operator
       promotion on the same host that did not start the VM: it goes ahead. A
       majority of voters still reaching the owner: no recovery can be
@@ -2372,6 +2375,17 @@ where it described the mechanism; this list records what changed and why.
     - **The coordinator's side is unchanged.** Its reschedule site already
       defers to a decided value of another action (`noteClaimLost`), and an
       automated promotion refuses a value not its own (`RecoveryClaimLostError`).
+    - **A claim that never starts the VM is released** (review I2). The
+      executing host records a start fence for the value just before
+      `StartDomain`, under one lock with every abandonment on that host:
+      an abandoned value refuses the start, and a started one is never
+      abandoned (`AbandonProof` and the abandonment RPC refuse it). Every
+      failure between the claim and the fence abandons the value, and so
+      does a refused claim (a minority may have accepted it). A coordinator
+      that learns an operator's value asks its host to abandon it, and moves
+      to the next attempt on the signature, from its reschedule site and its
+      automated promotion alike; a host that started the VM refuses, and the
+      value stands. An operator's promotion on another host does the same.
     - **Without claims** (the flag off, or the token not latched — what a
       rolling upgrade waits for, so an older coordinator that writes no claims
       is never on the other side of an enforced one), the operator's promotion

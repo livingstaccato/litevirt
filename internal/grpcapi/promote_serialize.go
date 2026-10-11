@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -36,16 +38,124 @@ import (
 // recovery proof of the VM in flight at its current epoch
 // (refuseWhileRecoveryInFlight): best effort, as a replica can lag.
 
-// operatorClaimPrefix marks a claim value an operator's promotion decided:
-// its Coordinator is "operator@<the host that promoted>". It is never a host
-// name, so no coordinator mistakes it for its own decision — the one it would
-// ask the destination to abandon on a fallback (failover.supersedeEvidence).
-const operatorClaimPrefix = "operator@"
+// operatorClaimPrefix marks a claim value an operator's promotion decided
+// (corrosion.OperatorClaimPrefix): its Coordinator is "operator@<the host that
+// promoted>". It is never a host name, so no coordinator mistakes it for its
+// own decision.
+const operatorClaimPrefix = corrosion.OperatorClaimPrefix
 
 // isOperatorPromoteValue reports whether p is a value an operator's promotion
 // decided.
-func isOperatorPromoteValue(p corrosion.ActionProof) bool {
-	return p.Action == corrosion.ActionPromote && strings.HasPrefix(p.Coordinator, operatorClaimPrefix)
+func isOperatorPromoteValue(p corrosion.ActionProof) bool { return corrosion.IsOperatorPromoteValue(p) }
+
+// operatorClaim is the claim an operator's promotion on this host holds, or
+// may hold (review I2): the key and the proof ID of the value that would
+// start the VM here. Between the claim and the start fence a failure abandons
+// it (releaseOperatorClaim), so the failover coordinator can move past it;
+// once the fence is recorded (fenceOperatorStart) nothing abandons it.
+type operatorClaim struct {
+	Key     corrosion.ClaimKey
+	ProofID string
+}
+
+// operatorStartPath is where this host records that it started an
+// operator's claimed promotion: beside the promote markers, keyed by the
+// value's proof ID. "" for an ID that is not a bare file name.
+func (s *Server) operatorStartPath(id string) string {
+	if id == "" || filepath.Base(id) != id || strings.HasPrefix(id, ".") {
+		return ""
+	}
+	return filepath.Join(s.dataDir, "promote-started", id)
+}
+
+// operatorStartRecorded reports whether this host recorded the start of the
+// operator promotion whose claim value is proofID. An unreadable record fails
+// closed: it may be there.
+func (s *Server) operatorStartRecorded(proofID string) bool {
+	p := s.operatorStartPath(proofID)
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil || !os.IsNotExist(err)
+}
+
+// fenceOperatorStart is the start fence of an operator's claimed promotion,
+// recorded just before StartDomain: under operatorClaimMu, which every
+// abandonment on this host also takes, it refuses if this host has abandoned
+// the claim's value (a coordinator moved past it), and otherwise records the
+// start durably, so the value is never abandoned again. Idempotent.
+func (s *Server) fenceOperatorStart(ctx context.Context, oc *operatorClaim) error {
+	s.operatorClaimMu.Lock()
+	defer s.operatorClaimMu.Unlock()
+	if s.operatorStartRecorded(oc.ProofID) {
+		return nil
+	}
+	abandoned, err := s.db.ProofAbandoned(ctx, oc.ProofID)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "promote: read the abandonment of claim value %s: %v", oc.ProofID, err)
+	}
+	if abandoned {
+		return status.Errorf(codes.FailedPrecondition,
+			"promote refused: this host abandoned the operator's claim %s at %s before the VM started (the failover "+
+				"coordinator moved past it); `lv cluster claim %s/%s` shows the recovery decided since", oc.ProofID, oc.Key,
+			oc.Key.TargetKind, oc.Key.TargetName)
+	}
+	p := s.operatorStartPath(oc.ProofID)
+	if p == "" {
+		return status.Errorf(codes.Internal, "promote: claim value id %q cannot be recorded", oc.ProofID)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return status.Errorf(codes.Internal, "promote: record the start of claim %s: %v", oc.ProofID, err)
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return status.Errorf(codes.Internal, "promote: record the start of claim %s: %v", oc.ProofID, err)
+	}
+	_, werr := f.WriteString(oc.Key.String())
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		_ = os.Remove(p)
+		return status.Errorf(codes.Internal, "promote: record the start of claim %s: %v %v %v", oc.ProofID, werr, serr, cerr)
+	}
+	if d, err := os.Open(filepath.Dir(p)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+// unfenceOperatorStart withdraws the start record of a promotion whose
+// StartDomain failed and whose domain is not running: it never ran, so its
+// claim may be released again.
+func (s *Server) unfenceOperatorStart(oc *operatorClaim) {
+	s.operatorClaimMu.Lock()
+	defer s.operatorClaimMu.Unlock()
+	if p := s.operatorStartPath(oc.ProofID); p != "" {
+		_ = os.Remove(p)
+	}
+}
+
+// releaseOperatorClaim abandons the claim of an operator's promotion that
+// failed before it started the VM, so the failover coordinator can move past
+// it (failover.supersedeEvidence asks this host, which re-signs). A started
+// one is never released.
+func (s *Server) releaseOperatorClaim(ctx context.Context, oc *operatorClaim, why string) {
+	if oc == nil {
+		return
+	}
+	s.operatorClaimMu.Lock()
+	defer s.operatorClaimMu.Unlock()
+	if s.operatorStartRecorded(oc.ProofID) {
+		return
+	}
+	if err := s.db.AbandonProof(ctx, oc.ProofID, oc.Key, "an operator's promotion failed before it started the VM: "+why); err != nil {
+		slog.Warn("promote: could not release the operator's claim; the coordinator asks this host again",
+			"claim", oc.Key.String(), "value", oc.ProofID, "error", err)
+		return
+	}
+	slog.Info("promote: released the operator's claim of a promotion that never started", "claim", oc.Key.String(), "value", oc.ProofID)
 }
 
 // maxOperatorClaimAttempts bounds how many superseded attempts an operator's
@@ -106,7 +216,7 @@ func (s *Server) refuseWhileRecoveryInFlight(ctx context.Context, vm *corrosion.
 // names what to wait for: a recovery decided at this owner epoch, or one in
 // flight (a coordinator holds the voters at a higher ballot; this claim never
 // outranks it).
-func (s *Server) claimOperatorPromote(ctx context.Context, vm *corrosion.VMRecord) error {
+func (s *Server) claimOperatorPromote(ctx context.Context, vm *corrosion.VMRecord) (*operatorClaim, error) {
 	key := s.ClaimKeyFor(ctx, "vm", vm.Name, vm.OwnerEpoch, vm.CreatedAt)
 	proposal := corrosion.ActionProof{
 		ID: randid.New(), Action: corrosion.ActionPromote, TargetKind: "vm", TargetName: vm.Name,
@@ -121,39 +231,53 @@ func (s *Server) claimOperatorPromote(ctx context.Context, vm *corrosion.VMRecor
 			if ownerReachedByMajority(err) {
 				slog.Warn("promote: a majority of voters still reach the VM's owner; no recovery can be certified, "+
 					"so the operator's promotion goes ahead unclaimed", "vm", vm.Name, "owner", vm.HostName, "detail", err)
-				return nil
+				// A minority may have accepted the proposal, and a later
+				// coordinator would learn it: it is fenced at the start like
+				// a decided one, and released on a failure (review I2).
+				return &operatorClaim{Key: key, ProofID: proposal.ID}, nil
 			}
 			s.noteGateRefused(corrosion.ActionPromote, claimRefusalReason(err))
-			return status.Errorf(codes.FailedPrecondition,
+			// A refused accept may still have left the proposal with a
+			// minority, which a later coordinator learns: released at once.
+			s.releaseOperatorClaim(ctx, &operatorClaim{Key: key, ProofID: proposal.ID}, "its claim was refused")
+			return nil, status.Errorf(codes.FailedPrecondition,
 				"promote of %s refused: its recovery claim at owner epoch %d could not be decided (%v). Failover may be "+
 					"recovering it now: wait for that to finish (`lv cluster claim vm/%s` shows each voter's state, "+
 					"`lv inspect %s` where the VM runs), then re-run", vm.Name, vm.OwnerEpoch, err, vm.Name, vm.Name)
 		}
 		if out.Ours {
-			return nil
+			return &operatorClaim{Key: out.Certificate.Key, ProofID: proposal.ID}, nil
 		}
 		if out.Value.Proof == nil {
-			return status.Errorf(codes.FailedPrecondition, "promote of %s refused: its recovery claim at %s decided a value with no proof",
+			return nil, status.Errorf(codes.FailedPrecondition, "promote of %s refused: its recovery claim at %s decided a value with no proof",
 				vm.Name, key)
 		}
 		decided := *out.Value.Proof
 		if isOperatorPromoteValue(decided) && decided.DestHost == s.hostName {
 			// An operator's promotion on this host decided it and did not get
-			// as far as starting the VM: this one completes that decision.
-			return nil
+			// as far as starting the VM: this one completes that decision,
+			// unless this host has since abandoned it (then it is moved past).
+			if abandoned, aerr := s.db.ProofAbandoned(ctx, decided.ID); aerr == nil && !abandoned {
+				return &operatorClaim{Key: out.Certificate.Key, ProofID: decided.ID}, nil
+			}
 		}
 		next := s.operatorSupersedeEvidence(ctx, out, decided)
 		if next == nil {
 			s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
-			return status.Errorf(codes.FailedPrecondition,
-				"promote of %s refused: the cluster has decided its recovery at owner epoch %d: %s to %s by %s (proof %s). "+
-					"Wait for that recovery to finish (`lv inspect %s` shows where the VM runs, `lv cluster claim vm/%s` "+
-					"the decision); promoting it now would start it a second time",
-				vm.Name, vm.OwnerEpoch, decided.Action, decided.DestHost, decided.Coordinator, decided.ID, vm.Name, vm.Name)
+			wait := fmt.Sprintf("Wait for that recovery to finish (`lv inspect %s` shows where the VM runs, `lv cluster claim vm/%s` "+
+				"the decision); promoting it now would start it a second time", vm.Name, vm.Name)
+			if isOperatorPromoteValue(decided) {
+				wait = fmt.Sprintf("It is an operator's promotion on %s, which has started the VM or cannot be asked: re-run the "+
+					"promotion there, or check where the VM runs (`lv inspect %s`); once %s confirms that promotion never "+
+					"started, the failover coordinator or a re-run moves past it", decided.DestHost, vm.Name, decided.DestHost)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"promote of %s refused: the cluster has decided its recovery at owner epoch %d: %s to %s by %s (proof %s). %s",
+				vm.Name, vm.OwnerEpoch, decided.Action, decided.DestHost, decided.Coordinator, decided.ID, wait)
 		}
 		ev = next
 	}
-	return status.Errorf(codes.FailedPrecondition,
+	return nil, status.Errorf(codes.FailedPrecondition,
 		"promote of %s refused: %d attempts of its recovery claim at owner epoch %d were each superseded; `lv cluster claim vm/%s` "+
 			"shows them", vm.Name, maxOperatorClaimAttempts, vm.OwnerEpoch, vm.Name)
 }
@@ -186,6 +310,17 @@ func (s *Server) operatorSupersedeEvidence(ctx context.Context, out claims.Outco
 		}
 		ev.Abandonment = enc
 		return ev
+	}
+	if isOperatorPromoteValue(decided) {
+		// Another host's operator promotion: that host signs an abandonment
+		// only if it never started the VM (its start fence), and records it
+		// so it never will (review I2).
+		enc, err := s.RequestAbandonment(ctx, decided.DestHost, out.Certificate.Key, decided.ID,
+			"an operator's promotion on "+s.hostName+" moves past one that never started")
+		if err == nil {
+			ev.Abandonment = enc
+			return ev
+		}
 	}
 	if h, err := corrosion.GetHost(ctx, s.db, decided.DestHost); err == nil && h == nil && decided.DestHost != "" {
 		return ev

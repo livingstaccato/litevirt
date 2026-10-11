@@ -172,6 +172,12 @@ func (c *Client) AbandonProof(ctx context.Context, proofID string, key ClaimKey,
 		if len(rows) > 0 {
 			return nil
 		}
+		// An operator's claimed promotion has no proof row to read a start
+		// checkpoint from: its start fence is recorded beside the promote
+		// marker, and the server checks it here (review I2).
+		if fn := c.startedProofCheck.Load(); fn != nil && (*fn)(proofID) {
+			return fmt.Errorf("%w: proof %s is an operator's promotion that this node has started", ErrProofExecuted, proofID)
+		}
 		rows, err = tx.Query(ctx, `SELECT action, status, executor_host, step_state FROM runtime_action_proofs
 			WHERE id = ? AND deleted_at IS NULL`, proofID)
 		if err != nil {
@@ -396,6 +402,22 @@ func ProofIsPendingDecisionOf(ctx context.Context, c *Client, key ClaimKey, proo
 		}
 	}
 	return false, nil
+}
+
+// SetStartedProofCheck wires the check of a proof this node started without a
+// proof row (an operator's claimed promotion, grpcapi), which AbandonProof
+// refuses.
+func (c *Client) SetStartedProofCheck(fn func(proofID string) bool) { c.startedProofCheck.Store(&fn) }
+
+// OperatorClaimPrefix marks a recovery-claim value an operator's promotion
+// decided: its Coordinator is "operator@<the host that promotes>", never a
+// host name (docs/design/recovery-claims.md §10 item 43).
+const OperatorClaimPrefix = "operator@"
+
+// IsOperatorPromoteValue reports whether p is a value an operator's
+// promotion decided, for its own destination.
+func IsOperatorPromoteValue(p ActionProof) bool {
+	return p.Action == ActionPromote && p.Coordinator == OperatorClaimPrefix+p.DestHost
 }
 
 // ProofAbandoned reports whether this node abandoned proofID.

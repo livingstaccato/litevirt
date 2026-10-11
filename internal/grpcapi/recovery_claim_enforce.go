@@ -100,10 +100,28 @@ func (s *Server) claimPromote(ctx context.Context, vm *corrosion.VMRecord, p *pb
 		round = uint64(p.GetLeaseTerm())
 	}
 	value := corrosion.ClaimValue{Proof: &proposal, SourceHost: vm.HostName}
-	out, err := s.DecideRecoveryClaim(ctx, key, value, round, nil)
-	if err != nil {
-		s.noteGateRefused(corrosion.ActionPromote, claimRefusalReason(err))
-		return status.Errorf(codes.Unavailable, "promote of %s formed no recovery-claim certificate: %v", vm.Name, err)
+	var out claims.Outcome
+	var ev *corrosion.SupersedeEvidence
+	for attempt := int64(0); ; attempt++ {
+		key.Attempt = attempt
+		o, err := s.DecideRecoveryClaim(ctx, key, value, round, ev)
+		if err != nil {
+			s.noteGateRefused(corrosion.ActionPromote, claimRefusalReason(err))
+			return status.Errorf(codes.Unavailable, "promote of %s formed no recovery-claim certificate: %v", vm.Name, err)
+		}
+		out = o
+		// An operator's promotion decided here that never started the VM
+		// (review I2): its host abandons it, and the claim moves on. Only
+		// operator values: a coordinator's decision is never abandoned from
+		// here.
+		if out.Ours || out.Value.Proof == nil || !isOperatorPromoteValue(*out.Value.Proof) || attempt+1 >= maxOperatorClaimAttempts {
+			break
+		}
+		next := s.operatorSupersedeEvidence(ctx, out, *out.Value.Proof)
+		if next == nil {
+			break
+		}
+		ev = next
 	}
 	cert, err := out.Certificate.Encode()
 	if err != nil {

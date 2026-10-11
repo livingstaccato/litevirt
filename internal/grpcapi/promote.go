@@ -1485,11 +1485,22 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// refuses this promotion instead. Only a takeover of a VM recorded on
 	// another host: no coordinator recovers a VM off a host that is up, and a
 	// voter never certifies the eviction of the host asking.
+	// A claim that never gets as far as starting the VM is released on the
+	// way out (review I2), so the failover coordinator can move past it;
+	// the start fence just before StartDomain makes it unreleasable.
+	var opClaim *operatorClaim
 	if operatorPromote && vm.HostName != "" && vm.HostName != s.hostName && s.RecoveryClaimEnforced(ctx) {
-		if err := s.claimOperatorPromote(ctx, vm); err != nil {
+		oc, err := s.claimOperatorPromote(ctx, vm)
+		if err != nil {
 			removeLive()
 			return err
 		}
+		opClaim = oc
+		defer func() {
+			if retErr != nil {
+				s.releaseOperatorClaim(context.WithoutCancel(ctx), opClaim, retErr.Error())
+			}
+		}()
 	}
 
 	// Define + start — skipped on a resume where the domain was already started by
@@ -1547,11 +1558,24 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			if err := s.writePromoteMarker(targetName, proofID); err != nil {
 				return "marker", err
 			}
+			if opClaim != nil {
+				if err := s.fenceOperatorStart(ctx, opClaim); err != nil {
+					_ = s.virt.UndefineDomain(targetName, false)
+					s.removePromoteMarker(targetName)
+					return "operator claim", err
+				}
+			}
 			if err := s.virt.StartDomain(targetName); err != nil {
 				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 				// Don't leak the marker: we tore the half-built domain down, so a later --force
 				// retry must not treat a same-name stranger as our adopted prior promotion.
 				s.removePromoteMarker(targetName)
+				// Nothing runs: the claim may be released again.
+				if opClaim != nil {
+					if st, serr := s.virt.DomainState(targetName); serr != nil || st != "running" {
+						s.unfenceOperatorStart(opClaim)
+					}
+				}
 				return "start domain", err
 			}
 			return "", nil
@@ -1593,6 +1617,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", proofID, err)
 			case "marker":
 				return status.Errorf(codes.Internal, "record promote marker: %v", err)
+			case "operator claim":
+				return err
 			default:
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}

@@ -260,6 +260,24 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 		ev.Abandonment = ab
 		return ev
 	}
+	// An operator's promotion (docs/design/recovery-claims.md §10 item 43)
+	// whose destination never started the VM: it abandons the value when its
+	// start fence is not recorded — a promotion that failed before the start,
+	// crashed between its claim and its start, or a value a minority accepted
+	// for a claim that was refused — and refuses once it is, so the value
+	// stands while the VM may run there (review I2). An older destination has
+	// no fence and no operator values to abandon.
+	if corrosion.IsOperatorPromoteValue(decided) {
+		ab, err := c.Claimer.RequestAbandonment(ctx, dest, key, decided.ID,
+			"the operator's promotion on "+dest+" never started the VM; the coordinator moves past it")
+		if err != nil {
+			slog.Warn("failover: an operator's decided promotion was not abandoned by its host; it stands", "claim", key.String(),
+				"dest", dest, "proof", decided.ID, "error", err)
+			return nil
+		}
+		ev.Abandonment = ab
+		return ev
+	}
 	// A decided proof that is already spent, at an incarnation-scoped key: it
 	// can never run again, and the legacy-key bridge may have adopted it from
 	// a previous incarnation of the name (§10 item 37). The destination that

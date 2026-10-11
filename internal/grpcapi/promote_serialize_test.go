@@ -23,6 +23,7 @@ func operatorPromoteServer(t *testing.T) (*Server, *corrosion.VMRecord, corrosio
 	t.Helper()
 	s := claimingServer(t)
 	s.virt = libvirtfake.New()
+	s.dataDir = t.TempDir()
 	seedReplicaOfAge(t, s, "db-c", "0 * * * *", 10*time.Minute)
 	// A raw replica the overlay can be built on (seedReplicaOfAge's is a
 	// 7-byte stand-in), newer, so it is the one chosen.
@@ -209,5 +210,77 @@ func TestPromote_AnOperatorsPromotionWaitsForARecoveryInFlight(t *testing.T) {
 				t.Error("the refused promotion defined db")
 			}
 		})
+	}
+}
+
+// decidedAt is the proof ID of the value s's voter accepted at key.
+func decidedAt(t *testing.T, s *Server, key corrosion.ClaimKey) string {
+	t.Helper()
+	st := mustClaimState(t, s, key)
+	if st.Value == nil || st.Value.Proof == nil {
+		t.Fatalf("nothing accepted at %s", key)
+	}
+	return st.Value.Proof.ID
+}
+
+// Review I2: an operator's promotion whose claim was decided but which failed
+// before the VM started releases the claim (this host abandons the value), so
+// a coordinator can move past it; and a re-run here moves past it to the next
+// attempt and starts the VM.
+//
+// Mutation "no release" (releaseOperatorClaim does nothing) — red.
+func TestPromote_AFailedOperatorPromotionReleasesItsClaim(t *testing.T) {
+	s, _, key := operatorPromoteServer(t)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailStartDomain = func(string) error { return errors.New("qemu refused") }
+	if err := operatorPromote(s, "db-c"); err == nil {
+		t.Fatal("the promotion succeeded with StartDomain failing")
+	}
+	id := decidedAt(t, s, key)
+	if abandoned, err := s.db.ProofAbandoned(context.Background(), id); err != nil || !abandoned {
+		t.Fatalf("the failed promotion's claim %s is not released: abandoned=%v err=%v", id, abandoned, err)
+	}
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, id, "a coordinator moves past it"); err != nil {
+		t.Fatalf("this host does not sign the released claim's abandonment: %v", err)
+	}
+	fake.FailStartDomain = nil
+	if err := operatorPromote(s, "db-c"); err != nil {
+		t.Fatalf("re-run after the release: %v", err)
+	}
+	if st, _ := fake.DomainState("db-c"); st != "running" {
+		t.Errorf("db-c = %q, want running", st)
+	}
+}
+
+// Review I2: once an operator's promotion has started the VM its claim value
+// is never abandoned — not by a request (a coordinator moving past it), not
+// by AbandonProof itself — so no later attempt is decided elsewhere while the
+// VM runs here. A value abandoned before the start fence refuses the start.
+//
+// Mutation "no start fence" (fenceOperatorStart records nothing) — red.
+func TestPromote_AStartedOperatorPromotionIsNeverAbandoned(t *testing.T) {
+	s, _, key := operatorPromoteServer(t)
+	s.db.SetStartedProofCheck(s.operatorStartRecorded)
+	if err := operatorPromote(s, "db-c"); err != nil {
+		t.Fatalf("operator promotion: %v", err)
+	}
+	id := decidedAt(t, s, key)
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, id, "x"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("abandonment of a started operator promotion = %v, want FailedPrecondition", err)
+	}
+	if err := s.db.AbandonProof(context.Background(), id, key, "x"); !errors.Is(err, corrosion.ErrProofExecuted) {
+		t.Errorf("AbandonProof of a started operator promotion = %v, want ErrProofExecuted", err)
+	}
+	if abandoned, _ := s.db.ProofAbandoned(context.Background(), id); abandoned {
+		t.Error("the started operator promotion's claim was abandoned")
+	}
+
+	// The other order: abandoned first, then the fence refuses the start.
+	oc := &operatorClaim{Key: key, ProofID: "abandoned-first"}
+	if err := s.db.AbandonProof(context.Background(), oc.ProofID, key, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.fenceOperatorStart(context.Background(), oc); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("start fence over an abandoned claim = %v, want FailedPrecondition", err)
 	}
 }

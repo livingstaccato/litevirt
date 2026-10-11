@@ -709,9 +709,10 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 
 // decideRecoveryClaim is DecideRecoveryClaim with the proposer's ballot
 // budget (maxRounds, 0 for the default) and round reuse made explicit. An
-// operator's promotion (claimOperatorPromote) tries one ballot at round 1 and
-// never outranks a coordinator that has promised a higher one: it waits for
-// that recovery instead of preempting it.
+// operator's promotion (claimOperatorPromote) tries a single ballot at the
+// lowest round and never retries above a higher promise: it waits for a
+// recovery in flight instead of preempting it. (At an equal round the name
+// tie-break may still rank it higher; Paxos keeps that safe.)
 func (s *Server) decideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64,
 	ev *corrosion.SupersedeEvidence, maxRounds int, reuseRound bool) (claims.Outcome, error) {
 	if !key.IsWorkload() {

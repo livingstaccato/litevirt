@@ -963,7 +963,7 @@ func HoldAdvice(vm, diskName string, a Assessment) string {
 		return fmt.Sprintf("The VM ran on its disk without the overlay, so committing it now would write old blocks over newer ones. See the verdict with `%s` (no --confirm); normally the overlay is discarded (--discard, which asks for --accept-torn-disk if a commit had begun).", cmd)
 	}
 	if a.CommitBegan {
-		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, discard the overlay first (`%s --discard --accept-torn-disk --confirm`) and only then put back a backup or replica of the disk — or let `lv backup restore-from --vm %s --disk %s --in-place` do both: it sets the overlay aside, kept, before it writes the disk. Otherwise decide with --force-commit.", cmd, cmd, vm, diskName)
+		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, discard the overlay first (`%s --discard --accept-torn-disk --confirm`) and only then put back a backup or replica of the disk — or let `lv backup restore-from --repo <repo> --vm %s --disk %s --timestamp <timestamp> --in-place` do both (the backup's timestamp from `lv backup repo ls <repo>`): it sets the overlay aside, kept, before it writes the disk. Otherwise decide with --force-commit.", cmd, cmd, vm, diskName)
 	}
 	return fmt.Sprintf("Its writes cannot be verified against the disk. See the verdict and what each action does with `%s` (no --confirm): discarding keeps the disk as it is and loses the overlay's writes; a commit is refused unless forced (--force-commit).", cmd)
 }
@@ -988,14 +988,14 @@ func (a Assessment) Consequences() (commit, discard string) {
 		discard = "deletes the overlay and the guest's writes in it; the disk stays as it was when the overlay was taken (consistent, but older)"
 	case HalfWritten:
 		commit = "finishes the commit that was cut short: the disk then holds every write, and is whole again"
-		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
+		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --repo <repo> --vm <vm> --disk <disk> --timestamp <timestamp> --in-place`, which sets the overlay aside before it writes"
 	case Pivoted:
 		commit = "REFUSED, even with --force-commit (only --overwrite-newer-writes overrides it): the overlay is already in the disk; committing it again writes its old blocks over everything the guest wrote since"
 		discard = "removes the overlay, whose writes are already in the disk: nothing is lost"
 	default:
 		commit = "REFUSED without --force-commit: " + a.Reason + "; a commit could write stale blocks over newer data"
 		if a.CommitBegan {
-			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
+			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --repo <repo> --vm <vm> --disk <disk> --timestamp <timestamp> --in-place`, which sets the overlay aside before it writes"
 		} else {
 			discard = "deletes the overlay and its writes; the disk is used as it is"
 		}

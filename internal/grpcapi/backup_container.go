@@ -1104,7 +1104,15 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// (hostAccessG), taken here on the node that writes the row.
 	var hostAccessG capabilities.FeatureGrant
 	{
-		authorized, stripped, g := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		if herr != nil {
+			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+				slog.Warn("container restore: cleanup after a refused host-access grant also failed", "name", req.Name, "error", delErr)
+			}
+			s.removeRestoreMarker(req.Name)
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (host access: release gate refused; retry)", "error")
+			return herr
+		}
 		hostAccessG = g
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
@@ -1207,7 +1215,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// landed"). On failure, delete the just-imported runtime container so nothing
 	// untracked is left, then error out (before signalling "landed").
 	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
-	if err := s.createRestoredContainerRow(ctx, hostAccessG, rec, ifs); err != nil {
+	if err := s.createRestoredContainerRow(ctx, hostAccessG, !operatorRestore, rec, ifs); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)

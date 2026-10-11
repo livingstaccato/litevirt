@@ -399,36 +399,44 @@ func withoutHostAccess(cs corrosion.ContainerCreateSpec) (corrosion.ContainerCre
 //
 // An operator restore that keeps them writes the feature's data afresh, so it
 // takes the feature's grant on this node (the one that writes the row), and
-// the row must be written with it (createRestoredContainerRow). Before the
-// release token latches it strips them, as main does. A peer move keeps what
-// the source row already holds, and takes none.
-func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string, capabilities.FeatureGrant) {
+// the row is written with it (createRestoredContainerRow). Before the release
+// token latches it strips them, as main does. After the latch a gate refusal
+// (a first use not yet acknowledged, a host rolled back after the latch) is
+// returned as err and the restore refuses, so the admin can retry: what an
+// admin restore keeps is never silently dropped. A peer move keeps what the
+// source row already holds, and takes none.
+func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string, capabilities.FeatureGrant, error) {
 	var none capabilities.FeatureGrant
-	if len(cs.Mounts) == 0 && len(cs.Devices) == 0 {
-		return cs, "", none
+	if !containerSpecSetsHostAccess(cs) {
+		return cs, "", none, nil
 	}
 	if peer {
 		if source != nil && sameHostAccess(cs, corrosion.DecodeCreateSpec(source.CreateSpec)) {
-			return cs, "", none
+			return cs, "", none, nil
 		}
 		out, stripped := withoutHostAccess(cs)
-		return out, stripped, none
+		return out, stripped, none, nil
 	}
 	if RequireRole(ctx, "admin") == nil {
-		if g, ok := s.passthroughGrantIfAvailable(ctx); ok {
-			return cs, "", g
+		g, ok, err := s.passthroughGrantIfLatched(ctx)
+		if err != nil {
+			return cs, "", none, err
+		}
+		if ok {
+			return cs, "", g, nil
 		}
 	}
 	out, stripped := withoutHostAccess(cs)
-	return out, stripped, none
+	return out, stripped, none, nil
 }
 
-// createRestoredContainerRow writes a restored container's row. One that
-// carries host access an operator restore kept (g is the feature's grant) goes
-// through the feature's writer; any other — a peer move keeping its source
-// row's host access, or a container without any — is written as before.
-func (s *Server) createRestoredContainerRow(ctx context.Context, g capabilities.FeatureGrant, rec corrosion.ContainerRecord, ifaces []corrosion.ContainerInterfaceRecord) error {
-	if passthroughGranted(g) {
+// createRestoredContainerRow writes a restored container's row, choosing the
+// writer by what the row carries: host access an operator restore kept goes
+// through the feature's writer with g (refused without the grant); a peer
+// move keeping its source row's host access, or a container without any, is
+// written as before.
+func (s *Server) createRestoredContainerRow(ctx context.Context, g capabilities.FeatureGrant, peer bool, rec corrosion.ContainerRecord, ifaces []corrosion.ContainerInterfaceRecord) error {
+	if !peer && containerSpecSetsHostAccess(corrosion.DecodeCreateSpec(rec.CreateSpec)) {
 		return corrosion.CreateContainerAtomicWithHostAccess(ctx, s.db, g, rec, ifaces)
 	}
 	return corrosion.CreateContainerAtomic(ctx, s.db, rec, ifaces)

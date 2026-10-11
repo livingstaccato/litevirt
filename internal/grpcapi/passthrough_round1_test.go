@@ -132,7 +132,10 @@ func TestAuthorizeRestoredHostAccess(t *testing.T) {
 		if tc.closed {
 			closePassthroughGate(s)
 		}
-		got, stripped, g := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer)
+		got, stripped, g, err := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer)
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+		}
 		kept := len(got.Mounts) == 1 && len(got.Devices) == 1
 		if kept != tc.keep || (stripped == "") != tc.keep {
 			t.Errorf("%s: kept=%v stripped=%q; want kept=%v", tc.name, kept, stripped, tc.keep)

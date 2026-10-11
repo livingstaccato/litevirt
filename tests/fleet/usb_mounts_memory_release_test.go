@@ -3,6 +3,8 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
 )
 
 // seedStoppedVM puts a stopped VM `hv` on owner: spec, a root disk row and a
@@ -78,8 +81,10 @@ func TestFleet_USBMountsMemoryReleaseToken_RefusedThenRecordedBeforeData(t *test
 	old.Server.SetWALQuarantined(func() bool { return true })
 	want := "the cluster upgrade must finish first (usb_mounts_memory needs " + capabilities.ReleaseToken + ")"
 	_, err := c.SelfClient(entry).UpdateVM(ctx, req)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) {
-		t.Fatalf("UpdateVM hot-add with %s on the old build: %v, want FailedPrecondition %q", old.Name, err, want)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) ||
+		!strings.Contains(err.Error(), old.Name) || !strings.HasSuffix(status.Convert(err).Message(), "— see `lv cluster upgrade-status`") {
+		t.Fatalf("UpdateVM hot-add with %s on the old build: %v, want FailedPrecondition %q naming %s and ending with the upgrade-status pointer",
+			old.Name, err, want, old.Name)
 	}
 	for _, n := range c.Nodes {
 		if featureUsedOn(t, n, capabilities.ReleaseToken, feature) {
@@ -155,5 +160,55 @@ func TestFleet_USBMountsMemoryReleaseToken_RefusedThenRecordedBeforeData(t *test
 		if got := hotplugMaxOn(t, n, "hv"); got != 4096 {
 			t.Errorf("%s: hot-add max after the write = %d, want 4096", n.Name, got)
 		}
+	}
+}
+
+// wrongGrantGate opens every feature but hands out another feature's grant, so
+// only a write through a CHECKING writer is refused: it pins the writer choice
+// at a call site whose grant is taken upstream.
+type wrongGrantGate struct{ t testing.TB }
+
+func (g wrongGrantGate) WithFeature(ctx context.Context, _ capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	return write(ctx, capabilities.GrantForTest(g.t, capabilities.FeatureVMLimits))
+}
+
+func (wrongGrantGate) FeatureAvailable(capabilities.Feature) bool { return true }
+
+// An admin's restore that keeps a backup's host mount writes the container row
+// through the feature's checking writer: handed a grant that is not the
+// feature's, the restore is refused and no row lands.
+//
+// Mutation: write the restored row with the plain CreateContainerAtomic in
+// RestoreContainer — the restore succeeds and this goes red.
+func TestFleet_AdminRestoreOfHostAccessGoesThroughTheWriter(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		n.Server.SetReleaseFeatureGate(openReleaseGate{t})
+	}
+	allowed, _ := filepath.EvalSymlinks(t.TempDir())
+	_ = os.MkdirAll(filepath.Join(allowed, "data"), 0o755)
+	lxc.TrustHookBinaryForTest(t)
+	dst.CT.SetHostAccessPolicy(lxc.HostAccess{MountPaths: []string{allowed}, HookBinary: "/opt/litevirt"})
+	createSizedContainer(t, c, src, "ct", "", 0, 256)
+	rec, _ := corrosion.GetContainer(ctx, src.DB, src.Name, "ct")
+	cs := corrosion.DecodeCreateSpec(rec.CreateSpec)
+	cs.Mounts = []corrosion.ContainerHostMount{{HostPath: filepath.Join(allowed, "data"), ContainerPath: "/data"}}
+	rec.CreateSpec = corrosion.EncodeCreateSpec(cs)
+	if err := corrosion.UpsertContainer(ctx, src.DB, *rec); err != nil {
+		t.Fatal(err)
+	}
+	repo, ts := backupContainer(t, c, src, "ct")
+
+	dst.Server.SetReleaseFeatureGate(wrongGrantGate{t})
+	err := restoreContainerAt(t, c, dst, repo, "ct", ts)
+	if err == nil || !strings.Contains(err.Error(), "without a grant") {
+		t.Fatalf("admin restore with another feature's grant = %v; want refused by the writer", err)
+	}
+	if row, _ := corrosion.GetContainer(ctx, dst.DB, dst.Name, "ct"); row != nil {
+		t.Fatalf("a refused restore left a row: %+v", row)
 	}
 }

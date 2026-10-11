@@ -12,10 +12,13 @@ drop them from any spec it rewrites, or place, fail over or recreate the
 workload without them. Once the upgrade finishes they are on, as on Proxmox
 VE. Clearing them is never gated, and a workload without them is unaffected.
 
-The first time any of them is set, the cluster records `usb_mounts_memory` as
-used (`lv cluster upgrade-status` shows it). From then on, rolling a host back
-below this release quarantines it (see upgrades.md, *Rolling back after a
-release token latched*); while it is unused, a rollback does not.
+Once `release_2026_11_v1` has latched, rolling a host back below this
+release quarantines it whether or not this feature was ever used: every build
+below the token predates rollback rules, so `lv cluster upgrade-status` shows
+`BLOCKS ROLLBACK: yes` for it (see upgrades.md, *Rolling back after a release
+token latched*). The first time any of the three is set, the cluster also
+records `usb_mounts_memory` as used (`lv cluster upgrade-status` shows it);
+that record is what a rule-aware build below a later release token reads.
 
 ## USB passthrough (VMs)
 

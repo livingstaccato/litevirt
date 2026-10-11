@@ -5,6 +5,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // USB passthrough, memory hot-add and container host mounts/devices are one
@@ -19,18 +20,15 @@ import (
 // a spec without them is unaffected.
 
 // passthroughFeatureGate is the entry-node check: nil when the release token
-// has durably latched here, else the release gate's own refusal
-// (FailedPrecondition, "the cluster upgrade must finish first
-// (usb_mounts_memory needs release_2026_11_v1)", naming the hosts still to
-// upgrade). It lets a request fail before anything is created or forwarded; it
-// grants nothing. The node that WRITES takes the grant itself
-// (passthroughGrant), so a forwarded request is gated there.
+// has latched, else the release gate's own refusal (FailedPrecondition, "the
+// cluster upgrade must finish first (usb_mounts_memory needs
+// release_2026_11_v1)", the hosts still to upgrade, and the pointer to `lv
+// cluster upgrade-status`). It drives the latch but records and grants nothing
+// (Server.ReleaseFeatureRefusal), so a request that later fails leaves no used
+// record. The node that WRITES takes the grant itself (passthroughGrant), so a
+// forwarded request is gated there.
 func (s *Server) passthroughFeatureGate(ctx context.Context) error {
-	if s.ReleaseFeatureAvailable(capabilities.FeatureUSBMountsMemory) {
-		return nil
-	}
-	return s.WithReleaseFeature(ctx, capabilities.FeatureUSBMountsMemory,
-		func(context.Context, capabilities.FeatureGrant) error { return nil })
+	return s.ReleaseFeatureRefusal(ctx, capabilities.FeatureUSBMountsMemory)
 }
 
 // passthroughGrant runs the feature's gate on THIS node, the one that writes
@@ -44,17 +42,28 @@ func (s *Server) passthroughGrant(ctx context.Context) (capabilities.FeatureGran
 	return g, err
 }
 
-// passthroughGrantIfAvailable is passthroughGrant for a caller that falls back
-// rather than fails (an admin's restore keeps the backup's host access only
-// when it can be written, and otherwise strips it as main does): ok is false,
-// with no error, when the token has not latched here or the gate refuses. It
-// asks no peer unless the token has latched.
-func (s *Server) passthroughGrantIfAvailable(ctx context.Context) (g capabilities.FeatureGrant, ok bool) {
+// passthroughGrantIfLatched is passthroughGrant for a caller that falls back
+// before the release token latches (an admin's restore strips the backup's
+// host access then, as main does): ok is false, with no error, when the token
+// has not latched here, and nothing is asked of any peer. Once it has latched
+// the gate decides, and its refusal (a first use not yet acknowledged, a host
+// rolled back after the latch) is returned unchanged: what the caller asked to
+// keep is never silently dropped after the latch.
+func (s *Server) passthroughGrantIfLatched(ctx context.Context) (g capabilities.FeatureGrant, ok bool, err error) {
 	if !s.ReleaseFeatureAvailable(capabilities.FeatureUSBMountsMemory) {
-		return g, false
+		return g, false, nil
 	}
-	g, err := s.passthroughGrant(ctx)
-	return g, err == nil
+	g, err = s.passthroughGrant(ctx)
+	if err != nil {
+		return g, false, err
+	}
+	return g, true, nil
+}
+
+// containerSpecSetsHostAccess reports whether a container create spec carries
+// the feature's data.
+func containerSpecSetsHostAccess(cs corrosion.ContainerCreateSpec) bool {
+	return len(cs.Mounts) > 0 || len(cs.Devices) > 0
 }
 
 // passthroughGranted reports whether g is the feature's grant.

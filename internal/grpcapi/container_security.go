@@ -302,19 +302,6 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	if s.containerRuntime == nil || !ok {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
-	// Setting host mounts or devices writes the feature's data on THIS node
-	// (the owner), so the feature's gate runs here, before anything is
-	// converted or rendered; the entry check above only failed fast. A clear
-	// takes no grant.
-	var hostAccessG capabilities.FeatureGrant
-	if req.SetHostAccess && (len(req.Mounts) > 0 || len(req.Devices) > 0) {
-		g, gerr := s.passthroughGrant(ctx)
-		if gerr != nil {
-			s.audit(ctx, "ct.convert", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
-			return nil, gerr
-		}
-		hostAccessG = g
-	}
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
 	rec, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
@@ -332,6 +319,20 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 		}
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"container %q must be stopped to convert (lv ct stop %s); it is %s", req.Name, req.Name, got)
+	}
+	// Setting host mounts or devices writes the feature's data on THIS node
+	// (the owner), so the feature's gate runs here, after the cheap local
+	// refusals (no such container, not stopped) and before anything is
+	// converted or rendered; the entry check only failed fast. A clear takes
+	// no grant.
+	var hostAccessG capabilities.FeatureGrant
+	if req.SetHostAccess && (len(req.Mounts) > 0 || len(req.Devices) > 0) {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			s.audit(ctx, "ct.convert", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
+			return nil, gerr
+		}
+		hostAccessG = g
 	}
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	if req.SetHostAccess && !req.Unprivileged && req.Confinement == "" {

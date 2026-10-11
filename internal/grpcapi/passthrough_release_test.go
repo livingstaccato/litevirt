@@ -136,10 +136,13 @@ func TestPassthroughRelease_TheWritingNodeTakesTheGrant(t *testing.T) {
 		t.Error("ConvertContainer applied host access the gate refused")
 	}
 
+	// After the latch an admin's restore never silently drops what it keeps:
+	// the gate's refusal is returned, unchanged, for a retry (m2).
 	cs := corrosion.ContainerCreateSpec{Template: "download", Mounts: []corrosion.ContainerHostMount{{HostPath: "/srv", ContainerPath: "/s"}}}
-	got, stripped, g := ct.authorizeRestoredHostAccess(ctx, cs, nil, false)
-	if len(got.Mounts) != 0 || stripped == "" || passthroughGranted(g) {
-		t.Errorf("admin restore with the grant refused: kept %+v, stripped %q, granted %v; want stripped", got.Mounts, stripped, passthroughGranted(g))
+	_, _, g, err := ct.authorizeRestoredHostAccess(ctx, cs, nil, false)
+	wantReleaseRefusal(t, "admin restore after the latch, grant refused", err)
+	if passthroughGranted(g) {
+		t.Error("a refused admin restore holds the grant")
 	}
 }
 

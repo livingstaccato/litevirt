@@ -157,18 +157,6 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
 		return nil, err
 	}
-	// Host mounts and devices are written by THIS node, so the feature's gate
-	// runs here, before anything is created: the entry check
-	// (containerHostAccessRequest) only fails fast, and a forwarded create is
-	// gated on the owner. A create without them takes no grant.
-	var hostAccessG capabilities.FeatureGrant
-	if len(req.Mounts) > 0 || len(req.Devices) > 0 {
-		g, gerr := s.passthroughGrant(ctx)
-		if gerr != nil {
-			return nil, gerr
-		}
-		hostAccessG = g
-	}
 	if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
 		return nil, err
@@ -200,6 +188,19 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Name, s.hostName)
+	}
+	// Host mounts and devices are written by THIS node, so the feature's gate
+	// runs here, after the cheap local refusals (template, image ownership, a
+	// duplicate name) and before anything is admitted or created: the entry
+	// check (containerHostAccessRequest) only fails fast, and a forwarded
+	// create is gated on the owner. A create without them takes no grant.
+	var hostAccessG capabilities.FeatureGrant
+	if len(req.Mounts) > 0 || len(req.Devices) > 0 {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		hostAccessG = g
 	}
 
 	// Tenancy admission — containers draw down the SAME project vCPU/Mem budget

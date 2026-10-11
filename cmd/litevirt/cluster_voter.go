@@ -50,7 +50,7 @@ force-reconfigure is the audited break-glass (docs/design/recovery-claims.md §4
 against one survivor, which drives the rest.
 
 It refuses, naming what failed, unless every named host is a member that is fenced
-proof-grade (an IPMI power-off or 'lv host fence-confirm'); the members not named are
+proof-grade (an IPMI or Redfish power-off, or 'lv host fence-confirm'); the members not named are
 fewer than a majority (otherwise 'lv cluster voter rm' is the change); this host reaches
 no named host and no majority of the generation; every survivor is reachable and signs;
 and every other host is reachable or fenced proof-grade. It then seals the generation on

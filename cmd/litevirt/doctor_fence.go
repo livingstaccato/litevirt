@@ -25,7 +25,7 @@ func newDoctorFenceCmd() *cobra.Command {
 
 Starting a VM on a second host while the first may still be writing the same
 shared disk corrupts it. litevirt guards that with a proof-grade fence — an
-IPMI-confirmed power-off or an operator 'lv host fence-confirm' — required
+IPMI- or Redfish-confirmed power-off or an operator 'lv host fence-confirm' — required
 before an ownership transfer of a VM with a disk on shared storage
 (nfs/ceph/rbd/iscsi).
 
@@ -205,7 +205,7 @@ func fenceEventAssurance(e *pb.FenceEvent) string {
 
 // printRecentFences lists recent fences with what each one ESTABLISHED.
 //
-// The stored result writes "fenced" for an IPMI power-off that was observed off
+// The stored result writes "fenced" for an IPMI or Redfish power-off that was observed off
 // and for an SSH poweroff nobody checked, so the result column alone shows two
 // identical rows meaning different things. The assurance column is the
 // difference, and an unverified success is called out, because the coordinator
@@ -232,7 +232,7 @@ func printRecentFences(events []*pb.FenceEvent) {
 		fmt.Println("was stopped, and nothing checked the host actually went down. `assumed` means")
 		fmt.Println("not even the request is known to have arrived. The coordinator that ran such a")
 		fmt.Println("fence rescheduled on it. Shared-disk VMs are not affected — their transfer")
-		fmt.Println("needs an IPMI or operator-confirmed fence regardless — but a local-disk VM can")
+		fmt.Println("needs an IPMI, Redfish or operator-confirmed fence regardless — but a local-disk VM can")
 		fmt.Println("have been started elsewhere while the original was still running.")
 		fmt.Println("To stop rescheduling on an unverified fence of a host:")
 		fmt.Println("  lv host label set <host> " + corrosion.LabelFenceRequiresConfirmation + "=true")

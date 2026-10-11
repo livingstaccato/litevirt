@@ -88,30 +88,31 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 
 	return &pb.Host{
-		Name:             h.Name,
-		Address:          h.Address,
-		State:            hostStateToPB(h.State),
-		CpuTotal:         int32(h.CPUTotal),
-		MemTotalMib:      int32(h.MemTotal),
-		DiskTotalGib:     diskTotal,
-		CpuUsed:          cpuUsed,
-		MemUsedMib:       memUsed,
-		DiskUsedGib:      diskUsed,
-		DiskAllocatedGib: diskAllocated,
-		VmCount:          int32(len(vms)),
-		Labels:           h.Labels,
-		Version:          h.Version,
-		StoragePools:     pools,
-		FenceStrategy:    h.FenceStrategy,
-		IpmiAddress:      h.IPMIAddress,
-		RedfishEndpoint:  h.Redfish.Endpoint,
-		RedfishSystemId:  h.Redfish.SystemID,
-		RedfishAuth:      h.Redfish.Auth,
-		WatchdogDev:      h.WatchdogDev,
-		Region:           h.Region,
-		CertSerial:       h.CertSerial,
-		CreatedAt:        parseTimestamp(h.CreatedAt),
-		UpdatedAt:        parseTimestamp(h.UpdatedAt),
+		Name:                h.Name,
+		Address:             h.Address,
+		State:               hostStateToPB(h.State),
+		CpuTotal:            int32(h.CPUTotal),
+		MemTotalMib:         int32(h.MemTotal),
+		DiskTotalGib:        diskTotal,
+		CpuUsed:             cpuUsed,
+		MemUsedMib:          memUsed,
+		DiskUsedGib:         diskUsed,
+		DiskAllocatedGib:    diskAllocated,
+		VmCount:             int32(len(vms)),
+		Labels:              h.Labels,
+		Version:             h.Version,
+		StoragePools:        pools,
+		FenceStrategy:       h.FenceStrategy,
+		IpmiAddress:         h.IPMIAddress,
+		RedfishEndpoint:     h.Redfish.Endpoint,
+		RedfishSystemId:     h.Redfish.SystemID,
+		RedfishAuth:         h.Redfish.Auth,
+		RedfishCaConfigured: h.Redfish.CACert != "",
+		WatchdogDev:         h.WatchdogDev,
+		Region:              h.Region,
+		CertSerial:          h.CertSerial,
+		CreatedAt:           parseTimestamp(h.CreatedAt),
+		UpdatedAt:           parseTimestamp(h.UpdatedAt),
 	}, nil
 }
 
@@ -1246,7 +1247,16 @@ type redfishChange struct {
 // configuration time, rather than discovered by the first fence of an outage.
 func planRedfishChange(h *corrosion.HostRecord, req *pb.ConfigureHostRequest) (redfishChange, error) {
 	named := req.RedfishEndpoint != "" || req.RedfishUser != "" || req.RedfishPass != "" ||
-		req.RedfishSystemId != "" || req.RedfishAuth != "" || req.RedfishCaPem != ""
+		req.RedfishSystemId != "" || req.RedfishAuth != "" || req.RedfishCaPem != "" ||
+		req.ClearRedfishSystemId || req.ClearRedfishCa
+	if req.ClearRedfishSystemId && req.RedfishSystemId != "" {
+		return redfishChange{}, status.Error(codes.InvalidArgument,
+			"clear_redfish_system_id cannot be combined with redfish_system_id")
+	}
+	if req.ClearRedfishCa && req.RedfishCaPem != "" {
+		return redfishChange{}, status.Error(codes.InvalidArgument,
+			"clear_redfish_ca cannot be combined with redfish_ca_pem")
+	}
 	strategy := h.FenceStrategy
 	if req.FenceStrategy != "" {
 		strategy = req.FenceStrategy
@@ -1284,11 +1294,17 @@ func planRedfishChange(h *corrosion.HostRecord, req *pb.ConfigureHostRequest) (r
 		if req.RedfishSystemId != "" {
 			cur.SystemID = req.RedfishSystemId
 		}
+		if req.ClearRedfishSystemId {
+			cur.SystemID = ""
+		}
 		if req.RedfishAuth != "" {
 			cur.Auth = req.RedfishAuth
 		}
 		if req.RedfishCaPem != "" {
 			cur.CACert = req.RedfishCaPem
+		}
+		if req.ClearRedfishCa {
+			cur.CACert = ""
 		}
 		if err := fence.ValidateRedfishConfig(cur); err != nil {
 			return ch, status.Errorf(codes.InvalidArgument, "%v", err)

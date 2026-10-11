@@ -161,8 +161,8 @@ func TestFleet_RedfishFence_ReleaseFeatureGate(t *testing.T) {
 // replicated to x — and dies before it recovers anything. The fence is
 // verified, so it records d 'fenced', the same proof as an IPMI power-off. Seven
 // minutes later its successor a renews it with the recorded method, through the
-// same BMC (the system already reads Off, so a renewal is a verified read, not
-// a second reset), and recovers the VM exactly once on that fresh fence.
+// same BMC (a second ForceOff, as ipmi always sends its power-off, then a read
+// of Off), and recovers the VM exactly once on that fresh fence.
 //
 // Mutation: classify redfish as unverified in fence.Assurance (x's fence
 // records 'offline' and is never renewed: the fixture and wantRefence go red),
@@ -240,6 +240,9 @@ func TestFleet_RedfishFence_SuccessorRenewsThroughTheBMC(t *testing.T) {
 	}
 	if n := refenced.Load(); n != 1 {
 		t.Errorf("a fenced %s %d time(s), want 1 renewal", d.Name, n)
+	}
+	if n := bmc.forceOffs(); n != 2 {
+		t.Errorf("the BMC took %d ForceOff(s) in all, want 2: the renewal sends its own", n)
 	}
 	if decided == nil {
 		t.Fatalf("the successor never recovered %s from x's redfish fence: %+v", vm, vmOn(t, a, vm))

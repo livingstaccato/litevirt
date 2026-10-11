@@ -2919,9 +2919,15 @@ type ConfigureHostRequest struct {
 	RedfishCaPem    string `protobuf:"bytes,19,opt,name=redfish_ca_pem,json=redfishCaPem,proto3" json:"redfish_ca_pem,omitempty"`
 	// Clear the host's Redfish settings. Refused together with any redfish_*
 	// field, and while the host would be left fencing by "redfish".
-	ClearRedfish  bool `protobuf:"varint,20,opt,name=clear_redfish,json=clearRedfish,proto3" json:"clear_redfish,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ClearRedfish bool `protobuf:"varint,20,opt,name=clear_redfish,json=clearRedfish,proto3" json:"clear_redfish,omitempty"`
+	// Unset one Redfish setting, keeping the rest: the system id (back to
+	// "the BMC's only ComputerSystem") or the CA bundle (back to the system
+	// roots). An empty field cannot say this, since it means "leave alone".
+	// Each is refused together with a value for the same setting.
+	ClearRedfishSystemId bool `protobuf:"varint,21,opt,name=clear_redfish_system_id,json=clearRedfishSystemId,proto3" json:"clear_redfish_system_id,omitempty"`
+	ClearRedfishCa       bool `protobuf:"varint,22,opt,name=clear_redfish_ca,json=clearRedfishCa,proto3" json:"clear_redfish_ca,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ConfigureHostRequest) Reset() {
@@ -3090,6 +3096,20 @@ func (x *ConfigureHostRequest) GetRedfishCaPem() string {
 func (x *ConfigureHostRequest) GetClearRedfish() bool {
 	if x != nil {
 		return x.ClearRedfish
+	}
+	return false
+}
+
+func (x *ConfigureHostRequest) GetClearRedfishSystemId() bool {
+	if x != nil {
+		return x.ClearRedfishSystemId
+	}
+	return false
+}
+
+func (x *ConfigureHostRequest) GetClearRedfishCa() bool {
+	if x != nil {
+		return x.ClearRedfishCa
 	}
 	return false
 }
@@ -38974,7 +38994,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\brestored\x18\x04 \x01(\tR\brestored\x12\x1f\n" +
 	"\vrestored_to\x18\x05 \x01(\tR\n" +
 	"restoredTo\x12\x1b\n" +
-	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\x9c\x06\n" +
+	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\xfd\x06\n" +
 	"\x14ConfigureHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
 	"\x0efence_strategy\x18\x02 \x01(\tR\rfenceStrategy\x12!\n" +
@@ -38998,7 +39018,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11redfish_system_id\x18\x11 \x01(\tR\x0fredfishSystemId\x12!\n" +
 	"\fredfish_auth\x18\x12 \x01(\tR\vredfishAuth\x12$\n" +
 	"\x0eredfish_ca_pem\x18\x13 \x01(\tR\fredfishCaPem\x12#\n" +
-	"\rclear_redfish\x18\x14 \x01(\bR\fclearRedfishB\x11\n" +
+	"\rclear_redfish\x18\x14 \x01(\bR\fclearRedfish\x125\n" +
+	"\x17clear_redfish_system_id\x18\x15 \x01(\bR\x14clearRedfishSystemId\x12(\n" +
+	"\x10clear_redfish_ca\x18\x16 \x01(\bR\x0eclearRedfishCaB\x11\n" +
 	"\x0f_cpu_overcommitB\x11\n" +
 	"\x0f_mem_overcommitB\x0e\n" +
 	"\f_cpu_reserveB\x12\n" +

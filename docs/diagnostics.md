@@ -560,7 +560,7 @@ lv doctor fence
 
 Starting a VM on a second host while the first may still be writing the same
 shared disk corrupts it. The guard against that is a **proof-grade fence** — an
-IPMI-confirmed power-off, or an operator `lv host fence-confirm` — required
+IPMI- or Redfish-confirmed power-off, or an operator `lv host fence-confirm` — required
 before an ownership transfer of any VM with a disk on shared storage
 (`nfs`, `ceph`, `rbd`, `iscsi`). Local-disk VMs need no fence: a relocation
 target holds a different image, not the same bytes.

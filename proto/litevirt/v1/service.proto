@@ -263,6 +263,12 @@ message ConfigureHostRequest {
     // Clear the host's Redfish settings. Refused together with any redfish_*
     // field, and while the host would be left fencing by "redfish".
     bool clear_redfish = 20;
+    // Unset one Redfish setting, keeping the rest: the system id (back to
+    // "the BMC's only ComputerSystem") or the CA bundle (back to the system
+    // roots). An empty field cannot say this, since it means "leave alone".
+    // Each is refused together with a value for the same setting.
+    bool clear_redfish_system_id = 21;
+    bool clear_redfish_ca        = 22;
 }
 
 // ── VMs ──

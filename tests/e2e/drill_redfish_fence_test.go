@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +28,10 @@ import (
 //	E2E_REDFISH_ENDPOINT   the BMC's base URL, e.g. https://10.77.0.40:8000
 //	E2E_REDFISH_HOST       the lab node that BMC powers (the victim)
 //	E2E_REDFISH_USER       Redfish user
-//	E2E_REDFISH_PASS       Redfish password
+//	E2E_REDFISH_PASS_FILE  file holding the Redfish password (preferred), or
+//	E2E_REDFISH_PASS       the password itself. Either way it reaches lv on
+//	                       the node through ssh's stdin (--redfish-pass-file -),
+//	                       never through any argv
 //	E2E_REDFISH_SYSTEM_ID  the victim's ComputerSystem Id (needed when the
 //	                       service lists more than one system)
 //	E2E_REDFISH_AUTH       session (default) or basic
@@ -45,7 +49,7 @@ func TestDrill_RedfishFenceRecordsFencedAndRecovers(t *testing.T) {
 	cfg := fence.RedfishConfig{
 		Endpoint: endpoint,
 		User:     os.Getenv("E2E_REDFISH_USER"),
-		Pass:     os.Getenv("E2E_REDFISH_PASS"),
+		Pass:     redfishDrillPass(t),
 		SystemID: os.Getenv("E2E_REDFISH_SYSTEM_ID"),
 		Auth:     os.Getenv("E2E_REDFISH_AUTH"),
 	}
@@ -81,7 +85,7 @@ func TestDrill_RedfishFenceRecordsFencedAndRecovers(t *testing.T) {
 
 	prev := l.fenceStrategy(q, victim)
 	args := []string{"host", "config", victim, "--fence-strategy", "redfish",
-		"--redfish-endpoint", cfg.Endpoint, "--redfish-user", cfg.User, "--redfish-pass", cfg.Pass}
+		"--redfish-endpoint", cfg.Endpoint, "--redfish-user", cfg.User, "--redfish-pass-file", "-"}
 	if cfg.SystemID != "" {
 		args = append(args, "--redfish-system-id", cfg.SystemID)
 	}
@@ -94,7 +98,9 @@ func TestDrill_RedfishFenceRecordsFencedAndRecovers(t *testing.T) {
 			" | base64 -d > "+caPath)
 		args = append(args, "--redfish-ca-file", caPath)
 	}
-	l.mustLV(q, args...)
+	if out, err := l.lvWithStdin(q, cfg.Pass+"\n", args...); err != nil {
+		t.Fatalf("lv host config %s (redfish): %v: %s", victim, err, out)
+	}
 	t.Cleanup(func() {
 		if prev == "" || prev == "redfish" {
 			prev = "best-effort"
@@ -180,4 +186,34 @@ func redfishRows(rows [][]string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// redfishDrillPass is the BMC password from E2E_REDFISH_PASS_FILE or
+// E2E_REDFISH_PASS.
+func redfishDrillPass(t *testing.T) string {
+	t.Helper()
+	if f := os.Getenv("E2E_REDFISH_PASS_FILE"); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("E2E_REDFISH_PASS_FILE: %v", err)
+		}
+		return strings.TrimRight(string(b), "\r\n")
+	}
+	return os.Getenv("E2E_REDFISH_PASS")
+}
+
+// lvWithStdin runs the CLI on host with stdin fed from in, so a secret reaches
+// it without appearing in any argv (ours, ssh's, or the remote shell's).
+func (l *lab) lvWithStdin(host, in string, args ...string) (string, error) {
+	q := []string{shellQuote(l.lvPath)}
+	for _, a := range args {
+		q = append(q, shellQuote(a))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	c := exec.CommandContext(ctx, "ssh", append(l.sshArgs(host), strings.Join(q, " "))...)
+	c.Stdin = strings.NewReader(in)
+	c.WaitDelay = 2 * time.Second
+	out, err := c.CombinedOutput()
+	return string(out), err
 }

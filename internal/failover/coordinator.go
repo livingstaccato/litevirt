@@ -2468,7 +2468,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	if a := corrosion.FenceAssuranceDetail(fr.Method, logResult, fr.Detail); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
 		slog.Warn("failover: this fence was not verified — the host may still be running",
 			"host", h.Name, "method", fr.Method, "assurance", a,
-			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
+			"fix", "give "+h.Name+" an ipmi or redfish fence strategy to make its fences verifiable")
 	}
 
 	// The fence is recorded; confirm this node is still the leader before acting
@@ -2953,7 +2953,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// fence strategy) makes fenceEpoch proof-grade on the next cycle.
 		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
 			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasWritableSharedDisk(disks) {
-				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI fence strategy",
+				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI or Redfish fence strategy",
 					"vm", vm.Name, "old_owner", h.Name)
 				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
 				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)

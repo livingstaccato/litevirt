@@ -633,9 +633,13 @@ lv host config host-b \
   --fence-strategy redfish \
   --redfish-endpoint https://10.0.50.111 \
   --redfish-user admin \
-  --redfish-pass <secret> \
+  --redfish-pass-file /root/bmc-pass \
   --redfish-ca-file /etc/litevirt/bmc-ca.pem
 ```
+
+`--redfish-pass-file` (a path, or `-` for stdin) is the preferred way to give
+the password: `--redfish-pass <secret>` also works, as `--ipmi-pass` does, but
+leaves the password in `ps` and the shell history.
 
 The fence:
 
@@ -646,19 +650,24 @@ The fence:
 2. finds the ComputerSystem in `/redfish/v1/Systems`: the member whose Id is
    `--redfish-system-id`, or the only member when no id is set. A BMC that
    lists several and no id is configured is refused rather than guessed at;
-3. reads its `PowerState`. Unless it already reads `Off`, posts a
-   `ComputerSystem.Reset` with `ResetType` `ForceOff`. A BMC whose reset action
-   does not offer `ForceOff` is refused, never reset with something gentler;
+3. reads it (its body's `Id` must be the configured system id) and always
+   posts a `ComputerSystem.Reset` with `ResetType` `ForceOff`, as `ipmi` always
+   sends its power-off: a `PowerState` read can be stale, so it never stands in
+   for the command. A BMC that refuses the reset (a 4xx) fails the fence,
+   unless the read before it said `Off` — some BMCs refuse a `ForceOff` of a
+   system that is already off. A BMC whose reset action does not offer
+   `ForceOff` is refused, never reset with something gentler;
 4. polls `PowerState` until it reads `Off`, for up to 15 seconds. Only `Off`
    counts: `PoweringOff`, an empty value or an error is not off, and a fence
    that never observes `Off` has failed;
-5. deletes its session.
+5. deletes its session — also when the fence was cut short, on a detached
+   2-second deadline, since some BMCs allow only a handful of sessions.
 
 A fence that succeeded is `verified`, exactly like an IPMI power-off: it
 records the host `fenced`, it satisfies the shared-disk fence gate, a
 successor resumes from it while it is fresh and renews it with a fresh Redfish
-power-off otherwise (a renewal of a host that already reads `Off` is a verified
-read, not a second reset), and a failed one is retried on the backoff below.
+power-off otherwise (a second `ForceOff`, then a read of `Off`), and a failed
+one is retried on the backoff below.
 Its time budget is IPMI's, so the leader's lease floor covers both.
 
 **TLS is always verified**: against the PEM bundle given with
@@ -674,8 +683,11 @@ credentials. Each request is bounded (4 s), and everything up to the reset by
 and CA bundle are one row of `host_fence_redfish`, on the sensitive lane next to
 the IPMI credential, never on the `hosts` row and never in an operator-readable
 state dump. `lv host inspect` shows the endpoint, system id and auth mode,
-never the user, password or CA. An empty `--redfish-*` flag leaves that setting
-alone, so `--redfish-pass` alone rotates the password. `--clear-redfish`
+never the user, password or CA (it says whether a CA bundle is set). An omitted
+`--redfish-*` flag leaves that setting alone, so `--redfish-pass-file` alone
+rotates the password. Two settings can be unset on their own, keeping the
+rest: `--redfish-system-id=""` (back to the BMC's only ComputerSystem) and
+`--clear-redfish-ca` (back to the system roots). `--clear-redfish`
 removes them all; a host that fences by `redfish` needs another strategy in the
 same command:
 

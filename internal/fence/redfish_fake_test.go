@@ -49,6 +49,12 @@ type fakeBMC struct {
 	resetTarget string
 	// redirectTo makes the reset answer 307 to this URL.
 	redirectTo string
+	// stateAfterRefusal: after a refused reset, the system reads this.
+	stateAfterRefusal string
+	// noLocation omits the session's Location header (its body still names it).
+	noLocation bool
+	// bodyID overrides the Id a system's body reports.
+	bodyID map[string]string
 }
 
 func newFakeBMC(t *testing.T, ids ...string) *fakeBMC {
@@ -59,7 +65,7 @@ func newFakeBMC(t *testing.T, ids ...string) *fakeBMC {
 	b := &fakeBMC{
 		t: t, user: "admin", pass: "bmc-s3cret",
 		systems: map[string]string{}, reads: map[string]int{}, offAt: map[string]bool{},
-		tokens: map[string]bool{}, memberRef: map[string]string{},
+		tokens: map[string]bool{}, memberRef: map[string]string{}, bodyID: map[string]string{},
 	}
 	for _, id := range ids {
 		b.systems[id] = "On"
@@ -154,8 +160,13 @@ func (b *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 		b.tokens[tok] = true
 		b.mu.Unlock()
 		w.Header().Set("X-Auth-Token", tok)
-		w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/"+tok)
-		writeJSON(w, 201, map[string]string{"Id": tok})
+		b.mu.Lock()
+		noLoc := b.noLocation
+		b.mu.Unlock()
+		if !noLoc {
+			w.Header().Set("Location", "/redfish/v1/SessionService/Sessions/"+tok)
+		}
+		writeJSON(w, 201, map[string]string{"Id": tok, "@odata.id": "/redfish/v1/SessionService/Sessions/" + tok})
 		return
 	}
 	if !ok {
@@ -222,9 +233,13 @@ func (b *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 		if len(b.allowable) > 0 {
 			reset["ResetType@Redfish.AllowableValues"] = b.allowable
 		}
+		bid := id
+		if o, ok := b.bodyID[id]; ok {
+			bid = o
+		}
 		b.mu.Unlock()
 		writeJSON(w, 200, map[string]any{
-			"@odata.id": "/redfish/v1/Systems/" + id, "Id": id, "PowerState": cur,
+			"@odata.id": "/redfish/v1/Systems/" + id, "Id": bid, "PowerState": cur,
 			"Actions": map[string]any{"#ComputerSystem.Reset": reset},
 		})
 	case r.Method == http.MethodPost && action == "Actions/ComputerSystem.Reset":
@@ -246,6 +261,11 @@ func (b *fakeBMC) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if st != 0 {
+			b.mu.Lock()
+			if b.stateAfterRefusal != "" {
+				b.systems[id] = b.stateAfterRefusal
+			}
+			b.mu.Unlock()
 			w.WriteHeader(st)
 			_, _ = w.Write([]byte(sb))
 			return

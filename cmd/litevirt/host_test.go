@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -86,5 +88,36 @@ func TestHostConfig_RedfishUnhonouredIsAnError(t *testing.T) {
 		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "clear-redfish") {
 			t.Errorf("--clear-redfish with --%s: err = %v, want a flag-conflict error", other, err)
 		}
+	}
+}
+
+// The BMC password can come from a file or stdin, keeping it out of argv.
+func TestReadSecretFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "pw")
+	if err := os.WriteFile(f, []byte("s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readSecretFile(nil, f); err != nil || got != "s3cret" {
+		t.Errorf("file: %q %v", got, err)
+	}
+	if got, err := readSecretFile(strings.NewReader("from-stdin\r\n"), "-"); err != nil || got != "from-stdin" {
+		t.Errorf("stdin: %q %v", got, err)
+	}
+	if _, err := readSecretFile(strings.NewReader("\n"), "-"); err == nil {
+		t.Error("an empty secret was accepted")
+	}
+	for _, pair := range [][]string{{"--redfish-pass", "x", "--redfish-pass-file", f}, {"--clear-redfish-ca", "--redfish-ca-file", f}} {
+		cmd := newHostConfigCmd()
+		cmd.SetArgs(append([]string{"h"}, pair...))
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "none of the others") && !strings.Contains(err.Error(), "if any flags in the group") {
+			t.Errorf("%v: err = %v, want a flag-conflict error", pair, err)
+		}
+	}
+	if err := checkRedfishApplied(&pb.Host{Name: "h", RedfishSystemId: "1"}, &pb.ConfigureHostRequest{ClearRedfishSystemId: true}); err == nil {
+		t.Error("an unhonoured system-id unset must be an error")
+	}
+	if err := checkRedfishApplied(&pb.Host{Name: "h", RedfishCaConfigured: true}, &pb.ConfigureHostRequest{ClearRedfishCa: true}); err == nil {
+		t.Error("an unhonoured CA unset must be an error")
 	}
 }

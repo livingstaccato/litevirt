@@ -206,10 +206,30 @@ func (c *redfishClient) resolve(ref string) (string, error) {
 	return p, nil
 }
 
-// redact removes the password from text taken from a BMC's response.
+// redact removes the password from text taken from a BMC's response: as
+// sent, and in the forms a BMC that echoes it is likely to use — JSON-escaped
+// (the login body is JSON) and percent-encoded.
 func (c *redfishClient) redact(s string) string {
-	if c.cfg.Pass != "" {
-		s = strings.ReplaceAll(s, c.cfg.Pass, "***")
+	pass := c.cfg.Pass
+	if pass == "" {
+		return s
+	}
+	forms := []string{pass, url.QueryEscape(pass), url.PathEscape(pass)}
+	if b, err := json.Marshal(pass); err == nil && len(b) >= 2 {
+		forms = append(forms, string(b[1:len(b)-1]))
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // `&`, `<`, `>` as themselves, as most encoders write them
+	if enc.Encode(pass) == nil {
+		if b := bytes.TrimSpace(buf.Bytes()); len(b) >= 2 {
+			forms = append(forms, string(b[1:len(b)-1]))
+		}
+	}
+	for _, f := range forms {
+		if f != "" {
+			s = strings.ReplaceAll(s, f, "***")
+		}
 	}
 	return s
 }
@@ -323,8 +343,9 @@ func (c *redfishClient) open(ctx context.Context) (string, error) {
 		}
 		sessions = p
 	}
+	var session odataRef
 	resp, err := c.do(ctx, http.MethodPost, sessions,
-		map[string]string{"UserName": c.cfg.User, "Password": c.cfg.Pass}, nil)
+		map[string]string{"UserName": c.cfg.User, "Password": c.cfg.Pass}, &session)
 	if err != nil {
 		return "", fmt.Errorf("session login: %w", err)
 	}
@@ -337,16 +358,27 @@ func (c *redfishClient) open(ctx context.Context) (string, error) {
 			c.session = p
 		}
 	}
+	if c.session == "" && session.ID != "" {
+		// No Location: the session resource names itself.
+		if p, err := c.resolve(session.ID); err == nil {
+			c.session = p
+		}
+	}
 	return systems, nil
 }
 
-// logout deletes the session, if there is one. Best effort: a session the
-// BMC keeps expires on its own.
+// logout deletes the session, if there is one. Best effort, but it runs even
+// when ctx is already cancelled or expired — a fence cut short by the
+// coordinator's lease included — on a detached context bounded by
+// redfishLogoutTimeout: several BMCs cap concurrent sessions at a handful, and
+// sessions left to idle out can lock the next fence out of its login. The
+// coordinator withholds leaseFenceMargin (5 s) from the fence deadline, which
+// covers this.
 func (c *redfishClient) logout(ctx context.Context) {
-	if c.session == "" || c.token == "" || ctx.Err() != nil {
+	if c.session == "" || c.token == "" {
 		return
 	}
-	lctx, cancel := context.WithTimeout(ctx, redfishLogoutTimeout)
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), redfishLogoutTimeout)
 	defer cancel()
 	if _, err := c.do(lctx, http.MethodDelete, c.session, nil, nil); err != nil {
 		slog.Debug("redfish: session logout failed", "endpoint", c.base.Host, "error", err)
@@ -430,8 +462,29 @@ func (c *redfishClient) reset(ctx context.Context, p string, s redfishSystem, re
 				resetType, strings.Join(allowed, ", "))
 		}
 	}
-	if _, err := c.do(ctx, http.MethodPost, target, map[string]string{"ResetType": resetType}, nil); err != nil {
+	resp, err := c.do(ctx, http.MethodPost, target, map[string]string{"ResetType": resetType}, nil)
+	if err != nil {
+		if resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// The BMC answered and said no: a refusal, not a lost request.
+			return &resetRefusedError{fmt.Errorf("reset %s: %w", resetType, err)}
+		}
 		return fmt.Errorf("reset %s: %w", resetType, err)
+	}
+	return nil
+}
+
+// resetRefusedError is a reset the BMC answered with a 4xx.
+type resetRefusedError struct{ err error }
+
+func (e *resetRefusedError) Error() string { return e.err.Error() }
+func (e *resetRefusedError) Unwrap() error { return e.err }
+
+// checkSystemID refuses a system whose body names an Id other than the
+// configured one: a BMC that aliases member URIs must not get a different
+// machine powered off.
+func (c *redfishClient) checkSystemID(s redfishSystem) error {
+	if c.cfg.SystemID != "" && s.ID != c.cfg.SystemID {
+		return fmt.Errorf("the ComputerSystem found for %q names itself %q; not resetting it", c.cfg.SystemID, s.ID)
 	}
 	return nil
 }
@@ -464,7 +517,7 @@ func fenceRedfish(ctx context.Context, h HostConfig) Result {
 		return Result{Method: "redfish", Detail: fmt.Sprintf("%s: %v", detail, err), Success: false}
 	}
 	if !sent {
-		detail += " (already off; not reset)"
+		detail += " (refused: the system already read Off)"
 	}
 
 	// The reset being accepted means the BMC took the request, not that the
@@ -491,10 +544,15 @@ func orUnknown(s string) string {
 	return s
 }
 
-// sendPowerOff opens the conversation, finds the system and, unless it already
-// reads Off, resets it with ForceOff. sent is false for a system that already
-// read Off: a power-off of an off system is a no-op on every BMC that accepts
-// it and an error on some that do not, and either way verification decides.
+// sendPowerOff opens the conversation, finds the system and ALWAYS resets it
+// with ForceOff, as the ipmi strategy always sends chassis power off: a BMC's
+// PowerState can be stale (after a BMC reboot, or a lost link to the power
+// controller), so a read that says Off is never a substitute for the command.
+//
+// sent is false only when the BMC refused the reset AND the read before it
+// said Off: some BMCs refuse a ForceOff of a system that is already off (409),
+// and a successor renewing a verified fence meets exactly that. Any other
+// refusal fails the fence. Either way verification must then observe Off.
 func (c *redfishClient) sendPowerOff(ctx context.Context) (sysPath string, sent bool, err error) {
 	systems, err := c.open(ctx)
 	if err != nil {
@@ -508,10 +566,14 @@ func (c *redfishClient) sendPowerOff(ctx context.Context) (sysPath string, sent 
 	if err != nil {
 		return sysPath, false, fmt.Errorf("read system: %w", err)
 	}
-	if s.PowerState == redfishPowerStateOff {
-		return sysPath, false, nil
+	if err := c.checkSystemID(s); err != nil {
+		return sysPath, false, err
 	}
 	if err := c.reset(ctx, sysPath, s, "ForceOff"); err != nil {
+		var refused *resetRefusedError
+		if errors.As(err, &refused) && s.PowerState == redfishPowerStateOff {
+			return sysPath, false, nil
+		}
 		return sysPath, false, err
 	}
 	return sysPath, true, nil
@@ -601,6 +663,9 @@ func RedfishPowerOn(ctx context.Context, cfg RedfishConfig) error {
 	}
 	s, err := c.system(sctx, p)
 	if err != nil {
+		return err
+	}
+	if err := c.checkSystemID(s); err != nil {
 		return err
 	}
 	return c.reset(sctx, p, s, "On")

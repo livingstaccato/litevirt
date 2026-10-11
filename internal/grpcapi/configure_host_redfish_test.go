@@ -1,9 +1,17 @@
 package grpcapi
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -224,4 +232,64 @@ func TestConfigureHost_RedfishStrategyAloneIsGated(t *testing.T) {
 	if h, _ := corrosion.GetHost(ctx, s.db, "h"); h == nil || h.FenceStrategy != "ssh" {
 		t.Errorf("a refused strategy change was written: %+v", h)
 	}
+}
+
+// The system id and the CA bundle can each be unset on its own (an empty field
+// means "leave alone", so it needs its own flag), keeping every other setting,
+// and the host keeps fencing by redfish throughout.
+func TestConfigureHost_RedfishUnsetOneSetting(t *testing.T) {
+	s := redfishTestServer(t)
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+	ctx := adminCtx()
+	req := redfishRequest()
+	req.RedfishCaPem = testCAPEM(t)
+	out, err := s.ConfigureHost(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.RedfishCaConfigured || out.RedfishSystemId != "node-1" {
+		t.Fatalf("reply = %+v", out)
+	}
+	if out, err = s.ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: "h", ClearRedfishSystemId: true}); err != nil {
+		t.Fatalf("unset system id: %v", err)
+	}
+	h, _ := corrosion.GetHost(ctx, s.db, "h")
+	if h.Redfish.SystemID != "" || h.Redfish.CACert == "" || h.Redfish.Pass != testRedfishPass || h.FenceStrategy != "redfish" {
+		t.Errorf("after unsetting the system id: %s %+v", h.FenceStrategy, h.Redfish)
+	}
+	if out, err = s.ConfigureHost(ctx, &pb.ConfigureHostRequest{Name: "h", ClearRedfishCa: true}); err != nil {
+		t.Fatalf("unset CA: %v", err)
+	}
+	if out.RedfishCaConfigured {
+		t.Error("reply still reports a CA bundle")
+	}
+	h, _ = corrosion.GetHost(ctx, s.db, "h")
+	if h.Redfish.CACert != "" || h.Redfish.Endpoint != "https://10.0.1.1:8000" || h.Redfish.Auth != "basic" || h.Redfish.Pass != testRedfishPass {
+		t.Errorf("after unsetting the CA: %+v", h.Redfish)
+	}
+	for _, bad := range []*pb.ConfigureHostRequest{
+		{Name: "h", ClearRedfishSystemId: true, RedfishSystemId: "x"},
+		{Name: "h", ClearRedfishCa: true, RedfishCaPem: req.RedfishCaPem},
+		{Name: "h", ClearRedfish: true, ClearRedfishCa: true, FenceStrategy: "ssh"},
+	} {
+		if _, err := s.ConfigureHost(ctx, bad); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("%v: got %v, want InvalidArgument", bad, err)
+		}
+	}
+}
+
+// testCAPEM is a PEM certificate for a CA bundle setting.
+func testCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: "bmc-ca"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }

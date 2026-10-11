@@ -7,7 +7,7 @@ import (
 
 // HostProvedOff reports whether the cluster has PROOF that host is powered
 // off: it is recorded 'fenced' AND the newest fence on record for it
-// (FenceRecordProvesOff) is proof-grade — a verified IPMI power-off or an
+// (FenceRecordProvesOff) is proof-grade — a verified IPMI or Redfish power-off or an
 // operator's `lv host fence-confirm`.
 //
 // The state alone is not proof (colonelpanik/litevirt#253). A coordinator

@@ -148,8 +148,11 @@ lv host config <host>                     # Configure host settings
   [--fence-strategy ssh|ipmi|redfish|watchdog|manual|best-effort]
   [--ipmi-address <addr>] [--ipmi-user <u>] [--ipmi-pass <p>]
   [--clear-ipmi]                          # Remove the IPMI address, user and password
-  [--redfish-endpoint https://<bmc>[:port]] [--redfish-user <u>] [--redfish-pass <p>]
-  [--redfish-system-id <id>]              # ComputerSystem Id, when the BMC lists several
+  [--redfish-endpoint https://<bmc>[:port]] [--redfish-user <u>]
+  [--redfish-pass-file <path>|-]          # password from a file or stdin (preferred)
+  [--redfish-pass <p>]                    # password on the command line (visible in ps)
+  [--redfish-system-id <id>]              # ComputerSystem Id, when the BMC lists several; ="" unsets
+  [--clear-redfish-ca]                    # back to the system roots
   [--redfish-auth session|basic]          # default session
   [--redfish-ca-file <pem>]               # CA the BMC certificate must chain to (default: system roots)
   [--clear-redfish]                       # Remove the Redfish settings

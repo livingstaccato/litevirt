@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,22 +75,45 @@ func TestRedfishFence_NeverOffIsAFailure(t *testing.T) {
 	}
 }
 
-// TestRedfishFence_AlreadyOff: a system that already reads Off is not reset
-// (some BMCs refuse a ForceOff of an off system), and is still verified by a
-// read after. A re-fence of a host a verified fence already powered off must
-// succeed, or the successor's recovery strands.
+// TestRedfishFence_AlreadyOff: a ForceOff is ALWAYS sent, as ipmi always
+// sends chassis power off — a PowerState read is never a substitute for the
+// command. A system already Off whose BMC accepts the reset, and one whose BMC
+// refuses a ForceOff of an off system (409), are both verified by a read of
+// Off afterwards. A re-fence of a host a verified fence already powered off
+// must succeed, or the successor's recovery strands.
 func TestRedfishFence_AlreadyOff(t *testing.T) {
+	for _, refuse := range []bool{false, true} {
+		shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
+		b := newFakeBMC(t)
+		b.systems["node-1"] = "Off"
+		if refuse {
+			b.resetStatus = http.StatusConflict
+		}
+		r := Execute(context.Background(), b.host(b.config()))
+		if !r.Success || !r.ProvedOff() {
+			t.Fatalf("refuse=%v: fence of an off system = %+v, want a verified success", refuse, r)
+		}
+		if got := b.resetCalls(); len(got) != 1 || got[0] != "node-1:ForceOff" {
+			t.Errorf("refuse=%v: resets = %v, want the ForceOff sent anyway", refuse, got)
+		}
+	}
+}
+
+// TestRedfishFence_RefusalIsToleratedOnlyWhenAlreadyOff: a refused ForceOff
+// of a system that read On is a failed fence, even when the system reads Off
+// afterwards — nothing the fence did powered it off, and a stale Off is the
+// very reading the command exists to override.
+func TestRedfishFence_RefusalIsToleratedOnlyWhenAlreadyOff(t *testing.T) {
 	shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
 	b := newFakeBMC(t)
-	b.systems["node-1"] = "Off"
-	b.resetStatus = http.StatusConflict // a BMC that refuses ForceOff of an off system
-
+	b.resetStatus = http.StatusConflict
+	b.stateAfterRefusal = "Off"
 	r := Execute(context.Background(), b.host(b.config()))
-	if !r.Success || !r.ProvedOff() {
-		t.Fatalf("fence of an off system = %+v, want a verified success", r)
+	if r.Success || r.ProvedOff() {
+		t.Fatalf("a refused ForceOff of a system that read On fenced: %+v", r)
 	}
-	if got := b.resetCalls(); len(got) != 0 {
-		t.Errorf("resets = %v, want none for a system already off", got)
+	if !strings.Contains(r.Detail, "HTTP 409") {
+		t.Errorf("detail %q does not carry the refusal", r.Detail)
 	}
 }
 
@@ -116,14 +140,18 @@ func TestRedfishFence_ResetRefusedFails(t *testing.T) {
 func TestRedfishFence_PasswordNeverInDetail(t *testing.T) {
 	b := newFakeBMC(t)
 	b.resetStatus = http.StatusBadRequest
-	b.resetBody = `{"error":"rejected for user admin password ` + b.pass + `"}`
+	b.pass = `p"w/d&é 1`
+	b.resetBody = `{"error":"rejected for user admin password ` + b.pass + ` json \"` + strings.ReplaceAll(b.pass, `"`, `\"`) +
+		`\" query ` + url.QueryEscape(b.pass) + ` path ` + url.PathEscape(b.pass) + `"}`
 
 	r := Execute(context.Background(), b.host(b.config()))
 	if r.Success {
 		t.Fatalf("fence succeeded: %+v", r)
 	}
-	if strings.Contains(r.Detail, b.pass) {
-		t.Errorf("detail carries the BMC password: %q", r.Detail)
+	for _, form := range []string{b.pass, strings.ReplaceAll(b.pass, `"`, `\"`), url.QueryEscape(b.pass), url.PathEscape(b.pass)} {
+		if strings.Contains(r.Detail, form) {
+			t.Errorf("detail carries the BMC password as %q: %q", form, r.Detail)
+		}
 	}
 }
 
@@ -322,7 +350,9 @@ func TestRedfishFence_HungBMCIsBounded(t *testing.T) {
 }
 
 // TestRedfishFence_HonoursCancelledContext: the fence runs inside a failover
-// cycle bounded by the lease; a cancelled context ends it.
+// cycle bounded by the lease; a cancelled context ends it — and still logs its
+// session out, on a detached deadline, so BMCs that cap concurrent sessions
+// are not locked out of the next fence.
 func TestRedfishFence_HonoursCancelledContext(t *testing.T) {
 	b := newFakeBMC(t)
 	b.afterOff = []string{"On"}
@@ -334,8 +364,45 @@ func TestRedfishFence_HonoursCancelledContext(t *testing.T) {
 	if r.Success {
 		t.Fatalf("fence = %+v", r)
 	}
-	if took := time.Since(start); took > 2*time.Second {
+	if took := time.Since(start); took > 2*time.Second+redfishLogoutTimeout {
 		t.Errorf("fence ran %v past a 300ms context", took)
+	}
+	if logins, logouts, open := b.sessions(); logins != 1 || logouts != 1 || open != 0 {
+		t.Errorf("a fence cut short left its session: logins=%d logouts=%d open=%d", logins, logouts, open)
+	}
+}
+
+// TestRedfishFence_LogoutWithoutLocation: a BMC that answers the login with no
+// Location header names the session in its body; the fence logs out of it.
+func TestRedfishFence_LogoutWithoutLocation(t *testing.T) {
+	shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
+	b := newFakeBMC(t)
+	b.noLocation = true
+	if r := Execute(context.Background(), b.host(b.config())); !r.Success {
+		t.Fatalf("fence = %+v", r)
+	}
+	if _, logouts, open := b.sessions(); logouts != 1 || open != 0 {
+		t.Errorf("logouts=%d open=%d, want the session deleted", logouts, open)
+	}
+}
+
+// TestRedfishFence_SystemBodyIDMustMatch: the configured system id is checked
+// against the Id the system's own body reports, not only its URI: a BMC that
+// aliases member URIs must not get another machine powered off.
+func TestRedfishFence_SystemBodyIDMustMatch(t *testing.T) {
+	b := newFakeBMC(t, "node-1", "node-2")
+	b.bodyID["node-2"] = "node-1"
+	cfg := b.config()
+	cfg.SystemID = "node-2"
+	r := Execute(context.Background(), b.host(cfg))
+	if r.Success || !strings.Contains(r.Detail, `names itself "node-1"`) {
+		t.Fatalf("fence of an aliased system = %+v, want a refusal", r)
+	}
+	if got := b.resetCalls(); len(got) != 0 {
+		t.Errorf("resets = %v, want none", got)
+	}
+	if err := RedfishPowerOn(context.Background(), cfg); err == nil {
+		t.Error("power on of an aliased system was allowed")
 	}
 }
 

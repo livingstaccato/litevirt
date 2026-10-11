@@ -151,7 +151,7 @@ drive a local `lv`).
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
 | `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
-| `E2E_REDFISH_ENDPOINT` / `E2E_REDFISH_HOST` | (none) | both set: run `TestDrill_RedfishFenceRecordsFencedAndRecovers` against that Redfish BMC, fencing the named node. Also `E2E_REDFISH_USER`, `E2E_REDFISH_PASS`, `E2E_REDFISH_SYSTEM_ID` (the node's ComputerSystem Id when the service lists several), `E2E_REDFISH_AUTH` (`session`/`basic`) and `E2E_REDFISH_CA_FILE` (a PEM on the machine running the test). That machine must reach the endpoint: it reads the power state and powers the node back on through it |
+| `E2E_REDFISH_ENDPOINT` / `E2E_REDFISH_HOST` | (none) | both set: run `TestDrill_RedfishFenceRecordsFencedAndRecovers` against that Redfish BMC, fencing the named node. Also `E2E_REDFISH_USER`, `E2E_REDFISH_PASS_FILE` (preferred) or `E2E_REDFISH_PASS` (the password reaches `lv` through ssh's stdin, never argv), `E2E_REDFISH_SYSTEM_ID` (the node's ComputerSystem Id when the service lists several), `E2E_REDFISH_AUTH` (`session`/`basic`) and `E2E_REDFISH_CA_FILE` (a PEM on the machine running the test). That machine must reach the endpoint: it reads the power state and powers the node back on through it |
 
 ### The drills
 

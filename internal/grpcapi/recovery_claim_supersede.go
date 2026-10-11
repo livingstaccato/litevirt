@@ -388,7 +388,7 @@ func (s *Server) deadRemovalRefusal(ctx context.Context, h *corrosion.HostRecord
 			note = "; " + n
 		}
 		return status.Errorf(codes.FailedPrecondition,
-			"%s has no proof-grade fence (an IPMI power-off, or `lv host fence-confirm %s` once it is powered off)%s; "+
+			"%s has no proof-grade fence (an IPMI or Redfish power-off, or `lv host fence-confirm %s` once it is powered off)%s; "+
 				"--dead removes only a host proven off", h.Name, h.Name, note)
 	}
 	return nil

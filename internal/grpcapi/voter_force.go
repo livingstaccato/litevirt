@@ -180,7 +180,7 @@ func (s *Server) planForcedReconfiguration(ctx context.Context, lostIn []string)
 		}
 		if !ok {
 			return nil, none, nil, nil, status.Errorf(codes.FailedPrecondition,
-				"%s has no proof-grade fence (an IPMI power-off, or `lv host fence-confirm %s` once it is powered off); "+
+				"%s has no proof-grade fence (an IPMI or Redfish power-off, or `lv host fence-confirm %s` once it is powered off); "+
 					"a lost voter must be proven off before its vote is dropped — a lost majority that is merely partitioned "+
 					"could go on certifying under generation %d", l, l, prev.Generation)
 		}

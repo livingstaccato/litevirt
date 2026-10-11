@@ -694,6 +694,9 @@ message Host {
     string                         redfish_endpoint  = 25;
     string                         redfish_system_id = 26;
     string                         redfish_auth      = 27;
+    // Whether a Redfish CA bundle is configured (the bundle itself is not
+    // returned); false means the system roots.
+    bool                           redfish_ca_configured = 28;
 }
 
 message Image {

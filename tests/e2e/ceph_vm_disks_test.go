@@ -234,13 +234,15 @@ func TestLab_CephVMDisks(t *testing.T) {
 		t.Fatalf("the daemon on %s, which owned %s when it was deleted, did not delete %s-root through the trash", owner, vm, vm)
 	}
 
-	// A create that fails AFTER its ceph disk exists removes it. The second
-	// disk names a pool that exists in the cluster — a throwaway dir pool on
-	// dst only — so compose's cluster-wide storage check passes, and CreateVM
-	// on src fails resolving it there (resolveVolume: "… storage pool on host
-	// …") once the ceph disk has been made: compose creates disks in name
-	// order (sortedKeys), "data" before "zz". The daemon log on src proves the
-	// image was created, so the "nothing left" check is not vacuous.
+	// A create that cannot place every disk leaves no ceph image behind. The
+	// second disk names a pool that exists in the cluster — a throwaway dir
+	// pool on dst only — so compose's cluster-wide storage check passes, and
+	// CreateVM on src refuses it there. A build that resolves every disk's
+	// storage before making any disk (the LUN-claim pass) refuses it before
+	// an rbd image exists; one that makes disks in name order ("data" before
+	// "zz") makes the ceph disk first and must remove it. Either way the pool
+	// and its trash hold nothing of the VM; the daemon log says which path
+	// ran, and the test names it.
 	badStack := stack + "-bad"
 	bad := badStack + "-1"
 	elsewhere := "cephnohere-" + strings.TrimPrefix(stack, "e2e-")
@@ -261,13 +263,17 @@ func TestLab_CephVMDisks(t *testing.T) {
 	if err == nil {
 		t.Fatalf("a create with a disk on a pool %s does not have succeeded:\n%s", src, out)
 	}
-	if !strings.Contains(out+err.Error(), "storage pool on host") {
-		t.Fatalf("the create did not fail resolving the second disk on %s (so no ceph disk was made first):\n%v\n%s", src, err, out)
+	if msg := out + err.Error(); !strings.Contains(msg, elsewhere) && !strings.Contains(msg, "storage pool on host") {
+		t.Fatalf("the create did not fail on the second disk's storage %s on %s:\n%v\n%s", elsewhere, src, err, out)
 	}
-	if made := l.journalSince(src, since, "Ceph RBD disk created.*"+bad+"-data"); !strings.Contains(made, bad+"-data") {
-		t.Fatalf("the daemon on %s never created %s-data, so the cleanup was not exercised", src, bad)
+	if made := l.journalSince(src, since, "Ceph RBD disk created.*"+bad+"-data"); strings.Contains(made, bad+"-data") {
+		l.mark("ceph: the failed create made %s-data first; checking it was removed", bad)
+	} else {
+		l.mark("ceph: the failed create was refused before any rbd image of %s existed", bad)
 	}
-	if ls, _ := rbd(src, "ls "+shellQuote(rbdPool)); strings.Contains(ls, bad+"-") {
+	if ls, err := rbd(src, "ls "+shellQuote(rbdPool)); err != nil {
+		t.Fatalf("rbd ls: %v\n%s", err, ls)
+	} else if strings.Contains(ls, bad+"-") {
 		t.Fatalf("the failed create left an image behind:\n%s", ls)
 	}
 	trashEmptyOf(bad + "-")

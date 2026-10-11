@@ -833,6 +833,98 @@ func TestFleet_DoomedLimitUpdateWithRestartNeitherStopsNorRecords(t *testing.T) 
 	}
 }
 
+// R1, every other branch of validateRedefineRequest: max_cpu without live
+// resize, max_cpu below cpu, and a secure_boot or tpm toggle over existing
+// firmware state without --force are refused before the recording gate and
+// before any stop, exactly as the cpu-mode case above. Each is the only check
+// that refuses its request (no copy of it runs later), so a deleted branch
+// would also let the request through.
+//
+// Mutations (one per branch of validateRedefineRequest, each red): drop the
+// live-resize check; drop the max_cpu >= cpu check; drop the secure_boot
+// check; drop the tpm check.
+func TestFleet_DoomedRedefineWithRestartIsRefusedBeforeTheGuestIsTouched(t *testing.T) {
+	cases := []struct {
+		name     string
+		setup    func(t *testing.T, node *Node, spec *pb.VMSpec)
+		req      func(r *pb.UpdateVMRequest)
+		code     codes.Code
+		contains string
+	}{
+		{
+			name: "max_cpu without live resize",
+			req:  func(r *pb.UpdateVMRequest) { m := int32(4); r.MaxCpu = &m },
+			code: codes.FailedPrecondition, contains: liveResizeRefusal,
+		},
+		{
+			name:  "max_cpu below cpu",
+			setup: func(t *testing.T, node *Node, _ *pb.VMSpec) { node.Server.SetLiveResize(true) },
+			req:   func(r *pb.UpdateVMRequest) { m := int32(1); r.MaxCpu = &m },
+			code:  codes.InvalidArgument, contains: "max_cpu (1) must be >= cpu (2)",
+		},
+		{
+			name: "secure_boot over existing NVRAM",
+			setup: func(t *testing.T, node *Node, _ *pb.VMSpec) {
+				p := lv.NvramPath(node.Server.DataDir(), "db")
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte("vars"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			req:  func(r *pb.UpdateVMRequest) { on := true; r.SecureBoot = &on },
+			code: codes.FailedPrecondition, contains: "changing secure_boot on \"db\" with existing firmware state",
+		},
+		{
+			name: "tpm over existing TPM state",
+			setup: func(t *testing.T, _ *Node, spec *pb.VMSpec) {
+				t.Cleanup(lv.SetSwtpmBaseForTest(t.TempDir()))
+				if spec.Uuid == "" {
+					t.Fatal("setup: db has no uuid in its spec")
+				}
+				dir := lv.LibvirtSwtpmDir(spec.Uuid)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "tpm2-00.permall"), []byte("state"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			req:  func(r *pb.UpdateVMRequest) { on := true; r.Tpm = &on },
+			code: codes.FailedPrecondition, contains: "changing tpm on \"db\" with existing TPM state",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			node, client := newLimitsNode(t)
+			ctx := context.Background()
+			deployClean(t, ctx, client, limitlessCompose)
+			waitRunning(t, ctx, node, "db")
+			if tc.setup != nil {
+				tc.setup(t, node, storedSpec(t, ctx, node, "db"))
+			}
+			before := len(node.Virt.EventLog())
+			limit, restart := 2.0, true
+			req := &pb.UpdateVMRequest{Name: "db", CpuLimit: &limit, AllowRestart: &restart}
+			tc.req(req)
+			_, err := client.UpdateVM(ctx, req)
+			if status.Code(err) != tc.code || !strings.Contains(errText(err), tc.contains) {
+				t.Fatalf("err = %v, want %s containing %q", err, tc.code, tc.contains)
+			}
+			for _, e := range node.Virt.EventLog()[before:] {
+				switch e.Op {
+				case "shutdown", "destroy", "start", "define":
+					t.Errorf("a doomed update touched the guest: %s %s", e.Op, e.Note)
+				}
+			}
+			if vmLimitsUsed(t, node) {
+				t.Fatal("a doomed update recorded the vm_limits use")
+			}
+		})
+	}
+}
+
 // The unlatched twin on the restart path: refused by the precheck, guest
 // untouched, nothing recorded.
 func TestFleet_UnlatchedLimitUpdateWithRestartNeverStopsTheGuest(t *testing.T) {

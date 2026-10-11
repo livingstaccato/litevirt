@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // The voter's rules (docs/design/recovery-claims.md §3.5–§3.7, §3.11, §4.4).
@@ -46,6 +48,12 @@ const (
 	// (§10 item 37). Retryable: the coordinator latches the token and claims
 	// at the incarnation-scoped key.
 	RefusalLegacyKeySealed = "recovery_claim_legacy_key_sealed"
+	// RefusalFeatureUnrecorded: a Prepare or Accept at a LUN key at a voter
+	// whose replica does not hold iscsi_lun_claim's used record yet — a voter
+	// added after the first use, before the record reached it. Its LUN state
+	// would be state a rollback below the release could not see it holds,
+	// unquarantined (switch review M-3). Retryable: the record replicates.
+	RefusalFeatureUnrecorded = "recovery_claim_feature_unrecorded"
 )
 
 // ClaimVoterState is one voter's recorded state for a key.
@@ -98,6 +106,9 @@ type voterStanding struct {
 	adopted     int64
 	cfg         *VoterConfig // nil when nothing adopted
 	sealed      bool         // accepted a voter_config value at key `adopted`
+	// lunUsed: this replica holds iscsi_lun_claim's used record (any state,
+	// as ReleaseFeatureUsed counts it). Read only for a LUN key.
+	lunUsed bool
 }
 
 func readStandingTx(ctx context.Context, tx *LocalTx, me string) (voterStanding, error) {
@@ -145,6 +156,27 @@ func readStandingTx(ctx context.Context, tx *LocalTx, me string) (voterStanding,
 		}
 		st.sealed = len(rows) > 0
 	}
+	return st, nil
+}
+
+// readStandingForKeyTx is readStandingTx, plus — for a LUN key — whether this
+// replica holds iscsi_lun_claim's used record, read in the same transaction
+// as the step it admits.
+func readStandingForKeyTx(ctx context.Context, tx *LocalTx, me string, key ClaimKey) (voterStanding, error) {
+	st, err := readStandingTx(ctx, tx, me)
+	if err != nil || !key.IsLUN() {
+		return st, err
+	}
+	token := capabilities.ReleaseToken
+	if info, ok := capabilities.LookupFeature(capabilities.FeatureISCSILUNClaim); ok {
+		token = info.Token
+	}
+	rows, err := tx.Query(ctx, `SELECT 1 AS one FROM cluster_policies WHERE key = ?`,
+		releaseFeatureKey(token, string(capabilities.FeatureISCSILUNClaim)))
+	if err != nil {
+		return st, err
+	}
+	st.lunUsed = len(rows) > 0
 	return st, nil
 }
 
@@ -218,6 +250,14 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 			"votes on recoveries under it; retry once generation %d is adopted", st.me, st.adopted, st.adopted+1)
 	}
 	if key.IsLUN() {
+		if !st.lunUsed {
+			// The first use has every voter acknowledge the used record
+			// before any LUN key is proposed; a voter without it (added since,
+			// and not caught up) would hold LUN state that a rollback below
+			// the release could not see, unquarantined (switch review M-3).
+			return RefusalFeatureUnrecorded, fmt.Sprintf("%s does not hold the %s used record yet, and takes no "+
+				"LUN allocation before it does; retry once it has replicated", st.me, capabilities.FeatureISCSILUNClaim)
+		}
 		if v == nil {
 			return "", ""
 		}
@@ -399,7 +439,7 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		return res, nil
 	}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		st, err := readStandingTx(ctx, tx, c.hostName)
+		st, err := readStandingForKeyTx(ctx, tx, c.hostName, key)
 		if err != nil {
 			return err
 		}
@@ -485,7 +525,7 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	for {
 		res = AcceptResult{Voter: c.hostName}
 		err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-			st, err := readStandingTx(ctx, tx, c.hostName)
+			st, err := readStandingForKeyTx(ctx, tx, c.hostName, key)
 			if err != nil {
 				return err
 			}

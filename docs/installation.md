@@ -239,7 +239,55 @@ single-node install does not require copying daemon certificates out of
   images/                       # base VM images
   disks/                        # VM disk images
   state.db                      # local SQLite state store
+/var/cache/litevirt-restore/    # file restore: restore-VM kernel copy + initramfs (root:litevirt-restore 0750)
+/run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
 ```
+
+### What file restore changes on the host
+
+Single-file restore (`lv backup file-ls` / `file-restore`,
+[backups.md](backups.md#single-file-restore)) is on by default. The daemon must
+run as **root** for it (a non-root daemon refuses it). At start, the daemon:
+
+- **creates a system account `litevirt-restore`** if there is none — its own
+  group, no other group, no home, no login shell. To create it yourself (or
+  in your configuration management) beforehand:
+
+  ```bash
+  useradd --system --user-group --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin litevirt-restore
+  ```
+
+  An existing account of that name is used only if it looks like this — a
+  system uid, a nologin shell, no supplementary group but `kvm` (which
+  earlier builds added), a uid no other account shares — otherwise file
+  restore is refused, naming what differs. Restore VMs do not run as this
+  account: each runs as its own uid from a reserved range
+  (`file_restore.uid_base`, 64 uids from 3800000000, which must belong to no
+  account or group NSS knows and lie outside `/etc/subuid`, `/etc/subgid` and
+  the containers' id-map range), with this account's group and its own slot
+  group (the same number as its uid) only. A starting
+  daemon kills any process left running as one of these uids;
+- **adds and removes POSIX ACL group entries on `/dev/kvm`**: one per restore
+  VM, giving its slot group read-write for as long as the session runs (`getfacl
+  /dev/kvm` shows them). A starting daemon removes any a daemon that died
+  left;
+- **loads an AppArmor profile `litevirt-restore-qemu`** into the kernel where
+  AppArmor is enabled (it stays loaded until reboot; nothing is written under
+  `/etc/apparmor.d`). With AppArmor enabled but `apparmor_parser` not
+  installed, restore VMs run under Landlock alone (a warning says so), or
+  file restore is refused on a kernel without Landlock;
+- **starts each restore qemu in a network namespace of its own** (nothing to
+  configure: it has a loopback interface only, down);
+- **confines each restore qemu with Landlock** where the kernel has it
+  (`landlock` in `/sys/kernel/security/lsm`); nothing is installed for it. A
+  host with neither AppArmor nor Landlock refuses file restore;
+- **creates `/var/cache/litevirt-restore`** for the restore VM's boot files and
+  `/run/litevirt/file-restore` for its sessions, and removes an older build's
+  `/var/lib/litevirt/file-restore/cache`.
+
+None of this happens with `file_restore: {enabled: false}` in the daemon
+config (the start-up sweep of leftover restore VMs still runs).
 
 ## Upgrading
 
@@ -497,4 +545,8 @@ rm -rf /etc/litevirt
 rm -rf /var/lib/litevirt          # remove VM data
 rm -f /etc/udev/rules.d/99-litevirt-pci.rules
 systemctl daemon-reload
+# File restore's host state:
+apparmor_parser -R /dev/stdin <<<'profile litevirt-restore-qemu {}' 2>/dev/null || true  # or reboot
+rm -rf /var/cache/litevirt-restore /run/litevirt/file-restore
+userdel litevirt-restore
 ```

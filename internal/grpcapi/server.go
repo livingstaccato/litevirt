@@ -218,6 +218,14 @@ type Server struct {
 	// unregistered path is admin-only (resolveBackupRepoPath).
 	backupRepos map[string]string
 
+	// backupBW holds the per-repo backup bandwidth limits (daemon config
+	// backup_bwlimits), set via SetBackupBandwidthLimits.
+	backupBW backupBandwidth
+
+	// fileRestore holds single-file restore's restore VM sessions
+	// (file_restore.go), configured via SetFileRestore.
+	fileRestore fileRestoreSessions
+
 	// imageMaxBytes / imagePullTimeout bound image pull+import (disk-fill /
 	// SSRF guards), set from daemon config via SetImageLimits. Zero → the image
 	// package defaults apply. imageBlockedCIDRs is the opt-in URL-pull network

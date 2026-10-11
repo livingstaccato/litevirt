@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
+.PHONY: all build proto lint test test-fleet test-fleet-race test-filerestore-vm test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -62,6 +62,15 @@ test-fleet:
 
 test-fleet-race:
 	go test ./tests/fleet/ -count=1 -race
+
+# test-filerestore-vm boots real single-file-restore VMs
+# (internal/filerestore/vm_boot_linux_test.go). Needs KVM, /dev/vhost-vsock
+# and qemu; as non-root also LITEVIRT_FR_KERNEL, a readable kernel matching
+# /lib/modules/$(uname -r). Run it as root too: that is the configuration
+# where qemu is started as the unprivileged qemu user.
+test-filerestore-vm:
+	CGO_ENABLED=0 go build -o bin/litevirt-fr-agent ./cmd/litevirt
+	LITEVIRT_FR_AGENT=$(CURDIR)/bin/litevirt-fr-agent go test -count=1 -v -run TestRestoreVM ./internal/filerestore/
 
 # Mutation-prove telemetry pass-2 guards (clean tree required). Each case
 # breaks one fix, asserts the pinning test goes red, restores. See

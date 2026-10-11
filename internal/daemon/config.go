@@ -22,6 +22,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -124,6 +125,19 @@ type Config struct {
 	// host backup data leave this empty; the scheduler then quietly
 	// skips any VM whose backup.repo cannot be resolved locally.
 	BackupRepos map[string]string `yaml:"backup_repos,omitempty"`
+
+	// BackupBWLimits caps, per backup repo (by logical name, as in
+	// backup_repos or a compose backup-repos block), how fast this host's
+	// backups into that repo read disks and send chunks: "100MiB", "512K",
+	// or a byte count, per second. One limit is shared by every backup job
+	// this host runs into the repo; a job's own --bwlimit can only lower it.
+	// Absent or 0 = no limit.
+	BackupBWLimits map[string]string `yaml:"backup_bwlimits,omitempty"`
+
+	// FileRestore configures single-file restore from backups, which reads
+	// the backed-up filesystem inside a throwaway restore VM
+	// (docs/design/backup-file-restore.md).
+	FileRestore FileRestoreConfig `yaml:"file_restore"`
 
 	// MaxImageBytes caps a single image pull/import (disk-fill guard);
 	// ImagePullTimeoutSec bounds a pull's total wall time (SSRF/slowloris
@@ -1029,6 +1043,14 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.ACME.validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.FileRestore.validate(cfg.Containers); err != nil {
+		return nil, err
+	}
+
+	// A typo'd bandwidth limit must fail load, not silently run unlimited.
+	if _, err := cfg.BackupBandwidthLimits(); err != nil {
+		return nil, err
+	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
 	// (never silently drop a configured security policy).
@@ -1343,4 +1365,191 @@ func (c ContainersConfig) hostAccess(dataDir, pkiDir string) lxc.HostAccess {
 		Deny:        []string{dataDir, pkiDir},
 		HookBinary:  exe,
 	}
+}
+
+// BackupBandwidthLimits parses backup_bwlimits into bytes per second per repo
+// name. Zero entries are dropped (no limit).
+func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
+	out := make(map[string]int64, len(c.BackupBWLimits))
+	for name, v := range c.BackupBWLimits {
+		bps, err := pbsstore.ParseRate(v)
+		if err != nil {
+			return nil, fmt.Errorf("config backup_bwlimits.%s: %w", name, err)
+		}
+		if bps > 0 {
+			out[name] = bps
+		}
+	}
+	return out, nil
+}
+
+// FileRestoreConfig is the `file_restore:` block. Every field is optional;
+// the defaults boot this host's own kernel.
+type FileRestoreConfig struct {
+	// Enabled turns single-file restore off when false (default on). Off,
+	// the RPCs refuse; a full restore is unaffected either way.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Kernel the restore VM boots (default /boot/vmlinuz-<running release>).
+	Kernel string `yaml:"kernel,omitempty"`
+	// ModulesDir holds that kernel's modules (default
+	// /lib/modules/<running release>).
+	ModulesDir string `yaml:"modules_dir,omitempty"`
+	// QEMU is the system emulator (default: qemu-system-x86_64 /
+	// qemu-system-aarch64 on PATH, or /usr/libexec/qemu-kvm).
+	QEMU string `yaml:"qemu,omitempty"`
+	// MemoryMiB is the restore VM's memory (default 512, minimum 256).
+	MemoryMiB int `yaml:"memory_mib,omitempty"`
+	// RunAs is the restore account (default litevirt-restore, created at
+	// daemon start): a system account whose group reads the restore VM's
+	// boot files. qemu is not started as it: each restore VM runs as its own
+	// uid from uid_base, with that group and its own slot group (KVM by an
+	// ACL group entry on /dev/kvm for the slot group). root, libvirt-qemu, qemu and nobody are refused unless
+	// allow_shared_run_as, which then runs qemu as that user itself.
+	RunAs string `yaml:"run_as,omitempty"`
+	// IdleTimeoutSec kills a browsing session's restore VM after this long
+	// unused (default 300).
+	IdleTimeoutSec int `yaml:"idle_timeout_sec,omitempty"`
+	// MaxSessions caps restore VMs running at once on this host (default 2).
+	MaxSessions int `yaml:"max_sessions,omitempty"`
+	// MaxExtractions caps extractions running at once on this host
+	// (default 1); each also takes a session.
+	MaxExtractions int `yaml:"max_extractions,omitempty"`
+	// AllowUnsandboxed names the restore VM barriers file restore may run
+	// without: a list of seccomp (qemu's seccomp sandbox), mac (both the
+	// AppArmor profile and Landlock: AppArmor on but apparmor_parser missing,
+	// or a host with neither) and root (a non-root daemon) — or true for all
+	// three. DANGEROUS: each removes a barrier between a malicious backup and
+	// the host. Default none: file restore is then refused.
+	AllowUnsandboxed UnsandboxedBarriers `yaml:"allow_unsandboxed,omitempty"`
+	// AllowSharedRunAs permits run_as to be root or a shared qemu user
+	// (libvirt-qemu, qemu, nobody). DANGEROUS. Default false.
+	AllowSharedRunAs bool `yaml:"allow_shared_run_as,omitempty"`
+	// UIDBase is the first of the 64 uids reserved for restore VMs, one per
+	// session (default 3800000000). They must belong to no account.
+	UIDBase uint32 `yaml:"uid_base,omitempty"`
+	// MaxExtractBytes caps one extraction ("16G" default).
+	MaxExtractBytes string `yaml:"max_extract_bytes,omitempty"`
+}
+
+// On reports whether file restore is enabled (default on).
+func (f FileRestoreConfig) On() bool { return f.Enabled == nil || *f.Enabled }
+
+// UnsandboxedBarriers is file_restore.allow_unsandboxed: false, true (every
+// barrier), or a list of the barriers allowed away — seccomp, mac, root — so
+// an operator who needs one does not lift all three.
+type UnsandboxedBarriers struct{ Seccomp, MAC, Root bool }
+
+// UnmarshalYAML accepts a bool or a list of barrier names.
+func (u *UnsandboxedBarriers) UnmarshalYAML(n *yaml.Node) error {
+	const want = "want true, false or a list of seccomp, mac and root"
+	if n.Kind == yaml.ScalarNode {
+		var b bool
+		if err := n.Decode(&b); err != nil {
+			return fmt.Errorf("config file_restore.allow_unsandboxed: %q: %s", n.Value, want)
+		}
+		*u = UnsandboxedBarriers{b, b, b}
+		return nil
+	}
+	var names []string
+	if err := n.Decode(&names); err != nil {
+		return fmt.Errorf("config file_restore.allow_unsandboxed: %s", want)
+	}
+	*u = UnsandboxedBarriers{}
+	for _, name := range names {
+		switch name {
+		case "seccomp":
+			u.Seccomp = true
+		case "mac":
+			u.MAC = true
+		case "root":
+			u.Root = true
+		default:
+			return fmt.Errorf("config file_restore.allow_unsandboxed: unknown barrier %q: %s", name, want)
+		}
+	}
+	return nil
+}
+
+// MarshalYAML writes the list form (false when empty).
+func (u UnsandboxedBarriers) MarshalYAML() (any, error) {
+	if names := u.Names(); len(names) > 0 {
+		return names, nil
+	}
+	return false, nil
+}
+
+// IsZero lets omitempty drop an empty set.
+func (u UnsandboxedBarriers) IsZero() bool { return u == UnsandboxedBarriers{} }
+
+// Names lists the barriers allowed away.
+func (u UnsandboxedBarriers) Names() []string {
+	var out []string
+	if u.Seccomp {
+		out = append(out, "seccomp")
+	}
+	if u.MAC {
+		out = append(out, "mac")
+	}
+	if u.Root {
+		out = append(out, "root")
+	}
+	return out
+}
+
+// ReducedBarrierKeys names the keys set that let a restore VM run with
+// fewer barriers ("allow_unsandboxed: [seccomp]", "allow_shared_run_as");
+// none while file restore is off. The host raises file_restore_unsandboxed
+// while any is set.
+func (f FileRestoreConfig) ReducedBarrierKeys() []string {
+	if !f.On() {
+		return nil
+	}
+	var keys []string
+	if names := f.AllowUnsandboxed.Names(); len(names) > 0 {
+		keys = append(keys, "allow_unsandboxed: ["+strings.Join(names, ", ")+"]")
+	}
+	if f.AllowSharedRunAs {
+		keys = append(keys, "allow_shared_run_as")
+	}
+	return keys
+}
+
+// ContainerIDRange is the host id range unprivileged containers are mapped
+// into, [start, end).
+func (c ContainersConfig) ContainerIDRange() [2]uint64 {
+	if c.IDMapBase <= 0 || c.IDMapRanges <= 0 {
+		return [2]uint64{}
+	}
+	return [2]uint64{uint64(c.IDMapBase), uint64(c.IDMapBase) + uint64(c.IDMapRanges)*65536}
+}
+
+// ExtractLimit is MaxExtractBytes in bytes (0 = the default).
+func (f FileRestoreConfig) ExtractLimit() int64 {
+	n, _ := pbsstore.ParseSize(f.MaxExtractBytes)
+	return n
+}
+
+func (f FileRestoreConfig) validate(containers ContainersConfig) error {
+	if f.MemoryMiB != 0 && f.MemoryMiB < 256 {
+		return fmt.Errorf("config file_restore.memory_mib %d: the restore VM needs at least 256", f.MemoryMiB)
+	}
+	if f.IdleTimeoutSec < 0 || f.MaxSessions < 0 || f.MaxExtractions < 0 {
+		return fmt.Errorf("config file_restore: idle_timeout_sec, max_sessions and max_extractions cannot be negative")
+	}
+	if _, err := pbsstore.ParseSize(f.MaxExtractBytes); err != nil {
+		return fmt.Errorf("config file_restore.max_extract_bytes: %w", err)
+	}
+	if f.UIDBase != 0 && (f.UIDBase < 65536 || uint64(f.UIDBase)+64 > 4294967294) {
+		return fmt.Errorf("config file_restore.uid_base %d: want 65536..%d (64 uids are reserved from it)", f.UIDBase, uint64(4294967294-64))
+	}
+	// Both are this node's config: an explicit uid_base inside the
+	// containers' range is refused here. (With the default base the daemon
+	// starts, and file restore refuses, naming the overlap.)
+	if r := containers.ContainerIDRange(); f.On() && f.UIDBase != 0 && r[1] > r[0] &&
+		uint64(f.UIDBase) < r[1] && r[0] < uint64(f.UIDBase)+64 {
+		return fmt.Errorf("config file_restore.uid_base %d: its 64 uids overlap the containers' id-map range %d..%d "+
+			"(containers.idmap_base + idmap_ranges*65536); a container process would share a restore VM's uid — move one of them",
+			f.UIDBase, r[0], r[1]-1)
+	}
+	return nil
 }

@@ -365,7 +365,7 @@ lv ct rm <name> --force                               # a running container: sto
 lv ct ls
 lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, confinement, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
-lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
+lv ct backup <name> --repo <dir> [--bwlimit <rate>]    # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
 lv ct migrate <name> <target-host> --repo <src-dir>    # cold-migrate (stop → stream → start)
 lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
@@ -901,7 +901,15 @@ lv host ui-cert clear <host>   # back to ACME / the cluster certificate / plain 
 
 ```bash
 # Repository management (host-local)
-lv backup repo init <path> [--encrypted --key-file <file>]
+lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none] [--force]
+#   Default: a local, uncompressed repo, as on every release. zstd (feature
+#   backup_zstd) is explicit, and refused until the cluster's release token
+#   has latched. zstd marks the repo schema 2, which releases
+#   without backup compression refuse to open; --force allows it before the
+#   latch, locally, for a repo no older host reads. Without --force a zstd
+#   repo is created by the connected host's daemon (release feature gate), so
+#   <path> is a path on that host, which the command prints.
+lv backup repo set-compression <path> zstd|none [--force]   # for chunks written from now on; zstd gated as above
 lv backup repo ls <path>
 lv backup repo verify <path>
 lv backup repo gc <path>
@@ -918,11 +926,16 @@ lv backup schedule ls
 lv backup schedule rm [vm] --repo <repo> [--scope vm|pool|project|cluster] [--pool <p>] [--project <p>]
 
 # Push / restore via the daemon
-lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off]
+lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off] [--bwlimit <rate>]
+#   --bwlimit 50MiB: cap this backup's read (and remote send) rate, per second;
+#   the repo's backup_bwlimits limit still applies, and the lower one wins.
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
 lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+# Single files, read inside a throwaway restore VM (never mounted on the host):
+lv backup file-ls --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] [/<volume>/<dir>]
+lv backup file-restore --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] <path>... -o <archive.tar|-> [--max-bytes <size>]
   [--in-place]        # restore over the VM's own disk from its record (VM stopped)
   [--target-path <f>] # admin only; never an existing file but the VM's own disk (then as --in-place). Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \

@@ -2,8 +2,8 @@
 
 litevirt's backup system mirrors Proxmox PBS in shape: a
 content-addressed deduped chunk store, BLAKE3 hashing, dirty-bitmap
-incrementals, AES-256-GCM encryption, mark-and-sweep GC, retention,
-cross-repo sync, and live restore.
+incrementals, zstd compression, AES-256-GCM encryption, mark-and-sweep GC,
+retention, cross-repo sync, bandwidth limits, and live restore.
 
 ## Application consistency (guest fs-freeze)
 
@@ -21,10 +21,11 @@ surface:
 
 | Surface | What |
 |---|---|
-| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync |
+| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync, set-compression |
 | `lv backup snapshot <vm>` | push a VM disk into a repo via the daemon (gRPC) |
 | `lv backup restore-from` | offline restore: stream chunks to a target disk path |
 | `lv backup restore-live` | live restore: serve manifest over NBD while the VM boots against a qcow2 overlay |
+| `lv backup file-ls` / `file-restore` | browse a VM or container backup and extract single files, read inside a throwaway restore VM |
 | `lv backup schedule …` | cron-driven backups, scoped per-VM, per-pool, per-project, or cluster-wide |
 | compose `backup:` block | deploy-time hook that reconciles a `backup_schedules` row from the stack |
 | `/backups` UI page | manifest list per configured repo, plus verify / GC / prune / sync through the daemon's repo RPCs |
@@ -82,9 +83,98 @@ share even a single 4 MiB region (a guest OS image, a database WAL
 segment, untouched filesystem regions) share the chunk file — the
 second snapshot's manifest just references the existing chunk.
 
-Compression is left to the underlying filesystem. Most backup hosts
-already run on ZFS or btrfs with native lz4; layering Go-side
-compression would just contend.
+## Compression
+
+A compressed repo compresses each chunk with zstd before it is written (and before it is sealed, in an encrypted repo). The
+chunk id stays the BLAKE3 of the *uncompressed* bytes, so dedup is unchanged,
+spans compressed and uncompressed repos, and sync and peer streaming still
+move plain chunks — a DR copy can differ in compression from its source. A
+chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
+
+```bash
+lv backup repo init /srv/backup/main                      # local, uncompressed (the default)
+lv backup repo init /srv/backup/main --compression zstd   # compressed, via the daemon (below)
+lv backup repo set-compression /srv/backup/main zstd      # existing repo, via the daemon
+```
+
+**zstd is explicit, and gated on the cluster's upgrade.** A plain `lv backup
+repo init <path>` is exactly what earlier releases did: a local,
+uncompressed repository, created by the CLI with your own rights and no
+daemon. Compression is asked for with `--compression zstd` on `init`, or
+`set-compression <path> zstd` on an existing repo. Until the cluster's
+release token has latched — every host runs a build that reads compressed
+repos — both are refused, naming the release feature `backup_zstd`.
+
+Creating or converting to zstd is done by the **daemon of the host the CLI
+is connected to** (`SetBackupRepoCompression`, below), not by the CLI alone:
+the daemon's release-feature gate records that `backup_zstd` is in use
+before `repo.json` changes. The path is then a path on that host, the repo is
+owned by the daemon, a custom absolute path needs the admin role, and the
+daemon refuses its own data and PKI directories. The CLI prints which host
+created or converted the repo. `--force` skips the daemon and the gate and
+writes the repo locally; nothing records that use, so it is for a repository
+no older host or backup host reads (an air-gapped one). Creating an
+uncompressed repo and turning compression off need no daemon and no feature.
+
+**Older releases refuse a compressed repo.** A compressed repo's `repo.json`
+says `"compression": "zstd"` and `"schema_version": 2`. Every release before
+backup compression opens schema 1 only, so it stops at `repository
+schema-version 2 newer than supported 1` before it reads anything — it never
+misreads a compressed chunk as corrupt, and its GC never touches the repo.
+That marker is permanent: `set-compression <path> none` stops compressing
+new chunks, but compressed chunks are already there, so the repo stays
+schema 2.
+
+So an **existing** repo is never compressed behind your back: it stays
+schema 1 and uncompressed, byte-identical to what earlier releases wrote,
+until `lv backup repo set-compression <path> zstd`. Turning compression on
+rewrites nothing: earlier backups stay as they are and keep restoring, and
+only chunks written from then on are compressed.
+
+A compressed chunk is a 4-byte marker followed by a zstd frame. Guest data
+is arbitrary and may begin with the same bytes, so a chunk is taken as
+compressed only when its decompressed bytes hash to the chunk id; otherwise
+the stored bytes must. Decompression stops at the 4 MiB chunk size, so a
+crafted chunk file in a shared repo cannot make a reader allocate more.
+
+Daemon-internal transfer staging repos are created uncompressed.
+
+## Bandwidth limits
+
+A backup can be rate-limited per job and per target repo:
+
+```bash
+lv backup snapshot postgres-1 --repo main --bwlimit 50MiB
+lv ct backup web --repo main --bwlimit 20MiB
+```
+
+```yaml
+# daemon config, on the host(s) running the backups
+backup_bwlimits:
+  main: 100MiB      # per second; "512K" or a byte count also work
+```
+
+- **Per job** — `--bwlimit` (the `bwlimit_bytes_per_sec` RPC field).
+- **Per target** — `backup_bwlimits:` in the daemon config, by repo name. One
+  limit is shared by every backup job that host runs into that repo, so a
+  scheduled fan-out over twenty VMs moves at the repo's rate in total, not
+  twenty times it. It applies to scheduled backups too, which have no
+  per-job limit of their own.
+
+When both are set, the lower wins. A limit is at least 64 KiB/s (a lower
+one is refused, or raised to it when it arrives over the RPC); a job that is
+cancelled gives back the part of its reservation it did not use, so it does
+not hold up the jobs sharing the repo's limit. A limit covers the bytes read from the
+disk or container (holes, and regions an incremental inherits from its
+parent, are not read and cost nothing) and, for a remote backup, the chunks
+sent to the repo's host. For a remote backup the host you call (the repo's
+host) hands the lower of the job limit and its own `backup_bwlimits` entry
+for the repo to the host that reads the disk. A host on an older release
+ignores the field and backs up unlimited. Restores and replication are not
+rate-limited.
+
+A target limit is enforced per host: two hosts backing up into the same repo
+each get the full limit.
 
 ## Incremental backups
 
@@ -852,6 +942,126 @@ The NBD server is read-only and rejects writes with `EPERM` — guests
 that try to write straight to the backing source get a clear error
 rather than silent corruption. All writes land in the qcow2 overlay.
 
+## Single-file restore
+
+Browse a backup and pull files out of it without restoring the disk:
+
+```bash
+# The backup's volumes: partitions (vda1, vda2, …), the whole disk (vda),
+# or rootfs for a container.
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z /vda1/etc
+
+# Extract as a tar archive (a new file; - for stdout).
+lv backup file-restore --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z \
+    /vda1/etc/postgresql /vda1/home/app/.env -o files.tar
+
+# Containers: --ct, and the volume is rootfs.
+lv backup file-restore --repo main --ct web --timestamp 2026-05-11T03:00:00Z /rootfs/etc/nginx -o nginx.tar
+```
+
+**The host never mounts the backup.** A malformed filesystem is a kernel
+attack surface whatever the mount options, and a backup holds whatever its
+guest wrote. The daemon boots a throwaway **restore VM** instead: this host's
+own kernel and an initramfs whose init is the litevirt binary itself, the
+backup attached read-only as its only disk (served from the repo over a local
+NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
+guest kernel parses the partition table and mounts each filesystem read-only
+inside the VM. Each restore VM's qemu runs as its own uid from a reserved
+range — so two sessions (possibly two tenants) cannot signal, trace or reach
+each other — with only the `litevirt-restore` group and a group of its own slot
+(never `kvm`: KVM is given to that slot group alone by an ACL group entry on
+`/dev/kvm`, checked again just before the VM starts and removed when the
+session ends — a group entry rather than a user one because udev drops every
+named-user entry on `/dev/kvm` whenever any KVM VM starts or stops; the
+reserved range must hold no account or group NSS knows), in a network namespace of its own (no UDP, TCP or abstract
+sockets of the host), its seccomp sandbox on and, where AppArmor is enabled, confined by the
+`litevirt-restore-qemu` profile (its boot files, its session's export socket
+and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
+`/var/lib/litevirt`), and — on every host whose kernel has it — inside a
+**Landlock** ruleset that allows qemu its own binary and libraries, its boot
+files, its session's directory and `/dev/kvm`, and no other file: no VM
+disk (even a world-readable one), nothing under `/var/lib/litevirt` or
+`data_dir`, no writes, and, with Linux 6.7+, no TCP; with 6.12+, no abstract
+sockets and no signals out. Landlock does not cover UDP or `connect()` to a
+pathname unix socket on any kernel: the network namespace takes away the
+first, and the uid's lack of any shared group (DAC) the second. On a host
+without AppArmor and a kernel older than 6.7, TCP is held back by the
+network namespace alone; the audit row's `landlock=` (below 4) shows it,
+but such a VM is not reported as missing a barrier. The reserved uids are checked to be no one
+else's (not the containers' id-map range, `/etc/subuid`/`subgid`, or any
+account NSS knows). Its disk export accepts exactly one connection, from
+that qemu (checked by its socket credentials, process group and, under
+AppArmor, its confinement), and the socket is unlinked the moment qemu has
+it. The daemon must run as root for this; a non-root daemon refuses file
+restore. On a host without AppArmor (SELinux, or no LSM), Landlock is the
+barrier between an escaped qemu and the host's files and network, alongside
+the per-VM uid, the seccomp sandbox and the single-peer export; **a host
+with neither AppArmor nor Landlock refuses file restore** (the uid alone does
+not keep an escaped qemu from world-readable VM disks or the host's
+network). Its kernel copy and
+initramfs are root-owned and read-only to that user
+(`/var/cache/litevirt-restore`), and re-verified against a recorded digest
+before every boot. It dies with the daemon, a restarted daemon kills any it
+left, and the agent inside powers off on its own when no one talks to it.
+The VM's console stays in a small in-memory buffer. Everything the VM
+returns is untrusted: it sends simple records, not tar, and the daemon builds
+the archive itself entry by entry — relative names inside what you selected,
+only directories, regular files and symlinks, nothing under a symlink (also
+compared case-insensitively), no owners, setuid bits or extended attributes,
+bounded sizes, counts and memory — and streams it to you. A symlink is kept
+only when its target is relative, any `..` in it comes first, and it stays
+inside the archive; any other is left out and counted. Nothing is written on
+the daemon's host.
+
+**Extract each archive into a new, empty directory**, and use your tar's
+protections (GNU tar: `tar -xf files.tar --no-overwrite-dir -C <new dir>`).
+Extracting two archives from the same backup into one directory lets a
+symlink from the first meet a path in the second. The architecture,
+limits and threat model are in
+[design/backup-file-restore.md](design/backup-file-restore.md).
+
+- **Permission:** the same as a full restore of that VM or container
+  (`backup.restore` on the backup's project). Every extraction is audited as
+  `backup.file_restore`, with the paths, what was extracted, and what
+  isolated its restore VM (`sandbox=… apparmor=… landlock=… uid=…`). A restore
+  VM started without one of its barriers — browsing included — is also
+  audited as `backup.file_restore_unsandboxed`.
+- **Sessions:** browsing reuses one restore VM per backup, killed after five
+  idle minutes; each extraction runs on a VM of its own, killed when it
+  completes, when you cancel, or at its wall-clock limit (10 minutes, or the
+  byte limit at 1 MiB/s if longer); two VMs and one extraction at a time per
+  host (`file_restore:` in the daemon config tunes all of it).
+- **Filesystems:** ext2/3/4, xfs, btrfs, vfat and iso9660, on a disk or its
+  partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
+  stopped linked clone's disk-file backup (it is only the delta over its base)
+  — restore the disk for those.
+- **Requirements:** KVM (`/dev/kvm` on a filesystem with POSIX ACLs, as
+  devtmpfs is, or world read-write), `/dev/vhost-vsock` (the `vhost_vsock`
+  module), `qemu_fw_cfg` in the kernel's modules (on Ubuntu it is in
+  `linux-modules-extra-$(uname -r)`), a qemu with seccomp support, AppArmor or
+  Landlock (`landlock` in `/sys/kernel/security/lsm`; Ubuntu, Debian 12+,
+  Fedora and RHEL 9+ kernels have it), a root daemon, and a kernel the
+  daemon can read (its own by default). Without them file restore is refused
+  naming what is missing; a full restore keeps working. There is no fallback
+  to mounting on the host. Whether qemu can install its seccomp sandbox is
+  asked of qemu itself before each restore VM starts.
+- **`file_restore.allow_unsandboxed` is dangerous.** It names the barriers a
+  restore VM may run without, one at a time: `seccomp` (qemu's seccomp
+  sandbox), `mac` (any MAC barrier, on a host with neither a loadable
+  AppArmor profile nor Landlock; AppArmor on without `apparmor_parser` but
+  with Landlock runs under Landlock and needs no key), and
+  `root` (a non-root daemon, which runs qemu as itself, the user that owns
+  `data_dir` and its keys) — for example `allow_unsandboxed: [seccomp]`.
+  `true` lifts all three. Each removes a barrier between a malicious backup
+  and the host. Install a qemu with seccomp and `apparmor_parser`, use a
+  kernel with Landlock, and run the daemon as root, instead.
+  **`file_restore.allow_shared_run_as`** separately permits `run_as` to be root
+  or a shared qemu user, which then runs the VM itself — equally dangerous.
+  While either key is set the host carries an informational
+  `file_restore_unsandboxed` health condition
+  ([diagnostics](diagnostics.md#file-restore-without-a-barrier-file_restore_unsandboxed)).
+
 ## Containers
 
 Containers back up to the same chunk store as VM disks:
@@ -1078,7 +1288,7 @@ A custom absolute `repo_path` also requires the **admin** role.
 ### Repo maintenance RPCs
 
 The daemon verifies, garbage-collects, prunes and syncs a repo it holds
-through four RPCs. Each is checked at `/` with its own verb. A repo holds
+through four RPCs (and a fifth for compression, below). Each is checked at `/` with its own verb. A repo holds
 every project's backups, so a project-scoped grant or token cannot reach
 it. Each RPC writes one audit row: the caller, the repo, the outcome, and
 what the operation counted.
@@ -1090,7 +1300,12 @@ what the operation counted.
 | `PruneBackupRepo` | `backup.prune` | `backup.repo.prune` | the `keep_*` policy, `kept`, `deleted` |
 | `SyncBackupRepo` | `backup.sync` | `backup.repo.sync` (target `src -> dst`) | `manifests_copied chunks_copied chunks_skipped bytes_copied` |
 
-All four sit in `backup.*`, which Operator and BackupOperator hold and
+A fifth RPC, `SetBackupRepoCompression` (verb `backup.compression`, audit
+action `backup.repo.compression`; detail `init compression schema`), creates a
+zstd repo or turns zstd on for one, through the release token's `backup_zstd`
+gate. It refuses until the token has latched and records the use first.
+
+All of them sit in `backup.*`, which Operator and BackupOperator hold and
 Viewer's `*.read` does not. Without RBAC bindings the floor is the
 legacy `operator` role.
 

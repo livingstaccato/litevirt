@@ -230,8 +230,7 @@ func f() {
 // not: the branch that adds its Writers deletes it from here in the same
 // change, after which the feature must list them.
 var writersPending = map[Feature]bool{
-	"backup_zstd": true, "firewall_ipv6": true,
-	"nic_guards": true, "pit_overlay": true,
+	"firewall_ipv6": true, "nic_guards": true, "pit_overlay": true,
 }
 
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {

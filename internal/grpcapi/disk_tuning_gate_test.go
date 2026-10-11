@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -397,5 +398,39 @@ func TestIOGrant_TakenByTheNodeThatWritesTuning(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("SetDiskIO clear took %d grants, want 0", n)
+	}
+}
+
+// m2: a compose file that sets no tuning never asks the gate (a plain deploy
+// mid-roll pings nobody); one that does asks it once and is refused with the
+// VM's name. CreateVM runs the entry check only after the permission check.
+//
+// Mutations: call the gate before the scan — the plain-file case goes red; run
+// the entry check before RequirePerm in CreateVM — the permission case goes red.
+func TestRefuseUnlatchedStack_PlainFileNeverAsksTheGate(t *testing.T) {
+	var n int
+	r := &refuserGate{ioGate: ioGate{t: t, on: false, grants: &n}}
+	s := testServer(t)
+	s.SetReleaseFeatureGate(r)
+	plain := &compose.File{VMs: map[string]compose.VMDef{"a": {Disks: map[string]compose.DiskDef{"root": {}}}}}
+	if err := s.refuseUnlatchedStackDiskNICIO(context.Background(), plain); err != nil || r.refusals != 0 {
+		t.Fatalf("plain file: err=%v gate asked %d times", err, r.refusals)
+	}
+	tuned := &compose.File{VMs: map[string]compose.VMDef{"a": {Disks: map[string]compose.DiskDef{"root": {Discard: "on"}}}}}
+	err := s.refuseUnlatchedStackDiskNICIO(context.Background(), tuned)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), `vm "a"`) || r.refusals != 1 {
+		t.Fatalf("tuned file: err=%v asks=%d, want one refusal naming vm a", err, r.refusals)
+	}
+}
+
+func TestCreateVM_EntryCheckRunsAfterThePermissionCheck(t *testing.T) {
+	r := &refuserGate{ioGate: ioGate{t: t, on: false}}
+	s := testServer(t)
+	s.SetReleaseFeatureGate(r)
+	viewer := context.WithValue(context.WithValue(context.Background(), ctxKeyUsername, "v"), ctxKeyRole, "viewer")
+	_, err := s.CreateVM(viewer, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "x", Cpu: 1, MemoryMib: 256,
+		Disks: []*pb.DiskSpec{{Name: "root", Discard: "unmap"}}}})
+	if status.Code(err) != codes.PermissionDenied || r.refusals != 0 {
+		t.Fatalf("err=%v gate asked %d times, want PermissionDenied before any gate work", err, r.refusals)
 	}
 }

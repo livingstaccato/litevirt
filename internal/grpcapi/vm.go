@@ -111,10 +111,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := validateSpecTuning(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
+	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
 	}
-	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
+	// After the cheap local refusals (validation, permission): the check may drive
+	// the latch and ask peers, which only a request that could succeed should pay.
+	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
 		return nil, err
 	}
 

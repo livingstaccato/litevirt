@@ -1282,7 +1282,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
 		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
-	s.auditTuningDropped(ctx, ioR, targetName, "promote")
+	op := "promote"
+	if automated {
+		op = "failover"
+	}
+	s.auditTuningDropped(ctx, ioR, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

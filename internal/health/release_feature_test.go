@@ -502,3 +502,47 @@ func TestWithFeature_RefusalTextIsExact(t *testing.T) {
 		t.Fatalf("refusal = %v\nwant FailedPrecondition %q", err, want)
 	}
 }
+
+// FeatureRefusal (the entry-node fail-fast): refuses with the release text,
+// names the lagging host and ends with the upgrade-status pointer; passes once
+// every host is on the release, driving the latch itself; and in neither case
+// records a use.
+//
+// Mutations: make it write the use record — the state checks go red; make it
+// return nil without checking the latch — the refusal case goes red; skip
+// c.Enforced — the latch-driven pass goes red.
+func TestFeatureRefusal_RefusesNamesLaggardsDrivesTheLatchAndRecordsNothing(t *testing.T) {
+	e := newRelEnv(t)
+	ctx := context.Background()
+	if err := corrosion.UpdateHostVersion(ctx, e.db, "host-b", "1.9.0"); err != nil {
+		t.Fatal(err)
+	}
+	e.bAdvertises.Store(false)
+	err := e.c.FeatureRefusal(ctx, testFeature)
+	if status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "the cluster upgrade must finish first (widgets needs "+capabilities.ReleaseToken+")") ||
+		!strings.Contains(err.Error(), "host-b (1.9.0)") || !strings.HasSuffix(err.Error(), "`lv cluster upgrade-status`") {
+		t.Fatalf("refusal = %v", err)
+	}
+	if p, _ := e.state(t); p {
+		t.Fatal("a refusal recorded a use")
+	}
+	// Every host upgraded; nothing has driven the latch yet.
+	e.bAdvertises.Store(true)
+	e.c = e.checker() // the negative ping answer is cached for a few seconds
+	if e.c.FeatureAvailable(testFeature) {
+		t.Fatal("the token latched before anything drove it")
+	}
+	if err := e.c.FeatureRefusal(ctx, testFeature); err != nil {
+		t.Fatalf("after the roll: %v", err)
+	}
+	if !e.c.FeatureAvailable(testFeature) {
+		t.Error("the entry check passed without latching the token")
+	}
+	if p, _ := e.state(t); p {
+		t.Fatal("a passing entry check recorded a use")
+	}
+	if err := e.c.FeatureRefusal(ctx, "not_declared"); status.Code(err) != codes.Internal {
+		t.Errorf("undeclared feature: %v, want Internal", err)
+	}
+}

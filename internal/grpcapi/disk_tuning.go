@@ -113,10 +113,9 @@ func (s *Server) refuseUnlatchedDiskNICIO(ctx context.Context, spec *pb.VMSpec) 
 // refuseUnlatchedStackDiskNICIO refuses a compose file that sets any of them,
 // up front, rather than by the Nth VM's create after N-1 are up.
 func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.File) error {
-	gateErr := s.ioFeatureGate(ctx)
-	if gateErr == nil {
-		return nil
-	}
+	// The scan comes first: a file that sets no tuning never asks the gate, so a
+	// plain deploy mid-roll pings nobody. The check runs once, for the first VM
+	// that does.
 	for name, vm := range f.VMs {
 		if vm.IsContainer() {
 			continue
@@ -129,7 +128,10 @@ func (s *Server) refuseUnlatchedStackDiskNICIO(ctx context.Context, f *compose.F
 			set = set || !n.Queues.IsZero()
 		}
 		if set {
-			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, status.Convert(gateErr).Message())
+			if gateErr := s.ioFeatureGate(ctx); gateErr != nil {
+				return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, status.Convert(gateErr).Message())
+			}
+			return nil
 		}
 	}
 	return nil

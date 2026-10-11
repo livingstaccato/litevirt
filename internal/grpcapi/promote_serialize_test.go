@@ -284,3 +284,56 @@ func TestPromote_AStartedOperatorPromotionIsNeverAbandoned(t *testing.T) {
 		t.Errorf("start fence over an abandoned claim = %v, want FailedPrecondition", err)
 	}
 }
+
+// Review I-1: a StartDomain that fails while libvirt cannot be asked —
+// the connection dropped, so the state read fails too — may have launched
+// qemu. The start fence stays and the claim is not released: nothing can
+// abandon the value, so no coordinator recovers the VM elsewhere while it may
+// be running here. (A stall an operator resolves, never two starts.)
+//
+// Mutation "unfence on any read error" (round 2's DomainState shape) — red.
+func TestPromote_AnAmbiguousStartFailureKeepsTheFence(t *testing.T) {
+	s, _, key := operatorPromoteServer(t)
+	fake := s.virt.(*libvirtfake.Fake)
+	dropped := errors.New("libvirt: connection dropped")
+	fake.FailStartDomain = func(string) error { return dropped }
+	fake.FailDomainState = func(string) error { return dropped }
+	if err := operatorPromote(s, "db-c"); err == nil {
+		t.Fatal("the promotion succeeded with StartDomain failing")
+	}
+	id := decidedAt(t, s, key)
+	if !s.operatorStartRecorded(id) {
+		t.Error("the start fence was withdrawn on an unanswerable start")
+	}
+	if abandoned, _ := s.db.ProofAbandoned(context.Background(), id); abandoned {
+		t.Error("the claim of a start that may have run was released")
+	}
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, id, "a coordinator moves past it"); err == nil {
+		t.Error("a coordinator's abandonment request was signed for a start that may have run")
+	}
+}
+
+// Review I-1 (belt and braces) and m1: whatever the records say, nothing is
+// abandoned on a host where a domain of the workload is active, or libvirt
+// cannot say it is not. A value with no start fence — a promotion resumed
+// over a domain an earlier run started — is still never abandoned while that
+// domain runs.
+//
+// Mutation "no domain check in abandonRecoveryProof" — red.
+func TestAbandon_IsRefusedWhileTheWorkloadsDomainMayRun(t *testing.T) {
+	s, _, key := operatorPromoteServer(t)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.SetState("db-c", libvirtfake.StateRunning)
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, "unfenced", "x"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("abandonment with db-c running here = %v, want FailedPrecondition", err)
+	}
+	fake.SetState("db-c", libvirtfake.StateShutdown)
+	fake.FailDomainState = func(string) error { return errors.New("connection dropped") }
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, "unfenced", "x"); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("abandonment with libvirt unanswerable = %v, want FailedPrecondition", err)
+	}
+	fake.FailDomainState = nil
+	if _, err := s.RequestAbandonment(context.Background(), s.hostName, key, "unfenced", "x"); err != nil {
+		t.Errorf("abandonment with db-c shut off here: %v", err)
+	}
+}

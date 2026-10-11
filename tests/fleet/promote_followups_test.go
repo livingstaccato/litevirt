@@ -308,3 +308,44 @@ func TestFleet_AFailedOperatorPromotionLetsTheCoordinatorRecoverTheVM(t *testing
 		t.Error("a runs db, whose promotion failed")
 	}
 }
+
+// Review I-1, end to end: the operator's promotion on a fails at StartDomain
+// while a's libvirt connection is down (every read fails too), so qemu may be
+// running there. a keeps its start fence and refuses the coordinator's
+// abandonment request, so b's coordinator does not recover db elsewhere: the
+// VM waits for an operator, and never runs twice.
+//
+// Mutation "unfence on any read error" — red: b recovers db.
+func TestFleet_AnAmbiguousOperatorStartFailureIsNeverRecoveredElsewhere(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c, a, b, _ := pbf1Fleet(t, clock, true)
+	cs := c.NewCoordinators(clock)
+	cs.ByNode[b.Name].Promoter = b.Server
+
+	a.Virt.FailStartDomain = func(string) error { return io.ErrUnexpectedEOF }
+	a.Virt.FailDomainState = func(string) error { return io.ErrUnexpectedEOF }
+	st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
+		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil || err == io.EOF {
+		t.Fatal("the operator's promotion succeeded with StartDomain failing on a")
+	}
+
+	cs.Tick(ctx, b)
+
+	rows, err := b.DB.Query(ctx, `SELECT id FROM runtime_action_proofs
+		WHERE target_name = 'db' AND coordinator = ? AND claim_certificate != '' AND deleted_at IS NULL`, b.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 || runs(b) {
+		t.Fatalf("b recovered db past an operator start on a that may be running (%d certified proofs, runs=%v)", len(rows), runs(b))
+	}
+}

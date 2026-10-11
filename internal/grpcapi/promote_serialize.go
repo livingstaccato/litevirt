@@ -17,6 +17,7 @@ import (
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -342,4 +343,19 @@ func ownerReachedByMajority(err error) bool {
 		}
 	}
 	return n >= nm.Need
+}
+
+// domainPositivelyInactive reports whether libvirt answers that name is not
+// active: DomainIsActive false, or VIR_ERR_NO_DOMAIN. Any other error — a
+// dropped connection fails every call — is not an answer, and reads as
+// possibly running (review I-1).
+func (s *Server) domainPositivelyInactive(name string) bool {
+	if s.virt == nil {
+		return false
+	}
+	active, err := s.virt.DomainIsActive(name)
+	if err == nil {
+		return !active
+	}
+	return lv.IsNoDomain(err)
 }

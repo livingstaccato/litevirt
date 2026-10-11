@@ -19,6 +19,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	golibvirt "github.com/digitalocean/go-libvirt"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -663,7 +664,9 @@ func (f *Fake) DomainIsActive(name string) (bool, error) {
 	defer f.mu.Unlock()
 	st, ok := f.domains[name]
 	if !ok {
-		return false, fmt.Errorf("libvirtfake: domain %q not found", name)
+		// libvirt's own VIR_ERR_NO_DOMAIN, so lv.IsNoDomain reads it as the
+		// positive "no such domain" a dropped connection never is.
+		return false, golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: fmt.Sprintf("libvirtfake: domain %q not found", name)}
 	}
 	return st == StateRunning || st == StatePaused, nil
 }

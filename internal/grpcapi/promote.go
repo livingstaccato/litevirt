@@ -1581,11 +1581,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				// Don't leak the marker: we tore the half-built domain down, so a later --force
 				// retry must not treat a same-name stranger as our adopted prior promotion.
 				s.removePromoteMarker(targetName)
-				// Nothing runs: the claim may be released again.
-				if opClaim != nil {
-					if st, serr := s.virt.DomainState(targetName); serr != nil || st != "running" {
-						s.unfenceOperatorStart(opClaim)
-					}
+				// Nothing runs: the claim may be released again — but only on
+				// libvirt's positive answer (review I-1). A dropped connection
+				// can fail the start after qemu was launched, and fails every
+				// read after it; the fence then stays, and the claim with it.
+				if opClaim != nil && s.domainPositivelyInactive(targetName) {
+					s.unfenceOperatorStart(opClaim)
 				}
 				return "start domain", err
 			}

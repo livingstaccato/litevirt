@@ -28,7 +28,7 @@ import (
 //	hosts.capacity_policy_hash -> host_runtime.capacity_policy_hash
 //
 // Replication is statement-level with a row-level LWW gate, so an operator's
-// `lv host region` on one node and the host's boot report on another are not
+// region change on one node and the host's boot report on another are not
 // independent: a replica that applied the newer one first refuses the older
 // one as stale, and loses it. This file gives the self-reported columns a
 // second home with a clock of their own. Identity and operator configuration

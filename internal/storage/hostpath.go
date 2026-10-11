@@ -193,6 +193,7 @@ var dataDirOwned = []string{
 	"credentials_unhydrated",    // corrosion/isolation.go credentialsUnhydratedFile
 	"digest-invalidate",         // corrosion/digest_cache.go digestMarkerFile
 	"host_membership_live",      // corrosion/host_membership.go hostMembershipLiveFile
+	"host_runtime_live",         // corrosion/host_runtime.go hostRuntimeLiveFile
 	"credentials_split_live",    // corrosion/credentials_live.go credentialsLiveFile
 	"credentials_baseline",      // corrosion/credentials_live.go credentialsBaselineFile
 	"credentials_external_seen", // corrosion/credentials_live.go externalSeenFile

@@ -341,3 +341,33 @@ func TestPreflightRollback_EveryBootBelowAMarkerIsAProbation(t *testing.T) {
 		t.Fatalf("a use after the lift: quarantine = %v, want [%s]", q, futureRelease)
 	}
 }
+
+// TestPreflightCapabilityRollback_FirewallLabNodeIsNotARollback: lab 1 ran a
+// pre-release build of the tenant-firewall branch (labfw-863d1dcb) that
+// advertised its own mandatory token firewall_ipv6_v1, and every node there
+// holds its durable marker. This build gates IPv6 rules on the release feature
+// firewall_ipv6 instead and never advertises that token, so it must recognise
+// the marker as retired: an unknown one would read as "a newer binary ran
+// here" and start every lab node in WAL quarantine on the UPGRADE to it. The
+// node is modelled as it is: the retired marker beside the release token's,
+// with the firewall's two features recorded used.
+//
+// The literal is the on-disk name the lab build wrote.
+func TestPreflightCapabilityRollback_FirewallLabNodeIsNotARollback(t *testing.T) {
+	dir := t.TempDir()
+	const labToken = "firewall_ipv6_v1"
+	writeMarker(t, dir, labToken)
+	writeMarker(t, dir, capabilities.ReleaseToken)
+	uses := func() ([]corrosion.ReleaseFeatureUse, error) {
+		return []corrosion.ReleaseFeatureUse{
+			{Token: capabilities.ReleaseToken, Feature: string(capabilities.FeatureNICGuards)},
+			{Token: capabilities.ReleaseToken, Feature: string(capabilities.FeatureFirewallIPv6)},
+		}, nil
+	}
+
+	q, probation := preflightRollback(dir, uses)
+	if len(q) != 0 || len(probation) != 0 {
+		t.Fatalf("preflightRollback = quarantine %v, probation %v on a lab node holding the marker of "+
+			"the retired %s; want neither: it would emit no replicated writes after an upgrade", q, probation, labToken)
+	}
+}

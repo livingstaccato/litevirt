@@ -60,6 +60,12 @@ func TestStateDB_ANewDatabaseIsOwnerOnly(t *testing.T) {
 			t.Errorf("%s is %04o, want 0600", filepath.Base(p), got)
 		}
 	}
+	// The pre-made empty file is still a NEW database to SQLite: auto_vacuum,
+	// which only a freshly created database adopts (sqliteDSN), is incremental.
+	var av int
+	if err := c.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&av); err != nil || av != 2 {
+		t.Errorf("auto_vacuum = %d (err %v), want 2 (incremental)", av, err)
+	}
 }
 
 // A database an earlier build made 0644 is narrowed when it is opened: this

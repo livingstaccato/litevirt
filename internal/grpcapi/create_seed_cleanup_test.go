@@ -86,3 +86,30 @@ func TestCreateVM_AFailedStartRemovesTheSeedItMade(t *testing.T) {
 		})
 	}
 }
+
+// The seed a failed create removes is the file it placed, not whatever is at
+// the name by then: a concurrent create of the same name may have placed its
+// own seed there (review M6), and that one is not this create's to remove.
+//
+// Mutation: remove by path alone — the other create's seed goes, red.
+func TestCreateVM_AFailedCreateLeavesASeedItDidNotPlace(t *testing.T) {
+	stageGenisoimage(t)
+	s, fake, _ := isoServer(t)
+	seed := lv.CloudInitISOPath(s.dataDir, "w")
+	fake.FailStartDomain = func(string) error {
+		// Another create of the name replaces the seed meanwhile.
+		if err := os.Remove(seed); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(seed, []byte("another create's seed"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return errors.New("start failed")
+	}
+	if _, err := s.CreateVM(adminCtx(), seedCreateRequest(t, s, "w", "#cloud-config\n")); err == nil {
+		t.Fatal("the create was meant to fail")
+	}
+	if b, err := os.ReadFile(seed); err != nil || string(b) != "another create's seed" {
+		t.Errorf("the failed create removed a seed it did not place: %q %v", b, err)
+	}
+}

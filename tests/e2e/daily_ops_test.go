@@ -87,6 +87,13 @@ func TestLab_CloneToAnotherHost(t *testing.T) {
 // and reports the rest. The lab's VMs have host-local disks, which a live move
 // would have to copy, so the VM must be reported and left running on the host
 // the drain put it on, and its record kept.
+//
+// A running VM with a host-local disk always drains COLD: it is shut down and
+// started again on the target, so its guest has to honour the ACPI shutdown
+// within its stop timeout. The test waits for the guest to finish booting
+// first (a guest still booting ignores it; lab2c drained one a second after
+// creation), and a drill image that never honours ACPI (cirros on lab 2) is a
+// skip naming it, not a failure.
 func TestLab_UndrainFailbackLeavesAHostLocalVMRunning(t *testing.T) {
 	l := newLab(t)
 	b := l.requireBaseline()
@@ -94,14 +101,23 @@ func TestLab_UndrainFailbackLeavesAHostLocalVMRunning(t *testing.T) {
 
 	q := l.hosts[0]
 	victim := l.leastLoaded(q, l.except(q))
-	vm := l.createVMs(q, "fb", victim)[victim]
+	vm := l.createLabVM(q, "fb", victim, "", false)
+	l.waitGuestBooted(victim, vm, guestBootWait)
 
-	l.mustLVf(q, "drain", "host", "drain", victim)
 	l.onRestore(func() {
 		if via := l.liveHost(); via != "" {
 			l.lv(via, "host", "undrain", victim)
 		}
 	})
+	// Bounded past the stop timeout and the drain's 5-minute late wait, so a
+	// guest that ignores the shutdown ends in the drain's own answer.
+	if out, err := l.lvTimeout(q, drainCLITimeout, "host", "drain", victim); err != nil {
+		if strings.Contains(out+err.Error(), "did not shut down within its stop timeout") {
+			t.Skipf("the drill image %q does not honour an ACPI shutdown, which a host-local VM's cold drain needs; "+
+				"run with E2E_DRILL_IMAGE set to one that does:\n%s", drillImage(), out)
+		}
+		t.Fatalf("drain (lv host drain %s): %v\n%s", victim, err, out)
+	}
 	moved, err := l.inspectVM(q, vm)
 	if err != nil || moved.HostName == victim || moved.HostName == "" {
 		t.Fatalf("the drain left %s on %s: %+v %v", vm, victim, moved, err)
@@ -210,24 +226,91 @@ func sharedPool(t *testing.T) string {
 // pool, with placement.failback set when failback is true.
 func (l *lab) createSharedVM(via, prefix, host, pool string, failback bool) string {
 	l.t.Helper()
+	return l.createLabVM(via, prefix, host, pool, failback)
+}
+
+// createLabVM makes a running VM on host with the guest-agent channel, its root
+// disk on pool ("" = the host's default, host-local storage), with
+// placement.failback set when failback is true.
+func (l *lab) createLabVM(via, prefix, host, pool string, failback bool) string {
+	l.t.Helper()
 	stack := uniqueName(prefix)
 	name := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: 4G\n        storage: %s\n    placement:\n      host: %s\n      failback: %t\n",
-		stack, name, drillImage(), drillMemory(), pool, host, failback)
+	disks := ""
+	if pool != "" {
+		disks = fmt.Sprintf("    disks:\n      root:\n        size: 4G\n        storage: %s\n", pool)
+	}
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    guest-agent: true\n%s    placement:\n      host: %s\n      failback: %t\n",
+		stack, name, drillImage(), drillMemory(), disks, host, failback)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{host: name}) })
-	l.mustLVf(via, "compose up on the shared pool", "compose", "up", "-f", file, "-y")
+	l.mustLVf(via, "compose up", "compose", "up", "-f", file, "-y")
 	if !l.waitDomainState(host, name, "running", 4*time.Minute) {
-		l.t.Fatalf("shared-storage VM %s never ran on %s (virsh)", name, host)
+		l.t.Fatalf("VM %s never ran on %s (virsh)", name, host)
 	}
 	return name
+}
+
+// guestBootWait bounds waitGuestBooted; drainCLITimeout bounds a drain that
+// may move a VM cold: its stop timeout, the drain's 5-minute late wait for a
+// guest slower than that, and the copy.
+const (
+	guestBootWait   = 3 * time.Minute
+	drainCLITimeout = 9 * time.Minute
+)
+
+// lvTimeout is lv bounded by timeout instead of two minutes.
+func (l *lab) lvTimeout(host string, timeout time.Duration, args ...string) (string, error) {
+	q := make([]string, 0, len(args)+1)
+	q = append(q, shellQuote(l.lvPath))
+	for _, a := range args {
+		q = append(q, shellQuote(a))
+	}
+	return l.ssh(host, timeout, strings.Join(q, " "))
+}
+
+// waitGuestBooted waits until vm's guest on host has finished booting, read
+// from its guest agent (guest-ping through virsh on host), and reports whether
+// the agent answered. An image with no agent never answers, and the guest has
+// then had the whole timeout to boot: the wait is logged and the test goes on.
+func (l *lab) waitGuestBooted(host, vm string, timeout time.Duration) bool {
+	l.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := l.ssh(host, 20*time.Second, "virsh -c qemu:///system qemu-agent-command "+shellQuote(vm)+` '{"execute":"guest-ping"}'`)
+		if err == nil && strings.Contains(out, `"return"`) {
+			l.mark("guest: %s on %s booted (guest agent answers)", vm, host)
+			return true
+		}
+		time.Sleep(5 * time.Second)
+	}
+	l.mark("guest: %s on %s: no guest agent answered within %v; it has had that long to boot", vm, host, timeout)
+	return false
+}
+
+// guestBootID is the guest's /proc/sys/kernel/random/boot_id, read through its
+// agent ("" when it cannot be read). A live migration keeps it; a cold move
+// boots the guest again and changes it.
+func (l *lab) guestBootID(via, vm string) string {
+	out, err := l.lv(via, "exec", vm, "cat", "/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // A drain moves a shared-storage VM by live migration, and an undrain with the
 // VM opted in (placement.failback) live-migrates it back by itself, in the
 // background. Read with virsh on both hosts: the domain is running on the
 // returning host and gone from the other, never on both.
+//
+// The drain must be LIVE: the VM has a cloud-init ISO (every compose VM does),
+// which the drain has to put on the target first, as `lv migrate` does; on
+// lab2c it did not, libvirt refused, and the drain fell back to a cold move
+// that outlasted the CLI timeout. The guest is let finish booting first, and
+// the drain's line for it must say [MIGRATE_LIVE] done; with a guest agent the
+// guest's boot_id is the same after the drain, which a cold move changes.
 func TestLab_LiveFailbackOnSharedStorage(t *testing.T) {
 	pool := sharedPool(t)
 	l := newLab(t)
@@ -237,13 +320,36 @@ func TestLab_LiveFailbackOnSharedStorage(t *testing.T) {
 	q := l.hosts[0]
 	victim := l.leastLoaded(q, l.except(q))
 	vm := l.createSharedVM(q, "fbshared", victim, pool, true)
+	agent := l.waitGuestBooted(victim, vm, guestBootWait)
+	bootID := ""
+	if agent {
+		bootID = l.guestBootID(q, vm)
+	}
 
-	l.mustLVf(q, "drain", "host", "drain", victim)
 	l.onRestore(func() {
 		if via := l.liveHost(); via != "" {
 			l.lv(via, "host", "undrain", victim)
 		}
 	})
+	dout, err := l.lvTimeout(q, drainCLITimeout, "host", "drain", victim)
+	l.saveEvidence("live-failback-drain", dout)
+	if err != nil {
+		t.Fatalf("drain (lv host drain %s): %v\n%s", victim, err, dout)
+	}
+	live := false
+	for _, line := range strings.Split(dout, "\n") {
+		if strings.Contains(line, vm) && strings.Contains(line, "[MIGRATE_LIVE] done") {
+			live = true
+		}
+	}
+	if !live {
+		t.Fatalf("the drain did not move %s live:\n%s", vm, dout)
+	}
+	if bootID != "" {
+		if after := l.guestBootID(q, vm); after != bootID {
+			t.Errorf("%s's boot_id changed across the drain (%q -> %q): the guest was rebooted, not migrated live", vm, bootID, after)
+		}
+	}
 	moved, err := l.inspectVM(q, vm)
 	if err != nil || moved.HostName == victim {
 		t.Fatalf("the drain left %s on %s: %+v %v", vm, victim, moved, err)

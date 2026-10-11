@@ -151,6 +151,12 @@
       <code style="font-size:12px">{{.Host.IpmiAddress}}</code>
     </div>
     {{end}}
+    {{if .Host.RedfishEndpoint}}
+    <div>
+      <div class="card-title">Redfish Endpoint</div>
+      <code style="font-size:12px">{{.Host.RedfishEndpoint}}{{if .Host.RedfishSystemId}} ({{.Host.RedfishSystemId}}){{end}}</code>
+    </div>
+    {{end}}
     {{if .Host.WatchdogDev}}
     <div>
       <div class="card-title">Watchdog Device</div>

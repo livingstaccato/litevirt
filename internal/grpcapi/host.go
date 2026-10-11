@@ -104,6 +104,9 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		StoragePools:     pools,
 		FenceStrategy:    h.FenceStrategy,
 		IpmiAddress:      h.IPMIAddress,
+		RedfishEndpoint:  h.Redfish.Endpoint,
+		RedfishSystemId:  h.Redfish.SystemID,
+		RedfishAuth:      h.Redfish.Auth,
 		WatchdogDev:      h.WatchdogDev,
 		Region:           h.Region,
 		CertSerial:       h.CertSerial,
@@ -929,6 +932,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		IPMIAddress:   h.IPMIAddress,
 		IPMIUser:      h.IPMIUser,
 		IPMIPass:      h.IPMIPass,
+		Redfish:       h.Redfish,
 		WatchdogDev:   h.WatchdogDev,
 		// Only a fence aimed at THIS node may use the watchdog strategy; it arms
 		// the caller's own device. Everything else is unaffected.
@@ -993,11 +997,18 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	// field existed) could not be restored once changed away from.
 	if req.FenceStrategy != "" {
 		switch req.FenceStrategy {
-		case "ssh", "ipmi", "watchdog", "manual", "best-effort":
+		case "ssh", "ipmi", "redfish", "watchdog", "manual", "best-effort":
 		default:
 			return nil, status.Errorf(codes.InvalidArgument,
-				"invalid fence strategy %q (valid: ssh, ipmi, watchdog, manual, best-effort)", req.FenceStrategy)
+				"invalid fence strategy %q (valid: ssh, ipmi, redfish, watchdog, manual, best-effort)", req.FenceStrategy)
 		}
+	}
+
+	// The Redfish settings: what this request does to them, decided and
+	// validated before anything is written or any release gate is taken.
+	redfish, err := planRedfishChange(h, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// clear_ipmi removes the IPMI address, user and password, which an empty
@@ -1129,6 +1140,10 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		args = append(args, nil)
 	}
 
+	hostsProvided := provided
+	if redfish.touched {
+		provided++
+	}
 	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
@@ -1150,15 +1165,56 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	// Once credentials_clear_v1 has latched as well, the old column gets ''
 	// instead of the password, in the same statement shape: nothing reads it
 	// any more, and the operator-safe dump must not carry it.
-	if (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables() {
-		if req.IpmiPass != "" && s.db.MayClearCredentialColumns() {
-			args[3] = ""
+	ipmiCredential := (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables()
+	if ipmiCredential && req.IpmiPass != "" && s.db.MayClearCredentialColumns() {
+		args[3] = ""
+	}
+	switch {
+	case redfish.gated:
+		// A 'redfish' strategy and the Redfish row are the release feature
+		// redfish_fence's data: a previous-release peer cannot decode the row
+		// and would fence a 'redfish' host as best-effort SSH. Written through
+		// the gate on this node, which refuses (FailedPrecondition) until
+		// release_2026_11_v1 has latched and records the use first. The hosts
+		// write, the IPMI credential and the Redfish row are one batch under
+		// one updated_at.
+		err = s.WithReleaseFeature(ctx, capabilities.FeatureRedfishFence,
+			func(ctx context.Context, g capabilities.FeatureGrant) error {
+				if gerr := g.Check(capabilities.FeatureRedfishFence); gerr != nil {
+					return gerr
+				}
+				batch := []corrosion.Statement{}
+				if hostsProvided > 0 {
+					batch = append(batch, corrosion.Statement{SQL: configureHostSQL, Params: args})
+				}
+				if ipmiCredential {
+					batch = append(batch, corrosion.Statement{
+						SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}})
+				}
+				if redfish.write {
+					st, serr := hostFenceRedfishStatement(g, req.Name, redfish.cfg, now)
+					if serr != nil {
+						return serr
+					}
+					batch = append(batch, st)
+				}
+				return s.db.ExecuteBatch(ctx, batch)
+			})
+		if err != nil {
+			if _, ok := status.FromError(err); ok {
+				return nil, err
+			}
+			return nil, status.Errorf(codes.Internal, "update host config: %v", err)
 		}
+	case hostsProvided == 0:
+		// Only a --clear-redfish of a host with no Redfish settings: there is
+		// nothing to clear, and nothing to record.
+	case ipmiCredential:
 		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
 			{SQL: configureHostSQL, Params: args},
 			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},
 		})
-	} else {
+	default:
 		err = s.db.Execute(ctx, configureHostSQL, args...)
 	}
 	if err != nil {
@@ -1169,6 +1225,109 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	s.audit(ctx, "host.configure", req.Name, fmt.Sprintf("fields=%d", provided), "ok")
 
 	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+}
+
+// redfishChange is what one ConfigureHost does to a host's Redfish settings.
+type redfishChange struct {
+	// touched: the request named a redfish_* field or clear_redfish.
+	touched bool
+	// gated: the write goes through the redfish_fence release gate — it
+	// writes the Redfish row, or sets fence_strategy to "redfish".
+	gated bool
+	// write: the Redfish row is written, to set (cfg non-nil) or clear (nil).
+	write bool
+	cfg   *fence.RedfishConfig
+}
+
+// planRedfishChange decides and validates what req does to h's Redfish
+// settings. A request that names some of them keeps the rest (an empty field
+// means "leave alone", as for ipmi_*). A host left fencing by "redfish" must
+// have an endpoint, a user and a password to fence with: refused here, at
+// configuration time, rather than discovered by the first fence of an outage.
+func planRedfishChange(h *corrosion.HostRecord, req *pb.ConfigureHostRequest) (redfishChange, error) {
+	named := req.RedfishEndpoint != "" || req.RedfishUser != "" || req.RedfishPass != "" ||
+		req.RedfishSystemId != "" || req.RedfishAuth != "" || req.RedfishCaPem != ""
+	strategy := h.FenceStrategy
+	if req.FenceStrategy != "" {
+		strategy = req.FenceStrategy
+	}
+	var ch redfishChange
+	ch.touched = named || req.ClearRedfish
+	cur := h.Redfish
+	switch {
+	case req.ClearRedfish:
+		if named {
+			return ch, status.Error(codes.InvalidArgument,
+				"clear_redfish cannot be combined with a redfish_* field")
+		}
+		if strategy == "redfish" {
+			return ch, status.Errorf(codes.FailedPrecondition,
+				"host %q fences by redfish; clearing its Redfish settings would fail every fence. "+
+					"Set another fence strategy in the same request", req.Name)
+		}
+		// Nothing to clear is not a write: a cluster that never used the
+		// feature is not made to record a use for it.
+		if cur.Configured() {
+			ch.write, ch.gated = true, true
+		}
+		return ch, nil
+	case named:
+		if req.RedfishEndpoint != "" {
+			cur.Endpoint = req.RedfishEndpoint
+		}
+		if req.RedfishUser != "" {
+			cur.User = req.RedfishUser
+		}
+		if req.RedfishPass != "" {
+			cur.Pass = req.RedfishPass
+		}
+		if req.RedfishSystemId != "" {
+			cur.SystemID = req.RedfishSystemId
+		}
+		if req.RedfishAuth != "" {
+			cur.Auth = req.RedfishAuth
+		}
+		if req.RedfishCaPem != "" {
+			cur.CACert = req.RedfishCaPem
+		}
+		if err := fence.ValidateRedfishConfig(cur); err != nil {
+			return ch, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if !cur.Configured() {
+			return ch, status.Error(codes.InvalidArgument,
+				"Redfish settings need redfish_endpoint (https://host[:port])")
+		}
+		c := cur
+		ch.write, ch.gated, ch.cfg = true, true, &c
+	}
+	if strategy == "redfish" && (req.FenceStrategy == "redfish" || named) {
+		if !cur.Configured() || cur.User == "" || cur.Pass == "" {
+			return ch, status.Errorf(codes.FailedPrecondition,
+				"host %q cannot fence by redfish without a Redfish endpoint, user and password; "+
+					"set redfish_endpoint, redfish_user and redfish_pass in the same request", req.Name)
+		}
+	}
+	if req.FenceStrategy == "redfish" {
+		ch.gated = true
+	}
+	return ch, nil
+}
+
+// hostFenceRedfishStatement is the statement that sets host's Redfish settings
+// to cfg or, for cfg nil, clears them (a tombstone with every field empty). It
+// is redfish_fence's data, so it takes the feature's grant. updatedAt is the
+// batch's clock, shared with the hosts write beside it.
+func hostFenceRedfishStatement(g capabilities.FeatureGrant, host string, cfg *fence.RedfishConfig, updatedAt string) (corrosion.Statement, error) {
+	if err := g.Check(capabilities.FeatureRedfishFence); err != nil {
+		return corrosion.Statement{}, err
+	}
+	if cfg == nil {
+		return corrosion.Statement{SQL: corrosion.HostFenceRedfishClearSQL,
+			Params: []interface{}{updatedAt, updatedAt, host}}, nil
+	}
+	return corrosion.Statement{SQL: corrosion.HostFenceRedfishUpsertSQL, Params: []interface{}{
+		host, cfg.Endpoint, cfg.User, cfg.Pass, cfg.SystemID, cfg.Auth, cfg.CACert, updatedAt,
+	}}, nil
 }
 
 // configureHostSQL is the single fixed shape ConfigureHost emits. COALESCE(?, col) keeps a

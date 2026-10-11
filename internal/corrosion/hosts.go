@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/fence"
 )
 
 // HostRecord represents a host in the cluster.
@@ -27,6 +29,10 @@ type HostRecord struct {
 	IPMIAddress string
 	IPMIUser    string
 	IPMIPass    string
+	// Redfish — only used when fence_strategy = "redfish". Read from the
+	// host's live host_fence_redfish row (host_fence_redfish.go), never from
+	// the hosts row.
+	Redfish     fence.RedfishConfig
 	WatchdogDev string
 	Labels      map[string]string // decoded from JSON column
 	Version     string
@@ -429,7 +435,8 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 }
 
 // hostSelectSQL is the column list scanHost reads, joined to the host's fence
-// credential so IPMIPass is resolved new-first (credentials_split.go), and to
+// credential so IPMIPass is resolved new-first (credentials_split.go), to its
+// live Redfish row (host_fence_redfish.go), and to
 // its membership row so State is too (host_membership.go). Columns the tables
 // share are qualified; SQLite names a qualified result column by its bare name,
 // which is what scanHost looks up.
@@ -441,8 +448,11 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			h.capacity_policy_hash,
 			h.created_at, h.updated_at,
 			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
+			rf.endpoint AS rf_endpoint, rf.username AS rf_username, rf.password AS rf_password,
+			rf.system_id AS rf_system_id, rf.auth AS rf_auth, rf.ca_pem AS rf_ca_pem,
 			` + membershipCols + `
-		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` + membershipJoins
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL
+		 LEFT JOIN host_fence_redfish rf ON rf.host_name = h.name AND rf.deleted_at IS NULL` + membershipJoins
 
 func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 	name := r.String("name")
@@ -461,6 +471,7 @@ func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 		IPMIAddress:        r.String("ipmi_address"),
 		IPMIUser:           r.String("ipmi_user"),
 		IPMIPass:           resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass")),
+		Redfish:            redfishFromRow(r, "rf_"),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
 		Version:            r.String("version"),

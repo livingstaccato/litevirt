@@ -668,12 +668,24 @@ func newHostConfigCmd() *cobra.Command {
 	var cpuOvercommit, memOvercommit float64
 	var cpuReserve, memReserveMiB int
 	var clearIPMI bool
+	var rfEndpoint, rfUser, rfPass, rfSystemID, rfAuth, rfCAFile string
+	var clearRedfish bool
 
 	cmd := &cobra.Command{
 		Use:   "config <host>",
-		Short: "Configure host settings (fencing, IPMI, watchdog, role, region)",
+		Short: "Configure host settings (fencing, IPMI, Redfish, watchdog, role, region)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// The CA bundle is read here, on the operator's machine, and sent
+			// as PEM: the daemon that takes the request may be any host.
+			var rfCA string
+			if rfCAFile != "" {
+				b, err := os.ReadFile(rfCAFile)
+				if err != nil {
+					return fmt.Errorf("read --redfish-ca-file: %w", err)
+				}
+				rfCA = string(b)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				out := &pb.ConfigureHostRequest{
 					Name:          args[0],
@@ -685,6 +697,14 @@ func newHostConfigCmd() *cobra.Command {
 					Role:          role,
 					Region:        region,
 					ClearIpmi:     clearIPMI,
+
+					RedfishEndpoint: rfEndpoint,
+					RedfishUser:     rfUser,
+					RedfishPass:     rfPass,
+					RedfishSystemId: rfSystemID,
+					RedfishAuth:     rfAuth,
+					RedfishCaPem:    rfCA,
+					ClearRedfish:    clearRedfish,
 				}
 				// Send capacity overrides only when the operator actually passed the
 				// flag: an omitted numeric flag is 0, which for a reserve is a REAL
@@ -712,6 +732,9 @@ func newHostConfigCmd() *cobra.Command {
 						return err
 					}
 				}
+				if err := checkRedfishApplied(h, out); err != nil {
+					return err
+				}
 				fmt.Printf("Host %s configured.\n", h.Name)
 				return nil
 			})
@@ -719,7 +742,7 @@ func newHostConfigCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&fenceStrategy, "fence-strategy", "",
-		"Fencing strategy: ssh | ipmi | watchdog | manual | best-effort. 'manual' never powers the host off — it records the intent and waits for `lv host fence-confirm`.")
+		"Fencing strategy: ssh | ipmi | redfish | watchdog | manual | best-effort. 'manual' never powers the host off — it records the intent and waits for `lv host fence-confirm`.")
 	cmd.Flags().StringVar(&ipmiAddr, "ipmi-address", "", "IPMI BMC address")
 	cmd.Flags().StringVar(&ipmiUser, "ipmi-user", "", "IPMI username")
 	cmd.Flags().StringVar(&ipmiPass, "ipmi-pass", "", "IPMI password")
@@ -741,6 +764,19 @@ func newHostConfigCmd() *cobra.Command {
 	for _, f := range []string{"ipmi-address", "ipmi-user", "ipmi-pass"} {
 		cmd.MarkFlagsMutuallyExclusive("clear-ipmi", f)
 	}
+	cmd.Flags().StringVar(&rfEndpoint, "redfish-endpoint", "", "Redfish BMC base URL, https://host[:port] (http is refused)")
+	cmd.Flags().StringVar(&rfUser, "redfish-user", "", "Redfish username")
+	cmd.Flags().StringVar(&rfPass, "redfish-pass", "", "Redfish password (stored on the sensitive lane, never on the hosts row)")
+	cmd.Flags().StringVar(&rfSystemID, "redfish-system-id", "",
+		"Redfish ComputerSystem Id to power off; needed only when the BMC lists more than one")
+	cmd.Flags().StringVar(&rfAuth, "redfish-auth", "", "Redfish auth: session (default) or basic")
+	cmd.Flags().StringVar(&rfCAFile, "redfish-ca-file", "",
+		"PEM file of the CA the BMC's certificate must chain to (default: the system roots; TLS is always verified)")
+	cmd.Flags().BoolVar(&clearRedfish, "clear-redfish", false,
+		"Remove the host's Redfish settings (an empty --redfish-* flag leaves them alone). A host that fences by redfish needs another --fence-strategy with it.")
+	for _, f := range []string{"redfish-endpoint", "redfish-user", "redfish-pass", "redfish-system-id", "redfish-auth", "redfish-ca-file"} {
+		cmd.MarkFlagsMutuallyExclusive("clear-redfish", f)
+	}
 
 	return cmd
 }
@@ -753,6 +789,22 @@ func checkIPMICleared(h *pb.Host) error {
 	if h.GetIpmiAddress() != "" {
 		return fmt.Errorf("host %s still has IPMI address %s: the server did not clear it (it may predate "+
 			"--clear-ipmi; retry once every host is upgraded)", h.GetName(), h.GetIpmiAddress())
+	}
+	return nil
+}
+
+// checkRedfishApplied confirms the server took a request's Redfish settings.
+// A server that predates them ignores the fields: beside another setting it
+// applies that one and returns the host with no Redfish endpoint (or, for a
+// --clear-redfish, with the old one).
+func checkRedfishApplied(h *pb.Host, req *pb.ConfigureHostRequest) error {
+	switch {
+	case req.GetClearRedfish() && h.GetRedfishEndpoint() != "":
+		return fmt.Errorf("host %s still has Redfish endpoint %s: the server did not clear it (it may predate "+
+			"--clear-redfish; retry once every host is upgraded)", h.GetName(), h.GetRedfishEndpoint())
+	case req.GetRedfishEndpoint() != "" && h.GetRedfishEndpoint() == "":
+		return fmt.Errorf("host %s has no Redfish endpoint: the server did not store it (it may predate "+
+			"--redfish-endpoint; retry once every host is upgraded)", h.GetName())
 	}
 	return nil
 }

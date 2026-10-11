@@ -2870,7 +2870,7 @@ func (x *SupersededDisksResponse) GetSetAside() string {
 type ConfigureHostRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	FenceStrategy string                 `protobuf:"bytes,2,opt,name=fence_strategy,json=fenceStrategy,proto3" json:"fence_strategy,omitempty"` // ssh | ipmi | watchdog
+	FenceStrategy string                 `protobuf:"bytes,2,opt,name=fence_strategy,json=fenceStrategy,proto3" json:"fence_strategy,omitempty"` // ssh | ipmi | redfish | watchdog | manual | best-effort
 	IpmiAddress   string                 `protobuf:"bytes,3,opt,name=ipmi_address,json=ipmiAddress,proto3" json:"ipmi_address,omitempty"`
 	IpmiUser      string                 `protobuf:"bytes,4,opt,name=ipmi_user,json=ipmiUser,proto3" json:"ipmi_user,omitempty"`
 	IpmiPass      string                 `protobuf:"bytes,5,opt,name=ipmi_pass,json=ipmiPass,proto3" json:"ipmi_pass,omitempty"`
@@ -2899,7 +2899,27 @@ type ConfigureHostRequest struct {
 	// by "ipmi" (pass another fence_strategy with it). A server that predates
 	// the field ignores it: alone it answers "no fields to update", and a
 	// client must check the returned host's ipmi_address is empty.
-	ClearIpmi     bool `protobuf:"varint,13,opt,name=clear_ipmi,json=clearIpmi,proto3" json:"clear_ipmi,omitempty"`
+	ClearIpmi bool `protobuf:"varint,13,opt,name=clear_ipmi,json=clearIpmi,proto3" json:"clear_ipmi,omitempty"`
+	// Redfish BMC settings, for fence_strategy "redfish". As for ipmi_*, an
+	// empty field means "leave alone", and the rest of the host's settings are
+	// kept. redfish_endpoint is the BMC's base URL, https://host[:port];
+	// redfish_system_id picks the ComputerSystem when the BMC has several;
+	// redfish_auth is "session" (default) or "basic"; redfish_ca_pem is the
+	// PEM bundle the BMC's certificate must chain to (empty: the system
+	// roots). They are stored on the sensitive lane, never on the hosts row,
+	// and are the release feature redfish_fence: refused with
+	// FailedPrecondition until every host runs a build that knows it. A
+	// server that predates them ignores them and refuses fence_strategy
+	// "redfish"; a client must check the returned host's redfish_endpoint.
+	RedfishEndpoint string `protobuf:"bytes,14,opt,name=redfish_endpoint,json=redfishEndpoint,proto3" json:"redfish_endpoint,omitempty"`
+	RedfishUser     string `protobuf:"bytes,15,opt,name=redfish_user,json=redfishUser,proto3" json:"redfish_user,omitempty"`
+	RedfishPass     string `protobuf:"bytes,16,opt,name=redfish_pass,json=redfishPass,proto3" json:"redfish_pass,omitempty"`
+	RedfishSystemId string `protobuf:"bytes,17,opt,name=redfish_system_id,json=redfishSystemId,proto3" json:"redfish_system_id,omitempty"`
+	RedfishAuth     string `protobuf:"bytes,18,opt,name=redfish_auth,json=redfishAuth,proto3" json:"redfish_auth,omitempty"`
+	RedfishCaPem    string `protobuf:"bytes,19,opt,name=redfish_ca_pem,json=redfishCaPem,proto3" json:"redfish_ca_pem,omitempty"`
+	// Clear the host's Redfish settings. Refused together with any redfish_*
+	// field, and while the host would be left fencing by "redfish".
+	ClearRedfish  bool `protobuf:"varint,20,opt,name=clear_redfish,json=clearRedfish,proto3" json:"clear_redfish,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3021,6 +3041,55 @@ func (x *ConfigureHostRequest) GetMemReserveMib() int32 {
 func (x *ConfigureHostRequest) GetClearIpmi() bool {
 	if x != nil {
 		return x.ClearIpmi
+	}
+	return false
+}
+
+func (x *ConfigureHostRequest) GetRedfishEndpoint() string {
+	if x != nil {
+		return x.RedfishEndpoint
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetRedfishUser() string {
+	if x != nil {
+		return x.RedfishUser
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetRedfishPass() string {
+	if x != nil {
+		return x.RedfishPass
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetRedfishSystemId() string {
+	if x != nil {
+		return x.RedfishSystemId
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetRedfishAuth() string {
+	if x != nil {
+		return x.RedfishAuth
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetRedfishCaPem() string {
+	if x != nil {
+		return x.RedfishCaPem
+	}
+	return ""
+}
+
+func (x *ConfigureHostRequest) GetClearRedfish() bool {
+	if x != nil {
+		return x.ClearRedfish
 	}
 	return false
 }
@@ -38905,7 +38974,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\brestored\x18\x04 \x01(\tR\brestored\x12\x1f\n" +
 	"\vrestored_to\x18\x05 \x01(\tR\n" +
 	"restoredTo\x12\x1b\n" +
-	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\x91\x04\n" +
+	"\tset_aside\x18\x06 \x01(\tR\bsetAside\"\x9c\x06\n" +
 	"\x14ConfigureHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
 	"\x0efence_strategy\x18\x02 \x01(\tR\rfenceStrategy\x12!\n" +
@@ -38922,7 +38991,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"cpuReserve\x88\x01\x01\x12+\n" +
 	"\x0fmem_reserve_mib\x18\f \x01(\x05H\x03R\rmemReserveMib\x88\x01\x01\x12\x1d\n" +
 	"\n" +
-	"clear_ipmi\x18\r \x01(\bR\tclearIpmiB\x11\n" +
+	"clear_ipmi\x18\r \x01(\bR\tclearIpmi\x12)\n" +
+	"\x10redfish_endpoint\x18\x0e \x01(\tR\x0fredfishEndpoint\x12!\n" +
+	"\fredfish_user\x18\x0f \x01(\tR\vredfishUser\x12!\n" +
+	"\fredfish_pass\x18\x10 \x01(\tR\vredfishPass\x12*\n" +
+	"\x11redfish_system_id\x18\x11 \x01(\tR\x0fredfishSystemId\x12!\n" +
+	"\fredfish_auth\x18\x12 \x01(\tR\vredfishAuth\x12$\n" +
+	"\x0eredfish_ca_pem\x18\x13 \x01(\tR\fredfishCaPem\x12#\n" +
+	"\rclear_redfish\x18\x14 \x01(\bR\fclearRedfishB\x11\n" +
 	"\x0f_cpu_overcommitB\x11\n" +
 	"\x0f_mem_overcommitB\x0e\n" +
 	"\f_cpu_reserveB\x12\n" +

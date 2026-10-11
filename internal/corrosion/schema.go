@@ -507,7 +507,19 @@ import (
 //	     id an external-realm account is bound to at its first login after the
 //	     upgrade, refused under any other; one row per id, first binder
 //	     wins). Four new tables.
-const CurrentSchemaVersion = 64
+//	v65: the redfish fence strategy — host_fence_redfish (host_name PK;
+//	     endpoint, username, password, system_id, auth, ca_pem): a host's
+//	     Redfish BMC settings and password, fenced through by
+//	     fence_strategy = 'redfish'. On the sensitive lane beside
+//	     host_fence_credentials (sensitiveTableNames), so the operator-safe
+//	     state dump never carries the password, and never on the hosts row.
+//	     One row, written whole, with its own updated_at: nothing compares it
+//	     with the hosts row's clock. A previous-release node cannot decode the
+//	     table's statements, and would fence a 'redfish' host as best-effort
+//	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
+//	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
+//	     One new table.
+const CurrentSchemaVersion = 65
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2952,6 +2964,20 @@ var schemaDDL = []string{
 		deleted_at  TEXT,
 		PRIMARY KEY (username, realm, external_id)
 	)`,
+	// v65 a host's Redfish BMC settings and password, on the sensitive lane
+	// beside host_fence_credentials; see host_fence_redfish.go. One row per
+	// host, written whole, only with the release feature redfish_fence.
+	`CREATE TABLE IF NOT EXISTS host_fence_redfish (
+		host_name  TEXT PRIMARY KEY,
+		endpoint   TEXT NOT NULL DEFAULT '',
+		username   TEXT NOT NULL DEFAULT '',
+		password   TEXT NOT NULL DEFAULT '',
+		system_id  TEXT NOT NULL DEFAULT '',
+		auth       TEXT NOT NULL DEFAULT '',
+		ca_pem     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3150,6 +3176,7 @@ var tablePrimaryKeys = map[string][]string{
 	"session_factors":         {"session_id"},
 	"user_enrollment_codes":   {"username"},
 	"user_identity_bindings":  {"username", "realm", "external_id"},
+	"host_fence_redfish":      {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3526,6 +3553,7 @@ var createTableUnits = []struct {
 	{63, "local_incarnation_claims"},
 	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
 	{64, "user_identity_bindings"},
+	{65, "host_fence_redfish"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

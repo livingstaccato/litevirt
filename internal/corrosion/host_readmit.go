@@ -176,6 +176,9 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		if err := retireFenceCredential(ctx, tx, host, ts); err != nil {
 			return fmt.Errorf("retire %s's fence credential: %w", host, err)
 		}
+		if err := retireFenceRedfish(ctx, tx, host, ts); err != nil {
+			return fmt.Errorf("retire %s's Redfish settings: %w", host, err)
+		}
 	}
 	return nil
 }

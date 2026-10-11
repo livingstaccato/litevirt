@@ -61,3 +61,30 @@ func TestHostConfig_ClearIPMIUnhonouredIsAnError(t *testing.T) {
 		t.Errorf("cleared host: %v", err)
 	}
 }
+
+// A server that predates the Redfish fields ignores them and answers with the
+// host unchanged; the CLI must not report that as configured, or as cleared.
+func TestHostConfig_RedfishUnhonouredIsAnError(t *testing.T) {
+	set := &pb.ConfigureHostRequest{Name: "h", RedfishEndpoint: "https://10.0.1.1"}
+	if err := checkRedfishApplied(&pb.Host{Name: "h"}, set); err == nil {
+		t.Error("a host with no Redfish endpoint after --redfish-endpoint must be an error")
+	}
+	if err := checkRedfishApplied(&pb.Host{Name: "h", RedfishEndpoint: "https://10.0.1.1"}, set); err != nil {
+		t.Errorf("configured host: %v", err)
+	}
+	clear := &pb.ConfigureHostRequest{Name: "h", ClearRedfish: true}
+	if err := checkRedfishApplied(&pb.Host{Name: "h", RedfishEndpoint: "https://10.0.1.1"}, clear); err == nil {
+		t.Error("a host still carrying a Redfish endpoint after --clear-redfish must be an error")
+	}
+	if err := checkRedfishApplied(&pb.Host{Name: "h"}, clear); err != nil {
+		t.Errorf("cleared host: %v", err)
+	}
+	for _, other := range []string{"redfish-endpoint", "redfish-pass", "redfish-ca-file"} {
+		cmd := newHostConfigCmd()
+		cmd.SetArgs([]string{"h", "--clear-redfish", "--" + other, "x"})
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "clear-redfish") {
+			t.Errorf("--clear-redfish with --%s: err = %v, want a flag-conflict error", other, err)
+		}
+	}
+}

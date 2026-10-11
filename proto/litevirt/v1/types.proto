@@ -689,6 +689,11 @@ message Host {
     // not, or what to do, in words; empty when there is nothing to say.
     bool                           failback_started = 23;
     string                         failback_note    = 24;
+    // The host's Redfish BMC, when it has one: the endpoint, the
+    // ComputerSystem id and the auth mode. Never the user, password or CA.
+    string                         redfish_endpoint  = 25;
+    string                         redfish_system_id = 26;
+    string                         redfish_auth      = 27;
 }
 
 message Image {

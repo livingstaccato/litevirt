@@ -2399,6 +2399,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		IPMIAddress:   h.IPMIAddress,
 		IPMIUser:      h.IPMIUser,
 		IPMIPass:      h.IPMIPass,
+		Redfish:       h.Redfish,
 		WatchdogDev:   h.WatchdogDev,
 	})
 	// A best-effort fence that did not reach the host is recorded as

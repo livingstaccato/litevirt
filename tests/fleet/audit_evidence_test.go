@@ -58,7 +58,7 @@ func TestFleet_PeerKeepsRetirementAfterAbsorbingTheCompromisedNodesDump(t *testi
 	forgeRowWithRetiredKey(t, a, oldKR, "forged", 3)
 
 	// The erasure: retirement cleared, with a clock no honest write can beat.
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`DELETE FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = ?`, oldKR.KeyID()); err != nil {
 		t.Fatalf("clear the retirement on %s: %v", a.Name, err)
 	}
@@ -110,10 +110,10 @@ func TestFleet_PeerKeepsChainHeadsAfterAbsorbingTheCompromisedNodesDump(t *testi
 	}
 
 	// Cut the tail off, then delete the heads that would have noticed.
-	if err := a.DB.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('a3','a4')`); err != nil {
+	if err := localExec(ctx, a.DB, `DELETE FROM audit_log WHERE id IN ('a3','a4')`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
 		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z", a.Name); err != nil {
 		t.Fatalf("tombstone the heads on %s: %v", a.Name, err)
@@ -152,7 +152,7 @@ func forgeRowWithRetiredKey(t *testing.T, n *Node, kr *corrosion.AuditKeyring, i
 	if err != nil {
 		t.Fatalf("SignRow with the retired key: %v", err)
 	}
-	if err := n.DB.Execute(ctx,
+	if err := localExec(ctx, n.DB,
 		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail, result,
 		                        prev_hash, content_hash, key_id, signature, seq)
 		 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,

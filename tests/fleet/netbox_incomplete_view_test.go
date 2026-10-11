@@ -41,7 +41,7 @@ func TestFleetSweepDoesNotFreeAnAddressAHostMissingFromTheHostTableHolds(t *test
 	c.Nodes[1].Rejoin() // even the live peer signal still knows this host
 
 	// Model a host table that has not hydrated its peer's row yet.
-	if err := c.Nodes[0].DB.Execute(context.Background(),
+	if err := localExec(context.Background(), c.Nodes[0].DB,
 		`DELETE FROM hosts WHERE name = ?`, c.Nodes[1].Name); err != nil {
 		t.Fatal(err)
 	}

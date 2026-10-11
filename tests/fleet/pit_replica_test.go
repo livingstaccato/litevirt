@@ -250,7 +250,7 @@ func TestFleet_AHeldPromotionStaysDownAndItsCommandWorks(t *testing.T) {
 	// The victim dies; the coordinator fences it and tries to promote.
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, o := range []*Node{replicaHost, coord} {
-		if err := coord.DB.Execute(ctx, `INSERT OR REPLACE INTO host_health
+		if err := localExec(ctx, coord.DB, `INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, o.Name, victim.Name, nowRFC); err != nil {
 			t.Fatal(err)

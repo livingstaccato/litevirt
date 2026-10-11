@@ -158,7 +158,7 @@ func TestFleet_StackDownForwardedDeleteCarriesTheStack(t *testing.T) {
 		}, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		if err := row.n.DB.Execute(ctx, `UPDATE vms SET created_at = '2026-10-08T00:00:00.000000001Z' WHERE name = 'web'`); err != nil {
+		if err := localExec(ctx, row.n.DB, `UPDATE vms SET created_at = '2026-10-08T00:00:00.000000001Z' WHERE name = 'web'`); err != nil {
 			t.Fatal(err)
 		}
 	}

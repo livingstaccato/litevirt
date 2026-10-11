@@ -34,10 +34,18 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// setHostCapacity sizes a node's physical totals and, optionally, its per-host
-// policy overrides. Written to every node's DB so each one's view agrees —
-// admission runs on the entry node as well as the owner.
-func setHostCapacity(t *testing.T, c *Cluster, host string, cpuTotal, memTotal int, memReserve *int) {
+// setHostCapacity sizes a node's physical totals and clears its per-host memory
+// reserve back to the cluster default (-1). Written on every node so each
+// one's view agrees — admission runs on the entry node as well as the owner.
+//
+// The totals go through corrosion.UpdateHostResources, a registered statement
+// shape, so on independent replicas each write replicates like any other
+// instead of back-pressuring the node's stream (replicated_shapes.go). The
+// host's disk_total is kept as it is. No production statement clears the
+// reserve alone, so that half is written locally on each node (localExec), as
+// the old raw write effectively was: a scenario that sets a reserve with
+// setHostMemReserve must do so AFTER sizing the host.
+func setHostCapacity(t *testing.T, c *Cluster, host string, cpuTotal, memTotal int) {
 	t.Helper()
 	ctx := context.Background()
 	for _, n := range c.Nodes {
@@ -45,21 +53,27 @@ func setHostCapacity(t *testing.T, c *Cluster, host string, cpuTotal, memTotal i
 		if err != nil || rec == nil {
 			t.Fatalf("GetHost %s on %s: rec=%v err=%v", host, n.Name, rec, err)
 		}
-		if err := n.DB.Execute(ctx,
-			`UPDATE hosts SET cpu_total = ?, mem_total = ?, mem_reserve_mib = ?, updated_at = ? WHERE name = ?`,
-			cpuTotal, memTotal, optIntOrSentinel(memReserve), n.DB.NowTS(), host); err != nil {
+		if err := corrosion.UpdateHostResources(ctx, n.DB, host, cpuTotal, memTotal, rec.DiskTotal); err != nil {
 			t.Fatalf("size host %s on %s: %v", host, n.Name, err)
+		}
+		if err := localExec(ctx, n.DB, `UPDATE hosts SET mem_reserve_mib = -1 WHERE name = ?`, host); err != nil {
+			t.Fatalf("clear host %s's memory reserve on %s: %v", host, n.Name, err)
 		}
 	}
 }
 
-// optIntOrSentinel encodes an optional reserve the way the schema does: -1 means
-// "inherit the cluster default", and 0 is a real "no reserve".
-func optIntOrSentinel(p *int) int {
-	if p == nil {
-		return -1
+// setHostMemReserve sets a host's per-host memory reserve override as an
+// operator does, through ConfigureHost on every node (the override is a
+// replicated hosts column, read wherever admission runs).
+func setHostMemReserve(t *testing.T, c *Cluster, host string, mib int32) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		if _, err := c.SelfClient(n).ConfigureHost(context.Background(), &pb.ConfigureHostRequest{
+			Name: host, MemReserveMib: &mib,
+		}); err != nil {
+			t.Fatalf("ConfigureHost %s mem_reserve_mib=%d on %s: %v", host, mib, n.Name, err)
+		}
 	}
-	return *p
 }
 
 // runVM asks node n to create a VM, optionally pinned to a specific host.
@@ -96,9 +110,9 @@ func TestFleet_Capacity_PlacementSkipsTheHostItWouldOtherwisePrefer(t *testing.T
 	tiny, big := c.Nodes[0], c.Nodes[1]
 
 	// tiny: 2 GiB, idle → 0% utilization, but ~1 GiB allocatable after the reserve.
-	setHostCapacity(t, c, tiny.Name, 8, 2048, nil)
+	setHostCapacity(t, c, tiny.Name, 8, 2048)
 	// big: 64 GiB, half consumed → 50% utilization, and tens of GiB free.
-	setHostCapacity(t, c, big.Name, 32, 65536, nil)
+	setHostCapacity(t, c, big.Name, 32, 65536)
 	if err := corrosion.InsertVM(ctx, tiny.DB, corrosion.VMRecord{
 		Name: "ballast", HostName: big.Name, State: "running", Spec: "{}",
 		CPUActual: 8, MemActual: 32768,
@@ -130,8 +144,8 @@ func TestFleet_Capacity_PinnedCreateIsAdmittedAgainstTheTargetHost(t *testing.T)
 	ctx := context.Background()
 	entry, target := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 32, 65536, nil) // entry: enormous
-	setHostCapacity(t, c, target.Name, 8, 4096, nil)  // target: small
+	setHostCapacity(t, c, entry.Name, 32, 65536) // entry: enormous
+	setHostCapacity(t, c, target.Name, 8, 4096)  // target: small
 	if err := corrosion.InsertVM(ctx, entry.DB, corrosion.VMRecord{
 		Name: "sitting", HostName: target.Name, State: "running", Spec: "{}",
 		CPUActual: 1, MemActual: 2800,
@@ -156,11 +170,11 @@ func TestFleet_Capacity_PerHostOverrideDiffersAcrossTheFleet(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	strict, generous := c.Nodes[0], c.Nodes[1]
 
-	zero := 0
 	// Same physical size; only the reserve differs. 2048 MiB total: the default
 	// 1024 reserve leaves 1024, an explicit zero reserve leaves all 2048.
-	setHostCapacity(t, c, strict.Name, 8, 2048, nil)     // inherit → 1024 reserve
-	setHostCapacity(t, c, generous.Name, 8, 2048, &zero) // explicit zero reserve
+	setHostCapacity(t, c, strict.Name, 8, 2048)   // inherit → 1024 reserve
+	setHostCapacity(t, c, generous.Name, 8, 2048) // …
+	setHostMemReserve(t, c, generous.Name, 0)     // explicit zero reserve
 
 	if _, err := runVM(t, c, strict, "strict-vm", strict.Name, 1, 1600); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("1600 MiB onto the host with the default reserve: got %v, want ResourceExhausted", err)
@@ -178,8 +192,8 @@ func TestFleet_Capacity_ContainersCountAgainstVMs(t *testing.T) {
 	ctx := context.Background()
 	entry, target := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 32, 65536, nil)
-	setHostCapacity(t, c, target.Name, 8, 4096, nil) // allocatable 3072
+	setHostCapacity(t, c, entry.Name, 32, 65536)
+	setHostCapacity(t, c, target.Name, 8, 4096) // allocatable 3072
 
 	// A running, CAPPED container eats most of the target's headroom.
 	if err := corrosion.UpsertContainer(ctx, entry.DB, corrosion.ContainerRecord{
@@ -264,8 +278,8 @@ func TestFleet_Capacity_ConcurrentSameProjectAdmissions(t *testing.T) {
 	ctx := context.Background()
 	a, b := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, a.Name, 64, 65536, nil)
-	setHostCapacity(t, c, b.Name, 64, 65536, nil)
+	setHostCapacity(t, c, a.Name, 64, 65536)
+	setHostCapacity(t, c, b.Name, 64, 65536)
 
 	// Quota fits ONE 4 GiB VM, not two.
 	if _, err := c.SelfClient(a).CreateProject(ctx, &pb.CreateProjectRequest{
@@ -366,8 +380,8 @@ func TestFleet_Capacity_ConcurrentPinnedCreatesExactlyOneRefusal(t *testing.T) {
 	ctx := context.Background()
 	entry, target := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil) // entry: irrelevant, huge
-	setHostCapacity(t, c, target.Name, 64, 4096, nil) // target: fits exactly two
+	setHostCapacity(t, c, entry.Name, 64, 65536) // entry: irrelevant, huge
+	setHostCapacity(t, c, target.Name, 64, 4096) // target: fits exactly two
 
 	// Dial BEFORE the goroutines: SelfClient lazily builds the connection and calls
 	// t.Fatalf, neither of which is legal off the test goroutine. A ClientConn is
@@ -448,8 +462,8 @@ func TestFleet_Capacity_ConcurrentStartsExactlyOneRefusal(t *testing.T) {
 	ctx := context.Background()
 	entry, target := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
-	setHostCapacity(t, c, target.Name, 64, 4096, nil) // allocatable 3072 → two fit
+	setHostCapacity(t, c, entry.Name, 64, 65536)
+	setHostCapacity(t, c, target.Name, 64, 4096) // allocatable 3072 → two fit
 
 	names := make([]string, concurrent)
 	for i := range names {

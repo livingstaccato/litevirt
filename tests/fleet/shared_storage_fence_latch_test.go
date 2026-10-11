@@ -44,7 +44,7 @@ import (
 func makeWitness(t *testing.T, c *Cluster, witness *Node) {
 	t.Helper()
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`UPDATE hosts SET role = 'witness', updated_at = ? WHERE name = ?`,
 			n.DB.NowTS(), witness.Name); err != nil {
 			t.Fatalf("make %s a witness in %s's rows: %v", witness.Name, n.Name, err)

@@ -242,7 +242,7 @@ func TestReplicationReverse_AFailoverRescheduleSwitchesTheScheduleItLandsOn(t *t
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	nowRFC := time.Now().UTC().Format(time.RFC3339)
 	for _, observer := range []string{a.Name, b.Name} {
-		if err := a.DB.Execute(ctx,
+		if err := localExec(ctx, a.DB,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', 5, NULL, ?)`, observer, victim.Name, nowRFC); err != nil {
 			t.Fatal(err)

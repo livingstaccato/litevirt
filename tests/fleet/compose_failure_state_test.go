@@ -60,9 +60,7 @@ func newComposeFailNode(t *testing.T) (*Cluster, *Node, pb.LiteVirtClient) {
 	c := New(t, Options{Nodes: 1})
 	node := c.Nodes[0]
 	ctx := context.Background()
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+	if err := corrosion.InsertImage(ctx, node.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 		t.Fatalf("seed image: %v", err)
 	}
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
@@ -135,7 +133,7 @@ func lastAuditResult(t *testing.T, ctx context.Context, db *corrosion.Client, ac
 // injected undefine failure is retried by deleteVMWithFanout for ~18s.
 func barVMDelete(t *testing.T, ctx context.Context, db *corrosion.Client, vm string) {
 	t.Helper()
-	if err := db.Execute(ctx, `UPDATE vms SET active_operation_id = 'op-injected' WHERE name = ?`, vm); err != nil {
+	if err := localExec(ctx, db, `UPDATE vms SET active_operation_id = 'op-injected' WHERE name = ?`, vm); err != nil {
 		t.Fatalf("set mutation barrier on %s: %v", vm, err)
 	}
 }

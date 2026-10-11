@@ -168,7 +168,7 @@ func TestFleet_ForgedArchiveRelocationAttachesNoForeignNetwork(t *testing.T) {
 	coord, dead, target := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	const token = "tok-forged"
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	for _, nr := range []corrosion.NetworkRecord{
 		{Name: "ctnet", Type: "bridge", Config: `{"type":"bridge","interface":"br-ctnet"}`},

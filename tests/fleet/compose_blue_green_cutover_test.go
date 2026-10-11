@@ -89,9 +89,7 @@ func TestFleet_ComposeBlueGreenFailedBlueDeleteLeavesStackDegraded(t *testing.T)
 // seedImage registers and stages a second image on node.
 func seedImage(t *testing.T, ctx context.Context, node *Node, name string) {
 	t.Helper()
-	if err := node.DB.Execute(ctx,
-		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES (?, 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`, name); err != nil {
+	if err := corrosion.InsertImage(ctx, node.DB, corrosion.ImageRecord{Name: name, Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
 		t.Fatalf("seed image %s: %v", name, err)
 	}
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests(name)); err != nil {

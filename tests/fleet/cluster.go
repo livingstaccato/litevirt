@@ -41,6 +41,27 @@
 //
 // Membership is seeded, not gossiped (seedGossipMembership), in every mode —
 // unless Options.RealGossip gives every node a real memberlist (gossip_real.go).
+//
+// # Three things a scenario author trips over
+//
+//   - Seeding state. A raw n.DB.Execute is a REPLICATED write: it is logged for
+//     every peer, and a shape the compatibility ledger does not know is refused
+//     by every receiver and stalls the writer's stream for the rest of the
+//     test. Cluster.Stop fails any test (SharedCRDT excepted) that logged one,
+//     naming the statement (replicated_shapes.go). Seed a row peers should get
+//     through the corrosion builder production uses; seed a row, a tamper or a
+//     failure-injection trigger meant for ONE node with localExec
+//     (local_exec.go), which logs nothing.
+//   - Who a call comes from. A node's call to another node arrives from that
+//     node's address in 192.0.2.0/24, not loopback, so the receiver classifies
+//     it as a cluster PEER, as production does; SelfClient (a node's own
+//     certificate) stays on loopback, the on-node root. RemoteClient presents a
+//     node's own certificate from off the box. FLEET_LOOPBACK_PEERS=1 restores
+//     the old all-loopback view for an audit (peer_identity.go).
+//   - Forwarded identity is off unless a scenario turns it on
+//     (Server.SetForwardedIdentity plus a latched forwarded_identity_v1), so a
+//     forwarded call runs as the forwarding peer by default
+//     (TestFleet_PeerIdentity_TheOwnerJudgesAForwardedCallAsTheUser shows both).
 package fleet
 
 import (
@@ -199,6 +220,16 @@ type Cluster struct {
 	// ClaimFault does (claim_faults.go).
 	claimScriptMu sync.Mutex
 	claimScript   ClaimScript
+	// shapesChecked records that Stop ran checkReplicatedShapes, and
+	// unregisteredAllowed is the reason a scenario gave for turning it off
+	// (replicated_shapes.go).
+	shapesChecked       bool
+	unregisteredAllowed string
+	// shapeErrorf, when set, receives the check's failure instead of t.Errorf:
+	// how a test of the check itself observes it.
+	shapeErrorf func(format string, args ...any)
+	// remote marks the connections RemoteClient dialled (peer_identity.go).
+	remote remoteMarks
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -534,6 +565,8 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
+	// Before anything closes: the logged statements are read from each DB.
+	c.checkReplicatedShapes()
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -908,6 +941,8 @@ func (c *Cluster) buildServer(n *Node) {
 	if err != nil {
 		c.t.Fatalf("server TLS for %s: %v", n.Name, err)
 	}
+	// A peer's connection is presented with the peer's network address, not
+	// loopback, before anything reads it (peer_identity.go).
 	// Auth interceptors mirror the daemon's wiring — without them
 	// authenticate() never runs and every RPC fails RequireRole.
 	// With no bearer token in metadata the auth path treats the
@@ -927,8 +962,8 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	srv := grpc.NewServer(append(trackOpts,
 		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
-		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
+		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
+		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
@@ -1201,14 +1236,17 @@ func NewClusterWithNetBoxNamed(t *testing.T, nodes int, nb *NetBoxFake, namePref
 //
 // The NAME is the one thing still set by hand. The heal deliberately leaves it
 // empty (nothing in litevirt takes a cluster name), and scenarios that assert
-// which NetBox cluster object the mirror wrote into need a stable one.
+// which NetBox cluster object the mirror wrote into need a stable one. It is
+// written locally, on each node as it is wired: no production statement sets
+// it, so a replicated write of it would be refused by every peer and stall
+// this node's replication behind it (replicated_shapes.go).
 func (c *Cluster) wireNetBox(n *Node) {
 	c.t.Helper()
 
 	if err := corrosion.EnsureClusterRecord(context.Background(), n.DB, n.PKIDir); err != nil {
 		c.t.Fatalf("derive cluster record for %s: %v", n.Name, err)
 	}
-	rows, err := n.DB.ExecuteRows(context.Background(),
+	rows, err := localExecRows(context.Background(), n.DB,
 		`UPDATE cluster SET name = ?, domain = ?, updated_at = ? WHERE id = 'default'`,
 		"fleet", "fleet.local", n.DB.NowTS())
 	if err != nil {
@@ -1275,14 +1313,16 @@ func (c *Cluster) wireNetBox(n *Node) {
 // is a SHA-256 of that column, so ANY different string is a different cluster
 // identity. Re-minting the PKI would additionally invalidate every node
 // certificate the harness dials with — a second, unrelated failure that would
-// stop these scenarios reaching the binding logic at all. Every node is written
-// so the fleet stays uniform, exactly as a replicated row would be.
+// stop these scenarios reaching the binding logic at all. Every node is written,
+// locally, so the fleet stays uniform, exactly as a replicated row would be: no
+// production statement rewrites the column, so a replicated write would be
+// refused by every peer (replicated_shapes.go).
 func (c *Cluster) MoveClusterFingerprint() {
 	c.t.Helper()
 	replacement := fmt.Sprintf("-----BEGIN CERTIFICATE-----\nreplacement-ca-%d\n-----END CERTIFICATE-----\n",
 		time.Now().UnixNano())
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`UPDATE cluster SET ca_cert = ?, updated_at = ? WHERE id = 'default'`,
 			replacement, n.DB.NowWall()); err != nil {
 			c.t.Fatalf("move the cluster fingerprint on %s: %v", n.Name, err)
@@ -1307,13 +1347,13 @@ func (c *Cluster) MoveClusterFingerprint() {
 // scenario reaches the window between a started domain and its durable row.
 func (n *Node) FailVMRowWrites(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_vm_insert BEFORE INSERT ON vms
 		 BEGIN SELECT RAISE(ABORT, 'induced vm persist failure'); END`); err != nil {
 		t.Fatalf("install vm-insert failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_vm_insert`); err != nil {
 			t.Fatalf("drop vm-insert failure trigger on %s: %v", n.Name, err)
 		}
@@ -1329,13 +1369,13 @@ func (n *Node) FailVMRowWrites(t *testing.T) func() {
 // already on the ground.
 func (n *Node) FailNICRowWrites(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_legacy_nic_insert BEFORE INSERT ON vm_interfaces
 		 BEGIN SELECT RAISE(ABORT, 'induced legacy interface persist failure'); END`); err != nil {
 		t.Fatalf("install legacy-interface-insert failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_legacy_nic_insert`); err != nil {
 			t.Fatalf("drop legacy-interface-insert failure trigger on %s: %v", n.Name, err)
 		}
@@ -1351,14 +1391,14 @@ func (n *Node) FailNICRowWrites(t *testing.T) func() {
 // must NOT give the claimed address away.
 func (n *Node) FailNICRowDelete(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_nic_tombstone BEFORE UPDATE ON vm_nics
 		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
 		 BEGIN SELECT RAISE(ABORT, 'induced nic tombstone failure'); END`); err != nil {
 		t.Fatalf("install nic-tombstone failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_nic_tombstone`); err != nil {
 			t.Fatalf("drop nic-tombstone failure trigger on %s: %v", n.Name, err)
 		}
@@ -1373,14 +1413,14 @@ func (n *Node) FailNICRowDelete(t *testing.T) func() {
 // failed while the remote IPAM object still exists.
 func (n *Node) FailLeaseTombstones(t *testing.T) func() {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER test_fail_lease_tombstone BEFORE UPDATE ON ip_allocations
 		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
 		 BEGIN SELECT RAISE(ABORT, 'induced tombstone failure'); END`); err != nil {
 		t.Fatalf("install lease-tombstone failure trigger on %s: %v", n.Name, err)
 	}
 	drop := func() {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`DROP TRIGGER IF EXISTS test_fail_lease_tombstone`); err != nil {
 			t.Fatalf("drop lease-tombstone failure trigger on %s: %v", n.Name, err)
 		}

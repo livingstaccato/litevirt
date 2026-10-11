@@ -62,7 +62,7 @@ func TestFleetSweepDoesNotFreeAnAddressAPeerOnlyTombstoneHolds(t *testing.T) {
 	holder.Rejoin()
 	ctx := context.Background()
 
-	if err := sweeper.DB.Execute(ctx, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
+	if err := localExec(ctx, sweeper.DB, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
 	sweeper.DB.SetMembersForTests(func() []corrosion.PeerInfo {
@@ -87,7 +87,7 @@ func TestFleetSweepDoesNotFreeAnAddressAPeerOnlyTombstoneHolds(t *testing.T) {
 	}
 	// The only peer-side record of the holder is a tombstone: ListHosts omits it
 	// while the table's digest still counts it.
-	if err := peer.DB.Execute(ctx,
+	if err := localExec(ctx, peer.DB,
 		"UPDATE hosts SET deleted_at = '2026-09-01T00:00:00Z' WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestFleetBindDoesNotHandOutTheAddressOfAPeerOnlyTombstonedHolder(t *testing
 	mustCreateVMHoldingIP(t, c, holder, "incumbent", adoptNetName, adoptFirstIP)
 
 	ctx := context.Background()
-	if err := binder.DB.Execute(ctx, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
+	if err := localExec(ctx, binder.DB, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
 	binder.DB.SetMembersForTests(func() []corrosion.PeerInfo {
@@ -135,7 +135,7 @@ func TestFleetBindDoesNotHandOutTheAddressOfAPeerOnlyTombstonedHolder(t *testing
 	peer.DB.SetMembersForTests(func() []corrosion.PeerInfo {
 		return []corrosion.PeerInfo{{Name: binder.Name, Addr: net.JoinHostPort(binder.Address, "7946")}}
 	})
-	if err := peer.DB.Execute(ctx,
+	if err := localExec(ctx, peer.DB,
 		"UPDATE hosts SET deleted_at = '2026-09-01T00:00:00Z' WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestFleetSweepDoesNotFreeAnAddressAGossipOnlyHolderHolds(t *testing.T) {
 	holder.Rejoin()
 	ctx := context.Background()
 	for _, n := range []*Node{sweeper, peer} {
-		if err := n.DB.Execute(ctx, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
+		if err := localExec(ctx, n.DB, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 			t.Fatal(err)
 		}
 	}

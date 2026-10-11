@@ -23,7 +23,7 @@ func TestFleet_RestoreForgedSpecBridges(t *testing.T) {
 	ctx := context.Background()
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	if err := corrosion.UpsertNetwork(ctx, src.DB, corrosion.NetworkRecord{Name: "ctnet", Type: "bridge",
 		Config: `{"type":"bridge","interface":"br-ctnet"}`}); err != nil {

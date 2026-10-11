@@ -42,7 +42,7 @@ func setupFilledHost(t *testing.T) (context.Context, *Node, pb.LiteVirtClient) {
 	ctx := context.Background()
 	// 4 vCPU / 2971 MiB → 15 vCPU / 1947 MiB allocatable under the default
 	// policy. db's 1024+128 fits once; twice it does not.
-	if err := node.DB.Execute(ctx, `UPDATE hosts SET cpu_total = 4, mem_total = 2971 WHERE name = ?`, node.Name); err != nil {
+	if err := localExec(ctx, node.DB, `UPDATE hosts SET cpu_total = 4, mem_total = 2971 WHERE name = ?`, node.Name); err != nil {
 		t.Fatalf("size host: %v", err)
 	}
 	deployClean(t, ctx, client, composeFillHost)

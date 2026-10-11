@@ -34,7 +34,7 @@ func TestFleet_SchemaSkewBackPressure(t *testing.T) {
 	// Simulate the receiver being on an older binary by dropping a
 	// new-feature table. service_endpoints is a leaf table with no
 	// FK constraints so dropping it is a clean test fixture.
-	if err := receiver.DB.Execute(ctx, "DROP TABLE service_endpoints"); err != nil {
+	if err := localExec(ctx, receiver.DB, "DROP TABLE service_endpoints"); err != nil {
 		t.Fatalf("DROP TABLE on receiver: %v", err)
 	}
 

@@ -31,7 +31,7 @@ import (
 // written directly.
 func seedFenceAttempt(t *testing.T, n *Node, host, id, method, result string, at time.Time) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
 		id, host, method, result, at.UTC().Format(time.RFC3339), "an earlier outage's fence"); err != nil {
 		t.Fatalf("seed fence attempt %s: %v", id, err)

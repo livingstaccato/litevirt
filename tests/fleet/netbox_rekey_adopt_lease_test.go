@@ -45,7 +45,7 @@ func stealLeaseDuringClaim(nb *NetBoxFake, n *Node, holder string) func() error 
 	nb.SetOnClaimSpecific(func(string) error {
 		once.Do(func() {
 			expires := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
-			err := n.DB.Execute(context.Background(),
+			err := localExec(context.Background(), n.DB,
 				`INSERT INTO leader_election (key, holder, expires_at, updated_at)
 				 VALUES ('netbox', ?, ?, ?)
 				 ON CONFLICT(key) DO UPDATE SET holder = excluded.holder,

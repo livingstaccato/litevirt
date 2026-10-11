@@ -9,11 +9,11 @@
 // host would refuse it. Only a real fleet reaches this: the placement, the
 // judgement on another host and the forwarded create are different daemons.
 //
-// Forwarded identity is not reachable here: every fleet node dials loopback,
-// and a loopback peer is local-root, which is never promoted to the relayed
-// user. internal/grpcapi/iso_recreate_placement_test.go drives the same
-// rebuild and recreate against a second host that judges the relayed
-// Operator.
+// These scenarios run without forwarded identity enforced, so the second host
+// judges the forwarding peer. internal/grpcapi/iso_recreate_placement_test.go
+// drives the same rebuild and recreate against a second host that judges the
+// relayed Operator; the fleet can now reach that too (peer_identity.go,
+// TestFleet_PeerIdentity_TheOwnerJudgesAForwardedCallAsTheUser).
 package fleet
 
 import (

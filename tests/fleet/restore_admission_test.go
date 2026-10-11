@@ -100,8 +100,8 @@ func TestFleet_RestoreLive_IsAdmittedAgainstTheRestoringHostsCapacity(t *testing
 	ctx := context.Background()
 	tight, roomy := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, roomy.Name, 64, 65536, nil)
-	setHostCapacity(t, c, tight.Name, 8, 2048, nil) // ~1 GiB allocatable
+	setHostCapacity(t, c, roomy.Name, 64, 65536)
+	setHostCapacity(t, c, tight.Name, 8, 2048) // ~1 GiB allocatable
 	repo, ts := seedVMBackup(t, "backed-up", "", 2, 4096)
 
 	err := restoreLiveAt(t, c, tight, repo, "backed-up", ts, "restored")
@@ -117,7 +117,7 @@ func TestFleet_RestoreLive_IsAdmittedAgainstTheRestoringHostsCapacity(t *testing
 	}
 
 	// Control: the same restore once this host can hold it.
-	setHostCapacity(t, c, tight.Name, 64, 65536, nil)
+	setHostCapacity(t, c, tight.Name, 64, 65536)
 	if err := restoreLiveAt(t, c, tight, repo, "backed-up", ts, "restored-ok"); err != nil {
 		t.Fatalf("live-restore onto a host with tens of GiB free: %v", err)
 	}
@@ -151,8 +151,8 @@ func TestFleet_RestoreLive_ChargesTheProjectsQuota(t *testing.T) {
 	ctx := context.Background()
 	n, peer := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
-	setHostCapacity(t, c, peer.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
+	setHostCapacity(t, c, peer.Name, 64, 65536)
 	if err := corrosion.InsertProject(ctx, n.DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}
@@ -273,11 +273,11 @@ func TestFleet_RestoreContainer_IsAdmittedAgainstTheRestoringHostsCapacity(t *te
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	createSizedContainer(t, c, src, "ct-backed", "", 1, 2048)
 	repo, ts := backupContainer(t, c, src, "ct-backed")
 
-	setHostCapacity(t, c, dst.Name, 8, 2048, nil) // ~1 GiB allocatable
+	setHostCapacity(t, c, dst.Name, 8, 2048) // ~1 GiB allocatable
 	err := restoreContainerAt(t, c, dst, repo, "ct-backed", ts)
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("restoring a 2048 MiB container onto a host with ~1 GiB free: got %v, want ResourceExhausted", err)
@@ -291,7 +291,7 @@ func TestFleet_RestoreContainer_IsAdmittedAgainstTheRestoringHostsCapacity(t *te
 	}
 
 	// Control: the same restore once the host can hold it.
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	if err := restoreContainerAt(t, c, dst, repo, "ct-backed", ts); err != nil {
 		t.Fatalf("restore onto a host with tens of GiB free: %v", err)
 	}
@@ -315,8 +315,8 @@ func TestFleet_RestoreContainer_ChargesTheProjectsQuota(t *testing.T) {
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	if err := corrosion.InsertProject(ctx, src.DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}
@@ -362,8 +362,8 @@ func TestFleet_RestoreContainer_CPUOnlyRestoreIsStillAdmitted(t *testing.T) {
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	if err := corrosion.InsertProject(ctx, src.DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}
@@ -419,8 +419,8 @@ func TestFleet_RestoreContainer_FailoverRelocationIsNotBlockedByQuota(t *testing
 	ctx := context.Background()
 	src, dst := c.Nodes[0], c.Nodes[1]
 
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	if err := corrosion.InsertProject(ctx, src.DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
 	}

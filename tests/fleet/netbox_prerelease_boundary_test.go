@@ -36,7 +36,7 @@ import (
 func seedPrereleaseAccounting(t *testing.T, n *Node) {
 	t.Helper()
 	ctx := context.Background()
-	if err := n.DB.Execute(ctx, `CREATE TABLE netbox_recovery_manifests (
+	if err := localExec(ctx, n.DB, `CREATE TABLE netbox_recovery_manifests (
 		id TEXT PRIMARY KEY, cluster_fingerprint TEXT NOT NULL, host_name TEXT NOT NULL,
 		host_incarnation TEXT NOT NULL, premise TEXT NOT NULL, accounting TEXT NOT NULL,
 		attested_by TEXT NOT NULL, attested_at TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -47,7 +47,7 @@ func seedPrereleaseAccounting(t *testing.T, n *Node) {
 	if err != nil {
 		t.Fatalf("ClusterFingerprint on %s: %v", n.Name, err)
 	}
-	if err := n.DB.Execute(ctx, `INSERT INTO netbox_recovery_manifests
+	if err := localExec(ctx, n.DB, `INSERT INTO netbox_recovery_manifests
 		(id, cluster_fingerprint, host_name, host_incarnation, premise, accounting,
 		 attested_by, attested_at, created_at, updated_at)
 		VALUES ('an-account', ?, 'a-lost-host', 'an-incarnation', 'membership', '',

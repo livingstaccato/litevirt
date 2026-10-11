@@ -82,10 +82,10 @@ func TestFleet_MigrateVM_IsAdmittedAgainstTheTargetHostsCapacity(t *testing.T) {
 	ctx := context.Background()
 	entry, src, dst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 
-	setHostCapacity(t, c, entry.Name, 64, 65536, nil)
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, entry.Name, 64, 65536)
+	setHostCapacity(t, c, src.Name, 64, 65536)
 	// dst: ~1 GiB allocatable after the default reserve — cannot hold a 4 GiB VM.
-	setHostCapacity(t, c, dst.Name, 8, 2048, nil)
+	setHostCapacity(t, c, dst.Name, 8, 2048)
 
 	seedRunningVM(t, c, src, "mover", "", 2, 4096)
 
@@ -108,7 +108,7 @@ func TestFleet_MigrateVM_IsAdmittedAgainstTheTargetHostsCapacity(t *testing.T) {
 
 	// Control: the same migration once the target can hold it. Without this the
 	// refusal above passes for any reason at all, including a broken migrate path.
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	if err := migrateAt(t, c, entry, "mover", dst.Name); err != nil {
 		t.Fatalf("migrate onto a host with tens of GiB free: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestFleet_MigrateVM_DoesNotChargeTheProjectQuotaTwice(t *testing.T) {
 
 	// Every host is huge, so nothing but the quota could refuse this.
 	for _, n := range []*Node{entry, src, dst} {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	if err := corrosion.InsertProject(ctx, c.Nodes[0].DB, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
 		t.Fatalf("InsertProject: %v", err)
@@ -166,7 +166,7 @@ func TestFleet_MigrateVM_ReleasesItsReservation(t *testing.T) {
 	entry, src, dst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 
 	for _, n := range []*Node{entry, src, dst} {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	seedRunningVM(t, c, src, "rel-vm", "", 2, 4096)
 
@@ -197,7 +197,7 @@ func TestFleet_MigrateVM_RefusedWhenTargetInventoryIncomplete(t *testing.T) {
 	entry, src, dst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 
 	for _, n := range []*Node{entry, src, dst} {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 	seedRunningVM(t, c, src, "blind-mover", "", 2, 4096)
 
@@ -248,8 +248,8 @@ func TestFleet_MigrateContainer_IsAdmittedAgainstTheTargetHostsCapacity(t *testi
 	src, dst := c.Nodes[0], c.Nodes[1]
 	const name = "ct-toobig"
 
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 8, 2048, nil) // ~1 GiB allocatable
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 8, 2048) // ~1 GiB allocatable
 
 	if _, err := c.SelfClient(src).CreateContainer(context.Background(), &pb.CreateContainerRequest{
 		HostName: src.Name, Name: name, Template: "download",
@@ -275,7 +275,7 @@ func TestFleet_MigrateContainer_IsAdmittedAgainstTheTargetHostsCapacity(t *testi
 	// capacity and not the migrate path failing for its own reasons — and that one
 	// move reserves exactly ONCE (a source lease plus an unconditional target-side
 	// lease would need 2× the container's memory free and refuse this).
-	setHostCapacity(t, c, dst.Name, 8, 4096, nil) // 3072 allocatable: fits one 2048, not two
+	setHostCapacity(t, c, dst.Name, 8, 4096) // 3072 allocatable: fits one 2048, not two
 	if err := runMigrate(t, c, src, dst, name, stagingRepo(t)); err != nil {
 		t.Fatalf("cold-migrating a 2048 MiB container onto a host with 3072 MiB allocatable: %v", err)
 	}

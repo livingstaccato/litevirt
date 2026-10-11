@@ -32,7 +32,7 @@ func mustRunMaintenance(t *testing.T, n *Node) {
 // enumeration is untouched and would happily proceed.
 func failBindingWrites(t *testing.T, n *Node) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`CREATE TRIGGER netbox_binding_writes_fail_test BEFORE UPDATE ON netbox_bindings
 		 BEGIN SELECT RAISE(ABORT, 'binding write refused by the test'); END`); err != nil {
 		t.Fatalf("install binding-write trigger on %s: %v", n.Name, err)

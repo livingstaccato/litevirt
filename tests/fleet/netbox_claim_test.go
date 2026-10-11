@@ -121,7 +121,7 @@ func leaseCount(t *testing.T, n *Node, network string) int {
 func seedClusterRow(t *testing.T, c *Cluster) {
 	t.Helper()
 	for _, n := range c.Nodes {
-		if err := n.DB.Execute(context.Background(),
+		if err := localExec(context.Background(), n.DB,
 			`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
 			 VALUES ('default', 'fleet', 'fleet.local', 'fleet-ca-cert', ?, ?)
 			 ON CONFLICT(id) DO NOTHING`,

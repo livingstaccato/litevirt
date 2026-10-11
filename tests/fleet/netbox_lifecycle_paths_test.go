@@ -281,7 +281,7 @@ func TestCloneStillWorksOnAnUnboundNetwork(t *testing.T) {
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	seedClusterRow(t, c)
 	seedContainerNetwork(t, c)
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "src", ctNetName)
 	mustStopVM(t, c, n, "src")
@@ -331,7 +331,7 @@ func TestRestoreRefusedOntoBoundNetwork(t *testing.T) {
 	_, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	repo, ts := seedVMBackupOnNetwork(t, "backed-up", orphanNetwork)
 
@@ -479,7 +479,7 @@ func TestCutoverReleasesTheReplacedVMsLease(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -518,7 +518,7 @@ func TestCutoverKeepsTheReplacedVMsAddressWhenItDoesNotCommit(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -527,7 +527,7 @@ func TestCutoverKeepsTheReplacedVMsAddressWhenItDoesNotCommit(t *testing.T) {
 	oldIdentity := nicIdentityOf(t, n, "app")
 
 	// The transition cannot commit: the tombstone is refused.
-	if err := n.DB.Execute(ctx, `CREATE TRIGGER block_cutover_delete BEFORE UPDATE OF deleted_at ON vms
+	if err := localExec(ctx, n.DB, `CREATE TRIGGER block_cutover_delete BEFORE UPDATE OF deleted_at ON vms
  WHEN OLD.name = 'app' AND NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +557,7 @@ func TestCutoverRetriesAFailedAddressRelease(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -606,7 +606,7 @@ func TestCutoverRetryReusesTheJournaledManifest(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -647,14 +647,14 @@ func TestCutoverResumeTreatsAnAlreadyDeletedAddressAsReleased(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
 	latchCutoverCapabilities(t, c)
 
 	// Only the phase RECORD fails: both halves of the release land first.
-	if err := n.DB.Execute(ctx, `CREATE TRIGGER block_released_step BEFORE INSERT ON operation_steps
+	if err := localExec(ctx, n.DB, `CREATE TRIGGER block_released_step BEFORE INSERT ON operation_steps
  WHEN NEW.step_name = 'released' BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
 		t.Fatal(err)
 	}
@@ -664,7 +664,7 @@ func TestCutoverResumeTreatsAnAlreadyDeletedAddressAsReleased(t *testing.T) {
 	if got, ids := leaseCount(t, n, orphanNetwork), nb.Identities(); got != 1 || len(ids) != 1 {
 		t.Fatalf("the fixture did not reach the boundary it tests: %d leases, NetBox %v", got, ids)
 	}
-	if err := n.DB.Execute(ctx, `DROP TRIGGER block_released_step`); err != nil {
+	if err := localExec(ctx, n.DB, `DROP TRIGGER block_released_step`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -683,7 +683,7 @@ func TestCutoverResumeLeavesAReassignedAddressAlone(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -721,7 +721,7 @@ func TestCutoverReleasesACrossHostOriginalsAddress(t *testing.T) {
 	oldHost, nextHost := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 
 	mustCreateVMWithDiskOnNetwork(t, c, oldHost, "app", orphanNetwork)
@@ -764,7 +764,7 @@ func TestCutoverLeavesAReclaimedLeaseRowAlone(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -785,7 +785,7 @@ func TestCutoverLeavesAReclaimedLeaseRowAlone(t *testing.T) {
 	n.Server.SetCutoverCrashHook(nil)
 
 	// The row at that key now backs a different allocation.
-	if err := n.DB.Execute(ctx,
+	if err := localExec(ctx, n.DB,
 		`UPDATE ip_allocations SET netbox_ip_id = 12345 WHERE network = ? AND ip = ?`,
 		orphanNetwork, oldIP); err != nil {
 		t.Fatal(err)
@@ -812,7 +812,7 @@ func TestCutoverRetryLeavesAReassignedAddressAloneWhenTheLeaseRowSurvived(t *tes
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -858,7 +858,7 @@ func TestCutoverRefusesWhileTheOriginalStillHasADomainOnAnotherHost(t *testing.T
 	oldHost, nextHost := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
 	for _, n := range c.Nodes {
-		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+		setHostCapacity(t, c, n.Name, 64, 65536)
 	}
 
 	mustCreateVMWithDiskOnNetwork(t, c, oldHost, "app", orphanNetwork)
@@ -897,7 +897,7 @@ func TestCutoverLeavesAnAddressAnotherWorkloadNowHoldsAlone(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 	ctx := context.Background()
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
@@ -921,7 +921,7 @@ func TestCutoverLeavesAnAddressAnotherWorkloadNowHoldsAlone(t *testing.T) {
 	// external object, external identity — stays exactly as the manifest captured
 	// it. A local owner is not part of a NetBox identity, so the identity check
 	// alone cannot see this.
-	if err := n.DB.Execute(ctx,
+	if err := localExec(ctx, n.DB,
 		`UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE network = ? AND ip = ?`,
 		"retained", n.DB.NowTS(), orphanNetwork, oldIP); err != nil {
 		t.Fatal(err)

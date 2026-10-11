@@ -39,7 +39,7 @@ func TestPeerBootstrap_AClusterThatHasNotMetYetCanReplicate(t *testing.T) {
 			if other.Name == n.Name {
 				continue
 			}
-			if err := n.DB.Execute(ctx, `DELETE FROM hosts WHERE name = ?`, other.Name); err != nil {
+			if err := localExec(ctx, n.DB, `DELETE FROM hosts WHERE name = ?`, other.Name); err != nil {
 				t.Fatalf("un-register %s on %s: %v", other.Name, n.Name, err)
 			}
 		}
@@ -225,7 +225,7 @@ func TestPeerBootstrap_OutboundPeerRPCsWorkBeforeConvergence(t *testing.T) {
 
 	// a has never heard of b — no replicated row, only gossip membership, which is
 	// what a node actually has for a peer that has just been provisioned.
-	if err := a.DB.Execute(ctx, `DELETE FROM hosts WHERE name = ?`, b.Name); err != nil {
+	if err := localExec(ctx, a.DB, `DELETE FROM hosts WHERE name = ?`, b.Name); err != nil {
 		t.Fatalf("un-register %s on %s: %v", b.Name, a.Name, err)
 	}
 	a.DB.SetMembersForTests(func() []corrosion.PeerInfo {

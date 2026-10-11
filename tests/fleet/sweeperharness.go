@@ -125,7 +125,7 @@ func (n *Node) Stop() {
 // replication lag produces in production.
 func (n *Node) InsertLocalNICRow(t *testing.T, vmName, mac, ip string) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO vm_nics (vm_name, id, network_name, model, mac, ordinal, ip, updated_at)
 		 VALUES (?, ?, ?, 'virtio', ?, 0, ?, ?)`,
 		vmName, "nic-0", "bound", mac, ip, n.DB.NowTS()); err != nil {
@@ -145,12 +145,12 @@ func (n *Node) InsertLocalNICRow(t *testing.T, vmName, mac, ip string) {
 func (n *Node) FailFencingLogRead(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
-	if err := n.DB.Execute(ctx,
+	if err := localExec(ctx, n.DB,
 		`ALTER TABLE fencing_log RENAME TO fencing_log_hidden_by_test`); err != nil {
 		t.Fatalf("hide fencing_log on %s: %v", n.Name, err)
 	}
 	t.Cleanup(func() {
-		if err := n.DB.Execute(ctx,
+		if err := localExec(ctx, n.DB,
 			`ALTER TABLE fencing_log_hidden_by_test RENAME TO fencing_log`); err != nil {
 			t.Logf("restore fencing_log on %s: %v", n.Name, err)
 		}

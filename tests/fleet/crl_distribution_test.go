@@ -201,7 +201,7 @@ func TestFleet_ATombstoneCannotBuryARevocation(t *testing.T) {
 	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
 
 	// What the host being revoked does with the peer credentials it still holds.
-	if err := b.DB.Execute(ctx,
+	if err := localExec(ctx, b.DB,
 		`UPDATE cluster_crl SET deleted_at = ?, updated_at = ?`, b.DB.NowTS(), b.DB.NowTS()); err != nil {
 		t.Fatalf("tombstone the CRL row: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestFleet_SquattedRowsCannotBlockAGenuineRevocation(t *testing.T) {
 	sum := sha256.Sum256(genuine)
 	id := fmt.Sprintf("%x", sum[:])
 	now := a.DB.NowTS()
-	if err := a.DB.Execute(ctx,
+	if err := localExec(ctx, a.DB,
 		`INSERT INTO cluster_crl (id, crl_pem, created_at, updated_at, deleted_at)
 		 VALUES (?, 'attacker-controlled garbage', ?, ?, NULL)`,
 		id, now, now); err != nil {

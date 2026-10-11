@@ -130,13 +130,13 @@ func TestFleetMatchingVMTablesWithTheIncumbentsNICRowsMissing(t *testing.T) {
 		"DELETE FROM vm_nics WHERE vm_name = ?",
 		"DELETE FROM vm_interfaces WHERE vm_name = ?",
 	} {
-		if err := binder.DB.Execute(ctx, q, "incumbent"); err != nil {
+		if err := localExec(ctx, binder.DB, q, "incumbent"); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// The network record too, so the binder can create it BOUND — the operator
 	// action the whole feature is about.
-	if err := binder.DB.Execute(ctx, "DELETE FROM networks WHERE name = ?", adoptNetName); err != nil {
+	if err := localExec(ctx, binder.DB, "DELETE FROM networks WHERE name = ?", adoptNetName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -171,7 +171,7 @@ func TestFleetSweepStopsOnEqualHostCountsOverDifferentMembers(t *testing.T) {
 
 	// The sweeper has not learned the holder via EITHER local source — the row
 	// is gone from its table, and gossip does not name it.
-	if err := sweeper.DB.Execute(ctx, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
+	if err := localExec(ctx, sweeper.DB, "DELETE FROM hosts WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
 	}
 	sweeper.DB.SetMembersForTests(func() []corrosion.PeerInfo {

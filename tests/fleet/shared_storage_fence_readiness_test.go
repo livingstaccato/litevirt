@@ -33,7 +33,7 @@ import (
 // proof-grade fence.
 func seedSharedDiskVM(t *testing.T, n *Node, vm string) {
 	t.Helper()
-	if err := n.DB.Execute(context.Background(),
+	if err := localExec(context.Background(), n.DB,
 		`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, storage_type, updated_at)
 		 VALUES (?, 'd0', ?, '/pool/d0', 'ceph', ?)`, vm, n.Name, n.DB.NowTS()); err != nil {
 		t.Fatalf("seed shared disk on %s: %v", n.Name, err)

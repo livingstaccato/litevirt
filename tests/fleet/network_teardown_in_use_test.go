@@ -189,7 +189,7 @@ func TestFleet_DeleteStackKeepsNetworksWhileAWorkloadDeleteFails(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed stack network: %v", err)
 	}
-	if err := node.DB.Execute(ctx, `CREATE TRIGGER test_hb1_undeletable BEFORE UPDATE OF deleted_at ON vms
+	if err := localExec(ctx, node.DB, `CREATE TRIGGER test_hb1_undeletable BEFORE UPDATE OF deleted_at ON vms
 		WHEN OLD.name = 'hb-1' AND NEW.deleted_at IS NOT NULL
 		BEGIN SELECT RAISE(ABORT, 'injected: vm row locked'); END`); err != nil {
 		t.Fatalf("install trigger: %v", err)

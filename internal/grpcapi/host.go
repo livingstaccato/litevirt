@@ -692,6 +692,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
 			return progress
 		}
+		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress

@@ -59,7 +59,8 @@ func TestPromoteReplica_CannotSelectAnotherProjectsFile(t *testing.T) {
 // replica, which the next raw replica would otherwise be copied from.
 func TestIncrementalForkBase_NeverAnotherProjectsFile(t *testing.T) {
 	f := newPoolFixture(t)
-	if base := f.s.newestRawReplica(context.Background(), "dr", f.s.hostName, "a", "web", "1", "web/dr"); base != "" {
+	const taken = "20261002-000000" // the time project B's file carries
+	if base := f.s.rawReplicaTakenAt(context.Background(), "dr", f.s.hostName, "a", "web", "1", "web/dr", taken); base != "" {
 		t.Errorf("A's incremental fork base is %q, a file A has no record of", base)
 	}
 }
@@ -104,8 +105,14 @@ func TestPushReplica_IsPeerOnly(t *testing.T) {
 // From a peer, the replica lands in the VM's own directory with its record.
 func TestPushReplica_PeerReplicaIsRecordedInTheOwnersDirectory(t *testing.T) {
 	f := newPoolFixture(t)
+	// The pusher is the VM's owner (a replica from any other host is refused:
+	// replication_owner.go).
+	if err := corrosion.UpdateVMHost(context.Background(), f.s.db, "web", "peer-host", "running"); err != nil {
+		t.Fatal(err)
+	}
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20261009-000000", "qcow2")
-	st := &fakePushReplicaStream{ctx: peerCtxFor(t, f.s, "peer-host"), msgs: []*pb.PushReplicaRequest{
+	pctx := peerCtxFor(t, f.s, "peer-host")
+	st := &fakePushReplicaStream{ctx: pctx, msgs: []*pb.PushReplicaRequest{
 		{PoolName: "dr", Replica: rec.toPB()},
 		{Chunk: []byte("replica bytes")},
 	}}
@@ -116,8 +123,9 @@ func TestPushReplica_PeerReplicaIsRecordedInTheOwnersDirectory(t *testing.T) {
 	if len(recs) != 1 || recs[0].File != rec.File || recs[0].Schedule != "web/dr" || recs[0].SizeBytes != int64(len("replica bytes")) {
 		t.Errorf("records of (a, web) = %+v, want the pushed replica", recs)
 	}
-	// A second push of the same record is refused, not replaced.
-	st = &fakePushReplicaStream{ctx: peerCtxFor(t, f.s, "peer-host2"), msgs: []*pb.PushReplicaRequest{
+	// A second push of the same record is refused, not replaced (by the owner
+	// itself: another host is refused before that, as not the owner).
+	st = &fakePushReplicaStream{ctx: pctx, msgs: []*pb.PushReplicaRequest{
 		{PoolName: "dr", Replica: rec.toPB()}, {Chunk: []byte("other bytes")},
 	}}
 	if err := f.s.PushReplica(st); status.Code(err) != codes.AlreadyExists {
@@ -164,6 +172,10 @@ func TestReplicaRPCs_ArePeerOnly(t *testing.T) {
 // and schedule — never from a file named in the request, like B's raw replica.
 func TestPushReplicaIncrement_BaseMustBeARecordedReplica(t *testing.T) {
 	f := newPoolFixture(t)
+	// The pusher is the VM's owner, so the base check is what refuses.
+	if err := corrosion.UpdateVMHost(context.Background(), f.s.db, "web", "peer-host", "running"); err != nil {
+		t.Fatal(err)
+	}
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20261009-000000", "raw")
 	st := &fakePushStream{ctx: peerCtxFor(t, f.s, "peer-host"), msgs: []*pb.PushReplicaIncrementRequest{
 		{PoolName: "dr", Filename: rec.File, Base: bReplicaRaw, TotalSize: 1 << 16, Replica: rec.toPB()},

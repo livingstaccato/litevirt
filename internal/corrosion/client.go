@@ -456,6 +456,13 @@ type Client struct {
 	// host this node replicates to runs a build that knows every statement
 	// shape this build emits. Fails CLOSED (false) when unset.
 	claimIncarnationGate atomic.Pointer[func() bool]
+	// repointReady says whether every host applies the replication switch's
+	// compare-and-set statement (SetRepointReady): the release token has
+	// durably latched here.
+	repointReady atomic.Pointer[func(context.Context) bool]
+	// releaseFeatureGate runs a release feature's write through this node's
+	// release-feature gate (SetReleaseFeatureGate). Unset, it refuses.
+	releaseFeatureGate atomic.Pointer[ReleaseFeatureGate]
 	// claimCertVerifier supplies the verifier a proof's claim certificate is
 	// judged with before it may REPLACE another (SetProofClaimCertificate and
 	// the anti-entropy merge). Unset, or returning nil, nothing verifies and

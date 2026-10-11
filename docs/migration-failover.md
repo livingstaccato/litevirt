@@ -1105,7 +1105,15 @@ reachable repo holds a valid manifest and the survivor is schema-compatible),
 falling back to **recreate from image** (`ct.relocate.recreate` — managed NICs
 reconstructed from the persisted create spec), and finally **skip** a container
 that's neither restorable nor re-pullable (`ct.relocate.skipped`, left visible for
-operator recovery). A **stopped** container is not relocated: it stays on the
+operator recovery). A container replicated on a schedule with `--auto-promote`
+is placed on its **replica host** when placement accepts it and restored from
+the newest replica there taken from the container being relocated, ahead of the
+backup path above when the replica is newer (see
+[backups.md](backups.md#container-replication)); when it comes back without its
+replica (from a backup, its image, or on another host), the replicas it left are
+set aside, never deleted by the next run; once it has moved,
+its replication schedule replicates back to the host it left
+([Reverse replication](backups.md#reverse-replication)). A **stopped** container is not relocated: it stays on the
 failed host, stopped (see [Stopped workloads](#stopped-workloads)). The restore path is idempotent + crash-recoverable (source
 marker `relocate-restore:<target>:<token>`, where the attempt token is stamped on
 the restored target row so the coordinator only completes the handoff against a

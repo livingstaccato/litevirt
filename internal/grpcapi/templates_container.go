@@ -244,6 +244,7 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		CreateSpec: corrosion.EncodeCreateSpec(cloneSpec), CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
+	rec.CreateSpec, _ = corrosion.WithNewPlacement(rec.CreateSpec) // a new container's first placement
 	// The quota-authority commit fence, immediately before the durable write.
 	// A refusal deletes the just-cloned runtime container, same as a persist
 	// failure below: nothing was persisted, nothing is left untracked.

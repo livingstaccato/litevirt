@@ -3,13 +3,17 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // BackupScheduleRecord is one row of the backup_schedules table. A schedule
-// targets one of four scopes (Scope): "vm" (back up VMName), "pool" (every VM
-// whose disks live on PoolName), "cluster" (every VM), or "project" (every VM
-// in ProjectName). The scheduler fans the non-vm scopes out per host at tick
+// targets one of five scopes (Scope): "vm" (back up VMName), "pool" (every VM
+// whose disks live on PoolName), "cluster" (every VM), "project" (every VM
+// in ProjectName), or "container" (replication only: one container, see
+// ContainerScheduleKey). The scheduler fans the non-vm scopes out per host at tick
 // time. VMName always holds the row's identity key — for non-vm scopes it is a
 // sentinel (see ScheduleKey) so several scopes can share one repo under the
 // (vm_name, repo) primary key.
@@ -17,7 +21,7 @@ type BackupScheduleRecord struct {
 	VMName      string
 	PoolName    string // set when Scope == "pool"
 	ProjectName string // set when Scope == "project"
-	Scope       string // "vm" | "pool" | "cluster" | "project"; "" treated as "vm"
+	Scope       string // "vm" | "pool" | "cluster" | "project" | "container"; "" treated as "vm"
 	Repo        string
 	Cron        string
 	KeepLast    int
@@ -67,18 +71,106 @@ func ScheduleKey(scope, vmName, poolName, projectName string) string {
 		return "@project:" + projectName
 	case "cluster":
 		return "@cluster"
+	case "container":
+		return ContainerScheduleKey(projectName, vmName)
 	default:
 		return vmName
 	}
 }
 
+// containerScheduleKeyPrefix keeps a container schedule's identity apart from a
+// VM of the same name under the (vm_name, repo) primary key, and keeps a
+// previous-release scheduler (which looks the key up among VMs and finds none)
+// from running it as a VM replication.
+const containerScheduleKeyPrefix = "@ct:"
+
+// ContainerScheduleKey is the vm_name a container-scoped replication schedule is
+// stored under: "@ct:<project>/<name>". The project is part of the identity
+// because a container name is unique per project, not cluster-wide: keyed by
+// name alone, one project's schedule add would replace another project's
+// schedule of the same name into the same repo. Neither a project nor a
+// container name can contain "/".
+func ContainerScheduleKey(project, name string) string {
+	return containerScheduleKeyPrefix + normalizeProject(project) + "/" + name
+}
+
+// ContainerScheduleName is the container a container-scoped schedule key names.
+// project is "" for the earlier "@ct:<name>" form, whose row records its project
+// only in project_name (ContainerScheduleIs reads both forms). ok is false for
+// any other key.
+func ContainerScheduleName(key string) (project, name string, ok bool) {
+	rest, found := strings.CutPrefix(key, containerScheduleKeyPrefix)
+	if !found || rest == "" {
+		return "", "", false
+	}
+	if p, n, qualified := strings.Cut(rest, "/"); qualified {
+		if p == "" || n == "" {
+			return "", "", false
+		}
+		return p, n, true
+	}
+	return "", rest, true
+}
+
+// ContainerScheduleIs reports whether r is a container-scoped schedule of the
+// container name in project, in either key form.
+func ContainerScheduleIs(r BackupScheduleRecord, project, name string) bool {
+	if r.Scope != "container" {
+		return false
+	}
+	p, n, ok := ContainerScheduleName(r.VMName)
+	if !ok || n != name {
+		return false
+	}
+	if p == "" {
+		p = r.ProjectName
+	}
+	return normalizeProject(p) == normalizeProject(project)
+}
+
+// ContainerScheduleProject is the project of a container-scoped schedule row,
+// from its key when the key names one and from project_name otherwise.
+func ContainerScheduleProject(r BackupScheduleRecord) string {
+	if p, _, ok := ContainerScheduleName(r.VMName); ok && p != "" {
+		return p
+	}
+	return normalizeProject(r.ProjectName)
+}
+
+// UpsertContainerReplicationSchedule creates or replaces a container's
+// replication schedule: release feature container_replication's data, which a
+// host on an earlier build would skip without a word or take for a VM's. It
+// writes only with a grant from that feature's gate, which has put this node's
+// used record on its stream ahead of the row.
+func UpsertContainerReplicationSchedule(ctx context.Context, c *Client, g capabilities.FeatureGrant, s BackupScheduleRecord) error {
+	if err := g.Check(capabilities.FeatureContainerReplication); err != nil {
+		return err
+	}
+	if _, _, ok := ContainerScheduleName(s.VMName); !ok || s.Scope != "container" || s.Type != "replication" {
+		return fmt.Errorf("schedule %q (scope %q, type %q) is not a container replication schedule", s.VMName, s.Scope, s.Type)
+	}
+	return upsertBackupSchedule(ctx, c, s)
+}
+
 // UpsertBackupSchedule creates or replaces a schedule by (vm_name, repo).
+// A container's replication schedule (a key ContainerScheduleName reads) is
+// refused: it is written only by UpsertContainerReplicationSchedule, behind
+// its release feature's gate. No other schedule's key has that form (a VM
+// name cannot contain '@' or ':').
 // PoolName is stored alongside but is not part of the primary key —
 // callers wanting a pool-level row leave VMName empty and set PoolName.
 // The PRIMARY KEY is still (vm_name, repo), with the convention that
 // an empty vm_name + non-empty pool_name maps to a single pool row
 // per repo.
 func UpsertBackupSchedule(ctx context.Context, c *Client, s BackupScheduleRecord) error {
+	if _, _, ok := ContainerScheduleName(s.VMName); ok {
+		return fmt.Errorf("schedule %q is a container replication schedule, written only behind release feature %s",
+			s.VMName, capabilities.FeatureContainerReplication)
+	}
+	return upsertBackupSchedule(ctx, c, s)
+}
+
+func upsertBackupSchedule(ctx context.Context, c *Client, s BackupScheduleRecord) error {
 	now := c.NowTS()
 	scope := s.Scope
 	if scope == "" {

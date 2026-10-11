@@ -4,9 +4,17 @@ package safename
 
 import (
 	"errors"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// lutimes sets a path's access and modification times without following a
+// symlink.
+var lutimes = func(p string, atime, mtime time.Time) error {
+	ts := []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW)
+}
 
 var lsetxattr = func(p, name string, v []byte) error { return unix.Lsetxattr(p, name, v, 0) }
 

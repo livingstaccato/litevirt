@@ -82,7 +82,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 		if ferr != nil {
 			return ferr
 		}
-		up, perr := client.PushReplicaIncrement(fctx)
+		up, perr := client.PushReplicaIncrement(forwardReplicaOwnerFrom(ctx, fctx))
 		if perr != nil {
 			return status.Errorf(codes.Unavailable, "open push to %q: %v", host, perr)
 		}
@@ -151,6 +151,11 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 		}
 		return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
 	}
+	// Only the VM's current owner adds a promotable replica (replication_owner.go).
+	if err := s.admitVMReplicaSource(ctx, rec.Project, rec.VM); err != nil {
+		return err
+	}
+	rec.Source = replicaSourceOf(ctx)
 	dest, ferr := s.receiveRawReplica(ctx, first.PoolName, rec, first.Base, first.TotalSize, apply)
 	if ferr != nil {
 		if _, isStatus := status.FromError(ferr); isStatus {

@@ -91,9 +91,17 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
 	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
 	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
-	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
+	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host", Writers: containerReplicationWriters},
 	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},
 	FeaturePITOverlay:           {Token: Release202611V1, Description: "Point-in-time overlays for copies of running VMs"},
+}
+
+// containerReplicationWriters write container_replication's data: a container's
+// replication schedule row, its direction switch, and a run's replica.
+var containerReplicationWriters = []string{
+	"internal/corrosion.UpsertContainerReplicationSchedule",
+	"internal/corrosion.RepointContainerReplicationTarget",
+	"internal/grpcapi.Server.replicateContainer",
 }
 
 // The features of release_2026_11_v1. Each name is written into a replicated

@@ -55,6 +55,14 @@ type Server struct {
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
 
+	// hostUpdates is host_updates: the read-only pending-OS-update check
+	// (host_updates.go).
+	hostUpdates HostUpdatesConfig
+
+	// replRuns is each replication schedule's reporting state
+	// (replication_outcome.go).
+	replRuns replRuns
+
 	// isoLib holds the ISO library's per-host state: the sha256 cache of
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
 	isoLib isoLibraryState
@@ -786,6 +794,11 @@ type Server struct {
 	// containerRuntime executes LXC ops on this host.
 	// nil = container RPCs return Unavailable. Tests inject a fake.
 	containerRuntime ContainerRuntime
+
+	// lxcCapableForTest, when set, stands in for lxcCapable on this server
+	// only (SetLXCCapableForTest). nil = the host's real lxc tooling probe.
+	// Atomic: a fleet scenario sets it while the node's loops are running.
+	lxcCapableForTest atomic.Pointer[bool]
 
 	// liveMover drives libvirt blockdev-mirror for running-VM
 	// MoveVolume calls. nil = MoveVolume on a running
@@ -1990,6 +2003,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
+	s.wireReplicationReleaseGates()
 	return s
 }
 

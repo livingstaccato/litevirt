@@ -370,6 +370,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	s.deleteContainerDNS(ctx, req.Name, containerStackLabel(*rec))
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, source, req.Name)
 
+	// The container may now run on its own replica target: replicate back to the
+	// host it left.
+	s.reverseReplicationAfterMove(ctx, "container", req.Name, project, source, req.TargetHost)
 	s.audit(ctx, "ct.migrate", req.Name, fmt.Sprintf("project=%s %s→%s", project, source, req.TargetHost), "ok")
 	return send(&pb.MigrateContainerProgress{
 		Phase:  pb.MigrateContainerProgress_DONE,

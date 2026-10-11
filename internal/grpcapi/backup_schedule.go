@@ -16,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/scheduler"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 func (s *Server) CreateBackupSchedule(ctx context.Context, req *pb.CreateBackupScheduleRequest) (*pb.BackupSchedule, error) {
@@ -116,6 +117,17 @@ func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName
 		return projectRBACBase(projectName), true
 	case "cluster":
 		return "/", true
+	case "container":
+		// A container schedule row records its container's project when it is
+		// made, so it authorizes on the container's own path.
+		p, name, ok := corrosion.ContainerScheduleName(vmName)
+		if !ok {
+			name = vmName // a request names the container itself
+		}
+		if p == "" {
+			p = projectName
+		}
+		return ctRBACPathFor(tenancy.NormalizeProject(p), name), true
 	default:
 		if vm, err := corrosion.GetVM(ctx, s.db, vmName); err == nil && vm != nil {
 			return vmRBACPath(vm), true

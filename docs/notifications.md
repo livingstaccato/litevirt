@@ -30,7 +30,14 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
 | `host.recovery.stalled` | error | a `fenced`/`offline` host's recoverable workloads are still on it 60 s after its fence record; names the host, the leader coordinator and why it is not proceeding. Repeats at most every 10 minutes per host |
-| `replication.failed` | error | a scheduled replication run fails |
+| `replication.failed` | error (warn when the target host is down) | a scheduled replication run starts failing or fails differently; a continuing failure is repeated at most hourly |
+| `replication.recovered` | info | a replication schedule that was failing replicates again |
+| `replication.suspended` | warn | a replication schedule targets the host its workload now runs on, and the move's switch did not arrive within 15 minutes: it does not replicate there |
+| `replication.replica_set_aside` | warn | a container replica was set aside, not removed: it is not proven to be contained in the data now replicated (`lv replication replicas`) |
+| `replication.reversed` | info | a replicated VM or container moved onto its replica host and its schedule now replicates back to the host it left (docs/backups.md, "Reverse replication") |
+| `replication.reverse_skipped` | warn | the same move, but the host it left could not be made the target; the workload is replicating onto its own host until the schedule is replaced |
+| `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |
+| `host.updates` | info | a host has pending OS package updates, none of them security |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |
 | `ha.dualrun.vm` | error | a VM is an active disk-holder on more than one host — a split-brain that can corrupt the disk |

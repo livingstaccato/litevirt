@@ -398,3 +398,13 @@ func auditSettle(ctx context.Context, db *corrosion.Client, host, target, detail
 		Action: "partition.settle", Target: target, Detail: detail, Result: "ok",
 	})
 }
+
+// auditSystem writes one audit row as the system on host (signed through
+// InsertAuditLog on the daemon's client): for the health loops' replication
+// direction switches (corrosion.ReverseReplicationAudited).
+func auditSystem(ctx context.Context, db *corrosion.Client, host, action, target, detail, result string) {
+	_ = corrosion.InsertAuditLog(ctx, db, corrosion.AuditRecord{
+		ID: randid.New(), Username: "system", HostName: host,
+		Action: action, Target: target, Detail: detail, Result: result,
+	})
+}

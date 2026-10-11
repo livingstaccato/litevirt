@@ -192,6 +192,7 @@ func extractRootfsMembers(r io.Reader, dest, expectedTop string, deferDir func(s
 				return fmt.Errorf("rootfs tar: symlink %q: %w", hdr.Name, err)
 			}
 			_ = lchown(target, hdr.Uid, hdr.Gid)
+			restoreMtime(target, hdr)
 		case tar.TypeLink:
 			if err := mkdirAllNoFollow(dest, filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -342,7 +343,29 @@ func finishMember(target string, hdr *tar.Header, mode os.FileMode) ([]string, e
 	if err := os.Chmod(target, mode); err != nil {
 		return nil, fmt.Errorf("rootfs tar: mode of %q: %w", hdr.Name, err)
 	}
-	return applyXattrs(target, hdr, mode)
+	dropped, err := applyXattrs(target, hdr, mode)
+	if err != nil {
+		return dropped, err
+	}
+	restoreMtime(target, hdr)
+	return dropped, nil
+}
+
+// restoreMtime gives an extracted member the modification time its archive
+// recorded, as GNU tar does: a restored or migrated rootfs keeps its files'
+// times, and the next archive of it writes the same member headers, so the
+// content-defined chunks of an unchanged file are unchanged too. Best-effort:
+// a filesystem that refuses it costs fidelity, not the restore. Never follows
+// a symlink.
+func restoreMtime(target string, hdr *tar.Header) {
+	if hdr.ModTime.IsZero() {
+		return
+	}
+	at := hdr.AccessTime
+	if at.IsZero() {
+		at = hdr.ModTime
+	}
+	_ = lutimes(target, at, hdr.ModTime)
 }
 
 // xattrPAXPrefix is how GNU tar --xattrs (and Go) carry an attribute.

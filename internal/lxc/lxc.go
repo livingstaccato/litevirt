@@ -18,6 +18,7 @@
 package lxc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -698,8 +699,32 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 	// --xattrs with every attribute and --acls keep file capabilities, ACLs
 	// and labels; setuid/setgid/sticky are in the mode. ImportContainer
 	// restores all of it (safename.ExtractRootfsTar).
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner",
-		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-", name)
+	// The member order is the names' order, not the directory's (an ext4
+	// htree order differs per filesystem), and the pax headers --xattrs
+	// selects carry no atime or ctime: a restore keeps a member's mtime
+	// (safename.ExtractRootfsTar) but can never keep its ctime, and a read
+	// moves its atime. Two archives of the same tree, before and after a move,
+	// are then the same bytes, which is what lets a replica send only the
+	// content-defined chunks that changed. GNU tar sorts with --sort=name from
+	// 1.28; an older one is handed the same order as a list instead, so an
+	// export never fails where it did not before.
+	args := []string{"-C", r.lxcpath(), "--numeric-owner",
+		"--pax-option=delete=atime,delete=ctime",
+		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-"}
+	var list []byte
+	if tarSortsByName() {
+		args = append(args, "--sort=name", name)
+	} else {
+		var err error
+		if list, err = sortedMemberList(r.lxcpath(), name); err != nil {
+			return fmt.Errorf("tar export %s: list members: %w", name, err)
+		}
+		args = append(args, "--no-recursion", "--null", "--files-from=-")
+	}
+	cmd := exec.CommandContext(ctx, "tar", args...)
+	if list != nil {
+		cmd.Stdin = bytes.NewReader(list)
+	}
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}
 	cmd.Stdout = w
@@ -1485,4 +1510,51 @@ func securityDiffers(sec Security, to ConvertOpts) bool {
 		return true
 	}
 	return to.Confinement != "" && to.Confinement != sec.Confinement
+}
+
+// tarSortsByName reports whether this host's tar is GNU tar 1.28 or later,
+// which has --sort=name. Asked once.
+var tarSortsByName = sync.OnceValue(func() bool {
+	out, err := exec.Command("tar", "--version").Output()
+	return err == nil && gnuTarAtLeast(string(out), 1, 28)
+})
+
+// gnuTarAtLeast parses `tar --version` ("tar (GNU tar) 1.34") and reports
+// whether it is GNU tar major.minor or later.
+func gnuTarAtLeast(version string, major, minor int) bool {
+	first, _, _ := strings.Cut(version, "\n")
+	if !strings.Contains(first, "GNU tar") {
+		return false
+	}
+	f := strings.Fields(first)
+	parts := strings.Split(f[len(f)-1], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
+}
+
+// sortedMemberList is every path under <lxcpath>/<name>, the directory itself
+// first, relative to lxcpath, NUL-separated, in the order GNU tar's
+// --sort=name archives them (each directory's entries by name, depth first).
+func sortedMemberList(lxcpath, name string) ([]byte, error) {
+	var buf bytes.Buffer
+	err := filepath.WalkDir(filepath.Join(lxcpath, name), func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(lxcpath, p)
+		if rerr != nil {
+			return rerr
+		}
+		buf.WriteString(rel)
+		buf.WriteByte(0)
+		return nil
+	})
+	return buf.Bytes(), err
 }

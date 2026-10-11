@@ -1410,6 +1410,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "update disk record: %v", err)
 		}
 		_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, src.DiskName, poolRef.Driver, pool)
+		// The VM now runs on its replica target: replicate back to the host it left.
+		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)
 	}
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
 	// a future retry would see the re-homed row and not re-promote.

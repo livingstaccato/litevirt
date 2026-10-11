@@ -169,6 +169,20 @@ func (s *SnapshotScheduler) Tick(ctx context.Context) {
 			continue
 		}
 
+		// A container-scoped replication schedule routes by the container's
+		// host, not a VM's.
+		if sched.Scope == "container" {
+			if project, name, isCT := corrosion.ContainerScheduleName(sched.VMName); isCT {
+				if project == "" {
+					project = sched.ProjectName // the earlier name-only key
+				}
+				if owner, ok := s.containerOwner(ctx, name, project); ok && owner == s.HostName {
+					s.dispatch(ctx, sched, now)
+				}
+			}
+			continue
+		}
+
 		// Per-VM mode: route only when this host owns the VM.
 		owner, ok := s.vmOwner(ctx, sched.VMName)
 		if !ok || owner != s.HostName {
@@ -269,6 +283,22 @@ func (s *SnapshotScheduler) vmOwner(ctx context.Context, vmName string) (string,
 	rows, err := s.DB.Query(ctx,
 		`SELECT host_name FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName)
 	if err != nil || len(rows) == 0 {
+		return "", false
+	}
+	return rows[0].String("host_name"), true
+}
+
+// containerOwner returns the host holding the live container name of project
+// (the default project when empty). ok is false when there is none, or when
+// more than one host holds one: a container name is unique per host, not
+// cluster-wide, so an ambiguous schedule runs nowhere rather than on a guess.
+func (s *SnapshotScheduler) containerOwner(ctx context.Context, name, project string) (string, bool) {
+	if project == "" {
+		project = corrosion.DefaultProject
+	}
+	rows, err := s.DB.Query(ctx,
+		`SELECT host_name FROM containers WHERE name = ? AND project = ? AND deleted_at IS NULL`, name, project)
+	if err != nil || len(rows) != 1 {
 		return "", false
 	}
 	return rows[0].String("host_name"), true

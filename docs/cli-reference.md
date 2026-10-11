@@ -84,7 +84,7 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
-lv host ls                                # List hosts
+lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
@@ -877,9 +877,16 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
   [--incremental]          # transfer only dirty extents (raw replicas)
   [--auto-promote]         # failover may promote the freshest replica on host loss
   [--disabled]             # create the schedule disabled
-  [--scope vm|pool|cluster|project] [--pool-name <p>] [--project-name <p>]
+  [--scope vm|pool|cluster|project|container] [--pool-name <p>] [--project-name <p>]
+  [--container]            # a container: --target-host is the peer, --target-pool the backup repo on it
 lv replication schedule ls
-lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name <p>] [--project-name <p>]
+lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
+
+# A container's replicas on its replica host; restore one, or remove set-aside/orphaned ones (admin).
+lv replication replicas <container> --target-pool <repo> [--host <h>] [--project-name <p>]
+  [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
+  [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
+  [--yes]                  # remove without asking
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>

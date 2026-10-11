@@ -525,3 +525,32 @@ func assertRefusedWith(t *testing.T, what string, err error, want ...string) {
 		}
 	}
 }
+
+// A drain's live move of a VM onto the host that holds its replica switches the
+// schedule to the drained host (I2), as a migrate does.
+func TestFleet_ADrainOntoTheReplicaHostSwitchesReplication(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.addRunningSharedVM(t, "os3")
+	ctx := context.Background()
+	if err := corrosion.UpsertStoragePool(ctx, sc.src.DB, corrosion.StoragePoolRecord{
+		HostName: sc.src.Name, Name: "dr", Driver: "local", Target: "/dr", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, sc.src.DB, corrosion.BackupScheduleRecord{
+		VMName: "os3", Scope: "vm", Repo: "dr", Cron: "0 * * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: sc.dst.Name,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := sc.drain(t)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p := progress["os3"]; p == nil || p.Status != "done" || p.Strategy != pb.MigrateStrategy_MIGRATE_LIVE {
+		t.Fatalf("the premise: os3 must move live, got %+v", p)
+	}
+	if got := scheduleTarget(t, sc.src, "os3", "dr"); got != sc.src.Name {
+		t.Fatalf("after the drain the schedule targets %q, want the drained host %s", got, sc.src.Name)
+	}
+}

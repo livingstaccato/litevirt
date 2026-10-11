@@ -23,6 +23,8 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -74,6 +76,11 @@ type replicaRecord struct {
 	// a build that does not know it — reads as replicas always read. An
 	// older build reading this record ignores the field (encoding/json).
 	NotPointInTime bool `json:"not_point_in_time,omitempty"`
+
+	// Source is the host that wrote the replica (this host for a local run, the
+	// pushing host for a received one). On disk only; "" in a record an
+	// earlier build wrote.
+	Source string `json:"source,omitempty"`
 	// SizeBytes is filled in on listing, never stored.
 	SizeBytes int64 `json:"-"`
 }
@@ -411,9 +418,20 @@ func (s *Server) pruneRecordedReplicas(ctx context.Context, pool, project, vm, d
 		return 0, nil
 	}
 	dir := replicaOwnerDir(poolDir, project, vm)
+	// A disk copy a failover set aside here may be an overlay of one of these
+	// replicas (a --no-localize promotion's disk, set aside by a later
+	// failover): the replica is then that copy's data, and pruning it would
+	// leave `lv host superseded-disks --restore` a copy it cannot read.
+	backing, berr := s.supersededBacking(ctx)
+	if berr != nil {
+		return 0, fmt.Errorf("read the set-aside disk copies: %w", berr)
+	}
 	deleted := 0
 	for _, r := range mine[:len(mine)-keep] {
 		path := filepath.Join(dir, r.File)
+		if backing.has(path) {
+			continue
+		}
 		// Any host's disk: a pool on shared storage holds replicas a VM on
 		// another host runs from (a --no-localize promotion there).
 		owners, oerr := s.diskReferencesAnyHost(ctx, path)
@@ -529,7 +547,7 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer closeConn()
-		up, err := client.PushReplica(ctx)
+		up, err := client.PushReplica(forwardReplicaOwner(ctx))
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "open replica push to %q: %v", host, err)
 		}
@@ -554,6 +572,11 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 		}
 		return stream.SendAndClose(resp)
 	}
+	// Only the VM's current owner adds a promotable replica (replication_owner.go).
+	if err := s.admitVMReplicaSource(ctx, rec.Project, rec.VM); err != nil {
+		return err
+	}
+	rec.Source = replicaSourceOf(ctx)
 	poolDir, err := s.replicaPoolDir(ctx, first.GetPoolName())
 	if err != nil {
 		return err
@@ -720,4 +743,46 @@ func (s *Server) hostListsReplicas(ctx context.Context, host string) bool {
 		return true
 	}
 	return false
+}
+
+// backingSet is a set of files something is layered on.
+type backingSet map[string]bool
+
+func (b backingSet) has(path string) bool {
+	if b[filepath.Clean(path)] {
+		return true
+	}
+	r, err := filepath.EvalSymlinks(path)
+	return err == nil && b[r]
+}
+
+// supersededBacking returns every file a set-aside disk copy on this host
+// (health.ListSupersededDisks) is layered on: its whole qcow2 backing chain.
+// Replica pruning never removes one of them.
+func (s *Server) supersededBacking(ctx context.Context) (backingSet, error) {
+	copies, err := health.ListSupersededDisks(ctx, s.db, s.dataDir)
+	if err != nil {
+		return nil, err
+	}
+	out := backingSet{}
+	for _, c := range copies {
+		p := c.Path
+		for depth := 0; depth < 16; depth++ {
+			info, err := qcow2.Info(p)
+			if err != nil || info.BackingFile == "" {
+				break
+			}
+			b := info.BackingFile
+			if !filepath.IsAbs(b) {
+				b = filepath.Join(filepath.Dir(p), b)
+			}
+			b = filepath.Clean(b)
+			out[b] = true
+			if r, err := filepath.EvalSymlinks(b); err == nil {
+				out[r] = true
+			}
+			p = b
+		}
+	}
+	return out, nil
 }

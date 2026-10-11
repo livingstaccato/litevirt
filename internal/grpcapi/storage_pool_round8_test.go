@@ -176,7 +176,7 @@ func TestPoolRound8_ARawNamedCopyIsNeverAnIncrementBase(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.newestRawReplica(context.Background(), "pa", s.hostName, "acme", "web", "root", "web/pa"); got != rec.File {
+	if got := s.rawReplicaTakenAt(context.Background(), "pa", s.hostName, "acme", "web", "root", "web/pa", rec.Taken); got != rec.File {
 		t.Errorf("increment base = %q, want the runner's %q", got, rec.File)
 	}
 }

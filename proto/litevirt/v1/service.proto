@@ -1497,6 +1497,67 @@ message ProbeContainerBackupsResponse {
     repeated ContainerBackupProbe results = 1;
 }
 
+// ContainerReplica is one scheduled replica of a container, held in a backup
+// repo's replica namespace on the replica host (docs/backups.md, "Container
+// replication").
+message ContainerReplica {
+    string timestamp    = 1;
+    // The host the replica was taken on, and that host's container row's
+    // created_at: one segment of the container's history.
+    string source       = 2;
+    string incarnation  = 3;
+    int64  owner_epoch  = 4;
+    int64  total_size   = 5;
+    // Set aside: superseded by a later replica that is not proven to contain
+    // it. Kept, never promoted automatically, removed only by an operator.
+    bool   set_aside        = 6;
+    string set_aside_reason = 7;
+    string stream       = 8;
+    string owner_id     = 9;
+    // The placement it was taken in (the source row's placement id; "" for a
+    // row an earlier build wrote), and when it was captured (after the freeze;
+    // the timestamp is only its name).
+    string placement    = 10;
+    string captured_at  = 11;
+    // No schedule targets this host and repo for the container any more: the
+    // replica is kept, never settled, and an operator may remove it.
+    bool   orphaned     = 12;
+}
+message ListContainerReplicasRequest {
+    string host    = 1; // the replica host ("" = the receiver)
+    string repo    = 2; // the schedule's target repo on that host
+    string project = 3;
+    string name    = 4;
+}
+message ListContainerReplicasResponse {
+    repeated ContainerReplica replicas = 1;
+}
+message RemoveContainerReplicasRequest {
+    string host    = 1;
+    string repo    = 2;
+    string project = 3;
+    string name    = 4;
+    // The set-aside replicas to remove, by timestamp. A replica that is not
+    // set aside is refused.
+    repeated string timestamps = 5;
+}
+message RemoveContainerReplicasResponse {
+    int32 removed = 1;
+}
+// Restore a replica as the container, stopped, on the host that holds it
+// (admin). Refused while a live container of that name exists in the project:
+// it would be a second runnable copy.
+message RestoreContainerReplicaRequest {
+    string host      = 1;
+    string repo      = 2;
+    string project   = 3;
+    string name      = 4;
+    string timestamp = 5;
+}
+message RestoreContainerReplicaResponse {
+    string host = 1;
+}
+
 message ContainerDetail {
     Container container = 1;
     // privilege is "privileged" or "unprivileged", read from the container's
@@ -3661,6 +3722,13 @@ service LiteVirt {
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
     rpc InspectContainer(InspectContainerRequest) returns (ContainerDetail);
     rpc ProbeContainerBackups(ProbeContainerBackupsRequest) returns (ProbeContainerBackupsResponse);
+    // A container's scheduled replicas in a repo's replica namespace on one
+    // host: a peer (failover), or a caller who may read its backups.
+    rpc ListContainerReplicas(ListContainerReplicasRequest) returns (ListContainerReplicasResponse);
+    // Remove SET-ASIDE container replicas (admin): the only way one goes.
+    rpc RemoveContainerReplicas(RemoveContainerReplicasRequest) returns (RemoveContainerReplicasResponse);
+    // Restore one replica as the container, stopped (admin; never a second copy).
+    rpc RestoreContainerReplica(RestoreContainerReplicaRequest) returns (RestoreContainerReplicaResponse);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);

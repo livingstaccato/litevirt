@@ -326,6 +326,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		// Never started: the checker leaves it to the operator's start.
 		StateDetail: corrosion.ContainerCreatedDetail,
 	}
+	rec.CreateSpec, _ = corrosion.WithNewPlacement(rec.CreateSpec) // its first placement
 	// FENCE before the durable write; see CreateVM. The cleanup mirrors the
 	// failed-write path below: the runtime container exists but must not be
 	// recorded under an authority that no longer covers its admission.

@@ -14,7 +14,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -132,6 +131,8 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 		manifestSeen  bool
 		manifestFinal bool
 		stagingToken  string // non-empty when the target is a per-transfer staging repo
+		namespace     bool   // the target is a container replica namespace
+		repoName      string
 		committed     bool
 	)
 	// A per-transfer staging repo only has value once its manifest commits (a
@@ -170,6 +171,8 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 			}
 			repo = r
 			stagingToken = f.Header.GetTarget().GetStagingToken() // "" for a configured repo
+			repoName = f.Header.GetTarget().GetRepoName()
+			_, _, namespace = parseReplicaRepo(repoName)
 
 		case *pb.PushBackupFrame_Chunk:
 			if repo == nil {
@@ -231,9 +234,23 @@ func (s *Server) PushBackup(stream grpc.ClientStreamingServer[pb.PushBackupFrame
 			return status.Errorf(codes.FailedPrecondition, "push-backup: manifest references chunk %s not present at destination", ref.ID)
 		}
 	}
+	// A container replica goes only to a replica namespace, only from the host
+	// that may own the container, and never replaces a newer copy of it with an
+	// older one (replication_container.go).
+	if stagingToken == "" {
+		if err := s.admitContainerReplica(ctx, repo, &m, namespace, callerMTLSCommonName(ctx)); err != nil {
+			return err
+		}
+	}
 	// Manifest written LAST — every chunk it references is now confirmed present.
 	if err := repo.PutManifest(&m); err != nil {
 		return status.Errorf(codes.Internal, "push-backup: write manifest: %v", err)
+	}
+	if namespace {
+		s.notifyReplicaSetAside(ctx, &m, settleContainerReplicas(ctx, repo, &m), repoName)
+	}
+	if stagingToken == "" && m.DiskName == containerBackupDisk {
+		s.forgetBackupManifests(repo.Root(), m.VMName)
 	}
 	// Mark committed only AFTER the close succeeds: if SendAndClose fails the source
 	// sees an error and won't drive the restore, so a staging repo whose manifest
@@ -336,12 +353,10 @@ func (s *Server) resolveRepoTarget(ctx context.Context, t *pb.RepoTarget) (*pbss
 	case token != "":
 		return s.openStagingRepo(token)
 	case name != "":
-		path, ok := s.backupRepos[name]
-		if !ok && s.db != nil {
-			if p, err := corrosion.GetBackupRepoPath(ctx, s.db, name); err == nil && p != "" {
-				path, ok = p, true
-			}
+		if _, _, isReplica := parseReplicaRepo(name); isReplica {
+			return s.openReplicaNamespace(ctx, name, true)
 		}
+		path, ok := s.lookupRepoPath(ctx, name)
 		if !ok {
 			return nil, status.Errorf(codes.NotFound, "unknown backup repo %q (remote streaming requires a configured logical repo name)", name)
 		}

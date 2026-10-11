@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -84,5 +85,125 @@ func TestScheduler_FanoutRunCarriesItsOrigin(t *testing.T) {
 	}
 	if got := repl.calls[0]; got.VMName != "vm1" || got.Origin != "__cluster__" {
 		t.Errorf("fan-out run = vm %q origin %q, want vm1 from __cluster__", got.VMName, got.Origin)
+	}
+}
+
+func seedContainerRow(t *testing.T, db *corrosion.Client, host, name, project string) {
+	t.Helper()
+	if err := corrosion.UpsertContainer(context.Background(), db, corrosion.ContainerRecord{
+		HostName: host, Name: name, State: "running", Image: "alpine", Project: project,
+	}); err != nil {
+		t.Fatalf("seed container %s on %s: %v", name, host, err)
+	}
+}
+
+func containerReplSchedule(t *testing.T, db *corrosion.Client, name, project string) {
+	t.Helper()
+	grant := capabilities.GrantForTest(t, capabilities.FeatureContainerReplication)
+	if err := corrosion.UpsertContainerReplicationSchedule(context.Background(), db, grant, corrosion.BackupScheduleRecord{
+		VMName: corrosion.ScheduleKey("container", name, "", project), Scope: "container", ProjectName: project,
+		Repo: "dr-repo", Cron: "0 2 * * *", Enabled: true, Type: "replication", TargetPool: "dr-repo",
+		TargetHost: "host-b", KeepReplicas: 2,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+}
+
+// A container-scoped replication schedule runs on the host that holds the
+// container, once, and only there.
+func TestScheduler_ContainerReplicationRoutesToTheContainersHost(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	seedContainerRow(t, db, "host-a", "web", "_default")
+	containerReplSchedule(t, db, "web", "_default")
+
+	for _, tc := range []struct {
+		host string
+		want int
+	}{{"host-a", 1}, {"host-b", 0}} {
+		repl := &recordingReplRunner{}
+		s := NewSnapshotScheduler(db, tc.host, &recordingRunner{})
+		s.ReplRunner = repl
+		s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+		s.Tick(ctx)
+		repl.mu.Lock()
+		got := len(repl.calls)
+		repl.mu.Unlock()
+		if got != tc.want {
+			t.Errorf("%s: ReplRunner fired %d times, want %d", tc.host, got, tc.want)
+		}
+	}
+}
+
+// The same container name in two projects on two hosts is ambiguous without the
+// project; the schedule's project picks the one it is about.
+func TestScheduler_ContainerReplicationHonoursTheScheduleProject(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	seedContainerRow(t, db, "host-a", "web", "_default")
+	seedContainerRow(t, db, "host-c", "web", "prod")
+	containerReplSchedule(t, db, "web", "prod")
+
+	run := func(host string) int {
+		repl := &recordingReplRunner{}
+		s := NewSnapshotScheduler(db, host, &recordingRunner{})
+		s.ReplRunner = repl
+		s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+		s.Tick(ctx)
+		repl.mu.Lock()
+		defer repl.mu.Unlock()
+		return len(repl.calls)
+	}
+	if got := run("host-c"); got != 1 {
+		t.Errorf("the prod container's host ran it %d times, want 1", got)
+	}
+	if got := run("host-a"); got != 0 {
+		t.Errorf("the other project's same-named container ran it %d times, want 0", got)
+	}
+}
+
+// A container schedule is never mistaken for a VM of the same name.
+func TestScheduler_ContainerScheduleIsNotAVMSchedule(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	seedVM(t, db, "web") // a VM named like the container, on this host
+	seedContainerRow(t, db, "host-b", "web", "_default")
+	containerReplSchedule(t, db, "web", "_default")
+
+	repl := &recordingReplRunner{}
+	s := NewSnapshotScheduler(db, "host-a", &recordingRunner{})
+	s.ReplRunner = repl
+	s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+	s.Tick(ctx)
+	repl.mu.Lock()
+	defer repl.mu.Unlock()
+	if len(repl.calls) != 0 {
+		t.Fatalf("the container's schedule ran on the host of a same-named VM: %+v", repl.calls)
+	}
+}
+
+// A shared (pool, project, cluster) replication schedule whose explicit target
+// is this host still runs this host's own VMs, into the pool here, as on main.
+func TestScheduler_ASharedReplicationScheduleRunsItsTargetsOwnVMs(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm-on-b", HostName: "host-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+		VMName: "@cluster", Scope: "cluster", Repo: "dr", Cron: "0 2 * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: "host-b",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	repl := &recordingReplRunner{}
+	s := NewSnapshotScheduler(db, "host-b", &recordingRunner{})
+	s.ReplRunner = repl
+	s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+	s.Tick(ctx)
+	repl.mu.Lock()
+	defer repl.mu.Unlock()
+	if len(repl.calls) != 1 {
+		t.Fatalf("the target host's own VM ran %d time(s), want once, as on main", len(repl.calls))
 	}
 }

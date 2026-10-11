@@ -54,6 +54,25 @@ type containerBackupSpec struct {
 	// resurrecting a container the operator had deliberately stopped. (Other details
 	// are transient — the reconciler overwrites them on its next sweep.)
 	StateDetail string `json:"state_detail,omitempty"`
+	// Replica marks the manifest as a scheduled replica of a container rather
+	// than a backup (replication_container.go). Absent on a backup. A replica
+	// lives in a replica namespace a build that predates it cannot open.
+	Replica *containerReplicaMark `json:"replica,omitempty"`
+	// Source and Placement name the segment of the container's history the
+	// archive was taken in: the host, and the row's placement id there.
+	// CapturedAt is when the archive was captured (the container already
+	// quiesced), as opposed to its timestamp, which is only a name a scheduler
+	// tick or an operator chose. Bases is the container's provenance chain
+	// then. A restore of the archive records them as the restored container's
+	// chain (recordContainerBases), which is what proves a later replica
+	// contains an earlier one. Incarnation (the row's created_at) only matches a
+	// replica of a row with no placement id to that row. Ignored by a build that
+	// predates them.
+	Source      string        `json:"source,omitempty"`
+	Placement   string        `json:"placement,omitempty"`
+	CapturedAt  string        `json:"captured_at,omitempty"`
+	Incarnation string        `json:"incarnation,omitempty"`
+	Bases       []replicaBase `json:"bases,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
@@ -382,6 +401,21 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 		owner = nil
 	}
 	repoName, timestamp, err := s.findLatestContainerBackupFor(ctName, owner)
+	// A scheduled replica already on the target (replication_container.go) is a
+	// source too: restoring it moves nothing over the wire, and when it is newer
+	// than the newest backup it is the better one. It is restored by the same
+	// call as a backup, under the same relocation proof and token, so it is no
+	// second recovery path and cannot start a second copy.
+	//
+	// Newer is judged by when each was captured, never by its name: a replica
+	// named for the scheduler tick may have been captured long after it, and
+	// a backup's name can be anything its operator passed. A backup whose
+	// capture is not known (an earlier build's), or that was taken in another
+	// placement (on another host's clock), does not outrank a replica.
+	if rep, ok := s.containerReplicaFor(ctx, ctName, owner, targetHost, time.Now()); ok &&
+		(err != nil || !s.backupCapturedAfter(repoName, ctName, timestamp, rep.CapturedAt, rep.Source, rep.Placement)) {
+		return s.driveRemoteRestoreVia(ctx, targetHost, rep.Repo, ctName, rep.Timestamp, token, relocationLineageOf(owner), true)
+	}
 	if err != nil {
 		return corrosion.RestoreNotAttempted, err
 	}
@@ -461,6 +495,14 @@ func (s *Server) removeRestoreMarker(name string) { _ = os.Remove(s.restoreMarke
 // frame/stream was lost) → RestoreUnknown, which the coordinator defers rather
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string, lineage relocationLineage) (corrosion.RestoreOutcome, error) {
+	return s.driveRemoteRestoreVia(ctx, target, repoPath, name, timestamp, token, lineage, false)
+}
+
+// driveRemoteRestoreVia is driveRemoteRestore for a manifest that is either in a
+// repo this daemon resolves (repoOnTarget false: streamed to the target, or its
+// repo name handed over) or already in a repo the TARGET resolves in its own
+// config (repoOnTarget true: a scheduled replica, restored where it is).
+func (s *Server) driveRemoteRestoreVia(ctx context.Context, target, repoPath, name, timestamp, token string, lineage relocationLineage, repoOnTarget bool) (corrosion.RestoreOutcome, error) {
 	// Carry the attempt token to the target (on the RestoreContainer call) so it
 	// stamps the restored row. The transport (PR-4 push to staging vs. shared-repo
 	// fallback) is handled by drivePeerRestore.
@@ -487,6 +529,9 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			// defer and retry rather than silently downgrade.
 			return corrosion.RestoreNotAttempted, fmt.Errorf("relocation proof for token %s not found under enforcement; deferring", token)
 		}
+	}
+	if repoOnTarget {
+		return s.drivePeerRestoreFromTargetRepo(ctx, target, repoPath, name, timestamp, true, proof, lineage, md...)
 	}
 	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, true, proof, lineage, md...)
 }
@@ -568,16 +613,20 @@ func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.Co
 			continue // repo not openable from here — skip
 		}
 		if owner == nil {
-			m, ok, merr := repo.LatestManifestFor(ctName, containerBackupDisk)
-			if merr != nil || !ok || m == nil {
+			ms, merr := repo.ManifestsFor(context.Background(), ctName, containerBackupDisk)
+			if merr != nil {
 				continue
 			}
-			if pbsstore.ValidateManifest(m) != nil {
-				continue // structurally invalid → not restorable
-			}
-			// Manifest timestamps are RFC3339 (lexical == chronological).
-			if m.Timestamp > bestTS {
-				bestTS, bestName = m.Timestamp, name
+			for i := len(ms) - 1; i >= 0; i-- { // newest first
+				m := &ms[i]
+				if pbsstore.ValidateManifest(m) != nil || replicaMarkOf(m) != nil {
+					continue // not restorable; a replica is not a backup
+				}
+				// Manifest timestamps are RFC3339 (lexical == chronological).
+				if m.Timestamp > bestTS {
+					bestTS, bestName = m.Timestamp, name
+				}
+				break
 			}
 			continue
 		}
@@ -590,7 +639,7 @@ func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.Co
 			if m.VMName != ctName || m.DiskName != containerBackupDisk || m.Timestamp <= bestTS {
 				continue
 			}
-			if pbsstore.ValidateManifest(m) != nil || !manifestOwnedBy(m, owner) {
+			if pbsstore.ValidateManifest(m) != nil || !manifestOwnedBy(m, owner) || replicaMarkOf(m) != nil {
 				continue
 			}
 			bestTS, bestName = m.Timestamp, name
@@ -608,11 +657,19 @@ func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.Co
 // quiesced the container (frozen for a live backup, or stopped for migration).
 // Shared by BackupContainer and MigrateContainer — one tested data path.
 func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
+	return s.archiveContainerAs(ctx, repo, rec, timestamp, nil, progress)
+}
+
+// archiveContainerAs is archiveContainer with the manifest optionally marked as
+// a replica (mark non-nil).
+func (s *Server) archiveContainerAs(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, mark *containerReplicaMark, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
 	specJSON, _ := json.Marshal(containerBackupSpec{
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
 		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
-		StateDetail: rec.StateDetail,
+		StateDetail: rec.StateDetail, Replica: mark,
+		Source: s.hostName, Placement: corrosion.PlacementOf(rec.CreateSpec), Incarnation: rec.CreatedAt,
+		Bases: s.containerBases(rec), CapturedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
@@ -621,9 +678,13 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 	go func() {
 		pw.CloseWithError(s.containerRuntime.ExportContainer(ctx, rec.Name, pw))
 	}()
+	// A replica is cut into content-defined chunks: the next replica, from this
+	// host or, after a move, the other way, then shares every chunk the change
+	// did not touch, where fixed windows over a tar would shift with the first
+	// file that changed size (pbsstore/cdc.go).
 	m, perr := pbsstore.PushDisk(ctx, repo, pr, pbsstore.PushOptions{
 		VMName: rec.Name, DiskName: containerBackupDisk, Timestamp: timestamp,
-		ContainerSpecJSON: string(specJSON), Progress: progress,
+		ContainerSpecJSON: string(specJSON), Progress: progress, ContentDefined: mark != nil,
 	})
 	_ = pr.CloseWithError(perr)
 	return m, perr
@@ -728,7 +789,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// A coordinator is another node's daemon (a remote peer). `lv` run as root
 	// on this host presents the same host certificate over loopback, which is
 	// local root: an operator restore, not a coordinator's.
-	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) {
+	// An operator's replica restore forwarded by its entry host
+	// (RestoreContainerReplica) arrives as a peer but is no coordinator's
+	// relocation: it is admin-authorized, audited, and lays down a container
+	// only once its absence is confirmed.
+	if req.Proof == nil && s.gateActive(ctx) && s.isRemotePeer(ctx) && !operatorReplicaRestore(ctx) {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
 		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
 	}
@@ -760,6 +825,16 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
+	}
+	// A scheduled replica becomes a live copy only through failover promotion:
+	// the coordinator's peer-driven restore-relocation, under its proof and token,
+	// of the row the replica was taken from. Any other restore of it is refused,
+	// whatever path named the repo.
+	if mark := replicaMarkOf(manifest); mark != nil {
+		if err := s.admitReplicaPromotion(ctx, req, mark); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "replica "+req.Timestamp+": "+err.Error(), "denied")
+			return err
+		}
 	}
 	// Authorize against the backup's actual project (live row, else the manifest
 	// spec; admin when undeterminable) and use that project for the restored row
@@ -1089,7 +1164,12 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// Stamp the failover coordinator's attempt token (if this is a
 		// restore-relocation) so it can prove this row is its restore.
 		RelocateToken: relocationTokenToStamp(ctx, peerRelocation),
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	// A restore (an operator's, a migrate's, a relocation's) is a new placement:
+	// the provenance chain it records (recordContainerBases) is bound to it.
+	var placement string
+	rec.CreateSpec, placement = corrosion.WithNewPlacement(rec.CreateSpec)
 	// FENCE, immediately before the durable write (see allowCommit): the whole
 	// archive import sat between the quota grant and here, so the project's
 	// authority can genuinely move mid-restore. A refusal tears down the
@@ -1126,6 +1206,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// host-local proof marker is no longer needed (any future retry hits the "row already
 	// exists" guard above, never the resume path). Drop it best-effort.
 	s.removeRestoreMarker(req.Name)
+	s.recordContainerBases(project, req.Name, placement, spec)
 	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)
 	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
 	// attempt can't re-import.
@@ -1260,4 +1341,35 @@ func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string
 // with a backup from before projects charged to the default project.
 func manifestIndexProject(m *pbsstore.Manifest) string {
 	return tenancy.NormalizeProject(manifestContainerProject(m))
+}
+
+// backupCapturedAfter reports whether the backup (repoName, ts) of name is
+// known to have been captured after the instant replicaAt (RFC3339Nano).
+//
+// Instants are compared only within one placement (one host, one clock). A
+// backup taken in another placement never outranks the replica, which was
+// taken in the placement being relocated: the current placement's copy wins,
+// whatever two hosts' clocks say. A replica with no placement id (a row from
+// before this build) is compared only with a backup with none taken on the
+// same host: the same clock.
+func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSource, replicaPlacement string) bool {
+	path, ok := s.backupRepos[repoName]
+	if !ok {
+		return false
+	}
+	repo, err := pbsstore.Open(path)
+	if err != nil {
+		return false
+	}
+	m, err := repo.GetManifest(name, ts, containerBackupDisk)
+	if err != nil {
+		return false
+	}
+	spec, _ := manifestSpec(m)
+	if replicaSource == "" || spec.Placement != replicaPlacement || spec.Source != replicaSource {
+		return false
+	}
+	b, ok := capturedAt(m)
+	r, err := time.Parse(time.RFC3339Nano, replicaAt)
+	return ok && err == nil && b.After(r)
 }

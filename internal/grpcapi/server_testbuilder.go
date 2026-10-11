@@ -90,8 +90,15 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
+	s.wireReplicationReleaseGates()
 	return s
 }
+
+// SetLXCCapableForTest makes this server's runtime inventory list (on) or skip
+// (off) its containers whatever lxc tooling the machine running the test has,
+// so a fleet scenario that seeds a container runtime sees it in every host's
+// inventory, as an LXC-capable host would report it.
+func (s *Server) SetLXCCapableForTest(on bool) { s.lxcCapableForTest.Store(&on) }
 
 // RecordSelfReportedIsolationForTest drives one §A self-reported-quarantine
 // check synchronously, so a fleet scenario can assert the observation without

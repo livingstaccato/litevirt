@@ -354,7 +354,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			dom.CPUTune = &cpuTune{}
 		}
 		if cfg.CPUShares > 0 {
-			sh := uint64(cfg.CPUShares)
+			sh := uint64(HostCPUShares(cfg.CPUShares))
 			dom.CPUTune.Shares = &sh
 		}
 		if cfg.CPULimit > 0 {

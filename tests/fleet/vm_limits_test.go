@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -53,16 +54,27 @@ const (
 	rateFor2      = `<inbound average="2000"`
 )
 
-// newLimitsNode is newUpdateNode with a real capability gate wired, on which
-// vm_limits_v1 has latched: this build is the whole fleet.
+// latchRelease wires every node's release-feature gate against its real
+// checker and waits for the policy gate the used record travels through.
+func latchRelease(t *testing.T, c *Cluster) map[string]*health.Checker {
+	t.Helper()
+	gates := gateAll(t, c)
+	wireReleaseFeatures(t, c, gates)
+	for _, n := range c.Nodes {
+		if !gates[n.Name].Enforced(context.Background(), capabilities.FailoverScopeV1) {
+			t.Fatalf("%s: failover_scope_v1 did not latch", n.Name)
+		}
+	}
+	return gates
+}
+
+// newLimitsNode is newUpdateNode with the release-feature gate wired: this
+// build is the whole fleet, so release_2026_11_v1 latches on the first use.
 func newLimitsNode(t *testing.T) (*Node, pb.LiteVirtClient) {
 	t.Helper()
 	c, node, client := newComposeFailNode(t)
 	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
-	gates := gateAll(t, c)
-	if !gates[node.Name].Enforced(context.Background(), capabilities.VMLimitsV1) {
-		t.Fatal("vm_limits_v1 did not latch on a uniform build — advertisement is build-static")
-	}
+	latchRelease(t, c)
 	if _, err := client.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
 		Name: "hc", Type: "isolated", Subnet: "172.16.50.0/24", Dhcp: true,
 	}); err != nil {
@@ -181,7 +193,7 @@ func TestFleet_UpdateVMLimitsOnAStoppedVMEditTheConfigOnly(t *testing.T) {
 	// 0.5 core = 50000us per period; shares 0 restores the HOST's default weight
 	// (100 on cgroup v2, never a hard-coded 1024); 1 MB/s = 1000 KB/s.
 	mustContain(t, "stopped domain", xml, "<global_quota>50000</global_quota>",
-		fmt.Sprintf("<shares>%d</shares>", lv.DefaultCPUWeight()), `<inbound average="1000"`)
+		fmt.Sprintf("<shares>%d</shares>", lv.HostCPUShares(lv.DefaultCPUWeight())), `<inbound average="1000"`)
 	if rec := storedSpec(t, ctx, node, "db"); rec.CpuLimit != 0.5 || rec.CpuShares != 0 {
 		t.Errorf("spec = limit %v shares %d, want 0.5 / 0 (default)", rec.CpuLimit, rec.CpuShares)
 	}
@@ -294,7 +306,7 @@ func TestFleet_VMLimitsSurviveFailoverRebuild(t *testing.T) {
 		"<global_quota>200000</global_quota>", "<shares>300</shares>", `<inbound average="5000"`, `<outbound average="5000"`)
 }
 
-// ── the vm_limits_v1 gate ──────────────────────────────────────────────────
+// ── the vm_limits release gate ──────────────────────────────────────────────────
 
 const limitlessCompose = `name: upd
 
@@ -321,7 +333,7 @@ func domainsDefined(n *Node) int {
 	return c
 }
 
-// Until vm_limits_v1 latches, a stack that sets a limit is refused before any
+// Until the release token latches, a stack that sets a limit is refused before any
 // VM exists, and a stack without one deploys as it does on main. This node has
 // no gate wired, so the token has not latched.
 func TestFleet_VMLimitsRefusedUntilTheTokenLatches_Deploy(t *testing.T) {
@@ -361,32 +373,57 @@ func TestFleet_VMLimitsRefusedUntilTheTokenLatches_Deploy(t *testing.T) {
 	}
 }
 
-// A limit sent to a VM another host owns is refused at the ENTRY node, before it
-// is forwarded: an older owner would apply nothing and drop the fields from the
-// spec it rewrites. The owner never sees the request.
-func TestFleet_VMLimitsAreNeverForwardedBeforeTheLatch(t *testing.T) {
+// A limit sent to a VM another host owns is gated by the OWNER, the node that
+// performs the write: the entry node has the release feature wired and would
+// pass it, but the owner has no gate (it has not latched), so the forwarded
+// request is refused there and nothing is applied or persisted.
+func TestFleet_VMLimitsAreGatedOnTheOwner(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	entry, owner := c.Nodes[0], c.Nodes[1]
 	putVM(t, owner, "far", 2, "stopped")
 	owner.Virt.SetState("far", "stopped")
 	before := len(owner.Virt.EventLog())
-	// The OWNER has the token latched (the entry node has no gate, so it has
-	// not). A request forwarded to it would therefore be accepted and applied:
-	// the refusal below can only have come from the entry node.
-	if !gateFor(t, c, owner).Enforced(context.Background(), capabilities.VMLimitsV1) {
-		t.Fatal("vm_limits_v1 did not latch on the owner")
-	}
+	latchRelease(t, c)
+	owner.Server.SetReleaseFeatureGate(nil) // the owner has not latched
 
 	limit := 1.0
 	_, err := c.SelfClient(entry).UpdateVM(context.Background(), &pb.UpdateVMRequest{Name: "far", CpuLimit: &limit})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "cluster upgrade") {
-		t.Fatalf("err = %v, want FailedPrecondition naming the cluster upgrade", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "the cluster upgrade must finish first (vm_limits needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("err = %v, want the release refusal from the owner", err)
 	}
 	for _, e := range owner.Virt.EventLog()[before:] {
-		t.Errorf("the owner was handed work for a refused limit: %s %s", e.Op, e.Note)
+		t.Errorf("the owner applied work for a refused limit: %s %s", e.Op, e.Note)
 	}
 	if got := specCPULimit(t, owner, "far"); got != 0 {
 		t.Errorf("cpu_limit persisted as %v despite the refusal", got)
+	}
+	if featureUsedOn(t, entry, capabilities.ReleaseToken, string(capabilities.FeatureVMLimits)) {
+		t.Error("a use was recorded for a refused limit")
+	}
+}
+
+// Latched: a limit is accepted and the vm_limits use is on record; a limitless
+// VM before it never marks the feature used.
+func TestFleet_VMLimitsRecordTheUseOnFirstLimit(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
+	latchRelease(t, c)
+	ctx := context.Background()
+	deployClean(t, ctx, client, limitlessCompose)
+	if featureUsedOn(t, node, capabilities.ReleaseToken, string(capabilities.FeatureVMLimits)) {
+		t.Fatal("a limitless deploy marked vm_limits used")
+	}
+	limit := 1.0
+	var err error
+	eventually(t, 10*time.Second, "the first limit to be accepted", func() bool {
+		_, err = client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", CpuLimit: &limit})
+		return err == nil
+	})
+	if !featureUsedOn(t, node, capabilities.ReleaseToken, string(capabilities.FeatureVMLimits)) {
+		t.Fatal("vm_limits is not recorded as used after a limit was applied")
+	}
+	if got := specCPULimit(t, node, "db"); got != 1 {
+		t.Errorf("cpu_limit = %v, want 1", got)
 	}
 }
 

@@ -36,15 +36,42 @@ const (
 // so a test can point it elsewhere.
 var cgroupControllersFile = "/sys/fs/cgroup/cgroup.controllers"
 
-// DefaultCPUWeight is what an unconfigured VM's weight is on THIS host, and so
-// what clearing cpu-shares must write back: libvirt cannot unset <shares> on a
-// running domain, only set it. cgroup v2's cpu.weight defaults to 100, cgroup
-// v1's cpu.shares to 1024.
-func DefaultCPUWeight() int {
-	if _, err := os.Stat(cgroupControllersFile); err == nil {
-		return 100
+// DefaultCPUWeight is the weight of an unconfigured VM in the USER'S scale
+// (Proxmox cpuunits, cgroup v2 cpu.weight): 100, on every host. It is what
+// clearing cpu-shares writes back; HostCPUShares turns it into the number this
+// host's cgroup version expects.
+func DefaultCPUWeight() int { return 100 }
+
+// cgroupV2 reports whether this host runs the unified cgroup hierarchy.
+func cgroupV2() bool {
+	_, err := os.Stat(cgroupControllersFile)
+	return err == nil
+}
+
+// scaleWeightV1 maps a v2-scale weight onto cgroup v1's cpu.shares, whose
+// default is 1024 where v2's cpu.weight default is 100: weight * 1024/100,
+// never below v1's floor of 2.
+func scaleWeightV1(weight float64) int {
+	v := int(math.Round(weight * 1024 / 100))
+	if v < 2 {
+		v = 2
 	}
-	return 1024
+	return v
+}
+
+// HostCPUShares converts the user's weight (what the spec stores, 1..10000,
+// 0 = unset) into the value libvirt's <shares> must carry on THIS host:
+// unchanged on cgroup v2, scaled by 1024/100 on cgroup v1. It is applied where
+// the host's XML or scheduler parameters are written, never to the stored
+// spec, so a cluster mixing v1 and v2 hosts renders each host's own value.
+func HostCPUShares(weight int) int {
+	if weight <= 0 {
+		return 0
+	}
+	if cgroupV2() {
+		return weight
+	}
+	return scaleWeightV1(float64(weight))
 }
 
 // GlobalQuota converts a total-cores cap into libvirt's global period and
@@ -141,13 +168,13 @@ var (
 
 // PatchInactiveCPUTune returns domainXML with the weight and the whole-domain
 // cap of <cputune> set from shares/limit, every other node (vcpupin included)
-// preserved. A zero limit and zero shares remove them (a stale per-vCPU
+// preserved. shares is the user's weight; the host's value is rendered. A zero limit and zero shares remove them (a stale per-vCPU
 // period/quota goes too). It exists so a stopped VM's limits change is an
 // in-place edit that keeps libvirt-assigned device addresses.
 func PatchInactiveCPUTune(domainXML string, limit float64, shares int) (string, error) {
 	var add strings.Builder
 	if shares > 0 {
-		fmt.Fprintf(&add, "    <shares>%d</shares>\n", shares)
+		fmt.Fprintf(&add, "    <shares>%d</shares>\n", HostCPUShares(shares))
 	}
 	if limit > 0 {
 		period, quota := GlobalQuota(limit)
@@ -209,7 +236,7 @@ func (c *Client) SetCPUTune(name string, limit float64, shares int) error {
 			golibvirt.TypedParam{Field: "global_quota", Value: *golibvirt.NewTypedParamValueLlong(-1)})
 	}
 	if shares > 0 {
-		params = append(params, golibvirt.TypedParam{Field: "cpu_shares", Value: *golibvirt.NewTypedParamValueUllong(uint64(shares))})
+		params = append(params, golibvirt.TypedParam{Field: "cpu_shares", Value: *golibvirt.NewTypedParamValueUllong(uint64(HostCPUShares(shares)))})
 	}
 	if err := c.virt.DomainSetSchedulerParametersFlags(dom, params, uint32(golibvirt.DomainAffectConfig)); err != nil {
 		return fmt.Errorf("set cpu tune %s (config): %w", name, err)

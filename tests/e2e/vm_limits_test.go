@@ -240,7 +240,7 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 }
 
 // runWithLimits creates the test VM with a cap and a weight, skipping when the
-// cluster refuses limits because vm_limits_v1 has not latched (a node is still
+// cluster refuses limits because the release token has not latched (a node is still
 // on an older build) — a rollout state, not a defect.
 func runWithLimits(t *testing.T, name, host string) {
 	t.Helper()
@@ -249,7 +249,7 @@ func runWithLimits(t *testing.T, name, host string) {
 		"--cpu-limit", "1", "--cpu-shares", "200")
 	if err != nil {
 		if strings.Contains(out+err.Error(), "cluster upgrade") {
-			t.Skipf("vm_limits_v1 has not latched (roll every node to this build first): %v", err)
+			t.Skipf("the release token has not latched (roll every node to this build first): %v", err)
 		}
 		t.Fatalf("lv run with limits: %v\n%s", err, out)
 	}

@@ -50,7 +50,7 @@ func TestLiveGrow_UnderATinyCapNeedsNothingMore(t *testing.T) {
 // that completes in between must survive the limit write.
 func TestUpdateVMLimits_WritesTheSpecReadUnderTheLock(t *testing.T) {
 	s := reconfigServer(t)
-	s.SetGate(tokenGate{on: true})
+	s.SetReleaseFeatureGate(newLimitsGate(t, true))
 	ctx := adminCtx()
 	insertTestVMWithSpec(t, ctx, s.db, "web", "test-host", "stopped",
 		seedSpecJSON(t, &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 1024}))
@@ -173,7 +173,7 @@ func TestIsPureCPUGrowRequest_RefusesLimitFields(t *testing.T) {
 // would vanish at the next failover.
 func TestUpdateVMLimits_RefusesANICRateForANICThatMovedOffItsNetwork(t *testing.T) {
 	s := reconfigServer(t)
-	s.SetGate(tokenGate{on: true})
+	s.SetReleaseFeatureGate(newLimitsGate(t, true))
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 1024, Network: []*pb.NetworkAttachment{{Name: "old"}}}
 	// The NIC row says the NIC at ordinal 0 is on another network now.
@@ -198,8 +198,8 @@ func TestUpdateVMLimits_RefusesANICRateForANICThatMovedOffItsNetwork(t *testing.
 // it is judged like a create's: gated on the token, and validated.
 func TestRestoreSpec_LimitsAreGatedAndValidated(t *testing.T) {
 	ctx := adminCtx()
-	unlatched := &Server{gate: tokenGate{on: false}}
-	latched := &Server{gate: tokenGate{on: true}}
+	unlatched := serverWithLimitsGate(t, false)
+	latched := serverWithLimitsGate(t, true)
 	limited := &pb.VMSpec{Cpu: 2, CpuLimit: 1}
 	if err := unlatched.checkCopiedSpecLimits(ctx, limited); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cluster upgrade") {
 		t.Errorf("unlatched restore of a limited spec: err = %v, want the gate's refusal", err)
@@ -225,7 +225,7 @@ func TestRestoreSpec_LimitsAreGatedAndValidated(t *testing.T) {
 // --spec and a manifest's embedded spec alike — before it touches a domain.
 func TestAutoDefineRestoredVM_RefusesALimitBeforeTheToken(t *testing.T) {
 	s := reconfigServer(t)
-	s.SetGate(tokenGate{on: false})
+	s.SetReleaseFeatureGate(newLimitsGate(t, false))
 	ctx := adminCtx()
 	noop := func(*pb.RestoreLiveProgress) error { return nil }
 	embedded, _ := json.Marshal(&pb.VMSpec{Cpu: 2, CpuShares: 200})
@@ -246,7 +246,7 @@ func TestAutoDefineRestoredVM_RefusesALimitBeforeTheToken(t *testing.T) {
 // A clone copies the source's limits; the copy is judged as a create is.
 func TestCloneVM_RefusesACopiedLimitBeforeTheToken(t *testing.T) {
 	s := reconfigServer(t)
-	s.SetGate(tokenGate{on: false})
+	s.SetReleaseFeatureGate(newLimitsGate(t, false))
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "src", Cpu: 2, MemoryMib: 1024, CpuLimit: 1}
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{

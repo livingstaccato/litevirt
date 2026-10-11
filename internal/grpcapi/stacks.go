@@ -47,7 +47,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	}
 
 	// A limit in the file is refused before anything is deployed, rather than
-	// by the Nth VM's create after the first N-1 are up (vm_limits_v1).
+	// by the Nth VM's create after the first N-1 are up (the vm_limits release feature).
 	if err := s.refuseUnlatchedStackLimits(ctx, f); err != nil {
 		return err
 	}

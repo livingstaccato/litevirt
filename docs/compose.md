@@ -226,12 +226,15 @@ counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
   domain cgroup's `cpu.max`), so it does not depend on the vCPU count and a vCPU
   change leaves it alone.
 - `cpu-shares` is the VM's weight when the host is contended: Proxmox's `cpuunits`,
-  which is the cgroup v2 `cpu.weight` (1-10000, default 100; libvirt writes
-  `<shares>` straight into it). `200` is twice the default, so the Proxmox
-  numbers carry over unchanged. Clearing it (`0`, or dropping the key) writes the
-  host's default weight back. On a cgroup v1 host the same number is a
-  `cpu.shares` value whose default is 1024. It only matters under contention:
-  an idle host lets every guest run flat out.
+  the cgroup v2 `cpu.weight` scale (1-10000, default 100), and that number is what
+  is stored and what `lv inspect` shows. `200` is twice the default, so the Proxmox
+  numbers carry over unchanged. Each host renders the value its own cgroup version
+  wants when it defines the domain: unchanged on cgroup v2, scaled by 1024/100
+  (minimum 2) on cgroup v1, whose default `cpu.shares` is 1024. A cluster that mixes
+  v1 and v2 hosts therefore renders per host, and a failover rebuild re-renders for
+  the new host (a live migration carries the source host's rendered value until the
+  next define). Clearing it (`0`, or dropping the key) writes the default weight
+  back. It only matters under contention: an idle host lets every guest run flat out.
 - `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
   each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes
   of 1000 bytes, so `rate: 10` is `average='10000'`). It is set per NIC, so a
@@ -254,17 +257,15 @@ VM as smaller than its `cpu`. `lv inspect <vm>` shows the stored values as
 
 During a rolling upgrade a limit cannot be set until every host runs a build
 that understands it: setting `cpu-limit`, `cpu-shares` or a NIC `rate` is refused
-("finish the cluster upgrade first") until the `vm_limits_v1` capability has
-latched, because an older host would ignore the fields, and an older owner that
-rewrites a VM's stored spec would drop them. The refusal comes from the node the
-request enters, before anything is created or forwarded. Files and updates without
-limits are not affected, and clearing a limit (`0`) is always allowed. The token has
-no config flag: it states what the binary does, and it only affects workloads that
-carry a limit. To stop using the feature, clear the limits. Clearing does not undo the latch: as
-with any mandatory capability token, once `vm_limits_v1` has latched (which it does on
-every cluster running this build, whether or not a limit was ever set), rolling back to
-a build that does not know it puts each node into WAL quarantine until it is upgraded
-again or reseeded.
+("the cluster upgrade must finish first") until the release token
+`release_2026_11_v1` has latched, because an older host would ignore the fields, and
+an older owner that rewrites a VM's stored spec would drop them. The limit is gated
+by the host that performs the write (for an update, the VM's owner), and the first
+use is recorded cluster-wide before the limit's first data (the `vm_limits` feature
+in `lv cluster upgrade-status`). Files and updates without limits are not affected,
+and clearing a limit (`0`) is always allowed. Once a limit has been set, rolling back
+below the release puts each node into WAL quarantine until it is upgraded again;
+a cluster that never sets one can still roll back.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 

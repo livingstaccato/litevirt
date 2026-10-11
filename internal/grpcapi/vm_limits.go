@@ -51,16 +51,17 @@ func (u limitsUpdate) applyTo(spec *pb.VMSpec) {
 	}
 }
 
-// vmLimitsRefusal is what a create or update that sets a limit is refused with
-// until vm_limits_v1 has latched.
-const vmLimitsRefusal = "VM limits (cpu-limit, cpu-shares, NIC rate) cannot be set yet: an older host would ignore " +
-	"or drop them, so the cluster upgrade must finish first (vm_limits_v1 has not latched on every host)"
+// admitLimitedSpec is the writer of a create-time limit: it takes the
+// vm_limits grant and checks it, so a spec that carries a limit cannot reach
+// the VM record or the domain XML without having passed the release gate.
+func admitLimitedSpec(g capabilities.FeatureGrant, _ *pb.VMSpec) error {
+	return g.Check(capabilities.FeatureVMLimits)
+}
 
-// vmLimitsActive reports whether vm_limits_v1 has latched: every host this
-// node replicates to understands the limit fields. No config flag; a node with
-// no gate wired has not proved it.
-func (s *Server) vmLimitsActive(ctx context.Context) bool {
-	return s.gate != nil && s.gate.Enforced(ctx, capabilities.VMLimitsV1)
+// admitLimitUpdate is admitLimitedSpec for an update: the vm_limits grant
+// precedes any write of a limit to the domain or the stored spec.
+func admitLimitUpdate(g capabilities.FeatureGrant, _ *pb.UpdateVMRequest) error {
+	return g.Check(capabilities.FeatureVMLimits)
 }
 
 // specSetsLimits reports whether a create spec carries any limit. A zero is
@@ -92,31 +93,34 @@ func requestSetsLimits(req *pb.UpdateVMRequest) bool {
 	return false
 }
 
-// refuseUnlatchedLimits refuses a create spec that sets a limit while
-// vm_limits_v1 is unlatched. It runs at the entry node, before anything is
-// created or forwarded.
+// refuseUnlatchedLimits runs a create spec that sets a limit through the
+// release gate (vm_limits) on THIS node, the one that creates the VM; a spec
+// without a limit is not gated. Until the release token has latched the gate
+// refuses with the release refusal, and the first use is recorded before the
+// limit's first data.
 func (s *Server) refuseUnlatchedLimits(ctx context.Context, spec *pb.VMSpec) error {
-	if specSetsLimits(spec) && !s.vmLimitsActive(ctx) {
-		return status.Error(codes.FailedPrecondition, vmLimitsRefusal)
-	}
-	return nil
-}
-
-// refuseUnlatchedLimitUpdate is the update-side twin, run before the request is
-// forwarded to the owning host.
-func (s *Server) refuseUnlatchedLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
-	if requestSetsLimits(req) && !s.vmLimitsActive(ctx) {
-		return status.Error(codes.FailedPrecondition, vmLimitsRefusal)
-	}
-	return nil
-}
-
-// refuseUnlatchedStackLimits refuses a compose file that sets a VM limit while
-// vm_limits_v1 is unlatched. Containers have no such limits and are skipped.
-func (s *Server) refuseUnlatchedStackLimits(ctx context.Context, f *compose.File) error {
-	if s.vmLimitsActive(ctx) {
+	if !specSetsLimits(spec) {
 		return nil
 	}
+	return s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
+		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitedSpec(g, spec) })
+}
+
+// refuseUnlatchedLimitUpdate is the update-side twin. It runs on the host that
+// owns the VM, after the forward: a request forwarded to another node is gated
+// there, not here. Clearing a limit (zero) is not gated.
+func (s *Server) refuseUnlatchedLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
+	if !requestSetsLimits(req) {
+		return nil
+	}
+	return s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
+		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitUpdate(g, req) })
+}
+
+// refuseUnlatchedStackLimits fails a compose file that sets a VM limit fast,
+// before any VM is deployed, through the same gate each VM's create passes.
+// Containers have no such limits and are skipped.
+func (s *Server) refuseUnlatchedStackLimits(ctx context.Context, f *compose.File) error {
 	for name, vm := range f.VMs {
 		if vm.Kind == compose.WorkloadKindLXC || vm.Kind == compose.WorkloadKindOCI {
 			continue
@@ -126,7 +130,11 @@ func (s *Server) refuseUnlatchedStackLimits(ctx context.Context, f *compose.File
 			set = set || n.Rate != 0
 		}
 		if set {
-			return status.Errorf(codes.FailedPrecondition, "vm %q: %s", name, vmLimitsRefusal)
+			spec := &pb.VMSpec{CpuLimit: vm.CPULimit}
+			if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
+				return status.Errorf(status.Code(err), "vm %q: %s", name, status.Convert(err).Message())
+			}
+			return nil
 		}
 	}
 	return nil
@@ -266,7 +274,7 @@ func (s *Server) revertLimits(ctx context.Context, name string, spec *pb.VMSpec,
 
 // checkCopiedSpecLimits judges a spec a path takes from somewhere other than a
 // create request — a restore's --spec or manifest, a clone's source — the way a
-// create is judged: gated on vm_limits_v1, and validated against its own vCPU
+// create is judged: gated on the vm_limits release feature, and validated against its own vCPU
 // count. Without it a limit reaches a stored spec by a side door.
 func (s *Server) checkCopiedSpecLimits(ctx context.Context, spec *pb.VMSpec) error {
 	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {

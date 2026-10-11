@@ -62,21 +62,85 @@ func TestValidateCPUShares_IsTheCgroupV2WeightRange(t *testing.T) {
 	}
 }
 
-func TestDefaultCPUWeight_FollowsTheHostsCgroupVersion(t *testing.T) {
+// withCgroup points the cgroup-version probe at a v2 (true) or v1 (false) host.
+func withCgroup(t *testing.T, v2 bool) {
+	t.Helper()
 	dir := t.TempDir()
-	v2 := filepath.Join(dir, "cgroup.controllers")
-	if err := os.WriteFile(v2, []byte("cpu io memory\n"), 0o644); err != nil {
-		t.Fatal(err)
+	f := filepath.Join(dir, "cgroup.controllers")
+	if v2 {
+		if err := os.WriteFile(f, []byte("cpu io memory\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	old := cgroupControllersFile
-	defer func() { cgroupControllersFile = old }()
-	cgroupControllersFile = v2
-	if got := DefaultCPUWeight(); got != 100 {
-		t.Errorf("cgroup v2 host default = %d, want 100 (cpu.weight's default)", got)
+	t.Cleanup(func() { cgroupControllersFile = old })
+	cgroupControllersFile = f
+}
+
+// The user's weight is the Proxmox/cgroup v2 number whatever the host: the
+// default is 100 everywhere, and the host value is derived from it.
+func TestDefaultCPUWeight_IsTheUserDefaultOnEveryHost(t *testing.T) {
+	for _, v2 := range []bool{true, false} {
+		withCgroup(t, v2)
+		if got := DefaultCPUWeight(); got != 100 {
+			t.Errorf("v2=%v: DefaultCPUWeight = %d, want 100", v2, got)
+		}
 	}
-	cgroupControllersFile = filepath.Join(dir, "absent")
-	if got := DefaultCPUWeight(); got != 1024 {
-		t.Errorf("cgroup v1 host default = %d, want 1024 (cpu.shares' default)", got)
+}
+
+// A cgroup v2 host takes the weight as is; a cgroup v1 host takes it scaled by
+// 1024/100 (so the default 100 is v1's 1024), never below v1's floor of 2.
+func TestHostCPUShares_ScalesOnCgroupV1(t *testing.T) {
+	cases := []struct{ weight, v2, v1 int }{
+		{0, 0, 0}, // unset stays unset
+		{100, 100, 1024},
+		{200, 200, 2048},
+		{1, 1, 10},
+		{10000, 10000, 102400},
+	}
+	for _, c := range cases {
+		withCgroup(t, true)
+		if got := HostCPUShares(c.weight); got != c.v2 {
+			t.Errorf("v2 host: HostCPUShares(%d) = %d, want %d", c.weight, got, c.v2)
+		}
+		withCgroup(t, false)
+		if got := HostCPUShares(c.weight); got != c.v1 {
+			t.Errorf("v1 host: HostCPUShares(%d) = %d, want %d", c.weight, got, c.v1)
+		}
+	}
+	// The floor: cgroup v1 refuses cpu.shares below 2.
+	if got := scaleWeightV1(0.1); got != 2 {
+		t.Errorf("scaleWeightV1(0.1) = %d, want the floor 2", got)
+	}
+}
+
+// The XML renders the HOST value at define time: the same spec on a v1 and a v2
+// host (a mixed cluster) renders different <shares>.
+func TestGenerateDomainXML_SharesAreRenderedPerHost(t *testing.T) {
+	cfg := VMConfig{Name: "lim", CPU: 2, MemoryMiB: 1024, CPUShares: 200}
+	withCgroup(t, true)
+	x, err := GenerateDomainXML(cfg)
+	if err != nil || !strings.Contains(x, "<shares>200</shares>") {
+		t.Errorf("v2 host: want <shares>200</shares>, err=%v\n%s", err, x)
+	}
+	withCgroup(t, false)
+	x, err = GenerateDomainXML(cfg)
+	if err != nil || !strings.Contains(x, "<shares>2048</shares>") {
+		t.Errorf("v1 host: want <shares>2048</shares>, err=%v\n%s", err, x)
+	}
+}
+
+func TestPatchInactiveCPUTune_RendersTheHostShares(t *testing.T) {
+	base := "<domain>\n  <vcpu>2</vcpu>\n</domain>"
+	withCgroup(t, false)
+	out, err := PatchInactiveCPUTune(base, 0, 100)
+	if err != nil || !strings.Contains(out, "<shares>1024</shares>") {
+		t.Errorf("v1 host: want <shares>1024</shares>, err=%v\n%s", err, out)
+	}
+	withCgroup(t, true)
+	out, err = PatchInactiveCPUTune(base, 0, 100)
+	if err != nil || !strings.Contains(out, "<shares>100</shares>") {
+		t.Errorf("v2 host: want <shares>100</shares>, err=%v\n%s", err, out)
 	}
 }
 

@@ -3999,11 +3999,6 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	// Before anything is read or forwarded: an older owner would ignore a limit
-	// and drop it from the spec it rewrites (vm_limits_v1).
-	if err := s.refuseUnlatchedLimitUpdate(ctx, req); err != nil {
-		return nil, err
-	}
 	// updLease carries the commit FENCE for a quota-admitted grow: authority can
 	// move while the stop → redefine below is in flight, and committing then would
 	// land a charge the new authority knows nothing about. Nil (no grow admitted)
@@ -4025,6 +4020,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		defer conn.Close()
 		return client.UpdateVM(ctx, req)
+	}
+
+	// A limit is written here, on the owner, so it passes the vm_limits release
+	// gate here: a forwarded request is gated by the host that applies it.
+	if err := s.refuseUnlatchedLimitUpdate(ctx, req); err != nil {
+		return nil, err
 	}
 
 	// Deserialize stored spec.

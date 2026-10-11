@@ -808,8 +808,23 @@ type Server struct {
 	// gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
-	gate          serverGate
-	onGateRefused func(action, reason string)
+	gate serverGate
+	// releaseFeatures opens a release feature (WithReleaseFeature): the
+	// checker's WithFeature in production. Nil refuses every feature.
+	releaseFeatures releaseFeatureGate
+	// releasePeerMu guards the release-peer refusal state (ReleasePeerAllowed).
+	releasePeerMu      sync.Mutex
+	releaseUsed        []string
+	releaseUsedAt      time.Time
+	releasePeerRefused map[string]time.Time
+	releasePeerLast    map[string]*peerCapsEntry
+	// releaseRollout: the HA monitor's cached rollout answers
+	// (releaseRolloutLagging). Guarded by releasePeerMu.
+	releaseRollout map[string]*rolloutAnswer
+	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
+	// adopted, which Ping reports (PingResponse.voter_generation).
+	adoptedVoterGen atomic.Int64
+	onGateRefused   func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 
@@ -1032,10 +1047,6 @@ func (s *Server) advertisedCapabilities() []string {
 	// fence_state_v1 is not withheld either: it says what this binary's
 	// coordinator does with an unverified fence recorded 'offline', a fact
 	// about the build.
-	// vm_limits_v1 is not withheld either: it is a fact about the build (this
-	// binary renders, keeps and re-applies a VM's cpu/nic limits), and the
-	// guarantee is enforced where a limit is created — the entry node refuses
-	// one until the token has latched.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1497,11 +1508,6 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: it says this build resumes from an unverified fence
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
-		return true
-	case capabilities.VMLimitsV1:
-		// No kill switch: it says this build keeps and re-applies a VM's
-		// cpu/nic limits, a fact about the binary. It enforces nothing on a
-		// workload without a limit; its stand-down is clearing them.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
@@ -2155,6 +2161,11 @@ func (s *Server) SetDNSDomain(domain string) {
 // SetReplicator attaches the WAL-based replicator to the server.
 func (s *Server) SetReplicator(r *corrosion.Replicator) {
 	s.replicator = r
+	// Every push declares what this node advertises (ReplicateRequest.
+	// sender_capabilities), so a receiver can judge it without dialling back.
+	if r != nil {
+		r.SetAdvertisedCapabilities(s.DeclaredCapabilities)
+	}
 }
 
 // SetStoragePools configures host-level storage pool references for volume resolution.

@@ -10,6 +10,15 @@
 // once confirmed cluster-wide it LATCHES durably (per token, via a marker file), so
 // a later partition — where support can't be re-confirmed — fails closed rather
 // than reverting to the legacy ungated path.
+//
+// RELEASE TOKENS (release_features.go). A release's new data shares one
+// mandatory, replication-gated release token (release_<yyyy>_<mm>_v1), with a
+// replicated per-feature USED bit, instead of one token per feature. A release
+// token's FEATURE SET IS FROZEN WHEN ITS RELEASE SHIPS: a build that adds a
+// feature — a patch release included — declares it under the NEXT release
+// token, never a shipped one. capabilities_test.go pins every release token's
+// list (frozenReleaseFeatures), so adding a feature to a shipped token fails
+// CI. See docs/upgrades.md "Rolling back after a release token latched".
 package capabilities
 
 import "sort"
@@ -285,47 +294,6 @@ const (
 	// holder's state), so the latch must hold of every host this node
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
-
-	// VMLimitsV1 gates setting the noisy-neighbour limits: a VM's cpu_limit and
-	// cpu_shares and a NIC's rate_mb_sec. Until it latches, a create or update
-	// that sets any of them is refused ("finish the cluster upgrade first");
-	// specs without limits behave exactly as before.
-	//
-	// It states a fact about the BINARY, which is why it is mandatory and has
-	// no config flag: this build renders the limits into the domain, re-applies
-	// them on every rebuild of the definition (redefine, failover, restore,
-	// promote, clone) and keeps them in the spec it rewrites. An older build
-	// does none of that, and the loss is silent: a VM created on it runs
-	// uncapped, and an older OWNER that rewrites a stored spec drops the fields,
-	// so a later failover rebuilds the VM without its cap. Nothing downstream
-	// can notice a cap that is gone from the spec, so the only safe moment to
-	// accept a limit is once no host can be an older build. The guarantee is
-	// enforced where the limit is CREATED (the entry node refuses before it
-	// creates or forwards anything), so no node relies on a peer enforcing it;
-	// the latch is what proves every peer can honour it.
-	//
-	// ReplicationGated: the claim is about every host that can come to own or
-	// rewrite a spec, not only the voting-eligible ones. A host in maintenance
-	// on the previous build is skipped by the voting sweep, still receives
-	// every spec the owner writes, and can still own VMs it may rewrite — so
-	// it must hold the latch off. Fail-closed costs only the feature.
-	//
-	// Stand-down: there is no flag to turn it off in an incident, and none is
-	// needed — it enforces nothing on a workload that carries no limit. To
-	// stop using the feature, clear the limits (lv update <vm> --cpu-limit 0
-	// --cpu-shares 0 --nic-rate <n>=0, or drop the keys from the compose file);
-	// the token stays latched, as every latch does. It is never reused: a build
-	// that stops needing it moves it to the retired set, it is not deleted.
-	//
-	// What clearing the limits does NOT undo is the latch's rollback cost, which
-	// is the ordinary price of a mandatory, unconditionally advertised token and
-	// applies to EVERY cluster that runs this build, including one that never
-	// set a limit: once it has latched, rolling back to a build that does not
-	// know vm_limits_v1 puts each node into WAL quarantine
-	// (preflightCapabilityRollback) until it is upgraded again or reseeded.
-	// Replication gating has one more side effect: a witness or maintenance host
-	// left on an older build holds the latch off, so the feature stays refused.
-	VMLimitsV1 = "vm_limits_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
@@ -672,7 +640,49 @@ const (
 	// monotone and durable, so the flag has to gate the DECISION and not only the
 	// advertisement or the mirror could never be turned off again.
 	NetBoxMirrorV1 = "netbox_mirror_v1"
+
+	// Release202611V1 is the RELEASE TOKEN of the 2026-11 release train: one
+	// mandatory, ReplicationGated token that every feature of the release
+	// gates on, in place of one token per feature. Its claim is the one
+	// those per-feature tokens each made — "this build decodes, keeps and
+	// honours the new fields, tables and statement shapes of its release" —
+	// made once for the whole release.
+	//
+	// What it adds is a per-feature USED bit (release_features.go). A feature
+	// is opened by capabilities' closed set of Features, never by the latch
+	// alone: health.Checker.WithFeature refuses until this token has
+	// durably latched, and before a feature's first write it records, in a
+	// replicated cluster_policies row every replication recipient has
+	// acknowledged, that the feature is in use. A later binary rolled back onto a build that
+	// predates this token then quarantines only when a feature was actually
+	// used (preflightCapabilityRollback reads the marker's `rollback:
+	// safe_if_unused` attribute and the recorded uses, then holds the node in
+	// release probation until a voter majority confirms them). Nothing may gate on
+	// Latched/Enforced(Release202611V1) directly: a write that skipped
+	// WithFeature would leave no used bit, and a rolled-back node would
+	// believe it safe to keep running over data it drops.
+	//
+	// The name is the release train, not a version number. A version is
+	// assigned when a release is tagged and has moved before; this name is
+	// written to every node's data directory the day it latches and can never
+	// change or be reused. The next release gets release_<yyyy>_<mm>_v1, and
+	// this token stays in All() for good — its features stay bound to it.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag, for the credentials_split_v1 reason: a flag-gated token
+	// would never be driven and never latch, and no feature of the release
+	// could be used.
+	//
+	// ReplicationGated: a feature it opens may emit statement shapes, columns
+	// or values a previous-release peer cannot decode or would drop on a
+	// rewrite, so the latch is confirmed against every host this node
+	// replicates to, a maintenance host on the previous build included.
+	Release202611V1 = "release_2026_11_v1"
 )
+
+// ReleaseToken is the release token of THIS build's release train: the token a
+// Feature declared in this build gates on.
+const ReleaseToken = Release202611V1
 
 // supported is the set of tokens THIS build both implements AND advertises. A
 // token is added here only once its machinery is fully wired, so cluster-wide
@@ -830,6 +840,27 @@ const (
 //     runs on one. A binary rolled back below it enters WAL quarantine, as
 //     below every latched token.
 //
+//   - release_2026_11_v1 (the release token) has no flag and no stand-down of
+//     its own, and needs none: latching it changes nothing until a feature is
+//     USED, and every feature is opened through WithFeature, which records
+//     the use first. The stand-down for a feature is that feature's own
+//     (clear the field it set, remove the row it wrote); the used bit stays,
+//     because it is monotone — it records that data a previous build cannot
+//     keep may exist, and nothing proves it has all gone. Deleting the marker
+//     does nothing lasting: the HA monitor re-establishes the latch the moment
+//     the fleet is uniform. ROLLBACK: a binary older than this token's build
+//     enters WAL quarantine below it, used or not — it predates the
+//     `rollback: safe_if_unused` marker attribute and cannot honour it. A
+//     LATER release's token rolled back onto this build quarantines only if
+//     one of its features was used (daemon.preflightCapabilityRollback).
+//     RETIREMENT: never, and it stays ADVERTISED, unconditionally and for
+//     good. A build on this release refuses the pushes of a sender whose
+//     declaration lacks a release token in use (grpcapi ReleaseSenderAllowed),
+//     so a later build that stopped advertising it would be refused by every
+//     host still on this release during a forward roll. It also stays in All()
+//     so a later build keeps recognising its marker and its features' used
+//     bits.
+//
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery
 // authorization to the pre-claim behaviour; voters keep answering and keep
@@ -913,9 +944,6 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
-	// VMLimitsV1 is advertised UNCONDITIONALLY: it says "this build keeps and
-	// re-applies a VM's cpu/nic limits", a fact about the binary.
-	VMLimitsV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -940,12 +968,16 @@ var supported = []string{
 	// defeating the quarantine. Withholding advertisement while the flag is off
 	// keeps the cluster from latching until every node has opted in.
 	IsolationEpochV1,
+	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes, keeps and honours every field and shape of its release", a fact
+	// about the binary. What opens a feature is WithFeature, not a flag.
+	Release202611V1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, VMLimitsV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1007,14 +1039,14 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
-	// Confirmed against every replication recipient: a maintenance host on the
-	// previous build still receives every spec and can own and rewrite one,
-	// dropping the limit fields. See VMLimitsV1.
-	VMLimitsV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
 	RecoveryClaimV1: true,
+	// Confirmed against every replication recipient: a feature of the release
+	// may write what a previous-release peer cannot decode or would drop on a
+	// rewrite. See Release202611V1.
+	Release202611V1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -1065,9 +1097,10 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
-	// A fact about the binary (it keeps and re-applies a VM's cpu/nic limits).
-	// Its stand-down is clearing the limits; see VMLimitsV1.
-	VMLimitsV1: true,
+	// A fact about the binary (it decodes, keeps and honours its release's
+	// fields and shapes). Nothing changes until a feature is used, and every
+	// use is recorded first. See Release202611V1.
+	Release202611V1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

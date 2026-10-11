@@ -554,6 +554,12 @@ real disk is (its record still names it, on the failed host), and
 later promotion is complete. A disk not recovered is not attached; attach or
 restore it once its host is back.
 
+After a successful automatic promotion the failover coordinator records the
+disks the VM ran on, on the failed host — the real, newer data of every disk —
+as it does for a reschedule (`vm.failover.disk_stranded`, condition
+`vm_disk_stranded`): that host sets them aside when it returns and keeps them
+while the VM exists (`lv host superseded-disks <host>`).
+
 During a rolling upgrade a promotion executed by a host on an older build
 recovers the root disk alone, as that build always did.
 

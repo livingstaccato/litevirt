@@ -3000,6 +3000,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
+			// The disks as they were before the promotion re-homes them: what
+			// it leaves on the failed host, recorded once it succeeds.
+			disksBefore, disksErr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
 			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil && errors.Is(err, corrosion.ErrPromoteHeld) && c.holdsDown(ctx, vm) {
 				// Held: the VM's only replicas are not point-in-time. A
 				// host-local disk cannot be restarted elsewhere, so a
@@ -3030,6 +3033,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.fenceRelocated[h.Name] = true
 				c.mVM(ActionPromote, ResultSuccess, errClassNone)
 				c.audit(ctx, "failover.promote", vm.Name, "promoted replica after fencing "+h.Name, "ok")
+				c.noteDisksLeftByPromote(ctx, h.Name, vm, disksBefore, disksErr)
 				continue
 			}
 		}

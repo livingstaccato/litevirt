@@ -67,6 +67,57 @@ func (c *Coordinator) noteDiskStranded(ctx context.Context, host string, vm corr
 	}
 }
 
+// noteDisksLeftByPromote records the host-local disks a successful automatic
+// promotion of vm left on host: its disks as they were before the promotion
+// (disks, read before it re-homed any), each the real, newer copy of a disk
+// the promotion rebuilt from an older replica, or of one it could not
+// recover. Without the record nothing named them once the VM's rows moved,
+// and a later failover back onto host set them aside to be swept seven days
+// on, as for a reschedule (noteDiskStranded).
+func (c *Coordinator) noteDisksLeftByPromote(ctx context.Context, host string, vm corrosion.VMRecord, disks []corrosion.DiskRecord, readErr error) {
+	if vm.State == "pending" {
+		return // never ran on host: nothing of it is there
+	}
+	if readErr != nil {
+		slog.Error("failover: cannot tell which disks a promoted VM left on its failed host; they are not recorded",
+			"vm", vm.Name, "host", host, "error", readErr)
+		return
+	}
+	var left []corrosion.DiskRecord
+	for _, d := range disks {
+		if d.HostName == host || d.HostName == "" {
+			left = append(left, d)
+		}
+	}
+	target := ""
+	if now, err := corrosion.GetVM(ctx, c.db, vm.Name); err == nil && now != nil && now.HostName != host {
+		target = now.HostName
+	}
+	detail, err := health.RecordStrandedDisks(ctx, c.db, c.hostName, vm.Name, host, target, left, c.now())
+	if err != nil {
+		slog.Error("failover: could not record the host-local disks a promoted VM left on its failed host",
+			"vm", vm.Name, "host", host, "error", err)
+		return
+	}
+	if detail == "" {
+		return
+	}
+	detail = "promoted from its replica: " + detail + "; " + host + " keeps them once it is back (lv host superseded-disks " + host + ")"
+	slog.Warn("failover: a promoted VM left its host-local disks on the failed host; recorded and kept",
+		"vm", vm.Name, "host", host, "target", target)
+	c.audit(ctx, "failover.disk-stranded", vm.Name, detail, "ok")
+	if err := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm.Name, HostName: c.hostName, Type: "vm.failover.disk_stranded",
+		Result: "ok", Severity: "warn", Detail: detail, Username: "failover-coordinator",
+	}); err != nil {
+		slog.Warn("failover: record the stranded disk's event", "vm", vm.Name, "error", err)
+	}
+	c.publish("vm.failover.disk_stranded", vm.Name, detail)
+	if c.OnDiskStranded != nil {
+		c.OnDiskStranded(vm.Name, host, detail)
+	}
+}
+
 // noteRootfsStranded records that a relocation of ct from host to target
 // (how: image-recreate | backup-restore) left the container's own rootfs on
 // host (health/stranded_rootfs.go). Surface only: nothing is moved or

@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -226,5 +227,46 @@ func TestFleet_AutoPromote_IncompleteSetRecoversWhatHasAReplicaAndNamesTheRest(t
 	insp, err := c.SelfClient(coord).InspectVM(ctx, &pb.InspectVMRequest{Name: "set2"})
 	if err != nil || !strings.Contains(insp.GetPromotedPartial(), "data3") {
 		t.Errorf("inspect promoted_partial = %q (%v), want data3 named", insp.GetPromotedPartial(), err)
+	}
+}
+
+// The disks a successful automatic promotion leaves on the failed host — the
+// real, newer data of every disk, recovered or not — are recorded and kept
+// like those a reschedule leaves (vm_disk_stranded), so the host sets them
+// aside when it returns rather than leaving them unrecorded.
+//
+// Mutation "promote records nothing": the coordinator's noteDiskStranded
+// call after a successful promotion is removed — red.
+func TestFleet_AutoPromote_RecordsTheDisksLeftOnTheFailedHost(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	sched := replicaSetVM(t, c, victim, replicaHost, "set3")
+	if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-5*time.Minute)); err != nil {
+		t.Fatalf("replicate set3: %v", err)
+	}
+
+	failVictim(t, coord, victim, replicaHost, coord)
+
+	if !replicaHost.Virt.DomainExists("set3") {
+		t.Fatalf("set3 was not promoted on %s", replicaHost.Name)
+	}
+	recs, err := health.StrandedDisksOf(ctx, coord.DB, "set3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range recs {
+		if r.Host != victim.Name {
+			continue
+		}
+		for _, d := range r.Disks {
+			got[d.Disk] = d.Path
+		}
+	}
+	for _, d := range []string{"root", "data1", "data2", "data3"} {
+		if want := filepath.Join(c.tmpRoot, victim.Name, "set3-"+d+".qcow2"); got[d] != want {
+			t.Errorf("stranded record of %s on %s = %q, want %q (all: %v)", d, victim.Name, got[d], want, got)
+		}
 	}
 }

@@ -228,7 +228,13 @@ containers:
   kernel locks the flag. Root in a privileged or legacy-confined container
   (both admin-only) can remount the tree read-write.
 - **The config never names the tree.** LXC binds a staging path under
-  `/run/litevirt/ct` (root-only, private propagation). Litevirt's start hook,
+  `/var/lib/lxc/.litevirt+staging` (root-only, private propagation, no
+  symlink followed). It lies beneath LXC's store because that is the one tree
+  the stock AppArmor profile of `lxc-start` lets a start hook mount on
+  (Ubuntu's `abstractions/lxc/start-container`), so no host policy change is
+  needed; earlier builds staged under `/run/litevirt/ct`, which that profile
+  denies, and a config they rendered is staged there until a start by the
+  daemon renders it again. Litevirt's start hook,
   which LXC runs on **every** start — a reboot from inside the container
   included — opens each source beneath its allowed prefix with
   `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`, then judges what it opened

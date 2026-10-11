@@ -759,11 +759,34 @@ const (
 
 // stagingRoot is where the hook mounts each source before LXC binds it into
 // the container: root-only, so nothing unprivileged can rename in it.
-var stagingRoot = "/run/litevirt/ct"
+//
+// It lies beneath LXC's store because that is the one tree the stock
+// AppArmor profile of lxc-start lets a pre-start hook mount on ("mount ->
+// /var/lib/lxc/{**,}", abstractions/lxc/start-container on Ubuntu): a hook
+// mounting anywhere else is denied, and every container with a host mount
+// or device fails to start. It is directly beneath the store rather than in
+// the container's own directory, which belongs to an unprivileged
+// container's mapped root (secureContainerDir), and its name is not a valid
+// container name (the '+'), so no container can own it.
+var stagingRoot = defaultLxcpath + "/" + stagingDirName
+
+// stagingDirName is stagingRoot's directory in LXC's store.
+const stagingDirName = ".litevirt+staging"
+
+// legacyStagingRoot is where earlier builds staged. A config they rendered
+// still names it until a daemon-driven start renders it again, so the hook
+// stages such a config there, as before.
+const legacyStagingRoot = "/run/litevirt/ct"
 
 // stagingPath is the staging mount point of a container's i-th mount.
 func stagingPath(name string, i int) string {
-	return filepath.Join(stagingRoot, name, fmt.Sprintf("m%d", i))
+	return stagingPathUnder(stagingRoot, name, i)
+}
+
+// stagingPathUnder is the staging mount point of a container's i-th mount
+// under root.
+func stagingPathUnder(root, name string, i int) string {
+	return filepath.Join(root, name, fmt.Sprintf("m%d", i))
 }
 
 // renderHostAccessBlock is the litevirt-owned config block for a container's
@@ -1281,7 +1304,7 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 	}
 	var errs []error
 	for _, e := range ents {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == stagingDirName {
 			continue
 		}
 		if err := r.refreshHookPolicyBounded(e.Name()); err != nil {

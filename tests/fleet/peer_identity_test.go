@@ -177,3 +177,22 @@ func TestFleetHarness_ARemoteClientMarkIsGoneOnceItsConnectionCloses(t *testing.
 		t.Fatal("the mark outlived its connection")
 	}
 }
+
+// TestFleetHarness_ARemoteClientsMarkIsGoneOnceItCloses: closing a
+// RemoteClient connection removes the mark its dialer left, end to end — the
+// dialer hands gRPC the connection that unmarks, not the raw one.
+func TestFleetHarness_ARemoteClientsMarkIsGoneOnceItCloses(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	a := c.Nodes[0]
+	cc := c.remoteConn(a)
+	if _, err := pb.NewLiteVirtClient(cc).Ping(context.Background(), &pb.PingRequest{}); err != nil {
+		t.Fatalf("Ping over the remote connection: %v", err)
+	}
+	if n := c.remote.marked(); n != 1 {
+		t.Fatalf("%d connections marked after a dial, want 1", n)
+	}
+	if err := cc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the closed connection's mark to go", func() bool { return c.remote.marked() == 0 })
+}

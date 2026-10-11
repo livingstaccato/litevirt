@@ -595,22 +595,33 @@ when its old owner provably no longer writes it:
   best-effort fence can leave a partitioned host's qemu writing the disk;
 - any other promotion — an operator's, whether the CLI reaches the replica
   host directly or through another node, local-root `lv`, or a relay from a
-  coordinator on an older build — only when the owner is fenced, is removed,
-  or is no longer a member; not merely not active (maintenance, offline or
-  active is not enough, and `--force` does not change that);
-- an owner whose state cannot be read: never.
+  coordinator on an older build — only when the owner is removed, is no
+  longer a member, or is fenced **and proven powered off**: the newest fence
+  on record for it is proof-grade (a verified IPMI power-off, or
+  `lv host fence-confirm`), the same assurance the shared-storage fence and
+  recovery claims trust. A host recorded fenced by an SSH, watchdog or
+  best-effort fence, or with no fence record, may still be writing the disk,
+  so it is left unattached and the promotion reported partial, naming the
+  remedy: once the host is off, `lv host fence-confirm <host>`, then attach
+  the disk as-is. Not merely not
+  active either: maintenance, offline or active is not enough, and `--force`
+  does not change any of this;
+- an owner whose state or fence record cannot be read: never.
 
-"Shared" here is one definition, used by this rule and by both shared-disk
-fence checks (failover's decision and the promoting host's): a disk whose
-storage type is nfs, ceph, rbd or iscsi, or whose pool has a shared driver on
-its own host or the promoting host.
+"Shared" here is one definition, used by this rule and by every shared-disk
+fence check (failover's decision, the promoting host's, the host that starts
+a rescheduled VM, and failover's move of a stopped VM), and by the
+point-in-time overlay sweep: a disk whose storage type is nfs, ceph, rbd or
+iscsi, or whose pool has a shared driver on its own host or the deciding
+host.
 
 It must also be reachable from the promoting host within a few seconds (a
 hung NFS mount is given up on, and the root is promoted without it). A
 renamed promotion never attaches it: the disk belongs to the original VM.
 Whenever it is not attached the VM is promoted exactly as main promoted it,
 and the partial report names it as shared at its path, with why, and either
-"attach it as-is once the old host's fence is confirmed" or, for a renamed
+"attach it as-is once the old host is proven powered off (an IPMI power-off
+or `lv host fence-confirm`) or removed" or, for a renamed
 promotion, that it belongs to the original and must not be attached to the
 copy.
 

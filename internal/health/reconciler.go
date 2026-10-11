@@ -1515,16 +1515,26 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 
 	// Shared-disk split-brain gate: an ownership TRANSFER (a pending row carrying a
-	// coordinator proof) of a VM with a writable SHARED disk (nfs/ceph/rbd/iscsi) may
+	// coordinator proof) of a VM with a writable SHARED disk (corrosion.
+	// DiskOnSharedStorage: storage type nfs/ceph/rbd/iscsi, or a pool whose driver
+	// is shared on the disk's host or this one — colonelpanik/litevirt#258) may
 	// start only once the old owner is PROVEN powered off — carried in the proof's
 	// fence_epoch and re-verified against the append-only fencing_log. A local-disk
 	// transfer keeps the proof/quorum gate above (its disk is host-local; no
 	// shared-write hazard). Fail closed once enforced; the kill-switch restores legacy.
 	// host_name was re-pointed to this target, so we trust the proof-protected
 	// fence_epoch.Host as the old owner (oldOwner "").
+	//
+	// "Shared" consults the pool rows of this host and of the old owner the
+	// proof's fence names: the transfer re-pointed every disk row here, so
+	// the disk's own row names this host.
+	poolHosts := []string{r.hostName}
+	if ref, ok := corrosion.ParseFenceEpoch(proofFenceEpoch); ok {
+		poolHosts = append(poolHosts, ref.Host)
+	}
 	if proofID != "" && r.sharedStorageFenceEnforce && r.gate != nil &&
 		r.gate.Enforced(ctx, capabilities.SharedStorageFenceV1) &&
-		corrosion.VMHasWritableSharedDisk(diskRecords) {
+		corrosion.VMHasSharedDisk(ctx, r.db, diskRecords, poolHosts...) {
 		switch verdict, detail := corrosion.CheckProofGradeFence(ctx, r.db, proofFenceEpoch, "", corrosion.SharedDiskFenceWindow); verdict {
 		case corrosion.FenceOK:
 			// proof-grade fence verified — proceed.

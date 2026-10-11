@@ -135,9 +135,15 @@ func (s *Server) vmHasSharedDisk(ctx context.Context, disks []corrosion.DiskReco
 //   - every other promotion — an operator's, through any node or local-root
 //     lv, or an older coordinator's relay that carries neither a proof nor
 //     the mark — gets the manual rule: only when the owner is this host, is
-//     fenced, is removed, or is no longer a member. --force never bypasses it;
-//   - an owner whose host row cannot be read: never (fail closed).
-func sharedReattachVerdict(renamed, automated, fenceProven bool, owner, self string, ownerHost *corrosion.HostRecord, ownerErr error) (bool, string) {
+//     removed, is no longer a member, or is fenced AND proven off
+//     (ownerProvedOff: the newest fence on record for it is proof-grade, an
+//     IPMI power-off or `lv host fence-confirm` — corrosion.
+//     FenceRecordProvesOff). A `fenced` state over an SSH, watchdog or
+//     best-effort fence, or none, proves nothing: that host may still be
+//     writing the disk. --force never bypasses it;
+//   - an owner whose host row or fence record cannot be read: never (fail
+//     closed).
+func sharedReattachVerdict(renamed, automated, fenceProven bool, owner, self string, ownerHost *corrosion.HostRecord, ownerProvedOff bool, ownerErr error) (bool, string) {
 	switch {
 	case renamed:
 		return false, "renamed"
@@ -149,8 +155,14 @@ func sharedReattachVerdict(renamed, automated, fenceProven bool, owner, self str
 		return true, ""
 	case ownerErr != nil:
 		return false, fmt.Sprintf("the state of its owner %s cannot be read: %v", owner, ownerErr)
-	case ownerHost == nil || ownerHost.State == "removed" || ownerHost.State == "fenced":
+	case ownerHost == nil || ownerHost.State == "removed":
 		return true, ""
+	case ownerHost.State == "fenced" && ownerProvedOff:
+		return true, ""
+	case ownerHost.State == "fenced":
+		return false, fmt.Sprintf("its owner %s is fenced, but not proven powered off: its newest fence is not an IPMI power-off or "+
+			"an operator's confirmation, so it may still be writing the disk; once it is off, `lv host fence-confirm %s`",
+			owner, owner)
 	default:
 		return false, fmt.Sprintf("its owner %s is %s, not fenced (and no proof-grade fence was verified)", owner, ownerHost.State)
 	}
@@ -544,7 +556,7 @@ func assignTargetDevs(rootDev string, others []promotedSetDisk) {
 // reattached as-is, or why not. partial lists what makes the set incomplete,
 // "" when nothing does.
 func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM string, others []promotedSetDisk) (manifest, partial string) {
-	sharedAdvice := "attach it as-is once the old host's fence is confirmed"
+	sharedAdvice := "attach it as-is once the old host is proven powered off (an IPMI power-off or `lv host fence-confirm`) or removed"
 	if newVM != "" && newVM != origVM {
 		sharedAdvice = fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
 	}

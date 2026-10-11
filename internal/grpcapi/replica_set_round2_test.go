@@ -24,26 +24,30 @@ func TestSharedReattachVerdict_EveryBranch(t *testing.T) {
 		renamed, auto, proven bool
 		owner                 string
 		h                     *corrosion.HostRecord
+		provedOff             bool
 		herr                  error
 		want                  bool
 	}{
-		{"renamed, owner fenced", true, false, false, "old", host("fenced"), nil, false},
-		{"renamed, fence proven", true, true, true, "old", host("fenced"), nil, false},
-		{"fence proven, owner maintenance", false, true, true, "old", host("maintenance"), nil, true},
-		{"fence proven, owner active", false, false, true, "old", host("active"), nil, true},
-		{"automated, no fence proven, owner fenced", false, true, false, "old", host("fenced"), nil, false},
-		{"automated, no fence proven, owner maintenance", false, true, false, "old", host("maintenance"), nil, false},
-		{"unproven, owner is this host", false, false, false, "self", nil, nil, true},
-		{"unproven, no owner", false, false, false, "", nil, nil, true},
-		{"unproven, owner unreadable", false, false, false, "old", nil, errors.New("db down"), false},
-		{"unproven, owner no longer a member", false, false, false, "old", nil, nil, true},
-		{"unproven, owner removed", false, false, false, "old", host("removed"), nil, true},
-		{"unproven, owner fenced", false, false, false, "old", host("fenced"), nil, true},
-		{"unproven, owner maintenance", false, false, false, "old", host("maintenance"), nil, false},
-		{"unproven, owner offline", false, false, false, "old", host("offline"), nil, false},
-		{"unproven, owner active", false, false, false, "old", host("active"), nil, false},
+		{"renamed, owner fenced", true, false, false, "old", host("fenced"), true, nil, false},
+		{"renamed, fence proven", true, true, true, "old", host("fenced"), true, nil, false},
+		{"fence proven, owner maintenance", false, true, true, "old", host("maintenance"), false, nil, true},
+		{"fence proven, owner active", false, false, true, "old", host("active"), false, nil, true},
+		{"automated, no fence proven, owner fenced", false, true, false, "old", host("fenced"), false, nil, false},
+		{"automated, no fence proven, owner proven off", false, true, false, "old", host("fenced"), true, nil, false},
+		{"automated, no fence proven, owner maintenance", false, true, false, "old", host("maintenance"), false, nil, false},
+		{"unproven, owner is this host", false, false, false, "self", nil, false, nil, true},
+		{"unproven, no owner", false, false, false, "", nil, false, nil, true},
+		{"unproven, owner unreadable", false, false, false, "old", nil, false, errors.New("db down"), false},
+		{"unproven, owner fence record unreadable", false, false, false, "old", host("fenced"), false, errors.New("db down"), false},
+		{"unproven, owner no longer a member", false, false, false, "old", nil, false, nil, true},
+		{"unproven, owner removed", false, false, false, "old", host("removed"), false, nil, true},
+		{"unproven, owner fenced and proven off", false, false, false, "old", host("fenced"), true, nil, true},
+		{"unproven, owner fenced best-effort only", false, false, false, "old", host("fenced"), false, nil, false},
+		{"unproven, owner maintenance", false, false, false, "old", host("maintenance"), false, nil, false},
+		{"unproven, owner offline", false, false, false, "old", host("offline"), false, nil, false},
+		{"unproven, owner active", false, false, false, "old", host("active"), false, nil, false},
 	} {
-		got, why := sharedReattachVerdict(c.renamed, c.auto, c.proven, c.owner, "self", c.h, c.herr)
+		got, why := sharedReattachVerdict(c.renamed, c.auto, c.proven, c.owner, "self", c.h, c.provedOff, c.herr)
 		if got != c.want {
 			t.Errorf("%s: reattach = %v (%s), want %v", c.name, got, why, c.want)
 		}
@@ -87,8 +91,8 @@ func assertSharedUnattached(t *testing.T, s *Server, nfsDisk, reason string) {
 }
 
 // N1: a manual promotion whose owner is in maintenance — not fenced — leaves
-// the shared disk unattached and says why; one whose owner is fenced
-// reattaches it.
+// the shared disk unattached and says why; one whose owner is fenced and
+// proven off (fix round 4: an IPMI fence record) reattaches it.
 func TestPromote_ManualSharedReattachNeedsAFencedOwner(t *testing.T) {
 	s := testServer(t)
 	nfsDisk := nfsPromoteVM(t, s, "maintenance")
@@ -97,6 +101,7 @@ func TestPromote_ManualSharedReattachNeedsAFencedOwner(t *testing.T) {
 
 	s2 := testServer(t)
 	nfs2 := nfsPromoteVM(t, s2, "fenced")
+	recordOwnerFence(t, s2, "ipmi1", "ipmi", "fenced", time.Minute)
 	promoteSet(t, s2, &pb.PromoteReplicaRequest{VmName: "db", TargetPool: "dr", Force: true, NoLocalize: true})
 	if xml := s2.virt.(*libvirtfake.Fake).DefinedXML("db"); !strings.Contains(xml, nfs2) {
 		t.Errorf("a fenced owner's shared disk was not reattached: %s", xml)
@@ -143,6 +148,7 @@ func TestPromote_RenamedNeverTakesTheOriginalsSharedDisk(t *testing.T) {
 func TestPromote_AHungSharedPathTimesOut(t *testing.T) {
 	s := testServer(t)
 	nfsDisk := nfsPromoteVM(t, s, "fenced")
+	recordOwnerFence(t, s, "ipmi1", "ipmi", "fenced", time.Minute)
 	release := make(chan struct{})
 	defer close(release)
 	prevStat, prevTimeout := statShared, sharedDiskStatTimeout

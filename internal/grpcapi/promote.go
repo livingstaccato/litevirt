@@ -1218,15 +1218,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Whether a shared disk may be reattached as-is (sharedReattachVerdict).
 	var ownerHost *corrosion.HostRecord
 	var ownerErr error
+	ownerProvedOff := false
 	if vm.HostName != "" && vm.HostName != s.hostName {
 		ownerHost, ownerErr = corrosion.GetHost(ctx, s.db, vm.HostName)
+		// A `fenced` state is proof only over a proof-grade fence record
+		// (corrosion.HostProvedOff's rule, colonelpanik/litevirt#253).
+		if ownerErr == nil && ownerHost != nil && ownerHost.State == "fenced" {
+			ownerProvedOff, ownerErr = corrosion.FenceRecordProvesOff(ctx, s.db, vm.HostName)
+		}
 	}
 	// Automated: the coordinator's own call, a carried proof, or a relay the
 	// coordinator marked. A relay without either (an operator through another
 	// node, local-root lv, an older coordinator) gets the manual rule.
 	sharedAutomated := autoPath || req.Automated
 	reattachOK, reattachWhy := sharedReattachVerdict(renamed, sharedAutomated, fenceProven,
-		vm.HostName, s.hostName, ownerHost, ownerErr)
+		vm.HostName, s.hostName, ownerHost, ownerProvedOff, ownerErr)
 	for i := range others {
 		d := &others[i]
 		if d.shared {

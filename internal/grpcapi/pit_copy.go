@@ -833,7 +833,7 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 		if !pitoverlay.Present(s.hostDiskFile(d.Path)) {
 			continue
 		}
-		if corrosion.DiskIsShared(*d) && (s.virt == nil || !s.virt.DomainExists(name)) {
+		if s.diskOnSharedStorage(ctx, *d) && (s.virt == nil || !s.virt.DomainExists(name)) {
 			detail := fmt.Sprintf("%s: a point-in-time overlay %s is present on shared storage and %s's domain is not defined on this host; left for the host that defines or starts it", d.DiskName, pitOverlayPath(d.Path), name)
 			slog.Warn("point-in-time overlay sweep: "+detail, "vm", name)
 			s.recordVMEventSeverity(ctx, name, "disk.pit_overlay_left", "ok", "warn", detail)

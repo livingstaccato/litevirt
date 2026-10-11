@@ -110,7 +110,9 @@ func (c *Coordinator) vmWasCandidate(ctx context.Context, vm corrosion.VMRecord)
 // failover candidate, every disk is on shared storage, it has no host-local
 // firmware state, its ownership is not in dispute, and — for a writable
 // shared disk under the shared-storage fence — the old owner is proven off,
-// as for a running VM's transfer. Anything else stays where it is.
+// as for a running VM's transfer. "Shared" for that fence is the one
+// definition (corrosion.DiskOnSharedStorage: storage type or pool driver), so
+// a pool-shared disk never slips past it. Anything else stays where it is.
 func (c *Coordinator) stoppedVMRekeyable(ctx context.Context, host string, vm corrosion.VMRecord, disks []corrosion.DiskRecord, fenceEpoch string) bool {
 	if !c.vmWasCandidate(ctx, vm) || vmUsesFirmwareState(vm) || corrosion.VMHasHostLocalDisk(disks) {
 		return false
@@ -118,7 +120,7 @@ func (c *Coordinator) stoppedVMRekeyable(ctx context.Context, host string, vm co
 	if disputed, _, err := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "vm", vm.Name); err != nil || disputed {
 		return false
 	}
-	if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) && corrosion.VMHasWritableSharedDisk(disks) {
+	if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) && corrosion.VMHasSharedDisk(ctx, c.db, disks, c.hostName) {
 		return false
 	}
 	return true

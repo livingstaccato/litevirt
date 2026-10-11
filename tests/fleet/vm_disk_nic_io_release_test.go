@@ -139,3 +139,82 @@ func TestFleet_DiskNICIOReleaseToken_RefusedThenRecordedBeforeData(t *testing.T)
 		}
 	}
 }
+
+// N1: the entry check keeps the release UX and drives the latch, but records
+// nothing. With one host on the previous build the refusal names that host and
+// ends with the `lv cluster upgrade-status` pointer; once every host is on the
+// release the SAME call succeeds with the HA monitor idle (the check drove the
+// latch), and no host holds a use of the feature afterwards.
+//
+// Mutations: make ioFeatureGate return a fixed text — the host-naming check goes
+// red; make it read the local hint only — the latch-driven success goes red; run
+// the real gate (WithReleaseFeature) in it — the no-record check goes red.
+func TestFleet_DiskNICIOEntryCheck_NamesHostsDrivesTheLatchRecordsNothing(t *testing.T) {
+	c, _ := latchedFleet(t, 3, 4418)
+	ctx := context.Background()
+	entry, old := c.Nodes[1], c.Nodes[2]
+	f := capabilities.FeatureVMDiskNICIO
+	// A request for a VM that does not exist: it passes (or fails) the entry check
+	// and then stops at NotFound, so any record would come from the check itself.
+	probe := func() error {
+		_, err := c.SelfClient(entry).SetDiskIO(ctx, &pb.SetDiskIORequest{
+			VmName: "ghost", DiskName: "root", Limits: &pb.DiskIOLimits{TotalIopsSec: 5}})
+		return err
+	}
+
+	old.Server.SetWALQuarantined(func() bool { return true })
+	err := probe()
+	if status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "the cluster upgrade must finish first (vm_disk_nic_io needs "+capabilities.ReleaseToken+")") ||
+		!strings.Contains(err.Error(), old.Name) || !strings.Contains(err.Error(), "lv cluster upgrade-status") {
+		t.Fatalf("refusal with %s on the old build = %v, want the release text naming %s and the upgrade-status pointer", old.Name, err, old.Name)
+	}
+
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	eventually(t, 20*time.Second, "the entry check to latch the token and pass", func() bool {
+		return status.Code(probe()) == codes.NotFound
+	})
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if featureUsedOn(t, n, capabilities.ReleaseToken, string(f)) {
+			t.Errorf("%s holds a use of vm_disk_nic_io after only entry checks", n.Name)
+		}
+	}
+}
+
+// N3: a plain create must never perform the feature's first use. The release
+// token is latched everywhere (driven by an unrelated feature) but vm_disk_nic_io
+// is not recorded used: a compose deploy of an untuned VM stores no discard and
+// leaves no use record.
+//
+// Mutation: have CreateVM take s.ioGrant instead of s.ioGrantIfUsed for the
+// default — the use record and the stored discard appear, red.
+func TestFleet_DiskNICIOPlainCreateNeverPerformsTheFirstUse(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
+	gates := gateAll(t, c)
+	wireReleaseFeatures(t, c, gates)
+	if !gates[node.Name].Enforced(ctx, capabilities.FailoverScopeV1) {
+		t.Fatal("failover_scope_v1 did not latch")
+	}
+	info, _ := capabilities.LookupFeature(capabilities.FeatureVMDiskNICIO)
+	t.Cleanup(capabilities.OverrideFeaturesForTest(map[capabilities.Feature]capabilities.FeatureInfo{
+		capabilities.FeatureVMDiskNICIO: info,
+		"widgets":                       {Token: capabilities.ReleaseToken, Description: "Widgets"},
+	}))
+	eventually(t, 20*time.Second, "the release token to latch", func() bool { return writeFeature(ctx, node, "widgets") == nil })
+	if _, err := client.CreateNetwork(ctx, &pb.CreateNetworkRequest{Name: "hc", Type: "isolated", Subnet: "172.16.50.0/24", Dhcp: true}); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+	deployClean(t, ctx, client, composeNoTuning)
+	waitRunning(t, ctx, node, "db")
+	if featureUsedOn(t, node, capabilities.ReleaseToken, string(capabilities.FeatureVMDiskNICIO)) {
+		t.Fatal("a plain create recorded the first use of vm_disk_nic_io")
+	}
+	for _, d := range storedSpec(t, ctx, node, "db").Disks {
+		if d.Discard != "" {
+			t.Errorf("a plain create before the feature's first use stored discard %q", d.Discard)
+		}
+	}
+}

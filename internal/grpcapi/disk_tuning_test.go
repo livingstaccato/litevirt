@@ -175,7 +175,8 @@ func TestSetDiskIO_DiskTheSpecDoesNotListIsThrottledAndRecorded(t *testing.T) {
 	}
 	fake.SetState("io", libvirtfake.StateRunning)
 
-	for disk, dev := range map[string]string{"root": "vda", "hot": "vdb"} {
+	for _, pair := range [][2]string{{"root", "vda"}, {"hot", "vdb"}} { // a slice: the spec order follows the call order
+		disk, dev := pair[0], pair[1]
 		if _, err := s.SetDiskIO(ctx, &pb.SetDiskIORequest{VmName: "io", DiskName: disk, Limits: &pb.DiskIOLimits{TotalIopsSec: 77}}); err != nil {
 			t.Fatalf("%s: %v", disk, err)
 		}

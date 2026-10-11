@@ -75,12 +75,13 @@ func (s *Server) autoDefineRestoredVM(
 	}
 	// The spec is a manifest's or a caller's, never a validated create: its
 	// disk/NIC tuning is dropped before the gate opens and validated after.
-	stripped, ioG, rerr := s.restrictRestoredTuning(ctx, spec)
+	ioR, rerr := s.restrictRestoredTuning(ctx, spec)
 	if rerr != nil {
 		return "", "", rerr
 	}
-	if stripped {
-		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: the cluster upgrade has not finished"})
+	ioG := ioR.grant
+	if ioR.stripped {
+		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
 	}
 
 	originalName := spec.Name
@@ -418,6 +419,7 @@ func (s *Server) autoDefineRestoredVM(
 	})
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
+	s.auditTuningDropped(ctx, ioR, targetName, "restore")
 	return targetName, rootDev, nil
 }
 

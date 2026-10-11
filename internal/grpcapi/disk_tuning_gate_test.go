@@ -175,29 +175,31 @@ func TestRestrictRestoredTuning(t *testing.T) {
 	ctx := context.Background()
 	un := &Server{releaseFeatures: ioGate{t: t, on: false}}
 	spec := mk()
-	stripped, _, err := un.restrictRestoredTuning(ctx, spec)
-	if err != nil || !stripped || specSetsDiskNICIO(spec) {
+	rr, err := un.restrictRestoredTuning(ctx, spec)
+	stripped := rr.stripped
+	if err != nil || !stripped || rr.refused != nil || specSetsDiskNICIO(spec) {
 		t.Errorf("unlatched: stripped=%v err=%v spec=%+v", stripped, err, spec)
 	}
 	if untouched := (&pb.VMSpec{Disks: []*pb.DiskSpec{{Name: "root"}}}); true {
-		if st, _, err := un.restrictRestoredTuning(ctx, untouched); st || err != nil {
-			t.Errorf("a spec with no tuning reported stripped=%v err=%v", st, err)
+		if rr, err := un.restrictRestoredTuning(ctx, untouched); rr.stripped || err != nil {
+			t.Errorf("a spec with no tuning reported stripped=%v err=%v", rr.stripped, err)
 		}
 	}
 	la := &Server{releaseFeatures: ioGate{t: t, on: true}}
 	spec = mk()
-	st, g, err := la.restrictRestoredTuning(ctx, spec)
+	lr, err := la.restrictRestoredTuning(ctx, spec)
+	st, g := lr.stripped, lr.grant
 	if err != nil || st || !specSetsDiskNICIO(spec) || g.Check(capabilities.FeatureVMDiskNICIO) != nil {
 		t.Errorf("latched valid: stripped=%v err=%v grant=%v", st, err, g)
 	}
 	bad := mk()
 	bad.Network[0].Queues = 4096
-	if _, _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
+	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("latched, queues 4096: %v, want InvalidArgument", err)
 	}
 	bad = mk()
 	bad.Disks[0].Io = &pb.DiskIOLimits{TotalBytesSec: 1, ReadBytesSec: 1}
-	if _, _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
+	if _, err := la.restrictRestoredTuning(ctx, bad); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("latched, total with read: %v, want InvalidArgument", err)
 	}
 }
@@ -284,6 +286,24 @@ func TestIOFeatureGate_EntryCheckTakesNoGrant(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "vm_disk_nic_io needs release_2026_11_v1") || n != 0 {
 		t.Errorf("closed: err=%v runs=%d", err, n)
 	}
+	// A gate with a refusal entry point (health.Checker) is asked for it.
+	r := &refuserGate{ioGate: ioGate{t: t, on: false, grants: &n}}
+	s.SetReleaseFeatureGate(r)
+	if err := s.ioFeatureGate(context.Background()); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "lv cluster upgrade-status") || r.refusals != 1 || n != 0 {
+		t.Errorf("refuser: err=%v refusals=%d runs=%d", err, r.refusals, n)
+	}
+}
+
+type refuserGate struct {
+	ioGate
+	refusals int
+}
+
+func (g *refuserGate) FeatureRefusal(context.Context, capabilities.Feature) error {
+	g.refusals++
+	return status.Error(codes.FailedPrecondition,
+		"the cluster upgrade must finish first (vm_disk_nic_io needs release_2026_11_v1): not on this release yet: h2 (v0) — see `lv cluster upgrade-status`")
 }
 
 // m5: a hardware redefine of a VM with no tuning writes none, so it is not
@@ -300,21 +320,50 @@ func TestIOGrant_RedefineOfAnUntunedVMTakesNone(t *testing.T) {
 	}
 }
 
-// m1: a restore whose tuning the gate refuses AFTER the latch is never refused:
-// the tuning is stripped and an audit row records it.
+// m1/N2: a restore whose tuning the gate refuses AFTER the latch is never
+// refused: the tuning is stripped and the result says the gate refused (not "the
+// upgrade has not finished"). The audit row is written by the caller once the
+// restore cannot be refused any more, against the VM's ACTUAL name, under an
+// action that fits promote and failover too; a strip before the latch writes none.
 //
-// Mutation: return the gate's error instead of stripping — red.
+// Mutations: return the gate's error instead of stripping — red; audit inside
+// restrictRestoredTuning (before the caller's commit point) — the no-row-yet check
+// goes red; audit the spec's original name — the target check goes red.
 func TestRestrictRestoredTuning_RefusalAfterTheLatchStripsAndAudits(t *testing.T) {
+	ctx := adminCtx()
 	s := testServer(t)
 	s.SetReleaseFeatureGate(ioGate{t: t, latchedButRefuses: true})
-	spec := &pb.VMSpec{Name: "r", Disks: []*pb.DiskSpec{{Name: "root", Discard: "unmap"}}}
-	stripped, _, err := s.restrictRestoredTuning(adminCtx(), spec)
-	if err != nil || !stripped || specSetsDiskNICIO(spec) {
-		t.Fatalf("stripped=%v err=%v spec=%+v", stripped, err, spec)
+	spec := &pb.VMSpec{Name: "orig", Disks: []*pb.DiskSpec{{Name: "root", Discard: "unmap"}}}
+	rr, err := s.restrictRestoredTuning(ctx, spec)
+	if err != nil || !rr.stripped || rr.refused == nil || specSetsDiskNICIO(spec) {
+		t.Fatalf("restricted = %+v err=%v spec=%+v", rr, err, spec)
 	}
-	rows, qerr := s.db.Query(context.Background(), `SELECT action, target, result FROM audit_log WHERE action = ?`, "vm.restore.tuning_dropped")
-	if qerr != nil || len(rows) != 1 || rows[0].String("target") != "r" {
-		t.Fatalf("audit rows = %v err=%v, want one for r", rows, qerr)
+	if !strings.Contains(rr.why(), "refused after the latch") || strings.Contains(rr.why(), "has not finished") {
+		t.Errorf("why = %q, want the post-latch wording", rr.why())
+	}
+	count := func(target string) int {
+		rows, qerr := s.db.Query(context.Background(), `SELECT action FROM audit_log WHERE action = ? AND target = ?`, "vm.tuning_dropped", target)
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		return len(rows)
+	}
+	if count("orig") != 0 || count("renamed") != 0 {
+		t.Fatal("restrictRestoredTuning wrote the audit row itself; the restore may still be refused")
+	}
+	s.auditTuningDropped(ctx, rr, "renamed", "restore")
+	if count("renamed") != 1 || count("orig") != 0 {
+		t.Errorf("audit rows: renamed=%d orig=%d, want 1 and 0", count("renamed"), count("orig"))
+	}
+	// A strip before the latch is not an audit event.
+	pre := testServer(t)
+	pre.SetReleaseFeatureGate(ioGate{t: t, on: false})
+	spec2 := &pb.VMSpec{Name: "p", Disks: []*pb.DiskSpec{{Name: "root", Discard: "unmap"}}}
+	pr, _ := pre.restrictRestoredTuning(ctx, spec2)
+	pre.auditTuningDropped(ctx, pr, "p", "restore")
+	rows, _ := pre.db.Query(context.Background(), `SELECT action FROM audit_log WHERE action = ?`, "vm.tuning_dropped")
+	if !pr.stripped || pr.refused != nil || len(rows) != 0 || !strings.Contains(pr.why(), "has not finished") {
+		t.Errorf("pre-latch: %+v rows=%d", pr, len(rows))
 	}
 }
 

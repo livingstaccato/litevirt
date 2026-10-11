@@ -844,15 +844,16 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	spec.Name = targetName
 	// The stored tuning is validated again (and dropped before the gate opens)
 	// so a record from before a rollback cannot define what the cluster refuses.
-	ioStripped, ioG, err := s.restrictRestoredTuning(ctx, &spec)
+	ioR, err := s.restrictRestoredTuning(ctx, &spec)
 	if err != nil {
 		return err
 	}
-	if ioStripped {
+	ioG := ioR.grant
+	if ioR.stripped {
 		// The domain below is defined from the stripped spec. A takeover keeps the
 		// row's own spec, so the two differ until the next redefine renders it.
-		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain (the gate is closed on this host)",
-			"vm", targetName)
+		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
+			"vm", targetName, "why", ioR.why())
 	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
@@ -1281,6 +1282,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
 		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
+	s.auditTuningDropped(ctx, ioR, targetName, "promote")
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

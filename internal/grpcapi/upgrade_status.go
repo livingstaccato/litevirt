@@ -28,6 +28,30 @@ type releaseFeatureGate interface {
 	FeatureAvailable(feature capabilities.Feature) bool
 }
 
+// releaseFeatureRefuser is the optional entry-check side of a release gate:
+// *health.Checker implements it (FeatureRefusal).
+type releaseFeatureRefuser interface {
+	FeatureRefusal(ctx context.Context, feature capabilities.Feature) error
+}
+
+// ReleaseFeatureRefusal is the entry-node fail-fast of a release feature: nil
+// when its token has latched here (the latch is driven first, so a call made
+// just after the last host upgraded does not wait for the HA monitor), else the
+// release gate's refusal, naming the hosts that hold the release back and
+// ending with the `lv cluster upgrade-status` pointer. It records no use and
+// grants nothing: the node that writes the feature's data still goes through
+// WithReleaseFeature. With no gate wired it refuses (fail closed).
+func (s *Server) ReleaseFeatureRefusal(ctx context.Context, feature capabilities.Feature) error {
+	if r, ok := s.releaseFeatures.(releaseFeatureRefuser); ok {
+		return r.FeatureRefusal(ctx, feature)
+	}
+	if s.ReleaseFeatureAvailable(feature) {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition, "the cluster upgrade must finish first (%s needs %s)",
+		feature, featureToken(feature))
+}
+
 // ReleaseFeatureAvailable reports, without asking any peer, whether feature's
 // release token has durably latched here (health.Checker.FeatureAvailable). A
 // HINT for a caller that falls back rather than fails — a default that picks

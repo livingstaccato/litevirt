@@ -42,21 +42,16 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 }
 
 // ioFeatureGate is the entry-node check of the disk/NIC tuning feature
-// (capabilities.FeatureVMDiskNICIO): nil when its release token has latched
-// here, else FailedPrecondition with the release gate's text ("the cluster
-// upgrade must finish first (vm_disk_nic_io needs ...)"). It is a fail-fast
-// only: it reads the local latch, asks no peer, records nothing and grants
-// nothing, so a request that later fails leaves no used record. The node that
-// WRITES the tuning runs the real gate and takes the grant itself (ioGrant), so
-// a forwarded request is gated there. The latch is driven by the HA monitor and
-// by the first write that reaches the real gate.
+// (capabilities.FeatureVMDiskNICIO): nil when its release token has latched,
+// else the release gate's refusal (the hosts still to upgrade with their
+// versions, and `lv cluster upgrade-status`). It drives the latch, so a call
+// made just after the last host upgraded succeeds without waiting for the HA
+// monitor, but records and grants nothing (Server.ReleaseFeatureRefusal): a
+// request that later fails leaves no used record. The node that WRITES the
+// tuning runs the real gate and takes the grant itself (ioGrant), so a
+// forwarded request is gated there.
 func (s *Server) ioFeatureGate(ctx context.Context) error {
-	if s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
-		return nil
-	}
-	return status.Errorf(codes.FailedPrecondition,
-		"the cluster upgrade must finish first (%s needs %s)",
-		capabilities.FeatureVMDiskNICIO, featureToken(capabilities.FeatureVMDiskNICIO))
+	return s.ReleaseFeatureRefusal(ctx, capabilities.FeatureVMDiskNICIO)
 }
 
 // ioGrant runs the feature's gate on THIS node, the one that will write the
@@ -86,12 +81,6 @@ func (s *Server) ioGrantIfUsed(ctx context.Context) (g capabilities.FeatureGrant
 	}
 	g, err = s.ioGrant(ctx)
 	return g, err == nil
-}
-
-// diskNICIOActive reports whether the token has latched here (a hint: the write
-// still takes a grant through ioGrant).
-func (s *Server) diskNICIOActive(context.Context) bool {
-	return s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO)
 }
 
 // specSetsDiskNICIO reports whether a spec sets discard, detect_zeroes, a disk
@@ -444,47 +433,71 @@ func applyTuningRequest(spec *pb.VMSpec, dbDisks []corrosion.DiskRecord, req *pb
 	return nil
 }
 
+// restoredTuning is what restrictRestoredTuning decided for a restored or
+// promoted spec.
+type restoredTuning struct {
+	// stripped: the spec's tuning was dropped.
+	stripped bool
+	// grant is the feature's grant when the tuning is kept: the row this spec is
+	// written to must go through insertVMForSpec with it.
+	grant capabilities.FeatureGrant
+	// refused is the gate's error when the token HAD latched but the gate still
+	// refused (a first use that could not be acknowledged, a host rolled back
+	// after the latch). Nil when the strip is only "the upgrade has not finished".
+	refused error
+}
+
+// why words the strip for a progress line or a log: the two causes differ.
+func (r restoredTuning) why() string {
+	if r.refused != nil {
+		return "the disk/NIC feature gate refused after the latch: " + status.Convert(r.refused).Message()
+	}
+	return "the cluster upgrade has not finished"
+}
+
+// auditDropped writes the audit row for a strip caused by a refusal after the
+// latch. It is called by the restore or promote ONLY once that operation can no
+// longer be refused, and with the VM's actual name (--new-name included), so a
+// restore that fails later leaves no row and a renamed one names the right VM.
+func (s *Server) auditTuningDropped(ctx context.Context, r restoredTuning, vm, op string) {
+	if r.refused == nil || !r.stripped {
+		return
+	}
+	s.audit(ctx, "vm.tuning_dropped", vm, op+": disk/NIC tuning dropped: "+r.why(), "degraded")
+}
+
 // restrictRestoredTuning is the gate for a spec that did not come from a
-// validated create: a backup manifest or a promoted record. Before the gate
-// opens the tuning is STRIPPED (a restore main allows still works; older peers
-// would drop the fields anyway) and stripped=true says so; after it the values
-// are validated like a create's, so a hand-edited manifest cannot define a
-// domain libvirt refuses or open hundreds of queues.
-//
-// When the tuning is kept, the grant is the feature's: the row this spec is
-// written to must go through insertVMForSpec with it.
-func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (stripped bool, grant capabilities.FeatureGrant, err error) {
+// validated create: a backup manifest or a promoted record. When the token has
+// not latched, or has latched but the feature's gate refuses, the tuning is
+// STRIPPED (a restore main allows is never refused; older peers would drop the
+// fields anyway), a warning is logged and the result says which it was; when the
+// gate opens the values are validated like a create's, so a hand-edited
+// manifest cannot define a domain libvirt refuses or open hundreds of queues.
+func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (restoredTuning, error) {
+	var r restoredTuning
 	if !specSetsDiskNICIO(spec) {
-		return false, grant, nil
+		return r, nil
 	}
-	available := s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO)
-	var gerr error
-	if available {
-		grant, gerr = s.ioGrant(ctx)
-	}
-	if !available || gerr != nil {
-		for _, d := range spec.Disks {
-			d.Discard, d.DetectZeroes, d.Io = "", "", nil
+	if s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
+		g, gerr := s.ioGrant(ctx)
+		if gerr == nil {
+			if err := validateSpecTuning(spec); err != nil {
+				return r, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
+			}
+			r.grant = g
+			return r, nil
 		}
-		for _, n := range spec.Network {
-			n.Queues = 0
-		}
-		if gerr != nil {
-			// The token has latched but the feature's gate refused (a first use
-			// that could not be acknowledged, a host rolled back after the latch).
-			// A restore main allows is never refused: the tuning is dropped, and
-			// the operator is told in the log and the audit trail.
-			slog.Warn("restore: the disk/NIC feature gate refused after the latch: tuning dropped", "vm", spec.GetName(), "error", gerr)
-			s.audit(ctx, "vm.restore.tuning_dropped", spec.GetName(), "disk/NIC tuning dropped: "+status.Convert(gerr).Message(), "degraded")
-		} else {
-			slog.Warn("restore: the spec carries disk/NIC tuning and the cluster upgrade has not finished: tuning dropped", "vm", spec.GetName())
-		}
-		return true, grant, nil
+		r.refused = gerr
 	}
-	if err := validateSpecTuning(spec); err != nil {
-		return false, grant, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
+	for _, d := range spec.Disks {
+		d.Discard, d.DetectZeroes, d.Io = "", "", nil
 	}
-	return false, grant, nil
+	for _, n := range spec.Network {
+		n.Queues = 0
+	}
+	r.stripped = true
+	slog.Warn("restored spec: disk/NIC tuning dropped", "vm", spec.GetName(), "why", r.why())
+	return r, nil
 }
 
 // insertVMForSpec writes a new VM row. A spec that carries disk or NIC tuning

@@ -1565,7 +1565,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					return "operator claim", err
 				}
 			}
-			if err := s.virt.StartDomain(targetName); err != nil {
+			releaseGuard, gerr := s.guardSharedDiskStart(ctx, targetName, domXML)
+			if gerr != nil {
+				_ = s.virt.UndefineDomain(targetName, false)
+				s.removePromoteMarker(targetName)
+				if opClaim != nil {
+					s.unfenceOperatorStart(opClaim)
+				}
+				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
+			}
+			startErr := s.virt.StartDomain(targetName)
+			releaseGuard()
+			if err := startErr; err != nil {
 				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 				// Don't leak the marker: we tore the half-built domain down, so a later --force
 				// retry must not treat a same-name stranger as our adopted prior promotion.
@@ -1617,7 +1628,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", proofID, err)
 			case "marker":
 				return status.Errorf(codes.Internal, "record promote marker: %v", err)
-			case "operator claim":
+			case "operator claim", "shared disk released":
 				return err
 			default:
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)

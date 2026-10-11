@@ -1744,7 +1744,18 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)
 	}
-	if err := r.virt.StartDomain(vm.Name); err != nil {
+	// A shared disk this host released to another (review c2b) is never
+	// started here again unjudged.
+	releaseGuard, gerr := GuardSharedDiskStart(ctx, r.db, r.dataDir, r.hostName, vm.Name, domXML)
+	if gerr != nil {
+		releaseHW()
+		slog.Warn("reconciler: start refused — a shared disk this host released", "vm", vm.Name, "error", gerr)
+		r.failPendingStart(ctx, vm.Name, proofID, false, gerr.Error())
+		return
+	}
+	startErr := r.virt.StartDomain(vm.Name)
+	releaseGuard()
+	if err := startErr; err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt

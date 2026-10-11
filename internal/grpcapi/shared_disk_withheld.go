@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -154,4 +155,13 @@ func (s *Server) rejudgeSharedDisksForStart(ctx context.Context, vm *corrosion.V
 			"vm", vm.Name, "error", err)
 	}
 	return nil
+}
+
+// guardSharedDiskStart is health.GuardSharedDiskStart on this host, for the
+// definition about to start (its persistent XML when xml is "").
+func (s *Server) guardSharedDiskStart(ctx context.Context, vm, xml string) (func(), error) {
+	if xml == "" && s.virt != nil {
+		xml, _ = s.virt.DumpXMLInactive(vm)
+	}
+	return health.GuardSharedDiskStart(ctx, s.db, s.dataDir, s.hostName, vm, xml)
 }

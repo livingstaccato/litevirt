@@ -119,9 +119,9 @@ func WithheldSharedDiskDetail(vm, self string, withheld []WithheldSharedDisk) st
 	for _, o := range order {
 		remedies = append(remedies, fmt.Sprintf("once %s is powered off, `lv host fence-confirm %s` (with recovery claims "+
 			"enforced, a confirmation may also let the failover coordinator recover every workload still recorded on %s), "+
-			"then `lv restart %s`. Until %s is proven off no move of %s re-homes the disk's row, and "+
-			"`lv doctor repair-owner` refuses to",
-			o, o, o, vm, o, vm))
+			"then `lv restart %s`. Until %s is proven off no move of %s re-homes the disk's row; "+
+			"`lv doctor repair-owner` re-homes it only once %s, if it is active, attests no domain there uses the disk",
+			o, o, o, vm, o, vm, o))
 	}
 	return fmt.Sprintf("the domain of VM %s on %s was built without its shared disk(s) %s. A domain built from the disk rows "+
 		"attaches a shared disk whose row names another host only once that host is proven powered off. To attach it: %s",

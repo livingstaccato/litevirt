@@ -668,11 +668,18 @@ failover's move of a stopped VM, and an owner repair re-point every other
 disk row to the VM's new host, but not a shared disk's row that names a
 third host — neither the one the VM leaves nor the one it goes to — that is
 not proven off. Re-pointed, it would read as the new host's own at the next
-start and be attached unjudged. `lv doctor repair-owner` refuses outright
-while the VM has such a row, and names `lv host fence-confirm <host>`. That
-host may be up and not running the VM at all, for example the source of a
-migration whose ownership commit declined; it still has to be proven off,
-which for a host in service means taking it out of service first.
+start and be attached unjudged. `lv doctor repair-owner` re-homes such a row
+only when the host it names is active, reachable, and attests that no domain
+defined on it, running or not, uses the disk — the case of a migration whose
+ownership commit declined, whose rows name the source, still in service. The
+host attests under its start lock and records the release, and from then on
+refuses to start any domain using that disk until the VM's own row for it
+names that host again (the VM moved back). Otherwise — the host fenced,
+offline, removed, unreachable, on a build without the attestation, or with a
+domain still using the disk — repair-owner refuses and names
+`lv host fence-confirm <host>`. A `move-volume` of such a disk is refused
+the same way: copying it while its host may still write it would move a
+disk two hosts write.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts

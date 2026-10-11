@@ -2584,6 +2584,21 @@ message RecoveryClaimSupersede {
     RecoveryClaimValue prior_value  = 2;  // the value it decided
     string abandonment              = 3;  // JSON signed abandonment by that value's destination; "" = it was removed
 }
+// AttestSharedDiskUnusedRequest asks the host a shared disk's row names to
+// attest that no domain defined on it uses the disk (review c2b): `lv doctor
+// repair-owner` on the host running the VM re-homes the row only then. The
+// attesting host records the release, and refuses the start of any domain
+// using the path until the VM's own row for the disk names it again.
+message AttestSharedDiskUnusedRequest {
+    string vm_name   = 1;  // the VM whose disk row names the attesting host
+    string disk_name = 2;
+    string path      = 3;  // the shared disk's path, as the row records it
+    string requester = 4;  // the host the row is re-homed to
+}
+message AttestSharedDiskUnusedResponse {
+    bool   unused = 1;  // no domain defined on the attesting host uses path; released
+    string detail = 2;  // when not: which domain uses it
+}
 // AbandonRecoveryProofRequest asks a recovery destination to sign that it has
 // not executed, and never will, the proof a decided claim named (§3.12).
 message AbandonRecoveryProofRequest {
@@ -4178,6 +4193,10 @@ service LiteVirt {
     // not executed, and never will, a proof a decided claim named — refused if
     // it may already have (§3.12).
     rpc AbandonRecoveryProof(AbandonRecoveryProofRequest) returns (AbandonRecoveryProofResponse);
+    // AttestSharedDiskUnused: peer-only. The host a shared disk's row names
+    // attests, under its start lock, that no domain defined on it uses the
+    // disk, and records the release (review c2b).
+    rpc AttestSharedDiskUnused(AttestSharedDiskUnusedRequest) returns (AttestSharedDiskUnusedResponse);
     // ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
     // (admin): the decision an open ha.claim.legacy_held names, stuck in
     // flight on a live destination, is abandoned by that destination once it

@@ -975,8 +975,10 @@ have disk rows naming the host it left. Running `lv doctor repair-owner <vm>
 <host-that-runs-it>` once realigns them. A migration also commits over such a
 row, as long as the row has not changed since the migration began. A row of a
 disk on shared storage moves, by either, only once the host it names is
-proven powered off (`lv host fence-confirm <host>` first): until then it
-keeps naming that host, and repair-owner refuses (docs/backups.md).
+proven powered off (`lv host fence-confirm <host>` first), or, for repair-owner,
+once that host is active and attests that no domain on it uses the disk:
+until then it keeps naming that host, and repair-owner refuses
+(docs/backups.md).
 
 A migration whose ownership commit is refused after the cutover (a disk row
 changed while it ran) moves the `vms` row to the target, where the guest now

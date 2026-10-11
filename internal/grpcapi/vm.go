@@ -1832,7 +1832,16 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
 
-	if err := s.virt.StartDomain(vm.Name); err != nil {
+	// A shared disk this host released to another (review c2b) refuses the
+	// start of a domain that uses it.
+	releaseGuard, gerr := s.guardSharedDiskStart(ctx, vm.Name, "")
+	if gerr != nil {
+		releasePreflight()
+		return nil, status.Error(codes.FailedPrecondition, gerr.Error())
+	}
+	startErr := s.virt.StartDomain(vm.Name)
+	releaseGuard()
+	if err := startErr; err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an
 		// RPC that mutated libvirt but failed before writing state). Reconcile

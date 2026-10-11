@@ -769,7 +769,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			}
 			return
 		}
-		if err := v.virt.StartDomain(vm.Name); err != nil {
+		if err := v.startGuarded(ctx, vm.Name); err != nil {
 			releaseHW() // release any passthrough the preflight bound for this failed start
 			slog.Error("vmcheck: restart failed", "vm", vm.Name, "error", err)
 			if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("health check restart failed: %v", err)); werr != nil {
@@ -1091,7 +1091,7 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 		}
 		return
 	}
-	if err := v.virt.StartDomain(vm.Name); err != nil {
+	if err := v.startGuarded(ctx, vm.Name); err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("vmcheck: restart policy start failed", "vm", vm.Name, "error", err)
 		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
@@ -1153,4 +1153,21 @@ func parseDuration(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// startGuarded starts name's domain under the shared-disk release check
+// (GuardSharedDiskStart, review c2b).
+func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
+	xml := ""
+	if d, ok := v.virt.(interface {
+		DumpXMLInactive(string) (string, error)
+	}); ok {
+		xml, _ = d.DumpXMLInactive(name)
+	}
+	release, err := GuardSharedDiskStart(ctx, v.db, v.dataDir, v.hostName, name, xml)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return v.virt.StartDomain(name)
 }

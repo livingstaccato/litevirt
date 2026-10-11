@@ -650,7 +650,13 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 			return failed("start", e)
 		}
 	}
-	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
+	releaseGuard, gerr := s.guardSharedDiskStart(ctx, m.ReplacedVM, "")
+	if gerr != nil {
+		return failed("start", gerr)
+	}
+	e := s.virt.StartDomain(m.ReplacedVM)
+	releaseGuard()
+	if e != nil {
 		return failed("start", e)
 	}
 	s.noteVMStarted(m.ReplacedVM)

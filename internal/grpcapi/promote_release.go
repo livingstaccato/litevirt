@@ -65,16 +65,21 @@ func (s *Server) restrictPromotedReleaseFeatures(ctx context.Context, spec *pb.V
 		return g, ""
 	}
 
+	if specSetsLimits(spec) && s.ReleaseFeatureAvailable(capabilities.FeatureVMLimits) {
+		// Past the latch, a value a create would refuse is dropped by itself
+		// and the valid rest kept (as restore does: dropInvalidLimits).
+		for _, d := range dropInvalidLimits(spec) {
+			drop(d, "invalid in the stored spec")
+		}
+	}
 	if specSetsLimits(spec) {
-		g, why := gate(capabilities.FeatureVMLimits, validateCreateLimits(spec), func(ctx context.Context) (capabilities.FeatureGrant, error) {
+		g, why := gate(capabilities.FeatureVMLimits, nil, func(ctx context.Context) (capabilities.FeatureGrant, error) {
 			return s.recordLimitedSpec(ctx, spec)
 		})
 		if why != "" {
-			spec.CpuLimit, spec.CpuShares = 0, 0
-			for _, n := range spec.Network {
-				n.RateMbSec = 0
+			for _, k := range stripLimits(spec) {
+				drop(k, why)
 			}
-			drop("cpu and NIC limits", why)
 		}
 		r.limits = g
 	}

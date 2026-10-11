@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -340,8 +342,9 @@ func (s *Server) revertLimits(ctx context.Context, name string, spec *pb.VMSpec,
 }
 
 // checkCopiedSpecLimits judges a spec a path takes from somewhere other than a
-// create request — a restore's --spec or manifest, a clone's source — the way a
-// create is judged: refused early while the release token has not latched
+// create request — a clone's source — the way a create is judged (a restore or
+// promotion, a recovery path, drops instead: restrictRestoredLimits,
+// restrictPromotedReleaseFeatures): refused early while the release token has not latched
 // (a local read, recording nothing; the caller records the use with
 // recordLimitedSpec immediately before it writes), and validated against its
 // own vCPU count. Without it a limit reaches a stored spec by a side door.
@@ -418,4 +421,70 @@ func (s *Server) vmSharesWeight(ctx context.Context, name string) int {
 		}
 	}
 	return 0
+}
+
+// stripLimits clears every limit of spec and names each one that was set.
+func stripLimits(spec *pb.VMSpec) []string {
+	var names []string
+	if spec.CpuLimit != 0 {
+		names = append(names, "cpu_limit")
+	}
+	if spec.CpuShares != 0 {
+		names = append(names, "cpu_shares")
+	}
+	spec.CpuLimit, spec.CpuShares = 0, 0
+	for i, n := range spec.Network {
+		if n.RateMbSec != 0 {
+			names = append(names, fmt.Sprintf("network %d rate_mb_sec", i))
+		}
+		n.RateMbSec = 0
+	}
+	return names
+}
+
+// dropInvalidLimits clears each limit of spec a create would refuse
+// (validateCreateLimits, value by value) and names each, with the reason. The
+// valid ones are kept.
+func dropInvalidLimits(spec *pb.VMSpec) []string {
+	var dropped []string
+	if err := lv.ValidateCPULimit(spec.CpuLimit, int(spec.Cpu)); err != nil {
+		dropped = append(dropped, fmt.Sprintf("cpu_limit (%v)", err))
+		spec.CpuLimit = 0
+	}
+	if err := lv.ValidateCPUShares(int(spec.CpuShares)); err != nil {
+		dropped = append(dropped, fmt.Sprintf("cpu_shares (%v)", err))
+		spec.CpuShares = 0
+	}
+	for i, n := range spec.Network {
+		if err := lv.ValidateNICRate(n.GetRateMbSec()); err != nil {
+			dropped = append(dropped, fmt.Sprintf("network %d rate_mb_sec (%v)", i, err))
+			n.RateMbSec = 0
+		}
+	}
+	return dropped
+}
+
+// restrictRestoredLimits is the limits half of a live restore's spec gate. A
+// restore is a recovery path main allowed, and main knows no limit fields, so
+// nothing here refuses: before the release token has latched every limit is
+// dropped (main's behaviour), and after it each value a create would refuse is.
+// Each drop is logged by name. The use is still recorded, and the grant taken,
+// immediately before the define (recordLimitedSpec), where a refusing gate
+// drops the rest.
+func (s *Server) restrictRestoredLimits(spec *pb.VMSpec) []string {
+	if !specSetsLimits(spec) {
+		return nil
+	}
+	var dropped []string
+	if !s.ReleaseFeatureAvailable(capabilities.FeatureVMLimits) {
+		for _, k := range stripLimits(spec) {
+			dropped = append(dropped, k+" (the cluster upgrade has not finished)")
+		}
+	} else {
+		dropped = dropInvalidLimits(spec)
+	}
+	for _, d := range dropped {
+		slog.Warn("restored spec: CPU/NIC limit dropped", "vm", spec.GetName(), "dropped", d)
+	}
+	return dropped
 }

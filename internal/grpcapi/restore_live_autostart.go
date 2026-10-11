@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -89,9 +90,11 @@ func (s *Server) autoDefineRestoredVM(
 		_ = send(&pb.RestoreLiveProgress{Status: "invalid disk/NIC tuning in the backup's spec is not applied: " + strings.Join(ioR.invalid, "; ")})
 	}
 	// A limit in the spec — an operator's --spec or one embedded in a backup,
-	// possibly from a cluster that has latched — is judged as a create's is.
-	if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
-		return "", "", err
+	// possibly from a cluster that has latched — is dropped, never refused,
+	// where a create's would be refused (restrictRestoredLimits).
+	limDropped := s.restrictRestoredLimits(spec)
+	if len(limDropped) > 0 {
+		_ = send(&pb.RestoreLiveProgress{Status: "CPU/NIC limits in the spec are not applied: " + strings.Join(limDropped, "; ")})
 	}
 
 	originalName := spec.Name
@@ -339,7 +342,22 @@ func (s *Server) autoDefineRestoredVM(
 	// the domain that holds them is defined.
 	limitsG, err := s.recordLimitedSpec(ctx, spec)
 	if err != nil {
-		return "", "", err
+		// A refusing gate drops the limits, not the restore: the domain is
+		// generated again without them.
+		why := "the vm_limits gate refused: " + status.Convert(err).Message()
+		for _, k := range stripLimits(spec) {
+			d := k + " (" + why + ")"
+			slog.Warn("restored spec: CPU/NIC limit dropped", "vm", targetName, "dropped", d)
+			limDropped = append(limDropped, d)
+		}
+		vmCfg.CPULimit, vmCfg.CPUShares = 0, 0
+		for i := range vmCfg.Networks {
+			vmCfg.Networks[i].RateMBps = 0
+		}
+		if domXML, err = lv.GenerateDomainXML(vmCfg); err != nil {
+			return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		}
+		limitsG = capabilities.FeatureGrant{}
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
@@ -450,6 +468,9 @@ func (s *Server) autoDefineRestoredVM(
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
 	s.auditTuningDropped(ctx, ioR, targetName, "restore")
+	if len(limDropped) > 0 {
+		s.audit(ctx, "vm.release_features_dropped", targetName, "restore: not carried: "+strings.Join(limDropped, "; "), "degraded")
+	}
 	return targetName, rootDev, nil
 }
 

@@ -26,6 +26,9 @@ func TestClientAddress_TrustedProxies(t *testing.T) {
 		{"a non-address hop falls back to its proxy", "127.0.0.1:5000", "10.9.9.9, garbage", true, "127.0.0.1"},
 		{"trusted peer, no header: the peer", "127.0.0.1:5000", "", true, "127.0.0.1"},
 		{"an IPv4-mapped hop is its IPv4 form", "127.0.0.1:5000", "::ffff:198.51.100.7", true, "198.51.100.7"},
+		{"a hop with a port is its address", "127.0.0.1:5000", "198.51.100.7:51234", true, "198.51.100.7"},
+		{"an IPv6 hop with a port", "127.0.0.1:5000", "[2001:db8::7]:443", true, "2001:db8::7"},
+		{"a non-address hop falls back to the trusted hop that recorded it", "127.0.0.1:5000", "unknown, 10.9.9.9", true, "10.9.9.9"},
 	} {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = tc.peer
@@ -42,5 +45,25 @@ func TestClientAddress_TrustedProxies(t *testing.T) {
 	}
 	if _, err := ParseTrustedProxies([]string{"not-a-cidr"}); err == nil {
 		t.Error("a bad trusted_proxies entry parsed")
+	}
+}
+
+// TestClientAddress_SeveralHeaderLines (re-review 2, M4): X-Forwarded-For on
+// several lines is one list in order (RFC 9110 §5.3); the right-most line is
+// the nearest proxy's.
+func TestClientAddress_SeveralHeaderLines(t *testing.T) {
+	trusted, _ := ParseTrustedProxies([]string{"127.0.0.1", "10.0.0.0/8"})
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "127.0.0.1:5000"
+	r.Header.Add("X-Forwarded-For", "6.6.6.6")
+	r.Header.Add("X-Forwarded-For", "198.51.100.7, 10.1.2.3")
+	if got := ClientAddress(r, trusted); got != "198.51.100.7" {
+		t.Fatalf("%q, want the right-most untrusted hop across both lines", got)
+	}
+	r.Header.Del("X-Forwarded-For")
+	r.Header.Add("X-Forwarded-For", "6.6.6.6, 198.51.100.7")
+	r.Header.Add("X-Forwarded-For", "10.1.2.3")
+	if got := ClientAddress(r, trusted); got != "198.51.100.7" {
+		t.Fatalf("%q, want 198.51.100.7 (only the first line read?)", got)
 	}
 }

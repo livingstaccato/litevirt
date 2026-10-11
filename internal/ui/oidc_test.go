@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,11 +28,21 @@ type oidcMock struct {
 	beginErr  error
 	logins    []*pb.LoginRequest
 	redirect  string // the realm's redirect_uri; "" = https://node-1:7445/oidc/callback
+	// realms are the advertised realms ("" = local, ldap:corp, oidc:kanidm);
+	// redirects overrides redirect per realm; flowRealm is the realm holding
+	// state st-1 (default oidc:kanidm): Login for any other realm answers
+	// "state unknown", as the daemon does.
+	realms    []string
+	redirects map[string]string
+	flowRealm string
 }
 
 const mockBinding = "bind-1"
 
 func (m *oidcMock) ListRealms(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.ListRealmsResponse, error) {
+	if m.realms != nil {
+		return &pb.ListRealmsResponse{Realms: m.realms}, nil
+	}
 	return &pb.ListRealmsResponse{Realms: []string{"local", "ldap:corp", "oidc:kanidm"}}, nil
 }
 
@@ -43,18 +55,32 @@ func (m *oidcMock) BeginOIDCLogin(_ context.Context, in *pb.BeginOIDCLoginReques
 	return &pb.BeginOIDCLoginResponse{
 		AuthUrl:     "https://idp.example/authorize?state=st-1",
 		State:       "st-1",
-		RedirectUri: m.redirectURI(),
+		RedirectUri: m.redirectFor(in.Realm),
 		Binding:     mockBinding,
 	}, nil
 }
 
 func (m *oidcMock) Login(ctx context.Context, in *pb.LoginRequest, opts ...grpc.CallOption) (*pb.LoginResponse, error) {
 	m.logins = append(m.logins, in)
+	flowRealm := m.flowRealm
+	if flowRealm == "" {
+		flowRealm = "oidc:kanidm"
+	}
+	if in.OidcCode != "" && in.Realm != flowRealm {
+		return nil, status.Error(codes.Unauthenticated, "invalid credentials: OIDC login state unknown, expired or already used on this node")
+	}
 	if in.OidcCode != "" && in.OidcBinding != mockBinding {
 		m.lastLoginReq = in
 		return nil, status.Error(codes.Unauthenticated, "invalid credentials: this OIDC login was not begun by this client")
 	}
 	return m.mockGRPC.Login(ctx, in, opts...)
+}
+
+func (m *oidcMock) redirectFor(realm string) string {
+	if r, ok := m.redirects[realm]; ok {
+		return r
+	}
+	return m.redirectURI()
 }
 
 func (m *oidcMock) redirectURI() string {
@@ -336,5 +362,91 @@ func TestOIDCUI_SecondFactorTravelsInTheForm(t *testing.T) {
 	}
 	if c := cookieNamed(w, sessionCookieName); c == nil || c.Value != "lvs_tok" {
 		t.Fatalf("resume: %d, session cookie %+v", w.Code, c)
+	}
+}
+
+// TestOIDCUI_LoopbackHTTPRealmCallbackWithAPlainCookie (re-review 2, M4): a
+// developer's loopback-http redirect (main allows it) still completes: the
+// plain cookie is the flow's, and its binding is honoured for that realm.
+func TestOIDCUI_LoopbackHTTPRealmCallbackWithAPlainCookie(t *testing.T) {
+	s, m := newOIDCUI(t)
+	m.redirect = "http://127.0.0.1:7445/oidc/callback"
+	m.loginResp = &pb.LoginResponse{Token: "lvs_tok", Username: "dev", ExpiresAt: "2099-01-01T00:00:00Z"}
+	w := serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:kanidm", nil))
+	flow := cookieNamed(w, oidcFlowCookieName)
+	if flow == nil || flow.Secure {
+		t.Fatalf("plain flow cookie %+v", flow)
+	}
+	r := httptest.NewRequest("GET", "/oidc/callback?code=c&state=st-1", nil)
+	r.AddCookie(flow)
+	w = serve(s, r)
+	if c := cookieNamed(w, sessionCookieName); c == nil || c.Value != "lvs_tok" {
+		t.Fatalf("loopback-http callback: %d, session %+v", w.Code, c)
+	}
+	if got := m.lastLoginReq; got == nil || got.OidcBinding != mockBinding {
+		t.Fatalf("Login request %+v: want the plain cookie's binding", got)
+	}
+}
+
+// TestOIDCUI_APlainCookieUnlocksOnlyItsOwnRealm (re-review 2, M1): on a node
+// with an https realm and a loopback-http realm, a planted plain cookie that
+// names the http realm carries its binding to that realm only; the https
+// realm, which holds the flow, gets no binding — so the flow is burned and
+// nobody is signed in.
+func TestOIDCUI_APlainCookieUnlocksOnlyItsOwnRealm(t *testing.T) {
+	s, m := newOIDCUI(t)
+	m.realms = []string{"local", "oidc:corp", "oidc:dev"}
+	m.redirects = map[string]string{"oidc:dev": "http://127.0.0.1:7445/oidc/callback", "oidc:corp": "https://node-1:7445/oidc/callback"}
+	m.flowRealm = "oidc:corp"
+	m.loginResp = &pb.LoginResponse{Token: "lvs_attacker", Username: "mallory", ExpiresAt: "2099-01-01T00:00:00Z"}
+	serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:dev", nil)) // the node learns oidc:dev is plain http
+	r := httptest.NewRequest("GET", "/oidc/callback?code=c&state=st-1", nil)
+	r.AddCookie(&http.Cookie{Name: oidcFlowCookieName, Value: mockBinding + ".b2lkYzpkZXY"}) // "oidc:dev"
+	m.logins = nil
+	w := serve(s, r)
+	if cookieNamed(w, sessionCookieName) != nil {
+		t.Fatal("a plain cookie naming the http realm unlocked the https realm's flow")
+	}
+	sawCorp := false
+	for _, l := range m.logins {
+		if l.Realm == "oidc:corp" {
+			sawCorp = true
+			if l.OidcBinding != "" {
+				t.Fatalf("the https realm was sent the plain cookie's binding: %+v", l)
+			}
+		}
+	}
+	if !sawCorp {
+		t.Fatal("the https realm's flow was not handed to the daemon to be burned")
+	}
+}
+
+// TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer (re-review 2, M2): a sign-in
+// with X-Forwarded-For from a peer not in trusted_proxies is logged, at most
+// once per interval; a listed proxy is not.
+func TestOIDCUI_WarnsOnForwardingFromAnUnlistedPeer(t *testing.T) {
+	s, _ := newOIDCUI(t)
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	begin := func(peer string) {
+		r := httptest.NewRequest("GET", "/oidc/login?realm=oidc:kanidm", nil)
+		r.RemoteAddr = peer
+		r.Header.Set("X-Forwarded-For", "198.51.100.7")
+		serve(s, r)
+	}
+	begin("10.0.0.5:4000")
+	begin("10.0.0.5:4000")
+	if n := strings.Count(logs.String(), "not in trusted_proxies"); n != 1 {
+		t.Fatalf("%d warnings for two sign-ins from an unlisted proxy, want 1 (rate-limited)", n)
+	}
+	logs.Reset()
+	p, _ := auth.ParseTrustedProxies([]string{"10.0.0.0/8"})
+	s.SetTrustedProxies(p)
+	s.lastUntrustedForwardWarn.Store(0)
+	begin("10.0.0.5:4000")
+	if strings.Contains(logs.String(), "not in trusted_proxies") {
+		t.Fatal("warned about a listed proxy")
 	}
 }

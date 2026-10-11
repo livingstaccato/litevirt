@@ -194,9 +194,19 @@ In-progress sign-ins are bounded, and beginning one is never refused:
   over its bound loses its own oldest sign-in, so clients sharing an address
   (a NAT, or a proxy without `trusted_proxies`) cannot lock each other out
   with a handful of requests.
-- **Per realm: 4096.** When the realm's table is full, the oldest sign-in of
-  the address holding the most is dropped (fair share), so a user with one
-  sign-in in progress outlasts a flood from any address holding more.
+- **Per realm: 4096.** When the realm's table is full, one sign-in is
+  dropped. Which one is chosen in three steps:
+  1. the network holding the most sign-ins: an IPv6 /48 or an IPv4 /24;
+  2. within it, the client address (above) holding the most;
+  3. that address's oldest sign-in.
+
+  Ties go to the candidate whose newest sign-in is the newest, so a churning
+  flood evicts itself. A flood spread over many addresses of one network
+  therefore counts as one heavy network, and a user from another network
+  outlasts it. The networks are used only to choose what to drop, never to
+  refuse. A legitimate NAT that shares a /24 with an attacker is dropped
+  along with it. That costs availability only: password, LDAP and local
+  logins are unaffected.
 
 The client address is:
 - for the web UI and the REST gateway, the TCP peer. When that peer is in
@@ -210,10 +220,26 @@ The client address is:
 
 **Behind a reverse proxy**, list the proxy in `trusted_proxies` (CIDRs or
 addresses, default empty). Without it, every browser arrives from the proxy's
-one address and shares its bound. The daemon warns at startup when an OIDC
-realm is configured, the UI is bound to loopback, and `trusted_proxies` is
-empty. Never list an address that clients can reach directly: a forwarding
-header is believed only from a listed proxy.
+one address and shares its bound. Two warnings point at this:
+- the daemon warns at startup when an OIDC realm is configured, the UI is
+  bound to loopback, and `trusted_proxies` is empty;
+- the UI warns, at most every 10 minutes, when a sign-in arrives with
+  `X-Forwarded-For` from a peer that is not listed. This catches a proxy on
+  another host.
+
+Requirements on the proxy:
+- It must **append** the client's address to `X-Forwarded-For`, or overwrite
+  the header. A proxy that passes the client's own header through unchanged
+  lets every client choose its own address.
+- Hops are read as addresses, with an `:port` suffix dropped. A hop that is not
+  an address (`unknown`, an obfuscated name) is not believed; the address of
+  the proxy that recorded it is used instead.
+
+Never list an address that clients can reach directly: a forwarding header
+is believed only from a listed proxy. Listing `127.0.0.1`, as a proxy on the
+node itself needs, trusts every local process on that node to name a client
+address to the UI and the REST gateway, with no cluster certificate needed.
+Do it only on a node where local users are trusted that far.
 
 The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then calls
 `Login` with the code, the state and the cookie's binding secret on the same

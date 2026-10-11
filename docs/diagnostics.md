@@ -1668,6 +1668,51 @@ domain may still hold state that can be resumed.
    run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
    if you want to keep the firmware variables.
 
+### Shared iSCSI LUN (`shared_lun`)
+
+The `shared_lun` evaluator raises `shared_lun` (subject kind `cluster`, subject
+the LUN) when more than one guest writes one iSCSI LUN — two VMs, or two disks
+of one VM, on iscsi pools that name the same target and LUN (through any
+portal), or a VM whose disk is a LUN that an OLDER linked clone reads as its
+base: a clone's source is always older than the clone, so a younger VM on its
+base took the LUN after the source was deleted with `--keep-disks`. An iscsi
+pool is one LUN and holds one disk ([storage.md](storage.md#iscsi-one-lun-one-disk)),
+and a create refuses a second disk on one; a cluster where an older build let
+it happen is what this reports. The evidence names every VM, disk and host on
+the LUN; the involved hosts are the hosts those VMs are on.
+
+| Raised when | Clears when |
+|---|---|
+| A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
+
+It runs once a minute on whichever node holds its own lease
+(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
+It **changes nothing**: no disk is touched, and it is not an ownership code, so
+admission — starting either VM included — does not read it. Refusing the start
+would not undo what both guests already wrote. Decide which VM keeps the LUN,
+stop the others, and move their disks to LUNs of their own (a pool per LUN).
+
+### iSCSI LUN holds (`iscsi_lun_hold_unreadable`, `iscsi_lun_hold_standing`)
+
+A rebuild or recreate of a VM with a disk on an iSCSI LUN moves the LUN's
+claim, and the host running it keeps a durable hold on the LUN until the
+evidence that it may let go arrives
+([storage.md](storage.md#iscsi-one-lun-one-disk)). Each host reports its own
+holds (evaluator `iscsi_lun_hold`, subject kind `host`, the subject the host),
+so each row has one writer. Neither condition is an ownership code: admission
+never reads it.
+
+| Code | Severity | Raised when | Clears when |
+|---|---|---|---|
+| `iscsi_lun_hold_unreadable` | critical | The host cannot read its hold records under `<data_dir>/iscsi-lun-holds/`: the directory or a record cannot be read, or a record does not parse. The evidence names the file. While it stands the host answers no LUN question: every iSCSI create on it, and every create elsewhere that must ask it, is refused. | The records read cleanly again: a read error is retried on every question; a record that does not parse stays until `lv host lun-hold discard` moves it aside. |
+| `iscsi_lun_hold_standing` | warning | A hold has stood for more than five minutes with no re-create running under it. The evidence names each VM, its LUNs and the host it was re-created on — normally that host cannot be asked, or the VM's rows have not reached the holding host. | The hold is released (its evidence arrived) or discarded. |
+
+The holds are checked every five seconds, and a condition is written only when
+it changes. `lv host lun-holds <host>` lists them. Discard one only after the
+check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
+a second VM off a LUN whose re-created VM's rows are still on their way.
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

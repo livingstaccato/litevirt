@@ -203,20 +203,38 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		}
 		return "", ""
 	}
-	// A workload key.
-	if !st.cfg.Explicit() {
+	// A workload key, or a LUN key.
+	switch {
+	case st.cfg.Explicit():
+		if r, d := memberCheck(st.cfg); r != "" {
+			return r, d
+		}
+	default:
 		return RefusalNoVoterConfig, fmt.Sprintf("%s has adopted no member voter generation", st.me)
-	}
-	if r, d := memberCheck(st.cfg); r != "" {
-		return r, d
 	}
 	if st.sealed {
 		// §4.4 rule 1: deciding g+1 seals g for workload keys.
 		return RefusalSealed, fmt.Sprintf("%s has accepted a change of voter generation %d and no longer "+
 			"votes on recoveries under it; retry once generation %d is adopted", st.me, st.adopted, st.adopted+1)
 	}
+	if key.IsLUN() {
+		if v == nil {
+			return "", ""
+		}
+		l := v.LUN
+		if l == nil || v.Proof != nil || v.Config != nil || v.SourceHost != "" {
+			return RefusalInvalidValue, "a LUN key decides a LUN allocation"
+		}
+		if l.LUN != key.TargetName || l.Generation != key.OwnerEpoch {
+			return RefusalInvalidValue, fmt.Sprintf("value allocates %s@%d, key is %s", l.LUN, l.Generation, key)
+		}
+		if l.ClaimID == "" || l.VMID == "" || l.VMName == "" || l.Disk == "" || l.Host == "" {
+			return RefusalInvalidValue, "a LUN value names its claim, VM, disk and host"
+		}
+		return "", ""
+	}
 	if v != nil {
-		if v.Proof == nil || v.Config != nil {
+		if v.Proof == nil || v.Config != nil || v.LUN != nil {
 			return RefusalInvalidValue, "a workload key decides a proof"
 		}
 		p := v.Proof
@@ -692,11 +710,11 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		// Both tables: an importer must carry the legacy keys and the
 		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
 		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_recovery_claims WHERE target_kind IN (?, ?) AND accepted_round > 0
+			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?) AND accepted_round > 0
 			UNION ALL
 			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
 			FROM local_incarnation_claims WHERE target_kind IN (?, ?) AND accepted_round > 0
-			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindVM, ClaimKindContainer)
+			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
 		}
@@ -738,7 +756,7 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 		}
 		best := map[ClaimKey]ClaimVoterState{}
 		for _, s := range states {
-			if !s.Key.IsWorkload() || s.Accepted.IsZero() || s.Value == nil {
+			if !s.Key.IsGenerationScoped() || s.Accepted.IsZero() || s.Value == nil {
 				continue
 			}
 			if d, err := s.Value.Digest(); err != nil || d != s.ValueDigest {

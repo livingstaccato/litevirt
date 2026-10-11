@@ -276,6 +276,10 @@ type Node struct {
 	// GossipPort is the node's memberlist port under Options.RealGossip, and
 	// zero otherwise.
 	GossipPort int
+
+	// stopServerLoops stops the background loops buildServer started for this
+	// node's current server, as a daemon's exit does (see restartNode).
+	stopServerLoops context.CancelFunc
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -881,6 +885,12 @@ func (c *Cluster) buildServer(n *Node) {
 	// the reason a scenario that both queues work and counts NetBox writes must
 	// not be made to run for minutes.
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
+	// The moved-iSCSI-hold resolver, as the daemon runs it. Its interval is
+	// longer than a scenario's steps take; a re-create that returns kicks it
+	// at once, as in production.
+	loops, stop := context.WithCancel(c.ctx)
+	n.stopServerLoops = stop
+	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so

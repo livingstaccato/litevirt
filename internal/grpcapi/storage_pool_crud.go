@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -192,6 +193,29 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, err
 	}
 
+	// A NEW iscsi pool records its portal as host:port — the spelling udev
+	// names the LUN's device with, which the disk path is spelled from. An
+	// existing pool keeps the spelling its disks were recorded with.
+	if strings.EqualFold(req.Driver, "iscsi") {
+		portal := req.Options["portal"]
+		if portal == "" {
+			portal = "127.0.0.1" // the driver's default
+		}
+		norm, warn := storage.NormalizeISCSIPortal(portal, func(h string) ([]net.IP, error) {
+			return net.DefaultResolver.LookupIP(ctx, "ip", h)
+		})
+		if warn != "" {
+			slog.Warn("iscsi pool portal", "pool", req.Name, "detail", warn)
+		}
+		if norm != req.Options["portal"] {
+			opts := make(map[string]string, len(req.Options)+1)
+			for k, v := range req.Options {
+				opts[k] = v
+			}
+			opts["portal"] = norm
+			req.Options = opts
+		}
+	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,
 		Source:  req.Source,

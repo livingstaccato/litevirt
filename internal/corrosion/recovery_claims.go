@@ -39,6 +39,18 @@ const (
 	ClaimKindContainer = "container"
 )
 
+// ClaimKindLUN is the target_kind of an iSCSI LUN allocation: the claim at
+// key (lun, <LUN key>, g, 0) decides which disk the LUN's g-th allocation is
+// (docs/storage.md, "iSCSI: one LUN, one disk"). It is decided under the voter
+// generation like a workload key, and carried across a generation change.
+const ClaimKindLUN = "lun"
+
+// LUNClaimKey is the key of a LUN's gen-th allocation; lun is a
+// storage.FixedDevice key.
+func LUNClaimKey(lun string, gen int64) ClaimKey {
+	return ClaimKey{TargetKind: ClaimKindLUN, TargetName: lun, OwnerEpoch: gen}
+}
+
 // ClaimKey is what one claim decides.
 type ClaimKey struct {
 	TargetKind string `json:"target_kind"`
@@ -100,9 +112,21 @@ func (k ClaimKey) IsWorkload() bool {
 	return k.TargetKind == ClaimKindVM || k.TargetKind == ClaimKindContainer
 }
 
+// IsLUN reports whether k decides an iSCSI LUN allocation.
+func (k ClaimKey) IsLUN() bool { return k.TargetKind == ClaimKindLUN }
+
+// IsGenerationScoped reports whether k is decided by the members of the voter
+// generation and carried into the next one (§4.4): a workload recovery or a LUN
+// allocation. A voter_config key decides the generation itself.
+func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() }
+
 // Validate refuses a key no voter should record state for.
 func (k ClaimKey) Validate() error {
 	switch {
+	case k.IsLUN():
+		if k.TargetName == "" || k.OwnerEpoch < 0 || k.Attempt != 0 || k.Incarnation != "" {
+			return fmt.Errorf("a LUN key is (lun, <LUN>, generation, 0) with no incarnation, got %+v", k)
+		}
 	case k.IsVoterConfig():
 		if k.TargetName != "" || k.Attempt != 0 || k.OwnerEpoch < 0 || k.Incarnation != "" {
 			return fmt.Errorf("a voter_config key is (voter_config, \"\", generation, 0), got %+v", k)
@@ -209,8 +233,39 @@ type VoterConfigValue struct {
 	CreatedAt  string        `json:"created_at"`
 }
 
+// LUNAllocation is the value a LUN claim decides: which disk of which VM the
+// LUN's Generation-th allocation is, made by which create on which host.
+type LUNAllocation struct {
+	LUN        string `json:"lun"`        // storage.FixedDevice key
+	Generation int64  `json:"generation"` // the key's OwnerEpoch
+	ClaimID    string `json:"claim_id"`   // the create that proposed it, unique
+	VMID       string `json:"vm_id"`      // the VM's uuid (one incarnation)
+	VMName     string `json:"vm_name"`
+	Disk       string `json:"disk"`
+	Host       string `json:"host"` // the host running the create
+	// RunHost is set on a MOVED allocation — a rebuild or recreate deciding
+	// its VM's next allocation before the teardown — when the re-created VM
+	// runs on another host than Host: Host holds the claim until that VM's
+	// rows reach it, RunHost runs the VM. The allocation is gone only once
+	// both show nothing (or are recorded removed).
+	RunHost string `json:"run_host,omitempty"`
+	// Kept is set on a moved allocation whose disk keeps the LUN's contents
+	// across the re-create: the LUN is that VM's own disk, as it was. A
+	// create of the same VM name and disk that decides the allocation right
+	// after it takes the LUN over as it is (the recovery of a re-create torn
+	// down and failed), where any other create meets a LUN holding data.
+	Kept bool `json:"kept,omitempty"`
+	// Project and ReplacedCreatedAt bind a Kept allocation: only a create in
+	// that (canonical) project takes the LUN over, and only while no plain
+	// delete of the VM's incarnation ReplacedCreatedAt, or of a later one, is
+	// recorded on the LUN (GetLUNPlainDelete). Set only with Kept.
+	Project           string `json:"project,omitempty"`
+	ReplacedCreatedAt string `json:"replaced_created_at,omitempty"`
+}
+
 // ClaimValue is what a claim decides. Exactly one of Proof (a workload
-// recovery, §3.4) and Config (a voter-config change, §4.3) is set.
+// recovery, §3.4), Config (a voter-config change, §4.3) and LUN (an iSCSI LUN
+// allocation) is set.
 type ClaimValue struct {
 	// Proof carries the ActionProof binding fields (ProofBindingEqual's set
 	// plus the proof ID). The lease-holder and quorum fields are not part of
@@ -221,11 +276,13 @@ type ClaimValue struct {
 	// certificate names the source its voters could not reach.
 	SourceHost string            `json:"source_host,omitempty"`
 	Config     *VoterConfigValue `json:"config,omitempty"`
+	LUN        *LUNAllocation    `json:"lun,omitempty"`
 }
 
 const (
 	claimValueDomain       = "litevirt-recovery-value-v1"
 	claimConfigValueDomain = "litevirt-voter-config-value-v1"
+	claimLUNValueDomain    = "litevirt-lun-allocation-v1"
 	claimAcceptDomain      = "litevirt-recovery-accept-v1"
 	// claimAcceptDomainV2 signs an accept at an incarnation-scoped key. Its
 	// own domain, so no v2 accept is ever the same bytes as a v1 one: a legacy
@@ -272,7 +329,7 @@ func SortMembers(members []VoterMember) []VoterMember {
 func (v ClaimValue) Digest() (string, error) {
 	h := sha256.New()
 	switch {
-	case v.Proof != nil && v.Config == nil:
+	case v.Proof != nil && v.Config == nil && v.LUN == nil:
 		p := v.Proof
 		claimField(h, claimValueDomain)
 		for _, f := range []string{
@@ -282,7 +339,32 @@ func (v ClaimValue) Digest() (string, error) {
 		} {
 			claimField(h, f)
 		}
-	case v.Config != nil && v.Proof == nil && v.SourceHost == "":
+	case v.LUN != nil && v.Proof == nil && v.Config == nil && v.SourceHost == "":
+		l := v.LUN
+		claimField(h, claimLUNValueDomain)
+		for _, f := range []string{l.LUN, i64(l.Generation), l.ClaimID, l.VMID, l.VMName, l.Disk, l.Host} {
+			claimField(h, f)
+		}
+		if l.RunHost != "" {
+			// Only a moved allocation has it, so every other value digests
+			// as it always did.
+			claimField(h, l.RunHost)
+		}
+		if l.Kept || l.Project != "" || l.ReplacedCreatedAt != "" {
+			// Only a kept moved allocation has these, so every other value
+			// digests as it always did. One block of four fields: with or
+			// without RunHost (one field), the four field counts differ, so no
+			// spelling of one digests as another.
+			kept := "0"
+			if l.Kept {
+				kept = "1"
+			}
+			claimField(h, "kept-v1")
+			claimField(h, kept)
+			claimField(h, l.Project)
+			claimField(h, l.ReplacedCreatedAt)
+		}
+	case v.Config != nil && v.Proof == nil && v.LUN == nil && v.SourceHost == "":
 		cfg := v.Config
 		claimField(h, claimConfigValueDomain)
 		claimField(h, i64(cfg.Generation))
@@ -291,7 +373,7 @@ func (v ClaimValue) Digest() (string, error) {
 		claimField(h, cfg.CreatedBy)
 		claimField(h, cfg.CreatedAt)
 	default:
-		return "", fmt.Errorf("a claim value carries exactly one of a proof or a voter config")
+		return "", fmt.Errorf("a claim value carries exactly one of a proof, a voter config or a LUN allocation")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

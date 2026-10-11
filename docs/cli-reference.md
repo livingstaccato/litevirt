@@ -122,6 +122,9 @@ lv host superseded-disks <host>           # List the disk copies a failover set 
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
+lv host lun-holds [host]                  # List the holds kept on iSCSI LUNs a rebuild or recreate moved
+lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be taken again (admin, audited)
+  [--host <host>]                         #   on that host (default: the one host holding it)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
@@ -155,6 +158,9 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
+  --storage <pool>      # Storage pool for the root disk (default: the host's local disks)
+  --overwrite           # iscsi pool + --image: write the image over a LUN that is not blank
+                        #   (destroys what it holds; a LUN another VM uses is never written)
   --host <name>         # Target host (auto-placed if omitted)
   --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready

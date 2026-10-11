@@ -38,6 +38,8 @@ func newRunCmd() *cobra.Command {
 		cpuModel     string
 
 		allowOvercommit bool
+		storagePool     string
+		overwrite       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -69,8 +71,11 @@ func newRunCmd() *cobra.Command {
 				if err := lvpkg.ValidateCPUMode(cpuMode, cpuModel); err != nil {
 					return err
 				}
-				if disk != "" {
-					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio"}}
+				if overwrite && storagePool == "" {
+					return fmt.Errorf("--overwrite applies to a root disk on a storage pool; name one with --storage")
+				}
+				if disk != "" || storagePool != "" {
+					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio", Storage: storagePool, Overwrite: overwrite}}
 				}
 				if host != "" {
 					spec.Placement = &pb.PlacementSpec{Host: host}
@@ -119,6 +124,9 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
+	cmd.Flags().StringVar(&storagePool, "storage", "", "Storage pool for the root disk (default: the host's local disk directory)")
+	cmd.Flags().BoolVar(&overwrite, "overwrite", false,
+		"With --storage on an iscsi pool and --image: write the image over a LUN that is not blank (destroys what it holds). A LUN another VM uses is never written.")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

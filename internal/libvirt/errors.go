@@ -1,6 +1,7 @@
 package libvirt
 
 import (
+	"errors"
 	"strings"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -32,6 +33,15 @@ func IsNotFound(err error) bool {
 		strings.Contains(msg, "no domain checkpoint") ||
 		strings.Contains(msg, "no domain snapshot") ||
 		strings.Contains(msg, "cannot find")
+}
+
+// IsNoDomain reports whether err is libvirt's VIR_ERR_NO_DOMAIN — the domain
+// does not exist — and nothing else: unlike IsNotFound it has no text
+// fallback, so a caller that treats "no such domain" as "holds nothing" never
+// reads a dropped connection or any other failure that way.
+func IsNoDomain(err error) bool {
+	var e golibvirt.Error
+	return errors.As(err, &e) && e.Code == uint32(golibvirt.ErrNoDomain)
 }
 
 // IsPCISlotsExhausted classifies a libvirt attach error as "the domain has no free

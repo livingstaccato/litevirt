@@ -165,6 +165,11 @@ message DiskSpec {
     // | vmpvscsi | buslogic). Set by VM import to preserve guest bootability;
     // empty = virtio-scsi. Ignored for non-SCSI buses.
     string controller_model = 7;
+    // overwrite lets a root disk created from an image on an iscsi pool write
+    // the image over a LUN that is not blank (a partition table, filesystem or
+    // any earlier data in its first or last MiB). Without it such a LUN is
+    // refused. A LUN any VM's disk is never written, whatever this says.
+    bool overwrite = 8;
 }
 
 message NetworkAttachment {

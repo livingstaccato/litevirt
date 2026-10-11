@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -337,6 +338,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
+		// An overwrite is audited where it was asked for, as the caller it was
+		// asked by, as well as on the owner that writes (writeImageOntoLUN).
+		for _, d := range spec.Disks {
+			if d.Overwrite && d.Storage != "" {
+				s.audit(ctx, "vm.create", spec.Name, fmt.Sprintf("overwrite requested for disk %s on storage %s; forwarded to %s",
+					d.Name, d.Storage, targetHost), "forwarded")
+			}
+		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
 	// Stable domain identity (G1): persisted in the spec so libvirt's default
@@ -379,6 +388,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		defer lease.release(ctx)
 		createLease = lease
+	}
+
+	// An iscsi pool is one LUN: take each one this VM's disks would use, or
+	// refuse naming the VM that holds it, before anything is created. Held
+	// until this create returns, by when its disk rows are committed here
+	// (vm_lun_claim.go).
+	lunHold, err := s.claimLUNs(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	defer lunHold.release(ctx, spec.Name)
+	keepLUNs := lunHold.keep
+	replacedImage := ""
+	if rep, ok := replacedVMFor(ctx, spec.Name); ok {
+		replacedImage = rep.image
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
@@ -444,14 +468,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		var diskPath string
 		var err error
 		storageType := "local"
+		// fixedDevice: the disk is a device the create did not make (an
+		// iscsi LUN), so a failed create must not remove it.
+		fixedDevice := false
 
 		isRootDisk := d.Name == "root"
 
 		if d.Storage != "" {
-			// Use a named storage volume (nfs, ceph, iscsi, etc.).
-			volCfg, volErr := s.resolveVolume(ctx, spec.StackName, d.Storage)
-			if volErr != nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+			// Use a named storage volume (nfs, ceph, iscsi, etc.) — as the
+			// LUN claim resolved it, so the disk is the LUN the claim took
+			// (re-review 4, I-2); claimLUNs refused a storage that did not
+			// resolve.
+			volCfg, resolved := lunHold.cfgs[d.Name]
+			if !resolved {
+				var volErr error
+				if volCfg, volErr = s.resolveVolume(ctx, spec.StackName, d.Storage); volErr != nil {
+					return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+				}
 			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
@@ -476,6 +509,28 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if storageType == "" {
 				storageType = "local"
 			}
+			// A fixed-device pool (iscsi) allocated nothing: the disk is the
+			// LUN, as it is. A root disk from an image must BE the image, so
+			// it is written onto the LUN now — never a blank LUN booting to the
+			// firmware shell. Not the LUN this VM's previous incarnation held
+			// (a rebuild/recreate whose old rows are still here): that is a
+			// disk in use, and keeps what it holds.
+			if key, _, fixed := storage.FixedDevice(volCfg); fixed && err == nil {
+				fixedDevice = true
+				if sourceImage != "" {
+					// A re-created VM takes its own LUN over as it is. Only an
+					// image change with overwrite — which its preflight
+					// required before the teardown — writes the new image.
+					imageChange := keepLUNs[key] && d.Overwrite && replacedImage != "" && replacedImage != spec.Image
+					if keepLUNs[key] && !imageChange {
+						slog.Info("iSCSI root disk: the re-created VM takes its previous incarnation's LUN over as it is; "+
+							"nothing is written", "vm", spec.Name, "disk", d.Name, "lun", diskPath)
+					} else if werr := s.writeImageOntoLUN(ctx, spec.Name, d.Name, spec.Image, sourceImage, diskPath, d.Overwrite); werr != nil {
+						cleanupDisks()
+						return nil, werr
+					}
+				}
+			}
 		} else if spec.Image != "" && isRootDisk {
 			// Cloud image mode: only the root disk gets the backing image
 			diskPath, err = s.images.CreateOverlayDisk(spec.Name, d.Name, spec.Image, d.Size)
@@ -495,7 +550,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
-		createdDiskPaths = append(createdDiskPaths, diskPath)
+		if !fixedDevice {
+			createdDiskPaths = append(createdDiskPaths, diskPath)
+		}
 
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  d.Name,
@@ -984,8 +1041,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		spec.Machine = pinned
 	}
 
-	// Serialize spec to JSON for storage
-	specJSON, _ := json.Marshal(spec)
+	// Serialize spec to JSON for storage. A disk's overwrite is a one-shot
+	// acknowledgement for this create, never a standing permission: a rebuild
+	// or a rolling recreate re-creates from the stored spec, and must not
+	// re-image a LUN because a create once said overwrite.
+	stored := proto.Clone(spec).(*pb.VMSpec)
+	for _, d := range stored.Disks {
+		d.Overwrite = false
+	}
+	specJSON, _ := json.Marshal(stored)
 
 	// Write to corrosion. Inserted "creating", not "running": the row lands at the
 	// vm_owner_epoch default of 0, and assignOwnerEpochAtCreate publishes it
@@ -1030,8 +1094,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// cluster references it. Nothing later re-creates the row, so the only
 		// fail-closed answer is to undo the create — teardown, disks, firmware
 		// state, and the claims themselves, matching the admission fence above.
-		if !claims.empty() {
-			slog.Error("vm create: row persistence failed after an address claim — aborting",
+		// The same for a create that took an iSCSI LUN: a guest left running on
+		// the LUN with no row is one no claim can see (review N-2).
+		if !claims.empty() || len(keepLUNs) > 0 || len(lunHold.own) > 0 {
+			slog.Error("vm create: row persistence failed after an address or LUN claim — aborting",
 				"name", spec.Name, "error", err)
 			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
 				slog.Warn("vm create: teardown after failed persistence also failed",
@@ -1046,6 +1112,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	} else {
+		lunHold.committed = true
 		// Guarded on the insert having landed: with no row there is nothing to
 		// graduate or publish. The invariant it maintains lives on
 		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
@@ -2013,6 +2080,58 @@ func deleteLocalOnly(ctx context.Context) bool {
 }
 
 func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	// A plain delete — not a rebuild's or recreate's teardown, not a peer's
+	// forward or probe of one — ends the VM's claim to its iSCSI LUNs'
+	// contents: once it succeeds, it is recorded on each LUN, which voids a
+	// kept allocation of the VM (keptForVM; re-review 5, R-1). Recorded on
+	// the entry host, which knows what the delete is for.
+	var luns []string
+	var createdAt string
+	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
+		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
+			createdAt = vm.CreatedAt
+			if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt); err == nil {
+				for _, d := range disks {
+					if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
+						luns = append(luns, k)
+					}
+				}
+			}
+		}
+	}
+	out, err := s.deleteVM(ctx, req)
+	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
+		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
+		// The token has latched here but this replica holds no use: it may
+		// lag one that does, and then a kept allocation of this VM stays
+		// valid (switch review M-2).
+		slog.Warn("iSCSI LUN: a plain delete recorded nothing on its LUNs, because this host's replica holds no "+
+			"use of iscsi_lun_claim; if the feature was used while this host was away, a kept LUN of the VM is not voided",
+			"vm", req.Name, "luns", luns)
+	}
+	if err == nil && len(luns) > 0 && s.lunPlainDeleteRecordable(ctx) {
+		// The record is iscsi_lun_claim's data: written through its gate,
+		// never refusing the delete, which has happened. The gate may still
+		// ask peers (a use not yet acknowledged everywhere, a latch not yet
+		// durable here), so it gets lunPlainDeleteGateTimeout, not its own
+		// acknowledgement budget (switch review M-1).
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lunPlainDeleteGateTimeout)
+		defer cancel()
+		if gerr := s.WithReleaseFeature(wctx, capabilities.FeatureISCSILUNClaim, func(wctx context.Context, g capabilities.FeatureGrant) error {
+			for _, k := range luns {
+				if rerr := corrosion.RecordLUNPlainDelete(wctx, s.db, g, k, createdAt, s.hostName); rerr != nil {
+					slog.Warn("iSCSI LUN: could not record a VM's delete on its LUN", "vm", req.Name, "lun", k, "error", rerr)
+				}
+			}
+			return nil
+		}); gerr != nil {
+			slog.Warn("iSCSI LUN: could not record a VM's delete on its LUNs", "vm", req.Name, "luns", luns, "error", gerr)
+		}
+	}
+	return out, err
+}
+
+func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -3288,7 +3407,15 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// chose (judgeRecreateOn); the create below goes to that host.
 	rctx := withRecreateISOGrant(ctx, vm)
 	host, placed := s.hostName, false
-	if spec.GetIso() != "" {
+	// A VM on an iSCSI LUN is placed now too: its moved claim names the host
+	// it will run on, so the create must go exactly there (vm_lun_hold.go).
+	// A storage that cannot be judged refuses, the VM intact.
+	onLUN, err := s.hasFixedDeviceDisk(rctx, spec, vm)
+	if err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+	if spec.GetIso() != "" || onLUN {
 		h, err := s.placeRecreate(rctx, spec, vm)
 		if err != nil {
 			st := status.Convert(err)
@@ -3300,6 +3427,25 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		st := status.Convert(err)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
+	// Its iSCSI LUNs too: the claim is judged now and moved to an allocation
+	// naming this host and the one the VM is created on, and a LUN the create
+	// would refuse is refused now. This host then holds the LUNs until the
+	// evidence that it may let go arrives (vm_lun_hold.go).
+	// Unplaced, the create goes wherever CreateVM places it: no run host is
+	// named, and a LUN found now refuses (preflightLUNs).
+	runHost := ""
+	if placed {
+		runHost = host
+	}
+	rctx, lunDone, err := s.preflightLUNs(rctx, spec, vm, runHost)
+	if err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+	// Until the create is called, the rebuild ended before one was attempted
+	// (the record's tombstone failed): its hold is abandoned.
+	outcome := recreateNotAttempted
+	defer func() { lunDone(outcome) }()
 
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
@@ -3347,9 +3493,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// The VM replaced is the row the delete actually tombstoned (its guard
 	// re-reads under the CAS); nil only when the row was already gone.
 	if deleted != nil {
-		rctx = withReplacedVM(rctx, deleted)
+		rctx = s.withReplacedLUNs(withReplacedVM(rctx, deleted), deleted)
 	} else {
-		rctx = withReplacedVM(rctx, vm)
+		rctx = s.withReplacedLUNs(withReplacedVM(rctx, vm), vm)
 	}
 	var out *pb.VM
 	if placed {
@@ -3357,9 +3503,11 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	} else {
 		out, err = s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 	}
+	outcome = recreateFailed
 	if err != nil {
-		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err)
+		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err, len(lunPreflightKeys(rctx)) > 0)
 	}
+	outcome = recreateCommitted
 	return out, nil
 }
 
@@ -3762,6 +3910,11 @@ func (s *Server) storedStackFile(ctx context.Context, stackName string) (*compos
 // this host's storage pools. A name found in neither is an error — never the
 // local driver (a disk with no storage name is what uses that).
 func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) (storage.Config, error) {
+	if f := resolveVolumeFault; f != nil {
+		if err := f(stackName, volumeName); err != nil {
+			return storage.Config{}, err
+		}
+	}
 	// 1. Try compose volumes. A stored stack that cannot be read is an
 	// error: falling through would put the disk on whatever storage the
 	// later steps find, most likely the local driver.

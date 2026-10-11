@@ -319,6 +319,9 @@ type DiskDef struct {
 	Storage      string `yaml:"storage"`       // references volumes section
 	ClusterSize  string `yaml:"cluster_size"`  // qcow2 cluster size (e.g. "64K", "2M")
 	RefcountBits int    `yaml:"refcount_bits"` // qcow2 refcount width (1–64, default 16)
+	// Overwrite lets a root disk from an image on an iscsi pool write the image
+	// over a LUN that is not blank (docs/storage.md).
+	Overwrite bool `yaml:"overwrite"`
 }
 
 func (d *DiskDef) UnmarshalYAML(unmarshal func(interface{}) error) error {

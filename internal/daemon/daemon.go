@@ -1358,6 +1358,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
 		go svc.RunSMARTMonitor(ctx, iv)
 	}
+	go svc.RunSharedLUNDetector(ctx, 60*time.Second)
+	// The holds this host keeps on iSCSI LUNs whose claims its rebuilds and
+	// recreates moved: released only on positive evidence, re-judged here.
+	go svc.RunLUNHoldResolver(ctx, 0)
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.

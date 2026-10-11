@@ -345,7 +345,17 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         storage: "nfs-volume"       # Reference a volume
         cluster_size: "2M"          # qcow2 cluster size (default 64K)
         refcount_bits: 16           # qcow2 refcount width (default 16)
+        overwrite: false            # iscsi root disk from an image: write it over a non-blank LUN
 ```
+
+`overwrite` matters only for a root disk built on an image in an `iscsi` pool:
+the image is written onto the LUN, and a LUN that is not blank is refused
+unless the disk sets `overwrite: true` — see
+[storage.md](storage.md#iscsi-one-lun-one-disk). `overwrite` applies to the
+create that carries it and is never stored: a later rebuild or recreate keeps
+the LUN as it is. A VM with a disk on an iscsi volume or pool may have only one
+replica, and may not update by `blue-green` or `snapshot-and-replace`: both put
+two instances on the one LUN, and the deploy refuses them.
 
 ## Networks
 

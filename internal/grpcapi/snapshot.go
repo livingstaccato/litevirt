@@ -204,7 +204,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if snapCreated {
 			s.reconcileDiskPaths(ctx, req.VmName)
 			if hasFW {
-				_ = os.Remove(lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name))
+				_ = removeFirmwareBundle(s.dataDir, req.VmName, req.Name)
 			}
 			_ = corrosion.InsertSnapshot(ctx, s.db, corrosion.SnapshotRecord{
 				VMName: req.VmName, HostName: s.hostName, Name: req.Name, State: "error",
@@ -715,7 +715,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		}
 	}
 	// Remove the firmware-state sidecar (G1), if any (best-effort).
-	if rmErr := os.Remove(lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.SnapshotName)); rmErr != nil && !os.IsNotExist(rmErr) {
+	if rmErr := removeFirmwareBundle(s.dataDir, req.VmName, req.SnapshotName); rmErr != nil {
 		slog.Warn("snapshot delete: remove firmware sidecar", "vm", req.VmName, "snap", req.SnapshotName, "error", rmErr)
 	}
 
@@ -757,4 +757,20 @@ func (s *Server) removeVMSnapshotRAMImages(ctx context.Context, vmName string) {
 			slog.Warn("delete: remove snapshot RAM image", "vm", vmName, "snapshot", sn.Name, "path", own, "error", err)
 		}
 	}
+}
+
+// removeFirmwareBundle removes a snapshot's firmware bundle and then the VM's
+// snapfw/<vm> directory if that left it empty: rmdir, never a recursive
+// remove, so another snapshot's bundle, or anything else in it, keeps it.
+// Snapshot create and delete of one VM hold its lock, so a create never makes
+// its bundle in a directory this is removing. Only the bundle's own error is
+// returned; an rmdir that finds the directory in use or gone is not one.
+func removeFirmwareBundle(dataDir, vmName, snapName string) error {
+	bundle := lv.SnapshotFirmwareBundlePath(dataDir, vmName, snapName)
+	err := os.Remove(bundle)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = os.Remove(filepath.Dir(bundle)) // only when empty
+	return nil
 }

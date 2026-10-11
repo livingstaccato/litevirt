@@ -185,7 +185,10 @@ func TestFleet_NICGuard_CloneOfATrunkIsGuarded(t *testing.T) {
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	setHostCapacity(t, c, n.Name, 64, 65536)
 	seedCloneSource(t, c, n, "tpl", "", 1, 256)
-	if err := n.DB.Execute(ctx, `UPDATE vms SET spec = ? WHERE name = 'tpl'`,
+	// The source's spec, written on the one node that holds it: a raw
+	// replicated UPDATE of vms is a shape no receiver applies (the fleet's
+	// replicated-shape guard, replicated_shapes.go).
+	if err := localExec(ctx, n.DB, `UPDATE vms SET spec = ? WHERE name = 'tpl'`,
 		`{"name":"tpl","cpu":1,"memory_mib":256,"network":[{"name":"lan","trunk":[10,11]}]}`); err != nil {
 		t.Fatal(err)
 	}

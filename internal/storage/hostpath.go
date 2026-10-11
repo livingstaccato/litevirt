@@ -176,6 +176,7 @@ var dataDirOwned = []string{
 	"ct-snapshots",              // snapshot_container.go containerSnapshotDir
 	"ct-restore",                // backup_container.go container restore staging
 	"ct-restore-markers",        // backup_container.go
+	"ct-provenance",             // grpcapi/replication_container.go: container replica provenance
 	"promote-markers",           // promote.go
 	"restore-staging",           // peer_backup.go
 	"backup-staging",            // peer_backup.go
@@ -197,6 +198,7 @@ var dataDirOwned = []string{
 	"credentials_external_seen", // corrosion/credentials_live.go externalSeenFile
 	"genesis-pending",           // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
 	"pool-uploads.json",         // storage_pool_confine.go poolUploadsFile
+	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 }

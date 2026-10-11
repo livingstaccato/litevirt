@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/hooks"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -687,6 +688,11 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 
 	// Live migrate — every disk is on shared storage. (Ownership confirmed above.)
 	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
+	// What `lv migrate` puts on the target first, through the same helper:
+	// the VM's networks and its cloud-init ISO. libvirt checks both on the
+	// destination, and without them every cloud-init VM's live drain failed
+	// and fell back to a cold move that waits for the guest to shut down.
+	s.prepareMigrationTarget(ctx, fresh, target.Name)
 	// The target's qemu opens the installer ISO from its own filesystem: the
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	// Where it resolves the ISO to another file (a link, a library
@@ -694,6 +700,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	srcTLS := s.migrationNetwork != "" && s.migrationTLSReady()
 	ens, ierr := s.ensureDisksOnTargetNet(ctx, target.Name, vm.Name, nil, srcTLS, true)
 	if ierr != nil {
+		// The guest never left: take back the ISO this attempt put there.
+		s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 		progress.Status = "error"
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
@@ -701,12 +709,22 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	cdromSources := ens.remap
 	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
+	// The VM's own migration policy, as `lv migrate` reads it. Its timeout is
+	// not applied: MigrateToTarget ignores contexts, and a drain has no
+	// adoption of a migration it stopped waiting for (migrateOwnedVM's).
+	tuning := migrationTuningFor(fresh, true)
+	mp := libvirt.MigrateParams{
+		Live: true, CDROMSources: cdromSources,
+		BandwidthMiB: tuning.bandwidthMiB, AutoConverge: tuning.autoConverge, MaxDowntimeMS: tuning.maxDowntimeMS,
+	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true
 		mp.TargetAddress = corrosion.URIHost(route.addr)
 		mp.TLSDestination = target.Address
 	}
+	hspec := vmHooks(fresh)
+	pbVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_RUNNING}
+	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
@@ -721,13 +739,22 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
 			return progress
 		}
-		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
+		// What follows a cut-over for `lv migrate` follows it here: reverse
+		// replication, the NetBox mirror, GARP, DNS, LB backends, VXLAN FDB,
+		// the post_migrate hook, the target's notify, and the source's own
+		// cloud-init ISO.
+		s.finishMigrationOnTarget(ctx, fresh, migrationFinish{target: &target, pbVM: pbVM, hspec: hspec})
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress
 	}
 	slog.Warn("live migration failed during drain, falling back to a cold move",
 		"vm", vm.Name, "error", lerr)
+	// The guest stayed here: take back the ISO this attempt put on the target,
+	// which only the attempt that made it may remove. The cold move puts its
+	// own there, and one that fails before it does would otherwise leave this
+	// one behind for a VM the target does not run.
+	s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 	// One lease per move: the cold move takes the destination's lease itself.
 	migLease.release(ctx)
 

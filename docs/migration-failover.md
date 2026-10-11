@@ -299,6 +299,19 @@ to stop it and move it.
   is then moved with its disks and started on the target.
 - A running VM on shared storage whose live migration fails is moved the same
   way.
+- While drain waits for a guest to shut down, the VM's record already says
+  stopped (so nothing reads the power-off as a crash), but `lv inspect` and
+  `lv ls` on its host show it `stopping` for as long as its domain still runs.
+
+A live drain prepares the target exactly as `lv migrate` does: the VM's
+networks and its cloud-init ISO are put there first, the VM's migration
+policy (bandwidth, auto-converge, maximum downtime) applies, and the
+`pre_migrate`/`post_migrate` hooks run. After the cut-over the source's
+cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
+forwarding entries follow the VM, as for a migration. A live attempt that
+fails takes back the cloud-init ISO it put on the target before the cold move
+is tried. (Builds before this put no ISO on the target, so every cloud-init
+VM's live drain failed and fell back to the cold move.)
 
 A VM that drain cannot move stays on the host with its disks; a failed attempt
 removes what it put on the target. It is never moved without its disks:

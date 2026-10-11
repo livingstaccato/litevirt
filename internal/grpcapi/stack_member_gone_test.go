@@ -128,3 +128,92 @@ func TestDeleteStack_AnAlreadyDeletedMemberWaitsForAnUnaskedPeer(t *testing.T) {
 		t.Errorf("the stack = %+v, want it kept \"deleting\" while a peer was not asked", st)
 	}
 }
+
+// A peer that is draining, in maintenance, fenced or unknown is never asked —
+// and a draining host still runs VMs — so it counts as unasked: compose down
+// errors and leaves the stack "deleting", as on main, rather than report a
+// member gone that such a peer may still run.
+//
+// Mutation: skip non-active peers without counting them — red.
+func TestDeleteStack_AnAlreadyDeletedMemberWaitsForAPeerNotActive(t *testing.T) {
+	for _, state := range []string{"draining", "maintenance", "fenced", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			s := testServerR2(t)
+			s.virt = libvirtfake.New()
+			ctx := adminContext(context.Background())
+			goneMemberStack(t, s, ctx, "fbm")
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.9", State: state}); err != nil {
+				t.Fatal(err)
+			}
+			stream := &mockDeleteStreamR2{ctx: ctx}
+			if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fbm"}, stream); err != nil {
+				t.Fatalf("DeleteStack: %v", err)
+			}
+			if st, _ := corrosion.GetStack(ctx, s.db, "fbm"); st == nil || st.State != "deleting" {
+				t.Errorf("the stack = %+v, want it kept \"deleting\" while a %s peer was not asked", st, state)
+			}
+		})
+	}
+	// A witness never runs a VM, and a removed host is gone: neither holds it.
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	goneMemberStack(t, s, ctx, "fbm")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "w-1", Address: "10.0.0.8", State: "maintenance", Role: "witness"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "gone-1", Address: "10.0.0.7", State: "removed"}); err != nil {
+		t.Fatal(err)
+	}
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fbm"}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+	if st, _ := corrosion.GetStack(ctx, s.db, "fbm"); st != nil {
+		t.Errorf("a witness or a removed host held the teardown: %+v", st)
+	}
+}
+
+// The tombstone has to be this stack's member: a tombstone of the name left
+// by a VM of another stack (or none) proves nothing about this stack's.
+//
+// Mutation: accept any tombstone of the name — red.
+func TestDeleteStack_ATombstoneOfAnotherStacksVMIsNotProof(t *testing.T) {
+	s := testServerR2(t)
+	s.virt = libvirtfake.New()
+	ctx := adminContext(context.Background())
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: "fbm", State: "active", ComposeYAML: goneStackYAML}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "lbfbm", StackName: "other", HostName: "test-host", State: "stopped", CPUActual: 1, MemActual: 256},
+		nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, s.db, "lbfbm"); err != nil {
+		t.Fatal(err)
+	}
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "fbm"}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+	if st, _ := corrosion.GetStack(ctx, s.db, "fbm"); st == nil || st.State != "deleting" {
+		t.Errorf("the stack = %+v, want it kept \"deleting\": the tombstone is another stack's VM", st)
+	}
+}
+
+// goneMemberStack makes stack fbm whose one member, lbfbm, was deleted here.
+func goneMemberStack(t *testing.T, s *Server, ctx context.Context, stack string) {
+	t.Helper()
+	if err := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{Name: stack, State: "active", ComposeYAML: goneStackYAML}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "lbfbm", StackName: stack, HostName: "test-host", State: "stopped", CPUActual: 1, MemActual: 256},
+		nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, s.db, "lbfbm"); err != nil {
+		t.Fatal(err)
+	}
+}

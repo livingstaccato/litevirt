@@ -1211,7 +1211,7 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 				return nil
 			case errors.Is(peerErr, errNotStackMember):
 				return peerErr
-			case errors.Is(peerErr, errNoPeerHasVM) && s.vmAlreadyDeleted(ctx, vmName):
+			case errors.Is(peerErr, errNoPeerHasVM) && s.vmAlreadyDeleted(ctx, m):
 				// Deleted before the teardown reached it (lv rm --force): it
 				// is removed, and the stack's teardown goes on.
 				slog.Info("stack delete: member was already deleted", "stack", stackName, "vm", vmName)
@@ -1244,18 +1244,28 @@ func (s *Server) deleteVMWithFanout(ctx context.Context, m stackMember, keepDisk
 	return err
 }
 
-// vmAlreadyDeleted reports a VM that was deleted: this host has no live row
-// of the name and does have its tombstone. With every active peer answering
-// that it has no such VM (errNoPeerHasVM), that is the proof a stack teardown
-// takes it as removed. A name with no row at all — one never made, or one a
-// peer made that has not replicated — is not proven gone, and is left to the
-// reconciler as before.
-func (s *Server) vmAlreadyDeleted(ctx context.Context, vmName string) bool {
-	if live, err := corrosion.GetVM(ctx, s.db, vmName); err != nil || live != nil {
+// vmAlreadyDeleted reports a stack member that was deleted: this host has no
+// live row of the name and does have its tombstone, and the tombstone is this
+// stack's VM (its stack_name) — of the incarnation the teardown listed, when it
+// listed one (created_at). With every peer that may hold the VM answering that
+// it has none (errNoPeerHasVM), that is the proof a stack teardown takes it as
+// removed. A name with no row at all — one never made, or one a peer made that
+// has not replicated — or a tombstone of another stack's VM is not, and is left
+// to the reconciler as before.
+func (s *Server) vmAlreadyDeleted(ctx context.Context, m stackMember) bool {
+	if live, err := corrosion.GetVM(ctx, s.db, m.Name); err != nil || live != nil {
 		return false
 	}
-	dead, err := corrosion.GetDeletedVM(ctx, s.db, vmName)
-	return err == nil && dead != nil
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(stack_name, '') AS stack_name, COALESCE(created_at, '') AS created_at
+		 FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, m.Name)
+	if err != nil || len(rows) == 0 {
+		return false
+	}
+	if rows[0].String("stack_name") != m.Stack {
+		return false
+	}
+	return m.CreatedAt == "" || rows[0].String("created_at") == m.CreatedAt
 }
 
 // stackMember is a stack's VM as the teardown saw it: its name, the stack
@@ -1341,9 +1351,19 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 		return listErr
 	}
 
+	// unasked counts the peers that may hold the VM and did not answer that
+	// they have none: one this host could not dial, one that answered
+	// PermissionDenied (it may hold a row of the name in another project),
+	// and one that is not active — never asked here, and a draining host
+	// still runs its VMs. A witness never runs one and a removed host is
+	// gone, so neither counts.
 	unasked := 0
 	for _, h := range hosts {
-		if h.Name == s.hostName || h.State != "active" {
+		if h.Name == s.hostName || h.State == "removed" || h.IsWitness() {
+			continue
+		}
+		if h.State != "active" {
+			unasked++
 			continue
 		}
 		client, conn, peerErr := s.peerClient(ctx, h.Name)
@@ -1361,10 +1381,15 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName, stackName string, k
 		if peerErr != nil {
 			conn.Close()
 			// A peer without the row answers a project-scoped caller with
-			// PermissionDenied, not NotFound: either way it is not the
-			// holder, so the search goes on. The holder's bound delete is
-			// the authority.
-			if c := status.Code(peerErr); c == codes.NotFound || c == codes.PermissionDenied {
+			// PermissionDenied, not NotFound, so the search goes on. The
+			// holder's bound delete is the authority. PermissionDenied is
+			// not "no such VM", though — the peer may hold one in another
+			// project — so it does not count toward errNoPeerHasVM.
+			switch status.Code(peerErr) {
+			case codes.NotFound:
+				continue
+			case codes.PermissionDenied:
+				unasked++
 				continue
 			}
 			return peerErr

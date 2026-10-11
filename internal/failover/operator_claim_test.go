@@ -33,25 +33,34 @@ func decideOperatorAt0(host string) func(corrosion.ClaimKey, corrosion.ClaimValu
 // refuses — it started the VM — the value stands and nothing is minted.
 //
 // Mutation "no operator branch" in supersedeEvidence — red: the coordinator
-// stands down, nothing asked, nothing minted.
+// stands down, nothing asked, nothing minted. Mutation "return on a failed
+// request" (round 1's shape, review I-2) — red on "its host removed for good".
 func TestReschedule_MovesPastAnOperatorPromotionThatNeverStarted(t *testing.T) {
 	for _, c := range []struct {
 		name     string
+		dest     string
 		abandons bool
-	}{{"never started: abandoned", true}, {"started: refused", false}} {
+		moves    bool
+	}{
+		{"never started: abandoned", "other", true, true},
+		{"started: refused", "other", false, false},
+		// Review I-2: the host cannot be asked, and it has been removed for
+		// good: the removal is the evidence, as for any other decided value.
+		{"refused, its host removed for good", "gone-for-good", false, true},
+	} {
 		t.Run(c.name, func(t *testing.T) {
-			cl := &fakeClaimer{decide: decideOperatorAt0("other")}
+			cl := &fakeClaimer{decide: decideOperatorAt0(c.dest)}
 			if c.abandons {
 				cl.abandon = func(string, corrosion.ClaimKey, string) (string, error) { return "signed-abandonment", nil }
 			}
 			db, coord := claimFixture(t, cl)
 			coord.run(context.Background())
 
-			if len(cl.abandonAsked) == 0 || cl.abandonAsked[0] != "other/op-proof" {
-				t.Fatalf("abandonment asked of %v, want other/op-proof", cl.abandonAsked)
+			if len(cl.abandonAsked) == 0 || cl.abandonAsked[0] != c.dest+"/op-proof" {
+				t.Fatalf("abandonment asked of %v, want %s/op-proof", cl.abandonAsked, c.dest)
 			}
 			ps := vmProofs(t, db)
-			if !c.abandons {
+			if !c.moves {
 				if len(ps) != 0 {
 					t.Fatalf("a started operator promotion was moved past: %+v", ps)
 				}
@@ -61,7 +70,11 @@ func TestReschedule_MovesPastAnOperatorPromotionThatNeverStarted(t *testing.T) {
 				t.Fatalf("want vm1 rescheduled at the next attempt, got %+v", ps)
 			}
 			last := cl.evidence[len(cl.evidence)-1]
-			if last == nil || last.Abandonment != "signed-abandonment" || cl.calls[len(cl.calls)-1].Attempt != 1 {
+			want := ""
+			if c.abandons {
+				want = "signed-abandonment"
+			}
+			if last == nil || last.Abandonment != want || cl.calls[len(cl.calls)-1].Attempt != 1 {
 				t.Fatalf("attempt 1 was not claimed on the operator host's abandonment: calls %v evidence %+v", cl.calls, last)
 			}
 		})

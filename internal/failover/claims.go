@@ -270,13 +270,16 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 	if corrosion.IsOperatorPromoteValue(decided) {
 		ab, err := c.Claimer.RequestAbandonment(ctx, dest, key, decided.ID,
 			"the operator's promotion on "+dest+" never started the VM; the coordinator moves past it")
-		if err != nil {
-			slog.Warn("failover: an operator's decided promotion was not abandoned by its host; it stands", "claim", key.String(),
-				"dest", dest, "proof", decided.ID, "error", err)
-			return nil
+		if err == nil {
+			ev.Abandonment = ab
+			return ev
 		}
-		ev.Abandonment = ab
-		return ev
+		// Not abandoned: the host started the VM, or cannot be asked. The
+		// value stands unless that host has been removed for good, which the
+		// checks below still find (review I-2: `lv host rm --dead` is the
+		// remedy for a dead operator host, and returning here stalled it).
+		slog.Warn("failover: an operator's decided promotion was not abandoned by its host", "claim", key.String(),
+			"dest", dest, "proof", decided.ID, "error", err)
 	}
 	// A decided proof that is already spent, at an incarnation-scoped key: it
 	// can never run again, and the legacy-key bridge may have adopted it from

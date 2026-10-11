@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -260,5 +261,85 @@ func (s *Server) SyncBackupRepo(ctx context.Context, req *pb.SyncBackupRepoReque
 		ChunksCopied:    int64(stats.ChunksCopied),
 		ChunksSkipped:   int64(stats.ChunksSkipped),
 		BytesCopied:     stats.BytesCopied,
+	}, nil
+}
+
+// SetBackupRepoCompression creates a repository with zstd chunk compression, or
+// turns zstd on for an existing one, on THIS host: the daemon-side half of
+// `lv backup repo init|set-compression`, there so the write goes through the
+// release token's backup_zstd gate. A compressed repo is schema_version 2,
+// which a release without compression refuses at Open, so the gate refuses
+// until every host reads it and records the use before repo.json changes.
+//
+// Only zstd comes here. Creating an uncompressed repo or turning compression
+// off writes nothing an older build drops, so the CLI does those without a
+// daemon. Verb backup.compression at `/`, legacy floor operator, audited as
+// backup.repo.compression.
+func (s *Server) SetBackupRepoCompression(ctx context.Context, req *pb.SetBackupRepoCompressionRequest) (*pb.SetBackupRepoCompressionResponse, error) {
+	const action = "backup.repo.compression"
+	repoName := req.GetRepo()
+	if err := s.backupRepoAllowed(ctx, "backup.compression", action, repoName); err != nil {
+		return nil, err
+	}
+	if req.GetCompression() != pbsstore.CompressionZstd {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"compression %q: only %q is set through the daemon (turning compression off needs no release feature)",
+			req.GetCompression(), pbsstore.CompressionZstd)
+	}
+	if req.GetEncrypted() && !req.GetInit() {
+		return nil, status.Error(codes.InvalidArgument, "encrypted applies only with init")
+	}
+	path, err := s.resolveBackupRepoPath(ctx, repoName)
+	if err != nil {
+		result := "error"
+		if status.Code(err) == codes.PermissionDenied {
+			result = "denied"
+		}
+		s.audit(ctx, action, repoName, fmt.Sprintf("repo %q: %v", repoName, err), result)
+		return nil, err
+	}
+	if req.GetOnlyIfAvailable() && !s.ReleaseFeatureAvailable(capabilities.FeatureBackupZstd) {
+		return &pb.SetBackupRepoCompressionResponse{
+			NotAppliedReason: "the cluster's release token has not latched yet",
+		}, nil
+	}
+
+	var repo *pbsstore.Repo
+	if !req.GetInit() {
+		// Read first, so a bad path costs no used record.
+		repo, err = pbsstore.Open(path)
+		if err != nil {
+			s.audit(ctx, action, repoName, fmt.Sprintf("open repo %q: %v", repoName, err), "error")
+			return nil, status.Errorf(codes.FailedPrecondition, "open repo %q: %v", repoName, err)
+		}
+	}
+	err = s.WithReleaseFeature(ctx, capabilities.FeatureBackupZstd, func(_ context.Context, g capabilities.FeatureGrant) error {
+		if req.GetInit() {
+			opts := pbsstore.InitOptions{Compression: pbsstore.CompressionZstd}
+			if req.GetEncrypted() {
+				opts.Encryption = pbsstore.EncryptionModeAESGCM
+			}
+			repo, err = pbsstore.InitWithGrant(path, opts, g)
+			return err
+		}
+		return repo.EnableCompressionWithGrant(g)
+	})
+	if err != nil {
+		if req.GetOnlyIfAvailable() && status.Code(err) == codes.FailedPrecondition {
+			return &pb.SetBackupRepoCompressionResponse{NotAppliedReason: status.Convert(err).Message()}, nil
+		}
+		s.audit(ctx, action, repoName, err.Error(), "error")
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "backup repo %q: %v", repoName, err)
+	}
+	s.audit(ctx, action, repoName, fmt.Sprintf("init=%t compression=%s schema=%d",
+		req.GetInit(), repo.Compression(), repo.Meta().SchemaVersion), "ok")
+	return &pb.SetBackupRepoCompressionResponse{
+		Applied:       true,
+		Path:          path,
+		Compression:   repo.Compression(),
+		SchemaVersion: int32(repo.Meta().SchemaVersion),
 	}, nil
 }

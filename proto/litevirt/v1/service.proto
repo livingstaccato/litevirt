@@ -1112,6 +1112,24 @@ message VerifyBackupRepoResponse {
     repeated string missing        = 3;  // chunk ids a manifest references that are absent
 }
 
+// SetBackupRepoCompression: only zstd is gated, so only zstd is asked for;
+// turning compression off, or creating an uncompressed repo, needs no daemon.
+message SetBackupRepoCompressionRequest {
+    string repo        = 1;  // a registered repo name, or an absolute path (admin)
+    string compression = 2;  // "zstd"
+    bool   init        = 3;  // create the repo (it must not exist) instead of converting one
+    bool   encrypted   = 4;  // with init: mark the new repo AES-256-GCM encrypted
+    // only_if_available: do nothing, and say so, when backup_zstd cannot be used
+    // yet, instead of failing. For a default that falls back to no compression.
+    bool   only_if_available = 5;
+}
+message SetBackupRepoCompressionResponse {
+    bool   applied            = 1;  // false only with only_if_available, when the feature is not open
+    string not_applied_reason = 2;
+    string path               = 3;
+    string compression        = 4;
+    int32  schema_version     = 5;
+}
 message GarbageCollectBackupRepoRequest {
     string repo = 1;
 }
@@ -3586,10 +3604,15 @@ service LiteVirt {
     // daemon to a repo it holds, under RBAC and on the audit record. The web
     // UI's /backups actions call these. Verbs: backup.verify, backup.gc,
     // backup.prune, backup.sync, all at `/`, legacy floor operator.
+    // SetBackupRepoCompression (verb backup.compression, same place and floor)
+    // creates a repo with zstd chunk compression, or turns zstd on for an
+    // existing one, through the release token's backup_zstd gate: it is the
+    // daemon-side half of `lv backup repo init|set-compression`.
     rpc VerifyBackupRepo(VerifyBackupRepoRequest)                 returns (VerifyBackupRepoResponse);
     rpc GarbageCollectBackupRepo(GarbageCollectBackupRepoRequest) returns (GarbageCollectBackupRepoResponse);
     rpc PruneBackupRepo(PruneBackupRepoRequest)                   returns (PruneBackupRepoResponse);
     rpc SyncBackupRepo(SyncBackupRepoRequest)                     returns (SyncBackupRepoResponse);
+    rpc SetBackupRepoCompression(SetBackupRepoCompressionRequest) returns (SetBackupRepoCompressionResponse);
     // The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
     // a read, so not audited.
     rpc ListBackupRepoSnapshots(ListBackupRepoSnapshotsRequest)   returns (ListBackupRepoSnapshotsResponse);

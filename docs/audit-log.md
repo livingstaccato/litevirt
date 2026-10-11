@@ -149,7 +149,8 @@ Use cases:
 - Who pruned or garbage-collected a backup repo? —
   `lv audit ls --action 'backup.repo.*'`. The actions are
   `backup.repo.verify`, `backup.repo.gc`, `backup.repo.prune` and
-  `backup.repo.sync`. Each row names the repo, or `src -> dst` for a sync, and
+  `backup.repo.sync`, plus `backup.repo.compression` for creating or converting
+a repo to zstd. Each row names the repo, or `src -> dst` for a sync, and
   its detail holds what the operation counted: chunks deleted and bytes
   reclaimed for a GC, the `keep_*` policy and the kept and deleted counts for a
   prune. A refused attempt is recorded as `denied`. The full format is in

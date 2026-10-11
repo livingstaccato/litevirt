@@ -104,6 +104,18 @@ zstd` is refused, naming the release feature `backup_zstd`. Once it has
 latched, new repos are compressed by default. `--force` allows zstd earlier,
 for a repository no older host or backup host reads (an air-gapped one).
 
+Creating a compressed repo, or turning zstd on for one, is done by the
+**daemon of the host the CLI is connected to**
+(`SetBackupRepoCompression`, below), not by the CLI alone: the daemon's
+release-feature gate records that `backup_zstd` is in use before
+`repo.json` changes, and the path is then a path on that host. When no
+daemon can be asked, or the feature is not open, the default falls back to
+an uncompressed repo and says so; an explicit `--compression zstd` fails
+with the reason. `--force` skips the daemon and the gate and writes the
+repo locally; nothing records that use, so it is for a repository no host
+of this cluster's rollback story depends on. Creating an uncompressed
+repo and turning compression off need no daemon and no feature.
+
 **Older releases refuse a compressed repo.** A compressed repo's `repo.json`
 says `"compression": "zstd"` and `"schema_version": 2`. Every release before
 backup compression opens schema 1 only, so it stops at `repository
@@ -846,7 +858,7 @@ A custom absolute `repo_path` also requires the **admin** role.
 ### Repo maintenance RPCs
 
 The daemon verifies, garbage-collects, prunes and syncs a repo it holds
-through four RPCs. Each is checked at `/` with its own verb. A repo holds
+through four RPCs (and a fifth for compression, below). Each is checked at `/` with its own verb. A repo holds
 every project's backups, so a project-scoped grant or token cannot reach
 it. Each RPC writes one audit row: the caller, the repo, the outcome, and
 what the operation counted.
@@ -858,7 +870,12 @@ what the operation counted.
 | `PruneBackupRepo` | `backup.prune` | `backup.repo.prune` | the `keep_*` policy, `kept`, `deleted` |
 | `SyncBackupRepo` | `backup.sync` | `backup.repo.sync` (target `src -> dst`) | `manifests_copied chunks_copied chunks_skipped bytes_copied` |
 
-All four sit in `backup.*`, which Operator and BackupOperator hold and
+A fifth RPC, `SetBackupRepoCompression` (verb `backup.compression`, audit
+action `backup.repo.compression`; detail `init compression schema`), creates a
+zstd repo or turns zstd on for one, through the release token's `backup_zstd`
+gate. It refuses until the token has latched and records the use first.
+
+All of them sit in `backup.*`, which Operator and BackupOperator hold and
 Viewer's `*.read` does not. Without RBAC bindings the floor is the
 legacy `operator` role.
 

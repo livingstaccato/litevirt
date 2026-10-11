@@ -813,7 +813,9 @@ lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|n
 #   Default: none until the cluster's release token has latched (feature
 #   backup_zstd), zstd after. zstd marks the repo schema 2, which releases
 #   without backup compression refuse to open; --force allows it before the
-#   latch, for a repo no older host reads.
+#   latch, locally, for a repo no older host reads. Without --force a zstd
+#   repo is created by the connected host's daemon (release feature gate), so
+#   <path> is a path on that host.
 lv backup repo set-compression <path> zstd|none [--force]   # for chunks written from now on; zstd gated as above
 lv backup repo ls <path>
 lv backup repo verify <path>

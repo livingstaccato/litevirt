@@ -159,6 +159,7 @@ const (
 	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
 	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
 	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
+	LiteVirt_SetBackupRepoCompression_FullMethodName   = "/litevirt.v1.LiteVirt/SetBackupRepoCompression"
 	LiteVirt_ListBackupRepoSnapshots_FullMethodName    = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
 	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
 	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
@@ -549,10 +550,15 @@ type LiteVirtClient interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(ctx context.Context, in *VerifyBackupRepoRequest, opts ...grpc.CallOption) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error)
@@ -2507,6 +2513,16 @@ func (c *liteVirtClient) SyncBackupRepo(ctx context.Context, in *SyncBackupRepoR
 	return out, nil
 }
 
+func (c *liteVirtClient) SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetBackupRepoCompressionResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SetBackupRepoCompression_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListBackupRepoSnapshotsResponse)
@@ -4446,10 +4462,15 @@ type LiteVirtServer interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(context.Context, *VerifyBackupRepoRequest) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error)
@@ -5253,6 +5274,9 @@ func (UnimplementedLiteVirtServer) PruneBackupRepo(context.Context, *PruneBackup
 }
 func (UnimplementedLiteVirtServer) SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetBackupRepoCompression not implemented")
 }
 func (UnimplementedLiteVirtServer) ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBackupRepoSnapshots not implemented")
@@ -8040,6 +8064,24 @@ func _LiteVirt_SyncBackupRepo_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SyncBackupRepo(ctx, req.(*SyncBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetBackupRepoCompression_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetBackupRepoCompressionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetBackupRepoCompression_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, req.(*SetBackupRepoCompressionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11215,6 +11257,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SyncBackupRepo",
 			Handler:    _LiteVirt_SyncBackupRepo_Handler,
+		},
+		{
+			MethodName: "SetBackupRepoCompression",
+			Handler:    _LiteVirt_SetBackupRepoCompression_Handler,
 		},
 		{
 			MethodName: "ListBackupRepoSnapshots",

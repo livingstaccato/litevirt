@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // Chunk compression.
@@ -158,4 +160,30 @@ func (r *Repo) SetCompression(mode string) error {
 	}
 	r.meta = meta
 	return nil
+}
+
+// InitWithGrant creates a zstd-compressed repository. It is a writer of the
+// release feature backup_zstd: a compressed repo is schema_version 2, which a
+// release without compression refuses, so the repo's creation is the data the
+// feature's used bit must precede. g comes from the release-feature gate
+// (grpcapi.Server.WithReleaseFeature). opts.Compression must be zstd; an
+// uncompressed repo needs no grant and is InitWithOptions.
+func InitWithGrant(root string, opts InitOptions, g capabilities.FeatureGrant) (*Repo, error) {
+	if err := g.Check(capabilities.FeatureBackupZstd); err != nil {
+		return nil, err
+	}
+	if opts.Compression != CompressionZstd {
+		return nil, fmt.Errorf("InitWithGrant creates a %s repository, not %q", CompressionZstd, opts.Compression)
+	}
+	return InitWithOptions(root, opts)
+}
+
+// EnableCompressionWithGrant turns zstd on for an existing repository, raising
+// it to schema_version 2: the other writer of backup_zstd's data. See
+// InitWithGrant. Turning compression off is SetCompression and needs no grant.
+func (r *Repo) EnableCompressionWithGrant(g capabilities.FeatureGrant) error {
+	if err := g.Check(capabilities.FeatureBackupZstd); err != nil {
+		return err
+	}
+	return r.SetCompression(CompressionZstd)
 }

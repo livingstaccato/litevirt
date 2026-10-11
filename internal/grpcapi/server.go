@@ -1077,6 +1077,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.voterConfigAdvertisable() {
 		caps = withoutCapability(caps, capabilities.VoterConfigV1)
 	}
+	// credentials_clear_v1 is mandatory but advertised only once this node has
+	// completed a credentials split pass (corrosion.CredentialsLive). The clear
+	// then cannot latch anywhere until every recipient has, so a node's first
+	// pass runs before any old column is cleared — which is what makes its
+	// legacy-shadow materialisation safe (corrosion/credentials_live.go).
+	if s.db == nil || !s.db.CredentialsLive() {
+		caps = withoutCapability(caps, capabilities.CredentialsClearV1)
+	}
 	// recovery_claim_v1 is withheld while enforcement.recovery_claim is off,
 	// and the reason is the question CLAUDE.md asks of every token: where is
 	// the guarantee enforced? At EXECUTION. A coordinator cannot stop another

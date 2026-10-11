@@ -128,6 +128,7 @@ const (
 	LiteVirt_CreateUser_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateUser"
 	LiteVirt_ListUsers_FullMethodName                  = "/litevirt.v1.LiteVirt/ListUsers"
 	LiteVirt_DeleteUser_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteUser"
+	LiteVirt_MarkUserExternal_FullMethodName           = "/litevirt.v1.LiteVirt/MarkUserExternal"
 	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
@@ -497,6 +498,11 @@ type LiteVirtClient interface {
 	CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*User, error)
 	ListUsers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListUsersResponse, error)
 	DeleteUser(ctx context.Context, in *DeleteUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// MarkUserExternal records, as an administrator's audited decision, that an
+	// existing user with no local password is an external-realm (LDAP/OIDC)
+	// user, so an external login under that name is not refused for want of
+	// evidence. Refused for an account that holds a password. Admin only.
+	MarkUserExternal(ctx context.Context, in *MarkUserExternalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CreateToken(ctx context.Context, in *CreateTokenRequest, opts ...grpc.CallOption) (*Token, error)
 	RevokeToken(ctx context.Context, in *RevokeTokenRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -2151,6 +2157,16 @@ func (c *liteVirtClient) DeleteUser(ctx context.Context, in *DeleteUserRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_DeleteUser_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) MarkUserExternal(ctx context.Context, in *MarkUserExternalRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_MarkUserExternal_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4375,6 +4391,11 @@ type LiteVirtServer interface {
 	CreateUser(context.Context, *CreateUserRequest) (*User, error)
 	ListUsers(context.Context, *emptypb.Empty) (*ListUsersResponse, error)
 	DeleteUser(context.Context, *DeleteUserRequest) (*emptypb.Empty, error)
+	// MarkUserExternal records, as an administrator's audited decision, that an
+	// existing user with no local password is an external-realm (LDAP/OIDC)
+	// user, so an external login under that name is not refused for want of
+	// evidence. Refused for an account that holds a password. Admin only.
+	MarkUserExternal(context.Context, *MarkUserExternalRequest) (*emptypb.Empty, error)
 	CreateToken(context.Context, *CreateTokenRequest) (*Token, error)
 	RevokeToken(context.Context, *RevokeTokenRequest) (*emptypb.Empty, error)
 	// Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -5140,6 +5161,9 @@ func (UnimplementedLiteVirtServer) ListUsers(context.Context, *emptypb.Empty) (*
 }
 func (UnimplementedLiteVirtServer) DeleteUser(context.Context, *DeleteUserRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteUser not implemented")
+}
+func (UnimplementedLiteVirtServer) MarkUserExternal(context.Context, *MarkUserExternalRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method MarkUserExternal not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateToken(context.Context, *CreateTokenRequest) (*Token, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateToken not implemented")
@@ -7498,6 +7522,24 @@ func _LiteVirt_DeleteUser_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).DeleteUser(ctx, req.(*DeleteUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_MarkUserExternal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MarkUserExternalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).MarkUserExternal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_MarkUserExternal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).MarkUserExternal(ctx, req.(*MarkUserExternalRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11077,6 +11119,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteUser",
 			Handler:    _LiteVirt_DeleteUser_Handler,
+		},
+		{
+			MethodName: "MarkUserExternal",
+			Handler:    _LiteVirt_MarkUserExternal_Handler,
 		},
 		{
 			MethodName: "CreateToken",

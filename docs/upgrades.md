@@ -526,11 +526,11 @@ refuses the rotation's public-row half, so it holds the OLD password on a NEWER
 public row. A rule that preferred the newer row would serve the rotated-out
 password, and the pass would copy it over the credential row.
 
-This is the dual-write step of a column move, and the release stops there.
-Every old column still holds the current secret, so the public rows, and the
-operator-safe state dump built from them, **still carry the secrets in this
-release**. Clearing the old columns is a later release's step, behind a second
-mandatory, replication-gated token (see
+This is the dual-write step of a column move. Every old column still holds
+the current secret, so the public rows, and the operator-safe state dump built
+from them, **still carry the secrets until the second step below**: clearing
+the old columns, behind a second mandatory, replication-gated token (see
+[The old secret columns are emptied](#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 
 Latches form per host, so for a few seconds after one host latches its
@@ -581,6 +581,99 @@ Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pendin
 is set, as it is for every mandatory token mid-roll. If it stays set after the
 roll, a host is still on the previous release — most often one in
 `maintenance`.
+
+### The old secret columns are emptied
+
+The second step of the move takes the secrets out of the public rows. It
+starts **on its own, after every host runs a build carrying the
+`credentials_clear_v1` capability token**; no flag starts it, and none stops
+it. The token is mandatory and replication-gated, like `credentials_split_v1`:
+it latches only once every memberlist member advertises it, a host parked in
+`maintenance` included, so no host that still reads only the old columns ever
+receives a clear. A host advertises it only after it has completed its first
+credentials split pass, so no old column anywhere is cleared before every
+host has a credential row for every secret it holds.
+
+Once it has latched on a host (and `credentials_split_v1` has too):
+
+- every writer writes the secret to the credential table and an empty value
+  to the old column, in the same statements as before;
+- the pass that runs at start and every minute empties every old column that
+  still holds a value — a deleted user's hash, a revoked token's hash and a
+  removed host's BMC password included. Each clear goes out in one replicated
+  batch with the credential row it hands over to, credential row first;
+- each clear is stamped just after the public row's own `updated_at`, not
+  with the current time, so a revoke or delete a peer made just before the
+  clear, still in flight, still wins when it arrives;
+- password, token and IPMI readers do not change: they already take the
+  credential row whenever one exists;
+- an LDAP or OIDC login under a name that already has a users row reads the
+  credential row to decide whether that row is a local account, because an
+  empty `password_hash` no longer means "no local password". A host that has
+  received the account's users row but not yet its credential row (the two
+  are repaired separately) refuses that login with "its credential has not
+  reached this node yet" until it has, rather than guess. An external user
+  that existed before `credentials_split_v1` latched is given an empty
+  credential row by the first split pass of the hosts that held it before the
+  clear, so it keeps logging in. A host added after the clear refuses such a
+  login until that credential row has reached it, usually within one
+  anti-entropy cycle.
+
+From then on no public row, and no operator-safe state dump, carries a
+password hash, an API token hash or an IPMI password. `lv user reset-admin`
+follows the same latch when it writes the local database directly.
+
+A host's latch forms a few seconds before or after its neighbours'. A host
+that has not latched yet still writes secrets to both places; the next pass
+on a latched host empties that old column again.
+
+**Rollback.** One build back — to the build that dual-writes — is the
+supported rollback. That binary enters WAL quarantine like any rollback below
+a latched token, and it still validates tokens, checks passwords and fences,
+because it reads the credential row whenever one exists and the credential
+rows hold every secret. Upgrading it again loses nothing. **A rollback two
+builds back, to a build before `credentials_split_v1`, is unsupported once
+`credentials_clear_v1` has latched**: that build reads only the old columns,
+which are empty, so it has no IPMI password, password hash or token hash to
+read. The startup rollback preflight refuses such a binary only if it carries
+the preflight.
+
+A host rolled back one build also loses one safeguard: that build recognises a
+re-minted admin account's credential (colonelpanik/litevirt#224) only by the
+hash on the refused users row, which is empty once the re-minting host has
+cleared. Under WAL quarantine it still merges anti-entropy, so during a
+re-mint incident it can take the re-minted credential. Resolve the re-mint
+(`lv user reset-admin` on the host you trust) before rolling a host back.
+
+**A host that was switched off across the latch.** The latch is confirmed
+against hosts that are in the cluster's membership at the time. A host that
+was off throughout is not asked, and if it runs a build before
+`credentials_split_v1` it holds no marker for either token, so the rollback
+preflight does not stop it either. Back online on that build, it reads only
+the old columns, which are now empty: it cannot fence by IPMI and its logins
+fail. Do not bring it back with its old data. The safe path is to remove it
+and add it again as a fresh host: `lv host rm <host>` from a running host,
+wipe its data directory, then `lv host add` it on this build, so it joins
+with an empty database and takes every row, credential rows included, from
+the cluster. (Bringing it back on the dual-write build reads empty secrets;
+bringing it back with its old database on this build is safe for logins —
+evidence that a user is external is kept per user and bound to that user's
+row as it stood, including its last write, so a local account cleared since,
+or a name deleted and created again since, is never taken for one; such a
+login is refused until the account's credential arrives — but it holds stale
+state for everything else until anti-entropy has caught up.)
+
+**External users after the roll.** An LDAP or OIDC user created before
+`credentials_split_v1` latched has no credential row until a host that held it
+then runs its first split pass on this build. If no such host does — for
+example, the old hosts were replaced by new ones instead of being upgraded in
+place — logins under that name are refused with `FailedPrecondition` until an
+administrator runs `lv user mark-external <username>` (docs/auth.md). Upgrade
+at least one existing host in place before retiring the rest to avoid it.
+
+Until the token latches,
+`litevirt_ha_degraded{reason="capability_rollout_pending"}` is set, as for
+every mandatory token mid-roll.
 
 ### Host state moves to its own row after the roll
 

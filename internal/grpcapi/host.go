@@ -1092,16 +1092,23 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 
 	// Once credentials_split_v1 has latched, a supplied IPMI password is ALSO
 	// written to the host's sensitive-lane credential row, in the same batch
-	// and under the same updated_at. hosts.ipmi_pass keeps it too: a host
-	// rolled back one release reads that column and nothing else, and clearing
-	// it is a later release's step (docs/design/credentials-clear.md). Before
+	// and under the same updated_at. hosts.ipmi_pass keeps it too until
+	// credentials_clear_v1 latches: a host on a build before credentials_split_v1
+	// reads that column and nothing else (docs/design/credentials-clear.md). Before
 	// the latch no node may write the credential table (a previous-release
 	// peer cannot decode it), so the password goes to hosts.ipmi_pass alone.
 	// err is reused from the host lookup above.
 	// A clear writes an empty password to the credential row the same way
 	// (checked above that the gate is open): a live row with no secret, which
 	// readers serve as "none".
+	//
+	// Once credentials_clear_v1 has latched as well, the old column gets ''
+	// instead of the password, in the same statement shape: nothing reads it
+	// any more, and the operator-safe dump must not carry it.
 	if (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables() {
+		if req.IpmiPass != "" && s.db.MayClearCredentialColumns() {
+			args[3] = ""
+		}
 		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
 			{SQL: configureHostSQL, Params: args},
 			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},

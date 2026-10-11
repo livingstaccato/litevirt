@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -47,29 +48,89 @@ const usersReactivateSQL = `UPDATE users SET role = ?, password_hash = ?, delete
 //
 // Once credentials_split_v1 has latched the hash is written to user_credentials
 // as well, in the same batch and under the same updated_at; users.password_hash
-// keeps it for a previous-release reader (see credentials_split.go).
+// keeps it for a previous-release reader until credentials_clear_v1 latches,
+// and is empty after (oldColumnValue; see credentials_split.go).
 func InsertUser(ctx context.Context, c *Client, username, role, passwordHash string) error {
 	now := c.NowTS()
 	split := c.MayWriteCredentialTables()
 	// Try reactivating a soft-deleted user first.
 	rows, err := c.Query(ctx,
-		`SELECT username FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username)
+		`SELECT u.username, u.created_at, u.updated_at, k.updated_at AS cred_ts
+		   FROM users u LEFT JOIN user_credentials k ON k.username = u.username
+		  WHERE u.username = ? AND u.deleted_at IS NOT NULL`, username)
 	if err == nil && len(rows) > 0 {
+		// Whatever this node recorded about the name describes the row before
+		// this write (re-review 3, R1).
+		c.forgetExternalShadow(username)
+		ts := now
+		if passwordHash == "" {
+			ts = shadowReactivationTS(rows[0].String("updated_at"), rows[0].String("cred_ts"), now)
+		}
 		if split {
 			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, passwordHash, now, username}},
-				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), ts, username}},
+				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, ts}},
 			})
 		}
-		return c.Execute(ctx, usersReactivateSQL, role, passwordHash, now, username)
+		if err := c.Execute(ctx, usersReactivateSQL, role, passwordHash, ts, username); err != nil {
+			return err
+		}
+		if passwordHash == "" {
+			c.noteExternalShadow(userIdentity{Username: username, CreatedAt: rows[0].String("created_at"), UpdatedAt: ts})
+		}
+		return nil
+	}
+	created := nowRFC3339()
+	if passwordHash != "" {
+		// A local account under this name: any record that this node made
+		// an external shadow of it is about an earlier incarnation.
+		c.forgetExternalShadow(username)
 	}
 	if split {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersInsertSQL, Params: []interface{}{username, role, passwordHash, nowRFC3339(), now}},
+			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), created, now}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
-	return c.Execute(ctx, usersInsertSQL, username, role, passwordHash, nowRFC3339(), now)
+	if err := c.Execute(ctx, usersInsertSQL, username, role, passwordHash, created, now); err != nil {
+		return err
+	}
+	if passwordHash == "" {
+		// An external-realm shadow made where no credential row can be
+		// written yet: positive evidence, bound to this row's identity, which
+		// this node's first live pass replicates (credentials_live.go).
+		c.noteExternalShadow(userIdentity{Username: username, CreatedAt: created, UpdatedAt: now})
+	}
+	return nil
+}
+
+// shadowReactivationTS is the updated_at of an external shadow that
+// reactivates a tombstoned users row: two successor steps (clearTS) past the
+// newest write this node holds for the row or its credential — not a fresh
+// clock (re-review 3, R4; pre-existing on main). Two, because one step is
+// exactly the stamp another node's credentials_clear_v1 pass gives the same
+// tombstone, and an equal timestamp with different content is a tie.
+//
+// The shadow is a reactivation of the tombstone THIS node holds. Any write a
+// peer made after that tombstone — above all the name created again as a local
+// account, still in flight to this node — is newer than the successor, so it
+// wins on every node, here included once it arrives, and the local account
+// keeps its password and role. With a fresh clock the shadow, written later in
+// real time, beat that write by LWW and wiped the local password cluster-wide.
+// It still beats the tombstone, so the reactivation itself replicates. A row
+// whose timestamps cannot be read keeps the fresh clock (main's behaviour).
+func shadowReactivationTS(usersTS, credTS, now string) string {
+	newest := usersTS
+	if credTS != "" && lwwOrder(credTS, newest) > 0 {
+		newest = credTS
+	}
+	if once, ok := clearTS(credentialSplitRow{srcTS: newest}); ok {
+		if twice, ok := clearTS(credentialSplitRow{srcTS: once}); ok {
+			return twice
+		}
+	}
+	slog.Warn("users: a tombstoned row has no readable timestamp; reactivating it with a fresh clock")
+	return now
 }
 
 const usersInsertSQL = `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
@@ -147,7 +208,7 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 			return nil
 		}
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}},
+			{SQL: usersUpdatePasswordSQL, Params: []interface{}{c.oldColumnValue(passwordHash), now, username}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
@@ -168,6 +229,7 @@ const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at =
 // (Local users authenticate through the "local" realm; external OIDC/LDAP group
 // bindings are out of scope — they are not session-persisted yet.)
 func DeleteUser(ctx context.Context, c *Client, username string) error {
+	c.forgetExternalShadow(username)
 	now := c.NowTS()
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
@@ -202,7 +264,7 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 	}
 	if c.MayWriteCredentialTables() {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}},
+			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, c.oldColumnValue(t.TokenHash), t.ExpiresAt, scope, nowRFC3339(), now}},
 			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
 		})
 	}
@@ -360,7 +422,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	now := c.NowTS()
 	if c.MayWriteCredentialTables() {
 		if err := c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}},
+			{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}},
 		}); err != nil {
 			return "", err

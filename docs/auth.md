@@ -28,6 +28,45 @@ Roles map to *principal IDs*: `user:<subject>@<realm>` and
 `group:<name>@<realm>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
 
+### External users and local accounts share one name space
+
+A user's first LDAP or OIDC login creates a row in the users table with no
+local password (a "shadow"), so roles and audit can name it. Because users
+are keyed by name alone, an external login is refused when the name belongs
+to a local account, which would otherwise hand the external principal that
+account's role.
+
+Once `credentials_clear_v1` has latched (docs/upgrades.md), every local
+account's users row also has an empty password column, so a host decides
+"external" only on positive evidence: an empty credential row for the user,
+written when the shadow was made after `credentials_split_v1`, by a host's
+first split pass for a shadow that host could vouch for, or by an
+administrator. When a host cannot tell, the login is refused:
+
+- `Unavailable` ("retry") while the host has not synced or not finished its
+  first credentials pass: retry, or log in through another host;
+- `FailedPrecondition`, naming the command below, when the host is up to date
+  and still holds no evidence. That is an external user created before
+  `credentials_split_v1` latched on a host that has since been removed without
+  running this build. If the user is external, an administrator marks it:
+
+  ```bash
+  lv user mark-external <username>
+  ```
+
+  The command is audited (`user.mark-external`, refusals included),
+  admin-only, refused while the host it runs on sees any local password for
+  the name (in the users row, or in a credential row, live or deleted), and
+  refused while that host has not caught up with its peers. The mark is an
+  empty credential row with a timestamp older than any real write, so it never
+  replaces a password. It holds for the account as it stands when it is made:
+  if the user is deleted and created again, the login is refused again until an
+  administrator decides again.
+
+A host that has not synced its users table yet also refuses to create a NEW
+shadow (`Unavailable`): "no row under this name" there may only mean the
+local account has not arrived, and the new row would replace it everywhere.
+
 ### OIDC realm keys
 
 Under `auth.realms[].oidc:`. `issuer_url`, `client_id`, and `redirect_url` are
@@ -752,10 +791,10 @@ secrets to `host_fence_credentials`, `user_credentials` and
 `token_credentials`, which only the sensitive lane below carries. This release
 keeps writing the three old columns too, so a host still reading only those
 columns (one on the previous release, including one rolled back and under WAL
-quarantine) reads current secrets. The state dump therefore **still carries
-the secrets**. Clearing the old columns, after which the dump carries none, is a
-later release's step (see
-[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll) and
+quarantine) reads current secrets, and the state dump **still carries the
+secrets**. Once every host runs a build carrying `credentials_clear_v1` as
+well, the old columns are emptied and the dump carries none (see
+[upgrades.md](upgrades.md#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 All three RPCs stay peer-only regardless: only a **peer** or **local-root**
 caller (a cluster host certificate) can read them. An operator or admin bearer,

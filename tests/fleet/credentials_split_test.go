@@ -219,6 +219,10 @@ func previousReleaseTokenValid(t *testing.T, n *Node, raw string) bool {
 func latchAndSplit(t *testing.T, nodes ...*Node) {
 	t.Helper()
 	for _, n := range nodes {
+		// As the daemon does at start (a no-op once recorded).
+		if err := n.DB.NoteCredentialsBaseline(context.Background()); err != nil {
+			t.Fatalf("%s baseline: %v", n.Name, err)
+		}
 		n.DB.SetCredentialsSplitGate(func() bool { return true })
 		if _, err := n.DB.SplitCredentials(context.Background()); err != nil {
 			t.Fatalf("%s split: %v", n.Name, err)

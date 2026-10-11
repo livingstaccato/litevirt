@@ -396,6 +396,25 @@ type Client struct {
 	// Atomic: read on replication goroutines that may already run when set.
 	credentialsSplit atomic.Pointer[func() bool]
 
+	// credentialsClear, when non-nil and returning true (and credentialsSplit
+	// too), makes writers and the split pass EMPTY the old secret columns.
+	// Injected via SetCredentialsClearGate, wired to
+	// DurablyLatched(CredentialsClearV1). Fails CLOSED when unset: the old
+	// columns keep their secrets, the dual-write build's behaviour.
+	credentialsClear atomic.Pointer[func() bool]
+
+	// credentialsLive is set once this node has completed a SplitCredentials
+	// pass with the split gate open (credentials_live.go); durable through
+	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
+	credentialsLive        atomic.Bool
+	credentialsLiveChecked atomic.Bool
+	// The credentials baseline and the external-seen set
+	// (credentials_live.go), guarded by externalSeenMu.
+	externalSeenMu  sync.Mutex
+	baselineLoaded  bool
+	baselineSet     map[userIdentity]bool
+	externalSeenSet map[userIdentity]bool
+
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable
 	// host_membership_split_v1 latch. Fails CLOSED when unset, for the

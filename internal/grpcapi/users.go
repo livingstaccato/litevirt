@@ -102,6 +102,15 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// `lv role grant`.
 	if realmName != "local" {
 		if err := auth.EnsureUserShadow(ctx, s.db, principal, "viewer"); err != nil {
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" shadow refused", "denied")
+			switch {
+			case errors.Is(err, auth.ErrShadowPending):
+				return nil, status.Errorf(codes.Unavailable, "retry: %v", err)
+			case errors.Is(err, auth.ErrExternalUnproven):
+				return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+			case errors.Is(err, auth.ErrLocalAccount):
+				return nil, status.Errorf(codes.PermissionDenied, "%v", err)
+			}
 			return nil, status.Errorf(codes.Internal, "shadow user: %v", err)
 		}
 	}
@@ -346,6 +355,52 @@ func (s *Server) ListUsers(ctx context.Context, _ *emptypb.Empty) (*pb.ListUsers
 		resp.Users = append(resp.Users, pbUser)
 	}
 	return resp, nil
+}
+
+// MarkUserExternal is an administrator's affirmative, audited statement that an
+// existing user with no local password is an external-realm (LDAP/OIDC) user.
+// It writes the positive evidence an external login needs once the old secret
+// columns are cleared (corrosion.MarkUserExternal): an empty credential row at
+// a timestamp decades back, which never replaces a real credential anywhere,
+// and which holds only for the users row as it stands now.
+//
+// Refused for an account with any local-credential evidence in view (a
+// password in its old column, or a credential row with one, live or
+// tombstoned), and on a node whose replica has not caught up — there a missing
+// credential row may only be one that has not arrived yet. Every refusal is
+// audited.
+func (s *Server) MarkUserExternal(ctx context.Context, req *pb.MarkUserExternalRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if !s.db.UsersSynced() {
+		_, why := s.db.ReplicaCaughtUp()
+		s.audit(ctx, "user.mark-external", req.Username, "replica not caught up: "+why, "denied")
+		return nil, status.Errorf(codes.Unavailable,
+			"retry: this node's replica has not caught up with its peers (%s), so it cannot tell "+
+				"whether %q holds a local password elsewhere", why, req.Username)
+	}
+	err := corrosion.MarkUserExternal(ctx, s.db, req.Username)
+	switch {
+	case err == nil:
+	case errors.Is(err, corrosion.ErrUserNotExternalCandidate):
+		s.audit(ctx, "user.mark-external", req.Username, "has a local password or does not exist", "denied")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"user %q does not exist or holds a local password; only an account with no local "+
+				"password can be marked external", req.Username)
+	case errors.Is(err, corrosion.ErrCredentialTablesNotLatched):
+		s.audit(ctx, "user.mark-external", req.Username, "credentials_split_v1 not latched", "denied")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"credentials_split_v1 has not latched on this node; external users need no mark until it has")
+	default:
+		s.audit(ctx, "user.mark-external", req.Username, "error", "denied")
+		return nil, status.Errorf(codes.Internal, "mark %q external: %v", req.Username, err)
+	}
+	s.audit(ctx, "user.mark-external", req.Username, "by="+callerUsername(ctx), "ok")
+	return &emptypb.Empty{}, nil
 }
 
 func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*emptypb.Empty, error) {

@@ -35,8 +35,8 @@ import (
 // that is newer than the credential row it replaces. Every node computes the
 // same row from the same write, so the replicas agree, and sensitive-lane
 // anti-entropy repairs one that missed the entry from any that did not. Empty
-// values (the clears the first credentials_split_v1 build emitted) are never
-// absorbed.
+// values (the clears credentials_clear_v1 emits, and the first
+// credentials_split_v1 build emitted) are never absorbed.
 //
 // A node whose own gate is open may create the row (insert). A node whose gate
 // is still closed only UPDATES a row it already holds: such rows exist only

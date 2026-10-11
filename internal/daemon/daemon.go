@@ -349,6 +349,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
+	// Record, once, whether this node held users rows before anything could
+	// replicate in: the positive evidence an external-realm login needs on a
+	// node that is not credentials-live yet (corrosion/credentials_live.go).
+	if err := d.db.NoteCredentialsBaseline(ctx); err != nil {
+		return fmt.Errorf("record the credentials baseline: %w", err)
+	}
 
 	// Derive the cluster record from this node's CA if the cluster has none.
 	// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why
@@ -611,6 +617,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireLeaseTermLedgerGate()
 	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
+	d.wireCredentialsClearGate()
 	d.wireClusterPolicyGate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
@@ -641,7 +648,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.runPendingAuditFold(ctx)
 
 	// Move the secret columns onto the sensitive lane once credentials_split_v1
-	// has durably latched. Inert until then; see corrosion.SplitCredentials.
+	// has durably latched, and empty them once credentials_clear_v1 has too.
+	// Inert until then; see corrosion.SplitCredentials.
 	go d.runCredentialsSplit(ctx)
 
 	// Give host state and isolation their own row once host_membership_split_v1
@@ -2891,6 +2899,33 @@ func CredentialsSplitLatchedOnDisk(dataDir string) func() bool {
 	}
 }
 
+// wireCredentialsClearGate lets corrosion EMPTY the old secret columns once
+// credentials_clear_v1 is DURABLY latched (corrosion.MayClearCredentialColumns
+// also requires the split gate, so a node never empties its only copy).
+//
+// No config flag: the clear begins on its own once every replication
+// recipient runs a build that never needs the old columns. Unwired, the gate
+// fails closed and every old column keeps its secret, which is the dual-write
+// build's behaviour.
+func (d *Daemon) wireCredentialsClearGate() {
+	d.db.SetCredentialsClearGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.CredentialsClearV1)
+	})
+}
+
+// CredentialsClearLatchedOnDisk is the credentials_clear_v1 gate for a process
+// that is NOT the daemon — `lv user reset-admin` opens the local database
+// directly. It reads the same durable activation marker Checker.DurablyLatched
+// is backed by, so the CLI empties the old column exactly when the daemon on
+// that node would.
+func CredentialsClearLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.CredentialsClearV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
 // credentialsSplitInterval is how often the daemon re-runs the credentials
 // split. Each pass is a few indexed reads when there is nothing to do.
 const credentialsSplitInterval = time.Minute
@@ -2904,8 +2939,9 @@ func (d *Daemon) runCredentialsSplit(ctx context.Context) {
 	for {
 		if rep, err := d.db.SplitCredentials(ctx); err != nil {
 			slog.Warn("credentials split: pass failed", "error", err)
-		} else if rep.Copied > 0 {
-			slog.Info("credentials split: copied secrets onto the sensitive lane", "copied", rep.Copied)
+		} else if rep.Copied > 0 || rep.Cleared > 0 {
+			slog.Info("credentials split: moved secrets onto the sensitive lane",
+				"copied", rep.Copied, "cleared", rep.Cleared)
 		}
 		select {
 		case <-ctx.Done():

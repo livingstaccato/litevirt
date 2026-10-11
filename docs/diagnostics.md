@@ -1050,7 +1050,15 @@ observed → confirmed → resolved lifecycle:
   cannot see them completely. Hosts are probed one by one, so a scan can read
   a migration's source before the cutover and its target after it; the
   re-probe settles that, and a real dual run is still recorded in the same
-  scan;
+  scan. A domain that libvirt undefines while a host is being probed (a
+  migration source at the end of its cutover) is reported absent, not as a
+  probe error: it was in the host's domain list and libvirt then answered "no
+  such domain" for it. Any other per-domain error still makes the host's
+  answer partial, and a partial re-probe leaves the sighting standing. Nor
+  does a re-probe ever narrow a workload that already has an open
+  `vm_dual_run` / `ct_dual_run`: a real dual run whose second copy flaps is
+  missed by a re-probe now and then, and counting those scans clean would
+  resolve it while both copies run;
 - resolution needs **two consecutive clean scans with complete coverage** by
   the detector lease holder under a valid decision gate — an unreachable,
   partial, or older-binary peer blocks resolution (blind is not clean);
@@ -1380,9 +1388,13 @@ it the owner of a VM that was rescheduled and is running elsewhere, and an
 unguarded sync would replicate `stopped` over the real owner's row (the VM
 lists as stopped while it runs; the owner's health sweep flips it back each
 time). This guard is on in every configuration; with `enforcement.owner_epoch`
-enabled and latched the write is additionally epoch-conditioned. Expect the
-deferral to last up to one anti-entropy interval (`anti_entropy_interval_sec`,
-60 s by default) after a restart. A single-node cluster — no other host in the
+enabled and latched the write is additionally epoch-conditioned. While the
+replica is not caught up, the anti-entropy loop tries an exchange every few
+seconds (starting right after the daemon starts, and right after it loses
+sight of every peer) instead of waiting for its interval
+(`anti_entropy_interval_sec`), so with a peer reachable the deferral lasts
+seconds. Passes are still at least 12 s apart, so a first try that finds no
+peer yet costs up to about 12 s. A single-node cluster — no other host in the
 hosts table — is not gated. The same sync is also withheld, on a current
 replica, while the VM has an active ownership condition (`vm_dual_run`,
 `runtime_owner_mismatch`, `owner_epoch_mismatch`), matching the self-heal
@@ -1400,7 +1412,7 @@ and `lv compose up` / `lv compose down`. Until the serving host's replica has
 caught up, they fail with `Unavailable` and nothing is touched:
 
 ```
-DeleteVM refused on node-1: this node's replica has not caught up with the cluster yet (...), so it cannot tell which host owns the workload now. Retry in a minute, or run the command against another node
+DeleteVM refused on node-1: this node's replica has not caught up with the cluster yet (no anti-entropy exchange with a peer has completed since this process started; 3s so far), so it cannot tell which host owns the workload now. It retries the exchange every few seconds and this clears as soon as one peer answers — retry shortly, or run the command against another node
 ```
 
 Served from a stale record, such a command acts on the wrong copy and writes
@@ -1410,7 +1422,10 @@ seconds before its first anti-entropy exchange. It destroyed its own shut-off
 leftover and tombstoned the record naming itself, and that tombstone replaced
 the owner's record everywhere — the VM kept running on node-4 with no record.
 Retry after the `replica caught up` journal line, or run the command on any
-other host. A single-node cluster is not gated.
+other host. With a peer reachable that line follows a daemon restart within
+seconds; the refusal says how long the node has been waiting, so a count that
+keeps growing points at the peers rather than the node (see below). A
+single-node cluster is not gated.
 
 A host whose peers are all down cannot catch up, so it refuses these commands
 until one of them answers. That is deliberate: it cannot know whether another

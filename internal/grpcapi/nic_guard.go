@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -311,6 +312,13 @@ func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.N
 			return nil, status.Errorf(codes.InvalidArgument, "network %q allowed addresses: %v", att.GetName(), aerr)
 		}
 		same := decisions[i].carry
+		if same != nil {
+			// A guard this re-create carries must be writable here before the
+			// create claims anything (switch re-review 2, R2).
+			if err := s.requireGuardsWritable(ctx, "the guard network "+strconv.Quote(att.GetName())+" carries"); err != nil {
+				return nil, err
+			}
+		}
 		if !nicGuardExplicit(att) {
 			continue
 		}
@@ -466,14 +474,8 @@ func (s *Server) writeNewNICGuards(ctx context.Context, recs []corrosion.NICGuar
 				"vm", recs[0].VMName, "nics", len(recs))
 			return nil
 		}
-		if s.gate != nil {
-			s.gate.Enforced(ctx, capabilities.FailoverScopeV1) // form this host's latch, as a joiner's lags
-		}
-		if !s.db.MayWriteClusterPolicy() {
-			return status.Errorf(codes.FailedPrecondition,
-				"the guard of NIC %s cannot be recorded on %s until failover_scope_v1 has latched here; a guard the request "+
-					"asked for, or one a re-create carries, is never dropped: retry once it has (`lv cluster upgrade-status`)",
-				must[0].MAC, s.hostName)
+		if err := s.requireGuardsWritable(ctx, "the guard of NIC "+must[0].MAC); err != nil {
+			return err
 		}
 	}
 	if len(must) > 0 {
@@ -509,6 +511,47 @@ func (s *Server) writeNewNICGuards(ctx context.Context, recs []corrosion.NICGuar
 	}
 	slog.Warn("NIC guard: creating NICs unguarded; the release gate did not grant their default guards in time "+
 		"(see `lv cluster upgrade-status`)", "vm", defaults[0].VMName, "nics", len(defaults), "error", err)
+	return nil
+}
+
+// requireGuardsWritable is what a write of a guard that must not be dropped
+// needs on this host: the cluster_policies gate, its failover_scope_v1 latch,
+// open. A host that just joined may lag it, so the latch is driven here
+// first; if it still cannot form, the write is refused with
+// FailedPrecondition (switch re-review N1).
+func (s *Server) requireGuardsWritable(ctx context.Context, what string) error {
+	if s.db.MayWriteClusterPolicy() {
+		return nil
+	}
+	if s.gate != nil {
+		s.gate.Enforced(ctx, capabilities.FailoverScopeV1) // form this host's latch, as a joiner's lags
+	}
+	if s.db.MayWriteClusterPolicy() {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"%s cannot be recorded on %s until failover_scope_v1 has latched here; a guard the request asked for, or one "+
+			"a re-create carries, is never dropped: retry once it has (`lv cluster upgrade-status`)", what, s.hostName)
+}
+
+// requireGuardCarryPossible refuses, BEFORE a rebuild or a re-create deletes
+// vm, a re-create whose NICs have guard records this host could not carry
+// (requireGuardsWritable), so a refusal leaves the VM as it was instead of
+// deleted and not re-created (switch re-review 2, R2).
+func (s *Server) requireGuardCarryPossible(ctx context.Context, vm *corrosion.VMRecord) error {
+	if vm == nil || s.db.MayWriteClusterPolicy() {
+		return nil
+	}
+	recs, err := corrosion.ListNICGuards(ctx, s.db)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "read the NIC guards of %s: %v", vm.Name, err)
+	}
+	uuid := specUUID(vm.Spec)
+	for _, r := range recs {
+		if r.VMName == vm.Name && (r.VMUUID == "" || uuid == "" || r.VMUUID == uuid) {
+			return s.requireGuardsWritable(ctx, fmt.Sprintf("the NIC guards %s's re-create carries", vm.Name))
+		}
+	}
 	return nil
 }
 

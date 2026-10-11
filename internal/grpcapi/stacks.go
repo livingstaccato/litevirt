@@ -303,7 +303,21 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			return err
 		}
 	}
-	if err := corrosion.DeleteStackFirewall(ctx, s.db, f.Name); err != nil {
+	// The stack's default never fails open (switch re-review 2, R1): a
+	// default-deny the new config asks for is in force before any row is torn
+	// down, and the stack's default row is not torn down with its rows — it
+	// goes only once the new config's rows are written, and only when the new
+	// config drops default-deny. A redeploy that fails part way leaves the
+	// cluster denying, with fewer accepts: fail closed.
+	wantDeny := f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
+	if wantDeny {
+		// Compose sets the cluster-wide default; per-host overrides live in
+		// host config (lv firewall default-deny <host>).
+		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
+			return fmt.Errorf("default-deny: %w", err)
+		}
+	}
+	if err := corrosion.DeleteStackFirewallRows(ctx, s.db, f.Name); err != nil {
 		return err
 	}
 
@@ -357,12 +371,10 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 				return fmt.Errorf("cluster rule: %w", err)
 			}
 		}
-		if fd.DefaultDeny {
-			// Compose sets the cluster-wide default; per-host overrides live in
-			// host config (lv firewall default-deny <host>).
-			if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
-				return fmt.Errorf("default-deny: %w", err)
-			}
+	}
+	if !wantDeny {
+		if err := corrosion.DeleteStackFirewallDefaults(ctx, s.db, f.Name); err != nil {
+			return fmt.Errorf("default-deny: %w", err)
 		}
 	}
 	return nil

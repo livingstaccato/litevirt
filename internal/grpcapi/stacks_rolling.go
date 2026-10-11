@@ -56,8 +56,10 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	cur, _ := corrosion.GetVM(ctx, o.s.db, target)
 	if cur != nil {
 		host := cur.HostName
-		var perr error
-		if spec.GetIso() != "" {
+		// A guard this host could not carry is refused before the delete
+		// (switch re-review 2, R2).
+		perr := o.s.requireGuardCarryPossible(ctx, cur)
+		if perr == nil && spec.GetIso() != "" {
 			if host, perr = o.s.placeRecreate(ctx, spec, cur); perr == nil {
 				decision = &resolvedCreateVMDecision{resolvedHost: host, placedHere: true}
 			}

@@ -16,6 +16,8 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // relGate is a release-feature gate that is closed (the release token has not
@@ -583,5 +585,122 @@ firewall:
 		t.Errorf("a refused redeploy changed the stack's rows: groups %+v, cluster rules %+v", sgs, rules)
 	} else if r, _ := corrosion.ListSGRules(ctx, s.db, sgs[0].ID); len(r) != 2 {
 		t.Errorf("a refused redeploy changed the stack's rules: %+v", r)
+	}
+}
+
+// TestSwitchFix3_StackDefaultNeverFailsOpen (switch re-review 2, R1): a
+// redeploy of a stack with default-deny whose row rewrite fails part way —
+// here the second security-group rule insert — leaves the cluster default
+// denying: the default is not torn down with the rows.
+func TestSwitchFix3_StackDefaultNeverFailsOpen(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	s.SetReleaseFeatureGate(&relGate{t: t, open: true})
+	f, err := compose.ParseBytes([]byte(`
+name: dd
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+      - {direction: ingress, proto: tcp, port: "443", cidr: "10.0.0.0/8", action: accept}
+firewall:
+  default-deny: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.DB().ExecContext(ctx, `CREATE TRIGGER r1_fail_second BEFORE INSERT ON sg_rules
+		WHEN (SELECT COUNT(*) FROM sg_rules WHERE deleted_at IS NULL) >= 1
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, f); err == nil {
+		t.Fatal("fixture: the redeploy did not fail")
+	}
+	if def, err := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); err != nil || def == nil || !def.DefaultDeny {
+		t.Errorf("a redeploy that failed part way left the cluster default-allow: %+v %v", def, err)
+	}
+	// A redeploy that drops default-deny removes the stack's default once its
+	// rows are written.
+	if _, err := s.db.DB().ExecContext(ctx, `DROP TRIGGER r1_fail_second`); err != nil {
+		t.Fatal(err)
+	}
+	f2, err := compose.ParseBytes([]byte(`
+name: dd
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.persistStackFirewall(ctx, f2); err != nil {
+		t.Fatal(err)
+	}
+	if def, _ := corrosion.GetFirewallDefault(ctx, s.db, "cluster"); def != nil {
+		t.Errorf("a redeploy that dropped default-deny kept the stack's default: %+v", def)
+	}
+}
+
+// r3GuardedVM is a VM on this host whose NIC has a guard record, on a host
+// whose own failover_scope_v1 latch has not formed and cannot form here.
+func r3GuardedVM(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	const mac = "52:54:00:00:0e:01"
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped",
+		Spec: `{"name":"web","uuid":"u-web","cpu":1,"memory_mib":256,"network":[{"name":"lan"}]}`},
+		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "lan", MAC: mac}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards),
+		corrosion.NICGuardRecord{VMName: "web", MAC: mac, Mode: corrosion.NICGuardOn, VMUUID: "u-web", Network: "lan"}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.SetClusterPolicyGate(func() bool { return false })
+}
+
+// TestSwitchFix3_CarriedGuardRefusedBeforeTheDelete (switch re-review 2, R2):
+// a rebuild or a stack's re-create of a VM whose guard this host could not
+// carry (its own failover_scope_v1 latch cannot form) is refused before the
+// old incarnation is deleted, so the VM is left as it was.
+func TestSwitchFix3_CarriedGuardRefusedBeforeTheDelete(t *testing.T) {
+	ctx := adminCtx()
+	for _, how := range []string{"rebuild", "recreate"} {
+		t.Run(how, func(t *testing.T) {
+			s := guardServer(t, true)
+			s.virt = libvirtfake.New()
+			s.dataDir = t.TempDir()
+			s.images = image.NewStore(s.dataDir)
+			_ = s.images.Init()
+			r3GuardedVM(t, s)
+			var err error
+			if how == "rebuild" {
+				_, err = s.RebuildVM(ctx, &pb.RebuildVMRequest{Name: "web"})
+			} else {
+				spec := &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256, Network: []*pb.NetworkAttachment{{Name: "lan"}}}
+				err = (&serverOps{s: s}).RecreateVM(ctx, "web", spec)
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "failover_scope_v1") {
+				t.Errorf("%s of a guarded VM this host could not carry: %v, want a FailedPrecondition naming failover_scope_v1", how, err)
+			}
+			if vm, _ := corrosion.GetVM(context.Background(), s.db, "web"); vm == nil {
+				t.Errorf("the %s was refused after the old incarnation was deleted", how)
+			}
+		})
+	}
+	// The create's own admission refuses a carried guard it cannot write,
+	// before it claims anything.
+	s := guardServer(t, true)
+	r3GuardedVM(t, s)
+	vm, _ := corrosion.GetVM(context.Background(), s.db, "web")
+	_, err := s.admitNICGuards(withReplacedVM(ctx, vm), "web",
+		[]*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:00:0e:01"}}, admitRecreate)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "failover_scope_v1") {
+		t.Errorf("admitting a re-create carrying a guard this host cannot write: %v, want FailedPrecondition", err)
 	}
 }

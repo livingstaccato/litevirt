@@ -356,6 +356,50 @@ func DeleteFirewallDefault(ctx context.Context, c *Client, scope string) error {
 // its security groups (+ their rules), ip sets, cluster/host tier rules, and
 // any default-deny policy it set. Called from `compose down`.
 func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
+	if err := DeleteStackFirewallRows(ctx, c, stack); err != nil {
+		return err
+	}
+	return DeleteStackFirewallDefaults(ctx, c, stack)
+}
+
+// DeleteStackFirewallDefaults tombstones the firewall_defaults rows a stack
+// set (its default-deny). A redeploy calls it only once the new config's rows
+// are written, and only when the new config drops default-deny, so a
+// redeploy that fails part way never leaves the cluster default-allow
+// (switch re-review 2, R1).
+func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) error {
+	if stack == "" {
+		return nil
+	}
+	now := c.NowTS()
+	wall := nowRFC3339()
+	return tombStackRows(ctx, c, stack, `SELECT scope AS pk FROM firewall_defaults WHERE stack_name = ? AND deleted_at IS NULL`,
+		func(pk string) error {
+			return c.Execute(ctx, `UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ? AND deleted_at IS NULL`, wall, now, pk)
+		})
+}
+
+// tombStackRows runs exec for the primary key of every row sel (one ?, the
+// stack) selects locally. Each replicating Execute carries its statement as a
+// LITERAL constant in exec, so the ledger/CI guard can resolve it; the local
+// SELECT is not replicated, so its SQL may vary.
+func tombStackRows(ctx context.Context, c *Client, stack, sel string, exec func(pk string) error) error {
+	rows, err := c.Query(ctx, sel, stack)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := exec(row.String("pk")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteStackFirewallRows tombstones a stack's firewall rows but not its
+// firewall_defaults row (DeleteStackFirewallDefaults): its security groups
+// (+ their rules), ip sets, and cluster/host tier rules.
+func DeleteStackFirewallRows(ctx context.Context, c *Client, stack string) error {
 	if stack == "" {
 		return nil
 	}
@@ -410,8 +454,5 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 		}); err != nil {
 		return err
 	}
-	return tomb(`SELECT scope AS pk FROM firewall_defaults WHERE stack_name = ? AND deleted_at IS NULL`,
-		func(pk string) error {
-			return c.Execute(ctx, `UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ? AND deleted_at IS NULL`, wall, now, pk)
-		})
+	return nil
 }

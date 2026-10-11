@@ -360,7 +360,10 @@ one until the release token has latched, and the first one records the use
 first. Before that, adding one fails with FailedPrecondition, "the cluster
 upgrade must finish first (firewall_ipv6 needs release_2026_11_v1)", naming
 the hosts still on the older build; IPv4 rules are unaffected. A malformed
-IPv6 rule is refused as malformed either way.
+IPv6 rule is refused as malformed either way. A stack deploy holding an IPv6
+row takes the `firewall_ipv6` first use before it replaces the stack's old
+rows, so the feature is recorded as used — and a rollback below the release
+then quarantines — even if a later row of that deploy fails.
 
 ## NIC guards
 

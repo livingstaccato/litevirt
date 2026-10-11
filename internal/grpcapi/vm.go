@@ -3347,6 +3347,12 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// of an Admin's authority. A VM with an installer ISO is placed now, as
 	// main placed it after the teardown, and judged by the host placement
 	// chose (judgeRecreateOn); the create below goes to that host.
+	// A guard this host could not carry is refused here too, with the VM
+	// intact (switch re-review 2, R2).
+	if err := s.requireGuardCarryPossible(ctx, vm); err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
 	rctx := withRecreateISOGrant(ctx, vm)
 	host, placed := s.hostName, false
 	if spec.GetIso() != "" {

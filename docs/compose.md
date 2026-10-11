@@ -1209,6 +1209,12 @@ vms:
         security-groups: ["web"]   # attach the SG to this NIC
 ```
 
+A redeploy replaces the stack's firewall rows, and keeps its `default-deny` in
+force throughout: a default-deny the new file asks for is set before the old
+rows go, and the stack's default is removed only once the new rows are written
+and only when the new file drops it. A redeploy that fails part way leaves the
+cluster denying, with fewer accepts, until the next one succeeds.
+
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See
 [`docs/firewall.md`](firewall.md) for the three-tier model and CLI surface.

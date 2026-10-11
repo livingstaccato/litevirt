@@ -661,11 +661,16 @@ func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureG
 		Placement: corrosion.PlacementOf(rec.CreateSpec), Incarnation: rec.CreatedAt,
 		Epoch: rec.OwnerEpoch, Keep: sched.KeepReplicas, Bases: s.containerBases(rec),
 	}
-	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, nil, func(pbsstore.PushProgress) {})
+	// The run pushes into the target's backup repo repoName, so the repo's
+	// backup_bwlimits entry on this host paces it, as it paces a backup into
+	// that repo pushed to its host: the shared per-repo throttle, over the
+	// archive read and the chunks sent. A schedule has no per-job limit.
+	lim := s.backupRateLimit(ctx, repoName, 0)
+	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, lim, func(pbsstore.PushProgress) {})
 	if err != nil {
 		return fmt.Errorf("archive container: %w", err)
 	}
-	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest, nil); err != nil {
+	if err := s.pushManifestToPeerRepo(ctx, target, containerReplicaRepo(project, repoName), staging, manifest, lim); err != nil {
 		if status.Code(err) == codes.Unavailable {
 			return &replTargetDownError{host: target, err: err}
 		}

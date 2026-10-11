@@ -170,8 +170,11 @@ parent, are not read and cost nothing) and, for a remote backup, the chunks
 sent to the repo's host. For a remote backup the host you call (the repo's
 host) hands the lower of the job limit and its own `backup_bwlimits` entry
 for the repo to the host that reads the disk. A host on an older release
-ignores the field and backs up unlimited. Restores and replication are not
-rate-limited.
+ignores the field and backs up unlimited. A container replication run pushes
+into a backup repo on its target host, so the owner's `backup_bwlimits` entry
+for that repo (the schedule's `--target-pool`) paces it too, sharing the
+repo's limit with backups into it: the archive it reads and the chunks it
+sends. Restores and VM disk replication are not rate-limited.
 
 A target limit is enforced per host: two hosts backing up into the same repo
 each get the full limit.
@@ -740,7 +743,9 @@ different decision.
 the way a VM schedule replicates a disk. A container has no storage pool, so
 `--target-host` names the peer that holds the replica and `--target-pool` the
 backup repo on it: a logical repo name that peer has in its `backup_repos`
-config (or a repo registered cluster-wide).
+config (or a repo registered cluster-wide). A run is paced by the owner's
+`backup_bwlimits` entry for that repo name, if it has one (see
+[Bandwidth limits](#bandwidth-limits)).
 
 ```bash
 lv replication schedule add web --container --cron "0 * * * *" \

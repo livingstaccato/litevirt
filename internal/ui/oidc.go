@@ -3,7 +3,6 @@ package ui
 import (
 	"encoding/base64"
 	"log/slog"
-	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // The flow cookie binds an OIDC login to the browser that began it. It
@@ -22,9 +22,13 @@ import (
 // began (login CSRF, RFC 6749 §10.12), and a (code, state) pair lifted from a
 // URL redeems nothing anywhere (RFC 9700 §4.5).
 //
-// Over https it is a __Host- cookie (Secure, Path=/, no Domain), so a sibling
-// host cannot plant one (cookie tossing). Plain http (a loopback developer
-// setup) cannot carry that prefix and uses the plain name.
+// Which cookie is decided by the realm's configured redirect_url, the URL the
+// browser actually comes back on — not by anything in the request (a proxy
+// that omits X-Forwarded-Proto must not downgrade it): an https redirect gets
+// a __Host- cookie (Secure, Path=/, no Domain), so a sibling host or a
+// plain-http answer for the name cannot plant one (cookie tossing), and the
+// callback for such a realm accepts only that cookie. Only a plain-http
+// redirect — allowed solely to a loopback address — uses the plain name.
 const (
 	oidcFlowCookieName       = "lv_oidc_flow"
 	oidcFlowCookieNameSecure = "__Host-lv_oidc_flow"
@@ -65,7 +69,7 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.grpc.BeginOIDCLogin(r.Context(), &pb.BeginOIDCLoginRequest{
-		Realm: realm, Client: "web", ClientAddress: browserAddress(r),
+		Realm: realm, Client: "web", ClientAddress: auth.ClientAddress(r, s.trustedProxies),
 	})
 	if err != nil {
 		slog.Warn("UI OIDC login could not begin", "realm", realm, "code", status.Code(err), "error", status.Convert(err).Message())
@@ -83,7 +87,9 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 			maxAge = secs
 		}
 	}
-	c := oidcFlowCookie(r)
+	secure := strings.HasPrefix(strings.ToLower(resp.RedirectUri), "https://")
+	s.oidcSecureRealms.Store(realm, secure)
+	c := oidcFlowCookie(secure)
 	c.Value = resp.Binding + "." + base64.RawURLEncoding.EncodeToString([]byte(realm))
 	c.MaxAge = maxAge
 	http.SetCookie(w, c)
@@ -105,8 +111,8 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	q := r.URL.Query()
-	binding, cookieRealm := readOIDCFlowCookie(r)
-	clearOIDCFlowCookie(w, r)
+	binding, cookieRealm := s.readOIDCFlowCookie(r)
+	clearOIDCFlowCookies(w)
 	page := loginPageData{Realms: s.availableRealms(), OIDCRealms: s.oidcRealms()}
 
 	if idpErr := q.Get("error"); idpErr != "" {
@@ -238,18 +244,9 @@ func oidcLoginFailureMessage(err error) string {
 	return msgOIDCFailed
 }
 
-// browserAddress is the browser's address as this UI sees it (the TCP peer;
-// a forwarding header is not trusted).
-func browserAddress(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// oidcFlowCookie is the flow cookie's attributes for r: __Host- over https.
-func oidcFlowCookie(r *http.Request) *http.Cookie {
+// oidcFlowCookie is the flow cookie's attributes: __Host- (Secure) when the
+// realm's redirect is https.
+func oidcFlowCookie(secure bool) *http.Cookie {
 	c := &http.Cookie{
 		Name:     oidcFlowCookieName,
 		Path:     "/",
@@ -258,7 +255,7 @@ func oidcFlowCookie(r *http.Request) *http.Cookie {
 		// carries a Lax cookie; a cross-site subrequest does not.
 		SameSite: http.SameSiteLaxMode,
 	}
-	if requestIsHTTPS(r) {
+	if secure {
 		c.Name = oidcFlowCookieNameSecure
 		c.Secure = true
 	}
@@ -266,12 +263,23 @@ func oidcFlowCookie(r *http.Request) *http.Cookie {
 }
 
 // readOIDCFlowCookie returns the binding secret and realm the browser's flow
-// cookie carries ("" when there is none or it is malformed).
-func readOIDCFlowCookie(r *http.Request) (binding, realm string) {
-	name := oidcFlowCookieName
-	if requestIsHTTPS(r) {
-		name = oidcFlowCookieNameSecure
+// cookie carries ("" when there is none, it is malformed, or it is a plain
+// cookie for a realm whose redirect is https — a planted one).
+func (s *Server) readOIDCFlowCookie(r *http.Request) (binding, realm string) {
+	if b, rn := parseOIDCFlowCookie(r, oidcFlowCookieNameSecure); b != "" {
+		return b, rn
 	}
+	b, rn := parseOIDCFlowCookie(r, oidcFlowCookieName)
+	if b == "" {
+		return "", ""
+	}
+	if secure, known := s.oidcSecureRealms.Load(rn); !known || secure.(bool) {
+		return "", ""
+	}
+	return b, rn
+}
+
+func parseOIDCFlowCookie(r *http.Request, name string) (binding, realm string) {
 	c, err := r.Cookie(name)
 	if err != nil || c.Value == "" {
 		return "", ""
@@ -287,10 +295,13 @@ func readOIDCFlowCookie(r *http.Request) (binding, realm string) {
 	return b, string(rb)
 }
 
-func clearOIDCFlowCookie(w http.ResponseWriter, r *http.Request) {
-	c := oidcFlowCookie(r)
-	c.MaxAge = -1
-	http.SetCookie(w, c)
+// clearOIDCFlowCookies expires both flow cookie names.
+func clearOIDCFlowCookies(w http.ResponseWriter) {
+	for _, secure := range []bool{true, false} {
+		c := oidcFlowCookie(secure)
+		c.MaxAge = -1
+		http.SetCookie(w, c)
+	}
 }
 
 // noStore keeps an auth response (it carries a code in its URL or a handle in

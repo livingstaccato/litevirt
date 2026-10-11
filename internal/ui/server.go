@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -73,7 +74,20 @@ type Server struct {
 	// tlsConfig, when set (ACME enabled, #13), makes ListenAndServe terminate
 	// TLS itself. Nil = plain HTTP (default; e.g. behind a fronting proxy).
 	tlsConfig *tls.Config
+
+	// trustedProxies are the reverse proxies whose X-Forwarded-For header
+	// names the browser (config trusted_proxies; auth.ClientAddress).
+	trustedProxies []netip.Prefix
+
+	// oidcSecureRealms remembers, per OIDC realm, whether its redirect_url is
+	// https (from BeginOIDCLogin), so the callback knows which flow cookie
+	// to accept: the __Host- one for an https redirect, never a plain one.
+	oidcSecureRealms sync.Map // realm → bool
 }
+
+// SetTrustedProxies sets the reverse proxies whose X-Forwarded-For header
+// names the browser.
+func (s *Server) SetTrustedProxies(p []netip.Prefix) { s.trustedProxies = p }
 
 // SetTLSConfig enables TLS termination on the UI listener (ACME, #13).
 func (s *Server) SetTLSConfig(c *tls.Config) { s.tlsConfig = c }

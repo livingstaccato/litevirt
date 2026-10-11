@@ -149,9 +149,10 @@ const (
 // defaultMaxOIDCFlows bounds the in-flight flows one realm holds. Beginning a
 // flow needs no credential, so without a bound anyone who can reach the node
 // could grow this map for the length of the state expiry. When it is full the
-// OLDEST flow is evicted rather than the new one refused, so a flood cannot
-// lock real users out; defaultMaxOIDCFlowsPerAddr stops one address from
-// filling it at all.
+// oldest flow of the address holding the most is evicted rather than the
+// new one refused, so a flood cannot lock real users out;
+// defaultMaxOIDCFlowsPerAddr stops one address (an IPv6 /64) from filling it:
+// over it, that address's own oldest flow goes.
 const (
 	defaultMaxOIDCFlows        = 4096
 	defaultMaxOIDCFlowsPerAddr = 16
@@ -163,14 +164,14 @@ const (
 var ErrOIDCFlowUnknown = fmt.Errorf("%w: OIDC login state unknown, expired or already used on this node "+
 	"(a login must finish on the node it began on, within 10 minutes, once)", ErrInvalidCredentials)
 
-// ErrOIDCTooManyFlows: this client address already holds its bound of
-// in-flight flows.
+// ErrOIDCTooManyFlows: kept for callers that map it; BeginFlow no longer
+// refuses (an address over its bound loses its own oldest flow).
 var ErrOIDCTooManyFlows = errors.New("too many OIDC logins in progress from this address; finish one, or retry in a few minutes")
 
 // ErrOIDCFlowBindingMismatch: the flow exists but the redeemer did not present
 // the binding secret its beginner was given. The flow is consumed (single use)
 // and the code is never presented to the IdP. It wraps ErrInvalidCredentials.
-var ErrOIDCFlowBindingMismatch = fmt.Errorf("%w: this OIDC login was not begun by this client", ErrInvalidCredentials)
+var ErrOIDCFlowBindingMismatch = fmt.Errorf("%w: this OIDC login was not begun by this client (or the client is older than this node)", ErrInvalidCredentials)
 
 // ErrOIDCClientNotConfigured: the realm has no redirect for the requested
 // client (no cli_redirect_url for the CLI), or the configured one is unsafe.
@@ -318,17 +319,23 @@ func (r *OIDCRealm) BeginFlow(client, addr string) (OIDCFlowStart, error) {
 	}
 	verifier := oauth2.GenerateVerifier()
 	nonce := oauth2.GenerateVerifier()
+	key := flowAddrKey(addr)
 	r.mu.Lock()
 	r.pruneLocked(time.Now())
-	if r.flowsFromLocked(addr) >= r.maxFlowsPerAddr {
-		r.mu.Unlock()
-		return OIDCFlowStart{}, ErrOIDCTooManyFlows
+	// Nothing here refuses: a login always begins. An address over its
+	// bound loses ITS OWN oldest flow, so clients sharing an address (a
+	// proxy, a NAT) can never lock each other out with a handful of
+	// requests; a full realm loses the oldest flow of the address holding
+	// the most (fair share), so a user with one flow in progress survives a
+	// flood from any address holding more.
+	for r.flowsFromLocked(key) >= r.maxFlowsPerAddr {
+		r.evictOldestOfLocked(key)
 	}
 	for len(r.stateStore) >= r.maxFlows {
-		r.evictOldestLocked()
+		r.evictFairLocked()
 	}
 	exp := r.putFlowLocked(state, oidcFlow{verifier: verifier, nonce: nonce, redirect: redirect,
-		binding: sha256.Sum256([]byte(binding)), hasBinding: true, addr: addr})
+		binding: sha256.Sum256([]byte(binding)), hasBinding: true, addr: key})
 	r.mu.Unlock()
 	return OIDCFlowStart{
 		AuthURL:     r.authCodeURL(state, verifier, nonce, redirect),
@@ -623,16 +630,45 @@ func (r *OIDCRealm) flowsFromLocked(addr string) int {
 	return n
 }
 
-// evictOldestLocked drops the flow that expires first; r.mu must be held.
-func (r *OIDCRealm) evictOldestLocked() {
+// evictOldestOfLocked drops addr's flow that expires first; r.mu must be held.
+func (r *OIDCRealm) evictOldestOfLocked(addr string) {
 	var oldest string
 	var at time.Time
 	for s, f := range r.stateStore {
-		if oldest == "" || f.expiry.Before(at) {
+		if f.addr == addr && (oldest == "" || f.expiry.Before(at)) {
 			oldest, at = s, f.expiry
 		}
 	}
 	delete(r.stateStore, oldest)
+}
+
+// evictFairLocked drops the oldest flow of the address holding the most
+// flows; r.mu must be held.
+func (r *OIDCRealm) evictFairLocked() {
+	count := map[string]int{}
+	top := ""
+	for _, f := range r.stateStore {
+		count[f.addr]++
+		if top == "" || count[f.addr] > count[top] {
+			top = f.addr
+		}
+	}
+	r.evictOldestOfLocked(top)
+}
+
+// flowAddrKey is the key the per-address bound counts by: an IPv4 address
+// (an IPv4-mapped IPv6 one in its IPv4 form) as itself, an IPv6 address by
+// its /64 — one subscriber's allocation — so a single site cannot spread a
+// flood over 2^64 addresses. Anything else is used as given.
+func flowAddrKey(addr string) string {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return addr
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 func (r *OIDCRealm) pruneLocked(now time.Time) {

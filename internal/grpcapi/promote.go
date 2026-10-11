@@ -844,9 +844,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	spec.Name = targetName
 	// The stored tuning is validated again (and dropped before the gate opens)
 	// so a record from before a rollback cannot define what the cluster refuses.
-	_, ioG, err := s.restrictRestoredTuning(ctx, &spec)
+	ioStripped, ioG, err := s.restrictRestoredTuning(ctx, &spec)
 	if err != nil {
 		return err
+	}
+	if ioStripped {
+		// The domain below is defined from the stripped spec. A takeover keeps the
+		// row's own spec, so the two differ until the next redefine renders it.
+		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain (the gate is closed on this host)",
+			"vm", targetName)
 	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs

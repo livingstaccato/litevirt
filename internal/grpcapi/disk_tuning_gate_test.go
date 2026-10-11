@@ -21,20 +21,26 @@ type ioGate struct {
 	t      testing.TB
 	on     bool
 	grants *int
+	// latchedButRefuses models a latched token whose first use cannot be
+	// acknowledged: FeatureAvailable is true, WithFeature refuses.
+	latchedButRefuses bool
 }
 
 func (g ioGate) WithFeature(ctx context.Context, f capabilities.Feature,
 	write func(context.Context, capabilities.FeatureGrant) error) error {
+	if g.grants != nil {
+		*g.grants++ // every run of the gate, granted or refused
+	}
+	if g.latchedButRefuses {
+		return status.Errorf(codes.Unavailable, "could not confirm %s with every host", f)
+	}
 	if !g.on {
 		return status.Errorf(codes.FailedPrecondition, "the cluster upgrade must finish first (%s needs %s)", f, capabilities.ReleaseToken)
-	}
-	if g.grants != nil {
-		*g.grants++
 	}
 	return write(ctx, capabilities.GrantForTest(g.t, f))
 }
 
-func (g ioGate) FeatureAvailable(capabilities.Feature) bool { return g.on }
+func (g ioGate) FeatureAvailable(capabilities.Feature) bool { return g.on || g.latchedButRefuses }
 
 // Until the disk/NIC feature gate latches, every way of setting discard, detect_zeroes,
 // a throttle or NIC queues is refused with FailedPrecondition naming the cluster
@@ -114,8 +120,13 @@ func TestDiskNICIOGate_SetDiskIO(t *testing.T) {
 func TestDiskNICIOGate_HardwareRedefine(t *testing.T) {
 	s, _, ctx := ioVM(t, "stopped")
 	s.SetReleaseFeatureGate(ioGate{t: t, on: false})
+	// A VM whose spec carries tuning: the redefine renders it, so it waits (m5).
+	tuned := &pb.VMSpec{Name: "io", Cpu: 2, MemoryMib: 512, Disks: []*pb.DiskSpec{{Name: "root", Bus: "virtio", Discard: "unmap"}}}
+	if _, _, err := corrosion.MutateDesiredSpec(ctx, s.db, "io", func(string) (string, error) { return seedSpecJSON(t, tuned), nil }); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "io", RedefineHardware: true}); status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("UpdateVM redefine_hardware before the latch: %v", err)
+		t.Errorf("UpdateVM redefine_hardware of a tuned VM before the latch: %v", err)
 	}
 }
 
@@ -219,21 +230,91 @@ func TestDiskNICIOWriters_RefuseWithoutAGrant(t *testing.T) {
 	}
 }
 
-// A VM created with the gate open and a tuned spec takes the grant on THIS node;
-// an untuned create on a closed gate takes none (it creates as main does).
-func TestIOGrant_TakenOnlyForTunedWrites(t *testing.T) {
+// I1: the default discard of a plain create is applied only when the feature
+// is ALREADY recorded used and acknowledged here. Before the first use the
+// create never reaches the gate, however degraded the cluster is: no first-use
+// wait, no unacknowledged row.
+//
+// Mutation: have ioGrantIfUsed skip the recorded-used read — the first-use case
+// goes red.
+func TestIOGrant_DefaultDiscardNeverPerformsTheFirstUse(t *testing.T) {
+	ctx := context.Background()
 	var n int
-	s := &Server{releaseFeatures: ioGate{t: t, on: true, grants: &n}}
-	if _, ok := s.ioGrantIfAvailable(context.Background()); !ok || n != 1 {
-		t.Errorf("open gate: ok=%v grants=%d", ok, n)
+	s := testServer(t)
+	s.db.SetClusterPolicyGate(func() bool { return true })
+	s.SetReleaseFeatureGate(ioGate{t: t, on: true, grants: &n})
+	if _, ok := s.ioGrantIfUsed(ctx); ok || n != 0 {
+		t.Fatalf("before the first use: ok=%v, gate runs=%d; a plain create must not touch the gate", ok, n)
 	}
-	closed := &Server{releaseFeatures: ioGate{t: t, on: false, grants: &n}}
-	if _, ok := closed.ioGrantIfAvailable(context.Background()); ok {
+	// Recorded but not yet acknowledged (a first use in flight): still nothing.
+	tok := featureToken(capabilities.FeatureVMDiskNICIO)
+	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, tok, string(capabilities.FeatureVMDiskNICIO), "h", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ioGrantIfUsed(ctx); ok || n != 0 {
+		t.Fatalf("unacknowledged use: ok=%v runs=%d", ok, n)
+	}
+	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, tok, string(capabilities.FeatureVMDiskNICIO), "h", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ioGrantIfUsed(ctx); !ok || n != 1 {
+		t.Fatalf("acknowledged use: ok=%v runs=%d, want a grant", ok, n)
+	}
+	closed := testServer(t)
+	closed.SetReleaseFeatureGate(ioGate{t: t, on: false})
+	if _, ok := closed.ioGrantIfUsed(ctx); ok {
 		t.Error("closed gate handed out a grant")
 	}
-	if _, err := closed.ioGrant(context.Background()); status.Code(err) != codes.FailedPrecondition ||
+	if _, err := closed.ioGrant(ctx); status.Code(err) != codes.FailedPrecondition ||
 		!strings.Contains(err.Error(), "the cluster upgrade must finish first (vm_disk_nic_io needs release_2026_11_v1)") {
 		t.Errorf("closed ioGrant: %v", err)
+	}
+}
+
+// m4: the entry-node check records and grants nothing, even when it passes.
+func TestIOFeatureGate_EntryCheckTakesNoGrant(t *testing.T) {
+	var n int
+	s := testServer(t)
+	s.SetReleaseFeatureGate(ioGate{t: t, on: true, grants: &n})
+	if err := s.ioFeatureGate(context.Background()); err != nil || n != 0 {
+		t.Errorf("open: err=%v runs=%d", err, n)
+	}
+	s.SetReleaseFeatureGate(ioGate{t: t, on: false, grants: &n})
+	err := s.ioFeatureGate(context.Background())
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "vm_disk_nic_io needs release_2026_11_v1") || n != 0 {
+		t.Errorf("closed: err=%v runs=%d", err, n)
+	}
+}
+
+// m5: a hardware redefine of a VM with no tuning writes none, so it is not
+// gated and takes no grant.
+func TestIOGrant_RedefineOfAnUntunedVMTakesNone(t *testing.T) {
+	var n int
+	s, _, ctx := ioVM(t, "stopped")
+	s.SetReleaseFeatureGate(ioGate{t: t, on: false, grants: &n})
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "io", RedefineHardware: true}); err != nil {
+		t.Errorf("redefine_hardware of an untuned VM on a closed gate: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("took %d grants", n)
+	}
+}
+
+// m1: a restore whose tuning the gate refuses AFTER the latch is never refused:
+// the tuning is stripped and an audit row records it.
+//
+// Mutation: return the gate's error instead of stripping — red.
+func TestRestrictRestoredTuning_RefusalAfterTheLatchStripsAndAudits(t *testing.T) {
+	s := testServer(t)
+	s.SetReleaseFeatureGate(ioGate{t: t, latchedButRefuses: true})
+	spec := &pb.VMSpec{Name: "r", Disks: []*pb.DiskSpec{{Name: "root", Discard: "unmap"}}}
+	stripped, _, err := s.restrictRestoredTuning(adminCtx(), spec)
+	if err != nil || !stripped || specSetsDiskNICIO(spec) {
+		t.Fatalf("stripped=%v err=%v spec=%+v", stripped, err, spec)
+	}
+	rows, qerr := s.db.Query(context.Background(), `SELECT action, target, result FROM audit_log WHERE action = ?`, "vm.restore.tuning_dropped")
+	if qerr != nil || len(rows) != 1 || rows[0].String("target") != "r" {
+		t.Fatalf("audit rows = %v err=%v, want one for r", rows, qerr)
 	}
 }
 

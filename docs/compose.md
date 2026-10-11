@@ -382,9 +382,10 @@ a create, update, compose deploy, recreate or `lv disk-io` that sets any of them
 refused with `the cluster upgrade must finish first (vm_disk_nic_io needs
 release_2026_11_v1)`, and nothing about a VM that sets none of them changes: a restore
 or promotion of a spec that carries them still works, with the tuning dropped. Once the
-token has latched, the first write of any of them (an unset discard also becomes the
-storage default on a new disk) records the feature as used, and a rollback below the
-release is then blocked (see upgrades.md, *Rolling back after a release token latched*).
+token has latched, the first write of any of them (an unset discard becomes the
+storage default on a new disk only once the feature is already in use, so a plain create never waits on a first use) records the feature as used; see upgrades.md, *Rolling back after a release token
+latched*, for what a rollback does. A restore whose tuning the gate refuses after the latch
+still completes, with the tuning dropped, a warning and an audit row.
 The gate has no config flag and, once open, stays open; to stop using the feature, clear
 the settings (`lv disk-io <vm> --clear`, or drop the keys).
 

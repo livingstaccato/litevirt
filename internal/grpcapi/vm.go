@@ -393,7 +393,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Disk/NIC tuning is written by THIS node, so the feature's gate runs here,
 	// before anything is created. A spec that sets tuning needs the grant (the
 	// entry check above only fails fast); a spec that does not gets the default
-	// discard only when the gate opens, and otherwise creates exactly as main.
+	// discard only once the feature is ALREADY recorded used (a local read), so a
+	// plain create never triggers or waits on a first use, and otherwise creates
+	// exactly as main.
 	var ioG capabilities.FeatureGrant
 	if specSetsDiskNICIO(spec) {
 		g, gerr := s.ioGrant(ctx)
@@ -401,7 +403,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, gerr
 		}
 		ioG = g
-	} else if g, ok := s.ioGrantIfAvailable(ctx); ok {
+	} else if g, ok := s.ioGrantIfUsed(ctx); ok {
 		ioG = g
 	}
 	ioGranted := ioG.Check(capabilities.FeatureVMDiskNICIO) == nil
@@ -4023,7 +4025,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	// The hardware redefine renders disk/NIC tuning, which waits for the latch;
 	// refused at the entry node, before the call is forwarded.
-	if requestsHardwareTuning(req) {
+	if requestsTuningWrite(req, vm.Spec) {
 		if err := s.ioFeatureGate(ctx); err != nil {
 			return nil, err
 		}
@@ -4085,7 +4087,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// This node writes the tuning, so the feature's gate runs here (the entry
 	// node only failed fast), before anything is stopped or redefined.
 	var ioG capabilities.FeatureGrant
-	if requestsHardwareTuning(req) {
+	tuningWrite := requestsTuningWrite(req, vm.Spec)
+	if tuningWrite {
 		g, gerr := s.ioGrant(ctx)
 		if gerr != nil {
 			return nil, gerr
@@ -4658,7 +4661,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
 	mutateSpec := corrosion.MutateDesiredSpec
-	if requestsHardwareTuning(req) {
+	if tuningWrite {
 		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
 			return corrosion.MutateDesiredSpecTuning(ctx, c, ioG, name, fn)
 		}

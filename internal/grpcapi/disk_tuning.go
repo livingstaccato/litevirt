@@ -43,17 +43,20 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 
 // ioFeatureGate is the entry-node check of the disk/NIC tuning feature
 // (capabilities.FeatureVMDiskNICIO): nil when its release token has latched
-// here, else the release gate's own refusal (FailedPrecondition, "the cluster
-// upgrade must finish first (vm_disk_nic_io needs ...)", naming the hosts still
-// to upgrade). It lets a request fail before anything is created or forwarded;
-// it grants nothing. The node that WRITES the tuning takes the grant itself
-// (ioGrant), so a forwarded request is gated there.
+// here, else FailedPrecondition with the release gate's text ("the cluster
+// upgrade must finish first (vm_disk_nic_io needs ...)"). It is a fail-fast
+// only: it reads the local latch, asks no peer, records nothing and grants
+// nothing, so a request that later fails leaves no used record. The node that
+// WRITES the tuning runs the real gate and takes the grant itself (ioGrant), so
+// a forwarded request is gated there. The latch is driven by the HA monitor and
+// by the first write that reaches the real gate.
 func (s *Server) ioFeatureGate(ctx context.Context) error {
 	if s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
 		return nil
 	}
-	return s.WithReleaseFeature(ctx, capabilities.FeatureVMDiskNICIO,
-		func(context.Context, capabilities.FeatureGrant) error { return nil })
+	return status.Errorf(codes.FailedPrecondition,
+		"the cluster upgrade must finish first (%s needs %s)",
+		capabilities.FeatureVMDiskNICIO, featureToken(capabilities.FeatureVMDiskNICIO))
 }
 
 // ioGrant runs the feature's gate on THIS node, the one that will write the
@@ -66,15 +69,22 @@ func (s *Server) ioGrant(ctx context.Context) (capabilities.FeatureGrant, error)
 	return g, err
 }
 
-// ioGrantIfAvailable is ioGrant for a caller that falls back rather than fails
-// (the create-time default discard, a restore's tuning): ok is false, with no
-// error, when the token has not latched here or the gate refuses, and the
-// caller behaves as main does. It asks no peer unless the token has latched.
-func (s *Server) ioGrantIfAvailable(ctx context.Context) (g capabilities.FeatureGrant, ok bool) {
+// ioGrantIfUsed is ioGrant for a write that must never perform the feature's
+// FIRST use: the default discard of a plain create. ok is true only when the
+// token has latched here AND the feature is already recorded used and
+// acknowledged in this replica (a local read, no peer). A plain create then
+// never triggers or waits on the first-use protocol, however degraded the
+// cluster, and behaves as main until an operator (or a restore) has used the
+// feature.
+func (s *Server) ioGrantIfUsed(ctx context.Context) (g capabilities.FeatureGrant, ok bool) {
 	if !s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
 		return g, false
 	}
-	g, err := s.ioGrant(ctx)
+	present, acked, err := corrosion.ReleaseFeatureState(ctx, s.db, featureToken(capabilities.FeatureVMDiskNICIO), string(capabilities.FeatureVMDiskNICIO))
+	if err != nil || !present || !acked {
+		return g, false
+	}
+	g, err = s.ioGrant(ctx)
 	return g, err == nil
 }
 
@@ -447,15 +457,28 @@ func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (s
 	if !specSetsDiskNICIO(spec) {
 		return false, grant, nil
 	}
-	grant, ok := s.ioGrantIfAvailable(ctx)
-	if !ok {
+	available := s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO)
+	var gerr error
+	if available {
+		grant, gerr = s.ioGrant(ctx)
+	}
+	if !available || gerr != nil {
 		for _, d := range spec.Disks {
 			d.Discard, d.DetectZeroes, d.Io = "", "", nil
 		}
 		for _, n := range spec.Network {
 			n.Queues = 0
 		}
-		slog.Warn("restore: the spec carries disk/NIC tuning and the cluster upgrade has not finished: tuning dropped", "vm", spec.GetName())
+		if gerr != nil {
+			// The token has latched but the feature's gate refused (a first use
+			// that could not be acknowledged, a host rolled back after the latch).
+			// A restore main allows is never refused: the tuning is dropped, and
+			// the operator is told in the log and the audit trail.
+			slog.Warn("restore: the disk/NIC feature gate refused after the latch: tuning dropped", "vm", spec.GetName(), "error", gerr)
+			s.audit(ctx, "vm.restore.tuning_dropped", spec.GetName(), "disk/NIC tuning dropped: "+status.Convert(gerr).Message(), "degraded")
+		} else {
+			slog.Warn("restore: the spec carries disk/NIC tuning and the cluster upgrade has not finished: tuning dropped", "vm", spec.GetName())
+		}
 		return true, grant, nil
 	}
 	if err := validateSpecTuning(spec); err != nil {
@@ -480,6 +503,20 @@ func (s *Server) insertVMForSpec(ctx context.Context, spec *pb.VMSpec, g capabil
 // domain for disk/NIC tuning: its payload, or the explicit regenerate flag.
 func requestsHardwareTuning(req *pb.UpdateVMRequest) bool {
 	return req.GetRedefineHardware() || len(req.GetDiskTuning()) > 0 || len(req.GetNicQueues()) > 0
+}
+
+// requestsTuningWrite reports whether an UpdateVM adds tuning to the stored
+// spec: its payload, or a hardware redefine of a VM whose spec already carries
+// tuning. A redefine of an untuned VM writes none and needs no gate.
+func requestsTuningWrite(req *pb.UpdateVMRequest, storedSpec string) bool {
+	if len(req.GetDiskTuning()) > 0 || len(req.GetNicQueues()) > 0 {
+		return true
+	}
+	if !req.GetRedefineHardware() || storedSpec == "" {
+		return false
+	}
+	st := &pb.VMSpec{}
+	return json.Unmarshal([]byte(storedSpec), st) == nil && specSetsDiskNICIO(st)
 }
 
 // patchTuningInPlace applies a request's discard / detect_zeroes / queue

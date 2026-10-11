@@ -178,7 +178,24 @@ Two kinds of NIC carry tags:
   --allow-vlan-tags`, compose `allow-vlan-tags: true`) — a VLAN-aware guest
   outside the `trunk:` feature, a nested hypervisor — sends and receives tags
   of any kind; its rules see what the kernel parses of the frame and nothing
-  beyond a second tag. Allowing it is a relaxation (see below).
+  beyond a second tag. Allowing it is a relaxation (see below). If the NIC is
+  **guarded**, its tags are held like this:
+  - a **single-tagged** frame (VID 1-4094) is held to the NIC's MAC, to its own
+    MAC in ARP and neighbour discovery, and may not answer DHCP (unless the
+    guard allows it) or advertise a router, but it is **not** checked against
+    the NIC's addresses: the addresses a guest uses inside a VLAN are no one's
+    to know. So an IPv4 or IPv6 source, a link-local address, a neighbour
+    advertisement's target and an ARP sender address are all unchecked inside a
+    VLAN tag;
+  - a **priority-tagged** frame (VID 0) is native-VLAN traffic (the host and a
+    `vlan_filtering` bridge treat it as untagged), so it is held to the NIC's
+    addresses exactly as an untagged frame is;
+  - a **doubled** tag (an 802.1ad outer tag, or an 802.1Q tag inside the outer
+    one) is dropped: the checks above cannot see inside it. QinQ through a
+    guarded NIC needs the guard off (`--mode off`).
+  A guarded trunk NIC is held the same way for a single tag, and its doubled
+  tags are dropped by its confinement (above). The NIC-guard list below states
+  the address rules for untagged and priority-tagged frames.
 
 **Routed traffic.** The `inet litevirt-fw` forward chain still judges routed
 traffic with the cluster and host tiers and the default policy, as before. Two
@@ -387,6 +404,9 @@ guarded guest sends:
   answer DHCP;
 - router advertisements and redirects, unless the guard allows the guest to act
   as a router.
+
+The address rules above hold untagged and priority-tagged frames; inside a VLAN
+tag they are relaxed on a NIC allowed tags or on a trunk (see "VLAN tags").
 
 **Which addresses are the guest's.** For each family:
 

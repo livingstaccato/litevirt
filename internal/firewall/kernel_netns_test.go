@@ -899,6 +899,52 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 		}
 	}
 
+	// A guarded NIC allowed tags with --allow-vlan-tags (not a trunk), on a
+	// plain bridge, receiving port allowed tags too. Its tagged frames are
+	// held to its MAC, ARP sender MAC and ND link-layer option, and not to its
+	// native addresses; a priority tag (VID 0) is native traffic and is held
+	// to them; a doubled tag is dropped.
+	sh(t, "ip", "link", "add", "lvab0", "type", "bridge", "stp_state", "0", "forward_delay", "0")
+	sh(t, "ip", "link", "set", "lvab0", "up")
+	am := vport(t, "lvab0", "lvah0", "lvag0")
+	vport(t, "lvab0", "lvah1", "lvag1")
+	allowTags := Plan{NICs: []NICBinding{
+		{NICDev: "lvah0", VMName: "vlanaware", Bridge: "lvab0", AllowVLANTags: true,
+			Guard: &NICGuard{MAC: am.String(), V4: []string{"10.0.0.8"}}},
+		{NICDev: "lvah1", VMName: "peer", Bridge: "lvab0", AllowVLANTags: true},
+	}}
+	ll := "fe80::5054:ff:fe00:1"
+	nd := func(sll net.HardwareAddr) []byte {
+		return ipv6Exact(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", sll))
+	}
+	allow := []struct {
+		name  string
+		frame []byte
+		want  bool
+	}{
+		{"untagged, its own address", ether(am, 0x0800, udp(5000)), true},
+		{"untagged, a foreign address", ether(am, 0x0800, ipv4UDP("10.0.0.99", "10.0.0.9", 4000, 5000)), false},
+		{"VLAN 10, IPv4 on another subnet", tagged(am, 0x8100, ipv4UDP("10.215.0.1", "10.215.0.2", 4000, 5000), 10), true},
+		{"VLAN 10, ARP with its own MAC on another subnet", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.215.0.1", "10.215.0.2"), 10), true},
+		{"VLAN 10, ARP naming another MAC", taggedType(am, 0x8100, 0x0806, arpRequest(foreign, "10.215.0.1", "10.215.0.2"), 10), false},
+		{"VLAN 10, a DHCP server reply", tagged(am, 0x8100, ipv4UDP("10.215.0.1", "255.255.255.255", 67, 68), 10), false},
+		{"VLAN 10, ND naming another MAC", taggedType(am, 0x8100, 0x86dd, nd(foreign), 10), false},
+		{"VLAN 10, ND with its own MAC", taggedType(am, 0x8100, 0x86dd, nd(am), 10), true},
+		{"VID 0, its own address", tagged(am, 0x8100, udp(5000), 0), true},
+		{"VID 0, a foreign address", tagged(am, 0x8100, ipv4UDP("10.0.0.99", "10.0.0.9", 4000, 5000), 0), false},
+		{"VID 0, ARP with its own address", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.0.0.8", "10.0.0.9"), 0), true},
+		{"VID 0, ARP claiming a foreign address", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.0.0.99", "10.0.0.9"), 0), false},
+		{"802.1Q inside 802.1Q", tagged(am, 0x8100, udp(5000), 10, 20), false},
+		{"802.1ad outer tag", tagged(am, 0x88a8, udp(5000), 10, 20), false},
+		{"802.1ad outer tag, ARP naming another MAC", taggedType(am, 0x88a8, 0x0806, arpRequest(foreign, "10.215.0.1", "10.215.0.2"), 10, 20), false},
+	}
+	apply(allowTags)
+	for _, c := range allow {
+		if got := l.deliveredFrom(t, "lvag0", "lvag1", c.frame); got != c.want {
+			t.Errorf("allow-vlan-tags guard: %s: delivered=%v, want %v", c.name, got, c.want)
+		}
+	}
+
 	// A trunk on a bridge with no VLAN filtering of its own (a plain managed
 	// bridge with an uplink): a VLAN the tenant chose, which its network does
 	// not allow, does not leave through the uplink, in either mode.
@@ -948,6 +994,13 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	for _, c := range trunk {
 		if got := l.deliveredFrom(t, "lvtg0", "lvtg1", c.frame); got != c.empty {
 			t.Errorf("no table: %s: delivered=%v, want %v", c.name, got, c.empty)
+		}
+	}
+	for _, c := range allow {
+		// With no table nothing is held, whatever the frame (the doubled and
+		// forged ones go through); the ND frames are exact-length and still pass.
+		if !l.deliveredFrom(t, "lvag0", "lvag1", c.frame) {
+			t.Errorf("no table: %s still dropped — the drop above was not the rule's", c.name)
 		}
 	}
 	if !l.deliveredFrom(t, "lvvg0", "lvvg2", hop) {

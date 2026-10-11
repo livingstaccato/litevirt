@@ -500,6 +500,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// it must reach host_membership too. Written to hosts.state alone, this
 	// node's own host_membership row would miss it until anti-entropy.
 	d.wireHostMembershipGate()
+	d.wireHostMembershipRetireGate()
 
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
@@ -2962,6 +2963,25 @@ func (d *Daemon) runCredentialsSplit(ctx context.Context) {
 // change goes to hosts.state, the previous release's behaviour.
 func (d *Daemon) wireHostMembershipGate() {
 	d.db.SetHostMembershipGate(HostMembershipLatchedOnDisk(d.cfg.DataDir))
+}
+
+// wireHostMembershipRetireGate stops the state and isolation writers writing
+// the hosts copy once host_membership_retire_v1 has durably latched. Read from
+// the marker on disk, like wireHostMembershipGate, because the boot state is
+// written before the checker exists. No config flag. Unwired, the gate fails
+// closed and both homes keep being written, the dual-write build's behaviour.
+func (d *Daemon) wireHostMembershipRetireGate() {
+	d.db.SetHostMembershipRetireGate(HostMembershipRetireLatchedOnDisk(d.cfg.DataDir))
+}
+
+// HostMembershipRetireLatchedOnDisk reports whether host_membership_retire_v1
+// has durably latched on the node whose data directory is dataDir.
+func HostMembershipRetireLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.HostMembershipRetireV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
 }
 
 // HostMembershipLatchedOnDisk reports whether host_membership_split_v1 has

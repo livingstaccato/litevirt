@@ -19,13 +19,11 @@ import (
 // toward a fence quorum, and a fence row older than it does not make the host
 // "recently fenced".
 //
-// A host with no membership row, or a node not reading host_membership yet,
-// is absent from the map: the caller then judges it as before.
+// A host with no membership row is absent from the map: the caller then
+// judges it as before. A present row is read on a live node or not, as
+// resolve reads it.
 func HostsActiveSince(ctx context.Context, c *Client) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
-	if !c.HostMembershipLive() {
-		return out, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
@@ -41,9 +39,6 @@ func HostsActiveSince(ctx context.Context, c *Client) (map[string]time.Time, err
 // HostActiveSince is HostsActiveSince for one host: ok=false when host is not
 // recorded active in a membership row this node reads.
 func HostActiveSince(ctx context.Context, c *Client, host string) (time.Time, bool, error) {
-	if !c.HostMembershipLive() {
-		return time.Time{}, false, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
 	if err != nil || len(rows) == 0 {
 		return time.Time{}, false, err
@@ -56,8 +51,34 @@ func activeSince(r membershipRow) (time.Time, bool) {
 	if !r.memPresent || r.mem.State != "active" {
 		return time.Time{}, false
 	}
-	return ParseUpdatedAt(r.memTS)
+	at, ok := ParseUpdatedAt(r.memTS)
+	if !ok {
+		return time.Time{}, false
+	}
+	return lifeBoundary(at), true
 }
+
+// isMembershipCopyFloor reports whether a membership row's updated_at is a
+// split-pass copy's floor (membershipCopyTS). Any real write is decades newer.
+func isMembershipCopyFloor(at time.Time) bool {
+	return at.Before(membershipFloorCeiling)
+}
+
+// lifeBoundary is the instant a membership row dates the host's current life
+// from. A floor copy's stamp is the copied hosts row's instant moved back by
+// the fixed membershipCopyFloorShift, so the shift is undone: the boundary is
+// the hosts row's time at the copy, as it was before the split, decoded from
+// the copy's OWN timestamp — no parent row is read or compared (re-review 2,
+// N6).
+func lifeBoundary(at time.Time) time.Time {
+	if isMembershipCopyFloor(at) {
+		return at.Add(membershipCopyFloorShift)
+	}
+	return at
+}
+
+// membershipFloorCeiling: every floor copy is older, every real write newer.
+var membershipFloorCeiling = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // fenceLifeSkew is how much older than the host's last membership change a
 // proof-grade fence row may be and still count (HostFenceLife). The row is
@@ -94,9 +115,6 @@ const fenceLifeSkew = 5 * time.Second
 // count for it (colonelpanik/litevirt#253). Its state write dates its life like
 // any other state's.
 func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time, state string, ok bool, err error) {
-	if !c.HostMembershipLive() {
-		return time.Time{}, "", false, nil
-	}
 	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
 	if err != nil || len(rows) == 0 {
 		return time.Time{}, "", false, err
@@ -118,5 +136,5 @@ func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time
 	if !ok {
 		return time.Time{}, "", false, nil
 	}
-	return at.Add(-fenceLifeSkew).Truncate(time.Second), r.mem.State, true, nil
+	return lifeBoundary(at).Add(-fenceLifeSkew).Truncate(time.Second), r.mem.State, true, nil
 }

@@ -1403,7 +1403,7 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		// host_membership yet is absorbed into it here, locally
 		// (host_membership.go). Back-pressured on failure, like the secret
 		// absorb: swallowed, it would lose a fence on this node.
-		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership()); err != nil {
+		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
 			_ = tx.Rollback()
 			slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)

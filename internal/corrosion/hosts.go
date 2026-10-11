@@ -294,10 +294,10 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 		return nil, err
 	}
 
-	live := c.HostMembershipLive()
+	frozen := c.hostsCopyFrozen()
 	hosts := make([]HostRecord, len(rows))
 	for i, r := range rows {
-		hosts[i] = scanHost(r, live)
+		hosts[i] = scanHost(r, frozen)
 	}
 	return hosts, nil
 }
@@ -357,6 +357,47 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 	return DerivedVoterSet(ctx, c)
 }
 
+// VoterSetWithUncounted is VoterSet together with the voters that must not
+// count toward a quorum's LIVE numerator however healthy their probes:
+// derived-set voters this node reads as HostStateUnknown. Such a host may be
+// in maintenance or offline on the cluster's view — out of the voter set
+// there — so counting its probes could hand a minority a majority. It stays in
+// the denominator, which is the fail-closed side. With an adopted voter
+// generation the set is the generation's members and nothing is excluded.
+//
+// Both come from ONE read of host state, so a membership row landing between
+// two reads cannot make them disagree (re-review 2, N4; re-review 3, R6). It is
+// the only source of the uncounted set: every quorum count takes it from here
+// or from VoterRegions, which calls it.
+func VoterSetWithUncounted(ctx context.Context, c *Client) (voters, uncounted map[string]bool, err error) {
+	cfg, err := AdoptedVoterConfig(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	uncounted = map[string]bool{}
+	if cfg.Explicit() {
+		voters = make(map[string]bool, len(cfg.Members))
+		for _, m := range cfg.Members {
+			voters[m.Name] = true
+		}
+		return voters, uncounted, nil
+	}
+	states, err := resolvedHostStates(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	voters = make(map[string]bool, len(states))
+	for name, state := range states {
+		if VotingEligible(state) {
+			voters[name] = true
+		}
+		if state == HostStateUnknown {
+			uncounted[name] = true
+		}
+	}
+	return voters, uncounted, nil
+}
+
 // DerivedVoterSet is the voter set as it was before any explicit generation:
 // every non-deleted host whose state is VotingEligible. Automatic genesis
 // proposes it as generation 1's members.
@@ -383,7 +424,7 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	h := scanHost(rows[0], c.HostMembershipLive())
+	h := scanHost(rows[0], c.hostsCopyFrozen())
 	return &h, nil
 }
 
@@ -403,7 +444,7 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			` + membershipCols + `
 		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` + membershipJoins
 
-func scanHost(r Row, membershipLive bool) HostRecord {
+func scanHost(r Row, hostsCopyFrozen bool) HostRecord {
 	name := r.String("name")
 	return HostRecord{
 		Name:               name,
@@ -411,7 +452,7 @@ func scanHost(r Row, membershipLive bool) HostRecord {
 		SSHUser:            r.String("ssh_user"),
 		SSHPort:            r.Int("ssh_port"),
 		GRPCPort:           r.Int("grpc_port"),
-		State:              membershipRowFrom(r, name).resolve(membershipLive).State,
+		State:              membershipRowFrom(r, name).resolve(hostsCopyFrozen).State,
 		CertSerial:         r.String("cert_serial"),
 		CPUTotal:           r.Int("cpu_total"),
 		MemTotal:           r.Int("mem_total"),
@@ -489,7 +530,8 @@ func decodeLabels(raw string) map[string]string {
 
 // UpdateHostState changes a host's state: hosts.state before the membership
 // split, and after it hosts.state AND host_membership.state in one batch under
-// one updated_at (host_membership.go). The hosts half keeps a node rolled back
+// one updated_at (host_membership.go) — host_membership alone once
+// host_membership_retire_v1 has latched (host_membership_retire.go). The hosts half keeps a node rolled back
 // one release reading the right state; the membership half is the copy that no
 // longer shares a clock with the host's own reports.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
@@ -498,9 +540,23 @@ func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 		if !live {
 			return c.Execute(ctx, updateHostStateSQL, state, uts, name)
 		}
+		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		if missing {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
+			})
+		}
 		epoch, reason, err := currentIsolation(ctx, c, name)
 		if err != nil {
 			return err
+		}
+		if c.hostsCopyRetired(live) {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+			})
 		}
 		return c.ExecuteBatch(ctx, []Statement{
 			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
@@ -594,6 +650,16 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 		// in the same batch under the same updated_at: the hosts statement is
 		// the previous release's, unchanged, so a node rolled back one release
 		// still reads it.
+		missing, err := membershipRowMissingFrozen(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		if missing {
+			return c.ExecuteBatch(ctx, []Statement{
+				hostsStmt,
+				{SQL: hostMembershipStateOnlySQL, Params: []interface{}{state, uts, name}},
+			})
+		}
 		epoch, reason, err := currentIsolation(ctx, c, name)
 		if err != nil {
 			return err

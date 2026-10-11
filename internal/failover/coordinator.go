@@ -843,6 +843,16 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue
 		}
+		// A host whose state this node cannot know — no membership row, and a
+		// hosts copy the retire token stopped (corrosion.HostStateUnknown) —
+		// is neither fenced nor recovered: a fence is irrevocable, and the
+		// row is one anti-entropy cycle away. It may be in maintenance or
+		// still joining. Not cached: re-read next cycle.
+		if h.State == corrosion.HostStateUnknown {
+			slog.Info("failover: target's membership row has not reached this node; skipping fence until it does", "host", target)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrStateUnknown)
+			continue
+		}
 		if aerr == nil && c.turnedActiveThisCycle(ctx, target, activeSince) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue

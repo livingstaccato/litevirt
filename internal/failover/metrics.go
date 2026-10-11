@@ -143,6 +143,9 @@ const (
 	// saw the host answer after the attempt that failed, so it is not fenced
 	// again (retryStillDown).
 	ErrRetryHostAnswered = "retry_host_answered"
+	// ErrStateUnknown: quorum agreed a host failed, but this node has no
+	// membership row for it and cannot read its state, so it is not fenced.
+	ErrStateUnknown = "state_unknown"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

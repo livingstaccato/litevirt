@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Host membership on a clock of its own (colonelpanik/litevirt#267).
@@ -58,9 +59,10 @@ import (
 //     shapes, and host_membership. The hosts copy is what keeps a rollback of
 //     one release safe — a node back on the previous build reads hosts.state
 //     and nothing else, and it must still see every drain, fence and
-//     isolation. Nothing ever clears or freezes the hosts columns in this
-//     release; retiring them is a later release's step behind a second token
-//     (docs/design/host-membership-retire-old-columns.md).
+//     isolation. Nothing ever clears the hosts columns. Once
+//     host_membership_retire_v1 latches as well, the pure state and isolation
+//     writers stop writing them (host_membership_retire.go,
+//     docs/design/host-membership-retire-old-columns.md).
 //   - every reader reads state and isolation from host_membership ONLY,
 //     falling back to the hosts columns for a host that has no membership row
 //     yet.
@@ -98,11 +100,16 @@ import (
 // None of these can undo a fence: a value reaches host_membership only from a
 // live writer, a first copy, or a hosts-only write newer than the row.
 //
-// TIMESTAMPS. A copied row takes the hosts row's updated_at, never NowTS, for
-// the #268 reason: every node copies the same replicated hosts row, so every
-// node writes the same membership row and the copies converge instead of
-// racing, and a node whose hosts row is behind copies an OLDER timestamp that
-// loses to a fresher node's copy.
+// TIMESTAMPS. A copied row takes the hosts row's updated_at moved back by a
+// fixed floor shift (membershipCopyTS), never NowTS. Two properties follow.
+// Every node copies the same replicated hosts row, so every node writes the
+// same membership row and the copies converge instead of racing, and a node
+// whose hosts row is behind copies an OLDER timestamp that loses to a fresher
+// node's copy (the #268 reason). And no copy ever beats a real membership
+// write, because a copy only fills an absence: the hosts row's updated_at
+// moves on unrelated writes while its state may be stale, so a copy at that
+// time would otherwise replicate a stale state over a newer fence or drain.
+// Once host_membership_retire_v1 has latched, no copy is made at all.
 
 // hostMembershipLiveFile is the durable half of "this node has completed a
 // split pass". NODE-LOCAL: it describes which columns this node's readers
@@ -157,9 +164,10 @@ func (c *Client) markHostMembershipLive() {
 		return
 	}
 	if err := os.WriteFile(filepath.Join(c.dataDir, hostMembershipLiveFile), []byte("1\n"), 0o600); err != nil {
-		// In-memory the node is live. After a restart it reads the hosts
-		// columns until its first pass — the pre-split behaviour, and safe,
-		// because every live write also writes them. The next pass retries.
+		// In-memory the node is live. After a restart its WRITERS write the
+		// hosts columns only until its first pass, and those are absorbed by
+		// every node that holds the membership row. Its readers read a present
+		// membership row regardless (resolve). The next pass retries.
 		c.hostMembershipLive.Store(false)
 		slog.Warn("host membership split: could not persist the live marker; retrying next pass", "error", err)
 	}
@@ -183,16 +191,34 @@ type membershipRow struct {
 	memTS      string
 }
 
-// resolve is THE read rule: before this node is live, or for a host with no
-// membership row, the hosts columns — what the previous release reads.
-// Otherwise the membership row, whatever the hosts copy says or however new
-// its row is.
-func (r membershipRow) resolve(live bool) membershipVals {
-	if !live || !r.memPresent {
-		return r.hosts
+// resolve is THE read rule: the membership row whenever there is one,
+// whatever the hosts copy says or however new its row is, on a live node or
+// not. Every membership row was written by a live writer, a copy or an absorb,
+// so it is never less current than the hosts copy — and once
+// host_membership_retire_v1 has latched anywhere the hosts copy stops
+// following, so reading it ahead of a present row would serve a frozen state.
+//
+// A host with no membership row reads the hosts columns, which the dual-write
+// build keeps current. Once THIS node has latched the retire token (frozen)
+// those columns may be frozen: such a host reads as HostStateUnknown — never
+// 'active', so nothing is placed on it, but voting-eligible, so it still
+// counts in every quorum's denominator — until its row arrives.
+func (r membershipRow) resolve(frozen bool) membershipVals {
+	if r.memPresent {
+		return r.mem
 	}
-	return r.mem
+	if frozen {
+		v := r.hosts
+		v.State = HostStateUnknown
+		return v
+	}
+	return r.hosts
 }
+
+// HostStateUnknown is the state a host reads as when this node cannot know it:
+// no membership row, and a hosts copy that may have stopped following
+// (resolve). Not 'active', and VotingEligible.
+const HostStateUnknown = "unknown"
 
 // membershipCols and membershipJoins are the read side of a host's membership,
 // for any query over `hosts h`. Qualified and aliased, so they can sit beside
@@ -236,7 +262,7 @@ func hostMembershipOf(ctx context.Context, c *Client, host string) (*membershipV
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}
-	v := rows[0].resolve(c.HostMembershipLive())
+	v := rows[0].resolve(c.hostsCopyFrozen())
 	return &v, nil
 }
 
@@ -246,10 +272,10 @@ func resolvedHostStates(ctx context.Context, c *Client) (map[string]string, erro
 	if err != nil {
 		return nil, err
 	}
-	live := c.HostMembershipLive()
+	frozen := c.hostsCopyFrozen()
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
-		out[r.name] = r.resolve(live).State
+		out[r.name] = r.resolve(frozen).State
 	}
 	return out, nil
 }
@@ -274,6 +300,14 @@ const (
 		   updated_at = excluded.updated_at, deleted_at = NULL`
 	// The isolation writers keep hosts' guards: record only over epoch 0,
 	// clear only the pinned epoch (isolation.go says why).
+	// hostMembershipStateOnlySQL changes state on a row that EXISTS and
+	// nothing else. A writer on a node whose hosts copy is frozen and that has
+	// no membership row for the host uses it instead of the upsert: an insert
+	// would take its isolation pair from the frozen copy (re-review m1). A
+	// receiver without the row applies nothing; the row reaches it, with this
+	// state, by anti-entropy from any node that had it.
+	hostMembershipStateOnlySQL = `UPDATE host_membership SET state = ?, updated_at = ?
+		 WHERE host_name = ? AND deleted_at IS NULL`
 	hostMembershipIsolateSQL = `UPDATE host_membership SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
 		 WHERE host_name = ? AND deleted_at IS NULL AND isolation_epoch = 0`
 	hostMembershipClearIsolationSQL = `UPDATE host_membership SET isolation_epoch = 0, isolation_reason = '', updated_at = ?
@@ -304,6 +338,12 @@ func membershipEpochIs(ctx context.Context, host string, want int64) func(tx *sq
 // which updated_at. Later statements in the entry override earlier ones.
 type unlatchedMembershipWrite struct {
 	host, ts string
+	// insert is true when the write is an INSERT INTO hosts, or a
+	// re-admission (readmitHostSQL): the identity row is written whole, so
+	// the write may create a missing membership row and revive a tombstoned
+	// one (re-review 2, N5). Re-admission keeps isolation by contract.
+	insert   bool
+	revive   bool
 	hasState bool
 	state    string
 	hasIso   bool
@@ -372,6 +412,12 @@ func unlatchedMembershipWrites(stmts []Statement) []unlatchedMembershipWrite {
 			out = append(out, unlatchedMembershipWrite{host: host})
 		}
 		w := &out[i]
+		if sh.Kind == KindInsert {
+			w.insert = true
+		}
+		if isReadmit(s) {
+			w.insert, w.revive = true, true
+		}
 		if lwwOrder(w.ts, ts) < 0 {
 			w.ts = ts
 		}
@@ -430,6 +476,7 @@ const (
 		 WHERE host_name = ?`
 	absorbBothSQL = `UPDATE host_membership SET state = ?, isolation_epoch = ?, isolation_reason = ?, updated_at = ?
 		 WHERE host_name = ?`
+	absorbReviveSQL = `UPDATE host_membership SET state = ?, deleted_at = NULL, updated_at = ? WHERE host_name = ?`
 	absorbInsertSQL = `INSERT INTO host_membership (host_name, state, isolation_epoch, isolation_reason, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)`
 )
@@ -458,9 +505,16 @@ const (
 // from before a fence with nothing but anti-entropy to correct it. The absorb
 // runs in the same transaction and database as the statements that just
 // applied, so anything that fails it would fail them too.
-func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool) error {
+//
+// frozen (this node has latched host_membership_retire_v1): the hosts copy may
+// have stopped following, so a missing membership row is created only from a
+// write that carries everything itself — an INSERT INTO hosts, or a write that
+// sets both state and isolation. A partial write would otherwise fill the other
+// group from the frozen copy and stamp it with the write's new time.
+func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert, frozen bool) error {
 	for _, w := range unlatchedMembershipWrites(stmts) {
-		if err := absorbMembershipWrite(ctx, tx, w, w.ts, mayInsert); err != nil {
+		insert := mayInsert && (!frozen || w.insert || (w.hasState && w.hasIso))
+		if err := absorbMembershipWrite(ctx, tx, w, w.ts, insert, frozen); err != nil {
 			return fmt.Errorf("absorb hosts-only membership write for %s: %w", w.host, err)
 		}
 	}
@@ -470,7 +524,18 @@ func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Sta
 // absorbMembershipWrite writes one absorbed write, LWW-gated on updatedAt. It
 // takes updatedAt from its caller because an absorbed row carries the WRITE's
 // own updated_at, never a fresh clock: every node must compute the same row.
-func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string, mayInsert bool) error {
+//
+// One exception (re-review 3, R5): a re-admission that must CREATE the row on
+// a retired node (frozen) — the node lacks the host's tombstoned row. Its
+// isolation can only come from the frozen hosts copy, which may be behind the
+// epoch the nodes holding the tombstone revive with at the re-admission's own
+// timestamp, and an equal timestamp with a different epoch is a tie no rule
+// resolves. So the created row takes a fresh epoch strictly above the one this
+// node has seen, and is stamped one step past the floor copy of the
+// re-admission (membershipCopyTS): below any real write, so the revived row
+// replaces it on every node, and above a not-retired node's pass copy of the
+// same hosts row, which carries the lower epoch.
+func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string, mayInsert, frozen bool) error {
 	var hState, hReason string
 	var hEpoch int64
 	err := tx.QueryRowContext(ctx,
@@ -483,7 +548,8 @@ func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershi
 		return err
 	}
 	var memTS string
-	err = tx.QueryRowContext(ctx, `SELECT updated_at FROM host_membership WHERE host_name = ?`, w.host).Scan(&memTS)
+	var memDeleted sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT updated_at, deleted_at FROM host_membership WHERE host_name = ?`, w.host).Scan(&memTS, &memDeleted)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if !mayInsert {
@@ -496,12 +562,29 @@ func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershi
 		if w.hasIso {
 			epoch, reason = w.epoch, w.reason
 		}
-		_, err = tx.ExecContext(ctx, absorbInsertSQL, w.host, state, epoch, reason, updatedAt)
+		ts := updatedAt
+		if frozen && w.revive && !w.hasIso {
+			floor, ok := membershipCopyTS(updatedAt)
+			if ok {
+				ts, ok = clearTS(credentialSplitRow{srcTS: floor})
+			}
+			if !ok {
+				return nil // no stamp below the write: leave the row to anti-entropy
+			}
+			epoch++
+		}
+		_, err = tx.ExecContext(ctx, absorbInsertSQL, w.host, state, epoch, reason, ts)
 		return err
 	case err != nil:
 		return err
 	case lwwOrder(memTS, updatedAt) >= 0:
 		return nil // the membership row is as new or newer
+	}
+	if w.revive && memDeleted.Valid && w.hasState {
+		// A re-admission revives the host's tombstoned row: its state from
+		// the write, its isolation the tombstone's own (kept by contract).
+		_, err = tx.ExecContext(ctx, absorbReviveSQL, w.state, updatedAt, w.host)
+		return err
 	}
 	switch {
 	case w.hasState && w.hasIso:
@@ -535,14 +618,31 @@ type HostMembershipReport struct {
 	Copied int
 }
 
-// membershipCopyTS is the updated_at a copied row carries: the hosts row's. See
-// TIMESTAMPS above.
-func (c *Client) membershipCopyTS(hostsTS string) string {
-	if _, ok := tsInstant(hostsTS); ok {
-		return hostsTS
+// membershipCopyTS is the updated_at a copied row carries: a FLOOR — the hosts
+// row's instant moved back by membershipCopyFloorShift — so a copy only fills
+// an absence and never beats a real membership write, which carries a current
+// clock. Copies of one hosts row still order among themselves by that row (see
+// TIMESTAMPS above). ok is false for a hosts timestamp that cannot be read; the
+// copy is then not made, rather than stamped with a fresh clock that would
+// beat a real write.
+//
+// The floor matters because hosts.updated_at moves on every unrelated hosts
+// write (labels, role, region, version, resources, certificate, address) while
+// hosts.state can be stale — always, once host_membership_retire_v1 has
+// stopped writing it. A copy stamped with the hosts row's own timestamp would
+// then carry a stale state at a newer time than the real fence or drain, and
+// replicate over it everywhere.
+func membershipCopyTS(hostsTS string) (string, bool) {
+	at, ok := tsInstant(hostsTS)
+	if !ok {
+		return "", false
 	}
-	return c.NowTS()
+	return at.Add(-membershipCopyFloorShift).UTC().Format(nowTSLayout), true
 }
+
+// membershipCopyFloorShift puts every copy decades before any clock a real
+// membership write can carry.
+const membershipCopyFloorShift = 40 * 365 * 24 * time.Hour
 
 // SplitHostMembership gives every host that has no membership row one copied
 // from hosts. It never writes the hosts columns and never touches an existing
@@ -566,11 +666,21 @@ func (c *Client) splitHostMembershipLocked(ctx context.Context) (HostMembershipR
 		return rep, fmt.Errorf("host membership split: scan: %w", err)
 	}
 	var firstErr error
+	// Once the hosts copy is frozen (host_membership_retire_v1 latched here)
+	// it is no source for anything: a host with no membership row waits for a
+	// live writer, an absorb or anti-entropy, and reads as HostStateUnknown
+	// until then (resolve).
+	frozen := c.hostsCopyFrozen()
 	for _, r := range rows {
-		if r.memPresent {
+		if r.memPresent || frozen {
 			continue
 		}
-		wrote, err := c.writeMembershipRow(ctx, r.name, r.hosts, c.membershipCopyTS(r.hostsTS))
+		ts, ok := membershipCopyTS(r.hostsTS)
+		if !ok {
+			slog.Warn("host membership split: hosts row has no readable updated_at; not copied", "host", r.name)
+			continue
+		}
+		wrote, err := c.writeMembershipRow(ctx, r.name, r.hosts, ts)
 		if err != nil {
 			slog.Warn("host membership split: pass incomplete; retrying next cycle", "host", r.name, "error", err)
 			if firstErr == nil {
@@ -633,6 +743,20 @@ func (c *Client) withMembershipWrite(ctx context.Context, fn func(live bool) err
 		slog.Warn("host membership split: pass before a membership write failed", "error", err)
 	}
 	return fn(c.HostMembershipLive())
+}
+
+// membershipRowMissingFrozen reports whether a live state writer on this node
+// must not insert host's membership row: the hosts copy is frozen here and no
+// live row exists (hostMembershipStateOnlySQL).
+func membershipRowMissingFrozen(ctx context.Context, c *Client, host string) (bool, error) {
+	if !c.hostsCopyFrozen() {
+		return false, nil
+	}
+	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) == 1 && !rows[0].memPresent, nil
 }
 
 // currentIsolation is host's resolved isolation, for a live state writer's

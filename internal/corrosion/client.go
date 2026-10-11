@@ -403,6 +403,12 @@ type Client struct {
 	// columns keep their secrets, the dual-write build's behaviour.
 	credentialsClear atomic.Pointer[func() bool]
 
+	// hostMembershipRetire, when non-nil and returning true, stops the state
+	// and isolation writers writing the hosts copy (host_membership_retire_v1).
+	// Fails CLOSED when unset: both homes are written, the dual-write build's
+	// behaviour. See host_membership_retire.go.
+	hostMembershipRetire atomic.Pointer[func() bool]
+
 	// credentialsLive is set once this node has completed a SplitCredentials
 	// pass with the split gate open (credentials_live.go); durable through
 	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
@@ -1399,7 +1405,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1562,7 +1568,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

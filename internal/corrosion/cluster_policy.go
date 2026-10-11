@@ -152,13 +152,17 @@ type VoterRegionSets struct {
 	// RegionOf maps every non-deleted host, voter or not, to its region
 	// ("default" when unset). A fence target need not be a voter.
 	RegionOf map[string]string
+	// Uncounted is the voters that stay in a quorum's denominator but never
+	// count live (VoterSetWithUncounted), from the SAME read of host state
+	// as Voters.
+	Uncounted map[string]bool
 }
 
 // VoterRegions reads VoterSet and every host's region. It depends on
 // VoterSet's contract alone — a set of names — so it keeps working when that
 // set becomes an explicit voter configuration (colonelpanik/litevirt#251).
 func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
-	voters, err := VoterSet(ctx, c)
+	voters, uncounted, err := VoterSetWithUncounted(ctx, c)
 	if err != nil {
 		return VoterRegionSets{}, err
 	}
@@ -170,7 +174,7 @@ func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
 	for _, r := range rows {
 		regionOf[r.String("name")] = regionOrDefault(r.String("region"))
 	}
-	return VoterRegionSets{Voters: voters, RegionOf: regionOf}, nil
+	return VoterRegionSets{Voters: voters, RegionOf: regionOf, Uncounted: uncounted}, nil
 }
 
 // Region returns h's region, "default" for a host this set does not know.

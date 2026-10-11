@@ -26,10 +26,24 @@ import (
 // the iSCSI fleet tests' replication (iscsi-lun-report.md, round 3).
 //
 // So the harness refuses it. When a cluster stops, every node's mutation_log is
-// read back and each statement is fingerprinted exactly as a receiver would;
-// one no receiver can apply fails the test, naming the statement. Seed a
-// replicated row through a corrosion builder, or, where every node should hold
-// it without replication, write it on each with localExec (local_exec.go).
+// read back and each statement is checked against the receiver's first two
+// refusals: it must parse (corrosion.FingerprintSQL) and its shape must be in
+// the ledger (corrosion.LedgerLookup). One that fails either fails the test,
+// naming the statement; so does a log the check cannot read, because a
+// statement it cannot see is one it cannot clear. Seed a replicated row through
+// a corrosion builder, or, where every node should hold it without replication,
+// write it on each with localExec (local_exec.go).
+//
+// The check is narrower than the receiver, and deliberately so. The receiver
+// (Replicator.applyStatementLWW) also normalises a few prior-release shapes
+// through a legacy transformer before parsing, refuses a registered shape whose
+// parameter count does not match it, and refuses a capability-gated shape
+// emitted before its capability latched. This check reports none of those: a
+// wrong-arity write or a premature gated shape still stalls a stream unseen,
+// and a scenario that emits a prior-release statement the transformer accepts
+// would be reported although a receiver applies it. Product builders cannot
+// produce the first two (stmtshapecheck); a scenario emitting the third says
+// so with AllowUnregisteredReplicatedWrites.
 //
 // A shared-database cluster (SharedCRDT) replicates nothing and is not checked.
 // A scenario that writes an unregistered shape ON PURPOSE — to test the
@@ -48,32 +62,59 @@ func (c *Cluster) AllowUnregisteredReplicatedWrites(reason string) {
 }
 
 // checkReplicatedShapes is the stop-time check described above. It runs once,
-// from Stop, before any database closes.
+// from Stop, before any database closes, and reports through shapeErrorf
+// (t.Errorf unless a test of the check itself captures it).
 func (c *Cluster) checkReplicatedShapes() {
-	if c.shapesChecked || c.opts.SharedCRDT || c.unregisteredAllowed != "" {
-		c.shapesChecked = true
+	if c.shapesChecked {
 		return
 	}
 	c.shapesChecked = true
-	bad := unregisteredReplicatedStatements(c.Nodes)
-	if len(bad) == 0 {
-		return
+	if report := c.replicatedShapeReport(); report != "" {
+		errorf := c.shapeErrorf
+		if errorf == nil {
+			errorf = c.t.Errorf
+		}
+		errorf("%s", report)
+	}
+}
+
+// replicatedShapeReport is what checkReplicatedShapes fails the test with, or
+// "" when there is nothing to report.
+func (c *Cluster) replicatedShapeReport() string {
+	if c.opts.SharedCRDT || c.unregisteredAllowed != "" {
+		return ""
+	}
+	bad, unreadable := unregisteredReplicatedStatements(c.Nodes)
+	if len(bad) == 0 && len(unreadable) == 0 {
+		return ""
 	}
 	mode := "scenario-steered replication"
 	if c.opts.IndependentReplicas {
 		mode = "IndependentReplicas"
 	}
-	c.t.Errorf("fleet (%s): the scenario logged %d replicated statement shape(s) no receiver applies. "+
-		"Each one back-pressures replication from the node that wrote it for the rest of the test, "+
-		"so an assertion that something did not reach a peer can pass vacuously. Write the row "+
-		"through a corrosion builder, or locally on each node that should hold it (localExec):\n%s",
-		mode, len(bad), strings.Join(bad, "\n"))
+	var b strings.Builder
+	if len(bad) > 0 {
+		fmt.Fprintf(&b, "fleet (%s): the scenario logged %d replicated statement shape(s) no receiver applies. "+
+			"Each one back-pressures replication from the node that wrote it for the rest of the test, "+
+			"so an assertion that something did not reach a peer can pass vacuously. Write the row "+
+			"through a corrosion builder, or locally on each node that should hold it (localExec):\n%s",
+			mode, len(bad), strings.Join(bad, "\n"))
+	}
+	if len(unreadable) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "fleet (%s): the replicated-shape check could not read every node's mutation_log, "+
+			"so it cannot clear what it did not see:\n%s", mode, strings.Join(unreadable, "\n"))
+	}
+	return b.String()
 }
 
 // unregisteredReplicatedStatements reads every node's mutation_log and returns,
 // once per distinct SQL, each statement a receiver would refuse as an
-// unparseable or unregistered shape, with the nodes that logged it.
-func unregisteredReplicatedStatements(nodes []*Node) []string {
+// unparseable or unregistered shape, with the nodes that logged it; and, in
+// unreadable, every log or entry it could not read.
+func unregisteredReplicatedStatements(nodes []*Node) (bad, unreadable []string) {
 	ctx := context.Background()
 	where := map[string]map[string]bool{} // sql → node names
 	why := map[string]string{}
@@ -81,17 +122,22 @@ func unregisteredReplicatedStatements(nodes []*Node) []string {
 		if n.DB == nil {
 			continue
 		}
-		rows, err := n.DB.DB().QueryContext(ctx, `SELECT stmts FROM mutation_log`)
+		rows, err := n.DB.DB().QueryContext(ctx, `SELECT seq, stmts FROM mutation_log`)
 		if err != nil {
-			continue // closed or never opened: nothing this check can read
+			unreadable = append(unreadable, fmt.Sprintf("  - %s: read mutation_log: %v", n.Name, err))
+			continue
 		}
 		for rows.Next() {
+			var seq int64
 			var raw string
-			if rows.Scan(&raw) != nil {
+			if err := rows.Scan(&seq, &raw); err != nil {
+				unreadable = append(unreadable, fmt.Sprintf("  - %s: scan mutation_log: %v", n.Name, err))
 				continue
 			}
 			var stmts []corrosion.Statement
-			if json.Unmarshal([]byte(raw), &stmts) != nil {
+			if err := json.Unmarshal([]byte(raw), &stmts); err != nil {
+				// An undecodable entry back-pressures a receiver too.
+				unreadable = append(unreadable, fmt.Sprintf("  - %s: mutation_log seq %d does not decode: %v", n.Name, seq, err))
 				continue
 			}
 			for _, s := range stmts {
@@ -111,18 +157,20 @@ func unregisteredReplicatedStatements(nodes []*Node) []string {
 				why[s.SQL] = reason
 			}
 		}
+		if err := rows.Err(); err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("  - %s: read mutation_log: %v", n.Name, err))
+		}
 		rows.Close()
 	}
-	var out []string
 	for sql, ns := range where {
 		var names []string
 		for n := range ns {
 			names = append(names, n)
 		}
 		sort.Strings(names)
-		out = append(out, fmt.Sprintf("  - %s (%s; logged on %s)",
+		bad = append(bad, fmt.Sprintf("  - %s (%s; logged on %s)",
 			strings.Join(strings.Fields(sql), " "), why[sql], strings.Join(names, ", ")))
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(bad)
+	return bad, unreadable
 }

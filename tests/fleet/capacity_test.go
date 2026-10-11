@@ -34,12 +34,17 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// setHostCapacity sizes a node's physical totals. Written on every node so each
-// one's view agrees — admission runs on the entry node as well as the owner —
-// and through corrosion.UpdateHostResources, a registered statement shape, so
-// on independent replicas each write replicates like any other instead of
-// back-pressuring the node's stream (replicated_shapes.go). The host's
-// disk_total is kept as it is.
+// setHostCapacity sizes a node's physical totals and clears its per-host memory
+// reserve back to the cluster default (-1). Written on every node so each
+// one's view agrees — admission runs on the entry node as well as the owner.
+//
+// The totals go through corrosion.UpdateHostResources, a registered statement
+// shape, so on independent replicas each write replicates like any other
+// instead of back-pressuring the node's stream (replicated_shapes.go). The
+// host's disk_total is kept as it is. No production statement clears the
+// reserve alone, so that half is written locally on each node (localExec), as
+// the old raw write effectively was: a scenario that sets a reserve with
+// setHostMemReserve must do so AFTER sizing the host.
 func setHostCapacity(t *testing.T, c *Cluster, host string, cpuTotal, memTotal int) {
 	t.Helper()
 	ctx := context.Background()
@@ -50,6 +55,9 @@ func setHostCapacity(t *testing.T, c *Cluster, host string, cpuTotal, memTotal i
 		}
 		if err := corrosion.UpdateHostResources(ctx, n.DB, host, cpuTotal, memTotal, rec.DiskTotal); err != nil {
 			t.Fatalf("size host %s on %s: %v", host, n.Name, err)
+		}
+		if err := localExec(ctx, n.DB, `UPDATE hosts SET mem_reserve_mib = -1 WHERE name = ?`, host); err != nil {
+			t.Fatalf("clear host %s's memory reserve on %s: %v", host, n.Name, err)
 		}
 	}
 }

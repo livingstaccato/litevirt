@@ -41,6 +41,27 @@
 //
 // Membership is seeded, not gossiped (seedGossipMembership), in every mode —
 // unless Options.RealGossip gives every node a real memberlist (gossip_real.go).
+//
+// # Three things a scenario author trips over
+//
+//   - Seeding state. A raw n.DB.Execute is a REPLICATED write: it is logged for
+//     every peer, and a shape the compatibility ledger does not know is refused
+//     by every receiver and stalls the writer's stream for the rest of the
+//     test. Cluster.Stop fails any test (SharedCRDT excepted) that logged one,
+//     naming the statement (replicated_shapes.go). Seed a row peers should get
+//     through the corrosion builder production uses; seed a row, a tamper or a
+//     failure-injection trigger meant for ONE node with localExec
+//     (local_exec.go), which logs nothing.
+//   - Who a call comes from. A node's call to another node arrives from that
+//     node's address in 192.0.2.0/24, not loopback, so the receiver classifies
+//     it as a cluster PEER, as production does; SelfClient (a node's own
+//     certificate) stays on loopback, the on-node root. RemoteClient presents a
+//     node's own certificate from off the box. FLEET_LOOPBACK_PEERS=1 restores
+//     the old all-loopback view for an audit (peer_identity.go).
+//   - Forwarded identity is off unless a scenario turns it on
+//     (Server.SetForwardedIdentity plus a latched forwarded_identity_v1), so a
+//     forwarded call runs as the forwarding peer by default
+//     (TestFleet_PeerIdentity_TheOwnerJudgesAForwardedCallAsTheUser shows both).
 package fleet
 
 import (
@@ -204,6 +225,9 @@ type Cluster struct {
 	// (replicated_shapes.go).
 	shapesChecked       bool
 	unregisteredAllowed string
+	// shapeErrorf, when set, receives the check's failure instead of t.Errorf:
+	// how a test of the check itself observes it.
+	shapeErrorf func(format string, args ...any)
 	// remote marks the connections RemoteClient dialled (peer_identity.go).
 	remote remoteMarks
 }

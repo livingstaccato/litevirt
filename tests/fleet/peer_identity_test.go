@@ -9,6 +9,7 @@ package fleet
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -134,12 +135,45 @@ func TestFleet_PeerIdentity_TheOwnerJudgesAForwardedCallAsTheUser(t *testing.T) 
 	if err := corrosion.RevokeSession(ctx, owner.DB, sid); err != nil {
 		t.Fatalf("revoke on %s: %v", owner.Name, err)
 	}
+	// The precondition the refusal below depends on: the entry node, which has
+	// not heard of the revocation, still accepts the session. Without it an
+	// Unauthenticated could be the entry's own refusal, never reaching the owner.
+	if _, err := op.ListVMs(ctx, &pb.ListVMsRequest{}); err != nil {
+		t.Fatalf("the entry node no longer accepts the session (the revocation reached it?): %v", err)
+	}
+	if s, _ := corrosion.GetSession(ctx, entry.DB, sid); s == nil || s.RevokedAt != "" {
+		t.Fatalf("the entry node's copy of the session is %+v; the scenario needs it live there", s)
+	}
 	_, err = op.StopVM(ctx, &pb.StopVMRequest{Name: "fw-revoked", Force: true})
-	if status.Code(err) != codes.Unauthenticated {
-		t.Fatalf("forwarded stop with a session the owner holds revoked: err = %v, want Unauthenticated — "+
-			"the owner judged the forwarded call as the forwarding peer, not as the operator", err)
+	// "forwarded session revoked" is the OWNER's refusal of a promoted bearer
+	// (authenticateForwardedBearer); the entry's own would not say forwarded.
+	if status.Code(err) != codes.Unauthenticated || !strings.Contains(status.Convert(err).Message(), "forwarded session revoked") {
+		t.Fatalf("forwarded stop with a session the owner holds revoked: err = %v, want the owner's Unauthenticated "+
+			"(forwarded session revoked) — the owner judged the forwarded call as the forwarding peer, not as the operator", err)
 	}
 	if st, _ := owner.Virt.DomainState("fw-revoked"); st != "running" {
 		t.Fatalf("fw-revoked is %q on %s; a revoked session stopped it", st, owner.Name)
+	}
+}
+
+// TestFleetHarness_ARemoteClientMarkIsGoneOnceItsConnectionCloses: the mark
+// RemoteClient leaves on a connection's local address is removed when the
+// connection closes, so a later loopback connection the kernel hands the same
+// ephemeral port is classified on its own certificate, not as a peer.
+func TestFleetHarness_ARemoteClientMarkIsGoneOnceItsConnectionCloses(t *testing.T) {
+	var m remoteMarks
+	a, b := net.Pipe()
+	defer b.Close()
+	const addr = "127.0.0.1:40000"
+	m.mark(addr, 1)
+	conn := &markedConn{Conn: a, unmark: func() { m.unmark(addr) }}
+	if i, ok := m.lookup(addr); !ok || i != 1 {
+		t.Fatalf("lookup before close = %d, %v; want 1, true", i, ok)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.lookup(addr); ok {
+		t.Fatal("the mark outlived its connection")
 	}
 }

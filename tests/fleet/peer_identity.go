@@ -74,6 +74,26 @@ func (m *remoteMarks) mark(addr string, i int) {
 	m.addrs[addr] = i
 }
 
+// unmark forgets addr once its connection has closed, so a later loopback
+// connection the kernel gives the same ephemeral port is not taken for it.
+func (m *remoteMarks) unmark(addr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.addrs, addr)
+}
+
+// markedConn is a RemoteClient connection: closing it removes its mark.
+type markedConn struct {
+	net.Conn
+	once   sync.Once
+	unmark func()
+}
+
+func (c *markedConn) Close() error {
+	c.once.Do(c.unmark)
+	return c.Conn.Close()
+}
+
 func (m *remoteMarks) lookup(addr string) (int, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -164,9 +184,10 @@ func (c *Cluster) RemoteClient(target *Node) pb.LiteVirtClient {
 				return nil, err
 			}
 			// Marked before the TLS handshake starts, so before the server
-			// can have accepted a single RPC on it.
-			c.remote.mark(conn.LocalAddr().String(), idx)
-			return conn, nil
+			// can have accepted a single RPC on it; unmarked when it closes.
+			local := conn.LocalAddr().String()
+			c.remote.mark(local, idx)
+			return &markedConn{Conn: conn, unmark: func() { c.remote.unmark(local) }}, nil
 		}),
 	)
 	if err != nil {

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/tests/e2e/labsecret"
 )
 
 // One iSCSI LUN, one disk, on the nested lab (E2E_LAB_DIR; skipped without it,
@@ -33,7 +35,9 @@ import (
 // A node whose open-iscsi default is CHAP (node.session.auth.authmethod =
 // CHAP in /etc/iscsi/iscsid.conf) can log in only to a CHAP target: the test
 // target then uses CHAP with E2E_ISCSI_CHAP_USER / E2E_ISCSI_CHAP_PASSWORD
-// (that default's credentials), and without them the test skips saying so.
+// (that default's credentials, sent on stdin and redacted from any error), and
+// without them the test skips saying so — as it does when the nodes' defaults
+// disagree.
 //
 // Run it with:
 //
@@ -57,23 +61,39 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 	// the credentials E2E_ISCSI_CHAP_USER / E2E_ISCSI_CHAP_PASSWORD name —
 	// those of that default — or the test skips: a no-auth target cannot be
 	// logged in to with a CHAP default.
+	// The default is read on each node; nodes that disagree skip (the test
+	// target has one auth setting for both). The credentials go to node 1 on
+	// stdin only, and a failure's error is redacted (labsecret): never on a
+	// command line, never in test output.
 	auth := "authentication=0"
-	var chapUser, chapPass string
+	var chapNodes, plainNodes []string
 	for _, h := range []string{h1, h2} {
-		out, _ := l.ssh(h, 20*time.Second, iscsiCHAPDefaultProbe)
-		if strings.TrimSpace(out) != "chap" {
-			continue
+		out, err := l.ssh(h, 20*time.Second, iscsiCHAPDefaultProbe)
+		if err != nil {
+			t.Fatalf("read the open-iscsi auth default on %s: %v", h, err)
 		}
-		user, pass := os.Getenv("E2E_ISCSI_CHAP_USER"), os.Getenv("E2E_ISCSI_CHAP_PASSWORD")
-		if user == "" || pass == "" {
-			t.Skipf("%s logs in to iSCSI targets with CHAP by default (node.session.auth.authmethod = CHAP in "+
+		if strings.TrimSpace(out) == "chap" {
+			chapNodes = append(chapNodes, h)
+		} else {
+			plainNodes = append(plainNodes, h)
+		}
+	}
+	var chapUser, chapPass string
+	switch {
+	case len(chapNodes) > 0 && len(plainNodes) > 0:
+		t.Skipf("the nodes' open-iscsi auth defaults disagree (CHAP on %s, none on %s): the test target has one auth "+
+			"setting, so one of them could not log in — give the nodes one default (/etc/iscsi/iscsid.conf)",
+			strings.Join(chapNodes, ", "), strings.Join(plainNodes, ", "))
+	case len(chapNodes) > 0:
+		chapUser, chapPass = os.Getenv("E2E_ISCSI_CHAP_USER"), os.Getenv("E2E_ISCSI_CHAP_PASSWORD")
+		if chapUser == "" || chapPass == "" {
+			t.Skipf("%s log in to iSCSI targets with CHAP by default (node.session.auth.authmethod = CHAP in "+
 				"/etc/iscsi/iscsid.conf), and litevirt's iscsi pools carry no credentials of their own, so the "+
 				"test's no-auth target cannot be logged in to: set E2E_ISCSI_CHAP_USER and E2E_ISCSI_CHAP_PASSWORD "+
-				"to that default's node.session.auth.username and password to serve it with CHAP", h)
+				"to that default's node.session.auth.username and password to serve it with CHAP",
+				strings.Join(chapNodes, ", "))
 		}
 		auth = "authentication=1"
-		chapUser, chapPass = user, pass
-		break
 	}
 	addr := l.mustSQL(h1, "SELECT address FROM hosts WHERE name = '"+h1+"' AND deleted_at IS NULL")
 	if len(addr) != 1 || addr[0][0] == "" {
@@ -94,16 +114,19 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		setup = append(setup, fmt.Sprintf("targetcli /iscsi/%s/tpg1/luns create /backstores/fileio/lve2e-%s-%d", iqn, suffix, i))
 	}
-	setup = append(setup, "targetcli /iscsi/"+iqn+"/tpg1 set attribute generate_node_acls=1 demo_mode_write_protect=0 "+auth+" cache_dynamic_acls=1")
-	if chapUser != "" {
-		setup = append(setup, "targetcli /iscsi/"+iqn+"/tpg1 set auth userid="+shellQuote(chapUser)+" password="+shellQuote(chapPass))
-	}
 	l.mustSSH(h1, 2*time.Minute, strings.Join(setup, " && "))
 	t.Cleanup(func() {
 		l.ssh(h1, time.Minute, fmt.Sprintf(
 			"targetcli /iscsi delete %[1]s; for i in 0 1; do targetcli /backstores/fileio delete lve2e-%[2]s-$i; rm -f /var/tmp/lve2e-%[2]s-$i.img; done",
 			iqn, suffix))
 	})
+	if chapUser != "" {
+		run := func(cmd, stdin string) (string, error) { return l.sshInput(h1, time.Minute, cmd, stdin) }
+		if err := labsecret.SetTPGCHAP(run, iqn, chapUser, chapPass); err != nil {
+			t.Fatal(err) // redacted
+		}
+	}
+	l.mustSSH(h1, time.Minute, "targetcli /iscsi/"+iqn+"/tpg1 set attribute generate_node_acls=1 demo_mode_write_protect=0 "+auth+" cache_dynamic_acls=1")
 
 	pool := func(lun int) string { return fmt.Sprintf("lun%d-%s", lun, suffix) }
 	for _, h := range []string{h1, h2} {

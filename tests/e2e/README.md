@@ -151,7 +151,7 @@ drive a local `lv`).
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
 | `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
-| `E2E_ISCSI_CHAP_USER` / `E2E_ISCSI_CHAP_PASSWORD` | (none) | `TestLab_ISCSIOneDiskPerLUN` on nodes whose open-iscsi default is CHAP (`node.session.auth.authmethod = CHAP` in `/etc/iscsi/iscsid.conf`): that default's username and password, which the test target is then served with. Without them such a lab skips the test, saying why |
+| `E2E_ISCSI_CHAP_USER` / `E2E_ISCSI_CHAP_PASSWORD` | (none) | `TestLab_ISCSIOneDiskPerLUN` on nodes whose open-iscsi default is CHAP (`node.session.auth.authmethod = CHAP` in `/etc/iscsi/iscsid.conf`): that default's username and password, which the test target is then served with — handed to the node on stdin, never on a command line or in test output. Without them such a lab skips the test, saying why; so do nodes whose defaults disagree |
 
 ### The drills
 

@@ -251,9 +251,20 @@ func (l *lab) closeMaster(host string) {
 // ssh runs a shell command on host, bounded by timeout. It never fails the
 // test: callers decide what an error means.
 func (l *lab) ssh(host string, timeout time.Duration, cmd string) (string, error) {
+	return l.sshInput(host, timeout, cmd, "")
+}
+
+// sshInput is ssh with stdin as the remote command's standard input: how a
+// secret reaches a node without being on any command line
+// (tests/e2e/labsecret). Its error quotes cmd, never stdin — and a caller
+// handing a secret still redacts it.
+func (l *lab) sshInput(host string, timeout time.Duration, cmd, stdin string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	c := exec.CommandContext(ctx, "ssh", append(l.sshArgs(host), cmd)...)
+	if stdin != "" {
+		c.Stdin = strings.NewReader(stdin)
+	}
 	c.WaitDelay = 2 * time.Second
 	// stdout only: the CLI prints notes on stderr (`lv host inspect` follows its
 	// JSON with one), and stderr belongs in the error, not in parsed output.

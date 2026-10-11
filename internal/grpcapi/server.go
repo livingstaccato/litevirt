@@ -807,8 +807,23 @@ type Server struct {
 	// gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
-	gate          serverGate
-	onGateRefused func(action, reason string)
+	gate serverGate
+	// releaseFeatures opens a release feature (WithReleaseFeature): the
+	// checker's WithFeature in production. Nil refuses every feature.
+	releaseFeatures releaseFeatureGate
+	// releasePeerMu guards the release-peer refusal state (ReleasePeerAllowed).
+	releasePeerMu      sync.Mutex
+	releaseUsed        []string
+	releaseUsedAt      time.Time
+	releasePeerRefused map[string]time.Time
+	releasePeerLast    map[string]*peerCapsEntry
+	// releaseRollout: the HA monitor's cached rollout answers
+	// (releaseRolloutLagging). Guarded by releasePeerMu.
+	releaseRollout map[string]*rolloutAnswer
+	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
+	// adopted, which Ping reports (PingResponse.voter_generation).
+	adoptedVoterGen atomic.Int64
+	onGateRefused   func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 
@@ -1493,10 +1508,6 @@ func (s *Server) tokenEnabled(token string) bool {
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
 		return true
-	case capabilities.EmailTargetSecretV1:
-		// No kill switch: it says this build masks an email target's SMTP
-		// password on read, a fact about the binary.
-		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.RecoveryClaimV1:
@@ -2149,6 +2160,11 @@ func (s *Server) SetDNSDomain(domain string) {
 // SetReplicator attaches the WAL-based replicator to the server.
 func (s *Server) SetReplicator(r *corrosion.Replicator) {
 	s.replicator = r
+	// Every push declares what this node advertises (ReplicateRequest.
+	// sender_capabilities), so a receiver can judge it without dialling back.
+	if r != nil {
+		r.SetAdvertisedCapabilities(s.DeclaredCapabilities)
+	}
 }
 
 // SetStoragePools configures host-level storage pool references for volume resolution.

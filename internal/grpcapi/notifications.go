@@ -120,16 +120,24 @@ func (s *Server) CreateNotificationTarget(ctx context.Context, req *pb.CreateNot
 	if cerr != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
 	}
-	// An email target's SMTP password replicates in the row, and a host on an
-	// older build would list it unmasked. Hold it back until every host masks.
-	if notify.HasSecret(req.Type, cfg) && !(s.gate != nil && s.gate.Enforced(ctx, capabilities.EmailTargetSecretV1)) {
-		return nil, status.Error(codes.FailedPrecondition,
-			"an email target with a password cannot be created yet: "+capabilities.EmailTargetSecretV1+
-				" has not latched cluster-wide, because at least one host still runs a build that would show the stored "+
-				"password unmasked. Finish the rolling upgrade first, or create the target without a password")
-	}
 	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: cfg, Enabled: req.Enabled}
-	if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
+	if notify.HasSecret(req.Type, cfg) {
+		// An email target's SMTP password is data an older build does not
+		// mask or keep, so it is written through the release gate on this node,
+		// which refuses (FailedPrecondition) until release_2026_11_v1 has latched
+		// and records the feature's use first. A passwordless email target, and
+		// every other type, is not gated.
+		err := s.WithReleaseFeature(ctx, capabilities.FeatureEmailTargetSecret,
+			func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertEmailTargetWithSecret(ctx, s.db, g, t)
+			})
+		if err != nil {
+			if _, ok := status.FromError(err); ok {
+				return nil, err
+			}
+			return nil, status.Errorf(codes.Internal, "create target: %v", err)
+		}
+	} else if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
 		return nil, status.Errorf(codes.Internal, "create target: %v", err)
 	}
 	slog.Info("notification target created", "name", t.Name, "type", t.Type)

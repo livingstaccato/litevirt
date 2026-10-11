@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // NotificationTarget is a configured delivery destination (#5).
@@ -23,6 +25,19 @@ type NotificationRoute struct {
 	TargetID       string
 	MinSeverity    string // info | warn | error
 	Enabled        bool
+}
+
+// InsertEmailTargetWithSecret stores an email notification target whose config
+// carries an SMTP password: the data of capabilities.FeatureEmailTargetSecret.
+// It takes the FeatureGrant the release-feature gate hands out and refuses
+// without it, so no code path can store such a row without the feature's used
+// bit having been recorded first. A target without a secret, and every other
+// target type, goes through InsertNotificationTarget unchanged.
+func InsertEmailTargetWithSecret(ctx context.Context, c *Client, g capabilities.FeatureGrant, t NotificationTarget) error {
+	if err := g.Check(capabilities.FeatureEmailTargetSecret); err != nil {
+		return err
+	}
+	return InsertNotificationTarget(ctx, c, t)
 }
 
 func InsertNotificationTarget(ctx context.Context, c *Client, t NotificationTarget) error {

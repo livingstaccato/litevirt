@@ -1,10 +1,13 @@
 package grpcapi
 
 import (
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -97,13 +100,16 @@ func TestListNotificationTargets_EmailPasswordMaskedForEveryRole(t *testing.T) {
 	}
 }
 
-func latchedEmailGate() fakeServerGate {
-	return fakeServerGate{enforcedTok: map[string]bool{capabilities.EmailTargetSecretV1: true}}
+// openEmailFeature wires a release-feature gate that grants (the release token
+// has latched), so a create reaches the writer with its FeatureGrant.
+func openEmailFeature(t *testing.T, s *Server) {
+	t.Helper()
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 }
 
 func TestCreateNotificationTarget_EmailValidated(t *testing.T) {
 	s := testServer(t)
-	s.gate = latchedEmailGate()
+	openEmailFeature(t, s)
 	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: `{"host":"h"}`, Enabled: true})
 	if err == nil {
 		t.Fatal("invalid email config accepted")
@@ -116,7 +122,7 @@ func TestCreateNotificationTarget_EmailValidated(t *testing.T) {
 // I-2: the create response must not echo the password.
 func TestCreateNotificationTarget_ResponseMasksPassword(t *testing.T) {
 	s := testServer(t)
-	s.gate = latchedEmailGate()
+	openEmailFeature(t, s)
 	pt, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +140,7 @@ func TestCreateNotificationTarget_ResponseMasksPassword(t *testing.T) {
 // I-1: a differently-cased key is stored canonically and masked on list.
 func TestCreateNotificationTarget_MixedCasePasswordCanonicalAndMasked(t *testing.T) {
 	s := testServer(t)
-	s.gate = latchedEmailGate()
+	openEmailFeature(t, s)
 	cfg := `{"Host":"smtp.example.com","From":"lv@example.com","To":["ops@example.com"],"Username":"u","Password":"MixedCasePw"}`
 	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: cfg, Enabled: true}); err != nil {
 		t.Fatal(err)
@@ -151,28 +157,50 @@ func TestCreateNotificationTarget_MixedCasePasswordCanonicalAndMasked(t *testing
 	}
 }
 
-// Rolling upgrade: an email target with a password is refused until the token
-// latches; one without a password is always allowed.
-func TestCreateNotificationTarget_EmailPasswordGatedOnCapability(t *testing.T) {
-	s := testServer(t) // no gate / not latched
+// Rolling upgrade: an email target with a password is refused until the release
+// token has latched; one without a password is never gated.
+func TestCreateNotificationTarget_EmailPasswordGatedOnReleaseFeature(t *testing.T) {
+	s := testServer(t) // no release-feature gate wired: fail closed
 	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true})
-	if err == nil || !strings.Contains(err.Error(), "email_target_secret_v1") || !strings.Contains(err.Error(), "upgrade") {
-		t.Fatalf("want a refusal naming the token and the upgrade, got %v", err)
+	if status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "the cluster upgrade must finish first (email_target_secret needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("want the release refusal naming the feature and token, got %v", err)
 	}
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.EmailTargetSecretV1: false}}
-	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); err == nil {
-		t.Fatal("accepted with the token unlatched")
+	refusal := status.Error(codes.FailedPrecondition, "the cluster upgrade must finish first (email_target_secret needs "+capabilities.ReleaseToken+"): x")
+	s.SetReleaseFeatureGate(fakeFeatureGate{err: refusal})
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); !errors.Is(err, refusal) {
+		t.Fatalf("want the gate's refusal unchanged, got %v", err)
+	}
+	if rows, _ := corrosion.ListNotificationTargets(adminCtx(), s.db); len(rows) != 0 {
+		t.Fatalf("a refused create left %d rows", len(rows))
 	}
 	nopw := `{"host":"smtp.example.com","from":"lv@example.com","to":["ops@example.com"]}`
 	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m2", Type: "email", Config: nopw, Enabled: true}); err != nil {
 		t.Fatalf("passwordless email target refused: %v", err)
+	}
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "w", Type: "webhook", Config: `{"url":"http://x"}`, Enabled: true}); err != nil {
+		t.Fatalf("webhook target refused: %v", err)
+	}
+	openEmailFeature(t, s)
+	if _, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: emailSecret, Enabled: true}); err != nil {
+		t.Fatalf("create through an open gate: %v", err)
+	}
+}
+
+// The writer refuses a call that did not come through the gate.
+func TestInsertEmailTargetWithSecret_RefusesWithoutGrant(t *testing.T) {
+	s := testServer(t)
+	err := corrosion.InsertEmailTargetWithSecret(context.Background(), s.db, capabilities.FeatureGrant{},
+		corrosion.NotificationTarget{ID: "x", Name: "x", Type: "email", Config: emailSecret, Enabled: true})
+	if !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Fatalf("want ErrNoFeatureGrant, got %v", err)
 	}
 }
 
 // N-5: an unknown key is refused with InvalidArgument naming it.
 func TestCreateNotificationTarget_EmailUnknownKeyRejectedByName(t *testing.T) {
 	s := testServer(t)
-	s.gate = latchedEmailGate()
+	openEmailFeature(t, s)
 	cfg := `{"host":"h","from":"a@b.c","to":["x@y.z"],"passwrd":"typo"}`
 	_, err := s.CreateNotificationTarget(adminCtx(), &pb.CreateNotificationTargetRequest{Name: "m", Type: "email", Config: cfg, Enabled: true})
 	if err == nil || status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "passwrd") {

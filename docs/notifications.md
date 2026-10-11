@@ -149,10 +149,12 @@ An unknown key in the email config is refused by name. The config is stored cano
 only) so a differently-cased `Password` key cannot dodge the masking. To change the
 password, delete and re-add the target.
 
-**Rolling upgrade.** Creating an email target *with a password* is refused until the
-mandatory, replication-gated `email_target_secret_v1` token has latched, i.e. every
-host runs a build that masks the password on read; the refusal says to finish the
-upgrade first. A passwordless email target (an open relay or IP-allowlisted relay) can
+**Rolling upgrade.** Creating an email target *with a password* is the
+`email_target_secret` feature of the release token `release_2026_11_v1`: it is refused
+(`the cluster upgrade must finish first (email_target_secret needs release_2026_11_v1)`)
+until every host runs a build that masks the password on read and the token has latched;
+the first create after the latch is recorded as the feature's use. See `lv cluster
+upgrade-status`. A passwordless email target (an open relay or IP-allowlisted relay) can
 be created at any time. Hosts still on an older build do not know the `email` type: they
 log `notify: bad target config` and send **no email** for events they handle, so email
 coverage has gaps (and a warning per event in those hosts' logs) until the rollout

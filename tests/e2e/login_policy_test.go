@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/tests/e2e/e2ehelp"
+	"github.com/litevirt/litevirt/tests/e2e/labsecret"
 )
 
 // Login rules on the live lab: an account disabled on one node stops
@@ -20,14 +23,37 @@ import (
 
 var tokenLine = regexp.MustCompile(`(?m)^Token:\s+([0-9a-f]{64})\s*$`)
 
+// e2eUserPassword is the throwaway password of the test users. It is a
+// credential like any other: it never reaches a failure message or a log.
+const e2eUserPassword = "e2e-password-0123456789"
+
 // lvAs runs the CLI on host with an API token, so the call authenticates as
-// that token's user rather than as the host.
+// that token's user rather than as the host. The token rides on the remote
+// command line, which an ssh error quotes, so the output and the error are
+// redacted of it before they leave this function.
 func (l *lab) lvAs(host, token string, args ...string) (string, error) {
 	q := []string{"LV_TOKEN=" + shellQuote(token), shellQuote(l.lvPath)}
 	for _, a := range args {
 		q = append(q, shellQuote(a))
 	}
-	return l.ssh(host, 2*time.Minute, strings.Join(q, " "))
+	out, err := l.ssh(host, 2*time.Minute, strings.Join(q, " "))
+	return labsecret.Redact(out, token), e2ehelp.RedactError(err, token)
+}
+
+// quietFailure is the message for a failed command that carried a credential:
+// the command and the error with every secret redacted.
+func quietFailure(host string, args []string, err error, secrets []string) string {
+	return fmt.Sprintf("lv %s on %s: %v", labsecret.Redact(strings.Join(args, " "), secrets...), host, e2ehelp.RedactError(err, secrets...))
+}
+
+// mustLVQuiet is mustLV for a command that carries a credential.
+func (l *lab) mustLVQuiet(secrets []string, host string, args ...string) string {
+	l.t.Helper()
+	out, err := l.lv(host, args...)
+	if err != nil {
+		l.t.Fatal(quietFailure(host, args, err, secrets))
+	}
+	return out
 }
 
 func (l *lab) mintToken(host, user string) string {
@@ -35,7 +61,9 @@ func (l *lab) mintToken(host, user string) string {
 	out := l.mustLV(host, "user", "token-create", user, "e2e-"+user)
 	m := tokenLine.FindStringSubmatch(out)
 	if m == nil {
-		l.t.Fatalf("no token in `lv user token-create` output:\n%s", out)
+		// The output may hold a token in a shape the pattern missed: say how
+		// much there was, not what.
+		l.t.Fatalf("no token line in `lv user token-create` output (%d bytes, not shown: it may hold a credential)", len(out))
 	}
 	return m[1]
 }
@@ -44,7 +72,7 @@ func TestLab_DisabledAccountRefusedOnEveryNode(t *testing.T) {
 	l := newLab(t)
 	a, b, c := l.hosts[0], l.hosts[1], l.hosts[2]
 	user := fmt.Sprintf("e2e-bob-%d", time.Now().Unix())
-	l.mustLV(a, "user", "create", user, "--role", "operator", "--password", "e2e-password-0123456789")
+	l.mustLVQuiet([]string{e2eUserPassword}, a, "user", "create", user, "--role", "operator", "--password", e2eUserPassword)
 	l.onRestore(func() { _, _ = l.lv(a, "user", "delete", user) })
 	tok := l.mintToken(a, user)
 
@@ -96,7 +124,7 @@ func TestLab_DelegatedAdminStaysInItsProject(t *testing.T) {
 	pat, bob := fmt.Sprintf("e2e-pat-%d", sfx), fmt.Sprintf("e2e-bob-%d", sfx)
 	proj := fmt.Sprintf("/projects/e2e-acme-%d", sfx)
 	for _, u := range []string{pat, bob} {
-		l.mustLV(a, "user", "create", u, "--role", "viewer", "--password", "e2e-password-0123456789")
+		l.mustLVQuiet([]string{e2eUserPassword}, a, "user", "create", u, "--role", "viewer", "--password", e2eUserPassword)
 		u := u
 		l.onRestore(func() { _, _ = l.lv(a, "user", "delete", u) })
 	}
@@ -104,7 +132,25 @@ func TestLab_DelegatedAdminStaysInItsProject(t *testing.T) {
 	l.mustLV(a, "role", "grant", "PermissionAdmin", "user:"+pat+"@local", "--path", proj, "--propagate")
 	l.mustLV(a, "role", "grant", "VMOperator", "user:"+bob+"@local", "--path", proj+"/vms/seed", "--propagate")
 	tok := l.mintToken(a, pat)
-	time.Sleep(10 * time.Second) // let the bindings and the token reach b
+
+	// The delegated grant is judged against the engine snapshot of b, which
+	// reloads on its own schedule (about 30 s; 16 s was measured): until it
+	// has, b still sees pat as a viewer and refuses. So wait for the in-project
+	// grant to WORK, bounded, and only then check what must stay refused: a
+	// refusal before the snapshot loads would pass those checks for the wrong
+	// reason.
+	inProject := []string{"role", "grant", "VMOperator", "user:" + bob + "@local", "--path", proj, "--propagate"}
+	start := time.Now()
+	if err := e2ehelp.Eventually(60*time.Second, 2*time.Second, func() error {
+		out, err := l.lvAs(b, tok, inProject...)
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, out)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("delegated grant inside the project on %s never worked in 60s: %v", b, err)
+	}
+	l.mark("the delegated grant on %s worked after %v", b, time.Since(start).Round(time.Second))
 
 	for _, bad := range [][]string{
 		{"role", "grant", "Admin", "user:" + bob + "@local", "--path", proj, "--propagate"},
@@ -115,9 +161,6 @@ func TestLab_DelegatedAdminStaysInItsProject(t *testing.T) {
 		if out, err := l.lvAs(b, tok, bad...); err == nil {
 			t.Fatalf("delegated `lv %s` on %s succeeded:\n%s", strings.Join(bad, " "), b, out)
 		}
-	}
-	if out, err := l.lvAs(b, tok, "role", "grant", "VMOperator", "user:"+bob+"@local", "--path", proj, "--propagate"); err != nil {
-		t.Fatalf("delegated grant inside the project on %s: %v\n%s", b, err, out)
 	}
 	rows := l.mustSQL(a, fmt.Sprintf(
 		`SELECT role, path FROM role_bindings WHERE principal = 'user:%s@local' AND path != '%s'

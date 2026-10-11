@@ -243,3 +243,39 @@ func TestFleet_M9_AnUpdateCarryingThreeFeaturesTakesEveryGrant(t *testing.T) {
 		}
 	}
 }
+
+// A clone, once the release token has latched, takes the grant of every
+// feature its source's spec carries (limits, disk/NIC tuning, memory hot-add)
+// and records each: the clone writes that data again under a new name.
+//
+// Mutation (red): delete the clone's ioGrant (or passthroughGrant) block in
+// CloneVM — the clone is written without that feature's record.
+func TestFleet_M9_ACloneOfAThreeFeatureVMTakesEveryGrant(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	entry, src := c.Nodes[0], c.Nodes[1]
+	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	src.Server.SetBridgeEnsure(src.Net.EnsureBridge)
+	latchRelease(t, c)
+	spec := tunedSpec("tpl")
+	spec.CpuLimit = 1
+	spec.MemoryHotplugMaxMib, spec.MemoryHotplugBaseMib = 1024, 512 // a hot-add VM records its boot cell
+	seedCloneSourceSpec(t, c, src, spec)
+	for _, f := range vmSpecFeatures {
+		if featureUsedOn(t, src, capabilities.ReleaseToken, string(f)) {
+			t.Fatalf("%s is recorded before the clone", f)
+		}
+	}
+	var last error
+	eventually(t, 30*time.Second, "the clone to be accepted", func() bool {
+		_, last = cloneAt(t, c, entry, "tpl", "kid")
+		return last == nil || strings.Contains(last.Error(), "already exists")
+	})
+	for _, f := range vmSpecFeatures {
+		if !featureUsedOn(t, src, capabilities.ReleaseToken, string(f)) {
+			t.Errorf("the clone carrying %s did not record it", f)
+		}
+	}
+	if sp := specIOOn(t, src, "kid"); sp == nil || sp.CpuLimit != 1 || sp.MemoryHotplugMaxMib != 1024 || sp.Disks[0].Discard != "unmap" {
+		t.Errorf("clone spec = %+v, want the source's limit, hot-add ceiling and discard", sp)
+	}
+}

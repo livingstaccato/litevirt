@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -531,26 +532,33 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
-	// The release gates for what the clone's spec carries — its limits, its
-	// disk/NIC tuning, its memory hot-add (USB devices are not cloned) —
-	// immediately before the domain that holds them is defined; the row is
-	// written through the one writer that checks every grant (M9).
+	// The release gates for what the clone's spec carries, immediately before
+	// the domain that holds them is defined; the row is written through the
+	// one writer that checks every grant taken (M9). Limits are gated as a
+	// create's are. Disk/NIC tuning and memory hot-add (USB devices are not
+	// cloned) are copied from the source as the io and passthrough branches
+	// copy them: once the release token has latched their grants are taken
+	// (recording a first use, refusing as a create would); before it, the
+	// clone keeps its source's settings ungated, as those branches do.
 	var gs vmSpecGrants
 	if gs.limits, err = s.recordLimitedSpec(ctx, &srcSpec); err != nil {
 		cleanup()
 		return nil, err
 	}
-	if specSetsDiskNICIO(&srcSpec) {
+	cloneNeeds := corrosion.VMSpecFeatures{Limits: specSetsLimits(&srcSpec)}
+	if specSetsDiskNICIO(&srcSpec) && s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
 		if gs.tuning, err = s.ioGrant(ctx); err != nil {
 			cleanup()
 			return nil, err
 		}
+		cloneNeeds.Tuning = true
 	}
-	if vmSpecSetsPassthrough(&srcSpec) {
+	if vmSpecSetsPassthrough(&srcSpec) && s.ReleaseFeatureAvailable(capabilities.FeatureUSBMountsMemory) {
 		if gs.passthrough, err = s.passthroughGrant(ctx); err != nil {
 			cleanup()
 			return nil, err
 		}
+		cloneNeeds.Passthrough = true
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
@@ -615,7 +623,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if state == "running" {
 		insertState = "creating"
 	}
-	if err := s.insertVMWithGrants(ctx, &srcSpec, gs, corrosion.VMRecord{
+	if err := corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, cloneNeeds, corrosion.VMRecord{
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
 		State: insertState, CPUActual: cpu, MemActual: mem, Project: project,
 	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {

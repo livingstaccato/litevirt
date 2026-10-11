@@ -669,6 +669,17 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// cephSecrets remembers the ceph secrets this daemon defined (ceph_secrets.go).
+	cephSecrets cephSecretMarks
+	// cephProofs remembers, briefly, the ceph keys a start proved (ceph_probe.go).
+	cephProofs cephKeyProofs
+	// cephTrash is what the last scans of the ceph pools' trash found that no
+	// purge here tracks (ScanCephTrash).
+	cephTrash cephTrashScans
+	// cephKept is the ceph images a VM delete left in their pool (a client
+	// still had one open), named until gone or reattached (ceph_kept.go).
+	cephKept cephKeptImages
+
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).
 	poolUploadsMu sync.Mutex
@@ -2328,16 +2339,26 @@ func (s *Server) lookupStoragePool(name string) (StoragePoolRef, bool) {
 // cluster-wide upgrade resolved "" for the pool dir → "replica not found").
 // corrosion is always current, so consult it on a miss and warm the cache.
 func (s *Server) resolvePool(ctx context.Context, name string) (StoragePoolRef, bool) {
+	ref, ok, _ := s.resolvePoolErr(ctx, name)
+	return ref, ok
+}
+
+// resolvePoolErr is resolvePool that tells "this host has no such pool"
+// (ok false, nil) from "the table could not be read" (an error).
+func (s *Server) resolvePoolErr(ctx context.Context, name string) (StoragePoolRef, bool, error) {
 	if ref, ok := s.lookupStoragePool(name); ok {
-		return ref, true
+		return ref, true, nil
 	}
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, name)
-	if err != nil || !ok {
-		return StoragePoolRef{}, false
+	if err != nil {
+		return StoragePoolRef{}, false, err
+	}
+	if !ok {
+		return StoragePoolRef{}, false, nil
 	}
 	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
 	s.addStoragePoolRef(name, ref)
-	return ref, true
+	return ref, true, nil
 }
 
 // addStoragePoolRef inserts/updates one pool ref under the write lock, so a

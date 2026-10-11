@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	lvpkg "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -290,14 +294,26 @@ func newRmCmd() *cobra.Command {
 					// Ignore error — VM may already be stopped or not found.
 				}
 
+				var hdr metadata.MD
 				_, err := c.DeleteVM(ctx, &pb.DeleteVMRequest{
 					Name:      args[0],
 					KeepDisks: keepDisks,
-				})
+				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("delete VM: %w", err)
 				}
 				fmt.Printf("VM %s deleted\n", args[0])
+				// A ceph image the delete could not free (a client still
+				// has it open) stays in its pool: named here, and by the
+				// health condition, never left unnamed.
+				for _, v := range hdr.Get(grpcapi.KeptCephImageMD) {
+					var k grpcapi.KeptCephImage
+					if json.Unmarshal([]byte(v), &k) != nil {
+						continue
+					}
+					fmt.Printf("Kept ceph image %s (disk %s) in its pool: %s\n  It is named by the health condition ceph_image_leftover; see who has it open with: rbd status %s\n",
+						k.Image, k.Disk, k.Reason, k.Image)
+				}
 				return nil
 			})
 		},

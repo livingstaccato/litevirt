@@ -112,7 +112,7 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 	}
 	var diskConfigs []lv.DiskConfig
 	for _, d := range disks {
-		if _, err := os.Stat(d.Path); err != nil {
+		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
 			r.noteRekeyOnce(vm.Name, "a shared disk is not visible on this host", "disk", d.DiskName, "path", d.Path)
 			return
 		}

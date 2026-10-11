@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
+	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
@@ -474,8 +475,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
 	var createdDiskPaths []string
+	// A disk that is not a file (an rbd image) is removed by the driver that
+	// created it: os.Remove of "rbd:pool/image" removes nothing, which is how a
+	// failed create left its ceph images behind.
+	createdBy := map[string]storage.Driver{}
+	actualSize := map[string]int64{} // a pool disk's real size, when its driver says
 	cleanupDisks := func() {
 		for _, p := range createdDiskPaths {
+			if drv := createdBy[p]; drv != nil {
+				// The request may be what failed (cancelled, timed out); the
+				// image this create made is removed regardless.
+				rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				if rmErr := drv.DeleteDisk(rmCtx, p); rmErr != nil {
+					slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
+				}
+				cancel()
+				continue
+			}
 			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
 				slog.Warn("cleanup: failed to remove disk", "path", p, "error", rmErr)
 			}
@@ -537,28 +553,61 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			if !resolved {
 				var volErr error
 				if volCfg, volErr = s.resolveVolume(ctx, spec.StackName, d.Storage); volErr != nil {
+					cleanupDisks()
 					return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
 				}
 			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
+				cleanupDisks()
 				return nil, status.Errorf(codes.Internal, "storage driver %q: %v", d.Storage, drvErr)
 			}
 			if pErr := drv.Prepare(ctx); pErr != nil {
+				cleanupDisks()
 				return nil, status.Errorf(codes.Internal, "storage prepare %q: %v", d.Storage, pErr)
 			}
-			sourceImage := ""
+			// A ceph disk is opened by qemu through the pool's libvirt
+			// secret: without it the domain could not start, so it is
+			// defined before anything is allocated.
+			if _, sErr := s.ensureCephSecret(volCfg); sErr != nil {
+				cleanupDisks()
+				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, sErr)
+			}
+			sourceImage, sourceDigest := "", ""
 			if isRootDisk {
 				if sourceImage, err = s.poolRootDiskBacking(spec.Image, volCfg.Driver); err != nil {
+					cleanupDisks()
 					return nil, err
+				}
+				if sourceImage != "" && strings.EqualFold(volCfg.Driver, "ceph") {
+					// The base is named by the content's digest: the one the
+					// store recorded when it published the file, or the file's.
+					sourceDigest, _ = image.RecordedDigest(sourceImage)
 				}
 			}
 			diskPath, err = drv.CreateDisk(ctx, storage.DiskOptions{
-				VMName:      spec.Name,
-				DiskName:    d.Name,
-				SizeBytes:   parseDiskSizeBytes(d.Size),
-				SourceImage: sourceImage,
+				VMName:            spec.Name,
+				DiskName:          d.Name,
+				SizeBytes:         parseDiskSizeBytes(d.Size),
+				SourceImage:       sourceImage,
+				SourceImageName:   spec.Image,
+				SourceImageDigest: sourceDigest,
 			})
+			// A disk that is not a file (an rbd image, a zvol, a thin LV) is
+			// removed by its driver on a rollback: os.Remove of its path
+			// removes nothing, or only the /dev symlink.
+			if err == nil && !isFileBasedDriver(volCfg.Driver) {
+				createdBy[diskPath] = drv
+			}
+			// A clone of an image bigger than the size asked for IS that size:
+			// the row records what exists, so accounting does not under-count.
+			if err == nil {
+				if sz, ok := drv.(storage.DiskSizer); ok {
+					if n, serr := sz.DiskSize(ctx, diskPath); serr == nil && n > 0 {
+						actualSize[diskPath] = n
+					}
+				}
+			}
 			storageType = volCfg.Driver
 			if storageType == "" {
 				storageType = "local"
@@ -625,15 +674,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		})
 
 		backingImage := ""
-		if isRootDisk {
+		if isRootDisk && !strings.HasPrefix(diskPath, "rbd:") {
+			// An rbd root disk is a clone of the image's base IN the pool and
+			// never needs the store's file again; recording the image would
+			// tell a peer that cannot find the disk as a file (an older build,
+			// on a failover) to "rebuild" it as a blank local overlay of the
+			// image. Without it, such a peer refuses the start instead.
 			backingImage = spec.Image
+		}
+		recordedSize := parseDiskSizeBytes(d.Size)
+		if n := actualSize[diskPath]; n > recordedSize {
+			recordedSize = n
 		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName:        spec.Name,
 			DiskName:      d.Name,
 			HostName:      s.hostName,
 			Path:          diskPath,
-			SizeBytes:     parseDiskSizeBytes(d.Size),
+			SizeBytes:     recordedSize,
 			BackingImage:  backingImage,
 			StorageType:   storageType,
 			StorageVolume: d.Storage,
@@ -1838,6 +1896,21 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if err := s.refreshUSBHostdevsForStart(ctx, vm); err != nil {
 		return releasePreflight, err
 	}
+	// A ceph disk is opened through its pool's libvirt secret, which a
+	// libvirtd restart drops (it is ephemeral): put back before every start,
+	// on every start path, so none waits for the daemon's reconcile.
+	if err := s.ensureCephSecretsForVM(ctx, vm, ""); err != nil {
+		// FailedPrecondition only for what an operator must fix; anything
+		// transient is Unavailable, which every start path retries — and a
+		// deferral (health.ErrStartDeferred), which the reconciler re-drives
+		// instead of parking a proof-less start in error.
+		serr := status.Errorf(cephErrCode(err), "start %q: %v", vm.Name, err)
+		if cephErrCode(err) == codes.Unavailable {
+			serr = deferStart(serr, cephDeferKind(err))
+		}
+		return releasePreflight, serr
+	}
+	s.refreshRBDMonitors(ctx, vm.Name)
 
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/
@@ -2303,6 +2376,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		out, err := client.DeleteVM(proxyCtx, req, grpc.Header(&hdr))
 		if err == nil {
 			acceptDeletedVMHeader(ctx, req.Name, hdr)
+			forwardKeptImages(ctx, hdr) // the ceph images the owner left in place
 		}
 		return out, err
 	}
@@ -2332,10 +2406,12 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 			probeCtx, cancel := context.WithTimeout(
 				metadata.AppendToOutgoingContext(ctx, "x-lv-delete-local-only", "1"), 15*time.Second)
-			_, peerErr = client.DeleteVM(probeCtx, req)
+			var phdr metadata.MD
+			_, peerErr = client.DeleteVM(probeCtx, req, grpc.Header(&phdr))
 			cancel()
 			conn.Close()
 			if peerErr == nil {
+				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
 				return &emptypb.Empty{}, nil
 			}
@@ -2529,7 +2605,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (driver-dispatched, so non-default pools and block backends are released)
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
-		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
+		// The VM is deleted even when a disk is not freed (a ceph image a
+		// client still has open), as on main; each image left in its pool is
+		// named in the response and by ceph_image_leftover.
+		setKeptHeader(ctx, s.deleteRecordedVMDiskVolumes(ctx, req.Name))
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
@@ -4030,6 +4109,7 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		if f != nil {
 			if vol, ok := f.Volumes[volumeName]; ok {
 				cfg := storage.Config{
+					Name:    stackName + "/" + volumeName,
 					Driver:  vol.Driver,
 					Source:  vol.Source,
 					Target:  vol.Target,
@@ -4048,13 +4128,18 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// 2. Try this host's storage pools: the cache, then the cluster table
 	// (a pool created since the cache was last refreshed, e.g. just after a
 	// restart, is only there).
-	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+	pool, ok, perr := s.resolvePoolErr(ctx, volumeName)
+	if perr != nil {
+		return storage.Config{}, fmt.Errorf("storage %q: read this host's pools: %w", volumeName, perr)
+	}
+	if ok {
 		// The disk is created there: a pool created before the directory and
 		// source checks must not take one (nor be re-mounted for it).
 		if err := s.checkPoolForWrite(ctx, volumeName, pool); err != nil {
 			return storage.Config{}, err
 		}
 		return storage.Config{
+			Name:    volumeName,
 			Driver:  pool.Driver,
 			Source:  pool.Source,
 			Target:  pool.Target,
@@ -4066,10 +4151,10 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// the disk somewhere nobody asked for; a disk that wants local storage
 	// says so by naming no storage at all.
 	if stackName != "" {
-		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q",
-			volumeName, stackName, s.hostName)
+		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q: %w",
+			volumeName, stackName, s.hostName, errStorageNotFound)
 	}
-	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q", volumeName, s.hostName)
+	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q: %w", volumeName, s.hostName, errStorageNotFound)
 }
 
 // parseDiskSizeBytes converts a human-readable size string (e.g. "20G", "512M")
@@ -4168,6 +4253,9 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	}
 	if disk == nil {
 		return nil, status.Errorf(codes.NotFound, "disk %q not found on VM %q", req.DiskName, req.VmName)
+	}
+	if err := refuseRBDDisk(disk, "resize"); err != nil {
+		return nil, err
 	}
 
 	newSizeBytes := parseDiskSizeBytes(req.Size)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,3 +104,8 @@ func (r *Reconciler) setAsideSupersededDisk(ctx context.Context, vmName, proofID
 		"a failover onto "+r.hostName+" found an old copy of the VM's disk and set it aside")
 	return aside, nil
 }
+
+// isNetworkDiskPath reports whether a disk path names a network disk (an rbd
+// image, "rbd:<pool>/<image>…") rather than a file or device on this host:
+// such a disk cannot be stat'ed, and is never missing from a host.
+func isNetworkDiskPath(p string) bool { return strings.HasPrefix(p, "rbd:") }

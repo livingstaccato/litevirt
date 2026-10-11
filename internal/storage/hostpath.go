@@ -202,6 +202,8 @@ var dataDirOwned = []string{
 	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
 	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
+	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
+	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path
@@ -211,7 +213,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "ceph-trash-purges.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

@@ -1078,6 +1078,20 @@ type diskSource struct {
 	Protocol string           `xml:"protocol,attr,omitempty"`
 	Name     string           `xml:"name,attr,omitempty"`
 	Hosts    []diskSourceHost `xml:"host,omitempty"`
+	// Auth is the identity an rbd disk authenticates as: a ceph secret in
+	// libvirt's own store (libvirt accepts <auth> inside <source> since 3.9).
+	Auth *diskAuth `xml:"auth,omitempty"`
+}
+
+// diskAuth is <auth username=…><secret type='ceph' uuid=…/></auth>.
+type diskAuth struct {
+	Username string         `xml:"username,attr"`
+	Secret   diskAuthSecret `xml:"secret"`
+}
+
+type diskAuthSecret struct {
+	Type string `xml:"type,attr"`
+	UUID string `xml:"uuid,attr"`
 }
 
 // diskSourceHost is one monitor/target address for a network-backed disk.

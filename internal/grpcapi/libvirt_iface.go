@@ -184,6 +184,14 @@ type LibvirtBackend interface {
 	// no-op when the pool isn't defined). Belt-and-suspenders on pool delete.
 	PoolDestroyIfDefined(name string) error
 
+	// Ceph secrets: the key a ceph pool's VM disks authenticate with, in
+	// libvirt's own store (libvirt.CephSecretUUID names it). The value is never
+	// logged and cannot be read back.
+	DefineCephSecret(secretUUID, clientID string, value []byte) error
+	HasSecret(secretUUID string) (bool, error)
+	ListCephSecrets() ([]string, error)
+	UndefineSecret(secretUUID string) error
+
 	// VLAN tap configuration — invoked after CreateVM's StartDomain
 	// to push bridge-vlan rules onto the tap device libvirt created.
 	ConfigureVLANTap(domainName, bridge, mac string, vlanID int) error

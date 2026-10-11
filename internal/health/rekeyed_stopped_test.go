@@ -53,3 +53,30 @@ func TestRekeyedStoppedVM_DefineLeavesADomainStartedMeanwhile(t *testing.T) {
 		t.Fatalf("the define replaced a running domain's definition:\n%s", xml)
 	}
 }
+
+// A re-keyed stopped VM on an rbd disk is defined here: the disk is in the
+// cluster, not a file on this host, and must not read as "not visible".
+//
+// Mutation: stat rbd paths as files again in defineRekeyedStoppedVM — the VM
+// is never defined and the test goes red.
+func TestRekeyedStoppedVM_RBDDiskIsVisible(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "node-a", Address: "10.0.0.1", SSHUser: "root", CertSerial: "s-a", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "rv", HostName: "node-a", State: "stopped", StateDetail: corrosion.StoppedRekeyDetail("node-f"),
+		CPUActual: 1, MemActual: 256, Spec: `{"name":"rv","cpu":1,"memory_mib":256}`,
+	}, nil, []corrosion.DiskRecord{{VMName: "rv", DiskName: "root", HostName: "node-a", Path: "rbd:lv/rv-root", StorageType: "ceph"}}); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.ReconcileOnce(ctx)
+	if xml := fake.DefinedXML("rv"); !strings.Contains(xml, `protocol="rbd"`) {
+		t.Fatalf("the re-keyed VM on an rbd disk was not defined here:\n%s", xml)
+	}
+}

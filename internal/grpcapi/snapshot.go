@@ -64,6 +64,16 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		return client.CreateSnapshot(ctx, req)
 	}
 
+	// A libvirt snapshot of a VM is an external qcow2 overlay per disk, which a
+	// network (rbd) disk cannot have.
+	if disks, derr := corrosion.GetVMDisks(ctx, s.db, req.VmName); derr == nil {
+		for i := range disks {
+			if err := refuseRBDDisk(&disks[i], "snapshot"); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Memory snapshots (#3) suspend the guest — refuse during transient/unsafe
 	// states, and require a path-safe name (a vmstate file is written under
 	// dataDir/vmstate). A memory snapshot of a stopped VM is meaningless, so

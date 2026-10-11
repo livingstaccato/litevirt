@@ -1125,6 +1125,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
+	// restart): defined now, then kept in line with the pools and keyrings.
+	// An rbd disk's domain takes its monitors from its pool as configured on
+	// this host when the domain is defined, not from when the disk was made.
+	libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
+	// Deleted ceph images wait in their pool's trash for a background purge;
+	// the ones a previous run had not finished are resumed (and named by
+	// ceph_trash_leftover while they fail).
+	if err := storage.ResumeCephPurges(d.cfg.DataDir); err != nil {
+		slog.Warn("ceph: trash purges of a previous run not resumed", "error", err)
+	}
+	svc.ReconcileCephSecrets(ctx)
+	go d.runCephSecretReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -1146,6 +1159,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A start whose ceph key must be proven, late in a walk with no time left
+	// for it, is left untouched for the next pass rather than half-started.
+	reconciler.SetStartDeferral(svc.CephStartDeferral)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
@@ -2097,6 +2113,13 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		if disksExp != "" {
 			opts[storage.DataDisksExportOption] = disksExp
 		}
+		// A ceph pool's row carries this host's key fingerprint, which the
+		// pool's other hosts compare theirs against (grpcapi/ceph_secrets.go).
+		if strings.EqualFold(p.Driver, "ceph") {
+			if fp, ok, err := storage.CephKeyFingerprintOf(p.Options); err == nil && ok {
+				opts[storage.CephKeyFPOption] = fp
+			}
+		}
 		if len(opts) > 0 {
 			rec.Options = opts
 		}
@@ -2313,6 +2336,41 @@ func (d *Daemon) refreshStoragePools(ctx context.Context) {
 		case <-ticker.C:
 			d.registerStoragePools(ctx)
 			d.refreshDBPoolCapacity(ctx)
+		}
+	}
+}
+
+// cephSecretReconcileInterval is how often the ceph pools' libvirt secrets are
+// checked: a libvirtd restart drops them (they are ephemeral), and a keyring
+// rotated on disk changes the value they must hold.
+const cephSecretReconcileInterval = 30 * time.Second
+
+// runCephSecretReconcile keeps the ceph pools' libvirt secrets defined and
+// current until ctx is cancelled (grpcapi.ReconcileCephSecrets), and scans
+// the pools' trash for leftovers no purge here tracks — at start, and every
+// grpcapi.CephTrashScanInterval after (grpcapi.ScanCephTrash). Here, not in
+// Run's synchronous first reconcile: a cluster that does not answer must not
+// hold the daemon's start.
+func (d *Daemon) runCephSecretReconcile(ctx context.Context) {
+	ticker := time.NewTicker(cephSecretReconcileInterval)
+	defer ticker.Stop()
+	var lastScan time.Time
+	scan := func() {
+		if d.svc != nil && time.Since(lastScan) >= grpcapi.CephTrashScanInterval {
+			lastScan = time.Now()
+			d.svc.ScanCephTrash(ctx)
+		}
+	}
+	scan()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if d.svc != nil {
+				scan()
+				d.svc.ReconcileCephSecrets(ctx)
+			}
 		}
 	}
 }

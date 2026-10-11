@@ -1176,11 +1176,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if rootTaken == "" {
 		if t, ok := replicaTimestamp(replica); ok {
 			rootTaken = t.UTC().Format("20060102-150405")
-		} else if fi, serr := os.Stat(replicaPath); serr == nil {
-			// An admin-named file with no stamp: the time it was written,
-			// so the "never newer than the root" filter still holds.
-			rootTaken = fi.ModTime().UTC().Format("20060102-150405")
 		}
+		// An admin-named file with no stamp has no run time: no other disk's
+		// replica can be matched to it, so none is taken (partial). Its
+		// mtime is not its data's time (a copy of a replica is newer).
 	}
 	vmDisks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
@@ -1207,28 +1206,36 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	inAdopted := func(path string) bool {
 		return adoptedXML != "" && (strings.Contains(adoptedXML, "'"+path+"'") || strings.Contains(adoptedXML, `"`+path+`"`))
 	}
-	// Whether a shared disk may be reattached as-is: only by a takeover (a
-	// renamed promotion would give two VMs one writable disk), and only once
-	// the old owner is not an active host (an automated promotion's shared-disk
-	// fence was verified above).
-	ownerActive := false
+	// Whether a shared disk may be reattached as-is (sharedReattachVerdict).
+	var ownerHost *corrosion.HostRecord
+	var ownerErr error
 	if vm.HostName != "" && vm.HostName != s.hostName {
-		if h, _ := corrosion.GetHost(ctx, s.db, vm.HostName); h != nil && h.State == "active" {
-			ownerActive = true
-		}
+		ownerHost, ownerErr = corrosion.GetHost(ctx, s.db, vm.HostName)
 	}
+	// A promotion relayed from another host counts as automatic here: the
+	// coordinator's relay carries a proof only under enforcement, and a host
+	// on an older build carries none at all, so a relayed call is never
+	// trusted to be an operator's (which only narrows what is reattached).
+	sharedAuto := autoPath || s.requirePeerCert(ctx) == nil
+	reattachOK, reattachWhy := sharedReattachVerdict(renamed, sharedAuto, s.sharedStorageFenceActive(ctx),
+		vm.HostName, s.hostName, ownerHost, ownerErr)
 	for i := range others {
 		d := &others[i]
 		if d.shared {
 			switch {
 			case renamed:
 				d.missing = "a renamed promotion never shares a writable disk with the original"
-			case ownerActive:
-				d.missing = fmt.Sprintf("its owner %s is still an active host", vm.HostName)
-			case started && !inAdopted(d.row.Path):
-				d.missing = "not attached by the attempt that started the domain"
+			case started:
+				// Adopting: attached exactly when the running domain has it.
+				if inAdopted(d.row.Path) {
+					d.livePath = d.row.Path
+				} else {
+					d.missing = "not attached by the attempt that started the domain"
+				}
+			case !reattachOK:
+				d.missing = reattachWhy
 			default:
-				if _, serr := os.Stat(s.hostDiskFile(d.row.Path)); serr != nil {
+				if serr := statWithin(s.hostDiskFile(d.row.Path), sharedDiskStatTimeout); serr != nil {
 					d.missing = fmt.Sprintf("not reachable from %s: %v", s.hostName, serr)
 				} else {
 					d.livePath = d.row.Path
@@ -1241,7 +1248,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		d.livePath = filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName,
 			strings.TrimSuffix(strings.TrimSuffix(d.replica.File, ".qcow2"), ".raw")))
-		step := "disk_built:" + d.row.DiskName
+		// The step names the file this proof built (review N4): a retry
+		// reuses that file and no other, so a file at the canonical name
+		// that this proof did not build is never reused nor removed.
+		if built, ok := builtStepPath(steps, d.row.DiskName); ok {
+			d.livePath = filepath.Join(poolDir, built)
+		}
+		step := "disk_built:" + d.row.DiskName + "=" + filepath.Base(d.livePath)
 		_, statErr := os.Stat(d.livePath)
 		if started {
 			// Adopting a domain an earlier attempt started: the disk counts
@@ -1263,6 +1276,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			slog.Warn("promote: a file is already where the live disk would go; left alone, building beside it",
 				"vm", vm.Name, "disk", d.row.DiskName, "path", d.livePath, "instead", alt)
 			d.livePath = alt
+			step = "disk_built:" + d.row.DiskName + "=" + filepath.Base(alt)
 		}
 		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, d.replica.File, d.replicaPath, d.replica.Format, d.livePath, send); err != nil {
 			slog.Error("promote: a disk of the replica set could not be built; promoting without it",
@@ -1346,7 +1360,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return cfg, recs
 	}
 	diskCfg, diskRecords := setDisks()
-	_, partialNote := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
+	_, partialNote := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, vm.Name, targetName, others)
 	multiDiskNote := ""
 	if partialNote != "" {
 		multiDiskNote = " (" + partialNote + ")"
@@ -1486,7 +1500,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			Replica: replica, DiskPath: livePath, Status: "VM started off the promoted replica",
 		})
 	}
-	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, others)
+	manifest, partial := promotionManifest(src.DiskName, replica, rootTaken, s.hostName, vm.Name, targetName, others)
 	multiDiskNote = ""
 	if partial != "" {
 		multiDiskNote = " (" + partial + ")"
@@ -1576,6 +1590,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		Replica: replica, DiskPath: livePath, Status: "promotion complete" + multiDiskNote,
 	})
 	return nil
+}
+
+// builtStepPath is the file name the proof's step records for disk's built
+// live disk ("disk_built:<disk>=<file>"), if one does.
+func builtStepPath(steps, disk string) (string, bool) {
+	for _, f := range strings.Fields(steps) {
+		if v, ok := strings.CutPrefix(f, "disk_built:"+disk+"="); ok && v != "" && filepath.Base(v) == v {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // buildPromotedDisk builds the live disk at livePath from the replica at

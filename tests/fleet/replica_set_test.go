@@ -271,13 +271,18 @@ func TestFleet_AutoPromote_RecordsTheDisksLeftOnTheFailedHost(t *testing.T) {
 	}
 }
 
-// C1 of the review: a data disk on NFS is reachable from the replica host as
-// it is. Replication never copies it, and failover's promotion reattaches it
-// as-is — current data, its row untouched — never rebuilds it from a replica.
+// C1 and N1 of the reviews: a data disk on NFS is never copied into a replica
+// and never rebuilt from one. Failover's promotion, relayed to the replica
+// host, reattaches it as-is only behind a proven fence: with
+// enforcement.shared_storage_fence off (an upgraded cluster's default) the old
+// owner may still be writing it, so it is left unattached — main's outcome —
+// its row untouched, its data intact, and the VM marked partial with why.
 //
-// Mutation "nfs copied and rebuilt": the shared classification is removed
-// from replicateOtherDisks and chooseSetReplicas — red.
-func TestFleet_AutoPromote_ReattachesASharedDiskAsIs(t *testing.T) {
+// Mutations: "nfs copied and rebuilt" (the shared classification removed from
+// replicateOtherDisks and chooseSetReplicas) — red; "reattach on any fenced
+// owner" (sharedReattachVerdict's automatic-without-fence case removed, or the
+// relayed call trusted as an operator's) — red.
+func TestFleet_AutoPromote_SharedDiskStaysUnattachedWithoutAProvenFence(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -298,6 +303,16 @@ func TestFleet_AutoPromote_ReattachesASharedDiskAsIs(t *testing.T) {
 	if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-5*time.Minute)); err != nil {
 		t.Fatalf("replicate set4: %v", err)
 	}
+	var copied []string
+	_ = filepath.WalkDir(filepath.Join(c.tmpRoot, replicaHost.Name, "data", "dr", ".replicas"), func(p string, d os.DirEntry, err error) error {
+		if err == nil && strings.Contains(filepath.Base(p), "data1-") {
+			copied = append(copied, p)
+		}
+		return nil
+	})
+	if len(copied) != 0 {
+		t.Fatalf("the NFS disk was copied into a replica: %v", copied)
+	}
 	// After the run the guest writes data1 again: only the shared file has it.
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x55 0 65536", shared).CombinedOutput(); err != nil {
 		t.Fatalf("write data1: %v %s", err, out)
@@ -308,18 +323,18 @@ func TestFleet_AutoPromote_ReattachesASharedDiskAsIs(t *testing.T) {
 	promotedDisks(t, c, replicaHost, victim, "set4", []string{"root", "data2", "data3"}, nil)
 	rows, _ := corrosion.GetVMDisks(ctx, replicaHost.DB, "set4")
 	for _, r := range rows {
-		if r.DiskName == "data1" && (r.Path != shared || r.StorageType != "nfs") {
+		if r.DiskName == "data1" && (r.Path != shared || r.StorageType != "nfs" || r.HostName != victim.Name) {
 			t.Errorf("data1 row = %+v, want it untouched on NFS", r)
 		}
 	}
-	if xml := replicaHost.Virt.DefinedXML("set4"); !strings.Contains(xml, shared) {
-		t.Errorf("data1 was not reattached as-is: %s", xml)
+	if xml := replicaHost.Virt.DefinedXML("set4"); strings.Contains(xml, shared) {
+		t.Errorf("data1 was attached without a proven fence of %s: %s", victim.Name, xml)
 	}
 	if !diskPattern(t, shared, 0x55) {
 		t.Error("the shared data1 lost the write made after the last run")
 	}
 	insp, err := c.SelfClient(coord).InspectVM(ctx, &pb.InspectVMRequest{Name: "set4"})
-	if err != nil || insp.GetPromotedPartial() != "" {
-		t.Errorf("inspect promoted_partial = %q (%v), want empty", insp.GetPromotedPartial(), err)
+	if err != nil || !strings.Contains(insp.GetPromotedPartial(), "no proof-grade fence of "+victim.Name) {
+		t.Errorf("inspect promoted_partial = %q (%v), want data1 named as unattached for want of a proven fence", insp.GetPromotedPartial(), err)
 	}
 }

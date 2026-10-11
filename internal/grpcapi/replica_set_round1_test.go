@@ -402,8 +402,11 @@ func TestOtherDiskCopy_AShutOffDiskThatChangedDuringTheCopyIsDiscarded(t *testin
 	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
-	vm := &corrosion.VMRecord{Name: "od1", HostName: s.hostName, State: "stopped"}
+	vm := &corrosion.VMRecord{Name: "od1", HostName: s.hostName, State: "stopped", Spec: `{}`}
 	d := &corrosion.DiskRecord{VMName: "od1", DiskName: "data1", Path: disk, StorageType: "dir"}
+	if err := corrosion.InsertVM(context.Background(), s.db, *vm, nil, []corrosion.DiskRecord{*d}); err != nil {
+		t.Fatal(err)
+	}
 	takes := 0
 	take := func() func() {
 		takes++

@@ -2139,6 +2139,10 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	out, err := s.deleteVM(ctx, req)
+	if err == nil {
+		// A deleted VM's partial-recovery marker goes with it (review N5).
+		s.clearPromotedPartial(ctx, req.Name)
+	}
 	if err == nil && len(luns) > 0 && !s.lunPlainDeleteRecordable(ctx) &&
 		s.ReleaseFeatureAvailable(capabilities.FeatureISCSILUNClaim) {
 		// The token has latched here but this replica holds no use: it may

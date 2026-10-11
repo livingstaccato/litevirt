@@ -104,8 +104,72 @@ func (s *Server) diskOnSharedStorage(ctx context.Context, d corrosion.DiskRecord
 	if d.StorageVolume == "" {
 		return false
 	}
-	ref, ok := s.resolvePool(ctx, d.StorageVolume)
-	return ok && isSharedDriver(ref.Driver)
+	if ref, ok := s.resolvePool(ctx, d.StorageVolume); ok && isSharedDriver(ref.Driver) {
+		return true
+	}
+	// The pool may be defined only on the disk's own host: its row there
+	// says what it is (review N9).
+	if d.HostName != "" && s.db != nil {
+		if p, ok, err := corrosion.GetStoragePool(ctx, s.db, d.HostName, d.StorageVolume); err == nil && ok && isSharedDriver(p.Driver) {
+			return true
+		}
+	}
+	return false
+}
+
+// sharedReattachVerdict decides whether a promotion may reattach a disk on
+// shared storage as-is, where main attached nothing — so every doubt leaves
+// it unattached (main's outcome), never refuses the promotion:
+//
+//   - a renamed promotion never: the original VM owns the disk;
+//   - an automatic one (a coordinator's, or a relayed proof) only when the
+//     shared-storage fence is enforced, which is when the old owner was
+//     proven powered off before this promotion could run;
+//   - a manual one only when the owner is this host, is fenced, is removed,
+//     or is no longer a member at all — not merely "not active";
+//   - an owner whose host row cannot be read: never (fail closed).
+func sharedReattachVerdict(renamed, automatic, fenceEnforced bool, owner, self string, ownerHost *corrosion.HostRecord, ownerErr error) (bool, string) {
+	switch {
+	case renamed:
+		return false, "renamed"
+	case automatic && !fenceEnforced:
+		return false, fmt.Sprintf("no proof-grade fence of %s (enforcement.shared_storage_fence is off)", owner)
+	case automatic:
+		return true, ""
+	case owner == "" || owner == self:
+		return true, ""
+	case ownerErr != nil:
+		return false, fmt.Sprintf("the state of its owner %s cannot be read: %v", owner, ownerErr)
+	case ownerHost == nil || ownerHost.State == "removed" || ownerHost.State == "fenced":
+		return true, ""
+	default:
+		return false, fmt.Sprintf("its owner %s is %s, not fenced", owner, ownerHost.State)
+	}
+}
+
+// sharedDiskStatTimeout bounds the look at a shared disk's path: a hard NFS
+// mount whose server is gone blocks a stat forever, and main never looked.
+var sharedDiskStatTimeout = 5 * time.Second
+
+// statShared is os.Stat; a var so a test can make it block.
+var statShared = os.Stat
+
+// statWithin stats path, giving up after timeout (review N2). The stat left
+// running when it times out is abandoned; it ends when the mount answers.
+func statWithin(path string, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := statShared(path)
+		done <- err
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return fmt.Errorf("not reachable (timed out after %s)", timeout)
+	}
 }
 
 // replicateOtherDisks replicates each of disks with the root's run time ts,
@@ -173,6 +237,9 @@ func (s *Server) replicateOtherDisks(ctx context.Context, sched corrosion.Backup
 			slog.Warn("replication: a disk of the set was not replicated; the set of this run is incomplete",
 				"vm", vm.Name, "disk", d.DiskName, "error", err)
 			errs = append(errs, err)
+			if errors.Is(err, errVMNoLongerHere) {
+				break // the rest would be copies of a VM this host no longer runs
+			}
 		}
 	}
 	if len(errs) > 0 {
@@ -270,7 +337,15 @@ var errOtherDiskChanged = errors.New("the disk changed or its VM started while i
 func (s *Server) otherDiskCopy(ctx context.Context, take func() func(), vm *corrosion.VMRecord, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error, allowForceShare bool) (copyResult, error) {
 	lk := &heldLock{take: take}
 	defer lk.drop()
-	lk.acquire()
+	// Each time the lock is taken again, the VM may have moved or gone while
+	// it was dropped: then nothing more is copied of it here (review N7).
+	acquireHere := func() error {
+		lk.acquire()
+		return s.vmStillHere(ctx, vm.Name)
+	}
+	if err := acquireHere(); err != nil {
+		return copyResult{}, err
+	}
 	if err := s.healPITOverlay(ctx, vm, d); err != nil {
 		return copyResult{}, err
 	}
@@ -284,7 +359,9 @@ func (s *Server) otherDiskCopy(ctx context.Context, take func() func(), vm *corr
 		if err := convertImageForceShare(ctx, src, "qcow2", s.diskChainRule(ctx, *d), dst, emit); err != nil {
 			return copyResult{}, err
 		}
-		lk.acquire()
+		if err := acquireHere(); err != nil {
+			return copyResult{}, err
+		}
 		after, aerr := identityOf(src)
 		if aerr != nil || after != before || !s.sourceClosedForPlainCopy(vm) {
 			return copyResult{}, errOtherDiskChanged
@@ -297,7 +374,9 @@ func (s *Server) otherDiskCopy(ctx context.Context, take func() func(), vm *corr
 		return copyResult{method: copyBackupSession}, nil
 	}
 	why = append(why, "backup session: "+err.Error())
-	lk.acquire()
+	if err := acquireHere(); err != nil {
+		return copyResult{}, err
+	}
 	m, err := s.copyViaExternalSnapshot(ctx, vm, d, dst, emit)
 	if err == nil {
 		return copyResult{method: m}, nil
@@ -314,6 +393,28 @@ func (s *Server) otherDiskCopy(ctx context.Context, take func() func(), vm *corr
 		return copyResult{}, err
 	}
 	return copyResult{method: copyForceShare, why: reason}, nil
+}
+
+// errVMNoLongerHere stops a run's copies of the other disks: while the VM
+// lock was dropped, the VM moved to another host, was deleted, or its domain
+// went from this host. Nothing more of it is copied here, and never by the
+// -U last resort.
+var errVMNoLongerHere = errors.New("the VM is no longer owned and defined on this host")
+
+// vmStillHere checks, under the VM lock, that vm is still this host's and its
+// domain still defined here.
+func (s *Server) vmStillHere(ctx context.Context, vm string) error {
+	rec, err := corrosion.GetVM(ctx, s.db, vm)
+	if err != nil {
+		return fmt.Errorf("%w: read the VM: %v", errVMNoLongerHere, err)
+	}
+	if rec == nil || rec.HostName != s.hostName {
+		return errVMNoLongerHere
+	}
+	if s.virt != nil && !s.virt.DomainExists(vm) {
+		return errVMNoLongerHere
+	}
+	return nil
 }
 
 // promotedSetDisk is one disk of a promotion besides the one promoted from the
@@ -432,7 +533,11 @@ func assignTargetDevs(rootDev string, others []promotedSetDisk) {
 // then every other disk and the replica it was recovered from, that it was
 // reattached as-is, or why not. partial lists what makes the set incomplete,
 // "" when nothing does.
-func promotionManifest(rootDisk, rootReplica, rootTaken, host string, others []promotedSetDisk) (manifest, partial string) {
+func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM string, others []promotedSetDisk) (manifest, partial string) {
+	sharedAdvice := "attach it as-is once the old host's fence is confirmed"
+	if newVM != "" && newVM != origVM {
+		sharedAdvice = fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
+	}
 	parts := []string{fmt.Sprintf("%s ← %s", rootDisk, rootReplica)}
 	var missing, earlier []string
 	for _, d := range others {
@@ -441,8 +546,8 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host string, others []p
 			parts = append(parts, fmt.Sprintf("%s: shared (%s) — reattached as-is at %s", d.row.DiskName, d.row.StorageType, d.row.Path))
 		case d.shared:
 			parts = append(parts, fmt.Sprintf("%s: shared (%s) — NOT attached (%s)", d.row.DiskName, d.row.StorageType, d.missing))
-			missing = append(missing, fmt.Sprintf("%s (shared (%s) at %s, not attached: %s; attach it as-is once the old host's fence is confirmed)",
-				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing))
+			missing = append(missing, fmt.Sprintf("%s (shared (%s) at %s, not attached: %s; %s)",
+				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing, sharedAdvice))
 		case !d.recovered():
 			parts = append(parts, fmt.Sprintf("%s: NOT recovered (%s)", d.row.DiskName, d.missing))
 			where := ""
@@ -489,6 +594,9 @@ type promotedPartialEvidence struct {
 	VM     string `json:"vm"`
 	Host   string `json:"host"`
 	Detail string `json:"detail"`
+	// CreatedAt is the VM row's created_at when the marker was raised: a VM
+	// re-created under the name later is another VM, and never inherits it.
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // reportPromotedPartial is the event, notification and durable marker of a
@@ -504,7 +612,11 @@ func (s *Server) reportPromotedPartial(ctx context.Context, vm, host, partial st
 		return
 	}
 	ts := time.Now().UTC().Format(time.RFC3339)
-	b, _ := json.Marshal(promotedPartialEvidence{VM: vm, Host: host, Detail: detail})
+	ev := promotedPartialEvidence{VM: vm, Host: host, Detail: detail}
+	if rec, err := corrosion.GetVM(ctx, s.db, vm); err == nil && rec != nil {
+		ev.CreatedAt = rec.CreatedAt
+	}
+	b, _ := json.Marshal(ev)
 	row := corrosion.HealthCondition{
 		Evaluator: promotedPartialEvaluator, Code: promotedPartialCode, SubjectKind: promotedPartialKind, SubjectID: vm,
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning, Hosts: []string{host},
@@ -516,7 +628,8 @@ func (s *Server) reportPromotedPartial(ctx context.Context, vm, host, partial st
 }
 
 // clearPromotedPartial resolves vm's partial-recovery marker, if one is open:
-// a later promotion recovered the whole set.
+// a later promotion recovered the whole set, or the VM was deleted. There is
+// no generic "resolve a health condition by hand" command to clear it with.
 func (s *Server) clearPromotedPartial(ctx context.Context, vm string) {
 	if s.db == nil {
 		return
@@ -543,6 +656,11 @@ func (s *Server) promotedPartialReason(ctx context.Context, vmName string) strin
 	var ev promotedPartialEvidence
 	if json.Unmarshal([]byte(row.Evidence), &ev) != nil || ev.Detail == "" {
 		return "promoted without its whole replica set"
+	}
+	if ev.CreatedAt != "" {
+		if rec, err := corrosion.GetVM(ctx, s.db, vmName); err == nil && rec != nil && rec.CreatedAt != ev.CreatedAt {
+			return "" // raised for an earlier VM of this name
+		}
 	}
 	return ev.Detail
 }

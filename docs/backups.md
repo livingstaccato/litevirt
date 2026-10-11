@@ -271,8 +271,16 @@ the VM waits at most for that step:
   inode); otherwise it is discarded and the run reports the disk failed;
 - a running VM's backup session is opened under the lock, which is dropped as
   soon as the session's point in time is fixed; the export is read without
-  it. A stop during the read aborts the session and the copy fails; libvirt
-  refuses a migration while the session runs, so retry it;
+  it. A stop during the read aborts the session; the copy then falls back to
+  the last resort below and is recorded as not point-in-time, with a
+  point-in-time retry owed. While the session runs, libvirt refuses or times
+  out every other operation that needs a block job or the disk: a migration,
+  a backup (`lv backup create`), a snapshot, `lv replicate-volume`, and a
+  detach of that disk. Retry them once the run is done;
+- each time a disk's copy takes the lock again, it checks that the VM is
+  still this host's and its domain still defined here; if not (it migrated,
+  moved or was deleted meanwhile) nothing more of it is copied in that run,
+  not even by the last resort;
 - the external-snapshot step (skipped until the `pit_overlay` release
   feature) keeps the lock throughout, as its overlay must not meet a move.
 
@@ -561,8 +569,10 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Every disk with a replica is recovered**, manual or automatic: the root from
 the chosen replica, and each other disk from the replica of the same run, or,
 when that run did not copy it, its newest replica from before it (never a
-newer one: a root replica named with `--replica` sets the point in time; a
-root replica with no readable run time is matched by its file's write time).
+newer one: a root replica named with `--replica` sets the point in time). A
+root replica with no run time in its name (an admin-named file) takes no
+other disk's replica at all: its file's time is not its data's time, so the
+promotion is partial.
 Automatic promotion takes another disk's replica only within the same age
 bound as the root's (below); an older one is not attached. A not
 point-in-time replica of another disk is taken only where the root's would be
@@ -572,12 +582,25 @@ target device unless that collides with the root's (`vda` on virtio) or an
 earlier disk's, in which case it gets the next free one.
 
 A disk on **shared storage** is never rebuilt from a replica. A takeover
-promotion reattaches it as-is, at its own path, with its row unchanged, when
-it is reachable from the promoting host and its old owner is not an active
-host. A renamed promotion never does (two VMs would share one writable disk),
-and an unreachable one (a ceph image, for example) is not attached. Either way
-the partial report names it as shared at its path, to attach as-is once the
-old host's fence is confirmed.
+promotion reattaches it as-is, at its own path, with its row unchanged, only
+when its old owner provably no longer writes it:
+
+- automatic promotion (failover's, and any promotion relayed from another
+  host): only with `enforcement.shared_storage_fence` enforced, which is when
+  the old owner was proven powered off before the promotion could run;
+- a manual promotion on the host itself: only when the owner is fenced, is
+  removed, or is no longer a member — not merely not active (maintenance or
+  offline is not enough);
+- an owner whose state cannot be read: never.
+
+It must also be reachable from the promoting host within a few seconds (a
+hung NFS mount is given up on, and the root is promoted without it). A
+renamed promotion never attaches it: the disk belongs to the original VM.
+Whenever it is not attached the VM is promoted exactly as main promoted it,
+and the partial report names it as shared at its path, with why, and either
+"attach it as-is once the old host's fence is confirmed" or, for a renamed
+promotion, that it belongs to the original and must not be attached to the
+copy.
 
 The `vm.promoted` event is the recovery manifest: every disk and the replica
 it came from, that it was reattached as-is, or why it was not recovered.
@@ -595,7 +618,9 @@ incomplete the VM is marked **partial**:
   host, whose record still names it, or on shared storage);
 - the marker is durable: the health condition `vm.promoted_partial` (evaluator
   `replica_set`), shown by `lv inspect <vm>` as `promotedPartial` until a later
-  promotion recovers the whole set.
+  promotion recovers the whole set or the VM is deleted (a VM re-created
+  under the name never inherits it). There is no command to resolve a health
+  condition by hand.
 
 A disk not recovered is not attached; attach or restore it once its host is
 back. A file already where a disk's live disk would go (a crashed earlier

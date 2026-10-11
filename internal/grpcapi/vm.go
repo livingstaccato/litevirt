@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -188,7 +189,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	compose.NormalizeVMSpecResources(spec)
 	compose.NormalizeVMSpecResources(req.Spec)
 
-	// USB passthrough and memory hot-add: gated on the release (passthroughFeaturesActive), and
+	// USB passthrough and memory hot-add: gated on the release (passthroughFeatureGate), and
 	// checked before placement (which a raw USB device or a mapping
 	// constrains). After the resource defaults, since the hot-add boot memory
 	// is the VM's memory. spec is req.Spec here, so the forwarded request
@@ -391,6 +392,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
+
+	// USB devices and memory hot-add are written by THIS node, so the
+	// feature's gate runs here, before anything is created: the entry check
+	// (admitCreateUSBAndHotplug) only fails fast, and a forwarded create is
+	// gated on the owner. A spec without them takes no grant and creates
+	// exactly as main.
+	var passthroughG capabilities.FeatureGrant
+	if vmSpecSetsPassthrough(spec) {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		passthroughG = g
+	}
 
 	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
@@ -1040,7 +1055,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+	if err := s.insertVMForPassthrough(ctx, spec, passthroughG, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
 		// deployment keeps today's behaviour exactly. With a claim in play, a
 		// running VM with no row is the one state that lets the orphan sweeper
@@ -4117,6 +4132,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if err := s.preflightUSBHotplugUpdate(ctx, req, spec, vm.HostName); err != nil {
 		return nil, err
 	}
+	// This node writes the spec, so a request that adds USB devices or turns
+	// hot-add on takes the feature's grant here (a forwarded call is gated on
+	// the owner), before anything is stopped or redefined. A clear takes none.
+	var passthroughG capabilities.FeatureGrant
+	if updateSetsPassthrough(req) {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		passthroughG = g
+	}
 	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
 	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
 	// details (PCI slot addresses, controller models) survive — which matters for
@@ -4669,7 +4695,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
-	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, func(string) (string, error) {
+	mutateSpec := corrosion.MutateDesiredSpec
+	if updateSetsPassthrough(req) {
+		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
+			return corrosion.MutateDesiredSpecPassthrough(ctx, c, passthroughG, name, fn)
+		}
+	}
+	applied, newGen, err := mutateSpec(ctx, s.db, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
 	if err != nil || !applied {

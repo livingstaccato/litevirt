@@ -81,14 +81,20 @@ type FeatureInfo struct {
 // and IPv6 rules on firewall_ipv6, so a cluster with no IPv6 rule can still
 // roll back below the release.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
-	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
-	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
-	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
-	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
-	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
-	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
-	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
+	FeatureVMLimits:          {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
+	FeatureVMDiskNICIO:       {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
+	FeatureEmailTargetSecret: {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
+	FeatureLoginPolicy:       {Token: Release202611V1, Description: "Cluster login policy"},
+	FeatureDrainFailback:     {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
+	FeatureFirewallIPv6:      {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
+	FeatureNICGuards:         {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
+	FeatureUSBMountsMemory: {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices",
+		Writers: []string{
+			"internal/corrosion.InsertVMWithPassthrough",
+			"internal/corrosion.MutateDesiredSpecPassthrough",
+			"internal/corrosion.CreateContainerAtomicWithHostAccess",
+			"internal/corrosion.UpsertContainerWithHostAccess",
+		}},
 	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
 	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
 	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},

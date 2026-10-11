@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/lxc"
@@ -301,6 +302,19 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	if s.containerRuntime == nil || !ok {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
+	// Setting host mounts or devices writes the feature's data on THIS node
+	// (the owner), so the feature's gate runs here, before anything is
+	// converted or rendered; the entry check above only failed fast. A clear
+	// takes no grant.
+	var hostAccessG capabilities.FeatureGrant
+	if req.SetHostAccess && (len(req.Mounts) > 0 || len(req.Devices) > 0) {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			s.audit(ctx, "ct.convert", req.Name, hostAccessAudit(req.Mounts, req.Devices), "denied")
+			return nil, gerr
+		}
+		hostAccessG = g
+	}
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
 	rec, err := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
@@ -322,7 +336,7 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	if req.SetHostAccess && !req.Unprivileged && req.Confinement == "" {
 		if cur, cerr := sc.ContainerSecurity(req.Name); cerr != nil || !cur.Converting {
-			return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices)
+			return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices, hostAccessG)
 		}
 	}
 	if !req.Unprivileged && req.Confinement == "" {
@@ -369,7 +383,7 @@ func (s *Server) ConvertContainer(ctx context.Context, req *pb.ConvertContainerR
 	}
 	s.audit(ctx, "ct.convert", req.Name, fmt.Sprintf("project=%s idmap_base=%d confinement=%s", project, spec.IDMapBase, spec.Confinement), "ok")
 	if req.SetHostAccess {
-		return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices)
+		return s.setContainerHostAccess(ctx, rec, project, req.Mounts, req.Devices, hostAccessG)
 	}
 	return toPbContainer(*rec), nil
 }
@@ -383,8 +397,10 @@ type hostAccessSetter interface {
 // setContainerHostAccess replaces a stopped container's host mounts and
 // devices, already authorized by the caller (ConvertContainer judged them
 // before any forward): the runtime records and renders them, judged against
-// this host, then the row records them.
-func (s *Server) setContainerHostAccess(ctx context.Context, rec *corrosion.ContainerRecord, project string, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice) (*pb.Container, error) {
+// this host, then the row records them. Setting any takes the feature's grant g
+// (ConvertContainer takes it on this node before anything changes); a clear
+// writes as main does.
+func (s *Server) setContainerHostAccess(ctx context.Context, rec *corrosion.ContainerRecord, project string, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice, g capabilities.FeatureGrant) (*pb.Container, error) {
 	hs, ok := s.containerRuntime.(hostAccessSetter)
 	if !ok {
 		return nil, status.Error(codes.Unavailable, "this host's container runtime cannot render host mounts")
@@ -398,7 +414,13 @@ func (s *Server) setContainerHostAccess(ctx context.Context, rec *corrosion.Cont
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	spec.Mounts, spec.Devices = specMounts, specDevices
 	rec.CreateSpec = corrosion.EncodeCreateSpec(spec)
-	if err := corrosion.UpsertContainer(ctx, s.db, *rec); err != nil {
+	writeRow := corrosion.UpsertContainer
+	if len(specMounts) > 0 || len(specDevices) > 0 {
+		writeRow = func(ctx context.Context, c *corrosion.Client, r corrosion.ContainerRecord) error {
+			return corrosion.UpsertContainerWithHostAccess(ctx, c, g, r)
+		}
+	}
+	if err := writeRow(ctx, s.db, *rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "host access set, but recording it failed: %v", err)
 	}
 	detail := hostAccessAudit(mounts, devices)

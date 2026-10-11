@@ -447,8 +447,9 @@ type VMSpec struct {
 	// vendor:product, by physical bus-port, or through a cluster-wide resource
 	// mapping. A raw (unmapped) device pins the VM to the host it lives on; a
 	// mapped one restricts placement to the hosts the mapping lists. Setting it
-	// is refused until usb_mounts_memory_v1 has latched: an older peer would
-	// drop the field from a spec it rewrites.
+	// is refused until release_2026_11_v1 has latched (feature
+	// usb_mounts_memory): an older peer would drop the field from a spec it
+	// rewrites.
 	UsbDevices []*USBDeviceSpec `protobuf:"bytes,60,rep,name=usb_devices,json=usbDevices,proto3" json:"usb_devices,omitempty"`
 	// Memory hot-add (virtio-mem). memory_hotplug_max_mib (> memory_mib) gives
 	// the domain a NUMA cell of memory_hotplug_base_mib boot memory plus a

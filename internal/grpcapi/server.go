@@ -293,9 +293,6 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
-	// passthroughGate, when set, decides whether USB passthrough, memory
-	// hot-add and container host mounts/devices may be SET (passthroughFeaturesActive).
-	passthroughGate func(ctx context.Context) bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses

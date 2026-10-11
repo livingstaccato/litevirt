@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/network"
@@ -1098,8 +1099,13 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// said so. Then the config is rendered from the authorized spec — nothing
 	// in the archive's config is trusted (the import already dropped every line
 	// that grants host access or overrides confinement).
+	//
+	// Host access an operator restore keeps is written with the feature's grant
+	// (hostAccessG), taken here on the node that writes the row.
+	var hostAccessG capabilities.FeatureGrant
 	{
-		authorized, stripped := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		authorized, stripped, g := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		hostAccessG = g
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
 		// id range of its own (its files shifted) before its config is rendered.
@@ -1201,7 +1207,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// landed"). On failure, delete the just-imported runtime container so nothing
 	// untracked is left, then error out (before signalling "landed").
 	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs); err != nil {
+	if err := s.createRestoredContainerRow(ctx, hostAccessG, rec, ifs); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)

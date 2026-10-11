@@ -20,10 +20,39 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// enableUsbMountsMemory opens the passthrough gate and latches any extra
-// tokens the scenario needs.
+// passthroughGate is a release-feature gate for usb_mounts_memory: open, it
+// mints the feature's grant (counting them in grants); closed, it refuses with
+// the real gate's text. A server with no gate wired refuses everything.
+type passthroughGate struct {
+	on     bool
+	grants *int
+}
+
+// passthroughRefusalText is the release gate's refusal for this feature.
+const passthroughRefusalText = "the cluster upgrade must finish first (usb_mounts_memory needs " + capabilities.Release202611V1 + ")"
+
+func (g passthroughGate) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	if !g.on {
+		return status.Errorf(codes.FailedPrecondition, "the cluster upgrade must finish first (%s needs %s)", f, capabilities.Release202611V1)
+	}
+	if g.grants != nil {
+		*g.grants++
+	}
+	return write(ctx, capabilities.GrantForTest(testingTB{}, f))
+}
+
+func (g passthroughGate) FeatureAvailable(capabilities.Feature) bool { return g.on }
+
+// testingTB satisfies GrantForTest's helper call outside a *testing.T.
+type testingTB struct{ testing.TB }
+
+func (testingTB) Helper() {}
+
+// enableUsbMountsMemory opens the release gate for the passthrough features
+// and latches any extra tokens the scenario needs.
 func enableUsbMountsMemory(s *Server, extra ...string) {
-	s.SetPassthroughGate(func(context.Context) bool { return true })
+	s.SetReleaseFeatureGate(passthroughGate{on: true})
 	if len(extra) > 0 {
 		tok := map[string]bool{}
 		for _, e := range extra {
@@ -35,7 +64,7 @@ func enableUsbMountsMemory(s *Server, extra ...string) {
 
 // closePassthroughGate models a cluster still mid-upgrade.
 func closePassthroughGate(s *Server) {
-	s.SetPassthroughGate(func(context.Context) bool { return false })
+	s.SetReleaseFeatureGate(passthroughGate{on: false})
 }
 
 func usbCreateRequest(name string, usb ...*pb.USBDeviceSpec) *pb.CreateVMRequest {

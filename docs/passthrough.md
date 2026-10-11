@@ -2,14 +2,20 @@
 
 Three Proxmox VE features that change what a workload can reach on its host.
 
-Setting any of them is refused — "the cluster upgrade must finish first" —
-until the cluster's shared release token proves every host runs this
-release: the fields live in a VM's or container's stored spec, and a host on
-an older release would drop them from any spec it rewrites, or place, fail
-over or recreate the workload without them. Until that gate is wired the
-features stay refused (they fail closed); once the upgrade finishes they are
-on, as on Proxmox VE. Clearing them is never gated, and a workload without
-them is unaffected.
+The three are one feature of the release, `usb_mounts_memory`, under the
+cluster's shared release token `release_2026_11_v1`. Setting any of them is
+refused — "the cluster upgrade must finish first (usb_mounts_memory needs
+release_2026_11_v1)", followed by the hosts still to upgrade — until that
+token has latched, which proves every host runs this release: the fields live
+in a VM's or container's stored spec, and a host on an older release would
+drop them from any spec it rewrites, or place, fail over or recreate the
+workload without them. Once the upgrade finishes they are on, as on Proxmox
+VE. Clearing them is never gated, and a workload without them is unaffected.
+
+The first time any of them is set, the cluster records `usb_mounts_memory` as
+used (`lv cluster upgrade-status` shows it). From then on, rolling a host back
+below this release quarantines it (see upgrades.md, *Rolling back after a
+release token latched*); while it is unused, a rollback does not.
 
 ## USB passthrough (VMs)
 

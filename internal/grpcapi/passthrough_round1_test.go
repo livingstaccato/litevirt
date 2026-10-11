@@ -132,10 +132,16 @@ func TestAuthorizeRestoredHostAccess(t *testing.T) {
 		if tc.closed {
 			closePassthroughGate(s)
 		}
-		got, stripped := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer)
+		got, stripped, g := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer)
 		kept := len(got.Mounts) == 1 && len(got.Devices) == 1
 		if kept != tc.keep || (stripped == "") != tc.keep {
 			t.Errorf("%s: kept=%v stripped=%q; want kept=%v", tc.name, kept, stripped, tc.keep)
+		}
+		// Only an operator restore that keeps them writes the feature's data
+		// afresh, so only it holds the feature's grant; a peer move keeps what
+		// the source row already holds.
+		if wantGrant := tc.keep && !tc.peer; passthroughGranted(g) != wantGrant {
+			t.Errorf("%s: granted=%v; want %v", tc.name, passthroughGranted(g), wantGrant)
 		}
 	}
 }
@@ -270,19 +276,26 @@ func TestAdmitRestoredUSBAndHotplug(t *testing.T) {
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "r", MemoryMib: 1024, MemoryHotplugBaseMib: 64, MemoryHotplugMaxMib: 4096,
 		UsbDevices: []*pb.USBDeviceSpec{{Vendor: "046d", Product: "c52b"}}}
-	if err := s.admitRestoredUSBAndHotplug(ctx, spec, "r", false); err != nil {
-		t.Fatal(err)
+	if g, err := s.admitRestoredUSBAndHotplug(ctx, spec, "r", false); err != nil || passthroughGranted(g) {
+		t.Fatalf("a manifest spec: %v (granted %v); want stripped, no grant", err, passthroughGranted(g))
 	}
 	if len(spec.UsbDevices) != 0 || spec.MemoryHotplugMaxMib != 0 || spec.MemoryHotplugBaseMib != 0 {
 		t.Fatalf("a manifest spec kept %+v", spec)
 	}
 	own := &pb.VMSpec{Name: "r", MemoryMib: 1024, MemoryHotplugBaseMib: 1024, MemoryHotplugMaxMib: 4096,
 		UsbDevices: []*pb.USBDeviceSpec{{Vendor: "046d", Product: "c52b"}}}
-	if err := s.admitRestoredUSBAndHotplug(userCtx("op", "operator"), proto.Clone(own).(*pb.VMSpec), "r", true); status.Code(err) != codes.PermissionDenied {
+	if _, err := s.admitRestoredUSBAndHotplug(userCtx("op", "operator"), proto.Clone(own).(*pb.VMSpec), "r", true); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("an operator restoring a raw USB device from the row = %v; want PermissionDenied", err)
 	}
-	if err := s.admitRestoredUSBAndHotplug(ctx, own, "r", true); err != nil || own.MemoryHotplugMaxMib != 4096 || len(own.UsbDevices) != 1 {
-		t.Fatalf("the row's spec was not kept for an admin: %v %+v", err, own)
+	g, err := s.admitRestoredUSBAndHotplug(ctx, own, "r", true)
+	if err != nil || own.MemoryHotplugMaxMib != 4096 || len(own.UsbDevices) != 1 || !passthroughGranted(g) {
+		t.Fatalf("the row's spec was not kept for an admin with the feature's grant: %v %+v (granted %v)", err, own, passthroughGranted(g))
+	}
+	// Closed, the row's spec is refused with the release text, never stripped.
+	closePassthroughGate(s)
+	if _, err := s.admitRestoredUSBAndHotplug(ctx, proto.Clone(own).(*pb.VMSpec), "r", true); status.Code(err) != codes.FailedPrecondition ||
+		status.Convert(err).Message() != passthroughRefusalText {
+		t.Fatalf("restoring the row's spec with the gate closed = %v; want the release refusal", err)
 	}
 }
 

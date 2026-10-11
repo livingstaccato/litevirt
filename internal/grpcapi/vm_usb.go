@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
@@ -276,12 +277,10 @@ func (s *Server) admitCreateUSBAndHotplug(ctx context.Context, spec *pb.VMSpec) 
 	if len(spec.UsbDevices) == 0 && spec.MemoryHotplugMaxMib == 0 {
 		return nil
 	}
-	if !s.passthroughFeaturesActive(ctx) {
-		what := "memory hot-add"
-		if len(spec.UsbDevices) > 0 {
-			what = "USB passthrough"
-		}
-		return passthroughRefusal(what)
+	// The entry node's fail-fast; the owner that writes the row takes the
+	// feature's grant itself (createVM).
+	if err := s.passthroughFeatureGate(ctx); err != nil {
+		return err
 	}
 	if len(spec.UsbDevices) > 0 {
 		if err := s.authorizeUSBDevices(ctx, spec.UsbDevices); err != nil {
@@ -375,13 +374,9 @@ func (s *Server) preflightUSBHotplugUpdate(ctx context.Context, req *pb.UpdateVM
 		}
 		return nil
 	}
-	if (req.SetUsbDevices && len(req.UsbDevices) > 0) || (req.MemoryHotplugMaxMib != nil && *req.MemoryHotplugMaxMib != 0) {
-		if !s.passthroughFeaturesActive(ctx) {
-			what := "memory hot-add"
-			if req.SetUsbDevices && len(req.UsbDevices) > 0 {
-				what = "USB passthrough"
-			}
-			return passthroughRefusal(what)
+	if updateSetsPassthrough(req) {
+		if err := s.passthroughFeatureGate(ctx); err != nil {
+			return err
 		}
 	}
 	if req.SetUsbDevices && len(req.UsbDevices) > 0 {
@@ -470,9 +465,13 @@ func mappingRBACPath(name string) string { return "/mappings/" + name }
 // devices on THIS host). A client-supplied or manifest spec grants neither:
 // both are stripped — the VM restores with fixed memory and no USB device —
 // and the strip is audited.
-func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec, name string, fromExisting bool) error {
+//
+// When they are kept, the grant is the feature's, taken on this node (the one
+// that writes the row): the row must be written with it (insertVMForPassthrough).
+func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec, name string, fromExisting bool) (capabilities.FeatureGrant, error) {
+	var none capabilities.FeatureGrant
 	if len(spec.UsbDevices) == 0 && spec.MemoryHotplugMaxMib == 0 && spec.MemoryHotplugBaseMib == 0 {
-		return nil
+		return none, nil
 	}
 	if !fromExisting {
 		what := usbSummary(spec.UsbDevices)
@@ -482,18 +481,33 @@ func (s *Server) admitRestoredUSBAndHotplug(ctx context.Context, spec *pb.VMSpec
 		spec.UsbDevices = nil
 		spec.MemoryHotplugMaxMib, spec.MemoryHotplugBaseMib = 0, 0
 		s.audit(ctx, "vm.restore", name, "not carried from the restored spec (set them again with lv update): "+what, "ok")
-		return nil
+		return none, nil
 	}
-	if !s.passthroughFeaturesActive(ctx) {
-		return passthroughRefusal("restoring USB passthrough or memory hot-add")
-	}
+	// The caller's permission and the devices first, so a refused restore
+	// records no use; then the feature's grant, the last check before the row.
 	if len(spec.UsbDevices) > 0 {
 		if err := s.authorizeUSBDevices(ctx, spec.UsbDevices); err != nil {
-			return err
+			return none, err
 		}
 		if err := s.validateUSBForVM(ctx, spec.UsbDevices, s.hostName); err != nil {
-			return err
+			return none, err
 		}
 	}
-	return validateMemoryHotplugSpec(spec)
+	if err := validateMemoryHotplugSpec(spec); err != nil {
+		return none, err
+	}
+	return s.passthroughGrant(ctx)
+}
+
+// insertVMForPassthrough writes a new VM row. A spec that carries USB devices
+// or memory hot-add goes through the feature's writer with its grant; any other
+// spec is written exactly as before, so nothing main allows waits on the
+// release token.
+func (s *Server) insertVMForPassthrough(ctx context.Context, spec *pb.VMSpec, g capabilities.FeatureGrant, vm corrosion.VMRecord,
+	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
+	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
+	if vmSpecSetsPassthrough(spec) {
+		return corrosion.InsertVMWithPassthrough(ctx, s.db, g, vm, ifaces, disks, nics, pciIntents, adopt)
+	}
+	return corrosion.InsertVMWithHardware(ctx, s.db, vm, ifaces, disks, nics, pciIntents, adopt)
 }

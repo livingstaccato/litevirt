@@ -12053,7 +12053,7 @@ type CreateContainerRequest struct {
 	// device nodes through (Proxmox mpN / devN). Both require the admin role,
 	// and each host path must resolve, on the host, under a prefix that host's
 	// containers.bind_mount_paths / containers.device_paths allows. Refused
-	// until usb_mounts_memory_v1 has latched.
+	// until release_2026_11_v1 has latched (feature usb_mounts_memory).
 	Mounts        []*ContainerMount  `protobuf:"bytes,30,rep,name=mounts,proto3" json:"mounts,omitempty"`
 	Devices       []*ContainerDevice `protobuf:"bytes,31,rep,name=devices,proto3" json:"devices,omitempty"`
 	unknownFields protoimpl.UnknownFields

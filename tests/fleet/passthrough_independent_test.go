@@ -19,10 +19,24 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
+
+// openReleaseGate is a release-feature gate that is open: it mints the
+// feature's grant for every write. These scenarios are about authorization on
+// one database, not the release; TestFleet_USBMountsMemoryReleaseToken_* runs
+// the real gate.
+type openReleaseGate struct{ t testing.TB }
+
+func (g openReleaseGate) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	return write(ctx, capabilities.GrantForTest(g.t, f))
+}
+
+func (openReleaseGate) FeatureAvailable(capabilities.Feature) bool { return true }
 
 // operatorOn creates an operator user and token on n and returns a client
 // carrying that token; the rows replicate before it returns.
@@ -145,7 +159,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
 		setHostCapacity(t, c, n.Name, 64, 65536, nil)
-		n.Server.SetPassthroughGate(func(context.Context) bool { return true })
+		n.Server.SetReleaseFeatureGate(openReleaseGate{t})
 	}
 	allowed, _ := filepath.EvalSymlinks(t.TempDir())
 	_ = os.MkdirAll(filepath.Join(allowed, "data"), 0o755)
@@ -403,7 +417,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedPrivilege(t *testing.T) {
 	src, opDst, adminDst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	for _, n := range c.Nodes {
 		setHostCapacity(t, c, n.Name, 64, 65536, nil)
-		n.Server.SetPassthroughGate(func(context.Context) bool { return true })
+		n.Server.SetReleaseFeatureGate(openReleaseGate{t})
 	}
 	if _, err := c.SelfClient(src).CreateContainer(ctx, &pb.CreateContainerRequest{
 		HostName: src.Name, Name: "pv", Template: "download", Distro: "debian", Release: "bookworm", Arch: "amd64",

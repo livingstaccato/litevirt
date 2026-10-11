@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -155,6 +156,18 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
 		return nil, err
+	}
+	// Host mounts and devices are written by THIS node, so the feature's gate
+	// runs here, before anything is created: the entry check
+	// (containerHostAccessRequest) only fails fast, and a forwarded create is
+	// gated on the owner. A create without them takes no grant.
+	var hostAccessG capabilities.FeatureGrant
+	if len(req.Mounts) > 0 || len(req.Devices) > 0 {
+		g, gerr := s.passthroughGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		hostAccessG = g
 	}
 	if err := s.checkContainerTemplate(req.Template, req.Name); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "template="+req.Template, "denied")
@@ -350,7 +363,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// closed: the runtime container exists but the DB write failed → delete the
 	// just-created container and release its leases, so no partial tracked state
 	// and no leaked lease.
-	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
+	writeRow := corrosion.CreateContainerAtomic
+	if len(createSpec.Mounts) > 0 || len(createSpec.Devices) > 0 {
+		writeRow = func(ctx context.Context, c *corrosion.Client, rec corrosion.ContainerRecord, ifaces []corrosion.ContainerInterfaceRecord) error {
+			return corrosion.CreateContainerAtomicWithHostAccess(ctx, c, hostAccessG, rec, ifaces)
+		}
+	}
+	if err := writeRow(ctx, s.db, rec, plan.ifaces); err != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
 			slog.Warn("container create: cleanup after cluster-state-write failure also failed",

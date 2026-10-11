@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
@@ -32,8 +33,10 @@ import (
 const hostAccessDenied = "bind-mounting a host path or passing a host device into a container requires the admin role (a host path inside a container is access to the host)"
 
 // containerHostAccessRequest is a create's check of the mounts and devices it
-// asks for: the admin role, the usb_mounts_memory_v1 gate, and paths that can
-// be judged at all. The owning host judges them against its allowed prefixes.
+// asks for: the admin role, the release gate of the usb_mounts_memory feature
+// (a fail-fast here; the owner that writes the row takes the grant), and paths
+// that can be judged at all. The owning host judges them against its allowed
+// prefixes.
 func (s *Server) containerHostAccessRequest(ctx context.Context, host string, mounts []*pb.ContainerMount, devices []*pb.ContainerDevice) error {
 	if len(mounts) == 0 && len(devices) == 0 {
 		return nil
@@ -41,8 +44,8 @@ func (s *Server) containerHostAccessRequest(ctx context.Context, host string, mo
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return status.Error(codes.PermissionDenied, hostAccessDenied)
 	}
-	if !s.passthroughFeaturesActive(ctx) {
-		return passthroughRefusal("container host mounts and devices")
+	if err := s.passthroughFeatureGate(ctx); err != nil {
+		return err
 	}
 	if err := lxc.CheckHostAccessShape(lxcMountsFromPb(mounts), lxcDevicesFromPb(devices)); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
@@ -393,20 +396,42 @@ func withoutHostAccess(cs corrosion.ContainerCreateSpec) (corrosion.ContainerCre
 //
 // Anything else is stripped; stripped describes what, for the audit row and
 // the admin who re-applies them (lv ct convert --mount/--device).
-func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string) {
+//
+// An operator restore that keeps them writes the feature's data afresh, so it
+// takes the feature's grant on this node (the one that writes the row), and
+// the row must be written with it (createRestoredContainerRow). Before the
+// release token latches it strips them, as main does. A peer move keeps what
+// the source row already holds, and takes none.
+func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string, capabilities.FeatureGrant) {
+	var none capabilities.FeatureGrant
 	if len(cs.Mounts) == 0 && len(cs.Devices) == 0 {
-		return cs, ""
+		return cs, "", none
 	}
 	if peer {
 		if source != nil && sameHostAccess(cs, corrosion.DecodeCreateSpec(source.CreateSpec)) {
-			return cs, ""
+			return cs, "", none
 		}
-		return withoutHostAccess(cs)
+		out, stripped := withoutHostAccess(cs)
+		return out, stripped, none
 	}
-	if RequireRole(ctx, "admin") == nil && s.passthroughFeaturesActive(ctx) {
-		return cs, ""
+	if RequireRole(ctx, "admin") == nil {
+		if g, ok := s.passthroughGrantIfAvailable(ctx); ok {
+			return cs, "", g
+		}
 	}
-	return withoutHostAccess(cs)
+	out, stripped := withoutHostAccess(cs)
+	return out, stripped, none
+}
+
+// createRestoredContainerRow writes a restored container's row. One that
+// carries host access an operator restore kept (g is the feature's grant) goes
+// through the feature's writer; any other — a peer move keeping its source
+// row's host access, or a container without any — is written as before.
+func (s *Server) createRestoredContainerRow(ctx context.Context, g capabilities.FeatureGrant, rec corrosion.ContainerRecord, ifaces []corrosion.ContainerInterfaceRecord) error {
+	if passthroughGranted(g) {
+		return corrosion.CreateContainerAtomicWithHostAccess(ctx, s.db, g, rec, ifaces)
+	}
+	return corrosion.CreateContainerAtomic(ctx, s.db, rec, ifaces)
 }
 
 // escalatedSecurity reports whether a spec runs privileged (no id range) or

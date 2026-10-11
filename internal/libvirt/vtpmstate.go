@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -239,7 +240,7 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 	}
 
 	if haveNvram {
-		if err := os.MkdirAll(filepath.Dir(nvramDst), 0o755); err != nil {
+		if err := diskmode.MkdirAll(filepath.Dir(nvramDst)); err != nil {
 			return err
 		}
 		staged := nvramDst + ".staged"
@@ -333,7 +334,7 @@ func retainedMarkerPath(dataDir, vmName string) string {
 
 func WriteRetainedFirmwareMarker(dataDir, vmName, uuid string) error {
 	p := retainedMarkerPath(dataDir, vmName)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := diskmode.MkdirAll(filepath.Dir(p)); err != nil {
 		return err
 	}
 	return os.WriteFile(p, []byte(uuid), 0o600)

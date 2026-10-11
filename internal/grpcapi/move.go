@@ -22,6 +22,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -955,6 +956,12 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 	if err := cmd.Wait(); err != nil {
 		return err
 	}
+	// Every caller hands qemu-img a 0600 file it made, whose mode qemu-img
+	// keeps; a dst qemu-img had to create itself is 0644 less the umask, and
+	// is narrowed to its owner before anything uses it (internal/diskmode).
+	if err := diskmode.Narrow(dst); err != nil {
+		return err
+	}
 	if err := qcow2.AssertStandalone(dst); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "converted image is not standalone: %v", err)
 	}
@@ -1041,7 +1048,7 @@ func copyFileWithProgress(ctx context.Context, src, dst string, emit func(*pb.Mo
 	total := st.Size()
 
 	// Never through a symlink at dst: the pool may be somewhere others write.
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, diskmode.File)
 	if err != nil {
 		return err
 	}

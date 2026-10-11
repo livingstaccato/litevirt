@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/litevirt/litevirt/internal/diskmode"
 )
 
 // fsyncDir best-effort fsyncs a directory so a rename into it survives power
@@ -206,7 +208,9 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	// of one path never share it and nothing can be planted there; it is
 	// still created exclusively without following a final symlink.
 	tmpPath := tempSibling(path)
-	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
+	// Owner-only from its first byte: a disk is a guest's data, and qemu opens
+	// it as its owner once libvirt has labelled it (internal/diskmode).
+	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}

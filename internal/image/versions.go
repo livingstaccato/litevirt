@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -385,7 +386,7 @@ func (s *Store) healWith(src, f string) error {
 	}
 	defer in.Close()
 	tmp := filepath.Join(s.imageDir, "import-heal-"+randid.New()+".tmp")
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, diskmode.File)
 	if err != nil {
 		return err
 	}

@@ -33,6 +33,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -438,7 +439,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	spaceDir := dir
 	if hdr.CheckOnly {
 		spaceDir = nearestExistingDir(dir)
-	} else if err := os.MkdirAll(dir, 0o755); err != nil {
+	} else if err := diskmode.MkdirAll(dir); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
 	}
 	// The data the copy writes, not the file's apparent size: the receive
@@ -513,7 +514,9 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if got := hex.EncodeToString(h.Sum(nil)); got != digest {
 		return status.Errorf(codes.DataLoss, "the copy of %s does not match the source (digest %s, want %s)", hdr.Path, got, digest)
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	// The copy is a new file: owner-only, whatever the source's mode was
+	// (internal/diskmode).
+	if err := tmp.Chmod(diskmode.File); err != nil {
 		return status.Errorf(codes.Internal, "chmod %s: %v", hdr.Path, err)
 	}
 	if err := tmp.Sync(); err != nil {

@@ -5,6 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/litevirt/litevirt/internal/diskmode"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Config holds cloud-init data for a VM.
@@ -47,13 +50,23 @@ func GenerateISO(cfg Config, outputPath string) error {
 	}
 
 	// Ensure output directory exists
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+	if err := diskmode.MkdirAll(filepath.Dir(outputPath)); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
 	}
 
+	// The seed carries the user-data — passwords, keys, tokens — and is
+	// attached to the guest as a disk, so it is owner-only like one
+	// (internal/diskmode): genisoimage writes into a 0600 file made for it
+	// (it keeps an existing file's mode), which then takes the seed's name.
+	tmp := filepath.Join(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+"."+randid.New()+".tmp")
+	if err := diskmode.Create(tmp); err != nil {
+		return fmt.Errorf("create seed: %w", err)
+	}
+	defer os.Remove(tmp) // gone after the rename
+
 	// Generate ISO
 	args := []string{
-		"-output", outputPath,
+		"-output", tmp,
 		"-volid", "cidata",
 		"-joliet",
 		"-rock",
@@ -64,6 +77,11 @@ func GenerateISO(cfg Config, outputPath string) error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("genisoimage: %s: %w", string(output), err)
 	}
-
+	if err := diskmode.Narrow(tmp); err != nil {
+		return fmt.Errorf("seed: %w", err)
+	}
+	if err := os.Rename(tmp, outputPath); err != nil {
+		return fmt.Errorf("place seed: %w", err)
+	}
 	return nil
 }

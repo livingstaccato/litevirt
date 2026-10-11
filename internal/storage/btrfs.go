@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -55,6 +56,15 @@ func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string,
 	subvol := filepath.Join(d.subvolRoot, fmt.Sprintf("%s-%s", opts.VMName, opts.DiskName))
 	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", "--", subvol).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvol, err, out)
+	}
+	// The new subvolume holds one disk: searchable, not listable, as every
+	// directory litevirt makes for disks (internal/diskmode); `btrfs subvolume
+	// create` makes it 0755. Never through a symlink.
+	if fi, err := os.Lstat(subvol); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("btrfs: new subvolume %s is not a directory (%v)", subvol, err)
+	}
+	if err := os.Chmod(subvol, diskmode.Dir); err != nil {
+		return "", fmt.Errorf("btrfs: narrow the new subvolume %s: %w", subvol, err)
 	}
 	// Reuse the local qcow2 path inside the subvolume. CoW conflicts
 	// with qcow2 random writes on some workloads — operators who need

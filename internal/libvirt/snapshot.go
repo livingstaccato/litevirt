@@ -17,6 +17,7 @@ import (
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -171,12 +172,50 @@ func (c *Client) CreateSnapshot(domainName, snapshotName string) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
+	before, _ := c.virt.DomainGetXMLDesc(dom, 0)
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
 	_, err = c.virt.DomainSnapshotCreateXML(dom, xml, flags)
 	if err != nil {
 		return 0, err
 	}
+	if after, aerr := c.virt.DomainGetXMLDesc(dom, 0); aerr == nil {
+		narrowNew(newDiskSources(before, after)...)
+	}
 	return int64(allocation), nil
+}
+
+// newDiskSources returns the disk files afterXML names that beforeXML did
+// not: the overlays a snapshot just made. A disk the snapshot left alone is
+// never in it, and without a readable before nothing is (no file that already
+// existed is ever narrowed).
+func newDiskSources(beforeXML, afterXML string) []string {
+	before := map[string]bool{}
+	for _, p := range parseDomainDiskSources(beforeXML) {
+		before[p] = true
+	}
+	if len(before) == 0 {
+		return nil
+	}
+	after := parseDomainDiskSources(afterXML)
+	var out []string
+	for _, dev := range sortedDevs(after) {
+		if p := after[dev]; !before[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// narrowNew narrows files libvirt has just made for a snapshot — its
+// overlays, its memory image — to their owner (qemu, by libvirt's label, or
+// root), whatever mode libvirt gave them (internal/diskmode). Best effort: the
+// snapshot stands either way, and a failure is logged.
+func narrowNew(paths ...string) {
+	for _, p := range paths {
+		if err := diskmode.Narrow(p); err != nil {
+			slog.Warn("a new snapshot file could not be narrowed to its owner", "path", p, "error", err)
+		}
+	}
 }
 
 // ListSnapshots returns all snapshot names for a domain.
@@ -629,9 +668,13 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if err != nil {
 		return 0, 0, err
 	}
+	before, _ := c.virt.DomainGetXMLDesc(dom, 0)
 	flags := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic)
 	if _, err := c.virt.DomainSnapshotCreateXML(dom, snapXML, flags); err != nil {
 		return 0, 0, fmt.Errorf("disk snapshot: %w", err)
+	}
+	if after, aerr := c.virt.DomainGetXMLDesc(dom, 0); aerr == nil {
+		narrowNew(newDiskSources(before, after)...)
 	}
 	allocation, _, _, _ := c.virt.DomainGetBlockInfo(dom, "vda", 0)
 
@@ -648,6 +691,7 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 	if err := c.virt.DomainSaveFlags(dom, vmstatePath, nil, uint32(domainSavePaused)); err != nil {
 		return 0, 0, fmt.Errorf("save guest memory: %w", err)
 	}
+	narrowNew(vmstatePath) // the guest's RAM
 
 	// 4. Resume from the saved image as running (disks already point at the
 	// overlay, so no Dxml override is needed here).
@@ -1317,11 +1361,17 @@ func resetOverlay(overlay, base string) error {
 		return fmt.Errorf("snapshot base %s: %w", base, err)
 	}
 	_ = os.Remove(overlay)
+	// Made owner-only before qemu-img writes into it (qemu-img keeps an
+	// existing file's mode; its own would be 0644): the overlay takes the
+	// guest's writes from here on (internal/diskmode).
+	if err := diskmode.Create(overlay); err != nil {
+		return fmt.Errorf("create overlay %s: %w", overlay, err)
+	}
 	cmd := exec.Command("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", base, overlay)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("qemu-img create: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return diskmode.Narrow(overlay)
 }
 
 // restoreWithRetry calls DomainRestoreFlags (as running) retrying on virtlockd

@@ -161,6 +161,35 @@ node the request enters, so during a rolling upgrade an entry node on an older
 build does not check it; the directory check runs there and again on the
 pool's host.
 
+### File modes
+
+A disk file is the guest's data, so every one litevirt writes is readable and
+writable by its owner only (`0600`): a new disk, an overlay, a clone, an image
+made from a VM's disk, a restore, a promoted replica, the copy a migration or a
+replication writes on its target, a cloud-init seed (it carries the user-data)
+and a snapshot's firmware bundle. qemu, which runs as the distro's qemu user,
+opens a disk as its owner: libvirt's default `dynamic_ownership` chowns every
+image of a disk's chain to that user when the domain starts. Pulled base images
+were already `0600`. Snapshot overlays and memory images libvirt makes itself
+are narrowed to their owner once the snapshot is taken.
+
+A directory litevirt makes to hold disks — the data directory's `disks`,
+`images` and `cloudinit` on a new host, a pool directory, a btrfs disk's
+subvolume, an NVRAM or snapshot directory — is `0711`: every user can reach a
+file in it by name, which qemu needs (libvirt labels files, never the
+directories above them), and nobody but root can list it.
+
+Nothing that already exists is changed: a disk or directory an earlier release
+made keeps its mode. A copy of one — a migration's, a restore's — is a new file
+and is `0600`. Installer ISOs in a library stay `0644`: they are shared,
+read-only install media.
+
+A host where libvirt does not chown disks (`dynamic_ownership = 0`) and qemu is
+not root could not open a writable `0644` disk either; it runs qemu as root, for
+which `0600` is the same. On a root-squashed NFS export, the daemon's files
+belong to the export's anonymous user, so qemu opens them as their owner only
+when that user is qemu's (`anonuid`), which a writable disk needed before too.
+
 ### Directory pools on NFS
 
 A `local`, `dir` or `btrfs` pool may sit on an NFS mount the host makes itself

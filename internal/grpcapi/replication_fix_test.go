@@ -9,7 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,17 +66,52 @@ func settled(rec *hookRecorder) []string {
 	return rec.kinds()
 }
 
+// seenKinds records, in call order, what replicationOutcome asked notify to
+// send. notify delivers each notification from its own goroutine, so the order
+// a webhook receives them in is the scheduler's, not the product's; this hook
+// is called synchronously and is the order the product decided.
+func seenKinds(s *Server) func() []string {
+	var mu sync.Mutex
+	var seen []string
+	s.notifySeen = func(n notify.Notification) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, n.Kind+"/"+string(n.Severity))
+	}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+}
+
+// delivered waits until the webhook has received want notifications, then holds
+// a bounded quiet period to catch one more arriving. It returns what arrived,
+// sorted: delivery order across goroutines is not a property of the product.
+func delivered(t *testing.T, rec *hookRecorder, want int) []string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(rec.kinds()) < want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // quiet period: nothing beyond want
+	got := rec.kinds()
+	sort.Strings(got)
+	return got
+}
+
 // I4: a target that stays down is reported once when it goes down, then at most
 // hourly, and once when it comes back; audit rows only on the transitions.
 func TestReplicationOutcome_ReportsTransitionsNotTicks(t *testing.T) {
 	s, rec := replNotifyServer(t)
+	seen := seenKinds(s)
 	ctx := context.Background()
 	sched := corrosion.BackupScheduleRecord{VMName: corrosion.ContainerScheduleKey("_default", "web"), Repo: "dr", TargetHost: "host-b"}
 	down := &replTargetDownError{host: "host-b"}
 	for i := 0; i < 12; i++ { // an hour of */5 ticks
 		s.replicationOutcome(ctx, sched, "container", "web", "_default", "host-b", "dr", "", down)
 	}
-	if got := settled(rec); len(got) != 1 || got[0] != "replication.failed/warn" {
+	if got := seen(); len(got) != 1 || got[0] != "replication.failed/warn" {
 		t.Fatalf("a target down for 12 ticks notified %v, want one warning", got)
 	}
 	if n := auditCount(t, s, "ct.replicate"); n != 1 {
@@ -86,7 +124,7 @@ func TestReplicationOutcome_ReportsTransitionsNotTicks(t *testing.T) {
 	s.replRuns.mu.Unlock()
 	s.replicationOutcome(ctx, sched, "container", "web", "_default", "host-b", "dr", "", down)
 	s.replicationOutcome(ctx, sched, "container", "web", "_default", "host-b", "dr", "", down)
-	if got := settled(rec); len(got) != 2 {
+	if got := seen(); len(got) != 2 {
 		t.Fatalf("after an hour: %v, want exactly one more notification", got)
 	}
 	if n := auditCount(t, s, "ct.replicate"); n != 1 {
@@ -98,12 +136,18 @@ func TestReplicationOutcome_ReportsTransitionsNotTicks(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		s.replicationOutcome(ctx, sched, "container", "web", "_default", "host-b", "dr", "ok", nil)
 	}
-	got := settled(rec)
+	got := seen()
 	if len(got) != 4 || got[2] != "replication.failed/error" || got[3] != "replication.recovered/info" {
 		t.Fatalf("notifications %v, want a new error class and one recovery", got)
 	}
 	if n := auditCount(t, s, "ct.replicate"); n != 3 {
 		t.Fatalf("%d audit rows, want 3 (down, new class, recovered)", n)
+	}
+	// What the product sent is what the webhook receives: all four and no more.
+	want := append([]string(nil), got...)
+	sort.Strings(want)
+	if d := delivered(t, rec, len(want)); !reflect.DeepEqual(d, want) {
+		t.Fatalf("webhook received %v, want %v", d, want)
 	}
 }
 

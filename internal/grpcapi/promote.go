@@ -1010,10 +1010,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
 			"vm", targetName, "why", ioR.why())
 	}
-	// The limits, hot-add band and USB devices take their own gates the same
-	// way (never refusing the promotion), so the renamed copy's row below is
-	// written through the one writer that checks every grant its spec needs.
-	relR := s.restrictPromotedReleaseFeatures(ctx, &spec, renamed)
+	// The limits, hot-add band and USB devices are restricted the same way
+	// (never refusing the promotion); their grants are taken once the
+	// promotion's refusals have passed (relR.grant, below), so the renamed
+	// copy's row is written through the one writer that checks every grant
+	// its spec needs.
+	relR := s.restrictPromotedReleaseFeatures(&spec, renamed)
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1275,6 +1277,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
 		BackingDisk: liveDiskBacking(livePath, replicaPath),
 	}}
+
+	// The release grants for what the spec still carries, now that every
+	// refusal of the promotion has passed (relR.grant): a refused promotion
+	// records no use.
+	relR.grant(ctx, s, &spec)
 
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord

@@ -2,7 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -23,8 +27,11 @@ func TestCreateVM_AGrantTheWriterRefusesIsRefusedBeforeDefine(t *testing.T) {
 	req := disklessCreateRequest("h1")
 	req.Spec.MemoryHotplugMaxMib = 4096
 	_, err := s.CreateVM(adminCtx(), req)
-	if err == nil {
-		t.Error("a create whose grant the writer refuses succeeded")
+	// The refusal is the grant check's own, not a later failure (before the
+	// fix the create also failed, but only because vmToProto found no row).
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "vm create") ||
+		!strings.Contains(err.Error(), "without a grant from its gate") {
+		t.Errorf("CreateVM = %v; want Internal naming the missing grant", err)
 	}
 	if defined {
 		t.Error("the domain was defined before the grant was found wanting")

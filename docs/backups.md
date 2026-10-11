@@ -745,7 +745,8 @@ the way a VM schedule replicates a disk. A container has no storage pool, so
 backup repo on it: a logical repo name that peer has in its `backup_repos`
 config (or a repo registered cluster-wide). A run is paced by the owner's
 `backup_bwlimits` entry for that repo name, if it has one (see
-[Bandwidth limits](#bandwidth-limits)).
+[Bandwidth limits](#bandwidth-limits)); an entry on the target host does not
+apply to it.
 
 ```bash
 lv replication schedule add web --container --cron "0 * * * *" \

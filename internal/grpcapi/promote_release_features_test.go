@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -112,10 +115,15 @@ func TestPromoteReplica_ReleaseFeaturesTakeTheCombinedWriter(t *testing.T) {
 		"closed":                   {on: false},
 		"latched but refusing use": {latchedButRefuses: true},
 	} {
-		s, fake, _, err := promoteWithReleaseData(t, g)
+		s, fake, asked, err := promoteWithReleaseData(t, g)
 		if err != nil {
 			t.Errorf("%s: promote refused: %v", name, err)
 			continue
+		}
+		// Before the latch the data is dropped without asking the gate, which
+		// would only ping the lagging hosts to refuse.
+		if name == "closed" && len(asked) != 0 {
+			t.Errorf("closed: the gate was asked for %v before the latch", asked)
 		}
 		x := fake.DefinedXML("vm1-p")
 		if lv.HasVirtioMem(x) || strings.Contains(x, "<cputune>") || strings.Contains(x, "<bandwidth") {
@@ -124,6 +132,92 @@ func TestPromoteReplica_ReleaseFeaturesTakeTheCombinedWriter(t *testing.T) {
 		got := loadStoredSpec(t, s, "vm1-p")
 		if specSetsLimits(got) || vmSpecSetsPassthrough(got) || got.MemoryHotplugBaseMib != 0 {
 			t.Errorf("%s: the stored spec carries release data: %+v", name, got)
+		}
+	}
+}
+
+// insertLimitedVM1 records vm1, owned by a failed host in project acme, with
+// limits and a hot-add band in its spec, and a replica of its root disk.
+func insertLimitedVM1(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	poolDir := t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 1024,
+		MemoryHotplugBaseMib: 1024, MemoryHotplugMaxMib: 4096, CpuLimit: 1.5, CpuShares: 200,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "virtio"}}})
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1", HostName: "dead-host", State: "running",
+		Spec: string(specJSON), Project: "acme", CPUActual: 2, MemActual: 1024}, nil,
+		[]corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "dead-host", Path: "/gone", SizeBytes: 1 << 20, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "dead-host", Address: "10.0.0.66", State: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	seedReplica(t, poolDir, "acme", "vm1", "root", "20260101-000000", "raw", 1<<20)
+}
+
+// A promotion its own checks refuse records no release-feature use: the
+// grants are taken only once every refusal has passed (review m-2), so a
+// renamed promotion over its project's quota asks the gate nothing.
+//
+// Mutation: take the grants in restrictPromotedReleaseFeatures, ahead of the
+// refusals (as before) — the gate is asked.
+func TestPromoteReplica_ARefusedPromotionRecordsNoUse(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	s.virt = libvirtfake.New()
+	var asked []capabilities.Feature
+	s.SetReleaseFeatureGate(askedGate{ioGate: ioGate{t: t, on: true}, asked: &asked})
+	insertLimitedVM1(t, s)
+	if err := corrosion.UpsertProjectQuota(context.Background(), s.db, corrosion.ProjectQuotaRecord{
+		ProjectName: "acme", VCPULimit: 3, MemMiBLimit: 3000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1", NewName: "vm1-dr"})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("renamed promotion past the quota: %v, want ResourceExhausted", err)
+	}
+	if len(asked) != 0 {
+		t.Errorf("a refused promotion ran the release gate for %v", asked)
+	}
+}
+
+// A takeover keeps its row's spec. With the gate closed its domain is defined
+// without the limits and the hot-add band, the row keeps them for the next
+// redefine, and the audit says so — not that they were dropped (review m-3).
+// With the gate open, the domain renders them.
+//
+// Mutation: word the takeover audit as a renamed one's ("not carried") —
+// the closed case goes red.
+func TestPromoteReplica_TakeoverKeepsTheRowsReleaseData(t *testing.T) {
+	for _, open := range []bool{false, true} {
+		s := testServer(t)
+		s.dataDir = t.TempDir()
+		fake := libvirtfake.New()
+		s.virt = fake
+		s.SetReleaseFeatureGate(ioGate{t: t, on: open})
+		insertLimitedVM1(t, s)
+		if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err != nil {
+			t.Fatalf("open=%v: takeover: %v", open, err)
+		}
+		x := fake.DefinedXML("vm1")
+		if rendered := lv.HasVirtioMem(x) && strings.Contains(x, "<cputune>"); rendered != open {
+			t.Errorf("open=%v: the domain renders the limits and band = %v:\n%s", open, rendered, x)
+		}
+		if got := loadStoredSpec(t, s, "vm1"); !specSetsLimits(got) || got.MemoryHotplugMaxMib != 4096 {
+			t.Errorf("open=%v: the takeover's row lost its release data: %+v", open, got)
+		}
+		rows, _ := s.db.Query(context.Background(), `SELECT detail FROM audit_log WHERE action = 'vm.release_features_dropped'`)
+		switch {
+		case open && len(rows) != 0:
+			t.Errorf("open gate: an audit of a drop: %v", rows)
+		case !open && (len(rows) != 1 || !strings.Contains(rows[0].String("detail"), "kept in the row")):
+			t.Errorf("closed gate: audit rows %v; want one saying the data is kept in the row", rows)
 		}
 	}
 }

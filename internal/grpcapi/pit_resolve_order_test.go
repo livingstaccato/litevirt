@@ -97,3 +97,50 @@ func TestResolvePITOverlay_ACrashBetweenRepointAndRemovalRecovers(t *testing.T) 
 		t.Fatalf("start after the discard: %v", err)
 	}
 }
+
+// Re-review 1, m5: a crash after a forced commit's repoint and before the
+// commit leaves the overlay uncommitted beside the disk; the VM stays held,
+// and the forced commit run again finishes.
+//
+// Mutation "force-commit commits, then repoints" — red.
+func TestResolvePITOverlay_ACrashBetweenRepointAndForcedCommitRecovers(t *testing.T) {
+	s, fake, live := heldOnItsOverlay(t)
+	overlay := pitoverlay.Path(live)
+	type crash struct{}
+	prev := resolvePITStep
+	resolvePITStep = func(step string) {
+		if step == "repointed" {
+			panic(crash{})
+		}
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if _, ok := r.(crash); !ok {
+					panic(r)
+				}
+			}
+		}()
+		_, _ = s.resolveWebOn("commit", true)
+	}()
+	resolvePITStep = prev
+
+	if on, _ := fake.DomainUsesFile("web", overlay); on {
+		t.Fatal("the definition still names the overlay after the repoint")
+	}
+	if !pitoverlay.Present(live) || holdsTheWindowsWrite(t, live) {
+		t.Fatal("the overlay was committed or removed before the crash point")
+	}
+	if err := startWeb(t, s); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("start after a crash mid-forced-commit = %v; want refused, held", err)
+	}
+	if _, err := s.resolveWebOn("commit", true); err != nil {
+		t.Fatalf("forced commit run again: %v", err)
+	}
+	if pitoverlay.Present(live) || !holdsTheWindowsWrite(t, live) {
+		t.Fatal("after the forced commit the overlay is still there, or its write is not in the disk")
+	}
+	if err := startWeb(t, s); err != nil {
+		t.Fatalf("start after the forced commit: %v", err)
+	}
+}

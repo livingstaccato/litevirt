@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,9 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 	cleanup(t, func() {
 		lvErr(t, "compose", "down", "--name", stack, "-y")
 		lvErr(t, "network", "rm", netName, "--force")
+		// `network rm` leaves a user-managed bridge behind; remove the one this
+		// test created on every host the VM touched.
+		removeTestBridge(t, netName)
 	})
 	lv(t, "network", "create", netName, "--type", "bridge", "--subnet", "172.31.7.0/24", "--dhcp")
 
@@ -175,27 +179,39 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 		}
 	}
 
-	// Live migration carries the throttle, discard and queues (libvirt copies the
-	// running definition). Skipped on a single-host lab.
+	lv(t, "disk-io", vm, "--disk", "root", "--clear")
+	if virshAvailable() {
+		if got := virshBlkIOTune(t, vm, "vda")["read_iops_sec"]; got != "0" {
+			t.Errorf("after --clear libvirt reports read_iops_sec=%q, want 0", got)
+		}
+	}
+
+	// Live migration carries the throttle (libvirt copies the running
+	// definition). Skipped on a single-host lab. Runs last because the VM then
+	// lives on another host, out of reach of the local virsh reads above.
 	if len(hostNames) > 1 {
 		target := hostNames[1]
 		if target == host {
 			target = hostNames[0]
 		}
-		if out, err := lvErr(t, "migrate", vm, "--to", target); err != nil {
-			t.Logf("live migration not possible here: %v\n%s", err, out)
-		} else {
-			waitVM(t, vm, "RUNNING", 2*time.Minute)
-			if got := lv(t, "inspect", vm); !strings.Contains(got, target) {
-				t.Errorf("VM did not land on %s:\n%s", target, got)
-			}
+		lv(t, "disk-io", vm, "--disk", "root", "--read-iops", "700")
+		// A local-disk VM needs --with-storage. A failure here fails the test: a
+		// silent skip would stop checking that migration carries the throttle.
+		if out, err := lvErr(t, "migrate", vm, target, "--with-storage"); err != nil {
+			t.Fatalf("live migration to %s failed: %v\n%s", target, err, out)
 		}
-	}
-
-	lv(t, "disk-io", vm, "--disk", "root", "--clear")
-	if virshAvailable() {
-		if got := virshBlkIOTune(t, vm, "vda")["read_iops_sec"]; got != "0" {
-			t.Errorf("after --clear libvirt reports read_iops_sec=%q, want 0", got)
+		waitVM(t, vm, "RUNNING", 2*time.Minute)
+		if got := lv(t, "inspect", vm); !strings.Contains(got, target) {
+			t.Errorf("VM did not land on %s:\n%s", target, got)
+		}
+		// Read the throttle from libvirt on the destination, not through litevirt.
+		out, err := exec.Command("timeout", "30", "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", target,
+			"virsh -c qemu:///system blkdeviotune "+vm+" vda").CombinedOutput()
+		if err != nil {
+			t.Fatalf("cannot read libvirt on %s: %v\n%s", target, err, out)
+		}
+		if !regexp.MustCompile(`(?m)^read_iops_sec\s*:\s*700\s*$`).Match(out) {
+			t.Errorf("destination %s lost the read_iops_sec=700 throttle after migration:\n%s", target, out)
 		}
 	}
 }

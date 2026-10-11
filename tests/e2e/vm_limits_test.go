@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // The noisy-neighbour controls against a real hypervisor. tests/fleet injects
@@ -107,20 +109,130 @@ func hostShares(v2 bool, weight int) int {
 	return v
 }
 
-// domainCgroupFile reads a control file from the domain's cgroup (cgroup v2),
-// or "" when the host has no such cgroup layout. The scope name escapes the
-// VM name's dashes, so the pattern wildcards them.
-func domainCgroupFile(domain, file string) string {
-	pat := "/sys/fs/cgroup/machine.slice/machine-qemu*" + strings.ReplaceAll(domain, "-", "*") + "*.scope/" + file
+// domainCgroupScope returns the domain's cgroup v2 scope directory, or "" when
+// the host has no such layout. The scope name escapes the VM name's dashes, so
+// the pattern wildcards them.
+func domainCgroupScope(domain string) string {
+	pat := "/sys/fs/cgroup/machine.slice/machine-qemu*" + strings.ReplaceAll(domain, "-", "*") + "*.scope"
 	m, _ := filepath.Glob(pat)
 	if len(m) == 0 {
 		return ""
 	}
-	b, err := os.ReadFile(m[0])
+	return m[0]
+}
+
+// domainCgroupFile reads a control file from the domain's scope cgroup (cgroup
+// v2), or "" when the host has no such cgroup layout or file.
+func domainCgroupFile(domain, file string) string {
+	scope := domainCgroupScope(domain)
+	if scope == "" {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(scope, file))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// hasCPUQuota reports whether a cpu.max value carries a quota ("max <period>"
+// is the unlimited form).
+func hasCPUQuota(v string) bool {
+	f := strings.Fields(v)
+	return len(f) == 2 && f[0] != "max"
+}
+
+// domainCPUMax returns the cgroup cpu.max that holds the whole-domain quota.
+// libvirt 10 applies the global cputune quota on the <scope>/libvirt
+// sub-cgroup and leaves the scope's own cpu.max at "max"; older layouts put it
+// on the scope. The sub-cgroup is preferred, then the scope; ok is false when
+// neither carries a quota, which on a cgroup v2 host means the cap was never
+// enforced. An empty result with ok true means the host is not on cgroup v2,
+// where there is no cpu.max to read.
+func domainCPUMax(domain string) (val string, ok bool) {
+	if !localV2() {
+		return "", true
+	}
+	for _, f := range []string{"libvirt/cpu.max", "cpu.max"} {
+		if v := domainCgroupFile(domain, f); hasCPUQuota(v) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// wantCPUMax asserts the whole-domain quota in the cgroup, failing when no
+// cgroup level carries one.
+func wantCPUMax(t *testing.T, domain, want string) {
+	t.Helper()
+	got, ok := domainCPUMax(domain)
+	if !ok {
+		t.Errorf("no cgroup level carries a cpu.max quota (scope %q: libvirt/cpu.max=%q cpu.max=%q), want %q: the cap is not enforced",
+			domainCgroupScope(domain), domainCgroupFile(domain, "libvirt/cpu.max"), domainCgroupFile(domain, "cpu.max"), want)
+		return
+	}
+	if got != "" && got != want {
+		t.Errorf("cgroup cpu.max = %q, want %q", got, want)
+	}
+}
+
+// limitsNetwork creates a bridge network for a limits test and registers its
+// cleanup, which also removes the Linux bridge the network provisioned:
+// `lv network rm` deliberately leaves a user-managed bridge behind, so without
+// this every run leaks one per host the VM touched.
+func limitsNetwork(t *testing.T, subnet string) string {
+	t.Helper()
+	netName := uniqueName("ln")
+	cleanup(t, func() {
+		lvErr(t, "network", "rm", netName, "--force")
+		removeTestBridge(t, netName)
+	})
+	lv(t, "network", "create", netName, "--type", "bridge", "--subnet", subnet, "--dhcp")
+	return netName
+}
+
+// removeTestBridge deletes, on every cluster host, the Linux bridge that the
+// test's own bridge network (created without --interface) provisioned. The
+// name is derived from a uniqueName, so no bridge the test did not create can
+// match. Best effort: failures are logged, not fatal, in a cleanup.
+func removeTestBridge(t *testing.T, netName string) {
+	t.Helper()
+	br := network.FlatBridgeName(netName)
+	if !strings.HasPrefix(netName, "e2e-") || br == "" {
+		t.Logf("refusing to delete bridge %q of network %q: not a test-created name", br, netName)
+		return
+	}
+	script := "if ip link show " + br + " >/dev/null 2>&1; then ip link del " + br + "; fi"
+	for _, h := range hostNames {
+		var cmd *exec.Cmd
+		if h == localHost {
+			cmd = exec.Command("sh", "-c", script)
+		} else {
+			cmd = exec.Command("timeout", "30", "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", h, script)
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Logf("cleanup: removing bridge %s on %s: %v\n%s", br, h, err, out)
+		}
+	}
+}
+
+// attachLimitsNIC gives a VM made by `lv run` (which has no network flag, so
+// no NIC) one NIC on netName and returns its MAC, waiting for libvirt to show it.
+func attachLimitsNIC(t *testing.T, name, netName string) string {
+	t.Helper()
+	before := domIfaceMACs(t, name)
+	lv(t, "attach-nic", name, netName)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range domIfaceMACs(t, name) {
+			if !containsMAC(before, m) {
+				return m
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("no NIC appeared on %s after attach-nic (libvirt reports %v)", name, domIfaceMACs(t, name))
+	return ""
 }
 
 // tapOf returns the host tap device of a domain's first NIC.
@@ -148,6 +260,7 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	if host != localHost {
 		t.Skipf("no local capacity (placed on %s); virsh assertions need the local host", host)
 	}
+	netName := limitsNetwork(t, "172.34.1.0/24")
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 
 	// A 1-core cap is 100000us of CPU per 100000us period for the WHOLE guest;
@@ -160,14 +273,10 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	if got := domainCgroupFile(name, "cpu.weight"); got != "" && got != "200" {
 		t.Errorf("cgroup cpu.weight = %q, want 200 (the weight is passed through unconverted)", got)
 	}
-	if got := domainCgroupFile(name, "cpu.max"); got != "" && got != "100000 100000" {
-		t.Errorf("cgroup cpu.max = %q, want \"100000 100000\" (a whole-domain cap)", got)
-	}
+	wantCPUMax(t, name, "100000 100000") // a whole-domain cap
 
-	macs := domIfaceMACs(t, name)
-	if len(macs) == 0 {
-		t.Fatal("VM has no NIC to rate-limit")
-	}
+	// `lv run` makes a VM with no NIC, so give it one before rate-limiting "nic 0".
+	macs := []string{attachLimitsNIC(t, name, netName)}
 
 	// Change everything on the RUNNING guest: no stop, same qemu process.
 	pid := qemuPID(name)
@@ -178,9 +287,7 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	live := map[string]string{"cpu_shares": strconv.Itoa(hostShares(localV2(), 400)), "global_period": "100000", "global_quota": "150000"}
 	wantSched(t, "live", virshSched(t, name, false), live)
 	wantSched(t, "config", virshSched(t, name, true), live) // a reboot keeps it
-	if got := domainCgroupFile(name, "cpu.max"); got != "" && got != "150000 100000" {
-		t.Errorf("cgroup cpu.max = %q, want \"150000 100000\"", got)
-	}
+	wantCPUMax(t, name, "150000 100000")
 	// 4 MB/s is 4000 KB/s (libvirt's unit), live and persistent.
 	for _, config := range []bool{false, true} {
 		if in, out := virshIfaceRate(t, name, macs[0], config); in != "4000" || out != "4000" {
@@ -241,10 +348,14 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	if host != localHost {
 		t.Skipf("no local capacity (placed on %s)", host)
 	}
+	netName := limitsNetwork(t, "172.34.2.0/24")
 	cleanup(t, func() { lvErr(t, "rm", name, "--force") })
 	runWithLimits(t, name, host)
+	attachLimitsNIC(t, name, netName) // `lv run` makes a VM with no NIC
 	lv(t, "update", name, "--nic-rate", "0=2")
-	if out, err := lvErr(t, "migrate", name, target); err != nil {
+	// The VM has a host-local disk, which `lv migrate` refuses to move without
+	// --with-storage.
+	if out, err := lvErr(t, "migrate", name, target, "--with-storage"); err != nil {
 		t.Fatalf("migration to %s failed: %v\n%s", target, err, out)
 	}
 	waitVM(t, name, "RUNNING", 3*time.Minute)

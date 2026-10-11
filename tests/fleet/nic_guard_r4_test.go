@@ -183,7 +183,7 @@ func TestFleet_NICGuard_CloneOfATrunkIsGuarded(t *testing.T) {
 	ctx := context.Background()
 	openNICGuards(t, n)
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
-	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	setHostCapacity(t, c, n.Name, 64, 65536)
 	seedCloneSource(t, c, n, "tpl", "", 1, 256)
 	if err := n.DB.Execute(ctx, `UPDATE vms SET spec = ? WHERE name = 'tpl'`,
 		`{"name":"tpl","cpu":1,"memory_mib":256,"network":[{"name":"lan","trunk":[10,11]}]}`); err != nil {

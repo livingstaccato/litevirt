@@ -108,8 +108,8 @@ func TestFleet_NICGuard_HeldHandOverRetried(t *testing.T) {
 func TestFleet_NICGuard_HeldHandOverReported(t *testing.T) {
 	c, src, dst, nfts := heldCluster(t)
 	ctx := context.Background()
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	dst.Virt.FailResumeDomain = func(string) error { return errors.New("qemu would not resume") }
 
 	st, err := c.SelfClient(src).DrainHost(ctx, &pb.DrainHostRequest{Name: src.Name})
@@ -229,8 +229,8 @@ func TestFleet_NICGuard_ResumeHeldCommand(t *testing.T) {
 func TestFleet_NICGuard_HeldDrainStillReversesReplication(t *testing.T) {
 	c, src, dst, _ := heldCluster(t)
 	ctx := context.Background()
-	setHostCapacity(t, c, src.Name, 64, 65536, nil)
-	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	setHostCapacity(t, c, src.Name, 64, 65536)
+	setHostCapacity(t, c, dst.Name, 64, 65536)
 	drPool(t, c, src)
 	drPool(t, c, dst)
 	if err := corrosion.UpsertBackupSchedule(ctx, src.DB, corrosion.BackupScheduleRecord{

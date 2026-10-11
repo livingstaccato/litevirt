@@ -98,19 +98,23 @@ func replicaSetOthers(disks []corrosion.DiskRecord, src *corrosion.DiskRecord) [
 // another host as it is, so it is never copied into a replica and never
 // rebuilt from one: a promotion reattaches it as-is (plan §5.1 "reattach").
 func (s *Server) diskOnSharedStorage(ctx context.Context, d corrosion.DiskRecord) bool {
-	if corrosion.DiskIsShared(d) {
+	if corrosion.DiskOnSharedStorage(ctx, s.db, d, s.hostName) {
 		return true
 	}
-	if d.StorageVolume == "" {
-		return false
+	// This host's pool configuration, which may not be a row yet.
+	if d.StorageVolume != "" {
+		if ref, ok := s.resolvePool(ctx, d.StorageVolume); ok && isSharedDriver(ref.Driver) {
+			return true
+		}
 	}
-	if ref, ok := s.resolvePool(ctx, d.StorageVolume); ok && isSharedDriver(ref.Driver) {
-		return true
-	}
-	// The pool may be defined only on the disk's own host: its row there
-	// says what it is (review N9).
-	if d.HostName != "" && s.db != nil {
-		if p, ok, err := corrosion.GetStoragePool(ctx, s.db, d.HostName, d.StorageVolume); err == nil && ok && isSharedDriver(p.Driver) {
+	return false
+}
+
+// vmHasSharedDisk is diskOnSharedStorage over a VM's disks: the one test the
+// executor's shared-disk fence gate and the promotion's reattach agree on.
+func (s *Server) vmHasSharedDisk(ctx context.Context, disks []corrosion.DiskRecord) bool {
+	for _, d := range disks {
+		if s.diskOnSharedStorage(ctx, d) {
 			return true
 		}
 	}
@@ -122,20 +126,25 @@ func (s *Server) diskOnSharedStorage(ctx context.Context, d corrosion.DiskRecord
 // it unattached (main's outcome), never refuses the promotion:
 //
 //   - a renamed promotion never: the original VM owns the disk;
-//   - an automatic one (a coordinator's, or a relayed proof) only when the
-//     shared-storage fence is enforced, which is when the old owner was
-//     proven powered off before this promotion could run;
-//   - a manual one only when the owner is this host, is fenced, is removed,
-//     or is no longer a member at all — not merely "not active";
+//   - fenceProven — THIS executor verified a proof-grade fence of the owner
+//     for this promotion (a carried proof, the shared-storage fence
+//     enforced, requireProofGradeFence passed) — reattaches;
+//   - an automated promotion (the coordinator's, in-process or relayed with
+//     the automated mark) without that never: its old owner may have been
+//     fenced best-effort only, and may still be writing the disk;
+//   - every other promotion — an operator's, through any node or local-root
+//     lv, or an older coordinator's relay that carries neither a proof nor
+//     the mark — gets the manual rule: only when the owner is this host, is
+//     fenced, is removed, or is no longer a member. --force never bypasses it;
 //   - an owner whose host row cannot be read: never (fail closed).
-func sharedReattachVerdict(renamed, automatic, fenceEnforced bool, owner, self string, ownerHost *corrosion.HostRecord, ownerErr error) (bool, string) {
+func sharedReattachVerdict(renamed, automated, fenceProven bool, owner, self string, ownerHost *corrosion.HostRecord, ownerErr error) (bool, string) {
 	switch {
 	case renamed:
 		return false, "renamed"
-	case automatic && !fenceEnforced:
-		return false, fmt.Sprintf("no proof-grade fence of %s (enforcement.shared_storage_fence is off)", owner)
-	case automatic:
+	case fenceProven:
 		return true, ""
+	case automated:
+		return false, fmt.Sprintf("no proof-grade fence of %s was verified by this host for this promotion", owner)
 	case owner == "" || owner == self:
 		return true, ""
 	case ownerErr != nil:
@@ -143,7 +152,7 @@ func sharedReattachVerdict(renamed, automatic, fenceEnforced bool, owner, self s
 	case ownerHost == nil || ownerHost.State == "removed" || ownerHost.State == "fenced":
 		return true, ""
 	default:
-		return false, fmt.Sprintf("its owner %s is %s, not fenced", owner, ownerHost.State)
+		return false, fmt.Sprintf("its owner %s is %s, not fenced (and no proof-grade fence was verified)", owner, ownerHost.State)
 	}
 }
 

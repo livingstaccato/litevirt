@@ -401,6 +401,7 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 				NewName: req.NewName, Force: req.Force, NoLocalize: req.NoLocalize,
 				Proof:                req.Proof, // carry the full single-use proof to the executor
 				AcceptNotPointInTime: acceptNotPIT,
+				Automated:            automated || req.Automated,
 			}
 			err = s.relayPromote(ctx, host, fwd, send)
 		} else {
@@ -866,15 +867,23 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// is writable from both hosts, so a double-run corrupts it. A local-disk transfer
 	// (a replica is a different image) keeps the existing quorum/proof gate above. Fail
 	// closed once enforced; kill-switch (enforcement.shared_storage_fence) restores legacy.
+	//
+	// "Shared" is the one definition the promotion's reattach uses too
+	// (vmHasSharedDisk: storage type or pool driver). fenceProven records that
+	// this executor itself verified a proof-grade fence of the old owner for
+	// this promotion — the only thing that lets an automated promotion
+	// reattach a shared data disk as-is (sharedReattachVerdict).
+	fenceProven := false
 	if req.Proof != nil && s.sharedStorageFenceActive(ctx) {
 		disks, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 		if derr != nil {
 			return status.Errorf(codes.Unavailable, "shared-disk fence check — list disks: %v", derr)
 		}
-		if corrosion.VMHasWritableSharedDisk(disks) {
+		if s.vmHasSharedDisk(ctx, disks) {
 			if err := s.requireProofGradeFence(ctx, req.Proof.GetFenceEpoch(), vm.HostName); err != nil {
 				return err
 			}
+			fenceProven = true
 		}
 	}
 	// Durable step-resume: promote is a multi-step, partly-destructive sequence
@@ -1212,12 +1221,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if vm.HostName != "" && vm.HostName != s.hostName {
 		ownerHost, ownerErr = corrosion.GetHost(ctx, s.db, vm.HostName)
 	}
-	// A promotion relayed from another host counts as automatic here: the
-	// coordinator's relay carries a proof only under enforcement, and a host
-	// on an older build carries none at all, so a relayed call is never
-	// trusted to be an operator's (which only narrows what is reattached).
-	sharedAuto := autoPath || s.requirePeerCert(ctx) == nil
-	reattachOK, reattachWhy := sharedReattachVerdict(renamed, sharedAuto, s.sharedStorageFenceActive(ctx),
+	// Automated: the coordinator's own call, a carried proof, or a relay the
+	// coordinator marked. A relay without either (an operator through another
+	// node, local-root lv, an older coordinator) gets the manual rule.
+	sharedAutomated := autoPath || req.Automated
+	reattachOK, reattachWhy := sharedReattachVerdict(renamed, sharedAutomated, fenceProven,
 		vm.HostName, s.hostName, ownerHost, ownerErr)
 	for i := range others {
 		d := &others[i]
@@ -1248,13 +1256,16 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		d.livePath = filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName,
 			strings.TrimSuffix(strings.TrimSuffix(d.replica.File, ".qcow2"), ".raw")))
-		// The step names the file this proof built (review N4): a retry
-		// reuses that file and no other, so a file at the canonical name
-		// that this proof did not build is never reused nor removed.
-		if built, ok := builtStepPath(steps, d.row.DiskName); ok {
+		// The step names the file this proof built and the replica it built
+		// it from (reviews N4, R2-m2): a retry reuses that file only when it
+		// was built from the replica chosen now, and never any other file —
+		// one at the canonical name this proof did not build is never reused
+		// nor removed, and one built from another replica is left and a new
+		// one built beside it.
+		if built, from, ok := builtStepPath(steps, d.row.DiskName); ok && from == d.replica.File {
 			d.livePath = filepath.Join(poolDir, built)
 		}
-		step := "disk_built:" + d.row.DiskName + "=" + filepath.Base(d.livePath)
+		step := builtStep(d.row.DiskName, filepath.Base(d.livePath), d.replica.File)
 		_, statErr := os.Stat(d.livePath)
 		if started {
 			// Adopting a domain an earlier attempt started: the disk counts
@@ -1276,7 +1287,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			slog.Warn("promote: a file is already where the live disk would go; left alone, building beside it",
 				"vm", vm.Name, "disk", d.row.DiskName, "path", d.livePath, "instead", alt)
 			d.livePath = alt
-			step = "disk_built:" + d.row.DiskName + "=" + filepath.Base(alt)
+			step = builtStep(d.row.DiskName, filepath.Base(alt), d.replica.File)
 		}
 		if err := s.buildPromotedDisk(ctx, req, targetName, poolDir, d.replica.File, d.replicaPath, d.replica.Format, d.livePath, send); err != nil {
 			slog.Error("promote: a disk of the replica set could not be built; promoting without it",
@@ -1592,15 +1603,28 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	return nil
 }
 
-// builtStepPath is the file name the proof's step records for disk's built
-// live disk ("disk_built:<disk>=<file>"), if one does.
-func builtStepPath(steps, disk string) (string, bool) {
+// builtStep is the proof step recording that disk's live disk was built as
+// file (a bare name in the pool) from the replica named from:
+// "disk_built:<disk>=<file>,<replica>".
+func builtStep(disk, file, from string) string {
+	return "disk_built:" + disk + "=" + file + "," + from
+}
+
+// builtStepPath is the file and source replica the proof's step records for
+// disk's built live disk, if one does. Both must be bare file names.
+func builtStepPath(steps, disk string) (file, from string, ok bool) {
 	for _, f := range strings.Fields(steps) {
-		if v, ok := strings.CutPrefix(f, "disk_built:"+disk+"="); ok && v != "" && filepath.Base(v) == v {
-			return v, true
+		v, found := strings.CutPrefix(f, "disk_built:"+disk+"=")
+		if !found {
+			continue
 		}
+		file, from, _ = strings.Cut(v, ",")
+		if file == "" || from == "" || filepath.Base(file) != file || filepath.Base(from) != from {
+			continue
+		}
+		return file, from, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // buildPromotedDisk builds the live disk at livePath from the replica at

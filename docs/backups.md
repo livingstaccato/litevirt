@@ -275,8 +275,10 @@ the VM waits at most for that step:
   the last resort below and is recorded as not point-in-time, with a
   point-in-time retry owed. While the session runs, libvirt refuses or times
   out every other operation that needs a block job or the disk: a migration,
-  a backup (`lv backup create`), a snapshot, `lv replicate-volume`, and a
-  detach of that disk. Retry them once the run is done;
+  a backup (`lv backup create`), a snapshot, `lv replicate-volume`,
+  `lv move-volume` of a running VM's disk, `lv resize-disk`, a snapshot delete
+  that flattens (`lv snapshot rm`), and a detach of that disk. Retry them once
+  the run is done;
 - each time a disk's copy takes the lock again, it checks that the VM is
   still this host's and its domain still defined here; if not (it migrated,
   moved or was deleted meanwhile) nothing more of it is copied in that run,
@@ -585,13 +587,23 @@ A disk on **shared storage** is never rebuilt from a replica. A takeover
 promotion reattaches it as-is, at its own path, with its row unchanged, only
 when its old owner provably no longer writes it:
 
-- automatic promotion (failover's, and any promotion relayed from another
-  host): only with `enforcement.shared_storage_fence` enforced, which is when
-  the old owner was proven powered off before the promotion could run;
-- a manual promotion on the host itself: only when the owner is fenced, is
-  removed, or is no longer a member — not merely not active (maintenance or
-  offline is not enough);
+- when the promoting host itself verified a proof-grade fence of the old
+  owner for this promotion: the promotion carries a proof (failover's, under
+  enforcement), `enforcement.shared_storage_fence` is enforced, and the
+  proof's fence is proof-grade (IPMI, or `lv host fence-confirm`);
+- failover's own promotion without such a verified fence: never — a
+  best-effort fence can leave a partitioned host's qemu writing the disk;
+- any other promotion — an operator's, whether the CLI reaches the replica
+  host directly or through another node, local-root `lv`, or a relay from a
+  coordinator on an older build — only when the owner is fenced, is removed,
+  or is no longer a member; not merely not active (maintenance, offline or
+  active is not enough, and `--force` does not change that);
 - an owner whose state cannot be read: never.
+
+"Shared" here is one definition, used by this rule and by both shared-disk
+fence checks (failover's decision and the promoting host's): a disk whose
+storage type is nfs, ceph, rbd or iscsi, or whose pool has a shared driver on
+its own host or the promoting host.
 
 It must also be reachable from the promoting host within a few seconds (a
 hung NFS mount is given up on, and the root is promoted without it). A

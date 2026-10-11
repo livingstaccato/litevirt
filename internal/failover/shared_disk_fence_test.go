@@ -150,3 +150,36 @@ func TestCoordinator_AutoPromote_RetryableFallsThroughToReschedule(t *testing.T)
 		t.Errorf("want vm1 rescheduled to 'good', got host=%q", vm.HostName)
 	}
 }
+
+// R2-m1 of the #258 re-review: the decide-site gate counts a disk shared by
+// its pool's driver, not only by its storage type — the one definition the
+// promotion's reattach uses too (corrosion.DiskOnSharedStorage).
+//
+// Mutation "storage type only" (the gate uses VMHasWritableSharedDisk) — red.
+func TestCoordinator_SharedByPoolDiskRefusedWithoutProofGradeFence(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, h := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort", CPUTotal: 8, MemTotal: 8192,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	// storage_type says local, but its pool on its host is nfs.
+	seedVMWithDisk(t, ctx, db, "pd", "bad", "local")
+	if err := corrosion.UpsertStoragePool(ctx, db, corrosion.StoragePoolRecord{
+		HostName: "bad", Name: "pool", Driver: "nfs", Source: "nas:/vm", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fenceQuorum(t, ctx, db, []string{"coordinator", "good"}, "bad")
+	c := newTestCoordinator("coordinator", db)
+	c.SharedStorageFenceEnforce = true
+	c.Gate = gateEnforcing(capabilities.SharedStorageFenceV1)
+	c.run(ctx)
+	if pd, _ := corrosion.GetVM(ctx, db, "pd"); pd == nil || pd.HostName != "bad" {
+		t.Errorf("a disk shared by its pool without a proof-grade fence must be refused at source, got %+v", pd)
+	}
+}

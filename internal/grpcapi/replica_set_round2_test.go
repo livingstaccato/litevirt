@@ -15,33 +15,35 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
-// N1/N6: every branch of the shared-disk reattach verdict. Each case removed
-// from sharedReattachVerdict turns one row here red.
+// N1/N6/R2-I1: every branch of the shared-disk reattach verdict. Each case
+// removed from sharedReattachVerdict turns a row here red.
 func TestSharedReattachVerdict_EveryBranch(t *testing.T) {
 	host := func(state string) *corrosion.HostRecord { return &corrosion.HostRecord{Name: "old", State: state} }
 	for _, c := range []struct {
-		name               string
-		renamed, auto, fen bool
-		owner              string
-		h                  *corrosion.HostRecord
-		herr               error
-		want               bool
+		name                  string
+		renamed, auto, proven bool
+		owner                 string
+		h                     *corrosion.HostRecord
+		herr                  error
+		want                  bool
 	}{
 		{"renamed, owner fenced", true, false, false, "old", host("fenced"), nil, false},
-		{"renamed, automatic, fence enforced", true, true, true, "old", host("fenced"), nil, false},
-		{"automatic, fence off, owner fenced", false, true, false, "old", host("fenced"), nil, false},
-		{"automatic, fence enforced, owner maintenance", false, true, true, "old", host("maintenance"), nil, true},
-		{"manual, owner is this host", false, false, false, "self", nil, nil, true},
-		{"manual, no owner", false, false, false, "", nil, nil, true},
-		{"manual, owner unreadable", false, false, false, "old", nil, errors.New("db down"), false},
-		{"manual, owner no longer a member", false, false, false, "old", nil, nil, true},
-		{"manual, owner removed", false, false, false, "old", host("removed"), nil, true},
-		{"manual, owner fenced", false, false, false, "old", host("fenced"), nil, true},
-		{"manual, owner maintenance", false, false, false, "old", host("maintenance"), nil, false},
-		{"manual, owner offline", false, false, false, "old", host("offline"), nil, false},
-		{"manual, owner active", false, false, false, "old", host("active"), nil, false},
+		{"renamed, fence proven", true, true, true, "old", host("fenced"), nil, false},
+		{"fence proven, owner maintenance", false, true, true, "old", host("maintenance"), nil, true},
+		{"fence proven, owner active", false, false, true, "old", host("active"), nil, true},
+		{"automated, no fence proven, owner fenced", false, true, false, "old", host("fenced"), nil, false},
+		{"automated, no fence proven, owner maintenance", false, true, false, "old", host("maintenance"), nil, false},
+		{"unproven, owner is this host", false, false, false, "self", nil, nil, true},
+		{"unproven, no owner", false, false, false, "", nil, nil, true},
+		{"unproven, owner unreadable", false, false, false, "old", nil, errors.New("db down"), false},
+		{"unproven, owner no longer a member", false, false, false, "old", nil, nil, true},
+		{"unproven, owner removed", false, false, false, "old", host("removed"), nil, true},
+		{"unproven, owner fenced", false, false, false, "old", host("fenced"), nil, true},
+		{"unproven, owner maintenance", false, false, false, "old", host("maintenance"), nil, false},
+		{"unproven, owner offline", false, false, false, "old", host("offline"), nil, false},
+		{"unproven, owner active", false, false, false, "old", host("active"), nil, false},
 	} {
-		got, why := sharedReattachVerdict(c.renamed, c.auto, c.fen, c.owner, "self", c.h, c.herr)
+		got, why := sharedReattachVerdict(c.renamed, c.auto, c.proven, c.owner, "self", c.h, c.herr)
 		if got != c.want {
 			t.Errorf("%s: reattach = %v (%s), want %v", c.name, got, why, c.want)
 		}
@@ -183,16 +185,20 @@ func TestPromote_AnUnstampedRootTakesNoOtherReplica(t *testing.T) {
 	}
 }
 
-// N4: the build step names the file the proof built; a retry reuses that one
-// and no other.
+// N4/R2-m2: the build step names the file the proof built and the replica
+// it was built from; a retry reuses that file only for that replica.
+//
+// Mutations: "path unchecked" (builtStepPath accepts a path) — red; "source
+// ignored" (builtStepPath drops the replica) — red.
 func TestBuiltStepPath(t *testing.T) {
-	steps := "disk_built disk_built:data1=db-promoted-data1-x-abc.qcow2 started"
-	if got, ok := builtStepPath(steps, "data1"); !ok || got != "db-promoted-data1-x-abc.qcow2" {
-		t.Errorf("builtStepPath = %q, %v", got, ok)
+	steps := "disk_built started " + builtStep("data1", "db-promoted-data1-x-abc.qcow2", "data1-x.qcow2")
+	if file, from, ok := builtStepPath(steps, "data1"); !ok || file != "db-promoted-data1-x-abc.qcow2" || from != "data1-x.qcow2" {
+		t.Errorf("builtStepPath = %q, %q, %v", file, from, ok)
 	}
-	for _, bad := range []string{"disk_built:data1", "disk_built:data1=", "disk_built:data1=../x", "disk_built:data10=y"} {
-		if got, ok := builtStepPath(bad, "data1"); ok {
-			t.Errorf("builtStepPath(%q) = %q, want none", bad, got)
+	for _, bad := range []string{"disk_built:data1", "disk_built:data1=", "disk_built:data1=f", "disk_built:data1=../x,r",
+		"disk_built:data1=f,../r", "disk_built:data10=y,r"} {
+		if file, from, ok := builtStepPath(bad, "data1"); ok {
+			t.Errorf("builtStepPath(%q) = %q, %q, want none", bad, file, from)
 		}
 	}
 }

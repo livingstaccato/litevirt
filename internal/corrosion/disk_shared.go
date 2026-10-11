@@ -68,3 +68,41 @@ func VMNamesWithWritableSharedDisk(ctx context.Context, c *Client) ([]string, er
 	sort.Strings(out)
 	return out, nil
 }
+
+// DiskOnSharedStorage is the one definition of "shared" for a disk that a
+// promotion and the shared-disk fence gates agree on (colonelpanik/litevirt#258
+// re-review R2-m1): its storage type is shared (DiskIsShared), or the pool it
+// names has a shared driver in the pool row of any of hosts — the disk's own
+// host is always consulted. A read error counts as not shared by pool; the
+// storage type still decides.
+func DiskOnSharedStorage(ctx context.Context, c *Client, d DiskRecord, hosts ...string) bool {
+	if DiskIsShared(d) {
+		return true
+	}
+	if d.StorageVolume == "" || c == nil {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, h := range append([]string{d.HostName}, hosts...) {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		if p, ok, err := GetStoragePool(ctx, c, h, d.StorageVolume); err == nil && ok && sharedStorageType(p.Driver) {
+			return true
+		}
+	}
+	return false
+}
+
+// VMHasSharedDisk reports whether any of disks is on shared storage by
+// DiskOnSharedStorage. Every disk is treated as writable, as in
+// VMHasWritableSharedDisk.
+func VMHasSharedDisk(ctx context.Context, c *Client, disks []DiskRecord, hosts ...string) bool {
+	for _, d := range disks {
+		if DiskOnSharedStorage(ctx, c, d, hosts...) {
+			return true
+		}
+	}
+	return false
+}

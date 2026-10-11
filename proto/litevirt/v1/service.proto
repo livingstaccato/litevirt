@@ -2852,6 +2852,12 @@ message PromoteReplicaRequest {
     // promotion is refused with a warning naming this flag
     // (--accept-not-point-in-time).
     bool   accept_not_point_in_time = 9;
+    // automated marks a promotion the failover coordinator decided, relayed
+    // to the host holding the replica. It only ever narrows what the
+    // executor does (a shared data disk is then reattached only behind a
+    // proof-grade fence this executor verified); an older coordinator that
+    // does not set it gets the manual rule.
+    bool   automated = 10;
 }
 message ResolvePITOverlayRequest {
     string vm_name   = 1;

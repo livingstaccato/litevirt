@@ -2951,7 +2951,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// defense-in-depth. Operator remediation: `lv host fence-confirm` (or an IPMI
 		// fence strategy) makes fenceEpoch proof-grade on the next cycle.
 		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
-			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasWritableSharedDisk(disks) {
+			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasSharedDisk(ctx, c.db, disks, c.hostName) {
 				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI fence strategy",
 					"vm", vm.Name, "old_owner", h.Name)
 				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)

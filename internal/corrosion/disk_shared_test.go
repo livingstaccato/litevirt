@@ -104,3 +104,34 @@ func (c *Client) namesWithSharedDisk(ctx context.Context, t *testing.T) ([]strin
 	t.Helper()
 	return VMNamesWithWritableSharedDisk(ctx, c)
 }
+
+// DiskOnSharedStorage: storage type, or the pool's driver on the disk's own
+// host or another named host.
+func TestDiskOnSharedStorage_TypeOrPool(t *testing.T) {
+	c := NewTestClientT(t)
+	ctx := context.Background()
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertStoragePool(ctx, c, StoragePoolRecord{HostName: "a", Name: "nas", Driver: "nfs", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertStoragePool(ctx, c, StoragePoolRecord{HostName: "b", Name: "loc", Driver: "local", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		d     DiskRecord
+		hosts []string
+		want  bool
+	}{
+		{DiskRecord{StorageType: "nfs"}, nil, true},
+		{DiskRecord{HostName: "a", StorageType: "local", StorageVolume: "nas"}, nil, true},
+		{DiskRecord{HostName: "x", StorageType: "local", StorageVolume: "nas"}, []string{"a"}, true},
+		{DiskRecord{HostName: "x", StorageType: "local", StorageVolume: "nas"}, nil, false},
+		{DiskRecord{HostName: "b", StorageType: "local", StorageVolume: "loc"}, nil, false},
+	} {
+		if got := DiskOnSharedStorage(ctx, c, tc.d, tc.hosts...); got != tc.want {
+			t.Errorf("DiskOnSharedStorage(%+v, %v) = %v, want %v", tc.d, tc.hosts, got, tc.want)
+		}
+	}
+}

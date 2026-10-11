@@ -2742,6 +2742,12 @@ message EnsureFirmwareStateRequest {
     // the domain and firmware it creates, and RollbackFirmwareState removes
     // them only for the same attempt_id. An older target ignores it.
     string attempt_id = 6;
+    // shares_weight: the VM's cpu-shares weight in the user's scale (0 = none to
+    // render), as the source knows it. The target re-renders the domain's
+    // <shares> for its own cgroup version from this, never from its own replica
+    // of the VM row, which may not hold a just-set weight yet. An older source
+    // never sets it: the target then defines the XML unchanged, as before.
+    int32 shares_weight = 7;
 }
 
 // EnsureFirmwareStateResponse says what the call created on the target. It

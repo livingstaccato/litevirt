@@ -802,3 +802,83 @@ func TestFleet_LiveMigrationOfAClearedWeightCarriesTheDefault(t *testing.T) {
 		t.Fatalf("libvirt migrate = %q, want the default weight 100 and the target's cgroup %s", note, lv.CgroupMode())
 	}
 }
+
+// ── fix round 3 ─────────────────────────────────────────────────────────────
+
+// R1: spec-only refusals (here a bogus cpu-mode) come before the recording
+// gate and before any stop: a doomed limit update on a running VM, after the
+// latch, never stops the guest and never records the use.
+//
+// Mutation: leave the cpu-mode check where it was (after the stop) — the guest
+// is shut down and the use is recorded, red.
+func TestFleet_DoomedLimitUpdateWithRestartNeitherStopsNorRecords(t *testing.T) {
+	node, client := newLimitsNode(t)
+	ctx := context.Background()
+	deployClean(t, ctx, client, limitlessCompose)
+	waitRunning(t, ctx, node, "db")
+	before := len(node.Virt.EventLog())
+	limit, restart := 2.0, true
+	_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", CpuMode: "bogus", CpuLimit: &limit, AllowRestart: &restart})
+	if err == nil {
+		t.Fatal("an update with a bogus cpu-mode was accepted")
+	}
+	for _, e := range node.Virt.EventLog()[before:] {
+		switch e.Op {
+		case "shutdown", "destroy", "start", "define":
+			t.Errorf("a doomed update touched the guest: %s %s", e.Op, e.Note)
+		}
+	}
+	if vmLimitsUsed(t, node) {
+		t.Fatal("a doomed update recorded the vm_limits use")
+	}
+}
+
+// The unlatched twin on the restart path: refused by the precheck, guest
+// untouched, nothing recorded.
+func TestFleet_UnlatchedLimitUpdateWithRestartNeverStopsTheGuest(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	deployClean(t, ctx, client, limitlessCompose)
+	waitRunning(t, ctx, node, "db")
+	before := len(node.Virt.EventLog())
+	limit, restart := 2.0, true
+	_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", Cpu: 4, CpuLimit: &limit, AllowRestart: &restart})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "the cluster upgrade must finish first") {
+		t.Fatalf("err = %v, want the release refusal", err)
+	}
+	for _, e := range node.Virt.EventLog()[before:] {
+		switch e.Op {
+		case "shutdown", "destroy", "start", "define":
+			t.Errorf("a refused update touched the guest: %s %s", e.Op, e.Note)
+		}
+	}
+}
+
+// R2: a cold move re-renders <shares> from the weight the SOURCE sends, not
+// from the target's replica.
+//
+// Mutation: do not set SharesWeight on the request — the target leaves the
+// source's rendering (54321) in place, red.
+func TestFleet_ColdMigrationRendersTheSourcesWeightOnTheTarget(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	_ = sc.src.Virt.UndefineDomain("os1", false)
+	if err := sc.src.Virt.DefineDomain(`<domain type='kvm'><name>os1</name><uuid>11111111-2222-4333-8444-555555555555</uuid>` +
+		`<cputune><shares>54321</shares></cputune><devices>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='` + sc.disk + `'/><target dev='vda'/></disk>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + sc.shared + `'/><target dev='vdb'/></disk>` +
+		`</devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256, CpuShares: 977})
+	if err := sc.src.DB.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = 'os1'`, string(spec)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.migrateCold(t); err != nil {
+		t.Fatalf("cold migration: %v", err)
+	}
+	got := sc.dst.Virt.DefinedXML("os1")
+	want := fmt.Sprintf("<shares>%d</shares>", lv.HostCPUShares(977))
+	if !strings.Contains(got, want) || strings.Contains(got, "<shares>54321</shares>") {
+		t.Fatalf("target definition = %s, want %s", got, want)
+	}
+}

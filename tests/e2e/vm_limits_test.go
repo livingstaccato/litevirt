@@ -84,9 +84,6 @@ func wantSched(t *testing.T, when string, got map[string]string, want map[string
 	}
 }
 
-// domainCgroupFile reads a control file from the domain's cgroup (cgroup v2),
-// or "" when the host has no such cgroup layout. The scope name escapes the
-// VM name's dashes, so the pattern wildcards them.
 // localV2 reports whether this host runs the unified cgroup hierarchy.
 func localV2() bool { return fileExists("/sys/fs/cgroup/cgroup.controllers") }
 
@@ -110,6 +107,9 @@ func hostShares(v2 bool, weight int) int {
 	return v
 }
 
+// domainCgroupFile reads a control file from the domain's cgroup (cgroup v2),
+// or "" when the host has no such cgroup layout. The scope name escapes the
+// VM name's dashes, so the pattern wildcards them.
 func domainCgroupFile(domain, file string) string {
 	pat := "/sys/fs/cgroup/machine.slice/machine-qemu*" + strings.ReplaceAll(domain, "-", "*") + "*.scope/" + file
 	m, _ := filepath.Glob(pat)

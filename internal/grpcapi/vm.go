@@ -4116,6 +4116,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
+		// Every refusal that is a pure function of the request, the stored spec
+		// and local files, in one pass BEFORE the release gate records anything
+		// and before any stop: a doomed request must not stop a guest or leave
+		// a first-use record behind.
+		if err := s.validateRedefineRequest(ctx, spec, req); err != nil {
+			return nil, err
+		}
 		if vm.State != "stopped" {
 			// UpdateVM NEVER restarts implicitly. A redefine-class change on a running
 			// VM is refused unless --restart-if-needed (allow_restart), which does a
@@ -4827,6 +4834,40 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 		if err := s.images.AssertBase(b); err != nil {
 			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
 			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
+		}
+	}
+	return nil
+}
+
+// validateRedefineRequest runs the spec-only refusals of a redefine-class
+// UpdateVM against spec (the stored spec, not yet modified by req).
+func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest) error {
+	if _, _, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel); cerr != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", cerr)
+	}
+	if req.MaxCpu != nil {
+		if !s.liveResizeActive(ctx) {
+			return status.Errorf(codes.FailedPrecondition,
+				"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
+		}
+		effectiveCPU := spec.Cpu
+		if req.Cpu > 0 {
+			effectiveCPU = req.Cpu
+		}
+		if *req.MaxCpu != 0 && *req.MaxCpu < effectiveCPU {
+			return status.Errorf(codes.InvalidArgument, "max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
+		}
+	}
+	if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
+		if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
+			return status.Errorf(codes.FailedPrecondition,
+				"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
+		}
+	}
+	if req.Tpm != nil && *req.Tpm != spec.Tpm {
+		if !req.Force && lv.HasTPMState(spec.Uuid) {
+			return status.Errorf(codes.FailedPrecondition,
+				"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
 		}
 	}
 	return nil

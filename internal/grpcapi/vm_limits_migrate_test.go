@@ -25,9 +25,10 @@ func TestEnsureFirmwareState_DefinesSharesOnTheTargetsScale(t *testing.T) {
 	fake := libvirtfake.New()
 	s.virt = fake
 	s.dataDir = t.TempDir()
-	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1","cpu_shares":977}`)
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1"}`)
 	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
-	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err != nil {
+	// The target's own replica holds no weight (stale); the source's request does.
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1", SharesWeight: 977}); err != nil {
 		t.Fatalf("EnsureFirmwareState: %v", err)
 	}
 	want := "<shares>" + strconv.Itoa(lv.HostCPUShares(977)) + "</shares>"
@@ -65,7 +66,8 @@ func TestEnsureFirmwareState_ARemovedWeightIsRetargetedAsTheDefault(t *testing.T
 	s.dataDir = t.TempDir()
 	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1"}`)
 	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
-	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err != nil {
+	// The source sends a cleared weight as the default.
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1", SharesWeight: int32(lv.DefaultCPUWeight())}); err != nil {
 		t.Fatalf("EnsureFirmwareState: %v", err)
 	}
 	want := "<shares>" + strconv.Itoa(lv.HostCPUShares(lv.DefaultCPUWeight())) + "</shares>"
@@ -96,5 +98,22 @@ func TestVMSharesWeight_AClearedWeightIsTheDefault(t *testing.T) {
 		if got := s.vmSharesWeight(ctx, name); got != want {
 			t.Errorf("vmSharesWeight(%s) = %d, want %d", name, got, want)
 		}
+	}
+}
+
+// No weight in the request (an older source, or a VM with no <shares>): the
+// XML is defined unchanged, whatever the target's own replica says.
+func TestEnsureFirmwareState_NoWeightSentDefinesTheXMLAsIs(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1","cpu_shares":977}`)
+	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err != nil {
+		t.Fatalf("EnsureFirmwareState: %v", err)
+	}
+	if got := fake.DefinedXML("os1"); !strings.Contains(got, "<shares>55555</shares>") {
+		t.Errorf("defined XML = %s, want it unchanged", got)
 	}
 }

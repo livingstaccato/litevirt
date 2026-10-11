@@ -235,7 +235,7 @@ counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
   the new host. A migration does the same: a cold move defines the domain on the
   target at the target's scale, and a live move hands libvirt a destination
   definition rendered for the target's cgroup version, which the target reports
-  (a v1 to v2 move of a VM with weight 977 or more is not refused). Clearing it (`0`, or dropping the key) writes the default weight
+  (a v1 to v2 move of a VM with weight 977 or more is not refused). litevirt owns the domain definition, so a `<shares>` it finds there, even one it did not write (set with `virsh schedinfo --config`, say), is rewritten to the stored weight, or to the default when none is stored, on every migration. Clearing it (`0`, or dropping the key) writes the default weight
   back. It only matters under contention: an idle host lets every guest run flat out.
 - `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
   each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes

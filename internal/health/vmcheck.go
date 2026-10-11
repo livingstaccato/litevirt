@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -841,7 +842,7 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	}
 
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true, SharesWeight: sharesWeightOf(vm)}); err != nil {
+	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true, SharesWeight: v.sharesWeightOf(vm)}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
 		// A LOCAL publish, unlike the successful handoff below, which repoints the
 		// row to another host while running on this one.
@@ -1150,14 +1151,21 @@ func parseDuration(s string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// sharesWeightOf is the VM's stored cpu-shares weight (0 = unset), carried to
-// a direct libvirt migration. This fallback has no peer to ask for the target's
-// cgroup version, so it retargets nothing on its own; the RPC path
-// (migrateVMFunc), which production wires, does.
-func sharesWeightOf(vm corrosion.VMRecord) int {
+// sharesWeightOf is the VM's cpu-shares weight in the user's scale, carried to
+// a direct libvirt migration, by the same rule as the RPC path's
+// Server.vmSharesWeight: the stored weight, else the default when the domain
+// carries a <shares> (a cleared weight), else 0. This fallback has no peer to
+// ask for the target's cgroup version, so it retargets nothing on its own; the
+// RPC path (migrateVMFunc), which production wires, does.
+func (v *VMChecker) sharesWeightOf(vm corrosion.VMRecord) int {
 	spec := &pb.VMSpec{}
-	if vm.Spec == "" || json.Unmarshal([]byte(vm.Spec), spec) != nil {
-		return 0
+	if vm.Spec != "" && json.Unmarshal([]byte(vm.Spec), spec) == nil && spec.GetCpuShares() > 0 {
+		return int(spec.GetCpuShares())
 	}
-	return int(spec.GetCpuShares())
+	if d, ok := v.virt.(interface{ DumpXML(string) (string, error) }); ok {
+		if x, err := d.DumpXML(vm.Name); err == nil && strings.Contains(x, "<shares>") {
+			return lv.DefaultCPUWeight()
+		}
+	}
+	return 0
 }

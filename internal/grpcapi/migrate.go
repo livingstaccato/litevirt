@@ -1362,15 +1362,10 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			return nil, status.Errorf(codes.InvalidArgument,
 				"domain XML identity (name=%q uuid=%q) does not match request (name=%q uuid=%q)", xn, xu, req.VmName, req.Uuid)
 		}
-		// The source rendered <shares> for ITS cgroup version. The weight is
-		// the stored one; this host defines the domain at its own scale.
-		// A stored weight of 0 is the default: a cleared weight leaves an
-		// explicit <shares> of the default for the SOURCE's scale.
-		w := s.vmSharesWeight(ctx, req.VmName)
-		if w == 0 {
-			w = lv.DefaultCPUWeight()
-		}
-		domainXML := lv.RetargetCPUShares(req.DomainXml, w, lv.CgroupMode() == "v2")
+		// The source rendered <shares> for ITS cgroup version and says which
+		// weight that was (a cleared weight arrives as the default); this host
+		// defines the domain at its own scale. No weight sent: unchanged.
+		domainXML := lv.RetargetCPUShares(req.DomainXml, int(req.SharesWeight), lv.CgroupMode() == "v2")
 		if err := s.virt.DefineDomain(domainXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()
@@ -1401,7 +1396,8 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // before the handoff commits (abandonFirmwareTarget). attempt names this
 // migration attempt to the target, which records the domain it defines under it.
 func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string) (firmwareTargetOutcome, error) {
-	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt}
+	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt,
+		SharesWeight: int32(s.vmSharesWeight(ctx, vmName))}
 	if fs.SecureBoot || fs.Tpm {
 		// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 		// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.

@@ -25896,7 +25896,13 @@ type EnsureFirmwareStateRequest struct {
 	// attempt_id names this migration attempt. The target records it against
 	// the domain and firmware it creates, and RollbackFirmwareState removes
 	// them only for the same attempt_id. An older target ignores it.
-	AttemptId     string `protobuf:"bytes,6,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	AttemptId string `protobuf:"bytes,6,opt,name=attempt_id,json=attemptId,proto3" json:"attempt_id,omitempty"`
+	// shares_weight: the VM's cpu-shares weight in the user's scale (0 = none to
+	// render), as the source knows it. The target re-renders the domain's
+	// <shares> for its own cgroup version from this, never from its own replica
+	// of the VM row, which may not hold a just-set weight yet. An older source
+	// never sets it: the target then defines the XML unchanged, as before.
+	SharesWeight  int32 `protobuf:"varint,7,opt,name=shares_weight,json=sharesWeight,proto3" json:"shares_weight,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -25971,6 +25977,13 @@ func (x *EnsureFirmwareStateRequest) GetAttemptId() string {
 		return x.AttemptId
 	}
 	return ""
+}
+
+func (x *EnsureFirmwareStateRequest) GetSharesWeight() int32 {
+	if x != nil {
+		return x.SharesWeight
+	}
+	return 0
 }
 
 // EnsureFirmwareStateResponse says what the call created on the target. It
@@ -37241,7 +37254,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"cgroupMode\x1aG\n" +
 	"\x19InstallerIsoResolvedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xdf\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x84\x02\n" +
 	"\x1aEnsureFirmwareStateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12\x16\n" +
@@ -37250,7 +37263,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"domain_xml\x18\x04 \x01(\tR\tdomainXml\x12>\n" +
 	"\x1bsource_firmware_fingerprint\x18\x05 \x01(\tR\x19sourceFirmwareFingerprint\x12\x1d\n" +
 	"\n" +
-	"attempt_id\x18\x06 \x01(\tR\tattemptId\"D\n" +
+	"attempt_id\x18\x06 \x01(\tR\tattemptId\x12#\n" +
+	"\rshares_weight\x18\a \x01(\x05R\fsharesWeight\"D\n" +
 	"\x1bEnsureFirmwareStateResponse\x12%\n" +
 	"\x0edomain_defined\x18\x01 \x01(\bR\rdomainDefined\"j\n" +
 	"\x1cRollbackFirmwareStateRequest\x12\x17\n" +

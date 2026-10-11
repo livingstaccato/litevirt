@@ -2,9 +2,13 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -158,5 +162,57 @@ func TestGetRuntimeInventory_TargetedFilter(t *testing.T) {
 	}
 	if !resp.GetComplete() {
 		t.Fatal("a clean probe of an absent workload must be COMPLETE — that is what absence proof means")
+	}
+}
+
+// A domain undefined between ListDomains and its per-domain calls is absent —
+// libvirt says so — and the inventory stays complete. Any other per-domain
+// error still makes the inventory incomplete. (The dual-run consequence is
+// tests/fleet/migrate_dualrun_vanish_test.go.)
+func TestCollectRuntimeInventory_VanishedDomainIsAbsentNotPartial(t *testing.T) {
+	noDomain := golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: "Domain not found"}
+	cases := []struct {
+		name         string
+		failState    error
+		failDump     error
+		wantComplete bool
+		wantGone     bool
+	}{
+		{"state says no domain", fmt.Errorf("lookup domain gone: %w", noDomain), nil, true, true},
+		{"xml says no domain", nil, fmt.Errorf("lookup domain gone: %w", noDomain), true, true},
+		{"state fails otherwise", errors.New("cannot acquire state change lock"), nil, false, false},
+		{"xml fails otherwise", nil, errors.New("Domain not found (text only)"), false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := inventoryServer(t)
+			fake := libvirtfake.New()
+			s.virt = fake
+			fake.SetState("stays", libvirtfake.StateRunning)
+			fake.SetState("gone", libvirtfake.StateRunning)
+			fake.FailDomainState = func(n string) error {
+				if n == "gone" {
+					return tc.failState
+				}
+				return nil
+			}
+			fake.FailDumpXML = func(n string) error {
+				if n == "gone" {
+					return tc.failDump
+				}
+				return nil
+			}
+			inv := s.collectRuntimeInventory(context.Background())
+			if inv.Complete != tc.wantComplete {
+				t.Errorf("Complete=%v (errors %v), want %v", inv.Complete, inv.Errors, tc.wantComplete)
+			}
+			_, present := inv.find(corrosion.WorkloadVM, "gone")
+			if present == tc.wantGone {
+				t.Errorf("entry for the vanished domain present=%v, want %v", present, !tc.wantGone)
+			}
+			if w, ok := inv.find(corrosion.WorkloadVM, "stays"); !ok || !w.DiskHolder {
+				t.Errorf("the other domain must still be reported a disk-holder: %+v ok=%v", w, ok)
+			}
+		})
 	}
 }

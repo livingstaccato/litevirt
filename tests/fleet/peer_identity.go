@@ -162,6 +162,12 @@ func (s *ctxServerStream) Context() context.Context { return s.ctx }
 // peer names the host it is calling.
 func (c *Cluster) RemoteClient(target *Node) pb.LiteVirtClient {
 	c.t.Helper()
+	return pb.NewLiteVirtClient(c.remoteConn(target))
+}
+
+// remoteConn is RemoteClient's connection, closed at the end of the test.
+func (c *Cluster) remoteConn(target *Node) *grpc.ClientConn {
+	c.t.Helper()
 	idx := -1
 	for i, o := range c.Nodes {
 		if o == target {
@@ -194,5 +200,12 @@ func (c *Cluster) RemoteClient(target *Node) pb.LiteVirtClient {
 		c.t.Fatalf("dial %s remotely: %v", target.Name, err)
 	}
 	c.t.Cleanup(func() { _ = cc.Close() })
-	return pb.NewLiteVirtClient(cc)
+	return cc
+}
+
+// marked reports how many connections are marked as dialled from off the box.
+func (m *remoteMarks) marked() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.addrs)
 }

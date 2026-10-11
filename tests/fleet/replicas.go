@@ -642,3 +642,19 @@ func PublishHealth(t *testing.T, n *Node, target string, failures int, at time.T
 		t.Fatalf("publish %s's health of %s: %v", n.Name, target, err)
 	}
 }
+
+// PublishHealthRun is PublishHealth with the failing run's start in last_seen,
+// as the current health checker publishes it. A host that has just turned
+// active is counted down afresh: a run that began before its activation counts
+// only once the host has failed a whole run since (failover's
+// countedSinceActive), so an observation of a host that failed after it
+// turned active carries a run that began after the activation.
+func PublishHealthRun(t *testing.T, n *Node, target string, failures int, runStart, at time.Time) {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+		n.Name, target, "suspect", failures, runStart.UTC().Format(time.RFC3339Nano), at.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("publish %s's health of %s: %v", n.Name, target, err)
+	}
+}

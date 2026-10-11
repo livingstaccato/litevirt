@@ -88,11 +88,14 @@ func TestRecentFence_ANewLifeIsFencedWithoutWaitingOutTheWindow(t *testing.T) {
 	if err := corrosion.UpdateHostStartup(ctx, db, "down", "active", "", 0, 0, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	// Observers count it down after it turned active.
+	// Observers count it down after it turned active: their runs began after
+	// the boot write (last_seen, the run's first failed probe).
+	time.Sleep(10 * time.Millisecond)
+	runStart := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, o := range []string{"coordinator", "alive"} {
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, 'down', 'suspect', ?, NULL, ?)`, o, offlineThreshold, db.NowTS()); err != nil {
+			 VALUES (?, 'down', 'suspect', ?, ?, ?)`, o, offlineThreshold, runStart, db.NowTS()); err != nil {
 			t.Fatal(err)
 		}
 	}

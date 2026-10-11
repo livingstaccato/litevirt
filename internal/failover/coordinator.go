@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostboot"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/placement"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -93,7 +95,7 @@ const (
 	// before the coordinator treats it as a genuine failure. Long enough for a
 	// binary stream + restart, short enough that a host that died mid-upgrade
 	// still fails over instead of stranding its VMs forever.
-	upgradingTimeout = 2 * time.Minute
+	upgradingTimeout = hostboot.UpgradingTimeout
 	// defaultRelocateRestoreTimeout is the fallback for Coordinator.RelocateRestoreTimeout
 	// (config container_restore_timeout_sec): how long a relocate-restore marker is
 	// treated as in-flight before the coordinator gives up and image-recreates.
@@ -223,6 +225,10 @@ type Coordinator struct {
 	// virtual clock so scenarios can advance time deterministically
 	// past the recentFenceWindow / lease expiry without sleeping.
 	Now func() time.Time
+	// UpgradingTimeout, when set, replaces upgradingTimeout: how long a host
+	// recorded 'upgrading' is skipped before it is treated as failed. For
+	// fleet scenarios, which cannot wait out two minutes.
+	UpgradingTimeout time.Duration
 	// OnFence, when set, is invoked after a fence is recorded so the daemon can
 	// emit an operator notification (#5). Best-effort; must not block.
 	OnFence func(host, method, result, detail string)
@@ -463,6 +469,14 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 	}
 }
 
+// upgradingTimeout is how long a host recorded 'upgrading' is skipped.
+func (c *Coordinator) upgradingTimeout() time.Duration {
+	if c.UpgradingTimeout > 0 {
+		return c.UpgradingTimeout
+	}
+	return upgradingTimeout
+}
+
 // SetFencer replaces the fence implementation. Test-only; production code
 // should not use this.
 func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
@@ -692,7 +706,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// count it during a rolling upgrade either.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
-		`SELECT target, observer, updated_at
+		`SELECT target, observer, consecutive_failures, last_seen, updated_at
 		 FROM host_health
 		 WHERE target != ?
 		   AND consecutive_failures >= ?
@@ -713,9 +727,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	// one-sided test, since readmitting a host is not the irreversible act.
 	futureCutoff := c.now().Add(healthFreshness)
 	// An observation older than the moment its target turned active is about
-	// the host before (joining, offline, fenced), not the one active now, so
-	// a host that just turned active is counted down afresh. Unreadable: judged
-	// as before.
+	// the host before (joining, offline, fenced, upgrading), not the one active
+	// now, so a host that just turned active is counted down afresh — and so
+	// is one whose observation is newer but whose failing run began before the
+	// activation (countedSinceActive). Unreadable: judged as before.
 	activeSince, aerr := corrosion.HostsActiveSince(ctx, c.db)
 	if aerr != nil {
 		slog.Warn("failover: read when hosts turned active", "error", aerr)
@@ -736,7 +751,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
-		if since, ok := activeSince[t]; ok && inst.Before(since) {
+		if since, ok := activeSince[t]; ok && !countedSinceActive(r.Int("consecutive_failures"), r.String("last_seen"), inst, since) {
 			continue
 		}
 		if c.scope.region && countsAsVote(voters, o, t) {
@@ -971,15 +986,24 @@ func (c *Coordinator) run(ctx context.Context) {
 		// 'upgrading' and never returned must still fail over, or its VMs are
 		// stranded — so we only skip while it's within upgradingTimeout. On a
 		// timestamp parse error we err on the safe side and keep skipping.
+		//
+		// The timeout runs from the STATE write (the membership row's own
+		// timestamp, corrosion.HostStateSince), not from the hosts row: that
+		// moves with every version or resource report, so a host stuck
+		// 'upgrading' that kept reporting pushed its own timeout out. A host
+		// with no membership row is timed from the hosts row as before.
 		if h.State == "upgrading" {
 			upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
-			if !ok || c.now().Sub(upd) < upgradingTimeout {
+			if since, sok, serr := corrosion.HostStateSince(ctx, c.db, target); serr == nil && sok {
+				upd, ok = since, true
+			}
+			if !ok || c.now().Sub(upd) < c.upgradingTimeout() {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue
 			}
 			slog.Warn("failover: host stuck 'upgrading' past timeout — treating as failed",
-				"host", target, "upgrading_since", h.UpdatedAt)
+				"host", target, "upgrading_since", upd.UTC().Format(time.RFC3339))
 			// fall through to fence
 		}
 
@@ -1806,6 +1830,15 @@ func (c *Coordinator) resumeActionFor(ctx context.Context, host string, rec fenc
 // docs/operating-model.md): skew beyond it makes these checks refuse more,
 // and it is only an observer running BEHIND the leader by more than the
 // margin that can make them accept wrongly.
+//
+// Under hlc_lww the stamps are HLC, not wall time: an observer that has
+// adopted a fast peer's physical time stamps its rows that far ahead (up to
+// hlc.MaxSkewMS), while a host that has just booted may stamp its activation
+// from its own wall clock. countedSinceActive's afreshRun then shrinks by that
+// lead, and past it a restarted host is fenced on its carried count as before
+// this margin existed. That errs toward fencing, never toward leaving a dead
+// host unfenced, and a graceful restart is covered regardless: it stays
+// 'upgrading' until it serves (hostboot).
 const fenceSkewMargin = 5 * time.Second
 
 // fenceStillStands reports whether a fence of host at `at` is still authority
@@ -1891,7 +1924,19 @@ func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec 
 		"host", h.Name, "fence_id", rec.ID, "method", rec.Method, "fenced_at", rec.TS, "observers", observers)
 	again := *h
 	again.FenceStrategy = rec.Method
-	if fr, fenced := c.failover(ctx, &again); fenced && !fr.Success {
+	fr, fenced := c.failover(ctx, &again)
+	if fenced && fr.Success {
+		// Visibility only: an operator who finds the host powered off again
+		// learns that the coordinator did it, and why — durably in the audit
+		// log (any node's `lv events`, and the audit export), and live on
+		// this leader's event stream.
+		detail := fmt.Sprintf(
+			"method=%s renews fence %s (%s at %s), which was aged or in doubt; recovering on the fresh fence",
+			fr.Method, rec.ID, rec.Method, rec.TS)
+		c.audit(ctx, "host.refence", h.Name, detail, "ok")
+		c.publish("host.refenced", h.Name, detail)
+	}
+	if fenced && !fr.Success {
 		slog.Error("failover: the re-fence failed, NOT resuming the recovery on the older fence",
 			"host", h.Name, "fence_id", rec.ID, "method", fr.Method, "detail", fr.Detail,
 			"hint", "confirm "+h.Name+" is powered off, then run 'lv host fence-confirm "+h.Name+"'; the recovery resumes from it")

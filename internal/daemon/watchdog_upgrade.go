@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hostboot"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/upgrade"
@@ -115,7 +116,14 @@ func (d *Daemon) runUpgradeWatchdog(ctx context.Context, binaryPath string, sent
 func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 	mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer mcancel()
-	if err := corrosion.UpdateHostState(mctx, d.db, d.cfg.HostName, "active"); err != nil {
+	// Only from 'upgrading' (hostboot.ConfirmServing): a host fenced, put in
+	// maintenance or isolated while it upgraded keeps that state. The binary
+	// is healthy either way, so the sentinel goes.
+	_, state, err := hostboot.ConfirmServing(mctx, d.db, d.cfg.HostName)
+	switch {
+	case errors.Is(err, hostboot.ErrNotUpgrading):
+		slog.Warn("post-upgrade watchdog: confirmed healthy; host is no longer recorded upgrading, leaving its state as it is", "state", state)
+	case err != nil:
 		slog.Warn("post-upgrade watchdog: confirmed healthy but failed to mark host active — keeping sentinel for retry next boot", "error", err)
 		metrics.UpgradeWatchdogOutcome("confirm_failed")
 		return
@@ -123,6 +131,85 @@ func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 	upgrade.Clear(binaryPath)
 	slog.Info("post-upgrade watchdog: new binary healthy (local gRPC ping ok)", "version", d.cfg.Version)
 	metrics.UpgradeWatchdogOutcome("confirmed")
+}
+
+// awaitServingThenActivate is the boot after a graceful stop
+// (hostboot.BootState): the host stays 'upgrading' until this daemon answers
+// its own Ping over mTLS, and is then recorded active. There is no binary to
+// roll back to. If it never answers within the upgrade health deadline the
+// host is LEFT 'upgrading', and the failover coordinator fences it once
+// hostboot.UpgradingTimeout has passed since the boot write: a daemon that
+// cannot serve is a failed host.
+func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
+	deadline := time.Duration(d.cfg.UpgradeHealthDeadlineSec) * time.Second
+	if deadline <= 0 {
+		deadline = 120 * time.Second
+	}
+	dial := d.selfPinger
+	if dial == nil {
+		dial = func() (pinger, func(), error) {
+			client, conn, err := d.localGRPCClient()
+			if err != nil {
+				return nil, nil, err
+			}
+			return client, func() { _ = conn.Close() }, nil
+		}
+	}
+	client, closeFn, err := dial()
+	if err != nil {
+		// Environmental, and it would never let the host turn active: record
+		// it active now, as the boot write did before.
+		slog.Warn("restart: cannot build the local gRPC client to confirm serving; recording the host active now", "error", err)
+		d.activateAfterRestart()
+		return
+	}
+	defer closeFn()
+	d.activateOnceServing(ctx, client, deadline)
+}
+
+// activateOnceServing pings this daemon until it answers, and then records the
+// host active. Until it answers the host stays 'upgrading' — there is no
+// previous binary to roll back to — and the coordinator fences it once its
+// upgrading timeout has passed.
+//
+// The deadline only times the error log. Pinging goes on past it, until the
+// daemon answers or shuts down: a daemon that comes up late is a healthy host,
+// and nothing else would ever record it active again (recoverHosts revives
+// only offline and fenced hosts), so stopping at the deadline left it
+// 'upgrading' — unplaceable, shown draining — until an operator undrained it.
+// ConfirmServing still refuses a host fenced or otherwise moved on meanwhile.
+func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadline time.Duration) {
+	dctx, cancel := context.WithTimeout(ctx, deadline)
+	answered := pingUntil(dctx, client)
+	cancel()
+	if !answered {
+		if ctx.Err() != nil {
+			return // shutting down
+		}
+		slog.Error("restart: this daemon has not answered its own Ping; the host stays 'upgrading', and the cluster fences it once its upgrading timeout passes. Still checking.",
+			"deadline", deadline, "timeout", hostboot.UpgradingTimeout)
+		if !pingUntil(ctx, client) {
+			return // shutting down
+		}
+		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
+	}
+	d.activateAfterRestart()
+}
+
+// activateAfterRestart records the host active after a graceful restart, if it
+// is still recorded 'upgrading'.
+func (d *Daemon) activateAfterRestart() {
+	mctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, state, err := hostboot.ConfirmServing(mctx, d.db, d.cfg.HostName)
+	switch {
+	case errors.Is(err, hostboot.ErrNotUpgrading):
+		slog.Info("restart: serving; host is recorded as something other than upgrading, leaving it", "state", state)
+	case err != nil:
+		slog.Error("restart: serving, but recording the host active failed; it stays 'upgrading'", "error", err)
+	default:
+		slog.Info("restart: serving; host recorded active")
+	}
 }
 
 // rollbackToOld restores <binary>.old over the running binary path and exits

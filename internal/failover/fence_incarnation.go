@@ -6,7 +6,44 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
+
+// afreshRun is how long a host must have failed since it turned active before
+// a failing run that began earlier counts toward its fence: the span of
+// offlineThreshold probes, one run's worth, plus fenceSkewMargin, because the
+// activation is stamped by the host's clock and the observation by the
+// observer's.
+const afreshRun = time.Duration(offlineThreshold-1)*health.ProbeInterval + fenceSkewMargin
+
+// countedSinceActive reports whether an observer's failing verdict, n failures
+// published at `at`, with last_seen as host_health carries it, counts toward
+// the fence of a host recorded active since `since`.
+//
+// A verdict published before the activation is about the host before it, and
+// never counts. One published after it counts once its failing run began after
+// the activation — the observers have counted the host down afresh — or once
+// the host has been failing for a whole run since (afreshRun).
+//
+// The second half is the restart case (lab 1, 2026-10-11). An observer does
+// not reset its count when its target's state changes, so a host that was
+// down, recorded 'upgrading' by its own SIGTERM, comes back with every
+// observer's count already past the threshold. Its boot write records it
+// 'active' a few seconds before its gRPC server listens, and the first
+// unanswered probe in that gap republished the old count with a new
+// updated_at: quorum at once, and the host was fenced as soon as its sshd
+// answered — node-5 twice and node-2 once, each about 3 s after the boot
+// write. Dropping the run outright would never fence a host that turned
+// active and then never answered, because the observers' runs never break.
+func countedSinceActive(n int, lastSeen string, at, since time.Time) bool {
+	if at.Before(since) {
+		return false
+	}
+	if !observerRunStart(n, lastSeen, at).Before(since) {
+		return true
+	}
+	return at.Sub(since) >= afreshRun
+}
 
 // turnedActiveThisCycle reports whether target turned active after this cycle
 // read when each host last turned active (snapshot), and so after it counted

@@ -232,8 +232,8 @@ func TestFleet_HostMembershipRetire_TheCoordinatorNeverFencesAnUnknownHost(t *te
 	// membership row dates it from its hosts row, HostFenceLife).
 	clock := NewVirtualClock(time.Now().UTC())
 	c.Isolate(victim)
-	PublishHealth(t, a, victim.Name, 5, clock.Now())
-	PublishHealth(t, b, victim.Name, 5, clock.Now())
+	PublishHealthRun(t, a, victim.Name, 5, clock.Now(), clock.Now())
+	PublishHealthRun(t, b, victim.Name, 5, clock.Now(), clock.Now())
 	c.WaitConverged(t, convergeTimeout, a, b)
 
 	// a misses victim's membership row (a merge that brought hosts but not

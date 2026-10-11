@@ -57,7 +57,7 @@ func (s *Server) auditAdmissionPosition(ctx context.Context, name string) (int64
 		if !alone {
 			return 0, "", status.Errorf(codes.Unavailable,
 				"%s cannot admit %s: its replica has not caught up with the cluster since it started (%s), "+
-					"so it cannot vouch for %s's audit history. Retry in a minute, or run `lv host add` "+
+					"so it cannot vouch for %s's audit history. It retries the exchange every few seconds; retry shortly, or run `lv host add` "+
 					"against another node", s.hostName, name, why, name)
 		}
 	}

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -85,8 +86,10 @@ func (s *Server) requireReplicaCaughtUp(ctx context.Context, what string) error 
 	slog.Warn("refusing a workload mutation: this node's replica has not caught up with the cluster, so the host it names as owner may be stale",
 		"rpc", what, "detail", why)
 	return status.Errorf(codes.Unavailable,
-		"%s refused on %s: this node's replica has not caught up with the cluster yet (%s), so it cannot tell which host "+
-			"owns the workload now. Retry in a minute, or run the command against another node", what, s.hostName, why)
+		"%s refused on %s: this node's replica has not caught up with the cluster yet (%s; %s so far), so it cannot "+
+			"tell which host owns the workload now. It retries the exchange every few seconds and this clears as soon as "+
+			"one peer answers — retry shortly, or run the command against another node",
+		what, s.hostName, why, s.db.ReplicaStaleFor().Round(time.Second))
 }
 
 // gateStaleReplica applies requireReplicaCaughtUp to the RPCs in

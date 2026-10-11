@@ -245,6 +245,14 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 			w := runtimeWorkload{Kind: corrosion.WorkloadVM, Name: n}
 			st, err := s.virt.DomainState(n)
 			switch {
+			case lv.IsNoDomain(err):
+				// Listed a moment ago, gone now: undefined between the list
+				// and this call (a migration source's MigrateUndefineSource,
+				// a delete). libvirt itself says it does not exist, so it
+				// holds nothing — that is proven absence, not a probe error.
+				// See vanishedDomain.
+				vanishedDomain(n, err)
+				continue
 			case err != nil:
 				w.State = health.RuntimeUnknown
 				w.ProbeError = fmt.Sprintf("domain state: %v", err)
@@ -255,7 +263,10 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 			default:
 				w.State = health.RuntimeDefinedStopped
 			}
-			if xmlDef, err := s.virt.DumpXML(n); err != nil {
+			if xmlDef, err := s.virt.DumpXML(n); lv.IsNoDomain(err) {
+				vanishedDomain(n, err)
+				continue
+			} else if err != nil {
 				if w.ProbeError == "" {
 					w.ProbeError = fmt.Sprintf("dump xml: %v", err)
 				}
@@ -519,6 +530,31 @@ func classifyMarker(epoch int64, found bool, err error) (int64, string) {
 	}
 }
 
+// vanishedDomain notes a domain that ListDomains returned and that libvirt
+// then reported as VIR_ERR_NO_DOMAIN: it was undefined while the probe ran.
+//
+// It is left out of the inventory, and the inventory stays complete. Counted
+// as a probe error it made the whole host's snapshot partial, and a partial
+// snapshot proves no absence anywhere on that host. That is how the dual-run
+// detector's re-probe, landing on a migration source while libvirt undefined
+// the domain (MigrateUndefineSource), could not settle a gather that had
+// straddled the cutover, and recorded vm_dual_run for a VM that ran only on
+// the target (kvm003 lab, 2026-10-10, rt-vm node-3 -> node-4). Only libvirt's
+// own "no such domain" counts (lv.IsNoDomain, typed code, no text fallback):
+// any other error still marks the domain and the inventory incomplete.
+//
+// One narrowing, accepted: DomainState looks the domain up by name and then
+// asks by the handle's UUID, so a domain deleted and a DIFFERENT one (another
+// UUID) defined and started under the same name between those two calls reads
+// as absent where it used to read as partial. A migrate-back keeps the UUID
+// and is not affected. It is the same class as the pre-existing ListDomains
+// snapshot race, where a domain started just after the list is missed by a
+// complete inventory.
+func vanishedDomain(name string, err error) {
+	slog.Debug("runtime inventory: domain undefined while it was being probed; it holds nothing",
+		"domain", name, "error", err)
+}
+
 // GetRuntimeInventory serves this host's inventory to a peer. Peer-only
 // (host-cert mTLS), so an operator bearer credential can't probe runtime state.
 // A (kind, name) filter narrows to one workload — the targeted form owner
@@ -666,6 +702,7 @@ func snapshotFromInventory(inv runtimeInventory) runtimeSnapshot {
 		kernelVIPs:     inv.KernelVIPs,
 		unresolvedTies: inv.UnresolvedTies,
 		partial:        !inv.Complete,
+		probeErrors:    inv.Errors,
 		vmMarkers:      map[string]markerInfo{},
 		ctMarkers:      map[string]markerInfo{},
 	}

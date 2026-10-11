@@ -470,20 +470,29 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// did not do what it was asked for them, so it does not end clean.
 	var failures int
 	var notStarted []string
+	// Drain records (failback.go) are written off this loop, after each frame:
+	// the release gate can take seconds, and a drain never waits for it.
+	addRecord, recordsQueued := s.startDrainRecords(ctx, len(drainJobs))
+	defer recordsQueued()
 	for range drainJobs {
 		progress := <-results
+		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
 		} else if progress.Status == "done" {
-			// Recorded so that undrain can move it back (failback.go).
-			s.recordDrainOrigin(ctx, progress.VmName, req.Name, progress.TargetHost)
+			record = true // so that undrain can move it back
 		}
-		if err := stream.Send(progress); err != nil {
-			return err
+		serr := stream.Send(progress)
+		if record {
+			addRecord(progress.VmName, req.Name, progress.TargetHost)
+		}
+		if serr != nil {
+			return serr
 		}
 	}
+	recordsQueued()
 
 	// Check for VMs that were skipped (pinned, no placement target).
 	// If any VMs remain on the host, report a partial drain (#25).

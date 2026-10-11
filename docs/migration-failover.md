@@ -394,6 +394,14 @@ below the release is quarantined rather than left to move VMs without advancing
 their generation. The placement generation itself is not behind the feature: it
 is kept from the moment cluster-wide policy writes are allowed.
 
+A drain never waits for its records. Each is written after the VM's progress
+line, bounded to 3 seconds; one that is refused or times out (the first use
+waits for every host to acknowledge the feature, and a host that is down cannot)
+is skipped, put on the VM's events (`vm.failback`) and audited, and further
+records are skipped without asking again for a backoff of 5 seconds doubling
+to 5 minutes. A VM whose record was skipped is not failed back; `lv migrate`
+moves it by hand.
+
 A VM returns only while its record still describes it exactly. One that an
 operator has since moved by hand, that a failover recovered, that was deleted
 and created again, or that a later drain moved again stays where it is, and the

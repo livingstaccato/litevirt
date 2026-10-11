@@ -307,5 +307,14 @@ func TestFleet_Clone_ASourceThatIgnoresThePoolIsReported(t *testing.T) {
 			t.Errorf("clone %s (destination %q) through an older source = %v, want FailedPrecondition naming the older release and `lv move-volume`",
 				req.Target, req.DestinationHost, err)
 		}
+		// The clone exists; the refusal is on its events too.
+		evs, _ := corrosion.ListVMEvents(context.Background(), f.entry.DB, req.Target, 20, "")
+		found := false
+		for _, e := range evs {
+			found = found || (e.Type == "vm.clone" && strings.Contains(e.Detail, "ignores target_pool"))
+		}
+		if !found {
+			t.Errorf("the refusal of %s is not on its events: %+v", req.Target, evs)
+		}
 	}
 }

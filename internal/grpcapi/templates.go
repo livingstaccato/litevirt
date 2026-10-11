@@ -113,6 +113,9 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		// so, rather than let the clone sit where it was not asked to be.
 		if err == nil && vm != nil {
 			if ierr := cloneTargetIgnored(req, vm, src.HostName); ierr != nil {
+				// The clone exists, complete, where the older source made it: on
+				// its events too, as a failed step of a cross-host clone is.
+				s.recordVMEvent(ctx, req.Target, "vm.clone", "error", status.Convert(ierr).Message())
 				return nil, ierr
 			}
 		}

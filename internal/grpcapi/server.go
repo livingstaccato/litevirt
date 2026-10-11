@@ -313,6 +313,9 @@ type Server struct {
 	localIPs                               func() ([]localAddr, error)
 	// failbacks is the set of hosts a failback is running for (failback.go).
 	failbacks failbackRuns
+	// drainRecords writes drain records off the drain's result path, with a
+	// bound and a backoff shared by every drain on this daemon (failback.go).
+	drainRecords drainRecorder
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.

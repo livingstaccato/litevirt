@@ -8,10 +8,12 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -163,6 +165,8 @@ func (f *fbScenario) drain(t *testing.T, dst *Node) {
 			t.Fatalf("drain of %s: %s", p.VmName, p.Error)
 		}
 	}
+	// The records are written after the drain's frames, off its result path.
+	f.a.Server.WaitDrainRecordsForTest()
 	f.c.WaitConverged(t, convergeTimeout)
 }
 
@@ -771,6 +775,122 @@ func TestFleet_Failback_WaitsForTheReleaseToken(t *testing.T) {
 	}
 	if _, ok := got["w"]; ok || f.vmAt(t, f.a, "w").HostName != f.b.Name {
 		t.Fatalf("w, drained before the upgrade, was considered (%+v) or moved", got["w"])
+	}
+}
+
+// A recipient that never acknowledges the drain_failback use record must not
+// slow a drain down (secure, don't remove: main's drain has no record and no
+// wait). x is a voter that never answers that it holds the record, so the
+// first use's acknowledgement wait would run for 30s per VM. A 10-VM drain
+// still ends as fast as main's: the records are written after the frames, one
+// gate attempt is made and bounded by 3s, and the backoff it starts skips the
+// other nine without asking again, each skip on the VM's events. Once x
+// answers and the backoff has run out, a drain records again.
+//
+// Mutations: record inside the result collector - the drain takes the record
+// budget; drop the backoff - the gate is asked for every VM; drop the budget -
+// the attempt runs the full acknowledgement wait.
+func TestFleet_Failback_AnUnacknowledgingRecipientNeverSlowsADrain(t *testing.T) {
+	ctx := context.Background()
+	f, gates := startFB(t, 3)
+	latchFailoverScope(t, f.c, gates)
+	latchReleaseToken(t, f.c, gates)
+	f.xOut(t)
+	t.Cleanup(grpcapi.SetDrainRecordTimingForTest(3*time.Second, 2*time.Second))
+
+	var mu sync.Mutex
+	var asks []time.Time
+	silent := true
+	gates[f.a.Name].SetReleaseUseConfirmer(func(cctx context.Context, host, tok, feature string) (bool, error) {
+		mu.Lock()
+		asks = append(asks, time.Now())
+		mute := silent && host == f.x.Name
+		mu.Unlock()
+		if mute {
+			return false, nil
+		}
+		return f.a.Server.PeerHoldsReleaseFeatureUse(cctx, host, tok, feature)
+	})
+
+	var names []string
+	for i := 0; i < 10; i++ {
+		n := fmt.Sprintf("v%d", i)
+		names = append(names, n)
+		f.addVM(t, n, f.a, nil)
+	}
+	emulateLibvirtMove(f.a, f.b)
+	start := time.Now()
+	st, err := f.c.SelfClient(f.a).DrainHost(ctx, &pb.DrainHostRequest{Name: f.a.Name})
+	if err != nil {
+		t.Fatalf("DrainHost: %v", err)
+	}
+	frames := 0
+	for {
+		p, rerr := st.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("drain: %v", rerr)
+		}
+		if p.Error != "" {
+			t.Fatalf("drain of %s: %s", p.VmName, p.Error)
+		}
+		if p.Status == "done" {
+			frames++
+		}
+	}
+	elapsed := time.Since(start)
+	if frames != 10 {
+		t.Fatalf("%d done frames, want 10", frames)
+	}
+	// Main's budget: a drain of these emulated moves takes well under a second;
+	// one record's wait (3s) inside the drain would show.
+	if elapsed >= 3*time.Second {
+		t.Fatalf("the drain took %s with a recipient that never acknowledges; it must not wait on drain records", elapsed)
+	}
+
+	f.a.Server.WaitDrainRecordsForTest()
+	mu.Lock()
+	first, last, n := asks[0], asks[len(asks)-1], len(asks)
+	mu.Unlock()
+	if span := last.Sub(first); span > 4*time.Second {
+		t.Fatalf("the gate was asked over %s (%d asks): the record is bounded by 3s and the backoff stops the rest", span, n)
+	}
+	if o := f.origins(t, f.a); len(o) != 0 {
+		t.Fatalf("records written although x never acknowledged: %+v", o)
+	}
+	for _, name := range names {
+		evs, _ := corrosion.ListVMEvents(ctx, f.a.DB, name, 20, "")
+		found := false
+		for _, e := range evs {
+			found = found || (e.Type == "vm.failback" && strings.Contains(e.Detail, "not recorded for failback"))
+		}
+		if !found {
+			t.Errorf("the skipped record of %s is not on its events: %+v", name, evs)
+		}
+	}
+
+	// x answers again; after the backoff a drain records.
+	mu.Lock()
+	silent = false
+	mu.Unlock()
+	time.Sleep(2100 * time.Millisecond)
+	f.undrainSettled(t, f.a)
+	f.addVM(t, "after", f.a, nil)
+	for _, n := range f.c.Nodes {
+		gates[n.Name].QuorumProof(ctx)
+		peers := map[string]bool{}
+		for _, o := range f.c.Nodes {
+			if o != n {
+				peers[o.Name] = true
+			}
+		}
+		gates[n.Name].SeedPeersForTests(peers)
+	}
+	f.drain(t, f.b)
+	if o := f.origins(t, f.a); len(o) != 1 || o[0].VM != "after" {
+		t.Fatalf("records after x answered = %+v, want after's", o)
 	}
 }
 

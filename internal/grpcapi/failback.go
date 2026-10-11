@@ -197,24 +197,133 @@ func (s *Server) failbackFeatureGate(_ context.Context) error {
 // recordDrainOrigin notes that a drain of from moved vmName to to. It records
 // only a VM the drain really left on to, and only through the drain_failback
 // release feature's gate; when that refuses, failback is unavailable for that
-// VM, the safe direction, and the drain itself is never refused.
-func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) {
+// VM, the safe direction, and the drain itself is never refused. attempted is
+// false when nothing went to the gate: the release token has not latched (a
+// local read), or the VM is no longer where the drain put it.
+func (s *Server) recordDrainOrigin(ctx context.Context, vmName, from, to string) (attempted bool, err error) {
 	if s.failbackFeatureGate(ctx) != nil {
 		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", vmName)
-		return
+		return false, nil
 	}
-	vm, err := corrosion.GetVM(ctx, s.db, vmName)
-	if err != nil || vm == nil || vm.HostName != to {
-		return
+	vm, gerr := corrosion.GetVM(ctx, s.db, vmName)
+	if gerr != nil || vm == nil || vm.HostName != to {
+		return false, nil
 	}
 	gen, _ := corrosion.GetPlacementGen(ctx, s.db, vmName)
 	o := corrosion.DrainOrigin{VM: vmName, From: from, To: to, Epoch: vm.OwnerEpoch, CreatedAt: vm.CreatedAt, Gen: gen}
-	err = s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
+	return true, s.WithReleaseFeature(ctx, capabilities.FeatureDrainFailback, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.PutDrainOrigin(ctx, s.db, g, o, "drain")
 	})
-	if err != nil {
-		slog.Info("drain: not recorded for failback", "vm", vmName, "from", from, "to", to, "error", err)
+}
+
+// drainRecordBudget bounds one drain record's trip through the release gate. A
+// first use of drain_failback waits for every recipient to acknowledge its used
+// record (up to 30s); a drain must not, so a record that takes longer is
+// skipped. drainRecordBackoffMin/Max bound the backoff after a refused or
+// timed-out record, during which records are skipped without asking the gate
+// again: the gate's answer is the same for every VM until a recipient returns.
+// Vars so tests can set them.
+var (
+	drainRecordBudget     = 3 * time.Second
+	drainRecordBackoffMin = 5 * time.Second
+	drainRecordBackoffMax = 5 * time.Minute
+)
+
+// drainRecorder writes drain records after each VM's progress frame has been
+// sent, one at a time, on its own goroutine per drain, so the drain's result
+// collector never waits on the release gate (secure, don't remove: a drain is a
+// main workflow, the record is new). The backoff is the daemon's, remembered
+// across VMs and across drains.
+type drainRecorder struct {
+	mu    sync.Mutex
+	until time.Time     // no attempt before this
+	delay time.Duration // the next backoff
+	wg    sync.WaitGroup
+}
+
+type drainRecordJob struct{ vm, from, to string }
+
+// startDrainRecords starts the recorder of one drain and returns the function
+// that queues a record (never blocking: the queue holds every VM of the drain)
+// and the one that closes the queue. The records outlive the drain's RPC: they
+// run under ctx without its cancellation.
+func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(vm, from, to string), done func()) {
+	q := make(chan drainRecordJob, n)
+	base := context.WithoutCancel(ctx)
+	s.drainRecords.wg.Add(1)
+	go func() {
+		defer s.drainRecords.wg.Done()
+		for j := range q {
+			s.recordDrainOriginBounded(base, j)
+		}
+	}()
+	var once sync.Once
+	return func(vm, from, to string) {
+			select {
+			case q <- drainRecordJob{vm, from, to}:
+			default: // cannot happen (sized for the drain); never block the drain
+				slog.Warn("drain: record queue full; not recorded for failback", "vm", vm)
+			}
+		}, func() {
+			once.Do(func() { close(q) })
+		}
+}
+
+// recordDrainOriginBounded is one record, bounded by drainRecordBudget and
+// skipped during a backoff. A skip is audited and put on the VM's events.
+func (s *Server) recordDrainOriginBounded(ctx context.Context, j drainRecordJob) {
+	r := &s.drainRecords
+	r.mu.Lock()
+	until := r.until
+	r.mu.Unlock()
+	if time.Now().Before(until) {
+		s.drainRecordSkipped(ctx, j, fmt.Sprintf("an earlier record was refused; not retried before %s", until.UTC().Format(time.RFC3339)))
+		return
 	}
+	rctx, cancel := context.WithTimeout(ctx, drainRecordBudget)
+	attempted, err := s.recordDrainOrigin(rctx, j.vm, j.from, j.to)
+	cancel()
+	if !attempted {
+		return
+	}
+	r.mu.Lock()
+	if err == nil {
+		r.until, r.delay = time.Time{}, 0
+		r.mu.Unlock()
+		return
+	}
+	if r.delay == 0 {
+		r.delay = drainRecordBackoffMin
+	}
+	r.until = time.Now().Add(r.delay)
+	backoff := r.delay
+	r.delay = min(2*r.delay, drainRecordBackoffMax)
+	r.mu.Unlock()
+	reason := status.Convert(err).Message()
+	if rctx.Err() != nil && status.Code(err) != codes.FailedPrecondition {
+		reason = fmt.Sprintf("the release gate did not answer within %s: %s", drainRecordBudget, reason)
+	}
+	slog.Warn("drain: not recorded for failback; drain records are skipped for a while",
+		"vm", j.vm, "from", j.from, "to", j.to, "backoff", backoff, "reason", reason)
+	s.drainRecordSkipped(ctx, j, reason)
+}
+
+func (s *Server) drainRecordSkipped(ctx context.Context, j drainRecordJob, reason string) {
+	detail := fmt.Sprintf("drain of %s: not recorded for failback (%s); `lv migrate %s %s` moves it back by hand", j.from, reason, j.vm, j.from)
+	s.recordVMEvent(ctx, j.vm, "vm.failback", "error", detail)
+	s.audit(ctx, "vm.failback", j.vm, detail, "error")
+}
+
+// WaitDrainRecordsForTest waits until every drain record queued so far has been
+// written or skipped. Tests only.
+func (s *Server) WaitDrainRecordsForTest() { s.drainRecords.wg.Wait() }
+
+// SetDrainRecordTimingForTest sets the record budget and the minimum backoff,
+// and returns what restores them. Tests only.
+func SetDrainRecordTimingForTest(budget, backoffMin time.Duration) (restore func()) {
+	ob, om := drainRecordBudget, drainRecordBackoffMin
+	drainRecordBudget, drainRecordBackoffMin = budget, backoffMin
+	return func() { drainRecordBudget, drainRecordBackoffMin = ob, om }
 }
 
 // failbackPreconditionMarker begins the message of the owner-side refusal of a

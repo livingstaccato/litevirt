@@ -280,6 +280,7 @@ type cephTrashScans struct {
 // before saw of it.
 func (s *Server) ScanCephTrash(ctx context.Context) {
 	storage.RecheckHeldCephPurges(ctx)
+	s.recheckKeptCephImages(ctx) // ceph_kept.go
 	s.storagePoolsMu.RLock()
 	pools := map[string]StoragePoolRef{}
 	for n, p := range s.storagePools {

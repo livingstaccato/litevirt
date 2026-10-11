@@ -1811,6 +1811,22 @@ held entry is forgotten once its trash no longer lists it.
 The condition resolves on the next reconcile (30 s) once nothing is listed.
 See [storage.md](storage.md#ceph-rbd-pools).
 
+### A VM delete left a ceph image in its pool (`ceph_image_leftover`)
+
+A VM delete frees its disks best effort. A ceph image that a client still has
+open is refused as in use. The VM is deleted anyway, as before, but the image
+stays in its pool. That client may be another VM still running on the image.
+`lv rm` prints one line per image left in place, with its pool, name and the
+reason. This host also records the image in `<data_dir>/ceph-kept-images.json`
+and raises `ceph_image_leftover` (evaluator `ceph_pool`, subject
+`host/<host>`, warning). For each image, the evidence gives the VM and disk
+it came from, when the delete left it, the reason, and the check to run
+(`by_hand`: `rbd status <pool>/<image>; rbd info <pool>/<image>`).
+litevirt removes none of these images; decide by hand once you know who has
+the image open. An image stops being named as soon as a VM's disk names it
+again, and is forgotten once its pool answers without it (checked every 5
+minutes).
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

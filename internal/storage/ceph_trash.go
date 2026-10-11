@@ -895,6 +895,39 @@ func (d *cephDriver) UntrackedTrash(ctx context.Context) ([]CephTrashEntry, erro
 	return out, nil
 }
 
+// CephImageChecker is a driver that can say whether a disk's image is still
+// in its pool.
+type CephImageChecker interface {
+	ImageExists(ctx context.Context, path string) (bool, error)
+}
+
+// ImageExists reports whether the image a disk locator names is still in its
+// pool. "Gone" is believed only once the pool itself answers without it
+// (rbd exits ENOENT for a missing keyring too); anything else is an error.
+func (d *cephDriver) ImageExists(ctx context.Context, path string) (bool, error) {
+	l, ok := ParseCephLocator(path)
+	if !ok {
+		return false, fmt.Errorf("cannot parse Ceph image name from %q", path)
+	}
+	_, _, err := d.info(ctx, l.Spec)
+	if err == nil {
+		return true, nil
+	}
+	if rbdErrno(err) != rbdENOENT {
+		return false, err
+	}
+	out, lerr := d.rbd(ctx, d.rbdArgs("ls", "--", l.Pool)...)
+	if lerr != nil {
+		return false, fmt.Errorf("%w (and pool %s does not answer: %v: %s)", err, l.Pool, lerr, strings.TrimSpace(string(out)))
+	}
+	for _, name := range strings.Fields(string(out)) {
+		if name == l.Image {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // cutLast splits s around the last sep.
 func cutLast(s, sep string) (before, after string, found bool) {
 	if i := strings.LastIndex(s, sep); i >= 0 {

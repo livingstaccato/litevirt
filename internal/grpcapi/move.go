@@ -497,15 +497,20 @@ func (s *Server) deleteSourceIfUnreferenced(ctx context.Context, vm *corrosion.V
 // Callers MUST invoke this BEFORE tombstoning the VM's corrosion records, since
 // it reads vm_disks. The glob-based Store.DeleteVMDisks remains as the fallback
 // for default-dir / cloud-init debris not represented in vm_disks.
-func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) {
+//
+// It returns the ceph images left in their pool (a client still had one
+// open): the delete goes on, best-effort, but each such image is named to the
+// caller and by ceph_image_leftover (ceph_kept.go), never left unnamed.
+func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) []KeptCephImage {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: list disks for volume cleanup — falling back to default-dir glob only",
 			"vm", vmName, "error", err)
-		return
+		return nil
 	}
 	// Best-effort by design on this path: the caller globs the default dir next.
-	_ = s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+	kept, _ := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return kept
 }
 
 // deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
@@ -525,6 +530,16 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 func (s *Server) deleteRecordedVMDiskVolumeRecords(
 	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
 ) error {
+	_, err := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return err
+}
+
+// deleteRecordedVMDiskVolumeRecordsKept is deleteRecordedVMDiskVolumeRecords,
+// also returning the ceph images it left in their pool, each recorded for
+// ceph_image_leftover.
+func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
+	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
+) ([]KeptCephImage, error) {
 	errs := make([]error, len(disks))
 	var wg sync.WaitGroup
 	for i := range disks {
@@ -561,12 +576,13 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 		del()
 	}
 	wg.Wait()
+	kept := s.keptFromErrs(vmName, disks, errs)
 	for _, err := range errs {
 		if err != nil {
-			return err
+			return kept, err
 		}
 	}
-	return nil
+	return kept, nil
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool
@@ -577,6 +593,16 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
+	drv, err := s.diskDriver(d)
+	if err != nil {
+		return err
+	}
+	return drv.DeleteDisk(ctx, d.Path)
+}
+
+// diskDriver is the storage driver that serves a disk at its recorded
+// location (deleteDiskAtRecordedLocation).
+func (s *Server) diskDriver(d *corrosion.DiskRecord) (storage.Driver, error) {
 	cfg := storage.Config{Driver: d.StorageType}
 	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
 		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
@@ -596,9 +622,9 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	}
 	drv, err := storage.New(s.dataDir, cfg)
 	if err != nil {
-		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
+		return nil, fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
-	return drv.DeleteDisk(ctx, d.Path)
+	return drv, nil
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a

@@ -617,6 +617,9 @@ type Server struct {
 	// cephTrash is what the last scans of the ceph pools' trash found that no
 	// purge here tracks (ScanCephTrash).
 	cephTrash cephTrashScans
+	// cephKept is the ceph images a VM delete left in their pool (a client
+	// still had one open), named until gone or reattached (ceph_kept.go).
+	cephKept cephKeptImages
 
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).

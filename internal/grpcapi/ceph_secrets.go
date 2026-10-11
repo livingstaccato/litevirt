@@ -511,6 +511,7 @@ func (s *Server) judgeCephKey(ctx context.Context, pool, mine string) {
 func (s *Server) ReconcileCephSecrets(ctx context.Context) {
 	if s.db != nil {
 		s.judgeCephTrash(ctx)
+		s.judgeCephImages(ctx)
 	}
 	if s.virt == nil || s.db == nil {
 		return

@@ -2150,6 +2150,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		out, err := client.DeleteVM(proxyCtx, req, grpc.Header(&hdr))
 		if err == nil {
 			acceptDeletedVMHeader(ctx, req.Name, hdr)
+			forwardKeptImages(ctx, hdr) // the ceph images the owner left in place
 		}
 		return out, err
 	}
@@ -2179,10 +2180,12 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 			probeCtx, cancel := context.WithTimeout(
 				metadata.AppendToOutgoingContext(ctx, "x-lv-delete-local-only", "1"), 15*time.Second)
-			_, peerErr = client.DeleteVM(probeCtx, req)
+			var phdr metadata.MD
+			_, peerErr = client.DeleteVM(probeCtx, req, grpc.Header(&phdr))
 			cancel()
 			conn.Close()
 			if peerErr == nil {
+				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
 				return &emptypb.Empty{}, nil
 			}
@@ -2368,7 +2371,10 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (driver-dispatched, so non-default pools and block backends are released)
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
-		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
+		// The VM is deleted even when a disk is not freed (a ceph image a
+		// client still has open), as on main; each image left in its pool is
+		// named in the response and by ceph_image_leftover.
+		setKeptHeader(ctx, s.deleteRecordedVMDiskVolumes(ctx, req.Name))
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)

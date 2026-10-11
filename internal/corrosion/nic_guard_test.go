@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 func nicGuardDB(t *testing.T, open bool) *Client {
@@ -25,9 +27,26 @@ func nicGuardDB(t *testing.T, open bool) *Client {
 // same latch every other writer of that table waits for.
 func TestPutNICGuard_RefusedUntilGateOpens(t *testing.T) {
 	c := nicGuardDB(t, false)
-	err := PutNICGuard(context.Background(), c, NICGuardRecord{VMName: "vm", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOn}, "admin")
+	err := PutNICGuard(context.Background(), c, capabilities.GrantForTest(t, capabilities.FeatureNICGuards),
+		NICGuardRecord{VMName: "vm", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOn}, "admin")
 	if !errors.Is(err, ErrClusterPolicyGateClosed) {
 		t.Fatalf("err = %v, want ErrClusterPolicyGateClosed", err)
+	}
+}
+
+// TestPutNICGuard_NeedsTheNICGuardsGrant (merge checklist M8): a guard record
+// is the release feature nic_guards; without its grant nothing is written.
+func TestPutNICGuard_NeedsTheNICGuardsGrant(t *testing.T) {
+	ctx := context.Background()
+	c := nicGuardDB(t, true)
+	rec := NICGuardRecord{VMName: "vm", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOn}
+	for _, g := range []capabilities.FeatureGrant{{}, capabilities.GrantForTest(t, capabilities.FeatureFirewallIPv6)} {
+		if err := PutNICGuard(ctx, c, g, rec, "admin"); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+			t.Errorf("PutNICGuard with grant %q: %v, want ErrNoFeatureGrant", g.Feature(), err)
+		}
+	}
+	if got, _ := GetNICGuard(ctx, c, "vm", "52:54:00:aa:bb:cc"); got != nil {
+		t.Errorf("a guard was written without a nic_guards grant: %+v", got)
 	}
 }
 
@@ -36,7 +55,7 @@ func TestPutNICGuard_RefusedUntilGateOpens(t *testing.T) {
 func TestPutNICGuard_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	c := nicGuardDB(t, true)
-	if err := PutNICGuard(ctx, c, NICGuardRecord{
+	if err := PutNICGuard(ctx, c, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), NICGuardRecord{
 		VMName: "web-1", MAC: "52:54:00:AA:BB:CC", Mode: NICGuardOn,
 		Allowed: []string{"10.0.0.250", " 10.0.1.7/24 ", "10.0.0.250", "2001:DB8::1"},
 		Known:   []string{"fd00::5"}, AllowRouterAdvert: true,
@@ -61,7 +80,7 @@ func TestPutNICGuard_RoundTrip(t *testing.T) {
 		t.Errorf("ListNICGuards = %v", all)
 	}
 	// Overwrite with off.
-	if err := PutNICGuard(ctx, c, NICGuardRecord{VMName: "web-1", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOff}, "bob"); err != nil {
+	if err := PutNICGuard(ctx, c, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), NICGuardRecord{VMName: "web-1", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOff}, "bob"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := GetNICGuard(ctx, c, "web-1", "52:54:00:aa:bb:cc"); got == nil || got.Guarded() || len(got.Allowed) != 0 {
@@ -87,7 +106,7 @@ func TestPutNICGuard_Refuses(t *testing.T) {
 		"zoned":        {VMName: "vm", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOn, Allowed: []string{"fe80::1%eth0"}},
 		"too many":     {VMName: "vm", MAC: "52:54:00:aa:bb:cc", Mode: NICGuardOn, Allowed: many},
 	} {
-		if err := PutNICGuard(ctx, c, r, "x"); err == nil {
+		if err := PutNICGuard(ctx, c, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), r, "x"); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

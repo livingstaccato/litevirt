@@ -15,13 +15,22 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// guardServer is a server whose guard records can be written (open): the
+// cluster_policies gate is open and the release token of nic_guards has
+// latched (a relGate, open). guardRelease(s) reaches the gate.
 func guardServer(t *testing.T, open bool) *Server {
 	t.Helper()
 	s := testServer(t)
 	if open {
 		s.db.SetClusterPolicyGate(func() bool { return true })
 	}
+	s.SetReleaseFeatureGate(&relGate{t: t, open: open})
 	return s
+}
+
+// guardRelease is the release-feature gate guardServer wired.
+func guardRelease(s *Server) *relGate {
+	return s.releaseFeatures.(*relGate)
 }
 
 // TestAdmitNICGuards pins who may create a NIC with which guard: the default
@@ -98,7 +107,7 @@ func TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad(t *testing.T) {
 	rctx := seedReplacedVM(t, s, bob, "web", `{"name":"web","uuid":"u-2","network":[{"name":"lan"},{"name":"old"}]}`)
 	put := func(r corrosion.NICGuardRecord) {
 		t.Helper()
-		if err := corrosion.PutNICGuard(ctx, s.db, r, "admin"); err != nil {
+		if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), r, "admin"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -145,11 +154,12 @@ func TestAdmitNICGuards_RecreateCarriesOnlyWhatItHad(t *testing.T) {
 // makes it; before, a forwarded relaxation is refused.
 func TestAdmitNICGuards_PeerOwnerBeforeRelease(t *testing.T) {
 	s := guardServer(t, true)
+	guardRelease(s).open = false
 	off := []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "off"}}
 	if _, err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("forwarded relaxation before the release latch: %v, want FailedPrecondition", err)
 	}
-	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{capabilities.FirewallIPv6V1: true}})
+	guardRelease(s).open = true
 	if _, err := s.admitNICGuards(adminCtx(), "vm", off, admitPeerOwner); err != nil {
 		t.Errorf("forwarded relaxation after the release latch: %v", err)
 	}
@@ -169,7 +179,7 @@ func TestCheckNICIdentities(t *testing.T) {
 		[]corrosion.InterfaceRecord{{VMName: "victim", NetworkName: "lan", MAC: "52:54:00:00:00:aa", IP: "10.9.0.5"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "victim", MAC: "52:54:00:00:00:aa",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "victim", MAC: "52:54:00:00:00:aa",
 		Mode: corrosion.NICGuardOn, Known: []string{"fd00::5"}}, "x"); err != nil {
 		t.Fatal(err)
 	}
@@ -292,8 +302,9 @@ func TestSetNICGuard(t *testing.T) {
 }
 
 // TestFirewallIPv6Rule_PreconditionUntilLatch: an IPv6 rule written before
-// firewall_ipv6_v1 has latched is a precondition failure (retry after the
-// upgrade), not a malformed request; once the gate opens it is accepted.
+// the release token of firewall_ipv6 has latched is a precondition failure
+// (retry after the upgrade), not a malformed request — with no release gate
+// wired too; once the gate opens it is accepted.
 func TestFirewallIPv6Rule_PreconditionUntilLatch(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtxWithEngine(t, s)
@@ -304,7 +315,7 @@ func TestFirewallIPv6Rule_PreconditionUntilLatch(t *testing.T) {
 	if _, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: "v6", Cidrs: []string{"fd00::/8"}}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("ip set before the latch: %v, want FailedPrecondition", err)
 	}
-	s.db.SetFirewallIPv6Gate(func() bool { return true })
+	s.SetReleaseFeatureGate(&relGate{t: t, open: true})
 	if _, err := s.CreateClusterFirewallRule(ctx, req); err != nil {
 		t.Fatalf("after the latch: %v", err)
 	}

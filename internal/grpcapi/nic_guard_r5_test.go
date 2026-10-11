@@ -63,7 +63,7 @@ func r5TrunkVM(t *testing.T, s *Server, name, stack, network, mac, vids string, 
 		t.Fatal(err)
 	}
 	if guarded {
-		if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn,
+		if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn,
 			VMUUID: "u-" + name, Network: network}, "t"); err != nil {
 			t.Fatal(err)
 		}
@@ -71,7 +71,7 @@ func r5TrunkVM(t *testing.T, s *Server, name, stack, network, mac, vids string, 
 }
 
 func r5Latch(s *Server) {
-	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{capabilities.FirewallIPv6V1: true}})
+	guardRelease(s).open = true
 }
 
 func r5AuditCount(t *testing.T, s *Server, target, user string) int {
@@ -375,7 +375,7 @@ func TestGuardReadError_RefusesOnlyWhatMayBeGuarded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "broken", MAC: "52:54:00:00:05:08",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "broken", MAC: "52:54:00:00:05:08",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-broken"}, "t"); err != nil {
 		t.Fatal(err)
 	}

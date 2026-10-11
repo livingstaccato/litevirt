@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -147,7 +148,7 @@ func TestCorrosionPlanLoader_TrunkVLANsTheNetworkAllows(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: "tenant", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "tenant", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-tenant", Network: "core"}, "t"); err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -45,11 +46,11 @@ func TestAdmitNICGuards_RecreateMatchesSameNIC(t *testing.T) {
 	}
 	bob := sgBindUser(t, s, "bob", "team")
 	rctx := seedReplacedVM(t, s, bob, "web", `{"name":"web","uuid":"u-1","network":[{"name":"priv"},{"name":"lan"}]}`)
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOff}, "bob"); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:02",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:02",
 		Mode: corrosion.NICGuardOn}, "bob"); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +223,7 @@ func TestArmNICsFor_FailsClosedForGuardedVMs(t *testing.T) {
 	s := guardServer(t, true)
 	a := &fakeArmer{err: errors.New("the kernel refused the per-NIC table")}
 	s.SetFirewallReconciler(a)
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ArmNICsFor(ctx, "guarded"); err == nil {

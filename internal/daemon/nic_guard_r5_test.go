@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -70,7 +71,7 @@ func TestStartWaitPredicate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:05:09",
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:05:09",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-guarded"}, "t"); err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
@@ -45,7 +46,7 @@ func TestRecordExistingTrunkVLANs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if guarded {
-			if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn,
+			if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn,
 				VMUUID: "u-" + name, Network: "core"}, "t"); err != nil {
 				t.Fatal(err)
 			}
@@ -146,14 +147,14 @@ func TestVMGuarded_OnlyThisIncarnationsLiveRecords(t *testing.T) {
 		Spec: `{"name":"web","uuid":"u-2"}`}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-1"}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	if g, err := s.vmGuarded(ctx, "web"); err != nil || g {
 		t.Errorf("an earlier incarnation's record guards the VM: %v, %v", g, err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:02",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:02",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-2"}, "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func (a *inForceArmer) GuardsInForce(string, []string) bool { return a.inForce }
 func TestArmNICsFor_RefusesOnlyWhatIsNotInForce(t *testing.T) {
 	ctx := context.Background()
 	s := guardServer(t, true)
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	a := &inForceArmer{fakeArmer: fakeArmer{err: errors.New("inet apply failed")}, inForce: true}
@@ -213,10 +214,13 @@ func TestGuardHostLabel(t *testing.T) {
 		Spec: `{"name":"web","uuid":"u-1"}`}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-1"}, "t"); err != nil {
 		t.Fatal(err)
 	}
+	// Written where the release token had latched; this node's own latch
+	// lags (it forms per node).
+	guardRelease(s).open = false
 	need, err := s.guardHostNeeded(ctx, "web")
 	if err != nil || !need {
 		t.Errorf("a guarded VM before the release latch: need %v, %v", need, err)
@@ -245,7 +249,7 @@ func TestStartContainer_ArmsItsNICsFirst(t *testing.T) {
 	if _, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{Name: "ct1", Template: "download", Distro: "alpine"}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: corrosion.ContainerGuardOwner("host-a", "ct1"),
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: corrosion.ContainerGuardOwner("host-a", "ct1"),
 		MAC: "52:00:00:00:00:10", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}

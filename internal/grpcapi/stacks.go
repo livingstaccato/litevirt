@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -263,9 +264,13 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			// Priority follows YAML order (10, 20, …) so an accept-then-drop
 			// sequence renders deterministically — equal priorities would sort
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
-			if err := corrosion.InsertSGRule(ctx, s.db, corrosion.SGRule{
+			row := corrosion.SGRule{
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
+			}
+			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -274,8 +279,10 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 
 	// IP sets.
 	for name, set := range f.IPSets {
-		if err := corrosion.InsertIPSet(ctx, s.db, corrosion.IPSet{
-			ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
+		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
+		v6, invalid := corrosion.IPSetFamily(row.CIDRs)
+		if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -284,9 +291,13 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	// Cluster-tier rules + default-deny policy.
 	if fd := f.FirewallDefaults; fd != nil {
 		for i, r := range fd.ClusterRules {
-			if err := corrosion.InsertClusterFirewallRule(ctx, s.db, corrosion.FirewallRule{
+			row := corrosion.FirewallRule{
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
+			}
+			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}

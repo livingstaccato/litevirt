@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -138,7 +139,7 @@ func TestStartContainer_MigratedGuardFailsClosed(t *testing.T) {
 		{VMName: corrosion.ContainerGuardOwner("host-a", "ct1"), MAC: mac, Mode: corrosion.NICGuardOn},
 		{VMName: corrosion.ContainerGuardOwner("host-c", "ct1"), MAC: "52:00:00:00:00:30", Mode: corrosion.NICGuardOn},
 	} {
-		if err := corrosion.PutNICGuard(ctx, s.db, r, "t"); err != nil {
+		if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), r, "t"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -176,10 +177,11 @@ func TestGuardHost_LabelCountsOnlyForTheBuildThatSetIt(t *testing.T) {
 		Spec: `{"name":"web","uuid":"u-1"}`}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-1"}, "t"); err != nil {
 		t.Fatal(err)
 	}
+	guardRelease(s).open = false // this node's own release latch lags
 	upgraded := corrosion.HostRecord{Name: "new", Version: "v2", Labels: map[string]string{corrosion.LabelNICGuards: "v2"}}
 	if err := s.refuseUnguardedTarget(ctx, "web", upgraded); err != nil {
 		t.Errorf("a host running the build that set its label: %v", err)
@@ -204,7 +206,7 @@ func TestArmNICsFor_UnguardedVMWaitsForNoPass(t *testing.T) {
 	if len(a.armed) != 0 {
 		t.Errorf("an unguarded VM's start ran a forced pass: %v", a.armed)
 	}
-	if err := corrosion.PutNICGuard(ctx, s.db, corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
+	if err := corrosion.PutNICGuard(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "guarded", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ArmNICsFor(ctx, "guarded"); err != nil || len(a.armed) != 1 {

@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -88,7 +89,7 @@ func everyTrue(b []bool) bool {
 func TestFleet_NICGuard_InForceAfterAReboot(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
-	n.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, n)
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	wireNodeFirewall(t, n)
 	guardedVM(t, c, n, "web", "10.30.0.51", "52:54:00:77:01:01")
@@ -123,7 +124,7 @@ func TestFleet_NICGuard_DrainArmsTheTarget(t *testing.T) {
 	ctx := context.Background()
 	nfts := map[string]*recordingNft{}
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 		nfts[n.Name] = wireNodeFirewall(t, n)
 	}
 	const mac = "52:54:00:77:02:01"
@@ -132,7 +133,7 @@ func TestFleet_NICGuard_DrainArmsTheTarget(t *testing.T) {
 		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "lan", MAC: mac, IP: "10.30.0.52"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, src.DB, corrosion.NICGuardRecord{VMName: "web", MAC: mac, Mode: corrosion.NICGuardOn,
+	if err := corrosion.PutNICGuard(ctx, src.DB, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: mac, Mode: corrosion.NICGuardOn,
 		VMUUID: "u-web", Network: "lan"}, "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +181,7 @@ func TestFleet_NICGuard_OlderDomainGuardedUnderItsOwnTap(t *testing.T) {
 	src, dst := c.Nodes[0], c.Nodes[1]
 	nfts := map[string]*recordingNft{}
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 		n.Server.SetBridgeEnsure(func(string) error { return nil })
 		nfts[n.Name] = wireNodeFirewall(t, n)
 	}
@@ -230,7 +231,7 @@ func TestFleet_NICGuard_OlderDomainGuardedUnderItsOwnTap(t *testing.T) {
 func TestFleet_NICGuard_DeletedWithTheVM(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
-	n.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, n)
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	guardedVM(t, c, n, "gone", "10.30.0.54", "52:54:00:77:04:01")
 	if _, err := c.SelfClient(n).DeleteVM(context.Background(), &pb.DeleteVMRequest{Name: "gone"}); err != nil {
@@ -249,11 +250,14 @@ func TestFleet_NICGuard_GuardedVMStaysOnGuardingHosts(t *testing.T) {
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 		n.Server.SetBridgeEnsure(func(string) error { return nil })
 	}
 	wireNodeFirewall(t, src) // dst is "older": no guards, no label
 	guardedVM(t, c, src, "web", "10.30.0.55", "52:54:00:77:05:01")
+	// src's own release latch lags the one the guard was written under
+	// (a latch forms per node): it must narrow the move itself.
+	src.Server.SetReleaseFeatureGate(grantAllGate{t: t, lagging: true})
 	err := migrateAt(t, c, src, "web", dst.Name)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("migrating a guarded VM to a host that does not advertise guards: %v, want FailedPrecondition", err)

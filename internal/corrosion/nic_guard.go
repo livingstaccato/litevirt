@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 )
 
@@ -182,9 +183,14 @@ func normalizeNICGuard(r *NICGuardRecord) error {
 	return nil
 }
 
-// PutNICGuard writes a NIC's guard record. It refuses with
-// ErrClusterPolicyGateClosed until failover_scope_v1 has latched.
-func PutNICGuard(ctx context.Context, c *Client, r NICGuardRecord, setBy string) error {
+// PutNICGuard writes a NIC's guard record. The record is the release feature
+// nic_guards: g must be its grant (the release token has latched and the use
+// is recorded). It refuses with ErrClusterPolicyGateClosed until
+// failover_scope_v1 has latched.
+func PutNICGuard(ctx context.Context, c *Client, g capabilities.FeatureGrant, r NICGuardRecord, setBy string) error {
+	if err := g.Check(capabilities.FeatureNICGuards); err != nil {
+		return err
+	}
 	if err := normalizeNICGuard(&r); err != nil {
 		return err
 	}

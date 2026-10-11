@@ -325,7 +325,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
 	// has to stay up anyway so peers can see it degraded and an operator can reseed
 	// it. Fail-closed happens at the write path instead, wired below.
-	if toks := preflightCapabilityRollback(d.cfg.DataDir); len(toks) > 0 {
+	// Release probation (C1): rolled back below a safe_if_unused release token
+	// with no use in this replica. No replicated writes until a voter majority
+	// confirms (RunReleaseProbation, below).
+	if toks := BootRollbackCheck(ctx, d.cfg.DataDir, d.db); len(toks) > 0 {
 		d.rolledBackTokens = toks
 		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
 			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
@@ -615,6 +618,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetVMReplaceAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
 	})
+	// Every push declares this build's release tokens from the first one
+	// (I-R2-2): the server, which wires the live advertisement, is built later,
+	// and a push that declared nothing would be refused by every peer with a
+	// release feature in use.
+	repl.SetAdvertisedCapabilities(capabilities.ReleaseTokens)
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -651,6 +659,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae.SetRelayConfig(relayCfg)
 	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
+	// Release probation (entered only from a marker at boot) is lifted only by
+	// asking a voter majority.
+	go RunReleaseProbation(ctx, d.db, ae)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
 	// gRPC container adapter + health checker below, so the metrics collector can
@@ -851,6 +862,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// Release features (capabilities.Feature) open through the checker's
+	// WithFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
+	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
+	// A peer advertising a release token this build does not know is, almost
+	// always, a forward roll: a non-blocking look at its used records, never a
+	// probation (N2). Probation comes only from a marker at boot.
+	corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
+	// Take no replicated state from a peer that cannot keep a release feature
+	// in use: pushes are refused in PushMutations, pulls here.
+	d.db.SetReplicationSourceGate(svc.ReleaseSourceAllowed)
+	// A probation round that hears of a newer voter generation adopts it (each
+	// certificate verified) and counts against it (I-R4-2).
+	ae.SetVoterAdopter(svc.AdoptVoterConfigs)
 	// The server can answer the lease-mint clearance from here on: it has the
 	// gate whose quorum and healthy-peer set its high-water read uses.
 	d.mintClearance.Store(svc)
@@ -1314,7 +1339,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A rolled-back node stops advertising capabilities, so the cluster cannot
 	// latch anything further across a member that could not honour it, and peers
 	// raise ha_degraded against it.
-	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
+	// Quarantined below a latched token found at startup, OR since startup by
+	// a use of a newer release's feature arriving by replication.
+	// A rollback quarantine or a tripped release use — never a release
+	// probation, which is not a rollback below anything known to be used and
+	// must not get this node isolated by its peers (N1).
+	svc.SetWALQuarantined(func() bool {
+		return len(d.rolledBackTokens) > 0 || d.db.WALQuarantined()
+	})
 	go vipDemoter.Start(ctx)
 	// Partition pause (docs/design/partition-pause.md): on losing the execution
 	// quorum for T_pause, suspend/freeze every workload the majority would
@@ -3039,19 +3071,8 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
-	d.wireFirewallIPv6Gate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
-}
-
-// wireFirewallIPv6Gate lets corrosion write an IPv6 firewall rule or ip-set
-// element only once firewall_ipv6_v1 is DURABLY latched: a peer on an older
-// build refuses its whole firewall plan on one. Unwired, the gate fails closed
-// and IPv6 rules are refused, as every earlier build refused them.
-func (d *Daemon) wireFirewallIPv6Gate() {
-	d.db.SetFirewallIPv6Gate(func() bool {
-		return d.checker.DurablyLatched(capabilities.FirewallIPv6V1)
-	})
 }
 
 // wireLeaseMintClearance makes every new lease term wait for the quorum

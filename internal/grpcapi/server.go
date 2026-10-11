@@ -820,8 +820,23 @@ type Server struct {
 	// gate is the split-brain safety gate (Phase 1), implemented by *health.Checker.
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
-	gate          serverGate
-	onGateRefused func(action, reason string)
+	gate serverGate
+	// releaseFeatures opens a release feature (WithReleaseFeature): the
+	// checker's WithFeature in production. Nil refuses every feature.
+	releaseFeatures releaseFeatureGate
+	// releasePeerMu guards the release-peer refusal state (ReleasePeerAllowed).
+	releasePeerMu      sync.Mutex
+	releaseUsed        []string
+	releaseUsedAt      time.Time
+	releasePeerRefused map[string]time.Time
+	releasePeerLast    map[string]*peerCapsEntry
+	// releaseRollout: the HA monitor's cached rollout answers
+	// (releaseRolloutLagging). Guarded by releasePeerMu.
+	releaseRollout map[string]*rolloutAnswer
+	// adoptedVoterGen is the voter generation AdoptVoterConfigs last found
+	// adopted, which Ping reports (PingResponse.voter_generation).
+	adoptedVoterGen atomic.Int64
+	onGateRefused   func(action, reason string)
 	// vmStartObserver is told of every guest start (SetVMStartObserver).
 	vmStartObserver VMStartObserver
 
@@ -1038,9 +1053,6 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this binary decodes cluster_policies and honours failover_scope). The
 	// opt-in is the replicated policy row, which cannot be written until the
 	// ReplicationGated latch has formed.
-	// firewall_ipv6_v1 is not withheld either: it is a fact about the build
-	// (this binary renders IPv6 firewall rows), and no IPv6 row is written
-	// until the ReplicationGated latch has formed.
 	// claim_incarnation_v1 is not withheld either: it is the claim format this
 	// binary's voters keep (an incarnation in the key, the v2 accept, the
 	// legacy-key seal), a fact about the build.
@@ -1502,10 +1514,6 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.FailoverScopeV1:
 		// No kill switch: the token says this build decodes cluster_policies
 		// and honours failover_scope. The opt-in is the replicated policy row.
-		return true
-	case capabilities.FirewallIPv6V1:
-		// No kill switch: the token says this build renders IPv6 firewall
-		// rows. The opt-in is writing one.
 		return true
 	case capabilities.VoterConfigV1:
 		// No kill switch: a node with voter_config_v1 off would count a
@@ -2186,6 +2194,11 @@ func (s *Server) SetDNSDomain(domain string) {
 // SetReplicator attaches the WAL-based replicator to the server.
 func (s *Server) SetReplicator(r *corrosion.Replicator) {
 	s.replicator = r
+	// Every push declares what this node advertises (ReplicateRequest.
+	// sender_capabilities), so a receiver can judge it without dialling back.
+	if r != nil {
+		r.SetAdvertisedCapabilities(s.DeclaredCapabilities)
+	}
 }
 
 // SetStoragePools configures host-level storage pool references for volume resolution.

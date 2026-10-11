@@ -409,12 +409,6 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
-	// firewallIPv6Gate, when non-nil and returning true, permits writing an
-	// IPv6 firewall rule or ip-set element. Injected via SetFirewallIPv6Gate,
-	// wired to the durable firewall_ipv6_v1 latch. Fails CLOSED when unset: a
-	// peer on an older build stops applying its firewall on one. See
-	// firewall_ipv6.go.
-	firewallIPv6Gate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
@@ -494,6 +488,21 @@ type Client struct {
 	// stop emitting, because the rest of the cluster has moved past it. Nil ⇒ no
 	// quarantine, which is every healthy node.
 	writeQuarantine func() string
+
+	// releaseUseTripped is every token this binary does not know whose
+	// release-feature use has arrived by replication (release_features.go).
+	// Non-empty is a WAL quarantine of its own, added to writeQuarantine's.
+	// Guarded by releaseUseMu, never by mu: the apply path sets it while
+	// holding mu, and the writers read it both before and under mu.
+	releaseUseMu      sync.Mutex
+	releaseUseTripped map[string]bool
+	// releaseProbation: see EnterReleaseProbation. Guarded by releaseUseMu.
+	releaseProbation map[string]bool
+	// releaseProbationWaiting: see ReleaseProbationWaitingOn. Guarded by
+	// releaseUseMu.
+	releaseProbationWaiting []string
+	// replicationSourceGate: see SetReplicationSourceGate.
+	replicationSourceGate atomic.Pointer[func(ctx context.Context, peer string) error]
 }
 
 // SetWriteQuarantine injects the predicate that refuses replicated writes, returning
@@ -506,11 +515,18 @@ func (c *Client) SetWriteQuarantine(fn func() string) { c.writeQuarantine = fn }
 
 // quarantineReason returns why replicated writes are currently refused, or "".
 func (c *Client) quarantineReason() string {
-	if c.writeQuarantine == nil {
-		return ""
+	if c.writeQuarantine != nil {
+		if reason := c.writeQuarantine(); reason != "" {
+			return reason
+		}
 	}
-	return c.writeQuarantine()
+	return c.releaseUseQuarantineReason()
 }
+
+// QuarantineReason reports why replicated writes are refused right now, or ""
+// when they are not: the injected predicate's reason, or a release-feature use
+// this binary cannot honour (release_features.go).
+func (c *Client) QuarantineReason() string { return c.quarantineReason() }
 
 // errQuarantined is the refusal both replicated writers return. It fails the WHOLE
 // write rather than just suppressing the mutation-log row: committing the
@@ -518,6 +534,10 @@ func (c *Client) quarantineReason() string {
 // carrying changes no peer will ever see, which is the precise failure the
 // quarantine exists to prevent.
 func errQuarantined(reason string) error {
+	if strings.HasPrefix(reason, releaseProbationPrefix) {
+		return fmt.Errorf("write refused: this node is in release probation (%s); it lifts by itself once a "+
+			"voter majority has been asked, see docs/upgrades.md", reason)
+	}
 	return fmt.Errorf("write refused: node is under WAL quarantine (%s); operator reseed required", reason)
 }
 
@@ -1302,6 +1322,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 		return false, errQuarantined(reason)
 	}
 	c.mu.Lock()
+	// Again under mu: an apply holding mu may have tripped the quarantine
+	// (a release-feature use this binary cannot honour) while this writer
+	// waited, and the feature's data may be the next thing it applies.
+	if reason := c.quarantineReason(); reason != "" {
+		c.mu.Unlock()
+		return false, errQuarantined(reason)
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		c.mu.Unlock()
@@ -1490,6 +1517,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		return 0, errQuarantined(reason)
 	}
 	c.mu.Lock()
+	// Again under mu, for the ExecuteEntriesGuarded reason.
+	if reason := c.quarantineReason(); reason != "" {
+		c.mu.Unlock()
+		return 0, errQuarantined(reason)
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		c.mu.Unlock()

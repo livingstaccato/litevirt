@@ -350,10 +350,14 @@ lv firewall ipset add admins --cidr 10.0.0.0/8 --cidr 2001:db8:1::/48
   default-deny policy does not break IPv6 itself.
 
 **Rolling upgrade.** Until every host runs a build that renders IPv6, an IPv6
-rule would make an older host refuse its whole firewall plan, so nothing writes
-one until the mandatory, replication-gated capability `firewall_ipv6_v1` has
-latched. Before that, adding one fails with FailedPrecondition naming the
-token; IPv4 rules are unaffected.
+rule would make an older host refuse its whole firewall plan, so an IPv6 rule
+or ip-set element is the release feature `firewall_ipv6` of
+`release_2026_11_v1` (docs/upgrades.md, "Release features"): nothing writes
+one until the release token has latched, and the first one records the use
+first. Before that, adding one fails with FailedPrecondition, "the cluster
+upgrade must finish first (firewall_ipv6 needs release_2026_11_v1)", naming
+the hosts still on the older build; IPv4 rules are unaffected. A malformed
+IPv6 rule is refused as malformed either way.
 
 ## NIC guards
 
@@ -600,10 +604,14 @@ Guards are stored per NIC in the replicated `cluster_policies` table under
 `nic_guard/<vm>/<mac>` (`nic_guard/ct:<host>:<name>/<mac>` for a container,
 under the host it was created on; a container that moved finds its record by
 name and MAC), with the incarnation, network and position of the NIC they were
-written for. Nothing writes them until `failover_scope_v1` has latched. Before
-that, a NIC is created unguarded with a warning, and a request that sets guard
-options is refused rather than silently unguarded. A container whose guards
-cannot be written is not created. A record is retired (tombstoned) when its
+written for. A guard record is the release feature `nic_guards` of
+`release_2026_11_v1` (docs/upgrades.md, "Release features"): nothing writes
+one until the release token has latched — every host runs this release — and
+the first one records the use first. Before that, a NIC is created unguarded
+with a warning, as before guards; a request that sets guard options, and
+`lv firewall nic-guard set`, are refused with "the cluster upgrade must finish
+first (nic_guards needs release_2026_11_v1)" rather than silently unguarded. A
+container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
 incarnation it replaces.

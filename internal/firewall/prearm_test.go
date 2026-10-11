@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/nictap"
 )
@@ -31,7 +32,7 @@ func TestCorrosionPlanLoader_PreArmsGuardedNICs(t *testing.T) {
 			t.Fatal(err)
 		}
 		if guard {
-			if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn}, "t"); err != nil {
+			if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: name, MAC: mac, Mode: corrosion.NICGuardOn}, "t"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -39,7 +40,7 @@ func TestCorrosionPlanLoader_PreArmsGuardedNICs(t *testing.T) {
 	vm("guarded", "host-a", "52:54:00:00:00:01", "10.0.0.1", true)
 	vm("legacy", "host-a", "52:54:00:00:00:02", "10.0.0.2", false)
 	vm("incoming", "host-b", "52:54:00:00:00:03", "10.0.0.3", true)
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: "creating", MAC: "52:54:00:00:00:04", Mode: corrosion.NICGuardOn}, "t"); err != nil {
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "creating", MAC: "52:54:00:00:00:04", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	arm := NewArming()

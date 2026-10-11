@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -27,14 +28,14 @@ func TestCorrosionPlanLoader_ContainerGuardFollowsMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Created on host-a; the record stayed under host-a's name.
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{
 		VMName: corrosion.ContainerGuardOwner("host-a", "ct-web"), MAC: "52:00:00:00:00:10", Mode: corrosion.NICGuardOn,
 	}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	// Another container's record under the same name on another host, with
 	// another MAC, must not be picked up.
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{
 		VMName: corrosion.ContainerGuardOwner("host-c", "ct-web"), MAC: "52:00:00:00:00:99", Mode: corrosion.NICGuardOff,
 	}, "t"); err != nil {
 		t.Fatal(err)

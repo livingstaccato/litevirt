@@ -41,7 +41,7 @@ func renderOn(t *testing.T, n *Node) string {
 func TestFleet_NICGuard_CreateRecordsAndOwnerRenders(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 		n.Server.SetBridgeEnsure(func(string) error { return nil })
 	}
 	owner, entry, other := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -133,7 +133,7 @@ func TestFleet_NICGuard_NoRecordWhileStoreClosed(t *testing.T) {
 func TestFleet_FirewallEnforcement_ReplicatesAndRenders(t *testing.T) {
 	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 	}
 	plan := func(n *Node) firewall.Plan {
 		p, err := firewall.CorrosionPlanLoader(n.DB, n.Name, firewall.Plan{}, firewall.LoaderOptions{})(context.Background())
@@ -160,7 +160,7 @@ func TestFleet_FirewallEnforcement_ReplicatesAndRenders(t *testing.T) {
 func TestFleet_NICGuard_DHCPNICGetsExactReservation(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
-	n.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, n)
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	// The bridge is host-local and this host's dnsmasq serves it (no real
 	// dnsmasq runs in the fleet).
@@ -220,7 +220,7 @@ func TestFleet_NICGuard_RebuildCarriesGuardState(t *testing.T) {
 		return nics[0].MAC
 	}
 	legacyMAC := create("legacy", "10.30.0.21") // the store is closed: no record, as before guards
-	n.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, n)
 	freshMAC := create("fresh", "10.30.0.22")
 	relaxedMAC := create("relaxed", "10.30.0.23")
 	if _, err := cl.SetNICGuard(ctx, &pb.SetNICGuardRequest{VmName: "relaxed", Mac: relaxedMAC, Mode: "on",

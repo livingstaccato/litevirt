@@ -1,14 +1,17 @@
 package corrosion
 
-// IPv6 firewall rules (firewall_ipv6_v1).
+// IPv6 firewall rules: the release feature firewall_ipv6
+// (capabilities.FeatureFirewallIPv6).
 //
 // A security-group, cluster or host rule may name an IPv6 CIDR or the icmpv6
 // protocol, and an ip set may hold IPv6 elements. They replicate in the
 // statement shapes those tables always had, so every peer DECODES them — but a
 // peer on a build that predates IPv6 rendering refuses the whole plan when
 // one reaches its renderer, and stops applying its firewall until it is
-// upgraded. So none is written until firewall_ipv6_v1 has durably latched,
-// which cannot happen while any replication recipient runs such a build.
+// upgraded. So an IPv6 row is written only by the ...WithGrant writers, with
+// a grant from the release-feature gate: the release token has latched (no
+// such peer remains) and the use is recorded ahead of the row. An IPv4 row
+// needs no grant, as on main; the writers without a grant refuse an IPv6 one.
 
 import (
 	"errors"
@@ -18,28 +21,9 @@ import (
 )
 
 // ErrFirewallIPv6GateClosed is returned by a write of an IPv6 rule or ip-set
-// element before firewall_ipv6_v1 has durably latched on this node.
-var ErrFirewallIPv6GateClosed = errors.New("IPv6 firewall rules are not writable until firewall_ipv6_v1 has latched on every host " +
-	"(a host on an older build cannot render them and would stop applying its firewall); upgrade every host first")
-
-// SetFirewallIPv6Gate injects the predicate that permits writing IPv6
-// firewall rules and ip-set elements, wired at daemon start to the durable
-// firewall_ipv6_v1 latch. Nil-safe and FAIL CLOSED: an unset gate refuses
-// every IPv6 write, which is what every earlier build did.
-func (c *Client) SetFirewallIPv6Gate(fn func() bool) {
-	if fn == nil {
-		c.firewallIPv6Gate.Store(nil)
-		return
-	}
-	c.firewallIPv6Gate.Store(&fn)
-}
-
-// MayWriteFirewallIPv6 reports whether this node may write IPv6 firewall
-// rules (nil-safe, fail closed).
-func (c *Client) MayWriteFirewallIPv6() bool {
-	fn := c.firewallIPv6Gate.Load()
-	return fn != nil && (*fn)()
-}
+// element without a firewall_ipv6 grant.
+var ErrFirewallIPv6GateClosed = errors.New("IPv6 firewall rules are written only through the release feature firewall_ipv6 " +
+	"(the cluster upgrade must finish first: a host on an older build cannot render them and would stop applying its firewall)")
 
 // isIPv6Proto reports whether proto is ICMPv6, which exists only in IPv6.
 func isIPv6Proto(proto string) bool {
@@ -50,46 +34,64 @@ func isIPv6Proto(proto string) bool {
 	return false
 }
 
-// checkFirewallRuleFamily refuses a rule this build or an older peer could not
-// render. An IPv6 CIDR must parse (a malformed one would stop every host's
-// renderer), must not be paired with IPv4's icmp, and — like icmpv6 — may only
-// be written once the IPv6 gate is open. An IPv4 CIDR is left alone, as it
-// always was, except that icmpv6 cannot match one.
-func (c *Client) checkFirewallRuleFamily(cidr, proto string) error {
+func looksIPv6CIDR(cidr string) bool {
 	cidr = strings.TrimSpace(cidr)
-	v6 := isIPv6CIDR(cidr) || (strings.Contains(cidr, ":") && !strings.HasPrefix(cidr, "@"))
-	if v6 {
-		if !validIPv6AddrOrPrefix(cidr) {
-			return fmt.Errorf("%q is not an IPv6 address or prefix", cidr)
-		}
-		if strings.EqualFold(strings.TrimSpace(proto), "icmp") {
-			return fmt.Errorf("proto icmp is IPv4-only and cannot match IPv6 CIDR %q; use icmpv6", cidr)
-		}
-	} else if cidr != "" && !strings.HasPrefix(cidr, "@") && isIPv6Proto(proto) {
-		return fmt.Errorf("proto %s is IPv6-only and cannot match IPv4 CIDR %q", proto, cidr)
-	}
-	if (v6 || isIPv6Proto(proto)) && !c.MayWriteFirewallIPv6() {
-		return ErrFirewallIPv6GateClosed
-	}
-	return nil
+	return isIPv6CIDR(cidr) || (strings.Contains(cidr, ":") && !strings.HasPrefix(cidr, "@"))
 }
 
-// checkIPSetFamily refuses an IPv6 ip-set element that does not parse, and
-// any IPv6 element while the gate is closed.
-func (c *Client) checkIPSetFamily(cidrs []string) error {
+// FirewallRuleFamily validates a rule naming cidr and proto as its writer
+// does (firewallRuleFamily) and reports whether it is an IPv6 rule, whose
+// write is the release feature firewall_ipv6: a caller refuses a malformed
+// rule before it asks the release gate for anything.
+func FirewallRuleFamily(cidr, proto string) (v6 bool, err error) {
+	return firewallRuleFamily(cidr, proto)
+}
+
+// IPSetFamily is FirewallRuleFamily for an ip set's elements.
+func IPSetFamily(cidrs []string) (v6 bool, err error) {
+	return ipSetFamily(cidrs)
+}
+
+// firewallRuleFamily refuses a rule this build or an older peer could not
+// render — an IPv6 CIDR that does not parse (it would stop every host's
+// renderer), IPv4's icmp with an IPv6 CIDR, icmpv6 with an IPv4 CIDR — and
+// reports whether the rule is IPv6.
+func firewallRuleFamily(cidr, proto string) (v6 bool, err error) {
+	cidr = strings.TrimSpace(cidr)
+	v6cidr := looksIPv6CIDR(cidr)
+	if v6cidr {
+		if !validIPv6AddrOrPrefix(cidr) {
+			return false, fmt.Errorf("%q is not an IPv6 address or prefix", cidr)
+		}
+		if strings.EqualFold(strings.TrimSpace(proto), "icmp") {
+			return false, fmt.Errorf("proto icmp is IPv4-only and cannot match IPv6 CIDR %q; use icmpv6", cidr)
+		}
+	} else if cidr != "" && !strings.HasPrefix(cidr, "@") && isIPv6Proto(proto) {
+		return false, fmt.Errorf("proto %s is IPv6-only and cannot match IPv4 CIDR %q", proto, cidr)
+	}
+	return v6cidr || isIPv6Proto(proto), nil
+}
+
+// ipSetFamily refuses an IPv6 ip-set element that does not parse, and reports
+// whether the set holds one.
+func ipSetFamily(cidrs []string) (v6 bool, err error) {
 	for _, e := range cidrs {
 		e = strings.TrimSpace(e)
 		if !strings.Contains(e, ":") {
 			continue
 		}
 		if !validIPv6AddrOrPrefix(e) {
-			return fmt.Errorf("ip set element %q is not an IPv6 address or prefix", e)
+			return false, fmt.Errorf("ip set element %q is not an IPv6 address or prefix", e)
 		}
-		if !c.MayWriteFirewallIPv6() {
-			return ErrFirewallIPv6GateClosed
-		}
+		v6 = true
 	}
-	return nil
+	return v6, nil
+}
+
+// noIPv6Grant is the error a writer returns for an IPv6 row its grant does
+// not cover.
+func noIPv6Grant(err error) error {
+	return fmt.Errorf("%w (%v)", ErrFirewallIPv6GateClosed, err)
 }
 
 // validIPv6AddrOrPrefix reports whether s is an IPv6 address or prefix with

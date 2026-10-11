@@ -83,7 +83,7 @@ func TestFleet_NICGuard_RecreateCannotWidenAPreGuardTrunk(t *testing.T) {
 		t.Fatalf("fixture: records before the upgrade = %v, %v", all, err)
 	}
 	// The upgrade: records can be written, and the trunks in use are recorded.
-	node.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, node)
 	rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	node.Server.RecordExistingTrunkVLANsLoop(rctx, 50*time.Millisecond)
 	cancel()
@@ -181,7 +181,7 @@ func TestFleet_NICGuard_CloneOfATrunkIsGuarded(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
 	ctx := context.Background()
-	n.DB.SetClusterPolicyGate(func() bool { return true })
+	openNICGuards(t, n)
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 	setHostCapacity(t, c, n.Name, 64, 65536, nil)
 	seedCloneSource(t, c, n, "tpl", "", 1, 256)

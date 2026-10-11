@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -79,7 +80,7 @@ func TestCorrosionPlanLoader_GuardsRecordedNICsOnly(t *testing.T) {
 		[]corrosion.InterfaceRecord{{VMName: "old", NetworkName: "prod", MAC: "52:54:00:00:00:02", IP: "10.0.0.11"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{
 		VMName: "new", MAC: "52:54:00:00:00:01", Mode: corrosion.NICGuardOn, Allowed: []string{"10.0.0.250"},
 	}, "test"); err != nil {
 		t.Fatalf("PutNICGuard: %v", err)

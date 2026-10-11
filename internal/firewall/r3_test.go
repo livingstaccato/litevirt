@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -96,7 +97,7 @@ func TestCorrosionPlanLoader_IgnoresAnotherIncarnationsRecord(t *testing.T) {
 		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "lan", MAC: "52:54:00:00:00:01", IP: "10.0.0.5"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: "web", MAC: "52:54:00:00:00:01",
 		Mode: corrosion.NICGuardOn, VMUUID: "u-1"}, "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +121,7 @@ func TestCorrosionPlanLoader_PendingContainerNICs(t *testing.T) {
 	}
 	db.SetClusterPolicyGate(func() bool { return true })
 	owner := corrosion.ContainerGuardOwner("host-a", "web")
-	if err := corrosion.PutNICGuard(ctx, db, corrosion.NICGuardRecord{VMName: owner, MAC: "52:00:00:00:00:10", Mode: corrosion.NICGuardOn}, "t"); err != nil {
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{VMName: owner, MAC: "52:00:00:00:00:10", Mode: corrosion.NICGuardOn}, "t"); err != nil {
 		t.Fatal(err)
 	}
 	arm := NewArming()

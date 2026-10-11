@@ -29,7 +29,7 @@ func heldCluster(t *testing.T) (*Cluster, *Node, *Node, map[string]*recordingNft
 	src, dst := c.Nodes[0], c.Nodes[1]
 	nfts := map[string]*recordingNft{}
 	for _, n := range c.Nodes {
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		openNICGuards(t, n)
 		n.Server.SetBridgeEnsure(func(string) error { return nil })
 		nfts[n.Name] = wireNodeFirewall(t, n)
 	}

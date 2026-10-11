@@ -5,6 +5,8 @@ import (
 	"net"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // SecurityGroup represents a security group.
@@ -102,13 +104,25 @@ func DeleteSecurityGroup(ctx context.Context, c *Client, id string) error {
 	)
 }
 
-// InsertSGRule adds a rule to a security group.
+// InsertSGRule adds an IPv4 rule to a security group; an IPv6 one needs
+// InsertSGRuleWithGrant.
 func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
-	// An IPv6 rule renders as ip6 on this build, but a peer on an older
-	// build refuses its whole plan on one, so it waits for firewall_ipv6_v1
-	// (checkFirewallRuleFamily), and a malformed one is never written.
-	if err := c.checkFirewallRuleFamily(rule.CIDR, rule.Proto); err != nil {
+	return InsertSGRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, rule)
+}
+
+// InsertSGRuleWithGrant adds a rule to a security group. An IPv6 rule renders
+// as ip6 on this build, but a peer on an older build refuses its whole plan
+// on one, so it is the release feature firewall_ipv6: g must be its grant. A
+// malformed one is never written.
+func InsertSGRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, rule SGRule) error {
+	v6, err := firewallRuleFamily(rule.CIDR, rule.Proto)
+	if err != nil {
 		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
 	}
 	now := c.NowTS()
 	proto := rule.Proto

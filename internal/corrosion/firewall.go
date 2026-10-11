@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"fmt"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // FirewallRule is a cluster- or host-tier firewall rule — the two policy
@@ -40,12 +42,8 @@ type FirewallDefault struct {
 }
 
 // normRule applies the same field defaults the renderer/security-group path
-// uses, and refuses an IPv6 rule this build or an older peer could not render
-// (checkFirewallRuleFamily — same guard as InsertSGRule).
-func normRule(c *Client, r *FirewallRule) error {
-	if err := c.checkFirewallRuleFamily(r.CIDR, r.Proto); err != nil {
-		return err
-	}
+// uses.
+func normRule(r *FirewallRule) error {
 	if r.Proto == "" {
 		r.Proto = "all"
 	}
@@ -60,10 +58,23 @@ func normRule(c *Client, r *FirewallRule) error {
 
 // ── IP sets ──────────────────────────────────────────────────────────────
 
-// InsertIPSet creates a named CIDR list.
+// InsertIPSet creates a named CIDR list of IPv4 elements; one with an IPv6
+// element needs InsertIPSetWithGrant.
 func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
-	if err := c.checkIPSetFamily(s.CIDRs); err != nil {
+	return InsertIPSetWithGrant(ctx, c, capabilities.FeatureGrant{}, s)
+}
+
+// InsertIPSetWithGrant creates a named CIDR list. An IPv6 element is the
+// release feature firewall_ipv6: g must be its grant.
+func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, s IPSet) error {
+	v6, err := ipSetFamily(s.CIDRs)
+	if err != nil {
 		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
 	}
 	cidrs, err := encodeSGs(s.CIDRs) // reuse the []string→JSON helper
 	if err != nil {
@@ -107,9 +118,26 @@ func DeleteIPSet(ctx context.Context, c *Client, id string) error {
 
 // ── Cluster-tier rules ─────────────────────────────────────────────────────
 
-// InsertClusterFirewallRule adds a rule to the cluster_default chain.
+// InsertClusterFirewallRule adds an IPv4 rule to the cluster_default chain;
+// an IPv6 one needs InsertClusterFirewallRuleWithGrant.
 func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) error {
-	if err := normRule(c, &r); err != nil {
+	return InsertClusterFirewallRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, r)
+}
+
+// InsertClusterFirewallRuleWithGrant adds a rule to the cluster_default
+// chain. An IPv6 rule is the release feature firewall_ipv6: g must be its
+// grant.
+func InsertClusterFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
+	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
+	if err != nil {
+		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
+	}
+	if err := normRule(&r); err != nil {
 		return err
 	}
 	now := c.NowTS()
@@ -142,12 +170,29 @@ func DeleteClusterFirewallRule(ctx context.Context, c *Client, id string) error 
 
 // ── Host-tier rules ─────────────────────────────────────────────────────────
 
-// InsertHostFirewallRule adds a rule to one host's host_overrides chain.
+// InsertHostFirewallRule adds an IPv4 rule to one host's host_overrides
+// chain; an IPv6 one needs InsertHostFirewallRuleWithGrant.
 func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) error {
+	return InsertHostFirewallRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, r)
+}
+
+// InsertHostFirewallRuleWithGrant adds a rule to one host's host_overrides
+// chain. An IPv6 rule is the release feature firewall_ipv6: g must be its
+// grant.
+func InsertHostFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
 	}
-	if err := normRule(c, &r); err != nil {
+	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
+	if err != nil {
+		return err
+	}
+	if v6 {
+		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
+			return noIPv6Grant(err)
+		}
+	}
+	if err := normRule(&r); err != nil {
 		return err
 	}
 	now := c.NowTS()

@@ -75,7 +75,9 @@ func TestRunWiresEveryCredentialGate(t *testing.T) {
 	assertRunCalls(t, "wireCredentialsSplitGate", "wireCredentialsClearGate", "wireHostMembershipGate")
 }
 
-// assertRunCalls fails unless (*Daemon).Run calls each named method on d.
+// assertRunCalls fails unless (*Daemon).Run calls each named method on d,
+// directly or through another (*Daemon) method of daemon.go that Run reaches
+// the same way (wireCorrosionGates wires several gates for Run and its test).
 func assertRunCalls(t *testing.T, names ...string) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -83,25 +85,34 @@ func assertRunCalls(t *testing.T, names ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	called := map[string]bool{}
+	bodies := map[string]*ast.BlockStmt{}
 	for _, decl := range f.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "Run" || fn.Recv == nil || fn.Body == nil {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Body != nil {
+			bodies[fn.Name.Name] = fn.Body
+		}
+	}
+	if bodies["Run"] == nil {
+		t.Fatal("found no (*Daemon).Run in daemon.go")
+	}
+	called := map[string]bool{}
+	queue := []string{"Run"}
+	for len(queue) > 0 {
+		body := bodies[queue[0]]
+		queue = queue[1:]
+		if body == nil {
 			continue
 		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ast.Inspect(body, func(n ast.Node) bool {
 			if call, ok := n.(*ast.CallExpr); ok {
 				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "d" {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "d" && !called[sel.Sel.Name] {
 						called[sel.Sel.Name] = true
+						queue = append(queue, sel.Sel.Name)
 					}
 				}
 			}
 			return true
 		})
-	}
-	if len(called) == 0 {
-		t.Fatal("found no (*Daemon).Run in daemon.go")
 	}
 	for _, n := range names {
 		if !called[n] {

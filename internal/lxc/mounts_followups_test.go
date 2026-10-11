@@ -135,6 +135,11 @@ func TestHostAccessLock_BoundedBehindAStuckRefresh(t *testing.T) {
 		}
 	}
 
+	// N-3. The start's error names the container once.
+	if err := r.prepareStart("a"); !errors.Is(err, ErrHostAccessBusy) || strings.Count(err.Error(), `container "a"`) != 1 {
+		t.Errorf("prepareStart behind a stuck refresh = %v; want ErrHostAccessBusy naming the container once", err)
+	}
+
 	unblock()
 	waitFree()
 	if err := r.SetHostAccess("a", nil, nil); err != nil {

@@ -231,7 +231,11 @@ containers:
   `/var/lib/lxc/.litevirt+staging` (root's, mode 0711 — traverse only, so
   an unprivileged container's mapped root reaches its own staged mounts and
   nobody but root can list, create or rename there — private propagation, no
-  symlink followed). It lies beneath LXC's store because that is the one tree
+  symlink followed). Permissions on the directories above a mount's source do
+  not apply to its staged copy: only the source tree's own modes do, so a
+  source readable by local users only because a parent directory is closed
+  becomes reachable through the staging path; allow only sources whose own
+  modes say who may read them. It lies beneath LXC's store because that is the one tree
   the stock AppArmor profile of `lxc-start` lets a start hook mount on
   (Ubuntu's `abstractions/lxc/start-container`), so no host policy change is
   needed; earlier builds staged under `/run/litevirt/ct`, which that profile

@@ -330,7 +330,7 @@ func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corr
 	}
 	dropped, err := rb.RebuildContainerConfig(ctx, name, cfg)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "render %q's config from its authorized spec: %v", name, err)
+		return nil, status.Errorf(hostAccessBusyCode(err, codes.Internal), "render %q's config from its authorized spec: %v", name, err)
 	}
 	return dropped, nil
 }

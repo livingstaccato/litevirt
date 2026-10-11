@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func stagingCfg(entries ...string) string {
@@ -117,5 +119,32 @@ func TestClearStaging_RefusesASymlinkedDir(t *testing.T) {
 	clearStaging(link)
 	if _, err := os.Stat(precious); err != nil {
 		t.Errorf("clearStaging followed a symlinked staging dir and removed what it points at: %v", err)
+	}
+}
+
+// N-4. Taking a staging entry down never follows a symlink planted there:
+// every unmount is MNT_DETACH|UMOUNT_NOFOLLOW, so a symlink entry pointing at
+// a host mount detaches nothing.
+//
+// Mutation: drop UMOUNT_NOFOLLOW from unmountAll — red.
+func TestUnmountAll_NeverFollowsASymlink(t *testing.T) {
+	var flags []int
+	prev := unmount
+	unmount = func(_ string, f int) error {
+		flags = append(flags, f)
+		if len(flags) > 2 {
+			return unix.EINVAL
+		}
+		return nil
+	}
+	t.Cleanup(func() { unmount = prev })
+	unmountAll("/var/lib/lxc/.litevirt+staging/c1/m0")
+	if len(flags) == 0 {
+		t.Fatal("unmountAll unmounted nothing")
+	}
+	for _, f := range flags {
+		if f&unix.UMOUNT_NOFOLLOW == 0 || f&unix.MNT_DETACH == 0 {
+			t.Errorf("unmount flags %#x; want MNT_DETACH|UMOUNT_NOFOLLOW", f)
+		}
 	}
 }

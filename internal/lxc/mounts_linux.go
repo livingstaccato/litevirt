@@ -179,11 +179,16 @@ func isMountpoint(p string) bool {
 // unmountAll detaches every mount stacked on p.
 func unmountAll(p string) {
 	for i := 0; i < 16; i++ {
-		if unix.Unmount(p, unix.MNT_DETACH) != nil {
+		// Never through a symlink at p: one planted there would detach
+		// whatever host mount it points at.
+		if unmount(p, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW) != nil {
 			return
 		}
 	}
 }
+
+// unmount is unix.Unmount (tests).
+var unmount = unix.Unmount
 
 // stageMount mounts one source onto its staging path from an fd: open
 // beneath the prefix, clone exactly that tree (no submounts), set its

@@ -242,3 +242,24 @@ func TestRestoreContainer_WithoutHostAccessAuditedOnlyOnceLanded(t *testing.T) {
 		}
 	}
 }
+
+// N-1. A config render behind a stuck host-access refresh — the path snapshot
+// revert, clone and restore take — fails Unavailable (retry), as start and
+// convert do, not Internal.
+//
+// Mutation: map a render error to Internal unconditionally — red.
+func TestRenderContainerConfig_BusyIsUnavailable(t *testing.T) {
+	s, rt := secServer(t)
+	rt.rebuildErr = fmt.Errorf("container %q: %w", "a", lxc.ErrHostAccessBusy)
+	spec := corrosion.ContainerCreateSpec{Template: "download"}
+	if err := s.rebuildContainerConfig(context.Background(), "a", spec); status.Code(err) != codes.Unavailable {
+		t.Errorf("rebuild (revert, clone) behind a stuck refresh = %v; want Unavailable", err)
+	}
+	if _, err := s.renderContainerConfig(context.Background(), "a", spec, networkRender); status.Code(err) != codes.Unavailable {
+		t.Errorf("render (restore) behind a stuck refresh = %v; want Unavailable", err)
+	}
+	rt.rebuildErr = errors.New("disk full")
+	if err := s.rebuildContainerConfig(context.Background(), "a", spec); status.Code(err) != codes.Internal {
+		t.Errorf("any other render error = %v; want Internal, as before", err)
+	}
+}

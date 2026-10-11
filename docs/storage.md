@@ -201,6 +201,17 @@ A narrowing is never what fails an operation: on a filesystem that refuses
 chmod, the file keeps the mode it was made with — already `0600` for every disk
 litevirt makes — and the daemon logs a warning naming it.
 
+The cluster database, `<data_dir>/state.db`, is `0600` and root's, as are the
+`state.db-wal` and `state.db-shm` files SQLite keeps beside it (they take the
+database's mode). It holds every credential the cluster has: password hashes,
+API tokens, the credential tables. It is the one existing file that is
+narrowed in place. Earlier releases made it `0644`, readable by any local
+user, so the daemon narrows it and its `-wal`, `-shm` and `-journal` files at
+every start. Nothing else in the data directory is touched. Nothing but root
+opens the database: the daemon, `lv user reset-admin`, the `lv sg ls`
+fallback, and `litevirt schema-migrate` all run as root. If the narrowing
+fails, the daemon logs a warning naming the file and starts anyway.
+
 ### Directory pools on NFS
 
 A `local`, `dir` or `btrfs` pool may sit on an NFS mount the host makes itself

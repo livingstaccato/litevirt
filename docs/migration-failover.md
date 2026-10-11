@@ -879,14 +879,22 @@ turned active is counted down afresh, and a host `lv host add` admitted is not
 probed at all until its daemon's first boot records it `active`.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
-counts at any age, and for the one a lost voter's removal and a superseded
-claim rest on. A proof-grade row from before the host was last recorded as it
-is now — admitted (`joining`), booted (`active`), lost unfenced (`offline`),
-drained — is about an earlier life and does not count, so a machine `lv host
-add` put under a removed host's name is not removed on the old machine's
-confirmation: `lv host fence-confirm` it once it is powered off. A host
-recorded `fenced` is exempt, since that write is itself its fence. Rows within
-5 seconds of the state write still count, for the clock between them.
+counts at any age, and for the one a lost voter's removal, a superseded claim
+and the coordinator's recovery of a removed host's workloads rest on. A
+proof-grade row from before the host was last recorded as it is now —
+admitted (`joining`), booted (`active`), lost unfenced (`offline`), drained —
+is about an earlier life and does not count, so a machine `lv host add` put
+under a removed host's name is not removed on the old machine's confirmation:
+`lv host fence-confirm` it once it is powered off. A host recorded `fenced` is
+exempt, since that write is itself its fence. Rows within 5 seconds of the
+state write still count, for the clock between them.
+
+This holds after the host is removed too. The membership row outlives the
+removal, so a removed name's fence from an earlier life is not taken as the
+proof that its workloads may be recovered, or that a claim decided for it may
+move on; it used to be, at any age, once the live hosts row was gone. The
+remedy is `lv host fence-confirm <host>` once it is powered off, which a
+removed host accepts.
 
 ### Resuming a recovery from a confirmation
 

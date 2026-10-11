@@ -454,19 +454,32 @@ type SupersedeEvidence struct {
 }
 
 // HostProofGradeFence returns the newest proof-grade fencing_log row for host
-// (an IPMI power-off or an operator's `lv host fence-confirm`) of the host as
-// it is now, however old: the supersede evidence and `lv host rm --dead` ask
-// whether the host was proven off, alongside its removal and revocation. A row
-// from before the host was last recorded as it is now (HostFenceLife) is about
-// an earlier life of it — the machine removed under its name before `lv host
-// add` gave the name to a new one, or the same machine before it came back —
-// and does not count.
+// (an IPMI power-off or an operator's `lv host fence-confirm`) of the host's
+// LAST life, however old: the supersede evidence, `lv host rm --dead` and the
+// coordinator's recovery of a removed host's workloads (recoverRemovedHosts)
+// ask whether the host was proven off, alongside its removal and revocation.
+//
+// A row from before the host was last recorded as it is now (HostFenceLife)
+// is about an earlier life of it — the machine removed under its name before
+// `lv host add` gave the name to a new one, or the same machine before it
+// came back — and does not count. The life is read through the tombstone, as
+// RemovedHostProvedOff reads it: DeleteHost leaves the host_membership row
+// live, so its updated_at still dates a removed host's last life, and a
+// removed name's earlier-life fence no longer counts either (it used to, at
+// any age, once the live hosts row was gone). The remedy is `lv host
+// fence-confirm <host>` once it is powered off, which a removed host accepts.
+//
+// Unlike RemovedHostProvedOff it does not let the newest fence decide: a
+// weaker fence after a proof writes a state (RecordFenceWithState) that moves
+// the life past the proof anyway, and only a same-second tie would differ —
+// which would refuse an operator's confirmation recorded in the same second
+// as a coordinator's best-effort fence.
 func HostProofGradeFence(ctx context.Context, c *Client, host string) (FenceLogRecord, bool, error) {
-	rows, err := c.Query(ctx, `SELECT id, host_name, method, result, timestamp, detail FROM fencing_log WHERE host_name = ?`, host)
+	life, _, lifeKnown, err := hostFenceLife(ctx, c, host, ` WHERE h.name = ?`)
 	if err != nil {
 		return FenceLogRecord{}, false, err
 	}
-	life, _, lifeKnown, err := HostFenceLife(ctx, c, host)
+	rows, err := c.Query(ctx, `SELECT id, host_name, method, result, timestamp, detail FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
 		return FenceLogRecord{}, false, err
 	}
@@ -499,7 +512,8 @@ func RemovedHostEvidence(ctx context.Context, c *Client, pkiDir, host string) er
 	if _, ok, err := HostProofGradeFence(ctx, c, host); err != nil {
 		return err
 	} else if !ok {
-		return fmt.Errorf("%s has no proof-grade fence recorded (IPMI power-off or `lv host fence-confirm %s`)", host, host)
+		return fmt.Errorf("%s has no proof-grade fence of its last life recorded (IPMI power-off or `lv host fence-confirm %s` "+
+			"once it is powered off)", host, host)
 	}
 	if h, err := GetHost(ctx, c, host); err != nil {
 		return err

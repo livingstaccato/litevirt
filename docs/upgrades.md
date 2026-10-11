@@ -1157,9 +1157,28 @@ machine's labels, region, role, fence settings and `grpc_port`. A
 re-admission now records its own time as the row's `created_at`, on every host
 that applies it, and a tie between two `hosts` rows with different
 `created_at` goes to the later one, whole: the re-admitted row, with every
-write the host has made since. Mid-roll this needs at least one host on this
-build to have applied the re-admission; where none did, the tie stays as it
-was on the previous release.
+write the host has made since. Anti-entropy pulls whole rows, so a host that
+pulled the re-added host's row before its writes arrived used to take the
+stale row outright — it is newer — and where every survivor did, the cluster
+settled on it with no tie to report. A host holding the re-admitted row now
+keeps it against a row with an earlier `created_at`; the re-added host's
+writes still reach it by replication.
+
+Mid-roll, this needs at least one host on this build to have applied the
+re-admission, and that is necessary rather than sufficient. A host on a build
+with the re-admission reset but without this change settles a tie between a
+stamped and an unstamped row on the stamped one; a host on a build without
+the reset (v1.9.0 and earlier) leaves the tie unresolved, as before. An
+older-build host can also erase the stamp by pulling a newer, unstamped row
+from another older-build host. Where no host stamped, the tie stays as it was.
+
+The two `created_at` values come from two hosts' clocks. If the host's
+original `created_at` is later than the re-admission's — a clock skew larger
+than its whole first membership — the stale row wins whole, on every host.
+
+The re-added host publishes its capability labels again (`litevirt.lxc`,
+`litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row
+reaching it; it does not need a restart.
 
 **Rollback.** Both tokens ship in the same build, so a binary rolled back
 below them is below both. It enters WAL quarantine at startup, as below every

@@ -49,28 +49,38 @@ func hostsRowOf(t *testing.T, n *Node, host string) map[string]string {
 // no label, region or override of the machine removed under the name, and the
 // admission's grpc_port.
 //
+// The "anti-entropy first" subtests take the other order: the survivors can
+// dial d (it is admitted at the port it serves on), and their anti-entropy
+// pass pulls d's whole row before any of d's replicated writes reach them.
+// That row is newer than the re-admission, and taken whole it brought the
+// removed machine's settings back on every survivor, with no tie to report.
+//
 // Mutations: (1) the re-admission does not stamp its incarnation on created_at
-// — red, hosts stays apart; (2) the hosts tie chain does not order two
-// incarnations by created_at — red, the same.
+// — red, hosts stays apart (WAL first) or settles on the stale row
+// (anti-entropy first); (2) the hosts tie chain does not order two
+// incarnations by created_at — red (WAL first); (3) the hosts merge floor
+// lets an older incarnation's newer row in — red (anti-entropy first).
 func TestFleet_StaleDBReaddConvergesOnTheReadmission(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		retired bool
-		seed    int64
+		name             string
+		retired, aeFirst bool
+		seed             int64
 	}{
 		// Every hosts write the boot makes still lands on hosts itself.
 		{name: "dual-write", seed: 2671},
 		// Both copies retired: the boot report writes host_membership and
 		// host_runtime alone, and RegisterHost's serial is the hosts write.
 		{name: "both copies retired", retired: true, seed: 2672},
+		{name: "dual-write, anti-entropy first", aeFirst: true, seed: 2673},
+		{name: "both copies retired, anti-entropy first", retired: true, aeFirst: true, seed: 2674},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			staleDBReadd(t, tc.retired, tc.seed)
+			staleDBReadd(t, tc.retired, tc.aeFirst, tc.seed)
 		})
 	}
 }
 
-func staleDBReadd(t *testing.T, retired bool, seed int64) {
+func staleDBReadd(t *testing.T, retired, aeFirst bool, seed int64) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: seed})
 	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -92,7 +102,7 @@ func staleDBReadd(t *testing.T, retired bool, seed int64) {
 	}
 	ratio := 4.0
 	if _, err := c.SelfClient(a).ConfigureHost(ctx, &pb.ConfigureHostRequest{
-		Name: d.Name, CpuOvercommit: &ratio,
+		Name: d.Name, CpuOvercommit: &ratio, WatchdogDev: "/dev/watchdog0",
 	}); err != nil {
 		t.Fatalf("configure %s: %v", d.Name, err)
 	}
@@ -116,7 +126,17 @@ func staleDBReadd(t *testing.T, retired bool, seed int64) {
 		return true
 	})
 	serial := restartWithNewCert(t, c, d)
-	if _, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
+	wantPort := "7443" // AdmitHost's RPC admits every host at the default port
+	if aeFirst {
+		// Admitted at the port d serves on, so the survivors can dial it.
+		wantPort = fmt.Sprint(d.Port)
+		if err := corrosion.AdmitHost(ctx, a.DB, corrosion.HostRecord{
+			Name: d.Name, Address: d.Address, SSHUser: "root", SSHPort: 22, GRPCPort: d.Port,
+			State: corrosion.HostStateJoining, CertSerial: serial,
+		}); err != nil {
+			t.Fatalf("admit %s again: %v", d.Name, err)
+		}
+	} else if _, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
 		Name: d.Name, Address: d.Address, CertSerial: serial,
 	}); err != nil {
 		t.Fatalf("admit %s again: %v", d.Name, err)
@@ -131,7 +151,7 @@ func staleDBReadd(t *testing.T, retired bool, seed int64) {
 		return true
 	})
 	intent := hostsRowOf(t, a, d.Name)
-	if intent["labels"] != "NULL" || intent["region"] != "default" || intent["grpc_port"] != "7443" {
+	if intent["labels"] != "NULL" || intent["region"] != "default" || intent["grpc_port"] != wantPort {
 		t.Fatalf("fixture: the re-admission on %s = %v, want its reset row", a.Name, intent)
 	}
 
@@ -153,6 +173,25 @@ func staleDBReadd(t *testing.T, retired bool, seed int64) {
 	for _, o := range c.Nodes {
 		if o != d {
 			c.SetLinkFaultBoth(d, o, LinkFault{})
+		}
+	}
+	if aeFirst {
+		// The survivors' anti-entropy reaches d before any of d's writes do:
+		// d's replicator has not started. That the pull reached d at all is
+		// shown by a probe label on a's row that only d holds until then.
+		if err := corrosion.SetHostLabel(ctx, d.DB, a.Name, "ae-probe", d.Name); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range survivors {
+			corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+		}
+		for _, n := range survivors {
+			if h, err := corrosion.GetHost(ctx, n.DB, a.Name); err != nil || h == nil || h.Labels["ae-probe"] != d.Name {
+				t.Fatalf("fixture: %s's anti-entropy pass did not reach %s (reads %s as %+v, %v)", n.Name, d.Name, a.Name, h, err)
+			}
+			if got := hostsRowOf(t, n, d.Name); got["region"] != "default" || got["watchdog_dev"] != "NULL" {
+				t.Errorf("%s took %s's stale row from its database over the re-admission: %v", n.Name, d.Name, got)
+			}
 		}
 	}
 	d.repl.Start(c.ctx)
@@ -187,10 +226,11 @@ func staleDBReadd(t *testing.T, retired bool, seed int64) {
 			t.Errorf("%s's hosts row for %s differs from %s's:\n %s: %v\n %s: %v",
 				n.Name, d.Name, a.Name, n.Name, got, a.Name, want)
 		}
-		if got["labels"] != "NULL" || got["region"] != "default" || got["grpc_port"] != "7443" ||
-			got["cpu_overcommit"] != "0" || got["cert_serial"] != serial || got["deleted_at"] != "NULL" {
+		if got["labels"] != "NULL" || got["region"] != "default" || got["grpc_port"] != wantPort ||
+			got["cpu_overcommit"] != "0" || got["watchdog_dev"] != "NULL" || got["cert_serial"] != serial ||
+			got["deleted_at"] != "NULL" {
 			t.Errorf("%s holds %s's row as %v; want the re-admission's (no labels, region default, "+
-				"grpc_port 7443, no overcommit, serial %s, live)", n.Name, d.Name, got, serial)
+				"grpc_port %s, no overcommit, no watchdog, serial %s, live)", n.Name, d.Name, got, wantPort, serial)
 		}
 		h, err := corrosion.GetHost(ctx, n.DB, d.Name)
 		if err != nil || h == nil {

@@ -848,6 +848,10 @@ column tie by content-max — applied in that order, first strict decision wins.
 `hosts` settles a tie between two live rows with different `created_at` (two
 incarnations: a host's stale database against its re-admission) by the later
 `created_at`, ahead of its control-plane columns, reported as `timestamp_max`.
+Anti-entropy also refuses to replace a re-admitted `hosts` row with a newer
+row of the host's previous incarnation: it is counted in
+`litevirt_merge_apply_rejected_total{table="hosts",path="ae",reason="older_incarnation"}`
+and logged.
 
 `containers` ownership is part of the primary key, so an ownership split is two
 distinct rows (not a single-row tie) — detected by `duplicate_live_container`

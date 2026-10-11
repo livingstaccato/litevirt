@@ -305,20 +305,34 @@ func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string
 // the later one wins whole: the re-admitted row, which also carries every
 // write the machine made since, because every node applied them over it.
 //
-// Nothing changes on the wire. A node on the previous release does not stamp,
-// so where none of the nodes that applied the re-admission stamped, both
-// sides keep the old created_at and the tie stays as it was. Where one did,
-// the previous release's chain reaches content-max over two rows that differ
-// only in created_at (they both applied the re-admission and everything since),
-// and picks the same row this one does: the canonical encoding length-prefixes
-// each value, and the stamp's 30 characters order after InsertHost's 20
-// (whole-second RFC3339), while two stamps, both fixed-width, order as time
-// does.
+// Nothing changes on the wire. Mid-roll, an older build does not stamp, and
+// what it does with a stamped row depends on which build it is:
+//   - a build that carries the re-admission reset (f3126912) but not the stamp
+//     holds, after the re-admission and every write since, the same row as a
+//     stamping node except for created_at. Its chain reaches content-max over
+//     the two and picks the stamped row: the canonical encoding length-prefixes
+//     each value, and the stamp's 30 characters order after InsertHost's 20
+//     (whole-second RFC3339), while two stamps, both fixed-width, order as time
+//     does;
+//   - a build without the reset (v1.9.0 and earlier) applies the narrow
+//     re-admission and keeps the old machine's settings, so control-plane
+//     columns still differ and its chain leaves the tie unresolved, as before.
+//
+// Where no node that applied the re-admission stamped, both sides keep the old
+// created_at and the tie stays as it was. A stamp can also be erased: a whole
+// row pulled from an older-build survivor that holds a newer write replaces
+// the stamped row on a node that has no merge floor (an older build). A node
+// on this build keeps its stamp against such a row (host_incarnation_floor.go),
+// so stamping on one node is necessary for convergence, not sufficient.
 //
 // The comparison is between two wall clocks: the old row's created_at was
 // written by whichever node first inserted it, the stamp is the admitting
-// node's. A skew larger than the old machine's whole membership would hand the
-// tie to the stale row, which is the state before this rule.
+// node's (HLC physical time where HLC is on). If the old row's created_at is
+// LATER than the stamp — a skew larger than the host's whole first membership —
+// the tie rule hands every node the stale row, whole: the removed machine's
+// labels, role, fence settings and grpc_port come back cluster-wide, where
+// before this rule only the machine itself kept them. The merge floor does not
+// help there either, since it too judges by the stamp being later.
 func stampReadmitIncarnation(ctx context.Context, tx *sql.Tx, s Statement, host, updatedAt string) error {
 	serial, ok := s.Params[5].(string)
 	if !ok || serial == "" {

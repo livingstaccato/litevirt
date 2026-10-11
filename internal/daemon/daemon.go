@@ -1428,40 +1428,30 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// root the container checker converges them into.
 	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 
-	// Advertise LXC capability as a host label so placement puts a container
-	// only on a host that can run it (strict: litevirt.lxc=true, see
-	// corrosion.HostRunsContainers). The runtime is always wired, but the lxc-*
-	// binaries may be absent — probe for lxc-create. Asserted now, before the
-	// container checker starts, and re-asserted every lxcLabelInterval so a
-	// write that did not land does not leave a capable host refusing
-	// containers until its next restart.
-	if capable, err := assertLXCLabel(ctx, d.db, d.cfg.HostName, lxc.Available); err != nil {
-		slog.Warn("set LXC capability host label failed; retrying in the background", "capable", capable, "error", err)
+	// Advertise the host's capabilities as labels so placement puts a workload
+	// only on a host that can run it:
+	//   - LXC (strict: litevirt.lxc=true, see corrosion.HostRunsContainers). The
+	//     runtime is always wired, but the lxc-* binaries may be absent — probe
+	//     for lxc-create.
+	//   - vTPM (G1): both swtpm_setup and swtpm are needed to START a vTPM VM —
+	//     libvirt runs swtpm_setup to initialize state, then swtpm. (The first
+	//     G1 drill failed in swtpm_setup with swtpm alone present.)
+	//   - Secure Boot: the secboot/MS OVMF pair (resolved above).
+	// Asserted now, before the container checker starts, and re-asserted every
+	// capabilityLabelInterval (keepCapabilityLabels says why).
+	capabilityLabels := []capabilityLabel{
+		{key: corrosion.LabelLXCCapable, capable: lxc.Available},
+		{key: corrosion.LabelTPMCapable, capable: func() bool {
+			_, errSwtpm := exec.LookPath("swtpm")
+			_, errSetup := exec.LookPath("swtpm_setup")
+			return errSwtpm == nil && errSetup == nil
+		}},
+		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
-	go keepLXCLabel(ctx, d.db, d.cfg.HostName, lxc.Available, lxcLabelInterval)
-
-	// Advertise vTPM + Secure Boot capability (G1) so placement only lands such VMs
-	// on hosts that can run them. TPM needs swtpm; Secure Boot needs the secboot/MS
-	// OVMF pair (resolved above). Independent capabilities → two labels.
-	// Both binaries are needed to actually START a vTPM VM — libvirt runs
-	// swtpm_setup to initialize state, then swtpm. (The first G1 drill failed in
-	// swtpm_setup with swtpm alone present.)
-	tpmCapable := "false"
-	_, errSwtpm := exec.LookPath("swtpm")
-	_, errSetup := exec.LookPath("swtpm_setup")
-	if errSwtpm == nil && errSetup == nil {
-		tpmCapable = "true"
+	if set, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels); err != nil {
+		slog.Warn("set capability host labels failed; retrying in the background", "labels", set, "error", err)
 	}
-	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelTPMCapable, tpmCapable); err != nil {
-		slog.Warn("set TPM capability host label failed", "capable", tpmCapable, "error", err)
-	}
-	sbCapable := "false"
-	if firmwarePaths.SecureBootAvailable() {
-		sbCapable = "true"
-	}
-	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelSecureBootCapable, sbCapable); err != nil {
-		slog.Warn("set Secure Boot capability host label failed", "capable", sbCapable, "error", err)
-	}
+	go keepCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels, capabilityLabelInterval)
 
 	// Container reconciler + restart engine: every cycle, sync each locally-owned
 	// container's cluster row to the LXC runtime's reality and auto-restart one

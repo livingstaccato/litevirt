@@ -1084,6 +1084,25 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				continue
 			}
 		}
+		// The hosts floor: a row of a host's previous incarnation never replaces
+		// the re-admitted one (host_incarnation_floor.go).
+		if table.Name == "hosts" {
+			keepLocal, reason, kErr := hostsOlderIncarnationRefused(tx, table, row, pkCols, pkIdx)
+			if kErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, kErr
+			}
+			if keepLocal {
+				skipped++
+				pk := pkKeyAt(row, pkIdx)
+				c.deferAfterCommit(tx, func() {
+					c.observeMergeRejected("hosts", "ae", reason)
+					slog.Warn("anti-entropy: kept the re-admitted host row. "+hostsIncarnationAdvice,
+						"table", "hosts", "pk", pk, "reason", reason)
+				})
+				continue
+			}
+		}
 		// ...and the credential that belongs to a refused re-mint, which this
 		// lane carries apart from its users row (users_admin_guard.go).
 		if table.Name == "user_credentials" {

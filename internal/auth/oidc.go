@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -642,18 +643,84 @@ func (r *OIDCRealm) evictOldestOfLocked(addr string) {
 	delete(r.stateStore, oldest)
 }
 
-// evictFairLocked drops the oldest flow of the address holding the most
-// flows; r.mu must be held.
+// evictFairLocked chooses whom to evict when the realm is full, never whom to
+// refuse (re-review 2, R1). The choice is hierarchical, so spreading single
+// flows across many keys of one network does not make a flood tie with a
+// victim:
+//
+//  1. the heaviest AGGREGATE: an IPv6 /48 or an IPv4 /24 (flowAggregate) —
+//     one site's allocation, used only for this choice;
+//  2. within it, the heaviest key (the per-address bound's key);
+//  3. that key's oldest flow.
+//
+// Ties at each level go deterministically to the candidate whose newest flow
+// is the newest, so a churning flood evicts itself rather than older flows,
+// and then to the smaller key string. r.mu must be held.
+//
+// Cost: a legitimate NAT /24 that shares an aggregate with an attacker is
+// evicted along with it. That is availability only, and one O(n) pass.
 func (r *OIDCRealm) evictFairLocked() {
-	count := map[string]int{}
-	top := ""
+	type tally struct {
+		n      int
+		newest time.Time
+	}
+	aggs := map[string]*tally{}
+	keys := map[string]*tally{}
 	for _, f := range r.stateStore {
-		count[f.addr]++
-		if top == "" || count[f.addr] > count[top] {
-			top = f.addr
+		for _, t := range []struct {
+			m map[string]*tally
+			k string
+		}{{aggs, flowAggregate(f.addr)}, {keys, f.addr}} {
+			c := t.m[t.k]
+			if c == nil {
+				c = &tally{}
+				t.m[t.k] = c
+			}
+			c.n++
+			if f.expiry.After(c.newest) {
+				c.newest = f.expiry
+			}
 		}
 	}
-	r.evictOldestOfLocked(top)
+	heavier := func(a string, at *tally, b string, bt *tally) bool {
+		if at.n != bt.n {
+			return at.n > bt.n
+		}
+		if !at.newest.Equal(bt.newest) {
+			return at.newest.After(bt.newest)
+		}
+		return a < b
+	}
+	agg := ""
+	for k, t := range aggs {
+		if agg == "" || heavier(k, t, agg, aggs[agg]) {
+			agg = k
+		}
+	}
+	key := ""
+	for k, t := range keys {
+		if flowAggregate(k) != agg {
+			continue
+		}
+		if key == "" || heavier(k, t, key, keys[key]) {
+			key = k
+		}
+	}
+	r.evictOldestOfLocked(key)
+}
+
+// flowAggregate is the network a flow key belongs to for evictFairLocked: an
+// IPv4 key's /24, an IPv6 key's /48. Any other key is its own aggregate.
+func flowAggregate(key string) string {
+	if ip := net.ParseIP(key); ip != nil && ip.To4() != nil {
+		return ip.Mask(net.CIDRMask(24, 32)).String() + "/24"
+	}
+	if pfx, ok := strings.CutSuffix(key, "/64"); ok {
+		if ip := net.ParseIP(pfx); ip != nil {
+			return ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
+		}
+	}
+	return key
 }
 
 // flowAddrKey is the key the per-address bound counts by: an IPv4 address

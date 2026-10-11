@@ -30,6 +30,30 @@ func ParseTrustedProxies(cidrs []string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// PeerTrusted reports whether r's TCP peer is a listed trusted proxy.
+func PeerTrusted(r *http.Request, trusted []netip.Prefix) bool {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
+	}
+	return isTrusted(peer, trusted)
+}
+
+// hopAddr is an X-Forwarded-For hop's address: a bare address, or one with a
+// port ("1.2.3.4:5678", "[2001:db8::1]:443", which some load balancers emit),
+// the port dropped. Anything else ("unknown", an obfuscated name) is not an
+// address.
+func hopAddr(hop string) (netip.Addr, bool) {
+	hop = strings.TrimSpace(hop)
+	if a, err := netip.ParseAddr(hop); err == nil {
+		return a.Unmap(), true
+	}
+	if ap, err := netip.ParseAddrPort(hop); err == nil {
+		return ap.Addr().Unmap(), true
+	}
+	return netip.Addr{}, false
+}
+
 func isTrusted(addr string, trusted []netip.Prefix) bool {
 	a, err := netip.ParseAddr(strings.TrimSpace(addr))
 	if err != nil {
@@ -68,14 +92,17 @@ func ClientAddress(r *http.Request, trusted []netip.Prefix) string {
 		}
 	}
 	for i := len(hops) - 1; i >= 0; i-- {
-		if !isTrusted(hops[i], trusted) {
-			if a, err := netip.ParseAddr(hops[i]); err == nil {
-				return a.Unmap().String()
+		a, ok := hopAddr(hops[i])
+		if !ok || !isTrusted(a.String(), trusted) {
+			if ok {
+				return a.String()
 			}
 			// A hop that is not an address is the client's own claim: fall
 			// back to the trusted proxy that recorded it.
 			if i+1 < len(hops) {
-				return hops[i+1]
+				if a, ok := hopAddr(hops[i+1]); ok {
+					return a.String()
+				}
 			}
 			return peer
 		}
@@ -83,7 +110,9 @@ func ClientAddress(r *http.Request, trusted []netip.Prefix) string {
 	// Every hop is a trusted proxy (or there is no header): the left-most
 	// trusted hop, else the peer.
 	if len(hops) > 0 {
-		return hops[0]
+		if a, ok := hopAddr(hops[0]); ok {
+			return a.String()
+		}
 	}
 	return peer
 }

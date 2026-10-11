@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -83,6 +84,9 @@ type Server struct {
 	// https (from BeginOIDCLogin), so the callback knows which flow cookie
 	// to accept: the __Host- one for an https redirect, never a plain one.
 	oidcSecureRealms sync.Map // realm → bool
+
+	// lastUntrustedForwardWarn rate-limits warnUntrustedForwarding.
+	lastUntrustedForwardWarn atomic.Int64
 }
 
 // SetTrustedProxies sets the reverse proxies whose X-Forwarded-For header

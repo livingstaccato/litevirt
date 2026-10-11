@@ -68,6 +68,7 @@ func (s *Server) handleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 		s.renderLoginPage(w, page)
 		return
 	}
+	s.warnUntrustedForwarding(r)
 	resp, err := s.grpc.BeginOIDCLogin(r.Context(), &pb.BeginOIDCLoginRequest{
 		Realm: realm, Client: "web", ClientAddress: auth.ClientAddress(r, s.trustedProxies),
 	})
@@ -145,11 +146,19 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	realm := ""
 	for _, rn := range realms {
 		realm = rn
+		// The cookie's binding goes only to the realm the cookie names
+		// (re-review 2, M1): a plain cookie naming a loopback-http realm must
+		// not unlock another realm's flow. Every other realm gets no binding,
+		// so a flow it holds is still consumed (burned).
+		b := ""
+		if rn == cookieRealm {
+			b = binding
+		}
 		resp, err = s.grpc.Login(r.Context(), &pb.LoginRequest{
 			Realm:       rn,
 			OidcCode:    code,
 			OidcState:   state,
-			OidcBinding: binding,
+			OidcBinding: b,
 			UserAgent:   r.UserAgent(),
 		})
 		if !oidcStateUnknown(err) {
@@ -176,6 +185,31 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.finishLogin(w, r, resp)
+}
+
+// untrustedForwardWarnEvery rate-limits warnUntrustedForwarding.
+const untrustedForwardWarnEvery = 10 * time.Minute
+
+// warnUntrustedForwarding logs, at most once per untrustedForwardWarnEvery,
+// that a sign-in arrived with X-Forwarded-For from a peer not listed in
+// trusted_proxies (re-review 2, M2): a proxy in front of the UI that is not
+// listed makes every browser share the proxy's per-address bound. The
+// header itself is never believed from such a peer.
+func (s *Server) warnUntrustedForwarding(r *http.Request) {
+	if r.Header.Get("X-Forwarded-For") == "" || auth.PeerTrusted(r, s.trustedProxies) {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.lastUntrustedForwardWarn.Load()
+	if last != 0 && now-last < int64(untrustedForwardWarnEvery) {
+		return
+	}
+	if !s.lastUntrustedForwardWarn.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn("an OIDC sign-in arrived with X-Forwarded-For from a peer not in trusted_proxies: the header is "+
+		"ignored, so every browser behind that proxy shares its address's bound of in-progress sign-ins. If the "+
+		"peer is your reverse proxy, list it in trusted_proxies", "peer", auth.ClientAddress(r, nil))
 }
 
 // oidcStateUnknown reports a refusal because the realm holds no such flow.

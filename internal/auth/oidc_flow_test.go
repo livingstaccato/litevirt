@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -348,6 +349,77 @@ func TestOIDCBeginFlow_AFullStoreEvictsFairly(t *testing.T) {
 	}
 	if !redeemable(t, r, idp, victim) {
 		t.Fatal("the victim's single sign-in (the OLDEST flow) was evicted by another address's flood")
+	}
+}
+
+// TestOIDCBeginFlow_ASpreadNetworkCannotEvictAVictim (re-review 2, R1): a
+// flood that keeps every key at one flow, spread over one IPv6 /48 or one
+// IPv4 /24, counts as one heavy network when the realm is full, so a victim
+// from another network keeps its single sign-in.
+func TestOIDCBeginFlow_ASpreadNetworkCannotEvictAVictim(t *testing.T) {
+	for name, addr := range map[string]func(int) string{
+		"ipv6 /48": func(i int) string { return fmt.Sprintf("2001:db8:abcd:%x::1", i) },
+		"ipv4 /24": func(i int) string { return fmt.Sprintf("198.51.100.%d", i%250+1) },
+	} {
+		r, idp := newFlowRealm(t, nil)
+		r.maxFlows = 32
+		victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 4*r.maxFlows; i++ {
+			if _, err := r.BeginFlow(OIDCClientWeb, addr(i)); err != nil {
+				t.Fatalf("%s: begin %d: %v", name, i, err)
+			}
+		}
+		if !redeemable(t, r, idp, victim) {
+			t.Fatalf("%s: a flood of single-flow keys in one network evicted the victim", name)
+		}
+	}
+}
+
+// TestOIDCBeginFlow_ASpreadFloodCannotTargetASharedAddress (re-review 2, R1):
+// a NAT with two sign-ins in progress is the heaviest single key, so fair share
+// by key alone would evict it on every begin of a flood that keeps each of its
+// keys at one flow. Counted by network, the flood's /48 is the heaviest, and
+// both of the NAT's sign-ins survive.
+func TestOIDCBeginFlow_ASpreadFloodCannotTargetASharedAddress(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	r.maxFlows = 32
+	nat1, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	nat2, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	for i := 0; i < 4*r.maxFlows; i++ {
+		if _, err := r.BeginFlow(OIDCClientWeb, fmt.Sprintf("2001:db8:abcd:%x::1", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !redeemable(t, r, idp, nat1) || !redeemable(t, r, idp, nat2) {
+		t.Fatal("a flood spread across one /48 evicted a shared address's sign-ins")
+	}
+}
+
+// TestOIDCBeginFlow_TiesEvictTheNewest (re-review 2, R1): when the networks
+// tie, the one whose newest flow is the newest loses its oldest flow — a
+// flood hopping across networks one flow at a time evicts itself, not the
+// victim who began first.
+func TestOIDCBeginFlow_TiesEvictTheNewest(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	r.maxFlows = 2
+	victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		time.Sleep(time.Millisecond)
+		if _, err := r.BeginFlow(OIDCClientWeb, fmt.Sprintf("10.%d.0.1", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !redeemable(t, r, idp, victim) {
+		t.Fatal("a tie was broken against the oldest flow")
+	}
+	if a, b := flowAggregate("192.0.2.77"), flowAggregate("2001:db8:abcd:12::/64"); a != "192.0.2.0/24" || b != "2001:db8:abcd::/48" {
+		t.Fatalf("aggregates %q %q", a, b)
 	}
 }
 

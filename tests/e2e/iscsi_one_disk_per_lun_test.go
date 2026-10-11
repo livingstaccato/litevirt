@@ -3,6 +3,7 @@ package e2e
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,11 @@ import (
 // iscsi create is refused and the first deploy fails saying so. Once it has
 // run, the feature is used: a rollback below the release quarantines.
 //
+// A node whose open-iscsi default is CHAP (node.session.auth.authmethod =
+// CHAP in /etc/iscsi/iscsid.conf) can log in only to a CHAP target: the test
+// target then uses CHAP with E2E_ISCSI_CHAP_USER / E2E_ISCSI_CHAP_PASSWORD
+// (that default's credentials), and without them the test skips saying so.
+//
 // Run it with:
 //
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \
@@ -44,6 +50,30 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 	}
 	if out, err := l.ssh(h1, 20*time.Second, "command -v targetcli"); err != nil {
 		t.Skipf("%s has no targetcli to serve a test target: %s", h1, strings.TrimSpace(out))
+	}
+	// litevirt's iscsi pools carry no credentials: a node logs in with
+	// open-iscsi's own default. Where that default is CHAP (a lab whose
+	// shared target needs it), the test target is served with CHAP too, with
+	// the credentials E2E_ISCSI_CHAP_USER / E2E_ISCSI_CHAP_PASSWORD name —
+	// those of that default — or the test skips: a no-auth target cannot be
+	// logged in to with a CHAP default.
+	auth := "authentication=0"
+	var chapUser, chapPass string
+	for _, h := range []string{h1, h2} {
+		out, _ := l.ssh(h, 20*time.Second, iscsiCHAPDefaultProbe)
+		if strings.TrimSpace(out) != "chap" {
+			continue
+		}
+		user, pass := os.Getenv("E2E_ISCSI_CHAP_USER"), os.Getenv("E2E_ISCSI_CHAP_PASSWORD")
+		if user == "" || pass == "" {
+			t.Skipf("%s logs in to iSCSI targets with CHAP by default (node.session.auth.authmethod = CHAP in "+
+				"/etc/iscsi/iscsid.conf), and litevirt's iscsi pools carry no credentials of their own, so the "+
+				"test's no-auth target cannot be logged in to: set E2E_ISCSI_CHAP_USER and E2E_ISCSI_CHAP_PASSWORD "+
+				"to that default's node.session.auth.username and password to serve it with CHAP", h)
+		}
+		auth = "authentication=1"
+		chapUser, chapPass = user, pass
+		break
 	}
 	addr := l.mustSQL(h1, "SELECT address FROM hosts WHERE name = '"+h1+"' AND deleted_at IS NULL")
 	if len(addr) != 1 || addr[0][0] == "" {
@@ -64,7 +94,10 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		setup = append(setup, fmt.Sprintf("targetcli /iscsi/%s/tpg1/luns create /backstores/fileio/lve2e-%s-%d", iqn, suffix, i))
 	}
-	setup = append(setup, "targetcli /iscsi/"+iqn+"/tpg1 set attribute generate_node_acls=1 demo_mode_write_protect=0 authentication=0 cache_dynamic_acls=1")
+	setup = append(setup, "targetcli /iscsi/"+iqn+"/tpg1 set attribute generate_node_acls=1 demo_mode_write_protect=0 "+auth+" cache_dynamic_acls=1")
+	if chapUser != "" {
+		setup = append(setup, "targetcli /iscsi/"+iqn+"/tpg1 set auth userid="+shellQuote(chapUser)+" password="+shellQuote(chapPass))
+	}
 	l.mustSSH(h1, 2*time.Minute, strings.Join(setup, " && "))
 	t.Cleanup(func() {
 		l.ssh(h1, time.Minute, fmt.Sprintf(
@@ -148,3 +181,8 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 		t.Errorf("a shared_lun condition stands: %v", rows)
 	}
 }
+
+// iscsiCHAPDefaultProbe prints "chap" when the node's open-iscsi default
+// session auth method is CHAP.
+const iscsiCHAPDefaultProbe = `grep -Eiq '^[[:space:]]*node\.session\.auth\.authmethod[[:space:]]*=[[:space:]]*CHAP' ` +
+	`/etc/iscsi/iscsid.conf 2>/dev/null && echo chap || echo none`

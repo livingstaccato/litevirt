@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,10 +28,11 @@ func TestKeepCapabilityLabels_HealsALabelThatDidNotLand(t *testing.T) {
 	labels := []capabilityLabel{{key: corrosion.LabelLXCCapable, capable: func() bool { return true }}}
 
 	// The start-time assert finds no host row: nothing is written.
-	if _, err := assertCapabilityLabels(ctx, db, "node-1", labels); err != nil {
+	asserted, err := assertCapabilityLabels(ctx, db, "node-1", labels)
+	if err != nil {
 		t.Fatalf("assert with no host row: %v", err)
 	}
-	go keepCapabilityLabels(ctx, db, "node-1", labels, 10*time.Millisecond)
+	go keepCapabilityLabels(ctx, db, "node-1", labels, asserted, 10*time.Millisecond)
 
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "node-1", Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443, State: "active",
@@ -87,10 +89,11 @@ func TestKeepCapabilityLabels_RepublishesEveryLabelAfterAReadmission(t *testing.
 		{key: corrosion.LabelTPMCapable, capable: yes},
 		{key: corrosion.LabelSecureBootCapable, capable: yes},
 	}
-	if _, err := assertCapabilityLabels(ctx, db, "node-1", labels); err != nil {
+	asserted, err := assertCapabilityLabels(ctx, db, "node-1", labels)
+	if err != nil {
 		t.Fatalf("start-time assert: %v", err)
 	}
-	go keepCapabilityLabels(ctx, db, "node-1", labels, 10*time.Millisecond)
+	go keepCapabilityLabels(ctx, db, "node-1", labels, asserted, 10*time.Millisecond)
 
 	// The re-admitted row wins: its labels are reset.
 	if err := db.Execute(ctx, `UPDATE hosts SET labels = NULL WHERE name = 'node-1'`); err != nil {
@@ -107,5 +110,65 @@ func TestKeepCapabilityLabels_RepublishesEveryLabelAfterAReadmission(t *testing.
 			t.Fatalf("node-1's capability labels did not come back after its labels were reset: %+v, err %v", h, err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// An operator who sets a capability label to a value other than the one this
+// daemon published (`lv host label node-1 litevirt.tpm=false` to keep vTPM
+// VMs off a host) has overridden it: the keeper leaves it alone, where a value
+// it published itself follows the runtime (a runtime installed or removed
+// while the daemon runs).
+//
+// Mutations: the keeper overwrites any differing value — red on the override;
+// the keeper only ever adds a missing label — red on the runtime change.
+func TestKeepCapabilityLabels_KeepsAnOperatorOverrideAndFollowsItsOwnValue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "node-1", Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443, State: "active",
+	}); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+	var lxcOn atomic.Bool
+	lxcOn.Store(true)
+	yes := func() bool { return true }
+	labels := []capabilityLabel{
+		{key: corrosion.LabelLXCCapable, capable: lxcOn.Load},
+		{key: corrosion.LabelTPMCapable, capable: yes},
+	}
+	asserted, err := assertCapabilityLabels(ctx, db, "node-1", labels)
+	if err != nil {
+		t.Fatalf("start-time assert: %v", err)
+	}
+	// The operator's override, made after the start-time assert.
+	if err := corrosion.SetHostLabel(ctx, db, "node-1", corrosion.LabelTPMCapable, "false"); err != nil {
+		t.Fatal(err)
+	}
+	go keepCapabilityLabels(ctx, db, "node-1", labels, asserted, 10*time.Millisecond)
+
+	// The runtime goes away while the daemon runs: the value it published follows.
+	lxcOn.Store(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h, err := corrosion.GetHost(ctx, db, "node-1")
+		if err == nil && h != nil && h.Labels[corrosion.LabelLXCCapable] == "false" {
+			if got := h.Labels[corrosion.LabelTPMCapable]; got != "false" {
+				t.Fatalf("the operator's %s=false was overwritten with %q", corrosion.LabelTPMCapable, got)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not follow the runtime going away: %+v, err %v", corrosion.LabelLXCCapable, h, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// And a while later the override still stands.
+	time.Sleep(100 * time.Millisecond)
+	if h, err := corrosion.GetHost(ctx, db, "node-1"); err != nil || h == nil || h.Labels[corrosion.LabelTPMCapable] != "false" {
+		t.Fatalf("the operator's override did not stand: %+v, err %v", h, err)
 	}
 }

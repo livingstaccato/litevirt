@@ -1097,8 +1097,11 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				pk := pkKeyAt(row, pkIdx)
 				c.deferAfterCommit(tx, func() {
 					c.observeMergeRejected("hosts", "ae", reason)
-					slog.Warn("anti-entropy: kept the re-admitted host row. "+hostsIncarnationAdvice,
-						"table", "hosts", "pk", pk, "reason", reason)
+					if c.incarnationRefusals.allow(pk, time.Now()) {
+						slog.Warn("anti-entropy: kept the re-admitted host row. "+hostsIncarnationAdvice,
+							"table", "hosts", "pk", pk, "reason", reason,
+							"next_report_after", refusalLogInterval)
+					}
 				})
 				continue
 			}

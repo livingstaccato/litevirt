@@ -196,8 +196,8 @@ func ruleTimestampMax(col string) tieRule {
 }
 
 // ruleIncarnation: two live hosts rows of different incarnations — one's
-// created_at earlier than the whole second of the other's fixed-width one
-// (olderIncarnation, host_incarnation_floor.go) — go to the later
+// created_at earlier than the other's fixed-width one by more than the HLC's
+// skew (olderIncarnation, host_incarnation_floor.go) — go to the later
 // incarnation. Anything else passes.
 func ruleIncarnation() tieRule {
 	return func(rv rowView) tieDecision {

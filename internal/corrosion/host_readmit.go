@@ -309,8 +309,11 @@ func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string
 // what it does with a stamped row depends on which build it is:
 //   - a build that carries the re-admission reset (f3126912) but not the stamp
 //     holds, after the re-admission and every write since, the same row as a
-//     stamping node except for created_at. Its chain reaches content-max over
-//     the two and picks the stamped row: the canonical encoding length-prefixes
+//     stamping node except for created_at — unless it pulled the stale row
+//     whole (it has no merge floor), in which case control-plane columns
+//     differ and its chain leaves the tie unresolved until it is upgraded.
+//     Where the rows otherwise agree, its chain reaches content-max over the
+//     two and picks the stamped row: the canonical encoding length-prefixes
 //     each value, and the stamp's 30 characters order after the 20 of an
 //     older build's InsertHost (whole-second RFC3339), while two fixed-width
 //     values order as time does;

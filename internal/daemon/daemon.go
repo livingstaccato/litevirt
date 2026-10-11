@@ -1448,10 +1448,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
 	}
-	if set, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels); err != nil {
-		slog.Warn("set capability host labels failed; retrying in the background", "labels", set, "error", err)
+	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
+	if err != nil {
+		slog.Warn("set capability host labels failed; retrying in the background", "labels", asserted, "error", err)
+		asserted = nil // nothing this daemon published stands on the row yet
 	}
-	go keepCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels, capabilityLabelInterval)
+	go keepCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels, asserted, capabilityLabelInterval)
 
 	// Container reconciler + restart engine: every cycle, sync each locally-owned
 	// container's cluster row to the LXC runtime's reality and auto-restart one

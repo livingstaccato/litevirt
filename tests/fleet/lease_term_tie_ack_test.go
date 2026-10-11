@@ -77,9 +77,9 @@ func TestFleet_LeaseTermTieAck_StaysAcknowledgedAndReadsConverged(t *testing.T) 
 	}
 
 	// The operator acknowledges on each host, as the condition tells them to,
-	// with a bearer. (The refusal of a PEER certificate is pinned in grpcapi,
-	// TestAcknowledgeLeaseTermTie_RefusesAPeer: every fleet node dials from
-	// loopback, where a host certificate classifies as the on-node root.)
+	// with a bearer. (The refusal of a PEER certificate is pinned by
+	// TestFleet_PeerIdentity_APeerCannotAcknowledgeALeaseTermTie and, in
+	// grpcapi, TestAcknowledgeLeaseTermTie_RefusesAPeer.)
 	// One operator per host, minted there: the contested table never
 	// converges, so waiting for a token to replicate would wait forever.
 	for _, n := range c.Nodes {

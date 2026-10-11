@@ -87,8 +87,10 @@ func TestFleet_ResetAdminIsAuditedAndVerifiesEverywhere(t *testing.T) {
 }
 
 // TestFleet_ResetAdminRefusesAnyoneButLocalRoot: over the real stack, a peer's
-// certificate — even arriving on loopback, as every fleet peer does — and an
-// admin session are refused, and nothing is reset.
+// certificate and an admin session are refused, and nothing is reset. (The
+// peer here names another host, so the name check refuses it as well as the
+// transport check; TestFleet_PeerIdentity_AHostKeyFromOffTheBoxCannotResetAdmin
+// reaches the transport check alone.)
 func TestFleet_ResetAdminRefusesAnyoneButLocalRoot(t *testing.T) {
 	c := New(t, Options{Nodes: 2})
 	ctx := context.Background()

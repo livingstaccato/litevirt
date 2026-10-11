@@ -204,6 +204,8 @@ type Cluster struct {
 	// (replicated_shapes.go).
 	shapesChecked       bool
 	unregisteredAllowed string
+	// remote marks the connections RemoteClient dialled (peer_identity.go).
+	remote remoteMarks
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -915,6 +917,8 @@ func (c *Cluster) buildServer(n *Node) {
 	if err != nil {
 		c.t.Fatalf("server TLS for %s: %v", n.Name, err)
 	}
+	// A peer's connection is presented with the peer's network address, not
+	// loopback, before anything reads it (peer_identity.go).
 	// Auth interceptors mirror the daemon's wiring — without them
 	// authenticate() never runs and every RPC fails RequireRole.
 	// With no bearer token in metadata the auth path treats the
@@ -934,8 +938,8 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	srv := grpc.NewServer(append(trackOpts,
 		grpc.Creds(creds),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
-		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
+		grpc.ChainUnaryInterceptor(n.peerAddrUnaryInterceptor, n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
+		grpc.ChainStreamInterceptor(n.peerAddrStreamInterceptor, n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
 	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv

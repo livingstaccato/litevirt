@@ -402,17 +402,51 @@ func TestRedfishFence_DeletesOnlyItsOwnSession(t *testing.T) {
 		"/redfish/v1/SessionService/Sessions",
 		"/redfish/v1/SessionService/Sessions/../../Systems/node-1",
 		"/redfish/v1/SessionService/SessionsX/1",
+		// Encoded escapes: one segment lexically, outside once decoded.
+		"/redfish/v1/SessionService/Sessions/%2e%2e",
+		"/redfish/v1/SessionService/Sessions/%2E%2E%2FSystems%2Fnode-1",
+		"/redfish/v1/SessionService/Sessions/..%2fSystems%2fnode-1",
+		"/redfish/v1/SessionService/Sessions/a%2f..%2f..",
+		"/redfish/v1/SessionService/Sessions/a%5c..%5c..",
+		"/redfish/v1/SessionService/Sessions/./1",
 	} {
-		shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
-		b := newFakeBMC(t)
-		b.sessionRef = ref
-		if r := Execute(context.Background(), b.host(b.config())); !r.Success {
-			t.Fatalf("%s: fence = %+v", ref, r)
-		}
-		for _, req := range b.requestLog() {
-			if strings.HasPrefix(req, "DELETE ") {
-				t.Errorf("session named %q: the fence sent %s", ref, req)
+		// From Location, and from the login body alone (no Location): each
+		// source is checked on its own.
+		for _, noLoc := range []bool{false, true} {
+			shrinkVerifyKnobs(t, 2*time.Second, 20*time.Millisecond)
+			b := newFakeBMC(t)
+			b.sessionRef = ref
+			b.noLocation = noLoc
+			if r := Execute(context.Background(), b.host(b.config())); !r.Success {
+				t.Fatalf("%s (noLocation %v): fence = %+v", ref, noLoc, r)
 			}
+			for _, req := range b.requestLog() {
+				if strings.HasPrefix(req, "DELETE ") {
+					t.Errorf("session named %q (noLocation %v): the fence sent %s", ref, noLoc, req)
+				}
+			}
+		}
+	}
+}
+
+// sessionMember accepts exactly a direct child of the collection.
+func TestSessionMember(t *testing.T) {
+	const coll = "/redfish/v1/SessionService/Sessions"
+	for p, want := range map[string]bool{
+		coll + "/abc":         true,
+		coll + "/abc/":        true,
+		coll + "/a%20b":       true,
+		coll:                  false,
+		coll + "/":            false,
+		coll + "/a/b":         false,
+		coll + "/%2e%2e":      false,
+		coll + "/..%2Fx":      false,
+		coll + "/a%5Cb":       false,
+		coll + "/../Sessions": false,
+		coll + "X/1":          false,
+	} {
+		if got := sessionMember(coll, p); got != want {
+			t.Errorf("sessionMember(%q) = %v, want %v", p, got, want)
 		}
 	}
 }

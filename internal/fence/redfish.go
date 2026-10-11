@@ -368,12 +368,27 @@ func (c *redfishClient) open(ctx context.Context) (string, error) {
 	return systems, nil
 }
 
-// sessionMember reports whether p names one member of the Sessions
-// collection at coll: coll + "/" + a single non-empty segment.
+// sessionMember reports whether p (an escaped path) names one member of the
+// Sessions collection at coll: coll + "/" + a single segment. It judges the
+// DECODED path, since a BMC or proxy that decodes before routing would act on
+// that: any encoded dot, slash or backslash is refused outright, and the
+// unescaped, cleaned path must be a direct child of the collection with no
+// dot-segment along the way.
 func sessionMember(coll, p string) bool {
-	rest, ok := strings.CutPrefix(p, strings.TrimSuffix(coll, "/")+"/")
-	rest = strings.TrimSuffix(rest, "/")
-	return ok && rest != "" && !strings.Contains(rest, "/") && rest != ".." && rest != "."
+	low := strings.ToLower(p)
+	for _, enc := range []string{"%2e", "%2f", "%5c"} {
+		if strings.Contains(low, enc) {
+			return false
+		}
+	}
+	dp, err := url.PathUnescape(p)
+	if err != nil || strings.Contains(dp, "\\") {
+		return false
+	}
+	dp = strings.TrimSuffix(dp, "/")
+	clean := path.Clean(dp)
+	base := path.Clean(coll)
+	return clean == dp && clean != base && path.Dir(clean) == base
 }
 
 // logout deletes the session, if there is one. Best effort, but it runs even

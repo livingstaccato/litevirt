@@ -265,7 +265,7 @@ func (s *Server) ensureCephSecretsForVM(ctx context.Context, vm *corrosion.VMRec
 	wg.Wait()
 	for i, p := range probes {
 		if errs[i] == nil && p.key != "" {
-			s.cephProofs.put(p.key)
+			s.cephProofs.provedFor(vm.Name, p.key)
 		}
 	}
 	// What an operator must fix is reported first: retrying cannot clear it.
@@ -359,7 +359,10 @@ func (s *Server) cephStartPlan(ctx context.Context, vm *corrosion.VMRecord, sour
 			continue
 		}
 		key := cephProofKey(cfg, l.Pool)
-		if key != "" && s.cephProofs.fresh(key) {
+		// A proven key skips the probe — unless this VM's own probe through
+		// it got no answer: another VM's proof says nothing about this VM's
+		// image (Breaker R-1).
+		if key != "" && s.cephProofs.fresh(key) && !s.cephProofs.ownFailed(vm.Name, key) {
 			continue
 		}
 		probes = append(probes, cephProbe{disk: d.DiskName, path: d.Path, prober: p, key: key})

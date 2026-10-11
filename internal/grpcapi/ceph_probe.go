@@ -52,6 +52,32 @@ type cephKeyProofs struct {
 	// failed: cephProofKey → the last probe through it that got no answer,
 	// and the VM it was for.
 	failed map[string]cephProbeFailure
+	// own: VM + cephProofKey → when that VM's OWN probe through the key got
+	// no answer. A proof of the key another VM's probe made says nothing
+	// about this VM's image (an inactive PG under it), so it does not skip
+	// this VM's probe while the record lasts (cephKeyProofTTL); only this
+	// VM's own answered probe clears it (Breaker R-1).
+	own map[string]time.Time
+}
+
+func ownKey(vm, key string) string { return vm + "\x00" + key }
+
+// ownFailed reports whether vm's own probe through key got no answer within
+// cephKeyProofTTL.
+func (c *cephKeyProofs) ownFailed(vm, key string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.own[ownKey(vm, key)]
+	return ok && cephProofNow().Sub(t) < cephKeyProofTTL
+}
+
+// provedFor records vm's own answered probe through key: the key is proven,
+// and vm's own failure record is gone.
+func (c *cephKeyProofs) provedFor(vm, key string) {
+	c.put(key)
+	c.mu.Lock()
+	delete(c.own, ownKey(vm, key))
+	c.mu.Unlock()
 }
 
 type cephProbeFailure struct {
@@ -87,6 +113,15 @@ func (c *cephKeyProofs) fail(key, vm string) {
 	for k, f := range c.failed {
 		if now.Sub(f.at) >= cephKeyFailTTL {
 			delete(c.failed, k)
+		}
+	}
+	if c.own == nil {
+		c.own = map[string]time.Time{}
+	}
+	c.own[ownKey(vm, key)] = now
+	for k, t := range c.own {
+		if now.Sub(t) >= cephKeyProofTTL {
+			delete(c.own, k)
 		}
 	}
 }
@@ -359,6 +394,11 @@ func (s *Server) judgeCephTrash(ctx context.Context) {
 		case storage.CephPurgeHeld, storage.CephPurgeHalfMoved:
 			l.State, l.ByHand = p.State, "rbd trash restore "+p.TrashRef()
 			held++
+		case storage.CephPurgeMoving:
+			// A move whose outcome is not settled: the image may still be
+			// live under its name. Only the check, never a removal.
+			l.State, l.ByHand = "settling", "rbd trash ls --all --long "+p.Pool+"; rbd info "+p.Pool+"/"+p.Image
+			held++
 		default:
 			l.State, l.ByHand = "purge_failing", "rbd trash rm "+p.TrashRef()
 			retrying++
@@ -367,12 +407,13 @@ func (s *Server) judgeCephTrash(ctx context.Context) {
 	}
 	for _, e := range untracked {
 		list = append(list, leftover{Trash: e.TrashRef(), Image: e.Pool + "/" + e.Name, State: "untracked",
-			LastError: fmt.Sprintf("in the trash (source %s) and tracked by no purge on %s; another host may still be purging it", e.Source, s.hostName),
-			ByHand:    "rbd trash restore " + e.TrashRef() + "  (or: rbd trash rm " + e.TrashRef() + ")"})
+			LastError: fmt.Sprintf("in the trash (source %s) and tracked by no purge on %s: another host may still be purging it, or hold it because a client has it open; "+
+				"restoring it is never destructive, removing it may be", e.Source, s.hostName),
+			ByHand: "rbd trash restore " + e.TrashRef()})
 	}
 	ev, _ := json.Marshal(map[string]any{
 		"host": s.hostName, "leftovers": list, "unreadable_queue_files": aside,
-		"detail": fmt.Sprintf("in the ceph pools' trash: %d image(s) moved there by %s and not purged yet (retried), %d held because a client may still use them (restore them), "+
+		"detail": fmt.Sprintf("in the ceph pools' trash: %d image(s) moved there by %s and not purged yet (retried), %d held, or not yet settled, because a client may still use them (check, then restore them), "+
 			"%d litevirt image(s) no purge here tracks; and %d purge queue file(s) set aside as unreadable, whose images are no longer tracked (check the pools' trash with rbd trash ls --all --long)",
 			retrying, s.hostName, held, len(untracked), len(aside)),
 	})

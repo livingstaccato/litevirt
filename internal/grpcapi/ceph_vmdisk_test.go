@@ -53,6 +53,12 @@ type cephWorld struct {
 	watchers map[string]bool
 	// probeLeft: the time each probe's context had left when it ran.
 	probeLeft []time.Duration
+	// downImages: images whose probe gets no answer (an inactive PG under
+	// them), while the rest of their pool answers.
+	downImages map[string]bool
+	// trashMvExit / trashLsExit make `rbd trash mv` / `rbd trash ls` fail
+	// with that status.
+	trashMvExit, trashLsExit int
 }
 
 // cephExit is a failed rbd command as exec reports it (rbd exits with the errno).
@@ -99,6 +105,11 @@ func (w *cephWorld) run(ctx context.Context, name string, args ...string) ([]byt
 		for _, a := range args {
 			if p, _, ok := strings.Cut(a, "/"); ok && w.down[p] {
 				down = true
+			}
+			if w.downImages[a] {
+				w.calls = append(w.calls, "info (no answer)")
+				w.mu.Unlock()
+				return []byte("rbd: error opening image: (110) Connection timed out"), cephExit(110)
 			}
 		}
 		w.mu.Unlock()
@@ -183,6 +194,9 @@ func (w *cephWorld) run(ctx context.Context, name string, args ...string) ([]byt
 		}
 		return []byte(`{"watchers":[]}`), nil
 	case "trash mv":
+		if w.trashMvExit != 0 {
+			return []byte("rbd: injected trash mv failure"), cephExit(w.trashMvExit)
+		}
 		if _, ok := w.images[pos[0]]; !ok {
 			return missing, cephExit(2)
 		}
@@ -203,6 +217,9 @@ func (w *cephWorld) run(ctx context.Context, name string, args ...string) ([]byt
 		}
 		delete(w.trash, pos[0])
 	case "trash ls":
+		if w.trashLsExit != 0 {
+			return []byte("rbd: injected trash ls failure"), cephExit(w.trashLsExit)
+		}
 		// 19.2.3: `source` only with --long.
 		long := slices.Contains(words, "--long")
 		var entries []string

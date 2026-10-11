@@ -88,6 +88,9 @@ const (
 	// cephPurgeMoving: a `rbd trash mv` is running, or was interrupted; its
 	// outcome is settled by the image's id (settleMove).
 	cephPurgeMoving = "moving"
+	// CephPurgeMoving is cephPurgeMoving, for those naming such an entry:
+	// the image may still be live under its name.
+	CephPurgeMoving = cephPurgeMoving
 )
 
 // CephPurge is an rbd image moved to its pool's trash that this host still

@@ -1791,10 +1791,17 @@ by hand (`by_hand`):
   and under its name. It is never purged. Check it with
   `rbd trash ls --all --long <pool>` and `rbd info <pool>/<image>`, then restore
   it.
+- `settling`: a `rbd trash mv` failed and the trash or the image could not be
+  read to settle what it did, so the image may still be live under its name.
+  It is retried. Check it with `rbd trash ls --all --long <pool>` and
+  `rbd info <pool>/<image>`; litevirt advises no removal.
 - `untracked`: a litevirt-named image in a ceph pool's trash that no purge on
   this host tracks, seen by two scans in a row (every 5 minutes). Causes: an
-  interrupted `rbd rm`, a crash that lost the queue, or another host's purge
-  still running. Restore it, or remove it with `rbd trash rm`.
+  interrupted `rbd rm`, a crash that lost the queue, another host's purge
+  still running, or another host holding it because a client has it open.
+  Restoring it (`rbd trash restore <pool>/<id>`) is never destructive;
+  removing it may be, so litevirt advises only the restore. Remove it by hand
+  only once the host that put it there no longer names it.
 
 `unreadable_queue_files` names purge queue files found unreadable and moved
 aside (`<data_dir>/ceph-trash-purges.json.unreadable-<time>`). The purges they

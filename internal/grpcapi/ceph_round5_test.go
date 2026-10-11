@@ -301,3 +301,85 @@ func TestCephTrashLeftover_NamesHeldSetAsideAndUntracked(t *testing.T) {
 		t.Fatalf("evidence %s, want the untracked lv/0dd1 (web-data) named", row.Evidence)
 	}
 }
+
+// Breaker R-1. A key another VM's probe proved says nothing about the image
+// whose own probe got no answer (an inactive PG under it): that VM is probed
+// again — never started on the other VM's proof, where qemu's open of its
+// image would hang the start.
+func TestPrepareHardwareForStart_AnotherVMsProofDoesNotSkipAFailedVMsProbe(t *testing.T) {
+	f := newCephPoolFixture(t)
+	x := f.insertPoolVM(t, "x-db", "ceph", "lv", "stopped")
+	y := f.insertPoolVM(t, "y-web", "ceph", "lv", "stopped")
+	f.world.downImages = map[string]bool{"lv/x-db-root": true}
+	if _, err := f.s.PrepareHardwareForStart(health.WithWalkProbeTurn(context.Background()), &x); !errors.Is(err, health.ErrStartProbeFailed) {
+		t.Fatalf("x, whose image does not answer: %v, want ErrStartProbeFailed", err)
+	}
+	if _, err := f.s.PrepareHardwareForStart(context.Background(), &y); err != nil {
+		t.Fatalf("y, on the same key: %v", err)
+	}
+	before := f.world.probes()
+	_, err := f.s.PrepareHardwareForStart(health.WithWalkProbeTurn(context.Background()), &x)
+	if f.world.probes() != before+1 || !errors.Is(err, health.ErrStartProbeFailed) {
+		t.Fatalf("x after y proved the key: %v, %d new probes; want x probed itself and deferred, not started on y's proof", err, f.world.probes()-before)
+	}
+	// Once x's own image answers (an operator's start, which always
+	// probes), x starts, and the remembered proof covers it again.
+	f.world.downImages = nil
+	if _, err := f.s.PrepareHardwareForStart(context.Background(), &x); err != nil {
+		t.Fatalf("x once its image answers: %v", err)
+	}
+	before = f.world.probes()
+	if _, err := f.s.PrepareHardwareForStart(health.WithWalkProbeTurn(context.Background()), &x); err != nil || f.world.probes() != before {
+		t.Fatalf("x again: %v, %d probes; want the proof to cover it once its own probe succeeded", err, f.world.probes()-before)
+	}
+}
+
+// Breaker R-2/R-4. ceph_trash_leftover never advises `rbd trash rm` for an
+// entry this host cannot vouch for: an untracked one (another host may hold
+// it for a client that has it open) gets only `rbd trash restore`, and a move
+// whose outcome is not settled (the image may still be live under its name)
+// gets only the check to run.
+func TestCephTrashLeftover_NoRemoveAdviceForUntrackedOrUnsettled(t *testing.T) {
+	f := newCephPoolFixture(t)
+	ctx := context.Background()
+	vm := f.insertCephVM(t, "unsettled", "test-host")
+	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, vm.Name)
+	f.world.trashMvExit, f.world.trashLsExit = 110, 110
+	if err := f.s.deleteRecordedVMDiskVolumeRecords(ctx, vm.Name, disks); err == nil {
+		t.Fatal("a move that could not be settled reported success")
+	}
+	storage.RunCephPurgesOnceForTest() // still cannot settle it
+	f.world.trashLsExit = 0
+	f.world.mu.Lock()
+	f.world.trash["lv/0dd1"] = "web-data"
+	f.world.mu.Unlock()
+	f.s.ScanCephTrash(ctx)
+	f.s.ScanCephTrash(ctx)
+	f.s.judgeCephTrash(ctx)
+	row, found, err := corrosion.GetHealthCondition(ctx, f.s.db, cephPoolEvaluator, condCephTrashLeftover, "host", "test-host")
+	if err != nil || !found {
+		t.Fatalf("condition %+v %v %v", row, found, err)
+	}
+	var ev struct {
+		Leftovers []struct {
+			Trash, Image, State string
+			ByHand              string `json:"by_hand"`
+		} `json:"leftovers"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, l := range ev.Leftovers {
+		if strings.Contains(l.ByHand, "trash rm") {
+			t.Errorf("%s (%s) is advised %q", l.Trash, l.State, l.ByHand)
+		}
+		got[l.State] = l.ByHand
+	}
+	if want := "rbd trash restore lv/0dd1"; got["untracked"] != want {
+		t.Errorf("untracked by_hand %q, want %q", got["untracked"], want)
+	}
+	if want := "rbd trash ls --all --long lv; rbd info lv/unsettled-data"; got["settling"] != want {
+		t.Errorf("settling by_hand %q, want %q (evidence %s)", got["settling"], want, row.Evidence)
+	}
+}

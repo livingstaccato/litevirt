@@ -127,7 +127,8 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 
 	g := &recordingGate{}
 	s := &Server{gate: g}
-	for i := 0; i < 10; i++ {
+	// One still-unlatched token per cycle: give every mandatory token a turn.
+	for i := 0; i < 2*len(capabilities.Supported()); i++ {
 		s.driveCapabilityActivation(context.Background())
 	}
 	got := g.drivenUnique()

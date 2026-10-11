@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
@@ -76,11 +76,7 @@ func GenerateRenewalCSR(pkiDir, cn string) (string, []byte, error) {
 	if err := os.MkdirAll(hostDir(pkiDir), 0o700); err != nil {
 		return "", nil, err
 	}
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		return "", nil, err
-	}
-	id := hex.EncodeToString(buf)
+	id := randid.New()
 	dir := filepath.Join(hostDir(pkiDir), stagingPrefix+id)
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return "", nil, err

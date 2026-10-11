@@ -207,39 +207,47 @@ func peerAt(ip string) context.Context {
 	return peer.NewContext(context.Background(), &peer.Peer{Addr: tcpAddr(ip)})
 }
 
-// TestBeginOIDCLogin_BoundPerClientAddress (review I1): a remote caller is
-// bounded by its own address whatever client_address it claims; this node's
-// own loopback callers (the UI, the REST gateway) pass the end client's
-// address, so one browser's flood leaves another browser able to begin.
+// beginAt begins a web flow on s as peer, naming claimed as the client
+// address, and returns a function reporting whether the flow is still held.
+func beginAt(t *testing.T, s *Server, idp *oidctest.Provider, peerIP, claimed string) func() bool {
+	t.Helper()
+	b, err := s.BeginOIDCLogin(peerAt(peerIP), &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: claimed})
+	if err != nil {
+		t.Fatalf("BeginOIDCLogin from %s: %v", peerIP, err)
+	}
+	return func() bool {
+		resp, err := idp.BrowserClient().Get(b.AuthUrl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		_, err = s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp",
+			OidcCode: loc.Query().Get("code"), OidcState: b.State, OidcBinding: b.Binding})
+		return err == nil
+	}
+}
+
+// TestBeginOIDCLogin_BoundPerClientAddress (review I1, re-review N1): a
+// remote caller is bounded by its own address whatever client_address it
+// claims, so its own earlier flow is what its flood evicts; this node's
+// loopback callers (the UI, the REST gateway) name the end client, so one
+// browser's flood leaves another browser's sign-in alone. Nothing refuses.
 func TestBeginOIDCLogin_BoundPerClientAddress(t *testing.T) {
-	s, _ := oidcServer(t)
-	remote := peerAt("10.0.0.9")
-	for i := 0; ; i++ {
-		_, err := s.BeginOIDCLogin(remote, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: fmt.Sprintf("192.0.2.%d", i)})
-		if err != nil {
-			wantCode(t, "a remote flood", err, codes.ResourceExhausted)
-			if i == 0 || i > 64 {
-				t.Fatalf("the remote address was refused after %d begins", i)
-			}
-			break
-		}
-		if i > 64 {
-			t.Fatal("a remote caller rotating client_address was never bounded")
-		}
+	s, idp := oidcServer(t)
+	own := beginAt(t, s, idp, "10.0.0.9", "192.0.2.1")
+	for i := 0; i < 40; i++ {
+		beginAt(t, s, idp, "10.0.0.9", fmt.Sprintf("192.0.2.%d", i+2))
 	}
-	ui := peerAt("127.0.0.1")
-	for i := 0; ; i++ {
-		_, err := s.BeginOIDCLogin(ui, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: "198.51.100.66"})
-		if err != nil {
-			wantCode(t, "one browser's flood through the UI", err, codes.ResourceExhausted)
-			break
-		}
-		if i > 64 {
-			t.Fatal("one browser through the UI was never bounded")
-		}
+	if own() {
+		t.Fatal("a remote caller rotating client_address was not bounded by its own address")
 	}
-	if _, err := s.BeginOIDCLogin(ui, &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: "203.0.113.1"}); err != nil {
-		t.Fatalf("another browser through the UI after the flood: %v", err)
+	victim := beginAt(t, s, idp, "127.0.0.1", "203.0.113.1")
+	for i := 0; i < 40; i++ {
+		beginAt(t, s, idp, "127.0.0.1", "198.51.100.66")
+	}
+	if !victim() {
+		t.Fatal("one browser's flood through the UI evicted another browser's sign-in")
 	}
 }
 

@@ -73,8 +73,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +87,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // Server is the REST gateway.
@@ -94,7 +95,14 @@ type Server struct {
 	grpc  pb.LiteVirtClient
 	token string // optional static bearer token for auth
 	mux   *http.ServeMux
+	// trustedProxies are the reverse proxies whose X-Forwarded-For names the
+	// client (auth.ClientAddress); empty = the TCP peer, always.
+	trustedProxies []netip.Prefix
 }
+
+// SetTrustedProxies sets the reverse proxies whose X-Forwarded-For header
+// names the client (config trusted_proxies).
+func (s *Server) SetTrustedProxies(p []netip.Prefix) { s.trustedProxies = p }
 
 // maxRequestBodyBytes is deliberately larger than ordinary API payloads while
 // keeping authenticated clients from using JSON decoding as an unbounded
@@ -1118,11 +1126,9 @@ func (s *Server) handleOIDCBegin(w http.ResponseWriter, r *http.Request) {
 	}
 	// The daemon bounds in-progress logins per client address and takes this
 	// gateway's word for it (it is a loopback caller); the address is the
-	// HTTP peer's, never the body's.
-	req.ClientAddress = r.RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		req.ClientAddress = host
-	}
+	// HTTP peer's (or, from a trusted proxy, the forwarded client's), never
+	// the body's.
+	req.ClientAddress = auth.ClientAddress(r, s.trustedProxies)
 	resp, err := s.grpc.BeginOIDCLogin(s.grpcCtx(r), &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)

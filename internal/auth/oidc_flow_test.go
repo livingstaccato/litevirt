@@ -286,55 +286,88 @@ func TestOIDCAuthenticate_MultiAudienceNeedsAZP(t *testing.T) {
 	}
 }
 
-// TestOIDCBeginFlow_OneAddressCannotFillTheStore: beginning a flow needs no
-// credential. One address is bounded on its own, so its flood leaves another
-// address able to begin (review I1).
-func TestOIDCBeginFlow_OneAddressCannotFillTheStore(t *testing.T) {
-	r, _ := newFlowRealm(t, nil)
-	r.maxFlowsPerAddr = 3
-	for i := 0; i < 3; i++ {
-		if _, err := r.BeginFlow(OIDCClientWeb, "198.51.100.66"); err != nil {
-			t.Fatal(err)
-		}
+// redeemable reports whether start's flow is still held: it plays the IdP and
+// redeems it.
+func redeemable(t *testing.T, r *OIDCRealm, idp *oidctest.Provider, start OIDCFlowStart) bool {
+	t.Helper()
+	back := visit(t, idp, start.AuthURL)
+	_, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding})
+	if err != nil && !errors.Is(err, ErrOIDCFlowUnknown) {
+		t.Fatalf("redeem: %v", err)
 	}
-	if _, err := r.BeginFlow(OIDCClientWeb, "198.51.100.66"); !errors.Is(err, ErrOIDCTooManyFlows) {
-		t.Fatalf("the flooding address over its bound: %v", err)
-	}
-	if _, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1"); err != nil {
-		t.Fatalf("another address after the flood: %v", err)
-	}
+	return err == nil
 }
 
-// TestOIDCBeginFlow_AFullStoreEvictsTheOldest: when the node-wide store is
-// full (a flood from many addresses), a new login still begins; the oldest
-// flow is the one dropped.
-func TestOIDCBeginFlow_AFullStoreEvictsTheOldest(t *testing.T) {
+// TestOIDCBeginFlow_ASharedAddressNeverBlocks (re-review N1): clients behind
+// one address (a proxy, a NAT) share its bound, and going over it evicts that
+// address's OWN oldest flow — 100 begins from it never refuse, its newest flow
+// is still redeemable, and a flow begun from another address survives.
+func TestOIDCBeginFlow_ASharedAddressNeverBlocks(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	r.maxFlows = 3
-	first, err := r.BeginFlow(OIDCClientWeb, "198.51.100.1")
+	victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5 * time.Millisecond)
-	for _, a := range []string{"198.51.100.2", "198.51.100.3"} {
-		if _, err := r.BeginFlow(OIDCClientWeb, a); err != nil {
-			t.Fatal(err)
+	var last OIDCFlowStart
+	for i := 0; i < 100; i++ {
+		last, err = r.BeginFlow(OIDCClientWeb, "198.51.100.66")
+		if err != nil {
+			t.Fatalf("begin %d from the shared address was refused: %v", i, err)
 		}
 	}
-	latest, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	if n := r.flowsFromLocked("198.51.100.66"); n != r.maxFlowsPerAddr {
+		t.Fatalf("the shared address holds %d flows, want its bound %d", n, r.maxFlowsPerAddr)
+	}
+	if !redeemable(t, r, idp, last) {
+		t.Fatal("the shared address's newest sign-in was evicted")
+	}
+	if !redeemable(t, r, idp, victim) {
+		t.Fatal("another address's sign-in did not survive the flood")
+	}
+}
+
+// TestOIDCBeginFlow_AFullStoreEvictsFairly (re-review N2): when the realm is
+// full, the flow evicted is the oldest of the address holding the most, so a
+// user with one sign-in in progress outlasts a flood.
+func TestOIDCBeginFlow_AFullStoreEvictsFairly(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	r.maxFlows = 8
+	r.maxFlowsPerAddr = 100
+	victim, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	if err != nil {
-		t.Fatalf("a login on a full store: %v", err)
+		t.Fatal(err)
 	}
-	if n := len(r.stateStore); n != 3 {
-		t.Fatalf("store holds %d flows, want the bound 3", n)
+	time.Sleep(2 * time.Millisecond)
+	for i := 0; i < 50; i++ {
+		if _, err := r.BeginFlow(OIDCClientWeb, "198.51.100.66"); err != nil {
+			t.Fatalf("a begin on a full store: %v", err)
+		}
 	}
-	back := visit(t, idp, first.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: first.State, OIDCBinding: first.Binding}); !errors.Is(err, ErrOIDCFlowUnknown) {
-		t.Fatalf("the oldest flow after eviction: %v, want ErrOIDCFlowUnknown", err)
+	if n := len(r.stateStore); n != 8 {
+		t.Fatalf("store holds %d flows, want its bound 8", n)
 	}
-	back = visit(t, idp, latest.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: latest.State, OIDCBinding: latest.Binding}); err != nil {
-		t.Fatalf("the newest flow: %v", err)
+	if !redeemable(t, r, idp, victim) {
+		t.Fatal("the victim's single sign-in (the OLDEST flow) was evicted by another address's flood")
+	}
+}
+
+// TestOIDCBeginFlow_IPv6CountsByItsSlash64 (re-review N2): one /64 is one
+// client for the bound; an IPv4-mapped address is its IPv4 form.
+func TestOIDCBeginFlow_IPv6CountsByItsSlash64(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	r.maxFlowsPerAddr = 2
+	first, _ := r.BeginFlow(OIDCClientWeb, "2001:db8:1:2::1")
+	other, _ := r.BeginFlow(OIDCClientWeb, "2001:db8:1:3::1")
+	r.BeginFlow(OIDCClientWeb, "2001:db8:1:2::ffff:1")
+	r.BeginFlow(OIDCClientWeb, "2001:db8:1:2:aaaa::9")
+	if redeemable(t, r, idp, first) {
+		t.Fatal("three addresses of one /64 were counted as three clients")
+	}
+	if !redeemable(t, r, idp, other) {
+		t.Fatal("another /64's sign-in was evicted")
+	}
+	if a, b := flowAddrKey("::ffff:192.0.2.7"), flowAddrKey("192.0.2.7"); a != b {
+		t.Fatalf("mapped %q vs plain %q", a, b)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // oidcMock is the UI mock with an OIDC realm, a BeginOIDCLogin, and a Login
@@ -24,6 +25,7 @@ type oidcMock struct {
 	lastBegin *pb.BeginOIDCLoginRequest
 	beginErr  error
 	logins    []*pb.LoginRequest
+	redirect  string // the realm's redirect_uri; "" = https://node-1:7445/oidc/callback
 }
 
 const mockBinding = "bind-1"
@@ -41,7 +43,7 @@ func (m *oidcMock) BeginOIDCLogin(_ context.Context, in *pb.BeginOIDCLoginReques
 	return &pb.BeginOIDCLoginResponse{
 		AuthUrl:     "https://idp.example/authorize?state=st-1",
 		State:       "st-1",
-		RedirectUri: "https://node-1:7445/oidc/callback",
+		RedirectUri: m.redirectURI(),
 		Binding:     mockBinding,
 	}, nil
 }
@@ -53,6 +55,13 @@ func (m *oidcMock) Login(ctx context.Context, in *pb.LoginRequest, opts ...grpc.
 		return nil, status.Error(codes.Unauthenticated, "invalid credentials: this OIDC login was not begun by this client")
 	}
 	return m.mockGRPC.Login(ctx, in, opts...)
+}
+
+func (m *oidcMock) redirectURI() string {
+	if m.redirect != "" {
+		return m.redirect
+	}
+	return "https://node-1:7445/oidc/callback"
 }
 
 func newOIDCUI(t *testing.T) (*Server, *oidcMock) {
@@ -87,10 +96,10 @@ func begin(t *testing.T, s *Server) *http.Cookie {
 	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "https://idp.example/authorize") {
 		t.Fatalf("begin: %d to %q", w.Code, w.Header().Get("Location"))
 	}
-	c := cookieNamed(w, oidcFlowCookieName)
-	if c == nil || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.MaxAge <= 0 ||
+	c := cookieNamed(w, oidcFlowCookieNameSecure)
+	if c == nil || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.MaxAge <= 0 ||
 		!strings.HasPrefix(c.Value, mockBinding+".") {
-		t.Fatalf("flow cookie %+v: want HttpOnly, SameSite=Lax, Path=/, short-lived, carrying the binding", c)
+		t.Fatalf("flow cookie %+v: want __Host-, HttpOnly, Secure, SameSite=Lax, Path=/, short-lived, carrying the binding", c)
 	}
 	if strings.Contains(w.Header().Get("Location"), mockBinding) || strings.Contains(w.Header().Get("Location"), "lvs_") {
 		t.Fatal("a binding or session token in a URL")
@@ -126,18 +135,63 @@ func TestOIDCUI_BeginPassesTheBrowserAddress(t *testing.T) {
 	}
 }
 
-// TestOIDCUI_HostPrefixedCookieOverHTTPS (review M3): over https the flow
-// cookie is __Host- (Secure, Path=/, no Domain), so a sibling host cannot
-// plant one.
-func TestOIDCUI_HostPrefixedCookieOverHTTPS(t *testing.T) {
-	s, _ := newOIDCUI(t)
-	w := serve(s, httptest.NewRequest("GET", "https://node-1:7445/oidc/login?realm=oidc:kanidm", nil))
+// TestOIDCUI_CookieFollowsTheRedirectScheme (review M3, re-review N4): the
+// cookie is chosen by the realm's redirect_url, not the request: an https
+// redirect gets the __Host- cookie even when the request looks like plain http
+// (a TLS proxy that omits X-Forwarded-Proto); only a plain-http (loopback)
+// redirect gets the plain one.
+func TestOIDCUI_CookieFollowsTheRedirectScheme(t *testing.T) {
+	s, m := newOIDCUI(t)
+	w := serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:kanidm", nil)) // plain http, no X-Forwarded-Proto
 	c := cookieNamed(w, oidcFlowCookieNameSecure)
 	if c == nil || !c.Secure || c.Path != "/" || c.Domain != "" || !c.HttpOnly {
-		t.Fatalf("flow cookie over https %+v, want __Host-: Secure, Path=/, no Domain, HttpOnly", c)
+		t.Fatalf("flow cookie for an https redirect %+v, want __Host-: Secure, Path=/, no Domain, HttpOnly", c)
 	}
-	if cookieNamed(w, oidcFlowCookieName) != nil {
-		t.Fatal("the un-prefixed cookie was set over https")
+	if cookieNamed(w, oidcFlowCookieName) != nil && cookieNamed(w, oidcFlowCookieName).MaxAge >= 0 {
+		t.Fatal("the un-prefixed cookie was set for an https redirect")
+	}
+
+	m.redirect = "http://127.0.0.1:7445/oidc/callback"
+	w = serve(s, httptest.NewRequest("GET", "/oidc/login?realm=oidc:kanidm", nil))
+	if c := cookieNamed(w, oidcFlowCookieName); c == nil || c.Secure || c.MaxAge <= 0 {
+		t.Fatalf("flow cookie for a loopback http redirect %+v, want the plain one", c)
+	}
+}
+
+// TestOIDCUI_APlantedPlainCookieIsIgnoredForAnHTTPSRealm (re-review N4): a
+// plain lv_oidc_flow cookie (which a sibling host or a plain-http answer can
+// set) never carries a binding for a realm whose redirect is https.
+func TestOIDCUI_APlantedPlainCookieIsIgnoredForAnHTTPSRealm(t *testing.T) {
+	s, m := newOIDCUI(t)
+	begin(t, s) // learns that oidc:kanidm's redirect is https
+	r := httptest.NewRequest("GET", "/oidc/callback?code=c&state=st-1", nil)
+	r.AddCookie(&http.Cookie{Name: oidcFlowCookieName, Value: mockBinding + "." + "b2lkYzprYW5pZG0"}) // "oidc:kanidm"
+	w := serve(s, r)
+	if cookieNamed(w, sessionCookieName) != nil {
+		t.Fatal("a planted plain cookie redeemed an https realm's flow")
+	}
+	for _, l := range m.logins {
+		if l.OidcBinding != "" {
+			t.Fatalf("the planted cookie's binding was sent: %+v", l)
+		}
+	}
+}
+
+// TestOIDCUI_BrowserAddressThroughATrustedProxy (re-review N1): behind a
+// listed proxy the UI names the forwarded browser; from an unlisted peer the
+// header is ignored.
+func TestOIDCUI_BrowserAddressThroughATrustedProxy(t *testing.T) {
+	s, m := newOIDCUI(t)
+	p, _ := auth.ParseTrustedProxies([]string{"127.0.0.1"})
+	s.SetTrustedProxies(p)
+	for peer, want := range map[string]string{"127.0.0.1:4000": "198.51.100.7", "203.0.113.9:4000": "203.0.113.9"} {
+		r := httptest.NewRequest("GET", "/oidc/login?realm=oidc:kanidm", nil)
+		r.RemoteAddr = peer
+		r.Header.Set("X-Forwarded-For", "6.6.6.6, 198.51.100.7")
+		serve(s, r)
+		if m.lastBegin.ClientAddress != want {
+			t.Errorf("peer %s: client_address %q, want %q", peer, m.lastBegin.ClientAddress, want)
+		}
 	}
 }
 
@@ -157,7 +211,7 @@ func TestOIDCUI_CallbackCompletesTheLogin(t *testing.T) {
 	if c := cookieNamed(w, sessionCookieName); c == nil || c.Value != "lvs_tok" || !c.HttpOnly {
 		t.Fatalf("session cookie %+v", c)
 	}
-	if c := cookieNamed(w, oidcFlowCookieName); c == nil || c.MaxAge >= 0 {
+	if c := cookieNamed(w, oidcFlowCookieNameSecure); c == nil || c.MaxAge >= 0 {
 		t.Fatalf("the flow cookie was not cleared: %+v", c)
 	}
 	if w.Header().Get("Referrer-Policy") != "no-referrer" || w.Header().Get("Cache-Control") != "no-store" {
@@ -175,8 +229,8 @@ func TestOIDCUI_CallbackNotBegunByThisBrowserBurnsTheFlow(t *testing.T) {
 	flow := begin(t, s)
 	for name, c := range map[string]*http.Cookie{
 		"no cookie":        nil,
-		"another flow's":   {Name: oidcFlowCookieName, Value: "bind-2." + strings.SplitN(flow.Value, ".", 2)[1]},
-		"a garbled cookie": {Name: oidcFlowCookieName, Value: "nonsense"},
+		"another flow's":   {Name: oidcFlowCookieNameSecure, Value: "bind-2." + strings.SplitN(flow.Value, ".", 2)[1]},
+		"a garbled cookie": {Name: oidcFlowCookieNameSecure, Value: "nonsense"},
 	} {
 		m.logins = nil
 		r := httptest.NewRequest("GET", "/oidc/callback?code=the-code&state=st-1", nil)

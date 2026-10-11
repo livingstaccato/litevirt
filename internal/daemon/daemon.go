@@ -1732,6 +1732,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		uiSrv.SetCorrosionDB(d.db)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
+		// Validated at LoadConfig; a parse error here cannot happen.
+		proxies, _ := auth.ParseTrustedProxies(d.cfg.TrustedProxies)
+		uiSrv.SetTrustedProxies(proxies)
 		// UI TLS (acme.go): a custom certificate (`lv host ui-cert set`), else
 		// ACME (HTTP-01 on :80, or DNS-01), else the cluster certificate. The
 		// listener re-decides TLS vs plain HTTP while running, so installing or
@@ -1741,6 +1744,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.certWatch.addUI(uiTLS)
 		uiAddr := fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)
 		warnPlainUI(d.cfg.UIBind, uiTLS.wantTLS())
+		warnOIDCBehindProxy(d.cfg)
 		uiSrv.StartCollector(ctx)
 		if err := uiSrv.ServeSupervised(ctx, uiAddr, uiTLS.tlsConfig(), uiTLS.wantTLS, 5*time.Second); err != nil {
 			slog.Warn("UI server stopped", "error", err)
@@ -1757,6 +1761,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			restClient := pb.NewLiteVirtClient(restConn)
 			restSrv := restapi.NewServer(restClient, "")
+			proxies, _ := auth.ParseTrustedProxies(d.cfg.TrustedProxies)
+			restSrv.SetTrustedProxies(proxies)
 			restAddr := fmt.Sprintf("127.0.0.1:%d", d.cfg.RESTPort)
 			if err := restSrv.ListenAndServe(restAddr); err != nil {
 				slog.Warn("REST API server stopped", "error", err)

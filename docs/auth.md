@@ -177,16 +177,42 @@ each OIDC realm (`GET /oidc/login?realm=oidc:<name>`). The node:
    a nonce and a separate **binding secret**, held in memory **on that node
    only**, single-use, for 10 minutes;
 2. binds the flow to the browser: the binding secret goes into a short-lived
-   `HttpOnly`, `SameSite=Lax` cookie (`__Host-lv_oidc_flow` over https:
-   `Secure`, `Path=/`, no `Domain`, so a sibling host cannot plant one). It is
-   never put in a URL;
+   `HttpOnly`, `SameSite=Lax`, `Path=/` cookie. It is never put in a URL. The
+   cookie's kind follows the realm's `redirect_url` (the URL the browser comes
+   back on), not the request. With an https redirect it is
+   `__Host-lv_oidc_flow`: `Secure`, no `Domain`, so a sibling host cannot
+   plant one. The callback then accepts only that cookie, even when a TLS
+   proxy omits `X-Forwarded-Proto`. A plain-http redirect is allowed only to a
+   loopback address (a developer's own machine). There the cookie is the
+   unprefixed, non-`Secure` `lv_oidc_flow`;
 3. sends the browser to the IdP.
 
-In-progress sign-ins are bounded: 16 per client address (the browser's, which
-the UI passes to the daemon; for a direct gRPC caller, its own address) and
-4096 per realm. When the realm's table is full the oldest flow is dropped, so
-a flood cannot lock out other users; a single address over its bound is
-refused ("too many sign-ins in progress from your address").
+In-progress sign-ins are bounded, and beginning one is never refused:
+
+- **Per client address: 16.** An IPv6 client counts by its /64. An address
+  over its bound loses its own oldest sign-in, so clients sharing an address
+  (a NAT, or a proxy without `trusted_proxies`) cannot lock each other out
+  with a handful of requests.
+- **Per realm: 4096.** When the realm's table is full, the oldest sign-in of
+  the address holding the most is dropped (fair share), so a user with one
+  sign-in in progress outlasts a flood from any address holding more.
+
+The client address is:
+- for the web UI and the REST gateway, the TCP peer. When that peer is in
+  `trusted_proxies` (below), it is the right-most `X-Forwarded-For` hop that is
+  not itself a trusted proxy.
+- for a direct gRPC caller, its own address. A `client_address` it sends is
+  honoured only from a loopback peer. That means this node's own UI and REST
+  gateway, but also any process on the node that holds a cluster certificate.
+  Such a process is trusted for it as it is for everything else: holding a
+  node's certificate on the node is equivalent to root on it.
+
+**Behind a reverse proxy**, list the proxy in `trusted_proxies` (CIDRs or
+addresses, default empty). Without it, every browser arrives from the proxy's
+one address and shares its bound. The daemon warns at startup when an OIDC
+realm is configured, the UI is bound to loopback, and `trusted_proxies` is
+empty. Never list an address that clients can reach directly: a forwarding
+header is believed only from a listed proxy.
 
 The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then calls
 `Login` with the code, the state and the cookie's binding secret on the same
@@ -223,7 +249,7 @@ prompt. Sign out at the identity provider too, or configure it to always ask
 another node finds no flow and is refused (`Unauthenticated`, "state unknown
 ... on this node"); the code is not presented to the IdP. Give each node its
 own `redirect_url` naming itself. Behind a load balancer, pin `/oidc/` to one
-node (sticky sessions).
+node (sticky sessions), and list the balancer in `trusted_proxies`.
 
 **CLI.** `lv login --realm oidc:<name>` asks the node it is connected to for a
 CLI flow. The node returns the IdP URL and the realm's `cli_redirect_url`. lv

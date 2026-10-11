@@ -614,14 +614,20 @@ daemon names it if you don't).`,
 // newCTRestoreCmd rebuilds a container from a backup manifest on the target host.
 func newCTRestoreCmd() *cobra.Command {
 	var host, repo, ts string
-	var start bool
+	var start, withoutHostAccess bool
 	cmd := &cobra.Command{
 		Use:   "restore <name>",
 		Short: "Restore a container from a backup repo onto a host",
 		Long: `Rebuild a container from a backup manifest: materialise the archived
 rootfs, lay down the container + config, and recreate its cluster row.
 Self-contained — works even after the original container and its image
-are gone. Runs on the target host; pass --start to bring it up.`,
+are gone. Runs on the target host; pass --start to bring it up.
+
+A backup's host mounts and devices are kept only for an admin, once the
+cluster upgrade has finished. --without-host-access restores the container
+without them (audited) — the way out when the release gate cannot grant
+them now, e.g. a host is down for good; re-apply them later with
+lv ct convert --mount/--device.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			for name, val := range map[string]string{"--repo": repo, "--timestamp": ts} {
@@ -632,6 +638,7 @@ are gone. Runs on the target host; pass --start to bring it up.`,
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.RestoreContainer(ctx, &pb.RestoreContainerRequest{
 					Name: args[0], HostName: host, RepoPath: repo, Timestamp: ts, Start: start,
+					WithoutHostAccess: withoutHostAccess,
 				})
 				if err != nil {
 					return err
@@ -662,6 +669,8 @@ are gone. Runs on the target host; pass --start to bring it up.`,
 	cmd.Flags().StringVar(&repo, "repo", "", "Backup repo path")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
 	cmd.Flags().BoolVar(&start, "start", false, "Start the container after restore")
+	cmd.Flags().BoolVar(&withoutHostAccess, "without-host-access", false,
+		"Restore without the backup's host mounts and devices (audited; re-apply with lv ct convert --mount/--device)")
 	return cmd
 }
 

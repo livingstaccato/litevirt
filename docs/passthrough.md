@@ -311,6 +311,18 @@ containers:
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.
+  Keeping them writes this feature's data, so an admin's restore takes the
+  release gate's grant: before `release_2026_11_v1` latches they are stripped
+  as above, and after it a gate that refuses (the first use not acknowledged
+  by every host yet, a host rolled back) refuses the restore — the imported
+  container is removed, nothing is recorded, and the refusal is audited —
+  rather than drop what the admin asked to keep. While that refusal lasts (a
+  host down for good, or in release probation — the refusal names it), an
+  admin restores the container now with `lv ct restore <name> --repo <dir>
+  --timestamp <ts> --without-host-access`: its mounts and devices are left
+  out, no grant is asked, and the audit (`ct.restore`) records the request
+  and what was left out; re-apply them later with `lv ct convert --mount` and `--device`.
+  A cold migration or failover relocation ignores the option.
   **Privileged mode and legacy confinement** recorded in a backup are the same
   class and are decided the same way: an operator's restore of a privileged or
   legacy container lands unprivileged, in an id range of its own (its files

@@ -346,6 +346,7 @@ lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, p
 lv ct exec <name> -- <cmd> [args...]
 lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
+lv ct restore <name> --repo <dir> --timestamp <ts> --without-host-access  # without the backup's host mounts/devices (audited)
 lv ct migrate <name> <target-host> --repo <src-dir>    # cold-migrate (stop → stream → start)
 lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
 lv ct snapshot ls <name>                               # list a container's snapshots

@@ -1179,16 +1179,23 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// (hostAccessG), taken here on the node that writes the row.
 	var hostAccessG capabilities.FeatureGrant
 	{
-		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore, req.GetWithoutHostAccess())
 		if herr != nil {
 			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 				slog.Warn("container restore: cleanup after a refused host-access grant also failed", "name", req.Name, "error", delErr)
 			}
 			s.removeRestoreMarker(req.Name)
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (host access: release gate refused; retry)", "error")
-			return herr
+			// The gate's own text, then the way out when it cannot grant
+			// for a while (a host down for good, or in release probation).
+			return status.Error(status.Code(herr), status.Convert(herr).Message()+
+				"; to restore now without the backup's host mounts and devices, retry with --without-host-access "+
+				"(an admin re-applies them later with lv ct convert --mount/--device)")
 		}
 		hostAccessG = g
+		if operatorRestore && req.GetWithoutHostAccess() && stripped != "" {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" restored --without-host-access (requested); not carried: "+stripped, "ok")
+		}
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
 		// id range of its own (its files shifted) before its config is rendered.

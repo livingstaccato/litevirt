@@ -1535,6 +1535,15 @@ message RestoreContainerRequest {
     // ignores it. Empty (an earlier build, or a row with no spec) = the
     // target reads the row from its own replica.
     string source_create_spec = 11;
+    // without_host_access restores the container without the host mounts and
+    // devices its backup records (lv ct restore --without-host-access),
+    // audited: the disaster-recovery way out while the release gate cannot
+    // grant usb_mounts_memory (a host down for good, or in release
+    // probation), since an admin's restore that keeps them refuses rather
+    // than drop them. An admin re-applies them later with lv ct convert
+    // --mount/--device. Honoured only on an operator restore; a peer move
+    // ignores it.
+    bool without_host_access = 12;
 }
 
 message RestoreContainerProgress {

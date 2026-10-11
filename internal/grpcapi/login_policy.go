@@ -142,9 +142,20 @@ func (s *Server) refuseInactiveToken(ctx context.Context, username, createdAt st
 		return err
 	}
 	if life.TokenPredates(createdAt) {
-		return status.Error(codes.Unauthenticated, tokenCutoffRefusal(life, createdAt, ""))
+		return status.Error(codes.Unauthenticated, tokenCutoffRefusal(life, username, createdAt, ""))
 	}
 	return nil
+}
+
+// tokenCutoffAheadText describes a token cut-off dated further in the future
+// than the skew margin: a node whose clock ran ahead wrote it, and every token
+// of the account made before that time is refused (login-fu review Minor 2,
+// as docs/auth.md says).
+func tokenCutoffAheadText(life corrosion.UserLifecycle, username string) string {
+	return fmt.Sprintf("the account's API token cut-off is dated %s, in the future, so no token made before then "+
+		"works; a node's clock is ahead (see the clock-skew health check). For an admin account, root corrects the "+
+		"cut-off at once with `lv user reset-admin --user %s` on a node whose litevirtd is running",
+		life.TokensNotBefore, username)
 }
 
 // tokenCutoffRefusal is the message of an API token TokenPredates refuses,
@@ -152,7 +163,10 @@ func (s *Server) refuseInactiveToken(ctx context.Context, username, createdAt st
 // was most likely minted on a node the account's delete or re-create had not
 // reached yet: it never works, and the message says why and what to do
 // (re-review 4, m-4).
-func tokenCutoffRefusal(life corrosion.UserLifecycle, createdAt, prefix string) string {
+func tokenCutoffRefusal(life corrosion.UserLifecycle, username, createdAt, prefix string) string {
+	if corrosion.CutoffAhead(life.TokensNotBefore, time.Now()) {
+		return prefix + tokenCutoffAheadText(life, username)
+	}
 	if life.TokenNearCutoff(createdAt) {
 		return fmt.Sprintf("%sAPI token was created at %s, within %s of the account's last delete or re-create "+
 			"(%s), and the cut-off that change set refuses it: a token minted for the re-created account on a node "+

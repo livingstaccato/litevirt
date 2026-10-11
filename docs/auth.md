@@ -630,8 +630,12 @@ written by a node whose clock ran ahead: it refuses every login (or new API
 token) of the account until that time, and the refusal names the time.
 `lv user reset-admin` (as root, with litevirtd running) replaces such a
 cut-off on the admin account it resets, `--user <name>` for another admin,
-and logs that it did; with the daemon down it resets the password and leaves
-the cut-off.
+and logs that it did. Correcting it needs the release feature `login_policy`,
+and reset-admin waits for that at most 3 s: with the daemon down, or with the
+feature unable to open in time (the cluster upgrade unfinished, a first use
+not yet acknowledged by an unreachable host), it still resets the password at
+once, leaves the cut-off, and prints that it did and what clears it (run it
+again once the feature opens, or wait).
 
 **Where and when it holds.** Each node judges against its own replica and its
 own clock. A change takes effect on a node when its row arrives there: on the

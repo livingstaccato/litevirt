@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -131,5 +132,40 @@ func TestResetAdmin_UserRefusedUpFrontByAnOlderDaemon(t *testing.T) {
 	env.username = "oldops"
 	if err := runResetAdmin(context.Background(), env); err != nil || unsure.got.GetUsername() != "oldops" {
 		t.Fatalf("--user with a failing Ping: %v (asked %+v)", err, unsure.got)
+	}
+}
+
+// login-fu review Minor 3: the note the daemon returns — a cut-off it left in
+// place — is printed; and the daemon-down path, which cannot open the gate,
+// prints its own.
+func TestResetAdmin_PrintsTheCutoffNote(t *testing.T) {
+	d := &fakeResetDaemon{note: "The account admin has a cut-off dated in the future: it was left in place"}
+	env := envFor(t, d, t.TempDir(), noDB(t))
+	var out bytes.Buffer
+	env.out = &out
+	if err := runResetAdmin(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), d.note) {
+		t.Errorf("output %q does not carry the daemon's note", out.String())
+	}
+
+	ctx := context.Background()
+	db := resetAdminTestDB(t)
+	if err := corrosion.InsertUser(ctx, db, "admin", "admin", "$2a$10$stub"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `INSERT INTO user_lifecycle (username, attribute, value, set_by, updated_at)
+		VALUES ('admin', ?, ?, 'peer', ?)`, corrosion.UserAttrSessionsNotBefore,
+		time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339), db.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	password, hash, _ := mintAdminPassword()
+	out.Reset()
+	if err := resetAdminOffline(ctx, db, t.TempDir(), filepath.Join(t.TempDir(), "pw"), "root", "", password, hash, false, &out); err != nil {
+		t.Fatalf("daemon-down reset under a future cut-off: %v", err)
+	}
+	if !strings.Contains(out.String(), "left in place") || !strings.Contains(out.String(), "litevirtd is not running") {
+		t.Errorf("daemon-down output %q: want the cut-off note", out.String())
 	}
 }

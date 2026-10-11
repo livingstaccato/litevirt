@@ -933,6 +933,9 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 	// rather than hand out a token that never works.
 	if life, lerr := corrosion.GetUserLifecycle(ctx, s.db, user.Username); lerr != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the account state of %q: %v", user.Username, lerr)
+	} else if corrosion.CutoffAhead(life.TokensNotBefore, time.Now()) {
+		return nil, status.Errorf(codes.Unavailable, "cannot create a token for %q: %s",
+			user.Username, tokenCutoffAheadText(life, user.Username))
 	} else if life.TokenPredates(time.Now().UTC().Format(time.RFC3339)) {
 		return nil, status.Errorf(codes.Unavailable,
 			"the account %q was re-created moments ago; create the token again in %s",

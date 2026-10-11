@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -202,5 +203,48 @@ func TestFU_M6_ExternalReinstatementNoteNamesResetAdmin(t *testing.T) {
 	note := corrosion.AdminReinstatementNote(ctx, s.db, "ext")
 	if !strings.Contains(note, "external") || !strings.Contains(note, "lv user reset-admin --user ext") {
 		t.Fatalf("note %q: want it external and naming lv user reset-admin --user ext", note)
+	}
+}
+
+// login-fu review Minor 2: a token cut-off dated in the future refuses
+// token creation and every existing token with a message that names the time
+// and, for an admin, reset-admin — not "re-created moments ago; again in 5s".
+func TestFU_Minor2_FutureTokenCutoffNamesTheTime(t *testing.T) {
+	s := loginPolicyServer(t)
+	seedAdmins(t, s)
+	tok := mintAPIToken(t, s, "admin")
+	ahead := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	writeLifecycle(t, s, "admin", corrosion.UserAttrTokensNotBefore, ahead)
+	_, err := s.CreateToken(adminCtx(), &pb.CreateTokenRequest{Username: "admin", Name: "later"})
+	wantCode(t, "a token under a 2 h future cut-off", err, codes.Unavailable)
+	wantMessage(t, "the create refusal", err, ahead, "lv user reset-admin --user admin")
+	_, err = s.authenticate(bearerCtx(tok))
+	wantCode(t, "an existing token under a 2 h future cut-off", err, codes.Unauthenticated)
+	wantMessage(t, "the token refusal", err, ahead, "lv user reset-admin --user admin")
+}
+
+// login-fu review Minor 3: when reset-admin cannot open the gate to correct
+// a future cut-off, the RPC's answer says the cut-off stayed and what clears
+// it; with the gate open there is no note.
+func TestFU_Minor3_ResetAdminSaysWhenTheCutoffStays(t *testing.T) {
+	s := resetAdminFixture(t)
+	writeLifecycle(t, s, "admin", corrosion.UserAttrSessionsNotBefore, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, err: status.Error(codes.FailedPrecondition, "the cluster upgrade must finish first")})
+	ctx, err := authedCtx(t, s, "test-host", tcpAddr("127.0.0.1"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ResetAdminPassword(ctx, &pb.ResetAdminPasswordRequest{PasswordHash: mustHash(t, "0123456789abcdef-the-new-secret")})
+	if err != nil {
+		t.Fatalf("reset-admin with the gate closed: %v", err)
+	}
+	if !strings.Contains(resp.GetNote(), "left in place") || !strings.Contains(resp.GetNote(), "cluster upgrade must finish") {
+		t.Fatalf("note %q: want it to say the cut-off stayed, and why", resp.GetNote())
+	}
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+	writeLifecycle(t, s, "admin", corrosion.UserAttrSessionsNotBefore, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
+	resp, err = s.ResetAdminPassword(ctx, &pb.ResetAdminPasswordRequest{PasswordHash: mustHash(t, "0123456789abcdef-the-new-secret2")})
+	if err != nil || resp.GetNote() != "" {
+		t.Fatalf("reset-admin with the gate open: note %q, err %v; want no note", resp.GetNote(), err)
 	}
 }

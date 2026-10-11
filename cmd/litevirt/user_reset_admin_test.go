@@ -165,6 +165,7 @@ type fakeResetDaemon struct {
 	pingSchema int32
 	pingErr    error
 	pinged     int
+	note       string // the daemon's ResetAdminPasswordResponse.note
 }
 
 func (f *fakeResetDaemon) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
@@ -191,7 +192,7 @@ func (f *fakeResetDaemon) ResetAdminPassword(_ context.Context, req *pb.ResetAdm
 	if name == "" {
 		name = "admin"
 	}
-	return &pb.ResetAdminPasswordResponse{Username: name}, nil
+	return &pb.ResetAdminPasswordResponse{Username: name, Note: f.note}, nil
 }
 
 func envFor(t *testing.T, d *fakeResetDaemon, dataDir string, openDB func() (*corrosion.Client, error)) resetAdminEnv {

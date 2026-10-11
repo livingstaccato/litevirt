@@ -31,6 +31,26 @@ import (
 type fbScenario struct {
 	c       *Cluster
 	a, b, x *Node // a is drained and returns; b receives its VMs; x is a third host (nil with two nodes)
+	gates   map[string]*health.Checker
+}
+
+// refreshQuorum beats every node's checker once and seeds a fresh view of its
+// peers. The view enforceGate seeded at the start does not age by itself: the
+// checker reads a gap since its last beat as a stall and refuses with
+// no_quorum (the HA monitor beats and probes in production; nothing does in
+// the fleet). Under -race a scenario's steps open such gaps, so a scenario
+// calls this before a gated step that runs long after the seeding.
+func (f *fbScenario) refreshQuorum() {
+	for _, n := range f.c.Nodes {
+		f.gates[n.Name].QuorumProof(context.Background())
+		peers := map[string]bool{}
+		for _, o := range f.c.Nodes {
+			if o != n {
+				peers[o.Name] = true
+			}
+		}
+		f.gates[n.Name].SeedPeersForTests(peers)
+	}
 }
 
 // newFB starts nodes independent replicas, wired as the daemon wires the
@@ -56,7 +76,7 @@ func startFB(t *testing.T, nodes int) (*fbScenario, map[string]*health.Checker) 
 	wireReleaseFeatures(t, c, gates)
 	t.Cleanup(grpcapi.SetFailbackPauseForTest(time.Millisecond))
 	c.WaitConverged(t, convergeTimeout)
-	f := &fbScenario{c: c, a: c.Nodes[0], b: c.Nodes[1]}
+	f := &fbScenario{c: c, a: c.Nodes[0], b: c.Nodes[1], gates: gates}
 	if nodes > 2 {
 		f.x = c.Nodes[2]
 	}
@@ -316,13 +336,16 @@ func TestFleet_Failback_AServingNodeThatLagsNeverMovesAVMAnOperatorMoved(t *test
 	f.c.SetLinkFault(f.b, f.a, LinkFault{Block: true})
 	f.c.SetLinkFault(f.x, f.a, LinkFault{Block: true})
 
+	f.refreshQuorum()
 	emulateLibvirtMove(f.b, f.x)
 	if err := migrateAt(t, f.c, f.b, "hand", f.x.Name); err != nil {
 		t.Fatalf("operator migrate: %v", err)
 	}
+	f.refreshQuorum()
 	if err := migrateAt(t, f.c, f.b, "again", f.x.Name); err != nil {
 		t.Fatalf("operator migrate: %v", err)
 	}
+	f.refreshQuorum()
 	emulateLibvirtMove(f.x, f.b)
 	if err := migrateAt(t, f.c, f.x, "again", f.b.Name); err != nil {
 		t.Fatalf("operator migrate back: %v", err)
@@ -337,6 +360,7 @@ func TestFleet_Failback_AServingNodeThatLagsNeverMovesAVMAnOperatorMoved(t *test
 		t.Fatalf("a's replica should still hold both live records, holds %+v", o)
 	}
 
+	f.refreshQuorum()
 	emulateLibvirtMove(f.b, f.a)
 	emulateLibvirtMove(f.x, f.a)
 	got, err := f.failback(t, f.a, &pb.FailbackHostRequest{All: true})
@@ -818,6 +842,7 @@ func TestFleet_Failback_AnUnacknowledgingRecipientNeverSlowsADrain(t *testing.T)
 		names = append(names, n)
 		f.addVM(t, n, f.a, nil)
 	}
+	f.refreshQuorum()
 	emulateLibvirtMove(f.a, f.b)
 	start := time.Now()
 	st, err := f.c.SelfClient(f.a).DrainHost(ctx, &pb.DrainHostRequest{Name: f.a.Name})

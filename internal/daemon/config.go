@@ -1201,8 +1201,8 @@ type FileRestoreConfig struct {
 	// RunAs is the restore account (default litevirt-restore, created at
 	// daemon start): a system account whose group reads the restore VM's
 	// boot files. qemu is not started as it: each restore VM runs as its own
-	// uid from uid_base, with that group only (KVM by an ACL entry on
-	// /dev/kvm). root, libvirt-qemu, qemu and nobody are refused unless
+	// uid from uid_base, with that group and its own slot group (KVM by an
+	// ACL group entry on /dev/kvm for the slot group). root, libvirt-qemu, qemu and nobody are refused unless
 	// allow_shared_run_as, which then runs qemu as that user itself.
 	RunAs string `yaml:"run_as,omitempty"`
 	// IdleTimeoutSec kills a browsing session's restore VM after this long

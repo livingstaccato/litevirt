@@ -275,8 +275,11 @@ func TestSweepStale_PreviousUIDBase(t *testing.T) {
 func TestUIDRangeConflict(t *testing.T) {
 	sub := filepath.Join(t.TempDir(), "subuid")
 	_ = os.WriteFile(sub, nil, 0o644)
-	oldP, oldO := subIDPaths, uidOwners
-	defer func() { subIDPaths, uidOwners = oldP, oldO }()
+	oldP, oldO, oldG := subIDPaths, uidOwners, gidOwners
+	defer func() { subIDPaths, uidOwners, gidOwners = oldP, oldO, oldG }()
+	groups := map[uint32]string{}
+	var groupsErr error
+	gidOwners = func([]uint32) (map[uint32]string, error) { return groups, groupsErr }
 	subIDPaths = []string{sub}
 	owners := map[uint32]string{}
 	var ownersErr error
@@ -303,6 +306,18 @@ func TestUIDRangeConflict(t *testing.T) {
 	if err := l.uidRangeConflict(); err == nil || !strings.Contains(err.Error(), "ldap-alice") {
 		t.Errorf("a uid NSS knows: %v", err)
 	}
+	// The slot gid is a supplementary group of the restore qemu: a group NSS
+	// knows at a reserved id is refused, like an account at a reserved uid.
+	owners = map[uint32]string{}
+	groups = map[uint32]string{3_800_000_005: "dbops"}
+	if err := l.uidRangeConflict(); err == nil || !strings.Contains(err.Error(), "dbops") || !strings.Contains(err.Error(), "gid 3800000005") {
+		t.Errorf("a gid NSS knows: %v", err)
+	}
+	groups, groupsErr = nil, errors.New("winbind is down")
+	if err := l.uidRangeConflict(); err == nil || !strings.Contains(err.Error(), "winbind is down") {
+		t.Errorf("a group lookup that failed: %v", err)
+	}
+	groupsErr = nil
 	owners, ownersErr = nil, errors.New("sssd is down")
 	if err := l.uidRangeConflict(); err == nil || !strings.Contains(err.Error(), "sssd is down") {
 		t.Errorf("an NSS lookup that failed: %v", err)
@@ -320,6 +335,13 @@ func TestUIDOwners_Getent(t *testing.T) {
 	}
 	if got[0] != "root" || got[3_800_000_000] != "" {
 		t.Fatalf("owners %v, want uid 0 = root only", got)
+	}
+	gg, err := gidOwners([]uint32{0, 3_800_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gg[0] != "root" || gg[3_800_000_000] != "" {
+		t.Fatalf("group owners %v, want gid 0 = root only", gg)
 	}
 }
 

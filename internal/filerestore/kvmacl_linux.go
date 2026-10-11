@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,7 +24,9 @@ import (
 // tagged uaccess, and udev rewrites its ACL on the change uevent every KVM VM
 // create and destroy emits, dropping every named-USER entry (seen in the lab
 // within a second of the grant). Named-group entries survive that rewrite.
-// The slot gid is in the reserved range: no account, no files, no other use.
+// The slot gid is in the reserved range, which the launcher refuses unless no
+// account or group NSS knows has an id in it (reservedRangeConflict), and
+// nothing the daemon creates is owned by it.
 //
 // The VM is never put in the kvm group: libvirt's
 // qemu creates group-writable sockets as libvirt-qemu:kvm — among them the
@@ -51,6 +54,9 @@ type aclEntry struct {
 	tag, perm uint16
 	id        uint32
 }
+
+// aclWrites counts ACL writes (tests assert that a present grant is not rewritten).
+var aclWrites atomic.Int64
 
 // deviceACLMu serializes this daemon's read-modify-write of a device's ACL.
 var deviceACLMu sync.Mutex
@@ -115,6 +121,7 @@ func parseACL(b []byte) ([]aclEntry, error) {
 // a named entry. With none left the kernel folds the ACL back into the mode
 // bits and drops the xattr.
 func writeAccessACL(path string, ents []aclEntry) error {
+	aclWrites.Add(1)
 	var kept []aclEntry
 	named := false
 	var mask uint16
@@ -148,6 +155,21 @@ func writeAccessACL(path string, ents []aclEntry) error {
 		binary.LittleEndian.PutUint32(b[off+4:], e.id)
 	}
 	return unix.Setxattr(path, aclAccessXattr, b, 0)
+}
+
+// deviceGroupHasRW reports whether path's access ACL has a named-group entry
+// for gid that is read-write (and so, through the mask, effective).
+func deviceGroupHasRW(path string, gid uint32) bool {
+	ents, err := readAccessACL(path)
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if e.tag == aclGroup && e.id == gid && e.perm&aclRW == aclRW {
+			return true
+		}
+	}
+	return false
 }
 
 // worldRW reports whether path is read-write for every uid by its mode

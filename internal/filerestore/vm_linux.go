@@ -107,8 +107,8 @@ type host struct {
 	qemu, kernel, modules, agent string
 	// account is the restore account (its group reads the boot files);
 	// perSession means each VM runs as its own uid from the reserved range
-	// with the account's group only (sessionCredential), given /dev/kvm by
-	// an ACL entry. Otherwise shared is the credential qemu runs with (nil:
+	// with the account's group and its own slot group (sessionCredential),
+	// the slot group given /dev/kvm by an ACL group entry. Otherwise shared is the credential qemu runs with (nil:
 	// the daemon's own).
 	account    *qemuUser
 	perSession bool
@@ -124,7 +124,7 @@ type host struct {
 // EnsureRestoreUser creates DefaultRestoreUser if it does not exist: a
 // system user with its own group, no home, no shell and no other group (no
 // restore VM runs as it, nor with any group but its own: each runs as its
-// own uid, given /dev/kvm by an ACL entry). Idempotent; a no-op unless
+// own uid, its slot group given /dev/kvm by an ACL group entry). Idempotent; a no-op unless
 // root. The daemon calls it at start when file restore is enabled
 // (docs/installation.md).
 func EnsureRestoreUser() error {
@@ -321,7 +321,7 @@ func (l *Launcher) checkRootIdentity(h *host) error {
 	}
 	h.account = &qemuUser{name: name, uid: uid, gid: gid}
 	h.perSession, h.gid = true, int(gid)
-	// Each session's uid is given KVM by an ACL entry (never the kvm group).
+	// Each session's slot group is given KVM by an ACL group entry (never the kvm group).
 	if err := deviceACLUsable(l.kvmPath); err != nil {
 		return unavailable("no usable KVM for restore VMs: %v", err)
 	}
@@ -357,6 +357,8 @@ func (l *Launcher) uidRangeConflict() error {
 }
 
 func reservedRangeConflict(base uint32, containers [2]uint64) error {
+	// Each reserved id is a uid AND, as the session's slot group, a gid: an
+	// account or a group NSS knows at any of them is someone else's.
 	lo, hi := uint64(base), uint64(base)+UIDSlots
 	if containers[1] > containers[0] && lo < containers[1] && containers[0] < hi {
 		return fmt.Errorf("the uids reserved for restore VMs (file_restore.uid_base: %d..%d) overlap the containers' id-map range "+
@@ -378,6 +380,18 @@ func reservedRangeConflict(base uint32, containers [2]uint64) error {
 	for _, u := range uids {
 		if name, ok := owners[u]; ok {
 			return fmt.Errorf("uid %d, reserved for restore VMs (file_restore.uid_base), belongs to %s", u, name)
+		}
+	}
+	// The slot gid (== the uid) is a supplementary group of the restore qemu:
+	// a real group there would hand the qemu that group's files and sockets,
+	// and its members /dev/kvm.
+	gowners, err := gidOwners(uids)
+	if err != nil {
+		return fmt.Errorf("could not check that no group has a gid reserved for restore VMs (file_restore.uid_base): %v", err)
+	}
+	for _, g := range uids {
+		if name, ok := gowners[g]; ok {
+			return fmt.Errorf("gid %d, reserved for restore VMs (file_restore.uid_base), belongs to group %s", g, name)
 		}
 	}
 	return nil
@@ -421,17 +435,26 @@ func subIDConflict(path string, lo, hi uint64) error {
 }
 
 // uidOwners names the accounts NSS knows for uids (a var for tests).
-var uidOwners = getentOwners
+var uidOwners = func(ids []uint32) (map[uint32]string, error) { return getentOwners("passwd", ids) }
+
+// gidOwners names the groups NSS knows for gids (a var for tests).
+var gidOwners = func(ids []uint32) (map[uint32]string, error) { return getentOwners("group", ids) }
 
 // getentOwners asks NSS through getent(1) — the static litevirt binary
-// cannot load NSS modules itself, so os/user sees /etc/passwd only. Without
-// getent it falls back to /etc/passwd.
-func getentOwners(uids []uint32) (map[uint32]string, error) {
+// cannot load NSS modules itself, so os/user sees /etc/passwd and /etc/group
+// only — which database ("passwd" or "group") knows each id. Without getent
+// it falls back to those files.
+func getentOwners(db string, uids []uint32) (map[uint32]string, error) {
 	out := map[uint32]string{}
 	getent, err := exec.LookPath("getent")
 	if err != nil {
 		for _, u := range uids {
-			if pu, err := user.LookupId(strconv.FormatUint(uint64(u), 10)); err == nil {
+			id := strconv.FormatUint(uint64(u), 10)
+			if db == "group" {
+				if g, err := user.LookupGroupId(id); err == nil {
+					out[u] = g.Name
+				}
+			} else if pu, err := user.LookupId(id); err == nil {
 				out[u] = pu.Username
 			}
 		}
@@ -439,7 +462,7 @@ func getentOwners(uids []uint32) (map[uint32]string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	args := []string{"passwd"}
+	args := []string{db}
 	for _, u := range uids {
 		args = append(args, strconv.FormatUint(uint64(u), 10))
 	}
@@ -450,7 +473,7 @@ func getentOwners(uids []uint32) (map[uint32]string, error) {
 		// Exit 2: one or more keys not found — the normal answer.
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) || ee.ExitCode() != 2 {
-			return nil, fmt.Errorf("getent passwd: %v", err)
+			return nil, fmt.Errorf("getent %s: %v", db, err)
 		}
 	}
 	for _, line := range strings.Split(string(b), "\n") {
@@ -458,6 +481,7 @@ func getentOwners(uids []uint32) (map[uint32]string, error) {
 		if len(p) < 3 {
 			continue
 		}
+		// passwd: name:x:UID:...; group: name:x:GID:... — the id is field 3 of both.
 		if v, err := strconv.ParseUint(p[2], 10, 32); err == nil {
 			out[uint32(v)] = p[0]
 		}
@@ -1077,6 +1101,7 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 		slog.Warn("file restore: running a restore VM WITHOUT qemu's seccomp sandbox (file_restore.allow_unsandboxed: [seccomp])", "qemu", h.qemu, "why", sandboxMsg)
 	}
 	var lastErr error
+	kvmRetried := false
 	for attempt := 0; attempt < 6; attempt++ {
 		spec.CID = randomCID()
 		// A previous attempt's group and qemu are gone: vet and verify this
@@ -1111,6 +1136,11 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 		switch {
 		case stderrSaysCIDInUse(out):
 			continue // a CID collision: pick another
+		case !kvmRetried && h.perSession && stderrSaysKVMDenied(out):
+			// Something rewrote /dev/kvm's ACL between the pre-exec re-grant
+			// and qemu's open; start re-grants, so try once more.
+			kvmRetried = true
+			continue
 		case spec.Sandbox && stderrSaysNoSeccomp(out):
 			// The probe passed but the VM's sandbox failed: decide again,
 			// for this attempt only.
@@ -1130,9 +1160,15 @@ func (l *Launcher) Open(ctx context.Context, dev BlockDevice, kind, format strin
 	return nil, unavailable("the restore VM did not come up: %v", lastErr)
 }
 
+// stderrSaysKVMDenied reports qemu's refusal to open /dev/kvm.
+func stderrSaysKVMDenied(out string) bool {
+	return strings.Contains(out, "Could not access KVM kernel module: Permission denied") ||
+		strings.Contains(out, "failed to initialize kvm: Permission denied")
+}
+
 // sessionCredential is what a per-session restore VM runs as: its own uid
-// and the restore account's group, nothing else. Not kvm: KVM is given to
-// the uid by an ACL entry (allocUID), and kvm's group-writable sockets —
+// and two groups: the restore account's and its own slot group (below). Not kvm: KVM is given to
+// its slot group by an ACL group entry (allocUID), and kvm's group-writable sockets —
 // libvirt's qemu creates them libvirt-qemu:kvm, among them the pull-mode
 // backup's NBD export of a live guest disk — are pathname unix sockets,
 // which Landlock does not mediate.
@@ -1151,8 +1187,14 @@ func (l *Launcher) ensureKVMGrant(h *host, uid uint32) error {
 	if !h.perSession {
 		return nil
 	}
+	if deviceGroupHasRW(l.kvmPath, uid) {
+		return nil // present: do not rewrite the ACL under a concurrent udev/logind writer
+	}
 	if err := grantDeviceACL(l.kvmPath, uid); err != nil {
 		return unavailable("give restore VM group %d %s (POSIX ACL group entry): %v", uid, l.kvmPath, err)
+	}
+	if !deviceGroupHasRW(l.kvmPath, uid) && !worldRW(l.kvmPath) {
+		return unavailable("restore VM group %d has no read-write ACL entry on %s after it was granted: something is rewriting the device's ACL", uid, l.kvmPath)
 	}
 	return nil
 }

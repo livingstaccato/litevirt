@@ -542,11 +542,12 @@ NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
 guest kernel parses the partition table and mounts each filesystem read-only
 inside the VM. Each restore VM's qemu runs as its own uid from a reserved
 range — so two sessions (possibly two tenants) cannot signal, trace or reach
-each other — with only the `litevirt-restore` group and a group of its own
-slot (never `kvm`: KVM is given to that slot group alone by an ACL group
-entry on `/dev/kvm`, checked again just before the VM starts and removed when
-the session ends — a group entry rather than a user one because udev drops
-every named-user entry on `/dev/kvm` whenever any KVM VM starts or stops), in a network namespace of its own (no UDP, TCP or abstract
+each other — with only the `litevirt-restore` group and a group of its own slot
+(never `kvm`: KVM is given to that slot group alone by an ACL group entry on
+`/dev/kvm`, checked again just before the VM starts and removed when the
+session ends — a group entry rather than a user one because udev drops every
+named-user entry on `/dev/kvm` whenever any KVM VM starts or stops; the
+reserved range must hold no account or group NSS knows), in a network namespace of its own (no UDP, TCP or abstract
 sockets of the host), its seccomp sandbox on and, where AppArmor is enabled, confined by the
 `litevirt-restore-qemu` profile (its boot files, its session's export socket
 and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under

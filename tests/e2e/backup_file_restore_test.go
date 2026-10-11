@@ -124,8 +124,13 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	if grants[uid] != 6 {
 		t.Errorf("/dev/kvm has no read-write ACL group entry for the session's slot group %d: %v", uid, grants)
 	}
-	if !slices.Contains(groups, strconv.FormatUint(uid, 10)) {
-		t.Errorf("the restore VM's qemu is not in its slot group %d, so it cannot use the /dev/kvm entry: Groups: %v", uid, groups)
+	restoreGid := strings.TrimSpace(l.mustSSH(host, 30*time.Second, "getent group litevirt-restore | cut -d: -f3"))
+	wantGroups := []string{restoreGid, strconv.FormatUint(uid, 10)}
+	gs := slices.Clone(groups)
+	slices.Sort(gs)
+	slices.Sort(wantGroups)
+	if !slices.Equal(gs, wantGroups) {
+		t.Errorf("the restore VM's qemu Groups are %v, want exactly the restore group and its slot group %v", groups, wantGroups)
 	}
 	// R4-M2: a network namespace of its own.
 	if len(netns) != 2 || netns[0] == netns[1] || !strings.HasPrefix(netns[0], "net:[") {
@@ -256,9 +261,7 @@ func TestLab_BackupFileRestore(t *testing.T) {
 	// The browsing session ends with the daemon: its VM goes and the
 	// restarted daemon's sweep removes its /dev/kvm grant.
 	frEndSessions(l, host)
-	if g := frReservedGrants(frKVMGrants(l, host)); len(g) != 0 {
-		t.Errorf("/dev/kvm still grants reserved uids after every session ended: %v", g)
-	}
+	frNoReservedGrants(t, l, host, "after every session ended")
 }
 
 // I-4: a daemon restart in the middle of a browsing session leaves no restore
@@ -298,9 +301,7 @@ func TestLab_BackupFileRestore_DaemonRestartKillsTheVM(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	if g := frReservedGrants(frKVMGrants(l, host)); len(g) != 0 {
-		t.Errorf("/dev/kvm grants survived the daemon restart: %v", g)
-	}
+	frNoReservedGrants(t, l, host, "after the daemon restart")
 }
 
 // R2-I1: two restore VMs at once (two backups, possibly two tenants) run as
@@ -351,7 +352,7 @@ func TestLab_BackupFileRestore_ConcurrentSessionsIsolated(t *testing.T) {
 	// uid succeeds), or a missing setpriv, a wrong pid or a dead qemu would
 	// pass it; and the refusal must be a permission error.
 	as := func(uid uint64, cmd string) (string, error) {
-		return l.ssh(host, 30*time.Second, "setpriv --reuid="+strconv.FormatUint(uid, 10)+" --regid=$(getent group litevirt-restore | cut -d: -f3) --clear-groups "+cmd+" 2>&1")
+		return l.ssh(host, 30*time.Second, "setpriv --reuid="+strconv.FormatUint(uid, 10)+" --regid=$(getent group litevirt-restore | cut -d: -f3) --groups=$(getent group litevirt-restore | cut -d: -f3),"+strconv.FormatUint(uid, 10)+" "+cmd+" 2>&1")
 	}
 	denied := func(out string) bool {
 		return strings.Contains(out, "Operation not permitted") || strings.Contains(out, "Permission denied")
@@ -435,9 +436,7 @@ func TestLab_BackupFileRestore_UIDRangeSweep(t *testing.T) {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	if g := frReservedGrants(frKVMGrants(l, host)); len(g) != 0 {
-		t.Errorf("/dev/kvm grants survived the daemon restart: %v", g)
-	}
+	frNoReservedGrants(t, l, host, "after the daemon restart")
 }
 
 // fileRestoreImage is the image of the VM the file-restore e2e backs up: its
@@ -502,8 +501,8 @@ func frReservedProcs(l *lab, host string) []string {
 	return procs
 }
 
-// frACLEntries prints the ACL_GROUP entries ("<gid> <perm>") of /dev/kvm's
-// access ACL, read from the xattr itself. Groups, not users: udev drops every
+// frACLEntries prints the named entries ("<tag> <id> <perm>", tag 2 = user,
+// 8 = group) of /dev/kvm's access ACL, read from the xattr itself. Groups, not users: udev drops every
 // named-user entry whenever a KVM VM starts or stops, so a restore VM's slot
 // group (gid == its reserved uid) is what holds its access.
 const frACLEntries = `import os, struct
@@ -513,8 +512,8 @@ except OSError:
     b = b""
 for i in range(4, len(b) - 7, 8):
     t, p, u = struct.unpack("<HHI", b[i:i + 8])
-    if t == 8:
-        print(u, p)
+    if t in (2, 8):
+        print(t, u, p)
 `
 
 // frTarModes prints "<octal mode> <name>" for every entry of the archive.
@@ -529,22 +528,40 @@ func frPython(script string) string {
 	return "echo " + base64.StdEncoding.EncodeToString([]byte(script)) + " | base64 -d | python3 -"
 }
 
-// frKVMGrants is slot gid (== the session's uid) → permission of every named-group ACL entry on /dev/kvm.
-func frKVMGrants(l *lab, host string) map[uint64]int {
+// frKVMEntries is id → permission of every named ACL entry of the given tag
+// (2 = user, 8 = group) on /dev/kvm.
+func frKVMEntries(l *lab, host string, tag int) map[uint64]int {
 	out := l.mustSSH(host, 30*time.Second, frPython(frACLEntries))
 	g := map[uint64]int{}
 	for _, ln := range strings.Split(strings.TrimSpace(out), "\n") {
 		f := strings.Fields(ln)
-		if len(f) != 2 {
+		if len(f) != 3 {
 			continue
 		}
-		u, err1 := strconv.ParseUint(f[0], 10, 32)
-		p, err2 := strconv.Atoi(f[1])
-		if err1 == nil && err2 == nil {
+		tg, err0 := strconv.Atoi(f[0])
+		u, err1 := strconv.ParseUint(f[1], 10, 32)
+		p, err2 := strconv.Atoi(f[2])
+		if err0 == nil && err1 == nil && err2 == nil && tg == tag {
 			g[u] = p
 		}
 	}
 	return g
+}
+
+// frKVMGrants is slot gid (== the session's uid) → permission of every
+// named-group ACL entry on /dev/kvm.
+func frKVMGrants(l *lab, host string) map[uint64]int { return frKVMEntries(l, host, 8) }
+
+// frNoReservedGrants fails if /dev/kvm still names a reserved restore-VM id,
+// as a group (the grant) or as a user (what an older daemon granted).
+func frNoReservedGrants(t *testing.T, l *lab, host, when string) {
+	t.Helper()
+	if g := frReservedGrants(frKVMGrants(l, host)); len(g) != 0 {
+		t.Errorf("/dev/kvm still has group grants to reserved ids %s: %v", when, g)
+	}
+	if u := frReservedGrants(frKVMEntries(l, host, 2)); len(u) != 0 {
+		t.Errorf("/dev/kvm still has per-user entries for reserved uids %s: %v", when, u)
+	}
 }
 
 // frReservedGrants keeps the grants to reserved restore-VM uids.

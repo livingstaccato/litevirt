@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/tests/e2e/latchparse"
 )
 
 // Backup compression and bandwidth limits on a real node, against a real
@@ -135,7 +136,7 @@ func TestLab_BackupBWLimit_HoldsTheRate(t *testing.T) {
 	rnd := fmt.Sprintf("/var/tmp/e2e-bkbw-rand-%d", time.Now().UnixNano())
 	l.onRestore(func() { _, _ = l.ssh(host, time.Minute, "rm -f "+shellQuote(rnd)) })
 	l.mustSSH(host, 2*time.Minute, "head -c 67108864 /dev/urandom > "+shellQuote(rnd)+
-		" && qemu-io -f qcow2 -c 'write -s "+rnd+" 0 64M' "+shellQuote(disk)+" | tail -3")
+		" && qemu-io -f qcow2 -c 'write -s "+rnd+" 0 64M' "+shellQuote(disk)+" >/dev/null")
 	repo := bkRepo(l, host, "e2e-bkbw")
 	const rate = 4 << 20 // 4 MiB/s
 	_, covered, took := bkSnapshot(l, host, vm, repo, "--bwlimit", "4MiB")
@@ -156,10 +157,8 @@ func TestLab_BackupCompression_DefaultIsNoneBeforeTheLatch(t *testing.T) {
 	host := labUpHosts(l, 1)[0]
 	// The premise is "before the latch": once release_2026_11_v1 has latched,
 	// zstd is allowed and this test has nothing to assert.
-	for _, ln := range strings.Split(l.mustLV(host, "cluster", "upgrade-status"), "\n") {
-		if f := strings.Fields(ln); len(f) > 0 && f[0] == capabilities.ReleaseToken {
-			t.Skipf("%s has latched; the pre-latch refusal cannot be tested", capabilities.ReleaseToken)
-		}
+	if latchparse.TokenLatched(l.mustLV(host, "cluster", "upgrade-status"), capabilities.ReleaseToken) {
+		t.Skipf("%s has latched; the pre-latch refusal cannot be tested", capabilities.ReleaseToken)
 	}
 	repo := bkRepo(l, host, "e2e-bkdef")
 	meta := l.mustSSH(host, 30*time.Second, "cat "+shellQuote(repo+"/repo.json"))

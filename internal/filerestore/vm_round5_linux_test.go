@@ -94,7 +94,16 @@ func TestSessionCredential_NoKVMGroup(t *testing.T) {
 func TestDeviceACL_GrantAndRevoke(t *testing.T) {
 	const base = 3_800_000_000
 	dev := aclDevice(t)
-	if err := grantDeviceACL(dev, 12345); err != nil { // someone else's entry (logind's uaccess)
+	// Someone else's entries: a seat user's (what logind/udev uaccess puts
+	// there) and a group's. A grant must leave both alone.
+	ents, err := readAccessACL(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAccessACL(dev, append(ents, aclEntry{aclUser, aclRW, 1000})); err != nil {
+		t.Fatal(err)
+	}
+	if err := grantDeviceACL(dev, 12345); err != nil {
 		t.Fatal(err)
 	}
 	if err := grantDeviceACL(dev, base+3); err != nil {
@@ -114,7 +123,13 @@ func TestDeviceACL_GrantAndRevoke(t *testing.T) {
 		t.Fatalf("uid %d still has ACL perm %d after the revoke", base+3, p)
 	}
 	if p := groupACL(t, dev, 12345); p != 6 {
-		t.Fatalf("another uid's entry was touched: perm %d", p)
+		t.Fatalf("another group's entry was touched: perm %d", p)
+	}
+	if p := userACL(t, dev, 1000); p != 6 {
+		t.Fatalf("a seat user's entry did not survive the grant and revoke: perm %d", p)
+	}
+	if n, err := revokeDeviceACL(dev, 1000, 1001); err != nil || n != 1 {
+		t.Fatalf("cleanup: %d %v", n, err)
 	}
 	if n, err := revokeDeviceACL(dev, 12345, 12346); err != nil || n != 1 {
 		t.Fatalf("revoke the last named entry: %d %v", n, err)
@@ -399,5 +414,39 @@ func TestStart_ChecksTheKVMGrantBeforeExec(t *testing.T) {
 	g, e := strings.Index(body, "l.ensureKVMGrant(h, uid)"), strings.Index(body, "cmd.Start()")
 	if g < 0 || e < 0 || g > e {
 		t.Fatalf("start does not call ensureKVMGrant before cmd.Start (grant at %d, exec at %d)", g, e)
+	}
+}
+
+// The pre-exec re-check leaves a present entry alone: rewriting the ACL under
+// a concurrent udev or logind writer is what could lose it.
+func TestEnsureKVMGrant_PresentEntryIsNotRewritten(t *testing.T) {
+	const base = 3_800_000_000
+	l := NewLauncher(Config{UIDBase: base})
+	l.kvmPath = aclDevice(t)
+	uid, rel, err := l.allocUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rel()
+	before := aclWrites.Load()
+	if err := l.ensureKVMGrant(&host{perSession: true}, uid); err != nil {
+		t.Fatal(err)
+	}
+	if n := aclWrites.Load() - before; n != 0 {
+		t.Fatalf("a present grant was rewritten (%d ACL writes)", n)
+	}
+}
+
+func TestStderrSaysKVMDenied(t *testing.T) {
+	for _, s := range []string{
+		"qemu-system-x86_64: -accel kvm: Could not access KVM kernel module: Permission denied",
+		"qemu-system-x86_64: -accel kvm: failed to initialize kvm: Permission denied",
+	} {
+		if !stderrSaysKVMDenied(s) {
+			t.Errorf("not recognised: %q", s)
+		}
+	}
+	if stderrSaysKVMDenied("qemu: Could not access KVM kernel module: No such file or directory") {
+		t.Error("a missing module is not a permission problem")
 	}
 }

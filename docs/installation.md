@@ -264,11 +264,12 @@ run as **root** for it (a non-root daemon refuses it). At start, the daemon:
   restore is refused, naming what differs. Restore VMs do not run as this
   account: each runs as its own uid from a reserved range
   (`file_restore.uid_base`, 64 uids from 3800000000, which must belong to no
-  account NSS knows and lie outside `/etc/subuid`, `/etc/subgid` and the
-  containers' id-map range), with this account's group only. A starting
+  account or group NSS knows and lie outside `/etc/subuid`, `/etc/subgid` and
+  the containers' id-map range), with this account's group and its own slot
+  group (the same number as its uid) only. A starting
   daemon kills any process left running as one of these uids;
-- **adds and removes POSIX ACL entries on `/dev/kvm`**: one per restore VM,
-  giving its uid read-write for as long as the session runs (`getfacl
+- **adds and removes POSIX ACL group entries on `/dev/kvm`**: one per restore
+  VM, giving its slot group read-write for as long as the session runs (`getfacl
   /dev/kvm` shows them). A starting daemon removes any a daemon that died
   left;
 - **loads an AppArmor profile `litevirt-restore-qemu`** into the kernel where

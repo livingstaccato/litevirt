@@ -78,11 +78,15 @@ guest kernel exploited by a malicious filesystem controls the agent.
   refuses it (unless `allow_unsandboxed: [root]`: qemu would run as the
   daemon's own user, which owns `data_dir` and its keys). Each restore VM runs
   as **its own uid**, taken from 64 reserved ones (`file_restore.uid_base`,
-  default 3800000000), with the group `litevirt-restore` only — never an
-  account's supplementary groups, and never `kvm`. KVM is given to the
-  session's uid by a POSIX ACL entry on `/dev/kvm`, set when the uid is
-  handed out and removed when it is released; a starting daemon removes any
-  a daemon that died left behind. Not `kvm`, because libvirt's qemu creates
+  default 3800000000), with the group `litevirt-restore` and its own slot
+  group (the reserved gid equal to its uid) only — never an account's
+  supplementary groups, and never `kvm`. KVM is given to the session's slot
+  group by a POSIX ACL group entry on `/dev/kvm` — a group entry, because udev
+  drops every named-user entry whenever a KVM VM starts or stops — set when
+  the slot is handed out, checked again just before qemu starts and removed
+  when it is released; a starting daemon removes any a daemon that died left
+  behind. The launcher refuses a `uid_base` range in which any account or
+  group is known to NSS. Not `kvm`, because libvirt's qemu creates
   group-writable sockets as `libvirt-qemu:kvm` — among them the pull-mode
   backup's NBD export of a live guest disk (`0775` in a `0777` directory) and
   each domain's monitor — and Landlock does not mediate `connect()` to a

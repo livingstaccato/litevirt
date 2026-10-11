@@ -211,6 +211,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 		if prev != nil {
 			adopted = prev.Generation
 		}
+		s.noteAdoptedVoterGen(adopted)
 		row, err := corrosion.GetVoterConfig(ctx, s.db, adopted+1)
 		if err != nil {
 			return adopted, err
@@ -280,6 +281,17 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			}
 			slog.Info("voter set: adopted a generation", "generation", row.Generation, "change", row.Change,
 				"members", strings.Join(row.Names(), ","))
+		}
+	}
+}
+
+// noteAdoptedVoterGen raises the generation Ping reports to g; it never
+// lowers it (two adoption passes can run at once).
+func (s *Server) noteAdoptedVoterGen(g int64) {
+	for {
+		cur := s.adoptedVoterGen.Load()
+		if g <= cur || s.adoptedVoterGen.CompareAndSwap(cur, g) {
+			return
 		}
 	}
 }

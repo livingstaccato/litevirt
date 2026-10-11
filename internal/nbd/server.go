@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 )
 
@@ -47,10 +48,21 @@ type Server struct {
 	ExportName string      // advertised export name (the part after "nbd://host:port/")
 	Dev        BlockDevice // backing storage
 
-	listener net.Listener
-	wg       sync.WaitGroup
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	// PeerCheck, when set, vets each accepted connection before anything is
+	// served on it; a refused connection is closed and the server keeps
+	// waiting for the right peer.
+	PeerCheck func(net.Conn) error
+	// SinglePeer makes the server serve exactly one (vetted) connection: on
+	// accepting it, the listener is closed and a unix socket unlinked, so no
+	// second client — the same or another — can ever connect.
+	SinglePeer bool
+
+	listener  net.Listener
+	unixPath  string
+	peerTaken bool
+	wg        sync.WaitGroup
+	stopOnce  sync.Once
+	stopCh    chan struct{}
 
 	// activeMu guards activeConns. Stop closes every entry so a
 	// blocked-on-Read connection unwinds promptly rather than waiting
@@ -74,6 +86,26 @@ func (s *Server) Listen(addr string) (net.Addr, error) {
 	return l.Addr(), nil
 }
 
+// ListenUnix binds a unix socket at path and makes it owner-only. Put it in
+// a directory only the daemon can enter (file restore uses a 0700 session
+// directory), so it is never reachable by anyone else, even before the
+// chmod. The socket must not exist yet.
+func (s *Server) ListenUnix(path string) error {
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("nbd listen: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("nbd listen: %w", err)
+	}
+	s.listener = l
+	s.unixPath = path
+	s.stopCh = make(chan struct{})
+	s.activeConns = map[net.Conn]struct{}{}
+	return nil
+}
+
 // Serve accepts connections until Stop is called or ctx is cancelled.
 // Blocks. Errors from individual connections are logged but don't tear
 // the server down — qemu retries on disconnect and we don't want a
@@ -89,6 +121,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		case <-s.stopCh:
 		}
 	}()
+	refused := 0
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -96,7 +129,29 @@ func (s *Server) Serve(ctx context.Context) error {
 			case <-s.stopCh:
 				return nil
 			default:
+				if s.peerTaken {
+					return nil // the single peer is being served
+				}
 				return fmt.Errorf("nbd accept: %w", err)
+			}
+		}
+		if s.PeerCheck != nil {
+			if err := s.PeerCheck(conn); err != nil {
+				_ = conn.Close()
+				refused++
+				slog.Warn("nbd: refused a connection that is not the expected peer", "error", err)
+				if refused >= 64 {
+					s.Stop()
+					return fmt.Errorf("nbd: %d connections refused; giving up", refused)
+				}
+				continue
+			}
+		}
+		if s.SinglePeer {
+			s.peerTaken = true
+			_ = s.listener.Close()
+			if s.unixPath != "" {
+				_ = os.Remove(s.unixPath)
 			}
 		}
 		s.trackConn(conn)

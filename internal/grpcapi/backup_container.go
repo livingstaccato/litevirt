@@ -271,7 +271,13 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 
 	s.audit(ctx, "ct.backup", req.Name, "project="+project+" → "+req.RepoPath, "started")
 
-	manifest, perr := s.archiveContainer(ctx, repo, rec, timestamp, func(p pbsstore.PushProgress) {
+	lim := s.backupRateLimit(ctx, req.RepoPath, req.BwlimitBytesPerSec)
+	if bps := minPositive(req.BwlimitBytesPerSec, s.targetRate(ctx, req.RepoPath)); bps > 0 {
+		_ = send(&pb.BackupContainerProgress{
+			Phase: pb.BackupContainerProgress_COPY, Status: "bandwidth limit " + pbsstore.FormatRate(bps),
+		})
+	}
+	manifest, perr := s.archiveContainer(ctx, repo, rec, timestamp, lim, func(p pbsstore.PushProgress) {
 		_ = send(&pb.BackupContainerProgress{
 			Phase:          pb.BackupContainerProgress_COPY,
 			BytesProcessed: p.BytesProcessed, BytesNew: p.BytesNew,
@@ -286,7 +292,8 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if pushToSink {
 		// Stream the just-created manifest + its missing chunks to the sink's repo.
 		// The sink records its own usage index; we don't double-count here.
-		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest); err != nil {
+		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest,
+			s.backupRateLimit(ctx, req.RepoPath, req.BwlimitBytesPerSec)); err != nil {
 			s.audit(ctx, "ct.backup", req.Name, "project="+project, "error")
 			return err
 		}
@@ -326,6 +333,9 @@ func (s *Server) sinkRemoteContainerBackup(ctx context.Context, owner string, re
 
 	fwd := proto.Clone(req).(*pb.BackupContainerRequest)
 	fwd.SinkHost = s.hostName
+	// See sinkRemoteVMBackup: the owner reads and sends under the lower of the
+	// job's limit and this sink's limit for the target.
+	fwd.BwlimitBytesPerSec = s.forwardRate(ctx, req.RepoPath, req.BwlimitBytesPerSec)
 	stream2, err := c.BackupContainer(ctx, fwd)
 	if err != nil {
 		return err
@@ -658,13 +668,14 @@ func (s *Server) findLatestContainerBackupFor(ctName string, owner *corrosion.Co
 // so a restore is self-contained. The caller holds the ct lock and has already
 // quiesced the container (frozen for a live backup, or stopped for migration).
 // Shared by BackupContainer and MigrateContainer — one tested data path.
-func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
-	return s.archiveContainerAs(ctx, repo, rec, timestamp, nil, progress)
+// lim (nil = none) is the bandwidth limit the archive is read under.
+func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, lim pbsstore.RateLimiter, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
+	return s.archiveContainerAs(ctx, repo, rec, timestamp, nil, lim, progress)
 }
 
 // archiveContainerAs is archiveContainer with the manifest optionally marked as
 // a replica (mark non-nil).
-func (s *Server) archiveContainerAs(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, mark *containerReplicaMark, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
+func (s *Server) archiveContainerAs(ctx context.Context, repo *pbsstore.Repo, rec *corrosion.ContainerRecord, timestamp string, mark *containerReplicaMark, lim pbsstore.RateLimiter, progress func(pbsstore.PushProgress)) (*pbsstore.Manifest, error) {
 	specJSON, _ := json.Marshal(containerBackupSpec{
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
@@ -686,7 +697,7 @@ func (s *Server) archiveContainerAs(ctx context.Context, repo *pbsstore.Repo, re
 	// file that changed size (pbsstore/cdc.go).
 	m, perr := pbsstore.PushDisk(ctx, repo, pr, pbsstore.PushOptions{
 		VMName: rec.Name, DiskName: containerBackupDisk, Timestamp: timestamp,
-		ContainerSpecJSON: string(specJSON), Progress: progress, ContentDefined: mark != nil,
+		ContainerSpecJSON: string(specJSON), Progress: progress, ContentDefined: mark != nil, RateLimit: lim,
 	})
 	_ = pr.CloseWithError(perr)
 	return m, perr

@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/filerestore"
+	"github.com/litevirt/litevirt/internal/filerestore/agent"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -17,6 +19,18 @@ var (
 )
 
 func main() {
+	// Inside a restore VM this binary is /init, the file-restore agent
+	// (internal/filerestore). Nothing else of the CLI applies there.
+	if agent.IsAgent() {
+		agent.RunAgent()
+		return
+	}
+	// A restore VM's qemu is exec'd through this binary to confine it by
+	// AppArmor first (filerestore.RunTrampoline).
+	if len(os.Args) > 1 && os.Args[1] == filerestore.TrampolineArg {
+		filerestore.RunTrampoline(os.Args[2:])
+		return
+	}
 	bootstrapDefaultLogger()
 	// Handle --version before cobra so the output format is stable and
 	// independent of the command tree. `lv host upgrade` execs `<binary>

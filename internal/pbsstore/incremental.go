@@ -88,6 +88,10 @@ func PushIncremental(
 			return ctx.Err()
 		default:
 		}
+		// A sequential source is read in full, clean windows included.
+		if err := opts.waitRate(ctx, len(data)); err != nil {
+			return err
+		}
 		size := int64(len(data))
 		if !bitmap.IsDirty(off, size) {
 			// Reuse parent ref if it lines up. Falling through to the
@@ -205,6 +209,9 @@ func pushIncrementalSeek(
 		n, rerr := ra.ReadAt(buf[:csize], off)
 		if rerr != nil && rerr != io.EOF {
 			return nil, fmt.Errorf("read at offset %d: %w", off, rerr)
+		}
+		if err := opts.waitRate(ctx, n); err != nil {
+			return nil, err
 		}
 		chunk := append([]byte(nil), buf[:n]...)
 		id, created, perr := repo.PutChunk(chunk)

@@ -260,7 +260,7 @@ binding can:
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
   a NIC (`lv sg bind`) is `network.update` on the VM's own path.
 - **Backup repository maintenance** (`backup.verify`, `backup.gc`,
-  `backup.prune`, `backup.sync`) is checked at `/`. These are the
+  `backup.prune`, `backup.sync`, `backup.compression`) is checked at `/`. These are the
   `VerifyBackupRepo`, `GarbageCollectBackupRepo`, `PruneBackupRepo` and
   `SyncBackupRepo` RPCs, which the web UI's `/backups` actions call. A repo holds
   every project's backups, so a project-scoped grant cannot reach it. Operator

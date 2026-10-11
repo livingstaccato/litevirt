@@ -135,6 +135,9 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 		return stream.Send(p)
 	}
 	statusMsg := fmt.Sprintf("backing up %s/%s → %s", req.VmName, disk.DiskName, req.RepoPath)
+	if lim := minPositive(req.BwlimitBytesPerSec, s.targetRate(ctx, req.RepoPath)); lim > 0 {
+		statusMsg += " (bandwidth limit " + pbsstore.FormatRate(lim) + ")"
+	}
 	if err := send(&pb.BackupSnapshotProgress{
 		Phase:  pb.BackupSnapshotProgress_SNAPSHOT,
 		Status: statusMsg,
@@ -154,7 +157,8 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 
 	if pushToSink {
 		// Stream the just-created manifest + its missing chunks to the sink's repo.
-		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest); err != nil {
+		if err := s.pushManifestToPeerRepo(ctx, req.SinkHost, req.RepoPath, repo, manifest,
+			s.backupRateLimit(ctx, req.RepoPath, req.BwlimitBytesPerSec)); err != nil {
 			s.recordVMEvent(ctx, req.VmName, "backup.failed", "error", err.Error())
 			s.notify(ctx, notify.Notification{
 				Kind: "backup.failed", Severity: notify.SevError, Subject: req.VmName, Detail: err.Error(),
@@ -208,6 +212,9 @@ func (s *Server) sinkRemoteVMBackup(ctx context.Context, vm *corrosion.VMRecord,
 
 	fwd := proto.Clone(req).(*pb.BackupSnapshotRequest)
 	fwd.SinkHost = s.hostName // tell the owner to push back to us
+	// The owner reads and sends; it does not know this sink's limit for the
+	// target, so hand it the lower of the two as the job's own.
+	fwd.BwlimitBytesPerSec = s.forwardRate(ctx, req.RepoPath, req.BwlimitBytesPerSec)
 	owner, err := c.BackupSnapshot(ctx, fwd)
 	if err != nil {
 		return err
@@ -304,6 +311,9 @@ func (s *Server) pushBackup(
 	opts := pbsstore.PushOptions{
 		VMName: req.VmName, DiskName: disk.DiskName,
 		Timestamp: timestamp, Progress: progress,
+		// The job's own limit and the target repo's shared one; the
+		// scheduler names the target by its path, an RPC by its name.
+		RateLimit: s.backupRateLimit(ctx, req.RepoPath, req.BwlimitBytesPerSec),
 	}
 	// Embed the VM spec on the root-disk manifest so a live restore can
 	// auto-define the domain without the source cluster (the spec already

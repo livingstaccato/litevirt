@@ -162,12 +162,15 @@ const (
 	LiteVirt_ReloadFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ReloadFirewall"
 	LiteVirt_BackupSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/BackupSnapshot"
 	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
+	LiteVirt_ListBackupFiles_FullMethodName            = "/litevirt.v1.LiteVirt/ListBackupFiles"
+	LiteVirt_RestoreBackupFiles_FullMethodName         = "/litevirt.v1.LiteVirt/RestoreBackupFiles"
 	LiteVirt_HasChunks_FullMethodName                  = "/litevirt.v1.LiteVirt/HasChunks"
 	LiteVirt_PushBackup_FullMethodName                 = "/litevirt.v1.LiteVirt/PushBackup"
 	LiteVirt_VerifyBackupRepo_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyBackupRepo"
 	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
 	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
 	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
+	LiteVirt_SetBackupRepoCompression_FullMethodName   = "/litevirt.v1.LiteVirt/SetBackupRepoCompression"
 	LiteVirt_ListBackupRepoSnapshots_FullMethodName    = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
 	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
 	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
@@ -575,6 +578,12 @@ type LiteVirtClient interface {
 	// ── Backup snapshots ──
 	BackupSnapshot(ctx context.Context, in *BackupSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupSnapshotProgress], error)
 	RestoreFromBackup(ctx context.Context, in *RestoreFromBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreFromBackupProgress], error)
+	// Single-file restore: browse a backup and extract files from it. The
+	// filesystem is read inside a throwaway restore VM, never on the host
+	// (docs/design/backup-file-restore.md). Same permission as a full restore
+	// of the VM or container; each extraction is audited.
+	ListBackupFiles(ctx context.Context, in *ListBackupFilesRequest, opts ...grpc.CallOption) (*ListBackupFilesResponse, error)
+	RestoreBackupFiles(ctx context.Context, in *RestoreBackupFilesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreBackupFilesChunk], error)
 	// ── Peer streaming backup transport (PR 4) ──
 	// Move ONE manifest + only its missing chunks between two daemons over peer
 	// mTLS, so backup/restore/migrate no longer need a shared NFS repo. Peer-only
@@ -588,10 +597,15 @@ type LiteVirtClient interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(ctx context.Context, in *VerifyBackupRepoRequest, opts ...grpc.CallOption) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error)
@@ -2610,6 +2624,35 @@ func (c *liteVirtClient) RestoreFromBackup(ctx context.Context, in *RestoreFromB
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_RestoreFromBackupClient = grpc.ServerStreamingClient[RestoreFromBackupProgress]
 
+func (c *liteVirtClient) ListBackupFiles(ctx context.Context, in *ListBackupFilesRequest, opts ...grpc.CallOption) (*ListBackupFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBackupFilesResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListBackupFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RestoreBackupFiles(ctx context.Context, in *RestoreBackupFilesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreBackupFilesChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_RestoreBackupFiles_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RestoreBackupFilesRequest, RestoreBackupFilesChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_RestoreBackupFilesClient = grpc.ServerStreamingClient[RestoreBackupFilesChunk]
+
 func (c *liteVirtClient) HasChunks(ctx context.Context, in *HasChunksRequest, opts ...grpc.CallOption) (*HasChunksResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HasChunksResponse)
@@ -2622,7 +2665,7 @@ func (c *liteVirtClient) HasChunks(ctx context.Context, in *HasChunksRequest, op
 
 func (c *liteVirtClient) PushBackup(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushBackupFrame, PushBackupResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_PushBackup_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_PushBackup_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2667,6 +2710,16 @@ func (c *liteVirtClient) SyncBackupRepo(ctx context.Context, in *SyncBackupRepoR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SyncBackupRepoResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_SyncBackupRepo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetBackupRepoCompression(ctx context.Context, in *SetBackupRepoCompressionRequest, opts ...grpc.CallOption) (*SetBackupRepoCompressionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetBackupRepoCompressionResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SetBackupRepoCompression_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2805,7 +2858,7 @@ func (c *liteVirtClient) PullOCIImage(ctx context.Context, in *PullOCIImageReque
 
 func (c *liteVirtClient) BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_BackupContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_BackupContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2824,7 +2877,7 @@ type LiteVirt_BackupContainerClient = grpc.ServerStreamingClient[BackupContainer
 
 func (c *liteVirtClient) RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_RestoreContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[27], LiteVirt_RestoreContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2843,7 +2896,7 @@ type LiteVirt_RestoreContainerClient = grpc.ServerStreamingClient[RestoreContain
 
 func (c *liteVirtClient) MigrateContainer(ctx context.Context, in *MigrateContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[27], LiteVirt_MigrateContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[28], LiteVirt_MigrateContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2972,7 +3025,7 @@ func (c *liteVirtClient) GetClusterStatus(ctx context.Context, in *emptypb.Empty
 
 func (c *liteVirtClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ClusterEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[28], LiteVirt_StreamEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_StreamEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3061,7 +3114,7 @@ func (c *liteVirtClient) ListStoragePoolContents(ctx context.Context, in *ListSt
 
 func (c *liteVirtClient) UploadStoragePoolContent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadStoragePoolContentRequest, UploadStoragePoolContentResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3434,7 +3487,7 @@ func (c *liteVirtClient) SetISOLibraryMode(ctx context.Context, in *SetISOLibrar
 
 func (c *liteVirtClient) FetchISOLibraryFile(ctx context.Context, in *FetchISOLibraryFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchISOLibraryFileChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_FetchISOLibraryFile_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_FetchISOLibraryFile_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3453,7 +3506,7 @@ type LiteVirt_FetchISOLibraryFileClient = grpc.ServerStreamingClient[FetchISOLib
 
 func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3476,7 +3529,7 @@ func (c *liteVirtClient) ListReplicas(ctx context.Context, in *ListReplicasReque
 
 func (c *liteVirtClient) PushReplica(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaRequest, PushReplicaResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_PushReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_PushReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3619,7 +3672,7 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 
 func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3682,7 +3735,7 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 
 func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3701,7 +3754,7 @@ type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
 func (c *liteVirtClient) StreamTableDump(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3730,7 +3783,7 @@ func (c *liteVirtClient) GetSensitiveStateDigest(ctx context.Context, in *Sensit
 
 func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3759,7 +3812,7 @@ func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDi
 
 func (c *liteVirtClient) StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3778,7 +3831,7 @@ type LiteVirt_StreamTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
 
 func (c *liteVirtClient) StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[39], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3847,7 +3900,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[39], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4076,7 +4129,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4245,7 +4298,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[42], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4701,6 +4754,12 @@ type LiteVirtServer interface {
 	// ── Backup snapshots ──
 	BackupSnapshot(*BackupSnapshotRequest, grpc.ServerStreamingServer[BackupSnapshotProgress]) error
 	RestoreFromBackup(*RestoreFromBackupRequest, grpc.ServerStreamingServer[RestoreFromBackupProgress]) error
+	// Single-file restore: browse a backup and extract files from it. The
+	// filesystem is read inside a throwaway restore VM, never on the host
+	// (docs/design/backup-file-restore.md). Same permission as a full restore
+	// of the VM or container; each extraction is audited.
+	ListBackupFiles(context.Context, *ListBackupFilesRequest) (*ListBackupFilesResponse, error)
+	RestoreBackupFiles(*RestoreBackupFilesRequest, grpc.ServerStreamingServer[RestoreBackupFilesChunk]) error
 	// ── Peer streaming backup transport (PR 4) ──
 	// Move ONE manifest + only its missing chunks between two daemons over peer
 	// mTLS, so backup/restore/migrate no longer need a shared NFS repo. Peer-only
@@ -4714,10 +4773,15 @@ type LiteVirtServer interface {
 	// daemon to a repo it holds, under RBAC and on the audit record. The web
 	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
 	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	// SetBackupRepoCompression (verb backup.compression, same place and floor)
+	// creates a repo with zstd chunk compression, or turns zstd on for an
+	// existing one, through the release token's backup_zstd gate: it is the
+	// daemon-side half of `lv backup repo init|set-compression`.
 	VerifyBackupRepo(context.Context, *VerifyBackupRepoRequest) (*VerifyBackupRepoResponse, error)
 	GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error)
+	SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error)
 	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
 	// a read, so not audited.
 	ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error)
@@ -5568,6 +5632,12 @@ func (UnimplementedLiteVirtServer) BackupSnapshot(*BackupSnapshotRequest, grpc.S
 func (UnimplementedLiteVirtServer) RestoreFromBackup(*RestoreFromBackupRequest, grpc.ServerStreamingServer[RestoreFromBackupProgress]) error {
 	return status.Error(codes.Unimplemented, "method RestoreFromBackup not implemented")
 }
+func (UnimplementedLiteVirtServer) ListBackupFiles(context.Context, *ListBackupFilesRequest) (*ListBackupFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBackupFiles not implemented")
+}
+func (UnimplementedLiteVirtServer) RestoreBackupFiles(*RestoreBackupFilesRequest, grpc.ServerStreamingServer[RestoreBackupFilesChunk]) error {
+	return status.Error(codes.Unimplemented, "method RestoreBackupFiles not implemented")
+}
 func (UnimplementedLiteVirtServer) HasChunks(context.Context, *HasChunksRequest) (*HasChunksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method HasChunks not implemented")
 }
@@ -5585,6 +5655,9 @@ func (UnimplementedLiteVirtServer) PruneBackupRepo(context.Context, *PruneBackup
 }
 func (UnimplementedLiteVirtServer) SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) SetBackupRepoCompression(context.Context, *SetBackupRepoCompressionRequest) (*SetBackupRepoCompressionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetBackupRepoCompression not implemented")
 }
 func (UnimplementedLiteVirtServer) ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListBackupRepoSnapshots not implemented")
@@ -8465,6 +8538,35 @@ func _LiteVirt_RestoreFromBackup_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_RestoreFromBackupServer = grpc.ServerStreamingServer[RestoreFromBackupProgress]
 
+func _LiteVirt_ListBackupFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBackupFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListBackupFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListBackupFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListBackupFiles(ctx, req.(*ListBackupFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RestoreBackupFiles_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(RestoreBackupFilesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).RestoreBackupFiles(m, &grpc.GenericServerStream[RestoreBackupFilesRequest, RestoreBackupFilesChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_RestoreBackupFilesServer = grpc.ServerStreamingServer[RestoreBackupFilesChunk]
+
 func _LiteVirt_HasChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HasChunksRequest)
 	if err := dec(in); err != nil {
@@ -8558,6 +8660,24 @@ func _LiteVirt_SyncBackupRepo_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SyncBackupRepo(ctx, req.(*SyncBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetBackupRepoCompression_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetBackupRepoCompressionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetBackupRepoCompression_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetBackupRepoCompression(ctx, req.(*SetBackupRepoCompressionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11895,6 +12015,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_ReloadFirewall_Handler,
 		},
 		{
+			MethodName: "ListBackupFiles",
+			Handler:    _LiteVirt_ListBackupFiles_Handler,
+		},
+		{
 			MethodName: "HasChunks",
 			Handler:    _LiteVirt_HasChunks_Handler,
 		},
@@ -11913,6 +12037,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SyncBackupRepo",
 			Handler:    _LiteVirt_SyncBackupRepo_Handler,
+		},
+		{
+			MethodName: "SetBackupRepoCompression",
+			Handler:    _LiteVirt_SetBackupRepoCompression_Handler,
 		},
 		{
 			MethodName: "ListBackupRepoSnapshots",
@@ -12633,6 +12761,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "RestoreFromBackup",
 			Handler:       _LiteVirt_RestoreFromBackup_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RestoreBackupFiles",
+			Handler:       _LiteVirt_RestoreBackupFiles_Handler,
 			ServerStreams: true,
 		},
 		{

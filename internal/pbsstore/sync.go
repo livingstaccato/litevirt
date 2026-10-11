@@ -81,6 +81,13 @@ func (s *localSink) PutManifest(_ context.Context, m *Manifest) error {
 // already-transferred content-addressed chunks remain only as harmless,
 // GC-collectable orphans (nothing references them).
 func SyncManifest(ctx context.Context, src *Repo, m *Manifest, dst ChunkSink) (SyncStats, error) {
+	return SyncManifestLimited(ctx, src, m, dst, nil)
+}
+
+// SyncManifestLimited is SyncManifest with a bandwidth limit: lim (when
+// non-nil) is charged for every chunk byte sent to dst. Chunks the
+// destination already holds cost nothing.
+func SyncManifestLimited(ctx context.Context, src *Repo, m *Manifest, dst ChunkSink, lim RateLimiter) (SyncStats, error) {
 	var stats SyncStats
 
 	// De-duplicate ids: a manifest can reference the same chunk at multiple
@@ -117,6 +124,11 @@ func SyncManifest(ctx context.Context, src *Repo, m *Manifest, dst ChunkSink) (S
 		data, err := src.GetChunk(id)
 		if err != nil {
 			return stats, fmt.Errorf("read source chunk %s: %w", id, err)
+		}
+		if lim != nil {
+			if err := lim.WaitN(ctx, len(data)); err != nil {
+				return stats, err
+			}
 		}
 		if err := dst.PutChunk(ctx, data); err != nil {
 			return stats, fmt.Errorf("put destination chunk %s: %w", id, err)

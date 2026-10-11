@@ -276,7 +276,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_ARCHIVING, Status: "archiving rootfs into staging repo"})
-	if _, err := s.archiveContainer(ctx, repo, rec, timestamp, func(p pbsstore.PushProgress) {
+	if _, err := s.archiveContainer(ctx, repo, rec, timestamp, nil, func(p pbsstore.PushProgress) {
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_ARCHIVING, BytesProcessed: p.BytesProcessed})
 	}); err != nil {
 		return rollback(fmt.Errorf("archive: %w", err))

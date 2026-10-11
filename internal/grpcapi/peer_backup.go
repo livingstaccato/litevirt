@@ -455,7 +455,10 @@ func (s *Server) SweepTransferStaging() {
 // pushManifestToPeerRepo streams one manifest + its missing chunks from a local
 // (staging) repo into a peer's CONFIGURED logical repo over peer mTLS — the owner
 // side of remote VM/CT backup (the owner pushes to the sink's repo by name).
-func (s *Server) pushManifestToPeerRepo(ctx context.Context, sinkHost, repoName string, srcRepo *pbsstore.Repo, m *pbsstore.Manifest) error {
+//
+// lim (nil = none) paces the chunks sent: a backup's bandwidth limit covers
+// the wire as well as the read.
+func (s *Server) pushManifestToPeerRepo(ctx context.Context, sinkHost, repoName string, srcRepo *pbsstore.Repo, m *pbsstore.Manifest, lim pbsstore.RateLimiter) error {
 	c, closeConn, err := s.dialPeer(ctx, sinkHost)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "reach sink host %q: %v", sinkHost, err)
@@ -463,7 +466,7 @@ func (s *Server) pushManifestToPeerRepo(ctx context.Context, sinkHost, repoName 
 	defer closeConn()
 	sink := newRemoteRepoSink(ctx, c, &pb.RepoTarget{RepoName: repoName})
 	defer sink.Close()
-	if _, err := pbsstore.SyncManifest(ctx, srcRepo, m, sink); err != nil {
+	if _, err := pbsstore.SyncManifestLimited(ctx, srcRepo, m, sink, lim); err != nil {
 		// SyncManifest wraps the sink's RPC error (status.Code unwraps the %w chain).
 		// Preserve the sink-returned status so the operator sees the real reason —
 		// e.g. FailedPrecondition for an encrypted sink repo without daemon-side key

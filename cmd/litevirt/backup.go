@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 func newBackupCmd() *cobra.Command {
@@ -23,6 +24,8 @@ func newBackupCmd() *cobra.Command {
 		newBackupSnapshotCmd(),
 		newBackupRestoreFromCmd(),
 		newBackupRestoreLiveCmd(),
+		newBackupFileLsCmd(),
+		newBackupFileRestoreCmd(),
 		newBackupScheduleCmd(),
 	)
 	return cmd
@@ -184,7 +187,7 @@ func newBackupScheduleRmCmd() *cobra.Command {
 // newBackupSnapshotCmd is the gRPC-driven push: streams a VM's disk
 // into a host-local backup repo via the daemon.
 func newBackupSnapshotCmd() *cobra.Command {
-	var disk, repo, ts, quiesce string
+	var disk, repo, ts, quiesce, bwlimit string
 	var incremental bool
 	cmd := &cobra.Command{
 		Use:   "snapshot <vm>",
@@ -203,10 +206,15 @@ intact (but disk I/O is full).`,
 			if repo == "" {
 				return fmt.Errorf("--repo is required")
 			}
+			bps, err := pbsstore.ParseRate(bwlimit)
+			if err != nil {
+				return fmt.Errorf("--bwlimit: %w", err)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.BackupSnapshot(ctx, &pb.BackupSnapshotRequest{
 					VmName: args[0], DiskName: disk, RepoPath: repo,
 					Timestamp: ts, Incremental: incremental, Quiesce: quiesce,
+					BwlimitBytesPerSec: bps,
 				})
 				if err != nil {
 					return err
@@ -246,6 +254,7 @@ intact (but disk I/O is full).`,
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Override snapshot timestamp (RFC3339)")
 	cmd.Flags().BoolVar(&incremental, "incremental", false, "Push only chunks changed since the most-recent manifest in this repo")
 	cmd.Flags().StringVar(&quiesce, "quiesce", "auto", "In-guest fs-freeze for an app-consistent backup: auto (freeze if guest agent present) | off")
+	cmd.Flags().StringVar(&bwlimit, "bwlimit", "", "Bandwidth limit for this backup, per second (e.g. 50MiB, 512K); the repo's backup_bwlimits limit still applies")
 	return cmd
 }
 

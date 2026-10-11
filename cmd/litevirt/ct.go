@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 // newCTCmd groups container subcommands.: by default these
@@ -559,7 +560,7 @@ func newCTPullCmd() *cobra.Command {
 // newCTBackupCmd pushes a container's rootfs+config into a backup repo as a
 // full, content-addressed manifest (dedup against earlier backups is automatic).
 func newCTBackupCmd() *cobra.Command {
-	var host, repo, ts string
+	var host, repo, ts, bwlimit string
 	cmd := &cobra.Command{
 		Use:   "backup <name>",
 		Short: "Back up a container's rootfs into a repo (full, dedup chunks)",
@@ -575,9 +576,14 @@ daemon names it if you don't).`,
 			if repo == "" {
 				return fmt.Errorf("--repo is required")
 			}
+			bps, err := pbsstore.ParseRate(bwlimit)
+			if err != nil {
+				return fmt.Errorf("--bwlimit: %w", err)
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.BackupContainer(ctx, &pb.BackupContainerRequest{
 					Name: args[0], HostName: host, RepoPath: repo, Timestamp: ts,
+					BwlimitBytesPerSec: bps,
 				})
 				if err != nil {
 					return err
@@ -608,6 +614,7 @@ daemon names it if you don't).`,
 	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
 	cmd.Flags().StringVar(&repo, "repo", "", "Backup repo path (host-local)")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Override snapshot timestamp (RFC3339)")
+	cmd.Flags().StringVar(&bwlimit, "bwlimit", "", "Bandwidth limit for this backup, per second (e.g. 50MiB, 512K); the repo's backup_bwlimits limit still applies")
 	return cmd
 }
 

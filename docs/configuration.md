@@ -632,6 +632,48 @@ backup_repos:
   main: /srv/backup/main
   offsite: /mnt/dr/offsite
 
+# Backup bandwidth limits, per repo (by logical name), per second: "100MiB",
+# "512K" or a byte count; at least 64KiB (0 = none). One limit is shared by every backup job THIS host
+# runs into the repo (a scheduled fan-out moves at the repo's rate in total),
+# and covers the disk read and, for a remote backup, the chunks sent to the
+# repo's host. When this host is the repo's sink for a remote backup, it hands
+# its limit to the host that reads the disk. A job's own `--bwlimit` can only
+# lower it. Absent or 0 = no limit; an invalid value refuses to start the
+# daemon. See docs/backups.md#bandwidth-limits.
+backup_bwlimits:
+  offsite: 100MiB
+
+# Single-file restore (lv backup file-ls / file-restore). The backup is read
+# inside a throwaway restore VM booted from this host's own kernel; every key
+# is optional. See docs/design/backup-file-restore.md.
+file_restore:
+  enabled: true              # false refuses file restore (full restore is unaffected)
+  kernel: ""                 # default /boot/vmlinuz-<running release>
+  modules_dir: ""            # default /lib/modules/<running release>
+  qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
+  memory_mib: 512            # the restore VM's memory (at least 256)
+  run_as: ""                 # restore account whose group reads the boot files; default litevirt-restore
+                             # (created at daemon start). qemu runs as a per-session uid (uid_base), not as it.
+                             # root, libvirt-qemu, qemu and nobody are refused unless allow_shared_run_as
+  idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
+  max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
+  max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
+  max_extract_bytes: 16G     # per extraction; a request can only lower it
+  uid_base: 3800000000       # first of 64 uids reserved for restore VMs, one per session; must belong to no
+                             # account (NSS, getent), lie outside /etc/subuid, /etc/subgid and the containers'
+                             # idmap range (an explicit uid_base inside that range refuses to load)
+  allow_shared_run_as: false # DANGEROUS. true permits run_as to be root or a shared qemu user (libvirt-qemu,
+                             # qemu, nobody): the restore VM then shares an identity with production VMs.
+  allow_unsandboxed: false   # DANGEROUS. A list of the barriers a restore VM may run without, e.g. [seccomp]:
+                             #   seccomp - qemu's seccomp sandbox;
+                             #   mac     - mandatory access control: the AppArmor profile (AppArmor on but
+                             #             apparmor_parser missing) and Landlock (a host with neither);
+                             #   root    - a root daemon (a non-root daemon runs qemu as itself, with its
+                             #             data_dir and keys).
+                             # true lifts all three. Each removes a barrier between a malicious backup and the
+                             # host; while set, the host raises file_restore_unsandboxed. Install a qemu with
+                             # seccomp and apparmor_parser, use a kernel with Landlock, run the daemon as root.
+
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON
 # {kind, project, subject, vcpu, mem_mib, disk_gib, …, at} on every

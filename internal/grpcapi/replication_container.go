@@ -661,7 +661,7 @@ func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureG
 		Placement: corrosion.PlacementOf(rec.CreateSpec), Incarnation: rec.CreatedAt,
 		Epoch: rec.OwnerEpoch, Keep: sched.KeepReplicas, Bases: s.containerBases(rec),
 	}
-	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, func(pbsstore.PushProgress) {})
+	manifest, err := s.archiveContainerAs(ctx, staging, rec, runAt.UTC().Format(time.RFC3339), mark, nil, func(pbsstore.PushProgress) {})
 	if err != nil {
 		return fmt.Errorf("archive container: %w", err)
 	}

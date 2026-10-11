@@ -61,10 +61,19 @@ func TestPoolRootDiskBacking_RefusesAPathAsTheImageName(t *testing.T) {
 	}
 }
 
-func TestPoolRootDiskBacking_CephKeepsItsSnapshotName(t *testing.T) {
+// A ceph root disk is built from the same image store file as any other
+// (imported into the pool once, then cloned): the name an image create
+// carries, auto-pulled like every image, never a caller-named rbd snapshot.
+func TestPoolRootDiskBacking_CephUsesTheImageStoreFile(t *testing.T) {
 	s := poolBackingServer(t)
-	got, err := s.poolRootDiskBacking("rbd/base@gold", "ceph")
-	if err != nil || got != "rbd/base@gold" {
-		t.Fatalf("ceph clone source = %q, %v; want it unchanged", got, err)
+	if err := qcow2.Create(s.images.ImagePath("cirros"), 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.poolRootDiskBacking("cirros", "ceph")
+	if err != nil || got != s.images.ImagePath("cirros") {
+		t.Fatalf("ceph backing = %q, %v; want the image store file", got, err)
+	}
+	if _, err := s.poolRootDiskBacking("rbd/base@gold", "ceph"); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("an rbd snapshot spec as the image: got %v, want InvalidArgument", err)
 	}
 }

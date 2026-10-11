@@ -701,7 +701,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	cdromSources := ens.remap
 	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
+	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources, RBDLocators: s.rbdLocatorsOf(ctx, vm.Name)}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true
 		mp.TargetAddress = corrosion.URIHost(route.addr)

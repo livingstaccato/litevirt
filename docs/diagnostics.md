@@ -1842,6 +1842,77 @@ on a stale decision.
    `<data_dir>/containers/<name>/owner_epoch` if it exists.
 4. The next reconcile pass resolves the condition.
 
+### A host's ceph keyring holds another key (`ceph_keyring_mismatch`)
+
+Each host records a one-way fingerprint of the key its ceph pool's keyring
+holds on its own row of the pool. When another host's row of the same pool
+records a different key, the host raises `ceph_keyring_mismatch` (evaluator
+`ceph_pool`, subject `host/<pool>@<host>`, warning) naming itself and the
+hosts whose key differs. It is a diagnostic: a start is gated on the host's
+own key opening each disk (`rbd info`), never on other hosts' rows; a live
+migration onto a host whose key differs from the source host's is refused
+before libvirt is asked. Install the cluster's keyring for the client on the
+odd host; the next reconcile (30 s) resolves the condition.
+See [storage.md](storage.md#ceph-rbd-pools).
+
+### A deleted ceph image is not purged from the trash (`ceph_trash_leftover`)
+
+A ceph image a VM delete (or a rollback of litevirt's own copy) removes is
+moved to its pool's trash, and its objects are purged in the background with
+`rbd trash rm <pool>/<id>`, retried until it succeeds and resumed after a
+daemon restart. While a purge this host owes has failed, the host raises
+`ceph_trash_leftover` (evaluator `ceph_pool`, subject `host/<host>`, warning).
+The evidence lists each leftover with its trash reference (`<pool>/<id>`), the
+image it was, a `state`, why it is listed, and the command that deals with it
+by hand (`by_hand`):
+
+- `purge_failing`: the purge keeps failing and is retried. The image's
+  capacity stays used until then. Common causes: the cluster unreachable from
+  the host, or snapshots on it. By hand: `rbd trash rm <pool>/<id>`.
+- `held`: a client has the image open in the trash. It opened the image just
+  before the move, and `rbd trash mv` does not refuse an open image. It may be
+  a running VM's disk, so it is **never purged automatically**. Put it back
+  with `rbd trash restore <pool>/<id>`.
+- `half_moved`: a `rbd trash mv` that failed left the image both in the trash
+  and under its name. It is never purged. Check it with
+  `rbd trash ls --all --long <pool>` and `rbd info <pool>/<image>`, then restore
+  it.
+- `settling`: a `rbd trash mv` failed and the trash or the image could not be
+  read to settle what it did, so the image may still be live under its name.
+  It is retried. Check it with `rbd trash ls --all --long <pool>` and
+  `rbd info <pool>/<image>`; litevirt advises no removal.
+- `untracked`: a litevirt-named image in a ceph pool's trash that no purge on
+  this host tracks, seen by two scans in a row (every 5 minutes). Causes: an
+  interrupted `rbd rm`, a crash that lost the queue, another host's purge
+  still running, or another host holding it because a client has it open.
+  Restoring it (`rbd trash restore <pool>/<id>`) is never destructive;
+  removing it may be, so litevirt advises only the restore. Remove it by hand
+  only once the host that put it there no longer names it.
+
+`unreadable_queue_files` names purge queue files found unreadable and moved
+aside (`<data_dir>/ceph-trash-purges.json.unreadable-<time>`). The purges they
+held are no longer tracked; check the pools' trash, then remove the file. A
+held entry is forgotten once its trash no longer lists it.
+
+The condition resolves on the next reconcile (30 s) once nothing is listed.
+See [storage.md](storage.md#ceph-rbd-pools).
+
+### A VM delete left a ceph image in its pool (`ceph_image_leftover`)
+
+A VM delete frees its disks best effort. A ceph image that a client still has
+open is refused as in use. The VM is deleted anyway, as before, but the image
+stays in its pool. That client may be another VM still running on the image.
+`lv rm` prints one line per image left in place, with its pool, name and the
+reason. This host also records the image in `<data_dir>/ceph-kept-images.json`
+and raises `ceph_image_leftover` (evaluator `ceph_pool`, subject
+`host/<host>`, warning). For each image, the evidence gives the VM and disk
+it came from, when the delete left it, the reason, and the check to run
+(`by_hand`: `rbd status <pool>/<image>; rbd info <pool>/<image>`).
+litevirt removes none of these images; decide by hand once you know who has
+the image open. An image stops being named as soon as a VM's disk names it
+again, and is forgotten once its pool answers without it (checked every 5
+minutes).
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

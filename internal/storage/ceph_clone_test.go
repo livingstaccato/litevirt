@@ -27,7 +27,7 @@ func newFakeRBD(existing ...string) *fakeRBD {
 func (f *fakeRBD) run(_ context.Context, _ string, args ...string) ([]byte, error) {
 	// Skip the auth flags rbdArgs prepends (--id/--conf/--keyring, each with a value).
 	i := 0
-	for i < len(args) && strings.HasPrefix(args[i], "--") {
+	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "--" {
 		i += 2
 	}
 	if i >= len(args) {

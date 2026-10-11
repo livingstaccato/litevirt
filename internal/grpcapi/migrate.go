@@ -775,6 +775,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			TLSDestination: targetHost.Address,
 			Direct:         route.direct,
 			CDROMSources:   cdromSources,
+			// The destination definition carries each rbd disk's monitors as
+			// its pool resolves them now (a re-addressed cluster's).
+			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
 		})
 	}()
 
@@ -1242,6 +1245,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, err
 		}
 		isoWarning, isoResolved = w, resolved
+		// The incoming domain names its ceph disks' secrets: defined here
+		// now, from this host's pool, or the migration is refused with the
+		// reason before libvirt is asked (libvirtd drops the secrets on a
+		// restart, and this host's keyring may hold another key).
+		if err := s.prepareIncomingCephDisks(ctx, rec); err != nil {
+			return nil, err
+		}
 	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
@@ -2166,7 +2176,9 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	if err != nil {
 		return ensureOutcome{}, err
 	}
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" {
+	// A VM with an rbd disk always asks: the target defines (or refuses) the
+	// ceph secrets the domain names (prepareIncomingCephDisks).
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !s.vmHasRBDDisk(ctx, vmName) {
 		return ensureOutcome{}, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)

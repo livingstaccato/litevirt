@@ -140,7 +140,7 @@ func TestReplicateVolume_NativeCephWorksIntoAFreshImage(t *testing.T) {
 		}
 		if rest, ok := strings.CutPrefix(c, "rbd import -- - "); ok {
 			incoming = rest
-			if !strings.HasPrefix(rest, dst+".litevirt-incoming-") {
+			if !strings.HasPrefix(rest, dst+"+litevirt-incoming-") {
 				t.Errorf("import argv %q, want a fresh name beside %q", c, dst)
 			}
 		}
@@ -276,6 +276,7 @@ echo "$(basename "$0") $*" >> ` + logPath + `
 for a in "$@"; do
   case "$a" in
     info) exit 1 ;;
+    status) echo '{"watchers":[]}'; exit 0 ;;
     export) echo stream; exit 0 ;;
     import) cat >/dev/null; echo "rbd: image exists" >&2; exit 1 ;;
   esac

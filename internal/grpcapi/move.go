@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -508,15 +509,20 @@ func (s *Server) deleteSourceIfUnreferenced(ctx context.Context, vm *corrosion.V
 // Callers MUST invoke this BEFORE tombstoning the VM's corrosion records, since
 // it reads vm_disks. The glob-based Store.DeleteVMDisks remains as the fallback
 // for default-dir / cloud-init debris not represented in vm_disks.
-func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) {
+//
+// It returns the ceph images left in their pool (a client still had one
+// open): the delete goes on, best-effort, but each such image is named to the
+// caller and by ceph_image_leftover (ceph_kept.go), never left unnamed.
+func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) []KeptCephImage {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: list disks for volume cleanup — falling back to default-dir glob only",
 			"vm", vmName, "error", err)
-		return
+		return nil
 	}
 	// Best-effort by design on this path: the caller globs the default dir next.
-	_ = s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+	kept, _ := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return kept
 }
 
 // deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
@@ -527,10 +533,27 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 // records the cleanup as DONE must not do so while a volume is still there — the
 // record is what stops a restart from retrying. Skipping a path another VM still
 // references is a success, not a failure.
+//
+// The rbd disks are deleted together: each may wait for the clients still
+// watching it to go (a dead client's watch lasts about 30 s, and a live one
+// is waited for up to 45 s before the delete is refused as in use), and
+// those waits run at once within one bound, not one after another — which
+// for three or more disks outlasted the owner proxy's 2 minutes.
 func (s *Server) deleteRecordedVMDiskVolumeRecords(
 	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
 ) error {
-	var firstErr error
+	_, err := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return err
+}
+
+// deleteRecordedVMDiskVolumeRecordsKept is deleteRecordedVMDiskVolumeRecords,
+// also returning the ceph images it left in their pool, each recorded for
+// ceph_image_leftover.
+func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
+	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
+) ([]KeptCephImage, error) {
+	errs := make([]error, len(disks))
+	var wg sync.WaitGroup
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {
@@ -546,16 +569,32 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 		if s.diskPathReferencedByOtherVM(ctx, vmName, d) {
 			continue
 		}
-		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
-			slog.Warn("delete: free disk volume",
-				"vm", vmName, "disk", d.DiskName, "path", d.Path,
-				"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
-			if firstErr == nil {
-				firstErr = err
+		del := func() {
+			if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+				slog.Warn("delete: free disk volume",
+					"vm", vmName, "disk", d.DiskName, "path", d.Path,
+					"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
+				errs[i] = err
 			}
 		}
+		if strings.HasPrefix(d.Path, "rbd:") {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				del()
+			}()
+			continue
+		}
+		del()
 	}
-	return firstErr
+	wg.Wait()
+	kept := s.keptFromErrs(vmName, disks, errs)
+	for _, err := range errs {
+		if err != nil {
+			return kept, err
+		}
+	}
+	return kept, nil
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool
@@ -566,16 +605,9 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
-	cfg := storage.Config{Driver: d.StorageType}
-	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
-		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
-	}
-	if cfg.Driver == "" {
-		cfg.Driver = "local"
-	}
-	drv, err := storage.New(s.dataDir, cfg)
+	drv, err := s.diskDriver(d)
 	if err != nil {
-		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
+		return err
 	}
 	// hostDiskFile is the recorded path itself, except under the per-node file
 	// root a multi-node test gives each node.
@@ -593,6 +625,33 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 		s.ClearPITOverlayHold(ctx, d.VMName, d.DiskName)
 	}
 	return nil
+}
+
+// diskDriver is the storage driver that serves a disk at its recorded
+// location (deleteDiskAtRecordedLocation).
+func (s *Server) diskDriver(d *corrosion.DiskRecord) (storage.Driver, error) {
+	cfg := storage.Config{Driver: d.StorageType}
+	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
+		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
+	} else if strings.HasPrefix(d.Path, "rbd:") {
+		// A ceph disk whose pool is gone from this host (or not loaded yet)
+		// is removed as the identity its own locator names: with no --id and
+		// --keyring the rbd CLI would act as client.admin, which a node holding
+		// only a restricted key cannot.
+		pool := ""
+		if l, ok := storage.ParseCephLocator(d.Path); ok {
+			pool = l.Pool // pool[/namespace]
+		}
+		cfg = storage.Config{Driver: "ceph", Source: pool, Options: rbdPathOptions(d.Path)}
+	}
+	if cfg.Driver == "" {
+		cfg.Driver = "local"
+	}
+	drv, err := storage.New(s.dataDir, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
+	}
+	return drv, nil
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a
@@ -680,6 +739,17 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
 			"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
 		return true
+	}
+	// An rbd image is named by its spec, whatever options a row's locator
+	// carries: two rows can name one image with different suffixes.
+	if l, ok := storage.ParseCephLocator(d.Path); ok {
+		more, err := corrosion.DisksNamingRBDImage(ctx, s.db, l.Spec)
+		if err != nil {
+			slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
+				"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
+			return true
+		}
+		refs = append(refs, more...)
 	}
 	for _, r := range refs {
 		if r.VMName == vmName {

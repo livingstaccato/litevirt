@@ -98,33 +98,49 @@ sees a 500.
 
 ## Using a Ceph pool from litevirt
 
-Once the cluster is healthy, declare a `ceph` storage pool in compose:
+Once the cluster is healthy, give litevirt an RBD pool and a client that can
+use only that pool — never `client.admin`:
+
+```
+ceph osd pool create lv
+rbd pool init lv
+ceph auth get-or-create client.litevirt mon 'profile rbd' osd 'profile rbd pool=lv' \
+    > /etc/ceph/ceph.client.litevirt.keyring
+```
+
+Copy `/etc/ceph/ceph.conf` and that keyring (mode 0600, the same path on every
+host) to every litevirt host, and declare the pool — per host with `lv pool
+create`, or in compose:
 
 ```yaml
 volumes:
   rbd-fast:
     driver: ceph
-    source: rbd                 # Ceph pool name
+    source: lv                  # Ceph pool name
     options:
+      id: litevirt
       conf: /etc/ceph/ceph.conf
-      keyring: /etc/ceph/ceph.client.admin.keyring
-      id: admin
+      keyring: /etc/ceph/ceph.client.litevirt.keyring
 ```
 
-VMs reference it by name:
+VMs reference it by name, root disk and data disks alike:
 
 ```yaml
 vms:
   db-1:
     image: ubuntu-24.04
     disks:
+      root: { size: 40G, storage: rbd-fast }
       data: { size: 500G, storage: rbd-fast }
 ```
 
-An RBD disk is always raw, and there is no format to set: litevirt creates
-the image with `rbd create` (or clones a protected snapshot) and attaches it
-to the guest as a raw network disk, so qcow2 never sits over rbd. The
-package maps the RBD image to a `rbd:pool/image` spec libvirt understands.
+An RBD disk is always raw, and there is no format to set. A data disk is an
+`rbd create`d image; a root disk is a copy-on-write clone of the image,
+imported into the pool once (`lvimage+<image>+<digest>@base`). qemu opens the
+disk itself as `client.litevirt`, through a libvirt ceph secret the daemon
+defines on every host from the keyring, with the monitors from `ceph.conf`.
+See [storage.md](storage.md#ceph-rbd-pools) for the secret's lifecycle,
+clone, delete and live migration.
 
 ## What's still in flight
 

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -93,12 +94,46 @@ func requestSetsLimits(req *pb.UpdateVMRequest) bool {
 	return false
 }
 
-// refuseUnlatchedLimits runs a create spec that sets a limit through the
-// release gate (vm_limits) on THIS node, the one that creates the VM; a spec
-// without a limit is not gated. Until the release token has latched the gate
-// refuses with the release refusal, and the first use is recorded before the
-// limit's first data.
-func (s *Server) refuseUnlatchedLimits(ctx context.Context, spec *pb.VMSpec) error {
+// The limits gate has two halves, because the gate has durable, cluster-wide
+// side effects (it Pings the fleet and records the feature's first use, which
+// a rollback below the release then quarantines on):
+//
+//   - precheck*: Server.ReleaseFeatureRefusal, the release gate's latch step
+//     alone: it drives the latch and, when it has not formed, refuses with the
+//     gate's own text (the lagging hosts and versions, and the pointer to
+//     `lv cluster upgrade-status`), but records and grants nothing. It refuses
+//     early, before any work, and is what a caller that is not the writer (an
+//     entry node forwarding to the owner, a dry run, a preflight) uses.
+//   - record*: the full gate (WithReleaseFeature). It runs on the node that
+//     writes, immediately before the first write of a limit, after every
+//     permission and validation check has passed, so a refused or failed
+//     request never records a use.
+//
+// Limitless specs, zero values and clears are never gated by either.
+
+// precheckLimitedSpec refuses a spec that sets a limit while the release token
+// has not latched here. Records nothing.
+func (s *Server) precheckLimitedSpec(ctx context.Context, spec *pb.VMSpec) error {
+	if !specSetsLimits(spec) {
+		return nil
+	}
+	return s.ReleaseFeatureRefusal(ctx, capabilities.FeatureVMLimits)
+}
+
+// precheckLimitUpdate is precheckLimitedSpec for an update. An entry node runs
+// it before forwarding: an owner on an older build would ignore the fields and
+// answer success, and an older owner implies the token has not latched. The
+// owner still runs the full gate.
+func (s *Server) precheckLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
+	if !requestSetsLimits(req) {
+		return nil
+	}
+	return s.ReleaseFeatureRefusal(ctx, capabilities.FeatureVMLimits)
+}
+
+// recordLimitedSpec runs a spec that sets a limit through the release gate
+// (vm_limits) on THIS node, immediately before the first write of that limit.
+func (s *Server) recordLimitedSpec(ctx context.Context, spec *pb.VMSpec) error {
 	if !specSetsLimits(spec) {
 		return nil
 	}
@@ -106,10 +141,8 @@ func (s *Server) refuseUnlatchedLimits(ctx context.Context, spec *pb.VMSpec) err
 		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitedSpec(g, spec) })
 }
 
-// refuseUnlatchedLimitUpdate is the update-side twin. It runs on the host that
-// owns the VM, after the forward: a request forwarded to another node is gated
-// there, not here. Clearing a limit (zero) is not gated.
-func (s *Server) refuseUnlatchedLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
+// recordLimitUpdate is recordLimitedSpec for an update, run on the owner.
+func (s *Server) recordLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
 	if !requestSetsLimits(req) {
 		return nil
 	}
@@ -117,25 +150,41 @@ func (s *Server) refuseUnlatchedLimitUpdate(ctx context.Context, req *pb.UpdateV
 		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitUpdate(g, req) })
 }
 
-// refuseUnlatchedStackLimits fails a compose file that sets a VM limit fast,
-// before any VM is deployed, through the same gate each VM's create passes.
-// Containers have no such limits and are skipped.
-func (s *Server) refuseUnlatchedStackLimits(ctx context.Context, f *compose.File) error {
-	for name, vm := range f.VMs {
-		if vm.Kind == compose.WorkloadKindLXC || vm.Kind == compose.WorkloadKindOCI {
+// composeVMSetsLimit reports whether a compose VM entry names any limit this
+// branch owns: the cpu cap, the weight, or a NIC rate. Containers have none.
+func composeVMSetsLimit(vm compose.VMDef) bool {
+	if vm.Kind == compose.WorkloadKindLXC || vm.Kind == compose.WorkloadKindOCI {
+		return false
+	}
+	if vm.CPULimit != 0 || vm.CPUShares != 0 {
+		return true
+	}
+	for _, n := range vm.Network {
+		if n.Rate != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// precheckStackLimits fails a compose file that sets a limit anywhere in it
+// before any VM is deployed, through the non-recording latch step: it records nothing,
+// so a dry run or a deploy that later fails validation leaves no use behind.
+// Every VM's own create runs the full gate when it writes.
+func (s *Server) precheckStackLimits(ctx context.Context, f *compose.File) error {
+	names := make([]string, 0, len(f.VMs))
+	for name := range f.VMs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !composeVMSetsLimit(f.VMs[name]) {
 			continue
 		}
-		set := vm.CPULimit != 0 || vm.CPUShares != 0
-		for _, n := range vm.Network {
-			set = set || n.Rate != 0
+		if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureVMLimits); err != nil {
+			return status.Errorf(status.Code(err), "vm %q: %s", name, status.Convert(err).Message())
 		}
-		if set {
-			spec := &pb.VMSpec{CpuLimit: vm.CPULimit}
-			if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
-				return status.Errorf(status.Code(err), "vm %q: %s", name, status.Convert(err).Message())
-			}
-			return nil
-		}
+		return nil
 	}
 	return nil
 }
@@ -274,10 +323,18 @@ func (s *Server) revertLimits(ctx context.Context, name string, spec *pb.VMSpec,
 
 // checkCopiedSpecLimits judges a spec a path takes from somewhere other than a
 // create request — a restore's --spec or manifest, a clone's source — the way a
-// create is judged: gated on the vm_limits release feature, and validated against its own vCPU
-// count. Without it a limit reaches a stored spec by a side door.
+// create is judged: refused early while the release token has not latched
+// (a local read, recording nothing; the caller records the use with
+// recordLimitedSpec immediately before it writes), and validated against its
+// own vCPU count. Without it a limit reaches a stored spec by a side door.
+//
+// The grant the vm_limits writers take (admitLimitedSpec, admitLimitUpdate)
+// does not travel into InsertVM, DefineDomain or MutateDesiredSpec, because a
+// limit lives in the generic spec JSON. So the guard test cannot see a NEW path
+// that writes a limit: any path that takes a spec from outside must call this
+// and recordLimitedSpec before it writes.
 func (s *Server) checkCopiedSpecLimits(ctx context.Context, spec *pb.VMSpec) error {
-	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
+	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
 		return err
 	}
 	return validateCreateLimits(spec)
@@ -320,4 +377,14 @@ func limitUpdateFromDesired(name string, desired *pb.VMSpec, limitFields []strin
 		}
 	}
 	return req
+}
+
+// vmSharesWeight is the VM's stored cpu-shares weight in the user's scale
+// (0 when unset or unreadable), for a migration to render on the target's.
+func (s *Server) vmSharesWeight(ctx context.Context, name string) int {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil || vm == nil {
+		return 0
+	}
+	return int(vmSpecFor(vm).GetCpuShares())
 }

@@ -303,6 +303,11 @@ func (s *Server) autoDefineRestoredVM(
 		Phase: pb.RestoreLiveProgress_DEFINING, VmName: targetName,
 		TargetPath: overlayPath, Status: "defining domain against overlay",
 	})
+	// The release gate for the limits this restore carries, immediately before
+	// the domain that holds them is defined.
+	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+		return "", "", err
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}

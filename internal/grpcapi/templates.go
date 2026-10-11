@@ -386,6 +386,12 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
+	// The release gate for the limits the clone carries, immediately before
+	// the domain that holds them is defined.
+	if err := s.recordLimitedSpec(ctx, &srcSpec); err != nil {
+		cleanup()
+		return nil, err
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)

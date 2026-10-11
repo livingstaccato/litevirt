@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,9 +49,10 @@ vms:
 // 1 core is a 100000us quota per 100000us period across the WHOLE domain
 // (global_quota), whatever the vCPU count; 2 MB/s = 2000 KB/s (libvirt's unit),
 // both directions; cpu-shares is the cgroup v2 weight.
+var sharesFor200 = fmt.Sprintf("<shares>%d</shares>", lv.HostCPUShares(200))
+
 const (
 	quotaFor1Core = "<global_quota>100000</global_quota>"
-	sharesFor200  = "<shares>200</shares>"
 	rateFor2      = `<inbound average="2000"`
 )
 
@@ -142,7 +144,7 @@ func TestFleet_ComposeLimitChangesApplyLiveToTheRunningVM(t *testing.T) {
 
 	xml := node.Virt.DefinedXML("db")
 	// 1.5 cores = 150000us per period across the domain; 4 MB/s = 4000 KB/s.
-	mustContain(t, "updated domain", xml, "<global_quota>150000</global_quota>", "<shares>400</shares>", `<inbound average="4000"`)
+	mustContain(t, "updated domain", xml, "<global_quota>150000</global_quota>", fmt.Sprintf("<shares>%d</shares>", lv.HostCPUShares(400)), `<inbound average="4000"`)
 	mustNotContain(t, "updated domain", xml, quotaFor1Core, sharesFor200, rateFor2)
 	sawTune, sawRate := false, false
 	for _, e := range node.Virt.EventLog()[from:] {
@@ -303,7 +305,7 @@ func TestFleet_VMLimitsSurviveFailoverRebuild(t *testing.T) {
 
 	// 2 cores = 200000us per period across the domain; 5 MB/s = 5000 KB/s.
 	mustContain(t, "rebuilt domain", survivor.Virt.DefinedXML("db"),
-		"<global_quota>200000</global_quota>", "<shares>300</shares>", `<inbound average="5000"`, `<outbound average="5000"`)
+		"<global_quota>200000</global_quota>", fmt.Sprintf("<shares>%d</shares>", lv.HostCPUShares(300)), `<inbound average="5000"`, `<outbound average="5000"`)
 }
 
 // ── the vm_limits release gate ──────────────────────────────────────────────────
@@ -484,4 +486,239 @@ func TestFleet_ComposeShrinkWithAMatchingLimitDeploys(t *testing.T) {
 	if phase, detail := planDetailFor(t, ctx, client, small, "db"); phase != "no-change" {
 		t.Errorf("re-applying the file plans %s %q, want no change", phase, detail)
 	}
+}
+
+// ── fix round 1 ─────────────────────────────────────────────────────────────
+
+func vmLimitsUsed(t *testing.T, n *Node) bool {
+	t.Helper()
+	return featureUsedOn(t, n, capabilities.ReleaseToken, string(capabilities.FeatureVMLimits))
+}
+
+// I1: a caller who may not create VMs never records a release use. The gate
+// has cluster-wide, durable side effects (a rollback below the release then
+// quarantines), so it runs only after RBAC and validation.
+//
+// Mutation: gate before RequirePerm in createVM — the viewer's request
+// records the use and goes red.
+func TestFleet_ViewerCreatingALimitedVMRecordsNoUse(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	latchRelease(t, c)
+	ctx := context.Background()
+	if _, err := client.CreateUser(ctx, &pb.CreateUserRequest{Username: "vw", Password: "p4ssw0rd", Role: "viewer"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	tok, err := client.CreateToken(ctx, &pb.CreateTokenRequest{Username: "vw", Name: "t"})
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	viewer := c.bearerClient(node, tok.Token)
+	_, err = viewer.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "nope", Image: "test", Cpu: 2, MemoryMib: 512,
+		CpuLimit: 1, Placement: &pb.PlacementSpec{Host: node.Name}}})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("viewer CreateVM with a limit: err = %v, want PermissionDenied", err)
+	}
+	if vmLimitsUsed(t, node) {
+		t.Fatal("a refused viewer recorded the vm_limits use")
+	}
+}
+
+// I2: an entry node forwarding a limit-bearing update first drives and checks
+// the latch, without recording: an owner on an older build would ignore the
+// field and answer success. The refusal is the release's; the owner is never
+// handed the request and nothing is recorded.
+//
+// Mutation: drop the entry check — the (latched) owner accepts and the test
+// goes red.
+func TestFleet_EntryNodeRefusesALimitUpdateItCannotLatch(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	entry, owner := c.Nodes[0], c.Nodes[1]
+	putVM(t, owner, "far", 2, "stopped")
+	owner.Virt.SetState("far", "stopped")
+	before := len(owner.Virt.EventLog())
+	latchRelease(t, c)
+	entry.Server.SetReleaseFeatureGate(nil) // the entry has not latched; the owner has
+
+	limit := 1.0
+	_, err := c.SelfClient(entry).UpdateVM(context.Background(), &pb.UpdateVMRequest{Name: "far", CpuLimit: &limit})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "the cluster upgrade must finish first (vm_limits needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("err = %v, want the release refusal from the entry node", err)
+	}
+	for _, e := range owner.Virt.EventLog()[before:] {
+		t.Errorf("the owner was handed work for a refused limit: %s %s", e.Op, e.Note)
+	}
+	if got := specCPULimit(t, owner, "far"); got != 0 {
+		t.Errorf("cpu_limit persisted as %v", got)
+	}
+	if vmLimitsUsed(t, owner) {
+		t.Error("the entry-node refusal recorded a use")
+	}
+	// A limitless update through the same entry is never refused.
+	onboot := true
+	if _, err := c.SelfClient(entry).UpdateVM(context.Background(), &pb.UpdateVMRequest{Name: "far", Onboot: &onboot}); err != nil {
+		t.Errorf("limitless forwarded update refused: %v", err)
+	}
+}
+
+// I3: the stack check covers every limit kind in the whole file before any VM
+// is deployed: a limitless VM first, a shares-only or rate-only VM later, and
+// no VM is created.
+//
+// Mutation: only look at cpu-limit — the shares-only and rate-only variants
+// go red (the limitless VM is created first).
+func TestFleet_StackLimitCheckCoversEveryKindAndTheWholeFile(t *testing.T) {
+	for name, vmExtra := range map[string]string{
+		"shares":    "    cpu-shares: 200\n",
+		"nic rate":  "    network:\n      - name: hc\n        rate: 2\n",
+		"cpu-limit": "    cpu-limit: 1\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, node, client := newComposeFailNode(t)
+			ctx := context.Background()
+			y := limitlessCompose + "  zlimited:\n    image: test\n    cpu: 2\n    memory: 512\n" + vmExtra + "    placement:\n      host: node-0\n"
+			stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{ComposeYaml: y})
+			if err == nil {
+				_, err = stream.Recv()
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(errText(err), "the cluster upgrade must finish first") {
+				t.Fatalf("err = %v, want the release refusal", err)
+			}
+			if rec, _ := corrosion.GetVM(ctx, node.DB, "db"); rec != nil {
+				t.Errorf("the limitless VM was created before the refusal: %+v", rec)
+			}
+		})
+	}
+}
+
+// I4: a dry run, and a deploy that fails validation, never record a use.
+//
+// Mutation: gate in the stack precheck with the recording gate — the dry run
+// records the use and goes red.
+func TestFleet_DryRunAndFailedValidationRecordNoUse(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	node.Server.SetBridgeEnsure(node.Net.EnsureBridge)
+	latchRelease(t, c)
+	ctx := context.Background()
+	limited := strings.Replace(limitlessCompose, "    memory: 512\n", "    memory: 512\n    cpu-limit: 1\n", 1)
+	stream, err := client.DeployStack(ctx, &pb.DeployStackRequest{ComposeYaml: limited, DryRun: true})
+	if err == nil {
+		for {
+			if _, err = stream.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil && err != io.EOF {
+		t.Fatalf("dry run: %v", err)
+	}
+	if vmLimitsUsed(t, node) {
+		t.Fatal("a dry run recorded the vm_limits use")
+	}
+	// A limit above the VM's vCPUs fails validation before any write.
+	_, err = client.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "bad", Image: "test", Cpu: 2, MemoryMib: 512,
+		CpuLimit: 99, Placement: &pb.PlacementSpec{Host: node.Name}}})
+	if err == nil {
+		t.Fatal("a limit above the vCPU count was accepted")
+	}
+	if vmLimitsUsed(t, node) {
+		t.Fatal("a create that failed validation recorded the use")
+	}
+}
+
+// M1 and M4: an update that fails validation records no use, and a valid one
+// has the use on record BEFORE the limit reaches the domain.
+//
+// Mutation: gate before mergeLimitUpdate (or after applyLimitsToDomain) —
+// the invalid update records, or the hook sees no record, and goes red.
+func TestFleet_LimitUpdateRecordsTheUseAfterValidationAndBeforeTheWrite(t *testing.T) {
+	node, client := newLimitsNode(t)
+	ctx := context.Background()
+	deployClean(t, ctx, client, limitlessCompose)
+	waitRunning(t, ctx, node, "db")
+	over := 99.0
+	if _, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", CpuLimit: &over}); err == nil {
+		t.Fatal("a limit above the vCPU count was accepted")
+	}
+	if vmLimitsUsed(t, node) {
+		t.Fatal("an invalid limit update recorded the use")
+	}
+	var usedAtWrite, wrote bool
+	node.Virt.FailSetCPUTune = func(string, float64, int) error {
+		wrote = true
+		usedAtWrite = vmLimitsUsed(t, node)
+		return nil
+	}
+	limit := 1.5
+	eventually(t, 10*time.Second, "the update to be accepted", func() bool {
+		_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", CpuLimit: &limit})
+		return err == nil
+	})
+	if !wrote {
+		t.Fatal("the limit never reached the domain")
+	}
+	if !usedAtWrite {
+		t.Fatal("the vm_limits use was not on record when the limit reached the domain")
+	}
+}
+
+// I5: a live migration of a VM with a weight asks the target for its cgroup
+// version and hands libvirt the weight and that version, so the destination
+// definition is rendered on the target's scale.
+//
+// Mutation: skip the target's report (do not ask when only the weight needs
+// it) — target_cgroup is empty and the test goes red.
+func TestFleet_LiveMigrationCarriesTheWeightAndTheTargetsCgroup(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "pp1", Cpu: 1, MemoryMib: 256, CpuShares: 977})
+	if err := corrosion.InsertVM(context.Background(), src.DB, corrosion.VMRecord{
+		Name: "pp1", HostName: src.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	src.Virt.SetState("pp1", "running")
+	st, err := c.SelfClient(src).MigrateVM(context.Background(), &pb.MigrateVMRequest{
+		VmName: "pp1", TargetHost: dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+	})
+	if err != nil {
+		t.Fatalf("MigrateVM: %v", err)
+	}
+	for {
+		if _, err := st.Recv(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+	}
+	note := ""
+	for _, e := range src.Virt.EventLog() {
+		if e.Op == "migrate" {
+			note = e.Note
+		}
+	}
+	if !strings.Contains(note, "shares_weight=977") || !strings.Contains(note, "target_cgroup="+lv.CgroupMode()) {
+		t.Fatalf("libvirt migrate = %q, want the weight 977 and the target's cgroup %s", note, lv.CgroupMode())
+	}
+}
+
+// A create that carries a limit, on a latched cluster, has the use on record
+// and the cap in the domain; the gate sits immediately before the define.
+//
+// Mutation: drop the recording gate before DefineDomain in createVM — the
+// use is never recorded and the test goes red.
+func TestFleet_LatchedCreateWithALimitRecordsTheUse(t *testing.T) {
+	c, node, client := newComposeFailNode(t)
+	latchRelease(t, c)
+	ctx := context.Background()
+	var err error
+	eventually(t, 10*time.Second, "a limited create to be accepted", func() bool {
+		_, err = client.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "lim", Image: "test", Cpu: 2, MemoryMib: 512,
+			CpuLimit: 1, Placement: &pb.PlacementSpec{Host: node.Name}}})
+		return err == nil
+	})
+	if !vmLimitsUsed(t, node) {
+		t.Fatal("the vm_limits use is not recorded after a limited create")
+	}
+	mustContain(t, "created domain", node.Virt.DefinedXML("lim"), quotaFor1Core)
 }

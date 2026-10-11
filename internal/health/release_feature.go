@@ -123,29 +123,53 @@ func (c *Checker) FeatureAvailable(feature capabilities.Feature) bool {
 	return ok && c.DurablyLatched(info.Token)
 }
 
-// requireFeature is WithFeature's gate (see there).
-func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Feature) error {
+// FeatureRefusal is WithFeature's latch step alone, for an entry-node
+// fail-fast that must not record or grant anything: nil when feature's release
+// token has durably latched here — driving the latch first, so a call made the
+// moment the last host finishes upgrading does not wait for the HA monitor —
+// else the same FailedPrecondition WithFeature returns (the lagging hosts with
+// their versions, and the pointer to `lv cluster upgrade-status`). It writes no
+// used record, so a request that later fails leaves none; the node that writes
+// the feature's data still goes through WithFeature.
+func (c *Checker) FeatureRefusal(ctx context.Context, feature capabilities.Feature) error {
+	_, err := c.latchOrRefuse(ctx, feature)
+	return err
+}
+
+// latchOrRefuse drives and checks the feature's token latch (the first step of
+// WithFeature) and returns the feature's token.
+func (c *Checker) latchOrRefuse(ctx context.Context, feature capabilities.Feature) (string, error) {
 	info, ok := capabilities.LookupFeature(feature)
 	if !ok {
-		return status.Errorf(codes.Internal, "release feature %q is not declared by this build", feature)
+		return "", status.Errorf(codes.Internal, "release feature %q is not declared by this build", feature)
 	}
 	tok := info.Token
-	refuse := func(why string) error {
-		msg := fmt.Sprintf("the cluster upgrade must finish first (%s needs %s)", feature, tok)
-		if why != "" {
-			msg += ": " + why
-		}
-		return status.Error(codes.FailedPrecondition, msg)
-	}
 	if !c.DurablyLatched(tok) {
 		// Drive the latch from here too, so the first use after a roll does
 		// not wait for the HA monitor's turn.
 		c.Enforced(ctx, tok)
 		if !c.DurablyLatched(tok) {
-			return refuse(c.releaseLaggards(ctx, tok))
+			return tok, releaseRefusal(feature, tok, c.releaseLaggards(ctx, tok))
 		}
 	}
+	return tok, nil
+}
 
+func releaseRefusal(feature capabilities.Feature, tok, why string) error {
+	msg := fmt.Sprintf("the cluster upgrade must finish first (%s needs %s)", feature, tok)
+	if why != "" {
+		msg += ": " + why
+	}
+	return status.Error(codes.FailedPrecondition, msg)
+}
+
+// requireFeature is WithFeature's gate (see there).
+func (c *Checker) requireFeature(ctx context.Context, feature capabilities.Feature) error {
+	tok, err := c.latchOrRefuse(ctx, feature)
+	if err != nil {
+		return err
+	}
+	refuse := func(why string) error { return releaseRefusal(feature, tok, why) }
 	c.mu.Lock()
 	recorded := c.featuresRecorded[feature]
 	c.mu.Unlock()

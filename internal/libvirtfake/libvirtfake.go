@@ -1364,6 +1364,7 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	// which ones (libvirt's migrate_disks; empty means every writable disk).
 	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s",
 		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination)
+	note += fmt.Sprintf(" shares_weight=%d target_cgroup=%s", p.SharesWeight, p.TargetCgroup)
 	if len(p.CDROMSources) > 0 {
 		// As libvirt would: the destination definition must still carry each
 		// CD-ROM being pointed elsewhere.

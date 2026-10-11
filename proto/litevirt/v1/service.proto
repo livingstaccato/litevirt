@@ -2721,6 +2721,12 @@ message EnsureDisksResponse {
     // file here than on the source). An older target never sets it: the
     // source then migrates the domain unchanged, as before.
     map<string, string> installer_iso_resolved = 4;
+    // cgroup_mode: "v2" or "v1", the cgroup hierarchy this host runs. A runtime
+    // migration of a VM with a cpu-shares weight needs it: the source renders
+    // the destination definition's <shares> for this host's scale. An older
+    // target never sets it ("" = unknown), and the source migrates the domain
+    // unchanged, as before.
+    string cgroup_mode = 5;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle

@@ -64,14 +64,52 @@ func scaleWeightV1(weight float64) int {
 // unchanged on cgroup v2, scaled by 1024/100 on cgroup v1. It is applied where
 // the host's XML or scheduler parameters are written, never to the stored
 // spec, so a cluster mixing v1 and v2 hosts renders each host's own value.
-func HostCPUShares(weight int) int {
+func HostCPUShares(weight int) int { return HostCPUSharesFor(weight, cgroupV2()) }
+
+// HostCPUSharesFor is HostCPUShares for a host whose cgroup version is known:
+// a migration renders the destination's definition for the TARGET's scale.
+func HostCPUSharesFor(weight int, v2 bool) int {
 	if weight <= 0 {
 		return 0
 	}
-	if cgroupV2() {
+	if v2 {
 		return weight
 	}
 	return scaleWeightV1(float64(weight))
+}
+
+// CgroupMode names this host's cgroup hierarchy, "v2" or "v1", for a peer that
+// must render a definition for it.
+func CgroupMode() string {
+	if cgroupV2() {
+		return "v2"
+	}
+	return "v1"
+}
+
+var reSharesElem = regexp.MustCompile(`<shares>[0-9]+</shares>`)
+
+// RetargetCPUShares returns domainXML with its <shares> set to the host value
+// of weight on a host of the given cgroup version, every other node untouched.
+// A definition without <shares> is returned unchanged.
+func RetargetCPUShares(domainXML string, weight int, v2 bool) string {
+	if weight <= 0 {
+		return domainXML
+	}
+	return reSharesElem.ReplaceAllString(domainXML, fmt.Sprintf("<shares>%d</shares>", HostCPUSharesFor(weight, v2)))
+}
+
+// MigrationShareXML builds the destination and persistent definitions of a
+// migration of a VM whose cpu-shares weight is set: the same definitions with
+// <shares> on the target's scale. ok is false when nothing needs rewriting:
+// no weight, a target whose cgroup version is unknown (an older build), or the
+// same version as the source (srcV2), where the number is already right.
+func MigrationShareXML(live, persist string, weight int, targetMode string, srcV2 bool) (dest, persistOut string, ok bool) {
+	if weight <= 0 || (targetMode != "v1" && targetMode != "v2") || (targetMode == "v2") == srcV2 {
+		return "", "", false
+	}
+	v2 := targetMode == "v2"
+	return RetargetCPUShares(live, weight, v2), RetargetCPUShares(persist, weight, v2), true
 }
 
 // GlobalQuota converts a total-cores cap into libvirt's global period and

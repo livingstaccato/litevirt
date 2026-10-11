@@ -25808,8 +25808,14 @@ type EnsureDisksResponse struct {
 	// file here than on the source). An older target never sets it: the
 	// source then migrates the domain unchanged, as before.
 	InstallerIsoResolved map[string]string `protobuf:"bytes,4,rep,name=installer_iso_resolved,json=installerIsoResolved,proto3" json:"installer_iso_resolved,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// cgroup_mode: "v2" or "v1", the cgroup hierarchy this host runs. A runtime
+	// migration of a VM with a cpu-shares weight needs it: the source renders
+	// the destination definition's <shares> for this host's scale. An older
+	// target never sets it ("" = unknown), and the source migrates the domain
+	// unchanged, as before.
+	CgroupMode    string `protobuf:"bytes,5,opt,name=cgroup_mode,json=cgroupMode,proto3" json:"cgroup_mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EnsureDisksResponse) Reset() {
@@ -25868,6 +25874,13 @@ func (x *EnsureDisksResponse) GetInstallerIsoResolved() map[string]string {
 		return x.InstallerIsoResolved
 	}
 	return nil
+}
+
+func (x *EnsureDisksResponse) GetCgroupMode() string {
+	if x != nil {
+		return x.CgroupMode
+	}
+	return ""
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -37218,12 +37231,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bDiskStub\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xd9\x02\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xfa\x02\n" +
 	"\x13EnsureDisksResponse\x12#\n" +
 	"\rcreated_paths\x18\x01 \x03(\tR\fcreatedPaths\x12.\n" +
 	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\x122\n" +
 	"\x15installer_iso_warning\x18\x03 \x01(\tR\x13installerIsoWarning\x12p\n" +
-	"\x16installer_iso_resolved\x18\x04 \x03(\v2:.litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntryR\x14installerIsoResolved\x1aG\n" +
+	"\x16installer_iso_resolved\x18\x04 \x03(\v2:.litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntryR\x14installerIsoResolved\x12\x1f\n" +
+	"\vcgroup_mode\x18\x05 \x01(\tR\n" +
+	"cgroupMode\x1aG\n" +
 	"\x19InstallerIsoResolvedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xdf\x01\n" +

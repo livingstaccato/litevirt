@@ -289,3 +289,86 @@ func TestPatchInterfaceBandwidth(t *testing.T) {
 		t.Error("unknown MAC reported as found")
 	}
 }
+
+// A migration lands the weight on the TARGET's scale, whatever the source's.
+func TestHostCPUSharesFor_IsTheTargetsScale(t *testing.T) {
+	cases := []struct {
+		weight int
+		v2     bool
+		want   int
+	}{
+		{100, true, 100}, {100, false, 1024}, {200, false, 2048},
+		{977, true, 977}, {977, false, 10004}, // v1 value for weight 977: out of range on a v2 host
+		{0, true, 0}, {0, false, 0},
+	}
+	for _, c := range cases {
+		if got := HostCPUSharesFor(c.weight, c.v2); got != c.want {
+			t.Errorf("HostCPUSharesFor(%d, v2=%v) = %d, want %d", c.weight, c.v2, got, c.want)
+		}
+	}
+}
+
+func TestRetargetCPUShares_RewritesOnlyTheShares(t *testing.T) {
+	x := "<domain>\n  <cputune>\n    <shares>10004</shares>\n    <global_period>100000</global_period>\n    <global_quota>50000</global_quota>\n  </cputune>\n</domain>"
+	out := RetargetCPUShares(x, 977, true)
+	if !strings.Contains(out, "<shares>977</shares>") || strings.Contains(out, "10004") ||
+		!strings.Contains(out, "<global_quota>50000</global_quota>") {
+		t.Errorf("retargeted to v2:\n%s", out)
+	}
+	if got := RetargetCPUShares("<domain/>", 977, true); got != "<domain/>" {
+		t.Errorf("no <shares>: want unchanged, got %q", got)
+	}
+}
+
+// The live migration hands the destination (and persistent) definitions the
+// target's value, only when the weight is set and the scales differ.
+func TestMigrationShareXML(t *testing.T) {
+	live := "<domain><cputune><shares>10004</shares></cputune></domain>"
+	persist := "<domain><cputune><shares>10004</shares></cputune><x/></domain>"
+	d, p, ok := MigrationShareXML(live, persist, 977, "v2", false)
+	if !ok || !strings.Contains(d, "<shares>977</shares>") || !strings.Contains(p, "<shares>977</shares>") {
+		t.Errorf("v1 source to v2 target: ok=%v dest=%q persist=%q", ok, d, p)
+	}
+	for name, c := range map[string]struct {
+		weight int
+		mode   string
+		srcV2  bool
+	}{
+		"same scale":     {977, "v1", false},
+		"unknown target": {977, "", false},
+		"no weight":      {0, "v2", false},
+	} {
+		if _, _, ok := MigrationShareXML(live, persist, c.weight, c.mode, c.srcV2); ok {
+			t.Errorf("%s: rewrote the definitions", name)
+		}
+	}
+}
+
+func TestCgroupMode(t *testing.T) {
+	withCgroup(t, true)
+	if CgroupMode() != "v2" {
+		t.Error("v2 host")
+	}
+	withCgroup(t, false)
+	if CgroupMode() != "v1" {
+		t.Error("v1 host")
+	}
+}
+
+func TestShareRetargetNeeded(t *testing.T) {
+	for _, c := range []struct {
+		p     MigrateParams
+		srcV2 bool
+		want  bool
+	}{
+		{MigrateParams{SharesWeight: 977, TargetCgroup: "v2"}, false, true},
+		{MigrateParams{SharesWeight: 100, TargetCgroup: "v1"}, true, true},
+		{MigrateParams{SharesWeight: 977, TargetCgroup: "v2"}, true, false},
+		{MigrateParams{SharesWeight: 977, TargetCgroup: ""}, true, false},
+		{MigrateParams{SharesWeight: 0, TargetCgroup: "v2"}, false, false},
+	} {
+		if got := shareRetargetNeeded(c.p, c.srcV2); got != c.want {
+			t.Errorf("shareRetargetNeeded(%+v, srcV2=%v) = %v, want %v", c.p, c.srcV2, got, c.want)
+		}
+	}
+}

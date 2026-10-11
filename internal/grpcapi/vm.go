@@ -94,9 +94,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err != nil {
 		return nil, err
 	}
-	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
-		return nil, err
-	}
 	// iso_scope is server-owned: a client's is dropped, and only a forwarded
 	// leg (a peer) carries the entry node's classification to the owner.
 	if sc := req.GetSpec().GetIsoScope(); sc != "" && s.requirePeerCert(ctx) == nil {
@@ -111,6 +108,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
+		return nil, err
+	}
+	// A limit is refused early on a local read of the release latch, after the
+	// caller is known to be allowed and the spec valid; the use is recorded only
+	// where it is first written, just before the domain is defined.
+	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
 		return nil, err
 	}
 
@@ -920,6 +923,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		if err == nil {
 			err = status.Errorf(codes.FailedPrecondition, "iso %q now resolves to %s, not %s; retry the create", spec.Iso, again, isoPath)
 		}
+		return nil, err
+	}
+
+	// The release gate for a limit, on the node that writes it, immediately
+	// before the domain carrying it is defined.
+	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
 		return nil, err
 	}
 
@@ -4014,18 +4025,19 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {
+		// An owner on an older build would ignore a limit and answer success;
+		// an older owner means the release token has not latched. The latch is
+		// driven and checked here without recording or granting anything; the
+		// owner runs the full gate when it writes.
+		if err := s.precheckLimitUpdate(ctx, req); err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
 		defer conn.Close()
 		return client.UpdateVM(ctx, req)
-	}
-
-	// A limit is written here, on the owner, so it passes the vm_limits release
-	// gate here: a forwarded request is gated by the host that applies it.
-	if err := s.refuseUnlatchedLimitUpdate(ctx, req); err != nil {
-		return nil, err
 	}
 
 	// Deserialize stored spec.
@@ -4370,6 +4382,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			spec.Uuid = uuid.NewString()
 		}
 		spec.DisableVnc = req.DisableVnc
+		// Limits baked into the redefine: the release gate, on the owner,
+		// after every refusal above and before anything is written.
+		if err := s.recordLimitUpdate(ctx, req); err != nil {
+			return nil, err
+		}
 	}
 
 	// Re-serialize spec.
@@ -4431,6 +4448,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				limitsUp.applyTo(o)
 				b, merr := json.Marshal(o)
 				return string(b), merr
+			}
+			// The release gate, on the owner, under the lock, after the request
+			// validated against the spec read here and before the first write.
+			if gerr := s.recordLimitUpdate(ctx, req); gerr != nil {
+				return nil, gerr
 			}
 			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp); aerr != nil {
 				s.revertLimits(ctx, req.Name, spec, limitsUp)

@@ -104,7 +104,7 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.refuseUnlatchedLimits(ctx, spec); err != nil {
+	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
 		return nil, err
 	}
 	// As createVM: iso_scope is server-owned, carried only by a peer's leg.

@@ -232,8 +232,10 @@ counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
   wants when it defines the domain: unchanged on cgroup v2, scaled by 1024/100
   (minimum 2) on cgroup v1, whose default `cpu.shares` is 1024. A cluster that mixes
   v1 and v2 hosts therefore renders per host, and a failover rebuild re-renders for
-  the new host (a live migration carries the source host's rendered value until the
-  next define). Clearing it (`0`, or dropping the key) writes the default weight
+  the new host. A migration does the same: a cold move defines the domain on the
+  target at the target's scale, and a live move hands libvirt a destination
+  definition rendered for the target's cgroup version, which the target reports
+  (a v1 to v2 move of a VM with weight 977 or more is not refused). Clearing it (`0`, or dropping the key) writes the default weight
   back. It only matters under contention: an idle host lets every guest run flat out.
 - `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
   each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes
@@ -259,9 +261,12 @@ During a rolling upgrade a limit cannot be set until every host runs a build
 that understands it: setting `cpu-limit`, `cpu-shares` or a NIC `rate` is refused
 ("the cluster upgrade must finish first") until the release token
 `release_2026_11_v1` has latched, because an older host would ignore the fields, and
-an older owner that rewrites a VM's stored spec would drop them. The limit is gated
-by the host that performs the write (for an update, the VM's owner), and the first
-use is recorded cluster-wide before the limit's first data (the `vm_limits` feature
+an older owner that rewrites a VM's stored spec would drop them. The request is refused
+early, without recording anything, while the token has not latched (an entry node
+checks this before forwarding an update, so an older owner is never handed a limit it
+would drop). The host that performs the write (for an update, the VM's owner) runs
+the full gate after permission and validation checks, and the first use is recorded
+cluster-wide immediately before the limit's first data (the `vm_limits` feature
 in `lv cluster upgrade-status`). Files and updates without limits are not affected,
 and clearing a limit (`0`) is always allowed. Once a limit has been set, rolling back
 below the release puts each node into WAL quarantine until it is upgraded again;

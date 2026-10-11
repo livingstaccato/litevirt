@@ -49,7 +49,7 @@ type restartFleet struct {
 	fencedAt []time.Time
 }
 
-func newRestartFleet(t *testing.T, seed int64) *restartFleet {
+func newRestartFleet(t *testing.T, seed int64, tune ...func(*failover.Coordinator)) *restartFleet {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -76,6 +76,9 @@ func newRestartFleet(t *testing.T, seed int64) *restartFleet {
 		go ch.Start(ctx)
 	}
 	coord := failover.NewCoordinator(f.a.Name, f.a.DB)
+	for _, fn := range tune {
+		fn(coord)
+	}
 	coord.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 		if h.Name == f.d.Name {
 			f.mu.Lock()

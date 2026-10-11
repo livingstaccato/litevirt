@@ -849,6 +849,28 @@ clock-skew margin. Observers keep counting through a restart, and a daemon's
 boot write records it `active` a few seconds before it answers probes, so
 without this a host that restarted (recorded `upgrading` while it was down) was
 fenced the moment its boot write landed, on the count from its restart.
+The rule is the failover leader's: until the leader runs a build with it, a
+restarted host can still be fenced in that gap.
+
+**A graceful restart stays `upgrading` until it serves.** A daemon stopped by
+SIGTERM (`systemctl restart`, a reboot) records its host `upgrading` and
+leaves a `restart-pending` marker in its `data_dir`. Its next boot consumes
+the marker and records the host `upgrading` again, and the daemon records it
+`active` only once it answers its own Ping, however long its startup takes.
+The coordinator skips an `upgrading` host for 2 minutes, counted from the
+state write itself and not from the host's version or resource reports, and
+fences it after that. A daemon that never serves is therefore fenced 2 minutes
+after its boot write. Each of these boots `active`, as before:
+
+- a crash, or a daemon that dies before serving (the marker is consumed);
+- a host that was not `active` when it was stopped. A fenced, offline or
+  maintenance host keeps that state through the SIGTERM, and a draining one is
+  recorded `upgrading` for the restart, as before;
+- a stop more than 2 minutes old;
+- a host recorded as something other than `upgrading` by the time it boots.
+
+Recording the host `active` once it serves changes only an `upgrading` host,
+and never its isolation.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
 counts at any age, and for the one a lost voter's removal and a superseded

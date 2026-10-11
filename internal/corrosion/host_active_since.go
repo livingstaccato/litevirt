@@ -138,3 +138,24 @@ func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time
 	}
 	return lifeBoundary(at).Add(-fenceLifeSkew).Truncate(time.Second), r.mem.State, true, nil
 }
+
+// HostStateSince returns when host's membership row last had its state (or
+// isolation) written: for a host recorded 'upgrading', the moment it entered
+// that state. ok=false when the host has no membership row this node reads;
+// the caller then judges by the hosts row as before.
+//
+// The failover coordinator times an 'upgrading' host out from it. The hosts
+// row's updated_at, which it used to read, moves with every report the host
+// makes — a version or resource write, a label, a certificate serial — so a
+// host stuck 'upgrading' that kept reporting pushed its own timeout out.
+func HostStateSince(ctx context.Context, c *Client, host string) (time.Time, bool, error) {
+	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
+	if err != nil || len(rows) == 0 || !rows[0].memPresent {
+		return time.Time{}, false, err
+	}
+	at, ok := ParseUpdatedAt(rows[0].memTS)
+	if !ok {
+		return time.Time{}, false, nil
+	}
+	return lifeBoundary(at), true, nil
+}

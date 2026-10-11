@@ -36,6 +36,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/hostboot"
 	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
@@ -220,7 +221,10 @@ const localMaxRecvMsgSize = 256 << 20
 func (d *Daemon) markRestarting() {
 	mctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	if err := corrosion.UpdateHostState(mctx, d.db, d.cfg.HostName, "upgrading"); err != nil {
+	// hostboot leaves the marker that keeps the next boot 'upgrading' until it
+	// serves, for an active host only: a fenced, offline or maintenance one
+	// keeps its state.
+	if err := hostboot.MarkRestarting(mctx, d.db, d.cfg.HostName, d.cfg.DataDir, time.Now()); err != nil {
 		slog.Warn("shutdown: failed to mark host upgrading", "error", err)
 		return
 	}
@@ -532,13 +536,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	// On an upgrade boot, stay "upgrading" until the watchdog confirms local gRPC
 	// is healthy (it flips to "active"); version + resources are still written
-	// here either way so the new version propagates immediately.
-	bootState := "active"
-	if d.upgradePending {
-		bootState = "upgrading"
-	}
+	// here either way so the new version propagates immediately. After a
+	// graceful stop (SIGTERM) the host likewise stays "upgrading" until this
+	// daemon answers its own Ping (awaitServingThenActivate): recorded active
+	// before its gRPC server listened, it was fenced on the failure count its
+	// observers carried through the restart (hostboot).
+	boot := hostboot.BootState(ctx, d.db, d.cfg.HostName, d.cfg.DataDir, d.upgradePending, time.Now())
+	bootState := boot.State
+	slog.Info("boot state", "state", boot.State, "await_serving", boot.AwaitServing, "reason", boot.Reason)
 	if err := corrosion.UpdateHostStartup(ctx, d.db, d.cfg.HostName, bootState, d.cfg.Version, cpus, memMiB, diskGiB, niErr == nil); err != nil {
 		slog.Warn("failed to write host startup state", "error", err)
+	}
+	if boot.AwaitServing {
+		go d.awaitServingThenActivate(ctx)
 	}
 	// Record version on the corrosion client so it goes into Crescent
 	// peer handshakes (used by skew detection).

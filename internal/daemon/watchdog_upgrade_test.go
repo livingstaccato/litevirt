@@ -209,3 +209,49 @@ func TestLocalGRPCClient_BadPKI(t *testing.T) {
 		t.Fatal("expected an error building the local gRPC client with a bad PKI dir")
 	}
 }
+
+// TestActivateOnceServing: after a graceful restart the host stays
+// 'upgrading' until this daemon answers its own Ping. If it never does, it is
+// LEFT 'upgrading' — there is nothing to roll back to — and the coordinator
+// fences it once the upgrading timeout passes; if it does, it is recorded
+// active. A host recorded fenced meanwhile is not flipped.
+//
+// Mutation: record the host active when the deadline passes — the
+// never-serving host turns active.
+func TestActivateOnceServing(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	for _, tc := range []struct {
+		name  string
+		start string
+		failN int
+		want  string
+	}{
+		{"never serves", "upgrading", 1 << 30, "upgrading"},
+		{"serves", "upgrading", 3, "active"},
+		{"fenced meanwhile", "fenced", 0, "fenced"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := corrosion.NewTestClientT(t)
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatalf("InitSchema: %v", err)
+			}
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: tc.start,
+			}); err != nil {
+				t.Fatalf("InsertHost: %v", err)
+			}
+			d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
+			d.activateOnceServing(ctx, &fakePinger{failN: tc.failN}, 50*time.Millisecond)
+			h, err := corrosion.GetHost(ctx, db, "h")
+			if err != nil || h == nil {
+				t.Fatalf("GetHost: %v", err)
+			}
+			if h.State != tc.want {
+				t.Fatalf("host is %q after the restart's serving check, want %q", h.State, tc.want)
+			}
+		})
+	}
+}

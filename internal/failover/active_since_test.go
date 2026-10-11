@@ -104,6 +104,11 @@ func TestTurnedActiveThisCycle(t *testing.T) {
 // the run began before the activation (a host that turned active and never
 // answered is never fenced).
 func TestCountedSinceActive(t *testing.T) {
+	// Pinned, not derived: dropping the skew margin from afreshRun must fail
+	// here, not move every row with it.
+	if afreshRun != 13*time.Second {
+		t.Fatalf("afreshRun = %s, want 13s: FailuresToFence-1 probe intervals (8 s) and fenceSkewMargin (5 s)", afreshRun)
+	}
 	since := time.Date(2026, 10, 11, 10, 48, 59, 0, time.UTC)
 	rfc := func(t time.Time) string { return t.Format(time.RFC3339Nano) }
 	for _, tc := range []struct {
@@ -120,6 +125,9 @@ func TestCountedSinceActive(t *testing.T) {
 		{"restart: run from before, 3s since", 22, rfc(since.Add(-34 * time.Second)), since.Add(3 * time.Second), false},
 		{"restart: run from before, just short of a whole run since", 22, rfc(since.Add(-34 * time.Second)), since.Add(afreshRun - time.Millisecond), false},
 		{"restart: run from before, a whole run since", 22, rfc(since.Add(-34 * time.Second)), since.Add(afreshRun), true},
+		// The literal span: four probe intervals (8 s) and the 5 s skew margin.
+		{"restart: run from before, 12.9s since", 22, rfc(since.Add(-34 * time.Second)), since.Add(12900 * time.Millisecond), false},
+		{"restart: run from before, 13s since", 22, rfc(since.Add(-34 * time.Second)), since.Add(13 * time.Second), true},
 		// An older observer's row has no last_seen: its run is taken to span
 		// one probe interval per failure back from updated_at.
 		{"older build: count reaches back before the activation", offlineThreshold, "", since.Add(2 * time.Second), false},
@@ -131,5 +139,39 @@ func TestCountedSinceActive(t *testing.T) {
 					tc.n, tc.lastSeen, tc.at.Sub(since), got, tc.want)
 			}
 		})
+	}
+}
+
+// An older observer's row carries no last_seen; its run is estimated as one
+// probe interval per failure back from updated_at (observerRunStart). Such a
+// row whose estimated run fits after the host's activation counts toward the
+// fence through run(), as it did before countedSinceActive.
+//
+// Mutation: treat a NULL last_seen as a run from before the activation — the
+// host, failing since it turned active 9 s ago, is not fenced.
+func TestHostJustActive_OlderObserverRowCounts(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	liveMembership(t, db)
+	// The host turned active 9 s ago: FailuresToFence probes (8 s) fit since.
+	if _, err := db.DB().Exec(`UPDATE host_membership SET state = 'active', updated_at = ? WHERE host_name = 'down'`,
+		time.Now().Add(-9*time.Second).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []string{"coordinator", "alive"} {
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'down', 'suspect', ?, NULL, ?)`, o, offlineThreshold, db.NowTS()); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
+	}
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "ssh", Success: true}
+	})
+	c.run(ctx)
+	if fences != 1 {
+		t.Fatalf("a host failing since it turned active, seen by older observers, was fenced %d times, want 1", fences)
 	}
 }

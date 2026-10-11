@@ -1194,6 +1194,15 @@ recovery resumes from it. The condition resolves once a later fence of the host
 succeeds or an operator confirms it off, or the host is back `active` or
 removed.
 
+A re-fence that **succeeds** publishes a `host.refenced` event on the cluster
+event stream, naming the recorded fence it renewed and the method. A host
+fenced by hand (`lv host fence`) while it was still answering has a fence
+that does not stand, so with `ipmi` (or another verified method) the leader
+powers it off once more, 15-20 s later, before it recovers the host's
+workloads. This happens even if the host has just been powered back on. To
+bring a fenced host back, `lv host undrain` it (or hold it at
+`--fence-strategy manual`) before powering it on.
+
 ### Recovery-claim refusals (`recovery_claim_*`)
 
 With recovery claims enforced (`enforcement.recovery_claim`), a recovery that

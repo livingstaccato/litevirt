@@ -216,8 +216,9 @@ func TestLocalGRPCClient_BadPKI(t *testing.T) {
 // fences it once the upgrading timeout passes; if it does, it is recorded
 // active. A host recorded fenced meanwhile is not flipped.
 //
-// Mutation: record the host active when the deadline passes — the
-// never-serving host turns active.
+// Mutations: record the host active when the deadline passes — the
+// never-serving host turns active; stop checking at the deadline — the host
+// that serves after it stays 'upgrading'.
 func TestActivateOnceServing(t *testing.T) {
 	old := pingPollInterval
 	pingPollInterval = time.Millisecond
@@ -230,6 +231,9 @@ func TestActivateOnceServing(t *testing.T) {
 	}{
 		{"never serves", "upgrading", 1 << 30, "upgrading"},
 		{"serves", "upgrading", 3, "active"},
+		// Answers only after the 50 ms deadline: a healthy host that came up
+		// late, which must not be left 'upgrading' for good.
+		{"serves after the deadline", "upgrading", 200, "active"},
 		{"fenced meanwhile", "fenced", 0, "fenced"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -244,7 +248,12 @@ func TestActivateOnceServing(t *testing.T) {
 				t.Fatalf("InsertHost: %v", err)
 			}
 			d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
-			d.activateOnceServing(ctx, &fakePinger{failN: tc.failN}, 50*time.Millisecond)
+			// The check runs until the daemon answers or shuts down; this
+			// context is the shutdown. Made here, after the fixture, so a slow
+			// setup (under -race) does not spend it.
+			checkCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			d.activateOnceServing(checkCtx, &fakePinger{failN: tc.failN}, 50*time.Millisecond)
 			h, err := corrosion.GetHost(ctx, db, "h")
 			if err != nil || h == nil {
 				t.Fatalf("GetHost: %v", err)
@@ -253,5 +262,91 @@ func TestActivateOnceServing(t *testing.T) {
 				t.Fatalf("host is %q after the restart's serving check, want %q", h.State, tc.want)
 			}
 		})
+	}
+}
+
+// TestGracefulRestartWiring drives the daemon's own wiring: markRestarting on
+// the SIGTERM, then the boot write (writeBootState), which must start the
+// check that records the host active once this daemon answers its own Ping.
+// Without that goroutine every graceful restart would leave its host
+// 'upgrading' until the coordinator fenced it.
+//
+// Mutations: delete `go d.awaitServingThenActivate(ctx)` from writeBootState —
+// the host stays 'upgrading'; call corrosion.UpdateHostState instead of
+// hostboot.MarkRestarting in markRestarting — no marker, the boot is 'active'
+// straight away and the first assertion fails.
+func TestGracefulRestartWiring(t *testing.T) {
+	old := pingPollInterval
+	pingPollInterval = time.Millisecond
+	defer func() { pingPollInterval = old }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: "active",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	stateOf := func() string {
+		h, err := corrosion.GetHost(ctx, db, "h")
+		if err != nil || h == nil {
+			t.Fatalf("GetHost: %v", err)
+		}
+		return h.State
+	}
+	d := &Daemon{cfg: &Config{HostName: "h", DataDir: t.TempDir()}, db: db}
+
+	d.markRestarting() // the SIGTERM
+	if got := stateOf(); got != "upgrading" {
+		t.Fatalf("after the SIGTERM the host is %q, want upgrading", got)
+	}
+
+	// The next boot. Its gRPC server answers once `serving` is closed; until
+	// then the host must stay 'upgrading'.
+	serving := make(chan struct{})
+	p := &gatedPinger{open: serving}
+	d.selfPinger = func() (pinger, func(), error) { return p, func() {}, nil }
+	d.writeBootState(ctx, 0, 0, 0, false)
+	time.Sleep(50 * time.Millisecond)
+	if got := stateOf(); got != "upgrading" {
+		t.Fatalf("before this daemon serves the host is %q, want upgrading", got)
+	}
+	close(serving)
+	deadline := time.Now().Add(3 * time.Second)
+	for stateOf() != "active" {
+		if time.Now().After(deadline) {
+			t.Fatalf("this daemon serves, and the host is still %q: the boot did not start the serving check", stateOf())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A boot with no graceful stop before it is 'active' at once, and starts
+	// no check.
+	if err := corrosion.UpdateHostState(ctx, db, "h", "upgrading"); err != nil {
+		t.Fatal(err)
+	}
+	d.selfPinger = func() (pinger, func(), error) {
+		t.Error("a boot with no graceful stop started the serving check")
+		return p, func() {}, nil
+	}
+	d.writeBootState(ctx, 0, 0, 0, false)
+	if got := stateOf(); got != "active" {
+		t.Fatalf("a boot with no graceful stop recorded %q, want active", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+}
+
+// gatedPinger fails every Ping until open is closed.
+type gatedPinger struct{ open chan struct{} }
+
+func (g *gatedPinger) Ping(ctx context.Context, _ *pb.PingRequest, _ ...grpc.CallOption) (*pb.PingResponse, error) {
+	select {
+	case <-g.open:
+		return &pb.PingResponse{}, nil
+	default:
+		return nil, errors.New("not serving yet")
 	}
 }

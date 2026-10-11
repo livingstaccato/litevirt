@@ -94,6 +94,7 @@ func TestBootWithoutMarker(t *testing.T) {
 // down.
 //
 // Mutations: drop the age check — the stale stop boots 'upgrading'; drop the
+// negative-age arm — the stop dated after the boot boots 'upgrading'; drop the
 // state check — the fenced host boots 'upgrading'.
 func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	db, ctx := hostIn(t, "active")
@@ -104,6 +105,17 @@ func TestBootAfterAStaleOrSupersededStop(t *testing.T) {
 	}
 	if b := BootState(ctx, db, "h", dir, false, now.Add(UpgradingTimeout)); b.State != "active" || b.AwaitServing {
 		t.Fatalf("boot %s after the stop = %+v, want active", UpgradingTimeout, b)
+	}
+	// The clock went back across the restart: the stop is dated in the
+	// future, and its age says nothing.
+	if err := corrosion.UpdateHostState(ctx, db, "h", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkRestarting(ctx, db, "h", dir, now); err != nil {
+		t.Fatal(err)
+	}
+	if b := BootState(ctx, db, "h", dir, false, now.Add(-time.Second)); b.State != "active" || b.AwaitServing {
+		t.Fatalf("boot dated a second before the stop = %+v, want active", b)
 	}
 
 	for _, moved := range []string{"fenced", "offline", "maintenance"} {

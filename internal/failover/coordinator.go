@@ -1919,10 +1919,14 @@ func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec 
 	fr, fenced := c.failover(ctx, &again)
 	if fenced && fr.Success {
 		// Visibility only: an operator who finds the host powered off again
-		// learns here that the coordinator did it, and why.
-		c.publish("host.refenced", h.Name, fmt.Sprintf(
+		// learns that the coordinator did it, and why — durably in the audit
+		// log (any node's `lv events`, and the audit export), and live on
+		// this leader's event stream.
+		detail := fmt.Sprintf(
 			"method=%s renews fence %s (%s at %s), which was aged or in doubt; recovering on the fresh fence",
-			fr.Method, rec.ID, rec.Method, rec.TS))
+			fr.Method, rec.ID, rec.Method, rec.TS)
+		c.audit(ctx, "host.refence", h.Name, detail, "ok")
+		c.publish("host.refenced", h.Name, detail)
 	}
 	if fenced && !fr.Success {
 		slog.Error("failover: the re-fence failed, NOT resuming the recovery on the older fence",

@@ -860,7 +860,11 @@ the marker and records the host `upgrading` again, and the daemon records it
 The coordinator skips an `upgrading` host for 2 minutes, counted from the
 state write itself and not from the host's version or resource reports, and
 fences it after that. A daemon that never serves is therefore fenced 2 minutes
-after its boot write. Each of these boots `active`, as before:
+after its boot write. Its boot can come up to 2 minutes after the SIGTERM and
+still keep the host `upgrading`, so the longest such a host is held unfenced
+is about 4 minutes from the SIGTERM. A daemon that serves late, past
+`upgrade_health_deadline_sec`, logs an error at the deadline and keeps
+checking, and is recorded `active` once it answers. Each of these boots `active`, as before:
 
 - a crash, or a daemon that dies before serving (the marker is consumed);
 - a host that was not `active` when it was stopped. A fenced, offline or

@@ -145,7 +145,17 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 	if deadline <= 0 {
 		deadline = 120 * time.Second
 	}
-	client, conn, err := d.localGRPCClient()
+	dial := d.selfPinger
+	if dial == nil {
+		dial = func() (pinger, func(), error) {
+			client, conn, err := d.localGRPCClient()
+			if err != nil {
+				return nil, nil, err
+			}
+			return client, func() { _ = conn.Close() }, nil
+		}
+	}
+	client, closeFn, err := dial()
 	if err != nil {
 		// Environmental, and it would never let the host turn active: record
 		// it active now, as the boot write did before.
@@ -153,24 +163,35 @@ func (d *Daemon) awaitServingThenActivate(ctx context.Context) {
 		d.activateAfterRestart()
 		return
 	}
-	defer conn.Close()
+	defer closeFn()
 	d.activateOnceServing(ctx, client, deadline)
 }
 
-// activateOnceServing pings this daemon until it answers or deadline passes.
-// Answered: the host is recorded active. Not: it is LEFT 'upgrading' — there
-// is no previous binary to roll back to — and the coordinator fences it once
-// its upgrading timeout has passed.
+// activateOnceServing pings this daemon until it answers, and then records the
+// host active. Until it answers the host stays 'upgrading' — there is no
+// previous binary to roll back to — and the coordinator fences it once its
+// upgrading timeout has passed.
+//
+// The deadline only times the error log. Pinging goes on past it, until the
+// daemon answers or shuts down: a daemon that comes up late is a healthy host,
+// and nothing else would ever record it active again (recoverHosts revives
+// only offline and fenced hosts), so stopping at the deadline left it
+// 'upgrading' — unplaceable, shown draining — until an operator undrained it.
+// ConfirmServing still refuses a host fenced or otherwise moved on meanwhile.
 func (d *Daemon) activateOnceServing(ctx context.Context, client pinger, deadline time.Duration) {
 	dctx, cancel := context.WithTimeout(ctx, deadline)
-	defer cancel()
-	if !pingUntil(dctx, client) {
+	answered := pingUntil(dctx, client)
+	cancel()
+	if !answered {
 		if ctx.Err() != nil {
 			return // shutting down
 		}
-		slog.Error("restart: this daemon never answered its own Ping; leaving the host 'upgrading', and the cluster fences it once its upgrading timeout passes",
+		slog.Error("restart: this daemon has not answered its own Ping; the host stays 'upgrading', and the cluster fences it once its upgrading timeout passes. Still checking.",
 			"deadline", deadline, "timeout", hostboot.UpgradingTimeout)
-		return
+		if !pingUntil(ctx, client) {
+			return // shutting down
+		}
+		slog.Info("restart: this daemon answered its own Ping after the deadline", "deadline", deadline)
 	}
 	d.activateAfterRestart()
 }

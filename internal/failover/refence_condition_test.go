@@ -141,3 +141,33 @@ func TestRefence_SuccessPublishesAHostEvent(t *testing.T) {
 		}
 	}
 }
+
+// TestRefence_SuccessIsAudited: the event bus is the leader's alone and keeps
+// nothing, so a successful re-fence is also an audit row, which replicates
+// and which `lv events` streams on any node. A failed one writes none.
+//
+// Mutation: drop the audit call — no row.
+func TestRefence_SuccessIsAudited(t *testing.T) {
+	for _, ok := range []bool{true, false} {
+		ctx := context.Background()
+		db, second, _ := agedFenceFixture(t)
+		second.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+			return fence.Result{Method: "ipmi", Detail: "powered off", Success: ok}
+		})
+		second.RunOnce(ctx)
+		rows, err := db.Query(ctx, `SELECT target, detail, result FROM audit_log WHERE action = 'host.refence'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			if len(rows) != 0 {
+				t.Fatalf("a failed re-fence was audited as one: %d rows", len(rows))
+			}
+			continue
+		}
+		if len(rows) != 1 || rows[0].String("target") != "bad" || rows[0].String("result") != "ok" ||
+			!strings.Contains(rows[0].String("detail"), "renews fence") {
+			t.Fatalf("a successful re-fence wrote %d host.refence audit rows, want one for bad naming the renewed fence", len(rows))
+		}
+	}
+}

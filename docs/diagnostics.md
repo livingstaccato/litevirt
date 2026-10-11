@@ -1194,8 +1194,10 @@ recovery resumes from it. The condition resolves once a later fence of the host
 succeeds or an operator confirms it off, or the host is back `active` or
 removed.
 
-A re-fence that **succeeds** publishes a `host.refenced` event on the cluster
-event stream, naming the recorded fence it renewed and the method. A host
+A re-fence that **succeeds** is recorded as a `host.refence` audit entry,
+naming the recorded fence it renewed and the method. The entry replicates, so
+`lv events` on any node shows it, and so does the audit export. The failover
+leader also publishes it live as `host.refenced` on its own event stream. A host
 fenced by hand (`lv host fence`) while it was still answering has a fence
 that does not stand, so with `ipmi` (or another verified method) the leader
 powers it off once more, 15-20 s later, before it recovers the host's

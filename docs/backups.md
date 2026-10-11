@@ -599,7 +599,10 @@ when its old owner provably no longer writes it:
   promoting host, or its owner is fenced, removed or no longer a member
   **and proven powered off**: the newest fence on record for it is
   proof-grade (a verified IPMI power-off, or `lv host fence-confirm`), the
-  same assurance the shared-storage fence and recovery claims trust. A host
+  same assurance the shared-storage fence and recovery claims trust. For a
+  host that is no longer a member, only a fence of its last life counts: one
+  recorded before it was last re-added or returned to service is about an
+  earlier life of the name and proves nothing. A host
   recorded fenced by an SSH, watchdog or best-effort fence, or with no fence
   record, may still be writing the disk, and so may a removed one:
   `lv host rm --force` asks for no fence, and a host whose daemon died may
@@ -619,7 +622,11 @@ does not excuse the host the VM was running on.
 The remedy is to prove the owner off **before** promoting: once it is powered
 off, `lv host fence-confirm <host>` (a removed host is accepted, see
 docs/migration-failover.md), or an IPMI fence. A promotion made after that
-reattaches the disk. No command attaches an existing disk at its path to a VM
+reattaches the disk. Confirming a removed host also lets the failover
+coordinator, with recovery claims enforced, recover every workload still
+recorded on it, possibly before your promotion runs. A node still on an older
+build answers "not found" for a removed host, so set `LV_HOST` to an upgraded
+node. No command attaches an existing disk at its path to a VM
 already promoted, and re-running `lv replication promote <vm> --force` over a
 partial promotion is not a remedy: it destroys the promoted domain, then
 rebuilds the disks from their replicas (losing what the promoted VM wrote) or

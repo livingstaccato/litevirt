@@ -1019,8 +1019,13 @@ func (s *Server) confirmRemovedHostFence(ctx context.Context, req *pb.FenceHostR
 		HostName: req.Name,
 		Method:   "manual",
 		Result:   "manual-confirmed",
+		// Review R4-m1: the confirmation is also the proof-grade fence that
+		// lets the failover coordinator recover, under recovery claims, every
+		// workload still recorded on the removed host (recoverRemovedHosts),
+		// and that can come before the operator's own promotion.
 		Detail: "operator confirmation of a removed host recorded; a promotion made from now on may reattach " +
-			"a shared disk it owned",
+			"a shared disk it owned. With recovery claims enforced, the failover coordinator may now also recover " +
+			"every workload still recorded on " + req.Name + " under its failure policy, possibly before a promotion you run",
 	}, nil
 }
 

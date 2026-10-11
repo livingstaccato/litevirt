@@ -653,6 +653,28 @@ accepted (`lv host fence <host>` refuses a removed host, since there is
 nothing left to fence it by), and a name the cluster holds no hosts row for
 at all is still not found.
 
+Only a fence of the removed host's **last life** counts. A removal writes no
+fence row, so an IPMI fence or a confirmation recorded before the host last
+came back (the same machine before it returned to service, or the machine
+removed under the name before `lv host add` gave it to a new one) proves
+nothing about the machine behind the name now. The boundary is the same one
+`lv host rm --dead` uses: the host's membership row, which outlives the
+removal, dates its last life. A confirmation recorded after the removal
+always counts.
+
+The confirmation is not only for the promotion. It is also the proof-grade
+fence that `lv host rm --dead` would have required, so with recovery claims
+enforced the failover coordinator may now recover **every workload still
+recorded on the removed host** under its failure policy, by the same claim
+path as after `lv host rm --dead`, once the removal and the host's certificate
+revocation have replicated. That can happen before a promotion you run next,
+so confirm a removed host only when you want its workloads recovered.
+
+The confirmation of a removed host needs a node on a build that has it. A
+node still on an older build answers `host "<host>" not found` for a removed
+host, as it always did; during a rolling upgrade, point `lv` at an upgraded
+node (set `LV_HOST` to it).
+
 ### Shared-disk fence gating (host-fence-gated shared storage)
 
 A VM whose disk lives on **shared** storage (NFS/Ceph/RBD/iSCSI) is a special

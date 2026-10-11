@@ -155,6 +155,11 @@ func TestFenceConfirm_ARemovedHostThenPromoteReattaches(t *testing.T) {
 	if res.Result != "manual-confirmed" {
 		t.Errorf("result = %q, want manual-confirmed", res.Result)
 	}
+	// Review R4-m1: the result says the confirmation also unblocks the
+	// coordinator's recovery of the workloads recorded on the removed host.
+	if !strings.Contains(res.Detail, "recover every workload still recorded on dead-host") {
+		t.Errorf("detail = %q, want the removed-host recovery side effect named", res.Detail)
+	}
 	if h, err := corrosion.GetHost(ctx, s.db, "dead-host"); err != nil || h != nil {
 		t.Errorf("GetHost after fence-confirm = %+v, %v; want the host to stay removed", h, err)
 	}
@@ -270,8 +275,13 @@ func TestPromote_TheVMsOwnerIsJudgedToo(t *testing.T) {
 	if xml := s.virt.(*libvirtfake.Fake).DefinedXML("db"); strings.Contains(xml, nfsDisk) {
 		t.Errorf("attached while the VM's owner is not proven off: %s", xml)
 	}
-	if p := eventDetail(t, s, "db", vmEventPromotedPartial); !strings.Contains(p, "dead-host is fenced, but not proven powered off") {
+	p := eventDetail(t, s, "db", vmEventPromotedPartial)
+	if !strings.Contains(p, "dead-host is fenced, but not proven powered off") {
 		t.Errorf("partial = %q, want the VM's owner named", p)
+	}
+	// Review R4-m2: the remedy names the host that failed, not old-src.
+	if !strings.Contains(p, "once dead-host is powered off, `lv host fence-confirm dead-host`") || strings.Contains(p, "fence-confirm old-src") {
+		t.Errorf("partial = %q, want the remedy to name dead-host, not old-src", p)
 	}
 }
 

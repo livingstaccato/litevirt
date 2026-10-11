@@ -1238,8 +1238,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// R3-I2): `lv host rm --force` needs no fence, and a host whose
 		// daemon died may still run its qemu. fencing_log rows outlive the
 		// tombstone, and `lv host fence-confirm` records one for a removed host.
-		if o.err == nil && (o.host == nil || o.host.State == "fenced" || o.host.State == "removed") {
-			o.provedOff, o.err = corrosion.FenceRecordProvesOff(ctx, s.db, name)
+		// For a removed host only a fence of its LAST life counts (review
+		// R4-I1): a removal writes no fence row, so the newest one can be about
+		// the machine removed under the name before it was re-added, or the
+		// same machine before it came back. A `fenced` state is written in one
+		// entry with its own row, so its newest row is always of this life.
+		if o.err == nil {
+			switch {
+			case o.host == nil || o.host.State == "removed":
+				o.provedOff, o.err = corrosion.RemovedHostProvedOff(ctx, s.db, name)
+			case o.host.State == "fenced":
+				o.provedOff, o.err = corrosion.FenceRecordProvesOff(ctx, s.db, name)
+			}
 		}
 		owners[name] = o
 		return o
@@ -1248,7 +1258,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// coordinator marked. A relay without either (an operator through another
 	// node, local-root lv, an older coordinator) gets the manual rule.
 	sharedAutomated := autoPath || req.Automated
-	reattachVerdict := func(d corrosion.DiskRecord) (bool, string) {
+	// reattachVerdict also returns the host the disk was refused for, which
+	// the partial report's remedy names (review R4-m2): not the disk row's
+	// host when that one passed, and "" when no host failed.
+	reattachVerdict := func(d corrosion.DiskRecord) (bool, string, string) {
 		judged, ok := sharedDiskOwners(d.HostName, vm.HostName, s.hostName)
 		switch {
 		case !ok:
@@ -1263,10 +1276,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 			if ok, why := sharedReattachVerdict(renamed, sharedAutomated, fenceProven, vm.HostName,
 				owner, s.hostName, o.host, o.provedOff, o.err); !ok {
-				return false, why
+				return false, why, owner
 			}
 		}
-		return true, ""
+		return true, "", ""
 	}
 	for i := range others {
 		d := &others[i]
@@ -1282,8 +1295,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 					d.missing = "not attached by the attempt that started the domain"
 				}
 			default:
-				if ok, why := reattachVerdict(d.row); !ok {
-					d.missing = why
+				if ok, why, owner := reattachVerdict(d.row); !ok {
+					d.missing, d.unproven = why, owner
 				} else if serr := statWithin(s.hostDiskFile(d.row.Path), sharedDiskStatTimeout); serr != nil {
 					d.missing = fmt.Sprintf("not reachable from %s: %v", s.hostName, serr)
 				} else {

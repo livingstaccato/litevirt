@@ -115,7 +115,13 @@ const fenceLifeSkew = 5 * time.Second
 // count for it (colonelpanik/litevirt#253). Its state write dates its life like
 // any other state's.
 func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time, state string, ok bool, err error) {
-	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
+	return hostFenceLife(ctx, c, host, ` WHERE h.name = ? AND h.deleted_at IS NULL`)
+}
+
+// hostFenceLife is HostFenceLife over the hosts rows where selects: the live
+// one, or (RemovedHostProvedOff) the row whatever its tombstone says.
+func hostFenceLife(ctx context.Context, c *Client, host, where string) (since time.Time, state string, ok bool, err error) {
+	rows, err := scanMembership(ctx, c, where, host)
 	if err != nil || len(rows) == 0 {
 		return time.Time{}, "", false, err
 	}

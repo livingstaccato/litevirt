@@ -117,3 +117,96 @@ func TestHostProofGradeFence_JudgedByTheHostsLife(t *testing.T) {
 		}
 	})
 }
+
+// RemovedHostProvedOff is FenceRecordProvesOff bounded by the host's last
+// life (HostFenceLife), read through the tombstone: the membership row
+// survives DeleteHost, so a removed name's proof-grade fence from before its
+// last membership change is about an earlier life and proves nothing (review
+// R4-I1). A confirmation recorded after the removal, a fence of the last
+// life, and a name with no membership row (judged as before) still count.
+//
+// Mutation "no life bound" (RemovedHostProvedOff reads every row) — red on
+// "an earlier life's fence".
+func TestRemovedHostProvedOff_JudgedByTheHostsLastLife(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	row := func(t *testing.T, c *Client, id, method, result string, at time.Time) {
+		t.Helper()
+		if err := c.Execute(ctx,
+			`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, 'h1', ?, ?, ?, '')`,
+			id, method, result, at.Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorded := func(t *testing.T, c *Client, state string, at time.Time) {
+		t.Helper()
+		if err := UpdateHostState(ctx, c, "h1", state); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.DB().Exec(`UPDATE host_membership SET updated_at = ? WHERE host_name = 'h1'`,
+			at.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := func(t *testing.T) *Client {
+		t.Helper()
+		c := testClient(t)
+		seedHost(t, c, "h1")
+		c.SetHostMembershipGate(func() bool { return true })
+		if _, err := c.SplitHostMembership(ctx); err != nil || !c.HostMembershipLive() {
+			t.Fatalf("split: live=%v err=%v", c.HostMembershipLive(), err)
+		}
+		return c
+	}
+	for _, tc := range []struct {
+		name   string
+		prep   func(t *testing.T, c *Client)
+		proved bool
+	}{
+		{"an earlier life's confirmation", func(t *testing.T, c *Client) {
+			row(t, c, "old", "manual", "manual-confirmed", now.Add(-time.Hour))
+			recorded(t, c, "active", now.Add(-time.Minute))
+		}, false},
+		{"an earlier life's IPMI fence", func(t *testing.T, c *Client) {
+			row(t, c, "old", "ipmi", "fenced", now.Add(-time.Hour))
+			recorded(t, c, "active", now.Add(-time.Minute))
+		}, false},
+		{"a confirmation after the removal", func(t *testing.T, c *Client) {
+			row(t, c, "old", "manual", "manual-confirmed", now.Add(-time.Hour))
+			recorded(t, c, "active", now.Add(-time.Minute))
+			row(t, c, "new", "manual", "manual-confirmed", now)
+		}, true},
+		{"a confirmation in the last life, recorded fenced", func(t *testing.T, c *Client) {
+			recorded(t, c, "fenced", now.Add(-time.Minute))
+			row(t, c, "f", "manual", "manual-confirmed", now.Add(-time.Minute))
+		}, true},
+		{"a weaker fence in the last life over an older proof", func(t *testing.T, c *Client) {
+			recorded(t, c, "offline", now.Add(-time.Hour))
+			row(t, c, "p", "ipmi", "fenced", now.Add(-30*time.Minute))
+			row(t, c, "s", "ssh", "fenced", now.Add(-time.Minute))
+		}, false},
+		{"no fence at all", func(t *testing.T, c *Client) {
+			recorded(t, c, "active", now.Add(-time.Minute))
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := live(t)
+			tc.prep(t, c)
+			if err := DeleteHost(ctx, c, "h1"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := RemovedHostProvedOff(ctx, c, "h1")
+			if err != nil || got != tc.proved {
+				t.Fatalf("RemovedHostProvedOff = %v, %v; want %v", got, err, tc.proved)
+			}
+		})
+	}
+
+	t.Run("a name with no membership row is judged as before", func(t *testing.T) {
+		c := testClient(t)
+		row(t, c, "old", "ipmi", "fenced", now.Add(-time.Hour))
+		if got, err := RemovedHostProvedOff(ctx, c, "h1"); err != nil || !got {
+			t.Fatalf("RemovedHostProvedOff = %v, %v; want the fence counted", got, err)
+		}
+	})
+}

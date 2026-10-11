@@ -166,7 +166,9 @@ func sharedDiskOwners(diskHost, vmHost, self string) (owners []string, ok bool) 
 //     host, or its owner is fenced, removed or no longer a member AND proven
 //     off (ownerProvedOff: the newest fence on record for it is
 //     proof-grade, an IPMI power-off or `lv host fence-confirm` —
-//     corrosion.FenceRecordProvesOff). A `fenced` state over an SSH,
+//     corrosion.FenceRecordProvesOff; for a host no longer a member, the
+//     newest of its LAST life, corrosion.RemovedHostProvedOff, review
+//     R4-I1). A `fenced` state over an SSH,
 //     watchdog or best-effort fence, or none, proves nothing, and neither
 //     does a removal (review R3-I2): `lv host rm --force` asks for no fence,
 //     and a host whose daemon died may still be running its qemu. --force
@@ -482,6 +484,10 @@ type promotedSetDisk struct {
 	livePath    string // the built live disk, or a shared disk's own path
 	shared      bool   // on shared storage: never copied, never rebuilt
 	missing     string // why it is not attached; "" when it is
+	// unproven is the host a shared disk was left unattached for — the one
+	// that failed the reattach verdict — named by the partial report's
+	// remedy; "" when no host did.
+	unproven string
 	// Where it is attached in the promoted domain.
 	bus, ctrl, dev string
 }
@@ -599,8 +605,13 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM str
 		if newVM != "" && newVM != origVM {
 			return fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
 		}
-		if owner == "" {
-			owner = "<host>"
+		if owner == "" || owner == host {
+			// No host failed the verdict, or the one that did is the
+			// promoting host itself: confirming a fence would not attach it,
+			// and the promoting host is never the one to power off.
+			return fmt.Sprintf("confirming a host powered off would not attach it. Do not re-run "+
+				"`lv replication promote %s --force` over this promotion to attach it: that destroys the promoted "+
+				"domain and rebuilds its disks from their replicas, or fails", origVM)
 		}
 		return fmt.Sprintf("a promotion attaches it as-is only once its owner is proven off, so do that first next time: "+
 			"once %s is powered off, `lv host fence-confirm %s`. Do not re-run `lv replication promote %s --force` "+
@@ -616,7 +627,7 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM str
 		case d.shared:
 			parts = append(parts, fmt.Sprintf("%s: shared (%s) — NOT attached (%s)", d.row.DiskName, d.row.StorageType, d.missing))
 			missing = append(missing, fmt.Sprintf("%s (shared (%s) at %s, not attached: %s; %s)",
-				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing, sharedAdvice(d.row.HostName)))
+				d.row.DiskName, d.row.StorageType, d.row.Path, d.missing, sharedAdvice(d.unproven)))
 		case !d.recovered():
 			parts = append(parts, fmt.Sprintf("%s: NOT recovered (%s)", d.row.DiskName, d.missing))
 			where := ""

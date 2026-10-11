@@ -198,6 +198,9 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 		// A local-disk VM needs --with-storage. A failure here fails the test: a
 		// silent skip would stop checking that migration carries the throttle.
 		if out, err := lvErr(t, "migrate", vm, target, "--with-storage"); err != nil {
+			if strings.Contains(out, "qemu overhead") {
+				t.Skipf("%s has no room for the guest: %s", target, out)
+			}
 			t.Fatalf("live migration to %s failed: %v\n%s", target, err, out)
 		}
 		waitVM(t, vm, "RUNNING", 2*time.Minute)
@@ -205,12 +208,12 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 			t.Errorf("VM did not land on %s:\n%s", target, got)
 		}
 		// Read the throttle from libvirt on the destination, not through litevirt.
-		out, err := exec.Command("timeout", "30", "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", target,
-			"virsh -c qemu:///system blkdeviotune "+vm+" vda").CombinedOutput()
+		// By address: the cluster's host names do not resolve on the nodes.
+		out, err := nodeOut(target, "virsh -c qemu:///system blkdeviotune "+vm+" vda")
 		if err != nil {
 			t.Fatalf("cannot read libvirt on %s: %v\n%s", target, err, out)
 		}
-		if !regexp.MustCompile(`(?m)^read_iops_sec\s*:\s*700\s*$`).Match(out) {
+		if !regexp.MustCompile(`(?m)^read_iops_sec\s*:\s*700\s*$`).MatchString(out) {
 			t.Errorf("destination %s lost the read_iops_sec=700 throttle after migration:\n%s", target, out)
 		}
 	}

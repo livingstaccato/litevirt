@@ -2424,7 +2424,8 @@ func assertEventually(t *testing.T, timeout time.Duration, desc string, fn func(
 // if SSH isn't available, so the test degrades gracefully off-cluster.
 func nftTable(t *testing.T, host string) (string, bool) {
 	t.Helper()
-	target := envOr("E2E_FW_SSH_"+strings.ReplaceAll(host, "-", "_"), host)
+	// By address: cluster host names do not resolve on the nodes.
+	target := envOr("E2E_FW_SSH_"+strings.ReplaceAll(host, "-", "_"), sshTarget(host))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no",

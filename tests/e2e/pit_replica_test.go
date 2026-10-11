@@ -176,10 +176,12 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		defer l.ssh(h, 30*time.Second, "rm -f "+raw)
 		lo, hi := slotByte(raw, low), slotByte(raw, high)
 		l.mark("%s: copy %s has LOW=%d HIGH=%d", what, copyPath, lo, hi)
-		// Both slots hold a round's byte (1..rounds-1), never the empty disk
-		// (0) or the last round: the copy was taken while the writer ran,
-		// so a smear could show. Layer 3's smear check rests on this.
-		if lo == 0 || hi == 0 || lo >= rounds || hi >= rounds {
+		// Both slots hold a round's byte, never the empty disk (0), and HIGH
+		// is short of the last round: the copy was taken while the writer
+		// ran, so a smear could show. Layer 3's smear check rests on this.
+		// LOW may hold the last round only mid-round (LOW=rounds,
+		// HIGH=rounds-1), a genuine point-in-time state.
+		if lo == 0 || hi == 0 || hi >= rounds || lo > rounds || (lo == rounds && hi != rounds-1) {
 			t.Errorf("%s: LOW=%d HIGH=%d: the copy was not taken while the writer ran", what, lo, hi)
 		}
 		return lo, hi

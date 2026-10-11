@@ -124,3 +124,15 @@ func TestWindowTokenCmd_PrintsTheTokenAlone(t *testing.T) {
 		t.Fatalf("token read = %q, %v; want %q alone", out, err, tok)
 	}
 }
+
+// The same property where getfattr or user xattrs are missing (a CI runner
+// without attr): the command asks getfattr not to print its notice, and does
+// not fold stderr into the token.
+//
+// Mutations "no --absolute-names" and "2>&1 back" — red.
+func TestWindowTokenCmd_Shape(t *testing.T) {
+	c := WindowTokenCmd("'/d'")
+	if !strings.Contains(c, "--absolute-names") || strings.Contains(c, "2>&1") {
+		t.Fatalf("WindowTokenCmd = %q: want --absolute-names and stderr kept apart", c)
+	}
+}

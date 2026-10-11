@@ -1312,6 +1312,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		})
 	}
 
+	// A renamed promotion is a second VM with fresh MACs: its NICs are new and
+	// guarded by default, as a clone's are (copyNICGuards).
+	var guardRecords []corrosion.NICGuardRecord
+	if renamed {
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+			os.Remove(livePath)
+			return err
+		}
+	}
+
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	compose.ApplyDiskTuning(diskCfg, &spec)
@@ -1366,6 +1377,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := s.writePromoteMarker(targetName, proofID); err != nil {
 			os.Remove(livePath)
 			return status.Errorf(codes.Internal, "record promote marker: %v", err)
+		}
+		if renamed {
+			// The new row is written once the domain runs; until then the
+			// firewall renders its NICs from here (nic_firewall_arming.go).
+			defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
 		}
 		if err := s.virt.StartDomain(targetName); err != nil {
 			_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
@@ -1426,6 +1442,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// nothing here mints a generation; this assigns the first one, marks it,
 		// and publishes the row running.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
+		// The guards apply from the first reconcile that sees the row.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
 		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {

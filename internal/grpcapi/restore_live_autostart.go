@@ -301,6 +301,16 @@ func (s *Server) autoDefineRestoredVM(
 		})
 	}
 
+	// Restored under a new name, the VM is a second VM with fresh MACs: its
+	// NICs are new and guarded by default, as a clone's are (copyNICGuards).
+	var guardRecords []corrosion.NICGuardRecord
+	if renamed {
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+			return "", "", err
+		}
+	}
+
 	vmCfg := lv.VMConfig{
 		Name:        targetName,
 		CPU:         int(spec.Cpu),
@@ -382,6 +392,11 @@ func (s *Server) autoDefineRestoredVM(
 	// Spare root ports last, as in the reconciler's start: a device the
 	// pre-start patches in would otherwise land on a spare.
 	s.ensureSparePCIeRootPorts(targetName)
+	if len(guardRecords) > 0 {
+		// The row is written once the domain runs; until then the firewall
+		// renders its NICs from here (nic_firewall_arming.go).
+		defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
+	}
 	if err := s.virt.StartDomain(targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can
@@ -456,6 +471,10 @@ func (s *Server) autoDefineRestoredVM(
 		// In the else on purpose: a non-firmware insert failure is NOT fatal on
 		// this path, so an unguarded call would act on a row that does not exist.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
+		// The guards apply from the first reconcile that sees the row.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	}
 	// Only now: the fence has passed and the row is in the cluster, published
 	// running unless assignOwnerEpochAtCreate left it "creating" for the

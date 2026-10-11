@@ -2695,6 +2695,22 @@ message PingResponse {
   // wall_clock got away without a companion flag because its zero value is not
   // a legal reading; an empty token list is, so it needs one.
   bool posture_reported = 8;
+  // release_probation is true while this node is in RELEASE PROBATION: rolled
+  // back below a release token none of whose features is recorded used in its
+  // own replica, it emits no replicated writes until a voter majority confirms
+  // that. Diagnostic and for peers' probation majority only. It is NOT
+  // wal_quarantined: the node keeps advertising, and no peer isolates it.
+  bool release_probation = 9;
+  // voter_generation is the highest voter generation this node has ADOPTED
+  // (voter_configs, docs/design/recovery-claims.md §4), 0 when it has adopted
+  // none or has not run an adoption pass since it started. A node in release
+  // probation compares it with its own: a peer that reports a newer one shows
+  // that the voter set this node is counting is stale, so it adopts the newer
+  // generation (which its probation pull has just merged) and counts against
+  // that instead. Read only for that; a generation is adopted only once its
+  // certificate verifies, never because a peer reports it. (Tag 10: 9 is taken
+  // on another branch too, see the merge checklist.)
+  int64 voter_generation = 10;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -3229,6 +3245,11 @@ message ReplicateRequest {
     // belief used to apply the push locally and forward nothing. Absent (false)
     // from a released peer, which reproduces exactly that prior behaviour.
     bool   receiver_is_relay       = 6;
+    // sender_capabilities is the capability set the sender advertises at the
+    // moment of the push, the same list its Ping returns. A receiver with a
+    // release feature in use refuses a sender whose declaration lacks that
+    // release token, without dialling it back (an older build sends nothing).
+    repeated string sender_capabilities = 7;
 }
 
 message ReplicateResponse {
@@ -3923,6 +3944,16 @@ service LiteVirt {
     // operator hold (viewer): demoted or restored, since when and why, and
     // any hold with its expiry.
     rpc GetRelayHealth(google.protobuf.Empty)         returns (RelayHealthStatus);
+    // GetUpgradeStatus reports, as the answering host sees them, every
+    // capability token latched here, whether each blocks a rollback, and for
+    // each release token which of its features have been used cluster-wide
+    // (`lv cluster upgrade-status`, docs/upgrades.md). Viewer.
+    rpc GetUpgradeStatus(google.protobuf.Empty)       returns (UpgradeStatus);
+    // HoldsReleaseFeatureUse answers, for a peer, whether this replica holds the
+    // used record of one release feature. A first use waits for every
+    // replication recipient to answer yes before the feature writes anything.
+    // Peer mTLS only.
+    rpc HoldsReleaseFeatureUse(ReleaseFeatureUseQuery) returns (ReleaseFeatureUseHeld);
 
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
@@ -4186,6 +4217,85 @@ message RestoreRelayResponse {
     string host        = 1;
     bool   was_demoted = 2;  // the host was demoted before this call
     string hold_until  = 3;  // RFC 3339, empty with no hold
+}
+
+// UpgradeStatus is the answering host's view of the capability latches and the
+// release features recorded as used.
+message UpgradeStatus {
+    // release_token is the release token of the answering host's build.
+    string release_token = 1;
+    repeated UpgradeToken tokens = 2;
+    repeated ReleaseFeatureStatus features = 3;
+    // wal_quarantined is true while the answering host emits no replicated
+    // writes; quarantine_reason says why.
+    bool   wal_quarantined   = 4;
+    string quarantine_reason = 5;
+    // The rollout summary the status opens with: how many hosts run a build
+    // that advertises release_token, which do not (with their build version),
+    // and how many declared features wait for it.
+    int32  hosts_total      = 6;
+    int32  hosts_on_release = 7;
+    repeated LaggingHost lagging = 8;
+    int32  features_waiting = 9;
+    // release_probation is true while the answering host is in release
+    // probation (its replicated writes refused until a voter majority confirms
+    // no use); probation_reason says why.
+    bool   release_probation = 10;
+    string probation_reason  = 11;
+    // refused_peers are the peers this host is refusing replication from
+    // because they cannot keep a release feature in use.
+    repeated string refused_peers = 12;
+}
+
+// LaggingHost is a host not yet on the answering host's release.
+message LaggingHost {
+    string name    = 1;
+    string version = 2;  // its reported build version, "" if unknown
+    string reason  = 3;  // "not advertising <token>" | "unreachable"
+}
+
+// UpgradeToken is one capability token latched on the answering host.
+message UpgradeToken {
+    string name      = 1;
+    bool   durable   = 2;  // the latch's marker is on disk
+    bool   mandatory = 3;  // no config flag
+    // rollback_rule is the marker's rollback rule ("safe_if_unused") or "".
+    string rollback_rule = 4;
+    // blocks_rollback is true when rolling a host back to the build directly
+    // below this token would quarantine it. Always for a token with no rule;
+    // always for the first release token, because every build below it
+    // predates rollback rules; for a later release token, once one of its
+    // features is used.
+    bool   blocks_rollback = 5;
+    // blocks_rollback_rule_aware is the same question for a target build that
+    // reads rollback rules: false for a safe_if_unused token none of whose
+    // features is used, true otherwise.
+    bool   blocks_rollback_rule_aware = 6;
+}
+
+// ReleaseFeatureStatus is one release feature: declared by this build, or
+// recorded as used under a token this build does not know.
+message ReleaseFeatureStatus {
+    string token         = 1;
+    string name          = 2;
+    string description   = 3;  // "" for a feature this build does not declare
+    bool   used          = 4;
+    string recorded_by   = 5;  // the host that last recorded the use (every writing host re-records it)
+    string recorded_at   = 6;
+    bool   declared      = 7;  // this build declares the feature
+}
+
+message ReleaseFeatureUseQuery {
+    string token   = 1;
+    string feature = 2;
+}
+
+message ReleaseFeatureUseHeld {
+    bool held = 1;
+    // in_release_probation: the answering host is in release probation, so it
+    // applies nothing pushed to it and cannot come to hold a new record until
+    // its probation lifts (lv cluster upgrade-status shows why it has not).
+    bool in_release_probation = 2;
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

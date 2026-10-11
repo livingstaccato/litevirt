@@ -328,7 +328,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
 	// has to stay up anyway so peers can see it degraded and an operator can reseed
 	// it. Fail-closed happens at the write path instead, wired below.
-	if toks := preflightCapabilityRollback(d.cfg.DataDir); len(toks) > 0 {
+	// Release probation (C1): rolled back below a safe_if_unused release token
+	// with no use in this replica. No replicated writes until a voter majority
+	// confirms (RunReleaseProbation, below).
+	if toks := BootRollbackCheck(ctx, d.cfg.DataDir, d.db); len(toks) > 0 {
 		d.rolledBackTokens = toks
 		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
 			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
@@ -631,6 +634,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetVMReplaceAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
 	})
+	// Every push declares this build's release tokens from the first one
+	// (I-R2-2): the server, which wires the live advertisement, is built later,
+	// and a push that declared nothing would be refused by every peer with a
+	// release feature in use.
+	repl.SetAdvertisedCapabilities(capabilities.ReleaseTokens)
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -668,6 +676,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ae.SetRelayConfig(relayCfg)
 	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
+	// Release probation (entered only from a marker at boot) is lifted only by
+	// asking a voter majority.
+	go RunReleaseProbation(ctx, d.db, ae)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
 	// gRPC container adapter + health checker below, so the metrics collector can
@@ -868,6 +879,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// Release features (capabilities.Feature) open through the checker's
+	// WithFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
+	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
+	// A peer advertising a release token this build does not know is, almost
+	// always, a forward roll: a non-blocking look at its used records, never a
+	// probation (N2). Probation comes only from a marker at boot.
+	corrosion.WireUnknownReleaseObserver(ctx, d.checker, ae)
+	// Take no replicated state from a peer that cannot keep a release feature
+	// in use: pushes are refused in PushMutations, pulls here.
+	d.db.SetReplicationSourceGate(svc.ReleaseSourceAllowed)
+	// A probation round that hears of a newer voter generation adopts it (each
+	// certificate verified) and counts against it (I-R4-2).
+	ae.SetVoterAdopter(svc.AdoptVoterConfigs)
 	// The server can answer the lease-mint clearance from here on: it has the
 	// gate whose quorum and healthy-peer set its high-water read uses.
 	d.mintClearance.Store(svc)
@@ -1073,6 +1098,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
+	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
@@ -1274,7 +1300,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A rolled-back node stops advertising capabilities, so the cluster cannot
 	// latch anything further across a member that could not honour it, and peers
 	// raise ha_degraded against it.
-	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
+	// Quarantined below a latched token found at startup, OR since startup by
+	// a use of a newer release's feature arriving by replication.
+	// A rollback quarantine or a tripped release use — never a release
+	// probation, which is not a rollback below anything known to be used and
+	// must not get this node isolated by its peers (N1).
+	svc.SetWALQuarantined(func() bool {
+		return len(d.rolledBackTokens) > 0 || d.db.WALQuarantined()
+	})
 	go vipDemoter.Start(ctx)
 	// Partition pause (docs/design/partition-pause.md): on losing the execution
 	// quorum for T_pause, suspend/freeze every workload the majority would
@@ -1300,6 +1333,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	// Per-host disk SMART health: gauges + a notification on a failing/prefail disk.
+	if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
+		go svc.RunSMARTMonitor(ctx, iv)
+	}
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.
@@ -2348,6 +2385,34 @@ func (d *Daemon) parsePCIRescanInterval() time.Duration {
 	}
 	return dur
 }
+
+// parseSMARTInterval parses smart.interval: empty = 1h default, "0"/"off" = disabled,
+// an unparseable value falls back to the default with a warning.
+func parseSMARTInterval(s string) time.Duration {
+	switch s {
+	case "":
+		return time.Hour
+	case "0", "off":
+		return 0
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil || dur < 0 {
+		slog.Warn("invalid smart.interval; using 1h", "value", s, "error", err)
+		return time.Hour
+	}
+	if dur == 0 {
+		return 0
+	}
+	if dur < minSMARTInterval {
+		slog.Warn("smart.interval below the floor; clamped", "value", s, "floor", minSMARTInterval)
+		return minSMARTInterval
+	}
+	return dur
+}
+
+// minSMARTInterval is the shortest smart.interval: smartctl forks per disk per
+// pass and a sub-minute interval would run it continuously.
+const minSMARTInterval = 10 * time.Minute
 
 // parseDurationOr parses a Go duration string, returning fallback when empty
 // or unparseable (logging a warning in the latter case).

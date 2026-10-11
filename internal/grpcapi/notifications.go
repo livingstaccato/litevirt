@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -127,13 +128,39 @@ func (s *Server) CreateNotificationTarget(ctx context.Context, req *pb.CreateNot
 	if _, err := notify.NewTarget(req.Name, req.Type, req.Config); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: req.Config, Enabled: req.Enabled}
-	if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
+	// Store the validated config in canonical form: encoding/json matches field
+	// names case-insensitively, so without this a "Password" key would be
+	// accepted and persisted under a name masking does not look for.
+	cfg, cerr := notify.CanonicalConfig(req.Type, req.Config)
+	if cerr != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
+	}
+	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: cfg, Enabled: req.Enabled}
+	if notify.HasSecret(req.Type, cfg) {
+		// An email target's SMTP password is data an older build does not
+		// mask or keep, so it is written through the release gate on this node,
+		// which refuses (FailedPrecondition) until release_2026_11_v1 has latched
+		// and records the feature's use first. A passwordless email target, and
+		// every other type, is not gated.
+		err := s.WithReleaseFeature(ctx, capabilities.FeatureEmailTargetSecret,
+			func(ctx context.Context, g capabilities.FeatureGrant) error {
+				return corrosion.InsertEmailTargetWithSecret(ctx, s.db, g, t)
+			})
+		if err != nil {
+			if _, ok := status.FromError(err); ok {
+				return nil, err
+			}
+			return nil, status.Errorf(codes.Internal, "create target: %v", err)
+		}
+	} else if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
 		return nil, status.Errorf(codes.Internal, "create target: %v", err)
 	}
 	slog.Info("notification target created", "name", t.Name, "type", t.Type)
 	s.audit(ctx, "notify.target.add", t.ID, t.Name+" "+t.Type, "ok")
-	return toPbTarget(t), nil
+	// Never echo the stored secret back: the response is masked like a list.
+	pt := toPbTarget(t)
+	pt.Config = notify.RedactConfig(t.Type, t.Config)
+	return pt, nil
 }
 
 func (s *Server) ListNotificationTargets(ctx context.Context, _ *pb.ListNotificationTargetsRequest) (*pb.ListNotificationTargetsResponse, error) {
@@ -154,6 +181,10 @@ func (s *Server) ListNotificationTargets(ctx context.Context, _ *pb.ListNotifica
 	resp := &pb.ListNotificationTargetsResponse{}
 	for _, t := range targets {
 		pt := toPbTarget(t)
+		// An SMTP password is masked for EVERY role, operator included: unlike a
+		// webhook URL, which an operator needs to see to know what is being
+		// called, nothing about managing a target requires reading it back.
+		pt.Config = notify.RedactConfig(t.Type, t.Config)
 		if redactConfig {
 			pt.Config = redactedTargetConfig
 		}

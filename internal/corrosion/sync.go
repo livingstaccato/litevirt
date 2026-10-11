@@ -648,6 +648,14 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	start := time.Now()
 	merged, skipped := 0, 0
 	var firstErr error
+	// A use of a release feature this binary does not know quarantines it
+	// before ANY table of the payload is merged — the feature's data may sit in
+	// a table merged ahead of cluster_policies (release_features.go).
+	for _, table := range payload.Tables {
+		if allowedTables[table.Name] {
+			c.noteReleaseUseRows(table)
+		}
+	}
 	tables := authorityOrderedMergeTables(payload)
 	for _, table := range tables {
 		table.remints = payload.remints
@@ -672,6 +680,10 @@ var mergeApplyChunkRows = 1000
 // mergeChunkHook is a test-only seam invoked between merge chunks (with c.mu
 // released). Nil in production.
 var mergeChunkHook func()
+
+// mergeTableHook is a test-only seam invoked as each table's merge begins, before
+// anything of it is applied. Nil in production.
+var mergeTableHook func(table string)
 
 // mergeChunkFailHook is a test-only seam: when set and it returns true, mergeChunk rolls the chunk
 // back after applying its rows but before commit. Nil in production.
@@ -744,6 +756,12 @@ func (c *Client) mergeTable(table syncTable, allowedTables map[string]bool) (mer
 		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")
 		return 0, len(table.Rows), nil
 	}
+	if mergeTableHook != nil {
+		mergeTableHook(table.Name)
+	}
+	// Paged anti-entropy merges table by table, with no payload to scan
+	// first; a used record is still checked before its own table is merged.
+	c.noteReleaseUseRows(table)
 	localCols, ok := c.readTableColumns(table.Name)
 	if !ok {
 		c.observeMergeRejected(boundedTableLabel(table.Name), "ae", "unknown_table")

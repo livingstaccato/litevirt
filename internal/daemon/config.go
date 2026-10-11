@@ -227,6 +227,11 @@ type Config struct {
 	// DefaultWebhook seeds a catch-all webhook target without UI/CLI.
 	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
 
+	// SMART controls the periodic per-host disk SMART health check
+	// (smartctl). Informational: exposes litevirt_disk_smart_* gauges and
+	// notifies on a failing/prefail disk; never fences or blocks anything.
+	SMART SMARTConfig `yaml:"smart,omitempty"`
+
 	// Telemetry configures structured logging + distributed tracing via
 	// provide-telemetry. With no otlp_endpoint the daemon logs locally and traces
 	// are no-ops; set otlp_endpoint to export logs + traces to a collector.
@@ -463,6 +468,12 @@ func (a ACMEConfig) validate() error {
 // NotificationsConfig holds the optional default-webhook shortcut (#5).
 type NotificationsConfig struct {
 	DefaultWebhook string `yaml:"default_webhook,omitempty"`
+}
+
+// SMARTConfig configures the disk SMART monitor. Interval is a Go duration;
+// empty means the default (1h) and "0" or "off" disables the check.
+type SMARTConfig struct {
+	Interval string `yaml:"interval,omitempty"`
 }
 
 // AutoUpgradeConfig controls peer self-upgrade. FromPeer is a pointer so an

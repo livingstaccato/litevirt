@@ -28,6 +28,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
 		newClusterRelayRestoreCmd(),
+		newClusterUpgradeStatusCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),
 		newClusterClaimCmd(),
@@ -206,6 +207,122 @@ func printFailoverScope(out io.Writer, st *pb.FailoverScopeStatus) {
 			"automatically fenced or recovered under region scope. Add voters (a witness counts), or\n"+
 			"run 'lv cluster failover-scope cluster'.\n", small)
 	}
+}
+
+// lv cluster upgrade-status — the capability tokens latched on the connected
+// host, whether each blocks a rollback, and which release features are in use
+// (capabilities.ReleaseToken, docs/upgrades.md).
+func newClusterUpgradeStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "upgrade-status",
+		Short: "Show latched capability tokens, rollback blockers and release features in use",
+		Long: `Show, as the connected host sees them, every capability token latched on it,
+whether each would block rolling a host back below the build that introduced it,
+and which features of each release token have been used anywhere in the cluster.
+
+BLOCKS ROLLBACK answers for the build directly below the token. A token with no
+rollback rule always blocks: a host rolled back below it enters WAL quarantine.
+release_2026_11_v1 always blocks too, because every build below it predates
+rollback rules and quarantines on any marker it does not know, used or not.
+
+IF RULE-AWARE answers for a target build that reads the "safe_if_unused" rule a
+release token's marker carries: there, a rollback below the token quarantines
+only once one of its features has been used. That is what a later release's
+token offers when rolled back onto this release.
+
+The first line is the rollout: how many of the hosts the release token waits
+on run this release — every voting-eligible host and every host the cluster
+replicates to, so a powered-off host parked in maintenance is not counted —
+which do not (with their build version), and how many features wait for them. A feature
+refused mid-upgrade says the same and points here. The release token latches by
+itself once every host is on the release; nothing has to be run.
+
+A feature is marked used before its first write anywhere, every host that writes
+it records it again, and the mark is never cleared: nothing proves the
+feature's data has all gone. RECORDED BY is the host that last recorded it.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				st, err := c.GetUpgradeStatus(ctx, &emptypb.Empty{})
+				if err != nil {
+					return fmt.Errorf("get upgrade status: %w", err)
+				}
+				printUpgradeStatus(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+func upgradeYesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+func printUpgradeStatus(out io.Writer, st *pb.UpgradeStatus) {
+	// The one line that answers "is the upgrade done?" (UX 2).
+	if st.GetHostsTotal() > 0 {
+		fmt.Fprintf(out, "Rollout: %d of %d hosts on %s", st.GetHostsOnRelease(), st.GetHostsTotal(), st.GetReleaseToken())
+		if n := st.GetFeaturesWaiting(); n > 0 {
+			fmt.Fprintf(out, "; %d feature(s) waiting for the rest", n)
+		}
+		fmt.Fprintln(out)
+		for _, l := range st.GetLagging() {
+			v := l.GetVersion()
+			if v == "" {
+				v = "version unknown"
+			}
+			fmt.Fprintf(out, "  not yet: %s (%s)\n", l.GetName(), v)
+		}
+	}
+	fmt.Fprintf(out, "Release token: %s\n", st.GetReleaseToken())
+	if st.GetWalQuarantined() {
+		fmt.Fprintf(out, "WAL quarantine: yes — %s\n", st.GetQuarantineReason())
+	}
+	if st.GetReleaseProbation() {
+		fmt.Fprintf(out, "Release probation: yes — %s\n", st.GetProbationReason())
+	}
+	if peers := st.GetRefusedPeers(); len(peers) > 0 {
+		fmt.Fprintf(out, "Refusing replication from: %s (they do not advertise a release token in use)\n",
+			strings.Join(peers, ", "))
+	}
+	fmt.Fprintln(out)
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "TOKEN\tDURABLE\tMANDATORY\tROLLBACK RULE\tBLOCKS ROLLBACK\tIF RULE-AWARE\n")
+	for _, tk := range st.GetTokens() {
+		rule := tk.GetRollbackRule()
+		if rule == "" {
+			rule = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", tk.GetName(), upgradeYesNo(tk.GetDurable()),
+			upgradeYesNo(tk.GetMandatory()), rule, upgradeYesNo(tk.GetBlocksRollback()),
+			upgradeYesNo(tk.GetBlocksRollbackRuleAware()))
+	}
+	w.Flush()
+	if len(st.GetTokens()) == 0 {
+		fmt.Fprintln(out, "(no capability token has latched on this host)")
+	}
+	fmt.Fprintln(out)
+	if len(st.GetFeatures()) == 0 {
+		fmt.Fprintln(out, "No release features are declared by this build or recorded as used.")
+		return
+	}
+	w = tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "RELEASE TOKEN\tFEATURE\tUSED\tRECORDED BY\tDESCRIPTION\n")
+	for _, f := range st.GetFeatures() {
+		desc := f.GetDescription()
+		if !f.GetDeclared() {
+			desc = "(not known to this build: a newer release's feature)"
+		}
+		by := f.GetRecordedBy()
+		if by == "" {
+			by = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", f.GetToken(), f.GetName(), upgradeYesNo(f.GetUsed()), by, desc)
+	}
+	w.Flush()
 }
 
 // lv cluster acknowledge-lease-term — clear a contested lease term from the CONNECTED

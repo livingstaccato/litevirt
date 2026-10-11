@@ -51,6 +51,9 @@ lv cluster failover-scope [cluster|region]  # Show or set whether failover quoru
 lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
 lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
+lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
+                                   #   rollback, and which release features are in use (see upgrades.md →
+                                   #   Rolling back after a release token latched)
 lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
 lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
 lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
@@ -800,6 +803,9 @@ lv run … --restart on-failure --restart-max-attempts 5 --restart-delay 5s --re
 ```bash
 lv notify target add --name ops-slack --type slack --url <incoming-webhook-url>
 lv notify target add --name ops-hook --type webhook --url <url>
+lv notify target add --name ops-mail --type email --smtp-host smtp.example.com \
+    --smtp-user lv@example.com --smtp-password-file /root/smtp.pw \
+    --from litevirt@example.com --to ops@example.com --to oncall@example.com
 lv notify target ls
 lv notify route add --pattern "backup.*" --target <target-id> --min-severity error
 lv notify route add --pattern "*" --target <target-id> --min-severity warn

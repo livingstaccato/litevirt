@@ -392,7 +392,7 @@ func (s *Server) recheckStreamIdentity(ctx context.Context) error {
 			return status.Error(codes.Unauthenticated, "stream ended: API token revoked or expired")
 		}
 		if life.TokenPredates(created) {
-			return status.Error(codes.Unauthenticated, "stream ended: API token predates the account's last delete")
+			return status.Error(codes.Unauthenticated, tokenCutoffRefusal(life, user, created, "stream ended: "))
 		}
 	}
 	return nil

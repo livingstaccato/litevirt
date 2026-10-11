@@ -1096,8 +1096,10 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; string username = 4; }
 // ResetAdminPasswordResponse names the account the daemon reset, as stored. A
 // daemon that predates the field answers with an empty name: it reset "admin"
-// whatever the request named, and the CLI says so.
-message ResetAdminPasswordResponse { string username = 1; }
+// whatever the request named, and the CLI says so. note, when set, is for the
+// operator: the reset left something in place they must know about (a cut-off
+// dated in the future it could not correct), and what clears it.
+message ResetAdminPasswordResponse { string username = 1; string note = 2; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;

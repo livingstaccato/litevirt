@@ -160,6 +160,24 @@ type fakeResetDaemon struct {
 	// predatesUser answers as a daemon that does not know the username field:
 	// it resets "admin" and names no account.
 	predatesUser bool
+	// pingSchema is the schema version Ping reports, 0 for this build's;
+	// pingErr fails the Ping instead. pinged counts the Pings.
+	pingSchema int32
+	pingErr    error
+	pinged     int
+	note       string // the daemon's ResetAdminPasswordResponse.note
+}
+
+func (f *fakeResetDaemon) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	f.pinged++
+	if f.pingErr != nil {
+		return nil, f.pingErr
+	}
+	v := f.pingSchema
+	if v == 0 {
+		v = int32(corrosion.CurrentSchemaVersion)
+	}
+	return &pb.PingResponse{SchemaVersion: v}, nil
 }
 
 func (f *fakeResetDaemon) ResetAdminPassword(_ context.Context, req *pb.ResetAdminPasswordRequest, _ ...grpc.CallOption) (*pb.ResetAdminPasswordResponse, error) {
@@ -174,7 +192,7 @@ func (f *fakeResetDaemon) ResetAdminPassword(_ context.Context, req *pb.ResetAdm
 	if name == "" {
 		name = "admin"
 	}
-	return &pb.ResetAdminPasswordResponse{Username: name}, nil
+	return &pb.ResetAdminPasswordResponse{Username: name, Note: f.note}, nil
 }
 
 func envFor(t *testing.T, d *fakeResetDaemon, dataDir string, openDB func() (*corrosion.Client, error)) resetAdminEnv {

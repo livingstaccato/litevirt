@@ -372,20 +372,24 @@ func TestM5_CutoffNeverMovesBackwards(t *testing.T) {
 	ctx := context.Background()
 	seedAdmins(t, s)
 	seedUser(t, s, "bob", "operator", "pw")
-	ahead := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
-	for _, u := range []string{"admin", "bob"} {
-		writeLifecycle(t, s, u, corrosion.UserAttrSessionsNotBefore, ahead)
-	}
+	// Ahead by less than the skew margin: a disable written a moment ago, or
+	// by a clock slightly ahead. reset-admin keeps it; only a cut-off further
+	// ahead than the margin is clock error it replaces (re-review 4, m-2,
+	// TestFU_M2_ResetAdminCorrectsAFutureDatedCutoff). An enable or disable
+	// never moves one back, however far ahead.
+	ahead := time.Now().Add(corrosion.SessionCutoffSkewMargin - time.Second).UTC().Format(time.RFC3339)
+	writeLifecycle(t, s, "admin", corrosion.UserAttrSessionsNotBefore, ahead)
+	writeLifecycle(t, s, "bob", corrosion.UserAttrSessionsNotBefore, time.Now().Add(2*time.Hour).UTC().Format(time.RFC3339))
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
 	if err := corrosion.ResetAdminPassword(ctx, s.db, s.withLoginPolicy, mustHash(t, "fresh-pw-0123456789"), false); err != nil {
 		t.Fatal(err)
 	}
 	setDisabled(t, s, "bob", true)
-	for _, u := range []string{"admin", "bob"} {
-		l, err := corrosion.GetUserLifecycle(ctx, s.db, u)
-		if err != nil || l.SessionsNotBefore < ahead {
-			t.Errorf("%s: sessions_not_before moved back from %s to %s (%v)", u, ahead, l.SessionsNotBefore, err)
-		}
+	if l, err := corrosion.GetUserLifecycle(ctx, s.db, "admin"); err != nil || l.SessionsNotBefore < ahead {
+		t.Errorf("admin: sessions_not_before moved back from %s to %s (%v)", ahead, l.SessionsNotBefore, err)
+	}
+	if l, err := corrosion.GetUserLifecycle(ctx, s.db, "bob"); err != nil || l.SessionsNotBefore < time.Now().Add(time.Hour).UTC().Format(time.RFC3339) {
+		t.Errorf("bob: a disable moved a future sessions_not_before back to %s (%v)", l.SessionsNotBefore, err)
 	}
 }
 
@@ -423,15 +427,24 @@ func TestM6_TokenCutoffHasASkewMargin(t *testing.T) {
 // its identity binding is kept — while its old API token stays cut off.
 func TestI1a_FloorKeepsAnExternalAdminExternal(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		delete func(t *testing.T, s *Server)
+		name       string
+		preUpgrade bool
+		delete     func(t *testing.T, s *Server)
 	}{
-		{"this build's delete", func(t *testing.T, s *Server) {
+		{"this build's delete", false, func(t *testing.T, s *Server) {
 			if _, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "ext"}); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"pre-upgrade delete", func(t *testing.T, s *Server) { rawDelete(t, s, "ext") }},
+		// A build before the login rules bound nothing and its delete
+		// tombstoned no binding (re-review 4, n-4): the reinstated account
+		// binds afresh at its next directory login.
+		{"pre-upgrade delete", true, func(t *testing.T, s *Server) {
+			if err := s.db.Execute(context.Background(), `DELETE FROM user_identity_bindings WHERE username = 'ext'`); err != nil {
+				t.Fatal(err)
+			}
+			rawDelete(t, s, "ext")
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r := newIDRealm("ldap:corp", "ext", "entryUUID:e-1")
@@ -464,11 +477,16 @@ func TestI1a_FloorKeepsAnExternalAdminExternal(t *testing.T) {
 			}
 			_, err := s.authenticate(bearerCtx(tok))
 			wantCode(t, "the external admin's old API token", err, codes.Unauthenticated)
-			// Before its own entry logs in again: the binding came back with
-			// the account, so another entry answering to "ext" is refused.
-			r.id.Store("entryUUID:e-2")
-			wantCode(t, "another entry after the reinstatement (binding kept)", extLogin(), codes.PermissionDenied)
-			r.id.Store("entryUUID:e-1")
+			if !c.preUpgrade {
+				// Before its own entry logs in again: the binding came back
+				// with the account, so another entry answering to "ext" is
+				// refused.
+				r.id.Store("entryUUID:e-2")
+				wantCode(t, "another entry after the reinstatement (binding kept)", extLogin(), codes.PermissionDenied)
+				r.id.Store("entryUUID:e-1")
+			} else if id, _ := corrosion.GetIdentityBinding(ctx, s.db, "ext", "ldap:corp"); id != "" {
+				t.Fatalf("a pre-upgrade delete's reinstatement came back bound to %q; there was no binding", id)
+			}
 			err = extLogin()
 			if status.Code(err) == codes.Unavailable {
 				time.Sleep(corrosion.SessionCutoffSkewMargin + time.Second)
@@ -479,6 +497,9 @@ func TestI1a_FloorKeepsAnExternalAdminExternal(t *testing.T) {
 			}
 			if rep, _ := corrosion.AdminLoginState(ctx, s.db); !rep.Loggable {
 				t.Errorf("the reinstated external admin does not count as able to log in: %+v", rep)
+			}
+			if id, _ := corrosion.GetIdentityBinding(ctx, s.db, "ext", "ldap:corp"); id != "entryUUID:e-1" {
+				t.Errorf("after its directory login the reinstated admin is bound to %q, want entryUUID:e-1", id)
 			}
 		})
 	}

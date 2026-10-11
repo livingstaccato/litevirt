@@ -204,6 +204,15 @@ func TestLoginPolicyIfAvailable_BackoffLiftsOnceTheFeatureIsInUse(t *testing.T) 
 	if l, err := corrosion.GetUserLifecycle(ctx, s.db, "carol"); err != nil || l.TokensNotBefore == "" {
 		t.Fatalf("a delete in the backoff window wrote no cut-off: %+v %v", l, err)
 	}
+	// And a create of a name a peer left a disable on clears it rather than
+	// refusing (switch-rereview-login m-A).
+	writeLifecycle(t, s, "dave", corrosion.UserAttrDisabled, "true")
+	if _, err := s.CreateUser(adminCtx(), &pb.CreateUserRequest{Username: "dave", Password: "dave-pw-0123456789"}); err != nil {
+		t.Fatalf("a create over a peer's lifecycle row in the backoff window: %v", err)
+	}
+	if l, err := corrosion.GetUserLifecycle(ctx, s.db, "dave"); err != nil || l.Disabled || l.SessionsNotBefore == "" {
+		t.Fatalf("a create in the backoff window did not reset the name's lifecycle: %+v %v", l, err)
+	}
 }
 
 type ctxKeyLoginPolicyTest struct{}

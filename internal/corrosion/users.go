@@ -674,7 +674,9 @@ func AdminReinstatementNote(ctx context.Context, c *Client, username string) str
 		  WHERE u.username = ? AND u.deleted_at IS NULL`, username)
 	if err == nil && len(rows) > 0 && reinstatedAsExternal(rows[0].String("cred_key") != "", rows[0].String("cred_val")) {
 		return "reinstated as an external (directory) admin with its directory binding; it logs in through " +
-			"its realm, and its old sessions, API tokens and second factors were not restored"
+			"its realm, and its old sessions, API tokens and second factors were not restored. If its directory " +
+			"entry is gone, it cannot log in: give it a local password as root on a node with " +
+			"lv user reset-admin --user " + username
 	}
 	return "reinstated with no credential: give it one as root on a node with lv user reset-admin --user " + username
 }

@@ -11527,10 +11527,13 @@ func (x *ResetAdminPasswordRequest) GetUsername() string {
 
 // ResetAdminPasswordResponse names the account the daemon reset, as stored. A
 // daemon that predates the field answers with an empty name: it reset "admin"
-// whatever the request named, and the CLI says so.
+// whatever the request named, and the CLI says so. note, when set, is for the
+// operator: the reset left something in place they must know about (a cut-off
+// dated in the future it could not correct), and what clears it.
 type ResetAdminPasswordResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Note          string                 `protobuf:"bytes,2,opt,name=note,proto3" json:"note,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -11568,6 +11571,13 @@ func (*ResetAdminPasswordResponse) Descriptor() ([]byte, []int) {
 func (x *ResetAdminPasswordResponse) GetUsername() string {
 	if x != nil {
 		return x.Username
+	}
+	return ""
+}
+
+func (x *ResetAdminPasswordResponse) GetNote() string {
+	if x != nil {
+		return x.Note
 	}
 	return ""
 }
@@ -40209,9 +40219,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\rpassword_hash\x18\x01 \x01(\tR\fpasswordHash\x12\x17\n" +
 	"\aos_user\x18\x02 \x01(\tR\x06osUser\x12(\n" +
 	"\x10clear_two_factor\x18\x03 \x01(\bR\x0eclearTwoFactor\x12\x1a\n" +
-	"\busername\x18\x04 \x01(\tR\busername\"8\n" +
+	"\busername\x18\x04 \x01(\tR\busername\"L\n" +
 	"\x1aResetAdminPasswordResponse\x12\x1a\n" +
-	"\busername\x18\x01 \x01(\tR\busername\"\x7f\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04note\x18\x02 \x01(\tR\x04note\"\x7f\n" +
 	"\x12CreateTokenRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x18\n" +

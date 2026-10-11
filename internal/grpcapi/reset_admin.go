@@ -63,7 +63,8 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 	// --clear-2fa, and re-enabling a restricted admin, are login rules: they
 	// go through the login_policy release feature's gate. A plain reset does
 	// not ask it (corrosion.ResetAdminPasswordFor).
-	if err := corrosion.ResetAdminPasswordFor(ctx, s.db, s.withLoginPolicy, target, req.PasswordHash, req.GetClearTwoFactor()); err != nil {
+	note, err := corrosion.ResetAdminPasswordReport(ctx, s.db, s.withLoginPolicy, target, req.PasswordHash, req.GetClearTwoFactor())
+	if err != nil {
 		switch {
 		case errors.Is(err, corrosion.ErrNoLiveAdmin):
 			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied: no live admin account")
@@ -88,5 +89,5 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 	}
 	s.auditAs(ctx, actor, "user.reset-admin", target, detail, "ok")
 	s.kickStreams()
-	return &pb.ResetAdminPasswordResponse{Username: target}, nil
+	return &pb.ResetAdminPasswordResponse{Username: target, Note: note}, nil
 }

@@ -107,6 +107,16 @@ const adminPasswordPath = "/etc/litevirt/admin-password"
 // so beats hanging a recovery command.
 const resetAdminRPCTimeout = 30 * time.Second
 
+// resetAdminPingTimeout bounds the --user probe (refuseUserOnOlderDaemon): a
+// Ping is one in-memory answer, and a wedged daemon must not add the reset's
+// whole budget again before the reset is even asked.
+const resetAdminPingTimeout = 5 * time.Second
+
+// resetAdminUserSchema is the first schema version of a litevirtd that knows
+// ResetAdminPasswordRequest.username (--user). Every released build, and
+// main, is below it.
+const resetAdminUserSchema = 64
+
 // resetAdminEnv is everything reset-admin touches, so a test can point it at a
 // temporary data dir and a daemon of its choosing.
 type resetAdminEnv struct {
@@ -145,6 +155,10 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 	if err != nil {
 		return fmt.Errorf("reach the local daemon: %w", err)
 	}
+	if err := refuseUserOnOlderDaemon(ctx, client, env.username); err != nil {
+		closeConn()
+		return err
+	}
 	rpcCtx, cancel := context.WithTimeout(ctx, resetAdminRPCTimeout)
 	resp, err := client.ResetAdminPassword(rpcCtx, &pb.ResetAdminPasswordRequest{
 		PasswordHash: hash, OsUser: env.osUser, ClearTwoFactor: env.clear2FA, Username: env.username,
@@ -168,6 +182,9 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 		fmt.Fprintf(env.out, "Account: %s\n", reset)
 		fmt.Fprintf(env.out, "New password written to %s\n", env.pwPath)
 		fmt.Fprintln(env.out, "Recorded in the audit log as user.reset-admin.")
+		if note := resp.GetNote(); note != "" {
+			fmt.Fprintln(env.out, note)
+		}
 		if older && env.username != "" && corrosion.NormalizeUsername(env.username) != "admin" {
 			return fmt.Errorf("litevirtd on this node predates --user: it reset the password of \"admin\", "+
 				"not of %q (the new admin password is in %s). Restart litevirtd on this node with the "+
@@ -198,6 +215,30 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 	}
 	defer db.Close()
 	return resetAdminOffline(ctx, db, env.dataDir, env.pwPath, env.osUser, env.username, password, hash, env.clear2FA, env.out)
+}
+
+// refuseUserOnOlderDaemon refuses --user, before anything is reset, when the
+// local daemon's Ping shows a build from before the field (re-review 4,
+// m-7): that daemon ignores it and resets "admin" — possibly a colleague's
+// live password — whatever was named. Plain reset-admin (or --user admin) is
+// not probed. A Ping that fails says nothing about the build and refuses
+// nothing: the reset is asked as before, and the after-the-fact check in
+// runResetAdmin still stands behind it (an unreleased build at the same
+// schema version predates --user too).
+func refuseUserOnOlderDaemon(ctx context.Context, client pb.LiteVirtClient, username string) error {
+	if username == "" || corrosion.NormalizeUsername(username) == "admin" {
+		return nil
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, resetAdminPingTimeout)
+	defer cancel()
+	resp, err := client.Ping(pingCtx, &pb.PingRequest{})
+	if err != nil || resp.GetSchemaVersion() >= resetAdminUserSchema {
+		return nil
+	}
+	return fmt.Errorf("litevirtd on this node predates --user (its schema version is %d; --user needs %d): "+
+		"it would reset the password of \"admin\", not of %q, so nothing was changed. Restart litevirtd on "+
+		"this node with the installed binary, then run `lv user reset-admin --user %s` again",
+		resp.GetSchemaVersion(), resetAdminUserSchema, username, username)
 }
 
 // printEnrollmentCode tells the operator the admin's first-enrollment code, or
@@ -247,7 +288,7 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 
 	// No release-feature gate in this process (nil): a reset that needs the
 	// login rules' data (--clear-2fa, or a restricted admin) is refused.
-	resetErr := corrosion.ResetAdminPasswordFor(ctx, db, nil, name, hash, clear2FA)
+	note, resetErr := corrosion.ResetAdminPasswordReport(ctx, db, nil, name, hash, clear2FA)
 	switch {
 	case resetErr == nil:
 		entry.Result = "ok"
@@ -274,6 +315,9 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 	fmt.Fprintln(out, "Admin password reset.")
 	fmt.Fprintf(out, "Account: %s\n", name)
 	fmt.Fprintf(out, "New password written to %s\n", pwPath)
+	if note != "" {
+		fmt.Fprintln(out, note)
+	}
 	// --clear-2fa never reaches here: it is a login rule, refused above
 	// without the daemon's release-feature gate.
 	return nil

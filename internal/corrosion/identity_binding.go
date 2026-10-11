@@ -32,6 +32,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -255,14 +256,33 @@ func restoreDeletedBindingsStatements(ctx context.Context, c *Client, username, 
 // ClearIdentityBindingRows tombstones exactly the bindings bs, one row each:
 // the later bindings of a conflict the first-binder rule decided, cleared by a
 // login through the binding that won.
+//
+// In the same batch it sets each account's session cut-off (re-review 4,
+// m-3): a session minted through a losing binding — by a node that held only
+// that binding — is the recycled-name threat the rule exists for, and would
+// otherwise live to its hard expiry. The cut-off is set back like a
+// re-create's (setBackCutoff), so the winning login that clears the bindings
+// mints its own session at once; it never moves backwards (laterCutoff). The
+// cost is one logout of the account's other sessions, once per conflict.
 func ClearIdentityBindingRows(ctx context.Context, c *Client, g capabilities.FeatureGrant, bs []IdentityBinding) error {
 	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	marker, now := nowRFC3339(), c.NowTS()
-	stmts := make([]Statement, 0, len(bs))
+	stmts := make([]Statement, 0, len(bs)+1)
+	cut := map[string]bool{}
 	for _, b := range bs {
 		stmts = append(stmts, Statement{SQL: identityBindingClearSQL, Params: []interface{}{marker, now, b.Username, b.Realm, b.ExternalID}})
+		if cut[b.Username] {
+			continue
+		}
+		cut[b.Username] = true
+		life, err := GetUserLifecycle(ctx, c, b.Username)
+		if err != nil {
+			return fmt.Errorf("read the account's lifecycle: %w", err)
+		}
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL, Params: []interface{}{b.Username,
+			UserAttrSessionsNotBefore, laterCutoff(life.SessionsNotBefore, setBackCutoff()), "auth.identity_conflict", now}})
 	}
 	return c.ExecuteBatch(ctx, stmts)
 }

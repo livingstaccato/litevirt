@@ -240,3 +240,32 @@ func TestStart_ARunningDomainIsLeftAloneAndABootDiskIsNotWithheldSilently(t *tes
 		t.Error("db started without its boot disk")
 	}
 }
+
+// Review c4: move-volume of a shared disk whose row names a host not proven
+// off is refused with the remedy, as a start would withhold it: copying it
+// while that host may still write it moves a disk two hosts write.
+//
+// Mutation "no judgement in moveOneVolume" — red.
+func TestMoveVolume_AWithheldSharedDiskIsNotMoved(t *testing.T) {
+	s := testServer(t)
+	nfsDisk := nfsPromoteVM(t, s, "fenced")
+	recordOwnerFence(t, s, "f1", "ssh", "fenced", time.Minute)
+	alreadyPromotedHere(t, s)
+	vm, err := corrosion.GetVM(context.Background(), s.db, "db")
+	if err != nil || vm == nil {
+		t.Fatal(err)
+	}
+	var data1 corrosion.DiskRecord
+	for _, d := range diskRowsOf(t, s, "db") {
+		if d.DiskName == "data1" {
+			data1 = d
+		}
+	}
+	err = s.moveOneVolume(context.Background(), vm, &data1, "dr", false, func(*pb.MoveVolumeProgress) error { return nil })
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "`lv host fence-confirm dead-host`") {
+		t.Fatalf("move-volume of a withheld shared disk = %v, want FailedPrecondition naming fence-confirm", err)
+	}
+	if r := diskRowsOf(t, s, "db")["data1"]; r.Path != nfsDisk || r.HostName != "dead-host" {
+		t.Errorf("data1 row = %+v, want it untouched", r)
+	}
+}

@@ -145,6 +145,14 @@ func (s *Server) moveOneVolume(
 			"VM %q has %d snapshot(s); a disk with a snapshot overlay can't be moved between pools (its backing chain would be orphaned) — remove them first (`lv snapshot rm %s <name>`), then move", vm.Name, len(snaps), vm.Name)
 	}
 
+	// A shared disk whose row names another host not proven off is judged as
+	// a start judges it (review c4): copying it while that host may still be
+	// writing it moves a disk two hosts write, and re-points its row here.
+	if _, withheld := s.judgeSharedDiskRows(ctx, []corrosion.DiskRecord{*src}); len(withheld) > 0 {
+		return status.Errorf(codes.FailedPrecondition, "move-volume of %s's disk %s refused: %s",
+			vm.Name, src.DiskName, corrosion.WithheldSharedDiskDetail(vm.Name, s.hostName, withheld))
+	}
+
 	// Project isolation: the VM's project may move a disk only onto a global pool or
 	// one it owns (the target pool is on this host — moveOneVolume is local).
 	if err := s.admitVMPoolUse(ctx, vm, s.hostName, targetPool); err != nil {

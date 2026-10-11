@@ -39,6 +39,8 @@ type mockGRPC struct {
 	// authorization gate rather than only its happy path.
 	whoamiRole string
 	whoamiErr  error
+	// whoamiEnroll makes Whoami report an enrollment-only session.
+	whoamiEnroll bool
 	// stateDumpCalls counts GetStateDump calls: the UI must never make one (the
 	// dump is peer-only and carries secret columns). lastTriggerAntiEntropy
 	// records the Force Sync button's request.
@@ -782,6 +784,12 @@ func (m *mockGRPC) Whoami(context.Context, *emptypb.Empty, ...grpc.CallOption) (
 	}
 	if role == "" {
 		role = "admin"
+	}
+	m.mu.Lock()
+	enroll := m.whoamiEnroll
+	m.mu.Unlock()
+	if enroll {
+		return &pb.WhoamiResponse{Username: "bob", Realm: "local", Requires_2FaEnrollment: true}, nil
 	}
 	return &pb.WhoamiResponse{Username: role, Role: role, Realm: "local"}, nil
 }

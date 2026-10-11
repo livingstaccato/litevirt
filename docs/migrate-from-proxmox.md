@@ -35,6 +35,7 @@ You want:
 | OIDC / LDAP / TOTP | realms + 2FA | OIDC code flow; LDAP search-then-bind |
 | Live migration | `lv migrate <vm> <host>` | qemu native; storage replicated via `lv replicate-volume` |
 | Live storage motion | `lv move-volume` | libvirt blockdev-mirror, no downtime |
+| `cpulimit`, `cpuunits`, NIC `rate=` | `cpu-limit`, `cpu-shares`, `rate:` on a network entry | applied live. `cpu-limit` is total host cores (whole-domain cap, as `cpulimit`), `cpu-shares` is the same 1-10000 cgroup weight as `cpuunits` (default 100), `rate` is MB/s. `lv import` warns about the three and does not carry them — set them with `lv update` — see [compose](compose.md#noisy-neighbour-limits) |
 
 ## What's different (intentionally)
 
@@ -49,6 +50,12 @@ You want:
   per-VM `qm set` lives in shell history; compose lives in git.
 - **Decentralised by design.** No primary node election. `lv`
   connects to whichever host is reachable.
+- **An iSCSI pool is one LUN = one disk.** PVE's shared LVM volume
+  group on a SAN LUN (one LV per disk) has no litevirt equivalent yet;
+  create a LUN per disk and an `iscsi` pool per LUN (`--option lun=N`).
+  litevirt refuses a second disk on a LUN, deciding each LUN's owner by a
+  voter-majority claim. See
+  [storage.md](storage.md#iscsi-one-lun-one-disk).
 
 ## Step 1 — Bootstrap a litevirt host alongside PVE
 
@@ -126,6 +133,17 @@ directly — `lv import` reads the embedded config and reconstructs the disks:
 lv import --from vma --server-path /srv/stage/vzdump-qemu-<vmid>-*.vma.zst \
           --name pilot-vm --net-map vmbr0=br0 --start
 ```
+
+`lv import` does not carry per-disk tuning. A Proxmox disk or NIC option you
+relied on is set in the compose file after the import (or with `lv disk-io`):
+
+| Proxmox (`qm set`) | litevirt |
+|---|---|
+| `scsi0: ...,discard=on` | `disks.<name>.discard: unmap` (the default for a new VM on local, ZFS, thin LVM, Ceph) |
+| `scsi0: ...,mbps_rd=100,mbps_wr=50` | `disks.<name>.iotune: { read_bytes_sec: 100M, write_bytes_sec: 50M }`, or `lv disk-io <vm> --read-bps 100M --write-bps 50M` |
+| `scsi0: ...,iops_rd=500,iops_wr=500` | `iotune: { read_iops_sec: 500, write_iops_sec: 500 }` |
+| `scsi0: ...,mbps_rd_max=200` | `iotune: { read_bytes_sec: 100M, read_bytes_sec_max: 200M }` |
+| `net0: virtio=...,queues=4` | `network[].queues: 4` (or `auto`) |
 
 ## Step 4 — Migrate one container
 

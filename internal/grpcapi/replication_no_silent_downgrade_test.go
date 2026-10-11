@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -46,17 +47,21 @@ func seedReplicationVM(t *testing.T, s *Server, vmName, state string) string {
 	return replicaPoolDir(t, s, "dr")
 }
 
-// When the safe mechanism fails on a RUNNING source, the run fails. It does not
-// quietly produce the unsafe copy instead.
+// When the safe mechanism fails on a RUNNING source, the run does not quietly
+// produce the unsafe copy instead.
 //
-// The incremental path exists because a full `qemu-img convert -U` of a running
-// disk reads an image the guest still has open with no snapshot: the result is
-// smeared across the copy and is not point-in-time. Falling through to it on
-// failure means an operator who asked for the safe mechanism silently gets the
-// unsafe one — and the replica it produces is then eligible for promotion, so
-// the downgrade surfaces as a corrupt guest during a failover.
+// A full `qemu-img convert -U` of a running disk reads an image the guest
+// still has open with no snapshot: the result is smeared across the copy and is
+// not point-in-time. The full copy that follows a failed incremental is now
+// copyVMDiskConsistent's (pit_copy.go): a backup session or an external
+// snapshot. Only when neither can be made — as here, with no session and no
+// snapshotter — is it main's -U copy, and then never silently: the replica's
+// record says it is not point-in-time (so promotion treats it as the last
+// choice) and an event says why. Nothing main produced is refused
+// (owner decision D2).
 func TestRunReplication_NoSilentDowngradeOnARunningSource(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir()
 	s.SetBackupSource(failingBackupSource{})
 	dir := seedReplicationVM(t, s, "web-1", "running")
 
@@ -64,15 +69,15 @@ func TestRunReplication_NoSilentDowngradeOnARunningSource(t *testing.T) {
 		VMName: "web-1", Type: "replication", TargetPool: "dr",
 		Incremental: true, KeepReplicas: 3,
 	}, time.Now())
-
-	if err == nil {
-		t.Fatal("RunReplication succeeded; the incremental session failed, so it fell back to the unsafe full copy")
+	if err != nil {
+		t.Fatalf("RunReplication refused the copy main made: %v", err)
 	}
-	if !errors.Is(err, errUnsafeFullCopyFallback) {
-		t.Errorf("error %v is not errUnsafeFullCopyFallback; the refusal has to be distinguishable from any other failure", err)
+	recs, lerr := listReplicaRecords(dir, "", "web-1")
+	if lerr != nil || len(recs) != 1 || !recs[0].NotPointInTime {
+		t.Fatalf("records %+v (%v): the -U copy must be recorded as not point-in-time", recs, lerr)
 	}
-	if left := promotableIn(t, dir, "web-1", "root"); len(left) != 0 {
-		t.Errorf("a replica was produced anyway: %v", left)
+	if !slices.Contains(pitEventTypes(t, s, "web-1"), "disk.replica_not_point_in_time") {
+		t.Errorf("the downgrade was silent: events %v", pitEventTypes(t, s, "web-1"))
 	}
 }
 
@@ -97,29 +102,34 @@ func TestRunReplication_AStoppedSourceStillFallsBack(t *testing.T) {
 	if left := promotableIn(t, dir, "web-2", "root"); len(left) != 1 {
 		t.Errorf("stopped-source fallback produced %v, want one replica", left)
 	}
+	if recs, _ := listReplicaRecords(dir, "", "web-2"); len(recs) != 1 || recs[0].NotPointInTime {
+		t.Errorf("records %+v: a shut-off source's plain copy is point-in-time", recs)
+	}
 }
 
 // "stopped" in the store is not "shut off". The coarse libvirt state folds
 // paused and pm-suspended domains into "stopped", and qemu still holds their
-// images open: resuming the guest mid-copy smears the full copy exactly as a
-// running source does. So the fallback asks libvirt for the state REASON and
-// runs only for a genuine shut-off.
+// images open: resuming the guest mid-copy smears a plain copy exactly as a
+// running source does. So the plain copy asks libvirt for the state REASON and
+// runs only for a genuine shut-off; a paused source takes the point-in-time
+// layers, and here, where none is available, a copy marked not point-in-time.
 func TestRunReplication_APausedSourceDoesNotFallBack(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir()
 	s.SetBackupSource(failingBackupSource{})
 	dir := seedReplicationVM(t, s, "web-3", "stopped")
 	fake := libvirtfake.New()
 	fake.SetState("web-3", libvirtfake.StatePaused)
 	s.virt = fake
 
-	err := s.RunReplication(context.Background(), corrosion.BackupScheduleRecord{
+	if err := s.RunReplication(context.Background(), corrosion.BackupScheduleRecord{
 		VMName: "web-3", Type: "replication", TargetPool: "dr",
 		Incremental: true, KeepReplicas: 3,
-	}, time.Now())
-	if !errors.Is(err, errUnsafeFullCopyFallback) {
-		t.Fatalf("RunReplication on a paused source returned %v; the full copy of an image qemu still holds open must be refused", err)
+	}, time.Now()); err != nil {
+		t.Fatalf("RunReplication: %v", err)
 	}
-	if left := promotableIn(t, dir, "web-3", "root"); len(left) != 0 {
-		t.Errorf("a replica was produced from a paused source: %v", left)
+	recs, err := listReplicaRecords(dir, "", "web-3")
+	if err != nil || len(recs) != 1 || !recs[0].NotPointInTime {
+		t.Fatalf("records %+v (%v): a paused source's copy is the -U one, not point-in-time, and must be marked", recs, err)
 	}
 }

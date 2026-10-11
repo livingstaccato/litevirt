@@ -166,7 +166,7 @@ func TestAuthenticate_BearerWins(t *testing.T) {
 	if err := corrosion.InsertUser(ctx, s.db, "alice", "viewer", "x"); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
-	token, _, _, err := s.mintSession(ctx, "alice", "local", "10.0.0.9", "test")
+	token, _, _, err := s.mintSession(ctx, "alice", "local", "10.0.0.9", "test", "")
 	if err != nil {
 		t.Fatalf("mintSession: %v", err)
 	}
@@ -286,7 +286,7 @@ func aliceSession(t *testing.T, s *Server) string {
 	if err := corrosion.InsertUser(ctx, s.db, "alice", "viewer", "x"); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
-	token, _, _, err := s.mintSession(ctx, "alice", "local", "10.0.0.9", "test")
+	token, _, _, err := s.mintSession(ctx, "alice", "local", "10.0.0.9", "test", "")
 	if err != nil {
 		t.Fatalf("mintSession: %v", err)
 	}

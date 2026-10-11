@@ -20,7 +20,7 @@ import (
 // reports differently.
 //
 // The stand-down (legacyRepair) goes straight to the blob dump.
-func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope, sensReq *pb.SensitiveStateRequest) (kept *syncPayload, pullErr, mergeErr error) {
+func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope, sensReq *pb.SensitiveStateRequest, rs *remintScope) (kept *syncPayload, pullErr, mergeErr error) {
 	sensitive := sensReq != nil
 	// A used release-feature record must be in, and any quarantine it trips up,
 	// before a feature table is merged (I2). The paged stream merges vms and
@@ -31,7 +31,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	// The sensitive lane carries feature data too (a secret a feature stores),
 	// and has no cluster_policies of its own: pull the public one first (N6).
 	if (sensitive || len(tables) > 1) && (sensitive || slices.Contains(tables, "cluster_policies")) {
-		if _, perr, merr := ae.pullAndMerge(ctx, client, []string{"cluster_policies"}, nil, nil); perr != nil || merr != nil {
+		if _, perr, merr := ae.pullAndMerge(ctx, client, []string{"cluster_policies"}, nil, nil, rs); perr != nil || merr != nil {
 			return nil, perr, merr
 		}
 	}
@@ -74,7 +74,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 				}
 				return p, rerr
 			}
-			kept, rows, perr, merr := ae.client.mergeTableRowsStream(recv, allowed, keep)
+			kept, rows, perr, merr := ae.client.mergeTableRowsStreamScoped(recv, allowed, keep, rs)
 			if !older {
 				ae.client.observePulledRows(rows, tables, scope, sensitive)
 				return kept, perr, merr
@@ -95,7 +95,7 @@ func (ae *AntiEntropy) pullAndMerge(ctx context.Context, client pb.LiteVirtClien
 	if err != nil {
 		return nil, err, nil
 	}
-	payload, merr := ae.client.mergeRepairPull(data, tables, scope, sensitive)
+	payload, merr := ae.client.mergeRepairPullScoped(data, tables, scope, sensitive, rs)
 	return payload, nil, merr
 }
 

@@ -259,7 +259,7 @@ func TestKeepRecreateSpec_UniqueAndBounded(t *testing.T) {
 func TestRecreateFailedAfterTeardown_NamesWhatIsGoneAndKeepsTheSpec(t *testing.T) {
 	s, _ := provableCreateServer(t)
 	cause := status.Error(codes.AlreadyExists, `VM "vm1" already exists`)
-	err := s.recreateFailedAfterTeardown("rebuild", "vm1", "host-a", &pb.VMSpec{Name: "vm1", Cpu: 3}, cause)
+	err := s.recreateFailedAfterTeardown("rebuild", "vm1", "host-a", &pb.VMSpec{Name: "vm1", Cpu: 3}, cause, false)
 	st := status.Convert(err)
 	if st.Code() != codes.AlreadyExists {
 		t.Fatalf("code = %v, want the create's own (AlreadyExists)", st.Code())

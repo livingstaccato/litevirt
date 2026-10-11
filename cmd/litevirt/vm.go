@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	lvpkg "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -36,8 +40,14 @@ func newRunCmd() *cobra.Command {
 		tpm          bool
 		cpuMode      string
 		cpuModel     string
+		cpuLimit     float64
+		cpuShares    int32
 
 		allowOvercommit bool
+		storagePool     string
+		overwrite       bool
+		memHotplugMax   int32
+		usb             usbFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -63,14 +73,26 @@ func newRunCmd() *cobra.Command {
 					Tpm:           tpm,
 					CpuMode:       cpuMode,
 					CpuModel:      cpuModel,
+
+					MemoryHotplugMaxMib: memHotplugMax,
+					CpuLimit:            cpuLimit,
+					CpuShares:           cpuShares,
 				}
+				usbDevs, err := usb.devices()
+				if err != nil {
+					return err
+				}
+				spec.UsbDevices = usbDevs
 				// Validate here too, so a typo costs a round trip and not a
 				// half-understood server error.
 				if err := lvpkg.ValidateCPUMode(cpuMode, cpuModel); err != nil {
 					return err
 				}
-				if disk != "" {
-					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio"}}
+				if overwrite && storagePool == "" {
+					return fmt.Errorf("--overwrite applies to a root disk on a storage pool; name one with --storage")
+				}
+				if disk != "" || storagePool != "" {
+					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio", Storage: storagePool, Overwrite: overwrite}}
 				}
 				if host != "" {
 					spec.Placement = &pb.PlacementSpec{Host: host}
@@ -100,6 +122,8 @@ func newRunCmd() *cobra.Command {
 		"CPU mode: host-passthrough|host-model|custom (default host-model — the guest gets the host's "+
 			"AVX/AVX2/SSE4.2; host-passthrough adds nested virt but pins live migration to identical hardware)")
 	cmd.Flags().StringVar(&cpuModel, "cpu-model", "", "CPU model for --cpu-mode custom (e.g. x86-64-v3)")
+	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (0 = unlimited)")
+	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits (default 100)")
 	cmd.Flags().Int32Var(&memory, "memory", 4096, "Memory in MiB (boot allocation)")
 	cmd.Flags().Int32Var(&minMemory, "min-mem", 0, "Minimum memory in MiB the balloon may reclaim to (0 = none)")
 	cmd.Flags().Int32Var(&maxMemory, "max-mem", 0, "Maximum memory in MiB the guest may balloon up to (0 = fixed at --memory)")
@@ -119,6 +143,12 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&tpm, "tpm", false, "Attach an emulated TPM 2.0 device (Windows 11 / BitLocker)")
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check for this VM (project quota still applies). For deliberate density on a host you know can take it; the bypass is audited.")
+	cmd.Flags().StringVar(&storagePool, "storage", "", "Storage pool for the root disk (default: the host's local disk directory)")
+	cmd.Flags().BoolVar(&overwrite, "overwrite", false,
+		"With --storage on an iscsi pool and --image: write the image over a LUN that is not blank (destroys what it holds). A LUN another VM uses is never written.")
+	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
+		"Memory hot-add ceiling in MiB (virtio-mem; > --memory): memory can then be raised live up to it with lv set-memory or lv update --memory")
+	usb.register(cmd)
 	cmd.MarkFlagRequired("name")
 	return cmd
 }
@@ -264,14 +294,26 @@ func newRmCmd() *cobra.Command {
 					// Ignore error — VM may already be stopped or not found.
 				}
 
+				var hdr metadata.MD
 				_, err := c.DeleteVM(ctx, &pb.DeleteVMRequest{
 					Name:      args[0],
 					KeepDisks: keepDisks,
-				})
+				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("delete VM: %w", err)
 				}
 				fmt.Printf("VM %s deleted\n", args[0])
+				// A ceph image the delete could not free (a client still
+				// has it open) stays in its pool: named here, and by the
+				// health condition, never left unnamed.
+				for _, v := range hdr.Get(grpcapi.KeptCephImageMD) {
+					var k grpcapi.KeptCephImage
+					if json.Unmarshal([]byte(v), &k) != nil {
+						continue
+					}
+					fmt.Printf("Kept ceph image %s (disk %s) in its pool: %s\n  It is named by the health condition ceph_image_leftover; see who has it open with: rbd status %s\n",
+						k.Image, k.Disk, k.Reason, k.Image)
+				}
 				return nil
 			})
 		},

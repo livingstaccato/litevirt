@@ -145,6 +145,28 @@ func TestRetiredTokensAreDisjointFromAll(t *testing.T) {
 	}
 }
 
+// TestRelayHealthV1Registered pins relay_health_v1 (colonelpanik/litevirt#175):
+// advertised, known, mandatory (a fact about the binary — it reads the relay
+// demotion rows) and replication-gated (every recipient elects relays from
+// what it receives, so every recipient must read them).
+func TestRelayHealthV1Registered(t *testing.T) {
+	if RelayHealthV1 != "relay_health_v1" {
+		t.Fatalf("RelayHealthV1 = %q, want %q", RelayHealthV1, "relay_health_v1")
+	}
+	if !slices.Contains(Supported(), RelayHealthV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), RelayHealthV1)
+	}
+	if !slices.Contains(All(), RelayHealthV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), RelayHealthV1)
+	}
+	if !Mandatory(RelayHealthV1) {
+		t.Fatal("relay_health_v1 must be mandatory: a flag would let one node elect a different relay set")
+	}
+	if !ReplicationGated(RelayHealthV1) {
+		t.Fatal("relay_health_v1 must be replication-gated: every replication recipient elects relays")
+	}
+}
+
 // TestReleaseTokenRegistered pins the release token's registration. Every one
 // of these sets matters: Supported is what peers latch on, All is what the
 // checker loads markers for and what the rollback preflight treats as known,

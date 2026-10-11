@@ -176,6 +176,136 @@ func voterAnchor(ctx context.Context, db *corrosion.Client, v *corrosion.ClaimVe
 	return anchor, nil
 }
 
+// voterPinned pins voter-chain verification (corrosion.ClaimVerifier.
+// WithSerialPin): an accept in a generation this node has not adopted does not
+// count when it is signed with a certificate the CA has replaced — one this
+// node holds a CA-issued successor of (pki.SupersededBy).
+//
+// Without it, a renewed voter's REPLACED key — whose revocation may be owed
+// (an older build in the cluster, trust_rotated_peer_certs somewhere) or kept
+// with --keep-old — together with one compromised live host could sign a new
+// generation that every node adopts, and through it decide claims. The pin's
+// authority is the successor's CA signature only; no replicated row (the
+// hosts.cert_serial column any peer can write) can relax or tighten it. It
+// covers every generation above the adopted one, the anchor search included;
+// history at or below the anchor is verified historically and is not pinned
+// (it was signed with whatever each voter held then). The cost is §4.1's: a
+// node that adopts a generation decided BEFORE one of its signers renewed
+// cannot count that signer's accept until the signer re-attests it with its
+// renewed certificate (reattestRenewedAccepts) or the voter set next changes;
+// noteStuckByRenewal reports it meanwhile. auth.trust_rotated_peer_certs
+// turns the pin off (verifierPolicy).
+func (s *Server) voterPinned(_ context.Context, v *corrosion.ClaimVerifier) *corrosion.ClaimVerifier {
+	if v.SerialPinDisabled() {
+		return v
+	}
+	return v.WithSerialPin()
+}
+
+// condVoterGenerationStuck is raised by a node whose adoption of the next
+// voter generation is refused only because a renewal took accepts out of its
+// count: the generation was decided with an accept signed by a certificate
+// the CA has since replaced (one of its voters renewed before this node
+// adopted it) — refused by the serial pin and, once `lv host renew-cert` has
+// revoked the replaced certificate, by revocation. Nothing about the
+// generation is wrong. The node asks each such voter to re-attest its accept
+// with its current certificate (reattestRenewedAccepts) and adopts as soon as
+// enough do; the condition is raised while they cannot (unreachable, or on an
+// older build) and names them, and it resolves once the node reaches the
+// newest generation.
+const condVoterGenerationStuck = "voter_generation_stuck"
+
+// voterReattestTimeout bounds each re-attestation request.
+var voterReattestTimeout = 5 * time.Second
+
+// reattestRenewedAccepts tries to make row verify under v when the only thing
+// wrong with it is a renewal: its certificate verifies with v.RenewalBlind()
+// (an accept signed with a replaced certificate counted, revoked or not) and
+// not with v. Each voter whose accept is signed with a replaced certificate is
+// asked to re-sign its own recorded accept with its current one
+// (Server.reattestedAccept, GetRecoveryClaim with reattest); the re-signed
+// accepts are added to the certificate, and the result is verified with v
+// itself — nothing is relaxed. It returns the row with that certificate, or
+// the voters that could not re-attest, with renewal=false when the row fails
+// for another reason as well.
+func (s *Server) reattestRenewedAccepts(ctx context.Context, v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig) (
+	fixed *corrosion.VoterConfig, missing []string, renewal bool) {
+	if verifyVoterConfigRow(v.RenewalBlind(), prev, row) != nil {
+		return nil, nil, false
+	}
+	cert, err := corrosion.DecodeClaimCertificate(row.Certificate)
+	if err != nil {
+		return nil, nil, false
+	}
+	voters := v.SupersededAccepts(cert)
+	for _, voter := range voters {
+		a, err := s.askReattest(ctx, voter, cert.Key)
+		if err != nil || a == nil {
+			why := "nothing to re-sign"
+			if err != nil {
+				why = err.Error()
+			}
+			missing = append(missing, voter+" ("+why+")")
+			continue
+		}
+		cert.Accepts = append(cert.Accepts, *a)
+	}
+	enc, err := cert.Encode()
+	if err != nil {
+		return nil, missing, true
+	}
+	out := *row
+	out.Certificate = enc
+	if verifyVoterConfigRow(v, prev, &out) != nil {
+		if len(missing) == 0 {
+			missing = append(missing, strings.Join(voters, ", ")+" (re-attested, still short of a majority)")
+		}
+		return nil, missing, true
+	}
+	return &out, nil, true
+}
+
+// askReattest asks voter for its accept at key re-signed with its current
+// certificate.
+func (s *Server) askReattest(ctx context.Context, voter string, key corrosion.ClaimKey) (*corrosion.ClaimAccept, error) {
+	if voter == s.hostName {
+		return s.reattestedAccept(ctx, key)
+	}
+	rctx, cancel := context.WithTimeout(ctx, voterReattestTimeout)
+	defer cancel()
+	cl, closer, err := s.dialPeer(rctx, voter)
+	if err != nil {
+		return nil, err
+	}
+	defer closer()
+	resp, err := cl.GetRecoveryClaim(rctx, &pb.GetRecoveryClaimRequest{Key: keyToPB(key), Reattest: true})
+	if err != nil {
+		return nil, err
+	}
+	if resp.GetReattested() == nil {
+		return nil, fmt.Errorf("it has no renewed accept to give (an older build, or it did not record this accept)")
+	}
+	return acceptFromPB(resp.GetReattested()), nil
+}
+
+// noteStuckByRenewal raises condVoterGenerationStuck: row fails only because
+// of a renewal, and the voters in missing could not re-attest.
+func (s *Server) noteStuckByRenewal(ctx context.Context, prev, row *corrosion.VoterConfig, missing []string) {
+	var adopted int64
+	if prev != nil {
+		adopted = prev.Generation
+	}
+	s.setOwnCondition(ctx, condVoterGenerationStuck, corrosion.SeverityWarning, true, fmt.Sprintf(
+		"this node has adopted voter generation %d and cannot adopt %d: it was decided with an accept signed by a "+
+			"certificate the CA has since replaced, and a renewal takes that accept out of the count (pinned, and "+
+			"revoked once `lv host renew-cert` revokes it). This node asks the renewed voter to re-sign its own "+
+			"recorded accept with its current certificate and adopts as soon as it does; still waiting on: %s. "+
+			"Bring that host back (it must run this build), or decide one more voter change from a node that has "+
+			"adopted %d — `lv cluster voter add <host>`, or `lv cluster voter rm <host>` then add it back — whose "+
+			"accepts carry current certificates; this node adopts through it (docs/auth.md, \"Renewing a voter\")",
+		adopted, row.Generation, strings.Join(missing, "; "), row.Generation))
+}
+
 // memberAs reports whether this node is a member of cfg as the voter it is
 // now: its name with ITS incarnation. An entry under this node's name with
 // another incarnation is an earlier machine — removed and rebuilt under the
@@ -217,6 +347,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			return adopted, err
 		}
 		if row == nil {
+			s.setOwnCondition(ctx, condVoterGenerationStuck, corrosion.SeverityWarning, false, "")
 			return adopted, nil
 		}
 		if verifier == nil {
@@ -224,6 +355,7 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			if _, verifier, err = s.claimIdentity(); err != nil {
 				return adopted, err
 			}
+			verifier = s.voterPinned(ctx, verifier)
 			if inc, err = s.db.VoterIncarnation(ctx); err != nil {
 				return adopted, err
 			}
@@ -264,9 +396,19 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			continue
 		}
 		if err := verifyVoterConfigRow(v, prev, row); err != nil {
-			slog.Error("voter set: refusing to adopt a voter generation whose certificate does not verify",
-				"generation", row.Generation, "change", row.Change, "created_by", row.CreatedBy, "error", err)
-			return adopted, fmt.Errorf("generation %d does not verify: %w", row.Generation, err)
+			fixed, missing, renewal := s.reattestRenewedAccepts(ctx, v, prev, row)
+			if fixed == nil {
+				if renewal {
+					s.noteStuckByRenewal(ctx, prev, row, missing)
+				}
+				slog.Error("voter set: refusing to adopt a voter generation whose certificate does not verify",
+					"generation", row.Generation, "change", row.Change, "created_by", row.CreatedBy, "error", err,
+					"stuck_by_renewal", renewal, "waiting_on", strings.Join(missing, "; "))
+				return adopted, fmt.Errorf("generation %d does not verify: %w", row.Generation, err)
+			}
+			slog.Warn("voter set: a renewed voter re-attested its accept; adopting the generation decided before "+
+				"it renewed", "generation", row.Generation, "change", row.Change)
+			row = fixed
 		}
 		if member && prev.Explicit() {
 			n, from, err := s.importFromSealedMajority(ctx, prev, row.Generation)

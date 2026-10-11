@@ -2,8 +2,8 @@
 
 litevirt's backup system mirrors Proxmox PBS in shape: a
 content-addressed deduped chunk store, BLAKE3 hashing, dirty-bitmap
-incrementals, AES-256-GCM encryption, mark-and-sweep GC, retention,
-cross-repo sync, and live restore.
+incrementals, zstd compression, AES-256-GCM encryption, mark-and-sweep GC,
+retention, cross-repo sync, bandwidth limits, and live restore.
 
 ## Application consistency (guest fs-freeze)
 
@@ -21,10 +21,11 @@ surface:
 
 | Surface | What |
 |---|---|
-| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync |
+| `lv backup repo …` | local repo management — init, ls, gc, verify, prune, sync, set-compression |
 | `lv backup snapshot <vm>` | push a VM disk into a repo via the daemon (gRPC) |
 | `lv backup restore-from` | offline restore: stream chunks to a target disk path |
 | `lv backup restore-live` | live restore: serve manifest over NBD while the VM boots against a qcow2 overlay |
+| `lv backup file-ls` / `file-restore` | browse a VM or container backup and extract single files, read inside a throwaway restore VM |
 | `lv backup schedule …` | cron-driven backups, scoped per-VM, per-pool, per-project, or cluster-wide |
 | compose `backup:` block | deploy-time hook that reconciles a `backup_schedules` row from the stack |
 | `/backups` UI page | manifest list per configured repo, plus verify / GC / prune / sync through the daemon's repo RPCs |
@@ -82,9 +83,98 @@ share even a single 4 MiB region (a guest OS image, a database WAL
 segment, untouched filesystem regions) share the chunk file — the
 second snapshot's manifest just references the existing chunk.
 
-Compression is left to the underlying filesystem. Most backup hosts
-already run on ZFS or btrfs with native lz4; layering Go-side
-compression would just contend.
+## Compression
+
+A compressed repo compresses each chunk with zstd before it is written (and before it is sealed, in an encrypted repo). The
+chunk id stays the BLAKE3 of the *uncompressed* bytes, so dedup is unchanged,
+spans compressed and uncompressed repos, and sync and peer streaming still
+move plain chunks — a DR copy can differ in compression from its source. A
+chunk zstd cannot shrink (already-compressed guest data) is stored as it is.
+
+```bash
+lv backup repo init /srv/backup/main                      # local, uncompressed (the default)
+lv backup repo init /srv/backup/main --compression zstd   # compressed, via the daemon (below)
+lv backup repo set-compression /srv/backup/main zstd      # existing repo, via the daemon
+```
+
+**zstd is explicit, and gated on the cluster's upgrade.** A plain `lv backup
+repo init <path>` is exactly what earlier releases did: a local,
+uncompressed repository, created by the CLI with your own rights and no
+daemon. Compression is asked for with `--compression zstd` on `init`, or
+`set-compression <path> zstd` on an existing repo. Until the cluster's
+release token has latched — every host runs a build that reads compressed
+repos — both are refused, naming the release feature `backup_zstd`.
+
+Creating or converting to zstd is done by the **daemon of the host the CLI
+is connected to** (`SetBackupRepoCompression`, below), not by the CLI alone:
+the daemon's release-feature gate records that `backup_zstd` is in use
+before `repo.json` changes. The path is then a path on that host, the repo is
+owned by the daemon, a custom absolute path needs the admin role, and the
+daemon refuses its own data and PKI directories. The CLI prints which host
+created or converted the repo. `--force` skips the daemon and the gate and
+writes the repo locally; nothing records that use, so it is for a repository
+no older host or backup host reads (an air-gapped one). Creating an
+uncompressed repo and turning compression off need no daemon and no feature.
+
+**Older releases refuse a compressed repo.** A compressed repo's `repo.json`
+says `"compression": "zstd"` and `"schema_version": 2`. Every release before
+backup compression opens schema 1 only, so it stops at `repository
+schema-version 2 newer than supported 1` before it reads anything — it never
+misreads a compressed chunk as corrupt, and its GC never touches the repo.
+That marker is permanent: `set-compression <path> none` stops compressing
+new chunks, but compressed chunks are already there, so the repo stays
+schema 2.
+
+So an **existing** repo is never compressed behind your back: it stays
+schema 1 and uncompressed, byte-identical to what earlier releases wrote,
+until `lv backup repo set-compression <path> zstd`. Turning compression on
+rewrites nothing: earlier backups stay as they are and keep restoring, and
+only chunks written from then on are compressed.
+
+A compressed chunk is a 4-byte marker followed by a zstd frame. Guest data
+is arbitrary and may begin with the same bytes, so a chunk is taken as
+compressed only when its decompressed bytes hash to the chunk id; otherwise
+the stored bytes must. Decompression stops at the 4 MiB chunk size, so a
+crafted chunk file in a shared repo cannot make a reader allocate more.
+
+Daemon-internal transfer staging repos are created uncompressed.
+
+## Bandwidth limits
+
+A backup can be rate-limited per job and per target repo:
+
+```bash
+lv backup snapshot postgres-1 --repo main --bwlimit 50MiB
+lv ct backup web --repo main --bwlimit 20MiB
+```
+
+```yaml
+# daemon config, on the host(s) running the backups
+backup_bwlimits:
+  main: 100MiB      # per second; "512K" or a byte count also work
+```
+
+- **Per job** — `--bwlimit` (the `bwlimit_bytes_per_sec` RPC field).
+- **Per target** — `backup_bwlimits:` in the daemon config, by repo name. One
+  limit is shared by every backup job that host runs into that repo, so a
+  scheduled fan-out over twenty VMs moves at the repo's rate in total, not
+  twenty times it. It applies to scheduled backups too, which have no
+  per-job limit of their own.
+
+When both are set, the lower wins. A limit is at least 64 KiB/s (a lower
+one is refused, or raised to it when it arrives over the RPC); a job that is
+cancelled gives back the part of its reservation it did not use, so it does
+not hold up the jobs sharing the repo's limit. A limit covers the bytes read from the
+disk or container (holes, and regions an incremental inherits from its
+parent, are not read and cost nothing) and, for a remote backup, the chunks
+sent to the repo's host. For a remote backup the host you call (the repo's
+host) hands the lower of the job limit and its own `backup_bwlimits` entry
+for the repo to the host that reads the disk. A host on an older release
+ignores the field and backs up unlimited. Restores and replication are not
+rate-limited.
+
+A target limit is enforced per host: two hosts backing up into the same repo
+each get the full limit.
 
 ## Incremental backups
 
@@ -235,22 +325,168 @@ target pool as a timestamped, self-contained point-in-time copy, keeping the
 newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
 backups too.
 
-**Consistency differs between the two replication modes, and the default is the
-weaker one.** A full replica of a RUNNING VM is `qemu-img convert -U` reading
-the image the guest still has open — no snapshot is taken, so the copy is
-smeared over however long it ran. That is neither point-in-time nor
-crash-consistent, and a guest filesystem restored from it may need repair. The
-`--incremental` path opens a real point-in-time session (the same pull-mode
-machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
-consistent either way. Prefer `--incremental` for anything you intend to
-promote, or replicate on a schedule the workload can tolerate being torn.
+**How a full replica is copied.** A full (non-incremental) replica — and the
+full copy an `--incremental` run falls back to when its session fails — is made
+by the strongest method the host has, tried in this order:
 
-An `--incremental` run whose backup session fails **does not downgrade to the
-full copy while the VM is running** — the run fails and produces no replica,
-rather than silently substituting the weaker mechanism for the one you asked
-for. A stopped source still falls back, because there is nothing writing the
-image. Watch for `replication.failed` notifications: a schedule failing this
-way keeps its previous replicas and stops making new ones.
+1. **Shut-off VM:** a plain `qemu-img convert` of the disk, *without* `-U`.
+   "Shut off" is what libvirt reports, whatever state the VM's record is in (a
+   VM in `error` whose domain is down is copied this way). If a qemu does hold
+   the image, its lock fails the copy rather than letting it read a changing
+   image. A paused or pm-suspended VM is not shut off (qemu still holds its
+   image) and takes the steps below.
+2. **Backup session:** a full pull-mode backup of the running disk (the same
+   machinery backups and `--incremental` use, with no checkpoint, so no
+   incremental chain is touched). Point-in-time and crash-consistent.
+3. **External snapshot:** only on a host that holds the `pit_overlay`
+   release feature — the cluster-wide promise that every host serving the
+   pool understands the overlay this step leaves (see "Older builds" below).
+   This build does not hold it yet: it arrives with the release token, so
+   until then this step is skipped and the copy goes on to step 4, exactly as
+   before. When no session opens (an older libvirt, a failed
+   job), and only for a VM libvirt reports running or paused, an external
+   disk-only snapshot moves the guest's writes onto an overlay — quiesced
+   through the guest agent when one answers, otherwise crash-consistent — the
+   now-frozen disk file is copied, and the overlay is committed back (active
+   block-commit and pivot; a commit job already running is resumed, and a
+   pivot that keeps failing is aborted so no job is left behind). Still
+   point-in-time. The overlay is `.<disk file>.lv-pit` beside the disk, on the
+   same pool, so a failover target on shared storage sees it too. It is never
+   placed where it would not survive: a disk that is not a regular file (a
+   `/dev` block device, whose directory is devtmpfs) or a pool directory on
+   tmpfs takes the next step instead, because a reboot or a failover would
+   lose the overlay and the guest's writes in it.
+
+   **Never delete a `.lv-pit` file.** While one exists it may hold the
+   guest's newest writes. It is bound to the exact disk file it was taken of:
+   - before the snapshot, a new random token is written into an extended
+     attribute of the disk file (`user.litevirt.pit_window`) and synced. A
+     copy or restore of the file (`cp -p`, `rsync -a` without `-X`) does not
+     carry it, and a new file at the same path does not have it;
+   - a sidecar beside the overlay (`.<disk file>.lv-pit.id`) records the VM,
+     its disk, that token, and the file's inode, size and modification time —
+     not the device number, which differs between hosts mounting one NFS
+     export and can change across a remount or reboot.
+
+   On a filesystem without user extended attributes there is no token, and
+   the size and time bounds below decide alone. Local ext4, XFS, btrfs and
+   ZFS datasets, and tmpfs, have them; NFS has them only at version 4.2 (Linux
+   5.9 or later on both ends), so an export mounted at 4.1 or 3 has none. A
+   host that cannot read a token another host recorded (it mounts the export
+   at an older version) holds the VM rather than guess. zfs zvols, lvm-thin,
+   ceph and iscsi disks are block devices, which take no overlay at all.
+
+   The sidecar is written, and synced, before anything relies on it, and it
+   follows the commit: `committing` before the commit's first write to the
+   disk (every attempt rewrites it, and a long commit rewrites it every ten
+   minutes while it runs); the disk as each attempt left it, failed or not,
+   once the attempt ends; `pivoting` just before a live commit pivots the VM
+   onto the disk; and `committed` once a recorded pivot has landed. If a
+   record cannot be written, the step it records does not happen: no commit
+   starts, no pivot is made, and the window stays open, reported, and is
+   retried. All the times compared are the filesystem's own (the disk's and
+   the sidecar's modification times), so a server clock that disagrees with
+   the hosts' does not matter. If the commit fails, the VM keeps
+   running on the overlay and a `disk.pit_overlay_stranded` event and a
+   `replication.pit_overlay_stranded` notification say so.
+
+   Every later copy (replication, `lv replicate-volume`), move
+   (`lv move-volume`, live or offline), migration, backup, clone, `lv start`,
+   reconfigure, in-place restore, `lv rm` of a disk it keeps, failover restart
+   and the daemon's start-up sweep settles the overlay first. It judges it
+   against the disk as it is now — a **verdict**:
+   - **matches**: the disk is the file the overlay was taken of, unchanged.
+     It is committed (`qemu-img commit`, without `-U`, pointing the overlay at
+     the disk by its name beside it if another host took it under another
+     mount path), the persistent definition is pointed back at the disk, and
+     only then is the overlay removed. A running VM on the overlay is
+     committed live instead;
+   - **half-written**: a commit began and the disk is the file it was writing
+     — same token, no smaller and no older than when the overlay was taken,
+     and either exactly as the last attempt left it (nothing writes the disk
+     after a failed attempt, so a restore over it in place, which keeps its
+     inode and token, is caught) or, if the daemon died mid-attempt, written
+     no later than twelve minutes after the daemon last recorded the attempt.
+     The commit is finished the same way: only that makes the disk whole;
+   - **pivoted**: the overlay is already in the disk — the commit was
+     recorded, or a pivot was recorded and the VM runs on its disk, written no
+     later than twelve minutes after that record (later, something else may
+     have started the VM there: it is marked diverged and held). It is
+     removed, never committed again over the guest's newer writes;
+   - **unknown**: anything else — the overlay is another VM's or unbound; the
+     disk was replaced, restored, re-created or written since; the token is
+     missing or another; the VM was found running on its disk without the
+     overlay (it is then marked so, and never committed automatically after);
+     or a pivot was under way and, with the VM off, it cannot be told whether
+     it landed. It is never committed (that could write stale blocks over
+     newer data) and never dropped (it may hold the guest's writes): the VM is
+     **held** — not started or defined on the bare disk, and the operation
+     refused. If libvirt cannot say whether the VM runs, nothing is touched
+     and the operation is refused until it can.
+
+   A hold is a `pit_overlay.held` health condition per disk (a warning:
+   `lv health` is degraded while it stands), and `lv inspect <vm>` shows it as
+   `pitOverlayHeld`, read from that condition. A `disk.pit_overlay_held` event
+   and a `replication.pit_overlay_held` notification name both files, the
+   verdict and what to do for it — once when the hold begins, then at most
+   daily. It resolves by itself once a later settle can commit the overlay or
+   finds it merged, or when the disk is deleted.
+
+   An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which is admin
+   only and audited. Without `--confirm` it does nothing, and answers even
+   while the VM runs: it prints the verdict, the disk's and the overlay's
+   identity then and now, the overlay's backing file, and what each action
+   would do. For a pivot that was under way with the VM off, it compares the
+   two files' times: a disk written after the overlay means the pivot landed
+   (discard), an overlay written last means it did not (commit). Carrying an
+   action out (`--confirm`) needs the VM stopped.
+   - `--commit --confirm` writes the overlay into the disk, through the same
+     checks as every automatic commit, and is refused unless the verdict is
+     matches or half-written. `--force-commit` overrides the verdict, for
+     experts who have checked both files: if the disk is not what the overlay
+     was taken of, it overwrites newer data with older blocks. Even forced, an
+     overlay whose backing file is another file (another name, or a file of
+     the same name in another directory of this host) is never pointed at
+     this disk. An overlay already in the disk (verdict pivoted, or a
+     committed binding) is refused even forced: committing it again writes
+     its old blocks over everything the guest wrote since. Only
+     `--overwrite-newer-writes` overrides that; `lv` prints the consequence
+     and, without the flag, asks for a typed `yes` on a terminal before it
+     sends anything.
+   - `--discard --confirm` deletes the overlay and its writes. Of a disk a
+     commit had begun writing (half-written, or unknown after a commit began)
+     it is refused unless `--accept-torn-disk` is given: without the overlay
+     that disk is inconsistent. To start over from a backup or a replica
+     instead, discard the overlay first (`--discard --accept-torn-disk`) and
+     only then restore the disk — a restore over it in place with the overlay
+     still beside it is not mistaken for the disk (the end record catches it),
+     but the VM stays held. `lv backup restore-from --in-place` does both: an
+     overlay that holds the VM is set aside (kept, as
+     `.<disk file>.lv-pit.orphan-<time>`) before the restore writes the disk.
+
+   When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
+   deleted with it. An import that finds an overlay where its new disk goes
+   renames it `.<disk file>.lv-pit.orphan-<time>` (never over an earlier one
+   or its sidecar), says where the file it was taken of went if the import
+   moved that aside too, and reports it (`disk.pit_overlay_set_aside`);
+   inspect both, then delete them.
+   The start-up sweep waits until the host's replica is trusted (caught up
+   with a peer, or the cluster's only host), and on a shared pool touches only
+   disks of VMs this host owns and has defined (others are left to their owner
+   and reported as `disk.pit_overlay_left`).
+4. **Last resort:** when neither 2 nor 3 can be made, the copy is what earlier
+   builds always made — `qemu-img convert -U` reading the image the guest has
+   open. That copy is **not point-in-time** (it is smeared over however long it
+   ran, and a guest restored from it may need repair). It is still made, but
+   the replica's record says `not_point_in_time`, a
+   `disk.replica_not_point_in_time` event and a `replication.not_point_in_time`
+   notification name the reason, and the scheduler retries a point-in-time copy
+   at its next tick (a minute later, not a full interval). That retry makes a
+   point-in-time copy or nothing; the schedule's own next run may make another
+   `-U` copy if the cause persists.
+
+The `disk.replicated` event names the method used. zfs, ceph and btrfs pools
+replicated natively use their own snapshots and are point-in-time.
 
 A replica is also **published by rename**. The copy lands in a dotted
 temp sibling and is renamed into its final name only once it has completed
@@ -359,6 +595,7 @@ it must be one of the VM's own recorded replicas:
 lv replication promote web-1                 # take over the name (host-loss case)
 lv replication promote web-1 --new-name web-1-dr   # bring up alongside the original
 lv replication promote web-1 --no-localize   # fast: boot off an overlay (pins the replica)
+lv replication promote web-1 --accept-not-point-in-time   # a replica recorded as not point-in-time
 ```
 
 A split-brain guard refuses to take over the name while the original is on a
@@ -368,11 +605,69 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in
 VMs onto a healthy peer (so a VM on lost local storage resumes), falling back to
-a bare reschedule on failure. Default off. Promotion uses the newest replica,
-which is lagging by up to one schedule interval and — for a full (non-
-incremental) replica of a VM that was running — is a torn copy rather than a
-crash-consistent one, as above. Enable only where a small lag window is
-acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
+a bare reschedule on failure. Default off. Promotion uses the newest
+point-in-time replica, which is lagging by up to one schedule interval. Enable
+only where a small lag window is acceptable.
+
+**Replicas that are not point-in-time** (the last-resort copy above) are the
+last choice:
+
+- Automatic promotion never uses one while any point-in-time replica of the
+  VM exists, even an older one.
+- When a VM's only replicas are not point-in-time (or its point-in-time ones
+  are all too old and a newer one is not point-in-time), automatic promotion
+  **holds the VM down** by default: the replica is left untouched, and a
+  `vm.failover.held` event and a `replication.promote_held` notification give
+  the reason and the exact command that promotes it by hand. A VM with any
+  disk that is not on shared storage is not rescheduled either — its record
+  stays on its failed host, `lv inspect <vm>` shows the hold as `failoverHeld`,
+  and the printed command works as printed. A VM whose disks are all on shared
+  storage is restarted from its own disk by its `on_host_failure` policy, as
+  before (a `vm.failover.restart_shared` event says so).
+- A VM can opt in, one VM at a time, to automatic promotion of such a replica
+  when no point-in-time one exists: give it the label
+  `litevirt.auto_promote_not_point_in_time=true` in its spec's `labels`. There is
+  no cluster-wide switch, and a build that does not know the label ignores it
+  (default off). When it fires, a `vm.promoted_not_point_in_time` event and a
+  `replication.promoted_not_point_in_time` notification say a NOT point-in-time
+  copy was promoted.
+- A manual `lv replication promote` of one is refused with a warning unless
+  `--accept-not-point-in-time` is given, whatever the label says.
+
+During a rolling upgrade, a host on an older build does not know the mark. A
+failover it coordinates promotes the newest replica as before when the replica
+is on that host or another older one; when the replica host is upgraded, that
+host refuses the marked replica and holds the VM with the same event and
+notification, but the older coordinator then falls back to its reschedule. A
+replica sent to a receiver on an older build is recorded without the mark, and
+the `disk.replica_not_point_in_time` event says so. An `lv` older than the
+daemon has no `--accept-not-point-in-time` flag: upgrade it to promote a marked
+replica by hand. A `lv replicate-volume` copy made with `-U` is recorded as not
+point-in-time too, and promoting it by name needs the same flag. On shared
+storage that copy's mark is also kept in its host's replicated pool record.
+Each host rewrites only its own records, so no peer on an older build can drop
+a mark; a host rolled back to an older build drops the marks of the copies it
+recorded (local and replicated) the next time it rewrites those records.
+
+**Older builds and `.lv-pit` overlays.** A build older than this one knows
+nothing of overlays: one that started a VM whose window was open would start
+it on the bare disk and drop the window's writes. So no overlay is made until
+every host serving the pool holds the `pit_overlay` release feature: until
+then the external-snapshot step is skipped (this build fails that gate closed
+until the release token is wired), which refuses nothing earlier builds did.
+A host below the feature — this build included, until it holds it — settles
+no overlay it finds, not even one it could verify: it holds the VM (the
+`pit_overlay.held` condition says why) rather than start it on that disk, and
+a binding written by a newer build than itself is never settled either.
+Before rolling a host back to a build OLDER than this one, settle every
+overlay on the pools it serves: `find <pool dir> -name '.*.lv-pit'` must find
+none (start or replicate each VM on an upgraded host, or resolve it with
+`lv resolve-pit-overlay`), because such a build has no hold and would start
+the VM on the bare disk. An older build shows the `pit_overlay.held`
+condition in `lv health` like any other, but never raises or resolves it, and
+an `lv` older than the daemon has none of `--force-commit`,
+`--accept-torn-disk` or `--overwrite-newer-writes`: upgrade it to resolve a
+hold.
 
 Automatic promotion **refuses a replica older than two of the schedule's
 longest intervals plus an hour** (or one whose filename carries no readable
@@ -386,6 +681,228 @@ two weeks and an hour. When the schedule cannot be read the bound is 48 hours.
 **Manual** `lv replication promote` is
 not bounded: an operator who has seen the age and chosen it anyway is making a
 different decision.
+
+### Container replication
+
+`lv replication schedule add <container> --container` replicates a container
+the way a VM schedule replicates a disk. A container has no storage pool, so
+`--target-host` names the peer that holds the replica and `--target-pool` the
+backup repo on it: a logical repo name that peer has in its `backup_repos`
+config (or a repo registered cluster-wide).
+
+```bash
+lv replication schedule add web --container --cron "0 * * * *" \
+    --target-host hostB --target-pool dr --keep 3 --auto-promote
+lv replication schedule ls            # a container shows as ct:web
+lv replication schedule rm web --container --target-pool dr
+lv replication replicas web --host hostB --target-pool dr   # what hostB holds
+```
+
+**Release gate.** Container replication is release feature
+`container_replication` of the release token (`lv cluster upgrade-status`): a
+schedule is created, a run replicates and a schedule switches direction only
+once every host runs a release that has it (the release token has latched).
+Until then each is refused with "the cluster upgrade must finish first
+(container_replication needs release_2026_11_v1)", naming the hosts still to
+upgrade; a switch that is refused is reported like any other switch that could
+not be made. The first schedule marks the feature used, so from then on a
+rollback below the release quarantines (docs/upgrades.md, "Rolling back after a
+release token latched"). An older daemon would otherwise skip a
+container schedule without a word, keep its replicas without pruning them, or
+take its name for a VM's. The CLI sends a container schedule's key
+(`@ct:<project>/<name>`), never the bare name, so even an older daemon that is
+asked to remove one never matches a VM's schedule.
+
+A schedule is keyed by the container's **project and name**: a container name is
+unique per project, so the same name in two projects is two schedules, and
+adding one never replaces the other's. `--project-name` picks the container when
+the name exists in more than one project.
+
+**Where a replica lives.** Not among backups: in a **replica namespace** of
+the repo, a chunk store of its own at `<repo>/.ct-replicas/<project>`. Backup
+retention, `keep_last`, `lv backup repo prune` and a restore's search for a
+backup never see a replica, and a replica never counts as one. A peer on an
+older release cannot resolve the namespace, so it refuses the push rather than
+store a replica among its backups. The namespace's chunks are reclaimed by its
+own GC after each run that removes a replica.
+
+**A run.** Each run archives the container on its host, frozen while it is
+archived (a freeze that is unavailable leaves the replica crash-consistent, as
+for a backup), and streams it over the chunk store container backups,
+migrations and failover relocations already use, so only chunks the peer does
+not hold cross the wire. A replica archive is cut into **content-defined
+chunks**: a chunk ends where the bytes say so, not every 4 MiB, so a file that
+grew in the middle of the rootfs (which shifts every later byte of the tar)
+changes only the chunks around it, and the next replica sends those and little
+else. The archive is written in name order with each member's modification
+time and no access or change time, and a restore, migrate or promotion lays
+every member down with its archived modification time, so an unchanged tree
+archives to the same bytes before and after a move. (GNU tar sorts with
+`--sort=name` from 1.28; on an older one the export hands tar the same order as
+a list, so no export fails where it did not before.) (A container whose files
+did change sends those; the first run into a repo that holds no replica of the
+container sends it whole.) Only the container's owner pushes: the run refuses on a host that has
+self-fenced, is not an active member, or whose owner-epoch marker is ahead of
+its own row, and the **target** checks again against its own view, refusing a
+replica from a host it knows is fenced. When the container's row there is on
+another host, is another placement, or has moved past the replica's owner epoch,
+the push is refused too, as "moving": a warning, since the owner's next run
+lands. A stale owner coming back from a partition therefore adds nothing that
+could later be promoted.
+
+**Keeping the newest copy.** Each replica records the segment of the
+container's history it was taken in: the host and the container's **placement
+id**, a random id minted every time the container's row is put on a host (a
+create, clone, restore, migrate, relocation or re-key), so a container that
+returns to a host it ran on before is a new segment there. It records when it
+was **captured** (after the freeze), as opposed to its name, which is only the
+scheduler's tick. And it records the points of earlier history its data
+descends from (a restore records the archive it laid down; a migrate carries its
+source's chain), each by capture instant. A replica of the same placement is a
+snapshot of one linear history, so `--keep` trims the oldest of those, and never
+a set-aside one or one whose capture is not known. A replica of another
+placement is removed only when the new replica's data provably descends from a
+point of that placement captured at or after it. Anything else is **set
+aside**: kept, never pruned by the schedule,
+never promoted by failover, reported once (`replication.replica_set_aside`, warn,
+and an audit row), and listed by `lv replication replicas` with the reason. That
+is what a failover that did not restore from the replica leaves behind (the
+container came back from its image or a backup, or on a host placement chose
+over the replica host): the set-aside replica may be the newest copy of the
+data. An operator can restore it, stopped, as the container, or remove it;
+removal asks first. It may be entered on any node. A restore is refused unless
+each of these positively says it holds and sees no live copy of the container,
+so there is never a second runnable copy:
+
+- the replica host;
+- the host the replica was taken on, which is asked even when the replica host
+  has no row of the container at all;
+- every host the replica host holds a row of the container for, deleted rows
+  included;
+- every other member of the cluster that has not been removed, voter or not.
+
+Each host answers from its own rows and from its own runtime. A live row of the
+container, on any host, refuses the restore. So does a container of that name
+in a host's runtime with no live row of it: an orphaned runtime
+(`ct_orphan_runtime`, see [diagnostics.md](diagnostics.md)), left by a stale
+delete or an interrupted create or migrate, which may hold newer data than the
+replica. Deal with that copy first; do not discard it unread. A host that cannot
+be asked, or whose runtime cannot be read in full, cannot vouch: the refusal
+names the host, and the remedy is to bring it back or remove it from the
+cluster (`lv host rm`). That is the cost of the check: while any one member is
+unreachable, no replica restore goes through. A host this cluster has no record
+of cannot be removed either, so a replica taken on one cannot be restored until
+it rejoins. A replica no schedule settles any more (the schedule was deleted,
+re-targeted or reversed away) is listed as orphaned and may be removed too:
+
+```bash
+lv replication replicas web --host hostB --target-pool dr
+lv replication replicas web --host hostB --target-pool dr --restore 2026-10-10T08:00:00Z
+lv replication replicas web --host hostB --target-pool dr --remove 2026-10-10T08:00:00Z
+```
+
+A replica older than one the target holds of the same segment, or one a held
+replica's data descends from, is refused, so the newer copy is never replaced by
+an older one; a replica already held is never written over. The command refuses
+a target that is the container's own host, is not active, cannot run
+containers, or cannot open the repo's namespace; `--auto-promote` additionally
+needs the container to have a host-failure policy (`on_host_failure`), since
+failover never moves one without it. `--incremental` is for VM disks and is
+refused.
+
+**Reporting.** A run that fails is reported when it starts failing, when the
+failure changes (another cause, another target), and when it recovers
+(`replication.recovered`); while the same failure continues it is re-notified
+at most hourly and writes no further audit row. A target host that is down is a
+warning, not an error. The schedule's `LAST ERR` always shows the latest run.
+
+**Promotion.** When a container's host is fenced, the failover coordinator
+places a container whose schedule has `--auto-promote` on the replica host when
+placement accepts it, and restores the newest replica there that was taken from
+the very container row being relocated (its host and placement) and is not set
+aside, through the same restore-relocation as a restore from backup: the same
+relocation proof, recovery claim and single-use token, so one copy exists at
+every moment. It restores the replica unless the newest backup it can reach was
+taken in the same placement and captured after it: capture instants are only
+ever compared on one host's clock, so a backup taken in another placement, or
+whose capture is not known, does not outrank the replica. A replica becomes a live copy only this way or through
+`lv replication replicas --restore`; a plain restore or a cold migrate of a
+replica is refused.
+Like a VM, a replica older than two of the schedule's longest intervals plus an
+hour is not promoted automatically; the container then falls back to the
+backup or image-recreate path as if there were no replica.
+
+### Reverse replication
+
+After a replicated workload moves onto the host that holds its replica, the
+schedule replicates the other way: the host it left becomes the target. Every
+path that moves a workload switches it: a promotion from its replica (by
+failover or `lv replication promote`), a failover reschedule of a VM, a live,
+cold or health-driven migration, a drain, an owner repair (`lv doctor repair-owner`)
+or an owner reclaim by the reconciler, and for a container a failover
+relocation, a migrate or an owner re-key; and again when the workload moves back
+(failback), so the direction follows the workload. The `replication.reversed`
+event (and a `replication.reverse` audit row) records each switch.
+
+Only a schedule with an **explicit `--target-host` equal to the host the
+workload moved onto** is switched. A schedule with no target host (a shared
+pool, or an auto-selected peer) already replicates away from wherever the
+workload runs; a schedule that targets a third host stays as it is. A pool,
+project or cluster schedule is shared by many workloads, so none is re-pointed
+for one of them.
+
+**Never onto its own host after a move.** An explicit `--target-host` equal to
+the VM's own host is an operator's same-host copy and works as it always has. But
+a run that finds the workload on its replica target because it MOVED there (a
+container's schedule never targets its own host; a VM's replicas there were
+written by another host) never replicates: the replica would be lost with the
+workload. It is not reported as a success either. While the switch made by the
+move is still on its way to this host (it replicates from the host that
+committed the move), the run is skipped quietly; after 15 minutes it is reported
+as `replication.suspended` (warn), once and then hourly, with the reason in the
+schedule's `LAST ERR`. A pool, project or cluster schedule is never switched for
+one of its VMs, so a VM that moves onto such a schedule's explicit target keeps
+replicating into the pool there, as it always has.
+
+The switch changes only the target host: once the release token has latched,
+as a compare-and-set of that one column, so an operator's concurrent edit of the
+schedule on another node survives it; before that (a VM's switch only), by
+re-reading the row just before re-writing it. A container's switch is always
+the compare-and-set, since it only runs past the release gate. (A container's
+re-key mints its new placement id with a statement of the same kind, under the
+same condition.) The latch is read on the host making the switch and is not a
+use of the feature: a cluster that only moves VMs can still roll back below the
+release.
+
+**If a member is rolled back.** The release token's latch is monotone: it says
+every host ran this release when it formed, not that every host still does. A
+member rolled back below the release after the latch cannot apply the next such
+statement: it refuses it, and replication from the sending host to that member
+stops at it (back-pressure) until the member runs this release again. Nothing is
+applied in part and nothing is corrupted; other members are not affected, and
+anti-entropy still merges the rows. A member that had latched the token itself
+is in WAL quarantine on the earlier build anyway. The remedy is to upgrade the
+member again (or remove it from the cluster); replication then resumes from
+where it stopped. For a VM the incremental checkpoint of
+the old direction is dropped, and an incremental run forks only from the replica
+its own checkpoint continues (a checkpoint names the run that made it, as does
+that run's replica): when the target does not hold that replica (after a
+reversal, or when another period left a newer one there), the run is a full
+push, never increments grafted onto another run's file. A container needs no
+such step: a reversed run over a target that still holds its earlier replicas
+sends only the chunks that changed (see "A run" above; the first run into a repo
+that holds none sends the container whole). Nothing on the old host
+is read, written or removed by the switch: replicas are only ever added there as
+new files, written without replacing an existing one, and a replica that a disk
+copy set aside by a failover is layered on (a `--no-localize` promotion's
+overlay) is never pruned.
+
+When the old host cannot be the target (it has no pool of that name, cannot run
+containers, or is gone), the schedule is left as it was and
+`replication.reverse_skipped` (warn) says so; its runs are then suspended, as
+above, until the schedule is replaced. When the old host is simply down after a
+failover, the schedule is switched anyway and its runs report the missing target
+(a warning when it goes down and when it is back, at most hourly in between).
 
 ## Live restore
 
@@ -424,6 +941,126 @@ when the manifest has none.
 The NBD server is read-only and rejects writes with `EPERM` — guests
 that try to write straight to the backing source get a clear error
 rather than silent corruption. All writes land in the qcow2 overlay.
+
+## Single-file restore
+
+Browse a backup and pull files out of it without restoring the disk:
+
+```bash
+# The backup's volumes: partitions (vda1, vda2, …), the whole disk (vda),
+# or rootfs for a container.
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z
+lv backup file-ls --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z /vda1/etc
+
+# Extract as a tar archive (a new file; - for stdout).
+lv backup file-restore --repo main --vm postgres-1 --timestamp 2026-05-11T02:15:00Z \
+    /vda1/etc/postgresql /vda1/home/app/.env -o files.tar
+
+# Containers: --ct, and the volume is rootfs.
+lv backup file-restore --repo main --ct web --timestamp 2026-05-11T03:00:00Z /rootfs/etc/nginx -o nginx.tar
+```
+
+**The host never mounts the backup.** A malformed filesystem is a kernel
+attack surface whatever the mount options, and a backup holds whatever its
+guest wrote. The daemon boots a throwaway **restore VM** instead: this host's
+own kernel and an initramfs whose init is the litevirt binary itself, the
+backup attached read-only as its only disk (served from the repo over a local
+NBD socket), no network, vsock as its only channel, one vCPU and 512 MiB. The
+guest kernel parses the partition table and mounts each filesystem read-only
+inside the VM. Each restore VM's qemu runs as its own uid from a reserved
+range — so two sessions (possibly two tenants) cannot signal, trace or reach
+each other — with only the `litevirt-restore` group and a group of its own slot
+(never `kvm`: KVM is given to that slot group alone by an ACL group entry on
+`/dev/kvm`, checked again just before the VM starts and removed when the
+session ends — a group entry rather than a user one because udev drops every
+named-user entry on `/dev/kvm` whenever any KVM VM starts or stops; the
+reserved range must hold no account or group NSS knows), in a network namespace of its own (no UDP, TCP or abstract
+sockets of the host), its seccomp sandbox on and, where AppArmor is enabled, confined by the
+`litevirt-restore-qemu` profile (its boot files, its session's export socket
+and nonce, `/dev/kvm` and vsock; no IP, no abstract sockets, nothing under
+`/var/lib/litevirt`), and — on every host whose kernel has it — inside a
+**Landlock** ruleset that allows qemu its own binary and libraries, its boot
+files, its session's directory and `/dev/kvm`, and no other file: no VM
+disk (even a world-readable one), nothing under `/var/lib/litevirt` or
+`data_dir`, no writes, and, with Linux 6.7+, no TCP; with 6.12+, no abstract
+sockets and no signals out. Landlock does not cover UDP or `connect()` to a
+pathname unix socket on any kernel: the network namespace takes away the
+first, and the uid's lack of any shared group (DAC) the second. On a host
+without AppArmor and a kernel older than 6.7, TCP is held back by the
+network namespace alone; the audit row's `landlock=` (below 4) shows it,
+but such a VM is not reported as missing a barrier. The reserved uids are checked to be no one
+else's (not the containers' id-map range, `/etc/subuid`/`subgid`, or any
+account NSS knows). Its disk export accepts exactly one connection, from
+that qemu (checked by its socket credentials, process group and, under
+AppArmor, its confinement), and the socket is unlinked the moment qemu has
+it. The daemon must run as root for this; a non-root daemon refuses file
+restore. On a host without AppArmor (SELinux, or no LSM), Landlock is the
+barrier between an escaped qemu and the host's files and network, alongside
+the per-VM uid, the seccomp sandbox and the single-peer export; **a host
+with neither AppArmor nor Landlock refuses file restore** (the uid alone does
+not keep an escaped qemu from world-readable VM disks or the host's
+network). Its kernel copy and
+initramfs are root-owned and read-only to that user
+(`/var/cache/litevirt-restore`), and re-verified against a recorded digest
+before every boot. It dies with the daemon, a restarted daemon kills any it
+left, and the agent inside powers off on its own when no one talks to it.
+The VM's console stays in a small in-memory buffer. Everything the VM
+returns is untrusted: it sends simple records, not tar, and the daemon builds
+the archive itself entry by entry — relative names inside what you selected,
+only directories, regular files and symlinks, nothing under a symlink (also
+compared case-insensitively), no owners, setuid bits or extended attributes,
+bounded sizes, counts and memory — and streams it to you. A symlink is kept
+only when its target is relative, any `..` in it comes first, and it stays
+inside the archive; any other is left out and counted. Nothing is written on
+the daemon's host.
+
+**Extract each archive into a new, empty directory**, and use your tar's
+protections (GNU tar: `tar -xf files.tar --no-overwrite-dir -C <new dir>`).
+Extracting two archives from the same backup into one directory lets a
+symlink from the first meet a path in the second. The architecture,
+limits and threat model are in
+[design/backup-file-restore.md](design/backup-file-restore.md).
+
+- **Permission:** the same as a full restore of that VM or container
+  (`backup.restore` on the backup's project). Every extraction is audited as
+  `backup.file_restore`, with the paths, what was extracted, and what
+  isolated its restore VM (`sandbox=… apparmor=… landlock=… uid=…`). A restore
+  VM started without one of its barriers — browsing included — is also
+  audited as `backup.file_restore_unsandboxed`.
+- **Sessions:** browsing reuses one restore VM per backup, killed after five
+  idle minutes; each extraction runs on a VM of its own, killed when it
+  completes, when you cancel, or at its wall-clock limit (10 minutes, or the
+  byte limit at 1 MiB/s if longer); two VMs and one extraction at a time per
+  host (`file_restore:` in the daemon config tunes all of it).
+- **Filesystems:** ext2/3/4, xfs, btrfs, vfat and iso9660, on a disk or its
+  partitions. Not LVM, LUKS, ZFS or md-raid inside the backup, and not a
+  stopped linked clone's disk-file backup (it is only the delta over its base)
+  — restore the disk for those.
+- **Requirements:** KVM (`/dev/kvm` on a filesystem with POSIX ACLs, as
+  devtmpfs is, or world read-write), `/dev/vhost-vsock` (the `vhost_vsock`
+  module), `qemu_fw_cfg` in the kernel's modules (on Ubuntu it is in
+  `linux-modules-extra-$(uname -r)`), a qemu with seccomp support, AppArmor or
+  Landlock (`landlock` in `/sys/kernel/security/lsm`; Ubuntu, Debian 12+,
+  Fedora and RHEL 9+ kernels have it), a root daemon, and a kernel the
+  daemon can read (its own by default). Without them file restore is refused
+  naming what is missing; a full restore keeps working. There is no fallback
+  to mounting on the host. Whether qemu can install its seccomp sandbox is
+  asked of qemu itself before each restore VM starts.
+- **`file_restore.allow_unsandboxed` is dangerous.** It names the barriers a
+  restore VM may run without, one at a time: `seccomp` (qemu's seccomp
+  sandbox), `mac` (any MAC barrier, on a host with neither a loadable
+  AppArmor profile nor Landlock; AppArmor on without `apparmor_parser` but
+  with Landlock runs under Landlock and needs no key), and
+  `root` (a non-root daemon, which runs qemu as itself, the user that owns
+  `data_dir` and its keys) — for example `allow_unsandboxed: [seccomp]`.
+  `true` lifts all three. Each removes a barrier between a malicious backup
+  and the host. Install a qemu with seccomp and `apparmor_parser`, use a
+  kernel with Landlock, and run the daemon as root, instead.
+  **`file_restore.allow_shared_run_as`** separately permits `run_as` to be root
+  or a shared qemu user, which then runs the VM itself — equally dangerous.
+  While either key is set the host carries an informational
+  `file_restore_unsandboxed` health condition
+  ([diagnostics](diagnostics.md#file-restore-without-a-barrier-file_restore_unsandboxed)).
 
 ## Containers
 
@@ -651,7 +1288,7 @@ A custom absolute `repo_path` also requires the **admin** role.
 ### Repo maintenance RPCs
 
 The daemon verifies, garbage-collects, prunes and syncs a repo it holds
-through four RPCs. Each is checked at `/` with its own verb. A repo holds
+through four RPCs (and a fifth for compression, below). Each is checked at `/` with its own verb. A repo holds
 every project's backups, so a project-scoped grant or token cannot reach
 it. Each RPC writes one audit row: the caller, the repo, the outcome, and
 what the operation counted.
@@ -663,7 +1300,12 @@ what the operation counted.
 | `PruneBackupRepo` | `backup.prune` | `backup.repo.prune` | the `keep_*` policy, `kept`, `deleted` |
 | `SyncBackupRepo` | `backup.sync` | `backup.repo.sync` (target `src -> dst`) | `manifests_copied chunks_copied chunks_skipped bytes_copied` |
 
-All four sit in `backup.*`, which Operator and BackupOperator hold and
+A fifth RPC, `SetBackupRepoCompression` (verb `backup.compression`, audit
+action `backup.repo.compression`; detail `init compression schema`), creates a
+zstd repo or turns zstd on for one, through the release token's `backup_zstd`
+gate. It refuses until the token has latched and records the use first.
+
+All of them sit in `backup.*`, which Operator and BackupOperator hold and
 Viewer's `*.read` does not. Without RBAC bindings the floor is the
 legacy `operator` role.
 

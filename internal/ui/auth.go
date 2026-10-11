@@ -106,6 +106,15 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
+	// An enrollment-only session (the login policy requires a second factor
+	// and the account has none) can do nothing but enroll one, so every page
+	// but the enrollment page sends it there instead of failing piecemeal.
+	// The daemon enforces this whatever the UI does (gateEnrollmentOnly).
+	if who.GetRequires_2FaEnrollment() && !enrollmentPath(r.URL.Path) {
+		http.Redirect(w, r, "/account/2fa", http.StatusFound)
+		return false
+	}
+
 	// A mutation is authorized by the DAEMON, not here. The write handlers now
 	// call their gRPC twins, whose RequirePerm consults the token's scope paths
 	// and the caller's RBAC bindings — neither of which is visible in the
@@ -123,6 +132,13 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+// enrollmentPath reports whether p is part of the second-factor enrollment
+// page an enrollment-only session is confined to.
+func enrollmentPath(p string) bool {
+	cleaned := path.Clean(p)
+	return cleaned == "/account/2fa" || strings.HasPrefix(cleaned, "/account/2fa/")
 }
 
 // selfServiceMutation reports whether path is a user acting on their OWN
@@ -316,6 +332,10 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
 	})
+	if resp.GetRequires_2FaEnrollment() {
+		http.Redirect(w, r, "/account/2fa", http.StatusFound)
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 

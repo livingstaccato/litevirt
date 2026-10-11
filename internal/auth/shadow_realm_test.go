@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -71,5 +72,26 @@ func TestEnsureUserShadow_IsIdempotentWithinOneRealm(t *testing.T) {
 	}
 	if err := EnsureUserShadow(ctx, db, p, "viewer"); err != nil {
 		t.Fatalf("second login from the same realm was refused: %v", err)
+	}
+}
+
+// TestEnsureUserShadow_WaitsForTheUsersTableToSync (re-review 2, Info): a node
+// with peers whose replica has not caught up must not create a new shadow —
+// "no row" may only mean the local account under that name has not arrived.
+// A node alone (a single-node founder) creates it as before.
+func TestEnsureUserShadow_WaitsForTheUsersTableToSync(t *testing.T) {
+	ctx := context.Background()
+	db := shadowTestDB(t)
+	db.SetMembersForTests(func() []corrosion.PeerInfo { return []corrosion.PeerInfo{{Name: "peer-1"}} })
+	err := EnsureUserShadow(ctx, db, &Principal{Subject: "carol", Realm: "ldap:corp"}, "viewer")
+	if !errors.Is(err, ErrShadowPending) {
+		t.Fatalf("EnsureUserShadow on an unsynced node = %v, want ErrShadowPending", err)
+	}
+	if u, _ := corrosion.GetUser(ctx, db, "carol"); u != nil {
+		t.Errorf("a shadow was created on an unsynced node: %+v", u)
+	}
+	db.SetMembersForTests(func() []corrosion.PeerInfo { return nil })
+	if err := EnsureUserShadow(ctx, db, &Principal{Subject: "carol", Realm: "ldap:corp"}, "viewer"); err != nil {
+		t.Errorf("a node alone refused a new external user: %v", err)
 	}
 }

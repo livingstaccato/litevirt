@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // A rebuild (RebuildVM) and a rolling recreate (serverOps.recreateAs)
@@ -64,6 +65,21 @@ type replacedVMKey struct{}
 type replacedVM struct {
 	name string
 	snap corrosion.VMDeleteSnapshot
+	// uuid is the incarnation's VM id and luns its iSCSI LUNs (LUN key →
+	// disk name): what lets the new incarnation take its own LUNs over
+	// (vm_lun_claim.go). Empty when unknown — then it takes over nothing.
+	uuid string
+	luns map[string]string
+	// claimed is the LUNs (LUN key → disk name) the recreate's preflight
+	// claimed for the VM before the teardown, which its create takes over
+	// without a claim of its own; image is the replaced incarnation's image.
+	claimed map[string]string
+	image   string
+	// holdToken and holdHost name the moved hold that host keeps on the
+	// claimed LUNs (vm_lun_hold.go): the create takes them over only while
+	// that hold stands.
+	holdToken string
+	holdHost  string
 }
 
 // withReplacedVM returns ctx carrying vm's identity into the create that
@@ -101,6 +117,13 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 // peer that forwarded the delete in a response header (deletedVMMD), which
 // the forwarding DeleteVM puts in its own caller's sink. An owner on an older
 // build reports nothing; the caller then falls back to its own copy.
+
+// isRecreateDelete reports whether ctx is a rebuild's or recreate's delete
+// of the VM it re-creates (it carries a deleted-VM sink).
+func isRecreateDelete(ctx context.Context) bool {
+	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok
+}
 
 // deletedVMSinkKey carries a *deletedVMSink in a context.
 type deletedVMSinkKey struct{}
@@ -172,18 +195,59 @@ func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
 	}
 }
 
+// withReplacedLUNs adds to the replaced VM ctx carries for vm.Name the
+// incarnation's VM id (vm's spec uuid) and its iSCSI LUNs — from vm's disk
+// rows in this replica, tombstoned ones included — so the create that
+// re-creates it can take its own LUNs over. vm must be the incarnation ctx
+// carries (same created_at); anything else is left as it is.
+func (s *Server) withReplacedLUNs(ctx context.Context, vm *corrosion.VMRecord) context.Context {
+	if vm == nil {
+		return ctx
+	}
+	r, ok := replacedVMFor(ctx, vm.Name)
+	if !ok || r.snap.CreatedAt != vm.CreatedAt {
+		return ctx
+	}
+	if spec := vmSpecFor(vm); spec != nil {
+		r.uuid, r.image = spec.GetUuid(), spec.GetImage()
+	}
+	if c, ok := ctx.Value(lunPreflightKey{}).(map[string]string); ok {
+		r.claimed = c
+		if tok := lunHandoffFrom(ctx); tok != "" {
+			r.holdToken, r.holdHost = tok, s.hostName
+		}
+	}
+	if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt); err == nil {
+		for _, d := range disks {
+			if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
+				if r.luns == nil {
+					r.luns = map[string]string{}
+				}
+				r.luns[k] = d.DiskName
+			}
+		}
+	}
+	return context.WithValue(ctx, replacedVMKey{}, r)
+}
+
 // replacedVMMD is the metadata key that hands a replacedVM to the host a
 // re-create is forwarded to. That host honours it only from a peer host
 // (acceptReplacedVMMD), which hands one over only for a VM it has deleted.
 const replacedVMMD = "x-litevirt-recreate-replaces"
 
 type replacedVMWire struct {
-	Name           string `json:"name"`
-	CreatedAt      string `json:"created_at"`
-	HostName       string `json:"host_name"`
-	OwnerEpoch     int64  `json:"owner_epoch"`
-	SpecGeneration int64  `json:"spec_generation"`
-	IdentityHash   string `json:"identity_hash"`
+	Name           string            `json:"name"`
+	CreatedAt      string            `json:"created_at"`
+	HostName       string            `json:"host_name"`
+	OwnerEpoch     int64             `json:"owner_epoch"`
+	SpecGeneration int64             `json:"spec_generation"`
+	IdentityHash   string            `json:"identity_hash"`
+	UUID           string            `json:"uuid,omitempty"`
+	LUNs           map[string]string `json:"luns,omitempty"`
+	Claimed        map[string]string `json:"claimed,omitempty"`
+	Image          string            `json:"image,omitempty"`
+	HoldToken      string            `json:"hold_token,omitempty"`
+	HoldHost       string            `json:"hold_host,omitempty"`
 }
 
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
@@ -196,6 +260,8 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 	b, err := json.Marshal(replacedVMWire{
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 		OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
+		UUID: r.uuid, LUNs: r.luns, Claimed: r.claimed, Image: r.image,
+		HoldToken: r.holdToken, HoldHost: r.holdHost,
 	})
 	if err != nil {
 		return ctx
@@ -225,7 +291,7 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
 		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
-	}})
+	}, uuid: w.UUID, luns: w.LUNs, claimed: w.Claimed, image: w.Image, holdToken: w.HoldToken, holdHost: w.HoldHost})
 }
 
 func (s *Server) replacedTombstoneWaitBound() time.Duration {
@@ -312,15 +378,26 @@ func (s *Server) retireReplacedRow(ctx context.Context, name string, snap corros
 
 // recreateFailedAfterTeardown is the error a rebuild or recreate returns when
 // its create fails after the VM was torn down: it says what is gone, where
-// the spec to re-create it from was kept, and the create's own error.
-func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VMSpec, cause error) error {
+// the spec to re-create it from was kept, and the create's own error. luns
+// says the VM kept disks on iSCSI LUNs, which were not torn down: the
+// recovery takes them over as they are (re-review 4, concern 3).
+func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VMSpec, cause error, luns bool) error {
 	kept := s.keepRecreateSpec(op, name, spec)
+	if luns {
+		kept += " " + lunRecoveryHint
+	}
 	slog.Error(op+": the VM was torn down and its re-create failed",
 		"vm", name, "torn_down_on", where, "spec_kept_at", kept, "error", cause)
 	st := status.Convert(cause)
 	return status.Errorf(st.Code(), "%s %q: the VM was torn down on %s (its domain, disks and record are gone) and "+
 		"re-creating it failed: %s. %s", op, name, where, st.Message(), kept)
 }
+
+// lunRecoveryHint is how a VM whose re-create was torn down and failed gets
+// its iSCSI disks back.
+const lunRecoveryHint = "Its disks on iSCSI LUNs keep the guest's data: create the VM again under the same name, in " +
+	"the same project, on the same pools (lv compose up, or lv run) and it takes them over as they are, with no overwrite — once this " +
+	"re-create's hold on them is released, normally within seconds."
 
 // recreateKeepMax and recreateKeepMaxAge bound <data_dir>/recreate-failed/:
 // the newest recreateKeepMax kept specs are kept, and none older than

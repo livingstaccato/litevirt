@@ -58,11 +58,26 @@ type VMConfig struct {
 	CPUPinning []int // host CPU IDs to pin vCPUs to
 	IOThreads  int   // number of IO threads (0 = default)
 
+	// CPULimit caps the VM's total CPU time in host cores (Proxmox cpulimit);
+	// 0 = unlimited. CPUShares is the relative CPU weight (libvirt <shares>);
+	// 0 = leave at the default. Both render into <cputune> (see GlobalQuota).
+	CPULimit  float64
+	CPUShares int
+
 	// NUMA policy
 	NUMAPolicy *NUMAPolicy
 
 	// PCI passthrough devices
 	Hostdevs []HostdevConfig
+	// USB passthrough devices, already resolved on this host (USBHostdevConfig).
+	USBHostdevs []USBHostdevConfig
+
+	// Memory hot-add (virtio-mem). HotplugMaxMiB > 0 boots the guest with a
+	// NUMA cell of HotplugBaseMiB plus a virtio-mem device covering
+	// HotplugMaxMiB-HotplugBaseMiB, of which MemoryMiB-HotplugBaseMiB is
+	// plugged. Both 0 = no hot-add. Exclusive with a balloon ceiling.
+	HotplugBaseMiB int
+	HotplugMaxMiB  int
 
 	// Secure Boot + vTPM (G1). SecureBoot uses the secboot/MS OVMF pair + SMM
 	// (q35-only); TPM adds an emulated TPM 2.0 device. LoaderPath/NvramTemplate
@@ -120,6 +135,14 @@ type DiskConfig struct {
 	// DiskDevName(Bus, index) — existing callers that never set this see no
 	// change in behavior.
 	TargetDev string
+	// Discard is the <driver discard=…> value: "unmap" passes the guest's TRIM
+	// down so thin storage reclaims space, "ignore" drops it, empty emits no
+	// attribute. DetectZeroes is <driver detect_zeroes=…> (off | on | unmap),
+	// empty = no attribute. IOTune is the <iotune> throttle; zero = none. All
+	// three apply to real disks only, never to a CD-ROM.
+	Discard      string
+	DetectZeroes string
+	IOTune       IOTune
 }
 
 // NetworkConfig describes a VM network interface.
@@ -129,6 +152,18 @@ type NetworkConfig struct {
 	MAC    string
 	VLAN   int    // 0 = untagged, 1–4094 = 802.1Q VLAN ID
 	Direct string // non-empty = macvtap direct attach to this interface (e.g. "bond0.206")
+	// Queues is the virtio-net multiqueue count: <driver queues='N'/>. Below 2
+	// emits nothing (a single queue is the default). Only the virtio model takes
+	// it.
+	Queues int
+	// SpecOrdinal is the NIC's 1-based position in the VM's spec (its
+	// vm_interfaces ordinal + 1); 0 = unknown. It lets the stored queue count
+	// find its NIC when the spec recorded no MAC, however many NICs have been
+	// hot-plugged or detached since.
+	SpecOrdinal int
+	// RateMBps caps this NIC's bandwidth in MB/s in both directions (Proxmox
+	// rate=), rendered as <bandwidth>. 0 = unlimited.
+	RateMBps float64
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -311,6 +346,20 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		dom.CurrentMemory = &memory{Value: cfg.MemoryMiB * 1024, Unit: "KiB"}
 	}
 
+	// Memory hot-add: <maxMemory>, one NUMA cell holding the boot memory, and
+	// (below, in <devices>) the virtio-mem device covering the rest. <memory>
+	// is the cell plus the whole region, which is what libvirt computes anyway.
+	var hotplugDev *memoryDevice
+	if cfg.HotplugMaxMiB > 0 || cfg.HotplugBaseMiB > 0 {
+		if err := validateMemoryHotplug(cfg); err != nil {
+			return "", err
+		}
+		dom.Memory = memory{Value: cfg.HotplugMaxMiB * 1024, Unit: "KiB"}
+		dom.MaxMemory = &maxMemory{Slots: memoryHotplugSlots, Unit: "KiB", Value: cfg.HotplugMaxMiB * 1024}
+		dom.CurrentMemory = nil
+		hotplugDev = virtioMemDevice(cfg.HotplugMaxMiB-cfg.HotplugBaseMiB, cfg.MemoryMiB-cfg.HotplugBaseMiB)
+	}
+
 	// CPU mode: host-passthrough, host-model, or custom. A custom mode carries a
 	// <model> child; libvirt rejects <cpu mode='custom'/> without one, so the
 	// model is not optional (ValidateCPUMode enforces the pair upstream).
@@ -321,6 +370,23 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			cd.Model = &cpuModel{Fallback: "allow", Name: cfg.CPUModel}
 		}
 		dom.CPUDef = cd
+	}
+	if hotplugDev != nil {
+		// virtio-mem plugs into a NUMA node, so the guest needs one. The cell
+		// spans every vCPU the domain can ever have (the hotplug ceiling too):
+		// libvirt refuses a vCPU outside every cell.
+		if dom.CPUDef == nil {
+			dom.CPUDef = &cpuDef{}
+		}
+		vcpus := cfg.CPU
+		if cfg.MaxCPU > vcpus {
+			vcpus = cfg.MaxCPU
+		}
+		cpus := "0"
+		if vcpus > 1 {
+			cpus = fmt.Sprintf("0-%d", vcpus-1)
+		}
+		dom.CPUDef.Numa = &cpuNuma{Cells: []numaCell{{ID: 0, CPUs: cpus, Memory: cfg.HotplugBaseMiB * 1024, Unit: "KiB"}}}
 	}
 
 	// Hugepages: back guest memory with host hugepages.
@@ -338,6 +404,22 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			})
 		}
 		dom.CPUTune = ct
+	}
+	// CPU limit and shares: the noisy-neighbour controls. They share <cputune>
+	// with any pinning rendered above.
+	if cfg.CPULimit > 0 || cfg.CPUShares > 0 {
+		if dom.CPUTune == nil {
+			dom.CPUTune = &cpuTune{}
+		}
+		if cfg.CPUShares > 0 {
+			sh := uint64(HostCPUShares(cfg.CPUShares))
+			dom.CPUTune.Shares = &sh
+		}
+		if cfg.CPULimit > 0 {
+			period, quota := GlobalQuota(cfg.CPULimit)
+			dom.CPUTune.GlobalPeriod = &period
+			dom.CPUTune.GlobalQuota = &quota
+		}
 	}
 
 	// NUMA tune: bind guest memory to a specific host NUMA node.
@@ -430,9 +512,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		disk := diskDevice{
 			Type:   diskType,
 			Device: "disk",
-			Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache},
+			Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache,
+				Discard: d.Discard, DetectZeroes: d.DetectZeroes},
 			Source: source,
 			Target: diskTarget{Dev: targetDev, Bus: d.Bus},
+			IOTune: d.IOTune.element(),
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"
@@ -442,6 +526,8 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			disk.Device = "cdrom"
 			disk.Type = "file"
 			disk.Driver.Type = "raw"
+			disk.Driver.Discard, disk.Driver.DetectZeroes = "", ""
+			disk.IOTune = nil
 			disk.Source = diskSource{File: d.Path}
 			disk.Target = diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+i), Bus: "sata"}
 			disk.Readonly = &struct{}{}
@@ -526,6 +612,13 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		} else {
 			iface = bridgeInterface(n.Bridge, model, mac)
 		}
+		if n.Queues >= 2 && model == "virtio" {
+			// No driver name: libvirt picks vhost-net when the host has it and
+			// qemu userspace when it does not. Naming vhost would turn a host
+			// without /dev/vhost-net into a failed start or migration.
+			iface.Driver = &ifaceDriver{Queues: n.Queues}
+		}
+		iface.Bandwidth = bandwidthElement(n.RateMBps)
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
 
@@ -592,7 +685,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Type:    "pci",
 			Managed: "yes",
 			Source: hostdevSource{
-				Address: hostdevAddress{
+				Address: &hostdevAddress{
 					Domain:   parsed.Domain,
 					Bus:      parsed.Bus,
 					Slot:     parsed.Slot,
@@ -604,6 +697,18 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			hostdev.Alias = &hostdevAlias{Name: hd.Alias}
 		}
 		dev.Hostdevs = append(dev.Hostdevs, hostdev)
+	}
+
+	// USB passthrough hostdevs.
+	for _, u := range cfg.USBHostdevs {
+		hd, err := usbHostdev(u)
+		if err != nil {
+			return "", err
+		}
+		dev.Hostdevs = append(dev.Hostdevs, hd)
+	}
+	if hotplugDev != nil {
+		dev.MemoryDevices = append(dev.MemoryDevices, *hotplugDev)
 	}
 
 	// Emulated TPM 2.0 (G1). State is pinned at TPMStateDir (when set) so it
@@ -739,6 +844,7 @@ type domain struct {
 	Type          string         `xml:"type,attr"`
 	Name          string         `xml:"name"`
 	UUID          string         `xml:"uuid,omitempty"` // stable VM identity; makes the libvirt-default swtpm path deterministic (G1)
+	MaxMemory     *maxMemory     `xml:"maxMemory,omitempty"`
 	Memory        memory         `xml:"memory"`
 	CurrentMemory *memory        `xml:"currentMemory,omitempty"`
 	VCPU          vcpu           `xml:"vcpu"`
@@ -761,9 +867,12 @@ type cpuDef struct {
 	// its own, outside a domain struct (see PatchInactiveCPUMode). Identical to
 	// the name the domain field tag already gives it.
 	XMLName xml.Name  `xml:"cpu"`
-	Mode    string    `xml:"mode,attr"`
+	Mode    string    `xml:"mode,attr,omitempty"`
 	Match   string    `xml:"match,attr,omitempty"`
 	Model   *cpuModel `xml:"model,omitempty"`
+	// Numa carries the guest NUMA cell memory hot-add needs. Nil otherwise,
+	// so every other <cpu> renders exactly as before.
+	Numa *cpuNuma `xml:"numa,omitempty"`
 }
 
 type cpuModel struct {
@@ -786,6 +895,10 @@ type memoryBacking struct {
 
 type cpuTune struct {
 	VCPUPin []vcpuPin `xml:"vcpupin"`
+	Shares  *uint64   `xml:"shares,omitempty"`
+	// GlobalPeriod/GlobalQuota cap the whole domain (cpu.max of its cgroup).
+	GlobalPeriod *uint64 `xml:"global_period,omitempty"`
+	GlobalQuota  *int64  `xml:"global_quota,omitempty"`
 }
 
 type vcpuPin struct {
@@ -882,13 +995,15 @@ type devices struct {
 	Disks       []diskDevice       `xml:"disk"`
 	Interfaces  []interfaceDevice  `xml:"interface"`
 	Hostdevs    []hostdevDevice    `xml:"hostdev"`
-	Serials     []serialDevice     `xml:"serial"`
-	Consoles    []consoleDevice    `xml:"console"`
-	Channels    []channelDevice    `xml:"channel"`
-	Graphics    []graphicsDevice   `xml:"graphics"`
-	Videos      []videoDevice      `xml:"video"`
-	MemBalloon  *memballoon        `xml:"memballoon,omitempty"`
-	TPM         *tpmDevice         `xml:"tpm,omitempty"`
+	// MemoryDevices holds the virtio-mem device of a hot-add domain.
+	MemoryDevices []memoryDevice   `xml:"memory"`
+	Serials       []serialDevice   `xml:"serial"`
+	Consoles      []consoleDevice  `xml:"console"`
+	Channels      []channelDevice  `xml:"channel"`
+	Graphics      []graphicsDevice `xml:"graphics"`
+	Videos        []videoDevice    `xml:"video"`
+	MemBalloon    *memballoon      `xml:"memballoon,omitempty"`
+	TPM           *tpmDevice       `xml:"tpm,omitempty"`
 }
 
 // tpmDevice is an emulated TPM 2.0 (G1). State lives at Backend.Source.Path
@@ -925,14 +1040,15 @@ type controllerDevice struct {
 }
 
 type diskDevice struct {
-	XMLName   xml.Name   `xml:"disk"`
-	Type      string     `xml:"type,attr"`
-	Device    string     `xml:"device,attr"`
-	Driver    diskDriver `xml:"driver,omitempty"`
-	Source    diskSource `xml:"source,omitempty"`
-	Target    diskTarget `xml:"target"`
-	BootOrder *bootOrder `xml:"boot,omitempty"`
-	Readonly  *struct{}  `xml:"readonly,omitempty"`
+	XMLName   xml.Name    `xml:"disk"`
+	Type      string      `xml:"type,attr"`
+	Device    string      `xml:"device,attr"`
+	Driver    diskDriver  `xml:"driver,omitempty"`
+	Source    diskSource  `xml:"source,omitempty"`
+	Target    diskTarget  `xml:"target"`
+	BootOrder *bootOrder  `xml:"boot,omitempty"`
+	Readonly  *struct{}   `xml:"readonly,omitempty"`
+	IOTune    *diskIOTune `xml:"iotune,omitempty"`
 }
 
 type bootOrder struct {
@@ -943,6 +1059,9 @@ type diskDriver struct {
 	Name  string `xml:"name,attr,omitempty"`
 	Type  string `xml:"type,attr,omitempty"`
 	Cache string `xml:"cache,attr,omitempty"`
+	// Discard and DetectZeroes: see DiskConfig.
+	Discard      string `xml:"discard,attr,omitempty"`
+	DetectZeroes string `xml:"detect_zeroes,attr,omitempty"`
 }
 
 // diskSource carries the three shapes libvirt accepts, selected by the
@@ -955,6 +1074,20 @@ type diskSource struct {
 	Protocol string           `xml:"protocol,attr,omitempty"`
 	Name     string           `xml:"name,attr,omitempty"`
 	Hosts    []diskSourceHost `xml:"host,omitempty"`
+	// Auth is the identity an rbd disk authenticates as: a ceph secret in
+	// libvirt's own store (libvirt accepts <auth> inside <source> since 3.9).
+	Auth *diskAuth `xml:"auth,omitempty"`
+}
+
+// diskAuth is <auth username=…><secret type='ceph' uuid=…/></auth>.
+type diskAuth struct {
+	Username string         `xml:"username,attr"`
+	Secret   diskAuthSecret `xml:"secret"`
+}
+
+type diskAuthSecret struct {
+	Type string `xml:"type,attr"`
+	UUID string `xml:"uuid,attr"`
 }
 
 // diskSourceHost is one monitor/target address for a network-backed disk.
@@ -976,6 +1109,15 @@ type interfaceDevice struct {
 	Source  ifaceSource  `xml:"source"`
 	Target  *ifaceTarget `xml:"target,omitempty"`
 	Model   ifaceModel   `xml:"model"`
+	Driver  *ifaceDriver `xml:"driver,omitempty"`
+	// Bandwidth is the per-NIC rate cap (<bandwidth>), nil when unlimited.
+	Bandwidth *ifaceBandwidth `xml:"bandwidth,omitempty"`
+}
+
+// ifaceDriver is the NIC's <driver>: N queues for virtio multiqueue.
+type ifaceDriver struct {
+	Name   string `xml:"name,attr,omitempty"`
+	Queues int    `xml:"queues,attr,omitempty"`
 }
 
 type ifaceTarget struct {
@@ -1081,14 +1223,27 @@ type hostdevAlias struct {
 }
 
 type hostdevSource struct {
-	Address hostdevAddress `xml:"address"`
+	// Vendor/Product select a USB device by id; nil for PCI and for a USB
+	// device selected by bus/device address.
+	Vendor  *hostdevUSBID   `xml:"vendor,omitempty"`
+	Product *hostdevUSBID   `xml:"product,omitempty"`
+	Address *hostdevAddress `xml:"address,omitempty"`
 }
 
+// hostdevUSBID is a USB <vendor id=…/> or <product id=…/>.
+type hostdevUSBID struct {
+	ID string `xml:"id,attr"`
+}
+
+// hostdevAddress is a PCI source address (domain/bus/slot/function) or a USB
+// one (bus/device). Every attribute is omitempty so each kind renders only
+// its own; a PCI address always sets all four of its attributes.
 type hostdevAddress struct {
-	Domain   string `xml:"domain,attr"`
-	Bus      string `xml:"bus,attr"`
-	Slot     string `xml:"slot,attr"`
-	Function string `xml:"function,attr"`
+	Domain   string `xml:"domain,attr,omitempty"`
+	Bus      string `xml:"bus,attr,omitempty"`
+	Slot     string `xml:"slot,attr,omitempty"`
+	Function string `xml:"function,attr,omitempty"`
+	Device   string `xml:"device,attr,omitempty"`
 }
 
 // ParsedPCIAddr holds the four components of a PCI address.

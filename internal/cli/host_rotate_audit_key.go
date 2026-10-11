@@ -22,14 +22,13 @@ import (
 // audit-signing.crt/.key in place and bounce the unit.
 //
 // It deliberately does NOT touch host.crt/host.key, even though those are what
-// an un-rotated host signs with. Three things read the TLS identity and none of
-// them would notice a swap: the daemon builds its gRPC serving TLS config once
-// at boot (internal/daemon/daemon.go), the health checker caches the client
-// config it dials peers with (internal/health/checker.go), and
-// internal/pki/libvirt.go symlinks /etc/pki/libvirt/{server,client}{cert,key}.pem
-// at those files, which qemu+tls:// follows mid-migration. Replacing the TLS
-// identity of a running node is a much larger operation — an operator restoring
-// audit integrity must not be gambling with quorum or a live migration.
+// an un-rotated host signs with. Replacing the TLS identity of a running node
+// is a different operation with its own command (`lv host renew-cert`): peers
+// pin the host's certificate serial, the gRPC listener and peer probes switch
+// to the new pair at their next handshake, and internal/pki/libvirt.go
+// symlinks /etc/pki/libvirt/{server,client}{cert,key}.pem at those files, which
+// qemu+tls:// follows mid-migration. An operator restoring audit integrity must
+// not be gambling with quorum or a live migration.
 
 // auditRotationSettleHint is how long the target's daemon waits for replication
 // before recording the rotation. Kept in step with daemon.auditLifecycleSettle by

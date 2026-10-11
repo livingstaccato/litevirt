@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -36,9 +38,10 @@ import (
 // copy primitives — they return Unimplemented until the corresponding
 // driver Mover lands.
 //
-// Live (running-VM) cutover is wired: a running VM routes to liveMoveVolume
-// (libvirt block-copy → pivot, see move_live.go); a stopped VM does an offline
-// copy. Only the block-backend gap above remains.
+// Live cutover is wired: any VM not definitely shut off (running, paused,
+// partition-paused, an unknown state) routes to liveMoveVolume (libvirt
+// block-copy → pivot, see move_live.go); a shut-off VM does an offline copy
+// without qemu-img's -U. Only the block-backend gap above remains.
 func (s *Server) MoveVolume(req *pb.MoveVolumeRequest, stream grpc.ServerStreamingServer[pb.MoveVolumeProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -198,10 +201,20 @@ func (s *Server) moveOneVolume(
 		return send(p)
 	}
 
-	// running VMs go through libvirt blockdev-mirror so
-	// the disk swap is online. Stopped VMs use the simpler offline
-	// qemu-img convert path below — still atomic at the DB layer.
-	if vm.State == "running" {
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: settle it before either path reads the disk.
+	if err := s.healPITOverlay(ctx, vm, src); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+
+	// Anything not definitely shut off goes through libvirt blockdev-mirror,
+	// so the disk swap is online and the copy is never read from an image a
+	// qemu holds open: a paused or pm-suspended domain (which the store folds
+	// into "stopped"), a partition-paused one, or a state this code does not
+	// recognise. Only a disk that is definitely closed takes the offline
+	// qemu-img convert below — without -U, so a wrong "stopped" fails on
+	// qemu's lock instead of copying a smeared disk.
+	if !s.sourceClosedForPlainCopy(vm) {
 		if err := s.liveMoveVolume(ctx, vm, src, dstPath, targetPool, dstPool, deleteSource, emit); err != nil {
 			return err
 		}
@@ -496,15 +509,20 @@ func (s *Server) deleteSourceIfUnreferenced(ctx context.Context, vm *corrosion.V
 // Callers MUST invoke this BEFORE tombstoning the VM's corrosion records, since
 // it reads vm_disks. The glob-based Store.DeleteVMDisks remains as the fallback
 // for default-dir / cloud-init debris not represented in vm_disks.
-func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) {
+//
+// It returns the ceph images left in their pool (a client still had one
+// open): the delete goes on, best-effort, but each such image is named to the
+// caller and by ceph_image_leftover (ceph_kept.go), never left unnamed.
+func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string) []KeptCephImage {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil {
 		slog.Warn("delete: list disks for volume cleanup — falling back to default-dir glob only",
 			"vm", vmName, "error", err)
-		return
+		return nil
 	}
 	// Best-effort by design on this path: the caller globs the default dir next.
-	_ = s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+	kept, _ := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return kept
 }
 
 // deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
@@ -515,10 +533,27 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 // records the cleanup as DONE must not do so while a volume is still there — the
 // record is what stops a restart from retrying. Skipping a path another VM still
 // references is a success, not a failure.
+//
+// The rbd disks are deleted together: each may wait for the clients still
+// watching it to go (a dead client's watch lasts about 30 s, and a live one
+// is waited for up to 45 s before the delete is refused as in use), and
+// those waits run at once within one bound, not one after another — which
+// for three or more disks outlasted the owner proxy's 2 minutes.
 func (s *Server) deleteRecordedVMDiskVolumeRecords(
 	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
 ) error {
-	var firstErr error
+	_, err := s.deleteRecordedVMDiskVolumeRecordsKept(ctx, vmName, disks)
+	return err
+}
+
+// deleteRecordedVMDiskVolumeRecordsKept is deleteRecordedVMDiskVolumeRecords,
+// also returning the ceph images it left in their pool, each recorded for
+// ceph_image_leftover.
+func (s *Server) deleteRecordedVMDiskVolumeRecordsKept(
+	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
+) ([]KeptCephImage, error) {
+	errs := make([]error, len(disks))
+	var wg sync.WaitGroup
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {
@@ -534,16 +569,32 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 		if s.diskPathReferencedByOtherVM(ctx, vmName, d) {
 			continue
 		}
-		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
-			slog.Warn("delete: free disk volume",
-				"vm", vmName, "disk", d.DiskName, "path", d.Path,
-				"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
-			if firstErr == nil {
-				firstErr = err
+		del := func() {
+			if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+				slog.Warn("delete: free disk volume",
+					"vm", vmName, "disk", d.DiskName, "path", d.Path,
+					"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
+				errs[i] = err
 			}
 		}
+		if strings.HasPrefix(d.Path, "rbd:") {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				del()
+			}()
+			continue
+		}
+		del()
 	}
-	return firstErr
+	wg.Wait()
+	kept := s.keptFromErrs(vmName, disks, errs)
+	for _, err := range errs {
+		if err != nil {
+			return kept, err
+		}
+	}
+	return kept, nil
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool
@@ -554,18 +605,53 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 // matter for ceph); otherwise we fall back to the recorded StorageType, and to
 // "local" when even that is blank (legacy rows).
 func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.DiskRecord) error {
+	drv, err := s.diskDriver(d)
+	if err != nil {
+		return err
+	}
+	// hostDiskFile is the recorded path itself, except under the per-node file
+	// root a multi-node test gives each node.
+	if err := drv.DeleteDisk(ctx, s.hostDiskFile(d.Path)); err != nil {
+		return err
+	}
+	// The disk's data is destroyed by intent: a point-in-time overlay of it
+	// (and its binding) goes with it, so a disk re-created at this path never
+	// meets it. One already set aside (.orphan-*) is kept.
+	if err := pitoverlay.Remove(s.hostDiskFile(d.Path)); err != nil {
+		slog.Warn("delete: point-in-time overlay of a deleted disk not removed", "disk", d.Path, "error", err)
+		return nil
+	}
+	if d.VMName != "" {
+		s.ClearPITOverlayHold(ctx, d.VMName, d.DiskName)
+	}
+	return nil
+}
+
+// diskDriver is the storage driver that serves a disk at its recorded
+// location (deleteDiskAtRecordedLocation).
+func (s *Server) diskDriver(d *corrosion.DiskRecord) (storage.Driver, error) {
 	cfg := storage.Config{Driver: d.StorageType}
 	if pool, ok := s.lookupStoragePool(d.StorageVolume); ok {
 		cfg = storage.Config{Driver: pool.Driver, Source: pool.Source, Target: pool.Target, Options: pool.Options}
+	} else if strings.HasPrefix(d.Path, "rbd:") {
+		// A ceph disk whose pool is gone from this host (or not loaded yet)
+		// is removed as the identity its own locator names: with no --id and
+		// --keyring the rbd CLI would act as client.admin, which a node holding
+		// only a restricted key cannot.
+		pool := ""
+		if l, ok := storage.ParseCephLocator(d.Path); ok {
+			pool = l.Pool // pool[/namespace]
+		}
+		cfg = storage.Config{Driver: "ceph", Source: pool, Options: rbdPathOptions(d.Path)}
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "local"
 	}
 	drv, err := storage.New(s.dataDir, cfg)
 	if err != nil {
-		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
+		return nil, fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
-	return drv.DeleteDisk(ctx, d.Path)
+	return drv, nil
 }
 
 // diskPathReferencedByOtherVM reports whether a disk's path is still in use by a
@@ -653,6 +739,17 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
 			"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
 		return true
+	}
+	// An rbd image is named by its spec, whatever options a row's locator
+	// carries: two rows can name one image with different suffixes.
+	if l, ok := storage.ParseCephLocator(d.Path); ok {
+		more, err := corrosion.DisksNamingRBDImage(ctx, s.db, l.Spec)
+		if err != nil {
+			slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
+				"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
+			return true
+		}
+		refs = append(refs, more...)
 	}
 	for _, r := range refs {
 		if r.VMName == vmName {
@@ -852,7 +949,28 @@ func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst
 // Without qemu-img a qcow2 source is byte-copied (it was pre-checked); a raw
 // source cannot be, since the copy would land raw bytes in a qcow2-declared
 // file.
+//
+// It never passes -U: an image a running qemu holds open fails on qemu's lock
+// instead of being read smeared. The one copy that still forces the share is
+// convertImageForceShare (point-in-time copy layer 3, pit_copy.go).
 func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	return convertImageWith(ctx, src, srcFormat, rule, dst, emit, false)
+}
+
+// convertImageForceShare is convertImage with qemu-img's -U (force-share):
+// it reads an image a running qemu holds open. Such a copy is smeared across
+// the time the read takes — NOT point-in-time and not crash-consistent — so
+// it is only the last layer of copyVMDiskConsistent, whose callers mark what
+// it produced as not point-in-time.
+func convertImageForceShare(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	return convertImageWith(ctx, src, srcFormat, rule, dst, emit, true)
+}
+
+// qemuImgCommand builds the qemu-img process. A variable so a test can see
+// the argv.
+var qemuImgCommand = exec.CommandContext
+
+func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) error {
 	// qemu-img follows symlinks; on an NFS export mounted without
 	// nosymfollow (a kernel before 5.10) none is handed to it.
 	for _, p := range []string{src, dst} {
@@ -875,10 +993,12 @@ func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, ds
 		}
 		return copyFileWithProgress(ctx, src, dst, emit)
 	}
-	// -U (force-share) lets us read a source image a running VM holds open —
-	// required for crash-consistent replication/move of a live disk; harmless
-	// for an offline (stopped) source.
-	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-U", "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
+	args := []string{"convert"}
+	if forceShare {
+		args = append(args, "-U")
+	}
+	args = append(args, "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
+	cmd := qemuImgCommand(ctx, "qemu-img", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -933,6 +1053,30 @@ func (s *Server) copyNoClobber(ctx context.Context, src *corrosion.DiskRecord, d
 		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
 	}
 	return placeNoClobber(tmp, dst)
+}
+
+// copyNoClobberConsistent is copyNoClobber with copyVMDiskConsistent's copy
+// (pit_copy.go): point-in-time for a running or paused source, and main's -U
+// copy, reported as not point-in-time, only when nothing else can be made.
+func (s *Server) copyNoClobberConsistent(ctx context.Context, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) (copyResult, error) {
+	if err := refuseExistingFile(dst); err != nil {
+		return copyResult{}, err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dst), ".repl-*.tmp")
+	if err != nil {
+		return copyResult{}, status.Errorf(codes.Internal, "create copy temp: %v", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
+	res, err := s.copyVMDiskConsistent(ctx, vm, src, tmp, emit, true)
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return copyResult{}, err
+		}
+		return copyResult{}, status.Errorf(codes.Internal, "copy: %v", err)
+	}
+	return res, placeNoClobber(tmp, dst)
 }
 
 // parseQemuImgProgress extracts "    (12.34/100%)" → 12.34. Returns -1

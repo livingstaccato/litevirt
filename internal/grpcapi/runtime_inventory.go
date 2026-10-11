@@ -183,6 +183,15 @@ func (inv *runtimeInventory) find(kind, name string) (runtimeWorkload, bool) {
 	return runtimeWorkload{}, false
 }
 
+// runsContainers is lxcCapable for this server: the host's lxc tooling probe,
+// unless a test has said otherwise (SetLXCCapableForTest).
+func (s *Server) runsContainers() bool {
+	if on := s.lxcCapableForTest.Load(); on != nil {
+		return *on
+	}
+	return lxcCapable()
+}
+
 // collectRuntimeInventory builds this host's inventory.
 //
 // Error discipline, unchanged from the snapshot it replaces: any probe error
@@ -233,7 +242,9 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 				fail("domain %s xml: %v", n, err)
 			} else {
 				w.CPU = lv.CurrentVCPUFromXML(xmlDef)
-				w.MemoryMiB = lv.CurrentMemoryMiBFromXML(xmlDef)
+				// A hot-add domain holds its boot cell plus what is plugged
+				// (the larger of requested and actual), not its whole region.
+				w.MemoryMiB = lv.HeldMemoryMiBFromXML(xmlDef)
 			}
 			w.OwnerEpochMarker, w.MarkerStatus = s.readVMMarker(n)
 			if w.MarkerStatus == MarkerUnreadable {
@@ -245,7 +256,7 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 
 	// Containers — only on an LXC-capable host (a non-LXC host has no local
 	// containers to miss, so it is neither probed nor marked incomplete).
-	if s.containerRuntime != nil && lxcCapable() {
+	if s.containerRuntime != nil && s.runsContainers() {
 		names, err := s.containerRuntime.ListContainers(ctx)
 		if err != nil {
 			fail("list containers: %v", err)

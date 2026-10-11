@@ -92,6 +92,59 @@ func verbMatches(grants []string, verb string) bool {
 	return false
 }
 
+// VerbPermModify is the delegated-administration verb (Proxmox:
+// Permissions.Modify). A principal holding it at a path may grant and revoke
+// role bindings at that path and below — never a role carrying a verb it does
+// not itself hold there. GrantRole / RevokeRole enforce the rest
+// (internal/grpcapi/role_delegation.go).
+const VerbPermModify = "perm.modify"
+
+// GrantCovers reports whether holding grant `held` covers grant `requested`:
+// every verb `requested` matches (verbMatches) is matched by `held` too. It
+// is the no-escalation test of a delegated grant, so it errs towards "no": a
+// pair it cannot prove is a subset is not one.
+//
+//	held "*"        covers everything
+//	held == requested
+//	held "ns.*"     covers any requested grant under "ns." ("ns.x", "ns.*", "ns.x.*")
+//	held "*.sfx"    covers any requested grant ending ".sfx" ("vm.sfx", "*.x.sfx")
+//
+// "*" requested is covered only by "*".
+func GrantCovers(held, requested string) bool {
+	if held == "*" || held == requested {
+		return true
+	}
+	if requested == "*" {
+		return false
+	}
+	if strings.HasSuffix(held, ".*") && !strings.HasPrefix(held, "*") {
+		return strings.HasPrefix(requested, held[:len(held)-1]) // "ns.*" -> "ns."
+	}
+	if strings.HasPrefix(held, "*.") && !strings.HasSuffix(held, ".*") {
+		return strings.HasSuffix(requested, held[1:]) // "*.read" -> ".read"
+	}
+	return false
+}
+
+// UncoveredGrants returns every grant in requested that no grant in held
+// covers (GrantCovers). Empty means requested is no more than held.
+func UncoveredGrants(held, requested []string) []string {
+	var out []string
+	for _, r := range requested {
+		covered := false
+		for _, h := range held {
+			if GrantCovers(h, r) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // engineSnapshot is the atomic unit of Engine state. We swap the entire
 // snapshot on Reload so readers never see a torn (half-updated) view of
 // roleVerbs vs bindings.
@@ -163,6 +216,29 @@ func (e *Engine) Reload(ctx context.Context) error {
 // principal keeps whatever perms their remaining bindings supply.
 func (e *Engine) RemoveBinding(id string) {
 	e.removeWhere(func(b corrosion.RoleBindingRecord) bool { return b.ID != id })
+}
+
+// ReplaceBinding drops the binding with id and adds repl, in one snapshot
+// swap, so no reader sees the principal with neither. A delegated revoke uses
+// it for the NoAccess sentinel it leaves.
+func (e *Engine) ReplaceBinding(id string, repl corrosion.RoleBindingRecord) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.snap.Load()
+	if cur == nil {
+		return
+	}
+	kept := make([]corrosion.RoleBindingRecord, 0, len(cur.bindings)+1)
+	for _, b := range cur.bindings {
+		if b.ID != id {
+			kept = append(kept, b)
+		}
+	}
+	kept = append(kept, repl)
+	e.snap.Store(&engineSnapshot{roleVerbs: cur.roleVerbs, bindings: kept})
 }
 
 // RemovePrincipal drops every binding for the given principal from the live
@@ -255,6 +331,173 @@ func (e *Engine) Allowed(principalIDs []string, verb, path string) bool {
 			continue
 		}
 		if verbMatches(grants, verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// RoleVerbs returns a role's grants as the live snapshot holds them, and
+// whether the role exists there.
+func (e *Engine) RoleVerbs(role string) ([]string, bool) {
+	if e == nil {
+		return nil, false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return nil, false
+	}
+	v, ok := snap.roleVerbs[role]
+	return append([]string(nil), v...), ok
+}
+
+// GrantsAt returns the union of the grants principalIDs hold at path. With
+// mustPropagate it counts only bindings that also apply to every DESCENDANT
+// of path — a propagating binding at path or an ancestor — because a
+// propagating grant made at path reaches all of them, and a holder whose own
+// binding stops at path holds nothing below it.
+func (e *Engine) GrantsAt(principalIDs []string, path string, mustPropagate bool) []string {
+	if e == nil {
+		return nil
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return nil
+	}
+	path = canonicalPath(path)
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	var out []string
+	for _, b := range snap.bindings {
+		if !pSet[b.Principal] {
+			continue
+		}
+		bp := canonicalPath(b.Path)
+		switch {
+		case b.Propagate && pathPrefixOf(bp, path):
+		case !b.Propagate && !mustPropagate && bp == path:
+		default:
+			continue
+		}
+		out = append(out, snap.roleVerbs[b.Role]...)
+	}
+	return out
+}
+
+// HasAnyBindingExcept is HasAnyBinding ignoring the binding with id exceptID:
+// whether principalIDs would still hold a binding once that one is revoked.
+func (e *Engine) HasAnyBindingExcept(principalIDs []string, exceptID string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if b.ID != exceptID && pSet[b.Principal] {
+			return true
+		}
+	}
+	return false
+}
+
+// explicitGrantMatches is verbMatches without the broad wildcards: a grant
+// matches verb only when it names it, or names its namespace ("perm.*"). "*",
+// "*.<suffix>" and wildcards spanning namespaces do not. Delegation is checked
+// this way (t1-auth-review I7): an Admin ("*") binding that predates
+// delegation meant "full control of these resources", and must not become
+// "may also hand out any role here" on upgrade.
+func explicitGrantMatches(grants []string, verb string) bool {
+	for _, g := range grants {
+		if g == verb {
+			return true
+		}
+		if strings.HasSuffix(g, ".*") && len(g) > 2 && !strings.Contains(g[:len(g)-2], "*") &&
+			strings.HasPrefix(verb, g[:len(g)-1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowedExplicit is Allowed with explicitGrantMatches: the verb must be
+// granted by name (or namespace) at path, not through "*".
+func (e *Engine) AllowedExplicit(principalIDs []string, verb, path string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	path = canonicalPath(path)
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if !pSet[b.Principal] {
+			continue
+		}
+		bp := canonicalPath(b.Path)
+		if b.Propagate {
+			if !pathPrefixOf(bp, path) {
+				continue
+			}
+		} else if bp != path {
+			continue
+		}
+		if explicitGrantMatches(snap.roleVerbs[b.Role], verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// HoldsVerbExplicitlyAnywhere is HoldsVerbAnywhere with explicitGrantMatches.
+func (e *Engine) HoldsVerbExplicitlyAnywhere(principalIDs []string, verb string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if pSet[b.Principal] && explicitGrantMatches(snap.roleVerbs[b.Role], verb) {
+			return true
+		}
+	}
+	return false
+}
+
+// HoldsVerbAnywhere reports whether principalIDs hold verb through any binding
+// at any path — a cheap "could this caller ever be authorized" precheck.
+func (e *Engine) HoldsVerbAnywhere(principalIDs []string, verb string) bool {
+	if e == nil {
+		return false
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return false
+	}
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	for _, b := range snap.bindings {
+		if pSet[b.Principal] && verbMatches(snap.roleVerbs[b.Role], verb) {
 			return true
 		}
 	}
@@ -379,8 +622,17 @@ var BuiltinRoles = []BuiltinRole{
 		Description: "Networking and load balancing. No VM lifecycle access.",
 	},
 	{
-		Name:        "NoAccess",
-		Verbs:       []string{},
-		Description: "Explicit deny-all. Useful for binding to revoked groups.",
+		Name:  "PermissionAdmin",
+		Verbs: []string{VerbPermModify},
+		Description: "Delegated administration (Proxmox: Permissions.Modify): grant and revoke roles at the " +
+			"bound path and below, never a role carrying a verb the holder does not itself hold there. " +
+			"Bind it beside the roles to delegate, e.g. Operator + PermissionAdmin on /projects/acme.",
+	},
+	{
+		Name:  "NoAccess",
+		Verbs: []string{},
+		Description: "Grants nothing. Bindings are union-only, so it cannot deny what another binding grants; " +
+			"what it does is keep a principal bound, and so off its cluster-wide legacy-role fallback. " +
+			"A delegated revoke leaves one as a sentinel.",
 	},
 }

@@ -11,7 +11,7 @@ or the host config; every VM disk references a pool by name.
 | `local` (default) | unused | dir override | qcow2 files under `<dataDir>/disks` |
 | `dir` | unused | required | qcow2 files in an arbitrary directory (e.g. an externally-mounted SAN LUN) |
 | `nfs` | `host:/export` | mountpoint override | mounted lazily by the daemon; survives restarts |
-| `iscsi` | IQN | unused | LUNs are pre-provisioned on the SAN; we discover and login |
+| `iscsi` | IQN | unused | **one pre-provisioned LUN per pool, and so one disk** — see [iSCSI: one LUN, one disk](#iscsi-one-lun-one-disk) |
 | `ceph` | pool name | unused | `rbd` CLI shell-out; CGO-free build supported |
 | `zfs` | parent dataset (`tank/litevirt`) | unused | zvol per disk; `volblocksize` tunable via options |
 | `btrfs` | absolute path on btrfs | unused | one subvolume per disk; qcow2 inside |
@@ -854,6 +854,12 @@ under `<data_dir>/recreate-failed/`, one file per failure, readable by root
 only, to re-create the VM from. The directory keeps the newest 50 files and
 none older than 30 days; copy out a spec you still need.
 
+A disk on an iSCSI LUN is not torn down: the LUN keeps the guest's data. Create
+the VM again under the **same name**, in the same project, on the same pools (`lv compose up`, or
+`lv run`) and it takes its own LUN over as it is — nothing is written over it,
+and no `overwrite` is needed, even for a root disk built on an image (see
+[iSCSI: one LUN, one disk](#iscsi-one-lun-one-disk)).
+
 ### Known limits
 
 - **qemu reopens the path.** The last check opens the file without following a
@@ -887,6 +893,234 @@ none older than 30 days; copy out a spec you still need.
 - **A live migration from an older source** carries the source's domain as
   it is: the target judges what it would open, and refuses a pool ISO it
   cannot resolve there.
+
+## Ceph RBD pools
+
+A `ceph` pool puts VM disks in an RBD pool of an existing Ceph cluster (one
+litevirt deployed with `lv host ceph`, or any other). Every host that runs
+the pool's VMs authenticates with a **restricted client key** — never
+`client.admin`, and no admin keyring on any node.
+
+### Setting one up
+
+On the Ceph cluster, create the RBD pool and a client that can use only it:
+
+```bash
+ceph osd pool create lv
+rbd pool init lv
+ceph auth get-or-create client.litevirt mon 'profile rbd' osd 'profile rbd pool=lv' \
+    > ceph.client.litevirt.keyring
+```
+
+On every litevirt host, install the client tools and the qemu RBD driver
+(`ceph-common` and, on Debian/Ubuntu, `qemu-block-extra`), copy the cluster's
+`/etc/ceph/ceph.conf`, and install the keyring as
+`/etc/ceph/ceph.client.litevirt.keyring`, mode 0600, **at the same path on
+every host. Then create the pool, under the same name, on each host:
+
+```bash
+lv pool create ceph --driver ceph --source lv --host host-a \
+    --option id=litevirt \
+    --option conf=/etc/ceph/ceph.conf \
+    --option keyring=/etc/ceph/ceph.client.litevirt.keyring
+```
+
+`--option id=` is the client name without `client.`; a keyring with no id is
+`client.admin`'s, as for the `rbd` CLI. With an id and no `keyring` option,
+`/etc/ceph/ceph.client.<id>.keyring` is used when it exists. `--option
+mon_host=` lists the monitors explicitly; otherwise they are read from the
+conf's `mon_host` (cephadm's `[v2:…,v1:…]` form is understood, and the v1
+address is used). A conf other than `/etc/ceph/ceph.conf` must name
+`mon_host`, or a VM disk on the pool is refused: qemu reads only the default
+conf by itself. A conf or keyring path may not contain `:`, `\`, `;` or `=`.
+
+### How a VM disk authenticates
+
+qemu opens an RBD disk itself, and a libvirt domain cannot name a keyring
+file. So for each ceph pool on a host, the daemon defines a **libvirt ceph
+secret** holding the pool's client's key, read from the keyring the host's
+pool names:
+
+- The secret's UUID is derived from the pool's name and the client id
+  (UUIDv5) — not from the keyring's path — so every host with the pool names
+  the same secret, wherever it keeps the keyring. Its usage name is
+  `litevirt/ceph/<uuid>`.
+- It is **ephemeral** (never written under `/etc/libvirt`) and **private**
+  (libvirt will not hand the value back). The key never appears in a log, an
+  event or an error.
+- It is defined when the pool is created, when the daemon starts, every 30
+  seconds after (a secret libvirtd lost on a restart is put back, and a value
+  is re-set when the keyring on disk changed), before every start of a VM with
+  a ceph disk (including failover restarts and promotes), and on a live
+  migration's target when the source prepares it — the target refuses the
+  migration, with the reason, if it cannot.
+- It is removed once no ceph pool on the host and no disk recorded on the host
+  uses it — not while a disk still does, even after its pool was deleted; such
+  a disk's secret is defined from the keyring its own recorded path names.
+
+**Every host's keyring must hold the same key.** Each host records a short
+fingerprint of its key (one-way, `ceph_key_fp`) on its own row of the pool.
+A host whose key differs from another host's raises the degraded condition
+`ceph_keyring_mismatch` (see [diagnostics.md](diagnostics.md)), naming the
+host. It is a diagnostic: rows of hosts that are down, removed or mid key
+rotation cannot vouch for anyone, so no start is refused by it. Instead every
+start of a VM with a ceph disk (failover restarts included) first proves the
+host's own key with `rbd info` as the pool's client. A VM's disks are probed
+at the same time, bounded together by 8 s and by rbd's own 5 s monitor and OSD
+timeouts (rbd runs under the C locale, so its messages are read the same on
+any host). A key a probe proved is taken as proven for 2 minutes for every
+disk of that pool and client — until its keyring changes — so the VMs a
+failover starts after the first on a pool need no probe; an image that is
+gone is still reported, by qemu, when the domain starts. The start refuses for
+good, with the reason, only when Ceph is unambiguous that an operator must
+act: permission denied (naming the keyring), or the image not in a pool that
+answers. Anything else — Ceph not answering in time, a cluster re-electing
+its monitors, an ambiguous error — is transient. A failover, onboot autostart
+or restart of a VM whose domain died is then **deferred**, never put in
+`error`: it waits in `starting` (a failover in `pending`, its proof kept) and
+the next reconcile pass starts it. A start the reconcile pass has no time
+left to probe for is deferred before anything is done for it — except the
+pass's first probe, which runs on whatever time is left (from 2 s), so every
+pass makes progress. A probe Ceph did not answer is remembered for 15 s
+(about one pass): the reconcile pass defers the other VMs on that pool at
+once, without a probe each (an operator's `lv start` always probes). The next
+pass takes the deferred VMs first: those deferred for time, then those whose
+pool did not answer, the VM whose own probe failed last of them. So a pool
+that is down never holds up the VMs on a healthy pool. A live migration onto a host
+whose recorded key differs from the source host's is refused before libvirt
+is asked.
+
+Each disk's domain definition is a network disk with the monitors as `<host>`
+elements and an `<auth username='litevirt'>` naming that secret:
+
+```xml
+<disk type='network' device='disk'>
+  <driver name='qemu' type='raw'/>
+  <source protocol='rbd' name='lv/web-1-root'>
+    <host name='10.78.0.22' port='6789'/>
+    <auth username='litevirt'>
+      <secret type='ceph' uuid='…'/>
+    </auth>
+  </source>
+  <target dev='vda' bus='virtio'/>
+</disk>
+```
+
+The disk's recorded path (`rbd:lv/web-1-root:id=litevirt:keyring=…:conf=…:lvpool=ceph`)
+names the image, the client and the litevirt pool. The **monitors are looked
+up each time the domain is defined** (a create, a start, a failover restart):
+from the pool on that host — its `mon_host` option, else its conf's — so after
+the monitors are re-addressed, updating `/etc/ceph/ceph.conf` (or the pool's
+`mon_host`) on the hosts is all a stopped VM needs to start. Only a pool with
+a `mon_host` option also writes that list into the path, as the fallback for
+a host that does not have the pool. Every start also rewrites the
+domain's persistent definition with the monitors its pool resolves to then,
+when they differ from the ones it names (a disk recorded before litevirt
+named its pool and client in the path is left as it is). A
+disk whose pool does not resolve (or resolves to no monitors) keeps the
+`<host>` list it has; an empty list is never written. A running VM keeps working (librbd
+follows the cluster's monitor map), and a live migration hands the
+destination the monitors its pool resolves to at that moment, not the ones the
+running domain was defined with, so a re-addressed cluster's VMs migrate
+without a restart.
+
+A pool with neither an id nor a keyring gives its disks no `<auth>`: qemu
+then uses Ceph's own defaults, which means `client.admin` and its keyring on
+every host. That is how such pools behaved before and is not recommended.
+
+### Disks
+
+- **Data disks** are `rbd create --image-feature layering` images of the
+  requested size, named `<vm>-<disk>`.
+- **Root disks from an image.** The image is fetched into the host's image
+  store by name, as for any pool (auto-pulled from a peer when missing), then
+  imported into the RBD pool **once per image content**: converted to raw,
+  `rbd import`ed as `lvimage+<image>+<sha256 prefix>`, given a protected
+  snapshot `@base`. Each VM's root disk is an `rbd clone` of that snapshot
+  (copy-on-write, as Proxmox does for templates on RBD), grown to the size
+  asked for (never shrunk). Concurrent imports of the same image on several
+  hosts are safe: each imports under a private name and only one rename wins.
+  A refreshed image has a new digest and becomes a new base; the old base
+  stays while clones of it exist.
+- **A failed create** removes every RBD image it created, whatever step failed.
+- **Clone** (`lv clone`) copies a ceph disk inside its pool with `rbd deep cp`
+  — nothing passes through the host, and a root disk's copy stays a clone of
+  the same base. The copy lands in the same pool, which the clone's project
+  must be allowed to use. `--mode linked` is refused for a VM with a ceph disk
+  (there is no file a qcow2 overlay could back on); auto mode copies.
+- **Delete** (`lv rm`) removes the VM's own images. It never removes an
+  imported base (`lvimage+…`), an image outside the pool, one that has
+  snapshots (as `rbd rm` refuses one, so a clone made from one is never
+  orphaned), or one another VM's disk row still names. An image is removed in
+  two steps, as `rbd rm` itself does: `rbd trash mv` — quick whatever the
+  image's size, and the delete succeeds then — and a background
+  `rbd trash rm <pool>/<id>` that deletes its objects (minutes for a large
+  image), retried until done and resumed after a daemon restart (the queue is
+  kept in `<data_dir>/ceph-trash-purges.json`). A purge that keeps failing is
+  named by `ceph_trash_leftover` (see [diagnostics.md](diagnostics.md)).
+  An image a client still has open is never moved: a delete waits up to 45 s
+  (a killed client's watch lapses in about 30) and then refuses it as
+  **in use**, naming the watcher; a rollback of litevirt's own copy waits up
+  to a minute. An `rbd status` answer that cannot be read counts as in use.
+  A VM's ceph disks wait together, so a VM with several disks a client
+  still holds is refused in about 45 s, not 45 s per disk, and the wait never
+  outlasts the request's own deadline. `rbd trash mv` does not refuse an image a client
+  has open (Ceph 19.2.3), so after the move the image's watchers are listed
+  again by id (`rados -p <pool> listwatchers rbd_header.<id>`, from
+  `ceph-common` like `rbd`). An image a client opened in between is put back
+  under its name with `rbd trash restore` and the delete refused as in use.
+  If its watchers cannot be listed, the purge is the guard: `rbd trash rm`
+  refuses an image a client has open (exit 16), and such an image is
+  **held**: it is never purged automatically, and `ceph_trash_leftover` names
+  it with `rbd trash restore <pool>/<id>`. A move is recorded by the image's
+  id before it runs. A move that fails, or that a crash interrupts, is
+  settled by id: it is purged if the image went to the trash, forgotten if it
+  never moved, and held and named if it is in the trash and still under its
+  name. A queue file that cannot be read is moved aside
+  (`ceph-trash-purges.json.unreadable-<time>`) and named. The pools' trash is
+  scanned every 5 minutes for litevirt images no purge on the host tracks,
+  and those are named too. An image already gone is not an error —
+  but only once the pool itself answers: a delete that cannot reach the
+  cluster (a missing keyring or conf) fails instead of reporting success.
+  If an interrupted `rbd rm` left the image in the trash, that leftover is
+  purged too; an image of that name someone moved to the trash by hand is
+  left for them.
+- **Clone copies** are made under a private staging name and renamed into
+  place, so a failed clone removes only its own copy, never an image that
+  already had the destination's name.
+- **Not supported on ceph disks yet**: `lv resize-disk`, `lv snapshot create`
+  and `lv backup snapshot` refuse a ceph disk up front with that reason.
+
+Unused bases are not removed automatically. To reclaim one, check that it has
+no clones and then remove it by hand:
+
+```bash
+rbd --id litevirt children --all lv/lvimage+cirros+0123456789abcdef@base   # must print nothing (--all includes clones in the trash)
+rbd --id litevirt snap unprotect lv/lvimage+cirros+0123456789abcdef@base
+rbd --id litevirt snap purge lv/lvimage+cirros+0123456789abcdef
+rbd --id litevirt rm lv/lvimage+cirros+0123456789abcdef
+```
+
+### Live migration
+
+A ceph disk is shared storage: a live migration moves only the guest's
+memory. The source always asks the target to prepare first (`EnsureDisks`):
+the target defines the secret the incoming domain names — the pool's, so the
+target needs a ceph pool of the **same name** and client — from its own
+keyring, proves that key opens each disk (`rbd info`), and refuses the
+migration with the reason when it cannot read its keyring, the key does not
+open the disk, its recorded key differs from the source's, or the disk's
+storage name is a different pool there. A target that does not have the pool
+at all serves the disk from the client and keyring the disk's recorded path
+names — if that keyring is readable there and opens the disk — and refuses
+otherwise; a target that cannot read its own pool list refuses. An older
+target build does not do this: the migration then fails when the target's qemu
+opens the disk, and the VM keeps running on the source.
+
+**Rolling upgrades.** A host on a build before ceph VM disks cannot start or
+receive one: a failover onto it parks the VM in `error` (it refuses, rather
+than rebuilding the disk), and a migration onto it fails with the VM left on
+the source. Upgrade every host before relying on ceph HA.
 
 ## Compose example
 
@@ -922,14 +1156,16 @@ Move a VM's disk to a different pool on the same host:
 lv move-volume web-1 root warm --delete-source
 ```
 
-**Stopped VMs** — `qemu-img convert` from source to destination, then the inactive
+**Shut-off VMs** (as libvirt reports them, whatever the VM's record says) —
+`qemu-img convert` (without `-U`, so a VM that is in fact still running fails
+the copy on qemu's image lock) from source to destination, then the inactive
 libvirt domain's disk source is repointed and the disk record is updated in a single
 atomic write (host, path, driver, and pool together). The redefine happens *before*
 the DB commit, so a mid-move failure rolls back cleanly; if a prior attempt already
 repointed the domain at the destination, the copy is skipped so a newer destination is
 never clobbered.
 
-**Running VMs** — libvirt `BlockCopy` mirrors writes into the destination while the VM
+**Running, paused or otherwise not shut-off VMs** — libvirt `BlockCopy` mirrors writes into the destination while the VM
 keeps running. The persistent domain config and the disk record are moved to the
 destination **before** the `BlockJobAbort PIVOT` that swaps the live disk — the pivot is
 the irreversible commit, so durable state never lags behind a pivoted guest and no
@@ -937,11 +1173,12 @@ acknowledged write is lost. Operator-visible downtime: zero. The orchestrator
 preallocates the destination, polls progress every ~250 ms, and cancels/rolls back on
 context-cancel or pivot failure.
 
-> **Note:** `lv replicate-volume`'s copy step uses `qemu-img convert`, which
-> needs the source disk quiescent — replicate a **stopped** VM (or a disk no
-> running VM holds open), otherwise the convert fails on the disk lock. Online
-> `move-volume` has no such restriction: it mirrors via libvirt `BlockCopy`
-> while the VM keeps running.
+> **Note:** `lv replicate-volume` copies a shut-off VM's disk plainly and a
+> running or paused one point-in-time — through a full backup session, or an
+> external disk-only snapshot committed back afterwards. Only when neither can
+> be made does it fall back to `qemu-img convert -U`, and its final status says
+> that copy is NOT point-in-time. See [Backups](backups.md), "How a full replica
+> is copied".
 
 Both paths support file-based pools (local / nfs / dir / btrfs).
 Block backends use Replication below.
@@ -969,8 +1206,8 @@ lv stack migrate-volumes postgres --to fast --dry-run
 ```
 
 - **Online by default** — running VMs migrate via blockdev-mirror (no
-  downtime); stopped VMs use the offline convert path. The choice is per VM,
-  based on its state.
+  downtime); shut-off VMs use the offline convert path. The choice is per VM,
+  based on its state as libvirt reports it (a paused VM is mirrored).
 - **Rolling** — `--parallel 1` (default) migrates one VM at a time and
   health-gates between VMs; raise `--parallel N` for stateless stacks. Use
   `--order replica-1,replica-2,primary` to fix the sequence.
@@ -1075,16 +1312,285 @@ sender pipes straight into the remote CLI. Same-host uses a local pipe.
 Crash-consistent by default; quiesce-via-guest-agent for application
 consistency is a planned follow-up.
 
+## iSCSI: one LUN, one disk
+
+An `iscsi` pool is **one LUN** of one target: the LUN the operator created on
+the SAN, named by the pool's `lun` option (default `0`). litevirt does not
+carve it up. Every disk created on the pool *is* that LUN — the driver
+allocates nothing and hands each disk the same
+`/dev/disk/by-path/ip-<portal>-iscsi-<iqn>-lun-<n>` device. Two disks on one
+LUN are one block device written by two guests (or twice by one), and corrupt
+each other silently.
+
+A LUN is named by its target and LUN number: the same target and LUN reached
+through two portals — one per storage subnet, or multipath — is one LUN.
+
+**A create takes a LUN by a voter claim.** The LUN's allocations are decided
+one at a time by the cluster's voters — the same single-decree claims recovery
+uses ([design/recovery-claims.md](design/recovery-claims.md)), at key
+`lun/<target>/lun<n>@<allocation>`. The decided value names the VM (by its
+uuid), the disk and the host that ran the create. So:
+
+- two disks of one VM on the same LUN — through one pool or two pools that
+  name the same target and LUN — are refused before anything is created;
+- two creates on two hosts at the same moment cannot both take a LUN: only one
+  value is ever decided per allocation. The other is refused naming the VM —
+  `Aborted` while that create is still running (retry once it has finished),
+  `FailedPrecondition` once it holds the LUN;
+- a host cut off from the voters allocates no LUN at all; its create is
+  refused `Unavailable`, with each voter's reason;
+- a LUN is free again only on **positive evidence** that what took it is gone:
+  the host that ran that create, asked by name (an answer from any other host
+  does not count), shows the LUN in none of its in-flight creates, its VM rows,
+  or its libvirt domains — a guest running with no row still holds it — or
+  that host's removal is recorded (its tombstone after `lv host rm`, or a voter
+  generation that dropped it). A host this node merely has no row for, or
+  cannot reach, holds what it took: `Unavailable`, naming it, until it answers
+  or is removed;
+- no live VM may use the LUN as a disk or as a **linked clone's base**: a clone
+  made from an iscsi VM reads its source's LUN, so deleting the source with
+  `--keep-disks` does not free the LUN while the clone exists;
+- a create whose VM row cannot be written is undone (domain destroyed), rather
+  than leaving a guest on the LUN that no claim can see; a create that fails
+  releases its allocation itself.
+
+**Cost.** Each LUN keeps a checkpoint (`lun_resolved/<LUN>` in the replicated
+cluster policies): every allocation below it is decided and gone. A create
+checks with the voters that an allocation was proposed just below the
+checkpoint, then starts its walk at that allocation — deciding it too, since
+a value there proves only what came before it — so a checkpoint that is wrong
+by any amount is never trusted past a live holder. Every allocation the walk
+steps past is decided, never only read. A create therefore pays for the
+allocations still open (normally one: the current holder), not for the LUN's
+history.
+
+**Which voters.** The adopted voter generation's members decide, a majority of
+them. There is no fallback: a cluster with no member generation — automatic
+genesis is pending because a host is offline, fenced or in maintenance (see
+the `ha.voter.genesis_pending` health condition), or the voters were reset —
+allocates no iscsi LUN, and the create is refused (`FailedPrecondition`) until
+a generation is adopted: run `lv cluster voter init`, or bring the missing
+hosts back so automatic genesis completes.
+
+**Rebuild and rolling recreate.** A VM that is rebuilt (`lv rebuild`) or
+re-created by a compose update keeps its LUN **exactly as it is** — nothing is
+written to it — but its claim **moves**: before the teardown, the host doing
+the rebuild or running the update decides the LUN's next allocation for the
+VM, after proving every earlier allocation but the VM's own gone. The new
+allocation names two hosts: that host, which holds the claim, and the host
+the VM is re-created on (placed before the teardown, so the create goes
+exactly there). A LUN is free again only when **both** show nothing; either
+one that cannot be asked holds it (`Unavailable`, naming it) until it answers
+or is removed (`lv host rm`). So a create that races the teardown, or comes
+after the re-create returned but before the VM's rows reached every host, is
+refused, whichever host created the VM originally or runs it now. Everything
+about the claim is judged before the teardown — no voter majority, a LUN
+another create is taking, an image the root disk could not take — and the new
+allocation is decided only after all of it passed, so a refused rebuild moves
+nothing and nothing about the claim can refuse after the VM is torn down. A
+recreate that changes only the VM's image cannot reach a kept root LUN: it is
+refused before the teardown unless the root disk sets `overwrite`, which
+writes the new image over the old system. The previous incarnation is
+recognised by its rows' name and creation time, and its claim by the VM's name
+and disk with nothing else holding the LUN — never by a name alone.
+
+The storage of every disk is judged before the teardown, on the host running
+the rebuild or update, and must be readable there: a storage that cannot be
+read refuses (nothing is deleted), never counts as "no LUN". A storage that is
+not a pool on that host is judged where the VM is created — unless the VM's
+current disk of that name is an iSCSI LUN, whose claim must move from here:
+then the update or rebuild is refused, naming the pool; run it from a host with
+that pool. A create, likewise, refuses a disk whose storage does not resolve,
+and puts the disk on exactly the storage its claim resolved.
+
+**Re-creating a VM whose re-create was torn down.** If the re-created VM's
+create fails after the teardown (a fault), the LUN keeps the guest's disk, and
+the moved allocation records that it was kept, for that VM's project and the
+incarnation it replaced. A create of the **same VM name and disk, in the same
+project**, that takes the LUN next — the documented recovery, `lv compose up`
+or `lv run` with the same pools — takes it over **as it is**: a root disk built
+on an image is not refused for holding data, and nothing is written over it.
+Set `overwrite` on the disk to write the image instead.
+
+Only that VM's own kept LUN is taken over this way. VM names are cluster-wide,
+so the check is not the name alone:
+
+- a VM of another name, or of the same name in **another project**, meets a
+  LUN that holds data and needs `overwrite`;
+- a VM **deleted** gives the LUN up: a plain delete (`lv rm`, a stack
+  teardown — not a rebuild's or recreate's own teardown) is recorded on each
+  of its LUNs (`lun_plain_delete/<LUN>` in the replicated cluster policies),
+  and a later VM of the same name, even in the same project, is a new disk
+  that needs `overwrite` — whether or not the deleted VM was ever rebuilt or
+  re-created.
+
+The holding host keeps a **durable hold** on the LUN, a record in
+`<data_dir>/iscsi-lun-holds/`: it survives a daemon restart, and nothing
+releases it on a timer or because the re-create returned, with or without an
+error. It is released only on evidence — the re-created incarnation's own rows
+(by creation time) have reached that host, or the host the VM was re-created
+on shows nothing holding the LUN, or that host is recorded removed. While that
+host cannot be asked, the hold stays, however long. The re-created VM's create
+takes the LUN over only after confirming the hold still stands, so a create
+still on its way when the hold was released (its rebuild given up, or the
+holding host restarted) is refused before it starts anything. A rebuild or
+recreate of the same VM while an earlier one's hold stands is refused
+(`Aborted`) until that hold is released, normally seconds after the earlier
+re-create.
+
+A rebuild or recreate that ends **before its create runs** — its delete was
+refused (a journaled operation such as a backup holds the VM, its host cannot
+be reached, the delete is not allowed) or failed — leaves **no hold**: no guest
+was started under the moved claim, and the VM, which still runs, holds its LUN
+as it did. Run it again once the cause is gone. The LUN's checkpoint moves to
+the moved allocation only once the re-created VM's create has committed, so
+refused re-creates, however many, never walk it past the VM that still runs.
+
+**Seeing and clearing holds.** `lv host lun-holds [host]` lists the holds a
+host keeps (every host without one): the VM, its LUNs, the host it is
+re-created on, since when, and whether its re-create is still running. A hold
+that has stood for more than five minutes raises the
+`iscsi_lun_hold_standing` warning on its host, naming the VM, its LUNs and the
+host it waits for ([diagnostics.md](diagnostics.md#iscsi-lun-holds-iscsi_lun_hold_unreadable-iscsi_lun_hold_standing)).
+
+A hold record that cannot be read fails that host closed: it answers no LUN
+question, so every iSCSI create on it, and every create elsewhere that must
+ask it, is refused. A read error is retried on the next question; a record
+that does not parse (it was edited by hand, or the disk was damaged — records
+are written whole, by a rename) stays until it is discarded. Either raises the
+critical `iscsi_lun_hold_unreadable` condition on that host, naming the file.
+
+Do not edit or delete a record by hand. `lv host lun-hold discard <lun> --yes`
+(admin, audited) moves every record that names `<lun>` — the LUN key the list
+shows (`iscsi:<target>/lun<n>`), a hold's token, or a record's file name — to
+`<data_dir>/iscsi-lun-holds/discarded/` on that host, where it is kept, and
+reloads the host's holds at once, with no restart. Without `--host`, the one
+host holding it is found; a hold whose re-create is still running is refused.
+A hold is what keeps a second VM off the LUN while the re-created VM's rows
+travel, so discard one only once it is safe:
+
+- the VM it names shows running in `lv ls`, on the host the hold names as its
+  run host, and its row has reached the hold's own host; or
+- that VM no longer exists, and no domain of it is defined on any host.
+
+A record that does not parse names no VM. Identify it from the LUN: the VM
+whose pool is that LUN, its rebuild or recreate around the record's time
+(`lv events`), and the host that ran it — then check the same two things.
+
+**Upgrading.** Allocation on an iscsi pool needs the release feature
+`iscsi_lun_claim` of the release token `release_2026_11_v1`, which opens only
+once the whole cluster runs a build that knows LUN claims: an older voter
+cannot decide a LUN key, and an older host allocates without asking. Until it
+is open every create, rebuild or recreate with a disk on an iscsi pool is
+refused with "the cluster upgrade must finish first (iscsi_lun_claim needs
+release_2026_11_v1)", naming the hosts still to upgrade (`lv cluster
+upgrade-status`). Running VMs, and deleting them, are not affected. Refusing is
+safer than the silent sharing older builds allowed. The first iscsi allocation
+after the upgrade records the feature as used, cluster-wide, before any LUN
+claim exists; from then on a host rolled back below the release is
+WAL-quarantined rather than allocating LUNs without claims (see
+[upgrades.md](upgrades.md)).
+
+A compose file that would put two instances of a VM on one iscsi volume or pool
+at once — `replicas` above 1, or an `update: strategy` of `blue-green` or
+`snapshot-and-replace`, which create the new instance beside the old — is
+refused when the stack is deployed, where the disk is written.
+
+A cluster that already has two VMs on one LUN — an older build allowed it —
+is left as it is: litevirt does not touch those disks or refuse to start those
+VMs. It raises the `shared_lun` health condition naming them (see
+[diagnostics.md](diagnostics.md#shared-iscsi-lun-shared_lun)) and a
+`storage.lun_shared` notification; stop all but one and move the others'
+disks to LUNs of their own. The claim is the prevention; `shared_lun` only
+detects.
+
+**What it does not cover.** Claims order litevirt's own creates. They do not
+stop something outside litevirt — another cluster, a host attaching the LUN by
+hand — from writing it. The storage-side guarantee is SCSI-3 persistent
+reservations on the LUN, which litevirt does not take (yet).
+
+**A root disk from an image is written onto the LUN.** The driver allocates
+nothing, so a root disk on an iscsi pool built on an image (`image:` in
+compose, `lv run --image … --storage <pool>`) has the image's guest contents
+written onto the LUN with `qemu-img convert` before the VM is first defined —
+never a blank LUN booting to the firmware shell. The image store's images are
+qcow2, and the image is opened as qcow2 with no backing chain; anything else
+(raw bytes, VDI, VHDX, VMDK) is refused, never copied over as raw — a raw
+image in the store cannot be the root of an iscsi VM (convert it to qcow2). Before writing:
+
+- the LUN is not any VM's disk (the claim above, held for the whole write);
+- the LUN is at least the image's virtual size, or the create is refused with
+  both sizes. The disk's requested `size` is not applied: the disk is the LUN,
+  at the size the SAN gave it;
+- the LUN is blank — zeros in its first and last MiB (partition tables: MBR,
+  GPT and its backup; LVM labels), in the 128 KiB from 1 MiB (where a first
+  partition's filesystem starts even when the partition table was wiped), and
+  in 64 KiB samples every GiB across the device (at most 256) — read past the
+  page cache. Otherwise the disk must set `overwrite` (compose
+  `overwrite: true`, `lv run --overwrite`), a one-shot acknowledgement for that
+  create that is never stored in the VM's spec. An overwrite is audited, after
+  the write, with its outcome.
+
+The probe is a sample. Data that lies only between the probed regions — a
+blank-looking LUN reused without being wiped — reaches the new guest when it
+grows its filesystem; litevirt does not wipe a LUN when a VM is deleted. A
+write that fails part-way (the write runs on, detached, even if the client
+gives up) leaves the LUN partly written, so a retry needs `overwrite`.
+
+`overwrite` is an accident interlock, not a permission boundary: whoever may
+create the VM on the pool may also attach the LUN as a data disk and write
+anything to it from the guest.
+
+A data disk on an iscsi pool, and a root disk with no image, is the LUN as it
+is: nothing is written.
+
+To give each disk its own LUN, create the LUNs on the SAN and one pool per
+LUN, then name the pool on the disk:
+
+```bash
+lv pool create san-vm1-root --driver iscsi --source iqn.2003-01.org.example:store \
+    --option portal=10.0.0.5:3260 --option lun=1
+lv pool create san-vm1-data --driver iscsi --source iqn.2003-01.org.example:store \
+    --option portal=10.0.0.5:3260 --option lun=2
+```
+
+```yaml
+vms:
+  vm1:
+    disks:
+      root: { size: "40G", storage: san-vm1-root }
+      data: { size: "200G", storage: san-vm1-data }
+```
+
+A new iscsi pool records its portal as `host:port`, adding `:3260` when no
+port is given and resolving a host name to its IPv4 address (with a warning,
+or keeping the name when it does not resolve): the device path is spelled from
+the option, and udev names the device `ip-<address>:<port>-iscsi-…`. Pools
+created before keep the spelling their disks were recorded with.
+
+**Not implemented: LVM on an iSCSI LUN.** Proxmox's usual shared-SAN layout is
+one big LUN with a shared LVM volume group on it, carved into one logical
+volume per disk. litevirt has no such driver — `lvm-thin` is a host-local
+volume group, not a shared one — so a LUN holds exactly one disk (see "Disks
+per pool" in the backend matrix below).
+
 ## Backend matrix
 
 |  | local | nfs | dir | btrfs | zfs | ceph | iscsi | lvm-thin |
 |---|---|---|---|---|---|---|---|---|
+| Disks per pool | many | many | many | many | many | many | **one** (the LUN; no LVM-on-LUN) | many |
 | Snapshots | qcow2 | qcow2 | qcow2 | atomic (subvol) | atomic (zvol) | atomic (rbd snap) | external | atomic (LV snap) |
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
 | Native send / receive (`replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
+
+**Discard (TRIM).** A new VM's disk gets `discard=unmap` by default on `local`,
+`dir`, `btrfs`, `zfs`, `lvm-thin` and `ceph` (on a virtio, scsi or sata bus), so a
+guest's `fstrim` returns the space to the pool. It is not defaulted on `nfs` or `iscsi`
+(whether a TRIM frees anything there depends on the server), nor for an existing VM; set `discard:` on a compose
+disk to choose either way (see [compose.md](compose.md)).
 
 The **Snapshots** row describes each backend's *native* snapshot capability
 (what the driver could do). It is not the `lv snapshot create` code path: that

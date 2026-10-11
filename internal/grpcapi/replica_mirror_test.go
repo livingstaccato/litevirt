@@ -92,7 +92,7 @@ func TestReplicateCrossHost_AlsoWritesMainsReplicaWhileAHostCannotSeeTheArea(t *
 		disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
 		if err := f.s.replicateCrossHost(ctx, corrosion.BackupScheduleRecord{
 			VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 3,
-		}, vm, &disks[0], "new-host", "20261005-000000"); err != nil {
+		}, vm, &disks[0], "new-host", "20261005-000000", true); err != nil {
 			t.Fatalf("replicate (every host lists replicas: %v): %v", all, err)
 		}
 		if rcv.areaPushes != 1 {

@@ -4,22 +4,42 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/obs"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
+
+// HostUpdatesConfig configures the pending-OS-update check.
+type HostUpdatesConfig struct {
+	// Enabled turns the check on (default true). It reads the package
+	// manager's cached index and installs nothing.
+	Enabled bool `yaml:"enabled"`
+	// IntervalMinutes is how often the check runs (default 360, minimum 5).
+	IntervalMinutes int `yaml:"interval_minutes"`
+	// RefreshIndex runs `apt-get update` / `dnf makecache` before each check.
+	// Default false: a refresh is a network call, and on apt takes the package
+	// lock, so it is opt-in; without it the report is only as fresh as the
+	// host's own refresh timer.
+	RefreshIndex bool `yaml:"refresh_index"`
+}
 
 // Config holds litevirtd configuration.
 type Config struct {
@@ -84,6 +104,10 @@ type Config struct {
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
 
+	// HostUpdates is the read-only check for pending OS package updates on this
+	// host (docs/upgrades.md, "Pending OS updates"). litevirt installs nothing.
+	HostUpdates HostUpdatesConfig `yaml:"host_updates"`
+
 	// VM holds cluster-wide defaults for newly created VMs.
 	VM VMDefaultsConfig `yaml:"vm"`
 
@@ -101,6 +125,19 @@ type Config struct {
 	// host backup data leave this empty; the scheduler then quietly
 	// skips any VM whose backup.repo cannot be resolved locally.
 	BackupRepos map[string]string `yaml:"backup_repos,omitempty"`
+
+	// BackupBWLimits caps, per backup repo (by logical name, as in
+	// backup_repos or a compose backup-repos block), how fast this host's
+	// backups into that repo read disks and send chunks: "100MiB", "512K",
+	// or a byte count, per second. One limit is shared by every backup job
+	// this host runs into the repo; a job's own --bwlimit can only lower it.
+	// Absent or 0 = no limit.
+	BackupBWLimits map[string]string `yaml:"backup_bwlimits,omitempty"`
+
+	// FileRestore configures single-file restore from backups, which reads
+	// the backed-up filesystem inside a throwaway restore VM
+	// (docs/design/backup-file-restore.md).
+	FileRestore FileRestoreConfig `yaml:"file_restore"`
 
 	// MaxImageBytes caps a single image pull/import (disk-fill guard);
 	// ImagePullTimeoutSec bounds a pull's total wall time (SSRF/slowloris
@@ -209,14 +246,27 @@ type Config struct {
 	// upgrade and came back on its old binary. See docs/self-upgrade-from-peer.md.
 	AutoUpgrade AutoUpgradeConfig `yaml:"auto_upgrade,omitempty"`
 
+	// UITLS decides whether the web UI listener speaks TLS. "auto" (the
+	// default, also ""): TLS when acme: is configured or a custom certificate
+	// is installed (`lv host ui-cert set`), plain HTTP otherwise — re-decided
+	// while running, so installing or clearing a certificate takes effect
+	// without a restart. "on": always TLS, serving the custom certificate, else
+	// ACME's, else this host's cluster certificate (signed by the cluster CA).
+	UITLS string `yaml:"ui_tls,omitempty"`
+
 	// ACME auto-provisions a public TLS cert for the web UI (#13). When set, the
-	// daemon terminates UI TLS itself via autocert; when unset the UI stays plain
-	// HTTP (today's behavior, e.g. behind a fronting proxy).
+	// daemon terminates UI TLS itself (HTTP-01 via autocert, or DNS-01); when
+	// unset, ui_tls decides.
 	ACME ACMEConfig `yaml:"acme,omitempty"`
 
 	// Notifications: operator alerting targets/routes (#5). The optional
 	// DefaultWebhook seeds a catch-all webhook target without UI/CLI.
 	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
+
+	// SMART controls the periodic per-host disk SMART health check
+	// (smartctl). Informational: exposes litevirt_disk_smart_* gauges and
+	// notifies on a failing/prefail disk; never fences or blocks anything.
+	SMART SMARTConfig `yaml:"smart,omitempty"`
 
 	// Telemetry configures structured logging + distributed tracing via
 	// provide-telemetry. With no otlp_endpoint the daemon logs locally and traces
@@ -249,6 +299,14 @@ type ContainersConfig struct {
 	// "auto" (an idmapped mount where this host supports one, otherwise its
 	// files are shifted into the range), "on" or "off". Default "auto".
 	IDMappedRootfs string `yaml:"idmapped_rootfs"`
+	// BindMountPaths and DevicePaths are the host path prefixes an admin may
+	// bind-mount into a container, and the device nodes they may pass through.
+	// A path is resolved on this host (symlinks followed) and must land under
+	// one, at create and again at every start. Empty (the default) allows
+	// none. Per host: a container moved to a host that does not allow its
+	// paths does not start there.
+	BindMountPaths []string `yaml:"bind_mount_paths,omitempty"`
+	DevicePaths    []string `yaml:"device_paths,omitempty"`
 }
 
 // validate refuses container defaults that cannot work.
@@ -263,6 +321,17 @@ func (c ContainersConfig) validate() error {
 	}
 	if c.IDMapRanges <= 0 {
 		return fmt.Errorf("config containers.idmap_ranges: %d, want at least 1", c.IDMapRanges)
+	}
+	return nil
+}
+
+// validateHostAccess refuses allowed host paths a host must not run with: a
+// bind-mount prefix that is, lies in, or contains a protected tree (so never
+// "/"; litevirt's own data and PKI directories among them), and a device entry
+// that is not an exact, permitted node under /dev.
+func (c ContainersConfig) validateHostAccess(dataDir, pkiDir string) error {
+	if err := lxc.ValidateHostAccess(c.hostAccess(dataDir, pkiDir)); err != nil {
+		return fmt.Errorf("config %w", err)
 	}
 	// The ranges must leave the host's own ids (0-65535) alone and fit in 32
 	// bits (4294967295 is the kernel's invalid id).
@@ -360,24 +429,106 @@ type TelemetryConfig struct {
 	LogFormat    string   `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
 }
 
-// ACMEConfig configures autocert for the web UI (#13). directory_url points at
-// an ACME directory — internal step-ca (e.g.
+// ACMEConfig configures ACME certificates for the web UI (#13). directory_url
+// points at an ACME directory — internal step-ca (e.g.
 // "https://ca.internal/acme/acme/directory") or Let's Encrypt. Empty
-// directory_url or domains disables ACME (UI stays plain HTTP). HTTP-01 only
-// (needs inbound :80 reachable from the CA).
+// directory_url or domains disables ACME.
+//
+// challenge picks how the CA is shown control of the names: "http-01" (the
+// default; autocert, needs inbound :80 reachable from the CA) or "dns-01"
+// (publishes a TXT record through dns.provider; needs no inbound port and can
+// issue wildcards).
 type ACMEConfig struct {
-	DirectoryURL string   `yaml:"directory_url,omitempty"`
-	Email        string   `yaml:"email,omitempty"`
-	Domains      []string `yaml:"domains,omitempty"`
-	CacheDir     string   `yaml:"cache_dir,omitempty"` // default {DataDir}/acme
+	DirectoryURL string        `yaml:"directory_url,omitempty"`
+	Email        string        `yaml:"email,omitempty"`
+	Domains      []string      `yaml:"domains,omitempty"`
+	CacheDir     string        `yaml:"cache_dir,omitempty"` // default {DataDir}/acme
+	Challenge    string        `yaml:"challenge,omitempty"` // http-01 (default) | dns-01
+	DNS          ACMEDNSConfig `yaml:"dns,omitempty"`
+}
+
+// ACMEDNSConfig configures the dns-01 challenge's DNS provider.
+type ACMEDNSConfig struct {
+	// Provider names the DNS backend. "rfc2136" (TSIG-signed DNS UPDATE) is
+	// the generic one.
+	Provider string        `yaml:"provider,omitempty"`
+	RFC2136  RFC2136Config `yaml:"rfc2136,omitempty"`
+	// PropagationTimeoutSec bounds the wait for the record to be visible on
+	// the provider's server (default 120). PropagationDelaySec is then waited
+	// for secondaries (default 0).
+	PropagationTimeoutSec int `yaml:"propagation_timeout_sec,omitempty"`
+	PropagationDelaySec   int `yaml:"propagation_delay_sec,omitempty"`
+}
+
+// RFC2136Config is a DNS UPDATE target. The TSIG secret is read from
+// tsig_secret_path (base64, the format `tsig-keygen` and BIND key files use)
+// and never stored in this file: the daemon tightens that file to 0600 like
+// every other key on the host, and never logs its contents.
+type RFC2136Config struct {
+	Nameserver     string `yaml:"nameserver,omitempty"`     // host[:port] of the primary; port default 53
+	Zone           string `yaml:"zone,omitempty"`           // zone the _acme-challenge records live in
+	TSIGKeyName    string `yaml:"tsig_key_name,omitempty"`  // TSIG key name
+	TSIGAlgorithm  string `yaml:"tsig_algorithm,omitempty"` // hmac-sha256 (default) | hmac-sha384 | hmac-sha512 | hmac-sha224 | hmac-sha1
+	TSIGSecretPath string `yaml:"tsig_secret_path,omitempty"`
+	TTL            int    `yaml:"ttl,omitempty"`       // record TTL, seconds (default 60)
+	Transport      string `yaml:"transport,omitempty"` // udp (default) | tcp
 }
 
 // Enabled reports whether ACME should run.
 func (a ACMEConfig) Enabled() bool { return a.DirectoryURL != "" && len(a.Domains) > 0 }
 
+// DNS01 reports whether ACME runs with the dns-01 challenge.
+func (a ACMEConfig) DNS01() bool { return a.Enabled() && a.Challenge == "dns-01" }
+
+// validate refuses an ACME block that cannot work, at load time rather than
+// at the first issuance attempt hours later.
+func (a ACMEConfig) validate() error {
+	switch a.Challenge {
+	case "", "http-01":
+		return nil
+	case "dns-01":
+	default:
+		return fmt.Errorf("config acme.challenge: %q is not one of http-01, dns-01", a.Challenge)
+	}
+	if !a.Enabled() {
+		return nil
+	}
+	if a.DNS.Provider != "rfc2136" {
+		return fmt.Errorf("config acme.dns.provider: %q is not a supported provider (rfc2136)", a.DNS.Provider)
+	}
+	r := a.DNS.RFC2136
+	if r.Nameserver == "" || r.Zone == "" || r.TSIGKeyName == "" || r.TSIGSecretPath == "" {
+		return fmt.Errorf("config acme.dns.rfc2136: nameserver, zone, tsig_key_name and tsig_secret_path are all required " +
+			"(an unauthenticated DNS update would let anyone who reaches the server obtain a certificate)")
+	}
+	if _, err := acmedns.TSIGAlgorithm(r.TSIGAlgorithm); err != nil {
+		return fmt.Errorf("config acme.dns.rfc2136.tsig_algorithm: %w", err)
+	}
+	switch r.Transport {
+	case "", "udp", "tcp":
+	default:
+		return fmt.Errorf("config acme.dns.rfc2136.transport: %q is not udp or tcp", r.Transport)
+	}
+	zone := strings.ToLower(strings.TrimSuffix(r.Zone, "."))
+	for _, d := range a.Domains {
+		name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(d, "*."), "."))
+		if name != zone && !strings.HasSuffix(name, "."+zone) {
+			return fmt.Errorf("config acme.domains: %q is not in acme.dns.rfc2136.zone %q, so its "+
+				"_acme-challenge record cannot be published there", d, r.Zone)
+		}
+	}
+	return nil
+}
+
 // NotificationsConfig holds the optional default-webhook shortcut (#5).
 type NotificationsConfig struct {
 	DefaultWebhook string `yaml:"default_webhook,omitempty"`
+}
+
+// SMARTConfig configures the disk SMART monitor. Interval is a Go duration;
+// empty means the default (1h) and "0" or "off" disables the check.
+type SMARTConfig struct {
+	Interval string `yaml:"interval,omitempty"`
 }
 
 // AutoUpgradeConfig controls peer self-upgrade. FromPeer is a pointer so an
@@ -780,6 +931,8 @@ func LoadConfig() (*Config, error) {
 
 		SupersededDiskRetentionDays: 7,
 
+		HostUpdates: HostUpdatesConfig{Enabled: true, IntervalMinutes: 360},
+
 		UpgradeWatchdogEnabled:   true,
 		UpgradeHealthDeadlineSec: 120,
 
@@ -818,6 +971,24 @@ func LoadConfig() (*Config, error) {
 
 	if err := cfg.Containers.validate(); err != nil {
 		return nil, err
+	}
+	if err := cfg.Containers.validateHostAccess(cfg.DataDir, cfg.PKIDir); err != nil {
+		return nil, err
+	}
+
+	if cfg.Migration.Network != "" {
+		n, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Migration.Address != "" {
+			a := net.ParseIP(cfg.Migration.Address)
+			if a == nil || a.To4() == nil || !n.Contains(a) {
+				return nil, fmt.Errorf("migration.address %q is not an IPv4 address inside migration.network %s", cfg.Migration.Address, cfg.Migration.Network)
+			}
+		}
+	} else if cfg.Migration.Address != "" {
+		return nil, fmt.Errorf("migration.address is set without migration.network")
 	}
 
 	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
@@ -862,6 +1033,23 @@ func LoadConfig() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("config vm.default_cpu_mode: invalid mode %q: want %s or %s",
 			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	}
+
+	switch cfg.UITLS {
+	case "", "auto", "on":
+	default:
+		return nil, fmt.Errorf("config ui_tls: %q is not one of auto, on", cfg.UITLS)
+	}
+	if err := cfg.ACME.validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.FileRestore.validate(cfg.Containers); err != nil {
+		return nil, err
+	}
+
+	// A typo'd bandwidth limit must fail load, not silently run unlimited.
+	if _, err := cfg.BackupBandwidthLimits(); err != nil {
+		return nil, err
 	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
@@ -1088,6 +1276,25 @@ type MigrationConfig struct {
 	// such a migration is refused; set true only where the network between hosts
 	// is trusted.
 	AllowUnencryptedStorage bool `yaml:"allow_unencrypted_storage,omitempty"`
+	// Network is a dedicated migration network, an IPv4 CIDR like
+	// "10.20.0.0/24". A migration this node sends then moves its data (guest
+	// memory, and the disk blocks of a storage copy) to the target's address in
+	// that network instead of the address the host is dialed on, as Proxmox's
+	// `migration: network=` does. The control connection and the certificate
+	// checks stay on the cluster address. A target with no address there, or
+	// one that cannot answer, is moved over the cluster address with a
+	// warning. Default empty: the cluster address.
+	Network string `yaml:"network,omitempty"`
+	// Address is this host's own address in Network, answered to a source that
+	// asks for it, instead of the one chosen among the host's addresses there.
+	// Set it where the host holds more than one address in the network, or a
+	// floating one a plain choice could pick. It must be inside Network.
+	Address string `yaml:"address,omitempty"`
+	// AllowAnyNetwork accepts a Network that is not inside a private (RFC 1918)
+	// range, or that contains this host's cluster or default-route address.
+	// Default false: such a network would send migration data out the uplink
+	// or the cluster interface, and the daemon refuses to start with one.
+	AllowAnyNetwork bool `yaml:"allow_any_network,omitempty"`
 }
 
 type CapacityConfig struct {
@@ -1143,4 +1350,206 @@ func orDefault[T interface{ ~int | ~float64 }](v, d T) T {
 		return d
 	}
 	return v
+}
+
+// hostAccess is what this host lets containers reach, with litevirt's own
+// directories protected.
+func (c ContainersConfig) hostAccess(dataDir, pkiDir string) lxc.HostAccess {
+	exe, _ := os.Executable()
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+	return lxc.HostAccess{
+		MountPaths:  c.BindMountPaths,
+		DevicePaths: c.DevicePaths,
+		Deny:        []string{dataDir, pkiDir},
+		HookBinary:  exe,
+	}
+}
+
+// BackupBandwidthLimits parses backup_bwlimits into bytes per second per repo
+// name. Zero entries are dropped (no limit).
+func (c *Config) BackupBandwidthLimits() (map[string]int64, error) {
+	out := make(map[string]int64, len(c.BackupBWLimits))
+	for name, v := range c.BackupBWLimits {
+		bps, err := pbsstore.ParseRate(v)
+		if err != nil {
+			return nil, fmt.Errorf("config backup_bwlimits.%s: %w", name, err)
+		}
+		if bps > 0 {
+			out[name] = bps
+		}
+	}
+	return out, nil
+}
+
+// FileRestoreConfig is the `file_restore:` block. Every field is optional;
+// the defaults boot this host's own kernel.
+type FileRestoreConfig struct {
+	// Enabled turns single-file restore off when false (default on). Off,
+	// the RPCs refuse; a full restore is unaffected either way.
+	Enabled *bool `yaml:"enabled,omitempty"`
+	// Kernel the restore VM boots (default /boot/vmlinuz-<running release>).
+	Kernel string `yaml:"kernel,omitempty"`
+	// ModulesDir holds that kernel's modules (default
+	// /lib/modules/<running release>).
+	ModulesDir string `yaml:"modules_dir,omitempty"`
+	// QEMU is the system emulator (default: qemu-system-x86_64 /
+	// qemu-system-aarch64 on PATH, or /usr/libexec/qemu-kvm).
+	QEMU string `yaml:"qemu,omitempty"`
+	// MemoryMiB is the restore VM's memory (default 512, minimum 256).
+	MemoryMiB int `yaml:"memory_mib,omitempty"`
+	// RunAs is the restore account (default litevirt-restore, created at
+	// daemon start): a system account whose group reads the restore VM's
+	// boot files. qemu is not started as it: each restore VM runs as its own
+	// uid from uid_base, with that group and its own slot group (KVM by an
+	// ACL group entry on /dev/kvm for the slot group). root, libvirt-qemu, qemu and nobody are refused unless
+	// allow_shared_run_as, which then runs qemu as that user itself.
+	RunAs string `yaml:"run_as,omitempty"`
+	// IdleTimeoutSec kills a browsing session's restore VM after this long
+	// unused (default 300).
+	IdleTimeoutSec int `yaml:"idle_timeout_sec,omitempty"`
+	// MaxSessions caps restore VMs running at once on this host (default 2).
+	MaxSessions int `yaml:"max_sessions,omitempty"`
+	// MaxExtractions caps extractions running at once on this host
+	// (default 1); each also takes a session.
+	MaxExtractions int `yaml:"max_extractions,omitempty"`
+	// AllowUnsandboxed names the restore VM barriers file restore may run
+	// without: a list of seccomp (qemu's seccomp sandbox), mac (both the
+	// AppArmor profile and Landlock: AppArmor on but apparmor_parser missing,
+	// or a host with neither) and root (a non-root daemon) — or true for all
+	// three. DANGEROUS: each removes a barrier between a malicious backup and
+	// the host. Default none: file restore is then refused.
+	AllowUnsandboxed UnsandboxedBarriers `yaml:"allow_unsandboxed,omitempty"`
+	// AllowSharedRunAs permits run_as to be root or a shared qemu user
+	// (libvirt-qemu, qemu, nobody). DANGEROUS. Default false.
+	AllowSharedRunAs bool `yaml:"allow_shared_run_as,omitempty"`
+	// UIDBase is the first of the 64 uids reserved for restore VMs, one per
+	// session (default 3800000000). They must belong to no account.
+	UIDBase uint32 `yaml:"uid_base,omitempty"`
+	// MaxExtractBytes caps one extraction ("16G" default).
+	MaxExtractBytes string `yaml:"max_extract_bytes,omitempty"`
+}
+
+// On reports whether file restore is enabled (default on).
+func (f FileRestoreConfig) On() bool { return f.Enabled == nil || *f.Enabled }
+
+// UnsandboxedBarriers is file_restore.allow_unsandboxed: false, true (every
+// barrier), or a list of the barriers allowed away — seccomp, mac, root — so
+// an operator who needs one does not lift all three.
+type UnsandboxedBarriers struct{ Seccomp, MAC, Root bool }
+
+// UnmarshalYAML accepts a bool or a list of barrier names.
+func (u *UnsandboxedBarriers) UnmarshalYAML(n *yaml.Node) error {
+	const want = "want true, false or a list of seccomp, mac and root"
+	if n.Kind == yaml.ScalarNode {
+		var b bool
+		if err := n.Decode(&b); err != nil {
+			return fmt.Errorf("config file_restore.allow_unsandboxed: %q: %s", n.Value, want)
+		}
+		*u = UnsandboxedBarriers{b, b, b}
+		return nil
+	}
+	var names []string
+	if err := n.Decode(&names); err != nil {
+		return fmt.Errorf("config file_restore.allow_unsandboxed: %s", want)
+	}
+	*u = UnsandboxedBarriers{}
+	for _, name := range names {
+		switch name {
+		case "seccomp":
+			u.Seccomp = true
+		case "mac":
+			u.MAC = true
+		case "root":
+			u.Root = true
+		default:
+			return fmt.Errorf("config file_restore.allow_unsandboxed: unknown barrier %q: %s", name, want)
+		}
+	}
+	return nil
+}
+
+// MarshalYAML writes the list form (false when empty).
+func (u UnsandboxedBarriers) MarshalYAML() (any, error) {
+	if names := u.Names(); len(names) > 0 {
+		return names, nil
+	}
+	return false, nil
+}
+
+// IsZero lets omitempty drop an empty set.
+func (u UnsandboxedBarriers) IsZero() bool { return u == UnsandboxedBarriers{} }
+
+// Names lists the barriers allowed away.
+func (u UnsandboxedBarriers) Names() []string {
+	var out []string
+	if u.Seccomp {
+		out = append(out, "seccomp")
+	}
+	if u.MAC {
+		out = append(out, "mac")
+	}
+	if u.Root {
+		out = append(out, "root")
+	}
+	return out
+}
+
+// ReducedBarrierKeys names the keys set that let a restore VM run with
+// fewer barriers ("allow_unsandboxed: [seccomp]", "allow_shared_run_as");
+// none while file restore is off. The host raises file_restore_unsandboxed
+// while any is set.
+func (f FileRestoreConfig) ReducedBarrierKeys() []string {
+	if !f.On() {
+		return nil
+	}
+	var keys []string
+	if names := f.AllowUnsandboxed.Names(); len(names) > 0 {
+		keys = append(keys, "allow_unsandboxed: ["+strings.Join(names, ", ")+"]")
+	}
+	if f.AllowSharedRunAs {
+		keys = append(keys, "allow_shared_run_as")
+	}
+	return keys
+}
+
+// ContainerIDRange is the host id range unprivileged containers are mapped
+// into, [start, end).
+func (c ContainersConfig) ContainerIDRange() [2]uint64 {
+	if c.IDMapBase <= 0 || c.IDMapRanges <= 0 {
+		return [2]uint64{}
+	}
+	return [2]uint64{uint64(c.IDMapBase), uint64(c.IDMapBase) + uint64(c.IDMapRanges)*65536}
+}
+
+// ExtractLimit is MaxExtractBytes in bytes (0 = the default).
+func (f FileRestoreConfig) ExtractLimit() int64 {
+	n, _ := pbsstore.ParseSize(f.MaxExtractBytes)
+	return n
+}
+
+func (f FileRestoreConfig) validate(containers ContainersConfig) error {
+	if f.MemoryMiB != 0 && f.MemoryMiB < 256 {
+		return fmt.Errorf("config file_restore.memory_mib %d: the restore VM needs at least 256", f.MemoryMiB)
+	}
+	if f.IdleTimeoutSec < 0 || f.MaxSessions < 0 || f.MaxExtractions < 0 {
+		return fmt.Errorf("config file_restore: idle_timeout_sec, max_sessions and max_extractions cannot be negative")
+	}
+	if _, err := pbsstore.ParseSize(f.MaxExtractBytes); err != nil {
+		return fmt.Errorf("config file_restore.max_extract_bytes: %w", err)
+	}
+	if f.UIDBase != 0 && (f.UIDBase < 65536 || uint64(f.UIDBase)+64 > 4294967294) {
+		return fmt.Errorf("config file_restore.uid_base %d: want 65536..%d (64 uids are reserved from it)", f.UIDBase, uint64(4294967294-64))
+	}
+	// Both are this node's config: an explicit uid_base inside the
+	// containers' range is refused here. (With the default base the daemon
+	// starts, and file restore refuses, naming the overlap.)
+	if r := containers.ContainerIDRange(); f.On() && f.UIDBase != 0 && r[1] > r[0] &&
+		uint64(f.UIDBase) < r[1] && r[0] < uint64(f.UIDBase)+64 {
+		return fmt.Errorf("config file_restore.uid_base %d: its 64 uids overlap the containers' id-map range %d..%d "+
+			"(containers.idmap_base + idmap_ranges*65536); a container process would share a restore VM's uid — move one of them",
+			f.UIDBase, r[0], r[1]-1)
+	}
+	return nil
 }

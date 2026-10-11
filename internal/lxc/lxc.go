@@ -18,6 +18,7 @@
 package lxc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -199,6 +200,11 @@ type CreateOpts struct {
 	IDMap *IDMap
 	// PidsMax is written as lxc.cgroup2.pids.max when positive.
 	PidsMax int
+	// Mounts and Devices are host paths passed into the container. Create
+	// judges them against the runner's HostAccess on this host (mounts.go);
+	// the caller has already required the admin role.
+	Mounts  []Mount
+	Devices []Device
 }
 
 // Validate checks cross-field invariants before any shell-out.
@@ -244,6 +250,11 @@ type LxcRunner struct {
 	cgPathMu    sync.Mutex
 	cgPathCache map[string]string
 
+	// hostAccessMu guards hostAccessLocks, one lock per container name under
+	// which its host-access record, config block and hook policy change.
+	hostAccessMu    sync.Mutex
+	hostAccessLocks map[string]*sync.Mutex
+
 	// DefaultPidsMax is the pids.max a container whose config sets none gets
 	// at its next start (prepareStart). 0 adds none.
 	DefaultPidsMax int
@@ -254,6 +265,10 @@ type LxcRunner struct {
 	// SubIDSpan is the whole id span containers are allocated from; root's
 	// subordinate range is added for all of it at once (ensureRootSubIDs).
 	SubIDSpan *IDMap
+
+	// HostAccess is what this host lets containers reach: the prefixes host
+	// bind mounts and device nodes must resolve under. Empty allows none.
+	HostAccess HostAccess
 
 	probeOnce     sync.Once
 	probeIDMapped bool
@@ -311,6 +326,13 @@ func (r *LxcRunner) Create(ctx context.Context, opts CreateOpts) (*Container, er
 	}
 	if opts.PidsMax == 0 {
 		opts.PidsMax = r.DefaultPidsMax
+	}
+	// Host mounts and devices are judged before anything is created, so a
+	// refusal leaves nothing behind.
+	if len(opts.Mounts) > 0 || len(opts.Devices) > 0 {
+		if _, _, err := ResolveHostAccess(opts.Mounts, opts.Devices, r.hostAccess()); err != nil {
+			return nil, fmt.Errorf("container %q: %w", opts.Name, err)
+		}
 	}
 	if opts.Template != "download" {
 		rootfs, ok, err := resolveRootfs(opts.Template)
@@ -698,8 +720,32 @@ func (r *LxcRunner) ExportContainer(ctx context.Context, name string, w io.Write
 	// --xattrs with every attribute and --acls keep file capabilities, ACLs
 	// and labels; setuid/setgid/sticky are in the mode. ImportContainer
 	// restores all of it (safename.ExtractRootfsTar).
-	cmd := exec.CommandContext(ctx, "tar", "-C", r.lxcpath(), "--numeric-owner",
-		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-", name)
+	// The member order is the names' order, not the directory's (an ext4
+	// htree order differs per filesystem), and the pax headers --xattrs
+	// selects carry no atime or ctime: a restore keeps a member's mtime
+	// (safename.ExtractRootfsTar) but can never keep its ctime, and a read
+	// moves its atime. Two archives of the same tree, before and after a move,
+	// are then the same bytes, which is what lets a replica send only the
+	// content-defined chunks that changed. GNU tar sorts with --sort=name from
+	// 1.28; an older one is handed the same order as a list instead, so an
+	// export never fails where it did not before.
+	args := []string{"-C", r.lxcpath(), "--numeric-owner",
+		"--pax-option=delete=atime,delete=ctime",
+		"--xattrs", "--xattrs-include=*", "--acls", "-cf", "-"}
+	var list []byte
+	if tarSortsByName() {
+		args = append(args, "--sort=name", name)
+	} else {
+		var err error
+		if list, err = sortedMemberList(r.lxcpath(), name); err != nil {
+			return fmt.Errorf("tar export %s: list members: %w", name, err)
+		}
+		args = append(args, "--no-recursion", "--null", "--files-from=-")
+	}
+	cmd := exec.CommandContext(ctx, "tar", args...)
+	if list != nil {
+		cmd.Stdin = bytes.NewReader(list)
+	}
 	stderr := strings.Builder{}
 	cmd.Stderr = stringWriter{&stderr}
 	cmd.Stdout = w
@@ -793,6 +839,14 @@ func (r *LxcRunner) importContainerMarked(ctx context.Context, name string, src 
 	}
 	staged := filepath.Join(staging, name)
 	if err := rewriteRootFSPathAt(staged, filepath.Join(dir, "rootfs")); err != nil {
+		return err
+	}
+	// The archive is untrusted: its config keeps only what litevirt itself
+	// writes (no mounts, hooks, foreign includes, device rules or confinement
+	// overrides), and its authorized host-access record is not an
+	// authorization here. The caller renders security and host access again
+	// from the authorized spec (RebuildConfig).
+	if err := SanitizeImportedDir(staged); err != nil {
 		return err
 	}
 	if b, rerr := os.ReadFile(filepath.Join(staged, "config")); rerr == nil {
@@ -1158,6 +1212,13 @@ func (r *LxcRunner) finalizeContainerConfig(opts CreateOpts) error {
 	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
 		return err
 	}
+	// Host mounts and devices, recorded as authorized and rendered (the
+	// caller required the admin role; Create judged them already).
+	if len(opts.Mounts) > 0 || len(opts.Devices) > 0 {
+		if err := r.SetHostAccess(opts.Name, opts.Mounts, opts.Devices); err != nil {
+			return err
+		}
+	}
 	// When a static IP is requested, configure the guest's own networking too —
 	// otherwise the stock image's boot-time DHCP client flushes the address LXC
 	// assigned via lxc.net.*.ipv4.address.
@@ -1485,4 +1546,80 @@ func securityDiffers(sec Security, to ConvertOpts) bool {
 		return true
 	}
 	return to.Confinement != "" && to.Confinement != sec.Confinement
+}
+
+// tarSortsByName reports whether this host's tar is GNU tar 1.28 or later,
+// which has --sort=name. Asked once.
+var tarSortsByName = sync.OnceValue(func() bool {
+	out, err := exec.Command("tar", "--version").Output()
+	return err == nil && gnuTarAtLeast(string(out), 1, 28)
+})
+
+// gnuTarAtLeast parses `tar --version` ("tar (GNU tar) 1.34") and reports
+// whether it is GNU tar major.minor or later.
+func gnuTarAtLeast(version string, major, minor int) bool {
+	first, _, _ := strings.Cut(version, "\n")
+	if !strings.Contains(first, "GNU tar") {
+		return false
+	}
+	f := strings.Fields(first)
+	parts := strings.Split(f[len(f)-1], ".")
+	if len(parts) < 2 {
+		return false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
+}
+
+// sortedMemberList is every path under <lxcpath>/<name>, the directory itself
+// first, relative to lxcpath, NUL-separated, in the order GNU tar's
+// --sort=name archives them (each directory's entries by name, depth first).
+func sortedMemberList(lxcpath, name string) ([]byte, error) {
+	var buf bytes.Buffer
+	err := filepath.WalkDir(filepath.Join(lxcpath, name), func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(lxcpath, p)
+		if rerr != nil {
+			return rerr
+		}
+		buf.WriteString(rel)
+		buf.WriteByte(0)
+		return nil
+	})
+	return buf.Bytes(), err
+}
+
+// SanitizeImportedDir strips an imported container directory's config to
+// what an imported config may keep and removes its host-access record.
+func SanitizeImportedDir(dir string) error {
+	cfgPath := filepath.Join(dir, "config")
+	b, err := os.ReadFile(cfgPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		b = nil // nothing to sanitize; the record still goes
+	} else if err != nil {
+		return fmt.Errorf("read imported config: %w", err)
+	}
+	if b == nil {
+		if err := os.Remove(filepath.Join(dir, hostAccessFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	clean, dropped := sanitizeConfig(string(b), true)
+	if len(dropped) > 0 {
+		slog.Warn("container import: dropped config lines an imported container may not carry", "dir", filepath.Base(dir), "keys", dropped)
+	}
+	if err := os.WriteFile(cfgPath, []byte(clean), 0o644); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(dir, hostAccessFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }

@@ -101,6 +101,9 @@ func PushFromSource(
 		if rerr != nil && rerr != io.EOF {
 			return nil, fmt.Errorf("read source at offset %d: %w", off, rerr)
 		}
+		if err := opts.waitRate(ctx, n); err != nil {
+			return nil, err
+		}
 		chunk := append([]byte(nil), buf[:n]...)
 		id, created, perr := repo.PutChunk(chunk)
 		if perr != nil {

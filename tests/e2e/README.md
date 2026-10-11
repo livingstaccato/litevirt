@@ -56,7 +56,10 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 | `E2E_HOSTS` | (auto-detected) | Comma-separated host names |
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |
 | `E2E_REST_TOKEN` | (skip REST tests) | API token for REST tests |
+| `LV_E2E_DR_REPO` | (skip container replication test) | A backup repo name the second host has in `backup_repos`, initialised, to hold container replicas (`container_replication_test.go`). |
 | `E2E_SKIP_SLOW` | `0` | Set to `1` to skip migration/backup tests |
+| `E2E_CERT_RENEW` | `0` | Set to `1` to run `TestCert_RenewHostCertificateInPlace`: renews a peer's cluster certificate with `lv host renew-cert` (revoking the old one) and checks gRPC (7443) and libvirt (16514) present the successor and the host stays active. Run on the machine holding the cluster CA key |
+| `E2E_UI_CERT` | `0` | Set to `1` to run `TestCert_UICertificateSetAndClear`: installs a custom UI certificate on this node, checks 127.0.0.1:7445 serves it without a restart, then clears it |
 
 ## Test phases
 
@@ -146,6 +149,7 @@ drive a local `lv`).
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
+| `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `E2E_GUEST_USER` / `E2E_GUEST_PASSWORD` | `cirros` / `gocubsgo` | login the firewall traffic case (`TestFirewall_TrafficBetweenVMs`) uses inside its guests, over SSH through the host node |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
 

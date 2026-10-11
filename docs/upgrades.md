@@ -118,6 +118,26 @@ Use this only when you understand the risk — for example, you've
 
 ---
 
+## First start after upgrading to a build with file restore
+
+The first start of a build with single-file restore (and file restore not
+disabled) creates the `litevirt-restore` system account, loads the
+`litevirt-restore-qemu` AppArmor profile where AppArmor is enabled, creates
+`/var/cache/litevirt-restore` and `/run/litevirt/file-restore`, and removes
+`/var/lib/litevirt/file-restore/cache` left by an earlier build. To avoid the
+account being created by the daemon, create it beforehand
+([installation.md](installation.md#what-file-restore-changes-on-the-host)); to
+avoid all of it, set `file_restore: {enabled: false}` before upgrading.
+
+Every start also kills any process running as one of the uids reserved for
+restore VMs (`file_restore.uid_base`, 64 uids from 3800000000) — but only
+after checking that range is no one else's: not the containers' id-map range,
+no `/etc/subuid` or `/etc/subgid` range, no account `getent passwd` knows.
+If you moved `containers.idmap_base` high enough that its range covers the
+reserved uids, an explicit `file_restore.uid_base` inside it refuses to load
+the config; with the default, the daemon starts and file restore is refused,
+naming the overlap — move `file_restore.uid_base`.
+
 ## How a normal upgrade flows
 
 ```
@@ -557,7 +577,14 @@ guards are on by default for every new NIC, so they are their own feature,
 security-group and firewall rules are `firewall_ipv6`, used only once someone
 writes one. `usb_mounts_memory` is one bit for VM USB devices, VM memory
 hot-add and container host mounts and devices: any one of them in use makes a
-rollback below the release quarantine.
+rollback below the release quarantine. `login_policy` is used by default too:
+account disable and expiry, the second-factor policy and enrollment codes are
+written on request, but the same feature carries what the login rules write
+on their own — a directory account's identity binding at its first login, the
+second factor a login presented, and the credential cut-offs a user create or
+delete writes — so it is used from the first such login, create or delete
+after the latch. Logins, creates and deletes are never refused for it: until
+the feature opens they run as on the previous release.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -620,6 +647,39 @@ uses and the startup probation included, as before (see
 [configuration.md](configuration.md)). A use that arrives by replication after
 startup still quarantines the node at run time; that ends with an upgrade back
 to a build that knows the token, a reseed, or a restart with the override set.
+
+---
+
+## Pending OS updates
+
+litevirt does not patch a host's operating system, but it tells you which hosts
+are behind. Each daemon asks the host's package manager what its cached index
+says is upgradable (`apt list --upgradable`, or `dnf check-update` plus
+`dnf updateinfo list --security`), every `host_updates.interval_minutes`
+(default 360), and installs nothing. By default it does not refresh the index
+either: that is a network call and takes the apt lock, so it runs only with
+`host_updates.refresh_index: true`; without it the report is as fresh as the
+host's own refresh timer (`apt-daily.timer`, `dnf-makecache.timer`).
+
+The result is published three ways:
+
+- `lv host ls` shows an `UPDATES` column (`-` not reported or no apt/dnf, `?`
+  the last check failed, `0`, `5`, or `5 (2 security)`), and `lv host inspect
+  <host>` prints a note and carries the counts in its labels
+  (`litevirt.os-updates`, `litevirt.os-security-updates`).
+- The `litevirt_host_pending_updates{host,kind}` gauge (`kind` is `all` or
+  `security`), emitted for every host that has reported. A host whose last check
+  failed emits nothing rather than a zero that reads as fully patched.
+- A `host.security_updates` (warn) notification when the host has security
+  updates pending, or `host.updates` (info) when only other updates are, sent
+  when the counts change. A daemon restart does not repeat a notification the
+  published counts already cover. Route them with `lv notify route add
+  --pattern 'host.*' --target <target-id>`.
+
+A security update is one offered from a security suite (`*-security` on
+apt) or listed by `dnf updateinfo --security`. Patch the host with its own
+package manager; drain it first (`lv host drain`) when the update needs a
+reboot. A release check for litevirt itself is not part of this.
 
 ---
 
@@ -748,11 +808,11 @@ refuses the rotation's public-row half, so it holds the OLD password on a NEWER
 public row. A rule that preferred the newer row would serve the rotated-out
 password, and the pass would copy it over the credential row.
 
-This is the dual-write step of a column move, and the release stops there.
-Every old column still holds the current secret, so the public rows, and the
-operator-safe state dump built from them, **still carry the secrets in this
-release**. Clearing the old columns is a later release's step, behind a second
-mandatory, replication-gated token (see
+This is the dual-write step of a column move. Every old column still holds
+the current secret, so the public rows, and the operator-safe state dump built
+from them, **still carry the secrets until the second step below**: clearing
+the old columns, behind a second mandatory, replication-gated token (see
+[The old secret columns are emptied](#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 
 Latches form per host, so for a few seconds after one host latches its
@@ -803,6 +863,99 @@ Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pendin
 is set, as it is for every mandatory token mid-roll. If it stays set after the
 roll, a host is still on the previous release — most often one in
 `maintenance`.
+
+### The old secret columns are emptied
+
+The second step of the move takes the secrets out of the public rows. It
+starts **on its own, after every host runs a build carrying the
+`credentials_clear_v1` capability token**; no flag starts it, and none stops
+it. The token is mandatory and replication-gated, like `credentials_split_v1`:
+it latches only once every memberlist member advertises it, a host parked in
+`maintenance` included, so no host that still reads only the old columns ever
+receives a clear. A host advertises it only after it has completed its first
+credentials split pass, so no old column anywhere is cleared before every
+host has a credential row for every secret it holds.
+
+Once it has latched on a host (and `credentials_split_v1` has too):
+
+- every writer writes the secret to the credential table and an empty value
+  to the old column, in the same statements as before;
+- the pass that runs at start and every minute empties every old column that
+  still holds a value — a deleted user's hash, a revoked token's hash and a
+  removed host's BMC password included. Each clear goes out in one replicated
+  batch with the credential row it hands over to, credential row first;
+- each clear is stamped just after the public row's own `updated_at`, not
+  with the current time, so a revoke or delete a peer made just before the
+  clear, still in flight, still wins when it arrives;
+- password, token and IPMI readers do not change: they already take the
+  credential row whenever one exists;
+- an LDAP or OIDC login under a name that already has a users row reads the
+  credential row to decide whether that row is a local account, because an
+  empty `password_hash` no longer means "no local password". A host that has
+  received the account's users row but not yet its credential row (the two
+  are repaired separately) refuses that login with "its credential has not
+  reached this node yet" until it has, rather than guess. An external user
+  that existed before `credentials_split_v1` latched is given an empty
+  credential row by the first split pass of the hosts that held it before the
+  clear, so it keeps logging in. A host added after the clear refuses such a
+  login until that credential row has reached it, usually within one
+  anti-entropy cycle.
+
+From then on no public row, and no operator-safe state dump, carries a
+password hash, an API token hash or an IPMI password. `lv user reset-admin`
+follows the same latch when it writes the local database directly.
+
+A host's latch forms a few seconds before or after its neighbours'. A host
+that has not latched yet still writes secrets to both places; the next pass
+on a latched host empties that old column again.
+
+**Rollback.** One build back — to the build that dual-writes — is the
+supported rollback. That binary enters WAL quarantine like any rollback below
+a latched token, and it still validates tokens, checks passwords and fences,
+because it reads the credential row whenever one exists and the credential
+rows hold every secret. Upgrading it again loses nothing. **A rollback two
+builds back, to a build before `credentials_split_v1`, is unsupported once
+`credentials_clear_v1` has latched**: that build reads only the old columns,
+which are empty, so it has no IPMI password, password hash or token hash to
+read. The startup rollback preflight refuses such a binary only if it carries
+the preflight.
+
+A host rolled back one build also loses one safeguard: that build recognises a
+re-minted admin account's credential (colonelpanik/litevirt#224) only by the
+hash on the refused users row, which is empty once the re-minting host has
+cleared. Under WAL quarantine it still merges anti-entropy, so during a
+re-mint incident it can take the re-minted credential. Resolve the re-mint
+(`lv user reset-admin` on the host you trust) before rolling a host back.
+
+**A host that was switched off across the latch.** The latch is confirmed
+against hosts that are in the cluster's membership at the time. A host that
+was off throughout is not asked, and if it runs a build before
+`credentials_split_v1` it holds no marker for either token, so the rollback
+preflight does not stop it either. Back online on that build, it reads only
+the old columns, which are now empty: it cannot fence by IPMI and its logins
+fail. Do not bring it back with its old data. The safe path is to remove it
+and add it again as a fresh host: `lv host rm <host>` from a running host,
+wipe its data directory, then `lv host add` it on this build, so it joins
+with an empty database and takes every row, credential rows included, from
+the cluster. (Bringing it back on the dual-write build reads empty secrets;
+bringing it back with its old database on this build is safe for logins —
+evidence that a user is external is kept per user and bound to that user's
+row as it stood, including its last write, so a local account cleared since,
+or a name deleted and created again since, is never taken for one; such a
+login is refused until the account's credential arrives — but it holds stale
+state for everything else until anti-entropy has caught up.)
+
+**External users after the roll.** An LDAP or OIDC user created before
+`credentials_split_v1` latched has no credential row until a host that held it
+then runs its first split pass on this build. If no such host does — for
+example, the old hosts were replaced by new ones instead of being upgraded in
+place — logins under that name are refused with `FailedPrecondition` until an
+administrator runs `lv user mark-external <username>` (docs/auth.md). Upgrade
+at least one existing host in place before retiring the rest to avoid it.
+
+Until the token latches,
+`litevirt_ha_degraded{reason="capability_rollout_pending"}` is set, as for
+every mandatory token mid-roll.
 
 ### Host state moves to its own row after the roll
 
@@ -888,7 +1041,66 @@ writes until it is upgraded again or reseeded, and it cannot decode the
 `host_membership` statements that latched peers keep sending. Upgrading it
 again loses nothing. Roll forward.
 
-Retiring the `hosts` copy is a later release's step, behind a second token; see
+### The `hosts` copy of host state is retired
+
+The second step stops writing the `hosts` copy. It starts **on its own, after
+every host runs a build carrying the `host_membership_retire_v1` capability
+token**; no flag starts or stops it. The token is mandatory and
+replication-gated: it latches only once every memberlist member advertises
+it, a host in `maintenance` included, so no host that reads state only from
+`hosts` stops seeing fences and drains.
+
+Once it has latched on a host that is writing `host_membership`, a state
+change, a fence, an isolation and the clearing of an isolation write
+`host_membership` alone. They no longer move the `hosts` row's `updated_at`,
+so they cannot cost a concurrent version or resource report on any replica.
+The `hosts` columns are left as they are, never cleared (`hosts.state` is
+`NOT NULL`), and they stop following. Adding a host, re-admitting one and a
+host's boot report still write `hosts.state` in their existing statements,
+because those statements write the rest of the row anyway.
+
+Readers change in two ways, both so that the frozen copy is never taken as
+current:
+
+- every host reads its state and isolation from its `host_membership` row
+  whenever one exists, including a host whose own `host_membership_split_v1`
+  latch has not formed yet;
+- on a host that has latched `host_membership_retire_v1`, a host with no
+  `host_membership` row reads as `unknown`: not `active`, so nothing is
+  placed on it, but still counted in every quorum's denominator. The split
+  pass no longer fills such a row from the `hosts` copy there, and a
+  hosts-only write fills one only when it carries the whole row (adding the
+  host) or both state and isolation; a state change made on that host writes
+  only to an existing row. The row arrives from its peers by replication or
+  anti-entropy. Until it does, the failover coordinator on that host neither
+  fences nor recovers such a host (it logs the skip), and the host never
+  counts as a live voter there unless it is a member of an adopted voter
+  generation.
+
+Before the retire latch, a split pass that fills a missing `host_membership`
+row from the `hosts` copy stamps it decades in the past, so it fills an
+absence and never replaces a newer fence or drain.
+
+A host whose own `host_membership_split_v1` latch has not formed yet still
+writes `hosts` alone, and every latched host still takes such a write into
+its `host_membership` row as described above.
+
+**Rollback.** One build back, to the build that dual-writes, is supported: it
+enters WAL quarantine and reads state and isolation from `host_membership`
+once it has completed a split pass. Until then that build reads the `hosts`
+copy, which no longer follows, so a fence or drain made after the retire
+latch is invisible to it for that first pass interval (about 10 seconds).
+**A rollback two builds back, below `host_membership_split_v1`, is
+unsupported once `host_membership_retire_v1` has latched**: that build reads
+`hosts.state` only, and it no longer follows.
+
+**A host that was switched off across the latch.** The latch is confirmed
+against hosts in the cluster's membership at the time; a host that was off
+throughout is not asked. If it runs a build before
+`host_membership_split_v1` it holds no marker for the token, the rollback
+preflight does not stop it, and back online it reads `hosts.state`, which no
+longer follows: it can count a fenced host as active. Upgrade such a host to
+at least the dual-write build before you power it on again. See
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
 ### An unverified fence records `offline` after the roll
@@ -1000,6 +1212,31 @@ release. Nothing is written to the table before then, and the scope stays
 `lv cluster failover-scope cluster` is the stand-down. A binary rolled back
 below the latched token enters WAL quarantine, as below every latched token.
 Roll forward.
+
+### Health-aware relays need every host upgraded
+
+This release lets the failover lease holder demote a host whose probes keep
+failing from relay duty, by writing a `relay_demoted/<host>` row in
+`cluster_policies` (colonelpanik/litevirt#175;
+[operating-model.md](operating-model.md#replication)). A host on the previous
+release decodes that row but ignores it, so it would keep the demoted host as
+a relay while every upgraded host dropped it — two relay sets in one cluster.
+So nothing is demoted until the `relay_health_v1` capability token has
+latched, which it does on its own once every host the cluster replicates to —
+including one parked in `maintenance` — runs this release, and until
+`failover_scope_v1` has latched too. Until then relays are chosen exactly as
+before.
+
+`relay_health_v1` is mandatory and replication-gated, like
+`failover_scope_v1`, with no flag: a flag would let one node elect a different
+relay set from its peers. A demotion withholds the relay role only, and a host
+is restored on its own after 10 minutes below the demotion bar. The
+state is listed by `lv cluster relay-restore` with no argument, and the
+stand-down is `lv cluster relay-restore <host> [--hold <duration>]` (admin):
+it clears the demotion at once for the whole cluster and, with a hold, keeps
+the lease holder from demoting the host again until the hold runs out. A
+binary rolled back below the latched token enters WAL quarantine, as below
+every latched token. Roll forward.
 
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 
@@ -1117,6 +1354,54 @@ majority from its peers. `lv cluster voter reset` is the decided exit back to
 the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
+
+### Account lifecycle and the second-factor policy latch after the roll
+
+Schema v64 adds `user_lifecycle`, one row per (account, attribute) holding an
+account's `disabled` flag and `expires_at`. Nothing writes it, and nothing
+writes the `login_2fa_required` second-factor policy row, until the release
+feature `login_policy` opens (the release token `release_2026_11_v1` has
+latched; see "Rolling back after a release token latched") — so `lv user
+disable`, `lv user enable`, `lv user expire`, `lv user unbind`, `lv 2fa
+enroll-code` and setting `lv 2fa policy` are refused with `FailedPrecondition`
+(`the cluster upgrade must finish first (login_policy needs
+release_2026_11_v1)`) until every host (every host in `maintenance` included)
+runs this release. A previous-release host would neither decode the rows nor
+enforce them; it has no statement that touches the table, so it cannot undo a
+disable either. Delegated administration (`perm.modify`) needs no token: it
+writes the existing `role_bindings` shape, and its rules are enforced where a
+grant is created. It needs an **explicit** `perm.modify` (or `perm.*`) grant:
+an existing `Admin` (`*`) binding on a project does **not** gain the right to
+grant or revoke roles there. To see who holds delegation:
+`lv role ls --role PermissionAdmin`.
+
+**LDAP logins this release refuses.** The typed name must now literally be
+the login value of the one entry the search finds (docs/auth.md,
+`user_login_attr`). Check the realm config before the roll; these setups that
+logged in before are refused after it:
+- a `user_filter` with `%s` inside a longer value, such as
+  `(userPrincipalName=%s@corp.example)`, and no `user_login_attr`: no
+  attribute value equals the typed name. Set `user_login_attr` (for example
+  `sAMAccountName`) or match a whole attribute (`(uid=%s)`);
+- a `user_filter` with no `%s` at all (`(objectClass=person)`): every login is
+  refused. Use `(&(objectClass=person)(uid=%s))`;
+- a service account that cannot read the matched attribute (or
+  `user_login_attr`): grant it read access;
+- a typed name that differs from the stored one by more than ASCII case and
+  surrounding spaces (non-ASCII case, NFD, width or accent variants): users
+  type their name as stored.
+A search that finds two entries for one name is refused too. Each LDAP or
+OIDC account is bound to its directory entry at its first login after the
+`login_policy` feature opens.
+
+v64 also adds `session_factors` (what each session's login presented) and
+`user_enrollment_codes` (hashed first-enrollment codes), written under the
+same feature. A host below the release does not enforce any of it: it
+accepts a disabled account's sessions and API tokens and does not confine
+password-only sessions. Keep such a host out of the client path until it is
+upgraded (docs/auth.md, "Rolling upgrade, and hosts below the latch"). From
+this release on, a host in WAL quarantine refuses every user credential and
+serves only local-root and peer mTLS.
 
 ### Recovery claims latch after the roll
 
@@ -1368,3 +1653,21 @@ The whole regime is gated on `isolation_epoch_v1`
 (`enforcement.isolation_epoch`, default off). A pre-latch cluster does none of
 this, so it can be rolled out incrementally — enable the
 flag fleet-uniformly, since the token latches only under config uniformity.
+
+## Email notification targets during a rolling upgrade
+
+Email notification targets (see [notifications.md](notifications.md)) are new in
+this release. Two effects while the fleet is mixed:
+
+- **No email from older hosts.** A host on the previous build does not know the
+  `email` target type: it logs `notify: bad target config` and sends no email
+  for the events it handles. Create email targets after the last host has
+  upgraded, or accept gaps in email coverage until then.
+- **SMTP password creation is held back.** Storing an SMTP password is the
+  `email_target_secret` feature of the release token `release_2026_11_v1` (see
+  "Rolling back after a release token latched"). Until the token has latched,
+  creating an email target that carries a password is refused with `the cluster
+  upgrade must finish first (email_target_secret needs release_2026_11_v1)`; an
+  email target without a password is allowed at any time. The first such create
+  after the latch marks the feature used, after which a rollback below this
+  release quarantines the host.

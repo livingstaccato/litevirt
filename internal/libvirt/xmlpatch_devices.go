@@ -509,7 +509,7 @@ func marshalNewHostdev(childIndent string, h WantHostdev) (string, error) {
 		Type:    "pci",
 		Managed: "yes",
 		Source: hostdevSource{
-			Address: hostdevAddress{Domain: p.Domain, Bus: p.Bus, Slot: p.Slot, Function: p.Function},
+			Address: &hostdevAddress{Domain: p.Domain, Bus: p.Bus, Slot: p.Slot, Function: p.Function},
 		},
 	}
 	if h.Alias != "" {

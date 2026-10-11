@@ -25,7 +25,7 @@ func zeroAdmins(t *testing.T, c *Client) {
 
 func floor(t *testing.T, c *Client, settle time.Duration) string {
 	t.Helper()
-	who, err := c.EnsureAdminFloor(context.Background(), settle)
+	who, err := c.EnsureAdminFloor(context.Background(), settle, nil)
 	if err != nil {
 		t.Fatalf("EnsureAdminFloor: %v", err)
 	}

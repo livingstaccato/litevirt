@@ -90,6 +90,10 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 		t.Fatalf("rebind %s on port %d: %v", n.Name, n.Port, err)
 	}
 	n.Listener = l
+	// The replaced server's loops stop with it (re-review 4, n-1).
+	if n.stopServerLoops != nil {
+		n.stopServerLoops()
+	}
 	c.buildServer(n)
 	for _, o := range c.Nodes {
 		if o != n {

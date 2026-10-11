@@ -130,18 +130,58 @@ func InsertRoleBinding(ctx context.Context, c *Client, b RoleBindingRecord) erro
 	if !b.Propagate {
 		prop = 0
 	}
-	return c.Execute(ctx,
-		`INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		b.ID, b.Path, b.Role, b.Principal, prop, now)
+	return c.Execute(ctx, roleBindingInsertSQL, b.ID, b.Path, b.Role, b.Principal, prop, now)
+}
+
+const roleBindingInsertSQL = `INSERT INTO role_bindings (id, path, role, principal, propagate, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+
+const roleBindingDeleteSQL = `UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`
+
+// SentinelRole is the role a delegated revoke leaves behind (NoAccess: no
+// verbs). See RevokeRoleBindingLeavingSentinel.
+const SentinelRole = "NoAccess"
+
+// RevokeRoleBindingLeavingSentinel tombstones binding id and, in the same
+// batch, binds sentinel — a NoAccess binding of the same principal at the same
+// path. A delegated revoke uses it so that no sequence of delegated revokes,
+// on any nodes, in any order, takes a principal to zero bindings: each leaves
+// its own sentinel, and a principal with zero bindings falls back to its
+// legacy role cluster-wide (t1-auth-review I3). Both statements are the
+// existing role_bindings shapes.
+//
+// At most one sentinel is kept per (principal, path): when one is already
+// there the revoke only tombstones (rereview m-c), so a delegate looping
+// grant and revoke at one path cannot grow the table. Two revokes on two nodes
+// at once can each add one; a duplicate grants nothing and is harmless. It
+// reports whether it added one.
+func RevokeRoleBindingLeavingSentinel(ctx context.Context, c *Client, id string, sentinel RoleBindingRecord) (bool, error) {
+	now := c.NowTS()
+	existing, err := c.Query(ctx,
+		`SELECT id FROM role_bindings WHERE principal = ? AND path = ? AND role = ? AND deleted_at IS NULL AND id != ? LIMIT 1`,
+		sentinel.Principal, sentinel.Path, SentinelRole, id)
+	if err != nil {
+		return false, err
+	}
+	if len(existing) > 0 {
+		return false, c.ExecuteBatch(ctx, []Statement{
+			{SQL: roleBindingDeleteSQL, Params: []interface{}{nowRFC3339(), now, id}},
+		})
+	}
+	prop := 0
+	if sentinel.Propagate {
+		prop = 1
+	}
+	return true, c.ExecuteBatch(ctx, []Statement{
+		{SQL: roleBindingDeleteSQL, Params: []interface{}{nowRFC3339(), now, id}},
+		{SQL: roleBindingInsertSQL, Params: []interface{}{sentinel.ID, sentinel.Path, SentinelRole, sentinel.Principal, prop, now}},
+	})
 }
 
 // DeleteRoleBinding soft-deletes a binding by id.
 func DeleteRoleBinding(ctx context.Context, c *Client, id string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE role_bindings SET deleted_at = ?, updated_at = ? WHERE id = ?`,
-		nowRFC3339(), now, id)
+	return c.Execute(ctx, roleBindingDeleteSQL, nowRFC3339(), now, id)
 }
 
 // ListRoleBindings returns all active bindings. Used by the permission
@@ -166,6 +206,29 @@ func ListRoleBindings(ctx context.Context, c *Client) ([]RoleBindingRecord, erro
 		}
 	}
 	return out, nil
+}
+
+// GetRoleBinding returns the live binding with id, or nil when there is none
+// (never written here, or revoked).
+func GetRoleBinding(ctx context.Context, c *Client, id string) (*RoleBindingRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, path, role, principal, propagate, updated_at
+		 FROM role_bindings WHERE id = ? AND deleted_at IS NULL`, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	r := rows[0]
+	return &RoleBindingRecord{
+		ID:        r.String("id"),
+		Path:      r.String("path"),
+		Role:      r.String("role"),
+		Principal: r.String("principal"),
+		Propagate: r.Int("propagate") == 1,
+		UpdatedAt: r.String("updated_at"),
+	}, nil
 }
 
 // ListBindingsForPrincipal returns bindings that apply to a single
@@ -208,12 +271,17 @@ type SessionRecord struct {
 
 // InsertSession creates a session row.
 func InsertSession(ctx context.Context, c *Client, s SessionRecord) error {
-	return c.Execute(ctx,
-		`INSERT INTO sessions
-		 (id, username, realm, ip, user_agent, created_at, last_used_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
+	return c.Execute(ctx, sessionsInsertSQL, s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
 		s.CreatedAt, s.LastUsedAt, s.ExpiresAt)
+}
+
+const sessionsInsertSQL = `INSERT INTO sessions
+		 (id, username, realm, ip, user_agent, created_at, last_used_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+
+func sessionInsertStatement(s SessionRecord) Statement {
+	return Statement{SQL: sessionsInsertSQL, Params: []interface{}{s.ID, s.Username, s.Realm, s.IP, s.UserAgent,
+		s.CreatedAt, s.LastUsedAt, s.ExpiresAt}}
 }
 
 // GetSession returns a session by id, including revoked rows so the auth
@@ -248,10 +316,10 @@ func TouchSession(ctx context.Context, c *Client, id string) error {
 
 // RevokeSession marks a session as terminated immediately.
 func RevokeSession(ctx context.Context, c *Client, id string) error {
-	return c.Execute(ctx,
-		`UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`,
-		nowRFC3339(), id) // bare marker
+	return c.Execute(ctx, sessionRevokeSQL, nowRFC3339(), id) // bare marker
 }
+
+const sessionRevokeSQL = `UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`
 
 // ListSessionsForUser returns active sessions for a username.
 func ListSessionsForUser(ctx context.Context, c *Client, username string) ([]SessionRecord, error) {

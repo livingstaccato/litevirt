@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func openMembershipGate(c *Client) { c.SetHostMembershipGate(func() bool { return true }) }
@@ -43,16 +44,21 @@ func TestMembershipRow_Resolve(t *testing.T) {
 	active := membershipVals{State: "active"}
 	fenced := membershipVals{State: "fenced"}
 	cases := []struct {
-		name string
-		row  membershipRow
-		live bool
-		want membershipVals
+		name   string
+		row    membershipRow
+		frozen bool
+		want   membershipVals
 	}{
-		{"not live reads the hosts columns, whatever the membership row says",
-			membershipRow{hosts: active, hostsTS: older, memPresent: true, mem: fenced, memTS: newer}, false, active},
-		{"no membership row falls back to the hosts columns",
-			membershipRow{hosts: fenced, hostsTS: older}, true, fenced},
-		{"live reads the membership row",
+		// colonelpanik/litevirt#267 review M1: once the retire token stops the
+		// hosts copy following, a node that is not live yet must not read it
+		// ahead of a present membership row.
+		{"a present membership row is read whether or not the copy is frozen",
+			membershipRow{hosts: active, hostsTS: older, memPresent: true, mem: fenced, memTS: newer}, false, fenced},
+		{"no membership row falls back to the hosts columns while they follow",
+			membershipRow{hosts: fenced, hostsTS: older}, false, fenced},
+		{"no membership row and a frozen copy reads unknown, never active",
+			membershipRow{hosts: active, hostsTS: older}, true, membershipVals{State: HostStateUnknown}},
+		{"a frozen copy does not hide a present row",
 			membershipRow{hosts: active, hostsTS: older, memPresent: true, mem: fenced, memTS: newer}, true, fenced},
 		// THE case #267 is about: this replica refused the hosts half of the
 		// coordinator's fence because a concurrent version report made its hosts
@@ -62,7 +68,7 @@ func TestMembershipRow_Resolve(t *testing.T) {
 			membershipRow{hosts: active, hostsTS: newer, memPresent: true, mem: fenced, memTS: older}, true, fenced},
 	}
 	for _, tc := range cases {
-		if got := tc.row.resolve(tc.live); got != tc.want {
+		if got := tc.row.resolve(tc.frozen); got != tc.want {
 			t.Errorf("%s: resolve = %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
@@ -178,8 +184,18 @@ func TestHostMembership_ThePassCopiesWithTheHostsTimestamp(t *testing.T) {
 	if !c.HostMembershipLive() {
 		t.Fatal("a complete pass with the gate open did not make the node live")
 	}
-	if got := membershipCol(t, c, "h2", "updated_at"); got != srcTS {
-		t.Errorf("copied row updated_at = %q, want the hosts row's %q (NowTS here makes every node's copy differ)", got, srcTS)
+	// The copy is the hosts row's instant moved back by the floor shift: the
+	// same on every node that copies this row, and older than any real write.
+	at, err := time.Parse(time.RFC3339, srcTS)
+	if err != nil {
+		t.Fatalf("hosts updated_at %q unreadable: %v", srcTS, err)
+	}
+	want := at.Add(-membershipCopyFloorShift).UTC().Format(nowTSLayout)
+	if lwwOrder(want, "2000-01-01T00:00:00Z") >= 0 {
+		t.Fatalf("the floor %q is not older than any real write", want)
+	}
+	if got := membershipCol(t, c, "h2", "updated_at"); got != want {
+		t.Errorf("copied row updated_at = %q, want the floor of the hosts row's %q (NowTS here makes every node's copy differ)", got, want)
 	}
 	if got := membershipCol(t, c, "h1", "state"); got != "maintenance" {
 		t.Errorf("copied state = %q", got)
@@ -311,7 +327,7 @@ func applyAsReplicated(t *testing.T, c *Client, stmts ...Statement) {
 			t.Fatal(err)
 		}
 	}
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}

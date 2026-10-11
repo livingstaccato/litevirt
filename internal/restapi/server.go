@@ -33,6 +33,7 @@
 //	POST   /api/v1/vms/{name}/set-ip                   → SetVMIP
 //	POST   /api/v1/vms/{name}/rebuild                  → RebuildVM
 //	POST   /api/v1/vms/{name}/disks/{disk}/resize      → ResizeDisk
+//	POST   /api/v1/vms/{name}/disks/{disk}/io          → SetDiskIO (body: {"limits": {...}})
 //	POST   /api/v1/vms/{name}/snapshots                → CreateSnapshot
 //	GET    /api/v1/vms/{name}/snapshots                → ListSnapshots
 //	POST   /api/v1/vms/{name}/snapshots/{snap}/restore → RestoreSnapshot
@@ -628,6 +629,23 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 	// POST /api/v1/vms/{name}/disks/{disk}/resize
 	case strings.HasPrefix(action, "disks/") && r.Method == http.MethodPost:
 		diskParts := strings.SplitN(strings.TrimPrefix(action, "disks/"), "/", 2)
+		if len(diskParts) == 2 && diskParts[1] == "io" {
+			// POST /api/v1/vms/{name}/disks/{disk}/io — the body is the limits.
+			var req pb.SetDiskIORequest
+			if err := protoFromJSON(r, &req); err != nil {
+				jsonError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			req.VmName = name
+			req.DiskName = diskParts[0]
+			resp, err := s.grpc.SetDiskIO(ctx, &req)
+			if err != nil {
+				grpcHTTPError(w, http.StatusInternalServerError, err)
+				return
+			}
+			jsonProto(w, resp)
+			return
+		}
 		if len(diskParts) != 2 || diskParts[1] != "resize" {
 			jsonError(w, http.StatusNotFound, fmt.Sprintf("unknown disk action %q", action))
 			return

@@ -49,15 +49,7 @@ func InitEncrypted(root, mode string) (*Repo, error) {
 	if mode != EncryptionModeAESGCM {
 		return nil, fmt.Errorf("unsupported encryption mode %q", mode)
 	}
-	r, err := Init(root)
-	if err != nil {
-		return nil, err
-	}
-	r.meta.Encryption = mode
-	if err := writeJSONAtomic(metaPath(root), r.meta); err != nil {
-		return nil, err
-	}
-	return r, nil
+	return InitWithOptions(root, InitOptions{Encryption: mode})
 }
 
 func metaPath(root string) string { return root + "/repo.json" }

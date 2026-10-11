@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"strings"
 )
 
@@ -38,7 +37,7 @@ var zfsPipe = pipeCmds
 func (d *zfsDriver) zfs(ctx context.Context, args ...string) ([]byte, error) {
 	run := d.run
 	if run == nil {
-		run = realCmd
+		run = volumeRunner
 	}
 	return run(ctx, "zfs", args...)
 }
@@ -47,7 +46,7 @@ func (d *zfsDriver) Prepare(ctx context.Context) error {
 	if d.dataset == "" {
 		return fmt.Errorf("zfs: dataset (Source) required")
 	}
-	out, err := exec.CommandContext(ctx, "zfs", "list", "-H", "-o", "name", "--", d.dataset).CombinedOutput()
+	out, err := d.zfs(ctx, "list", "-H", "-o", "name", "--", d.dataset)
 	if err != nil {
 		return fmt.Errorf("zfs list %s: %w: %s", d.dataset, err, out)
 	}
@@ -73,7 +72,7 @@ func (d *zfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 	}
 	args = append(args, "--", zvol)
 
-	if out, err := exec.CommandContext(ctx, "zfs", args...).CombinedOutput(); err != nil {
+	if out, err := d.zfs(ctx, args...); err != nil {
 		return "", fmt.Errorf("zfs create %s: %w: %s", zvol, err, out)
 	}
 
@@ -211,7 +210,7 @@ func (d *zfsDriver) DeleteDisk(ctx context.Context, path string) error {
 	if zvol == path {
 		return fmt.Errorf("zfs: cannot derive zvol name from %q", path)
 	}
-	if out, err := exec.CommandContext(ctx, "zfs", "destroy", "-r", "--", zvol).CombinedOutput(); err != nil {
+	if out, err := d.zfs(ctx, "destroy", "-r", "--", zvol); err != nil {
 		return fmt.Errorf("zfs destroy %s: %w: %s", zvol, err, out)
 	}
 	slog.Info("zvol destroyed", "zvol", zvol)

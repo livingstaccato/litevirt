@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -22,10 +24,15 @@ func newUserCmd() *cobra.Command {
 		newUserCreateCmd(),
 		newUserListCmd(),
 		newUserDeleteCmd(),
+		newUserMarkExternalCmd(),
 		newUserPasswdCmd(),
 		newTokenCreateCmd(),
 		newTokenRevokeCmd(),
 		newUserResetAdminCmd(),
+		newUserDisableCmd(),
+		newUserEnableCmd(),
+		newUserExpireCmd(),
+		newUserUnbindCmd(),
 	)
 	return cmd
 }
@@ -126,13 +133,15 @@ func newUserListCmd() *cobra.Command {
 				}
 
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-				fmt.Fprintln(w, "USERNAME\tROLE\tCREATED")
+				fmt.Fprintln(w, "USERNAME\tROLE\tCREATED\tSTATUS\tEXPIRES")
 				for _, u := range resp.Users {
 					created := ""
 					if u.CreatedAt != nil {
 						created = u.CreatedAt.AsTime().Format("2006-01-02")
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\n", u.Username, u.Role, created)
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", u.Username, u.Role, created,
+						userStatusLabel(u, time.Now()), orDash(u.GetExpiresAt()))
+					// STATUS is the daemon's verdict, by the daemon's clock (m1).
 				}
 				return w.Flush()
 			})
@@ -141,17 +150,92 @@ func newUserListCmd() *cobra.Command {
 }
 
 func newUserDeleteCmd() *cobra.Command {
-	return &cobra.Command{
+	var exact bool
+	var id string
+	cmd := &cobra.Command{
 		Use:   "delete <username>",
-		Short: "Delete a user",
-		Args:  cobra.ExactArgs(1),
+		Short: "Delete a user (its sessions and API tokens are revoked)",
+		Long: `Delete a user. Its sessions and API tokens are revoked and its open streams
+end, in the same write as the delete. Names are matched ignoring case and
+surrounding spaces; two accounts that differ only that way are refused by every
+lookup. To remove one of them, run --exact without --id: it lists every account
+named like <username> with its id, creation time, role, realm, last login,
+factors and tokens, and deletes nothing. Then run it again with --id <id> of
+the one to remove (admin, audited).`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if id != "" && !exact {
+				return fmt.Errorf("--id chooses among the accounts --exact lists; pass --exact too")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0]})
+				if exact && id == "" {
+					r, err := c.ListUserVariants(ctx, &pb.ListUserVariantsRequest{Username: args[0]})
+					if err != nil {
+						return err
+					}
+					w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintln(w, "ID\tUSERNAME\tCREATED\tROLE\tREALM\tLAST LOGIN\tFACTORS\tTOKENS")
+					for _, v := range r.GetVariants() {
+						fmt.Fprintf(w, "%s\t%q\t%s\t%s\t%s\t%s\t%d\t%d\n", v.GetId(), v.GetUsername(), v.GetCreatedAt(),
+							v.GetRole(), v.GetRealm(), orDash(v.GetLastLogin()), v.GetFactors(), v.GetTokens())
+					}
+					if err := w.Flush(); err != nil {
+						return err
+					}
+					return fmt.Errorf("nothing deleted: choose one account and run `lv user delete --exact %s --id <ID>`", args[0])
+				}
+				_, err := c.DeleteUser(ctx, &pb.DeleteUserRequest{Username: args[0], Exact: exact, ExactId: id})
 				if err != nil {
 					return err
 				}
 				fmt.Printf("Deleted user %q\n", args[0])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&exact, "exact", false, "list the accounts named like <username> (with --id: delete the one chosen)")
+	cmd.Flags().StringVar(&id, "id", "", "with --exact: the id of the account to delete, from the list --exact prints")
+	return cmd
+}
+
+// newUserUnbindCmd clears the directory entry an external-realm account is
+// bound to, for when the directory re-created the user's entry.
+func newUserUnbindCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "unbind <username> <realm>",
+		Short: "Clear the directory entry an LDAP or OIDC account is bound to (admin)",
+		Long: `An LDAP or OIDC account is bound, on its first login, to the directory entry's
+immutable id (LDAP entryUUID, objectGUID or nsUniqueId, else its DN; OIDC
+issuer and subject), and a login through any other entry is refused. When the
+directory re-creates a user's entry under a new id, clear the binding: the
+account's next login binds to the entry it comes through (admin, audited).`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.ClearIdentityBinding(ctx, &pb.ClearIdentityBindingRequest{Username: args[0], Realm: args[1]}); err != nil {
+					return err
+				}
+				fmt.Printf("Cleared the directory binding of %q in realm %q; its next login binds afresh\n", args[0], args[1])
+				return nil
+			})
+		},
+	}
+	return cmd
+}
+
+// newUserMarkExternalCmd marks an existing user with no local password as an
+// external-realm (LDAP/OIDC) user (docs/auth.md).
+func newUserMarkExternalCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "mark-external <username>",
+		Short: "Mark a user with no local password as an external-realm (LDAP/OIDC) user",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.MarkUserExternal(ctx, &pb.MarkUserExternalRequest{Username: args[0]}); err != nil {
+					return err
+				}
+				fmt.Printf("Marked user %q as an external-realm user\n", args[0])
 				return nil
 			})
 		},
@@ -206,6 +290,100 @@ func newTokenRevokeCmd() *cobra.Command {
 				fmt.Printf("Token %q revoked\n", args[0])
 				return nil
 			})
+		},
+	}
+}
+
+// userStatusLabel is the STATUS column of `lv user ls`.
+func userStatusLabel(u *pb.User, now time.Time) string {
+	if st := u.GetStatus(); st != "" {
+		return st
+	}
+	// A daemon that predates User.status: judge it here.
+	if u.GetDisabled() {
+		return "disabled"
+	}
+	if e := u.GetExpiresAt(); e != "" {
+		if t, err := time.Parse(time.RFC3339, e); err != nil || !now.Before(t) {
+			return "expired"
+		}
+	}
+	return "active"
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// setUserAccount is the one call behind disable, enable and expire.
+func setUserAccount(cmd *cobra.Command, req *pb.SetUserAccountRequest, done string) error {
+	return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		u, err := c.SetUserAccount(ctx, req)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s (status: %s, expires: %s)\n", done, userStatusLabel(u, time.Now()), orDash(u.GetExpiresAt()))
+		return nil
+	})
+}
+
+func newUserDisableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "disable <username>",
+		Short: "Disable an account: no login, and its sessions and API tokens stop working",
+		Long: `Disable an account (admin only). It cannot log in through any realm, its
+sessions are ended, and its API tokens are refused until it is re-enabled
+with ` + "`lv user enable`" + `. Refused for the last admin that is enabled with no
+expiry, and until the cluster upgrade has finished.
+
+A disable cannot reach the distributable lv-cli client certificate, which
+authenticates as the cluster admin with no user behind it; turn on
+auth.strict_mtls_identity to close that path.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			t := true
+			return setUserAccount(cmd, &pb.SetUserAccountRequest{Username: args[0], Disabled: &t},
+				fmt.Sprintf("Disabled user %q", args[0]))
+		},
+	}
+}
+
+func newUserEnableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "enable <username>",
+		Short: "Re-enable a disabled account",
+		Long: `Re-enable an account disabled with ` + "`lv user disable`" + ` (admin only). Its
+API tokens work again; its sessions were ended by the disable and stay ended.
+An expiry is left as it is: clear it with ` + "`lv user expire <username> never`" + `.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			f := false
+			return setUserAccount(cmd, &pb.SetUserAccountRequest{Username: args[0], Disabled: &f},
+				fmt.Sprintf("Enabled user %q", args[0]))
+		},
+	}
+}
+
+func newUserExpireCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "expire <username> <RFC3339|never>",
+		Short: "Set or clear the instant an account stops authenticating",
+		Long: `Set the instant an account stops authenticating (admin only), e.g.
+2026-12-31T00:00:00Z, or "never" to clear it. From that instant the account
+cannot log in and its sessions and API tokens are refused. Setting an expiry
+ends the account's current sessions. Refused for the last admin that is
+enabled with no expiry, and until the cluster upgrade has finished.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			exp := args[1]
+			if strings.EqualFold(exp, "never") {
+				exp = ""
+			}
+			return setUserAccount(cmd, &pb.SetUserAccountRequest{Username: args[0], ExpiresAt: &exp},
+				fmt.Sprintf("Set expiry of user %q", args[0]))
 		},
 	}
 }

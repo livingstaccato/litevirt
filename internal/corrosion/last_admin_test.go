@@ -37,7 +37,7 @@ func TestReinstateAdminIfNoneRemain(t *testing.T) {
 		t.Fatalf("DeleteUser bob: %v", err)
 	}
 
-	reinstated, err := ReinstateAdminIfNoneRemain(ctx, db)
+	reinstated, err := ReinstateAdminIfNoneRemain(ctx, db, nil)
 	if err != nil {
 		t.Fatalf("ReinstateAdminIfNoneRemain: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestReinstateAdminIfNoneRemain_NoopWhileAnAdminLives(t *testing.T) {
 		t.Fatalf("DeleteUser alice: %v", err)
 	}
 
-	reinstated, err := ReinstateAdminIfNoneRemain(ctx, db)
+	reinstated, err := ReinstateAdminIfNoneRemain(ctx, db, nil)
 	if err != nil {
 		t.Fatalf("ReinstateAdminIfNoneRemain: %v", err)
 	}

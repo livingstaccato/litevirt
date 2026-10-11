@@ -1,6 +1,7 @@
 package failover
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -69,6 +70,29 @@ func TestBuildFailoverPlacementRequest_IgnoresPinToADownHost(t *testing.T) {
 		vm := corrosion.VMRecord{Name: "vm1", CPUActual: 1, MemActual: 512, Spec: tc.spec}
 		if req := buildFailoverPlacementRequest(vm, "failed-host", corrosion.CapacityPolicy{}, down); req.PinHost != tc.wantPin {
 			t.Errorf("spec %s: PinHost = %q, want %q", tc.spec, req.PinHost, tc.wantPin)
+		}
+	}
+}
+
+// USB passthrough survives into the recovery request: a mapped device limits
+// it to the mapping's hosts, and a raw one — plugged into the failed host —
+// binds it there, so no other host qualifies and the VM is not started
+// without its device. Both apply with or without a placement block.
+func TestBuildFailoverPlacementRequest_CarriesUSBConstraints(t *testing.T) {
+	for _, tc := range []struct {
+		spec         string
+		wantMappings []string
+		wantHost     string
+	}{
+		{`{"usb_devices":[{"mapping":"dongle"},{"mapping":"dongle"},{"mapping":"serial"}]}`, []string{"dongle", "serial"}, ""},
+		{`{"usb_devices":[{"vendor":"046d","product":"c52b"}],"placement":{"host":"failed-host"}}`, nil, "failed-host"},
+		{`{"usb_devices":[{"bus_port":"1-2"}]}`, nil, "failed-host"},
+		{`{"placement":{"host":"x"}}`, nil, ""},
+	} {
+		vm := corrosion.VMRecord{Name: "vm1", HostName: "failed-host", CPUActual: 1, MemActual: 512, Spec: tc.spec}
+		req := buildFailoverPlacementRequest(vm, "failed-host", corrosion.CapacityPolicy{}, noneDown)
+		if strings.Join(req.USBMappings, ",") != strings.Join(tc.wantMappings, ",") || req.USBHost != tc.wantHost {
+			t.Errorf("spec %s: USBMappings %v USBHost %q; want %v %q", tc.spec, req.USBMappings, req.USBHost, tc.wantMappings, tc.wantHost)
 		}
 	}
 }

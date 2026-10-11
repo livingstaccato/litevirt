@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Resource mappings (#14) are cluster-wide aliases for equivalent passthrough
@@ -53,6 +54,37 @@ func (s *Server) resourceMapWriteAllowed(ctx context.Context, action, target, re
 		s.audit(ctx, action, target, requested+" "+err.Error(), "denied")
 	}
 	return err
+}
+
+// usbMappingEditAllowed refuses a non-admin change to a USB mapping's
+// devices — adding a USB device, removing a device from a mapping that holds
+// USB devices, or deleting such a mapping. A mapping's devices are what every
+// VM granted resourcemap.use on it receives at its next start: whoever edits
+// them hands out host hardware, raw USB being the admin role's alone. So no
+// resourcemap.write (Operator's) or resourcemap.use grant changes one, and a
+// mapping another tenant's VMs use is changed only by an admin. PCI mappings
+// keep resourcemap.write.
+func (s *Server) usbMappingEditAllowed(ctx context.Context, action, mapping, address, requested string) error {
+	usb := address != "" && corrosion.IsUSBMappingAddress(address)
+	if !usb {
+		m, err := corrosion.GetResourceMapping(ctx, s.db, mapping)
+		if err != nil {
+			return status.Errorf(codes.Internal, "read resource mapping %q: %v", mapping, err)
+		}
+		if m != nil {
+			k := m.MappingKind()
+			usb = k == corrosion.MappingKindUSB || k == corrosion.MappingKindMixed
+		}
+	}
+	if !usb {
+		return nil
+	}
+	if err := RequireRole(ctx, "admin"); err != nil {
+		err = status.Errorf(codes.PermissionDenied, "changing a USB mapping's devices hands out host USB devices, which requires the admin role (raw USB is the host's own)")
+		s.audit(ctx, action, mapping, requested+" "+err.Error(), "denied")
+		return err
+	}
+	return nil
 }
 
 // mappingDeviceKey renders the device a removal names, for the rows that have
@@ -110,6 +142,9 @@ func (s *Server) DeleteResourceMapping(ctx context.Context, req *pb.DeleteResour
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapRm, req.Name, "requested="+corrosion.AuditStateNone); err != nil {
 		return nil, err
 	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapRm, req.Name, "", "requested="+corrosion.AuditStateNone); err != nil {
+		return nil, err
+	}
 	// Read what is about to go, devices included: after this the audit row is
 	// the only record of which host devices the mapping handed out.
 	before := corrosion.ResourceMappingAuditState(ctx, s.db, req.Name)
@@ -138,8 +173,18 @@ func (s *Server) AddMappingDevice(ctx context.Context, req *pb.AddMappingDeviceR
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapDeviceAdd, req.Mapping, "requested="+requested); err != nil {
 		return nil, err
 	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapDeviceAdd, req.Mapping, req.Address, "requested="+requested); err != nil {
+		return nil, err
+	}
 	if req.Mapping == "" || req.Address == "" {
 		return nil, status.Error(codes.InvalidArgument, "mapping and address required")
+	}
+	// A mapping hands out PCI devices or USB devices, never both: a VM's PCI
+	// selector and its USB device read the same rows, and each would resolve
+	// the other kind's address into a hostdev of the wrong type.
+	if err := s.checkMappingDeviceKind(ctx, req.Mapping, req.Address); err != nil {
+		s.audit(ctx, auditResourceMapDeviceAdd, req.Mapping, "requested="+requested+" "+err.Error(), "error")
+		return nil, err
 	}
 	// Re-adding the same (mapping, host, address) rewrites vendor and device:
 	// read what it replaces.
@@ -168,6 +213,9 @@ func (s *Server) RemoveMappingDevice(ctx context.Context, req *pb.RemoveMappingD
 	if err := s.resourceMapWriteAllowed(ctx, auditResourceMapDeviceRm, req.Mapping, device+" requested="+corrosion.AuditStateNone); err != nil {
 		return nil, err
 	}
+	if err := s.usbMappingEditAllowed(ctx, auditResourceMapDeviceRm, req.Mapping, req.Address, device+" requested="+corrosion.AuditStateNone); err != nil {
+		return nil, err
+	}
 	// Read the device before it is tombstoned: after this the row is the only
 	// record of which device the mapping used to name.
 	before := corrosion.MappingDeviceAuditState(ctx, s.db, req.Mapping, host, req.Address)
@@ -188,4 +236,31 @@ func (s *Server) RemoveMappingDevice(ctx context.Context, req *pb.RemoveMappingD
 		return &pb.ResourceMapping{Name: req.Mapping}, nil
 	}
 	return toPbResourceMapping(*m), nil
+}
+
+// checkMappingDeviceKind refuses a malformed USB device address and a device
+// whose kind (USB or PCI) differs from the devices the mapping already holds.
+func (s *Server) checkMappingDeviceKind(ctx context.Context, mapping, address string) error {
+	usb := corrosion.IsUSBMappingAddress(address)
+	if usb {
+		if _, err := lv.ParseUSBMappingAddress(address); err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	}
+	m, err := corrosion.GetResourceMapping(ctx, s.db, mapping)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read resource mapping %q: %v", mapping, err)
+	}
+	if m == nil {
+		return nil
+	}
+	switch kind := m.MappingKind(); {
+	case usb && (kind == corrosion.MappingKindPCI || kind == corrosion.MappingKindMixed):
+		return status.Errorf(codes.FailedPrecondition,
+			"mapping %q holds PCI devices; give the USB device a mapping of its own", mapping)
+	case !usb && (kind == corrosion.MappingKindUSB || kind == corrosion.MappingKindMixed):
+		return status.Errorf(codes.FailedPrecondition,
+			"mapping %q holds USB devices; give the PCI device a mapping of its own", mapping)
+	}
+	return nil
 }

@@ -155,13 +155,98 @@ func TestUsersMerge_ANonAdminRowIsUnaffected(t *testing.T) {
 	if err := InsertUser(ctx, c, "bob", "viewer", "old"); err != nil {
 		t.Fatalf("seed viewer: %v", err)
 	}
+	rows, _ := c.Query(ctx, `SELECT created_at FROM users WHERE username = 'bob'`)
+	createdAt := rows[0].String("created_at")
 
-	mergeUsersRow(t, c, usersRowCells("bob", "viewer", "new",
-		"2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
-
-	rows, _ := c.Query(ctx, `SELECT password_hash FROM users WHERE username = 'bob'`)
+	// An update of the SAME account (its created_at) converges as always.
+	mergeUsersRow(t, c, usersRowCells("bob", "viewer", "new", createdAt, "2099-01-01T00:00:00Z"))
+	rows, _ = c.Query(ctx, `SELECT password_hash FROM users WHERE username = 'bob'`)
 	if got := rows[0].String("password_hash"); got != "new" {
 		t.Errorf("password_hash = %q, want new — an ordinary user row stopped converging", got)
+	}
+}
+
+// TestUsersMerge_ADifferentAccountNeverReplacesALocalAccount (pre-existing on
+// main, found in the colonelpanik/litevirt#268 review): a row with another
+// created_at under a live local account's name — for example an external
+// shadow a stale node created — is a different account, and is refused just
+// as an admin re-mint is. Over an account without a password (a shadow) it
+// still converges by LWW.
+func TestUsersMerge_ADifferentAccountNeverReplacesALocalAccount(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	if err := InsertUser(ctx, c, "carol", "operator", "carol-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertUser(ctx, c, "ext", "viewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	mergeUsersRow(t, c, usersRowCells("carol", "viewer", "", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
+	mergeUsersRow(t, c, usersRowCells("ext", "operator", "ext-hash", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"))
+	if u, _ := GetUser(ctx, c, "carol"); u == nil || u.Role != "operator" || u.PasswordHash != "carol-hash" {
+		t.Errorf("carol = %+v: a different account replaced the live local account", u)
+	}
+	if u, _ := GetUser(ctx, c, "ext"); u == nil || u.Role != "operator" {
+		t.Errorf("ext = %+v: a shadow must still converge by LWW", u)
+	}
+}
+
+// TestUsersMerge_AClearedLocalAccountWhoseCredentialLagsIsNeverReplaced
+// (re-review 3, R3): after the clear a local account's users row carries an
+// empty password_hash, and on a receiver whose sensitive lane lags it has no
+// credential row yet. With no evidence that it is external it is an account
+// this node cannot judge, and a different account under its name (another
+// created_at — a stale node's shadow) is refused on both lanes rather than
+// demoting it on the strength of an absence. In the same exchange, the
+// refused row's empty credential is refused too: nothing of ours to compare
+// it with. An account with evidence that it is external still converges.
+func TestUsersMerge_AClearedLocalAccountWhoseCredentialLagsIsNeverReplaced(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	for _, q := range []string{
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('dora', 'operator', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('ella', 'operator', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
+		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES ('ext', 'viewer', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.000000001Z')`,
+		`INSERT INTO user_credentials (username, password_hash, updated_at) VALUES ('ext', '', '2026-01-01T00:00:00.000000001Z')`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scope := &remintScope{}
+	users := usersSyncTable()
+	users.remints = scope
+	for _, row := range [][]interface{}{
+		usersRowCells("dora", "viewer", "", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+		usersRowCells("ext", "operator", "", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+	} {
+		if _, _, err := c.mergeChunk(users, [][]interface{}{row},
+			buildMergeUpsertSQL(users.Name, users.Columns, []string{"username"}),
+			[]string{"username"}, []int{0}, indexOf(users.Columns, "updated_at")); err != nil {
+			t.Fatalf("mergeChunk: %v", err)
+		}
+	}
+	if err := applyWALUserInsert(t, c, "ella", "viewer", "", "2098-01-01T00:00:00Z", "2099-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, u := range []string{"dora", "ella"} {
+		if got := oneString(t, c, `SELECT role || ' ' || created_at AS v FROM users WHERE username = ?`, "v", u); got != "operator 2026-01-01T00:00:00Z" {
+			t.Errorf("%s = %q: a different account replaced a local account whose credential had not arrived", u, got)
+		}
+	}
+	if got := oneString(t, c, `SELECT role FROM users WHERE username = 'ext'`, "role"); got != "operator" {
+		t.Errorf("ext role = %q: an account with evidence that it is external must still converge by LWW", got)
+	}
+
+	creds := syncTable{Name: "user_credentials", Columns: []string{"username", "password_hash", "updated_at", "deleted_at"}, remints: scope}
+	if _, _, err := c.mergeChunk(creds, [][]interface{}{{"dora", "", "2099-01-01T00:00:00Z", nil}},
+		buildMergeUpsertSQL(creds.Name, creds.Columns, []string{"username"}),
+		[]string{"username"}, []int{0}, indexOf(creds.Columns, "updated_at")); err != nil {
+		t.Fatalf("mergeChunk credentials: %v", err)
+	}
+	if n := oneString(t, c, `SELECT COUNT(*) AS n FROM user_credentials WHERE username = 'dora'`, "n"); n != "0" {
+		t.Errorf("the refused account's empty credential landed beside dora's users row (%s rows): "+
+			"dora now reads as an external user", n)
 	}
 }
 

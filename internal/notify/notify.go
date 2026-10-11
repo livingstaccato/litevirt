@@ -4,9 +4,9 @@
 // blocks the caller — but fans out to multiple typed targets selected by
 // event-pattern + minimum-severity routes.
 //
-// Targets today: webhook (generic JSON POST) and slack (incoming-webhook
-// payload). Both are thin HTTP POSTs; email/gotify are future Target impls on
-// the same interface.
+// Targets today: webhook (generic JSON POST), slack (incoming-webhook payload)
+// and email (SMTP; see email.go). Further kinds are further Target impls on the
+// same interface.
 package notify
 
 import (
@@ -15,6 +15,12 @@ import (
 	"strings"
 	"time"
 )
+
+// KindHostRecoveryStalled is the kind of the notification the failover
+// coordinator raises when a fenced or offline host's recoverable workloads
+// are still on it a while after its fence record (failover.EventRecoveryStalled
+// is the same string, for the event).
+const KindHostRecoveryStalled = "host.recovery.stalled"
 
 // Severity orders notifications so a route can subscribe to "warn and above".
 type Severity string
@@ -58,7 +64,7 @@ type Target interface {
 }
 
 // NewTarget builds a Target from its stored type + JSON config. Supported
-// types: "webhook", "slack". Returns an error for an unknown type so a typo in
+// types: "webhook", "slack", "email". Returns an error for an unknown type so a typo in
 // the stored config surfaces instead of silently dropping notifications.
 func NewTarget(name, typ, configJSON string) (Target, error) {
 	switch typ {
@@ -66,6 +72,8 @@ func NewTarget(name, typ, configJSON string) (Target, error) {
 		return newWebhookTarget(name, configJSON)
 	case "slack":
 		return newSlackTarget(name, configJSON)
+	case "email":
+		return newEmailTarget(name, configJSON)
 	default:
 		return nil, fmt.Errorf("unknown notification target type %q", typ)
 	}

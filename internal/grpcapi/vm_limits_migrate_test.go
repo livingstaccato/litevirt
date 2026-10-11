@@ -1,0 +1,119 @@
+package grpcapi
+
+import (
+	"strconv"
+	"strings"
+	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
+)
+
+// A cold move defines the source's XML on the target, and that XML carries
+// <shares> rendered for the SOURCE's cgroup version. The target re-renders it
+// for its own from the stored weight: a weight of 977 rendered on a cgroup v1
+// source is out of range on a v2 target, and 100 rendered on a v2 source is a
+// tenth of its neighbours on a v1 target.
+//
+// The XML carries a value no host would render (55555), so the test is not
+// satisfied by a host whose own scale happens to match.
+//
+// Mutation: define req.DomainXml unchanged — red.
+func TestEnsureFirmwareState_DefinesSharesOnTheTargetsScale(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1"}`)
+	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
+	// The target's own replica holds no weight (stale); the source's request does.
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1", SharesWeight: 977}); err != nil {
+		t.Fatalf("EnsureFirmwareState: %v", err)
+	}
+	want := "<shares>" + strconv.Itoa(lv.HostCPUShares(977)) + "</shares>"
+	if got := fake.DefinedXML("os1"); !strings.Contains(got, want) || strings.Contains(got, "55555") {
+		t.Errorf("defined XML = %s, want %s (this host's scale for weight 977)", got, want)
+	}
+}
+
+// The target reports its cgroup version in EnsureDisks, so a live migration's
+// source can render the destination definition for it.
+//
+// Mutation: drop CgroupMode from the response — red.
+func TestEnsureDisks_ReportsTheCgroupVersion(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "running", `{"name":"os1"}`)
+	resp, err := s.EnsureDisks(diskPeerCtx(t, s), &pb.EnsureDisksRequest{VmName: "os1"})
+	if err != nil {
+		t.Fatalf("EnsureDisks: %v", err)
+	}
+	if resp.GetCgroupMode() != lv.CgroupMode() {
+		t.Errorf("cgroup_mode = %q, want %q", resp.GetCgroupMode(), lv.CgroupMode())
+	}
+}
+
+// N2: a VM whose weight was set and then cleared stores 0 but its domain still
+// carries an explicit <shares> of the default for the SOURCE's scale. The cold
+// target re-renders it as the default weight on its own scale.
+//
+// Mutation: treat a stored 0 as "nothing to render" — red.
+func TestEnsureFirmwareState_ARemovedWeightIsRetargetedAsTheDefault(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1"}`)
+	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
+	// The source sends a cleared weight as the default.
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1", SharesWeight: int32(lv.DefaultCPUWeight())}); err != nil {
+		t.Fatalf("EnsureFirmwareState: %v", err)
+	}
+	want := "<shares>" + strconv.Itoa(lv.HostCPUShares(lv.DefaultCPUWeight())) + "</shares>"
+	if got := fake.DefinedXML("os1"); !strings.Contains(got, want) || strings.Contains(got, "55555") {
+		t.Errorf("defined XML = %s, want %s", got, want)
+	}
+}
+
+// The live path's weight: a stored 0 with a <shares> in the running domain is
+// the default weight; a stored 0 without one stays 0 (no ask, no rewrite).
+//
+// Mutation: return the stored weight only — red.
+func TestVMSharesWeight_AClearedWeightIsTheDefault(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "a", "test-host", "running", `{"name":"a"}`)
+	insertTestVMWithSpec(t, ctx, s.db, "b", "test-host", "running", `{"name":"b"}`)
+	insertTestVMWithSpec(t, ctx, s.db, "c", "test-host", "running", `{"name":"c","cpu_shares":977}`)
+	if err := fake.DefineDomain(`<domain type='kvm'><name>a</name><cputune><shares>1024</shares></cputune></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>b</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"a": 100, "b": 0, "c": 977} {
+		if got := s.vmSharesWeight(ctx, name); got != want {
+			t.Errorf("vmSharesWeight(%s) = %d, want %d", name, got, want)
+		}
+	}
+}
+
+// No weight in the request (an older source, or a VM with no <shares>): the
+// XML is defined unchanged, whatever the target's own replica says.
+func TestEnsureFirmwareState_NoWeightSentDefinesTheXMLAsIs(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1","cpu_shares":977}`)
+	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err != nil {
+		t.Fatalf("EnsureFirmwareState: %v", err)
+	}
+	if got := fake.DefinedXML("os1"); !strings.Contains(got, "<shares>55555</shares>") {
+		t.Errorf("defined XML = %s, want it unchanged", got)
+	}
+}

@@ -134,14 +134,16 @@ Use --dry-run to preview counts without writing.`,
 }
 
 func newRoleListCmd() *cobra.Command {
-	var principal string
+	var principal, role string
 	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "List role bindings",
 		Long: `List role bindings. Without --principal, admins see all bindings
 and non-admins see only their own. With --principal, the daemon
 filters server-side; non-admins may only filter to their own
-principal.`,
+principal. --role keeps only the bindings of one role: run it before
+changing a custom role, because every binding of it — delegated ones
+included — changes with it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{
@@ -153,6 +155,9 @@ principal.`,
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 				fmt.Fprintln(w, "ID\tPATH\tROLE\tPRINCIPAL\tPROPAGATE\tUPDATED")
 				for _, b := range resp.Bindings {
+					if role != "" && b.Role != role {
+						continue
+					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%v\t%s\n",
 						b.Id, b.Path, b.Role, b.Principal, b.Propagate, b.UpdatedAt)
 				}
@@ -161,5 +166,6 @@ principal.`,
 		},
 	}
 	cmd.Flags().StringVar(&principal, "principal", "", "Filter to a single principal (user:foo or group:bar@realm)")
+	cmd.Flags().StringVar(&role, "role", "", "Show only the bindings of this role")
 	return cmd
 }

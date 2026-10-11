@@ -19,10 +19,13 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -108,7 +111,12 @@ type Reconciler struct {
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
-	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	pitReport    func(ctx context.Context, vm, disk, detail string)
+	pitCleared   func(ctx context.Context, vm, disk string)
+	// pitHeldReported: the holds already reported when no reporter is wired
+	// (reportPITHeld).
+	pitHeldReported sync.Map
+	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
@@ -156,6 +164,10 @@ type Reconciler struct {
 	// deferredTransfers: proof-less transfers parked in "starting" while their
 	// backing image transfers (missing_disk.go).
 	deferredTransfers deferredTransfers
+	// startDeferral / startDeferred: starts deferred for want of time or an
+	// answer from storage, walked first on the next pass (start_deferral.go).
+	startDeferral func(ctx context.Context, vm *corrosion.VMRecord) error
+	startDeferred startDeferredSet
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -429,7 +441,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) {
 // safety sweeps. The sweeps deliberately take the UNBOUNDED ctx — they are what
 // the walk's budget exists to protect, not things to cut short.
 func (r *Reconciler) reconcilePass(ctx context.Context) {
-	wctx, cancel := context.WithTimeout(ctx, reconcileWalkBudget)
+	// The walk carries one probe turn (start_deferral.go): its first storage
+	// probe runs on whatever time is left.
+	wctx, cancel := context.WithTimeout(WithWalkProbeTurn(ctx), reconcileWalkBudget)
 	r.reconcile(wctx)
 	cancel()
 
@@ -563,13 +577,28 @@ func specOnboot(specJSON string) bool {
 // gone or reassigned, the operator has since stopped it (operator-stop), or onboot
 // was disabled. So a returning quorum can't resurrect a VM the operator stood down
 // while it was absent. Idempotent: startPendingVM no-ops on an already-running domain.
-func (r *Reconciler) retryOnbootPending(ctx context.Context) {
+//
+// The only argument picks which of them this call retries: the ones whose
+// start was deferred for time last pass go before the walk, the rest after
+// it — those whose storage did not answer first (start_deferral.go), in
+// deferral rank order.
+func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name string) bool, deferred map[string]int) {
 	r.onbootMu.Lock()
 	names := make([]string, 0, len(r.onbootPending))
 	for name := range r.onbootPending {
-		names = append(names, name)
+		if only(name) {
+			names = append(names, name)
+		}
 	}
 	r.onbootMu.Unlock()
+	sort.Strings(names)
+	rank := func(name string) int {
+		if rk, ok := deferred[name]; ok {
+			return rk
+		}
+		return rankNotDeferred
+	}
+	sort.SliceStable(names, func(i, j int) bool { return rank(names[i]) < rank(names[j]) })
 	for _, name := range names {
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
@@ -612,6 +641,14 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.resolveDiskMissing(ctx)
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
+
+	// Starts deferred last pass go first — the onboot retries deferred for
+	// time among them too — so the same VMs are not the ones the walk's
+	// budget runs out on every pass; a start whose storage did not answer
+	// goes after those deferred for time (start_deferral.go).
+	deferred := r.startDeferred.take()
+	vms = deferredFirst(vms, deferred)
+	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
 		switch vm.State {
@@ -845,7 +882,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 
 	// Retry any onboot autostart the split-brain gate refused during warmup/quorum
 	// loss, so a latched gate can't permanently strand it after a reboot.
-	r.retryOnbootPending(ctx)
+	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return !ok || rk != rankTime }, deferred)
 }
 
 // selfFence detects split-brain: VMs running locally in libvirt that corrosion
@@ -1195,6 +1232,12 @@ func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
+	// A start that would be deferred for want of time is left as it is
+	// before anything is done for it — no lease, no proof claimed, no
+	// define — and goes first on the next pass (start_deferral.go).
+	if r.deferredBeforeWork(ctx, vm) {
+		return
+	}
 	// Take a per-VM startup lease before doing anything destructive.
 	// Without this, two reconcilers on different hosts that both briefly
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
@@ -1545,8 +1588,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				return
 			}
 		}
-		// Verify disk file exists on this host.
-		if _, err := os.Stat(d.Path); err != nil {
+		// Verify disk file exists on this host. An rbd disk is no file: it is
+		// in the cluster, not on a host, and is never rebuilt here — an
+		// overlay "recreated" in its place would boot the VM on a blank copy
+		// of its image.
+		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
 			if !transfer {
 				// A local start of a VM whose disk is gone: never rebuilt
 				// blank (missing_disk.go).
@@ -1652,6 +1698,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// After the start checkpoint (a host that abandoned the proof has
+	// returned above): settle any point-in-time overlay into the disk before
+	// the domain is defined on it.
+	if failure := r.settlePITOverlays(ctx, vm, spec, diskConfigs); failure != "" {
+		r.failPendingStart(ctx, vm.Name, proofID, true, failure)
+		return
+	}
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1668,6 +1722,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// is a non-retryable operator-repair condition → terminalize the proof + set the VM error;
 	// a transient read/DB failure (Internal/Unavailable) re-arms for the next reconcile tick.
 	releaseHW, hwErr := r.hwPrepareStart(ctx, fresh)
+	if hwErr != nil && errors.Is(hwErr, ErrStartDeferred) {
+		// Not a failure: storage did not answer, or there was no time left
+		// to ask it. Re-driven next pass — never parked in error.
+		r.deferStart(ctx, vm.Name, proofID, transfer, hwErr)
+		return
+	}
 	if hwErr != nil {
 		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
 		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
@@ -1734,6 +1794,72 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 }
 
+// SetPITOverlayReporter wires the report of a VM the define path holds on an
+// overlay it cannot verify, and of a disk whose hold has cleared
+// (grpcapi.Server.ReportPITOverlayHeld and ClearPITOverlayHold: a durable,
+// per-disk health condition, notified once and then at most daily).
+func (r *Reconciler) SetPITOverlayReporter(held func(ctx context.Context, vm, disk, detail string), cleared func(ctx context.Context, vm, disk string)) {
+	r.pitReport, r.pitCleared = held, cleared
+}
+
+// settlePITOverlays settles each disk's point-in-time copy overlay
+// (pitoverlay) before the domain is defined on the disk: a copy whose commit
+// failed, or whose host died mid-window, left the guest's newest writes in it
+// — on a shared pool it travels here with the disk — and the definition names
+// only the disk. An overlay bound to this VM's disk as the file is now is
+// committed offline (no -U: a qemu still holding it fails this closed); one
+// already merged is removed. Any other cannot be verified, so the VM is
+// HELD: not defined or started on the bare disk, which would drop the
+// overlay's writes; the hold says what an admin should do for its verdict
+// (lv resolve-pit-overlay). Nothing replicated records an overlay; its fixed
+// name beside the disk is what finds it. A failure is the start's failure,
+// retried; a disk settled or without an overlay clears its hold.
+func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
+	for _, dc := range diskConfigs {
+		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
+		out, err := pitoverlay.Settle(ctx, dc.Path, owner)
+		switch {
+		case out == pitoverlay.Held:
+			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.Assess(dc.Path, owner, false))
+			r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
+			return detail
+		case err != nil:
+			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
+			return fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
+		case out == pitoverlay.Committed:
+			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
+				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+		}
+		// A disk this host cannot see (a shared pool not mounted here) reads
+		// as "no overlay" too: only a disk that is here clears a hold.
+		if _, serr := os.Stat(dc.Path); serr == nil && r.pitCleared != nil {
+			r.pitCleared(ctx, vm.Name, dc.Name)
+		}
+	}
+	return ""
+}
+
+// reportPITHeld reports a hold through the wired reporter, which keeps it as
+// a durable condition and decides when to notify. Without one (a bare
+// reconciler) it records the event once per (VM, disk) for as long as this
+// process runs: the start is retried every pass.
+func (r *Reconciler) reportPITHeld(ctx context.Context, vm, disk, detail string) {
+	if r.pitReport != nil {
+		r.pitReport(ctx, vm, disk, detail)
+		return
+	}
+	key := vm + "\x00" + disk
+	if _, done := r.pitHeldReported.LoadOrStore(key, true); done {
+		return
+	}
+	slog.Error("reconciler: "+detail, "vm", vm)
+	_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm, HostName: r.hostName, Type: "disk.pit_overlay_held",
+		Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
+	})
+}
+
 // domainXMLFor builds vm's domain XML on this host from its stored spec and
 // the disk configs the caller resolved: the cloud-init ISO, the networks
 // (provisioned here), firmware and resources. On failure it returns "" with
@@ -1780,6 +1906,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := network.FlatBridgeName(iface.NetworkName)
+		rate := compose.NICRate(spec, iface.Ordinal, iface.NetworkName)
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
 		provision := r.provision
@@ -1794,17 +1921,26 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:      strings.TrimPrefix(bridge, "direct:"),
+				Model:       "virtio",
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
+				RateMBps:    rate,
 			})
 		} else {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				MAC:    iface.MAC,
+				Bridge:      bridge,
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
+				RateMBps:    rate,
 			})
 		}
 	}
+
+	// The stored spec's disk tuning (discard, throttle) and NIC queues: a VM
+	// started on this host after a failover keeps what it had.
+	compose.ApplyDiskTuning(diskConfigs, spec)
+	compose.ApplyNICTuning(netConfigs, spec)
 
 	// Build libvirt domain config.
 	vmCfg := lv.VMConfig{
@@ -1818,12 +1954,23 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		Networks:     netConfigs,
 		CloudInitISO: cloudInitISO,
 		Boot:         spec.Boot,
+		CPULimit:     spec.CpuLimit,
+		CPUShares:    int(spec.CpuShares),
 	}
 	if vmCfg.Machine == "" {
 		vmCfg.Machine = "q35"
 	}
 	if vmCfg.Firmware == "" {
 		vmCfg.Firmware = "uefi"
+	}
+	// Memory hot-add: the same NUMA cell and virtio-mem region the VM was
+	// created with, plugged to its desired memory, so a set-memory after the
+	// recovery plugs instead of finding no region. (USB devices are added by
+	// the start hook every start path runs, PrepareHardwareForStart.)
+	if spec.MemoryHotplugMaxMib > 0 {
+		vmCfg.HotplugBaseMiB = int(spec.MemoryHotplugBaseMib)
+		vmCfg.HotplugMaxMiB = int(spec.MemoryHotplugMaxMib)
+		vmCfg.MemoryMiB = int(spec.MemoryMib)
 	}
 	// Secure Boot + vTPM (G1): stable UUID makes the swtpm state path
 	// (/var/lib/libvirt/swtpm/<uuid>/) deterministic; render the same firmware

@@ -94,14 +94,22 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
 		}
 	}
-	client, closeConn, err := s.dialPeer(ctx, targetHost)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
-	}
-	defer closeConn()
 	for i, d := range toCopy {
+		// One connection per disk: each disk's stream is the only RPC on its
+		// connection. A renewal of either host's certificate mid-copy drains
+		// the connections made with the replaced one — the stream in flight
+		// finishes (pki.ConnTracker), but no new RPC starts on them — so the
+		// next disk must not reuse one; a fresh dial presents and sees the
+		// renewed certificates. Each dial goes to the migration network when
+		// one is configured (dialColdPeer), as the whole copy did.
+		client, closeConn, err := s.dialColdPeer(ctx, targetHost, vmName, abort.diskAddr)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
+		}
 		abort.createdStubs = append(abort.createdStubs, d.Path)
-		if err := s.streamColdDisk(ctx, client, vmName, d, formats[d.Path]); err != nil {
+		err = s.streamColdDisk(ctx, client, vmName, d, formats[d.Path])
+		closeConn()
+		if err != nil {
 			code := status.Code(err)
 			switch code {
 			case codes.Unimplemented:

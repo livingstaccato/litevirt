@@ -59,8 +59,13 @@ func AssertStandalone(path string) error {
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("read image header: %w", err)
 	}
-	head = head[:n]
+	return AssertStandaloneHeader(head[:n])
+}
 
+// AssertStandaloneHeader is AssertStandalone for the first bytes of an image
+// already in memory (at least the first 4 KiB, or the whole image when it is
+// shorter).
+func AssertStandaloneHeader(head []byte) error {
 	switch {
 	case len(head) >= 4 && binary.BigEndian.Uint32(head[0:4]) == Magic:
 		if len(head) < 20 {

@@ -130,3 +130,31 @@ func TestVoterRegions(t *testing.T) {
 		t.Errorf("Voters must be the whole VoterSet (5 hosts not in maintenance), got %v", vr.Voters)
 	}
 }
+
+// TestVoterRegions_CarriesTheUncountedVotersOfTheSameRead (re-review 3, R6):
+// the region-scoped quorum counts take the voters and the voters that must not
+// count live from ONE read of host state, so a membership row landing between
+// two reads cannot make them disagree.
+func TestVoterRegions_CarriesTheUncountedVotersOfTheSameRead(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "e1", "e2")
+	retireLive(t, c)
+	if err := c.execLocal(ctx, `DELETE FROM host_membership WHERE host_name = 'e2'`); err != nil {
+		t.Fatal(err)
+	}
+	vr, err := VoterRegions(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	voters, uncounted, err := VoterSetWithUncounted(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vr.Voters) != len(voters) || !vr.Voters["e2"] {
+		t.Errorf("VoterRegions voters %v, want %v", vr.Voters, voters)
+	}
+	if !uncounted["e2"] || len(vr.Uncounted) != len(uncounted) || !vr.Uncounted["e2"] {
+		t.Errorf("VoterRegions uncounted %v, want %v (e2 reads unknown here)", vr.Uncounted, uncounted)
+	}
+}

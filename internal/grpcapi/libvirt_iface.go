@@ -81,6 +81,10 @@ type LibvirtBackend interface {
 	// domain, whose nonexistent live instance would reject a live-flagged DetachHostdev.
 	DetachHostdevConfig(domainName, pciAddress string) error
 	BlockResize(domainName, path string, sizeBytes int64) error
+	// SetDiskIOTune throttles one disk's I/O (target device dev, e.g. "vda"):
+	// the persistent definition, then the running domain. A zero IOTune clears
+	// every limit.
+	SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error
 	SetBootOrder(domainName, bootOrder string) error
 
 	// Migration.
@@ -124,11 +128,23 @@ type LibvirtBackend interface {
 
 	// Memory ballooning (#4): set the live balloon target (MiB) on a running VM.
 	SetMemory(domainName string, memMiB int) error
+	// SetVirtioMemRequested sets how much of a hot-add domain's virtio-mem
+	// region is plugged (MiB above the boot cell), persistent config first,
+	// then live when running.
+	SetVirtioMemRequested(domainName string, requestedMiB int) error
 
 	// SetVCPUs hot-adds (or reduces, guest permitting) the live vCPU count on a
 	// running domain, persisting to config too — for live CPU resize within the
 	// hotplug ceiling (live_resize).
 	SetVCPUs(name string, count int) error
+
+	// Noisy-neighbour limits, applied to the persistent config and, when the
+	// domain is running, live. SetCPUTune sets the CPU cap (cores; 0 clears it)
+	// and weight (0 leaves it); the cap is the whole domain's, so no vCPU count is
+	// involved. SetNICRate sets one NIC's bandwidth cap in MB/s
+	// (0 clears it).
+	SetCPUTune(name string, limit float64, shares int) error
+	SetNICRate(name, mac string, rateMBps float64) error
 
 	// Owner-epoch runtime marker, mirrored into domain metadata. The create path
 	// stamps it so a fresh VM is provable before CreateVM returns; internal/health
@@ -167,6 +183,14 @@ type LibvirtBackend interface {
 	// PoolDestroyIfDefined stops + undefines a libvirt storage pool (idempotent;
 	// no-op when the pool isn't defined). Belt-and-suspenders on pool delete.
 	PoolDestroyIfDefined(name string) error
+
+	// Ceph secrets: the key a ceph pool's VM disks authenticate with, in
+	// libvirt's own store (libvirt.CephSecretUUID names it). The value is never
+	// logged and cannot be read back.
+	DefineCephSecret(secretUUID, clientID string, value []byte) error
+	HasSecret(secretUUID string) (bool, error)
+	ListCephSecrets() ([]string, error)
+	UndefineSecret(secretUUID string) error
 
 	// VLAN tap configuration — invoked after CreateVM's StartDomain
 	// to push bridge-vlan rules onto the tap device libvirt created.

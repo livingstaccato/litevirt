@@ -32,6 +32,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
+	"github.com/litevirt/litevirt/internal/filerestore"
 	"github.com/litevirt/litevirt/internal/firewall"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
@@ -78,6 +79,9 @@ type Daemon struct {
 	svc     *grpcapi.Server // gRPC service handler; held so background loops can refresh it
 	checker *health.Checker
 	metrics *metrics.Server
+
+	// certWatch reports on the certificates this node serves (cert_watch.go).
+	certWatch *certWatch
 
 	// mintClearance is the gRPC server the lease-mint clearance asks, published
 	// once its gate is wired. Atomic because lease holders (the rebalancer)
@@ -263,6 +267,9 @@ func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
+	if err := d.checkMigrationNetwork(); err != nil {
+		return err
+	}
 	// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
 	// telemetry setup (which can block on a slow/unreachable collector — production
 	// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
@@ -310,6 +317,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Safe here: replication/anti-entropy start later in this method.
 	pki.SetTraceDialOptions(obs.ClientDialOptions)
 
+	// Finish or repair a host certificate renewal a crash interrupted
+	// (pki/hostswap.go), before anything reads host.crt/host.key. A pair that
+	// already loads is left alone.
+	if _, err := pki.RecoverHostIdentity(d.cfg.PKIDir, d.cfg.HostName); err != nil {
+		slog.Error("the host identity does not load and could not be recovered", "error", err)
+	}
+
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
 	if err := preflightUnitCheck(); err != nil {
@@ -348,6 +362,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Initialize corrosion schema
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
 		return fmt.Errorf("init schema: %w", err)
+	}
+	// Record, once, whether this node held users rows before anything could
+	// replicate in: the positive evidence an external-realm login needs on a
+	// node that is not credentials-live yet (corrosion/credentials_live.go).
+	if err := d.db.NoteCredentialsBaseline(ctx); err != nil {
+		return fmt.Errorf("record the credentials baseline: %w", err)
 	}
 
 	// Derive the cluster record from this node's CA if the cluster has none.
@@ -494,6 +514,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// it must reach host_membership too. Written to hosts.state alone, this
 	// node's own host_membership row would miss it until anti-entropy.
 	d.wireHostMembershipGate()
+	d.wireHostMembershipRetireGate()
 
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
@@ -641,7 +662,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.runPendingAuditFold(ctx)
 
 	// Move the secret columns onto the sensitive lane once credentials_split_v1
-	// has durably latched. Inert until then; see corrosion.SplitCredentials.
+	// has durably latched, and empty them once credentials_clear_v1 has too.
+	// Inert until then; see corrosion.SplitCredentials.
 	go d.runCredentialsSplit(ctx)
 
 	// Give host state and isolation their own row once host_membership_split_v1
@@ -670,9 +692,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.HostName = d.cfg.HostName
 	lxcRunner.DefaultPidsMax = d.cfg.Containers.DefaultPidsMax
 	lxcRunner.IDMappedRootfs = d.cfg.Containers.IDMappedRootfs
+	lxcRunner.HostAccess = d.cfg.Containers.hostAccess(d.cfg.DataDir, d.cfg.PKIDir)
+	lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
+	lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
+	lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
+	d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(lxcRunner.HostAccess))
+	go refreshHookPolicies(ctx, lxcRunner)
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
+	d.metrics.SetRelayRoles(repl.RelayRoles)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
 	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
 	// and bound an EPHEMERAL port on every interface — an unauthenticated
@@ -696,6 +725,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// so its replica-promoter (auto_promote recovery) can be wired first.
 	fc := failover.NewCoordinator(d.cfg.HostName, d.db)
 	fc.SetCapacityPolicy(capacity)
+	// The relay-health floor is the replicator's own BaseRelays.
+	fc.RelayConfig = relayCfg
 
 	// Start rebalance coordinator. Leader-gated; safe to start on
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
@@ -849,6 +880,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
 	d.svc = svc
 	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
+	{
+		iv := d.cfg.HostUpdates.IntervalMinutes
+		if iv <= 0 {
+			iv = 360
+		} else if iv < 5 {
+			iv = 5
+		}
+		svc.SetHostUpdates(grpcapi.HostUpdatesConfig{
+			Enabled:      d.cfg.HostUpdates.Enabled,
+			Interval:     time.Duration(iv) * time.Minute,
+			RefreshIndex: d.cfg.HostUpdates.RefreshIndex,
+		})
+	}
 	svc.SetContainerIDMapRange(d.cfg.Containers.IDMapBase, d.cfg.Containers.IDMapRanges)
 
 	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
@@ -984,6 +1028,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
+	svc.SetMigrationNetwork(d.cfg.Migration.Network)
+	svc.SetMigrationAddress(d.cfg.Migration.Address)
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	// Install once at start so the operator sees the state in the log; it runs
@@ -1051,6 +1097,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// copy whose row a VERIFIED recovery-claim certificate gave to another
 	// host is stopped on that proof, and only on it.
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
+	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1080,7 +1127,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
+	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
+	// restart): defined now, then kept in line with the pools and keyrings.
+	// An rbd disk's domain takes its monitors from its pool as configured on
+	// this host when the domain is defined, not from when the disk was made.
+	libvirt.SetCephMonitorResolver(svc.CephMonitorsForPool)
+	// Deleted ceph images wait in their pool's trash for a background purge;
+	// the ones a previous run had not finished are resumed (and named by
+	// ceph_trash_leftover while they fail).
+	if err := storage.ResumeCephPurges(d.cfg.DataDir); err != nil {
+		slog.Warn("ceph: trash purges of a previous run not resumed", "error", err)
+	}
+	svc.ReconcileCephSecrets(ctx)
+	go d.runCephSecretReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -1102,6 +1163,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	// A start whose ceph key must be proven, late in a walk with no time left
+	// for it, is left untouched for the next pass rather than half-started.
+	reconciler.SetStartDeferral(svc.CephStartDeferral)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
@@ -1368,10 +1432,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+
+	// Read-only report of this host's pending OS package updates (host_updates).
+	go svc.RunHostUpdateLoop(ctx)
 	// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	// Per-host disk SMART health: gauges + a notification on a failing/prefail disk.
+	if iv := parseSMARTInterval(d.cfg.SMART.Interval); iv > 0 {
+		go svc.RunSMARTMonitor(ctx, iv)
+	}
+	go svc.RunSharedLUNDetector(ctx, 60*time.Second)
+	// The holds this host keeps on iSCSI LUNs whose claims its rebuilds and
+	// recreates moved: released only on positive evidence, re-judged here.
+	go svc.RunLUNHoldResolver(ctx, 0)
 	// Effective-capacity sampler: every host publishes what it is ACTUALLY
 	// carrying (union of DB and runtime workloads), so placement counts rogue
 	// runtimes and refuses hosts whose observation is stale or incomplete.
@@ -1495,6 +1570,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// nil-safe: if BeginBackup fails, BackupSnapshot falls back to a full
 	// container backup.
 	svc.SetBackupSource(grpcapi.NewLibvirtBackupSource(d.virt))
+	// Point-in-time copies fall back to an external disk-only snapshot when
+	// no backup session opens (grpcapi/pit_copy.go, layer 2).
+	svc.SetPointInTimeSnapshotter(d.virt)
+	// A daemon that died while a layer-2 copy was in its window left the VM
+	// on the overlay with no event: settle every such overlay now.
+	go svc.SweepPITOverlays(ctx, svc.PITSweepReady(ctx))
 
 	// wire the WebAuthn second-factor engine. Empty
 	// rp_id disables — the gRPC handlers then return Unimplemented
@@ -1517,7 +1598,62 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// effectively (every schedule errors with ErrNoRepoConfigured until
 	// the operator adds a repo).
 	d.snapScheduler.Runner = grpcapi.BackupRunnerForScheduler(svc, d.cfg.BackupRepos)
-	svc.SetBackupRepos(d.cfg.BackupRepos)               // let RPC handlers resolve repo names
+	svc.SetBackupRepos(d.cfg.BackupRepos) // let RPC handlers resolve repo names
+	// Per-repo backup bandwidth limits. LoadConfig already refused a bad value.
+	if bw, err := d.cfg.BackupBandwidthLimits(); err == nil {
+		svc.SetBackupBandwidthLimits(bw)
+	} else {
+		slog.Error("backup_bwlimits", "error", err)
+	}
+	// Restore VMs a previous daemon left running (a crash, a restart, an
+	// upgrade) are killed whether or not file restore is still enabled.
+	frRunDir := fileRestoreRunDir(d.cfg.DataDir)
+	frUIDBase := d.cfg.FileRestore.UIDBase
+	if frUIDBase == 0 {
+		frUIDBase = filerestore.DefaultUIDBase
+	}
+	if n := filerestore.SweepStale(frRunDir, frUIDBase, d.cfg.Containers.ContainerIDRange()); n > 0 {
+		slog.Warn("file restore: killed restore VMs a previous daemon left running", "count", n)
+	}
+	if fr := d.cfg.FileRestore; fr.On() {
+		if err := filerestore.EnsureRestoreUser(); err != nil {
+			// File restore then refuses, naming the missing user.
+			slog.Warn("file restore: no restore VM user", "error", err)
+		}
+		// Round-1 builds kept the boot files in data_dir, owned by qemu's
+		// user; they are never read again.
+		_ = os.RemoveAll(filepath.Join(d.cfg.DataDir, "file-restore", "cache"))
+		idle := time.Duration(fr.IdleTimeoutSec) * time.Second
+		if idle <= 0 {
+			idle = 5 * time.Minute
+		}
+		svc.SetFileRestore(grpcapi.FileRestoreOptions{
+			Launcher: filerestore.NewLauncher(filerestore.Config{
+				QEMU: fr.QEMU, Kernel: fr.Kernel, ModulesDir: fr.ModulesDir,
+				MemoryMiB: fr.MemoryMiB, RunAs: fr.RunAs,
+				CacheDir: fileRestoreCacheDir(d.cfg.DataDir),
+				RunDir:   frRunDir,
+				OnTamper: svc.FileRestoreTampered,
+				// The agent outlives the host's idle timeout by a minute, so
+				// it only ever powers off on its own when the host is gone.
+				AgentIdle: idle + time.Minute,
+				Unsandboxed: filerestore.Barriers{
+					Seccomp: fr.AllowUnsandboxed.Seccomp, MAC: fr.AllowUnsandboxed.MAC, Root: fr.AllowUnsandboxed.Root,
+				},
+				AllowSharedRunAs: fr.AllowSharedRunAs,
+				UIDBase:          frUIDBase,
+				ContainerIDs:     d.cfg.Containers.ContainerIDRange(),
+			}),
+			IdleTimeout:     idle,
+			MaxSessions:     fr.MaxSessions,
+			MaxExtractions:  fr.MaxExtractions,
+			MaxExtractBytes: fr.ExtractLimit(),
+		})
+	}
+	// While a key that lifts a restore VM barrier is set, this host carries
+	// an informational file_restore_unsandboxed condition (resolved once it
+	// is not).
+	svc.ReconcileFileRestoreCondition(ctx, d.cfg.FileRestore.ReducedBarrierKeys())
 	svc.SweepTransferStaging()                          // clear orphaned peer-transfer staging repos from a prior incarnation
 	blockedCIDRs, _ := d.cfg.ImagePullBlockedPrefixes() // already validated in LoadConfig
 	svc.SetImageLimits(d.cfg.MaxImageBytes, time.Duration(d.cfg.ImagePullTimeoutSec)*time.Second, blockedCIDRs)
@@ -1542,6 +1678,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.OnFence = svc.NotifyHostFenced                                   // operator notification on fence (#5)
 	fc.OnDiskStranded = svc.NotifyVMDiskStranded                        // a VM restarted elsewhere left its host-local disk behind
 	fc.OnRootfsStranded = svc.NotifyCTRootfsStranded                    // a relocated container left its own rootfs behind
+	fc.OnRecoveryStalled = svc.NotifyRecoveryStalled                    // a fenced host's recovery that is not proceeding
 	fc.Events = svc.EventBus()                                          // a stopped workload left on a failed host
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
@@ -1596,6 +1733,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// library file to the recorded version (iso_library.go).
 	go d.runISOLibrarySync(ctx, svc)
 
+	// Certificates this node serves: re-record a host certificate renewed in
+	// place, export expiry, and notify ahead of it (cert_watch.go).
+	d.certWatch = newCertWatch(d.cfg.HostName, d.cfg.PKIDir, d.db, svc, metrics.NewCertMetrics())
+	go d.certWatch.run(ctx)
+
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
 	// and re-execs. Default on; disable with auto_upgrade.from_peer: false.
@@ -1649,8 +1791,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	rpcMetrics := metrics.NewRPCMetrics()
+	// Established connections are re-judged every few seconds (pki.ConnTracker):
+	// one made with a certificate since revoked, or with a host certificate a
+	// renewal replaced, drains and is closed, and its client re-handshakes. The
+	// auth interceptors refuse a new RPC on such a connection at once, without
+	// waiting for a sweep (Server.connIdentityGate).
+	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
+	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) pki.Verdict { return svc.ConnJudge(ctx) })
 	grpcOpts := []grpc.ServerOption{
-		grpc.Creds(credentials.NewTLS(tlsCfg)),
+		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
+		grpc.StatsHandler(connTracker.StatsHandler()),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
 		// Defense-in-depth for the legacy unary state-dump/replication paths: the
@@ -1688,15 +1838,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start web UI (connects back to local gRPC as a client).
 	go func() {
-		clientTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-		if err != nil {
-			slog.Warn("UI client TLS config failed", "error", err)
-			return
-		}
-		localConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-			grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
-			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-		)
+		// Recycled when this host's certificate is renewed: the connection
+		// made with the replaced one accepts no new RPC (pki.RecyclingConn).
+		localConn, err := d.localRecyclingConn()
 		if err != nil {
 			slog.Warn("UI gRPC dial failed", "error", err)
 			return
@@ -1713,14 +1857,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		uiSrv.SetCorrosionDB(d.db)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
-		// ACME (#13): when enabled, terminate UI TLS via autocert (step-ca / LE)
-		// with an internal-PKI fallback, and serve the HTTP-01 challenge on :80.
-		if tlsCfg, challenge := d.buildUITLSConfig(); tlsCfg != nil {
-			uiSrv.SetTLSConfig(tlsCfg)
-			startACMEChallengeServer(ctx, challenge)
-		}
+		// UI TLS (acme.go): a custom certificate (`lv host ui-cert set`), else
+		// ACME (HTTP-01 on :80, or DNS-01), else the cluster certificate. The
+		// listener re-decides TLS vs plain HTTP while running, so installing or
+		// clearing a custom certificate needs no restart.
+		uiTLS, challenge := d.buildUITLS(ctx)
+		startACMEChallengeServer(ctx, challenge)
+		d.certWatch.addUI(uiTLS)
+		uiAddr := fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)
+		warnPlainUI(d.cfg.UIBind, uiTLS.wantTLS())
 		uiSrv.StartCollector(ctx)
-		if err := uiSrv.ListenAndServe(fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)); err != nil {
+		if err := uiSrv.ServeSupervised(ctx, uiAddr, uiTLS.tlsConfig(), uiTLS.wantTLS, 5*time.Second); err != nil {
 			slog.Warn("UI server stopped", "error", err)
 		}
 	}()
@@ -1728,15 +1875,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start REST API gateway.
 	if d.cfg.RESTPort > 0 {
 		go func() {
-			restTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-			if err != nil {
-				slog.Warn("REST client TLS config failed", "error", err)
-				return
-			}
-			restConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-				grpc.WithTransportCredentials(credentials.NewTLS(restTLS)),
-				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-			)
+			restConn, err := d.localRecyclingConn()
 			if err != nil {
 				slog.Warn("REST gRPC dial failed", "error", err)
 				return
@@ -2027,6 +2166,13 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		if disksExp != "" {
 			opts[storage.DataDisksExportOption] = disksExp
 		}
+		// A ceph pool's row carries this host's key fingerprint, which the
+		// pool's other hosts compare theirs against (grpcapi/ceph_secrets.go).
+		if strings.EqualFold(p.Driver, "ceph") {
+			if fp, ok, err := storage.CephKeyFingerprintOf(p.Options); err == nil && ok {
+				opts[storage.CephKeyFPOption] = fp
+			}
+		}
 		if len(opts) > 0 {
 			rec.Options = opts
 		}
@@ -2247,6 +2393,41 @@ func (d *Daemon) refreshStoragePools(ctx context.Context) {
 	}
 }
 
+// cephSecretReconcileInterval is how often the ceph pools' libvirt secrets are
+// checked: a libvirtd restart drops them (they are ephemeral), and a keyring
+// rotated on disk changes the value they must hold.
+const cephSecretReconcileInterval = 30 * time.Second
+
+// runCephSecretReconcile keeps the ceph pools' libvirt secrets defined and
+// current until ctx is cancelled (grpcapi.ReconcileCephSecrets), and scans
+// the pools' trash for leftovers no purge here tracks — at start, and every
+// grpcapi.CephTrashScanInterval after (grpcapi.ScanCephTrash). Here, not in
+// Run's synchronous first reconcile: a cluster that does not answer must not
+// hold the daemon's start.
+func (d *Daemon) runCephSecretReconcile(ctx context.Context) {
+	ticker := time.NewTicker(cephSecretReconcileInterval)
+	defer ticker.Stop()
+	var lastScan time.Time
+	scan := func() {
+		if d.svc != nil && time.Since(lastScan) >= grpcapi.CephTrashScanInterval {
+			lastScan = time.Now()
+			d.svc.ScanCephTrash(ctx)
+		}
+	}
+	scan()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if d.svc != nil {
+				scan()
+				d.svc.ReconcileCephSecrets(ctx)
+			}
+		}
+	}
+}
+
 // refreshDBPoolCapacity updates total/used bytes for every file-based storage
 // pool registered for THIS host in the DB — including pools created at runtime
 // via `lv pool create`. registerStoragePools only scans cfg.StoragePools, so
@@ -2402,6 +2583,34 @@ func (d *Daemon) parsePCIRescanInterval() time.Duration {
 	}
 	return dur
 }
+
+// parseSMARTInterval parses smart.interval: empty = 1h default, "0"/"off" = disabled,
+// an unparseable value falls back to the default with a warning.
+func parseSMARTInterval(s string) time.Duration {
+	switch s {
+	case "":
+		return time.Hour
+	case "0", "off":
+		return 0
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil || dur < 0 {
+		slog.Warn("invalid smart.interval; using 1h", "value", s, "error", err)
+		return time.Hour
+	}
+	if dur == 0 {
+		return 0
+	}
+	if dur < minSMARTInterval {
+		slog.Warn("smart.interval below the floor; clamped", "value", s, "floor", minSMARTInterval)
+		return minSMARTInterval
+	}
+	return dur
+}
+
+// minSMARTInterval is the shortest smart.interval: smartctl forks per disk per
+// pass and a sub-minute interval would run it continuously.
+const minSMARTInterval = 10 * time.Minute
 
 // parseDurationOr parses a Go duration string, returning fallback when empty
 // or unparseable (logging a warning in the latter case).
@@ -2977,6 +3186,33 @@ func CredentialsSplitLatchedOnDisk(dataDir string) func() bool {
 	}
 }
 
+// wireCredentialsClearGate lets corrosion EMPTY the old secret columns once
+// credentials_clear_v1 is DURABLY latched (corrosion.MayClearCredentialColumns
+// also requires the split gate, so a node never empties its only copy).
+//
+// No config flag: the clear begins on its own once every replication
+// recipient runs a build that never needs the old columns. Unwired, the gate
+// fails closed and every old column keeps its secret, which is the dual-write
+// build's behaviour.
+func (d *Daemon) wireCredentialsClearGate() {
+	d.db.SetCredentialsClearGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.CredentialsClearV1)
+	})
+}
+
+// CredentialsClearLatchedOnDisk is the credentials_clear_v1 gate for a process
+// that is NOT the daemon — `lv user reset-admin` opens the local database
+// directly. It reads the same durable activation marker Checker.DurablyLatched
+// is backed by, so the CLI empties the old column exactly when the daemon on
+// that node would.
+func CredentialsClearLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.CredentialsClearV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
 // credentialsSplitInterval is how often the daemon re-runs the credentials
 // split. Each pass is a few indexed reads when there is nothing to do.
 const credentialsSplitInterval = time.Minute
@@ -2990,8 +3226,9 @@ func (d *Daemon) runCredentialsSplit(ctx context.Context) {
 	for {
 		if rep, err := d.db.SplitCredentials(ctx); err != nil {
 			slog.Warn("credentials split: pass failed", "error", err)
-		} else if rep.Copied > 0 {
-			slog.Info("credentials split: copied secrets onto the sensitive lane", "copied", rep.Copied)
+		} else if rep.Copied > 0 || rep.Cleared > 0 {
+			slog.Info("credentials split: moved secrets onto the sensitive lane",
+				"copied", rep.Copied, "cleared", rep.Cleared)
 		}
 		select {
 		case <-ctx.Done():
@@ -3012,6 +3249,25 @@ func (d *Daemon) runCredentialsSplit(ctx context.Context) {
 // change goes to hosts.state, the previous release's behaviour.
 func (d *Daemon) wireHostMembershipGate() {
 	d.db.SetHostMembershipGate(HostMembershipLatchedOnDisk(d.cfg.DataDir))
+}
+
+// wireHostMembershipRetireGate stops the state and isolation writers writing
+// the hosts copy once host_membership_retire_v1 has durably latched. Read from
+// the marker on disk, like wireHostMembershipGate, because the boot state is
+// written before the checker exists. No config flag. Unwired, the gate fails
+// closed and both homes keep being written, the dual-write build's behaviour.
+func (d *Daemon) wireHostMembershipRetireGate() {
+	d.db.SetHostMembershipRetireGate(HostMembershipRetireLatchedOnDisk(d.cfg.DataDir))
+}
+
+// HostMembershipRetireLatchedOnDisk reports whether host_membership_retire_v1
+// has durably latched on the node whose data directory is dataDir.
+func HostMembershipRetireLatchedOnDisk(dataDir string) func() bool {
+	path := health.ActivationMarkerPath(dataDir, capabilities.HostMembershipRetireV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
 }
 
 // HostMembershipLatchedOnDisk reports whether host_membership_split_v1 has
@@ -3060,6 +3316,12 @@ func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
 	})
+	// The relay demotion rows ride in cluster_policies, and are also unread by
+	// a previous-release peer, which would elect a different relay set: they
+	// wait for relay_health_v1 as well (corrosion/relay_health.go).
+	d.db.SetRelayHealthGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.RelayHealthV1)
+	})
 }
 
 // wireCorrosionGates wires every gate corrosion consults before emitting a
@@ -3070,6 +3332,7 @@ func (d *Daemon) wireCorrosionGates() {
 	d.wireLeaseTermLedgerGate()
 	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
+	d.wireCredentialsClearGate()
 	d.wireClusterPolicyGate()
 	d.wireVoterConfigGate()
 	d.wireRecoveryClaimGate()
@@ -3197,4 +3460,56 @@ func bootFirewallPass(ctx context.Context, r interface{ Reconcile(context.Contex
 	bctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	return r.Reconcile(bctx)
+}
+
+// checkMigrationNetwork refuses a migration.network that would send migration
+// data out the uplink or the cluster interface (grpcapi.CheckMigrationNetwork):
+// one outside the private ranges, or containing this host's cluster address or
+// its default-route source address.
+func (d *Daemon) checkMigrationNetwork() error {
+	if d.cfg.Migration.Network == "" {
+		return nil
+	}
+	n, err := grpcapi.ParseMigrationNetwork(d.cfg.Migration.Network)
+	if err != nil {
+		return err
+	}
+	if err := grpcapi.CheckMigrationNetwork(n, d.cfg.Migration.AllowAnyNetwork,
+		net.ParseIP(netutil.OutboundIP()), net.ParseIP(d.cfg.AdvertiseAddress)); err != nil {
+		return err
+	}
+	// migration.address must be this host's own: a down NIC would send the data
+	// out by the default route, and an address copied from another host's config
+	// would send every source to the wrong host.
+	if a := net.ParseIP(d.cfg.Migration.Address); a != nil {
+		addrs, _ := net.InterfaceAddrs()
+		for _, x := range addrs {
+			if ipn, ok := x.(*net.IPNet); ok && ipn.IP.Equal(a) {
+				return nil
+			}
+		}
+		return fmt.Errorf("migration.address %s is not an address of this host: check the interface is up, "+
+			"and that the value was not copied from another host's config", a)
+	}
+	return nil
+}
+
+// fileRestoreCacheDir holds the restore VM's boot files: outside data_dir
+// (whose contents production qemus may be granted), root-owned, 0750 to the
+// restore user's group.
+func fileRestoreCacheDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/var/cache/litevirt-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "boot-cache")
+}
+
+// fileRestoreRunDir is where restore VM sessions keep their NBD socket and
+// pidfile: under /run for a root daemon, outside data_dir, so a session never
+// shares a filesystem with state.db.
+func fileRestoreRunDir(dataDir string) string {
+	if os.Geteuid() == 0 {
+		return "/run/litevirt/file-restore"
+	}
+	return filepath.Join(dataDir, "file-restore", "run")
 }

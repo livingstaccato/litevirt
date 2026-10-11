@@ -122,7 +122,7 @@ func TestResetAdminPassword_LocalRootResetsAndAuditsOnce(t *testing.T) {
 // point: holding a session or a peer certificate is not root on this host.
 func TestResetAdminPassword_OnlyLocalRoot(t *testing.T) {
 	s := resetAdminFixture(t)
-	sess, _, _, err := s.mintSession(context.Background(), "admin", "local", "127.0.0.1", "test")
+	sess, _, _, err := s.mintSession(context.Background(), "admin", "local", "127.0.0.1", "test", "")
 	if err != nil {
 		t.Fatalf("mintSession: %v", err)
 	}

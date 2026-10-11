@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -28,16 +29,25 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		MemoryMiB:    int(spec.MemoryMib),
 		MinMemoryMiB: int(spec.MinMemoryMib),
 		MaxMemoryMiB: int(spec.MaxMemoryMib),
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		EnableVNC:    !spec.DisableVnc,
-		EnableSPICE:  spec.EnableSpice,
-		Disks:        disks,
-		Networks:     nets,
-		Hostdevs:     hostdevs,
-		Boot:         spec.Boot,
+		// Memory hot-add (virtio-mem): the boot cell and the ceiling.
+		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
+		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
+		Machine:        spec.Machine,
+		Firmware:       spec.Firmware,
+		GuestAgent:     spec.GuestAgent,
+		EnableVNC:      !spec.DisableVnc,
+		EnableSPICE:    spec.EnableSpice,
+		Disks:          disks,
+		Networks:       nets,
+		Hostdevs:       hostdevs,
+		Boot:           spec.Boot,
+		CPULimit:       spec.CpuLimit,
+		CPUShares:      int(spec.CpuShares),
 	}
+	// Disk discard / detect_zeroes / I/O throttle and NIC queues ride in the
+	// stored spec, so every render of the domain carries them.
+	compose.ApplyDiskTuning(cfg.Disks, spec)
+	compose.ApplyNICTuning(cfg.Networks, spec)
 	if r := spec.Resources; r != nil {
 		cfg.HugePages = r.Hugepages
 		cfg.IOThreads = int(r.IoThreads)

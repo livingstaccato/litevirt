@@ -1333,6 +1333,31 @@ destination keeps refusing is the cluster-wide stand-down left:
 recovered, then back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
+
+### A VM held on its point-in-time overlay (`pit_overlay.held`)
+
+Evaluator `pit_overlay`, subject kind `disk`, subject `<vm>/<disk>`, severity
+warning (it degrades the cluster's health). Raised, as a replicated row, by the
+host that held the VM: a layer-2 point-in-time copy left an overlay
+(`.<disk file>.lv-pit`) beside the disk that may hold the guest's newest writes
+and cannot be verified against the disk (docs/backups.md, "How a full replica
+is copied"). The VM is not started or defined on the bare disk while it stands.
+Its evidence carries the hold's text: the two files, the verdict
+(`matches`, `half-written`, `pivoted` or `unknown`) with its reason, and what to
+do for that verdict. `lv inspect <vm>` shows the same text as
+`pitOverlayHeld`, read from this row. The hold is notified once when it begins
+(`disk.pit_overlay_held` event, `replication.pit_overlay_held` notification) and
+then at most once a day while it lasts.
+
+A host that does not hold the `pit_overlay` release feature raises it for any
+overlay it finds, verifiable or not: it settles none (docs/backups.md, "Older
+builds and `.lv-pit` overlays"). It resolves when the hold clears: the overlay is committed or found already
+merged by any later start, copy, move or define of the disk; an admin resolves
+it with `lv resolve-pit-overlay <vm> <disk>`; `lv backup restore-from
+--in-place` sets the overlay aside before it restores; or the disk is deleted
+(a host that cannot see the disk never resolves it). Run that
+command without `--confirm` first: it prints the verdict, the disk's identity
+then and now, and what `--commit` and `--discard` would each do.
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external
@@ -1533,6 +1558,22 @@ with the `assert_nonce` in the node's marker, which neither this condition, the
 log, nor any RPC shows, and which a marker with `problem` set does not have. The
 condition row is rewritten only when what it says changes.
 
+### Container mount prefix shares a protected filesystem (`container_mount_prefix_overlap`)
+
+A node raises `container_mount_prefix_overlap` (warning) about **itself** when
+one of its `containers.bind_mount_paths` prefixes reaches a protected tree by
+filesystem identity but not by path — the prefix is on a filesystem that also
+holds `data_dir`, a pool or a backup repo, mounted somewhere else
+([passthrough.md](passthrough.md)). The daemon still starts: such a config
+loaded before identity was checked. Mount sources beneath the prefix that lie
+in the protected tree are refused when they are resolved; the rest of the
+prefix keeps working. The evidence carries `overlaps`, one line per prefix,
+naming the prefix and the tree; the daemon log says the same at start.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved
@@ -1642,6 +1683,51 @@ domain may still hold state that can be resumed.
    managed-save image (`virsh dominfo <vm>` reports `Managed save: no`). Then
    run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
    if you want to keep the firmware variables.
+
+### Shared iSCSI LUN (`shared_lun`)
+
+The `shared_lun` evaluator raises `shared_lun` (subject kind `cluster`, subject
+the LUN) when more than one guest writes one iSCSI LUN — two VMs, or two disks
+of one VM, on iscsi pools that name the same target and LUN (through any
+portal), or a VM whose disk is a LUN that an OLDER linked clone reads as its
+base: a clone's source is always older than the clone, so a younger VM on its
+base took the LUN after the source was deleted with `--keep-disks`. An iscsi
+pool is one LUN and holds one disk ([storage.md](storage.md#iscsi-one-lun-one-disk)),
+and a create refuses a second disk on one; a cluster where an older build let
+it happen is what this reports. The evidence names every VM, disk and host on
+the LUN; the involved hosts are the hosts those VMs are on.
+
+| Raised when | Clears when |
+|---|---|
+| A scan of the replica's `vm_disks` finds two or more live disks of live VMs whose recorded paths are one LUN (the target compared case-insensitively, the portal ignored), or such a disk and an older linked clone layered on it. Observed (warning) on the first such scan, confirmed (critical) on the second. | Two consecutive scans find no such use, under a valid decision gate. |
+
+It runs once a minute on whichever node holds its own lease
+(`shared_lun_detector`). It is detection only: the voter-majority LUN claim
+at create time is the prevention ([storage.md](storage.md#iscsi-one-lun-one-disk)).
+It **changes nothing**: no disk is touched, and it is not an ownership code, so
+admission — starting either VM included — does not read it. Refusing the start
+would not undo what both guests already wrote. Decide which VM keeps the LUN,
+stop the others, and move their disks to LUNs of their own (a pool per LUN).
+
+### iSCSI LUN holds (`iscsi_lun_hold_unreadable`, `iscsi_lun_hold_standing`)
+
+A rebuild or recreate of a VM with a disk on an iSCSI LUN moves the LUN's
+claim, and the host running it keeps a durable hold on the LUN until the
+evidence that it may let go arrives
+([storage.md](storage.md#iscsi-one-lun-one-disk)). Each host reports its own
+holds (evaluator `iscsi_lun_hold`, subject kind `host`, the subject the host),
+so each row has one writer. Neither condition is an ownership code: admission
+never reads it.
+
+| Code | Severity | Raised when | Clears when |
+|---|---|---|---|
+| `iscsi_lun_hold_unreadable` | critical | The host cannot read its hold records under `<data_dir>/iscsi-lun-holds/`: the directory or a record cannot be read, or a record does not parse. The evidence names the file. While it stands the host answers no LUN question: every iSCSI create on it, and every create elsewhere that must ask it, is refused. | The records read cleanly again: a read error is retried on every question; a record that does not parse stays until `lv host lun-hold discard` moves it aside. |
+| `iscsi_lun_hold_standing` | warning | A hold has stood for more than five minutes with no re-create running under it. The evidence names each VM, its LUNs and the host it was re-created on — normally that host cannot be asked, or the VM's rows have not reached the holding host. | The hold is released (its evidence arrived) or discarded. |
+
+The holds are checked every five seconds, and a condition is written only when
+it changes. `lv host lun-holds <host>` lists them. Discard one only after the
+check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
+a second VM off a LUN whose re-created VM's rows are still on their way.
 
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
@@ -1756,6 +1842,77 @@ on a stale decision.
    `<data_dir>/containers/<name>/owner_epoch` if it exists.
 4. The next reconcile pass resolves the condition.
 
+### A host's ceph keyring holds another key (`ceph_keyring_mismatch`)
+
+Each host records a one-way fingerprint of the key its ceph pool's keyring
+holds on its own row of the pool. When another host's row of the same pool
+records a different key, the host raises `ceph_keyring_mismatch` (evaluator
+`ceph_pool`, subject `host/<pool>@<host>`, warning) naming itself and the
+hosts whose key differs. It is a diagnostic: a start is gated on the host's
+own key opening each disk (`rbd info`), never on other hosts' rows; a live
+migration onto a host whose key differs from the source host's is refused
+before libvirt is asked. Install the cluster's keyring for the client on the
+odd host; the next reconcile (30 s) resolves the condition.
+See [storage.md](storage.md#ceph-rbd-pools).
+
+### A deleted ceph image is not purged from the trash (`ceph_trash_leftover`)
+
+A ceph image a VM delete (or a rollback of litevirt's own copy) removes is
+moved to its pool's trash, and its objects are purged in the background with
+`rbd trash rm <pool>/<id>`, retried until it succeeds and resumed after a
+daemon restart. While a purge this host owes has failed, the host raises
+`ceph_trash_leftover` (evaluator `ceph_pool`, subject `host/<host>`, warning).
+The evidence lists each leftover with its trash reference (`<pool>/<id>`), the
+image it was, a `state`, why it is listed, and the command that deals with it
+by hand (`by_hand`):
+
+- `purge_failing`: the purge keeps failing and is retried. The image's
+  capacity stays used until then. Common causes: the cluster unreachable from
+  the host, or snapshots on it. By hand: `rbd trash rm <pool>/<id>`.
+- `held`: a client has the image open in the trash. It opened the image just
+  before the move, and `rbd trash mv` does not refuse an open image. It may be
+  a running VM's disk, so it is **never purged automatically**. Put it back
+  with `rbd trash restore <pool>/<id>`.
+- `half_moved`: a `rbd trash mv` that failed left the image both in the trash
+  and under its name. It is never purged. Check it with
+  `rbd trash ls --all --long <pool>` and `rbd info <pool>/<image>`, then restore
+  it.
+- `settling`: a `rbd trash mv` failed and the trash or the image could not be
+  read to settle what it did, so the image may still be live under its name.
+  It is retried. Check it with `rbd trash ls --all --long <pool>` and
+  `rbd info <pool>/<image>`; litevirt advises no removal.
+- `untracked`: a litevirt-named image in a ceph pool's trash that no purge on
+  this host tracks, seen by two scans in a row (every 5 minutes). Causes: an
+  interrupted `rbd rm`, a crash that lost the queue, another host's purge
+  still running, or another host holding it because a client has it open.
+  Restoring it (`rbd trash restore <pool>/<id>`) is never destructive;
+  removing it may be, so litevirt advises only the restore. Remove it by hand
+  only once the host that put it there no longer names it.
+
+`unreadable_queue_files` names purge queue files found unreadable and moved
+aside (`<data_dir>/ceph-trash-purges.json.unreadable-<time>`). The purges they
+held are no longer tracked; check the pools' trash, then remove the file. A
+held entry is forgotten once its trash no longer lists it.
+
+The condition resolves on the next reconcile (30 s) once nothing is listed.
+See [storage.md](storage.md#ceph-rbd-pools).
+
+### A VM delete left a ceph image in its pool (`ceph_image_leftover`)
+
+A VM delete frees its disks best effort. A ceph image that a client still has
+open is refused as in use. The VM is deleted anyway, as before, but the image
+stays in its pool. That client may be another VM still running on the image.
+`lv rm` prints one line per image left in place, with its pool, name and the
+reason. This host also records the image in `<data_dir>/ceph-kept-images.json`
+and raises `ceph_image_leftover` (evaluator `ceph_pool`, subject
+`host/<host>`, warning). For each image, the evidence gives the VM and disk
+it came from, when the delete left it, the reason, and the check to run
+(`by_hand`: `rbd status <pool>/<image>; rbd info <pool>/<image>`).
+litevirt removes none of these images; decide by hand once you know who has
+the image open. An image stops being named as soon as a VM's disk names it
+again, and is forgotten once its pool answers without it (checked every 5
+minutes).
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the
@@ -1830,6 +1987,29 @@ Nothing moves or removes the rootfs; `lv ct inspect <name>` shows it.
 | Raised when | Clears when |
 |---|---|
 | A relocation moves the container off a host that ran it. | No container of that name is left on that host, or a relocation back adopted it (`ct.relocate.adopted` in the audit log). |
+
+### File restore without a barrier (`file_restore_unsandboxed`)
+
+A host whose daemon config lets restore VMs run without one of their barriers
+raises `file_restore_unsandboxed` about **itself** (evaluator `file_restore`,
+subject `host/<name>`), with one writer per row like `observer_stalled`. The
+keys are `file_restore.allow_unsandboxed` (`seccomp`, `mac`, `root`, or `true`
+for all three) and `file_restore.allow_shared_run_as`; both are off by
+default and dangerous (see [backups](backups.md#single-file-restore)). It is
+not an ownership condition and never blocks admission.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts with file restore on and either key set. Confirmed at once; **info** severity. The evidence lists the keys set (`allow_unsandboxed: [seccomp]`, `allow_shared_run_as`). | The daemon starts with neither key set, or with file restore off. |
+
+**What it means.** On this host a malicious backup meets one barrier fewer on
+its way to the host: no seccomp sandbox, no MAC (neither the AppArmor profile
+nor Landlock), a non-root daemon's own uid, or a shared qemu user. Every
+restore VM actually started that way is audited as
+`backup.file_restore_unsandboxed`, with `sandbox=on|off apparmor=on|off|absent
+landlock=<abi>|off uid=<n>`; the same summary is in every
+`backup.file_restore` row. Fix what the key works around (a qemu with seccomp,
+`apparmor_parser`, a kernel with Landlock, a root daemon) and remove the key.
 
 ## NetBox IPAM: metrics and health findings
 

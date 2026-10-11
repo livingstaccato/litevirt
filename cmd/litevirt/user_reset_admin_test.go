@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -40,7 +39,7 @@ func offlineReset(t *testing.T, db *corrosion.Client, dataDir, pw string) error 
 	if err != nil {
 		t.Fatalf("mintAdminPassword: %v", err)
 	}
-	return resetAdminOffline(context.Background(), db, dataDir, pw, "root", password, hash, io.Discard)
+	return resetAdminOffline(context.Background(), db, dataDir, pw, "root", "", password, hash, false, io.Discard)
 }
 
 // `lv user reset-admin` must not resurrect a deliberately deleted admin.
@@ -158,14 +157,42 @@ type fakeResetDaemon struct {
 	pb.LiteVirtClient
 	err error
 	got *pb.ResetAdminPasswordRequest
+	// predatesUser answers as a daemon that does not know the username field:
+	// it resets "admin" and names no account.
+	predatesUser bool
+	// pingSchema is the schema version Ping reports, 0 for this build's;
+	// pingErr fails the Ping instead. pinged counts the Pings.
+	pingSchema int32
+	pingErr    error
+	pinged     int
+	note       string // the daemon's ResetAdminPasswordResponse.note
 }
 
-func (f *fakeResetDaemon) ResetAdminPassword(_ context.Context, req *pb.ResetAdminPasswordRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (f *fakeResetDaemon) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	f.pinged++
+	if f.pingErr != nil {
+		return nil, f.pingErr
+	}
+	v := f.pingSchema
+	if v == 0 {
+		v = int32(corrosion.CurrentSchemaVersion)
+	}
+	return &pb.PingResponse{SchemaVersion: v}, nil
+}
+
+func (f *fakeResetDaemon) ResetAdminPassword(_ context.Context, req *pb.ResetAdminPasswordRequest, _ ...grpc.CallOption) (*pb.ResetAdminPasswordResponse, error) {
 	f.got = req
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &emptypb.Empty{}, nil
+	if f.predatesUser {
+		return &pb.ResetAdminPasswordResponse{}, nil
+	}
+	name := req.GetUsername()
+	if name == "" {
+		name = "admin"
+	}
+	return &pb.ResetAdminPasswordResponse{Username: name, Note: f.note}, nil
 }
 
 func envFor(t *testing.T, d *fakeResetDaemon, dataDir string, openDB func() (*corrosion.Client, error)) resetAdminEnv {

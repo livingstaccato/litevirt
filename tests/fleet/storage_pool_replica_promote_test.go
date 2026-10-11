@@ -22,6 +22,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -63,6 +64,7 @@ func TestFleet_ReplicaInADisksPoolIsPromotableAcrossHosts(t *testing.T) {
 		if err := corrosion.UpsertBackupSchedule(ctx, vmHost.DB, sched); err != nil {
 			t.Fatal(err)
 		}
+		vmHost.Virt.SetState(vm, libvirtfake.StateRunning) // running: its copy is point-in-time (layer 2)
 		// Two runs: the second prunes the first through the peer.
 		for _, ago := range []time.Duration{20 * time.Minute, 10 * time.Minute} {
 			if err := vmHost.Server.RunReplication(ctx, sched, time.Now().Add(-ago)); err != nil {

@@ -14,7 +14,8 @@ peers repair missed pushes through a peer-mTLS-only sensitive anti-entropy lane.
 
 - **Target** — a delivery destination. Types today: `webhook` (generic JSON
   POST of the notification) and `slack` (Slack incoming-webhook message with a
-  severity emoji). Config is `{"url": "…"}`.
+  severity emoji). Config is `{"url": "…"}`. `email` sends a plain-text email
+  over SMTP (see *Email targets* below).
 - **Route** — sends events whose **kind** matches an event-pattern glob and whose
   **severity** is at least `min_severity` to a target. A target receives nothing
   until a route points at it.
@@ -28,7 +29,16 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 |---|---|---|
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
-| `replication.failed` | error | a scheduled replication run fails |
+| `host.recovery.stalled` | error | a `fenced`/`offline` host's recoverable workloads are still on it 60 s after its fence record; names the host, the leader coordinator and why it is not proceeding. Repeats at most every 10 minutes per host |
+| `replication.failed` | error (warn when the target host is down) | a scheduled replication run starts failing or fails differently; a continuing failure is repeated at most hourly |
+| `replication.recovered` | info | a replication schedule that was failing replicates again |
+| `replication.suspended` | warn | a replication schedule targets the host its workload now runs on, and the move's switch did not arrive within 15 minutes: it does not replicate there |
+| `replication.replica_set_aside` | warn | a container replica was set aside, not removed: it is not proven to be contained in the data now replicated (`lv replication replicas`) |
+| `replication.reversed` | info | a replicated VM or container moved onto its replica host and its schedule now replicates back to the host it left (docs/backups.md, "Reverse replication") |
+| `replication.reverse_skipped` | warn | the same move, but the host it left could not be made the target; the workload is replicating onto its own host until the schedule is replaced |
+| `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |
+| `host.updates` | info | a host has pending OS package updates, none of them security |
+| `auth.first_factor_enrolled` | warn | an account enrolled its first second factor from an enrollment-only session (mandatory second-factor policy); if it was not the account's owner, remove the factor and reset the password |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |
 | `ha.dualrun.vm` | error | a VM is an active disk-holder on more than one host — a split-brain that can corrupt the disk |
@@ -39,9 +49,19 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.owner.epoch_suppressed` | error | under a latched `owner_epoch_v1`, a DB row is telling the owner-epoch check not to examine a VM while the runtime says that VM is running — a tombstoned row with a live disk-holder, a migration state parked well past its cutover window, or a `host_name` naming a host that is not in the cluster and so can never be probed |
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
+| `storage.lun_shared` | warn / error / info | more than one disk is one iSCSI LUN (an older build allowed it): warn when first observed, error once confirmed on a second scan, info when resolved. The detail names the VMs and disks — see `shared_lun` in [diagnostics.md](diagnostics.md#shared-iscsi-lun-shared_lun) |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
 | `ct.rootfs.stranded` | warn | a container relocated off a failed host left its own rootfs there (nothing removes it); the detail names the container and the host |
 | `vm.disk.stranded` | warn | a failover restarted a VM elsewhere and left its host-local disk on the failed host, a host set such a disk (or an old copy a failover found) aside, or failover held a `restart-same` VM with a host-local disk on its failed host to wait for it; the detail names the VM, the host and the path. See [migration-failover.md](migration-failover.md#the-real-disk-a-restart-leaves-behind) |
+| `certificate.expiring` | warn / error | a certificate this node serves (`host`: its cluster mTLS identity; `ui`: a custom web UI certificate) expires within 30 days (error within 7); repeated daily. Subject is `<host>/<cert>`; the detail names the renew command. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
+| `certificate.expired` | error | that certificate is past its NotAfter |
+| `certificate.revocation_owed` | warn | a renewal's replaced certificate is not revoked yet: a node that does not pin (an older build, or `auth.trust_rotated_peer_certs` on) still needs its signature in the newest voter generation; repeated daily until the cluster publishes the revocation itself. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
+| `certificate.revoked` | info | an owed revocation was published |
+| `certificate.revocation_owed_tampered` | error | an owed revocation's row was marked done or its CRL replaced although the serial was never revoked; restored to owed where possible. See [auth.md](auth.md#renewing-a-host-certificate-lv-host-renew-cert) |
+| `disk.smart.failing` | error | a disk on this host fails its SMART overall-health self-assessment (subject `host:/dev/sdX`) |
+| `disk.smart.warning` | warn | a disk passes SMART but reports a non-failure warning (NVMe temperature above its threshold: check cooling) |
+| `disk.smart.prefail` | warn | a disk still passes SMART but a prefailure attribute has tripped or the NVMe critical-warning flag is set |
+| `disk.smart.recovered` | info | a disk that was prefail/failing reports healthy again |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /
@@ -111,3 +131,90 @@ target + route (min-severity `warn`) without the CLI/UI — see
 Slack: paste an [incoming-webhook](https://api.slack.com/messaging/webhooks) URL
 as a `slack` target. Slack channels render the severity emoji + cluster +
 kind/subject at a glance.
+
+## Email targets
+
+An `email` target delivers each notification as a plain-text email over SMTP.
+Event routing is identical to the other types: a route (pattern + minimum
+severity) points at the target.
+
+```bash
+printf '%s' "$SMTP_PASSWORD" > /root/smtp.pw && chmod 600 /root/smtp.pw
+lv notify target add --name ops-mail --type email \
+    --smtp-host smtp.example.com --smtp-user lv@example.com \
+    --smtp-password-file /root/smtp.pw \
+    --from litevirt@example.com --to ops@example.com --to oncall@example.com
+lv notify route add --pattern "*" --target <target-id> --min-severity warn
+lv notify test <target-id>        # sends a real test email, like Proxmox's "Test"
+```
+
+| Flag | Meaning |
+|---|---|
+| `--smtp-host` / `--smtp-port` | relay; port defaults to 587 (`starttls`), 465 (`implicit`) or 25 (`none`) |
+| `--smtp-tls` | `starttls` (default: the relay MUST offer STARTTLS or nothing is sent), `implicit` (TLS from connect) or `none` |
+| `--smtp-tls-skip-verify` | do not verify the relay's certificate. **Certificate verification is on by default**; this is for a self-signed lab relay |
+| `--smtp-user` / `--smtp-password-file` | AUTH PLAIN credentials; the password comes from a file (or `-` for stdin), never a flag, so it stays out of shell history and `ps` |
+| `--from` / `--to` | sender and recipients (`--to` repeats) |
+
+Credentials are never sent before TLS is established, and a target with a
+username and `--smtp-tls none` is refused unless the relay is loopback. The
+SMTP password is stored in the target's config, in the same replicated,
+sensitive `notification_targets` table that holds webhook URLs; every list
+response (`lv notify target ls`, the API, the UI) masks it for every role, and
+it is never logged, and `CreateNotificationTarget` masks it in its own response too.
+An unknown key in the email config is refused by name. The config is stored canonically (re-encoded from the validated struct, lowercase keys
+only) so a differently-cased `Password` key cannot dodge the masking. To change the
+password, delete and re-add the target.
+
+**Rolling upgrade.** Creating an email target *with a password* is the
+`email_target_secret` feature of the release token `release_2026_11_v1`: it is refused
+(`the cluster upgrade must finish first (email_target_secret needs release_2026_11_v1)`)
+until every host runs a build that masks the password on read and the token has latched;
+the first create after the latch is recorded as the feature's use. See `lv cluster
+upgrade-status`. A passwordless email target (an open relay or IP-allowlisted relay) can
+be created at any time. Hosts still on an older build do not know the `email` type: they
+log `notify: bad target config` and send **no email** for events they handle, so email
+coverage has gaps (and a warning per event in those hosts' logs) until the rollout
+completes. Create email targets after the upgrade. Subjects are
+`[cluster] severity: kind subject`, with newlines stripped so a hostile VM name
+cannot inject headers. Each email also carries cluster, kind, severity, subject
+and detail in the body.
+
+A host on an older binary that receives an `email` target treats it as an
+unknown type, logs a warning and skips it; the other targets keep working.
+
+## Disk SMART alerts
+
+Every host checks its own disks with `smartctl` (from smartmontools) on
+`smart.interval` (default `1h`; `0` or `off` disables; values under `10m` are
+clamped to `10m` with a warning, since smartctl runs once per disk per pass) and:
+
+- exposes `litevirt_disk_smart_status{device,model,status}` (1 for the disk's
+  current status: `ok`, `warning`, `prefail`, `failing` or `unknown`; the series set
+  is swapped atomically each pass) and
+  `litevirt_disk_smart_available` (0 when `smartctl` is not installed) on that
+  host's Prometheus endpoint;
+- notifies `disk.smart.failing` (error) or `disk.smart.prefail` (warn) when a
+  disk enters or worsens into that state, and `disk.smart.recovered` (info) when
+  it clears. A standing failure is paged once per daemon run, not every pass; a
+  daemon restart pages it again.
+
+smartctl runs with `-n standby`, so a spun-down disk is not woken (it reports
+`unknown` for that pass and keeps its last state). Disk state is keyed by serial
+number (WWN as a fallback, device name last), so a device renamed across a reboot
+neither re-pages nor strands a standing failure; a disk that is physically removed
+simply drops out. An NVMe critical warning of only the temperature bit is
+`warning`; any other bit is `prefail`.
+
+An `unknown` read (a smartctl hiccup, or a disk asleep under `-n standby`, whose
+output carries no serial) keeps the disk's tracked identity and last state: a
+standing failure neither re-pages nor is lost, and a disk that recovered while
+unknown emits `disk.smart.recovered` when it next reads healthy. `recovered`
+means the same physical disk: a disk that is removed stops being tracked and
+never emits it, and a replacement at the same device name is a new disk (a bad
+one pages; a healthy one is silent).
+
+A host without `smartctl`, a virtual disk with no SMART support, or output that
+cannot be parsed reports `unknown`: it neither pages nor clears a standing
+failure. The check is informational only. It never fences a host, drains it or
+blocks a workload.

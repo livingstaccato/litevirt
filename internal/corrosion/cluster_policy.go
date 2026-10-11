@@ -6,7 +6,11 @@ package corrosion
 // read by every node from its own replica. Its keys are failover_scope and
 // the ISO library's (iso_library.go: iso_library_mode, one iso_library/<file>
 // row per sync-mode library file and one iso_library_host/<host> row per
-// host), all written through clusterPolicyUpsertSQL.
+// host), the pool records' (pool_records.go) and relay health's
+// (relay_health.go: one relay_demoted/<host> row per host the failover lease
+// holder has demoted from relay duty, and one relay_hold/<host> row per
+// operator hold), all written through
+// clusterPolicyUpsertSQL.
 // failover_scope says whether a host is fenced and its workloads recovered by a
 // quorum of the whole cluster (the default, and what every cluster did before
 // v58) or by a quorum of its own region's voters
@@ -148,13 +152,17 @@ type VoterRegionSets struct {
 	// RegionOf maps every non-deleted host, voter or not, to its region
 	// ("default" when unset). A fence target need not be a voter.
 	RegionOf map[string]string
+	// Uncounted is the voters that stay in a quorum's denominator but never
+	// count live (VoterSetWithUncounted), from the SAME read of host state
+	// as Voters.
+	Uncounted map[string]bool
 }
 
 // VoterRegions reads VoterSet and every host's region. It depends on
 // VoterSet's contract alone — a set of names — so it keeps working when that
 // set becomes an explicit voter configuration (colonelpanik/litevirt#251).
 func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
-	voters, err := VoterSet(ctx, c)
+	voters, uncounted, err := VoterSetWithUncounted(ctx, c)
 	if err != nil {
 		return VoterRegionSets{}, err
 	}
@@ -166,7 +174,7 @@ func VoterRegions(ctx context.Context, c *Client) (VoterRegionSets, error) {
 	for _, r := range rows {
 		regionOf[r.String("name")] = regionOrDefault(r.String("region"))
 	}
-	return VoterRegionSets{Voters: voters, RegionOf: regionOf}, nil
+	return VoterRegionSets{Voters: voters, RegionOf: regionOf, Uncounted: uncounted}, nil
 }
 
 // Region returns h's region, "default" for a host this set does not know.
@@ -213,6 +221,22 @@ func (v VoterRegionSets) Regions() []string {
 // keeps recovery in region. It means nothing under the cluster scope, where
 // recovery targets are cluster-wide anyway.
 const LabelFailoverAnyRegion = "litevirt.failover_any_region"
+
+// LabelAutoPromoteNotPointInTime, when "true" in a VM spec's labels, lets
+// automatic failover promote one of the VM's replicas that is recorded as
+// not point-in-time (copied with qemu-img convert -U after every
+// point-in-time copy failed) — and only when no point-in-time replica of it
+// exists. Absent, or anything else, holds such a VM down with an event naming
+// the manual promote command instead. A build that does not know the label
+// ignores it, which is the default.
+const LabelAutoPromoteNotPointInTime = "litevirt.auto_promote_not_point_in_time"
+
+// ErrPromoteHeld is wrapped by an automatic promotion that deliberately holds
+// the VM down — its only replicas are not point-in-time and it has not opted
+// in (LabelAutoPromoteNotPointInTime). The failover coordinator does not
+// reschedule a held VM that has a host-local disk: a reschedule cannot start
+// it, would re-home its record, and would hide the hold.
+var ErrPromoteHeld = errors.New("automatic promotion held")
 
 // RegionQuorum is one region's voting strength, as `lv cluster failover-scope`
 // prints it and the coordinator's regions-without-quorum gauge counts it.

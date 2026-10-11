@@ -27,6 +27,9 @@ func (s *Server) ListTwoFactors(ctx context.Context, req *pb.ListTwoFactorsReque
 			return nil, err
 		}
 	}
+	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
+		target = u.Username
+	}
 	rows, err := corrosion.ListUser2FA(ctx, s.db, target)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list 2fa: %v", err)
@@ -67,16 +70,34 @@ func (s *Server) EnrollTOTP(ctx context.Context, req *pb.EnrollTOTPRequest) (*pb
 		return nil, status.Errorf(codes.NotFound, "user %q not found", target)
 	}
 
+	target = user.Username
+	// From an enrollment-only session: no factor yet, a code (or the
+	// self-enrollment window), and the session ended BEFORE anything is
+	// enrolled — never promoted, never left beside the new factor (C1, I5).
+	first, err := s.firstEnrollment(ctx, req.GetEnrollmentCode(), true)
+	if err != nil {
+		return nil, err
+	}
 	res, err := auth.EnrollTOTP(ctx, s.db, target, req.Label)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "enroll totp: %v", err)
 	}
 	slog.Info("totp enrolled", "username", target, "label", req.Label, "by", caller)
 	s.audit(ctx, "2fa.enroll", target, "method=totp label="+req.Label, "ok")
+	if first {
+		s.noteFirstFactor(ctx, "totp")
+	} else if target != caller {
+		// An administrator enrolled a factor for the account: an outstanding
+		// first-enrollment code has nothing left to do (rereview m-b).
+		if err := s.voidEnrollmentCode(ctx, target); err != nil {
+			slog.Warn("could not void the enrollment code of an account an admin enrolled", "user", target, "error", err)
+		}
+	}
 	return &pb.EnrollTOTPResponse{
 		OtpauthUrl:    res.OtpAuthURL,
 		SecretBase32:  res.SecretBase32,
 		RecoveryCodes: res.RecoveryCodes,
+		SessionEnded:  first,
 	}, nil
 }
 
@@ -97,6 +118,9 @@ func (s *Server) DisableTwoFactor(ctx context.Context, req *pb.DisableTwoFactorR
 	}
 	if req.Method == "" {
 		return nil, status.Error(codes.InvalidArgument, "method required")
+	}
+	if u, err := corrosion.GetUser(ctx, s.db, target); err == nil && u != nil {
+		target = u.Username
 	}
 	if err := corrosion.DeleteUser2FA(ctx, s.db, target, req.Method, req.Label); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete 2fa: %v", err)

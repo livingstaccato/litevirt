@@ -35,6 +35,13 @@ const (
 	ctxKeyAuthMethod
 	ctxKeyMTLSCommonName
 	ctxKeyPrincipalKind
+	// ctxKeyEnrollOnly marks an enrollment-only session: the login policy
+	// requires a second factor for its realm and the account has none
+	// (login_policy.go).
+	ctxKeyEnrollOnly
+	// ctxKeyTokenID is the matched API token's id, so an open stream it
+	// authenticated can be re-checked (stream_watch.go).
+	ctxKeyTokenID
 )
 
 const (
@@ -126,7 +133,7 @@ func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
 // replicated because replication is what is refused. Leave it false in steady
 // state: with RegisterHost re-recording each node's own serial at startup, an
 // ordinary rotation converges without it.
-func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts = on }
+func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts.Store(on) }
 
 // SetRBACRealm sets this node's opt-in for realm-aware role-binding grammar.
 // The flag is the reversible kill switch; realm enforcement in GrantRole is
@@ -156,6 +163,9 @@ func (s *Server) UnaryAuthInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
+	if err := s.connIdentityGate(ctx); err != nil {
+		return nil, err
+	}
 	if skipAuth[info.FullMethod] {
 		if preSessionAuthMethods[info.FullMethod] {
 			if err := s.gateAuditHold(ctx, info.FullMethod, true); err != nil {
@@ -170,6 +180,9 @@ func (s *Server) UnaryAuthInterceptor(
 	}
 	ctx, err := s.authenticate(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := gateEnrollmentOnly(ctx, info.FullMethod); err != nil {
 		return nil, err
 	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
@@ -188,6 +201,9 @@ func (s *Server) StreamAuthInterceptor(
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
+	if err := s.connIdentityGate(ss.Context()); err != nil {
+		return err
+	}
 	if skipAuth[info.FullMethod] {
 		// Stamped here too, so a pre-session credential exchange added as a
 		// STREAMING RPC later cannot slip in unstamped — the unary path would
@@ -207,11 +223,19 @@ func (s *Server) StreamAuthInterceptor(
 	if err != nil {
 		return err
 	}
+	if err := gateEnrollmentOnly(ctx, info.FullMethod); err != nil {
+		return err
+	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
 		return err
 	}
 	if err := s.gateAuditHold(ctx, info.FullMethod, false); err != nil {
 		return err
+	}
+	// A stream authenticated by a USER credential is re-checked while it is
+	// open, and cut when the credential stops being one (stream_watch.go).
+	if userBearerIdentity(ctx) {
+		return s.serveWatched(ctx, srv, ss, handler)
 	}
 	return handler(srv, &wrappedStream{ss, ctx})
 }
@@ -230,6 +254,9 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 				return nil, status.Error(codes.Unauthenticated, "authorization header must use Bearer scheme")
 			}
 			rawToken := strings.TrimPrefix(val, "Bearer ")
+			if err := s.refuseUserBearersInQuarantine(); err != nil {
+				return nil, err
+			}
 
 			if strings.HasPrefix(rawToken, SessionTokenPrefix) {
 				return s.authenticateSession(ctx, strings.TrimPrefix(rawToken, SessionTokenPrefix))
@@ -242,10 +269,20 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 			if user == nil {
 				return nil, status.Error(codes.Unauthenticated, "invalid or expired token")
 			}
+			// A disabled or expired account's tokens stop working with it. Not
+			// subject to the second-factor policy: an API token is
+			// administrator-issued automation with no interactive holder.
+			if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
+				return nil, err
+			}
+			if err := s.refuseInactiveToken(ctx, user.Username, user.TokenCreatedAt); err != nil {
+				return nil, err
+			}
 			ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 			ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 			ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 			ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
+			ctx = context.WithValue(ctx, ctxKeyTokenID, user.TokenID)
 			if len(user.ScopePaths) > 0 {
 				ctx = context.WithValue(ctx, ctxKeyScopePaths, user.ScopePaths)
 			}
@@ -275,6 +312,9 @@ func (s *Server) authenticate(ctx context.Context) (context.Context, error) {
 	// continuation and stays admin (audits as system).
 	if kind == principalKindPeer && s.forwardedIdentityEnforced(ctx) {
 		if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+			if err := s.refuseUserBearersInQuarantine(); err != nil {
+				return nil, err
+			}
 			return s.authenticateForwardedBearer(ctx, fwd)
 		}
 	}
@@ -358,6 +398,13 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		if rows[0].String("deleted_at") != "" {
 			return false
 		}
+		// A certificate the CA has replaced (a standing renewal successor this
+		// node holds, pki.SupersededBy) is never the host, whatever the row's
+		// serial says: that column is replicated data any peer can write back.
+		if cert := peerLeafCert(ctx); cert != nil && !s.trustRotatedPeerCerts.Load() && s.pkiDir != "" &&
+			pki.SupersededError(s.pkiDir, cert) != nil {
+			return false
+		}
 		// Real peer calls carry the leaf certificate. Bind an active name to the
 		// exact CA-issued identity recorded at admission, so re-admitting a name
 		// cannot reopen a lagging peer to that name's old certificate.
@@ -375,7 +422,19 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 			if strings.EqualFold(recorded, presented) {
 				return true
 			}
-			if !s.trustRotatedPeerCerts {
+			// A CA-issued SUCCESSOR of the recorded certificate (`lv host
+			// renew-cert`): the CA's signature over "this replaces <recorded>"
+			// is the same authority admission recorded, so the renewed node
+			// stays a peer through the swap instead of waiting for its
+			// re-recorded serial to replicate. It cannot reopen a re-admitted
+			// name to an old certificate: that certificate predates the
+			// admission and so cannot name the serial the admission recorded.
+			// See pki.RenewedFromSerial.
+			if prev, ok := pki.RenewedFromSerial(cert); ok && strings.EqualFold(prev, recorded) &&
+				callerCertHasServerAuth(ctx) {
+				return true
+			}
+			if !s.trustRotatedPeerCerts.Load() {
 				return false
 			}
 			slog.Warn("peer presented a certificate other than the one recorded at admission; "+
@@ -545,11 +604,29 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 			// the owner would churn the row across nodes.
 			return nil, status.Error(codes.Unavailable, "forwarded identity not yet visible on owner; retry")
 		}
+		if user.Username != sess.Username {
+			return nil, status.Error(codes.Unauthenticated, "forwarded session belongs to an account that no longer exists")
+		}
+		if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
+			return nil, err
+		}
+		enrollOnly, err := s.sessionEnrollOnly(ctx, sid, sess.Realm)
+		if err != nil {
+			return nil, err
+		}
+		role := user.Role
+		if enrollOnly {
+			role = ""
+			ctx = context.WithValue(ctx, ctxKeyEnrollOnly, true)
+		}
 		ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
-		ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+		ctx = context.WithValue(ctx, ctxKeyRole, role)
 		ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
 		ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
+		// The relayed session's id, so an enrollment through this peer ends
+		// it exactly as one made on the entry node would (C1).
+		ctx = context.WithValue(ctx, ctxKeySessionID, sid)
 		// Preserve the relaying peer's transport CN so requirePeerCert /
 		// requireReplicationPeer (and audit) still see it through the promotion.
 		ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
@@ -566,10 +643,17 @@ func (s *Server) authenticateForwardedBearer(ctx context.Context, val string) (c
 	if user == nil {
 		return nil, status.Error(codes.Unauthenticated, "forwarded identity: invalid or expired token")
 	}
+	if err := s.refuseAmbiguousAccount(ctx, user.Username); err != nil {
+		return nil, err
+	}
+	if err := s.refuseInactiveToken(ctx, user.Username, user.TokenCreatedAt); err != nil {
+		return nil, err
+	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
 	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, "local")
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodToken)
+	ctx = context.WithValue(ctx, ctxKeyTokenID, user.TokenID)
 	ctx = context.WithValue(ctx, ctxKeyPrincipalKind, principalKindPeer)
 	ctx = context.WithValue(ctx, ctxKeyMTLSCommonName, peerCommonName(ctx))
 	if len(user.ScopePaths) > 0 {
@@ -638,9 +722,34 @@ func (s *Server) authenticateSession(ctx context.Context, sid string) (context.C
 		_ = corrosion.RevokeSession(ctx, s.db, sid)
 		return nil, status.Error(codes.Unauthenticated, "session user not found")
 	}
+	// Checked on every request rather than at disable time, so a disable or
+	// an expiry takes effect on every node as soon as its replica has it,
+	// whatever happened to the session rows.
+	// A session is bound to the EXACT stored name it was minted for
+	// (rereview-2 N6). The lookup above is normalized, so once one of two
+	// spellings is deleted, a session of the deleted one would otherwise
+	// resolve to — and authenticate as — the spelling that survives.
+	if user.Username != sess.Username {
+		_ = corrosion.RevokeSession(ctx, s.db, sid)
+		return nil, status.Error(codes.Unauthenticated, "session belongs to an account that no longer exists")
+	}
+	if err := s.refuseInactiveSession(ctx, user.Username, sess.CreatedAt); err != nil {
+		return nil, err
+	}
+	enrollOnly, err := s.sessionEnrollOnly(ctx, sid, sess.Realm)
+	if err != nil {
+		return nil, err
+	}
 	_ = corrosion.TouchSession(ctx, s.db, sid)
+	role := user.Role
+	if enrollOnly {
+		// No role at all: every role gate refuses it, so the few methods
+		// gateEnrollmentOnly admits cannot act on anyone but the caller.
+		role = ""
+		ctx = context.WithValue(ctx, ctxKeyEnrollOnly, true)
+	}
 	ctx = context.WithValue(ctx, ctxKeyUsername, user.Username)
-	ctx = context.WithValue(ctx, ctxKeyRole, user.Role)
+	ctx = context.WithValue(ctx, ctxKeyRole, role)
 	ctx = context.WithValue(ctx, ctxKeyRealm, sess.Realm)
 	ctx = context.WithValue(ctx, ctxKeySessionID, sid)
 	ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)

@@ -118,7 +118,7 @@ func TestReplicateCrossHost_ToAMainBuildSendsMainsReplica(t *testing.T) {
 	disks, _ := corrosion.GetVMDisks(ctx, f.s.db, "web")
 	if err := f.s.replicateCrossHost(ctx, corrosion.BackupScheduleRecord{
 		VMName: "web", Repo: "dr", Type: "replication", TargetPool: "dr", KeepReplicas: 1,
-	}, vm, &disks[0], "old-host", "20260910-000000"); err != nil {
+	}, vm, &disks[0], "old-host", "20260910-000000", true); err != nil {
 		t.Fatalf("replicating to a main-build host: %v", err)
 	}
 	if old.uploaded == nil || old.uploaded.GetFilename() != "web-1-20260910-000000.qcow2" || old.uploaded.GetPoolName() != "dr" || old.uploadData == 0 {
@@ -141,8 +141,11 @@ func TestReplicateIncremental_ToAMainBuildPushesMainsIncrement(t *testing.T) {
 	f.s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return old, func() {}, nil }
 	ctx := context.Background()
 	vm, _ := corrosion.GetVM(ctx, f.s.db, "web")
-	if base := f.s.newestLegacyRawReplica(ctx, "dr", "old-host", replicaKeyOf(vm, "1")); base != "web-1-20260909-000000.raw" {
+	if base := f.s.legacyRawReplicaTakenAt(ctx, "dr", "old-host", replicaKeyOf(vm, "1"), "web-1-20260909-000000.raw"); base != "web-1-20260909-000000.raw" {
 		t.Fatalf("fork base on a main-build host = %q, want web-1-20260909-000000.raw", base)
+	}
+	if base := f.s.legacyRawReplicaTakenAt(ctx, "dr", "old-host", replicaKeyOf(vm, "1"), bReplicaRaw); base != "" {
+		t.Fatalf("another project's top-level file %q was taken as web's fork base", base)
 	}
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20260910-000000", "raw")
 	if err := f.s.applyIncrementRemote(ctx, "old-host", "dr", rec, "web-1-20260909-000000.raw", 4,

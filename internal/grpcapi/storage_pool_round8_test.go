@@ -36,6 +36,10 @@ func ownPoolServer(t *testing.T) (*Server, string) {
 	}
 	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "pa", Driver: "dir", Target: own, Project: "acme"})
 	insertPromotableVM(t, s, "web", "acme", s.hostName, "root")
+	// web is running: its replicas are point-in-time through a backup
+	// session (pit_copy.go, layer 1), so failover promotes them. With no
+	// point-in-time layer they would be -U copies, which it holds instead.
+	s.SetBackupSource(sessionSource())
 	return s, own
 }
 
@@ -172,7 +176,7 @@ func TestPoolRound8_ARawNamedCopyIsNeverAnIncrementBase(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.newestRawReplica(context.Background(), "pa", s.hostName, "acme", "web", "root", "web/pa"); got != rec.File {
+	if got := s.rawReplicaTakenAt(context.Background(), "pa", s.hostName, "acme", "web", "root", "web/pa", rec.Taken); got != rec.File {
 		t.Errorf("increment base = %q, want the runner's %q", got, rec.File)
 	}
 }

@@ -71,6 +71,7 @@ type LDAPRealmConfig struct {
 	UserFilter       string `yaml:"user_filter,omitempty"`
 	GroupBaseDN      string `yaml:"group_base_dn,omitempty"`
 	GroupFilter      string `yaml:"group_filter,omitempty"`
+	UserLoginAttr    string `yaml:"user_login_attr,omitempty"`
 	UserNameAttr     string `yaml:"user_name_attr,omitempty"`
 	UserMailAttr     string `yaml:"user_mail_attr,omitempty"`
 	UserGroupAttr    string `yaml:"user_group_attr,omitempty"`
@@ -135,6 +136,7 @@ func BuildRegistry(ctx context.Context, db *corrosion.Client, configs []RealmCon
 				UserFilter:    rc.LDAP.UserFilter,
 				GroupBaseDN:   rc.LDAP.GroupBaseDN,
 				GroupFilter:   rc.LDAP.GroupFilter,
+				UserLoginAttr: rc.LDAP.UserLoginAttr,
 				UserNameAttr:  rc.LDAP.UserNameAttr,
 				UserMailAttr:  rc.LDAP.UserMailAttr,
 				UserGroupAttr: rc.LDAP.UserGroupAttr,

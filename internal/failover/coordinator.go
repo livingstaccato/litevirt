@@ -172,6 +172,39 @@ type Coordinator struct {
 	// skipAudited is the failover.skip state last audited per host and
 	// workload (auditSkip).
 	skipAudited map[string]string
+	// fencedOn records, per host in c.fenced, the fencing_log id of the fence
+	// this coordinator's recovery acted on ("" when it acted on none). A
+	// successful fence recorded since is news the cached host must not hide
+	// (fenceAuthorityChanged, lab drill S5).
+	fencedOn map[string]string
+	// lastFenceAt is, per host, when this coordinator last ran a fence of it,
+	// on its own clock; the failed-fence retry counts its backoff from it
+	// when that is later than the row (fenceRetryDue).
+	lastFenceAt map[string]time.Time
+	// retrying is the plan of the failed-fence retry failover is running, or
+	// nil for any other fence; it decides whether the fence notifies
+	// (fenceNotifies).
+	retrying *fenceRetry
+	// retryNotified is, per host, when a failed retry last notified.
+	retryNotified map[string]time.Time
+	// retryRefusedLogged is, per host, the failed attempt and reason of the
+	// last refused retry logged at Warn (logRetryRefused).
+	retryRefusedLogged map[string]string
+	// cycleCandidates is the set of fence candidates of the current cycle,
+	// for the stall alert's default reason.
+	cycleCandidates map[string]bool
+	// holdReason is, per host, why its recovery last did not proceed; the
+	// stall alert names it (alertStalledRecoveries).
+	holdReason map[string]string
+	// stallSince and stallAlerted are the stall alert's clock and its last
+	// alert, per host (alertStalledRecoveries).
+	stallSince   map[string]time.Time
+	stallAlerted map[string]time.Time
+	// OnRecoveryStalled, when set, is invoked when a fenced or offline host's
+	// recoverable workloads are still on it recoveryStallAfter after its fence
+	// record, and again at most every recoveryStallRepeat, so the daemon can
+	// emit an operator notification. Best-effort; must not block.
+	OnRecoveryStalled func(host, coordinator, reason string, pending int, since time.Time)
 	// confirmResumed records, per host, the operator confirmation a recovery
 	// was already resumed from in this process, so one confirmation resumes one
 	// recovery rather than one per cycle. Losing it on restart costs at most one
@@ -343,6 +376,13 @@ type Coordinator struct {
 	// (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.
 	pauseWaits map[string]pauseWait
+
+	// RelayConfig is the replicator's relay configuration; its BaseRelays is
+	// the floor below which relay health never demotes (relay_health.go).
+	// Zero is corrosion.RelayConfig's default.
+	RelayConfig corrosion.RelayConfig
+	// relay is the lease holder's relay-health hysteresis (relay_health.go).
+	relay relayHealthState
 	// oneWay records the hosts partition_one_way is raised for.
 	oneWay map[string]bool
 }
@@ -474,7 +514,19 @@ func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, cap
 		return req
 	}
 	spec := &pb.VMSpec{}
-	if json.Unmarshal([]byte(vm.Spec), spec) != nil || spec.Placement == nil {
+	if json.Unmarshal([]byte(vm.Spec), spec) != nil {
+		return req
+	}
+	// USB passthrough: a mapped device restricts recovery to the hosts its
+	// mapping lists; a raw one is plugged into the failed host and no other,
+	// so the VM stays there (no candidate) rather than starting without it.
+	if mappings, raw := corrosion.USBMappingNames(spec); len(mappings) > 0 || raw {
+		req.USBMappings = mappings
+		if raw {
+			req.USBHost = vm.HostName
+		}
+	}
+	if spec.Placement == nil {
 		return req
 	}
 	p := spec.Placement
@@ -490,6 +542,16 @@ func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, cap
 		req.MaxPerNode = int(p.MaxPerNode)
 	}
 	return req
+}
+
+// resolveUSBPlacement loads the hosts a recovering VM's USB mappings have a
+// device on, which SelectBatch cannot read itself. A read error leaves them
+// unresolved, and an unresolved mapping qualifies no host: the VM is not
+// recovered this pass rather than started where its device is not.
+func (c *Coordinator) resolveUSBPlacement(ctx context.Context, req *placement.Request) {
+	if err := placement.ResolveUSBMappingHosts(ctx, c.db, req); err != nil {
+		slog.Warn("failover: cannot read a VM's USB mappings; leaving it this pass (fail closed)", "vm", req.VMName, "error", err)
+	}
 }
 
 // now is the coordinator's clock — defaults to time.Now, overridable
@@ -722,6 +784,21 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.clearRegionDeclined(declined)
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
+	c.cycleCandidates = make(map[string]bool, len(candidates))
+	for _, cand := range candidates {
+		c.cycleCandidates[cand.target] = true
+	}
+
+	// Relay health (colonelpanik/litevirt#175): demote a host whose probes
+	// keep failing from relay duty, or restore one, as a replicated row every
+	// node's relay election reads. Before any fence, so a fence that ends the
+	// cycle early does not starve it, and told which hosts are fence
+	// candidates — those are fenced, not demoted. It never fails the cycle.
+	fenceCandidates := make(map[string]bool, len(candidates))
+	for _, cand := range candidates {
+		fenceCandidates[cand.target] = true
+	}
+	c.evaluateRelayHealth(ctx, voters, fenceCandidates)
 
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
@@ -764,10 +841,20 @@ func (c *Coordinator) run(ctx context.Context) {
 			// Or confirmed it off before anything fenced it: the cached skip
 			// of an 'offline' host would otherwise hide that for good.
 			h, err := corrosion.GetHost(ctx, c.db, target)
-			if err != nil || !c.confirmationFencesAfresh(ctx, h) {
+			if err != nil || h == nil {
 				continue
 			}
-			afresh = true
+			switch {
+			case c.confirmationFencesAfresh(ctx, h):
+				afresh = true
+			case c.fenceAuthorityChanged(ctx, h):
+				// A fence recorded since this coordinator handled the host
+				// (an operator's, another coordinator's), or its own failed
+				// fence due a retry: the cache must not hide either (lab drill
+				// S5). The ordinary path below re-reads both and decides.
+			default:
+				continue
+			}
 			delete(c.fenced, target)
 		}
 
@@ -795,6 +882,16 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue
 		}
+		// A host whose state this node cannot know — no membership row, and a
+		// hosts copy the retire token stopped (corrosion.HostStateUnknown) —
+		// is neither fenced nor recovered: a fence is irrevocable, and the
+		// row is one anti-entropy cycle away. It may be in maintenance or
+		// still joining. Not cached: re-read next cycle.
+		if h.State == corrosion.HostStateUnknown {
+			slog.Info("failover: target's membership row has not reached this node; skipping fence until it does", "host", target)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrStateUnknown)
+			continue
+		}
 		if aerr == nil && c.turnedActiveThisCycle(ctx, target, activeSince) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue
@@ -802,6 +899,11 @@ func (c *Coordinator) run(ctx context.Context) {
 		// recorded: h carries a successful fence a successor may resume from
 		// (recordedFence), whether or not this cycle resumed it.
 		recorded := false
+		// retry: this host's newest fence attempt failed and its retry
+		// backoff has passed (fenceRetryDue); it goes down the fence path
+		// below although it is recorded 'offline'.
+		retry := false
+		var retryPlan fenceRetry
 		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host is normally finished with — the fence ran and its
 			// recovery ran with it. But the two halves can land on different
@@ -819,6 +921,7 @@ func (c *Coordinator) run(ctx context.Context) {
 					slog.Info("failover: resuming recovery from a fence a previous leader recorded",
 						"host", target, "fence_id", rec.ID, "method", rec.Method)
 					c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
+					c.noteFencedOn(target, rec.ID)
 					c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "", c.fenceStateLatched(ctx))
 					continue
 				case resumeAfterRefence:
@@ -838,8 +941,17 @@ func (c *Coordinator) run(ctx context.Context) {
 			// A confirmation of this outage that no fence has followed: fence
 			// it now, as if it were still active (confirmationFencesAfresh).
 			afresh = c.confirmationFencesAfresh(ctx, h)
+			// A fence that FAILED does not park the host: once its backoff
+			// has passed, it is fenced again (fenceRetryDue).
+			if !afresh && !recorded {
+				retryPlan = c.fenceRetryDue(ctx, h)
+				retry = retryPlan.Due
+				if !retry && !retryPlan.Next.IsZero() {
+					c.noteHold(target, "fence failed; retrying at "+retryPlan.Next.UTC().Format(time.RFC3339))
+				}
+			}
 		}
-		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
+		if !afresh && !retry && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
 			// hosts.state and fencing_log replicate independently, so the state
 			// can land here a cycle or more before the row that authorises the
@@ -925,7 +1037,27 @@ func (c *Coordinator) run(ctx context.Context) {
 			"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target),
 			"region_scoped", c.scope.region)
 
+		if retry {
+			// Immediately before the fence, under the lease the candidate
+			// loop re-validated: a host anyone has seen answer since the
+			// attempt that failed is never fenced again (retryStillDown).
+			if why, down := c.retryStillDown(ctx, target, retryPlan.FailedAt); !down {
+				c.logRetryRefused(target, retryPlan.FailedAt, why)
+				c.mAttempt(PhaseSkip, ResultSkipped, ErrRetryHostAnswered)
+				c.noteHold(target, "fence failed, and the host has answered since; not retried: "+why)
+				continue
+			}
+			slog.Warn("failover: the newest fence of this host failed; fencing it again",
+				"host", target, "strategy", retryPlan.Strategy, "failures", retryPlan.Failures, "observers", cand.observers)
+			// The retry runs retryStrategy, never weaker than the host's
+			// current strategy allows, as a re-fence runs the recorded method.
+			again := *h
+			again.FenceStrategy = retryPlan.Strategy
+			h = &again
+			c.retrying = &retryPlan
+		}
 		c.failover(ctx, h)
+		c.retrying = nil
 	}
 
 	// A one-way condition raised for a host that is no longer a fence
@@ -966,13 +1098,20 @@ func (c *Coordinator) run(ctx context.Context) {
 	// this reports rather than recovers. Runs after recoverHosts and
 	// resolvePendingRelocations so a host or marker settled THIS cycle is already
 	// out of the count.
-	if n, err := c.strandedWorkloads(ctx); err != nil {
+	if byHost, err := c.strandedByHost(ctx); err != nil {
 		// Leave the gauge holding its last measured value: publishing 0 here
 		// would clear an operator's alert using a number we failed to read.
 		slog.Error("failover: count stranded workloads", "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 	} else {
+		n := 0
+		for _, k := range byHost {
+			n += k
+		}
 		c.mStranded(n)
+		// Name each host whose recovery has stalled, and why
+		// (alertStalledRecoveries).
+		c.alertStalledRecoveries(ctx, byHost)
 	}
 }
 
@@ -990,6 +1129,9 @@ func (c *Coordinator) run(ctx context.Context) {
 func (c *Coordinator) stepDownGauges() {
 	c.mStranded(0)
 	c.mRegionsWithoutQuorum(0)
+	// The stall alert is the leader's too: a node that takes the lease back
+	// starts its clocks afresh rather than alerting on a stale one.
+	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
@@ -1141,6 +1283,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, q quorumView) {
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		delete(c.fenced, h.Name)
 		delete(c.fenceRelocated, h.Name)
+		c.forgetHost(h.Name)
 	}
 }
 
@@ -1157,6 +1300,7 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
 			delete(c.pauseWaits, host)
+			c.forgetHost(host)
 		}
 	}
 }
@@ -1693,6 +1837,20 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 	if !c.observerStreakSpans(ctx, host, at) {
 		return "no observer has watched the host stay down since the fence", false
 	}
+	return c.answeredSince(ctx, host, at)
+}
+
+// answeredSince is fenceStillStands' second half: it reports false, and why,
+// when some observer's latest verdict about host — healthy or unready — is
+// newer than `at` (less fenceSkewMargin). It fails closed on a read error.
+//
+// Any observer counts, a non-voter included, and a verdict dated in the
+// future is not discarded the way the fence-candidate count discards one.
+// Both are deliberate and safe, because this check only ever REFUSES: a
+// non-voter that saw the host answer is evidence it is up, and an observer
+// whose clock runs ahead can delay a resume or a retry by at most its skew,
+// never cause one.
+func (c *Coordinator) answeredSince(ctx context.Context, host string, at time.Time) (string, bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
 	if err != nil {
@@ -1725,9 +1883,10 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 // recovery proceeds on, and binds shared-disk transfers to, the FRESH fence.
 // On failure nothing is recovered: the failed attempt is now the newest on
 // record, so recordedFence no longer offers the old fence and the host is not
-// re-fenced every cycle. The host is left for an operator — recorded
-// 'offline' by the failed fence, with `lv host fence-confirm` resuming it
-// through the confirmation path — and counted as error_class=refence_failed.
+// re-fenced every cycle, only on the failed-fence retry backoff
+// (fenceRetryDue). Until a fence succeeds the host stays recorded 'offline'
+// by the failed fence, with `lv host fence-confirm` resuming it through the
+// confirmation path, and is counted as error_class=refence_failed.
 func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec fenceRecord, observers int) bool {
 	// A re-fence is a new judgement, unlike a resume from the record, so it is
 	// held back while this node is in its stall grace, like any fence.
@@ -1762,6 +1921,7 @@ func (c *Coordinator) noteResumeDeclined(host string, rec fenceRecord, why strin
 		return
 	}
 	c.resumeDeclined[host] = rec.ID
+	c.noteHold(host, "the recorded fence "+rec.ID+" no longer stands: "+why)
 	slog.Warn("failover: the recorded fence of this host no longer stands, NOT resuming its recovery",
 		"host", host, "fence_id", rec.ID, "method", rec.Method, "fenced_at", rec.TS, "reason", why,
 		"hint", "if the host is down, 'lv host undrain "+host+"' lets the coordinator fence it afresh for this outage")
@@ -2243,6 +2403,10 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	defer cancelFence()
 
 	// Step 1: Fence the host.
+	if c.lastFenceAt == nil {
+		c.lastFenceAt = map[string]time.Time{}
+	}
+	c.lastFenceAt[h.Name] = c.now()
 	fr := c.fencer(fenceCtx, fence.HostConfig{
 		Name:          h.Name,
 		Address:       h.Address,
@@ -2305,8 +2469,13 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		c.writeFenceLog(ctx, rec)
 	}
 
-	if c.OnFence != nil {
+	if c.OnFence != nil && c.fenceNotifies(h.Name, fr) {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
+	}
+	if fr.Success {
+		// A fence that succeeded answers whatever held the recovery back;
+		// recoverFenced records anything that holds it now.
+		delete(c.holdReason, h.Name)
 	}
 
 	// Say so, at the moment it matters, when the fence proves nothing. The row
@@ -2340,7 +2509,12 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// one that relocated VMs must stay manual to avoid split-brain. Absent
 	// entirely — the resuming-leader case — means "not mine to judge", which
 	// recoverHosts reads as manual-undrain-only. See recoverHosts.
-	c.fenceRelocated[h.Name] = false
+	// A retry or re-fence of a host this coordinator already recovered from
+	// must not erase "VMs moved": only the first commit seeds it.
+	if _, seen := c.fenceRelocated[h.Name]; !seen {
+		c.fenceRelocated[h.Name] = false
+	}
+	c.noteFencedOn(h.Name, rec.ID)
 
 	// recoverFenced sees the host as this fence recorded it, so it does not
 	// write the same state a second time as a separate entry.
@@ -2538,6 +2712,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
 					"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "best-effort fence awaiting 'lv host fence-confirm "+h.Name+"' (safe-fence policy)")
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
@@ -2559,6 +2734,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"label", corrosion.LabelFenceRequiresConfirmation,
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			c.noteHold(h.Name, "unverified "+fr.Method+" fence awaiting 'lv host fence-confirm "+h.Name+"' ("+corrosion.LabelFenceRequiresConfirmation+")")
 			return
 		}
 		slog.Info("failover: operator confirmed an unverified fence, proceeding", "host", h.Name, "method", fr.Method)
@@ -2586,6 +2762,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 					"host", h.Name, "detail", fr.Detail,
 					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
 				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+				c.noteHold(h.Name, "manual fence awaiting 'lv host fence-confirm "+h.Name+"'")
 				return
 			}
 			slog.Info("failover: operator confirmed manual fence, proceeding",
@@ -2595,6 +2772,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
 				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+			c.noteHold(h.Name, "fence failed ("+fr.Method+": "+fr.Detail+"); retrying with backoff, or 'lv host fence-confirm "+h.Name+"' once it is off")
 			return
 		}
 	}
@@ -2603,6 +2781,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// the pause has certainly happened (docs/design/partition-pause.md §4.2);
 	// retryPauseWait finishes it from the fence loop.
 	if corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.pauseDeadlinePassed(ctx, h) {
+		c.noteHold(h.Name, "waiting out the host's partition pause")
 		return
 	}
 	delete(c.pauseWaits, h.Name)
@@ -2643,12 +2822,16 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
 	// a shared-disk transfer closed while a local-disk transfer still proceeds.
 	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+	// Recovery is running: whatever held it back before no longer does, and
+	// a refusal below records what holds it now (the stall alert's reason).
+	delete(c.holdReason, h.Name)
 
 	// Step 3: Find VMs that should be restarted.
 	vms, err := corrosion.ListVMs(ctx, c.db, "", h.Name)
 	if err != nil {
 		slog.Error("failover: list VMs", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list the host's VMs: "+err.Error())
 		return
 	}
 
@@ -2657,11 +2840,13 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	if err != nil {
 		slog.Error("failover: list healthy hosts", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list healthy hosts: "+err.Error())
 		return
 	}
 	if len(candidates) == 0 {
 		slog.Warn("failover: no healthy hosts available for VM rescheduling", "host", h.Name)
 		c.mAttempt(PhaseFence, ResultRefused, ErrNoCandidates)
+		c.noteHold(h.Name, "no healthy host to recover its workloads onto")
 		return
 	}
 	// A spec pin to a host that is down is ignored for this recovery
@@ -2672,6 +2857,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	if err != nil {
 		slog.Error("failover: list hosts", "host", h.Name, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		c.noteHold(h.Name, "recovery could not list hosts: "+err.Error())
 		return
 	}
 	hostState := make(map[string]string, len(allHosts))
@@ -2719,6 +2905,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				if c.stoppedVMRekeyable(ctx, h.Name, vm, disks, fenceEpoch) {
 					req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 					c.addPlacementLabels(ctx, &req, vm.Name)
+					c.resolveUSBPlacement(ctx, &req)
 					req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 					placementReqs = append(placementReqs, req)
 					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
@@ -2764,6 +2951,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				"vm", vm.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
+			c.noteHold(h.Name, "VM "+vm.Name+": active ownership condition "+code+"; resolve the dispute")
 			c.auditSkip(ctx, h.Name, vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
 			continue
 		}
@@ -2830,7 +3018,18 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
-			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil {
+			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil && errors.Is(err, corrosion.ErrPromoteHeld) && c.holdsDown(ctx, vm) {
+				// Held: the VM's only replicas are not point-in-time. A
+				// host-local disk cannot be restarted elsewhere, so a
+				// reschedule would only re-home the record onto a host that
+				// cannot start it and hide the hold; the VM stays where it
+				// is, down, until an operator promotes it by hand (the
+				// promotion's event names the command).
+				slog.Warn("failover: VM held down; its only replica is not point-in-time", "vm", vm.Name, "error", err)
+				c.mVM(ActionPromote, ResultSkipped, ErrPromoteFailed)
+				c.auditSkip(ctx, h.Name, vm.Name, "held: the only replica is not point-in-time", "held")
+				continue
+			} else if err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a
@@ -2886,6 +3085,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
 			c.addPlacementLabels(ctx, &req, vm.Name)
+			c.resolveUSBPlacement(ctx, &req)
 			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
 				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",
 					"vm", vm.Name, "pinned_host", pin, "pinned_host_state", hostState[pin], "from", h.Name)
@@ -2934,6 +3134,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			observations, c.now(), placementReqs); err != nil {
 			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
 				"host", h.Name, "error", err)
+			c.noteHold(h.Name, "batch placement failed: "+err.Error())
 			for i := range plans {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
@@ -2962,6 +3163,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
+				c.noteHold(h.Name, "VM "+vm.Name+": "+detail)
 				c.auditSkip(ctx, h.Name, vm.Name, detail, "skipped")
 				continue
 			}
@@ -3089,6 +3291,11 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
 		c.noteDiskStranded(ctx, h.Name, vm, targetName)
+		// The VM may now run on its own replica target: replicate back to the
+		// host it left (or leave the schedule suspended, reported by its runs).
+		corrosion.ReverseReplicationAudited(ctx, c.db, "vm", vm.Name, "", h.Name, targetName, func(detail, result string) {
+			c.audit(ctx, "replication.reverse", vm.Name, detail, result)
+		})
 	}
 
 	// Step 6: Relocate containers on the fenced host (B5). Unlike VMs, a
@@ -3157,6 +3364,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 				"container", ct.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionRelocate, health.ReasonOwnershipDispute)
 			c.mCt(ActionRelocate, ResultRefused, ErrOwnershipDispute)
+			c.noteHold(h.Name, "ct "+ct.Name+": active ownership condition "+code+"; resolve the dispute")
 			continue
 		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on
@@ -3352,6 +3560,17 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 	slog.Info("failover: container relocated via restore-from-backup", "container", ct.Name, "from", h.Name, "to", target)
 	c.audit(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
 	c.noteRootfsStranded(ctx, h.Name, ct, target, "backup-restore")
+	c.reverseContainerReplication(ctx, h.Name, ct, target)
+}
+
+// reverseContainerReplication switches the direction of a relocated container's
+// replication schedule when it landed on its own replica target: the host it left
+// becomes the target (corrosion.ReverseReplicationOnMove). Never fails the
+// relocation; a schedule that cannot be re-pointed is audited as skipped.
+func (c *Coordinator) reverseContainerReplication(ctx context.Context, from string, ct corrosion.ContainerRecord, to string) {
+	corrosion.ReverseReplicationAudited(ctx, c.db, "container", ct.Name, ct.Project, from, to, func(detail, result string) {
+		c.audit(ctx, "replication.reverse", ct.Name, detail, result)
+	})
 }
 
 // imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
@@ -3463,6 +3682,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	c.audit(ctx, "ct.relocate.recreate", ct.Name,
 		"relocated from "+h.Name+" to "+target+" (recreate from image)", "ok")
 	c.noteRootfsStranded(ctx, h.Name, ct, target, "image-recreate")
+	c.reverseContainerReplication(ctx, h.Name, ct, target)
 }
 
 // pickContainerTarget chooses a survivor via the placement engine, falling back
@@ -3472,6 +3692,18 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 // collision-free target exists, with skipped=true when that refusal already
 // marked the container relocate-skipped (no host has a container runtime).
 func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) (target string, skipped bool) {
+	// A container replicated on a schedule that allows auto-promote is restored
+	// where its replica is, so the data is already there: place it on that host
+	// when it is a healthy candidate and placement accepts it, and only then fall
+	// back to placement over every candidate.
+	if rh := c.containerReplicaHost(ctx, ct, candidates); rh != "" {
+		req := c.containerPlacementRequest(ct)
+		req.PinHost = rh
+		if t, perr := placement.Select(ctx, c.db, req); perr == nil && t == rh && !c.targetHasLiveContainer(ctx, t, ct.Name) {
+			return t, false
+		}
+	}
+
 	// The single-VM Select path carries the full capacity model (observations,
 	// reserves, incomplete-host exclusion). There is deliberately NO
 	// round-robin fallback on its failure: the old one walked the raw healthy
@@ -3573,6 +3805,26 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 	return out, nil
 }
 
+// holdsDown reports whether a VM whose automatic promotion was held stays
+// down rather than falling back to a reschedule: any disk that is not on
+// shared storage (or disks that cannot be read) holds it. A VM whose disks
+// are all shared is rescheduled as before — restarting from its own live disk
+// beats any replica — and an event says so.
+func (c *Coordinator) holdsDown(ctx context.Context, vm corrosion.VMRecord) bool {
+	disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+	if err != nil || len(disks) == 0 || corrosion.VMHasHostLocalDisk(disks) {
+		return true
+	}
+	detail := "automatic promotion held (the only replica is not point-in-time); every disk is on shared storage, so the VM is restarted from its own disk instead"
+	if ierr := corrosion.InsertVMEvent(ctx, c.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm.Name, HostName: c.hostName, Type: "vm.failover.restart_shared",
+		Result: "ok", Severity: "warn", Detail: detail, Username: "failover-coordinator",
+	}); ierr != nil {
+		slog.Warn("failover: record the shared-disk restart event", "vm", vm.Name, "error", ierr)
+	}
+	return false
+}
+
 // vmNeedsFailover reports whether this VM is one the coordinator would ever try
 // to move off a dead host.
 //
@@ -3645,9 +3897,23 @@ func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
 // value in place and reports through the error metric instead, because "0"
 // during a store outage is the all-clear on the one signal an operator alerts on.
 func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
-	hosts, err := corrosion.ListHosts(ctx, c.db)
+	byHost, err := c.strandedByHost(ctx)
 	if err != nil {
 		return 0, err
+	}
+	total := 0
+	for _, n := range byHost {
+		total += n
+	}
+	return total, nil
+}
+
+// strandedByHost is strandedWorkloads per fenced or offline host; a host with
+// none is absent.
+func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error) {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		return nil, err
 	}
 	// Read ONCE per cycle, not once per down host: ListBackupSchedules has no
 	// host or vm_name predicate (a full scan), and the map it builds is keyed by
@@ -3658,7 +3924,7 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 	if c.Promoter != nil {
 		rows, serr := corrosion.ListBackupSchedules(ctx, c.db)
 		if serr != nil {
-			return 0, serr
+			return nil, serr
 		}
 		for _, r := range rows {
 			if r.Type == "replication" && r.AutoPromote {
@@ -3666,14 +3932,14 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	total := 0
+	total := map[string]int{}
 	for _, h := range hosts {
 		if h.State != "fenced" && h.State != "offline" {
 			continue
 		}
 		vms, verr := corrosion.ListVMs(ctx, c.db, "", h.Name)
 		if verr != nil {
-			return 0, verr
+			return nil, verr
 		}
 		for _, vm := range vms {
 			if vmNeedsFailover(vm, enrolled[vm.Name]) {
@@ -3683,22 +3949,22 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 				if vm.State == "stopped" {
 					disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
 					if derr != nil {
-						return 0, derr
+						return nil, derr
 					}
 					if corrosion.VMHasHostLocalDisk(disks) {
 						continue
 					}
 				}
-				total++
+				total[h.Name]++
 			}
 		}
 		cts, cerr := corrosion.ListContainers(ctx, c.db, h.Name)
 		if cerr != nil {
-			return 0, cerr
+			return nil, cerr
 		}
 		for _, ct := range cts {
 			if containerNeedsFailover(ct) {
-				total++
+				total[h.Name]++
 			}
 		}
 	}
@@ -3711,3 +3977,29 @@ func vmFailurePolicy(vm corrosion.VMRecord) string { return corrosion.VMFailureP
 // vmUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e. has
 // host-local firmware state (NVRAM + swtpm) that can't survive its host dying (G1).
 func vmUsesFirmwareState(vm corrosion.VMRecord) bool { return corrosion.VMUsesFirmwareState(vm) }
+
+// containerReplicaHost is the host holding the replica of ct that a failover may
+// promote: the target of its enabled, auto-promote, container-scoped replication
+// schedule, when that host is one of the healthy candidates. "" when ct is not
+// replicated that way, or no restorer is wired to use a replica.
+func (c *Coordinator) containerReplicaHost(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) string {
+	if c.Restorer == nil {
+		return ""
+	}
+	rows, err := corrosion.ListBackupSchedules(ctx, c.db)
+	if err != nil {
+		return ""
+	}
+	for _, r := range rows {
+		if r.Type != "replication" || !r.Enabled || !r.AutoPromote || r.TargetHost == "" ||
+			!corrosion.ContainerScheduleIs(r, ct.Project, ct.Name) {
+			continue
+		}
+		for _, h := range candidates {
+			if h.Name == r.TargetHost {
+				return r.TargetHost
+			}
+		}
+	}
+	return ""
+}

@@ -50,18 +50,21 @@ type adminFloor struct {
 const AdminFloorSettle = 30 * time.Second
 
 // EnsureAdminFloor is one check of the admin floor. It reports the account it
-// reinstated, "" when it did not act. See the block comment above.
-func (c *Client) EnsureAdminFloor(ctx context.Context, settle time.Duration) (string, error) {
+// reinstated, "" when it did not act. See the block comment above. run opens
+// the login rules' release feature for the reinstatement's cut-offs
+// (ReinstateAdminIfNoneRemain); nil writes without them.
+func (c *Client) EnsureAdminFloor(ctx context.Context, settle time.Duration, run FeatureRun) (string, error) {
 	f := &c.adminFloor
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	live, err := c.Query(ctx,
-		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL LIMIT 1`)
+	// Usable admins only (t1-auth-review I4): a live admin that is disabled
+	// or expired does not satisfy the floor.
+	usable, err := UsableAdminExists(ctx, c)
 	if err != nil {
 		return "", err
 	}
-	if len(live) > 0 {
+	if usable {
 		f.zeroSince = time.Time{}
 		return "", nil
 	}
@@ -82,7 +85,7 @@ func (c *Client) EnsureAdminFloor(ctx context.Context, settle time.Duration) (st
 	if now.Sub(f.zeroSince) < settle {
 		return "", nil
 	}
-	who, err := ReinstateAdminIfNoneRemain(ctx, c)
+	who, err := ReinstateAdminIfNoneRemain(ctx, c, run)
 	if err != nil {
 		return "", err
 	}

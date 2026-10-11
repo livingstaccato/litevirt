@@ -142,6 +142,33 @@ const (
 	// stored, not a policy.
 	CredentialsSplitV1 = "credentials_split_v1"
 
+	// CredentialsClearV1 is the second step of the secret-column move
+	// (docs/design/credentials-clear.md, colonelpanik/litevirt#268): once it
+	// has durably latched, hosts.ipmi_pass, users.password_hash and
+	// tokens.token_hash are EMPTIED, so the public rows and the operator-safe
+	// state dump stop carrying secrets. Writers write the credential row and ''
+	// in the old column, in the statement shapes the previous build already
+	// decodes, and the split pass clears what is left, re-emitting the
+	// credential row ahead of each clear in one batch.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build never needs the old column to find a secret.
+	// Its readers take the credential row whenever one exists, and so does the
+	// build before it (credentials_split_v1), which is the build a rollback
+	// lands on. A flag would only stop the latch forming
+	// (driveCapabilityLatches skips a flag-off token that has not latched), and
+	// the secrets would stay in the public dump.
+	//
+	// The claim must hold of every host still RECEIVING replication, not
+	// merely of every host that votes, so the token is in replicationGated: a
+	// host parked in `maintenance` on a build that reads only the old columns
+	// still receives the clears and still serves logins once it returns.
+	//
+	// The clear needs credentials_split_v1 as well: Client.MayClearCredentialColumns
+	// requires both gates, so a node never empties an old column before it is
+	// writing the credential tables.
+	CredentialsClearV1 = "credentials_clear_v1"
+
 	// HostMembershipSplitV1 gates moving a host's coordinator-owned membership
 	// facts — hosts.state and hosts.isolation_epoch/isolation_reason — out of
 	// the shared `hosts` row into host_membership, a row of their own with its
@@ -176,6 +203,31 @@ const (
 	// flag-gated split would never latch and the lost updates would stay. The
 	// split changes where a fact is stored, not a policy.
 	HostMembershipSplitV1 = "host_membership_split_v1"
+
+	// HostMembershipRetireV1 is the second step of the membership move
+	// (docs/design/host-membership-retire-old-columns.md,
+	// colonelpanik/litevirt#267): once it has durably latched, the state and
+	// isolation writers stop writing the hosts copy (hosts.state,
+	// hosts.isolation_epoch, hosts.isolation_reason) and write host_membership
+	// alone, so a fence or a drain no longer moves the hosts row's clock and
+	// cannot cost a concurrent version or resource report.
+	//
+	// It states a fact about the BINARY: this build never needs the hosts copy
+	// to know a host's state or isolation. Its readers resolve from
+	// host_membership, and so does the build before it
+	// (host_membership_split_v1), the build a rollback lands on. Mandatory, for
+	// the credentials_split_v1 reason: a flag would only stop the latch forming.
+	//
+	// ReplicationGated: the claim must hold of every host still RECEIVING
+	// replication, a maintenance host on a build that reads only hosts.state
+	// included, or that host would stop seeing fences and drains.
+	//
+	// The columns are never cleared (hosts.state is NOT NULL, and a clear would
+	// itself be the hosts write this token exists to stop). A writer whose
+	// hosts statement carries other columns too — InsertHost, a re-admission,
+	// the boot report — keeps its shape: the row clock moves for those columns
+	// anyway, and keeping the shape adds no ledger entry.
+	HostMembershipRetireV1 = "host_membership_retire_v1"
 
 	// FailoverScopeV1 gates the cluster-wide failover_scope policy
 	// (cluster_policies, schema v58; docs/design/region-scoped-failover.md).
@@ -294,6 +346,28 @@ const (
 	// holder's state), so the latch must hold of every host this node
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
+
+	// RelayHealthV1 gates health-aware relay election
+	// (colonelpanik/litevirt#175, internal/corrosion/relay_health.go). Once
+	// latched, the failover lease holder may DEMOTE a host whose probes keep
+	// failing from enough voters, by writing a relay_demoted/<host> row in
+	// cluster_policies, and every node's RelayEligibleHosts treats that host
+	// as ineligible: a leaf, never a relay.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build READS the demotion rows when it elects
+	// relays. The relay set is only useful if every node computes the same
+	// one, and a previous-release peer decodes the row but ignores the key,
+	// so it would keep the demoted host as a relay while every upgraded node
+	// dropped it. A flag would do the same thing on purpose: one node
+	// electing a different set from its peers.
+	//
+	// ReplicationGated: the claim is about what every host still receiving
+	// replication READS, a maintenance host on the previous build included,
+	// because every one of them elects relays from what it receives. The
+	// write also needs the cluster_policies gate (failover_scope_v1), which
+	// proves the shape decodes.
+	RelayHealthV1 = "relay_health_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
@@ -793,6 +867,18 @@ const ReleaseToken = Release202611V1
 //     comes with a second token in a later one
 //     (docs/design/credentials-clear.md).
 //
+//   - credentials_clear_v1 has no stand-down either, and it is the one step
+//     of the secret move that is not undone by upgrading again: once it has
+//     latched, every node empties hosts.ipmi_pass, users.password_hash and
+//     tokens.token_hash. A binary rolled back one build, to
+//     credentials_split_v1, enters WAL quarantine like any rollback below a
+//     latched token, and still reads every secret, because that build reads
+//     the credential row whenever one exists and the clearing build keeps
+//     writing them. A binary rolled back TWO builds, below
+//     credentials_split_v1, reads only the old columns and finds nothing;
+//     that rollback is unsupported once this token has latched
+//     (docs/upgrades.md).
+//
 //   - host_membership_split_v1 has no stand-down either, and the same
 //     rollback shape as credentials_split_v1: a binary rolled back below it
 //     enters WAL quarantine, and cannot decode the host_membership statements
@@ -801,6 +887,13 @@ const ReleaseToken = Release202611V1
 //     reader still reads the current state, voter set and isolation, and
 //     upgrading again loses nothing. Retiring the old columns is a later
 //     release's step (docs/design/host-membership-retire-old-columns.md).
+//
+//   - host_membership_retire_v1 has no stand-down either. Once it has
+//     latched, fences, drains and isolations stop writing the hosts copy. A
+//     binary rolled back one build, to host_membership_split_v1, enters WAL
+//     quarantine and still reads state and isolation from host_membership. A
+//     binary rolled back TWO builds reads only hosts.state, which no longer
+//     follows; that rollback is unsupported once this token has latched.
 //
 //   - failover_scope_v1 has no stand-down of its own: the policy it licenses
 //     does. `lv cluster failover-scope cluster` returns every coordinator to
@@ -839,6 +932,20 @@ const ReleaseToken = Release202611V1
 //     litevirt.fence_requires_confirmation still decide whether a recovery
 //     runs on one. A binary rolled back below it enters WAL quarantine, as
 //     below every latched token.
+//
+//   - relay_health_v1 has no flag either: it says this build reads the
+//     demotion rows when it elects relays, and every node relies on every
+//     other electing the same set. What it licenses is bounded — a demotion
+//     withholds the relay ROLE only (the host stays a leaf), the lease holder
+//     never demotes below the election's relay count, changes at most one
+//     host per cycle, and restores a host after 10 minutes below the
+//     demotion bar. Its stand-down is `lv cluster relay-restore <host>
+//     [--hold <duration>]` (admin, audited): it clears the demotion through
+//     the same replicated row at once and, with a hold, keeps the lease
+//     holder from demoting that host again — the answer to a demotion the
+//     evaluator keeps re-deriving from a fault that is not the host's. A
+//     binary rolled back below it enters WAL quarantine, as below every
+//     latched token.
 //
 //   - release_2026_11_v1 (the release token) has no flag and no stand-down of
 //     its own, and needs none: latching it changes nothing until a feature is
@@ -923,10 +1030,20 @@ var supported = []string{
 	// be able to misreport, and a flag would keep the latch from forming on a
 	// fully rolled fleet.
 	CredentialsSplitV1,
+	// CredentialsClearV1 is mandatory but advertised only once this node has
+	// completed a credentials split pass (grpcapi's advertisement filter,
+	// corrosion.CredentialsLive): readiness, not a policy. So no clear can
+	// latch before every recipient has a credential row for every secret it
+	// holds, and a node's first pass always runs before any clear.
+	CredentialsClearV1,
 	// HostMembershipSplitV1 is advertised UNCONDITIONALLY, for the same reason:
 	// it says "this build decodes host_membership's statement shapes and reads
 	// state and isolation from it", a fact about the binary.
 	HostMembershipSplitV1,
+	// HostMembershipRetireV1 is advertised UNCONDITIONALLY: it says "this
+	// build never needs the hosts copy of state and isolation", a fact about
+	// the binary.
+	HostMembershipRetireV1,
 	// FailoverScopeV1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes cluster_policies and honours failover_scope", a fact about the
 	// binary. The policy is the row, not a flag.
@@ -944,6 +1061,9 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
+	// RelayHealthV1 is advertised UNCONDITIONALLY: it says "this build reads
+	// the relay_demoted rows when it elects relays", a fact about the binary.
+	RelayHealthV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -977,7 +1097,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1020,12 +1140,21 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: the
 	// credential tables' shapes must be decodable by every host we stream to —
 	// a maintenance host on the previous build still receives every statement.
-	// (The old-column clear that also needs this is a later release's token.)
+	// (The old-column clear that also needs this is credentials_clear_v1.)
 	CredentialsSplitV1: true,
+	// Confirmed against every replication recipient: the clear must not reach
+	// a host that still reads only the old columns — a maintenance host on a
+	// build before credentials_split_v1 serves logins and fences once it
+	// returns to service.
+	CredentialsClearV1: true,
 	// Confirmed against every replication recipient: host_membership's shapes
 	// must be decodable by every host we stream to, a maintenance host on the
 	// previous build included.
 	HostMembershipSplitV1: true,
+	// Confirmed against every replication recipient: once the hosts copy stops
+	// being written, a host that reads state only from hosts would stop seeing
+	// fences and drains — a maintenance host on such a build included.
+	HostMembershipRetireV1: true,
 	// Confirmed against every replication recipient: cluster_policies' shapes
 	// must be decodable by every host we stream to.
 	FailoverScopeV1: true,
@@ -1039,6 +1168,10 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
+	// Confirmed against every replication recipient: each of them elects
+	// relays from what it receives, so each must read the demotion rows. See
+	// RelayHealthV1.
+	RelayHealthV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1078,9 +1211,15 @@ var mandatory = map[string]bool{
 	// not a policy. See CredentialsSplitV1 for why a flag would leave the
 	// secrets in the public dump forever.
 	CredentialsSplitV1: true,
+	// A fact about the binary (it never needs the old secret columns), not a
+	// policy. See CredentialsClearV1 and its stand-down note above `supported`.
+	CredentialsClearV1: true,
 	// A fact about the binary (it decodes and reads host_membership), not a
 	// policy. See HostMembershipSplitV1.
 	HostMembershipSplitV1: true,
+	// A fact about the binary (it never needs the hosts copy of state and
+	// isolation), not a policy. See HostMembershipRetireV1.
+	HostMembershipRetireV1: true,
 	// A fact about the binary (it decodes cluster_policies and honours
 	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
 	FailoverScopeV1: true,
@@ -1097,6 +1236,10 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
+	// A fact about the binary (it reads the relay demotion rows when it
+	// elects relays), and every node relies on every other electing the same
+	// set. See RelayHealthV1.
+	RelayHealthV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

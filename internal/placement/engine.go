@@ -62,6 +62,19 @@ type Request struct {
 	// Devices required (each {type, count} must be satisfied).
 	Devices []DeviceRequest
 
+	// USBMappings are the USB resource mappings the VM's passthrough devices
+	// name: a host qualifies only when every one has a device registered on
+	// it. USBHost, when set, is the one host the VM can run on at all — it
+	// holds a raw (unmapped) USB device, which is plugged into that host and
+	// no other. Both are hard filters; a snapshot that never loaded the
+	// USBMappingHosts is each mapping's host set (mapping → host → true),
+	// loaded by ResolveUSBMappingHosts — Select and ValidatePinned do it
+	// themselves; a SelectBatch caller must. A mapping with no entry here
+	// qualifies no host, so a request nobody resolved fails closed.
+	USBMappings     []string
+	USBHost         string
+	USBMappingHosts map[string]map[string]bool
+
 	// Networks the VM will attach to — used for soft scoring; SR-IOV is
 	// penalized if the host has no matching VF.
 	Networks []NetworkReq
@@ -352,10 +365,36 @@ func snapshotForRequest(ctx context.Context, db *corrosion.Client, req *Request)
 			snap.MappingDevices[device.Mapping] = byHost
 		}
 	}
+	if err := ResolveUSBMappingHosts(ctx, db, req); err != nil {
+		return nil, infrastructureError(err)
+	}
 	if req.MaxPerNode > 0 {
 		snap.SeedReplicasForBase(req.VMBaseName)
 	}
 	return snap, nil
+}
+
+// ResolveUSBMappingHosts loads, for each of req.USBMappings, the hosts the
+// mapping has a device on into req.USBMappingHosts. A no-op for a request
+// naming no USB mapping.
+func ResolveUSBMappingHosts(ctx context.Context, db *corrosion.Client, req *Request) error {
+	if len(req.USBMappings) == 0 {
+		return nil
+	}
+	resolved := make(map[string]map[string]bool, len(req.USBMappings))
+	for _, name := range req.USBMappings {
+		hosts, err := corrosion.HostsForMapping(ctx, db, name)
+		if err != nil {
+			return fmt.Errorf("hosts for USB mapping %q: %w", name, err)
+		}
+		set := make(map[string]bool, len(hosts))
+		for _, h := range hosts {
+			set[h] = true
+		}
+		resolved[name] = set
+	}
+	req.USBMappingHosts = resolved
+	return nil
 }
 
 func restrictToPinnedHost(snap *ClusterSnapshot, host string) error {
@@ -506,6 +545,17 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 				}
 			} else {
 				anyContainerRuntime = true
+			}
+		}
+
+		// Hard: USB passthrough. A raw device exists on one host; a mapped
+		// one on the hosts its mapping lists.
+		if req.USBHost != "" && h.Name != req.USBHost {
+			failed = append(failed, "usb device (a raw USB device is plugged into "+req.USBHost+")")
+		}
+		for _, m := range req.USBMappings {
+			if !req.USBMappingHosts[m][h.Name] {
+				failed = append(failed, "usb mapping "+m+" (no device on this host)")
 			}
 		}
 

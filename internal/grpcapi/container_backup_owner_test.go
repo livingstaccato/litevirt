@@ -756,9 +756,14 @@ func TestRestoreContainer_AMigrateLooksForNoRelocatingRow(t *testing.T) {
 		name    string
 		md      []string
 		wantLog bool
+		// sent is the row the moving peer sends: a relocation whose mark has
+		// not replicated here lands on it (and has no lineage to keep but the
+		// manifest's, which it says).
+		sent string
 	}{
-		{"migrate", []string{migrateFromMDKey, "host-a", relocateTokenMDKey, "tok-mig"}, false},
-		{"relocation, mark absent", []string{relocateTokenMDKey, "tok-rel"}, true},
+		{"migrate", []string{migrateFromMDKey, "host-a", relocateTokenMDKey, "tok-mig"}, false, ""},
+		{"relocation, mark absent", []string{relocateTokenMDKey, "tok-rel"}, true,
+			corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download"})},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s, rt := secServer(t)
@@ -781,7 +786,7 @@ func TestRestoreContainer_AMigrateLooksForNoRelocatingRow(t *testing.T) {
 			s.hostName = "host-b"
 			rctx := metadata.NewIncomingContext(mtlsAdminCtx("host-a"), metadata.Pairs(c.md...))
 			rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
-			if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: ts}, rs); err != nil {
+			if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "db", RepoPath: repo, Timestamp: ts, SourceCreateSpec: c.sent}, rs); err != nil {
 				t.Fatalf("restore on host-b: %v", err)
 			}
 			if cs := specOf(t, s, "host-b", "db"); cs.OwnerID != "own-1" || cs.RestoredFromOwnerID != "" {

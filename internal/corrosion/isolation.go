@@ -87,10 +87,16 @@ func isolateHost(ctx context.Context, c *Client, host, reason string, live bool)
 		if cur == nil || cur.Epoch != 0 {
 			return ErrIsolationNotMonotone
 		}
-		ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, 0), []Statement{
+		stmts := []Statement{
 			{SQL: isolateHostSQL, Params: []interface{}{next, reason, now, host}},
 			{SQL: hostMembershipIsolateSQL, Params: []interface{}{next, reason, now, host}},
-		})
+		}
+		if c.hostsCopyRetired(live) {
+			stmts = []Statement{
+				{SQL: hostMembershipIsolateSQL, Params: []interface{}{next, reason, now, host}},
+			}
+		}
+		ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, 0), stmts)
 		if err != nil {
 			return err
 		}
@@ -175,10 +181,16 @@ func ClearHostIsolation(ctx context.Context, c *Client, host string, expectedEpo
 			// Both homes, guarded on the membership row's epoch. The hosts
 			// half keeps its own guard, so a copy that already moved on is
 			// left alone there.
-			ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, expectedEpoch), []Statement{
+			stmts := []Statement{
 				{SQL: clearHostIsolationSQL, Params: []interface{}{now, host, expectedEpoch}},
 				{SQL: hostMembershipClearIsolationSQL, Params: []interface{}{now, host, expectedEpoch}},
-			})
+			}
+			if c.hostsCopyRetired(live) {
+				stmts = []Statement{
+					{SQL: hostMembershipClearIsolationSQL, Params: []interface{}{now, host, expectedEpoch}},
+				}
+			}
+			ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, expectedEpoch), stmts)
 			if err != nil {
 				return err
 			}

@@ -302,6 +302,9 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 		slog.Warn("owner-assert: reclaimed VM ownership — runs locally and all workload-capable peers report absent",
 			"vm", name, "from_host", dbHost, "to_host", r.hostName)
 		r.auditOwnerAssert(ctx, name, dbHost)
+		corrosion.ReverseReplicationAudited(ctx, r.db, "vm", name, "", dbHost, r.hostName, func(detail, result string) {
+			auditSystem(ctx, r.db, r.hostName, "replication.reverse", name, detail, result)
+		})
 		r.observeOwnerAssert(name, "asserted")
 		r.clearOwnershipDebounce(name)
 	}

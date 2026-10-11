@@ -131,6 +131,13 @@ func (s *Server) resolveBackupRepoPath(ctx context.Context, repoPath string) (st
 	if repoPath == "" {
 		return "", status.Error(codes.InvalidArgument, "repo_path required")
 	}
+	if _, _, isReplica := parseReplicaRepo(repoPath); isReplica {
+		r, err := s.openReplicaNamespace(ctx, repoPath, false)
+		if err != nil {
+			return "", err
+		}
+		return r.Root(), nil
+	}
 	if p, ok := s.backupRepos[repoPath]; ok {
 		return p, nil
 	}

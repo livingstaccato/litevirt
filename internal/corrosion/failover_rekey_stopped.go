@@ -64,6 +64,7 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
 	}
 	stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
 	if err != nil {
 		return err
@@ -71,6 +72,7 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 
@@ -106,6 +108,7 @@ func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destH
 	}
 	stmts = append(stmts, Statement{SQL: vmStateAtEpochSQL,
 		Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name, expectedEpoch + 1}})
+	stmts = append(stmts, placementGenStmts(ctx, c, name)...)
 	applied, err := c.ExecuteBatchGuarded(ctx, rekeyStoppedGuard(ctx, name, fromHost, expectedEpoch), stmts)
 	if err != nil {
 		return err
@@ -113,6 +116,7 @@ func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destH
 	if !applied {
 		return ErrNoRowsAffected
 	}
+	SpendDrainOrigin(ctx, c, name)
 	return nil
 }
 

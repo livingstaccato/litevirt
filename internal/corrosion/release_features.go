@@ -694,7 +694,7 @@ func (ae *AntiEntropy) pullForProbation(ctx context.Context, peer string) (proba
 	if resp.GetWalQuarantined() {
 		return probationAnswer{excluded: true}, nil
 	}
-	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil)
+	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil, nil)
 	if perr != nil {
 		return probationAnswer{}, perr
 	}
@@ -704,7 +704,7 @@ func (ae *AntiEntropy) pullForProbation(ctx context.Context, peer string) (proba
 	if len(ae.client.ReleaseUseQuarantine()) == 0 {
 		// The used records are what the answer is; the voter view only says
 		// whom to ask next. A failure here costs a stale view, not the answer.
-		if _, perr, merr := ae.pullAndMerge(pctx, client, probationVoterTables, nil, nil); perr != nil || merr != nil {
+		if _, perr, merr := ae.pullAndMerge(pctx, client, probationVoterTables, nil, nil, nil); perr != nil || merr != nil {
 			slog.Debug("release probation: could not merge a peer's voter view", "peer", peer,
 				"pull_error", perr, "merge_error", merr)
 		}
@@ -723,7 +723,7 @@ func (ae *AntiEntropy) CheckReleaseUsesFrom(ctx context.Context, peer string) er
 		return err
 	}
 	defer conn.Close()
-	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil)
+	_, perr, merr := ae.pullAndMerge(pctx, client, []string{"cluster_policies"}, nil, nil, nil)
 	if perr != nil {
 		return perr
 	}

@@ -216,6 +216,57 @@ of acting — it says nothing about whether the resulting rows have replicated.
   the topology changes, the peer's watermark row is left behind and can never
   advance again — nothing will push to it from here. Such a row is ignored
   rather than treated as a slow peer.
+- **Relays are chosen from replicated state, and probe health is part of it.**
+  Every node elects the same relays (`internal/corrosion/relay.go`): `active`,
+  non-witness hosts first, in name order, then the rest. A host whose probes
+  keep failing is a poor relay, so the failover lease holder reads the voters'
+  probe verdicts and **demotes** it: when enough of its voter observers report
+  probe failures on every evaluation across 2 minutes — a third of them, never
+  fewer than 2, and a majority of the voters when there are 4 or fewer (an
+  adopted voter generation can be that small in a large cluster, where a third
+  would be a single voter's view); one rule for voter and non-voter hosts — and the host is not a fence candidate, it writes a
+  `relay_demoted/<host>` row in `cluster_policies`, and every node then treats
+  the host as ineligible. It stays a leaf and keeps receiving replication; only
+  the relay role is withheld.
+  - An observer's standing healthy verdict counts whatever its age (a healthy
+    verdict is published once, when it changes); a failing verdict counts only
+    while it is fresh (failing verdicts are re-published every probe).
+  - An observer failing more than half of the active, non-witness hosts it
+    observes is the fault, not its targets, and is not counted. Verdicts about
+    hosts that are down (offline, fenced, in maintenance), removed or
+    tombstoned do not count toward that: every live observer fails a
+    powered-off host.
+  - A demoted host is restored after 10 minutes below that bar, with at least
+    one active observer holding a verdict on it.
+  - At most one host changes per cycle. A demotion never leaves fewer eligible
+    hosts than the election's relay count (the base of 3 plus one per 50
+    hosts), counting only hosts in gossip membership, so a demoted host is
+    never elected back in to fill a slot; and if every host is ineligible,
+    relays are still elected by name order.
+  - An alternating fail/ok pattern never demotes: one evaluation below the bar
+    restarts the window.
+  - The demotion row of a removed host is cleared, so a host later added under
+    that name does not start out demoted.
+
+  **Seeing it:** `lv cluster relay-restore` with no argument lists every
+  demoted or restored host with since when and why, and every operator hold
+  with its expiry. `litevirt_relay_demoted` (1 per demoted host) and
+  `litevirt_relay_hold_seconds` (time left on each hold) report the same
+  state; `litevirt_relay_role` shows each node's election, one series per
+  member (1 relay, 0 leaf) — a demoted host reads 0 on every node, but so does
+  any leaf.
+
+  **Stand-down:** `lv cluster relay-restore <host>` (admin, audited) clears a
+  demotion at once for the whole cluster; `--hold 1h` keeps the lease holder
+  from demoting it again until the hold runs out, for a fault that is not the
+  host's. The hold is a row of its own (`relay_hold/<host>`) that the lease
+  holder never writes for a host that exists, so its own rows cannot erase it;
+  a host found demoted under a hold is restored at once. A removed host's
+  hold and demotion both end, so a host later added under the name starts
+  clean. The listing shows who set a hold to an admin, and "an operator" (with
+  the time) to anyone else; the audit log records who. Nothing is
+  demoted until the `relay_health_v1` token has latched
+  ([upgrades.md](upgrades.md#health-aware-relays-need-every-host-upgraded)).
 - **A peer that stops acknowledging stops pinning the log.** `mutation_log` is
   retained until the slowest peer has acked it. A peer only counts while it is
   both recently-acked and currently pushable: the watermark timestamp advances
@@ -241,8 +292,50 @@ of acting — it says nothing about whether the resulting rows have replicated.
   re-fenced — see
   [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails (and the strategy is not
-  `best-effort`), the coordinator refuses to reschedule the host's VMs.
-  Operator must intervene.
+  `best-effort`), the coordinator refuses to reschedule the host's VMs. It
+  does not park the host: while a quorum still sees it down, the leader fences
+  it again on a backoff — 30 s after the failed attempt, doubling per
+  consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
+  or a new leader keeps the schedule — and recovers on the first success.
+  - **Which strategy a retry runs:** the host's current strategy when it is
+    `ipmi` or `ssh`, so fixing the cause with
+    `lv host config <host> --fence-strategy ipmi` (and the BMC credentials)
+    takes effect on the next retry. Otherwise the method that failed is
+    repeated: a host switched to `best-effort` is never "recovered" on a failed
+    best-effort fence.
+  - **What is never retried:** a `manual` fence (`lv host fence-confirm`
+    resumes it) and a `watchdog` fence of a peer (it cannot succeed) — unless
+    the host's strategy has since been set to `ipmi` or `ssh`, which the next
+    retry then runs — and a host any observer has seen answer since the
+    attempt that failed. That last
+    check is made immediately before each retry, so a partition that heals
+    between attempts does not power off a host that has just come back.
+  - **Notifications:** the first failure raises `host.fenced` (warn); failed
+    retries do not, until the backoff has reached its cap, and then at most
+    once an hour per host. Every attempt still writes its `fencing_log` row.
+  - **What ends the retries:** the host answering again (it returns to
+    `active` once a quorum sees it healthy); `lv host fence-confirm <host>`
+    once you have confirmed it off, which resumes the recovery;
+    `lv host config <host> --fence-strategy manual`; or
+    `lv host rm --dead <host>` for a host that is gone for good.
+- **A fence recorded by anyone wakes the leader.** A successful fence of a
+  quorum-down host recorded after the leader handled it — an operator's
+  `lv host fence`, or another coordinator's — is picked up on the leader's
+  next cycle, exactly as a successor would resume from it, with no restart.
+  The host and fence state are re-read every cycle; nothing the leader cached
+  about its own earlier, failed attempt hides the newer record.
+- **Stalled recovery alert.** When a `fenced` or `offline` host's recoverable
+  workloads are still on it 60 s after its fence record, the leader logs
+  "recovery of a fenced host has stalled" and emits a `host.recovery.stalled`
+  event and notification naming the host, the coordinator and why it is not
+  proceeding (a failed fence and its next retry, a host that answered since, a
+  confirmation it waits for, a partition pause, a fence that no longer stands,
+  no host to place on, a stranded claim, or "not a fence candidate this
+  cycle"). It repeats at most every 10 minutes per host while the condition
+  lasts. It ends when the workloads are recovered or leave the host:
+  resolve the reason it names, `lv host undrain <host>` or
+  `lv host rm --dead <host>` for the host, or set the workload's
+  `on_host_failure` to `none` if it is meant to stay.
 - **A new VM is never published `running` before it can prove its
   generation.** Every path that creates a VM row — `CreateVM`, template
   instantiation, import, live-restore autostart and a renamed replica
@@ -645,7 +738,7 @@ Check `lv host inspect <host>` and the last `fencing_log` row before acting:
 | --- | --- |
 | Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
 | Fenced successfully, but recovery was then refused — lost quorum, an ungated target, a superseded lease term, no placement candidate, a store error on the proof write | `lv host undrain <host>` once you have confirmed the host is dead. |
-| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves: confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
+| Marked down by hand — `lv host fence <host>` | If the fence succeeded, the failover leader treats it as it treats its own fence, and only while it still **stands**: some observer has watched the host fail without a break since **before** the fence, and nobody has seen it answer since. Then an `ssh` or `best-effort` fence is resumed from and the workloads are recovered; an `ipmi` fence is resumed from while under 5 minutes old, and otherwise renewed with a fresh power-off and then recovered. A fence that does not stand — the host was still answering when you fenced it, or every observer restarted since (a rolling upgrade restarts them all, so a host fenced before the upgrade) — is never resumed from on an `ssh` or `best-effort` fence: its workloads stay. Confirm the power state, then `lv host fence-confirm <host>`: within 5 minutes of the fence that resumes the recovery, and later the coordinator fences the host afresh for the outage. An `ipmi` fence that does not stand is renewed with a fresh power-off and recovered. If the fence failed, nothing moves on it: while a quorum sees the host down the leader fences it again on its retry backoff, and otherwise confirm the power state, then `lv host fence-confirm <host>`. A host whose fence **failed** returns to `active` on its own once quorum sees it healthy; one whose fence **succeeded** stays `offline` until `lv host undrain <host>` or its own reboot, because its workloads may have moved. For planned removal, `lv host drain <host>` first, which moves the workloads. |
 | Fenced on a fence that did not verify the power-off (`ssh`, `watchdog`, `best-effort`), and its workloads were not recovered | Owner-assert keeps asking such a host whether it runs a workload, and repairs nothing while it does not answer. If it is off, `lv host fence-confirm <host>` makes that a proof. |
 
 Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
@@ -1110,13 +1203,16 @@ leadership churn or a partition.
 - Backups, snapshots, and live migration are crash-consistent at the block
   level: each takes a real point-in-time view (a libvirt pull-mode session for
   backups, qemu's own machinery for migration).
-- **Scheduled volume replication is weaker than that, and the difference
-  matters.** A full (non-incremental) replica of a RUNNING VM is
-  `qemu-img convert -U` reading the image the guest still has open, with no
-  snapshot: the copy is smeared across however long it took, so it is not
-  point-in-time and not crash-consistent either. The `--incremental` path DOES
-  open a point-in-time session and is crash-consistent. See
-  [Backups](backups.md). The guest's database, filesystem, etc. must tolerate "as if power
+- Volume replication and `lv replicate-volume` of a running or paused VM are
+  point-in-time and crash-consistent too: a full backup session, or, where none
+  opens, an external disk-only snapshot (quiesced when the guest agent answers)
+  committed back after the copy. A shut-off VM is copied plainly. Only when
+  neither point-in-time method can be made is the copy `qemu-img convert -U` of
+  the open image, which is smeared and NOT point-in-time; such a replica is
+  recorded and reported as not point-in-time, and automatic promotion holds a VM
+  whose only replicas are such copies. zfs, ceph and btrfs replicate through
+  their native snapshots. See [Backups](backups.md), "How a full replica is
+  copied". The guest's database, filesystem, etc. must tolerate "as if power
   was cut" recovery. For application-consistent backups, install
   `qemu-guest-agent` in the guest and use the `freeze`/`thaw` hooks
   (currently best-effort; richer integration is on the roadmap).
@@ -1224,7 +1320,7 @@ The web UI at port 7445 surfaces the most critical of these on the
 | Symptom | Action |
 |---|---|
 | Host unreachable, fence-pending alert | Confirm out-of-band; if dead, `lv host fence-confirm <host>` |
-| Fence failed, VMs stuck on offline host | Inspect IPMI; if power-off confirmed externally, run fence-confirm |
+| Fence failed, VMs stuck on offline host | The leader retries the fence on a backoff and raises `host.recovery.stalled` with the reason; inspect IPMI; if power-off confirmed externally, run fence-confirm |
 | Two leaders observed via metric | Kill the older daemon; investigate clock skew |
 | HLC rejected counter rising on one peer | Check NTP on that peer; expect to fence it |
 | Replication backlog growing | Identify slow peer via watermarks; consider `lv host drain` |

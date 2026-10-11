@@ -77,9 +77,15 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// would keep it from ever being driven, and the secrets would stay in
 		// the public dump.
 		capabilities.CredentialsSplitV1: true,
+		// credentials_clear_v1 likewise: "this build never needs the old
+		// secret columns to find a secret".
+		capabilities.CredentialsClearV1: true,
 		// host_membership_split_v1 likewise: "this build decodes
 		// host_membership and reads state from it".
 		capabilities.HostMembershipSplitV1: true,
+		// host_membership_retire_v1 likewise: "this build never needs the
+		// hosts copy of state and isolation".
+		capabilities.HostMembershipRetireV1: true,
 		// failover_scope_v1 likewise: "this build decodes cluster_policies
 		// and honours failover_scope".
 		capabilities.FailoverScopeV1: true,
@@ -95,6 +101,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// recorded 'offline' and does not auto-activate such a host". The
 		// failover lease holder relies on whichever node holds it next.
 		capabilities.FenceStateV1: true,
+		// relay_health_v1: "this build reads the relay demotion rows when it
+		// elects relays". Every node relies on every other electing the same
+		// relay set.
+		capabilities.RelayHealthV1: true,
 		// release_2026_11_v1, the release token: "this build decodes, keeps
 		// and honours every field and shape of its release". Nothing changes
 		// when it latches; a feature is opened only through WithFeature,
@@ -122,7 +132,8 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 
 	g := &recordingGate{}
 	s := &Server{gate: g}
-	for i := 0; i < 10; i++ {
+	// One still-unlatched token per cycle: give every mandatory token a turn.
+	for i := 0; i < 2*len(capabilities.Supported()); i++ {
 		s.driveCapabilityActivation(context.Background())
 	}
 	got := g.drivenUnique()

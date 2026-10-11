@@ -562,6 +562,47 @@ func (v *validator) validate(f *File) {
 			}
 		}
 
+		// Disk and NIC tuning: refuse what libvirt would refuse at define time.
+		if !vm.IsContainer() {
+			for _, diskName := range sortedKeys(vm.Disks) {
+				ds := diskTuningSpec(vm.Disks[diskName])
+				if err := ValidateDiskTuning(ds); err != nil {
+					v.ps.add(p+".disks."+diskName, err.Error(), "")
+				}
+			}
+			for i, n := range vm.Network {
+				if err := ValidateQueues(n.Model, nicQueues(n.Queues, vm.CPU)); err != nil {
+					v.ps.add(fmt.Sprintf("%s.network[%d].queues", p, i), err.Error(), "")
+				}
+			}
+		}
+		// Noisy-neighbour limits. The daemon re-checks against the VM's final vCPU
+		// count; this catches the obvious mistakes at parse time, with a path.
+		if vm.CPULimit < 0 {
+			v.ps.add(p+".cpu-limit", "cpu-limit must be >= 0 (0 = unlimited)", "")
+		} else if vm.CPU > 0 && vm.CPULimit > float64(vm.CPU) {
+			v.ps.add(p+".cpu-limit", fmt.Sprintf("cpu-limit %v exceeds cpu %d, so it could never be reached", vm.CPULimit, vm.CPU), "use 0 for unlimited")
+		}
+		if vm.CPUShares != 0 && (vm.CPUShares < 1 || vm.CPUShares > 10000) {
+			v.ps.add(p+".cpu-shares", fmt.Sprintf("cpu-shares %d is outside 1..10000", vm.CPUShares), "it is the cgroup weight (Proxmox cpuunits); 0 keeps the default (100)")
+		}
+		for i, n := range vm.Network {
+			if n.Rate < 0 {
+				v.ps.add(fmt.Sprintf("%s.network[%d].rate", p, i), "rate must be >= 0 MB/s (0 = unlimited)", "")
+			}
+		}
+		// Containers have no cputune or libvirt bandwidth; setting these on one
+		// would be silently ignored, so it is an error.
+		if vm.Kind == WorkloadKindLXC || vm.Kind == WorkloadKindOCI {
+			setOnCT := vm.CPULimit != 0 || vm.CPUShares != 0
+			for _, n := range vm.Network {
+				setOnCT = setOnCT || n.Rate != 0
+			}
+			if setOnCT {
+				v.ps.add(p, "cpu-limit, cpu-shares and network rate apply to VMs only (kind: vm)", "a container's cpu is its core cap already")
+			}
+		}
+
 		// Replicas validation
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")

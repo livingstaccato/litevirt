@@ -20,10 +20,12 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/scheduler"
@@ -223,11 +225,40 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		Status: "locating replica of disk " + src.DiskName + " in pool " + pool,
 	})
 
-	host, replicas, err := s.findReplicaHost(ctx, req, vm, src.DiskName, pool, schedHost)
+	// A replica recorded as not point-in-time (pit_copy.go, layer 3) is the
+	// last choice. Automatic promotion never uses one while a point-in-time
+	// replica exists, and uses one at all only for a VM that opted in
+	// (LabelAutoPromoteNotPointInTime); otherwise it holds the VM down and
+	// says how to promote it by hand. A manual promotion of one needs
+	// accept_not_point_in_time.
+	acceptNotPIT := req.AcceptNotPointInTime
+	promotedNotPIT := false
+	host, replicas, notPIT, err := s.findReplicaHostPIT(ctx, req, vm, src.DiskName, pool, schedHost, automated)
+	if automated && status.Code(err) == codes.NotFound {
+		h, reps, marks, aerr := s.findReplicaHostPIT(ctx, req, vm, src.DiskName, pool, schedHost, false)
+		if aerr == nil && len(reps) > 0 && marks[reps[0]] {
+			if !vmAllowsAutoPromoteNotPIT(vm) {
+				return s.holdNotPointInTime(ctx, vm, pool, h, reps[0])
+			}
+			host, replicas, notPIT, err = h, reps, marks, nil
+			acceptNotPIT, promotedNotPIT = true, true
+		}
+	}
 	if err != nil {
 		return err
 	}
 	replica := replicas[0]
+	if notPIT[replica] && !acceptNotPIT {
+		if req.Proof != nil {
+			// An automated promotion relayed here (a main-build coordinator
+			// during a rolling upgrade knows nothing of the mark): held, as
+			// loudly as this build's own coordinator holds it.
+			return status.Errorf(codes.FailedPrecondition, "%v", s.holdNotPointInTime(ctx, vm, pool, host, replica))
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"replica %s of vm %q (pool %s on %s) is NOT point-in-time: it was copied with qemu-img convert -U while the VM ran, after every point-in-time copy failed, and may be inconsistent. Promote it only if nothing better exists, with --accept-not-point-in-time (a CLI older than this daemon lacks the flag: upgrade it)",
+			replica, req.VmName, pool, host)
+	}
 	// Region-scoped failover keeps a recovery in the fenced host's region. The
 	// replica's host is known only now, so this is the first point it can be
 	// checked, and it is before any proof is persisted or relayed. An unknown
@@ -255,6 +286,12 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		sched, _ := s.replicationScheduleForVM(ctx, req.VmName)
 		ageLimit = autoPromoteAgeLimit(sched.Cron)
 		if err := checkAutoPromoteReplicaAge(replica, time.Now(), ageLimit); err != nil {
+			// The newest point-in-time replica is too old. If a newer one
+			// exists that is not point-in-time, say why nothing is promoted:
+			// it is held, not merely stale.
+			if h, reps, marks, aerr := s.findReplicaHostPIT(ctx, req, vm, src.DiskName, pool, schedHost, false); aerr == nil && len(reps) > 0 && marks[reps[0]] && !acceptNotPIT {
+				return fmt.Errorf("%w; and %w", err, s.holdNotPointInTime(ctx, vm, pool, h, reps[0]))
+			}
 			return err
 		}
 	}
@@ -350,6 +387,9 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 					return fmt.Errorf("%w (a newer replica was unavailable: %v)", err, lastErr)
 				}
 			}
+			if notPIT[replica] && !acceptNotPIT {
+				return fmt.Errorf("%w (the next-older replica %s is not point-in-time; promote it with --accept-not-point-in-time)", lastErr, replica)
+			}
 			_ = send(&pb.PromoteReplicaProgress{
 				Phase: pb.PromoteReplicaProgress_RESOLVING, VmName: req.VmName, Host: host, Replica: replica,
 				Status: "newer replica unavailable; trying " + replica,
@@ -359,11 +399,15 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 			fwd := &pb.PromoteReplicaRequest{
 				VmName: req.VmName, TargetPool: pool, TargetHost: host, Replica: replica,
 				NewName: req.NewName, Force: req.Force, NoLocalize: req.NoLocalize,
-				Proof: req.Proof, // carry the full single-use proof to the executor
+				Proof:                req.Proof, // carry the full single-use proof to the executor
+				AcceptNotPointInTime: acceptNotPIT,
 			}
 			err = s.relayPromote(ctx, host, fwd, send)
 		} else {
 			err = s.doPromoteLocal(ctx, req, vm, src, pool, replica, automated, send)
+		}
+		if err == nil && promotedNotPIT {
+			s.reportPromotedNotPointInTime(ctx, vm, pool, host, replica)
 		}
 		if err == nil || !replicaUnavailable(err) {
 			return err
@@ -481,6 +525,17 @@ func (s *Server) replicationScheduleForVM(ctx context.Context, vmName string) (c
 // with an unauthenticated context, which the handler's RequireRole would
 // reject.
 func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, diskName, pool, schedHost string) (host string, replicas []string, err error) {
+	host, replicas, _, err = s.findReplicaHostPIT(ctx, req, vm, diskName, pool, schedHost, false)
+	return host, replicas, err
+}
+
+// findReplicaHostPIT is findReplicaHost that also returns which of the
+// chosen host's replicas are not point-in-time, and with skipNotPIT leaves
+// those out of the choice altogether. A replica is not point-in-time when its
+// record says so, or — a top-level copy main's runner name gives it
+// (replica_mirror.go) — when a record of that disk taken at the same time on
+// that host says so: the mirror is the same bytes under another name.
+func (s *Server) findReplicaHostPIT(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, diskName, pool, schedHost string, skipNotPIT bool) (host string, replicas []string, notPIT map[string]bool, err error) {
 	var candidates []string
 	switch {
 	case req.TargetHost != "":
@@ -502,42 +557,142 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 	// project owns (explicitReplicaOK); the newest is chosen by record.
 	admin := req.Replica != "" && s.namedReplicaAdmin(ctx)
 	byHost := map[string][]string{}
+	marksByHost := map[string]map[string]bool{}
 	bestHost, bestName := "", ""
 	for _, h := range candidates {
 		var names []string
-		for _, r := range s.replicaRecordsOn(ctx, pool, h, vm.Project, vm.Name) {
+		marks := map[string]bool{}
+		markedTaken := map[string]bool{}
+		recs := s.replicaRecordsOn(ctx, pool, h, vm.Project, vm.Name)
+		for _, r := range recs {
+			if r.Disk == diskName && r.NotPointInTime {
+				marks[r.File], markedTaken[r.Taken] = true, true
+			}
+		}
+		for _, r := range recs {
 			if r.Disk != diskName {
 				continue
 			}
 			if req.Replica != "" && r.File == req.Replica {
-				return h, []string{r.File}, nil
+				return h, []string{r.File}, marks, nil
 			}
 			names = append(names, r.File)
 		}
 		top := s.replicaNames(ctx, pool, h, k, req.Replica, admin)
+		for _, n := range top {
+			if ts, ok := replicaTimestamp(n); ok && markedTaken[ts.UTC().Format("20060102-150405")] {
+				marks[n] = true
+			}
+			// A copy lv replicate-volume made with -U, promoted by name.
+			// Its record is read on the host that holds it, which is
+			// where a relayed promotion is decided.
+			if (h == "" || h == s.hostName) && s.poolCopyNotPIT(ctx, pool, n) {
+				marks[n] = true
+			}
+		}
 		if req.Replica != "" {
 			if slices.Contains(top, req.Replica) {
-				return h, []string{req.Replica}, nil
+				return h, []string{req.Replica}, marks, nil
 			}
 			continue
 		}
 		names = append(names, top...)
+		if skipNotPIT {
+			names = slices.DeleteFunc(names, func(n string) bool { return marks[n] })
+		}
 		sortReplicasOldestFirst(names)
 		byHost[h] = names
+		marksByHost[h] = marks
 		// Each host's list is oldest first, by the run time in the names.
 		if len(names) > 0 && (bestName == "" || replicaOlder(bestName, names[len(names)-1])) {
 			bestName, bestHost = names[len(names)-1], h
 		}
 	}
 	if req.Replica != "" {
-		return "", nil, status.Errorf(codes.NotFound, "replica %q of vm %q disk %q not found in pool %q", req.Replica, req.VmName, diskName, pool)
+		return "", nil, nil, status.Errorf(codes.NotFound, "replica %q of vm %q disk %q not found in pool %q", req.Replica, req.VmName, diskName, pool)
 	}
 	if bestHost == "" {
-		return "", nil, status.Errorf(codes.NotFound, "no replica of %q disk %q found in pool %q", req.VmName, diskName, pool)
+		what := "replica"
+		if skipNotPIT {
+			what = "point-in-time replica"
+		}
+		return "", nil, nil, status.Errorf(codes.NotFound, "no %s of %q disk %q found in pool %q", what, req.VmName, diskName, pool)
 	}
 	newestFirst := slices.Clone(byHost[bestHost])
 	slices.Reverse(newestFirst)
-	return bestHost, newestFirst, nil
+	return bestHost, newestFirst, marksByHost[bestHost], nil
+}
+
+// errReplicaNotPointInTime marks an automatic promotion held because the
+// VM's only replicas are not point-in-time and the VM has not opted in.
+var errReplicaNotPointInTime = fmt.Errorf("the only replica is not point-in-time; %w", corrosion.ErrPromoteHeld)
+
+// vmEventFailoverHeld is the event a held automatic promotion records;
+// InspectVM shows the newest one as failover_held while the VM's host is down.
+const vmEventFailoverHeld = "vm.failover.held"
+
+// vmAllowsAutoPromoteNotPIT reports whether vm opted in, with
+// corrosion.LabelAutoPromoteNotPointInTime=true in its spec's labels, to
+// automatic promotion of a not-point-in-time replica when no point-in-time
+// one exists. A build that does not know the label ignores it, which is the
+// default: off.
+func vmAllowsAutoPromoteNotPIT(vm *corrosion.VMRecord) bool {
+	var spec struct {
+		Labels map[string]string `json:"labels"`
+	}
+	if vm.Spec != "" {
+		_ = json.Unmarshal([]byte(vm.Spec), &spec)
+	}
+	return spec.Labels[corrosion.LabelAutoPromoteNotPointInTime] == "true"
+}
+
+// holdNotPointInTime refuses an automatic promotion whose only replica is
+// not point-in-time, loudly: an event (which InspectVM shows), a
+// notification, and the command that promotes it by hand. The replica is
+// not touched, and the VM's record is not changed.
+func (s *Server) holdNotPointInTime(ctx context.Context, vm *corrosion.VMRecord, pool, host, replica string) error {
+	cmd := fmt.Sprintf("lv replication promote %s --pool %s --host %s --replica %s --accept-not-point-in-time", vm.Name, pool, host, replica)
+	detail := fmt.Sprintf("automatic promotion held: the only replica is not point-in-time (%s in pool %s on %s, copied with qemu-img convert -U after every point-in-time copy failed). The VM stays down and the replica is untouched. To promote it anyway: %s. To let failover do so for this VM, set the label %s=true",
+		replica, pool, host, cmd, corrosion.LabelAutoPromoteNotPointInTime)
+	slog.Error("failover: automatic promotion held; the only replica is not point-in-time", "vm", vm.Name, "replica", replica, "pool", pool, "host", host)
+	s.recordVMEventSeverity(ctx, vm.Name, vmEventFailoverHeld, "error", "error", detail)
+	s.notify(ctx, notify.Notification{
+		Kind: "replication.promote_held", Severity: notify.SevError, Subject: vm.Name, Detail: detail,
+	})
+	return fmt.Errorf("%w: %s", errReplicaNotPointInTime, detail)
+}
+
+// reportPromotedNotPointInTime is the event and notification of an automatic
+// promotion that used a not-point-in-time replica (the VM opted in).
+func (s *Server) reportPromotedNotPointInTime(ctx context.Context, vm *corrosion.VMRecord, pool, host, replica string) {
+	detail := fmt.Sprintf("automatic promotion used a NOT point-in-time replica (%s in pool %s on %s): no point-in-time replica existed and the VM has %s=true. The guest may find its disk inconsistent",
+		replica, pool, host, corrosion.LabelAutoPromoteNotPointInTime)
+	slog.Error("failover: promoted a not-point-in-time replica", "vm", vm.Name, "replica", replica)
+	s.recordVMEventSeverity(ctx, vm.Name, "vm.promoted_not_point_in_time", "warning", "error", detail)
+	s.notify(ctx, notify.Notification{
+		Kind: "replication.promoted_not_point_in_time", Severity: notify.SevError, Subject: vm.Name, Detail: detail,
+	})
+}
+
+// failoverHeldReason is the newest held-promotion event's detail while vm's
+// host is down and nothing has promoted it since; "" otherwise.
+func (s *Server) failoverHeldReason(ctx context.Context, vm *corrosion.VMRecord) string {
+	if h, err := corrosion.GetHost(ctx, s.db, vm.HostName); err == nil && h != nil && h.State == "active" {
+		return ""
+	}
+	evs, err := corrosion.ListVMEvents(ctx, s.db, vm.Name, 100, "")
+	if err != nil {
+		return ""
+	}
+	for _, e := range evs { // newest first
+		switch e.Type {
+		case vmEventFailoverHeld:
+			return e.Detail
+		case "vm.promoted", "vm.promoted_not_point_in_time":
+			return ""
+		}
+	}
+	return ""
 }
 
 // namedReplicaAdmin reports whether the operator who named a replica may name
@@ -842,6 +997,19 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
 	}
 	spec.Name = targetName
+	// The stored tuning is validated again (and dropped before the gate opens)
+	// so a record from before a rollback cannot define what the cluster refuses.
+	ioR, err := s.restrictRestoredTuning(ctx, &spec)
+	if err != nil {
+		return err
+	}
+	ioG := ioR.grant
+	if ioR.stripped {
+		// The domain below is defined from the stripped spec. A takeover keeps the
+		// row's own spec, so the two differ until the next redefine renders it.
+		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
+			"vm", targetName, "why", ioR.why())
+	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1112,12 +1280,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
+		// The spec records the NIC's real MAC (as a clone does), so its queues
+		// are matched at every later redefine, not lost to the source's MAC.
+		n.Mac = mac
 		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
 			os.Remove(livePath)
 			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
 		}
-		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		// The groups go on the legacy row as well as the vm_nics one: a peer on
 		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -1139,12 +1310,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
+	compose.ApplyDiskTuning(diskCfg, &spec)
+	compose.ApplyNICTuningByPosition(netCfg, &spec)
 	if !started {
 		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
 			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
 			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,
+			// Memory hot-add carried, as every definer does (domainconfig.go).
+			HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
+			CPULimit: spec.CpuLimit, CPUShares: int(spec.CpuShares),
 		})
 		if err != nil {
 			os.Remove(livePath)
@@ -1237,7 +1413,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+		if err := s.insertVMForSpec(ctx, &spec, ioG, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
@@ -1256,6 +1432,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "update disk record: %v", err)
 		}
 		_ = corrosion.UpdateDiskStorage(ctx, s.db, targetName, src.DiskName, poolRef.Driver, pool)
+		// The VM now runs on its replica target: replicate back to the host it left.
+		s.reverseReplicationAfterMove(ctx, "vm", targetName, "", vm.HostName, s.hostName)
 	}
 	// Row persisted (the durable record now exists) → drop the host-local promote marker;
 	// a future retry would see the re-homed row and not re-promote.
@@ -1264,6 +1442,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
 		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
+	op := "promote"
+	if automated {
+		op = "failover"
+	}
+	s.auditTuningDropped(ctx, ioR, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

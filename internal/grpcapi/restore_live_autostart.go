@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -73,6 +74,21 @@ func (s *Server) autoDefineRestoredVM(
 	if err != nil {
 		return "", "", err
 	}
+	// The spec is a manifest's or a caller's, never a validated create: its
+	// disk/NIC tuning is dropped before the gate opens and validated after.
+	ioR, rerr := s.restrictRestoredTuning(ctx, spec)
+	if rerr != nil {
+		return "", "", rerr
+	}
+	ioG := ioR.grant
+	if ioR.stripped {
+		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
+	}
+	// A limit in the spec — an operator's --spec or one embedded in a backup,
+	// possibly from a cluster that has latched — is judged as a create's is.
+	if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
+		return "", "", err
+	}
 
 	originalName := spec.Name
 	targetName := req.NewName
@@ -103,6 +119,14 @@ func (s *Server) autoDefineRestoredVM(
 	// of a VM in spec.Project and admitted as one. Refused before admission and
 	// DefineDomain.
 	fromExisting := req.Spec == nil && manifest.VMSpecJSON == ""
+	// USB devices and memory hot-add come only from server-side state that
+	// passed create's gates: a client --spec and a manifest's embedded spec
+	// grant neither (stripped, and said so); the cluster's own row keeps them,
+	// re-judged as a create would judge them, on this host.
+	passthroughG, err := s.admitRestoredUSBAndHotplug(ctx, spec, targetName, fromExisting)
+	if err != nil {
+		return "", "", err
+	}
 	if fromExisting {
 		if err := s.admitCopiedNetworks(ctx, "restore", project, spec.Project, specNetworkNames(spec.Network)); err != nil {
 			return "", "", err
@@ -242,12 +266,15 @@ func (s *Server) autoDefineRestoredVM(
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
+		// The spec records the NIC's real MAC (as a clone does), so its queues
+		// are matched at every later redefine, not lost to the source's MAC.
+		n.Mac = mac
 		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
 			return "", "", status.Errorf(codes.FailedPrecondition,
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
-		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
 		// The groups go on the legacy row as well as the vm_nics one: a peer on
 		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -281,7 +308,14 @@ func (s *Server) autoDefineRestoredVM(
 		Disks:       diskCfg,
 		Networks:    netCfg,
 		Boot:        spec.Boot,
+		// Memory hot-add, only as admitted above (admitRestoredUSBAndHotplug).
+		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
+		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
+		CPULimit:       spec.CpuLimit,
+		CPUShares:      int(spec.CpuShares),
 	}
+	compose.ApplyDiskTuning(vmCfg.Disks, spec)
+	compose.ApplyNICTuningByPosition(vmCfg.Networks, spec)
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
 	if fwVM {
@@ -297,6 +331,12 @@ func (s *Server) autoDefineRestoredVM(
 		Phase: pb.RestoreLiveProgress_DEFINING, VmName: targetName,
 		TargetPath: overlayPath, Status: "defining domain against overlay",
 	})
+	// The release gate for the limits this restore carries, immediately before
+	// the domain that holds them is defined.
+	limitsG, err := s.recordLimitedSpec(ctx, spec)
+	if err != nil {
+		return "", "", err
+	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}
@@ -378,7 +418,8 @@ func (s *Server) autoDefineRestoredVM(
 	// it from the (device-less) inactive definition, which correctly imports nothing.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the
@@ -404,6 +445,7 @@ func (s *Server) autoDefineRestoredVM(
 	})
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
+	s.auditTuningDropped(ctx, ioR, targetName, "restore")
 	return targetName, rootDev, nil
 }
 

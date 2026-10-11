@@ -209,11 +209,14 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 
 	p := &Principal{
 		Subject: subject,
-		Realm:   r.Name(),
-		Email:   stringClaim(claims, r.emailClaim),
-		Name:    stringClaim(claims, r.nameClaim),
-		Groups:  stringSliceClaim(claims, r.groupsClaim),
-		Claims:  flattenClaims(claims),
+		// The account is bound to (issuer, sub) — the IdP's stable identity
+		// of this person — whatever claim names the account (rereview N5).
+		ExternalID: idTok.Issuer + "|" + idTok.Subject,
+		Realm:      r.Name(),
+		Email:      stringClaim(claims, r.emailClaim),
+		Name:       stringClaim(claims, r.nameClaim),
+		Groups:     stringSliceClaim(claims, r.groupsClaim),
+		Claims:     flattenClaims(claims),
 	}
 	return p, nil
 }
@@ -222,6 +225,17 @@ func (r *OIDCRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 // claims at login time, not via a separate sync API. Reserved for future
 // use if we add a back-channel claim-refresh.
 func (r *OIDCRealm) SyncGroups(ctx context.Context) error { return nil }
+
+// Errors EnsureUserShadow wraps, so the login RPC can answer with the right code.
+var (
+	// ErrShadowPending: transient; this node cannot decide yet. Retry.
+	ErrShadowPending = errors.New("not decidable on this node yet")
+	// ErrExternalUnproven: durable until an administrator marks the user
+	// external (`lv user mark-external`) or its credential row arrives.
+	ErrExternalUnproven = errors.New("not known to be an external user")
+	// ErrLocalAccount: the name belongs to a local account.
+	ErrLocalAccount = errors.New("a local account holds this name")
+)
 
 // EnsureUserShadow creates a row in the local users table for an OIDC
 // principal so existing handlers (RBAC, audit) can reference the user
@@ -234,6 +248,11 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 	if p == nil || p.Subject == "" {
 		return errors.New("nil principal")
 	}
+	// Every lookup normalizes the name (corrosion.NormalizeUsername), and so
+	// does the shadow this writes: a directory subject typed `ALICE` is the
+	// account `alice`, never a second one beside it (t1-auth-review I2). On
+	// return p.Subject is the account's name as stored, which is what every
+	// per-account row is keyed on.
 	existing, err := corrosion.GetUser(ctx, db, p.Subject)
 	if err != nil {
 		return err
@@ -275,18 +294,74 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 		// Refusing rather than namespacing: a rename would have to carry the row's
 		// RBAC bindings, tokens and sessions with it, and doing that silently
 		// during a login is a larger and more surprising act than declining one.
-		if p.Realm != "local" && existing.PasswordHash != "" {
-			return fmt.Errorf("user %q already exists as a local account; refusing to "+
-				"authenticate it from realm %q, because that would adopt the local account's "+
-				"role — rename one of the two", p.Subject, p.Realm)
+		//
+		// Once credentials_clear_v1 has latched, a local account's users row
+		// carries an EMPTY password_hash and its hash lives in user_credentials,
+		// which anti-entropy can deliver after the users row. An empty hash is
+		// then not proof of anything: UserLocalCredential judges the row
+		// external only on positive evidence, and when it cannot tell the login
+		// is refused rather than guessed — transiently while this node is not
+		// credentials-live, durably once it is (an administrator then marks the
+		// user external with `lv user mark-external`).
+		if p.Realm != "local" {
+			// Judged, and named, by the STORED name (credentials-clear M1):
+			// GetUser matches the normalized name, so p.Subject may be another
+			// spelling (an OIDC subject is not normalized), and
+			// UserLocalCredential matches exactly.
+			local, known, err := corrosion.UserLocalCredential(ctx, db, existing.Username)
+			if err != nil {
+				return fmt.Errorf("check whether %q is a local account: %w", existing.Username, err)
+			}
+			if !known {
+				if !db.CredentialsLive() {
+					return fmt.Errorf("%w: user %q exists but this node cannot tell yet whether it is "+
+						"a local account; retry shortly, or log in through another node", ErrShadowPending, existing.Username)
+				}
+				return fmt.Errorf("%w: user %q exists with no local password and no record that it is an "+
+					"external user. If it is one, an administrator can run `lv user mark-external %s`; "+
+					"if it is a local account, its credential has not reached this node yet",
+					ErrExternalUnproven, existing.Username, existing.Username)
+			}
+			if local || existing.PasswordHash != "" {
+				return fmt.Errorf("%w: user %q already exists as a local account; refusing to "+
+					"authenticate it from realm %q, because that would adopt the local account's "+
+					"role — rename one of the two", ErrLocalAccount, existing.Username, p.Realm)
+			}
 		}
+		p.Subject = existing.Username
 		return nil
+	}
+	// A new shadow is a new users row, newer than anything the cluster holds
+	// under this name. On a node whose users table has not synced, "no row"
+	// may only mean "not here yet", and the shadow would replace the cluster's
+	// local account cluster-wide (pre-existing; colonelpanik/litevirt#268
+	// review). Wait for the node to sync.
+	if !db.UsersSynced() {
+		return fmt.Errorf("%w: this node has not synced its users yet, so it cannot tell whether %q "+
+			"is already an account; retry shortly, or log in through another node", ErrShadowPending, p.Subject)
 	}
 	role := defaultRole
 	if role == "" {
 		role = "viewer"
 	}
-	return corrosion.InsertUser(ctx, db, p.Subject, role, "")
+	name := corrosion.NormalizeUsername(p.Subject)
+	if name == "" {
+		return errors.New("empty subject")
+	}
+	// A deleted account under a variant spelling (a legacy `Bob` shadow from
+	// before names were normalized) is brought back under ITS name, so it
+	// returns with its own lifecycle: a disabled `Bob` stays disabled when
+	// `bob` logs in again, instead of a fresh `bob` row with none.
+	if variant, err := corrosion.DeletedVariantOf(ctx, db, name); err != nil {
+		return err
+	} else if variant != "" {
+		name = variant
+	}
+	if err := corrosion.InsertUser(ctx, db, name, role, ""); err != nil {
+		return err
+	}
+	p.Subject = name
+	return nil
 }
 
 // rememberFlow stores the per-login PKCE verifier + nonce under the CSRF

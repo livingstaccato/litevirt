@@ -86,10 +86,56 @@ func adminRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreat
 	return incomingCreatedAt != localCreatedAt
 }
 
+// accountRemintRefused widens adminRemintRefused from admin accounts to every
+// live account that may be LOCAL (localAccountProtected). A different account
+// under such a name (another created_at) is not that account's update, whoever
+// minted it: a node whose users table had not caught up and created an
+// external shadow under a name it could not see is the common way, and before
+// this the newer shadow replaced the local account cluster-wide (pre-existing;
+// found in the colonelpanik/litevirt#268 review). An account this node knows
+// to be external is still replaced by LWW, as before.
+func accountRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreatedAt string, localProtected bool) bool {
+	if adminRemintRefused(localRole, localDeletedAt, localCreatedAt, incomingCreatedAt) {
+		return true
+	}
+	if !localProtected {
+		return false
+	}
+	return adminRemintRefused("admin", localDeletedAt, localCreatedAt, incomingCreatedAt)
+}
+
+// localAccountProtected reports whether username's live local row may be a
+// local account, judged inside the merge transaction exactly as
+// UserLocalCredential judges it: it holds a password (its old column, or a
+// live credential row), OR this node cannot tell (re-review 3, R3). After the
+// clear, a local account whose credential row has not arrived reads as an
+// empty old column with no credential row; replacing it then would demote it
+// on this node permanently once its credential arrives under the other
+// account's created_at. Only an account known to be external is left to LWW.
+// Refusing is fail-closed: anti-entropy offers the row again, and once the
+// evidence or the credential has arrived the judgement is made on it.
+func (c *Client) localAccountProtected(tx *sql.Tx, username string) (bool, error) {
+	var oldVal, createdAt, updatedAt string
+	var credKey, credVal, credTS sql.NullString
+	err := tx.QueryRow(`SELECT u.password_hash, u.created_at, u.updated_at, k.username, k.password_hash, k.updated_at
+		  FROM users u LEFT JOIN user_credentials k ON k.username = u.username AND k.deleted_at IS NULL
+		 WHERE u.username = ? AND u.deleted_at IS NULL`, username).
+		Scan(&oldVal, &createdAt, &updatedAt, &credKey, &credVal, &credTS)
+	if err == sql.ErrNoRows {
+		return false, nil // no live row: nothing to protect
+	}
+	if err != nil {
+		return false, err
+	}
+	local, known := c.judgeUserRow(userIdentity{Username: username, CreatedAt: createdAt, UpdatedAt: updatedAt},
+		oldVal, credKey.Valid, credVal.String, credTS.String)
+	return local || !known, nil
+}
+
 // usersAdminRemintIsRefused is the anti-entropy lane's adapter: it reads the
-// local row for the incoming row's PK and applies adminRemintRefused. Its
-// signature matches auditEvidenceGuard so it can only ever REFUSE.
-func usersAdminRemintIsRefused(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
+// local row for the incoming row's PK and applies accountRemintRefused. Like
+// auditEvidenceGuard it can only ever REFUSE.
+func (c *Client) usersAdminRemintIsRefused(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error) {
 	idx := columnIndexMap(table.Columns)
 	if _, ok := idx["created_at"]; !ok {
 		// A dump that does not carry created_at cannot be judged.
@@ -99,11 +145,16 @@ func usersAdminRemintIsRefused(tx *sql.Tx, table syncTable, row []interface{}, p
 	if err != nil || !found {
 		return false, "", err
 	}
-	if adminRemintRefused(
+	protected, err := c.localAccountProtected(tx, cellStr(localRow, idx, "username"))
+	if err != nil {
+		return false, "", err
+	}
+	if accountRemintRefused(
 		cellStr(localRow, idx, "role"),
 		cellStr(localRow, idx, "deleted_at"),
 		cellStr(localRow, idx, "created_at"),
 		cellStr(row, idx, "created_at"),
+		protected,
 	) {
 		return true, "admin_remint", nil
 	}
@@ -114,8 +165,15 @@ func usersAdminRemintIsRefused(tx *sql.Tx, table syncTable, row []interface{}, p
 // separate from auditEvidenceGuards because the two answer different questions —
 // that one protects immutable signed assertions, this one protects a live
 // credential — and collapsing them would make one comment have to explain both.
-var credentialMergeGuards = map[string]mergeFloor{
-	"users": {usersAdminRemintIsRefused, adminRemintAdvice},
+var credentialMergeGuards = map[string]credentialMergeFloor{
+	"users": {(*Client).usersAdminRemintIsRefused, adminRemintAdvice},
+}
+
+// credentialMergeFloor is mergeFloor with the receiving client, which the
+// users judgement needs for this node's own evidence (localAccountProtected).
+type credentialMergeFloor struct {
+	refuse func(c *Client, tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int) (bool, string, error)
+	advice string
 }
 
 // usersInsertRemintsALiveAdmin is the WAL lane's adapter.
@@ -147,7 +205,11 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 	if err != nil {
 		return false, err // unreadable is not "no live admin"
 	}
-	if !adminRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt) {
+	protected, err := r.client.localAccountProtected(tx, username)
+	if err != nil {
+		return false, err
+	}
+	if !accountRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt, protected) {
 		return false, nil
 	}
 	if hash, ok := insertParamString(s, sh, "password_hash"); ok {
@@ -176,12 +238,23 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 //     row is simply not part of what the entry wrote here.
 //   - Anti-entropy carries the users row on the public lane and its
 //     credential on the sensitive lane, in separate pulls with nothing to pair
-//     them by entry. Every writer puts the same hash in users.password_hash
-//     and user_credentials (dual-write; the old column is never cleared), so a
+//     them by entry. Until credentials_clear_v1 latches every writer puts the
+//     same hash in users.password_hash and user_credentials (dual-write), so a
 //     refused users row names the credential that belongs to it by VALUE. The
 //     refusal is remembered (refusedRemints) and the sensitive lane refuses a
 //     user_credentials row carrying a remembered hash. A rotation of the SAME
 //     account has the same created_at, is never refused, and keeps repairing.
+//     Once the re-minting node has latched credentials_clear_v1 its users row
+//     carries '' and names no credential. The refusal is then remembered for
+//     the USERNAME, in the anti-entropy exchange with THAT peer only
+//     (remintScope), and that exchange's sensitive pull refuses any
+//     user_credentials row for the username whose hash differs from the one
+//     this node holds for the account it kept. The peer that holds the re-mint
+//     keeps offering it, so every exchange with it refuses again, including
+//     the first after a restart. The cost is confined to that peer: a genuine
+//     rotation of the account is still repaired from every other peer, and
+//     the WAL lane delivers it as usual. The judgement ends with the exchange;
+//     nothing is remembered across exchanges or peers.
 //     The memory is per process: checkPeer pulls the public lane first, and
 //     withholds user_credentials from the sensitive pull when the public pull
 //     that should have judged the peer's users rows did not complete.
@@ -194,6 +267,37 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 type refusedRemints struct {
 	mu     sync.Mutex
 	hashes map[string][]string
+}
+
+// remintScope is one anti-entropy exchange's memory of the re-minted accounts
+// whose users row carried NO hash (credentials_clear_v1 had cleared it on the
+// sender), so the credential cannot be recognised by value. checkPeer creates
+// one per peer per cycle and hands it to both of that peer's pulls; nil means
+// no exchange (a reseed, a test merge) and judges nothing.
+type remintScope struct {
+	mu      sync.Mutex
+	unknown map[string]bool
+}
+
+func (s *remintScope) noteUnknown(username string) {
+	if s == nil || username == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unknown == nil {
+		s.unknown = map[string]bool{}
+	}
+	s.unknown[username] = true
+}
+
+func (s *remintScope) hashUnknown(username string) bool {
+	if s == nil || username == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unknown[username]
 }
 
 const refusedRemintsPerUser = 16
@@ -309,10 +413,39 @@ func withoutRefusedRemints(stmts []Statement, refused map[string]bool) []Stateme
 
 // userCredentialOfRefusedRemint is the sensitive lane's check: the incoming
 // user_credentials row carries the hash of a re-minted users row this node
-// refused.
-func (c *Client) userCredentialOfRefusedRemint(table syncTable, row []interface{}) bool {
+// refused — or, where the refused row's old column had been cleared and this
+// is the same exchange with the same peer (table.remints), a hash other than
+// the one this node holds for the account it kept.
+func (c *Client) userCredentialOfRefusedRemint(tx *sql.Tx, table syncTable, row []interface{}) (bool, error) {
 	idx := columnIndexMap(table.Columns)
-	return c.remints.refused(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
+	username, hash := cellStr(row, idx, "username"), cellStr(row, idx, "password_hash")
+	if c.remints.refused(username, hash) {
+		return true, nil
+	}
+	if !table.remints.hashUnknown(username) {
+		return false, nil
+	}
+	var oldVal string
+	var credKey, credVal sql.NullString
+	err := tx.QueryRow(
+		`SELECT u.password_hash, c.username, c.password_hash
+		   FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		  WHERE u.username = ?`, username).Scan(&oldVal, &credKey, &credVal)
+	if err == sql.ErrNoRows {
+		return true, nil // no account of ours to compare with: refuse, never guess
+	}
+	if err != nil {
+		return false, err
+	}
+	ours := resolveCredential(credKey.Valid, credVal.String, oldVal)
+	if ours == "" {
+		// The account we kept holds no credential this node can see — a
+		// local account whose credential row lags (localAccountProtected).
+		// An empty credential from the refused account would make it read
+		// as external here: nothing to compare with, so refuse, never guess.
+		return true, nil
+	}
+	return hash != ours, nil
 }
 
 // noteRemintCredentialRefused records a refused credential on the shared merge
@@ -346,7 +479,7 @@ func insertParamString(s Statement, sh StmtShape, col string) (string, bool) {
 // overwrite it replaces was completely silent, so being visible IS the fix.
 func (c *Client) noteAdminRemintRefused(path resolveTiePath) {
 	c.observeMergeRejected("users", string(path), "admin_remint")
-	slog.Warn("refused a replicated users row that re-mints a live admin account: "+
+	slog.Warn("refused a replicated users row that re-mints a live admin or local account: "+
 		"its created_at does not match the local row's, so it is a DIFFERENT account "+
 		"under the same name, not a password change. "+adminRemintAdvice,
 		"table", "users", "reason", "admin_remint", "path", string(path))

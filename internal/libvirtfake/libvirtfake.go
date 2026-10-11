@@ -67,6 +67,9 @@ type Fake struct {
 	activeXML              map[string]string              // domain → live-view override (see DumpXML)
 	snapshots              map[string]map[string]struct{} // domain → snapshot names
 	diskSources            map[string]map[string]string   // domain → target-dev → source file
+	pitOn                  map[string]string              // point-in-time overlay → domain on it (pit_snapshot.go)
+	pitSnapErr             error
+	pitCommitErr           error
 	stats                  map[string]*libvirt.DomainStats
 	reasons                map[string]string // domain → injected DomainStateReason.Reason
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
@@ -88,6 +91,9 @@ type Fake struct {
 	// RegisterDomainEventCallback; nil until something registers. FireEvent
 	// delivers to it. Guarded by f.mu.
 	eventCB libvirt.DomainEventCallback
+
+	// secrets models libvirt's secret store: UUID → ceph secret. Guarded by f.mu.
+	secrets map[string]fakeSecret
 
 	// Optional time source for events. Defaults to time.Now.
 	Now func() time.Time
@@ -231,11 +237,23 @@ type Fake struct {
 	FailHasManagedSaveImage func(name string) error
 	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
 	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
-	FailSetVCPUs        func(name string, count int) error
-	FailSetMemory       func(name string, memMiB int) error
+	FailSetVCPUs  func(name string, count int) error
+	FailSetMemory func(name string, memMiB int) error
+	// FailSetVirtioMem injects a memory hot-add primitive failure.
+	FailSetVirtioMem    func(name string, requestedMiB int) error
+	FailSetCPUTune      func(name string, limit float64, shares int) error
+	FailSetNICRate      func(name, mac string, rateMBps float64) error
 	FailMigrateToTarget func(name, dconnuri string) error
-	FailBlockPull       func(domain, disk string) error
-	FailPoolDestroy     func(name string) error
+	// FailSetDiskIOTune injects a failure from the disk I/O throttle primitive.
+	FailSetDiskIOTune func(name, dev string) error
+	// FailSetDiskIOTuneLive fails AFTER the persistent definition took the
+	// throttle, as libvirt does when the live call is refused (a job-lock
+	// timeout during a backup).
+	FailSetDiskIOTuneLive func(name, dev string) error
+	FailBlockPull         func(domain, disk string) error
+	FailPoolDestroy       func(name string) error
+	// FailDefineSecret, when set, makes DefineCephSecret fail for a UUID.
+	FailDefineSecret func(uuid string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -1455,6 +1473,45 @@ func (f *Fake) BlockResize(domainName, path string, sizeBytes int64) error {
 	f.record("block-resize", domainName, fmt.Sprintf("path=%s size=%d", path, sizeBytes))
 	return nil
 }
+
+// SetDiskIOTune models the real client: the persistent definition takes the
+// throttle, and so does the live view of a running domain, so a test reads
+// either back with DumpXML / DumpXMLInactive. Like libvirt it refuses a disk
+// the definition does not carry and a throttle libvirt would refuse.
+func (f *Fake) SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error {
+	if f.FailSetDiskIOTune != nil {
+		if err := f.FailSetDiskIOTune(domainName, dev); err != nil {
+			return err
+		}
+	}
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[domainName]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", domainName)
+	}
+	persisted, err := libvirt.PatchDiskIOTune(f.xml[domainName], dev, t)
+	if err != nil {
+		return fmt.Errorf("libvirtfake: set I/O limits on %q: %w", domainName, err)
+	}
+	f.xml[domainName] = persisted
+	if f.FailSetDiskIOTuneLive != nil && (st == StateRunning || st == StatePaused) {
+		if err := f.FailSetDiskIOTuneLive(domainName, dev); err != nil {
+			return err
+		}
+	}
+	if live, ok := f.activeXML[domainName]; ok && (st == StateRunning || st == StatePaused) {
+		if patched, perr := libvirt.PatchDiskIOTune(live, dev, t); perr == nil {
+			f.activeXML[domainName] = patched
+		}
+	}
+	f.record("set-iotune", domainName, fmt.Sprintf("dev=%s %+v", dev, t))
+	return nil
+}
+
 func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1474,8 +1531,9 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	defer f.mu.Unlock()
 	// The parameters a test asserts on: whether the disks were copied, and
 	// which ones (libvirt's migrate_disks; empty means every writable disk).
-	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s",
-		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination)
+	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s addr=%s direct=%t",
+		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination, p.TargetAddress, p.Direct)
+	note += fmt.Sprintf(" shares_weight=%d target_cgroup=%s", p.SharesWeight, p.TargetCgroup)
 	if len(p.CDROMSources) > 0 {
 		// As libvirt would: the destination definition must still carry each
 		// CD-ROM being pointed elsewhere.
@@ -1492,6 +1550,14 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	}
 	if p.Paused {
 		note += " paused=true"
+	}
+	if len(p.RBDLocators) > 0 {
+		var names []string
+		for n := range p.RBDLocators {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		note += " rbd=" + strings.Join(names, ",")
 	}
 	f.record("migrate", name, note)
 	if cb := f.OnMigrateToTarget; cb != nil {
@@ -1746,6 +1812,47 @@ func (f *Fake) SetMemory(domainName string, memMiB int) error {
 	return nil
 }
 
+// SetVirtioMemRequested models plugging memory into a hot-add domain: the
+// virtio-mem element's <requested> is rewritten in the persistent definition
+// and, when one is tracked, the live view — so DumpXML shows what libvirt
+// would. A domain with no virtio-mem device errors, as libvirt does.
+func (f *Fake) SetVirtioMemRequested(domainName string, requestedMiB int) error {
+	if f.FailSetVirtioMem != nil {
+		if err := f.FailSetVirtioMem(domainName, requestedMiB); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, ok := f.xml[domainName]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", domainName)
+	}
+	rewrite := func(doc string) (string, error) {
+		elem, err := libvirt.VirtioMemUpdateXML(doc, requestedMiB)
+		if err != nil {
+			return "", err
+		}
+		return virtioMemElemRe.ReplaceAllLiteralString(doc, elem), nil
+	}
+	next, err := rewrite(cur)
+	if err != nil {
+		return err
+	}
+	f.xml[domainName] = next
+	if live, ok := f.activeXML[domainName]; ok {
+		if nl, lerr := rewrite(live); lerr == nil {
+			f.activeXML[domainName] = nl
+		}
+	}
+	f.record("set-virtio-mem", domainName, fmt.Sprintf("%d", requestedMiB))
+	return nil
+}
+
+// virtioMemElemRe matches the virtio-mem element SetVirtioMemRequested
+// rewrites (the same shape libvirt.VirtioMemUpdateXML reads).
+var virtioMemElemRe = regexp.MustCompile(`(?s)<memory\b[^>]*\bmodel=['"]virtio-mem['"][^>]*>.*?</memory>`)
+
 func (f *Fake) SetVCPUs(name string, count int) error {
 	if f.FailSetVCPUs != nil {
 		if err := f.FailSetVCPUs(name, count); err != nil {
@@ -1755,6 +1862,78 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("set-vcpus", name, fmt.Sprintf("%d", count))
+	return nil
+}
+
+// SetCPUTune models the libvirt scheduler-parameter write: it patches the
+// persistent XML and, for a running domain with a live override, the live XML,
+// exactly as the real primitive's config-then-live apply does.
+func (f *Fake) SetCPUTune(name string, limit float64, shares int) error {
+	// Refuse what the real primitive refuses, so a caller cannot pass a value the
+	// fake accepts and libvirt would not.
+	if err := libvirt.ValidateCPUShares(shares); err != nil {
+		return err
+	}
+	if limit < 0 {
+		return fmt.Errorf("libvirtfake: negative cpu limit %v", limit)
+	}
+	if f.FailSetCPUTune != nil {
+		if err := f.FailSetCPUTune(name, limit, shares); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	patch := func(x string) string {
+		out, err := libvirt.PatchInactiveCPUTune(x, limit, shares)
+		if err != nil {
+			return x
+		}
+		return out
+	}
+	if x, ok := f.xml[name]; ok {
+		f.xml[name] = patch(x)
+	}
+	if x, ok := f.activeXML[name]; ok {
+		f.activeXML[name] = patch(x)
+	}
+	f.record("set-cputune", name, fmt.Sprintf("limit=%g shares=%d", limit, shares))
+	return nil
+}
+
+// SetNICRate models the libvirt interface-parameter write (see SetCPUTune).
+func (f *Fake) SetNICRate(name, mac string, rateMBps float64) error {
+	if err := libvirt.ValidateNICRate(rateMBps); err != nil {
+		return err
+	}
+	if f.FailSetNICRate != nil {
+		if err := f.FailSetNICRate(name, mac, rateMBps); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	found := false
+	if x, ok := f.xml[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.xml[name], found = out, true
+		}
+	}
+	if x, ok := f.activeXML[name]; ok {
+		if out, hit := libvirt.PatchInterfaceBandwidth(x, mac, rateMBps); hit {
+			f.activeXML[name], found = out, true
+		}
+	}
+	if !found {
+		return fmt.Errorf("libvirtfake: domain %q has no interface %s", name, mac)
+	}
+	f.record("set-nic-rate", name, fmt.Sprintf("%s=%g", mac, rateMBps))
 	return nil
 }
 
@@ -2201,4 +2380,79 @@ func (f *Fake) AbortedMigrations(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.abortedMigrations[name]
+}
+
+// fakeSecret is one ceph secret in the fake's store.
+type fakeSecret struct {
+	clientID string
+	value    []byte
+}
+
+// DefineCephSecret defines or redefines a ceph secret and sets its value. The
+// event recorded carries the client, never the value.
+func (f *Fake) DefineCephSecret(secretUUID, clientID string, value []byte) error {
+	if f.FailDefineSecret != nil {
+		if err := f.FailDefineSecret(secretUUID); err != nil {
+			return err
+		}
+	}
+	if len(value) == 0 {
+		return fmt.Errorf("ceph secret %s: empty value", secretUUID)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.secrets == nil {
+		f.secrets = map[string]fakeSecret{}
+	}
+	f.secrets[secretUUID] = fakeSecret{clientID: clientID, value: append([]byte(nil), value...)}
+	f.record("secret-define", secretUUID, "client="+clientID)
+	return nil
+}
+
+// HasSecret reports whether the secret is defined.
+func (f *Fake) HasSecret(secretUUID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.secrets[secretUUID]
+	return ok, nil
+}
+
+// ListCephSecrets returns every defined secret's UUID (the fake holds only
+// litevirt's).
+func (f *Fake) ListCephSecrets() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.secrets))
+	for u := range f.secrets {
+		out = append(out, u)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// UndefineSecret removes a secret; one not defined is not an error.
+func (f *Fake) UndefineSecret(secretUUID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.secrets[secretUUID]; ok {
+		delete(f.secrets, secretUUID)
+		f.record("secret-undefine", secretUUID, "")
+	}
+	return nil
+}
+
+// CephSecret returns a defined secret's client and value (test accessor).
+func (f *Fake) CephSecret(secretUUID string) (clientID string, value []byte, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.secrets[secretUUID]
+	return s.clientID, append([]byte(nil), s.value...), ok
+}
+
+// DropSecrets forgets every secret, as a libvirtd restart does to ephemeral
+// ones.
+func (f *Fake) DropSecrets() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets = nil
 }

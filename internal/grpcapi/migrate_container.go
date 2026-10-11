@@ -276,7 +276,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_ARCHIVING, Status: "archiving rootfs into staging repo"})
-	if _, err := s.archiveContainer(ctx, repo, rec, timestamp, func(p pbsstore.PushProgress) {
+	if _, err := s.archiveContainer(ctx, repo, rec, timestamp, nil, func(p pbsstore.PushProgress) {
 		_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_ARCHIVING, BytesProcessed: p.BytesProcessed})
 	}); err != nil {
 		return rollback(fmt.Errorf("archive: %w", err))
@@ -312,7 +312,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_RESTORING, Status: "restoring on target"})
-	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning, rec.OwnerEpoch)
+	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning, rec.OwnerEpoch, rec.CreateSpec)
 	switch outcome {
 	case corrosion.RestoreLanded:
 		// The target recorded its row (authoritative). Even if its start then failed,
@@ -370,6 +370,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	s.deleteContainerDNS(ctx, req.Name, containerStackLabel(*rec))
 	_ = corrosion.DeleteContainerRestartState(ctx, s.db, source, req.Name)
 
+	// The container may now run on its own replica target: replicate back to the
+	// host it left.
+	s.reverseReplicationAfterMove(ctx, "container", req.Name, project, source, req.TargetHost)
 	s.audit(ctx, "ct.migrate", req.Name, fmt.Sprintf("project=%s %s→%s", project, source, req.TargetHost), "ok")
 	return send(&pb.MigrateContainerProgress{
 		Phase:  pb.MigrateContainerProgress_DONE,
@@ -396,7 +399,7 @@ func detachedMigrateCleanupCtx(ctx context.Context) (context.Context, context.Ca
 // restore (whose later start may have failed) from a genuine pre-row failure and
 // only roll back the source in the latter case. The test seam replaces the whole
 // drive so the path is unit-testable without a second daemon.
-func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool, ownerEpoch int64) (corrosion.RestoreOutcome, error) {
+func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool, ownerEpoch int64, sourceSpec string) (corrosion.RestoreOutcome, error) {
 	// Tell the target this is a migrate FROM us (peer-verified on the far side), so it keeps
 	// the imported NIC IPs — we handed it the IPAM leases before this call — rather than
 	// re-reserving and blanking them. The transport (PR-4 push to the target's staging repo
@@ -418,7 +421,10 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 		}
 		mdPairs = append(mdPairs, relocateTokenMDKey, proof.GetRelocationToken())
 	}
-	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, proof, relocationLineage{}, mdPairs...)
+	// The container's own row travels with it: the target takes the moved
+	// container's NICs, host access and privilege from it, and its replica
+	// need not have the row yet.
+	return s.drivePeerRestore(ctx, target, repoPath, name, timestamp, start, proof, relocationLineage{sourceSpec: sourceSpec}, mdPairs...)
 }
 
 // mintRelocationProof writes a durable single-use container-relocation proof (dest==target,

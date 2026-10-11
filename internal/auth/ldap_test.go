@@ -29,6 +29,10 @@ type fakeLDAPConn struct {
 	// regardless of filter — used to test the "ambiguous filter" path.
 	multiResults []*ldap.Entry
 
+	// userEntriesMulti maps a filter to every entry it returns, for
+	// collision scenarios (ldap_identity_test.go).
+	userEntriesMulti map[string][]*ldap.Entry
+
 	// searchErr forces Search to fail (transport-style error).
 	searchErr error
 	// dialErr is set on the dialer, not the conn — kept here for symmetry.
@@ -54,6 +58,9 @@ func (c *fakeLDAPConn) Search(req *ldap.SearchRequest) (*ldap.SearchResult, erro
 	}
 	if c.multiResults != nil {
 		return &ldap.SearchResult{Entries: c.multiResults}, nil
+	}
+	if es, ok := c.userEntriesMulti[req.Filter]; ok {
+		return &ldap.SearchResult{Entries: es}, nil
 	}
 	if e, ok := c.userEntries[req.Filter]; ok {
 		return &ldap.SearchResult{Entries: []*ldap.Entry{e}}, nil

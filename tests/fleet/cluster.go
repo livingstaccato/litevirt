@@ -84,6 +84,12 @@ type Options struct {
 	// own DB and mutations must travel via the real Replicator —
 	// steered by the scenario unless IndependentReplicas starts its loop.
 	SharedCRDT bool
+	// SharedDataDir gives every node the SAME data directory string, as every
+	// host of a real cluster has /var/lib/litevirt. A disk's recorded path then
+	// names a file under every node's disk-artifact root, which a copy between
+	// hosts needs; pair it with SetHostDiskRootForTest so each node still has
+	// its own files.
+	SharedDataDir bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
 	// NetBoxURL points every node's NetBox client at an external IPAM — in
@@ -128,6 +134,11 @@ type Options struct {
 	// relay and still wants each side to converge sets this to Nodes, which
 	// makes every node a relay and the mesh full.
 	Relays int
+	// ConnTracking wraps every node's gRPC listener in a pki.ConnTracker, as
+	// the daemon does, so established connections can be re-judged
+	// (Node.SweepConnections) after a revocation or a renewal. Nothing sweeps
+	// by itself: a scenario sweeps at the exact moment it is asserting about.
+	ConnTracking bool
 	// RealGossip replaces the seeded Members() view with a real memberlist per
 	// node, on its own gossip port, behind a firewall SplitGossip can cut (see
 	// gossip_real.go). It is for scenarios about how a node comes to SEE its
@@ -210,6 +221,10 @@ type Node struct {
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
 
+	// ConnTracker tracks the node's established connections under
+	// Options.ConnTracking; nil otherwise.
+	ConnTracker *pki.ConnTracker
+
 	// cluster is the fleet this node belongs to, so a node-scoped helper can
 	// reach cluster-wide state (the self client, the reachability overlay).
 	cluster *Cluster
@@ -246,6 +261,8 @@ type Node struct {
 	// unaryHooks are armed by HookUnary, keyed by method name, and consumed
 	// by the next call to that unary method. Guarded by partMu.
 	unaryHooks map[string][]UnaryHook
+	// streamHooks are armed by HookStream, likewise. Guarded by partMu.
+	streamHooks map[string][]StreamHook
 
 	// faults is the per-link replication fault injector for pushes INTO this
 	// node (see LinkFault). Inert until a scenario sets a fault.
@@ -259,6 +276,10 @@ type Node struct {
 	// GossipPort is the node's memberlist port under Options.RealGossip, and
 	// zero otherwise.
 	GossipPort int
+
+	// stopServerLoops stops the background loops buildServer started for this
+	// node's current server, as a daemon's exit does (see restartNode).
+	stopServerLoops context.CancelFunc
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -320,6 +341,46 @@ func (n *Node) hookUnaryInterceptor(ctx context.Context, req any, info *grpc.Una
 		return handler(ctx, req)
 	}
 	return fn(ctx, req, handler)
+}
+
+// StreamHook stands in for one call of a streaming method on a node, as
+// UnaryHook does for a unary one: it receives the server stream and the real
+// handler, and decides what the handler sees (a scenario wraps the stream to
+// act between two messages).
+type StreamHook func(srv any, ss grpc.ServerStream, handler grpc.StreamHandler) error
+
+// HookStream arms fn for the next call of the named streaming method served
+// by this node. It runs inside the auth interceptor.
+func (n *Node) HookStream(method string, fn StreamHook) {
+	n.partMu.Lock()
+	n.streamHooks[method] = append(n.streamHooks[method], fn)
+	n.partMu.Unlock()
+}
+
+func (n *Node) hookStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	m := methodName(info.FullMethod)
+	n.partMu.Lock()
+	var fn StreamHook
+	if hs := n.streamHooks[m]; len(hs) > 0 {
+		fn = hs[0]
+		n.streamHooks[m] = hs[1:]
+	}
+	n.partMu.Unlock()
+	if fn == nil {
+		return handler(srv, ss)
+	}
+	return fn(srv, ss, handler)
+}
+
+// SweepConnections re-judges every established connection to n with its
+// server's policy (grpcapi.Server.ConnJudge), as the daemon's tracker does
+// every few seconds, and returns how many it closed. It needs
+// Options.ConnTracking.
+func (n *Node) SweepConnections(ctx context.Context) int {
+	if n.ConnTracker == nil {
+		n.cluster.t.Fatalf("%s: SweepConnections needs Options.ConnTracking", n.Name)
+	}
+	return n.ConnTracker.Sweep(n.Server.ConnJudge(ctx))
 }
 
 // New brings up a Cluster ready for scenarios. Each node has:
@@ -387,6 +448,7 @@ func New(t *testing.T, opts Options) *Cluster {
 			unimplemented: make(map[string]bool),
 			streamWatches: make(map[string][]*StreamWatch),
 			unaryHooks:    make(map[string][]UnaryHook),
+			streamHooks:   make(map[string][]StreamHook),
 			cluster:       c,
 		}
 		c.mintHostCert(n)
@@ -740,6 +802,9 @@ func (c *Cluster) crossRegisterHosts() {
 
 func (c *Cluster) buildServer(n *Node) {
 	dataDir := filepath.Join(c.tmpRoot, n.Name, "data")
+	if c.opts.SharedDataDir {
+		dataDir = filepath.Join(c.tmpRoot, "shared-data")
+	}
 	if err := mkdirAll(dataDir); err != nil {
 		c.t.Fatalf("mkdir data for %s: %v", n.Name, err)
 	}
@@ -754,6 +819,10 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+	// A running VM's replica or copy is point-in-time through the external
+	// snapshot layer, as the daemon wires it from its libvirt client
+	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
+	n.Server.SetPointInTimeSnapshotter(n.Virt)
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
@@ -816,6 +885,12 @@ func (c *Cluster) buildServer(n *Node) {
 	// the reason a scenario that both queues work and counts NetBox writes must
 	// not be made to run for minutes.
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
+	// The moved-iSCSI-hold resolver, as the daemon runs it. Its interval is
+	// longer than a scenario's steps take; a re-create that returns kicks it
+	// at once, as in production.
+	loops, stop := context.WithCancel(c.ctx)
+	n.stopServerLoops = stop
+	go n.Server.RunLUNHoldResolver(loops, 10*time.Second)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. By default its background push loop is NOT started, so
@@ -843,11 +918,18 @@ func (c *Cluster) buildServer(n *Node) {
 	// if the link were severed. Both a unary and a stream interceptor are needed
 	// — the streaming dump RPCs (StreamStateDump / StreamSensitiveStateDump)
 	// never hit a unary interceptor.
-	srv := grpc.NewServer(
-		grpc.Creds(credentials.NewTLS(tlsCfg)),
+	creds := credentials.NewTLS(tlsCfg)
+	var trackOpts []grpc.ServerOption
+	if c.opts.ConnTracking {
+		n.ConnTracker = pki.NewConnTracker(n.PKIDir)
+		creds = n.ConnTracker.ServerCreds(creds)
+		trackOpts = append(trackOpts, grpc.StatsHandler(n.ConnTracker.StatsHandler()))
+	}
+	srv := grpc.NewServer(append(trackOpts,
+		grpc.Creds(creds),
 		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
-		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor),
-	)
+		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor, n.hookStreamInterceptor),
+	)...)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
 	go func() {
@@ -923,6 +1005,9 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 		return true
 	}
 	if n.claimBlocked(fullMethod, peerCertCN(ctx)) {
+		return true
+	}
+	if n.readyBlocked(fullMethod, peerCertCN(ctx)) {
 		return true
 	}
 	if !partitionedMethods[methodName(fullMethod)] {

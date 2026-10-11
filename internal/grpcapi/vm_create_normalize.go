@@ -55,5 +55,25 @@ func normalizeCreateVMSpec(in *pb.VMSpec, defaultCPUMode string) (*pb.VMSpec, er
 	if err := lv.ValidateCPUMode(spec.CpuMode, spec.CpuModel); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := validateCreateLimits(spec); err != nil {
+		return nil, err
+	}
 	return spec, nil
+}
+
+// validateCreateLimits checks the noisy-neighbour limits of a create spec
+// against its (defaulted) vCPU count.
+func validateCreateLimits(spec *pb.VMSpec) error {
+	if err := lv.ValidateCPULimit(spec.CpuLimit, int(spec.Cpu)); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := lv.ValidateCPUShares(int(spec.CpuShares)); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	for i, n := range spec.Network {
+		if err := lv.ValidateNICRate(n.GetRateMbSec()); err != nil {
+			return status.Errorf(codes.InvalidArgument, "network[%d]: %v", i, err)
+		}
+	}
+	return nil
 }

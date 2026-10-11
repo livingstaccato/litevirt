@@ -575,3 +575,106 @@ func TestCapacityConfigPolicy_EmptyBlockIsDefaults(t *testing.T) {
 		t.Errorf("Policy() = %+v, want %+v", got, want)
 	}
 }
+
+// TestLoadConfig_MigrationNetwork: migration.network is an IPv4 CIDR. A value
+// the migration code cannot use refuses the boot, instead of every migration
+// quietly falling back to the cluster address later.
+//
+// Mutation: drop the ParseMigrationNetwork call in LoadConfig — the bad values
+// load.
+func TestLoadConfig_MigrationNetwork(t *testing.T) {
+	load := func(value string) (*Config, error) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := "host_name: \"h\"\nmigration:\n  network: " + strconv.Quote(value) + "\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+	cfg, err := load("10.20.0.0/24")
+	if err != nil || cfg.Migration.Network != "10.20.0.0/24" {
+		t.Fatalf("LoadConfig(10.20.0.0/24) = %+v, %v; want it accepted", cfg, err)
+	}
+	for _, bad := range []string{"10.20.0.1", "fd00::/64", "0.0.0.0/0", "lan"} {
+		if _, err := load(bad); err == nil || !strings.Contains(err.Error(), "migration.network") {
+			t.Errorf("LoadConfig(%q) = %v; want a load error naming migration.network", bad, err)
+		}
+	}
+}
+
+// migration.address must be inside migration.network, and means nothing
+// without it.
+//
+// Mutation: drop the address checks in LoadConfig - the bad rows load.
+func TestLoadConfig_MigrationAddress(t *testing.T) {
+	load := func(body string) (*Config, error) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte("host_name: \"h\"\n"+body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", path)
+		return LoadConfig()
+	}
+	if cfg, err := load("migration:\n  network: 10.20.0.0/24\n  address: 10.20.0.7\n  allow_any_network: true\n"); err != nil ||
+		cfg.Migration.Address != "10.20.0.7" || !cfg.Migration.AllowAnyNetwork {
+		t.Fatalf("a valid address: %+v %v", cfg, err)
+	}
+	for name, body := range map[string]string{
+		"outside the network": "migration:\n  network: 10.20.0.0/24\n  address: 10.30.0.7\n",
+		"not an address":      "migration:\n  network: 10.20.0.0/24\n  address: nope\n",
+		"no network":          "migration:\n  address: 10.20.0.7\n",
+	} {
+		if _, err := load(body); err == nil || !strings.Contains(err.Error(), "migration.address") {
+			t.Errorf("%s: %v, want a load error naming migration.address", name, err)
+		}
+	}
+}
+
+// The daemon refuses to start with a migration network that would send
+// migration data out the uplink or the cluster interface, unless told.
+//
+// Mutation: make checkMigrationNetwork return nil - the public and cluster rows
+// are accepted.
+func TestCheckMigrationNetworkAtStart(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg     MigrationConfig
+		advert  string
+		wantErr bool
+	}{
+		"unset":                    {MigrationConfig{}, "", false},
+		"private, separate":        {MigrationConfig{Network: "10.20.0.0/24"}, "192.168.1.5", false},
+		"public":                   {MigrationConfig{Network: "203.0.113.0/24"}, "192.168.1.5", true},
+		"public with override":     {MigrationConfig{Network: "203.0.113.0/24", AllowAnyNetwork: true}, "192.168.1.5", false},
+		"contains the cluster":     {MigrationConfig{Network: "192.168.0.0/16"}, "192.168.1.5", true},
+		"address not on this host": {MigrationConfig{Network: "10.20.0.0/24", Address: "10.20.0.77"}, "192.168.1.5", true},
+	} {
+		d := &Daemon{cfg: &Config{Migration: tc.cfg, AdvertiseAddress: tc.advert}}
+		if err := d.checkMigrationNetwork(); (err != nil) != tc.wantErr {
+			t.Errorf("%s: %v, want error=%v", name, err, tc.wantErr)
+		}
+	}
+}
+
+// A host must not start with a bind-mount prefix that is, lies in or
+// contains a protected tree, nor a device entry that is a directory.
+func TestLoadConfig_RefusesUnsafeContainerHostAccess(t *testing.T) {
+	for _, extra := range []string{
+		"containers:\n  bind_mount_paths: [\"/\"]\n",
+		"containers:\n  bind_mount_paths: [\"/var\"]\n",
+		"containers:\n  bind_mount_paths: [\"/tmp/data/x\"]\n", // inside data_dir
+		"containers:\n  device_paths: [\"/dev\"]\n",
+		"containers:\n  device_paths: [\"/dev/mem\"]\n",
+	} {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		yaml := "host_name: \"test-host\"\npki_dir: /tmp/pki\ndata_dir: /tmp/data\n" + extra
+		if err := os.WriteFile(configPath, []byte(yaml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("LITEVIRT_CONFIG", configPath)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("LoadConfig accepted %q", extra)
+		}
+	}
+}

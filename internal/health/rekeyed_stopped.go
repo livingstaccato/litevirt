@@ -112,7 +112,7 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 	}
 	var diskConfigs []lv.DiskConfig
 	for _, d := range disks {
-		if _, err := os.Stat(d.Path); err != nil {
+		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
 			r.noteRekeyOnce(vm.Name, "a shared disk is not visible on this host", "disk", d.DiskName, "path", d.Path)
 			return
 		}
@@ -128,6 +128,10 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 	domXML, _, failure := r.domainXMLFor(ctx, *fresh, spec, diskConfigs)
 	if failure != "" {
 		r.noteRekeyOnce(vm.Name, "its domain cannot be built: "+failure)
+		return
+	}
+	if failure := r.settlePITOverlays(ctx, *fresh, spec, diskConfigs); failure != "" {
+		r.noteRekeyOnce(vm.Name, failure)
 		return
 	}
 	if r.virt.DomainExists(vm.Name) {

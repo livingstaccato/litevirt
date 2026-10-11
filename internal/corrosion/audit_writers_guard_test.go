@@ -30,6 +30,7 @@ var auditWriters = map[string]struct{ dir, test string }{
 	"health.(*Reconciler).auditOwnerAssert":     {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
 	"health.(*ContainerChecker).auditContainer": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
 	"health.auditSettle":                        {"internal/health", "TestAuditWriter_SettleRowsAreSigned"},
+	"health.auditSystem":                        {"internal/health", "TestAuditWriter_SystemRowsAreSigned"},
 	"daemon.(*Daemon).checkAdminFloor":          {"internal/daemon", "TestAuditWriter_AdminFloorRowsAreSigned"},
 	"corrosion.RecordAuditSeededAssertion":      {"internal/corrosion", "TestAuditSeeded_AnAssertionIsAuditedOnceSigned"},
 }

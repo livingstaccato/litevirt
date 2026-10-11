@@ -1118,3 +1118,20 @@ func TestClaimActionProofFenced_TheWireCarriesTheRowLocalClaim(t *testing.T) {
 		t.Errorf("the accepted claim did not reach the wire at all:\n\t%s", stmts)
 	}
 }
+
+// A failover reschedule changes the VM's host, so it advances the VM's
+// placement generation in the same batch (failback compares it).
+//
+// Mutation: drop the generation statement from WriteVMRescheduleProof.
+func TestWriteVMRescheduleProof_AdvancesThePlacementGeneration(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	openClusterPolicyGate(c)
+	apInsertVM(t, c, "vm1", "host-a", "running")
+	if err := WriteVMRescheduleProof(ctx, c, apProof("p1", "vm1", "host-b"), "vm1", "host-b"); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := GetPlacementGen(ctx, c, "vm1"); err != nil || g != 1 {
+		t.Fatalf("placement generation = %d, %v; want 1", g, err)
+	}
+}

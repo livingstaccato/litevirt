@@ -23,6 +23,8 @@ func (s *Server) Whoami(ctx context.Context, _ *emptypb.Empty) (*pb.WhoamiRespon
 		Username: callerUsername(ctx),
 		Role:     callerRole(ctx),
 		Realm:    callerRealm(ctx),
+
+		Requires_2FaEnrollment: callerEnrollOnly(ctx),
 	}
 	// Best-effort: surface the session's hard-expiry so the UI can show it.
 	if sid := callerSessionID(ctx); sid != "" {

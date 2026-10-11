@@ -99,3 +99,43 @@ func TestMigrationFlagsAndParams_MemoryOnlyIsTunnelled(t *testing.T) {
 		t.Errorf("tls.destination set on a tunnelled migration")
 	}
 }
+
+// A memory-only migration over a dedicated migration network leaves libvirt's
+// tunnel: QEMU opens its own TLS stream to the address on that network, and the
+// certificate is checked against the name the target's migration certificate
+// carries (its cluster address), not the dedicated address, which is not in it.
+//
+// Mutation: drop `p.Direct` from the tunnelled branch, or drop the
+// tls.destination parameter, in migrationFlagsAndParams — red.
+func TestMigrationFlagsAndParams_DirectMemoryOnlyOverMigrationNetwork(t *testing.T) {
+	flags, params := migrationFlagsAndParams(MigrateParams{
+		Live: true, Direct: true, TargetAddress: "10.9.0.2", TLS: true, TLSDestination: "192.168.1.2",
+	})
+	if flags&golibvirt.MigrateTunnelled != 0 {
+		t.Fatalf("flags = %#x; a migration over the migration network must not be tunnelled through the cluster address", uint64(flags))
+	}
+	if flags&golibvirt.MigrateTLS == 0 {
+		t.Fatalf("flags = %#x; VIR_MIGRATE_TLS is not set: the memory would cross the network in plaintext", uint64(flags))
+	}
+	if flags&golibvirt.MigrateNonSharedDisk != 0 {
+		t.Errorf("flags = %#x; no disk is copied", uint64(flags))
+	}
+	if v, n := stringParam(params, golibvirt.MigrateParamURI); n != 1 || v != "tcp://10.9.0.2" {
+		t.Errorf("migrate_uri = %q (x%d); want exactly one, tcp://10.9.0.2", v, n)
+	}
+	if v, n := stringParam(params, golibvirt.MigrateParamTLSDestination); n != 1 || v != "192.168.1.2" {
+		t.Errorf("tls.destination = %q (x%d); want exactly one, the cluster address", v, n)
+	}
+}
+
+// Direct without TLS is not a mode: the caller falls back to the tunnel rather
+// than send memory in the clear, and the builder holds that line too.
+func TestMigrationFlagsAndParams_DirectWithoutTLSStaysTunnelled(t *testing.T) {
+	flags, params := migrationFlagsAndParams(MigrateParams{Live: true, Direct: true, TargetAddress: "10.9.0.2"})
+	if flags&golibvirt.MigrateTunnelled == 0 {
+		t.Fatalf("flags = %#x; a direct migration without TLS must stay tunnelled", uint64(flags))
+	}
+	if _, n := stringParam(params, golibvirt.MigrateParamURI); n != 0 {
+		t.Errorf("migrate_uri set although the migration stayed tunnelled")
+	}
+}

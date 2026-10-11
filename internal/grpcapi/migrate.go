@@ -193,6 +193,18 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A failback move is conditional on the VM still being where the drain left
+	// it, judged here, by its owner under its lock (failback.go).
+	if req.GetExpectDrainRecord() {
+		if err := s.checkDrainExpectation(ctx, req, vm); err != nil {
+			return err
+		}
+	}
+	// A point-in-time overlay an earlier copy left holds writes the disk's
+	// file lacks: a migration must carry them, so settle it first.
+	if err := s.settlePITOverlays(ctx, vm); err != nil {
+		return err
+	}
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
 	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
@@ -257,6 +269,20 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// the guest's machine type still refuses, at the define.
 	if !coldStopped && !fwVM {
 		if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
+			return err
+		}
+	}
+
+	// USB passthrough: live is refused while a device is attached; cold needs
+	// every device mapped and the target to hold each mapping. Before any
+	// target-side work, so a refusal wastes none. A spec that cannot be read
+	// refuses rather than migrating a VM whose devices are unknown.
+	if vm.Spec != "" {
+		usbSpec := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), usbSpec); err != nil {
+			return status.Errorf(codes.Internal, "parse spec of %q: %v", vm.Name, err)
+		}
+		if err := s.refuseUSBMigration(ctx, vm, usbSpec, targetHost.Name, req.Strategy == pb.MigrateStrategy_MIGRATE_COLD); err != nil {
 			return err
 		}
 	}
@@ -374,6 +400,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		if !srcTLS && !s.allowPlaintextStorageMigration {
 			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, s.hostName)
 		}
+	} else if s.migrationNetwork != "" {
+		// A memory-only migration rides libvirt's tunnel on the cluster
+		// address; it can use the migration network only on QEMU's own stream,
+		// which needs this host's credentials too (migration_network.go). Not
+		// being ready is not a refusal here: the move stays in the tunnel.
+		srcTLS = s.migrationTLSReady()
 	}
 	// The disks the copy needs on the target, checked against their records
 	// here, before any work on the target.
@@ -540,16 +572,28 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// another file there (a link, a library directory); the destination
 	// definition carries those (MigrateParams.CDROMSources).
 	var cdromSources map[string]string
+	// targetCgroup: the target's cgroup version when it reported one.
+	var targetCgroup string
 	useTLS := false
+	// route is where the migration's data goes: the cluster address, or the
+	// target's address in migration.network (migration_network.go).
+	route := migrationRoute{addr: targetHost.Address}
 	if withStorage {
 		var dstTLS bool
-		if createdStubs, dstTLS, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
+		var ens ensureOutcome
+		if ens, err = s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
 		}
+		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
+		kind := routeStorage
+		if fwVM || coldStopped {
+			kind = routeCold
+		}
+		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
 			// older build that never answers). The abort undoes the stubs.
@@ -564,9 +608,21 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
-		if _, _, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, nil, false, !(fwVM || coldStopped)); err != nil {
-			return err
+		ens, eerr := s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, nil, srcTLS, !(fwVM || coldStopped))
+		if eerr != nil {
+			return eerr
 		}
+		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
+		if fwVM || coldStopped {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
+		} else {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
+		}
+	}
+	if route.onNetwork {
+		// A cold move's disk stream (and the clone copy, which is one) is dialed
+		// at this address; a live move's data is not (migration_network.go).
+		abort.diskAddr = route.addr
 	}
 
 	// A STOPPED VM — every Secure-Boot/vTPM VM, and any other VM migrated with
@@ -696,6 +752,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		s.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	migrationStart := time.Now()
+	sharesWeight := s.vmSharesWeight(ctx, vm.Name)
 
 	// Apply migration timeout if configured.
 	migrateCtx := ctx
@@ -718,14 +775,23 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			MaxDowntimeMS: maxDowntimeMS,
 			// Bracketed here, not in internal/libvirt: that package renders it
 			// into a tcp:// migrate_uri authority but must not import corrosion.
-			TargetAddress: corrosion.URIHost(targetHost.Address),
+			// The data channel's address: the cluster address, or the target's
+			// address in migration.network (migration_network.go).
+			TargetAddress: corrosion.URIHost(route.addr),
 			DiskTargets:   diskTargets,
-			// The target's migration certificate carries its address as an IP
-			// SAN (`lv host init`/`add` issue it for the same address peers
-			// dial), and the migrate_uri names that address.
-			TLS:            useTLS,
+			// The target's migration certificate carries its CLUSTER address as
+			// an IP SAN (`lv host init`/`add` issue it for the same address
+			// peers dial). The name it is checked against stays that address
+			// even when the data goes to another one, which is in no SAN.
+			TLS:            useTLS || route.direct,
 			TLSDestination: targetHost.Address,
+			Direct:         route.direct,
 			CDROMSources:   cdromSources,
+			SharesWeight:   sharesWeight,
+			TargetCgroup:   targetCgroup,
+			// The destination definition carries each rbd disk's monitors as
+			// its pool resolves them now (a re-addressed cluster's).
+			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
 		}
 		armed.apply(&params)
 		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
@@ -1201,6 +1267,13 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, err
 		}
 		isoWarning, isoResolved = w, resolved
+		// The incoming domain names its ceph disks' secrets: defined here
+		// now, from this host's pool, or the migration is refused with the
+		// reason before libvirt is asked (libvirtd drops the secrets on a
+		// restart, and this host's keyring may hold another key).
+		if err := s.prepareIncomingCephDisks(ctx, rec); err != nil {
+			return nil, err
+		}
 	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
@@ -1226,7 +1299,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if s.isoResolvedWithheld {
 		isoResolved = nil
 	}
-	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved}
+	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved, CgroupMode: lv.CgroupMode()}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -1277,6 +1350,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// take the other end.
 		resp.MigrationTlsReady = s.migrationTLSReady()
 	}
+	s.answerMigrationNetwork(ctx, req, resp)
 	return resp, nil
 }
 
@@ -1375,7 +1449,29 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			return nil, status.Errorf(codes.InvalidArgument,
 				"domain XML identity (name=%q uuid=%q) does not match request (name=%q uuid=%q)", xn, xu, req.VmName, req.Uuid)
 		}
-		if err := s.virt.DefineDomain(req.DomainXml); err != nil {
+		// USB passthrough: the source's definition names the SOURCE's device.
+		// Re-resolve each one here — its mapping's row for this host, a
+		// bus-port from this host's sysfs — so the VM is defined with the device
+		// this host has, or not at all.
+		domXML := req.DomainXml
+		if usbSpec := parseSpecOrNil(vm.Spec); len(usbSpec.GetUsbDevices()) > 0 {
+			usb, uerr := s.resolveUSBHostdevs(ctx, usbSpec)
+			if uerr != nil {
+				wipe()
+				return nil, uerr
+			}
+			rewritten, rerr := lv.ReplaceUSBHostdevs(domXML, usb)
+			if rerr != nil {
+				wipe()
+				return nil, status.Errorf(codes.Internal, "re-resolve USB devices of %q on %s: %v", req.VmName, s.hostName, rerr)
+			}
+			domXML = rewritten
+		}
+		// The source rendered <shares> for ITS cgroup version and says which
+		// weight that was (a cleared weight arrives as the default); this host
+		// defines the domain at its own scale. No weight sent: unchanged.
+		domXML = lv.RetargetCPUShares(domXML, int(req.SharesWeight), lv.CgroupMode() == "v2")
+		if err := s.virt.DefineDomain(domXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()
 			return nil, status.Errorf(codes.Internal, "define migrated domain %q: %v", req.VmName, err)
@@ -1405,7 +1501,8 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // before the handoff commits (abandonFirmwareTarget). attempt names this
 // migration attempt to the target, which records the domain it defines under it.
 func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string) (firmwareTargetOutcome, error) {
-	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt}
+	req := &pb.EnsureFirmwareStateRequest{VmName: vmName, DomainXml: domainXML, AttemptId: attempt,
+		SharesWeight: int32(s.vmSharesWeight(ctx, vmName))}
 	if fs.SecureBoot || fs.Tpm {
 		// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 		// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
@@ -1754,6 +1851,7 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	if err != nil {
 		return status.Errorf(codes.Internal, "reassign VM %q and its disks to %s: %v", vm.Name, targetHost.Name, err)
 	}
+	s.reverseReplicationAfterMove(cctx, "vm", vm.Name, "", s.hostName, targetHost.Name)
 	return nil
 }
 
@@ -2024,8 +2122,15 @@ func copiedByStorageMigration(d corrosion.DiskRecord) bool {
 // refusal and the copy itself must agree, or an untyped disk is left behind by
 // a move that copies none. Removal paths keep the stricter
 // isHostLocalDiskDriver: they delete, and an untyped row proves less.
+//
+// It agrees with corrosion.DiskIsShared, which is the cluster's definition of
+// shared storage, on every driver whose disk is a plain file a move can copy:
+// btrfs is host-local there, so it is here too (a clone or MoveVolume into a
+// btrfs pool makes such a disk). TestIsHostLocalDiskAgreesWithDiskIsShared pins
+// the two together. zfs and lvm are not shared either, but their disks are
+// volumes, not files, so no move here copies them; they stay as they were.
 func isHostLocalDisk(d corrosion.DiskRecord) bool {
-	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType)
+	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType) || strings.EqualFold(d.StorageType, "btrfs")
 }
 
 // storageMigrationTargets is the migrate_disks list of a --with-storage
@@ -2065,7 +2170,7 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // target judges the ISO it would open; runtime says the domain moves by
 // libvirt runtime migration (ensureDisksOnTargetISO).
 func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, error) {
-	created, tls, _, err := s.ensureDisksOnTargetISO(ctx, targetHost, vmName, stubs, wantTLS, runtime)
+	created, tls, _, _, err := s.ensureDisksOnTargetISO(ctx, targetHost, vmName, stubs, wantTLS, runtime)
 	return created, tls, err
 }
 
@@ -2075,17 +2180,50 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 // MigrateParams.CDROMSources. With the ISO paths it sends the sha256 of the
 // file this host judged for the VM's ISO, so a target where another project's
 // pool maps the directory admits that very content on the VM's first arrival.
-func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, error) {
+func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, string, error) {
+	o, err := s.ensureDisksOnTargetNet(ctx, targetHost, vmName, stubs, wantTLS, runtime)
+	return o.created, o.tlsReady, o.remap, o.cgroupMode, err
+}
+
+// ensureOutcome is what the target's EnsureDisks answered.
+type ensureOutcome struct {
+	created  []string          // disk stubs this call made
+	tlsReady bool              // wantTLS and the target has migration-TLS credentials
+	remap    map[string]string // installer CD-ROM source path -> the target's file
+	// migAddr is the target's address inside migration.network, "" when none
+	// was asked for or the target gave none (migration_network.go).
+	migAddr string
+	// cgroupMode is the target's cgroup version ("v2"/"v1"), "" when it did
+	// not say (an older target, or no call was made).
+	cgroupMode string
+}
+
+// ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
+// target's address in migration.network when one is configured, which makes
+// the call even where it would otherwise have nothing to send.
+func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) (ensureOutcome, error) {
 	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
 	if err != nil {
-		return nil, false, nil, err
+		return ensureOutcome{}, err
 	}
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
-		return nil, false, nil, nil
+	// A VM with an rbd disk always asks: the target defines (or refuses) the
+	// ceph secrets the domain names (prepareIncomingCephDisks). A runtime move
+	// of a VM with a cpu-shares weight also asks the target for its cgroup
+	// version, so the destination definition carries the target's scale
+	// (MigrateParams.SharesWeight). That ask alone is best effort: an
+	// unanswered one leaves the domain as it is, as before.
+	hasRBD := s.vmHasRBDDisk(ctx, vmName)
+	shareOnly := runtime && s.vmSharesWeight(ctx, vmName) > 0 && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+		s.migrationNetwork == "" && !hasRBD
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD {
+		return ensureOutcome{}, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		return nil, false, nil, status.Errorf(codes.Unavailable,
+		if shareOnly {
+			return ensureOutcome{}, nil
+		}
+		return ensureOutcome{}, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
@@ -2094,13 +2232,19 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
 		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
+		MigrationNetwork:   s.migrationNetwork,
 	})
+	if err != nil && shareOnly {
+		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
+			"vm", vmName, "target", targetHost, "error", err)
+		return ensureOutcome{}, nil
+	}
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {
 			code = codes.Internal
 		}
-		return nil, false, nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+		return ensureOutcome{}, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
 	}
 	if w := resp.GetInstallerIsoWarning(); w != "" {
@@ -2127,7 +2271,7 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), remap, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2382,6 +2526,8 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
 	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+	// The VM may now run on its own replica target: replicate back to this host.
+	s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(f.detachedVFs) > 0 {
@@ -2458,6 +2604,9 @@ type migrationAbort struct {
 	// lease an earlier attempt left — the restart anchor of VFs still out of
 	// the guest — is not this attempt's to end.
 	leaseWritten bool
+	// diskAddr is the target's address in migration.network, when the cold disk
+	// copy is to use it ("" = the cluster address).
+	diskAddr string
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before

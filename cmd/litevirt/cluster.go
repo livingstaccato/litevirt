@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -26,6 +27,8 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterRelayRestoreCmd(),
+		newClusterFailbackCmd(),
 		newClusterUpgradeStatusCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),
@@ -33,6 +36,98 @@ func newClusterCmd() *cobra.Command {
 		newClusterClaimReleaseCmd(),
 	)
 	return cmd
+}
+
+// lv cluster relay-restore [host] — list relay-health demotions and holds,
+// or clear one host's demotion now (colonelpanik/litevirt#175).
+// relay_health_v1's stand-down.
+func newClusterRelayRestoreCmd() *cobra.Command {
+	var hold time.Duration
+	cmd := &cobra.Command{
+		Use:   "relay-restore [host]",
+		Short: "List relay-health demotions and holds, or clear a host's demotion now",
+		Long: `With no argument, list every host the failover lease holder has demoted
+from relay duty, or that has been restored, with since when and why, and every
+operator hold in force with its expiry.
+
+The lease holder demotes a host from relay duty when enough of its voter
+observers keep failing their probes of it (a third, never fewer than 2, a
+majority of a voter set of 4 or fewer), and restores it on its own once they
+stop. With a host, this clears the demotion now, for the whole cluster: the
+host is relay-eligible again on every node at its next relay election.
+
+With --hold, the lease holder may not demote the host again until the hold
+runs out (at most 7 days): use it when the fault is not the host's, such as a
+bad observer, while the cause is fixed. Without a hold, a host whose probes
+still fail is demoted again after the ordinary 2-minute window, and any
+earlier hold on it ends.
+
+Clearing needs the admin role, is audited, and refuses until every host runs
+a release carrying relay_health_v1 (before which no host is ever demoted).
+litevirt_relay_demoted and litevirt_relay_hold_seconds show the same state as
+metrics; litevirt_relay_role shows each node's relay election.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if len(args) == 0 {
+					st, err := c.GetRelayHealth(ctx, &emptypb.Empty{})
+					if err != nil {
+						return fmt.Errorf("get relay health: %w", err)
+					}
+					printRelayHealth(os.Stdout, st)
+					return nil
+				}
+				resp, err := c.RestoreRelay(ctx, &pb.RestoreRelayRequest{Host: args[0], HoldSeconds: int64(hold / time.Second)})
+				if err != nil {
+					return fmt.Errorf("restore relay: %w", err)
+				}
+				if resp.GetWasDemoted() {
+					fmt.Printf("%s: relay demotion cleared\n", resp.GetHost())
+				} else {
+					fmt.Printf("%s: was not demoted\n", resp.GetHost())
+				}
+				if resp.GetHoldUntil() != "" {
+					fmt.Printf("%s: not demoted again before %s\n", resp.GetHost(), resp.GetHoldUntil())
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().DurationVar(&hold, "hold", 0, "keep the host from being demoted again for this long (max 168h)")
+	return cmd
+}
+
+// printRelayHealth prints the demotion and hold table.
+func printRelayHealth(out io.Writer, st *pb.RelayHealthStatus) {
+	if !st.GetLatched() {
+		fmt.Fprintln(out, "relay_health_v1 has not latched: no host is demoted until every host runs a release carrying it.")
+	}
+	if len(st.GetHosts()) == 0 {
+		fmt.Fprintln(out, "No relay demotions or holds.")
+		return
+	}
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "HOST\tSTATE\tSINCE\tHOLD UNTIL\tREASON")
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	for _, e := range st.GetHosts() {
+		state := "restored"
+		if e.GetDemoted() {
+			state = "demoted"
+		} else if e.GetSince() == "" {
+			state = "held"
+		}
+		hold := e.GetHoldUntil()
+		if hold != "" && e.GetHoldBy() != "" {
+			hold += " (" + e.GetHoldBy() + ")"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.GetHost(), state, dash(e.GetSince()), dash(hold), dash(e.GetReason()))
+	}
+	w.Flush()
 }
 
 // lv cluster failover-scope [cluster|region] — show or change the cluster-wide
@@ -78,6 +173,57 @@ because a change made from one side of a partition reaches only that side.`,
 					}
 				}
 				printFailoverScope(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+// lv cluster failback [on|off] — show or change the cluster failback policy
+// (docs/migration-failover.md, "Failback after maintenance").
+func newClusterFailbackCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "failback [on|off]",
+		Short: "Show or set whether an undrain moves drained VMs back",
+		Long: `With no argument, show the failback policy.
+
+  off  (the default) an undrain moves nothing back. A VM can still opt in
+       itself (placement.failback in compose), or lv host failback <host> --all
+       moves them for one host.
+  on   undraining a host live-migrates back, in the background and one at a
+       time, every VM a drain of that host moved away and nothing has moved
+       since.
+
+The policy is replicated and cluster-wide. Changing it needs the admin role and
+refuses until every host runs a release that carries it: failover_scope_v1 and
+the drain_failback feature of the release token (lv cluster upgrade-status).`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var st *pb.FailbackPolicyStatus
+				var err error
+				if len(args) == 1 {
+					if args[0] != "on" && args[0] != "off" {
+						return fmt.Errorf("failback policy is on or off, not %q", args[0])
+					}
+					st, err = c.SetFailbackPolicy(ctx, &pb.SetFailbackPolicyRequest{Enabled: args[0] == "on"})
+					if err != nil {
+						return fmt.Errorf("set failback policy: %w", err)
+					}
+				} else if st, err = c.GetFailbackPolicy(ctx, &emptypb.Empty{}); err != nil {
+					return fmt.Errorf("get failback policy: %w", err)
+				}
+				state := "off"
+				if st.GetEnabled() {
+					state = "on"
+				}
+				fmt.Printf("Failback: %s\n", state)
+				if st.GetSetBy() != "" {
+					fmt.Printf("Set by:   %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
+				}
+				if !st.GetSettable() {
+					fmt.Println("Changeable: no — the cluster upgrade has not finished (failover_scope_v1 and the release token must latch on every host)")
+				}
 				return nil
 			})
 		},

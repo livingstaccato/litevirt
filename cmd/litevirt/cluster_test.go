@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/tests/e2e/latchparse"
 )
 
 func td(name, hash, hashV2 string, count int32, ties int32) *pb.TableDigest {
@@ -301,4 +302,27 @@ func TestPrintUpgradeStatus(t *testing.T) {
 	check("release_2026_11_v1/widgets", "release_2026_11_v1", "widgets", "yes", "host-b")
 	check("release_2026_11_v1/gadgets", "release_2026_11_v1", "gadgets", "no", "-")
 	check("release_2099_01_v1/sprockets", "release_2099_01_v1", "sprockets", "yes", "host-c")
+}
+
+// The e2e pre-latch test decides "has the release token latched" from the
+// TOKEN table of the real `lv cluster upgrade-status` output. The feature
+// table below it has a row for every declared feature, latched or not, and
+// its first column is the same token name.
+func TestUpgradeStatus_TokenLatchedFromTheTokenTable(t *testing.T) {
+	const tok = "release_2026_11_v1"
+	features := []*pb.ReleaseFeatureStatus{{Token: tok, Name: "backup_zstd", Declared: true, Description: "zstd chunk compression in backup repositories"}}
+	render := func(st *pb.UpgradeStatus) string {
+		var b strings.Builder
+		printUpgradeStatus(&b, st)
+		return b.String()
+	}
+	pre := render(&pb.UpgradeStatus{ReleaseToken: tok, HostsTotal: 5, HostsOnRelease: 4, Features: features})
+	post := render(&pb.UpgradeStatus{ReleaseToken: tok, HostsTotal: 5, HostsOnRelease: 5, Features: features,
+		Tokens: []*pb.UpgradeToken{{Name: tok, Durable: true, Mandatory: true, RollbackRule: "safe_if_unused", BlocksRollback: true}}})
+	if latchparse.TokenLatched(pre, tok) {
+		t.Errorf("a pre-latch output (features table names %s) reads as latched:\n%s", tok, pre)
+	}
+	if !latchparse.TokenLatched(post, tok) {
+		t.Errorf("a post-latch output does not read as latched:\n%s", post)
+	}
 }

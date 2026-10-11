@@ -148,7 +148,8 @@ var firstShapeAcks = map[string]string{
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
 	"cluster_policies": "every writer (corrosion.SetFailoverScope, SetISOLibraryMode, PutISOCatalogEntry, " +
-		"CollectISOCatalogEntry, PutISOLibraryHostAck, PutNICGuard, SetClusterPolicy, WriteNetworkVLANsCAS and RecordReleaseFeatureUse, " +
+		"CollectISOCatalogEntry, PutISOLibraryHostAck, PutNICGuard, SetClusterPolicy, WriteNetworkVLANsCAS, RecordReleaseFeatureUse, SetRelayDemotion and SetRelayHold — the last two additionally behind " +
+		"Client.MayWriteRelayDemotion, the durable relay_health_v1 marker — " +
 		"all through the one clusterPolicyUpsertSQL) returns " +
 		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
 		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +
@@ -157,6 +158,36 @@ var firstShapeAcks = map[string]string{
 		"latch cannot form, and nothing is written, while a previous-release peer is listening. Their " +
 		"callers (SetFailoverScope, SetISOLibraryMode, SetNICGuard, and ISO library uploads, pulls and removals) refuse " +
 		"on the same gate first; NIC create, clone and attach record no guard while it is closed",
+	"session_factors": "the only writer is corrosion.InsertSessionWithFactor, which writes the row only with " +
+		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it, inserting the session alone",
+	"user_identity_bindings": "every writer (corrosion.BindIdentity, ClearIdentityBinding, ClearIdentityBindingRows, " +
+		"and the per-row clears and restores DeleteUserCounted and the admin floor append) writes only with " +
+		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it. Its RPCs (Login's binding, ClearIdentityBinding) refuse or skip without it",
+	"user_enrollment_codes": "every writer (corrosion.IssueEnrollmentCode, ConsumeEnrollmentCode, " +
+		"InvalidateEnrollmentCode, and the invalidation SetUserLifecycle, ResetUserLifecycle, DeleteUserCounted and " +
+		"the admin floor append) writes only with " +
+		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it. Their RPCs (IssueEnrollmentCode, and enrollment from an enrollment-only session) refuse without it",
+	"user_lifecycle": "every writer (corrosion.SetUserLifecycle, ResetUserLifecycle, and the statements " +
+		"DeleteUserCounted, ResetAdminPasswordFor, ClearIdentityBindingRows and the admin floor append, all through the one " +
+		"userLifecycleUpsertSQL) writes only with " +
+		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it. `lv user reset-admin` with the daemon down has no gate and writes none of it. Its RPC " +
+		"(SetUserAccount) refuses without it",
 	"voter_configs": "the only writer is corrosion.WriteVoterConfig, which returns ErrVoterConfigGateClosed " +
 		"without touching the table unless Client.MayWriteVoterConfigs — the durable voter_config_v1 marker, " +
 		"wired by the daemon and failing CLOSED when unwired. voter_config_v1 is mandatory, so advertised by " +

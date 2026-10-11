@@ -39,3 +39,16 @@ func TestAuditWriter_SettleRowsAreSigned(t *testing.T) {
 	auditSettle(ctx, db, host, "vm-a", "stopped the local copy")
 	corrosion.AssertAuditRowsSignedForTest(t, db, 1)
 }
+
+// auditSystem: the health loops' replication direction switches.
+func TestAuditWriter_SystemRowsAreSigned(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	corrosion.SignAuditRowsForTest(t, db, host)
+	auditSystem(ctx, db, host, "replication.reverse", "vm-a", "vm vm-a moved node-1 -> node-0: replication now runs node-0 -> node-1 (dr)", "ok")
+	corrosion.AssertAuditRowsSignedForTest(t, db, 1)
+}

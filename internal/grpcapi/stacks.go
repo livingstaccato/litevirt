@@ -27,6 +27,8 @@ import (
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
+
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // DeployStack parses a compose YAML, runs the declarative planner to resolve all
@@ -45,6 +47,17 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	f, err := compose.ParseBytes([]byte(req.ComposeYaml))
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
+	}
+
+	// Disk/NIC tuning in the file is refused before anything is deployed, rather
+	// than by the Nth VM's create after the first N-1 are up (the disk/NIC feature gate).
+	if err := s.refuseUnlatchedStackDiskNICIO(ctx, f); err != nil {
+		return err
+	}
+	// A limit in the file is refused before anything is deployed, rather than
+	// by the Nth VM's create after the first N-1 are up (the vm_limits release feature).
+	if err := s.precheckStackLimits(ctx, f); err != nil {
+		return err
 	}
 
 	// A volume or backup repo that names a host path makes the daemon write
@@ -479,26 +492,9 @@ func (s *Server) streamResolvedPlan(stream grpc.ServerStreamingServer[pb.DeployP
 // assignments. The spec's Placement.Host is pinned so CreateVM skips placement, and
 // device addresses are set so allocateDevices uses exact pinning.
 func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMAction, f *compose.File) error {
-	spec := action.Spec
-	if spec == nil {
-		// Fallback: build spec from compose (shouldn't happen with planner).
-		vmDef, baseName := compose.FindVMDef(f, action.VMName)
-		if vmDef == nil {
-			return fmt.Errorf("no VM definition found for %q", action.VMName)
-		}
-		var err error
-		spec, err = compose.BuildVMSpec(action.VMName, baseName, vmDef, f)
-		if err != nil {
-			return fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
-		}
-	}
-
-	// Pin placement to the planner-resolved host.
-	if action.TargetHost != "" {
-		if spec.Placement == nil {
-			spec.Placement = &pb.PlacementSpec{}
-		}
-		spec.Placement.Host = action.TargetHost
+	spec, err := s.plannedVMSpec(action, f)
+	if err != nil {
+		return err
 	}
 
 	// Pin pre-resolved device addresses so allocateDevices uses exact binding. SR-IOV
@@ -1668,6 +1664,33 @@ func (s *Server) ExportStack(ctx context.Context, req *pb.ExportStackRequest) (*
 	}, nil
 }
 
+// plannedVMSpec is the spec a planned VM action creates: the planner's, or
+// one built from the compose file, pinned to the planner-resolved host.
+func (s *Server) plannedVMSpec(action planner.VMAction, f *compose.File) (*pb.VMSpec, error) {
+	spec := action.Spec
+	if spec == nil {
+		// Fallback: build spec from compose (shouldn't happen with planner).
+		vmDef, baseName := compose.FindVMDef(f, action.VMName)
+		if vmDef == nil {
+			return nil, fmt.Errorf("no VM definition found for %q", action.VMName)
+		}
+		var err error
+		spec, err = compose.BuildVMSpec(action.VMName, baseName, vmDef, f)
+		if err != nil {
+			return nil, fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
+		}
+	}
+
+	// Pin placement to the planner-resolved host.
+	if action.TargetHost != "" {
+		if spec.Placement == nil {
+			spec.Placement = &pb.PlacementSpec{}
+		}
+		spec.Placement.Host = action.TargetHost
+	}
+	return spec, nil
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 func (s *Server) deployCreate(ctx context.Context, instanceName string, f *compose.File) error {
@@ -2217,6 +2240,15 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 			poolNames = append(poolNames, p.Name)
 		}
 		for _, p := range compose.CheckStorage(composeYAML, f, poolNames) {
+			errs = append(errs, p.String())
+		}
+		fixed := map[string]bool{}
+		for _, p := range pools {
+			if _, _, ok := storage.FixedDevice(storage.Config{Driver: p.Driver}); ok {
+				fixed[p.Name] = true
+			}
+		}
+		for _, p := range compose.CheckFixedDeviceStorage(composeYAML, f, fixed) {
 			errs = append(errs, p.String())
 		}
 	}

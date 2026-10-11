@@ -28,9 +28,13 @@ func TestDiskBacking_RefusesCephOptionsLibvirtCannotExpress(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, wantIn string
 	}{
+		// A conf other than the default, with its monitors not in the
+		// locator: qemu reads only the default one by itself.
 		{"conf", "rbd:pool/img:conf=/etc/ceph/custom.conf", "conf"},
-		{"keyring", "rbd:pool/img:keyring=/etc/ceph/custom.keyring", "keyring"},
-		{"both names the first", "rbd:pool/img:conf=/a.conf:keyring=/b.key", "conf"},
+		// An identity with no keyring to define its secret from.
+		{"id without keyring", "rbd:pool/img:id=litevirt", "id"},
+		{"conf beside a keyring", "rbd:pool/img:conf=/a.conf:keyring=/b.key", "conf"},
+		{"an option with no domain form", "rbd:pool/img:rbd_cache=true", "rbd_cache"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, _, err := diskBacking(tc.path)

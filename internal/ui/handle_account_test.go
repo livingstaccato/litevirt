@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func TestHandleAccount2FA_RendersPage(t *testing.T) {
@@ -101,5 +103,39 @@ func TestHandleWebAuthnFinish_ReturnsLabel(t *testing.T) {
 	}
 	if !out.OK || out.CredentialLabel != "test-label" {
 		t.Fatalf("response = %+v", out)
+	}
+}
+
+// An enrollment-only session (review m10): login sends it to /account/2fa,
+// every other page redirects there, and the account page says why.
+func TestEnrollmentOnlySession_ConfinedToTheEnrollmentPage(t *testing.T) {
+	m := newDefaultMock()
+	m.whoamiEnroll = true
+	s := newTestUIServer(t, m)
+	for _, p := range []string{"/", "/vms", "/account/registry"} {
+		w := serveRequest(s, withAuth(httptest.NewRequest(http.MethodGet, p, nil)))
+		if w.Code != http.StatusFound || w.Header().Get("Location") != "/account/2fa" {
+			t.Errorf("GET %s from an enrollment-only session: %d -> %q, want a redirect to /account/2fa",
+				p, w.Code, w.Header().Get("Location"))
+		}
+	}
+	w := serveRequest(s, withAuth(httptest.NewRequest(http.MethodGet, "/account/2fa", nil)))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "enrollment-code") {
+		t.Fatalf("/account/2fa for an enrollment-only session: %d, body lacks the enrollment notice", w.Code)
+	}
+	if strings.Contains(w.Body.String(), `action="/account/password"`) {
+		t.Error("an enrollment-only session is offered the password form")
+	}
+}
+
+func TestLoginSubmit_EnrollmentOnlyGoesToTheEnrollmentPage(t *testing.T) {
+	m := newDefaultMock()
+	m.loginResp = &pb.LoginResponse{Token: "lvs_x", Username: "bob", Requires_2FaEnrollment: true}
+	s := newTestUIServer(t, m)
+	r := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("username=bob&password=pw"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := serveRequest(s, r)
+	if w.Code != http.StatusFound || w.Header().Get("Location") != "/account/2fa" {
+		t.Fatalf("login of an enrollment-only account: %d -> %q, want /account/2fa", w.Code, w.Header().Get("Location"))
 	}
 }

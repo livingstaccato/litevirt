@@ -179,6 +179,8 @@ vms:
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it
     cpu-mode: "host-model"    # host-passthrough | host-model | custom (default host-model)
     cpu-model: "x86-64-v3"    # required by cpu-mode: custom; invalid for any other mode
+    cpu-limit: 2.5            # Cap on the VM's TOTAL CPU, in host cores (fractions ok; 0/unset = unlimited; at most cpu). Live
+    cpu-shares: 200           # CPU weight under contention: cgroup v2 cpu.weight, Proxmox cpuunits (1-10000, default 100). Live
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)
     max-memory: "8G"          # Ballooning ceiling the guest may inflate to (0 = fixed at memory)
@@ -217,6 +219,65 @@ empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 bakes into the domain XML — so a deploy reconfigures and restarts the same VM
 (disks kept), and an update under `strategy: in-place` (set in the VM's `update:`
 block) refuses it: in-place never restarts a VM.
+
+### Noisy-neighbour limits
+
+Three settings keep one guest from starving its neighbours. They are the
+counterparts of Proxmox's `cpulimit`, `cpuunits` and the NIC `rate=`:
+
+- `cpu-limit` caps the VM's **total** CPU in host cores, across all its vCPUs:
+  `2.5` lets a 4-vCPU guest burn at most two and a half cores in total, so one busy
+  thread can use a full core, exactly as Proxmox's `cpulimit` behaves. It must be at
+  most `cpu` (a cap above the vCPU count could never be reached) and at least `0.01`.
+  It is applied as libvirt's whole-domain `global_period`/`global_quota` (the
+  domain cgroup's `cpu.max`), so it does not depend on the vCPU count and a vCPU
+  change leaves it alone.
+- `cpu-shares` is the VM's weight when the host is contended: Proxmox's `cpuunits`,
+  the cgroup v2 `cpu.weight` scale (1-10000, default 100), and that number is what
+  is stored and what `lv inspect` shows. `200` is twice the default, so the Proxmox
+  numbers carry over unchanged. Each host renders the value its own cgroup version
+  wants when it defines the domain: unchanged on cgroup v2, scaled by 1024/100
+  (minimum 2) on cgroup v1, whose default `cpu.shares` is 1024. A cluster that mixes
+  v1 and v2 hosts therefore renders per host, and a failover rebuild re-renders for
+  the new host. A migration does the same: a cold move defines the domain on the
+  target at the target's scale, and a live move hands libvirt a destination
+  definition rendered for the target's cgroup version, which the target reports
+  (a v1 to v2 move of a VM with weight 977 or more is not refused). litevirt owns the domain definition, so a `<shares>` it finds there, even one it did not write (set with `virsh schedinfo --config`, say), is rewritten to the stored weight, or to the default when none is stored, on every migration. Clearing it (`0`, or dropping the key) writes the default weight
+  back. It only matters under contention: an idle host lets every guest run flat out.
+- `rate` on a `network:` entry caps that NIC in MB/s (10^6 bytes), the same in
+  each direction, rendered as libvirt `<bandwidth>` (whose `average` is in kilobytes
+  of 1000 bytes, so `rate: 10` is `average='10000'`). It is set per NIC, so a
+  VM's management NIC can stay unthrottled.
+
+All three **apply to a running VM with no restart**: a deploy that changes them is
+an in-place update (`~ update`, `applied in place`), as is `lv update`'s
+`--cpu-limit`, `--cpu-shares` and `--nic-rate` — to the persistent definition as
+well as the running domain, so the value survives a reboot and a stopped VM takes
+it at its next start. They are carried through live and cold migration and rebuilt
+on failover from the stored spec. Dropping a key from the file removes that limit.
+
+`cpu-limit`, `cpu-shares` and `rate` apply to VMs only; setting one on an `lxc` or `oci` entry is an error.
+
+A capped VM is still **placed and charged for its full vCPU count**: the cap bounds
+how much CPU the guest may take, not how many cores it needs scheduled onto, and it
+can be raised or removed live, so placement and project quota never count a capped
+VM as smaller than its `cpu`. `lv inspect <vm>` shows the stored values as
+`cpuLimit`, `cpuShares` and each network's `rateMbSec`.
+
+During a rolling upgrade a limit cannot be set until every host runs a build
+that understands it: setting `cpu-limit`, `cpu-shares` or a NIC `rate` is refused
+("the cluster upgrade must finish first") until the release token
+`release_2026_11_v1` has latched, because an older host would ignore the fields, and
+an older owner that rewrites a VM's stored spec would drop them. The request is refused
+early, without recording anything, while the token has not latched (an entry node
+checks this before forwarding an update, so an older owner is never handed a limit it
+would drop). The host that performs the write (for an update, the VM's owner) runs
+the full gate after permission and validation checks, and the first use is recorded
+cluster-wide immediately before the limit's first data (the `vm_limits` feature
+in `lv cluster upgrade-status`). Files and updates without limits are not affected,
+and clearing a limit (`0`) is always allowed. Once a limit has been set, rolling back
+below the release puts each node into WAL quarantine until it is upgraded again;
+a cluster that never sets one can still roll back.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -352,7 +413,82 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         storage: "nfs-volume"       # Reference a volume
         cluster_size: "2M"          # qcow2 cluster size (default 64K)
         refcount_bits: 16           # qcow2 refcount width (default 16)
+        overwrite: false            # iscsi root disk from an image: write it over a non-blank LUN
+        discard: unmap              # unmap (or on) | ignore (or off); see below
+        detect_zeroes: unmap        # off | on | unmap (unmap needs discard unmap)
+        iotune:                     # I/O throttle, live-changeable; see below
+          read_bytes_sec: 100M
+          write_iops_sec: 2000
 ```
+
+`overwrite` matters only for a root disk built on an image in an `iscsi` pool:
+the image is written onto the LUN, and a LUN that is not blank is refused
+unless the disk sets `overwrite: true` — see
+[storage.md](storage.md#iscsi-one-lun-one-disk). `overwrite` applies to the
+create that carries it and is never stored: a later rebuild or recreate keeps
+the LUN as it is. A VM with a disk on an iscsi volume or pool may have only one
+replica, and may not update by `blue-green` or `snapshot-and-replace`: both put
+two instances on the one LUN, and the deploy refuses them.
+
+### Discard (TRIM)
+
+`discard: unmap` passes the guest's TRIM down to the storage, so a thin
+backend (qcow2 on a filesystem, ZFS, thin LVM, Ceph RBD) gets back the space the
+guest freed; `ignore` drops it. **A new VM's disk with no `discard:` gets `unmap`
+on the local store, btrfs, ZFS, thin LVM and Ceph, on a virtio, scsi or sata bus**,
+and nothing on NFS or iSCSI (whether a TRIM frees anything there depends on the server's own space accounting, so it is left to you; a `dir` pool that sits on NFS gets the default too) or
+on an IDE disk. The default is written into the VM's spec when it is created: a VM
+created before it keeps rendering no discard, and applying a file that leaves
+`discard:` out never changes a disk. The root disk a VM gets when `disks:` names
+none gets the default too, and is then listed in the spec as `root`. The default is
+written only once the whole cluster keeps these settings (see below); before
+that, a create renders exactly what an earlier release did.
+`detect_zeroes: unmap` additionally turns a guest write of zeroes into a discard; it
+is off unless you set it, because it costs CPU on every write. Changing either on an
+existing VM needs a restart: the deploy reconfigures and restarts the same VM, disks
+kept. Run `fstrim` in the guest (most distributions schedule it weekly) to reclaim
+space it freed before the setting was on.
+
+### Upgrading a cluster
+
+`discard`, `detect_zeroes`, `iotune` and `queues` are kept in the VM's spec, and a
+host on an older release would drop them when it rewrites a spec (a failover onto it
+would rebuild the VM without its throttle). So they are accepted only once the
+release token (`release_2026_11_v1`, feature `vm_disk_nic_io`) has latched, which needs
+every host, one in maintenance included, to be on a release that keeps them. Until then
+a create, update, compose deploy, recreate or `lv disk-io` that sets any of them is
+refused with `the cluster upgrade must finish first (vm_disk_nic_io needs
+release_2026_11_v1)`, and nothing about a VM that sets none of them changes: a restore
+or promotion of a spec that carries them still works, with the tuning dropped. Once the
+token has latched, the first write of any of them (an unset discard becomes the
+storage default on a new disk only once the feature is already in use, so a plain create never waits on a first use) records the feature as used; see upgrades.md, *Rolling back after a release token
+latched*, for what a rollback does. A restore whose tuning the gate refuses after the latch
+still completes, with the tuning dropped, a warning and an audit row.
+The gate has no config flag and, once open, stays open; to stop using the feature, clear
+the settings (`lv disk-io <vm> --clear`, or drop the keys).
+
+### I/O limits
+
+`iotune:` throttles one disk (libvirt `<iotune>`). Rates are bytes per second (a
+number, or with a `K`, `M` or `G` suffix) and operations per second; unset or `0` is
+unlimited:
+
+| Key | Meaning |
+|---|---|
+| `total_bytes_sec`, `read_bytes_sec`, `write_bytes_sec` | sustained bytes per second |
+| `total_iops_sec`, `read_iops_sec`, `write_iops_sec` | sustained operations per second |
+| `total_bytes_sec_max`, `read_bytes_sec_max`, `write_bytes_sec_max`, `total_iops_sec_max`, `read_iops_sec_max`, `write_iops_sec_max` | burst ceiling above the sustained rate; needs it |
+| `burst_seconds` | how long a burst lasts (default 1) |
+
+A `total_*` key cannot be combined with the `read_*` / `write_*` of the same kind.
+Changing `iotune:` in the file throttles the **running** disk in place (no restart)
+and updates the definition; `iotune: {}` removes every limit. The same can be done
+without the file: [`lv disk-io`](cli-reference.md). The limits are kept in the VM's
+spec, so a restart, a failover start and a migration carry them. A disk the spec does
+not list yet (the root disk a VM got before disks were recorded, a hot-plugged one) is
+throttled too: its entry is made in the spec when the limits are set. The limits are
+per VM: a disk shared by several VMs is throttled separately in each, so the aggregate
+is not bounded (libvirt's `group_name` is not supported).
 
 ## Networks
 
@@ -364,6 +500,8 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         mac: "52:54:00:12:34:56"    # Fixed MAC (optional)
         gateway: "10.0.1.1"
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
+        queues: 4                   # virtio-net multiqueue (1-64, or auto)
+        rate: 12.5                  # Bandwidth cap in MB/s, both directions (0/unset = unlimited). Live
         # NIC guard (anti-spoofing, docs/firewall.md "NIC guards"). A new NIC
         # is guarded by default; anything below but the default needs
         # network.update on the network at deploy.
@@ -392,6 +530,18 @@ upstream router of an external or VLAN bridge, often not the subnet's first
 host — and `reserved-addresses:` its other infrastructure addresses. No guest
 NIC may claim either, and a guest whose guard is confined to the subnet may not
 use them (docs/firewall.md, "NIC guards").
+
+`queues:` gives a virtio NIC that many queue pairs (`<driver queues='N'/>`; libvirt
+uses vhost-net when the host has it and qemu's userspace backend when it does not,
+so a migration or failover onto a host without vhost-net still works), so a guest with several vCPUs spreads network interrupts and
+packets across them. It is off unless set (one queue); `queues: auto` is one per
+vCPU up to 8, none for a single-vCPU guest. Only the virtio model takes it. Inside
+the guest, enable the queues with `ethtool -L <nic> combined N`. A change needs a
+restart: the deploy reconfigures and restarts the same VM, disks kept. An unset
+`queues:` inherits what the VM has, so removing the key from the file does not turn
+multiqueue off: write `queues: 1`. `queues: auto` is resolved from `cpu:` when the file
+is read, so changing `cpu:` in the file changes the queue count with it (which makes a
+vCPU grow a restart), and `lv update --cpu` never re-resolves it; write a number to pin it.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack
@@ -465,6 +615,7 @@ options (VNC via noVNC; SPICE-in-browser is on the roadmap).
       prefer:                       # Host preferably has these labels (+5 score per match)
         zone: "us-east-1a"
       no-migrate: false             # Opt this VM out of all rebalancer-driven moves
+      failback: false               # Move back by live migration after the host it was drained from is undrained
 
       # ── Initial-placement scoring ──
       policy: balance               # balance | bin-pack | spread-strict | cost-aware
@@ -526,6 +677,8 @@ it deploys, the VM's mode is stored as `dry-run`, and a WARN says so. Write
 `max-per-node` is a hard constraint: the placement engine will not place more than this many replicas of the same VM group on a single host. Use `max-per-node: 1` to ensure each replica runs on a separate host.
 
 `no-migrate: true` opts the VM out of all rebalancer-driven moves and (planned) storage-motion. Set automatically by admission for VMs with non-migratable PCI passthrough.
+
+`failback: true` opts the VM in to returning after maintenance: when a host drain moves it away and that host is later undrained, it is live-migrated back (see [failback](migration-failover.md#failback-after-maintenance)). Only a VM the drain moved, and that nothing has moved since, returns.
 
 See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, and worked examples.
 
@@ -815,7 +968,7 @@ Control how VMs are updated when a compose file changes.
 
 **Every update is applied with the least destructive mechanism the change allows, whatever the strategy** — the plan names the mechanism on each `~ update` line:
 
-- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`;
+- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`; and the noisy-neighbour limits `cpu-limit`, `cpu-shares` and each NIC's `rate`, which libvirt applies to the running domain;
 - **restart** (`restart — the same VM is reconfigured and restarted, disks kept`) — a change that bakes into the domain (a cpu shrink or grow beyond the ceiling, an out-of-band memory size, `max-cpu`, memory bounds, `cpu-mode`/`cpu-model`, `machine`, `firmware`, `guest-agent`, VNC graphics, `secure-boot`, `tpm`) reconfigures and restarts the **same** VM: same disks, same MACs, same identity. A stopped VM is reconfigured and left stopped. Toggling `secure-boot` or `tpm` on a VM that already has firmware state is refused, as `lv update` refuses it without `--force`;
 - **recreate** (`recreate — disks are replaced (<why>)`) — only a change of VM identity (`image`, `iso`, disk or network topology, `cloud-init`) deletes the VM and creates it again, **which replaces its disks**. So does a change that needs only a redefine but that no reconfigure path can apply to an existing VM yet (SPICE graphics, resource tuning, passthrough devices), and a VM whose stored spec cannot be read. Disks are not carried over to the new VM. The plan says so on the VM's line, and `compose up` asks for confirmation before applying it (as it does for every plan, unless `-y`).
 

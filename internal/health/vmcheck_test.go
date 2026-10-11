@@ -4,11 +4,13 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 func testVMDB(t *testing.T) *corrosion.Client {
@@ -320,5 +322,71 @@ func TestVMCheckSpec_WithHealthCheck(t *testing.T) {
 	}
 	if spec.Timeout != "3s" {
 		t.Errorf("Timeout = %q, want 3s", spec.Timeout)
+	}
+}
+
+// N5: the direct-libvirt fallback migration carries the VM's stored weight.
+func TestSharesWeightOf(t *testing.T) {
+	v := &VMChecker{}
+	if got := v.sharesWeightOf(corrosion.VMRecord{Spec: `{"name":"a","cpu_shares":977}`}); got != 977 {
+		t.Errorf("weight = %d, want 977", got)
+	}
+	if got := v.sharesWeightOf(corrosion.VMRecord{Spec: `not json`}) + v.sharesWeightOf(corrosion.VMRecord{}); got != 0 {
+		t.Errorf("unreadable/absent spec weight = %d, want 0", got)
+	}
+}
+
+// The fallback's weight follows the RPC path's rule: stored, else the default
+// when the domain carries a <shares> (cleared), else 0.
+func TestVMCheckerSharesWeightOf_ClearedIsTheDefault(t *testing.T) {
+	fake := libvirtfake.New()
+	if err := fake.DefineDomain(`<domain type='kvm'><name>a</name><cputune><shares>1024</shares></cputune></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>b</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	v := &VMChecker{virt: fake}
+	for name, want := range map[string]int{"a": 100, "b": 0} {
+		if got := v.sharesWeightOf(corrosion.VMRecord{Name: name, Spec: `{}`}); got != want {
+			t.Errorf("sharesWeightOf(%s) = %d, want %d", name, got, want)
+		}
+	}
+	if got := v.sharesWeightOf(corrosion.VMRecord{Name: "a", Spec: `{"cpu_shares":977}`}); got != 977 {
+		t.Errorf("stored weight = %d, want 977", got)
+	}
+}
+
+// The direct migration records the weight it hands libvirt.
+//
+// Mutation: drop SharesWeight from the fallback's MigrateParams — red.
+func TestMigrateVM_Fallback_CarriesTheWeight(t *testing.T) {
+	db := testCheckVMDB(t)
+	ctx := context.Background()
+	for _, h := range []string{"host-a", "host-b"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: h, State: "active", MemTotal: 32768}); err != nil {
+			t.Fatalf("InsertHost: %v", err)
+		}
+	}
+	spec := `{"cpu_shares":977}`
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "w", HostName: "host-a", State: "running", Spec: spec}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	if err := fake.DefineDomain(`<domain type='kvm'><name>w</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("w", libvirtfake.StateRunning)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
+	v.virt = fake
+	v.migrateVM(ctx, corrosion.VMRecord{Name: "w", HostName: "host-a", State: "running", Spec: spec})
+	found := false
+	for _, e := range fake.EventLog() {
+		if e.Op == "migrate" && strings.Contains(e.Note, "shares_weight=977") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no migrate event carried shares_weight=977: %v", fake.EventLog())
 	}
 }

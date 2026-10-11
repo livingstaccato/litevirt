@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -188,6 +190,95 @@ type ContainerCreateSpec struct {
 	// and let any node report them.
 	IDMapBase   int64  `json:"idmap_base,omitempty"`
 	Confinement string `json:"confinement,omitempty"`
+	// Placement names ONE placement of the container: a random id minted
+	// whenever its row is written onto a host by a create, clone, restore
+	// (including a migrate and a replica promotion), relocate-recreate or
+	// owner re-key (WithNewPlacement). Unlike created_at, which a
+	// relocate-recreate and a re-key keep on purpose, it is never reused, so
+	// a container that returns to a host it once ran on is a new placement
+	// there. Container replication keys a segment of the container's history
+	// by it. Empty for a row an earlier build wrote: an unknown placement.
+	Placement string `json:"placement,omitempty"`
+
+	// Mounts and Devices are the host paths an admin passed into the
+	// container at create. They are also in its LXC config, which travels
+	// with it; these let a relocation recreate them (judged again by the
+	// recreating host) and let any node report them. Setting them is gated
+	// on the release gate, so no older peer rewrites a spec holding them.
+	Mounts  []ContainerHostMount  `json:"mounts,omitempty"`
+	Devices []ContainerHostDevice `json:"devices,omitempty"`
+}
+
+// WithNewPlacement returns createSpec carrying a freshly minted placement id,
+// and that id.
+func WithNewPlacement(createSpec string) (string, string) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("corrosion: no randomness for a placement id: " + err.Error())
+	}
+	id := hex.EncodeToString(b[:])
+	// Only the placement changes: every other key is kept verbatim, including
+	// one this build does not know.
+	m := map[string]json.RawMessage{}
+	if createSpec != "" {
+		if err := json.Unmarshal([]byte(createSpec), &m); err != nil {
+			m = map[string]json.RawMessage{}
+		}
+	}
+	m["placement"], _ = json.Marshal(id)
+	out, _ := json.Marshal(m)
+	return string(out), id
+}
+
+// PlacementOf is the placement id a stored create spec carries ("" unknown).
+func PlacementOf(createSpec string) string { return DecodeCreateSpec(createSpec).Placement }
+
+// MintContainerPlacement gives the live row (host, name) a new placement id,
+// compare-and-set on the create spec it has now: for a re-key, whose own
+// statements must carry the source row's create spec unchanged (every receiver
+// verifies the re-keyed row's identity against the source). Changes nothing
+// else. The statement is a shape a host on an earlier build does not know, so
+// it is emitted only when RepointReady says the release token has durably
+// latched (so every host applies this build's shapes); until then the re-keyed
+// row keeps the placement it had (applied false), and container replication,
+// whose gate needs the same latch, is off. applied is also false when the row
+// changed meanwhile.
+func MintContainerPlacement(ctx context.Context, c *Client, host, name, current string) (bool, error) {
+	_, applied, err := MintContainerPlacementSpec(ctx, c, host, name, current)
+	return applied, err
+}
+
+// MintContainerPlacementSpec is MintContainerPlacement returning the create
+// spec it wrote.
+func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, current string) (string, bool, error) {
+	if !c.RepointReady(ctx) {
+		return "", false, nil
+	}
+	next, _ := WithNewPlacement(current)
+	n, err := c.ExecuteRowsStrict(ctx,
+		`UPDATE containers SET create_spec = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND COALESCE(create_spec, '') = ?`,
+		next, c.NowTS(), host, name, current)
+	if errors.Is(err, ErrNoRowsAffected) {
+		return "", false, nil
+	}
+	if err != nil || n == 0 {
+		return "", false, err
+	}
+	return next, true, nil
+}
+
+// ContainerHostMount is one host bind mount of a ContainerCreateSpec.
+type ContainerHostMount struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path"`
+	ReadWrite     bool   `json:"read_write,omitempty"`
+}
+
+// ContainerHostDevice is one host device node of a ContainerCreateSpec.
+type ContainerHostDevice struct {
+	HostPath      string `json:"host_path"`
+	ContainerPath string `json:"container_path,omitempty"`
 }
 
 // ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
@@ -212,7 +303,7 @@ type ContainerNetwork struct {
 // zero/empty spec so it round-trips as "unknown".
 func EncodeCreateSpec(s ContainerCreateSpec) string {
 	if s.Template == "" && s.Distro == "" && s.Release == "" && s.Arch == "" && len(s.Networks) == 0 && s.OwnerID == "" &&
-		s.IDMapBase == 0 && s.Confinement == "" {
+		s.IDMapBase == 0 && s.Confinement == "" && s.Placement == "" {
 		return ""
 	}
 	b, err := json.Marshal(s)
@@ -917,6 +1008,8 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	rec.State = "pending"
 	rec.StateDetail = ContainerRelocateRecreateDetail
 	rec.RelocateToken = token
+	// A new placement, whatever created_at keeps (below).
+	rec.CreateSpec, _ = WithNewPlacement(rec.CreateSpec)
 	// created_at is PRESERVED, as RekeyContainerOwnerGuarded preserves it: a
 	// relocation moves one incarnation of the container, it does not make a
 	// new one. A recovery claim is keyed by created_at
@@ -1399,4 +1492,52 @@ func HostEnforcesNICGuards(h HostRecord) bool {
 // said so. Every decision about whether a host can run a container uses it.
 func HostRunsContainers(h HostRecord) bool {
 	return h.Labels[LabelLXCCapable] == "true"
+}
+
+// VMDiskPaths maps each absolute disk path of every VM in the cluster to the
+// VM's name — what a container must never be handed as a device. Every host's
+// rows, not only this one's: on shared storage a LUN backing a VM on another
+// host is visible here too.
+func VMDiskPaths(ctx context.Context, c *Client) (map[string]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, path FROM vm_disks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, r := range rows {
+		if p := r.String("path"); strings.HasPrefix(p, "/") {
+			out[p] = r.String("vm_name")
+		}
+	}
+	return out, nil
+}
+
+// HostPathInUse reports what of litevirt's on host already uses path — a VM
+// disk, or a storage pool's source or target — so it is never also handed to
+// a container as a host mount or device. "" when nothing does.
+func HostPathInUse(ctx context.Context, c *Client, host, path string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name FROM vm_disks WHERE host_name = ? AND path = ? AND deleted_at IS NULL LIMIT 1`, host, path)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) > 0 {
+		return "the disk of VM " + rows[0].String("vm_name"), nil
+	}
+	pools, err := ListStoragePoolsForHost(ctx, c, host)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pools {
+		for _, pp := range []string{p.Source, p.Target} {
+			if pp == "" || !strings.HasPrefix(pp, "/") {
+				continue
+			}
+			if path == pp || strings.HasPrefix(path, strings.TrimSuffix(pp, "/")+"/") || strings.HasPrefix(pp, strings.TrimSuffix(path, "/")+"/") {
+				return "storage pool " + p.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

@@ -26,9 +26,23 @@ ui_port: 7445
 
 # Address the web UI listens on. Defaults to 127.0.0.1 (localhost only)
 # so the UI is unreachable from off-host without a reverse proxy or
-# SSH tunnel. Set to 0.0.0.0 to expose directly — only do this behind
-# a reverse proxy that terminates TLS.
+# SSH tunnel. Set to 0.0.0.0 to expose directly — only with TLS: either a
+# reverse proxy that terminates it, or ui_tls / a custom certificate / acme
+# below. The daemon warns at startup when it serves plain HTTP on a
+# non-loopback address.
 ui_bind: "127.0.0.1"
+
+# Whether the web UI speaks TLS itself (docs/ui.md, "TLS"). `lv host init` /
+# `lv host add` write `on` for a NEW node; a config without the key (an older
+# node) means auto, and re-initialising a node keeps the value it has.
+#   auto (the default when unset): TLS while a custom certificate is installed
+#        (`lv host ui-cert set`) or acme: is configured; plain HTTP otherwise.
+#        Re-decided while running — installing or clearing a certificate
+#        switches the listener within seconds, no restart.
+#   on:  always TLS. Serves the custom certificate, else ACME's, else this
+#        host's cluster certificate (issued by the cluster CA; import ca.crt
+#        into browsers that should trust it).
+ui_tls: on
 
 # WebSocket Origin allowlist for the UI (host patterns). Empty (default)
 # enforces strict same-origin checks on the console WebSocket; add entries
@@ -561,7 +575,17 @@ auth:
   # admitted for CA-issued HOST certificates instead of refused — wait for the
   # fleet to replicate, then set it back to false. It never relaxes the removal
   # tombstone (a decommissioned host stays out) and never lets a distributable
-  # client certificate act as a peer. Default false.
+  # client certificate act as a peer. While it is on it ALSO turns off the
+  # recovery-claim serial pin (accepts signed with a renewal's replaced key
+  # count again, in claim certificates and voter generations) and stops
+  # refusing RPCs on, or closing, connections made with a superseded host
+  # certificate. Because such a node does not pin, the cluster also HOLDS the
+  # revocation of a renewal's replaced certificate while any node has it on
+  # (each node reports it as a certificate/trust_rotated_peer_certs
+  # condition). Turn it off as soon as the fleet has converged. It is NOT a way
+  # out of a voter chain stuck after a renewal: it relaxes the pin, never
+  # revocation, and a renewal revokes the replaced certificate — the renewed
+  # voter's re-attestation is (docs/auth.md, "Renewing a voter"). Default false.
   trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's
@@ -608,6 +632,48 @@ backup_repos:
   main: /srv/backup/main
   offsite: /mnt/dr/offsite
 
+# Backup bandwidth limits, per repo (by logical name), per second: "100MiB",
+# "512K" or a byte count; at least 64KiB (0 = none). One limit is shared by every backup job THIS host
+# runs into the repo (a scheduled fan-out moves at the repo's rate in total),
+# and covers the disk read and, for a remote backup, the chunks sent to the
+# repo's host. When this host is the repo's sink for a remote backup, it hands
+# its limit to the host that reads the disk. A job's own `--bwlimit` can only
+# lower it. Absent or 0 = no limit; an invalid value refuses to start the
+# daemon. See docs/backups.md#bandwidth-limits.
+backup_bwlimits:
+  offsite: 100MiB
+
+# Single-file restore (lv backup file-ls / file-restore). The backup is read
+# inside a throwaway restore VM booted from this host's own kernel; every key
+# is optional. See docs/design/backup-file-restore.md.
+file_restore:
+  enabled: true              # false refuses file restore (full restore is unaffected)
+  kernel: ""                 # default /boot/vmlinuz-<running release>
+  modules_dir: ""            # default /lib/modules/<running release>
+  qemu: ""                   # default qemu-system-x86_64 / -aarch64 on PATH, or /usr/libexec/qemu-kvm
+  memory_mib: 512            # the restore VM's memory (at least 256)
+  run_as: ""                 # restore account whose group reads the boot files; default litevirt-restore
+                             # (created at daemon start). qemu runs as a per-session uid (uid_base), not as it.
+                             # root, libvirt-qemu, qemu and nobody are refused unless allow_shared_run_as
+  idle_timeout_sec: 300      # a browsing session's VM is killed after this long unused
+  max_sessions: 2            # restore VMs at once on this host (browsing and extracting)
+  max_extractions: 1         # extractions at once on this host; each runs on a VM of its own
+  max_extract_bytes: 16G     # per extraction; a request can only lower it
+  uid_base: 3800000000       # first of 64 uids reserved for restore VMs, one per session; must belong to no
+                             # account (NSS, getent), lie outside /etc/subuid, /etc/subgid and the containers'
+                             # idmap range (an explicit uid_base inside that range refuses to load)
+  allow_shared_run_as: false # DANGEROUS. true permits run_as to be root or a shared qemu user (libvirt-qemu,
+                             # qemu, nobody): the restore VM then shares an identity with production VMs.
+  allow_unsandboxed: false   # DANGEROUS. A list of the barriers a restore VM may run without, e.g. [seccomp]:
+                             #   seccomp - qemu's seccomp sandbox;
+                             #   mac     - mandatory access control: the AppArmor profile (AppArmor on but
+                             #             apparmor_parser missing) and Landlock (a host with neither);
+                             #   root    - a root daemon (a non-root daemon runs qemu as itself, with its
+                             #             data_dir and keys).
+                             # true lifts all three. Each removes a barrier between a malicious backup and the
+                             # host; while set, the host raises file_restore_unsandboxed. Install a qemu with
+                             # seccomp and apparmor_parser, use a kernel with Landlock, run the daemon as root.
+
 # Billing-event webhook. Empty disables (the default — events
 # are dropped). When set, `internal/billing` POSTs JSON
 # {kind, project, subject, vcpu, mem_mib, disk_gib, …, at} on every
@@ -633,6 +699,17 @@ vm_event_prune_hours: 24
 # removed by their host when older than this. 0 keeps every copy until removed
 # with `lv host superseded-disks --purge` or `--remove`.
 superseded_disk_retention_days: 7
+
+# Pending OS package updates (docs/upgrades.md, "Pending OS updates"). A
+# read-only check of what apt (Debian, Ubuntu) or dnf/yum (RHEL family) says is
+# upgradable from its CACHED index and installs nothing. The counts are
+# published on the host record (`lv host ls`, `lv host inspect`), as
+# litevirt_host_pending_updates{host,kind}, and as a host.updates /
+# host.security_updates notification when they change.
+host_updates:
+  enabled: true            # false stops the check on this host
+  interval_minutes: 360    # 0 -> 360; minimum 5
+  refresh_index: false     # true runs `apt-get update` / `dnf makecache` first: a network call (and the apt lock), so opt-in
 
 # Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW
 # binary's local gRPC becomes pingable within the deadline; if not, roll back to
@@ -667,24 +744,64 @@ containers:
   # on Linux 5.19+, LXC 5+ and an ext4/xfs/btrfs container store, otherwise
   # its files are shifted into the range at create), on, or off.
   idmapped_rootfs: auto
+  # Host paths an ADMIN may pass into a container on THIS host (lv ct create
+  # --mount / --device; docs/passthrough.md). A mount's host path is resolved
+  # here, symlinks followed, and must land under one of these prefixes; LXC's
+  # start hook mounts it from an fd on every start, never by path. A prefix
+  # whose path is, lies in or contains a protected tree (/, /etc, /run, the
+  # LXC store, litevirt's data and PKI directories, ...) is refused at load;
+  # one that reaches a protected tree only through another mount of the same
+  # filesystem still loads, with a warning and the condition
+  # container_mount_prefix_overlap, and sources in that tree are refused.
+  # Devices are listed EXACTLY, one node each (never a directory such as /dev;
+  # /dev/mem, /dev/kvm and /dev/vhost-* are refused). Mounts are read-only
+  # unless --mount asks for :rw, and always nosuid,nodev. Empty (the default)
+  # allows nothing. Allow only trees untrusted users cannot write.
+  bind_mount_paths: []                # e.g. ["/srv/shared", "/mnt/media"]
+  device_paths: []                    # exact nodes, e.g. ["/dev/ttyUSB0", "/dev/dri/renderD128"]
 
-# ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
-# TLS itself (port 7445) using a cert from the configured ACME directory, with an
-# internal-PKI fallback during issuance. Unset (default) = UI stays plain HTTP
-# (e.g. behind a fronting proxy). HTTP-01 only — needs inbound :80 reachable from
-# the CA. directory_url points at internal step-ca or Let's Encrypt.
+# ACME for the web UI cert (#13). When set, the daemon TERMINATES UI TLS itself
+# (port 7445) using a cert from the configured ACME directory, with the cluster
+# certificate as fallback during issuance and for names outside `domains`. A
+# custom certificate (`lv host ui-cert set`) takes precedence over both. Unset
+# (default) = see ui_tls. directory_url points at internal step-ca or Let's
+# Encrypt.
 acme:
   directory_url: ""                 # e.g. https://ca.internal/acme/acme/directory  (empty = disabled)
   email: "ops@example.com"
-  domains: ["litevirt.example.com"] # SANs to request; must resolve to this host
+  domains: ["litevirt.example.com"] # SANs to request; must resolve to this host (dns-01: "*.x" allowed)
   cache_dir: ""                     # default {data_dir}/acme
+  # http-01 (default): autocert; needs inbound :80 reachable from the CA.
+  # dns-01: publishes _acme-challenge TXT records through dns.provider; needs no
+  #         inbound port and can issue wildcards. Renewed 30 days before expiry.
+  challenge: http-01
+  dns:
+    provider: rfc2136               # TSIG-signed DNS UPDATE (BIND, Knot, PowerDNS, Windows DNS, ...)
+    propagation_timeout_sec: 120    # wait for the record to be visible on the nameserver
+    propagation_delay_sec: 0        # extra wait for secondaries that serve the zone too
+    rfc2136:
+      nameserver: "10.0.0.53"       # primary that accepts updates; host[:port], port default 53
+      zone: "example.com"           # every acme.domains entry must be inside it
+      tsig_key_name: "litevirt-acme"
+      tsig_algorithm: hmac-sha256   # hmac-sha256 | hmac-sha384 | hmac-sha512 | hmac-sha224 | hmac-sha1
+      # The TSIG secret (base64, or a BIND key file). A SECRET: it is never put
+      # in this file, the daemon tightens the file to 0600 and never logs it.
+      # Grant the key update rights for _acme-challenge names only.
+      tsig_secret_path: /etc/litevirt/acme-tsig.key
+      ttl: 60
+      transport: udp                # udp (default) | tcp
 
 # Notifications (#5). Optional shortcut: seed a catch-all webhook target+route
 # (min-severity warn) from config without using `lv notify` / the UI. Manage
-# additional targets/routes (webhook, Slack) via `lv notify` or the /notifications
+# additional targets/routes (webhook, Slack, email) via `lv notify` or the /notifications
 # page; they are CRDT-replicated cluster-wide.
 notifications:
   default_webhook: ""               # e.g. https://hooks.slack.com/services/…  (empty = none)
+
+# Disk SMART health check (smartctl): litevirt_disk_smart_* gauges plus
+# disk.smart.* notifications (see notifications.md). Informational only.
+smart:
+  interval: "1h"                    # Go duration (floor 10m); "0" or "off" disables
 
 # Telemetry: structured logging + distributed tracing over OTLP (see
 # telemetry.md). Metrics stay on Prometheus (metrics_port) — this block does NOT
@@ -841,6 +958,9 @@ forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 ```yaml
 migration:
   allow_unencrypted_storage: false   # default false
+  network: 10.20.0.0/24              # default empty: the cluster address
+  address: 10.20.0.7                 # optional: this host's own address in that network
+  allow_any_network: false           # default false: refuse a non-private network, or one holding the cluster address
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
@@ -856,6 +976,19 @@ With the default, `false`, that plaintext copy is refused, and the error names
 the host without credentials and this setting. Set it to `true` only where the
 network between hosts is trusted, for example a dedicated, isolated migration
 VLAN. It is read on the source host, and only at daemon start.
+
+`network` is a dedicated migration network, an IPv4 CIDR, like Proxmox's
+`migration: network=`. A migration this node sends then moves its data (guest
+memory, and the disk blocks of a storage copy) to the target's address inside
+that network instead of the address the host is dialed on. Nothing needs setting
+on the target: the source asks it, in the request that already prepares the
+move, for the address of its own in the network, or `address` if you set one
+there (use it where a host holds several addresses in the network). The daemon
+refuses to start with a `network` that is not inside a private range or that
+contains the host's cluster or default-route address, unless `allow_any_network`
+is `true`. The network carries live moves and the disk stream of cold moves and
+clone copies, and an unencrypted storage copy stays on the cluster address. See
+[migration](migration-failover.md#a-dedicated-migration-network).
 
 Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
 libvirt's TLS connection, and this setting does not affect them.
@@ -1034,7 +1167,7 @@ difference rather than a judgement that this endpoint carries less.
 |---------|---------|----------|----------------|--------------|---------|
 | `grpc_port` | 7443 | gRPC/mTLS | yes — mTLS, client cert required | all | API (CLI, inter-host) |
 | `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
-| `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
+| `ui_port` | 7445 | HTTP, or HTTPS per `ui_tls` | session cookie | `127.0.0.1` | Web dashboard |
 | `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
 | `gossip_port` | 7946 | TCP+UDP | only with `enforcement.gossip_encryption: true` — AES-256-GCM under `gossip.key` ([details](auth.md#gossip-encryption)); members are also admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)) | **all** | Cluster membership |
 | `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |

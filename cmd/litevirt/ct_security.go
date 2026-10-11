@@ -41,7 +41,8 @@ func privilegedText(ct *pb.Container) string {
 // newCTConvertCmd changes a stopped container's security settings in place.
 func newCTConvertCmd() *cobra.Command {
 	var host, confinement string
-	var unprivileged bool
+	var unprivileged, clearHostAccess bool
+	var mountFlags, deviceFlags []string
 	cmd := &cobra.Command{
 		Use:   "convert <name>",
 		Short: "Convert a stopped container: --unprivileged moves it into an id range of its own; --confinement default|legacy",
@@ -56,13 +57,28 @@ restores what earlier releases wrote.
 
 A convert that is interrupted leaves the container refusing to start; run
 lv ct convert <name> with no flags to finish it to the recorded target (with
-flags, the recorded target is finished first and the flags applied after).`,
+flags, the recorded target is finished first and the flags applied after).
+
+--mount and --device REPLACE the container's host bind mounts and device nodes
+(Admin only, as at create); --clear-host-access removes them. This is how an
+admin re-applies host access a restore did not carry.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				ct, err := c.ConvertContainer(ctx, &pb.ConvertContainerRequest{
+				req := &pb.ConvertContainerRequest{
 					Name: args[0], HostName: host, Unprivileged: unprivileged, Confinement: confinement,
-				})
+				}
+				if len(mountFlags) > 0 || len(deviceFlags) > 0 || clearHostAccess {
+					if clearHostAccess && (len(mountFlags) > 0 || len(deviceFlags) > 0) {
+						return fmt.Errorf("--clear-host-access and --mount/--device are exclusive: --mount/--device already replace the whole set")
+					}
+					mounts, devices, perr := parseCTHostAccess(mountFlags, deviceFlags)
+					if perr != nil {
+						return perr
+					}
+					req.SetHostAccess, req.Mounts, req.Devices = true, mounts, devices
+				}
+				ct, err := c.ConvertContainer(ctx, req)
 				if err != nil {
 					return err
 				}
@@ -74,6 +90,9 @@ flags, the recorded target is finished first and the flags applied after).`,
 	cmd.Flags().StringVar(&host, "host", "", "Owning host (default: resolve by name)")
 	cmd.Flags().BoolVar(&unprivileged, "unprivileged", false, "Move the container into an id range of its own")
 	cmd.Flags().StringVar(&confinement, "confinement", "", "default | legacy (legacy needs the Admin role)")
+	cmd.Flags().StringArrayVar(&mountFlags, "mount", nil, "Replace the host bind mounts: <host-path>:<container-path>[:ro|rw] (repeatable; Admin only)")
+	cmd.Flags().StringArrayVar(&deviceFlags, "device", nil, "Replace the host device nodes: <host-path>[:<container-path>] (repeatable; Admin only)")
+	cmd.Flags().BoolVar(&clearHostAccess, "clear-host-access", false, "Remove every host bind mount and device node")
 	return cmd
 }
 

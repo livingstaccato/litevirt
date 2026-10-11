@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -841,7 +842,7 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	}
 
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true}); err != nil {
+	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true, SharesWeight: v.sharesWeightOf(vm)}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
 		// A LOCAL publish, unlike the successful handoff below, which repoints the
 		// row to another host while running on this one.
@@ -880,6 +881,11 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		v.noteStateWriteFail(corrosion.OpVMHost, werr)
 		return
 	}
+	// The VM may now run on its own replica target: replicate back to this host.
+	// (The RPC path above switches it in MigrateVM's own finish.)
+	corrosion.ReverseReplicationAudited(ctx, v.db, "vm", vm.Name, "", v.hostName, target.Name, func(detail, result string) {
+		auditSystem(ctx, v.db, v.hostName, "replication.reverse", vm.Name, detail, result)
+	})
 	v.publish("vm.health.migrated", vm.Name, fmt.Sprintf("from=%s to=%s", v.hostName, target.Name))
 	slog.Info("vmcheck: VM migrated successfully", "vm", vm.Name, "to", target.Name)
 }
@@ -1148,4 +1154,23 @@ func parseDuration(s string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// sharesWeightOf is the VM's cpu-shares weight in the user's scale, carried to
+// a direct libvirt migration, by the same rule as the RPC path's
+// Server.vmSharesWeight: the stored weight, else the default when the domain
+// carries a <shares> (a cleared weight), else 0. This fallback has no peer to
+// ask for the target's cgroup version, so it retargets nothing on its own; the
+// RPC path (migrateVMFunc), which production wires, does.
+func (v *VMChecker) sharesWeightOf(vm corrosion.VMRecord) int {
+	spec := &pb.VMSpec{}
+	if vm.Spec != "" && json.Unmarshal([]byte(vm.Spec), spec) == nil && spec.GetCpuShares() > 0 {
+		return int(spec.GetCpuShares())
+	}
+	if d, ok := v.virt.(interface{ DumpXML(string) (string, error) }); ok {
+		if x, err := d.DumpXML(vm.Name); err == nil && strings.Contains(x, "<shares>") {
+			return lv.DefaultCPUWeight()
+		}
+	}
+	return 0
 }

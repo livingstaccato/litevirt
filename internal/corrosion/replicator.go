@@ -1417,7 +1417,7 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		// host_membership yet is absorbed into it here, locally
 		// (host_membership.go). Back-pressured on failure, like the secret
 		// absorb: swallowed, it would lose a fence on this node.
-		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership()); err != nil {
+		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
 			_ = tx.Rollback()
 			slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
@@ -4106,6 +4106,19 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 		}
 	}
 	return sh.InsertCols, vals, true
+}
+
+// RelayRoles is this node's current relay election: every node it knows of,
+// true for a relay and false for a leaf. Nil before the first election. The
+// metrics collector reads it for litevirt_relay_role, so an operator can see
+// on every node that a demoted host is a leaf everywhere.
+func (r *Replicator) RelayRoles() map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.relaySet == nil {
+		return nil
+	}
+	return r.relaySet.Roles()
 }
 
 // Targets names the peers this node is currently pushing to — one per running

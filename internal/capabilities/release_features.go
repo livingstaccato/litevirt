@@ -79,20 +79,71 @@ type FeatureInfo struct {
 // request. The firewall branch gates per-NIC guards — on by default for every
 // new NIC, so used on the first NIC created after the latch — on nic_guards,
 // and IPv6 rules on firewall_ipv6, so a cluster with no IPv6 rule can still
-// roll back below the release.
+// roll back below the release. drain_failback is used by default in the same
+// way: every drain after the latch records the VMs it moved, because
+// `lv host failback --all` may be asked for them later, so the first drain
+// after the latch marks it used. Its other data, the cluster failback policy,
+// is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
-	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
-	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
-	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
-	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
-	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group, cluster and host firewall rules, and IPv6 ip-set elements", Writers: []string{"internal/corrosion.InsertSGRuleWithGrant", "internal/corrosion.InsertClusterFirewallRuleWithGrant", "internal/corrosion.InsertHostFirewallRuleWithGrant", "internal/corrosion.InsertIPSetWithGrant"}},
-	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC guards (source MAC and IP, DHCP server, router advertisements, VLAN tags); on by default for new NICs", Writers: []string{"internal/corrosion.PutNICGuard"}},
-	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
-	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
-	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
-	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},
+	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits",
+		Writers: []string{"internal/grpcapi.admitLimitedSpec", "internal/grpcapi.admitLimitUpdate",
+			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
+	FeatureVMDiskNICIO: {Token: Release202611V1, Description: "Per-disk discard and I/O limits and per-NIC queues; discard defaults on for new disks",
+		Writers: []string{"internal/corrosion.InsertVMWithTuning", "internal/corrosion.MutateDesiredSpecTuning",
+			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
+	FeatureEmailTargetSecret: {Token: Release202611V1, Description: "Email notification targets with a stored SMTP password",
+		Writers: []string{"internal/corrosion.InsertEmailTargetWithSecret"}},
+	FeatureLoginPolicy:   {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor and directory identity binding (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},
+	FeatureDrainFailback: {Token: Release202611V1, Description: "Failback after a drain: the record every drain writes of the VMs it moved, and the cluster failback policy", Writers: []string{"internal/corrosion.PutDrainOrigin", "internal/corrosion.SetFailbackPolicy"}},
+	FeatureFirewallIPv6: {Token: Release202611V1, Description: "IPv6 security-group, cluster and host firewall rules, and IPv6 ip-set elements",
+		Writers: []string{"internal/corrosion.InsertSGRuleWithGrant", "internal/corrosion.InsertClusterFirewallRuleWithGrant", "internal/corrosion.InsertHostFirewallRuleWithGrant", "internal/corrosion.InsertIPSetWithGrant"}},
+	FeatureNICGuards: {Token: Release202611V1, Description: "Per-NIC guards (source MAC and IP, DHCP server, router advertisements, VLAN tags); on by default for new NICs",
+		Writers: []string{"internal/corrosion.PutNICGuard"}},
+	FeatureUSBMountsMemory: {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices",
+		Writers: []string{
+			"internal/corrosion.InsertVMWithPassthrough",
+			"internal/corrosion.MutateDesiredSpecPassthrough",
+			"internal/corrosion.CreateContainerAtomicWithHostAccess",
+			"internal/corrosion.UpsertContainerWithHostAccess",
+			"internal/corrosion.InsertVMWithReleaseFeatures",
+			"internal/corrosion.MutateDesiredSpecWithReleaseFeatures",
+		}},
+	FeatureBackupZstd: {Token: Release202611V1, Description: "zstd chunk compression in backup repositories",
+		Writers: []string{"internal/pbsstore.InitWithGrant", "internal/pbsstore.Repo.EnableCompressionWithGrant"}},
+	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host", Writers: containerReplicationWriters},
 	FeaturePITOverlay:           {Token: Release202611V1, Description: "Point-in-time overlays for copies of running VMs"},
+	FeatureISCSILUNClaim: {Token: Release202611V1, Description: "Cluster-wide voter claim of each iSCSI LUN by one disk; iSCSI disk creates, rebuilds and recreates wait for it",
+		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
+			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
+}
+
+// containerReplicationWriters write container_replication's data: a container's
+// replication schedule row, its direction switch, and a run's replica.
+var containerReplicationWriters = []string{
+	"internal/corrosion.UpsertContainerReplicationSchedule",
+	"internal/corrosion.RepointContainerReplicationTarget",
+	"internal/grpcapi.Server.replicateContainer",
+}
+
+// loginPolicyWriters are the writers of login_policy's data: user_lifecycle,
+// the second-factor policy row, session_factors, user_enrollment_codes and
+// user_identity_bindings (the statement builders take the grant where a batch
+// carries the login rules' part only when it is granted).
+var loginPolicyWriters = []string{
+	"internal/corrosion.SetUserLifecycle",
+	"internal/corrosion.ResetUserLifecycle",
+	"internal/corrosion.enableUserStatements",
+	"internal/corrosion.SetTwoFactorPolicy",
+	"internal/corrosion.InsertSessionWithFactor",
+	"internal/corrosion.IssueEnrollmentCode",
+	"internal/corrosion.ConsumeEnrollmentCode",
+	"internal/corrosion.InvalidateEnrollmentCode",
+	"internal/corrosion.BindIdentity",
+	"internal/corrosion.ClearIdentityBinding",
+	"internal/corrosion.ClearIdentityBindingRows",
+	"internal/corrosion.DeleteUserCounted",
+	"internal/corrosion.reinstateAdminStatements",
+	"internal/corrosion.resetAdminStatements",
 }
 
 // The features of release_2026_11_v1. Each name is written into a replicated

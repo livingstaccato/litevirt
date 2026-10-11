@@ -22,6 +22,35 @@ message DrainProgress      { string vm_name = 1; string target_host = 2;
     MigrateStrategy strategy = 3; float progress_pct = 4;
     string status = 5; string error = 6; }
 message UndrainHostRequest { string name = 1; }
+// FailbackHost moves VMs a drain of the host moved away back to it, by live
+// migration, one at a time. Without all, only VMs that opted in (their
+// placement.failback, or the cluster failback policy) are considered.
+// dry_run reports what would move and why each other VM stays.
+message FailbackHostRequest {
+    string name    = 1;
+    bool   all     = 2;
+    bool   dry_run = 3;
+    // follow attaches to the run on this daemon for the host (the one an
+    // undrain started, running or finished) and streams its results, instead
+    // of starting one. all and dry_run are ignored.
+    bool   follow  = 4;
+}
+// FailbackProgress is one VM's failback result. status: moved | would-move |
+// skipped | failed; reason says why for the last two.
+message FailbackProgress {
+    string vm_name  = 1;
+    string from_host = 2;
+    string status   = 3;
+    string reason   = 4;
+}
+message FailbackPolicyStatus {
+    bool   enabled    = 1;
+    string set_by     = 2;
+    string updated_at = 3;
+    // settable: this host may write the policy (failover_scope_v1 latched).
+    bool   settable   = 4;
+}
+message SetFailbackPolicyRequest { bool enabled = 1; }
 // Ordered shutdown of a host's running VMs (honors startup_order desc +
 // stop_delay_sec between VMs). Explicit operator action — NOT run on daemon
 // SIGTERM / restart. This is the consumer of vms.stop_delay_sec.
@@ -52,6 +81,24 @@ message PublishCRLRequest  { string crl_pem = 1; }
 // shares a pki directory with its daemon, so that answer would be "no" in the
 // ordinary case and mean nothing about the cluster.
 message PublishCRLResponse { int64 version = 1; }
+// RevokeReplacedCertificateRequest carries a CRL the CA machine minted with the
+// replaced serial of host added (`lv host renew-cert`). The daemon publishes it
+// at once when that is safe for the voter chain, and otherwise records it as a
+// revocation owed and publishes it as soon as it is.
+message RevokeReplacedCertificateRequest {
+    string host    = 1;
+    string serial  = 2;   // lower-case hex
+    string crl_pem = 3;   // must verify against the cluster CA and list serial
+}
+// revoked: published now. held: recorded as owed (reason says why); the
+// cluster publishes it once the newest voter generation still verifies with
+// the serial revoked.
+message RevokeReplacedCertificateResponse {
+    bool   revoked = 1;
+    bool   held    = 2;
+    string reason  = 3;
+    int64  version = 4;
+}
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
 // GetClusterHealth is THE health read: the durable condition set, evaluator
@@ -468,9 +515,18 @@ message CloneVMRequest {
     string mode         = 3;  // "" (auto) | "linked" | "full"
     string snapshot     = 4;  // optional: clone from this snapshot of the source
     string project      = 5;  // tenancy bucket for the clone ("" → source's)
-    string target_host  = 6;  // optional placement pin (else placement engine / host-pin)
+    // target_host is not used (an older design's placement pin); see
+    // destination_host.
+    string target_host  = 6;
     string ip           = 7;  // optional static IP for the clone's first NIC
     bool   start        = 8;  // start the clone after creation
+    // target_pool: the storage pool, on the host the clone ends up on, that
+    // holds the clone's disks. Empty means that host's default disk directory.
+    string target_pool  = 9;
+    // destination_host is the host the clone ends up on, as target_host was
+    // meant to be: empty keeps it on the source's host. Field 6 stays
+    // ignored, as it always was, so a client that sets it is not newly refused.
+    string destination_host = 10;
 }
 message ConvertToTemplateRequest { string name = 1; bool revert = 2; }
 message ExecVMRequest      { string name = 1; repeated string command = 2; }
@@ -512,11 +568,43 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
     string         cpu_model       = 23;  // CPU model for --cpu-mode custom; empty for any other mode
+    // redefine_hardware regenerates the domain from the stored spec's disk and
+    // NIC tuning (discard, detect_zeroes, queues) with no other change — the
+    // compose reconfigure persists the tuning first, then sets this.
+    bool           redefine_hardware = 30;
+    // disk_tuning / nic_queues carry the discard, detect_zeroes and queue changes
+    // themselves, so the OWNING host applies them to its own spec under the VM
+    // lock and writes the spec only after the domain has them. Both imply
+    // redefine_hardware.
+    repeated DiskTuningUpdate disk_tuning = 31;
+    repeated NICQueuesUpdate  nic_queues  = 32;
+    // Noisy-neighbour limits: applied LIVE (config + running domain), no restart.
+    optional double cpu_limit      = 24;  // cap in host cores; 0 clears the cap
+    optional int32  cpu_shares     = 25;  // relative CPU weight; 0 restores the default
+    repeated NICRateUpdate nic_rate = 26; // per-NIC bandwidth caps
 
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
     bool allow_overcommit = 22;
+
+    // usb_devices replaces the VM's USB passthrough list when set_usb_devices is
+    // true (an empty list with set_usb_devices clears it). A redefine-class
+    // change: the VM must be stopped, or pass allow_restart.
+    repeated USBDeviceSpec usb_devices = 40;
+    bool set_usb_devices = 41;
+    // memory_hotplug_max_mib sets the virtio-mem hot-add ceiling (0 turns
+    // hot-add off). Redefine-class, like usb_devices.
+    optional int32 memory_hotplug_max_mib = 42;
 }
+// DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
+// leaves it as stored).
+message DiskTuningUpdate { string name = 1; string discard = 2; string detect_zeroes = 3; }
+// NICQueuesUpdate changes the virtio-net queue count of the NIC at this position
+// in the VM's spec (1 turns multiqueue off).
+message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
+// NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
+// is named by its 0-based position in the VM's interface list.
+message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.
@@ -527,6 +615,13 @@ message SetVMMemoryRequest  { string name = 1; int32 target_mib = 2;
 message SetVMLabelsRequest  { string name = 1; map<string, string> labels = 2; }
 message ResizeDiskRequest  { string vm_name = 1; string disk_name = 2;
     string size = 3; }  // size: new total size e.g. "40G"
+
+// SetDiskIO replaces one disk's I/O throttle. A running VM is throttled live
+// and the persistent definition updated; the limits are stored in the VM's spec
+// so a restart, redefine or migration carries them. An empty limits message
+// clears every limit.
+message SetDiskIORequest { string vm_name = 1; string disk_name = 2;
+    DiskIOLimits limits = 3; }
 
 // ── VNC Proxy ──
 message VNCData { bytes data = 1; }
@@ -552,7 +647,23 @@ message ExportStackResponse { string name = 1; string compose_yaml = 2; string c
 
 // ── Migration ──
 message MigrateVMRequest { string vm_name = 1; string target_host = 2;
-    MigrateStrategy strategy = 3; bool with_storage = 4; }
+    MigrateStrategy strategy = 3; bool with_storage = 4;
+    // expect_drain_record makes the migration conditional on a drain record:
+    // the host that OWNS the VM when it runs must be expect_host, at owner
+    // epoch expect_owner_epoch, and its own replica must still hold a live
+    // drain record naming it and target_host (the host the drain moved the VM
+    // off). Failback sets it, so the check is made by the owner under the VM's
+    // lock, not by the daemon that decided on a replica that may lag. Any
+    // difference refuses with FailedPrecondition and moves nothing.
+    bool   expect_drain_record = 5;
+    string expect_host         = 6;
+    int64  expect_owner_epoch  = 7;
+    // expect_placement_gen is the VM's placement generation the drain recorded.
+    // Every change of the VM's host advances it in the same batch, so the owner,
+    // which cannot own the VM without having the generation of the move that
+    // made it the owner, compares its own current value: any placement change
+    // since the drain, however the record travelled, refuses the move.
+    int64  expect_placement_gen = 8; }
 message MigrateProgress  { MigratePhase phase = 1; float memory_pct = 2;
     float disk_pct = 3; int64 memory_remaining = 4; int64 disk_remaining = 5;
     string status = 6; int64 downtime_ms = 7; string error = 8;
@@ -892,12 +1003,84 @@ message LoginResponse      {
     string role          = 3;
     string expires_at    = 4;  // RFC3339; hard expiry of the session
     bool   requires_2fa  = 5;  // if true, token is empty; client must re-call Login with totp_code
+    // requires_2fa_enrollment: the login policy requires a second factor for
+    // this realm and the account has none. token is an ENROLLMENT-ONLY session:
+    // it can enroll a factor for its own account (EnrollTOTP, WebAuthn
+    // registration), call Whoami and Logout, and nothing else. Enrolling ends
+    // it; log in again with the new factor.
+    bool   requires_2fa_enrollment = 6;
 }
 message ListRealmsResponse { repeated string realms = 1; }
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }
-message DeleteUserRequest  { string username = 1; }
-message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+// exact: match username as stored, byte for byte, instead of by normalized
+// name — the way to remove one of two accounts that differ only in case or
+// surrounding spaces, which every normalized lookup refuses (admin, audited).
+// exact_id: with exact, the id of the one account to delete, as
+// ListUserVariants reports it — an exact delete refuses without it.
+message DeleteUserRequest  { string username = 1; bool exact = 2; string exact_id = 3; }
+message MarkUserExternalRequest { string username = 1; }
+// ListUserVariants lists every live account whose name normalizes like
+// username (case and surrounding spaces), with what an operator needs to
+// choose which one an exact delete removes. Admin only.
+message ListUserVariantsRequest { string username = 1; }
+message UserVariant {
+    string id         = 1;  // stable id to pass as DeleteUserRequest.exact_id
+    string username   = 2;  // as stored, byte for byte
+    string created_at = 3;
+    string role       = 4;
+    string realm      = 5;
+    string last_login = 6;  // newest session created_at, "" if none here
+    int32  factors    = 7;
+    int32  tokens     = 8;
+}
+message ListUserVariantsResponse { repeated UserVariant variants = 1; }
+// ClearIdentityBindingRequest drops the directory identity an external-realm
+// account is bound to, so its next login binds afresh (an entry re-created in
+// the directory). Admin only, audited.
+message ClearIdentityBindingRequest { string username = 1; string realm = 2; }
+message WhoamiResponse     {
+    string username = 1; string role = 2; string realm = 3; string expires_at = 4;
+    // requires_2fa_enrollment: this is an enrollment-only session (see
+    // LoginResponse.requires_2fa_enrollment).
+    bool requires_2fa_enrollment = 5;
+}
+// SetUserAccountRequest changes an account's lifecycle. An unset field is left
+// as it is, so disabling and setting an expiry from two places cannot undo each
+// other. expires_at is RFC3339; "" clears the expiry (never expires).
+message SetUserAccountRequest {
+    string username = 1;
+    optional bool   disabled   = 2;
+    optional string expires_at = 3;
+}
+// LoginPolicy is the cluster-wide mandatory second-factor policy.
+// require_2fa is "off" (no row, the default), "all", or a comma-separated list
+// of realm names ("local,ldap:corp"). A value this build does not understand is
+// reported as stored and enforced as "all".
+message LoginPolicy {
+    string          require_2fa      = 1;
+    repeated string realms           = 2;  // the realms it covers; empty with all_realms=false = off
+    bool            all_realms       = 3;
+    string          set_by           = 4;
+    string          updated_at       = 5;
+    bool            settable         = 6;  // the login_policy release feature is available here
+    int32           sessions_revoked = 7;  // SetLoginPolicy only: sessions ended in newly covered realms
+    string          self_enroll_by   = 8;  // RFC3339; "" = enrollment needs an admin-issued code
+    repeated string warnings         = 9;  // e.g. a covered realm that is not configured on this node
+}
+// SetLoginPolicyRequest: by default an enrollment-only session can enroll its
+// first factor only with an admin-issued enrollment code (IssueEnrollmentCode).
+// allow_self_enroll with enroll_by (RFC3339, in the future) lets it enroll
+// without one until enroll_by; after it, a code is required again.
+message SetLoginPolicyRequest { string require_2fa = 1; bool allow_self_enroll = 2; string enroll_by = 3; }
+// IssueEnrollmentCode mints a single-use, short-lived code with which an
+// enrollment-only session of username may enroll its first factor. Admin only.
+// ttl_seconds 0 = one hour; at most 24 hours. The code is shown once and
+// stored hashed.
+message IssueEnrollmentCodeRequest  { string username = 1; int64 ttl_seconds = 2; }
+// issued_on: the node the code is bound to; it can be used only through that
+// node.
+message IssueEnrollmentCodeResponse { string code = 1; string expires_at = 2; string issued_on = 3; }
 // CheckPermissionsRequest names permission gates (see grpcapi permGates), not
 // raw verbs, so the question cannot drift from the one the RPC asks.
 message CheckPermissionsRequest  { repeated string gates = 1; }
@@ -912,7 +1095,20 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 // never leaves the process that writes the password file. os_user is the
 // invoking account as the CLI reports it (SUDO_USER when set); it is recorded
 // in the audit row as a claim, not as an authenticated identity.
-message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; }
+// clear_two_factor also removes every second factor and recovery code of the
+// admin account (`lv user reset-admin --clear-2fa`); refused until the
+// login_policy release feature opens.
+// username names the admin-role account to reset (`lv user reset-admin
+// --user`); empty is "admin". It is how an operator gives an account the admin
+// floor reinstated its first credential: the floor never brings back a deleted
+// account's old password.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; bool clear_two_factor = 3; string username = 4; }
+// ResetAdminPasswordResponse names the account the daemon reset, as stored. A
+// daemon that predates the field answers with an empty name: it reset "admin"
+// whatever the request named, and the CLI says so. note, when set, is for the
+// operator: the reset left something in place they must know about (a cut-off
+// dated in the future it could not correct), and what clears it.
+message ResetAdminPasswordResponse { string username = 1; string note = 2; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -963,6 +1159,11 @@ message BackupSnapshotRequest {
     // repo name). The owner accepts it only from that peer over mTLS (host-cert CN
     // == sink_host); a non-peer request that sets it is rejected. Leave empty.
     string sink_host = 7;
+    // bwlimit_bytes_per_sec caps how fast this job reads the disk and, for a
+    // remote backup, sends chunks to the sink. 0 = no job limit. The daemon
+    // also applies the target repo's limit (daemon config backup_bwlimits);
+    // the lower of the two wins. An older daemon ignores the field.
+    int64 bwlimit_bytes_per_sec = 8;
 }
 message BackupSnapshotProgress {
     enum Phase {
@@ -1038,6 +1239,52 @@ message PushBackupResponse {
     int64 bytes_written  = 3;
 }
 
+// ListBackupFilesRequest names one backup (as RestoreFromBackup does) and a
+// path in it: "/" lists the backup's volumes (filesystems the restore VM
+// mounted: partitions, the whole disk, or "rootfs" of a container archive),
+// "/<volume>/<dir>" lists a directory.
+message ListBackupFilesRequest {
+    string repo_path = 1;
+    string name      = 2;  // VM or container name, as in the manifest
+    string disk_name = 3;  // "root" for a VM's root disk, "rootfs" for a container
+    string timestamp = 4;  // exact RFC3339
+    string path      = 5;  // empty = "/"
+}
+message BackupFileEntry {
+    string name        = 1;
+    string type        = 2;  // file | dir | symlink | other
+    int64  size        = 3;
+    uint32 mode        = 4;  // permission bits
+    int64  mtime_unix  = 5;
+    string link_target = 6;  // a symlink's target, shown only; never followed
+}
+message ListBackupFilesResponse {
+    string path                    = 1;
+    repeated BackupFileEntry entries = 2;
+    bool   truncated               = 3;  // more entries than one listing returns
+    int32  skipped                 = 4;  // entries left out (invalid or non-UTF-8 names)
+}
+// RestoreBackupFilesRequest selects paths ("/<volume>/<path>") to extract.
+// The answer is a tar archive streamed in chunks; nothing is written on the
+// daemon's host.
+message RestoreBackupFilesRequest {
+    string repo_path = 1;
+    string name      = 2;
+    string disk_name = 3;
+    string timestamp = 4;
+    repeated string paths = 5;
+    int64  max_bytes = 6;  // 0 = the daemon's limit; can only lower it
+}
+message RestoreBackupFilesChunk {
+    bytes  data      = 1;  // the next bytes of the tar archive
+    bool   done      = 2;  // last frame: the counts below are final
+    int32  entries   = 3;
+    int64  bytes     = 4;  // file bytes in the archive
+    int32  skipped   = 5;  // entries refused (names, types, links)
+    bool   truncated = 6;  // stopped at a size or entry limit
+    string status    = 7;
+}
+
 message RestoreFromBackupRequest {
     string repo_path     = 1;
     string vm_name       = 2;  // manifest selector
@@ -1084,6 +1331,20 @@ message VerifyBackupRepoResponse {
     repeated string missing        = 3;  // chunk ids a manifest references that are absent
 }
 
+// SetBackupRepoCompression: only zstd is gated, so only zstd is asked for;
+// turning compression off, or creating an uncompressed repo, needs no daemon.
+message SetBackupRepoCompressionRequest {
+    string repo        = 1;  // a registered repo name, or an absolute path (admin)
+    string compression = 2;  // "zstd"
+    bool   init        = 3;  // create the repo (it must not exist) instead of converting one
+    bool   encrypted   = 4;  // with init: mark the new repo AES-256-GCM encrypted
+}
+message SetBackupRepoCompressionResponse {
+    string path           = 1;
+    string compression    = 2;
+    int32  schema_version = 3;
+    string host           = 4;  // the host whose disk now holds the repo
+}
 message GarbageCollectBackupRepoRequest {
     string repo = 1;
 }
@@ -1166,6 +1427,8 @@ message Container {
     bool privileged     = 12;
     string confinement  = 13;    // "default" | "legacy"
     int64 idmap_base    = 14;    // first host id of its range (unprivileged only)
+    repeated ContainerMount  mounts  = 30;  // host bind mounts recorded at create
+    repeated ContainerDevice devices = 31;  // host devices recorded at create
 }
 
 message ContainerNetwork {
@@ -1206,6 +1469,30 @@ message CreateContainerRequest {
     // list) or "legacy" (the generated profile with nesting, as earlier
     // builds wrote; admin only). Empty means "default".
     string confinement = 17;
+    // mounts bind-mounts host paths into the container and devices passes host
+    // device nodes through (Proxmox mpN / devN). Both require the admin role,
+    // and each host path must resolve, on the host, under a prefix that host's
+    // containers.bind_mount_paths / containers.device_paths allows. Refused
+    // until release_2026_11_v1 has latched (feature usb_mounts_memory).
+    repeated ContainerMount  mounts  = 30;
+    repeated ContainerDevice devices = 31;
+}
+
+// ContainerMount bind-mounts a host path into a container. Read-only unless
+// read_write is set; nosuid and nodev always. The host path is resolved on the
+// host (symlinks followed) and must stay under an allowed prefix, and it is
+// checked again at every start.
+message ContainerMount {
+    string host_path      = 1;
+    string container_path = 2;  // absolute path inside the container
+    bool   read_write     = 3;
+}
+
+// ContainerDevice passes one host device node (character or block) into a
+// container: the node is bind-mounted and the cgroup allows its major:minor.
+message ContainerDevice {
+    string host_path      = 1;  // e.g. /dev/ttyUSB0
+    string container_path = 2;  // "" = the same path inside the container
 }
 
 // PrepareContainerTargetRequest is a migrate's preflight on the TARGET (peer
@@ -1229,6 +1516,12 @@ message ConvertContainerRequest {
     string name = 2;
     bool unprivileged = 3;
     string confinement = 4;
+    // set_host_access replaces the container's host bind mounts and device
+    // nodes with mounts/devices (empty clears them): how an admin re-applies
+    // what a restore did not carry. Adding any needs the admin role.
+    bool set_host_access = 5;
+    repeated ContainerMount  mounts  = 6;
+    repeated ContainerDevice devices = 7;
 }
 
 message StartContainerRequest  { string host_name = 1; string name = 2; }
@@ -1289,6 +1582,8 @@ message BackupContainerRequest {
     // forwarding to the owner, which accepts it only from that peer over mTLS
     // (CN == sink_host). Leave empty.
     string sink_host = 5;
+    // bwlimit_bytes_per_sec: see BackupSnapshotRequest.bwlimit_bytes_per_sec.
+    int64 bwlimit_bytes_per_sec = 6;
 }
 
 message BackupContainerProgress {
@@ -1338,6 +1633,16 @@ message RestoreContainerRequest {
     string owner_id               = 8;
     string restored_from_owner_id = 9;
     string restored_from_ts       = 10;
+    // source_create_spec is the moving container's create spec as the peer
+    // that drives a move read it off the container's row: the cold migrate's
+    // source (its own row) or the failover coordinator (the row it marked).
+    // A peer move takes the container's NICs, host mounts and devices and
+    // privilege from that row, never from the archive, and the target's own
+    // replica need not have the row yet. Honoured only on a peer move (a
+    // verified migrate-from, or a peer relocation); any other restore
+    // ignores it. Empty (an earlier build, or a row with no spec) = the
+    // target reads the row from its own replica.
+    string source_create_spec = 11;
 }
 
 message RestoreContainerProgress {
@@ -1487,6 +1792,67 @@ message ProbeContainerBackupsResponse {
     repeated ContainerBackupProbe results = 1;
 }
 
+// ContainerReplica is one scheduled replica of a container, held in a backup
+// repo's replica namespace on the replica host (docs/backups.md, "Container
+// replication").
+message ContainerReplica {
+    string timestamp    = 1;
+    // The host the replica was taken on, and that host's container row's
+    // created_at: one segment of the container's history.
+    string source       = 2;
+    string incarnation  = 3;
+    int64  owner_epoch  = 4;
+    int64  total_size   = 5;
+    // Set aside: superseded by a later replica that is not proven to contain
+    // it. Kept, never promoted automatically, removed only by an operator.
+    bool   set_aside        = 6;
+    string set_aside_reason = 7;
+    string stream       = 8;
+    string owner_id     = 9;
+    // The placement it was taken in (the source row's placement id; "" for a
+    // row an earlier build wrote), and when it was captured (after the freeze;
+    // the timestamp is only its name).
+    string placement    = 10;
+    string captured_at  = 11;
+    // No schedule targets this host and repo for the container any more: the
+    // replica is kept, never settled, and an operator may remove it.
+    bool   orphaned     = 12;
+}
+message ListContainerReplicasRequest {
+    string host    = 1; // the replica host ("" = the receiver)
+    string repo    = 2; // the schedule's target repo on that host
+    string project = 3;
+    string name    = 4;
+}
+message ListContainerReplicasResponse {
+    repeated ContainerReplica replicas = 1;
+}
+message RemoveContainerReplicasRequest {
+    string host    = 1;
+    string repo    = 2;
+    string project = 3;
+    string name    = 4;
+    // The set-aside replicas to remove, by timestamp. A replica that is not
+    // set aside is refused.
+    repeated string timestamps = 5;
+}
+message RemoveContainerReplicasResponse {
+    int32 removed = 1;
+}
+// Restore a replica as the container, stopped, on the host that holds it
+// (admin). Refused while a live container of that name exists in the project:
+// it would be a second runnable copy.
+message RestoreContainerReplicaRequest {
+    string host      = 1;
+    string repo      = 2;
+    string project   = 3;
+    string name      = 4;
+    string timestamp = 5;
+}
+message RestoreContainerReplicaResponse {
+    string host = 1;
+}
+
 message ContainerDetail {
     Container container = 1;
     // privilege is "privileged" or "unprivileged", read from the container's
@@ -1535,6 +1901,13 @@ message CloneContainerRequest {
     string host_name = 3;  // source's host; empty = resolve by name
     string project   = 4;  // clone's tenancy project; empty = source's
     bool   start     = 5;  // start the clone after creation
+    // The entry node's ruling that the caller may not hold a privileged mode
+    // or legacy confinement (not an admin): the clone lands unprivileged, in
+    // an id range of its own with its files shifted, with default
+    // confinement, and is audited. Set by the node the caller reached before
+    // it forwards, since the source's host sees only the peer. Setting it
+    // can only lower what the clone holds.
+    bool   unprivileged = 6;
 }
 
 // FirewallStatus is the post-Reconcile snapshot the daemon hands back
@@ -1714,11 +2087,16 @@ message TwoFactor {
 }
 message ListTwoFactorsRequest  { string username = 1; }  // empty = caller's own
 message ListTwoFactorsResponse { repeated TwoFactor factors = 1; }
-message EnrollTOTPRequest      { string username = 1; string label = 2; }
+// enrollment_code: required from an enrollment-only session unless the
+// policy's self-enrollment window is open (IssueEnrollmentCode).
+message EnrollTOTPRequest      { string username = 1; string label = 2; string enrollment_code = 3; }
 message EnrollTOTPResponse {
     string otpauth_url    = 1;  // for QR code rendering
     string secret_base32  = 2;  // for manual entry
     repeated string recovery_codes = 3; // shown once; user must save them
+    // session_ended: the call came from an enrollment-only session, which the
+    // enrollment ended. Log in again with the new factor.
+    bool session_ended = 4;
 }
 message DisableTwoFactorRequest { string username = 1; string method = 2; string label = 3; }
 
@@ -1869,13 +2247,15 @@ message RestoreLiveProgress {
 // navigator.credentials.create /.get. The daemon holds the in-flight
 // session between Begin and Finish in memory; a Begin without a
 // matching Finish within 60s is garbage-collected.
-message BeginWebAuthnRegistrationRequest  { string username = 1; }
+message BeginWebAuthnRegistrationRequest  { string username = 1; string enrollment_code = 2; }
 message BeginWebAuthnRegistrationResponse { bytes options_json = 1; }
 message FinishWebAuthnRegistrationRequest {
     string username        = 1;
     bytes  attestation_json = 2;
+    string enrollment_code = 3;
 }
-message FinishWebAuthnRegistrationResponse { string credential_label = 1; }
+// session_ended: as EnrollTOTPResponse.session_ended.
+message FinishWebAuthnRegistrationResponse { string credential_label = 1; bool session_ended = 2; }
 
 message BeginWebAuthnLoginRequest  { string username = 1; }
 message BeginWebAuthnLoginResponse { bytes options_json = 1; }
@@ -1950,7 +2330,9 @@ message ListResourceMappingsRequest  {}
 message ListResourceMappingsResponse { repeated ResourceMapping mappings = 1; }
 message DeleteResourceMappingRequest { string name = 1; }
 // AddMappingDevice registers one host's concrete device under a mapping.
-// host empty = caller's host. address is the PCI address on that host.
+// host empty = caller's host. address is the PCI address on that host, or a
+// USB device as "usb:<vendor>:<product>" or "usb:<bus>-<port>[.<port>...]".
+// A mapping holds PCI devices or USB devices, never both.
 message AddMappingDeviceRequest {
     string mapping = 1;
     string host    = 2;
@@ -2123,6 +2505,10 @@ message PushReplicaRequest {
 message PushReplicaResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    // The receiver recorded the replica's not_point_in_time mark. A receiver
+    // on a build that does not know the mark leaves it false, so a sender
+    // that set it can tell the mark was dropped.
+    bool   not_point_in_time_recorded = 3;
 }
 // Delete one file from a file-based pool. filename is a base name. A file any
 // VM disk on any host uses is refused. (Replicas are pruned with the
@@ -2222,6 +2608,14 @@ message ReplicaRecord {
     string format     = 6; // qcow2 | raw
     string taken      = 7; // UTC run time, 20060102-150405
     int64  size_bytes = 8; // set by ListReplicas
+    // not_point_in_time is set on a replica copied with qemu-img convert -U
+    // after every point-in-time copy failed (a backup session, an external
+    // snapshot): it may be inconsistent. Automatic promotion does not use one
+    // while a point-in-time replica exists, and by default not at all; manual
+    // promotion asks for accept_not_point_in_time. Absent (every replica
+    // written before this field, or by a build that does not know it) reads
+    // as such replicas always read.
+    bool   not_point_in_time = 9;
 }
 // Peer only. The replica records of one VM in a pool on host.
 message ListReplicasRequest {
@@ -2397,6 +2791,18 @@ message RecoveryClaimValue {
     string lease_key        = 11;
     string source_host      = 12;
     VoterConfigValue voter_config = 13;
+    // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
+    LUNAllocationValue lun = 14;
+}
+// LUNAllocationValue is which disk of which VM one allocation of a LUN is.
+message LUNAllocationValue {
+    string lun        = 1;  // storage.FixedDevice key: target and LUN number
+    int64  generation = 2;  // the key's allocation generation
+    string claim_id   = 3;  // the create that proposed it
+    string vm_id      = 4;  // the VM's uuid
+    string vm_name    = 5;
+    string disk       = 6;
+    string host       = 7;  // the host that ran the create
 }
 // ClaimAccept is one voter's signed accept.
 message ClaimAccept {
@@ -2607,6 +3013,12 @@ message AcceptRecoveryClaimResponse {
 }
 message GetRecoveryClaimRequest {
     RecoveryClaimKey key = 1;
+    // reattest: for a voter_config key whose accept this voter signed with a
+    // host certificate a renewal has since replaced, also return the same
+    // accept re-signed with its current certificate (reattested). It re-signs
+    // only the accept recorded in its own durable claim state, never a value
+    // it did not accept. An older build ignores the field.
+    bool reattest = 2;
 }
 message GetRecoveryClaimResponse {
     PrepareRecoveryClaimResponse state = 1;  // promised/accepted ballot and value, voter, incarnation
@@ -2614,6 +3026,7 @@ message GetRecoveryClaimResponse {
     string last_refusal_reason         = 3;  // this voter's most recent refusal for the key (memory only)
     string last_refusal_detail         = 4;
     int64  adopted_generation          = 5;
+    ClaimAccept reattested             = 6;  // with reattest: the accept above, re-signed with the current certificate
 }
 message ListRecoveryClaimsRequest {
     int64 config_generation = 1;  // the generation the importer is leaving
@@ -2679,6 +3092,47 @@ message PromoteReplicaRequest {
     // it (dest==self, target==vm, action==promote), upserts it, and claims it
     // single-use before the destructive define+start.
     RuntimeActionProof proof = 8;
+    // accept_not_point_in_time promotes a replica recorded as not
+    // point-in-time (ReplicaRecord.not_point_in_time). Without it such a
+    // promotion is refused with a warning naming this flag
+    // (--accept-not-point-in-time).
+    bool   accept_not_point_in_time = 9;
+}
+message ResolvePITOverlayRequest {
+    string vm_name   = 1;
+    string disk_name = 2;
+    string action    = 3; // "commit" | "discard" | "" (report only, without confirm)
+    bool   confirm   = 4; // false: report the verdict and what would be done, do nothing
+    // force_commit commits whatever the verdict says (an expert's override;
+    // the backing file must still be the disk's). accept_torn_disk discards
+    // the overlay of a disk a commit had begun writing, leaving it
+    // inconsistent.
+    bool   force_commit     = 5;
+    bool   accept_torn_disk = 6;
+    // overwrite_newer_writes lets force_commit go ahead on an overlay that is
+    // already in the disk (verdict pivoted, or a committed binding): the
+    // commit then writes the window's old blocks over everything the guest
+    // wrote since. Refused without it, whatever force_commit says.
+    bool   overwrite_newer_writes = 7;
+}
+message ResolvePITOverlayResponse {
+    string overlay = 1; // the overlay file
+    string disk    = 2; // the disk file
+    string binding = 3; // what its binding records, if anything
+    bool   done    = 4; // the action was carried out
+    string status  = 5;
+    // verdict: matches | half-written | pivoted | unknown (pitoverlay.Assess).
+    string verdict        = 6;
+    string verdict_reason = 7;
+    string current        = 8;  // the disk's identity now
+    string backing_file   = 9;  // the overlay's backing file
+    string if_commit      = 10; // what --commit would do, or why it is refused
+    string if_discard     = 11; // what --discard would do, or why it is refused
+    string recommendation = 12;
+    string overlay_current = 13; // the overlay's own identity now (its modification time)
+    // needs_overwrite_newer_writes: a forced commit of this overlay would
+    // overwrite the guest's newer writes, and needs overwrite_newer_writes.
+    bool   needs_overwrite_newer_writes = 14;
 }
 message PromoteReplicaProgress {
     enum Phase {
@@ -2778,6 +3232,11 @@ message PingResponse {
   // certificate verifies, never because a peer reports it. (Tag 10: 9 is taken
   // on another branch too, see the merge checklist.)
   int64 voter_generation = 10;
+  // migrate_preconditions: this build checks MigrateVMRequest's expect_*
+  // preconditions before it moves a VM. An older owner ignores them and moves the
+  // VM unconditionally, so failback skips a VM whose owner does not say so.
+  // (Tag 11: 9 and 10 belong to the release token.)
+  bool migrate_preconditions = 11;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS
@@ -2859,6 +3318,11 @@ message EnsureDisksRequest {
     // VM's first arrival in a directory another project's pool also maps, the
     // target admits only a file with these very bytes.
     map<string, string> installer_iso_sha256 = 7;
+    // migration_network is the source's migration.network (an IPv4 CIDR). When
+    // set, the target answers in migration_address with the address of its own
+    // that lies in that network, so the migration's data channel can use it.
+    // An older target ignores the field and never answers.
+    string migration_network = 8;
 }
 
 message DiskStub {
@@ -2887,6 +3351,17 @@ message EnsureDisksResponse {
     // file here than on the source). An older target never sets it: the
     // source then migrates the domain unchanged, as before.
     map<string, string> installer_iso_resolved = 4;
+    // migration_address: an IPv4 address of this host inside the request's
+    // migration_network. Empty when none was asked for, or this host has no
+    // address in that network; the source then moves the migration over the
+    // address the host is dialed on, and says so.
+    string migration_address = 5;
+    // cgroup_mode: "v2" or "v1", the cgroup hierarchy this host runs. A runtime
+    // migration of a VM with a cpu-shares weight needs it: the source renders
+    // the destination definition's <shares> for this host's scale. An older
+    // target never sets it ("" = unknown), and the source migrates the domain
+    // unchanged, as before.
+    string cgroup_mode = 6;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -2902,6 +3377,12 @@ message EnsureFirmwareStateRequest {
     // the domain and firmware it creates, and RollbackFirmwareState removes
     // them only for the same attempt_id. An older target ignores it.
     string attempt_id = 6;
+    // shares_weight: the VM's cpu-shares weight in the user's scale (0 = none to
+    // render), as the source knows it. The target re-renders the domain's
+    // <shares> for its own cgroup version from this, never from its own replica
+    // of the VM row, which may not hold a just-set weight yet. An older source
+    // never sets it: the target then defines the XML unchanged, as before.
+    int32 shares_weight = 7;
 }
 
 // EnsureFirmwareStateResponse says what the call created on the target. It
@@ -3473,6 +3954,12 @@ service LiteVirt {
     rpc DrainHost(DrainHostRequest)            returns (stream DrainProgress);
     rpc ShutdownHostWorkloads(ShutdownHostWorkloadsRequest) returns (stream ShutdownProgress);
     rpc UndrainHost(UndrainHostRequest)        returns (Host);
+    // FailbackHost moves the VMs a drain moved off the host back to it by live
+    // migration, at a bounded rate. Get/SetFailbackPolicy read and change the
+    // cluster policy that makes an undrain do it by itself.
+    rpc FailbackHost(FailbackHostRequest)      returns (stream FailbackProgress);
+    rpc GetFailbackPolicy(google.protobuf.Empty) returns (FailbackPolicyStatus);
+    rpc SetFailbackPolicy(SetFailbackPolicyRequest) returns (FailbackPolicyStatus);
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
@@ -3502,6 +3989,12 @@ service LiteVirt {
     // opens a peer connection, and an unverified one would let a caller un-revoke
     // themselves by publishing a CRL that simply omits their serial.
     rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
+    // RevokeReplacedCertificate revokes the certificate a renewal replaced —
+    // now, or, when revoking now would leave the newest voter generation
+    // without a quorum of unrevoked signatures for a node that adopts it later
+    // (docs/design/recovery-claims.md §4.1), as a durable revocation owed that
+    // the cluster publishes automatically once it is safe.
+    rpc RevokeReplacedCertificate(RevokeReplacedCertificateRequest) returns (RevokeReplacedCertificateResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
     // SupersededDisks lists the disk copies a failover start set aside on a
@@ -3566,6 +4059,8 @@ service LiteVirt {
     rpc AttachDevice(AttachDeviceRequest) returns (VM);
     rpc DetachDevice(DetachDeviceRequest) returns (VM);
     rpc ResizeDisk(ResizeDiskRequest)    returns (VM);
+    // SetDiskIO throttles one disk's I/O (live on a running VM, persisted).
+    rpc SetDiskIO(SetDiskIORequest)      returns (VM);
     rpc ProxyVNC(stream VNCData)         returns (stream VNCData);
     rpc GetVMLogs(GetVMLogsRequest)      returns (stream VMLogChunk);
 
@@ -3646,6 +4141,22 @@ service LiteVirt {
     rpc CreateUser(CreateUserRequest)   returns (User);
     rpc ListUsers(google.protobuf.Empty) returns (ListUsersResponse);
     rpc DeleteUser(DeleteUserRequest)    returns (google.protobuf.Empty);
+    // MarkUserExternal records, as an administrator's audited decision, that an
+    // existing user with no local password is an external-realm (LDAP/OIDC)
+    // user, so an external login under that name is not refused for want of
+    // evidence. Refused for an account that holds a password. Admin only.
+    rpc MarkUserExternal(MarkUserExternalRequest) returns (google.protobuf.Empty);
+    // SetUserAccount disables, re-enables, or sets the expiry of an account.
+    // Admin only. Refused until the login_policy release feature opens.
+    rpc SetUserAccount(SetUserAccountRequest) returns (User);
+    // GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
+    // mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
+    // refused until the login_policy release feature opens.
+    rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
+    rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
+    rpc IssueEnrollmentCode(IssueEnrollmentCodeRequest) returns (IssueEnrollmentCodeResponse);
+    rpc ListUserVariants(ListUserVariantsRequest) returns (ListUserVariantsResponse);
+    rpc ClearIdentityBinding(ClearIdentityBindingRequest) returns (google.protobuf.Empty);
     rpc CreateToken(CreateTokenRequest)  returns (Token);
     rpc RevokeToken(RevokeTokenRequest)  returns (google.protobuf.Empty);
     // Whoami returns the authenticated caller's identity. Authenticated (NOT in
@@ -3664,7 +4175,7 @@ service LiteVirt {
     // ResetAdminPassword replaces the local admin's password hash and records a
     // `user.reset-admin` audit row. Local root only: loopback, this host's own
     // certificate, no bearer. It resets an existing admin and never creates one.
-    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (google.protobuf.Empty);
+    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (ResetAdminPasswordResponse);
     rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
     rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
     rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);
@@ -3704,6 +4215,12 @@ service LiteVirt {
     // ── Backup snapshots ──
     rpc BackupSnapshot(BackupSnapshotRequest)       returns (stream BackupSnapshotProgress);
     rpc RestoreFromBackup(RestoreFromBackupRequest) returns (stream RestoreFromBackupProgress);
+    // Single-file restore: browse a backup and extract files from it. The
+    // filesystem is read inside a throwaway restore VM, never on the host
+    // (docs/design/backup-file-restore.md). Same permission as a full restore
+    // of the VM or container; each extraction is audited.
+    rpc ListBackupFiles(ListBackupFilesRequest) returns (ListBackupFilesResponse);
+    rpc RestoreBackupFiles(RestoreBackupFilesRequest) returns (stream RestoreBackupFilesChunk);
 
     // ── Peer streaming backup transport (PR 4) ──
     // Move ONE manifest + only its missing chunks between two daemons over peer
@@ -3719,10 +4236,15 @@ service LiteVirt {
     // daemon to a repo it holds, under RBAC and on the audit record. The web
     // UI's /backups actions call these. Verbs: backup.verify, backup.gc,
     // backup.prune, backup.sync, all at `/`, legacy floor operator.
+    // SetBackupRepoCompression (verb backup.compression, same place and floor)
+    // creates a repo with zstd chunk compression, or turns zstd on for an
+    // existing one, through the release token's backup_zstd gate: it is the
+    // daemon-side half of `lv backup repo init|set-compression`.
     rpc VerifyBackupRepo(VerifyBackupRepoRequest)                 returns (VerifyBackupRepoResponse);
     rpc GarbageCollectBackupRepo(GarbageCollectBackupRepoRequest) returns (GarbageCollectBackupRepoResponse);
     rpc PruneBackupRepo(PruneBackupRepoRequest)                   returns (PruneBackupRepoResponse);
     rpc SyncBackupRepo(SyncBackupRepoRequest)                     returns (SyncBackupRepoResponse);
+    rpc SetBackupRepoCompression(SetBackupRepoCompressionRequest) returns (SetBackupRepoCompressionResponse);
     // The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
     // a read, so not audited.
     rpc ListBackupRepoSnapshots(ListBackupRepoSnapshotsRequest)   returns (ListBackupRepoSnapshotsResponse);
@@ -3736,6 +4258,13 @@ service LiteVirt {
     rpc ListContainers(ListContainersRequest)   returns (ListContainersResponse);
     rpc InspectContainer(InspectContainerRequest) returns (ContainerDetail);
     rpc ProbeContainerBackups(ProbeContainerBackupsRequest) returns (ProbeContainerBackupsResponse);
+    // A container's scheduled replicas in a repo's replica namespace on one
+    // host: a peer (failover), or a caller who may read its backups.
+    rpc ListContainerReplicas(ListContainerReplicasRequest) returns (ListContainerReplicasResponse);
+    // Remove SET-ASIDE container replicas (admin): the only way one goes.
+    rpc RemoveContainerReplicas(RemoveContainerReplicasRequest) returns (RemoveContainerReplicasResponse);
+    // Restore one replica as the container, stopped (admin; never a second copy).
+    rpc RestoreContainerReplica(RestoreContainerReplicaRequest) returns (RestoreContainerReplicaResponse);
     rpc PullOCIImage(PullOCIImageRequest)       returns (google.protobuf.Empty);
     rpc BackupContainer(BackupContainerRequest)   returns (stream BackupContainerProgress);
     rpc RestoreContainer(RestoreContainerRequest) returns (stream RestoreContainerProgress);
@@ -4009,6 +4538,16 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // RestoreRelay clears a relay-health demotion now (admin;
+    // colonelpanik/litevirt#175): it writes the host's relay_demoted row back
+    // to demoted=false, replicated and audited, and with hold_seconds > 0
+    // keeps the failover lease holder from demoting it again until the hold
+    // runs out. Refuses until relay_health_v1 has durably latched.
+    rpc RestoreRelay(RestoreRelayRequest)             returns (RestoreRelayResponse);
+    // GetRelayHealth lists every host with a relay demotion row or an
+    // operator hold (viewer): demoted or restored, since when and why, and
+    // any hold with its expiry.
+    rpc GetRelayHealth(google.protobuf.Empty)         returns (RelayHealthStatus);
     // GetUpgradeStatus reports, as the answering host sees them, every
     // capability token latched here, whether each blocks a rollback, and for
     // each release token which of its features have been used cluster-wide
@@ -4047,6 +4586,11 @@ service LiteVirt {
     // against an overlay backed by the chosen replica on the host that holds
     // it, then localizes via blockpull. Disaster recovery after host loss.
     rpc PromoteReplica(PromoteReplicaRequest) returns (stream PromoteReplicaProgress);
+    // ResolvePITOverlay decides, as an admin, what happens to a point-in-time
+    // copy overlay that could not be verified against its disk and holds the
+    // VM: commit it into the disk, or discard it. Without confirm it only says
+    // what it would do. Audited. lv resolve-pit-overlay.
+    rpc ResolvePITOverlay(ResolvePITOverlayRequest) returns (ResolvePITOverlayResponse);
 
     // ── tamper-evident audit log ──
     // VerifyAuditChain walks each host's audit sub-chain (a row's
@@ -4126,6 +4670,22 @@ service LiteVirt {
     // a dead import of theirs, unchanged since. The answer comes from the
     // answering host's record alone: it never opens a path the caller names.
     rpc ImportLeftoverStatus(ImportLeftoverStatusRequest) returns (ImportLeftoverStatusResponse);
+
+    // ── iSCSI LUN holders (peer-only) ──
+    //
+    // An iscsi pool is one LUN: every disk created on it IS that LUN, and a
+    // create takes it by a voter-majority claim (target_kind "lun"). A LUN
+    // already decided for another create is free again only once that create
+    // is proven gone: the creating host is asked which VMs hold the LUN — in
+    // its replica, and in a create of its own still in flight.
+    rpc LUNHolders(LUNHoldersRequest) returns (LUNHoldersResponse);
+    // ISCSILUNHolds is `lv host lun-holds [host]`: the durable holds a host
+    // keeps on iSCSI LUNs whose claim a rebuild or recreate there moved,
+    // including records it cannot read. With discard (admin, audited) —
+    // `lv host lun-hold discard <lun>` — it moves the records naming that LUN
+    // (or that token or file) aside, to iscsi-lun-holds/discarded/, and
+    // reloads the holds without a restart.
+    rpc ISCSILUNHolds(ISCSILUNHoldsRequest) returns (ISCSILUNHoldsResponse);
 
     // ── Re-create judgement (peer-only) ──
     //
@@ -4252,6 +4812,31 @@ message FailoverScopeRegion {
 
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
+}
+
+message RestoreRelayRequest {
+    string host         = 1;
+    int64  hold_seconds = 2;  // 0: no hold
+}
+
+message RelayHealthEntry {
+    string host       = 1;
+    bool   demoted    = 2;
+    string since      = 3;  // RFC 3339: when the current state began
+    string reason     = 4;
+    string hold_until = 5;  // RFC 3339, empty with no hold in force
+    string hold_by    = 6;
+}
+
+message RelayHealthStatus {
+    repeated RelayHealthEntry hosts = 1;
+    bool latched = 2;  // relay_health_v1 has latched: demotions are in use
+}
+
+message RestoreRelayResponse {
+    string host        = 1;
+    bool   was_demoted = 2;  // the host was demoted before this call
+    string hold_until  = 3;  // RFC 3339, empty with no hold
 }
 
 // UpgradeStatus is the answering host's view of the capability latches and the
@@ -4902,6 +5487,75 @@ message ImportLeftoverStatusResponse {
     // The names, among those asked, that the answering host's record shows a
     // dead import of its own left there, in exactly the asked state.
     repeated string dead = 1;
+}
+
+// LUNHoldersRequest asks a host which VMs hold any of the named LUNs.
+message LUNHoldersRequest {
+    // LUN keys (storage.FixedDevice), at most 64.
+    repeated string luns = 1;
+    // The incarnation a rebuild or a recreate replaces — name and created_at,
+    // both or neither. Only that incarnation's own disk rows hold nothing
+    // against the asker; no name alone exempts anything.
+    string replaced_name       = 2;
+    string replaced_created_at = 3;
+    // A moved claim's hold (its token) the asker needs to know this host still
+    // keeps on every asked LUN: the create of a re-created VM, taking its LUN
+    // over, asks the host that moved the claim before it goes on.
+    string hold_token          = 4;
+}
+message LUNHolder {
+    string lun       = 1;
+    string vm_name   = 2;
+    string disk_name = 3;
+    // The VM's host as recorded; for an in-flight create, the answering host.
+    string host_name = 4;
+    // A create on the answering host holds it and has not committed yet.
+    bool   in_flight = 5;
+    // The VM's uuid, where the answering host knows it.
+    string vm_id     = 6;
+    // The VM reads the LUN as its disk's base (a linked clone), not as its disk.
+    bool   backing   = 7;
+    // The incarnation (created_at) of the VM whose row holds the LUN; empty for
+    // an in-flight create or a domain.
+    string vm_created_at = 8;
+}
+message LUNHoldersResponse {
+    repeated LUNHolder holders = 1;
+    // The host that answered. The asker counts the answer only from the host
+    // it asked.
+    string answered_by = 2;
+    // The answering host still keeps the hold the request's hold_token names,
+    // on every asked LUN.
+    bool hold_present = 3;
+}
+
+// ISCSILUNHoldsRequest lists, or with discard moves aside, a host's iSCSI LUN
+// holds (`lv host lun-holds`, `lv host lun-hold discard`).
+message ISCSILUNHoldsRequest {
+    string host    = 1;  // "" = the host answering
+    // A LUN key (iscsi:<target>/lun<n>), a hold's token, or a record's file
+    // name: every record it names is moved aside. Admin only.
+    string discard = 2;
+}
+message ISCSILUNHold {
+    string file                = 1;  // the record, under <data_dir>/iscsi-lun-holds/
+    string token               = 2;
+    string vm_name             = 3;
+    map<string, string> luns   = 4;  // LUN key → disk name
+    string run_host            = 5;  // where the re-created VM runs
+    string since               = 6;  // RFC3339
+    string replaced_created_at = 7;
+    string new_created_at      = 8;  // the re-created incarnation, once learnt
+    bool   active              = 9;  // its re-create is still running on this host
+    string error               = 10; // set when the record cannot be read; the rest is empty
+}
+message ISCSILUNHoldsResponse {
+    string                host      = 1;
+    repeated ISCSILUNHold holds     = 2;
+    repeated string       discarded = 3;  // the records this request moved aside
+    // Why the holds cannot be read, if they cannot: while it is set the host
+    // answers no LUN question.
+    string                load_error = 4;
 }
 
 // PreflightRecreateVMRequest is the spec of a VM about to be re-created on the

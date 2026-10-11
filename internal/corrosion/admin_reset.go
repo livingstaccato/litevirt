@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // ErrNoLiveAdmin is ResetAdminPassword's refusal: there is no live admin
@@ -14,7 +18,9 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 	"On a node that has joined a cluster the admin credential replicates in; " +
 	"wait for this node to converge and try again. On a brand-new cluster the " +
 	"founder's `lv host init` mints it. If the admin account was deliberately " +
-	"deleted, it stays deleted")
+	"deleted, it stays deleted; name another admin-role account with " +
+	"`lv user reset-admin --user <name>` (the one the admin floor reinstated, " +
+	"if it did)")
 
 // ResetAdminPassword replaces the local admin account's password hash. It is
 // the one write behind `lv user reset-admin`, shared by the daemon's local-root
@@ -38,19 +44,239 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 // Nothing is lost by refusing: founding a cluster mints the admin through
 // `lv host init` and the daemon's founder path, and a joined node receives it by
 // replication.
-func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string) error {
-	existing, err := GetUser(ctx, c, "admin")
+//
+// clearTwoFactor (`--clear-2fa`) also removes every second factor and recovery
+// code of the account: the way back in for a sole admin who lost both under a
+// mandatory second-factor policy. It is part of the login rules, so it needs
+// the release feature capabilities.FeatureLoginPolicy, like every other write
+// they make.
+//
+// Everything — the lifecycle re-enable, the factor clear and the password — is
+// ONE batch (t1-auth-review m4): a reset that half-lands would leave the
+// account re-enabled with its old password, or with a new password it still
+// cannot use.
+//
+// run opens the release feature, and is asked to only when the reset writes
+// the login rules' data (--clear-2fa, or an admin that is disabled or has an
+// expiry): a plain password reset stays what it was before the release, and
+// does not mark the feature used. A nil run (reset-admin with litevirtd down,
+// which has no release-feature gate) writes none of that data and refuses a
+// reset that needs it.
+func ResetAdminPassword(ctx context.Context, c *Client, run FeatureRun, passwordHash string, clearTwoFactor bool) error {
+	return ResetAdminPasswordFor(ctx, c, run, "admin", passwordHash, clearTwoFactor)
+}
+
+// ErrNotAnAdmin is ResetAdminPasswordFor's refusal of an account whose role is
+// not admin: reset-admin recovers administrators, it is not a way for root to
+// set any user's password.
+var ErrNotAnAdmin = errors.New("not an admin-role account; reset-admin resets an administrator's password only")
+
+// ResetAdminPasswordFor is ResetAdminPassword for the admin-role account named
+// username (`lv user reset-admin --user`; "" is "admin"). It is how root gives
+// an account the admin floor reinstated its first credential: the floor never
+// brings back a deleted account's old password (re-review 3, I1a).
+func ResetAdminPasswordFor(ctx context.Context, c *Client, run FeatureRun, username, passwordHash string, clearTwoFactor bool) error {
+	_, err := ResetAdminPasswordReport(ctx, c, run, username, passwordHash, clearTwoFactor)
+	return err
+}
+
+// resetAdminGateWait bounds how long a plain reset-admin waits on the
+// login_policy gate when all it needs it for is correcting a forward-dated
+// cut-off (re-review 4, m-2; login-fu review Minor 1). Before that correction
+// the plain reset never asked the gate and answered at once; a first use whose
+// acknowledgements wait on an unreachable peer (30 s) must not turn
+// break-glass into a wait, or into a failure once the CLI's own deadline
+// cancels the call. The bound matches the login path's (loginPolicyGateWait).
+var resetAdminGateWait = 3 * time.Second
+
+// ResetAdminPasswordReport is ResetAdminPasswordFor, and also returns a note
+// for the operator: non-empty when the account's session or token cut-off is
+// dated in the future (a node's clock ran ahead) and was left in place,
+// because this process could not open the login_policy feature to correct it.
+// Logins (or new tokens) of the account stay refused until that time; the note
+// says so and what will clear it (login-fu review Minor 3).
+func ResetAdminPasswordReport(ctx context.Context, c *Client, run FeatureRun, username, passwordHash string, clearTwoFactor bool) (string, error) {
+	if username == "" {
+		username = "admin"
+	}
+	existing, err := GetUser(ctx, c, username)
+	if errors.Is(err, ErrAmbiguousUsername) {
+		return "", fmt.Errorf("%w. Two accounts are named like %q, and reset-admin cannot choose. As root, with "+
+			"credentials.json moved aside, run `lv user delete --exact %s` to list them with their ids, "+
+			"then `lv user delete --exact %s --id <ID>` for the one to remove, and run reset-admin again",
+			err, username, username, username)
+	}
 	if err != nil {
 		// A read that fails must not read as absence.
-		return fmt.Errorf("look up the admin account: %w", err)
+		return "", fmt.Errorf("look up the account %q: %w", username, err)
 	}
 	if existing == nil {
-		return ErrNoLiveAdmin
+		if username != "admin" {
+			return "", fmt.Errorf("%w (no live account named %q)", ErrNoLiveAdmin, username)
+		}
+		return "", ErrNoLiveAdmin
 	}
-	if err := UpdateUserPassword(ctx, c, "admin", passwordHash); err != nil {
-		return fmt.Errorf("update password: %w", err)
+	if existing.Role != "admin" {
+		return "", fmt.Errorf("%q is %w", existing.Username, ErrNotAnAdmin)
 	}
-	return nil
+	name := existing.Username
+	// The recovery path must also recover an admin that cannot log in for a
+	// reason other than its password: a disable or an expiry (user_lifecycle).
+	// Without this, disabling or expiring every administrator — which the
+	// SetUserAccount guard refuses, but two admins on two nodes can still
+	// race into — would leave the cluster with no supported way back in.
+	life, err := GetUserLifecycle(ctx, c, name)
+	if err != nil {
+		return "", fmt.Errorf("read the admin account's lifecycle: %w", err)
+	}
+	corrected := false // the write ran with the grant, so the cut-offs were corrected
+	write := func(ctx context.Context, g capabilities.FeatureGrant) error {
+		stmts, err := resetAdminStatements(ctx, c, g, name, life, passwordHash, clearTwoFactor)
+		if err != nil {
+			return err
+		}
+		if err := c.ExecuteBatch(ctx, stmts); err != nil {
+			return fmt.Errorf("reset the admin account: %w", err)
+		}
+		corrected = g.Check(capabilities.FeatureLoginPolicy) == nil
+		return nil
+	}
+	if !clearTwoFactor && life.Unrestricted() {
+		if !cutoffsAhead(life, time.Now()) {
+			return "", write(ctx, capabilities.FeatureGrant{})
+		}
+		// Only the forward-dated cut-off's correction needs the release
+		// feature (re-review 4, m-2). A gate that does not open — or does
+		// not open within resetAdminGateWait — must not cost root the plain
+		// password reset it had before: reset without the correction, on a
+		// context the gate's wait or the caller's deadline has not spent,
+		// and say that the cut-off stays.
+		wrote := false
+		var gateErr error
+		gctx, cancel := context.WithTimeout(ctx, resetAdminGateWait)
+		err := run.run(gctx, func(_ context.Context, g capabilities.FeatureGrant) error {
+			wrote = true
+			return write(context.WithoutCancel(ctx), g)
+		})
+		cancel()
+		if err != nil && !wrote {
+			gateErr = err
+			slog.Warn("reset-admin could not open the login_policy feature to correct a cut-off dated in the future; "+
+				"resetting the password only", "user", name, "error", err)
+			err = write(context.WithoutCancel(ctx), capabilities.FeatureGrant{})
+		}
+		if err != nil {
+			return "", err
+		}
+		if !corrected {
+			return cutoffLeftNote(name, life, gateErr), nil
+		}
+		return "", nil
+	}
+	return "", run.run(ctx, write)
+}
+
+// cutoffLeftNote tells the operator that reset-admin reset the password of
+// name but left its forward-dated cut-off in place, why, and what clears it.
+func cutoffLeftNote(name string, life UserLifecycle, gateErr error) string {
+	why := "litevirtd is not running here, so the login_policy feature could not be opened"
+	if gateErr != nil {
+		why = "the login_policy feature could not be opened here (" + gateErr.Error() + ")"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "The account %s has a cut-off dated in the future (a node's clock ran ahead):", name)
+	if CutoffAhead(life.SessionsNotBefore, time.Now()) {
+		fmt.Fprintf(&b, " no login works until after %s;", life.SessionsRetryAt())
+	}
+	if CutoffAhead(life.TokensNotBefore, time.Now()) {
+		fmt.Fprintf(&b, " no API token made before %s works;", life.TokensNotBefore)
+	}
+	fmt.Fprintf(&b, " it was left in place because %s. Run `lv user reset-admin --user %s` again on a node whose "+
+		"litevirtd is running, once the cluster upgrade has finished and every host is reachable "+
+		"(`lv cluster upgrade-status`), to correct it; or wait until then.", why, name)
+	return b.String()
+}
+
+// resetAdminStatements is ResetAdminPasswordFor's batch for name, whose
+// lifecycle is life. The login rules' part of it — the factor clear and the
+// re-enable — needs a grant for capabilities.FeatureLoginPolicy; without one
+// a reset that needs it is refused, wrapping ErrLoginPolicyGateClosed, and
+// nothing is changed.
+func resetAdminStatements(ctx context.Context, c *Client, g capabilities.FeatureGrant, name string, life UserLifecycle,
+	passwordHash string, clearTwoFactor bool) ([]Statement, error) {
+	granted := g.Check(capabilities.FeatureLoginPolicy) == nil
+	now := c.NowTS()
+	nowT := time.Now()
+	var stmts []Statement
+	if clearTwoFactor {
+		if !granted {
+			return nil, fmt.Errorf("%w: --clear-2fa needs the login_policy feature of %s, which this process "+
+				"cannot open (litevirtd is not running here, or the cluster upgrade has not finished); "+
+				"nothing was changed. Run it again with litevirtd running", ErrLoginPolicyGateClosed, capabilities.ReleaseToken)
+		}
+		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now)...)
+	}
+	if !life.Unrestricted() {
+		enable := enableUserStatements(g, name, "user.reset-admin", now)
+		if enable == nil {
+			// A row exists, so the feature is in use somewhere, but this
+			// process cannot open it: litevirtd is down, or this node's own
+			// latch has not formed yet. Writing without it would be the one
+			// write the gate exists to stop.
+			state := life.InactiveReason(time.Now().UTC())
+			if state == "" {
+				state = "set to expire at " + life.ExpiresAt
+			}
+			return nil, fmt.Errorf("%w: the admin account %q is restricted (%s), and this process cannot "+
+				"clear that (litevirtd is not running here, or its release feature gate has not opened); "+
+				"run reset-admin again with litevirtd running, or run `lv user enable %s` and "+
+				"`lv user expire %s never` from a node where it is",
+				ErrLoginPolicyGateClosed, name, state, name, name)
+		}
+		stmts = append(stmts, enable...)
+		// A re-enable is a session cut-off here as in SetUserLifecycle
+		// (rereview-2 m-3): nothing minted before it — on a node the disable
+		// had not reached — revives with it. Set back by the skew margin, as
+		// a re-create's is (ResetUserLifecycle), so the operator's login
+		// right after the reset works at once.
+		//
+		// It never moves the stored cut-off backwards (re-review 3, m-5): a
+		// disable written in the last few seconds, or by a node whose clock
+		// runs a little ahead, keeps its later cut-off, and the operator's
+		// login waits out that margin instead. One dated further ahead than
+		// the margin is clock error, and is replaced (resetCutoff).
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrSessionsNotBefore, resetCutoff(life.SessionsNotBefore, nowT),
+				"user.reset-admin", now}})
+	} else if granted && CutoffAhead(life.SessionsNotBefore, nowT) {
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrSessionsNotBefore, setBackCutoff(), "user.reset-admin", now}})
+	}
+	// A cut-off further ahead than the skew margin was written by a node
+	// whose clock runs ahead and refuses the admin's logins (or new tokens)
+	// until that time; every other write keeps it. Root replaces it here
+	// (re-review 4, m-2). Without the grant (litevirtd down, or its gate not
+	// open) the password is still reset, as before the login rules.
+	if granted && CutoffAhead(life.TokensNotBefore, nowT) {
+		stmts = append(stmts, Statement{SQL: userLifecycleUpsertSQL,
+			Params: []interface{}{name, UserAttrTokensNotBefore, setBackCutoff(), "user.reset-admin", now}})
+	}
+	if granted && cutoffsAhead(life, nowT) {
+		slog.Warn("reset-admin replaced a cut-off dated in the future: a node's clock ran ahead when it was written",
+			"user", name, "sessions_not_before", life.SessionsNotBefore, "tokens_not_before", life.TokensNotBefore)
+	}
+	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
+	if err != nil {
+		return nil, fmt.Errorf("update password: %w", err)
+	}
+	stmts = append(stmts, pw...)
+	return stmts, nil
+}
+
+// cutoffsAhead reports whether either of life's cut-offs is dated further
+// ahead than the skew margin (CutoffAhead).
+func cutoffsAhead(life UserLifecycle, now time.Time) bool {
+	return CutoffAhead(life.SessionsNotBefore, now) || CutoffAhead(life.TokensNotBefore, now)
 }
 
 // ResetAdminAuditDetail is the detail of a user.reset-admin row, shared with the

@@ -1,0 +1,4 @@
+{"smartctl":{"version":[7,4],"exit_status":0},"device":{"name":"/dev/nvme2","type":"nvme","protocol":"NVMe"},
+"model_name":"INTEL SSDPEKKW256G8","serial_number":"BTHH123","smart_support":{"available":true,"enabled":true},
+"smart_status":{"passed":true,"nvme":{"value":3}},
+"nvme_smart_health_information_log":{"critical_warning":3,"temperature":50,"available_spare":3,"available_spare_threshold":10}}

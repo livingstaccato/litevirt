@@ -41,8 +41,12 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const (
@@ -207,4 +211,91 @@ func DisksReferencingName(ctx context.Context, c *Client, name string) ([]DiskRe
 			Path: r.String("path"), BackingImage: r.String("backing_image"), BackingDisk: r.String("backing_disk")}
 	}
 	return out, nil
+}
+
+// lunResolvedKeyPrefix keys, in cluster_policies, the per-LUN checkpoint of
+// iSCSI LUN allocations (grpcapi vm_lun_claim.go): every allocation of the
+// LUN below the stored generation is decided and proven gone, so a create
+// starts its walk there.
+const lunResolvedKeyPrefix = "lun_resolved/"
+
+// GetLUNResolved returns the LUN's checkpoint in this replica, 0 when none.
+// It is a hint: a walker checks it against the voters before trusting it.
+func GetLUNResolved(ctx context.Context, c *Client, lun string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, lunResolvedKeyPrefix+lun)
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	g, err := strconv.ParseInt(rows[0].String("value"), 10, 64)
+	if err != nil || g < 0 {
+		return 0, nil // unreadable: no checkpoint, the walk starts at 0
+	}
+	return g, nil
+}
+
+// lunPlainDeleteKeyPrefix keys, in cluster_policies, the latest incarnation
+// (its created_at) of a VM on the LUN deleted by a plain delete — not as
+// part of a rebuild or recreate. A kept moved allocation that replaced that
+// incarnation or an earlier one is void: its VM was deleted, so the LUN is no
+// longer that VM's disk to take over (grpcapi keptForVM).
+const lunPlainDeleteKeyPrefix = "lun_plain_delete/"
+
+// GetLUNPlainDelete is the created_at recorded for lun's latest plain
+// delete in this replica, "" when none.
+func GetLUNPlainDelete(ctx context.Context, c *Client, lun string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, lunPlainDeleteKeyPrefix+lun)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("value"), nil
+}
+
+// RecordLUNPlainDelete records a plain delete of the incarnation created at
+// createdAt of a VM whose disk is lun. It keeps the latest: an earlier
+// incarnation never moves it back. A cluster that may not write
+// cluster_policies yet records nothing (it has no kept allocations either:
+// LUN claims open only after it can). It is iscsi_lun_claim's data, so it
+// takes the feature's grant (capabilities.FeatureISCSILUNClaim).
+func RecordLUNPlainDelete(ctx context.Context, c *Client, g capabilities.FeatureGrant, lun, createdAt, setBy string) error {
+	if err := g.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return err
+	}
+	if !c.MayWriteClusterPolicy() || createdAt == "" {
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return fmt.Errorf("incarnation time %q: %w", createdAt, err)
+	}
+	cur, err := GetLUNPlainDelete(ctx, c, lun)
+	if err != nil {
+		return err
+	}
+	if prev, perr := time.Parse(time.RFC3339Nano, cur); perr == nil && !at.After(prev) {
+		return nil
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, lunPlainDeleteKeyPrefix+lun, createdAt, setBy, c.NowTS())
+}
+
+// AdvanceLUNResolved moves the LUN's checkpoint forward to g. It never moves
+// it back (a concurrent writer's LWW win can, which only costs a longer walk),
+// and writes nothing where cluster_policies may not be written yet. It is
+// iscsi_lun_claim's data, so it takes the feature's grant.
+func AdvanceLUNResolved(ctx context.Context, c *Client, grant capabilities.FeatureGrant, lun string, g int64, setBy string) error {
+	if err := grant.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return err
+	}
+	if !c.MayWriteClusterPolicy() {
+		return nil
+	}
+	cur, err := GetLUNResolved(ctx, c, lun)
+	if err != nil {
+		return err
+	}
+	if g <= cur {
+		return nil
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, lunResolvedKeyPrefix+lun, strconv.FormatInt(g, 10), setBy, c.NowTS())
 }

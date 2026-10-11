@@ -50,3 +50,16 @@ func TestBuildDrainPlacementRequest_DropsPinToDrainingHost(t *testing.T) {
 		t.Errorf("AntiAffinity = %v, want [other] (constraints survive the pin drop)", req.AntiAffinity)
 	}
 }
+
+// A raw USB device binds a VM to the host being drained, so no target
+// qualifies; a mapped one limits it to the mapping's hosts.
+func TestBuildDrainPlacementRequest_CarriesUSBConstraints(t *testing.T) {
+	raw := corrosion.VMRecord{Name: "vm1", HostName: "draining-host", Spec: `{"usb_devices":[{"vendor":"046d","product":"c52b"}]}`}
+	if req := buildDrainPlacementRequest(raw, "draining-host", corrosion.CapacityPolicy{}); req.USBHost != "draining-host" {
+		t.Errorf("raw USB: USBHost = %q; want the draining host", req.USBHost)
+	}
+	mapped := corrosion.VMRecord{Name: "vm1", HostName: "draining-host", Spec: `{"usb_devices":[{"mapping":"dongle"}]}`}
+	if req := buildDrainPlacementRequest(mapped, "draining-host", corrosion.CapacityPolicy{}); len(req.USBMappings) != 1 || req.USBHost != "" {
+		t.Errorf("mapped USB: USBMappings %v USBHost %q; want [dongle] and no host", req.USBMappings, req.USBHost)
+	}
+}

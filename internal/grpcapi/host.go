@@ -178,6 +178,8 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// UNKNOWN bucket as an old binary — the fail-closed reading, and the
 		// honest one: that caller was told nothing either way.
 		PostureReported: disclosePosture,
+		// This build checks a migration's expect_* preconditions (failback.go).
+		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
 	}, nil
 }
 
@@ -471,17 +473,29 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// did not do what it was asked for them, so it does not end clean.
 	var failures int
 	var notStarted []string
+	// Drain records (failback.go) are written off this loop, after each frame:
+	// the release gate can take seconds, and a drain never waits for it.
+	addRecord, recordsQueued := s.startDrainRecords(ctx, len(drainJobs))
+	defer recordsQueued()
 	for range drainJobs {
 		progress := <-results
+		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
+		} else if progress.Status == "done" {
+			record = true // so that undrain can move it back
 		}
-		if err := stream.Send(progress); err != nil {
-			return err
+		serr := stream.Send(progress)
+		if record {
+			addRecord(progress.VmName, req.Name, progress.TargetHost)
+		}
+		if serr != nil {
+			return serr
 		}
 	}
+	recordsQueued()
 
 	// Check for VMs that were skipped (pinned, no placement target).
 	// If any VMs remain on the host, report a partial drain (#25).
@@ -523,6 +537,9 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
 		return placementReq
 	}
+	// A raw USB device binds the VM to the host being drained, so it has no
+	// target; a mapped one restricts it to the mapping's hosts.
+	applyUSBPlacement(&placementReq, spec, vm.HostName)
 	if p := spec.Placement; p != nil {
 		// Override PinHost — cannot pin to the host being drained.
 		if p.Host != "" && p.Host != drainHost {
@@ -649,7 +666,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			break
 		}
 	}
-	if hostLocal {
+	// A VM with USB passthrough is never moved live (as on Proxmox VE): a
+	// mapped device is re-resolved on the target by the cold move, and a raw
+	// one has no target at all (placement keeps it on its host).
+	if hostLocal || len(parseSpecOrNil(fresh.Spec).GetUsbDevices()) > 0 {
 		return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
 	}
 
@@ -674,12 +694,14 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	// Where it resolves the ISO to another file (a link, a library
 	// directory), the destination definition carries that file.
-	_, _, cdromSources, ierr := s.ensureDisksOnTargetISO(ctx, target.Name, vm.Name, nil, false, true)
+	srcTLS := s.migrationNetwork != "" && s.migrationTLSReady()
+	ens, ierr := s.ensureDisksOnTargetNet(ctx, target.Name, vm.Name, nil, srcTLS, true)
 	if ierr != nil {
 		progress.Status = "error"
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
 	}
+	cdromSources, targetCgroup := ens.remap, ens.cgroupMode
 	// The same arming every live move goes through (re-review R2-I3): the
 	// target puts the guest's NIC guards in force before it arrives.
 	armed, aerr := s.armMigrationTarget(ctx, &target, vm.Name)
@@ -688,10 +710,18 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		progress.Error = "target refused: " + aerr.Error()
 		return progress
 	}
+	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	params := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
-	armed.apply(&params)
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, params)
+	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources,
+		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
+		RBDLocators: s.rbdLocatorsOf(ctx, vm.Name)}
+	if route.direct {
+		mp.Direct, mp.TLS = true, true
+		mp.TargetAddress = corrosion.URIHost(route.addr)
+		mp.TLSDestination = target.Address
+	}
+	armed.apply(&mp)
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while
@@ -716,6 +746,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated; " + herr.Error()
 			return progress
 		}
+		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress
@@ -755,8 +786,14 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
-
-	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	reply, err := s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	if err != nil {
+		return nil, err
+	}
+	// Moves back, in the background, the VMs a drain moved away that opted in
+	// to returning (failback.go), and says so in the reply.
+	s.autoFailback(ctx, req.Name, reply)
+	return reply, nil
 }
 
 // SetHostLabels sets or removes labels on a host.
@@ -1124,16 +1161,23 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 
 	// Once credentials_split_v1 has latched, a supplied IPMI password is ALSO
 	// written to the host's sensitive-lane credential row, in the same batch
-	// and under the same updated_at. hosts.ipmi_pass keeps it too: a host
-	// rolled back one release reads that column and nothing else, and clearing
-	// it is a later release's step (docs/design/credentials-clear.md). Before
+	// and under the same updated_at. hosts.ipmi_pass keeps it too until
+	// credentials_clear_v1 latches: a host on a build before credentials_split_v1
+	// reads that column and nothing else (docs/design/credentials-clear.md). Before
 	// the latch no node may write the credential table (a previous-release
 	// peer cannot decode it), so the password goes to hosts.ipmi_pass alone.
 	// err is reused from the host lookup above.
 	// A clear writes an empty password to the credential row the same way
 	// (checked above that the gate is open): a live row with no secret, which
 	// readers serve as "none".
+	//
+	// Once credentials_clear_v1 has latched as well, the old column gets ''
+	// instead of the password, in the same statement shape: nothing reads it
+	// any more, and the operator-safe dump must not carry it.
 	if (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables() {
+		if req.IpmiPass != "" && s.db.MayClearCredentialColumns() {
+			args[3] = ""
+		}
 		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
 			{SQL: configureHostSQL, Params: args},
 			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},

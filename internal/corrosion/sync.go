@@ -325,6 +325,9 @@ func lwwOrder(localTS, incomingTS string) int {
 // syncPayload is the full-state dump sent to joining nodes.
 type syncPayload struct {
 	Tables []syncTable `json:"tables"`
+	// remints is receiver-local, never serialized: the re-mint judgements of
+	// the anti-entropy exchange this payload belongs to (remintScope).
+	remints *remintScope
 }
 
 type syncTable struct {
@@ -334,18 +337,21 @@ type syncTable struct {
 	// authority is receiver-local merge metadata derived from the complete
 	// payload. It is never serialized.
 	authority *mergeAuthorityManifest
+	// remints is receiver-local, never serialized: see syncPayload.remints.
+	remints *remintScope
 }
 
 // tableNames are the tables carried by the public full-state dump. Wholly
 // secret-bearing tables stay out of this list (see sensitiveTableNames). Three
 // tables here still have a secret COLUMN — hosts.ipmi_pass,
 // users.password_hash, tokens.token_hash. Once credentials_split_v1 has latched
-// the value also lives in a sensitive credential table, but this release keeps
-// writing the old column too so a host rolled back one release can still read
-// it; clearing it is a later release's step (credentials_split.go,
-// docs/design/credentials-clear.md). So the dump still carries them
-// unredacted, because it is the repair representation, which is one reason
-// GetStateDump/StreamStateDump are peer-only (host certificate).
+// the value also lives in a sensitive credential table, and the old column is
+// dual-written so a host on the build before can still read it. Once
+// credentials_clear_v1 has latched too, the old columns are emptied
+// (credentials_split.go, docs/design/credentials-clear.md) and the dump stops
+// carrying them. Until then it carries them unredacted, because it is the
+// repair representation, which is one reason GetStateDump/StreamStateDump are
+// peer-only (host certificate).
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"health_conditions", "health_evaluator_status", "host_capacity_observations",
@@ -414,6 +420,18 @@ var tableNames = []string{
 	// signed accepts whose certificates are public. Written only once
 	// voter_config_v1 has latched (voter_config.go).
 	"voter_configs",
+	// v64 account lifecycle (disabled, expires_at). Every node enforces it at
+	// authentication, so a node that missed a disable must be repaired here
+	// like any other cluster fact. Nothing secret. Written only through the
+	// release feature login_policy (user_lifecycle.go).
+	"user_lifecycle",
+	// v64 first-enrollment codes (hashed, node-bound, at most a day). Repaired
+	// here so every replica converges on one row per account — a re-issue on
+	// one node and a use on another otherwise leave two answers.
+	"user_enrollment_codes",
+	// v64 directory identity bindings: every node enforces them at login, so
+	// a node that missed one must be repaired. Nothing secret.
+	"user_identity_bindings",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -652,6 +670,7 @@ func (c *Client) mergeStatePayloadLWWWithAllowlist(payload *syncPayload, allowed
 	}
 	tables := authorityOrderedMergeTables(payload)
 	for _, table := range tables {
+		table.remints = payload.remints
 		m, s, err := c.mergeTable(table, allowedTables)
 		merged += m
 		skipped += s
@@ -1035,7 +1054,7 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		// so. See users_admin_guard.go for why this is keyed on created_at and why
 		// it is not a customMergeTables entry.
 		if floor, ok := credentialMergeGuards[table.Name]; ok {
-			keepLocal, reason, kErr := floor.refuse(tx, table, row, pkCols, pkIdx)
+			keepLocal, reason, kErr := floor.refuse(c, tx, table, row, pkCols, pkIdx)
 			if kErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, kErr
@@ -1047,6 +1066,9 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				// refuse this account's credential even if this chunk rolls back.
 				idx := columnIndexMap(table.Columns)
 				c.remints.note(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
+				if cellStr(row, idx, "password_hash") == "" {
+					table.remints.noteUnknown(cellStr(row, idx, "username"))
+				}
 				c.deferAfterCommit(tx, func() {
 					c.noteAdminRemintRefused(pathAE)
 					slog.Warn("anti-entropy: kept the local credential row",
@@ -1057,10 +1079,17 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 		// ...and the credential that belongs to a refused re-mint, which this
 		// lane carries apart from its users row (users_admin_guard.go).
-		if table.Name == "user_credentials" && c.userCredentialOfRefusedRemint(table, row) {
-			skipped++
-			c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
-			continue
+		if table.Name == "user_credentials" {
+			refused, rErr := c.userCredentialOfRefusedRemint(tx, table, row)
+			if rErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, rErr
+			}
+			if refused {
+				skipped++
+				c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
+				continue
+			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two

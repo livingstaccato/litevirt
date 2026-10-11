@@ -452,7 +452,7 @@ func TestAntiEntropy_PagedPullMergesClusterPoliciesFirst(t *testing.T) {
 	c := testClient(t)
 	ae := NewAntiEntropy(c, "", time.Minute)
 	f := &fakeRowsClient{t: t, src: src, recv: c}
-	if _, perr, merr := ae.pullAndMerge(ctx, f, []string{"projects", "cluster_policies"}, nil, nil); perr != nil || merr != nil {
+	if _, perr, merr := ae.pullAndMerge(ctx, f, []string{"projects", "cluster_policies"}, nil, nil, nil); perr != nil || merr != nil {
 		t.Fatalf("pullAndMerge: pull %v merge %v", perr, merr)
 	}
 	if len(f.requests) != 2 || !slices.Equal(f.requests[0], []string{"cluster_policies"}) {
@@ -802,7 +802,7 @@ func TestAntiEntropy_SensitivePullTakesClusterPoliciesFirst(t *testing.T) {
 	c := testClient(t)
 	f := &sensitiveRowsClient{fakeRowsClient: fakeRowsClient{t: t, src: src, recv: c}}
 	ae := NewAntiEntropy(c, "", time.Minute)
-	_, _, _ = ae.pullAndMerge(ctx, f, []string{"user_credentials"}, nil, &pb.SensitiveStateRequest{})
+	_, _, _ = ae.pullAndMerge(ctx, f, []string{"user_credentials"}, nil, &pb.SensitiveStateRequest{}, nil)
 	if len(f.calls) < 2 || f.calls[0] != "public:cluster_policies" || f.calls[1] != "sensitive" {
 		t.Fatalf("calls = %v, want cluster_policies pulled before the sensitive lane", f.calls)
 	}

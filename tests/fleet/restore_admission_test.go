@@ -434,10 +434,17 @@ func TestFleet_RestoreContainer_FailoverRelocationIsNotBlockedByQuota(t *testing
 	createSizedContainer(t, c, src, "ct-fail", "/acme", 0, 3000)
 	repo, ts := backupContainer(t, c, src, "ct-fail")
 
-	// Drive the relocation the way the failover coordinator does: from the
-	// coordinator daemon, over peer mTLS, carrying the attempt token it will use
-	// as provenance for the restored row (driveRemoteRestore's shape before
-	// split-brain enforcement is latched, where no proof accompanies it).
+	// Drive the relocation the way the failover coordinator does: it marks the
+	// source row for this restore, then calls from the coordinator daemon, over
+	// peer mTLS, carrying the attempt token it will use as provenance for the
+	// restored row (driveRemoteRestore's shape before split-brain enforcement
+	// is latched, where no proof accompanies it). The mark is the row the
+	// relocated container's NICs and host access come from.
+	row, _ := corrosion.GetContainer(ctx, src.DB, src.Name, "ct-fail")
+	row.State, row.StateDetail = "relocating", corrosion.RelocateRestoreDetail(dst.Name, "attempt-1")
+	if err := corrosion.UpsertContainer(ctx, src.DB, *row); err != nil {
+		t.Fatal(err)
+	}
 	relocCtx := metadata.AppendToOutgoingContext(ctx, relocateTokenHeader, "attempt-1")
 	st, err := c.PeerClient(src, dst).RestoreContainer(relocCtx, &pb.RestoreContainerRequest{
 		RepoPath: repo, Name: "ct-fail", Timestamp: ts, HostName: dst.Name, Start: true,

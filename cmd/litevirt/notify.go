@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -14,7 +16,7 @@ import (
 
 // newNotifyCmd manages operator notification targets + routes (#5).
 func newNotifyCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "notify", Short: "Manage operator notifications (webhook/Slack)"}
+	cmd := &cobra.Command{Use: "notify", Short: "Manage operator notifications (webhook/Slack/email)"}
 	cmd.AddCommand(newNotifyTargetCmd(), newNotifyRouteCmd(), newNotifyTestCmd())
 	return cmd
 }
@@ -25,20 +27,80 @@ func newNotifyTargetCmd() *cobra.Command {
 	return cmd
 }
 
+// emailTargetFlags are the SMTP settings of an email target.
+type emailTargetFlags struct {
+	host, tls, user, passwordFile, from string
+	port                                int
+	to                                  []string
+	skipVerify                          bool
+}
+
+// buildTargetConfig renders the stored JSON config for a target. The SMTP
+// password is read from a file (or "-" for stdin), never from a flag, so it
+// stays out of shell history and the process list.
+func buildTargetConfig(typ, url string, e emailTargetFlags, stdin io.Reader) (string, error) {
+	if typ != "email" {
+		if url == "" {
+			return "", fmt.Errorf("--url is required")
+		}
+		cfg, _ := json.Marshal(map[string]string{"url": url})
+		return string(cfg), nil
+	}
+	if url != "" {
+		return "", fmt.Errorf("--url does not apply to an email target")
+	}
+	if e.host == "" || e.from == "" || len(e.to) == 0 {
+		return "", fmt.Errorf("an email target needs --smtp-host, --from and at least one --to")
+	}
+	m := map[string]any{"host": e.host, "from": e.from, "to": e.to}
+	if e.port != 0 {
+		m["port"] = e.port
+	}
+	if e.tls != "" {
+		m["tls"] = e.tls
+	}
+	if e.skipVerify {
+		m["tls_skip_verify"] = true
+	}
+	if e.user != "" {
+		m["username"] = e.user
+	}
+	if e.passwordFile != "" {
+		var raw []byte
+		var err error
+		if e.passwordFile == "-" {
+			raw, err = io.ReadAll(stdin)
+		} else {
+			raw, err = os.ReadFile(e.passwordFile)
+		}
+		if err != nil {
+			return "", fmt.Errorf("read SMTP password: %w", err)
+		}
+		pw := strings.TrimRight(string(raw), "\r\n")
+		if pw == "" {
+			return "", fmt.Errorf("SMTP password file is empty")
+		}
+		m["password"] = pw
+	}
+	cfg, _ := json.Marshal(m)
+	return string(cfg), nil
+}
+
 func newNotifyTargetAddCmd() *cobra.Command {
 	var name, typ, url string
 	var disabled bool
+	var e emailTargetFlags
 	cmd := &cobra.Command{
 		Use:   "add",
-		Short: "Add a notification target (webhook or slack)",
+		Short: "Add a notification target (webhook, slack or email)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if url == "" {
-				return fmt.Errorf("--url is required")
+			cfg, err := buildTargetConfig(typ, url, e, cmd.InOrStdin())
+			if err != nil {
+				return err
 			}
-			cfg, _ := json.Marshal(map[string]string{"url": url})
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				t, err := c.CreateNotificationTarget(ctx, &pb.CreateNotificationTargetRequest{
-					Name: name, Type: typ, Config: string(cfg), Enabled: !disabled,
+					Name: name, Type: typ, Config: cfg, Enabled: !disabled,
 				})
 				if err != nil {
 					return fmt.Errorf("add target: %w", err)
@@ -49,8 +111,16 @@ func newNotifyTargetAddCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "target name (required)")
-	cmd.Flags().StringVar(&typ, "type", "webhook", "target type: webhook | slack")
-	cmd.Flags().StringVar(&url, "url", "", "webhook / Slack incoming-webhook URL (required)")
+	cmd.Flags().StringVar(&typ, "type", "webhook", "target type: webhook | slack | email")
+	cmd.Flags().StringVar(&url, "url", "", "webhook / Slack incoming-webhook URL (webhook and slack targets)")
+	cmd.Flags().StringVar(&e.host, "smtp-host", "", "SMTP server host (email targets)")
+	cmd.Flags().IntVar(&e.port, "smtp-port", 0, "SMTP port (default 587 starttls, 465 implicit, 25 none)")
+	cmd.Flags().StringVar(&e.tls, "smtp-tls", "", "starttls (default) | implicit | none; certificates are always verified unless --smtp-tls-skip-verify")
+	cmd.Flags().BoolVar(&e.skipVerify, "smtp-tls-skip-verify", false, "do not verify the SMTP server certificate (self-signed lab relay)")
+	cmd.Flags().StringVar(&e.user, "smtp-user", "", "SMTP username")
+	cmd.Flags().StringVar(&e.passwordFile, "smtp-password-file", "", "file holding the SMTP password ('-' reads stdin)")
+	cmd.Flags().StringVar(&e.from, "from", "", "sender address (email targets)")
+	cmd.Flags().StringSliceVar(&e.to, "to", nil, "recipient address, repeatable (email targets)")
 	cmd.Flags().BoolVar(&disabled, "disabled", false, "create disabled")
 	cmd.MarkFlagRequired("name")
 	return cmd

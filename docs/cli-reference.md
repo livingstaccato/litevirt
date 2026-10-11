@@ -29,7 +29,18 @@ lv session revoke <session-id>         # Revoke a session immediately
 lv 2fa enroll-totp --label <name>          # Enroll TOTP; prints otpauth URL + recovery codes
 lv 2fa disable --method totp --label <l>   # Drop a single factor
 lv 2fa ls [--user <name>]                  # List enrolled factors
+lv 2fa policy                              # Show the mandatory second-factor policy
+lv 2fa policy off|all|<realm>[,<realm>...] # Set it (admin); ends sessions in newly covered realms
+  [--allow-self-enroll --enroll-by <RFC3339>] # let a first factor be enrolled without a code until then
+lv 2fa enroll-code <username> [--ttl 1h]   # Admin: single-use first-enrollment code (max 24h), usable only through the node it names
+lv 2fa enroll-totp --code <code>           # Enroll a first factor from an enrollment-only session
 ```
+
+Under a policy that covers their realm, a login that presents no factor gets
+an enrollment-only session: if the account has no factor yet it can enroll one
+for itself (with an admin-issued code, unless self-enrollment is open) and
+nothing else, and the enrollment ends it. See `docs/auth.md`,
+"Mandatory second factor".
 
 WebAuthn enrollment is browser-only; use the `/account/2fa` page.
 
@@ -48,6 +59,11 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
+lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
+                                   #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
+lv cluster failback [on|off]       # Show or set whether an undrain moves drained VMs back (see
+                                   #   migration-failover.md → Failback after maintenance)
 lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
                                    #   rollback, and which release features are in use (see upgrades.md →
                                    #   Rolling back after a release token latched)
@@ -81,18 +97,25 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
                                           #   which also makes the node look like a
                                           #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
-lv host ls                                # List hosts
+lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host>                    # Return host to scheduling
+lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
+lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
                                           #   removes it, and reports the stranded recoveries that now retry
                                           #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
+lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
+  [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
+  [--revoke-old] [--force]                #   confirmed, then the old one revoked (owed while the
+  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it). See auth.md
+lv host revoke-cert <host> --serial <hex> # Revoke a certificate a renewal replaced; --force for the
+  [--force] [--grpc-port 7443]            #   live/presented one (fences the host)
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"
@@ -110,6 +133,9 @@ lv host superseded-disks <host>           # List the disk copies a failover set 
   [--purge] [--older-than 72h]            #   remove the ones neither retained nor held (admin)
   [--remove <copy>]...                    #   remove exactly these copies, even retained (admin)
   [--restore <copy>]                      #   put a copy back as its stopped VM's disk (admin)
+lv host lun-holds [host]                  # List the holds kept on iSCSI LUNs a rebuild or recreate moved
+lv host lun-hold discard <lun> --yes      # Move a hold aside so the LUN can be taken again (admin, audited)
+  [--host <host>]                         #   on that host (default: the one host holding it)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
@@ -141,8 +167,13 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu <n>             # vCPUs (default 2)
   --cpu-mode <mode>     # host-passthrough|host-model|custom (default host-model)
   --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
+  --cpu-limit <cores>   # cap total CPU at this many host cores (fractions ok, at most --cpu)
+  --cpu-shares <n>      # CPU weight under contention, 1-10000, default 100 (cgroup v2 cpu.weight = Proxmox cpuunits)
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
+  --storage <pool>      # Storage pool for the root disk (default: the host's local disks)
+  --overwrite           # iscsi pool + --image: write the image over a LUN that is not blank
+                        #   (destroys what it holds; a LUN another VM uses is never written)
   --host <name>         # Target host (auto-placed if omitted)
   --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready
@@ -203,6 +234,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
   [--restart-max-attempts N --restart-delay 5s --restart-window 1h]
   [--restart none]                           # clear the policy
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
+lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (live; 0 clears the cap / restores the weight)
+lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]
@@ -211,6 +244,11 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);
                                              # with it set, --cpu grows a RUNNING VM's
                                              # vCPUs live up to the ceiling
+  [--memory-hotplug-max N]                   # virtio-mem hot-add ceiling (0 = off); with
+                                             # it set, --memory changes a RUNNING VM live
+  [--usb <vendor>:<product>] [--usb-port <bus>-<port>] [--usb-mapping <name>]
+                                             # REPLACE the USB passthrough list (repeatable)
+  [--clear-usb]                              # remove every USB device
   [--secure-boot] [--tpm] [--force]          # toggle Secure Boot / vTPM (stopped).
                                              # Once firmware state exists, --force is
                                              # required to change them (enabling SB can
@@ -219,8 +257,25 @@ lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
 lv rebuild <vm>                              # Recreate from stored spec
 lv cutover <vm>                              # Snapshot-and-replace update
 lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
+lv disk-io <vm> [--disk <name>] [--total-bps <rate>] [--read-bps <rate>] [--write-bps <rate>]
+            [--total-iops <n>] [--read-iops <n>] [--write-iops <n>]
+            [--read-bps-max <rate>] [--write-iops-max <n>] [--burst-seconds <n>] [--clear]
+                                             # Throttle a disk's I/O, live on a running VM
 lv stats <vm>                                # VM resource statistics
 ```
+
+`lv disk-io` sets one disk's I/O limits (default disk `root`): bytes per second
+(`--total-bps`, `--read-bps`, `--write-bps`, with a K/M/G suffix such as `50M`) and
+operations per second (`--total-iops`, `--read-iops`, `--write-iops`), each with a
+`-max` burst ceiling above the sustained rate and `--burst-seconds` for how long it
+lasts. A running VM is throttled live and its definition updated; the limits are kept
+in the VM's spec, so a restart, a failover start and a migration carry them. **Each call
+sets the complete set of limits for the disk**: one you do not name is unlimited
+afterwards, and `--clear` removes them all. A `--total-*` limit cannot be combined with
+the `--read-*` / `--write-*` of the same kind. A disk the VM's spec does not list yet (the implicit
+root disk, a hot-plugged one) is throttled too; its entry is made in the spec. If a step
+fails partway the previous limits are put back and the spec is left as it was. The same limits are the `iotune:` key of a compose disk; see
+[compose.md](compose.md).
 
 `lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The replaced
 VM is deleted first, and a delete is a SOFT delete, so its rows still hold the primary
@@ -310,7 +365,7 @@ lv ct rm <name> --force                               # a running container: sto
 lv ct ls
 lv ct inspect <name> [--host <h>] [--size] [-o json]  # one container: limits, privilege, confinement, NICs, rootfs, snapshots, backups
 lv ct exec <name> -- <cmd> [args...]
-lv ct backup <name> --repo <dir>                       # full rootfs backup → dedup chunk store
+lv ct backup <name> --repo <dir> [--bwlimit <rate>]    # full rootfs backup → dedup chunk store
 lv ct restore <name> --repo <dir> --timestamp <ts> [--start]  # rebuild from a backup manifest
 lv ct migrate <name> <target-host> --repo <src-dir>    # cold-migrate (stop → stream → start)
 lv ct snapshot create <name> <snapshot>                # freeze+tar point-in-time snapshot
@@ -322,9 +377,14 @@ lv ct clone <source> <new-name> [--project p] [--start] # full-copy clone with a
 lv ct pull <image> --dest <name> [--project p]       # stage an OCI image; with --project only p (and Admin) may use it
 lv ct convert <name> --unprivileged [--confinement default]  # stopped ct → an id range of its own
 lv ct convert <name> --confinement default|legacy      # change confinement (legacy: Admin only)
+lv ct convert <name> --mount <host>:<ct>[:rw] --device <host>  # replace host mounts/devices (Admin only)
+lv ct convert <name> --clear-host-access               # remove them
 lv ct convert <name>                                  # finish an interrupted convert (the start refusal names it)
 lv ct create <name> --privileged                       # no user namespace, as earlier releases (Admin only)
 lv ct create <name> --confinement legacy               # AppArmor nesting, template seccomp/caps (Admin only)
+lv ct create <name> --mount /srv/data:/data[:rw]       # host bind mount, read-only unless :rw (Admin only;
+                                                       # under the host's containers.bind_mount_paths)
+lv ct create <name> --device /dev/ttyUSB0[:/dev/ttyS0] # host device node (Admin only; containers.device_paths)
 ```
 
 `--local` runs against the local lxc-* binaries instead of the gRPC service
@@ -527,7 +587,11 @@ path. See `docs/storage.md`, "Installer ISOs".
 
 ```bash
 lv move-volume <vm> <disk> <target-pool>       # Move a disk between pools (live or offline)
-lv replicate-volume <vm> <disk> <target-pool>  # Crash-consistent point-in-time copy
+lv replicate-volume <vm> <disk> <target-pool>  # Point-in-time copy: plain if shut off, else a backup session or external snapshot; a last-resort -U copy is reported NOT point-in-time
+lv resolve-pit-overlay <vm> <disk>                       # Admin: the verdict on a point-in-time overlay that holds a VM, and what each action would do (see backups.md)
+lv resolve-pit-overlay <vm> <disk> --commit --confirm    # Commit it; refused unless the verdict says it is safe (--force-commit overrides, experts only)
+lv resolve-pit-overlay <vm> <disk> --commit --force-commit --overwrite-newer-writes --confirm  # Expert only: commit an overlay already in the disk, over the guest's newer writes
+lv resolve-pit-overlay <vm> <disk> --discard --confirm   # Discard it; of a half-written disk only with --accept-torn-disk
 
 # Migrate every VM's volumes in a stack to a different pool (rolling, online):
 lv stack migrate-volumes <stack> --to <pool>
@@ -754,12 +818,31 @@ lv run --name web --image ubuntu --memory 2048 --min-mem 1024 --max-mem 4096
 lv set-memory <vm> <MiB>                   # live balloon target, within [min, max]
 ```
 
+## Memory hot-add and USB passthrough
+
+```bash
+# virtio-mem: boot with 2 GiB, raise live up to 16 GiB
+lv run --name db --image ubuntu --memory 2048 --memory-hotplug-max 16384
+lv set-memory db 8192                      # plug 6 GiB into the running guest
+lv update db --memory 4096                 # the same, through update
+
+# USB: raw devices bind the VM to its host (pin it); a mapping follows the VM
+lv run --name pos --image ubuntu --host node-1 --usb 046d:c52b --usb-port 1-2
+lv mapping create dongle && lv mapping add-device dongle usb:096e:0006 --host node-1
+lv run --name lic --image ubuntu --usb-mapping dongle
+lv update lic --clear-usb                  # stopped, or --restart-if-needed
+```
+
+See docs/passthrough.md.
+
 ## Resource mappings (cluster-wide passthrough device aliases)
 
 ```bash
 lv mapping create <name> [--description <text>]
-lv mapping add-device <name> <pci-address> [--host <h>] [--vendor <v>] [--device <d>]
-lv mapping rm-device <name> <pci-address> [--host <h>]
+lv mapping add-device <name> <address> [--host <h>] [--vendor <v>] [--device <d>]
+                                           # address: a PCI address, or usb:<vendor>:<product>
+                                           # / usb:<bus>-<port> (a mapping is PCI or USB)
+lv mapping rm-device <name> <address> [--host <h>]
 lv mapping ls
 lv mapping rm <name>
 # Reference from a VM: `lv run … ` device spec / compose `devices: [{mapping: <name>}]`
@@ -794,6 +877,9 @@ lv run … --restart on-failure --restart-max-attempts 5 --restart-delay 5s --re
 ```bash
 lv notify target add --name ops-slack --type slack --url <incoming-webhook-url>
 lv notify target add --name ops-hook --type webhook --url <url>
+lv notify target add --name ops-mail --type email --smtp-host smtp.example.com \
+    --smtp-user lv@example.com --smtp-password-file /root/smtp.pw \
+    --from litevirt@example.com --to ops@example.com --to oncall@example.com
 lv notify target ls
 lv notify route add --pattern "backup.*" --target <target-id> --min-severity error
 lv notify route add --pattern "*" --target <target-id> --min-severity warn
@@ -801,21 +887,33 @@ lv notify route ls
 lv notify test <target-id>
 lv notify route rm <id>
 lv notify target rm <id>
-# Events: backup.failed, host.fenced, replication.failed, quota.exceeded. See notifications.md.
+# Events: backup.failed, host.fenced, host.recovery.stalled, replication.failed, quota.exceeded. See notifications.md.
 ```
 
-## ACME (web UI cert)
+## Web UI certificate (ACME, custom)
 
 ```bash
 lv acme status [host]   # show the TLS cert the UI is serving (subject/issuer/SANs/expiry)
-# Configure under `acme:` in the daemon config; see configuration.md.
+# Configure under `acme:` in the daemon config (http-01 or dns-01); see configuration.md.
+lv host ui-cert set <host> --cert chain.pem --key key.pem [--name <fqdn>]...
+                        # install a corporate-PKI certificate for the UI: validated
+                        #   (key, chain order, expiry, names), key 0600, served at once
+lv host ui-cert clear <host>   # back to ACME / the cluster certificate / plain HTTP (ui_tls)
 ```
 
 ## Backups
 
 ```bash
 # Repository management (host-local)
-lv backup repo init <path> [--encrypted --key-file <file>]
+lv backup repo init <path> [--encrypted --key-file <file>] [--compression zstd|none] [--force]
+#   Default: a local, uncompressed repo, as on every release. zstd (feature
+#   backup_zstd) is explicit, and refused until the cluster's release token
+#   has latched. zstd marks the repo schema 2, which releases
+#   without backup compression refuse to open; --force allows it before the
+#   latch, locally, for a repo no older host reads. Without --force a zstd
+#   repo is created by the connected host's daemon (release feature gate), so
+#   <path> is a path on that host, which the command prints.
+lv backup repo set-compression <path> zstd|none [--force]   # for chunks written from now on; zstd gated as above
 lv backup repo ls <path>
 lv backup repo verify <path>
 lv backup repo gc <path>
@@ -832,11 +930,16 @@ lv backup schedule ls
 lv backup schedule rm [vm] --repo <repo> [--scope vm|pool|project|cluster] [--pool <p>] [--project <p>]
 
 # Push / restore via the daemon
-lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off]
+lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce auto|off] [--bwlimit <rate>]
+#   --bwlimit 50MiB: cap this backup's read (and remote send) rate, per second;
+#   the repo's backup_bwlimits limit still applies, and the lower one wins.
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
 lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+# Single files, read inside a throwaway restore VM (never mounted on the host):
+lv backup file-ls --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] [/<volume>/<dir>]
+lv backup file-restore --repo <r> --vm <v>|--ct <c> --timestamp <ts> [--disk <d>] <path>... -o <archive.tar|-> [--max-bytes <size>]
   [--in-place]        # restore over the VM's own disk from its record (VM stopped)
   [--target-path <f>] # admin only; never an existing file but the VM's own disk (then as --in-place). Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \
@@ -861,9 +964,16 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
   [--incremental]          # transfer only dirty extents (raw replicas)
   [--auto-promote]         # failover may promote the freshest replica on host loss
   [--disabled]             # create the schedule disabled
-  [--scope vm|pool|cluster|project] [--pool-name <p>] [--project-name <p>]
+  [--scope vm|pool|cluster|project|container] [--pool-name <p>] [--project-name <p>]
+  [--container]            # a container: --target-host is the peer, --target-pool the backup repo on it
 lv replication schedule ls
-lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name <p>] [--project-name <p>]
+lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
+
+# A container's replicas on its replica host; restore one, or remove set-aside/orphaned ones (admin).
+lv replication replicas <container> --target-pool <repo> [--host <h>] [--project-name <p>]
+  [--restore <timestamp>]  # lay that replica down as the container, stopped (never a second copy)
+  [--remove <timestamp>]   # a SET-ASIDE or ORPHANED replica to remove (repeatable; asks first)
+  [--yes]                  # remove without asking
 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
@@ -872,6 +982,7 @@ lv replication promote <vm>
   [--new-name <name>]         # promote alongside a still-running original
   [--no-localize]             # boot off an overlay backed by the replica (fast; pins it)
   [--force]                   # promote even if the original is on a healthy host
+  [--accept-not-point-in-time] # promote a replica recorded as not point-in-time (a -U copy of a running disk)
 ```
 
 ## Clones and templates
@@ -884,7 +995,33 @@ lv clone <source> <new-name>       # Clone a template or stopped VM into a new V
   [--ip <ip>]                      # static IP for the clone's first NIC (default: DHCP)
   [--start]                        # start the clone after creation
   [--snapshot <name>]              # clone from this snapshot of the source
+  [--host <host>]                  # end up on another host: a full copy, moved there like `migrate --cold`
+  [--pool <pool>]                  # put the clone's disks in this file-based pool on that host
 ```
+
+`--host` makes the clone where the source's disks are, as a full copy (a linked
+clone cannot span hosts), then moves it to the host as `lv migrate <vm> <host>
+--cold` moves a stopped VM: its disks stream over the cluster's mTLS connection
+with a checksum, its domain is defined there, and the staged copy is removed
+once the handoff commits. The source host therefore needs room for the copy
+while it travels. `--pool` puts the disks in a pool: directly on the source's
+host, or, on another host, by a move-volume after the move. The caller needs the
+clone's permissions and the project must be allowed to use the pool; a clone on
+another host also needs `vm.migrate` and `vm.delete` on the new VM, `vm.move` for
+a pool there and `vm.start` for `--start`. All are checked as you, before any
+copy starts. The staged copy is admitted against the source host's free space
+with the same headroom a cold migration leaves, and refused if it would take the
+filesystem that holds running guests' disks that close to full. A request that
+entered at another node is carried to the source host with your identity; where
+forwarded identity is not enforced it is refused rather than run as a cluster
+peer. If the move fails, the staged copy is removed and nothing is left behind (a
+crash of the source host's daemon between staging and the move leaves the staged
+clone as a complete stopped VM there, whose events show `vm.clone.staged` without
+`vm.clone.moved`; `lv rm` removes it); the staged copy and a copy into a pool
+are admitted for space with headroom, a same-host clone is as it always was;
+if the move succeeded and a later step (the pool, the start) fails, the VM is
+complete on its host and the error names the command that finishes the job
+(`lv move-volume`, `lv start`).
 
 ## GitOps
 
@@ -983,26 +1120,47 @@ show the VM deleted and no domain of that name is defined there.
 ```bash
 lv user create <username> --role admin|operator|viewer
 lv user ls
-lv user delete <username>
+lv user delete <username>             # Revokes its sessions and API tokens in the same write
+lv user delete <username> --exact     # List the accounts named like <username> (case-duplicates) with ids; deletes nothing
+lv user delete <username> --exact --id <id>   # Delete the one chosen by id (admin, audited)
+lv user unbind <username> <realm>     # Clear an LDAP/OIDC account's directory bindings (all of them, a conflict too); next login binds afresh (admin)
 lv user passwd [username]           # Change your own password (or, as admin, another user's)
   [--old-password <p>] [--new-password <p>]   # prompts if unset; old not needed for an admin reset
 lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
 lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
+                                   # It also re-enables a disabled or expired admin account, and logs it out everywhere
+lv user reset-admin --clear-2fa    # Also remove the admin's second factors and print an enrollment code
+lv user reset-admin --user <name>  # Reset another admin-role account, e.g. the one the admin floor reinstated with no credential
+lv user disable <username>         # No login; sessions ended, sessions and API tokens refused (admin)
+lv user enable <username>          # Re-enable; API tokens work again, ended sessions stay ended (admin)
+lv user expire <username> <RFC3339|never>   # Stop authenticating at that instant; "never" clears it (admin)
 ```
+
+`lv user ls` shows each account's STATUS (`active`, `disabled`, `expired`) and
+EXPIRES. Disable and expiry are refused for the last admin that can log in,
+enabled with no expiry, and until the cluster upgrade has finished (the release feature
+`login_policy`; `lv cluster upgrade-status`). See
+`docs/auth.md`, "Account lifecycle".
 
 ## Roles (path-based RBAC)
 
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice]
+lv role ls [--principal user:alice] [--role <role>]
 ```
 
 Principals are `user:<name>` or `group:<name>@<realm>`. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
+
+A cluster admin may grant anything anywhere. A caller holding `perm.modify`
+at a path (the `PermissionAdmin` role) may grant and revoke there and below,
+never a role carrying a verb it does not itself hold there, never a
+principal's first binding or last. See `docs/auth.md`, "Delegated
+administration".
 
 ## Projects (tenancy)
 

@@ -28,6 +28,45 @@ Roles map to *principal IDs*: `user:<subject>@<realm>` and
 `group:<name>@<realm>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
 
+### External users and local accounts share one name space
+
+A user's first LDAP or OIDC login creates a row in the users table with no
+local password (a "shadow"), so roles and audit can name it. Because users
+are keyed by name alone, an external login is refused when the name belongs
+to a local account, which would otherwise hand the external principal that
+account's role.
+
+Once `credentials_clear_v1` has latched (docs/upgrades.md), every local
+account's users row also has an empty password column, so a host decides
+"external" only on positive evidence: an empty credential row for the user,
+written when the shadow was made after `credentials_split_v1`, by a host's
+first split pass for a shadow that host could vouch for, or by an
+administrator. When a host cannot tell, the login is refused:
+
+- `Unavailable` ("retry") while the host has not synced or not finished its
+  first credentials pass: retry, or log in through another host;
+- `FailedPrecondition`, naming the command below, when the host is up to date
+  and still holds no evidence. That is an external user created before
+  `credentials_split_v1` latched on a host that has since been removed without
+  running this build. If the user is external, an administrator marks it:
+
+  ```bash
+  lv user mark-external <username>
+  ```
+
+  The command is audited (`user.mark-external`, refusals included),
+  admin-only, refused while the host it runs on sees any local password for
+  the name (in the users row, or in a credential row, live or deleted), and
+  refused while that host has not caught up with its peers. The mark is an
+  empty credential row with a timestamp older than any real write, so it never
+  replaces a password. It holds for the account as it stands when it is made:
+  if the user is deleted and created again, the login is refused again until an
+  administrator decides again.
+
+A host that has not synced its users table yet also refuses to create a NEW
+shadow (`Unavailable`): "no row under this name" there may only mean the
+local account has not arrived, and the new row would replace it everywhere.
+
 ### OIDC realm keys
 
 Under `auth.realms[].oidc:`. `issuer_url`, `client_id`, and `redirect_url` are
@@ -53,17 +92,83 @@ Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
 
 | Key | Purpose |
 |---|---|
-| `user_filter` | LDAP filter selecting user entries (e.g. `(objectClass=person)`). |
+| `user_filter` | LDAP filter selecting the typed user's entry; `%s` stands for the typed name, e.g. `(&(objectClass=person)(uid=%s))`. Without `user_login_attr`, the attribute `%s` is compared against is the one whose value must equal the typed name, so a filter with no `%s` — `(objectClass=person)` alone — matches no login, and one with `%s` inside a longer value (`(userPrincipalName=%s@corp.example)`) needs `user_login_attr` (see the upgrade note in docs/upgrades.md). |
 | `group_base_dn` | Subtree searched for groups. |
 | `group_filter` | LDAP filter selecting group entries. |
-| `user_name_attr` | Attribute read as the login/subject name. |
+| `user_login_attr` | Attribute that must hold the typed login name. When set, the entry must carry it with exactly one value, equal to the typed name ignoring ASCII case and surrounding spaces; an entry where it is missing or multi-valued is refused, with no fall-through to other attributes. Unset: some value of an attribute `user_filter` matches the typed name against (`(uid=%s)` → `uid`), or the entry DN's RDN when its attribute is one of those, must equal the typed name that way. A directory that matched the filter by a looser rule (width or accent folding, a second attribute) does not log in. |
+| `user_name_attr` | Attribute read as the display name. |
 | `user_mail_attr` | Attribute read as the email address. |
 | `user_group_attr` | Attribute on the user entry listing group membership (typically `memberOf`). |
 | `group_name_attr` | Attribute on a group entry holding its name. |
 | `skip_tls_verify` | Disables certificate verification on the LDAPS connection. **Leave off outside a lab** — it makes directory traffic, including bind credentials, trivially interceptable. |
 
-As with OIDC, changing `user_name_attr` or `group_name_attr` re-keys principal
-ids and invalidates existing role bindings.
+The account is named by the typed login name, normalized (ASCII lower case,
+surrounding spaces trimmed), exactly as before this release: upgrading re-keys
+no account. Changing `group_name_attr` re-keys group principal ids and
+invalidates existing group role bindings.
+
+**Directory identity binding.** An LDAP or OIDC account is bound to the
+directory entry it is reached through, by an id the directory never reuses:
+for LDAP the entry's `entryUUID` (OpenLDAP), `objectGUID` (Active Directory)
+or `nsUniqueId` (389 DS), and only when the entry has none of those, its full
+DN (lower-cased) — a weaker id, since a renamed or moved entry gets a new one;
+for OIDC the token's issuer and subject. The binding is written on the
+account's first successful login after the upgrade (once the release feature
+`login_policy` has opened; before that, logins proceed unbound, as on the
+previous release).
+After that, a login that name-matches the account through an entry with a
+different id is refused with `PermissionDenied` and audited as
+`auth.identity_mismatch`, whatever its password; and one entry is never bound
+to two accounts of a realm, so a second name on the same entry (a second
+`uid` value, another attribute) cannot log in as another account. The search
+for the typed name must return exactly one entry, or the login is refused.
+When the directory re-creates a user's entry (a new id), an admin clears the
+binding with `lv user unbind <username> <realm>` (audited as
+`user.identity_unbind`), and the next login binds to the entry it comes
+through; a refused login's message names that command with its arguments.
+Deleting the account clears its bindings too. For one spelling of a
+case-duplicate pair, pass the exact stored name (`lv user delete --exact
+<name>` lists them).
+
+*Every id the entry carries counts.* An LDAP account bound under one id still
+logs in when the directory starts returning another one first — 389 DS
+enabling its `entryUUID` plugin, an ACL change that exposes `entryUUID` where
+only `nsUniqueId` or the DN was readable: the binding holds when it equals
+any of the entry's `entryUUID`, `objectGUID` and `nsUniqueId`, or its DN when
+the binding itself was made by DN. A DN never stands in for an immutable id,
+so an entry deleted and re-created at the same DN is still refused. These
+attributes must be server-assigned (they are on OpenLDAP, Active Directory and
+389 DS); a schema that lets users write them would let one entry claim
+another's id. OIDC has no second id: changing the provider's issuer URL
+changes every account's id, and each account then needs `lv user unbind
+<name> oidc:<realm>` (or keep the old issuer URL).
+
+*First binder wins.* A node that has not yet received an account's binding
+(replication lag, a partition) binds the entry that logs in through it. That
+binding is added beside the first rather than replacing it: every node
+resolves the bindings the same way, and the earliest holds when every other
+was made more than 5 s (`SessionCutoffSkewMargin`) after it. A login through
+the binding that holds clears the later ones. Bindings closer together than
+that cannot be ordered by clocks, so neither holds: the account's logins
+through that realm are refused, naming `lv user unbind <name> <realm>`, until
+an admin clears them. Every conflict is audited as `auth.identity_conflict`.
+One entry bound to two accounts by two nodes is decided the same way. A
+session minted through the later binding on the lagging node, before the
+first binding reached it, ends when a login through the binding that holds
+clears the later ones: that login also sets the account's session cut-off,
+so every other session of the account from before it ends too (one logout
+of the legitimate user's other sessions, once per conflict). Until that
+login it lives, unless an admin revokes it (`lv session revoke`, or
+`lv user disable`).
+
+*Bindings are per realm.* An account bound in `ldap:corp` is still reachable
+by a first login of the same name through any other external realm, which
+binds it there: the name, not the realm, is the account (as on the previous
+release, `EnsureUserShadow`). One person using two realms is legitimate, but
+two external realms whose namespaces overlap and are governed differently hand
+accounts across: a name created in the laxer directory logs in as the account
+the stricter one's user owns. Configure such realms only with disjoint
+namespaces.
 
 ## Path-based RBAC
 
@@ -100,7 +205,8 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | Auditor | `*.read`, `audit.export` |
 | BackupOperator | `backup.*`, `snapshot.*`, `vm.read` |
 | NetworkAdmin | `network.*`, `lb.*`, `sg.*` |
-| NoAccess | (none) |
+| PermissionAdmin | `perm.modify` (delegated administration; see below) |
+| NoAccess | (none): grants nothing and denies nothing (bindings are union-only); it keeps a principal bound, off its legacy-role fallback |
 
 `--allow-overcommit` (CreateVM/StartVM/UpdateVM) additionally requires
 `vm.overcommit`: bypassing the host capacity check is an operator-level
@@ -158,7 +264,7 @@ binding can:
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
   a NIC (`lv sg bind`) is `network.update` on the VM's own path.
 - **Backup repository maintenance** (`backup.verify`, `backup.gc`,
-  `backup.prune`, `backup.sync`) is checked at `/`. These are the
+  `backup.prune`, `backup.sync`, `backup.compression`) is checked at `/`. These are the
   `VerifyBackupRepo`, `GarbageCollectBackupRepo`, `PruneBackupRepo` and
   `SyncBackupRepo` RPCs, which the web UI's `/backups` actions call. A repo holds
   every project's backups, so a project-scoped grant cannot reach it. Operator
@@ -204,6 +310,64 @@ mutated on a **peer** — the effective bound on a peer-side change is one
 successful reload interval after it becomes locally visible. Deleting a user
 tombstones that user's role bindings in the same transaction, so a deleted
 account cannot retain access through a lingering binding.
+
+### Delegated administration (`perm.modify`)
+
+`GrantRole` and `RevokeRole` are open to a cluster admin, and to any caller
+holding `perm.modify` at the binding's path (Proxmox: `Permissions.Modify`).
+The grant has to name it — `perm.modify` or `perm.*` — so an `Admin` (`*`)
+binding on a project means full control of what is under it, but not the
+right to hand out roles there.
+The built-in `PermissionAdmin` role carries it alone, so a project admin is two
+bindings:
+
+```bash
+lv role grant Operator        user:pat@local --path /projects/acme --propagate
+lv role grant PermissionAdmin user:pat@local --path /projects/acme --propagate
+```
+
+pat can now grant and revoke roles at `/projects/acme` and below. A delegated
+grant or revoke is refused, and audited as `denied`, when:
+
+- **the role carries more than the grantor holds there.** Every grant in the
+  role must be covered by one the grantor holds at that path: `vm.*` covers
+  `vm.start`, `*.read` covers `vm.read`, only `*` covers `*`. A list of
+  specific reads does not cover `*.read`, so an Operator cannot hand out
+  Viewer. Delegating delegation is allowed, because pat holds `perm.modify`.
+- **it propagates and the grantor's own grant does not.** A propagating grant
+  at a path reaches every path below it, so it is measured against the
+  grantor's propagating bindings only.
+- **the path is outside the grantor's reach,** including through a sibling
+  prefix (`/projects/acme2`), a `.`/`..`/empty segment, or a scoped API token
+  whose scope does not cover it.
+- **it would be the principal's first binding.** A principal with no binding
+  is authorized by its legacy role cluster-wide; its first binding ends that,
+  which changes its access outside the delegated path, so only a cluster
+  admin may.
+- **it revokes a `NoAccess` sentinel** (below); only a cluster admin removes
+  one.
+- **the principal is not resolvable:** a delegated grant names an existing
+  user with its realm (`user:<name>@<realm>`) or a group, never a bare
+  `user:<name>`, an unknown user, or an undefined role.
+
+A delegated revoke never empties a principal: in the same write it removes the
+binding and binds `NoAccess` for the same principal at the same path. A
+principal left with no binding at all would fall back to its legacy role
+cluster-wide — a legacy operator pinned to one project would become a
+cluster-wide operator again — and a "not the last binding" check could be beaten
+by two revokes on two nodes before either saw the other. Each revoke leaves its
+own sentinel, so that cannot happen in any order. Every delegated decision reads
+the bindings from the node's database at that moment, not the engine's
+periodically reloaded copy.
+
+A delegated revoke of a binding outside the caller's reach answers exactly as
+for a binding that does not exist. `lv role ls` shows a delegated admin its own
+bindings and those at the paths it administers. Bindings carry no record of who
+granted them: revoking a delegate's `PermissionAdmin` does not revoke what it
+granted, and a delegate may delegate further within its subtree (as in
+Proxmox). A cluster admin who later widens a custom role widens every binding of
+it, delegated ones included; check `lv role ls --role <role>` before editing
+one.
 
 ## Sessions
 
@@ -289,6 +453,293 @@ against the daemon; the resulting credential lands in the same
 
 To disable a factor: `lv 2fa disable --method totp --label phone`.
 
+### Mandatory second factor (`lv 2fa policy`)
+
+A cluster-wide policy decides which realms must present a second factor:
+
+```bash
+lv 2fa policy                                   # show it
+lv 2fa policy all                               # every realm
+lv 2fa policy local,ldap:corp                   # only these realms
+lv 2fa policy off                               # the default
+lv 2fa policy all --allow-self-enroll --enroll-by 2026-11-01T00:00:00Z
+lv 2fa enroll-code bob [--ttl 1h]               # admin: bob's first-enrollment code
+lv 2fa enroll-totp --code <code>                # bob, from an enrollment-only session
+```
+
+It is a replicated row (the `login_2fa_required` key of `cluster_policies`),
+so every node enforces the same rule. Setting it is admin only, and refused
+until the cluster upgrade has finished (the release feature `login_policy`). A realm the answering node
+does not have configured is set anyway and reported as a warning (a typo such
+as `ldap:crop` covers nothing).
+
+- **A session is full only if its login presented a second factor.** That is
+  recorded when the session is minted (`session_factors`) and read back for
+  the session's whole life; it is never re-derived from the account's factors
+  now. A password-only session stays confined even after a factor is enrolled
+  for the account — by its holder in another session, by an admin, or after a
+  lost-device reset — so whoever held only the password never inherits a full
+  session. A session opened on a node the policy had not reached yet is
+  confined as soon as it arrives.
+- **A covered user with a factor** must present it at every login, through
+  every covered realm. The local realm always did this; the policy extends
+  it to LDAP and OIDC. An OIDC code is single-use, so through an OIDC realm
+  the TOTP code has to arrive in the same `Login` call as the OIDC code. No
+  shipped client (CLI or web UI) drives an OIDC login today, so an OIDC client
+  under a covering policy must send both itself. WebAuthn login is itself a
+  second factor.
+- **A login that presents no factor** gets an enrollment-only session
+  (`requires_2fa_enrollment`, no role): it can call `Whoami`, `Logout` and
+  `GetLoginPolicy`, list its own factors and, if the account has NO factor
+  yet, enroll one for itself (`lv 2fa enroll-totp`, or a security key at
+  `/account/2fa`); every other call, and every stream, is refused. The web UI
+  keeps such a session on `/account/2fa`. An account that already has a
+  factor cannot add one from such a session: log in again presenting it.
+- **The first factor needs an admin-issued code by default.** Anyone holding
+  only the password of an account with no factor could otherwise enroll their
+  own factor and lock the real user out. `lv 2fa enroll-code <user>` mints a
+  single-use code (shown once, stored as a SHA-256, valid for `--ttl`, at most
+  24 hours; issuing another replaces it), handed over out of band. The code is
+  **bound to the node that issued it**: it is checked and spent there alone, in
+  one guarded write, so it is single-use cluster-wide even across a partition.
+  Used on any other node it is refused with a message naming the issuing node
+  — log in through that node, or have an admin issue a new code where you are.
+  `lv 2fa enroll-code` (and `lv user reset-admin --clear-2fa`) prints that
+  node with the code, so hand both over together. A disable, a delete or a
+  re-create of the account, or an admin enrolling a factor for it (TOTP or a
+  security key), voids an outstanding code. Each of those is a replicated
+  write: it voids the code on the issuing node once it has replicated there,
+  so a code used on that node within replication lag of a disable made on
+  another one can still be spent — the enrollment-only session it ends in is
+  then refused by the disable as soon as that arrives. A WebAuthn enrollment verifies the
+  attestation before it spends the code or ends the session, so a failed
+  ceremony leaves both. The policy
+  can instead allow self-enrollment until a deadline (`--allow-self-enroll
+  --enroll-by <RFC3339>`); after the deadline a code is needed again, and
+  setting the policy without the flag closes the window. Enrolling ends the
+  enrollment-only session first — if it cannot be ended, nothing is enrolled —
+  and the next login presents the new factor. Every first-factor enrollment
+  from such a session is audited, published and sent as the
+  `auth.first_factor_enrolled` notification, so a claimed account is seen.
+- **It holds from the moment it is set.** Setting it ends every live session
+  in a realm it newly covers, the caller's own included, and open streams end
+  with them.
+- **API tokens are not subject to it.** They are administrator-issued
+  automation with no interactive holder; scope them, give them an expiry,
+  and revoke them with `lv user token-revoke`.
+- **The distributable `lv-cli` client certificate is not subject to it
+  either**: it authenticates as the cluster admin with no user behind it.
+  Turn on `auth.strict_mtls_identity` (below) so every operator must log in.
+
+A stored value this build does not understand (a later release's) is enforced
+as `all`. A node that cannot read the policy, a session's recorded factor, or
+a user's factors — including one whose credential tables a reseed has not
+repopulated yet — refuses the login, request or enrollment rather than guess.
+
+**Recovery.** The policy never locks an account out; it asks it to enroll,
+with a code. A user who lost their factor: an admin removes it (`lv 2fa
+disable --user <name> --method totp`) and issues a code (`lv 2fa enroll-code
+<name>`). The **only** admin who lost their factor and recovery codes: as root
+on a node that is not in WAL quarantine (a quarantined node accepts local root
+but refuses every replicated write, so no account change can be made on it),
+`lv user reset-admin --clear-2fa` (with litevirtd running: it is a login rule,
+and the daemon-down path refuses it) removes the `admin` account's
+factors and recovery codes, gives it a new password, and prints an enrollment
+code; log in, `lv 2fa enroll-totp --code <code>`, and log in again with the
+new factor. As root on a node, `lv` with no stored session reaches the local
+daemon as local-root, which is admin: `sudo lv 2fa enroll-code admin`, `sudo
+lv user enable <admin>` and `sudo lv 2fa disable --user <admin> --method totp`
+all work there. Move `~/.config/litevirt/credentials.json` (root's) aside
+first, so the call is not made as a stale or disabled session.
+
+## Account lifecycle (`lv user disable`, `lv user expire`)
+
+```bash
+lv user disable bob                          # refuse every credential of bob's
+lv user enable bob                           # undo it
+lv user expire contractor 2026-12-31T00:00:00Z
+lv user expire contractor never              # clear the expiry
+lv user ls                                   # STATUS and EXPIRES columns
+```
+
+Names are compared ignoring ASCII case and surrounding spaces at every
+lookup (`ALICE`, `alice ` and `alice` are one account), including the subject
+an LDAP or OIDC login maps to, so a disabled account is not reachable through
+a variant spelling. Two existing accounts that differ only that way are never
+merged: every lookup of either refuses, naming both, until one is renamed or
+deleted. New names are stored trimmed.
+
+A disabled account, or one past its expiry, cannot authenticate by any path:
+password and WebAuthn login through any realm (an LDAP or OIDC user is refused
+like a local one), its sessions, its API tokens, and either one relayed by a
+peer as a forwarded identity. The check runs on every request against the
+node's replica, so a disable takes effect on each node as soon as it has
+replicated there, and an expiry needs no timer. Any lifecycle change — a disable, a re-enable, an expiry set, changed or
+cleared, a re-create, `lv user reset-admin` re-enabling the admin — logs the
+account out everywhere: it records a cut-off before which no session is
+honoured (below), so re-enabling does not revive ended sessions. Its API
+tokens work again on re-enable. A wrong password for a disabled
+account is still just a wrong password: the disabled state is told only to
+someone who presents the account's credentials.
+
+Each attribute is its own replicated row (`user_lifecycle`), so a disable and
+an expiry change made on two nodes never undo each other. A value a node
+cannot read is treated as disabled. A disable or an expiry also records the
+instant before which no session of the account is honoured again — and so
+does every later lifecycle change: a re-enable, an expiry set, changed or
+cleared, a re-create. The comparison allows for clock skew in the refusing
+direction (`SessionCutoffSkewMargin`, 5 s, the failover coordinator's skew
+margin): a session created up to 5 s after a change is refused too, and a
+login in those 5 s is told to retry. So a session minted before a disable —
+on another node, by a clock up to 5 s ahead, or on a node the disable had not
+reached yet — stays dead after the re-enable, and an expiry that passed and is
+then extended revives nothing. A clock more than 5 s off is the LWW skew
+guard's to report; such a node can still mint a session that survives a
+re-enable. Deleting a user keeps its disable:
+the admin floor never brings back a disabled admin, and a directory login that
+re-creates a deleted, disabled LDAP or OIDC user's account finds it still
+disabled. An explicit `lv user create` starts the name afresh (enabled, and
+none of a former namesake's sessions or API tokens honoured).
+
+**Deleting a user** revokes its sessions and API tokens in the same write as
+the delete, voids its enrollment code and clears its directory bindings, and
+records durable session and API-token cut-offs (`user_lifecycle`). So a
+session or token the deleting node never held — minted elsewhere, its revoke
+lost — is refused anyway once the cut-offs replicate, and stays refused when
+the name is re-created or the admin floor reinstates it. A session or token
+is also bound to the exact stored name it was issued for: once that spelling
+is deleted, it does not authenticate as another spelling of the name that
+survives, on any path (direct, forwarded by a peer, or an open stream). The
+token cut-off allows for skew the way the session one does: a token stamped up
+to 5 s after it is refused, so a namesake's token minted by a node whose clock
+runs ahead does not survive a re-create. Re-creating a name the node knows
+had an account (a deleted row, or a token issued under it) puts the token
+cut-off at the create, and `lv user token-create` for it in the next 5 s is
+refused with a retry message rather than minting a token that would never
+work; for a name new to the node, and for sessions, the cut-off is set back
+by the margin and a second, so a login or token right after `lv user create`
+works at once (even just after a delete, as before). A token minted through
+another node within those 5 s, before the re-create reached that node, is
+refused once the cut-off arrives and never works; its refusal says so. Create
+the token through the node the name was re-created on, or wait 5 s. No other lifecycle
+write moves a cut-off backwards: a re-enable, an expiry change or
+`lv user reset-admin` just after a disable, or from a node whose clock is
+behind, keeps the later cut-off, and a login in its margin is told to retry,
+and when. The one exception is a cut-off dated more than 5 s in the future,
+written by a node whose clock ran ahead: it refuses every login (or new API
+token) of the account until that time, and the refusal names the time.
+`lv user reset-admin` (as root, with litevirtd running) replaces such a
+cut-off on the admin account it resets, `--user <name>` for another admin,
+and logs that it did. Correcting it needs the release feature `login_policy`,
+and reset-admin waits for that at most 3 s: with the daemon down, or with the
+feature unable to open in time (the cluster upgrade unfinished, a first use
+not yet acknowledged by an unreachable host), it still resets the password at
+once, leaves the cut-off, and prints that it did and what clears it (run it
+again once the feature opens, or wait).
+
+**Where and when it holds.** Each node judges against its own replica and its
+own clock. A change takes effect on a node when its row arrives there: on the
+node where it was made at once, elsewhere within replication lag — and a node
+cut off from the cluster keeps accepting the account for as long as it is cut
+off. Expiry is compared with each node's wall clock, so a node whose clock runs
+S seconds slow accepts an expired account for S seconds (the LWW skew guard
+bounds how far a clock may drift); `lv user ls` STATUS is the answering
+daemon's verdict by its clock. **Open streams** — serial consoles, VNC, log
+follows, event watches, and the web UI websockets and REST SSE built on them —
+are re-checked while open: one authenticated by a session or API token ends
+within 5 seconds of a disable, an expiry, a delete, a session or token revoke,
+or a policy change reaching the node, and at once on the node where the change
+was made. A recheck runs every 2 s, each allowed 1.5 s. One that fails or does
+not finish in time (a replica stall, a reseed) is retried at once instead of
+ending the stream; the stream ends only when no recheck has succeeded for 5 s,
+so its credential is still unknown at the bound. At the cut, what a handler
+holds for the caller — the console's PTY, the VNC socket, a followed log file —
+is closed at once, whether or not the handler is watching; any handler still
+blocked 2 s after the cut has its RPC ended. Every streaming RPC is listed,
+with what it holds, in `streamHandlerAudit` (internal/grpcapi), and a test
+fails when one is added without an entry. Exec (`lv exec`, the UI exec page)
+is one RPC per command, each authenticated on its own.
+
+**SPICE is not cut.** SPICE is not proxied through the daemon: it listens on
+the host's `127.0.0.1` and is reached through an SSH tunnel (`lv spice`), so
+an open SPICE session lives as long as that tunnel, whatever happens to the
+account. To end one when disabling a user, revoke the user's SSH access to
+the host and kill their SSH session there (`pkill -u <ssh-user> sshd`), which
+ends the tunnel and the SPICE connection in it; restarting the VM also ends
+it. `lv user disable` alone stops only new `lv spice` calls.
+
+Admin only, audited as `user.account`. Refused for the cluster's last admin
+that can log in, enabled with no expiry — `lv user delete` applies the same rule — and
+until the cluster upgrade has finished (the release feature `login_policy`). Two admins restricting each
+other on two nodes at once can still race past that guard; every node then
+raises the `no_unrestricted_admin` health condition (critical), and the floor
+does NOT re-enable either admin itself. Recovery, as root on a node that is
+not in WAL quarantine: `lv user reset-admin` re-enables the `admin` account;
+for an admin with another name, `sudo lv user enable <name>` with root's
+credentials.json moved aside. In a whole-fleet rollback below a latched token
+every node is quarantined, and no account change is possible anywhere until
+the fleet is upgraded again; local root still reaches every running daemon.
+
+**Duplicate spellings.** Two accounts whose names differ only in case or
+surrounding spaces (left over from before names were normalized, or created
+on two nodes at once) are never merged: every lookup of either — a login, a
+session, an API token, `lv user`, reset-admin — refuses, naming both. To
+remove one, `lv user delete --exact <name>` lists every account named like it
+— id, exact stored name, creation time, role, realm, last login seen by the
+answering node, factors and tokens — and deletes nothing; then
+`lv user delete --exact <name> --id <id>` deletes the one chosen (admin,
+audited as an exact delete). The id alone chooses: typed as either spelling,
+it deletes the account the id names. An admin that is one of such a pair
+cannot log in, so it never counts as the admin that remains when the
+last-admin guard decides — except the spelling that survives the delete being
+decided: when a pair are the cluster's only admins, deleting one spelling by
+its id is allowed, and leaves the other usable. The admin floor, on the other
+hand, counts such a pair as admins present, so it never reinstates a deleted
+admin beside them; `no_unrestricted_admin` names the pair and the command
+instead, which root runs with credentials.json moved aside. A deleted
+account under a variant spelling is brought back under its own name by a
+directory login, so it keeps its disable. Every last-admin refusal names, with
+its arguments, what the refused admin can do instead: create an admin, enable
+one or lift its expiry, resolve a pair, or give an admin the floor reinstated
+with no credential one (`lv user reset-admin --user <name>`, as root).
+
+**The one credential a disable cannot reach** is the distributable `lv-cli`
+client certificate: it authenticates as the cluster admin with no user behind
+it. Turn on `auth.strict_mtls_identity` (below) so that a disabled operator
+cannot keep acting through it.
+
+### Rolling upgrade, and hosts below the latch
+
+The login rules are the release feature `login_policy` of the release token
+`release_2026_11_v1`, which is mandatory and replication-gated: every build
+that has the `user_lifecycle` table advertises it, and it latches only once
+every host the cluster replicates to does. Until then `lv user
+disable|enable|expire|unbind`, `lv 2fa enroll-code` and setting `lv 2fa policy`
+are refused (`the cluster upgrade must finish first (login_policy needs
+release_2026_11_v1)`), and nothing is written; logins, `lv user create` and
+`lv user delete` work as on the previous release, without the login rules'
+data. Before the first write, the cluster records that the feature is used
+(docs/upgrades.md, "Rolling back after a release token latched"), so a
+rollback below the release quarantines once any of it exists. A previous-release host therefore never receives a statement it
+cannot decode, never holds an account state it would not enforce, and —
+having no statement that names the table — cannot re-enable an account.
+
+What a host **below** the latch does and does not enforce, exactly:
+
+- A host on an older build (one admitted after the latch, or one rolled back
+  below it) does not read `user_lifecycle`, `session_factors` or the
+  second-factor policy at all. It does **not** refuse a disabled or expired
+  account's sessions or API tokens, does not confine password-only sessions,
+  and does not cut open streams. The post-latch `unsupported_member` health
+  condition is the signal. Keep such a host out of the client path, or revoke
+  the account's API tokens and sessions, until it is upgraded.
+- A host whose binary is below a token it already latched is in WAL
+  quarantine and writes nothing. From this release on, a quarantined host
+  also **refuses every user credential** — logins, sessions and API tokens,
+  direct or forwarded — and still serves local-root and peer mTLS, which are
+  how it is repaired. A binary older than this release does not have that
+  refusal: it is the case above.
+
 ## Migration from the legacy admin/operator/viewer roles
 
 `users.role` holds a flat `admin > operator > viewer` ladder. The RBAC
@@ -313,8 +764,8 @@ is the only authority.
 
 | Bearer prefix | Lookup table | Rejected on |
 |---|---|---|
-| `lvs_<hex>` | `sessions` | revoked, hard-expired, idle-timeout |
-| `<hex>` (no prefix) | `tokens` (bcrypt match) | `deleted_at`, `expires_at` |
+| `lvs_<hex>` | `sessions` | revoked, hard-expired, idle-timeout, account disabled/expired |
+| `<hex>` (no prefix) | `tokens` (bcrypt match) | `deleted_at`, `expires_at`, account disabled/expired |
 | (no Authorization header) | mTLS client cert → classified (see below) | invalid/expired peer cert |
 
 ## mTLS principal model
@@ -385,6 +836,231 @@ root-obtained *node* identity. What this model closes is that a **distributable*
 credential (the shared CLI client cert) does not equal admin: hand someone CLI
 reach and they still need to `lv login` to act.
 
+### Renewing a host certificate (`lv host renew-cert`)
+
+A host's cluster certificate — the identity behind every peer and on-node mTLS
+call — is valid for five years. Each daemon exports its expiry as
+`litevirt_certificate_expiry_timestamp_seconds{cert="host"}` and sends a
+`certificate.expiring` notification from 30 days out (error severity inside 7
+days), then `certificate.expired`, repeating daily while it stands. Renew it from
+the machine that holds the cluster CA key:
+
+```bash
+lv host renew-cert host-b
+lv host renew-cert host-b --ssh root@10.0.50.11   # name isn't the address
+```
+
+The host keeps running throughout — no restart, no partition, nothing a peer
+could read as a failure:
+
+1. **The key is generated on the host.** The host (its own `litevirt` binary,
+   over SSH) creates the new key and sends back only a certificate request; the
+   CA machine signs the request and sends back only a certificate. The private
+   key never crosses SSH and never exists on the CA machine.
+2. The certificate is a **successor**: same name and addresses, a fresh
+   five-year validity, and — signed by the CA — the serial of the certificate it
+   replaces. Peers pin each host's recorded serial (that pin is what keeps a
+   re-admitted name's old certificate out), and a peer whose record still names
+   the predecessor accepts its successor immediately. The pin is not relaxed:
+   only one hop is honoured, and an older certificate cannot name a serial
+   recorded after it was minted.
+3. **One atomic switch.** The host keeps each identity as a complete pair under
+   `pki_dir/host.d/<serial>/`, with `host.crt` and `host.key` resolving through
+   one `host.d/current` link, and the install is a single rename of that link.
+   A crash or a dropped connection at any point leaves a pair the daemon starts
+   with, and a daemon that finds its identity unloadable at start repairs it from
+   the newest complete pair under `host.d`.
+4. The daemon serves the new pair from the next handshake — its gRPC listener,
+   its peer probes and its loopback clients read the identity at handshake time,
+   and its recovery-claim votes are signed with it too. A replacement that does
+   not chain to the cluster CA, names another host or does not match its key is
+   refused, as is a renewed key not held safely. The identity a node already
+   has is never refused over how its key file is held: a `host.key` outside the
+   PKI directory, owned by another user, or with a mode that cannot be tightened
+   is still served, logged as a WARN and raised as a degraded
+   `certificate/key_file_unsafe` condition naming the file and the fix (move,
+   `chown` or `chmod 600`); a key readable by others is tightened.
+   **Established connections** are judged on every RPC, not only at the
+   handshake. A connection made with a certificate the CA has **replaced** —
+   see "Superseded certificates" below — starts no new RPC: the next one is
+   refused with `Unavailable`, and the client reconnects and presents its
+   renewed certificate. Only the RPCs already in flight on it — a cold-disk
+   migration stream, a backup push — are left to finish, and the connection
+   is closed when the last one ends, or after 15 minutes; one cut by that
+   bound fails and must be re-run (cold-disk migration and peer backup streams
+   do not resume), so renew outside long transfers. That holds once the
+   replaced certificate is REVOKED too, as step 7 does at once: a revoked
+   certificate with a standing CA-issued successor was revoked because it was
+   renewed, and its connections drain the same way. A cold-disk migration
+   opens a fresh connection for each disk, so one renewed mid-copy finishes
+   the disk in flight and copies the rest with the renewed certificate; a
+   container migrate or failover relocate likewise drives the target's
+   restore over a fresh connection once its rootfs push has finished.
+   A certificate revoked with **no** successor — `lv host rm`, `lv host
+   revoke-cert` of a live identity — is the emergency path: a connection made
+   with it (or on which the host served it) refuses its next RPC and is closed
+   at once, streams in flight included. If you renewed because a key was
+   stolen, a connection the thief opened before the renewal is not cut at
+   once but drained: it starts nothing new, and what it had in flight runs out
+   within 15 minutes; restart the daemons to cut it sooner. A host's own UI
+   and REST clients reconnect by themselves when the host's certificate
+   changes: the next request goes over a new connection with the renewed
+   certificate, while a console or event stream already open on the old one
+   runs on until it ends (or 15 minutes pass).
+5. The command dials the host and **confirms** it presents the new certificate.
+   It switches back only when the host demonstrably still presents the old one
+   and the cluster does not record the new one; a probe that merely fails proves
+   nothing, so nothing is undone on it. A successor that was signed but never
+   used is revoked.
+6. The daemon re-records its own serial within a minute, so the record moves on
+   and the old certificate stops being accepted as that host.
+7. Then the replaced certificate is **revoked, at once**. Every node on this
+   build already refuses it — as a voter, as a claim signer and on every RPC
+   (see "Superseded certificates") — so revoking it costs a pinning node
+   nothing. The revocation is held only while the cluster has a node that does
+   **not** pin: a live host on a different build (`--force`), or one running
+   with `auth.trust_rotated_peer_certs` (each node reports that switch as its
+   own `certificate/trust_rotated_peer_certs` condition, which is how the others
+   know). For such a node the newest voter generation, if it needed the replaced
+   certificate's accept, would stop verifying after the revocation
+   ([recovery-claims.md §4.1](design/recovery-claims.md)); so while one exists,
+   and only if the newest generation does need that accept, the revocation is
+   **owed**: the CA-signed CRL is stored in a replicated
+   `certificate/revocation_owed` health condition (a degraded reason in
+   `lv health`), the host notifies `certificate.revocation_owed` daily, and the
+   cluster publishes the CRL by itself as soon as no such node is left, or a
+   newer voter generation no longer needs the accept. `--revoke-old` revokes at
+   once regardless; `--keep-old` not at all.
+
+   An owed revocation is published only by a node that can trust its own view:
+   its replica has caught up, it has adopted the newest voter generation it
+   holds, and a majority of that generation's members answer it now, each
+   having adopted it and none holding anything newer. A node on the minority
+   side of a partition, or one still mid-exchange after a heal, holds.
+
+#### Superseded certificates
+
+A successor is the CA's own statement that the certificate it names is no
+longer the host's identity. Every node collects that statement wherever it sees
+a successor — a TLS handshake in either direction, an accept carried in a claim
+or voter certificate, its own renewed identity — and keeps it node-locally in
+`pki_dir/superseded.pem` (re-verified against the CA on load, never replicated,
+only ever added to). A certificate a node holds a standing successor of is
+refused there:
+
+- its accepts do not count — in workload claim certificates or in a voter
+  generation the node has not yet adopted;
+- every new RPC on a connection made with it is refused, and the connection
+  drains as above;
+- it is never the host for peer trust, whatever the host's row says.
+
+None of this reads `hosts.cert_serial`. That column is replicated data any peer
+can write — a compromised host could write a renewed voter's record back to its
+replaced serial — so it decides nothing here; a host recorded with a serial
+whose revocation is owed is reported as `certificate/serial_regressed` (a pki
+directory restored from before a renewal, or a peer rewriting the row) and the
+revocation is published regardless. Only the CA can take a successor back: a
+successor it revokes unused (an abandoned renewal) hands the identity back to
+its predecessor; one revoked because it was renewed in turn does not.
+
+The record is fail-closed against loss: a `superseded.pem` the node cannot
+read (unreadable, not a regular file, over 16 MiB) is left exactly as it is
+and never written over, what the node learns meanwhile is kept in memory, and
+the read is retried; once it succeeds, both are merged and saved. If the
+installed CRL cannot be parsed, the node treats nothing in it as revoked — the
+CRL's fail-open rule — so an abandoned (revoked unused) successor looks
+standing there, and the predecessor it would hand back is refused on that node
+until the CRL is readable again; `certificate/crl_install_failed` reports that
+node.
+
+A node that holds no successor for a certificate does not refuse it on that
+ground; revocation is what ends it everywhere. Until it is revoked — while it is
+owed, or after `--keep-old` — the replaced certificate still authenticates as a
+**bearerless client** (`admin` unless `auth.strict_mtls_identity` is on) to a
+node that has not yet seen its successor, and as a TLS server to anything that
+dials it. Under `auth.trust_rotated_peer_certs` the supersession checks are off
+on that node — its serial pins and the stale-connection judge with them — so
+while that recovery switch is on, a replaced key's accepts DO count there.
+
+#### Renewing a voter
+
+A node that adopts a voter generation decided BEFORE one of its signers renewed
+cannot count that signer's pre-renewal accept as it stands (§4.1's cost): the
+pin refuses it, and once the renewal has revoked the replaced certificate, so
+does revocation. Most of the time this is invisible: every node adopts within
+seconds. A node that was offline, whose import was retrying, or that was
+admitted later can be left one generation short.
+
+Such a node asks the renewed voter to **re-attest** its accept: the voter
+re-signs, with its current certificate, the accept it recorded in its own
+durable claim state when it voted — the same key, generation, ballot and
+value, never anything taken from the row or the caller — and the node adopts
+the generation with that accept counted. Nothing is relaxed: the re-signed
+accept is checked like any other, the replaced certificate counts for nothing,
+and a voter asked about a generation it never accepted has nothing to give, so
+a forged generation gets nothing. This works however many members are stuck,
+including a MAJORITY of the newest generation, where no voter change could be
+decided (a voter answers only at its adopted generation) and
+`auth.trust_rotated_peer_certs` would not help (it relaxes the pin, never
+revocation).
+
+While the renewed voter cannot re-attest — unreachable, or on an older build
+— the node raises `certificate/voter_generation_stuck`, naming the generation,
+the voter it is waiting on, and the fixes: bring that host back on this build,
+or **decide one more voter change** from a node that has adopted the newest
+generation — `lv cluster voter add <host>`, or `lv cluster voter rm <host>`
+and then add it back. Its accepts carry current certificates, it becomes the
+stuck node's anchor, and the node adopts through it; the condition clears. A
+voter change needs a majority of the newest generation, so when a majority is
+stuck, re-attestation is the way out. To avoid all of this, renew voters only
+when `lv cluster voter ls` shows every node on the newest generation.
+
+The renewal deletes the replaced key from the host's PKI directory and the copy
+`lv host init`/`lv host add` left on the CA machine (`<host>.key`, when it is
+that key, together with `<host>.crt`, when it is the replaced certificate). A legacy `host.key` that resolved OUTSIDE the PKI directory is no
+longer used but is not deleted (the renewal cannot know what else uses that
+file); the command names it. Any other copy taken earlier is what `lv host
+revoke-cert` closes, at any time.
+
+An owed revocation is not a row a peer can quietly drop. It counts as done only
+when its serial is in the CRL the node installed from CA-verified rows: a row
+marked resolved or tombstoned without that is restored to owed, and a row whose
+evidence no longer carries a CA-signed CRL listing its serial raises the
+critical `certificate/revocation_owed_tampered` condition (and
+`certificate.revocation_owed_tampered`), telling the operator to publish it with
+`lv host revoke-cert`. Only a node that can trust its view judges this (the
+same test as for publishing), after installing the cluster CRL that tick, and
+only once the row has looked dropped there for three minutes — the row and the
+CRL that justifies a legitimate resolve replicate independently, and a node
+holding the first without the second accuses no one. A node that cannot install
+the cluster CRL raises `certificate/crl_install_failed` once and judges nothing
+until it can. A row deleted outright leaves the CA machine's
+`pki/renewals.json` as the record.
+
+A recovery whose claim certificate was signed with the replaced key before the
+revocation lands is refused at execution (`recovery_claim_unproven`) and
+re-certified at the coordinator's next attempt with the new certificate; it is
+delayed, never run twice.
+
+The command refuses, touching nothing, when the cluster's recorded serial and the
+installed certificate disagree, and while hosts run different builds (`--force`
+overrides): a peer on an older release does not recognise the successor and
+refuses the renewed host until its re-recorded serial reaches it by anti-entropy
+(`anti_entropy_interval_sec`, 60 s by default). A re-added host's audit admission
+record, bound to its certificate serial, is re-signed for the new one. libvirt's
+TLS listener (`qemu+tls://` migration) is asked to reload; if it cannot, it keeps
+the old certificate until libvirt restarts, which is harmless because libvirt
+does not read the cluster CRL. The migration-TLS certificates under
+`pki_dir/migration` come from a separate CA and are not renewed by this command.
+
+`lv host revoke-cert <host> --serial <hex>` is the manual path. It accepts only a
+serial known to be the host's — one the CA machine's renewal log
+(`pki/renewals.json`) records for it, or the predecessor named by the certificate
+the host presents — and refuses a serial any other host is recorded with. The
+host's own live or presented certificate needs `--force`, because revoking it
+cuts the host off and gets it fenced (that is what `lv host rm` is for); and when
+the host's presented certificate cannot be read, it refuses unless `--force`.
+
 ### Recovering the admin account (`lv user reset-admin`)
 
 `lv user reset-admin` is for the cluster nobody can log in to, so it takes no
@@ -392,9 +1068,51 @@ credential. It runs as root on a node and gives the existing `admin` account a
 new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
 never creates an admin: on a node with no live admin it refuses, because a
 joining node's credential replicates in and a deleted admin stays deleted.
+`--user <name>` resets another admin-role account instead (refused for an
+account whose role is not admin); the reset prints the account it reset.
+Before sending `--user`, the CLI asks the running litevirtd its build's schema
+version (`Ping`): a daemon from before `--user` would reset `admin`
+whatever was named, so it is refused with nothing changed, and the CLI says
+to restart litevirtd with the installed binary. (A daemon that cannot be
+asked is sent the request; if it reset `admin` instead, the CLI says so and
+keeps that new password in the file.) If
+the `admin` account is disabled or has an expiry, the reset also clears both,
+so it recovers an account locked out by `lv user disable` or `lv user expire`
+too (with litevirtd running, once the cluster upgrade has finished; with the
+daemon down, or before then, it refuses and changes nothing).
+
+**The admin floor reinstates an account, never its credentials.** When admins
+are deleted on two nodes at once and no admin is left, every node's floor
+brings back the most recently deleted admin's account (`user.admin_reinstated`)
+— but with no password anyone knows, every session and API token revoked
+(durable cut-offs once the release feature `login_policy` has opened), its second factors and
+enrollment code cleared. That holds for an admin deleted by a release before
+the login rules too, whose delete revoked nothing: its API tokens do not come
+back. Nobody can log in as the account until root, on a node, runs
+`lv user reset-admin --user <name>`; the `no_unrestricted_admin` condition
+names the account and the command until then. An external (LDAP or OIDC)
+admin stays external: it gets no local password, the directory bindings its
+delete cleared are restored, and it logs in through its realm as before (an
+admin deleted by an earlier release had no binding, and binds at its next
+login). Its old sessions, API tokens and second factors do not come back
+either. If its directory entry is gone (people leave), it cannot log in, yet
+counts as an admin who can: give it a local password with
+`lv user reset-admin --user <name>`, as root on a node. Until root gives a
+LOCAL reinstated admin a credential it is no admin anyone can log in as, so
+the last-admin guard does not count it: the one admin who can log in is not
+allowed to delete, disable or expire itself beside it, and the refusal names
+`lv user reset-admin --user <name>`. Before the release feature `login_policy`
+has opened (mid-upgrade), the floor revokes only the sessions held by the
+node that reinstated the account; a session of a pre-upgrade delete that
+never reached that node authenticates on the node that holds it until it
+expires or an admin revokes it (`lv session revoke`), and a node does not
+re-run the floor once the reinstatement reaches it. Once the feature has
+opened, the durable cut-offs cover every node. A previous-release host still
+runs the old floor, which restores the old password: finish the roll before
+deleting admins.
 
 Every reset is audited as `user.reset-admin`, attributed to `root@<host>`, with
-target `admin` and a detail of `via=<channel> os_user=<who>`. `os_user` is
+the reset account as target and a detail of `via=<channel> os_user=<who>`. `os_user` is
 `SUDO_USER` when set, otherwise the login name. The CLI reports it and the daemon
 records it as a claim, not as an authenticated identity. No password and no hash
 is ever written to the row. The CLI mints the password, keeps it, and sends only
@@ -527,10 +1245,10 @@ secrets to `host_fence_credentials`, `user_credentials` and
 `token_credentials`, which only the sensitive lane below carries. This release
 keeps writing the three old columns too, so a host still reading only those
 columns (one on the previous release, including one rolled back and under WAL
-quarantine) reads current secrets. The state dump therefore **still carries
-the secrets**. Clearing the old columns, after which the dump carries none, is a
-later release's step (see
-[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll) and
+quarantine) reads current secrets, and the state dump **still carries the
+secrets**. Once every host runs a build carrying `credentials_clear_v1` as
+well, the old columns are emptied and the dump carries none (see
+[upgrades.md](upgrades.md#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
 All three RPCs stay peer-only regardless: only a **peer** or **local-root**
 caller (a cluster host certificate) can read them. An operator or admin bearer,

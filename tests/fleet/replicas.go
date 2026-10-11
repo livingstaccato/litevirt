@@ -92,6 +92,12 @@ type LinkFault struct {
 	// drop the request, lose the reply, duplicate it, or hold it until after
 	// the sender's next claim RPC (claim_faults.go).
 	Claim ClaimFault
+	// BlockReady refuses the health checker's readiness probe (Ready) on the
+	// link and nothing else: a degraded link whose probes keep failing while
+	// replication still gets through — what relay health
+	// (colonelpanik/litevirt#175) reads. Directed: SetLinkFault(observer,
+	// target, LinkFault{BlockReady: true}) fails observer's probes of target.
+	BlockReady bool
 	// BlockAll refuses EVERY RPC on the link, of any kind — the health
 	// checker's readiness probe, an owner probe's Ping, the claim RPCs, a
 	// client call such as ListHosts — as a firewall dropping all traffic from
@@ -222,6 +228,22 @@ func (n *Node) claimBlocked(fullMethod string, caller string) bool {
 	defer n.faults.mu.Unlock()
 	ls := n.faults.links[caller]
 	if ls == nil || (claimMethods[m] && !ls.fault.BlockClaims) || (m == "Ping" && !ls.fault.BlockProbe) {
+		return false
+	}
+	ls.stats.Blocked++
+	return true
+}
+
+// readyBlocked reports whether a BlockReady fault refuses caller's readiness
+// probe of n.
+func (n *Node) readyBlocked(fullMethod string, caller string) bool {
+	if methodName(fullMethod) != "Ready" || caller == "" {
+		return false
+	}
+	n.faults.mu.Lock()
+	defer n.faults.mu.Unlock()
+	ls := n.faults.links[caller]
+	if ls == nil || !ls.fault.BlockReady {
 		return false
 	}
 	ls.stats.Blocked++

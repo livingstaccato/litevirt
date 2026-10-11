@@ -247,7 +247,13 @@ type VMDef struct {
 	MaxCPU   int    `yaml:"max-cpu"`   // vCPU hotplug ceiling (> cpu) for live CPU hot-add; requires live_resize
 	CPUMode  string `yaml:"cpu-mode"`  // host-passthrough | host-model | custom (unset → host-model)
 	CPUModel string `yaml:"cpu-model"` // CPU model for cpu-mode: custom (e.g. x86-64-v3)
-	Memory   Memory `yaml:"memory"`    // int MiB or string "8G"
+	// Noisy-neighbour controls, both changeable on a running VM with no restart.
+	// cpu-limit caps the VM's total CPU in host cores (Proxmox cpulimit; fractions
+	// allowed, 0/unset = unlimited, at most cpu). cpu-shares is its relative CPU
+	// weight under contention (libvirt shares, default 1024; range 2-262144).
+	CPULimit  float64 `yaml:"cpu-limit"`
+	CPUShares int     `yaml:"cpu-shares"`
+	Memory    Memory  `yaml:"memory"` // int MiB or string "8G"
 	// Memory ballooning (#4). max-memory (> memory) raises the balloon ceiling
 	// so the guest can be inflated up to it; min-memory is the floor the host may
 	// reclaim to. Both accept int MiB or "8G" strings. 0/unset = fixed memory.
@@ -379,6 +385,21 @@ type DiskDef struct {
 	Storage      string `yaml:"storage"`       // references volumes section
 	ClusterSize  string `yaml:"cluster_size"`  // qcow2 cluster size (e.g. "64K", "2M")
 	RefcountBits int    `yaml:"refcount_bits"` // qcow2 refcount width (1–64, default 16)
+	// Overwrite lets a root disk from an image on an iscsi pool write the image
+	// over a LUN that is not blank (docs/storage.md).
+	Overwrite bool `yaml:"overwrite"`
+
+	// Discard passes the guest's TRIM down to the storage: unmap (or on) frees
+	// the space on thin storage, ignore (or off) drops it. Unset: a new VM gets
+	// the storage type's default (docs/storage.md), an existing one keeps what
+	// it has.
+	Discard string `yaml:"discard,omitempty"`
+	// DetectZeroes turns a guest write of zeroes into a discard (unmap, which
+	// needs discard unmap), or only skips the zero blocks (on); off disables it.
+	DetectZeroes string `yaml:"detect_zeroes,omitempty"`
+	// IOTune throttles this disk's I/O (libvirt <iotune>). Changeable on a
+	// running VM; an empty `iotune: {}` clears every limit.
+	IOTune *IOTuneDef `yaml:"iotune,omitempty"`
 }
 
 func (d *DiskDef) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -402,6 +423,10 @@ type NetworkAttachment struct {
 	MAC     string `yaml:"mac"`
 	Trunk   []int  `yaml:"trunk"`
 
+	// Rate caps this NIC's bandwidth in MB/s in both directions (Proxmox rate=,
+	// fractions allowed). 0/unset = unlimited. Changeable on a running VM.
+	Rate float64 `yaml:"rate,omitempty"`
+
 	// IPv6 / IPv6Gateway are the v6 counterparts. Empty = use SLAAC
 	// (router advertisement) or DHCPv6 if the network is configured
 	// for it. Networks themselves carry both an IPv4 subnet and an
@@ -413,6 +438,11 @@ type NetworkAttachment struct {
 	// security-groups: definitions. Empty = inherit cluster + host
 	// rules only (no per-NIC SG layer).
 	SecurityGroups []string `yaml:"security-groups,omitempty"`
+
+	// Queues is the virtio-net multiqueue count (<driver
+	// queues='N'/>): 1 to 64, or "auto" for one per vCPU up to 8. Unset or 1
+	// is a single queue. Virtio model only; applies on the next define.
+	Queues NICQueues `yaml:"queues,omitempty"`
 
 	// NIC guard (anti-spoofing; docs/firewall.md "NIC guards"). SpoofGuard is
 	// "" (on, the default for a new NIC), "on" or "off". AllowedAddresses are
@@ -467,6 +497,11 @@ type PlacementDef struct {
 	// it; storage motion not allowed). Set automatically by admission for
 	// VMs with non-migratable PCI passthrough.
 	NoMigrate bool `yaml:"no-migrate"`
+
+	// Failback: after a host drain moves this VM away, live-migrate it back
+	// once that host is undrained (docs/migration-failover.md#failback). It
+	// moves back only a VM the drain moved and nothing has moved since.
+	Failback bool `yaml:"failback"`
 }
 
 // RebalanceDef controls per-VM (or per-stack / per-cluster) rebalancer

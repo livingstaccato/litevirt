@@ -48,10 +48,23 @@ type PushOptions struct {
 	// root disk so a restore materializes BitLocker-binding firmware (G1).
 	FirmwareChunks []ChunkRef
 
+	// ContentDefined cuts the stream into content-defined chunks (cdc.go)
+	// instead of fixed ChunkSize windows: for an archive stream (a container's
+	// tar), where a size change shifts every later byte, so that the next
+	// archive shares the chunks past the change. A disk image keeps the fixed
+	// windows, which a write never shifts.
+	ContentDefined bool
+
 	// Progress, if non-nil, is called once per chunk after the chunk
 	// has been written or deduped against the repo. Use it to drive
 	// gRPC stream progress.
 	Progress func(PushProgress)
+
+	// RateLimit, if non-nil, is charged for every byte read from the source,
+	// after the read: a bandwidth limit (a job's own and/or its target's,
+	// see CombineLimiters). Holes and chunks inherited from a parent cost
+	// nothing, because they are not read.
+	RateLimit RateLimiter
 }
 
 // PushProgress is the per-chunk callback payload.
@@ -91,13 +104,19 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		FirmwareChunks:    opts.FirmwareChunks,
 	}
 
-	buf := make([]byte, ChunkSize)
 	var prog PushProgress
-	err := ReadChunks(src, buf, func(off int64, data []byte) error {
+	read := func(fn func(int64, []byte) error) error { return ReadChunks(src, make([]byte, ChunkSize), fn) }
+	if opts.ContentDefined {
+		read = func(fn func(int64, []byte) error) error { return ReadChunksContentDefined(src, fn) }
+	}
+	err := read(func(off int64, data []byte) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		if err := opts.waitRate(ctx, len(data)); err != nil {
+			return err
 		}
 		// Copy into a fresh slice so PutChunk can keep the bytes; the
 		// caller-supplied buffer is reused on the next iteration.

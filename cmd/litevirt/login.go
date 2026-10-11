@@ -64,6 +64,12 @@ func newLoginCmd() *cobra.Command {
 					return fmt.Errorf("save credential: %w", err)
 				}
 
+				if resp.GetRequires_2FaEnrollment() {
+					fmt.Printf("Logged in as %s with an ENROLLMENT-ONLY session.\n", resp.Username)
+					fmt.Println("The login policy requires a second factor and your account has none.")
+					fmt.Println("Enroll one with `lv 2fa enroll-totp`, then `lv login` again with its code.")
+					return nil
+				}
 				fmt.Printf("Logged in as %s (role: %s)\n", resp.Username, resp.Role)
 				return nil
 			})

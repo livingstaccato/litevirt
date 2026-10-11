@@ -9,6 +9,12 @@
     </p>
   </div>
 
+  {{if .EnrollmentRequired}}<div class="error">The login policy requires a second factor and
+    this session's login presented none. If you have a factor, log out and log in again with it.
+    If you have none yet, enter the enrollment code an administrator gave you and register a
+    security key below, or run <code>lv 2fa enroll-totp --code &lt;code&gt;</code>; then log in again.
+    Nothing else is available until you do.
+    <p><label>Enrollment code <input id="enrollment-code" autocomplete="off"></label></p></div>{{end}}
   {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 
   <h3>Enrolled factors</h3>
@@ -82,7 +88,9 @@ async function registerWebAuthn() {
   btn.disabled = true;
   out.textContent = 'Asking the daemon for a challenge…';
   try {
-    const beginRes = await fetch('/account/2fa/webauthn/begin', {method: 'POST'});
+    const codeEl = document.getElementById('enrollment-code');
+    const codeHdr = codeEl ? {'X-Enrollment-Code': codeEl.value.trim()} : {};
+    const beginRes = await fetch('/account/2fa/webauthn/begin', {method: 'POST', headers: codeHdr});
     if (!beginRes.ok) {
       const err = await beginRes.json().catch(() => ({error: beginRes.statusText}));
       throw new Error('begin: ' + (err.error || beginRes.statusText));
@@ -116,7 +124,7 @@ async function registerWebAuthn() {
 
     const finishRes = await fetch('/account/2fa/webauthn/finish', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: Object.assign({'Content-Type': 'application/json'}, codeHdr),
       body: JSON.stringify(attestation),
     });
     const finishBody = await finishRes.json().catch(() => ({}));

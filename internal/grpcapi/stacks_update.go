@@ -141,10 +141,25 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		v := desired.Tpm
 		req.Tpm = &v
 	}
+	if plan.TuningRedefine {
+		// Discard, detect_zeroes and NIC queues travel IN the request: whichever
+		// host owns the VM applies them to its own spec and writes it only after
+		// the redefine, so a deploy entering on another node cannot lose them to
+		// a spec it overwrote, and a failed redefine leaves the spec untouched.
+		req.DiskTuning, req.NicQueues = tuningUpdates(desired, stored)
+	}
+	// The limits travel in the same update as the new size: a file that lowers
+	// the cpu count and the cap together must not have the old cap judged
+	// against the new count.
+	limitFields, otherFields := splitLimitFields(planMetadataFields(plan))
+	if len(limitFields) > 0 {
+		lr := limitUpdateFromDesired(name, desired, limitFields)
+		req.CpuLimit, req.CpuShares, req.NicRate = lr.CpuLimit, lr.CpuShares, lr.NicRate
+	}
 	if _, err := s.UpdateVM(ctx, req); err != nil {
 		return fmt.Errorf("reconfigure with restart: %w", err)
 	}
-	if fields := planMetadataFields(plan); len(fields) > 0 {
+	if fields := otherFields; len(fields) > 0 {
 		if err := s.applyLiveMetadata(ctx, name, desired, fields); err != nil {
 			return fmt.Errorf("metadata after reconfigure: %w", err)
 		}
@@ -215,4 +230,45 @@ func (s *Server) applyPlannedUpdate(ctx context.Context, action planner.VMAction
 		return gate.waitCreated(ctx, action)
 	}
 	return nil
+}
+
+// tuningUpdates lists what the desired spec changes in the stored one's disk
+// discard / detect_zeroes and NIC queues; a value left unset inherits.
+func tuningUpdates(desired, stored *pb.VMSpec) ([]*pb.DiskTuningUpdate, []*pb.NICQueuesUpdate) {
+	cur := map[string]*pb.DiskSpec{}
+	for _, d := range stored.Disks {
+		if d != nil {
+			cur[compose.DiskKey(d.Name)] = d
+		}
+	}
+	var disks []*pb.DiskTuningUpdate
+	for _, d := range desired.Disks {
+		if d == nil || (d.Discard == "" && d.DetectZeroes == "") {
+			continue
+		}
+		c := cur[compose.DiskKey(d.Name)]
+		if c == nil {
+			c = &pb.DiskSpec{}
+		}
+		u := &pb.DiskTuningUpdate{Name: compose.DiskKey(d.Name)}
+		if d.Discard != "" && d.Discard != c.Discard {
+			u.Discard = d.Discard
+		}
+		if d.DetectZeroes != "" && d.DetectZeroes != c.DetectZeroes {
+			u.DetectZeroes = d.DetectZeroes
+		}
+		if u.Discard != "" || u.DetectZeroes != "" {
+			disks = append(disks, u)
+		}
+	}
+	var nics []*pb.NICQueuesUpdate
+	for i, n := range desired.Network {
+		if n == nil || n.Queues == 0 || i >= len(stored.Network) || stored.Network[i] == nil {
+			continue
+		}
+		if n.Queues != stored.Network[i].Queues {
+			nics = append(nics, &pb.NICQueuesUpdate{Ordinal: int32(i), Queues: n.Queues})
+		}
+	}
+	return disks, nics
 }

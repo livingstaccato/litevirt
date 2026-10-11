@@ -156,45 +156,54 @@ var dataDirPoolAreas = []string{"mounts", "pools"}
 // newHWMStore(dir)): those were found by sweeping every function the data
 // directory is passed to, and a new one needs adding here by hand.
 var dataDirOwned = []string{
-	"state.db",               // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
-	"pki",                    // the daemon's PKI when pki_dir is put in the data directory
-	"vms",                    // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go
-	"images",                 // image/store.go, imageops.go, restore_dest.go
-	"imports",                // vmimport.go: import work dirs and imports/staging (--server-path)
-	"import-placements",      // vmimport_placement.go importPlacementDirName
-	"iso-identity",           // iso_identity.go isoIdentityDir
-	"cloudinit",              // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
-	"nvram",                  // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
-	"vmstate",                // libvirt/xmlgen.go VMStatePath (saved memory state)
-	"snapfw",                 // libvirt/vtpmstate.go snapshot firmware bundles
-	"oci",                    // grpcapi/containers.go OCI image cache
-	"oci-owners",             // grpcapi/container_paths.go ociOwnersDir
-	"ct-idmap-ledger",        // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
-	"recreate-failed",        // grpcapi/vm_recreate_replaces.go: specs of failed recreates
-	"containers",             // daemon.go: the LXC container root
-	"ct-snapshots",           // snapshot_container.go containerSnapshotDir
-	"ct-restore",             // backup_container.go container restore staging
-	"ct-restore-markers",     // backup_container.go
-	"promote-markers",        // promote.go
-	"restore-staging",        // peer_backup.go
-	"backup-staging",         // peer_backup.go
-	"backup-scratch",         // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)
-	"backup-sock",            // libvirt/backup_session.go sessSocketDir (hardcoded /var/lib/litevirt)
-	"replicate-scratch",      // replication_runner.go
-	"opjournal",              // daemon.go: the operation journal
-	"acme",                   // daemon/acme.go: ACME cache_dir default
-	"partition-pause",        // health/partition_pause_store.go partitionPauseDir
-	"pending-audit",          // corrosion/pending_audit.go PendingAuditDirName
-	"audit-hold",             // corrosion/audit_hold.go AuditHoldDirName
-	"audit-seeded.json",      // corrosion/audit_seeded.go AuditSeededFileName
-	"audit-seeded-assert",    // corrosion/audit_seeded.go AuditSeededAssertFileName
-	"credentials_unhydrated", // corrosion/isolation.go credentialsUnhydratedFile
-	"digest-invalidate",      // corrosion/digest_cache.go digestMarkerFile
-	"host_membership_live",   // corrosion/host_membership.go hostMembershipLiveFile
-	"genesis-pending",        // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
-	"pool-uploads.json",      // storage_pool_confine.go poolUploadsFile
-	"nowts.hwm",              // corrosion/hwm.go (and nowts.hwm.lock)
-	"split_brain_activated",  // health/capability.go ActivationMarkerBase (markers are .<token>)
+	"state.db",                  // corrosion/client.go NewClient, NewLocalClient (and -wal/-shm, dataDirOwnedPrefixes)
+	"pki",                       // the daemon's PKI when pki_dir is put in the data directory
+	"vms",                       // health/owner_marker.go: per-VM owner-epoch markers; deleted_vm_marker_sweep.go
+	"images",                    // image/store.go, imageops.go, restore_dest.go
+	"imports",                   // vmimport.go: import work dirs and imports/staging (--server-path)
+	"import-placements",         // vmimport_placement.go importPlacementDirName
+	"iso-identity",              // iso_identity.go isoIdentityDir
+	"cloudinit",                 // libvirt/xmlgen.go CloudInitISOPath; migrate.go, vm_iso.go
+	"nvram",                     // libvirt/xmlgen.go NvramPath; vtpmstate.go retainedMarkerPath
+	"vmstate",                   // libvirt/xmlgen.go VMStatePath (saved memory state)
+	"snapfw",                    // libvirt/vtpmstate.go snapshot firmware bundles
+	"oci",                       // grpcapi/containers.go OCI image cache
+	"oci-owners",                // grpcapi/container_paths.go ociOwnersDir
+	"ct-idmap-ledger",           // grpcapi/container_security.go idmapLedgerFile (and its .tmp)
+	"recreate-failed",           // grpcapi/vm_recreate_replaces.go: specs of failed recreates
+	"iscsi-lun-holds",           // grpcapi/vm_lun_hold.go lunHoldDirName: moved iSCSI LUN holds
+	"containers",                // daemon.go: the LXC container root
+	"ct-snapshots",              // snapshot_container.go containerSnapshotDir
+	"ct-restore",                // backup_container.go container restore staging
+	"ct-restore-markers",        // backup_container.go
+	"ct-provenance",             // grpcapi/replication_container.go: container replica provenance
+	"promote-markers",           // promote.go
+	"restore-staging",           // peer_backup.go
+	"backup-staging",            // peer_backup.go
+	"backup-scratch",            // libvirt/backup_session.go sessScratchDir (hardcoded /var/lib/litevirt)
+	"backup-sock",               // libvirt/backup_session.go sessSocketDir (hardcoded /var/lib/litevirt)
+	"replicate-scratch",         // replication_runner.go
+	"opjournal",                 // daemon.go: the operation journal
+	"acme",                      // daemon/acme.go: ACME cache_dir default
+	"partition-pause",           // health/partition_pause_store.go partitionPauseDir
+	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
+	"audit-hold",                // corrosion/audit_hold.go AuditHoldDirName
+	"audit-seeded.json",         // corrosion/audit_seeded.go AuditSeededFileName
+	"audit-seeded-assert",       // corrosion/audit_seeded.go AuditSeededAssertFileName
+	"credentials_unhydrated",    // corrosion/isolation.go credentialsUnhydratedFile
+	"digest-invalidate",         // corrosion/digest_cache.go digestMarkerFile
+	"host_membership_live",      // corrosion/host_membership.go hostMembershipLiveFile
+	"credentials_split_live",    // corrosion/credentials_live.go credentialsLiveFile
+	"credentials_baseline",      // corrosion/credentials_live.go credentialsBaselineFile
+	"credentials_external_seen", // corrosion/credentials_live.go externalSeenFile
+	"genesis-pending",           // daemon.go genesisMarkerName; host_init.go genesisMarkerScript
+	"pool-uploads.json",         // storage_pool_confine.go poolUploadsFile
+	"host-updates.json",         // grpcapi/host_updates.go hostUpdateCountsPath
+	"file-restore",              // daemon.go fileRestoreCacheDir/fileRestoreRunDir (a non-root daemon only)
+	"nowts.hwm",                 // corrosion/hwm.go (and nowts.hwm.lock)
+	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
+	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
+	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path
@@ -204,7 +213,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "ceph-trash-purges.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

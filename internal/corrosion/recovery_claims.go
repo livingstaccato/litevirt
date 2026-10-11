@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -36,6 +38,18 @@ const (
 	ClaimKindVM        = "vm"
 	ClaimKindContainer = "container"
 )
+
+// ClaimKindLUN is the target_kind of an iSCSI LUN allocation: the claim at
+// key (lun, <LUN key>, g, 0) decides which disk the LUN's g-th allocation is
+// (docs/storage.md, "iSCSI: one LUN, one disk"). It is decided under the voter
+// generation like a workload key, and carried across a generation change.
+const ClaimKindLUN = "lun"
+
+// LUNClaimKey is the key of a LUN's gen-th allocation; lun is a
+// storage.FixedDevice key.
+func LUNClaimKey(lun string, gen int64) ClaimKey {
+	return ClaimKey{TargetKind: ClaimKindLUN, TargetName: lun, OwnerEpoch: gen}
+}
 
 // ClaimKey is what one claim decides.
 type ClaimKey struct {
@@ -98,9 +112,21 @@ func (k ClaimKey) IsWorkload() bool {
 	return k.TargetKind == ClaimKindVM || k.TargetKind == ClaimKindContainer
 }
 
+// IsLUN reports whether k decides an iSCSI LUN allocation.
+func (k ClaimKey) IsLUN() bool { return k.TargetKind == ClaimKindLUN }
+
+// IsGenerationScoped reports whether k is decided by the members of the voter
+// generation and carried into the next one (§4.4): a workload recovery or a LUN
+// allocation. A voter_config key decides the generation itself.
+func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() }
+
 // Validate refuses a key no voter should record state for.
 func (k ClaimKey) Validate() error {
 	switch {
+	case k.IsLUN():
+		if k.TargetName == "" || k.OwnerEpoch < 0 || k.Attempt != 0 || k.Incarnation != "" {
+			return fmt.Errorf("a LUN key is (lun, <LUN>, generation, 0) with no incarnation, got %+v", k)
+		}
 	case k.IsVoterConfig():
 		if k.TargetName != "" || k.Attempt != 0 || k.OwnerEpoch < 0 || k.Incarnation != "" {
 			return fmt.Errorf("a voter_config key is (voter_config, \"\", generation, 0), got %+v", k)
@@ -207,8 +233,39 @@ type VoterConfigValue struct {
 	CreatedAt  string        `json:"created_at"`
 }
 
+// LUNAllocation is the value a LUN claim decides: which disk of which VM the
+// LUN's Generation-th allocation is, made by which create on which host.
+type LUNAllocation struct {
+	LUN        string `json:"lun"`        // storage.FixedDevice key
+	Generation int64  `json:"generation"` // the key's OwnerEpoch
+	ClaimID    string `json:"claim_id"`   // the create that proposed it, unique
+	VMID       string `json:"vm_id"`      // the VM's uuid (one incarnation)
+	VMName     string `json:"vm_name"`
+	Disk       string `json:"disk"`
+	Host       string `json:"host"` // the host running the create
+	// RunHost is set on a MOVED allocation — a rebuild or recreate deciding
+	// its VM's next allocation before the teardown — when the re-created VM
+	// runs on another host than Host: Host holds the claim until that VM's
+	// rows reach it, RunHost runs the VM. The allocation is gone only once
+	// both show nothing (or are recorded removed).
+	RunHost string `json:"run_host,omitempty"`
+	// Kept is set on a moved allocation whose disk keeps the LUN's contents
+	// across the re-create: the LUN is that VM's own disk, as it was. A
+	// create of the same VM name and disk that decides the allocation right
+	// after it takes the LUN over as it is (the recovery of a re-create torn
+	// down and failed), where any other create meets a LUN holding data.
+	Kept bool `json:"kept,omitempty"`
+	// Project and ReplacedCreatedAt bind a Kept allocation: only a create in
+	// that (canonical) project takes the LUN over, and only while no plain
+	// delete of the VM's incarnation ReplacedCreatedAt, or of a later one, is
+	// recorded on the LUN (GetLUNPlainDelete). Set only with Kept.
+	Project           string `json:"project,omitempty"`
+	ReplacedCreatedAt string `json:"replaced_created_at,omitempty"`
+}
+
 // ClaimValue is what a claim decides. Exactly one of Proof (a workload
-// recovery, §3.4) and Config (a voter-config change, §4.3) is set.
+// recovery, §3.4), Config (a voter-config change, §4.3) and LUN (an iSCSI LUN
+// allocation) is set.
 type ClaimValue struct {
 	// Proof carries the ActionProof binding fields (ProofBindingEqual's set
 	// plus the proof ID). The lease-holder and quorum fields are not part of
@@ -219,11 +276,13 @@ type ClaimValue struct {
 	// certificate names the source its voters could not reach.
 	SourceHost string            `json:"source_host,omitempty"`
 	Config     *VoterConfigValue `json:"config,omitempty"`
+	LUN        *LUNAllocation    `json:"lun,omitempty"`
 }
 
 const (
 	claimValueDomain       = "litevirt-recovery-value-v1"
 	claimConfigValueDomain = "litevirt-voter-config-value-v1"
+	claimLUNValueDomain    = "litevirt-lun-allocation-v1"
 	claimAcceptDomain      = "litevirt-recovery-accept-v1"
 	// claimAcceptDomainV2 signs an accept at an incarnation-scoped key. Its
 	// own domain, so no v2 accept is ever the same bytes as a v1 one: a legacy
@@ -270,7 +329,7 @@ func SortMembers(members []VoterMember) []VoterMember {
 func (v ClaimValue) Digest() (string, error) {
 	h := sha256.New()
 	switch {
-	case v.Proof != nil && v.Config == nil:
+	case v.Proof != nil && v.Config == nil && v.LUN == nil:
 		p := v.Proof
 		claimField(h, claimValueDomain)
 		for _, f := range []string{
@@ -280,7 +339,32 @@ func (v ClaimValue) Digest() (string, error) {
 		} {
 			claimField(h, f)
 		}
-	case v.Config != nil && v.Proof == nil && v.SourceHost == "":
+	case v.LUN != nil && v.Proof == nil && v.Config == nil && v.SourceHost == "":
+		l := v.LUN
+		claimField(h, claimLUNValueDomain)
+		for _, f := range []string{l.LUN, i64(l.Generation), l.ClaimID, l.VMID, l.VMName, l.Disk, l.Host} {
+			claimField(h, f)
+		}
+		if l.RunHost != "" {
+			// Only a moved allocation has it, so every other value digests
+			// as it always did.
+			claimField(h, l.RunHost)
+		}
+		if l.Kept || l.Project != "" || l.ReplacedCreatedAt != "" {
+			// Only a kept moved allocation has these, so every other value
+			// digests as it always did. One block of four fields: with or
+			// without RunHost (one field), the four field counts differ, so no
+			// spelling of one digests as another.
+			kept := "0"
+			if l.Kept {
+				kept = "1"
+			}
+			claimField(h, "kept-v1")
+			claimField(h, kept)
+			claimField(h, l.Project)
+			claimField(h, l.ReplacedCreatedAt)
+		}
+	case v.Config != nil && v.Proof == nil && v.LUN == nil && v.SourceHost == "":
 		cfg := v.Config
 		claimField(h, claimConfigValueDomain)
 		claimField(h, i64(cfg.Generation))
@@ -289,7 +373,7 @@ func (v ClaimValue) Digest() (string, error) {
 		claimField(h, cfg.CreatedBy)
 		claimField(h, cfg.CreatedAt)
 	default:
-		return "", fmt.Errorf("a claim value carries exactly one of a proof or a voter config")
+		return "", fmt.Errorf("a claim value carries exactly one of a proof, a voter config or a LUN allocation")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -375,6 +459,7 @@ func acceptPayload(key ClaimKey, gen int64, b Ballot, digest, voter, incarnation
 type ClaimSigner struct {
 	name    string
 	certPEM string
+	serial  string // lower-case hex, of the certificate in certPEM
 	key     *ecdsa.PrivateKey
 }
 
@@ -409,7 +494,40 @@ func LoadClaimSigner(pkiDir, hostName string) (*ClaimSigner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse host key: %w", err)
 	}
-	return &ClaimSigner{name: hostName, certPEM: string(certPEM), key: priv}, nil
+	return &ClaimSigner{name: hostName, certPEM: string(certPEM),
+		serial: strings.ToLower(cert.SerialNumber.Text(16)), key: priv}, nil
+}
+
+// ClaimSignerFromKeyPair builds the signer from the host identity this process
+// is SERVING (pki.ServedHostKeyPair), for a signer that has to follow a renewal.
+//
+// The pair comes from the TLS identity source rather than two file reads
+// because it is already known to match: certificate and key are separate files,
+// and reading them one after the other mid-renewal can pair the new certificate
+// with the old key — a signer whose every accept fails verification.
+func ClaimSignerFromKeyPair(hostName string, pair *tls.Certificate) (*ClaimSigner, error) {
+	if pair == nil || pair.Leaf == nil || len(pair.Certificate) == 0 {
+		return nil, fmt.Errorf("no host certificate loaded")
+	}
+	if pair.Leaf.Subject.CommonName != hostName {
+		return nil, fmt.Errorf("host certificate CN is %q but this host is %q", pair.Leaf.Subject.CommonName, hostName)
+	}
+	priv, ok := pair.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("host key is %T, not an ECDSA key", pair.PrivateKey)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]})
+	return &ClaimSigner{name: hostName, certPEM: string(certPEM),
+		serial: strings.ToLower(pair.Leaf.SerialNumber.Text(16)), key: priv}, nil
+}
+
+// Serial is the serial of the certificate this signer's accepts carry, as
+// lower-case hex.
+func (s *ClaimSigner) Serial() string {
+	if s == nil {
+		return ""
+	}
+	return s.serial
 }
 
 // Name is the voter this signer signs as.
@@ -444,7 +562,121 @@ type ClaimVerifier struct {
 	// historical is set on the copy Historical returns: a certificate
 	// revoked since still counts. Nothing else is relaxed.
 	historical bool
+	// extraRevoked are serials (lower-case hex) treated as revoked in addition
+	// to the installed CRL — the "what if" WithRevoked asks.
+	extraRevoked map[string]bool
+	// pinned (WithSerialPin): an accept signed with a certificate the CA has
+	// replaced (pki.SupersededBy) does not count.
+	pinned bool
+	noPin  bool
+	// renewalBlind (RenewalBlind): an accept signed with a certificate the CA
+	// has replaced counts, revoked or not. Diagnosis only.
+	renewalBlind bool
 }
+
+// WithRevoked returns a copy of v that also treats serials as revoked: the
+// question "would this still verify if these were revoked?" asked before a
+// revocation is published (a renewed voter's replaced certificate).
+func (v *ClaimVerifier) WithRevoked(serials ...string) *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.extraRevoked = map[string]bool{}
+	for k := range v.extraRevoked {
+		h.extraRevoked[k] = true
+	}
+	for _, s := range serials {
+		h.extraRevoked[strings.ToLower(s)] = true
+	}
+	return &h
+}
+
+// WithSerialPin returns a copy of v that also refuses an accept signed with a
+// certificate the CA has REPLACED: one this node holds a standing CA-issued
+// successor of (pki.SupersededBy — the renewal extension, collected from
+// handshakes, from accepts and from this node's own identity, and kept
+// node-locally). Its authority is the CA's signature on the successor and
+// nothing else: no replicated row, which any peer can write, can relax it.
+//
+// Without it, §3.10 step 5 asks only for a CA-issued, unrevoked certificate
+// naming the voter, so the key of a certificate a renewal replaced — revocation
+// of which may be held (§4.1) or skipped with --keep-old — could still sign
+// accepts. A certificate this node holds no successor of is not refused by
+// the pin; revocation (the CRL) is what ends it. Historical verification is
+// never pinned: history was signed by whatever a voter held then.
+func (v *ClaimVerifier) WithSerialPin() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pinned, h.noPin = true, false
+	return &h
+}
+
+// Pinned reports whether v refuses accepts signed with replaced certificates.
+func (v *ClaimVerifier) Pinned() bool { return v != nil && v.pinned }
+
+// WithoutSerialPin returns a copy of v that VerifyClaimCertificate does not
+// pin: the auth.trust_rotated_peer_certs recovery mode, for a fleet whose
+// recorded serials went stale and which peer trust already relaxes.
+func (v *ClaimVerifier) WithoutSerialPin() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pinned, h.noPin = false, true
+	return &h
+}
+
+// RenewalBlind returns a copy of v that COUNTS an accept signed with a
+// certificate the CA has replaced (a standing successor this node holds,
+// pki.SupersededBy) — not pinned, and its revocation disregarded, since `lv
+// host renew-cert` revokes the replaced certificate BECAUSE it was renewed.
+// Everything else is checked as v does.
+//
+// It answers one question and must never decide anything: "does this
+// certificate fail ONLY because one of its signers renewed since?" A
+// generation that passes RenewalBlind but not v is one this node is stuck
+// below by a renewal (voter_generation_stuck), and the signers whose accepts
+// it cannot count are the ones asked to re-attest them.
+func (v *ClaimVerifier) RenewalBlind() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.pinned, h.noPin, h.renewalBlind = false, true, true
+	return &h
+}
+
+// SupersededAccepts lists the voters whose accepts in cert are signed with a
+// certificate the CA has replaced, as far as this node knows (a standing
+// successor it holds). They are the accepts a renewal took out of the count.
+func (v *ClaimVerifier) SupersededAccepts(cert ClaimCertificate) []string {
+	if v == nil {
+		return nil
+	}
+	for _, a := range cert.Accepts {
+		v.noteSuccessors(a.CertPEM)
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, a := range cert.Accepts {
+		c, err := parseCertPEM([]byte(a.CertPEM))
+		if err != nil || seen[a.Voter] {
+			continue
+		}
+		if pki.SupersededError(v.pkiDir, c) != nil {
+			seen[a.Voter] = true
+			out = append(out, a.Voter)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SerialPinDisabled reports whether WithoutSerialPin made v.
+func (v *ClaimVerifier) SerialPinDisabled() bool { return v != nil && v.noPin }
 
 // LoadClaimVerifier loads the cluster CA from pkiDir. Revocation is read from
 // the CRL bundle installed in pkiDir (the CA-verified union of every published
@@ -481,7 +713,39 @@ func (v *ClaimVerifier) Historical() *ClaimVerifier {
 
 // revoked reports whether c's certificate counts as revoked for this verifier.
 func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
-	return !v.historical && pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
+	if v.historical {
+		return false
+	}
+	if v.renewalBlind && pki.SupersededError(v.pkiDir, c) != nil {
+		return false
+	}
+	if v.extraRevoked[strings.ToLower(c.SerialNumber.Text(16))] {
+		return true
+	}
+	return pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
+}
+
+// pinRefuses reports why c may not sign as voter under v's serial pin, or nil.
+func (v *ClaimVerifier) pinRefuses(c *x509.Certificate, voter string) error {
+	if v.historical || !v.pinned {
+		return nil
+	}
+	if err := pki.SupersededError(v.pkiDir, c); err != nil {
+		return fmt.Errorf("signed as %s with a replaced certificate: %w", voter, err)
+	}
+	return nil
+}
+
+// noteSuccessors collects, from every certificate an accept carries, the CA's
+// proof that some other certificate was replaced (pki.NoteSuccessor). It runs
+// before any accept is judged, so a renewed voter's own accept in a row proves
+// its predecessor replaced for the rest of that row as well.
+func (v *ClaimVerifier) noteSuccessors(certPEMs ...string) {
+	for _, p := range certPEMs {
+		if c, err := parseCertPEM([]byte(p)); err == nil {
+			pki.NoteSuccessor(v.pkiDir, c)
+		}
+	}
 }
 
 // CertExpectation is what a certificate must certify, and who may certify it.
@@ -527,6 +791,9 @@ func (v *ClaimVerifier) Verify(cert ClaimCertificate, want CertExpectation) erro
 	counted := map[string]bool{}
 	var problems []string
 	for _, a := range cert.Accepts {
+		v.noteSuccessors(a.CertPEM)
+	}
+	for _, a := range cert.Accepts {
 		if err := v.verifyAccept(cert, a, electorate); err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", a.Voter, err))
 			continue
@@ -564,6 +831,9 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	}
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
+	}
+	if err := v.pinRefuses(c, a.Voter); err != nil {
+		return err
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)
 	if !ok {

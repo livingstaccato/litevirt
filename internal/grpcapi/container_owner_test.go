@@ -106,10 +106,10 @@ func chooseOwnersBackup(t *testing.T, otherProject, otherOwnerID string) {
 		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", OwnerID: "own-1"})}
 	other := &corrosion.ContainerRecord{HostName: "host-c", Name: "ct1", Project: otherProject,
 		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Template: "download", Distro: "alpine", OwnerID: otherOwnerID})}
-	if _, err := s.archiveContainer(ctx, repo, own, "2026-06-27T12:00:00Z", nil); err != nil {
+	if _, err := s.archiveContainer(ctx, repo, own, "2026-06-27T12:00:00Z", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.archiveContainer(ctx, repo, other, "2026-06-28T12:00:00Z", nil); err != nil {
+	if _, err := s.archiveContainer(ctx, repo, other, "2026-06-28T12:00:00Z", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	own.State, own.StateDetail = "relocating", corrosion.RelocateRestoreDetail("host-b", "tok-x")

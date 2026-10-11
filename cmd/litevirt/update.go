@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -37,20 +39,35 @@ func newUpdateCmd() *cobra.Command {
 		force           bool
 		restartIfNeeded bool
 		allowOvercommit bool
+		memHotplugMax   int32
+		clearUSB        bool
+		usb             usbFlags
+		// noisy-neighbour limits (applied live, no restart)
+		cpuLimit  float64
+		cpuShares int32
+		nicRates  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
 		Short: "Reconfigure a VM (restart policy, autostart, resources, ...)",
 		Long: `Reconfigure an existing VM.
 
-Restart policy, autostart (onboot) and startup ordering apply LIVE — the VM does
+Restart policy, autostart (onboot), startup ordering and the noisy-neighbour
+limits (--cpu-limit, --cpu-shares, --nic-rate) apply LIVE — the VM does
 not need to be stopped. CPU, memory, CPU mode, VNC, machine type, firmware,
 guest-agent and the balloon min/max bounds change the domain definition, so the
 VM must be stopped for those.
 
 With live_resize enabled cluster-wide, --cpu GROWS a running VM's vCPUs LIVE up to
 its --max-cpu hotplug ceiling (a CPU shrink or exceeding the ceiling still needs a
-stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
+stop), and 'lv set-memory' balloons memory live within the min/max bounds.
+
+A VM with memory hot-add (--memory-hotplug-max) takes --memory LIVE: memory above
+its boot size is a virtio-mem region, plugged or unplugged in the running guest.
+
+--usb, --usb-port and --usb-mapping REPLACE the VM's USB passthrough list
+(--clear-usb empties it). Like the other definition changes, they need the VM
+stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f := cmd.Flags()
@@ -59,7 +76,8 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 				"restart", "restart-max-attempts", "restart-delay", "restart-window",
 				"onboot", "startup-order", "start-delay", "stop-delay",
 				"machine", "firmware", "guest-agent", "min-mem", "max-mem", "max-cpu",
-				"secure-boot", "tpm"} {
+				"secure-boot", "tpm", "memory-hotplug-max", "clear-usb", "usb", "usb-port", "usb-mapping",
+				"cpu-limit", "cpu-shares", "nic-rate"} {
 				if f.Changed(n) {
 					any = true
 					break
@@ -112,7 +130,34 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			if f.Changed("tpm") {
 				req.Tpm = &tpm
 			}
+			if f.Changed("memory-hotplug-max") {
+				req.MemoryHotplugMaxMib = &memHotplugMax
+			}
+			if usb.changed(cmd) || clearUSB {
+				if clearUSB && usb.changed(cmd) {
+					return fmt.Errorf("--clear-usb and --usb/--usb-port/--usb-mapping are exclusive: the USB flags already replace the whole list")
+				}
+				devs, err := usb.devices()
+				if err != nil {
+					return err
+				}
+				req.SetUsbDevices, req.UsbDevices = true, devs
+			}
 			req.Force = force
+			// Noisy-neighbour limits: presence-detected, so 0 can clear one.
+			if f.Changed("cpu-limit") {
+				req.CpuLimit = &cpuLimit
+			}
+			if f.Changed("cpu-shares") {
+				req.CpuShares = &cpuShares
+			}
+			for _, spec := range nicRates {
+				nr, err := parseNICRate(spec)
+				if err != nil {
+					return err
+				}
+				req.NicRate = append(req.NicRate, nr)
+			}
 			// Live metadata: only send what changed (presence-detected).
 			if f.Changed("restart") || f.Changed("restart-max-attempts") ||
 				f.Changed("restart-delay") || f.Changed("restart-window") {
@@ -148,6 +193,9 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			})
 		},
 	}
+	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (live; 0 removes the cap)")
+	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits, default 100 (live; 0 restores the default)")
+	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s> with a 0-based NIC number, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")
 	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "", "CPU mode: host-passthrough|host-model|custom (VM must be stopped)")
@@ -173,5 +221,26 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 	cmd.Flags().BoolVar(&restartIfNeeded, "restart-if-needed", false, "Permit a stop→redefine→start for a change that can't apply live (cpu shrink, machine/firmware, beyond the vCPU ceiling)")
 	cmd.Flags().BoolVar(&allowOvercommit, "allow-overcommit", false,
 		"Skip the host capacity check when --restart-if-needed grows the VM (project quota still applies). The bypass is audited.")
+	cmd.Flags().Int32Var(&memHotplugMax, "memory-hotplug-max", 0,
+		"Memory hot-add ceiling in MiB (virtio-mem; 0 turns it off). Set while stopped; then --memory or lv set-memory changes memory live up to it")
+	cmd.Flags().BoolVar(&clearUSB, "clear-usb", false, "Remove every USB passthrough device (VM must be stopped)")
+	usb.register(cmd)
 	return cmd
+}
+
+// parseNICRate parses one --nic-rate value, "<nic>=<MB/s>".
+func parseNICRate(v string) (*pb.NICRateUpdate, error) {
+	n, rate, ok := strings.Cut(v, "=")
+	if !ok {
+		return nil, fmt.Errorf("--nic-rate %q: want <nic>=<MB/s>, e.g. 0=12.5", v)
+	}
+	ord, err := strconv.Atoi(strings.TrimSpace(n))
+	if err != nil || ord < 0 {
+		return nil, fmt.Errorf("--nic-rate %q: the NIC must be a 0-based number", v)
+	}
+	r, err := strconv.ParseFloat(strings.TrimSpace(rate), 64)
+	if err != nil || r < 0 {
+		return nil, fmt.Errorf("--nic-rate %q: the rate must be a number of MB/s, 0 or more", v)
+	}
+	return &pb.NICRateUpdate{Ordinal: int32(ord), RateMbSec: r}, nil
 }

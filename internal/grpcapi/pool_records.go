@@ -50,9 +50,10 @@ type replicaRow struct {
 }
 
 type slotFile struct {
-	Size    int64 `json:"size"`
-	MtimeNs int64 `json:"mtime_ns"`
-	Copy    bool  `json:"copy,omitempty"`
+	Size           int64 `json:"size"`
+	MtimeNs        int64 `json:"mtime_ns"`
+	Copy           bool  `json:"copy,omitempty"`
+	NotPointInTime bool  `json:"not_point_in_time,omitempty"`
 }
 
 // uploadRow is one host's replicated record of the uploads it recorded on
@@ -109,7 +110,7 @@ func (s *Server) shareRecord(ctx context.Context, path string, u poolUpload) err
 			if row.Files == nil {
 				row.Files = map[string]slotFile{}
 			}
-			row.Files[name] = slotFile{Size: u.Size, MtimeNs: u.MtimeNs, Copy: u.Copy}
+			row.Files[name] = slotFile{Size: u.Size, MtimeNs: u.MtimeNs, Copy: u.Copy, NotPointInTime: u.NotPointInTime}
 			dropGone(dir, row.Files)
 			b, err := json.Marshal(row)
 			return string(b), err
@@ -268,7 +269,7 @@ func (s *Server) addSharedRecords(ctx context.Context, m poolRecords, dir string
 			}
 			p := filepath.Join(dir, name)
 			m[p] = append(m[p], poolUpload{Pool: row.Pool, Project: row.Project, VM: row.VM, VMUUID: row.VMUUID, Disk: row.Disk,
-				Copy: f.Copy, Size: f.Size, MtimeNs: f.MtimeNs, shared: true})
+				Copy: f.Copy, NotPointInTime: f.NotPointInTime, Size: f.Size, MtimeNs: f.MtimeNs, shared: true})
 		}
 	}
 	return nil

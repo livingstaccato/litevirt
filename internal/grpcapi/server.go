@@ -27,9 +27,11 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/smart"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -52,6 +54,14 @@ type Server struct {
 	// supersededRetentionDays is superseded_disk_retention_days, reported by
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
+
+	// hostUpdates is host_updates: the read-only pending-OS-update check
+	// (host_updates.go).
+	hostUpdates HostUpdatesConfig
+
+	// replRuns is each replication schedule's reporting state
+	// (replication_outcome.go).
+	replRuns replRuns
 
 	// isoLib holds the ISO library's per-host state: the sha256 cache of
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
@@ -208,6 +218,14 @@ type Server struct {
 	// unregistered path is admin-only (resolveBackupRepoPath).
 	backupRepos map[string]string
 
+	// backupBW holds the per-repo backup bandwidth limits (daemon config
+	// backup_bwlimits), set via SetBackupBandwidthLimits.
+	backupBW backupBandwidth
+
+	// fileRestore holds single-file restore's restore VM sessions
+	// (file_restore.go), configured via SetFileRestore.
+	fileRestore fileRestoreSessions
+
 	// imageMaxBytes / imagePullTimeout bound image pull+import (disk-fill /
 	// SSRF guards), set from daemon config via SetImageLimits. Zero → the image
 	// package defaults apply. imageBlockedCIDRs is the opt-in URL-pull network
@@ -235,8 +253,14 @@ type Server struct {
 	// converges a rotation on a healthy cluster, but cannot rescue one that has
 	// stopped replicating, because the corrected row has to travel over the very
 	// channel the stale serial blocks. Default false — turn it on fleet-wide, let
-	// the self-recorded serials replicate, then turn it back off.
-	trustRotatedPeerCerts bool
+	// the self-recorded serials replicate, then turn it back off. Atomic: the
+	// certificate watch and every RPC read it, and SetTrustRotatedPeerCerts may
+	// change it while they run.
+	trustRotatedPeerCerts atomic.Bool
+
+	// certRev is the owed-revocation processing state kept between ticks
+	// (cert_revocation.go).
+	certRev certRevocationState
 
 	// forwardedIdentity, when true, is this node's enforcement switch for owner-
 	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated
@@ -302,6 +326,20 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
+	// should travel on (migration_network.go). Empty means the host's cluster
+	// address. localIPs is a test seam for the host's own addresses.
+	migrationNetwork                       string
+	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
+	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
+	migrationAddress                       string // migration.address: this host's own answer, when set
+	localIPs                               func() ([]localAddr, error)
+	// failbacks is the set of hosts a failback is running for (failback.go).
+	failbacks failbackRuns
+	// drainRecords writes drain records off the drain's result path, with a
+	// bound and a backoff shared by every drain on this daemon (failback.go).
+	drainRecords drainRecorder
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.
@@ -339,6 +377,10 @@ type Server struct {
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)
+
+	// limitsPreLockHook is a test-only seam run by a limits-only UpdateVM just
+	// before it takes the VM lock, to land a concurrent change in that window.
+	limitsPreLockHook func(vmName string)
 	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
 	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
@@ -514,6 +556,11 @@ type Server struct {
 	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
 
+	// sourceRowWait is how long a peer move's restore polls this replica for
+	// the source row before deciding without it (peerMoveSource); 0 is
+	// defaultSourceRowWait. Tests shorten it.
+	sourceRowWait time.Duration
+
 	// leaseBarrierCache holds the last quorum-observed lease-term threshold per
 	// key. Read ONLY to serve refusals — see leaseTermBarrier for why accepting
 	// from it would be unsound. leaseBarrierFlight collapses concurrent callers
@@ -561,6 +608,12 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// lunClaims holds the iscsi LUNs this host's in-flight creates are taking,
+	// until their disk rows commit (vm_lun_claim.go).
+	lunClaims lunClaimRegistry
+	// lunHolds is this host's durable holds on the LUNs whose claims its
+	// rebuilds and recreates moved (vm_lun_hold.go).
+	lunHolds lunHoldStore
 	// rootfsSizes caches InspectContainer's measured rootfs sizes by path for
 	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
 	rootfsSizeMu sync.Mutex
@@ -597,6 +650,8 @@ type Server struct {
 	lbMetrics        *metrics.LBMetrics
 	haMetrics        *metrics.HAHealthMetrics
 	dualRunMetrics   *metrics.DualRunMetrics
+	smartMetrics     *metrics.SMARTMetrics
+	smartRunner      smart.Runner // test seam; nil = real smartctl
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
@@ -613,6 +668,17 @@ type Server struct {
 	// Guarded by storagePoolsMu because the daemon rewrites it while RPCs read.
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
+
+	// cephSecrets remembers the ceph secrets this daemon defined (ceph_secrets.go).
+	cephSecrets cephSecretMarks
+	// cephProofs remembers, briefly, the ceph keys a start proved (ceph_probe.go).
+	cephProofs cephKeyProofs
+	// cephTrash is what the last scans of the ceph pools' trash found that no
+	// purge here tracks (ScanCephTrash).
+	cephTrash cephTrashScans
+	// cephKept is the ceph images a VM delete left in their pool (a client
+	// still had one open), named until gone or reattached (ceph_kept.go).
+	cephKept cephKeptImages
 
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).
@@ -687,6 +753,10 @@ type Server struct {
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
+	// ioSpecWriteHook, when set, runs between SetDiskIO's libvirt call and its spec
+	// write. Test seam only.
+	ioSpecWriteHook func()
+
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
@@ -789,6 +859,11 @@ type Server struct {
 	// nil = container RPCs return Unavailable. Tests inject a fake.
 	containerRuntime ContainerRuntime
 
+	// lxcCapableForTest, when set, stands in for lxcCapable on this server
+	// only (SetLXCCapableForTest). nil = the host's real lxc tooling probe.
+	// Atomic: a fleet scenario sets it while the node's loops are running.
+	lxcCapableForTest atomic.Pointer[bool]
+
 	// liveMover drives libvirt blockdev-mirror for running-VM
 	// MoveVolume calls. nil = MoveVolume on a running
 	// VM returns Unimplemented (the legacy 1.2.E behaviour).
@@ -799,10 +874,33 @@ type Server struct {
 	// nil and the WebAuthn RPCs return Unimplemented.
 	webauthn *auth.WebAuthnService
 
+	// streamRecheckEvery is how often an open user-authenticated stream
+	// re-checks its credential (stream_watch.go); 0 = StreamRecheckInterval.
+	streamRecheckEvery time.Duration
+	// streamKick wakes every open stream's watcher to re-check now; replaced
+	// (closed) on each kick. Guarded by streamKickMu.
+	streamKickMu sync.Mutex
+	streamKick   chan struct{}
+
 	// backupSource opens guest-content backup sessions (pull-mode NBD).
 	// nil = legacy qcow2-container full backup. Set by daemon when libvirt
 	// is reachable. content-based rewrite.
 	backupSource BackupSource
+
+	// pitSnapshotter takes the external disk-only snapshot a point-in-time
+	// copy falls back to when no backup session opens (pit_copy.go). nil =
+	// that layer is unavailable.
+	pitSnapshotter PointInTimeSnapshotter
+
+	// pitRetry holds the replication runs whose last copy was not
+	// point-in-time, so the scheduler retries them at its next tick
+	// (pit_retry.go). Node-local and in memory: a restart forgets it and
+	// the schedule's own cron runs next.
+	pitRetry pitRetrySet
+
+	// notifySeen, when set, sees every notification notify is asked to
+	// send, before any routing. Tests only.
+	notifySeen func(notify.Notification)
 
 	// ReExecCh is signalled after a successful self-upgrade to trigger
 	// a re-exec of the daemon binary. The daemon's main loop should
@@ -824,6 +922,9 @@ type Server struct {
 	// releaseFeatures opens a release feature (WithReleaseFeature): the
 	// checker's WithFeature in production. Nil refuses every feature.
 	releaseFeatures releaseFeatureGate
+	// loginPolicyBackoff spaces out the best-effort login-rule writes after
+	// the release feature's gate refused one (login_policy_gate.go).
+	loginPolicyBackoff loginPolicyBackoff
 	// releasePeerMu guards the release-peer refusal state (ReleasePeerAllowed).
 	releasePeerMu      sync.Mutex
 	releaseUsed        []string
@@ -1059,6 +1160,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// fence_state_v1 is not withheld either: it says what this binary's
 	// coordinator does with an unverified fence recorded 'offline', a fact
 	// about the build.
+	// relay_health_v1 is not withheld either: it says this binary reads the
+	// relay demotion rows when it elects relays, a fact about the build. The
+	// demotion rows are not written until the ReplicationGated latch forms.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1094,6 +1198,14 @@ func (s *Server) advertisedCapabilities() []string {
 	// every decision it takes part in.
 	if !s.voterConfigAdvertisable() {
 		caps = withoutCapability(caps, capabilities.VoterConfigV1)
+	}
+	// credentials_clear_v1 is mandatory but advertised only once this node has
+	// completed a credentials split pass (corrosion.CredentialsLive). The clear
+	// then cannot latch anywhere until every recipient has, so a node's first
+	// pass runs before any old column is cleared — which is what makes its
+	// legacy-shadow materialisation safe (corrosion/credentials_live.go).
+	if s.db == nil || !s.db.CredentialsLive() {
+		caps = withoutCapability(caps, capabilities.CredentialsClearV1)
 	}
 	// recovery_claim_v1 is withheld while enforcement.recovery_claim is off,
 	// and the reason is the question CLAUDE.md asks of every token: where is
@@ -1529,6 +1641,11 @@ func (s *Server) tokenEnabled(token string) bool {
 		// recorded 'offline' and does not auto-activate such a host, which
 		// the failover lease holder relies on of every node.
 		return true
+	case capabilities.RelayHealthV1:
+		// No kill switch: it says this build reads the relay demotion rows
+		// when it elects relays, and every node relies on every other
+		// electing the same set.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.RecoveryClaimV1:
@@ -1904,6 +2021,20 @@ type CreateContainerOpts struct {
 	// IDMapBase makes the container unprivileged in the range starting there;
 	// 0 is privileged.
 	IDMapBase int64
+	// Mounts and Devices are host paths passed into the container (admin
+	// only); the runtime judges them against this host's allowed prefixes.
+	Mounts  []ContainerMountOpt
+	Devices []ContainerDeviceOpt
+}
+
+// ContainerMountOpt mirrors lxc.Mount; ContainerDeviceOpt mirrors lxc.Device.
+type ContainerMountOpt struct {
+	HostPath, ContainerPath string
+	ReadWrite               bool
+}
+
+type ContainerDeviceOpt struct {
+	HostPath, ContainerPath string
 }
 
 // ContainerNICOpt mirrors lxc.NetworkAttach.
@@ -1969,6 +2100,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
+	s.wireReplicationReleaseGates()
 	return s
 }
 
@@ -2240,16 +2372,26 @@ func (s *Server) lookupStoragePool(name string) (StoragePoolRef, bool) {
 // cluster-wide upgrade resolved "" for the pool dir → "replica not found").
 // corrosion is always current, so consult it on a miss and warm the cache.
 func (s *Server) resolvePool(ctx context.Context, name string) (StoragePoolRef, bool) {
+	ref, ok, _ := s.resolvePoolErr(ctx, name)
+	return ref, ok
+}
+
+// resolvePoolErr is resolvePool that tells "this host has no such pool"
+// (ok false, nil) from "the table could not be read" (an error).
+func (s *Server) resolvePoolErr(ctx context.Context, name string) (StoragePoolRef, bool, error) {
 	if ref, ok := s.lookupStoragePool(name); ok {
-		return ref, true
+		return ref, true, nil
 	}
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, name)
-	if err != nil || !ok {
-		return StoragePoolRef{}, false
+	if err != nil {
+		return StoragePoolRef{}, false, err
+	}
+	if !ok {
+		return StoragePoolRef{}, false, nil
 	}
 	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
 	s.addStoragePoolRef(name, ref)
-	return ref, true
+	return ref, true, nil
 }
 
 // addStoragePoolRef inserts/updates one pool ref under the write lock, so a

@@ -249,6 +249,10 @@ func TestOIDCRealm_AuthCodeFlow_HappyPath(t *testing.T) {
 	if p.Subject != subject {
 		t.Errorf("Subject = %q, want %q", p.Subject, subject)
 	}
+	// The account binds to (issuer, sub) (t1-auth rereview-2 N5).
+	if want := mock.issuer + "|" + subject; p.ExternalID != want {
+		t.Errorf("ExternalID = %q, want %q", p.ExternalID, want)
+	}
 	if p.Realm != "oidc:test" {
 		t.Errorf("Realm = %q, want oidc:test", p.Realm)
 	}

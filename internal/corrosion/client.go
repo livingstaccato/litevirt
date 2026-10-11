@@ -396,6 +396,31 @@ type Client struct {
 	// Atomic: read on replication goroutines that may already run when set.
 	credentialsSplit atomic.Pointer[func() bool]
 
+	// credentialsClear, when non-nil and returning true (and credentialsSplit
+	// too), makes writers and the split pass EMPTY the old secret columns.
+	// Injected via SetCredentialsClearGate, wired to
+	// DurablyLatched(CredentialsClearV1). Fails CLOSED when unset: the old
+	// columns keep their secrets, the dual-write build's behaviour.
+	credentialsClear atomic.Pointer[func() bool]
+
+	// hostMembershipRetire, when non-nil and returning true, stops the state
+	// and isolation writers writing the hosts copy (host_membership_retire_v1).
+	// Fails CLOSED when unset: both homes are written, the dual-write build's
+	// behaviour. See host_membership_retire.go.
+	hostMembershipRetire atomic.Pointer[func() bool]
+
+	// credentialsLive is set once this node has completed a SplitCredentials
+	// pass with the split gate open (credentials_live.go); durable through
+	// credentialsLiveFile. credentialsLiveChecked makes the file read once.
+	credentialsLive        atomic.Bool
+	credentialsLiveChecked atomic.Bool
+	// The credentials baseline and the external-seen set
+	// (credentials_live.go), guarded by externalSeenMu.
+	externalSeenMu  sync.Mutex
+	baselineLoaded  bool
+	baselineSet     map[userIdentity]bool
+	externalSeenSet map[userIdentity]bool
+
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable
 	// host_membership_split_v1 latch. Fails CLOSED when unset, for the
@@ -409,6 +434,12 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// relayHealthGate, when non-nil and returning true, permits writing the
+	// relay_demoted/<host> rows of cluster_policies. Injected via
+	// SetRelayHealthGate, wired to the durable relay_health_v1 latch. Fails
+	// CLOSED when unset: a previous-release peer ignores the key and would
+	// elect a different relay set. See relay_health.go.
+	relayHealthGate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
@@ -425,6 +456,13 @@ type Client struct {
 	// host this node replicates to runs a build that knows every statement
 	// shape this build emits. Fails CLOSED (false) when unset.
 	claimIncarnationGate atomic.Pointer[func() bool]
+	// repointReady says whether every host applies the replication switch's
+	// compare-and-set statement (SetRepointReady): the release token has
+	// durably latched here.
+	repointReady atomic.Pointer[func(context.Context) bool]
+	// releaseFeatureGate runs a release feature's write through this node's
+	// release-feature gate (SetReleaseFeatureGate). Unset, it refuses.
+	releaseFeatureGate atomic.Pointer[ReleaseFeatureGate]
 	// claimCertVerifier supplies the verifier a proof's claim certificate is
 	// judged with before it may REPLACE another (SetProofClaimCertificate and
 	// the anti-entropy merge). Unset, or returning nil, nothing verifies and
@@ -512,6 +550,10 @@ type Client struct {
 // open on purpose — they carry incoming replication and a reseed, and a node that
 // cannot receive could never be repaired, only rebuilt.
 func (c *Client) SetWriteQuarantine(fn func() string) { c.writeQuarantine = fn }
+
+// WriteQuarantineReason is quarantineReason for callers outside the package:
+// the auth interceptor refuses user bearers on a quarantined node.
+func (c *Client) WriteQuarantineReason() string { return c.quarantineReason() }
 
 // quarantineReason returns why replicated writes are currently refused, or "".
 func (c *Client) quarantineReason() string {
@@ -1407,7 +1449,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1575,7 +1617,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
-	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership(), c.hostsCopyFrozen()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

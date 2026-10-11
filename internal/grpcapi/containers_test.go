@@ -18,10 +18,14 @@ import (
 // fakeCTRuntime captures every call so handler tests can assert
 // behaviour without standing up real LXC.
 type fakeCTRuntime struct {
-	mu          sync.Mutex
-	createCalls []CreateContainerOpts
-	startCalls  []string
-	stopCalls   []struct {
+	mu       sync.Mutex
+	rebuilds []fakeRebuild
+	// rebuildDropped is what each RebuildContainerConfig reports dropped.
+	rebuildDropped []string
+	hostAccess     map[string][]ContainerMountOpt
+	createCalls    []CreateContainerOpts
+	startCalls     []string
+	stopCalls      []struct {
 		Name    string
 		Timeout int
 	}
@@ -59,7 +63,9 @@ type fakeCTRuntime struct {
 	// security is each container's config security (containerSecurer);
 	// converts records ConvertContainerSecurity calls.
 	security map[string]lxc.Security
-	converts []fakeConvert
+	// securityErr is what ContainerSecurity returns for a name, when set.
+	securityErr map[string]error
+	converts    []fakeConvert
 	// dropped is what TakeDroppedAttrs reports per container (once).
 	dropped map[string][]string
 	// revertSecurity is the security a RevertContainer lays down (the
@@ -338,6 +344,9 @@ type fakeConvert struct {
 func (f *fakeCTRuntime) ContainerSecurity(name string) (lxc.Security, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.securityErr[name]; err != nil {
+		return lxc.Security{}, err
+	}
 	if sec, ok := f.security[name]; ok {
 		return sec, nil
 	}

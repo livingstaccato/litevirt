@@ -547,6 +547,14 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 		groups = nil // the local realm has no directory
 	}
 	insert := func(ctx context.Context, g capabilities.FeatureGrant) error {
+		// Fail closed (review M1): once login_policy is open on this node
+		// (an acknowledged used record), a login that verified groups is never
+		// minted without them. Such a session would fall back to the
+		// account's legacy role, which can be WIDER than its group-scoped
+		// access. The login is refused instead; retrying is safe.
+		if len(groups) > 0 && g.Check(capabilities.FeatureLoginPolicy) != nil && s.loginPolicyInUse(ctx) {
+			return errGroupsUnrecordable
+		}
 		return corrosion.InsertSessionWithLoginData(ctx, s.db, g, rec, factor, groups)
 	}
 	// Only a login that presented a factor or verified groups has login-rule
@@ -557,11 +565,19 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 	} else {
 		serr = s.withLoginPolicyIfAvailable(ctx, insert)
 	}
+	if errors.Is(serr, errGroupsUnrecordable) {
+		return "", "", "", status.Error(codes.Unavailable,
+			"retry: this node could not record the directory groups this login verified, and does not mint a session without them")
+	}
 	if serr != nil {
 		return "", "", "", status.Errorf(codes.Internal, "store session: %v", serr)
 	}
 	return SessionTokenPrefix + id, exp.Format(time.RFC3339), user.Role, nil
 }
+
+// errGroupsUnrecordable: a login verified directory groups after login_policy
+// opened on this node, but its gate did not pass for this write.
+var errGroupsUnrecordable = errors.New("directory groups not recordable")
 
 // ListRealms enumerates the authentication realms the daemon accepts
 // Login against. The "local" realm is always present; OIDC/LDAP names

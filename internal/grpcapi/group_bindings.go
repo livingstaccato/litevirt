@@ -2,12 +2,19 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// maxGroupAuditDetail bounds one auth.group_bindings row (it is replicated
+// and signed, once per login).
+const maxGroupAuditDetail = 4096
 
 // auditGroupBindings records, for a login that verified directory groups,
 // which groups the session carries and which role bindings each of them
@@ -16,7 +23,9 @@ import (
 // not recorded at all (the login_policy release feature not open yet).
 //
 // What is audited is read back from the session as stored, not from the
-// login's intent: it is what every node will evaluate.
+// login's intent: it is what every node will evaluate. The groups that hold a
+// binding are named in full; the rest are a count and a hash of their names,
+// and the whole detail is capped (maxGroupAuditDetail).
 func (s *Server) auditGroupBindings(ctx context.Context, subject, realm, token string, verified []string) {
 	if realm == "local" || len(verified) == 0 {
 		return
@@ -29,14 +38,20 @@ func (s *Server) auditGroupBindings(ctx context.Context, subject, realm, token s
 	}
 	if len(recorded) == 0 {
 		s.audit(ctx, "auth.group_bindings", subject,
-			fmt.Sprintf("realm=%s session=%s groups=%s not recorded: the login_policy release feature is not open on this "+
-				"node, so group bindings do not apply to this session", realm, shortID(sid), strings.Join(verified, ",")), "skipped")
+			capDetail(fmt.Sprintf("realm=%s session=%s %d verified groups not recorded: the login_policy release feature's gate "+
+				"did not pass on this node (the feature is not open yet), so group bindings do not apply to this session",
+				realm, shortID(sid), len(verified))), "skipped")
 		return
 	}
-	var grants []string
+	var grants, rest []string
 	for _, g := range recorded {
-		p := "group:" + g + "@" + realm
-		for _, b := range s.authEngine.BindingsOf([]string{p}) {
+		p := auth.DirectoryGroupPrincipal(realm, g)
+		bs := s.authEngine.BindingsOf([]string{p})
+		if len(bs) == 0 {
+			rest = append(rest, g)
+			continue
+		}
+		for _, b := range bs {
 			prop := ""
 			if b.Propagate {
 				prop = " (propagate)"
@@ -45,11 +60,24 @@ func (s *Server) auditGroupBindings(ctx context.Context, subject, realm, token s
 		}
 	}
 	sort.Strings(grants)
-	detail := fmt.Sprintf("realm=%s session=%s groups=%s", realm, shortID(sid), strings.Join(recorded, ","))
+	detail := fmt.Sprintf("realm=%s session=%s groups=%d", realm, shortID(sid), len(recorded))
 	if len(grants) == 0 {
 		detail += "; no role binding names any of these groups"
 	} else {
 		detail += "; " + strings.Join(grants, "; ")
 	}
-	s.audit(ctx, "auth.group_bindings", subject, detail, "ok")
+	if len(rest) > 0 {
+		h := sha256.Sum256([]byte(strings.Join(rest, "\n")))
+		detail += fmt.Sprintf("; %d groups hold no binding (sha256 of their sorted names %s)", len(rest), hex.EncodeToString(h[:8]))
+	}
+	s.audit(ctx, "auth.group_bindings", subject, capDetail(detail), "ok")
+}
+
+// capDetail cuts an audit detail at maxGroupAuditDetail bytes.
+func capDetail(d string) string {
+	if len(d) <= maxGroupAuditDetail {
+		return d
+	}
+	const tail = " …(truncated)"
+	return strings.ToValidUTF8(d[:maxGroupAuditDetail-len(tail)], "") + tail
 }

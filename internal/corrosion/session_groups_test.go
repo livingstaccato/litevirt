@@ -28,8 +28,8 @@ func TestSessionGroups_RecordedWithTheSessionOnlyWithTheGrant(t *testing.T) {
 	if err != nil || strings.Join(g, ",") != "dev,ops" {
 		t.Fatalf("groups %v %v, want the normalized set dev,ops", g, err)
 	}
-	if g, _ := SessionGroups(ctx, c, "s1", "oidc:other"); g != nil {
-		t.Fatalf("groups read for another realm: %v", g)
+	if g, err := SessionGroups(ctx, c, "s1", "oidc:other"); g != nil || err == nil {
+		t.Fatalf("groups read for another realm: %v %v, want an error (review M2)", g, err)
 	}
 	if err := InsertSessionWithLoginData(ctx, c, capabilities.FeatureGrant{}, groupSession("s2", "oidc:corp", now, now.Add(time.Hour)), "", []string{"ops"}); err != nil {
 		t.Fatal(err)
@@ -75,5 +75,15 @@ func TestGC_PrunesSessionGroupsWithTheirSessions(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].String("k") != "live" {
 		t.Fatalf("session_groups after GC: %v, want only live", rows)
+	}
+}
+
+// TestNormalizeSessionGroups_DropsControlCharacters (review M3): any C0, DEL
+// or C1 code point (terminal escapes in lv role ls and the audit log), and
+// invalid UTF-8, drop the name.
+func TestNormalizeSessionGroups_DropsControlCharacters(t *testing.T) {
+	out, dropped := NormalizeSessionGroups([]string{"ok", "esc\x1b[31m", "tab\tx", "del\x7f", "c1\u0085x", "bad\xffutf8", "kanidm@idm.lab"})
+	if strings.Join(out, ",") != "kanidm@idm.lab,ok" || dropped != 5 {
+		t.Fatalf("kept %q dropped %d", out, dropped)
 	}
 }

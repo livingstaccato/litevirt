@@ -93,7 +93,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 			"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureEmailTargetSecret: {Token: Release202611V1, Description: "Email notification targets with a stored SMTP password",
 		Writers: []string{"internal/corrosion.InsertEmailTargetWithSecret"}},
-	FeatureLoginPolicy:   {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor and directory identity binding (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},
+	FeatureLoginPolicy:   {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor, directory identity binding and session directory groups for group role bindings (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},
 	FeatureDrainFailback: {Token: Release202611V1, Description: "Failback after a drain: the record every drain writes of the VMs it moved, and the cluster failback policy", Writers: []string{"internal/corrosion.PutDrainOrigin", "internal/corrosion.SetFailbackPolicy"}},
 	FeatureFirewallIPv6:  {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
 	FeatureNICGuards:     {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},

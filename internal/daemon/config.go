@@ -541,6 +541,31 @@ func (a AutoUpgradeConfig) Interval() time.Duration {
 // AuthConfig is the YAML wrapper around auth.RealmConfig. We delegate
 // to the auth package's typed struct so the YAML tags live next to
 // the constructor logic.
+//
+// MaxSessionHardExpiry caps auth.session_hard_expiry. A session carries the
+// directory groups its login verified until it ends, and nothing outside the
+// session (no back-channel) can take a group away mid-session, so the cap is
+// the longest a removed group can keep granting to a session nobody revoked.
+const MaxSessionHardExpiry = 30 * 24 * time.Hour
+
+// validateSessionHardExpiry refuses a session_hard_expiry above
+// MaxSessionHardExpiry. An unparsable value keeps its old treatment (a logged
+// warning and the default, parseDurationOr).
+func validateSessionHardExpiry(v string) error {
+	if v == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return nil
+	}
+	if d > MaxSessionHardExpiry {
+		return fmt.Errorf("config auth.session_hard_expiry %q is above the maximum %s (30 days): a session keeps "+
+			"the directory groups it was minted with until it ends; set it to %s or less", v, MaxSessionHardExpiry, MaxSessionHardExpiry)
+	}
+	return nil
+}
+
 type AuthConfig struct {
 	Realms []auth.RealmConfig `yaml:"realms,omitempty"`
 	// Session lifetimes as Go durations (e.g. "8h", "168h"). Empty = built-in
@@ -1027,6 +1052,9 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config ui_tls: %q is not one of auto, on", cfg.UITLS)
 	}
 	if err := cfg.ACME.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateSessionHardExpiry(cfg.Auth.SessionHardExpiry); err != nil {
 		return nil, err
 	}
 

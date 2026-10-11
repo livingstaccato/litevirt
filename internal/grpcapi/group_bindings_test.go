@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/auth/oidctest"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -43,8 +47,8 @@ func grantGroup(t *testing.T, s *Server, role, principal, path string) string {
 // its session, as the interceptor builds it.
 func oidcSession(t *testing.T, s *Server, idp *oidctest.Provider) (string, context.Context) {
 	t.Helper()
-	code, state := oidcCallback(t, s, idp)
-	r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state})
+	code, state, binding := oidcCallback(t, s, idp)
+	r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
 	if err != nil || r.Token == "" {
 		t.Fatalf("OIDC login: %+v %v", r, err)
 	}
@@ -57,9 +61,18 @@ func oidcSession(t *testing.T, s *Server, idp *oidctest.Provider) (string, conte
 
 func TestPrincipalsForCaller_GroupsOnlyForExternalRealms(t *testing.T) {
 	got := principalsForCaller("olga", "viewer", "oidc:corp", "ops", "", "ops")
-	want := []string{"user:olga@oidc:corp", "group:viewer@oidc:corp", "group:ops@oidc:corp"}
+	want := []string{"user:olga@oidc:corp", "group:viewer@oidc:corp", "group:oidc:corp/ops"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("principals %v, want %v", got, want)
+	}
+	// A directory group and a legacy role of one name are different
+	// principals (review I1), and so are same-named groups of two realms
+	// (review M7).
+	if g := principalsForCaller("olga", "viewer", "oidc:corp", "admin"); slices.Contains(g, "group:admin@oidc:corp") {
+		t.Fatalf("an IdP group named admin became the legacy admins' principal: %v", g)
+	}
+	if a, b := principalsForCaller("o", "", "ldap:corp", "ops"), principalsForCaller("o", "", "oidc:corp", "ops"); a[1] == b[1] {
+		t.Fatalf("group ops of two realms is one principal: %v %v", a, b)
 	}
 	if got := principalsForCaller("bob", "admin", "local", "ops"); len(got) != 2 {
 		t.Fatalf("a local session took directory groups: %v", got)
@@ -71,7 +84,7 @@ func TestPrincipalsForCaller_GroupsOnlyForExternalRealms(t *testing.T) {
 // binding's path only; the login audits which binding granted what.
 func TestGroupBinding_GrantsThroughTheVerifiedGroup(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators")
-	id := grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
+	id := grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
 	_, ctx := oidcSession(t, s, idp)
 	if g := callerGroups(ctx); len(g) != 1 || g[0] != "lv-operators" {
 		t.Fatalf("session groups %v", g)
@@ -83,7 +96,7 @@ func TestGroupBinding_GrantsThroughTheVerifiedGroup(t *testing.T) {
 
 	row := lastAuditRow(t, s, "auth.group_bindings")
 	if !row.found || row.result != "ok" || row.target != "olga" ||
-		!strings.Contains(row.detail, "group:lv-operators@oidc:corp grants Operator at /projects/acme") ||
+		!strings.Contains(row.detail, "group:oidc:corp/lv-operators grants Operator at /projects/acme") ||
 		!strings.Contains(row.detail, id) {
 		t.Fatalf("group binding audit %+v, want the group, role, path and binding id %s", row, id)
 	}
@@ -93,7 +106,7 @@ func TestGroupBinding_GrantsThroughTheVerifiedGroup(t *testing.T) {
 func TestGroupBinding_UnionWithUserBindings(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators", "lv-auditors")
 	grantGroup(t, s, "Viewer", "user:olga@oidc:corp", "/")
-	grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
+	grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
 	_, ctx := oidcSession(t, s, idp)
 	if err := s.RequirePerm(ctx, "/projects/other", "vm.read", "admin"); err != nil {
 		t.Fatalf("the user's own Viewer binding: %v", err)
@@ -102,8 +115,9 @@ func TestGroupBinding_UnionWithUserBindings(t *testing.T) {
 		t.Fatalf("the group's Operator binding: %v", err)
 	}
 	row := lastAuditRow(t, s, "auth.group_bindings")
-	if !strings.Contains(row.detail, "lv-auditors") {
-		t.Fatalf("audit %q does not name every verified group", row.detail)
+	if !strings.Contains(row.detail, "groups=2") || !strings.Contains(row.detail, "1 groups hold no binding") ||
+		strings.Contains(row.detail, "lv-auditors") {
+		t.Fatalf("audit %q: want the count, the granting group in full and the rest as a count and hash", row.detail)
 	}
 }
 
@@ -113,7 +127,7 @@ func TestGroupBinding_UnionWithUserBindings(t *testing.T) {
 // until it ends (documented), and ending it ends the grant.
 func TestGroupBinding_ARemovedGroupStopsAtTheNextLogin(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators")
-	grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
+	grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
 	oldTok, oldCtx := oidcSession(t, s, idp)
 
 	idp.SignIn(&oidctest.User{Subject: "sub-olga", PreferredUsername: "olga", Groups: []string{"lv-viewers"}})
@@ -135,7 +149,7 @@ func TestGroupBinding_ARemovedGroupStopsAtTheNextLogin(t *testing.T) {
 // and the audit says why.
 func TestGroupBinding_NotRecordedWithoutTheReleaseFeature(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators")
-	grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
+	grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
 	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: false})
 	_, ctx := oidcSession(t, s, idp)
 	if g := callerGroups(ctx); len(g) != 0 {
@@ -166,8 +180,8 @@ func TestGroupBinding_UnreadableGroupsRefuse(t *testing.T) {
 // their groups, but not to someone else's.
 func TestGroupBinding_CallerSeesTheirGroupBindings(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators")
-	id := grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
-	grantGroup(t, s, "Admin", "group:lv-admins@oidc:corp", "/")
+	id := grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
+	grantGroup(t, s, "Admin", "group:oidc:corp/lv-admins", "/")
 	_, ctx := oidcSession(t, s, idp)
 	r, err := s.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{})
 	if err != nil {
@@ -176,10 +190,10 @@ func TestGroupBinding_CallerSeesTheirGroupBindings(t *testing.T) {
 	if len(r.Bindings) != 1 || r.Bindings[0].Id != id {
 		t.Fatalf("bindings %v, want only the caller's group binding %s", r.Bindings, id)
 	}
-	if _, err := s.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{Principal: "group:lv-operators@oidc:corp"}); err != nil {
+	if _, err := s.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{Principal: "group:oidc:corp/lv-operators"}); err != nil {
 		t.Fatalf("filter to the caller's own group: %v", err)
 	}
-	_, err = s.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{Principal: "group:lv-admins@oidc:corp"})
+	_, err = s.ListRoleBindings(ctx, &pb.ListRoleBindingsRequest{Principal: "group:oidc:corp/lv-admins"})
 	wantCode(t, "filter to a group the caller is not in", err, codes.PermissionDenied)
 }
 
@@ -201,7 +215,7 @@ func TestSessionGroups_LocalLoginsCarryNone(t *testing.T) {
 // peer (forwarded identity) is authorized with the same groups on the owner.
 func TestGroupBinding_AForwardedSessionKeepsItsGroups(t *testing.T) {
 	s, idp := groupServer(t, "lv-operators")
-	grantGroup(t, s, "Operator", "group:lv-operators@oidc:corp", "/projects/acme")
+	grantGroup(t, s, "Operator", "group:oidc:corp/lv-operators", "/projects/acme")
 	s.SetForwardedIdentity(true)
 	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.9", State: "active"}); err != nil {
 		t.Fatal(err)
@@ -216,5 +230,113 @@ func TestGroupBinding_AForwardedSessionKeepsItsGroups(t *testing.T) {
 	}
 	if err := s.RequirePerm(fctx, "/projects/acme/vms/x", "vm.start", "admin"); err != nil {
 		t.Fatalf("the group binding through a forwarded session: %v", err)
+	}
+}
+
+// TestGroupBinding_AnIdPGroupNamedLikeALegacyRoleGainsNothing (review I1): a
+// user who creates and joins an IdP group "admin" does not take on a binding
+// made for the realm's legacy admins (group:admin@<realm>).
+func TestGroupBinding_AnIdPGroupNamedLikeALegacyRoleGainsNothing(t *testing.T) {
+	s, idp := groupServer(t, "admin")
+	grantGroup(t, s, "Admin", "group:admin@oidc:corp", "/")
+	_, ctx := oidcSession(t, s, idp)
+	wantCode(t, "an IdP group named admin", s.RequirePerm(ctx, "/projects/acme/vms/x", "vm.start", "admin"), codes.PermissionDenied)
+}
+
+// TestGroupBinding_LDAPGroupsAreKeyedByDN (review I2, M7): an LDAP login's
+// groups are full DNs; a binding on the managed group's DN applies, and a
+// same-named group in another OU is a different principal.
+func TestGroupBinding_LDAPGroupsAreKeyedByDN(t *testing.T) {
+	s, _ := groupServer(t)
+	managed := "cn=lv-operators,ou=groups,dc=corp,dc=example"
+	ldap := groupRealm{name: "ldap:corp", subject: "lena"}
+	s.realmRegistry.Register(&ldap)
+	grantGroup(t, s, "Operator", "group:ldap:corp/"+managed, "/projects/acme")
+	login := func(groups ...string) context.Context {
+		ldap.groups = groups
+		r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "ldap:corp", Username: "lena", Password: "pw"})
+		if err != nil || r.Token == "" {
+			t.Fatalf("LDAP login: %+v %v", r, err)
+		}
+		ctx, err := s.authenticate(bearerCtx(r.Token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ctx
+	}
+	if err := s.RequirePerm(login(managed), "/projects/acme/vms/x", "vm.start", "admin"); err != nil {
+		t.Fatalf("the managed group's binding: %v", err)
+	}
+	wantCode(t, "a same-named group in another OU",
+		s.RequirePerm(login("cn=lv-operators,ou=helpdesk,dc=corp,dc=example"), "/projects/acme/vms/x", "vm.start", "admin"),
+		codes.PermissionDenied)
+}
+
+// groupRealm authenticates any password as subject with the given groups.
+type groupRealm struct {
+	name, subject string
+	groups        []string
+}
+
+func (g *groupRealm) Name() string { return g.name }
+func (g *groupRealm) Authenticate(_ context.Context, c auth.Credentials) (*auth.Principal, error) {
+	if c.Password == "" {
+		return nil, auth.ErrInvalidCredentials
+	}
+	return &auth.Principal{Subject: g.subject, Realm: g.name, Groups: g.groups}, nil
+}
+func (*groupRealm) SyncGroups(context.Context) error { return nil }
+
+// TestGroupBinding_NeverMintedWithoutItsGroupsOnceOpen (review M1): once
+// login_policy is open on this node, a login whose groups cannot be recorded
+// (the gate does not pass for this write) is refused rather than minted
+// without them, since such a session falls back to its legacy role.
+func TestGroupBinding_NeverMintedWithoutItsGroupsOnceOpen(t *testing.T) {
+	s, idp := groupServer(t, "lv-operators")
+	if err := corrosion.RecordReleaseFeatureUse(context.Background(), s.db, capabilities.ReleaseToken,
+		string(capabilities.FeatureLoginPolicy), "node-a", true); err != nil {
+		t.Fatal(err)
+	}
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, err: errors.New("gate refused")})
+	code, state, binding := oidcCallback(t, s, idp)
+	r, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
+	wantCode(t, "a login whose groups cannot be recorded", err, codes.Unavailable)
+	if r != nil && r.Token != "" {
+		t.Fatal("a session was minted without its groups")
+	}
+	if rows, _ := s.db.Query(context.Background(), `SELECT id FROM sessions WHERE username = 'olga'`); len(rows) != 0 {
+		t.Fatalf("session rows %v", rows)
+	}
+}
+
+// TestSessionGroups_RealmMismatchRefuses (review M2): a groups row for another
+// realm than its session's is an error, and the request is refused.
+func TestSessionGroups_RealmMismatchRefuses(t *testing.T) {
+	s, idp := groupServer(t, "lv-operators")
+	tok, _ := oidcSession(t, s, idp)
+	if err := s.db.Execute(context.Background(), `UPDATE session_groups SET realm = 'oidc:other' WHERE session_id = ?`,
+		strings.TrimPrefix(tok, SessionTokenPrefix)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.authenticate(bearerCtx(tok))
+	wantCode(t, "groups recorded for another realm", err, codes.Unavailable)
+}
+
+// TestGroupBinding_AuditDetailIsBounded (review M4): one login's audit row
+// stays small however many groups the IdP sends; the groups that hold no
+// binding are a count and a hash.
+func TestGroupBinding_AuditDetailIsBounded(t *testing.T) {
+	var many []string
+	for i := 0; i < corrosion.MaxSessionGroups; i++ {
+		many = append(many, fmt.Sprintf("%0200d", i))
+	}
+	s, idp := groupServer(t, many...)
+	for i := 0; i < 40; i++ {
+		grantGroup(t, s, "Viewer", "group:oidc:corp/"+many[i], "/projects/p")
+	}
+	oidcSession(t, s, idp)
+	row := lastAuditRow(t, s, "auth.group_bindings")
+	if !row.found || len(row.detail) > maxGroupAuditDetail || !strings.Contains(row.detail, fmt.Sprintf("groups=%d", corrosion.MaxSessionGroups)) {
+		t.Fatalf("audit detail of %d bytes (cap %d): %.200s", len(row.detail), maxGroupAuditDetail, row.detail)
 	}
 }

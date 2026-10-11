@@ -176,6 +176,12 @@ func (s *Server) principalSet(ctx context.Context, principal string) (canonical 
 		if u == nil {
 			return "", nil, false, nil
 		}
+		// The target's directory groups are deliberately NOT in the set
+		// (review ruling on concern 5). They are per session, and the target
+		// may also act through sessions minted without them, API tokens, or
+		// stored actions, all on its legacy role. Leaving them out can only
+		// shrink the set, so HasAnyBinding(set) can only turn a "has a
+		// binding" into a refusal: it under-counts, never over-grants.
 		return "user:" + u.Username + "@" + realm, principalsForCaller(u.Username, u.Role, realm), true, nil
 	}
 	return principal, []string{principal}, true, nil

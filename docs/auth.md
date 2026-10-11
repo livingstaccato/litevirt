@@ -24,57 +24,87 @@ Realms are configured under `auth.realms:` in `/etc/litevirt/config.yaml`
 at login (the OIDC groups claim, the LDAP group search); nothing refreshes
 them in between (below).
 
-Roles map to *principal IDs*: `user:<subject>@<realm>` and
-`group:<name>@<realm>`. Bind a role to a principal in the engine and the
+Roles map to *principal IDs*: `user:<subject>@<realm>`, the legacy-role
+group `group:<role>@<realm>` (`admin`, `operator`, `viewer`), and a directory
+group `group:<realm>/<group>`. Bind a role to a principal in the engine and the
 caller gets the role's verbs at the binding's path.
 
 ### Directory group bindings
 
-A role bound to `group:<g>@<realm>` applies to every session whose login
-through that LDAP or OIDC realm verified membership of `<g>`. For OIDC the
-groups come from `groups_claim` in the verified ID token; for LDAP they come
-from `user_group_attr` or the group search.
+A role bound to `group:<realm>/<group>` applies to every session whose login
+through that LDAP or OIDC realm verified membership of `<group>`:
+
+- **OIDC:** the group is a value of `groups_claim` in the verified ID token,
+  as the IdP sends it: `group:oidc:kanidm/lv-operators`.
+- **LDAP:** the group is its **full DN**, normalized: lower case, no spaces
+  around separators, RFC 4514 escaping. For example,
+  `group:ldap:corp/cn=lv-operators,ou=groups,dc=corp,dc=example`. Groups come
+  from `user_group_attr` (`memberOf`) and from the group search. With
+  `group_base_dn` set, only groups at or under it count, `memberOf` included.
+  A `cn` is unique only within its container, so a same-named group in another
+  OU is a different principal, never the managed one. A `memberOf` value that is
+  not a DN is ignored.
 
 ```bash
-lv role grant Operator group:lv-operators@oidc:kanidm --path /projects/acme --propagate
+lv role grant Operator group:oidc:kanidm/lv-operators --path /projects/acme --propagate
+lv role grant Viewer   group:ldap:corp/cn=contractors,ou=groups,dc=corp,dc=example --path /projects/acme
 ```
 
-- **Union.** A session holds every grant of its user binding, its legacy
-  role's synthetic `group:<role>@<realm>`, and each of its directory groups.
-  No binding subtracts. Holding any binding switches the caller from the legacy
+**Trust boundary.** A group binding trusts whoever can create a group, or add
+members to it, at the directory. A user who can create a group named like a
+bound one and join it holds that binding. Bind only groups that directory
+administrators alone manage:
+
+- restrict the OIDC groups claim to admin-managed groups (a Keycloak group
+  mapper on a managed subtree, Entra "groups assigned to the application", a
+  kanidm claim map listing specific groups);
+- for LDAP, point `group_base_dn` at the OU only administrators write.
+
+A directory group never equals a legacy-role principal: an IdP group named
+`admin` is `group:oidc:corp/admin`, not `group:admin@oidc:corp`, so it cannot
+take on bindings meant for the realm's legacy admins. A binding written in the
+earlier `group:<g>@<realm>` form names a legacy role, not a directory group;
+re-grant it as `group:<realm>/<g>`.
+
+- **Union.** A session holds every grant of its user binding, of its legacy
+  role's `group:<role>@<realm>`, and of each of its directory groups. No
+  binding subtracts. Holding any binding switches the caller from the legacy
   role to the bindings, as for user bindings.
 - **Per session, fixed at login.** The groups are recorded with the session,
   in the same replicated batch (`session_groups`, schema v65), so every node
-  evaluates the same groups for it. A group the directory removes stops
-  granting at the user's **next login**. A session minted before keeps its
-  groups until it ends: the idle timeout (default 8h), the hard expiry
-  (default 7d), logout, `lv session revoke`, or any account lifecycle change
-  (`lv user disable`). To cut a removed member off at once, revoke their
-  sessions. Shorten `session_hard_expiry` if directory changes must take effect
-  sooner. A group added at the directory applies from the next login.
+  evaluates the same groups for it.
+  - A group the directory removes stops granting at the user's **next login**.
+  - A session minted before keeps its groups until it ends: the idle timeout
+    (default 8h), the hard expiry (default 7d, at most 30 days:
+    `session_hard_expiry` above `720h` is refused at startup), logout,
+    `lv session revoke`, or any account lifecycle change (`lv user disable`).
+  - To cut a removed member off at once, revoke their sessions.
+  - A group added at the directory applies from the next login.
+- **Only sessions carry groups.** API tokens, and actions re-checked later
+  for a stored user (an upload's owner), carry no directory groups. They run on
+  the user's own bindings and legacy role.
 - **Audited.** Each external login with groups writes `auth.group_bindings`:
-  - the session's groups, with each group binding they hold (role, path,
-    binding id);
-  - "no role binding names any of these groups" when a group matches nothing
-    (a misspelt binding);
+  - the number of groups, and each group binding they hold (principal, role,
+    path, binding id);
+  - the groups that hold no binding, as a count and a hash of their names;
   - `skipped` when the groups were not recorded (below).
+
+  The detail is capped at 4 KB.
 - **Visible to the user.** `lv role ls` run by a non-admin lists the bindings
   that apply through their session's groups along with their own.
 - **Release feature.** The groups are written only once the `login_policy`
   release feature is open (`lv cluster upgrade-status`). Before that, a login
   records none, and group bindings apply to nobody, as on the previous release.
-  The first directory login that opens the feature may still be minted without
-  them; the next login has them.
-- **Bounds.** At most 256 groups of at most 256 bytes are recorded per session;
-  the rest are dropped and logged.
-- **Local realm.** It has no directory groups; a `group:<g>@local` binding
-  matches only the legacy role's synthetic group.
-- **Name clash.** An IdP group named like a legacy role (`admin`, `operator`,
-  `viewer`) is the same principal as that role's synthetic group in the realm.
-  Name directory groups distinctly (`lv-admins`).
-- **Unreadable groups.** If a session's recorded groups cannot be read, its
-  requests are refused (`Unavailable`), not authorized without them: dropping a
-  group can widen a caller back to its legacy role.
+  Once it is open on a node, a login whose groups that node cannot record is
+  **refused** (`Unavailable`, retry). It is never minted without them, because
+  such a session would fall back to the legacy role.
+- **Bounds.** At most 256 groups of at most 256 bytes are recorded per session.
+  Names with control characters or invalid UTF-8 are dropped and logged, as are
+  any over the limits.
+- **Local realm.** It has no directory groups.
+- **Unreadable groups.** If a session's recorded groups cannot be read, or name
+  another realm, its requests are refused (`Unavailable`), not authorized
+  without them: dropping a group can widen a caller back to its legacy role.
 
 ### External users and local accounts share one name space
 
@@ -127,7 +157,7 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 | `cli_redirect_url` | The loopback address `lv login --realm oidc:<name>` listens on, `http://127.0.0.1:<port>/<path>` (RFC 8252 §7.3): IPv4 loopback, an explicit port, no query. Checked at load. Unset: the CLI sign-in is off for this realm (the web UI still works). Register it with the IdP too. |
 | `ca_file` | PEM CA bundle the IdP's certificate must chain to (discovery, JWKS and the token endpoint). Unset: the system trust store. Verification is never skipped. |
 | `scopes` | Scopes to request. Default `openid profile email groups`; `openid` is always added. |
-| `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal of the session ("Directory group bindings"). |
+| `groups_claim` | Token claim carrying group membership; each value becomes a `group:<realm>/<value>` principal of the session ("Directory group bindings"). Restrict it to admin-managed groups. |
 | `subject_claim` | Claim used as the stable subject — the `user:<subject>@<realm>` principal. Override when `sub` is an opaque id and you want a readable, stable alternative. |
 | `email_claim` | Claim read as the user's email address. |
 | `name_claim` | Claim read as the user's display name. |
@@ -242,13 +272,13 @@ Under `auth.realms[].ldap:`. `url` and `user_base_dn` are required; prefer
 | `user_name_attr` | Attribute read as the display name. |
 | `user_mail_attr` | Attribute read as the email address. |
 | `user_group_attr` | Attribute on the user entry listing group membership (typically `memberOf`). |
-| `group_name_attr` | Attribute on a group entry holding its name. |
+| `group_name_attr` | Attribute on a group entry holding its name. Not used for group principals: groups are keyed by their DN ("Directory group bindings"). |
 | `skip_tls_verify` | Disables certificate verification on the LDAPS connection. **Leave off outside a lab** — it makes directory traffic, including bind credentials, trivially interceptable. |
 
 The account is named by the typed login name, normalized (ASCII lower case,
 surrounding spaces trimmed), exactly as before this release: upgrading re-keys
-no account. Changing `group_name_attr` re-keys group principal ids and
-invalidates existing group role bindings.
+no account. Moving or renaming a group entry changes its DN, and so its
+principal: re-grant its bindings.
 
 **Directory identity binding.** An LDAP or OIDC account is bound to the
 directory entry it is reached through, by an id the directory never reuses:
@@ -433,8 +463,8 @@ broad operator role.
 
 ```bash
 lv role grant Admin    group:admin@local        --path /                --propagate
-lv role grant Operator group:eng@oidc:corp      --path /projects/acme   --propagate
-lv role grant Viewer   group:contractors@ldap:corp --path /projects/acme
+lv role grant Operator group:oidc:corp/eng      --path /projects/acme   --propagate
+lv role grant Viewer   group:ldap:corp/cn=contractors,ou=groups,dc=corp,dc=example --path /projects/acme
 ```
 
 `lv role ls` lists bindings (admins see all; non-admins see their own

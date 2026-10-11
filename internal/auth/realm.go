@@ -84,17 +84,32 @@ func (p *Principal) PrincipalID() string {
 	return fmt.Sprintf("user:%s@%s", p.Subject, p.Realm)
 }
 
-// GroupPrincipalIDs returns the "group:..." principal strings for this
-// principal's groups, formatted to match role_bindings.principal column.
+// GroupPrincipalIDs returns the role-binding principals of this principal's
+// directory groups (DirectoryGroupPrincipal). The local realm has none.
 func (p *Principal) GroupPrincipalIDs() []string {
-	if p == nil {
+	if p == nil || p.Realm == "" || p.Realm == "local" {
 		return nil
 	}
 	out := make([]string, len(p.Groups))
 	for i, g := range p.Groups {
-		out[i] = fmt.Sprintf("group:%s@%s", g, p.Realm)
+		out[i] = DirectoryGroupPrincipal(p.Realm, g)
 	}
 	return out
+}
+
+// DirectoryGroupPrincipal is the role-binding principal of a directory group:
+// `group:<realm>/<group>`, e.g. group:oidc:kanidm/lv-admins or
+// group:ldap:corp/cn=lv-admins,ou=groups,dc=corp,dc=example (an LDAP group is
+// its full normalized DN).
+//
+// It is qualified by the realm FIRST and carries no '@<realm>' suffix, so it
+// can never equal the synthetic `group:<legacy-role>@<realm>` principal of an
+// account's legacy role: a directory group named "admin" is
+// group:oidc:corp/admin, not group:admin@oidc:corp. Whoever can create or join
+// groups in the directory still decides who holds a binding on a group
+// principal; that is the trust boundary (docs/auth.md).
+func DirectoryGroupPrincipal(realm, group string) string {
+	return "group:" + realm + "/" + group
 }
 
 // Realm is one authentication backend. New backends implement this

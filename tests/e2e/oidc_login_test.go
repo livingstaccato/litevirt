@@ -49,7 +49,7 @@ import (
 //	                  /etc/litevirt/pki/ca.crt)
 //	E2E_OIDC_IDP_CA   CA kanidm's certificate chains to (default: system store)
 //	E2E_OIDC_GROUPS   user=group pairs the IdP's groups claim carries and a
-//	                  group:<g>@<realm> binding exists for (default lab 1's
+//	                  group:<realm>/<g> binding exists for (default lab 1's
 //	                  lvadmin=lv-admins,lvoper=lv-operators,lvview=lv-viewers,
 //	                  lvmfa=lv-operators); checked with `lv role ls` as the
 //	                  session (LV_TOKEN). Set to "-" to skip the group check.
@@ -336,7 +336,7 @@ func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 				if err != nil {
 					t.Fatalf("lv role ls as %s: %v\n%s", user, err, out)
 				}
-				if p := "group:" + want + "@" + realm; !strings.Contains(string(out), p) {
+				if p := "group:" + realm + "/" + want; !strings.Contains(string(out), p) {
 					t.Fatalf("lv role ls as %s does not list %s, the binding its verified group holds:\n%s", user, p, out)
 				}
 			}

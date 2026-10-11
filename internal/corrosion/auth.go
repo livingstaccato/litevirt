@@ -113,7 +113,9 @@ func scanRole(r Row) *RoleRecord {
 // RoleBindingRecord assigns a role to a principal at a path. Principals are:
 //
 //	user:<username>            — direct user binding
-//	group:<group>@<realm>      — group from a realm (e.g. group:platform-team@oidc)
+//	group:<role>@<realm>       — a legacy role's synthetic group (group:admin@local)
+//	group:<realm>/<group>      — a directory group (group:oidc:corp/platform-team;
+//	                             LDAP: the group's normalized DN)
 type RoleBindingRecord struct {
 	ID        string
 	Path      string

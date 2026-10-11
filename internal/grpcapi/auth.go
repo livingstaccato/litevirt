@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -1104,9 +1105,12 @@ func canonicalScopePath(p string) string {
 //	# Grant Admin to all admins:
 //	lv role grant Admin group:admin@local --path /
 //
-// and, for an external realm, `group:<g>@<realm>` for each directory group the
-// session's login verified (corrosion.SessionGroups). The engine grants the
-// union of every binding any of them holds.
+// and, for an external realm, `group:<realm>/<g>` (auth.DirectoryGroupPrincipal)
+// for each directory group the session's login verified
+// (corrosion.SessionGroups). The engine grants the union of every binding any
+// of them holds. A directory group's principal never equals the synthetic
+// legacy-role one, so an IdP group named "admin" cannot take on bindings meant
+// for the realm's legacy admins.
 //
 // realm is the caller's authenticated realm (callerRealm); it defaults to
 // "local" so local users and callers without a realm in context behave exactly
@@ -1124,7 +1128,7 @@ func principalsForCaller(user, role, realm string, groups ...string) []string {
 			if g == "" {
 				continue
 			}
-			p := "group:" + g + "@" + realm
+			p := auth.DirectoryGroupPrincipal(realm, g)
 			if !slices.Contains(out, p) {
 				out = append(out, p)
 			}

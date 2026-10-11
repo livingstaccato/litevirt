@@ -678,3 +678,25 @@ func TestLoadConfig_RefusesUnsafeContainerHostAccess(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadConfig_SessionHardExpiryCapped (review M8): above the documented
+// maximum the daemon refuses to start; the default (unset), the 7-day default
+// spelled out, and the maximum itself load.
+func TestLoadConfig_SessionHardExpiryCapped(t *testing.T) {
+	dir := t.TempDir()
+	cp := filepath.Join(dir, "config.yaml")
+	t.Setenv("LITEVIRT_CONFIG", cp)
+	for v, ok := range map[string]bool{"": true, "168h": true, "720h": true, "721h": false, "8760h": false} {
+		body := "host_name: h\n"
+		if v != "" {
+			body += "auth:\n  session_hard_expiry: \"" + v + "\"\n"
+		}
+		if err := os.WriteFile(cp, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig()
+		if (err == nil) != ok {
+			t.Errorf("session_hard_expiry %q: err=%v, want ok=%v", v, err, ok)
+		}
+	}
+}

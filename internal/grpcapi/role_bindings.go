@@ -51,7 +51,7 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 	}
 	if !isWellFormedPrincipal(req.Principal) {
 		return nil, status.Error(codes.InvalidArgument,
-			"principal must be user:<name> or group:<name>@<realm>")
+			"principal must be user:<name>, group:<role>@<realm>, or a directory group group:<oidc|ldap>:<realm>/<group>")
 	}
 
 	// Realm-aware grammar (opt-in via auth.rbac_realm): reject or canonicalize a
@@ -373,15 +373,23 @@ func (s *Server) resolveGrantPrincipal(ctx context.Context, principal string) (s
 	return "user:" + body + "@local", nil
 }
 
-// isWellFormedPrincipal accepts the two principal shapes the RBAC
-// engine resolves: `user:<name>` and `group:<group>@<realm>`. Anything
-// else would never match a row and confuse operators.
+// isWellFormedPrincipal accepts the principal shapes the RBAC engine
+// resolves: `user:<name>`, the legacy-role `group:<role>@<realm>`, and a
+// directory group `group:<oidc|ldap>:<realm>/<group>`
+// (auth.DirectoryGroupPrincipal). Anything else would never match a row and
+// confuse operators.
 func isWellFormedPrincipal(p string) bool {
 	switch {
 	case strings.HasPrefix(p, "user:") && len(p) > len("user:"):
 		return true
 	case strings.HasPrefix(p, "group:"):
 		body := p[len("group:"):]
+		if strings.HasPrefix(body, "oidc:") || strings.HasPrefix(body, "ldap:") {
+			if realm, group, ok := strings.Cut(body, "/"); ok && strings.Contains(realm, ":") &&
+				!strings.HasSuffix(realm, ":") && group != "" {
+				return true
+			}
+		}
 		if i := strings.IndexByte(body, '@'); i > 0 && i < len(body)-1 {
 			return true
 		}
@@ -424,14 +432,14 @@ func isSelfPrincipal(principal, caller, realm string) bool {
 }
 
 // isCallerGroupPrincipal reports whether principal is one of the caller's
-// session directory groups (group:<g>@<realm>), so a caller can see the
+// session directory groups (group:<realm>/<g>), so a caller can see the
 // bindings that apply to them through a group.
 func isCallerGroupPrincipal(principal, realm string, groups []string) bool {
 	if realm == "" || realm == "local" {
 		return false
 	}
 	for _, g := range groups {
-		if principal == "group:"+g+"@"+realm {
+		if principal == auth.DirectoryGroupPrincipal(realm, g) {
 			return true
 		}
 	}

@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -39,14 +41,15 @@ const (
 
 const sessionGroupsInsertSQL = `INSERT INTO session_groups (session_id, realm, groups_json, recorded_at, updated_at) VALUES (?, ?, ?, ?, ?)`
 
-// NormalizeSessionGroups is the set a session records: trimmed, empty and
-// over-long names dropped, de-duplicated, sorted, at most MaxSessionGroups.
+// NormalizeSessionGroups is the set a session records: trimmed; empty,
+// over-long, invalid-UTF-8 and control-character-bearing names (any C0, DEL or
+// C1 code point: terminal escapes in `lv role ls` and the audit log) dropped; de-duplicated, sorted, at most MaxSessionGroups.
 // It reports how many names it dropped, so the caller can say so.
 func NormalizeSessionGroups(groups []string) (out []string, dropped int) {
 	seen := map[string]bool{}
 	for _, g := range groups {
 		g = strings.TrimSpace(g)
-		if g == "" || len(g) > MaxSessionGroupBytes || strings.ContainsAny(g, "\x00\r\n") {
+		if g == "" || len(g) > MaxSessionGroupBytes || strings.IndexFunc(g, unicode.IsControl) >= 0 || !utf8.ValidString(g) {
 			dropped++
 			continue
 		}
@@ -100,8 +103,14 @@ func SessionGroups(ctx context.Context, c *Client, id, realm string) ([]string, 
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 || rows[0].String("realm") != realm {
+	if len(rows) == 0 {
 		return nil, nil
+	}
+	if got := rows[0].String("realm"); got != realm {
+		// Never legitimate (the row is written in the session's own batch,
+		// with its realm). "No groups" could widen the caller back to its
+		// legacy role, so it is an error, and the request is refused.
+		return nil, fmt.Errorf("session %s groups were recorded for realm %q, not the session's %q", id, got, realm)
 	}
 	var out []string
 	if err := json.Unmarshal([]byte(rows[0].String("groups_json")), &out); err != nil {

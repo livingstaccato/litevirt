@@ -2,11 +2,13 @@ package grpcapi
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // claimingServer is a voter-ready server that is the whole adopted voter
@@ -16,8 +18,14 @@ func claimingServer(t *testing.T) *Server {
 	ctx := context.Background()
 	s := recoveryClaimServer(t, true, capabilities.SplitBrainGateV1, capabilities.RecoveryClaimV1)
 	s.db.SetRecoveryClaimGate(func() bool { return true })
+	// The serial a real daemon records for itself: the claim serial pin checks
+	// every accept against it (corrosion.ClaimVerifier.PinnedTo).
+	serial, err := pki.CertSerial(filepath.Join(s.pkiDir, "host.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
-		Name: s.hostName, Address: "10.0.0.1", SSHUser: "root", State: "active", CertSerial: "s",
+		Name: s.hostName, Address: "10.0.0.1", SSHUser: "root", State: "active", CertSerial: serial,
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}

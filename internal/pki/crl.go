@@ -487,3 +487,46 @@ func toRevocationEntries(revoked []pkix.RevokedCertificate) []x509.RevocationLis
 	}
 	return entries
 }
+
+// CRLSerials lists the serials (lower-case hex) a PEM CRL bundle revokes, or
+// nothing if it does not parse. It does NOT verify signatures; callers verify
+// first (VerifiedCRLNumber).
+func CRLSerials(crlPEM []byte) []string {
+	crls, err := parseCRLs(crlPEM)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, crl := range crls {
+		for _, e := range crl.RevokedCertificateEntries {
+			out = append(out, strings.ToLower(e.SerialNumber.Text(16)))
+		}
+	}
+	return out
+}
+
+// MintCRLWith returns a CRL signed by the CA revoking everything crlPath
+// revokes plus serials, WITHOUT changing crlPath: for a revocation that may be
+// held (a renewed voter's replaced certificate), which must not ride along in
+// the next CRL minted from crlPath before it is safe.
+func MintCRLWith(caCertPath, caKeyPath, crlPath string, serials ...string) ([]byte, error) {
+	tmp, err := os.MkdirTemp("", "litevirt-crl-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+	work := filepath.Join(tmp, "crl.pem")
+	if b, err := os.ReadFile(crlPath); err == nil {
+		if err := os.WriteFile(work, b, 0o600); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	for _, s := range serials {
+		if err := AppendToCRL(caCertPath, caKeyPath, work, s); err != nil {
+			return nil, err
+		}
+	}
+	return os.ReadFile(work)
+}

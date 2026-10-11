@@ -93,6 +93,12 @@ lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and
                                           #   removes it, and reports the stranded recoveries that now retry
                                           #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
+lv host renew-cert <host>                 # Renew a host's cluster certificate in place: key made on
+  [--ssh root@<addr>] [--keep-old]        #   the host, one atomic switch, served without a restart,
+  [--revoke-old] [--force]                #   confirmed, then the old one revoked (owed while the
+  [--grpc-port 7443] [--wait 90s]         #   voter chain needs it). See auth.md
+lv host revoke-cert <host> --serial <hex> # Revoke a certificate a renewal replaced; --force for the
+  [--force] [--grpc-port 7443]            #   live/presented one (fences the host)
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"
@@ -800,11 +806,15 @@ lv notify target rm <id>
 # Events: backup.failed, host.fenced, host.recovery.stalled, replication.failed, quota.exceeded. See notifications.md.
 ```
 
-## ACME (web UI cert)
+## Web UI certificate (ACME, custom)
 
 ```bash
 lv acme status [host]   # show the TLS cert the UI is serving (subject/issuer/SANs/expiry)
-# Configure under `acme:` in the daemon config; see configuration.md.
+# Configure under `acme:` in the daemon config (http-01 or dns-01); see configuration.md.
+lv host ui-cert set <host> --cert chain.pem --key key.pem [--name <fqdn>]...
+                        # install a corporate-PKI certificate for the UI: validated
+                        #   (key, chain order, expiry, names), key 0600, served at once
+lv host ui-cert clear <host>   # back to ACME / the cluster certificate / plain HTTP (ui_tls)
 ```
 
 ## Backups

@@ -79,6 +79,9 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// certWatch reports on the certificates this node serves (cert_watch.go).
+	certWatch *certWatch
+
 	// mintClearance is the gRPC server the lease-mint clearance asks, published
 	// once its gate is wired. Atomic because lease holders (the rebalancer)
 	// start before the server exists. See wireLeaseMintClearance.
@@ -302,6 +305,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// finding 8), now that obs.Setup has resolved whether tracing is active.
 	// Safe here: replication/anti-entropy start later in this method.
 	pki.SetTraceDialOptions(obs.ClientDialOptions)
+
+	// Finish or repair a host certificate renewal a crash interrupted
+	// (pki/hostswap.go), before anything reads host.crt/host.key. A pair that
+	// already loads is left alone.
+	if _, err := pki.RecoverHostIdentity(d.cfg.PKIDir, d.cfg.HostName); err != nil {
+		slog.Error("the host identity does not load and could not be recovered", "error", err)
+	}
 
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
@@ -1514,6 +1524,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// library file to the recorded version (iso_library.go).
 	go d.runISOLibrarySync(ctx, svc)
 
+	// Certificates this node serves: re-record a host certificate renewed in
+	// place, export expiry, and notify ahead of it (cert_watch.go).
+	d.certWatch = newCertWatch(d.cfg.HostName, d.cfg.PKIDir, d.db, svc, metrics.NewCertMetrics())
+	go d.certWatch.run(ctx)
+
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
 	// and re-execs. Default on; disable with auto_upgrade.from_peer: false.
@@ -1567,8 +1582,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	rpcMetrics := metrics.NewRPCMetrics()
+	// Established connections are re-judged every few seconds (pki.ConnTracker):
+	// one made with a certificate since revoked, or with a host certificate a
+	// renewal replaced, drains and is closed, and its client re-handshakes. The
+	// auth interceptors refuse a new RPC on such a connection at once, without
+	// waiting for a sweep (Server.connIdentityGate).
+	connTracker := pki.NewConnTracker(d.cfg.PKIDir)
+	go connTracker.Run(ctx, connSweepInterval, func() func(pki.TrackedConn) pki.Verdict { return svc.ConnJudge(ctx) })
 	grpcOpts := []grpc.ServerOption{
-		grpc.Creds(credentials.NewTLS(tlsCfg)),
+		grpc.Creds(connTracker.ServerCreds(credentials.NewTLS(tlsCfg))),
+		grpc.StatsHandler(connTracker.StatsHandler()),
 		grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor(), svc.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor(), svc.StreamAuthInterceptor),
 		// Defense-in-depth for the legacy unary state-dump/replication paths: the
@@ -1606,15 +1629,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start web UI (connects back to local gRPC as a client).
 	go func() {
-		clientTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-		if err != nil {
-			slog.Warn("UI client TLS config failed", "error", err)
-			return
-		}
-		localConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-			grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
-			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-		)
+		// Recycled when this host's certificate is renewed: the connection
+		// made with the replaced one accepts no new RPC (pki.RecyclingConn).
+		localConn, err := d.localRecyclingConn()
 		if err != nil {
 			slog.Warn("UI gRPC dial failed", "error", err)
 			return
@@ -1631,14 +1648,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		uiSrv.SetCorrosionDB(d.db)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
-		// ACME (#13): when enabled, terminate UI TLS via autocert (step-ca / LE)
-		// with an internal-PKI fallback, and serve the HTTP-01 challenge on :80.
-		if tlsCfg, challenge := d.buildUITLSConfig(); tlsCfg != nil {
-			uiSrv.SetTLSConfig(tlsCfg)
-			startACMEChallengeServer(ctx, challenge)
-		}
+		// UI TLS (acme.go): a custom certificate (`lv host ui-cert set`), else
+		// ACME (HTTP-01 on :80, or DNS-01), else the cluster certificate. The
+		// listener re-decides TLS vs plain HTTP while running, so installing or
+		// clearing a custom certificate needs no restart.
+		uiTLS, challenge := d.buildUITLS(ctx)
+		startACMEChallengeServer(ctx, challenge)
+		d.certWatch.addUI(uiTLS)
+		uiAddr := fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)
+		warnPlainUI(d.cfg.UIBind, uiTLS.wantTLS())
 		uiSrv.StartCollector(ctx)
-		if err := uiSrv.ListenAndServe(fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort)); err != nil {
+		if err := uiSrv.ServeSupervised(ctx, uiAddr, uiTLS.tlsConfig(), uiTLS.wantTLS, 5*time.Second); err != nil {
 			slog.Warn("UI server stopped", "error", err)
 		}
 	}()
@@ -1646,15 +1666,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start REST API gateway.
 	if d.cfg.RESTPort > 0 {
 		go func() {
-			restTLS, err := pki.ClientTLSConfig(d.cfg.PKIDir)
-			if err != nil {
-				slog.Warn("REST client TLS config failed", "error", err)
-				return
-			}
-			restConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
-				grpc.WithTransportCredentials(credentials.NewTLS(restTLS)),
-				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
-			)
+			restConn, err := d.localRecyclingConn()
 			if err != nil {
 				slog.Warn("REST gRPC dial failed", "error", err)
 				return

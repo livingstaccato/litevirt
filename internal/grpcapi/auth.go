@@ -126,7 +126,7 @@ func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
 // replicated because replication is what is refused. Leave it false in steady
 // state: with RegisterHost re-recording each node's own serial at startup, an
 // ordinary rotation converges without it.
-func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts = on }
+func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts.Store(on) }
 
 // SetRBACRealm sets this node's opt-in for realm-aware role-binding grammar.
 // The flag is the reversible kill switch; realm enforcement in GrantRole is
@@ -156,6 +156,9 @@ func (s *Server) UnaryAuthInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
+	if err := s.connIdentityGate(ctx); err != nil {
+		return nil, err
+	}
 	if skipAuth[info.FullMethod] {
 		if preSessionAuthMethods[info.FullMethod] {
 			if err := s.gateAuditHold(ctx, info.FullMethod, true); err != nil {
@@ -188,6 +191,9 @@ func (s *Server) StreamAuthInterceptor(
 	info *grpc.StreamServerInfo,
 	handler grpc.StreamHandler,
 ) error {
+	if err := s.connIdentityGate(ss.Context()); err != nil {
+		return err
+	}
 	if skipAuth[info.FullMethod] {
 		// Stamped here too, so a pre-session credential exchange added as a
 		// STREAMING RPC later cannot slip in unstamped — the unary path would
@@ -358,6 +364,13 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		if rows[0].String("deleted_at") != "" {
 			return false
 		}
+		// A certificate the CA has replaced (a standing renewal successor this
+		// node holds, pki.SupersededBy) is never the host, whatever the row's
+		// serial says: that column is replicated data any peer can write back.
+		if cert := peerLeafCert(ctx); cert != nil && !s.trustRotatedPeerCerts.Load() && s.pkiDir != "" &&
+			pki.SupersededError(s.pkiDir, cert) != nil {
+			return false
+		}
 		// Real peer calls carry the leaf certificate. Bind an active name to the
 		// exact CA-issued identity recorded at admission, so re-admitting a name
 		// cannot reopen a lagging peer to that name's old certificate.
@@ -375,7 +388,19 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 			if strings.EqualFold(recorded, presented) {
 				return true
 			}
-			if !s.trustRotatedPeerCerts {
+			// A CA-issued SUCCESSOR of the recorded certificate (`lv host
+			// renew-cert`): the CA's signature over "this replaces <recorded>"
+			// is the same authority admission recorded, so the renewed node
+			// stays a peer through the swap instead of waiting for its
+			// re-recorded serial to replicate. It cannot reopen a re-admitted
+			// name to an old certificate: that certificate predates the
+			// admission and so cannot name the serial the admission recorded.
+			// See pki.RenewedFromSerial.
+			if prev, ok := pki.RenewedFromSerial(cert); ok && strings.EqualFold(prev, recorded) &&
+				callerCertHasServerAuth(ctx) {
+				return true
+			}
+			if !s.trustRotatedPeerCerts.Load() {
 				return false
 			}
 			slog.Warn("peer presented a certificate other than the one recorded at admission; "+

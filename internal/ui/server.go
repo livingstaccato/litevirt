@@ -4,11 +4,14 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -503,6 +506,91 @@ func (s *Server) ListenAndServe(addr string) error {
 	}
 	slog.Info("UI server listening", "addr", addr)
 	return srv.ListenAndServe()
+}
+
+// ServeSupervised serves the UI on addr until ctx ends, re-deciding between
+// TLS and plain HTTP every `every`.
+//
+// The listener's mode used to be fixed at boot: TLS when ACME was configured,
+// plain HTTP otherwise. A custom certificate installed on a running node (`lv
+// host ui-cert set`) has to take effect without a restart, and so does
+// clearing it, so wantTLS is polled and the listener is restarted — briefly,
+// gracefully — when the answer changes. Within a mode nothing is restarted:
+// tlsCfg's GetCertificate picks up a replaced certificate at the next
+// handshake. A bind that fails right after a switch (the old socket still
+// closing) is retried for a few seconds before it is reported.
+func (s *Server) ServeSupervised(ctx context.Context, addr string, tlsCfg *tls.Config, wantTLS func() bool, every time.Duration) error {
+	handler := s.csrfGuard(s.Handler())
+	for {
+		useTLS := tlsCfg != nil && wantTLS != nil && wantTLS()
+		ln, err := listenRetry(ctx, addr, 5*time.Second)
+		if err != nil {
+			return err
+		}
+		srv := &http.Server{Handler: handler, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second}
+		errCh := make(chan error, 1)
+		if useTLS {
+			srv.TLSConfig = tlsCfg
+			slog.Info("UI server listening (TLS)", "addr", addr)
+			go func() { errCh <- srv.ServeTLS(ln, "", "") }()
+		} else {
+			slog.Info("UI server listening", "addr", addr)
+			go func() { errCh <- srv.Serve(ln) }()
+		}
+		switched, err := waitSwitch(ctx, errCh, wantTLS, useTLS, every)
+		if !switched {
+			shutdownUI(srv)
+			return err
+		}
+		slog.Warn("UI listener switching mode", "addr", addr, "tls", !useTLS)
+		shutdownUI(srv)
+		<-errCh
+	}
+}
+
+// waitSwitch blocks until the listener must change mode (true), the context
+// ends (false, nil), or the server fails (false, err).
+func waitSwitch(ctx context.Context, errCh <-chan error, wantTLS func() bool, useTLS bool, every time.Duration) (bool, error) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false, nil
+		case err := <-errCh:
+			if errors.Is(err, http.ErrServerClosed) {
+				return false, nil
+			}
+			return false, err
+		case <-t.C:
+			if wantTLS != nil && wantTLS() != useTLS {
+				return true, nil
+			}
+		}
+	}
+}
+
+func shutdownUI(srv *http.Server) {
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		_ = srv.Close()
+	}
+}
+
+func listenRetry(ctx context.Context, addr string, within time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(within)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil || time.Now().After(deadline) {
+			return ln, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // csrfGuard rejects cross-site state-changing requests (CSRF defense-in-depth

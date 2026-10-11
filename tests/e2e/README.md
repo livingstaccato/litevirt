@@ -57,6 +57,8 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |
 | `E2E_REST_TOKEN` | (skip REST tests) | API token for REST tests |
 | `E2E_SKIP_SLOW` | `0` | Set to `1` to skip migration/backup tests |
+| `E2E_CERT_RENEW` | `0` | Set to `1` to run `TestCert_RenewHostCertificateInPlace`: renews a peer's cluster certificate with `lv host renew-cert` (revoking the old one) and checks gRPC (7443) and libvirt (16514) present the successor and the host stays active. Run on the machine holding the cluster CA key |
+| `E2E_UI_CERT` | `0` | Set to `1` to run `TestCert_UICertificateSetAndClear`: installs a custom UI certificate on this node, checks 127.0.0.1:7445 serves it without a restart, then clears it |
 
 ## Test phases
 

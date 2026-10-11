@@ -26,9 +26,23 @@ ui_port: 7445
 
 # Address the web UI listens on. Defaults to 127.0.0.1 (localhost only)
 # so the UI is unreachable from off-host without a reverse proxy or
-# SSH tunnel. Set to 0.0.0.0 to expose directly — only do this behind
-# a reverse proxy that terminates TLS.
+# SSH tunnel. Set to 0.0.0.0 to expose directly — only with TLS: either a
+# reverse proxy that terminates it, or ui_tls / a custom certificate / acme
+# below. The daemon warns at startup when it serves plain HTTP on a
+# non-loopback address.
 ui_bind: "127.0.0.1"
+
+# Whether the web UI speaks TLS itself (docs/ui.md, "TLS"). `lv host init` /
+# `lv host add` write `on` for a NEW node; a config without the key (an older
+# node) means auto, and re-initialising a node keeps the value it has.
+#   auto (the default when unset): TLS while a custom certificate is installed
+#        (`lv host ui-cert set`) or acme: is configured; plain HTTP otherwise.
+#        Re-decided while running — installing or clearing a certificate
+#        switches the listener within seconds, no restart.
+#   on:  always TLS. Serves the custom certificate, else ACME's, else this
+#        host's cluster certificate (issued by the cluster CA; import ca.crt
+#        into browsers that should trust it).
+ui_tls: on
 
 # WebSocket Origin allowlist for the UI (host patterns). Empty (default)
 # enforces strict same-origin checks on the console WebSocket; add entries
@@ -561,7 +575,17 @@ auth:
   # admitted for CA-issued HOST certificates instead of refused — wait for the
   # fleet to replicate, then set it back to false. It never relaxes the removal
   # tombstone (a decommissioned host stays out) and never lets a distributable
-  # client certificate act as a peer. Default false.
+  # client certificate act as a peer. While it is on it ALSO turns off the
+  # recovery-claim serial pin (accepts signed with a renewal's replaced key
+  # count again, in claim certificates and voter generations) and stops
+  # refusing RPCs on, or closing, connections made with a superseded host
+  # certificate. Because such a node does not pin, the cluster also HOLDS the
+  # revocation of a renewal's replaced certificate while any node has it on
+  # (each node reports it as a certificate/trust_rotated_peer_certs
+  # condition). Turn it off as soon as the fleet has converged. It is NOT a way
+  # out of a voter chain stuck after a renewal: it relaxes the pin, never
+  # revocation, and a renewal revokes the replaced certificate — the renewed
+  # voter's re-attestation is (docs/auth.md, "Renewing a voter"). Default false.
   trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's
@@ -668,16 +692,36 @@ containers:
   # its files are shifted into the range at create), on, or off.
   idmapped_rootfs: auto
 
-# ACME / autocert for the web UI cert (#13). When set, the daemon TERMINATES UI
-# TLS itself (port 7445) using a cert from the configured ACME directory, with an
-# internal-PKI fallback during issuance. Unset (default) = UI stays plain HTTP
-# (e.g. behind a fronting proxy). HTTP-01 only — needs inbound :80 reachable from
-# the CA. directory_url points at internal step-ca or Let's Encrypt.
+# ACME for the web UI cert (#13). When set, the daemon TERMINATES UI TLS itself
+# (port 7445) using a cert from the configured ACME directory, with the cluster
+# certificate as fallback during issuance and for names outside `domains`. A
+# custom certificate (`lv host ui-cert set`) takes precedence over both. Unset
+# (default) = see ui_tls. directory_url points at internal step-ca or Let's
+# Encrypt.
 acme:
   directory_url: ""                 # e.g. https://ca.internal/acme/acme/directory  (empty = disabled)
   email: "ops@example.com"
-  domains: ["litevirt.example.com"] # SANs to request; must resolve to this host
+  domains: ["litevirt.example.com"] # SANs to request; must resolve to this host (dns-01: "*.x" allowed)
   cache_dir: ""                     # default {data_dir}/acme
+  # http-01 (default): autocert; needs inbound :80 reachable from the CA.
+  # dns-01: publishes _acme-challenge TXT records through dns.provider; needs no
+  #         inbound port and can issue wildcards. Renewed 30 days before expiry.
+  challenge: http-01
+  dns:
+    provider: rfc2136               # TSIG-signed DNS UPDATE (BIND, Knot, PowerDNS, Windows DNS, ...)
+    propagation_timeout_sec: 120    # wait for the record to be visible on the nameserver
+    propagation_delay_sec: 0        # extra wait for secondaries that serve the zone too
+    rfc2136:
+      nameserver: "10.0.0.53"       # primary that accepts updates; host[:port], port default 53
+      zone: "example.com"           # every acme.domains entry must be inside it
+      tsig_key_name: "litevirt-acme"
+      tsig_algorithm: hmac-sha256   # hmac-sha256 | hmac-sha384 | hmac-sha512 | hmac-sha224 | hmac-sha1
+      # The TSIG secret (base64, or a BIND key file). A SECRET: it is never put
+      # in this file, the daemon tightens the file to 0600 and never logs it.
+      # Grant the key update rights for _acme-challenge names only.
+      tsig_secret_path: /etc/litevirt/acme-tsig.key
+      ttl: 60
+      transport: udp                # udp (default) | tcp
 
 # Notifications (#5). Optional shortcut: seed a catch-all webhook target+route
 # (min-severity warn) from config without using `lv notify` / the UI. Manage
@@ -1034,7 +1078,7 @@ difference rather than a judgement that this endpoint carries less.
 |---------|---------|----------|----------------|--------------|---------|
 | `grpc_port` | 7443 | gRPC/mTLS | yes — mTLS, client cert required | all | API (CLI, inter-host) |
 | `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
-| `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
+| `ui_port` | 7445 | HTTP, or HTTPS per `ui_tls` | session cookie | `127.0.0.1` | Web dashboard |
 | `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
 | `gossip_port` | 7946 | TCP+UDP | only with `enforcement.gossip_encryption: true` — AES-256-GCM under `gossip.key` ([details](auth.md#gossip-encryption)); members are also admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)) | **all** | Cluster membership |
 | `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |

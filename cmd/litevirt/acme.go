@@ -11,9 +11,10 @@ import (
 )
 
 // newACMECmd inspects the TLS cert the web UI is serving (#13). The cert is
-// provisioned by the daemon (autocert when acme: is configured, else the
-// internal-PKI fallback); this just reports what's actually presented on the
-// UI port so an operator can confirm issuance/renewal.
+// provisioned by the daemon (a custom certificate from `lv host ui-cert set`,
+// else ACME when acme: is configured, else the cluster certificate); this just
+// reports what's actually presented on the UI port so an operator can confirm
+// issuance/renewal.
 func newACMECmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "acme", Short: "Inspect the web UI's TLS certificate (ACME)"}
 	cmd.AddCommand(newACMEStatusCmd())
@@ -27,7 +28,7 @@ func newACMEStatusCmd() *cobra.Command {
 		Short: "Show the TLS certificate the UI is serving",
 		Long: "Dials the UI's TLS port and prints the served certificate's subject, issuer, " +
 			"SANs and expiry. host defaults to $LV_HOST. The UI must be serving TLS " +
-			"(acme: configured); a plain-HTTP UI will fail to handshake.",
+			"(a custom certificate, acme:, or ui_tls: on); a plain-HTTP UI will fail to handshake.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			host := os.Getenv("LV_HOST")
@@ -41,7 +42,7 @@ func newACMEStatusCmd() *cobra.Command {
 			dialer := &net.Dialer{Timeout: 8 * time.Second}
 			conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // inspection only
 			if err != nil {
-				return fmt.Errorf("dial %s: %w (is the UI serving TLS? acme must be configured)", addr, err)
+				return fmt.Errorf("dial %s: %w (is the UI serving TLS? it does with a custom certificate, acme:, or ui_tls: on)", addr, err)
 			}
 			defer conn.Close()
 			st := conn.ConnectionState()

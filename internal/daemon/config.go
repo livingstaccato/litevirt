@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
@@ -209,9 +210,17 @@ type Config struct {
 	// upgrade and came back on its old binary. See docs/self-upgrade-from-peer.md.
 	AutoUpgrade AutoUpgradeConfig `yaml:"auto_upgrade,omitempty"`
 
+	// UITLS decides whether the web UI listener speaks TLS. "auto" (the
+	// default, also ""): TLS when acme: is configured or a custom certificate
+	// is installed (`lv host ui-cert set`), plain HTTP otherwise — re-decided
+	// while running, so installing or clearing a certificate takes effect
+	// without a restart. "on": always TLS, serving the custom certificate, else
+	// ACME's, else this host's cluster certificate (signed by the cluster CA).
+	UITLS string `yaml:"ui_tls,omitempty"`
+
 	// ACME auto-provisions a public TLS cert for the web UI (#13). When set, the
-	// daemon terminates UI TLS itself via autocert; when unset the UI stays plain
-	// HTTP (today's behavior, e.g. behind a fronting proxy).
+	// daemon terminates UI TLS itself (HTTP-01 via autocert, or DNS-01); when
+	// unset, ui_tls decides.
 	ACME ACMEConfig `yaml:"acme,omitempty"`
 
 	// Notifications: operator alerting targets/routes (#5). The optional
@@ -360,20 +369,96 @@ type TelemetryConfig struct {
 	LogFormat    string   `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
 }
 
-// ACMEConfig configures autocert for the web UI (#13). directory_url points at
-// an ACME directory — internal step-ca (e.g.
+// ACMEConfig configures ACME certificates for the web UI (#13). directory_url
+// points at an ACME directory — internal step-ca (e.g.
 // "https://ca.internal/acme/acme/directory") or Let's Encrypt. Empty
-// directory_url or domains disables ACME (UI stays plain HTTP). HTTP-01 only
-// (needs inbound :80 reachable from the CA).
+// directory_url or domains disables ACME.
+//
+// challenge picks how the CA is shown control of the names: "http-01" (the
+// default; autocert, needs inbound :80 reachable from the CA) or "dns-01"
+// (publishes a TXT record through dns.provider; needs no inbound port and can
+// issue wildcards).
 type ACMEConfig struct {
-	DirectoryURL string   `yaml:"directory_url,omitempty"`
-	Email        string   `yaml:"email,omitempty"`
-	Domains      []string `yaml:"domains,omitempty"`
-	CacheDir     string   `yaml:"cache_dir,omitempty"` // default {DataDir}/acme
+	DirectoryURL string        `yaml:"directory_url,omitempty"`
+	Email        string        `yaml:"email,omitempty"`
+	Domains      []string      `yaml:"domains,omitempty"`
+	CacheDir     string        `yaml:"cache_dir,omitempty"` // default {DataDir}/acme
+	Challenge    string        `yaml:"challenge,omitempty"` // http-01 (default) | dns-01
+	DNS          ACMEDNSConfig `yaml:"dns,omitempty"`
+}
+
+// ACMEDNSConfig configures the dns-01 challenge's DNS provider.
+type ACMEDNSConfig struct {
+	// Provider names the DNS backend. "rfc2136" (TSIG-signed DNS UPDATE) is
+	// the generic one.
+	Provider string        `yaml:"provider,omitempty"`
+	RFC2136  RFC2136Config `yaml:"rfc2136,omitempty"`
+	// PropagationTimeoutSec bounds the wait for the record to be visible on
+	// the provider's server (default 120). PropagationDelaySec is then waited
+	// for secondaries (default 0).
+	PropagationTimeoutSec int `yaml:"propagation_timeout_sec,omitempty"`
+	PropagationDelaySec   int `yaml:"propagation_delay_sec,omitempty"`
+}
+
+// RFC2136Config is a DNS UPDATE target. The TSIG secret is read from
+// tsig_secret_path (base64, the format `tsig-keygen` and BIND key files use)
+// and never stored in this file: the daemon tightens that file to 0600 like
+// every other key on the host, and never logs its contents.
+type RFC2136Config struct {
+	Nameserver     string `yaml:"nameserver,omitempty"`     // host[:port] of the primary; port default 53
+	Zone           string `yaml:"zone,omitempty"`           // zone the _acme-challenge records live in
+	TSIGKeyName    string `yaml:"tsig_key_name,omitempty"`  // TSIG key name
+	TSIGAlgorithm  string `yaml:"tsig_algorithm,omitempty"` // hmac-sha256 (default) | hmac-sha384 | hmac-sha512 | hmac-sha224 | hmac-sha1
+	TSIGSecretPath string `yaml:"tsig_secret_path,omitempty"`
+	TTL            int    `yaml:"ttl,omitempty"`       // record TTL, seconds (default 60)
+	Transport      string `yaml:"transport,omitempty"` // udp (default) | tcp
 }
 
 // Enabled reports whether ACME should run.
 func (a ACMEConfig) Enabled() bool { return a.DirectoryURL != "" && len(a.Domains) > 0 }
+
+// DNS01 reports whether ACME runs with the dns-01 challenge.
+func (a ACMEConfig) DNS01() bool { return a.Enabled() && a.Challenge == "dns-01" }
+
+// validate refuses an ACME block that cannot work, at load time rather than
+// at the first issuance attempt hours later.
+func (a ACMEConfig) validate() error {
+	switch a.Challenge {
+	case "", "http-01":
+		return nil
+	case "dns-01":
+	default:
+		return fmt.Errorf("config acme.challenge: %q is not one of http-01, dns-01", a.Challenge)
+	}
+	if !a.Enabled() {
+		return nil
+	}
+	if a.DNS.Provider != "rfc2136" {
+		return fmt.Errorf("config acme.dns.provider: %q is not a supported provider (rfc2136)", a.DNS.Provider)
+	}
+	r := a.DNS.RFC2136
+	if r.Nameserver == "" || r.Zone == "" || r.TSIGKeyName == "" || r.TSIGSecretPath == "" {
+		return fmt.Errorf("config acme.dns.rfc2136: nameserver, zone, tsig_key_name and tsig_secret_path are all required " +
+			"(an unauthenticated DNS update would let anyone who reaches the server obtain a certificate)")
+	}
+	if _, err := acmedns.TSIGAlgorithm(r.TSIGAlgorithm); err != nil {
+		return fmt.Errorf("config acme.dns.rfc2136.tsig_algorithm: %w", err)
+	}
+	switch r.Transport {
+	case "", "udp", "tcp":
+	default:
+		return fmt.Errorf("config acme.dns.rfc2136.transport: %q is not udp or tcp", r.Transport)
+	}
+	zone := strings.ToLower(strings.TrimSuffix(r.Zone, "."))
+	for _, d := range a.Domains {
+		name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(d, "*."), "."))
+		if name != zone && !strings.HasSuffix(name, "."+zone) {
+			return fmt.Errorf("config acme.domains: %q is not in acme.dns.rfc2136.zone %q, so its "+
+				"_acme-challenge record cannot be published there", d, r.Zone)
+		}
+	}
+	return nil
+}
 
 // NotificationsConfig holds the optional default-webhook shortcut (#5).
 type NotificationsConfig struct {
@@ -862,6 +947,15 @@ func LoadConfig() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("config vm.default_cpu_mode: invalid mode %q: want %s or %s",
 			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	}
+
+	switch cfg.UITLS {
+	case "", "auto", "on":
+	default:
+		return nil, fmt.Errorf("config ui_tls: %q is not one of auto, on", cfg.UITLS)
+	}
+	if err := cfg.ACME.validate(); err != nil {
+		return nil, err
 	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly

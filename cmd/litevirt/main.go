@@ -75,6 +75,7 @@ func newRootCmd() *cobra.Command {
 
 	root.AddCommand(
 		newHostCmd(),
+		newHostPKICmd(),
 		newNetworkCmd(),
 		newNetboxCmd(),
 		newComposeCmd(),

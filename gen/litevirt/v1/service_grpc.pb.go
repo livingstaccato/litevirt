@@ -39,6 +39,7 @@ const (
 	LiteVirt_IsolateHost_FullMethodName                = "/litevirt.v1.LiteVirt/IsolateHost"
 	LiteVirt_ReseedHost_FullMethodName                 = "/litevirt.v1.LiteVirt/ReseedHost"
 	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
+	LiteVirt_RevokeReplacedCertificate_FullMethodName  = "/litevirt.v1.LiteVirt/RevokeReplacedCertificate"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
 	LiteVirt_SupersededDisks_FullMethodName            = "/litevirt.v1.LiteVirt/SupersededDisks"
@@ -356,6 +357,12 @@ type LiteVirtClient interface {
 	// opens a peer connection, and an unverified one would let a caller un-revoke
 	// themselves by publishing a CRL that simply omits their serial.
 	PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error)
+	// RevokeReplacedCertificate revokes the certificate a renewal replaced —
+	// now, or, when revoking now would leave the newest voter generation
+	// without a quorum of unrevoked signatures for a node that adopts it later
+	// (docs/design/recovery-claims.md §4.1), as a durable revocation owed that
+	// the cluster publishes automatically once it is safe.
+	RevokeReplacedCertificate(ctx context.Context, in *RevokeReplacedCertificateRequest, opts ...grpc.CallOption) (*RevokeReplacedCertificateResponse, error)
 	RescanHost(ctx context.Context, in *RescanHostRequest, opts ...grpc.CallOption) (*RescanHostResponse, error)
 	ListHostDevices(ctx context.Context, in *ListHostDevicesRequest, opts ...grpc.CallOption) (*ListHostDevicesResponse, error)
 	// SupersededDisks lists the disk copies a failover start set aside on a
@@ -1134,6 +1141,16 @@ func (c *liteVirtClient) PublishCRL(ctx context.Context, in *PublishCRLRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PublishCRLResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_PublishCRL_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RevokeReplacedCertificate(ctx context.Context, in *RevokeReplacedCertificateRequest, opts ...grpc.CallOption) (*RevokeReplacedCertificateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RevokeReplacedCertificateResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RevokeReplacedCertificate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4218,6 +4235,12 @@ type LiteVirtServer interface {
 	// opens a peer connection, and an unverified one would let a caller un-revoke
 	// themselves by publishing a CRL that simply omits their serial.
 	PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error)
+	// RevokeReplacedCertificate revokes the certificate a renewal replaced —
+	// now, or, when revoking now would leave the newest voter generation
+	// without a quorum of unrevoked signatures for a node that adopts it later
+	// (docs/design/recovery-claims.md §4.1), as a durable revocation owed that
+	// the cluster publishes automatically once it is safe.
+	RevokeReplacedCertificate(context.Context, *RevokeReplacedCertificateRequest) (*RevokeReplacedCertificateResponse, error)
 	RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error)
 	ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error)
 	// SupersededDisks lists the disk copies a failover start set aside on a
@@ -4850,6 +4873,9 @@ func (UnimplementedLiteVirtServer) ReseedHost(context.Context, *ReseedHostReques
 }
 func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
+}
+func (UnimplementedLiteVirtServer) RevokeReplacedCertificate(context.Context, *RevokeReplacedCertificateRequest) (*RevokeReplacedCertificateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RevokeReplacedCertificate not implemented")
 }
 func (UnimplementedLiteVirtServer) RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RescanHost not implemented")
@@ -6024,6 +6050,24 @@ func _LiteVirt_PublishCRL_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).PublishCRL(ctx, req.(*PublishCRLRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RevokeReplacedCertificate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevokeReplacedCertificateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RevokeReplacedCertificate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RevokeReplacedCertificate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RevokeReplacedCertificate(ctx, req.(*RevokeReplacedCertificateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10749,6 +10793,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PublishCRL",
 			Handler:    _LiteVirt_PublishCRL_Handler,
+		},
+		{
+			MethodName: "RevokeReplacedCertificate",
+			Handler:    _LiteVirt_RevokeReplacedCertificate_Handler,
 		},
 		{
 			MethodName: "RescanHost",

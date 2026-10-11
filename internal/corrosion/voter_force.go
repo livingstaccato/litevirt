@@ -188,6 +188,9 @@ func (v *ClaimVerifier) verifyForcedSignatures(prev *VoterConfig, next VoterConf
 	}
 	signed := map[string]bool{}
 	for _, sgn := range ev.Signatures {
+		v.noteSuccessors(sgn.CertPEM)
+	}
+	for _, sgn := range ev.Signatures {
 		if !isMember(next.Members, sgn.Voter) {
 			return fmt.Errorf("%s signed but is not a survivor", sgn.Voter)
 		}
@@ -234,6 +237,9 @@ func (v *ClaimVerifier) verifySigned(certPEM, name string, payload, sig []byte) 
 	}
 	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
+	}
+	if err := v.pinRefuses(c, name); err != nil {
+		return err
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)
 	if !ok {

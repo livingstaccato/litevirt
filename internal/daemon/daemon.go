@@ -1870,6 +1870,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Warn("graceful shutdown timed out, forcing stop")
 			d.grpcSrv.Stop()
 		}
+		// A drain returns before its failback records are written, and this
+		// is the host it drained: give them a moment to land while the
+		// replicator still runs, and name every VM whose record is lost.
+		svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
 		if d.fwReconciler != nil {
 			d.fwReconciler.Stop()
 		}

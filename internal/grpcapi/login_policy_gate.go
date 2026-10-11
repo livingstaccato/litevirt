@@ -35,8 +35,13 @@ import (
 const loginPolicyGateWait = 3 * time.Second
 
 // loginPolicyRefusalBackoff is how long a best-effort caller writes without
-// the feature after the gate refused it, so a recipient that cannot answer
-// costs one bounded wait per interval, not one per login.
+// the feature after the gate refused a FIRST use (no acknowledged record in
+// this replica), so a recipient that cannot answer costs one bounded wait per
+// interval — plus the callers already waiting on that attempt, each at most
+// loginPolicyGateWait — not one per login. It never applies once this
+// replica holds an acknowledged record: the gate's path is then local, with
+// no peer wait, and a write that skipped it would lose data the feature
+// already depends on (a presented factor, a delete's cut-offs).
 const loginPolicyRefusalBackoff = time.Minute
 
 // loginPolicyBackoff records when the gate last refused a best-effort write.
@@ -70,9 +75,26 @@ func (s *Server) withLoginPolicy(ctx context.Context, write func(context.Context
 	return s.WithReleaseFeature(ctx, capabilities.FeatureLoginPolicy, write)
 }
 
-// withLoginPolicyIfAvailable is LoginPolicyIfAvailable on this server's gate.
+// withLoginPolicyIfAvailable is LoginPolicyIfAvailable on this server's gate,
+// with the refusal backoff, which this replica's acknowledged record lifts.
 func (s *Server) withLoginPolicyIfAvailable(ctx context.Context, write func(context.Context, capabilities.FeatureGrant) error) error {
-	return loginPolicyIfAvailable(ctx, s.releaseFeatures, &s.loginPolicyBackoff, write)
+	return loginPolicyIfAvailable(ctx, s.releaseFeatures, s.loginPolicyInUse, &s.loginPolicyBackoff, write)
+}
+
+// loginPolicyInUse reports whether this replica holds an ACKNOWLEDGED used
+// record for login_policy, so the gate passes on its local path. A read that
+// fails is "no".
+func (s *Server) loginPolicyInUse(ctx context.Context) bool {
+	return releaseFeatureAckedHere(ctx, s.db, capabilities.FeatureLoginPolicy)
+}
+
+func releaseFeatureAckedHere(ctx context.Context, db *corrosion.Client, f capabilities.Feature) bool {
+	info, ok := capabilities.LookupFeature(f)
+	if !ok || db == nil {
+		return false
+	}
+	_, acked, err := corrosion.ReleaseFeatureState(ctx, db, info.Token, string(f))
+	return err == nil && acked
 }
 
 // LoginPolicyIfAvailable runs write — a write the previous release makes too
@@ -86,13 +108,17 @@ func (s *Server) withLoginPolicyIfAvailable(ctx context.Context, write func(cont
 // token durably latched; a local read, no Ping), and then for at most
 // loginPolicyGateWait. A nil gate is the zero grant.
 func LoginPolicyIfAvailable(ctx context.Context, gate releaseFeatureGate, write func(context.Context, capabilities.FeatureGrant) error) error {
-	return loginPolicyIfAvailable(ctx, gate, nil, write)
+	return loginPolicyIfAvailable(ctx, gate, nil, nil, write)
 }
 
-func loginPolicyIfAvailable(ctx context.Context, gate releaseFeatureGate, backoff *loginPolicyBackoff,
-	write func(context.Context, capabilities.FeatureGrant) error) error {
+// loginPolicyIfAvailable is LoginPolicyIfAvailable with an optional backoff
+// after a refused first use. inUse, when set, says this replica holds an
+// acknowledged record; the backoff is then ignored (re-review I-1).
+func loginPolicyIfAvailable(ctx context.Context, gate releaseFeatureGate, inUse func(context.Context) bool,
+	backoff *loginPolicyBackoff, write func(context.Context, capabilities.FeatureGrant) error) error {
 	const f = capabilities.FeatureLoginPolicy
-	if gate != nil && gate.FeatureAvailable(f) && !backoff.backingOff(time.Now()) {
+	if gate != nil && gate.FeatureAvailable(f) &&
+		(!backoff.backingOff(time.Now()) || (inUse != nil && inUse(ctx))) {
 		gctx, cancel := context.WithTimeout(ctx, loginPolicyGateWait)
 		ran := false
 		err := gate.WithFeature(gctx, f, func(_ context.Context, g capabilities.FeatureGrant) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -136,5 +137,118 @@ func TestVoidEnrollmentCode_AsksTheGateOnlyForALiveCode(t *testing.T) {
 	}
 	if live, err := corrosion.HasLiveEnrollmentCode(ctx, s.db, "bob"); err != nil || live {
 		t.Fatalf("after voiding: live=%v err=%v", live, err)
+	}
+}
+
+// TestLoginPolicyIfAvailable_BackoffLiftsOnceTheFeatureIsInUse is re-review
+// I-1. A first use from this node is refused (a voter was down), and the
+// node backs off. Another node then opens the feature, and its acknowledged
+// record reaches this replica. Inside the backoff window, a login that
+// presents a second factor still records it — or the policy would confine
+// that session for life — and a delete still writes its cut-offs: with an
+// acknowledged record the gate's path is local, so the backoff does not apply.
+func TestLoginPolicyIfAvailable_BackoffLiftsOnceTheFeatureIsInUse(t *testing.T) {
+	s := loginPolicyServer(t)
+	ctx := context.Background()
+	secrets := map[string]string{}
+	for _, u := range []string{"ann", "uma"} {
+		seedUser(t, s, u, "viewer", u+"-pw")
+		res, err := auth.EnrollTOTP(ctx, s.db, u, "phone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		secrets[u] = res.SecretBase32
+	}
+	seedUser(t, s, "carol", "viewer", "carol-pw")
+	g := &countingFeatureGate{t: t, available: true,
+		refuse: status.Error(codes.Unavailable, "voter y did not confirm the use")}
+	s.SetReleaseFeatureGate(g)
+	factorOf := func(token string) string {
+		t.Helper()
+		f, err := corrosion.SessionFactor(ctx, s.db, strings.TrimPrefix(token, SessionTokenPrefix))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	// 1. The first use is refused: the login works, without its factor row,
+	// and this node backs off.
+	r, err := s.Login(ctx, &pb.LoginRequest{Username: "ann", Password: "ann-pw", TotpCode: totpCode(t, secrets["ann"])})
+	if err != nil {
+		t.Fatalf("a factor login while the first use is refused: %v", err)
+	}
+	if f := factorOf(r.Token); f != "" || g.asked != 1 {
+		t.Fatalf("refused first use: factor=%q asked=%d, want no factor row and one attempt", f, g.asked)
+	}
+
+	// 2. Another node opens the feature; its acknowledged record arrives.
+	g.refuse = nil
+	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, capabilities.ReleaseToken,
+		string(capabilities.FeatureLoginPolicy), "node-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Inside the backoff window: the factor is recorded.
+	r, err = s.Login(ctx, &pb.LoginRequest{Username: "uma", Password: "uma-pw", TotpCode: totpCode(t, secrets["uma"])})
+	if err != nil {
+		t.Fatalf("a factor login in the backoff window: %v", err)
+	}
+	if f := factorOf(r.Token); f != "totp" {
+		t.Fatalf("a factor login in the backoff window after the feature opened recorded factor %q, want totp", f)
+	}
+	// And a delete writes its durable cut-offs.
+	if _, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "carol"}); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := corrosion.GetUserLifecycle(ctx, s.db, "carol"); err != nil || l.TokensNotBefore == "" {
+		t.Fatalf("a delete in the backoff window wrote no cut-off: %+v %v", l, err)
+	}
+}
+
+type ctxKeyLoginPolicyTest struct{}
+
+// deadlineGate records the deadline of the context the gate is given.
+type deadlineGate struct {
+	t           testing.TB
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (g *deadlineGate) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	g.deadline, g.hasDeadline = ctx.Deadline()
+	return write(ctx, capabilities.GrantForTest(g.t, f))
+}
+
+func (g *deadlineGate) FeatureAvailable(capabilities.Feature) bool { return true }
+
+// TestLoginPolicyIfAvailable_GateWaitIsBoundedTo3s (re-review m-2): a login,
+// create or delete waits on the release feature's gate for at most 3 s (a
+// first use's acknowledgements may take 30 s), and the write itself runs on
+// the caller's context, not on that bound.
+func TestLoginPolicyIfAvailable_GateWaitIsBoundedTo3s(t *testing.T) {
+	g := &deadlineGate{t: t}
+	caller := context.WithValue(context.Background(), ctxKeyLoginPolicyTest{}, "caller")
+	start := time.Now()
+	var writeCtx context.Context
+	if err := loginPolicyIfAvailable(caller, g, nil, nil, func(ctx context.Context, _ capabilities.FeatureGrant) error {
+		writeCtx = ctx
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !g.hasDeadline {
+		t.Fatal("the gate was given no deadline")
+	}
+	// The deadline is set inside the call, so allow the call's own duration.
+	if d := g.deadline.Sub(start); d <= 0 || d > 3*time.Second+time.Since(start) {
+		t.Fatalf("the gate's deadline is %s after the call began, want at most 3s", d)
+	}
+	if writeCtx == nil || writeCtx.Value(ctxKeyLoginPolicyTest{}) != "caller" {
+		t.Fatal("the write did not run on the caller's context")
+	}
+	if _, ok := writeCtx.Deadline(); ok {
+		t.Fatal("the write runs under the gate's bound; it must keep the caller's context")
 	}
 }

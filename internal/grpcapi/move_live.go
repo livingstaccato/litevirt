@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -102,7 +103,9 @@ func (s *Server) liveMoveVolume(
 	// destination as an existing qcow2 and mirror into it, so it must be a
 	// VALID qcow2 of the source's virtual size — a raw/truncated file fails
 	// blockdev-add with "Image is not in qcow2 format".
-	if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
+	// 0711, not 0750: libvirt labels the file, never the directory, so a
+	// non-root qemu must be able to search a new one (internal/diskmode).
+	if err := diskmode.MkdirAll(filepath.Dir(destPath)); err != nil {
 		return status.Errorf(codes.Internal, "mkdir destination: %v", err)
 	}
 	virtualSize := src.SizeBytes

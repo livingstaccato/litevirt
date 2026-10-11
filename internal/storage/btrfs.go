@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -56,14 +57,38 @@ func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string,
 	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", "--", subvol).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvol, err, out)
 	}
+	// The new subvolume holds one disk: searchable, not listable, as every
+	// directory litevirt makes for disks (internal/diskmode); `btrfs subvolume
+	// create` makes it 0755. Never through a symlink.
+	// Best effort: a refused chmod never fails the create.
+	if dir, err := os.OpenFile(subvol, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0); err == nil {
+		diskmode.Restrict(dir, diskmode.Dir)
+		dir.Close()
+	} else {
+		slog.Warn("the new btrfs subvolume could not be opened to set its mode", "path", subvol, "error", err)
+	}
 	// Reuse the local qcow2 path inside the subvolume. CoW conflicts
 	// with qcow2 random writes on some workloads — operators who need
 	// raw can override Format=raw.
 	inner := &localDriver{dataDir: subvol}
-	if err := inner.Prepare(ctx); err != nil {
+	path, err := func() (string, error) {
+		if err := inner.Prepare(ctx); err != nil {
+			return "", err
+		}
+		return inner.CreateDisk(ctx, opts)
+	}()
+	if err != nil {
+		// The subvolume is this call's own and holds no disk: remove it, so a
+		// failed create leaves nothing behind (a retry would otherwise find
+		// the name taken).
+		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if out, derr := exec.CommandContext(dctx, "btrfs", "subvolume", "delete", "--", subvol).CombinedOutput(); derr != nil {
+			slog.Warn("a failed disk create left its new btrfs subvolume", "path", subvol, "error", derr, "output", strings.TrimSpace(string(out)))
+		}
 		return "", err
 	}
-	return inner.CreateDisk(ctx, opts)
+	return path, nil
 }
 
 // btrfs runs a btrfs subcommand through the driver's runner (real exec by

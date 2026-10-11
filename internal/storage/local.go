@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -20,7 +21,7 @@ type localDriver struct {
 func (d *localDriver) String() string { return "local" }
 
 func (d *localDriver) Prepare(_ context.Context) error {
-	return os.MkdirAll(d.dataDir, 0755)
+	return diskmode.MkdirAll(d.dataDir)
 }
 
 func (d *localDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {
@@ -104,7 +105,7 @@ func (d *dirDriver) DeleteDisk(ctx context.Context, path string) error {
 // O_NOFOLLOW makes sure the last component is never followed. A pool directory
 // is somewhere others can write — an NFS export's server, at least — so a file
 // the daemon creates there must never land on, or through, a name planted in
-// advance.
+// advance. The file is the owner's alone (internal/diskmode).
 func CreateExclusive(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
 }

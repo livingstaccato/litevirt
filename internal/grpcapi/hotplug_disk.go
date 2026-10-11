@@ -22,6 +22,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -224,7 +225,7 @@ func (s *Server) appendOpStepFacts(ctx context.Context, opID string, ownerEpoch 
 // final disk path). It does NOT stat or touch the final path. On any failure it
 // leaves no partial file at tempPath.
 func stageQcow2(tempPath string, sizeBytes uint64) error {
-	if err := os.MkdirAll(filepath.Dir(tempPath), 0o755); err != nil {
+	if err := diskmode.MkdirAll(filepath.Dir(tempPath)); err != nil {
 		return fmt.Errorf("create disk dir: %w", err)
 	}
 	if err := qcow2.Create(tempPath, sizeBytes, nil); err != nil {

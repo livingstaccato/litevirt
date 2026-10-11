@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -19,6 +20,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
@@ -145,13 +147,16 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
+		if err := diskmode.MkdirAll(filepath.Dir(bundle)); err != nil {
 			return err
 		}
-		f, err := os.Create(bundle)
+		// UEFI variables and TPM state — Secure Boot keys, sealed secrets:
+		// the owner's alone, as a disk is (internal/diskmode).
+		f, err := os.OpenFile(bundle, os.O_RDWR|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, diskmode.File)
 		if err != nil {
 			return err
 		}
+		diskmode.Restrict(f, diskmode.File) // best effort
 		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
 		f.Close()
 		if werr != nil {
@@ -172,7 +177,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
-		if mkErr := os.MkdirAll(filepath.Dir(vmstatePath), 0o755); mkErr != nil {
+		if mkErr := diskmode.MkdirAll(filepath.Dir(vmstatePath)); mkErr != nil {
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}
 		sizeBytes, vmstateBytes, err = s.virt.CreateLiveSnapshot(req.VmName, req.Name, vmstatePath, captureFW)

@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/storage"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -245,7 +246,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 	if totalSize <= 0 {
 		return "", fmt.Errorf("total_size must be > 0")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := diskmode.MkdirAll(dir); err != nil {
 		return "", err
 	}
 	tmp, err := storage.CreatePoolTemp(dir, ".repl-*.tmp")

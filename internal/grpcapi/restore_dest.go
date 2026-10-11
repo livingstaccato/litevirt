@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -194,7 +195,7 @@ func (d restoreDest) place(tmp string) error {
 // stagingTemp creates an empty temp file beside dst for a restore to fill. The
 // "restore-" prefix is one SweepStaleStaging collects after a crash.
 func stagingTemp(dst string) (string, error) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := diskmode.MkdirAll(filepath.Dir(dst)); err != nil {
 		return "", status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
 	f, err := os.CreateTemp(filepath.Dir(dst), "restore-*.tmp")

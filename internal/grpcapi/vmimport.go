@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -898,7 +899,7 @@ func (s *Server) admitImport(ctx context.Context, project string, fv *vmimport.F
 func (s *Server) importPoolDir(ctx context.Context, pool string) (string, error) {
 	if pool == "" {
 		dir := filepath.Join(s.dataDir, "disks")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := diskmode.MkdirAll(dir); err != nil {
 			return "", status.Errorf(codes.Internal, "prepare disks dir: %v", err)
 		}
 		return dir, nil
@@ -917,7 +918,7 @@ func (s *Server) importPoolDir(ctx context.Context, pool string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := diskmode.MkdirAll(dir); err != nil {
 		return "", status.Errorf(codes.Internal, "prepare pool dir: %v", err)
 	}
 	return dir, nil

@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/litevirt/litevirt/internal/diskmode"
 )
 
 // PushOptions controls a snapshot push.
@@ -203,7 +205,7 @@ func RestoreToFile(ctx context.Context, repo *Repo, m *Manifest, dst string, opt
 		return fmt.Errorf("open restore temp: %w", err)
 	}
 	tmp := f.Name()
-	_ = f.Chmod(0o640)
+	diskmode.Restrict(f, diskmode.File)
 	committed := false
 	defer func() {
 		if !committed {

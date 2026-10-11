@@ -31,7 +31,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,6 +40,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -155,7 +155,7 @@ func (s *Server) cloneTargetPoolFor(ctx context.Context, project, name string, s
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := diskmode.MkdirAll(dir); err != nil {
 		return nil, status.Errorf(codes.Internal, "prepare pool dir: %v", err)
 	}
 	var need int64

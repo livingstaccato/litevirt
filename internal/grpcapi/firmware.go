@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/diskmode"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
 )
@@ -114,9 +114,10 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 			return status.Errorf(codes.FailedPrecondition,
 				"UEFI vars already exist for %q (left by a prior `delete --keep-disks`); restore the VM instead of recreating it", spec.Name)
 		}
-		// 0755 so the dropped-privilege qemu user can traverse to the vars file
-		// (the file itself is dynamic-owned by libvirt); matches the disks dir.
-		if err := os.MkdirAll(filepath.Dir(cfg.NvramPath), 0o755); err != nil {
+		// Searchable (0711) so the dropped-privilege qemu user can traverse to
+		// the vars file (the file itself is dynamic-owned by libvirt), listable
+		// by nobody else; matches the disks dir (internal/diskmode).
+		if err := diskmode.MkdirAll(filepath.Dir(cfg.NvramPath)); err != nil {
 			return status.Errorf(codes.Internal, "create nvram dir: %v", err)
 		}
 	}

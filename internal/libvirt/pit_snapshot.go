@@ -91,10 +91,12 @@ func snapshotDiskExternal(v pitAPI, domain, diskPath, overlay string) (bool, err
 	}
 	base := uint32(golibvirt.DomainSnapshotCreateDiskOnly | golibvirt.DomainSnapshotCreateAtomic | golibvirt.DomainSnapshotCreateNoMetadata)
 	if _, qerr := v.DomainSnapshotCreateXML(dom, snapXML, base|uint32(golibvirt.DomainSnapshotCreateQuiesce)); qerr == nil {
+		narrowNew(overlay)
 		return true, nil
 	} else if _, err := v.DomainSnapshotCreateXML(dom, snapXML, base); err != nil {
 		return false, fmt.Errorf("external disk snapshot (quiesced: %v; crash-consistent: %w)", qerr, err)
 	}
+	narrowNew(overlay)
 	return false, nil
 }
 

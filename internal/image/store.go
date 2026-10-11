@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -28,7 +29,7 @@ func NewStore(dataDir string) *Store {
 // Init creates required directories.
 func (s *Store) Init() error {
 	for _, d := range []string{s.imageDir, s.diskDir} {
-		if err := os.MkdirAll(d, 0755); err != nil {
+		if err := diskmode.MkdirAll(d); err != nil {
 			return fmt.Errorf("create dir %s: %w", d, err)
 		}
 	}
@@ -100,7 +101,7 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 		return "", err
 	}
 	diskDir := s.DiskDir(vmName)
-	if err := os.MkdirAll(diskDir, 0755); err != nil {
+	if err := diskmode.MkdirAll(diskDir); err != nil {
 		return "", fmt.Errorf("create disk dir: %w", err)
 	}
 
@@ -138,7 +139,7 @@ func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
 		return "", err
 	}
 	diskDir := s.DiskDir(vmName)
-	if err := os.MkdirAll(diskDir, 0755); err != nil {
+	if err := diskmode.MkdirAll(diskDir); err != nil {
 		return "", fmt.Errorf("create disk dir: %w", err)
 	}
 

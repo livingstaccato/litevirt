@@ -1338,8 +1338,11 @@ sleep 1
 systemctl start libvirtd-tls.socket libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket
 echo "Enabled libvirtd TLS (port 16514)"
 
-# Create litevirt directories
-mkdir -p /var/lib/litevirt/{images,disks,cloudinit}
+# Create litevirt directories. The ones holding VM disks, images and cloud-init
+# seeds are searchable but not listable (0711) when made here; one that exists
+# keeps its mode. qemu reaches its files through them (internal/diskmode).
+mkdir -p /var/lib/litevirt
+mkdir -p -m 0711 /var/lib/litevirt/{images,disks,cloudinit}
 mkdir -p /etc/litevirt
 ` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup

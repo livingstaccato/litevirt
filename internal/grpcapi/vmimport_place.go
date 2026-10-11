@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/litevirt/litevirt/internal/diskmode"
 )
 
 // placeNoReplace gives the file at src the name dst and removes src, never
@@ -131,9 +133,9 @@ func copyIntoPlace(ctx context.Context, src, dst string, w *importDiskWrites) er
 		dropTemp()
 		return err
 	}
-	if err := out.Chmod(fi.Mode().Perm()); err != nil {
-		return fail(err)
-	}
+	// A disk: owner-only, whatever the mode of what is copied (internal/diskmode);
+	// best effort, so a filesystem that refuses chmod never fails the import.
+	diskmode.Restrict(out, diskmode.File)
 	if err := placeCopy(ctx, out, in, math.MaxInt64); err != nil {
 		return fail(err)
 	}
@@ -154,7 +156,7 @@ func copyIntoPlace(ctx context.Context, src, dst string, w *importDiskWrites) er
 	// taking the name and putting the copy there hold no slow step.
 	w.willPlace(dst, cur)
 	// Take dst's name exclusively, then put the copy there.
-	hold, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, fi.Mode().Perm())
+	hold, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, diskmode.File)
 	if err != nil {
 		w.discard(dst)
 		dropTemp()

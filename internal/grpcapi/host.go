@@ -737,6 +737,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			s.noteStateWriteFail(corrosion.OpVMHost, err)
 			progress.Status = "error"
 			progress.Error = "migrated but recording new owner failed: " + err.Error()
+			// The guest runs on the target even though its row says otherwise.
+			s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_RUNNING)
 			return progress
 		}
 		// What follows a cut-over for `lv migrate` follows it here: reverse
@@ -765,12 +767,44 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// (live migration failure leaves the source domain up).
 	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
+		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 			Error: "drain refused: " + reason,
 		}
 	}
-	return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
+	cold := s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
+	// pre_migrate ran before the live attempt, so post_migrate runs once, with
+	// where the VM ended: on the target after a cold move (stopped there if it
+	// did not start), or here when the cold move failed too.
+	switch {
+	case cold.Status == "done" && cold.Error == "":
+		s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_RUNNING)
+	case cold.Status == "done":
+		s.runDrainPostMigrate(ctx, pbVM, hspec, target.Name, pb.VMState_VM_STOPPED)
+	default:
+		s.runDrainPostMigrate(ctx, pbVM, hspec, s.hostName, s.drainVMStateHere(ctx, vm.Name))
+	}
+	return cold
+}
+
+// runDrainPostMigrate runs the post_migrate hook of a drain whose live attempt
+// ran pre_migrate but did not end in a live cut-over (finishMigrationOnTarget
+// runs it for that one), so every pre_migrate is followed by exactly one
+// post_migrate naming the VM's final host and state. Detached: the drain's
+// request going away must not skip it.
+func (s *Server) runDrainPostMigrate(ctx context.Context, pbVM *pb.VM, hspec *pb.HooksSpec, host string, state pb.VMState) {
+	pbVM.HostName, pbVM.State = host, state
+	hooks.Run(context.WithoutCancel(ctx), hooks.PostMigrate, pbVM, hspec)
+}
+
+// drainVMStateHere is the state of a VM a drain left on this host, from its
+// row (running when it cannot be read: the drain found it running).
+func (s *Server) drainVMStateHere(ctx context.Context, name string) pb.VMState {
+	if cur, err := corrosion.GetVM(context.WithoutCancel(ctx), s.db, name); err == nil && cur != nil {
+		return vmStateToPB(cur.State)
+	}
+	return pb.VMState_VM_RUNNING
 }
 
 // UndrainHost returns a host from draining/maintenance to active.

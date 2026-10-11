@@ -19,6 +19,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,6 +42,9 @@ type liveDrainScenario struct {
 	src, dst *Node
 	srcISO   string
 	dstISO   string
+	// hookLog is where the VM's pre_migrate/post_migrate hooks append
+	// "<event> <host> <state>", one line per run.
+	hookLog string
 
 	mu          sync.Mutex
 	provisioned map[string]bool // networks dst was asked to provision
@@ -71,9 +76,12 @@ func newLiveDrainScenario(t *testing.T) *liveDrainScenario {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	sc.hookLog = filepath.Join(c.tmpRoot, "hooks.log")
+	hook := `echo "$LV_EVENT $LV_VM_HOST $LV_VM_STATE" >> ` + sc.hookLog
 	spec, err := json.Marshal(&pb.VMSpec{
 		Name: "ci", Cpu: 1, MemoryMib: 256,
 		CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\nhostname: ci\n"},
+		Hooks:     &pb.HooksSpec{PreMigrate: hook, PostMigrate: hook},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +146,29 @@ func (sc *liveDrainScenario) drain(t *testing.T) (*pb.DrainProgress, error) {
 	}
 }
 
+// hooks is every pre_migrate/post_migrate run so far, in order.
+func (sc *liveDrainScenario) hooks(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(sc.hookLog)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(b)), " ", "_"))
+}
+
+// assertHooks: pre_migrate once on the source, then post_migrate once naming
+// where the VM ended.
+func (sc *liveDrainScenario) assertHooks(t *testing.T, postHost, postState string) {
+	t.Helper()
+	want := []string{"pre_migrate_" + sc.src.Name + "_running", "post_migrate_" + postHost + "_" + postState}
+	if got := sc.hooks(t); !slices.Equal(got, want) {
+		t.Errorf("migrate hooks = %q, want %q", got, want)
+	}
+}
+
 func (sc *liveDrainScenario) srcOps(op string) int {
 	n := 0
 	for _, e := range sc.src.Virt.EventLog() {
@@ -198,6 +229,34 @@ func TestFleet_DrainMovesACloudInitVMLiveToATargetWithoutItsISO(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	sc.assertHooks(t, sc.dst.Name, "running")
+}
+
+// A live attempt that fails ran pre_migrate; the cold move it falls back to
+// lands the VM on the target, and post_migrate then runs once, naming the
+// target — an operator's hook pair (take out of the LB / put back) is never
+// left half done.
+//
+// Mutation: drop the post_migrate after the cold fallback — only pre_migrate
+// ran and the test goes red.
+func TestFleet_ADrainsColdFallbackRunsPostMigrateOnTheTarget(t *testing.T) {
+	sc := newLiveDrainScenario(t)
+	sc.src.Virt.FailMigrateToTarget = func(string, string) error {
+		return errors.New("injected live migration failure")
+	}
+
+	p, err := sc.drain(t)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if p == nil || p.Status != "done" || p.Error != "" || p.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+		t.Fatalf("drain progress for ci = %+v, want a cold move, done", p)
+	}
+	vm, err := corrosion.GetVM(context.Background(), sc.src.DB, "ci")
+	if err != nil || vm == nil || vm.HostName != sc.dst.Name {
+		t.Fatalf("ci row = %+v (err %v), want it on %s", vm, err, sc.dst.Name)
+	}
+	sc.assertHooks(t, sc.dst.Name, "running")
 }
 
 // A live attempt that libvirt fails for another reason takes back the ISO it
@@ -231,6 +290,8 @@ func TestFleet_AFailedLiveDrainTakesBackTheISOItPutOnTheTarget(t *testing.T) {
 	if _, err := os.Stat(sc.srcISO); err != nil {
 		t.Errorf("the source's own ISO is gone, though ci still runs there: %v", err)
 	}
+	// The VM stayed here: post_migrate names this host.
+	sc.assertHooks(t, sc.src.Name, "running")
 }
 
 // While a drain's cold move waits for the guest to shut down, the row already

@@ -93,7 +93,8 @@ func TestLab_CloneToAnotherHost(t *testing.T) {
 // within its stop timeout. The test waits for the guest to finish booting
 // first (a guest still booting ignores it; lab2c drained one a second after
 // creation), and a drill image that never honours ACPI (cirros on lab 2) is a
-// skip naming it, not a failure.
+// skip naming it, not a failure — but only when no guest agent answered: a
+// guest seen booted that misses its stop timeout fails the test.
 func TestLab_UndrainFailbackLeavesAHostLocalVMRunning(t *testing.T) {
 	l := newLab(t)
 	b := l.requireBaseline()
@@ -102,7 +103,7 @@ func TestLab_UndrainFailbackLeavesAHostLocalVMRunning(t *testing.T) {
 	q := l.hosts[0]
 	victim := l.leastLoaded(q, l.except(q))
 	vm := l.createLabVM(q, "fb", victim, "", false)
-	l.waitGuestBooted(victim, vm, guestBootWait)
+	agent := l.waitGuestBooted(victim, vm, guestBootWait)
 
 	l.onRestore(func() {
 		if via := l.liveHost(); via != "" {
@@ -112,9 +113,12 @@ func TestLab_UndrainFailbackLeavesAHostLocalVMRunning(t *testing.T) {
 	// Bounded past the stop timeout and the drain's 5-minute late wait, so a
 	// guest that ignores the shutdown ends in the drain's own answer.
 	if out, err := l.lvTimeout(q, drainCLITimeout, "host", "drain", victim); err != nil {
-		if strings.Contains(out+err.Error(), "did not shut down within its stop timeout") {
-			t.Skipf("the drill image %q does not honour an ACPI shutdown, which a host-local VM's cold drain needs; "+
-				"run with E2E_DRILL_IMAGE set to one that does:\n%s", drillImage(), out)
+		// Only a guest whose boot could not be seen (no agent: cirros, which
+		// never honours ACPI either) is a skip. A guest whose agent answered
+		// had booted, and missing its stop timeout then is a finding.
+		if !agent && strings.Contains(out+err.Error(), "did not shut down within its stop timeout") {
+			t.Skipf("the drill image %q has no guest agent and did not honour an ACPI shutdown, which a host-local VM's cold drain needs; "+
+				"run with E2E_DRILL_IMAGE set to an image with qemu-guest-agent that does:\n%s", drillImage(), out)
 		}
 		t.Fatalf("drain (lv host drain %s): %v\n%s", victim, err, out)
 	}
@@ -260,7 +264,7 @@ const (
 	drainCLITimeout = 9 * time.Minute
 )
 
-// lvTimeout is lv bounded by timeout instead of two minutes.
+// lvTimeout is lv bounded by timeout instead of two minutes (lv delegates here).
 func (l *lab) lvTimeout(host string, timeout time.Duration, args ...string) (string, error) {
 	q := make([]string, 0, len(args)+1)
 	q = append(q, shellQuote(l.lvPath))
@@ -346,7 +350,18 @@ func TestLab_LiveFailbackOnSharedStorage(t *testing.T) {
 		t.Fatalf("the drain did not move %s live:\n%s", vm, dout)
 	}
 	if bootID != "" {
-		if after := l.guestBootID(q, vm); after != bootID {
+		// The agent channel can be briefly unavailable right after the
+		// cut-over: retry, and an unreadable boot_id is unknown, not changed.
+		after := ""
+		for deadline := time.Now().Add(30 * time.Second); after == "" && time.Now().Before(deadline); {
+			if after = l.guestBootID(q, vm); after == "" {
+				time.Sleep(3 * time.Second)
+			}
+		}
+		switch {
+		case after == "":
+			l.mark("guest: %s's boot_id unreadable after the drain; LIVE rests on the drain's own line", vm)
+		case after != bootID:
 			t.Errorf("%s's boot_id changed across the drain (%q -> %q): the guest was rebooted, not migrated live", vm, bootID, after)
 		}
 	}

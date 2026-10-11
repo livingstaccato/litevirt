@@ -306,7 +306,12 @@ to stop it and move it.
 A live drain prepares the target exactly as `lv migrate` does: the VM's
 networks and its cloud-init ISO are put there first, the VM's migration
 policy (bandwidth, auto-converge, maximum downtime) applies, and the
-`pre_migrate`/`post_migrate` hooks run. After the cut-over the source's
+`pre_migrate`/`post_migrate` hooks run: `post_migrate` runs once, naming the
+host the VM ended on — the target after the live move or after a cold move
+that a failed live attempt fell back to, or the drained host when the VM
+stayed there. Unlike `lv migrate`, a drain's live move applies no
+`timeout-sec`: it runs until libvirt finishes or fails it (bounding it is a
+tracked follow-up). After the cut-over the source's
 cloud-init ISO is removed and DNS, load-balancer backends and VXLAN
 forwarding entries follow the VM, as for a migration. A live attempt that
 fails takes back the cloud-init ISO it put on the target before the cold move

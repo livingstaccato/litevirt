@@ -862,7 +862,7 @@ type Server struct {
 	// disk (reportNotPointInTime).
 	notPITNotified sync.Map
 	// peerWALQ is each peer's last Ping answer on wal_quarantined
-	// (PeerReportsWALQuarantined), guarded by peerWALQMu.
+	// (PeerRecoveryExclusions), guarded by peerWALQMu.
 	peerWALQ   map[string]peerWALQAnswer
 	peerWALQMu sync.Mutex
 

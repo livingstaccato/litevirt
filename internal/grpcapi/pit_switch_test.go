@@ -382,3 +382,33 @@ func TestInPlaceRestore_ACrashMidPlacementLeavesTheVMHeld(t *testing.T) {
 		t.Fatalf("the hold cleared after a crash mid-placement: %+v", row)
 	}
 }
+
+// N5 of the switch re-review: a restore whose old overlay cannot be set aside
+// after the placement says the VM stays held and why, not "restore complete".
+//
+// Mutation "a failed set-aside reports success" — red.
+func TestInPlaceRestore_AFailedSetAsideSaysTheVMStaysHeld(t *testing.T) {
+	s, live := stoppedWithStaleOverlay(t)
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET state = 'stopped' WHERE name = 'web'`); err != nil {
+		t.Fatal(err)
+	}
+	_ = healWeb(t, s) // held
+	dest, err := s.inPlaceRestoreLocked(context.Background(), "web", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := pitSetAside
+	pitSetAside = func(string, string) (string, error) { return "", errors.New("EXDEV") }
+	defer func() { pitSetAside = prev }()
+	err = dest.place(stagedImage(t, live))
+	var held *placedButHeldError
+	if !errors.As(err, &held) || !strings.Contains(err.Error(), "stays held") || !strings.Contains(err.Error(), "EXDEV") {
+		t.Fatalf("place with a failing set-aside = %v; want it to say the VM stays held, and why", err)
+	}
+	if !pitoverlay.Present(live) {
+		t.Fatal("the overlay moved")
+	}
+	if row, found := heldCondition(t, s, "web", "root"); !found || row.Lifecycle == "resolved" {
+		t.Fatalf("the hold cleared: %+v", row)
+	}
+}

@@ -299,7 +299,7 @@ func TestFleet_PITOverlay_RecoveryNeverPicksAQuarantinedPeer(t *testing.T) {
 		return fence.Result{Method: "fleet-test", Success: true}
 	})
 	// As the daemon wires it: the coordinator's own node's cached Ping.
-	fc.PeerWALQuarantined = coordNode.Server.PeerReportsWALQuarantined
+	fc.PeerRecoveryExclusions = coordNode.Server.PeerRecoveryExclusions
 	fc.RunOnce(ctx)
 
 	if vm, _ := corrosion.GetVM(ctx, coordNode.DB, "pq"); vm == nil || vm.HostName == target.Name {

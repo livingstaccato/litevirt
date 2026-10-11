@@ -413,7 +413,7 @@ func (s *Server) pullAndApply(ctx context.Context, peer, expectVer string, expec
 		return fmt.Errorf("peer %s: %w", peer, err)
 	}
 
-	if err := s.pitOverlayDowngradeRefusal(ctx, stagingPath); err != nil {
+	if err := s.checkPITOverlayDowngrade(ctx, stagingPath, false); err != nil {
 		os.Remove(stagingPath)
 		return err
 	}

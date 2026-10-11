@@ -392,7 +392,10 @@ by the strongest method the host has, tried in this order:
      before (a missing chunk, a cancel), a placement that fails, or a crash
      between the placement and the set-aside leaves the overlay beside the
      disk and the VM held: the overlay was taken of the file the restore
-     replaced, so it is never committed into the restored one.
+     replaced, so it is never committed into the restored one. If the
+     set-aside itself fails after the placement, the restore says so — the
+     disk is restored, the VM stays held, re-run the restore or resolve the
+     overlay — instead of "restore complete".
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes
@@ -597,20 +600,28 @@ Once `pit_overlay` is used, a rollback below the release quarantines that
 host (WAL quarantine: it emits no replicated writes), and every rollback to a
 build older than `release_2026_11_v1` quarantines anyway. Peers then record
 it as isolated, and while `pit_overlay` is in use the failover coordinator restarts
-no VM on a host that is isolated or whose own Ping reports it WAL-quarantined
-(asked afresh at recovery time, so from the rollback's first answer, before
-the isolation is recorded). A VM whose host died mid window is restarted on
+no VM on a host that is isolated, whose own Ping reports it WAL-quarantined,
+or that does not answer (all candidates are asked at once at recovery time,
+under one two-second deadline, so from the rollback's first answer, before
+the isolation is recorded; a host that did not answer is not asked again for
+ten seconds). A host the coordinator cannot reach therefore takes no VM
+recovery while `pit_overlay` is in use. A VM whose host died mid window is restarted on
 an upgraded host, which commits the overlay first.
 
-`lv host upgrade` (and a host's pull self-upgrade) refuses to install a
-binary that does not know `pit_overlay` — a build older than
-`release_2026_11_v1`, asked with `litevirt --release-features` — while any
-overlay exists on that host (in the data directory's `disks/`, a pool
-directory, or the directory of any disk recorded on it), naming the files:
-settle each (start or replicate its VM on this build, or `lv
-resolve-pit-overlay`) or drain the host first; `--force` overrides. `lv host
-preflight-upgrade` lists them as `pit-overlay-present`. Upgrades to a build
-that knows `pit_overlay` are never refused for them. A host rolled back some
+Once `pit_overlay` has been used, `lv host upgrade` (and a host's pull
+self-upgrade) refuses to install a binary that does not know it — a build
+older than `release_2026_11_v1`, asked with `litevirt --release-features` —
+while any overlay exists on that host (in the data directory's `disks/`, a
+pool directory, or the directory of any disk recorded on it), naming the
+files: settle each (start or replicate its VM on this build, or `lv
+resolve-pit-overlay`) or drain the host first. A directory that does not
+answer within ten seconds (a hung mount) refuses it too, naming the
+directory: fix the mount and retry. `--force` overrides either, and is then
+logged and audited (`host.upgrade.force_pit_overlay`) with the overlays it
+skipped. `lv host preflight-upgrade` lists them as `pit-overlay-present` (and
+an unanswering directory as `pit-overlay-unscanned`). Before `pit_overlay` is
+used nothing is scanned, and an upgrade to a build that knows it is never
+scanned or refused for them. A host rolled back some
 other way (a package manager, a copied binary) is not stopped, so then check
 by hand: `find <dir> -name '.*.lv-pit'` over every pool directory and
 `disks/` must find none, and keep the host drained, because such a build has

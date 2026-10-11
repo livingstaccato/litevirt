@@ -75,7 +75,16 @@ func TestPITOverlaySafeTargets_AReportedQuarantineIsNoTargetBeforeItsIsolation(t
 	all, _ := corrosion.ListHosts(ctx, db)
 	c := newTestCoordinator("h1", db)
 	asked := 0
-	c.PeerWALQuarantined = func(_ context.Context, peer string) bool { asked++; return peer == "rolled-back" }
+	c.PeerRecoveryExclusions = func(_ context.Context, peers []string) map[string]string {
+		asked++
+		out := map[string]string{}
+		for _, p := range peers {
+			if p == "rolled-back" {
+				out[p] = "reports itself WAL-quarantined"
+			}
+		}
+		return out
+	}
 	var rolled corrosion.HostRecord
 	for _, h := range all {
 		if h.Name == "rolled-back" {

@@ -33,6 +33,14 @@ import (
 //     quorum (e.g. 2-node + witness; witness up = no fence; restart of
 //     witness during partition kills HA).
 func (s *Server) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeRequest) (*pb.PreflightUpgradeResponse, error) {
+	return s.preflightUpgrade(ctx, req, true)
+}
+
+// preflightUpgrade is PreflightUpgrade. pitScan says whether to look for
+// point-in-time overlays: UpgradeHost's own preflight does not, because the
+// swap checks them against the binary it is given
+// (checkPITOverlayDowngrade), so a forward upgrade never walks the pools.
+func (s *Server) preflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeRequest, pitScan bool) (*pb.PreflightUpgradeResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
@@ -144,10 +152,19 @@ func (s *Server) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeR
 
 	// 6b. Point-in-time overlays: the swap itself refuses a binary that does
 	// not know pit_overlay while any exists (pitOverlayDowngradeRefusal).
-	if files := s.pitOverlayFiles(ctx); len(files) > 0 {
-		add("warn", "pit-overlay-present",
-			fmt.Sprintf("%d point-in-time overlay(s) on this host (%s); an upgrade to a build older than %s is refused until they are settled",
-				len(files), strings.Join(files, ", "), capabilities.ReleaseToken))
+	// Only once pit_overlay is used here: before that, as main.
+	if pitScan && s.pitOverlayUsed(ctx) {
+		files, unanswered := s.pitOverlayScan(ctx)
+		if len(files) > 0 {
+			add("warn", "pit-overlay-present",
+				fmt.Sprintf("%d point-in-time overlay(s) on this host (%s); an upgrade to a build older than %s is refused until they are settled",
+					len(files), strings.Join(files, ", "), capabilities.ReleaseToken))
+		}
+		if len(unanswered) > 0 {
+			add("warn", "pit-overlay-unscanned",
+				fmt.Sprintf("%s did not answer within %s; an upgrade to a build older than %s is refused until it does (or --force)",
+					strings.Join(unanswered, ", "), pitOverlayScanTimeout, capabilities.ReleaseToken))
+		}
 	}
 
 	// 6. Witness role — losing the witness during a partition kills quorum.

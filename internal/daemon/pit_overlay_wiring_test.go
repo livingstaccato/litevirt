@@ -14,7 +14,7 @@ import (
 //
 // Mutations: drop reconciler.SetPITOverlayFeature(svc.PITOverlayFeature) —
 // every overlay found at define is held forever; drop
-// fc.PeerWALQuarantined = svc.PeerReportsWALQuarantined — a quarantined peer
+// fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions — a quarantined peer
 // is a recovery target until it is recorded isolated. Each — red.
 func TestRunWiresThePITOverlayGates(t *testing.T) {
 	f, err := parser.ParseFile(token.NewFileSet(), "daemon.go", nil, 0)
@@ -45,7 +45,7 @@ func TestRunWiresThePITOverlayGates(t *testing.T) {
 			if len(v.Lhs) == 1 && len(v.Rhs) == 1 {
 				lx, lm := sel(v.Lhs[0])
 				rx, rm := sel(v.Rhs[0])
-				if lx == "fc" && lm == "PeerWALQuarantined" && rx == "svc" && rm == "PeerReportsWALQuarantined" {
+				if lx == "fc" && lm == "PeerRecoveryExclusions" && rx == "svc" && rm == "PeerRecoveryExclusions" {
 					fcQuarantine = true
 				}
 			}
@@ -56,6 +56,6 @@ func TestRunWiresThePITOverlayGates(t *testing.T) {
 		t.Error("daemon.go does not call reconciler.SetPITOverlayFeature(svc.PITOverlayFeature): every overlay found at define would be held forever")
 	}
 	if !fcQuarantine {
-		t.Error("daemon.go does not wire fc.PeerWALQuarantined = svc.PeerReportsWALQuarantined")
+		t.Error("daemon.go does not wire fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions")
 	}
 }

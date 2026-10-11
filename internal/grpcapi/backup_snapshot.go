@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -715,7 +716,8 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		defer os.Remove(img) // gone after a successful place
 		tmpTarget = img
 	}
-	if err := dest.place(tmpTarget); err != nil {
+	var held *placedButHeldError
+	if err := dest.place(tmpTarget); err != nil && !errors.As(err, &held) {
 		return err
 	}
 	// A restore that left the disk standalone (raw guest content, a
@@ -724,6 +726,14 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	// rebuild onto it. Cleared under the VM lock the restore still holds.
 	if dest.inPlace && dest.disk != nil {
 		s.clearBackingIfFlattened(ctx, dest.disk.VMName, dest.disk.DiskName, dest.path)
+	}
+	if held != nil {
+		// The disk is restored, but the VM stays held on the old overlay:
+		// say so, never "restore complete".
+		s.recordVMEventSeverity(ctx, req.VmName, "disk.pit_overlay_set_aside", "error", "error", held.Error())
+		s.recordVMEvent(ctx, req.VmName, "backup.restored", "ok",
+			fmt.Sprintf("%s @ %s → %s (the VM stays held: its old point-in-time overlay could not be set aside)", req.DiskName, req.Timestamp, target))
+		return status.Error(codes.FailedPrecondition, held.Error())
 	}
 	s.recordVMEvent(ctx, req.VmName, "backup.restored", "ok",
 		fmt.Sprintf("%s @ %s → %s", req.DiskName, req.Timestamp, target))

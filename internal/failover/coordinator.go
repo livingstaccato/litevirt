@@ -354,12 +354,14 @@ type Coordinator struct {
 	// cluster latched it: a host whose flag went off after the latch says
 	// otherwise on its next probe. nil never relies.
 	PeerPausesOnLoss func(peer string) bool
-	// PeerWALQuarantined reports whether a peer's latest Ping answer (cached,
-	// refreshed when stale) says it is WAL-quarantined — rolled back below a
-	// latched token. Once pit_overlay is used such a host is never a VM
-	// recovery target, even before the HA monitor records it isolated
-	// (pitOverlaySafeTargets). Nil: only recorded isolation counts.
-	PeerWALQuarantined func(ctx context.Context, peer string) bool
+	// PeerRecoveryExclusions says which peers must not be a VM recovery
+	// target while pit_overlay is in use, and why: one whose own Ping says it
+	// is WAL-quarantined (rolled back below a latched token), and one that
+	// does not answer. All are asked at once under one short deadline
+	// (grpcapi.Server.PeerRecoveryExclusions). pitOverlaySafeTargets applies
+	// it, even before the HA monitor records such a host isolated. Nil: only
+	// recorded isolation counts.
+	PeerRecoveryExclusions func(ctx context.Context, peers []string) map[string]string
 	// PauseWaitFor replaces health.PartitionPauseWaitFor (fleet scenarios,
 	// which cannot wait production seconds). nil in production.
 	PauseWaitFor func(probeTargets int) time.Duration
@@ -3796,8 +3798,9 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 // restarted on once the pit_overlay release feature is in use (P2 of the
 // #256 re-review 5). A host recorded as isolated — rolled back below a latched
 // token and WAL-quarantined, or isolated by an operator — or one whose own Ping
-// says it is WAL-quarantined (PeerWALQuarantined: it reports that from boot,
-// cycles before the HA monitor records the isolation) may run a build that
+// says it is WAL-quarantined, or that does not answer
+// (PeerRecoveryExclusions: from the rollback's first answer, cycles before the
+// HA monitor records the isolation) may run a build that
 // knows nothing of point-in-time overlays: it would define the VM on the bare
 // disk and drop the writes an overlay on a shared pool still holds. Before the
 // feature is used no overlay exists, and nothing is filtered: recovery is
@@ -3810,17 +3813,28 @@ func (c *Coordinator) pitOverlaySafeTargets(ctx context.Context, candidates []co
 	if err == nil && !used {
 		return candidates
 	}
+	var excluded map[string]string
+	if c.PeerRecoveryExclusions != nil {
+		peers := make([]string, 0, len(candidates))
+		for _, h := range candidates {
+			if h.Name != c.hostName {
+				peers = append(peers, h.Name)
+			}
+		}
+		excluded = c.PeerRecoveryExclusions(ctx, peers)
+	}
 	out := make([]corrosion.HostRecord, 0, len(candidates))
 	for _, h := range candidates {
 		epoch, reason, ierr := corrosion.HostIsolation(ctx, c.db, h.Name)
 		if ierr == nil && epoch == 0 {
-			if c.PeerWALQuarantined == nil || h.Name == c.hostName || !c.PeerWALQuarantined(ctx, h.Name) {
+			why, bad := excluded[h.Name]
+			if !bad || h.Name == c.hostName {
 				out = append(out, h)
 				continue
 			}
-			reason = "reports itself WAL-quarantined"
+			reason = why
 		}
-		slog.Warn("failover: not restarting VMs on an isolated or WAL-quarantined host while point-in-time overlays are in use; it may not understand them",
+		slog.Warn("failover: not restarting VMs on this host while point-in-time overlays are in use; it is isolated, WAL-quarantined or did not answer, and may not understand them",
 			"host", h.Name, "reason", reason, "error", ierr)
 	}
 	return out

@@ -210,12 +210,29 @@ func (d restoreDest) place(tmp string) error {
 			// to the file it replaced, so the VM stays held (never
 			// committed into the restored disk) until it is set aside.
 			slog.Error("restore: the restored disk is in place, but its old point-in-time overlay could not be set aside; the VM stays held", "disk", d.path, "error", err)
-			return nil
+			return &placedButHeldError{disk: d.path, err: err}
 		}
 		done()
 	}
 	return nil
 }
+
+// placedButHeldError is an in-place placement that succeeded while the old
+// point-in-time overlay beside the disk could not be set aside: the restored
+// disk is in place, and the VM stays held on that overlay (N5 of the switch
+// re-review). The restore reports it instead of "restore complete".
+type placedButHeldError struct {
+	disk string
+	err  error
+}
+
+func (e *placedButHeldError) Error() string {
+	return fmt.Sprintf("restored in place over %s, but its old point-in-time overlay %s could not be set aside (%v): the VM stays held on it. Re-run the restore, or decide the overlay with `lv resolve-pit-overlay <vm> <disk>` (normally --discard: it was taken of the file the restore replaced)",
+		e.disk, pitoverlay.Path(e.disk), e.err)
+}
+
+// pitSetAside is pitoverlay.SetAside; a test makes it fail.
+var pitSetAside = pitoverlay.SetAside
 
 // restorePlaceStep marks a step of an in-place placement; a test makes it
 // crash there.
@@ -380,7 +397,7 @@ func (s *Server) setAsideHeldOverlayForRestore(ctx context.Context, vm *corrosio
 		return nil, err
 	}
 	path := s.hostDiskFile(disk.Path)
-	to, err := pitoverlay.SetAside(path, time.Now().UTC().Format("20060102-150405"))
+	to, err := pitSetAside(path, time.Now().UTC().Format("20060102-150405"))
 	if err != nil {
 		if to != "" {
 			// The overlay moved, its binding did not: put it back, so the

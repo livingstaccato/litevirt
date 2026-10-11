@@ -1583,8 +1583,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.LastContact = d.checker.LastContact
 	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
 	// Once pit_overlay is used, no VM recovery onto a peer whose Ping says it
-	// is WAL-quarantined (it may be a build that knows nothing of overlays).
-	fc.PeerWALQuarantined = svc.PeerReportsWALQuarantined
+	// is WAL-quarantined, or that does not answer (it may be a build that
+	// knows nothing of overlays).
+	fc.PeerRecoveryExclusions = svc.PeerRecoveryExclusions
 	// A coordinator that was itself cut off moments ago decides no new fence
 	// on the failure rows the cut left behind (a fleet-wide blip).
 	fc.QuorumRegain = d.checker.InQuorumRegainGraceFor

@@ -25813,7 +25813,7 @@ type EnsureDisksResponse struct {
 	// the destination definition's <shares> for this host's scale. An older
 	// target never sets it ("" = unknown), and the source migrates the domain
 	// unchanged, as before.
-	CgroupMode    string `protobuf:"bytes,5,opt,name=cgroup_mode,json=cgroupMode,proto3" json:"cgroup_mode,omitempty"`
+	CgroupMode    string `protobuf:"bytes,6,opt,name=cgroup_mode,json=cgroupMode,proto3" json:"cgroup_mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -37237,7 +37237,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\x122\n" +
 	"\x15installer_iso_warning\x18\x03 \x01(\tR\x13installerIsoWarning\x12p\n" +
 	"\x16installer_iso_resolved\x18\x04 \x03(\v2:.litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntryR\x14installerIsoResolved\x12\x1f\n" +
-	"\vcgroup_mode\x18\x05 \x01(\tR\n" +
+	"\vcgroup_mode\x18\x06 \x01(\tR\n" +
 	"cgroupMode\x1aG\n" +
 	"\x19InstallerIsoResolvedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +

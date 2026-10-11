@@ -911,10 +911,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// hazard (two operators creating the SAME name on both sides) is an operator error
 	// caught by the vms PK + owner-assert on heal, not something a quorum gate closes.
 
-	// pre_start hook — fires before the domain is started for the first time.
-	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
-	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
-
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
 	if again, err := s.resolveVMISO(ctx, project, spec); err != nil || again != isoPath {
@@ -933,6 +929,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		cleanupDisks()
 		return nil, err
 	}
+
+	// pre_start hook — fires before the domain is started for the first time,
+	// after the release gate, so a refused create runs no hook for a VM that is
+	// never defined.
+	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
+	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
@@ -4023,15 +4025,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.update", "operator"); err != nil {
 		return nil, err
 	}
+	// A limit-bearing update is refused up front, on whichever node it reaches,
+	// when the release token has not latched: the entry node (an owner on an
+	// older build would ignore a limit and answer success; an older owner means
+	// the token has not latched) and the owner alike, before any lock is taken
+	// or any guest stopped. The latch is driven and checked without recording or
+	// granting anything; the owner runs the full gate when it writes.
+	if err := s.precheckLimitUpdate(ctx, req); err != nil {
+		return nil, err
+	}
 	// Forward to the owning host first — it has authoritative state.
 	if vm.HostName != s.hostName {
-		// An owner on an older build would ignore a limit and answer success;
-		// an older owner means the release token has not latched. The latch is
-		// driven and checked here without recording or granting anything; the
-		// owner runs the full gate when it writes.
-		if err := s.precheckLimitUpdate(ctx, req); err != nil {
-			return nil, err
-		}
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -4108,6 +4112,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
+	limitsRecorded := false // the release gate already ran (before a stop)
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
@@ -4228,6 +4233,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				defer lease.release(ctx)
 				updLease = lease
 			}
+
+			// The release gate, now that the cheap refusals above are behind us
+			// and before the guest is touched: a first-use acknowledgement wait
+			// must never keep a stopped guest down, and a refusal never stops it.
+			if err := s.recordLimitUpdate(ctx, req); err != nil {
+				return nil, err
+			}
+			limitsRecorded = true
 
 			if repair {
 				// A VM left in error or mid-transition (a create, start or
@@ -4382,10 +4395,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			spec.Uuid = uuid.NewString()
 		}
 		spec.DisableVnc = req.DisableVnc
-		// Limits baked into the redefine: the release gate, on the owner,
-		// after every refusal above and before anything is written.
-		if err := s.recordLimitUpdate(ctx, req); err != nil {
-			return nil, err
+		// Limits baked into the redefine on a VM that was already stopped: the
+		// release gate, on the owner, after every refusal above and before
+		// anything is written. (A running VM recorded before its stop.)
+		if !limitsRecorded {
+			if err := s.recordLimitUpdate(ctx, req); err != nil {
+				return nil, err
+			}
 		}
 	}
 

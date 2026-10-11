@@ -322,3 +322,13 @@ func TestVMCheckSpec_WithHealthCheck(t *testing.T) {
 		t.Errorf("Timeout = %q, want 3s", spec.Timeout)
 	}
 }
+
+// N5: the direct-libvirt fallback migration carries the VM's stored weight.
+func TestSharesWeightOf(t *testing.T) {
+	if got := sharesWeightOf(corrosion.VMRecord{Spec: `{"name":"a","cpu_shares":977}`}); got != 977 {
+		t.Errorf("weight = %d, want 977", got)
+	}
+	if got := sharesWeightOf(corrosion.VMRecord{Spec: `not json`}) + sharesWeightOf(corrosion.VMRecord{}); got != 0 {
+		t.Errorf("unreadable/absent spec weight = %d, want 0", got)
+	}
+}

@@ -259,3 +259,27 @@ func TestCloneVM_RefusesACopiedLimitBeforeTheToken(t *testing.T) {
 		t.Fatalf("err = %v, want the gate's refusal", err)
 	}
 }
+
+// N4: an unlatched owner refuses a limit update BEFORE the VM lock, and never
+// reaches the full gate (which would Ping the fleet under the lock).
+//
+// Mutation: drop the owner-side precheck in UpdateVM — the pre-lock hook runs
+// and the full gate is called, red.
+func TestUpdateVMLimits_UnlatchedOwnerRefusesBeforeTheLock(t *testing.T) {
+	s := reconfigServer(t)
+	g := newLimitsGate(t, false)
+	s.SetReleaseFeatureGate(g)
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "web", "test-host", "stopped",
+		seedSpecJSON(t, &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 1024}))
+	hooked := false
+	s.limitsPreLockHook = func(string) { hooked = true }
+	limit := 1.0
+	_, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "web", CpuLimit: &limit})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "the cluster upgrade must finish first") {
+		t.Fatalf("err = %v, want the release refusal", err)
+	}
+	if hooked || *g.calls != 0 {
+		t.Errorf("reached the lock (%v) or the full gate (%d calls) before refusing", hooked, *g.calls)
+	}
+}

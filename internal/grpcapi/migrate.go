@@ -1364,7 +1364,13 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 		}
 		// The source rendered <shares> for ITS cgroup version. The weight is
 		// the stored one; this host defines the domain at its own scale.
-		domainXML := lv.RetargetCPUShares(req.DomainXml, s.vmSharesWeight(ctx, req.VmName), lv.CgroupMode() == "v2")
+		// A stored weight of 0 is the default: a cleared weight leaves an
+		// explicit <shares> of the default for the SOURCE's scale.
+		w := s.vmSharesWeight(ctx, req.VmName)
+		if w == 0 {
+			w = lv.DefaultCPUWeight()
+		}
+		domainXML := lv.RetargetCPUShares(req.DomainXml, w, lv.CgroupMode() == "v2")
 		if err := s.virt.DefineDomain(domainXML); err != nil {
 			// Roll back the firmware we just materialized so a retry is clean.
 			wipe()

@@ -722,3 +722,83 @@ func TestFleet_LatchedCreateWithALimitRecordsTheUse(t *testing.T) {
 	}
 	mustContain(t, "created domain", node.Virt.DefinedXML("lim"), quotaFor1Core)
 }
+
+// ── fix round 2 ─────────────────────────────────────────────────────────────
+
+// recordRefuser passes the non-recording latch step but refuses the recording
+// gate, as an acknowledgement timeout does after the latch.
+type recordRefuser struct{}
+
+func (recordRefuser) WithFeature(context.Context, capabilities.Feature, func(context.Context, capabilities.FeatureGrant) error) error {
+	return status.Error(codes.Unavailable, "a host did not acknowledge in time")
+}
+func (recordRefuser) FeatureAvailable(capabilities.Feature) bool                 { return true }
+func (recordRefuser) FeatureRefusal(context.Context, capabilities.Feature) error { return nil }
+
+// N1: the recording gate runs BEFORE the guest is stopped: a refused (or slow)
+// limit-bearing reconfigure never stops a running VM.
+//
+// Mutation: record after stopVMLocked — the guest is shut down and the test
+// goes red.
+func TestFleet_RefusedLimitUpdateWithRestartNeverStopsTheGuest(t *testing.T) {
+	node, client := newLimitsNode(t)
+	ctx := context.Background()
+	deployClean(t, ctx, client, limitlessCompose)
+	waitRunning(t, ctx, node, "db")
+	node.Server.SetReleaseFeatureGate(recordRefuser{})
+	before := len(node.Virt.EventLog())
+	limit, restart := 2.0, true
+	_, err := client.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "db", Cpu: 4, CpuLimit: &limit, AllowRestart: &restart})
+	if err == nil {
+		t.Fatal("the update was accepted although the gate refused it")
+	}
+	for _, e := range node.Virt.EventLog()[before:] {
+		switch e.Op {
+		case "shutdown", "destroy", "start", "define":
+			t.Errorf("a refused limit update touched the guest: %s %s", e.Op, e.Note)
+		}
+	}
+}
+
+// N2 (live): a VM whose weight was set and cleared stores 0, but its domain
+// carries an explicit <shares> of the default. The live migration still asks
+// the target for its cgroup version and hands libvirt the default weight.
+//
+// Mutation: vmSharesWeight returns the stored weight only — red.
+func TestFleet_LiveMigrationOfAClearedWeightCarriesTheDefault(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	defer c.Stop()
+	src, dst := c.Nodes[0], c.Nodes[1]
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "pp1", Cpu: 1, MemoryMib: 256})
+	if err := corrosion.InsertVM(context.Background(), src.DB, corrosion.VMRecord{
+		Name: "pp1", HostName: src.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := src.Virt.DefineDomain(`<domain type='kvm'><name>pp1</name><cputune><shares>1024</shares></cputune></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	src.Virt.SetState("pp1", "running")
+	st, err := c.SelfClient(src).MigrateVM(context.Background(), &pb.MigrateVMRequest{
+		VmName: "pp1", TargetHost: dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
+	})
+	if err != nil {
+		t.Fatalf("MigrateVM: %v", err)
+	}
+	for {
+		if _, err := st.Recv(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("migration: %v", err)
+		}
+	}
+	note := ""
+	for _, e := range src.Virt.EventLog() {
+		if e.Op == "migrate" {
+			note = e.Note
+		}
+	}
+	if !strings.Contains(note, "shares_weight=100") || !strings.Contains(note, "target_cgroup="+lv.CgroupMode()) {
+		t.Fatalf("libvirt migrate = %q, want the default weight 100 and the target's cgroup %s", note, lv.CgroupMode())
+	}
+}

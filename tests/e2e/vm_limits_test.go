@@ -1,10 +1,13 @@
 package e2e
 
 import (
+	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +87,29 @@ func wantSched(t *testing.T, when string, got map[string]string, want map[string
 // domainCgroupFile reads a control file from the domain's cgroup (cgroup v2),
 // or "" when the host has no such cgroup layout. The scope name escapes the
 // VM name's dashes, so the pattern wildcards them.
+// localV2 reports whether this host runs the unified cgroup hierarchy.
+func localV2() bool { return fileExists("/sys/fs/cgroup/cgroup.controllers") }
+
+// remoteV2 reports whether target runs the unified cgroup hierarchy.
+func remoteV2(t *testing.T, target string) bool {
+	t.Helper()
+	return exec.Command("timeout", "30", "ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", target,
+		"test -e /sys/fs/cgroup/cgroup.controllers").Run() == nil
+}
+
+// hostShares is the <shares> a weight renders as on a host of that cgroup
+// version: unchanged on v2, scaled by 1024/100 (floor 2) on v1.
+func hostShares(v2 bool, weight int) int {
+	if v2 {
+		return weight
+	}
+	v := int(math.Round(float64(weight) * 1024 / 100))
+	if v < 2 {
+		v = 2
+	}
+	return v
+}
+
 func domainCgroupFile(domain, file string) string {
 	pat := "/sys/fs/cgroup/machine.slice/machine-qemu*" + strings.ReplaceAll(domain, "-", "*") + "*.scope/" + file
 	m, _ := filepath.Glob(pat)
@@ -128,7 +154,9 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	// the weight is cgroup v2's cpu.weight (default 100).
 	runWithLimits(t, name, host)
 	wantSched(t, "at create", virshSched(t, name, false),
-		map[string]string{"cpu_shares": "200", "global_period": "100000", "global_quota": "100000"})
+		map[string]string{"cpu_shares": strconv.Itoa(hostShares(localV2(), 200)), "global_period": "100000", "global_quota": "100000"})
+	// cgroup v2: the weight is passed through unconverted; cgroup v1 reads
+	// cpu.shares instead, scaled by 1024/100.
 	if got := domainCgroupFile(name, "cpu.weight"); got != "" && got != "200" {
 		t.Errorf("cgroup cpu.weight = %q, want 200 (the weight is passed through unconverted)", got)
 	}
@@ -147,7 +175,7 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	if got := qemuPID(name); pid == "" || got != pid {
 		t.Errorf("qemu pid %q -> %q: a limit change restarted the guest", pid, got)
 	}
-	live := map[string]string{"cpu_shares": "400", "global_period": "100000", "global_quota": "150000"}
+	live := map[string]string{"cpu_shares": strconv.Itoa(hostShares(localV2(), 400)), "global_period": "100000", "global_quota": "150000"}
 	wantSched(t, "live", virshSched(t, name, false), live)
 	wantSched(t, "config", virshSched(t, name, true), live) // a reboot keeps it
 	if got := domainCgroupFile(name, "cpu.max"); got != "" && got != "150000 100000" {
@@ -178,10 +206,8 @@ func TestVM_NoisyNeighbourLimits_AppliedLiveAndPersisted(t *testing.T) {
 	if q := got["global_quota"]; q != "-1" && q != "0" {
 		t.Errorf("cap not removed: global_quota = %q", q)
 	}
-	if fileExists("/sys/fs/cgroup/cgroup.controllers") {
-		if got["cpu_shares"] != "100" {
-			t.Errorf("clearing cpu-shares left cpu_shares = %q, want the cgroup v2 default 100", got["cpu_shares"])
-		}
+	if want := strconv.Itoa(hostShares(localV2(), 100)); got["cpu_shares"] != want {
+		t.Errorf("clearing cpu-shares left cpu_shares = %q, want this host's default %s", got["cpu_shares"], want)
 	}
 	if in, out := virshIfaceRate(t, name, macs[0], false); in != "0" && in != "" || out != "0" && out != "" {
 		t.Errorf("NIC cap not removed: in %q out %q", in, out)
@@ -229,7 +255,8 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 		t.Fatalf("cannot read libvirt on %s: %v\n%s", target, err, out)
 	}
 	s := string(out)
-	for _, want := range []string{`cpu_shares\s*:\s*200`, `global_quota\s*:\s*100000`} {
+	// The destination definition carries the TARGET's scale for the weight.
+	for _, want := range []string{fmt.Sprintf(`cpu_shares\s*:\s*%d`, hostShares(remoteV2(t, target), 200)), `global_quota\s*:\s*100000`} {
 		if !regexp.MustCompile(want).MatchString(s) {
 			t.Errorf("destination domain lacks %q:\n%s", want, s)
 		}

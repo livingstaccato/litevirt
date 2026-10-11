@@ -2726,7 +2726,7 @@ message EnsureDisksResponse {
     // the destination definition's <shares> for this host's scale. An older
     // target never sets it ("" = unknown), and the source migrates the domain
     // unchanged, as before.
-    string cgroup_mode = 5;
+    string cgroup_mode = 6;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle

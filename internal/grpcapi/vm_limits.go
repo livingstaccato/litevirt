@@ -379,12 +379,25 @@ func limitUpdateFromDesired(name string, desired *pb.VMSpec, limitFields []strin
 	return req
 }
 
-// vmSharesWeight is the VM's stored cpu-shares weight in the user's scale
-// (0 when unset or unreadable), for a migration to render on the target's.
+// vmSharesWeight is the cpu-shares weight, in the user's scale, a migration
+// must render on the target's. A stored weight of 0 means the default, but a
+// domain whose weight was SET and then cleared carries an explicit <shares> of
+// the default for its host's scale (SetCPUTune writes it: libvirt cannot unset
+// one), which must be re-rendered for the target like any other. So 0 with a
+// <shares> in the domain is DefaultCPUWeight; 0 with none stays 0 (nothing to
+// rewrite, and no reason to ask the target anything).
 func (s *Server) vmSharesWeight(ctx context.Context, name string) int {
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil || vm == nil {
 		return 0
 	}
-	return int(vmSpecFor(vm).GetCpuShares())
+	if w := int(vmSpecFor(vm).GetCpuShares()); w > 0 {
+		return w
+	}
+	if s.virt != nil {
+		if x, derr := s.virt.DumpXML(name); derr == nil && strings.Contains(x, "<shares>") {
+			return lv.DefaultCPUWeight()
+		}
+	}
+	return 0
 }

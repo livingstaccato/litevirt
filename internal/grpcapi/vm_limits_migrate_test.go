@@ -52,3 +52,49 @@ func TestEnsureDisks_ReportsTheCgroupVersion(t *testing.T) {
 		t.Errorf("cgroup_mode = %q, want %q", resp.GetCgroupMode(), lv.CgroupMode())
 	}
 }
+
+// N2: a VM whose weight was set and then cleared stores 0 but its domain still
+// carries an explicit <shares> of the default for the SOURCE's scale. The cold
+// target re-renders it as the default weight on its own scale.
+//
+// Mutation: treat a stored 0 as "nothing to render" — red.
+func TestEnsureFirmwareState_ARemovedWeightIsRetargetedAsTheDefault(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.dataDir = t.TempDir()
+	insertTestVMWithSpec(t, adminCtx(), s.db, "os1", "src-host", "stopped", `{"name":"os1"}`)
+	xml := `<domain type='kvm'><name>os1</name><cputune><shares>55555</shares></cputune></domain>`
+	if _, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err != nil {
+		t.Fatalf("EnsureFirmwareState: %v", err)
+	}
+	want := "<shares>" + strconv.Itoa(lv.HostCPUShares(lv.DefaultCPUWeight())) + "</shares>"
+	if got := fake.DefinedXML("os1"); !strings.Contains(got, want) || strings.Contains(got, "55555") {
+		t.Errorf("defined XML = %s, want %s", got, want)
+	}
+}
+
+// The live path's weight: a stored 0 with a <shares> in the running domain is
+// the default weight; a stored 0 without one stays 0 (no ask, no rewrite).
+//
+// Mutation: return the stored weight only — red.
+func TestVMSharesWeight_AClearedWeightIsTheDefault(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "a", "test-host", "running", `{"name":"a"}`)
+	insertTestVMWithSpec(t, ctx, s.db, "b", "test-host", "running", `{"name":"b"}`)
+	insertTestVMWithSpec(t, ctx, s.db, "c", "test-host", "running", `{"name":"c","cpu_shares":977}`)
+	if err := fake.DefineDomain(`<domain type='kvm'><name>a</name><cputune><shares>1024</shares></cputune></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>b</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"a": 100, "b": 0, "c": 977} {
+		if got := s.vmSharesWeight(ctx, name); got != want {
+			t.Errorf("vmSharesWeight(%s) = %d, want %d", name, got, want)
+		}
+	}
+}

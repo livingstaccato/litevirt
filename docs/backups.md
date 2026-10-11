@@ -489,10 +489,18 @@ by the strongest method the host has, tried in this order:
      repoint or the set-aside itself fails after the placement, the restore
      says so — the disk is restored, the VM stays held, re-run the restore or
      resolve the overlay — instead of "restore complete". A stopped VM whose
-     definition still names an overlay that is no longer beside its disk (a
-     restore by an earlier build set it aside without the repoint) is pointed
-     back at the disk by its next start, move or copy, with a
-     `disk.pit_definition_repointed` event; the set-aside overlay is kept.
+     definition still names an overlay that a restore by an earlier build set
+     aside without the repoint is pointed back at the disk by its next start,
+     move or copy, with a `disk.pit_definition_repointed` event; the
+     set-aside overlay is kept. That happens only on proof of the set-aside:
+     the overlay and its binding are both gone (not merely unreadable — an
+     I/O or stale-handle error proves nothing) and a
+     `.<disk file>.lv-pit.orphan-*` lies beside the disk. An overlay moved
+     anywhere else is not taken as set aside: the definition is left naming
+     it and the start fails, naming the missing file — put the overlay back,
+     then resolve it. `lv resolve-pit-overlay --discard` and a forced
+     `--commit` likewise point the definition at the disk before the overlay
+     goes, so a failure or a crash between the two keeps the overlay.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes

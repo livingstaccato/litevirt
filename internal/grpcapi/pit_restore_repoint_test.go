@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -200,5 +201,67 @@ func TestInPlaceRestore_ACrashBetweenRepointAndSetAsideStaysHeldAndRecovers(t *t
 	}
 	if err := startWeb(t, s); err != nil {
 		t.Fatalf("start after the re-run restore: %v", err)
+	}
+}
+
+// C-1 of the pit-restore review: the start-time repoint acts only on proof
+// that the overlay was set aside — the overlay and its binding both ENOENT
+// and an orphan of it beside the disk. Anything less leaves the definition
+// as it is, and the start fails as it does on main: booting the base would
+// fork the VM away from writes the overlay may hold.
+
+// moveOverlayOut moves live's overlay and binding out of the pool (an admin's
+// safety copy): the overlay is gone from beside the disk, and nothing says
+// it was set aside.
+func moveOverlayOut(t *testing.T, live string) string {
+	t.Helper()
+	keep := t.TempDir()
+	for _, p := range []string{pitoverlay.Path(live), pitoverlay.SidecarPath(live)} {
+		if err := os.Rename(p, filepath.Join(keep, filepath.Base(p))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(keep, filepath.Base(pitoverlay.Path(live)))
+}
+
+// Mutation "repoint on any absent overlay" (no set-aside evidence asked) — red.
+func TestStart_AnOverlayMovedAwayIsNotTakenAsSetAside(t *testing.T) {
+	s, fake, live := heldOnItsOverlay(t)
+	overlay := pitoverlay.Path(live)
+	kept := moveOverlayOut(t, live)
+	if err := startWeb(t, s); err == nil {
+		t.Fatal("the VM started on its base with its overlay moved out of the pool")
+	}
+	if on, _ := fake.DomainUsesFile("web", overlay); !on {
+		t.Fatal("the definition was pointed at the base with no evidence the overlay was set aside")
+	}
+	if !holdsTheWindowsWrite(t, kept) {
+		t.Fatal("the moved overlay lost its write")
+	}
+}
+
+// Mutation "a stat error reads as absent" — red.
+func TestStart_AnUnreadableOverlayIsNotTakenAsGone(t *testing.T) {
+	s, fake, live := heldOnItsOverlay(t)
+	overlay := pitoverlay.Path(live)
+	// The set-aside evidence is there, but the overlay's own path cannot be
+	// read (EIO on an NFS dentry, say): nothing is established.
+	if err := os.Rename(stagedImage(t, live), live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pitoverlay.SetAside(live, "20261011-161109"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pitoverlay.SetLstatForTest(func(p string) (os.FileInfo, error) {
+		if p == overlay {
+			return nil, &os.PathError{Op: "lstat", Path: p, Err: syscall.EIO}
+		}
+		return os.Lstat(p)
+	}))
+	if err := startWeb(t, s); err == nil {
+		t.Fatal("the VM started on its base while its overlay's path could not be read")
+	}
+	if on, _ := fake.DomainUsesFile("web", overlay); !on {
+		t.Fatal("the definition was pointed at the base on a stat error")
 	}
 }

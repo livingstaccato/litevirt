@@ -58,6 +58,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -84,6 +85,65 @@ func SidecarPath(disk string) string { return Path(disk) + ".id" }
 func Present(disk string) bool {
 	_, err := os.Lstat(Path(disk))
 	return err == nil
+}
+
+// Presence is what this host can say about a disk's overlay: there, gone,
+// or neither established.
+type Presence int
+
+const (
+	// OverlayAbsent: the overlay and its binding both do not exist (ENOENT).
+	OverlayAbsent Presence = iota
+	// OverlayPresent: something is at the overlay's path.
+	OverlayPresent
+	// OverlayUnknown: neither can be established — a stat error other than
+	// ENOENT (EIO, ESTALE, EACCES, …), or a binding with no overlay beside it.
+	OverlayUnknown
+)
+
+// lstat is os.Lstat; a test makes it fail.
+var lstat = os.Lstat
+
+// SetLstatForTest makes PresenceOf stat with f, and returns the restore.
+func SetLstatForTest(f func(string) (os.FileInfo, error)) (restore func()) {
+	prev := lstat
+	lstat = f
+	return func() { lstat = prev }
+}
+
+// PresenceOf says whether disk's overlay is there. Unlike Present, an error
+// is never read as absence. Present keeps its meaning for its callers.
+func PresenceOf(disk string) (Presence, error) {
+	_, err := lstat(Path(disk))
+	switch {
+	case err == nil:
+		return OverlayPresent, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return OverlayUnknown, err
+	}
+	_, err = lstat(SidecarPath(disk))
+	switch {
+	case err == nil:
+		return OverlayUnknown, fmt.Errorf("%s has no overlay beside it", SidecarPath(disk))
+	case !errors.Is(err, fs.ErrNotExist):
+		return OverlayUnknown, err
+	}
+	return OverlayAbsent, nil
+}
+
+// SetAsideEvidence reports whether an overlay of disk was set aside beside
+// it: an <overlay>.orphan-<stamp> file (SetAside), not its binding alone.
+func SetAsideEvidence(disk string) bool {
+	m, err := filepath.Glob(Path(disk) + ".orphan-*")
+	if err != nil {
+		return false
+	}
+	for _, p := range m {
+		if !strings.HasSuffix(p, ".id") {
+			return true
+		}
+	}
+	return false
 }
 
 // Command builds the qemu-img process. A variable so a test can see the

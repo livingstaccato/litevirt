@@ -4720,21 +4720,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if req.MaxMemoryMib != nil {
 			spec.MaxMemoryMib = *req.MaxMemoryMib
 		}
+		// max_cpu, secure_boot and tpm were refused, when they must be, by
+		// validateRedefineRequest, before the gate and any stop.
 		if req.MaxCpu != nil {
-			// Setting a vCPU hotplug ceiling is refused until live_resize is latched
-			// cluster-wide — an old peer could drop max_cpu from a spec it rewrites.
-			if !s.liveResizeActive(ctx) {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
-			}
-			effectiveCPU := spec.Cpu
-			if req.Cpu > 0 {
-				effectiveCPU = req.Cpu
-			}
-			if *req.MaxCpu != 0 && *req.MaxCpu < effectiveCPU {
-				return nil, status.Errorf(codes.InvalidArgument,
-					"max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
-			}
 			spec.MaxCpu = *req.MaxCpu
 		}
 		// USB devices and the hot-add band, as preflightUSBHotplugUpdate
@@ -4742,20 +4730,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if err := applyUSBHotplugUpdate(req, spec); err != nil {
 			return nil, err
 		}
-		// Toggling secure_boot/tpm once firmware state exists can brick an
-		// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
-		if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
-			if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
-			}
+		if req.SecureBoot != nil {
 			spec.SecureBoot = *req.SecureBoot
 		}
-		if req.Tpm != nil && *req.Tpm != spec.Tpm {
-			if !req.Force && lv.HasTPMState(spec.Uuid) {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
-			}
+		if req.Tpm != nil {
 			spec.Tpm = *req.Tpm
 		}
 		// Backfill a stable UUID for a pre-G1 VM being redefined (it had none in
@@ -5226,12 +5204,16 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 }
 
 // validateRedefineRequest runs the spec-only refusals of a redefine-class
-// UpdateVM against spec (the stored spec, not yet modified by req).
+// UpdateVM against spec (the stored spec, not yet modified by req). It is the
+// only place they run: the redefine applies max_cpu, secure_boot and tpm
+// without checking them again.
 func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest) error {
 	if _, _, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel); cerr != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", cerr)
 	}
 	if req.MaxCpu != nil {
+		// Setting a vCPU hotplug ceiling is refused until live_resize is latched
+		// cluster-wide — an old peer could drop max_cpu from a spec it rewrites.
 		if !s.liveResizeActive(ctx) {
 			return status.Errorf(codes.FailedPrecondition,
 				"cannot set max_cpu for %q: live resize is not enabled and latched cluster-wide", req.Name)
@@ -5244,6 +5226,8 @@ func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, r
 			return status.Errorf(codes.InvalidArgument, "max_cpu (%d) must be >= cpu (%d)", *req.MaxCpu, effectiveCPU)
 		}
 	}
+	// Toggling secure_boot/tpm once firmware state exists can brick an
+	// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
 	if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
 		if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
 			return status.Errorf(codes.FailedPrecondition,

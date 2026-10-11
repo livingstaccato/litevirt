@@ -194,6 +194,14 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// duplicate name) and before anything is admitted or created: the entry
 	// check (containerHostAccessRequest) only fails fast, and a forwarded
 	// create is gated on the owner. A create without them takes no grant.
+	//
+	// The grant records the use before the tenancy check and the host
+	// admission below, so a create those refuse leaves the feature recorded
+	// as used with nothing set (n3). That errs only toward "used", which
+	// changes nothing for this release (release_2026_11_v1 blocks rollback
+	// whether or not it was used), and taking the grant after the admission
+	// would hold the host reservation through a first use's ack wait (up to
+	// 30s).
 	var hostAccessG capabilities.FeatureGrant
 	if len(req.Mounts) > 0 || len(req.Devices) > 0 {
 		g, gerr := s.passthroughGrant(ctx)
@@ -466,7 +474,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
-		return nil, status.Errorf(codes.Internal, "start: %v", err)
+		return nil, status.Errorf(hostAccessBusyCode(err, codes.Internal), "start: %v", err)
 	}
 	// Clear any prior stop intent ('operator-stop') so a later unexpected stop is
 	// judged fresh. Strict: if the row vanished mid-flight the container is now

@@ -18,7 +18,11 @@ below the token predates rollback rules, so `lv cluster upgrade-status` shows
 `BLOCKS ROLLBACK: yes` for it (see upgrades.md, *Rolling back after a release
 token latched*). The first time any of the three is set, the cluster also
 records `usb_mounts_memory` as used (`lv cluster upgrade-status` shows it);
-that record is what a rule-aware build below a later release token reads.
+that record is what a rule-aware build below a later release token reads. The
+record is written before the data it covers, so a request that fails after
+it — a create its project quota or host admission then refuses, a restore
+whose id-range move or row write then fails — can leave the feature recorded
+as used with nothing set. It never errs the other way.
 
 ## USB passthrough (VMs)
 
@@ -224,7 +228,26 @@ containers:
   kernel locks the flag. Root in a privileged or legacy-confined container
   (both admin-only) can remount the tree read-write.
 - **The config never names the tree.** LXC binds a staging path under
-  `/run/litevirt/ct` (root-only, private propagation). Litevirt's start hook,
+  `/var/lib/lxc/.litevirt+staging` (root's, mode 0711 — traverse only, so
+  an unprivileged container's mapped root reaches its own staged mounts and
+  nobody but root can list, create or rename there — private propagation, no
+  symlink followed). Permissions on the directories above a mount's source do
+  not apply to its staged copy: only the source tree's own modes do, so a
+  source readable by local users only because a parent directory is closed
+  becomes reachable through the staging path; allow only sources whose own
+  modes say who may read them. It lies beneath LXC's store because that is the one tree
+  the stock AppArmor profile of `lxc-start` lets a start hook mount on
+  (Ubuntu's `abstractions/lxc/start-container`), so no host policy change is
+  needed; earlier builds staged under `/run/litevirt/ct`, which that profile
+  denies, and a config they rendered is staged there until a start by the
+  daemon renders it again (logged at Info). Rolling a host back below this
+  build reverses it: the older hook refuses a config naming the new root, so
+  an in-container reboot fails until that build's daemon starts the
+  container and renders it again, and the older post-stop does not clear the
+  new root, so mounts staged there stay until the host reboots. A host whose
+  refresh of one container hangs (a mount source that stops answering)
+  refuses that container's start and host-access changes with a retryable
+  error naming the stuck refresh after 15 s, rather than waiting on it. Litevirt's start hook,
   which LXC runs on **every** start — a reboot from inside the container
   included — opens each source beneath its allowed prefix with
   `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`, then judges what it opened
@@ -252,7 +275,11 @@ containers:
   refresh and every change of a container's host access take that
   container's lock, so a refresh never writes an older policy over a newer
   one; a container whose lock is held (a start judging it now) is skipped and
-  refreshed at the next run, so one container never holds up the others. With no policy the hook stages nothing, and it stages only what the
+  refreshed at the next run, so one container never holds up the others.
+  Nor does one whose own refresh hangs (a hard-mounted NFS source that stops
+  answering): after 10 s the refresh moves on to the next container and logs
+  the one it left, which keeps the policy it last wrote and is skipped until
+  that lookup returns. With no policy the hook stages nothing, and it stages only what the
   record authorizes. A refusal is logged
   to the system log under the tag `litevirt-lxc-hook`. A failed start takes
   down what it staged, and the stop removes each staging entry by itself.
@@ -306,11 +333,29 @@ containers:
   another project's is dropped, host mounts, devices and privilege are not
   carried, and all of it is audited. A row from before the create
   spec records no NICs: a move keeps the archive's veth-on-bridge NICs and
-  drops every other kind. A network record or list that cannot be read fails
+  drops every other kind, audited (`ct.restore`). Litevirt never renders a
+  `phys`, `macvlan`, `ipvlan`, router-mode or `none` NIC, so one exists only
+  in a hand-edited config; re-add it by hand on the new host. The bridge NICs
+  kept this way are not admitted against network records (as on earlier
+  builds, which kept every archive NIC on a move), so a container that old
+  takes whatever bridge its archive names; recreate it to give it a row
+  that records its NICs. A network record or list that cannot be read fails
   the restore, to be retried. A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the
   strip is audited, and an admin re-applies them with `lv ct convert`.
+  Keeping them writes this feature's data, so an admin's restore takes the
+  release gate's grant: before `release_2026_11_v1` latches they are stripped
+  as above, and after it a gate that refuses (the first use not acknowledged
+  by every host yet, a host rolled back) refuses the restore — the imported
+  container is removed, nothing is recorded, and the refusal is audited —
+  rather than drop what the admin asked to keep. While that refusal lasts (a
+  host down for good, or in release probation — the refusal names it), an
+  admin restores the container now with `lv ct restore <name> --repo <dir>
+  --timestamp <ts> --without-host-access`: its mounts and devices are left
+  out, no grant is asked, and the audit (`ct.restore`) records the request
+  and what was left out; re-apply them later with `lv ct convert --mount` and `--device`.
+  A cold migration or failover relocation ignores the option.
   **Privileged mode and legacy confinement** recorded in a backup are the same
   class and are decided the same way: an operator's restore of a privileged or
   legacy container lands unprivileged, in an id range of its own (its files

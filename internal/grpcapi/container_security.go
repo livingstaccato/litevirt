@@ -410,7 +410,7 @@ func (s *Server) setContainerHostAccess(ctx context.Context, rec *corrosion.Cont
 	optMounts, optDevices := hostAccessOpts(corrosion.ContainerCreateSpec{Mounts: specMounts, Devices: specDevices})
 	if err := hs.SetContainerHostAccess(ctx, rec.Name, optMounts, optDevices); err != nil {
 		s.audit(ctx, "ct.convert", rec.Name, hostAccessAudit(mounts, devices), "error")
-		return nil, status.Errorf(codes.FailedPrecondition, "set host access of %q: %v", rec.Name, err)
+		return nil, status.Errorf(hostAccessBusyCode(err, codes.FailedPrecondition), "set host access of %q: %v", rec.Name, err)
 	}
 	spec := corrosion.DecodeCreateSpec(rec.CreateSpec)
 	spec.Mounts, spec.Devices = specMounts, specDevices

@@ -422,6 +422,9 @@ func (r *LxcRunner) prepareStart(name string) error {
 	// or a managed block that is not what was authorized, is refused before
 	// lxc-start. The mounts themselves are staged from fds by the start hook.
 	if err := r.checkHostAccessForStart(name); err != nil {
+		if errors.Is(err, ErrHostAccessBusy) {
+			return err // names the container and why already
+		}
 		return fmt.Errorf("container %q: %w (containers.bind_mount_paths / containers.device_paths on this host)", name, err)
 	}
 	// LXC refuses an unprivileged container whose range lies outside root's

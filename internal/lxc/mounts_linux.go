@@ -87,7 +87,7 @@ func hookMounts(cfg string) ([]hookMount, error) {
 		}
 		if k, v := configKey(line); k == "lxc.mount.entry" && pending != nil {
 			f := strings.Fields(v)
-			if len(f) < 2 || !strings.HasPrefix(f[0], stagingRoot+"/") {
+			if len(f) < 2 || (!strings.HasPrefix(f[0], stagingRoot+"/") && !strings.HasPrefix(f[0], legacyStagingRoot+"/")) {
 				return nil, fmt.Errorf("mount entry %q does not name a staging path", line)
 			}
 			pending.staging = f[0]
@@ -98,22 +98,68 @@ func hookMounts(cfg string) ([]hookMount, error) {
 	return out, nil
 }
 
-// ensurePrivateStagingRoot makes the staging root a root-only directory on a
-// mount of its own with private propagation, so staged mounts neither leak
-// into nor arrive from other mount namespaces.
-func ensurePrivateStagingRoot() error {
-	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
-		return err
+// hookStagingRoot is the staging root a container's config stages under:
+// the current one, or the root an earlier build rendered (legacyStagingRoot)
+// for a config no daemon-driven start has rendered again yet — an
+// in-container reboot right after an upgrade. Every entry must name exactly
+// its own staging path under that one root, in order.
+func hookStagingRoot(name string, mounts []hookMount) (string, error) {
+	root := stagingRoot
+	if len(mounts) > 0 && strings.HasPrefix(mounts[0].staging, legacyStagingRoot+"/") {
+		root = legacyStagingRoot
 	}
-	if err := os.Chmod(stagingRoot, 0o700); err != nil {
-		return err
-	}
-	if !isMountpoint(stagingRoot) {
-		if err := unix.Mount(stagingRoot, stagingRoot, "", unix.MS_BIND, ""); err != nil {
-			return fmt.Errorf("bind %s: %w", stagingRoot, err)
+	for i, m := range mounts {
+		if want := stagingPathUnder(root, name, i); m.staging != want {
+			return "", fmt.Errorf("entry %d names %s, not %s", i, m.staging, want)
 		}
 	}
-	return unix.Mount("", stagingRoot, "", unix.MS_PRIVATE|unix.MS_REC, "")
+	return root, nil
+}
+
+// ensureStagingDir makes p a directory its owner (root, for the hook) alone
+// can list, create or rename in, and refuses anything else found there — a
+// symlink is never followed, so one planted at a staging path cannot redirect
+// where host trees are staged. The mode is 0711, traverse only: LXC binds an
+// unprivileged container's entries as that container's mapped root, which
+// must reach its staged mounts through these directories. What it reaches
+// there is governed by each staged tree's own mode, as it is at the source.
+func ensureStagingDir(p string) error {
+	if err := os.Mkdir(p, stagingDirMode); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	st, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("staging path %s is not a directory (%s)", p, st.Mode().Type())
+	}
+	if sys, ok := st.Sys().(*unix.Stat_t); ok && int(sys.Uid) != os.Geteuid() {
+		return fmt.Errorf("staging path %s is owned by uid %d, not %d", p, sys.Uid, os.Geteuid())
+	}
+	return os.Chmod(p, stagingDirMode)
+}
+
+// stagingDirMode is the staging directories' mode: root's, traverse only.
+const stagingDirMode = 0o711
+
+// ensurePrivateStagingRoot makes root a root-owned, traverse-only directory
+// on a mount of its own with private propagation, so staged mounts neither leak into nor
+// arrive from other mount namespaces. The stock AppArmor profile of
+// lxc-start allows each of these mounts beneath LXC's store (stagingRoot).
+func ensurePrivateStagingRoot(root string) error {
+	if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
+		return err
+	}
+	if err := ensureStagingDir(root); err != nil {
+		return err
+	}
+	if !isMountpoint(root) {
+		if err := unix.Mount(root, root, "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind %s: %w", root, err)
+		}
+	}
+	return unix.Mount("", root, "", unix.MS_PRIVATE|unix.MS_REC, "")
 }
 
 // isMountpoint reports whether p is listed as a mount point in mountinfo.
@@ -133,11 +179,16 @@ func isMountpoint(p string) bool {
 // unmountAll detaches every mount stacked on p.
 func unmountAll(p string) {
 	for i := 0; i < 16; i++ {
-		if unix.Unmount(p, unix.MNT_DETACH) != nil {
+		// Never through a symlink at p: one planted there would detach
+		// whatever host mount it points at.
+		if unmount(p, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW) != nil {
 			return
 		}
 	}
 }
+
+// unmount is unix.Unmount (tests).
+var unmount = unix.Unmount
 
 // stageMount mounts one source onto its staging path from an fd: open
 // beneath the prefix, clone exactly that tree (no submounts), set its
@@ -186,12 +237,12 @@ func stageMount(m hookMount, policy hookPolicy) error {
 	}
 	unmountAll(m.staging)
 	if m.file {
-		f, err := os.OpenFile(m.staging, os.O_CREATE|os.O_RDONLY, 0o600)
+		f, err := os.OpenFile(m.staging, os.O_CREATE|os.O_RDONLY|unix.O_NOFOLLOW, 0o600)
 		if err != nil {
 			return err
 		}
 		f.Close()
-	} else if err := os.MkdirAll(m.staging, 0o700); err != nil {
+	} else if err := ensureStagingDir(m.staging); err != nil {
 		return err
 	}
 	if err := unix.MoveMount(tree, "", unix.AT_FDCWD, m.staging, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
@@ -216,10 +267,12 @@ func RunHook(args []string) int {
 		hookLog("no valid LXC_NAME")
 		return 1
 	}
-	dir := filepath.Join(stagingRoot, name)
 	switch hook {
 	case "post-stop":
-		clearStaging(dir)
+		// Wherever the start staged them: this build's root, or an earlier
+		// build's for a config not rendered again since.
+		clearStaging(filepath.Join(stagingRoot, name))
+		clearStaging(filepath.Join(legacyStagingRoot, name))
 		return 0
 	case "pre-start":
 	default:
@@ -269,19 +322,21 @@ func RunHook(args []string) int {
 			return 1
 		}
 	}
-	if err := ensurePrivateStagingRoot(); err != nil {
+	root, err := hookStagingRoot(name, mounts)
+	if err != nil {
+		hookLog("%s: %v", name, err)
+		return 1
+	}
+	dir := filepath.Join(root, name)
+	if err := ensurePrivateStagingRoot(root); err != nil {
 		hookLog("%v", err)
 		return 1
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensureStagingDir(dir); err != nil {
 		hookLog("%v", err)
 		return 1
 	}
-	for i, m := range mounts {
-		if want := stagingPath(name, i); m.staging != want {
-			hookLog("%s: entry %d names %s, not %s", name, i, m.staging, want)
-			return 1
-		}
+	for _, m := range mounts {
 		if err := stageMount(m, policy); err != nil {
 			// Unwind what was staged: a failed start leaves no host mount
 			// behind for post-stop (which LXC does not run) to miss.
@@ -329,6 +384,13 @@ func openedPath(fd int) (string, error) {
 // mounted there and delete its contents. An entry still mounted, or a
 // directory not empty, stays and is said.
 func clearStaging(dir string) {
+	// Never through a symlink: its target's entries are not staging entries.
+	if st, err := os.Lstat(dir); err != nil || !st.IsDir() {
+		if err == nil {
+			hookLog("%s is not a directory (%s); left in place", dir, st.Mode().Type())
+		}
+		return
+	}
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())

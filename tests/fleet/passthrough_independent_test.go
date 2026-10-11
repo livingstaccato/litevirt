@@ -229,7 +229,7 @@ func TestFleet_RestoreCarriesNoUnauthorizedHostAccess(t *testing.T) {
 		t.Fatalf("admin restore: %v", err)
 	}
 	got = adminDst.CT.Config("ct")
-	if !strings.Contains(got, "lxc.mount.entry = /run/litevirt/ct/ct/m0 data none bind,ro,nosuid,nodev,create=dir 0 0") {
+	if !strings.Contains(got, "lxc.mount.entry = /var/lib/lxc/.litevirt+staging/ct/m0 data none bind,ro,nosuid,nodev,create=dir 0 0") {
 		t.Errorf("admin-restored config lacks the authorized, staged mount:\n%s", got)
 	}
 	if strings.Contains(got, "hostroot") || strings.Contains(got, "rbind,rw") {

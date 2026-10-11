@@ -132,7 +132,7 @@ func TestAuthorizeRestoredHostAccess(t *testing.T) {
 		if tc.closed {
 			closePassthroughGate(s)
 		}
-		got, stripped, g, err := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer)
+		got, stripped, g, err := s.authorizeRestoredHostAccess(tc.ctx, cs, tc.source, tc.peer, false)
 		if err != nil {
 			t.Errorf("%s: %v", tc.name, err)
 		}

@@ -89,7 +89,10 @@ func TestRefreshHookPolicies_SkipsAContainerWhoseLockIsHeld(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	release := r.lockHostAccess("c1")
+	release, err := r.lockHostAccess("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	released := false
 	defer func() {
 		if !released {

@@ -39,6 +39,11 @@ type fakeCTRuntime struct {
 	createErr error
 	createOut *ContainerInfo
 	deleteErr error
+	// startErr, hostAccessErr and rebuildErr are what StartContainer,
+	// SetContainerHostAccess and RebuildContainerConfig return, when set.
+	startErr      error
+	hostAccessErr error
+	rebuildErr    error
 
 	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
 	// IP — what IPContainer (lxc-info -iH) would return on the LB host. ipCalls
@@ -131,6 +136,9 @@ func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerO
 func (f *fakeCTRuntime) StartContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.startCalls = append(f.startCalls, name)
 	f.setRunState(name, "running")
 	return nil

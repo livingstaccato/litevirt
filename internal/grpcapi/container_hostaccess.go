@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"reflect"
@@ -329,7 +330,7 @@ func (s *Server) renderContainerConfig(ctx context.Context, name string, cs corr
 	}
 	dropped, err := rb.RebuildContainerConfig(ctx, name, cfg)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "render %q's config from its authorized spec: %v", name, err)
+		return nil, status.Errorf(hostAccessBusyCode(err, codes.Internal), "render %q's config from its authorized spec: %v", name, err)
 	}
 	return dropped, nil
 }
@@ -405,10 +406,20 @@ func withoutHostAccess(cs corrosion.ContainerCreateSpec) (corrosion.ContainerCre
 // returned as err and the restore refuses, so the admin can retry: what an
 // admin restore keeps is never silently dropped. A peer move keeps what the
 // source row already holds, and takes none.
-func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer bool) (corrosion.ContainerCreateSpec, string, capabilities.FeatureGrant, error) {
+//
+// without is an operator restore's explicit request to leave them out (lv
+// ct restore --without-host-access): they are stripped, said so, and no
+// grant is asked. It is the disaster-recovery way out while the gate cannot
+// grant the first use (a host down for good, or in release probation). A
+// peer move ignores it: it carries what its source row records.
+func (s *Server) authorizeRestoredHostAccess(ctx context.Context, cs corrosion.ContainerCreateSpec, source *corrosion.ContainerRecord, peer, without bool) (corrosion.ContainerCreateSpec, string, capabilities.FeatureGrant, error) {
 	var none capabilities.FeatureGrant
 	if !containerSpecSetsHostAccess(cs) {
 		return cs, "", none, nil
+	}
+	if !peer && without {
+		out, stripped := withoutHostAccess(cs)
+		return out, stripped, none, nil
 	}
 	if peer {
 		if source != nil && sameHostAccess(cs, corrosion.DecodeCreateSpec(source.CreateSpec)) {
@@ -733,4 +744,14 @@ func cloneHostAccessAllowed(ctx context.Context, src corrosion.ContainerRecord) 
 		return status.Error(codes.PermissionDenied, "the source container has host mounts or devices; "+hostAccessDenied)
 	}
 	return nil
+}
+
+// hostAccessBusyCode is Unavailable (retry) for a runtime error saying the
+// container's host-access lock stayed held — a policy refresh stuck in a
+// lookup that does not return — and otherwise code.
+func hostAccessBusyCode(err error, code codes.Code) codes.Code {
+	if errors.Is(err, lxc.ErrHostAccessBusy) {
+		return codes.Unavailable
+	}
+	return code
 }

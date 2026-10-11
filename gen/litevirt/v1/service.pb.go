@@ -15398,8 +15398,17 @@ type RestoreContainerRequest struct {
 	// ignores it. Empty (an earlier build, or a row with no spec) = the
 	// target reads the row from its own replica.
 	SourceCreateSpec string `protobuf:"bytes,11,opt,name=source_create_spec,json=sourceCreateSpec,proto3" json:"source_create_spec,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// without_host_access restores the container without the host mounts and
+	// devices its backup records (lv ct restore --without-host-access),
+	// audited: the disaster-recovery way out while the release gate cannot
+	// grant usb_mounts_memory (a host down for good, or in release
+	// probation), since an admin's restore that keeps them refuses rather
+	// than drop them. An admin re-applies them later with lv ct convert
+	// --mount/--device. Honoured only on an operator restore; a peer move
+	// ignores it.
+	WithoutHostAccess bool `protobuf:"varint,12,opt,name=without_host_access,json=withoutHostAccess,proto3" json:"without_host_access,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *RestoreContainerRequest) Reset() {
@@ -15507,6 +15516,13 @@ func (x *RestoreContainerRequest) GetSourceCreateSpec() string {
 		return x.SourceCreateSpec
 	}
 	return ""
+}
+
+func (x *RestoreContainerRequest) GetWithoutHostAccess() bool {
+	if x != nil {
+		return x.WithoutHostAccess
+	}
+	return false
 }
 
 type RestoreContainerProgress struct {
@@ -40621,7 +40637,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"\x06FREEZE\x10\x01\x12\b\n" +
 	"\x04COPY\x10\x02\x12\b\n" +
-	"\x04DONE\x10\x03\"\x9f\x03\n" +
+	"\x04DONE\x10\x03\"\xcf\x03\n" +
 	"\x17RestoreContainerRequest\x12\x1b\n" +
 	"\trepo_path\x18\x01 \x01(\tR\brepoPath\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1c\n" +
@@ -40634,7 +40650,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16restored_from_owner_id\x18\t \x01(\tR\x13restoredFromOwnerId\x12(\n" +
 	"\x10restored_from_ts\x18\n" +
 	" \x01(\tR\x0erestoredFromTs\x12,\n" +
-	"\x12source_create_spec\x18\v \x01(\tR\x10sourceCreateSpec\"\xb3\x02\n" +
+	"\x12source_create_spec\x18\v \x01(\tR\x10sourceCreateSpec\x12.\n" +
+	"\x13without_host_access\x18\f \x01(\bR\x11withoutHostAccess\"\xb3\x02\n" +
 	"\x18RestoreContainerProgress\x12A\n" +
 	"\x05phase\x18\x01 \x01(\x0e2+.litevirt.v1.RestoreContainerProgress.PhaseR\x05phase\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12\x1f\n" +

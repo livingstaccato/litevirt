@@ -1187,19 +1187,29 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// that grants host access or overrides confinement).
 	//
 	// Host access an operator restore keeps is written with the feature's grant
-	// (hostAccessG), taken here on the node that writes the row.
+	// (hostAccessG), taken here on the node that writes the row. The grant
+	// records the use ahead of the work below; a restore that fails after it
+	// (the id-range move, the config render, the row write) leaves the use
+	// recorded with nothing set (n2). The record always precedes the data, so
+	// it errs only toward "used", which changes nothing for this release.
 	var hostAccessG capabilities.FeatureGrant
+	var withoutHostAccessAudit string
 	{
-		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore)
+		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore, req.GetWithoutHostAccess())
 		if herr != nil {
 			if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
 				slog.Warn("container restore: cleanup after a refused host-access grant also failed", "name", req.Name, "error", delErr)
 			}
 			s.removeRestoreMarker(req.Name)
 			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (host access: release gate refused; retry)", "error")
-			return herr
+			return restoreHostAccessRefusal(ctx, herr)
 		}
 		hostAccessG = g
+		if operatorRestore && req.GetWithoutHostAccess() && stripped != "" {
+			// Audited once the restore has landed (below), never for a
+			// restore that then fails.
+			withoutHostAccessAudit = "project=" + project + " restored --without-host-access (requested); not carried: " + stripped
+		}
 		// Privileged mode and legacy confinement are the same host-escalation
 		// class, decided the same way. Stripped, the container is moved into an
 		// id range of its own (its files shifted) before its config is rendered.
@@ -1319,6 +1329,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// host-local proof marker is no longer needed (any future retry hits the "row already
 	// exists" guard above, never the resume path). Drop it best-effort.
 	s.removeRestoreMarker(req.Name)
+	if withoutHostAccessAudit != "" {
+		s.audit(ctx, "ct.restore", req.Name, withoutHostAccessAudit, "ok")
+	}
 	s.recordContainerBases(project, req.Name, placement, spec)
 	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)
 	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
@@ -1486,3 +1499,28 @@ func (s *Server) backupCapturedAfter(repoName, name, ts, replicaAt, replicaSourc
 	r, err := time.Parse(time.RFC3339Nano, replicaAt)
 	return ok && err == nil && b.After(r)
 }
+
+// restoreHostAccessRefusal is the gate's own refusal of a restore's host
+// access, unchanged, and then — only where it helps — the way out when the
+// gate cannot grant for a while: a refusal that lasts (the gate's
+// FailedPrecondition, or a first use some host has not acknowledged, which a
+// host down for good never will), on a restore whose request accepts
+// --without-host-access. A transient error (a state read that failed) gets a
+// plain retry, and a replica restore, whose request has no such option, is
+// never told to use it.
+func restoreHostAccessRefusal(ctx context.Context, herr error) error {
+	st := status.Convert(herr)
+	lasting := st.Code() == codes.FailedPrecondition ||
+		(st.Code() == codes.Unavailable && strings.Contains(st.Message(), releaseUnackedMarker))
+	if !lasting || operatorReplicaRestore(ctx) {
+		return herr
+	}
+	return status.Error(st.Code(), st.Message()+
+		"; to restore now without the backup's host mounts and devices, retry with --without-host-access "+
+		"(an admin re-applies them later with lv ct convert --mount/--device)")
+}
+
+// releaseUnackedMarker is in the release gate's refusal of a first use some
+// host has not acknowledged (health.Checker; pinned by
+// TestWithFeature_UnackedRefusalCarriesItsMarker).
+const releaseUnackedMarker = "not yet acknowledged by"

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Host bind mounts and device nodes (Proxmox mpN / devN).
@@ -34,7 +35,8 @@ import (
 //     it, and every start renders it again and refuses a config whose block is
 //     anything else.
 //   - The config never names the user's tree. A mount entry names a staging
-//     path under /run/litevirt (root-only). The LXC pre-start hook — which LXC
+//     path under /var/lib/lxc/.litevirt+staging (root's, traverse only;
+//     stagingRoot). The LXC pre-start hook — which LXC
 //     runs on EVERY start, including a reboot from inside the container, where
 //     litevirt is not involved — opens each source beneath its allowed prefix
 //     with openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS), clones that exact
@@ -757,12 +759,36 @@ const (
 )
 
 // stagingRoot is where the hook mounts each source before LXC binds it into
-// the container: root-only, so nothing unprivileged can rename in it.
-var stagingRoot = "/run/litevirt/ct"
+// the container: root's and traverse only (0711), so nothing unprivileged
+// can list, create or rename in it.
+//
+// It lies beneath LXC's store because that is the one tree the stock
+// AppArmor profile of lxc-start lets a pre-start hook mount on ("mount ->
+// /var/lib/lxc/{**,}", abstractions/lxc/start-container on Ubuntu): a hook
+// mounting anywhere else is denied, and every container with a host mount
+// or device fails to start. It is directly beneath the store rather than in
+// the container's own directory, which belongs to an unprivileged
+// container's mapped root (secureContainerDir), and its name is not a valid
+// container name (the '+'), so no container can own it.
+var stagingRoot = defaultLxcpath + "/" + stagingDirName
+
+// stagingDirName is stagingRoot's directory in LXC's store.
+const stagingDirName = ".litevirt+staging"
+
+// legacyStagingRoot is where earlier builds staged. A config they rendered
+// still names it until a daemon-driven start renders it again, so the hook
+// stages such a config there, as before.
+const legacyStagingRoot = "/run/litevirt/ct"
 
 // stagingPath is the staging mount point of a container's i-th mount.
 func stagingPath(name string, i int) string {
-	return filepath.Join(stagingRoot, name, fmt.Sprintf("m%d", i))
+	return stagingPathUnder(stagingRoot, name, i)
+}
+
+// stagingPathUnder is the staging mount point of a container's i-th mount
+// under root.
+func stagingPathUnder(root, name string, i int) string {
+	return filepath.Join(root, name, fmt.Sprintf("m%d", i))
 }
 
 // renderHostAccessBlock is the litevirt-owned config block for a container's
@@ -885,7 +911,11 @@ func readAuthorizedHostAccess(dir string) (authorizedHostAccess, error) {
 // host now. Empty removes both. The caller has authorized them (the admin
 // role at create or convert, or a peer-verified source row).
 func (r *LxcRunner) SetHostAccess(name string, mounts []Mount, devices []Device) error {
-	defer r.lockHostAccess(name)()
+	unlock, err := r.lockHostAccess(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	dir := filepath.Join(r.lxcpath(), name)
 	cfgPath := filepath.Join(dir, "config")
 	b, err := os.ReadFile(cfgPath)
@@ -989,7 +1019,11 @@ func (r *LxcRunner) hostAccess() HostAccess {
 // cannot be read, a block that is not closed, or a path the host no longer
 // allows refuses the start.
 func (r *LxcRunner) checkHostAccessForStart(name string) error {
-	defer r.lockHostAccess(name)()
+	unlock, err := r.lockHostAccess(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	dir := filepath.Join(r.lxcpath(), name)
 	auth, err := readAuthorizedHostAccess(dir)
 	if err != nil {
@@ -1019,9 +1053,17 @@ func (r *LxcRunner) checkHostAccessForStart(name string) error {
 		// options, an extra devices.allow, a device renumbered by a reboot, a
 		// longer allowed prefix — it is rendered again from the record, and
 		// the difference said, never kept.
-		if withoutHookLines(have) != withoutHookLines(want) {
+		// A block an earlier build rendered names its staging root
+		// (legacyStagingRoot); moving it to this build's is no difference
+		// from the record.
+		moved := strings.ReplaceAll(have, legacyStagingRoot+"/", stagingRoot+"/")
+		switch {
+		case withoutHookLines(moved) != withoutHookLines(want):
 			slog.Warn("container: host-access block differed from its authorized record; rendered again from the record",
 				"container", name, "had", have, "now", want)
+		case moved != have:
+			slog.Info("container: host mounts were staged at the old path until this start; rendered again under the new staging root",
+				"container", name, "old", legacyStagingRoot, "new", stagingRoot)
 		}
 		cfg := withHostAccessBlock(string(b), want)
 		return writeFileAtomic(cfgPath, []byte(cfg), 0o644)
@@ -1280,10 +1322,10 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 	}
 	var errs []error
 	for _, e := range ents {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == stagingDirName {
 			continue
 		}
-		if err := r.refreshHookPolicy(e.Name()); err != nil {
+		if err := r.refreshHookPolicyBounded(e.Name()); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1291,6 +1333,82 @@ func (r *LxcRunner) RefreshHookPolicies() error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// refreshDeadline bounds how long the refresh loop waits for one container.
+var refreshDeadline = 10 * time.Second
+
+// refreshHookPolicyBounded is refreshHookPolicy that the loop stops waiting
+// for after refreshDeadline (P5): a resolve that hangs inside a syscall — a
+// hard-mounted NFS source that does not answer — while the refresh holds the
+// container's lock would otherwise stall the refresh of every container
+// after it. The abandoned refresh keeps running and still holds that lock,
+// so it writes nothing stale (a SetHostAccess waits for it) and every later
+// run skips the container (refreshHookPolicy's TryLock) rather than stacking
+// another goroutine behind it; the container's start hook keeps the policy
+// last written and judges again at pre-start.
+func (r *LxcRunner) refreshHookPolicyBounded(name string) error {
+	if since, stuck := r.refreshStuckSince(name); stuck {
+		return fmt.Errorf("container %q: its host-access policy refresh has not returned since %s (a mount source that does not answer?); "+
+			"its start hook keeps the policy last written, and its start and host-access changes are refused until it returns",
+			name, since.Format(time.RFC3339))
+	}
+	var mu sync.Mutex
+	finished, abandoned := false, false
+	done := make(chan error, 1)
+	go func() {
+		err := r.refreshHookPolicy(name)
+		mu.Lock()
+		finished = true
+		if abandoned {
+			r.clearRefreshStuck(name)
+		}
+		mu.Unlock()
+		done <- err
+	}()
+	t := time.NewTimer(refreshDeadline)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+	}
+	mu.Lock()
+	if finished {
+		mu.Unlock()
+		return <-done
+	}
+	abandoned = true
+	r.markRefreshStuck(name, time.Now())
+	mu.Unlock()
+	return fmt.Errorf("container %q: its host-access policy refresh has not finished in %s (a mount source that does not answer?); "+
+		"its start hook keeps the policy last written, and the other containers are refreshed", name, refreshDeadline)
+}
+
+// markRefreshStuck records that name's refresh was abandoned at since, still
+// holding its lock; clearRefreshStuck forgets it once that refresh returns.
+func (r *LxcRunner) markRefreshStuck(name string, since time.Time) {
+	r.hostAccessMu.Lock()
+	defer r.hostAccessMu.Unlock()
+	if r.refreshStuck == nil {
+		r.refreshStuck = map[string]time.Time{}
+	}
+	r.refreshStuck[name] = since
+}
+
+func (r *LxcRunner) clearRefreshStuck(name string) {
+	r.hostAccessMu.Lock()
+	defer r.hostAccessMu.Unlock()
+	delete(r.refreshStuck, name)
+}
+
+// refreshStuckSince reports whether name's refresh was abandoned and has not
+// returned, and since when.
+func (r *LxcRunner) refreshStuckSince(name string) (time.Time, bool) {
+	r.hostAccessMu.Lock()
+	defer r.hostAccessMu.Unlock()
+	since, ok := r.refreshStuck[name]
+	return since, ok
 }
 
 // refreshHookPolicy rewrites one container's policy under its lock. A
@@ -1365,21 +1483,37 @@ func (r *LxcRunner) sweepHookPolicies() error {
 	return errors.Join(errs...)
 }
 
+// ErrHostAccessBusy is what a host-access change or a start's judgment
+// returns when the container's host-access lock stays held past
+// hostAccessLockWait — most often by a policy refresh stuck in a lookup that
+// does not return. Retryable: the caller maps it to Unavailable.
+var ErrHostAccessBusy = errors.New("its host access is held by another operation")
+
+// hostAccessLockWait bounds how long lockHostAccess waits, so a refresh stuck
+// in a syscall never holds a start, a convert or a restore — or, through
+// their own per-container locks, its stop and delete — forever.
+var hostAccessLockWait = 15 * time.Second
+
 // lockHostAccess takes name's host-access lock (its record, config block and
-// hook policy change together under it) and returns its release.
-func (r *LxcRunner) lockHostAccess(name string) func() {
-	r.hostAccessMu.Lock()
-	if r.hostAccessLocks == nil {
-		r.hostAccessLocks = map[string]*sync.Mutex{}
+// hook policy change together under it) and returns its release. It waits at
+// most hostAccessLockWait, then fails with ErrHostAccessBusy, naming the
+// stuck refresh when that is what holds it.
+func (r *LxcRunner) lockHostAccess(name string) (func(), error) {
+	deadline := time.Now().Add(hostAccessLockWait)
+	for {
+		if unlock, ok := r.tryLockHostAccess(name); ok {
+			return unlock, nil
+		}
+		if !time.Now().Before(deadline) {
+			if since, stuck := r.refreshStuckSince(name); stuck {
+				return nil, fmt.Errorf("container %q: %w: a host-access policy refresh has not returned since %s "+
+					"(a mount source that does not answer?); retry once it returns", name, ErrHostAccessBusy, since.Format(time.RFC3339))
+			}
+			return nil, fmt.Errorf("container %q: %w (a start or a host-access change judging it, for over %s); retry",
+				name, ErrHostAccessBusy, hostAccessLockWait)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	l := r.hostAccessLocks[name]
-	if l == nil {
-		l = &sync.Mutex{}
-		r.hostAccessLocks[name] = l
-	}
-	r.hostAccessMu.Unlock()
-	l.Lock()
-	return l.Unlock
 }
 
 // tryLockHostAccess is lockHostAccess that does not wait: ok is false, and

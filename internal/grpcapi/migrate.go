@@ -796,6 +796,7 @@ poll:
 	// source cleanup or success signal — a failed commit is loud divergence, never
 	// silent success. `disks` is the pre-cutover snapshot captured above.
 	if err := s.finalizeMigrationOwnership(ctx, vm, req.TargetHost, withStorage, disks); err != nil {
+		armed.uncommitted(ctx)
 		s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 		s.recordVMEvent(context.WithoutCancel(ctx), vm.Name, "vm.migrated", "error",
 			"cut over to "+req.TargetHost+" but ownership commit failed: "+err.Error())
@@ -916,6 +917,7 @@ func (s *Server) adoptAbandonedMigration(
 		// agree with reality, and it cannot be skipped just because nobody is
 		// listening any more.
 		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
+			finish.armed.uncommitted(ctx)
 			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
 				"the guest is on the target and the cluster does not know",
 				"vm", vm.Name, "target", targetHost, "error", ferr)

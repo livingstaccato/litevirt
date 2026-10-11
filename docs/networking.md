@@ -85,7 +85,10 @@ network. A name longer than 15 characters (a stack network is `<stack>_<name>`)
 uses a stable hashed `lvf-<11 hex>` bridge instead; shorter names keep their own
 name. A `bridge` network whose bridge name (its `--iface`, or its own name)
 is over 15 characters is refused at create. The cleanup of leftover flat stack bridges logs a removal that keeps
-failing once per bridge, not on every pass.
+failing once per bridge, not on every pass. The trunk VLANs a NIC on the
+`trunk:` feature may carry on a flat bridge are set with `lv network set
+<bridge> --allowed-vlans` (`network.update` at the cluster root); see
+docs/firewall.md, "VLAN tags".
 
 An isolated network does not span hosts. Every host gets its own copy: its own
 `br-iso-<name>`, the subnet's first address as gateway, and its own `dnsmasq`

@@ -1649,6 +1649,12 @@ message ArmNICFirewallRequest {
     // holds the guest for them, and lets it run once they are in force even
     // if the source's resume never arrives. An older target ignores it.
     bool   paused_handover = 3;
+    // handover_uncommitted: the guest the target holds for a paused hand-over
+    // arrived, but the source could not commit the move's ownership (the VM's
+    // row still names the source). The target keeps it paused and says so in
+    // firewall.nic.held. Nothing is armed or resumed. An older target ignores
+    // it.
+    bool   handover_uncommitted = 4;
 }
 
 // ResumeHeldVMRequest asks the VM's host to let a guest it holds paused for

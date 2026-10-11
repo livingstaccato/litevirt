@@ -15433,8 +15433,14 @@ type ArmNICFirewallRequest struct {
 	// holds the guest for them, and lets it run once they are in force even
 	// if the source's resume never arrives. An older target ignores it.
 	PausedHandover bool `protobuf:"varint,3,opt,name=paused_handover,json=pausedHandover,proto3" json:"paused_handover,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// handover_uncommitted: the guest the target holds for a paused hand-over
+	// arrived, but the source could not commit the move's ownership (the VM's
+	// row still names the source). The target keeps it paused and says so in
+	// firewall.nic.held. Nothing is armed or resumed. An older target ignores
+	// it.
+	HandoverUncommitted bool `protobuf:"varint,4,opt,name=handover_uncommitted,json=handoverUncommitted,proto3" json:"handover_uncommitted,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ArmNICFirewallRequest) Reset() {
@@ -15484,6 +15490,13 @@ func (x *ArmNICFirewallRequest) GetResume() bool {
 func (x *ArmNICFirewallRequest) GetPausedHandover() bool {
 	if x != nil {
 		return x.PausedHandover
+	}
+	return false
+}
+
+func (x *ArmNICFirewallRequest) GetHandoverUncommitted() bool {
+	if x != nil {
+		return x.HandoverUncommitted
 	}
 	return false
 }
@@ -36966,11 +36979,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03mac\x18\a \x01(\tR\x03mac\"?\n" +
 	"\x1eResetFirewallWouldDropsRequest\x12\x1d\n" +
 	"\n" +
-	"local_only\x18\x01 \x01(\bR\tlocalOnly\"q\n" +
+	"local_only\x18\x01 \x01(\bR\tlocalOnly\"\xa4\x01\n" +
 	"\x15ArmNICFirewallRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x16\n" +
 	"\x06resume\x18\x02 \x01(\bR\x06resume\x12'\n" +
-	"\x0fpaused_handover\x18\x03 \x01(\bR\x0epausedHandover\".\n" +
+	"\x0fpaused_handover\x18\x03 \x01(\bR\x0epausedHandover\x121\n" +
+	"\x14handover_uncommitted\x18\x04 \x01(\bR\x13handoverUncommitted\".\n" +
 	"\x13ResumeHeldVMRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\xa3\x02\n" +
 	"\x1cSetNetworkGuardConfigRequest\x12\x12\n" +

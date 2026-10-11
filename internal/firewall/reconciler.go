@@ -54,6 +54,7 @@ type Reconciler struct {
 
 	state     AppliedState
 	stateHook func(context.Context, AppliedState)
+	passHook  func(context.Context, bool)
 
 	arming *Arming // SetArming; nil = nothing armed
 
@@ -141,7 +142,8 @@ func (r *Reconciler) LastTick() time.Time {
 
 // Reconcile runs one poll-load-apply cycle, exposed publicly so
 // `lv firewall reload` can drive it on demand.
-func (r *Reconciler) Reconcile(ctx context.Context) error {
+func (r *Reconciler) Reconcile(ctx context.Context) (err error) {
+	defer func() { r.notifyPass(ctx, err == nil) }()
 	plan, err := r.loader(ctx)
 	if err != nil {
 		r.recordErr(fmt.Errorf("load plan: %w", err))
@@ -196,6 +198,25 @@ func (r *Reconciler) SetStateHook(fn func(context.Context, AppliedState)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stateHook = fn
+}
+
+// SetPassHook registers fn to hear, after every pass, whether that pass put
+// the per-NIC table in force: false for a pass whose plan did not load, whose
+// apply failed or ran out of time, or whose per-NIC table the kernel refused.
+// The daemon derives its host's NIC-guard label from it (re-review m5).
+func (r *Reconciler) SetPassHook(fn func(ctx context.Context, enforcing bool)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.passHook = fn
+}
+
+func (r *Reconciler) notifyPass(ctx context.Context, enforcing bool) {
+	r.mu.Lock()
+	fn := r.passHook
+	r.mu.Unlock()
+	if fn != nil {
+		fn(ctx, enforcing)
+	}
 }
 
 // AppliedState returns the state the last pass put in force.
@@ -561,6 +582,10 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
+		flatVLANs, err := corrosion.FlatBridgeVLANs(ctx, db)
+		if err != nil {
+			return plan, err
+		}
 		// applyRecord sets what a NIC's guard record decides beyond the guard
 		// itself: a trunk allowance and a DHCP-server allowance hold whatever
 		// the record's mode.
@@ -632,9 +657,11 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				info, known := nets[ifc.NetworkName]
 				allowed := info.AllowedVLANs
 				if !known {
-					// A flat bridge (no network row) has no list an operator
-					// can set: it carries what was recorded for it.
-					allowed = recordedVLANs[ifc.NetworkName]
+					// A flat bridge (no network row) carries what was
+					// recorded for it at upgrade and what an operator allows
+					// on it (`lv network set <bridge> --allowed-vlans`,
+					// re-review R4-I1).
+					allowed = append(append([]int(nil), recordedVLANs[ifc.NetworkName]...), flatVLANs[ifc.NetworkName]...)
 				}
 				var blocked []int
 				nb.TrunkVIDs, blocked = allowedTrunkVIDs(ifc.TrunkVIDs, allowed)

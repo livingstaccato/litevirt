@@ -380,7 +380,8 @@ A NIC with `trunk:` (two or more VLANs) carries those of its VLANs its
 network's `allowed-vlans:` lists, single tagged, and its per-NIC rules still
 judge the packet inside the tag; it is guarded like any other new NIC. A trunk
 that existed when the cluster upgraded keeps its VLANs (they are recorded into
-the network's list during the roll). A re-create — a rolling update, a
+the network's list during the roll, and a re-deploy of the network keeps them
+there unless an operator took them off with `lv network set`). A re-create — a rolling update, a
 rebuild — that adds a VLAN to a trunk that predates guards makes it a new NIC:
 guarded, its new VLAN the network's to allow. A trunk change alone is not a
 topology change and does not re-create the VM. `allow-vlan-tags: true` is for a

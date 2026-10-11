@@ -212,6 +212,14 @@ func (s *Server) retargetLocalVMNICs(ctx context.Context, vm corrosion.VMRecord)
 				nic = n
 			}
 		}
+		// The trunk keeps the VLANs recorded for it under the flat name, on
+		// its new network's list, before any row says it is there
+		// (re-review R4-I2).
+		if rt.Ordinal < len(spec.Network) {
+			if err := s.carryRetargetVLANs(ctx, vm.Name, spec.GetUuid(), nic.MAC, spec.Network[rt.Ordinal].GetTrunk(), rt); err != nil {
+				return err
+			}
+		}
 		bridge, err := s.provisionForVM(ctx, rt.To)
 		if err != nil {
 			return fmt.Errorf("provision network %q for %q: %w", rt.To, vm.Name, err)

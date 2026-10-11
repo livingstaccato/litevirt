@@ -816,10 +816,15 @@ docs/firewall.md, "Held paused"). A trunk NIC's VLANs in use at the upgrade
 are recorded into its network's `allowed-vlans`, every 30 seconds until every
 host runs this release (so a trunk an older host creates during the roll keeps
 its VLANs too), each VLAN once; a new trunk's VLANs, and VLANs a re-create
-adds to a trunk, need `lv network set <net> --allowed-vlans`. Until every
+adds to a trunk, need `lv network set <net> --allowed-vlans` — on a flat
+bridge (a network name with no network row) too, with `network.update` at the
+cluster root. The VLANs recorded for a flat bridge go with its trunks: into a
+network row later created under its name, and onto `<name>` when a re-deploy
+moves a legacy stack's NIC off the flat `<stack>_<name>`. Until every
 host runs this release, a guarded VM is placed and moved only onto hosts that
 enforce NIC guards: hosts whose daemon set the `litevirt.nic-guards` label to
-the version they still report.
+the version they still report, which it does after every firewall pass that
+put the per-NIC table in force and clears after one that did not.
 Guards and the mode are recorded in `cluster_policies`, so a NIC created before
 `failover_scope_v1` has latched is created unguarded, and the mode stays
 observe until then.

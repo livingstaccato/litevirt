@@ -425,6 +425,7 @@ lv network create <name> --type bridge [flags]    # Create a network
   --gateway <ip> --reserved-address <ip>          # the network's router when it is not litevirt's, other infrastructure (repeatable); no guest NIC may claim them
 lv network set <name> [--gateway <ip>] [--reserved-address <ip>]... [--allowed-vlans 100,101]
                                                   # change what a network keeps from its NICs (network.update; each flag replaces its setting)
+                                                  # on a flat bridge (no network row): --allowed-vlans only, network.update at the cluster root
 lv network rm <name> [--force]
 ```
 

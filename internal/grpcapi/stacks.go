@@ -549,13 +549,23 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 			if ntype == "" {
 				ntype = "bridge"
 			}
+			scoped := compose.ScopedNetworkName(f.Name, name)
+			// As provisionAndPersistNetwork: the trunk VLANs litevirt keeps
+			// on the row survive the verbatim write (re-review R4-I2).
+			carried, kerr := s.keepTrunkVLANs(ctx, scoped, &netDef)
+			if kerr != nil {
+				netErrs = append(netErrs, fmt.Sprintf("network %q: read its kept trunk VLANs: %v", name, kerr))
+				continue
+			}
 			cfgJSON, _ := json.Marshal(netDef)
-			_ = corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
-				Name:      compose.ScopedNetworkName(f.Name, name),
+			if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
+				Name:      scoped,
 				StackName: f.Name,
 				Type:      ntype,
 				Config:    string(cfgJSON),
-			})
+			}); err == nil {
+				s.auditCarriedVLANs(ctx, scoped, carried)
+			}
 		}
 		if len(netErrs) > 0 {
 			detail := ""

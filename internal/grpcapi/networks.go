@@ -402,6 +402,13 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	if err := network.ValidateBridgeNetworkName(ntype, name, def.Interface); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	// The trunk VLANs litevirt keeps on the row survive its definition being
+	// written verbatim; a new row takes over its flat bridge's (re-review
+	// R4-I2).
+	carried, err := s.keepTrunkVLANs(ctx, name, &def)
+	if err != nil {
+		return nil, &networkNotPersistedError{err: err}
+	}
 	cfgJSON, _ := json.Marshal(def)
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
 		Name:      name,
@@ -412,6 +419,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	}); err != nil {
 		return nil, &networkNotPersistedError{err: err}
 	}
+	s.auditCarriedVLANs(ctx, name, carried)
 
 	localIP := getLocalIP()
 	if _, err := s.networkProvisioner().Provision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
@@ -531,13 +539,28 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	if ntype == "" {
 		ntype = "bridge"
 	}
+	// The sender wrote def verbatim; keep the trunk VLANs litevirt keeps on
+	// the row here too, or this write, landing last, would drop them
+	// (re-review R4-I2).
+	cfg := req.Config
+	before := fmt.Sprint(def.AllowedVLANs, def.KeptVLANs)
+	carried, kerr := s.keepTrunkVLANs(ctx, req.Name, &def)
+	if kerr == nil && fmt.Sprint(def.AllowedVLANs, def.KeptVLANs) != before {
+		if b, err := json.Marshal(def); err == nil {
+			cfg = string(b)
+		}
+	} else if kerr != nil {
+		slog.Warn("ProvisionNetwork: read the trunk VLANs kept on the network", "network", req.Name, "error", kerr)
+	}
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
 		Name:      req.Name,
 		StackName: req.StackName,
 		Type:      ntype,
-		Config:    req.Config,
+		Config:    cfg,
 	}); err != nil {
 		slog.Warn("ProvisionNetwork: persist failed", "network", req.Name, "error", err)
+	} else {
+		s.auditCarriedVLANs(ctx, req.Name, carried)
 	}
 
 	localIP := getLocalIP()

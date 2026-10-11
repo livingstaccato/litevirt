@@ -1,20 +1,16 @@
 package grpcapi
 
-import (
-	"testing"
+import "testing"
 
-	"github.com/litevirt/litevirt/internal/firewall"
-)
-
-// TestNICGuardLabelValue (re-review m2): the label a daemon sets at start is
-// derived from its build — its version, which a rolled-back host no longer
-// reports — and is cleared on a host whose kernel refuses the per-NIC table,
-// where no guard can be enforced.
+// TestNICGuardLabelValue (re-review m2, m5): the label a daemon sets after
+// each firewall pass is derived from its build — its version, which a
+// rolled-back host no longer reports — and is cleared while the per-NIC table
+// is not proven in force (refused, failed or timed out).
 func TestNICGuardLabelValue(t *testing.T) {
-	if got := NICGuardLabelValue("v2", firewall.AppliedState{}); got != "v2" {
-		t.Errorf("label for a build that enforces guards = %q, want its version", got)
+	if got := NICGuardLabelValue("v2", true); got != "v2" {
+		t.Errorf("label for a host enforcing guards = %q, want its version", got)
 	}
-	if got := NICGuardLabelValue("v2", firewall.AppliedState{NICTableError: "Operation not supported"}); got != "" {
-		t.Errorf("label for a host whose kernel refuses the per-NIC table = %q, want cleared", got)
+	if got := NICGuardLabelValue("v2", false); got != "" {
+		t.Errorf("label for a host whose last pass did not put the per-NIC table in force = %q, want cleared", got)
 	}
 }

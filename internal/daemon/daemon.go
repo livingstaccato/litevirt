@@ -188,12 +188,7 @@ func New(cfg *Config) (*Daemon, error) {
 	// start waits for SetStartGuard (Run), and refuses if it never comes. A
 	// VM with no NIC guard does not wait (m3): it starts as it did before
 	// guards. One whose guards cannot be read waits.
-	virt.RequireStartGuard(5*time.Minute, func(name string) bool {
-		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
-		return err != nil || len(macs) > 0
-	})
+	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db))
 
 	// Image store
 	store := image.NewStore(cfg.DataDir)
@@ -1203,6 +1198,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started (re-review I-10).
 	d.virt.SetStartGuard(svc.NICStartGuard(ctx))
 	d.fwReconciler.SetStateHook(svc.RecordFirewallState)
+	// Whether this host enforces NIC guards, after every pass, the boot pass
+	// included (re-review m8, m2, m5): the label carries this build's
+	// version while the last pass put the per-NIC table in force, so a host
+	// rolled back to an older build — which reports its own version and
+	// knows nothing of the label — stops counting, and so does one whose
+	// kernel refuses the table or whose pass failed or ran out of time. Until
+	// every host enforces them, a guarded VM is placed only on such a host.
+	d.fwReconciler.SetPassHook(nicGuardLabelHook(d.db, d.cfg.HostName, d.cfg.Version))
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables
 	// masquerade + `inet litevirt` chains) a prior binary left for it.
@@ -1220,16 +1223,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("firewall: the first pass failed; starts arm their own", "error", err)
 	}
 	d.fwReconciler.Start(ctx)
-	// Whether this host enforces NIC guards, derived from this build and
-	// this host at every start (re-review m8, m2): the label carries this
-	// build's version, so a host rolled back to an older build — which
-	// reports its own version and knows nothing of the label — stops counting;
-	// and it is cleared where the kernel refuses the per-NIC table. Until
-	// every host enforces them, a guarded VM is placed only on such a host.
-	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelNICGuards,
-		grpcapi.NICGuardLabelValue(d.cfg.Version, d.fwReconciler.AppliedState())); err != nil {
-		slog.Warn("could not advertise NIC guards in the host labels", "error", err)
-	}
 	go svc.RecordExistingTrunkVLANsLoop(ctx, 0)
 	// A guest handed over paused for its NIC guards runs once they are in
 	// force here, even when the source's resume never arrives (re-review
@@ -3143,6 +3136,34 @@ func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
 	})
+}
+
+// startWaitNeeded is the predicate RequireStartGuard waits on (re-review
+// m3): a start waits for the start guard only when its VM has a NIC guard
+// on, or whether it has one cannot be read. A VM with none starts as it did
+// before guards.
+func startWaitNeeded(db *corrosion.Client) func(name string) bool {
+	return func(name string) bool {
+		gctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		macs, err := corrosion.GuardedMACsOf(gctx, db, name)
+		return err != nil || len(macs) > 0
+	}
+}
+
+// nicGuardLabelHook sets host's NIC-guard label after every firewall pass
+// (firewall.Reconciler.SetPassHook): version while the pass put the per-NIC
+// table in force, "" otherwise (re-review m5). The write has its own
+// deadline, so a pass that ran out of time still clears the label.
+func nicGuardLabelHook(db *corrosion.Client, host, version string) func(context.Context, bool) {
+	return func(ctx context.Context, enforcing bool) {
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := corrosion.SetHostLabel(lctx, db, host, corrosion.LabelNICGuards,
+			grpcapi.NICGuardLabelValue(version, enforcing)); err != nil {
+			slog.Warn("could not set the NIC-guard host label", "enforcing", enforcing, "error", err)
+		}
+	}
 }
 
 // bootFirewallPassBudget bounds the daemon's first firewall pass (re-review m3).

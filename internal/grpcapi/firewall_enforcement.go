@@ -228,17 +228,30 @@ func (s *Server) blockedTrunksText(ctx context.Context, blocked []firewall.Block
 		nets = append(nets, n)
 	}
 	sort.Strings(nets)
+	flat, _ := corrosion.FlatBridgeVLANs(ctx, s.db)
 	var cmds []string
 	for _, n := range nets {
 		vids := byNet[n]
-		if def, err := lookupNetworkDef(ctx, s.db, n); err == nil && def != nil {
+		def, err := lookupNetworkDef(ctx, s.db, n)
+		switch {
+		case err != nil:
+			cmds = append(cmds, fmt.Sprintf("lv network set %s --allowed-vlans %s", n, vidList(sortedVIDs(vids))))
+		case def != nil:
 			vids = append(vids, def.AllowedVLANs...)
+			cmds = append(cmds, fmt.Sprintf("lv network set %s --allowed-vlans %s (needs network.update on %s)",
+				n, vidList(sortedVIDs(vids)), n))
+		default:
+			// A flat bridge (no network row): its own list, which the
+			// command replaces, beside the VLANs recorded for it at upgrade
+			// (re-review R4-I1).
+			vids = append(vids, flat[n]...)
+			cmds = append(cmds, fmt.Sprintf("lv network set %s --allowed-vlans %s (%s is a flat bridge, with no network row: "+
+				"needs network.update at the cluster root)", n, vidList(sortedVIDs(vids)), n))
 		}
-		cmds = append(cmds, fmt.Sprintf("lv network set %s --allowed-vlans %s", n, vidList(sortedVIDs(vids))))
 	}
 	sort.Strings(who)
 	return "trunk VLANs their network does not allow are dropped: " + strings.Join(who, "; ") +
-		". To allow them (needs network.update): " + strings.Join(cmds, "; ")
+		". To allow them: " + strings.Join(cmds, "; ")
 }
 
 func vidList(v []int) string {

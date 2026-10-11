@@ -123,6 +123,13 @@ type NetworkDef struct {
 	// its trunk VLANs listed here (docs/firewall.md, "VLAN tags"). Setting it
 	// needs network.update on the network.
 	AllowedVLANs []int `yaml:"allowed-vlans"`
+	// KeptVLANs are the VLANs litevirt itself put on AllowedVLANs, never set
+	// from a compose file: the trunk VLANs in use when the cluster upgraded,
+	// and those a network row took over from the flat bridge of its name
+	// (re-review R4-I2). A VLAN here and not on AllowedVLANs is one an
+	// operator removed, and stays removed; a re-deploy of the network, which
+	// writes its definition verbatim, keeps the others (re-review m6).
+	KeptVLANs []int `yaml:"-"`
 
 	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
 	// which is every network today.

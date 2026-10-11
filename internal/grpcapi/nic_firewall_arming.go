@@ -23,6 +23,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/nictap"
 	"github.com/litevirt/litevirt/internal/placement"
@@ -190,6 +191,9 @@ func (s *Server) NICStartGuard(ctx context.Context) lv.StartGuard {
 	}
 	return lv.StartGuard{
 		Before: func(name string) (bool, error) {
+			// A start here is not a hand-over: a record an earlier move left
+			// must not resume this run's guest (re-review m3).
+			s.endHeld(name, "it is started here")
 			if s.needsPausedStart(ctx, name, false) {
 				return true, nil
 			}
@@ -228,6 +232,14 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 	if req.GetVmName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name is required")
 	}
+	if req.GetHandoverUncommitted() {
+		// The guest arrived, its ownership is not recorded: it stays
+		// paused here, reported (re-review m4).
+		if err := s.markHeldUncommitted(req.GetVmName()); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "record that %s's move did not commit: %v", req.GetVmName(), err)
+		}
+		return &emptypb.Empty{}, nil
+	}
 	if req.GetResume() {
 		// The guest arrived paused: its guards in force under the taps it got
 		// here, then it runs (resumeHeld). A guest this host does not hold —
@@ -242,6 +254,12 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 		}
 		if st, serr := s.virt.DomainStateReason(req.GetVmName()); serr == nil && st.State == "running" {
 			return &emptypb.Empty{}, nil // let run already (this host's resumer, or a retry)
+		}
+		if _, paused, _ := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, req.GetVmName()); paused {
+			// Partition pause holds it: that is its pauser's to resume
+			// (re-review m2), never a late hand-over retry's.
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s is paused for a partition (partition pause); it resumes when the partition does", req.GetVmName())
 		}
 		if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
@@ -262,6 +280,10 @@ func (s *Server) ArmNICFirewall(ctx context.Context, req *pb.ArmNICFirewallReque
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"cannot record that %s will be held here for its NIC guards: %v", req.GetVmName(), err)
 		}
+	} else {
+		// Another move, not handed over paused: an earlier move's record has
+		// nothing left to resume (re-review m3).
+		s.endHeld(req.GetVmName(), "a later move arms it here")
 	}
 	if err := s.ArmNICsFor(ctx, req.GetVmName()); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
@@ -352,6 +374,27 @@ func (am *armedMigration) finish(ctx context.Context) error {
 	}
 }
 
+// uncommitted tells the target, best effort, that the guest it holds for a
+// paused hand-over arrived but its ownership commit failed, so the target
+// keeps it paused and reports it (re-review m4).
+func (am *armedMigration) uncommitted(ctx context.Context) {
+	if am == nil || !am.paused {
+		return
+	}
+	s := am.s
+	conn, err := s.dialPeerAddr(peerTarget(am.target.Address, am.target.GRPCPort))
+	if err == nil {
+		defer conn.Close()
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), armCallTimeout)
+		defer cancel()
+		_, err = pb.NewLiteVirtClient(conn).ArmNICFirewall(cctx, &pb.ArmNICFirewallRequest{VmName: am.vm, HandoverUncommitted: true})
+	}
+	if err != nil {
+		slog.Warn("migrate: could not tell the target that the guest it holds did not commit; it reports it once no move can be running",
+			"vm", am.vm, "target", am.target.Name, "error", err)
+	}
+}
+
 func (am *armedMigration) call(ctx context.Context, resume bool) error {
 	s := am.s
 	conn, err := s.dialPeerAddr(peerTarget(am.target.Address, am.target.GRPCPort))
@@ -434,12 +477,13 @@ func (s *Server) refuseUnguardedTarget(ctx context.Context, vm string, target co
 }
 
 // NICGuardLabelValue is the value a daemon of this build sets its host's
-// corrosion.LabelNICGuards to at start (re-review m2): its own version —
-// which a host rolled back to an older build no longer reports — or "" where
-// the kernel refused the per-NIC table on the first pass, so no guard can be
-// enforced here.
-func NICGuardLabelValue(version string, st firewall.AppliedState) string {
-	if st.NICTableError != "" {
+// corrosion.LabelNICGuards to after every firewall pass (re-review m2, m5):
+// its own version — which a host rolled back to an older build no longer
+// reports — while the pass put the per-NIC table in force, and "" when it did
+// not (the kernel refused the table, the pass failed or ran out of time), so
+// no guard is proven enforced here.
+func NICGuardLabelValue(version string, enforcing bool) string {
+	if !enforcing {
 		return ""
 	}
 	return version

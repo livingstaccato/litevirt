@@ -137,10 +137,30 @@ Two kinds of NIC carry tags:
     recorded into its network's allowed list (an audited `network.update` by
     `litevirt`). The recording runs on every host whose replica has caught up,
     every 30 seconds until every host runs this release, so a trunk an older
-    host creates during the rollout keeps its VLANs too; then it stops. A
-    VLAN is recorded once: one an operator later takes off the list stays off.
-    A NIC on a network with no network row (a flat bridge) has no list an
-    operator can set; its trunk carries the VLANs recorded for it.
+    host creates during the rollout keeps its VLANs too; then it stops, after
+    one more pass that finds nothing to write. A VLAN is recorded once: one an
+    operator later takes off the list (`lv network set --allowed-vlans`) stays
+    off. Each network's list is read and written under compare-and-swap, and
+    every pass puts back a recorded VLAN that a concurrent write on another
+    host dropped from the list without having seen it.
+  - The VLANs litevirt put on a network's list stay on it when the network is
+    written again from its definition — a re-deploy of the stack that declares
+    it, a peer provisioning it — unless an operator took them off with
+    `lv network set`.
+  - A NIC on a network with no network row attaches to a **flat bridge** of
+    that name (docs/networking.md). Its trunk carries the VLANs recorded for
+    the bridge at upgrade and those allowed on it with
+    `lv network set <bridge> --allowed-vlans 100,101`. A flat bridge belongs
+    to no project, so that needs `network.update` at the cluster root; only
+    `--allowed-vlans` can be set on one, and it replaces the bridge's list
+    (the recorded VLANs stay). It is audited as `network.update`.
+  - The VLANs of a flat bridge follow its trunks. A network row created under
+    the bridge's name (`lv network create`, or a stack declaring it) takes
+    over the VLANs recorded for the bridge and those allowed on it. When a
+    re-deploy moves a legacy stack's NIC from the flat `<stack>_<name>` onto
+    the cluster network `<name>`, that NIC's VLANs recorded under the flat
+    name are added to `<name>`'s list before the NIC moves. Both are audited
+    `network.update` by `litevirt`.
   - **Lacking a guard record grants nothing.** Once the recording has first
     run, every trunk — recorded or not — carries only what its network allows.
     Until that first run (the minutes after the first host upgrades, while its
@@ -151,8 +171,9 @@ Two kinds of NIC carry tags:
   - A tenant's **new** trunk outside its network's list is still created; its
     VLANs the network does not allow are dropped, and the host raises the
     warning condition `firewall.nic.trunk_vlans`, which names the trunk and the
-    `lv network set ... --allowed-vlans` that allows them — an operator decides
-    once per VLAN;
+    `lv network set ... --allowed-vlans` that allows them, and the authority it
+    needs (`network.update` on the network, or at the cluster root for a flat
+    bridge) — an operator decides once per VLAN;
 - a NIC allowed tags explicitly (`lv firewall nic-guard set ...
   --allow-vlan-tags`, compose `allow-vlan-tags: true`) — a VLAN-aware guest
   outside the `trunk:` feature, a nested hypervisor — sends and receives tags
@@ -469,7 +490,10 @@ that runs it:
 If a guarded workload's guards are not in force after the pass — the kernel
 refuses the table — it is not started, and the move is refused, rather than run
 unguarded; a pass that failed for another reason with the guards in force does
-not refuse. A NIC with no guard is rendered once it runs, as before. A domain
+not refuse. A workload whose own guard records cannot be read is treated as
+guarded: it is not started or moved. That reads only its own records, so a
+VM with no guard starts and moves as before guards whatever another
+workload's records say. A NIC with no guard is rendered once it runs, as before. A domain
 started paused for its guard that then cannot be resumed is stopped, and the
 start fails, rather than left paused.
 
@@ -478,7 +502,8 @@ guards in force. The arming before the move tells the target, which records
 on its own disk (`<data_dir>/nic-guard-held/`) that it holds the guest, so the
 target owns letting it run:
 
-- the source asks the target to resume it, retrying for up to two minutes;
+- the source asks the target to resume it, retrying for up to two minutes; a
+  retry never resumes a guest partition pause holds;
 - whatever becomes of that — a dropped connection, a target daemon restart, an
   arm that ran out of time — the target lets the guest run itself, every ten
   seconds trying again, as soon as its guards are in force there;
@@ -486,7 +511,22 @@ target owns letting it run:
   `firewall.nic.held`, naming the VM and why;
 - the move does not report success: `lv host drain` reports the VM as an
   error, "migrated; held paused on <host> …", and `lv migrate` fails with the
-  same, the VM already on its target.
+  same, the VM already on its target;
+- when the guest arrived but the source could not commit the move's
+  ownership (the VM's row still names another host), the source tells the
+  target, which keeps the guest paused — it resumes only a guest it owns — and
+  names it in `firewall.nic.held` with `lv doctor repair-owner <vm> <host>`;
+  once that records the VM on the target, the target lets it run. The
+  condition stays while the guest is paused there, also when its VM row
+  cannot be read.
+
+The record belongs to that move, not to the VM's name: it resumes only a
+domain of the incarnation the move carried (the domain's uuid), and it ends
+when the guest runs, when the VM is started on that host, and when another
+move arms the VM there. A guest that a later start or move brought to the
+host, and that libvirt then pauses for another reason (an I/O error), is not
+resumed by it. A record for a guest that never arrived is dropped two hours
+after the move began, once its VM is no longer `migrating`.
 
 To resume a held guest now, once its guards can be put in force (the kernel
 accepts the per-NIC table, or its guard was turned off): `lv firewall nic-guard
@@ -497,8 +537,11 @@ reboots the guest. A guest also paused by partition pause is left to it.
 **Mixed versions.** Until every host runs this release, a guarded VM is placed,
 moved and recovered only onto hosts that enforce NIC guards: on an older host
 it would run unguarded while `nic-guard ls` says `on`. Each daemon of this
-release sets the host label `litevirt.nic-guards` at start to its own version,
-and clears it where the kernel refuses the per-NIC table. The label counts only
+release sets the host label `litevirt.nic-guards` to its own version after
+every firewall pass that put the per-NIC table in force, its first pass at
+start included, and clears it after a pass that did not — the kernel refused
+the table, or the pass failed or ran out of time — until a pass does. The
+label counts only
 while the host reports that version, so a host rolled back to an older build —
 which reports its own version at start and does not know the label — no longer
 counts, and no guarded VM is placed there.

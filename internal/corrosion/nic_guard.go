@@ -628,13 +628,35 @@ func VMSpecOfIncarnation(ctx context.Context, c *Client, name, createdAt string)
 // is on — only records of the incarnation that exists now: one an earlier VM
 // of the same name left, or one tombstoned with its VM, guards nothing
 // (re-review m1, round 3).
+//
+// It reads owner's own records and nothing else (re-review m1, round 5): a
+// record of another workload that cannot be read is no reason to refuse
+// this one, so an unguarded VM's start goes ahead as on main. An error says
+// owner may have a guard: its own records could not be read, or it has a
+// record on and its VM row, which says which incarnation runs, could not be.
 func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, error) {
-	all, err := ListNICGuards(ctx, c)
+	lo, hi := keyRange(nicGuardKeyPrefix + owner + "/")
+	rows, err := c.Query(ctx,
+		`SELECT key, value, set_by, updated_at FROM cluster_policies
+		 WHERE key >= ? AND key < ? AND deleted_at IS NULL ORDER BY key`, lo, hi)
 	if err != nil {
 		return nil, err
 	}
+	var own []NICGuardRecord
+	for _, r := range rows {
+		if rec, ok := decodeNICGuard(r); ok && !rec.Deleted && rec.VMName == owner && rec.Guarded() {
+			own = append(own, rec)
+		}
+	}
+	if len(own) == 0 {
+		return nil, nil
+	}
 	uuid := ""
-	if vm, err := GetVM(ctx, c, owner); err == nil && vm != nil {
+	vm, err := GetVM(ctx, c, owner)
+	if err != nil {
+		return nil, fmt.Errorf("read the VM row of %s, which has a NIC guard on: %w", owner, err)
+	}
+	if vm != nil {
 		var sp struct {
 			UUID string `json:"uuid"`
 		}
@@ -642,10 +664,7 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 		uuid = sp.UUID
 	}
 	var out []string
-	for _, r := range all {
-		if r.VMName != owner || !r.Guarded() {
-			continue
-		}
+	for _, r := range own {
 		if r.VMUUID != "" && uuid != "" && r.VMUUID != uuid {
 			continue
 		}
@@ -666,18 +685,11 @@ const TrunkVLANsRecordedKey = "firewall_trunk_vlans_recorded"
 // false until its first pass. A value that does not parse (an earlier build of
 // this release wrote "done") counts as a pass that recorded nothing.
 func TrunkVLANsRecorded(ctx context.Context, c *Client) (map[string][]int, bool, error) {
-	rows, err := c.Query(ctx, `SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, TrunkVLANsRecordedKey)
-	if err != nil {
+	raw, have, err := clusterPolicyValue(ctx, c, TrunkVLANsRecordedKey)
+	if err != nil || !have {
 		return nil, false, err
 	}
-	if len(rows) == 0 {
-		return nil, false, nil
-	}
-	out := map[string][]int{}
-	if json.Unmarshal([]byte(rows[0].String("value")), &out) != nil {
-		out = map[string][]int{}
-	}
-	return out, true, nil
+	return DecodeVLANMap(raw), true, nil
 }
 
 // SetClusterPolicy writes one cluster_policies key (behind the gate), through

@@ -97,10 +97,10 @@ func TestRecordExistingTrunkVLANs_UntilTheRelease(t *testing.T) {
 		t.Fatalf("allowed VLANs = %v, want [100 101]", got)
 	}
 
-	// The operator removes 101; an older build creates another trunk.
-	nr, _ := corrosion.GetNetwork(ctx, s.db, "core")
-	nr.Config = `{"Type":"bridge","Interface":"brcore","AllowedVLANs":[100]}`
-	if err := corrosion.UpsertNetwork(ctx, s.db, *nr); err != nil {
+	// The operator removes 101 (`lv network set`); an older build creates
+	// another trunk.
+	if _, err := s.SetNetworkGuardConfig(adminCtxWithEngine(t, s), &pb.SetNetworkGuardConfigRequest{Name: "core",
+		SetAllowedVlans: true, AllowedVlans: []int32{100}}); err != nil {
 		t.Fatal(err)
 	}
 	trunkVM("rollout", "52:54:00:00:00:02", "101,200")

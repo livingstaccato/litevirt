@@ -200,7 +200,11 @@ func newNetworkSetCmd() *cobra.Command {
   --reserved-address   further infrastructure addresses no guest NIC may claim (repeatable; replaces the list)
   --allowed-vlans      the VLANs a NIC on the trunk: feature may carry (replaces the list)
 
-Only the flags given change; an empty value clears that setting.`,
+Only the flags given change; an empty value clears that setting.
+
+On a flat bridge (a network name with no network row, whose NICs attach to a
+bridge of that name) only --allowed-vlans can be set, and it needs
+network.update at the cluster root: no project owns a flat bridge.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req := &pb.SetNetworkGuardConfigRequest{Name: args[0]}

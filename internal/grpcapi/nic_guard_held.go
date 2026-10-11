@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -43,19 +45,31 @@ const CondFirewallHeld = "firewall.nic.held"
 // heldGuestDir is the record directory under the daemon's data dir.
 const heldGuestDir = "nic-guard-held"
 
-// heldStaleAfter is how long a record for a guest that never arrived here (a
-// move that failed, or still runs) is kept. Longer than any live migration
-// may run (adoptedMigrationCeiling).
+// heldStaleAfter is how long a record for a guest that never arrived here is
+// kept while its move may still be running: the record is written before the
+// row says `migrating`. Longer than any live migration may run
+// (adoptedMigrationCeiling). It only ever drops a record that can resume
+// nothing; it never lets one resume anything (re-review m3).
 var heldStaleAfter = 2 * time.Hour
 
 // heldGuest is one guest this host holds, or will hold, paused for its NIC
 // guards. A file, not a table: it is a statement about what this host does
 // to its own runtime, which must survive a restart and is no other host's.
+//
+// A record is the move's, not the name's (re-review m3): it is bound to the
+// incarnation the move carried (its spec uuid, which is the domain's uuid,
+// and its row's created_at), and it ends when the move does — when the
+// guest it held runs, and when anything else brings the VM's domain here: a
+// start of it here (the start guard), or another move's arming.
 type heldGuest struct {
-	VM     string `json:"vm"`
-	UUID   string `json:"uuid,omitempty"` // the VM's incarnation (spec uuid)
-	Source string `json:"source,omitempty"`
-	Since  string `json:"since"` // RFC3339, when the move announced it
+	VM        string `json:"vm"`
+	UUID      string `json:"uuid,omitempty"`       // the VM's incarnation (spec uuid = domain uuid)
+	CreatedAt string `json:"created_at,omitempty"` // the incarnation's row created_at
+	Source    string `json:"source,omitempty"`
+	Since     string `json:"since"` // RFC3339, when the move announced it
+	// Uncommitted: the source told this host the guest arrived but the
+	// move's ownership commit failed (re-review m4).
+	Uncommitted bool `json:"uncommitted,omitempty"`
 }
 
 func heldPath(dataDir, vm string) (string, error) {
@@ -208,9 +222,60 @@ func (s *Server) holdForHandOver(ctx context.Context, vm, source string) error {
 	g := heldGuest{VM: vm, Source: source, Since: time.Now().UTC().Format(time.RFC3339)}
 	if rec, err := corrosion.GetVM(ctx, s.db, vm); err == nil && rec != nil {
 		g.UUID = specUUID(rec.Spec)
+		g.CreatedAt = rec.CreatedAt
 	}
+	heldMu.Lock()
+	defer heldMu.Unlock()
 	return s.putHeld(g)
 }
+
+// endHeld drops vm's held record, if any: its domain comes here by another
+// way than the move that wrote it (a start here, another move), so the
+// record has nothing left to resume (re-review m3).
+func (s *Server) endHeld(vm, why string) {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	if _, ok, err := s.getHeld(vm); err != nil || !ok {
+		return
+	}
+	if err := s.removeHeld(vm); err != nil {
+		slog.Warn("NIC guard: could not drop a held-guest record", "vm", vm, "why", why, "error", err)
+		return
+	}
+	slog.Info("NIC guard: dropped the record of an earlier hand-over", "vm", vm, "why", why)
+}
+
+// markHeldUncommitted records that the guest held for vm's hand-over
+// arrived while its move's ownership commit failed
+// (ArmNICFirewall{handover_uncommitted}, re-review m4).
+func (s *Server) markHeldUncommitted(vm string) error {
+	heldMu.Lock()
+	defer heldMu.Unlock()
+	g, ok, err := s.getHeld(vm)
+	if err != nil || !ok {
+		return err
+	}
+	g.Uncommitted = true
+	return s.putHeld(g)
+}
+
+// domainOfIncarnation reports whether vm's domain here is the incarnation g
+// was written for: its domain uuid is g's spec uuid, when both are known.
+func (s *Server) domainOfIncarnation(vm string, g heldGuest) bool {
+	if !isUUID(g.UUID) {
+		return true
+	}
+	x, err := s.virt.DumpXML(vm)
+	if err != nil {
+		return true // the state check that follows decides
+	}
+	got := lv.UUIDFromXML(x)
+	return got == "" || got == strings.ToLower(g.UUID)
+}
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 
 // errNotHeld: the guest is not one this host holds paused for its guards.
 var errNotHeld = errors.New("not held")
@@ -229,6 +294,12 @@ func (s *Server) resumeHeld(ctx context.Context, vm string) error {
 	}
 	if !ok {
 		return errNotHeld
+	}
+	if !s.domainOfIncarnation(vm, g) {
+		// Not the domain the move carried: never resumed by its record. Kept
+		// and reported, not dropped: a guest nothing resumes must be seen.
+		return fmt.Errorf("its domain here is not the incarnation its move carried (domain uuid is not %s), "+
+			"so its hand-over record does not resume it", g.UUID)
 	}
 	st, err := s.virt.DomainStateReason(vm)
 	if err != nil || st.Reason != "paused" {
@@ -289,43 +360,81 @@ func (s *Server) ResumeHeldGuestsOnce(ctx context.Context) {
 }
 
 // resumeHeldGuest handles one record, returning why its guest stays held
-// ("" when it does not).
+// ("" when it does not). A record whose guest is paused here is reported for
+// as long as it is (re-review m4), whatever stops this host resuming it.
 func (s *Server) resumeHeldGuest(ctx context.Context, g heldGuest) string {
 	stale := func() bool {
 		t, err := time.Parse(time.RFC3339, g.Since)
 		return err != nil || time.Since(t) > heldStaleAfter
 	}
+	exists := s.virt.DomainExists(g.VM)
+	pausedHere := func() (bool, string) {
+		st, err := s.virt.DomainStateReason(g.VM)
+		if err != nil {
+			return true, "its state here cannot be read: " + err.Error()
+		}
+		return st.Reason == "paused", ""
+	}
+	held := func(why string) string {
+		return fmt.Sprintf("%s (since %s: %s; once its guards are in force, `lv firewall nic-guard resume %s`; "+
+			"or stop and start it, which reboots the guest)", g.VM, g.Since, why, g.VM)
+	}
 	vm, err := corrosion.GetVM(ctx, s.db, g.VM)
 	switch {
 	case err != nil:
+		if !exists {
+			return ""
+		}
+		if p, why := pausedHere(); p {
+			if why == "" {
+				why = "its VM row cannot be read: " + err.Error()
+			}
+			return held(why)
+		}
 		return ""
-	case vm == nil || (g.UUID != "" && specUUID(vm.Spec) != "" && specUUID(vm.Spec) != g.UUID):
+	case vm == nil || (g.UUID != "" && specUUID(vm.Spec) != "" && specUUID(vm.Spec) != g.UUID) ||
+		(g.CreatedAt != "" && vm.CreatedAt != "" && vm.CreatedAt != g.CreatedAt):
 		_ = s.removeHeld(g.VM) // deleted, or another incarnation
 		return ""
 	case vm.HostName != s.hostName:
-		// The move has not committed (or failed): nothing here to resume.
+		if !exists {
+			// Not arrived (the move still runs, or failed): nothing here to
+			// resume, and the record is dropped once no move can be running.
+			if stale() && vm.State != "migrating" {
+				_ = s.removeHeld(g.VM)
+			}
+			return ""
+		}
+		p, why := pausedHere()
+		if !p {
+			_ = s.removeHeld(g.VM) // it runs here: nothing is held
+			return ""
+		}
+		if why == "" && !g.Uncommitted && vm.State == "migrating" && !stale() {
+			return "" // the move is still under way
+		}
+		if why == "" {
+			why = fmt.Sprintf("it arrived here paused, but its move's ownership commit is not recorded (the VM's row names %s), "+
+				"so this host does not resume it: `lv doctor repair-owner %s %s` records it here", vm.HostName, g.VM, s.hostName)
+		}
+		return fmt.Sprintf("%s (since %s: %s; it then resumes here once its guards are in force)", g.VM, g.Since, why)
+	}
+	if !exists {
 		if stale() {
 			_ = s.removeHeld(g.VM)
 		}
 		return ""
 	}
-	if !s.virt.DomainExists(g.VM) {
-		if stale() {
-			_ = s.removeHeld(g.VM)
-		}
-		return ""
+	p, why := pausedHere()
+	if why != "" {
+		return held(why)
 	}
-	st, err := s.virt.DomainStateReason(g.VM)
-	if err != nil {
-		return ""
-	}
-	if st.Reason != "paused" {
+	if !p {
 		_ = s.removeHeld(g.VM) // running, or stopped: nothing is held
 		return ""
 	}
 	if err := s.resumeHeld(ctx, g.VM); err != nil && !errors.Is(err, errNotHeld) {
-		return fmt.Sprintf("%s (since %s: %v; once its guards are in force, `lv firewall nic-guard resume %s`; "+
-			"or stop and start it, which reboots the guest)", g.VM, g.Since, err, g.VM)
+		return held(err.Error())
 	}
 	return ""
 }

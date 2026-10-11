@@ -210,6 +210,28 @@ func TestFleet_OIDC_CallbackAtAnotherNodeIsRefused(t *testing.T) {
 	}
 }
 
+// TestFleet_OIDC_ACallbackFromAnotherBrowserBurnsTheFlow (review M2): the IdP
+// sends a code to a browser that did not begin the login (no flow cookie) at
+// the right node. It gets no session, the flow is consumed, the code never
+// reaches the IdP — and the browser that did begin it cannot redeem it either.
+func TestFleet_OIDC_ACallbackFromAnotherBrowserBurnsTheFlow(t *testing.T) {
+	f := newOIDCFleet(t)
+	a := f.c.Nodes[0]
+	owner := f.browser(t)
+	back := f.beginAtIdP(t, owner, a)
+	resp := get(t, f.browser(t), back.String())
+	if resp.StatusCode != http.StatusUnauthorized || sessionCookie(resp) != "" {
+		t.Fatalf("a browser without the flow cookie: %d, cookies %v", resp.StatusCode, resp.Cookies())
+	}
+	resp = get(t, owner, back.String())
+	if sessionCookie(resp) != "" {
+		t.Fatal("the flow survived a foreign redemption attempt")
+	}
+	if f.idp.Exchanges != 0 {
+		t.Fatalf("%d exchanges: a code reached the IdP without its binding", f.idp.Exchanges)
+	}
+}
+
 // TestFleet_OIDC_CLILoopbackLogin drives `lv login --realm oidc:corp`'s flow
 // (internal/cli.OIDCLogin) against node-1: the node hands out its loopback
 // redirect, the "browser" follows the IdP back to the CLI's listener, and the

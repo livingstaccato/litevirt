@@ -66,7 +66,7 @@ func visit(t *testing.T, idp *oidctest.Provider, authURL string) *url.URL {
 
 func TestOIDCBeginFlow_WebFlowEndToEnd(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	start, err := r.BeginFlow(OIDCClientWeb)
+	start, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestOIDCBeginFlow_WebFlowEndToEnd(t *testing.T) {
 	if back.Query().Get("state") != start.State {
 		t.Fatalf("IdP returned state %q", back.Query().Get("state"))
 	}
-	p, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State})
+	p, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding})
 	if err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
@@ -106,15 +106,15 @@ func TestOIDCBeginFlow_WebFlowEndToEnd(t *testing.T) {
 // (and even a fresh code) is refused once the state has been used.
 func TestOIDCBeginFlow_StateIsSingleUse(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); err != nil {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); err != nil {
 		t.Fatal(err)
 	}
 	// A second code minted against the same flow parameters (an attacker
 	// replaying the authorization request) cannot use the spent state.
 	back2 := visit(t, idp, start.AuthURL)
-	_, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back2.Query().Get("code"), OIDCState: start.State})
+	_, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back2.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding})
 	if !errors.Is(err, ErrOIDCFlowUnknown) || !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("replayed state: %v, want ErrOIDCFlowUnknown (an ErrInvalidCredentials)", err)
 	}
@@ -127,7 +127,7 @@ func TestOIDCBeginFlow_StateIsSingleUse(t *testing.T) {
 // configured loopback redirect, and the exchange replays it.
 func TestOIDCBeginFlow_CLIUsesTheLoopbackRedirect(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	start, err := r.BeginFlow(OIDCClientCLI)
+	start, err := r.BeginFlow(OIDCClientCLI, "203.0.113.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,17 +138,17 @@ func TestOIDCBeginFlow_CLIUsesTheLoopbackRedirect(t *testing.T) {
 	if back.Host != "127.0.0.1:18765" {
 		t.Fatalf("IdP sent the browser to %s", back)
 	}
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); err != nil {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
 }
 
 func TestOIDCBeginFlow_CLIUnconfiguredIsRefused(t *testing.T) {
 	r, _ := newFlowRealm(t, func(c *OIDCConfig) { c.CLIRedirectURL = "" })
-	if _, err := r.BeginFlow(OIDCClientCLI); !errors.Is(err, ErrOIDCClientNotConfigured) {
+	if _, err := r.BeginFlow(OIDCClientCLI, "203.0.113.1"); !errors.Is(err, ErrOIDCClientNotConfigured) {
 		t.Fatalf("cli flow with no cli_redirect_url: %v", err)
 	}
-	if _, err := r.BeginFlow("mobile"); !errors.Is(err, ErrOIDCClientNotConfigured) {
+	if _, err := r.BeginFlow("mobile", "203.0.113.1"); !errors.Is(err, ErrOIDCClientNotConfigured) {
 		t.Fatalf("unknown client: %v", err)
 	}
 }
@@ -157,10 +157,10 @@ func TestOIDCBeginFlow_CLIUnconfiguredIsRefused(t *testing.T) {
 // redirect other than the flow's is refused before any exchange.
 func TestOIDCAuthenticate_RedirectIsNotTheCallersToChoose(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
 	_, err := r.Authenticate(context.Background(), Credentials{
-		OIDCCode: back.Query().Get("code"), OIDCState: start.State,
+		OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding,
 		OIDCRedirectURI: "https://evil.example/cb",
 	})
 	if !errors.Is(err, ErrInvalidCredentials) {
@@ -185,7 +185,7 @@ func TestOIDCBeginFlow_WebRedirectMustBeTLS(t *testing.T) {
 		{"https://litevirt.corp/oidc/callback#frag", false},
 	} {
 		r, _ := newFlowRealm(t, func(c *OIDCConfig) { c.RedirectURL = tc.url })
-		_, err := r.BeginFlow(OIDCClientWeb)
+		_, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 		if (err == nil) != tc.ok {
 			t.Errorf("redirect_url %q: err=%v, want ok=%v", tc.url, err, tc.ok)
 		}
@@ -239,9 +239,9 @@ func TestOIDCRealm_TrustsOnlyTheConfiguredCA(t *testing.T) {
 // go through the same verified client as discovery (not the default one).
 func TestOIDCRealm_TokenEndpointAlsoUsesTheCA(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
-	p, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State})
+	p, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding})
 	if err != nil || p == nil {
 		t.Fatalf("exchange through the CA-pinned client: %v", err)
 	}
@@ -250,9 +250,9 @@ func TestOIDCRealm_TokenEndpointAlsoUsesTheCA(t *testing.T) {
 func TestOIDCAuthenticate_RejectsAWrongNonce(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
 	idp.NonceOverride = "not-the-flows-nonce"
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); !errors.Is(err, ErrInvalidCredentials) {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("wrong nonce: %v", err)
 	}
 }
@@ -260,9 +260,9 @@ func TestOIDCAuthenticate_RejectsAWrongNonce(t *testing.T) {
 func TestOIDCAuthenticate_RejectsAnExpiredIDToken(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
 	idp.TokenTTL = -time.Minute
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); !errors.Is(err, ErrInvalidCredentials) {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expired id token: %v", err)
 	}
 }
@@ -273,31 +273,117 @@ func TestOIDCAuthenticate_MultiAudienceNeedsAZP(t *testing.T) {
 	r, idp := newFlowRealm(t, nil)
 	idp.ExtraAudience = "other-client"
 	idp.AZP = "other-client"
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back := visit(t, idp, start.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); !errors.Is(err, ErrInvalidCredentials) {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("azp of another client: %v", err)
 	}
 	idp.AZP = "" // azp = this client
-	start, _ = r.BeginFlow(OIDCClientWeb)
+	start, _ = r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	back = visit(t, idp, start.AuthURL)
-	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State}); err != nil {
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); err != nil {
 		t.Fatalf("azp of this client: %v", err)
 	}
 }
 
-// TestOIDCBeginFlow_BoundsInFlightFlows: beginning a flow needs no credential,
-// so the store is bounded.
-func TestOIDCBeginFlow_BoundsInFlightFlows(t *testing.T) {
+// TestOIDCBeginFlow_OneAddressCannotFillTheStore: beginning a flow needs no
+// credential. One address is bounded on its own, so its flood leaves another
+// address able to begin (review I1).
+func TestOIDCBeginFlow_OneAddressCannotFillTheStore(t *testing.T) {
 	r, _ := newFlowRealm(t, nil)
-	r.maxFlows = 3
+	r.maxFlowsPerAddr = 3
 	for i := 0; i < 3; i++ {
-		if _, err := r.BeginFlow(OIDCClientWeb); err != nil {
+		if _, err := r.BeginFlow(OIDCClientWeb, "198.51.100.66"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := r.BeginFlow(OIDCClientWeb); !errors.Is(err, ErrOIDCTooManyFlows) {
-		t.Fatalf("flow over the bound: %v", err)
+	if _, err := r.BeginFlow(OIDCClientWeb, "198.51.100.66"); !errors.Is(err, ErrOIDCTooManyFlows) {
+		t.Fatalf("the flooding address over its bound: %v", err)
+	}
+	if _, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1"); err != nil {
+		t.Fatalf("another address after the flood: %v", err)
+	}
+}
+
+// TestOIDCBeginFlow_AFullStoreEvictsTheOldest: when the node-wide store is
+// full (a flood from many addresses), a new login still begins; the oldest
+// flow is the one dropped.
+func TestOIDCBeginFlow_AFullStoreEvictsTheOldest(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	r.maxFlows = 3
+	first, err := r.BeginFlow(OIDCClientWeb, "198.51.100.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	for _, a := range []string{"198.51.100.2", "198.51.100.3"} {
+		if _, err := r.BeginFlow(OIDCClientWeb, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest, err := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	if err != nil {
+		t.Fatalf("a login on a full store: %v", err)
+	}
+	if n := len(r.stateStore); n != 3 {
+		t.Fatalf("store holds %d flows, want the bound 3", n)
+	}
+	back := visit(t, idp, first.AuthURL)
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: first.State, OIDCBinding: first.Binding}); !errors.Is(err, ErrOIDCFlowUnknown) {
+		t.Fatalf("the oldest flow after eviction: %v, want ErrOIDCFlowUnknown", err)
+	}
+	back = visit(t, idp, latest.AuthURL)
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: latest.State, OIDCBinding: latest.Binding}); err != nil {
+		t.Fatalf("the newest flow: %v", err)
+	}
+}
+
+// TestOIDCAuthenticate_RedemptionNeedsTheBinding: the code and state travel in
+// the callback URL; without the beginner's binding secret they redeem
+// nothing, the code is never presented to the IdP, and the flow is spent
+// (review M1, M2).
+func TestOIDCAuthenticate_RedemptionNeedsTheBinding(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	if start.Binding == "" || strings.Contains(start.AuthURL, start.Binding) {
+		t.Fatal("the binding is empty or travels in the auth URL")
+	}
+	back := visit(t, idp, start.AuthURL)
+	code := back.Query().Get("code")
+	for _, b := range []string{"", "not-the-binding"} {
+		start2, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+		back2 := visit(t, idp, start2.AuthURL)
+		if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back2.Query().Get("code"), OIDCState: start2.State, OIDCBinding: b}); !errors.Is(err, ErrOIDCFlowBindingMismatch) {
+			t.Fatalf("binding %q: %v, want ErrOIDCFlowBindingMismatch", b, err)
+		}
+		if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back2.Query().Get("code"), OIDCState: start2.State, OIDCBinding: start2.Binding}); !errors.Is(err, ErrOIDCFlowUnknown) {
+			t.Fatalf("after a mismatched redemption the flow must be spent: %v", err)
+		}
+	}
+	if idp.Exchanges != 0 {
+		t.Fatalf("%d codes reached the IdP without the binding", idp.Exchanges)
+	}
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: code, OIDCState: start.State, OIDCBinding: start.Binding}); err != nil {
+		t.Fatalf("with the binding: %v", err)
+	}
+}
+
+// TestOIDCAuthenticate_SingleAudienceForeignAZPRefused: azp present names the
+// party the token was issued to; it must be this client even with one
+// audience (review M7).
+func TestOIDCAuthenticate_SingleAudienceForeignAZPRefused(t *testing.T) {
+	r, idp := newFlowRealm(t, nil)
+	idp.AZP = "other-client"
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	back := visit(t, idp, start.AuthURL)
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("single audience, foreign azp: %v", err)
+	}
+	idp.AZP = flowClientID
+	start, _ = r.BeginFlow(OIDCClientWeb, "203.0.113.1")
+	back = visit(t, idp, start.AuthURL)
+	if _, err := r.Authenticate(context.Background(), Credentials{OIDCCode: back.Query().Get("code"), OIDCState: start.State, OIDCBinding: start.Binding}); err != nil {
+		t.Fatalf("single audience, our azp: %v", err)
 	}
 }
 
@@ -305,7 +391,7 @@ func TestOIDCBeginFlow_BoundsInFlightFlows(t *testing.T) {
 // get no ID token, and so no identity.
 func TestOIDCRealm_ScopesAlwaysCarryOpenID(t *testing.T) {
 	r, idp := newFlowRealm(t, func(c *OIDCConfig) { c.Scopes = []string{"profile", "groups"} })
-	start, _ := r.BeginFlow(OIDCClientWeb)
+	start, _ := r.BeginFlow(OIDCClientWeb, "203.0.113.1")
 	visit(t, idp, start.AuthURL)
 	if s := idp.LastAuthorize.Get("scope"); !strings.Contains(" "+s+" ", " openid ") {
 		t.Fatalf("scope %q lacks openid", s)

@@ -95,30 +95,51 @@ The flow is the authorization code flow with PKCE (S256 only) and a nonce.
 **Web UI.** The login page shows a *Sign in with oidc:&lt;name&gt;* button for
 each OIDC realm (`GET /oidc/login?realm=oidc:<name>`). The node:
 
-1. begins a flow (`BeginOIDCLogin`): 256 random bits of state, a PKCE verifier
-   and a nonce, held in memory **on that node only**, single-use, for 10
-   minutes (at most 4096 in flight per realm);
-2. binds the flow to the browser with a short-lived `HttpOnly`, `SameSite=Lax`
-   cookie scoped to `/oidc/callback`;
+1. begins a flow (`BeginOIDCLogin`): 256 random bits of state, a PKCE verifier,
+   a nonce and a separate **binding secret**, held in memory **on that node
+   only**, single-use, for 10 minutes;
+2. binds the flow to the browser: the binding secret goes into a short-lived
+   `HttpOnly`, `SameSite=Lax` cookie (`__Host-lv_oidc_flow` over https:
+   `Secure`, `Path=/`, no `Domain`, so a sibling host cannot plant one). It is
+   never put in a URL;
 3. sends the browser to the IdP.
 
-The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then:
+In-progress sign-ins are bounded: 16 per client address (the browser's, which
+the UI passes to the daemon; for a direct gRPC caller, its own address) and
+4096 per realm. When the realm's table is full the oldest flow is dropped, so
+a flood cannot lock out other users; a single address over its bound is
+refused ("too many sign-ins in progress from your address").
 
-- refuses a callback whose state is not the one this browser's cookie names,
-  without spending the code. This stops login CSRF: an attacker cannot sign a
-  victim in as the attacker.
-- calls `Login` with the code and state on the same node. The node exchanges
-  the code with the verifier and the client secret. It verifies the ID token
-  against the discovery document's JWKS: signature, issuer, audience
-  (`client_id`, and `azp` when there are several audiences), expiry, and the
-  flow's nonce.
+The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then calls
+`Login` with the code, the state and the cookie's binding secret on the same
+node. The node:
+
+- consumes the flow (single use), then refuses it unless the binding secret is
+  the one its beginner was given — before the code is presented to the IdP. A
+  callback from a browser that did not begin the login (login CSRF), or a code
+  and state lifted from a URL or a log, therefore redeem nothing, and the flow
+  is spent;
+- exchanges the code with the verifier and the client secret, and verifies the
+  ID token against the discovery document's JWKS: signature, issuer, audience
+  (`client_id`; `azp`, when present or when there are several audiences, must
+  be `client_id`), expiry, and the flow's nonce.
 - maps the principal (`subject_claim`) and creates the session exactly as a
   password login does: the external shadow user, the directory identity
   binding, the account lifecycle, and the login policy below.
 
 The callback answers with `Cache-Control: no-store` and
-`Referrer-Policy: no-referrer`. The code, the state and the session token are
-never logged and never put in another URL.
+`Referrer-Policy: no-referrer`. The code, the state, the binding secret and
+the session token are never logged and never put in another URL. The login
+page shows only fixed messages: no text from the IdP (`error`,
+`error_description`, error bodies), from a crafted link, or from the daemon's
+refusal (which can name the account) reaches it — the detail is in the daemon
+log and the audit log.
+
+**Logging out.** `lv logout` and the UI's *Log out* end the litevirt session
+only. The identity provider's own session is untouched, so on a shared
+workstation the next *Sign in with* may sign in as the previous user without a
+prompt. Sign out at the identity provider too, or configure it to always ask
+(`prompt=login`-style policies on its side).
 
 **The login must finish on the node that began it.** A callback that reaches
 another node finds no flow and is refused (`Unauthenticated`, "state unknown
@@ -133,7 +154,8 @@ then:
 - listens on that loopback address;
 - opens the URL in a browser on the same machine (`--no-browser` prints it
   instead);
-- accepts only the flow's own state on the configured path.
+- accepts only the flow's own state on the configured path;
+- keeps the flow's binding secret in memory and sends it with the code.
 
 It completes the login on the same node. The code goes only to the user's
 loopback and to the node; the client secret stays on the node. A remote shell
@@ -141,8 +163,9 @@ needs the loopback forwarded, e.g. `ssh -L 18765:127.0.0.1:18765`. The IdP must
 list `cli_redirect_url` as a redirect URI for the client.
 
 **API.** `BeginOIDCLogin` (REST `POST /api/v1/auth/oidc/begin`,
-`{realm, client}`) and then `Login` with `oidc_code` and `oidc_state` on the
-same node. `client` is `web` (the default) or `cli`. The redirect is always the
+`{realm, client}`) returns `auth_url`, `state` and `binding`; then `Login` with
+`oidc_code`, `oidc_state` and `oidc_binding` on the same node. Keep `binding`
+out of URLs and logs. `client` is `web` (the default) or `cli`. The redirect is always the
 realm's configured one for that client; a caller cannot choose it. An
 `oidc_redirect_uri` sent to `Login` must equal it.
 
@@ -152,7 +175,8 @@ claims: an IdP that did its own MFA does not stand in for the account's
 litevirt factor. The OIDC code is single-use, so when a covered user with a
 factor signs in without one, `Login` answers `requires_2fa` with an
 `oidc_pending` handle and mints no session. The handle is node-local, lasts 5
-minutes and allows 5 wrong codes. Send it back with `realm` and `totp_code` (the
+minutes and allows 5 attempts, reserved atomically, so concurrent guesses
+cannot exceed them. Send it back with `realm` and `totp_code` (the
 web UI asks for the code; `lv login` prompts). A client may still send
 `totp_code` together with the code in one call.
 

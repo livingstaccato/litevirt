@@ -995,6 +995,9 @@ message LoginRequest       {
     // realm and totp_code instead of the spent code. Single-use per success,
     // node-local, valid for 5 minutes and 5 attempts.
     string oidc_pending      = 9;
+    // oidc_binding: the secret BeginOIDCLoginResponse.binding returned to whoever
+    // began the flow; required with oidc_code + oidc_state. Never in a URL.
+    string oidc_binding      = 10;
 }
 message LoginResponse      {
     string token         = 1;  // bearer; opaque session id (prefix "lvs_") on success
@@ -1022,12 +1025,19 @@ message ListRealmsResponse { repeated string realms = 1; }
 message BeginOIDCLoginRequest {
     string realm  = 1;  // "oidc:<name>"
     string client = 2;  // "web" | "cli"
+    // client_address: the end client's address, for the per-address bound on
+    // in-progress logins. Honoured only from a loopback caller (this node's
+    // web UI or REST gateway); any other caller is bounded by its own address.
+    string client_address = 3;
 }
 message BeginOIDCLoginResponse {
     string auth_url     = 1;  // send the user's browser here
     string state        = 2;  // single-use; the callback must carry it back
     string redirect_uri = 3;  // where the IdP will send the browser
     string expires_at   = 4;  // RFC3339; the flow is refused after this
+    // binding: a per-flow secret that redeeming the flow (LoginRequest.oidc_binding)
+    // must present. Keep it out of URLs and logs.
+    string binding      = 5;
 }
 message CreateUserRequest  { string username = 1; string password = 2; string role = 3; }
 message ListUsersResponse  { repeated User users = 1; }

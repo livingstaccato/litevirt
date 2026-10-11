@@ -14,6 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -120,6 +123,46 @@ func (s *Server) vmHasSharedDisk(ctx context.Context, disks []corrosion.DiskReco
 		}
 	}
 	return false
+}
+
+// refuseRebuildOverPromotedDisks refuses a same-name promotion of vm, already
+// this host's, while any of its disk rows here names a live disk an earlier
+// promotion built (`<vm>-promoted-<run>…`) that is still there. The promoted
+// VM has run from those disks, so they hold writes no replica on this host
+// has — the replicas here are of the host the VM left — and rebuilding them
+// from replica would discard those writes, as re-running a promotion over a
+// partial one with --force used to. A shared disk is never rebuilt, so its
+// row is not looked at. A file that cannot be examined refuses too: it may be
+// one. The remedy keeps both: a promotion under another name.
+func (s *Server) refuseRebuildOverPromotedDisks(ctx context.Context, vm *corrosion.VMRecord, replica string) error {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "list the disks of %s: %v", vm.Name, err)
+	}
+	var promoted []string
+	for _, d := range disks {
+		if d.HostName != s.hostName || d.Path == "" ||
+			!strings.HasPrefix(filepath.Base(d.Path), vm.Name+"-promoted-") || s.diskOnSharedStorage(ctx, d) {
+			continue
+		}
+		_, err := os.Lstat(d.Path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			continue // nothing there to lose
+		case err != nil:
+			return status.Errorf(codes.Unavailable, "examine %s's live disk %s at %s: %v", vm.Name, d.DiskName, d.Path, err)
+		}
+		promoted = append(promoted, fmt.Sprintf("%s at %s", d.DiskName, d.Path))
+	}
+	if len(promoted) == 0 {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"vm %q already runs on %s from live disks an earlier promotion built (%s), and holds what it has written to them "+
+			"since; no replica on %s has those writes, so rebuilding them from replica %s would discard them, and a "+
+			"promotion over it is refused, --force or not. To keep both, promote the replica under another name: "+
+			"`lv replication promote %s --replica %s --new-name <name>`",
+		vm.Name, s.hostName, strings.Join(promoted, ", "), s.hostName, replica, vm.Name, replica)
 }
 
 // sharedDiskOwners are the hosts a shared disk is judged by (review R3-I1):
@@ -597,10 +640,12 @@ func assignTargetDevs(rootDev string, others []promotedSetDisk) {
 func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM string, others []promotedSetDisk) (manifest, partial string) {
 	// The remedy for a shared disk left unattached (review R3-m2). No command
 	// attaches an existing disk at its path, and a second promotion over this
-	// one is not a remedy: with --force it destroys the promoted domain, then
-	// rebuilds the disks from their replicas (losing what the promoted VM
-	// wrote) or refuses the root's live file, which is already there. So the
-	// proof has to come before the promotion.
+	// one is not a remedy: it is refused (refuseRebuildOverPromotedDisks),
+	// because rebuilding the promoted VM's disks from their replicas would
+	// discard what it has written. So the proof has to come before the
+	// promotion.
+	rerun := fmt.Sprintf("Re-running `lv replication promote %s --force` over this promotion does not attach it: it is "+
+		"refused, because rebuilding the promoted VM's disks from their replicas would discard what it has written", origVM)
 	sharedAdvice := func(owner string) string {
 		if newVM != "" && newVM != origVM {
 			return fmt.Sprintf("it belongs to the original VM %s and must not be attached to %s", origVM, newVM)
@@ -609,14 +654,10 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM str
 			// No host failed the verdict, or the one that did is the
 			// promoting host itself: confirming a fence would not attach it,
 			// and the promoting host is never the one to power off.
-			return fmt.Sprintf("confirming a host powered off would not attach it. Do not re-run "+
-				"`lv replication promote %s --force` over this promotion to attach it: that destroys the promoted "+
-				"domain and rebuilds its disks from their replicas, or fails", origVM)
+			return "confirming a host powered off would not attach it. " + rerun
 		}
 		return fmt.Sprintf("a promotion attaches it as-is only once its owner is proven off, so do that first next time: "+
-			"once %s is powered off, `lv host fence-confirm %s`. Do not re-run `lv replication promote %s --force` "+
-			"over this promotion to attach it: that destroys the promoted domain and rebuilds its disks from their "+
-			"replicas, or fails", owner, owner, origVM)
+			"once %s is powered off, `lv host fence-confirm %s`. %s", owner, owner, rerun)
 	}
 	parts := []string{fmt.Sprintf("%s ← %s", rootDisk, rootReplica)}
 	var missing, earlier []string

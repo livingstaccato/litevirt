@@ -171,7 +171,7 @@ func TestPromote_ThePartialAdviceNamesTheHostThatFailed(t *testing.T) {
 					t.Errorf("partial = %q, must not contain %q", p, bad)
 				}
 			}
-			if !strings.Contains(p, "Do not re-run `lv replication promote db --force`") {
+			if !strings.Contains(p, "Re-running `lv replication promote db --force` over this promotion does not attach it: it is refused") {
 				t.Errorf("partial = %q, want the re-run warning kept", p)
 			}
 		})

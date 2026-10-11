@@ -628,9 +628,14 @@ recorded on it, possibly before your promotion runs. A node still on an older
 build answers "not found" for a removed host, so set `LV_HOST` to an upgraded
 node. No command attaches an existing disk at its path to a VM
 already promoted, and re-running `lv replication promote <vm> --force` over a
-partial promotion is not a remedy: it destroys the promoted domain, then
-rebuilds the disks from their replicas (losing what the promoted VM wrote) or
-refuses the root's live file, which is already there.
+partial promotion is not a remedy: it is refused. The promoted VM runs from
+live disks that promotion built and has written to them since, which no
+replica on that host holds, so a same-name promotion over a VM whose disk rows
+name such a live disk there is refused, `--force` or not, rather than
+rebuild them from a replica and discard those writes. To have both, promote
+the replica under another name (`--new-name`). Every refusal of a promotion
+comes before the domain already defined under the name is destroyed: a
+`--force` promotion replaces that domain only once nothing is left to refuse.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts

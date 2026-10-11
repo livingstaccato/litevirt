@@ -195,7 +195,7 @@ func TestPromote_ThePartialAdviceNamesTheRealRemedy(t *testing.T) {
 	p := eventDetail(t, s, "db", vmEventPromotedPartial)
 	for _, want := range []string{
 		"once dead-host is powered off, `lv host fence-confirm dead-host`",
-		"Do not re-run `lv replication promote db --force` over this promotion",
+		"Re-running `lv replication promote db --force` over this promotion does not attach it: it is refused",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("partial = %q, want %q", p, want)

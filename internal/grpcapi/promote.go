@@ -1139,19 +1139,30 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
+	// A domain already defined here under the name is replaced only with
+	// --force, and only just before the new one is defined: every refusal and
+	// every failure on the way there — a live disk already at the root's
+	// path, a disk that cannot be built, a bridge that cannot be had — leaves
+	// it exactly as it was. Destroying it first, as before, left a VM
+	// undefined by a promotion that then refused.
+	// (If this proof already reached "started", the existing domain is OUR OWN
+	// prior promotion — never destroy it on resume; fall through to persist.)
+	replaceDomain := false
 	if s.virt.DomainExists(targetName) && !started {
-		// (If this proof already reached "started", the existing domain is OUR OWN
-		// prior promotion — never destroy it on resume; fall through to persist.)
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
 		}
-		// Force takeover: the domain may be actively running on THIS host
-		// (same-host promote). Stop it first — UndefineDomain alone only drops
-		// the persistent config, leaving the live domain to collide on UUID at
-		// DefineDomain. (In a real failover the VM ran on the fenced host, so
-		// the promotion host has no such domain and this is a no-op.)
-		_ = s.virt.DestroyDomain(targetName)
-		_ = s.virt.UndefineDomain(targetName, false)
+		replaceDomain = true
+	}
+	// A VM an earlier promotion brought to this host runs from live disks it
+	// built from replicas, and has written to them since: those writes are in
+	// no replica here (the replicas this host holds are of the host the VM
+	// left). Rebuilding over them from a replica discards them, so a
+	// same-name promotion over such a VM is refused, --force or not.
+	if !renamed && !started && vm.HostName == s.hostName {
+		if err := s.refuseRebuildOverPromotedDisks(ctx, vm, replica); err != nil {
+			return err
+		}
 	}
 
 	// Build the live disk from the replica.
@@ -1467,6 +1478,16 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	if !started {
+		if replaceDomain {
+			// Force takeover, now that nothing is left to refuse: the domain
+			// may be actively running on THIS host (same-host promote). Stop it
+			// first — UndefineDomain alone only drops the persistent config,
+			// leaving the live domain to collide on UUID at DefineDomain. (In a
+			// real failover the VM ran on the fenced host, so the promotion
+			// host has no such domain and this is a no-op.)
+			_ = s.virt.DestroyDomain(targetName)
+			_ = s.virt.UndefineDomain(targetName, false)
+		}
 		// attempt defines and starts the domain on disks; stage names the
 		// step that failed.
 		attempt := func(disks []lv.DiskConfig) (string, error) {

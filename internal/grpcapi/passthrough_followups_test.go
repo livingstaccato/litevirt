@@ -54,8 +54,11 @@ func ctRestoreAudit(t *testing.T, s *Server, name string) []string {
 // marker is left, and the refusal is audited. The refusal names the way out
 // (--without-host-access, n1).
 //
-// Mutation: drop the DeleteContainer (or the audit) from RestoreContainer's
-// host-access refusal branch — red.
+// Mutation: drop the DeleteContainer, the audit or the hint from
+// RestoreContainer's host-access refusal branch — red. (The marker check
+// only says nothing is left: a restore marker is written for a proof-carrying
+// peer restore, which never reaches this branch, so dropping its removal
+// there survives.)
 func TestRestoreContainer_HostAccessGateRefusalCleansUp(t *testing.T) {
 	s, rt, repo, ts := hostAccessBackup(t)
 	s.SetReleaseFeatureGate(latchedButRefusingGate{})

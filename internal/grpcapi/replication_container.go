@@ -1534,11 +1534,12 @@ func (s *Server) liveCopySeenBy(ctx context.Context, host, project, name string)
 			break
 		}
 	}
-	inv, err := c.GetRuntimeInventory(ctx, &pb.GetRuntimeInventoryRequest{Kind: corrosion.WorkloadContainer, Name: name})
+	inv, err := c.GetRuntimeInventory(ctx, &pb.GetRuntimeInventoryRequest{
+		Kind: corrosion.WorkloadContainer, Name: name, ContainersOnly: true})
 	if err != nil {
 		return "", fmt.Errorf("read its runtime: %w", err)
 	}
-	return runtimeCopyOn(host, name, inventoryFromProto(inv), otherHere)
+	return runtimeCopyOn(host, project, name, inventoryFromProto(inv), otherHere)
 }
 
 // localRuntimeCopy is liveCopySeenBy's runtime half for this host. Its import
@@ -1554,19 +1555,35 @@ func (s *Server) localRuntimeCopy(ctx context.Context, project, name string) (st
 			otherHere = true
 		}
 	}
-	return runtimeCopyOn(s.hostName, name, s.collectRuntimeInventory(ctx), otherHere)
+	return runtimeCopyOn(s.hostName, project, name, s.collectContainerRuntime(ctx, name), otherHere)
 }
 
-// runtimeCopyOn reads host's runtime inventory for the container name: a
-// phrase naming the copy when the host holds one, "" for a positive none, or
+// runtimeCopyOn reads host's runtime inventory for project's container name:
+// a phrase naming the copy when the host holds one, "" for a positive none, or
 // an error when the inventory cannot vouch. otherHere says host's own live row
 // of that name on itself is another project's container, which is then what
-// its runtime of that name is.
-func runtimeCopyOn(host, name string, inv runtimeInventory, otherHere bool) (string, error) {
+// its runtime of that name is, unless the runtime's own owner record says it
+// is project's (a ghost row of the other project over our orphan), or cannot
+// be read. A runtime with no owner record (an earlier build made it) is taken
+// to be the row's, as before the record existed.
+//
+// Absence is proven by a complete inventory, or by a container listing that
+// succeeded (ContainersComplete, from a containers-only ask): a VM probe or
+// another container's marker that failed says nothing about this name.
+func runtimeCopyOn(host, project, name string, inv runtimeInventory, otherHere bool) (string, error) {
 	w, found := inv.find(corrosion.WorkloadContainer, name)
 	switch {
-	case found && otherHere:
+	case found && otherHere && w.OwnerStatus == OwnerUnreadable:
+		return "", fmt.Errorf("its runtime %s sits under another project's live row of that name, and its owner record cannot be read (%s), so whose it is is unproven",
+			name, w.ProbeError)
+	case found && otherHere && !(w.OwnerStatus == OwnerValid && w.OwnerProject == project):
 		return "", nil
+	case found && w.ProbeError == probeNoLXCTooling:
+		return fmt.Sprintf("%s holds %s with no live row of it (%s), a copy that may hold newer data than the replica",
+			host, name, w.ProbeError), nil
+	case found && otherHere:
+		return fmt.Sprintf("%s runs %s, whose owner record says it is %s's, under another project's live row of that name: an orphaned runtime that may hold newer data than the replica (see %s)",
+			host, name, project, health.CondCTOrphanRuntime), nil
 	case found && (w.State == health.RuntimeRunning || w.State == health.RuntimeDefinedStopped):
 		return fmt.Sprintf("%s runs %s with no live row of it, an orphaned runtime that may hold newer data than the replica (see %s)",
 			host, name, health.CondCTOrphanRuntime), nil
@@ -1576,7 +1593,7 @@ func runtimeCopyOn(host, name string, inv runtimeInventory, otherHere bool) (str
 			detail += ": " + w.ProbeError
 		}
 		return "", fmt.Errorf("its runtime holds %s in a state it could not read (%s)", name, detail)
-	case !inv.Complete:
+	case !inv.Complete && !inv.ContainersComplete:
 		return "", fmt.Errorf("its runtime inventory is incomplete, so absence is unproven (%s)", strings.Join(inv.Errors, "; "))
 	}
 	return "", nil

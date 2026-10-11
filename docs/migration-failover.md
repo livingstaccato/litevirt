@@ -592,6 +592,7 @@ When a host goes offline, the failover coordinator:
 | Method | How it works |
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
+| `redfish` | Power-off through the BMC's Redfish service over HTTPS: a `ComputerSystem.Reset` with `ForceOff`, then `PowerState` polled until it reads `Off`. Same weight as `ipmi`: the fence succeeds, and is verified, only once `Off` is observed. Requires `redfish_endpoint`, `redfish_user` and `redfish_pass` on the host. See [Redfish](#redfish) below. |
 | `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. |
 | `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
@@ -621,6 +622,83 @@ row and the old `hosts.ipmi_pass` column, so it is refused until
 `credentials_split_v1` has latched on the node that takes it. A server that
 predates the flag ignores it; the CLI reports an error when the host it gets
 back still has an IPMI address.
+
+### Redfish
+
+A host whose BMC speaks Redfish (DMTF DSP0266) can be fenced through it
+instead of IPMI:
+
+```bash
+lv host config host-b \
+  --fence-strategy redfish \
+  --redfish-endpoint https://10.0.50.111 \
+  --redfish-user admin \
+  --redfish-pass <secret> \
+  --redfish-ca-file /etc/litevirt/bmc-ca.pem
+```
+
+The fence:
+
+1. reads the service root (`/redfish/v1/`) and, with `--redfish-auth session`
+   (the default), logs in through the SessionService and sends the
+   `X-Auth-Token` it returns; `--redfish-auth basic` sends HTTP basic auth on
+   every request instead;
+2. finds the ComputerSystem in `/redfish/v1/Systems`: the member whose Id is
+   `--redfish-system-id`, or the only member when no id is set. A BMC that
+   lists several and no id is configured is refused rather than guessed at;
+3. reads its `PowerState`. Unless it already reads `Off`, posts a
+   `ComputerSystem.Reset` with `ResetType` `ForceOff`. A BMC whose reset action
+   does not offer `ForceOff` is refused, never reset with something gentler;
+4. polls `PowerState` until it reads `Off`, for up to 15 seconds. Only `Off`
+   counts: `PoweringOff`, an empty value or an error is not off, and a fence
+   that never observes `Off` has failed;
+5. deletes its session.
+
+A fence that succeeded is `verified`, exactly like an IPMI power-off: it
+records the host `fenced`, it satisfies the shared-disk fence gate, a
+successor resumes from it while it is fresh and renews it with a fresh Redfish
+power-off otherwise (a renewal of a host that already reads `Off` is a verified
+read, not a second reset), and a failed one is retried on the backoff below.
+Its time budget is IPMI's, so the leader's lease floor covers both.
+
+**TLS is always verified**: against the PEM bundle given with
+`--redfish-ca-file`, or the system roots when none is given. The BMC's
+certificate must name the endpoint's host (a DNS or IP SAN). There is no
+option to skip verification, and an `http://` endpoint is refused, since the
+login carries the BMC password. The fence never follows a redirect, and never a
+reference the BMC returns to another host: either would hand that host the
+credentials. Each request is bounded (4 s), and everything up to the reset by
+6 s in all.
+
+**Where the settings live.** The endpoint, user, password, system id, auth mode
+and CA bundle are one row of `host_fence_redfish`, on the sensitive lane next to
+the IPMI credential, never on the `hosts` row and never in an operator-readable
+state dump. `lv host inspect` shows the endpoint, system id and auth mode,
+never the user, password or CA. An empty `--redfish-*` flag leaves that setting
+alone, so `--redfish-pass` alone rotates the password. `--clear-redfish`
+removes them all; a host that fences by `redfish` needs another strategy in the
+same command:
+
+```bash
+lv host config host-b --fence-strategy ipmi --clear-redfish
+```
+
+A host set to `redfish` without an endpoint, user and password, or with an
+endpoint that is not `https://host[:port]`, is refused when it is configured,
+not at its first fence.
+
+**Rolling upgrades.** A host on a build before this one cannot decode
+`host_fence_redfish`, and reads `fence_strategy = redfish` as an unknown
+strategy, which falls back to best-effort SSH. So the strategy and its
+settings are the release feature `redfish_fence` of `release_2026_11_v1`:
+`lv host config` refuses them with "the cluster upgrade must finish first
+(redfish_fence needs release_2026_11_v1)" until every host runs this build, and
+the first one records the feature as used. From then on a host rolled back
+below the release quarantines itself rather than fence a Redfish host over SSH
+(see [upgrades.md](upgrades.md)). Every other setting, and `--clear-redfish` on
+a host with no Redfish settings, is accepted throughout. A server that predates
+the flags ignores them; the CLI reports an error when the host it gets back has
+no Redfish endpoint.
 
 ### Manual fence confirmation flow
 
@@ -653,7 +731,7 @@ When `enforcement.shared_storage_fence` is enabled (and the cluster has latched 
 reschedule — of a VM with a writable shared disk starts only once the old owner is
 **proven powered off**:
 
-- Accepted: a confirmed power-off (`ipmi`), or an operator `lv host fence-confirm`
+- Accepted: a confirmed power-off (`ipmi` or `redfish`), or an operator `lv host fence-confirm`
   (`manual-confirmed`).
 - Rejected: a `best-effort`/`ssh` fence — a lenient SSH poweroff reports success but
   never confirms the host is down.
@@ -714,7 +792,7 @@ one replicated entry. The state says what the fence **proved**:
 
 | Fence | Host state |
 |---|---|
-| `ipmi`, powered off and observed off | `fenced` |
+| `ipmi` or `redfish`, powered off and observed off | `fenced` |
 | `ssh`, `watchdog`, or `best-effort` that succeeded | `offline` once `fence_state_v1` has latched; `fenced` before |
 | any fence that failed | `offline` |
 | `lv host fence-confirm` | `fenced` |
@@ -751,8 +829,8 @@ the lease next takes the recovery over from that record. It needs:
    own daemon starting up again, but that write can be lost (a failed startup
    write, or a last-writer-wins loss under clock skew), so nothing below
    relies on it.
-2. **The newest fence attempt succeeded.** That covers a verified `ipmi`
-   power-off and an `ssh` or `best-effort` success. A host left `offline` by a
+2. **The newest fence attempt succeeded.** That covers a verified `ipmi` or
+   `redfish` power-off and an `ssh` or `best-effort` success. A host left `offline` by a
    failed fence has a failed newest attempt and is not resumed from; while a
    quorum sees it down, the leader fences it again on a backoff (30 s,
    doubling to 5 minutes), and a later successful fence by anyone — an
@@ -763,7 +841,7 @@ the lease next takes the recovery over from that record. It needs:
 
 What happens next depends on the fence:
 
-- **A verified (`ipmi`) fence** is resumed from directly only while it is under
+- **A verified (`ipmi` or `redfish`) fence** is resumed from directly only while it is under
   5 minutes old **and** still stands (below). Otherwise the successor powers the
   host off again with the recorded method first. A verified power-off of a host
   that is already off is harmless, and a fresh one is authority on its own,
@@ -772,7 +850,7 @@ What happens next depends on the fence:
   nothing is recovered. The failed attempt is now the newest on record, so the
   host is not re-fenced every cycle, only on the failed-fence retry backoff
   (30 s, doubling to 5 minutes, with the host's current strategy when that is
-  `ipmi` or `ssh` and the method that failed otherwise, and never once any
+  `ipmi`, `redfish` or `ssh` and the method that failed otherwise, and never once any
   observer has seen the host answer since the failed attempt); it is left
   `offline`, counted as `phase=recovery, error_class=refence_failed` and
   raised as the `refence_failed` health condition. Confirm it is off and run
@@ -939,9 +1017,9 @@ later) moves local-disk VMs and refuses shared-disk ones, which is the safe
 direction.
 
 **Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
-(anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated
+(anything but `ipmi` or `redfish`) gives its shared-disk VMs *manual-confirm-only* automated
 failover once this is enforced. `lv host inspect <host>` prints a note when a host's
-fence strategy can't prove a power-off. Give shared-disk hosts an IPMI fence strategy,
+fence strategy can't prove a power-off. Give shared-disk hosts an IPMI or Redfish fence strategy,
 or expect to run `lv host fence-confirm` for their failover.
 
 Local-disk VMs are unaffected: their transfers keep the existing quorum/proof gate

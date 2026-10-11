@@ -145,9 +145,14 @@ lv host label set <host> key=value ...    # Set labels on a host
 lv host label rm <host> <key> ...         # Remove labels from a host
 lv host label ls <host>                   # List labels on a host
 lv host config <host>                     # Configure host settings
-  [--fence-strategy ssh|ipmi|watchdog]
+  [--fence-strategy ssh|ipmi|redfish|watchdog|manual|best-effort]
   [--ipmi-address <addr>] [--ipmi-user <u>] [--ipmi-pass <p>]
   [--clear-ipmi]                          # Remove the IPMI address, user and password
+  [--redfish-endpoint https://<bmc>[:port]] [--redfish-user <u>] [--redfish-pass <p>]
+  [--redfish-system-id <id>]              # ComputerSystem Id, when the BMC lists several
+  [--redfish-auth session|basic]          # default session
+  [--redfish-ca-file <pem>]               # CA the BMC certificate must chain to (default: system roots)
+  [--clear-redfish]                       # Remove the Redfish settings
   [--watchdog-dev <path>]
   [--role worker|witness]                 # witness = vote-only tiebreaker
   [--region <name>]                       # Region label (federation)

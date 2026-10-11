@@ -90,6 +90,21 @@ Configure host request body (all fields optional):
 }
 ```
 
+A Redfish BMC instead (`fence_strategy` `redfish`; see
+[Migration and failover](migration-failover.md#fencing-methods)):
+
+```json
+{
+  "fence_strategy": "redfish",
+  "redfish_endpoint": "https://10.0.50.100",
+  "redfish_user": "admin",
+  "redfish_pass": "secret",
+  "redfish_system_id": "System.Embedded.1",
+  "redfish_auth": "session",
+  "redfish_ca_pem": "-----BEGIN CERTIFICATE-----\n..."
+}
+```
+
 ### Virtual Machines
 
 ```

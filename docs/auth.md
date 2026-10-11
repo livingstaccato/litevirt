@@ -1213,6 +1213,9 @@ secrets**. Once every host runs a build carrying `credentials_clear_v1` as
 well, the old columns are emptied and the dump carries none (see
 [upgrades.md](upgrades.md#the-old-secret-columns-are-emptied) and
 [design/credentials-clear.md](design/credentials-clear.md)).
+A host's Redfish BMC settings and password (`fence_strategy` `redfish`) were
+never on a public table: they live only in `host_fence_redfish`, on the
+sensitive lane, so no state dump carries them.
 All three RPCs stay peer-only regardless: only a **peer** or **local-root**
 caller (a cluster host certificate) can read them. An operator or admin bearer,
 a session, and the `lv-cli` client certificate are all refused with

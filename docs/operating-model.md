@@ -298,14 +298,14 @@ of acting — it says nothing about whether the resulting rows have replicated.
   consecutive failure to a 5-minute cap, read from `fencing_log` so a restart
   or a new leader keeps the schedule — and recovers on the first success.
   - **Which strategy a retry runs:** the host's current strategy when it is
-    `ipmi` or `ssh`, so fixing the cause with
+    `ipmi`, `redfish` or `ssh`, so fixing the cause with
     `lv host config <host> --fence-strategy ipmi` (and the BMC credentials)
     takes effect on the next retry. Otherwise the method that failed is
     repeated: a host switched to `best-effort` is never "recovered" on a failed
     best-effort fence.
   - **What is never retried:** a `manual` fence (`lv host fence-confirm`
     resumes it) and a `watchdog` fence of a peer (it cannot succeed) — unless
-    the host's strategy has since been set to `ipmi` or `ssh`, which the next
+    the host's strategy has since been set to `ipmi`, `redfish` or `ssh`, which the next
     retry then runs — and a host any observer has seen answer since the
     attempt that failed. That last
     check is made immediately before each retry, so a partition that heals
@@ -1275,7 +1275,8 @@ leadership churn or a partition.
   (see "A site partition is a majority/minority split of one cluster" above).
 
 ### Fencing strategy
-- **Production with shared storage**: `ipmi` (mandatory). SSH and watchdog
+- **Production with shared storage**: `ipmi` or `redfish` (one of them is
+  mandatory: both power the host off through its BMC and observe it off). SSH and watchdog
   are insufficient because a network-isolated but otherwise-healthy node can
   refuse SSH but continue writing to the shared volume.
 - **Production without shared storage**: `ssh` is acceptable; `best-effort`

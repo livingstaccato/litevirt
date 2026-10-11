@@ -643,12 +643,12 @@ the warning. The warning is diagnostic only and does not change the exit code.
 `lv doctor fence` also lists the fences of the last 7 days (newest 20), each
 with an **assurance** — what that fence actually establishes about the host.
 The stored `fencing_log.result` cannot make this distinction: it says `fenced`
-both for an IPMI power-off that was observed off and for an SSH poweroff nobody
+both for an IPMI or Redfish power-off that was observed off and for an SSH poweroff nobody
 checked.
 
 | Assurance | Produced by | Means |
 |---|---|---|
-| `verified` | `ipmi` + `fenced` | Powered off, then observed off. |
+| `verified` | `ipmi` or `redfish` + `fenced` | Powered off, then observed off (IPMI chassis power status, or Redfish `PowerState` `Off`). |
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
 | `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
 | `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |

@@ -107,9 +107,12 @@ func TestReplicationReverse_APromotedVMReplicatesBackToTheHostItLeft(t *testing.
 	}
 
 	// The VM's host is lost; the replica host promotes (the operator's promote is
-	// the same code path as the coordinator's).
+	// the same code path as the coordinator's). The fleet's fake makes no
+	// point-in-time copy of a running VM, so the replica is recorded as not
+	// point-in-time (fix/point-in-time-replicas) and the promote must accept it,
+	// as tests/fleet/pit_replica_test.go does.
 	st, err := c.SelfClient(replicaHost).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
-		VmName: "web", TargetPool: "dr", TargetHost: replicaHost.Name, Force: true,
+		VmName: "web", TargetPool: "dr", TargetHost: replicaHost.Name, Force: true, AcceptNotPointInTime: true,
 	})
 	if err == nil {
 		for {

@@ -23,7 +23,9 @@ type unackedReleaseGate struct{}
 
 func (unackedReleaseGate) WithFeature(_ context.Context, f capabilities.Feature,
 	_ func(context.Context, capabilities.FeatureGrant) error) error {
-	return status.Errorf(codes.Unavailable, "the first use of %s was not acknowledged by every host in time (host-gone); retry", f)
+	// The real gate's text (health.Checker.awaitReleaseAcks).
+	return status.Errorf(codes.Unavailable, "%s's use is recorded here but not yet acknowledged by host-gone; "+
+		"the write is refused until every host holds the record — retry", f)
 }
 
 func (unackedReleaseGate) FeatureAvailable(capabilities.Feature) bool { return true }

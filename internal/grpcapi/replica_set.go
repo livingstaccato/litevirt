@@ -645,8 +645,13 @@ func promotionManifest(rootDisk, rootReplica, rootTaken, host, origVM, newVM str
 			// and the promoting host is never the one to power off.
 			return "confirming a host powered off would not attach it. " + rerun
 		}
+		// The confirmation is not only for this disk (review PB-m3): with
+		// recovery claims enforced it may let the failover coordinator
+		// recover every workload still recorded on the owner, which the
+		// operator should know before confirming.
 		return fmt.Sprintf("it is attached as-is only once its owner is proven off: once %s is powered off, "+
-			"`lv host fence-confirm %s`, then `lv restart %s`, whose start attaches it. %s", owner, owner, origVM, rerun)
+			"`lv host fence-confirm %s`, then `lv restart %s`, whose start attaches it. The confirmation may also let "+
+			"the failover coordinator recover every workload still recorded on %s. %s", owner, owner, origVM, owner, rerun)
 	}
 	parts := []string{fmt.Sprintf("%s ← %s", rootDisk, rootReplica)}
 	var missing, earlier []string

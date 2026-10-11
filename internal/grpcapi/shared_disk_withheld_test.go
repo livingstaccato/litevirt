@@ -159,3 +159,34 @@ func TestJudgeSharedDiskRows(t *testing.T) {
 		t.Errorf("withheld %v", got)
 	}
 }
+
+// Review PB-m2, end to end: a removed owner whose fence on record would prove
+// it off, but whose fence rows cannot be read, is not proven off. (A
+// host_membership read that fails is pinned in corrosion,
+// TestRemovedHostProvedOff_AReadErrorIsNoProof: here it would refuse the
+// whole promotion earlier, at the host admission, as on main.) The promotion leaves its shared disk unattached and says the owner's
+// state cannot be read; a restart withholds it the same way. Nothing is
+// refused: main never attached the disk.
+//
+// Mutation "a read error is no error" (SharedDiskOwnerProvedOff drops it) —
+// red: the reason no longer says the state cannot be read.
+func TestPromote_AnOwnerWhoseRowsCannotBeReadIsNotProvenOff(t *testing.T) {
+	for _, broken := range []string{"fencing_log"} {
+		t.Run(broken, func(t *testing.T) {
+			s := testServer(t)
+			nfsDisk := nfsPromoteVM(t, s, "") // dead-host has no hosts row
+			recordOwnerFence(t, s, "f1", "ipmi", "fenced", time.Minute)
+			if _, err := s.db.DB().Exec(`ALTER TABLE ` + broken + ` RENAME TO ` + broken + `_gone`); err != nil {
+				t.Fatal(err)
+			}
+			promoteVia(t, s, false, true)
+			assertSharedUnattached(t, s, nfsDisk, "the state of its owner dead-host cannot be read")
+			if _, err := s.RestartVM(adminCtx(), &pb.RestartVMRequest{Name: "db"}); err != nil {
+				t.Fatalf("RestartVM: %v", err)
+			}
+			if xml := s.virt.(*libvirtfake.Fake).DefinedXML("db"); strings.Contains(xml, nfsDisk) {
+				t.Errorf("a restart attached data1 while its owner's rows cannot be read:\n%s", xml)
+			}
+		})
+	}
+}

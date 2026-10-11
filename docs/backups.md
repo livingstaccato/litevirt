@@ -669,7 +669,9 @@ renamed promotion never attaches it: the disk belongs to the original VM.
 Whenever it is not attached the VM is promoted exactly as main promoted it,
 and the partial report names it as shared at its path, with why, and either
 the remedy above (`lv host fence-confirm <host>` once it is powered off, then
-`lv restart <vm>`, and not to re-run the promotion over this one) or, for a
+`lv restart <vm>`, and not to re-run the promotion over this one), with the
+confirmation's side effect: it may also let the failover coordinator recover
+every workload still recorded on that host, or, for a
 renamed promotion, that it belongs to the original and must not be attached
 to the copy.
 

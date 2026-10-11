@@ -122,8 +122,8 @@ func TestFleet_HostRuntime_AStaleDBReaddReadsItsRealReport(t *testing.T) {
 	}
 	// Anti-entropy runs, as it does every minute: it is what spread a retired
 	// row's tombstone over d's own live one. hosts itself is not this test's
-	// subject (the re-admission's reset columns and d's old-database row stay
-	// apart under one clock: see the report); host_runtime must converge.
+	// subject (TestFleet_StaleDBReaddConvergesOnTheReadmission is);
+	// host_runtime must converge.
 	deadline := time.Now().Add(2 * convergeTimeout)
 	for {
 		for _, n := range c.Nodes {

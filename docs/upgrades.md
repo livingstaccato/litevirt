@@ -1146,6 +1146,21 @@ that was removed while it was down and re-added with its data directory
 intact brings its row back on every node with its first boot, even though
 every other node retired the old one when it applied the re-admission.
 
+Its `hosts` row converges too. On its old database the host's own row is
+still live, so its daemon re-records its new certificate serial instead of
+re-admitting, and every write it makes from then on is newer than the
+re-admission, which that host therefore never applies; every other host
+applies the same writes over the re-admission's reset row. The two rows end
+up under one `updated_at` with different content, which used to be an
+unresolved `control_plane` tie for good, with the host keeping the removed
+machine's labels, region, role, fence settings and `grpc_port`. A
+re-admission now records its own time as the row's `created_at`, on every host
+that applies it, and a tie between two `hosts` rows with different
+`created_at` goes to the later one, whole: the re-admitted row, with every
+write the host has made since. Mid-roll this needs at least one host on this
+build to have applied the re-admission; where none did, the tie stays as it
+was on the previous release.
+
 **Rollback.** Both tokens ship in the same build, so a binary rolled back
 below them is below both. It enters WAL quarantine at startup, as below every
 latched token, emits no replicated writes, and cannot decode the

@@ -491,3 +491,76 @@ func TestResolver_HostCapacityPolicyHashUnresolved(t *testing.T) {
 			keepLocal, unresolved, sm.tieUnresolved)
 	}
 }
+
+// TestResolver_HostsLaterIncarnationWins: two live hosts rows under one
+// updated_at whose created_at differ are two incarnations — a machine's stale
+// database against the re-admission (host_readmit.go, THE INCARNATION). The
+// later created_at wins whole, from either side, even where a control-plane
+// column differs; an equal created_at still leaves such a tie unresolved.
+func TestResolver_HostsLaterIncarnationWins(t *testing.T) {
+	cols := []string{"name", "grpc_port", "labels", "created_at", "deleted_at", "updated_at"}
+	stale := []interface{}{"h1", "17443", `{"gpu":"a100"}`, "2026-09-01T10:00:00Z", nil, "T"}
+	readmitted := []interface{}{"h1", "7443", nil, "2026-10-11T09:00:00.250000000Z", nil, "T"}
+
+	_, sm, keepLocal, unresolved := resolve(t, "hosts", cols, stale, readmitted)
+	if keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/timestamp_max/incoming" {
+		t.Fatalf("the stale incarnation must take the re-admitted row, got keepLocal=%v unresolved=%v breaks=%v",
+			keepLocal, unresolved, sm.tieBreaks)
+	}
+	_, sm, keepLocal, unresolved = resolve(t, "hosts", cols, readmitted, stale)
+	if !keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "hosts/timestamp_max/local" {
+		t.Fatalf("the re-admitted row must keep itself, got keepLocal=%v unresolved=%v breaks=%v",
+			keepLocal, unresolved, sm.tieBreaks)
+	}
+
+	sameIncarnation := append([]interface{}(nil), readmitted...)
+	sameIncarnation[3] = stale[3]
+	_, sm, keepLocal, unresolved = resolve(t, "hosts", cols, stale, sameIncarnation)
+	if !keepLocal || !unresolved || len(sm.tieUnresolved) != 1 || sm.tieUnresolved[0] != "hosts/ae/control_plane" {
+		t.Fatalf("one incarnation with a differing grpc_port must stay unresolved, got keepLocal=%v unresolved=%v track=%v",
+			keepLocal, unresolved, sm.tieUnresolved)
+	}
+
+	// A tombstone still wins first.
+	deleted := append([]interface{}(nil), stale...)
+	deleted[4] = "2026-10-01T00:00:00Z"
+	_, _, keepLocal, unresolved = resolve(t, "hosts", cols, deleted, readmitted)
+	if !keepLocal || unresolved {
+		t.Fatalf("a one-sided tombstone must still win ahead of the incarnation, got keepLocal=%v unresolved=%v",
+			keepLocal, unresolved)
+	}
+}
+
+// TestResolver_PreviousChainPicksTheSameIncarnation: mid-roll, a node on the
+// previous release resolves a tie between two nodes that both applied the
+// re-admission — one stamped, one did not — by content-max, since nothing
+// else differs. It must pick the row the incarnation rule picks, or the two
+// releases would hold different rows for good.
+func TestResolver_PreviousChainPicksTheSameIncarnation(t *testing.T) {
+	cols := []string{"name", "address", "cert_serial", "created_at", "grpc_port", "labels", "region", "updated_at"}
+	// InsertHost's whole-second form against the stamp's fixed-width one,
+	// days apart and within one second; and two stamps.
+	unstamped := []interface{}{"h1", "10.0.0.15", "0a0b", "2026-09-01T10:00:00Z", "7443", nil, "default", "T"}
+	stamped := []interface{}{"h1", "10.0.0.15", "0a0b", "2026-10-11T09:00:00.250000000Z", "7443", nil, "default", "T"}
+	sameSecond := append([]interface{}(nil), unstamped...)
+	sameSecond[3] = "2026-10-11T09:00:00Z"
+	earlierStamp := append([]interface{}(nil), unstamped...)
+	earlierStamp[3] = "2026-10-11T08:59:59.999999999Z"
+	for _, dir := range []struct {
+		local, incoming []interface{}
+		wantLocal       bool
+	}{
+		{unstamped, stamped, false}, {stamped, unstamped, true},
+		{sameSecond, stamped, false}, {stamped, sameSecond, true},
+		{earlierStamp, stamped, false}, {stamped, earlierStamp, true},
+	} {
+		rv := newRowView(cols, dir.local, dir.incoming)
+		if d := ruleContentMax()(rv); !d.decided || d.unresolved || d.keepLocal != dir.wantLocal {
+			t.Errorf("content-max over local created_at %v: keepLocal=%v, want %v (the stamped row)",
+				dir.local[3], d.keepLocal, dir.wantLocal)
+		}
+		if d := ruleTimestampMax("created_at")(rv); !d.decided || d.keepLocal != dir.wantLocal {
+			t.Errorf("incarnation over local created_at %v: keepLocal=%v, want %v", dir.local[3], d.keepLocal, dir.wantLocal)
+		}
+	}
+}

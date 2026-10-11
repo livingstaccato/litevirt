@@ -450,8 +450,15 @@ var capabilityMap = map[string]tableResolver{
 	// coin-flip could pick a wrong fencing strategy, IPMI target, cert serial,
 	// address/port, role, or schema version. Those differing → unresolved; a tie
 	// in only the benign columns still converges by content-max.
+	//
+	// Two live rows with different created_at are two incarnations of the
+	// host: the later one is the re-admission (host_readmit.go, THE
+	// INCARNATION) and wins whole, ahead of the control-plane carve-out — the
+	// earlier row is a machine's stale database, whose settings the operator's
+	// re-admission reset.
 	"hosts": {category: "host-control-plane", chain: []tieRule{
 		ruleTombstone(),
+		ruleTimestampMax("created_at"),
 		ruleAnyColUnresolved([]string{
 			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
 			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",

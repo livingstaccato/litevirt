@@ -42,9 +42,8 @@ import (
 // before, and keeps the old values until an operator writes them.
 //
 // What is not reset, deliberately:
-//   - created_at: a record of the row, not a setting, and a receiver has no
-//     deterministic value to put there; the new daemon's InsertHost carries its
-//     own;
+//   - created_at is not reset to a default: it becomes the re-admission's
+//     own instant, the row's new incarnation (THE INCARNATION, below);
 //   - isolation_epoch and isolation_reason: a quarantine, kept across
 //     re-admission as AdmitHost's membership write keeps it, and monotone by
 //     contract (isolation.go). host_membership carries nothing else.
@@ -166,6 +165,9 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 				if err := retireHostOwnedRows(ctx, tx, host, ts); err != nil {
 					return fmt.Errorf("reset %s's per-host rows on re-admission: %w", host, err)
 				}
+				if err := stampReadmitIncarnation(ctx, tx, s, host, ts); err != nil {
+					return fmt.Errorf("stamp %s's re-admission: %w", host, err)
+				}
 			}
 		case isHostDelete(s):
 			host, ts, ok = deleteParams(s)
@@ -276,4 +278,59 @@ func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string
 		}
 	}
 	return nil
+}
+
+// THE INCARNATION. A re-admission starts the row over, so the row's created_at
+// becomes the admission's own instant: its updated_at, read as wall time and
+// written in NowTS's fixed-width RFC3339Nano form, so a re-admission within
+// the same second as the row's first insert still orders after it. Like the
+// credential tombstone, it is written locally and never logged, by every node
+// that applies the re-admission, the origin included, and every node derives
+// the same value from the same statement. It is written only where the
+// re-admission itself applied: the row is live, carries the admitted serial
+// and is stamped with the admission's updated_at.
+//
+// It is what lets the hosts tie chain (resolver.go) tell the re-admitted row
+// from the machine's previous incarnation. A host removed while it was down
+// and re-added while its data directory still held the OLD database boots
+// with its own row live there: RegisterHost re-records the new serial instead
+// of re-admitting, and that write, like every later one, is newer than the
+// re-admission, which the machine therefore never applies (its row is live,
+// and newer). Every other node applies the same writes over the re-admission's
+// reset row. Both sides then hold different content under one updated_at, and
+// with grpc_port, role or the fence settings among the differences the chain
+// used to leave the tie unresolved for good: the machine kept the old
+// machine's labels, region, role and fence settings, and nothing but another
+// re-admission could settle it. The two rows now differ in created_at too, and
+// the later one wins whole: the re-admitted row, which also carries every
+// write the machine made since, because every node applied them over it.
+//
+// Nothing changes on the wire. A node on the previous release does not stamp,
+// so where none of the nodes that applied the re-admission stamped, both
+// sides keep the old created_at and the tie stays as it was. Where one did,
+// the previous release's chain reaches content-max over two rows that differ
+// only in created_at (they both applied the re-admission and everything since),
+// and picks the same row this one does: the canonical encoding length-prefixes
+// each value, and the stamp's 30 characters order after InsertHost's 20
+// (whole-second RFC3339), while two stamps, both fixed-width, order as time
+// does.
+//
+// The comparison is between two wall clocks: the old row's created_at was
+// written by whichever node first inserted it, the stamp is the admitting
+// node's. A skew larger than the old machine's whole membership would hand the
+// tie to the stale row, which is the state before this rule.
+func stampReadmitIncarnation(ctx context.Context, tx *sql.Tx, s Statement, host, ts string) error {
+	serial, ok := s.Params[5].(string)
+	if !ok || serial == "" {
+		return nil
+	}
+	at, ok := tsInstant(ts)
+	if !ok {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE hosts SET created_at = ? WHERE name = ? AND updated_at = ? AND deleted_at IS NULL
+			AND lower(cert_serial) = lower(?)`,
+		at.UTC().Format(nowTSLayout), host, ts, serial)
+	return err
 }

@@ -189,3 +189,50 @@ var refusedForTest = errRefusedForTest{}
 type errRefusedForTest struct{}
 
 func (errRefusedForTest) Error() string { return "the cluster upgrade must finish first (test)" }
+
+// The worker's read of the VM's placement as its move ends tells "found it on
+// the target" (the record describes that placement), "found it elsewhere" (it
+// moved again before the read: no record) and "could not read" (the record is
+// built from the row when it is written) apart.
+//
+// Mutation: report a VM found elsewhere as unread - its job falls back to the
+// write-time row.
+func TestDrainRecordJobFor_TellsElsewhereFromUnread(t *testing.T) {
+	ctx := context.Background()
+	s, _ := recordServer(t, map[string]string{"here": "b", "away": "c"})
+	if j := s.drainRecordJobFor(ctx, "here", "a", "b"); j.at == nil || j.movedAgain {
+		t.Fatalf("job for a VM on its target = %+v, want its placement", j)
+	}
+	if j := s.drainRecordJobFor(ctx, "away", "a", "b"); j.at != nil || !j.movedAgain {
+		t.Fatalf("job for a VM found elsewhere = %+v, want it marked as moved again", j)
+	}
+	if j := s.drainRecordJobFor(ctx, "missing", "a", "b"); j.at != nil || j.movedAgain {
+		t.Fatalf("job for a VM whose row could not be read = %+v, want neither", j)
+	}
+}
+
+// A VM the drain's worker found elsewhere, or whose placement has changed
+// since the drain's move, gets no record even though it is back on the
+// target when the record would be written; and its events say why, so an
+// operator reading them after `undrain --failback` sees why it stayed.
+//
+// Mutations: ignore movedAgain - the record is written from the write-time
+// row; drop the event - nothing on the VM's events.
+func TestDrainRecords_AVMMovedAgainGetsNoRecordAndAnEvent(t *testing.T) {
+	ctx := context.Background()
+	s, g := recordServer(t, map[string]string{"v1": "b", "v2": "b"})
+	s.recordDrainOriginBounded(ctx, drainRecordJob{vm: "v1", from: "a", to: "b", movedAgain: true})
+	stale := &drainPlacement{epoch: 41, gen: 7}
+	s.recordDrainOriginBounded(ctx, drainRecordJob{vm: "v2", from: "a", to: "b", at: stale})
+	if vms := recordedVMs(t, s, "a"); len(vms) != 0 {
+		t.Fatalf("records = %v, want none for VMs moved again", vms)
+	}
+	if n := g.called(); n != 0 {
+		t.Fatalf("the gate was asked %d times for VMs that get no record", n)
+	}
+	for _, vm := range []string{"v1", "v2"} {
+		if !failbackEvent(t, s, vm, "moved again since the drain moved it") {
+			t.Errorf("%s's events do not say why it got no record", vm)
+		}
+	}
+}

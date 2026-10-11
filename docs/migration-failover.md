@@ -408,8 +408,11 @@ The records may land a moment after the drain returns, so stopping the daemon
 at once can lose them: a stopping daemon waits up to 3 seconds for the records
 still queued, then gives up on the rest, logs each VM whose record it
 abandoned at Warn and puts it on the VM's events (`vm.failback`). Those VMs are
-not failed back. A record describes the drain's own move: a VM moved again
-(say out and back by hand) before its record was written gets none.
+not failed back. A record describes the drain's own move, read as the move
+finishes: a VM moved again (say out and back by hand) before its record was
+written gets none, and its events say so (`vm.failback`). Only if that read
+fails (the host's replica cannot be read) is the record built from the VM's
+row at the moment it is written.
 
 A VM returns only while its record still describes it exactly. One that an
 operator has since moved by hand, that a failover recovered, that was deleted

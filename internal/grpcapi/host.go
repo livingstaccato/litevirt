@@ -445,12 +445,12 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		parallel = 2
 	}
 
-	// at is the placement a finished move left the VM with, read by the
-	// worker as the move ends: its drain record describes this move, not a
-	// later one made while the record waits behind the release gate.
+	// record is the drain record job of a finished move, with the placement
+	// the worker read as the move ended: the record describes this move, not a
+	// later one made while it waits behind the release gate.
 	type drainResult struct {
 		progress *pb.DrainProgress
-		at       *drainPlacement
+		record   drainRecordJob
 	}
 	jobs := make(chan drainJob, len(drainJobs))
 	results := make(chan drainResult, len(drainJobs))
@@ -460,11 +460,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		go func() {
 			for job := range jobs {
 				progress := s.drainOneVM(ctx, job.vm, job.target)
-				var at *drainPlacement
+				var record drainRecordJob
 				if progress.Status == "done" && progress.Error == "" {
-					at = s.drainPlacementOf(ctx, progress.VmName, progress.TargetHost)
+					record = s.drainRecordJobFor(ctx, progress.VmName, req.Name, progress.TargetHost)
 				}
-				results <- drainResult{progress, at}
+				results <- drainResult{progress, record}
 			}
 		}()
 	}
@@ -498,7 +498,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		}
 		serr := stream.Send(progress)
 		if record {
-			addRecord(drainRecordJob{vm: progress.VmName, from: req.Name, to: progress.TargetHost, at: res.at})
+			addRecord(res.record)
 		}
 		if serr != nil {
 			return serr

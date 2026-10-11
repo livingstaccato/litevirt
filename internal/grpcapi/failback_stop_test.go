@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -92,5 +94,71 @@ func TestDrainRecords_AStopWaitsForRecordsThatLand(t *testing.T) {
 	}
 	if vms := recordedVMs(t, s, "a"); len(vms) != 2 {
 		t.Fatalf("records = %v, want v1 and v2", vms)
+	}
+}
+
+// Once a stop has begun, no recorder starts (no WaitGroup Add can run beside
+// the stop's Wait), and a record offered after the stop gave up - by a drain
+// that began after it, or by one whose recorder it abandoned - is named on the
+// spot: Warn and a vm.failback event, never a silent drop. Run under -race,
+// drains start concurrently with the stop.
+//
+// Mutations: let startDrainRecords start a recorder after the stop - late's
+// record is dropped silently (and -race may flag Add beside Wait); enqueue a
+// record offered after the stop gave up - after's record is dropped silently.
+func TestDrainRecords_ARecordOfferedAfterTheStopIsNamed(t *testing.T) {
+	t.Cleanup(SetDrainRecordTimingForTest(30*time.Second, time.Minute))
+	vms := map[string]string{"first": "b", "after": "b", "late": "b"}
+	for i := 0; i < 8; i++ {
+		vms[fmt.Sprintf("c%d", i)] = "b"
+	}
+	s, g := recordServer(t, vms)
+	entered := make(chan struct{}, 1)
+	g.fn = func(ctx context.Context, call int) error {
+		if call == 1 {
+			entered <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
+	add, done := s.startDrainRecords(context.Background(), 2)
+	add(drainRecordJob{vm: "first", from: "a", to: "b"})
+	<-entered
+
+	// Drains racing the stop: each record either lands, or is named.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a, d := s.startDrainRecords(context.Background(), 1)
+			a(drainRecordJob{vm: fmt.Sprintf("c%d", i), from: "a", to: "b"})
+			d()
+		}()
+	}
+	named := s.FinishDrainRecords(100 * time.Millisecond)
+	wg.Wait()
+	if !slices.Contains(named, "first") {
+		t.Fatalf("named = %v, want first", named)
+	}
+
+	add(drainRecordJob{vm: "after", from: "a", to: "b"})
+	done()
+	la, ld := s.startDrainRecords(context.Background(), 1)
+	la(drainRecordJob{vm: "late", from: "a", to: "b"})
+	ld()
+	for _, vm := range []string{"after", "late"} {
+		if !failbackEvent(t, s, vm, "the daemon stopped") {
+			t.Errorf("%s, offered after the stop, is not on its events", vm)
+		}
+	}
+	s.WaitDrainRecordsForTest()
+	recorded := recordedVMs(t, s, "a")
+	for i := 0; i < 8; i++ {
+		vm := fmt.Sprintf("c%d", i)
+		if !slices.Contains(recorded, vm) && !failbackEvent(t, s, vm, "the daemon stopped") {
+			t.Errorf("%s was neither recorded nor named", vm)
+		}
 	}
 }

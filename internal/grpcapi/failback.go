@@ -200,11 +200,12 @@ func (s *Server) failbackFeatureGate(_ context.Context) error {
 // is available (a local read): until then failback is unavailable for that VM,
 // the safe direction, and the drain itself is never refused.
 //
-// The record describes the drain's move: j.at, read when the move finished,
-// when the worker could read it. A VM that has moved again since (out and back
-// by hand, say) no longer has that placement, and gets no record: one built
-// from its current row would describe the operator's placement, and a failback
-// would take it back.
+// The record describes the drain's move: j.at, read when the move finished
+// (drainRecordJobFor). A VM that has moved again since (out and back by hand,
+// say), or that the worker already found elsewhere, gets no record, and its
+// events say so: one built from its current row would describe the operator's
+// placement, and a failback would take it back. Only when that read failed is
+// the record built from the VM's row as it is written.
 func (s *Server) drainOriginOf(ctx context.Context, j drainRecordJob) (corrosion.DrainOrigin, bool) {
 	if s.failbackFeatureGate(ctx) != nil {
 		slog.Info("drain: not recorded for failback: the upgrade has not finished on every host", "vm", j.vm)
@@ -219,8 +220,10 @@ func (s *Server) drainOriginOf(ctx context.Context, j drainRecordJob) (corrosion
 		return corrosion.DrainOrigin{}, false
 	}
 	now := drainPlacement{epoch: vm.OwnerEpoch, createdAt: vm.CreatedAt, gen: gen}
-	if j.at != nil && *j.at != now {
+	if j.movedAgain || (j.at != nil && *j.at != now) {
+		detail := fmt.Sprintf("drain of %s: not recorded for failback: it has moved again since the drain moved it to %s, so it is not failed back", j.from, j.to)
 		slog.Info("drain: not recorded for failback: the VM has moved again since the drain moved it", "vm", j.vm, "to", j.to)
+		s.recordVMEvent(ctx, j.vm, "vm.failback", "ok", detail)
 		return corrosion.DrainOrigin{}, false
 	}
 	return corrosion.DrainOrigin{VM: j.vm, From: j.from, To: j.to, Epoch: now.epoch, CreatedAt: now.createdAt, Gen: now.gen}, true
@@ -267,6 +270,10 @@ type drainRecorder struct {
 	seq     uint64
 	stopCtx context.Context
 	stop    context.CancelFunc
+	// closed is set when a stop begins: no recorder starts after it, so no
+	// wg.Add runs beside the stop's wg.Wait. stopped is set when the stop
+	// gives up: a record offered after it is named at once, not queued.
+	closed, stopped bool
 }
 
 // drainPlacement is a VM's ownership epoch, creation time and placement
@@ -279,11 +286,12 @@ type drainPlacement struct {
 
 type drainRecordJob struct {
 	vm, from, to string
-	// at is the VM's placement read when its move finished; nil when that read
-	// did not find it on to, and the record is then built from its row when
-	// it is written.
-	at *drainPlacement
-	id uint64
+	// at is the VM's placement read when its move finished. movedAgain says
+	// that read found it on another host than to. Neither is set when the read
+	// failed, and the record is then built from its row when it is written.
+	at         *drainPlacement
+	movedAgain bool
+	id         uint64
 }
 
 // stopping is the context a stop cancels. Callers hold r.mu.
@@ -312,18 +320,27 @@ func (r *drainRecorder) refused(now time.Time) time.Duration {
 	return backoff
 }
 
-// drainPlacementOf reads the placement a finished drain move left vm with on
-// to, for its record; nil when the move did not leave it there.
-func (s *Server) drainPlacementOf(ctx context.Context, vmName, to string) *drainPlacement {
+// drainRecordJobFor is the record job of a finished drain move of vmName from
+// from to to, with the placement the move left it with, read now. The read
+// does not follow the drain's cancellation (a client that goes away as the
+// move ends), so it fails only when the replica cannot be read.
+func (s *Server) drainRecordJobFor(ctx context.Context, vmName, from, to string) drainRecordJob {
+	j := drainRecordJob{vm: vmName, from: from, to: to}
+	ctx = context.WithoutCancel(ctx)
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
-	if err != nil || vm == nil || vm.HostName != to {
-		return nil
+	if err != nil || vm == nil {
+		return j
+	}
+	if vm.HostName != to {
+		j.movedAgain = true
+		return j
 	}
 	gen, err := corrosion.GetPlacementGen(ctx, s.db, vmName)
 	if err != nil {
-		return nil
+		return j
 	}
-	return &drainPlacement{epoch: vm.OwnerEpoch, createdAt: vm.CreatedAt, gen: gen}
+	j.at = &drainPlacement{epoch: vm.OwnerEpoch, createdAt: vm.CreatedAt, gen: gen}
+	return j
 }
 
 // startDrainRecords starts the recorder of one drain and returns the function
@@ -333,12 +350,17 @@ func (s *Server) drainPlacementOf(ctx context.Context, vmName, to string) *drain
 // (FinishDrainRecords).
 func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(drainRecordJob), done func()) {
 	r := &s.drainRecords
+	r.mu.Lock()
+	if r.closed {
+		// The daemon is stopping: start nothing it would have to wait for.
+		r.mu.Unlock()
+		return s.drainRecordAbandoned, func() {}
+	}
 	q := make(chan drainRecordJob, n)
 	base, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	r.mu.Lock()
 	unhook := context.AfterFunc(r.stopping(), cancel)
+	r.wg.Add(1) // under r.mu, ordered before a stop's closed and its Wait
 	r.mu.Unlock()
-	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
 		defer cancel()
@@ -355,6 +377,11 @@ func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(drainRe
 	var once sync.Once
 	return func(j drainRecordJob) {
 			r.mu.Lock()
+			if r.stopped {
+				r.mu.Unlock()
+				s.drainRecordAbandoned(j)
+				return
+			}
 			r.seq++
 			j.id = r.seq
 			if r.pending == nil {
@@ -384,9 +411,15 @@ func (s *Server) startDrainRecords(ctx context.Context, n int) (add func(drainRe
 // local event, which replicates when the host returns). It returns those VMs.
 // A VM without its record is not failed back; `lv migrate` moves it by hand.
 // An attempt that completes in the instant of the stop may still land: it is
-// then an ordinary record.
+// then an ordinary record. From the moment it is called no recorder starts,
+// and a record offered once it has given up is named at once in the same way
+// (drainRecordAbandoned), so none is dropped silently, even by a drain the
+// forced stop cut short.
 func (s *Server) FinishDrainRecords(wait time.Duration) []string {
 	r := &s.drainRecords
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
 	finished := make(chan struct{})
 	go func() { r.wg.Wait(); close(finished) }()
 	select {
@@ -395,6 +428,7 @@ func (s *Server) FinishDrainRecords(wait time.Duration) []string {
 	case <-time.After(wait):
 	}
 	r.mu.Lock()
+	r.stopped = true
 	r.stopping()
 	r.stop()
 	ids := make([]uint64, 0, len(r.pending))
@@ -412,11 +446,23 @@ func (s *Server) FinishDrainRecords(wait time.Duration) []string {
 	var vms []string
 	for _, j := range jobs {
 		vms = append(vms, j.vm)
-		slog.Warn("daemon stopping: drain record abandoned; the VM is not failed back",
-			"vm", j.vm, "from", j.from, "to", j.to, "waited", wait)
-		s.drainRecordSkipped(ctx, j, "the daemon stopped before it was written")
+		s.drainRecordAbandonedCtx(ctx, j)
 	}
 	return vms
+}
+
+// drainRecordAbandoned names a record the stopping daemon will not write: Warn,
+// and a vm.failback event and audit row (local writes, bounded).
+func (s *Server) drainRecordAbandoned(j drainRecordJob) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s.drainRecordAbandonedCtx(ctx, j)
+}
+
+func (s *Server) drainRecordAbandonedCtx(ctx context.Context, j drainRecordJob) {
+	slog.Warn("daemon stopping: drain record abandoned; the VM is not failed back",
+		"vm", j.vm, "from", j.from, "to", j.to)
+	s.drainRecordSkipped(ctx, j, "the daemon stopped before it was written")
 }
 
 // recordDrainOriginBounded is one record, bounded by drainRecordBudget and

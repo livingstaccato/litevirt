@@ -56,7 +56,7 @@ func applyRuntimeAsReplicated(t *testing.T, c *Client, stmts ...Statement) {
 			t.Fatal(err)
 		}
 	}
-	if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts, c.MayWriteHostRuntime()); err != nil {
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts); err != nil {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
@@ -379,5 +379,50 @@ func TestHostRuntime_ReadmissionRetiresTheOldMachinesRow(t *testing.T) {
 	}
 	if h := hostOf(t, c, "h1"); h.Version != "v-new" || h.CPUTotal == 96 {
 		t.Errorf("GetHost after the new machine's report: %+v; the old machine's totals came back", h)
+	}
+}
+
+// TestHostRuntime_TheAbsorbNeverCreatesARow (review m-1): two latched nodes
+// that hold no host_runtime row for a host, and whose hosts rows disagree on a
+// column the write does not set, apply the same hosts-only report. Neither
+// creates a row: a created row would take that column from its own hosts row
+// under the write's one updated_at, and the two rows would tie on
+// schema_version, which the resolver leaves unresolved. Each reads the report
+// from its hosts columns, and the pass then copies at the floor of its own
+// hosts row's clock.
+func TestHostRuntime_TheAbsorbNeverCreatesARow(t *testing.T) {
+	ctx := context.Background()
+	ts := "2026-06-01T00:00:00.000000001Z"
+	var nodes []*Client
+	for i, sv := range []int{63, 64} {
+		c := newTestDB(t)
+		seedMembershipHosts(t, c, "h1")
+		if err := c.execLocal(ctx, `UPDATE hosts SET schema_version = ? WHERE name = 'h1'`, sv); err != nil {
+			t.Fatal(err)
+		}
+		splitRuntime(t, c)
+		if _, err := c.db.Exec(`DELETE FROM host_runtime WHERE host_name = 'h1'`); err != nil {
+			t.Fatal(err)
+		}
+		applyRuntimeAsReplicated(t, c, Statement{SQL: updateHostVersionSQL, Params: []interface{}{"v-unlatched", ts, "h1"}})
+		if n := oneString(t, c, `SELECT CAST(COUNT(*) AS TEXT) AS n FROM host_runtime WHERE host_name = 'h1'`, "n"); n != "0" {
+			t.Errorf("node %d: the absorb created a host_runtime row with the gate open; two such nodes "+
+				"would hold different schema versions under one updated_at", i)
+		}
+		if h := hostOf(t, c, "h1"); h.Version != "v-unlatched" {
+			t.Errorf("node %d: a host with no row must read the report from hosts: %q", i, h.Version)
+		}
+		nodes = append(nodes, c)
+	}
+	for i, c := range nodes {
+		if _, err := c.SplitHostRuntime(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := runtimeCol(t, c, "h1", "version"); got != "v-unlatched" {
+			t.Errorf("node %d: the pass copy = %q, want the report", i, got)
+		}
+		if got := runtimeCol(t, c, "h1", "updated_at"); lwwOrder(got, "2000-01-01T00:00:00Z") >= 0 {
+			t.Errorf("node %d: the pass copy is stamped %q, not at the floor", i, got)
+		}
 	}
 }

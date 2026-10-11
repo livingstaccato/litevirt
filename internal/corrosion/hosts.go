@@ -732,11 +732,7 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 				// And after the runtime split the report goes to host_runtime
 				// too (host_runtime.go). An empty version keeps the one the
 				// host already has, as the hosts statement's COALESCE does.
-				kind := reportBoot
-				if hasResources {
-					kind = reportBootResources
-				}
-				rt, ok, err := runtimeStatement(ctx, c, name, kind, func(v *runtimeVals) {
+				rt, ok, err := runtimeStatement(ctx, c, name, reportBoot, func(v *runtimeVals) {
 					if version != "" {
 						v.Version = version
 					}

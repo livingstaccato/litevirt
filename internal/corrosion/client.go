@@ -1477,7 +1477,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	}
 	// And a runtime report this node makes to hosts alone updates the
 	// host_runtime row it holds (host_runtime.go).
-	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated, c.MayWriteHostRuntime()); err != nil {
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1652,7 +1652,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 	// And a runtime report this node makes to hosts alone updates the
 	// host_runtime row it holds (host_runtime.go).
-	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated, c.MayWriteHostRuntime()); err != nil {
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, mutated); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

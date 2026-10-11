@@ -25,13 +25,19 @@ func retireRuntime(t *testing.T, n *Node) {
 // waits for every write to be delivered and returns each node's resolved
 // (version, region) of subject, and whether every table, hosts included,
 // converged.
-func concurrentConfigAndReport(t *testing.T, retire bool, seed int64) (map[string][2]string, bool) {
+func concurrentConfigAndReport(t *testing.T, retire, boot bool, seed int64) (map[string][2]string, bool) {
 	t.Helper()
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: seed})
 	a, subject := c.Nodes[0], c.Nodes[2]
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
+		if boot {
+			// The production report: the daemon's boot report, which also
+			// carries the boot state until host_membership_retire_v1 has
+			// latched, so both copies are retired here.
+			retireMembership(t, n)
+		}
 		if retire {
 			retireRuntime(t, n)
 		} else {
@@ -46,7 +52,11 @@ func concurrentConfigAndReport(t *testing.T, retire bool, seed int64) (map[strin
 		t.Fatalf("region change on %s: %v", a.Name, err)
 	}
 	time.Sleep(5 * time.Millisecond) // the report is the newer write on every clock
-	if err := corrosion.UpdateHostVersion(ctx, subject.DB, subject.Name, "v-267-retire"); err != nil {
+	if boot {
+		if err := corrosion.UpdateHostStartup(ctx, subject.DB, subject.Name, "active", "v-267-retire", 32, 65536, 640, true); err != nil {
+			t.Fatalf("boot report on %s: %v", subject.Name, err)
+		}
+	} else if err := corrosion.UpdateHostVersion(ctx, subject.DB, subject.Name, "v-267-retire"); err != nil {
 		t.Fatalf("version report on %s: %v", subject.Name, err)
 	}
 	c.ClearLinkFaults()
@@ -97,7 +107,7 @@ func concurrentConfigAndReport(t *testing.T, retire bool, seed int64) (map[strin
 // clock. It must keep failing to reproduce that, or the second proves nothing.
 func TestFleet_HostRuntimeRetire_AReportNeverCostsAConcurrentConfigChange(t *testing.T) {
 	t.Run("with the hosts copy still written the region change is lost on a replica", func(t *testing.T) {
-		got, _ := concurrentConfigAndReport(t, false, 2677)
+		got, _ := concurrentConfigAndReport(t, false, false, 2677)
 		lost := 0
 		for _, vr := range got {
 			if vr[1] != "eu-267" {
@@ -111,7 +121,7 @@ func TestFleet_HostRuntimeRetire_AReportNeverCostsAConcurrentConfigChange(t *tes
 	})
 
 	t.Run("retired, both survive on every replica and hosts converges", func(t *testing.T) {
-		got, converged := concurrentConfigAndReport(t, true, 2678)
+		got, converged := concurrentConfigAndReport(t, true, false, 2678)
 		for node, vr := range got {
 			if vr[0] != "v-267-retire" || vr[1] != "eu-267" {
 				t.Errorf("%s holds version=%q region=%q, want v-267-retire and eu-267: a host's own "+
@@ -120,6 +130,20 @@ func TestFleet_HostRuntimeRetire_AReportNeverCostsAConcurrentConfigChange(t *tes
 		}
 		if !converged {
 			t.Error("the replicas did not converge: a report still shares the hosts row's clock")
+		}
+	})
+
+	// The daemon's boot report is the production runtime writer (review m-3).
+	t.Run("both copies retired, the boot report never costs it either", func(t *testing.T) {
+		got, converged := concurrentConfigAndReport(t, true, true, 2681)
+		for node, vr := range got {
+			if vr[0] != "v-267-retire" || vr[1] != "eu-267" {
+				t.Errorf("%s holds version=%q region=%q, want v-267-retire and eu-267: the boot report "+
+					"cost the operator's concurrent change", node, vr[0], vr[1])
+			}
+		}
+		if !converged {
+			t.Error("the replicas did not converge: the boot report still shares the hosts row's clock")
 		}
 	})
 }

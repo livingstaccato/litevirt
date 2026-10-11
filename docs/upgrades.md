@@ -1134,6 +1134,18 @@ change and a host's report then never share a clock. The `hosts` columns are
 never cleared; they keep the values they had at the latch. Adding a host and
 re-admitting one still write the whole `hosts` row, as before.
 
+The retire latch repairs nothing that diverged before it. A region or role
+change that a replica refused during the dual-write window, because a newer
+report had moved the `hosts` row's clock, stays refused there: that replica
+holds the old value under the same `updated_at` as one that applied the
+change, and nothing settles the tie until the operator's next write to that
+host. Re-apply such a change once the retire token has latched.
+
+A host's boot report always writes its whole `host_runtime` row, so a host
+that was removed while it was down and re-added with its data directory
+intact brings its row back on every node with its first boot, even though
+every other node retired the old one when it applied the re-admission.
+
 **Rollback.** Both tokens ship in the same build, so a binary rolled back
 below them is below both. It enters WAL quarantine at startup, as below every
 latched token, emits no replicated writes, and cannot decode the
@@ -1143,6 +1155,17 @@ host's version, schema version and totals as they were at the latch — never
 older than the build that latched it, so a newer peer still reads as newer.
 Nothing is lost: `host_runtime` keeps every report, and upgrading the host
 again reads it. Roll forward.
+
+**A host that was switched off across either latch.** Each latch is confirmed
+against the hosts in the cluster's membership at the time; a host that was
+off throughout is not asked. If it runs a build before
+`host_runtime_split_v1`, it holds no marker for either token, the rollback
+preflight does not stop it, and back online it reads every peer's version,
+schema version and totals from the `hosts` columns — current only up to the
+retire latch, frozen after it — and places workloads and gates upgrades on
+them. Its own reports, written to `hosts` alone, are still absorbed by the
+upgraded hosts. Upgrade such a host to this build before you power it on
+again.
 
 ### An unverified fence records `offline` after the roll
 

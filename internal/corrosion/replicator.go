@@ -1426,7 +1426,7 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		// A runtime report written to hosts alone, by a node that was not
 		// writing host_runtime yet, is absorbed into it here, locally
 		// (host_runtime.go). Back-pressured on failure, like the other absorbs.
-		if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts, r.client.MayWriteHostRuntime()); err != nil {
+		if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts); err != nil {
 			_ = tx.Rollback()
 			slog.Error("replicator: absorbing an unlatched runtime write failed — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)

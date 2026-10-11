@@ -246,29 +246,28 @@ func currentRuntime(ctx context.Context, c *Client, host string) (row runtimeRow
 // never carries a stale copy of the totals over a newer resource report.
 const (
 	// hostRuntimeUpsertSQL writes every column and revives a retired row: the
-	// pass's copy, a host created by a live InsertHost, and a live writer
-	// whose own row is missing or retired (a re-admitted machine's first
-	// report).
+	// pass's copy, a host created by a live InsertHost, every boot report,
+	// and a live writer whose own row is missing or retired here.
+	//
+	// THE BOOT REPORT IS ALWAYS THIS FULL FORM (review I-1). A host removed
+	// while it was down and re-added with its old data directory still holds
+	// its own row live, while every other node retired it on the
+	// re-admission. A partial upsert leaves deleted_at alone, so it would
+	// apply on those nodes and leave the row retired — and anti-entropy, at
+	// equal updated_at, keeps the tombstone, spreading it back to the host
+	// itself. With host_runtime_retire_v1 latched nothing else carries the
+	// report, and every node would read the re-admission's reset hosts
+	// columns until the daemon next restarted. The boot report carries every
+	// column it reports, from the host's own resolved view (the host is its
+	// row's only writer), and a newer report than the re-admission's retire
+	// is by construction made after it. Liveness of host_runtime decides
+	// nothing about membership: readers join it only to a live hosts row.
 	hostRuntimeUpsertSQL = `INSERT INTO host_runtime (host_name, version, schema_version, cpu_total, mem_total, disk_total,
 			capacity_policy_hash, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
 		 ON CONFLICT(host_name) DO UPDATE SET version = excluded.version, schema_version = excluded.schema_version,
 		   cpu_total = excluded.cpu_total, mem_total = excluded.mem_total, disk_total = excluded.disk_total,
 		   capacity_policy_hash = excluded.capacity_policy_hash, updated_at = excluded.updated_at, deleted_at = NULL`
-	// hostRuntimeReportSQL is the boot report without resources: version and
-	// schema version.
-	hostRuntimeReportSQL = `INSERT INTO host_runtime (host_name, version, schema_version, cpu_total, mem_total, disk_total,
-			capacity_policy_hash, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-		 ON CONFLICT(host_name) DO UPDATE SET version = excluded.version, schema_version = excluded.schema_version,
-		   updated_at = excluded.updated_at`
-	// hostRuntimeReportResourcesSQL is the boot report with resources.
-	hostRuntimeReportResourcesSQL = `INSERT INTO host_runtime (host_name, version, schema_version, cpu_total, mem_total, disk_total,
-			capacity_policy_hash, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-		 ON CONFLICT(host_name) DO UPDATE SET version = excluded.version, schema_version = excluded.schema_version,
-		   cpu_total = excluded.cpu_total, mem_total = excluded.mem_total, disk_total = excluded.disk_total,
-		   updated_at = excluded.updated_at`
 	// hostRuntimeVersionSQL is a version report alone (UpdateHostVersion).
 	hostRuntimeVersionSQL = `INSERT INTO host_runtime (host_name, version, schema_version, cpu_total, mem_total, disk_total,
 			capacity_policy_hash, updated_at, deleted_at)
@@ -294,13 +293,14 @@ type runtimeReport int
 const (
 	reportVersion runtimeReport = iota
 	reportResources
+	// reportBoot is the boot report: always the full upsert (see
+	// hostRuntimeUpsertSQL).
 	reportBoot
-	reportBootResources
 )
 
 // runtimeStatement is a live runtime writer's host_runtime statement: the
-// partial upsert of kind for a host whose live row this node holds, and the
-// full one — every column from the resolved view, which already carries the
+// partial upsert of a version or resource report for a host whose live row
+// this node holds, and the full one for a boot report, or — every column from the resolved view, which already carries the
 // report — for a host whose row is missing or retired here, so a re-admitted
 // machine's first report brings the whole row back rather than reviving the
 // old machine's totals beside its own version. ok is false when the host has
@@ -314,7 +314,7 @@ func runtimeStatement(ctx context.Context, c *Client, host string, kind runtimeR
 	next := cur.resolve()
 	apply(&next)
 	params := runtimeParams(host, next, updatedAt)
-	if !cur.present {
+	if !cur.present || kind == reportBoot {
 		return Statement{SQL: hostRuntimeUpsertSQL, Params: params}, true, nil
 	}
 	switch kind {
@@ -322,10 +322,6 @@ func runtimeStatement(ctx context.Context, c *Client, host string, kind runtimeR
 		return Statement{SQL: hostRuntimeVersionSQL, Params: params}, true, nil
 	case reportResources:
 		return Statement{SQL: hostRuntimeResourcesSQL, Params: params}, true, nil
-	case reportBoot:
-		return Statement{SQL: hostRuntimeReportSQL, Params: params}, true, nil
-	case reportBootResources:
-		return Statement{SQL: hostRuntimeReportResourcesSQL, Params: params}, true, nil
 	}
 	return Statement{}, false, fmt.Errorf("host runtime: unknown report kind %d", kind)
 }
@@ -500,40 +496,33 @@ func RuntimeWrite(s Statement) (host, ts string, cols map[string]interface{}, ok
 //
 // A write is taken only for a live hosts row, only when its updated_at is
 // newer than the host_runtime row's, and the row takes the write's own
-// updated_at. mayInsert — this node's host_runtime_split_v1 gate is open —
-// lets it create a missing row, the columns the write did not set taken from
-// the hosts row. With the gate closed it only updates a row this node already
-// holds: such rows exist only because a latched peer wrote them, and this
-// node's readers read them. A retired row (re-admission) is left alone: its
-// readers read the hosts columns, which carry the write.
+// updated_at. It only ever UPDATES a row this node already holds, gate open
+// or closed, and never creates one (review m-1). A created row would take the
+// columns the write did not set from this node's hosts row, stamped with the
+// write's updated_at, and two nodes whose hosts rows differed at that moment
+// would create rows under one clock with different schema_version or
+// capacity_policy_hash — a tie the resolver leaves unresolved. A host with no
+// row reads the hosts columns, which carry the write, until the pass copies
+// them at the floor timestamp, the same on every node that copies the same
+// hosts row. A retired row (re-admission) is left alone for the same reason.
 //
 // An error is returned, never swallowed; the caller fails the write, as for
 // the membership absorb.
-func absorbUnlatchedRuntimeWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool) error {
+func absorbUnlatchedRuntimeWrite(ctx context.Context, tx *sql.Tx, stmts []Statement) error {
 	for _, w := range unlatchedRuntimeWrites(stmts) {
-		if err := absorbRuntimeWrite(ctx, tx, w, w.ts, mayInsert); err != nil {
+		if err := absorbRuntimeWrite(ctx, tx, w, w.ts); err != nil {
 			return fmt.Errorf("absorb hosts-only runtime write for %s: %w", w.host, err)
 		}
 	}
 	return nil
 }
 
-// absorbRuntimeInsertSQL creates an absorbed row. Local only: run inside the
-// write's transaction and never logged, as every node computes the same row
-// from the same entry and anti-entropy carries it to one that missed it.
-const absorbRuntimeInsertSQL = `INSERT INTO host_runtime (host_name, version, schema_version, cpu_total, mem_total,
-		disk_total, capacity_policy_hash, updated_at, deleted_at)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
-
 // absorbRuntimeWrite writes one absorbed write, LWW-gated on updatedAt. It
 // takes updatedAt from its caller because an absorbed row carries the WRITE's
 // own updated_at, never a fresh clock: every node must compute the same row.
-func absorbRuntimeWrite(ctx context.Context, tx *sql.Tx, w unlatchedRuntimeWrite, updatedAt string, mayInsert bool) error {
-	var hv runtimeVals
-	err := tx.QueryRowContext(ctx,
-		`SELECT COALESCE(version, ''), schema_version, cpu_total, mem_total, disk_total, capacity_policy_hash
-		   FROM hosts WHERE name = ? AND deleted_at IS NULL`,
-		w.host).Scan(&hv.Version, &hv.SchemaVersion, &hv.CPU, &hv.Mem, &hv.Disk, &hv.PolicyHash)
+func absorbRuntimeWrite(ctx context.Context, tx *sql.Tx, w unlatchedRuntimeWrite, updatedAt string) error {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM hosts WHERE name = ? AND deleted_at IS NULL`, w.host).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // no live host: nothing a live writer would record either
 	}
@@ -545,13 +534,7 @@ func absorbRuntimeWrite(ctx context.Context, tx *sql.Tx, w unlatchedRuntimeWrite
 	err = tx.QueryRowContext(ctx, `SELECT updated_at, deleted_at FROM host_runtime WHERE host_name = ?`, w.host).Scan(&rowTS, &rowDeleted)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if !mayInsert {
-			return nil
-		}
-		v := hv
-		applyRuntimeCols(&v, w.cols)
-		_, err = tx.ExecContext(ctx, absorbRuntimeInsertSQL, runtimeParams(w.host, v, updatedAt)...)
-		return err
+		return nil // never created here: the pass copies it at the floor
 	case err != nil:
 		return err
 	case rowDeleted.Valid:
@@ -571,27 +554,6 @@ func absorbRuntimeWrite(ctx context.Context, tx *sql.Tx, w unlatchedRuntimeWrite
 	args = append(args, updatedAt, w.host)
 	_, err = tx.ExecContext(ctx, `UPDATE host_runtime SET `+strings.Join(sets, ", ")+` WHERE host_name = ?`, args...)
 	return err
-}
-
-// applyRuntimeCols overlays an absorbed write's columns on v.
-func applyRuntimeCols(v *runtimeVals, cols map[string]interface{}) {
-	for col, x := range cols {
-		switch col {
-		case "version":
-			v.Version = coerceString(x)
-		case "schema_version":
-			n, _ := coerceInt64OK(x)
-			v.SchemaVersion = n
-		case "cpu_total":
-			v.CPU = nullFrom(x)
-		case "mem_total":
-			v.Mem = nullFrom(x)
-		case "disk_total":
-			v.Disk = nullFrom(x)
-		case "capacity_policy_hash":
-			v.PolicyHash = coerceString(x)
-		}
-	}
 }
 
 // ── the pass ────────────────────────────────────────────────────────────────

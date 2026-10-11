@@ -185,3 +185,40 @@ func TestCheck_StandbyDiskIsUnknownWithDeviceNameID(t *testing.T) {
 		t.Errorf("standby disk = %+v", r.Disks)
 	}
 }
+
+// smartctl prints model_name and serial_number only for the information
+// section (-i, or -a / -x which include it). `-H -A` alone gives the health
+// verdict and the attribute table and no identity, so a scan that does not ask
+// for it never sets the model label or the serial-based disk ID. This runner
+// behaves that way, with the real NVMe values read on a lab node.
+func TestCheck_AsksForTheIdentitySection(t *testing.T) {
+	const health = `{"smart_support":{"available":true,"enabled":true},"smart_status":{"passed":true},
+"nvme_smart_health_information_log":{"critical_warning":0}}`
+	const withInfo = `{"model_name":"QEMU NVMe Ctrl","serial_number":"lvnvme0","smart_support":{"available":true,"enabled":true},"smart_status":{"passed":true},
+"nvme_smart_health_information_log":{"critical_warning":0}}`
+	run := func(ctx context.Context, args ...string) ([]byte, error) {
+		if args[0] == "--scan" {
+			return []byte(`{"devices":[{"name":"/dev/nvme0","type":"nvme"}]}`), nil
+		}
+		for _, a := range args {
+			if a == "-i" || a == "-a" || a == "-x" || a == "--info" || a == "--all" {
+				return []byte(withInfo), nil
+			}
+		}
+		return []byte(health), nil
+	}
+	r := Check(context.Background(), run)
+	if len(r.Disks) != 1 {
+		t.Fatalf("disks = %+v", r.Disks)
+	}
+	d := r.Disks[0]
+	if d.Model != "QEMU NVMe Ctrl" {
+		t.Errorf("model = %q, want %q: the scan never asked smartctl for the information section", d.Model, "QEMU NVMe Ctrl")
+	}
+	if d.ID != "serial:lvnvme0" {
+		t.Errorf("id = %q, want serial:lvnvme0", d.ID)
+	}
+	if d.Status != OK {
+		t.Errorf("status = %v, want ok", d.Status)
+	}
+}

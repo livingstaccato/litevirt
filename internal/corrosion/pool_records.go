@@ -41,6 +41,7 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -229,6 +230,47 @@ func GetLUNResolved(ctx context.Context, c *Client, lun string) (int64, error) {
 		return 0, nil // unreadable: no checkpoint, the walk starts at 0
 	}
 	return g, nil
+}
+
+// lunPlainDeleteKeyPrefix keys, in cluster_policies, the latest incarnation
+// (its created_at) of a VM on the LUN deleted by a plain delete — not as
+// part of a rebuild or recreate. A kept moved allocation that replaced that
+// incarnation or an earlier one is void: its VM was deleted, so the LUN is no
+// longer that VM's disk to take over (grpcapi keptForVM).
+const lunPlainDeleteKeyPrefix = "lun_plain_delete/"
+
+// GetLUNPlainDelete is the created_at recorded for lun's latest plain
+// delete in this replica, "" when none.
+func GetLUNPlainDelete(ctx context.Context, c *Client, lun string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`, lunPlainDeleteKeyPrefix+lun)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("value"), nil
+}
+
+// RecordLUNPlainDelete records a plain delete of the incarnation created at
+// createdAt of a VM whose disk is lun. It keeps the latest: an earlier
+// incarnation never moves it back. A cluster that may not write
+// cluster_policies yet records nothing (it has no kept allocations either:
+// LUN claims open only after it can).
+func RecordLUNPlainDelete(ctx context.Context, c *Client, lun, createdAt, setBy string) error {
+	if !c.MayWriteClusterPolicy() || createdAt == "" {
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return fmt.Errorf("incarnation time %q: %w", createdAt, err)
+	}
+	cur, err := GetLUNPlainDelete(ctx, c, lun)
+	if err != nil {
+		return err
+	}
+	if prev, perr := time.Parse(time.RFC3339Nano, cur); perr == nil && !at.After(prev) {
+		return nil
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, lunPlainDeleteKeyPrefix+lun, createdAt, setBy, c.NowTS())
 }
 
 // AdvanceLUNResolved moves the LUN's checkpoint forward to g. It never moves

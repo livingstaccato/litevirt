@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/storage"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // A root disk from an image on an iscsi pool.
@@ -422,7 +423,12 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	decided := map[string]int64{}
 	for _, u := range uses {
 		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: vmID, VMName: cur.Name,
-			Disk: u.disk, Host: s.hostName, RunHost: moved, Kept: lunKeptAcross(spec, rep, u)}
+			Disk: u.disk, Host: s.hostName, RunHost: moved}
+		if lunKeptAcross(spec, rep, u) {
+			// The keep is bound to the VM's project and to the incarnation
+			// this re-create replaces (keptForVM; re-review 5, R-1).
+			mine.Kept, mine.Project, mine.ReplacedCreatedAt = true, tenancy.NormalizeProject(cur.Project), cur.CreatedAt
+		}
 		g, _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID, token, false)
 		if err != nil {
 			return ctx, noop, err

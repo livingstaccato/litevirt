@@ -53,6 +53,8 @@ func TestLUNClaimValue_Digest(t *testing.T) {
 		func(l *LUNAllocation) { l.VMName = "db" },
 		func(l *LUNAllocation) { l.RunHost = "c" },
 		func(l *LUNAllocation) { l.Kept = true },
+		func(l *LUNAllocation) { l.Kept, l.Project = true, "p2" },
+		func(l *LUNAllocation) { l.Kept, l.ReplacedCreatedAt = true, "2026-01-01T00:00:00Z" },
 	} {
 		b := lunValue(0, "c1", "web")
 		mut(b.LUN)
@@ -66,6 +68,22 @@ func TestLUNClaimValue_Digest(t *testing.T) {
 	kept.LUN.Kept, spelled.LUN.RunHost = true, "kept"
 	if dk, _ := kept.Digest(); func() bool { ds, _ := spelled.Digest(); return ds == dk }() {
 		t.Error("a RunHost of \"kept\" digests like Kept")
+	}
+	// A kept allocation's project and replaced incarnation are each part of
+	// what is decided.
+	keptBase := lunValue(0, "c1", "web")
+	keptBase.LUN.Kept = true
+	dkb, _ := keptBase.Digest()
+	for _, mut := range []func(*LUNAllocation){
+		func(l *LUNAllocation) { l.Project = "p2" },
+		func(l *LUNAllocation) { l.ReplacedCreatedAt = "2026-01-01T00:00:00Z" },
+	} {
+		b := lunValue(0, "c1", "web")
+		b.LUN.Kept = true
+		mut(b.LUN)
+		if db, _ := b.Digest(); db == dkb {
+			t.Errorf("%+v digests like %+v", b.LUN, keptBase.LUN)
+		}
 	}
 	mixed := lunValue(0, "c1", "web")
 	mixed.Proof = &ActionProof{ID: "p"}

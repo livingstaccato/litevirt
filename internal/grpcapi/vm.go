@@ -2074,6 +2074,37 @@ func deleteLocalOnly(ctx context.Context) bool {
 }
 
 func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	// A plain delete — not a rebuild's or recreate's teardown, not a peer's
+	// forward or probe of one — ends the VM's claim to its iSCSI LUNs'
+	// contents: once it succeeds, it is recorded on each LUN, which voids a
+	// kept allocation of the VM (keptForVM; re-review 5, R-1). Recorded on
+	// the entry host, which knows what the delete is for.
+	var luns []string
+	var createdAt string
+	if !deleteLocalOnly(ctx) && !s.isRemotePeer(ctx) && !isRecreateDelete(ctx) {
+		if vm, err := corrosion.GetVM(ctx, s.db, req.Name); err == nil && vm != nil {
+			createdAt = vm.CreatedAt
+			if disks, err := corrosion.VMIncarnationDisks(ctx, s.db, vm.Name, vm.CreatedAt); err == nil {
+				for _, d := range disks {
+					if k, ok := storage.FixedDeviceKeyOfPath(d.Path); ok {
+						luns = append(luns, k)
+					}
+				}
+			}
+		}
+	}
+	out, err := s.deleteVM(ctx, req)
+	if err == nil {
+		for _, k := range luns {
+			if rerr := corrosion.RecordLUNPlainDelete(context.WithoutCancel(ctx), s.db, k, createdAt, s.hostName); rerr != nil {
+				slog.Warn("iSCSI LUN: could not record a VM's delete on its LUN", "vm", req.Name, "lun", k, "error", rerr)
+			}
+		}
+	}
+	return out, err
+}
+
+func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}

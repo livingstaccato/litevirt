@@ -118,6 +118,13 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 // the forwarding DeleteVM puts in its own caller's sink. An owner on an older
 // build reports nothing; the caller then falls back to its own copy.
 
+// isRecreateDelete reports whether ctx is a rebuild's or recreate's delete
+// of the VM it re-creates (it carries a deleted-VM sink).
+func isRecreateDelete(ctx context.Context) bool {
+	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok
+}
+
 // deletedVMSinkKey carries a *deletedVMSink in a context.
 type deletedVMSinkKey struct{}
 
@@ -388,8 +395,8 @@ func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VM
 
 // lunRecoveryHint is how a VM whose re-create was torn down and failed gets
 // its iSCSI disks back.
-const lunRecoveryHint = "Its disks on iSCSI LUNs keep the guest's data: create the VM again under the same name on " +
-	"the same pools (lv compose up, or lv run) and it takes them over as they are, with no overwrite — once this " +
+const lunRecoveryHint = "Its disks on iSCSI LUNs keep the guest's data: create the VM again under the same name, in " +
+	"the same project, on the same pools (lv compose up, or lv run) and it takes them over as they are, with no overwrite — once this " +
 	"re-create's hold on them is released, normally within seconds."
 
 // recreateKeepMax and recreateKeepMaxAge bound <data_dir>/recreate-failed/:

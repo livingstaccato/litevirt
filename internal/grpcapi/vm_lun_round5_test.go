@@ -486,3 +486,79 @@ func TestRebuildVM_ISCSI_ACommittedRebuildMovesTheCheckpoint(t *testing.T) {
 		t.Fatalf("the rebuild's hold on its own host stands after its rows are here: %v", toks)
 	}
 }
+
+// requireNotBlank asserts err is the refusal of an image root on a LUN that
+// holds data.
+func requireNotBlank(t *testing.T, err error, what string) {
+	t.Helper()
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "not blank") {
+		t.Fatalf("%s: got %v, want FailedPrecondition, not blank", what, err)
+	}
+}
+
+// R-1: a kept LUN is its VM's own disk only within the VM's project. VM names
+// are cluster-wide, so another project may create a VM of the same name once
+// the first is gone: it meets a LUN holding data, as any other create does.
+//
+// Mutation: drop the project check from keptForVM — p2's VM boots a's disk
+// and this goes red.
+func TestRecreate_ISCSI_AKeptLUNIsNotAnotherProjectsByTheName(t *testing.T) {
+	s, d, dev := tornDownRecreate(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "p2"}); err != nil {
+		t.Fatal(err)
+	}
+	req := lunImageVM("a", "lun0", false)
+	req.Spec.Project = "p2"
+	_, err := s.CreateVM(ctx, req)
+	requireNotBlank(t, err, "another project's VM of the same name on a's kept LUN")
+	if len(d.writes) != 1 || !guestDataIntact(t, d, dev) {
+		t.Errorf("writes = %v: p2's create touched a's guest", d.writes)
+	}
+}
+
+// R-1: a plain delete ends the VM's claim to its LUN's contents, whatever
+// moved the claim before: after a rebuild that committed, or a recreate
+// refused at its delete, a VM of the same name created later — even in the
+// same project — meets a LUN holding data.
+//
+// Mutation: record no plain delete — the kept allocation of the rebuild
+// (or of the refused recreate) hands the new a the old disk and this goes
+// red. Mutation: void only a delete of a LATER incarnation — the refused
+// recreate's subtest goes red.
+func TestCreateVM_ISCSI_APlainDeleteVoidsAKeptLUN(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		moved func(t *testing.T, s *Server)
+	}{
+		{"after a committed rebuild", func(t *testing.T, s *Server) {
+			if _, err := s.RebuildVM(adminCtx(), &pb.RebuildVMRequest{Name: "a"}); err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+		}},
+		{"after a recreate refused at its delete", func(t *testing.T, s *Server) {
+			barVM(t, s, "a", "op-backup")
+			if err := (&serverOps{s: s}).RecreateVM(adminCtx(), "a", lunImageVM("a", "lun0", false).Spec); err == nil {
+				t.Fatal("the recreate was not refused")
+			}
+			barVM(t, s, "a", "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := lunImageServer(t)
+			d := newLUNDisks(t)
+			dev := d.lun("0", 64<<20)
+			ctx := adminCtx()
+			if _, err := s.CreateVM(ctx, lunImageVM("a", "lun0", false)); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			writeGuestData(t, d, dev)
+			tc.moved(t, s)
+			if _, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "a"}); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			_, err := s.CreateVM(ctx, lunImageVM("a", "lun0", false))
+			requireNotBlank(t, err, "a new a after the old one was deleted")
+		})
+	}
+}

@@ -253,6 +253,12 @@ type LUNAllocation struct {
 	// after it takes the LUN over as it is (the recovery of a re-create torn
 	// down and failed), where any other create meets a LUN holding data.
 	Kept bool `json:"kept,omitempty"`
+	// Project and ReplacedCreatedAt bind a Kept allocation: only a create in
+	// that (canonical) project takes the LUN over, and only while no plain
+	// delete of the VM's incarnation ReplacedCreatedAt, or of a later one, is
+	// recorded on the LUN (GetLUNPlainDelete). Set only with Kept.
+	Project           string `json:"project,omitempty"`
+	ReplacedCreatedAt string `json:"replaced_created_at,omitempty"`
 }
 
 // ClaimValue is what a claim decides. Exactly one of Proof (a workload
@@ -342,11 +348,19 @@ func (v ClaimValue) Digest() (string, error) {
 			// as it always did.
 			claimField(h, l.RunHost)
 		}
-		if l.Kept {
-			// Likewise only on a moved allocation; a field of its own, so a
-			// RunHost of "kept" never digests as Kept.
-			claimField(h, "kept")
-			claimField(h, "1")
+		if l.Kept || l.Project != "" || l.ReplacedCreatedAt != "" {
+			// Only a kept moved allocation has these, so every other value
+			// digests as it always did. One block of four fields: with or
+			// without RunHost (one field), the four field counts differ, so no
+			// spelling of one digests as another.
+			kept := "0"
+			if l.Kept {
+				kept = "1"
+			}
+			claimField(h, "kept-v1")
+			claimField(h, kept)
+			claimField(h, l.Project)
+			claimField(h, l.ReplacedCreatedAt)
 		}
 	case v.Config != nil && v.Proof == nil && v.LUN == nil && v.SourceHost == "":
 		cfg := v.Config

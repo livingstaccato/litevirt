@@ -22,6 +22,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/storage"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // One iSCSI LUN, one disk.
@@ -543,7 +544,8 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 		// it is taken over as it is, never refused for holding data, and
 		// nothing is written over it unless the disk says overwrite
 		// (re-review 4, concern 3).
-		if keptForVM(prev, spec.Name, u) {
+		voidAt, verr := corrosion.GetLUNPlainDelete(ctx, s.db, u.key)
+		if verr == nil && keptForVM(prev, spec.Name, tenancy.NormalizeProject(spec.Project), u, voidAt) {
 			hold.keep[u.key] = true
 			slog.Info("iSCSI LUN: a create of the VM a re-create kept this LUN for takes it over as it is",
 				"vm", spec.Name, "disk", u.disk, "lun", u.device, "after_allocation", prev.Generation)
@@ -555,10 +557,30 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 
 // keptForVM reports whether prev, the allocation decided just before a
 // create's own, is a moved allocation that kept u's LUN as the disk of the
-// VM being created — same name, same disk — and u does not ask to write
-// over it.
-func keptForVM(prev *corrosion.LUNAllocation, vm string, u lunUse) bool {
-	return prev != nil && prev.Kept && prev.VMName == vm && prev.Disk == u.disk && !u.overwrite
+// VM being created — same name, same disk, same (canonical) project — that
+// no plain delete has voided since, and u does not ask to write over it.
+//
+// VM names are cluster-wide and a deleted VM's name is free to any project,
+// so the name alone would hand one project's disk to another (re-review 5,
+// R-1). And a VM deleted gives its LUN up: voidAt is the latest incarnation
+// of a VM on the LUN a plain delete removed (corrosion.GetLUNPlainDelete); a
+// kept allocation replacing that incarnation, or an earlier one, is void.
+func keptForVM(prev *corrosion.LUNAllocation, vm, project string, u lunUse, voidAt string) bool {
+	if prev == nil || !prev.Kept || prev.VMName != vm || prev.Disk != u.disk || u.overwrite {
+		return false
+	}
+	if prev.Project == "" || prev.Project != project || prev.ReplacedCreatedAt == "" {
+		return false
+	}
+	if voidAt == "" {
+		return true
+	}
+	replaced, err1 := time.Parse(time.RFC3339Nano, prev.ReplacedCreatedAt)
+	deleted, err2 := time.Parse(time.RFC3339Nano, voidAt)
+	if err1 != nil || err2 != nil {
+		return false // unreadable: never a keep
+	}
+	return deleted.Before(replaced)
 }
 
 // verifyLUNHold refuses the create of vm unless the host that moved its
@@ -582,7 +604,7 @@ func (s *Server) verifyLUNHold(ctx context.Context, vm string, rep replacedVM, k
 		return status.Errorf(codes.Aborted,
 			"VM %q: %s no longer holds the iSCSI LUN it moved for this re-create — the re-create was given up, "+
 				"and the LUN may since be another VM's; nothing was started. Create the VM again under the same "+
-				"name on the same pools: unless another VM has taken the LUN since, it takes its own disk over as "+
+				"name, in the same project, on the same pools: unless another VM has taken the LUN since, it takes its own disk over as "+
 				"it is, with no overwrite", vm, rep.holdHost)
 	}
 	return nil

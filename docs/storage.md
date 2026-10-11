@@ -855,7 +855,7 @@ only, to re-create the VM from. The directory keeps the newest 50 files and
 none older than 30 days; copy out a spec you still need.
 
 A disk on an iSCSI LUN is not torn down: the LUN keeps the guest's data. Create
-the VM again under the **same name** on the same pools (`lv compose up`, or
+the VM again under the **same name**, in the same project, on the same pools (`lv compose up`, or
 `lv run`) and it takes its own LUN over as it is — nothing is written over it,
 and no `overwrite` is needed, even for a root disk built on an image (see
 [iSCSI: one LUN, one disk](#iscsi-one-lun-one-disk)).
@@ -1174,14 +1174,24 @@ and puts the disk on exactly the storage its claim resolved.
 
 **Re-creating a VM whose re-create was torn down.** If the re-created VM's
 create fails after the teardown (a fault), the LUN keeps the guest's disk, and
-the moved allocation records that it was kept. A create of the **same VM name
-and disk** that takes the LUN next — the documented recovery, `lv compose up`
+the moved allocation records that it was kept, for that VM's project and the
+incarnation it replaced. A create of the **same VM name and disk, in the same
+project**, that takes the LUN next — the documented recovery, `lv compose up`
 or `lv run` with the same pools — takes it over **as it is**: a root disk built
 on an image is not refused for holding data, and nothing is written over it.
-Set `overwrite` on the disk to write the image instead. Only that VM's own
-kept LUN is taken over this way: a VM of another name meets a LUN that holds
-data and needs `overwrite`, as does a VM created after one of the same name
-was **deleted** (a delete gives the LUN up; the new VM is a new disk).
+Set `overwrite` on the disk to write the image instead.
+
+Only that VM's own kept LUN is taken over this way. VM names are cluster-wide,
+so the check is not the name alone:
+
+- a VM of another name, or of the same name in **another project**, meets a
+  LUN that holds data and needs `overwrite`;
+- a VM **deleted** gives the LUN up: a plain delete (`lv rm`, a stack
+  teardown — not a rebuild's or recreate's own teardown) is recorded on each
+  of its LUNs (`lun_plain_delete/<LUN>` in the replicated cluster policies),
+  and a later VM of the same name, even in the same project, is a new disk
+  that needs `overwrite` — whether or not the deleted VM was ever rebuilt or
+  re-created.
 
 The holding host keeps a **durable hold** on the LUN, a record in
 `<data_dir>/iscsi-lun-holds/`: it survives a daemon restart, and nothing

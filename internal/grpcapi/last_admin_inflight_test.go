@@ -82,3 +82,77 @@ func TestLastAdminGuard_FailsClosedWhileAReinstatedCredentialIsInFlight(t *testi
 		wantMessage(t, what+" refusal", err, "lv user reset-admin --user oldops")
 	}
 }
+
+// Before credentials_clear_v1 has latched (and nothing in this database shows
+// a clear), an empty old column can only be a directory admin's: only a clear
+// empties a local one. So an admin this node holds no evidence for — bob, a
+// directory admin first seen on another node mid-rolling-upgrade — counts, and
+// deleting, disabling or expiring the other admin goes through, as on main.
+//
+// Mutation: fail closed on an unjudgeable admin whatever the clear latch (as
+// before this fix) — every case is refused with Unavailable.
+func TestLastAdminGuard_BeforeTheClearADirectoryAdminCounts(t *testing.T) {
+	yes := true
+	never := "2099-01-01T00:00:00Z"
+	for what, call := range map[string]func(s *Server) error{
+		"disable": func(s *Server) error {
+			_, err := s.SetUserAccount(adminCtx(), &pb.SetUserAccountRequest{Username: "alice", Disabled: &yes})
+			return err
+		},
+		"expire": func(s *Server) error {
+			_, err := s.SetUserAccount(adminCtx(), &pb.SetUserAccountRequest{Username: "alice", ExpiresAt: &never})
+			return err
+		},
+		"delete": func(s *Server) error {
+			_, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "alice"})
+			return err
+		},
+	} {
+		for _, split := range []bool{false, true} {
+			s := loginPolicyServer(t)
+			s.db.SetCredentialsSplitGate(func() bool { return split })
+			ctx := context.Background()
+			seedUser(t, s, "alice", "admin", "alice-pw")
+			// bob: a directory admin's row, with no credential row and no
+			// evidence on this node (materialised on another node).
+			if err := corrosion.InsertUser(ctx, s.db, "bob", "admin", ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Execute(ctx, `DELETE FROM user_credentials WHERE username = 'bob'`); err != nil {
+				t.Fatal(err)
+			}
+			if err := call(s); err != nil {
+				t.Errorf("%s of alice beside directory admin bob (split gate %v, clear not latched): %v; want allowed, as on main",
+					what, split, err)
+			}
+		}
+	}
+}
+
+// A peer may latch credentials_clear_v1 first: its cleared rows replicate here
+// before this node's own latch. Such a row (an empty old column beside a live
+// credential) shows a clear has happened, so an admin this node cannot judge
+// is in doubt again and the guard fails closed.
+//
+// Mutation: consult only this node's clear latch — the change goes through.
+func TestLastAdminGuard_APeersClearSeenHereFailsClosed(t *testing.T) {
+	s := loginPolicyServer(t)
+	s.db.SetCredentialsSplitGate(func() bool { return true })
+	ctx := context.Background()
+	seedUser(t, s, "alice", "admin", "alice-pw")
+	seedUser(t, s, "carol", "operator", "carol-pw")
+	// carol's row as a peer that cleared it wrote it.
+	if err := s.db.Execute(ctx, `UPDATE users SET password_hash = '' WHERE username = 'carol'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertUser(ctx, s.db, "bob", "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `DELETE FROM user_credentials WHERE username = 'bob'`); err != nil {
+		t.Fatal(err)
+	}
+	yes := true
+	_, err := s.SetUserAccount(adminCtx(), &pb.SetUserAccountRequest{Username: "alice", Disabled: &yes})
+	wantCode(t, "disable of alice beside an unjudgeable bob, a peer's clear seen here", err, codes.Unavailable)
+	wantMessage(t, "the refusal", err, `"bob"`, "lv user mark-external bob")
+}

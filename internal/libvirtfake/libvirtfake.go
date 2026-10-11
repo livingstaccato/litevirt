@@ -455,10 +455,30 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 			}
 		}
 	}
+	if st := f.domains[name]; st != StateRunning && st != StatePaused {
+		// A new persistent definition of an inactive domain is what its next
+		// start opens: it stays on an overlay only if it names it.
+		f.dropPITLocked(name, xmlConfig)
+	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig
 	f.record("define", name, "")
 	return nil
+}
+
+// dropPITLocked takes domain name off every point-in-time overlay
+// (pit_snapshot.go) that keepXML does not name as a disk source. Caller
+// holds f.mu.
+func (f *Fake) dropPITLocked(name, keepXML string) {
+	for overlay, dom := range f.pitOn {
+		if dom != name {
+			continue
+		}
+		if keepXML != "" && (strings.Contains(keepXML, "file='"+overlay+"'") || strings.Contains(keepXML, `file="`+overlay+`"`)) {
+			continue
+		}
+		delete(f.pitOn, overlay)
+	}
 }
 
 // liveXMLLocked is the live view of a domain, caller holds f.mu.
@@ -591,7 +611,7 @@ func (f *Fake) startDomain(name string, paused bool) error {
 		if dom != name {
 			continue
 		}
-		if _, err := os.Lstat(overlay); err != nil {
+		if _, err := os.Stat(overlay); err != nil {
 			return fmt.Errorf("libvirtfake: start domain %q: Cannot access storage file '%s': %v", name, overlay, err)
 		}
 	}
@@ -737,6 +757,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.dropPITLocked(name, "")
 	delete(f.domains, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
@@ -774,6 +795,7 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 		f.record("undefine", name, "keep_state=true transient=true")
 		return nil
 	}
+	f.dropPITLocked(name, "")
 	delete(f.domains, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)

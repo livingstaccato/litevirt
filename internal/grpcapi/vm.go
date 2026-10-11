@@ -1322,7 +1322,11 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 			if liveState, err := s.liveVMState(vm.Name); err == nil {
 				switch {
 				case vm.State == "stopped" && liveState == "running":
-					// Graceful shutdown in progress — trust DB
+					// Graceful shutdown in progress — trust DB, except for
+					// a drain's cold move still waiting for its guest.
+					if drainStopInProgress(&vm) {
+						state = "stopping"
+					}
 				case vm.State == "running" && liveState == "stopped":
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
@@ -2652,7 +2656,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			// but trust DB for operator-initiated stops/starts.
 			switch {
 			case vm.State == "stopped" && liveState == "running":
-				// Graceful shutdown in progress — trust DB
+				// Graceful shutdown in progress — trust DB, except for a
+				// drain's cold move still waiting for its guest.
+				if drainStopInProgress(vm) {
+					state = "stopping"
+				}
 			case vm.State == "running" && liveState == "stopped":
 				// VM crashed or was stopped externally — trust libvirt
 				state = liveState
@@ -2919,6 +2927,18 @@ func (s *Server) liveVMState(name string) (string, error) {
 		return "paused", nil
 	}
 	return st, nil
+}
+
+// drainStopInProgress reports whether a local VM's row is the stop a drain's
+// cold move records BEFORE it asks the guest to shut down (shutDownForColdMove).
+// The row has to say stopped from that moment, so that no health decision
+// reads the coming power-off as a crash; but while the domain still runs —
+// for as long as the guest takes, up to its stop timeout and the drain's late
+// wait — the VM is stopping, not stopped, and a read shows it so. Only a read:
+// the row, and what the cold move does, are unchanged. The caller checks the
+// domain is still running; once it is shut off the VM is shown stopped.
+func drainStopInProgress(vm *corrosion.VMRecord) bool {
+	return strings.HasPrefix(vm.StateDetail, health.DrainStopDetailPrefix)
 }
 
 func vmStateToPB(s string) pb.VMState {

@@ -47,8 +47,10 @@ It also re-enables the admin account if it is disabled or has an expiry.
 --clear-2fa additionally removes every second factor and recovery code of
 the admin account, for a sole admin who lost both under a mandatory
 second-factor policy, and prints an enrollment code for the first factor
-the admin enrolls at the next login. It needs login_policy_v1 latched on
-this node, and is recorded as clear_2fa=true on the audit row.
+the admin enrolls at the next login, and is recorded as clear_2fa=true on
+the audit row. Both are login rules: they need the cluster upgrade to have
+finished and litevirtd running on this node, and with the daemon down
+reset-admin refuses them and changes nothing.
 
 --user resets another admin-role account instead of "admin". It is how an
 account the admin floor reinstated gets a credential: the floor brings back
@@ -71,11 +73,10 @@ condition names the account. An account whose role is not admin is refused.`,
 						return nil, err
 					}
 					// Write user_credentials too once this node has latched
-					// credentials_split_v1, as the daemon would.
+					// credentials_split_v1, as the daemon would. The login
+					// rules are a release feature, opened only through the
+					// daemon's gate: this process writes none of their data.
 					db.SetCredentialsSplitGate(daemon.CredentialsSplitLatchedOnDisk(cfg.DataDir))
-					// And re-enable a disabled or expired admin account once
-					// login_policy_v1 has latched, as the daemon would.
-					db.SetLoginPolicyGate(daemon.LoginPolicyLatchedOnDisk(cfg.DataDir))
 					return db, nil
 				},
 				dataDir:  cfg.DataDir,
@@ -200,8 +201,8 @@ func runResetAdmin(ctx context.Context, env resetAdminEnv) error {
 // how to get one when it could not be issued.
 func printEnrollmentCode(out io.Writer, user, code, expires, issuedOn string, err error) {
 	if err != nil || code == "" {
-		fmt.Fprintf(out, "No enrollment code could be issued (%v). Issue one as root on a node where\n"+
-			"login_policy_v1 has latched: `sudo lv 2fa enroll-code %s`.\n", err, user)
+		fmt.Fprintf(out, "No enrollment code could be issued (%v). Issue one as root on a node whose\n"+
+			"litevirtd is running, once the cluster upgrade has finished: `sudo lv 2fa enroll-code %s`.\n", err, user)
 		return
 	}
 	fmt.Fprintf(out, "Enrollment code for %s's first factor (single use, until %s):\n  %s\n", user, expires, code)
@@ -241,13 +242,16 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 		return fmt.Errorf("cannot journal the audit entry, so the reset was not made: %w", err)
 	}
 
-	resetErr := corrosion.ResetAdminPasswordFor(ctx, db, name, hash, clear2FA)
+	// No release-feature gate in this process (nil): a reset that needs the
+	// login rules' data (--clear-2fa, or a restricted admin) is refused.
+	resetErr := corrosion.ResetAdminPasswordFor(ctx, db, nil, name, hash, clear2FA)
 	switch {
 	case resetErr == nil:
 		entry.Result = "ok"
 	case errors.Is(resetErr, corrosion.ErrNoLiveAdmin):
 		entry.Result = "denied: no live admin account"
-	case errors.Is(resetErr, corrosion.ErrNotAnAdmin), errors.Is(resetErr, corrosion.ErrAmbiguousUsername):
+	case errors.Is(resetErr, corrosion.ErrNotAnAdmin), errors.Is(resetErr, corrosion.ErrAmbiguousUsername),
+		errors.Is(resetErr, corrosion.ErrLoginPolicyGateClosed):
 		entry.Result = "denied"
 	default:
 		entry.Result = "error"
@@ -267,11 +271,8 @@ func resetAdminOffline(ctx context.Context, db *corrosion.Client, dataDir, pwPat
 	fmt.Fprintln(out, "Admin password reset.")
 	fmt.Fprintf(out, "Account: %s\n", name)
 	fmt.Fprintf(out, "New password written to %s\n", pwPath)
-	if clear2FA {
-		fmt.Fprintf(out, "Every second factor of %s was removed.\n", name)
-		code, exp, err := corrosion.IssueEnrollmentCode(ctx, db, name, 0, "root (reset-admin)", db.HostName())
-		printEnrollmentCode(out, name, code, exp, db.HostName(), err)
-	}
+	// --clear-2fa never reaches here: it is a login rule, refused above
+	// without the daemon's release-feature gate.
 	return nil
 }
 

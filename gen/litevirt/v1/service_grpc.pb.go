@@ -497,11 +497,11 @@ type LiteVirtClient interface {
 	ListUsers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListUsersResponse, error)
 	DeleteUser(ctx context.Context, in *DeleteUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// SetUserAccount disables, re-enables, or sets the expiry of an account.
-	// Admin only. Refused until login_policy_v1 has latched on every host.
+	// Admin only. Refused until the login_policy release feature opens.
 	SetUserAccount(ctx context.Context, in *SetUserAccountRequest, opts ...grpc.CallOption) (*User, error)
 	// GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
 	// mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
-	// refused until login_policy_v1 has latched on every host.
+	// refused until the login_policy release feature opens.
 	GetLoginPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*LoginPolicy, error)
 	SetLoginPolicy(ctx context.Context, in *SetLoginPolicyRequest, opts ...grpc.CallOption) (*LoginPolicy, error)
 	IssueEnrollmentCode(ctx context.Context, in *IssueEnrollmentCodeRequest, opts ...grpc.CallOption) (*IssueEnrollmentCodeResponse, error)
@@ -4430,11 +4430,11 @@ type LiteVirtServer interface {
 	ListUsers(context.Context, *emptypb.Empty) (*ListUsersResponse, error)
 	DeleteUser(context.Context, *DeleteUserRequest) (*emptypb.Empty, error)
 	// SetUserAccount disables, re-enables, or sets the expiry of an account.
-	// Admin only. Refused until login_policy_v1 has latched on every host.
+	// Admin only. Refused until the login_policy release feature opens.
 	SetUserAccount(context.Context, *SetUserAccountRequest) (*User, error)
 	// GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
 	// mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
-	// refused until login_policy_v1 has latched on every host.
+	// refused until the login_policy release feature opens.
 	GetLoginPolicy(context.Context, *emptypb.Empty) (*LoginPolicy, error)
 	SetLoginPolicy(context.Context, *SetLoginPolicyRequest) (*LoginPolicy, error)
 	IssueEnrollmentCode(context.Context, *IssueEnrollmentCodeRequest) (*IssueEnrollmentCodeResponse, error)

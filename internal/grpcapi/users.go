@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -251,15 +252,18 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	s.loginThrottle.success(throttleKey)
 
 	// First login since the upgrade (or since an unbind): bind the account to
-	// the entry that just name-matched and proved its credentials. Before
-	// login_policy_v1 latches nothing is written and the login proceeds
-	// unbound, as on main.
+	// the entry that just name-matched and proved its credentials. Until the
+	// login_policy release feature opens nothing is written and the login
+	// proceeds unbound, as on main; a login is never refused for it
+	// (withLoginPolicyIfAvailable).
 	// A login through the binding that won a conflict proves that entry once
 	// more; the losing bindings beside it are cleared, so the conflict is
 	// audited once rather than at every login, and an unbind is never needed
 	// to settle a conflict the rule already decided.
 	if len(losingBindings) > 0 {
-		if err := corrosion.ClearIdentityBindingRows(ctx, s.db, losingBindings); err == nil {
+		if err := s.withLoginPolicyIfAvailable(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			return corrosion.ClearIdentityBindingRows(ctx, s.db, g, losingBindings)
+		}); err == nil {
 			s.audit(ctx, "auth.identity_conflict", principal.Subject,
 				"realm="+realmName+" cleared the later bindings "+strings.Join(corrosion.IdentityResolution{All: losingBindings}.IDs(), ",")+
 					" after a login through the first, "+boundID, "ok")
@@ -268,7 +272,9 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 	}
 	if bindID != "" && boundID == "" {
-		switch berr := corrosion.BindIdentity(ctx, s.db, principal.Subject, realmName, bindID); {
+		switch berr := s.withLoginPolicyIfAvailable(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			return corrosion.BindIdentity(ctx, s.db, g, principal.Subject, realmName, bindID)
+		}); {
 		case berr == nil:
 			s.audit(ctx, "auth.identity_bound", principal.Subject, "realm="+realmName+" id="+bindID, "ok")
 		case errors.Is(berr, corrosion.ErrLoginPolicyGateClosed):
@@ -442,7 +448,7 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 	}
 	now := time.Now().UTC()
 	exp := now.Add(s.hardExpiry())
-	if serr := corrosion.InsertSessionWithFactor(ctx, s.db, corrosion.SessionRecord{
+	rec := corrosion.SessionRecord{
 		ID:         id,
 		Username:   username,
 		Realm:      realm,
@@ -451,7 +457,19 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 		CreatedAt:  now.Format(time.RFC3339),
 		LastUsedAt: now.Format(time.RFC3339),
 		ExpiresAt:  exp.Format(time.RFC3339),
-	}, factor); serr != nil {
+	}
+	insert := func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.InsertSessionWithFactor(ctx, s.db, g, rec, factor)
+	}
+	// Only a login that presented a factor has login-rule data to record; a
+	// password-only one never asks the release feature's gate.
+	var serr error
+	if factor == "" {
+		serr = insert(ctx, capabilities.FeatureGrant{})
+	} else {
+		serr = s.withLoginPolicyIfAvailable(ctx, insert)
+	}
+	if serr != nil {
 		return "", "", "", status.Errorf(codes.Internal, "store session: %v", serr)
 	}
 	return SessionTokenPrefix + id, exp.Format(time.RFC3339), user.Role, nil
@@ -609,11 +627,14 @@ func (s *Server) CreateUser(ctx context.Context, req *pb.CreateUserRequest) (*pb
 	// none of a deleted namesake's sessions honoured. DeleteUser keeps the
 	// lifecycle on purpose (m3), so this is the one place that clears it.
 	// Before inserting, so a refusal leaves nothing behind.
-	if err := corrosion.ResetUserLifecycle(ctx, s.db, username, callerUsername(ctx)); err != nil {
+	if err := s.withLoginPolicyIfAvailable(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		return corrosion.ResetUserLifecycle(ctx, s.db, g, username, callerUsername(ctx))
+	}); err != nil {
 		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%q belonged to an account with a disable or expiry, and this node cannot clear it until "+
-					"login_policy_v1 has latched here; retry shortly or create it on another node", username)
+					"the login_policy feature of %s opens here; retry shortly or create it on another node",
+				username, capabilities.ReleaseToken)
 		}
 		return nil, status.Errorf(codes.Internal, "reset account state of %q: %v", username, err)
 	}
@@ -753,7 +774,12 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	// revoked and durable session and token cut-offs written, so a floor
 	// reinstatement or a re-create brings none of them back; and its open
 	// streams are re-checked now and cut.
-	ended, revokedTokens, err := corrosion.DeleteUserCounted(ctx, s.db, name)
+	var ended, revokedTokens int
+	err = s.withLoginPolicyIfAvailable(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		var derr error
+		ended, revokedTokens, derr = corrosion.DeleteUserCounted(ctx, s.db, g, name)
+		return derr
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
@@ -774,7 +800,7 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	// already happened, and a cancelled request must not leave the cluster
 	// admin-less.
 	if reinstated, rerr := corrosion.ReinstateAdminIfNoneRemain(
-		context.WithoutCancel(ctx), s.db); rerr != nil {
+		context.WithoutCancel(ctx), s.db, s.withLoginPolicyIfAvailable); rerr != nil {
 		slog.Error("could not verify an admin survived the delete", "deleted", req.Username, "error", rerr)
 	} else if reinstated != "" {
 		note := corrosion.AdminReinstatementNote(context.WithoutCancel(ctx), s.db, reinstated)

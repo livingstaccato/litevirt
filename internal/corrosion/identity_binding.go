@@ -24,15 +24,18 @@ package corrosion
 // conflict it sees (auth.identity_conflict). The same rule decides between two
 // accounts bound to one id (IdentityOwner).
 //
-// Written only once login_policy_v1 has latched (the same gate as
-// user_lifecycle); before that, logins proceed unbound, as on main. Repaired
-// by anti-entropy. Cleared one row at a time (re-review 3, m-8).
+// Written only with a grant for capabilities.FeatureLoginPolicy (the release
+// feature user_lifecycle is written under); without one, logins proceed
+// unbound, as on main. Repaired by anti-entropy. Cleared one row at a time
+// (re-review 3, m-8).
 
 import (
 	"context"
 	"errors"
 	"sort"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const identityBindingUpsertSQL = `INSERT INTO user_identity_bindings (username, realm, external_id, bound_at, updated_at, deleted_at)
@@ -186,10 +189,11 @@ func AccountsBoundTo(ctx context.Context, c *Client, realm, externalID string) (
 
 // BindIdentity binds username in realm to externalID. It refuses
 // (ErrIdentityBindingConflict) when the id is bound to another account, and
-// returns ErrLoginPolicyGateClosed before the latch. It only ever ADDS a row:
-// a binding another node made first is never overwritten (m-1).
-func BindIdentity(ctx context.Context, c *Client, username, realm, externalID string) error {
-	if !c.MayWriteLoginPolicy() {
+// returns ErrLoginPolicyGateClosed without a grant for
+// capabilities.FeatureLoginPolicy. It only ever ADDS a row: a binding another
+// node made first is never overwritten (m-1).
+func BindIdentity(ctx context.Context, c *Client, g capabilities.FeatureGrant, username, realm, externalID string) error {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	others, err := AccountsBoundTo(ctx, c, realm, externalID)
@@ -206,8 +210,8 @@ func BindIdentity(ctx context.Context, c *Client, username, realm, externalID st
 
 // ClearIdentityBinding drops every binding username has in realm, one row at a
 // time, and returns the ids it cleared.
-func ClearIdentityBinding(ctx context.Context, c *Client, username, realm string) ([]string, error) {
-	if !c.MayWriteLoginPolicy() {
+func ClearIdentityBinding(ctx context.Context, c *Client, g capabilities.FeatureGrant, username, realm string) ([]string, error) {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return nil, ErrLoginPolicyGateClosed
 	}
 	bs, err := queryBindings(ctx, c, `username = ? AND realm = ?`, username, realm)
@@ -251,8 +255,8 @@ func restoreDeletedBindingsStatements(ctx context.Context, c *Client, username, 
 // ClearIdentityBindingRows tombstones exactly the bindings bs, one row each:
 // the later bindings of a conflict the first-binder rule decided, cleared by a
 // login through the binding that won.
-func ClearIdentityBindingRows(ctx context.Context, c *Client, bs []IdentityBinding) error {
-	if !c.MayWriteLoginPolicy() {
+func ClearIdentityBindingRows(ctx context.Context, c *Client, g capabilities.FeatureGrant, bs []IdentityBinding) error {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	marker, now := nowRFC3339(), c.NowTS()

@@ -89,7 +89,7 @@ func (s *Server) EnrollTOTP(ctx context.Context, req *pb.EnrollTOTPRequest) (*pb
 	} else if target != caller {
 		// An administrator enrolled a factor for the account: an outstanding
 		// first-enrollment code has nothing left to do (rereview m-b).
-		if err := corrosion.InvalidateEnrollmentCode(ctx, s.db, target); err != nil {
+		if err := s.voidEnrollmentCode(ctx, target); err != nil {
 			slog.Warn("could not void the enrollment code of an account an admin enrolled", "user", target, "error", err)
 		}
 	}

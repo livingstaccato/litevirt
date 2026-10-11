@@ -295,38 +295,6 @@ const (
 	// replicates to, a maintenance host on the previous build included.
 	FenceStateV1 = "fence_state_v1"
 
-	// LoginPolicyV1 gates the login rules auditors ask for: account disable and
-	// expiry (user_lifecycle, schema v64) and the cluster-wide mandatory
-	// second-factor policy (the login_2fa_required key in cluster_policies).
-	// docs/auth.md, "Account lifecycle" and "Mandatory second factor".
-	//
-	// It states two facts about the BINARY, which is why it is mandatory and
-	// has no config flag:
-	//
-	//   - it can DECODE user_lifecycle's statement shapes. They are the first
-	//     replicated shapes that table ever had, and an unregistered shape
-	//     back-pressures a previous-release peer: its apply fails closed and its
-	//     stream stalls. So nothing writes user_lifecycle, and nothing writes
-	//     the login_2fa_required policy row, until this token has latched.
-	//   - it HONOURS them, on every path that authenticates a user: Login,
-	//     WebAuthn login, a session bearer, an API token, and a forwarded
-	//     session or token. A disable is enforced wherever the user next
-	//     presents a credential, which is any node, so a disable written while
-	//     one node ignored it would leave that node a way back in. That is the
-	//     rolling-upgrade answer, too: a previous-release node never sees a
-	//     user_lifecycle row, because none can be written until no such node
-	//     is listening, and it cannot re-enable an account because it has no
-	//     statement that touches the table. A binary rolled back below the
-	//     latch enters WAL quarantine and writes nothing.
-	//
-	// The decode claim must hold of every host this node REPLICATES TO, so the
-	// token is in replicationGated. The opt-ins are the rows themselves —
-	// `lv user disable`, `lv user expire`, `lv 2fa policy` — and the stand-downs
-	// are their inverses (`lv user enable`, `lv user expire <u> never`,
-	// `lv 2fa policy off`); a flag would only keep a mandatory token from
-	// latching.
-	LoginPolicyV1 = "login_policy_v1"
-
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
 	// colonelpanik/litevirt#250): a failover coordinator collects a majority
@@ -864,13 +832,6 @@ const ReleaseToken = Release202611V1
 //     intact, and the incarnation-scoped one is left unread until it is
 //     upgraded again.
 //
-//   - login_policy_v1 has no flag either: it says this build decodes
-//     user_lifecycle and enforces an account's disable and expiry and the
-//     mandatory second-factor policy on every authentication path. Its
-//     stand-downs are the rows' inverses: `lv user enable`, `lv user expire
-//     <user> never` and `lv 2fa policy off`. A binary rolled back below it
-//     enters WAL quarantine, as below every latched token.
-//
 //   - fence_state_v1 has no flag either: it says this build resumes from an
 //     unverified fence recorded 'offline' and does not auto-activate such a
 //     host, which the lease holder relies on of every node. It changes only
@@ -983,10 +944,6 @@ var supported = []string{
 	// a recovery from an unverified fence recorded 'offline' and does not
 	// auto-activate such a host", a fact about the binary.
 	FenceStateV1,
-	// LoginPolicyV1 is advertised UNCONDITIONALLY: it says "this build decodes
-	// user_lifecycle and enforces account disable, expiry and the mandatory
-	// second-factor policy", a fact about the binary.
-	LoginPolicyV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// (default on) on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -1020,7 +977,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, LoginPolicyV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1082,10 +1039,6 @@ var replicationGated = map[string]bool{
 	// failover lease, a maintenance host on the previous build included, and
 	// that build resumes only from 'fenced'. See FenceStateV1.
 	FenceStateV1: true,
-	// Confirmed against every replication recipient: user_lifecycle's shapes
-	// must be decodable by every host we stream to, and every one of them
-	// accepts logins, so every one must enforce what the rows say.
-	LoginPolicyV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -1144,10 +1097,6 @@ var mandatory = map[string]bool{
 	// 'offline' and does not auto-activate such a host), and the lease holder
 	// relies on whichever node holds the lease next. See FenceStateV1.
 	FenceStateV1: true,
-	// A fact about the binary (it decodes user_lifecycle and enforces account
-	// disable, expiry and the second-factor policy on every authentication
-	// path). The opt-ins are the replicated rows. See LoginPolicyV1.
-	LoginPolicyV1: true,
 	// A fact about the binary (it decodes, keeps and honours its release's
 	// fields and shapes). Nothing changes until a feature is used, and every
 	// use is recorded first. See Release202611V1.

@@ -274,7 +274,7 @@ func TestI6_OnlyAdminRecoversWithClearTwoFactor(t *testing.T) {
 	}
 	setPolicy(t, s, "all")
 	hash, _ := bcrypt.GenerateFromPassword([]byte("fresh-password-0123"), auth.BcryptCost)
-	if err := corrosion.ResetAdminPassword(ctx, s.db, string(hash), true); err != nil {
+	if err := corrosion.ResetAdminPassword(ctx, s.db, s.withLoginPolicy, string(hash), true); err != nil {
 		t.Fatalf("ResetAdminPassword --clear-2fa: %v", err)
 	}
 	if f, _ := corrosion.ListUser2FA(ctx, s.db, "admin"); len(f) != 0 {
@@ -302,11 +302,15 @@ func TestI6_OnlyAdminRecoversWithClearTwoFactor(t *testing.T) {
 	if err != nil || full.GetRequires_2FaEnrollment() || full.Role != "admin" {
 		t.Fatalf("admin login with the new factor: %+v %v", full, err)
 	}
-	// Gated: with the latch closed, --clear-2fa refuses and changes nothing.
-	s.db.SetLoginPolicyGate(nil)
-	err = corrosion.ResetAdminPassword(ctx, s.db, string(hash), true)
-	if err == nil || !strings.Contains(err.Error(), "login_policy_v1") {
-		t.Fatalf("--clear-2fa with the gate closed: %v, want a refusal naming login_policy_v1", err)
+	// Gated: with the latch closed, --clear-2fa refuses and changes nothing,
+	// through the daemon's gate and with no gate at all (the daemon down).
+	s.SetReleaseFeatureGate(nil)
+	err = corrosion.ResetAdminPassword(ctx, s.db, s.withLoginPolicy, string(hash), true)
+	if err == nil || !strings.Contains(err.Error(), loginPolicyRefusal) {
+		t.Fatalf("--clear-2fa with the gate closed: %v, want %q", err, loginPolicyRefusal)
+	}
+	if err := corrosion.ResetAdminPassword(ctx, s.db, nil, string(hash), true); !errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+		t.Fatalf("--clear-2fa with no gate: %v, want ErrLoginPolicyGateClosed", err)
 	}
 	if f, _ := corrosion.ListUser2FA(ctx, s.db, "admin"); len(f) != 1 {
 		t.Fatalf("--clear-2fa with the gate closed changed the factors: %+v", f)

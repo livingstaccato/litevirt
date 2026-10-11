@@ -84,7 +84,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureVMLimits:             {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
 	FeatureVMDiskNICIO:          {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
 	FeatureEmailTargetSecret:    {Token: Release202611V1, Description: "Email notification targets with a stored SMTP secret"},
-	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Cluster login policy"},
+	FeatureLoginPolicy:          {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor and directory identity binding (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},
 	FeatureDrainFailback:        {Token: Release202611V1, Description: "Failback of the workloads a drain moved"},
 	FeatureFirewallIPv6:         {Token: Release202611V1, Description: "IPv6 security-group and firewall rules"},
 	FeatureNICGuards:            {Token: Release202611V1, Description: "Per-NIC anti-spoofing guards (MAC and IP); on by default for new NICs"},
@@ -93,6 +93,27 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
 	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},
 	FeaturePITOverlay:           {Token: Release202611V1, Description: "Point-in-time overlays for copies of running VMs"},
+}
+
+// loginPolicyWriters are the writers of login_policy's data: user_lifecycle,
+// the second-factor policy row, session_factors, user_enrollment_codes and
+// user_identity_bindings (the statement builders take the grant where a batch
+// carries the login rules' part only when it is granted).
+var loginPolicyWriters = []string{
+	"internal/corrosion.SetUserLifecycle",
+	"internal/corrosion.ResetUserLifecycle",
+	"internal/corrosion.enableUserStatements",
+	"internal/corrosion.SetTwoFactorPolicy",
+	"internal/corrosion.InsertSessionWithFactor",
+	"internal/corrosion.IssueEnrollmentCode",
+	"internal/corrosion.ConsumeEnrollmentCode",
+	"internal/corrosion.InvalidateEnrollmentCode",
+	"internal/corrosion.BindIdentity",
+	"internal/corrosion.ClearIdentityBinding",
+	"internal/corrosion.ClearIdentityBindingRows",
+	"internal/corrosion.DeleteUserCounted",
+	"internal/corrosion.reinstateAdminStatements",
+	"internal/corrosion.resetAdminStatements",
 }
 
 // The features of release_2026_11_v1. Each name is written into a replicated

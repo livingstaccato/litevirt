@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -35,7 +37,7 @@ func (d *Daemon) runAdminFloor(ctx context.Context) {
 // checkAdminFloor is one tick: it logs and audits a reinstatement, which
 // brings back an account an operator deleted and so must never be quiet.
 func (d *Daemon) checkAdminFloor(ctx context.Context, settle time.Duration) {
-	who, err := d.db.EnsureAdminFloor(ctx, settle)
+	who, err := d.db.EnsureAdminFloor(ctx, settle, d.loginPolicyRun())
 	if err != nil {
 		slog.Warn("admin floor: check failed", "error", err)
 		return
@@ -106,4 +108,18 @@ func (d *Daemon) reportUsableAdmin(ctx context.Context) {
 	}
 	d.writeSelfConditionAs(ctx, adminFloorEvaluator, CondNoUnrestrictedAdmin, !rep.Loggable, corrosion.SeverityCritical,
 		map[string]any{"recovery": strings.Join(recovery, "; or ")})
+}
+
+// loginPolicyRun opens the login rules' release feature for the floor's
+// reinstatement through this node's checker, best effort: the reinstatement
+// is what the previous release does too, so it is never refused for the
+// feature's sake, and carries the durable cut-offs only when the gate passes
+// (grpcapi.LoginPolicyIfAvailable). No checker: the zero grant.
+func (d *Daemon) loginPolicyRun() corrosion.FeatureRun {
+	if d.checker == nil {
+		return nil
+	}
+	return func(ctx context.Context, write func(context.Context, capabilities.FeatureGrant) error) error {
+		return grpcapi.LoginPolicyIfAvailable(ctx, d.checker, write)
+	}
 }

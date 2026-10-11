@@ -23,10 +23,16 @@ package corrosion
 // table has ever had; a previous-release peer's apply fails closed on an
 // unregistered shape and stalls its whole stream. And a previous-release node
 // would not enforce a disable even if it could decode one, so a user disabled
-// while one is listening could keep logging in through it. Nothing writes the
-// table, or the second-factor policy row, until login_policy_v1 has DURABLY
-// latched, which cannot happen while any replication recipient runs a build
-// that does not decode and enforce them.
+// while one is listening could keep logging in through it. So every write of
+// this data — the table, the second-factor policy row, session_factors,
+// user_enrollment_codes and user_identity_bindings — is part of the release
+// feature capabilities.FeatureLoginPolicy, and its writer takes the
+// capabilities.FeatureGrant only health.Checker.WithFeature mints: the release
+// token (release_2026_11_v1) has DURABLY latched, which cannot happen while any
+// replication recipient runs a build that does not decode and enforce them, and
+// the feature's use is recorded, and held by every recipient, before its first
+// write. A rollback below the release then quarantines exactly when this data
+// exists. A writer handed the zero grant writes none of it.
 //
 // READS ARE NEVER GATED. A node whose own latch is still forming can receive a
 // row from a peer whose latch has formed; skipping the check "because nothing
@@ -40,6 +46,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const (
@@ -77,10 +85,28 @@ const (
 	TwoFactorPolicyAll = "all"
 )
 
-// ErrLoginPolicyGateClosed is returned by a user_lifecycle or second-factor
-// policy write attempted before login_policy_v1 has durably latched here.
-var ErrLoginPolicyGateClosed = errors.New("account lifecycle and login policy are not writable until " +
-	"login_policy_v1 has latched on every host")
+// ErrLoginPolicyGateClosed is returned by a write of the login rules' data
+// attempted without a grant for capabilities.FeatureLoginPolicy: the release
+// feature's gate has not passed on this node.
+var ErrLoginPolicyGateClosed = errors.New("account lifecycle and login policy are not writable here: the " +
+	"login_policy feature of the release has not opened (the cluster upgrade must finish first)")
+
+// FeatureRun runs write through the release-feature gate of
+// capabilities.FeatureLoginPolicy on this node, handing it the grant its
+// writer checks (grpcapi: Server.WithReleaseFeature, or the best-effort form
+// that hands the zero grant when the gate does not pass). A writer that needs
+// the grant only sometimes — the admin floor, reset-admin — takes one, so the
+// feature is opened (and its use recorded) only for a write that carries its
+// data. Nil means no gate: the zero grant.
+type FeatureRun func(ctx context.Context, write func(context.Context, capabilities.FeatureGrant) error) error
+
+// run runs write through r, or with the zero grant when r is nil.
+func (r FeatureRun) run(ctx context.Context, write func(context.Context, capabilities.FeatureGrant) error) error {
+	if r == nil {
+		return write(ctx, capabilities.FeatureGrant{})
+	}
+	return r(ctx, write)
+}
 
 // userLifecycleUpsertSQL is the table's one writer. Explicit on the primary
 // key, so the origin applies it whether or not it holds the row, and a
@@ -89,25 +115,6 @@ const userLifecycleUpsertSQL = `INSERT INTO user_lifecycle (username, attribute,
 	 VALUES (?, ?, ?, ?, ?, NULL)
 	 ON CONFLICT(username, attribute) DO UPDATE SET value = excluded.value, set_by = excluded.set_by,
 	   updated_at = excluded.updated_at, deleted_at = NULL`
-
-// SetLoginPolicyGate injects the predicate that permits WRITING
-// user_lifecycle and the second-factor policy row, wired at daemon start to
-// the durable login_policy_v1 latch. Nil-safe and FAIL CLOSED: an unset gate
-// refuses every write.
-func (c *Client) SetLoginPolicyGate(fn func() bool) {
-	if fn == nil {
-		c.loginPolicyGate.Store(nil)
-		return
-	}
-	c.loginPolicyGate.Store(&fn)
-}
-
-// MayWriteLoginPolicy reports whether this node may write user_lifecycle and
-// the second-factor policy (nil-safe, fail closed).
-func (c *Client) MayWriteLoginPolicy() bool {
-	fn := c.loginPolicyGate.Load()
-	return fn != nil && (*fn)()
-}
 
 // UserLifecycle is one account's lifecycle as this node's replica holds it.
 // The zero value is an enabled account that never expires.
@@ -309,9 +316,10 @@ func NormalizeExpiry(s string) (string, error) {
 // they are. disabled and expiresAt are each nil for "leave it"; expiresAt must
 // already be normalized (NormalizeExpiry). Both writes, when there are two,
 // share one batch and one updated_at. It refuses with ErrLoginPolicyGateClosed
-// until login_policy_v1 has latched. The caller — the gRPC handler — owns the
-// operator-facing preconditions (role, the last-admin guard).
-func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled *bool, expiresAt *string, setBy string) error {
+// without a grant for capabilities.FeatureLoginPolicy. The caller — the gRPC
+// handler — owns the operator-facing preconditions (role, the last-admin
+// guard).
+func SetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGrant, username string, disabled *bool, expiresAt *string, setBy string) error {
 	if username == "" {
 		return errors.New("username required")
 	}
@@ -320,7 +328,7 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 			return fmt.Errorf("expires_at %q is not RFC3339: %w", *expiresAt, err)
 		}
 	}
-	if !c.MayWriteLoginPolicy() {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	cur, err := GetUserLifecycle(ctx, c, username)
@@ -356,11 +364,11 @@ func SetUserLifecycle(ctx context.Context, c *Client, username string, disabled 
 }
 
 // enableUserStatements returns the statements that clear username's disable
-// and expiry (and leave SessionsNotBefore, so nothing old revives), or nil when
-// the gate is closed — in which case no row can have been written by this
-// node, and the caller decides whether one written elsewhere matters.
-func enableUserStatements(c *Client, username, setBy, now string) []Statement {
-	if !c.MayWriteLoginPolicy() {
+// and expiry (and leave SessionsNotBefore, so nothing old revives), or nil
+// without a grant for capabilities.FeatureLoginPolicy — in which case the
+// caller decides whether a row written elsewhere matters.
+func enableUserStatements(g capabilities.FeatureGrant, username, setBy, now string) []Statement {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return nil
 	}
 	return []Statement{
@@ -373,11 +381,12 @@ func enableUserStatements(c *Client, username, setBy, now string) []Statement {
 // session from before now honoured. It is what an explicit CreateUser does to
 // a name, which may have belonged to a deleted, disabled account (DeleteUser
 // keeps the lifecycle on purpose; m3) — and whose old sessions must not come
-// back with the new account. With the gate closed it does nothing when there
-// is nothing to reset, and refuses (ErrLoginPolicyGateClosed) when a row a
-// latched peer wrote is there.
-func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) error {
-	if !c.MayWriteLoginPolicy() {
+// back with the new account. Without a grant for
+// capabilities.FeatureLoginPolicy it does nothing when there is nothing to
+// reset, and refuses (ErrLoginPolicyGateClosed) when a row another node wrote
+// is there.
+func ResetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGrant, username, setBy string) error {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		rows, err := c.Query(ctx, `SELECT 1 FROM user_lifecycle WHERE username = ? AND deleted_at IS NULL LIMIT 1`, username)
 		if err != nil {
 			return err
@@ -400,7 +409,7 @@ func ResetUserLifecycle(ctx context.Context, c *Client, username, setBy string) 
 		return err
 	}
 	now := c.NowTS()
-	stmts := enableUserStatements(c, username, setBy, now)
+	stmts := enableUserStatements(g, username, setBy, now)
 	// The session cut-off is set back by the skew margin: the namesake's
 	// sessions all predate its deletion, which predates this, while a login
 	// made right after the create must work at once — also right after a
@@ -711,15 +720,16 @@ func GetTwoFactorPolicy(ctx context.Context, c *Client) (TwoFactorPolicy, error)
 
 // SetTwoFactorPolicy writes the policy (already parsed, so p.Value is
 // canonical). It goes through cluster_policies' existing upsert, so it needs
-// that table's gate (failover_scope_v1) as well as this one's: the shape is
-// registered, but a build that predates login_policy_v1 would read the row and
-// ignore it, so it may not be written while one is listening.
+// that table's gate (failover_scope_v1) as well as a grant for
+// capabilities.FeatureLoginPolicy: the shape is registered, but a build that
+// predates the release would read the row and ignore it, so it may not be
+// written while one is listening.
 //
 // The policy and its self-enrollment deadline (p.SelfEnrollBy, "" for none)
 // are written together, in one batch: every change of the policy restates the
 // deadline, so a window is open only because the latest change opened it.
-func SetTwoFactorPolicy(ctx context.Context, c *Client, p TwoFactorPolicy, setBy string) error {
-	if !c.MayWriteLoginPolicy() {
+func SetTwoFactorPolicy(ctx context.Context, c *Client, g capabilities.FeatureGrant, p TwoFactorPolicy, setBy string) error {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	if !c.MayWriteClusterPolicy() {

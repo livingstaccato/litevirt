@@ -216,7 +216,8 @@ the deadline; setting the policy again without the flag closes the window.
 Setting the policy ends every live session in a realm it newly covers,
 your own included. API tokens are not subject to it.
 
-Refused until login_policy_v1 has latched on every host.`,
+Refused until the cluster upgrade has finished (the login_policy feature of
+the release, ` + "`lv cluster upgrade-status`" + `).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -245,7 +246,7 @@ Refused until login_policy_v1 has latched on every host.`,
 					fmt.Printf("Warning:                %s\n", w)
 				}
 				if !p.GetSettable() {
-					fmt.Println("Not settable here yet:  login_policy_v1 has not latched on every host")
+					fmt.Println("Not settable here yet:  the cluster upgrade has not finished (lv cluster upgrade-status)")
 				}
 				if len(args) == 1 {
 					fmt.Printf("Sessions ended:         %d (log in again if yours was one)\n", p.GetSessionsRevoked())

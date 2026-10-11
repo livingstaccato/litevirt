@@ -557,7 +557,14 @@ guards are on by default for every new NIC, so they are their own feature,
 security-group and firewall rules are `firewall_ipv6`, used only once someone
 writes one. `usb_mounts_memory` is one bit for VM USB devices, VM memory
 hot-add and container host mounts and devices: any one of them in use makes a
-rollback below the release quarantine.
+rollback below the release quarantine. `login_policy` is used by default too:
+account disable and expiry, the second-factor policy and enrollment codes are
+written on request, but the same feature carries what the login rules write
+on their own — a directory account's identity binding at its first login, the
+second factor a login presented, and the credential cut-offs a user create or
+delete writes — so it is used from the first such login, create or delete
+after the latch. Logins, creates and deletes are never refused for it: until
+the feature opens they run as on the previous release.
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —
@@ -1043,10 +1050,13 @@ whether or not a voter generation exists.
 
 Schema v64 adds `user_lifecycle`, one row per (account, attribute) holding an
 account's `disabled` flag and `expires_at`. Nothing writes it, and nothing
-writes the `login_2fa_required` second-factor policy row, until the mandatory,
-replication-gated `login_policy_v1` token has latched — so `lv user disable`,
-`lv user enable`, `lv user expire` and setting `lv 2fa policy` are refused with
-`FailedPrecondition` until every host (every host in `maintenance` included)
+writes the `login_2fa_required` second-factor policy row, until the release
+feature `login_policy` opens (the release token `release_2026_11_v1` has
+latched; see "Rolling back after a release token latched") — so `lv user
+disable`, `lv user enable`, `lv user expire`, `lv user unbind`, `lv 2fa
+enroll-code` and setting `lv 2fa policy` are refused with `FailedPrecondition`
+(`the cluster upgrade must finish first (login_policy needs
+release_2026_11_v1)`) until every host (every host in `maintenance` included)
 runs this release. A previous-release host would neither decode the rows nor
 enforce them; it has no statement that touches the table, so it cannot undo a
 disable either. Delegated administration (`perm.modify`) needs no token: it
@@ -1072,12 +1082,12 @@ logged in before are refused after it:
   surrounding spaces (non-ASCII case, NFD, width or accent variants): users
   type their name as stored.
 A search that finds two entries for one name is refused too. Each LDAP or
-OIDC account is bound to its directory entry at its first login after
-`login_policy_v1` latches.
+OIDC account is bound to its directory entry at its first login after the
+`login_policy` feature opens.
 
 v64 also adds `session_factors` (what each session's login presented) and
 `user_enrollment_codes` (hashed first-enrollment codes), written under the
-same latch. A host below `login_policy_v1` does not enforce any of it: it
+same feature. A host below the release does not enforce any of it: it
 accepts a disabled account's sessions and API tokens and does not confine
 password-only sessions. Keep such a host out of the client path until it is
 upgraded (docs/auth.md, "Rolling upgrade, and hosts below the latch"). From

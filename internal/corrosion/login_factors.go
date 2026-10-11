@@ -16,8 +16,8 @@ package corrosion
 //     partition cannot let it be spent once on each side (rereview N3). A
 //     disable, a delete or a re-create of the account tombstones it.
 //
-// Both are written only once login_policy_v1 has latched (the same gate as
-// user_lifecycle). session_factors is left out of anti-entropy like sessions;
+// Both are written only with a grant for capabilities.FeatureLoginPolicy (the
+// release feature user_lifecycle is written under). session_factors is left out of anti-entropy like sessions;
 // user_enrollment_codes is repaired by it (public lane — the column is a hash
 // of a random value), so every replica converges on one row per account.
 
@@ -31,17 +31,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const sessionFactorInsertSQL = `INSERT INTO session_factors (session_id, method, presented_at, updated_at) VALUES (?, ?, ?, ?)`
 
 // InsertSessionWithFactor creates a session row and, when factor is not
 // empty, records in the same batch that its login presented that second
-// factor ("totp", "webauthn"). With the gate closed the factor is not
-// recorded: such a session counts as password-only, which only ever confines
-// it (no policy can be set before the latch).
-func InsertSessionWithFactor(ctx context.Context, c *Client, s SessionRecord, factor string) error {
-	if factor == "" || !c.MayWriteLoginPolicy() {
+// factor ("totp", "webauthn"). Without a grant for
+// capabilities.FeatureLoginPolicy the factor is not recorded: such a session
+// counts as password-only, which only ever confines it (no policy can be set
+// before the feature opens).
+func InsertSessionWithFactor(ctx context.Context, c *Client, g capabilities.FeatureGrant, s SessionRecord, factor string) error {
+	if factor == "" || g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return InsertSession(ctx, c, s)
 	}
 	return c.ExecuteBatch(ctx, []Statement{
@@ -92,13 +95,27 @@ func invalidateEnrollmentCodeStatement(username, now string) Statement {
 }
 
 // InvalidateEnrollmentCode tombstones username's outstanding code. A no-op
-// with the gate closed (no code can exist).
-func InvalidateEnrollmentCode(ctx context.Context, c *Client, username string) error {
-	if !c.MayWriteLoginPolicy() {
+// without a grant for capabilities.FeatureLoginPolicy; a caller opens the
+// feature for it only when HasLiveEnrollmentCode says there is one, so that
+// enrolling a factor never marks the feature used by itself.
+func InvalidateEnrollmentCode(ctx context.Context, c *Client, g capabilities.FeatureGrant, username string) error {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return nil
 	}
 	st := invalidateEnrollmentCodeStatement(username, c.NowTS())
 	return c.ExecuteBatch(ctx, []Statement{st})
+}
+
+// HasLiveEnrollmentCode reports whether username holds an enrollment code
+// that is not tombstoned (used or not, expired or not). A read that fails is
+// an error, never "none".
+func HasLiveEnrollmentCode(ctx context.Context, c *Client, username string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 1 FROM user_enrollment_codes WHERE username = ? AND deleted_at IS NULL LIMIT 1`, username)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 // ErrEnrollmentCodeElsewhere is the refusal for a code issued on another node.
@@ -116,15 +133,15 @@ func enrollmentCodeHash(code string) string {
 
 // IssueEnrollmentCode mints username's enrollment code, bound to node issuedOn
 // (this node), replacing any earlier one, and returns it (shown once) with its
-// expiry. Gated on login_policy_v1.
-func IssueEnrollmentCode(ctx context.Context, c *Client, username string, ttl time.Duration, issuedBy, issuedOn string) (string, string, error) {
+// expiry. It needs a grant for capabilities.FeatureLoginPolicy.
+func IssueEnrollmentCode(ctx context.Context, c *Client, g capabilities.FeatureGrant, username string, ttl time.Duration, issuedBy, issuedOn string) (string, string, error) {
 	if ttl <= 0 {
 		ttl = EnrollmentCodeDefaultTTL
 	}
 	if ttl > EnrollmentCodeMaxTTL {
 		return "", "", errors.New("an enrollment code lives at most 24 hours")
 	}
-	if !c.MayWriteLoginPolicy() {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return "", "", ErrLoginPolicyGateClosed
 	}
 	raw := make([]byte, 20)
@@ -166,11 +183,11 @@ func CheckEnrollmentCode(ctx context.Context, c *Client, username, code, here st
 // ConsumeEnrollmentCode uses code up, on the node that issued it: one guarded
 // update that changes a row only while it is live, unused, unexpired and
 // issued here, so it succeeds at most once anywhere.
-func ConsumeEnrollmentCode(ctx context.Context, c *Client, username, code, here string) error {
+func ConsumeEnrollmentCode(ctx context.Context, c *Client, g capabilities.FeatureGrant, username, code, here string) error {
 	if err := CheckEnrollmentCode(ctx, c, username, code, here); err != nil {
 		return err
 	}
-	if !c.MayWriteLoginPolicy() {
+	if g.Check(capabilities.FeatureLoginPolicy) != nil {
 		return ErrLoginPolicyGateClosed
 	}
 	n, err := c.ExecuteRowsStrict(ctx,

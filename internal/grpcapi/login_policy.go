@@ -2,8 +2,9 @@ package grpcapi
 
 // Login rules auditors ask for: account disable and expiry, and a cluster-wide
 // mandatory second factor (docs/auth.md, "Account lifecycle" and "Mandatory
-// second factor"). Both are gated on login_policy_v1; see
-// corrosion/user_lifecycle.go for why the state lives where it does.
+// second factor"). Both are the release feature login_policy
+// (login_policy_gate.go); see corrosion/user_lifecycle.go for why the state
+// lives where it does.
 //
 // WHERE THEY ARE ENFORCED. On every path that turns a credential into a user
 // identity, and on nothing else:
@@ -277,9 +278,14 @@ func (s *Server) firstEnrollment(ctx context.Context, code string, commit bool) 
 		s.kickStreams()
 	}
 	if !selfOK {
-		if err := corrosion.ConsumeEnrollmentCode(ctx, s.db, user, code, s.hostName); err != nil {
-			return false, status.Error(codes.PermissionDenied,
-				"the enrollment code could not be used (used elsewhere, or expired): "+err.Error())
+		if err := s.withLoginPolicy(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+			if err := corrosion.ConsumeEnrollmentCode(ctx, s.db, g, user, code, s.hostName); err != nil {
+				return status.Error(codes.PermissionDenied,
+					"the enrollment code could not be used (used elsewhere, or expired): "+err.Error())
+			}
+			return nil
+		}); err != nil {
+			return false, err
 		}
 	}
 	return true, nil
@@ -298,20 +304,6 @@ func (s *Server) noteFirstFactor(ctx context.Context, method string) {
 		Detail: user + " enrolled a first second factor (" + method + "); if that was not them, " +
 			"remove it (`lv 2fa disable --user " + user + "`) and reset the account's password",
 	})
-}
-
-// loginPolicySettable reports whether this host may write user_lifecycle and
-// the second-factor policy: login_policy_v1 durably latched, as the corrosion
-// gate requires too.
-func (s *Server) loginPolicySettable() bool {
-	return s.gate != nil && s.gate.DurablyLatched(capabilities.LoginPolicyV1)
-}
-
-func loginPolicyNotLatched() error {
-	return status.Errorf(codes.FailedPrecondition,
-		"account disable, expiry and the second-factor policy cannot be changed until %s has "+
-			"latched on every host: finish rolling every host (and every host in maintenance) "+
-			"to this release first", capabilities.LoginPolicyV1)
 }
 
 // SetUserAccount disables, re-enables, or sets the expiry of an account.
@@ -340,9 +332,6 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 			return nil, status.Errorf(codes.InvalidArgument, "invalid expiry %q: %v", req.GetExpiresAt(), err)
 		}
 		expires = &norm
-	}
-	if !s.loginPolicySettable() {
-		return nil, loginPolicyNotLatched()
 	}
 	user, err := corrosion.GetUser(ctx, s.db, req.GetUsername())
 	if err != nil {
@@ -380,11 +369,16 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 				"restricting it may leave the cluster with no administrator"))
 		}
 	}
-	if err := corrosion.SetUserLifecycle(ctx, s.db, user.Username, req.Disabled, expires, callerUsername(ctx)); err != nil {
-		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+	if err := s.withLoginPolicy(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		if err := corrosion.SetUserLifecycle(ctx, s.db, g, user.Username, req.Disabled, expires, callerUsername(ctx)); err != nil {
+			if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+				return status.Error(codes.FailedPrecondition, err.Error())
+			}
+			return status.Errorf(codes.Internal, "set account state: %v", err)
 		}
-		return nil, status.Errorf(codes.Internal, "set account state: %v", err)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	var detail []string
@@ -493,7 +487,7 @@ func (s *Server) loginPolicyPB(p corrosion.TwoFactorPolicy, revoked int, warning
 		AllRealms:       p.All,
 		SetBy:           p.SetBy,
 		UpdatedAt:       p.UpdatedAt,
-		Settable:        s.loginPolicySettable(),
+		Settable:        s.ReleaseFeatureAvailable(capabilities.FeatureLoginPolicy),
 		SessionsRevoked: int32(revoked),
 		SelfEnrollBy:    p.SelfEnrollBy,
 		Warnings:        warnings,
@@ -534,9 +528,6 @@ func (s *Server) SetLoginPolicy(ctx context.Context, req *pb.SetLoginPolicyReque
 	} else if req.GetEnrollBy() != "" {
 		return nil, status.Error(codes.InvalidArgument, "--enroll-by needs --allow-self-enroll")
 	}
-	if !s.loginPolicySettable() {
-		return nil, loginPolicyNotLatched()
-	}
 	// A realm named that this node does not have configured covers nothing
 	// here (a typo, or a realm configured elsewhere). Set anyway, and say so.
 	var warnings []string
@@ -558,11 +549,16 @@ func (s *Server) SetLoginPolicy(ctx context.Context, req *pb.SetLoginPolicyReque
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read the current policy: %v", err)
 	}
-	if err := corrosion.SetTwoFactorPolicy(ctx, s.db, next, callerUsername(ctx)); err != nil {
-		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) || errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+	if err := s.withLoginPolicy(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		if err := corrosion.SetTwoFactorPolicy(ctx, s.db, g, next, callerUsername(ctx)); err != nil {
+			if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) || errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+				return status.Error(codes.FailedPrecondition, err.Error())
+			}
+			return status.Errorf(codes.Internal, "set the second-factor policy: %v", err)
 		}
-		return nil, status.Errorf(codes.Internal, "set the second-factor policy: %v", err)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	revoked := 0
 	if sessions, lerr := corrosion.ListLiveSessions(ctx, s.db); lerr != nil {
@@ -607,9 +603,6 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 		return nil, status.Errorf(codes.InvalidArgument, "an enrollment code lives between 1 second and %s",
 			corrosion.EnrollmentCodeMaxTTL)
 	}
-	if !s.loginPolicySettable() {
-		return nil, loginPolicyNotLatched()
-	}
 	user, err := corrosion.GetUser(ctx, s.db, req.GetUsername())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "look up user %q: %v", req.GetUsername(), err)
@@ -617,12 +610,19 @@ func (s *Server) IssueEnrollmentCode(ctx context.Context, req *pb.IssueEnrollmen
 	if user == nil {
 		return nil, status.Errorf(codes.NotFound, "user %q not found", req.GetUsername())
 	}
-	code, exp, err := corrosion.IssueEnrollmentCode(ctx, s.db, user.Username, ttl, callerUsername(ctx), s.hostName)
-	if err != nil {
-		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+	var code, exp string
+	if err := s.withLoginPolicy(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		var ierr error
+		code, exp, ierr = corrosion.IssueEnrollmentCode(ctx, s.db, g, user.Username, ttl, callerUsername(ctx), s.hostName)
+		if ierr != nil {
+			if errors.Is(ierr, corrosion.ErrLoginPolicyGateClosed) {
+				return status.Error(codes.FailedPrecondition, ierr.Error())
+			}
+			return status.Errorf(codes.Internal, "issue enrollment code: %v", ierr)
 		}
-		return nil, status.Errorf(codes.Internal, "issue enrollment code: %v", err)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	s.audit(ctx, "2fa.enroll_code", user.Username, "expires_at="+exp+" issued_on="+s.hostName, "ok")
 	// The code is bound to this node (rereview N3); say which, so the
@@ -659,16 +659,13 @@ func (s *Server) ListUserVariants(ctx context.Context, req *pb.ListUserVariantsR
 // ClearIdentityBinding drops the directory entry an external-realm account is
 // bound to (rereview-2 N5), for when the directory re-created the user's entry
 // under a new immutable id: the account's next login binds afresh. Admin only,
-// audited, and refused until login_policy_v1 has latched.
+// audited, and refused until the login_policy release feature opens.
 func (s *Server) ClearIdentityBinding(ctx context.Context, req *pb.ClearIdentityBindingRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
 	if req.GetUsername() == "" || req.GetRealm() == "" {
 		return nil, status.Error(codes.InvalidArgument, "username and realm required")
-	}
-	if !s.loginPolicySettable() {
-		return nil, loginPolicyNotLatched()
 	}
 	// One spelling of a case-duplicate pair is unbound by its exact stored
 	// name (re-review 3, m-4): the normalized lookup refuses the pair.
@@ -688,12 +685,19 @@ func (s *Server) ClearIdentityBinding(ctx context.Context, req *pb.ClearIdentity
 	if u != nil {
 		name = u.Username
 	}
-	was, err := corrosion.ClearIdentityBinding(ctx, s.db, name, req.GetRealm())
-	if err != nil {
-		if errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
-			return nil, status.Error(codes.FailedPrecondition, err.Error())
+	var was []string
+	if err := s.withLoginPolicy(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		var cerr error
+		was, cerr = corrosion.ClearIdentityBinding(ctx, s.db, g, name, req.GetRealm())
+		if cerr != nil {
+			if errors.Is(cerr, corrosion.ErrLoginPolicyGateClosed) {
+				return status.Error(codes.FailedPrecondition, cerr.Error())
+			}
+			return status.Errorf(codes.Internal, "clear the identity binding: %v", cerr)
 		}
-		return nil, status.Errorf(codes.Internal, "clear the identity binding: %v", err)
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	s.audit(ctx, "user.identity_unbind", name, "realm="+req.GetRealm()+" was="+strings.Join(was, ","), "ok")
 	return &emptypb.Empty{}, nil

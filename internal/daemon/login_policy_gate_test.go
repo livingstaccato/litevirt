@@ -10,45 +10,58 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 )
 
-// TestWireLoginPolicyGate_TracksTheDurableLatch: user_lifecycle and the
-// second-factor policy are writable once login_policy_v1 has durably latched
-// and not before. Every other test opens the gate directly, so this is the one
-// that fails if the production wiring is deleted — an unwired gate fails
-// closed and looks exactly like a mid-roll. The on-disk form `lv user
-// reset-admin` uses must agree with it.
-func TestWireLoginPolicyGate_TracksTheDurableLatch(t *testing.T) {
+// TestAdminFloor_LoginRulesOnlyThroughTheReleaseGate: the admin floor's
+// reinstatement writes the login rules' durable cut-offs only through this
+// node's release-feature gate (the login_policy feature), and records the use
+// before it does. Before the release token latches it reinstates all the same,
+// as the previous release does, with none of that data and no use recorded.
+// This is the test that fails if the daemon's floor wiring is deleted.
+func TestAdminFloor_LoginRulesOnlyThroughTheReleaseGate(t *testing.T) {
 	ctx := context.Background()
-	db := corrosion.NewTestClientT(t)
-	if err := corrosion.InitSchema(ctx, db); err != nil {
-		t.Fatalf("init schema: %v", err)
-	}
-	if err := corrosion.RegisterHost(ctx, db, corrosion.HostRecord{
-		Name: "host-a", Address: "10.0.0.1", State: "active", Role: "worker",
-	}); err != nil {
-		t.Fatalf("register host: %v", err)
-	}
+	for _, latched := range []bool{false, true} {
+		d := zeroAdminDaemon(t)
+		d.cfg.HostName = "host-a"
+		d.cfg.DataDir = t.TempDir()
+		if err := corrosion.RegisterHost(ctx, d.db, corrosion.HostRecord{
+			Name: "host-a", Address: "10.0.0.1", State: "active", Role: "worker",
+		}); err != nil {
+			t.Fatalf("register host: %v", err)
+		}
+		d.db.SetClusterPolicyGate(func() bool { return true })
+		checker := health.NewChecker("host-a", "/etc/litevirt/pki", d.db)
+		checker.SetActivationMarker(health.ActivationMarkerBase(d.cfg.DataDir))
+		checker.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
+			return capabilities.Supported(), time.Time{}, nil
+		})
+		d.checker = checker
+		if latched && (!checker.Enforced(ctx, capabilities.ReleaseToken) || !checker.DurablyLatched(capabilities.ReleaseToken)) {
+			t.Fatal("the release token did not latch durably with the only host advertising it; the rest is vacuous")
+		}
 
-	dataDir := t.TempDir()
-	checker := health.NewChecker("host-a", "/etc/litevirt/pki", db)
-	checker.SetActivationMarker(health.ActivationMarkerBase(dataDir))
-	checker.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
-		return capabilities.Supported(), time.Time{}, nil
-	})
-
-	d := &Daemon{db: db, checker: checker, cfg: &Config{DataDir: dataDir}}
-	d.wireLoginPolicyGate()
-	onDisk := LoginPolicyLatchedOnDisk(dataDir)
-
-	if db.MayWriteLoginPolicy() || onDisk() {
-		t.Fatal("the login policy gate is open before login_policy_v1 has durably latched")
-	}
-	if !checker.Enforced(ctx, capabilities.LoginPolicyV1) || !checker.DurablyLatched(capabilities.LoginPolicyV1) {
-		t.Fatal("login_policy_v1 did not latch durably with the only host advertising it; the rest is vacuous")
-	}
-	if !db.MayWriteLoginPolicy() {
-		t.Error("the daemon's login policy gate stayed closed after login_policy_v1 durably latched")
-	}
-	if !onDisk() {
-		t.Error("LoginPolicyLatchedOnDisk stayed closed after login_policy_v1 durably latched")
+		d.checkAdminFloor(ctx, 0) // arms
+		d.checkAdminFloor(ctx, 0) // acts
+		if u, err := corrosion.GetUser(ctx, d.db, "alice"); err != nil || u == nil {
+			t.Fatalf("latched=%v: the floor did not reinstate alice: %+v %v", latched, u, err)
+		}
+		life, err := corrosion.GetUserLifecycle(ctx, d.db, "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		used, err := corrosion.ReleaseFeatureUsed(ctx, d.db, capabilities.ReleaseToken, string(capabilities.FeatureLoginPolicy))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !latched {
+			if life.TokensNotBefore != "" || used {
+				t.Fatalf("before the latch: tokens_not_before=%q used=%v, want neither written", life.TokensNotBefore, used)
+			}
+			continue
+		}
+		if life.TokensNotBefore == "" {
+			t.Error("after the latch the floor wrote no durable token cut-off: its login rules did not go through the gate")
+		}
+		if !used {
+			t.Error("the floor wrote the login rules' data with no login_policy use recorded")
+		}
 	}
 }

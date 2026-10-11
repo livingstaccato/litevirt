@@ -493,9 +493,10 @@ import (
 //	     its own rather than new columns on users, so no previous-release
 //	     statement on users can reset it. Absent = enabled, never expires. A
 //	     previous-release node cannot decode the table's statements, and would
-//	     not enforce them, so nothing writes it until login_policy_v1 latches
-//	     (ReplicationGated). With it, two tables the mandatory second-factor
-//	     policy needs, written under the same gate: session_factors (left out
+//	     not enforce them, so nothing writes it without the release feature
+//	     login_policy (release_2026_11_v1, ReplicationGated). With it, two
+//	     tables the mandatory second-factor policy needs, written under the
+//	     same gate: session_factors (left out
 //	     of anti-entropy like sessions; session_id PK: the second factor
 //	     a session's login presented, so a password-only session is never
 //	     re-derived into a full one) and user_enrollment_codes (username PK:
@@ -2906,8 +2907,8 @@ var schemaDDL = []string{
 	)`,
 	// v64 account lifecycle — one row per (account, attribute): `disabled`
 	// ("true"/"false") and `expires_at` (RFC3339 UTC, "" = never). Separate
-	// rows so each attribute has its own LWW clock. Written only once
-	// login_policy_v1 latches; see user_lifecycle.go.
+	// rows so each attribute has its own LWW clock. Written only through the
+	// release feature login_policy; see user_lifecycle.go.
 	`CREATE TABLE IF NOT EXISTS user_lifecycle (
 		username   TEXT NOT NULL,
 		attribute  TEXT NOT NULL,

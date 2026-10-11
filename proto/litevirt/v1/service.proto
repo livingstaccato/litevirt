@@ -928,7 +928,7 @@ message LoginPolicy {
     bool            all_realms       = 3;
     string          set_by           = 4;
     string          updated_at       = 5;
-    bool            settable         = 6;  // login_policy_v1 has latched here
+    bool            settable         = 6;  // the login_policy release feature is available here
     int32           sessions_revoked = 7;  // SetLoginPolicy only: sessions ended in newly covered realms
     string          self_enroll_by   = 8;  // RFC3339; "" = enrollment needs an admin-issued code
     repeated string warnings         = 9;  // e.g. a covered realm that is not configured on this node
@@ -961,8 +961,8 @@ message ChangePasswordRequest { string username = 1; string old_password = 2; st
 // invoking account as the CLI reports it (SUDO_USER when set); it is recorded
 // in the audit row as a claim, not as an authenticated identity.
 // clear_two_factor also removes every second factor and recovery code of the
-// admin account (`lv user reset-admin --clear-2fa`); refused until
-// login_policy_v1 has latched here.
+// admin account (`lv user reset-admin --clear-2fa`); refused until the
+// login_policy release feature opens.
 // username names the admin-role account to reset (`lv user reset-admin
 // --user`); empty is "admin". It is how an operator gives an account the admin
 // floor reinstated its first credential: the floor never brings back a deleted
@@ -3563,11 +3563,11 @@ service LiteVirt {
     rpc ListUsers(google.protobuf.Empty) returns (ListUsersResponse);
     rpc DeleteUser(DeleteUserRequest)    returns (google.protobuf.Empty);
     // SetUserAccount disables, re-enables, or sets the expiry of an account.
-    // Admin only. Refused until login_policy_v1 has latched on every host.
+    // Admin only. Refused until the login_policy release feature opens.
     rpc SetUserAccount(SetUserAccountRequest) returns (User);
     // GetLoginPolicy / SetLoginPolicy read and change the cluster-wide
     // mandatory second-factor policy (`lv 2fa policy`). Set is admin only and
-    // refused until login_policy_v1 has latched on every host.
+    // refused until the login_policy release feature opens.
     rpc GetLoginPolicy(google.protobuf.Empty) returns (LoginPolicy);
     rpc SetLoginPolicy(SetLoginPolicyRequest) returns (LoginPolicy);
     rpc IssueEnrollmentCode(IssueEnrollmentCodeRequest) returns (IssueEnrollmentCodeResponse);

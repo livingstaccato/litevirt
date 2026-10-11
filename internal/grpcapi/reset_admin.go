@@ -60,14 +60,25 @@ func (s *Server) ResetAdminPassword(ctx context.Context, req *pb.ResetAdminPassw
 	if target == "" {
 		target = "admin"
 	}
-	if err := corrosion.ResetAdminPasswordFor(ctx, s.db, target, req.PasswordHash, req.GetClearTwoFactor()); err != nil {
+	// --clear-2fa, and re-enabling a restricted admin, are login rules: they
+	// go through the login_policy release feature's gate. A plain reset does
+	// not ask it (corrosion.ResetAdminPasswordFor).
+	if err := corrosion.ResetAdminPasswordFor(ctx, s.db, s.withLoginPolicy, target, req.PasswordHash, req.GetClearTwoFactor()); err != nil {
 		switch {
 		case errors.Is(err, corrosion.ErrNoLiveAdmin):
 			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied: no live admin account")
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
-		case errors.Is(err, corrosion.ErrNotAnAdmin), errors.Is(err, corrosion.ErrAmbiguousUsername):
+		case errors.Is(err, corrosion.ErrNotAnAdmin), errors.Is(err, corrosion.ErrAmbiguousUsername),
+			errors.Is(err, corrosion.ErrLoginPolicyGateClosed):
 			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied")
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		if st, ok := status.FromError(err); ok {
+			// The release feature gate's refusal. Answered as a refusal, never
+			// as Unavailable: the CLI would take that for a daemon it cannot
+			// reach and reset in the local database instead.
+			s.auditAs(ctx, actor, "user.reset-admin", target, detail, "denied")
+			return nil, status.Error(codes.FailedPrecondition, st.Message())
 		}
 		s.auditAs(ctx, actor, "user.reset-admin", target, detail, "error")
 		return nil, status.Errorf(codes.Internal, "reset admin password: %v", err)

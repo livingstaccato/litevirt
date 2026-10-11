@@ -84,7 +84,7 @@ func (s *Server) FinishWebAuthnRegistration(ctx context.Context, req *pb.FinishW
 		// An administrator registered a key for the account: its outstanding
 		// first-enrollment code has nothing left to do, as when an admin
 		// enrolls TOTP (rereview-2 m-6).
-		if err := corrosion.InvalidateEnrollmentCode(ctx, s.db, target); err != nil {
+		if err := s.voidEnrollmentCode(ctx, target); err != nil {
 			slog.Warn("could not void the enrollment code of an account an admin enrolled", "user", target, "error", err)
 		}
 	}

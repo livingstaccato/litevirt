@@ -65,7 +65,7 @@ func TestFleet_LastAdmin_TwoRacingDeletesLeaveExactlyOneAdmin(t *testing.T) {
 	// first sighting of zero admins only arms it; a sighting that persists acts.
 	for round := 0; round < 2; round++ {
 		for _, n := range c.Nodes {
-			if _, err := n.DB.EnsureAdminFloor(ctx, 0); err != nil {
+			if _, err := n.DB.EnsureAdminFloor(ctx, 0, nil); err != nil {
 				t.Fatalf("%s: admin floor check: %v", n.Name, err)
 			}
 		}
@@ -86,7 +86,7 @@ func TestFleet_LastAdmin_TwoRacingDeletesLeaveExactlyOneAdmin(t *testing.T) {
 	}
 	// A further round changes nothing: the floor holds, so nobody acts.
 	for _, n := range c.Nodes {
-		if who, err := n.DB.EnsureAdminFloor(ctx, 0); err != nil || who != "" {
+		if who, err := n.DB.EnsureAdminFloor(ctx, 0, nil); err != nil || who != "" {
 			t.Fatalf("%s: a floor check with an admin alive reinstated %q (err %v)", n.Name, who, err)
 		}
 	}

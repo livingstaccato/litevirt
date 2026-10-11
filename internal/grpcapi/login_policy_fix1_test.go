@@ -111,7 +111,7 @@ func TestC1_SessionMintedBeforeThePolicyArrivedIsConfined(t *testing.T) {
 	}
 	// The policy row arrives by replication: no sweep runs here.
 	p, _ := corrosion.ParseTwoFactorPolicy("all")
-	if err := corrosion.SetTwoFactorPolicy(ctx, s.db, p, "peer"); err != nil {
+	if err := corrosion.SetTwoFactorPolicy(ctx, s.db, lpGrant(t), p, "peer"); err != nil {
 		t.Fatal(err)
 	}
 	mustBeConfined(t, s, "a session minted before the policy arrived", r.Token)
@@ -216,7 +216,7 @@ func TestI4_AdminFloorCountsUsableAdmins(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeLifecycle(t, s, "bob", corrosion.UserAttrDisabled, "true")
-	who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db)
+	who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db, s.withLoginPolicyIfAvailable)
 	if err != nil || who != "alice" {
 		t.Fatalf("floor with only a disabled live admin: reinstated %q, %v; want alice", who, err)
 	}

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 func lifecycleDB(t *testing.T) *Client {
@@ -16,19 +18,26 @@ func lifecycleDB(t *testing.T) *Client {
 	return c
 }
 
+// lpGrant is the grant the release-feature gate hands a login-rules writer
+// once the login_policy feature has opened.
+func lpGrant(t *testing.T) capabilities.FeatureGrant {
+	t.Helper()
+	return capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
+}
+
 // TestUserLifecycle_AttributesDoNotUndoEachOther: a disable and a later
 // expiry change are separate rows with separate clocks, so the expiry change
 // cannot re-enable the account — the failure one row per account would have.
 func TestUserLifecycle_AttributesDoNotUndoEachOther(t *testing.T) {
 	ctx := context.Background()
 	c := lifecycleDB(t)
-	c.SetLoginPolicyGate(func() bool { return true })
+	g := lpGrant(t)
 	yes := true
-	if err := SetUserLifecycle(ctx, c, "bob", &yes, nil, "a"); err != nil {
+	if err := SetUserLifecycle(ctx, c, g, "bob", &yes, nil, "a"); err != nil {
 		t.Fatal(err)
 	}
 	exp := "2030-01-01T00:00:00Z"
-	if err := SetUserLifecycle(ctx, c, "bob", nil, &exp, "b"); err != nil {
+	if err := SetUserLifecycle(ctx, c, g, "bob", nil, &exp, "b"); err != nil {
 		t.Fatal(err)
 	}
 	l, err := GetUserLifecycle(ctx, c, "bob")
@@ -47,15 +56,18 @@ func TestUserLifecycle_GateFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	c := lifecycleDB(t)
 	yes := true
-	if err := SetUserLifecycle(ctx, c, "bob", &yes, nil, "a"); err != ErrLoginPolicyGateClosed {
-		t.Fatalf("unwired gate: %v, want ErrLoginPolicyGateClosed", err)
+	if err := SetUserLifecycle(ctx, c, capabilities.FeatureGrant{}, "bob", &yes, nil, "a"); err != ErrLoginPolicyGateClosed {
+		t.Fatalf("no grant: %v, want ErrLoginPolicyGateClosed", err)
 	}
-	c.SetLoginPolicyGate(func() bool { return false })
-	if err := SetTwoFactorPolicy(ctx, c, TwoFactorPolicy{Value: "all", All: true}, "a"); err != ErrLoginPolicyGateClosed {
-		t.Fatalf("closed gate, policy: %v, want ErrLoginPolicyGateClosed", err)
+	// A grant for another feature of the release opens nothing here.
+	other := capabilities.GrantForTest(t, capabilities.FeatureVMLimits)
+	if err := SetUserLifecycle(ctx, c, other, "bob", &yes, nil, "a"); err != ErrLoginPolicyGateClosed {
+		t.Fatalf("another feature's grant: %v, want ErrLoginPolicyGateClosed", err)
 	}
-	c.SetLoginPolicyGate(func() bool { return true })
-	if err := SetTwoFactorPolicy(ctx, c, TwoFactorPolicy{Value: "all", All: true}, "a"); err != ErrClusterPolicyGateClosed {
+	if err := SetTwoFactorPolicy(ctx, c, capabilities.FeatureGrant{}, TwoFactorPolicy{Value: "all", All: true}, "a"); err != ErrLoginPolicyGateClosed {
+		t.Fatalf("no grant, policy: %v, want ErrLoginPolicyGateClosed", err)
+	}
+	if err := SetTwoFactorPolicy(ctx, c, lpGrant(t), TwoFactorPolicy{Value: "all", All: true}, "a"); err != ErrClusterPolicyGateClosed {
 		t.Fatalf("cluster_policies gate closed: %v, want ErrClusterPolicyGateClosed", err)
 	}
 	rows, _ := c.Query(ctx, `SELECT 1 FROM user_lifecycle UNION ALL SELECT 1 FROM cluster_policies`)
@@ -119,12 +131,12 @@ func TestGetTwoFactorPolicy_NoRowIsOff(t *testing.T) {
 func TestDeleteUser_KeepsLifecycle(t *testing.T) {
 	ctx := context.Background()
 	c := lifecycleDB(t)
-	c.SetLoginPolicyGate(func() bool { return true })
+	g := lpGrant(t)
 	if err := InsertUser(ctx, c, "bob", "viewer", "x"); err != nil {
 		t.Fatal(err)
 	}
 	yes := true
-	if err := SetUserLifecycle(ctx, c, "bob", &yes, nil, "a"); err != nil {
+	if err := SetUserLifecycle(ctx, c, g, "bob", &yes, nil, "a"); err != nil {
 		t.Fatal(err)
 	}
 	if err := DeleteUser(ctx, c, "bob"); err != nil {
@@ -133,19 +145,18 @@ func TestDeleteUser_KeepsLifecycle(t *testing.T) {
 	if l, err := GetUserLifecycle(ctx, c, "bob"); err != nil || !l.Disabled {
 		t.Fatalf("after delete: %+v %v, want still disabled", l, err)
 	}
-	if err := ResetUserLifecycle(ctx, c, "bob", "admin"); err != nil {
+	if err := ResetUserLifecycle(ctx, c, g, "bob", "admin"); err != nil {
 		t.Fatal(err)
 	}
 	l, err := GetUserLifecycle(ctx, c, "bob")
 	if err != nil || l.Disabled || l.ExpiresAt != "" || l.SessionsNotBefore == "" {
 		t.Fatalf("after ResetUserLifecycle: %+v %v, want enabled with sessions_not_before set", l, err)
 	}
-	// With the gate closed it refuses rather than leave a peer's disable.
-	c.SetLoginPolicyGate(nil)
-	if err := ResetUserLifecycle(ctx, c, "bob", "admin"); err != ErrLoginPolicyGateClosed {
-		t.Fatalf("gate closed with a row present: %v", err)
+	// Without a grant it refuses rather than leave a peer's disable.
+	if err := ResetUserLifecycle(ctx, c, capabilities.FeatureGrant{}, "bob", "admin"); err != ErrLoginPolicyGateClosed {
+		t.Fatalf("no grant with a row present: %v", err)
 	}
-	if err := ResetUserLifecycle(ctx, c, "nobody", "admin"); err != nil {
+	if err := ResetUserLifecycle(ctx, c, capabilities.FeatureGrant{}, "nobody", "admin"); err != nil {
 		t.Fatalf("gate closed, nothing to reset: %v", err)
 	}
 }
@@ -187,7 +198,6 @@ func TestGetUser_NormalizedAndAmbiguous(t *testing.T) {
 func TestGC_PrunesExpiredSessionsWithTheirFactors(t *testing.T) {
 	ctx := context.Background()
 	c := lifecycleDB(t)
-	c.SetLoginPolicyGate(func() bool { return true })
 	old := time.Now().Add(-48 * time.Hour).UTC()
 	now := time.Now().UTC()
 	for id, exp := range map[string]time.Time{"dead": old.Add(time.Hour), "live": now.Add(time.Hour)} {
@@ -195,7 +205,7 @@ func TestGC_PrunesExpiredSessionsWithTheirFactors(t *testing.T) {
 		if id == "live" {
 			created = now
 		}
-		if err := InsertSessionWithFactor(ctx, c, SessionRecord{
+		if err := InsertSessionWithFactor(ctx, c, lpGrant(t), SessionRecord{
 			ID: id, Username: "bob", Realm: "local", CreatedAt: created.Format(time.RFC3339),
 			LastUsedAt: created.Format(time.RFC3339), ExpiresAt: exp.Format(time.RFC3339),
 		}, "totp"); err != nil {

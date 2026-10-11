@@ -409,11 +409,6 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
-	// loginPolicyGate, when non-nil and returning true, permits WRITING
-	// user_lifecycle and the login_2fa_required policy row. Injected via
-	// SetLoginPolicyGate, wired to the durable login_policy_v1 latch. Fails
-	// CLOSED when unset. See user_lifecycle.go.
-	loginPolicyGate atomic.Pointer[func() bool]
 	// voterConfigGate, when set and returning true, permits WRITING
 	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes

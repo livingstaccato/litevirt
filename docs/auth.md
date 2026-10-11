@@ -74,8 +74,9 @@ for LDAP the entry's `entryUUID` (OpenLDAP), `objectGUID` (Active Directory)
 or `nsUniqueId` (389 DS), and only when the entry has none of those, its full
 DN (lower-cased) — a weaker id, since a renamed or moved entry gets a new one;
 for OIDC the token's issuer and subject. The binding is written on the
-account's first successful login after the upgrade (once `login_policy_v1`
-has latched; before that, logins proceed unbound, as on the previous release).
+account's first successful login after the upgrade (once the release feature
+`login_policy` has opened; before that, logins proceed unbound, as on the
+previous release).
 After that, a login that name-matches the account through an entry with a
 different id is refused with `PermissionDenied` and audited as
 `auth.identity_mismatch`, whatever its password; and one entry is never bound
@@ -425,7 +426,7 @@ lv 2fa enroll-totp --code <code>                # bob, from an enrollment-only s
 
 It is a replicated row (the `login_2fa_required` key of `cluster_policies`),
 so every node enforces the same rule. Setting it is admin only, and refused
-until `login_policy_v1` has latched on every host. A realm the answering node
+until the cluster upgrade has finished (the release feature `login_policy`). A realm the answering node
 does not have configured is set anyway and reported as a warning (a typo such
 as `ldap:crop` covers nothing).
 
@@ -498,7 +499,8 @@ disable --user <name> --method totp`) and issues a code (`lv 2fa enroll-code
 <name>`). The **only** admin who lost their factor and recovery codes: as root
 on a node that is not in WAL quarantine (a quarantined node accepts local root
 but refuses every replicated write, so no account change can be made on it),
-`lv user reset-admin --clear-2fa` removes the `admin` account's
+`lv user reset-admin --clear-2fa` (with litevirtd running: it is a login rule,
+and the daemon-down path refuses it) removes the `admin` account's
 factors and recovery codes, gives it a new password, and prints an enrollment
 code; log in, `lv 2fa enroll-totp --code <code>`, and log in again with the
 new factor. As root on a node, `lv` with no stored session reaches the local
@@ -611,7 +613,7 @@ it. `lv user disable` alone stops only new `lv spice` calls.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that is enabled with no expiry — `lv user delete` applies the same rule — and
-until `login_policy_v1` has latched on every host. Two admins restricting each
+until the cluster upgrade has finished (the release feature `login_policy`). Two admins restricting each
 other on two nodes at once can still race past that guard; every node then
 raises the `no_unrestricted_admin` health condition (critical), and the floor
 does NOT re-enable either admin itself. Recovery, as root on a node that is
@@ -650,11 +652,17 @@ cannot keep acting through it.
 
 ### Rolling upgrade, and hosts below the latch
 
-`login_policy_v1` is mandatory and replication-gated: every build that has the
-`user_lifecycle` table advertises it, and it latches only once every host the
-cluster replicates to does. Until then `lv user disable|enable|expire`,
-`lv 2fa enroll-code` and setting `lv 2fa policy` are refused, and nothing is
-written. A previous-release host therefore never receives a statement it
+The login rules are the release feature `login_policy` of the release token
+`release_2026_11_v1`, which is mandatory and replication-gated: every build
+that has the `user_lifecycle` table advertises it, and it latches only once
+every host the cluster replicates to does. Until then `lv user
+disable|enable|expire|unbind`, `lv 2fa enroll-code` and setting `lv 2fa policy`
+are refused (`the cluster upgrade must finish first (login_policy needs
+release_2026_11_v1)`), and nothing is written; logins, `lv user create` and
+`lv user delete` work as on the previous release, without the login rules'
+data. Before the first write, the cluster records that the feature is used
+(docs/upgrades.md, "Rolling back after a release token latched"), so a
+rollback below the release quarantines once any of it exists. A previous-release host therefore never receives a statement it
 cannot decode, never holds an account state it would not enforce, and —
 having no statement that names the table — cannot re-enable an account.
 
@@ -781,14 +789,14 @@ joining node's credential replicates in and a deleted admin stays deleted.
 account whose role is not admin); the reset prints the account it reset. If
 the `admin` account is disabled or has an expiry, the reset also clears both,
 so it recovers an account locked out by `lv user disable` or `lv user expire`
-too (on a node where `login_policy_v1` has latched; elsewhere it refuses and
-changes nothing).
+too (with litevirtd running, once the cluster upgrade has finished; with the
+daemon down, or before then, it refuses and changes nothing).
 
 **The admin floor reinstates an account, never its credentials.** When admins
 are deleted on two nodes at once and no admin is left, every node's floor
 brings back the most recently deleted admin's account (`user.admin_reinstated`)
 — but with no password anyone knows, every session and API token revoked
-(durable cut-offs once `login_policy_v1` has latched), its second factors and
+(durable cut-offs once the release feature `login_policy` has opened), its second factors and
 enrollment code cleared. That holds for an admin deleted by a release before
 the login rules too, whose delete revoked nothing: its API tokens do not come
 back. Nobody can log in as the account until root, on a node, runs

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // ErrNoLiveAdmin is ResetAdminPassword's refusal: there is no live admin
@@ -44,15 +46,23 @@ var ErrNoLiveAdmin = errors.New("no live admin account in this node's local data
 //
 // clearTwoFactor (`--clear-2fa`) also removes every second factor and recovery
 // code of the account: the way back in for a sole admin who lost both under a
-// mandatory second-factor policy. It needs login_policy_v1 latched here, like
-// every other write the login rules make.
+// mandatory second-factor policy. It is part of the login rules, so it needs
+// the release feature capabilities.FeatureLoginPolicy, like every other write
+// they make.
 //
 // Everything — the lifecycle re-enable, the factor clear and the password — is
 // ONE batch (t1-auth-review m4): a reset that half-lands would leave the
 // account re-enabled with its old password, or with a new password it still
 // cannot use.
-func ResetAdminPassword(ctx context.Context, c *Client, passwordHash string, clearTwoFactor bool) error {
-	return ResetAdminPasswordFor(ctx, c, "admin", passwordHash, clearTwoFactor)
+//
+// run opens the release feature, and is asked to only when the reset writes
+// the login rules' data (--clear-2fa, or an admin that is disabled or has an
+// expiry): a plain password reset stays what it was before the release, and
+// does not mark the feature used. A nil run (reset-admin with litevirtd down,
+// which has no release-feature gate) writes none of that data and refuses a
+// reset that needs it.
+func ResetAdminPassword(ctx context.Context, c *Client, run FeatureRun, passwordHash string, clearTwoFactor bool) error {
+	return ResetAdminPasswordFor(ctx, c, run, "admin", passwordHash, clearTwoFactor)
 }
 
 // ErrNotAnAdmin is ResetAdminPasswordFor's refusal of an account whose role is
@@ -64,7 +74,7 @@ var ErrNotAnAdmin = errors.New("not an admin-role account; reset-admin resets an
 // username (`lv user reset-admin --user`; "" is "admin"). It is how root gives
 // an account the admin floor reinstated its first credential: the floor never
 // brings back a deleted account's old password (re-review 3, I1a).
-func ResetAdminPasswordFor(ctx context.Context, c *Client, username, passwordHash string, clearTwoFactor bool) error {
+func ResetAdminPasswordFor(ctx context.Context, c *Client, run FeatureRun, username, passwordHash string, clearTwoFactor bool) error {
 	if username == "" {
 		username = "admin"
 	}
@@ -89,15 +99,6 @@ func ResetAdminPasswordFor(ctx context.Context, c *Client, username, passwordHas
 		return fmt.Errorf("%q is %w", existing.Username, ErrNotAnAdmin)
 	}
 	name := existing.Username
-	now := c.NowTS()
-	var stmts []Statement
-	if clearTwoFactor {
-		if !c.MayWriteLoginPolicy() {
-			return fmt.Errorf("--clear-2fa is refused until login_policy_v1 has latched on this node; " +
-				"nothing was changed")
-		}
-		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now)...)
-	}
 	// The recovery path must also recover an admin that cannot log in for a
 	// reason other than its password: a disable or an expiry (user_lifecycle).
 	// Without this, disabling or expiring every administrator — which the
@@ -107,20 +108,56 @@ func ResetAdminPasswordFor(ctx context.Context, c *Client, username, passwordHas
 	if err != nil {
 		return fmt.Errorf("read the admin account's lifecycle: %w", err)
 	}
+	write := func(ctx context.Context, g capabilities.FeatureGrant) error {
+		stmts, err := resetAdminStatements(ctx, c, g, name, life, passwordHash, clearTwoFactor)
+		if err != nil {
+			return err
+		}
+		if err := c.ExecuteBatch(ctx, stmts); err != nil {
+			return fmt.Errorf("reset the admin account: %w", err)
+		}
+		return nil
+	}
+	if !clearTwoFactor && life.Unrestricted() {
+		return write(ctx, capabilities.FeatureGrant{})
+	}
+	return run.run(ctx, write)
+}
+
+// resetAdminStatements is ResetAdminPasswordFor's batch for name, whose
+// lifecycle is life. The login rules' part of it — the factor clear and the
+// re-enable — needs a grant for capabilities.FeatureLoginPolicy; without one
+// a reset that needs it is refused, wrapping ErrLoginPolicyGateClosed, and
+// nothing is changed.
+func resetAdminStatements(ctx context.Context, c *Client, g capabilities.FeatureGrant, name string, life UserLifecycle,
+	passwordHash string, clearTwoFactor bool) ([]Statement, error) {
+	granted := g.Check(capabilities.FeatureLoginPolicy) == nil
+	now := c.NowTS()
+	var stmts []Statement
+	if clearTwoFactor {
+		if !granted {
+			return nil, fmt.Errorf("%w: --clear-2fa needs the login_policy feature of %s, which this process "+
+				"cannot open (litevirtd is not running here, or the cluster upgrade has not finished); "+
+				"nothing was changed. Run it again with litevirtd running", ErrLoginPolicyGateClosed, capabilities.ReleaseToken)
+		}
+		stmts = append(stmts, clearSecondFactorStatements(name, nowRFC3339(), now)...)
+	}
 	if !life.Unrestricted() {
-		enable := enableUserStatements(c, name, "user.reset-admin", now)
+		enable := enableUserStatements(g, name, "user.reset-admin", now)
 		if enable == nil {
-			// A row exists, so some node has latched login_policy_v1, but this
-			// one has not durably latched it yet. Its own latch follows within a
-			// capability sweep; writing before it would be the one write this
-			// node's gate exists to stop.
+			// A row exists, so the feature is in use somewhere, but this
+			// process cannot open it: litevirtd is down, or this node's own
+			// latch has not formed yet. Writing without it would be the one
+			// write the gate exists to stop.
 			state := life.InactiveReason(time.Now().UTC())
 			if state == "" {
 				state = "set to expire at " + life.ExpiresAt
 			}
-			return fmt.Errorf("the admin account %q is restricted (%s), and this node cannot clear that "+
-				"until login_policy_v1 has latched here; retry in a minute, or run `lv user enable %s` "+
-				"and `lv user expire %s never` from a node where it has", name, state, name, name)
+			return nil, fmt.Errorf("%w: the admin account %q is restricted (%s), and this process cannot "+
+				"clear that (litevirtd is not running here, or its release feature gate has not opened); "+
+				"run reset-admin again with litevirtd running, or run `lv user enable %s` and "+
+				"`lv user expire %s never` from a node where it is",
+				ErrLoginPolicyGateClosed, name, state, name, name)
 		}
 		stmts = append(stmts, enable...)
 		// A re-enable is a session cut-off here as in SetUserLifecycle
@@ -139,13 +176,10 @@ func ResetAdminPasswordFor(ctx context.Context, c *Client, username, passwordHas
 	}
 	pw, err := updateUserPasswordStatements(ctx, c, name, passwordHash, now)
 	if err != nil {
-		return fmt.Errorf("update password: %w", err)
+		return nil, fmt.Errorf("update password: %w", err)
 	}
 	stmts = append(stmts, pw...)
-	if err := c.ExecuteBatch(ctx, stmts); err != nil {
-		return fmt.Errorf("reset the admin account: %w", err)
-	}
-	return nil
+	return stmts, nil
 }
 
 // ResetAdminAuditDetail is the detail of a user.reset-admin row, shared with the

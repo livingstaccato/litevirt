@@ -416,8 +416,8 @@ var tableNames = []string{
 	"voter_configs",
 	// v64 account lifecycle (disabled, expires_at). Every node enforces it at
 	// authentication, so a node that missed a disable must be repaired here
-	// like any other cluster fact. Nothing secret. Written only once
-	// login_policy_v1 has latched (user_lifecycle.go).
+	// like any other cluster fact. Nothing secret. Written only through the
+	// release feature login_policy (user_lifecycle.go).
 	"user_lifecycle",
 	// v64 first-enrollment codes (hashed, node-bound, at most a day). Repaired
 	// here so every replica converges on one row per account — a re-issue on

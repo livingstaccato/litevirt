@@ -10129,7 +10129,7 @@ type LoginPolicy struct {
 	AllRealms       bool                   `protobuf:"varint,3,opt,name=all_realms,json=allRealms,proto3" json:"all_realms,omitempty"`
 	SetBy           string                 `protobuf:"bytes,4,opt,name=set_by,json=setBy,proto3" json:"set_by,omitempty"`
 	UpdatedAt       string                 `protobuf:"bytes,5,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	Settable        bool                   `protobuf:"varint,6,opt,name=settable,proto3" json:"settable,omitempty"`                                      // login_policy_v1 has latched here
+	Settable        bool                   `protobuf:"varint,6,opt,name=settable,proto3" json:"settable,omitempty"`                                      // the login_policy release feature is available here
 	SessionsRevoked int32                  `protobuf:"varint,7,opt,name=sessions_revoked,json=sessionsRevoked,proto3" json:"sessions_revoked,omitempty"` // SetLoginPolicy only: sessions ended in newly covered realms
 	SelfEnrollBy    string                 `protobuf:"bytes,8,opt,name=self_enroll_by,json=selfEnrollBy,proto3" json:"self_enroll_by,omitempty"`         // RFC3339; "" = enrollment needs an admin-issued code
 	Warnings        []string               `protobuf:"bytes,9,rep,name=warnings,proto3" json:"warnings,omitempty"`                                       // e.g. a covered realm that is not configured on this node
@@ -10572,8 +10572,8 @@ func (x *ChangePasswordRequest) GetNewPassword() string {
 // invoking account as the CLI reports it (SUDO_USER when set); it is recorded
 // in the audit row as a claim, not as an authenticated identity.
 // clear_two_factor also removes every second factor and recovery code of the
-// admin account (`lv user reset-admin --clear-2fa`); refused until
-// login_policy_v1 has latched here.
+// admin account (`lv user reset-admin --clear-2fa`); refused until the
+// login_policy release feature opens.
 // username names the admin-role account to reset (`lv user reset-admin
 // --user`); empty is "admin". It is how an operator gives an account the admin
 // floor reinstated its first credential: the floor never brings back a deleted

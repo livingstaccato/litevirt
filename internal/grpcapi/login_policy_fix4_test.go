@@ -51,11 +51,11 @@ func TestI1a_AmbiguousAdminPairSatisfiesTheFloor(t *testing.T) {
 	}
 	s.db.MarkReplicaCaughtUpForTests("peer")
 	for i := 0; i < 2; i++ {
-		if who, err := s.db.EnsureAdminFloor(ctx, 0); err != nil || who != "" {
+		if who, err := s.db.EnsureAdminFloor(ctx, 0, s.withLoginPolicyIfAvailable); err != nil || who != "" {
 			t.Fatalf("admin floor with a duplicate admin pair reinstated %q (%v)", who, err)
 		}
 	}
-	if who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db); err != nil || who != "" {
+	if who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db, s.withLoginPolicyIfAvailable); err != nil || who != "" {
 		t.Fatalf("ReinstateAdminIfNoneRemain with a duplicate admin pair reinstated %q (%v)", who, err)
 	}
 	if u, _ := corrosion.GetUser(ctx, s.db, "oldops"); u != nil {
@@ -92,15 +92,16 @@ func TestI1a_FloorNeverRevivesOldCredentials(t *testing.T) {
 				t.Fatal(err)
 			}
 			c.delete(t, s)
-			gate := c.gate
-			s.db.SetLoginPolicyGate(func() bool { return gate })
+			var run corrosion.FeatureRun // the gate closed: the zero grant
+			if c.gate {
+				run = s.withLoginPolicyIfAvailable
+			}
 			// The one live admin is disabled: no admin can log in.
 			writeLifecycle(t, s, "alice", corrosion.UserAttrDisabled, "true")
-			who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db)
+			who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db, run)
 			if err != nil || who != "oldops" {
 				t.Fatalf("floor reinstated %q, %v; want oldops", who, err)
 			}
-			s.db.SetLoginPolicyGate(func() bool { return true })
 			_, err = s.Login(ctx, &pb.LoginRequest{Username: "oldops", Password: "old-pw"})
 			wantCode(t, "the reinstated account's old password", err, codes.Unauthenticated)
 			_, err = s.authenticate(bearerCtx(tok))
@@ -112,7 +113,7 @@ func TestI1a_FloorNeverRevivesOldCredentials(t *testing.T) {
 			}
 			// Root gives it a fresh credential, and that works at once.
 			time.Sleep(10 * time.Millisecond)
-			if err := corrosion.ResetAdminPasswordFor(ctx, s.db, "oldops", mustHash(t, "fresh-pw-0123456789"), false); err != nil {
+			if err := corrosion.ResetAdminPasswordFor(ctx, s.db, s.withLoginPolicy, "oldops", mustHash(t, "fresh-pw-0123456789"), false); err != nil {
 				t.Fatalf("reset-admin --user oldops: %v", err)
 			}
 			_, err = s.Login(ctx, &pb.LoginRequest{Username: "oldops", Password: "fresh-pw-0123456789"})
@@ -232,7 +233,7 @@ func TestM4_UnbindOneSpellingOfAnAmbiguousPair(t *testing.T) {
 	seedUser(t, s, "Alice", "viewer", "pw1")
 	seedUser(t, s, "alice", "viewer", "pw2")
 	ctx := context.Background()
-	if err := corrosion.BindIdentity(ctx, s.db, "Alice", "ldap:corp", "entryUUID:u-1"); err != nil {
+	if err := corrosion.BindIdentity(ctx, s.db, lpGrant(t), "Alice", "ldap:corp", "entryUUID:u-1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.ClearIdentityBinding(adminCtx(), &pb.ClearIdentityBindingRequest{Username: "Alice", Realm: "ldap:corp"}); err != nil {
@@ -376,7 +377,7 @@ func TestM5_CutoffNeverMovesBackwards(t *testing.T) {
 		writeLifecycle(t, s, u, corrosion.UserAttrSessionsNotBefore, ahead)
 	}
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
-	if err := corrosion.ResetAdminPassword(ctx, s.db, mustHash(t, "fresh-pw-0123456789"), false); err != nil {
+	if err := corrosion.ResetAdminPassword(ctx, s.db, s.withLoginPolicy, mustHash(t, "fresh-pw-0123456789"), false); err != nil {
 		t.Fatal(err)
 	}
 	setDisabled(t, s, "bob", true)
@@ -450,7 +451,7 @@ func TestI1a_FloorKeepsAnExternalAdminExternal(t *testing.T) {
 			tok := mintAPIToken(t, s, "ext")
 			c.delete(t, s)
 			writeLifecycle(t, s, "alice", corrosion.UserAttrDisabled, "true")
-			if who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db); err != nil || who != "ext" {
+			if who, err := corrosion.ReinstateAdminIfNoneRemain(ctx, s.db, s.withLoginPolicyIfAvailable); err != nil || who != "ext" {
 				t.Fatalf("floor reinstated %q, %v; want ext", who, err)
 			}
 			if u, _ := corrosion.GetUser(ctx, s.db, "ext"); u == nil || u.PasswordHash != "" {

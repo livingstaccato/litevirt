@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -23,23 +24,33 @@ import (
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-// loginPolicyServer is a test server on which login_policy_v1 has durably
-// latched (both the server gate and the corrosion write gate), as on a fully
-// rolled cluster. failover_scope_v1 too, because the second-factor policy is
-// a cluster_policies row.
+// loginPolicyServer is a test server on which the login_policy release
+// feature is open (its gate hands every write the grant), as on a fully rolled
+// cluster. failover_scope_v1 too, because the second-factor policy is a
+// cluster_policies row.
 func loginPolicyServer(t *testing.T) *Server {
 	t.Helper()
 	s := testServer(t)
 	s.SetGate(fakeServerGate{
 		enforcedTok: map[string]bool{capabilities.ForwardedIdentityV1: true},
 		durablyLatchedTok: map[string]bool{
-			capabilities.LoginPolicyV1:   true,
 			capabilities.FailoverScopeV1: true,
 		},
 	})
-	s.db.SetLoginPolicyGate(func() bool { return true })
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 	s.db.SetClusterPolicyGate(func() bool { return true })
 	return s
+}
+
+// loginPolicyRefusal is the release-feature gate's refusal of a login rule
+// before the feature can open.
+var loginPolicyRefusal = "the cluster upgrade must finish first (" + string(capabilities.FeatureLoginPolicy) +
+	" needs " + capabilities.ReleaseToken + ")"
+
+// lpGrant is the grant the gate hands a login-rules writer once it is open.
+func lpGrant(t *testing.T) capabilities.FeatureGrant {
+	t.Helper()
+	return capabilities.GrantForTest(t, capabilities.FeatureLoginPolicy)
 }
 
 func bearerCtx(token string) context.Context {
@@ -296,23 +307,22 @@ func TestAccountLifecycle_EnforcedBeforeThisNodeLatches(t *testing.T) {
 // TestSetUserAccount_RefusedBeforeTheLatch: nothing may be written until every
 // host decodes and enforces it.
 func TestSetUserAccount_RefusedBeforeTheLatch(t *testing.T) {
-	s := testServer(t)
-	s.db.SetLoginPolicyGate(func() bool { return true })
+	s := testServer(t) // no release-feature gate: every feature is refused
 	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{}})
 	seedUser(t, s, "bob", "viewer", "pw")
 	yes := true
 	_, err := s.SetUserAccount(adminCtx(), &pb.SetUserAccountRequest{Username: "bob", Disabled: &yes})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), capabilities.LoginPolicyV1) {
-		t.Fatalf("SetUserAccount before the latch: %v, want FailedPrecondition naming %s", err, capabilities.LoginPolicyV1)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), loginPolicyRefusal) {
+		t.Fatalf("SetUserAccount before the latch: %v, want FailedPrecondition %q", err, loginPolicyRefusal)
 	}
 	rows, _ := s.db.Query(context.Background(), `SELECT username FROM user_lifecycle`)
 	if len(rows) != 0 {
 		t.Fatalf("a refused change was written: %d rows", len(rows))
 	}
-	// And the corrosion gate refuses on its own, whatever the RPC does.
-	s.db.SetLoginPolicyGate(nil)
-	if err := corrosion.SetUserLifecycle(context.Background(), s.db, "bob", &yes, nil, "x"); err != corrosion.ErrLoginPolicyGateClosed {
-		t.Fatalf("SetUserLifecycle with the gate unwired: %v, want ErrLoginPolicyGateClosed", err)
+	// And the corrosion writer refuses on its own without the gate's grant,
+	// whatever the RPC does.
+	if err := corrosion.SetUserLifecycle(context.Background(), s.db, capabilities.FeatureGrant{}, "bob", &yes, nil, "x"); err != corrosion.ErrLoginPolicyGateClosed {
+		t.Fatalf("SetUserLifecycle with no grant: %v, want ErrLoginPolicyGateClosed", err)
 	}
 }
 
@@ -411,18 +421,22 @@ func TestResetAdmin_ReEnablesTheAdminAccount(t *testing.T) {
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
 	writeLifecycle(t, s, "admin", corrosion.UserAttrExpiresAt, "2000-01-01T00:00:00Z")
 	hash, _ := bcrypt.GenerateFromPassword([]byte("fresh-password"), auth.BcryptCost)
-	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash), false); err != nil {
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, s.withLoginPolicy, string(hash), false); err != nil {
 		t.Fatalf("ResetAdminPassword: %v", err)
 	}
 	login(t, s, "admin", "fresh-password")
 
 	// With the gate closed it refuses rather than resetting a password the
-	// account still cannot use.
+	// account still cannot use: the daemon's gate refuses, and with no gate
+	// at all (reset-admin with the daemon down) the writer refuses.
 	writeLifecycle(t, s, "admin", corrosion.UserAttrDisabled, "true")
-	s.db.SetLoginPolicyGate(nil)
-	if err := corrosion.ResetAdminPassword(context.Background(), s.db, string(hash), false); err == nil ||
-		!strings.Contains(err.Error(), "login_policy_v1") {
-		t.Fatalf("ResetAdminPassword with the gate closed on a disabled admin: %v, want a refusal naming login_policy_v1", err)
+	s.SetReleaseFeatureGate(nil)
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, s.withLoginPolicy, string(hash), false); err == nil ||
+		!strings.Contains(err.Error(), loginPolicyRefusal) {
+		t.Fatalf("ResetAdminPassword with the gate closed on a disabled admin: %v, want %q", err, loginPolicyRefusal)
+	}
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, nil, string(hash), false); !errors.Is(err, corrosion.ErrLoginPolicyGateClosed) {
+		t.Fatalf("ResetAdminPassword with no gate on a disabled admin: %v, want ErrLoginPolicyGateClosed", err)
 	}
 }
 
@@ -680,13 +694,12 @@ func TestSetLoginPolicy_EndsSessionsInNewlyCoveredRealms(t *testing.T) {
 }
 
 func TestSetLoginPolicy_RefusedBeforeTheLatchAndValidated(t *testing.T) {
-	s := testServer(t)
-	s.db.SetLoginPolicyGate(func() bool { return true })
+	s := testServer(t) // no release-feature gate: every feature is refused
 	s.db.SetClusterPolicyGate(func() bool { return true })
 	s.SetGate(fakeServerGate{durablyLatchedTok: map[string]bool{capabilities.FailoverScopeV1: true}})
 	_, err := s.SetLoginPolicy(adminCtx(), &pb.SetLoginPolicyRequest{Require_2Fa: "all"})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), capabilities.LoginPolicyV1) {
-		t.Fatalf("SetLoginPolicy before the latch: %v, want FailedPrecondition naming %s", err, capabilities.LoginPolicyV1)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), loginPolicyRefusal) {
+		t.Fatalf("SetLoginPolicy before the latch: %v, want FailedPrecondition %q", err, loginPolicyRefusal)
 	}
 	if p, _ := corrosion.GetTwoFactorPolicy(context.Background(), s.db); !p.Off() {
 		t.Fatalf("a refused policy was written: %+v", p)

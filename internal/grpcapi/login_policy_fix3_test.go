@@ -213,7 +213,7 @@ func TestM3_ResetAdminReEnableIsACutoff(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.ResetAdminPassword(context.Background(), s.db, mustHash(t, "fresh-pw-0123456789"), false); err != nil {
+	if err := corrosion.ResetAdminPassword(context.Background(), s.db, s.withLoginPolicy, mustHash(t, "fresh-pw-0123456789"), false); err != nil {
 		t.Fatal(err)
 	}
 	_, err := s.authenticate(bearerCtx(SessionTokenPrefix + "lagging-admin"))

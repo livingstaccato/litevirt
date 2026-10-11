@@ -317,7 +317,7 @@ func newUserDisableCmd() *cobra.Command {
 		Long: `Disable an account (admin only). It cannot log in through any realm, its
 sessions are ended, and its API tokens are refused until it is re-enabled
 with ` + "`lv user enable`" + `. Refused for the last admin that is enabled with no
-expiry, and until login_policy_v1 has latched on every host.
+expiry, and until the cluster upgrade has finished.
 
 A disable cannot reach the distributable lv-cli client certificate, which
 authenticates as the cluster admin with no user behind it; turn on
@@ -355,7 +355,7 @@ func newUserExpireCmd() *cobra.Command {
 2026-12-31T00:00:00Z, or "never" to clear it. From that instant the account
 cannot log in and its sessions and API tokens are refused. Setting an expiry
 ends the account's current sessions. Refused for the last admin that is
-enabled with no expiry, and until login_policy_v1 has latched on every host.`,
+enabled with no expiry, and until the cluster upgrade has finished.`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			exp := args[1]

@@ -1,13 +1,15 @@
 // Fleet scenario for the login rules (account disable/expiry and the mandatory
 // second factor) over real gRPC and independent replicas: written on one
 // node, enforced on another node's authentication path once replication has
-// carried it, and refused everywhere until login_policy_v1 has latched.
+// carried it, and refused everywhere until the login_policy release feature
+// can open (release_2026_11_v1 latched).
 package fleet
 
 import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,7 +28,7 @@ func assertNoLifecycleRows(t *testing.T, n *Node) {
 		t.Fatalf("%s: query user_lifecycle: %v", n.Name, err)
 	}
 	if len(rows) != 0 {
-		t.Fatalf("%s holds %d user_lifecycle rows written before login_policy_v1 latched", n.Name, len(rows))
+		t.Fatalf("%s holds %d user_lifecycle rows written before the login_policy feature opened", n.Name, len(rows))
 	}
 }
 
@@ -37,14 +39,7 @@ func assertNoLifecycleRows(t *testing.T, n *Node) {
 // refused and nothing reaches any replica.
 func TestFleet_DisableWrittenOnOneNodeRefusedOnAnother(t *testing.T) {
 	ctx := context.Background()
-	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 64})
-	gates := gateAll(t, c)
-	for _, n := range c.Nodes {
-		g := gates[n.Name]
-		n.DB.SetLoginPolicyGate(func() bool { return g.DurablyLatched(capabilities.LoginPolicyV1) })
-		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
-	}
-	c.WaitConverged(t, convergeTimeout)
+	c, gates := latchedFleet(t, 3, 64)
 	a, b, cc := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	adminA, adminB := c.SelfClient(a), c.SelfClient(b)
 
@@ -62,20 +57,26 @@ func TestFleet_DisableWrittenOnOneNodeRefusedOnAnother(t *testing.T) {
 	}
 	c.WaitConverged(t, convergeTimeout)
 
-	// 1. Before the latch: refused, naming the token, nothing written anywhere.
+	// 1. Before the latch (node-2 modelled as a host still on the previous
+	// build): refused, naming the feature and the token, nothing written.
+	cc.Server.SetWALQuarantined(func() bool { return true })
 	yes := true
 	_, err = adminA.SetUserAccount(ctx, &pb.SetUserAccountRequest{Username: "bob", Disabled: &yes})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("SetUserAccount before the latch: %v, want FailedPrecondition", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), loginPolicyRefusal) {
+		t.Fatalf("SetUserAccount before the latch: %v, want FailedPrecondition %q", err, loginPolicyRefusal)
 	}
 	for _, n := range c.Nodes {
 		assertNoLifecycleRows(t, n)
 	}
+	cc.Server.SetWALQuarantined(cc.DB.WALQuarantined)
 
+	// A peer's last (empty) answer is reused for a few seconds, so the latch
+	// forms once every node has asked afresh.
 	for _, n := range c.Nodes {
-		if !gates[n.Name].Enforced(ctx, capabilities.LoginPolicyV1) || !gates[n.Name].DurablyLatched(capabilities.LoginPolicyV1) {
-			t.Fatalf("%s: login_policy_v1 did not latch on a uniform fleet", n.Name)
-		}
+		g := gates[n.Name]
+		eventually(t, 10*time.Second, n.Name+": "+capabilities.ReleaseToken+" to latch on a uniform fleet", func() bool {
+			return g.Enforced(ctx, capabilities.ReleaseToken) && g.DurablyLatched(capabilities.ReleaseToken)
+		})
 	}
 
 	login, err := c.SelfClient(b).Login(ctx, &pb.LoginRequest{Username: "bob", Password: "bobs-password-0123456789"})
@@ -120,21 +121,8 @@ func TestFleet_DisableWrittenOnOneNodeRefusedOnAnother(t *testing.T) {
 func TestFleet_TwoFactorPolicySetOnOneNodeEnforcedOnAnother(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 641})
-	gates := gateAll(t, c)
-	for _, n := range c.Nodes {
-		g := gates[n.Name]
-		n.DB.SetLoginPolicyGate(func() bool { return g.DurablyLatched(capabilities.LoginPolicyV1) })
-		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
-	}
-	c.WaitConverged(t, convergeTimeout)
+	latchLoginPolicy(t, c)
 	a, cc := c.Nodes[0], c.Nodes[2]
-	for _, n := range c.Nodes {
-		for _, tok := range []string{capabilities.LoginPolicyV1, capabilities.FailoverScopeV1} {
-			if !gates[n.Name].Enforced(ctx, tok) || !gates[n.Name].DurablyLatched(tok) {
-				t.Fatalf("%s: %s did not latch on a uniform fleet", n.Name, tok)
-			}
-		}
-	}
 	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
 		Username: "bob", Password: "bobs-password-0123456789", Role: "operator",
 	}); err != nil {
@@ -180,20 +168,22 @@ func TestFleet_TwoFactorPolicySetOnOneNodeEnforcedOnAnother(t *testing.T) {
 	}
 }
 
-// latchLoginPolicy wires the login-policy and cluster-policy gates to each
-// node's real checker and drives both latches.
+// loginPolicyRefusal is the release-feature gate's refusal of a login rule
+// before the release token has latched.
+var loginPolicyRefusal = "the cluster upgrade must finish first (" + string(capabilities.FeatureLoginPolicy) +
+	" needs " + capabilities.ReleaseToken + ")"
+
+// latchLoginPolicy wires each node's real release-feature gate (and the
+// cluster-policy gate the used record needs) and drives the release token's
+// latch, so the login_policy feature can open.
 func latchLoginPolicy(t *testing.T, c *Cluster) {
 	t.Helper()
 	ctx := context.Background()
 	gates := gateAll(t, c)
-	for _, n := range c.Nodes {
-		g := gates[n.Name]
-		n.DB.SetLoginPolicyGate(func() bool { return g.DurablyLatched(capabilities.LoginPolicyV1) })
-		n.DB.SetClusterPolicyGate(func() bool { return g.DurablyLatched(capabilities.FailoverScopeV1) })
-	}
+	wireReleaseFeatures(t, c, gates)
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
-		for _, tok := range []string{capabilities.LoginPolicyV1, capabilities.FailoverScopeV1} {
+		for _, tok := range []string{capabilities.ReleaseToken, capabilities.FailoverScopeV1} {
 			if !gates[n.Name].Enforced(ctx, tok) || !gates[n.Name].DurablyLatched(tok) {
 				t.Fatalf("%s: %s did not latch on a uniform fleet", n.Name, tok)
 			}
@@ -313,4 +303,95 @@ func TestFleet_DelegatedRevokesOnTwoNodesNeverEmptyAPrincipal(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestFleet_LoginPolicy_ReleaseFeatureGate: the login rules are the release
+// feature login_policy. While a host is still on the previous build (modelled
+// as one advertising nothing), every login rule is refused with the release
+// refusal and nothing is written or recorded anywhere — and what the previous
+// release does (create, log in, delete) still works, without the rules' data.
+// Once every host runs this build, the first login rule records the use, held
+// by every replica, before its data exists.
+func TestFleet_LoginPolicy_ReleaseFeatureGate(t *testing.T) {
+	ctx := context.Background()
+	c, gates := latchedFleet(t, 3, 645)
+	a, old := c.Nodes[0], c.Nodes[2]
+	admin := c.SelfClient(a)
+	feature := string(capabilities.FeatureLoginPolicy)
+	assertUnused := func(when string) {
+		t.Helper()
+		for _, n := range c.Nodes {
+			assertNoLifecycleRows(t, n)
+			if featureUsedOn(t, n, capabilities.ReleaseToken, feature) {
+				t.Fatalf("%s: %s recorded as used %s", n.Name, feature, when)
+			}
+		}
+	}
+
+	old.Server.SetWALQuarantined(func() bool { return true })
+	for _, u := range []string{"bob", "carol"} {
+		if _, err := admin.CreateUser(ctx, &pb.CreateUserRequest{
+			Username: u, Password: u + "-password-0123456789", Role: "operator",
+		}); err != nil {
+			t.Fatalf("CreateUser %s with a host on the previous build: %v", u, err)
+		}
+	}
+	if _, err := admin.Login(ctx, &pb.LoginRequest{Username: "bob", Password: "bob-password-0123456789"}); err != nil {
+		t.Fatalf("a login with a host on the previous build: %v", err)
+	}
+	if _, err := admin.DeleteUser(ctx, &pb.DeleteUserRequest{Username: "carol"}); err != nil {
+		t.Fatalf("DeleteUser with a host on the previous build: %v", err)
+	}
+	yes := true
+	refusals := map[string]func() error{
+		"SetUserAccount": func() error {
+			_, err := admin.SetUserAccount(ctx, &pb.SetUserAccountRequest{Username: "bob", Disabled: &yes})
+			return err
+		},
+		"SetLoginPolicy": func() error {
+			_, err := admin.SetLoginPolicy(ctx, &pb.SetLoginPolicyRequest{Require_2Fa: "all"})
+			return err
+		},
+		"IssueEnrollmentCode": func() error {
+			_, err := admin.IssueEnrollmentCode(ctx, &pb.IssueEnrollmentCodeRequest{Username: "bob"})
+			return err
+		},
+		"ClearIdentityBinding": func() error {
+			_, err := admin.ClearIdentityBinding(ctx, &pb.ClearIdentityBindingRequest{Username: "bob", Realm: "ldap:corp"})
+			return err
+		},
+	}
+	for name, call := range refusals {
+		if err := call(); status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), loginPolicyRefusal) {
+			t.Fatalf("%s with a host on the previous build: %v, want FailedPrecondition %q", name, err, loginPolicyRefusal)
+		}
+	}
+	if gates[a.Name].Latched(capabilities.ReleaseToken) {
+		t.Fatalf("the release token latched across %s", old.Name)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	assertUnused("before the latch")
+
+	// Every host on this build: the disable opens the feature. Its use is on
+	// every replica by the time the call returns — the gate waited for each
+	// to hold it before the write ran — and the data follows.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	var err error
+	eventually(t, 10*time.Second, "the first login rule accepted on a uniform fleet", func() bool {
+		_, err = admin.SetUserAccount(ctx, &pb.SetUserAccountRequest{Username: "bob", Disabled: &yes})
+		return err == nil
+	})
+	for _, n := range c.Nodes {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, feature) {
+			t.Fatalf("%s does not hold the %s record although the disable has been written", n.Name, feature)
+		}
+	}
+	eventually(t, convergeTimeout, "the disable on every replica", func() bool {
+		for _, n := range c.Nodes {
+			if l, err := corrosion.GetUserLifecycle(ctx, n.DB, "bob"); err != nil || !l.Disabled {
+				return false
+			}
+		}
+		return true
+	})
 }

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // UserRecord represents a litevirt user.
@@ -276,14 +278,19 @@ const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at =
 // canonical realm-qualified principal and the legacy bare form are removed.
 // (Local users authenticate through the "local" realm; external OIDC/LDAP group
 // bindings are out of scope — they are not session-persisted yet.)
+//
+// DeleteUser writes none of the login rules' data (it hands DeleteUserCounted
+// the zero grant), as a delete before the release feature opens does.
 func DeleteUser(ctx context.Context, c *Client, username string) error {
-	_, _, err := DeleteUserCounted(ctx, c, username)
+	_, _, err := DeleteUserCounted(ctx, c, capabilities.FeatureGrant{}, username)
 	return err
 }
 
 // DeleteUserCounted is DeleteUser, reporting how many sessions and API tokens
-// its batch revoked.
-func DeleteUserCounted(ctx context.Context, c *Client, username string) (sessions, tokens int, err error) {
+// its batch revoked. With a grant for capabilities.FeatureLoginPolicy the same
+// batch also voids the account's enrollment code, clears its directory
+// bindings and writes its durable session and token cut-offs.
+func DeleteUserCounted(ctx context.Context, c *Client, g capabilities.FeatureGrant, username string) (sessions, tokens int, err error) {
 	now := c.NowTS()
 	marker := nowRFC3339()
 	barePrincipal := "user:" + username
@@ -313,7 +320,7 @@ func DeleteUserCounted(ctx context.Context, c *Client, username string) (session
 	for _, r := range tokRows {
 		stmts = append(stmts, Statement{SQL: tokenRevokeSQL, Params: []interface{}{marker, now, r.String("id")}})
 	}
-	if c.MayWriteLoginPolicy() {
+	if g.Check(capabilities.FeatureLoginPolicy) == nil {
 		// A deleted account's first-enrollment code goes with it (N3); its
 		// directory binding too, so a re-created name binds afresh (N5).
 		stmts = append(stmts, invalidateEnrollmentCodeStatement(username, now))
@@ -521,15 +528,19 @@ func looksLikeAPIToken(s string) bool {
 // 3, I1a). The password is replaced by ReinstatedAdminPasswordHash, which no
 // password matches and which marks the account as local, so no directory
 // login adopts it either; every session and API token this node holds for it
-// is revoked and every second factor cleared; and, once login_policy_v1 has
-// latched, durable session and token cut-offs cover the ones it does not
-// hold. That matters most for an admin deleted by a build before the login
+// is revoked and every second factor cleared; and, when run opens the
+// release feature capabilities.FeatureLoginPolicy, durable session and token
+// cut-offs cover the ones it does not hold. That matters most for an admin deleted by a build before the login
 // rules, whose delete revoked nothing: its never-expiring API tokens would
 // otherwise authenticate as cluster admin again. Root gives the account a
 // credential with `lv user reset-admin --user <name>`, which the
 // no_unrestricted_admin condition names until it does. All of it is ONE batch,
 // so the row never comes back without the revocations.
-func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) {
+//
+// run opens the release feature only once a reinstatement is decided, so a
+// floor check that finds an admin never marks the feature used; nil writes
+// without its data.
+func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client, run FeatureRun) (string, error) {
 	// Counts only admins that can log in (t1-auth-review I4): a disabled or
 	// expired admin is not an administrator anyone can use.
 	usable, err := UsableAdminExists(ctx, c)
@@ -572,11 +583,14 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	// it, as in auth.EnsureUserShadow — and stays external.
 	external := resolveCredential(rows[pick].String("cred_key") != "", rows[pick].String("cred_val"),
 		rows[pick].String("password_hash")) == ""
-	stmts, err := reinstateAdminStatements(ctx, c, victim, external, rows[pick].String("deleted_at"))
-	if err != nil {
-		return "", err
-	}
-	if err := c.ExecuteBatch(ctx, stmts); err != nil {
+	deletedAt := rows[pick].String("deleted_at")
+	if err := run.run(ctx, func(ctx context.Context, g capabilities.FeatureGrant) error {
+		stmts, err := reinstateAdminStatements(ctx, c, g, victim, external, deletedAt)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, stmts)
+	}); err != nil {
 		return "", err
 	}
 	return victim, nil
@@ -612,7 +626,8 @@ const ReinstatedAdminPasswordHash = "!reinstated-by-admin-floor: run lv user res
 // credential upsert, the per-row session and token revokes DeleteUser uses,
 // DeleteUser's second-factor clear, the binding upsert, and the lifecycle and
 // enrollment-code writes.
-func reinstateAdminStatements(ctx context.Context, c *Client, victim string, external bool, deletedAt string) ([]Statement, error) {
+func reinstateAdminStatements(ctx context.Context, c *Client, g capabilities.FeatureGrant, victim string, external bool, deletedAt string) ([]Statement, error) {
+	loginRules := g.Check(capabilities.FeatureLoginPolicy) == nil
 	now := c.NowTS()
 	marker := nowRFC3339()
 	hash := ReinstatedAdminPasswordHash
@@ -623,7 +638,7 @@ func reinstateAdminStatements(ctx context.Context, c *Client, victim string, ext
 	if c.MayWriteCredentialTables() {
 		stmts = append(stmts, Statement{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}})
 	}
-	if external && c.MayWriteLoginPolicy() {
+	if external && loginRules {
 		restore, err := restoreDeletedBindingsStatements(ctx, c, victim, deletedAt, now)
 		if err != nil {
 			return nil, err
@@ -645,7 +660,7 @@ func reinstateAdminStatements(ctx context.Context, c *Client, victim string, ext
 		stmts = append(stmts, Statement{SQL: tokenRevokeSQL, Params: []interface{}{marker, now, r.String("id")}})
 	}
 	stmts = append(stmts, clearSecondFactorStatements(victim, marker, now)...)
-	if c.MayWriteLoginPolicy() {
+	if loginRules {
 		life, err := GetUserLifecycle(ctx, c, victim)
 		if err != nil {
 			return nil, err

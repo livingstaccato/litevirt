@@ -15,7 +15,8 @@ import (
 // real replication between lab nodes, and checks every replica's
 // user_lifecycle rows directly.
 //
-// Needs login_policy_v1 latched on the lab (every node on this build).
+// Needs release_2026_11_v1 latched on the lab (every node on this build), so
+// the login_policy feature can open.
 
 var tokenLine = regexp.MustCompile(`(?m)^Token:\s+([0-9a-f]{64})\s*$`)
 

@@ -81,19 +81,32 @@ func withFeature(t *testing.T, open bool) *daemonStub {
 	return d
 }
 
-// A plain init's stdout is byte-identical to main's: the hint goes to stderr.
+// A plain init's stdout is byte-identical to main's (no compression suffix):
+// main:cmd/litevirt/pbsrepo.go prints exactly these lines.
 func TestBackupRepoInit_DefaultStdoutIsMains(t *testing.T) {
 	withFeature(t, true)
-	dir := filepath.Join(t.TempDir(), "repo")
-	var err error
-	out := captureStdout(t, func() { err = runBackupRepoCmd(t, "init", dir) })
-	if err != nil {
+	key := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(key, []byte(strings.Repeat("ab", 32)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := openRepo(t, dir)
-	want := "Repository initialised at " + r.Root() + " (compression: none)\n"
-	if out != want {
-		t.Fatalf("stdout = %q, want main's %q", out, want)
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "Repository initialised at %s\n"},
+		{[]string{"--compression", "none"}, "Repository initialised at %s\n"},
+		{[]string{"--encrypted", "--key-file", key},
+			"Encrypted repository initialised at %s\nKeep the key file safe — without it, no chunk can be decrypted.\n"},
+	} {
+		dir := filepath.Join(t.TempDir(), "repo")
+		var err error
+		out := captureStdout(t, func() { err = runBackupRepoCmd(t, append([]string{"init", dir}, tc.args...)...) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := strings.Replace(tc.want, "%s", openRepo(t, dir).Root(), 1); out != want {
+			t.Fatalf("init %v: stdout = %q, want main's %q", tc.args, out, want)
+		}
 	}
 }
 

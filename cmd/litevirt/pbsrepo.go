@@ -71,11 +71,17 @@ func zstdRefusal(why error) error {
 
 // printInitialised reports a created repository.
 func printInitialised(root, compression string, encrypted bool) error {
+	// Uncompressed output is main's, byte for byte; the compression suffix
+	// appears only when zstd was asked for.
+	suffix := ""
+	if compression != pbsstore.CompressionNone {
+		suffix = fmt.Sprintf(" (compression: %s)", compression)
+	}
 	if encrypted {
-		fmt.Printf("Encrypted repository initialised at %s (compression: %s)\n", root, compression)
+		fmt.Printf("Encrypted repository initialised at %s%s\n", root, suffix)
 		fmt.Println("Keep the key file safe — without it, no chunk can be decrypted.")
 	} else {
-		fmt.Printf("Repository initialised at %s (compression: %s)\n", root, compression)
+		fmt.Printf("Repository initialised at %s%s\n", root, suffix)
 	}
 	if compression != pbsstore.CompressionNone {
 		fmt.Println("A compressed repository is not readable by litevirt releases without backup compression;",

@@ -119,7 +119,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	// Firmware-state capture (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm must be
 	// captured at the SAME instant as disk+RAM, or a revert pairs reverted disks
 	// with current firmware (BitLocker desync). A running disk-only snapshot has no
-	// consistent capture point — require --with-memory there.
+	// consistent capture point — require --memory there.
 	fwSpec := parseFirmwareSpec(vm.Spec)
 	fwUUID := fwSpec.UUID
 	hasFW := fwSpec.SecureBoot || fwSpec.Tpm
@@ -128,7 +128,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if !withMemory {
 			if st, _ := s.virt.DomainState(req.VmName); st == "running" {
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"a running Secure Boot / vTPM VM must be snapshotted with --with-memory (its firmware state can't be captured from a live disk-only snapshot)")
+					"a running Secure Boot / vTPM VM must be snapshotted with --memory (`lv snapshot create --memory`; its firmware state can't be captured from a live disk-only snapshot)")
 			}
 		}
 		// Preflight: the firmware state must be present locally to capture it —
@@ -653,7 +653,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// metadata-only delete; a flatten failure falls back to it too, so the
 	// snapshot is always removable.
 	existing, _ := corrosion.ListSnapshots(ctx, s.db, req.VmName)
-	// An errored snapshot (e.g. a failed --with-memory capture that still cut the
+	// An errored snapshot (e.g. a failed --memory capture that still cut the
 	// disk overlay over) has no usable RAM image — its only residue is the disk
 	// overlay, so it must be flattened on delete even though Type=="memory";
 	// otherwise the VM is left stranded on an untracked overlay chain (G1).

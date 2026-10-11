@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"strings"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -168,6 +169,11 @@ func TestResolveRestoreSpec_Precedence(t *testing.T) {
 	)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("missing metadata without from_existing: got %v", err)
+	}
+	// The advice names only flags `lv backup restore-live` has: there is no
+	// --spec, and --name renames, it supplies no spec.
+	if msg := status.Convert(err).Message(); strings.Contains(msg, "--spec") || !strings.Contains(msg, "--from-existing") {
+		t.Errorf("advice names a flag the CLI does not have, or not --from-existing: %q", msg)
 	}
 }
 

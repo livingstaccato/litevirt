@@ -49,7 +49,7 @@ func (s *Server) resolveRestoreSpec(ctx context.Context, req *pb.RestoreLiveRequ
 		}
 	}
 	return nil, status.Error(codes.FailedPrecondition,
-		"manifest has no embedded VM metadata; pass --spec/--name or --from-existing, or restore without --auto-start")
+		"manifest has no embedded VM metadata; pass --from-existing to use the VM's existing record (or a spec on the request), or restore without --auto-start")
 }
 
 // autoDefineRestoredVM reconstructs and starts a VM from the resolved spec

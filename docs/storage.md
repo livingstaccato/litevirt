@@ -213,16 +213,26 @@ fallback, and `litevirt schema-migrate` all run as root. If the narrowing
 fails, the daemon logs a warning naming the file and starts anyway.
 
 A backup session (a backup, a replication, or a point-in-time volume copy of a
-running VM) gets its own directory, `<vm>-<disk target>`, in each of `/var/lib/litevirt/backup-scratch`
-and `/var/lib/litevirt/backup-sock`. qemu creates the fleecing scratch image
-in one and binds the NBD socket in the other, and the daemon reads the disk
-through that socket. Both parent directories are root's and `0711`; earlier
-releases set them to `0777` at every session, and the next session narrows
-them. Each session directory belongs to the user qemu runs as for that VM
-(libvirt's DAC label) and is `0700`, so no other local user can reach the
-socket or the scratch. If that user cannot be read from the domain, or the
-chown is refused, the session directory is `01733` instead: sticky and not
-listable.
+running VM) makes a new directory of its own in each of
+`/var/lib/litevirt/backup-scratch` and `/var/lib/litevirt/backup-sock`: qemu
+creates the fleecing scratch image in one and binds the NBD socket in the
+other, and the daemon reads the disk through that socket. Each name ends in a
+random 16-character suffix and is made with a mkdir that fails if the name
+exists, so a session never uses a directory that was already there. Each
+belongs to the user qemu runs as for that VM (libvirt's DAC label, resolved by
+name when it is one) and is `0700`, so no other local user can reach the socket
+or the scratch. If that user cannot be read from the domain, or the chown is
+refused, the session directory is `01733` instead: every local user may create
+entries in it, but its name is unguessable and nobody but root can list the
+directory it is in, so nobody else can find it. Both parent directories must be
+root's own `0711` directories. Earlier releases set them to `0777` at every
+session; at daemon start and at every session, a parent that is anything else
+(`0777`, another user's, a symlink, a file) is renamed aside to
+`.backup-scratch.aside-<time>-<id>` (or `.backup-sock…`) beside it, kept with
+everything in it, and made afresh, with a warning naming both. Remove the
+set-aside copy once you have looked at it. A session's directories are removed
+when it ends, and a crashed session's scratch is removed by the next backup of
+the same disk.
 
 ### Directory pools on NFS
 

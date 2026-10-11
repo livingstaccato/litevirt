@@ -186,6 +186,9 @@ func New(cfg *Config) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("libvirt: %w", err)
 	}
+	// An earlier build left the backup session directories 0777; narrow them
+	// now rather than at the first backup (best effort, logged).
+	libvirt.PrepareBackupRoots()
 
 	// Image store
 	store := image.NewStore(cfg.DataDir)

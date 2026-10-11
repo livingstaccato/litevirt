@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -58,7 +57,7 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 // emitted only once the release token has DURABLY latched here: the latch is
 // replication-gated, so every host this one replicates to advertised a build
 // that has them, and it is monotone, so it never re-opens. This reads the latch
-// locally and asks no peer (ReleaseFeatureAvailable), and records no use: these
+// locally and asks no peer (ReleaseTokenLatched), and records no use: these
 // statements are a better form of a write main already makes, not release
 // feature data, so a cluster that never replicates a container still rolls back
 // below the release without a quarantine.
@@ -77,5 +76,5 @@ func (s *Server) wireReplicationReleaseGates() {
 }
 
 func (s *Server) repointReady(context.Context) bool {
-	return s.ReleaseFeatureAvailable(capabilities.FeatureContainerReplication)
+	return s.ReleaseTokenLatched()
 }

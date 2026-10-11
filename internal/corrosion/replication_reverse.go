@@ -265,7 +265,7 @@ func ReverseReplicationAudited(ctx context.Context, c *Client, kind, name, proje
 // SetRepointReady installs the answer to "may this client emit
 // RepointReplicationTarget's statement" (and MintContainerPlacement's): true
 // only once the release token has durably latched here (grpcapi wires
-// Server.ReleaseFeatureAvailable). The latch is replication-gated, so every
+// Server.ReleaseTokenLatched). The latch is replication-gated, so every
 // host this one replicates to advertised a build that has both shapes, and it
 // never re-opens. nil, the default, is "no".
 func (c *Client) SetRepointReady(fn func(context.Context) bool) { c.repointReady.Store(&fn) }

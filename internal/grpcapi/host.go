@@ -738,6 +738,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			}
 			return progress
 		}
+		// The ownership has committed: the replication direction switches now,
+		// before the hand-over below can fail, as finishMigrationOnTarget does.
+		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
 		// A guest handed over paused runs once the target has its guards in
 		// force; until then the move is not clean (re-review R3-I2).
 		if herr := armed.finish(context.WithoutCancel(ctx)); herr != nil {
@@ -746,7 +749,6 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			progress.Error = "migrated; " + herr.Error()
 			return progress
 		}
-		s.reverseReplicationAfterMove(ctx, "vm", vm.Name, "", s.hostName, target.Name)
 		progress.Status = "done"
 		progress.ProgressPct = 100
 		return progress

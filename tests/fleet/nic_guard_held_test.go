@@ -219,3 +219,47 @@ func TestFleet_NICGuard_ResumeHeldCommand(t *testing.T) {
 		t.Errorf("resuming a guest that is not held: %v, want FailedPrecondition", err)
 	}
 }
+
+// TestFleet_NICGuard_HeldDrainStillReversesReplication (merge review I1): a
+// drain that live-moves a guarded VM onto its own replica target switches the
+// schedule to replicate back to the host it left as soon as the ownership
+// commits, even when the target then cannot let the paused guest run. Done
+// after the hand-over instead, a failing hand-over left the schedule naming the
+// host the VM runs on, which the runner suspends and nothing re-points.
+func TestFleet_NICGuard_HeldDrainStillReversesReplication(t *testing.T) {
+	c, src, dst, _ := heldCluster(t)
+	ctx := context.Background()
+	setHostCapacity(t, c, src.Name, 64, 65536, nil)
+	setHostCapacity(t, c, dst.Name, 64, 65536, nil)
+	drPool(t, c, src)
+	drPool(t, c, dst)
+	if err := corrosion.UpsertBackupSchedule(ctx, src.DB, corrosion.BackupScheduleRecord{
+		VMName: "old", Scope: "vm", Repo: "dr", Cron: "0 * * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: dst.Name, KeepReplicas: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dst.Virt.FailResumeDomain = func(string) error { return errors.New("qemu would not resume") }
+
+	st, err := c.SelfClient(src).DrainHost(ctx, &pb.DrainHostRequest{Name: src.Name})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	var last *pb.DrainProgress
+	for {
+		p, rerr := st.Recv()
+		if rerr != nil {
+			break
+		}
+		if p.GetVmName() == "old" {
+			last = p
+		}
+	}
+	if last == nil || last.GetStatus() != "error" || !strings.Contains(last.GetError(), "held paused on "+dst.Name) {
+		t.Fatalf("fixture: drain progress = %+v, want the hand-over to fail with the hold", last)
+	}
+	if got := scheduleTarget(t, src, "old", "dr"); got != src.Name {
+		t.Fatalf("after the drain committed old onto its replica host %s, the schedule targets %q, want the host it left, %q",
+			dst.Name, got, src.Name)
+	}
+}

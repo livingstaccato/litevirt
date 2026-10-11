@@ -133,6 +133,76 @@ You can also set it as a per-VM default in compose:
       with-storage: true
 ```
 
+### A dedicated migration network
+
+By default a live migration's data goes to the target host's cluster address,
+the one its record names and peers dial. Set `migration.network` in the
+source's config to move it onto another network, as Proxmox's
+`migration: network=<CIDR>` does:
+
+```yaml
+migration:
+  network: 10.20.0.0/24
+  # address: 10.20.0.7          # this host's own address there, when it holds several
+  # allow_any_network: false    # accept a network that is not private, or that holds the cluster address
+```
+
+The source asks the target, in the request that already prepares the move, for
+the address of its own inside that network, and sends the data there. Set it on
+every host that sends migrations, which is every host; nothing is stored in the
+cluster, so a host with no address in the network is found out at the move, not
+at start.
+
+**What it carries.** A live move's guest memory, the disk blocks of a
+`--with-storage` copy, and the disk stream of a cold move: a stopped VM's
+`lv migrate --cold`, a drain's cold move and the copy of a clone made with
+`--host`. The cold stream is the cluster's mTLS connection and is dialed at the
+migration address. It is checked against the host certificate exactly as before,
+so no certificate is reissued. Everything else (libvirt's control connection,
+ownership commits) stays on the cluster address.
+
+**Certificates.** The host certificate libvirt presents and the migration
+certificate QEMU presents carry the host's cluster address as their only IP
+name, so the network's address is in neither. The data channel goes to the
+migration address while the certificate is still checked against the cluster
+address (libvirt's `tls.destination`, gRPC's authority), which needs no new
+trust.
+
+**Encryption.** Nothing travels the migration network that a main build kept
+off it in the clear:
+
+- A memory-only move normally rides inside libvirt's tunnel on the cluster
+  address. To use the migration network it leaves the tunnel for QEMU's own
+  stream, which is used only when both hosts hold migration-TLS credentials
+  (`lv host install-migration-tls`); otherwise the move stays in the tunnel.
+- A storage copy uses the network only when it is encrypted (migration TLS on
+  both hosts). A copy you allowed unencrypted with
+  `migration.allow_unencrypted_storage` stays on the cluster address, as it
+  always did.
+
+**Which address a target answers.** `migration.address` if you set one (inside
+the network). Otherwise the lowest address inside the network that is not
+loopback, link-local, a load-balancer VIP, or on a bridge litevirt made or a
+libvirt, container or guest interface: a floating address would send one host's
+data to another. Set `migration.address` where a host holds several.
+
+**Which networks are accepted.** The daemon refuses to start with a network
+that is not inside a private range (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16),
+or that contains this host's cluster address or its default-route source
+address: such a network would send migration data out the uplink or the cluster
+interface. `migration.allow_any_network: true` overrides both rules.
+
+**Fallback.** A move falls back to the cluster address, and is never refused for
+it, when the source has no address in the network (its data would leave by the
+default route), the target has none, the target runs a build that predates the
+setting, it answers with an address outside the network, a cold move's
+migration address does not answer, or the move would be unencrypted. Each time
+the source logs a warning and records a `vm.migrate.network_fallback` event on
+the VM (`lv events <vm>`) naming the address used. The same applies to drain's
+live moves. A live migration that was sent over the network and then cannot
+connect (the migration ports 49152-49215 on the migration address must be
+reachable from the source) fails; the fallback is decided before the move.
+
 ## Cold migration
 
 `--cold` migrates a VM without moving a running guest live:
@@ -288,6 +358,97 @@ either: a migration off it is refused, naming the state and
 load-balancer apply there. A migration onto it is refused because its target is
 not `active`. A VM moved by a drain is started on its target, which is
 `active`.
+
+### Failback after maintenance
+
+`lv host undrain` returns a host to scheduling and moves nothing back. Failback
+is the opt-in that does, as Proxmox's HA failback property does: after the
+undrain, the VMs the drain moved away return by live migration, at a bounded
+rate.
+
+A drain records, for every VM it moves, the host it left and the host it went
+to, with the VM's creation time, ownership epoch and **placement generation** at
+that moment. The records are replicated, so any node can run the failback. The
+placement generation is a per-VM counter that every writer that changes a VM's
+host (a live or cold migration, a failover, a drain) advances in the same batch
+as the host change, so whichever host owns the VM has the generation of the move
+that made it the owner. A drained host's record can be the last thing it wrote
+before it was powered off, and may reach nobody until it returns, so failback
+does not rely on the record for this: the owner compares its own current
+generation with the recorded one, and any placement change since the drain, a
+hand move out and back included, stops the VM from being moved. Records, and the
+generation, are written only while cluster-wide policy writes are allowed
+(failover_scope_v1).
+
+**The release gate.** Failback needs every host to run a release that
+advances the generation and checks a failback move's preconditions. It is the
+`drain_failback` feature of the release token (`lv cluster upgrade-status`;
+see upgrades.md, "Rolling back after a release token latched"). Until that
+token has latched on every host (and every host in maintenance), no record is
+written, `lv cluster failback on` refuses, and `lv host failback` refuses ("the
+cluster upgrade must finish first (drain_failback needs ...): failback waits for
+the upgrade"); an undrain behaves exactly as it always has, and says so when the
+cluster policy is on. Every drain after the latch records the VMs it moved, so
+the first drain marks `drain_failback` used: from then on a host rolled back
+below the release is quarantined rather than left to move VMs without advancing
+their generation. The placement generation itself is not behind the feature: it
+is kept from the moment cluster-wide policy writes are allowed.
+
+A drain never waits for its records. Each is written after the VM's progress
+line, bounded to 3 seconds; one that is refused or times out (the first use
+waits for every host to acknowledge the feature, and a host that is down cannot)
+is skipped, put on the VM's events (`vm.failback`) and audited, and further
+records are skipped without asking again for a backoff of 5 seconds doubling
+to 5 minutes. A VM whose record was skipped is not failed back; `lv migrate`
+moves it by hand.
+
+A VM returns only while its record still describes it exactly. One that an
+operator has since moved by hand, that a failover recovered, that was deleted
+and created again, or that a later drain moved again stays where it is, and the
+run says so. The check is made twice: by the daemon that decides, and again by
+the VM's owner under the VM's lock, on its own replica, just before the move
+(host, owner epoch and placement generation). An owner on a release that cannot make that check (it says so in its Ping) has its VMs skipped, never moved. A
+node that serves the failback from a replica that has not yet heard of an
+operator's move therefore cannot move that VM back; the owner refuses. A VM no
+drain moved is never touched.
+
+Opting in, any one of:
+
+- the VM: `placement.failback: true` in compose (see [compose](compose.md));
+- the cluster: `lv cluster failback on` returns every drained VM on undrain
+  (`lv cluster failback off`, the default, turns it off; admin role);
+- this run: `lv host failback <host> --all`, which moves every VM the drain
+  moved and prints each result.
+
+With the policy on, or with a VM that opted in, `lv host undrain` starts the
+failback in the background on the daemon that served it and says so in its
+reply (how many VMs, on which daemon). `lv host undrain <host> --failback` waits
+for that run and prints each VM's result; it is the same run, not a second one,
+and moves only the VMs that opted in. `lv host failback <host> --follow`
+attaches to that run later. A second `lv host failback` while a run is going is
+refused with that hint. `lv host failback <host>` otherwise runs in the
+foreground; `--dry-run` shows what would move without moving anything.
+
+The background run belongs to the daemon, not to the undrain's caller: it runs
+as the system, so a session that expires during a long run does not fail its
+later moves. **A restart of that daemon ends the run.** The records persist;
+`lv host failback <host>` finishes what is left. Every VM it skips is recorded
+on that VM's events (`vm.failback`), not only in the daemon's log.
+
+Each move is an ordinary live migration (`lv migrate`), so all of that move's
+checks hold, including the destination host's capacity admission and the
+split-brain gate. Before it, the returning host is checked as a placement target
+through the same hard filters as initial placement: capacity, required labels,
+devices, anti-affinity and per-node limits, and a VM pinned to another host
+stays there. A VM that fails any check is reported with the reason and left with
+its record. VMs move one at a time, with a pause between moves (20 seconds), so
+a returning host is not hit by every migration at once.
+
+Failback moves a running VM live. A VM that is stopped, or has a disk on
+host-local storage (local, dir or btrfs) that a live move would have to copy, is
+reported and left; move it with `lv migrate <vm> <host> --cold`. The host must
+be `active`. A cancelled record stays in the replicated table as an empty row
+(a later release can delete them); the same VM name reuses its row.
 
 ### A VM with no domain
 

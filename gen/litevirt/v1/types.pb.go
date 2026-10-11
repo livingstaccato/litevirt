@@ -1045,16 +1045,19 @@ type PlacementSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// A host pin restricts candidate selection but never bypasses hard
 	// constraints (capacity, labels, devices, anti-affinity, or replica caps).
-	Host          string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	AntiAffinity  []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
-	Affinity      []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
-	Require       map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Prefer        map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Spread        bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
-	MaxPerNode    int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
-	Policy        string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
-	Rebalance     *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
-	NoMigrate     bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	Host         string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	AntiAffinity []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
+	Affinity     []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
+	Require      map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Prefer       map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Spread       bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
+	MaxPerNode   int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
+	Policy       string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
+	Rebalance    *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
+	NoMigrate    bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	// failback: after a drain moved this VM off a host, move it back by live
+	// migration once that host is undrained (docs/migration-failover.md).
+	Failback      bool `protobuf:"varint,11,opt,name=failback,proto3" json:"failback,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1155,6 +1158,13 @@ func (x *PlacementSpec) GetRebalance() *RebalanceSpec {
 func (x *PlacementSpec) GetNoMigrate() bool {
 	if x != nil {
 		return x.NoMigrate
+	}
+	return false
+}
+
+func (x *PlacementSpec) GetFailback() bool {
+	if x != nil {
+		return x.Failback
 	}
 	return false
 }
@@ -4229,8 +4239,14 @@ type Host struct {
 	// numerator for disk_total_gib. Daemons before this field carried this
 	// figure in disk_used_gib.
 	DiskAllocatedGib int64 `protobuf:"varint,22,opt,name=disk_allocated_gib,json=diskAllocatedGib,proto3" json:"disk_allocated_gib,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Set only in UndrainHost's reply: what the undrain did about failback.
+	// failback_started: a background failback run was started on the answering
+	// daemon (follow it with FailbackHost follow=true). failback_note says why
+	// not, or what to do, in words; empty when there is nothing to say.
+	FailbackStarted bool   `protobuf:"varint,23,opt,name=failback_started,json=failbackStarted,proto3" json:"failback_started,omitempty"`
+	FailbackNote    string `protobuf:"bytes,24,opt,name=failback_note,json=failbackNote,proto3" json:"failback_note,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Host) Reset() {
@@ -4415,6 +4431,20 @@ func (x *Host) GetDiskAllocatedGib() int64 {
 		return x.DiskAllocatedGib
 	}
 	return 0
+}
+
+func (x *Host) GetFailbackStarted() bool {
+	if x != nil {
+		return x.FailbackStarted
+	}
+	return false
+}
+
+func (x *Host) GetFailbackNote() string {
+	if x != nil {
+		return x.FailbackNote
+	}
+	return ""
 }
 
 type Image struct {
@@ -5895,7 +5925,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +
-	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\x89\x04\n" +
+	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\xa5\x04\n" +
 	"\rPlacementSpec\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12#\n" +
 	"\ranti_affinity\x18\x02 \x03(\tR\fantiAffinity\x12\x1a\n" +
@@ -5909,7 +5939,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\trebalance\x18\t \x01(\v2\x1a.litevirt.v1.RebalanceSpecR\trebalance\x12\x1d\n" +
 	"\n" +
 	"no_migrate\x18\n" +
-	" \x01(\bR\tnoMigrate\x1a:\n" +
+	" \x01(\bR\tnoMigrate\x12\x1a\n" +
+	"\bfailback\x18\v \x01(\bR\bfailback\x1a:\n" +
 	"\fRequireEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
@@ -6204,7 +6235,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\x93\a\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe3\a\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -6233,7 +6264,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
 	"\vcert_serial\x18\x15 \x01(\tR\n" +
 	"certSerial\x12,\n" +
-	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x1a9\n" +
+	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x12)\n" +
+	"\x10failback_started\x18\x17 \x01(\bR\x0ffailbackStarted\x12#\n" +
+	"\rfailback_note\x18\x18 \x01(\tR\ffailbackNote\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

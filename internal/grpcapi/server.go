@@ -318,6 +318,20 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationNetwork is migration.network: the IPv4 CIDR a migration's data
+	// should travel on (migration_network.go). Empty means the host's cluster
+	// address. localIPs is a test seam for the host's own addresses.
+	migrationNetwork                       string
+	pingWithoutMigratePreconditionsForTest bool // Ping answers as a release that does not check migration preconditions
+	cloneAsOlderBuildForTest               bool // CloneVM ignores destination_host and target_pool, as an older release does
+	migrationDial                          func(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error)
+	migrationAddress                       string // migration.address: this host's own answer, when set
+	localIPs                               func() ([]localAddr, error)
+	// failbacks is the set of hosts a failback is running for (failback.go).
+	failbacks failbackRuns
+	// drainRecords writes drain records off the drain's result path, with a
+	// bound and a backoff shared by every drain on this daemon (failback.go).
+	drainRecords drainRecorder
 	// isoResolvedWithheld makes EnsureDisks answer as a target older than
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.

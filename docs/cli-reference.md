@@ -51,6 +51,8 @@ lv cluster failover-scope [cluster|region]  # Show or set whether failover quoru
 lv cluster relay-restore            # List relay-health demotions and operator holds (since, until, reason)
 lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now; --hold keeps the lease
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
+lv cluster failback [on|off]       # Show or set whether an undrain moves drained VMs back (see
+                                   #   migration-failover.md → Failback after maintenance)
 lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
                                    #   rollback, and which release features are in use (see upgrades.md →
                                    #   Rolling back after a release token latched)
@@ -89,7 +91,8 @@ lv host ls --names                        # Print only host names, one per line 
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
-lv host undrain <host>                    # Return host to scheduling
+lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)
+lv host failback <host> [--all] [--dry-run] [--follow]   # Live-migrate VMs a drain moved away back to the host
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
                                           #   fence, `voter rm` if it votes, revokes + publishes the CRL,
@@ -908,7 +911,33 @@ lv clone <source> <new-name>       # Clone a template or stopped VM into a new V
   [--ip <ip>]                      # static IP for the clone's first NIC (default: DHCP)
   [--start]                        # start the clone after creation
   [--snapshot <name>]              # clone from this snapshot of the source
+  [--host <host>]                  # end up on another host: a full copy, moved there like `migrate --cold`
+  [--pool <pool>]                  # put the clone's disks in this file-based pool on that host
 ```
+
+`--host` makes the clone where the source's disks are, as a full copy (a linked
+clone cannot span hosts), then moves it to the host as `lv migrate <vm> <host>
+--cold` moves a stopped VM: its disks stream over the cluster's mTLS connection
+with a checksum, its domain is defined there, and the staged copy is removed
+once the handoff commits. The source host therefore needs room for the copy
+while it travels. `--pool` puts the disks in a pool: directly on the source's
+host, or, on another host, by a move-volume after the move. The caller needs the
+clone's permissions and the project must be allowed to use the pool; a clone on
+another host also needs `vm.migrate` and `vm.delete` on the new VM, `vm.move` for
+a pool there and `vm.start` for `--start`. All are checked as you, before any
+copy starts. The staged copy is admitted against the source host's free space
+with the same headroom a cold migration leaves, and refused if it would take the
+filesystem that holds running guests' disks that close to full. A request that
+entered at another node is carried to the source host with your identity; where
+forwarded identity is not enforced it is refused rather than run as a cluster
+peer. If the move fails, the staged copy is removed and nothing is left behind (a
+crash of the source host's daemon between staging and the move leaves the staged
+clone as a complete stopped VM there, whose events show `vm.clone.staged` without
+`vm.clone.moved`; `lv rm` removes it); the staged copy and a copy into a pool
+are admitted for space with headroom, a same-host clone is as it always was;
+if the move succeeded and a later step (the pool, the start) fails, the VM is
+complete on its host and the error names the command that finishes the job
+(`lv move-volume`, `lv start`).
 
 ## GitOps
 

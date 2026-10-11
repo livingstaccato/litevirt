@@ -577,7 +577,9 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 	if err != nil {
 		return fmt.Errorf("construct %s driver: %w", cfg.Driver, err)
 	}
-	if err := drv.DeleteDisk(ctx, d.Path); err != nil {
+	// hostDiskFile is the recorded path itself, except under the per-node file
+	// root a multi-node test gives each node.
+	if err := drv.DeleteDisk(ctx, s.hostDiskFile(d.Path)); err != nil {
 		return err
 	}
 	// The disk's data is destroyed by intent: a point-in-time overlay of it

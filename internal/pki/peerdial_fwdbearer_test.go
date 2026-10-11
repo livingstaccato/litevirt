@@ -65,3 +65,25 @@ func TestPropagateFwdBearer_PresentButEmptyIncomingMD(t *testing.T) {
 		t.Errorf("propagated fwd-bearer from empty inbound MD: %v", md.Get(FwdBearerMDKey))
 	}
 }
+
+// A bearer that arrived forwarded is relayed ONLY where a caller asks for it
+// (RelayForwardedBearer), not by every peer dial: the clone's own continuation
+// calls ask, a third hop of any other operation does not change identity.
+//
+// Mutation: make propagateFwdBearer relay FwdBearerMDKey again, or drop the
+// relay from RelayForwardedBearer.
+func TestForwardedBearerIsRelayedOnlyOnRequest(t *testing.T) {
+	in := metadata.NewIncomingContext(context.Background(), metadata.Pairs(FwdBearerMDKey, "Bearer lvs_abc"))
+	if md, ok := metadata.FromOutgoingContext(propagateFwdBearer(in)); ok && len(md.Get(FwdBearerMDKey)) != 0 {
+		t.Fatalf("every peer dial relays a forwarded bearer: %v", md)
+	}
+	md, ok := metadata.FromOutgoingContext(RelayForwardedBearer(in))
+	if !ok || len(md.Get(FwdBearerMDKey)) != 1 || md.Get(FwdBearerMDKey)[0] != "Bearer lvs_abc" {
+		t.Fatalf("RelayForwardedBearer dropped the caller: %v", md)
+	}
+	// With an authorization bearer the dial's own propagation already carries it.
+	in = metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer mine", FwdBearerMDKey, "Bearer other"))
+	if md, _ := metadata.FromOutgoingContext(RelayForwardedBearer(in)); len(md.Get(FwdBearerMDKey)) != 0 {
+		t.Fatalf("RelayForwardedBearer added a second bearer beside authorization: %v", md.Get(FwdBearerMDKey))
+	}
+}

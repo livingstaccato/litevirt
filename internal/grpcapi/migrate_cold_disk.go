@@ -100,8 +100,9 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 		// the connections made with the replaced one — the stream in flight
 		// finishes (pki.ConnTracker), but no new RPC starts on them — so the
 		// next disk must not reuse one; a fresh dial presents and sees the
-		// renewed certificates.
-		client, closeConn, err := s.dialPeer(ctx, targetHost)
+		// renewed certificates. Each dial goes to the migration network when
+		// one is configured (dialColdPeer), as the whole copy did.
+		client, closeConn, err := s.dialColdPeer(ctx, targetHost, vmName, abort.diskAddr)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
 		}

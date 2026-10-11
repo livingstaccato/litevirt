@@ -25,6 +25,9 @@ const (
 	LiteVirt_DrainHost_FullMethodName                  = "/litevirt.v1.LiteVirt/DrainHost"
 	LiteVirt_ShutdownHostWorkloads_FullMethodName      = "/litevirt.v1.LiteVirt/ShutdownHostWorkloads"
 	LiteVirt_UndrainHost_FullMethodName                = "/litevirt.v1.LiteVirt/UndrainHost"
+	LiteVirt_FailbackHost_FullMethodName               = "/litevirt.v1.LiteVirt/FailbackHost"
+	LiteVirt_GetFailbackPolicy_FullMethodName          = "/litevirt.v1.LiteVirt/GetFailbackPolicy"
+	LiteVirt_SetFailbackPolicy_FullMethodName          = "/litevirt.v1.LiteVirt/SetFailbackPolicy"
 	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
@@ -335,6 +338,12 @@ type LiteVirtClient interface {
 	DrainHost(ctx context.Context, in *DrainHostRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DrainProgress], error)
 	ShutdownHostWorkloads(ctx context.Context, in *ShutdownHostWorkloadsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ShutdownProgress], error)
 	UndrainHost(ctx context.Context, in *UndrainHostRequest, opts ...grpc.CallOption) (*Host, error)
+	// FailbackHost moves the VMs a drain moved off the host back to it by live
+	// migration, at a bounded rate. Get/SetFailbackPolicy read and change the
+	// cluster policy that makes an undrain do it by itself.
+	FailbackHost(ctx context.Context, in *FailbackHostRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FailbackProgress], error)
+	GetFailbackPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailbackPolicyStatus, error)
+	SetFailbackPolicy(ctx context.Context, in *SetFailbackPolicyRequest, opts ...grpc.CallOption) (*FailbackPolicyStatus, error)
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
@@ -1041,6 +1050,45 @@ func (c *liteVirtClient) UndrainHost(ctx context.Context, in *UndrainHostRequest
 	return out, nil
 }
 
+func (c *liteVirtClient) FailbackHost(ctx context.Context, in *FailbackHostRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FailbackProgress], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[2], LiteVirt_FailbackHost_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FailbackHostRequest, FailbackProgress]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_FailbackHostClient = grpc.ServerStreamingClient[FailbackProgress]
+
+func (c *liteVirtClient) GetFailbackPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailbackPolicyStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailbackPolicyStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFailbackPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFailbackPolicy(ctx context.Context, in *SetFailbackPolicyRequest, opts ...grpc.CallOption) (*FailbackPolicyStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailbackPolicyStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFailbackPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Host)
@@ -1223,7 +1271,7 @@ func (c *liteVirtClient) SupersededDisks(ctx context.Context, in *SupersededDisk
 
 func (c *liteVirtClient) UpgradeHost(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[2], LiteVirt_UpgradeHost_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[3], LiteVirt_UpgradeHost_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1236,7 +1284,7 @@ type LiteVirt_UpgradeHostClient = grpc.ClientStreamingClient[UpgradeHostRequest,
 
 func (c *liteVirtClient) PreStageUpgrade(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[3], LiteVirt_PreStageUpgrade_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[4], LiteVirt_PreStageUpgrade_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1249,7 +1297,7 @@ type LiteVirt_PreStageUpgradeClient = grpc.ClientStreamingClient[UpgradeHostRequ
 
 func (c *liteVirtClient) FetchBinary(ctx context.Context, in *FetchBinaryRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchBinaryChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[4], LiteVirt_FetchBinary_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[5], LiteVirt_FetchBinary_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1468,7 +1516,7 @@ func (c *liteVirtClient) ExecVM(ctx context.Context, in *ExecVMRequest, opts ...
 
 func (c *liteVirtClient) ConsoleVM(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ConsoleInput, ConsoleOutput], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[5], LiteVirt_ConsoleVM_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[6], LiteVirt_ConsoleVM_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1581,7 +1629,7 @@ func (c *liteVirtClient) ResizeDisk(ctx context.Context, in *ResizeDiskRequest, 
 
 func (c *liteVirtClient) ProxyVNC(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[VNCData, VNCData], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[6], LiteVirt_ProxyVNC_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[7], LiteVirt_ProxyVNC_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1594,7 +1642,7 @@ type LiteVirt_ProxyVNCClient = grpc.BidiStreamingClient[VNCData, VNCData]
 
 func (c *liteVirtClient) GetVMLogs(ctx context.Context, in *GetVMLogsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[VMLogChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[7], LiteVirt_GetVMLogs_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[8], LiteVirt_GetVMLogs_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1613,7 +1661,7 @@ type LiteVirt_GetVMLogsClient = grpc.ServerStreamingClient[VMLogChunk]
 
 func (c *liteVirtClient) DeployStack(ctx context.Context, in *DeployStackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DeployProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[8], LiteVirt_DeployStack_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[9], LiteVirt_DeployStack_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1632,7 +1680,7 @@ type LiteVirt_DeployStackClient = grpc.ServerStreamingClient[DeployProgress]
 
 func (c *liteVirtClient) DeleteStack(ctx context.Context, in *DeleteStackRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DeleteProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[9], LiteVirt_DeleteStack_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[10], LiteVirt_DeleteStack_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1681,7 +1729,7 @@ func (c *liteVirtClient) ExportStack(ctx context.Context, in *ExportStackRequest
 
 func (c *liteVirtClient) MigrateVM(ctx context.Context, in *MigrateVMRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[10], LiteVirt_MigrateVM_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[11], LiteVirt_MigrateVM_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1700,7 +1748,7 @@ type LiteVirt_MigrateVMClient = grpc.ServerStreamingClient[MigrateProgress]
 
 func (c *liteVirtClient) MoveVolume(ctx context.Context, in *MoveVolumeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MoveVolumeProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[11], LiteVirt_MoveVolume_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[12], LiteVirt_MoveVolume_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1719,7 +1767,7 @@ type LiteVirt_MoveVolumeClient = grpc.ServerStreamingClient[MoveVolumeProgress]
 
 func (c *liteVirtClient) ReplicateVolume(ctx context.Context, in *ReplicateVolumeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReplicateVolumeProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[12], LiteVirt_ReplicateVolume_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[13], LiteVirt_ReplicateVolume_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1738,7 +1786,7 @@ type LiteVirt_ReplicateVolumeClient = grpc.ServerStreamingClient[ReplicateVolume
 
 func (c *liteVirtClient) MigrateStackVolumes(ctx context.Context, in *MigrateStackVolumesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StackVolumeProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[13], LiteVirt_MigrateStackVolumes_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[14], LiteVirt_MigrateStackVolumes_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1757,7 +1805,7 @@ type LiteVirt_MigrateStackVolumesClient = grpc.ServerStreamingClient[StackVolume
 
 func (c *liteVirtClient) PullImage(ctx context.Context, in *PullImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PullProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[14], LiteVirt_PullImage_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[15], LiteVirt_PullImage_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1796,7 +1844,7 @@ func (c *liteVirtClient) DeleteImage(ctx context.Context, in *DeleteImageRequest
 
 func (c *liteVirtClient) ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[15], LiteVirt_ImportImage_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[16], LiteVirt_ImportImage_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1809,7 +1857,7 @@ type LiteVirt_ImportImageClient = grpc.ClientStreamingClient[ImportImageRequest,
 
 func (c *liteVirtClient) PushImage(ctx context.Context, in *PushImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PushImageProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[16], LiteVirt_PushImage_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[17], LiteVirt_PushImage_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1848,7 +1896,7 @@ func (c *liteVirtClient) PruneImages(ctx context.Context, in *PruneImagesRequest
 
 func (c *liteVirtClient) BackupVM(ctx context.Context, in *BackupVMRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[17], LiteVirt_BackupVM_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[18], LiteVirt_BackupVM_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1867,7 +1915,7 @@ type LiteVirt_BackupVMClient = grpc.ServerStreamingClient[BackupChunk]
 
 func (c *liteVirtClient) RestoreVM(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RestoreVMRequest, VM], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[18], LiteVirt_RestoreVM_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[19], LiteVirt_RestoreVM_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1880,7 +1928,7 @@ type LiteVirt_RestoreVMClient = grpc.ClientStreamingClient[RestoreVMRequest, VM]
 
 func (c *liteVirtClient) ImportVM(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ImportVMRequest, ImportVMProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[19], LiteVirt_ImportVM_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[20], LiteVirt_ImportVM_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2393,7 +2441,7 @@ func (c *liteVirtClient) FinishWebAuthnLogin(ctx context.Context, in *FinishWebA
 
 func (c *liteVirtClient) RestoreLive(ctx context.Context, in *RestoreLiveRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreLiveProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[20], LiteVirt_RestoreLive_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[21], LiteVirt_RestoreLive_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2432,7 +2480,7 @@ func (c *liteVirtClient) ReloadFirewall(ctx context.Context, in *emptypb.Empty, 
 
 func (c *liteVirtClient) BackupSnapshot(ctx context.Context, in *BackupSnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupSnapshotProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[21], LiteVirt_BackupSnapshot_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[22], LiteVirt_BackupSnapshot_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2451,7 +2499,7 @@ type LiteVirt_BackupSnapshotClient = grpc.ServerStreamingClient[BackupSnapshotPr
 
 func (c *liteVirtClient) RestoreFromBackup(ctx context.Context, in *RestoreFromBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreFromBackupProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[22], LiteVirt_RestoreFromBackup_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[23], LiteVirt_RestoreFromBackup_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2480,7 +2528,7 @@ func (c *liteVirtClient) HasChunks(ctx context.Context, in *HasChunksRequest, op
 
 func (c *liteVirtClient) PushBackup(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushBackupFrame, PushBackupResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[23], LiteVirt_PushBackup_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_PushBackup_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2663,7 +2711,7 @@ func (c *liteVirtClient) PullOCIImage(ctx context.Context, in *PullOCIImageReque
 
 func (c *liteVirtClient) BackupContainer(ctx context.Context, in *BackupContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[24], LiteVirt_BackupContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_BackupContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2682,7 +2730,7 @@ type LiteVirt_BackupContainerClient = grpc.ServerStreamingClient[BackupContainer
 
 func (c *liteVirtClient) RestoreContainer(ctx context.Context, in *RestoreContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RestoreContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[25], LiteVirt_RestoreContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_RestoreContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2701,7 +2749,7 @@ type LiteVirt_RestoreContainerClient = grpc.ServerStreamingClient[RestoreContain
 
 func (c *liteVirtClient) MigrateContainer(ctx context.Context, in *MigrateContainerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateContainerProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[26], LiteVirt_MigrateContainer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[27], LiteVirt_MigrateContainer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2830,7 +2878,7 @@ func (c *liteVirtClient) GetClusterStatus(ctx context.Context, in *emptypb.Empty
 
 func (c *liteVirtClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ClusterEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[27], LiteVirt_StreamEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[28], LiteVirt_StreamEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2919,7 +2967,7 @@ func (c *liteVirtClient) ListStoragePoolContents(ctx context.Context, in *ListSt
 
 func (c *liteVirtClient) UploadStoragePoolContent(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadStoragePoolContentRequest, UploadStoragePoolContentResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[28], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_UploadStoragePoolContent_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3292,7 +3340,7 @@ func (c *liteVirtClient) SetISOLibraryMode(ctx context.Context, in *SetISOLibrar
 
 func (c *liteVirtClient) FetchISOLibraryFile(ctx context.Context, in *FetchISOLibraryFileRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchISOLibraryFileChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[29], LiteVirt_FetchISOLibraryFile_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_FetchISOLibraryFile_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3311,7 +3359,7 @@ type LiteVirt_FetchISOLibraryFileClient = grpc.ServerStreamingClient[FetchISOLib
 
 func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_PushReplicaIncrement_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3334,7 +3382,7 @@ func (c *liteVirtClient) ListReplicas(ctx context.Context, in *ListReplicasReque
 
 func (c *liteVirtClient) PushReplica(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaRequest, PushReplicaResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_PushReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_PushReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3477,7 +3525,7 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 
 func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3540,7 +3588,7 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 
 func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3559,7 +3607,7 @@ type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
 func (c *liteVirtClient) StreamTableDump(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3588,7 +3636,7 @@ func (c *liteVirtClient) GetSensitiveStateDigest(ctx context.Context, in *Sensit
 
 func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3617,7 +3665,7 @@ func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDi
 
 func (c *liteVirtClient) StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3636,7 +3684,7 @@ type LiteVirt_StreamTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
 
 func (c *liteVirtClient) StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3705,7 +3753,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[39], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3934,7 +3982,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[39], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4103,7 +4151,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[40], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4310,6 +4358,12 @@ type LiteVirtServer interface {
 	DrainHost(*DrainHostRequest, grpc.ServerStreamingServer[DrainProgress]) error
 	ShutdownHostWorkloads(*ShutdownHostWorkloadsRequest, grpc.ServerStreamingServer[ShutdownProgress]) error
 	UndrainHost(context.Context, *UndrainHostRequest) (*Host, error)
+	// FailbackHost moves the VMs a drain moved off the host back to it by live
+	// migration, at a bounded rate. Get/SetFailbackPolicy read and change the
+	// cluster policy that makes an undrain do it by itself.
+	FailbackHost(*FailbackHostRequest, grpc.ServerStreamingServer[FailbackProgress]) error
+	GetFailbackPolicy(context.Context, *emptypb.Empty) (*FailbackPolicyStatus, error)
+	SetFailbackPolicy(context.Context, *SetFailbackPolicyRequest) (*FailbackPolicyStatus, error)
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
@@ -4962,6 +5016,15 @@ func (UnimplementedLiteVirtServer) ShutdownHostWorkloads(*ShutdownHostWorkloadsR
 }
 func (UnimplementedLiteVirtServer) UndrainHost(context.Context, *UndrainHostRequest) (*Host, error) {
 	return nil, status.Error(codes.Unimplemented, "method UndrainHost not implemented")
+}
+func (UnimplementedLiteVirtServer) FailbackHost(*FailbackHostRequest, grpc.ServerStreamingServer[FailbackProgress]) error {
+	return status.Error(codes.Unimplemented, "method FailbackHost not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFailbackPolicy(context.Context, *emptypb.Empty) (*FailbackPolicyStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFailbackPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFailbackPolicy(context.Context, *SetFailbackPolicyRequest) (*FailbackPolicyStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFailbackPolicy not implemented")
 }
 func (UnimplementedLiteVirtServer) SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetHostLabels not implemented")
@@ -5950,6 +6013,53 @@ func _LiteVirt_UndrainHost_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).UndrainHost(ctx, req.(*UndrainHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_FailbackHost_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FailbackHostRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).FailbackHost(m, &grpc.GenericServerStream[FailbackHostRequest, FailbackProgress]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_FailbackHostServer = grpc.ServerStreamingServer[FailbackProgress]
+
+func _LiteVirt_GetFailbackPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFailbackPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFailbackPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFailbackPolicy(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFailbackPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFailbackPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFailbackPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFailbackPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFailbackPolicy(ctx, req.(*SetFailbackPolicyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -11017,6 +11127,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_UndrainHost_Handler,
 		},
 		{
+			MethodName: "GetFailbackPolicy",
+			Handler:    _LiteVirt_GetFailbackPolicy_Handler,
+		},
+		{
+			MethodName: "SetFailbackPolicy",
+			Handler:    _LiteVirt_SetFailbackPolicy_Handler,
+		},
+		{
 			MethodName: "SetHostLabels",
 			Handler:    _LiteVirt_SetHostLabels_Handler,
 		},
@@ -12062,6 +12180,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ShutdownHostWorkloads",
 			Handler:       _LiteVirt_ShutdownHostWorkloads_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "FailbackHost",
+			Handler:       _LiteVirt_FailbackHost_Handler,
 			ServerStreams: true,
 		},
 		{

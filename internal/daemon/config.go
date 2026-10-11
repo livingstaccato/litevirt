@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/litevirt/litevirt/internal/acmedns"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
@@ -936,6 +938,21 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.Migration.Network != "" {
+		n, err := grpcapi.ParseMigrationNetwork(cfg.Migration.Network)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Migration.Address != "" {
+			a := net.ParseIP(cfg.Migration.Address)
+			if a == nil || a.To4() == nil || !n.Contains(a) {
+				return nil, fmt.Errorf("migration.address %q is not an IPv4 address inside migration.network %s", cfg.Migration.Address, cfg.Migration.Network)
+			}
+		}
+	} else if cfg.Migration.Address != "" {
+		return nil, fmt.Errorf("migration.address is set without migration.network")
+	}
+
 	// (No demote-vs-takeover timing invariant: majority reclaim is proof-gated, not
 	// timer-gated — see the QuorumLossDemoteAfterSec/KeepalivedStopTimeoutSec doc above.)
 	if cfg.QuorumLossDemoteAfterSec <= 0 || cfg.KeepalivedStopTimeoutSec <= 0 {
@@ -1213,6 +1230,25 @@ type MigrationConfig struct {
 	// such a migration is refused; set true only where the network between hosts
 	// is trusted.
 	AllowUnencryptedStorage bool `yaml:"allow_unencrypted_storage,omitempty"`
+	// Network is a dedicated migration network, an IPv4 CIDR like
+	// "10.20.0.0/24". A migration this node sends then moves its data (guest
+	// memory, and the disk blocks of a storage copy) to the target's address in
+	// that network instead of the address the host is dialed on, as Proxmox's
+	// `migration: network=` does. The control connection and the certificate
+	// checks stay on the cluster address. A target with no address there, or
+	// one that cannot answer, is moved over the cluster address with a
+	// warning. Default empty: the cluster address.
+	Network string `yaml:"network,omitempty"`
+	// Address is this host's own address in Network, answered to a source that
+	// asks for it, instead of the one chosen among the host's addresses there.
+	// Set it where the host holds more than one address in the network, or a
+	// floating one a plain choice could pick. It must be inside Network.
+	Address string `yaml:"address,omitempty"`
+	// AllowAnyNetwork accepts a Network that is not inside a private (RFC 1918)
+	// range, or that contains this host's cluster or default-route address.
+	// Default false: such a network would send migration data out the uplink
+	// or the cluster interface, and the daemon refuses to start with one.
+	AllowAnyNetwork bool `yaml:"allow_any_network,omitempty"`
 }
 
 type CapacityConfig struct {

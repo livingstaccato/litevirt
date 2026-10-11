@@ -24,6 +24,13 @@ type MigrateParams struct {
 	// against (libvirt's tls.destination). Set it to the target address when the
 	// migrate_uri uses an IP, which the certificate carries as a SAN.
 	TLSDestination string
+	// Direct moves a memory-only migration out of libvirt's tunnel (port 16514
+	// on the address the host is dialed on) onto QEMU's own TLS stream to
+	// TargetAddress, so its data can take the dedicated migration network. It
+	// takes effect only with TLS: without it the migration stays tunnelled
+	// rather than send guest memory in the clear. A storage migration is
+	// always direct.
+	Direct bool
 	// CDROMSources points CD-ROMs at other files on the destination (source
 	// path here → path there): the target resolved the VM's installer ISO on
 	// its own filesystem, and a link (virtio-win.iso → a versioned file) or a
@@ -134,6 +141,10 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		// over the NBD block-mirror channel, so the cache-coherency concern
 		// that gate guards against doesn't apply; assert that explicitly.
 		flags |= golibvirt.MigrateUnsafe
+	} else if p.Direct && p.TLS && p.TargetAddress != "" {
+		// Over the dedicated migration network: QEMU's own stream, encrypted
+		// with the migration credentials, to the address on that network.
+		flags |= golibvirt.MigrateTLS
 	} else {
 		// Memory-only migration can be tunnelled through the single
 		// libvirt TLS connection (port 16514) — no extra ports needed.
@@ -151,14 +162,15 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 	// For non-tunnelled migration (--with-storage), provide an explicit
 	// migrate_uri so the target listens on the right address and QEMU
 	// can establish the NBD data channel for disk copy.
-	if p.WithStorage && p.TargetAddress != "" {
+	direct := p.WithStorage || (p.Direct && p.TLS)
+	if direct && p.TargetAddress != "" {
 		params = append(params, golibvirt.TypedParam{
 			Field: golibvirt.MigrateParamURI,
 			Value: *golibvirt.NewTypedParamValueString(fmt.Sprintf("tcp://%s", p.TargetAddress)),
 		})
 	}
 
-	if p.WithStorage && p.TLS && p.TLSDestination != "" {
+	if direct && p.TLS && p.TLSDestination != "" {
 		params = append(params, golibvirt.TypedParam{
 			Field: golibvirt.MigrateParamTLSDestination,
 			Value: *golibvirt.NewTypedParamValueString(p.TLSDestination),

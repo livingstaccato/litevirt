@@ -138,6 +138,7 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 			Params: []interface{}{destHost, now, vmName, d.DiskName},
 		})
 	}
+	stmts = append(stmts, placementGenStmts(ctx, c, vmName)...)
 	// Guard: only mint the proof + stamp the pending link if the VM row still
 	// exists (not deleted) AND no DIFFERENT proof already carries this id — so
 	// we never leave an orphan proof for a vanished VM or (astronomically) point

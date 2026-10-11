@@ -193,6 +193,13 @@ func (s *Server) sourceGateRefused(ctx context.Context, vm *corrosion.VMRecord, 
 // its whole step, calls this directly for its cold moves (drainColdMove), with
 // the same lock discipline.
 func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
+	// A failback move is conditional on the VM still being where the drain left
+	// it, judged here, by its owner under its lock (failback.go).
+	if req.GetExpectDrainRecord() {
+		if err := s.checkDrainExpectation(ctx, req, vm); err != nil {
+			return err
+		}
+	}
 	// A point-in-time overlay an earlier copy left holds writes the disk's
 	// file lacks: a migration must carry them, so settle it first.
 	if err := s.settlePITOverlays(ctx, vm); err != nil {
@@ -379,6 +386,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		if !srcTLS && !s.allowPlaintextStorageMigration {
 			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, s.hostName)
 		}
+	} else if s.migrationNetwork != "" {
+		// A memory-only migration rides libvirt's tunnel on the cluster
+		// address; it can use the migration network only on QEMU's own stream,
+		// which needs this host's credentials too (migration_network.go). Not
+		// being ready is not a refusal here: the move stays in the tunnel.
+		srcTLS = s.migrationTLSReady()
 	}
 	// The disks the copy needs on the target, checked against their records
 	// here, before any work on the target.
@@ -546,15 +559,25 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// definition carries those (MigrateParams.CDROMSources).
 	var cdromSources map[string]string
 	useTLS := false
+	// route is where the migration's data goes: the cluster address, or the
+	// target's address in migration.network (migration_network.go).
+	route := migrationRoute{addr: targetHost.Address}
 	if withStorage {
 		var dstTLS bool
-		if createdStubs, dstTLS, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
+		var ens ensureOutcome
+		if ens, err = s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
 		}
+		createdStubs, dstTLS, cdromSources = ens.created, ens.tlsReady, ens.remap
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
+		kind := routeStorage
+		if fwVM || coldStopped {
+			kind = routeCold
+		}
+		route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, kind, useTLS)
 		if !useTLS && !s.allowPlaintextStorageMigration {
 			// This host could encrypt; the target cannot (no credentials, or an
 			// older build that never answers). The abort undoes the stubs.
@@ -569,9 +592,21 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
-		if _, _, cdromSources, err = s.ensureDisksOnTargetISO(ctx, req.TargetHost, vm.Name, nil, false, !(fwVM || coldStopped)); err != nil {
-			return err
+		ens, eerr := s.ensureDisksOnTargetNet(ctx, req.TargetHost, vm.Name, nil, srcTLS, !(fwVM || coldStopped))
+		if eerr != nil {
+			return eerr
 		}
+		cdromSources = ens.remap
+		if fwVM || coldStopped {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
+		} else {
+			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
+		}
+	}
+	if route.onNetwork {
+		// A cold move's disk stream (and the clone copy, which is one) is dialed
+		// at this address; a live move's data is not (migration_network.go).
+		abort.diskAddr = route.addr
 	}
 
 	// A STOPPED VM — every Secure-Boot/vTPM VM, and any other VM migrated with
@@ -714,13 +749,17 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			MaxDowntimeMS: maxDowntimeMS,
 			// Bracketed here, not in internal/libvirt: that package renders it
 			// into a tcp:// migrate_uri authority but must not import corrosion.
-			TargetAddress: corrosion.URIHost(targetHost.Address),
+			// The data channel's address: the cluster address, or the target's
+			// address in migration.network (migration_network.go).
+			TargetAddress: corrosion.URIHost(route.addr),
 			DiskTargets:   diskTargets,
-			// The target's migration certificate carries its address as an IP
-			// SAN (`lv host init`/`add` issue it for the same address peers
-			// dial), and the migrate_uri names that address.
-			TLS:            useTLS,
+			// The target's migration certificate carries its CLUSTER address as
+			// an IP SAN (`lv host init`/`add` issue it for the same address
+			// peers dial). The name it is checked against stays that address
+			// even when the data goes to another one, which is in no SAN.
+			TLS:            useTLS || route.direct,
 			TLSDestination: targetHost.Address,
+			Direct:         route.direct,
 			CDROMSources:   cdromSources,
 		})
 	}()
@@ -1265,6 +1304,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		// take the other end.
 		resp.MigrationTlsReady = s.migrationTLSReady()
 	}
+	s.answerMigrationNetwork(ctx, req, resp)
 	return resp, nil
 }
 
@@ -2013,8 +2053,15 @@ func copiedByStorageMigration(d corrosion.DiskRecord) bool {
 // refusal and the copy itself must agree, or an untyped disk is left behind by
 // a move that copies none. Removal paths keep the stricter
 // isHostLocalDiskDriver: they delete, and an untyped row proves less.
+//
+// It agrees with corrosion.DiskIsShared, which is the cluster's definition of
+// shared storage, on every driver whose disk is a plain file a move can copy:
+// btrfs is host-local there, so it is here too (a clone or MoveVolume into a
+// btrfs pool makes such a disk). TestIsHostLocalDiskAgreesWithDiskIsShared pins
+// the two together. zfs and lvm are not shared either, but their disks are
+// volumes, not files, so no move here copies them; they stay as they were.
 func isHostLocalDisk(d corrosion.DiskRecord) bool {
-	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType)
+	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType) || strings.EqualFold(d.StorageType, "btrfs")
 }
 
 // storageMigrationTargets is the migrate_disks list of a --with-storage
@@ -2065,16 +2112,34 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 // file this host judged for the VM's ISO, so a target where another project's
 // pool maps the directory admits that very content on the VM's first arrival.
 func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, map[string]string, error) {
+	o, err := s.ensureDisksOnTargetNet(ctx, targetHost, vmName, stubs, wantTLS, runtime)
+	return o.created, o.tlsReady, o.remap, err
+}
+
+// ensureOutcome is what the target's EnsureDisks answered.
+type ensureOutcome struct {
+	created  []string          // disk stubs this call made
+	tlsReady bool              // wantTLS and the target has migration-TLS credentials
+	remap    map[string]string // installer CD-ROM source path -> the target's file
+	// migAddr is the target's address inside migration.network, "" when none
+	// was asked for or the target gave none (migration_network.go).
+	migAddr string
+}
+
+// ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
+// target's address in migration.network when one is configured, which makes
+// the call even where it would otherwise have nothing to send.
+func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) (ensureOutcome, error) {
 	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
 	if err != nil {
-		return nil, false, nil, err
+		return ensureOutcome{}, err
 	}
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
-		return nil, false, nil, nil
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" {
+		return ensureOutcome{}, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		return nil, false, nil, status.Errorf(codes.Unavailable,
+		return ensureOutcome{}, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
@@ -2083,13 +2148,14 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
 		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
+		MigrationNetwork:   s.migrationNetwork,
 	})
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {
 			code = codes.Internal
 		}
-		return nil, false, nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+		return ensureOutcome{}, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
 	}
 	if w := resp.GetInstallerIsoWarning(); w != "" {
@@ -2116,7 +2182,7 @@ func (s *Server) ensureDisksOnTargetISO(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), remap, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2432,6 +2498,9 @@ type migrationAbort struct {
 	// lease an earlier attempt left — the restart anchor of VFs still out of
 	// the guest — is not this attempt's to end.
 	leaseWritten bool
+	// diskAddr is the target's address in migration.network, when the cold disk
+	// copy is to use it ("" = the cluster address).
+	diskAddr string
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before

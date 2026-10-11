@@ -171,6 +171,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			MaxPerNode:   int32(eff.MaxPerNode),
 			Policy:       eff.Policy,
 			NoMigrate:    eff.NoMigrate,
+			Failback:     eff.Failback,
 		}
 		if eff.Rebalance != nil {
 			rb := &pb.RebalanceSpec{

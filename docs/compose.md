@@ -432,6 +432,7 @@ options (VNC via noVNC; SPICE-in-browser is on the roadmap).
       prefer:                       # Host preferably has these labels (+5 score per match)
         zone: "us-east-1a"
       no-migrate: false             # Opt this VM out of all rebalancer-driven moves
+      failback: false               # Move back by live migration after the host it was drained from is undrained
 
       # ── Initial-placement scoring ──
       policy: balance               # balance | bin-pack | spread-strict | cost-aware
@@ -493,6 +494,8 @@ it deploys, the VM's mode is stored as `dry-run`, and a WARN says so. Write
 `max-per-node` is a hard constraint: the placement engine will not place more than this many replicas of the same VM group on a single host. Use `max-per-node: 1` to ensure each replica runs on a separate host.
 
 `no-migrate: true` opts the VM out of all rebalancer-driven moves and (planned) storage-motion. Set automatically by admission for VMs with non-migratable PCI passthrough.
+
+`failback: true` opts the VM in to returning after maintenance: when a host drain moves it away and that host is later undrained, it is live-migrated back (see [failback](migration-failover.md#failback-after-maintenance)). Only a VM the drain moved, and that nothing has moved since, returns.
 
 See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, and worked examples.
 

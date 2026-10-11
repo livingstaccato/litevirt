@@ -178,6 +178,8 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// UNKNOWN bucket as an old binary — the fail-closed reading, and the
 		// honest one: that caller was told nothing either way.
 		PostureReported: disclosePosture,
+		// This build checks a migration's expect_* preconditions (failback.go).
+		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
 	}, nil
 }
 
@@ -468,17 +470,29 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// did not do what it was asked for them, so it does not end clean.
 	var failures int
 	var notStarted []string
+	// Drain records (failback.go) are written off this loop, after each frame:
+	// the release gate can take seconds, and a drain never waits for it.
+	addRecord, recordsQueued := s.startDrainRecords(ctx, len(drainJobs))
+	defer recordsQueued()
 	for range drainJobs {
 		progress := <-results
+		record := false
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
 		} else if progress.Status == "done" && progress.Error != "" {
 			notStarted = append(notStarted, progress.VmName)
+		} else if progress.Status == "done" {
+			record = true // so that undrain can move it back
 		}
-		if err := stream.Send(progress); err != nil {
-			return err
+		serr := stream.Send(progress)
+		if record {
+			addRecord(progress.VmName, req.Name, progress.TargetHost)
+		}
+		if serr != nil {
+			return serr
 		}
 	}
+	recordsQueued()
 
 	// Check for VMs that were skipped (pinned, no placement target).
 	// If any VMs remain on the host, report a partial drain (#25).
@@ -671,14 +685,23 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	// Where it resolves the ISO to another file (a link, a library
 	// directory), the destination definition carries that file.
-	_, _, cdromSources, ierr := s.ensureDisksOnTargetISO(ctx, target.Name, vm.Name, nil, false, true)
+	srcTLS := s.migrationNetwork != "" && s.migrationTLSReady()
+	ens, ierr := s.ensureDisksOnTargetNet(ctx, target.Name, vm.Name, nil, srcTLS, true)
 	if ierr != nil {
 		progress.Status = "error"
 		progress.Error = "target refused the installer ISO: " + ierr.Error()
 		return progress
 	}
+	cdromSources := ens.remap
+	route := s.chooseMigrationRoute(ctx, vm.Name, target, ens.migAddr, routeMemory, srcTLS && ens.tlsReady)
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
+	mp := libvirt.MigrateParams{Live: true, CDROMSources: cdromSources}
+	if route.direct {
+		mp.Direct, mp.TLS = true, true
+		mp.TargetAddress = corrosion.URIHost(route.addr)
+		mp.TLSDestination = target.Address
+	}
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while
@@ -732,8 +755,14 @@ func (s *Server) UndrainHost(ctx context.Context, req *pb.UndrainHostRequest) (*
 	}
 	s.publish("host.undrained", req.Name, "")
 	s.audit(ctx, "host.undrain", req.Name, "", "ok")
-
-	return s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	reply, err := s.InspectHost(ctx, &pb.InspectHostRequest{Name: req.Name})
+	if err != nil {
+		return nil, err
+	}
+	// Moves back, in the background, the VMs a drain moved away that opted in
+	// to returning (failback.go), and says so in the reply.
+	s.autoFailback(ctx, req.Name, reply)
+	return reply, nil
 }
 
 // SetHostLabels sets or removes labels on a host.

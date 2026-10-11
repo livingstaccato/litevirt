@@ -158,9 +158,13 @@ func (s *Server) cloneTargetPoolFor(ctx context.Context, project, name string, s
 	if err := diskmode.MkdirAll(dir); err != nil {
 		return nil, status.Errorf(codes.Internal, "prepare pool dir: %v", err)
 	}
+	// Only the file disks land here: a ceph disk is copied inside its own pool
+	// and admitted there (cloneVMOnSource).
 	var need int64
 	for _, d := range srcDisks {
-		need += d.SizeBytes
+		if !isRBDDisk(d) {
+			need += d.SizeBytes
+		}
 	}
 	if err := s.admitPoolCapacity(ctx, s.hostName, name, need); err != nil {
 		return nil, err
@@ -172,10 +176,17 @@ func (s *Server) cloneTargetPoolFor(ctx context.Context, project, name string, s
 // the headroom a cold migration also leaves (requireDiskSpace): the thin disks
 // of the guests running on that filesystem pause when it fills, so a copy that
 // would take it that far is refused before it starts. need is the allocated size
-// of each source disk's chain, never less than the flatten's own estimate.
+// of each source disk's chain, never less than the flatten's own estimate. A
+// ceph disk is not counted: it is copied inside its own pool, never into dir,
+// and with nothing copied into dir there is nothing to admit.
 func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []corrosion.DiskRecord, why string) error {
 	var need uint64
+	copied := false
 	for _, d := range srcDisks {
+		if isRBDDisk(d) {
+			continue
+		}
+		copied = true
 		src := s.hostDiskFile(d.Path)
 		alloc, aerr := chainAllocated(src)
 		info, ierr := qcow2.Info(src)
@@ -184,6 +195,9 @@ func (s *Server) requireCloneSpace(ctx context.Context, dir string, srcDisks []c
 			continue
 		}
 		need += coldFlattenEstimate(alloc, info.VirtualSize)
+	}
+	if !copied {
+		return nil
 	}
 	probe := nearestExistingDir(s.hostDiskFile(dir))
 	avail, total, err := s.diskSpace(probe)
@@ -253,7 +267,7 @@ func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMReques
 		if derr != nil {
 			return nil, status.Errorf(codes.Internal, "VM %q is on %s; read its disks to move them into pool %q: %v", name, th, req.TargetPool, derr)
 		}
-		for _, d := range disks {
+		for _, d := range clonePoolMoves(disks) {
 			stream, merr := client.MoveVolume(ctx, &pb.MoveVolumeRequest{
 				VmName: name, DiskName: d.DiskName, TargetPool: req.TargetPool, DeleteSource: true,
 			})
@@ -285,4 +299,17 @@ func (s *Server) finishCrossHostClone(ctx context.Context, req *pb.CloneVMReques
 		return nil, status.Errorf(status.Code(err), "VM %q was cloned to %s; read it back: %s", name, th, strings.TrimSpace(status.Convert(err).Message()))
 	}
 	return vm, nil
+}
+
+// clonePoolMoves is which of a staged clone's disks are moved into its target
+// pool: its file disks. A ceph disk was copied inside its own pool, where it
+// stays (MoveVolume moves no ceph disk).
+func clonePoolMoves(disks []corrosion.DiskRecord) []corrosion.DiskRecord {
+	var out []corrosion.DiskRecord
+	for _, d := range disks {
+		if !isRBDDisk(d) {
+			out = append(out, d)
+		}
+	}
+	return out
 }

@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -77,13 +78,17 @@ import (
 // a claim of its own — while this host's hold stands — so nothing about the
 // claim can refuse after the teardown.
 //
-// THE GATE. Nothing is allocated on a fixed-device pool until the release
-// feature iscsi_lun_claim is open and a member voter generation is adopted
-// (iscsiLUNClaimGate).
-
-// iscsiLUNClaimFeature is the release feature that opens iSCSI allocation.
-// Its string is frozen once it ships.
-const iscsiLUNClaimFeature = "iscsi_lun_claim"
+// THE GATE. Nothing is allocated on a fixed-device pool until a member voter
+// generation is adopted and the release feature iscsi_lun_claim
+// (capabilities.FeatureISCSILUNClaim, under the release token) is open on the
+// host that allocates (iscsiLUNClaimGate). Every write of the feature's data —
+// a LUN claim proposed or learned at a LUN key, the LUN's checkpoint, the
+// plain-delete record that voids a kept LUN — takes the FeatureGrant that gate
+// hands out and checks it: decideLUNWith, learnLUN,
+// corrosion.AdvanceLUNResolved and corrosion.RecordLUNPlainDelete. So the
+// feature's used record is on every replica before any voter holds a LUN
+// claim, and a host rolled back below the release (which allocates iSCSI with
+// no claim at all) quarantines rather than running beside them.
 
 // lunPeerAskTimeout bounds how long a create waits for one host's answer.
 const lunPeerAskTimeout = 5 * time.Second
@@ -97,39 +102,34 @@ const lunMaxGenerations = 1 << 16
 // iscsiDevicePrefix is where every iscsi pool's device lives.
 const iscsiDevicePrefix = "/dev/disk/by-path/"
 
-// SetReleaseFeatureGate wires the release-feature gate: fn(ctx, feature)
-// returns nil once the feature's release token has latched and its use is
-// recorded. Nil closes every release feature. The daemon wires the release
-// token's RequireReleaseFeature (feat/release-token); until then nothing opens
-// iscsi_lun_claim.
-func (s *Server) SetReleaseFeatureGate(fn func(ctx context.Context, feature string) error) {
-	s.releaseFeatureMu.Lock()
-	defer s.releaseFeatureMu.Unlock()
-	s.releaseFeatureGate = fn
+// iscsiLUNClaimGate is the one place allocation on a fixed-device pool waits:
+// for an electorate to decide on, then for the release feature's gate on THIS
+// host, the one that proposes the claims. It returns the grant every writer
+// of the feature's data checks. The electorate is read first, so a cluster
+// that cannot allocate anyway records no use. A refusal of the gate is the
+// release gate's own error, unchanged ("the cluster upgrade must finish first
+// (iscsi_lun_claim needs <token>)…").
+func (s *Server) iscsiLUNClaimGate(ctx context.Context) (capabilities.FeatureGrant, error) {
+	var g capabilities.FeatureGrant
+	if _, err := s.lunElectorate(ctx); err != nil {
+		return g, err
+	}
+	err := s.WithReleaseFeature(ctx, capabilities.FeatureISCSILUNClaim,
+		func(_ context.Context, got capabilities.FeatureGrant) error { g = got; return nil })
+	return g, err
 }
 
-// iscsiLUNClaimGate is the one place allocation on a fixed-device pool waits:
-// for the release latch, and for an electorate to decide on.
-func (s *Server) iscsiLUNClaimGate(ctx context.Context) error {
-	s.releaseFeatureMu.Lock()
-	gate := s.releaseFeatureGate
-	s.releaseFeatureMu.Unlock()
-	why := "the release feature is not wired on this build"
-	if gate != nil {
-		why = ""
-		if err := gate(ctx, iscsiLUNClaimFeature); err != nil {
-			why = err.Error()
-		}
-	}
-	if why != "" {
-		return status.Errorf(codes.FailedPrecondition,
-			"an iSCSI LUN is allocated by a voter claim (release feature %s), which is not open yet (%s): "+
-				"the cluster upgrade must finish first", iscsiLUNClaimFeature, why)
-	}
-	if _, err := s.lunElectorate(ctx); err != nil {
-		return err
-	}
-	return nil
+// lunPlainDeleteRecordable reports whether a plain delete must record itself
+// on its LUNs (corrosion.RecordLUNPlainDelete): only once iscsi_lun_claim is
+// in use. Before that no kept allocation exists anywhere for the record to
+// void — a kept allocation is a LUN claim, written only after the feature's
+// used record has been acknowledged by every replica, this one included — and
+// a delete must neither be refused nor mark the feature used. A local read,
+// no peer is asked.
+func (s *Server) lunPlainDeleteRecordable(ctx context.Context) bool {
+	used, err := corrosion.ReleaseFeatureUsed(ctx, s.db, featureToken(capabilities.FeatureISCSILUNClaim),
+		string(capabilities.FeatureISCSILUNClaim))
+	return err == nil && used
 }
 
 // lunElectorateT is who decides a LUN allocation: the adopted voter
@@ -417,6 +417,9 @@ type lunHold struct {
 	// cfgs is every disk's storage as the claim resolved it, by disk name:
 	// the create uses it as it is.
 	cfgs map[string]storage.Config
+	// grant is iscsi_lun_claim's, from the gate the create's claims passed
+	// (zero when it decided none, and then own is empty).
+	grant capabilities.FeatureGrant
 }
 
 // release drops the hold once the create has returned. A create that did not
@@ -435,7 +438,7 @@ func (h *lunHold) release(ctx context.Context, vm string) {
 		return // a domain outlived the create: it holds the LUN
 	}
 	for k, g := range h.own {
-		if err := corrosion.AdvanceLUNResolved(context.WithoutCancel(ctx), h.s.db, k, g+1, h.s.hostName); err != nil {
+		if err := corrosion.AdvanceLUNResolved(context.WithoutCancel(ctx), h.s.db, h.grant, k, g+1, h.s.hostName); err != nil {
 			slog.Warn("iSCSI LUN: could not record a failed create's allocation as resolved; a later create proves it",
 				"lun", k, "generation", g, "error", err)
 		}
@@ -467,10 +470,13 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			needClaim = true
 		}
 	}
+	var grant capabilities.FeatureGrant
 	if needClaim {
-		if err := s.iscsiLUNClaimGate(ctx); err != nil {
+		g, err := s.iscsiLUNClaimGate(ctx)
+		if err != nil {
 			return nil, err
 		}
+		grant = g
 	}
 	byKey := make(map[string]lunUse, len(uses))
 	keys := make(map[string]bool, len(uses))
@@ -485,7 +491,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 			Lun: heldKey, VmName: held.vm, DiskName: held.disk, HostName: s.hostName, InFlight: true, VmId: held.vmID,
 		})
 	}
-	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}, cfgs: cfgs}
+	hold := &lunHold{s: s, drop: drop, own: map[string]int64{}, keep: map[string]bool{}, cfgs: cfgs, grant: grant}
 	ok := false
 	defer func() {
 		if !ok {
@@ -533,7 +539,7 @@ func (s *Server) claimLUNs(ctx context.Context, spec *pb.VMSpec) (*lunHold, erro
 		}
 		mine := corrosion.LUNAllocation{LUN: u.key, ClaimID: randid.New(), VMID: spec.Uuid, VMName: spec.Name,
 			Disk: u.disk, Host: s.hostName}
-		g, prev, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, hasRep, id, lunHandoffFrom(ctx), true)
+		g, prev, err := s.allocateLUN(ctx, grant, spec.Name, u, mine, rep, hasRep, id, lunHandoffFrom(ctx), true)
 		if err != nil {
 			return nil, err
 		}
@@ -616,12 +622,12 @@ func (s *Server) verifyLUNHold(ctx context.Context, vm string, rep replacedVM, k
 // just below it — a value is only ever proposed at g once every allocation
 // below g was proven gone (the walk's own rule) — and otherwise the walk
 // starts at 0.
-func (s *Server) lunWalkStart(ctx context.Context, el lunElectorateT, lun string) (int64, error) {
+func (s *Server) lunWalkStart(ctx context.Context, grant capabilities.FeatureGrant, el lunElectorateT, lun string) (int64, error) {
 	c, err := corrosion.GetLUNResolved(ctx, s.db, lun)
 	if err != nil || c <= 0 {
 		return 0, nil
 	}
-	_, found, err := s.learnLUN(ctx, el, lun, c-1)
+	_, found, err := s.learnLUN(ctx, grant, el, lun, c-1)
 	if err != nil {
 		return 0, err
 	}
@@ -658,12 +664,12 @@ func lunDecisionError(u lunUse, vm string, err error) error {
 // commits (re-review 4, I-1), so a re-create refused before its create —
 // however often — never walks the checkpoint past the allocation of the VM
 // that still runs.
-func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string, advanceOwn bool) (int64, *corrosion.LUNAllocation, error) {
+func (s *Server) allocateLUN(ctx context.Context, grant capabilities.FeatureGrant, vm string, u lunUse, mine corrosion.LUNAllocation, rep replacedVM, hasRep bool, reg uint64, ownHold string, advanceOwn bool) (int64, *corrosion.LUNAllocation, error) {
 	el, err := s.lunElectorate(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	start, err := s.lunWalkStart(ctx, el, u.key)
+	start, err := s.lunWalkStart(ctx, grant, el, u.key)
 	if err != nil {
 		return 0, nil, lunDecisionError(u, vm, err)
 	}
@@ -679,7 +685,7 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 	var prev *corrosion.LUNAllocation
 	for g := start; g < start+lunMaxGenerations; g++ {
 		mine.Generation = g
-		out, err := s.decideLUNWith(ctx, el, mine)
+		out, err := s.decideLUNWith(ctx, grant, el, mine)
 		if err != nil {
 			return 0, nil, lunDecisionError(u, vm, err)
 		}
@@ -689,7 +695,7 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 		}
 		if a.ClaimID == mine.ClaimID {
 			if passedOwn && advanceOwn {
-				if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g, s.hostName); err != nil {
+				if err := corrosion.AdvanceLUNResolved(ctx, s.db, grant, u.key, g, s.hostName); err != nil {
 					slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g, "error", err)
 				}
 			}
@@ -710,7 +716,7 @@ func (s *Server) allocateLUN(ctx context.Context, vm string, u lunUse, mine corr
 		if passedOwn {
 			continue // the checkpoint waits for this walk's own decision
 		}
-		if err := corrosion.AdvanceLUNResolved(ctx, s.db, u.key, g+1, s.hostName); err != nil {
+		if err := corrosion.AdvanceLUNResolved(ctx, s.db, grant, u.key, g+1, s.hostName); err != nil {
 			slog.Warn("iSCSI LUN: record checkpoint", "lun", u.key, "generation", g+1, "error", err)
 		}
 	}
@@ -732,23 +738,32 @@ func lunSpec(el lunElectorateT, key corrosion.ClaimKey, propose *corrosion.Claim
 }
 
 // decideLUN decides mine's allocation under the current electorate.
-func (s *Server) decideLUN(ctx context.Context, mine corrosion.LUNAllocation) (claims.Outcome, error) {
+func (s *Server) decideLUN(ctx context.Context, grant capabilities.FeatureGrant, mine corrosion.LUNAllocation) (claims.Outcome, error) {
 	el, err := s.lunElectorate(ctx)
 	if err != nil {
 		return claims.Outcome{}, err
 	}
-	return s.decideLUNWith(ctx, el, mine)
+	return s.decideLUNWith(ctx, grant, el, mine)
 }
 
-// decideLUNWith decides mine's allocation under el, proposing mine.
-func (s *Server) decideLUNWith(ctx context.Context, el lunElectorateT, mine corrosion.LUNAllocation) (claims.Outcome, error) {
+// decideLUNWith decides mine's allocation under el, proposing mine. It writes
+// iscsi_lun_claim's data — the voters record the proposed value at the LUN
+// key — so it takes the feature's grant.
+func (s *Server) decideLUNWith(ctx context.Context, grant capabilities.FeatureGrant, el lunElectorateT, mine corrosion.LUNAllocation) (claims.Outcome, error) {
+	if err := grant.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return claims.Outcome{}, status.Errorf(codes.Internal, "iSCSI LUN %s: %v", mine.LUN, err)
+	}
 	v := corrosion.ClaimValue{LUN: &mine}
 	return s.claimProposer().Decide(ctx, lunSpec(el, corrosion.LUNClaimKey(mine.LUN, mine.Generation), &v))
 }
 
 // learnLUN learns, without deciding, the value proposed at allocation g of
-// lun, if a quorum's promises report one.
-func (s *Server) learnLUN(ctx context.Context, el lunElectorateT, lun string, g int64) (*corrosion.LUNAllocation, bool, error) {
+// lun, if a quorum's promises report one. Its promises are state the voters
+// record at a LUN key, so it takes the feature's grant too.
+func (s *Server) learnLUN(ctx context.Context, grant capabilities.FeatureGrant, el lunElectorateT, lun string, g int64) (*corrosion.LUNAllocation, bool, error) {
+	if err := grant.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return nil, false, status.Errorf(codes.Internal, "iSCSI LUN %s: %v", lun, err)
+	}
 	v, found, err := s.claimProposer().Learn(ctx, lunSpec(el, corrosion.LUNClaimKey(lun, g), nil))
 	if err != nil || !found || v == nil || v.LUN == nil {
 		return nil, false, err

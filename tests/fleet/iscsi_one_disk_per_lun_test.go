@@ -14,10 +14,11 @@ package fleet
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +26,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -42,19 +45,63 @@ func newLUNFleet(t *testing.T) *Cluster {
 // newLUNFleetN is newLUNFleet with n nodes.
 func newLUNFleetN(t *testing.T, nodes int) *Cluster {
 	t.Helper()
+	c := newLUNFleetGated(t, nodes)
+	openLUNFeature(t, c)
+	return c
+}
+
+// newLUNFleetGated is newLUNFleetN with each node's real release-feature gate
+// wired and iscsi_lun_claim not yet used.
+func newLUNFleetGated(t *testing.T, nodes int) *Cluster {
+	t.Helper()
 	t.Cleanup(storage.OverrideISCSICommandForTest(func(context.Context, string, ...string) ([]byte, error) {
 		return nil, nil
 	}))
 	c := New(t, Options{Nodes: nodes, IndependentReplicas: true, FaultSeed: 7301})
 	runGenesis(t, c)
 	for _, n := range c.Nodes {
-		n.Server.SetReleaseFeatureGate(func(context.Context, string) error { return nil })
-		n.DB.SetClusterPolicyGate(func() bool { return true })
+		wireLUNReleaseGate(t, c, n)
 	}
 	// (No setHostCapacity: its raw UPDATE of hosts is not a registered
 	// replicated shape, and on independent replicas it back-pressures every
 	// push behind it. The harness's hosts already have room.)
 	return c
+}
+
+// wireLUNReleaseGate gives n the release-feature gate the daemon wires: a
+// real health.Checker over real Pings and the real acknowledgement RPC (the
+// per-node half of wireReleaseFeatures). The server's own capability gate is
+// left as the LUN scenarios had it. cluster_policies stays writable, as the
+// LUN checkpoint and the used record both need.
+func wireLUNReleaseGate(t *testing.T, c *Cluster, n *Node) *health.Checker {
+	t.Helper()
+	if err := mkdirAll(filepath.Dir(markerBase(c, n))); err != nil {
+		t.Fatalf("mkdir markers for %s: %v", n.Name, err)
+	}
+	g := health.NewChecker(n.Name, n.PKIDir, n.DB)
+	g.SetPeerPinger(n.Server.PeerCapabilities)
+	g.SetActivationMarker(markerBase(c, n))
+	n.DB.SetClusterPolicyGate(func() bool { return true })
+	g.SetReleaseUseConfirmer(n.Server.PeerHoldsReleaseFeatureUse)
+	n.Server.SetReleaseFeatureGate(g)
+	n.DB.SetReplicationSourceGate(n.Server.ReleaseSourceAllowed)
+	n.Server.SetWALQuarantined(n.DB.WALQuarantined)
+	corrosion.WireUnknownReleaseObserver(c.ctx, g, corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0))
+	return g
+}
+
+// openLUNFeature latches the release token and records iscsi_lun_claim's use
+// on every node — what the first iSCSI create after the upgrade does — so a
+// scenario that later cuts a node off still allocates on the majority side.
+func openLUNFeature(t *testing.T, c *Cluster) {
+	t.Helper()
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		n := n
+		eventually(t, 20*time.Second, n.Name+" to open iscsi_lun_claim", func() bool {
+			return writeFeature(ctx, n, capabilities.FeatureISCSILUNClaim) == nil
+		})
+	}
 }
 
 // addLUNPool gives every node a pool `name` on LUN lun of the fleet target,
@@ -237,15 +284,98 @@ func TestFleet_ISCSI_APartitionedMinorityAllocatesNothing(t *testing.T) {
 	}
 }
 
-// Before the release feature is open — mid-upgrade — no host allocates a LUN.
+// lunClaimsOn counts the LUN-key claim state n's voter holds.
+func lunClaimsOn(t *testing.T, n *Node) int {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(),
+		`SELECT COUNT(*) AS n FROM local_recovery_claims WHERE target_kind = ?`, corrosion.ClaimKindLUN)
+	if err != nil {
+		t.Fatalf("read LUN claims on %s: %v", n.Name, err)
+	}
+	return rows[0].Int("n")
+}
+
+// Before the release feature is open — mid-upgrade — no host allocates a LUN:
+// with one host still on the previous build (advertising nothing, as a
+// quarantined or older host does) an iSCSI create is refused with the release
+// gate's text, and no use, no LUN claim and no VM is written anywhere. Once
+// the fleet is uniform the create goes through, and every voter holds the
+// feature's used record before it holds any LUN claim: a voter never holds a
+// claim a rolled-back build would not keep without the record that
+// quarantines that build.
+//
+// Mutations: let iscsiLUNClaimGate pass without the release gate — stage 1
+// goes red; write the claim before the gate's record (call the gate after
+// allocating) — the watcher goes red.
 func TestFleet_ISCSI_RefusedUntilTheUpgradeFinishes(t *testing.T) {
-	c := newLUNFleet(t)
-	n0 := c.Nodes[0]
+	c := newLUNFleetGated(t, 3)
+	ctx := context.Background()
+	n0, old := c.Nodes[0], c.Nodes[2]
 	addLUNPool(t, c, "san", 0, onePortal)
-	n0.Server.SetReleaseFeatureGate(func(context.Context, string) error { return errors.New("not latched") })
+	feature := string(capabilities.FeatureISCSILUNClaim)
+
+	// 1. One host on the previous build.
+	old.Server.SetWALQuarantined(func() bool { return true })
+	want := "the cluster upgrade must finish first (iscsi_lun_claim needs " + capabilities.ReleaseToken + ")"
 	err := createOnLUN(c, n0, "a", "san")
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "upgrade must finish first") {
-		t.Fatalf("create before the latch: got %v", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) {
+		t.Fatalf("create before the latch: got %v, want FailedPrecondition %q", err, want)
+	}
+	for _, n := range c.Nodes {
+		if featureUsedOn(t, n, capabilities.ReleaseToken, feature) {
+			t.Fatalf("%s holds a use of %s after only a refusal", n.Name, feature)
+		}
+		if k := lunClaimsOn(t, n); k != 0 {
+			t.Fatalf("%s holds %d LUN claim rows after a refused create", n.Name, k)
+		}
+		if lunVMOn(t, n, "a") {
+			t.Fatalf("%s holds the refused VM", n.Name)
+		}
+	}
+
+	// 2. Uniform fleet: the create goes through, and no voter ever holds a
+	// LUN claim without the used record.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	var violation atomic.Value
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, n := range c.Nodes {
+				rows, qerr := n.DB.Query(ctx,
+					`SELECT COUNT(*) AS n FROM local_recovery_claims WHERE target_kind = ?`, corrosion.ClaimKindLUN)
+				if qerr != nil || rows[0].Int("n") == 0 {
+					continue
+				}
+				if used, uerr := corrosion.ReleaseFeatureUsed(ctx, n.DB, capabilities.ReleaseToken, feature); uerr == nil && !used {
+					violation.Store(n.Name)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	eventually(t, 30*time.Second, "the iSCSI create to be accepted on a uniform fleet", func() bool {
+		return createOnLUN(c, n0, "a", "san") == nil
+	})
+	close(stop)
+	<-done
+	if v := violation.Load(); v != nil {
+		t.Fatalf("%s held a LUN claim before it held the %s use record", v, feature)
+	}
+	claimed := 0
+	for _, n := range c.Nodes {
+		if !featureUsedOn(t, n, capabilities.ReleaseToken, feature) {
+			t.Errorf("%s does not hold the %s use record", n.Name, feature)
+		}
+		claimed += lunClaimsOn(t, n)
+	}
+	if claimed == 0 {
+		t.Fatal("the create went through with no voter holding a LUN claim")
 	}
 }
 

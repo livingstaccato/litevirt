@@ -1247,12 +1247,18 @@ whose pool is that LUN, its rebuild or recreate around the record's time
 (`lv events`), and the host that ran it — then check the same two things.
 
 **Upgrading.** Allocation on an iscsi pool needs the release feature
-`iscsi_lun_claim`, which opens only once the whole cluster runs a build that
-knows LUN claims: an older voter cannot decide a LUN key, and an older host
-allocates without asking. Until it is open every create, rebuild or recreate
-with a disk on an iscsi pool is refused with "the cluster upgrade must finish
-first". Running VMs are not affected. Refusing is safer than the silent sharing
-older builds allowed.
+`iscsi_lun_claim` of the release token `release_2026_11_v1`, which opens only
+once the whole cluster runs a build that knows LUN claims: an older voter
+cannot decide a LUN key, and an older host allocates without asking. Until it
+is open every create, rebuild or recreate with a disk on an iscsi pool is
+refused with "the cluster upgrade must finish first (iscsi_lun_claim needs
+release_2026_11_v1)", naming the hosts still to upgrade (`lv cluster
+upgrade-status`). Running VMs, and deleting them, are not affected. Refusing is
+safer than the silent sharing older builds allowed. The first iscsi allocation
+after the upgrade records the feature as used, cluster-wide, before any LUN
+claim exists; from then on a host rolled back below the release is
+WAL-quarantined rather than allocating LUNs without claims (see
+[upgrades.md](upgrades.md)).
 
 A compose file that would put two instances of a VM on one iscsi volume or pool
 at once — `replicas` above 1, or an `update: strategy` of `blue-green` or

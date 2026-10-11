@@ -116,7 +116,7 @@ func restartNode(t *testing.T, c *Cluster, n *Node) {
 	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
 	n.repl.Start(c.ctx)
 	n.replStarted = true
-	n.Server.SetReleaseFeatureGate(func(context.Context, string) error { return nil })
+	wireLUNReleaseGate(t, c, n)
 }
 
 // webOn reports whether n's replica has web live on host.

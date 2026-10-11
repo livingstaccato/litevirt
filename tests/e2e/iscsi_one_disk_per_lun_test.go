@@ -23,10 +23,11 @@ import (
 //     and LUN 1's boot sector is the image's (the image was written onto it);
 //   - no shared_lun health condition stands.
 //
-// It needs a build where the iscsi_lun_claim release feature can open (this
-// branch merged with feat/release-token, the daemon wiring
-// Server.SetReleaseFeatureGate) and an adopted voter generation: without
-// either, every iscsi create is refused and the first deploy fails saying so.
+// It needs every lab node on a build that declares the iscsi_lun_claim
+// release feature (release_2026_11_v1 latched, so the first create records
+// the feature's use) and an adopted voter generation: without either, every
+// iscsi create is refused and the first deploy fails saying so. Once it has
+// run, the feature is used: a rollback below the release quarantines.
 //
 // Run it with:
 //

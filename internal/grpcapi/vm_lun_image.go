@@ -309,13 +309,14 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 	if err != nil || len(uses) == 0 {
 		return ctx, noop, err
 	}
-	if err := s.iscsiLUNClaimGate(ctx); err != nil {
-		return ctx, noop, err
-	}
 	if runHost == "" {
 		return ctx, noop, status.Errorf(codes.Unavailable,
 			"VM %q has a disk on an iSCSI LUN, and the host it is re-created on was not fixed before the "+
 				"teardown (its storage changed while the re-create was judged) — retry", spec.Name)
+	}
+	grant, err := s.iscsiLUNClaimGate(ctx)
+	if err != nil {
+		return ctx, noop, err
 	}
 	rep := replacedVM{name: cur.Name, snap: corrosion.VMDeleteSnapshot{CreatedAt: cur.CreatedAt}}
 	if cs := vmSpecFor(cur); cs != nil {
@@ -429,7 +430,7 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 			// this re-create replaces (keptForVM; re-review 5, R-1).
 			mine.Kept, mine.Project, mine.ReplacedCreatedAt = true, tenancy.NormalizeProject(cur.Project), cur.CreatedAt
 		}
-		g, _, err := s.allocateLUN(ctx, spec.Name, u, mine, rep, true, holdID, token, false)
+		g, _, err := s.allocateLUN(ctx, grant, spec.Name, u, mine, rep, true, holdID, token, false)
 		if err != nil {
 			return ctx, noop, err
 		}
@@ -449,7 +450,7 @@ func (s *Server) preflightLUNs(ctx context.Context, spec *pb.VMSpec, cur *corros
 				return
 			case recreateCommitted:
 				for k, g := range decided {
-					if err := corrosion.AdvanceLUNResolved(context.WithoutCancel(ctx), s.db, k, g, s.hostName); err != nil {
+					if err := corrosion.AdvanceLUNResolved(context.WithoutCancel(ctx), s.db, grant, k, g, s.hostName); err != nil {
 						slog.Warn("iSCSI LUN: record checkpoint", "lun", k, "generation", g, "error", err)
 					}
 				}

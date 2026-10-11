@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/image"
@@ -86,7 +87,13 @@ func newLUNTestServer(t *testing.T, adopt bool) *Server {
 		s.db.SetVoterConfigGate(func() bool { return true })
 	}
 	s.db.SetClusterPolicyGate(func() bool { return true })
-	s.releaseFeatureGate = func(context.Context, string) error { return nil }
+	// The feature is open: the gate grants, and the use is recorded as the
+	// real gate leaves it (a plain delete reads it, lunPlainDeleteRecordable).
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+	if err := corrosion.RecordReleaseFeatureUse(ctx, s.db, capabilities.ReleaseToken,
+		string(capabilities.FeatureISCSILUNClaim), s.hostName, true); err != nil {
+		t.Fatalf("record the iscsi_lun_claim use: %v", err)
+	}
 	for name, opts := range map[string]map[string]string{
 		"lun0":  {"portal": "10.0.0.1", "lun": "0"},
 		"lun0b": {"portal": "10.0.0.1:3260"},
@@ -286,7 +293,7 @@ func TestCreateVM_ISCSI_AnEarlierAllocationMustBeProvenGone(t *testing.T) {
 			}
 			// Allocation 0 of the LUN was decided for a create of VM "far" on
 			// peer-host, which this host's replica has never heard of.
-			if _, err := s.decideLUN(ctx, corrosion.LUNAllocation{LUN: key(t), Generation: 0, ClaimID: "far-claim",
+			if _, err := s.decideLUN(ctx, lunGrant(t), corrosion.LUNAllocation{LUN: key(t), Generation: 0, ClaimID: "far-claim",
 				VMID: "far-uuid", VMName: "far", Disk: "root", Host: "peer-host"}); err != nil {
 				t.Fatalf("decide allocation 0: %v", err)
 			}

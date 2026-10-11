@@ -563,10 +563,6 @@ type Server struct {
 	// lunHolds is this host's durable holds on the LUNs whose claims its
 	// rebuilds and recreates moved (vm_lun_hold.go).
 	lunHolds lunHoldStore
-	// releaseFeatureGate opens a release feature (SetReleaseFeatureGate); nil
-	// opens none.
-	releaseFeatureMu   sync.Mutex
-	releaseFeatureGate func(ctx context.Context, feature string) error
 	// rootfsSizes caches InspectContainer's measured rootfs sizes by path for
 	// rootfsSizeTTL; rootfsSizeMu guards it and serialises the walks.
 	rootfsSizeMu sync.Mutex

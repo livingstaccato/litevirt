@@ -27,6 +27,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -2094,11 +2095,20 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	out, err := s.deleteVM(ctx, req)
-	if err == nil {
-		for _, k := range luns {
-			if rerr := corrosion.RecordLUNPlainDelete(context.WithoutCancel(ctx), s.db, k, createdAt, s.hostName); rerr != nil {
-				slog.Warn("iSCSI LUN: could not record a VM's delete on its LUN", "vm", req.Name, "lun", k, "error", rerr)
+	if err == nil && len(luns) > 0 && s.lunPlainDeleteRecordable(ctx) {
+		// The record is iscsi_lun_claim's data: written through its gate
+		// (already in use, so no peer is asked), never refusing the delete,
+		// which has happened.
+		wctx := context.WithoutCancel(ctx)
+		if gerr := s.WithReleaseFeature(wctx, capabilities.FeatureISCSILUNClaim, func(wctx context.Context, g capabilities.FeatureGrant) error {
+			for _, k := range luns {
+				if rerr := corrosion.RecordLUNPlainDelete(wctx, s.db, g, k, createdAt, s.hostName); rerr != nil {
+					slog.Warn("iSCSI LUN: could not record a VM's delete on its LUN", "vm", req.Name, "lun", k, "error", rerr)
+				}
 			}
+			return nil
+		}); gerr != nil {
+			slog.Warn("iSCSI LUN: could not record a VM's delete on its LUNs", "vm", req.Name, "luns", luns, "error", gerr)
 		}
 	}
 	return out, err

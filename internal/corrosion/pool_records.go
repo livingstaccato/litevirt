@@ -45,6 +45,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 const (
@@ -254,8 +256,12 @@ func GetLUNPlainDelete(ctx context.Context, c *Client, lun string) (string, erro
 // createdAt of a VM whose disk is lun. It keeps the latest: an earlier
 // incarnation never moves it back. A cluster that may not write
 // cluster_policies yet records nothing (it has no kept allocations either:
-// LUN claims open only after it can).
-func RecordLUNPlainDelete(ctx context.Context, c *Client, lun, createdAt, setBy string) error {
+// LUN claims open only after it can). It is iscsi_lun_claim's data, so it
+// takes the feature's grant (capabilities.FeatureISCSILUNClaim).
+func RecordLUNPlainDelete(ctx context.Context, c *Client, g capabilities.FeatureGrant, lun, createdAt, setBy string) error {
+	if err := g.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return err
+	}
 	if !c.MayWriteClusterPolicy() || createdAt == "" {
 		return nil
 	}
@@ -275,8 +281,12 @@ func RecordLUNPlainDelete(ctx context.Context, c *Client, lun, createdAt, setBy 
 
 // AdvanceLUNResolved moves the LUN's checkpoint forward to g. It never moves
 // it back (a concurrent writer's LWW win can, which only costs a longer walk),
-// and writes nothing where cluster_policies may not be written yet.
-func AdvanceLUNResolved(ctx context.Context, c *Client, lun string, g int64, setBy string) error {
+// and writes nothing where cluster_policies may not be written yet. It is
+// iscsi_lun_claim's data, so it takes the feature's grant.
+func AdvanceLUNResolved(ctx context.Context, c *Client, grant capabilities.FeatureGrant, lun string, g int64, setBy string) error {
+	if err := grant.Check(capabilities.FeatureISCSILUNClaim); err != nil {
+		return err
+	}
 	if !c.MayWriteClusterPolicy() {
 		return nil
 	}

@@ -91,8 +91,10 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureUSBMountsMemory:      {Token: Release202611V1, Description: "VM USB devices and memory hot-add; container host mounts and devices"},
 	FeatureBackupZstd:           {Token: Release202611V1, Description: "zstd chunk compression in backup repositories"},
 	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host"},
-	FeatureISCSILUNClaim:        {Token: Release202611V1, Description: "Cluster-wide claim of an iSCSI LUN by one disk"},
 	FeaturePITOverlay:           {Token: Release202611V1, Description: "Point-in-time overlays for copies of running VMs"},
+	FeatureISCSILUNClaim: {Token: Release202611V1, Description: "Cluster-wide voter claim of each iSCSI LUN by one disk; iSCSI disk creates wait for it",
+		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
+			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
 }
 
 // The features of release_2026_11_v1. Each name is written into a replicated

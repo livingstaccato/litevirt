@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // LUN allocation claims: one iSCSI LUN, one disk, decided by a voter
@@ -225,7 +227,7 @@ func TestLUNResolved_MovesForwardOnly(t *testing.T) {
 	if g, err := GetLUNResolved(ctx, c, "iscsi:x/lun0"); err != nil || g != 0 {
 		t.Fatalf("no checkpoint: %d %v", g, err)
 	}
-	if err := AdvanceLUNResolved(ctx, c, "iscsi:x/lun0", 4, "h"); err != nil {
+	if err := AdvanceLUNResolved(ctx, c, capabilities.GrantForTest(t, capabilities.FeatureISCSILUNClaim), "iscsi:x/lun0", 4, "h"); err != nil {
 		t.Fatal(err)
 	}
 	if g, _ := GetLUNResolved(ctx, c, "iscsi:x/lun0"); g != 0 {
@@ -233,7 +235,7 @@ func TestLUNResolved_MovesForwardOnly(t *testing.T) {
 	}
 	c.SetClusterPolicyGate(func() bool { return true })
 	for _, step := range []struct{ to, want int64 }{{4, 4}, {2, 4}, {7, 7}} {
-		if err := AdvanceLUNResolved(ctx, c, "iscsi:x/lun0", step.to, "h"); err != nil {
+		if err := AdvanceLUNResolved(ctx, c, capabilities.GrantForTest(t, capabilities.FeatureISCSILUNClaim), "iscsi:x/lun0", step.to, "h"); err != nil {
 			t.Fatal(err)
 		}
 		if g, _ := GetLUNResolved(ctx, c, "iscsi:x/lun0"); g != step.want {

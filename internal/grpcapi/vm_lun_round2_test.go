@@ -24,7 +24,7 @@ import (
 func decideForeign(t *testing.T, s *Server, lun string, g int64, vm, host string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := s.decideLUN(ctx, corrosion.LUNAllocation{LUN: lun, Generation: g,
+	if _, err := s.decideLUN(ctx, lunGrant(t), corrosion.LUNAllocation{LUN: lun, Generation: g,
 		ClaimID: vm + "-claim", VMID: vm + "-uuid", VMName: vm, Disk: "root", Host: host}); err != nil {
 		t.Fatalf("decide allocation %d: %v", g, err)
 	}
@@ -353,7 +353,7 @@ func TestCreateVM_ISCSI_ABogusCheckpointIsNotTrusted(t *testing.T) {
 	}
 	key := mustLUNKey(t, "10.0.0.1", "0")
 	decideForeign(t, s, key, 0, "far", "peer-host")
-	if err := corrosion.AdvanceLUNResolved(ctx, s.db, key, 5, "forger"); err != nil {
+	if err := corrosion.AdvanceLUNResolved(ctx, s.db, lunGrant(t), key, 5, "forger"); err != nil {
 		t.Fatal(err)
 	}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
@@ -378,7 +378,7 @@ func TestCreateVM_ISCSI_ACheckpointOnePastTheHolderIsNotTrusted(t *testing.T) {
 	}
 	key := mustLUNKey(t, "10.0.0.1", "0")
 	decideForeign(t, s, key, 0, "far", "peer-host")
-	if err := corrosion.AdvanceLUNResolved(ctx, s.db, key, 1, "forger"); err != nil {
+	if err := corrosion.AdvanceLUNResolved(ctx, s.db, lunGrant(t), key, 1, "forger"); err != nil {
 		t.Fatal(err)
 	}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {

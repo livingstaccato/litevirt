@@ -33,7 +33,7 @@ func restartedLUNServer(s *Server) *Server {
 	return &Server{
 		hostName: s.hostName, dataDir: s.dataDir, db: s.db, images: s.images, events: s.events,
 		vmLocks: make(map[string]*sync.Mutex), bridgeEnsure: s.bridgeEnsure, virt: s.virt,
-		pkiDir: s.pkiDir, releaseFeatureGate: s.releaseFeatureGate,
+		pkiDir: s.pkiDir, releaseFeatures: s.releaseFeatures,
 	}
 }
 
@@ -225,7 +225,7 @@ func TestCreateVM_ISCSI_AMovedAllocationIsGoneOnlyWhenBothHostsShowNothing(t *te
 					t.Fatal(err)
 				}
 			}
-			if _, err := s.decideLUN(ctx, corrosion.LUNAllocation{LUN: key(t), Generation: 0, ClaimID: "moved",
+			if _, err := s.decideLUN(ctx, lunGrant(t), corrosion.LUNAllocation{LUN: key(t), Generation: 0, ClaimID: "moved",
 				VMID: "web-uuid", VMName: "web", Disk: "root", Host: "hold-host", RunHost: "run-host"}); err != nil {
 				t.Fatal(err)
 			}

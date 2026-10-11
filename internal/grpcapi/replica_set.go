@@ -158,8 +158,9 @@ var statShared = os.Stat
 // running when it times out is abandoned; it ends when the mount answers.
 func statWithin(path string, timeout time.Duration) error {
 	done := make(chan error, 1)
+	stat := statShared // read here, not in the goroutine that may outlive the call
 	go func() {
-		_, err := statShared(path)
+		_, err := stat(path)
 		done <- err
 	}()
 	t := time.NewTimer(timeout)

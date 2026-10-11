@@ -919,23 +919,6 @@ func TestFleet_Failback_AnUnacknowledgingRecipientNeverSlowsADrain(t *testing.T)
 	}
 }
 
-// freshQuorum beats every node's checker once and seeds a fresh peer view: the
-// view enforceGate seeded predates any gap since the checker's last beat, which
-// it reads as a stall (the HA monitor beats and probes in production). A slow
-// run (-race) opens such gaps between steps.
-func freshQuorum(f *fbScenario, gates map[string]*health.Checker) {
-	for _, n := range f.c.Nodes {
-		gates[n.Name].QuorumProof(context.Background())
-		peers := map[string]bool{}
-		for _, o := range f.c.Nodes {
-			if o != n {
-				peers[o.Name] = true
-			}
-		}
-		gates[n.Name].SeedPeersForTests(peers)
-	}
-}
-
 // A drain's record describes the drain's move, not whatever placement the VM
 // has by the time the record is written. Records are written after the drain's
 // frames, behind a first use that can wait seconds for acknowledgements; in
@@ -970,7 +953,7 @@ func TestFleet_Failback_ARecordDescribesTheDrainsMoveNotALaterOne(t *testing.T) 
 
 	f.addVM(t, "v1", f.a, nil)
 	f.addVM(t, "v2", f.a, nil)
-	freshQuorum(f, gates)
+	f.refreshQuorum()
 	emulateLibvirtMove(f.a, f.b)
 	st, err := f.c.SelfClient(f.a).DrainHost(ctx, &pb.DrainHostRequest{Name: f.a.Name})
 	if err != nil {
@@ -993,13 +976,13 @@ func TestFleet_Failback_ARecordDescribesTheDrainsMoveNotALaterOne(t *testing.T) 
 	// The operator moves both out and back while the records wait.
 	f.xIn(t)
 	for _, vm := range []string{"v1", "v2"} {
-		freshQuorum(f, gates)
+		f.refreshQuorum()
 		emulateLibvirtMove(f.b, f.x)
 		if err := migrateAt(t, f.c, f.b, vm, f.x.Name); err != nil {
 			t.Fatalf("operator migrate %s: %v", vm, err)
 		}
 		f.c.WaitConverged(t, convergeTimeout)
-		freshQuorum(f, gates)
+		f.refreshQuorum()
 		emulateLibvirtMove(f.x, f.b)
 		if err := migrateAt(t, f.c, f.x, vm, f.b.Name); err != nil {
 			t.Fatalf("operator migrate %s back: %v", vm, err)
@@ -1010,7 +993,7 @@ func TestFleet_Failback_ARecordDescribesTheDrainsMoveNotALaterOne(t *testing.T) 
 	f.a.Server.WaitDrainRecordsForTest()
 	f.c.WaitConverged(t, convergeTimeout)
 
-	freshQuorum(f, gates)
+	f.refreshQuorum()
 	f.undrainSettled(t, f.a)
 	emulateLibvirtMove(f.b, f.a)
 	got, err := f.failback(t, f.x, &pb.FailbackHostRequest{All: true})

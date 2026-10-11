@@ -1139,6 +1139,19 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
+	// An operator's same-name promotion is serialized with failover's recovery
+	// of the same VM (review PB-F1; promote_serialize.go): it refuses while a
+	// recovery of it is in flight at its current owner epoch, and, with
+	// recovery claims enforced, claims the VM's recovery just before it starts
+	// the domain. The coordinator's own promotion carries a proof and is
+	// claimed where it is minted (claimPromote); a relay the coordinator
+	// marked is its too.
+	operatorPromote := !renamed && req.Proof == nil && !automated && !req.Automated && !started
+	if operatorPromote {
+		if err := s.refuseWhileRecoveryInFlight(ctx, vm); err != nil {
+			return err
+		}
+	}
 	// A domain already defined here under the name is replaced only with
 	// --force, and only just before the new one is defined: every refusal and
 	// every failure on the way there — a live disk already at the root's
@@ -1463,6 +1476,20 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
+	}
+
+	// The operator's claim, after every other refusal and the disk builds and
+	// just before anything is destroyed or started: decided, it holds the
+	// VM's recovery at this owner epoch, so a coordinator recovering the same
+	// VM learns it and stands down; a recovery already decided, or in flight,
+	// refuses this promotion instead. Only a takeover of a VM recorded on
+	// another host: no coordinator recovers a VM off a host that is up, and a
+	// voter never certifies the eviction of the host asking.
+	if operatorPromote && vm.HostName != "" && vm.HostName != s.hostName && s.RecoveryClaimEnforced(ctx) {
+		if err := s.claimOperatorPromote(ctx, vm); err != nil {
+			removeLive()
+			return err
+		}
 	}
 
 	// Define + start — skipped on a resume where the domain was already started by

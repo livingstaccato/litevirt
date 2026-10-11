@@ -670,6 +670,20 @@ path as after `lv host rm --dead`, once the removal and the host's certificate
 revocation have replicated. That can happen before a promotion you run next,
 so confirm a removed host only when you want its workloads recovered.
 
+**An operator's promotion and failover's recovery of the same VM never both
+start it.** With recovery claims enforced, a same-name `lv replication promote`
+of a VM recorded on another host claims the VM's recovery at its current owner
+epoch just before it starts the VM (docs/design/recovery-claims.md §10 item
+43). Whichever is decided first runs the VM. A promotion that comes second is
+refused with the decision it lost to, `<action> to <host> by <coordinator>
+(proof <id>)`, and what to wait for (`lv inspect <vm>` shows where it runs,
+`lv cluster claim vm/<vm>` the decision); a coordinator that comes second
+stands down. The promotion goes ahead unclaimed only when a majority of voters
+still reach the VM's owner, where no recovery can be certified either. Without
+claims, a promotion refuses while this host's replica holds a reschedule or
+promote proof of the VM in flight at its current owner epoch (written within
+the last hour, or with a start recorded): best effort, as a replica can lag.
+
 The confirmation of a removed host needs a node on a build that has it. A
 node still on an older build answers `host "<host>" not found` for a removed
 host, as it always did; during a rolling upgrade, point `lv` at an upgraded

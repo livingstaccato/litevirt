@@ -2340,3 +2340,43 @@ where it described the mechanism; this list records what changed and why.
     - No schema, statement shape, protobuf or capability change. An older
       coordinator leaves the skip terminal, as before. A newer one retries it
       under a claim that every build's voters already decide.
+43. **An operator's takeover promotion claims too** (§2, review PB-F1). §2
+    leaves operator-driven moves out of scope, "already serialized by an
+    operator". An operator's `lv replication promote <vm>` of a VM recorded
+    on another host was not: it is proofless, never claimed, and read no
+    claim. When failover recovered the same VM to another replica host, or
+    the operator passed `--force`, both could start the VM within seconds,
+    and with a shared data disk both attached it. A `lv host fence-confirm`
+    of a removed host made that likelier, since it lets the coordinator
+    recover the host's workloads (`recoverRemovedHosts`).
+    - **The rule.** With claims enforced, the executing host claims the
+      VM's recovery at its current owner epoch for a same-name promotion of
+      a VM recorded on another host, after every other refusal and the disk
+      builds, just before it destroys or starts anything. The value is a
+      promote to that host whose `coordinator` is `operator@<host>`, never a
+      host name, so no coordinator mistakes it for its own decision and asks
+      the destination to abandon it on a fallback (`supersedeEvidence`). The
+      claim tries one ballot at round 1 (`MaxRounds` 1, no round reuse), so
+      it never outranks a coordinator that has promised a higher one.
+    - **Outcomes.** Decided for this promotion, or by an earlier operator
+      promotion on the same host that did not start the VM: it goes ahead. A
+      majority of voters still reaching the owner: no recovery can be
+      certified, and it goes ahead as an override of a live owner always did.
+      A decided recovery: refused, naming the decision and what to wait for.
+      A recovery decided for this host that this host has abandoned, or for a
+      host removed for good, is moved past at the next attempt, with this
+      host's own signed abandonment or the removal evidence; nothing new is
+      ever abandoned, so a recovery in flight is never preempted. Anything
+      else (no majority, a higher ballot held): refused, naming
+      `lv cluster claim vm/<vm>`.
+    - **The coordinator's side is unchanged.** Its reschedule site already
+      defers to a decided value of another action (`noteClaimLost`), and an
+      automated promotion refuses a value not its own (`RecoveryClaimLostError`).
+    - **Without claims** (the flag off, or the token not latched — what a
+      rolling upgrade waits for, so an older coordinator that writes no claims
+      is never on the other side of an enforced one), the operator's promotion
+      refuses while its own replica holds a reschedule or promote proof of the
+      VM in flight at the current owner epoch: prepared or in progress, and
+      written within the last hour or with a start recorded. That is best
+      effort, as a replica can lag.
+    - No schema, statement shape, protobuf or capability change.

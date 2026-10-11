@@ -5,6 +5,7 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,5 +114,137 @@ func TestFleet_PartialPromotionThenOnbootLeavesTheSharedDiskOut(t *testing.T) {
 	insp, err = c.SelfClient(coord).InspectVM(ctx, &pb.InspectVMRequest{Name: "set4"})
 	if err != nil || insp.GetSharedDiskWithheld() != "" {
 		t.Errorf("inspect shared_disk_withheld = %q (%v) after the attaching restart, want cleared", insp.GetSharedDiskWithheld(), err)
+	}
+}
+
+// pbf1Fleet is db on victim with a replica of every disk on both a and b, its
+// schedule auto-promoting to b. With claims: voters {a, b, victim}, recovery
+// claims enforced everywhere. The victim is then killed and replication
+// between a and b blocked — the window before either side's commit arrives —
+// while claim RPCs still reach their peer.
+func pbf1Fleet(t *testing.T, clock *VirtualClock, withClaims bool) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
+	setup := func(c *Cluster, a, b, victim *Node) {
+		ctx := context.Background()
+		sched := replicaSetVM(t, c, victim, a, "db")
+		if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-10*time.Minute)); err != nil {
+			t.Fatalf("replicate db to %s: %v", a.Name, err)
+		}
+		dr := filepath.Join(c.tmpRoot, b.Name, "data", "dr")
+		if err := os.MkdirAll(dr, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpsertStoragePool(ctx, b.DB, corrosion.StoragePoolRecord{
+			HostName: b.Name, Name: "dr", Driver: "local", Target: dr, State: "active",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		sched.TargetHost = b.Name
+		if err := corrosion.UpsertBackupSchedule(ctx, victim.DB, sched); err != nil {
+			t.Fatal(err)
+		}
+		if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-5*time.Minute)); err != nil {
+			t.Fatalf("replicate db to %s: %v", b.Name, err)
+		}
+	}
+	if withClaims {
+		c, a, b, victim = claimFleetWith(t, clock, 3258, setup)
+	} else {
+		c = New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 3258})
+		a, b, victim = c.Nodes[0], c.Nodes[1], c.Nodes[2]
+		setup(c, a, b, victim)
+		c.WaitConverged(t, convergeTimeout)
+		c.Kill(victim)
+		PublishHealth(t, a, victim.Name, 5, clock.Now())
+		PublishHealth(t, b, victim.Name, 5, clock.Now())
+		c.WaitConverged(t, convergeTimeout, a, b)
+	}
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	return c, a, b, victim
+}
+
+// runs reports whether n runs db.
+func runs(n *Node) bool {
+	st, err := n.Virt.DomainState("db")
+	return err == nil && st == "running"
+}
+
+// Review PB-F1: an operator's promotion and failover's recovery of the same VM
+// never both start it. The operator promotes db on a (its replica there,
+// --force) while b's coordinator recovers it by auto-promoting on b (its
+// replica there) — different replica hosts, inside the window before either
+// commit replicates, the case nothing serialized. With recovery claims the
+// two are one decision: whichever claims first starts the VM, and the other
+// is refused (the operator's promotion, naming the decision to wait for) or
+// stands down (the coordinator, which learns the operator's decision).
+//
+// The claims-off arm is the witness: there both start db, which is what the
+// issue reported and what keeps the enforced arms from passing vacuously.
+//
+// Mutation "no operator claim" (claimOperatorPromote not called) — red on
+// both enforced arms (two owners).
+func TestFleet_OperatorPromoteAndCoordinatorRecoveryNeverBothStartTheVM(t *testing.T) {
+	if testing.Short() {
+		t.Skip("fleet")
+	}
+	for _, tc := range []struct {
+		name           string
+		claims         bool
+		operatorFirst  bool
+		wantA, wantB   bool
+		operatorRefuse string
+	}{
+		{"claims, coordinator first", true, false, false, true, "has decided its recovery"},
+		{"claims, operator first", true, true, true, false, ""},
+		{"no claims, operator first (witness: two owners)", false, true, true, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			clock := NewVirtualClock(time.Now().UTC())
+			c, a, b, _ := pbf1Fleet(t, clock, tc.claims)
+			cs := c.NewCoordinators(clock)
+			cs.ByNode[b.Name].Promoter = b.Server
+			operator := func() error {
+				st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
+					VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+				if err != nil {
+					return err
+				}
+				for {
+					if _, err := st.Recv(); err != nil {
+						if err == io.EOF {
+							return nil
+						}
+						return err
+					}
+				}
+			}
+
+			var opErr error
+			if tc.operatorFirst {
+				opErr = operator()
+				cs.Tick(ctx, b)
+			} else {
+				cs.Tick(ctx, b)
+				opErr = operator()
+			}
+
+			if tc.operatorRefuse != "" {
+				if opErr == nil || !strings.Contains(opErr.Error(), tc.operatorRefuse) {
+					t.Errorf("operator promotion = %v, want it refused (%q)", opErr, tc.operatorRefuse)
+				}
+			} else if opErr != nil {
+				t.Errorf("operator promotion: %v", opErr)
+			}
+			if got := runs(a); got != tc.wantA {
+				t.Errorf("db running on %s (the operator's promotion) = %v, want %v", a.Name, got, tc.wantA)
+			}
+			if got := runs(b); got != tc.wantB {
+				t.Errorf("db running on %s (the coordinator's promotion) = %v, want %v", b.Name, got, tc.wantB)
+			}
+			if tc.claims && runs(a) && runs(b) {
+				t.Fatal("two hosts run db: the operator's promotion and the coordinator's recovery both started it")
+			}
+		})
 	}
 }

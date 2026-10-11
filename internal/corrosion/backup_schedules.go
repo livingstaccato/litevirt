@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // BackupScheduleRecord is one row of the backup_schedules table. A schedule
@@ -135,13 +137,40 @@ func ContainerScheduleProject(r BackupScheduleRecord) string {
 	return normalizeProject(r.ProjectName)
 }
 
+// UpsertContainerReplicationSchedule creates or replaces a container's
+// replication schedule: release feature container_replication's data, which a
+// host on an earlier build would skip without a word or take for a VM's. It
+// writes only with a grant from that feature's gate, which has put this node's
+// used record on its stream ahead of the row.
+func UpsertContainerReplicationSchedule(ctx context.Context, c *Client, g capabilities.FeatureGrant, s BackupScheduleRecord) error {
+	if err := g.Check(capabilities.FeatureContainerReplication); err != nil {
+		return err
+	}
+	if _, _, ok := ContainerScheduleName(s.VMName); !ok || s.Scope != "container" || s.Type != "replication" {
+		return fmt.Errorf("schedule %q (scope %q, type %q) is not a container replication schedule", s.VMName, s.Scope, s.Type)
+	}
+	return upsertBackupSchedule(ctx, c, s)
+}
+
 // UpsertBackupSchedule creates or replaces a schedule by (vm_name, repo).
+// A container's replication schedule (a key ContainerScheduleName reads) is
+// refused: it is written only by UpsertContainerReplicationSchedule, behind
+// its release feature's gate. No other schedule's key has that form (a VM
+// name cannot contain '@' or ':').
 // PoolName is stored alongside but is not part of the primary key —
 // callers wanting a pool-level row leave VMName empty and set PoolName.
 // The PRIMARY KEY is still (vm_name, repo), with the convention that
 // an empty vm_name + non-empty pool_name maps to a single pool row
 // per repo.
 func UpsertBackupSchedule(ctx context.Context, c *Client, s BackupScheduleRecord) error {
+	if _, _, ok := ContainerScheduleName(s.VMName); ok {
+		return fmt.Errorf("schedule %q is a container replication schedule, written only behind release feature %s",
+			s.VMName, capabilities.FeatureContainerReplication)
+	}
+	return upsertBackupSchedule(ctx, c, s)
+}
+
+func upsertBackupSchedule(ctx context.Context, c *Client, s BackupScheduleRecord) error {
 	now := c.NowTS()
 	scope := s.Scope
 	if scope == "" {

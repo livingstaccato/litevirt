@@ -230,7 +230,7 @@ func f() {
 // not: the branch that adds its Writers deletes it from here in the same
 // change, after which the feature must list them.
 var writersPending = map[Feature]bool{
-	"backup_zstd": true, "container_replication": true, "drain_failback": true,
+	"backup_zstd": true, "drain_failback": true,
 	"email_target_secret": true, "firewall_ipv6": true, "iscsi_lun_claim": true,
 	"login_policy": true, "nic_guards": true, "pit_overlay": true, "usb_mounts_memory": true,
 	"vm_disk_nic_io": true, "vm_limits": true,

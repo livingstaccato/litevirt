@@ -5,6 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
 // ReplicationReversal is one replication schedule ReverseReplicationOnMove
@@ -41,10 +46,20 @@ type ReplicationReversal struct {
 // concurrent edit of the same row on another node (enabled, cron, keep) is not
 // reverted by last-writer-wins. That statement is a shape a previous-release
 // peer does not know, and an unknown shape back-pressures the sender's whole
-// stream, so a caller sets TargetOnly only once every host is known to run a
-// build that has it (the container_replication release feature). Without it the
-// row is re-read immediately before the write and re-upserted from that read,
-// under the same compare: a change that landed here first is kept.
+// stream, so a caller sets TargetOnly only once the release token has durably
+// latched (RepointReady): the latch is replication-gated, so every host this
+// one replicates to runs a build that has it. Without it a VM's row is re-read
+// immediately before the write and re-upserted from that read, under the same
+// compare: a change that landed here first is kept.
+//
+// A container's schedule is release feature container_replication's data, so
+// its switch runs through this node's release-feature gate
+// (SetReleaseFeatureGate) and is always the compare-and-set
+// (RepointContainerReplicationTarget): the gate passes only once the release
+// token has latched, so the statement's shape is known everywhere, and the
+// statement is an UPDATE that can never create the row on a replica that has
+// not got it. A gate that refuses leaves the schedule as it is (Skipped, with
+// the refusal).
 //
 // It also drops the workload's incremental checkpoint, which belongs to the old
 // direction: the dirty-bitmap anchor lives on the OLD source's disk, and the new
@@ -89,7 +104,24 @@ func ReverseReplicationOnMove(ctx context.Context, c *Client, kind, name, projec
 		if reverseBeforeWrite != nil {
 			reverseBeforeWrite()
 		}
-		applied, err := repointSchedule(ctx, c, r.VMName, r.Repo, newHost, oldHost, opts.targetOnly())
+		var applied bool
+		if kind == "container" {
+			ran := false
+			err = c.WithReleaseFeature(ctx, capabilities.FeatureContainerReplication,
+				func(ctx context.Context, g capabilities.FeatureGrant) error {
+					ran = true
+					var werr error
+					applied, werr = RepointContainerReplicationTarget(ctx, c, g, r.VMName, r.Repo, newHost, oldHost)
+					return werr
+				})
+			if err != nil && !ran {
+				rev.Skipped = "the release gate refused the switch: " + status.Convert(err).Message()
+				out = append(out, rev)
+				continue
+			}
+		} else {
+			applied, err = repointSchedule(ctx, c, r.VMName, r.Repo, newHost, oldHost, opts.targetOnly())
+		}
 		if err != nil {
 			return out, fmt.Errorf("re-point replication schedule of %q: %w", name, err)
 		}
@@ -148,6 +180,21 @@ func repointSchedule(ctx context.Context, c *Client, vmName, repo, from, to stri
 		return true, UpsertBackupSchedule(ctx, c, r)
 	}
 	return false, nil
+}
+
+// RepointContainerReplicationTarget is RepointReplicationTarget for a
+// container's schedule, release feature container_replication's data: it
+// writes only with a grant from that feature's gate, which has latched the
+// release token (so the compare-and-set's shape is known to every host this
+// one replicates to) and put this node's used record on its stream first.
+func RepointContainerReplicationTarget(ctx context.Context, c *Client, g capabilities.FeatureGrant, vmName, repo, from, to string) (bool, error) {
+	if err := g.Check(capabilities.FeatureContainerReplication); err != nil {
+		return false, err
+	}
+	if _, _, ok := ContainerScheduleName(vmName); !ok {
+		return false, fmt.Errorf("schedule %q is not a container schedule", vmName)
+	}
+	return RepointReplicationTarget(ctx, c, vmName, repo, from, to)
 }
 
 // RepointReplicationTarget sets a replication schedule's target_host to to
@@ -216,9 +263,37 @@ func ReverseReplicationAudited(ctx context.Context, c *Client, kind, name, proje
 }
 
 // SetRepointReady installs the answer to "may this client emit
-// RepointReplicationTarget's statement": true only once every host is known to
-// apply it (grpcapi's readiness probe). nil, the default, is "no".
+// RepointReplicationTarget's statement" (and MintContainerPlacement's): true
+// only once the release token has durably latched here (grpcapi wires
+// Server.ReleaseFeatureAvailable). The latch is replication-gated, so every
+// host this one replicates to advertised a build that has both shapes, and it
+// never re-opens. nil, the default, is "no".
 func (c *Client) SetRepointReady(fn func(context.Context) bool) { c.repointReady.Store(&fn) }
+
+// ReleaseFeatureGate runs write — a write of a release feature's data —
+// through this node's release-feature gate, handing it the grant its writer
+// checks (grpcapi.Server.WithReleaseFeature, health.Checker.WithFeature).
+type ReleaseFeatureGate func(ctx context.Context, feature capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error
+
+// SetReleaseFeatureGate installs the gate this client's own writers of release
+// feature data go through when their caller holds no gate of its own (the
+// failover coordinator's and the health checker's replication reversal).
+func (c *Client) SetReleaseFeatureGate(fn ReleaseFeatureGate) { c.releaseFeatureGate.Store(&fn) }
+
+// WithReleaseFeature runs write through the installed release-feature gate.
+// With none installed it refuses, as the gate does before the latch: fail
+// closed.
+func (c *Client) WithReleaseFeature(ctx context.Context, feature capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	fn := c.releaseFeatureGate.Load()
+	if fn == nil || *fn == nil {
+		return status.Errorf(codes.FailedPrecondition,
+			"the cluster upgrade must finish first (%s needs %s): this host has no release-feature gate",
+			feature, capabilities.ReleaseToken)
+	}
+	return (*fn)(ctx, feature, write)
+}
 
 // RepointReady reports whether the compare-and-set switch may be emitted.
 func (c *Client) RepointReady(ctx context.Context) bool {

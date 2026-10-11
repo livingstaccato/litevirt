@@ -404,10 +404,15 @@ lv replication replicas web --host hostB --target-pool dr   # what hostB holds
 ```
 
 **Release gate.** Container replication is release feature
-`container_replication`: a schedule is created, a run replicates and a schedule
-switches direction only once every host runs a release that has it (the release
-token has latched). Until then each is refused with
-"the cluster upgrade must finish first". An older daemon would otherwise skip a
+`container_replication` of the release token (`lv cluster upgrade-status`): a
+schedule is created, a run replicates and a schedule switches direction only
+once every host runs a release that has it (the release token has latched).
+Until then each is refused with "the cluster upgrade must finish first
+(container_replication needs release_2026_11_v1)", naming the hosts still to
+upgrade; a switch that is refused is reported like any other switch that could
+not be made. The first schedule marks the feature used, so from then on a
+rollback below the release quarantines (docs/upgrades.md, "Rolling back after a
+release token latched"). An older daemon would otherwise skip a
 container schedule without a word, keep its replicas without pruning them, or
 take its name for a VM's. The CLI sends a container schedule's key
 (`@ct:<project>/<name>`), never the bare name, so even an older daemon that is
@@ -564,22 +569,26 @@ schedule's `LAST ERR`. A pool, project or cluster schedule is never switched for
 one of its VMs, so a VM that moves onto such a schedule's explicit target keeps
 replicating into the pool there, as it always has.
 
-The switch changes only the target host: once every host is known to run a
-build that has the statement (every member answers this build's replica RPC),
+The switch changes only the target host: once the release token has latched,
 as a compare-and-set of that one column, so an operator's concurrent edit of the
-schedule on another node survives it; before that, by re-reading the row just
-before re-writing it. (A container's re-key mints its new placement id with a
-statement of the same kind, under the same condition.)
+schedule on another node survives it; before that (a VM's switch only), by
+re-reading the row just before re-writing it. A container's switch is always
+the compare-and-set, since it only runs past the release gate. (A container's
+re-key mints its new placement id with a statement of the same kind, under the
+same condition.) The latch is read on the host making the switch and is not a
+use of the feature: a cluster that only moves VMs can still roll back below the
+release.
 
-**If a member is rolled back.** Until the release token gates these two
-statements, "every member answers" is asked of the members at the time, not
-latched. A member rolled back to an earlier build after the answer was yes
-cannot apply the next such statement: it refuses it, and replication from the
-sending host to that member stops at it (back-pressure) until the member runs
-this build again. Nothing is applied in part and nothing is corrupted; other
-members are not affected, and anti-entropy still merges the rows. The remedy is
-to upgrade the member again (or remove it from the cluster); replication then
-resumes from where it stopped. For a VM the incremental checkpoint of
+**If a member is rolled back.** The release token's latch is monotone: it says
+every host ran this release when it formed, not that every host still does. A
+member rolled back below the release after the latch cannot apply the next such
+statement: it refuses it, and replication from the sending host to that member
+stops at it (back-pressure) until the member runs this release again. Nothing is
+applied in part and nothing is corrupted; other members are not affected, and
+anti-entropy still merges the rows. A member that had latched the token itself
+is in WAL quarantine on the earlier build anyway. The remedy is to upgrade the
+member again (or remove it from the cluster); replication then resumes from
+where it stopped. For a VM the incremental checkpoint of
 the old direction is dropped, and an incremental run forks only from the replica
 its own checkpoint continues (a checkpoint names the run that made it, as does
 that run's replica): when the target does not hold that replica (after a

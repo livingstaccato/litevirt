@@ -223,10 +223,11 @@ func PlacementOf(createSpec string) string { return DecodeCreateSpec(createSpec)
 // statements must carry the source row's create spec unchanged (every receiver
 // verifies the re-keyed row's identity against the source). Changes nothing
 // else. The statement is a shape a host on an earlier build does not know, so
-// it is emitted only when RepointReady says every host applies this build's
-// shapes; until then the re-keyed row keeps the placement it had (applied
-// false), and container replication, which needs the same, is off. applied is
-// also false when the row changed meanwhile.
+// it is emitted only when RepointReady says the release token has durably
+// latched (so every host applies this build's shapes); until then the re-keyed
+// row keeps the placement it had (applied false), and container replication,
+// whose gate needs the same latch, is off. applied is also false when the row
+// changed meanwhile.
 func MintContainerPlacement(ctx context.Context, c *Client, host, name, current string) (bool, error) {
 	_, applied, err := MintContainerPlacementSpec(ctx, c, host, name, current)
 	return applied, err

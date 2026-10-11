@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -25,10 +26,22 @@ func replScheduleOnto(t *testing.T, db *corrosion.Client, key, project, target s
 	if project != "" {
 		scope = "container"
 	}
-	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+	rec := corrosion.BackupScheduleRecord{
 		VMName: key, Scope: scope, ProjectName: project, Repo: "dr", Cron: "0 * * * *", Enabled: true,
 		Type: "replication", TargetPool: "dr", TargetHost: target, KeepReplicas: 2,
-	}); err != nil {
+	}
+	var err error
+	if scope == "container" {
+		// container_replication's data, written with its grant, and the
+		// switch goes through a release gate that has passed.
+		err = corrosion.UpsertContainerReplicationSchedule(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureContainerReplication), rec)
+		db.SetReleaseFeatureGate(func(ctx context.Context, f capabilities.Feature, write func(context.Context, capabilities.FeatureGrant) error) error {
+			return write(ctx, capabilities.GrantForTest(t, f))
+		})
+	} else {
+		err = corrosion.UpsertBackupSchedule(ctx, db, rec)
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 }

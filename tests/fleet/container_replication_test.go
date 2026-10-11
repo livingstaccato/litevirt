@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/fence"
@@ -62,17 +64,43 @@ func drRepo(t *testing.T, target *Node) string {
 	return root
 }
 
+// passedReleaseGate is a release-feature gate that has passed on its node (the
+// release token latched, the use recorded): it hands every write its grant.
+// hook, when set, runs on each call — the run's gate (WithFeature) and the
+// placement mint's latch read (FeatureAvailable, through RepointReady) — which
+// is a seam for a concurrent writer. TestContainerReplication_TheReleaseGate
+// runs the real gate.
+type passedReleaseGate struct {
+	t    testing.TB
+	hook func()
+}
+
+func (g passedReleaseGate) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	if g.hook != nil {
+		g.hook()
+	}
+	return write(ctx, capabilities.GrantForTest(g.t, f))
+}
+
+func (g passedReleaseGate) FeatureAvailable(capabilities.Feature) bool {
+	if g.hook != nil {
+		g.hook()
+	}
+	return true
+}
+
 // openCTReplication opens the container_replication release feature on every
 // node, as a latched release token does in production.
-func openCTReplication(c *Cluster) {
+func openCTReplication(t testing.TB, c *Cluster) {
 	for _, n := range c.Nodes {
-		n.Server.SetContainerReplicationGate(func(context.Context) error { return nil })
+		n.Server.SetReleaseFeatureGate(passedReleaseGate{t: t})
 	}
 }
 
 func ctSchedule(t *testing.T, c *Cluster, owner *Node, name, targetHost string, keep int32, autoPromote bool) corrosion.BackupScheduleRecord {
 	t.Helper()
-	openCTReplication(c)
+	openCTReplication(t, c)
 	if _, err := c.SelfClient(owner).CreateReplicationSchedule(context.Background(), &pb.CreateReplicationScheduleRequest{
 		VmName: name, Scope: "container", Cron: "0 * * * *", TargetHost: targetHost, TargetPool: "dr",
 		KeepReplicas: keep, Enabled: true, AutoPromote: autoPromote,
@@ -474,9 +502,9 @@ func TestContainerReplication_APreUpgradeRowGetsAPlacementAndKeepApplies(t *test
 //   - "under the lock": another writer's mint lands between this run's re-read
 //     and its own compare-and-set, which therefore loses, and the run re-reads.
 //
-// The container replication gate is the seam: a run consults it once before
-// the lock, and the mint consults it (RepointReady) just before its
-// compare-and-set.
+// The release gate is the seam: a run passes it once before the lock
+// (WithFeature), and the mint reads the release latch (RepointReady, through
+// FeatureAvailable) just before its compare-and-set.
 func TestContainerReplication_ARunThatLosesTheMintArchivesUnderTheWinnersPlacement(t *testing.T) {
 	for _, tc := range []struct {
 		when  string
@@ -495,12 +523,13 @@ func TestContainerReplication_ARunThatLosesTheMintArchivesUnderTheWinnersPlaceme
 			}
 			var calls atomic.Int32
 			var won atomic.Bool
-			a.Server.SetContainerReplicationGate(func(gctx context.Context) error {
+			gctx := context.Background()
+			a.Server.SetReleaseFeatureGate(passedReleaseGate{t: t, hook: func() {
 				if calls.Add(1) == tc.winAt {
 					row, err := corrosion.GetContainer(gctx, a.DB, a.Name, name)
 					if err != nil || row == nil {
 						t.Errorf("row: %v", err)
-						return nil
+						return
 					}
 					_, applied, err := corrosion.MintContainerPlacementSpec(gctx, a.DB, a.Name, name, row.CreateSpec)
 					if err != nil {
@@ -508,8 +537,7 @@ func TestContainerReplication_ARunThatLosesTheMintArchivesUnderTheWinnersPlaceme
 					}
 					won.Store(applied)
 				}
-				return nil
-			})
+			}})
 			a.CT.Seed(name, "run")
 			if err := a.Server.RunReplication(ctx, sched, time.Now().UTC().Add(-time.Minute)); err != nil {
 				t.Fatalf("the run that lost the mint: %v", err)
@@ -566,5 +594,107 @@ func TestContainerReplication_NoPlacementIsMintedWithoutTheRuntime(t *testing.T)
 	}
 	if row.CreateSpec != "" {
 		t.Fatalf("a placement was minted for a container whose runtime is not here: create_spec %q", row.CreateSpec)
+	}
+}
+
+// TestContainerReplication_TheReleaseGate runs container replication through
+// the real release-token gate (health.Checker.WithFeature), the switch from the
+// branch-local stub. While a host still runs the previous build, a schedule is
+// refused with the release refusal and nothing is written or recorded. Once
+// every host runs this build, the token latches, the container_replication use
+// is recorded and held by every host before the row is written — on the
+// writer's own replication stream, the record precedes the row — and a run
+// replicates through the same gate.
+func TestContainerReplication_TheReleaseGate(t *testing.T) {
+	ctx := context.Background()
+	c, _ := latchedFleet(t, 3, 2611)
+	a, b, old := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	const name = "web"
+	replCT(t, c, a, name)
+	repo := drRepo(t, b)
+	c.WaitConverged(t, convergeTimeout)
+	tok, feat := capabilities.ReleaseToken, string(capabilities.FeatureContainerReplication)
+	refusal := "the cluster upgrade must finish first (" + feat + " needs " + tok + ")"
+	req := &pb.CreateReplicationScheduleRequest{VmName: name, Scope: "container", Cron: "0 * * * *",
+		TargetHost: b.Name, TargetPool: "dr", KeepReplicas: 2, Enabled: true}
+	ctRows := func(n *Node) []corrosion.BackupScheduleRecord {
+		rows, err := corrosion.ListBackupSchedules(ctx, n.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []corrosion.BackupScheduleRecord
+		for _, r := range rows {
+			if corrosion.ContainerScheduleIs(r, "", name) {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	// 1. A host still on the previous build (modelled as one advertising
+	// nothing): the token cannot latch, and the schedule is refused with the
+	// release refusal. No row, no used record, anywhere.
+	old.Server.SetWALQuarantined(func() bool { return true })
+	_, err := c.SelfClient(a).CreateReplicationSchedule(ctx, req)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), refusal) {
+		t.Fatalf("a container schedule with %s on the previous build: %v, want FailedPrecondition %q", old.Name, err, refusal)
+	}
+	for _, n := range c.Nodes {
+		if featureUsedOn(t, n, tok, feat) {
+			t.Fatalf("%s holds a %s use although the schedule was refused", n.Name, feat)
+		}
+		if rows := ctRows(n); len(rows) != 0 {
+			t.Fatalf("%s holds a container schedule written before the latch: %+v", n.Name, rows)
+		}
+	}
+
+	// 2. Every host on this build: the schedule is accepted, and every host
+	// holds the used record by the time the call returns.
+	old.Server.SetWALQuarantined(old.DB.WALQuarantined)
+	var lastErr error
+	eventually(t, 10*time.Second, "the container schedule to be accepted on a uniform fleet", func() bool {
+		_, lastErr = c.SelfClient(a).CreateReplicationSchedule(ctx, req)
+		return lastErr == nil
+	})
+	for _, n := range c.Nodes {
+		if !featureUsedOn(t, n, tok, feat) {
+			t.Fatalf("%s does not hold the %s use although the schedule was written", n.Name, feat)
+		}
+	}
+	// On a's own stream the record is ahead of the row.
+	logged, err := a.DB.Query(ctx, `SELECT seq, stmts FROM mutation_log ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recSeq, rowSeq := int64(-1), int64(-1)
+	for _, r := range logged {
+		st := r.String("stmts")
+		if recSeq < 0 && strings.Contains(st, "release_feature/"+tok+"/"+feat) {
+			recSeq = r.Int64("seq")
+		}
+		if rowSeq < 0 && strings.Contains(st, "INSERT INTO backup_schedules") && strings.Contains(st, "@ct:") {
+			rowSeq = r.Int64("seq")
+		}
+	}
+	if recSeq < 0 || rowSeq < 0 || recSeq > rowSeq {
+		t.Fatalf("on %s's stream the used record is at seq %d and the schedule row at %d: the record must come first", a.Name, recSeq, rowSeq)
+	}
+
+	// 3. A run replicates through the same release gate. (The split-brain
+	// execution gate is set aside: it needs a quorum view this harness does
+	// not drive, and it is not what is under test. The release gate stays the
+	// real checker.)
+	a.Server.SetGate(nil)
+	rows := ctRows(a)
+	if len(rows) != 1 {
+		t.Fatalf("want one container schedule on %s, got %+v", a.Name, rows)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	a.CT.Seed(name, "replicated through the release gate")
+	if err := a.Server.RunReplication(ctx, rows[0], time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("a run after the latch: %v", err)
+	}
+	if got := replicas(t, repo, name); len(got) != 1 {
+		t.Fatalf("want one replica on %s after the run, got %d", b.Name, len(got))
 	}
 }

@@ -90,7 +90,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
-	s.wireRepointReady()
+	s.wireReplicationReleaseGates()
 	return s
 }
 

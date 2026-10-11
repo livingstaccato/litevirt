@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/notify"
@@ -587,7 +588,22 @@ func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.Ba
 	defer func() {
 		s.replicationOutcome(ctx, sched, "container", name, project, target, repoName, detail, retErr)
 	}()
-	if err := s.containerReplicationGate(ctx); err != nil {
+	// A run writes container_replication's data (a replica in the target's
+	// replica namespace), so it runs through this node's release-feature gate:
+	// refused, with the gate's reason, until the release token has latched.
+	return s.WithReleaseFeature(ctx, capabilities.FeatureContainerReplication,
+		func(ctx context.Context, g capabilities.FeatureGrant) error {
+			return s.replicateContainer(ctx, g, sched, rec, project, name, repoName, target, runAt, &detail)
+		})
+}
+
+// replicateContainer is a container replication run past its release gate:
+// it archives the container (rec, the row runContainerReplication found on
+// this host) and pushes the archive to target's replica namespace of repo
+// repoName, and sets *detail to describe the replica written.
+func (s *Server) replicateContainer(ctx context.Context, g capabilities.FeatureGrant, sched corrosion.BackupScheduleRecord,
+	rec *corrosion.ContainerRecord, project, name, repoName, target string, runAt time.Time, detail *string) error {
+	if err := g.Check(capabilities.FeatureContainerReplication); err != nil {
 		return err
 	}
 	if repoName == "" || target == "" {
@@ -655,7 +671,7 @@ func (s *Server) runContainerReplication(ctx context.Context, sched corrosion.Ba
 		}
 		return fmt.Errorf("push replica to %s: %w", target, err)
 	}
-	detail = fmt.Sprintf("project=%s → %s@%s @ %s", project, repoName, target, manifest.Timestamp)
+	*detail = fmt.Sprintf("project=%s → %s@%s @ %s", project, repoName, target, manifest.Timestamp)
 	return nil
 }
 
@@ -721,31 +737,6 @@ func (s *Server) mayReplicateAsOwner(ctx context.Context, rec *corrosion.Contain
 		}
 	}
 	return nil
-}
-
-// containerReplicationGateFn opens the container_replication release feature.
-// Nil refuses.
-type containerReplicationGateFn func(ctx context.Context) error
-
-// SetContainerReplicationGate wires the gate container replication schedules,
-// runs and reversals go through (containerReplicationGate).
-func (s *Server) SetContainerReplicationGate(fn func(ctx context.Context) error) {
-	s.ctReplGate = fn
-}
-
-// containerReplicationGate is the one place container replication asks whether
-// the cluster may use it: feature container_replication of the release token
-// (capabilities.Feature, health.Checker.RequireFeature). Every host must run a
-// build that understands a container schedule row, a replica namespace and the
-// reversal's statement, or an older daemon would skip the row silently, keep
-// replicas without pruning, or delete the wrong schedule. Until the release-token
-// mechanism is wired here, nothing opens it: it refuses.
-func (s *Server) containerReplicationGate(ctx context.Context) error {
-	if s.ctReplGate == nil {
-		return status.Error(codes.FailedPrecondition,
-			"container replication needs every host on a release that has it (release feature container_replication); the cluster upgrade must finish first")
-	}
-	return s.ctReplGate(ctx)
 }
 
 // ctReplica is a promotable replica of a container, held by a host.
@@ -1120,11 +1111,6 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "backup repo %q is not usable for replicas on %q: %v", req.TargetPool, req.TargetHost, err)
 	}
-	// Last before the write: every host must understand the row it makes.
-	if err := s.containerReplicationGate(ctx); err != nil {
-		return nil, err
-	}
-
 	key := corrosion.ContainerScheduleKey(project, ct.Name)
 	// A schedule stored under the earlier name-only key keeps its identity.
 	if rows, lerr := corrosion.ListBackupSchedules(ctx, s.db); lerr == nil {
@@ -1147,7 +1133,18 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 		KeepReplicas: int(req.KeepReplicas),
 		AutoPromote:  req.AutoPromote,
 	}
-	if err := corrosion.UpsertBackupSchedule(ctx, s.db, rec); err != nil {
+	// The row is container_replication's data: every host must understand it,
+	// and this node's used record goes on its stream ahead of it. The gate's
+	// refusal ("the cluster upgrade must finish first") is returned as it is.
+	ran := false
+	if err := s.WithReleaseFeature(ctx, capabilities.FeatureContainerReplication,
+		func(ctx context.Context, g capabilities.FeatureGrant) error {
+			ran = true
+			return corrosion.UpsertContainerReplicationSchedule(ctx, s.db, g, rec)
+		}); err != nil {
+		if !ran {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule", ct.Name, "container project="+project+" target="+req.TargetHost+":"+req.TargetPool+" cron="+req.Cron, "ok")

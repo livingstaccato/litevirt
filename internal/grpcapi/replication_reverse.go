@@ -4,12 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -27,15 +23,11 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 	ctx = context.WithoutCancel(ctx)
 	// The compare-and-set of target_host alone is a statement shape a host on a
 	// previous release does not know (it would back-pressure this host's whole
-	// stream to it): it is used once every host runs a release that has it, the
-	// container_replication release feature. Until then the switch re-reads the
-	// row and re-upserts it (ReverseOptions).
-	if kind == "container" && s.containerReplicationGate(ctx) != nil {
-		// Container replication, its reversal included, is the
-		// container_replication release feature: with it closed no container
-		// schedule can have been made here to switch.
-		return
-	}
+	// stream to it): a VM's switch uses it once the release token has latched
+	// (repointReady), and re-reads and re-upserts the row until then
+	// (ReverseOptions). A container's schedule is container_replication's
+	// data: its switch goes through this node's release-feature gate and is
+	// always the compare-and-set (corrosion.RepointContainerReplicationTarget).
 	opts := corrosion.ReverseOptions{Ready: func() bool { return s.repointReady(ctx) }}
 	revs, err := corrosion.ReverseReplicationOnMove(ctx, s.db, kind, name, project, oldHost, newHost, opts)
 	if err != nil {
@@ -59,65 +51,31 @@ func (s *Server) reverseReplicationAfterMove(ctx context.Context, kind, name, pr
 	}
 }
 
-// The compare-and-set switch (corrosion.RepointReplicationTarget) is a statement
-// shape a host on an earlier build does not know, and an unknown shape
-// back-pressures the sender's whole replication stream to it. So it is emitted
-// only when every host is known to apply it: the container_replication release
-// feature is open, or every other member answers ListContainerReplicas, an RPC
-// of the same build as the statement (an older build answers Unimplemented).
-// The answer is kept for repointReadyTTL once yes, and re-asked a minute after
-// a no.
-const repointReadyTTL = 10 * time.Minute
-
-func (s *Server) wireRepointReady() {
+// The compare-and-set switch (corrosion.RepointReplicationTarget), and the
+// placement mint of the same kind (corrosion.MintContainerPlacement), are
+// statement shapes a host on an earlier build does not know, and an unknown
+// shape back-pressures the sender's whole replication stream to it. So they are
+// emitted only once the release token has DURABLY latched here: the latch is
+// replication-gated, so every host this one replicates to advertised a build
+// that has them, and it is monotone, so it never re-opens. This reads the latch
+// locally and asks no peer (ReleaseFeatureAvailable), and records no use: these
+// statements are a better form of a write main already makes, not release
+// feature data, so a cluster that never replicates a container still rolls back
+// below the release without a quarantine.
+//
+// A member rolled back below the release after the latch can still be sent
+// one of these statements: it refuses it, and replication from the sender to
+// it stops there (back-pressure) until it runs the release again; nothing is
+// applied in part (docs/backups.md, "If a member is rolled back"). A member
+// that had latched the token itself is also WAL-quarantined by the earlier
+// build's rollback preflight, which does not know the token's marker.
+func (s *Server) wireReplicationReleaseGates() {
 	if s.db != nil {
 		s.db.SetRepointReady(s.repointReady)
+		s.db.SetReleaseFeatureGate(s.WithReleaseFeature)
 	}
 }
 
-func (s *Server) repointReady(ctx context.Context) bool {
-	if s.containerReplicationGate(ctx) == nil {
-		return true
-	}
-	s.repointMu.Lock()
-	if !s.repointAt.IsZero() && time.Since(s.repointAt) < s.repointTTL() {
-		ok := s.repointOK
-		s.repointMu.Unlock()
-		return ok
-	}
-	s.repointMu.Unlock()
-	ok := s.everyHostAppliesRepoint(ctx)
-	s.repointMu.Lock()
-	s.repointOK, s.repointAt = ok, time.Now()
-	s.repointMu.Unlock()
-	return ok
-}
-
-func (s *Server) repointTTL() time.Duration {
-	if s.repointOK {
-		return repointReadyTTL
-	}
-	return time.Minute
-}
-
-func (s *Server) everyHostAppliesRepoint(ctx context.Context) bool {
-	hosts, err := corrosion.ListHosts(ctx, s.db)
-	if err != nil {
-		return false
-	}
-	for _, h := range hosts {
-		if h.Name == s.hostName || h.State == "removed" {
-			continue
-		}
-		c, closeConn, err := s.dialPeer(ctx, h.Name)
-		if err != nil {
-			return false
-		}
-		_, err = c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{})
-		closeConn()
-		if status.Code(err) == codes.Unimplemented || status.Code(err) == codes.Unavailable {
-			return false
-		}
-	}
-	return true
+func (s *Server) repointReady(context.Context) bool {
+	return s.ReleaseFeatureAvailable(capabilities.FeatureContainerReplication)
 }

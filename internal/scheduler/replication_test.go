@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -98,7 +99,8 @@ func seedContainerRow(t *testing.T, db *corrosion.Client, host, name, project st
 
 func containerReplSchedule(t *testing.T, db *corrosion.Client, name, project string) {
 	t.Helper()
-	if err := corrosion.UpsertBackupSchedule(context.Background(), db, corrosion.BackupScheduleRecord{
+	grant := capabilities.GrantForTest(t, capabilities.FeatureContainerReplication)
+	if err := corrosion.UpsertContainerReplicationSchedule(context.Background(), db, grant, corrosion.BackupScheduleRecord{
 		VMName: corrosion.ScheduleKey("container", name, "", project), Scope: "container", ProjectName: project,
 		Repo: "dr-repo", Cron: "0 2 * * *", Enabled: true, Type: "replication", TargetPool: "dr-repo",
 		TargetHost: "host-b", KeepReplicas: 2,

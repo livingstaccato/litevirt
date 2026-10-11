@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -399,13 +401,50 @@ func (p *replicaPeer) ListContainerReplicas(context.Context, *pb.ListContainerRe
 	return &pb.ListContainerReplicasResponse{Replicas: p.reps}, nil
 }
 
-// openGate opens the container_replication feature on s (the release token's
-// gate in production).
-func openCTGate(s *Server) { s.SetContainerReplicationGate(func(context.Context) error { return nil }) }
+// openCTGate opens the release features on s, container_replication among
+// them, as a latched release token's gate does in production.
+func openCTGate(t *testing.T, s *Server) {
+	t.Helper()
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+}
+
+// putCTSchedule stores a container's schedule as its release gate lets it be
+// written: through its writer, with the container_replication grant.
+func putCTSchedule(t *testing.T, s *Server, rec corrosion.BackupScheduleRecord) {
+	t.Helper()
+	if err := corrosion.UpsertContainerReplicationSchedule(context.Background(), s.db,
+		capabilities.GrantForTest(t, capabilities.FeatureContainerReplication), rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// orderedFeatureGate is a passing release gate that notes, when the write
+// runs, which feature it was for and whether the schedule row already existed.
+type orderedFeatureGate struct {
+	t        *testing.T
+	s        *Server
+	features *[]capabilities.Feature
+	rowFirst *bool
+}
+
+func (g orderedFeatureGate) WithFeature(ctx context.Context, f capabilities.Feature,
+	write func(context.Context, capabilities.FeatureGrant) error) error {
+	*g.features = append(*g.features, f)
+	if rows, _ := corrosion.ListBackupSchedules(ctx, g.s.db); len(rows) != 0 {
+		*g.rowFirst = true
+	}
+	return write(ctx, capabilities.GrantForTest(g.t, f))
+}
+
+func (g orderedFeatureGate) FeatureAvailable(capabilities.Feature) bool { return true }
+
+// ctReleaseRefusal is the refusal of a container_replication write before the
+// release token has latched.
+const ctReleaseRefusal = "the cluster upgrade must finish first (container_replication needs " + capabilities.ReleaseToken + ")"
 
 func TestCreateContainerReplicationSchedule_UnverifiableRepoIsNotStored(t *testing.T) {
 	s := testServer(t)
-	openCTGate(s)
+	openCTGate(t, s)
 	seedActiveHost(t, s, "host-b", true)
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
 	for _, perr := range []error{status.Error(codes.Unavailable, "down"), status.Error(codes.Unimplemented, "old build")} {
@@ -431,21 +470,61 @@ func TestCreateContainerReplicationSchedule_RefusedBeforeTheReleaseFeature(t *te
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return &replicaPeer{}, func() {}, nil
 	}
-	if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a closed release gate must refuse the schedule, got %v", err)
+	_, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr"))
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), ctReleaseRefusal) {
+		t.Fatalf("no release gate must refuse the schedule with %q, got %v", ctReleaseRefusal, err)
+	}
+	// The gate's own refusal (the release token not latched) is returned as it is.
+	closed := status.Error(codes.FailedPrecondition, ctReleaseRefusal+": not yet: host-b")
+	s.SetReleaseFeatureGate(fakeFeatureGate{err: closed})
+	if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); !errors.Is(err, closed) {
+		t.Fatalf("a closed release gate must refuse the schedule with its own reason, got %v", err)
 	}
 	if rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db); len(rows) != 0 {
 		t.Fatalf("a schedule was stored with the gate closed: %+v", rows)
 	}
-	openCTGate(s)
+	var features []capabilities.Feature
+	rowFirst := false
+	s.SetReleaseFeatureGate(orderedFeatureGate{t: t, s: s, features: &features, rowFirst: &rowFirst})
 	if _, err := s.CreateReplicationSchedule(adminCtx(), ctSchedReq("web", "host-b", "dr")); err != nil {
 		t.Fatalf("with the gate open: %v", err)
+	}
+	if rowFirst || !slices.Equal(features, []capabilities.Feature{capabilities.FeatureContainerReplication}) {
+		t.Fatalf("the schedule row was written outside its release gate: gate calls %v, row before the gate %v", features, rowFirst)
+	}
+	if rows, _ := corrosion.ListBackupSchedules(context.Background(), s.db); len(rows) != 1 {
+		t.Fatalf("the schedule was not stored through the gate: %+v", rows)
+	}
+}
+
+// Every container schedule row goes through the release gate's grant: the
+// generic upsert refuses one, and the container writer refuses without the
+// container_replication grant.
+func TestContainerReplicationSchedule_WrittenOnlyWithTheGrant(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	rec := corrosion.BackupScheduleRecord{VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default",
+		Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"}
+	if err := corrosion.UpsertBackupSchedule(ctx, s.db, rec); err == nil {
+		t.Fatal("the generic schedule upsert wrote a container schedule without the release gate")
+	}
+	if err := corrosion.UpsertContainerReplicationSchedule(ctx, s.db, capabilities.FeatureGrant{}, rec); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Fatalf("no grant: %v, want ErrNoFeatureGrant", err)
+	}
+	if err := corrosion.UpsertContainerReplicationSchedule(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureBackupZstd), rec); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Fatalf("another feature's grant: %v, want ErrNoFeatureGrant", err)
+	}
+	if rows, _ := corrosion.ListBackupSchedules(ctx, s.db); len(rows) != 0 {
+		t.Fatalf("a container schedule was stored without its grant: %+v", rows)
+	}
+	if err := corrosion.UpsertContainerReplicationSchedule(ctx, s.db, capabilities.GrantForTest(t, capabilities.FeatureContainerReplication), rec); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestCreateContainerReplicationSchedule_Refusals(t *testing.T) {
 	s := testServer(t)
-	openCTGate(s)
+	openCTGate(t, s)
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return &replicaPeer{}, func() {}, nil
 	}
@@ -485,7 +564,7 @@ func TestCreateContainerReplicationSchedule_Refusals(t *testing.T) {
 // schedules; adding one never replaces the other's target or auto-promote.
 func TestCreateContainerReplicationSchedule_TwoProjectsKeepTheirOwnSchedules(t *testing.T) {
 	s := testServer(t)
-	openCTGate(s)
+	openCTGate(t, s)
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return &replicaPeer{}, func() {}, nil
 	}
@@ -537,9 +616,7 @@ func TestContainerReplicationSchedule_ListAndDeleteUseTheContainerName(t *testin
 			VMName: key, ProjectName: "_default", Scope: "container",
 			Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b",
 		}
-		if err := corrosion.UpsertBackupSchedule(context.Background(), s.db, rec); err != nil {
-			t.Fatal(err)
-		}
+		putCTSchedule(t, s, rec)
 		resp, err := s.ListReplicationSchedules(ctx, &pb.ListReplicationSchedulesRequest{})
 		if err != nil {
 			t.Fatal(err)
@@ -569,7 +646,7 @@ func TestContainerReplicationSchedule_ListAndDeleteUseTheContainerName(t *testin
 
 func TestRunContainerReplication_RefusesItsOwnHostAndAnInactiveTarget(t *testing.T) {
 	s := testServer(t)
-	openCTGate(s)
+	openCTGate(t, s)
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
 	seedActiveHost(t, s, "host-b", true)
 	base := corrosion.BackupScheduleRecord{
@@ -594,11 +671,12 @@ func TestRunContainerReplication_RefusesItsOwnHostAndAnInactiveTarget(t *testing
 		t.Fatalf("a container this host does not hold is not an error: %v", err)
 	}
 	// And nothing runs with the release feature closed.
-	s.SetContainerReplicationGate(nil)
+	s.SetReleaseFeatureGate(nil)
 	tb := base
 	tb.TargetHost = "host-b"
-	if err := s.runContainerReplication(context.Background(), tb, time.Now()); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a run with the release gate closed: %v", err)
+	if err := s.runContainerReplication(context.Background(), tb, time.Now()); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), ctReleaseRefusal) {
+		t.Fatalf("a run with the release gate closed: %v, want %q", err, ctReleaseRefusal)
 	}
 }
 
@@ -634,12 +712,10 @@ func TestContainerReplicaFor_PromotesOnlyTheRelocatingRowsReplica(t *testing.T) 
 	ctx := context.Background()
 	now := time.Now().UTC()
 	at := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339) }
-	if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{
+	putCTSchedule(t, s, corrosion.BackupScheduleRecord{
 		VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default", Scope: "container",
 		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b", AutoPromote: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 	owner := &corrosion.ContainerRecord{HostName: "host-a", Name: "web", Project: "_default",
 		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{Placement: "p-a"})}
 	capt := func(d time.Duration) string { return now.Add(-d).Format(time.RFC3339Nano) }
@@ -694,7 +770,7 @@ func TestContainerBases_OnlyForTheRowTheRestoreLaidDown(t *testing.T) {
 // view behind the runtime it holds; it does not replicate.
 func TestRunContainerReplication_RefusesWhenItsMarkerIsAhead(t *testing.T) {
 	s := testServer(t)
-	openCTGate(s)
+	openCTGate(t, s)
 	s.containersRoot = t.TempDir()
 	seedCTRow(t, s, "test-host", "web", "_default", "image-recreate")
 	seedActiveHost(t, s, "host-b", true)
@@ -800,9 +876,7 @@ func TestRemoveContainerReplicas_OrphansAndTheOperatorsName(t *testing.T) {
 	put(t, ns, replicaManifest("web", "2026-01-01T00:00:00Z", "_default", "o1", mk("s", "host-a", "p-a", 0)))
 	sched := corrosion.BackupScheduleRecord{VMName: corrosion.ContainerScheduleKey("_default", "web"), ProjectName: "_default",
 		Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: s.hostName}
-	if err := corrosion.UpsertBackupSchedule(ctx, s.db, sched); err != nil {
-		t.Fatal(err)
-	}
+	putCTSchedule(t, s, sched)
 	pctx := metadata.NewIncomingContext(peerCtxFor(t, s, "entry-host"), metadata.Pairs(repairActorMDKey, "alice"))
 	req := &pb.RemoveContainerReplicasRequest{Repo: "dr", Name: "web", Timestamps: []string{"2026-01-01T00:00:00Z"}}
 	if _, err := s.RemoveContainerReplicas(pctx, req); status.Code(err) != codes.FailedPrecondition {
@@ -819,27 +893,35 @@ func TestRemoveContainerReplicas_OrphansAndTheOperatorsName(t *testing.T) {
 	}
 }
 
-// N9: the compare-and-set switch is emitted only once every other member
-// answers with this build's RPC; an older member (Unimplemented) keeps it off.
-func TestRepointReady_OnlyWhenEveryHostHasTheStatement(t *testing.T) {
+// m4 (re-review 2): the compare-and-set switch, and the placement mint of the
+// same kind, are emitted only once the release token has durably latched here,
+// read locally: every member answering this build's RPC is not enough (that
+// was a probe, not a latch), and no peer is asked.
+func TestRepointReady_FollowsTheReleaseLatch(t *testing.T) {
 	s := testServer(t)
+	ctx := context.Background()
 	seedActiveHost(t, s, "host-b", true)
+	s.wireReplicationReleaseGates()
+	asked := false
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		asked = true
 		return &replicaPeer{err: status.Error(codes.InvalidArgument, "name required")}, func() {}, nil
 	}
-	if !s.repointReady(context.Background()) {
-		t.Fatal("every member answers: the switch may be a compare-and-set")
+	if s.repointReady(ctx) || s.db.RepointReady(ctx) {
+		t.Fatal("no release gate: the switch must not be a compare-and-set")
 	}
-	s2 := testServer(t)
-	seedActiveHost(t, s2, "host-b", true)
-	s2.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		return &replicaPeer{err: status.Error(codes.Unimplemented, "unknown method")}, func() {}, nil
+	s.SetReleaseFeatureGate(fakeFeatureGate{err: status.Error(codes.FailedPrecondition, ctReleaseRefusal)})
+	if s.repointReady(ctx) || s.db.RepointReady(ctx) {
+		t.Fatal("every member answers but the release token has not latched: the switch must not be a compare-and-set")
 	}
-	if s2.repointReady(context.Background()) {
-		t.Fatal("a member on an earlier build would back-pressure the statement")
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
+	if !s.repointReady(ctx) {
+		t.Fatal("the release token has latched: the switch may be a compare-and-set")
 	}
-	s.wireRepointReady()
-	if !s.db.RepointReady(context.Background()) {
+	if !s.db.RepointReady(ctx) {
 		t.Fatal("the database client asks the server (the audited reversal paths use it)")
+	}
+	if asked {
+		t.Fatal("readiness asked a peer; it reads the latch")
 	}
 }

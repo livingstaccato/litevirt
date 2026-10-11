@@ -2,8 +2,43 @@ package corrosion
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
 )
+
+// passingReleaseGate is a release-feature gate that has passed: it runs the
+// write with the feature's grant, and counts the features it was asked for.
+func passingReleaseGate(t *testing.T, asked *[]capabilities.Feature) ReleaseFeatureGate {
+	return func(ctx context.Context, f capabilities.Feature, write func(context.Context, capabilities.FeatureGrant) error) error {
+		if asked != nil {
+			*asked = append(*asked, f)
+		}
+		return write(ctx, capabilities.GrantForTest(t, f))
+	}
+}
+
+// putSchedule stores r: a container's schedule through its release feature's
+// writer, with that feature's grant, as its gate hands it; any other directly.
+func putSchedule(t *testing.T, db *Client, r BackupScheduleRecord) {
+	t.Helper()
+	var err error
+	if _, _, ok := ContainerScheduleName(r.VMName); ok {
+		r.Type = "replication"
+		err = UpsertContainerReplicationSchedule(context.Background(), db,
+			capabilities.GrantForTest(t, capabilities.FeatureContainerReplication), r)
+	} else {
+		err = UpsertBackupSchedule(context.Background(), db, r)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func reverseFixture(t *testing.T) *Client {
 	t.Helper()
@@ -23,6 +58,7 @@ func reverseFixture(t *testing.T) *Client {
 			t.Fatal(err)
 		}
 	}
+	db.SetReleaseFeatureGate(passingReleaseGate(t, nil))
 	return db
 }
 
@@ -126,9 +162,7 @@ func TestReverseReplicationOnMove_OnlyTheWorkloadsOwnSchedule(t *testing.T) {
 		{VMName: "@cluster", Scope: "cluster", Repo: "dr", Cron: "0 * * * *", Enabled: true,
 			Type: "replication", TargetPool: "dr", TargetHost: "host-b"},
 	} {
-		if err := UpsertBackupSchedule(ctx, db, r); err != nil {
-			t.Fatal(err)
-		}
+		putSchedule(t, db, r)
 	}
 	if _, err := ReverseReplicationOnMove(ctx, db, "vm", "web", "", "host-a", "host-b", ReverseOptions{}); err != nil {
 		t.Fatal(err)
@@ -149,9 +183,7 @@ func TestReverseReplicationOnMove_Container(t *testing.T) {
 	ctx := context.Background()
 	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("prod", "web"), Scope: "container", ProjectName: "prod", Repo: "dr",
 		Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b", KeepReplicas: 2, AutoPromote: true}
-	if err := UpsertBackupSchedule(ctx, db, ct); err != nil {
-		t.Fatal(err)
-	}
+	putSchedule(t, db, ct)
 	// Another project's same-named container moving does not move this schedule.
 	if revs, _ := ReverseReplicationOnMove(ctx, db, "container", "web", "_default", "host-a", "host-b", ReverseOptions{}); len(revs) != 0 {
 		t.Fatalf("another project's container reversed this schedule: %+v", revs)
@@ -192,9 +224,7 @@ func TestReverseReplicationOnMove_ReportsWhenTheOldHostCannotBeATarget(t *testin
 	}
 	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("", "web"), Scope: "container", Repo: "dr", Cron: "0 * * * *",
 		Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"}
-	if err := UpsertBackupSchedule(ctx, db, ct); err != nil {
-		t.Fatal(err)
-	}
+	putSchedule(t, db, ct)
 	revs, err = ReverseReplicationOnMove(ctx, db, "container", "web", "", "host-a", "host-b", ReverseOptions{})
 	if err != nil || len(revs) != 1 || revs[0].Skipped == "" {
 		t.Fatalf("revs=%+v err=%v", revs, err)
@@ -214,10 +244,8 @@ func TestContainerScheduleKey_DoesNotCollideWithAVMSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctKey := ScheduleKey("container", "web", "", "")
-	if err := UpsertBackupSchedule(ctx, db, BackupScheduleRecord{VMName: ctKey, Scope: "container",
-		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-c"}); err != nil {
-		t.Fatal(err)
-	}
+	putSchedule(t, db, BackupScheduleRecord{VMName: ctKey, Scope: "container",
+		Repo: "dr", Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-c"})
 	s := schedulesOf(t, db)
 	if len(s) != 2 || s["web|dr"].TargetHost != "host-b" || s[ctKey+"|dr"].TargetHost != "host-c" {
 		t.Fatalf("the two schedules must coexist untouched: %+v", s)
@@ -235,7 +263,6 @@ func TestContainerScheduleKey_DoesNotCollideWithAVMSchedule(t *testing.T) {
 // adding one never replaces the other.
 func TestContainerScheduleKey_CarriesTheProject(t *testing.T) {
 	db := reverseFixture(t)
-	ctx := context.Background()
 	p1, p2 := ContainerScheduleKey("p1", "web"), ContainerScheduleKey("p2", "web")
 	if p1 == p2 {
 		t.Fatalf("two projects' containers share the key %q", p1)
@@ -246,9 +273,7 @@ func TestContainerScheduleKey_CarriesTheProject(t *testing.T) {
 		{VMName: p2, ProjectName: "p2", Scope: "container", Repo: "dr", Cron: "0 * * * *", Enabled: true,
 			Type: "replication", TargetPool: "dr", TargetHost: "host-c"},
 	} {
-		if err := UpsertBackupSchedule(ctx, db, r); err != nil {
-			t.Fatal(err)
-		}
+		putSchedule(t, db, r)
 	}
 	s := schedulesOf(t, db)
 	if len(s) != 2 || s[p1+"|dr"].TargetHost != "host-b" || !s[p1+"|dr"].AutoPromote || s[p2+"|dr"].TargetHost != "host-c" {
@@ -347,5 +372,106 @@ func TestReverseReplicationAudited_UsesTheCompareAndSetWhenReady(t *testing.T) {
 		if n := got[0].Int64("n"); (n > 0) != ready {
 			t.Fatalf("ready=%v: %d compare-and-set statement(s) emitted", ready, n)
 		}
+	}
+}
+
+// A container's schedule is release feature container_replication's data: its
+// switch runs through the release gate on this node and is the compare-and-set
+// of target_host alone whatever RepointReady says (the gate has latched the
+// release token). A gate that refuses leaves the schedule as it was and
+// reports the refusal; it is never skipped silently.
+func TestReverseReplicationOnMove_ContainerGoesThroughTheReleaseGate(t *testing.T) {
+	ctx := context.Background()
+	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("prod", "web"), Scope: "container", ProjectName: "prod", Repo: "dr",
+		Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"}
+
+	db := reverseFixture(t)
+	putSchedule(t, db, ct)
+	refusal := status.Error(codes.FailedPrecondition,
+		"the cluster upgrade must finish first (container_replication needs "+capabilities.ReleaseToken+"): not yet: host-c")
+	db.SetReleaseFeatureGate(func(context.Context, capabilities.Feature, func(context.Context, capabilities.FeatureGrant) error) error {
+		return refusal
+	})
+	var rows []string
+	ReverseReplicationAudited(ctx, db, "container", "web", "prod", "host-a", "host-b", func(d, r string) { rows = append(rows, r+": "+d) })
+	if len(rows) != 1 || !strings.HasPrefix(rows[0], "skipped: ") || !strings.Contains(rows[0], "the cluster upgrade must finish first") {
+		t.Fatalf("a refused switch must be reported with the refusal: %v", rows)
+	}
+	if got := schedulesOf(t, db)[ct.VMName+"|dr"]; got.TargetHost != "host-b" {
+		t.Fatalf("a refused switch changed the schedule: %+v", got)
+	}
+
+	// No gate wired: refused, fail closed.
+	db2 := reverseFixture(t)
+	putSchedule(t, db2, ct)
+	db2.releaseFeatureGate.Store(nil)
+	revs, err := ReverseReplicationOnMove(ctx, db2, "container", "web", "prod", "host-a", "host-b", ReverseOptions{TargetOnly: true})
+	if err != nil || len(revs) != 1 || !strings.Contains(revs[0].Skipped, "the cluster upgrade must finish first (container_replication needs "+capabilities.ReleaseToken+")") {
+		t.Fatalf("no gate wired: revs=%+v err=%v, want the release refusal", revs, err)
+	}
+
+	// The gate passes: one gate call for container_replication, the switch is
+	// the compare-and-set, with RepointReady saying no.
+	db3 := reverseFixture(t)
+	putSchedule(t, db3, ct)
+	var asked []capabilities.Feature
+	db3.SetReleaseFeatureGate(passingReleaseGate(t, &asked))
+	db3.SetRepointReady(func(context.Context) bool { return false })
+	revs, err = ReverseReplicationOnMove(ctx, db3, "container", "web", "prod", "host-a", "host-b", ReverseOptions{Ready: func() bool { return false }})
+	if err != nil || len(revs) != 1 || revs[0].Skipped != "" {
+		t.Fatalf("revs=%+v err=%v", revs, err)
+	}
+	if len(asked) != 1 || asked[0] != capabilities.FeatureContainerReplication {
+		t.Fatalf("the switch asked the release gate for %v, want [container_replication]", asked)
+	}
+	if got := schedulesOf(t, db3)[ct.VMName+"|dr"]; got.TargetHost != "host-a" {
+		t.Fatalf("the switch did not land: %+v", got)
+	}
+	got, err := db3.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log WHERE stmts LIKE '%UPDATE backup_schedules SET target_host%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := got[0].Int64("n"); n != 1 {
+		t.Fatalf("a container's switch emitted %d compare-and-set statement(s), want 1", n)
+	}
+	// A VM's switch never asks the release gate.
+	asked = nil
+	putSchedule(t, db3, vmSched("vmweb", "dr", "host-b"))
+	if _, err := ReverseReplicationOnMove(ctx, db3, "vm", "vmweb", "", "host-a", "host-b", ReverseOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 0 {
+		t.Fatalf("a VM's switch asked the release gate for %v", asked)
+	}
+}
+
+// The container writers write only with the container_replication grant, and
+// the generic schedule upsert never writes a container's schedule.
+func TestContainerScheduleWriters_TakeTheGrant(t *testing.T) {
+	db := reverseFixture(t)
+	ctx := context.Background()
+	ct := BackupScheduleRecord{VMName: ContainerScheduleKey("prod", "web"), Scope: "container", ProjectName: "prod", Repo: "dr",
+		Cron: "0 * * * *", Enabled: true, Type: "replication", TargetPool: "dr", TargetHost: "host-b"}
+	if err := UpsertBackupSchedule(ctx, db, ct); err == nil {
+		t.Fatal("the generic upsert wrote a container schedule")
+	}
+	for _, g := range []capabilities.FeatureGrant{{}, capabilities.GrantForTest(t, capabilities.FeatureVMLimits)} {
+		if err := UpsertContainerReplicationSchedule(ctx, db, g, ct); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+			t.Fatalf("UpsertContainerReplicationSchedule(%q grant) = %v, want ErrNoFeatureGrant", g.Feature(), err)
+		}
+	}
+	if len(schedulesOf(t, db)) != 0 {
+		t.Fatal("a container schedule was written without its grant")
+	}
+	putSchedule(t, db, ct)
+	if _, err := RepointContainerReplicationTarget(ctx, db, capabilities.FeatureGrant{}, ct.VMName, "dr", "host-b", "host-a"); !errors.Is(err, capabilities.ErrNoFeatureGrant) {
+		t.Fatalf("RepointContainerReplicationTarget without a grant = %v", err)
+	}
+	if got := schedulesOf(t, db)[ct.VMName+"|dr"]; got.TargetHost != "host-b" {
+		t.Fatalf("switched without a grant: %+v", got)
+	}
+	if _, err := RepointContainerReplicationTarget(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureContainerReplication),
+		"web", "dr", "host-b", "host-a"); err == nil {
+		t.Fatal("the container writer switched a VM's schedule")
 	}
 }

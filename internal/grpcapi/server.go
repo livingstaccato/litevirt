@@ -57,15 +57,9 @@ type Server struct {
 	// (host_updates.go).
 	hostUpdates HostUpdatesConfig
 
-	// ctReplGate opens the container_replication release feature
-	// (containerReplicationGate); nil refuses. replRuns is each replication
-	// schedule's reporting state (replication_outcome.go).
-	ctReplGate containerReplicationGateFn
-	replRuns   replRuns
-	// repointOK is the memoised answer of repointReady, taken at repointAt.
-	repointMu sync.Mutex
-	repointOK bool
-	repointAt time.Time
+	// replRuns is each replication schedule's reporting state
+	// (replication_outcome.go).
+	replRuns replRuns
 
 	// isoLib holds the ISO library's per-host state: the sha256 cache of
 	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
@@ -1968,7 +1962,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 	s.wireCertificateVerifier()
-	s.wireRepointReady()
+	s.wireReplicationReleaseGates()
 	return s
 }
 

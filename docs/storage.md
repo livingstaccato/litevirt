@@ -226,13 +226,15 @@ refused, the session directory is `01733` instead: every local user may create
 entries in it, but its name is unguessable and nobody but root can list the
 directory it is in, so nobody else can find it. Both parent directories must be
 root's own `0711` directories. Earlier releases set them to `0777` at every
-session; at daemon start and at every session, a parent that is anything else
-(`0777`, another user's, a symlink, a file) is renamed aside to
-`.backup-scratch.aside-<time>-<id>` (or `.backup-sock…`) beside it, kept with
-everything in it, and made afresh, with a warning naming both. Remove the
-set-aside copy once you have looked at it. A session's directories are removed
-when it ends, and a crashed session's scratch is removed by the next backup of
-the same disk.
+session; at daemon start and at every session, root's own directory with
+another mode is narrowed to `0711` in place (safe, because a session never uses
+an entry that was already there). A parent that is another user's, a symlink
+or not a directory is renamed aside to `.backup-scratch.aside-<time>-<id>` (or
+`.backup-sock…`) beside it, kept with everything in it, and made afresh, with a
+warning naming both; remove the set-aside copy once you have looked at it. A
+session's directories are removed when it ends, and a crashed session's
+scratch, or an earlier release's `<vm>-<disk>.scratch`, is removed by the next
+backup of the same disk.
 
 ### Directory pools on NFS
 

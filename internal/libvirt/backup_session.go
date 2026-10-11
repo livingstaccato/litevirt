@@ -378,11 +378,12 @@ func checkBackupRoot(root string) error {
 	return nil
 }
 
-// ensureBackupRoot makes root a root-owned, real 0711 directory. One that is
-// not — an earlier build's 0777, anything planted while it was, a symlink, a
-// file — is renamed aside to .<name>.aside-<time>-<random> beside it, kept
-// with everything in it, logged, and made afresh: never deleted, and never a
-// reason to refuse the backup.
+// ensureBackupRoot makes root a root-owned, real 0711 directory. Root's own
+// directory with another mode (an earlier build's 0777) is narrowed in place.
+// Anything else — another user's directory, a symlink, a file (which no chmod
+// makes a directory) — is renamed aside to .<name>.aside-<time>-<random>
+// beside it, kept with everything in it, logged, and made afresh: never
+// deleted, and never a reason to refuse the backup.
 func ensureBackupRoot(root string) error {
 	if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(root), err)
@@ -390,6 +391,21 @@ func ensureBackupRoot(root string) error {
 	bad := checkBackupRoot(root)
 	if bad == nil {
 		return nil
+	}
+	// Root's own real directory with the wrong mode — an earlier build left
+	// it 0777 — is narrowed in place: no session ever adopts an entry already
+	// in it (random names, exclusive mkdir), so nothing in it needs setting
+	// aside, and the earlier build's stale <tag>.scratch is swept by the next
+	// session of its disk (sweepStaleScratch).
+	if fi, err := os.Lstat(root); err == nil && fi.IsDir() && fi.Mode()&fs.ModeSymlink == 0 {
+		if uid, ok := backupOwnerOf(root, fi); ok && uid == 0 {
+			if err := os.Chmod(root, backupRootMode); err != nil {
+				return fmt.Errorf("chmod %s: %w", root, err)
+			}
+			slog.Info("backup session: narrowed a backup directory to its mode", "path", root,
+				"was", fmt.Sprintf("%04o", fi.Mode()&(fs.ModePerm|fs.ModeSticky|fs.ModeSetuid|fs.ModeSetgid)))
+			return checkBackupRoot(root)
+		}
 	}
 	if !errors.Is(bad, fs.ErrNotExist) {
 		aside := filepath.Join(filepath.Dir(root),
@@ -514,8 +530,9 @@ func removeBackupSessionPaths(scratch, socket string) {
 }
 
 // sweepStaleScratch removes what crashed sessions of tag's disk left in root:
-// the scratch file of every <tag>.<16 hex> session directory but keep, then
-// that directory when it is empty. The caller holds the domain's backup job —
+// an earlier build's <tag>.scratch file, and the scratch file of every
+// <tag>.<16 hex> session directory but keep, then that directory when it is
+// empty. The caller holds the domain's backup job —
 // libvirt runs one per domain — so no other session of this disk is live.
 // Nothing else is touched: another disk's directories, names that are not a
 // session's, symlinks, and anything in a session directory but its scratch.
@@ -523,6 +540,14 @@ func sweepStaleScratch(root, tag, keep string) {
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return
+	}
+	// The earlier build's scratch of this disk, <tag>.scratch directly in the
+	// root: its own name, which it removed at every session's start.
+	legacy := filepath.Join(root, tag+".scratch")
+	if fi, err := os.Lstat(legacy); err == nil && fi.Mode().IsRegular() {
+		if os.Remove(legacy) == nil {
+			slog.Info("backup session: removed an earlier build's scratch", "path", legacy)
+		}
 	}
 	for _, e := range ents {
 		name := e.Name()

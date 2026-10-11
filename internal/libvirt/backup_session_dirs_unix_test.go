@@ -232,17 +232,15 @@ func TestBackupSessionPaths_NeverAdoptsAnExistingDirectory(t *testing.T) {
 	}
 }
 
-// A root that is not a root-owned, real 0711 directory — an earlier build's
-// 0777, a planted symlink or directory, a file — is renamed aside, kept with
+// A root that is another user's directory, a symlink, or not a directory at all
+// (a file, which no chmod can make a directory) is renamed aside, kept with
 // everything in it, and made afresh. The backup goes on.
 //
 // Mutations: accept the root as it is — red; delete instead of renaming — the
-// kept content is gone, red.
+// kept content is gone, red; narrow another user's directory in place instead
+// of setting it aside — red.
 func TestBackupSessionPaths_ABadRootIsSetAsideAndMadeAfresh(t *testing.T) {
 	cases := map[string]func(t *testing.T, root string, plant func(string)){
-		"earlier build 0777": func(t *testing.T, root string, _ func(string)) {
-			mustMkdirMode(t, root, 0o777)
-		},
 		"another user's directory": func(t *testing.T, root string, plant func(string)) {
 			mustMkdirMode(t, root, 0o711)
 			plant(root)
@@ -300,7 +298,7 @@ func TestBackupSessionPaths_ABadRootIsSetAsideAndMadeAfresh(t *testing.T) {
 			if len(aside) != 1 {
 				t.Fatalf("set-aside copies in %s: %v, want one", base, entries(t, base))
 			}
-			if name == "earlier build 0777" || name == "another user's directory" {
+			if name == "another user's directory" {
 				if b, err := os.ReadFile(filepath.Join(base, aside[0], "kept")); err != nil || string(b) != "keep" {
 					t.Errorf("the set-aside root lost its content: %q %v", b, err)
 				}
@@ -500,5 +498,113 @@ func TestPrepareBackupRoots_NarrowsAnEarlierBuildsRootsAtStart(t *testing.T) {
 	}
 	if _, err := os.Lstat(missing); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("a missing root was made at start: %v", err)
+	}
+}
+
+// Fix round 2: an earlier build's root — root's own real directory, left 0777
+// — is narrowed to 0711 in place: no aside copy, and what is in it stays. That
+// is safe because a session never adopts an existing entry (random names,
+// exclusive mkdir). The earlier build's own stale <tag>.scratch in it is then
+// swept by the next session of that disk.
+//
+// Mutations: set it aside instead — an aside copy appears, red; leave the mode
+// — red.
+func TestBackupSessionPaths_AnEarlierBuildsRootIsNarrowedInPlace(t *testing.T) {
+	backupDirsUmask022(t)
+	recordChown(t, false)
+	asRoot(t)
+	base := t.TempDir()
+	scratchRoot, sockRoot := filepath.Join(base, "backup-scratch"), filepath.Join(base, "backup-sock")
+	for _, d := range []string{scratchRoot, sockRoot} {
+		mustMkdirMode(t, d, 0o777)
+		if err := os.WriteFile(filepath.Join(d, "kept"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", qemuOwner{}); err != nil {
+		t.Fatalf("prepareBackupSessionPaths: %v", err)
+	}
+	for _, d := range []string{scratchRoot, sockRoot} {
+		if got := modeOf(t, d); got != 0o711 {
+			t.Errorf("%s is %04o, want narrowed to 0711", d, got)
+		}
+		if b, err := os.ReadFile(filepath.Join(d, "kept")); err != nil || string(b) != "keep" {
+			t.Errorf("%s lost its content: %q %v", d, b, err)
+		}
+	}
+	for _, e := range entries(t, base) {
+		if strings.Contains(e, ".aside-") {
+			t.Errorf("an earlier build's root was set aside (%s), not narrowed in place", e)
+		}
+	}
+}
+
+// Fix round 2: only another owner or a symlink is set aside, at daemon start
+// too; root's own 0777 directory is narrowed in place there as well.
+func TestPrepareBackupRoots_SetsAsideOnlyAnotherOwnerOrASymlink(t *testing.T) {
+	backupDirsUmask022(t)
+	plant := asRoot(t)
+	base := t.TempDir()
+	old, foreign, link := filepath.Join(base, "a"), filepath.Join(base, "b"), filepath.Join(base, "c")
+	mustMkdirMode(t, old, 0o777)
+	mustMkdirMode(t, foreign, 0o711)
+	plant(foreign)
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Fatal(err)
+	}
+	prepareBackupRoots(old, foreign, link)
+	aside := map[string]bool{}
+	for _, e := range entries(t, base) {
+		if i := strings.Index(e, ".aside-"); i > 0 {
+			aside[e[1:i]] = true
+		}
+	}
+	if aside["a"] {
+		t.Error("root's own 0777 directory was set aside, not narrowed in place")
+	}
+	if !aside["b"] || !aside["c"] {
+		t.Errorf("set aside: %v, want another user's directory (b) and the symlink (c)", aside)
+	}
+	for _, d := range []string{old, foreign, link} {
+		if fi, err := os.Lstat(d); err != nil || !fi.IsDir() || modeOf(t, d) != 0o711 {
+			t.Errorf("%s is not a 0711 directory afterwards: %v %v", d, fi, err)
+		}
+	}
+}
+
+// The earlier build's stale scratch of this disk, <tag>.scratch directly in the
+// root (a regular file), is swept with the crashed sessions; another disk's,
+// and a symlink at the name, are not.
+//
+// Mutation: drop the legacy-name sweep — red.
+func TestSweepStaleScratch_TakesTheEarlierBuildsScratchOfThisDisk(t *testing.T) {
+	base := t.TempDir()
+	mine, other := filepath.Join(base, "v-vda.scratch"), filepath.Join(base, "w-vda.scratch")
+	for _, p := range []string{mine, other} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepStaleScratch(base, "v-vda", "")
+	if _, err := os.Lstat(mine); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the earlier build's scratch of this disk is left: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("another disk's scratch was removed: %v", err)
+	}
+	base2 := t.TempDir()
+	target := filepath.Join(t.TempDir(), "t")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(base2, "v-vda.scratch")); err != nil {
+		t.Fatal(err)
+	}
+	sweepStaleScratch(base2, "v-vda", "")
+	if _, err := os.Lstat(filepath.Join(base2, "v-vda.scratch")); err != nil {
+		t.Errorf("a symlink at the legacy name was removed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("a symlink's target was removed: %v", err)
 	}
 }

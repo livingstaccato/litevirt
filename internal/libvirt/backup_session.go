@@ -606,8 +606,11 @@ func isSessionDirName(name string) bool {
 
 // sweepStaleScratch removes what crashed sessions of tag's disk left in root:
 // an earlier build's <tag>.scratch file, and the scratch file of every
-// <tag>.<16 hex> session directory but keep, then that directory when it is
-// empty. The caller holds the domain's backup job —
+// <tag>.<16 hex> session directory but the live one, then that directory when
+// it is empty. keep is the live session's directory: the root entry that is
+// keep or contains it is skipped whole. A fallback session's directory is one
+// level below its root entry (<root>/<tag>.<hex>/<hex>), so an equality test
+// alone would sweep the live session. The caller holds the domain's backup job —
 // libvirt runs one per domain — so no other session of this disk is live.
 // Nothing else is touched: another disk's directories, names that are not a
 // session's, symlinks, and anything in a session directory but its scratch.
@@ -631,8 +634,8 @@ func sweepStaleScratch(root, tag, keep string) {
 			continue
 		}
 		dir := filepath.Join(root, name)
-		if dir == keep {
-			continue
+		if keep == dir || strings.HasPrefix(keep, dir+string(os.PathSeparator)) {
+			continue // the live session's
 		}
 		fi, err := os.Lstat(dir)
 		if err != nil || !fi.IsDir() {

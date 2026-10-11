@@ -227,9 +227,9 @@ entries in it, so it is made one level further down, inside a fresh root-owned
 `0711` directory that the session makes with its own unguessable name. Nobody
 but root can list either directory, and the fresh one was never readable by
 anyone else, so nobody else can find the session directory, not even a process
-that opened the parent while an earlier release left it `0777`. Both parent directories must be
-root's own `0711` directories. Earlier releases set them to `0777` at every
-session; at daemon start and at every session, root's own directory with
+that opened the parent while an earlier release left it `0777`. Both parent
+directories must be root's own `0711` directories. Earlier releases set them to
+`0777` at every session; at daemon start and at every session, root's own directory with
 another mode is narrowed to `0711` in place (safe, because a session never uses
 an entry that was already there). A parent that is another user's, a symlink
 or not a directory is renamed aside to `.backup-scratch.aside-<time>-<id>` (or
@@ -237,7 +237,7 @@ or not a directory is renamed aside to `.backup-scratch.aside-<time>-<id>` (or
 warning naming both; remove the set-aside copy once you have looked at it. A
 session's directories are removed when it ends, and a crashed session's
 scratch, or an earlier release's `<vm>-<disk>.scratch`, is removed by the next
-backup of the same disk.
+backup of the same disk; that backup's own live session is never touched.
 
 ### Directory pools on NFS
 

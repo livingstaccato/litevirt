@@ -808,3 +808,108 @@ func TestEnsureBackupRoot_ConcurrentSessionsSetABadRootAsideOnce(t *testing.T) {
 		t.Errorf("%d set-aside copies, want 1", n)
 	}
 }
+
+// Fix round 4, I1: BeginBackup sweeps while its own session is live — qemu
+// has the scratch open — and passes the session's directory as keep. A
+// fallback session's directory is one level below the root entry the sweep
+// walks (<root>/<tag>.<hex>/<hex>), so keep must protect the root entry that
+// CONTAINS it, not only one equal to it: comparing the two for equality
+// unlinked the live scratch and removed both of its directories mid-job.
+// Crashed sessions of the same disk, of both shapes, are still swept.
+//
+// Mutation: keep compared for equality only — the fallback case red.
+func TestSweepStaleScratch_NeverTouchesTheLiveSession(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		owner qemuOwner
+	}{
+		{"fallback", qemuOwner{}},
+		{"qemu-owned", qemuOwner{UID: 1, GID: 1, Known: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backupDirsUmask022(t)
+			recordChown(t, false)
+			asRoot(t)
+			base := t.TempDir()
+			scratchRoot, sockRoot := filepath.Join(base, "s"), filepath.Join(base, "k")
+			write := func(p string) {
+				t.Helper()
+				if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Two crashed sessions of this disk, one of each shape.
+			deadFB, _, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", qemuOwner{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadQ, _, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", qemuOwner{UID: 1, GID: 1, Known: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(deadFB)
+			write(deadQ)
+
+			scratch, _, err := prepareBackupSessionPaths(scratchRoot, sockRoot, "v-vda", tc.owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(scratch) // qemu has created it and holds it open
+
+			sweepStaleScratch(scratchRoot, "v-vda", filepath.Dir(scratch)) // as BeginBackup calls it
+
+			for p := scratch; p != scratchRoot; p = filepath.Dir(p) {
+				if _, err := os.Lstat(p); err != nil {
+					t.Errorf("the live session's %s was removed by the sweep: %v", p, err)
+				}
+			}
+			for _, d := range []string{deadFB, deadQ} {
+				// The crashed session's root-level entry is gone.
+				rel, err := filepath.Rel(scratchRoot, d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				top := filepath.Join(scratchRoot, strings.Split(rel, string(os.PathSeparator))[0])
+				if _, err := os.Lstat(top); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("a crashed session %s is left: %v", top, err)
+				}
+			}
+		})
+	}
+}
+
+// keep protects the root entry it is in or equal to — an ancestor check on
+// path elements, not a string prefix: a keep whose path merely starts with an
+// entry's name (<entry>x) does not protect that entry.
+//
+// Mutation: a bare strings.HasPrefix(keep, dir) — the second sweep red.
+func TestSweepStaleScratch_KeepIsAnAncestorNotANamePrefix(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "v-vda."+strings.Repeat("a", 16))
+	inner := filepath.Join(live, strings.Repeat("b", 16))
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inner, "scratch"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dead := filepath.Join(base, "v-vda."+strings.Repeat("c", 16))
+	if err := os.Mkdir(dead, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dead, "scratch"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// keep is the live fallback session's INNER directory.
+	sweepStaleScratch(base, "v-vda", inner)
+	if _, err := os.Stat(filepath.Join(inner, "scratch")); err != nil {
+		t.Errorf("the live fallback scratch was removed: %v", err)
+	}
+	if _, err := os.Lstat(dead); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a crashed session is left: %v", err)
+	}
+	sweepStaleScratch(base, "v-vda", live+"x")
+	if _, err := os.Lstat(live); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a keep that only shares a name prefix protected %s: %v", live, err)
+	}
+}

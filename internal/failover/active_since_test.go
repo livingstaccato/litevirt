@@ -7,6 +7,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // A host that just turned active is counted down afresh: an observation older
@@ -41,10 +42,14 @@ func TestHostJustActiveIsCountedAfresh(t *testing.T) {
 	}
 
 	// The observers count it down after it turned active: fenced as usual.
+	// Their runs began after the boot write (last_seen, the run's first
+	// failed probe), so the count is about the host active now.
+	time.Sleep(10 * time.Millisecond)
+	runStart := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, o := range []string{"coordinator", "alive"} {
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, 'down', 'suspect', ?, NULL, ?)`, o, offlineThreshold, db.NowTS()); err != nil {
+			 VALUES (?, 'down', 'suspect', ?, ?, ?)`, o, offlineThreshold, runStart, db.NowTS()); err != nil {
 			t.Fatalf("insert health: %v", err)
 		}
 	}
@@ -86,5 +91,45 @@ func TestTurnedActiveThisCycle(t *testing.T) {
 	}
 	if c.turnedActiveThisCycle(ctx, "down", snapshot) {
 		t.Error("a host active since before the cycle's snapshot was held back")
+	}
+}
+
+// countedSinceActive is the activation filter of the fence quorum: a verdict
+// counts for a host recorded active since `since` only when it is about the
+// host's current life — published after the activation, and either from a run
+// that began after it or from one that has lasted a whole afreshRun since.
+//
+// Mutations: return true for a verdict published after the activation (the
+// restart case of lab 1, 2026-10-11, fences at once); return false whenever
+// the run began before the activation (a host that turned active and never
+// answered is never fenced).
+func TestCountedSinceActive(t *testing.T) {
+	since := time.Date(2026, 10, 11, 10, 48, 59, 0, time.UTC)
+	rfc := func(t time.Time) string { return t.Format(time.RFC3339Nano) }
+	for _, tc := range []struct {
+		name     string
+		n        int
+		lastSeen string
+		at       time.Time
+		want     bool
+	}{
+		{"published before the activation", 9, rfc(since.Add(-20 * time.Second)), since.Add(-time.Second), false},
+		{"run began after the activation", offlineThreshold, rfc(since.Add(time.Second)), since.Add(9 * time.Second), true},
+		// node-2 on lab 1: the run began at its SIGTERM, 34 s before the boot
+		// write, and its next unanswered probe landed 3 s after it.
+		{"restart: run from before, 3s since", 22, rfc(since.Add(-34 * time.Second)), since.Add(3 * time.Second), false},
+		{"restart: run from before, just short of a whole run since", 22, rfc(since.Add(-34 * time.Second)), since.Add(afreshRun - time.Millisecond), false},
+		{"restart: run from before, a whole run since", 22, rfc(since.Add(-34 * time.Second)), since.Add(afreshRun), true},
+		// An older observer's row has no last_seen: its run is taken to span
+		// one probe interval per failure back from updated_at.
+		{"older build: count reaches back before the activation", offlineThreshold, "", since.Add(2 * time.Second), false},
+		{"older build: count fits after the activation", offlineThreshold, "", since.Add(time.Duration(offlineThreshold) * health.ProbeInterval), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countedSinceActive(tc.n, tc.lastSeen, tc.at, since); got != tc.want {
+				t.Errorf("countedSinceActive(n=%d, last_seen=%q, at=since%+v) = %v, want %v",
+					tc.n, tc.lastSeen, tc.at.Sub(since), got, tc.want)
+			}
+		})
 	}
 }

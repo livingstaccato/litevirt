@@ -252,8 +252,8 @@ func TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet(t *testing.T) {
 	// observations are stamped after that, or the coordinator rightly reads
 	// them as about the host before it turned active (HostsActiveSince).
 	clock = NewVirtualClock(time.Now().UTC())
-	PublishHealth(t, a, victim.Name, 5, clock.Now())
-	PublishHealth(t, b, victim.Name, 5, clock.Now())
+	PublishHealthRun(t, a, victim.Name, 5, clock.Now(), clock.Now())
+	PublishHealthRun(t, b, victim.Name, 5, clock.Now(), clock.Now())
 	c.WaitConverged(t, convergeTimeout, a, b)
 	cs := c.NewCoordinators(clock)
 	cs.Tick(ctx, a)

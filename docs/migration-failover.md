@@ -842,7 +842,13 @@ that fails again after coming back is fenced anew, without waiting out the
 the race the window exists for. Likewise, a health observation older than the
 moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not
-probed at all until its daemon's first boot records it `active`.
+probed at all until its daemon's first boot records it `active`. A newer
+observation counts only if its failing run began after the activation, or once
+the host has been failing for a whole run since it: 5 probes (8 s) plus the 5 s
+clock-skew margin. Observers keep counting through a restart, and a daemon's
+boot write records it `active` a few seconds before it answers probes, so
+without this a host that restarted (recorded `upgrading` while it was down) was
+fenced the moment its boot write landed, on the count from its restart.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
 counts at any age, and for the one a lost voter's removal and a superseded

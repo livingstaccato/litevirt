@@ -684,7 +684,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// count it during a rolling upgrade either.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
-		`SELECT target, observer, updated_at
+		`SELECT target, observer, consecutive_failures, last_seen, updated_at
 		 FROM host_health
 		 WHERE target != ?
 		   AND consecutive_failures >= ?
@@ -705,9 +705,10 @@ func (c *Coordinator) run(ctx context.Context) {
 	// one-sided test, since readmitting a host is not the irreversible act.
 	futureCutoff := c.now().Add(healthFreshness)
 	// An observation older than the moment its target turned active is about
-	// the host before (joining, offline, fenced), not the one active now, so
-	// a host that just turned active is counted down afresh. Unreadable: judged
-	// as before.
+	// the host before (joining, offline, fenced, upgrading), not the one active
+	// now, so a host that just turned active is counted down afresh — and so
+	// is one whose observation is newer but whose failing run began before the
+	// activation (countedSinceActive). Unreadable: judged as before.
 	activeSince, aerr := corrosion.HostsActiveSince(ctx, c.db)
 	if aerr != nil {
 		slog.Warn("failover: read when hosts turned active", "error", aerr)
@@ -728,7 +729,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
-		if since, ok := activeSince[t]; ok && inst.Before(since) {
+		if since, ok := activeSince[t]; ok && !countedSinceActive(r.Int("consecutive_failures"), r.String("last_seen"), inst, since) {
 			continue
 		}
 		if c.scope.region && countsAsVote(voters, o, t) {

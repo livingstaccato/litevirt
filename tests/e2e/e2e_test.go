@@ -1772,6 +1772,16 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		"--host", hostNames[0])
 	waitVM(t, vmName, "RUNNING", 2*time.Minute)
 
+	// `lv run --name ... --image ...` makes a VM with no NIC at all, so the VM
+	// starts with none and the NIC this test attaches is the only one. Record
+	// the MACs before, so the assertion is on the one the attach added whatever
+	// the VM started with.
+	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
+	before := map[string]bool{}
+	for _, m := range macRe.FindAllString(lv(t, "inspect", vmName), -1) {
+		before[m] = true
+	}
+
 	lv(t, "attach-nic", vmName, netName)
 
 	out := lv(t, "inspect", vmName)
@@ -1779,16 +1789,22 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		t.Error("attached NIC not in inspect output")
 	}
 
-	// Detach by MAC. This used to run only `if len(macs) >= 2`, which meant a run
-	// that parsed fewer MACs skipped the detach and still passed — the half of
-	// this test with the actual risk in it, silently opted out of. If the MACs
-	// can't be found the attach assertion above was already wrong, so fail.
-	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
-	macs := macRe.FindAllString(out, -1)
-	if len(macs) < 2 {
-		t.Fatalf("expected at least 2 MACs in inspect after attaching a NIC, found %d (%v)", len(macs), macs)
+	// Detach by the MAC the attach added. If it cannot be found the attach
+	// assertion above was already wrong, so fail rather than skip the half of
+	// this test with the actual risk in it.
+	var added string
+	for _, m := range macRe.FindAllString(out, -1) {
+		if !before[m] {
+			added = m
+		}
 	}
-	lv(t, "detach-nic", vmName, macs[len(macs)-1])
+	if added == "" {
+		t.Fatalf("no new MAC in inspect after attaching a NIC (before %v):\n%s", before, out)
+	}
+	lv(t, "detach-nic", vmName, added)
+	if after := lv(t, "inspect", vmName); strings.Contains(after, added) {
+		t.Errorf("detached NIC %s still in inspect output:\n%s", added, after)
+	}
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")
@@ -2424,12 +2440,20 @@ func assertEventually(t *testing.T, timeout time.Duration, desc string, fn func(
 // if SSH isn't available, so the test degrades gracefully off-cluster.
 func nftTable(t *testing.T, host string) (string, bool) {
 	t.Helper()
+	return nftTableOf(t, host, "inet", "litevirt-fw")
+}
+
+// nftTableOf dumps one nftables table of a cluster host (family and name as nft
+// takes them). Security-group rules render into the per-NIC `bridge
+// litevirt-nic` table; `inet litevirt-fw` holds the routed-traffic tiers.
+func nftTableOf(t *testing.T, host, family, name string) (string, bool) {
+	t.Helper()
 	// By address: cluster host names do not resolve on the nodes.
 	target := envOr("E2E_FW_SSH_"+strings.ReplaceAll(host, "-", "_"), sshTarget(host))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no",
-		target, "nft", "list", "table", "inet", "litevirt-fw")
+		target, "nft", "list", "table", family, name)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Logf("nft dump on %s unavailable (%v); skipping kernel-state assertions", host, err)
@@ -2447,6 +2471,7 @@ func nftTable(t *testing.T, host string) (string, bool) {
 // the rendered kernel ruleset (the same nft path that powers host-isolation),
 // backed by the renderer unit tests for packet-level behaviour.
 func TestFirewall(t *testing.T) {
+	ensureTopology(t)
 	requireImage(t)
 	if skipSlow {
 		t.Skip("E2E_SKIP_SLOW set, skipping firewall test")
@@ -2511,39 +2536,61 @@ vms:
 		}
 	})
 
-	// Kernel proof: the web SG must render into the host's nftables ruleset with
-	// the 8080 accept + DHCP accept + drop, in order, on the guarded VM's NIC
-	// chain — and the forward chain must appear exactly once (regression guard
-	// for the atomic-replace fix: a merge-not-replace bug duplicated it).
+	// Kernel proof: the web SG renders into the per-NIC bridge table
+	// (`bridge litevirt-nic`), as 8080 accept + DHCP accept + drop, in order, in
+	// the bound NIC's nic_in_<tap> chain; the other NIC's chain carries none of
+	// it. The inet table's forward chain must appear exactly once (regression
+	// guard for the atomic-replace fix: a merge-not-replace bug duplicated it).
 	t.Run("RenderedIntoKernel", func(t *testing.T) {
-		var table string
-		rendered := false
+		var nic, inet string
+		var chain string
 		deadline := time.Now().Add(2 * time.Minute) // tap discovery + 30s reconcile + margin
 		for time.Now().Before(deadline) {
-			tbl, ok := nftTable(t, host)
+			tbl, ok := nftTableOf(t, host, "bridge", "litevirt-nic")
 			if !ok {
 				t.Skip("nft inspection unavailable off-cluster")
 			}
-			table = tbl
-			if strings.Contains(tbl, "tcp dport 8080 accept") && strings.Contains(tbl, "udp dport 68 accept") {
-				rendered = true
+			nic = tbl
+			if chain = chainWith(nic, "nic_in_", "tcp dport 8080 accept"); chain != "" {
 				break
 			}
 			time.Sleep(5 * time.Second)
 		}
-		if !rendered {
-			t.Fatalf("web SG never rendered into nftables on %s within 2m:\n%s", host, table)
+		if chain == "" {
+			t.Fatalf("web SG never rendered into a nic_in_ chain of bridge litevirt-nic on %s within 2m:\n%s", host, nic)
 		}
-		// Exactly one forward hook — no duplication (atomic-replace regression guard).
-		if n := strings.Count(table, "hook forward"); n != 1 {
-			t.Errorf("forward chain appears %d times, want 1 (atomic-replace regression):\n%s", n, table)
+		a, d := strings.Index(chain, "tcp dport 8080 accept"), strings.Index(chain, "udp dport 68 accept")
+		if a < 0 || d < a {
+			t.Errorf("the SG's rules are not 8080 accept then DHCP accept:\n%s", chain)
+		} else if rest := strings.TrimSpace(chain[d+len("udp dport 68 accept"):]); !strings.HasPrefix(rest, "drop") {
+			// The SG's own `proto all drop` is the next rule: a later drop
+			// (a cluster default-deny) would not prove it rendered.
+			t.Errorf("the SG's drop does not follow its DHCP accept:\n%s", chain)
 		}
-		// The drop rule must be present (the "block everything else" half).
-		if !strings.Contains(table, "drop") {
-			t.Errorf("web SG drop rule not rendered:\n%s", table)
+		// Scoped to the bound NIC: exactly one nic_in_ chain carries the rule.
+		if n := strings.Count(nic, "tcp dport 8080 accept"); n != 1 {
+			t.Errorf("tcp dport 8080 accept appears %d times in bridge litevirt-nic, want 1 (the unbound NIC must carry none):\n%s", n, nic)
 		}
-		t.Logf("litevirt-fw on %s rendered the web SG correctly (8080 accept + drop, single forward chain)", host)
+		inet, ok := nftTable(t, host)
+		if !ok {
+			t.Skip("nft inspection unavailable off-cluster")
+		}
+		if n := strings.Count(inet, "hook forward"); n != 1 {
+			t.Errorf("forward chain appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", n, inet)
+		}
+		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (8080 accept, DHCP accept, drop; single inet forward chain)", host)
 	})
+}
+
+// chainWith returns the body of the first chain of an nft table dump whose name
+// starts with prefix and whose body contains needle, or "".
+func chainWith(table, prefix, needle string) string {
+	for _, part := range strings.Split(table, "\tchain ")[1:] {
+		if strings.HasPrefix(part, prefix) && strings.Contains(part, needle) {
+			return part
+		}
+	}
+	return ""
 }
 
 // TestFirewallManagementCLI exercises the cluster/host/ipset/default-deny
@@ -2551,6 +2598,9 @@ vms:
 // It uses only accept rules on unused ports and never flips the cluster default
 // to deny, so it cannot disrupt any running workload.
 func TestFirewallManagementCLI(t *testing.T) {
+	// Not every test calls this first: run alone, hostNames is empty and the
+	// host-rule subtest indexes it.
+	ensureTopology(t)
 	t.Run("ClusterRule", func(t *testing.T) {
 		out := lv(t, "firewall", "cluster-rule", "add", "--direction", "ingress",
 			"--proto", "tcp", "--port", "59443", "--action", "accept", "--comment", "e2e-cluster")

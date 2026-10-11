@@ -333,7 +333,8 @@ func (s *Server) autoDefineRestoredVM(
 	})
 	// The release gate for the limits this restore carries, immediately before
 	// the domain that holds them is defined.
-	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+	limitsG, err := s.recordLimitedSpec(ctx, spec)
+	if err != nil {
 		return "", "", err
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
@@ -417,12 +418,8 @@ func (s *Server) autoDefineRestoredVM(
 	// it from the (device-less) inactive definition, which correctly imports nothing.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
-	insertVM := s.insertVMForSpec
-	insertG := ioG
-	if vmSpecSetsPassthrough(spec) {
-		insertVM, insertG = s.insertVMForPassthrough, passthroughG
-	}
-	if err := insertVM(ctx, spec, insertG, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the

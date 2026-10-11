@@ -160,13 +160,13 @@ func TestVMLimitsGate_LimitlessWorkIsNeverGated(t *testing.T) {
 	if err := s.precheckLimitedSpec(ctx, plain); err != nil {
 		t.Errorf("limitless create refused: %v", err)
 	}
-	if err := s.recordLimitedSpec(ctx, plain); err != nil {
+	if _, err := s.recordLimitedSpec(ctx, plain); err != nil {
 		t.Errorf("limitless record refused: %v", err)
 	}
 	if err := s.precheckLimitUpdate(ctx, upd); err != nil {
 		t.Errorf("zero-valued limit update refused: %v", err)
 	}
-	if err := s.recordLimitUpdate(ctx, upd); err != nil {
+	if _, err := s.recordLimitUpdate(ctx, upd); err != nil {
 		t.Errorf("zero-valued limit update recorded/refused: %v", err)
 	}
 	if *g.calls != 0 {
@@ -185,10 +185,10 @@ func TestVMLimitsGate_LatchedRecordsThroughTheFeature(t *testing.T) {
 	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
 		t.Errorf("latched precheck refused: %v", err)
 	}
-	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+	if _, err := s.recordLimitedSpec(ctx, spec); err != nil {
 		t.Errorf("latched create refused: %v", err)
 	}
-	if err := s.recordLimitUpdate(ctx, req); err != nil {
+	if _, err := s.recordLimitUpdate(ctx, req); err != nil {
 		t.Errorf("latched update refused: %v", err)
 	}
 	if *g.runs != 2 || *g.feature != capabilities.FeatureVMLimits {

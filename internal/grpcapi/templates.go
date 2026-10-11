@@ -531,11 +531,26 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
-	// The release gate for the limits the clone carries, immediately before
-	// the domain that holds them is defined.
-	if err := s.recordLimitedSpec(ctx, &srcSpec); err != nil {
+	// The release gates for what the clone's spec carries — its limits, its
+	// disk/NIC tuning, its memory hot-add (USB devices are not cloned) —
+	// immediately before the domain that holds them is defined; the row is
+	// written through the one writer that checks every grant (M9).
+	var gs vmSpecGrants
+	if gs.limits, err = s.recordLimitedSpec(ctx, &srcSpec); err != nil {
 		cleanup()
 		return nil, err
+	}
+	if specSetsDiskNICIO(&srcSpec) {
+		if gs.tuning, err = s.ioGrant(ctx); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+	if vmSpecSetsPassthrough(&srcSpec) {
+		if gs.passthrough, err = s.passthroughGrant(ctx); err != nil {
+			cleanup()
+			return nil, err
+		}
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
@@ -600,7 +615,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if state == "running" {
 		insertState = "creating"
 	}
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
+	if err := s.insertVMWithGrants(ctx, &srcSpec, gs, corrosion.VMRecord{
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
 		State: insertState, CPUActual: cpu, MemActual: mem, Project: project,
 	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {

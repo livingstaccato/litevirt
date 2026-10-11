@@ -1057,7 +1057,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// The release gate for a limit, on the node that writes it, immediately
 	// before the domain carrying it is defined.
-	if err := s.recordLimitedSpec(ctx, spec); err != nil {
+	limitsG, err := s.recordLimitedSpec(ctx, spec)
+	if err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, err
@@ -1179,12 +1180,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
-	insertVM := s.insertVMForSpec
-	insertG := ioG
-	if vmSpecSetsPassthrough(spec) {
-		insertVM, insertG = s.insertVMForPassthrough, passthroughG
-	}
-	if err := insertVM(ctx, spec, insertG, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+	// One writer for every release feature the spec carries, each grant
+	// checked (M9).
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
 		// deployment keeps today's behaviour exactly. With a claim in play, a
 		// running VM with no row is the one state that lets the orphan sweeper
@@ -4466,7 +4465,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// the virtio-mem device) are not what the value-only patch edits.
 		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && spec.MemoryHotplugMaxMib == 0 &&
 		!req.RedefineHardware
-	limitsRecorded := false // the release gate already ran (before a stop)
+	// limitsRecorded: the release gate already ran (before a stop); limitsG is
+	// its grant, for the spec write (M9).
+	limitsRecorded := false
+	var limitsG capabilities.FeatureGrant
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
@@ -4603,10 +4605,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			// The release gate, now that the cheap refusals above are behind us
 			// and before the guest is touched: a first-use acknowledgement wait
 			// must never keep a stopped guest down, and a refusal never stops it.
-			if err := s.recordLimitUpdate(ctx, req); err != nil {
+			g, err := s.recordLimitUpdate(ctx, req)
+			if err != nil {
 				return nil, err
 			}
-			limitsRecorded = true
+			limitsG, limitsRecorded = g, true
 
 			if repair {
 				// A VM left in error or mid-transition (a create, start or
@@ -4770,9 +4773,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// release gate, on the owner, after every refusal above and before
 		// anything is written. (A running VM recorded before its stop.)
 		if !limitsRecorded {
-			if err := s.recordLimitUpdate(ctx, req); err != nil {
+			g, err := s.recordLimitUpdate(ctx, req)
+			if err != nil {
 				return nil, err
 			}
+			limitsG = g
 		}
 	}
 
@@ -4785,6 +4790,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// mem_actual (a running VM's live actuals must survive a metadata edit).
 	if !redefine {
 		limitsApplied := false
+		var liveLimitsG capabilities.FeatureGrant // the vm_limits grant, for the spec write (M9)
 		persistSpec := func(string) (string, error) { return string(specJSON), nil }
 		if limitsReq {
 			// Applied to the domain BEFORE the spec is written, under the VM
@@ -4838,16 +4844,22 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 			// The release gate, on the owner, under the lock, after the request
 			// validated against the spec read here and before the first write.
-			if gerr := s.recordLimitUpdate(ctx, req); gerr != nil {
+			g, gerr := s.recordLimitUpdate(ctx, req)
+			if gerr != nil {
 				return nil, gerr
 			}
+			liveLimitsG = g
 			if aerr := s.applyLimitsToDomain(ctx, req.Name, spec, limitsUp); aerr != nil {
 				s.revertLimits(ctx, req.Name, spec, limitsUp)
 				return nil, aerr
 			}
 			limitsApplied = true
 		}
-		applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, req.Name, persistSpec)
+		// The live write carries limits (and spec-only metadata): the one
+		// writer checks the vm_limits grant whenever it carries a limit (M9).
+		applied, _, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db,
+			capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, liveLimitsG,
+			corrosion.VMSpecFeatures{Limits: requestSetsLimits(req)}, req.Name, persistSpec)
 		if err != nil {
 			if limitsApplied {
 				s.revertLimits(ctx, req.Name, spec, limitsUp)
@@ -5118,17 +5130,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// half-applied firmware update). MutateDesiredSpec persists the desired spec and
 	// bumps spec_generation; UpdateObservedActuals then records the stopped VM's new
 	// cpu/mem actuals against that generation so a later start boots the right size.
-	mutateSpec := corrosion.MutateDesiredSpec
-	if updateSetsPassthrough(req) {
-		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
-			return corrosion.MutateDesiredSpecPassthrough(ctx, c, passthroughG, name, fn)
-		}
-	} else if tuningWrite {
-		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
-			return corrosion.MutateDesiredSpecTuning(ctx, c, ioG, name, fn)
-		}
+	// One writer for every release feature this update adds to the spec, each
+	// grant checked (M9): tuning, USB devices / hot-add, limits.
+	updNeeds := corrosion.VMSpecFeatures{
+		Tuning:      tuningWrite,
+		Passthrough: updateSetsPassthrough(req),
+		Limits:      requestSetsLimits(req),
 	}
-	applied, newGen, err := mutateSpec(ctx, s.db, req.Name, func(string) (string, error) {
+	applied, newGen, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db, ioG, passthroughG, limitsG, updNeeds, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
 	if err != nil || !applied {

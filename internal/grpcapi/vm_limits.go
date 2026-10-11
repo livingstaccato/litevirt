@@ -132,22 +132,40 @@ func (s *Server) precheckLimitUpdate(ctx context.Context, req *pb.UpdateVMReques
 }
 
 // recordLimitedSpec runs a spec that sets a limit through the release gate
-// (vm_limits) on THIS node, immediately before the first write of that limit.
-func (s *Server) recordLimitedSpec(ctx context.Context, spec *pb.VMSpec) error {
+// (vm_limits) on THIS node, immediately before the first write of that limit,
+// and returns the grant the spec's writer checks (vmSpecGrants.limits). A spec
+// with no limit takes none: the zero grant, which its writer does not check.
+func (s *Server) recordLimitedSpec(ctx context.Context, spec *pb.VMSpec) (capabilities.FeatureGrant, error) {
+	var granted capabilities.FeatureGrant
 	if !specSetsLimits(spec) {
-		return nil
+		return granted, nil
 	}
-	return s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
-		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitedSpec(g, spec) })
+	err := s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
+		func(_ context.Context, g capabilities.FeatureGrant) error {
+			if err := admitLimitedSpec(g, spec); err != nil {
+				return err
+			}
+			granted = g
+			return nil
+		})
+	return granted, err
 }
 
 // recordLimitUpdate is recordLimitedSpec for an update, run on the owner.
-func (s *Server) recordLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) error {
+func (s *Server) recordLimitUpdate(ctx context.Context, req *pb.UpdateVMRequest) (capabilities.FeatureGrant, error) {
+	var granted capabilities.FeatureGrant
 	if !requestSetsLimits(req) {
-		return nil
+		return granted, nil
 	}
-	return s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
-		func(_ context.Context, g capabilities.FeatureGrant) error { return admitLimitUpdate(g, req) })
+	err := s.WithReleaseFeature(ctx, capabilities.FeatureVMLimits,
+		func(_ context.Context, g capabilities.FeatureGrant) error {
+			if err := admitLimitUpdate(g, req); err != nil {
+				return err
+			}
+			granted = g
+			return nil
+		})
+	return granted, err
 }
 
 // composeVMSetsLimit reports whether a compose VM entry names any limit this

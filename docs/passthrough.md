@@ -18,7 +18,11 @@ below the token predates rollback rules, so `lv cluster upgrade-status` shows
 `BLOCKS ROLLBACK: yes` for it (see upgrades.md, *Rolling back after a release
 token latched*). The first time any of the three is set, the cluster also
 records `usb_mounts_memory` as used (`lv cluster upgrade-status` shows it);
-that record is what a rule-aware build below a later release token reads.
+that record is what a rule-aware build below a later release token reads. The
+record is written before the data it covers, so a request that fails after
+it — a create its project quota or host admission then refuses, a restore
+whose id-range move or row write then fails — can leave the feature recorded
+as used with nothing set. It never errs the other way.
 
 ## USB passthrough (VMs)
 
@@ -306,7 +310,13 @@ containers:
   another project's is dropped, host mounts, devices and privilege are not
   carried, and all of it is audited. A row from before the create
   spec records no NICs: a move keeps the archive's veth-on-bridge NICs and
-  drops every other kind. A network record or list that cannot be read fails
+  drops every other kind, audited (`ct.restore`). Litevirt never renders a
+  `phys`, `macvlan`, `ipvlan`, router-mode or `none` NIC, so one exists only
+  in a hand-edited config; re-add it by hand on the new host. The bridge NICs
+  kept this way are not admitted against network records (as on earlier
+  builds, which kept every archive NIC on a move), so a container that old
+  takes whatever bridge its archive names; recreate it to give it a row
+  that records its NICs. A network record or list that cannot be read fails
   the restore, to be retried. A restore keeps the backup's mounts and devices only for an
   admin (a cold migration or failover relocation keeps them only when they are
   exactly what the source's row records); otherwise they are stripped, the

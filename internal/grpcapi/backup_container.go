@@ -1176,7 +1176,11 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// that grants host access or overrides confinement).
 	//
 	// Host access an operator restore keeps is written with the feature's grant
-	// (hostAccessG), taken here on the node that writes the row.
+	// (hostAccessG), taken here on the node that writes the row. The grant
+	// records the use ahead of the work below; a restore that fails after it
+	// (the id-range move, the config render, the row write) leaves the use
+	// recorded with nothing set (n2). The record always precedes the data, so
+	// it errs only toward "used", which changes nothing for this release.
 	var hostAccessG capabilities.FeatureGrant
 	{
 		authorized, stripped, g, herr := s.authorizeRestoredHostAccess(ctx, corrosion.DecodeCreateSpec(spec.CreateSpec), source, !operatorRestore, req.GetWithoutHostAccess())

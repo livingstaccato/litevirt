@@ -11,6 +11,8 @@ func TestResolveStrategy(t *testing.T) {
 		"garbage":        "best-effort", // unknown → lenient best-effort (matches Execute default)
 		"ipmi":           "ipmi",
 		"IPMI":           "ipmi",
+		"redfish":        "redfish",
+		"Redfish":        "redfish",
 		"ssh":            "ssh",
 		"manual":         "manual",
 		"watchdog":       "watchdog",

@@ -97,7 +97,10 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	}
 	owner := pitOwner(vm, d)
 	activity := s.domainActivity(vm)
-	a := pitoverlay.Assess(disk, owner, false)
+	// The full verdict on every host (P3): below the pit_overlay feature the
+	// advice also says why nothing was settled automatically, and the admin
+	// may still act on the verdict.
+	a := pitoverlay.AssessAt(s.PITOverlayFeature, disk, owner, false)
 	resp.Verdict, resp.VerdictReason = string(a.Verdict), a.Reason
 	resp.Current, resp.BackingFile, resp.OverlayCurrent = a.Current, a.Backing, a.OverlayCurrent
 	resp.IfCommit, resp.IfDiscard = a.Consequences()
@@ -128,6 +131,15 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	case "commit":
 		safe := a.Verdict == pitoverlay.Matches || a.Verdict == pitoverlay.HalfWritten
 		if !safe && req.GetForceCommit() && mergedAlready && !req.GetOverwriteNewerWrites() {
+			if a.Verdict != pitoverlay.Pivoted {
+				// A committed binding whose overlay was written since (a VM
+				// ran on it after the commit): both files hold writes the
+				// other lacks, and a discard is no free way out either (P8).
+				s.audit(ctx, "vm.pit_overlay.commit", vm.Name, fmt.Sprintf("%s → %s: forced commit refused, the overlay was committed and written since (verdict %s)", resp.Overlay, disk, a.Verdict), "denied")
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"forced commit refused: the overlay was committed into %s once and has been written since (%s), so the disk and the overlay each hold writes the other lacks. Committing it again writes its blocks over the guest's writes to the disk since the commit; discarding it (--discard --accept-torn-disk --confirm) loses the overlay's newer writes. Decide which to keep; only --overwrite-newer-writes, with --force-commit, commits",
+					disk, a.Reason)
+			}
 			s.audit(ctx, "vm.pit_overlay.commit", vm.Name, fmt.Sprintf("%s → %s: forced commit refused, the overlay is already in the disk (verdict %s)", resp.Overlay, disk, a.Verdict), "denied")
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"forced commit refused: the overlay is already in the disk (verdict %s), so committing it again writes the window's old blocks over everything the guest has written to %s since — a silent rollback of part of the disk. Discard it instead (--discard --confirm). Only --overwrite-newer-writes, with --force-commit, overrides this",

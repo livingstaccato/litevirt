@@ -112,6 +112,9 @@ type Reconciler struct {
 	settleVerify SettleVerifier
 	pitReport    func(ctx context.Context, vm, disk, detail string)
 	pitCleared   func(ctx context.Context, vm, disk string)
+	// pitFeature is this host's pit_overlay release-feature gate
+	// (SetPITOverlayFeature); nil is closed: overlays are held, never settled.
+	pitFeature pitoverlay.Gate
 	// pitHeldReported: the holds already reported when no reporter is wired
 	// (reportPITHeld).
 	pitHeldReported sync.Map
@@ -1757,6 +1760,11 @@ func (r *Reconciler) SetPITOverlayReporter(held func(ctx context.Context, vm, di
 	r.pitReport, r.pitCleared = held, cleared
 }
 
+// SetPITOverlayFeature wires this host's pit_overlay release-feature gate
+// (grpcapi.Server.PITOverlayFeature). Below it the define path settles no
+// overlay: a VM with one is held. Unwired, it is closed.
+func (r *Reconciler) SetPITOverlayFeature(g pitoverlay.Gate) { r.pitFeature = g }
+
 // settlePITOverlays settles each disk's point-in-time copy overlay
 // (pitoverlay) before the domain is defined on the disk: a copy whose commit
 // failed, or whose host died mid-window, left the guest's newest writes in it
@@ -1772,10 +1780,10 @@ func (r *Reconciler) SetPITOverlayReporter(held func(ctx context.Context, vm, di
 func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
 	for _, dc := range diskConfigs {
 		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
-		out, err := pitoverlay.Settle(ctx, dc.Path, owner)
+		out, err := pitoverlay.Settle(ctx, r.pitFeature, dc.Path, owner)
 		switch {
 		case out == pitoverlay.Held:
-			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.Assess(dc.Path, owner, false))
+			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.AssessAt(r.pitFeature, dc.Path, owner, false))
 			r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
 			return detail
 		case err != nil:

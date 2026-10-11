@@ -237,10 +237,16 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		writerAlive("layer 2", "l2")
 		stopWriter("l2")
 		if strings.Contains(out, "pit_overlay") {
-			// Layer 2 waits for the pit_overlay release feature (round 5,
-			// I3): until this build holds it, the copy takes the existing
-			// path, marked, and no overlay is ever made.
-			l.mark("layer 2 is gated on the pit_overlay release feature; the copy took the last layer")
+			// Layer 2 waits for the pit_overlay release feature: until the
+			// release token has latched, the copy takes the existing path,
+			// marked, and no overlay is ever made. Once it has latched the
+			// gate is open and this leg must take layer 2 (P10 of the #256
+			// re-review 5): a gated outcome is then a failure.
+			status := l.mustLV(h, "cluster", "upgrade-status")
+			if releaseTokenLatched(status) {
+				t.Errorf("layer 2 was gated on pit_overlay although the release token has latched:\n%s\n%s", out, status)
+			}
+			l.mark("layer 2 is gated on the pit_overlay release feature (release token not latched); the copy took the last layer")
 			if !strings.Contains(out, "NOT point-in-time") || l.fileExists(h, overlay) {
 				t.Errorf("a gated layer 2 made an overlay or an unmarked copy:\n%s", out)
 			}
@@ -337,4 +343,16 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		t.Errorf("the scheduled replica is recorded as not point-in-time: %s", rec)
 	}
 	requirePointInTime("scheduled replication", replica)
+}
+
+// releaseTokenLatched reports whether `lv cluster upgrade-status` lists the
+// release token among the tokens latched durably on the host it asked.
+func releaseTokenLatched(status string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && strings.HasPrefix(f[0], "release_") && f[1] == "yes" {
+			return true
+		}
+	}
+	return false
 }

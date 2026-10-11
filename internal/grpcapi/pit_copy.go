@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -113,11 +114,13 @@ func (s *Server) copyVMDiskConsistent(ctx context.Context, vm *corrosion.VMRecor
 	var why []string
 	err := s.copyViaBackupSession(ctx, vm, d, dst, emit)
 	if err == nil {
+		s.notPITNotified.Delete(s.notPITKey(vm, d)) // the next copy that is not point-in-time is news again
 		return copyResult{method: copyBackupSession}, nil
 	}
 	why = append(why, "backup session: "+err.Error())
 	m, err := s.copyViaExternalSnapshot(ctx, vm, d, dst, emit)
 	if err == nil {
+		s.notPITNotified.Delete(s.notPITKey(vm, d))
 		return copyResult{method: m}, nil
 	}
 	why = append(why, "external snapshot: "+err.Error())
@@ -266,10 +269,16 @@ const pitDiskFormat = "qcow2"
 func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) (copyMethod, error) {
 	// No overlay before every host serving the pool understands one: an
 	// older build would start the VM on the bare disk and drop the
-	// window's writes. Until then the copy takes the existing path.
-	if open, why := pitoverlay.FeatureOpen(); !open {
-		return "", errors.New(why)
+	// window's writes. Until the release token has latched here the copy
+	// takes the existing path. This is the local read (no Ping): a copy
+	// that falls back must not pay the gate's refusal, which names every
+	// lagging host (release-token "How to switch", round 4).
+	if !s.ReleaseFeatureAvailable(capabilities.FeaturePITOverlay) {
+		return "", errors.New(pitFeatureClosed)
 	}
+	// The cheap local refusals come before the grant: one taken for a copy
+	// that cannot make an overlay would mark the feature used — blocking a
+	// rollback below the release — with no overlay ever made.
 	if s.pitSnapshotter == nil {
 		return "", errors.New("no snapshotter on this host")
 	}
@@ -280,19 +289,29 @@ func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRe
 	if err := pitoverlay.Placement(disk); err != nil {
 		return "", fmt.Errorf("no overlay is placed here: %w", err)
 	}
-	win, err := pitoverlay.OpenWindow(disk)
-	if err != nil {
+	overlay := pitOverlayPath(d.Path)
+	var (
+		win      pitoverlay.Window
+		quiesced bool
+		snapErr  error
+	)
+	// The window token and the overlay are the feature's data: written only
+	// under the release gate, which records the use (acknowledged by every
+	// replication recipient) before the first one exists anywhere.
+	if err := s.WithReleaseFeature(ctx, capabilities.FeaturePITOverlay, func(_ context.Context, g capabilities.FeatureGrant) error {
+		var err error
+		win, quiesced, snapErr, err = s.openPITWindow(g, vm, d, disk, overlay)
+		return err
+	}); err != nil {
 		return "", err
 	}
-	overlay := pitOverlayPath(d.Path)
-	quiesced, err := s.pitSnapshotter.SnapshotDiskExternal(vm.Name, d.Path, overlay)
-	if err != nil {
+	if snapErr != nil {
 		// Atomic: the domain is still on its disk. A file the failed
 		// snapshot left behind is settled — committed, never just deleted.
 		if herr := s.healPITOverlay(ctx, vm, d); herr != nil {
-			return "", fmt.Errorf("snapshot: %v; and its overlay: %w", err, herr)
+			return "", fmt.Errorf("snapshot: %v; and its overlay: %w", snapErr, herr)
 		}
-		return "", fmt.Errorf("snapshot: %w", err)
+		return "", fmt.Errorf("snapshot: %w", snapErr)
 	}
 	// The disk's own file is frozen now: guest writes go to the overlay.
 	// Bind the overlay to this very file, so it is never committed into
@@ -318,6 +337,39 @@ func (s *Server) copyViaExternalSnapshot(ctx context.Context, vm *corrosion.VMRe
 		return copyExternalSnapshotQuiesced, nil
 	}
 	return copyExternalSnapshot, nil
+}
+
+// pitFeatureClosed is why layer 2 is skipped below the pit_overlay release
+// feature: the release gate's own refusal text, without the lagging hosts
+// (naming them takes a Ping of each).
+var pitFeatureClosed = "the cluster upgrade must finish first (" + string(capabilities.FeaturePITOverlay) + " needs " + featureToken(capabilities.FeaturePITOverlay) + ")"
+
+// PITOverlayFeature is this host's pit_overlay gate (pitoverlay.Gate): open
+// once the release token has durably latched here (ReleaseFeatureAvailable, a
+// local read). Below it no overlay is made, and none found is settled
+// automatically: the VM is held. The daemon wires the reconciler's define
+// path to it too.
+func (s *Server) PITOverlayFeature() (bool, string) {
+	if s.ReleaseFeatureAvailable(capabilities.FeaturePITOverlay) {
+		return true, ""
+	}
+	return false, pitFeatureClosed
+}
+
+// openPITWindow writes the pit_overlay feature's data for one copy: the
+// window token on the base (pitoverlay.OpenWindow) and the overlay the
+// external snapshot creates. g is the feature's grant. snapErr is the
+// snapshot's own failure, which the caller settles; err refuses before
+// anything was written.
+func (s *Server) openPITWindow(g capabilities.FeatureGrant, vm *corrosion.VMRecord, d *corrosion.DiskRecord, disk, overlay string) (win pitoverlay.Window, quiesced bool, snapErr, err error) {
+	if err := g.Check(capabilities.FeaturePITOverlay); err != nil {
+		return win, false, nil, err
+	}
+	if win, err = pitoverlay.OpenWindow(g, disk); err != nil {
+		return win, false, nil, err
+	}
+	quiesced, snapErr = s.pitSnapshotter.SnapshotDiskExternal(vm.Name, d.Path, overlay)
+	return win, quiesced, snapErr, nil
 }
 
 // commitPITOverlay live-commits overlay back into d — the domain is active
@@ -426,15 +478,20 @@ func (s *Server) reportStrandedOverlay(ctx context.Context, vm *corrosion.VMReco
 func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord) error {
 	disk := s.hostDiskFile(d.Path)
 	if !pitoverlay.Present(disk) {
-		s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+		// Only a disk this host sees clears a hold: on a host where the
+		// shared pool is not mounted, "no overlay" says nothing (P7).
+		if _, err := os.Stat(disk); err == nil {
+			s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+		}
 		return nil
 	}
 	overlay := pitOverlayPath(d.Path)
 	owner := pitOwner(vm, d)
-	if open, _ := pitoverlay.FeatureOpen(); !open {
+	if open, _ := s.PITOverlayFeature(); !open {
 		// Below the pit_overlay feature this host settles no overlay — not
-		// even live: one present was made by a host above it. Held.
-		return s.holdPITOverlay(ctx, vm, d, pitoverlay.Assess(disk, owner, false))
+		// even live: one present was made by a host above it. Held, with
+		// the full verdict for the admin.
+		return s.holdPITOverlay(ctx, vm, d, pitoverlay.AssessAt(s.PITOverlayFeature, disk, owner, false))
 	}
 	committed := fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path)
 	switch s.domainActivity(vm) {
@@ -837,12 +894,25 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 	}
 }
 
-// reportNotPointInTime is the event and notification every layer-3 copy
-// gets. what names the copy ("replica <file> in <pool>").
+func (s *Server) notPITKey(vm *corrosion.VMRecord, d *corrosion.DiskRecord) string {
+	return vm.Name + "\x00" + d.DiskName
+}
+
+// reportNotPointInTime is the event every layer-3 copy gets, and its
+// notification: once per disk, then at most once a day while its copies stay
+// not point-in-time (P9 of the #256 re-review 5) — an hourly schedule would
+// otherwise notify 24 times a day. what names the copy ("replica <file> in
+// <pool>").
 func (s *Server) reportNotPointInTime(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, what, why string) {
 	detail := fmt.Sprintf("%s: %s is NOT point-in-time — no backup session or external snapshot could be made of the %s disk (%s), so it was copied with qemu-img convert -U and may be inconsistent. Automatic promotion will not use it while a point-in-time replica exists, and manual promotion asks for --accept-not-point-in-time",
 		d.DiskName, what, vm.State, why)
 	s.recordVMEventSeverity(ctx, vm.Name, "disk.replica_not_point_in_time", "warning", "warn", detail)
+	key := s.notPITKey(vm, d)
+	now := time.Now()
+	if last, ok := s.notPITNotified.Load(key); ok && now.Sub(last.(time.Time)) < pitHoldRenotify {
+		return
+	}
+	s.notPITNotified.Store(key, now)
 	s.notify(ctx, notify.Notification{
 		Kind: "replication.not_point_in_time", Severity: notify.SevWarn, Subject: vm.Name, Detail: detail,
 	})

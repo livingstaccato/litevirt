@@ -62,6 +62,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -155,34 +156,24 @@ var CommitMargin = 2 * time.Minute
 // settled by this one.
 const bindingFormat = 1
 
-// featureGate says whether this host holds the pit_overlay release feature:
-// the cluster-wide promise that every host serving these pools understands
-// overlays. Below it, this build makes no overlay (layer 2 is skipped) and
-// settles none it finds: an overlay present then was made by a host above
-// it, and the VM is held rather than started on its disk. It fails closed
-// until the release token (feat/release-token) is wired here.
-var featureGate = func() (bool, string) {
-	return false, "this build does not hold the pit_overlay release feature (the release token is not wired yet)"
-}
+// Gate says whether this host holds the pit_overlay release feature
+// (capabilities.FeaturePITOverlay), and why not: the cluster-wide promise that
+// every host serving these pools understands overlays. It is the host's own,
+// local read of its release-token latch (grpcapi.Server.PITOverlayFeature);
+// a nil Gate is closed. Below it this build makes no overlay (layer 2 is
+// skipped: a new window needs a FeatureGrant, OpenWindow) and settles none it
+// finds automatically (Settle, and grpcapi's heal): an overlay present then was
+// made by a host above it, and the VM is held rather than started on its
+// disk. An admin's explicit lv resolve-pit-overlay still sees the full
+// verdict and may act on it.
+type Gate func() (open bool, why string)
 
-// FeatureOpen reports whether this host holds the pit_overlay release
-// feature, and why not.
-func FeatureOpen() (bool, string) { return featureGate() }
-
-// OpenFeatureForTest opens the pit_overlay feature for a test suite. Call it
-// from TestMain only.
-func OpenFeatureForTest() { featureGate = func() (bool, string) { return true, "" } }
-
-// SetFeatureForTest opens or closes it for one test and returns the restore.
-func SetFeatureForTest(open bool) (restore func()) {
-	prev := featureGate
-	featureGate = func() (bool, string) {
-		if open {
-			return true, ""
-		}
-		return false, "the pit_overlay release feature is closed (test)"
+// Open reports whether g is open; a nil Gate is closed.
+func (g Gate) Open() (bool, string) {
+	if g == nil {
+		return false, "this host has no release-feature gate for pit_overlay"
 	}
-	return func() { featureGate = prev }
+	return g()
 }
 
 // identity is the base file's identity. A variable so a test can model a
@@ -223,10 +214,21 @@ type Window struct {
 }
 
 // OpenWindow writes a new random token into disk's xattr, durably, and reads
-// it back. Call it BEFORE the snapshot opens the window. A filesystem without
-// user xattrs gives a Window with NoXattr; any other failure is an error, and
-// no window may be opened.
-func OpenWindow(disk string) (Window, error) {
+// it back: the first write of a new window, so of the pit_overlay feature's
+// data, and it takes the feature's grant (capabilities.FeaturePITOverlay,
+// from grpcapi.Server.WithReleaseFeature). Call it BEFORE the snapshot opens
+// the window. A filesystem without user xattrs gives a Window with NoXattr;
+// any other failure is an error, and no window may be opened.
+func OpenWindow(g capabilities.FeatureGrant, disk string) (Window, error) {
+	if err := g.Check(capabilities.FeaturePITOverlay); err != nil {
+		return Window{}, err
+	}
+	return writeWindowToken(disk)
+}
+
+// writeWindowToken is OpenWindow's write, for a new window and for a rebind
+// of an overlay that already exists (Bind).
+func writeWindowToken(disk string) (Window, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return Window{}, err
@@ -268,9 +270,10 @@ func BindWindow(disk string, owner Owner, w Window) error {
 }
 
 // Bind opens a new window token on disk and binds its overlay to it: for an
-// overlay found unbound while the domain runs on it (the base is frozen).
+// overlay found unbound while the domain runs on it (the base is frozen). It
+// opens no window — the overlay already exists — so it takes no grant.
 func Bind(disk string, owner Owner) error {
-	w, err := OpenWindow(disk)
+	w, err := writeWindowToken(disk)
 	if err != nil {
 		return err
 	}
@@ -491,8 +494,11 @@ type Assessment struct {
 	// PivotUncertain: a pivot was under way and, with the VM off, whether it
 	// landed is told only by the two files' times (HoldAdvice).
 	PivotUncertain bool
-	// BelowFeature: this host does not hold the pit_overlay release feature.
+	// BelowFeature: this host does not hold the pit_overlay release feature
+	// (Gate), so it settles nothing automatically; the verdict is still the
+	// full one, for the admin (BelowWhy says why the gate is closed).
 	BelowFeature bool
+	BelowWhy     string
 	// DiskMtimeNs and OverlayMtimeNs are both files' modification times now
 	// (one clock: the filesystem's), and OverlayCurrent says so in words.
 	DiskMtimeNs    int64
@@ -506,9 +512,22 @@ func (a *Assessment) unknown(format string, args ...any) Assessment {
 	return *a
 }
 
-// Assess judges disk's overlay against owner and the disk file as it is now.
-// liveOnDisk says the caller saw the domain RUNNING on the disk itself, not
-// on the overlay: a pivot recorded as under way then landed.
+// AssessAt is Assess on a host whose pit_overlay gate is g: the same verdict,
+// marked BelowFeature when g is closed, so the hold's advice says why nothing
+// was settled automatically.
+func AssessAt(g Gate, disk string, owner Owner, liveOnDisk bool) Assessment {
+	a := Assess(disk, owner, liveOnDisk)
+	if open, why := g.Open(); !open {
+		a.BelowFeature, a.BelowWhy = true, why
+	}
+	return a
+}
+
+// Assess judges disk's overlay against owner and the disk file as it is now,
+// whatever this host's pit_overlay gate says (AssessAt marks that): an admin
+// deciding a hold needs the verdict on every host. liveOnDisk says the caller
+// saw the domain RUNNING on the disk itself, not on the overlay: a pivot
+// recorded as under way then landed.
 func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 	var a Assessment
 	ov := Path(disk)
@@ -523,18 +542,10 @@ func Assess(disk string, owner Owner, liveOnDisk bool) Assessment {
 	a.OverlayCurrent = fmt.Sprintf("%d bytes, modified %s", fi.Size(), time.Unix(0, a.OverlayMtimeNs).UTC().Format(time.RFC3339Nano))
 	b, err := readBinding(disk)
 	if err != nil {
-		if open, why := FeatureOpen(); !open {
-			a.BelowFeature = true
-			return a.unknown("%s; this host settles no overlay", why)
-		}
 		return a.unknown("no readable binding (%v)", err)
 	}
 	a.Binding = &b
 	a.CommitBegan = b.CommitStartedNs != 0 || b.State == StateCommitting || b.State == StatePivoting || b.State == StateCommitted
-	if open, why := FeatureOpen(); !open {
-		a.BelowFeature = true
-		return a.unknown("%s; this host settles no overlay", why)
-	}
 	if b.Format > bindingFormat {
 		return a.unknown("its binding was written by a newer build (format %d; this build knows %d)", b.Format, bindingFormat)
 	}
@@ -768,6 +779,14 @@ func ForceCommit(ctx context.Context, disk string) error {
 	err := commitInto(ctx, disk)
 	stop()
 	if err != nil {
+		// As every failed attempt does: the disk as it left it, so a later
+		// assessment does not take an overwrite within the keep-alive bound
+		// for this attempt's half-written disk.
+		if Bound(disk) {
+			if eerr := RecordAttemptEnd(disk); eerr != nil {
+				return fmt.Errorf("%v; and record its end: %v", err, eerr)
+			}
+		}
 		return err
 	}
 	return Remove(disk)
@@ -807,6 +826,31 @@ func SetAside(disk, stamp string) (string, error) {
 	return to, nil
 }
 
+// PutBack undoes SetAside: the overlay set aside as to (and its binding) is
+// renamed back to disk's overlay, never over one that is there now.
+//
+// A binding that never moved (SetAside renamed the overlay and then failed on
+// its binding) is left where it is.
+func PutBack(disk, to string) error {
+	if _, err := os.Lstat(Path(disk)); err == nil {
+		return fmt.Errorf("%s exists: %s stays set aside", Path(disk), to)
+	}
+	_, aerr := os.Lstat(to + ".id")
+	bindingAside := aerr == nil
+	if bindingAside {
+		if _, err := os.Lstat(SidecarPath(disk)); err == nil {
+			return fmt.Errorf("%s exists: %s stays set aside", SidecarPath(disk), to)
+		}
+	}
+	if err := os.Rename(to, Path(disk)); err != nil {
+		return err
+	}
+	if bindingAside {
+		return os.Rename(to+".id", SidecarPath(disk))
+	}
+	return nil
+}
+
 // Outcome is what Settle did.
 type Outcome int
 
@@ -822,7 +866,16 @@ const (
 // ErrNotOurs with the reason): the caller must not start or define the VM on
 // the bare disk. For a caller about to define the disk from its record (so
 // no definition names the overlay).
-func Settle(ctx context.Context, disk string, owner Owner) (Outcome, error) {
+//
+// Below the pit_overlay feature (g closed) nothing is committed or removed:
+// an overlay present is Held, whatever its verdict.
+func Settle(ctx context.Context, g Gate, disk string, owner Owner) (Outcome, error) {
+	if _, err := os.Lstat(Path(disk)); errors.Is(err, fs.ErrNotExist) {
+		return None, nil
+	}
+	if open, why := g.Open(); !open {
+		return Held, fmt.Errorf("%s: %w (%s; this host settles no overlay)", Path(disk), ErrNotOurs, why)
+	}
 	had, err := CommitOffline(ctx, disk, owner)
 	switch {
 	case !had:
@@ -885,6 +938,13 @@ func Placement(disk string) error {
 // assessment: never a blind "commit".
 func HoldAdvice(vm, diskName string, a Assessment) string {
 	cmd := fmt.Sprintf("lv resolve-pit-overlay %s %s", vm, diskName)
+	if a.BelowFeature {
+		// The full verdict's advice, after why nothing was settled
+		// automatically (P3 of the #256 re-review 5).
+		b := a
+		b.BelowFeature = false
+		return fmt.Sprintf("This host settles no overlay by itself (%s): that waits for the release token to latch on every host (`lv cluster upgrade-status`). To decide now: %s", a.BelowWhy, HoldAdvice(vm, diskName, b))
+	}
 	switch a.Verdict {
 	case Matches:
 		return fmt.Sprintf("The disk is the file the overlay was taken of, unchanged: commit it (`%s --commit --confirm`).", cmd)
@@ -892,9 +952,6 @@ func HoldAdvice(vm, diskName string, a Assessment) string {
 		return fmt.Sprintf("A commit into the disk was cut short, so the disk is partly written and only the commit makes it whole: commit it (`%s --commit --confirm`).", cmd)
 	case Pivoted:
 		return fmt.Sprintf("The overlay's writes are already in the disk: discard it (`%s --discard --confirm`); a second commit would overwrite newer writes.", cmd)
-	}
-	if a.BelowFeature {
-		return fmt.Sprintf("This host does not hold the pit_overlay release feature, so it settles no overlay and starts no VM on a disk that has one: upgrade it, or let an upgraded host start the VM. See the verdict with `%s` (no --confirm).", cmd)
 	}
 	if a.PivotUncertain {
 		if a.DiskMtimeNs > a.OverlayMtimeNs {
@@ -914,8 +971,12 @@ func HoldAdvice(vm, diskName string, a Assessment) string {
 // HoldDetail is the event, notification and inspect text of a VM held on an
 // overlay with this assessment.
 func HoldDetail(vm, diskName, disk string, a Assessment) string {
-	return fmt.Sprintf("%s: the point-in-time overlay %s may hold %s's newest writes and cannot be verified against its disk %s (verdict %s: %s). The VM is held — not started on the bare disk — until an admin decides. %s",
-		diskName, Path(disk), vm, disk, a.Verdict, a.Reason, HoldAdvice(vm, diskName, a))
+	why := fmt.Sprintf("cannot be verified against its disk %s (verdict %s: %s)", disk, a.Verdict, a.Reason)
+	if a.BelowFeature && a.Verdict != Unknown {
+		why = fmt.Sprintf("is not settled automatically on this host, which does not hold the pit_overlay release feature (verdict %s against its disk %s)", a.Verdict, disk)
+	}
+	return fmt.Sprintf("%s: the point-in-time overlay %s may hold %s's newest writes and %s. The VM is held — not started on the bare disk — until an admin decides. %s",
+		diskName, Path(disk), vm, why, HoldAdvice(vm, diskName, a))
 }
 
 // Consequences says what each admin action would do with this assessment,

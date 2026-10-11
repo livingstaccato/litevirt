@@ -231,7 +231,7 @@ func f() {
 // change, after which the feature must list them.
 var writersPending = map[Feature]bool{
 	"backup_zstd": true, "firewall_ipv6": true,
-	"nic_guards": true, "pit_overlay": true,
+	"nic_guards":     true,
 	"vm_disk_nic_io": true, "vm_limits": true,
 }
 

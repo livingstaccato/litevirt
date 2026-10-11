@@ -251,9 +251,15 @@ by the strongest method the host has, tried in this order:
 3. **External snapshot:** only on a host that holds the `pit_overlay`
    release feature — the cluster-wide promise that every host serving the
    pool understands the overlay this step leaves (see "Older builds" below).
-   This build does not hold it yet: it arrives with the release token, so
-   until then this step is skipped and the copy goes on to step 4, exactly as
-   before. When no session opens (an older libvirt, a failed
+   It is a feature of the release token `release_2026_11_v1`
+   ([upgrades.md](upgrades.md)): until that token has latched on every host
+   this step is skipped and the copy goes on to step 4, exactly as before,
+   with no refusal and nothing recorded. The first overlay after the latch
+   records that `pit_overlay` is used — a replicated row every host must hold
+   before the overlay is made — and from then on a rollback below the release
+   quarantines (`lv cluster upgrade-status` lists it). A copy that could not
+   make an overlay here anyway (no running domain, a disk on tmpfs or a block
+   device) records nothing. When no session opens (an older libvirt, a failed
    job), and only for a VM libvirt reports running or paused, an external
    disk-only snapshot moves the guest's writes onto an overlay — quiesced
    through the guest agent when one answers, otherwise crash-consistent — the
@@ -295,8 +301,13 @@ by the strongest method the host has, tried in this order:
    record cannot be written, the step it records does not happen: no commit
    starts, no pivot is made, and the window stays open, reported, and is
    retried. All the times compared are the filesystem's own (the disk's and
-   the sidecar's modification times), so a server clock that disagrees with
-   the hosts' does not matter. If the commit fails, the VM keeps
+   the sidecar's modification times). On a local filesystem and on NFS, where
+   the server sets both, a server clock that disagrees with the hosts' does
+   not matter. On a cluster filesystem whose clients set file times (CephFS,
+   GFS2, OCFS2) a client's clock goes into them: there, keep the hosts' clocks
+   within a minute of each other, because the twelve-minute bound below is
+   only as good as the agreement between the host that recorded a commit and
+   the one that later writes the disk. If the commit fails, the VM keeps
    running on the overlay and a `disk.pit_overlay_stranded` event and a
    `replication.pit_overlay_stranded` notification say so.
 
@@ -340,7 +351,8 @@ by the strongest method the host has, tried in this order:
    and a `replication.pit_overlay_held` notification name both files, the
    verdict and what to do for it — once when the hold begins, then at most
    daily. It resolves by itself once a later settle can commit the overlay or
-   finds it merged, or when the disk is deleted.
+   finds it merged, or when the disk is deleted. Only a host that sees the
+   disk resolves it: one where a shared pool is not mounted leaves it open.
 
    An admin decides with `lv resolve-pit-overlay <vm> <disk>`, which is admin
    only and audited. Without `--confirm` it does nothing, and answers even
@@ -362,7 +374,10 @@ by the strongest method the host has, tried in this order:
      its old blocks over everything the guest wrote since. Only
      `--overwrite-newer-writes` overrides that; `lv` prints the consequence
      and, without the flag, asks for a typed `yes` on a terminal before it
-     sends anything.
+     sends anything. A committed overlay that has been written since (a VM
+     ran on it after the commit) is refused the same way, but neither file is
+     then the whole story: the disk and the overlay each hold writes the
+     other lacks, and a discard needs `--accept-torn-disk`.
    - `--discard --confirm` deletes the overlay and its writes. Of a disk a
      commit had begun writing (half-written, or unknown after a commit began)
      it is refused unless `--accept-torn-disk` is given: without the overlay
@@ -372,7 +387,10 @@ by the strongest method the host has, tried in this order:
      still beside it is not mistaken for the disk (the end record catches it),
      but the VM stays held. `lv backup restore-from --in-place` does both: an
      overlay that holds the VM is set aside (kept, as
-     `.<disk file>.lv-pit.orphan-<time>`) before the restore writes the disk.
+     `.<disk file>.lv-pit.orphan-<time>`) when the restored image is ready to
+     be placed over the disk, and the hold clears once it is. A restore that
+     fails before then (a missing chunk, a cancel) leaves the overlay where it
+     is and the VM held; one whose placement fails puts the overlay back.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes
@@ -389,8 +407,10 @@ by the strongest method the host has, tried in this order:
    open. That copy is **not point-in-time** (it is smeared over however long it
    ran, and a guest restored from it may need repair). It is still made, but
    the replica's record says `not_point_in_time`, a
-   `disk.replica_not_point_in_time` event and a `replication.not_point_in_time`
-   notification name the reason, and the scheduler retries a point-in-time copy
+   `disk.replica_not_point_in_time` event names the reason on every such copy,
+   and a `replication.not_point_in_time` notification once per disk — again at
+   most daily while its copies stay not point-in-time, and afresh after a
+   point-in-time copy of it — and the scheduler retries a point-in-time copy
    at its next tick (a minute later, not a full interval). That retry makes a
    point-in-time copy or nothing; the schedule's own next run may make another
    `-U` copy if the cause persists.
@@ -563,17 +583,27 @@ recorded (local and replicated) the next time it rewrites those records.
 nothing of overlays: one that started a VM whose window was open would start
 it on the bare disk and drop the window's writes. So no overlay is made until
 every host serving the pool holds the `pit_overlay` release feature: until
-then the external-snapshot step is skipped (this build fails that gate closed
-until the release token is wired), which refuses nothing earlier builds did.
-A host below the feature — this build included, until it holds it — settles
-no overlay it finds, not even one it could verify: it holds the VM (the
-`pit_overlay.held` condition says why) rather than start it on that disk, and
-a binding written by a newer build than itself is never settled either.
-Before rolling a host back to a build OLDER than this one, settle every
-overlay on the pools it serves: `find <pool dir> -name '.*.lv-pit'` must find
-none (start or replicate each VM on an upgraded host, or resolve it with
-`lv resolve-pit-overlay`), because such a build has no hold and would start
-the VM on the bare disk. An older build shows the `pit_overlay.held`
+then the external-snapshot step is skipped, which refuses nothing earlier
+builds did. A host below the feature — one whose release token has not
+latched yet — settles no overlay it finds automatically, not even one it
+could verify: it holds the VM (the `pit_overlay.held` condition says why, and
+gives the full verdict) rather than start it on that disk, and a binding
+written by a newer build than itself is never settled either. An admin can
+still decide such a hold with `lv resolve-pit-overlay` on its verdict.
+
+Once `pit_overlay` is used, a rollback below the release quarantines that
+host (WAL quarantine: it emits no replicated writes), and every rollback to a
+build older than `release_2026_11_v1` quarantines anyway. Peers then record
+it as isolated, and the failover coordinator does not restart a VM on an
+isolated host while `pit_overlay` is in use, so a VM whose host died mid
+window is restarted on an upgraded host, which commits the overlay first.
+That isolation is recorded within a few health cycles of the rollback, not
+at once, so before rolling a host back, settle every overlay on the disks it
+can see — every pool directory, and the data directory's `disks/` — and keep
+it drained: `find <dir> -name '.*.lv-pit'` must find none (start or replicate
+each VM on an upgraded host, or resolve it with `lv resolve-pit-overlay`),
+because such a build has no hold of its own and would start a VM it still
+owns on the bare disk. An older build shows the `pit_overlay.held`
 condition in `lv health` like any other, but never raises or resolves it, and
 an `lv` older than the daemon has none of `--force-commit`,
 `--accept-torn-disk` or `--overwrite-newer-writes`: upgrade it to resolve a

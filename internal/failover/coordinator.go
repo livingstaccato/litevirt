@@ -3111,7 +3111,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// and the operator (or the next placement input change) recovers them;
 		// hard constraints that no surviving host satisfies must strand the
 		// workload, not relocate it somewhere it was never allowed to run.
-		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem,
+		if selected, err := placement.SelectBatch(c.pitOverlaySafeTargets(ctx, candidates), allVMs, nil, ctMem,
 			observations, c.now(), placementReqs); err != nil {
 			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
 				"host", h.Name, "error", err)
@@ -3784,6 +3784,33 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 		}
 	}
 	return out, nil
+}
+
+// pitOverlaySafeTargets is candidates without the hosts a VM must not be
+// restarted on once the pit_overlay release feature is in use (P2 of the
+// #256 re-review 5). A host recorded as isolated — rolled back below a latched
+// token and WAL-quarantined, or isolated by an operator — may run a build that
+// knows nothing of point-in-time overlays: it would define the VM on the bare
+// disk and drop the writes an overlay on a shared pool still holds. Before the
+// feature is used no overlay exists, and nothing is filtered: recovery is
+// exactly as it was. Containers keep the full list (they have no overlays).
+func (c *Coordinator) pitOverlaySafeTargets(ctx context.Context, candidates []corrosion.HostRecord) []corrosion.HostRecord {
+	info, _ := capabilities.LookupFeature(capabilities.FeaturePITOverlay)
+	used, err := corrosion.ReleaseFeatureUsed(ctx, c.db, info.Token, string(capabilities.FeaturePITOverlay))
+	if err == nil && !used {
+		return candidates
+	}
+	out := make([]corrosion.HostRecord, 0, len(candidates))
+	for _, h := range candidates {
+		epoch, reason, ierr := corrosion.HostIsolation(ctx, c.db, h.Name)
+		if ierr == nil && epoch == 0 {
+			out = append(out, h)
+			continue
+		}
+		slog.Warn("failover: not restarting VMs on an isolated host while point-in-time overlays are in use; it may not understand them",
+			"host", h.Name, "isolation_reason", reason, "error", ierr)
+	}
+	return out
 }
 
 // holdsDown reports whether a VM whose automatic promotion was held stays

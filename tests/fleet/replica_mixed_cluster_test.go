@@ -52,6 +52,10 @@ func mainCoordinatorChoice(t *testing.T, cl pb.LiteVirtClient, pool, host, vm, d
 
 func TestFleet_AMainBuildCoordinatorPromotesTheNewestReplica(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replica is point-in-time (an external-snapshot overlay; the fleet
+	// has no backup sessions).
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	vmHost, replicaHost, mainHost := c.Node("node-0"), c.Node("node-1"), c.Node("node-2")
 	// node-2 is on main's build: no replica area, so no ListReplicas.

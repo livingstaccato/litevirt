@@ -226,11 +226,15 @@ func replicaRecordsOf(t *testing.T, dir, vm string) []replicaRecord {
 }
 
 // pitServer is a server with a running VM "web" whose root disk is a real
-// qcow2, and a replica pool "dr".
+// qcow2, and a replica pool "dr", on a host that holds the pit_overlay
+// release feature.
 func pitServer(t *testing.T) (*Server, string, string) {
 	t.Helper()
 	s := testServer(t)
 	s.dataDir = t.TempDir()
+	// The pit_overlay release feature is open here (the release token has
+	// latched); the tests of the closed gate wire their own.
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, grant: true})
 	dir := seedReplicationVM(t, s, "web", "running")
 	fake := libvirtfake.New()
 	fake.SetState("web", libvirtfake.StateRunning)

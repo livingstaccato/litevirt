@@ -12,6 +12,5 @@ import (
 // (pitoverlay.Placement).
 func TestMain(m *testing.M) {
 	pitoverlay.AllowVolatileForTest()
-	pitoverlay.OpenFeatureForTest()
 	os.Exit(m.Run())
 }

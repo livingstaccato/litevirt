@@ -67,7 +67,7 @@ func readDisk(t *testing.T, disk string) []byte {
 func TestSettle_KeepsTheWindowsWrites(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle = %v, %v", out, err)
 	}
 	if Present(disk) {
@@ -90,7 +90,7 @@ func TestSettle_NeverDeletesAnOverlayItCannotCommit(t *testing.T) {
 		return exec.CommandContext(ctx, "false")
 	}
 	defer func() { Command = prev }()
-	if _, err := Settle(context.Background(), disk, owner); err == nil {
+	if _, err := Settle(context.Background(), openGate, disk, owner); err == nil {
 		t.Fatal("a failed commit reported success")
 	}
 	if !Present(disk) {
@@ -113,7 +113,7 @@ func TestSettle_ACrashMidCommitIsFinishedByTheNextSettle(t *testing.T) {
 	if !Present(disk) {
 		t.Fatal("CommitOffline removed the overlay; only Remove may")
 	}
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("the next Settle = %v, %v", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -137,7 +137,7 @@ func TestSettle_HoldsAnotherDisksOverlay(t *testing.T) {
 	if err := Bind(disk, owner); err != nil {
 		t.Fatal(err)
 	}
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), openGate, disk, owner)
 	if out != Held || !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("Settle = %v, %v; another disk's overlay must hold", out, err)
 	}
@@ -162,7 +162,7 @@ func TestSettle_ARecreatedDiskNeverReceivesTheOldOverlay(t *testing.T) {
 	}
 	// The same owner (a rebuild keeps the VM's identity): only the file's
 	// own identity tells the new disk from the old.
-	out, err := Settle(context.Background(), disk, owner)
+	out, err := Settle(context.Background(), openGate, disk, owner)
 	if out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
@@ -187,7 +187,7 @@ func TestSettle_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
 		t.Fatalf("write the base: %v %s", err, out)
 	}
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
 	if got := readDisk(t, disk); !bytes.Equal(got[65536:131072], bytes.Repeat([]byte{0x33}, 65536)) {
@@ -202,7 +202,7 @@ func TestSettle_ABaseWrittenSinceIsNeverOverwritten(t *testing.T) {
 func TestSettle_AnotherIncarnationsOverlayIsHeld(t *testing.T) {
 	needQemu(t)
 	disk := window(t)
-	out, err := Settle(context.Background(), disk, Owner{VM: "web", VMUUID: "u-2", Disk: "root"})
+	out, err := Settle(context.Background(), openGate, disk, Owner{VM: "web", VMUUID: "u-2", Disk: "root"})
 	if out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
@@ -226,7 +226,7 @@ func TestSettle_AnotherDeviceNumberIsTheSameFile(t *testing.T) {
 		return dev + 7, ino, size, mt, err
 	}
 	defer func() { identity = prev }()
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle on another host's device number = %v, %v, want committed", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -249,7 +249,7 @@ func TestSettle_ABaseNamedByAnotherHostsMountPath(t *testing.T) {
 	if err := Bind(disk, owner); err != nil { // the rebase wrote nothing to the base; rebind is idempotent
 		t.Fatal(err)
 	}
-	if out, err := Settle(context.Background(), disk, owner); err != nil || out != Committed {
+	if out, err := Settle(context.Background(), openGate, disk, owner); err != nil || out != Committed {
 		t.Fatalf("Settle = %v, %v, want committed", out, err)
 	}
 	if !windowWrite(t, disk) {
@@ -282,7 +282,7 @@ func TestSettle_ACommitLongAgoAndABaseWrittenSinceIsHeld(t *testing.T) {
 	if out, err := exec.Command("qemu-io", "-f", "qcow2", "-c", "write -P 0x33 65536 65536", disk).CombinedOutput(); err != nil {
 		t.Fatalf("write the base: %v %s", err, out)
 	}
-	if out, err := Settle(context.Background(), disk, owner); out != Held || err == nil {
+	if out, err := Settle(context.Background(), openGate, disk, owner); out != Held || err == nil {
 		t.Fatalf("Settle = %v, %v, want held", out, err)
 	}
 }

@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -128,6 +129,20 @@ func TestSMART_GaugeMatchesSmartctl(t *testing.T) {
 			}
 			if !strings.Contains(body, `litevirt_disk_smart_status{device="`+f[0]+`"`) {
 				t.Errorf("no litevirt_disk_smart_status series for %s", f[0])
+			}
+			// The model label comes from smartctl's information section (-i), which
+			// the scan must ask for. Compare it with what smartctl itself reports.
+			args := []string{"--json", "-i"}
+			if len(f) > 2 && f[1] == "-d" {
+				args = append(args, "-d", f[2])
+			}
+			info, _ := exec.Command("smartctl", append(args, f[0])...).Output() // exit status is a bitmask
+			var id struct {
+				ModelName string `json:"model_name"`
+			}
+			if json.Unmarshal(info, &id) == nil && id.ModelName != "" &&
+				!strings.Contains(body, `litevirt_disk_smart_status{device="`+f[0]+`",model="`+id.ModelName+`"`) {
+				t.Errorf("the series for %s lacks model=%q, which smartctl -i reports", f[0], id.ModelName)
 			}
 		}
 	}

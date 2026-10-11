@@ -139,8 +139,10 @@ func Check(ctx context.Context, run Runner) Report {
 		disk := Disk{Device: d.Name, ID: d.Name, Status: Unknown}
 		// -n standby: never spin up a sleeping disk to read it (smartd does the
 		// same). A disk in standby exits with no SMART data, which is Unknown
-		// and so keeps whatever state we last saw.
-		args := []string{"--json", "-n", "standby", "-H", "-A"}
+		// and so keeps whatever state we last saw. -i adds the information
+		// section: without it smartctl prints no model_name or serial_number, so
+		// the model label stays empty and the serial-based disk ID is never set.
+		args := []string{"--json", "-n", "standby", "-i", "-H", "-A"}
 		if d.Type != "" {
 			args = append(args, "-d", d.Type)
 		}

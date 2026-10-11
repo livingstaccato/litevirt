@@ -1105,6 +1105,11 @@ uuid), the disk and the host that ran the create. So:
 
 - two disks of one VM on the same LUN — through one pool or two pools that
   name the same target and LUN — are refused before anything is created;
+- a disk on an iscsi pool may not share its name with another disk of the VM
+  (`InvalidArgument`, before anything is created): a VM's disks are recorded
+  by name, and a LUN with no disk record of its own would be held by nothing
+  once the create is done. Two disks of one name on other storage are each
+  created on their own storage, as before;
 - two creates on two hosts at the same moment cannot both take a LUN: only one
   value is ever decided per allocation. The other is refused naming the VM —
   `Aborted` while that create is still running (retry once it has finished),

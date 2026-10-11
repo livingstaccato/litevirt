@@ -256,17 +256,22 @@ func lunHandoffFrom(ctx context.Context) string {
 
 // fixedDeviceUses resolves spec's disks, for a create on this host, to the
 // fixed devices (iscsi LUNs) they take, refusing a create that puts two of
-// its own disks on one — and returns every disk's resolved storage (by disk
-// name), which the create then uses as it is: the claim and the disk are one
-// resolution, so they cannot disagree (re-review 4, I-2). A disk whose
-// storage does not resolve refuses the create now, as the create's disk loop
-// would: never counted as no LUN, which let a transient read error, or a pool
-// row arriving between two resolutions, attach a LUN nothing claimed.
-func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse, map[string]storage.Config, error) {
-	cfgs := map[string]storage.Config{}
+// its own disks on one — and returns every disk's resolved storage (by its
+// index in spec.Disks), which the create then uses as it is: the claim and
+// the disk are one resolution, so they cannot disagree (re-review 4, I-2). A
+// disk whose storage does not resolve refuses the create now, as the create's
+// disk loop would: never counted as no LUN, which let a transient read error,
+// or a pool row arriving between two resolutions, attach a LUN nothing
+// claimed.
+//
+// By index, not by name: two disks sharing a name each keep their own
+// storage, as on main — keyed by name, both took the last one's (re-review 5,
+// R-2). A LUN disk may not share its name at all (refuseSharedLUNDiskName).
+func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse, map[int]storage.Config, error) {
+	cfgs := map[int]storage.Config{}
 	var uses []lunUse
 	seen := map[string]lunUse{}
-	for _, d := range spec.Disks {
+	for i, d := range spec.Disks {
 		if d.Storage == "" {
 			continue
 		}
@@ -275,7 +280,7 @@ func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse
 		if err != nil {
 			return nil, nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, err)
 		}
-		cfgs[name] = cfg
+		cfgs[i] = cfg
 		key, dev, ok := storage.FixedDevice(cfg)
 		if !ok {
 			continue
@@ -285,7 +290,36 @@ func (s *Server) fixedDeviceUses(ctx context.Context, spec *pb.VMSpec) ([]lunUse
 			return nil, nil, err
 		}
 	}
+	if err := refuseSharedLUNDiskName(spec, uses); err != nil {
+		return nil, nil, err
+	}
 	return uses, cfgs, nil
+}
+
+// refuseSharedLUNDiskName refuses a spec in which an iSCSI LUN disk (one of
+// uses) shares its name with another disk of the VM (re-review 5, R-2). A
+// VM's disks are recorded by name (vm_disks is keyed by VM and disk name), so
+// of two disks of one name only one keeps a row: the LUN would be attached
+// with no disk row of its own, and a row is what holds a LUN for its VM once
+// the create has committed. Two disks of one name on other storage are
+// created as on main.
+func refuseSharedLUNDiskName(spec *pb.VMSpec, uses []lunUse) error {
+	if len(uses) == 0 {
+		return nil
+	}
+	count := map[string]int{}
+	for _, d := range spec.Disks {
+		count[diskNameOrRoot(d.Name)]++
+	}
+	for _, u := range uses {
+		if n := count[u.disk]; n > 1 {
+			return status.Errorf(codes.InvalidArgument,
+				"VM %q has %d disks named %q, and one of them is iSCSI LUN %s (storage %q): a VM's disks are "+
+					"recorded by name, so a LUN sharing its name would be held by no disk record of its own — "+
+					"give each disk its own name", spec.Name, n, u.disk, u.device, u.pool)
+		}
+	}
+	return nil
 }
 
 func diskNameOrRoot(name string) string {
@@ -395,6 +429,9 @@ func (s *Server) recreateFixedDeviceUses(ctx context.Context, spec *pb.VMSpec, c
 			return nil, err
 		}
 	}
+	if err := refuseSharedLUNDiskName(spec, uses); err != nil {
+		return nil, err
+	}
 	return uses, nil
 }
 
@@ -418,9 +455,9 @@ type lunHold struct {
 	// committed is set once the create's row is written: from then on its
 	// allocations are held by the row.
 	committed bool
-	// cfgs is every disk's storage as the claim resolved it, by disk name:
-	// the create uses it as it is.
-	cfgs map[string]storage.Config
+	// cfgs is every disk's storage as the claim resolved it, by the disk's
+	// index in the spec: the create uses it as it is.
+	cfgs map[int]storage.Config
 	// grant is iscsi_lun_claim's, from the gate the create's claims passed
 	// (zero when it decided none, and then own is empty).
 	grant capabilities.FeatureGrant

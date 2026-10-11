@@ -502,7 +502,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// LUN claim resolved it, so the disk is the LUN the claim took
 			// (re-review 4, I-2); claimLUNs refused a storage that did not
 			// resolve.
-			volCfg, resolved := lunHold.cfgs[d.Name]
+			volCfg, resolved := lunHold.cfgs[i]
 			if !resolved {
 				var volErr error
 				if volCfg, volErr = s.resolveVolume(ctx, spec.StackName, d.Storage); volErr != nil {

@@ -43,7 +43,15 @@ type coldStoppedScenario struct {
 // disk holding payload and one disk on shared storage.
 func newColdStoppedScenario(t *testing.T) *coldStoppedScenario {
 	t.Helper()
-	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	return newColdStoppedScenarioWith(t, Options{Nodes: 2, SharedCRDT: true})
+}
+
+// newColdStoppedScenarioWith is the scenario on the given cluster shape: with
+// IndependentReplicas each node has its own database and the VM reaches the
+// other one by replication.
+func newColdStoppedScenarioWith(t *testing.T, opts Options) *coldStoppedScenario {
+	t.Helper()
+	c := New(t, opts)
 	t.Cleanup(c.Stop)
 	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range []*Node{src, dst} {
@@ -90,6 +98,9 @@ func newColdStoppedScenario(t *testing.T) *coldStoppedScenario {
 		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + sc.shared + `'/><target dev='vdb'/></disk>` +
 		`</devices></domain>`); err != nil {
 		t.Fatalf("define source domain: %v", err)
+	}
+	if opts.IndependentReplicas {
+		c.WaitConverged(t, convergeTimeout)
 	}
 	return sc
 }

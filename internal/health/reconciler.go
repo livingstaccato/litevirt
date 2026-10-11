@@ -19,6 +19,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -1875,17 +1876,24 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:      strings.TrimPrefix(bridge, "direct:"),
+				Model:       "virtio",
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 		} else {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Bridge: bridge,
-				MAC:    iface.MAC,
+				Bridge:      bridge,
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 		}
 	}
+
+	// The stored spec's disk tuning (discard, throttle) and NIC queues: a VM
+	// started on this host after a failover keeps what it had.
+	compose.ApplyDiskTuning(diskConfigs, spec)
+	compose.ApplyNICTuning(netConfigs, spec)
 
 	// Build libvirt domain config.
 	vmCfg := lv.VMConfig{

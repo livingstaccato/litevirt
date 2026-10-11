@@ -85,8 +85,9 @@ type FeatureInfo struct {
 // after the latch marks it used. Its other data, the cluster failback policy,
 // is nothing failback can act on without those records, so it shares the bit.
 var releaseFeatures = map[Feature]FeatureInfo{
-	FeatureVMLimits:    {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
-	FeatureVMDiskNICIO: {Token: Release202611V1, Description: "Per-disk I/O tuning and per-NIC tuning"},
+	FeatureVMLimits: {Token: Release202611V1, Description: "Per-VM CPU limit and shares, and NIC bandwidth limits"},
+	FeatureVMDiskNICIO: {Token: Release202611V1, Description: "Per-disk discard and I/O limits and per-NIC queues; discard defaults on for new disks",
+		Writers: []string{"internal/corrosion.InsertVMWithTuning", "internal/corrosion.MutateDesiredSpecTuning"}},
 	FeatureEmailTargetSecret: {Token: Release202611V1, Description: "Email notification targets with a stored SMTP password",
 		Writers: []string{"internal/corrosion.InsertEmailTargetWithSecret"}},
 	FeatureLoginPolicy:   {Token: Release202611V1, Description: "Account disable and expiry, the mandatory second factor and directory identity binding (used by default: the first directory or second-factor login, or user create or delete)", Writers: loginPolicyWriters},

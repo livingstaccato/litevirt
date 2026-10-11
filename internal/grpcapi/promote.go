@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -996,6 +997,19 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
 	}
 	spec.Name = targetName
+	// The stored tuning is validated again (and dropped before the gate opens)
+	// so a record from before a rollback cannot define what the cluster refuses.
+	ioR, err := s.restrictRestoredTuning(ctx, &spec)
+	if err != nil {
+		return err
+	}
+	ioG := ioR.grant
+	if ioR.stripped {
+		// The domain below is defined from the stripped spec. A takeover keeps the
+		// row's own spec, so the two differ until the next redefine renders it.
+		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
+			"vm", targetName, "why", ioR.why())
+	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1266,6 +1280,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
+		// The spec records the NIC's real MAC (as a clone does), so its queues
+		// are matched at every later redefine, not lost to the source's MAC.
+		n.Mac = mac
 		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
 			os.Remove(livePath)
@@ -1293,6 +1310,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
+	compose.ApplyDiskTuning(diskCfg, &spec)
+	compose.ApplyNICTuningByPosition(netCfg, &spec)
 	if !started {
 		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
 			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
@@ -1393,7 +1412,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+		if err := s.insertVMForSpec(ctx, &spec, ioG, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
@@ -1422,6 +1441,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
 		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
+	op := "promote"
+	if automated {
+		op = "failover"
+	}
+	s.auditTuningDropped(ctx, ioR, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

@@ -322,6 +322,18 @@ type DiskDef struct {
 	// Overwrite lets a root disk from an image on an iscsi pool write the image
 	// over a LUN that is not blank (docs/storage.md).
 	Overwrite bool `yaml:"overwrite"`
+
+	// Discard passes the guest's TRIM down to the storage: unmap (or on) frees
+	// the space on thin storage, ignore (or off) drops it. Unset: a new VM gets
+	// the storage type's default (docs/storage.md), an existing one keeps what
+	// it has.
+	Discard string `yaml:"discard,omitempty"`
+	// DetectZeroes turns a guest write of zeroes into a discard (unmap, which
+	// needs discard unmap), or only skips the zero blocks (on); off disables it.
+	DetectZeroes string `yaml:"detect_zeroes,omitempty"`
+	// IOTune throttles this disk's I/O (libvirt <iotune>). Changeable on a
+	// running VM; an empty `iotune: {}` clears every limit.
+	IOTune *IOTuneDef `yaml:"iotune,omitempty"`
 }
 
 func (d *DiskDef) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -356,6 +368,11 @@ type NetworkAttachment struct {
 	// security-groups: definitions. Empty = inherit cluster + host
 	// rules only (no per-NIC SG layer).
 	SecurityGroups []string `yaml:"security-groups,omitempty"`
+
+	// Queues is the virtio-net multiqueue count (<driver
+	// queues='N'/>): 1 to 64, or "auto" for one per vCPU up to 8. Unset or 1
+	// is a single queue. Virtio model only; applies on the next define.
+	Queues NICQueues `yaml:"queues,omitempty"`
 }
 
 // CloudInitDef holds cloud-init configuration.

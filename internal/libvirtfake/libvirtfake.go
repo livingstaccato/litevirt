@@ -223,8 +223,14 @@ type Fake struct {
 	// FailSetVirtioMem injects a memory hot-add primitive failure.
 	FailSetVirtioMem    func(name string, requestedMiB int) error
 	FailMigrateToTarget func(name, dconnuri string) error
-	FailBlockPull       func(domain, disk string) error
-	FailPoolDestroy     func(name string) error
+	// FailSetDiskIOTune injects a failure from the disk I/O throttle primitive.
+	FailSetDiskIOTune func(name, dev string) error
+	// FailSetDiskIOTuneLive fails AFTER the persistent definition took the
+	// throttle, as libvirt does when the live call is refused (a job-lock
+	// timeout during a backup).
+	FailSetDiskIOTuneLive func(name, dev string) error
+	FailBlockPull         func(domain, disk string) error
+	FailPoolDestroy       func(name string) error
 	// BlockJobStatusFn lets a scenario script block-job progress. Nil =
 	// "no job in progress" (Found=false), i.e. the pull is already done —
 	// the simplest happy path for the live-restore blockpull poll.
@@ -1346,6 +1352,45 @@ func (f *Fake) BlockResize(domainName, path string, sizeBytes int64) error {
 	f.record("block-resize", domainName, fmt.Sprintf("path=%s size=%d", path, sizeBytes))
 	return nil
 }
+
+// SetDiskIOTune models the real client: the persistent definition takes the
+// throttle, and so does the live view of a running domain, so a test reads
+// either back with DumpXML / DumpXMLInactive. Like libvirt it refuses a disk
+// the definition does not carry and a throttle libvirt would refuse.
+func (f *Fake) SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error {
+	if f.FailSetDiskIOTune != nil {
+		if err := f.FailSetDiskIOTune(domainName, dev); err != nil {
+			return err
+		}
+	}
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[domainName]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not found", domainName)
+	}
+	persisted, err := libvirt.PatchDiskIOTune(f.xml[domainName], dev, t)
+	if err != nil {
+		return fmt.Errorf("libvirtfake: set I/O limits on %q: %w", domainName, err)
+	}
+	f.xml[domainName] = persisted
+	if f.FailSetDiskIOTuneLive != nil && (st == StateRunning || st == StatePaused) {
+		if err := f.FailSetDiskIOTuneLive(domainName, dev); err != nil {
+			return err
+		}
+	}
+	if live, ok := f.activeXML[domainName]; ok && (st == StateRunning || st == StatePaused) {
+		if patched, perr := libvirt.PatchDiskIOTune(live, dev, t); perr == nil {
+			f.activeXML[domainName] = patched
+		}
+	}
+	f.record("set-iotune", domainName, fmt.Sprintf("dev=%s %+v", dev, t))
+	return nil
+}
+
 func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

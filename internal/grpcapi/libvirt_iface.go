@@ -81,6 +81,10 @@ type LibvirtBackend interface {
 	// domain, whose nonexistent live instance would reject a live-flagged DetachHostdev.
 	DetachHostdevConfig(domainName, pciAddress string) error
 	BlockResize(domainName, path string, sizeBytes int64) error
+	// SetDiskIOTune throttles one disk's I/O (target device dev, e.g. "vda"):
+	// the persistent definition, then the running domain. A zero IOTune clears
+	// every limit.
+	SetDiskIOTune(domainName, dev string, t libvirt.IOTune) error
 	SetBootOrder(domainName, bootOrder string) error
 
 	// Migration.

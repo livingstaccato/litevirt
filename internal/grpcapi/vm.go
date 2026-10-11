@@ -108,7 +108,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := validateSpecNames(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := validateSpecTuning(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
+		return nil, err
+	}
+	// After the cheap local refusals (validation, permission): the check may drive
+	// the latch and ask peers, which only a request that could succeed should pay.
+	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
 		return nil, err
 	}
 
@@ -429,6 +437,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		passthroughG = g
 	}
+	// Disk/NIC tuning is written by THIS node, so the feature's gate runs here,
+	// before anything is created. A spec that sets tuning needs the grant (the
+	// entry check above only fails fast); a spec that does not gets the default
+	// discard only once the feature is ALREADY recorded used (a local read), so a
+	// plain create never triggers or waits on a first use, and otherwise creates
+	// exactly as main.
+	var ioG capabilities.FeatureGrant
+	if specSetsDiskNICIO(spec) {
+		g, gerr := s.ioGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		ioG = g
+	} else if g, ok := s.ioGrantIfUsed(ctx); ok {
+		ioG = g
+	}
+	ioGranted := ioG.Check(capabilities.FeatureVMDiskNICIO) == nil
 
 	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
@@ -577,6 +602,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			createdDiskPaths = append(createdDiskPaths, diskPath)
 		}
 
+		// An unset discard becomes the storage type's default now, in the spec
+		// this create persists — so it is this VM's setting from here on.
+		// baseDomainConfig renders discard, detect_zeroes and the throttle from
+		// that spec.
+		// Only once the disk/NIC feature gate has opened: before it, an older owner
+		// would drop it, and the create must render exactly what main does.
+		if d.Discard == "" && ioGranted {
+			d.Discard = defaultDiscard(storageType, d.Bus)
+		}
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  d.Name,
 			Path:  diskPath,
@@ -615,6 +649,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			Path: diskPath,
 			Bus:  "virtio",
 		})
+		// The implicit root disk gets the default discard like a named one
+		// (after the latch). It is recorded in the spec, which is what every
+		// later render reads; before the latch the spec stays as main's.
+		if def := defaultDiscard("local", "virtio"); def != "" && ioGranted {
+			spec.Disks = append(spec.Disks, &pb.DiskSpec{Name: "root", Size: "20G", Bus: "virtio", Discard: def})
+		}
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName:       spec.Name,
 			DiskName:     "root",
@@ -674,6 +714,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		mac := n.Mac
 		if mac == "" {
 			mac = lv.GenerateMAC()
+			// Recorded in the spec so the NIC keeps its identity (its queue
+			// count) however many NICs are hot-plugged or detached later.
+			n.Mac = mac
 		}
 
 		// Attempt network provisioning if the network is defined in the stack.
@@ -1118,7 +1161,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
-	if err := s.insertVMForPassthrough(ctx, spec, passthroughG, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+	insertVM := s.insertVMForSpec
+	insertG := ioG
+	if vmSpecSetsPassthrough(spec) {
+		insertVM, insertG = s.insertVMForPassthrough, passthroughG
+	}
+	if err := insertVM(ctx, spec, insertG, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
 		// deployment keeps today's behaviour exactly. With a claim in play, a
 		// running VM with no row is the one state that lets the orphan sweeper
@@ -4170,7 +4218,7 @@ func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
 		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
-		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req)
 }
 
 // isPureMemoryRequest reports whether req changes nothing but memory — the
@@ -4183,7 +4231,7 @@ func isPureMemoryRequest(req *pb.UpdateVMRequest) bool {
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
 		req.StartDelaySec == nil && req.StopDelaySec == nil && !req.DisableVnc &&
-		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && !requestsHardwareTuning(req)
 }
 
 // liveGrowVCPU hot-adds vCPUs to a RUNNING VM in place (no stop). It is the pure
@@ -4221,6 +4269,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// before the forward: the owner runs a forwarded call as the peer.
 	if req.SetUsbDevices {
 		if err := s.authorizeUSBDevices(ctx, req.UsbDevices); err != nil {
+			return nil, err
+		}
+	}
+	// The hardware redefine renders disk/NIC tuning, which waits for the latch;
+	// refused at the entry node, before the call is forwarded.
+	if requestsTuningWrite(req, vm.Spec) {
+		if err := s.ioFeatureGate(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -4287,6 +4342,29 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		spec.StopDelaySec = *req.StopDelaySec
 	}
 
+	// This node writes the tuning, so the feature's gate runs here (the entry
+	// node only failed fast), before anything is stopped or redefined.
+	var ioG capabilities.FeatureGrant
+	tuningWrite := requestsTuningWrite(req, vm.Spec)
+	if tuningWrite {
+		g, gerr := s.ioGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		ioG = g
+	}
+
+	// Discard / detect_zeroes / queue changes ride in the request and are merged
+	// into THIS host's spec (the owner's, under the VM lock), validated before
+	// anything is stopped. The merged spec is only written after the domain has
+	// the setting, so it never claims what the domain lacks.
+	if len(req.DiskTuning) > 0 || len(req.NicQueues) > 0 {
+		tdisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
+		if err := applyTuningRequest(spec, tdisks, req); err != nil {
+			return nil, err
+		}
+	}
+
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
@@ -4294,7 +4372,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil ||
-		req.SetUsbDevices || req.MemoryHotplugMaxMib != nil
+		req.SetUsbDevices || req.MemoryHotplugMaxMib != nil || requestsHardwareTuning(req)
 	// USB passthrough and memory hot-add are checked here, before anything is
 	// stopped: a refusal after the stop of a --restart-if-needed would cost the
 	// VM a restart for nothing.
@@ -4332,7 +4410,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc &&
 		// USB devices and the hot-add topology (<maxMemory>, the NUMA cell,
 		// the virtio-mem device) are not what the value-only patch edits.
-		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && spec.MemoryHotplugMaxMib == 0
+		!req.SetUsbDevices && req.MemoryHotplugMaxMib == nil && spec.MemoryHotplugMaxMib == 0 &&
+		!req.RedefineHardware
 	restartAfter := false
 	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
@@ -4728,16 +4807,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{
-				Direct: strings.TrimPrefix(bridge, "direct:"),
-				Model:  "virtio",
-				MAC:    iface.MAC,
+				Direct:      strings.TrimPrefix(bridge, "direct:"),
+				Model:       "virtio",
+				MAC:         iface.MAC,
+				SpecOrdinal: iface.Ordinal + 1,
 			})
 			continue
 		}
 		netConfigs = append(netConfigs, lv.NetworkConfig{
-			Bridge: bridge,
-			Model:  "virtio",
-			MAC:    iface.MAC,
+			Bridge:      bridge,
+			Model:       "virtio",
+			MAC:         iface.MAC,
+			SpecOrdinal: iface.Ordinal + 1,
 		})
 	}
 
@@ -4771,6 +4852,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if req.CpuMode != "" || req.CpuModel != "" {
 					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
 				}
+			}
+			if perr == nil && (len(req.DiskTuning) > 0 || len(req.NicQueues) > 0) {
+				// discard / detect_zeroes / queues patch into the existing
+				// definition too, so the addresses libvirt assigned survive.
+				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, ifaces)
 			}
 			if perr == nil {
 				domXML = patched
@@ -4873,6 +4959,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if updateSetsPassthrough(req) {
 		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
 			return corrosion.MutateDesiredSpecPassthrough(ctx, c, passthroughG, name, fn)
+		}
+	} else if tuningWrite {
+		mutateSpec = func(ctx context.Context, c *corrosion.Client, name string, fn func(string) (string, error)) (bool, int64, error) {
+			return corrosion.MutateDesiredSpecTuning(ctx, c, ioG, name, fn)
 		}
 	}
 	applied, newGen, err := mutateSpec(ctx, s.db, req.Name, func(string) (string, error) {

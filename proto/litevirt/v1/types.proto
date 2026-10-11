@@ -197,6 +197,38 @@ message DiskSpec {
     // any earlier data in its first or last MiB). Without it such a LUN is
     // refused. A LUN any VM's disk is never written, whatever this says.
     bool overwrite = 8;
+    // TRIM/discard passthrough (libvirt <driver discard=...>): "unmap" passes the
+    // guest's TRIM down so thin storage reclaims space; "ignore" drops it. Empty
+    // = unset: a create stores the per-storage default (docs/storage.md), an
+    // update inherits what is stored, and a disk stored empty renders no attribute
+    // (the guest never sees a discard-capable device it did not have).
+    string discard = 9;
+    // <driver detect_zeroes=...>: "off" | "on" | "unmap". "unmap" turns a write
+    // of zeroes into a discard and needs discard "unmap". Empty = unset.
+    string detect_zeroes = 10;
+    // Per-disk I/O throttle (libvirt <iotune>); nil = unset, an empty message
+    // clears every limit. Changeable on a running VM (SetDiskIO).
+    DiskIOLimits io = 11;
+}
+
+// DiskIOLimits is one disk's I/O throttle. 0 = unlimited. A total_* limit is
+// exclusive with the read_*/write_* limit of the same kind (libvirt refuses the
+// pair). *_max is the burst ceiling above the sustained rate, held for
+// burst_seconds (default 1 when a *_max is set).
+message DiskIOLimits {
+    int64 total_bytes_sec     = 1;
+    int64 read_bytes_sec      = 2;
+    int64 write_bytes_sec     = 3;
+    int64 total_iops_sec      = 4;
+    int64 read_iops_sec       = 5;
+    int64 write_iops_sec      = 6;
+    int64 total_bytes_sec_max = 7;
+    int64 read_bytes_sec_max  = 8;
+    int64 write_bytes_sec_max = 9;
+    int64 total_iops_sec_max  = 10;
+    int64 read_iops_sec_max   = 11;
+    int64 write_iops_sec_max  = 12;
+    int64 burst_seconds       = 13;
 }
 
 message NetworkAttachment {
@@ -209,6 +241,9 @@ message NetworkAttachment {
     string          ipv6            = 7;
     string          ipv6_gateway    = 8;
     repeated string security_groups = 9;  // SG names bound to this NIC (distributed firewall)
+    // virtio-net multiqueue: <driver name='vhost' queues='N'/>. 0 or 1 = off
+    // (one queue). Only for the virtio model. Takes effect on the next define.
+    int32           queues          = 12;
 }
 
 message CloudInitSpec {

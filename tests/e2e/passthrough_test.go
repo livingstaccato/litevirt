@@ -38,18 +38,7 @@ func skipIfGated(t *testing.T, out string, err error) {
 	}
 }
 
-func virshXML(t *testing.T, domain string, inactive bool) string {
-	t.Helper()
-	args := []string{"-c", "qemu:///system", "dumpxml", domain}
-	if inactive {
-		args = append(args, "--inactive")
-	}
-	out, err := exec.Command("virsh", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("virsh dumpxml %s: %v\n%s", domain, err, out)
-	}
-	return string(out)
-}
+// virshXML is in disk_nic_io_test.go (same helper; both branches defined it).
 
 var reRequested = regexp.MustCompile(`<requested unit='KiB'>(\d+)</requested>`)
 

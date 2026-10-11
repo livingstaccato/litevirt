@@ -232,7 +232,7 @@ func f() {
 var writersPending = map[Feature]bool{
 	"backup_zstd": true, "firewall_ipv6": true,
 	"nic_guards": true, "pit_overlay": true,
-	"vm_disk_nic_io": true, "vm_limits": true,
+	"vm_limits": true,
 }
 
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {

@@ -108,6 +108,7 @@ POST   /api/v1/vms/{name}/detach                # Detach device
 POST   /api/v1/vms/{name}/set-ip                # Set VM IP address
 POST   /api/v1/vms/{name}/rebuild               # Recreate from stored spec
 POST   /api/v1/vms/{name}/disks/{disk}/resize   # Resize a disk
+POST   /api/v1/vms/{name}/disks/{disk}/io       # Set a disk's I/O limits ({"limits": {...}}; replaces the set)
 GET    /api/v1/vms/{name}/stats                 # VM resource statistics
 ```
 

@@ -901,7 +901,19 @@ type DiskSpec struct {
 	// the image over a LUN that is not blank (a partition table, filesystem or
 	// any earlier data in its first or last MiB). Without it such a LUN is
 	// refused. A LUN any VM's disk is never written, whatever this says.
-	Overwrite     bool `protobuf:"varint,8,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	Overwrite bool `protobuf:"varint,8,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	// TRIM/discard passthrough (libvirt <driver discard=...>): "unmap" passes the
+	// guest's TRIM down so thin storage reclaims space; "ignore" drops it. Empty
+	// = unset: a create stores the per-storage default (docs/storage.md), an
+	// update inherits what is stored, and a disk stored empty renders no attribute
+	// (the guest never sees a discard-capable device it did not have).
+	Discard string `protobuf:"bytes,9,opt,name=discard,proto3" json:"discard,omitempty"`
+	// <driver detect_zeroes=...>: "off" | "on" | "unmap". "unmap" turns a write
+	// of zeroes into a discard and needs discard "unmap". Empty = unset.
+	DetectZeroes string `protobuf:"bytes,10,opt,name=detect_zeroes,json=detectZeroes,proto3" json:"detect_zeroes,omitempty"`
+	// Per-disk I/O throttle (libvirt <iotune>); nil = unset, an empty message
+	// clears every limit. Changeable on a running VM (SetDiskIO).
+	Io            *DiskIOLimits `protobuf:"bytes,11,opt,name=io,proto3" json:"io,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -992,6 +1004,171 @@ func (x *DiskSpec) GetOverwrite() bool {
 	return false
 }
 
+func (x *DiskSpec) GetDiscard() string {
+	if x != nil {
+		return x.Discard
+	}
+	return ""
+}
+
+func (x *DiskSpec) GetDetectZeroes() string {
+	if x != nil {
+		return x.DetectZeroes
+	}
+	return ""
+}
+
+func (x *DiskSpec) GetIo() *DiskIOLimits {
+	if x != nil {
+		return x.Io
+	}
+	return nil
+}
+
+// DiskIOLimits is one disk's I/O throttle. 0 = unlimited. A total_* limit is
+// exclusive with the read_*/write_* limit of the same kind (libvirt refuses the
+// pair). *_max is the burst ceiling above the sustained rate, held for
+// burst_seconds (default 1 when a *_max is set).
+type DiskIOLimits struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	TotalBytesSec    int64                  `protobuf:"varint,1,opt,name=total_bytes_sec,json=totalBytesSec,proto3" json:"total_bytes_sec,omitempty"`
+	ReadBytesSec     int64                  `protobuf:"varint,2,opt,name=read_bytes_sec,json=readBytesSec,proto3" json:"read_bytes_sec,omitempty"`
+	WriteBytesSec    int64                  `protobuf:"varint,3,opt,name=write_bytes_sec,json=writeBytesSec,proto3" json:"write_bytes_sec,omitempty"`
+	TotalIopsSec     int64                  `protobuf:"varint,4,opt,name=total_iops_sec,json=totalIopsSec,proto3" json:"total_iops_sec,omitempty"`
+	ReadIopsSec      int64                  `protobuf:"varint,5,opt,name=read_iops_sec,json=readIopsSec,proto3" json:"read_iops_sec,omitempty"`
+	WriteIopsSec     int64                  `protobuf:"varint,6,opt,name=write_iops_sec,json=writeIopsSec,proto3" json:"write_iops_sec,omitempty"`
+	TotalBytesSecMax int64                  `protobuf:"varint,7,opt,name=total_bytes_sec_max,json=totalBytesSecMax,proto3" json:"total_bytes_sec_max,omitempty"`
+	ReadBytesSecMax  int64                  `protobuf:"varint,8,opt,name=read_bytes_sec_max,json=readBytesSecMax,proto3" json:"read_bytes_sec_max,omitempty"`
+	WriteBytesSecMax int64                  `protobuf:"varint,9,opt,name=write_bytes_sec_max,json=writeBytesSecMax,proto3" json:"write_bytes_sec_max,omitempty"`
+	TotalIopsSecMax  int64                  `protobuf:"varint,10,opt,name=total_iops_sec_max,json=totalIopsSecMax,proto3" json:"total_iops_sec_max,omitempty"`
+	ReadIopsSecMax   int64                  `protobuf:"varint,11,opt,name=read_iops_sec_max,json=readIopsSecMax,proto3" json:"read_iops_sec_max,omitempty"`
+	WriteIopsSecMax  int64                  `protobuf:"varint,12,opt,name=write_iops_sec_max,json=writeIopsSecMax,proto3" json:"write_iops_sec_max,omitempty"`
+	BurstSeconds     int64                  `protobuf:"varint,13,opt,name=burst_seconds,json=burstSeconds,proto3" json:"burst_seconds,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DiskIOLimits) Reset() {
+	*x = DiskIOLimits{}
+	mi := &file_litevirt_v1_types_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiskIOLimits) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskIOLimits) ProtoMessage() {}
+
+func (x *DiskIOLimits) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_types_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskIOLimits.ProtoReflect.Descriptor instead.
+func (*DiskIOLimits) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DiskIOLimits) GetTotalBytesSec() int64 {
+	if x != nil {
+		return x.TotalBytesSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetReadBytesSec() int64 {
+	if x != nil {
+		return x.ReadBytesSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetWriteBytesSec() int64 {
+	if x != nil {
+		return x.WriteBytesSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetTotalIopsSec() int64 {
+	if x != nil {
+		return x.TotalIopsSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetReadIopsSec() int64 {
+	if x != nil {
+		return x.ReadIopsSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetWriteIopsSec() int64 {
+	if x != nil {
+		return x.WriteIopsSec
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetTotalBytesSecMax() int64 {
+	if x != nil {
+		return x.TotalBytesSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetReadBytesSecMax() int64 {
+	if x != nil {
+		return x.ReadBytesSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetWriteBytesSecMax() int64 {
+	if x != nil {
+		return x.WriteBytesSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetTotalIopsSecMax() int64 {
+	if x != nil {
+		return x.TotalIopsSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetReadIopsSecMax() int64 {
+	if x != nil {
+		return x.ReadIopsSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetWriteIopsSecMax() int64 {
+	if x != nil {
+		return x.WriteIopsSecMax
+	}
+	return 0
+}
+
+func (x *DiskIOLimits) GetBurstSeconds() int64 {
+	if x != nil {
+		return x.BurstSeconds
+	}
+	return 0
+}
+
 type NetworkAttachment struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -1003,13 +1180,16 @@ type NetworkAttachment struct {
 	Ipv6           string                 `protobuf:"bytes,7,opt,name=ipv6,proto3" json:"ipv6,omitempty"`
 	Ipv6Gateway    string                 `protobuf:"bytes,8,opt,name=ipv6_gateway,json=ipv6Gateway,proto3" json:"ipv6_gateway,omitempty"`
 	SecurityGroups []string               `protobuf:"bytes,9,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"` // SG names bound to this NIC (distributed firewall)
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// virtio-net multiqueue: <driver name='vhost' queues='N'/>. 0 or 1 = off
+	// (one queue). Only for the virtio model. Takes effect on the next define.
+	Queues        int32 `protobuf:"varint,12,opt,name=queues,proto3" json:"queues,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkAttachment) Reset() {
 	*x = NetworkAttachment{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[3]
+	mi := &file_litevirt_v1_types_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1021,7 +1201,7 @@ func (x *NetworkAttachment) String() string {
 func (*NetworkAttachment) ProtoMessage() {}
 
 func (x *NetworkAttachment) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[3]
+	mi := &file_litevirt_v1_types_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1034,7 +1214,7 @@ func (x *NetworkAttachment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkAttachment.ProtoReflect.Descriptor instead.
 func (*NetworkAttachment) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{3}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *NetworkAttachment) GetName() string {
@@ -1100,6 +1280,13 @@ func (x *NetworkAttachment) GetSecurityGroups() []string {
 	return nil
 }
 
+func (x *NetworkAttachment) GetQueues() int32 {
+	if x != nil {
+		return x.Queues
+	}
+	return 0
+}
+
 type CloudInitSpec struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Userdata      string                 `protobuf:"bytes,1,opt,name=userdata,proto3" json:"userdata,omitempty"`
@@ -1111,7 +1298,7 @@ type CloudInitSpec struct {
 
 func (x *CloudInitSpec) Reset() {
 	*x = CloudInitSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[4]
+	mi := &file_litevirt_v1_types_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1123,7 +1310,7 @@ func (x *CloudInitSpec) String() string {
 func (*CloudInitSpec) ProtoMessage() {}
 
 func (x *CloudInitSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[4]
+	mi := &file_litevirt_v1_types_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1136,7 +1323,7 @@ func (x *CloudInitSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloudInitSpec.ProtoReflect.Descriptor instead.
 func (*CloudInitSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{4}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CloudInitSpec) GetUserdata() string {
@@ -1183,7 +1370,7 @@ type PlacementSpec struct {
 
 func (x *PlacementSpec) Reset() {
 	*x = PlacementSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[5]
+	mi := &file_litevirt_v1_types_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1195,7 +1382,7 @@ func (x *PlacementSpec) String() string {
 func (*PlacementSpec) ProtoMessage() {}
 
 func (x *PlacementSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[5]
+	mi := &file_litevirt_v1_types_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1208,7 +1395,7 @@ func (x *PlacementSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlacementSpec.ProtoReflect.Descriptor instead.
 func (*PlacementSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{5}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PlacementSpec) GetHost() string {
@@ -1301,7 +1488,7 @@ type RebalanceSpec struct {
 
 func (x *RebalanceSpec) Reset() {
 	*x = RebalanceSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[6]
+	mi := &file_litevirt_v1_types_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1313,7 +1500,7 @@ func (x *RebalanceSpec) String() string {
 func (*RebalanceSpec) ProtoMessage() {}
 
 func (x *RebalanceSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[6]
+	mi := &file_litevirt_v1_types_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1326,7 +1513,7 @@ func (x *RebalanceSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebalanceSpec.ProtoReflect.Descriptor instead.
 func (*RebalanceSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{6}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RebalanceSpec) GetMode() string {
@@ -1368,7 +1555,7 @@ type RebalanceBudget struct {
 
 func (x *RebalanceBudget) Reset() {
 	*x = RebalanceBudget{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[7]
+	mi := &file_litevirt_v1_types_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1380,7 +1567,7 @@ func (x *RebalanceBudget) String() string {
 func (*RebalanceBudget) ProtoMessage() {}
 
 func (x *RebalanceBudget) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[7]
+	mi := &file_litevirt_v1_types_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1393,7 +1580,7 @@ func (x *RebalanceBudget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebalanceBudget.ProtoReflect.Descriptor instead.
 func (*RebalanceBudget) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{7}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RebalanceBudget) GetMaxConcurrent() int32 {
@@ -1434,7 +1621,7 @@ type MigrationPolicy struct {
 
 func (x *MigrationPolicy) Reset() {
 	*x = MigrationPolicy{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[8]
+	mi := &file_litevirt_v1_types_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1446,7 +1633,7 @@ func (x *MigrationPolicy) String() string {
 func (*MigrationPolicy) ProtoMessage() {}
 
 func (x *MigrationPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[8]
+	mi := &file_litevirt_v1_types_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1459,7 +1646,7 @@ func (x *MigrationPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrationPolicy.ProtoReflect.Descriptor instead.
 func (*MigrationPolicy) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{8}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *MigrationPolicy) GetStrategy() MigrateStrategy {
@@ -1540,7 +1727,7 @@ type UpdatePolicy struct {
 
 func (x *UpdatePolicy) Reset() {
 	*x = UpdatePolicy{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[9]
+	mi := &file_litevirt_v1_types_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1552,7 +1739,7 @@ func (x *UpdatePolicy) String() string {
 func (*UpdatePolicy) ProtoMessage() {}
 
 func (x *UpdatePolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[9]
+	mi := &file_litevirt_v1_types_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1565,7 +1752,7 @@ func (x *UpdatePolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdatePolicy.ProtoReflect.Descriptor instead.
 func (*UpdatePolicy) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{9}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *UpdatePolicy) GetStrategy() string {
@@ -1630,7 +1817,7 @@ type ResourceTuning struct {
 
 func (x *ResourceTuning) Reset() {
 	*x = ResourceTuning{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[10]
+	mi := &file_litevirt_v1_types_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1642,7 +1829,7 @@ func (x *ResourceTuning) String() string {
 func (*ResourceTuning) ProtoMessage() {}
 
 func (x *ResourceTuning) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[10]
+	mi := &file_litevirt_v1_types_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1655,7 +1842,7 @@ func (x *ResourceTuning) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceTuning.ProtoReflect.Descriptor instead.
 func (*ResourceTuning) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{10}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ResourceTuning) GetHugepages() bool {
@@ -1704,7 +1891,7 @@ type NUMAPolicy struct {
 
 func (x *NUMAPolicy) Reset() {
 	*x = NUMAPolicy{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[11]
+	mi := &file_litevirt_v1_types_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1716,7 +1903,7 @@ func (x *NUMAPolicy) String() string {
 func (*NUMAPolicy) ProtoMessage() {}
 
 func (x *NUMAPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[11]
+	mi := &file_litevirt_v1_types_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1729,7 +1916,7 @@ func (x *NUMAPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NUMAPolicy.ProtoReflect.Descriptor instead.
 func (*NUMAPolicy) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{11}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *NUMAPolicy) GetPreferredNode() int32 {
@@ -1767,7 +1954,7 @@ type HealthCheckSpec struct {
 
 func (x *HealthCheckSpec) Reset() {
 	*x = HealthCheckSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[12]
+	mi := &file_litevirt_v1_types_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1779,7 +1966,7 @@ func (x *HealthCheckSpec) String() string {
 func (*HealthCheckSpec) ProtoMessage() {}
 
 func (x *HealthCheckSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[12]
+	mi := &file_litevirt_v1_types_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1792,7 +1979,7 @@ func (x *HealthCheckSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckSpec.ProtoReflect.Descriptor instead.
 func (*HealthCheckSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{12}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *HealthCheckSpec) GetType() string {
@@ -1851,7 +2038,7 @@ type HooksSpec struct {
 
 func (x *HooksSpec) Reset() {
 	*x = HooksSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[13]
+	mi := &file_litevirt_v1_types_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1863,7 +2050,7 @@ func (x *HooksSpec) String() string {
 func (*HooksSpec) ProtoMessage() {}
 
 func (x *HooksSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[13]
+	mi := &file_litevirt_v1_types_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1876,7 +2063,7 @@ func (x *HooksSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HooksSpec.ProtoReflect.Descriptor instead.
 func (*HooksSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{13}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *HooksSpec) GetPreStart() string {
@@ -1937,7 +2124,7 @@ type LBSpec struct {
 
 func (x *LBSpec) Reset() {
 	*x = LBSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[14]
+	mi := &file_litevirt_v1_types_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1949,7 +2136,7 @@ func (x *LBSpec) String() string {
 func (*LBSpec) ProtoMessage() {}
 
 func (x *LBSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[14]
+	mi := &file_litevirt_v1_types_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1962,7 +2149,7 @@ func (x *LBSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBSpec.ProtoReflect.Descriptor instead.
 func (*LBSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{14}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *LBSpec) GetEnabled() bool {
@@ -2034,7 +2221,7 @@ type LBPort struct {
 
 func (x *LBPort) Reset() {
 	*x = LBPort{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[15]
+	mi := &file_litevirt_v1_types_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2046,7 +2233,7 @@ func (x *LBPort) String() string {
 func (*LBPort) ProtoMessage() {}
 
 func (x *LBPort) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[15]
+	mi := &file_litevirt_v1_types_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2059,7 +2246,7 @@ func (x *LBPort) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBPort.ProtoReflect.Descriptor instead.
 func (*LBPort) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{15}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *LBPort) GetListen() int32 {
@@ -2107,7 +2294,7 @@ type LBTlsSpec struct {
 
 func (x *LBTlsSpec) Reset() {
 	*x = LBTlsSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[16]
+	mi := &file_litevirt_v1_types_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2119,7 +2306,7 @@ func (x *LBTlsSpec) String() string {
 func (*LBTlsSpec) ProtoMessage() {}
 
 func (x *LBTlsSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[16]
+	mi := &file_litevirt_v1_types_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2132,7 +2319,7 @@ func (x *LBTlsSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBTlsSpec.ProtoReflect.Descriptor instead.
 func (*LBTlsSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{16}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *LBTlsSpec) GetCert() string {
@@ -2161,7 +2348,7 @@ type LBHealthSpec struct {
 
 func (x *LBHealthSpec) Reset() {
 	*x = LBHealthSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[17]
+	mi := &file_litevirt_v1_types_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2173,7 +2360,7 @@ func (x *LBHealthSpec) String() string {
 func (*LBHealthSpec) ProtoMessage() {}
 
 func (x *LBHealthSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[17]
+	mi := &file_litevirt_v1_types_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2186,7 +2373,7 @@ func (x *LBHealthSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBHealthSpec.ProtoReflect.Descriptor instead.
 func (*LBHealthSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{17}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *LBHealthSpec) GetUseVmHealthcheck() bool {
@@ -2229,7 +2416,7 @@ type RestartPolicy struct {
 
 func (x *RestartPolicy) Reset() {
 	*x = RestartPolicy{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[18]
+	mi := &file_litevirt_v1_types_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2241,7 +2428,7 @@ func (x *RestartPolicy) String() string {
 func (*RestartPolicy) ProtoMessage() {}
 
 func (x *RestartPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[18]
+	mi := &file_litevirt_v1_types_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2254,7 +2441,7 @@ func (x *RestartPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartPolicy.ProtoReflect.Descriptor instead.
 func (*RestartPolicy) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{18}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *RestartPolicy) GetCondition() string {
@@ -2303,7 +2490,7 @@ type DeviceSpec struct {
 
 func (x *DeviceSpec) Reset() {
 	*x = DeviceSpec{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[19]
+	mi := &file_litevirt_v1_types_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2315,7 +2502,7 @@ func (x *DeviceSpec) String() string {
 func (*DeviceSpec) ProtoMessage() {}
 
 func (x *DeviceSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[19]
+	mi := &file_litevirt_v1_types_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2328,7 +2515,7 @@ func (x *DeviceSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeviceSpec.ProtoReflect.Descriptor instead.
 func (*DeviceSpec) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{19}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *DeviceSpec) GetType() string {
@@ -2414,7 +2601,7 @@ type ResourceMappingDevice struct {
 
 func (x *ResourceMappingDevice) Reset() {
 	*x = ResourceMappingDevice{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[20]
+	mi := &file_litevirt_v1_types_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2426,7 +2613,7 @@ func (x *ResourceMappingDevice) String() string {
 func (*ResourceMappingDevice) ProtoMessage() {}
 
 func (x *ResourceMappingDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[20]
+	mi := &file_litevirt_v1_types_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2439,7 +2626,7 @@ func (x *ResourceMappingDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceMappingDevice.ProtoReflect.Descriptor instead.
 func (*ResourceMappingDevice) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{20}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ResourceMappingDevice) GetHostName() string {
@@ -2484,7 +2671,7 @@ type ResourceMapping struct {
 
 func (x *ResourceMapping) Reset() {
 	*x = ResourceMapping{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[21]
+	mi := &file_litevirt_v1_types_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2496,7 +2683,7 @@ func (x *ResourceMapping) String() string {
 func (*ResourceMapping) ProtoMessage() {}
 
 func (x *ResourceMapping) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[21]
+	mi := &file_litevirt_v1_types_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2509,7 +2696,7 @@ func (x *ResourceMapping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceMapping.ProtoReflect.Descriptor instead.
 func (*ResourceMapping) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{21}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ResourceMapping) GetName() string {
@@ -2547,7 +2734,7 @@ type NotificationTarget struct {
 
 func (x *NotificationTarget) Reset() {
 	*x = NotificationTarget{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[22]
+	mi := &file_litevirt_v1_types_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2559,7 +2746,7 @@ func (x *NotificationTarget) String() string {
 func (*NotificationTarget) ProtoMessage() {}
 
 func (x *NotificationTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[22]
+	mi := &file_litevirt_v1_types_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2572,7 +2759,7 @@ func (x *NotificationTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotificationTarget.ProtoReflect.Descriptor instead.
 func (*NotificationTarget) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{22}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *NotificationTarget) GetId() string {
@@ -2624,7 +2811,7 @@ type NotificationRoute struct {
 
 func (x *NotificationRoute) Reset() {
 	*x = NotificationRoute{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[23]
+	mi := &file_litevirt_v1_types_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2636,7 +2823,7 @@ func (x *NotificationRoute) String() string {
 func (*NotificationRoute) ProtoMessage() {}
 
 func (x *NotificationRoute) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[23]
+	mi := &file_litevirt_v1_types_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2649,7 +2836,7 @@ func (x *NotificationRoute) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotificationRoute.ProtoReflect.Descriptor instead.
 func (*NotificationRoute) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{23}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *NotificationRoute) GetId() string {
@@ -2707,7 +2894,7 @@ type FirewallRule struct {
 
 func (x *FirewallRule) Reset() {
 	*x = FirewallRule{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[24]
+	mi := &file_litevirt_v1_types_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2719,7 +2906,7 @@ func (x *FirewallRule) String() string {
 func (*FirewallRule) ProtoMessage() {}
 
 func (x *FirewallRule) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[24]
+	mi := &file_litevirt_v1_types_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2732,7 +2919,7 @@ func (x *FirewallRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FirewallRule.ProtoReflect.Descriptor instead.
 func (*FirewallRule) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{24}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *FirewallRule) GetId() string {
@@ -2818,7 +3005,7 @@ type IpSet struct {
 
 func (x *IpSet) Reset() {
 	*x = IpSet{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[25]
+	mi := &file_litevirt_v1_types_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2830,7 +3017,7 @@ func (x *IpSet) String() string {
 func (*IpSet) ProtoMessage() {}
 
 func (x *IpSet) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[25]
+	mi := &file_litevirt_v1_types_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2843,7 +3030,7 @@ func (x *IpSet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IpSet.ProtoReflect.Descriptor instead.
 func (*IpSet) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{25}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *IpSet) GetId() string {
@@ -2886,7 +3073,7 @@ type FirewallDefault struct {
 
 func (x *FirewallDefault) Reset() {
 	*x = FirewallDefault{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[26]
+	mi := &file_litevirt_v1_types_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2898,7 +3085,7 @@ func (x *FirewallDefault) String() string {
 func (*FirewallDefault) ProtoMessage() {}
 
 func (x *FirewallDefault) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[26]
+	mi := &file_litevirt_v1_types_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2911,7 +3098,7 @@ func (x *FirewallDefault) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FirewallDefault.ProtoReflect.Descriptor instead.
 func (*FirewallDefault) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{26}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *FirewallDefault) GetScope() string {
@@ -2948,7 +3135,7 @@ type SecurityGroup struct {
 
 func (x *SecurityGroup) Reset() {
 	*x = SecurityGroup{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[27]
+	mi := &file_litevirt_v1_types_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2960,7 +3147,7 @@ func (x *SecurityGroup) String() string {
 func (*SecurityGroup) ProtoMessage() {}
 
 func (x *SecurityGroup) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[27]
+	mi := &file_litevirt_v1_types_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2973,7 +3160,7 @@ func (x *SecurityGroup) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecurityGroup.ProtoReflect.Descriptor instead.
 func (*SecurityGroup) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{27}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *SecurityGroup) GetId() string {
@@ -3021,7 +3208,7 @@ type SecurityGroupRule struct {
 
 func (x *SecurityGroupRule) Reset() {
 	*x = SecurityGroupRule{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[28]
+	mi := &file_litevirt_v1_types_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3033,7 +3220,7 @@ func (x *SecurityGroupRule) String() string {
 func (*SecurityGroupRule) ProtoMessage() {}
 
 func (x *SecurityGroupRule) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[28]
+	mi := &file_litevirt_v1_types_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3046,7 +3233,7 @@ func (x *SecurityGroupRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecurityGroupRule.ProtoReflect.Descriptor instead.
 func (*SecurityGroupRule) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{28}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *SecurityGroupRule) GetId() string {
@@ -3131,7 +3318,7 @@ type PCIDevice struct {
 
 func (x *PCIDevice) Reset() {
 	*x = PCIDevice{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[29]
+	mi := &file_litevirt_v1_types_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3143,7 +3330,7 @@ func (x *PCIDevice) String() string {
 func (*PCIDevice) ProtoMessage() {}
 
 func (x *PCIDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[29]
+	mi := &file_litevirt_v1_types_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3156,7 +3343,7 @@ func (x *PCIDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PCIDevice.ProtoReflect.Descriptor instead.
 func (*PCIDevice) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{29}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *PCIDevice) GetHostName() string {
@@ -3298,7 +3485,7 @@ type AttachDeviceRequest struct {
 
 func (x *AttachDeviceRequest) Reset() {
 	*x = AttachDeviceRequest{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[30]
+	mi := &file_litevirt_v1_types_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3310,7 +3497,7 @@ func (x *AttachDeviceRequest) String() string {
 func (*AttachDeviceRequest) ProtoMessage() {}
 
 func (x *AttachDeviceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[30]
+	mi := &file_litevirt_v1_types_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3323,7 +3510,7 @@ func (x *AttachDeviceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachDeviceRequest.ProtoReflect.Descriptor instead.
 func (*AttachDeviceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{30}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *AttachDeviceRequest) GetVmName() string {
@@ -3374,7 +3561,7 @@ type DetachDeviceRequest struct {
 
 func (x *DetachDeviceRequest) Reset() {
 	*x = DetachDeviceRequest{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[31]
+	mi := &file_litevirt_v1_types_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3386,7 +3573,7 @@ func (x *DetachDeviceRequest) String() string {
 func (*DetachDeviceRequest) ProtoMessage() {}
 
 func (x *DetachDeviceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[31]
+	mi := &file_litevirt_v1_types_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3399,7 +3586,7 @@ func (x *DetachDeviceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DetachDeviceRequest.ProtoReflect.Descriptor instead.
 func (*DetachDeviceRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{31}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *DetachDeviceRequest) GetVmName() string {
@@ -3481,7 +3668,7 @@ type VM struct {
 
 func (x *VM) Reset() {
 	*x = VM{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[32]
+	mi := &file_litevirt_v1_types_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3493,7 +3680,7 @@ func (x *VM) String() string {
 func (*VM) ProtoMessage() {}
 
 func (x *VM) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[32]
+	mi := &file_litevirt_v1_types_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3506,7 +3693,7 @@ func (x *VM) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VM.ProtoReflect.Descriptor instead.
 func (*VM) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{32}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *VM) GetName() string {
@@ -3655,7 +3842,7 @@ type VMStrandedDisk struct {
 
 func (x *VMStrandedDisk) Reset() {
 	*x = VMStrandedDisk{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[33]
+	mi := &file_litevirt_v1_types_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3667,7 +3854,7 @@ func (x *VMStrandedDisk) String() string {
 func (*VMStrandedDisk) ProtoMessage() {}
 
 func (x *VMStrandedDisk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[33]
+	mi := &file_litevirt_v1_types_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3680,7 +3867,7 @@ func (x *VMStrandedDisk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMStrandedDisk.ProtoReflect.Descriptor instead.
 func (*VMStrandedDisk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{33}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *VMStrandedDisk) GetHost() string {
@@ -3731,7 +3918,7 @@ type VMInterface struct {
 
 func (x *VMInterface) Reset() {
 	*x = VMInterface{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[34]
+	mi := &file_litevirt_v1_types_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3743,7 +3930,7 @@ func (x *VMInterface) String() string {
 func (*VMInterface) ProtoMessage() {}
 
 func (x *VMInterface) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[34]
+	mi := &file_litevirt_v1_types_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3756,7 +3943,7 @@ func (x *VMInterface) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMInterface.ProtoReflect.Descriptor instead.
 func (*VMInterface) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{34}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *VMInterface) GetNetworkName() string {
@@ -3809,7 +3996,7 @@ type VMDisk struct {
 
 func (x *VMDisk) Reset() {
 	*x = VMDisk{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[35]
+	mi := &file_litevirt_v1_types_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3821,7 +4008,7 @@ func (x *VMDisk) String() string {
 func (*VMDisk) ProtoMessage() {}
 
 func (x *VMDisk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[35]
+	mi := &file_litevirt_v1_types_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3834,7 +4021,7 @@ func (x *VMDisk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMDisk.ProtoReflect.Descriptor instead.
 func (*VMDisk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{35}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *VMDisk) GetName() string {
@@ -3900,7 +4087,7 @@ type HardwareDevice struct {
 
 func (x *HardwareDevice) Reset() {
 	*x = HardwareDevice{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[36]
+	mi := &file_litevirt_v1_types_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3912,7 +4099,7 @@ func (x *HardwareDevice) String() string {
 func (*HardwareDevice) ProtoMessage() {}
 
 func (x *HardwareDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[36]
+	mi := &file_litevirt_v1_types_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3925,7 +4112,7 @@ func (x *HardwareDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardwareDevice.ProtoReflect.Descriptor instead.
 func (*HardwareDevice) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{36}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *HardwareDevice) GetDevice() isHardwareDevice_Device {
@@ -4001,7 +4188,7 @@ type HardwareDisk struct {
 
 func (x *HardwareDisk) Reset() {
 	*x = HardwareDisk{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[37]
+	mi := &file_litevirt_v1_types_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4013,7 +4200,7 @@ func (x *HardwareDisk) String() string {
 func (*HardwareDisk) ProtoMessage() {}
 
 func (x *HardwareDisk) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[37]
+	mi := &file_litevirt_v1_types_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4026,7 +4213,7 @@ func (x *HardwareDisk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardwareDisk.ProtoReflect.Descriptor instead.
 func (*HardwareDisk) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{37}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *HardwareDisk) GetDeviceId() string {
@@ -4106,7 +4293,7 @@ type HardwareNIC struct {
 
 func (x *HardwareNIC) Reset() {
 	*x = HardwareNIC{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[38]
+	mi := &file_litevirt_v1_types_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4118,7 +4305,7 @@ func (x *HardwareNIC) String() string {
 func (*HardwareNIC) ProtoMessage() {}
 
 func (x *HardwareNIC) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[38]
+	mi := &file_litevirt_v1_types_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4131,7 +4318,7 @@ func (x *HardwareNIC) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardwareNIC.ProtoReflect.Descriptor instead.
 func (*HardwareNIC) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{38}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *HardwareNIC) GetMac() string {
@@ -4188,7 +4375,7 @@ type HardwarePCIMember struct {
 
 func (x *HardwarePCIMember) Reset() {
 	*x = HardwarePCIMember{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[39]
+	mi := &file_litevirt_v1_types_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4200,7 +4387,7 @@ func (x *HardwarePCIMember) String() string {
 func (*HardwarePCIMember) ProtoMessage() {}
 
 func (x *HardwarePCIMember) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[39]
+	mi := &file_litevirt_v1_types_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4213,7 +4400,7 @@ func (x *HardwarePCIMember) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardwarePCIMember.ProtoReflect.Descriptor instead.
 func (*HardwarePCIMember) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{39}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *HardwarePCIMember) GetMemberId() string {
@@ -4257,7 +4444,7 @@ type HardwarePCI struct {
 
 func (x *HardwarePCI) Reset() {
 	*x = HardwarePCI{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[40]
+	mi := &file_litevirt_v1_types_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4269,7 +4456,7 @@ func (x *HardwarePCI) String() string {
 func (*HardwarePCI) ProtoMessage() {}
 
 func (x *HardwarePCI) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[40]
+	mi := &file_litevirt_v1_types_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4282,7 +4469,7 @@ func (x *HardwarePCI) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HardwarePCI.ProtoReflect.Descriptor instead.
 func (*HardwarePCI) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{40}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *HardwarePCI) GetDeviceId() string {
@@ -4370,7 +4557,7 @@ type Host struct {
 
 func (x *Host) Reset() {
 	*x = Host{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[41]
+	mi := &file_litevirt_v1_types_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4382,7 +4569,7 @@ func (x *Host) String() string {
 func (*Host) ProtoMessage() {}
 
 func (x *Host) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[41]
+	mi := &file_litevirt_v1_types_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4395,7 +4582,7 @@ func (x *Host) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Host.ProtoReflect.Descriptor instead.
 func (*Host) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{41}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *Host) GetName() string {
@@ -4583,7 +4770,7 @@ type Image struct {
 
 func (x *Image) Reset() {
 	*x = Image{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[42]
+	mi := &file_litevirt_v1_types_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4595,7 +4782,7 @@ func (x *Image) String() string {
 func (*Image) ProtoMessage() {}
 
 func (x *Image) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[42]
+	mi := &file_litevirt_v1_types_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4608,7 +4795,7 @@ func (x *Image) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Image.ProtoReflect.Descriptor instead.
 func (*Image) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{42}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *Image) GetName() string {
@@ -4691,7 +4878,7 @@ type Snapshot struct {
 
 func (x *Snapshot) Reset() {
 	*x = Snapshot{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[43]
+	mi := &file_litevirt_v1_types_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4703,7 +4890,7 @@ func (x *Snapshot) String() string {
 func (*Snapshot) ProtoMessage() {}
 
 func (x *Snapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[43]
+	mi := &file_litevirt_v1_types_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4716,7 +4903,7 @@ func (x *Snapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Snapshot.ProtoReflect.Descriptor instead.
 func (*Snapshot) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{43}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *Snapshot) GetId() string {
@@ -4802,7 +4989,7 @@ type User struct {
 
 func (x *User) Reset() {
 	*x = User{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[44]
+	mi := &file_litevirt_v1_types_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4814,7 +5001,7 @@ func (x *User) String() string {
 func (*User) ProtoMessage() {}
 
 func (x *User) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[44]
+	mi := &file_litevirt_v1_types_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4827,7 +5014,7 @@ func (x *User) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use User.ProtoReflect.Descriptor instead.
 func (*User) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{44}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *User) GetUsername() string {
@@ -4886,7 +5073,7 @@ type Token struct {
 
 func (x *Token) Reset() {
 	*x = Token{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[45]
+	mi := &file_litevirt_v1_types_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4898,7 +5085,7 @@ func (x *Token) String() string {
 func (*Token) ProtoMessage() {}
 
 func (x *Token) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[45]
+	mi := &file_litevirt_v1_types_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4911,7 +5098,7 @@ func (x *Token) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Token.ProtoReflect.Descriptor instead.
 func (*Token) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{45}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *Token) GetId() string {
@@ -4973,7 +5160,7 @@ type LoadBalancer struct {
 
 func (x *LoadBalancer) Reset() {
 	*x = LoadBalancer{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[46]
+	mi := &file_litevirt_v1_types_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4985,7 +5172,7 @@ func (x *LoadBalancer) String() string {
 func (*LoadBalancer) ProtoMessage() {}
 
 func (x *LoadBalancer) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[46]
+	mi := &file_litevirt_v1_types_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4998,7 +5185,7 @@ func (x *LoadBalancer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadBalancer.ProtoReflect.Descriptor instead.
 func (*LoadBalancer) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{46}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *LoadBalancer) GetName() string {
@@ -5077,7 +5264,7 @@ type LBBackend struct {
 
 func (x *LBBackend) Reset() {
 	*x = LBBackend{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[47]
+	mi := &file_litevirt_v1_types_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5089,7 +5276,7 @@ func (x *LBBackend) String() string {
 func (*LBBackend) ProtoMessage() {}
 
 func (x *LBBackend) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[47]
+	mi := &file_litevirt_v1_types_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5102,7 +5289,7 @@ func (x *LBBackend) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBBackend.ProtoReflect.Descriptor instead.
 func (*LBBackend) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{47}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *LBBackend) GetVmName() string {
@@ -5151,7 +5338,7 @@ type LBBackendAddress struct {
 
 func (x *LBBackendAddress) Reset() {
 	*x = LBBackendAddress{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[48]
+	mi := &file_litevirt_v1_types_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5163,7 +5350,7 @@ func (x *LBBackendAddress) String() string {
 func (*LBBackendAddress) ProtoMessage() {}
 
 func (x *LBBackendAddress) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[48]
+	mi := &file_litevirt_v1_types_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5176,7 +5363,7 @@ func (x *LBBackendAddress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBBackendAddress.ProtoReflect.Descriptor instead.
 func (*LBBackendAddress) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{48}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *LBBackendAddress) GetName() string {
@@ -5217,7 +5404,7 @@ type LBBackendStats struct {
 
 func (x *LBBackendStats) Reset() {
 	*x = LBBackendStats{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[49]
+	mi := &file_litevirt_v1_types_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5229,7 +5416,7 @@ func (x *LBBackendStats) String() string {
 func (*LBBackendStats) ProtoMessage() {}
 
 func (x *LBBackendStats) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[49]
+	mi := &file_litevirt_v1_types_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5242,7 +5429,7 @@ func (x *LBBackendStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBBackendStats.ProtoReflect.Descriptor instead.
 func (*LBBackendStats) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{49}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *LBBackendStats) GetName() string {
@@ -5365,7 +5552,7 @@ type LBFrontendStats struct {
 
 func (x *LBFrontendStats) Reset() {
 	*x = LBFrontendStats{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[50]
+	mi := &file_litevirt_v1_types_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5377,7 +5564,7 @@ func (x *LBFrontendStats) String() string {
 func (*LBFrontendStats) ProtoMessage() {}
 
 func (x *LBFrontendStats) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[50]
+	mi := &file_litevirt_v1_types_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5390,7 +5577,7 @@ func (x *LBFrontendStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBFrontendStats.ProtoReflect.Descriptor instead.
 func (*LBFrontendStats) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{50}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *LBFrontendStats) GetListenPort() int32 {
@@ -5447,7 +5634,7 @@ type LBStatsResponse struct {
 
 func (x *LBStatsResponse) Reset() {
 	*x = LBStatsResponse{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[51]
+	mi := &file_litevirt_v1_types_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5459,7 +5646,7 @@ func (x *LBStatsResponse) String() string {
 func (*LBStatsResponse) ProtoMessage() {}
 
 func (x *LBStatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[51]
+	mi := &file_litevirt_v1_types_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5472,7 +5659,7 @@ func (x *LBStatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBStatsResponse.ProtoReflect.Descriptor instead.
 func (*LBStatsResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{51}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *LBStatsResponse) GetName() string {
@@ -5505,7 +5692,7 @@ type LBKeepalivedRequest struct {
 
 func (x *LBKeepalivedRequest) Reset() {
 	*x = LBKeepalivedRequest{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[52]
+	mi := &file_litevirt_v1_types_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5517,7 +5704,7 @@ func (x *LBKeepalivedRequest) String() string {
 func (*LBKeepalivedRequest) ProtoMessage() {}
 
 func (x *LBKeepalivedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[52]
+	mi := &file_litevirt_v1_types_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5530,7 +5717,7 @@ func (x *LBKeepalivedRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBKeepalivedRequest.ProtoReflect.Descriptor instead.
 func (*LBKeepalivedRequest) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{52}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *LBKeepalivedRequest) GetName() string {
@@ -5549,7 +5736,7 @@ type LBKeepalivedResponse struct {
 
 func (x *LBKeepalivedResponse) Reset() {
 	*x = LBKeepalivedResponse{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[53]
+	mi := &file_litevirt_v1_types_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5561,7 +5748,7 @@ func (x *LBKeepalivedResponse) String() string {
 func (*LBKeepalivedResponse) ProtoMessage() {}
 
 func (x *LBKeepalivedResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[53]
+	mi := &file_litevirt_v1_types_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5574,7 +5761,7 @@ func (x *LBKeepalivedResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LBKeepalivedResponse.ProtoReflect.Descriptor instead.
 func (*LBKeepalivedResponse) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{53}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *LBKeepalivedResponse) GetRunning() bool {
@@ -5603,7 +5790,7 @@ type VMStats struct {
 
 func (x *VMStats) Reset() {
 	*x = VMStats{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[54]
+	mi := &file_litevirt_v1_types_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5615,7 +5802,7 @@ func (x *VMStats) String() string {
 func (*VMStats) ProtoMessage() {}
 
 func (x *VMStats) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[54]
+	mi := &file_litevirt_v1_types_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5628,7 +5815,7 @@ func (x *VMStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMStats.ProtoReflect.Descriptor instead.
 func (*VMStats) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{54}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *VMStats) GetName() string {
@@ -5717,7 +5904,7 @@ type HostResourceStats struct {
 
 func (x *HostResourceStats) Reset() {
 	*x = HostResourceStats{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[55]
+	mi := &file_litevirt_v1_types_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5729,7 +5916,7 @@ func (x *HostResourceStats) String() string {
 func (*HostResourceStats) ProtoMessage() {}
 
 func (x *HostResourceStats) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[55]
+	mi := &file_litevirt_v1_types_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5742,7 +5929,7 @@ func (x *HostResourceStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostResourceStats.ProtoReflect.Descriptor instead.
 func (*HostResourceStats) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{55}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *HostResourceStats) GetHostName() string {
@@ -5807,7 +5994,7 @@ type ClusterEvent struct {
 
 func (x *ClusterEvent) Reset() {
 	*x = ClusterEvent{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[56]
+	mi := &file_litevirt_v1_types_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5819,7 +6006,7 @@ func (x *ClusterEvent) String() string {
 func (*ClusterEvent) ProtoMessage() {}
 
 func (x *ClusterEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[56]
+	mi := &file_litevirt_v1_types_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5832,7 +6019,7 @@ func (x *ClusterEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterEvent.ProtoReflect.Descriptor instead.
 func (*ClusterEvent) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{56}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *ClusterEvent) GetAction() string {
@@ -5889,7 +6076,7 @@ type StoragePool struct {
 
 func (x *StoragePool) Reset() {
 	*x = StoragePool{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[57]
+	mi := &file_litevirt_v1_types_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5901,7 +6088,7 @@ func (x *StoragePool) String() string {
 func (*StoragePool) ProtoMessage() {}
 
 func (x *StoragePool) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[57]
+	mi := &file_litevirt_v1_types_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5914,7 +6101,7 @@ func (x *StoragePool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoragePool.ProtoReflect.Descriptor instead.
 func (*StoragePool) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{57}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *StoragePool) GetName() string {
@@ -6061,7 +6248,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x06vendor\x18\x01 \x01(\tR\x06vendor\x12\x18\n" +
 	"\aproduct\x18\x02 \x01(\tR\aproduct\x12\x19\n" +
 	"\bbus_port\x18\x03 \x01(\tR\abusPort\x12\x18\n" +
-	"\amapping\x18\x04 \x01(\tR\amapping\"\xd3\x01\n" +
+	"\amapping\x18\x04 \x01(\tR\amapping\"\xbd\x02\n" +
 	"\bDiskSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\tR\x04size\x12\x10\n" +
@@ -6070,7 +6257,26 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05image\x18\x05 \x01(\tR\x05image\x12\x18\n" +
 	"\astorage\x18\x06 \x01(\tR\astorage\x12)\n" +
 	"\x10controller_model\x18\a \x01(\tR\x0fcontrollerModel\x12\x1c\n" +
-	"\toverwrite\x18\b \x01(\bR\toverwrite\"\xef\x01\n" +
+	"\toverwrite\x18\b \x01(\bR\toverwrite\x12\x18\n" +
+	"\adiscard\x18\t \x01(\tR\adiscard\x12#\n" +
+	"\rdetect_zeroes\x18\n" +
+	" \x01(\tR\fdetectZeroes\x12)\n" +
+	"\x02io\x18\v \x01(\v2\x19.litevirt.v1.DiskIOLimitsR\x02io\"\xa9\x04\n" +
+	"\fDiskIOLimits\x12&\n" +
+	"\x0ftotal_bytes_sec\x18\x01 \x01(\x03R\rtotalBytesSec\x12$\n" +
+	"\x0eread_bytes_sec\x18\x02 \x01(\x03R\freadBytesSec\x12&\n" +
+	"\x0fwrite_bytes_sec\x18\x03 \x01(\x03R\rwriteBytesSec\x12$\n" +
+	"\x0etotal_iops_sec\x18\x04 \x01(\x03R\ftotalIopsSec\x12\"\n" +
+	"\rread_iops_sec\x18\x05 \x01(\x03R\vreadIopsSec\x12$\n" +
+	"\x0ewrite_iops_sec\x18\x06 \x01(\x03R\fwriteIopsSec\x12-\n" +
+	"\x13total_bytes_sec_max\x18\a \x01(\x03R\x10totalBytesSecMax\x12+\n" +
+	"\x12read_bytes_sec_max\x18\b \x01(\x03R\x0freadBytesSecMax\x12-\n" +
+	"\x13write_bytes_sec_max\x18\t \x01(\x03R\x10writeBytesSecMax\x12+\n" +
+	"\x12total_iops_sec_max\x18\n" +
+	" \x01(\x03R\x0ftotalIopsSecMax\x12)\n" +
+	"\x11read_iops_sec_max\x18\v \x01(\x03R\x0ereadIopsSecMax\x12+\n" +
+	"\x12write_iops_sec_max\x18\f \x01(\x03R\x0fwriteIopsSecMax\x12#\n" +
+	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\x87\x02\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -6080,7 +6286,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x05trunk\x18\x06 \x03(\x05R\x05trunk\x12\x12\n" +
 	"\x04ipv6\x18\a \x01(\tR\x04ipv6\x12!\n" +
 	"\fipv6_gateway\x18\b \x01(\tR\vipv6Gateway\x12'\n" +
-	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\"m\n" +
+	"\x0fsecurity_groups\x18\t \x03(\tR\x0esecurityGroups\x12\x16\n" +
+	"\x06queues\x18\f \x01(\x05R\x06queues\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +
@@ -6632,7 +6839,7 @@ func file_litevirt_v1_types_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 62)
+var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 63)
 var file_litevirt_v1_types_proto_goTypes = []any{
 	(VMState)(0),                  // 0: litevirt.v1.VMState
 	(HostState)(0),                // 1: litevirt.v1.HostState
@@ -6643,130 +6850,132 @@ var file_litevirt_v1_types_proto_goTypes = []any{
 	(*VMSpec)(nil),                // 6: litevirt.v1.VMSpec
 	(*USBDeviceSpec)(nil),         // 7: litevirt.v1.USBDeviceSpec
 	(*DiskSpec)(nil),              // 8: litevirt.v1.DiskSpec
-	(*NetworkAttachment)(nil),     // 9: litevirt.v1.NetworkAttachment
-	(*CloudInitSpec)(nil),         // 10: litevirt.v1.CloudInitSpec
-	(*PlacementSpec)(nil),         // 11: litevirt.v1.PlacementSpec
-	(*RebalanceSpec)(nil),         // 12: litevirt.v1.RebalanceSpec
-	(*RebalanceBudget)(nil),       // 13: litevirt.v1.RebalanceBudget
-	(*MigrationPolicy)(nil),       // 14: litevirt.v1.MigrationPolicy
-	(*UpdatePolicy)(nil),          // 15: litevirt.v1.UpdatePolicy
-	(*ResourceTuning)(nil),        // 16: litevirt.v1.ResourceTuning
-	(*NUMAPolicy)(nil),            // 17: litevirt.v1.NUMAPolicy
-	(*HealthCheckSpec)(nil),       // 18: litevirt.v1.HealthCheckSpec
-	(*HooksSpec)(nil),             // 19: litevirt.v1.HooksSpec
-	(*LBSpec)(nil),                // 20: litevirt.v1.LBSpec
-	(*LBPort)(nil),                // 21: litevirt.v1.LBPort
-	(*LBTlsSpec)(nil),             // 22: litevirt.v1.LBTlsSpec
-	(*LBHealthSpec)(nil),          // 23: litevirt.v1.LBHealthSpec
-	(*RestartPolicy)(nil),         // 24: litevirt.v1.RestartPolicy
-	(*DeviceSpec)(nil),            // 25: litevirt.v1.DeviceSpec
-	(*ResourceMappingDevice)(nil), // 26: litevirt.v1.ResourceMappingDevice
-	(*ResourceMapping)(nil),       // 27: litevirt.v1.ResourceMapping
-	(*NotificationTarget)(nil),    // 28: litevirt.v1.NotificationTarget
-	(*NotificationRoute)(nil),     // 29: litevirt.v1.NotificationRoute
-	(*FirewallRule)(nil),          // 30: litevirt.v1.FirewallRule
-	(*IpSet)(nil),                 // 31: litevirt.v1.IpSet
-	(*FirewallDefault)(nil),       // 32: litevirt.v1.FirewallDefault
-	(*SecurityGroup)(nil),         // 33: litevirt.v1.SecurityGroup
-	(*SecurityGroupRule)(nil),     // 34: litevirt.v1.SecurityGroupRule
-	(*PCIDevice)(nil),             // 35: litevirt.v1.PCIDevice
-	(*AttachDeviceRequest)(nil),   // 36: litevirt.v1.AttachDeviceRequest
-	(*DetachDeviceRequest)(nil),   // 37: litevirt.v1.DetachDeviceRequest
-	(*VM)(nil),                    // 38: litevirt.v1.VM
-	(*VMStrandedDisk)(nil),        // 39: litevirt.v1.VMStrandedDisk
-	(*VMInterface)(nil),           // 40: litevirt.v1.VMInterface
-	(*VMDisk)(nil),                // 41: litevirt.v1.VMDisk
-	(*HardwareDevice)(nil),        // 42: litevirt.v1.HardwareDevice
-	(*HardwareDisk)(nil),          // 43: litevirt.v1.HardwareDisk
-	(*HardwareNIC)(nil),           // 44: litevirt.v1.HardwareNIC
-	(*HardwarePCIMember)(nil),     // 45: litevirt.v1.HardwarePCIMember
-	(*HardwarePCI)(nil),           // 46: litevirt.v1.HardwarePCI
-	(*Host)(nil),                  // 47: litevirt.v1.Host
-	(*Image)(nil),                 // 48: litevirt.v1.Image
-	(*Snapshot)(nil),              // 49: litevirt.v1.Snapshot
-	(*User)(nil),                  // 50: litevirt.v1.User
-	(*Token)(nil),                 // 51: litevirt.v1.Token
-	(*LoadBalancer)(nil),          // 52: litevirt.v1.LoadBalancer
-	(*LBBackend)(nil),             // 53: litevirt.v1.LBBackend
-	(*LBBackendAddress)(nil),      // 54: litevirt.v1.LBBackendAddress
-	(*LBBackendStats)(nil),        // 55: litevirt.v1.LBBackendStats
-	(*LBFrontendStats)(nil),       // 56: litevirt.v1.LBFrontendStats
-	(*LBStatsResponse)(nil),       // 57: litevirt.v1.LBStatsResponse
-	(*LBKeepalivedRequest)(nil),   // 58: litevirt.v1.LBKeepalivedRequest
-	(*LBKeepalivedResponse)(nil),  // 59: litevirt.v1.LBKeepalivedResponse
-	(*VMStats)(nil),               // 60: litevirt.v1.VMStats
-	(*HostResourceStats)(nil),     // 61: litevirt.v1.HostResourceStats
-	(*ClusterEvent)(nil),          // 62: litevirt.v1.ClusterEvent
-	(*StoragePool)(nil),           // 63: litevirt.v1.StoragePool
-	nil,                           // 64: litevirt.v1.VMSpec.LabelsEntry
-	nil,                           // 65: litevirt.v1.PlacementSpec.RequireEntry
-	nil,                           // 66: litevirt.v1.PlacementSpec.PreferEntry
-	nil,                           // 67: litevirt.v1.Host.LabelsEntry
-	(*timestamppb.Timestamp)(nil), // 68: google.protobuf.Timestamp
+	(*DiskIOLimits)(nil),          // 9: litevirt.v1.DiskIOLimits
+	(*NetworkAttachment)(nil),     // 10: litevirt.v1.NetworkAttachment
+	(*CloudInitSpec)(nil),         // 11: litevirt.v1.CloudInitSpec
+	(*PlacementSpec)(nil),         // 12: litevirt.v1.PlacementSpec
+	(*RebalanceSpec)(nil),         // 13: litevirt.v1.RebalanceSpec
+	(*RebalanceBudget)(nil),       // 14: litevirt.v1.RebalanceBudget
+	(*MigrationPolicy)(nil),       // 15: litevirt.v1.MigrationPolicy
+	(*UpdatePolicy)(nil),          // 16: litevirt.v1.UpdatePolicy
+	(*ResourceTuning)(nil),        // 17: litevirt.v1.ResourceTuning
+	(*NUMAPolicy)(nil),            // 18: litevirt.v1.NUMAPolicy
+	(*HealthCheckSpec)(nil),       // 19: litevirt.v1.HealthCheckSpec
+	(*HooksSpec)(nil),             // 20: litevirt.v1.HooksSpec
+	(*LBSpec)(nil),                // 21: litevirt.v1.LBSpec
+	(*LBPort)(nil),                // 22: litevirt.v1.LBPort
+	(*LBTlsSpec)(nil),             // 23: litevirt.v1.LBTlsSpec
+	(*LBHealthSpec)(nil),          // 24: litevirt.v1.LBHealthSpec
+	(*RestartPolicy)(nil),         // 25: litevirt.v1.RestartPolicy
+	(*DeviceSpec)(nil),            // 26: litevirt.v1.DeviceSpec
+	(*ResourceMappingDevice)(nil), // 27: litevirt.v1.ResourceMappingDevice
+	(*ResourceMapping)(nil),       // 28: litevirt.v1.ResourceMapping
+	(*NotificationTarget)(nil),    // 29: litevirt.v1.NotificationTarget
+	(*NotificationRoute)(nil),     // 30: litevirt.v1.NotificationRoute
+	(*FirewallRule)(nil),          // 31: litevirt.v1.FirewallRule
+	(*IpSet)(nil),                 // 32: litevirt.v1.IpSet
+	(*FirewallDefault)(nil),       // 33: litevirt.v1.FirewallDefault
+	(*SecurityGroup)(nil),         // 34: litevirt.v1.SecurityGroup
+	(*SecurityGroupRule)(nil),     // 35: litevirt.v1.SecurityGroupRule
+	(*PCIDevice)(nil),             // 36: litevirt.v1.PCIDevice
+	(*AttachDeviceRequest)(nil),   // 37: litevirt.v1.AttachDeviceRequest
+	(*DetachDeviceRequest)(nil),   // 38: litevirt.v1.DetachDeviceRequest
+	(*VM)(nil),                    // 39: litevirt.v1.VM
+	(*VMStrandedDisk)(nil),        // 40: litevirt.v1.VMStrandedDisk
+	(*VMInterface)(nil),           // 41: litevirt.v1.VMInterface
+	(*VMDisk)(nil),                // 42: litevirt.v1.VMDisk
+	(*HardwareDevice)(nil),        // 43: litevirt.v1.HardwareDevice
+	(*HardwareDisk)(nil),          // 44: litevirt.v1.HardwareDisk
+	(*HardwareNIC)(nil),           // 45: litevirt.v1.HardwareNIC
+	(*HardwarePCIMember)(nil),     // 46: litevirt.v1.HardwarePCIMember
+	(*HardwarePCI)(nil),           // 47: litevirt.v1.HardwarePCI
+	(*Host)(nil),                  // 48: litevirt.v1.Host
+	(*Image)(nil),                 // 49: litevirt.v1.Image
+	(*Snapshot)(nil),              // 50: litevirt.v1.Snapshot
+	(*User)(nil),                  // 51: litevirt.v1.User
+	(*Token)(nil),                 // 52: litevirt.v1.Token
+	(*LoadBalancer)(nil),          // 53: litevirt.v1.LoadBalancer
+	(*LBBackend)(nil),             // 54: litevirt.v1.LBBackend
+	(*LBBackendAddress)(nil),      // 55: litevirt.v1.LBBackendAddress
+	(*LBBackendStats)(nil),        // 56: litevirt.v1.LBBackendStats
+	(*LBFrontendStats)(nil),       // 57: litevirt.v1.LBFrontendStats
+	(*LBStatsResponse)(nil),       // 58: litevirt.v1.LBStatsResponse
+	(*LBKeepalivedRequest)(nil),   // 59: litevirt.v1.LBKeepalivedRequest
+	(*LBKeepalivedResponse)(nil),  // 60: litevirt.v1.LBKeepalivedResponse
+	(*VMStats)(nil),               // 61: litevirt.v1.VMStats
+	(*HostResourceStats)(nil),     // 62: litevirt.v1.HostResourceStats
+	(*ClusterEvent)(nil),          // 63: litevirt.v1.ClusterEvent
+	(*StoragePool)(nil),           // 64: litevirt.v1.StoragePool
+	nil,                           // 65: litevirt.v1.VMSpec.LabelsEntry
+	nil,                           // 66: litevirt.v1.PlacementSpec.RequireEntry
+	nil,                           // 67: litevirt.v1.PlacementSpec.PreferEntry
+	nil,                           // 68: litevirt.v1.Host.LabelsEntry
+	(*timestamppb.Timestamp)(nil), // 69: google.protobuf.Timestamp
 }
 var file_litevirt_v1_types_proto_depIdxs = []int32{
 	8,  // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
-	9,  // 1: litevirt.v1.VMSpec.network:type_name -> litevirt.v1.NetworkAttachment
-	10, // 2: litevirt.v1.VMSpec.cloud_init:type_name -> litevirt.v1.CloudInitSpec
-	11, // 3: litevirt.v1.VMSpec.placement:type_name -> litevirt.v1.PlacementSpec
-	14, // 4: litevirt.v1.VMSpec.migrate:type_name -> litevirt.v1.MigrationPolicy
-	15, // 5: litevirt.v1.VMSpec.update:type_name -> litevirt.v1.UpdatePolicy
-	16, // 6: litevirt.v1.VMSpec.resources:type_name -> litevirt.v1.ResourceTuning
-	18, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
-	19, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
-	20, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
-	64, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
-	25, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
-	24, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
+	10, // 1: litevirt.v1.VMSpec.network:type_name -> litevirt.v1.NetworkAttachment
+	11, // 2: litevirt.v1.VMSpec.cloud_init:type_name -> litevirt.v1.CloudInitSpec
+	12, // 3: litevirt.v1.VMSpec.placement:type_name -> litevirt.v1.PlacementSpec
+	15, // 4: litevirt.v1.VMSpec.migrate:type_name -> litevirt.v1.MigrationPolicy
+	16, // 5: litevirt.v1.VMSpec.update:type_name -> litevirt.v1.UpdatePolicy
+	17, // 6: litevirt.v1.VMSpec.resources:type_name -> litevirt.v1.ResourceTuning
+	19, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
+	20, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
+	21, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
+	65, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
+	26, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
+	25, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
 	7,  // 13: litevirt.v1.VMSpec.usb_devices:type_name -> litevirt.v1.USBDeviceSpec
-	65, // 14: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
-	66, // 15: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
-	12, // 16: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
-	13, // 17: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
-	2,  // 18: litevirt.v1.MigrationPolicy.strategy:type_name -> litevirt.v1.MigrateStrategy
-	3,  // 19: litevirt.v1.MigrationPolicy.on_host_failure:type_name -> litevirt.v1.HostFailurePolicy
-	17, // 20: litevirt.v1.ResourceTuning.numa_policy:type_name -> litevirt.v1.NUMAPolicy
-	21, // 21: litevirt.v1.LBSpec.ports:type_name -> litevirt.v1.LBPort
-	23, // 22: litevirt.v1.LBSpec.health:type_name -> litevirt.v1.LBHealthSpec
-	22, // 23: litevirt.v1.LBPort.tls:type_name -> litevirt.v1.LBTlsSpec
-	26, // 24: litevirt.v1.ResourceMapping.devices:type_name -> litevirt.v1.ResourceMappingDevice
-	8,  // 25: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
-	9,  // 26: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
-	25, // 27: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
-	6,  // 28: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
-	0,  // 29: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
-	40, // 30: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
-	41, // 31: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
-	68, // 32: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
-	68, // 33: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
-	39, // 34: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
-	43, // 35: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
-	44, // 36: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
-	46, // 37: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
-	25, // 38: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
-	45, // 39: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
-	1,  // 40: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
-	67, // 41: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
-	68, // 42: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
-	68, // 43: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
-	35, // 44: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
-	63, // 45: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
-	68, // 46: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
-	68, // 47: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
-	68, // 48: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	68, // 49: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
-	68, // 50: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
-	53, // 51: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
-	21, // 52: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
-	56, // 53: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
-	55, // 54: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
-	60, // 55: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
-	68, // 56: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
-	57, // [57:57] is the sub-list for method output_type
-	57, // [57:57] is the sub-list for method input_type
-	57, // [57:57] is the sub-list for extension type_name
-	57, // [57:57] is the sub-list for extension extendee
-	0,  // [0:57] is the sub-list for field type_name
+	9,  // 14: litevirt.v1.DiskSpec.io:type_name -> litevirt.v1.DiskIOLimits
+	66, // 15: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
+	67, // 16: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
+	13, // 17: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
+	14, // 18: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
+	2,  // 19: litevirt.v1.MigrationPolicy.strategy:type_name -> litevirt.v1.MigrateStrategy
+	3,  // 20: litevirt.v1.MigrationPolicy.on_host_failure:type_name -> litevirt.v1.HostFailurePolicy
+	18, // 21: litevirt.v1.ResourceTuning.numa_policy:type_name -> litevirt.v1.NUMAPolicy
+	22, // 22: litevirt.v1.LBSpec.ports:type_name -> litevirt.v1.LBPort
+	24, // 23: litevirt.v1.LBSpec.health:type_name -> litevirt.v1.LBHealthSpec
+	23, // 24: litevirt.v1.LBPort.tls:type_name -> litevirt.v1.LBTlsSpec
+	27, // 25: litevirt.v1.ResourceMapping.devices:type_name -> litevirt.v1.ResourceMappingDevice
+	8,  // 26: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
+	10, // 27: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
+	26, // 28: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
+	6,  // 29: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
+	0,  // 30: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
+	41, // 31: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
+	42, // 32: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
+	69, // 33: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
+	69, // 34: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
+	40, // 35: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
+	44, // 36: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
+	45, // 37: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
+	47, // 38: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
+	26, // 39: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
+	46, // 40: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
+	1,  // 41: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
+	68, // 42: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
+	69, // 43: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
+	69, // 44: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
+	36, // 45: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
+	64, // 46: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
+	69, // 47: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
+	69, // 48: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
+	69, // 49: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	69, // 50: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
+	69, // 51: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
+	54, // 52: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
+	22, // 53: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
+	57, // 54: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
+	56, // 55: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
+	61, // 56: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
+	69, // 57: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
+	58, // [58:58] is the sub-list for method output_type
+	58, // [58:58] is the sub-list for method input_type
+	58, // [58:58] is the sub-list for extension type_name
+	58, // [58:58] is the sub-list for extension extendee
+	0,  // [0:58] is the sub-list for field type_name
 }
 
 func init() { file_litevirt_v1_types_proto_init() }
@@ -6774,7 +6983,7 @@ func file_litevirt_v1_types_proto_init() {
 	if File_litevirt_v1_types_proto != nil {
 		return
 	}
-	file_litevirt_v1_types_proto_msgTypes[36].OneofWrappers = []any{
+	file_litevirt_v1_types_proto_msgTypes[37].OneofWrappers = []any{
 		(*HardwareDevice_Disk)(nil),
 		(*HardwareDevice_Nic)(nil),
 		(*HardwareDevice_Pci)(nil),
@@ -6785,7 +6994,7 @@ func file_litevirt_v1_types_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_types_proto_rawDesc), len(file_litevirt_v1_types_proto_rawDesc)),
 			NumEnums:      6,
-			NumMessages:   62,
+			NumMessages:   63,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

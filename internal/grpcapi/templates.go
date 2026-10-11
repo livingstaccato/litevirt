@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -502,6 +503,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		srcSpec.CpuMode = s.effectiveDefaultCPUMode()
 		specJSON, _ = json.Marshal(&srcSpec)
 	}
+	// The clone keeps the source's disk tuning and NIC queues (its NICs are
+	// matched by position: the MACs are fresh).
+	compose.ApplyDiskTuning(diskConfigs, &srcSpec)
+	compose.ApplyNICTuningByPosition(netConfigs, &srcSpec)
 	vmCfg := lv.VMConfig{
 		Name: req.Target, UUID: srcSpec.Uuid, CPU: cpu, CPUMode: srcSpec.CpuMode, CPUModel: srcSpec.CpuModel, MemoryMiB: mem,
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,

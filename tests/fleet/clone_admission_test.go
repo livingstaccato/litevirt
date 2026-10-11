@@ -40,7 +40,15 @@ import (
 // source's host" true rather than incidental.
 func seedCloneSource(t *testing.T, c *Cluster, n *Node, name, project string, cpu, memMiB int) {
 	t.Helper()
+	seedCloneSourceSpec(t, c, n, &pb.VMSpec{Name: name, Project: project, Cpu: int32(cpu), MemoryMib: int32(memMiB)})
+}
+
+// seedCloneSourceSpec is seedCloneSource for a source whose stored spec is the
+// one given (a tuned VM, for instance).
+func seedCloneSourceSpec(t *testing.T, c *Cluster, n *Node, spec *pb.VMSpec) {
+	t.Helper()
 	ctx := context.Background()
+	name, project, cpu, memMiB := spec.Name, spec.Project, int(spec.Cpu), int(spec.MemoryMib)
 
 	store := image.NewStore(filepath.Join(c.tmpRoot, n.Name, "data"))
 	if err := store.Init(); err != nil {
@@ -54,7 +62,7 @@ func seedCloneSource(t *testing.T, c *Cluster, n *Node, name, project string, cp
 		t.Fatalf("create source qcow2: %v", err)
 	}
 
-	specJSON, err := json.Marshal(&pb.VMSpec{Name: name, Project: project, Cpu: int32(cpu), MemoryMib: int32(memMiB)})
+	specJSON, err := json.Marshal(spec)
 	if err != nil {
 		t.Fatalf("marshal source spec: %v", err)
 	}

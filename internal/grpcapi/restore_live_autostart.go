@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
@@ -72,6 +73,16 @@ func (s *Server) autoDefineRestoredVM(
 	spec, err := s.resolveRestoreSpec(ctx, req, manifest)
 	if err != nil {
 		return "", "", err
+	}
+	// The spec is a manifest's or a caller's, never a validated create: its
+	// disk/NIC tuning is dropped before the gate opens and validated after.
+	ioR, rerr := s.restrictRestoredTuning(ctx, spec)
+	if rerr != nil {
+		return "", "", rerr
+	}
+	ioG := ioR.grant
+	if ioR.stripped {
+		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
 	}
 
 	originalName := spec.Name
@@ -250,6 +261,9 @@ func (s *Server) autoDefineRestoredVM(
 		if renamed || mac == "" {
 			mac = lv.GenerateMAC()
 		}
+		// The spec records the NIC's real MAC (as a clone does), so its queues
+		// are matched at every later redefine, not lost to the source's MAC.
+		n.Mac = mac
 		bridge := network.FlatBridgeName(n.Name)
 		if err := s.ensureBridge(bridge); err != nil {
 			return "", "", status.Errorf(codes.FailedPrecondition,
@@ -293,6 +307,8 @@ func (s *Server) autoDefineRestoredVM(
 		HotplugBaseMiB: int(spec.MemoryHotplugBaseMib),
 		HotplugMaxMiB:  int(spec.MemoryHotplugMaxMib),
 	}
+	compose.ApplyDiskTuning(vmCfg.Disks, spec)
+	compose.ApplyNICTuningByPosition(vmCfg.Networks, spec)
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
 	if fwVM {
@@ -389,7 +405,12 @@ func (s *Server) autoDefineRestoredVM(
 	// it from the (device-less) inactive definition, which correctly imports nothing.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
-	if err := s.insertVMForPassthrough(ctx, spec, passthroughG, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+	insertVM := s.insertVMForSpec
+	insertG := ioG
+	if vmSpecSetsPassthrough(spec) {
+		insertVM, insertG = s.insertVMForPassthrough, passthroughG
+	}
+	if err := insertVM(ctx, spec, insertG, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle
 			// code wouldn't know to preserve/wipe its state — so fail hard; the
@@ -415,6 +436,7 @@ func (s *Server) autoDefineRestoredVM(
 	})
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
+	s.auditTuningDropped(ctx, ioR, targetName, "restore")
 	return targetName, rootDev, nil
 }
 

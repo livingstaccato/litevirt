@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -101,7 +103,18 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 	if err != nil || afterRestart == nil {
 		t.Fatalf("GetVM after migration: vm=%v err=%v", afterRestart, err)
 	}
-	if !strings.Contains(afterRestart.Spec, `"network":[{"name":"lan"}]`) {
+	// (The NIC's assigned MAC is recorded in the spec at create, so the entry is
+	// matched on its name, not on being the whole object.)
+	var restarted pb.VMSpec
+	if err := json.Unmarshal([]byte(afterRestart.Spec), &restarted); err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	nic := &pb.NetworkAttachment{}
+	if len(restarted.Network) == 1 {
+		nic = proto.Clone(restarted.Network[0]).(*pb.NetworkAttachment)
+	}
+	nic.Mac = "" // the assigned MAC is recorded at create; nothing else may be
+	if len(restarted.Network) != 1 || !proto.Equal(nic, &pb.NetworkAttachment{Name: "lan"}) {
 		t.Errorf("startup migration rewrote the external network attachment in the stored spec: %s", afterRestart.Spec)
 	}
 

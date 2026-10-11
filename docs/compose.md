@@ -346,6 +346,11 @@ Supports `s` (seconds), `m` (minutes), `h` (hours). Defaults to 30 seconds if no
         cluster_size: "2M"          # qcow2 cluster size (default 64K)
         refcount_bits: 16           # qcow2 refcount width (default 16)
         overwrite: false            # iscsi root disk from an image: write it over a non-blank LUN
+        discard: unmap              # unmap (or on) | ignore (or off); see below
+        detect_zeroes: unmap        # off | on | unmap (unmap needs discard unmap)
+        iotune:                     # I/O throttle, live-changeable; see below
+          read_bytes_sec: 100M
+          write_iops_sec: 2000
 ```
 
 `overwrite` matters only for a root disk built on an image in an `iscsi` pool:
@@ -356,6 +361,66 @@ create that carries it and is never stored: a later rebuild or recreate keeps
 the LUN as it is. A VM with a disk on an iscsi volume or pool may have only one
 replica, and may not update by `blue-green` or `snapshot-and-replace`: both put
 two instances on the one LUN, and the deploy refuses them.
+
+### Discard (TRIM)
+
+`discard: unmap` passes the guest's TRIM down to the storage, so a thin
+backend (qcow2 on a filesystem, ZFS, thin LVM, Ceph RBD) gets back the space the
+guest freed; `ignore` drops it. **A new VM's disk with no `discard:` gets `unmap`
+on the local store, btrfs, ZFS, thin LVM and Ceph, on a virtio, scsi or sata bus**,
+and nothing on NFS or iSCSI (whether a TRIM frees anything there depends on the server's own space accounting, so it is left to you; a `dir` pool that sits on NFS gets the default too) or
+on an IDE disk. The default is written into the VM's spec when it is created: a VM
+created before it keeps rendering no discard, and applying a file that leaves
+`discard:` out never changes a disk. The root disk a VM gets when `disks:` names
+none gets the default too, and is then listed in the spec as `root`. The default is
+written only once the whole cluster keeps these settings (see below); before
+that, a create renders exactly what an earlier release did.
+`detect_zeroes: unmap` additionally turns a guest write of zeroes into a discard; it
+is off unless you set it, because it costs CPU on every write. Changing either on an
+existing VM needs a restart: the deploy reconfigures and restarts the same VM, disks
+kept. Run `fstrim` in the guest (most distributions schedule it weekly) to reclaim
+space it freed before the setting was on.
+
+### Upgrading a cluster
+
+`discard`, `detect_zeroes`, `iotune` and `queues` are kept in the VM's spec, and a
+host on an older release would drop them when it rewrites a spec (a failover onto it
+would rebuild the VM without its throttle). So they are accepted only once the
+release token (`release_2026_11_v1`, feature `vm_disk_nic_io`) has latched, which needs
+every host, one in maintenance included, to be on a release that keeps them. Until then
+a create, update, compose deploy, recreate or `lv disk-io` that sets any of them is
+refused with `the cluster upgrade must finish first (vm_disk_nic_io needs
+release_2026_11_v1)`, and nothing about a VM that sets none of them changes: a restore
+or promotion of a spec that carries them still works, with the tuning dropped. Once the
+token has latched, the first write of any of them (an unset discard becomes the
+storage default on a new disk only once the feature is already in use, so a plain create never waits on a first use) records the feature as used; see upgrades.md, *Rolling back after a release token
+latched*, for what a rollback does. A restore whose tuning the gate refuses after the latch
+still completes, with the tuning dropped, a warning and an audit row.
+The gate has no config flag and, once open, stays open; to stop using the feature, clear
+the settings (`lv disk-io <vm> --clear`, or drop the keys).
+
+### I/O limits
+
+`iotune:` throttles one disk (libvirt `<iotune>`). Rates are bytes per second (a
+number, or with a `K`, `M` or `G` suffix) and operations per second; unset or `0` is
+unlimited:
+
+| Key | Meaning |
+|---|---|
+| `total_bytes_sec`, `read_bytes_sec`, `write_bytes_sec` | sustained bytes per second |
+| `total_iops_sec`, `read_iops_sec`, `write_iops_sec` | sustained operations per second |
+| `total_bytes_sec_max`, `read_bytes_sec_max`, `write_bytes_sec_max`, `total_iops_sec_max`, `read_iops_sec_max`, `write_iops_sec_max` | burst ceiling above the sustained rate; needs it |
+| `burst_seconds` | how long a burst lasts (default 1) |
+
+A `total_*` key cannot be combined with the `read_*` / `write_*` of the same kind.
+Changing `iotune:` in the file throttles the **running** disk in place (no restart)
+and updates the definition; `iotune: {}` removes every limit. The same can be done
+without the file: [`lv disk-io`](cli-reference.md). The limits are kept in the VM's
+spec, so a restart, a failover start and a migration carry them. A disk the spec does
+not list yet (the root disk a VM got before disks were recorded, a hot-plugged one) is
+throttled too: its entry is made in the spec when the limits are set. The limits are
+per VM: a disk shared by several VMs is throttled separately in each, so the aggregate
+is not bounded (libvirt's `group_name` is not supported).
 
 ## Networks
 
@@ -368,7 +433,20 @@ two instances on the one LUN, and the deploy refuses them.
         gateway: "10.0.1.1"
         trunk: [100, 101]           # VLAN trunk mode
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
+        queues: 4                   # virtio-net multiqueue (1-64, or auto)
 ```
+
+`queues:` gives a virtio NIC that many queue pairs (`<driver queues='N'/>`; libvirt
+uses vhost-net when the host has it and qemu's userspace backend when it does not,
+so a migration or failover onto a host without vhost-net still works), so a guest with several vCPUs spreads network interrupts and
+packets across them. It is off unless set (one queue); `queues: auto` is one per
+vCPU up to 8, none for a single-vCPU guest. Only the virtio model takes it. Inside
+the guest, enable the queues with `ethtool -L <nic> combined N`. A change needs a
+restart: the deploy reconfigures and restarts the same VM, disks kept. An unset
+`queues:` inherits what the VM has, so removing the key from the file does not turn
+multiqueue off: write `queues: 1`. `queues: auto` is resolved from `cpu:` when the file
+is read, so changing `cpu:` in the file changes the queue count with it (which makes a
+vCPU grow a restart), and `lv update --cpu` never re-resolves it; write a number to pin it.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

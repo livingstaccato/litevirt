@@ -730,6 +730,10 @@ type Server struct {
 
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
+	// ioSpecWriteHook, when set, runs between SetDiskIO's libvirt call and its spec
+	// write. Test seam only.
+	ioSpecWriteHook func()
+
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 

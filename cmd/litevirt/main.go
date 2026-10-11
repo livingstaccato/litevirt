@@ -140,6 +140,7 @@ func newRootCmd() *cobra.Command {
 		newAttachPciCmd(),
 		newDetachPciCmd(),
 		newResizeDiskCmd(),
+		newDiskIOCmd(),
 		newUninstallCmd(),
 		newClusterCmd(),
 		newRebalanceCmd(),

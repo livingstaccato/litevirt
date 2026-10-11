@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,8 +69,19 @@ func envOr(key, fallback string) string {
 // ─── Test harness ───────────────────────────────────────────────────────────
 
 func TestMain(m *testing.M) {
-	// Pure helper tests (no cluster, no lv) opt in separately.
+	// Pure helper tests (no cluster, no lv) opt in separately, and only when
+	// -test.run names nothing but them: unit mode must never let a
+	// cluster-touching test run without LITEVIRT_E2E=1 and LV_BIN.
 	if os.Getenv("LITEVIRT_E2E_UNIT") == "1" {
+		flag.Parse() // -test.run is not set until the flags are parsed
+		run := ""
+		if f := flag.Lookup("test.run"); f != nil {
+			run = f.Value.String()
+		}
+		if !unitRunAllowed(run) {
+			fmt.Fprintf(os.Stderr, "E2E: LITEVIRT_E2E_UNIT=1 runs only %v; set -test.run to %s (got %q)\n", pureTests, "^("+strings.Join(pureTests, "|")+")$", run)
+			os.Exit(1)
+		}
 		os.Exit(m.Run())
 	}
 	// Live e2e is OPT-IN. It mutates a real cluster and runs the CLI against
@@ -2613,8 +2625,52 @@ func sgChainOrdered(chain string) error {
 	return fmt.Errorf("no tcp dport 8080 accept rule")
 }
 
+// pureTests are the tests that touch no cluster and no lv, and so are the only
+// ones LITEVIRT_E2E_UNIT=1 may run.
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed"}
+
+// unitRunAllowed reports whether a -test.run pattern selects only pureTests:
+// the exact form ^(A|B)$ or ^A$, with every name pure.
+func unitRunAllowed(run string) bool {
+	if !strings.HasPrefix(run, "^") || !strings.HasSuffix(run, "$") {
+		return false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(run, "^"), "$")
+	body = strings.TrimSuffix(strings.TrimPrefix(body, "("), ")")
+	for _, n := range strings.Split(body, "|") {
+		ok := false
+		for _, p := range pureTests {
+			ok = ok || n == p
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// TestUnitRunAllowed proves unit mode cannot select a cluster test.
+func TestUnitRunAllowed(t *testing.T) {
+	for run, want := range map[string]bool{
+		"^TestSGChainOrdered$":                      true,
+		"^(TestSGChainOrdered|TestUnitRunAllowed)$": true,
+		"":                                    false,
+		".":                                   false,
+		"TestSGChainOrdered":                  false,
+		"^TestSGChainOrdered|TestFirewall$":   false,
+		"^(TestSGChainOrdered|TestFirewall)$": false,
+		"^TestFirewall$":                      false,
+		"^(TestSGChainOrdered|)$":             false,
+		"^TestSGChainOrdered$|TestVM_AttachDetachNIC": false,
+	} {
+		if got := unitRunAllowed(run); got != want {
+			t.Errorf("unitRunAllowed(%q) = %v, want %v", run, got, want)
+		}
+	}
+}
+
 // TestSGChainOrdered pins sgChainOrdered against a chain as nft lists one.
-// Run it with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+// Run it with LITEVIRT_E2E_UNIT=1 -test.run '^TestSGChainOrdered$' (it needs no cluster).
 func TestSGChainOrdered(t *testing.T) {
 	const good = `	chain nic_in_vnet3 {
 		oifname "vnet3" tcp dport 8080 accept

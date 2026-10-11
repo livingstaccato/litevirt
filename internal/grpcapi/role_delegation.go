@@ -211,7 +211,7 @@ func (s *Server) authorizeDelegatedGrant(ctx context.Context, path, role, princi
 	if !ok {
 		return "", "", status.Errorf(codes.PermissionDenied,
 			"a delegated grant must name an existing user with its realm (user:<name>@<realm>) or a "+
-				"group (group:<group>@<realm>); %q is neither", principal)
+				"group (group:<realm>/<group> for a directory group, group:<role>@<realm> for a legacy role); %q is neither", principal)
 	}
 	if !e.HasAnyBinding(set) {
 		return "", "", status.Errorf(codes.PermissionDenied,

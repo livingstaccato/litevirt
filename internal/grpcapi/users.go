@@ -497,7 +497,7 @@ func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, use
 // mintSessionWithGroups is mintSession for an external-realm login that
 // verified directory groups: they are recorded in the session's own batch
 // (corrosion.InsertSessionWithLoginData) when the login_policy release feature
-// passes, so `group:<g>@<realm>` bindings apply to this session. Without it
+// passes, so `group:<realm>/<g>` bindings apply to this session. Without it
 // the session is minted without them, as before the release.
 func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, clientIP, userAgent, factor string, groups []string) (token, expiresAt, role string, err error) {
 	// Fail closed if a reseed ran while these credentials were being checked.
@@ -552,7 +552,7 @@ func (s *Server) mintSessionWithGroups(ctx context.Context, username, realm, cli
 		// minted without them. Such a session would fall back to the
 		// account's legacy role, which can be WIDER than its group-scoped
 		// access. The login is refused instead; retrying is safe.
-		if len(groups) > 0 && g.Check(capabilities.FeatureLoginPolicy) != nil && s.loginPolicyInUse(ctx) {
+		if len(groups) > 0 && g.Check(capabilities.FeatureLoginPolicy) != nil && s.loginPolicyInUseOrUnknown(ctx) {
 			return errGroupsUnrecordable
 		}
 		return corrosion.InsertSessionWithLoginData(ctx, s.db, g, rec, factor, groups)

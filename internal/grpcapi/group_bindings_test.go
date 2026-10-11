@@ -74,6 +74,12 @@ func TestPrincipalsForCaller_GroupsOnlyForExternalRealms(t *testing.T) {
 	if a, b := principalsForCaller("o", "", "ldap:corp", "ops"), principalsForCaller("o", "", "oidc:corp", "ops"); a[1] == b[1] {
 		t.Fatalf("group ops of two realms is one principal: %v %v", a, b)
 	}
+	// A realm whose name contains '/' could spell another realm's group
+	// principal (oidc:corp's "contractors/x" = oidc:corp/contractors's "x"):
+	// its groups are ignored (re-review m1).
+	if g := principalsForCaller("o", "", "oidc:corp/contractors", "x"); len(g) != 1 {
+		t.Fatalf("a realm named with '/' took directory groups: %v", g)
+	}
 	if got := principalsForCaller("bob", "admin", "local", "ops"); len(got) != 2 {
 		t.Fatalf("a local session took directory groups: %v", got)
 	}
@@ -339,4 +345,34 @@ func TestGroupBinding_AuditDetailIsBounded(t *testing.T) {
 	if !row.found || len(row.detail) > maxGroupAuditDetail || !strings.Contains(row.detail, fmt.Sprintf("groups=%d", corrosion.MaxSessionGroups)) {
 		t.Fatalf("audit detail of %d bytes (cap %d): %.200s", len(row.detail), maxGroupAuditDetail, row.detail)
 	}
+}
+
+// TestGrantRole_LDAPGroupDNIsCanonicalized (re-review m3): an LDAP group
+// binding names the DN as sessions carry it, whatever case and spacing the
+// operator typed; a value that is not a DN is refused rather than stored as a
+// binding that matches nothing.
+func TestGrantRole_LDAPGroupDNIsCanonicalized(t *testing.T) {
+	s, _ := groupServer(t)
+	r, err := s.GrantRole(adminCtx(), &pb.GrantRoleRequest{Role: "Viewer", Path: "/",
+		Principal: "group:ldap:corp/CN=Ops, OU=Groups,DC=Corp,DC=Example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Binding.Principal; got != "group:ldap:corp/cn=ops,ou=groups,dc=corp,dc=example" {
+		t.Fatalf("stored principal %q", got)
+	}
+	_, err = s.GrantRole(adminCtx(), &pb.GrantRoleRequest{Role: "Viewer", Path: "/", Principal: "group:ldap:corp/lv-admins"})
+	wantCode(t, "an LDAP group named by a bare cn", err, codes.InvalidArgument)
+}
+
+// TestGroupBinding_UnreadableFeatureStateFailsClosed (re-review m6): when
+// whether login_policy is open cannot be read and the gate does not pass, a
+// login with groups is refused, not minted without them.
+func TestGroupBinding_UnreadableFeatureStateFailsClosed(t *testing.T) {
+	s, idp := groupServer(t, "lv-operators")
+	s.SetReleaseFeatureGate(fakeFeatureGate{t: t, err: errors.New("gate refused")})
+	s.loginPolicyStateRead = func(context.Context) (bool, error) { return false, errors.New("replica read failed") }
+	code, state, binding := oidcCallback(t, s, idp)
+	_, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp", OidcCode: code, OidcState: state, OidcBinding: binding})
+	wantCode(t, "a login whose feature state is unreadable", err, codes.Unavailable)
 }

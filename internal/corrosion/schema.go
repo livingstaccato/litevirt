@@ -509,7 +509,7 @@ import (
 //	     wins). Four new tables.
 //	v65: session_groups (session_id PK; realm, groups_json, recorded_at): the
 //	     directory groups an external-realm login verified (the OIDC groups
-//	     claim, the LDAP group search), so `group:<g>@<realm>` role bindings
+//	     claim, the LDAP group search), so `group:<realm>/<g>` role bindings
 //	     apply to that session. Written in the session's own batch, like
 //	     session_factors, and only with the release feature login_policy; left
 //	     out of anti-entropy like sessions. No row = no groups. One new table.
@@ -1847,7 +1847,7 @@ var schemaDDL = []string{
 
 	// Path × role × principal bindings. principal is one of:
 	//   user:<username>           — direct user binding
-	//   group:<group>@<realm>     — group binding from realm sync
+	//   group:<realm>/<group>     — a directory group (group:<role>@<realm>: a legacy role)
 	`CREATE TABLE IF NOT EXISTS role_bindings (
 		id           TEXT PRIMARY KEY,
 		path         TEXT NOT NULL,

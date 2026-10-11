@@ -88,6 +88,22 @@ func (s *Server) loginPolicyInUse(ctx context.Context) bool {
 	return releaseFeatureAckedHere(ctx, s.db, capabilities.FeatureLoginPolicy)
 }
 
+// loginPolicyInUseOrUnknown is loginPolicyInUse for a caller that must fail
+// closed: a read that fails is "in use" (re-review m6). An injected reader
+// (tests) replaces the replica read.
+func (s *Server) loginPolicyInUseOrUnknown(ctx context.Context) bool {
+	if s.loginPolicyStateRead != nil {
+		inUse, err := s.loginPolicyStateRead(ctx)
+		return err != nil || inUse
+	}
+	info, ok := capabilities.LookupFeature(capabilities.FeatureLoginPolicy)
+	if !ok || s.db == nil {
+		return true
+	}
+	_, acked, err := corrosion.ReleaseFeatureState(ctx, s.db, info.Token, string(capabilities.FeatureLoginPolicy))
+	return err != nil || acked
+}
+
 func releaseFeatureAckedHere(ctx context.Context, db *corrosion.Client, f capabilities.Feature) bool {
 	info, ok := capabilities.LookupFeature(f)
 	if !ok || db == nil {

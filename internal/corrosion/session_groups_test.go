@@ -78,12 +78,14 @@ func TestGC_PrunesSessionGroupsWithTheirSessions(t *testing.T) {
 	}
 }
 
-// TestNormalizeSessionGroups_DropsControlCharacters (review M3): any C0, DEL
-// or C1 code point (terminal escapes in lv role ls and the audit log), and
-// invalid UTF-8, drop the name.
+// TestNormalizeSessionGroups_DropsControlCharacters (review M3, re-review m2):
+// any C0, DEL or C1 code point (terminal escapes in lv role ls and the audit
+// log), any format character (bidi overrides, zero-width), and invalid UTF-8
+// drop the name.
 func TestNormalizeSessionGroups_DropsControlCharacters(t *testing.T) {
-	out, dropped := NormalizeSessionGroups([]string{"ok", "esc\x1b[31m", "tab\tx", "del\x7f", "c1\u0085x", "bad\xffutf8", "kanidm@idm.lab"})
-	if strings.Join(out, ",") != "kanidm@idm.lab,ok" || dropped != 5 {
+	out, dropped := NormalizeSessionGroups([]string{"ok", "esc\x1b[31m", "tab\tx", "del\x7f", "c1\u0085x", "bad\xffutf8", "kanidm@idm.lab",
+		"lv-\u202esnimda", "zero\u200bwidth", "bom\ufeff"})
+	if strings.Join(out, ",") != "kanidm@idm.lab,ok" || dropped != 8 {
 		t.Fatalf("kept %q dropped %d", out, dropped)
 	}
 }

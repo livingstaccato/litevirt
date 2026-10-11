@@ -26,7 +26,7 @@ import (
 //   - role must be non-empty; existence is checked against the
 //     in-memory engine snapshot so a typo doesn't quietly create an
 //     unusable row.
-//   - principal must be "user:<name>" or "group:<name>@<realm>".
+//   - principal must be "user:<name>" "group:<role>@<realm>", or "group:<oidc|ldap>:<realm>/<group>".
 //
 // Idempotency: a binding is keyed by id. We mint a fresh id on every
 // GrantRole call, so re-running the RPC creates a second row — this
@@ -58,6 +58,20 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 	// bare user:<name> so this node never mints an inert bare binding. When the
 	// flag is off, principals are stored verbatim (legacy behavior).
 	principal := req.Principal
+	// An LDAP directory group is its normalized DN, which is what sessions
+	// carry; a DN typed as the directory shows it (CN=X,OU=Groups,...) would
+	// otherwise be a binding that silently matches nothing (re-review m3).
+	if body, ok := strings.CutPrefix(principal, "group:ldap:"); ok {
+		if realm, dn, ok := strings.Cut(body, "/"); ok {
+			canon, parsed := auth.NormalizeDN(dn)
+			if !parsed {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"%q names an LDAP directory group by %q, which is not a DN: an LDAP group is its full DN "+
+						"(group:ldap:<realm>/cn=<group>,ou=...)", principal, dn)
+			}
+			principal = "group:ldap:" + realm + "/" + canon
+		}
+	}
 	if s.rbacRealmConfigured() {
 		resolved, err := s.resolveGrantPrincipal(ctx, principal)
 		if err != nil {
@@ -274,7 +288,7 @@ func (s *Server) NormalizeRoleBindings(ctx context.Context, req *pb.NormalizeRol
 	for _, b := range rows {
 		body, ok := strings.CutPrefix(b.Principal, "user:")
 		if !ok {
-			continue // group:<g>@<realm> — already realm-qualified
+			continue // group:<role>@<realm> / group:<realm>/<g> — already realm-qualified
 		}
 		if _, _, qualified := classifyUserPrincipal(body); qualified {
 			continue
@@ -344,7 +358,7 @@ func classifyUserPrincipal(body string) (name, realm string, qualified bool) {
 
 // resolveGrantPrincipal applies realm-aware grammar to a well-formed principal
 // when auth.rbac_realm is on (callers gate on rbacRealmConfigured first). A
-// realm-qualified principal — or any group:<g>@<realm> — passes through
+// realm-qualified principal — or any group principal — passes through
 // unchanged. A bare user:<name> is either RESOLVED to canonical form (only once
 // the RBACRealmV1 capability is latched cluster-wide, so no peer still mints
 // bare bindings) or REJECTED (pre-latch), so this node never adds a new inert
@@ -353,7 +367,7 @@ func classifyUserPrincipal(body string) (name, realm string, qualified bool) {
 func (s *Server) resolveGrantPrincipal(ctx context.Context, principal string) (string, error) {
 	body, ok := strings.CutPrefix(principal, "user:")
 	if !ok {
-		return principal, nil // group:<g>@<realm> — already realm-qualified
+		return principal, nil // group:<role>@<realm> / group:<realm>/<g> — already realm-qualified
 	}
 	if _, _, qualified := classifyUserPrincipal(body); qualified {
 		return principal, nil

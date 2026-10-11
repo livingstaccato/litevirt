@@ -307,3 +307,27 @@ func TestLDAPRealm_GroupsScopedToGroupBaseDN(t *testing.T) {
 		t.Fatalf("principal %v", ids)
 	}
 }
+
+// TestNormalizeGroupDNs_RDNBoundaries (re-review m5): group_base_dn scoping
+// compares RDNs, not text — a DN whose string ends with the base's but whose
+// RDNs do not (an escaped comma, a value swallowing the base's text) is not
+// under it — and one multi-valued RDN in two orders is one group.
+func TestNormalizeGroupDNs_RDNBoundaries(t *testing.T) {
+	base := "ou=Groups,dc=corp,dc=example"
+	out := normalizeGroupDNs([]string{
+		`cn=lv-admins,ou=evil\,ou=Groups,dc=corp,dc=example`, // escaped comma: ou is "evil,ou=Groups"
+		"cn=lv-admins,ou=Groups,dc=corp,dc=example",
+		"cn=ops+uid=7,ou=Groups,dc=corp,dc=example",
+		"uid=7+cn=ops,ou=Groups,dc=corp,dc=example",
+		"cn=x,ou=Groups,dc=corp,dc=example,dc=evil", // the base's text, not its position
+	}, base)
+	want := []string{"cn=lv-admins,ou=groups,dc=corp,dc=example", "cn=ops+uid=7,ou=groups,dc=corp,dc=example"}
+	if len(out) != len(want) {
+		t.Fatalf("normalized %v, want %v", out, want)
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("normalized %v, want %v", out, want)
+		}
+	}
+}

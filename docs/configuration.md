@@ -563,7 +563,7 @@ auth:
   # (refreshed on each request); session_hard_expiry is the absolute cap.
   session_idle_timeout: ""                # e.g. "8h"
   session_hard_expiry: ""                 # e.g. "168h" (7 days); at most "720h" (30 days),
-                                          # above which the daemon refuses to start
+                                          # a larger value is clamped to 720h with a startup warning
   # Strict mTLS identity: when true (and the strict_mtls_identity_v1 capability
   # is active cluster-wide), a bearerless "client" certificate (the distributable
   # CLI client cert, or any cert whose CN is not a live cluster host) is not

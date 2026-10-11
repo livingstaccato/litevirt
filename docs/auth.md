@@ -76,7 +76,8 @@ re-grant it as `group:<realm>/<g>`.
   - A group the directory removes stops granting at the user's **next login**.
   - A session minted before keeps its groups until it ends: the idle timeout
     (default 8h), the hard expiry (default 7d, at most 30 days:
-    `session_hard_expiry` above `720h` is refused at startup), logout,
+    `session_hard_expiry` above `720h` is clamped to `720h`, with a startup
+    warning naming the configured and effective values), logout,
     `lv session revoke`, or any account lifecycle change (`lv user disable`).
   - To cut a removed member off at once, revoke their sessions.
   - A group added at the directory applies from the next login.

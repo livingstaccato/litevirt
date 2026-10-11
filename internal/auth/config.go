@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -97,6 +98,13 @@ func BuildRegistry(ctx context.Context, db *corrosion.Client, configs []RealmCon
 			// We tolerate it so operators can document the local realm
 			// in config.yaml alongside the others.
 			continue
+		}
+		if !RealmGroupsUsable(rc.Kind + ":" + rc.Name) {
+			slog.Warn("auth realm name contains '/', '@' or a control character: its users can still log in, "+
+				"but its directory groups are ignored (they could spell another realm's group principal); rename the realm "+
+				"to use group role bindings", "realm", rc.Kind+":"+rc.Name)
+		}
+		switch rc.Kind {
 		case "oidc":
 			if rc.OIDC == nil {
 				return nil, fmt.Errorf("realms[%d] %q: kind=oidc requires an oidc: block", i, rc.Name)

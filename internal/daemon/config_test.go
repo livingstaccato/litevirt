@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"bytes"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -679,14 +681,20 @@ func TestLoadConfig_RefusesUnsafeContainerHostAccess(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_SessionHardExpiryCapped (review M8): above the documented
-// maximum the daemon refuses to start; the default (unset), the 7-day default
-// spelled out, and the maximum itself load.
+// TestLoadConfig_SessionHardExpiryCapped (review M8, as ruled): above the
+// documented maximum the value is CLAMPED to 720h with a warning naming the
+// configured and effective values; the daemon always starts. The default
+// (unset), the 7-day default spelled out, and the maximum itself are kept.
 func TestLoadConfig_SessionHardExpiryCapped(t *testing.T) {
 	dir := t.TempDir()
 	cp := filepath.Join(dir, "config.yaml")
 	t.Setenv("LITEVIRT_CONFIG", cp)
-	for v, ok := range map[string]bool{"": true, "168h": true, "720h": true, "721h": false, "8760h": false} {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	for v, want := range map[string]string{"": "", "168h": "168h", "720h": "720h", "721h": "720h0m0s", "8760h": "720h0m0s"} {
+		logs.Reset()
 		body := "host_name: h\n"
 		if v != "" {
 			body += "auth:\n  session_hard_expiry: \"" + v + "\"\n"
@@ -694,9 +702,17 @@ func TestLoadConfig_SessionHardExpiryCapped(t *testing.T) {
 		if err := os.WriteFile(cp, []byte(body), 0644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := LoadConfig()
-		if (err == nil) != ok {
-			t.Errorf("session_hard_expiry %q: err=%v, want ok=%v", v, err, ok)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("session_hard_expiry %q: LoadConfig refused (%v); it must clamp, never refuse", v, err)
+		}
+		if cfg.Auth.SessionHardExpiry != want {
+			t.Errorf("session_hard_expiry %q: effective %q, want %q", v, cfg.Auth.SessionHardExpiry, want)
+		}
+		warned := strings.Contains(logs.String(), "clamped") &&
+			strings.Contains(logs.String(), "configured="+v) && strings.Contains(logs.String(), "effective=720h0m0s")
+		if clamped := want == "720h0m0s"; warned != clamped {
+			t.Errorf("session_hard_expiry %q: warning %v, want %v (log %q)", v, warned, clamped, logs.String())
 		}
 	}
 }

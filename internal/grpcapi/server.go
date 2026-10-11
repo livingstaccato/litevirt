@@ -809,6 +809,10 @@ type Server struct {
 	// litevirt's own second factor (LoginResponse.oidc_pending). Node-local.
 	oidcPending oidcPendingStore
 
+	// loginPolicyStateRead, when set (tests), replaces the replica read of
+	// whether login_policy is in use (loginPolicyInUseOrUnknown).
+	loginPolicyStateRead func(context.Context) (bool, error)
+
 	// fwReconciler is the firewall reconciler the daemon started.
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.

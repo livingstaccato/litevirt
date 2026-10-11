@@ -16,6 +16,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"unicode"
 )
 
 // Credentials is the realm-agnostic input to Authenticate. Different realms
@@ -45,7 +47,7 @@ type Principal struct {
 	Realm string
 
 	// Groups are realm-specific group identifiers (LDAP group DNs, OIDC
-	// `groups` claim values, etc.). Each becomes a `group:<g>@<realm>`
+	// `groups` claim values, etc.). Each becomes a `group:<realm>/<g>`
 	// principal eligible for role bindings.
 	Groups []string
 
@@ -87,7 +89,7 @@ func (p *Principal) PrincipalID() string {
 // GroupPrincipalIDs returns the role-binding principals of this principal's
 // directory groups (DirectoryGroupPrincipal). The local realm has none.
 func (p *Principal) GroupPrincipalIDs() []string {
-	if p == nil || p.Realm == "" || p.Realm == "local" {
+	if p == nil || p.Realm == "" || p.Realm == "local" || !RealmGroupsUsable(p.Realm) {
 		return nil
 	}
 	out := make([]string, len(p.Groups))
@@ -110,6 +112,15 @@ func (p *Principal) GroupPrincipalIDs() []string {
 // principal; that is the trust boundary (docs/auth.md).
 func DirectoryGroupPrincipal(realm, group string) string {
 	return "group:" + realm + "/" + group
+}
+
+// RealmGroupsUsable reports whether a realm's directory groups can be named
+// unambiguously: a realm short name containing '/' (or '@', or a control
+// character) could make one realm's group spell another realm's principal
+// (oidc:corp's group "contractors/x" vs oidc:corp/contractors's "x"). Such a
+// realm still authenticates; its groups are ignored, and BuildRegistry warns.
+func RealmGroupsUsable(realm string) bool {
+	return realm != "" && !strings.ContainsAny(realm, "/@") && strings.IndexFunc(realm, unicode.IsControl) < 0
 }
 
 // Realm is one authentication backend. New backends implement this

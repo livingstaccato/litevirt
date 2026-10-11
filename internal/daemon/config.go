@@ -554,22 +554,25 @@ func (a AutoUpgradeConfig) Interval() time.Duration {
 // the longest a removed group can keep granting to a session nobody revoked.
 const MaxSessionHardExpiry = 30 * 24 * time.Hour
 
-// validateSessionHardExpiry refuses a session_hard_expiry above
-// MaxSessionHardExpiry. An unparsable value keeps its old treatment (a logged
-// warning and the default, parseDurationOr).
-func validateSessionHardExpiry(v string) error {
-	if v == "" {
-		return nil
+// clampSessionHardExpiry lowers a session_hard_expiry above
+// MaxSessionHardExpiry to the maximum, with a startup warning naming the
+// configured and the effective value. It never refuses: a value the previous
+// release accepted must not stop a node from starting (secure the feature,
+// never brick the upgrade). An unparsable value keeps its old treatment (a
+// logged warning and the default, parseDurationOr).
+func clampSessionHardExpiry(a *AuthConfig) {
+	if a.SessionHardExpiry == "" {
+		return
 	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return nil
+	d, err := time.ParseDuration(a.SessionHardExpiry)
+	if err != nil || d <= MaxSessionHardExpiry {
+		return
 	}
-	if d > MaxSessionHardExpiry {
-		return fmt.Errorf("config auth.session_hard_expiry %q is above the maximum %s (30 days): a session keeps "+
-			"the directory groups it was minted with until it ends; set it to %s or less", v, MaxSessionHardExpiry, MaxSessionHardExpiry)
-	}
-	return nil
+	effective := MaxSessionHardExpiry.String()
+	slog.Warn("auth.session_hard_expiry is above the maximum and is clamped: a session keeps the directory "+
+		"groups it was minted with until it ends, so its lifetime is capped",
+		"configured", a.SessionHardExpiry, "effective", effective, "maximum", "30 days")
+	a.SessionHardExpiry = effective
 }
 
 type AuthConfig struct {
@@ -1060,9 +1063,7 @@ func LoadConfig() (*Config, error) {
 	if err := cfg.ACME.validate(); err != nil {
 		return nil, err
 	}
-	if err := validateSessionHardExpiry(cfg.Auth.SessionHardExpiry); err != nil {
-		return nil, err
-	}
+	clampSessionHardExpiry(&cfg.Auth)
 	if _, err := auth.ParseTrustedProxies(cfg.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("config %w", err)
 	}

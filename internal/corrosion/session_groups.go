@@ -2,7 +2,7 @@ package corrosion
 
 // session_groups (schema v65): the directory groups a session's external-realm
 // login verified — the OIDC realm's groups claim from a verified ID token, the
-// LDAP realm's group search — so `group:<g>@<realm>` role bindings apply to
+// LDAP realm's group search — so `group:<realm>/<g>` role bindings apply to
 // that session and to no other.
 //
 // The groups are a snapshot taken at login and live as long as the session.
@@ -41,15 +41,20 @@ const (
 
 const sessionGroupsInsertSQL = `INSERT INTO session_groups (session_id, realm, groups_json, recorded_at, updated_at) VALUES (?, ?, ?, ?, ?)`
 
+// unsafeGroupRune is a control character (C0, DEL, C1) or a format character
+// (Cf: bidi overrides and isolates, zero-width characters), any of which can
+// make a name in `lv role ls`, the audit log or slog read as another one.
+func unsafeGroupRune(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }
+
 // NormalizeSessionGroups is the set a session records: trimmed; empty,
-// over-long, invalid-UTF-8 and control-character-bearing names (any C0, DEL or
-// C1 code point: terminal escapes in `lv role ls` and the audit log) dropped; de-duplicated, sorted, at most MaxSessionGroups.
+// over-long, invalid-UTF-8, and control- or format-character-bearing names
+// (unsafeGroupRune) dropped; de-duplicated, sorted, at most MaxSessionGroups.
 // It reports how many names it dropped, so the caller can say so.
 func NormalizeSessionGroups(groups []string) (out []string, dropped int) {
 	seen := map[string]bool{}
 	for _, g := range groups {
 		g = strings.TrimSpace(g)
-		if g == "" || len(g) > MaxSessionGroupBytes || strings.IndexFunc(g, unicode.IsControl) >= 0 || !utf8.ValidString(g) {
+		if g == "" || len(g) > MaxSessionGroupBytes || strings.IndexFunc(g, unsafeGroupRune) >= 0 || !utf8.ValidString(g) {
 			dropped++
 			continue
 		}

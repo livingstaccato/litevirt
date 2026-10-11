@@ -45,7 +45,7 @@ const (
 	// authenticated can be re-checked (stream_watch.go).
 	ctxKeyTokenID
 	// ctxKeyGroups are the directory groups the session's external-realm
-	// login verified (corrosion.SessionGroups); each is a group:<g>@<realm>
+	// login verified (corrosion.SessionGroups); each is a group:<realm>/<g>
 	// principal for role bindings.
 	ctxKeyGroups
 )
@@ -1123,7 +1123,7 @@ func principalsForCaller(user, role, realm string, groups ...string) []string {
 	if role != "" {
 		out = append(out, "group:"+role+"@"+realm)
 	}
-	if realm != "local" {
+	if realm != "local" && auth.RealmGroupsUsable(realm) {
 		for _, g := range groups {
 			if g == "" {
 				continue

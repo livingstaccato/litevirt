@@ -409,6 +409,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	if len(toMigrate) == 0 {
 		return nil
 	}
+	// Highest compose migrate.priority first, ties in name order: targets are
+	// chosen, and the moves handed to the workers, in this order, so a
+	// higher-priority VM starts moving — and takes a target's room — before a
+	// lower one. Every move is still refused or admitted on its own.
+	corrosion.SortVMsByMigratePriority(toMigrate)
 
 	// Use placement engine to select targets per VM, respecting constraints.
 	// Build placement requests from each VM's stored spec.

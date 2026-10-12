@@ -2888,6 +2888,15 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.noteHold(h.Name, "recovery could not list the host's VMs: "+err.Error())
 		return
 	}
+	// Highest compose migrate.priority first, ties by name (ListVMs returns
+	// this replica's insertion order, which another coordinator's need not
+	// share).
+	// Everything below follows this order: auto-promote, the batch placement
+	// (SelectBatch commits each request's capacity before the next is
+	// scored, so a higher-priority VM is placed before the room runs out),
+	// and the claim and proof mint of each reschedule. It only orders work:
+	// every gate below still decides each VM on its own.
+	corrosion.SortVMsByMigratePriority(vms)
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)

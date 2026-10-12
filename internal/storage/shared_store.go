@@ -38,10 +38,17 @@ func SharedStoreOf(dir string) SharedStore {
 	return t.SharedStoreOf(dir)
 }
 
-// SharedStoreOf is SharedStoreOf against this table.
+// SharedStoreOf is SharedStoreOf against this table. A directory whose
+// resolution, or statfs, does not finish in time (a network filesystem that
+// does not answer: resolveBounded, Bounded) is "shared, no identity", as is
+// one whose mount table cannot be read.
 func (t MountTable) SharedStoreOf(dir string) SharedStore {
 	var out SharedStore
-	for _, p := range pathForms(dir) { // the resolved form, last, wins
+	forms, err := pathFormsBounded(&t, dir)
+	if err != nil {
+		return SharedStore{Shared: true}
+	}
+	for _, p := range forms { // the resolved form, last, wins
 		var under mountEntry
 		for _, e := range t.all {
 			if within(e.dir, p) && len(e.dir) >= len(under.dir) {
@@ -55,7 +62,12 @@ func (t MountTable) SharedStoreOf(dir string) SharedStore {
 		out = sharedStoreOfMount(under, rel, dir)
 	}
 	if !out.Shared {
-		if magic, _, err := statfsInfo(dir); err == nil && networkMagic(magic) {
+		info := statfsInfo
+		magic, err := Bounded("statfs", dir, func() (uint32, error) {
+			m, _, err := info(dir)
+			return m, err
+		})
+		if IsFSNoAnswer(err) || (err == nil && networkMagic(magic)) {
 			out = SharedStore{Shared: true}
 		}
 	}
@@ -75,7 +87,11 @@ func sharedStoreOfMount(e mountEntry, rel, dir string) SharedStore {
 	case e.fstype == "ceph":
 		// The kernel client's f_fsid folds the cluster's fsid with the
 		// filesystem's id within it: the same on every client.
-		_, fsid, err := statfsInfo(dir)
+		info := statfsInfo
+		fsid, err := Bounded("statfs", dir, func() (string, error) {
+			_, id, err := info(dir)
+			return id, err
+		})
 		path, ok := cephSourcePath(e.source)
 		if err != nil || fsid == "" || !ok {
 			return SharedStore{Shared: true}

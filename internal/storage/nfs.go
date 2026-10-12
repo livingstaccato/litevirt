@@ -461,9 +461,17 @@ type NFSBacking struct {
 // symlinks (the resolved form wins) — and if so which export it is and what
 // its mount lacks. nil: on no NFS mount. An error: the mount's source is not
 // an NFS export litevirt can identify.
+//
+// The resolution is bounded (resolveBounded): when a network filesystem that
+// does not answer keeps dir from being resolved, it is an error, never "on no
+// NFS mount".
 func (t MountTable) NFSBackingOf(dir string) (*NFSBacking, error) {
 	var out *NFSBacking
-	for _, p := range pathForms(dir) {
+	forms, err := pathFormsBounded(&t, dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot tell which export %s is on: %w", dir, err)
+	}
+	for _, p := range forms {
 		var under mountEntry
 		for _, e := range t.all {
 			// The deepest mount containing p is the one p is on; the last of

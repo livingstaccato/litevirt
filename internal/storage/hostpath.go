@@ -291,13 +291,21 @@ func dataDirChildRefusal(p, d, cand, dataDir string) error {
 const dataDirDisks = "disks"
 
 // IsDataDirDisks reports whether p is <data_dir>/disks, as written or after
-// resolving symlinks.
+// resolving symlinks. The resolutions are bounded (resolveBounded): a form a
+// network filesystem that does not answer keeps from being resolved is
+// judged as written only.
 func IsDataDirDisks(p, dataDir string) bool {
 	if dataDir == "" || p == "" {
 		return false
 	}
-	for _, d := range pathForms(dataDir) {
-		for _, c := range pathForms(p) {
+	var t MountTable
+	if mt, err := ReadMountTable(); err == nil {
+		t = mt
+	}
+	dataForms, _ := pathFormsBounded(&t, dataDir)
+	forms, _ := pathFormsBounded(&t, p)
+	for _, d := range dataForms {
+		for _, c := range forms {
 			if c == filepath.Join(d, dataDirDisks) {
 				return true
 			}
@@ -321,7 +329,14 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 	if !filepath.IsAbs(p) {
 		return fmt.Errorf("%q is not an absolute path", p)
 	}
-	for _, cand := range pathForms(p) {
+	// Resolved under a bound (resolveBounded): a pool directory below an NFS
+	// mount whose server does not answer is refused, as one that cannot be
+	// checked, instead of holding the caller (lab 2 F-2).
+	forms, err := pathFormsBounded(nil, p)
+	if err != nil {
+		return fmt.Errorf("%q cannot be checked: %w", p, err)
+	}
+	for _, cand := range forms {
 		if cand == "/" {
 			return fmt.Errorf("%q is the filesystem root", p)
 		}
@@ -485,15 +500,37 @@ func inPoolArea(dataDir, p string) bool {
 
 // DirsOverlap reports whether two directories are the same, or one is inside
 // the other, judged both as written and after resolving symlinks.
-func DirsOverlap(a, b string) bool {
-	for _, x := range pathForms(a) {
-		for _, y := range pathForms(b) {
+//
+// As written first, with no system call. Then resolved, under a bound
+// (resolveBounded): a mount point the mount table names is its own
+// resolution, and any other path's resolution that does not finish in time —
+// a symlink into, or a path below, a network mount whose server does not
+// answer — is an error. An overlap found on any form is an overlap; no
+// overlap is reported only when every form was resolved. A caller deciding
+// whether two pools may coexist must treat the error as "cannot verify",
+// never as "no overlap".
+func DirsOverlap(a, b string) (bool, error) {
+	ca, cb := filepath.Clean(a), filepath.Clean(b)
+	if within(ca, cb) || within(cb, ca) {
+		return true, nil
+	}
+	var t MountTable
+	if mt, err := ReadMountTable(); err == nil {
+		t = mt
+	}
+	xs, errA := pathFormsBounded(&t, a)
+	ys, errB := pathFormsBounded(&t, b)
+	for _, x := range xs {
+		for _, y := range ys {
 			if within(x, y) || within(y, x) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	if err := errors.Join(errA, errB); err != nil {
+		return false, fmt.Errorf("cannot verify that %s and %s do not overlap: %w", a, b, err)
+	}
+	return false, nil
 }
 
 // dataDirsToJudge is the configured data directory and defaultDataDir.

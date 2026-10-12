@@ -413,7 +413,12 @@ func (s *Server) poolDirShared(ctx context.Context, rec corrosion.StoragePoolRec
 			continue
 		}
 		d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target})
-		if err == nil && storage.DirsOverlap(dir, d) {
+		if err != nil {
+			continue
+		}
+		// An overlap that cannot be verified counts as shared, as a lookup
+		// error does: the content stays confined.
+		if overlap, oerr := storage.DirsOverlap(dir, d); overlap || oerr != nil {
 			return true
 		}
 	}

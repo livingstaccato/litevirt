@@ -19,6 +19,11 @@
       <span><span class="muted">Host</span> <span class="mono">{{.Host}}</span></span>
       <span><span class="muted">Port</span> <span class="mono">{{.Port}}</span></span>
     </div>
+    {{if .HasPassword}}
+    <p class="muted" style="font-size:12px;margin-bottom:8px">
+      This console requires a password. The .vv file carries it, and remote-viewer deletes the file once it has read it.
+    </p>
+    {{end}}
     <div class="form-actions">
       <a class="btn btn-primary" href="/ui/vms/{{.Name}}/spice.vv">Download .vv</a>
     </div>

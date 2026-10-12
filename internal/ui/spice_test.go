@@ -33,6 +33,35 @@ func TestSpiceModalAndVV(t *testing.T) {
 		}
 	})
 
+	t.Run("no password, no password line", func(t *testing.T) {
+		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice.vv")))
+		if strings.Contains(w.Body.String(), "password=") {
+			t.Errorf(".vv for a console with no password carries a password line:\n%s", w.Body.String())
+		}
+	})
+
+	// A passworded console (docs/ui.md "Console passwords"): the .vv file
+	// carries the password, so remote-viewer opens it without a prompt, and
+	// the modal's HTML never does.
+	//
+	// Mutation "drop the password line" — red.
+	t.Run("password rides in the vv file only", func(t *testing.T) {
+		pm := newDefaultMock()
+		pm.spiceInfoResp = &pb.GetSpiceInfoResponse{Host: "10.0.0.5", Port: 5901, Uri: "spice://10.0.0.5:5901",
+			Password: "Spice24CharPasswordAbcde"}
+		ps := newTestUIServer(t, pm)
+		w := serveRequest(ps, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice.vv")))
+		assertStatus(t, w, http.StatusOK)
+		if !strings.Contains(w.Body.String(), "\npassword=Spice24CharPasswordAbcde\n") {
+			t.Errorf(".vv does not carry the console password:\n%s", w.Body.String())
+		}
+		m := serveRequest(ps, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice-modal")))
+		if strings.Contains(m.Body.String(), "Spice24CharPasswordAbcde") {
+			t.Error("the modal's HTML carries the console password")
+		}
+		mustContain(t, m.Body.String(), "requires a password")
+	})
+
 	t.Run("modal surfaces unavailable error", func(t *testing.T) {
 		em := newDefaultMock()
 		em.spiceInfoErr = errSimulated

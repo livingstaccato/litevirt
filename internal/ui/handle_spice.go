@@ -16,8 +16,10 @@ func (s *Server) handleSpiceModal(w http.ResponseWriter, r *http.Request) {
 		s.renderFragment(w, "spice_modal.html", map[string]any{"Name": name, "Error": err.Error()})
 		return
 	}
+	// The password itself stays out of the page; only the .vv file carries it.
 	s.renderFragment(w, "spice_modal.html", map[string]any{
 		"Name": name, "Host": resp.Host, "Port": resp.Port, "Uri": resp.Uri,
+		"HasPassword": resp.Password != "",
 	})
 }
 
@@ -33,6 +35,13 @@ func (s *Server) handleSpiceVV(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/x-virt-viewer")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, name+".vv"))
+	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintf(w, "[virt-viewer]\ntype=spice\nhost=%s\nport=%d\ntitle=%s\ndelete-this-file=1\nfullscreen=0\n",
 		resp.Host, resp.Port, name)
+	// The console's password (docs/ui.md "Console passwords"), so
+	// remote-viewer opens it without a prompt. delete-this-file=1 has the
+	// viewer remove the file once it has read it.
+	if resp.Password != "" {
+		fmt.Fprintf(w, "password=%s\n", resp.Password)
+	}
 }

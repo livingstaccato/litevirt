@@ -114,6 +114,7 @@ func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {
 		"vmStateBadge":   vmStateBadge,
 		"hostStateBadge": hostStateBadge,
 		"firstIP":        firstIP,
+		"nicSettings":    nicSettings,
 		"vmActions":      vmActions,
 		"memGiB":         func(mib int32) int32 { return mib / 1024 },
 		"formatBytes":    formatBytes,
@@ -784,6 +785,38 @@ func firstIP(ifaces []*pb.VMInterface) string {
 		}
 	}
 	return "—"
+}
+
+// nicSettings summarises the per-NIC settings the stored spec holds for the NIC
+// with this MAC (bandwidth cap, queues, security groups, trunk, guard), for
+// the VM detail Network table. Empty when the NIC has none set.
+func nicSettings(spec *pb.VMSpec, mac string) string {
+	for _, n := range spec.GetNetwork() {
+		if !strings.EqualFold(n.GetMac(), mac) {
+			continue
+		}
+		var parts []string
+		if n.GetRateMbSec() > 0 {
+			parts = append(parts, fmt.Sprintf("rate %g MB/s", n.GetRateMbSec()))
+		}
+		if n.GetQueues() > 1 {
+			parts = append(parts, fmt.Sprintf("%d queues", n.GetQueues()))
+		}
+		if len(n.GetSecurityGroups()) > 0 {
+			parts = append(parts, "sg "+strings.Join(n.GetSecurityGroups(), ","))
+		}
+		if len(n.GetTrunk()) > 0 {
+			parts = append(parts, fmt.Sprintf("trunk %v", n.GetTrunk()))
+		}
+		if n.GetSpoofGuard() != "" {
+			parts = append(parts, "spoof-guard "+n.GetSpoofGuard())
+		}
+		if len(n.GetAllowedAddresses()) > 0 {
+			parts = append(parts, "allowed "+strings.Join(n.GetAllowedAddresses(), ","))
+		}
+		return strings.Join(parts, ", ")
+	}
+	return ""
 }
 
 func vmActions(name string, state pb.VMState) template.HTML {

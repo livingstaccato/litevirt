@@ -2518,13 +2518,22 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return s.deleteVMOnRemovedHost(ctx, vm)
 		}
 		releaseLock() // never hold a process lock across a peer RPC
-		client, conn, err := s.peerClient(ctx, vm.HostName)
+		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
-		defer conn.Close()
+		defer closePeer()
 		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
+		// An owner that predates DeleteVMRequest.force ignores it, and would
+		// destroy a running VM without the stop hooks or the operator-stop
+		// record. For it, stop first as the CLI used to (errors ignored: the
+		// VM may already be down) and send a plain delete.
+		if req.Force && !s.peerHonoursDeleteForce(proxyCtx, client) {
+			_, _ = client.StopVM(proxyCtx, &pb.StopVMRequest{Name: req.Name, Force: true})
+			req = proto.Clone(req).(*pb.DeleteVMRequest)
+			req.Force = false
+		}
 		// The owner reports the row it tombstoned in a response header, which
 		// a re-create waiting on this delete takes (vm_recreate_replaces.go).
 		var hdr metadata.MD
@@ -2666,6 +2675,33 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// removed.
 	active, activeErr := s.virt.DomainIsActive(req.Name)
 	destroyed := false
+	// --force: the operator asked for the running guest to be force-stopped
+	// first. Done here, after every check that can refuse the delete (the
+	// barrier, a backup, linked clones, the kept-overlay settle), and never
+	// from the CLI beforehand: a delete refused after a stop left the VM
+	// powered off. It runs the same stop path as StopVM{force} — hooks and the
+	// operator-stop record — under the lock this delete already holds.
+	if req.Force && activeErr == nil && active {
+		if _, err := s.stopVMLocked(ctx, vm, true, 0); err != nil {
+			// stopVMLocked can fail after the domain was destroyed (the
+			// pre-latch device release, recording the stop). Ask libvirt: a
+			// domain still active means nothing was touched; a stopped one
+			// carries on exactly as a plain delete of a running VM does, so
+			// the stop is recorded (abortDeleteAfterStop) by whatever refuses
+			// the rest of the delete, and a stop that only failed to persist
+			// is completed by the delete.
+			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: the forced stop failed while its domain is still active, so nothing was removed (retry is safe): %v", req.Name, err)
+			}
+			slog.Warn("DeleteVM: forced stop failed after the domain was destroyed; continuing the delete",
+				"vm", req.Name, "error", err)
+		} else {
+			vm.State = "stopped"
+		}
+		destroyed = true
+		active = false
+	}
 	if vm.State == "running" || activeErr != nil || active {
 		if err := s.virt.DestroyDomain(req.Name); err != nil {
 			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
@@ -3142,13 +3178,44 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			slog.Warn("failed to load merged NICs for spec projection", "vm", name, "error", err)
 		} else {
 			sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
+			// The NIC rows own name, model, MAC and the live security-group
+			// binding; every other field (rate, queues, trunk, IPv6, the guard
+			// fields, ...) lives only in the stored spec, so carry it over
+			// from the attachment that spec holds for the same NIC. Without
+			// this `lv inspect`, the UI and `lv compose diff` saw a NIC with
+			// no rate or queues. The caller already holds vm.read for the
+			// whole stored spec, so nothing here widens what it may read.
+			var stored []*pb.NetworkAttachment
+			if spec != nil {
+				stored = spec.Network
+			}
 			specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
+			used := make([]bool, len(stored))
 			for _, nic := range nics {
-				specNetwork = append(specNetwork, &pb.NetworkAttachment{
-					Name:  nic.NetworkName,
-					Model: nic.Model,
-					Mac:   nic.MAC,
-				})
+				att := &pb.NetworkAttachment{}
+				if i := matchStoredNIC(stored, used, nic); i >= 0 {
+					used[i] = true
+					att = proto.Clone(stored[i]).(*pb.NetworkAttachment)
+				}
+				att.Name = nic.NetworkName
+				att.Model = nic.Model
+				att.Mac = nic.MAC
+				// The NIC row is the live binding the firewall renders from;
+				// an empty one means "no groups", never "the spec's groups".
+				att.SecurityGroups = corrosion.DecodeSecurityGroups(nic.SecurityGroups)
+				// Likewise the guard: SetNICGuard writes only the nic_guards
+				// row, which the firewall enforces from, so a row beats the
+				// create-time values in the spec. No row: the spec's stand.
+				if g, gerr := corrosion.GetNICGuard(ctx, s.db, name, nic.MAC); gerr != nil {
+					slog.Warn("failed to load NIC guard for spec projection", "vm", name, "mac", nic.MAC, "error", gerr)
+				} else if g != nil {
+					att.SpoofGuard = g.Mode
+					att.AllowedAddresses = g.Allowed
+					att.AllowDhcpServer = g.AllowDHCPServer
+					att.AllowRouterAdvertisement = g.AllowRouterAdvert
+					att.AllowVlanTags = g.AllowVLANTags
+				}
+				specNetwork = append(specNetwork, att)
 			}
 			spec.Network = specNetwork
 		}
@@ -3187,6 +3254,33 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 
 	return pbVM, nil
+}
+
+// peerHonoursDeleteForce asks a peer whether its build acts on
+// DeleteVMRequest.force. A peer that cannot be asked is treated as not
+// honouring it: the stop-first flow is safe against either kind.
+func (s *Server) peerHonoursDeleteForce(ctx context.Context, client pb.LiteVirtClient) bool {
+	resp, err := client.Ping(ctx, &pb.PingRequest{})
+	return err == nil && resp.GetDeleteForce()
+}
+
+// matchStoredNIC finds the stored-spec attachment for one NIC row: by MAC, else
+// (a legacy spec written before MACs were recorded) the unclaimed MAC-less
+// attachment at the NIC's own ordinal on the same network, the position the
+// enforcement side indexes the spec by. -1 when the NIC was attached after
+// create and the spec never described it.
+func matchStoredNIC(stored []*pb.NetworkAttachment, used []bool, nic corrosion.NICRecord) int {
+	for i, a := range stored {
+		if !used[i] && a != nil && a.Mac != "" && strings.EqualFold(a.Mac, nic.MAC) {
+			return i
+		}
+	}
+	if i := nic.Ordinal; i >= 0 && i < len(stored) && !used[i] {
+		if a := stored[i]; a != nil && a.Mac == "" && a.Name == nic.NetworkName {
+			return i
+		}
+	}
+	return -1
 }
 
 // formatDiskSizeBytes converts a byte count to a human-readable size string

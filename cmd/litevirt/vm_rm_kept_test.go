@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -18,6 +19,10 @@ import (
 type keptDeleteSpy struct {
 	pb.LiteVirtClient
 	kept []string
+}
+
+func (c *keptDeleteSpy) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	return &pb.PingResponse{DeleteForce: true}, nil
 }
 
 func (c *keptDeleteSpy) StopVM(context.Context, *pb.StopVMRequest, ...grpc.CallOption) (*pb.VM, error) {
@@ -67,5 +72,80 @@ func TestRm_NamesEachCephImageLeftInPlace(t *testing.T) {
 	}
 	if strings.Contains(out, "rbd rm") {
 		t.Fatalf("output advises a removal: %q", out)
+	}
+}
+
+// forceSpy records the calls `lv rm --force` makes.
+type forceSpy struct {
+	pb.LiteVirtClient
+	pingForce bool
+	pingErr   error
+	calls     []string
+	deletes   []*pb.DeleteVMRequest
+}
+
+func (c *forceSpy) Ping(context.Context, *pb.PingRequest, ...grpc.CallOption) (*pb.PingResponse, error) {
+	if c.pingErr != nil {
+		return nil, c.pingErr
+	}
+	return &pb.PingResponse{DeleteForce: c.pingForce}, nil
+}
+
+func (c *forceSpy) StopVM(_ context.Context, r *pb.StopVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
+	c.calls = append(c.calls, "stop")
+	if !r.GetForce() {
+		return nil, errors.New("stop must be forced")
+	}
+	return &pb.VM{}, nil
+}
+
+func (c *forceSpy) DeleteVM(_ context.Context, r *pb.DeleteVMRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	c.calls = append(c.calls, "delete")
+	c.deletes = append(c.deletes, r)
+	return &emptypb.Empty{}, nil
+}
+
+func runRmForce(t *testing.T, spy *forceSpy) {
+	t.Helper()
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	t.Cleanup(func() { withClient = orig })
+	cmd := newRmCmd()
+	cmd.SetArgs([]string{"--force", "web"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	var err error
+	captureStdout(t, func() { err = cmd.Execute() })
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+}
+
+// F5: `lv rm --force` force-stopped the VM before DeleteVM could refuse the
+// delete, leaving a powered-off VM. Against a daemon that honours delete force,
+// the stop is the daemon's, after its checks: no StopVM, force set.
+func TestRm_ForceLeavesTheStopToADaemonThatHonoursIt(t *testing.T) {
+	spy := &forceSpy{pingForce: true}
+	runRmForce(t, spy)
+	if len(spy.calls) != 1 || spy.calls[0] != "delete" || !spy.deletes[0].GetForce() {
+		t.Errorf("calls = %v, force = %v; want one delete with force set", spy.calls, spy.deletes[0].GetForce())
+	}
+}
+
+// I3: a daemon that predates the field ignores it, so a stop-less delete would
+// lose the stop hooks and the operator-stop record. The old flow stands: StopVM
+// first, then a plain delete.
+func TestRm_ForceStopsFirstAgainstADaemonThatIgnoresIt(t *testing.T) {
+	for name, spy := range map[string]*forceSpy{
+		"old daemon":        {pingForce: false},
+		"ping unanswerable": {pingErr: errors.New("boom")},
+	} {
+		runRmForce(t, spy)
+		if len(spy.calls) != 2 || spy.calls[0] != "stop" || spy.calls[1] != "delete" || spy.deletes[0].GetForce() {
+			t.Errorf("%s: calls = %v force = %v; want [stop delete] without force", name, spy.calls, spy.deletes[0].GetForce())
+		}
 	}
 }

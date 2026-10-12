@@ -135,15 +135,16 @@
     <div class="section">
       <div class="section-header"><h2>Network</h2></div>
       <table>
-        <thead><tr><th>Network</th><th>MAC</th><th>IP</th></tr></thead>
+        <thead><tr><th>Network</th><th>MAC</th><th>IP</th><th>Settings</th></tr></thead>
         <tbody>
         {{range .VM.Interfaces}}
         <tr>
           <td>{{.NetworkName}}</td>
           <td style="font-family:monospace;color:var(--muted)">{{.Mac}}</td>
           <td>{{if .Ip}}{{.Ip}}{{else}}<span style="color:var(--muted)">discovering...</span>{{end}}</td>
+          <td style="color:var(--muted)">{{nicSettings $.VM.Spec .Mac}}</td>
         </tr>
-        {{else}}<tr><td colspan="3" class="empty">No interfaces</td></tr>
+        {{else}}<tr><td colspan="4" class="empty">No interfaces</td></tr>
         {{end}}
         </tbody>
       </table>

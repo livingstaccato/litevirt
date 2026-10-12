@@ -640,10 +640,51 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   not mounted or a backup repo that cannot be read refuses the prune,
 #   saying which. A refresh prunes the image's older unused versions by
 #   itself, in the background, keeping the one it superseded.
+#   A deleted image (lv image rm) has no current version to keep: prune
+#   removes all its files, under the rules lv image rm lists below, and
+#   lists each one it keeps with the reason.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls
 lv image rm <image>
+#   Deletes the image from the catalog, then asks every host to remove its
+#   files of the image, the current one too. Needs the operator role, as the
+#   catalog delete always has; each host's part runs as that host. Each host
+#   judges only its own files and removes one only when nothing keeps it:
+#     - a disk, staged disk (a restore, import or replica in progress — a
+#       backup repo's chunks there are guest data and are not read), backup
+#       base or other image this host can see is built on it, a kept file of
+#       a deleted image is built on it, or it is pinned;
+#     - a VM anywhere in the cluster records the image: a disk built on it, or
+#       a VM created from it (a failover, recreate or migration onto this host
+#       may need this host's copy) — so while any VM records it, every host
+#       keeps its copy. A VM deleted in the last 10 minutes still counts: a
+#       rebuild or rolling recreate deletes the VM and creates it again,
+#       possibly on another host. A host that has not yet received the record
+#       of a VM created moments before the rm may remove its own copy; the
+#       VM's own host keeps the copy its disk is built on;
+#     - a disk recorded on this host cannot be read here (a device path such as
+#       a logged-out iSCSI LUN does not count), a staging directory cannot be
+#       read or nests deeper than four levels, or the image store is on a
+#       network filesystem (nfs, cifs, ceph, fuse, ...) that other hosts may
+#       share;
+#     - a process holds it open (a running qemu), or some process's open files
+#       cannot be read: the reason names that process and fd (a daemon not
+#       running as root keeps every file; a process holding a dead FUSE or a
+#       stale share's file keeps them until it ends);
+#     - a disk create, pull, import or build of the image is in flight, or a
+#       rebuild, rolling recreate or compose deploy update that recreates a VM
+#       from it: each holds the image it creates from, from before its
+#       teardown until its create returns.
+#   The last check and the removal are one step against a create of the image:
+#   a create that begins afterwards finds no file. Each kept file is printed
+#   with its reason; once nothing uses it, lv image prune <image> --host <host>
+#   removes it. A host that cannot be reached, or runs an older build, keeps
+#   its files and is named. A host waits up to 15 seconds for the delete to
+#   replicate to it; one that still shows the image (or where it was pulled
+#   again) keeps the file. The delete itself is never refused. The REST and
+#   web UI delete (DeleteImage) removes the files the same way, in the
+#   background, and logs each host's outcome.
 ```
 
 `pull` and `import` accept only standalone images. A qcow2 that names a

@@ -437,6 +437,9 @@ type Server struct {
 	// imagePrune bounds and serializes the image-version prune, and holds
 	// the images an in-flight disk create uses (image_prune.go).
 	imagePrune imagePruneState
+	// recreateTornDown is a test seam: it runs in a rebuild and a rolling
+	// recreate once the old VM is torn down, before it is created again.
+	recreateTornDown func(name string)
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that

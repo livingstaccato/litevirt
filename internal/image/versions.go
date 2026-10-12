@@ -463,6 +463,35 @@ func (s *Store) RemoveImageFile(name, path string) error {
 	return nil
 }
 
+// RemoveDeletedImageFile removes one file of image name — a deleted image,
+// so its current file too — and its identity record. A pinned file is never
+// removed. When it is the file the name's pointer names, the pointer goes
+// first, so no new disk is created on it from here on.
+func (s *Store) RemoveDeletedImageFile(name, path string) error {
+	if !IsImageFile(s.imageDir, name, path) {
+		return fmt.Errorf("%s is not a file of image %q", path, name)
+	}
+	if Pinned(path) {
+		return fmt.Errorf("%s is pinned: a backup was taken on it", path)
+	}
+	if cur, ok := s.currentVersion(name); ok && cur == path {
+		if err := os.Remove(s.pointerPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove image %q's current-version pointer: %w", name, err)
+		}
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	_ = os.Remove(identityPath(path))
+	// A pointer left naming a file that is gone names nothing.
+	if t, err := os.Readlink(s.pointerPath(name)); err == nil {
+		if _, err := os.Lstat(filepath.Join(s.imageDir, t)); errors.Is(err, fs.ErrNotExist) {
+			_ = os.Remove(s.pointerPath(name))
+		}
+	}
+	return nil
+}
+
 // linkNoReplace makes tmp visible at path only if nothing is there (a hard
 // link refuses an existing name), then drops tmp's own name.
 func linkNoReplace(tmp, path string) error {

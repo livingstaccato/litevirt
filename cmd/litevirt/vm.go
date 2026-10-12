@@ -285,19 +285,14 @@ func newRmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				// Force-stop the VM first if --force is set and the VM is running.
-				if force {
-					c.StopVM(ctx, &pb.StopVMRequest{
-						Name:  args[0],
-						Force: true,
-					})
-					// Ignore error — VM may already be stopped or not found.
-				}
-
 				var hdr metadata.MD
 				_, err := c.DeleteVM(ctx, &pb.DeleteVMRequest{
 					Name:      args[0],
 					KeepDisks: keepDisks,
+					// The daemon force-stops a running VM itself, after every
+					// check that can refuse the delete: a stop sent from here
+					// first left a refused delete's VM powered off.
+					Force: force,
 				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("delete VM: %w", err)
@@ -319,7 +314,7 @@ func newRmCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&keepDisks, "keep-disks", false, "Keep disk files")
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "Force-stop the VM before deleting")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "Force-stop a running VM as part of the delete (after the delete's own checks pass)")
 	return cmd
 }
 

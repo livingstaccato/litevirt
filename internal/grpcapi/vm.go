@@ -2599,6 +2599,21 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// removed.
 	active, activeErr := s.virt.DomainIsActive(req.Name)
 	destroyed := false
+	// --force: the operator asked for the running guest to be force-stopped
+	// first. Done here, after every check that can refuse the delete (the
+	// barrier, a backup, linked clones, the kept-overlay settle), and never
+	// from the CLI beforehand: a delete refused after a stop left the VM
+	// powered off. It runs the same stop path as StopVM{force} — hooks and the
+	// operator-stop record — under the lock this delete already holds.
+	if req.Force && activeErr == nil && active {
+		if _, err := s.stopVMLocked(ctx, vm, true, 0); err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot delete VM %q: the forced stop failed, so nothing was removed (retry is safe): %v", req.Name, err)
+		}
+		destroyed = true
+		vm.State = "stopped"
+		active = false
+	}
 	if vm.State == "running" || activeErr != nil || active {
 		if err := s.virt.DestroyDomain(req.Name); err != nil {
 			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {

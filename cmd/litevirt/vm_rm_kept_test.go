@@ -69,3 +69,49 @@ func TestRm_NamesEachCephImageLeftInPlace(t *testing.T) {
 		t.Fatalf("output advises a removal: %q", out)
 	}
 }
+
+// forceSpy records the calls `lv rm --force` makes.
+type forceSpy struct {
+	pb.LiteVirtClient
+	stops   int
+	deletes []*pb.DeleteVMRequest
+}
+
+func (c *forceSpy) StopVM(context.Context, *pb.StopVMRequest, ...grpc.CallOption) (*pb.VM, error) {
+	c.stops++
+	return &pb.VM{}, nil
+}
+
+func (c *forceSpy) DeleteVM(_ context.Context, r *pb.DeleteVMRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	c.deletes = append(c.deletes, r)
+	return &emptypb.Empty{}, nil
+}
+
+// F5: `lv rm --force` force-stopped the VM before DeleteVM could refuse the
+// delete (operation barrier, linked clones, ...), leaving a powered-off VM. The
+// stop is the daemon's, after its checks: the CLI sends no StopVM and asks the
+// delete to force.
+func TestRm_ForceLeavesTheStopToTheDelete(t *testing.T) {
+	spy := &forceSpy{}
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	t.Cleanup(func() { withClient = orig })
+	cmd := newRmCmd()
+	cmd.SetArgs([]string{"--force", "web"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	var err error
+	captureStdout(t, func() { err = cmd.Execute() })
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	if spy.stops != 0 {
+		t.Errorf("rm --force sent %d StopVM calls before the delete", spy.stops)
+	}
+	if len(spy.deletes) != 1 || !spy.deletes[0].GetForce() {
+		t.Errorf("DeleteVM requests = %v, want one with force set", spy.deletes)
+	}
+}

@@ -3553,8 +3553,14 @@ type DeleteVMRequest struct {
 	// expected_created_at: the row must be this incarnation (vms.created_at,
 	// exactly as recorded).
 	ExpectedCreatedAt string `protobuf:"bytes,4,opt,name=expected_created_at,json=expectedCreatedAt,proto3" json:"expected_created_at,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// force: destroy a running VM as part of the delete (lv rm --force), on the
+	// VM's host and only after every check that can refuse the delete has
+	// passed — so a refused delete leaves a running VM running. Run through the
+	// same stop path as StopVM{force} (hooks, operator-stop record). Without it
+	// a running VM is still destroyed by the delete itself, as before.
+	Force         bool `protobuf:"varint,5,opt,name=force,proto3" json:"force,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeleteVMRequest) Reset() {
@@ -3613,6 +3619,13 @@ func (x *DeleteVMRequest) GetExpectedCreatedAt() string {
 		return x.ExpectedCreatedAt
 	}
 	return ""
+}
+
+func (x *DeleteVMRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 // RepairVMOwner re-stamps a VM's ownership (host_name + running state) with a
@@ -40635,13 +40648,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x05force\x18\x02 \x01(\bR\x05force\x12\x18\n" +
 	"\atimeout\x18\x03 \x01(\x05R\atimeout\"&\n" +
 	"\x10RestartVMRequest\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\x9b\x01\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"\xb1\x01\n" +
 	"\x0fDeleteVMRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
 	"keep_disks\x18\x02 \x01(\bR\tkeepDisks\x12%\n" +
 	"\x0eexpected_stack\x18\x03 \x01(\tR\rexpectedStack\x12.\n" +
-	"\x13expected_created_at\x18\x04 \x01(\tR\x11expectedCreatedAt\">\n" +
+	"\x13expected_created_at\x18\x04 \x01(\tR\x11expectedCreatedAt\x12\x14\n" +
+	"\x05force\x18\x05 \x01(\bR\x05force\">\n" +
 	"\x14RepairVMOwnerRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\"P\n" +

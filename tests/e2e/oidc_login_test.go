@@ -258,43 +258,85 @@ func oidcExpectedGroup(user string) string {
 	return ""
 }
 
+// oidcAuthorisedFlow begins a login on the node's UI in a fresh browser, signs
+// user in at kanidm and has kanidm answer the authorization request. It returns
+// the browser that began the flow (holding its flow cookie) and the callback URL
+// kanidm sent it to, not yet visited.
+func oidcAuthorisedFlow(t *testing.T, ui, realm, secrets, user string) (*http.Client, string) {
+	t.Helper()
+	br := oidcBrowser(t)
+	resp, err := br.Get(ui + "/oidc/login?realm=" + url.QueryEscape(realm))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	authURL := resp.Header.Get("Location")
+	if resp.StatusCode != http.StatusFound || authURL == "" {
+		t.Fatalf("begin: HTTP %d, Location %q", resp.StatusCode, authURL)
+	}
+	au, _ := url.Parse(authURL)
+	bearer := kanidmSignIn(t, br, au.Scheme+"://"+au.Host, user, secrets)
+	callback := kanidmAuthorise(t, br, authURL, bearer)
+	if !strings.HasPrefix(callback, ui+"/oidc/callback?") {
+		t.Fatalf("kanidm redirected to %q, not this node's callback", callback)
+	}
+	return br, callback
+}
+
+// oidcSessionSet is the lv_session cookie a response sets, "" for none.
+func oidcSessionSet(resp *http.Response) string {
+	for _, c := range resp.Cookies() {
+		if c.Name == "lv_session" && c.MaxAge >= 0 && c.Value != "" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
 // TestOIDC_LiveIdPSignInThroughTheWebUI signs each lab user in through the
 // node's UI and kanidm, and checks the session: set, usable, and in the realm.
 // lvmfa signs in with password + TOTP at kanidm (its account policy); with no
 // litevirt login policy covering the realm, that is all litevirt asks.
+//
+// Each user runs two flows. A callback redeemed by a browser that did not begin
+// the login is refused AND consumes the flow (internal/auth/oidc.go
+// Authenticate: the flow is taken before the binding is checked, so a stray
+// callback can never be redeemed later by anyone). So the login-CSRF probe gets a
+// flow of its own, and the real sign-in a second one; probing the flow the real
+// sign-in then redeems cannot pass.
 func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 	ui, realm, secrets, users := oidcE2E(t)
 	for _, user := range users {
 		user := strings.TrimSpace(user)
 		t.Run(user, func(t *testing.T) {
-			br := oidcBrowser(t)
-			resp, err := br.Get(ui + "/oidc/login?realm=" + url.QueryEscape(realm))
+			// ── flow A: login CSRF ─────────────────────────────────────────
+			// A fresh client has no flow cookie. The daemon refuses it with
+			// ErrOIDCFlowBindingMismatch, an ErrInvalidCredentials, which the UI
+			// answers 401 Unauthenticated (httpStatusFor; pinned in
+			// internal/ui TestOIDCUI_CallbackNotBegunByThisBrowserBurnsTheFlow).
+			beganA, callbackA := oidcAuthorisedFlow(t, ui, realm, secrets, user)
+			r, err := oidcBrowser(t).Get(callbackA)
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp.Body.Close()
-			authURL := resp.Header.Get("Location")
-			if resp.StatusCode != http.StatusFound || authURL == "" {
-				t.Fatalf("begin: HTTP %d, Location %q", resp.StatusCode, authURL)
+			r.Body.Close()
+			if r.StatusCode != http.StatusUnauthorized || oidcSessionSet(r) != "" {
+				t.Fatalf("a callback from a browser that did not begin the login: HTTP %d, session set %v; want 401 and none",
+					r.StatusCode, oidcSessionSet(r) != "")
 			}
-			au, _ := url.Parse(authURL)
-			bearer := kanidmSignIn(t, br, au.Scheme+"://"+au.Host, user, secrets)
-			callback := kanidmAuthorise(t, br, authURL, bearer)
-			if !strings.HasPrefix(callback, ui+"/oidc/callback?") {
-				t.Fatalf("kanidm redirected to %q, not this node's callback", callback)
+			// ...and the flow is spent: the browser that began it is refused too.
+			r, err = beganA.Get(callbackA)
+			if err != nil {
+				t.Fatal(err)
 			}
-
-			// A callback for this flow at the node without the browser's flow
-			// cookie is refused (login CSRF): a fresh client has none.
-			fresh := oidcBrowser(t)
-			if r, err := fresh.Get(callback); err == nil {
-				r.Body.Close()
-				if r.StatusCode != http.StatusForbidden {
-					t.Fatalf("a callback from a browser that did not begin the login: HTTP %d, want 403", r.StatusCode)
-				}
+			r.Body.Close()
+			if r.StatusCode == http.StatusFound || oidcSessionSet(r) != "" {
+				t.Fatalf("the beginner redeemed a flow a stray callback had already consumed: HTTP %d", r.StatusCode)
 			}
 
-			resp, err = br.Get(callback)
+			// ── flow B: the real sign-in ───────────────────────────────────
+			br, callback := oidcAuthorisedFlow(t, ui, realm, secrets, user)
+			resp, err := br.Get(callback)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -303,12 +345,7 @@ func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 			if resp.StatusCode == http.StatusOK && regexp.MustCompile(`name="oidc_pending"`).Match(body) {
 				t.Fatalf("litevirt asked %s for its own second factor; this test expects no login policy covering %s", user, realm)
 			}
-			var session string
-			for _, c := range resp.Cookies() {
-				if c.Name == "lv_session" && c.MaxAge >= 0 {
-					session = c.Value
-				}
-			}
+			session := oidcSessionSet(resp)
 			if resp.StatusCode != http.StatusFound || session == "" {
 				t.Fatalf("callback: HTTP %d, no session (body %.400s)", resp.StatusCode, body)
 			}
@@ -345,10 +382,8 @@ func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 			resp, err = br.Get(callback)
 			if err == nil {
 				resp.Body.Close()
-				for _, c := range resp.Cookies() {
-					if c.Name == "lv_session" && c.MaxAge >= 0 && c.Value != "" && c.Value != session {
-						t.Fatal("a replayed callback minted a second session")
-					}
+				if s := oidcSessionSet(resp); s != "" && s != session {
+					t.Fatal("a replayed callback minted a second session")
 				}
 			}
 			fmt.Printf("oidc e2e: %s signed in through %s\n", user, realm)

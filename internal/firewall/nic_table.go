@@ -440,19 +440,21 @@ func eui64LinkLocal(mac string) (string, bool) {
 // things a guest may never send come first, so the DHCP-client accept further
 // down can never let a server reply or a spoofed frame through.
 //
-// A trunk NIC's tagged frames leave the chain after the MAC check: the
-// addresses its guest uses on its other VLANs are not litevirt's to know, so
-// the address guards hold its untagged (native VLAN) traffic only. The
-// prerouting chain has already confined its tags (renderTrunkConfine).
+// A trunk NIC's (or an --allow-vlan-tags NIC's) tagged frames leave the chain
+// after the MAC-level checks: the addresses its guest uses on its other VLANs
+// are not litevirt's to know, so the address guards hold its untagged (native
+// VLAN) traffic only. A trunk's tags were confined by prerouting already
+// (renderTrunkConfine); an --allow-vlan-tags NIC has no such confinement, so
+// its guard drops doubled tags itself and treats VID 0 as native.
 func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk bool) {
 	mac := strings.ToLower(g.MAC)
 	hw, _ := net.ParseMAC(mac)
 	macHex := fmt.Sprintf("0x%x", []byte(hw))
 	fmt.Fprintf(b, "    chain guard_%s {\n", sanitiseChain(dev))
 	fmt.Fprintf(b, "        ether saddr != %s drop\n", mac)
-	if trunk {
-		// Every frame of a trunk, tagged or not, is held to the guest's own
-		// MAC in ARP and neighbour discovery, and may not answer DHCP or
+	if trunk || vlanOK {
+		// Every frame of a trunk (or of a NIC allowed tags), tagged or not, is
+		// held to the guest's own MAC in ARP and neighbour discovery, and may not answer DHCP or
 		// advertise a router (re-review R2-I1). These match with no network-
 		// header dependency (raw @nh, meta l4proto), because the kernel holds a
 		// single tag outside the frame and nft's ether type then reads the tag.
@@ -469,10 +471,33 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } @nh,32,16 > 32 drop\n")
 		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-router-solicit @nh,32,16 > 16 drop\n")
 		renderNDOptionChecks(b, macHex)
-		// The addresses its guest uses on its other VLANs are not litevirt's
-		// to know: the address guards below hold the native VLAN only.
-		fmt.Fprintf(b, "        ether type 8021q return\n")
-	} else if !vlanOK {
+		if trunk {
+			// The addresses its guest uses on its other VLANs are not
+			// litevirt's to know: the address guards below hold the native
+			// VLAN only.
+			fmt.Fprintf(b, "        ether type 8021q return\n")
+		} else {
+			// A NIC allowed tags without the trunk feature (--allow-vlan-tags)
+			// is held the same way, with two differences. A doubled tag (an
+			// 802.1ad outer tag, or an 802.1Q tag inside the outer one: the
+			// kernel's protocol is then 0x8100) hides every header the raw
+			// checks above read, so it is dropped, not waved through. And a
+			// priority tag (VID 0) is native-VLAN traffic everywhere the
+			// frame goes next, so it does not leave here: it falls through to
+			// the native address guards, with its ARP sender address (which
+			// nft's arp expression cannot read inside a tag) held by a raw match.
+			fmt.Fprintf(b, "        ether type 8021ad drop\n")
+			fmt.Fprintf(b, "        meta protocol { 8021q, 8021ad } drop\n")
+			fmt.Fprintf(b, "        vlan id != 0 return\n")
+			if len(g.ExcludeV4) > 0 {
+				fmt.Fprintf(b, "        vlan id 0 meta protocol arp @nh,112,32 { %s } drop\n", strings.Join(v4IntSet(g.ExcludeV4), ", "))
+			}
+			if g.V4 != nil {
+				fmt.Fprintf(b, "        vlan id 0 meta protocol arp @nh,112,32 != { %s } drop\n",
+					strings.Join(v4IntSet(append([]string{"0.0.0.0"}, g.V4...)), ", "))
+			}
+		}
+	} else {
 		// Held here too, so a guarded NIC drops tagged frames in observe mode,
 		// where the table-wide VLAN rule only counts.
 		fmt.Fprintf(b, "        ether type { 8021q, 8021ad } drop\n")
@@ -547,4 +572,34 @@ func renderNDOptionChecks(b *strings.Builder, macHex string) {
 	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != %s drop\n", macHex)
 	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != %s drop\n", macHex)
+}
+
+// v4IntSet renders IPv4 addresses and prefixes as the integers (and integer
+// ranges) a raw 32-bit payload match compares with, e.g. 10.0.2.0/24 as
+// 0x0a000200-0x0a0002ff. An element that is not IPv4 is skipped.
+func v4IntSet(elems []string) []string {
+	var out []string
+	for _, s := range collapseSetElements(elems) {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			a, aerr := netip.ParseAddr(s)
+			if aerr != nil {
+				continue
+			}
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		if !p.Addr().Is4() {
+			continue
+		}
+		p = p.Masked()
+		lo := p.Addr().As4()
+		first := uint32(lo[0])<<24 | uint32(lo[1])<<16 | uint32(lo[2])<<8 | uint32(lo[3])
+		last := first | (^uint32(0) >> uint(p.Bits()))
+		if first == last {
+			out = append(out, fmt.Sprintf("0x%08x", first))
+		} else {
+			out = append(out, fmt.Sprintf("0x%08x-0x%08x", first, last))
+		}
+	}
+	return out
 }

@@ -1771,13 +1771,48 @@ func TestVM_AttachDetachDisk(t *testing.T) {
 	lv(t, "rm", name, "--force")
 }
 
+// removeVerified runs args until gone() holds, for up to two minutes, and fails
+// the test naming the leak if it never does. A cleanup that ignores its errors
+// leaks the VM or network into every later test: in lab run lab1-c713 a VM whose
+// detach was left recoverable refused `rm --force` (its operation barrier was
+// held), kept the deleted network's dnsmasq alive, and the next two runs failed
+// on `network create` for the subnet it still held.
+func removeVerified(t *testing.T, what string, gone func() bool, args ...string) {
+	t.Helper()
+	var lastOut string
+	var lastErr error
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		if gone() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("cleanup: %s still present after 2m; it leaks into later tests (last `lv %s`: %v %s)",
+				what, strings.Join(args, " "), lastErr, strings.TrimSpace(lastOut))
+			return
+		}
+		lastOut, lastErr = lvErr(t, args...)
+		if gone() {
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
 func TestVM_AttachDetachNIC(t *testing.T) {
 	requireImage(t)
 	netName := uniqueName("n")
 	vmName := uniqueName("vm")
+	host := hostNames[0]
 	cleanup(t, func() {
-		lvErr(t, "rm", vmName, "--force")
-		lvErr(t, "network", "rm", netName, "--force")
+		removeVerified(t, "VM "+vmName, func() bool {
+			out, err := lvErr(t, "inspect", vmName)
+			return err != nil && strings.Contains(strings.ToLower(out+err.Error()), "not found")
+		}, "rm", vmName, "--force")
+		removeVerified(t, "network "+netName, func() bool {
+			out, err := lvErr(t, "network", "ls")
+			return err == nil && !strings.Contains(out, netName)
+		}, "network", "rm", netName, "--force")
 	})
 
 	lv(t, "network", "create", netName, "--type", "bridge",
@@ -1785,8 +1820,17 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 
 	lv(t, "run", "--name", vmName, "--image", testImage,
 		"--cpu", "1", "--memory", "1024", "--disk", "5G",
-		"--host", hostNames[0])
+		"--host", host)
 	waitVM(t, vmName, "RUNNING", 2*time.Minute)
+
+	// RUNNING is the DOMAIN, not the guest. Hot-unplug needs the guest to answer
+	// the eject, and a guest still booting drops it: the lab saw this test detach
+	// ~4 s after RUNNING and fail 3 runs in 3 (lab1-c713, M6). Wait until the
+	// guest is driving its root disk (it has booted), and later until it is
+	// driving the attached NIC (it has enumerated what it will be asked to
+	// eject). Read from QEMU on the VM's host; where that cannot be asked the
+	// CLI-level assertions below carry the test alone.
+	canAsk := waitVirtioDriversOK(t, host, vmName, "virtio-blk", 4*time.Minute)
 
 	// `lv run --name ... --image ...` makes a VM with no NIC at all, so the VM
 	// starts with none and the NIC this test attaches is the only one. Record
@@ -1817,11 +1861,32 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 	if added == "" {
 		t.Fatalf("no new MAC in inspect after attaching a NIC (before %v):\n%s", before, out)
 	}
+	if canAsk {
+		waitVirtioDriversOK(t, host, vmName, "virtio-net", 2*time.Minute)
+	}
+
+	// The detach must succeed outright: `lv detach-nic` waits for the unplug and
+	// re-requests it, so a guest that has booted releases the NIC inside that
+	// wait. A detach that is broken returns an error here and fails the test.
 	lv(t, "detach-nic", vmName, added)
 	// The guest acks an unplug asynchronously, so poll rather than read once.
 	assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from inspect", func() bool {
 		return !strings.Contains(lv(t, "inspect", vmName), added)
 	})
+	// inspect reads litevirt's rows. Where the host can be asked, the domain
+	// itself must agree, in BOTH copies: a NIC left in the live domain is still
+	// plugged into the guest, and one left in the persistent definition comes
+	// back on the next cold boot.
+	if canAsk {
+		assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from the live domain and the persistent definition", func() bool {
+			live, config, err := nicCopies(host, vmName, added)
+			if err != nil {
+				t.Logf("reading %s's definitions on %s: %v", vmName, host, err)
+				return false
+			}
+			return !live && !config
+		})
+	}
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")

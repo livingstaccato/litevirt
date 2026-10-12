@@ -269,6 +269,10 @@ func TestMoveVolume_RunningVMRejected(t *testing.T) {
 	if status.Code(err) != codes.Unimplemented {
 		t.Fatalf("expected Unimplemented for running VM, got %v", err)
 	}
+	// There is no --skip-live-mover flag; the advice is to stop the VM.
+	if msg := status.Convert(err).Message(); strings.Contains(msg, "--skip-live-mover") || !strings.Contains(msg, "lv stop") {
+		t.Errorf("advice names a flag the CLI does not have, or not lv stop: %q", msg)
+	}
 }
 
 // TestMoveVolume_UnknownTargetPoolRejected catches the most common

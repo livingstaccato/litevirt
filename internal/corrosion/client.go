@@ -1074,6 +1074,7 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	// Open SQLite with WAL mode
 	dbPath := filepath.Join(cfg.DataDir, "state.db")
+	prepareStateDBFile(dbPath) // owner-only: it holds the credentials
 	dsn := sqliteDSN(dbPath)
 	db, gens, err := openHookedDB(dsn)
 	if err != nil {
@@ -1181,6 +1182,7 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 // get picked up by the running daemon's replicator and broadcast to peers.
 func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	dbPath := filepath.Join(dataDir, "state.db")
+	prepareStateDBFile(dbPath) // owner-only: it holds the credentials
 	dsn := sqliteDSN(dbPath)
 	db, gens, err := openHookedDB(dsn)
 	if err != nil {

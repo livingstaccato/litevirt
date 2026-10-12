@@ -198,6 +198,10 @@ func New(cfg *Config) (*Daemon, error) {
 	// guards. One whose guards cannot be read waits.
 	virt.RequireStartGuard(5*time.Minute, startWaitNeeded(db))
 
+	// An earlier build left the backup session directories 0777; narrow them
+	// now rather than at the first backup (best effort, logged).
+	libvirt.PrepareBackupRoots()
+
 	// Image store
 	store := image.NewStore(cfg.DataDir)
 	if err := store.Init(); err != nil {

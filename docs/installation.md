@@ -238,7 +238,7 @@ single-node install does not require copying daemon certificates out of
 /var/lib/litevirt/              # data directory
   images/                       # base VM images
   disks/                        # VM disk images
-  state.db                      # local SQLite state store
+  state.db                      # local SQLite state store (0600: it holds the credentials)
 /var/cache/litevirt-restore/    # file restore: restore-VM kernel copy + initramfs (root:litevirt-restore 0750)
 /run/litevirt/file-restore/     # file restore: per-session export sockets and pidfiles
 ```

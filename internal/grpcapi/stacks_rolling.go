@@ -99,6 +99,14 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
 		}
 	}
+	// The image the VM is created again from is held from before the delete
+	// until the create has returned: in between, no disk and no live row on
+	// this host records it, and lv image rm must not take the file the create
+	// needs. A create on another host is covered there by the deleted row's
+	// grace (imageRecordedUsers) until its own create holds the image.
+	if spec.Image != "" {
+		defer o.s.holdImage(spec.Image)()
+	}
 	var curCreated string
 	if cur != nil {
 		curCreated = cur.CreatedAt
@@ -117,6 +125,9 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	// build and reports nothing. Only when this delete removed it: NotFound
 	// tore nothing down, so the create names nothing and claims no teardown.
 	tornDown := derr == nil && cur != nil
+	if hook := o.s.recreateTornDown; hook != nil && tornDown {
+		hook(target)
+	}
 	if tornDown {
 		if deleted.snap != nil {
 			ctx = withReplacedSnapshot(ctx, target, *deleted.snap)

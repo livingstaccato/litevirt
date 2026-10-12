@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -46,6 +47,16 @@ func importImageOn(t *testing.T, c *Cluster, n *Node, name string) string {
 	return f
 }
 
+// imageRmFleet limits every node's open-file check to this process: the
+// fleet runs without root, and the full read of /proc fails closed on every
+// other user's process, keeping every file. Every node runs in this process,
+// so a file any node holds open is still seen.
+func imageRmFleet(c *Cluster) {
+	for _, n := range c.Nodes {
+		n.Server.SetImageOpenFilesForTest(grpcapi.OpenFilesOfThisProcessForTest)
+	}
+}
+
 func fileThere(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
@@ -66,6 +77,7 @@ func hostResult(resp *pb.RemoveImageResponse, host string) *pb.PruneImagesRespon
 func TestFleet_ImageRm_RemovesTheFileOnEveryHost(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
 	files := map[string]string{}
 	for _, n := range c.Nodes {
 		files[n.Name] = importImageOn(t, c, n, "ubuntu")
@@ -103,6 +115,7 @@ func TestFleet_ImageRm_RemovesTheFileOnEveryHost(t *testing.T) {
 func TestFleet_ImageRm_KeepsEveryCopyWhileAVMIsBuiltOnIt(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
 	ctx := context.Background()
 	owner := c.Nodes[1]
 	files := map[string]string{}
@@ -142,6 +155,11 @@ func TestFleet_ImageRm_KeepsEveryCopyWhileAVMIsBuiltOnIt(t *testing.T) {
 	if _, err := c.SelfClient(owner).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web"}); err != nil {
 		t.Fatal(err)
 	}
+	// A deleted VM records its image for a grace (a rebuild creates it again);
+	// this one is gone for good.
+	for _, n := range c.Nodes {
+		n.Server.SetImageRecreateGraceForTest(-1)
+	}
 	for _, n := range c.Nodes {
 		eventually(t, 15*time.Second, "lv image prune on "+n.Name+" to remove its copy", func() bool {
 			_, err := c.SelfClient(c.Nodes[0]).PruneImages(ctx, &pb.PruneImagesRequest{Name: "ubuntu", HostName: n.Name})
@@ -155,6 +173,7 @@ func TestFleet_ImageRm_KeepsEveryCopyWhileAVMIsBuiltOnIt(t *testing.T) {
 func TestFleet_ImageRm_AnOlderHostKeepsItsFile(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
 	files := map[string]string{}
 	for _, n := range c.Nodes {
 		files[n.Name] = importImageOn(t, c, n, "ubuntu")

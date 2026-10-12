@@ -83,7 +83,7 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 		files = append(files, s.hostDiskFile(p))
 		// A disk recorded on this host whose file cannot be read here might be
 		// built on any image: a deleted image's files wait for it.
-		if len(deleted) > 0 && sc.missingDisk == "" && r.String("host_name") == s.hostName {
+		if len(deleted) > 0 && sc.missingDisk == "" && r.String("host_name") == s.hostName && !strings.HasPrefix(p, "/dev/") {
 			if _, err := os.Stat(s.hostDiskFile(p)); err != nil {
 				sc.missingDisk = fmt.Sprintf("disk %s/%s recorded on this host cannot be read here (%v): what it is built on is unknown",
 					r.String("vm_name"), r.String("disk_name"), err)
@@ -134,6 +134,15 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 				why = "a refresh of the image has just published or superseded it"
 			case f == st.ImagePath(n) && !deleted[n]:
 				why = "it is image " + n + "'s current file"
+			case deleted[n]:
+				// A deleted image's file may be kept for a reason only known
+				// below (a VM records it, a process holds it): what it is
+				// built on is kept while it is, not judged on its own.
+				if err := w.walk(f, false, "", "image file "+f); err != nil {
+					return nil, err
+				}
+				grew = true
+				continue
 			default:
 				continue
 			}
@@ -191,11 +200,20 @@ func (s *Server) stagedDiskFiles() ([]string, error) {
 		if err != nil {
 			return fmt.Errorf("list %s: %w", d, err)
 		}
+		// A backup repo's chunk store (a directory with repo.json, or its
+		// chunks/) holds guest data, never a disk file: a chunk that begins
+		// with the qcow2 magic is a guest's bytes, not an overlay.
+		for _, e := range ents {
+			if e.Name() == "repo.json" && e.Type().IsRegular() {
+				return nil
+			}
+		}
 		for _, e := range ents {
 			p := filepath.Join(d, e.Name())
 			switch {
 			case e.Type().IsRegular():
 				out = append(out, p)
+			case e.IsDir() && e.Name() == "chunks":
 			case e.IsDir():
 				if depth >= 4 {
 					return fmt.Errorf("%s is nested deeper than the scan reads", p)
@@ -281,32 +299,66 @@ func (s *Server) scanDeletedImageUse(ctx context.Context, st *image.Store, delet
 // cluster records — a disk row whose backing_image names it (by name, or by
 // one of its store files), or a VM whose spec was created from it — one such
 // VM, described.
+//
+// A row deleted within the recreate grace (imageRecreateGrace) still records
+// it: a rebuild or rolling recreate tombstones the VM and then creates it
+// again, possibly on another host, whose create takes its hold on the image
+// only once it begins. A deleted_at that cannot be read counts as recent.
 func (s *Server) imageRecordedUsers(ctx context.Context, names map[string]bool) (map[string]string, error) {
 	out := map[string]string{}
-	rows, err := s.db.Query(ctx, `SELECT vm_name, disk_name, host_name, backing_image FROM vm_disks
-		WHERE deleted_at IS NULL AND COALESCE(backing_image, '') != ''`)
+	grace := s.imagePrune.recreateGraceOr()
+	recent := func(deletedAt string) (string, bool) {
+		if deletedAt == "" {
+			return "", true
+		}
+		if grace <= 0 {
+			return "", false
+		}
+		t, err := time.Parse(time.RFC3339Nano, deletedAt)
+		if err != nil || time.Since(t) < grace {
+			return fmt.Sprintf(" (deleted at %s, within the %s a rebuild or recreate has to create it again)", deletedAt, grace), true
+		}
+		return "", false
+	}
+	rows, err := s.db.Query(ctx, `SELECT vm_name, disk_name, host_name, backing_image, COALESCE(deleted_at, '') AS deleted_at
+		FROM vm_disks WHERE COALESCE(backing_image, '') != ''`)
 	if err != nil {
 		return nil, fmt.Errorf("list disk rows: %w", err)
 	}
 	for _, r := range rows {
-		if n := recordedImageName(r.String("backing_image"), names); n != "" && out[n] == "" {
-			out[n] = fmt.Sprintf("disk %s/%s on host %s records it as its image",
-				r.String("vm_name"), r.String("disk_name"), r.String("host_name"))
+		n := recordedImageName(r.String("backing_image"), names)
+		if n == "" || out[n] != "" {
+			continue
+		}
+		if when, ok := recent(r.String("deleted_at")); ok {
+			out[n] = fmt.Sprintf("disk %s/%s on host %s records it as its image%s",
+				r.String("vm_name"), r.String("disk_name"), r.String("host_name"), when)
 		}
 	}
-	rows, err = s.db.Query(ctx, `SELECT name, host_name,
+	rows, err = s.db.Query(ctx, `SELECT name, host_name, COALESCE(deleted_at, '') AS deleted_at,
 		CASE WHEN json_valid(spec) THEN json_extract(spec, '$.image') END AS image
-		FROM vms WHERE deleted_at IS NULL`)
+		FROM vms`)
 	if err != nil {
 		return nil, fmt.Errorf("list VMs: %w", err)
 	}
 	for _, r := range rows {
-		if n := r.String("image"); names[n] && out[n] == "" {
-			out[n] = fmt.Sprintf("VM %s on host %s was created from it", r.String("name"), r.String("host_name"))
+		n := r.String("image")
+		if !names[n] || out[n] != "" {
+			continue
+		}
+		if when, ok := recent(r.String("deleted_at")); ok {
+			out[n] = fmt.Sprintf("VM %s on host %s was created from it%s", r.String("name"), r.String("host_name"), when)
 		}
 	}
 	return out, nil
 }
+
+// imageRecreateGrace is how long a deleted VM row still records its image
+// (imageRecordedUsers). A rebuild or rolling recreate creates the VM again
+// within seconds of the tombstone, and the create holds the image from its
+// start; ten minutes covers that gap, and the replication of the tombstone and
+// of the new rows, many times over.
+const imageRecreateGrace = 10 * time.Minute
 
 // recordedImageName is the image in names a disk row's backing_image names:
 // the image's name, or a path to one of its files in an image store.
@@ -855,11 +907,14 @@ func imageRemoveTimeout(p *imagePruneState) time.Duration {
 // with deleted_image), and reports each host's outcome: lv image rm. A host
 // that cannot be asked, or runs an older build, keeps its files; lv image
 // prune on it removes them later.
+//
+// It is gated exactly as DeleteImage (the operator role): removing the files
+// is part of the delete, which DeleteImage performs too, so no caller main let
+// delete an image is refused here. Each host's part runs as that host — this
+// one directly, a peer through its PruneImages with this host's certificate —
+// for RemoveImage and DeleteImage alike, never as the caller.
 func (s *Server) RemoveImage(ctx context.Context, req *pb.RemoveImageRequest) (*pb.RemoveImageResponse, error) {
 	if err := RequireRole(ctx, "operator"); err != nil {
-		return nil, err
-	}
-	if err := s.RequirePerm(ctx, "/", "image.import", "operator"); err != nil {
 		return nil, err
 	}
 	if err := safename.ValidateImageName(req.Name); err != nil {
@@ -971,6 +1026,17 @@ type imagePruneState struct {
 	afterScan    func()                                    // test seam: runs between the scan and the removals
 	afterCatalog func()                                    // test seam: runs after the catalog is read
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
+	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
+}
+
+func (p *imagePruneState) recreateGraceOr() time.Duration {
+	switch d := p.recentGrace.Load(); {
+	case d < 0:
+		return 0
+	case d > 0:
+		return time.Duration(d)
+	}
+	return imageRecreateGrace
 }
 
 // deletedImageWait bounds how long a host told an image was just deleted

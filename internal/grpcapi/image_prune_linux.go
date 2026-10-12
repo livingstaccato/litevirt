@@ -12,62 +12,78 @@ import (
 )
 
 // processesHolding is, for each of paths a process holds open (a running
-// qemu holds every layer of its disks' chains), that process, described.
-// A process this daemon may not look into (it runs as root, so none) or one
-// that exits during the read is passed over.
+// qemu holds every layer of its disks' chains), that process, described. It
+// reads every process in /proc (processesHoldingIn).
 func processesHolding(paths []string) (map[string]string, error) {
+	return processesHoldingIn("/proc", func(string) bool { return true }, paths)
+}
+
+// processesHoldingIn is processesHolding over the processes under procRoot
+// that want accepts. A process that exits during the read is passed over. One
+// whose open files cannot be read (a daemon not running as root cannot read
+// another user's) fails the answer closed: the error says which, and the
+// holders found are still returned, so a caller keeps every file either way.
+func processesHoldingIn(procRoot string, want func(pid string) bool, paths []string) (map[string]string, error) {
 	type fileID struct{ dev, ino uint64 }
-	want := map[fileID]string{}
+	targets := map[fileID]string{}
 	for _, p := range paths {
 		fi, err := os.Stat(p)
 		if err != nil {
 			continue
 		}
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			want[fileID{uint64(st.Dev), st.Ino}] = p
+			targets[fileID{uint64(st.Dev), st.Ino}] = p
 		}
 	}
 	out := map[string]string{}
-	if len(want) == 0 {
+	if len(targets) == 0 {
 		return out, nil
 	}
-	procs, err := os.ReadDir("/proc")
+	procs, err := os.ReadDir(procRoot)
 	if err != nil {
 		return nil, err
 	}
+	gone := func(err error) bool { return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) }
+	var unreadable []string
 	for _, pe := range procs {
 		pid := pe.Name()
-		if _, err := strconv.Atoi(pid); err != nil {
+		if _, err := strconv.Atoi(pid); err != nil || !want(pid) {
 			continue
 		}
-		fdDir := filepath.Join("/proc", pid, "fd")
+		fdDir := filepath.Join(procRoot, pid, "fd")
 		fds, err := os.ReadDir(fdDir)
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.ESRCH) {
-				continue
+			if !gone(err) {
+				unreadable = append(unreadable, fmt.Sprintf("%s (%v)", fdDir, err))
 			}
-			return nil, fmt.Errorf("read %s: %w", fdDir, err)
+			continue
 		}
 		for _, fd := range fds {
 			fi, err := os.Stat(filepath.Join(fdDir, fd.Name()))
 			if err != nil {
+				if !gone(err) {
+					unreadable = append(unreadable, fmt.Sprintf("%s/%s (%v)", fdDir, fd.Name(), err))
+				}
 				continue
 			}
 			st, ok := fi.Sys().(*syscall.Stat_t)
 			if !ok {
 				continue
 			}
-			if p, hit := want[fileID{uint64(st.Dev), st.Ino}]; hit && out[p] == "" {
-				comm, _ := os.ReadFile(filepath.Join("/proc", pid, "comm"))
+			if p, hit := targets[fileID{uint64(st.Dev), st.Ino}]; hit && out[p] == "" {
+				comm, _ := os.ReadFile(filepath.Join(procRoot, pid, "comm"))
 				out[p] = fmt.Sprintf("process %s (%s)", pid, strings.TrimSpace(string(comm)))
 			}
 		}
+	}
+	if len(unreadable) > 0 {
+		return out, fmt.Errorf("the open files of %d process(es) could not be read, first %s", len(unreadable), unreadable[0])
 	}
 	return out, nil
 }
 
 // networkFilesystems are the filesystems (statfs f_type) another host may
-// mount too.
+// mount too: network filesystems, and FUSE, which may be one.
 var networkFilesystems = map[uint32]string{
 	0x6969:     "nfs",
 	0x517b:     "smb",
@@ -85,12 +101,21 @@ var networkFilesystems = map[uint32]string{
 	0x6b414653: "kafs",
 }
 
-// networkFilesystem is the network filesystem dir is on ("" for a local one).
-func networkFilesystem(dir string) (string, error) {
+// statfsType is the statfs f_type of the filesystem dir is on, as the 32-bit
+// magic it is, whatever width the field has on the arch.
+var statfsType = func(dir string) (uint32, error) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0, err
+	}
+	return uint32(st.Type), nil
+}
+
+// networkFilesystem is the network filesystem dir is on ("" for a local one).
+func networkFilesystem(dir string) (string, error) {
+	t, err := statfsType(dir)
+	if err != nil {
 		return "", err
 	}
-	// f_type is a 32-bit magic, whatever width the field has on the arch.
-	return networkFilesystems[uint32(st.Type)], nil
+	return networkFilesystems[t], nil
 }

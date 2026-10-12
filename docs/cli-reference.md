@@ -640,19 +640,31 @@ lv image build <vm> --name <name>        # Create image from running VM
 lv image ls
 lv image rm <image>
 #   Deletes the image from the catalog, then asks every host to remove its
-#   files of the image, the current one too. Each host judges only its own
-#   files and removes one only when nothing keeps it:
-#     - a disk, staged disk (a restore, import or replica in progress), backup
-#       base or other image this host can see is built on it, or it is pinned;
+#   files of the image, the current one too. Needs the operator role, as the
+#   catalog delete always has; each host's part runs as that host. Each host
+#   judges only its own files and removes one only when nothing keeps it:
+#     - a disk, staged disk (a restore, import or replica in progress — a
+#       backup repo's chunks there are guest data and are not read), backup
+#       base or other image this host can see is built on it, a kept file of
+#       a deleted image is built on it, or it is pinned;
 #     - a VM anywhere in the cluster records the image: a disk built on it, or
 #       a VM created from it (a failover, recreate or migration onto this host
 #       may need this host's copy) — so while any VM records it, every host
-#       keeps its copy;
-#     - a disk recorded on this host cannot be read here, a staging directory
-#       cannot be read, or the image store is on a network filesystem (nfs,
-#       cifs, ceph, fuse, ...) that other hosts may share;
-#     - a process holds it open (a running qemu);
-#     - a disk create, pull or import of the image is in flight.
+#       keeps its copy. A VM deleted in the last 10 minutes still counts: a
+#       rebuild or rolling recreate deletes the VM and creates it again,
+#       possibly on another host. A host that has not yet received the record
+#       of a VM created moments before the rm may remove its own copy; the
+#       VM's own host keeps the copy its disk is built on;
+#     - a disk recorded on this host cannot be read here (a device path such as
+#       a logged-out iSCSI LUN does not count), a staging directory cannot be
+#       read or nests deeper than four levels, or the image store is on a
+#       network filesystem (nfs, cifs, ceph, fuse, ...) that other hosts may
+#       share;
+#     - a process holds it open (a running qemu), or some process's open files
+#       cannot be read (a daemon not running as root keeps every file);
+#     - a disk create, pull, import, build, rebuild or rolling recreate of the
+#       image is in flight (a rebuild and a recreate hold it from before their
+#       teardown until their create returns).
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>

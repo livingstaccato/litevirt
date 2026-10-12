@@ -539,10 +539,23 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			}
 		}
 	}
+	// The image the VM is created from — the update's, which may be another
+	// image than the one being replaced — is held from before the delete until
+	// the create has returned: in between, no disk and no live row on this
+	// host records it, and lv image rm must not take the file the create
+	// needs (recreateAs, RebuildVM).
+	if !action.IsContainer {
+		if sp, perr := s.plannedVMSpec(action, f); perr == nil && sp.GetImage() != "" {
+			defer s.holdImage(sp.GetImage())()
+		}
+	}
 	if delErr := s.deleteWorkloadIgnoringGone(deleteCtx, action); delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
+	}
+	if hook := s.recreateTornDown; hook != nil {
+		hook(action.VMName)
 	}
 	if len(lunKeys) > 0 && cur != nil {
 		if deleted != nil && deleted.snap != nil {

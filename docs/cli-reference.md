@@ -661,10 +661,13 @@ lv image rm <image>
 #       network filesystem (nfs, cifs, ceph, fuse, ...) that other hosts may
 #       share;
 #     - a process holds it open (a running qemu), or some process's open files
-#       cannot be read (a daemon not running as root keeps every file);
-#     - a disk create, pull, import, build, rebuild or rolling recreate of the
-#       image is in flight (a rebuild and a recreate hold it from before their
-#       teardown until their create returns).
+#       cannot be read: the reason names that process and fd (a daemon not
+#       running as root keeps every file; a process holding a dead FUSE or a
+#       stale share's file keeps them until it ends);
+#     - a disk create, pull, import or build of the image is in flight, or a
+#       rebuild, rolling recreate or compose deploy update that recreates a VM
+#       from it: each holds the image it creates from, from before its
+#       teardown until its create returns.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>

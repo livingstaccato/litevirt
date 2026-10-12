@@ -69,9 +69,38 @@ func TestProcessesHolding_AnUnreadableProcessFailsClosed(t *testing.T) {
 	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "4242", "comm"), []byte("qemu-x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := processesHoldingIn(root, func(string) bool { return true }, []string{target}); err == nil ||
-		!strings.Contains(err.Error(), "4242") {
-		t.Fatalf("err %v; want the unreadable process named", err)
+		!strings.Contains(err.Error(), "process 4242 (qemu-x)") {
+		t.Fatalf("err %v; want the unreadable process named, with its command", err)
+	}
+}
+
+// An open file whose target cannot be read (a dead FUSE daemon's, a stale
+// share's) fails the answer closed too, and the reason names the process and
+// the fd, so an operator can act on it.
+func TestProcessesHolding_AnUnreadableFdIsNamed(t *testing.T) {
+	root := t.TempDir()
+	fd := filepath.Join(root, "777", "fd")
+	if err := os.MkdirAll(fd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "777", "comm"), []byte("fusermount\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// fd 7 resolves to itself: stat fails with ELOOP, not "gone".
+	if err := os.Symlink(filepath.Join(fd, "7"), filepath.Join(fd, "7")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "img.qcow2")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := processesHoldingIn(root, func(string) bool { return true }, []string{target})
+	if err == nil || !strings.Contains(err.Error(), "fd 7 of process 777 (fusermount)") {
+		t.Fatalf("err %v; want process 777 and its fd 7 named", err)
 	}
 }
 

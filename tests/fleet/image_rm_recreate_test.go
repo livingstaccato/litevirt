@@ -96,6 +96,62 @@ func TestFleet_ImageRm_DuringARollingRecreateKeepsTheImageForItsCreate(t *testin
 	}
 }
 
+const composeImageSwitch = `name: imgswitch
+
+vms:
+  box:
+    image: IMG
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+`
+
+// A deploy update that switches a VM to another image recreates it (delete,
+// then create). lv image rm of the NEW image between the two: nothing on the
+// host records that image yet — the deleted row names the old one, so the
+// grace does not cover it — and only the update's own hold keeps the file
+// its create needs.
+func TestFleet_ImageRm_DuringADeployUpdateKeepsTheNewImageForItsCreate(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
+	n0 := c.Nodes[0]
+	ctx := context.Background()
+	importImageOn(t, c, n0, "ubuntu")
+	f2 := importImageOn(t, c, n0, "noble")
+	if p := errorPhaseFor(deployCollect(t, ctx, c.SelfClient(n0), strings.Replace(composeImageSwitch, "IMG", "ubuntu", 1)), "box"); p != nil {
+		t.Fatalf("first deploy: %s", p.Error)
+	}
+	var resp *pb.RemoveImageResponse
+	var rmErr error
+	n0.Server.SetRecreateTornDownHookForTest(func(string) {
+		resp, rmErr = c.SelfClient(n0).RemoveImage(ctx, &pb.RemoveImageRequest{Name: "noble"})
+	})
+	t.Cleanup(func() { n0.Server.SetRecreateTornDownHookForTest(nil) })
+
+	msgs := deployCollect(t, ctx, c.SelfClient(n0), strings.Replace(composeImageSwitch, "IMG", "noble", 1))
+	if p := errorPhaseFor(msgs, "box"); p != nil {
+		t.Fatalf("the update to image noble, while lv image rm noble ran: %s", p.Error)
+	}
+	if resp == nil && rmErr == nil {
+		t.Fatal("the update did not recreate box: the rm never ran in its window")
+	}
+	if rmErr != nil {
+		t.Fatal(rmErr)
+	}
+	if r := keptReason(resp, n0.Name, f2); !strings.Contains(r, "in flight") {
+		t.Errorf("%s reported %v; want noble's file kept for the update in flight", n0.Name, hostResult(resp, n0.Name))
+	}
+	if !fileThere(f2) {
+		t.Error("the image file the updated VM is built on is gone")
+	}
+	vm, err := corrosion.GetVM(ctx, n0.DB, "box")
+	if err != nil || vm == nil || !strings.Contains(vm.Spec, `"image":"noble"`) {
+		t.Errorf("box after the update: %v (err %v); want it on image noble", vm, err)
+	}
+}
+
 // Across hosts: a rebuild on node-0 of a VM pinned to node-1 creates it on
 // node-1. Between node-0's tombstone reaching node-1 and node-1's create
 // taking its hold, only the deleted row's grace keeps node-1's copy.

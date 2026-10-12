@@ -104,6 +104,29 @@ func TestPruneImages_ARecentlyDeletedVMStillRecordsTheImage(t *testing.T) {
 	}
 }
 
+// A deleted row whose deleted_at cannot be read counts as deleted just now:
+// how long ago it went is unknown, so its image is kept.
+func TestPruneImages_AnUnreadableDeletedAtCountsAsRecent(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	f := deletedImage(t, s, "ubuntu")
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "web", HostName: "other-host", State: "stopped", Spec: `{"name":"web","image":"ubuntu"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE vms SET deleted_at = 'garbage' WHERE name = 'web'`); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists(f) || !strings.Contains(keptFor(resp, f), "deleted at garbage") {
+		t.Fatalf("file there: %v, reason %q; want it kept for the row deleted at an unreadable time", exists(f), keptFor(resp, f))
+	}
+}
+
 // M8: a disk row naming the image by one of its store files keeps it.
 func TestPruneImages_ADiskRowNamingAStoreFileRecordsTheImage(t *testing.T) {
 	s := pruneServer(t)

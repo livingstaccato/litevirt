@@ -44,6 +44,18 @@ func processesHoldingIn(procRoot string, want func(pid string) bool, paths []str
 		return nil, err
 	}
 	gone := func(err error) bool { return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) }
+	// cause is err without the path it repeats.
+	cause := func(err error) error {
+		if u := errors.Unwrap(err); u != nil {
+			return u
+		}
+		return err
+	}
+	// process names a process for an operator: its pid and command.
+	process := func(pid string) string {
+		comm, _ := os.ReadFile(filepath.Join(procRoot, pid, "comm"))
+		return fmt.Sprintf("process %s (%s)", pid, strings.TrimSpace(string(comm)))
+	}
 	var unreadable []string
 	for _, pe := range procs {
 		pid := pe.Name()
@@ -54,7 +66,7 @@ func processesHoldingIn(procRoot string, want func(pid string) bool, paths []str
 		fds, err := os.ReadDir(fdDir)
 		if err != nil {
 			if !gone(err) {
-				unreadable = append(unreadable, fmt.Sprintf("%s (%v)", fdDir, err))
+				unreadable = append(unreadable, fmt.Sprintf("the open files of %s (%s): %v", process(pid), fdDir, cause(err)))
 			}
 			continue
 		}
@@ -62,7 +74,7 @@ func processesHoldingIn(procRoot string, want func(pid string) bool, paths []str
 			fi, err := os.Stat(filepath.Join(fdDir, fd.Name()))
 			if err != nil {
 				if !gone(err) {
-					unreadable = append(unreadable, fmt.Sprintf("%s/%s (%v)", fdDir, fd.Name(), err))
+					unreadable = append(unreadable, fmt.Sprintf("fd %s of %s (%s): %v", fd.Name(), process(pid), filepath.Join(fdDir, fd.Name()), cause(err)))
 				}
 				continue
 			}
@@ -71,13 +83,17 @@ func processesHoldingIn(procRoot string, want func(pid string) bool, paths []str
 				continue
 			}
 			if p, hit := targets[fileID{uint64(st.Dev), st.Ino}]; hit && out[p] == "" {
-				comm, _ := os.ReadFile(filepath.Join(procRoot, pid, "comm"))
-				out[p] = fmt.Sprintf("process %s (%s)", pid, strings.TrimSpace(string(comm)))
+				out[p] = process(pid)
 			}
 		}
 	}
 	if len(unreadable) > 0 {
-		return out, fmt.Errorf("the open files of %d process(es) could not be read, first %s", len(unreadable), unreadable[0])
+		more := ""
+		if len(unreadable) > 1 {
+			more = fmt.Sprintf(" (and %d more)", len(unreadable)-1)
+		}
+		return out, fmt.Errorf("could not read %s%s, so whether it holds the file open is unknown "+
+			"(run the daemon as root; or end that process, or fix what it holds open, and prune again)", unreadable[0], more)
 	}
 	return out, nil
 }

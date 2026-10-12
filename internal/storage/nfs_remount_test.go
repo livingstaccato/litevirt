@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // rebootMounts is a host's mount table after a reboot: what a fake
@@ -18,6 +19,8 @@ type rebootMounts struct {
 	entries  []string // "dir|fstype|source|flags"
 	calls    []string
 	mountErr string
+	onMount  func(dir string) // runs after a mount, outside the lock
+	umounts  int
 }
 
 func installRebootMounts(t *testing.T) *rebootMounts {
@@ -73,7 +76,22 @@ func (m *rebootMounts) run(_ context.Context, name string, args ...string) ([]by
 			return []byte(mountErr), errors.New("exit status 32")
 		}
 		m.add(args[6], "nfs4", args[5], "rw,nosuid,nodev,noexec,relatime")
+		if m.onMount != nil {
+			m.onMount(args[6])
+		}
 		return nil, nil
+	case "umount":
+		dir := args[len(args)-1]
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for i, e := range m.entries {
+			if strings.HasPrefix(e, dir+"|") {
+				m.entries = append(m.entries[:i:i], m.entries[i+1:]...)
+				m.umounts++
+				return nil, nil
+			}
+		}
+		return []byte("not mounted"), errors.New("exit status 32")
 	}
 	return nil, fmt.Errorf("unexpected %s %q", name, args)
 }
@@ -180,24 +198,148 @@ func TestMountNFSPool_FailureCarriesTheReason(t *testing.T) {
 	}
 }
 
-// What else is at the mount point is told apart from the pool's export, and
-// a pool directory inside another NFS mount is recognised as such.
-func TestCheckNFSPoolMount_ForeignAndParentMounts(t *testing.T) {
+// What is at the mount point is told apart: the pool's export, another NFS
+// mount (a hand mount spelled differently is still a mount, with its files
+// there), a mount that is not NFS (even one whose source string is the
+// pool's), and a pool directory inside another NFS mount.
+func TestCheckNFSPoolMount_WhatIsAtTheMountPoint(t *testing.T) {
 	m := installRebootMounts(t)
 	base := t.TempDir()
-	foreign := filepath.Join(base, "a")
-	m.add(foreign, "nfs4", "10.0.0.99:/other", "rw,nosuid,nodev,noexec")
-	st, err := CheckNFSPoolMount(base, nfsCfg(foreign))
-	if err != nil || st.Mounted || !strings.Contains(st.Foreign, "10.0.0.99:/other") {
-		t.Fatalf("foreign: %+v err=%v", st, err)
+	other := filepath.Join(base, "a")
+	m.add(other, "nfs4", "nas.example:/srv/lv", "rw,nosuid,nodev,noexec")
+	st, err := CheckNFSPoolMount(base, nfsCfg(other))
+	if err != nil || !st.Mounted || !strings.Contains(st.Other, "nas.example:/srv/lv") || st.Foreign != "" {
+		t.Fatalf("another spelling of an NFS export: %+v err=%v; want mounted, named", st, err)
+	}
+	notNFS := filepath.Join(base, "b")
+	m.add(notNFS, "ext4", "10.0.0.21:/srv/lv", "rw")
+	st, err = CheckNFSPoolMount(base, nfsCfg(notNFS))
+	if err != nil || st.Mounted || !strings.Contains(st.Foreign, "ext4") {
+		t.Fatalf("a non-NFS mount with the pool's source: %+v err=%v; want foreign", st, err)
 	}
 	parent := filepath.Join(base, "p")
 	m.add(parent, "nfs4", "10.0.0.21:/srv", "rw,nosuid,nodev,noexec")
+	t.Cleanup(OverrideNFSPathResolverForTest(func(p string) string {
+		t.Errorf("resolved %s for a mount point lexically inside an NFS mount", p)
+		return p
+	}, time.Second))
 	st, err = CheckNFSPoolMount(base, nfsCfg(filepath.Join(parent, "lv")))
 	if err != nil || st.Mounted || st.Foreign != "" || !st.OnNFS {
 		t.Fatalf("inside a parent NFS mount: %+v err=%v", st, err)
 	}
 	if _, err := CheckNFSPoolMount(base, Config{Driver: "iscsi"}); err == nil {
 		t.Fatal("a non-nfs pool was checked for a mount")
+	}
+}
+
+// A parent that reaches an NFS mount through a symlink is found by resolving
+// it; a resolution that blocks (a server that does not answer) is given up on
+// within the bound, with the reason.
+func TestCheckNFSPoolMount_SymlinkedParentIsResolvedWithinABound(t *testing.T) {
+	m := installRebootMounts(t)
+	base := t.TempDir()
+	nfsDir := filepath.Join(base, "nfs")
+	m.add(nfsDir, "nfs4", "10.0.0.21:/srv", "rw,nosuid,nodev,noexec")
+	link := filepath.Join(base, "link")
+	t.Cleanup(OverrideNFSPathResolverForTest(func(p string) string {
+		if p == link {
+			return nfsDir
+		}
+		return p
+	}, time.Second))
+	st, err := CheckNFSPoolMount(base, nfsCfg(filepath.Join(link, "lv")))
+	if err != nil || !st.OnNFS {
+		t.Fatalf("through a symlink into an NFS mount: %+v err=%v; want OnNFS", st, err)
+	}
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	hung := filepath.Join(base, "hung")
+	t.Cleanup(OverrideNFSPathResolverForTest(func(p string) string {
+		if p == hung {
+			<-release
+		}
+		return p
+	}, 200*time.Millisecond))
+	done := make(chan error, 1)
+	go func() {
+		_, err := CheckNFSPoolMount(base, nfsCfg(filepath.Join(hung, "lv")))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Fatalf("err = %v; want the resolution given up on", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the check hung on a resolution that does not finish")
+	}
+}
+
+// Mount points the mount would hide something under, or land elsewhere
+// through, are refused: a regular file, and a directory whose entries cannot
+// be listed (it is not known to be empty).
+func TestMountNFSPool_RefusesWhatItCannotJudge(t *testing.T) {
+	m := installRebootMounts(t)
+	file := filepath.Join(t.TempDir(), "pool")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := MountNFSPool(context.Background(), t.TempDir(), nfsCfg(file)); err == nil || err.Error() != "mount point "+file+" is not a directory" {
+		t.Fatalf("a regular file: err = %v; want refused", err)
+	}
+	prev := nfsListDir
+	nfsListDir = func(*os.File) ([]string, error) { return nil, errors.New("input/output error") }
+	t.Cleanup(func() { nfsListDir = prev })
+	if err := MountNFSPool(context.Background(), t.TempDir(), nfsCfg("")); err == nil || !strings.Contains(err.Error(), "input/output error") {
+		t.Fatalf("an unlistable mount point: err = %v; want refused", err)
+	}
+	if m.mounts() != 0 {
+		t.Fatalf("mounted onto a mount point it could not judge; calls %v", m.calls)
+	}
+}
+
+// A file written into the mount point while it is being mounted is found
+// under the mount (through the descriptor held across it): the export is
+// unmounted again and the mount refused.
+func TestMountNFSPool_FilesWrittenDuringTheMountAreNotHidden(t *testing.T) {
+	m := installRebootMounts(t)
+	dataDir := t.TempDir()
+	cfg := nfsCfg("")
+	m.onMount = func(dir string) {
+		// The fake mount covers nothing: the file lands in the directory
+		// itself, as one written just before the kernel's mount would.
+		if err := os.WriteFile(filepath.Join(dir, "late.qcow2"), []byte("x"), 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	err := MountNFSPool(context.Background(), dataDir, cfg)
+	if err == nil || !strings.Contains(err.Error(), "late.qcow2") || !strings.Contains(err.Error(), "unmounted again") {
+		t.Fatalf("err = %v; want the late file named and the mount undone", err)
+	}
+	if st, _ := CheckNFSPoolMount(dataDir, cfg); st.Mounted || m.umounts != 1 {
+		t.Fatalf("after the refusal: %+v, %d umounts; want it unmounted once", st, m.umounts)
+	}
+}
+
+// A non-empty mount point that a concurrent Prepare has just mounted holds
+// the export's files, not local ones: that is not refused.
+func TestMountNFSPool_AConcurrentMountIsNotLocalFiles(t *testing.T) {
+	m := installRebootMounts(t)
+	dataDir := t.TempDir()
+	cfg := nfsCfg("")
+	dir := NFSPoolMountDir(dataDir, cfg)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "vm-root.qcow2"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.add(dir, "nfs4", cfg.Source, "rw,nosuid,nodev,noexec")
+	if err := MountNFSPool(context.Background(), dataDir, cfg); err != nil {
+		t.Fatalf("err = %v; want none (the export is mounted)", err)
+	}
+	if m.mounts() != 0 {
+		t.Fatal("mounted again over a mounted export")
 	}
 }

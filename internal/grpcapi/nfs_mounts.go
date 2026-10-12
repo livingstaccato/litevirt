@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -106,6 +107,62 @@ func (m *nfsMountMemory) failedWithin(dir string, d time.Duration) (error, bool)
 	return f.err, true
 }
 
+// nfsPoolConfig is the driver config of one of this host's nfs pool rows: the
+// row's options, with a pool from the daemon config taking its options (its
+// row is registered without its mount options) from the config definition.
+func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
+	cfg := storage.Config{Name: r.Name, Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
+	if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target && len(ref.Options) > 0 {
+		cfg.Options = ref.Options
+	}
+	return cfg
+}
+
+// nfsLock serialises the mounts this daemon makes of nfs pools' exports with
+// an nfs pool's create and delete. It is held only across a mount (with the
+// re-read of the pool's row and of the mount table before it, and the row's
+// write after it), never across a check: a check can stat a path, and a path
+// on an NFS mount whose server does not answer can block. Lock takes a
+// context, so a start or an RPC waiting for it gives up when its own does.
+type nfsLock struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (l *nfsLock) init() { l.once.Do(func() { l.ch = make(chan struct{}, 1) }) }
+
+// Lock takes the lock, or returns ctx's error when ctx ends first.
+func (l *nfsLock) Lock(ctx context.Context) error {
+	l.init()
+	select {
+	case l.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *nfsLock) Unlock() { <-l.ch }
+
+// Test seams: run after the pass has listed the pools, and before a start
+// takes nfsMu to mount.
+var (
+	nfsPassAfterList   func()
+	nfsStartBeforeLock func()
+)
+
+// nfsNotMountedError is a start refused because a disk's NFS export is not
+// mounted: to a gRPC caller the Unavailable it wraps, to the reconciler and
+// the VM checker health.ErrStartStorageNotMounted, which they count under
+// their own refusal reason instead of a hardware one.
+type nfsNotMountedError struct{ err error }
+
+func (e *nfsNotMountedError) Error() string { return e.err.Error() }
+func (e *nfsNotMountedError) Unwrap() []error {
+	return []error{e.err, health.ErrStartStorageNotMounted}
+}
+func (e *nfsNotMountedError) GRPCStatus() *status.Status { return status.Convert(e.err) }
+
 // ReconcileNFSMounts checks the mount of every nfs pool of this host, mounts
 // an export missing since this daemon started, and records the outcome on
 // the pool's row and in nfs_mount_missing.
@@ -118,6 +175,9 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 		slog.Warn("NFS mounts: list this host's pools", "error", err)
 		return
 	}
+	if nfsPassAfterList != nil {
+		nfsPassAfterList()
+	}
 	live := map[string]bool{}
 	tried := map[string]error{} // per mount point, within this pass
 	for _, r := range rows {
@@ -125,45 +185,42 @@ func (s *Server) ReconcileNFSMounts(ctx context.Context) {
 			continue
 		}
 		live[r.Name] = true
-		s.reconcileNFSPool(ctx, r.Name, tried)
+		s.reconcileNFSPool(ctx, r, tried)
 	}
 	s.resolveGoneNFSPoolConditions(ctx, live)
 }
 
-// nfsPoolConfig is the driver config of one of this host's nfs pool rows: the
-// row's options, with a pool from the daemon config taking its options (its
-// row is registered without its mount options) from the config definition.
-func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
-	cfg := storage.Config{Name: r.Name, Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
-	if ref, ok := s.lookupStoragePool(r.Name); ok && strings.EqualFold(ref.Driver, "nfs") && ref.Source == r.Source && ref.Target == r.Target && len(ref.Options) > 0 {
-		cfg.Options = ref.Options
-	}
-	return cfg
-}
-
 // reconcileNFSPool checks one pool's mount (once per mount point in a pass:
-// tried), mounts it when it has been missing since this daemon started,
-// writes the pool's state (active, or degraded while it is not mounted) on
-// its row when it changed, and raises or resolves its condition. All of it
-// under nfsMu, which a pool create and delete of an nfs pool also hold, from
-// a fresh read of the row: a pool deleted meanwhile is neither mounted back
-// nor written back.
-func (s *Server) reconcileNFSPool(ctx context.Context, pool string, tried map[string]error) {
-	s.nfsMu.Lock()
-	defer s.nfsMu.Unlock()
-	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
-	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") {
-		return
-	}
-	cfg := s.nfsPoolConfig(rec)
+// tried) with no lock held, mounts it when it has been missing since this
+// daemon started, writes the pool's state (active, or degraded while it is
+// not mounted) on its row when it changed, and raises or resolves its
+// condition. The mount and the writes are made under nfsMu, which a pool
+// create and delete of an nfs pool also hold, from a fresh read of the row: a
+// pool deleted meanwhile is neither mounted back nor written back.
+func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StoragePoolRecord, tried map[string]error) {
+	cfg := s.nfsPoolConfig(listed)
 	dir := storage.NFSPoolMountDir(s.dataDir, cfg)
 	mountErr, done := tried[dir]
+	needMount := false
 	if !done {
-		mountErr = s.checkNFSMount(ctx, pool, cfg)
+		needMount, mountErr = s.checkNFSMount(cfg, dir)
+	}
+	if err := s.nfsMu.Lock(ctx); err != nil {
+		return
+	}
+	defer s.nfsMu.Unlock()
+	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, listed.Name)
+	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") || rec.Source != listed.Source || rec.Target != listed.Target {
+		return // deleted, or replaced, since the list: the next pass judges it afresh
+	}
+	if needMount {
+		mountErr = s.mountNFSLocked(ctx, listed.Name, cfg, dir)
+	}
+	if !done {
 		tried[dir] = mountErr
 	}
 	if mountErr != nil {
-		slog.Warn("NFS pool's export is not mounted; its disks are not available on this host", "pool", pool, "error", mountErr)
+		slog.Warn("NFS pool's export is not mounted; its disks are not available on this host", "pool", listed.Name, "error", mountErr)
 	}
 	want := rec.State
 	switch {
@@ -175,36 +232,47 @@ func (s *Server) reconcileNFSPool(ctx context.Context, pool string, tried map[st
 	if want != rec.State {
 		rec.State = want
 		if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
-			slog.Warn("NFS mounts: record the pool's state", "pool", pool, "error", err)
+			slog.Warn("NFS mounts: record the pool's state", "pool", listed.Name, "error", err)
 		}
 	}
-	s.judgeNFSMount(ctx, pool, mountErr)
+	s.judgeNFSMount(ctx, listed.Name, mountErr)
 }
 
-// checkNFSMount is one pass's verdict on a pool's mount: nil when its export
-// is mounted (now, or after a mount) or its directory lies on another NFS
-// mount, else why not. Only an export missing since this daemon started is
-// mounted.
-func (s *Server) checkNFSMount(ctx context.Context, pool string, cfg storage.Config) error {
+// checkNFSMount is a pass's verdict on a pool's mount, made with no lock
+// held: nil when an NFS export is mounted at its mount point (or the
+// directory lies on another NFS mount), else why it is not; needMount when it
+// has been missing since this daemon started, and is to be mounted.
+func (s *Server) checkNFSMount(cfg storage.Config, dir string) (needMount bool, err error) {
 	st, err := storage.CheckNFSPoolMount(s.dataDir, cfg)
 	switch {
 	case err != nil:
-		return err
+		return false, err
 	case st.Mounted || st.OnNFS:
-		s.nfsMem.up(st.Dir)
-		return nil
+		s.nfsMem.up(dir)
+		return false, nil
 	case st.Foreign != "":
-		return fmt.Errorf("mount point %s holds %s, not this pool's export %s; unmount it (umount %s) and litevirt mounts the export there", st.Dir, st.Foreign, cfg.Source, st.Dir)
-	case s.nfsMem.wasUp(st.Dir):
-		return fmt.Errorf("export %s is not mounted at %s: %s", cfg.Source, st.Dir, nfsUnmountedReason)
+		return false, fmt.Errorf("mount point %s holds %s, not this pool's export %s; unmount it (umount %s) and litevirt mounts the export there", dir, st.Foreign, cfg.Source, dir)
+	case s.nfsMem.wasUp(dir):
+		return false, fmt.Errorf("export %s is not mounted at %s: %s", cfg.Source, dir, nfsUnmountedReason)
+	}
+	return true, nil
+}
+
+// mountNFSLocked mounts a pool's export, under nfsMu: after a fresh look at
+// the mount table (a start, or a disk create's Prepare, may have mounted it
+// since the check), and only when it is still missing since this daemon
+// started.
+func (s *Server) mountNFSLocked(ctx context.Context, pool string, cfg storage.Config, dir string) error {
+	if need, err := s.checkNFSMount(cfg, dir); !need {
+		return err
 	}
 	if err := storage.MountNFSPool(ctx, s.dataDir, cfg); err != nil {
-		err = fmt.Errorf("export %s is not mounted at %s: %w; the mount is retried every %v", cfg.Source, st.Dir, err, NFSMountReconcileInterval)
-		s.nfsMem.mountFailed(st.Dir, err)
+		err = fmt.Errorf("export %s is not mounted at %s: %w; the mount is retried every %v", cfg.Source, dir, err, NFSMountReconcileInterval)
+		s.nfsMem.mountFailed(dir, err)
 		return err
 	}
-	s.nfsMem.up(st.Dir)
-	slog.Info("NFS pool's export was not mounted since the daemon started; mounted", "pool", pool, "source", cfg.Source, "mountpoint", st.Dir)
+	s.nfsMem.up(dir)
+	slog.Info("NFS pool's export was not mounted since the daemon started; mounted", "pool", pool, "source", cfg.Source, "mountpoint", dir)
 	return nil
 }
 
@@ -276,8 +344,10 @@ func (s *Server) resolveGoneNFSPoolConditions(ctx context.Context, live map[stri
 // its mount failed, or its mount point holds something a mount would hide.
 // Such a start failed on main too, at qemu's open of the disk, unless a file
 // of the disk's name sat in the empty mount point, which it would have
-// started the guest on. Unavailable, as that failure was: every start path
-// retries it. A mount table that cannot be read refuses nothing.
+// started the guest on. Unavailable, as that failure was; the reconciler
+// re-drives it, and the VM checker's restarts set the VM to error, as a
+// failed start always did there. A mount table that cannot be read refuses
+// nothing.
 func (s *Server) ensureNFSMountsForVM(ctx context.Context, vm *corrosion.VMRecord) error {
 	if s.db == nil {
 		return nil
@@ -298,9 +368,10 @@ func (s *Server) ensureNFSMountsForVM(ctx context.Context, vm *corrosion.VMRecor
 		// The pool's own row (for a config pool, its configured options) —
 		// only when the disk's storage resolved to the pool, not to a stack
 		// volume of the same name.
+		pool := ""
 		if cfg.Name == d.StorageVolume {
 			if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "nfs") {
-				cfg = s.nfsPoolConfig(r)
+				cfg, pool = s.nfsPoolConfig(r), r.Name
 			}
 		}
 		dir := storage.NFSPoolMountDir(s.dataDir, cfg)
@@ -308,40 +379,62 @@ func (s *Server) ensureNFSMountsForVM(ctx context.Context, vm *corrosion.VMRecor
 			continue
 		}
 		handled[dir] = true
-		if err := s.ensureNFSMountForStart(ctx, cfg, dir); err != nil {
+		if err := s.ensureNFSMountForStart(ctx, pool, cfg, dir); err != nil {
 			slog.Warn("VM start refused: its disk's NFS export is not mounted", "vm", vm.Name, "disk", d.DiskName, "pool", d.StorageVolume, "error", err)
-			return status.Errorf(codes.Unavailable, "start %q: disk %s is on nfs pool %q, whose export is not mounted on this host: %v",
-				vm.Name, d.DiskName, d.StorageVolume, err)
+			return &nfsNotMountedError{err: status.Errorf(codes.Unavailable, "start %q: disk %s is on nfs pool %q, whose export is not mounted on this host: %v",
+				vm.Name, d.DiskName, d.StorageVolume, err)}
 		}
 	}
 	return nil
 }
 
-// ensureNFSMountForStart is one start's mount of a pool's export: nil when it
-// is mounted (or its directory lies on another NFS mount, or the mount table
-// cannot be read), else why it is not.
-func (s *Server) ensureNFSMountForStart(ctx context.Context, cfg storage.Config, dir string) error {
-	st, err := storage.CheckNFSPoolMount(s.dataDir, cfg)
-	switch {
-	case err != nil:
-		return nil // as before this check: the start goes ahead
-	case st.Mounted || st.OnNFS:
-		return nil
-	case st.Foreign != "":
-		return fmt.Errorf("mount point %s holds %s, not the export %s; unmount it (umount %s) and litevirt mounts the export there", dir, st.Foreign, cfg.Source, dir)
-	case s.nfsMem.wasUp(dir):
-		return fmt.Errorf("export %s at %s was %s", cfg.Source, dir, nfsUnmountedReason)
+// ensureNFSMountForStart is one start's mount of a pool's export: nil when an
+// NFS export is mounted there (or its directory lies on another NFS mount, or
+// the mount table cannot be read), else why it is not. pool names the
+// pool's row on this host ("" for a stack volume): a pool deleted while the
+// start waited for nfsMu is not mounted back.
+func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg storage.Config, dir string) error {
+	judge := func() (bool, error) {
+		st, err := storage.CheckNFSPoolMount(s.dataDir, cfg)
+		switch {
+		case err != nil:
+			return false, nil // as before this check: the start goes ahead
+		case st.Mounted || st.OnNFS:
+			s.nfsMem.up(dir)
+			return false, nil
+		case st.Foreign != "":
+			return false, fmt.Errorf("mount point %s holds %s, not the export %s; unmount it (umount %s) and litevirt mounts the export there", dir, st.Foreign, cfg.Source, dir)
+		case s.nfsMem.wasUp(dir):
+			return false, fmt.Errorf("export %s at %s was %s", cfg.Source, dir, nfsUnmountedReason)
+		}
+		if ferr, recent := s.nfsMem.failedWithin(dir, NFSMountReconcileInterval); recent {
+			return false, fmt.Errorf("a mount of it failed moments ago, not retried: %v", ferr)
+		}
+		return true, nil
 	}
-	if ferr, recent := s.nfsMem.failedWithin(dir, NFSMountReconcileInterval); recent {
-		return fmt.Errorf("a mount of it failed moments ago, not retried: %v", ferr)
+	need, err := judge()
+	if !need {
+		return err
 	}
-	s.nfsMu.Lock()
-	defer s.nfsMu.Unlock()
-	if st, err := storage.CheckNFSPoolMount(s.dataDir, cfg); err == nil && st.Mounted {
-		return nil // a pass mounted it meanwhile
+	if nfsStartBeforeLock != nil {
+		nfsStartBeforeLock()
 	}
 	mctx, cancel := context.WithTimeout(ctx, nfsStartMountBound)
 	defer cancel()
+	if err := s.nfsMu.Lock(mctx); err != nil {
+		return fmt.Errorf("another NFS mount on this host did not finish in time: %v", err)
+	}
+	defer s.nfsMu.Unlock()
+	// Again, under the lock: a pass, or another start, may have mounted it,
+	// failed to, or seen it unmounted meanwhile, and the pool may be gone.
+	if need, err = judge(); !need {
+		return err
+	}
+	if pool != "" {
+		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source) {
+			return fmt.Errorf("pool %q was deleted or replaced on this host while the start waited", pool)
+		}
+	}
 	if err := storage.MountNFSPool(mctx, s.dataDir, cfg); err != nil {
 		s.nfsMem.mountFailed(dir, err)
 		return err

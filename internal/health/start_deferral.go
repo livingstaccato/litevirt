@@ -24,6 +24,12 @@ import (
 // (deferPendingStart). The VM is walked first on the next pass.
 var ErrStartDeferred = errors.New("start deferred")
 
+// ErrStartStorageNotMounted marks a start-preparation refusal because a
+// disk's NFS export is not mounted on this host (grpcapi's NFS start hook).
+// It is a refusal, not a deferral; it is counted under
+// ReasonStorageNotMounted.
+var ErrStartStorageNotMounted = errors.New("a disk's storage is not mounted on this host")
+
 // Why a start was deferred decides where it goes in the next walk
 // (deferredFirst). A plain ErrStartDeferred is a deferral for TIME — the walk
 // had too little left to ask the storage at all — and goes first: it never

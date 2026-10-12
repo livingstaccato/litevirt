@@ -1845,8 +1845,12 @@ carries the reason:
   litevirt does not mount over them. Move them out of the directory; the next
   check mounts the export.
 - **the mount point is a symlink**: replace it with an empty directory.
-- **the mount point holds another mount** (another export or filesystem):
-  unmount it; the next check mounts the pool's export there.
+- **the mount point holds another mount** that is not NFS: unmount it; the
+  next check mounts the pool's export there. (An NFS mount there, of any
+  export, counts as mounted.)
+- **resolving the symlinks of the mount point's parent did not finish**: a
+  symlink on the way leads into an NFS mount whose server does not answer.
+  Fix that server or the path; the check is tried again every 30 s.
 
 The pool returns to `active` and the condition resolves on the first check
 that finds the export mounted. Deleting the pool resolves it too.

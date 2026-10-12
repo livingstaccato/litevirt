@@ -236,7 +236,9 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	// Likewise an nfs pool's mount and row write, for the mount reconcile
 	// (nfs_mounts.go).
 	if strings.EqualFold(req.Driver, "nfs") {
-		s.nfsMu.Lock()
+		if err := s.nfsMu.Lock(ctx); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "wait for this host's NFS mounts: %v", err)
+		}
 		defer s.nfsMu.Unlock()
 	}
 	if err := driver.Prepare(ctx); err != nil {
@@ -392,7 +394,9 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	// Likewise an nfs pool's unmount and row delete, for the mount reconcile
 	// (nfs_mounts.go): it must not mount the export back in between.
 	if strings.EqualFold(rec.Driver, "nfs") {
-		s.nfsMu.Lock()
+		if err := s.nfsMu.Lock(ctx); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "wait for this host's NFS mounts: %v", err)
+		}
 		defer s.nfsMu.Unlock()
 	}
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS

@@ -679,10 +679,11 @@ type Server struct {
 	iscsiMu sync.Mutex
 	// iscsiMem is what this daemon has seen of its iSCSI sessions.
 	iscsiMem iscsiSessionMemory
-	// nfsMu serialises the NFS mount reconcile (nfs_mounts.go) with an nfs
-	// pool's create and delete, so a pass neither mounts a deleted pool's
-	// export back nor writes its row back.
-	nfsMu sync.Mutex
+	// nfsMu serialises the mounts of nfs pools' exports (nfs_mounts.go) with
+	// an nfs pool's create and delete, so neither a pass nor a start mounts a
+	// deleted pool's export back, nor a pass writes its row back. It is
+	// never held across a check of the mount table.
+	nfsMu nfsLock
 	// nfsMem is what this daemon has seen of its nfs pools' mounts.
 	nfsMem nfsMountMemory
 	// cephTrash is what the last scans of the ceph pools' trash found that no

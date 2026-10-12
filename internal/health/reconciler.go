@@ -1781,7 +1781,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 	if hwErr != nil {
 		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
-		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		r.noteGateRefused(corrosion.ActionReschedule, hwRefusalReason(hwErr))
 		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(hwErr), fmt.Sprintf("hardware pre-start: %v", hwErr))
 		return
 	}
@@ -2252,6 +2252,16 @@ func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID strin
 // (InvalidArgument) is an operator-repair condition that retrying on this host can't fix
 // → non-retryable (terminalize + set error); anything else (a transient read/DB failure,
 // Internal/Unavailable) → retryable, re-armed for the next reconcile tick.
+// hwRefusalReason is the refusal-metric reason of a pre-start refusal: a
+// disk's storage not mounted (ErrStartStorageNotMounted) is not a hardware
+// one.
+func hwRefusalReason(err error) string {
+	if errors.Is(err, ErrStartStorageNotMounted) {
+		return ReasonStorageNotMounted
+	}
+	return ReasonHardwareBlocked
+}
+
 func hwPrepareRetryable(err error) bool {
 	switch status.Code(err) {
 	case codes.FailedPrecondition, codes.InvalidArgument:

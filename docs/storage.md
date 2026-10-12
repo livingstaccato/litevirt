@@ -244,8 +244,14 @@ backup of the same disk; that backup's own live session is never touched.
 litevirt mounts an `nfs` pool's export itself: at pool create, and at every VM
 disk create, move or replicate on the pool. A host reboot unmounts it. Each
 host therefore checks the mount of each of its `nfs` pools, at daemon start
-and every 30 s after. The check reads only the mount table
-(`/proc/self/mountinfo`), so a server that does not answer cannot hang it.
+and every 30 s after. The check reads the mount table
+(`/proc/self/mountinfo`) and does not touch the export. Whether the mount
+point lies inside another NFS mount is judged from its path as written. Only
+when that finds none does the check resolve the symlinks of the mount point's
+parent, which can reach an NFS mount, and that is given up on after 5 s. No
+lock is held while a check runs, so a server that does not answer can delay
+that one pool's check, but not other pools, a pool create or delete, or a VM
+start.
 
 - **Not mounted since the daemon started** (the reboot case): the export is
   mounted, with the pool's mount options and the hardening a create uses
@@ -255,29 +261,44 @@ and every 30 s after. The check reads only the mount table
 - **Unmounted while the daemon ran** (`umount <mount point>`): left unmounted.
   A hard NFS mount of a server that does not answer stays in the mount table,
   so an export that disappears from it was unmounted, and litevirt takes that
-  as deliberate. To mount it again, restart the daemon on the host. A pool
-  create or a VM disk create, move or replicate on the pool also mounts it, as
-  they always did, and so does a reboot.
+  as deliberate. To mount it again, restart the daemon on the host. A VM disk
+  create, move or replicate on the pool also mounts it, as it always did, and
+  so does a reboot. (A pool create cannot: the pool already exists.)
 - **Never over anything.** A mount point that is a symlink, is not a
   directory, or holds any file is not mounted over: the mount would hide what
   is there, or land somewhere else. Files in an unmounted mount point were
   written while the export was not mounted, so they are not on it. Move them
-  out; the next check mounts the export.
-- **Another mount at the mount point** (another export, another filesystem) is
-  left alone. Unmount it, and the next check mounts the pool's export there.
+  out; the next check mounts the export. The mount point is opened (following
+  no symlink) and judged through that descriptor, which is kept across the
+  mount. A file written into it while the mount is made is found under the
+  mount afterwards, and the export is unmounted again and the mount refused.
+  `mount` takes a path, so a mount point replaced by a symlink between the
+  check and the mount is caught only after it: the mount point then holds no
+  mount, and the refusal says so (`findmnt -S <source>` shows where it
+  landed).
+- **Another NFS mount at the mount point** counts as mounted: the export
+  mounted by hand, or spelled another way (a host name where the pool has the
+  address). Its files are there. The pool's own check at use then judges
+  whether it is the pool's export (see "Host paths" above).
+- **A mount at the mount point that is not NFS** is left alone. Unmount it,
+  and the next check mounts the pool's export there.
 - **A pool whose directory lies inside another NFS mount** (a parent export
   mounted by hand) is left as it is: its files are reachable.
 
 This covers a pool with a `--target` too, since litevirt mounts that one
-itself as well. Pool delete unmounts the export as before, unless another pool
-of the host uses it, and the check never mounts a deleted pool back.
+itself as well. Pool delete unmounts the export unless another pool of the
+host uses it; a `--target` pool's mount is not unmounted at delete, as before
+(it may be shared with something else). No check or start mounts a deleted
+pool back.
 
 While a pool's export is not mounted, its row's state is `degraded` (`lv pool
 ls`, `lv pool inspect`), not `active`, and its host raises `nfs_mount_missing`
 with the reason
 ([diagnostics.md](diagnostics.md#an-nfs-pool-is-not-mounted-nfs_mount_missing)).
 Both clear on the first check that finds it mounted. An older build shows the
-state as it is recorded, and does not mount anything after a reboot.
+state as it is recorded, and does not mount anything after a reboot. The
+daemon's periodic pool registration can briefly write `active` over a fresh
+`degraded` (or the reverse); the next check, within 30 s, corrects it.
 
 **Starting a VM.** Every start path checks the mount of each of the VM's disks
 on an `nfs` pool first: `lv start`, `lv restart`, onboot, an HA restart, a
@@ -292,8 +313,14 @@ Such a start failed before this check too, at qemu's open of the disk (`Cannot
 access storage file … No such file or directory`). Worse, a file of the
 disk's name left in the empty mount point would have started the guest on
 that local file instead of the export's. The refusal is answered as
-`Unavailable`, as that failure was, so the reconciler tries again on its later
-passes. A start does not retry a mount that failed within the last 30 s.
+`Unavailable`, as that failure was. The reconciler (onboot, HA restart,
+failover) tries the start again on its later passes. The VM checker's
+restarts (a guest that stopped, a restart policy) set the VM to `error`, as a
+failed start always did there. Automated refusals are counted under the
+`storage_not_mounted` reason of the gate-refusal metric, not
+`hardware_blocked`. A start does not retry a mount that failed within the last
+30 s, and gives up waiting for another mount on the host when its own deadline
+ends.
 
 ### Directory pools on NFS
 

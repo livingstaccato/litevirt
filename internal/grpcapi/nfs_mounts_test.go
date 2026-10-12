@@ -9,11 +9,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -28,6 +31,8 @@ type hostMounts struct {
 	mountErr string
 	mounts   int
 	lastOpts string
+	gate     chan struct{} // set: the next mountpoint call waits for it
+	entered  chan struct{} // told when that call starts waiting
 }
 
 func installHostMounts(t *testing.T) *hostMounts {
@@ -54,8 +59,20 @@ func (m *hostMounts) info() ([]byte, error) {
 
 func (m *hostMounts) run(_ context.Context, name string, args ...string) ([]byte, error) {
 	m.mu.Lock()
+	if g := m.gate; name == "mountpoint" && g != nil {
+		// One-shot: this mountpoint call (a pool delete's teardown) holds
+		// until the test releases it.
+		m.gate = nil
+		m.mu.Unlock()
+		m.entered <- struct{}{}
+		<-g
+		m.mu.Lock()
+	}
 	defer m.mu.Unlock()
 	switch name {
+	case "umount":
+		delete(m.dirs, args[len(args)-1])
+		return nil, nil
 	case "mountpoint":
 		if _, ok := m.dirs[args[len(args)-1]]; ok {
 			return nil, nil
@@ -108,12 +125,19 @@ func (m *hostMounts) mounted(dir string) bool {
 
 func nfsPoolRow(t *testing.T, s *Server, name string) string {
 	t.Helper()
+	return nfsPoolRowAt(t, s, name, nfsTestSource, "")
+}
+
+// nfsPoolRowAt adds an nfs pool row on this host, and the empty directory a
+// reboot leaves at its mount point.
+func nfsPoolRowAt(t *testing.T, s *Server, name, source, target string) string {
+	t.Helper()
 	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
-		HostName: s.hostName, Name: name, Driver: "nfs", Source: nfsTestSource, State: "active",
+		HostName: s.hostName, Name: name, Driver: "nfs", Source: source, Target: target, State: "active",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(s.dataDir, "mounts", storage.NFSMountName(nfsTestSource))
+	dir := storage.NFSPoolMountDir(s.dataDir, storage.Config{Driver: "nfs", Source: source, Target: target})
 	if err := os.MkdirAll(dir, 0o755); err != nil { // the empty directory a reboot leaves
 		t.Fatal(err)
 	}
@@ -375,5 +399,203 @@ func TestPrepareHardwareForStart_NFSHookDoesNotRetryAFreshFailure(t *testing.T) 
 	}
 	if m.count() != before {
 		t.Fatal("the start retried a mount that failed moments ago")
+	}
+}
+
+// A pool whose directory lies inside another NFS mount is not mounted at,
+// and its VM's start is neither refused nor mounts anything.
+func TestPrepareHardwareForStart_PoolInsideAnotherNFSMountIsLeftAlone(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	parent := filepath.Join(t.TempDir(), "nfsroot")
+	m.dirs[parent] = "10.0.0.21:/srv"
+	dir := nfsPoolRowAt(t, s, "shared", nfsTestSource, filepath.Join(parent, "lv"))
+	vm := nfsDiskVM(t, s, "shared", dir)
+	if _, err := s.PrepareHardwareForStart(context.Background(), &vm); err != nil {
+		t.Fatalf("start on a pool inside another NFS mount: %v", err)
+	}
+	s.ReconcileNFSMounts(context.Background())
+	if m.count() != 0 {
+		t.Fatal("mounted over a directory inside another NFS mount")
+	}
+	if st := poolState(t, s, "shared"); st != "active" {
+		t.Fatalf("pool state %q, want active", st)
+	}
+}
+
+// Under nfsMu a start judges again: a mount made meanwhile (by a pass) is not
+// made twice; a mount the pass saw fail meanwhile is not retried at once; a
+// pool deleted meanwhile is not mounted back.
+func TestPrepareHardwareForStart_NFSRejudgesUnderTheLock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		between func(t *testing.T, s *Server, m *hostMounts)
+		wantErr string
+		mounts  int
+	}{
+		{"mounted meanwhile", func(t *testing.T, s *Server, m *hostMounts) {
+			s.ReconcileNFSMounts(context.Background())
+		}, "", 1},
+		{"failed meanwhile", func(t *testing.T, s *Server, m *hostMounts) {
+			m.setMountErr("mount.nfs: Connection timed out")
+			s.ReconcileNFSMounts(context.Background())
+		}, "failed moments ago", 1},
+		{"deleted meanwhile", func(t *testing.T, s *Server, m *hostMounts) {
+			if err := corrosion.MarkStoragePoolDeleted(context.Background(), s.db, s.hostName, "shared"); err != nil {
+				t.Error(err)
+			}
+		}, "deleted or replaced", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			m := installHostMounts(t)
+			dir := nfsPoolRow(t, s, "shared")
+			vm := nfsDiskVM(t, s, "shared", dir)
+			nfsStartBeforeLock = func() { tc.between(t, s, m) }
+			t.Cleanup(func() { nfsStartBeforeLock = nil })
+			_, err := s.PrepareHardwareForStart(context.Background(), &vm)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("start: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v; want %q", err, tc.wantErr)
+			}
+			if m.count() != tc.mounts {
+				t.Fatalf("%d mounts, want %d", m.count(), tc.mounts)
+			}
+		})
+	}
+}
+
+// A start that finds the export mounted marks it seen: an unmount after it is
+// honoured by the pass, even when no pass saw it mounted first.
+func TestPrepareHardwareForStart_MarksAMountedExportSeen(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	dir := nfsPoolRow(t, s, "shared")
+	m.dirs[dir] = nfsTestSource // mounted by a create's Prepare, before any pass
+	vm := nfsDiskVM(t, s, "shared", dir)
+	if _, err := s.PrepareHardwareForStart(context.Background(), &vm); err != nil {
+		t.Fatal(err)
+	}
+	m.umount(dir)
+	s.ReconcileNFSMounts(context.Background())
+	if m.count() != 0 || m.mounted(dir) {
+		t.Fatal("the pass mounted back an export unmounted after a start saw it")
+	}
+	if st := poolState(t, s, "shared"); st != PoolStateDegraded {
+		t.Fatalf("pool state %q, want %q", st, PoolStateDegraded)
+	}
+}
+
+// A hand mount of the pool's export spelled another way (a host name where
+// the pool has the address) is a mount: the start goes ahead, as on main.
+func TestPrepareHardwareForStart_AHandMountSpelledOtherwiseIsAMount(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	dir := nfsPoolRow(t, s, "shared")
+	m.dirs[dir] = "nas.example:/srv/lv"
+	vm := nfsDiskVM(t, s, "shared", dir)
+	if _, err := s.PrepareHardwareForStart(context.Background(), &vm); err != nil {
+		t.Fatalf("start on a hand-mounted export: %v", err)
+	}
+	s.ReconcileNFSMounts(context.Background())
+	if m.count() != 0 {
+		t.Fatal("mounted over a hand mount")
+	}
+	if st := poolState(t, s, "shared"); st != "active" {
+		t.Fatalf("pool state %q with its export hand-mounted, want active", st)
+	}
+}
+
+// The refusal is counted under its own reason, not a hardware one.
+func TestPrepareHardwareForStart_NFSRefusalIsAStorageRefusal(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	dir := nfsPoolRow(t, s, "shared")
+	vm := nfsDiskVM(t, s, "shared", dir)
+	m.setMountErr("mount.nfs: Connection timed out")
+	_, err := s.PrepareHardwareForStart(context.Background(), &vm)
+	if !errors.Is(err, health.ErrStartStorageNotMounted) || status.Code(err) != codes.Unavailable {
+		t.Fatalf("err = %v (code %v); want ErrStartStorageNotMounted and Unavailable", err, status.Code(err))
+	}
+}
+
+// A pool delete holds nfsMu across its teardown and row delete: a pass that
+// listed the pool before the delete waits, then finds the row gone and does
+// not mount it back.
+func TestReconcileNFSMounts_PoolDeleteSerialisesWithThePass(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	nfsPoolRow(t, s, "shared")
+	release := make(chan struct{})
+	m.gate, m.entered = release, make(chan struct{}, 1)
+	deleted := make(chan error, 1)
+	nfsPassAfterList = func() {
+		go func() {
+			_, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "shared"})
+			deleted <- err
+		}()
+		<-m.entered // the delete is in its teardown
+		time.AfterFunc(200*time.Millisecond, func() { close(release) })
+	}
+	t.Cleanup(func() { nfsPassAfterList = nil })
+	s.ReconcileNFSMounts(context.Background())
+	if err := <-deleted; err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if m.count() != 0 {
+		t.Fatal("the pass mounted a pool deleted while it ran")
+	}
+}
+
+// I-1: a check that blocks — resolving a symlink into an NFS mount whose
+// server does not answer — holds no lock (another pool's delete completes
+// meanwhile), and gives up within its bound (the pass goes on to mount the
+// other pools).
+func TestReconcileNFSMounts_AHungCheckWedgesNothing(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	hung := filepath.Join(t.TempDir(), "hung")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	t.Cleanup(storage.OverrideNFSPathResolverForTest(func(p string) string {
+		if p == hung {
+			<-release
+		}
+		return p
+	}, 2*time.Second))
+	nfsPoolRowAt(t, s, "a-hung", "10.0.0.31:/a", filepath.Join(hung, "lv"))
+	okDir := nfsPoolRowAt(t, s, "b-ok", "10.0.0.32:/b", "")
+	nfsPoolRowAt(t, s, "c-del", "10.0.0.33:/c", "")
+	pass := make(chan struct{})
+	go func() {
+		s.ReconcileNFSMounts(context.Background())
+		close(pass)
+	}()
+	time.Sleep(300 * time.Millisecond) // the pass is in a-hung's check
+	delDone := make(chan error, 1)
+	go func() {
+		_, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "c-del"})
+		delDone <- err
+	}()
+	select {
+	case err := <-delDone:
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("a pool delete waited on a pass stuck in a check")
+	}
+	select {
+	case <-pass:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass did not give up on a check that does not finish")
+	}
+	if !m.mounted(okDir) {
+		t.Fatal("the pass did not mount the other pool")
+	}
+	if c, ok := mountCondition(t, s, "a-hung"); !ok || !strings.Contains(c.Evidence, "did not finish") {
+		t.Fatalf("a-hung's condition %+v found=%v; want the check's reason", c, ok)
 	}
 }

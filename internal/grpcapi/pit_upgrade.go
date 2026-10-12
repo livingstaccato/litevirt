@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -99,43 +100,37 @@ func (s *Server) pitOverlayScan(ctx context.Context) (files, unanswered []string
 			}
 		}
 	}
-	type result struct {
-		dir   string
-		found []string
-	}
-	results := make(chan result, len(dirs))
+	// Every walk is started (or joined) at once; then each is waited for in
+	// turn, all under the one deadline. No goroutine waits on a walk for this
+	// scan: one that has not ended by the deadline leaves nothing behind but
+	// the walk itself (pitOverlayWalkOf).
+	walk := walkForOverlays
+	walks := make(map[string]*pitOverlayWalk, len(dirs))
 	for dir := range dirs {
-		go func(dir string) {
-			var found []string
-			_ = walkForOverlays(dir, func(p string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return nil
-				}
-				n := d.Name()
-				if !d.IsDir() && strings.HasPrefix(n, ".") && strings.HasSuffix(n, pitoverlay.Suffix) {
-					found = append(found, p)
-				}
-				return nil
-			})
-			results <- result{dir: dir, found: found}
-		}(dir)
+		walks[dir] = pitOverlayWalkOf(dir, walk)
 	}
 	deadline := time.NewTimer(pitOverlayScanTimeout)
 	defer deadline.Stop()
 	done := map[string]bool{}
 	seen := map[string]bool{}
-collect:
-	for len(done) < len(dirs) {
+	expired := false
+	for dir, w := range walks {
+		if !expired {
+			select {
+			case <-w.done:
+			case <-deadline.C:
+				expired = true
+			case <-ctx.Done():
+				expired = true
+			}
+		}
 		select {
-		case r := <-results:
-			done[r.dir] = true
-			for _, f := range r.found {
+		case <-w.done:
+			done[dir] = true
+			for _, f := range w.found {
 				seen[f] = true
 			}
-		case <-deadline.C:
-			break collect
-		case <-ctx.Done():
-			break collect
+		default:
 		}
 	}
 	for dir := range dirs {
@@ -149,6 +144,48 @@ collect:
 	slices.Sort(files)
 	slices.Sort(unanswered)
 	return files, unanswered
+}
+
+// pitOverlayWalk is one walk of a directory for overlays; found is set before
+// done is closed.
+type pitOverlayWalk struct {
+	done  chan struct{}
+	found []string
+}
+
+// pitOverlayWalks are the walks still running, by directory.
+var pitOverlayWalks sync.Map // dir -> *pitOverlayWalk
+
+// pitOverlayWalkOf returns the walk of dir still running, or starts one. A
+// scan gives up on a walk at pitOverlayScanTimeout but cannot stop it: on a
+// hung NFS mount it stays blocked in the kernel until the mount answers.
+// Joining it, instead of starting another, keeps repeated upgrades and
+// preflights against a hung directory at one blocked goroutine for it, not
+// one per call. The walk is forgotten once it ends, so a later scan walks
+// afresh.
+func pitOverlayWalkOf(dir string, walk func(string, fs.WalkDirFunc) error) *pitOverlayWalk {
+	v, running := pitOverlayWalks.LoadOrStore(dir, &pitOverlayWalk{done: make(chan struct{})})
+	w := v.(*pitOverlayWalk)
+	if running {
+		return w
+	}
+	go func() {
+		var found []string
+		_ = walk(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			n := d.Name()
+			if !d.IsDir() && strings.HasPrefix(n, ".") && strings.HasSuffix(n, pitoverlay.Suffix) {
+				found = append(found, p)
+			}
+			return nil
+		})
+		w.found = found
+		pitOverlayWalks.CompareAndDelete(dir, w)
+		close(w.done)
+	}()
+	return w
 }
 
 // pitOverlayDowngradeRefusal refuses swapping in binary bin when it does not

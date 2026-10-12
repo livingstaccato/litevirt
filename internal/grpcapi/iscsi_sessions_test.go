@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/storage"
@@ -64,6 +65,9 @@ func (f *sessionISCSIAdm) run(_ context.Context, name string, args ...string) ([
 		}
 		f.sessions[key] = true
 		return []byte("Login successful."), nil
+	case strings.HasPrefix(a, "-m node -o new"):
+		f.records[at("-p")+" "+at("-T")] = true
+		return []byte("New iSCSI node added"), nil
 	case strings.HasPrefix(a, "-m discovery"):
 		return []byte("iscsiadm: cannot make connection"), errors.New("exit status 4")
 	}
@@ -272,5 +276,131 @@ func TestPrepareHardwareForStart_LogsInAMissingISCSISession(t *testing.T) {
 	f.setLoginErr("iscsiadm: connection refused")
 	if _, err := s.PrepareHardwareForStart(context.Background(), &vm); err != nil {
 		t.Fatalf("start preflight refused on a failed login, which main did not refuse: %v", err)
+	}
+}
+
+func (f *sessionISCSIAdm) logout(key string) {
+	f.mu.Lock()
+	delete(f.sessions, key)
+	f.mu.Unlock()
+}
+
+// I2 (a): a session this daemon has seen up and that then disappears was
+// logged out on purpose (SAN maintenance, a LUN re-map): the periodic pass
+// does not log it back in, and reports the pool degraded with why.
+func TestReconcileISCSISessions_OperatorLogoutMidRunStaysOut(t *testing.T) {
+	for name, loggedInByUs := range map[string]bool{"session up at start": false, "session re-logged at start": true} {
+		t.Run(name, func(t *testing.T) {
+			s := testServer(t)
+			f := installSessionISCSIAdm(t)
+			key := "10.0.0.5:3260 " + sessTarget
+			f.records[key] = true
+			if !loggedInByUs {
+				f.sessions[key] = true
+			}
+			iscsiPoolRow(t, s, "san", "10.0.0.5:3260")
+			ctx := context.Background()
+			s.ReconcileISCSISessions(ctx)
+			before := f.logins()
+
+			f.logout(key)
+			s.ReconcileISCSISessions(ctx)
+			s.ReconcileISCSISessions(ctx)
+			if f.logins() != before {
+				t.Fatalf("the pass logged a deliberately logged-out session back in; calls %v", f.calls)
+			}
+			if f.sessions[key] {
+				t.Fatal("session back without a start or a restart")
+			}
+			if st := poolState(t, s, "san"); st != PoolStateDegraded {
+				t.Fatalf("pool state %q after a logout, want %q", st, PoolStateDegraded)
+			}
+			c, ok := sessionCondition(t, s, "san")
+			if !ok || c.Lifecycle == corrosion.ConditionResolved || !strings.Contains(c.Evidence, iscsiLoggedOutReason) {
+				t.Fatalf("condition %+v (found %v), want an open one with the logout reason", c, ok)
+			}
+		})
+	}
+}
+
+// I2 (c): a VM start logs a deliberately logged-out session back in (using the
+// LUN is the operator's intent), and the pool is active again on the next pass.
+func TestPrepareHardwareForStart_LogsInAfterAnOperatorLogout(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	f := installSessionISCSIAdm(t)
+	key := "10.0.0.5:3260 " + sessTarget
+	f.records[key], f.sessions[key] = true, true
+	iscsiPoolRow(t, s, "san", "10.0.0.5:3260")
+	prevExists, prevWait := iscsiDeviceExists, iscsiDeviceWait
+	iscsiDeviceExists, iscsiDeviceWait = func(string) bool { return false }, 0
+	t.Cleanup(func() { iscsiDeviceExists, iscsiDeviceWait = prevExists, prevWait })
+	ctx := context.Background()
+	s.ReconcileISCSISessions(ctx)
+	f.logout(key)
+	s.ReconcileISCSISessions(ctx)
+	if f.sessions[key] {
+		t.Fatal("the pass logged the session back in")
+	}
+
+	vm := corrosion.VMRecord{Name: "lunvm", HostName: "test-host", State: "stopped", Spec: `{"name":"lunvm","cpu":1,"memory_mib":256}`}
+	if err := corrosion.InsertVM(ctx, s.db, vm, nil, []corrosion.DiskRecord{{
+		VMName: "lunvm", DiskName: "root", HostName: "test-host", StorageType: "iscsi", StorageVolume: "san",
+		Path: "/dev/disk/by-path/ip-10.0.0.5:3260-iscsi-" + sessTarget + "-lun-1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHardwareForStart(ctx, &vm); err != nil {
+		t.Fatalf("start preflight: %v", err)
+	}
+	if !f.sessions[key] {
+		t.Fatalf("the start did not log the session back in; calls %v", f.calls)
+	}
+	s.ReconcileISCSISessions(ctx)
+	if st := poolState(t, s, "san"); st != "active" {
+		t.Fatalf("pool state %q after the start's login, want active", st)
+	}
+}
+
+// M-4: a start does not retry a login the session pass saw fail moments ago,
+// and does not wait for udev when it made no login.
+func TestPrepareHardwareForStart_ISCSIHookIsCheapWhenItCannotHelp(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	f := installSessionISCSIAdm(t)
+	key := "10.0.0.5:3260 " + sessTarget
+	f.records[key] = true
+	f.setLoginErr("iscsiadm: connection timed out")
+	iscsiPoolRow(t, s, "san", "10.0.0.5:3260")
+	prevExists, prevWait := iscsiDeviceExists, iscsiDeviceWait
+	iscsiDeviceExists, iscsiDeviceWait = func(string) bool { return false }, 3*time.Second
+	t.Cleanup(func() { iscsiDeviceExists, iscsiDeviceWait = prevExists, prevWait })
+	ctx := context.Background()
+	s.ReconcileISCSISessions(ctx) // fails: recorded
+	before := f.logins()
+
+	vm := corrosion.VMRecord{Name: "lunvm", HostName: "test-host", State: "stopped", Spec: `{"name":"lunvm","cpu":1,"memory_mib":256}`}
+	if err := corrosion.InsertVM(ctx, s.db, vm, nil, []corrosion.DiskRecord{{
+		VMName: "lunvm", DiskName: "root", HostName: "test-host", StorageType: "iscsi", StorageVolume: "san",
+		Path: "/dev/disk/by-path/ip-10.0.0.5:3260-iscsi-" + sessTarget + "-lun-1",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHardwareForStart(ctx, &vm); err != nil {
+		t.Fatalf("start preflight: %v", err)
+	}
+	if f.logins() != before {
+		t.Fatalf("the start retried a login that failed moments ago; calls %v", f.calls)
+	}
+	// Session up but device missing (an unmapped LUN): no login, so no wait.
+	f.setLoginErr("")
+	f.mu.Lock()
+	f.sessions[key] = true
+	f.mu.Unlock()
+	s.ReconcileISCSISessions(ctx)
+	t0 := time.Now()
+	if _, err := s.PrepareHardwareForStart(ctx, &vm); err != nil {
+		t.Fatalf("start preflight: %v", err)
+	}
+	if el := time.Since(t0); el > 2*time.Second {
+		t.Fatalf("start waited %v for a device although it made no login", el)
 	}
 }

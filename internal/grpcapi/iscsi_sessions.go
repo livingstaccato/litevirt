@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -18,10 +19,14 @@ import (
 // session; with the node records at node.startup = manual (the usual), nothing
 // logged back in until something prepared the pool again, while the pool kept
 // reporting active. ReconcileISCSISessions, run by the daemon at start and
-// every iscsiSessionReconcileInterval, checks each iscsi pool of this host and
-// logs in when its session is missing (storage.EnsureISCSISession: through
-// the existing node record, which holds any CHAP settings, never rewriting
-// it). A pool whose session is missing and cannot be had is recorded as
+// every ISCSISessionReconcileInterval, checks each iscsi pool of this host and
+// logs in when its session has been missing since this daemon started — after
+// a reboot (storage.LoginISCSISession: through the existing node record, which
+// holds any CHAP settings, never rewriting it). A session this daemon has seen
+// up and that then disappeared was logged out on purpose (SAN maintenance, a
+// LUN re-mapped on the array) and is left out: the pool is reported degraded
+// with iscsiLoggedOutReason, and a VM start that uses the LUN, or a daemon
+// restart, logs it back in. A pool whose session is missing is recorded as
 // PoolStateDegraded on its own row and raises iscsi_session_missing (evaluator
 // iscsi_pool, subject host/<pool>@<host>, warning) with the login's reason;
 // both clear on the pass that finds the session. Nothing is refused on a
@@ -38,7 +43,62 @@ const (
 	// ISCSISessionReconcileInterval is how often the daemon checks the
 	// sessions.
 	ISCSISessionReconcileInterval = 30 * time.Second
+
+	// iscsiLoggedOutReason is why a session seen up earlier in this daemon's
+	// life is missing and not logged back in.
+	iscsiLoggedOutReason = "logged out while the daemon ran; `lv start` of a VM using it or a daemon restart logs it back in"
 )
+
+// iscsiSessionMemory is what this daemon has seen of its iSCSI sessions,
+// keyed by target and portal (iscsiSessionKey): which it has seen up (a
+// later absence is a deliberate logout), and when a login last failed (a
+// start does not retry one the pass saw fail moments ago).
+type iscsiSessionMemory struct {
+	mu     sync.Mutex
+	seen   map[string]bool
+	failed map[string]time.Time
+}
+
+func (m *iscsiSessionMemory) up(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.seen == nil {
+		m.seen = map[string]bool{}
+	}
+	m.seen[key] = true
+	delete(m.failed, key)
+}
+
+func (m *iscsiSessionMemory) wasUp(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.seen[key]
+}
+
+func (m *iscsiSessionMemory) loginFailed(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failed == nil {
+		m.failed = map[string]time.Time{}
+	}
+	m.failed[key] = time.Now()
+}
+
+func (m *iscsiSessionMemory) failedWithin(key string, d time.Duration) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	at, ok := m.failed[key]
+	return ok && time.Since(at) < d
+}
+
+// iscsiSessionKey names one session: a pool's target and portal.
+func iscsiSessionKey(cfg storage.Config) string {
+	portal := cfg.Options["portal"]
+	if portal == "" {
+		portal = "127.0.0.1"
+	}
+	return strings.ToLower(cfg.Source) + "|" + portal
+}
 
 // iscsiDeviceExists reports whether a LUN's by-path device is present
 // (a test seam), and iscsiDeviceWait how long a start waits for udev to
@@ -110,15 +170,11 @@ func (s *Server) reconcileISCSIPool(ctx context.Context, pool string, tried map[
 		return
 	}
 	cfg := s.iscsiPoolConfig(rec)
-	key := strings.ToLower(cfg.Source) + "|" + cfg.Options["portal"]
+	key := iscsiSessionKey(cfg)
 	sessErr, done := tried[key]
 	if !done {
-		var in bool
-		in, sessErr = storage.EnsureISCSISession(ctx, cfg)
+		sessErr = s.checkISCSISession(ctx, pool, cfg, key)
 		tried[key] = sessErr
-		if in && sessErr == nil {
-			slog.Info("iSCSI session was missing; logged in", "pool", pool, "target", cfg.Source, "portal", cfg.Options["portal"])
-		}
 	}
 	if sessErr != nil {
 		slog.Warn("iSCSI pool has no session; its LUN is not available on this host", "pool", pool, "error", sessErr)
@@ -137,6 +193,29 @@ func (s *Server) reconcileISCSIPool(ctx context.Context, pool string, tried map[
 		}
 	}
 	s.judgeISCSISession(ctx, pool, sessErr)
+}
+
+// checkISCSISession is one pass's verdict on a session: nil when it is up
+// (now, or after a login), else why not. Only a session missing since this
+// daemon started is logged in.
+func (s *Server) checkISCSISession(ctx context.Context, pool string, cfg storage.Config, key string) error {
+	up, err := storage.ISCSISessionUp(ctx, cfg)
+	switch {
+	case err != nil:
+		return err
+	case up:
+		s.iscsiMem.up(key)
+		return nil
+	case s.iscsiMem.wasUp(key):
+		return fmt.Errorf("no session to iSCSI target %s through %s: %s", cfg.Source, cfg.Options["portal"], iscsiLoggedOutReason)
+	}
+	if err := storage.LoginISCSISession(ctx, cfg); err != nil {
+		s.iscsiMem.loginFailed(key)
+		return fmt.Errorf("%w; the login is retried every %v", err, ISCSISessionReconcileInterval)
+	}
+	s.iscsiMem.up(key)
+	slog.Info("iSCSI session was missing since the daemon started; logged in", "pool", pool, "target", cfg.Source, "portal", cfg.Options["portal"])
+	return nil
 }
 
 // judgeISCSISession raises iscsi_session_missing for pool on this host while
@@ -173,8 +252,8 @@ func (s *Server) judgeISCSISession(ctx context.Context, pool string, sessErr err
 	ev, _ := json.Marshal(map[string]any{
 		"pool": pool, "host": s.hostName,
 		"detail": fmt.Sprintf("iscsi pool %q on %s has no session, so its LUN's device is missing and a VM disk on it cannot open: %v. "+
-			"litevirt retries the login every %v; the pool reports %s until it succeeds",
-			pool, s.hostName, sessErr, ISCSISessionReconcileInterval, PoolStateDegraded),
+			"The pool reports %s until the session is back",
+			pool, s.hostName, sessErr, PoolStateDegraded),
 	})
 	row.Evidence = string(ev)
 	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName
@@ -221,20 +300,34 @@ func (s *Server) ensureISCSISessionsForVM(ctx context.Context, vm *corrosion.VMR
 		if err != nil || !strings.EqualFold(cfg.Driver, "iscsi") {
 			continue
 		}
-		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "iscsi") {
-			cfg = s.iscsiPoolConfig(r)
+		// The pool's own row (for a config pool, its configured portal) —
+		// only when the disk's storage resolved to the pool, not to a stack
+		// volume of the same name.
+		if cfg.Name == d.StorageVolume {
+			if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, d.StorageVolume); gerr == nil && ok && strings.EqualFold(r.Driver, "iscsi") {
+				cfg = s.iscsiPoolConfig(r)
+			}
+		}
+		key := iscsiSessionKey(cfg)
+		if s.iscsiMem.failedWithin(key, ISCSISessionReconcileInterval) {
+			slog.Warn("VM start: its iSCSI disk's device is missing, and a login to its target failed moments ago; not retried",
+				"vm", vm.Name, "disk", d.DiskName, "device", d.Path, "target", cfg.Source)
+			continue
 		}
 		lctx, cancel := context.WithTimeout(ctx, iscsiStartLoginBound)
 		in, lerr := storage.EnsureISCSISession(lctx, cfg)
 		cancel()
 		if lerr != nil {
+			s.iscsiMem.loginFailed(key)
 			slog.Warn("VM start: its iSCSI disk's device is missing and the session could not be logged in",
 				"vm", vm.Name, "disk", d.DiskName, "device", d.Path, "error", lerr)
 			continue
 		}
-		if in {
-			slog.Info("VM start: logged in the missing iSCSI session of its disk", "vm", vm.Name, "disk", d.DiskName, "target", cfg.Source)
+		s.iscsiMem.up(key)
+		if !in {
+			continue // the session was there: the device's absence is not udev's lag
 		}
+		slog.Info("VM start: logged in the missing iSCSI session of its disk", "vm", vm.Name, "disk", d.DiskName, "target", cfg.Source)
 		deadline := time.Now().Add(iscsiDeviceWait)
 		for !iscsiDeviceExists(d.Path) && time.Now().Before(deadline) && ctx.Err() == nil {
 			time.Sleep(200 * time.Millisecond)

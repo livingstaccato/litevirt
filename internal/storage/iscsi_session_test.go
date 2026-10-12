@@ -18,6 +18,7 @@ type fakeISCSIAdm struct {
 	records   map[string]bool
 	discovers map[string]string // portal -> target a sendtargets discovery finds
 	loginErr  string            // non-empty: every login fails with this output
+	pending   bool              // a login is in progress in iscsid: "already present", no session listed
 	listErr   string            // non-empty: `-m session` fails with this output
 	calls     [][]string
 }
@@ -55,8 +56,14 @@ func (f *fakeISCSIAdm) run(_ context.Context, name string, args ...string) ([]by
 			return []byte(portal + ",1 " + t), nil
 		}
 		return []byte("iscsiadm: cannot make connection to " + portal), errors.New("exit status 4")
+	case strings.HasPrefix(a, "-m node -o new"):
+		f.records[argAfter(args, "-p")+" "+argAfter(args, "-T")] = true
+		return []byte("New iSCSI node [tcp:[hw=,ip=,net_if=,iscsi_if=default] " + argAfter(args, "-p") + "," + argAfter(args, "-T") + "] added"), nil
 	case strings.HasPrefix(a, "-m node") && strings.HasSuffix(a, "--login"):
 		portal, target := argAfter(args, "-p"), argAfter(args, "-T")
+		if f.pending {
+			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), errors.New("exit status 15")
+		}
 		if f.loginErr != "" {
 			return []byte(f.loginErr), errors.New("exit status 8")
 		}
@@ -172,9 +179,11 @@ func TestEnsureISCSISession_MatchesTheSessionByPortal(t *testing.T) {
 	}
 }
 
-// No record at all (a host that never ran discovery for the portal): a
-// discovery that only ADDS records, then the login.
-func TestEnsureISCSISession_NoRecordDiscoversNewOnly(t *testing.T) {
+// No record at all (a host that never ran discovery for the portal): this
+// target's record alone is created (-o new), then the login. No discovery: a
+// sendtargets discovery would add a record for every target the portal
+// advertises, which a node.startup = automatic default logs in at boot.
+func TestEnsureISCSISession_NoRecordCreatesThisTargetsRecordOnly(t *testing.T) {
 	f := newFakeISCSIAdm()
 	f.discovers["10.0.0.5:3260"] = tgt
 	f.records["10.0.0.5:3260 iqn.2003-01.org.example:other"] = true // the operator's, untouched
@@ -182,11 +191,26 @@ func TestEnsureISCSISession_NoRecordDiscoversNewOnly(t *testing.T) {
 	if err != nil || !in {
 		t.Fatalf("no record: loggedIn=%v err=%v, want true, nil", in, err)
 	}
-	if n := f.count("-m discovery -t st -p 10.0.0.5:3260 -o new"); n != 1 {
-		t.Fatalf("want one add-only discovery; calls %v", f.calls)
+	if n := f.count("-m node -o new -T " + tgt + " -p 10.0.0.5:3260"); n != 1 {
+		t.Fatalf("want one add-only record of this target; calls %v", f.calls)
+	}
+	if n := f.count("-m discovery"); n != 0 {
+		t.Fatalf("discovery run: %v", f.calls)
 	}
 	if bad := f.mutating(); len(bad) > 0 {
 		t.Fatalf("calls that rewrite node records: %v", bad)
+	}
+}
+
+// "already present" while no session is listed is a login still in progress
+// in iscsid (an earlier, timed-out iscsiadm's): not a session.
+func TestEnsureISCSISession_AlreadyPresentWithoutASessionIsNotUp(t *testing.T) {
+	f := newFakeISCSIAdm()
+	f.records["10.0.0.5:3260 "+tgt] = true
+	f.pending = true
+	if _, err := ensureISCSISession(context.Background(), f.run, tgt, "10.0.0.5:3260"); err == nil ||
+		!strings.Contains(err.Error(), "in progress") {
+		t.Fatalf("pending login: err=%v, want it reported as no session yet", err)
 	}
 }
 

@@ -21,16 +21,17 @@ import (
 // CHAP credentials among them, which is how a CHAP target is logged in to
 // without a secret on litevirt's command lines or in its logs. A login goes
 // through the record as it is; only when the target has no record at all is
-// a discovery run, and that one adds records only (-o new): a plain
-// sendtargets discovery would reset existing records from iscsid.conf.
-// node.startup is left as the operator set it.
+// one created, for that target alone (-m node -o new). node.startup is left
+// as the operator set it. (A pool create's Prepare is another matter: its
+// plain sendtargets discovery refreshes the portal's records from
+// iscsid.conf.)
 
 // The bounds of the iscsiadm calls a session check makes. A login to a
 // portal that does not answer otherwise waits out iscsid's own retries.
 const (
-	iscsiListTimeout     = 15 * time.Second
-	iscsiDiscoverTimeout = 30 * time.Second
-	iscsiLoginTimeout    = 60 * time.Second
+	iscsiListTimeout   = 15 * time.Second
+	iscsiRecordTimeout = 30 * time.Second
+	iscsiLoginTimeout  = 60 * time.Second
 )
 
 // EnsureISCSISession makes sure this host has a session to an iscsi pool's
@@ -42,6 +43,26 @@ func EnsureISCSISession(ctx context.Context, cfg Config) (loggedIn bool, err err
 		return false, fmt.Errorf("pool driver %q has no iSCSI session", cfg.Driver)
 	}
 	return ensureISCSISession(ctx, iscsiRun, cfg.Source, iscsiPortalOf(cfg.Options))
+}
+
+// ISCSISessionUp reports whether this host has a session to an iscsi pool's
+// target through its portal. The error is that the sessions could not be
+// listed.
+func ISCSISessionUp(ctx context.Context, cfg Config) (bool, error) {
+	if !strings.EqualFold(cfg.Driver, "iscsi") {
+		return false, fmt.Errorf("pool driver %q has no iSCSI session", cfg.Driver)
+	}
+	return iscsiSessionUp(ctx, iscsiRun, cfg.Source, iscsiPortalOf(cfg.Options))
+}
+
+// LoginISCSISession logs this host in to an iscsi pool's target through its
+// portal, and checks that the session is listed. The error is the reason
+// there is none.
+func LoginISCSISession(ctx context.Context, cfg Config) error {
+	if !strings.EqualFold(cfg.Driver, "iscsi") {
+		return fmt.Errorf("pool driver %q has no iSCSI session", cfg.Driver)
+	}
+	return loginISCSISession(ctx, iscsiRun, cfg.Source, iscsiPortalOf(cfg.Options))
 }
 
 // iscsiPortalOf is the portal an iscsi pool's commands use: its option, or
@@ -64,24 +85,50 @@ func ensureISCSISession(ctx context.Context, run cmdRunner, target, portal strin
 	if up {
 		return false, nil
 	}
+	if err := loginISCSISession(ctx, run, target, portal); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func loginISCSISession(ctx context.Context, run cmdRunner, target, portal string) error {
+	if target == "" {
+		return fmt.Errorf("iscsi pool has no target")
+	}
 	out, err := iscsiLogin(ctx, run, target, portal)
 	if err != nil && strings.Contains(string(out), "No records found") {
-		// No record of this target through this portal: add one (and only
-		// new ones) from the portal's sendtargets, then log in.
-		dctx, cancel := context.WithTimeout(ctx, iscsiDiscoverTimeout)
-		dout, derr := run(dctx, "iscsiadm", "-m", "discovery", "-t", "st", "-p", portal, "-o", "new")
+		// No record of this target through this portal: this target's
+		// record alone is created (-o new adds, never changes one), from
+		// iscsid.conf's defaults, then logged in to. Not a sendtargets
+		// discovery: that adds a record for every target the portal
+		// advertises, which a node.startup = automatic default would log in
+		// to at the next boot.
+		nctx, cancel := context.WithTimeout(ctx, iscsiRecordTimeout)
+		nout, nerr := run(nctx, "iscsiadm", "-m", "node", "-o", "new", "-T", target, "-p", portal)
 		cancel()
-		if derr != nil {
-			return false, fmt.Errorf("no session to iSCSI target %s through %s, no node record of it, and discovery failed: %w: %s",
-				target, portal, derr, trimISCSIOutput(dout))
+		if nerr != nil {
+			return fmt.Errorf("no session to iSCSI target %s through %s, no node record of it, and creating one failed: %w: %s",
+				target, portal, nerr, trimISCSIOutput(nout))
 		}
 		out, err = iscsiLogin(ctx, run, target, portal)
 	}
 	if err != nil && !strings.Contains(string(out), "already present") {
-		return false, fmt.Errorf("no session to iSCSI target %s through %s, and the login failed: %w: %s",
+		return fmt.Errorf("no session to iSCSI target %s through %s, and the login failed: %w: %s",
 			target, portal, err, trimISCSIOutput(out))
 	}
-	return true, nil
+	if err != nil {
+		// "already present" can be iscsid still retrying an earlier login
+		// whose iscsiadm timed out: a session only once it is listed.
+		up, lerr := iscsiSessionUp(ctx, run, target, portal)
+		if lerr != nil {
+			return lerr
+		}
+		if !up {
+			return fmt.Errorf("no session to iSCSI target %s through %s: a login is in progress in iscsid (%s)",
+				target, portal, trimISCSIOutput(out))
+		}
+	}
+	return nil
 }
 
 func iscsiLogin(ctx context.Context, run cmdRunner, target, portal string) ([]byte, error) {

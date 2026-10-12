@@ -97,7 +97,10 @@ func TestFleet_ISCSIPoolSessionMissingIsDegradedEverywhereUntilLoggedBackIn(t *t
 		cond, ok := conditionOnPeer()
 		return stateOnPeer() == "active" && ok && cond.Lifecycle == corrosion.ConditionResolved
 	})
-	if adm.logins != 2 {
-		t.Fatalf("%d logins, want 2 (one failed, one made)", adm.logins)
+	adm.mu.Lock()
+	logins := adm.logins
+	adm.mu.Unlock()
+	if logins != 2 {
+		t.Fatalf("%d logins, want 2 (one failed, one made)", logins)
 	}
 }

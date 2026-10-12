@@ -315,7 +315,9 @@ func newReplicationPromoteCmd() *cobra.Command {
 		Long: `Promote a replica to a live VM. By default the newest replica of the VM's
 root disk is located (from the VM's replication schedule, or --pool/--host),
 copied into a self-contained live disk on the host holding it, and the VM is
-defined + started there.
+defined + started there. Every other disk with a replica there is recovered
+too, from the same run (else its newest earlier replica); a disk that cannot
+be is named, and the VM is marked partial (lv inspect: promotedPartial).
 
 By default the original name is taken over (the host-loss case); pass --new-name
 to bring it up alongside a still-running original. --force overrides the

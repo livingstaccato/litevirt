@@ -29063,8 +29063,14 @@ type PromoteReplicaRequest struct {
 	// promotion is refused with a warning naming this flag
 	// (--accept-not-point-in-time).
 	AcceptNotPointInTime bool `protobuf:"varint,9,opt,name=accept_not_point_in_time,json=acceptNotPointInTime,proto3" json:"accept_not_point_in_time,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// automated marks a promotion the failover coordinator decided, relayed
+	// to the host holding the replica. It only ever narrows what the
+	// executor does (a shared data disk is then reattached only behind a
+	// proof-grade fence this executor verified); an older coordinator that
+	// does not set it gets the manual rule.
+	Automated     bool `protobuf:"varint,10,opt,name=automated,proto3" json:"automated,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PromoteReplicaRequest) Reset() {
@@ -29156,6 +29162,13 @@ func (x *PromoteReplicaRequest) GetProof() *RuntimeActionProof {
 func (x *PromoteReplicaRequest) GetAcceptNotPointInTime() bool {
 	if x != nil {
 		return x.AcceptNotPointInTime
+	}
+	return false
+}
+
+func (x *PromoteReplicaRequest) GetAutomated() bool {
+	if x != nil {
+		return x.Automated
 	}
 	return false
 }
@@ -42744,7 +42757,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\amembers\x18\x02 \x03(\v2\x1d.litevirt.v1.ClaimVoterMemberR\amembers\x12\x16\n" +
 	"\x06change\x18\x03 \x01(\tR\x06change\x12\x18\n" +
 	"\aapplied\x18\x04 \x01(\bR\aapplied\x12\x16\n" +
-	"\x06detail\x18\x05 \x01(\tR\x06detail\"\xcd\x02\n" +
+	"\x06detail\x18\x05 \x01(\tR\x06detail\"\xeb\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +
@@ -42757,7 +42770,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vno_localize\x18\a \x01(\bR\n" +
 	"noLocalize\x125\n" +
 	"\x05proof\x18\b \x01(\v2\x1f.litevirt.v1.RuntimeActionProofR\x05proof\x126\n" +
-	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\"\x85\x02\n" +
+	"\x18accept_not_point_in_time\x18\t \x01(\bR\x14acceptNotPointInTime\x12\x1c\n" +
+	"\tautomated\x18\n" +
+	" \x01(\bR\tautomated\"\x85\x02\n" +
 	"\x18ResolvePITOverlayRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x12\x16\n" +

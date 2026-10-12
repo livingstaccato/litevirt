@@ -671,6 +671,40 @@ records a `manual-confirmed` row in `fencing_log`. This gate prevents
 the coordinator from rescheduling a manually-fenced host's VMs before
 an operator has actually confirmed the fence.
 
+**A removed host can be confirmed too.** Removing a host does not power it
+off: `lv host rm --force` asks for no fence, and a host whose daemon died may
+still be running its qemu. So a replica promotion treats a removed owner of a
+shared disk like a fenced one, and reattaches the disk only when the newest
+fence on record for it is proof-grade (docs/backups.md).
+`lv host fence-confirm <host>` accepts a host that has been removed, and
+records only the `manual-confirmed` row in `fencing_log`: the host is not
+brought back and no membership state is written. Only the confirmation is
+accepted (`lv host fence <host>` refuses a removed host, since there is
+nothing left to fence it by), and a name the cluster holds no hosts row for
+at all is still not found.
+
+Only a fence of the removed host's **last life** counts. A removal writes no
+fence row, so an IPMI fence or a confirmation recorded before the host last
+came back (the same machine before it returned to service, or the machine
+removed under the name before `lv host add` gave it to a new one) proves
+nothing about the machine behind the name now. The boundary is the same one
+`lv host rm --dead` uses: the host's membership row, which outlives the
+removal, dates its last life. A confirmation recorded after the removal
+always counts.
+
+The confirmation is not only for the promotion. It is also the proof-grade
+fence that `lv host rm --dead` would have required, so with recovery claims
+enforced the failover coordinator may now recover **every workload still
+recorded on the removed host** under its failure policy, by the same claim
+path as after `lv host rm --dead`, once the removal and the host's certificate
+revocation have replicated. That can happen before a promotion you run next,
+so confirm a removed host only when you want its workloads recovered.
+
+The confirmation of a removed host needs a node on a build that has it. A
+node still on an older build answers `host "<host>" not found` for a removed
+host, as it always did; during a rolling upgrade, point `lv` at an upgraded
+node (set `LV_HOST` to it).
+
 ### Shared-disk fence gating (host-fence-gated shared storage)
 
 A VM whose disk lives on **shared** storage (NFS/Ceph/RBD/iSCSI) is a special

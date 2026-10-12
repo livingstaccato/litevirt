@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -66,7 +67,12 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	if err := s.mayReplicateVMAsOwner(ctx, vm); err != nil {
 		return err
 	}
-	unlock := s.lockVM(sched.VMName)
+	// The lock is held for the root disk's run, as always, and released
+	// before the other disks: each of those takes it only for its brief
+	// point-in-time step (replica_set.go).
+	var unlockOnce sync.Once
+	vmUnlock := s.lockVM(sched.VMName)
+	unlock := func() { unlockOnce.Do(vmUnlock) }
 	defer unlock()
 
 	disks, err := corrosion.GetVMDisks(ctx, s.db, sched.VMName)
@@ -141,43 +147,55 @@ func (s *Server) runVMReplication(ctx context.Context, sched corrosion.BackupSch
 	}()
 	allowForceShare := !scheduler.IsPointInTimeRetry(ctx)
 
-	// Incremental path (opt-in): transfer only dirty extents into a raw replica
-	// via the libvirt backup session. Falls back to the full qcow2 copy below
-	// when the session can't open (stopped VM / old libvirt) or the transfer
-	// fails — resetting the chain so the next run re-bases cleanly.
-	if sched.Incremental && s.backupSource != nil {
-		err := s.replicateIncremental(ctx, sched, vm, src, targetHost, ts)
-		switch {
-		case err == nil:
-			return nil
-		case errors.Is(err, errCheckpointCommit):
-			// The transfer succeeded but the new anchor couldn't be recorded. The
-			// parent anchor (DB row + bitmap) is intact — do NOT reset the chain or
-			// fall back (that would erase the retryable parent). Retry next run.
-			slog.Error("incremental replication: checkpoint commit failed; parent anchor preserved for retry",
-				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
-			return err
-		default:
-			// Genuine transfer/session failure: reset the chain so the next run
-			// re-bases cleanly, then fall through to the full qcow2 copy.
-			if rerr := corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo, ""); rerr != nil {
-				slog.Error("incremental replication: chain reset write failed",
-					"vm", sched.VMName, "pool", sched.TargetPool, "error", rerr)
+	// The root disk first, exactly as before: its incremental chain, its
+	// fallback to a full copy, its mirror for main-build hosts.
+	replicateRoot := func() error {
+		// Incremental path (opt-in): transfer only dirty extents into a raw replica
+		// via the libvirt backup session. Falls back to the full qcow2 copy below
+		// when the session can't open (stopped VM / old libvirt) or the transfer
+		// fails — resetting the chain so the next run re-bases cleanly.
+		if sched.Incremental && s.backupSource != nil {
+			err := s.replicateIncremental(ctx, sched, vm, src, targetHost, ts)
+			switch {
+			case err == nil:
+				return nil
+			case errors.Is(err, errCheckpointCommit):
+				// The transfer succeeded but the new anchor couldn't be recorded. The
+				// parent anchor (DB row + bitmap) is intact — do NOT reset the chain or
+				// fall back (that would erase the retryable parent). Retry next run.
+				slog.Error("incremental replication: checkpoint commit failed; parent anchor preserved for retry",
+					"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
+				return err
+			default:
+				// Genuine transfer/session failure: reset the chain so the next run
+				// re-bases cleanly, then fall through to the full qcow2 copy.
+				if rerr := corrosion.SetReplicationCheckpoint(ctx, s.db, sched.VMName, sched.Repo, ""); rerr != nil {
+					slog.Error("incremental replication: chain reset write failed",
+						"vm", sched.VMName, "pool", sched.TargetPool, "error", rerr)
+				}
+				// The full copy below is point-in-time for a running source too
+				// (copyVMDiskConsistent: a backup session, else an external
+				// snapshot). Only when neither can be made is it main's -U copy,
+				// and that replica is recorded and reported as not point-in-time,
+				// so the downgrade is never silent.
+				slog.Warn("incremental replication fell back to full copy",
+					"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
 			}
-			// The full copy below is point-in-time for a running source too
-			// (copyVMDiskConsistent: a backup session, else an external
-			// snapshot). Only when neither can be made is it main's -U copy,
-			// and that replica is recorded and reported as not point-in-time,
-			// so the downgrade is never silent.
-			slog.Warn("incremental replication fell back to full copy",
-				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
 		}
-	}
 
-	if targetHost == s.hostName {
-		return s.replicateLocal(ctx, sched, vm, src, ts, allowForceShare)
+		if targetHost == s.hostName {
+			return s.replicateLocal(ctx, sched, vm, src, ts, allowForceShare)
+		}
+		return s.replicateCrossHost(ctx, sched, vm, src, targetHost, ts, allowForceShare)
 	}
-	return s.replicateCrossHost(ctx, sched, vm, src, targetHost, ts, allowForceShare)
+	if err := replicateRoot(); err != nil {
+		return err
+	}
+	// Then every other disk, with the same run time, so the run leaves one
+	// replica set a promotion recovers whole (replica_set.go).
+	unlock()
+	return s.replicateOtherDisks(ctx, sched, vm, replicaSetOthers(disks, src), targetHost, ts, allowForceShare,
+		func() func() { return s.lockVM(sched.VMName) })
 }
 
 // replicateLocal writes the replica into a file-based pool on this host (the
@@ -256,8 +274,9 @@ func (s *Server) replicateLocalCopy(ctx context.Context, sched corrosion.BackupS
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err))
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
 	}
-	// A main-build host promotes only top-level replicas (replica_mirror.go).
-	if s.mirrorReplicasToTopLevel(ctx) {
+	// A main-build host promotes only top-level replicas (replica_mirror.go),
+	// and of the root disk only: another disk's mirror is never read there.
+	if !isOtherSetDisk(ctx) && s.mirrorReplicasToTopLevel(ctx) {
 		if err := s.mirrorFullLocal(ctx, sched.TargetPool, replicaKeyOf(vm, src.DiskName), areaPath,
 			legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)); err != nil {
 			s.mirrorFailed(ctx, sched.VMName, src.DiskName, sched.TargetPool, s.hostName, err)
@@ -346,7 +365,7 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	}
 	// A main-build host promotes only top-level replicas (replica_mirror.go):
 	// the same data again, under main's name at the top level.
-	if !legacy && s.mirrorReplicasToTopLevel(ctx) {
+	if !legacy && !isOtherSetDisk(ctx) && s.mirrorReplicasToTopLevel(ctx) {
 		if err := streamLegacyReplica(ctx, client, scratch, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName),
 			legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)); err != nil {
 			s.mirrorFailed(ctx, sched.VMName, src.DiskName, sched.TargetPool, targetHost, err)

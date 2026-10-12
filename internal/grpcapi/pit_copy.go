@@ -105,6 +105,11 @@ var errNoPointInTimeCopy = errors.New("no point-in-time copy of the running disk
 // allowForceShare false, layer 3 is not tried and errNoPointInTimeCopy is
 // returned instead.
 func (s *Server) copyVMDiskConsistent(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error, allowForceShare bool) (copyResult, error) {
+	if take := otherDiskLockFrom(ctx); take != nil {
+		// A disk other than the root, copied without the VM lock but for its
+		// point-in-time step (replica_set.go).
+		return s.otherDiskCopy(ctx, take, vm, d, dst, emit, allowForceShare)
+	}
 	if err := s.healPITOverlay(ctx, vm, d); err != nil {
 		return copyResult{}, err
 	}
@@ -214,6 +219,9 @@ func (s *Server) copyViaBackupSession(ctx context.Context, vm *corrosion.VMRecor
 		return fmt.Errorf("open: %w", err)
 	}
 	defer session.Close()
+	// The point in time is fixed: a caller holding the VM lock only for
+	// this step drops it before the export is read.
+	afterPITPoint(ctx)
 	extents, err := session.ChangedExtents()
 	if err != nil {
 		return fmt.Errorf("extents: %w", err)
@@ -886,7 +894,7 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 		if !pitoverlay.Present(s.hostDiskFile(d.Path)) {
 			continue
 		}
-		if corrosion.DiskIsShared(*d) && (s.virt == nil || !s.virt.DomainExists(name)) {
+		if s.diskOnSharedStorage(ctx, *d) && (s.virt == nil || !s.virt.DomainExists(name)) {
 			detail := fmt.Sprintf("%s: a point-in-time overlay %s is present on shared storage and %s's domain is not defined on this host; left for the host that defines or starts it", d.DiskName, pitOverlayPath(d.Path), name)
 			slog.Warn("point-in-time overlay sweep: "+detail, "vm", name)
 			s.recordVMEventSeverity(ctx, name, "disk.pit_overlay_left", "ok", "warn", detail)

@@ -320,10 +320,66 @@ daemon config wins.
 ## Replication schedules
 
 The same scheduler also drives **volume replication** (`backup_schedules`
-rows with `type='replication'`). Each run copies the VM's root disk to a
-target pool as a timestamped, self-contained point-in-time copy, keeping the
-newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
-backups too.
+rows with `type='replication'`). Each run copies every disk of the VM to a
+target pool as timestamped, self-contained point-in-time copies, keeping the
+newest `keep_replicas` of each disk. A fast-recovery layer, not a backup
+replacement, so keep backups too.
+
+**Replica sets.** One run replicates every disk with one run time, so the
+replicas a run writes are a set: the root disk first, exactly as before (its
+`--incremental` chain, its fallback, its top-level copy for a host on an older
+build), then each other disk as a full point-in-time copy. Each disk keeps its
+own replica and record, so `keep_replicas` applies per disk and the storage
+cost is one replica per disk per kept run. A run whose copy of any disk fails
+reports the run failed (`disk.replicated` names the disk), and the disks it
+did copy stand. What a run does not copy:
+
+- a disk on shared storage (nfs, ceph, rbd, iscsi, or any pool with a shared
+  driver): it is reachable from another host as it is, so it is never copied
+  and a promotion reattaches it as-is (below); reported as `disk.replicated`
+  with result `skipped` on every run, and not a failure;
+- a disk on host-local storage that is not file-based (zfs, lvm): `skipped` the
+  same way, and a promotion cannot recover it;
+- a cdrom;
+- every disk but the root, when the target host runs an older build, which
+  promotes the root disk alone (`skipped`, naming the host).
+
+**`--incremental` schedules still copy the other disks in full on every run.**
+The incremental chain covers the root disk only; per-disk incremental is a
+tracked follow-up that needs verifying on real libvirt first. A VM with large
+data disks on an `--incremental` schedule therefore pays a full copy of each
+data disk per run, in time, I/O and target storage.
+
+**The VM lock during another disk's copy.** The root disk's run holds the VM's
+lock as it always did. Each other disk takes it only for its brief
+point-in-time step, never for the bulk copy, so a stop, migrate or hotplug of
+the VM waits at most for that step:
+
+- a shut-off VM's disk is copied without the lock (with `-U`, so a start in
+  the meantime is not refused), and the copy is kept only if, under the lock
+  again, the VM is still shut off and the disk file unchanged (size, mtime,
+  inode); otherwise it is discarded and the run reports the disk failed;
+- a running VM's backup session is opened under the lock, which is dropped as
+  soon as the session's point in time is fixed; the export is read without
+  it. A stop during the read aborts the session; the copy then falls back to
+  the last resort below and is recorded as not point-in-time, with a
+  point-in-time retry owed. While the session runs, libvirt refuses or times
+  out every other operation that needs a block job or the disk: a migration,
+  a backup (`lv backup create`), a snapshot, `lv replicate-volume`,
+  `lv move-volume` of a running VM's disk, `lv resize-disk`, a snapshot delete
+  that flattens (`lv snapshot rm`), and a detach of that disk. Retry them once
+  the run is done;
+- each time a disk's copy takes the lock again, it checks that the VM is
+  still this host's and its domain still defined here; if not (it migrated,
+  moved or was deleted meanwhile) nothing more of it is copied in that run,
+  not even by the last resort;
+- the external-snapshot step (skipped until the `pit_overlay` release
+  feature) keeps the lock throughout, as its overlay must not meet a move.
+
+Each disk's copy is point-in-time on its own; the disks of a running VM are
+copied one after another, so the set is not one instant across disks (a
+shut-off VM's set is). A guest volume that spans disks (LVM or md across
+disks) is therefore not crash-consistent across them.
 
 **How a full replica is copied.** A full (non-incremental) replica — and the
 full copy an `--incremental` run falls back to when its session fails — is made
@@ -626,6 +682,122 @@ lv replication promote web-1 --accept-not-point-in-time   # a replica recorded a
 A split-brain guard refuses to take over the name while the original is on a
 healthy host (`--force` overrides). The same action is on the VM detail page
 ("Promote replica").
+
+**Every disk with a replica is recovered**, manual or automatic: the root from
+the chosen replica, and each other disk from the replica of the same run, or,
+when that run did not copy it, its newest replica from before it (never a
+newer one: a root replica named with `--replica` sets the point in time). A
+root replica with no run time in its name (an admin-named file) takes no
+other disk's replica at all: its file's time is not its data's time, so the
+promotion is partial.
+Automatic promotion takes another disk's replica only within the same age
+bound as the root's (below); an older one is not attached. A not
+point-in-time replica of another disk is taken only where the root's would be
+(with `--accept-not-point-in-time`, or the VM's label for automatic
+promotion). Each disk comes back on its own bus and controller, at its stored
+target device unless that collides with the root's (`vda` on virtio) or an
+earlier disk's, in which case it gets the next free one.
+
+A disk on **shared storage** is never rebuilt from a replica. A takeover
+promotion reattaches it as-is, at its own path, with its row unchanged, only
+when its old owner provably no longer writes it:
+
+- when the promoting host itself verified a proof-grade fence of the old
+  owner for this promotion: the promotion carries a proof (failover's, under
+  enforcement), `enforcement.shared_storage_fence` is enforced, and the
+  proof's fence is proof-grade (IPMI, or `lv host fence-confirm`);
+- failover's own promotion without such a verified fence: never — a
+  best-effort fence can leave a partitioned host's qemu writing the disk;
+- any other promotion — an operator's, whether the CLI reaches the replica
+  host directly or through another node, local-root `lv`, or a relay from a
+  coordinator on an older build — only when the disk's own row names the
+  promoting host, or its owner is fenced, removed or no longer a member
+  **and proven powered off**: the newest fence on record for it is
+  proof-grade (a verified IPMI power-off, or `lv host fence-confirm`), the
+  same assurance the shared-storage fence and recovery claims trust. For a
+  host that is no longer a member, only a fence of its last life counts: one
+  recorded before it was last re-added or returned to service is about an
+  earlier life of the name and proves nothing. A host
+  recorded fenced by an SSH, watchdog or best-effort fence, or with no fence
+  record, may still be writing the disk, and so may a removed one:
+  `lv host rm --force` asks for no fence, and a host whose daemon died may
+  still be running its qemu. Such a disk is left unattached and the promotion reported
+  partial. Not merely not active either: maintenance, offline or active is
+  not enough, and `--force` does not change any of this;
+- an owner whose state or fence record cannot be read, or a disk whose row
+  names no host on a VM the promoting host already owns: never.
+
+The owner judged is the host the **disk's own row** names, and the VM's owner
+too when that is another host: each must pass. After a partial promotion the
+VM belongs to the promoting host while its shared disk's row still names the
+old owner, so a second promotion of the same VM is judged by that old owner,
+exactly as the first was; and a row left naming a host the VM has since left
+does not excuse the host the VM was running on.
+
+The remedy is to prove the owner off **before** promoting: once it is powered
+off, `lv host fence-confirm <host>` (a removed host is accepted, see
+docs/migration-failover.md), or an IPMI fence. A promotion made after that
+reattaches the disk. Confirming a removed host also lets the failover
+coordinator, with recovery claims enforced, recover every workload still
+recorded on it, possibly before your promotion runs. A node still on an older
+build answers "not found" for a removed host, so set `LV_HOST` to an upgraded
+node. No command attaches an existing disk at its path to a VM
+already promoted, and re-running `lv replication promote <vm> --force` over a
+partial promotion is not a remedy: it destroys the promoted domain, then
+rebuilds the disks from their replicas (losing what the promoted VM wrote) or
+refuses the root's live file, which is already there.
+
+"Shared" here is one definition, used by this rule and by every shared-disk
+fence check (failover's decision, the promoting host's, the host that starts
+a rescheduled VM, and failover's move of a stopped VM), and by the
+point-in-time overlay sweep: a disk whose storage type is nfs, ceph, rbd or
+iscsi, or whose pool has a shared driver on its own host or the deciding
+host.
+
+It must also be reachable from the promoting host within a few seconds (a
+hung NFS mount is given up on, and the root is promoted without it). A
+renamed promotion never attaches it: the disk belongs to the original VM.
+Whenever it is not attached the VM is promoted exactly as main promoted it,
+and the partial report names it as shared at its path, with why, and either
+the remedy above (`lv host fence-confirm <host>` once it is powered off,
+before promoting, and not to re-run the promotion over this one) or, for a
+renamed promotion, that it belongs to the original and must not be attached
+to the copy.
+
+The `vm.promoted` event is the recovery manifest: every disk and the replica
+it came from, that it was reattached as-is, or why it was not recovered.
+
+A promotion never fails for a disk it cannot recover. Automatic promotion
+recovers at least the root, as it always did. A domain that fails to define
+or start with the other disks is retried with the root alone. When the set is
+incomplete the VM is marked **partial**:
+
+- the set is incomplete when a disk has no replica (or none within the bound),
+  is on storage replication does not copy, has a replica that could not be
+  built, failed the domain, or comes from an earlier run than the root's;
+- a `vm.promoted_partial` event and a `replication.promoted_partial`
+  notification name each such disk and where its real disk is (on the failed
+  host, whose record still names it, or on shared storage);
+- the marker is durable: the health condition `vm.promoted_partial` (evaluator
+  `replica_set`), shown by `lv inspect <vm>` as `promotedPartial` until a later
+  promotion recovers the whole set or the VM is deleted (a VM re-created
+  under the name never inherits it). There is no command to resolve a health
+  condition by hand.
+
+A disk not recovered is not attached; attach or restore it once its host is
+back. A file already where a disk's live disk would go (a crashed earlier
+attempt's, say) is left alone, and the live disk is built beside it. A
+crash-recovered promotion counts another disk only when the domain it adopts
+has that disk.
+
+After a successful automatic promotion the failover coordinator records the
+disks the VM ran on, on the failed host — the real, newer data of every disk —
+as it does for a reschedule (`vm.failover.disk_stranded`, condition
+`vm_disk_stranded`): that host sets them aside when it returns and keeps them
+while the VM exists (`lv host superseded-disks <host>`).
+
+During a rolling upgrade a promotion executed by a host on an older build
+recovers the root disk alone, as that build always did.
 
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in

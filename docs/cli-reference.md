@@ -126,7 +126,7 @@ lv host rotate-gossip-key                 # Replace the gossip key everywhere, l
   [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
   [--ssh-user root]
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
-lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
+lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence (or removed) host
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
 lv host superseded-disks <host>           # List the disk copies a failover set aside

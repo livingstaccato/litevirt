@@ -126,20 +126,40 @@ destination's daemon reads it from there.
 
 Every define of a domain sets a **fresh** password: a create, a redefine on
 update, a restore, a clone, a failover define, or the target of a cold
-migration. The running guest keeps the password it started with, and the new
-one takes effect at its next start. A VM that is already running when
+migration. A redefine of a domain from its own definition (a snapshot revert, a
+point-in-time snapshot repair, a boot-order change) keeps the password it has.
+The running guest keeps the password it started with, and the new one takes
+effect at its next start. A VM that is already running when
 passwords come into force has none until its next define or start. Until then
 its console is open as before, and the proxy relays it unchanged.
 
 Passwords are set only when `enforcement.console_password` is on (the default)
-**and** the `console_password_v1` capability has latched. It latches once every
+**and** the `console_password_v1` capability has latched. Until it latches,
+litevirt neither sets nor removes a console password (one an operator gave an
+imported domain stays as it was). It latches once every
 host, including a maintenance host still receiving replication, runs a build
 that can present a password. An older daemon relays the RFB stream raw, so a
 passworded guest migrated onto it would have a console nobody could open. A
 console opened through an older host acting only as a relay keeps working,
 because the VM's own host does the authentication. Setting
-`console_password: false` on a host makes its next define of each domain drop
-the passwords.
+`console_password: false` on a host (after the latch) makes its next define of
+each domain drop the passwords, the redefines above included.
+
+**A host that cannot do VNC passwords.** VNC authentication is DES, which a
+FIPS-mode host's QEMU does not have, so QEMU refuses to start a guest whose VNC
+console has a password. litevirt never lets that fail a start, a failover or a
+migration:
+
+- At startup the daemon asks its own QEMU (a password-protected display on a
+  private socket, `-machine none`). A host that cannot sets no VNC passwords;
+  SPICE keeps its own. It logs why, and reports `console_password_v1` in
+  `PingResponse.not_enforcing`.
+- A live migration onto such a host moves the guest without its VNC password
+  (the target says so when the source prepares it); the guest arrives with an
+  open VNC console.
+- If QEMU still refuses a start for its console password, the daemon redefines
+  the domain without its console passwords, starts it once more, logs it, and
+  sets no VNC passwords from then on.
 
 Limits:
 
@@ -150,8 +170,14 @@ Limits:
   on the host, who can read the domain definition anyway. SPICE passwords are
   24 characters.
 - A direct VNC client over an SSH tunnel (`ssh -L ...:127.0.0.1:<port>`) now
-  meets a password prompt. Use the web UI, or as root on the host read the
-  password with `virsh dumpxml --security-info <vm>`.
+  meets a password prompt. Use `lv vnc <vm> --listen 127.0.0.1:5900` instead:
+  it opens that port on your machine, carries each connection to the console
+  through the daemon (the web UI's path, authorized as you with `vm.console`),
+  and your viewer needs no password and no SSH to the host. `lv vnc <vm>` says
+  when a password is required. Root on the host can also read it with
+  `virsh dumpxml --security-info <vm>`.
+- A VNC console configured with TLS or SASL in `qemu.conf` (`vnc_tls`,
+  `vnc_sasl`) cannot be opened through the console proxy; the error names it.
 - An `lv` binary older than this release does not print or pass on the SPICE
   password, so `lv spice` from it opens a client that prompts for a password.
   Upgrade the CLI.

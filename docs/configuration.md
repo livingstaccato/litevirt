@@ -453,9 +453,13 @@ enforcement:
                               # present a password), so a VM running when it latches picks
                               # it up at its next define or start. The token is advertised
                               # on the build, not this flag: presenting is unconditional,
-                              # so no host relies on a peer's flag. An explicit false is the
-                              # kill switch: this host's next define of each domain drops
-                              # its passwords. See ui.md "Console passwords".
+                              # so no host relies on a peer's flag. Before the latch nothing
+                              # is set or removed. An explicit false is the kill switch:
+                              # this host's next define (or revert/repair redefine) of each
+                              # domain drops its passwords. A host whose QEMU cannot do VNC
+                              # passwords (FIPS mode) sets none, keeps SPICE ones, never fails
+                              # a start over them, and reports console_password_v1 in
+                              # not_enforcing. See ui.md "Console passwords".
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

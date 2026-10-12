@@ -1395,7 +1395,15 @@ already running keeps an open console until then. `enforcement.console_password`
 says, because presenting a password does not depend on it, so a host with the
 flag off still opens every passworded console and only stops setting new
 passwords. A binary rolled back below the latched token enters WAL quarantine,
-as below every latched token. Roll forward.
+as below every latched token. It also cannot present a password, so every
+passworded guest on that host has a console nobody can open (the guests
+themselves keep running). Roll forward; if you must run the older build, set
+`enforcement.console_password: false` on every host first and restart each
+guest, so their next start has no password.
+
+A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
+passwords, takes incoming live migrations without them, and reports
+`console_password_v1` in `not_enforcing`; it never fails a start over one.
 
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 

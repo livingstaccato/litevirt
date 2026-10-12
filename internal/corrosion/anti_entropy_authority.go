@@ -646,6 +646,15 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 	if local.OperationKind != string(OpWorkloadCreate) {
 		return false, nil
 	}
+	// A reaped create operation: the header is tombstoned on both sides and the
+	// incoming step is a tombstone too. It binds no workload to anything, so the
+	// immutable merge decides it — that is how two nodes' concurrent reaps of one
+	// operation converge on one step row (tombstoneTieKeepsLocal). Without this,
+	// each node kept its own step tombstone forever.
+	if local.DeletedAt != "" && inManifest && sourceOp.valid && sourceOp.DeletedAt != "" &&
+		mergeRowIsDeleted(table, row) && sameOperationMergeAuthority(local, sourceOp) {
+		return false, nil
+	}
 	if !inManifest || !sourceOp.valid || sourceOp.DeletedAt != "" || local.DeletedAt != "" ||
 		incomingEpoch != sourceOp.VMOwnerEpoch ||
 		!sameOperationMergeAuthority(local, sourceOp) {

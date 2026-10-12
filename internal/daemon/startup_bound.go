@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Nothing the daemon does before its gRPC server serves may wait on storage
@@ -42,6 +44,34 @@ func awaitStartupStep(name string, bound time.Duration, step func()) bool {
 		slog.Warn("startup: a step that touches storage did not finish in time; it goes on in the background and the daemon starts serving (does an NFS or other network server not answer?)",
 			"step", name, "waited", bound)
 		return false
+	}
+}
+
+// vmReplaceCleanupRetry is how often a cutover cleanup deferred because its
+// storage did not answer is tried again.
+var vmReplaceCleanupRetry = 5 * time.Minute
+
+// resumeVMReplaceCleanups resumes the cutover cleanups a previous process
+// left, and tries again every retry while one was deferred because storage
+// it frees did not answer (storage.IsFSNoAnswer). Any other failure is
+// logged and left to the next start, as before.
+func resumeVMReplaceCleanups(ctx context.Context, r interface {
+	ResumeVMReplaceCleanups(context.Context) error
+}, retry time.Duration) {
+	for {
+		err := r.ResumeVMReplaceCleanups(ctx)
+		if err == nil {
+			return
+		}
+		slog.Warn("cutover: resuming journaled cleanups", "error", err)
+		if !storage.IsFSNoAnswer(err) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retry):
+		}
 	}
 }
 

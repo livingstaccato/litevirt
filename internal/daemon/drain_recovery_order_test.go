@@ -48,6 +48,14 @@ func TestRunLaunchesDrainRecoveryAfterTheStartupBarrier(t *testing.T) {
 		if !ok {
 			return true
 		}
+		// The cutover cleanup resume runs through its retry helper
+		// (startup_bound.go).
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "resumeVMReplaceCleanups" {
+			if _, seen := first["ResumeVMReplaceCleanups"]; !seen {
+				first["ResumeVMReplaceCleanups"] = int(call.Pos())
+			}
+			return true
+		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
 		if !ok {
 			return true

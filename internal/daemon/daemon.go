@@ -1095,12 +1095,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// to free — and nothing else will ever look at it.
 	// In the background: it removes the replaced VM's volumes, which may be on
 	// an NFS pool whose server does not answer, and it is safe at any time
-	// (each cleanup is taken under its VMs' locks and re-read there).
-	go func() {
-		if err := svc.ResumeVMReplaceCleanups(ctx); err != nil {
-			slog.Warn("cutover: resuming journaled cleanups at startup", "error", err)
-		}
-	}()
+	// (each cleanup is taken under its VMs' locks and re-read there). A
+	// cleanup whose storage does not answer is deferred, not run under the
+	// locks, and retried (startup_bound.go).
+	go resumeVMReplaceCleanups(ctx, svc, vmReplaceCleanupRetry)
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
 	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
@@ -2142,7 +2140,7 @@ var statfsFn = syscall.Statfs
 // statfs that failed.
 func poolStatfs(path string, st *syscall.Statfs_t) error {
 	statfs := statfsFn
-	got, err := storage.Bounded("statfs", path, func() (syscall.Statfs_t, error) {
+	got, err := storage.Bounded("statfs (pool)", path, func() (syscall.Statfs_t, error) {
 		var s syscall.Statfs_t
 		err := statfs(path, &s)
 		return s, err

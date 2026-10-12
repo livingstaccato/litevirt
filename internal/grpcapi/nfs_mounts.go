@@ -265,6 +265,10 @@ func (s *Server) recordNFSPoolOutcome(ctx context.Context, name, source, target 
 // the pool is reported degraded while it still runs; tests shorten it.
 var nfsMountSlowAfter = 5 * time.Second
 
+// nfsOutcomeWriteBound bounds the row and condition writes of a mount's
+// outcome, made on a fresh context.
+const nfsOutcomeWriteBound = 10 * time.Second
+
 // OverrideNFSMountSlowAfterForTest sets nfsMountSlowAfter, for tests in other
 // packages. It returns the restore function.
 func OverrideNFSMountSlowAfterForTest(d time.Duration) func() {
@@ -298,7 +302,11 @@ func (s *Server) watchNFSMount(ctx context.Context, pool, source, target, dir st
 		err := fmt.Errorf("a mount of export %s at %s has been running since %s without finishing (does its server answer?); it is given up when its command timeout ends, and retried every %v",
 			source, dir, started.Format(time.RFC3339), NFSMountReconcileInterval)
 		slog.Warn("NFS pool's export is still being mounted; the pool is degraded until it is", "pool", pool, "error", err)
-		s.recordNFSPoolOutcome(ctx, pool, source, target, err)
+		// A fresh, bounded context: the mount's own may be all but spent
+		// (a start waited for nfsMu out of its 45 s).
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nfsOutcomeWriteBound)
+		defer cancel()
+		s.recordNFSPoolOutcome(wctx, pool, source, target, err)
 	}()
 	return func() {
 		close(done)
@@ -528,7 +536,9 @@ func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg st
 	if pool != "" {
 		// The pool's row says so at once, not at the next pass: degraded
 		// with the reason, or active again.
-		s.recordNFSPoolOutcome(context.WithoutCancel(ctx), pool, cfg.Source, cfg.Target, err)
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nfsOutcomeWriteBound)
+		s.recordNFSPoolOutcome(wctx, pool, cfg.Source, cfg.Target, err)
+		cancel()
 	}
 	if err != nil {
 		s.nfsMem.mountFailed(dir, err)

@@ -1792,6 +1792,21 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)
 	}
+	// The row this start was decided from must still be this host's at the
+	// moment the domain boots: a delete can tombstone it in the window above
+	// by replication, without this host's start lease (start_row_gone.go).
+	// What this pass defined is its own, so it is taken back, firmware state
+	// kept; a row merely unreadable is retried next pass. The read is local
+	// and is not cut short by the walk budget: a pass whose budget ran out
+	// here still starts the VM, as it did before this check.
+	if why := r.startRowGone(context.WithoutCancel(ctx), vm.Name); why != "" {
+		releaseHW()
+		slog.Warn("reconciler: not starting the VM — "+why, "vm", vm.Name)
+		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
+			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
+		}
+		return
+	}
 	// A shared disk this host released to another (review c2b) is never
 	// started here again unjudged.
 	releaseGuard, gerr := GuardSharedDiskStart(ctx, r.db, r.dataDir, r.hostName, vm.Name, domXML)
@@ -1848,6 +1863,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
+	// The boot and a replicated tombstone cannot be ordered: look once more.
+	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs)) {
+		return
+	}
 	r.reportSharedWithheld(commitCtx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))
 	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
 

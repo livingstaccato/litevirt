@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -304,6 +305,85 @@ func udp6(sport, dport uint16) []byte {
 	binary.BigEndian.PutUint16(u[2:], dport)
 	binary.BigEndian.PutUint16(u[4:], 8+32)
 	return u
+}
+
+// icmpv6Packet is an exact-length IPv6 packet (hop limit 255) carrying msg as
+// ICMPv6, with a valid checksum: a frame conntrack would call invalid is
+// dropped by the forward chain in enforce mode whatever the guard does, which
+// would make a "dropped" row pass for the wrong reason (lab 1 C).
+func icmpv6Packet(src, dst string, msg []byte) []byte {
+	p := ipv6Exact(src, dst, 58, msg)
+	body := p[40:]
+	body[2], body[3] = 0, 0
+	var sum uint32
+	add := func(b []byte) {
+		for i := 0; i+1 < len(b); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(b[i:]))
+		}
+		if len(b)%2 == 1 {
+			sum += uint32(b[len(b)-1]) << 8
+		}
+	}
+	add(p[8:40]) // source and destination
+	add([]byte{0, 0, byte(len(body) >> 8), byte(len(body)), 0, 0, 0, 58})
+	add(body)
+	for sum > 0xffff {
+		sum = sum&0xffff + sum>>16
+	}
+	binary.BigEndian.PutUint16(body[2:], ^uint16(sum))
+	return p
+}
+
+// routerAdvert is a router advertisement with no options.
+func routerAdvert() []byte {
+	return icmpv6(134, []byte{64, 0, 0x07, 0x08, 0, 0, 0, 0, 0, 0, 0, 0})
+}
+
+// neighborAdvertTLL is a neighbour advertisement for target carrying a target
+// link-layer address option for tll.
+func neighborAdvertTLL(target string, tll net.HardwareAddr) []byte {
+	body := append([]byte{0x20, 0, 0, 0}, net.ParseIP(target).To16()...)
+	body = append(body, 2, 1)
+	return icmpv6(136, append(body, tll...))
+}
+
+var flowNonce atomic.Uint32
+
+// deliveredV6 sends the IPv6 packet pkt from src's port, untagged (vid < 0)
+// or in one 802.1Q tag (VID 0 is a priority tag), and reports whether it came
+// out of to. The packet goes at its exact length (the marker the other cases
+// append would be trimmed, or would count against the guard's ND length cap),
+// so it is told apart by a fresh flow label, which the checksum does not
+// cover, and found by the whole IPv6 packet: a receiving packet socket sees
+// the frame with its tag held outside the data.
+func (l *bridgeLab) deliveredV6(t *testing.T, from, to string, src net.HardwareAddr, vid int, pkt []byte) bool {
+	t.Helper()
+	p := append([]byte(nil), pkt...)
+	n := flowNonce.Add(1)&0xfffff | 0x80000
+	p[1] = p[1]&0xf0 | byte(n>>16)
+	p[2], p[3] = byte(n>>8), byte(n)
+	frame := ether(src, 0x86dd, p)
+	if vid >= 0 {
+		frame = taggedType(src, 0x8100, 0x86dd, p, uint16(vid))
+	}
+	tx := packetSocket(t, from)
+	rx := packetSocket(t, to)
+	ifc, _ := net.InterfaceByName(from)
+	if err := syscall.Sendto(tx, frame, 0, &syscall.SockaddrLinklayer{Ifindex: ifc.Index, Halen: 6}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		k, _, err := syscall.Recvfrom(rx, buf, 0)
+		if err != nil {
+			continue
+		}
+		if bytes.Contains(buf[:k], p) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestKernelChild_GuardDropsSpoofs pushes forged and honest frames through a
@@ -899,6 +979,35 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 		}
 	}
 
+	// The trunk's router advertisements and neighbour discovery on VLAN 100
+	// (lab 1 F3): held to its MAC and to no router role exactly as untagged,
+	// in either mode (a guard drops in observe mode too). VID 0 is no VLAN the
+	// trunk carries, so its confinement drops it before the guard.
+	trLL, _ := eui64LinkLocal(tr.String())
+	trunkV6 := []struct {
+		name           string
+		pkt            []byte
+		untagged, vlan bool
+	}{
+		{"RA", icmpv6Packet(trLL, "ff02::1", routerAdvert()), false, false},
+		{"NS with its own MAC", icmpv6Packet(trLL, "ff02::1:ff00:9", neighborSolicit("2001:db8::9", tr)), true, true},
+		{"NS naming another MAC", icmpv6Packet(trLL, "ff02::1:ff00:9", neighborSolicit("2001:db8::9", foreign)), false, false},
+		{"NA with its own MAC", icmpv6Packet(trLL, "ff02::1", neighborAdvertTLL(trLL, tr)), true, true},
+		{"NA naming another MAC", icmpv6Packet(trLL, "ff02::1", neighborAdvertTLL(trLL, foreign)), false, false},
+	}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		trunkPlan.NICMode = mode
+		apply(trunkPlan)
+		for _, c := range trunkV6 {
+			if got := l.deliveredV6(t, "lvtg0", "lvtg1", tr, -1, c.pkt); got != c.untagged {
+				t.Errorf("trunk, %s: untagged %s: delivered=%v, want %v", mode, c.name, got, c.untagged)
+			}
+			if got := l.deliveredV6(t, "lvtg0", "lvtg1", tr, 100, c.pkt); got != c.vlan {
+				t.Errorf("trunk, %s: VLAN 100 %s: delivered=%v, want %v", mode, c.name, got, c.vlan)
+			}
+		}
+	}
+
 	// A guarded NIC allowed tags with --allow-vlan-tags (not a trunk), on a
 	// plain bridge, receiving port allowed tags too. Its tagged frames are
 	// held to its MAC, ARP sender MAC and ND link-layer option, and not to its
@@ -916,10 +1025,6 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 			Guard: &NICGuard{MAC: am.String(), V4: []string{"10.0.0.0/24"}, ExcludeV4: []string{"10.0.0.1"}}},
 		{NICDev: "lvah1", VMName: "peer", Bridge: "lvab0", AllowVLANTags: true},
 	}}
-	ll := "fe80::5054:ff:fe00:1"
-	nd := func(sll net.HardwareAddr) []byte {
-		return ipv6Exact(ll, "ff02::1:ff00:9", 58, neighborSolicit("2001:db8::9", sll))
-	}
 	euiLL, _ := eui64LinkLocal(am.String())
 	allow := []struct {
 		name  string
@@ -932,8 +1037,6 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 		{"VLAN 10, ARP with its own MAC on another subnet", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.215.0.1", "10.215.0.2"), 10), true},
 		{"VLAN 10, ARP naming another MAC", taggedType(am, 0x8100, 0x0806, arpRequest(foreign, "10.215.0.1", "10.215.0.2"), 10), false},
 		{"VLAN 10, a DHCP server reply", tagged(am, 0x8100, ipv4UDP("10.215.0.1", "255.255.255.255", 67, 68), 10), false},
-		{"VLAN 10, ND naming another MAC", taggedType(am, 0x8100, 0x86dd, nd(foreign), 10), false},
-		{"VLAN 10, ND with its own MAC", taggedType(am, 0x8100, 0x86dd, nd(am), 10), true},
 		{"untagged, an excluded address", ether(am, 0x0800, ipv4UDP("10.0.0.1", "10.0.0.9", 4000, 5000)), false},
 		{"untagged ARP, its own address", ether(am, 0x0806, arpRequest(am, "10.0.0.8", "10.0.0.9")), true},
 		{"untagged ARP, an excluded address", ether(am, 0x0806, arpRequest(am, "10.0.0.1", "10.0.0.9")), false},
@@ -946,11 +1049,11 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 		{"VID 0, ARP probe from 0.0.0.0", taggedType(am, 0x8100, 0x0806, arpRequest(am, "0.0.0.0", "10.0.0.9"), 0), true},
 		{"VID 0, ARP from an excluded address", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.0.0.1", "10.0.0.9"), 0), false},
 		{"VID 0, ARP from an address outside the subnet", taggedType(am, 0x8100, 0x0806, arpRequest(am, "10.0.1.5", "10.0.0.9"), 0), false},
-		{"VID 0, IPv6 from its own link-local", taggedType(am, 0x8100, 0x86dd, ipv6(euiLL, "ff02::1", 17, make([]byte, 8)), 0), true},
-		{"VID 0, IPv6 from a foreign link-local", taggedType(am, 0x8100, 0x86dd, ipv6("fe80::dead:1", "ff02::1", 17, make([]byte, 8)), 0), false},
-		{"VID 0, NA for its own link-local", taggedType(am, 0x8100, 0x86dd, ipv6Exact(euiLL, "ff02::1", 58, neighborAdvert(euiLL)), 0), true},
-		{"VID 0, NA for a foreign link-local", taggedType(am, 0x8100, 0x86dd, ipv6Exact(euiLL, "ff02::1", 58, neighborAdvert("fe80::dead:1")), 0), false},
-		{"VLAN 10, IPv6 from a foreign link-local (unchecked inside a VLAN)", taggedType(am, 0x8100, 0x86dd, ipv6("fe80::dead:1", "ff02::1", 17, make([]byte, 8)), 10), true},
+		// A UDP header with a real length: an all-zero one is conntrack-invalid,
+		// and the forward chain drops it in enforce mode whatever the guard says.
+		{"VID 0, IPv6 from its own link-local", taggedType(am, 0x8100, 0x86dd, ipv6(euiLL, "ff02::1", 17, udp6(4000, 5000)), 0), true},
+		{"VID 0, IPv6 from a foreign link-local", taggedType(am, 0x8100, 0x86dd, ipv6("fe80::dead:1", "ff02::1", 17, udp6(4000, 5000)), 0), false},
+		{"VLAN 10, IPv6 from a foreign link-local (unchecked inside a VLAN)", taggedType(am, 0x8100, 0x86dd, ipv6("fe80::dead:1", "ff02::1", 17, udp6(4000, 5000)), 10), true},
 		{"a lone 802.1ad tag", tagged(am, 0x88a8, udp(5000), 10), false},
 		{"802.1Q inside 802.1Q", tagged(am, 0x8100, udp(5000), 10, 20), false},
 		{"802.1ad outer tag", tagged(am, 0x88a8, udp(5000), 10, 20), false},
@@ -960,6 +1063,48 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	for _, c := range allow {
 		if got := l.deliveredFrom(t, "lvag0", "lvag1", c.frame); got != c.want {
 			t.Errorf("allow-vlan-tags guard: %s: delivered=%v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// Router advertisements and neighbour discovery (lab 1 F3), each sent
+	// untagged, in VLAN 10 and with a priority tag (VID 0), at its exact length
+	// with a valid checksum. The RA and redirect drop, the ND length cap and
+	// the link-layer option checks hold all three; the NA target check holds
+	// untagged and VID 0, and not inside a VLAN, where the addresses are no one's
+	// to know. nft compiles a bare `icmpv6 type` in the bridge family with an
+	// `ether type ip6` check, which a tagged frame (VID 0 included) never
+	// passes: these rows are what catches a rule written that way.
+	ns := func(sll net.HardwareAddr) []byte {
+		return icmpv6Packet(euiLL, "ff02::1:ff00:9", neighborSolicit("2001:db8::9", sll))
+	}
+	na := func(target string, tll net.HardwareAddr) []byte {
+		return icmpv6Packet(euiLL, "ff02::1", neighborAdvertTLL(target, tll))
+	}
+	nonce := []byte{14, 1, 1, 2, 3, 4, 5, 6} // a Nonce option (RFC 3971), ahead of the SLLA
+	smuggled := icmpv6Packet(euiLL, "ff02::1:ff00:9", icmpv6(135, append(append(append([]byte{0, 0, 0, 0},
+		net.ParseIP("2001:db8::9").To16()...), nonce...), append([]byte{1, 1}, foreign...)...)))
+	type v6row struct {
+		name                   string
+		pkt                    []byte
+		untagged, vlan10, vid0 bool
+	}
+	allowV6 := []v6row{
+		{"RA", icmpv6Packet(euiLL, "ff02::1", routerAdvert()), false, false, false},
+		{"NS with its own MAC", ns(am), true, true, true},
+		{"NS naming another MAC", ns(foreign), false, false, false},
+		{"NS smuggling a foreign MAC in a second option", smuggled, false, false, false},
+		{"NA for its own link-local, its own MAC", na(euiLL, am), true, true, true},
+		{"NA naming another MAC", na(euiLL, foreign), false, false, false},
+		{"NA for a foreign link-local", na("fe80::dead:1", am), false, true, false},
+	}
+	for _, c := range allowV6 {
+		for _, tag := range []struct {
+			vid  int
+			want bool
+		}{{-1, c.untagged}, {10, c.vlan10}, {0, c.vid0}} {
+			if got := l.deliveredV6(t, "lvag0", "lvag1", am, tag.vid, c.pkt); got != tag.want {
+				t.Errorf("allow-vlan-tags guard: %s, vid %d (-1 untagged): delivered=%v, want %v", c.name, tag.vid, got, tag.want)
+			}
 		}
 	}
 
@@ -1016,9 +1161,23 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	}
 	for _, c := range allow {
 		// With no table nothing is held, whatever the frame (the doubled and
-		// forged ones go through); the ND frames are exact-length and still pass.
+		// forged ones go through).
 		if !l.deliveredFrom(t, "lvag0", "lvag1", c.frame) {
 			t.Errorf("no table: %s still dropped — the drop above was not the rule's", c.name)
+		}
+	}
+	for _, c := range allowV6 {
+		for _, vid := range []int{-1, 10, 0} {
+			if !l.deliveredV6(t, "lvag0", "lvag1", am, vid, c.pkt) {
+				t.Errorf("no table: allow-vlan-tags %s, vid %d still dropped — the drop above was not the rule's", c.name, vid)
+			}
+		}
+	}
+	for _, c := range trunkV6 {
+		for _, vid := range []int{-1, 100} {
+			if !l.deliveredV6(t, "lvtg0", "lvtg1", tr, vid, c.pkt) {
+				t.Errorf("no table: trunk %s, vid %d still dropped — the drop above was not the rule's", c.name, vid)
+			}
 		}
 	}
 	if !l.deliveredFrom(t, "lvvg0", "lvvg2", hop) {

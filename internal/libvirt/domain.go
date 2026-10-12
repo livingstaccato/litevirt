@@ -46,7 +46,7 @@ func (c *Client) StartDomain(name string) error {
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
-	return startWithConsoleBackstop(c.virt, g, name, c.SetVNCPasswordUnavailable)
+	return startWithConsoleBackstop(c.virt, g, name, c.consoleDecision(), c.SetVNCPasswordUnavailable)
 }
 
 // startDomainGuarded starts name through g.

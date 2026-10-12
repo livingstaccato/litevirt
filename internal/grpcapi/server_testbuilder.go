@@ -108,6 +108,14 @@ func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
 	s.observeOneSelfReportedQuarantine(ctx)
 }
 
+// SetVNCHandshakeTimeoutForTests shortens the bound on a viewer's RFB
+// handshake (package-wide), returning the restore.
+func SetVNCHandshakeTimeoutForTests(d time.Duration) func() {
+	old := vncHandshakeTimeout
+	vncHandshakeTimeout = d
+	return func() { vncHandshakeTimeout = old }
+}
+
 // NotEnforcingTokensForTests is what this server would report in
 // PingResponse.not_enforcing, for a fleet scenario to assert on.
 func (s *Server) NotEnforcingTokensForTests() []string { return s.notEnforcingTokens() }

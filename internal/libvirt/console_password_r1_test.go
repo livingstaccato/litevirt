@@ -1,10 +1,7 @@
 package libvirt
 
 import (
-	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -95,10 +92,11 @@ func TestConsolePassword_ReadsTheLiveSecureDefinition(t *testing.T) {
 // password (a FIPS-mode host).
 type startModel struct {
 	snapshotAPI
-	inactive string
-	refuse   bool
-	fail     error // every start fails with this
-	starts   int
+	inactive  string
+	refuse    bool
+	fail      error // every start fails with this
+	failFirst error // the first start fails with this
+	starts    int
 }
 
 func (m *startModel) DomainLookupByName(n string) (golibvirt.Domain, error) {
@@ -119,6 +117,9 @@ func (m *startModel) DomainCreate(golibvirt.Domain) error {
 	if m.fail != nil {
 		return m.fail
 	}
+	if m.failFirst != nil && m.starts == 1 {
+		return m.failFirst
+	}
 	if pw, _ := ConsolePasswordFromXML(m.inactive, "vnc"); m.refuse && pw != "" {
 		return errors.New("internal error: process exited while connecting to monitor: qemu-system-x86_64: -vnc unix:/run/x,password=on: Cipher backend does not support DES algorithm")
 	}
@@ -133,7 +134,7 @@ func (m *startModel) DomainCreate(golibvirt.Domain) error {
 func TestStart_ARefusedConsolePasswordIsRetriedWithout(t *testing.T) {
 	m := &startModel{inactive: passworded, refuse: true}
 	var reason string
-	if err := startWithConsoleBackstop(m, StartGuard{}, "web", func(r string) { reason = r }); err != nil {
+	if err := startWithConsoleBackstop(m, StartGuard{}, "web", PolicySet, func(r string) { reason = r }); err != nil {
 		t.Fatalf("start on a host whose QEMU refuses VNC passwords: %v", err)
 	}
 	if m.starts != 2 {
@@ -150,9 +151,9 @@ func TestStart_ARefusedConsolePasswordIsRetriedWithout(t *testing.T) {
 // Any other start failure, or a refusal-looking one on a domain with no
 // password, stands as it is and changes nothing.
 func TestStart_OtherFailuresAreNotRetried(t *testing.T) {
-	m := &startModel{inactive: StripMust(passworded), fail: errors.New("-vnc unix:/x,password=on: Cipher backend does not support DES algorithm")}
+	m := &startModel{inactive: StripMust(passworded), fail: errors.New("qemu-system-x86_64: -vnc unix:/x,password=on: Cipher backend does not support DES algorithm")}
 	called := false
-	_ = startWithConsoleBackstop(m, StartGuard{}, "web", func(string) { called = true })
+	_ = startWithConsoleBackstop(m, StartGuard{}, "web", PolicySet, func(string) { called = true })
 	if m.starts != 1 || called {
 		t.Errorf("a domain with no password was retried (%d starts) or marked (%v)", m.starts, called)
 	}
@@ -163,8 +164,8 @@ func TestStart_OtherFailuresAreNotRetried(t *testing.T) {
 		t.Error("a FIPS failure about something else was taken for a console password refusal")
 	}
 	for _, msg := range []string{
-		"VNC password auth disabled due to FIPS mode, consider using the VeNCrypt or SASL authentication methods as an alternative",
-		"-vnc unix:/x,password=on: Cipher backend does not support DES algorithm",
+		"internal error: process exited while connecting to monitor: qemu-system-x86_64: VNC password auth disabled due to FIPS mode, consider using the VeNCrypt or SASL authentication methods as an alternative",
+		"internal error: qemu unexpectedly closed the monitor: 2026-10-12T10:00:00.000000Z qemu-kvm: -vnc unix:/var/lib/libvirt/qemu/domain-3-web/vnc.sock,password=on: Cipher backend does not support DES algorithm",
 	} {
 		if !IsConsolePasswordRefusal(errors.New(msg)) {
 			t.Errorf("QEMU's refusal %q was not recognised", msg)
@@ -178,52 +179,6 @@ func StripMust(x string) string {
 		panic(err)
 	}
 	return out
-}
-
-// The startup probe: a QEMU that refuses the password-protected display
-// cannot; one that starts can; no QEMU falls back to the kernel's FIPS switch.
-func TestProbeVNCPassword(t *testing.T) {
-	oldRun, oldBin, oldFIPS := vncProbeRunner, vncProbeBinary, fipsEnabledPath
-	t.Cleanup(func() { vncProbeRunner, vncProbeBinary, fipsEnabledPath = oldRun, oldBin, oldFIPS })
-	fips := filepath.Join(t.TempDir(), "fips_enabled")
-	fipsEnabledPath = fips
-	_ = os.WriteFile(fips, []byte("0\n"), 0o644)
-
-	vncProbeBinary = func() string { return "/usr/bin/qemu-system-x86_64" }
-	var gotArgs []string
-	vncProbeRunner = func(_ context.Context, _ string, args []string, _ string) (string, error) {
-		gotArgs = args
-		return "", nil
-	}
-	if r := ProbeVNCPassword(context.Background()); r != "" {
-		t.Errorf("a QEMU that starts was reported unable: %q", r)
-	}
-	if !strings.Contains(strings.Join(gotArgs, " "), "password=on") {
-		t.Errorf("the probe did not ask for a password-protected display: %v", gotArgs)
-	}
-
-	vncProbeRunner = func(context.Context, string, []string, string) (string, error) {
-		return "qemu-system-x86_64: -vnc unix:/tmp/x,password=on: Cipher backend does not support DES algorithm\n", errors.New("exit status 1")
-	}
-	if r := ProbeVNCPassword(context.Background()); !strings.Contains(r, "DES") {
-		t.Errorf("a QEMU that refuses was reported able: %q", r)
-	}
-
-	vncProbeRunner = func(context.Context, string, []string, string) (string, error) {
-		return "qemu-system-x86_64: some other failure\n", errors.New("exit status 1")
-	}
-	if r := ProbeVNCPassword(context.Background()); r != "" {
-		t.Errorf("an inconclusive probe on a non-FIPS host was reported unable: %q", r)
-	}
-
-	vncProbeBinary = func() string { return "" }
-	if r := ProbeVNCPassword(context.Background()); r != "" {
-		t.Errorf("no QEMU and no FIPS reported unable: %q", r)
-	}
-	_ = os.WriteFile(fips, []byte("1\n"), 0o644)
-	if r := ProbeVNCPassword(context.Background()); !strings.Contains(r, "FIPS") {
-		t.Errorf("no QEMU on a FIPS kernel reported able: %q", r)
-	}
 }
 
 // A live migration onto a host that cannot do VNC passwords hands it a

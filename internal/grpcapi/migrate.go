@@ -1279,7 +1279,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved, CgroupMode: lv.CgroupMode(),
 		// A live migration onto this host moves a guest without its VNC
 		// password when this QEMU cannot do one (docs/ui.md "Console passwords").
-		VncPasswordUnavailable: s.vncPasswordUnavailable() != ""}
+		VncPasswordUnavailable: s.vncPasswordUnavailableForMigration() != ""}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {

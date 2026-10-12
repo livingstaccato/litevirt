@@ -790,6 +790,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
 	// refused start is still caught by the start backstop.
 	go func() {
+		defer d.virt.MarkVNCProbed()
 		if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {
 			d.virt.SetVNCPasswordUnavailable(reason)
 			slog.Warn("this host cannot give VNC consoles a password; they stay open here (SPICE keeps its own)",

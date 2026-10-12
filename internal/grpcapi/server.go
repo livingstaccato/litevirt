@@ -1529,6 +1529,27 @@ func (s *Server) vncPasswordUnavailable() string {
 	return ""
 }
 
+// vncProbeWaiter lets a target wait for its startup probe
+// (libvirt.Client.WaitVNCProbe).
+type vncProbeWaiter interface {
+	WaitVNCProbe(time.Duration)
+}
+
+// vncProbeWait bounds how long a migration target waits for its startup
+// probe before answering whether it can take a guest's VNC password.
+const vncProbeWait = 5 * time.Second
+
+// vncPasswordUnavailableForMigration is vncPasswordUnavailable for a target
+// being prepared for a live migration: a daemon that has just started waits
+// (briefly) for its probe, so it does not say "can" before it knows and then
+// fail the guest's arrival at its QEMU.
+func (s *Server) vncPasswordUnavailableForMigration() string {
+	if w, ok := s.virt.(vncProbeWaiter); ok {
+		w.WaitVNCProbe(vncProbeWait)
+	}
+	return s.vncPasswordUnavailable()
+}
+
 // wireConsolePasswordPolicy hands the backend ConsolePasswordPolicy, so every
 // DefineDomain on this host — whichever path calls it, the health reconciler's
 // included, since it shares the client — applies it.

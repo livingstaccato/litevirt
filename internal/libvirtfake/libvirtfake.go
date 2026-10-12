@@ -1175,6 +1175,10 @@ func withoutConsolePasswords(x string) string {
 func (f *Fake) stripConsoleForBackstop(name string, cause error) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Only a password litevirt set: before the latch, an operator's stays.
+	if f.consolePolicy == nil || f.consolePolicy() == libvirt.PolicyLeave {
+		return false
+	}
 	x, ok := f.xml[name]
 	if !ok || !libvirt.HasConsolePassword(x) {
 		return false

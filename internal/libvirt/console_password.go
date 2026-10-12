@@ -351,36 +351,65 @@ func (k keepConsolePITAPI) DomainDefineXML(x string) (golibvirt.Domain, error) {
 	return k.pitAPI.DomainDefineXML(x)
 }
 
-// reConsoleRefusalCause and reConsoleRefusalSubject recognise QEMU refusing a
-// console password it cannot do: "VNC password auth disabled due to FIPS
-// mode" (older QEMU), "Cipher backend does not support DES algorithm" on a
-// -vnc ...,password=on (newer). Both must match, so an unrelated FIPS or
-// cipher failure is not mistaken for one.
-var (
-	reConsoleRefusalCause   = regexp.MustCompile(`(?i)fips|\bdes\b|cipher`)
-	reConsoleRefusalSubject = regexp.MustCompile(`(?i)vnc|password`)
-)
+// reQEMUMessage finds each message QEMU wrote ("qemu-system-x86_64: ..." or
+// "qemu-kvm: ..."), to the end of its line, inside whatever libvirt wrapped
+// it in.
+var reQEMUMessage = regexp.MustCompile(`(?:qemu-system-[A-Za-z0-9_]+|qemu-kvm): ([^\n]*)`)
+
+// reConsoleRefusalCause is what QEMU says when it cannot do a console
+// password: "VNC password auth disabled due to FIPS mode" (older QEMU),
+// "Cipher backend does not support DES algorithm" (later).
+var reConsoleRefusalCause = regexp.MustCompile(`(?i)fips|\bdes\b|cipher`)
+
+var reVNCWord = regexp.MustCompile(`(?i)\bvnc\b`)
 
 // IsConsolePasswordRefusal reports whether a domain start failed because
-// QEMU cannot do the console password it was given.
+// QEMU cannot do the console password it was given. It reads only QEMU's own
+// messages, and in each only the text after the option QEMU echoes ("-vnc
+// unix:/…/domain-7-vnc-lab/…,password=on: <message>"): the message must name
+// the cause, and either the option is -vnc or the message names VNC. So a
+// domain or path that happens to contain "vnc" or "des" — a LUKS cipher error
+// on a VM called vnc-lab — is not mistaken for one.
 func IsConsolePasswordRefusal(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	return reConsoleRefusalCause.MatchString(s) && reConsoleRefusalSubject.MatchString(s)
+	for _, m := range reQEMUMessage.FindAllStringSubmatch(err.Error(), -1) {
+		text, vncOption := m[1], false
+		if strings.HasPrefix(text, "-") {
+			opt, msg, ok := strings.Cut(text, ": ")
+			if !ok {
+				continue
+			}
+			vncOption = strings.HasPrefix(opt, "-vnc ")
+			text = msg
+		}
+		if reConsoleRefusalCause.MatchString(text) && (vncOption || reVNCWord.MatchString(text)) {
+			return true
+		}
+	}
+	return false
 }
 
-// startWithConsoleBackstop starts name, and when QEMU refuses the start
-// because it cannot do a console password, redefines the domain without its
-// console passwords, reports why (unavailable), and starts it once more. A
-// host whose QEMU cannot do VNC passwords (FIPS) therefore never fails a start,
-// a failover or a restart because of them: the guest runs with an open
-// console, and the host stops setting VNC passwords. Any other failure, or a
-// domain with no console password, is returned as it is.
-func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, unavailable func(string)) error {
+// startWithConsoleBackstop starts name, and when the start fails because QEMU
+// cannot do the domain's console password — its own message says so, or the
+// kernel is in FIPS mode and the domain has one — redefines the domain
+// without its console passwords, reports why (unavailable), and starts it once
+// more. A host whose QEMU cannot do VNC passwords therefore never fails a
+// start, a failover or a restart because of them: the guest runs with an
+// open console, and the host stops setting VNC passwords.
+//
+// Only a password litevirt set: under PolicyLeave (console_password_v1 not
+// latched) litevirt has set none, and an operator's password on an imported
+// domain is left alone — that start fails as it always did. Any other
+// failure, or a domain with no console password, is returned as it is.
+func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, policy ConsolePolicy, unavailable func(string)) error {
 	err := startDomainGuarded(v, g, name)
-	if err == nil || !IsConsolePasswordRefusal(err) {
+	if err == nil || policy == PolicyLeave {
+		return err
+	}
+	refused := IsConsolePasswordRefusal(err)
+	if !refused && !fipsEnabled() {
 		return err
 	}
 	dom, lerr := v.DomainLookupByName(name)
@@ -398,7 +427,10 @@ func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, unavaila
 	if _, derr := v.DomainDefineXML(stripped); derr != nil {
 		return err
 	}
-	reason := strings.TrimSpace(strings.SplitN(err.Error(), "\n", 2)[0])
+	reason := firstLine(err.Error())
+	if !refused {
+		reason = "the kernel is in FIPS mode and a start with a console password failed: " + reason
+	}
 	slog.Warn("QEMU refused the console password; starting the domain without it, and setting no VNC passwords on this host",
 		"domain", name, "reason", reason)
 	if unavailable != nil {

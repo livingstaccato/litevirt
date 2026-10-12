@@ -1,10 +1,13 @@
 package grpcapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -85,7 +88,7 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
 
-	viewer := &vncViewerStream{stream: stream}
+	viewer := newVNCViewerStream(ctx, stream)
 	if password != "" {
 		// This host offers the viewer security type None and, once the viewer
 		// has picked it, authenticates to the listener itself: the viewer,
@@ -93,34 +96,29 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		// older relay needs no change. The viewer side goes first and is
 		// bounded, so a viewer that stalls never holds an authenticated
 		// listener connection; a refused password reaches a 3.8 viewer as a
-		// failed security result.
+		// failed security result. It runs on this goroutine: nothing that
+		// writes to the stream outlives the handler.
 		var backendErr error
-		hs := make(chan error, 1)
-		go func() {
-			hs <- rfb.ServeNoAuth(viewer, func() error {
-				_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
-				backendErr = rfb.Authenticate(conn, password)
-				_ = conn.SetDeadline(time.Time{})
-				return backendErr
-			})
-		}()
-		timer := time.NewTimer(vncHandshakeTimeout)
-		defer timer.Stop()
-		select {
-		case err := <-hs:
-			if backendErr != nil {
-				slog.Warn("vnc console authentication failed", "vm", vmName, "error", backendErr)
-				return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, backendErr)
-			}
-			if err != nil {
-				return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
-			}
-		case <-timer.C:
+		viewer.setDeadline(time.Now().Add(vncHandshakeTimeout))
+		err := rfb.ServeNoAuth(viewer, func() error {
+			_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
+			backendErr = rfb.Authenticate(conn, password)
+			_ = conn.SetDeadline(time.Time{})
+			return backendErr
+		})
+		viewer.setDeadline(time.Time{})
+		switch {
+		case backendErr != nil:
+			slog.Warn("vnc console authentication failed", "vm", vmName, "error", backendErr)
+			return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, backendErr)
+		case errors.Is(err, errVNCHandshakeTimeout):
 			_ = conn.Close()
 			return status.Errorf(codes.DeadlineExceeded, "the viewer did not complete the VNC handshake within %s", vncHandshakeTimeout)
-		case <-ctx.Done():
+		case err != nil && ctx.Err() != nil:
 			_ = conn.Close()
 			return streamEndError(ctx)
+		case err != nil:
+			return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
 		}
 	}
 
@@ -206,18 +204,80 @@ func (s *Server) vmHasVNCPassword(vmName string) bool {
 // vncViewerStream is the viewer side of a ProxyVNC stream as a byte stream,
 // for the RFB handshake this host runs with the viewer (rfb.ServeNoAuth) and
 // the relay after it.
+//
+// One goroutine (pump) is the stream's only reader; Read takes from it, so a
+// read can give up at a deadline without leaving a Recv behind that a later
+// read would race. The pump ends when the stream does (its context is
+// cancelled when the handler returns).
 type vncViewerStream struct {
-	stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]
-	buf    []byte
+	stream   grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]
+	ctx      context.Context
+	recv     chan vncRecv
+	buf      []byte
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+type vncRecv struct {
+	data []byte
+	err  error
+}
+
+// errVNCHandshakeTimeout is a viewer read that passed its deadline.
+var errVNCHandshakeTimeout = errors.New("the viewer did not answer in time")
+
+func newVNCViewerStream(ctx context.Context, stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) *vncViewerStream {
+	v := &vncViewerStream{stream: stream, ctx: ctx, recv: make(chan vncRecv)}
+	go v.pump()
+	return v
+}
+
+func (v *vncViewerStream) pump() {
+	for {
+		msg, err := v.stream.Recv()
+		r := vncRecv{err: err}
+		if err == nil {
+			r.data = msg.Data
+		}
+		select {
+		case v.recv <- r:
+		case <-v.ctx.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (v *vncViewerStream) setDeadline(t time.Time) {
+	v.mu.Lock()
+	v.deadline = t
+	v.mu.Unlock()
 }
 
 func (v *vncViewerStream) Read(p []byte) (int, error) {
 	for len(v.buf) == 0 {
-		msg, err := v.stream.Recv()
-		if err != nil {
-			return 0, err
+		v.mu.Lock()
+		deadline := v.deadline
+		v.mu.Unlock()
+		var expired <-chan time.Time
+		if !deadline.IsZero() {
+			t := time.NewTimer(time.Until(deadline))
+			defer t.Stop()
+			expired = t.C
 		}
-		v.buf = msg.Data
+		select {
+		case r := <-v.recv:
+			if r.err != nil {
+				return 0, r.err
+			}
+			v.buf = r.data
+		case <-expired:
+			return 0, errVNCHandshakeTimeout
+		case <-v.ctx.Done():
+			return 0, v.ctx.Err()
+		}
 	}
 	n := copy(p, v.buf)
 	v.buf = v.buf[n:]

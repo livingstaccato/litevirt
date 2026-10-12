@@ -37,7 +37,7 @@ var setDiskPatterns = map[string]byte{"root": 0x11, "data1": 0x22, "data2": 0x33
 // replicaSetVM puts VM vm on victim with a root disk and data1..data3, each a
 // qcow2 holding its own pattern, and an auto-promote replication schedule
 // into a "dr" pool on replicaHost. It returns the schedule.
-func replicaSetVM(t *testing.T, c *Cluster, victim, replicaHost *Node, vm string) corrosion.BackupScheduleRecord {
+func replicaSetVM(t *testing.T, c *Cluster, victim, replicaHost *Node, vm string, specOpts ...func(*pb.VMSpec)) corrosion.BackupScheduleRecord {
 	t.Helper()
 	if _, err := exec.LookPath("qemu-io"); err != nil {
 		t.Skip("qemu-io not on PATH")
@@ -67,7 +67,11 @@ func replicaSetVM(t *testing.T, c *Cluster, victim, replicaHost *Node, vm string
 			StorageType: "local", TargetDev: fmt.Sprintf("vd%c", 'a'+i), Bus: "virtio",
 		})
 	}
-	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 256})
+	vmSpec := &pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 256}
+	for _, o := range specOpts {
+		o(vmSpec)
+	}
+	spec, _ := json.Marshal(vmSpec)
 	if err := corrosion.InsertVM(ctx, victim.DB, corrosion.VMRecord{
 		Name: vm, HostName: victim.Name, State: "running", Spec: string(spec), CPUActual: 1, MemActual: 256,
 	}, nil, disks); err != nil {

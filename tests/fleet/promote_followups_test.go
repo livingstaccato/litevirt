@@ -128,11 +128,14 @@ func TestFleet_PartialPromotionThenOnbootLeavesTheSharedDiskOut(t *testing.T) {
 func pbf1Fleet(t *testing.T, clock *VirtualClock, withClaims bool) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
 	setup := func(c *Cluster, a, b, victim *Node) {
-		// The upgrade has finished: pit_overlay is available, so the running
-		// VM's replicas are point-in-time and failover promotes them.
-		latchPITOverlay(t, c)
 		ctx := context.Background()
-		sched := replicaSetVM(t, c, victim, a, "db")
+		// pit_overlay is not latched here (wiring the release gates would arm
+		// the execution gate, which this partitioned fleet cannot satisfy), so
+		// the replicas are not point-in-time: db opts in to their automatic
+		// promotion, and each operator promotion accepts them.
+		sched := replicaSetVM(t, c, victim, a, "db", func(sp *pb.VMSpec) {
+			sp.Labels = map[string]string{corrosion.LabelAutoPromoteNotPointInTime: "true"}
+		})
 		if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-10*time.Minute)); err != nil {
 			t.Fatalf("replicate db to %s: %v", a.Name, err)
 		}
@@ -212,7 +215,7 @@ func TestFleet_OperatorPromoteAndCoordinatorRecoveryNeverBothStartTheVM(t *testi
 			cs.ByNode[b.Name].Promoter = b.Server
 			operator := func() error {
 				st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
-					VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+					VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true, AcceptNotPointInTime: true})
 				if err != nil {
 					return err
 				}
@@ -274,7 +277,7 @@ func TestFleet_AFailedOperatorPromotionLetsTheCoordinatorRecoverTheVM(t *testing
 
 	a.Virt.FailStartDomain = func(string) error { return io.ErrUnexpectedEOF }
 	st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
-		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true, AcceptNotPointInTime: true})
 	if err == nil {
 		for {
 			if _, err = st.Recv(); err != nil {
@@ -332,7 +335,7 @@ func TestFleet_AnAmbiguousOperatorStartFailureIsNeverRecoveredElsewhere(t *testi
 	a.Virt.FailStartDomain = func(string) error { return io.ErrUnexpectedEOF }
 	a.Virt.FailDomainState = func(string) error { return io.ErrUnexpectedEOF }
 	st, err := c.SelfClient(a).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
-		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true})
+		VmName: "db", TargetHost: a.Name, TargetPool: "dr", Force: true, NoLocalize: true, AcceptNotPointInTime: true})
 	if err == nil {
 		for {
 			if _, err = st.Recv(); err != nil {

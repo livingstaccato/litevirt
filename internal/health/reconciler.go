@@ -1757,6 +1757,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	// Whether this VM's UEFI vars were here before this pass defined its
+	// domain: vars a boot creates for a since-deleted record are this pass's
+	// own to remove (start_row_gone.go).
+	nvramBefore := nvramExists(r.dataDir, vm.Name)
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1796,14 +1801,18 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// moment the domain boots: a delete can tombstone it in the window above
 	// by replication, without this host's start lease (start_row_gone.go).
 	// What this pass defined is its own, so it is taken back, firmware state
-	// kept; a row merely unreadable is retried next pass. The read is local
-	// and is not cut short by the walk budget: a pass whose budget ran out
-	// here still starts the VM, as it did before this check.
-	if why := r.startRowGone(context.WithoutCancel(ctx), vm.Name); why != "" {
+	// kept; a row merely unreadable is retried next pass, accounted like
+	// every other retryable failure here. The read is local and is not cut
+	// short by the walk budget: a pass whose budget ran out here still starts
+	// the VM, as it did before this check.
+	if why, unreadable := r.startRowGone(context.WithoutCancel(ctx), vm.Name, fresh.CreatedAt); why != "" {
 		releaseHW()
 		slog.Warn("reconciler: not starting the VM — "+why, "vm", vm.Name)
 		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
 			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
+		}
+		if unreadable {
+			r.failPendingStart(ctx, vm.Name, proofID, true, "not started: "+why)
 		}
 		return
 	}
@@ -1845,6 +1854,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// is a VM the cluster cannot account for, and the reconcile retry only
 	// converges it a tick later — after the budget has already cost the lease.
 	commitCtx := context.WithoutCancel(ctx)
+	// The boot and a replicated tombstone cannot be ordered: look before
+	// anything is published — a running write must not land on a row of
+	// the name created since — and once more after (start_row_gone.go).
+	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs), releaseHW, nvramBefore) {
+		return
+	}
 	if proofID != "" {
 		// Routed through the minting chokepoint, which IS the hand-rolled
 		// write-through this block used to carry — same ordering, one
@@ -1863,8 +1878,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
-	// The boot and a replicated tombstone cannot be ordered: look once more.
-	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs)) {
+	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs), releaseHW, nvramBefore) {
 		return
 	}
 	r.reportSharedWithheld(commitCtx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))

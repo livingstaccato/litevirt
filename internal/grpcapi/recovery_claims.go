@@ -906,7 +906,8 @@ func (s *Server) legacyHeldStill(ctx context.Context, ev legacyHeldEvidence) boo
 // then every coordinator claims the legacy key, so a recovery is never
 // claimed under two keys by two coordinators that disagree about the format.
 func (s *Server) IncarnationScopedClaims(ctx context.Context) bool {
-	return s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.ClaimIncarnationV1)
+	g := s.gateV()
+	return g != nil && g.Enforced(ctx, capabilities.ClaimIncarnationV1)
 }
 
 // ClaimKeyFor is the key a recovery of the workload row whose created_at is

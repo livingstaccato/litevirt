@@ -353,7 +353,8 @@ func (s *Server) sweepLeaseTerm(ctx context.Context, key string) leaseSweepResul
 func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepResult {
 	// Reuse the quorum every other gate in this path uses. Two different quorum
 	// rules inside one failover decision would be a defect in itself.
-	state, _, needed := s.gateV().QuorumProof(ctx)
+	gate := s.gateV()
+	state, _, needed := gate.QuorumProof(ctx)
 	if state != health.QuorumYes {
 		return leaseSweepResult{}
 	}
@@ -362,7 +363,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepRe
 	// that has been down for longer than a probe interval costs nothing here.
 	// What remains is a host that died WITHIN the last interval, which is why
 	// the budget still has to exist.
-	peers := s.gateV().HealthyPeers(ctx)
+	peers := gate.HealthyPeers(ctx)
 
 	sctx, cancel := context.WithTimeout(ctx, leaseBarrierBudget)
 	defer cancel()

@@ -42,10 +42,11 @@ func (s *Server) SetRecoveryClaimEnforce(on bool) { s.enfRecoveryClaim.Store(on)
 // advertisedCapabilities checks it — so an operator can ask "would this node
 // be ready" before turning it on.
 func (s *Server) RecoveryClaimReadiness(ctx context.Context) (bool, string) {
-	if s.gateV() == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return false, "no split-brain gate is wired on this node"
 	}
-	if !s.gateV().Latched(capabilities.SplitBrainGateV1) {
+	if !gate.Latched(capabilities.SplitBrainGateV1) {
 		return false, capabilities.SplitBrainGateV1 + " has not latched; a claim certificate rides on a runtime-action proof"
 	}
 	if ok, why := s.VoterConfigReadiness(ctx); !ok {
@@ -222,7 +223,7 @@ func (s *Server) RecoveryClaimGateForPendingProof(ctx context.Context, pr corros
 // Coordinators and destinations read this one predicate, so the two halves of
 // the decision cannot disagree on one node.
 func (s *Server) RecoveryClaimEnforced(ctx context.Context) bool {
-	if !s.enfRecoveryClaim.Load() || s.gateV() == nil || !s.gateV().Enforced(ctx, capabilities.RecoveryClaimV1) {
+	if g := s.gateV(); !s.enfRecoveryClaim.Load() || g == nil || !g.Enforced(ctx, capabilities.RecoveryClaimV1) {
 		return false
 	}
 	cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)

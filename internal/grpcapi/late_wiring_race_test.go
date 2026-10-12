@@ -10,7 +10,7 @@ import (
 // (SetReplicator -> SetAdvertisedCapabilities) while a fleet test wires the
 // gate and the enforcement flags on the already-running server. Under -race a
 // plain field behind either setter is a data race; this flips each setter while
-// DeclaredCapabilities is read.
+// DeclaredCapabilities and notEnforcingTokens (the Ping handler) are read.
 func TestLateWiringIsSafeAgainstDeclaredCapabilities(t *testing.T) {
 	s := testServer(t)
 	stop := make(chan struct{})
@@ -24,6 +24,7 @@ func TestLateWiringIsSafeAgainstDeclaredCapabilities(t *testing.T) {
 				return
 			default:
 				_ = s.DeclaredCapabilities()
+				_ = s.notEnforcingTokens()
 			}
 		}
 	}()
@@ -35,6 +36,21 @@ func TestLateWiringIsSafeAgainstDeclaredCapabilities(t *testing.T) {
 		s.SetProjectAuthorityEnforce(on)
 		s.SetEnforcementConfig(on, on, on, on, on, on)
 		s.SetGate(fakeServerGate{enforced: on})
+		s.SetOperationProtocol(on)
+		s.SetNetBoxIPAM(on)
+		s.SetNetBoxMirrorInventory(on)
+		s.SetVMReplaceEnforce(on)
+		s.SetCanonicalIdentityEnforce(on)
+		s.SetAuditSignatureEnforce(on)
+		s.SetLeaseTermEnforce(on)
+		s.SetIsolationEpochEnforce(on)
+		s.SetLiveResize(on)
+		s.SetStrictMTLSIdentity(on)
+		s.SetForwardedIdentity(on)
+		s.SetRBACRealm(on)
+		s.SetPartitionPause(on)
+		s.SetLeaseTermReady(func() bool { return on })
+		s.SetOwnerEpochReady(func() bool { return on })
 	}
 	close(stop)
 	wg.Wait()

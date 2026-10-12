@@ -218,22 +218,22 @@ func TestPing_WithholdsPostureFromANonHostCertificate(t *testing.T) {
 // notEnforcingTokens returns empty. Set directly rather than through the
 // setters: the point is to reach the empty-list state, not to model a config.
 func enforceEveryToken(s *Server) {
-	s.enfAuditSignature = true
-	s.enfCanonicalIdentity = true
-	s.enfHLCLww = true
-	s.enfIsolationEpoch = true
-	s.enfLiveResize = true
-	s.enfLWWSkew = true
-	s.enfOperationProtocol = true
+	s.enfAuditSignature.Store(true)
+	s.enfCanonicalIdentity.Store(true)
+	s.enfHLCLww.Store(true)
+	s.enfIsolationEpoch.Store(true)
+	s.enfLiveResize.Store(true)
+	s.enfLWWSkew.Store(true)
+	s.enfOperationProtocol.Store(true)
 	s.enfOwnerEpoch.Store(true)
 	s.enfProjectAuthority.Store(true)
-	s.enfSafeFence = true
+	s.enfSafeFence.Store(true)
 	s.enfSharedStorageFence.Store(true)
-	s.enfVIPProofReclaim = true
-	s.enfVIPSelfDemote = true
-	s.forwardedIdentity = true
-	s.rbacRealm = true
-	s.strictMTLSIdentity = true
+	s.enfVIPProofReclaim.Store(true)
+	s.enfVIPSelfDemote.Store(true)
+	s.forwardedIdentity.Store(true)
+	s.rbacRealm.Store(true)
+	s.strictMTLSIdentity.Store(true)
 }
 
 // TestPostureFromPing_OldPeerSilenceIsUnknown pins how a peer that predates the

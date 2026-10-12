@@ -196,13 +196,14 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		// the degraded set comes from it, and for EVERY supported token rather
 		// than only the configured ones — a token that was degraded and is then
 		// switched off must fall to 0 rather than keep its last value forever.
-		if s.gateV() != nil {
+		gate := s.gateV()
+		if gate != nil {
 			degraded := make(map[string]bool, len(unsupported))
 			for _, c := range unsupported {
 				degraded[c.Token] = true
 			}
 			for _, tok := range capabilities.Supported() {
-				s.haMetrics.SetEnforcement(tok, s.tokenEnabled(tok), s.gateV().Latched(tok))
+				s.haMetrics.SetEnforcement(tok, s.tokenEnabled(tok), gate.Latched(tok))
 				s.haMetrics.SetDegraded(tok, degraded[tok])
 			}
 		}
@@ -310,8 +311,9 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 // the lease-term mint) would fail closed forever.
 func (s *Server) retryLatchedMarkers(ctx context.Context) {
 	for _, tok := range capabilities.Supported() {
-		if s.gateV().Latched(tok) {
-			s.gateV().Enforced(ctx, tok)
+		gate := s.gateV()
+		if gate.Latched(tok) {
+			gate.Enforced(ctx, tok)
 		}
 	}
 }
@@ -345,7 +347,8 @@ func (s *Server) activateOneUnlatched(ctx context.Context) bool {
 	for i := 0; i < len(toks); i++ {
 		idx := (start + i) % len(toks)
 		tok := toks[idx]
-		if s.gateV().Latched(tok) || !s.tokenEnabled(tok) {
+		gate := s.gateV()
+		if gate.Latched(tok) || !s.tokenEnabled(tok) {
 			continue
 		}
 		// Resume AFTER this token next cycle, so one that never confirms is
@@ -354,7 +357,7 @@ func (s *Server) activateOneUnlatched(ctx context.Context) bool {
 		s.capDriveCursor = (idx + 1) % len(toks)
 		s.capHealthMu.Unlock()
 
-		s.gateV().Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
+		gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
 		return true
 	}
 	return false
@@ -407,7 +410,8 @@ func (s *Server) spendCapabilityPeerOp(ctx context.Context) {
 // driveCapabilityActivation had no unlatched token to drive, so the cycle spends at most
 // one peer op total.
 func (s *Server) checkOneCapabilityHealth(ctx context.Context) {
-	if s.gateV() == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return
 	}
 	var toks []string
@@ -434,7 +438,7 @@ func (s *Server) checkOneCapabilityHealth(ctx context.Context) {
 	// ReasonActivationUnconfirm at three (a hosts-table read failing, any
 	// voting-eligible peer's Ping erroring). Collapsing them means one host
 	// rebooting is reported as a capability a peer does not support.
-	ok, why := s.gateV().CapabilityActiveForHealth(ctx, tok)
+	ok, why := gate.CapabilityActiveForHealth(ctx, tok)
 	s.capHealthMu.Lock()
 	if s.capHealthCause == nil {
 		s.capHealthCause = map[string]string{}
@@ -479,7 +483,8 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 	// an operator reading a quarantine as version skew; naming tokens here would
 	// make the node itself commit that error.
 	quarantined := s.walQuarantinedNow()
-	if s.gateV() != nil && !quarantined {
+	gate := s.gateV()
+	if gate != nil && !quarantined {
 		for _, tok := range capabilities.Supported() {
 			// Only a token this node is configured to ENFORCE can be "degraded" —
 			// an advertised-but-disabled token (or one still mid-rollout on old
@@ -492,7 +497,7 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 			// recently found it unsupported/unreachable (a POST-latch regression the
 			// durable marker can't reflect). No fan-out here — we only read cheap
 			// in-memory state; the freshness Ping is the bounded one-per-cycle check.
-			latched := s.gateV().Latched(tok)
+			latched := gate.Latched(tok)
 			s.capHealthMu.Lock()
 			lastOK, checked := s.capHealthLast[tok]
 			cause := s.capHealthCause[tok]
@@ -553,7 +558,7 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 	// no transfer), so surface it persistently for operator repair rather than leave it a
 	// silent per-tick warn. (Repair is operator-driven / a future coordinator re-mint; the
 	// row no longer carries the source host, so an automatic safe re-mint isn't derivable.)
-	if s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.SplitBrainGateV1) && s.anyStrandedPending(ctx) {
+	if g := gate; g != nil && g.Enforced(ctx, capabilities.SplitBrainGateV1) && s.anyStrandedPending(ctx) {
 		out[haStrandedPending] = true
 	}
 	// This binary is a rollback below a token this node already latched, so it is
@@ -693,12 +698,13 @@ func (s *Server) hostClaimsVIP(ctx context.Context, host, vip string) bool {
 // quarantined is self-incriminating, which is the one direction worth trusting:
 // a node lying about its state claims health, not degradation.
 func (s *Server) recordSelfReportedIsolation(ctx context.Context) {
-	if !s.tokenEnabled(capabilities.IsolationEpochV1) || s.gateV() == nil {
+	gate := s.gateV()
+	if !s.tokenEnabled(capabilities.IsolationEpochV1) || gate == nil {
 		return
 	}
 	// Quorum-gated: a partitioned minority must not be able to quarantine the
 	// majority it simply cannot see.
-	if r := s.gateV().DecisionGate(ctx); !r.OK {
+	if r := gate.DecisionGate(ctx); !r.OK {
 		return
 	}
 	s.observeOneSelfReportedQuarantine(ctx)

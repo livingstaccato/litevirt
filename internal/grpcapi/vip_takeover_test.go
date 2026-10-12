@@ -31,15 +31,14 @@ func TestVIPMove_InertUntilFlipped(t *testing.T) {
 // even when the VIPReleaseProbeV1 capability is enforced cluster-wide (redeploy-free
 // stand-down). Mirrors the safe_fence kill-switch test.
 func TestVIPProofReclaim_KillSwitch(t *testing.T) {
-	s := &Server{
-		hostName:           "self",
-		enfVIPProofReclaim: false,                          // kill-switch OFF
-		gate:               fakeServerGate{enforced: true}, // capability latched cluster-wide
-		removeLBFromHost:   func(context.Context, string, string) error { return nil },
+	s := withVIPProofReclaim(&Server{
+		hostName:         "self",
+		gate:             fakeServerGate{enforced: true}, // capability latched cluster-wide
+		removeLBFromHost: func(context.Context, string, string) error { return nil },
 		probeHolder: func(context.Context, string, string) holderStatus {
 			return holderStatus{reachable: true, assigned: true} // still holds
 		},
-	}
+	}, false)
 	if s.vipGateActive(context.Background()) {
 		t.Fatal("config flag off must keep the gate inert even with the capability enforced")
 	}
@@ -57,15 +56,14 @@ func TestVIPMove_TransitionPredicate(t *testing.T) {
 		"released":    {reachable: true, assigned: false},
 	}
 	newS := func() *Server {
-		return &Server{
-			hostName:           "self",
-			vipGateFlipped:     func() bool { return true }, // activate the gate for the test
-			enfVIPProofReclaim: true,
-			removeLBFromHost:   func(context.Context, string, string) error { return nil }, // stand-down "succeeds"
+		return withVIPProofReclaim(&Server{
+			hostName:         "self",
+			vipGateFlipped:   func() bool { return true },                                // activate the gate for the test
+			removeLBFromHost: func(context.Context, string, string) error { return nil }, // stand-down "succeeds"
 			probeHolder: func(_ context.Context, host, _ string) holderStatus {
 				return statuses[host]
 			},
-		}
+		}, true)
 	}
 	ctx := context.Background()
 
@@ -99,15 +97,14 @@ func TestVIPMove_TransitionPredicate(t *testing.T) {
 // still-holding removed holder; flipping Enforced=true activates it.
 func TestVIPMove_UsesClusterLatch(t *testing.T) {
 	newS := func(enforced bool) *Server {
-		return &Server{
-			hostName:           "self",
-			enfVIPProofReclaim: true,                               // config kill-switch on
-			gate:               fakeServerGate{enforced: enforced}, // no vipGateFlipped seam → real path
-			removeLBFromHost:   func(context.Context, string, string) error { return nil },
+		return withVIPProofReclaim(&Server{
+			hostName:         "self",
+			gate:             fakeServerGate{enforced: enforced}, // no vipGateFlipped seam → real path
+			removeLBFromHost: func(context.Context, string, string) error { return nil },
 			probeHolder: func(context.Context, string, string) holderStatus {
 				return holderStatus{reachable: true, assigned: true} // still holds
 			},
-		}
+		}, true)
 	}
 	ctx := context.Background()
 
@@ -125,17 +122,16 @@ func TestVIPMove_UsesClusterLatch(t *testing.T) {
 // refuse — bringing up a new VRRP claimant beside an unreachable-but-maybe-live holder
 // risks dual-master (adverts unseen). No holder is removed here (pure add).
 func TestVIPMove_AddWhileExistingUnreachableRefuses(t *testing.T) {
-	s := &Server{
-		hostName:           "self",
-		vipGateFlipped:     func() bool { return true },
-		enfVIPProofReclaim: true,
+	s := withVIPProofReclaim(&Server{
+		hostName:       "self",
+		vipGateFlipped: func() bool { return true },
 		probeHolder: func(_ context.Context, host, _ string) holderStatus {
 			if host == "a" {
 				return holderStatus{reachable: false} // existing holder unreachable
 			}
 			return holderStatus{reachable: true, assigned: false}
 		},
-	}
+	}, true)
 	// old=[a], new=[a,b] — adding b as a backup while a (still first/master) is unreachable.
 	if _, refused := s.vipMoveRefused(context.Background(), "lb", "10.0.0.1", "10.0.0.1", []string{"a"}, []string{"a", "b"}, true, true); !refused {
 		t.Fatal("adding a participant while an existing one is unreachable must refuse")
@@ -155,10 +151,9 @@ func TestVIPMove_AddWhileExistingUnreachableRefuses(t *testing.T) {
 func TestVIPMove_MasterChangeStandsDownOldMaster(t *testing.T) {
 	var stoodDown []string
 	newS := func(oldMasterReleased bool) *Server {
-		return &Server{
-			hostName:           "self",
-			vipGateFlipped:     func() bool { return true },
-			enfVIPProofReclaim: true,
+		return withVIPProofReclaim(&Server{
+			hostName:       "self",
+			vipGateFlipped: func() bool { return true },
 			removeLBFromHost: func(_ context.Context, _, host string) error {
 				stoodDown = append(stoodDown, host)
 				return nil
@@ -169,7 +164,7 @@ func TestVIPMove_MasterChangeStandsDownOldMaster(t *testing.T) {
 				}
 				return holderStatus{reachable: true, assigned: false}
 			},
-		}
+		}, true)
 	}
 	ctx := context.Background()
 
@@ -192,15 +187,14 @@ func TestVIPMove_MasterChangeStandsDownOldMaster(t *testing.T) {
 // keepalived is inert, so it could still become VRRP master and re-claim the VIP —
 // even though its kernel currently reports the VIP absent.
 func TestVIPMove_StandDownFailureRefuses(t *testing.T) {
-	s := &Server{
-		hostName:           "self",
-		vipGateFlipped:     func() bool { return true },
-		enfVIPProofReclaim: true,
-		removeLBFromHost:   func(context.Context, string, string) error { return errors.New("unreachable") },
+	s := withVIPProofReclaim(&Server{
+		hostName:         "self",
+		vipGateFlipped:   func() bool { return true },
+		removeLBFromHost: func(context.Context, string, string) error { return errors.New("unreachable") },
 		probeHolder: func(context.Context, string, string) holderStatus {
 			return holderStatus{reachable: true, assigned: false} // VIP absent right now
 		},
-	}
+	}, true)
 	if _, refused := s.vipMoveRefused(context.Background(), "lb", "10.0.0.1", "10.0.0.1", []string{"old"}, []string{"new"}, true, true); !refused {
 		t.Fatal("a removed holder that can't be stood down must refuse (keepalived not confirmed inert)")
 	}
@@ -218,17 +212,16 @@ func TestVIPMove_EmptyOldResolvesActualParticipants(t *testing.T) {
 		if !vipFree {
 			holders = []string{"someone"}
 		}
-		return &Server{
+		return withVIPProofReclaim(&Server{
 			hostName:               "self",
 			vipGateFlipped:         func() bool { return true },
-			enfVIPProofReclaim:     true,
 			removeLBFromHost:       func(context.Context, string, string) error { return nil },
 			lbParticipantsOverride: func(context.Context, string) ([]string, bool) { return participants, ok },
 			vipHoldersOverride:     func(context.Context, string) ([]string, bool) { return holders, true },
 			probeHolder: func(context.Context, string, string) holderStatus {
 				return holderStatus{reachable: true, assigned: true} // resolved participant still holds it
 			},
-		}
+		}, true)
 	}
 	ctx := context.Background()
 
@@ -276,7 +269,7 @@ func TestUpdateLoadBalancer_VIPAndHostChange_ReleasesOldVIP(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
 	s.removeLBFromHost = func(context.Context, string, string) error { return nil }
 	s.vipHoldersOverride = func(context.Context, string) ([]string, bool) { return nil, true } // new VIP free
@@ -323,7 +316,7 @@ func TestUpdateLoadBalancer_VIPOnlyChangeImplicitLBNotTornDown(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
 	s.vipHoldersOverride = func(context.Context, string) ([]string, bool) { return nil, true } // new VIP free
 	// An existing implicit participant resolves here.
@@ -358,7 +351,7 @@ func TestCreateLoadBalancer_RefusedWhenVIPHeldElsewhere(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.vipHoldersOverride = func(context.Context, string) ([]string, bool) {
 		return []string{"leftover-host"}, true // VIP still assigned somewhere
 	}
@@ -384,7 +377,7 @@ func TestUpdateLoadBalancer_VIPChangeRequiresClaimProof(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.vipHoldersOverride = func(context.Context, string) ([]string, bool) {
 		return []string{"holds-new-vip"}, true // the NEW VIP is assigned somewhere
 	}
@@ -412,7 +405,7 @@ func TestCreateLoadBalancer_AllowedWhenVIPFree(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil } // no real haproxy
 	s.vipHoldersOverride = func(context.Context, string) ([]string, bool) {
 		return nil, true // VIP unassigned everywhere
@@ -460,17 +453,16 @@ func TestVIPMove_RowGoneUnknownOldVipProvesNewVip(t *testing.T) {
 		if newVipClaimed {
 			holders = []string{"elsewhere"}
 		}
-		return &Server{
+		return withVIPProofReclaim(&Server{
 			hostName:               "self",
 			vipGateFlipped:         func() bool { return true },
-			enfVIPProofReclaim:     true,
 			removeLBFromHost:       func(context.Context, string, string) error { return nil },
 			lbParticipantsOverride: func(context.Context, string) ([]string, bool) { return []string{"stale-h"}, true },
 			vipHoldersOverride:     func(context.Context, string) ([]string, bool) { return holders, true },
 			probeHolder: func(context.Context, string, string) holderStatus {
 				return holderStatus{reachable: true, assigned: false}
 			},
-		}
+		}, true)
 	}
 	ctx := context.Background()
 
@@ -501,7 +493,7 @@ func TestUpdateLoadBalancer_TakeoverRefusesRemovedHolder(t *testing.T) {
 
 	s.vipGateFlipped = func() bool { return true } // pretend the token is advertised
 
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.removeLBFromHost = func(context.Context, string, string) error { return nil }
 	s.probeHolder = func(_ context.Context, host, _ string) holderStatus {
 		if host == "old-holder" {
@@ -536,7 +528,7 @@ func TestUpdateLoadBalancer_TakeoverAllowedWhenReleased(t *testing.T) {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	s.probeHolder = func(context.Context, string, string) holderStatus {
 		return holderStatus{reachable: true, assigned: false} // released
 	}
@@ -560,7 +552,7 @@ func TestUpdateLoadBalancer_BackendOnlyEditNotGated(t *testing.T) {
 	ctx := adminCtx()
 	s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	// If these run, the gate is (wrongly) active for a no-host-change edit → fail loudly.
 	s.lbParticipantsOverride = func(context.Context, string) ([]string, bool) {
 		t.Fatal("gate must NOT resolve participants for a backend-only edit (req.Hosts empty)")
@@ -678,7 +670,7 @@ func TestUpdateLoadBalancer_AddHolderNotRefused(t *testing.T) {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
 	s.vipGateFlipped = func() bool { return true }
-	s.enfVIPProofReclaim = true
+	s.enfVIPProofReclaim.Store(true)
 	// Every configured holder currently holds the VIP (would trip a snapshot gate).
 	s.probeHolder = func(context.Context, string, string) holderStatus {
 		return holderStatus{reachable: true, assigned: true}

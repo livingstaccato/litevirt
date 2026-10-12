@@ -62,6 +62,9 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			if format == "" {
 				format = "qcow2"
 			}
+			// Until the catalog row is written, no file of the image is
+			// removed as a deleted image's (holdImagePublish).
+			defer s.holdImagePublish(name)()
 
 			destDir := filepath.Join(s.dataDir, "images")
 			os.MkdirAll(destDir, 0755)
@@ -496,6 +499,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "hash image: %v", err)
 	}
+	defer s.holdImagePublish(req.ImageName)() // until the catalog row is written
 	s.recordImageProvenance(ctx, req.ImageName)
 	pub, err := s.images.Publish(req.ImageName, destPath, digest)
 	if err != nil {

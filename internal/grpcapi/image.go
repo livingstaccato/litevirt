@@ -55,6 +55,15 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// published as a new version for new disks, and the file existing disks
 	// are built on is never written over (image.Store.Publish). The files
 	// already here keep their provenance from before this pull's records.
+	// Until its catalog row is written, no file of the image is removed as a
+	// deleted image's (holdImagePublish): the row may still read deleted.
+	release := s.holdImagePublish(req.Name)
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			release()
+		}
+	}()
 	s.recordImageProvenance(stream.Context(), req.Name)
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
@@ -90,7 +99,9 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// Start the download in a goroutine. Use a detached context so the
 	// pull completes even if the client disconnects (#17).
 	errCh := make(chan error, 1)
+	handedOff = true
 	go func() {
+		defer release()
 		pub, pullErr := image.PullPublished(s.images, req.Name, req.SourceUrl, req.Checksum, s.imagePullOptions(), progressCh)
 		errCh <- pullErr
 		if pullErr != nil {
@@ -240,6 +251,17 @@ func (s *Server) DeleteImage(ctx context.Context, req *pb.DeleteImageRequest) (*
 	}
 	if err := corrosion.DeleteImage(ctx, s.db, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete image: %v", err)
+	}
+	// The image's files go too, on every host where nothing uses them, in the
+	// background: this call (the REST and web UI delete, an older lv image rm)
+	// has nowhere to report them, so each host's outcome is logged here, and
+	// lv image prune on a host removes what was kept once it is unused.
+	if safename.ValidateImageName(req.Name) == nil {
+		s.imagePrune.bg.Add(1)
+		go func() {
+			defer s.imagePrune.bg.Done()
+			s.removeImageFiles(context.WithoutCancel(ctx), req.Name)
+		}()
 	}
 	return &emptypb.Empty{}, nil
 }

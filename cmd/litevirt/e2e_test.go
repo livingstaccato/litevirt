@@ -11,7 +11,9 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -62,6 +64,9 @@ type mockClient struct {
 	undrainedHost string
 	removedHost   string
 	rescannedHost string
+
+	// removeImageUnimplemented makes RemoveImage answer as an older serving host.
+	removeImageUnimplemented bool
 }
 
 func newMockClient() *mockClient {
@@ -303,6 +308,24 @@ func (m *mockClient) ListImages(_ context.Context, _ *emptypb.Empty, _ ...grpc.C
 func (m *mockClient) DeleteImage(_ context.Context, in *pb.DeleteImageRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.deletedImage = in.Name
 	return &emptypb.Empty{}, nil
+}
+
+// RemoveImage is lv image rm on a current serving host: the delete, and
+// each host's removal. With removeImageUnimplemented it answers as an older
+// serving host does, and lv image rm falls back to DeleteImage.
+func (m *mockClient) RemoveImage(_ context.Context, in *pb.RemoveImageRequest, _ ...grpc.CallOption) (*pb.RemoveImageResponse, error) {
+	if m.removeImageUnimplemented {
+		return nil, status.Error(codes.Unimplemented, "unknown method RemoveImage")
+	}
+	m.deletedImage = in.Name
+	f := "/var/lib/litevirt/images/" + in.Name + "@0123456789abcdef.qcow2"
+	return &pb.RemoveImageResponse{
+		Hosts: []*pb.PruneImagesResponse{
+			{HostName: "node-a", Removed: []string{f}, RemovesDeletedImages: true},
+			{HostName: "node-b", Kept: []*pb.KeptImageFile{{Path: f, Reason: "VM web on host node-b was created from it"}}, RemovesDeletedImages: true},
+		},
+		Failed: []*pb.RemoveImageHostError{{HostName: "node-c", Error: "host node-c runs an older build with no image prune; its files are kept"}},
+	}, nil
 }
 func (m *mockClient) ImportImage(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.ImportImageRequest, pb.ImportImageResponse], error) {
 	return nil, nil
@@ -1019,6 +1042,21 @@ func TestE2E_ImageOperations(t *testing.T) {
 	if mock.deletedImage != "debian-12" {
 		t.Errorf("expected delete debian-12, got %s", mock.deletedImage)
 	}
+	assertContains(t, out, "node-a: removed /var/lib/litevirt/images/debian-12@0123456789abcdef.qcow2")
+	assertContains(t, out, "node-b: kept /var/lib/litevirt/images/debian-12@0123456789abcdef.qcow2: VM web on host node-b was created from it")
+	assertContains(t, out, "node-c: not removed: host node-c runs an older build")
+
+	// An older serving host has no RemoveImage: the delete still happens.
+	mock.deletedImage, mock.removeImageUnimplemented = "", true
+	out, _, err = runCmd(t, mock, "image", "rm", "debian-12")
+	if err != nil {
+		t.Fatalf("image rm against an older host: %v", err)
+	}
+	assertContains(t, out, "older build")
+	if mock.deletedImage != "debian-12" {
+		t.Errorf("against an older host: expected delete debian-12, got %q", mock.deletedImage)
+	}
+	mock.removeImageUnimplemented = false
 
 	// Build image
 	out, _, err = runCmd(t, mock, "image", "build", "web-1", "--name", "golden-web")

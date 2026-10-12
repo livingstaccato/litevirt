@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -178,18 +181,56 @@ func newImageImportCmd() *cobra.Command {
 func newImageRmCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rm <image>",
-		Short: "Delete an image",
-		Args:  cobra.ExactArgs(1),
+		Short: "Delete an image and remove its files where nothing uses them",
+		Long: "Deletes the image from the catalog, then removes its files on every host " +
+			"where no disk, VM, backup, staged file or running process uses them. " +
+			"A file that is kept is listed with the reason.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				_, err := c.DeleteImage(ctx, &pb.DeleteImageRequest{Name: args[0]})
+				resp, err := c.RemoveImage(ctx, &pb.RemoveImageRequest{Name: args[0]})
+				if status.Code(err) == codes.Unimplemented {
+					// An older serving host: the catalog delete only.
+					if _, err := c.DeleteImage(ctx, &pb.DeleteImageRequest{Name: args[0]}); err != nil {
+						return fmt.Errorf("delete image: %w", err)
+					}
+					fmt.Printf("Image %s deleted\n", args[0])
+					fmt.Println("The serving host runs an older build: the image's files were not removed here. " +
+						"lv image prune on an upgraded host removes them there.")
+					return nil
+				}
 				if err != nil {
 					return fmt.Errorf("delete image: %w", err)
 				}
 				fmt.Printf("Image %s deleted\n", args[0])
+				printImageRemoval(os.Stdout, args[0], resp)
 				return nil
 			})
 		},
+	}
+}
+
+// printImageRemoval prints each host's part of lv image rm: the files it
+// removed, the files it kept and why, and the hosts that were not asked.
+func printImageRemoval(w io.Writer, name string, resp *pb.RemoveImageResponse) {
+	for _, h := range resp.GetHosts() {
+		for _, f := range h.Removed {
+			fmt.Fprintf(w, "%s: removed %s\n", h.HostName, f)
+		}
+		for _, k := range h.Kept {
+			fmt.Fprintf(w, "%s: kept %s: %s\n", h.HostName, k.Path, k.Reason)
+		}
+		if !h.RemovesDeletedImages {
+			fmt.Fprintf(w, "%s: runs an older build that keeps a deleted image's current file\n", h.HostName)
+		}
+	}
+	for _, f := range resp.GetFailed() {
+		fmt.Fprintf(w, "%s: not removed: %s\n", f.HostName, f.Error)
+	}
+	if len(resp.GetFailed()) > 0 || slices.ContainsFunc(resp.GetHosts(), func(h *pb.PruneImagesResponse) bool {
+		return len(h.Kept) > 0 || !h.RemovesDeletedImages
+	}) {
+		fmt.Fprintf(w, "Kept files stay until nothing uses them; then lv image prune %s --host <host> removes them.\n", name)
 	}
 }
 
@@ -276,7 +317,7 @@ func newImagePruneCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "prune [image]",
-		Short: "Remove image versions no disk on the host is built on",
+		Short: "Remove image versions, and deleted images' files, nothing on the host uses",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := ""
@@ -294,6 +335,9 @@ func newImagePruneCmd() *cobra.Command {
 				}
 				for _, f := range resp.Removed {
 					fmt.Printf("%s: %s %s\n", resp.HostName, verb, f)
+				}
+				for _, k := range resp.Kept {
+					fmt.Printf("%s: kept %s: %s\n", resp.HostName, k.Path, k.Reason)
 				}
 				fmt.Printf("%s: %s %d file(s), %d bytes\n", resp.HostName, verb, len(resp.Removed), resp.FreedBytes)
 				return nil

@@ -632,10 +632,36 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   not mounted or a backup repo that cannot be read refuses the prune,
 #   saying which. A refresh prunes the image's older unused versions by
 #   itself, in the background, keeping the one it superseded.
+#   A deleted image (lv image rm) has no current version to keep: prune
+#   removes all its files, under the rules lv image rm lists below, and
+#   lists each one it keeps with the reason.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls
 lv image rm <image>
+#   Deletes the image from the catalog, then asks every host to remove its
+#   files of the image, the current one too. Each host judges only its own
+#   files and removes one only when nothing keeps it:
+#     - a disk, staged disk (a restore, import or replica in progress), backup
+#       base or other image this host can see is built on it, or it is pinned;
+#     - a VM anywhere in the cluster records the image: a disk built on it, or
+#       a VM created from it (a failover, recreate or migration onto this host
+#       may need this host's copy) — so while any VM records it, every host
+#       keeps its copy;
+#     - a disk recorded on this host cannot be read here, a staging directory
+#       cannot be read, or the image store is on a network filesystem (nfs,
+#       cifs, ceph, fuse, ...) that other hosts may share;
+#     - a process holds it open (a running qemu);
+#     - a disk create, pull or import of the image is in flight.
+#   The last check and the removal are one step against a create of the image:
+#   a create that begins afterwards finds no file. Each kept file is printed
+#   with its reason; once nothing uses it, lv image prune <image> --host <host>
+#   removes it. A host that cannot be reached, or runs an older build, keeps
+#   its files and is named. A host waits up to 15 seconds for the delete to
+#   replicate to it; one that still shows the image (or where it was pulled
+#   again) keeps the file. The delete itself is never refused. The REST and
+#   web UI delete (DeleteImage) removes the files the same way, in the
+#   background, and logs each host's outcome.
 ```
 
 `pull` and `import` accept only standalone images. A qcow2 that names a

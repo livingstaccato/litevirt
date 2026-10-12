@@ -848,10 +848,26 @@ message ImportImageResponse { string name = 1; int64 size_bytes = 2;
     string checksum = 3; }
 message PushImageRequest   { string name = 1; string target_host = 2; }
 // PruneImagesRequest removes, on one host, the image-store files no disk there
-// is built on (each image's current file is always kept). name empty: every
-// image. host_name empty: the host serving the call.
-message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3; }
-message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3; }
+// is built on. Each image's current file is kept, unless the image's catalog
+// row is deleted (lv image rm): then its current file goes too, when nothing
+// anywhere uses it. name empty: every image. host_name empty: the host serving
+// the call. deleted_image: the caller has just deleted image name; the host
+// waits (bounded) for its own catalog to show the delete before it decides.
+// An older host ignores it and keeps the current file.
+message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3;
+    bool deleted_image = 4; }
+// kept: each file of a deleted image the host kept, and why.
+// removes_deleted_images: the host's build removes a deleted image's current
+// file (false from an older build, which always keeps it).
+message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3;
+    repeated KeptImageFile kept = 4; bool removes_deleted_images = 5; }
+message KeptImageFile { string path = 1; string reason = 2; }
+message RemoveImageRequest { string name = 1; }
+// hosts: each host's outcome; failed: the hosts that could not be asked, and
+// why (their files are kept; lv image prune removes them later).
+message RemoveImageResponse { repeated PruneImagesResponse hosts = 1;
+    repeated RemoveImageHostError failed = 2; }
+message RemoveImageHostError { string host_name = 1; string error = 2; }
 message PushImageProgress  { string status = 1; float progress_pct = 2;
     string error = 3; }
 message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
@@ -4191,6 +4207,10 @@ service LiteVirt {
     rpc PushImage(PushImageRequest)            returns (stream PushImageProgress);
     rpc BuildImage(BuildImageRequest)          returns (BuildImageResponse);
     rpc PruneImages(PruneImagesRequest)        returns (PruneImagesResponse);
+    // RemoveImage deletes an image (as DeleteImage) and then removes its files
+    // on every host where nothing uses them, reporting each host's outcome:
+    // lv image rm.
+    rpc RemoveImage(RemoveImageRequest)        returns (RemoveImageResponse);
 
     // ── Backup ──
     rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);

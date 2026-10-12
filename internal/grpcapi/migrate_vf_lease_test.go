@@ -148,7 +148,7 @@ func TestRecoverDeviceLeases_AfterACutoverReleasesTheSourceVFs(t *testing.T) {
 	j := r.withLeaseJournal(t)
 	ctx := adminCtx()
 	for _, a := range r.vfs {
-		if err := r.s.detachHostdevIfPresent("vf-vm", a); err != nil {
+		if err := r.s.detachHostdevIfPresent(context.Background(), "vf-vm", a); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -188,7 +188,7 @@ func TestRecoverDeviceLeases_AMigrationLeaseIsKeptWhenTheGuestCannotBeRead(t *te
 	r := vfMigrationRig(t, "0000:41:10.0")
 	j := r.withLeaseJournal(t)
 	for _, a := range r.vfs {
-		if err := r.s.detachHostdevIfPresent("vf-vm", a); err != nil {
+		if err := r.s.detachHostdevIfPresent(context.Background(), "vf-vm", a); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -305,7 +305,7 @@ func TestAdoptAbandonedMigration_ACutoverReleasesTheSourceVFs(t *testing.T) {
 	}
 	var detached []corrosion.PCIDeviceRecord
 	for _, a := range r.vfs {
-		if err := r.s.detachHostdevIfPresent("vf-vm", a); err != nil {
+		if err := r.s.detachHostdevIfPresent(context.Background(), "vf-vm", a); err != nil {
 			t.Fatal(err)
 		}
 		detached = append(detached, corrosion.PCIDeviceRecord{HostName: "test-host", Address: a, Type: "net", VendorID: "8086", VMName: "vf-vm"})

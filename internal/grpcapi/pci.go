@@ -1066,8 +1066,12 @@ func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs 
 	// later pass retry.
 	switch mode {
 	case reclaimLive:
+		// Runs in startup device-lease recovery, inside the startup barrier. A
+		// paused guest is refused without a wait (detachHostdevIfPresent), and the
+		// first device that times out ends the loop, leaving the rest for the
+		// next pass.
 		for _, addr := range reclaimable {
-			if derr := s.detachHostdevIfPresent(vmName, addr); derr != nil {
+			if derr := s.detachHostdevIfPresent(ctx, vmName, addr); derr != nil {
 				return fmt.Errorf("pci reclaim: guest-detach %s from %q: %w", addr, vmName, derr)
 			}
 		}

@@ -37,7 +37,13 @@ import (
 // waited for, re-requesting the unplug (waitDeviceGone), as waitPCILiveGone does
 // on the journaled path. Every read FAILS CLOSED: an unreadable copy is never
 // taken as absent.
-func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
+//
+// The wait runs under ctx, so a cancelled RPC stops it. A guest that cannot
+// acknowledge an unplug at all — paused or pm-suspended — is refused at once
+// rather than waited on, which matters most in startup device-lease recovery,
+// where each wait would hold the startup barrier: the device stays owned and
+// bound, and the retry path picks it up once the guest runs.
+func (s *Server) detachHostdevIfPresent(ctx context.Context, vmName, addr string) error {
 	live, err := s.liveHostdevPresent(vmName, addr)
 	if err != nil {
 		return err
@@ -49,6 +55,15 @@ func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
 	if !live && !persistent {
 		return nil // already detached from both — nothing to do
 	}
+	if live {
+		st, err := s.virt.DomainStateReason(vmName)
+		if err != nil {
+			return fmt.Errorf("read %s's state before the unplug: %w", vmName, err)
+		}
+		if st.State != "running" && (st.Reason == "paused" || st.Reason == "pmsuspended") {
+			return fmt.Errorf("%s is %s and cannot acknowledge the unplug of hostdev %s; left for a retry once it runs", vmName, st.Reason, addr)
+		}
+	}
 	if err := s.virt.DetachHostdev(vmName, addr); err != nil {
 		return err
 	}
@@ -58,7 +73,7 @@ func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
 	if persistent {
 		return fmt.Errorf("hostdev %s is still in %s's persistent definition after the detach", addr, vmName)
 	}
-	_, err = waitDeviceGone(context.Background(), func() (bool, error) {
+	_, err = waitDeviceGone(ctx, func() (bool, error) {
 		present, rerr := s.liveHostdevPresent(vmName, addr)
 		return !present, rerr
 	}, func() error { return s.virt.DetachHostdev(vmName, addr) })
@@ -414,7 +429,7 @@ func (s *Server) rollbackLegacyPCIAttach(ctx context.Context, vmName string, att
 	//      rather than clearing it. The safety invariant (a stuck member stays owned + bound,
 	//      never unowned + bound) holds regardless; an operator retry/detach also converges it.
 	for _, a := range attachedAddrs {
-		if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
+		if derr := s.detachHostdevIfPresent(ctx, vmName, a); derr != nil {
 			slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease marked rollback_incomplete",
 				"vm", vmName, "address", a, "error", derr)
 			s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
@@ -497,7 +512,7 @@ func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string)
 	// guest and a bare DetachHostdev would error ("device not found") and return before
 	// re-attempting the release. detachHostdevIfPresent skips the already-gone detach (and
 	// fails closed on a DumpXML error) so control falls through to the idempotent release.
-	if err := s.detachHostdevIfPresent(vmName, pciAddress); err != nil {
+	if err := s.detachHostdevIfPresent(ctx, vmName, pciAddress); err != nil {
 		return nil, status.Errorf(codes.Internal, "detach PCI device %s: %v", pciAddress, err)
 	}
 

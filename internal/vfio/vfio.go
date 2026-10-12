@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -32,11 +33,23 @@ const (
 	// HostDriversFileName is the per-host record, in the daemon's data
 	// directory, of the driver each device was on before Bind took it: a JSON
 	// object of PCI address → driver. "" means the device had no driver, and
-	// "vfio-pci" that it was already on vfio-pci (the operator's vfio-pci.ids=).
+	// "vfio-pci" that it was already on vfio-pci (the operator's vfio-pci.ids=
+	// or driverctl), and legacyBind that an older build bound it.
 	// It is host-local hardware state and is never replicated.
 	HostDriversFileName = "vfio-host-drivers.json"
 
 	vfioDriver = "vfio-pci"
+
+	// legacyBind is the record entry for a device an OLDER litevirt build bound
+	// (found on vfio-pci with driver_override=vfio-pci and no record). It is not a
+	// driver name: it marks the one case in which the release may remove a
+	// vfio-pci dynamic ID, since that build added one with new_id. It is written
+	// before the release clears the override, which erases that evidence.
+	legacyBind = "(older-litevirt-bind)"
+
+	// driverctlDir holds driverctl's persistent overrides, one pci-<address>
+	// file per device, naming the driver it binds at boot.
+	driverctlDir = "/etc/driverctl.d"
 )
 
 // SysFS abstracts sysfs filesystem operations for testability.
@@ -97,10 +110,10 @@ func Unbind(address, restoreDriver string) error { return HostAt("").Unbind(addr
 //
 // The previous driver is recorded first. A device already on vfio-pci with no
 // override set was put there by the operator (vfio-pci.ids=, or a tool that
-// binds by ID): it is recorded as "vfio-pci", and its release leaves it there.
-// One already on vfio-pci WITH driver_override=vfio-pci was bound by an
-// override-setter, an older litevirt build most likely, so nothing is recorded
-// and its release falls back to the restore driver or a reprobe.
+// binds by ID), or one driverctl pins there: it is recorded as "vfio-pci", and
+// its release leaves it there. One already on vfio-pci WITH
+// driver_override=vfio-pci and no driverctl pin was bound by an older litevirt
+// build, so nothing is recorded and its release identifies it (legacyBind).
 //
 // It claims the device through driver_override alone, set BEFORE the host
 // driver is unbound so a probe in between can only pick vfio-pci. It never
@@ -127,7 +140,11 @@ func (h *Host) Bind(address string) (previousDriver string, err error) {
 			if err != nil {
 				return "", fmt.Errorf("read driver_override of %s: %w", address, err)
 			}
-			if ov == "" {
+			// No override: bound by ID (the operator's vfio-pci.ids=). An override
+			// driverctl re-applies at boot: the operator's pin. Either way the
+			// device belongs on vfio-pci. (A device carrying litevirt's legacy
+			// marker is already recorded and never lands here.)
+			if ov == "" || (ov == vfioDriver && driverctlPinsVFIO(address)) {
 				if err := h.record(address, vfioDriver); err != nil {
 					return "", err
 				}
@@ -232,20 +249,27 @@ func (h *Host) restoreAfterFailedBind(devPath, address, previousDriver string) (
 
 // Unbind removes a device from vfio-pci and returns it to its host driver.
 //
-//  1. A device recorded as already on vfio-pci before Bind (the operator's) is
-//     left there: the release succeeds without touching it.
+//  1. The operator's devices are left on vfio-pci and the release succeeds
+//     untouched: one recorded as already on vfio-pci before Bind, one driverctl
+//     pins to vfio-pci, and — with no record — one on vfio-pci with NO override
+//     (bound by ID; every older litevirt bind set the override). A device with
+//     no record and driver_override=vfio-pci is an older litevirt build's: that
+//     fingerprint is recorded (legacyBind) before the override is cleared. A
+//     recorded host driver yields when the operator's ids= now names the device.
 //  2. Clear driver_override (with "\n", see clearOverride) and read it back. If
 //     it is still set, stop with the device still on vfio-pci.
 //  3. Unbind from vfio-pci.
 //  4. With a recorded driver, bind it explicitly, and a failure is the answer:
-//     no reprobe. With a record of no driver, reprobe. With no record (a device
-//     an older build bound), bind restoreDriver explicitly with a reprobe as
-//     fallback, or reprobe when it names nothing usable ("" or "vfio-pci", which
-//     is what the inventory holds once a rescan saw the device bound).
+//     no reprobe. With a record of no driver, reprobe. For an older build's
+//     device, bind restoreDriver explicitly with a reprobe as fallback, or
+//     reprobe when it names nothing usable ("" or "vfio-pci", which is what the
+//     inventory holds once a rescan saw the device bound).
 //  5. Read the driver back. Landing on vfio-pci with the override clear means a
-//     dynamic vfio-pci ID matched it (releaseFromDynamicID). NO driver is an
-//     error when a driver was named, and accepted when none was: a host with no
-//     driver for the device never had one.
+//     dynamic vfio-pci ID matched it. Only for an older build's device, whose
+//     new_id it may be, is that ID removed (releaseFromDynamicID); otherwise
+//     someone else chose vfio-pci and the device stays. NO driver is an error
+//     when a driver was named, and accepted when none was: a host with no driver
+//     for the device never had one.
 func (h *Host) Unbind(address, restoreDriver string) error {
 	devPath := filepath.Join(sysDevices, address)
 
@@ -261,6 +285,49 @@ func (h *Host) Unbind(address, restoreDriver string) error {
 	// 1. The operator's vfio-pci device stays where the operator put it.
 	if recorded && rec == vfioDriver {
 		slog.Info("device was on vfio-pci before litevirt bound it; leaving it there", "address", address)
+		return h.forget(address)
+	}
+	if current == vfioDriver && driverctlPinsVFIO(address) {
+		slog.Info("device is pinned to vfio-pci by driverctl; leaving it there", "address", address)
+		return h.forget(address)
+	}
+
+	// With no record, the override says who bound the device. Every older
+	// litevirt Bind set driver_override=vfio-pci (with a new_id it never
+	// removed); a device on vfio-pci with NO override was bound by ID, by the
+	// operator or by hand, and is left there. The older build's fingerprint is
+	// persisted before step 2 clears the override, so a release that fails after
+	// the clear cannot later be mistaken for the operator's device.
+	if !recorded && current == vfioDriver {
+		ov, err := readOverride(devPath)
+		if err != nil {
+			return fmt.Errorf("read driver_override of %s: %w", address, err)
+		}
+		if ov == "" {
+			slog.Warn("device is on vfio-pci with no override and no record: bound by ID, not by litevirt; leaving it there", "address", address)
+			return nil
+		}
+		if ov == vfioDriver {
+			if err := h.record(address, legacyBind); err != nil {
+				return err
+			}
+			rec, recorded = legacyBind, true
+		}
+	}
+	legacy := recorded && rec == legacyBind
+	hostDriver := ""
+	if recorded && !legacy {
+		hostDriver = rec
+	}
+
+	// A recorded host driver yields to the operator's configuration: a device
+	// whose ID the operator has since given vfio-pci (ids= and a reboot) stays.
+	if hostDriver != "" && current == vfioDriver && operatorClaims(devPath) {
+		if err := clearDriverOverride(devPath, address); err != nil {
+			return err
+		}
+		slog.Info("device's ID is now in the operator's vfio-pci ids=; leaving it on vfio-pci instead of its recorded driver",
+			"address", address, "recorded", hostDriver)
 		return h.forget(address)
 	}
 
@@ -281,14 +348,14 @@ func (h *Host) Unbind(address, restoreDriver string) error {
 	}
 
 	// 4. Return the device to a host driver.
-	want := rec
+	want := hostDriver
 	switch {
-	case recorded && rec != "":
-		bindPath := filepath.Join("/sys/bus/pci/drivers", rec, "bind")
+	case hostDriver != "":
+		bindPath := filepath.Join("/sys/bus/pci/drivers", hostDriver, "bind")
 		if err := sysfs.WriteFile(bindPath, []byte(address), 0200); err != nil {
-			return fmt.Errorf("restore %s to its recorded host driver %s: %w (not reprobing, which could hand it to any matching driver)", address, rec, err)
+			return fmt.Errorf("restore %s to its recorded host driver %s: %w (not reprobing, which could hand it to any matching driver)", address, hostDriver, err)
 		}
-	case recorded:
+	case recorded && !legacy:
 		if err := sysfs.WriteFile(driversProbePath, []byte(address), 0200); err != nil {
 			return fmt.Errorf("reprobe %s: %w", address, err)
 		}
@@ -308,6 +375,12 @@ func (h *Host) Unbind(address, restoreDriver string) error {
 		return fmt.Errorf("unbind %s: cannot read the driver back: %w", address, err)
 	}
 	if final == vfioDriver {
+		if !legacy {
+			// A dynamic ID litevirt did not add (this build never writes new_id):
+			// someone chose vfio-pci for this ID, so it stays.
+			slog.Warn("a reprobe gave the device to vfio-pci by a dynamic ID litevirt did not add; leaving it there", "address", address)
+			return h.forget(address)
+		}
 		if final, err = h.releaseFromDynamicID(devPath, address, want); err != nil {
 			return fmt.Errorf("unbind %s: verification failed — still bound to vfio-pci: %w", address, err)
 		}
@@ -391,6 +464,26 @@ func (h *Host) releaseFromDynamicID(devPath, address, want string) (string, erro
 	return final, nil
 }
 
+// driverctlPinsVFIO reports whether driverctl pins the device at address to
+// vfio-pci: /etc/driverctl.d/pci-<address> names the driver whose override
+// driverctl re-applies at every boot. Any read error is "not pinned".
+func driverctlPinsVFIO(address string) bool {
+	b, err := sysfs.ReadFile(filepath.Join(driverctlDir, "pci-"+address))
+	return err == nil && strings.TrimSpace(string(b)) == vfioDriver
+}
+
+// operatorClaims reports whether the operator's vfio-pci ids= names the device
+// at devPath. A configuration that cannot be read claims nothing.
+func operatorClaims(devPath string) bool {
+	vendor := strings.TrimPrefix(readTrimmed(filepath.Join(devPath, "vendor")), "0x")
+	device := strings.TrimPrefix(readTrimmed(filepath.Join(devPath, "device")), "0x")
+	if vendor == "" || device == "" {
+		return false
+	}
+	ids, err := operatorVfioIDs()
+	return err == nil && ids[strings.ToLower(vendor+" "+device)]
+}
+
 // modprobeDirs are where modprobe reads options from, in its own order.
 var modprobeDirs = []string{"/etc/modprobe.d", "/run/modprobe.d", "/usr/local/lib/modprobe.d", "/usr/lib/modprobe.d", "/lib/modprobe.d"}
 
@@ -465,6 +558,13 @@ func (h *Host) ReleaseUnbound(address string) error {
 		return nil // bound: Unbind's job
 	}
 	ov, err := readOverride(devPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		// The device is gone from sysfs (a VF that did not come back after a
+		// reboot, a pulled card): nothing is left to clear, and the release goes
+		// ahead as it always did.
+		slog.Info("released device is no longer present; nothing to clear", "address", address)
+		return h.forget(address)
+	}
 	if err != nil {
 		return fmt.Errorf("read driver_override of %s: %w", address, err)
 	}
@@ -474,7 +574,7 @@ func (h *Host) ReleaseUnbound(address string) error {
 	}
 	stale := ov == vfioDriver
 	hostDriver := ""
-	if recorded && rec != vfioDriver {
+	if recorded && rec != vfioDriver && rec != legacyBind {
 		hostDriver = rec
 	}
 	if !stale && hostDriver == "" {

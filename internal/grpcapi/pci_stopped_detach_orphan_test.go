@@ -2,9 +2,11 @@ package grpcapi
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -35,6 +37,16 @@ type pciUnbindRecordingFS struct {
 	onUnbind   func(addr string) // fired once per unbind (at the driver/unbind write), if set
 	native     map[string]string // address -> the host driver whose own ID table matches it
 	host       map[string]string // address -> the host (non-vfio) driver currently bound
+	absent     map[string]bool   // address -> gone from sysfs (a VF that did not come back, a pulled card)
+}
+
+// setAbsent removes addr from sysfs: every read under it is ENOENT.
+func (f *pciUnbindRecordingFS) setAbsent(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.absent[addr] = true
+	f.bound[addr] = false
+	f.host[addr] = ""
 }
 
 func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
@@ -47,6 +59,7 @@ func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
 		vf:         map[string]bool{},
 		native:     map[string]string{},
 		host:       map[string]string{},
+		absent:     map[string]bool{},
 	}
 }
 
@@ -142,6 +155,9 @@ func (f *pciUnbindRecordingFS) ReadFile(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/driver_override") {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if f.absent[f.devAddr(path, "/driver_override")] {
+			return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.ENOENT}
+		}
 		if f.override[f.devAddr(path, "/driver_override")] {
 			return []byte("vfio-pci\n"), nil
 		}

@@ -206,7 +206,7 @@ func TestAdoptAbandonedMigration_AFailureReattachesTheVFs(t *testing.T) {
 	// Where MigrateVM leaves things when libvirt takes over: VFs detached and
 	// released, the row `migrating`.
 	for _, a := range r.vfs {
-		if err := r.s.detachHostdevIfPresent("vf-vm", a); err != nil {
+		if err := r.s.detachHostdevIfPresent(context.Background(), "vf-vm", a); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.s.unbindAndReleaseOwnership(ctx, "vf-vm", []string{a}); err != nil {

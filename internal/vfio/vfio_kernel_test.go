@@ -2,6 +2,7 @@ package vfio
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +45,23 @@ type kernelFS struct {
 	// stickyOverride makes every override write a no-op, to model a kernel that
 	// does not honour the clear at all.
 	stickyOverride bool
+	// absent models a device that is gone from sysfs (a VF that did not come back
+	// after a reboot, a pulled card): every path under it is ENOENT.
+	absent bool
+}
+
+func (k *kernelFS) gone(path string) error {
+	if k.absent && strings.HasPrefix(path, k.devPath()+"/") {
+		return &fs.PathError{Op: "open", Path: path, Err: syscall.ENOENT}
+	}
+	return nil
+}
+
+func (k *kernelFS) Readlink(path string) (string, error) {
+	if err := k.gone(path); err != nil {
+		return "", err
+	}
+	return k.memFS.Readlink(path)
 }
 
 func newKernelFS(addr, native, bound, override string, loaded ...string) *kernelFS {
@@ -91,6 +109,9 @@ func (k *kernelFS) wrote(suffix string) bool {
 }
 
 func (k *kernelFS) ReadFile(path string) ([]byte, error) {
+	if err := k.gone(path); err != nil {
+		return nil, err
+	}
 	if path == k.devPath()+"/driver_override" {
 		if k.override == "" {
 			return []byte("(null)\n"), nil
@@ -104,6 +125,9 @@ func (k *kernelFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	k.log = append(k.log, path+"="+string(data))
 	if k.onWrite != nil {
 		k.onWrite(path)
+	}
+	if err := k.gone(path); err != nil {
+		return err
 	}
 	if err := k.memFS.WriteFile(path, data, perm); err != nil {
 		return err // injected failure
@@ -581,5 +605,170 @@ func TestHost_ReleaseUnboundLeavesACleanDeviceAlone(t *testing.T) {
 	}
 	if len(k.log) != 0 {
 		t.Fatalf("ReleaseUnbound wrote %v to a clean device", k.log)
+	}
+}
+
+// ── Round 2 ──
+
+// TestHost_ReleaseUnboundOfAVanishedDeviceReleasesIt (re-review R1-I1): a device
+// that is gone from sysfs — a VF that did not come back after a reboot, a pulled
+// card — has nothing to clear. Its release must succeed and drop its record
+// entry, as it did before ReleaseUnbound existed; an error here blocks `lv rm` on
+// every retry.
+func TestHost_ReleaseUnboundOfAVanishedDeviceReleasesIt(t *testing.T) {
+	addr := "0000:01:10.0"
+	k := newKernelFS(addr, "igbvf", "", "", "igbvf", "vfio-pci")
+	k.absent = true
+	defer SetFS(k)()
+	path := recordPath(t)
+	writeRecord(t, path, map[string]string{addr: "igbvf"})
+
+	if err := HostAt(path).ReleaseUnbound(addr); err != nil {
+		t.Fatalf("ReleaseUnbound of a vanished device: %v", err)
+	}
+	if got := readRecord(t, path); len(got) != 0 {
+		t.Fatalf("record = %v, want the vanished device's entry dropped", got)
+	}
+}
+
+// TestHost_NoRecordAndNoOverrideIsLeftOnVfio (re-review R1-M1): a device on
+// vfio-pci with no record and NO override was bound by ID, not by litevirt (every
+// older litevirt bind set the override). Whoever bound it — the operator's ids=
+// in an initramfs, or a hand-written new_id — owns that choice: the release
+// leaves it on vfio-pci and never removes the ID.
+func TestHost_NoRecordAndNoOverrideIsLeftOnVfio(t *testing.T) {
+	addr := "0000:01:10.0"
+	k := newKernelFS(addr, "igbvf", "vfio-pci", "", "vfio-pci", "igbvf")
+	k.dynids["vfio-pci "+k.id] = true // added by hand; in no config file
+	k.files["/proc/cmdline"] = []byte("ro quiet\n")
+	defer SetFS(k)()
+
+	if err := HostAt(recordPath(t)).Unbind(addr, ""); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	if k.driver() != "vfio-pci" {
+		t.Fatalf("driver = %q, want vfio-pci (bound by ID, not by litevirt)", k.driver())
+	}
+	if k.wrote("remove_id") || k.wrote("/driver/unbind") {
+		t.Fatalf("the release touched a device litevirt did not bind: %v", k.log)
+	}
+}
+
+// TestHost_ARecordedDeviceNeverRemovesADynamicID (re-review R1-M1): this build
+// recorded the device (it had no driver before), so it never wrote a new_id for
+// it. A reprobe that lands on vfio-pci by a dynamic ID found someone else's
+// choice, and remove_id is reserved for an older build's device: the device
+// stays on vfio-pci.
+func TestHost_ARecordedDeviceNeverRemovesADynamicID(t *testing.T) {
+	addr := "0000:01:10.0"
+	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
+	k.dynids["vfio-pci "+k.id] = true
+	k.files["/proc/cmdline"] = []byte("ro quiet\n")
+	defer SetFS(k)()
+	path := recordPath(t)
+	writeRecord(t, path, map[string]string{addr: ""})
+
+	if err := HostAt(path).Unbind(addr, ""); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	if k.wrote("remove_id") || !k.dynids["vfio-pci "+k.id] {
+		t.Fatal("the release removed a dynamic ID this build never added")
+	}
+	if k.driver() != "vfio-pci" {
+		t.Fatalf("driver = %q, want vfio-pci", k.driver())
+	}
+}
+
+// TestHost_AnOldBuildsFingerprintSurvivesAFailedUnbind (re-review R1-M1b): an
+// older build's device (no record, override vfio-pci) whose release clears the
+// override and then fails at the unbind is left on vfio-pci with no override. The
+// fingerprint must already be on disk by then: a later Bind must not take the
+// device for the operator's, and the retried release must still return it, the
+// older build's dynamic ID removed.
+func TestHost_AnOldBuildsFingerprintSurvivesAFailedUnbind(t *testing.T) {
+	addr := "0000:01:10.0"
+	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
+	k.dynids["vfio-pci "+k.id] = true // the older build's new_id
+	k.files["/proc/cmdline"] = []byte("ro quiet\n")
+	k.writeErr["driver/unbind"] = syscall.EBUSY
+	defer SetFS(k)()
+	path := recordPath(t)
+	h := HostAt(path)
+
+	if err := h.Unbind(addr, ""); err == nil {
+		t.Fatal("Unbind succeeded through a failing unbind")
+	}
+	if k.override != "" || k.driver() != "vfio-pci" {
+		t.Fatalf("precondition: driver=%q override=%q, want vfio-pci with the override cleared", k.driver(), k.override)
+	}
+	if _, err := h.Bind(addr); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if got := readRecord(t, path); got[addr] == "vfio-pci" {
+		t.Fatalf("record = %v: the older build's device was recorded as the operator's", got)
+	}
+
+	delete(k.writeErr, "driver/unbind")
+	if err := h.Unbind(addr, ""); err != nil {
+		t.Fatalf("retried Unbind: %v", err)
+	}
+	if k.driver() != "igbvf" || k.dynids["vfio-pci "+k.id] {
+		t.Fatalf("driver=%q dynid=%v, want igbvf and the older build's ID removed", k.driver(), k.dynids["vfio-pci "+k.id])
+	}
+}
+
+// TestHost_DriverctlPinnedDeviceIsLeftOnVfio (re-review R1-M3): driverctl pins a
+// device to vfio-pci with an override it re-applies at boot, recorded in
+// /etc/driverctl.d/pci-<addr>. That is the operator's choice: Bind records it as
+// such, and the release leaves the device on vfio-pci with driverctl's override
+// in place — with or without a record (an older build may have bound it).
+func TestHost_DriverctlPinnedDeviceIsLeftOnVfio(t *testing.T) {
+	for _, viaBind := range []bool{true, false} {
+		t.Run(map[bool]string{true: "recorded-at-bind", false: "no-record"}[viaBind], func(t *testing.T) {
+			addr := "0000:01:10.0"
+			k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "igbvf", "vfio-pci")
+			k.files["/etc/driverctl.d/pci-"+addr] = []byte("vfio-pci\n")
+			defer SetFS(k)()
+			path := recordPath(t)
+			h := HostAt(path)
+			if viaBind {
+				if _, err := h.Bind(addr); err != nil {
+					t.Fatalf("Bind: %v", err)
+				}
+				if got := readRecord(t, path); got[addr] != "vfio-pci" {
+					t.Fatalf("record = %v, want %s → vfio-pci (driverctl's)", got, addr)
+				}
+			}
+			if err := h.Unbind(addr, ""); err != nil {
+				t.Fatalf("Unbind: %v", err)
+			}
+			if k.driver() != "vfio-pci" || k.override != "vfio-pci" {
+				t.Fatalf("driver=%q override=%q, want driverctl's vfio-pci binding left as it was", k.driver(), k.override)
+			}
+		})
+	}
+}
+
+// TestHost_OperatorIDsBeatARecordedHostDriver (re-review R1-M4): the record says
+// igbvf, but since then the operator gave vfio-pci this device's ID (ids= and a
+// reboot). The operator's configuration wins: the release leaves the device on
+// vfio-pci and drops the stale entry.
+func TestHost_OperatorIDsBeatARecordedHostDriver(t *testing.T) {
+	addr := "0000:01:10.0"
+	k := newKernelFS(addr, "igbvf", "vfio-pci", "vfio-pci", "vfio-pci", "igbvf")
+	k.dynids["vfio-pci "+k.id] = true
+	k.files["/proc/cmdline"] = []byte("ro vfio-pci.ids=8086:10ca\n")
+	defer SetFS(k)()
+	path := recordPath(t)
+	writeRecord(t, path, map[string]string{addr: "igbvf"})
+
+	if err := HostAt(path).Unbind(addr, ""); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	if k.driver() != "vfio-pci" {
+		t.Fatalf("driver = %q, want vfio-pci (the operator's ids= now names it)", k.driver())
+	}
+	if got := readRecord(t, path); len(got) != 0 {
+		t.Fatalf("record = %v, want the stale entry dropped", got)
 	}
 }

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -171,5 +172,65 @@ func TestDetachPCI_LegacyDroppedEject_IsReRequested(t *testing.T) {
 	}
 	if o := pciOwnerOf(t, ctx, s, addr); o != "" || fs.isBound(addr) {
 		t.Fatalf("owner=%q bound=%v, want released and unbound", o, fs.isBound(addr))
+	}
+}
+
+// TestDetachPCI_LegacyWaitHonoursTheCallersContext (re-review R1-M2): the live
+// wait runs under the caller's context. A cancelled or expired RPC stops it
+// instead of holding the VM lock for the full unplug budget.
+func TestDetachPCI_LegacyWaitHonoursTheCallersContext(t *testing.T) {
+	const addr = "0000:50:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	defer vfio.SetFS(fs)()
+	fake := s.virt.(*libvirtfake.Fake)
+	legacyAttach(t, s, addr)
+	fake.DeferLiveUnplug = true // never acknowledged
+	fastUnplugWait(t, 20*time.Second)
+
+	ctx, cancel := context.WithTimeout(adminCtx(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the detach waited %v after its context expired at 500ms", took)
+	}
+	if err == nil {
+		t.Fatal("the detach reported success while the hostdev is still in the live domain")
+	}
+	if o := pciOwnerOf(t, adminCtx(), s, addr); o != "vm1" || !fs.isBound(addr) {
+		t.Fatalf("owner=%q bound=%v, want kept by vm1 and bound", o, fs.isBound(addr))
+	}
+}
+
+// TestReclaimLive_APausedGuestIsLeftForTheRetry (re-review R1-M2): a paused guest
+// cannot acknowledge an unplug, so waiting for it only stalls the caller — and
+// device-lease recovery runs inside the startup barrier, where that was up to the
+// full unplug budget per device. The detach must refuse at once and leave the
+// device owned and bound for the retry.
+func TestReclaimLive_APausedGuestIsLeftForTheRetry(t *testing.T) {
+	const addr = "0000:50:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	defer vfio.SetFS(fs)()
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+	legacyAttach(t, s, addr)
+	fake.SetState("vm1", libvirtfake.StatePaused)
+	fake.DeferLiveUnplug = true
+	fastUnplugWait(t, 20*time.Second)
+
+	start := time.Now()
+	err := s.reclaimLeasedDevices(ctx, "vm1", []string{addr}, reclaimLive)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the reclaim waited %v on a paused guest", took)
+	}
+	if err == nil {
+		t.Fatal("the reclaim succeeded although the paused guest still holds the hostdev")
+	}
+	if o := pciOwnerOf(t, ctx, s, addr); o != "vm1" || !fs.isBound(addr) {
+		t.Fatalf("owner=%q bound=%v, want kept by vm1 and bound for the retry", o, fs.isBound(addr))
 	}
 }

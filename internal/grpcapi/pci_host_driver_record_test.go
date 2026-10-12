@@ -100,3 +100,28 @@ func TestReleaseDevices_ClearsAStaleOverrideOnAnUnboundDevice(t *testing.T) {
 		t.Fatalf("owner = %q, want released", o)
 	}
 }
+
+// TestReleaseDevices_AVanishedDeviceIsReleased (re-review R1-I1): a stopped VM
+// keeps its VF, the host reboots, and the VF does not come back (sriov_numvfs is
+// not persistent). Its sysfs directory is gone. `lv rm` reaches releaseDevices,
+// and the vanished device must be released, not fail the delete on every retry
+// with "read driver_override: no such file".
+func TestReleaseDevices_AVanishedDeviceIsReleased(t *testing.T) {
+	const addr = "0000:50:00.0"
+	s := hotplugDiskServer(t)
+	fs := newPCIUnbindRecordingFS()
+	fs.setAbsent(addr)
+	defer vfio.SetFS(fs)()
+	ctx := adminCtx()
+	seedPCIGPU(t, s, addr, -1)
+	if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", addr, "vm1"); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+
+	if err := s.releaseDevices(ctx, "vm1"); err != nil {
+		t.Fatalf("releaseDevices with a vanished device: %v", err)
+	}
+	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
+		t.Fatalf("owner = %q, want released", o)
+	}
+}

@@ -1009,7 +1009,11 @@ before `lv host add` gave it to a new one, or the same machine before it booted
 again. Such a row does not make the host "recently fenced", does not confirm
 it off, and is not the proof-grade fence a shared-disk VM is moved on. A host
 that fails again after coming back is fenced anew, without waiting out the
-5 minutes. A row newer than the host's last activation still counts, which is
+5 minutes. If that fence fails, its retries keep to the failed-fence backoff
+(30 s, doubling to 5 minutes) too: the failed fence records the host
+`offline`, so its activation no longer dates its life, and a retry counts
+only a fence row newer than the attempt it repeats. Before this, the previous
+outage's fence held every retry back until it was 5 minutes old. A row newer than the host's last activation still counts, which is
 the race the window exists for. Likewise, a health observation older than the
 moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not

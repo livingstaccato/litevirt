@@ -38,15 +38,38 @@ func SharedStoreOf(dir string) SharedStore {
 	return t.SharedStoreOf(dir)
 }
 
+// SharedStoreOfErr is SharedStoreOf for a caller that writes on the strength
+// of its answer (a record, a marker): a directory whose resolution, or
+// statfs, does not finish in time (a network filesystem that does not answer)
+// is an error (IsFSNoAnswer), not "no identity", which such a caller would
+// read as "nothing to record".
+func SharedStoreOfErr(dir string) (SharedStore, error) {
+	t, err := ReadMountTable()
+	if err != nil {
+		return SharedStore{Shared: true}, nil
+	}
+	return t.SharedStoreOfErr(dir)
+}
+
 // SharedStoreOf is SharedStoreOf against this table. A directory whose
 // resolution, or statfs, does not finish in time (a network filesystem that
 // does not answer: resolveBounded, Bounded) is "shared, no identity", as is
-// one whose mount table cannot be read.
+// one whose mount table cannot be read: the conservative answer for a
+// reader.
 func (t MountTable) SharedStoreOf(dir string) SharedStore {
+	st, err := t.SharedStoreOfErr(dir)
+	if err != nil {
+		return SharedStore{Shared: true}
+	}
+	return st
+}
+
+// SharedStoreOfErr is SharedStoreOfErr against this table.
+func (t MountTable) SharedStoreOfErr(dir string) (SharedStore, error) {
 	var out SharedStore
 	forms, err := pathFormsBounded(&t, dir)
 	if err != nil {
-		return SharedStore{Shared: true}
+		return SharedStore{Shared: true}, err
 	}
 	for _, p := range forms { // the resolved form, last, wins
 		var under mountEntry
@@ -59,22 +82,51 @@ func (t MountTable) SharedStoreOf(dir string) SharedStore {
 		if under.dir == "" || err != nil {
 			continue
 		}
-		out = sharedStoreOfMount(under, rel, dir)
+		var serr error
+		if out, serr = sharedStoreOfMount(under, rel, dir); serr != nil {
+			return SharedStore{Shared: true}, serr
+		}
 	}
 	if !out.Shared {
 		info := statfsInfo
-		magic, err := Bounded("statfs", dir, func() (uint32, error) {
+		magic, err := Bounded("statfs (magic)", dir, func() (uint32, error) {
 			m, _, err := info(dir)
 			return m, err
 		})
-		if IsFSNoAnswer(err) || (err == nil && networkMagic(magic)) {
+		if IsFSNoAnswer(err) {
+			return SharedStore{Shared: true}, err
+		}
+		if err == nil && networkMagic(magic) {
 			out = SharedStore{Shared: true}
 		}
 	}
-	return out
+	return out, nil
 }
 
-func sharedStoreOfMount(e mountEntry, rel, dir string) SharedStore {
+// sharedStoreOfMount is the store of the path rel below mount e. A CephFS
+// statfs that does not answer is an error.
+func sharedStoreOfMount(e mountEntry, rel, dir string) (SharedStore, error) {
+	if e.fstype == "ceph" {
+		// The kernel client's f_fsid folds the cluster's fsid with the
+		// filesystem's id within it: the same on every client.
+		info := statfsInfo
+		fsid, err := Bounded("statfs (fsid)", dir, func() (string, error) {
+			_, id, err := info(dir)
+			return id, err
+		})
+		if IsFSNoAnswer(err) {
+			return SharedStore{Shared: true}, err
+		}
+		path, ok := cephSourcePath(e.source)
+		if err != nil || fsid == "" || !ok {
+			return SharedStore{Shared: true}, nil
+		}
+		return SharedStore{Shared: true, ID: "ceph:" + fsid + ":" + filepath.Clean("/"+filepath.Join(path, rel))}, nil
+	}
+	return sharedStoreOfMountNoErr(e, rel), nil
+}
+
+func sharedStoreOfMountNoErr(e mountEntry, rel string) SharedStore {
 	below := func(base string) string { return filepath.Clean("/" + filepath.Join(base, rel)) }
 	switch {
 	case isNFSFstype(e.fstype):
@@ -84,19 +136,6 @@ func sharedStoreOfMount(e mountEntry, rel, dir string) SharedStore {
 		}
 		exp.Path = below(exp.Path)
 		return SharedStore{Shared: true, ID: "nfs:" + exp.String()}
-	case e.fstype == "ceph":
-		// The kernel client's f_fsid folds the cluster's fsid with the
-		// filesystem's id within it: the same on every client.
-		info := statfsInfo
-		fsid, err := Bounded("statfs", dir, func() (string, error) {
-			_, id, err := info(dir)
-			return id, err
-		})
-		path, ok := cephSourcePath(e.source)
-		if err != nil || fsid == "" || !ok {
-			return SharedStore{Shared: true}
-		}
-		return SharedStore{Shared: true, ID: "ceph:" + fsid + ":" + below(path)}
 	case e.fstype == "cifs" || e.fstype == "smb3":
 		rest, ok := strings.CutPrefix(strings.ReplaceAll(e.source, `\`, "/"), "//")
 		server, sharePath, found := strings.Cut(rest, "/")

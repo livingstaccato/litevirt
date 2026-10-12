@@ -67,6 +67,16 @@ func sharedStoreOf(dir string) storage.SharedStore {
 	return storage.SharedStoreOf(dir)
 }
 
+// sharedStoreOfErr is sharedStoreOf for a writer: a store that does not
+// answer in time is an error, never "no identity, nothing to record".
+func sharedStoreOfErr(dir string) (storage.SharedStore, error) {
+	st, err := storage.SharedStoreOfErr(dir)
+	if err != nil {
+		return st, fmt.Errorf("cannot tell which shared store %s is on, so its record cannot be written: %w", dir, err)
+	}
+	return st, nil
+}
+
 // storeSeg is a store's identity as one key segment.
 func storeSeg(id string) string { return url.PathEscape(id) }
 
@@ -94,7 +104,12 @@ func replicaRowKey(id, host string, u poolUpload) string {
 // unrecorded file made after the records epoch, never matched.
 func (s *Server) shareRecord(ctx context.Context, path string, u poolUpload) error {
 	dir, name := filepath.Dir(path), filepath.Base(path)
-	st := sharedStoreOf(dir)
+	// A store that does not answer fails the caller, as a record that cannot
+	// be written does: an unrecorded file there would never be matched.
+	st, err := sharedStoreOfErr(dir)
+	if err != nil {
+		return err
+	}
 	if st.ID == "" || !s.db.MayWriteClusterPolicy() {
 		return nil
 	}
@@ -315,7 +330,7 @@ func hostStoresKey(host string) string { return corrosion.PoolRecordsHostStoresP
 // shares its records of a store only from when it moved onto it, and
 // whatever it wrote elsewhere meanwhile is recorded under the other identity.
 func (s *Server) refreshHostStores(ctx context.Context) error {
-	cur := s.localPoolStoreIDs(ctx)
+	cur, unjudged := s.localPoolStoreIDs(ctx)
 	s.hostStoresMu.Lock()
 	defer s.hostStoresMu.Unlock()
 	v, _, err := corrosion.GetPoolRecord(ctx, s.db, hostStoresKey(s.hostName))
@@ -324,8 +339,8 @@ func (s *Server) refreshHostStores(ctx context.Context) error {
 	}
 	old := map[string]hostStoreEntry{}
 	_ = json.Unmarshal([]byte(v), &old)
-	next := make(map[string]hostStoreEntry, len(cur))
-	changed := len(old) != len(cur)
+	next := make(map[string]hostStoreEntry, len(cur)+len(unjudged))
+	changed := false
 	now := time.Now().UTC()
 	for pool, ids := range cur {
 		if e, ok := old[pool]; ok && slices.Equal(e.IDs, ids) {
@@ -333,6 +348,16 @@ func (s *Server) refreshHostStores(ctx context.Context) error {
 			continue
 		}
 		next[pool] = hostStoreEntry{IDs: ids, Since: now}
+		changed = true
+	}
+	// A pool whose store did not answer keeps its entry, Since and all: a
+	// stall is no move, and must not set the store's records epoch later.
+	for pool := range unjudged {
+		if e, ok := old[pool]; ok {
+			next[pool] = e
+		}
+	}
+	if len(next) != len(old) {
 		changed = true
 	}
 	if !changed {
@@ -369,13 +394,16 @@ func (s *Server) RunPoolRecordsMarker(ctx context.Context) {
 
 // localPoolStoreIDs maps each of this host's file pools to the identities of
 // the shared stores its content directories are on now (sorted; none for a
-// pool on local or unidentified storage).
-func (s *Server) localPoolStoreIDs(ctx context.Context) map[string][]string {
-	out := map[string][]string{}
+// pool on local or unidentified storage). unjudged names the pools whose
+// store did not answer in time: what they are on now is not known, and is
+// not reported as "nothing".
+func (s *Server) localPoolStoreIDs(ctx context.Context) (out map[string][]string, unjudged map[string]bool) {
+	out, unjudged = map[string][]string{}, map[string]bool{}
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
 	if err != nil {
-		return out
+		return out, unjudged
 	}
+pools:
 	for _, p := range pools {
 		if !isFileBasedDriver(p.Driver) {
 			continue
@@ -386,14 +414,20 @@ func (s *Server) localPoolStoreIDs(ctx context.Context) map[string][]string {
 		}
 		ids := []string{}
 		for _, d := range s.poolContentDirs(dir) {
-			if id := sharedStoreOf(d).ID; id != "" && !slices.Contains(ids, id) {
+			st, err := storage.SharedStoreOfErr(d)
+			if err != nil {
+				slog.Warn("pool file records: a pool's store does not answer; its recorded store is kept", "pool", p.Name, "error", err)
+				unjudged[p.Name] = true
+				continue pools
+			}
+			if id := st.ID; id != "" && !slices.Contains(ids, id) {
 				ids = append(ids, id)
 			}
 		}
 		sort.Strings(ids)
 		out[p.Name] = ids
 	}
-	return out
+	return out, unjudged
 }
 
 // epochEntry is a cached answer of storeRecordsEpoch.
@@ -445,7 +479,11 @@ func (s *Server) computeStoreRecordsEpoch(ctx context.Context, id string) (time.
 		return time.Time{}, false
 	}
 	var pools []string
-	for pool, ids := range s.localPoolStoreIDs(ctx) {
+	cur, unjudged := s.localPoolStoreIDs(ctx)
+	if len(unjudged) > 0 {
+		return time.Time{}, false // which pools are on id is not known now
+	}
+	for pool, ids := range cur {
 		if slices.Contains(ids, id) {
 			pools = append(pools, pool)
 		}
@@ -517,7 +555,11 @@ func uploadMarkerPath(path string) string {
 // through: the upload goes ahead unmarked, as before markers.
 func markUpload(path string) error {
 	dir := filepath.Dir(path)
-	if sharedStoreOf(dir).ID == "" {
+	st, err := sharedStoreOfErr(dir)
+	if err != nil {
+		return err // the upload is not left unmarked on a store that may need it
+	}
+	if st.ID == "" {
 		return nil
 	}
 	mdir := filepath.Join(dir, uploadMarkerDir)

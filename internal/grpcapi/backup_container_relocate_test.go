@@ -222,7 +222,7 @@ func TestRelocationProofTokenBound(t *testing.T) {
 // must be REFUSED before claiming — proof and provenance can't diverge.
 func TestRestoreContainer_ProofTokenMustMatchStampedToken(t *testing.T) {
 	s := newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
-	s.gate = fakeServerGate{execOK: true}
+	s.SetGate(fakeServerGate{execOK: true})
 	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
 
 	// mTLS + admin caller (passes requirePermPrecheck + requirePeerCert), carrying md
@@ -248,7 +248,7 @@ func setupProofRestore(t *testing.T) (s *Server, rt *fakeCTRuntime, repo, ts, to
 	t.Helper()
 	s = newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
 	s.dataDir = t.TempDir()
-	s.gate = fakeServerGate{execOK: true}
+	s.SetGate(fakeServerGate{execOK: true})
 	rt = &fakeCTRuntime{exportPayload: []byte("rootfs")}
 	s.SetContainerRuntime(rt)
 	repo, ts, token, proofID = ctTestRepo(t), "2026-07-03T10:00:00Z", "reloc-token-1", "restore-proof-1"

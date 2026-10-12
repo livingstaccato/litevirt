@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -156,4 +158,28 @@ func (s *Server) RecreateVMForTest(ctx context.Context, name string, desired *pb
 // retiring the stale row itself (vm_recreate_replaces.go).
 func (s *Server) SetReplacedTombstoneWaitForTest(d time.Duration) {
 	s.replacedTombstoneWait = d
+}
+
+// SetRecreateTornDownHookForTest runs fn in every rebuild and rolling recreate
+// on this server once the old VM is torn down, before it is created again.
+func (s *Server) SetRecreateTornDownHookForTest(fn func(name string)) { s.recreateTornDown = fn }
+
+// SetImageRecreateGraceForTest sets how long a deleted VM row still records
+// its image for lv image rm (imageRecreateGrace); d < 0 turns it off.
+func (s *Server) SetImageRecreateGraceForTest(d time.Duration) {
+	s.imagePrune.recentGrace.Store(int64(d))
+}
+
+// SetImageOpenFilesForTest replaces lv image rm's reading of the processes
+// that hold a file open.
+func (s *Server) SetImageOpenFilesForTest(fn func([]string) (map[string]string, error)) {
+	s.imagePrune.openFiles = fn
+}
+
+// OpenFilesOfThisProcessForTest is lv image rm's open-file reading limited to
+// the calling process: a fleet test runs without root, where the full read
+// fails closed on every other user's process.
+func OpenFilesOfThisProcessForTest(paths []string) (map[string]string, error) {
+	self := strconv.Itoa(os.Getpid())
+	return processesHoldingIn("/proc", func(pid string) bool { return pid == self }, paths)
 }

@@ -59,7 +59,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		capabilities.LWWSkewGuardV1:         false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe
-	s.gate = g
+	s.SetGate(g)
 	s.SetEnforcementConfig(false, true, false, false, false, false) // lww configured-on (safeFence,lww,hlcLww,vipSelfDemote,vipProofReclaim,sharedStorageFence)
 
 	// Nothing to latch (all latched) ⇒ each cycle spends its peer op on a freshness

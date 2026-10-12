@@ -257,12 +257,13 @@ func (s *Server) notEnforcingWith(advertised []string) []string {
 // flag is off. Only tokens whose stand-down a peer must be told about are
 // considered.
 func (s *Server) withheldStandDowns(advertised []string) []string {
-	if s.gate == nil {
+	gt := s.gateV()
+	if gt == nil {
 		return nil
 	}
 	var out []string
 	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1} {
-		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && s.gate.Latched(tok) {
+		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && gt.Latched(tok) {
 			out = append(out, tok)
 		}
 	}
@@ -416,6 +417,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	if len(toMigrate) == 0 {
 		return nil
 	}
+	// Highest compose migrate.priority first, ties in name order: targets are
+	// chosen, and the moves handed to the workers, in this order, so a
+	// higher-priority VM starts moving — and takes a target's room — before a
+	// lower one. Every move is still refused or admitted on its own.
+	corrosion.SortVMsByMigratePriority(toMigrate)
 
 	// Use placement engine to select targets per VM, respecting constraints.
 	// Build placement requests from each VM's stored spec.

@@ -97,10 +97,11 @@ func (s *Server) LeaseTermReadiness(ctx context.Context) (bool, string) {
 	// advertisement alone, so this is cheap insurance rather than a real
 	// obstacle — but it is the difference between a documented dependency and
 	// an accidental one.
-	if s.gate == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return false, "no capability gate wired"
 	}
-	if !s.gate.Latched(capabilities.SplitBrainGateV1) {
+	if !gate.Latched(capabilities.SplitBrainGateV1) {
 		return false, fmt.Sprintf(
 			"%s has not latched; lease-term enforcement gates only PROOF-BEARING calls, so "+
 				"without it a proofless protected RPC is still accepted ungated",

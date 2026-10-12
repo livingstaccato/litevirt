@@ -19,7 +19,7 @@ func TestClaimKeyFor_ScopedOnlyOnceLatched(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
 	g := &fakeServerGate{enforcedTok: map[string]bool{}}
-	s.gate = g
+	s.SetGate(g)
 	if k := s.ClaimKeyFor(ctx, "vm", "vm1", 2, "inc"); k.Incarnation != "" {
 		t.Fatalf("before the latch the key is %s, want the legacy key", k)
 	}

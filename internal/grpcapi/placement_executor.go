@@ -183,9 +183,10 @@ func (s *Server) capacityPolicyFingerprint(ctx context.Context) (string, error) 
 }
 
 func (s *Server) capacityAdmissionLatched() bool {
-	return s.enfOperationProtocol && s.gate != nil &&
-		s.gate.Latched(capabilities.OperationProtocolV1) &&
-		s.gate.Latched(capabilities.CapacityAdmissionV1)
+	gate := s.gateV()
+	return s.enfOperationProtocol.Load() && gate != nil &&
+		gate.Latched(capabilities.OperationProtocolV1) &&
+		gate.Latched(capabilities.CapacityAdmissionV1)
 }
 
 func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, targetHost string) (*pb.VM, error) {

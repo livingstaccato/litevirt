@@ -2016,6 +2016,14 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// target, and a host reboot drops the sessions: one whose device is
 	// missing is logged back in first. Best effort, never a refusal.
 	s.ensureISCSISessionsForVM(ctx, vm)
+	// An NFS disk is a file on its pool's export only while the export is
+	// mounted here, and a host reboot unmounts it: one missing since the
+	// daemon started is mounted first; one still missing (unmounted on
+	// purpose, a mount that failed, a mount point holding local files)
+	// refuses the start with the reason, where it failed at qemu's open.
+	if err := s.ensureNFSMountsForVM(ctx, vm); err != nil {
+		return releasePreflight, err
+	}
 	// A ceph disk is opened through its pool's libvirt secret, which a
 	// libvirtd restart drops (it is ephemeral): put back before every start,
 	// on every start path, so none waits for the daemon's reconcile.
@@ -2384,6 +2392,31 @@ func without(ss []string, drop string) []string {
 	return out
 }
 
+// deleteLockHolder is a VM delete's identity on the per-VM start lease
+// (health.TryVMStartLease).
+//
+// A delete stops and undefines the domain BEFORE it tombstones the row, and
+// the row says "running" the whole time. The VM lock holds off this host's
+// RPCs only; the reconciler reads "running here, no domain" as a crashed
+// guest and restarts it under the start lease. Lab 2 run c713 (N-2): a delete
+// stalled on a dead iSCSI path between its undefine and its tombstone, the
+// reconciler restarted the VM, and the tombstone then left a running domain
+// with no record. So the delete holds the lease, renewed, from before it
+// touches the domain until after the tombstone: a start that already holds
+// it is waited for, bounded (delete_lease.go), and one that comes later
+// finds the lease held and, once it is free, no row.
+//
+// A daemon that crashes mid-delete leaves the lease behind. A retried delete
+// re-takes it at once — it runs on the same host, so it is the same holder —
+// but the reconciler and the restart policy are other holders, so the VM is
+// not restarted until the delete is retried or the lease expires (vmLockTTL,
+// 10 minutes).
+//
+// The holder is distinct from every start path's, so none can re-take it. An
+// older peer reads it as any other holder's unexpired lease, so its start
+// paths are held off too.
+func deleteLockHolder(hostName string) string { return hostName + "/delete" }
+
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe
 // (carries the x-lv-delete-local-only header), meaning it must act on the local
 // host only and never proxy or fan out to peers.
@@ -2543,6 +2576,36 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			forwardKeptImages(ctx, hdr) // the ceph images the owner left in place
 		}
 		return out, err
+	}
+
+	// This host carries the delete out. Hold the VM's start lease from here
+	// until the row is tombstoned (lab 2 run c713, N-2; deleteLockHolder).
+	// A peer-search probe is exempt: its host is not the row's, so no start
+	// path there acts on this VM, and its lease write would contend with the
+	// one the probing host already holds. A start holding the lease is waited
+	// for, bounded (delete_lease.go).
+	if !localOnly {
+		releaseLease, lerr := s.holdDeleteStartLease(ctx, req.Name)
+		if lerr != nil {
+			return nil, lerr
+		}
+		defer releaseLease()
+		// A start that held the lease until a moment ago may have changed
+		// the row since it was read above: decide from the row as it is now.
+		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+		if err != nil || vm == nil {
+			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+		if err := checkDeleteBinding(req, vm); err != nil {
+			return nil, err
+		}
+		if vm.ActiveOperationID != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+		}
+		if vm.HostName != s.hostName {
+			return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-delete; retry", req.Name, vm.HostName)
+		}
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the
@@ -3911,6 +3974,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	outcome := recreateNotAttempted
 	defer func() { lunDone(outcome) }()
 
+	// The image the VM is created again from is held from before the teardown
+	// until the create has returned: in between, no disk and no live row
+	// records it, and lv image rm must not take the file the create needs.
+	if spec.Image != "" {
+		defer s.holdImage(spec.Image)()
+	}
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -3948,6 +4018,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
 	s.retireNICGuards(ctx, req.Name)
+	if hook := s.recreateTornDown; hook != nil {
+		hook(req.Name)
+	}
 
 	// Recreate the VM using the stored spec. The create carries the identity
 	// of the VM just tombstoned: the host it lands on may not have applied

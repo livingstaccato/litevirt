@@ -24,6 +24,12 @@ import (
 // (deferPendingStart). The VM is walked first on the next pass.
 var ErrStartDeferred = errors.New("start deferred")
 
+// ErrStartStorageNotMounted marks a start-preparation refusal because a
+// disk's NFS export is not mounted on this host (grpcapi's NFS start hook).
+// It is a refusal, not a deferral; it is counted under
+// ReasonStorageNotMounted.
+var ErrStartStorageNotMounted = errors.New("a disk's storage is not mounted on this host")
+
 // Why a start was deferred decides where it goes in the next walk
 // (deferredFirst). A plain ErrStartDeferred is a deferral for TIME — the walk
 // had too little left to ask the storage at all — and goes first: it never
@@ -165,6 +171,23 @@ func (r *Reconciler) deferStart(ctx context.Context, vmName, proofID string, tra
 	}
 	r.startDeferred.add(vmName, cause)
 	r.deferPendingStart(ctx, vmName, proofID, "start deferred: "+cause.Error())
+}
+
+// walkOrder is the order a reconcile pass walks this host's VMs in: the
+// deferred starts first, by rank (deferredFirst), and within each group the
+// highest compose migrate.priority first, ties by name. A failover lands its
+// VMs here as "pending", so this is the order they start in on their new
+// host, and the walk's time budget runs out on the lowest priority. It only
+// orders the walk: every start still passes its own gates.
+//
+// Follow-up (predates priority ordering): a start reached after the budget
+// has run out fails its lock and is NOT recorded in startDeferred, so a slow
+// start that spends the budget every pass keeps starving the same tail —
+// now the lowest priorities, before the replica's last-inserted rows.
+// Recording it at rankTime when ctx is already done at startPendingVM's entry
+// would rotate the starved set to the front of the next pass.
+func walkOrder(vms []corrosion.VMRecord, deferred map[string]int) []corrosion.VMRecord {
+	return deferredFirst(corrosion.SortVMsByMigratePriority(vms), deferred)
 }
 
 // deferredFirst orders a walk's VMs with the deferred ones first, by rank

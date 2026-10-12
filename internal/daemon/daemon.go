@@ -1199,6 +1199,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
 	// does not answer must not hold the daemon's start.
 	go d.runISCSISessionReconcile(ctx)
+	// The nfs pools' exports: a host reboot unmounts them, and nothing but a
+	// pool's Prepare mounted them. Mounted back now and kept
+	// (grpcapi.ReconcileNFSMounts), off the start path: a server that does
+	// not answer must not hold the daemon's start.
+	go d.runNFSMountReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -2247,6 +2252,15 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 				rec.State = cur.State
 			}
 		}
+		// An nfs pool's degraded is its mount's, which the mount reconcile
+		// records (grpcapi.ReconcileNFSMounts): kept, not reset to active —
+		// an unmounted mount point is a local directory statfs measures.
+		if strings.EqualFold(p.Driver, "nfs") {
+			if cur, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, p.Name); err == nil && ok &&
+				strings.EqualFold(cur.Driver, "nfs") && cur.State == grpcapi.PoolStateDegraded {
+				rec.State = cur.State
+			}
+		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
 			if err := syscall.Statfs(p.Target, &st); err == nil {
@@ -2518,6 +2532,25 @@ func (d *Daemon) runISCSISessionReconcile(ctx context.Context) {
 	}
 }
 
+// runNFSMountReconcile checks this host's nfs pools' mounts at once, then
+// every grpcapi.NFSMountReconcileInterval, until ctx is cancelled.
+func (d *Daemon) runNFSMountReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	d.svc.ReconcileNFSMounts(ctx)
+	ticker := time.NewTicker(grpcapi.NFSMountReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.svc.ReconcileNFSMounts(ctx)
+		}
+	}
+}
+
 // refreshDBPoolCapacity updates total/used bytes for every file-based storage
 // pool registered for THIS host in the DB — including pools created at runtime
 // via `lv pool create`. registerStoragePools only scans cfg.StoragePools, so
@@ -2541,7 +2574,11 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 		}
 		p.TotalBytes = int64(st.Blocks * uint64(st.Bsize))
 		p.UsedBytes = int64((st.Blocks - st.Bavail) * uint64(st.Bsize))
-		p.State = "active"
+		// An nfs pool's degraded is its mount's (grpcapi.ReconcileNFSMounts),
+		// kept: the statfs above measured the local directory under it.
+		if !strings.EqualFold(p.Driver, "nfs") || p.State != grpcapi.PoolStateDegraded {
+			p.State = "active"
+		}
 		if err := corrosion.UpsertStoragePool(ctx, d.db, p); err != nil {
 			slog.Warn("refresh pool capacity: upsert", "pool", p.Name, "error", err)
 		}

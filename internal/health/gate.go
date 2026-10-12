@@ -95,6 +95,10 @@ const (
 	ReasonOwnershipDispute      = "ownership_dispute" // the workload has an active ownership condition; automated recovery must not add a holder
 	ReasonHardwareBlocked       = "hardware_blocked"  // hardware_v2 pre-start refused an automated (re)start (blocked adoption / unacquirable passthrough)
 
+	// ReasonStorageNotMounted: the pre-start refused an automated (re)start
+	// because a disk's NFS export is not mounted on this host.
+	ReasonStorageNotMounted = "storage_not_mounted"
+
 	// Recovery claims (docs/design/recovery-claims.md §5.4). The destination
 	// refuses with ReasonClaimUnproven; the coordinator with the other four,
 	// which say why no certificate formed.

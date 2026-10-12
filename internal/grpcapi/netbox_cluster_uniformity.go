@@ -196,7 +196,7 @@ func (s *Server) netboxClusterComparable() error {
 	if s.db == nil {
 		return fmt.Errorf("no cluster database")
 	}
-	if s.gate == nil || !s.gate.DurablyLatched(capabilities.NetBoxIPAMV1) {
+	if g := s.gateV(); g == nil || !g.DurablyLatched(capabilities.NetBoxIPAMV1) {
 		return fmt.Errorf("%w: %s is not durably latched",
 			errNetBoxClusterNotYetComparable, capabilities.NetBoxIPAMV1)
 	}

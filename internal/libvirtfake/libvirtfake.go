@@ -212,6 +212,11 @@ type Fake struct {
 	FailDestroyDomain   func(name string) error
 	FailUndefineDomain  func(name string, removeStorage bool) error
 	FailUndefinePreserv func(name string) error
+	// OnUndefined runs after an undefine of name has taken effect (either
+	// flavour), outside the fake's lock, so a scenario can run another
+	// component in the window between a teardown's undefine and its later
+	// steps — e.g. the reconciler racing a DeleteVM (lab 2 run c713, N-2).
+	OnUndefined func(name string)
 	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
 	// fail-closed path that must NOT proceed when the live membership is unreadable
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
@@ -802,6 +807,11 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.managed, name)
 	delete(f.managedInc, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
+	if hook := f.OnUndefined; hook != nil {
+		f.mu.Unlock()
+		hook(name)
+		f.mu.Lock()
+	}
 	return nil
 }
 
@@ -836,6 +846,11 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
 	f.record("undefine", name, "keep_state=true")
+	if hook := f.OnUndefined; hook != nil {
+		f.mu.Unlock()
+		hook(name)
+		f.mu.Lock()
+	}
 	return nil
 }
 
@@ -1278,20 +1293,93 @@ func (f *Fake) DetachDisk(domainName, targetDev string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.applyLiveUnplug(domainName, func() {
-		if f.diskSources[domainName] != nil {
-			delete(f.diskSources[domainName], targetDev)
-		}
-	})
-	// The real DetachDisk applies DomainDeviceModifyLive|Config, so the disk leaves the
-	// persistent (inactive) definition too — unless a scenario models a live-only
-	// divergence, in which case the config keeps the disk.
-	if !f.SkipConfigOnDiskMutation {
-		f.xml[domainName] = removeDiskFromDomainXML(f.xml[domainName], targetDev)
-	}
 	f.detachDiskN++
 	f.record("detach-disk", domainName, "target="+targetDev)
+	// The real DetachDisk runs libvirt.DetachLiveAndConfig over
+	// DomainDetachDeviceFlags; so does this, over a model of that call.
+	return libvirt.DetachLiveAndConfig(func(flags uint32) error {
+		_, inLive := f.liveDiskSourcesLocked(domainName)[targetDev]
+		return f.detachFlagsLocked(domainName, flags, f.SkipConfigOnDiskMutation,
+			inLive, diskDevInDomainXML(f.xml[domainName], targetDev),
+			"disk "+targetDev+" not found", "no target device "+targetDev,
+			func() {
+				if f.diskSources[domainName] != nil {
+					delete(f.diskSources[domainName], targetDev)
+				}
+			},
+			func() { f.xml[domainName] = removeDiskFromDomainXML(f.xml[domainName], targetDev) })
+	})
+}
+
+// detachFlagsLocked models ONE virDomainDetachDeviceFlags call against a running
+// domain, as qemuDomainDetachDeviceLiveAndConfig does it:
+//
+//   - VIR_DOMAIN_AFFECT_CONFIG needs the device in the persistent definition, and
+//     VIR_DOMAIN_AFFECT_LIVE needs it in the live instance; a copy that lacks it
+//     fails the call with VIR_ERR_DEVICE_MISSING ("device not found: ...").
+//   - The call is ALL-OR-NOTHING: both halves are checked before either applies, so
+//     a LIVE|CONFIG detach whose persistent copy is already gone does not re-issue
+//     the live unplug. That is lab finding N1, and the fake used to define it away
+//     by succeeding on any detach.
+//   - The live half only REQUESTS the unplug (applyLiveUnplug); the config half
+//     applies at once.
+//
+// skipConfig is a scenario's SkipConfigOn*Mutation knob: the config half is
+// neither checked nor applied.
+//
+// A guest that ignores every request is DeferLiveUnplug with
+// HonorUnplugOnRequest 0: each LIVE request is parked, none applies until
+// AckLiveUnplug.
+//
+// Not modeled:
+//   - libvirt refuses AFFECT_LIVE on a domain that is not running
+//     (VIR_ERR_OPERATION_INVALID);
+//   - QEMU >= 6.2 refuses a device_del for a PCIe device already "in the process
+//     of unplug" for ~5 s after the last request, a non-DEVICE_MISSING error. The
+//     fake accepts every re-request. Callers' re-request loops already treat a
+//     failed re-request as non-fatal (waitDeviceGone), so no test depends on it.
+//
+// Caller holds f.mu.
+func (f *Fake) detachFlagsLocked(domain string, flags uint32, skipConfig, inLive, inConfig bool,
+	liveMissing, configMissing string, removeLive, removeConfig func()) error {
+	config := flags&libvirt.ModifyConfig != 0 && !skipConfig
+	live := flags&libvirt.ModifyLive != 0
+	if config && !inConfig {
+		return deviceMissingError(configMissing)
+	}
+	if live && !inLive {
+		return deviceMissingError(liveMissing)
+	}
+	if live {
+		// A parked live removal must act on the live view as it stands NOW. Until
+		// something diverges them the fake reads the live view from the persistent
+		// one, which the config half below is about to change.
+		if _, ok := f.activeXML[domain]; !ok && f.DeferLiveUnplug {
+			f.activeXML[domain] = f.xml[domain]
+		}
+		f.applyLiveUnplug(domain, removeLive)
+	}
+	if config {
+		removeConfig()
+	}
 	return nil
+}
+
+// deviceMissingError is libvirt's VIR_ERR_DEVICE_MISSING as go-libvirt delivers it.
+func deviceMissingError(what string) error {
+	return golibvirt.Error{Code: uint32(golibvirt.ErrDeviceMissing), Message: "device not found: " + what}
+}
+
+// liveDiskSourcesLocked is DomainDiskSources' view, for a caller holding f.mu.
+func (f *Fake) liveDiskSourcesLocked(domain string) map[string]string {
+	out := map[string]string{}
+	for k, v := range f.diskSources[domain] {
+		out[k] = v
+	}
+	if len(out) == 0 {
+		out["vda"] = "/var/lib/litevirt/disks/" + domain + "-root.qcow2"
+	}
+	return out
 }
 
 // diskDevInDomainXML reports whether a domain XML carries a <target dev='X'.../>
@@ -1394,15 +1482,16 @@ func (f *Fake) DetachNIC(domainName, mac string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.applyLiveUnplug(domainName, func() {
-		f.activeXML[domainName] = removeNICFromDomainXML(f.activeBaseline(domainName), mac)
-	})
-	if !f.SkipConfigOnNICMutation {
-		f.xml[domainName] = removeNICFromDomainXML(f.xml[domainName], mac)
-	}
 	f.detachNICN++
 	f.record("detach-nic", domainName, "mac="+mac)
-	return nil
+	missing := "no device found at address '(<null>)' matching MAC address '" + mac + "' and alias '(<null>)'"
+	return libvirt.DetachLiveAndConfig(func(flags uint32) error {
+		return f.detachFlagsLocked(domainName, flags, f.SkipConfigOnNICMutation,
+			nicMacInDomainXML(f.activeBaseline(domainName), mac), nicMacInDomainXML(f.xml[domainName], mac),
+			missing, missing,
+			func() { f.activeXML[domainName] = removeNICFromDomainXML(f.activeBaseline(domainName), mac) },
+			func() { f.xml[domainName] = removeNICFromDomainXML(f.xml[domainName], mac) })
+	})
 }
 
 // SetNICBridge moves domainName's NIC with MAC mac onto bridge in both the
@@ -1546,15 +1635,24 @@ func (f *Fake) DetachHostdev(domainName, pciAddress string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.applyLiveUnplug(domainName, func() {
-		f.activeXML[domainName] = removeHostdevFromDomainXML(f.activeBaseline(domainName), pciAddress)
-	})
-	if !f.SkipConfigOnHostdevMutation {
-		f.xml[domainName] = removeHostdevFromDomainXML(f.xml[domainName], pciAddress)
-	}
 	f.detachHostdevN++
 	f.record("detach-hostdev", domainName, "pci="+pciAddress)
-	return nil
+	return libvirt.DetachLiveAndConfig(func(flags uint32) error {
+		return f.detachFlagsLocked(domainName, flags, f.SkipConfigOnHostdevMutation,
+			hostdevPCIInDomainXML(f.activeBaseline(domainName), pciAddress),
+			hostdevPCIInDomainXML(f.xml[domainName], pciAddress),
+			"host pci device "+pciAddress+" not found", "device not present in domain configuration",
+			func() {
+				f.activeXML[domainName] = removeHostdevFromDomainXML(f.activeBaseline(domainName), pciAddress)
+			},
+			func() { f.xml[domainName] = removeHostdevFromDomainXML(f.xml[domainName], pciAddress) })
+	})
+}
+
+// hostdevPCIInDomainXML reports whether a domain XML carries the <hostdev> whose
+// data-pci attribute is pciAddress — the key DetachHostdev removes by.
+func hostdevPCIInDomainXML(domainXML, pciAddress string) bool {
+	return removeHostdevFromDomainXML(domainXML, pciAddress) != domainXML
 }
 
 // DetachHostdevConfig removes a PCI passthrough device from the PERSISTENT (inactive)
@@ -1884,14 +1982,7 @@ func (f *Fake) DomainDiskSources(domain string) (map[string]string, error) {
 			return nil, err
 		}
 	}
-	out := map[string]string{}
-	for k, v := range f.diskSources[domain] {
-		out[k] = v
-	}
-	if len(out) == 0 {
-		out["vda"] = "/var/lib/litevirt/disks/" + domain + "-root.qcow2"
-	}
-	return out, nil
+	return f.liveDiskSourcesLocked(domain), nil
 }
 
 // cutoverDisks simulates libvirt's external-snapshot overlay rename: each disk

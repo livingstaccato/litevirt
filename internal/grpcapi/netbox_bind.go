@@ -31,7 +31,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	//    NetBoxPrefixID would then allocate from the builtin allocator across an
 	//    already-bound prefix. DurablyLatched requires the persisted marker, not
 	//    just the in-memory flag.
-	if s.gate == nil || !s.gate.DurablyLatched(capabilities.NetBoxIPAMV1) {
+	if g := s.gateV(); g == nil || !g.DurablyLatched(capabilities.NetBoxIPAMV1) {
 		return fmt.Errorf("%s is not durably latched cluster-wide — enable netbox on every node first", capabilities.NetBoxIPAMV1)
 	}
 

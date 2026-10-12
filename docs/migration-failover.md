@@ -280,6 +280,9 @@ lv host drain host-a
 lv host drain host-a --parallel 4    # Migrate 4 VMs at a time
 ```
 
+Drain starts the moves highest compose `migrate.priority` first, ties in name
+order (see [Recovery priority](#recovery-priority)).
+
 Drain live-migrates a running VM whose disks are all on shared storage. Every
 other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
 (see [Cold migration](#cold-migration)): its host-local disks (`local` and
@@ -1375,6 +1378,85 @@ on that data, not a fresh image, and the record clears.
 
 The restart of a VM on its own host never rebuilds a missing disk. That case
 is `vm_disk_missing` in [diagnostics](diagnostics.md).
+
+### Recovery priority
+
+Set `migrate.priority` in compose (a whole number, default `0`; **higher goes
+first**) to say which VMs matter most when there is not room for all of them:
+
+```yaml
+    migrate:
+      on-host-failure: "restart-any"
+      priority: 100
+```
+
+When a host is fenced, the coordinator recovers its VMs highest priority
+first, ties in name order. The placement of every VM that needs one and each
+reschedule's recovery claim and proof follow that order, and placement charges
+each VM's CPU and memory before it places the next. So when the survivors can
+hold only some of the failed host's VMs, the higher-priority ones are placed.
+
+**The rest are not recovered later on their own.** They stay recorded on the
+fenced host, reported like any VM no host can take: a `failover.skip` audit
+entry naming the reason, and the `host.recovery.stalled` notification, which
+names the VM and why. The coordinator decides a fenced host's recovery once,
+so freeing capacity afterwards does not re-run it. Such a VM stays down until
+one of these happens:
+
+- the host comes back. It returns `fenced` if failover moved anything off it,
+  and `lv host undrain <host>` makes it active again;
+- an operator promotes a replica of it, `lv replication promote <vm>`;
+- the host is gone for good, is fenced proof-grade, and is removed with
+  `lv host rm --dead <host>` (try `--dry-run` first). With recovery claims on
+  (the default), the coordinator then recovers the VMs still recorded on the
+  removed host on every cycle, in the same priority order, so make room first
+  and they are placed as it frees.
+
+**Auto-promotion is not ordered against placement.** A VM enrolled in
+auto-promote replication is promoted on the host holding its replica during the
+same pass, before any VM is placed, and takes that host's memory whatever its
+priority. Priority orders promotions among themselves, not against
+reschedules: a priority-0 DR VM promoted onto a survivor can take room a
+higher-priority VM would otherwise have been placed in.
+
+Priority only orders work that is already allowed. Quorum, fencing, recovery
+claims, capacity, placement constraints and the failure policy still decide
+each VM on its own: a high-priority VM with `on-host-failure: none` is still
+not restarted, and one whose proof a gate refuses is still refused.
+
+The same order applies to `lv host drain`, which starts the moves highest
+priority first, so `--parallel N` starts the N highest. Drain chooses every
+VM's target before any move, each on its own, without reserving room for the
+VMs chosen before it, so priority decides which move reaches a target first,
+not which target a VM gets: a later VM can still find its target full and be
+refused there. The order also applies to how a host starts the VMs failover
+sends it; a start deferred from the host's last pass still goes ahead of new
+ones.
+
+A host's start pass has a time budget. A start that is still waiting when the
+budget runs out is retried on a later pass, but only a start that was deferred
+(its storage did not answer in time) is moved to the front of the next pass.
+So a slow start that uses up the budget on every pass can keep the VMs after it
+waiting, and with priority ordering those are the lowest-priority ones. This
+predates priority ordering (before, it was whichever VMs the replica held
+last) and is a tracked follow-up.
+
+It does not order recovery
+across hosts that fail together (each fenced host is recovered in turn),
+`onboot` starts at host boot (`startup-order` does), failback or the
+rebalancer.
+
+Equal-priority VMs, which is every VM until you set one, are now recovered in
+name order. Before this release they went in the order the coordinator's own
+database replica held them, which was not always the same on every node, and
+`migrate.priority` was stored but read by nothing.
+
+**Mixed versions.** The value lives in the VM's stored spec, which every build
+already replicates; no column, statement or protocol field was added. Only a
+coordinator (or a draining or starting host) on this release orders by it. An
+older one ignores it and recovers in its database order, as before, and the
+safety checks are the same either way. Rely on the ordering once every host
+that can hold the failover lease runs this release.
 
 ### Stopped workloads
 

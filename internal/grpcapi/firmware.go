@@ -112,7 +112,10 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 	if cfg.NvramPath != "" {
 		if lv.HasNvram(s.dataDir, spec.Name) {
 			return status.Errorf(codes.FailedPrecondition,
-				"UEFI vars already exist for %q (left by a prior `delete --keep-disks`); restore the VM instead of recreating it", spec.Name)
+				"UEFI vars already exist for %q at %s: a prior `delete --keep-disks` keeps them on purpose (restore the VM "+
+					"instead of recreating it), and a guest the reconciler booted for a since-deleted VM can leave them "+
+					"too (docs/diagnostics.md, orphaned runtimes); remove the file only if no kept VM needs it",
+				spec.Name, cfg.NvramPath)
 		}
 		// Searchable (0711) so the dropped-privilege qemu user can traverse to
 		// the vars file (the file itself is dynamic-owned by libvirt), listable

@@ -764,7 +764,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		releaseHW, hwErr := v.hwPrepareStart(ctx, fresh)
 		if hwErr != nil {
 			slog.Warn("vmcheck: hardware pre-start refused/failed restart", "vm", vm.Name, "error", hwErr)
-			v.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+			v.noteGateRefused(corrosion.ActionReschedule, hwRefusalReason(hwErr))
 			if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error", fmt.Sprintf("hardware pre-start: %v", hwErr)); werr != nil {
 				v.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
@@ -1085,7 +1085,7 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	releaseHW, hwErr := v.hwPrepareStart(ctx, &vm)
 	if hwErr != nil {
 		slog.Warn("vmcheck: hardware pre-start refused/failed restart-policy start", "vm", vm.Name, "error", hwErr)
-		v.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		v.noteGateRefused(corrosion.ActionReschedule, hwRefusalReason(hwErr))
 		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "error",
 			fmt.Sprintf("hardware pre-start: %v", hwErr)); werr != nil {
 			v.noteStateWriteFail(corrosion.OpVMState, werr)

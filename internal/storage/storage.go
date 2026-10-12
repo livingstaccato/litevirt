@@ -131,7 +131,7 @@ func New(dataDir string, cfg Config) (Driver, error) {
 			mountBase:      mountBase,
 			targetOverride: cfg.Target,
 			opts:           cfg.Options,
-			run:            realCmd,
+			run:            nfsRunner(),
 		}, nil
 	case "ceph":
 		return &cephDriver{pool: cfg.Source, name: cfg.Name, opts: cfg.Options, scratch: dataDir}, nil

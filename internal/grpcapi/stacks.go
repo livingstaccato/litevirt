@@ -2122,7 +2122,10 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 
 		// Pull synchronously so the image is ready before VM creation. The
 		// content is published, never written over a file a disk is built
-		// on (image.Store.Publish).
+		// on (image.Store.Publish). Until the catalog row is written, no file
+		// of the image is removed as a deleted image's (holdImagePublish).
+		release := s.holdImagePublish(img)
+		defer release()
 		s.recordImageProvenance(ctx, img)
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)

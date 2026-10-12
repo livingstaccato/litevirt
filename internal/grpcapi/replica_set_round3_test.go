@@ -17,8 +17,8 @@ import (
 // enforceSharedStorageFence makes s enforce the shared-storage fence, as a
 // cluster made by lv host init does, with an execution gate that passes.
 func enforceSharedStorageFence(s *Server) {
-	s.enfSharedStorageFence = true
-	s.gate = fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.SharedStorageFenceV1: true}}
+	s.enfSharedStorageFence.Store(true)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.SharedStorageFenceV1: true}})
 }
 
 // R2-I1: with the shared-storage fence enforced, a promotion that arrives

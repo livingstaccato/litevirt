@@ -502,6 +502,15 @@ func (v *validator) validate(f *File) {
 			continue
 		}
 
+		// migrate.priority is stored as an int32 (MigrationPolicy.priority):
+		// a value outside it used to wrap silently, so 2147483648 was stored
+		// as the LOWEST priority. Clamped, with a WARN, never refused: such a
+		// file deployed before priorities were read, and must keep deploying —
+		// and redeploying it rewrites a VM stored with the wrapped value.
+		if vm.Migrate != nil {
+			vm.Migrate.Priority = clampMigratePriority(p+".migrate.priority", vm.Migrate.Priority)
+		}
+
 		// Validate migration + storage consistency
 		if vm.Migrate != nil && vm.Migrate.Strategy == "live" && !vm.Migrate.WithStorage {
 			for diskName, disk := range vm.Disks {

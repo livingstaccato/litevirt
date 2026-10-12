@@ -100,6 +100,11 @@ type Reconciler struct {
 	// timing race, and lets a test see WHICH context the walk handed down.
 	// Nil in production.
 	startDomainHook func(context.Context)
+	// startRowReadFault, when it returns an error, stands in for a failed
+	// read of the row startRowGone re-reads before the boot. Test-only seam
+	// for the transient read failure a stalled store produces. Nil in
+	// production.
+	startRowReadFault func(name string) error
 	// proofClaimedHook runs right after a pending start has claimed its proof.
 	// Test-only seam: it is the window in which a release of that proof can be
 	// recorded, which the start checkpoint has to catch. Nil in production.
@@ -658,7 +663,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	// budget runs out on every pass; a start whose storage did not answer
 	// goes after those deferred for time (start_deferral.go).
 	deferred := r.startDeferred.take()
-	vms = deferredFirst(vms, deferred)
+	vms = walkOrder(vms, deferred)
 	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
@@ -1757,6 +1762,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	// Whether this VM's UEFI vars were here before this pass defined its
+	// domain: vars a boot creates for a since-deleted record are this pass's
+	// own to remove (start_row_gone.go).
+	nvramBefore := nvramExists(r.dataDir, vm.Name)
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1781,7 +1791,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 	if hwErr != nil {
 		slog.Warn("reconciler: hardware pre-start refused/failed — not starting VM", "vm", vm.Name, "error", hwErr)
-		r.noteGateRefused(corrosion.ActionReschedule, ReasonHardwareBlocked)
+		r.noteGateRefused(corrosion.ActionReschedule, hwRefusalReason(hwErr))
 		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(hwErr), fmt.Sprintf("hardware pre-start: %v", hwErr))
 		return
 	}
@@ -1791,6 +1801,29 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)
+	}
+	// The row this start was decided from must still be this host's at the
+	// moment the domain boots: a delete can tombstone it in the window above
+	// by replication, without this host's start lease (start_row_gone.go).
+	// What this pass defined is its own, so it is taken back, firmware state
+	// kept. A row merely unreadable is transient and is retried next pass,
+	// never parked in error: a proof-gated start is re-armed to pending
+	// (failPendingStart, retryable), and a proof-less one — self-heal,
+	// onboot, whose failPendingStart would write "error", a state no pass
+	// re-drives — writes nothing, since its row already reads "starting" and
+	// the walk's starting case re-drives it. The read is local and is not
+	// cut short by the walk budget: a pass whose budget ran out here still
+	// starts the VM, as it did before this check.
+	if why, unreadable := r.startRowGone(context.WithoutCancel(ctx), vm.Name, fresh.CreatedAt); why != "" {
+		releaseHW()
+		slog.Warn("reconciler: not starting the VM — "+why, "vm", vm.Name)
+		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
+			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
+		}
+		if unreadable && proofID != "" {
+			r.failPendingStart(ctx, vm.Name, proofID, true, "not started: "+why)
+		}
+		return
 	}
 	// A shared disk this host released to another (review c2b) is never
 	// started here again unjudged.
@@ -1830,6 +1863,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// is a VM the cluster cannot account for, and the reconcile retry only
 	// converges it a tick later — after the budget has already cost the lease.
 	commitCtx := context.WithoutCancel(ctx)
+	// The boot and a replicated tombstone cannot be ordered: look before
+	// anything is published — a running write must not land on a row of
+	// the name created since — and once more after (start_row_gone.go).
+	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs), releaseHW, nvramBefore) {
+		return
+	}
 	if proofID != "" {
 		// Routed through the minting chokepoint, which IS the hand-rolled
 		// write-through this block used to carry — same ordering, one
@@ -1848,6 +1887,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
+	if r.startedForGoneRow(commitCtx, *fresh, len(diskConfigs), releaseHW, nvramBefore) {
+		return
+	}
 	r.reportSharedWithheld(commitCtx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))
 	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
 
@@ -2245,6 +2287,16 @@ func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID strin
 			r.noteStateWriteFail(corrosion.OpVMState, werr)
 		}
 	}
+}
+
+// hwRefusalReason is the refusal-metric reason of a pre-start refusal: a
+// disk's storage not mounted (ErrStartStorageNotMounted) is not a hardware
+// one.
+func hwRefusalReason(err error) string {
+	if errors.Is(err, ErrStartStorageNotMounted) {
+		return ReasonStorageNotMounted
+	}
+	return ReasonHardwareBlocked
 }
 
 // hwPrepareRetryable classifies a hardware pre-start error for the proof lifecycle: a

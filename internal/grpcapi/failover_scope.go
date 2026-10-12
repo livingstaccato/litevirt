@@ -80,7 +80,8 @@ func (s *Server) SetFailoverScope(ctx context.Context, req *pb.SetFailoverScopeR
 // failoverScopeSettable reports whether this host may write the policy:
 // failover_scope_v1 durably latched, as the corrosion gate requires too.
 func (s *Server) failoverScopeSettable() bool {
-	return s.gate != nil && s.gate.DurablyLatched(capabilities.FailoverScopeV1)
+	g := s.gateV()
+	return g != nil && g.DurablyLatched(capabilities.FailoverScopeV1)
 }
 
 // unreachableVoters lists the voters this host cannot currently reach: not
@@ -92,8 +93,9 @@ func (s *Server) unreachableVoters(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	reach := map[string]bool{s.hostName: true}
-	if s.gate != nil {
-		for _, p := range s.gate.HealthyPeers(ctx) {
+	gate := s.gateV()
+	if gate != nil {
+		for _, p := range gate.HealthyPeers(ctx) {
 			reach[p] = true
 		}
 	}

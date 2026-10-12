@@ -44,11 +44,12 @@ func newRoleGrantCmd() *cobra.Command {
 		Long: `Grant a role at an RBAC path. Principal forms:
 
   user:<username>
-  group:<group>@<realm>
+  group:<role>@<realm>       (a legacy role: admin, operator, viewer)
+  group:<realm>/<group>      (a directory group; LDAP: its full DN)
 
 Examples:
   lv role grant Admin user:alice --path /
-  lv role grant Operator group:platform-team@oidc --path /projects/acme --propagate
+  lv role grant Operator group:oidc:corp/platform-team --path /projects/acme --propagate
   lv role grant Viewer user:contractor --path /projects/acme/vms/web-1
 
 --propagate causes the binding to apply to every descendant path scope,
@@ -165,7 +166,7 @@ included — changes with it.`,
 			})
 		},
 	}
-	cmd.Flags().StringVar(&principal, "principal", "", "Filter to a single principal (user:foo or group:bar@realm)")
+	cmd.Flags().StringVar(&principal, "principal", "", "Filter to a single principal (user:foo, group:oidc:corp/bar)")
 	cmd.Flags().StringVar(&role, "role", "", "Show only the bindings of this role")
 	return cmd
 }

@@ -386,6 +386,29 @@ func (e *Engine) GrantsAt(principalIDs []string, path string, mustPropagate bool
 	return out
 }
 
+// BindingsOf returns the bindings the live snapshot holds for any of
+// principalIDs, for audit: which binding a principal set holds.
+func (e *Engine) BindingsOf(principalIDs []string) []corrosion.RoleBindingRecord {
+	if e == nil {
+		return nil
+	}
+	snap := e.snap.Load()
+	if snap == nil {
+		return nil
+	}
+	pSet := make(map[string]bool, len(principalIDs))
+	for _, p := range principalIDs {
+		pSet[p] = true
+	}
+	var out []corrosion.RoleBindingRecord
+	for _, b := range snap.bindings {
+		if pSet[b.Principal] {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
 // HasAnyBindingExcept is HasAnyBinding ignoring the binding with id exceptID:
 // whether principalIDs would still hold a binding once that one is revoked.
 func (e *Engine) HasAnyBindingExcept(principalIDs []string, exceptID string) bool {

@@ -269,7 +269,7 @@ func TestOIDCRealm_AuthCodeFlow_HappyPath(t *testing.T) {
 		}
 	}
 	gids := p.GroupPrincipalIDs()
-	wantGIDs := map[string]bool{"group:engineers@oidc:test": true, "group:ops@oidc:test": true}
+	wantGIDs := map[string]bool{"group:oidc:test/engineers": true, "group:oidc:test/ops": true}
 	for _, g := range gids {
 		if !wantGIDs[g] {
 			t.Errorf("unexpected group principal id %q", g)

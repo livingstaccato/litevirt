@@ -248,12 +248,21 @@ func TestEngine_BindingChange_RequiresReload(t *testing.T) {
 // TestPrincipal_PrincipalID + GroupPrincipalIDs verifies the canonical
 // "user:..." / "group:..." format used as role_bindings.principal value.
 func TestPrincipal_PrincipalIDs(t *testing.T) {
-	p := &Principal{Subject: "alice", Realm: "local", Groups: []string{"admins", "ops"}}
-	if got := p.PrincipalID(); got != "user:alice@local" {
-		t.Errorf("PrincipalID = %q, want user:alice@local", got)
+	p := &Principal{Subject: "alice", Realm: "oidc:corp", Groups: []string{"admins", "ops"}}
+	if got := p.PrincipalID(); got != "user:alice@oidc:corp" {
+		t.Errorf("PrincipalID = %q, want user:alice@oidc:corp", got)
 	}
 	groups := p.GroupPrincipalIDs()
-	if len(groups) != 2 || groups[0] != "group:admins@local" || groups[1] != "group:ops@local" {
+	if len(groups) != 2 || groups[0] != "group:oidc:corp/admins" || groups[1] != "group:oidc:corp/ops" {
 		t.Errorf("GroupPrincipalIDs = %v", groups)
+	}
+	// A directory group can never be the synthetic principal of a legacy
+	// role (group:<role>@<realm>): an IdP group named "admin" is
+	// group:oidc:corp/admin (review I1).
+	if g := DirectoryGroupPrincipal("oidc:corp", "admin"); g == "group:admin@oidc:corp" || g != "group:oidc:corp/admin" {
+		t.Errorf("DirectoryGroupPrincipal = %q", g)
+	}
+	if (&Principal{Subject: "bob", Realm: "local", Groups: []string{"admin"}}).GroupPrincipalIDs() != nil {
+		t.Error("the local realm has no directory groups")
 	}
 }

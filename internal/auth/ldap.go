@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
@@ -183,6 +184,11 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		return nil, ErrInvalidCredentials
 	}
 
+	// Group memberships are keyed by each group's full normalized DN, never
+	// by a short name: a cn is unique only within its container, so keying
+	// by it would let anyone who can create a group of that name anywhere
+	// in the directory take on its bindings. memberOf lists every group in
+	// the directory; with group_base_dn set, only groups under it count.
 	groups := entry.GetAttributeValues(r.cfg.UserGroupAttr)
 	if r.cfg.GroupBaseDN != "" {
 		extra, gErr := r.searchGroups(conn, entry.DN)
@@ -195,7 +201,7 @@ func (r *LDAPRealm) Authenticate(ctx context.Context, creds Credentials) (*Princ
 		}
 		groups = append(groups, extra...)
 	}
-	groups = normalizeGroups(groups, r.cfg.GroupNameAttr)
+	groups = normalizeGroupDNs(groups, r.cfg.GroupBaseDN)
 
 	// Name match: the directory matches width, case and compatibility
 	// variants of a name (RFC 4518: `ａｌｉｃｅ` binds as alice's entry); the
@@ -345,7 +351,7 @@ func (r *LDAPRealm) searchGroups(conn LDAPConn, userDN string) ([]string, error)
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 		0, 0, false,
 		filter,
-		[]string{"dn", r.cfg.GroupNameAttr},
+		[]string{"dn"},
 		nil,
 	)
 	res, err := conn.Search(req)
@@ -354,8 +360,8 @@ func (r *LDAPRealm) searchGroups(conn LDAPConn, userDN string) ([]string, error)
 	}
 	out := make([]string, 0, len(res.Entries))
 	for _, e := range res.Entries {
-		if name := firstAttr(e, r.cfg.GroupNameAttr); name != "" {
-			out = append(out, name)
+		if e.DN != "" {
+			out = append(out, e.DN)
 		}
 	}
 	return out, nil
@@ -366,31 +372,61 @@ func substituteUser(filter, username string) string {
 	return strings.ReplaceAll(filter, "%s", esc)
 }
 
-// normalizeGroups extracts a friendly name from each group entry. AD's
-// memberOf attribute returns full DNs ("CN=engineers,OU=Groups,DC=corp,DC=example");
-// we strip to the leading "<attr>=name" component so role-bindings can use
-// short names like "engineers".
-func normalizeGroups(groups []string, attr string) []string {
-	prefix := strings.ToLower(attr) + "="
+// normalizeGroupDNs keys each group by its full DN in one canonical spelling
+// (NormalizeDN), so `CN=Ops,OU=Groups,DC=corp` and `cn=ops, ou=groups,dc=corp`
+// are one group and `cn=ops,ou=contractors,dc=corp` is another. A value that
+// is not a DN is dropped: a bare name cannot say which container's group it
+// is. With base set, only groups at or under it are kept.
+func normalizeGroupDNs(groups []string, base string) []string {
+	var baseDN *ldap.DN
+	if base != "" {
+		if d, err := ldap.ParseDN(base); err == nil {
+			baseDN = d
+		} else {
+			return nil // an unparsable base scopes to nothing rather than everything
+		}
+	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(groups))
 	for _, g := range groups {
-		short := g
-		// If it looks like a DN, take the first RDN matching attr.
-		if strings.Contains(g, ",") {
-			parts := strings.SplitN(g, ",", 2)
-			if strings.HasPrefix(strings.ToLower(parts[0]), prefix) {
-				short = parts[0][len(prefix):]
-			} else {
-				short = parts[0]
-			}
+		d, err := ldap.ParseDN(g)
+		if err != nil || len(d.RDNs) == 0 {
+			continue
 		}
-		if !seen[short] {
-			seen[short] = true
-			out = append(out, short)
+		if baseDN != nil && !baseDN.EqualFold(d) && !baseDN.AncestorOfFold(d) {
+			continue
+		}
+		n := canonicalDN(d)
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
 		}
 	}
 	return out
+}
+
+// NormalizeDN is dn in canonical form: attribute types and values lower-cased,
+// each RDN's attributes in a fixed order, RFC 4514 escaping, no spaces around
+// separators. ok is false when dn does not parse.
+func NormalizeDN(dn string) (string, bool) {
+	d, err := ldap.ParseDN(dn)
+	if err != nil || len(d.RDNs) == 0 {
+		return "", false
+	}
+	return canonicalDN(d), true
+}
+
+func canonicalDN(d *ldap.DN) string {
+	rdns := make([]string, 0, len(d.RDNs))
+	for _, r := range d.RDNs {
+		avas := make([]string, 0, len(r.Attributes))
+		for _, a := range r.Attributes {
+			avas = append(avas, strings.ToLower(a.Type)+"="+ldap.EscapeDN(strings.ToLower(a.Value)))
+		}
+		sort.Strings(avas)
+		rdns = append(rdns, strings.Join(avas, "+"))
+	}
+	return strings.Join(rdns, ",")
 }
 
 func firstAttr(e *ldap.Entry, attr string) string {

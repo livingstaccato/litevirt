@@ -99,7 +99,7 @@ func delegablePath(p string) (string, error) {
 
 // callerPrincipals is principalsForCaller for the request's caller.
 func callerPrincipals(ctx context.Context) []string {
-	return principalsForCaller(callerUsername(ctx), callerRole(ctx), callerRealm(ctx))
+	return principalsForCaller(callerUsername(ctx), callerRole(ctx), callerRealm(ctx), callerGroups(ctx)...)
 }
 
 // callerMayDelegate reports whether the caller holds perm.modify, by name,
@@ -176,6 +176,12 @@ func (s *Server) principalSet(ctx context.Context, principal string) (canonical 
 		if u == nil {
 			return "", nil, false, nil
 		}
+		// The target's directory groups are deliberately NOT in the set
+		// (review ruling on concern 5). They are per session, and the target
+		// may also act through sessions minted without them, API tokens, or
+		// stored actions, all on its legacy role. Leaving them out can only
+		// shrink the set, so HasAnyBinding(set) can only turn a "has a
+		// binding" into a refusal: it under-counts, never over-grants.
 		return "user:" + u.Username + "@" + realm, principalsForCaller(u.Username, u.Role, realm), true, nil
 	}
 	return principal, []string{principal}, true, nil
@@ -205,7 +211,7 @@ func (s *Server) authorizeDelegatedGrant(ctx context.Context, path, role, princi
 	if !ok {
 		return "", "", status.Errorf(codes.PermissionDenied,
 			"a delegated grant must name an existing user with its realm (user:<name>@<realm>) or a "+
-				"group (group:<group>@<realm>); %q is neither", principal)
+				"group (group:<realm>/<group> for a directory group, group:<role>@<realm> for a legacy role); %q is neither", principal)
 	}
 	if !e.HasAnyBinding(set) {
 		return "", "", status.Errorf(codes.PermissionDenied,

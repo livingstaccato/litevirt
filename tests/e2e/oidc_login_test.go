@@ -18,6 +18,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -47,6 +48,11 @@ import (
 //	E2E_OIDC_UI_CA    CA the UI's certificate chains to (default
 //	                  /etc/litevirt/pki/ca.crt)
 //	E2E_OIDC_IDP_CA   CA kanidm's certificate chains to (default: system store)
+//	E2E_OIDC_GROUPS   user=group pairs the IdP's groups claim carries and a
+//	                  group:<realm>/<g> binding exists for (default lab 1's
+//	                  lvadmin=lv-admins,lvoper=lv-operators,lvview=lv-viewers,
+//	                  lvmfa=lv-operators); checked with `lv role ls` as the
+//	                  session (LV_TOKEN). Set to "-" to skip the group check.
 //
 // Run on a cluster node that resolves the IdP (lab 1: node-6). Credentials are
 // read from files, never from the command line.
@@ -238,6 +244,20 @@ func kanidmAuthorise(t *testing.T, br *http.Client, authURL, bearer string) stri
 	return loc
 }
 
+// oidcExpectedGroup is the group E2E_OIDC_GROUPS maps user to, "" for none.
+func oidcExpectedGroup(user string) string {
+	spec := envOr("E2E_OIDC_GROUPS", "lvadmin=lv-admins,lvoper=lv-operators,lvview=lv-viewers,lvmfa=lv-operators")
+	if spec == "-" {
+		return ""
+	}
+	for _, kv := range strings.Split(spec, ",") {
+		if u, g, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && u == user {
+			return g
+		}
+	}
+	return ""
+}
+
 // TestOIDC_LiveIdPSignInThroughTheWebUI signs each lab user in through the
 // node's UI and kanidm, and checks the session: set, usable, and in the realm.
 // lvmfa signs in with password + TOTP at kanidm (its account policy); with no
@@ -305,6 +325,20 @@ func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusFound {
 				t.Fatalf("dashboard with the OIDC session bounced to %q: the session is not accepted", resp.Header.Get("Location"))
+			}
+
+			// The group binding applies to the session: listed as the user's own
+			// by `lv role ls` run with the session as bearer.
+			if want := oidcExpectedGroup(user); want != "" {
+				cmd := exec.Command(lvBin, "role", "ls")
+				cmd.Env = append(lvEnv(), "LV_TOKEN="+session)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("lv role ls as %s: %v\n%s", user, err, out)
+				}
+				if p := "group:" + realm + "/" + want; !strings.Contains(string(out), p) {
+					t.Fatalf("lv role ls as %s does not list %s, the binding its verified group holds:\n%s", user, p, out)
+				}
 			}
 
 			// The callback replayed mints nothing: the state is single-use.

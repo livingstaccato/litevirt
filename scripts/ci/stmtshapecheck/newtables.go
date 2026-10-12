@@ -164,6 +164,12 @@ var firstShapeAcks = map[string]string{
 		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
 		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
 		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it, inserting the session alone",
+	"session_groups": "the only writer is corrosion.InsertSessionWithLoginData, which writes the row only with " +
+		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"these tables and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks each listed writer takes and checks the grant; the zero grant writes none of it, inserting the session alone",
 	"user_identity_bindings": "every writer (corrosion.BindIdentity, ClearIdentityBinding, ClearIdentityBindingRows, " +
 		"and the per-row clears and restores DeleteUserCounted and the admin floor append) writes only with " +
 		"a capabilities.FeatureGrant for FeatureLoginPolicy, which only health.Checker.WithFeature mints: " +

@@ -113,7 +113,7 @@ The project name is also the RBAC path under `/projects/`. To grant
 a team Operator on their slice:
 
 ```bash
-lv role grant Operator group:acme-eng@oidc:corp --path /projects/acme --propagate
+lv role grant Operator group:oidc:corp/acme-eng --path /projects/acme --propagate
 ```
 
 The grant covers every VM, network, and stack created under `acme`

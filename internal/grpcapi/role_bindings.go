@@ -26,7 +26,7 @@ import (
 //   - role must be non-empty; existence is checked against the
 //     in-memory engine snapshot so a typo doesn't quietly create an
 //     unusable row.
-//   - principal must be "user:<name>" or "group:<name>@<realm>".
+//   - principal must be "user:<name>" "group:<role>@<realm>", or "group:<oidc|ldap>:<realm>/<group>".
 //
 // Idempotency: a binding is keyed by id. We mint a fresh id on every
 // GrantRole call, so re-running the RPC creates a second row — this
@@ -51,13 +51,27 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 	}
 	if !isWellFormedPrincipal(req.Principal) {
 		return nil, status.Error(codes.InvalidArgument,
-			"principal must be user:<name> or group:<name>@<realm>")
+			"principal must be user:<name>, group:<role>@<realm>, or a directory group group:<oidc|ldap>:<realm>/<group>")
 	}
 
 	// Realm-aware grammar (opt-in via auth.rbac_realm): reject or canonicalize a
 	// bare user:<name> so this node never mints an inert bare binding. When the
 	// flag is off, principals are stored verbatim (legacy behavior).
 	principal := req.Principal
+	// An LDAP directory group is its normalized DN, which is what sessions
+	// carry; a DN typed as the directory shows it (CN=X,OU=Groups,...) would
+	// otherwise be a binding that silently matches nothing (re-review m3).
+	if body, ok := strings.CutPrefix(principal, "group:ldap:"); ok {
+		if realm, dn, ok := strings.Cut(body, "/"); ok {
+			canon, parsed := auth.NormalizeDN(dn)
+			if !parsed {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"%q names an LDAP directory group by %q, which is not a DN: an LDAP group is its full DN "+
+						"(group:ldap:<realm>/cn=<group>,ou=...)", principal, dn)
+			}
+			principal = "group:ldap:" + realm + "/" + canon
+		}
+	}
 	if s.rbacRealmConfigured() {
 		resolved, err := s.resolveGrantPrincipal(ctx, principal)
 		if err != nil {
@@ -212,7 +226,8 @@ func (s *Server) ListRoleBindings(ctx context.Context, req *pb.ListRoleBindingsR
 		// Non-admins can only filter to their own principal — or, for a
 		// delegated administrator, see that principal's bindings at the paths
 		// it administers.
-		self := isSelfPrincipal(req.Principal, caller, callerRealm(ctx))
+		self := isSelfPrincipal(req.Principal, caller, callerRealm(ctx)) ||
+			isCallerGroupPrincipal(req.Principal, callerRealm(ctx), callerGroups(ctx))
 		if !isAdmin && !self && !delegate {
 			return nil, status.Error(codes.PermissionDenied,
 				"non-admin callers may only list their own bindings")
@@ -224,7 +239,7 @@ func (s *Server) ListRoleBindings(ctx context.Context, req *pb.ListRoleBindingsR
 	} else {
 		rows, err = corrosion.ListRoleBindings(ctx, s.db)
 		if err == nil && !isAdmin {
-			own := filterBindingsForCaller(rows, caller, callerRealm(ctx))
+			own := filterBindingsForCaller(rows, caller, callerRealm(ctx), callerGroups(ctx)...)
 			seen := make(map[string]bool, len(own))
 			for _, b := range own {
 				seen[b.ID] = true
@@ -273,7 +288,7 @@ func (s *Server) NormalizeRoleBindings(ctx context.Context, req *pb.NormalizeRol
 	for _, b := range rows {
 		body, ok := strings.CutPrefix(b.Principal, "user:")
 		if !ok {
-			continue // group:<g>@<realm> — already realm-qualified
+			continue // group:<role>@<realm> / group:<realm>/<g> — already realm-qualified
 		}
 		if _, _, qualified := classifyUserPrincipal(body); qualified {
 			continue
@@ -343,7 +358,7 @@ func classifyUserPrincipal(body string) (name, realm string, qualified bool) {
 
 // resolveGrantPrincipal applies realm-aware grammar to a well-formed principal
 // when auth.rbac_realm is on (callers gate on rbacRealmConfigured first). A
-// realm-qualified principal — or any group:<g>@<realm> — passes through
+// realm-qualified principal — or any group principal — passes through
 // unchanged. A bare user:<name> is either RESOLVED to canonical form (only once
 // the RBACRealmV1 capability is latched cluster-wide, so no peer still mints
 // bare bindings) or REJECTED (pre-latch), so this node never adds a new inert
@@ -352,7 +367,7 @@ func classifyUserPrincipal(body string) (name, realm string, qualified bool) {
 func (s *Server) resolveGrantPrincipal(ctx context.Context, principal string) (string, error) {
 	body, ok := strings.CutPrefix(principal, "user:")
 	if !ok {
-		return principal, nil // group:<g>@<realm> — already realm-qualified
+		return principal, nil // group:<role>@<realm> / group:<realm>/<g> — already realm-qualified
 	}
 	if _, _, qualified := classifyUserPrincipal(body); qualified {
 		return principal, nil
@@ -372,15 +387,23 @@ func (s *Server) resolveGrantPrincipal(ctx context.Context, principal string) (s
 	return "user:" + body + "@local", nil
 }
 
-// isWellFormedPrincipal accepts the two principal shapes the RBAC
-// engine resolves: `user:<name>` and `group:<group>@<realm>`. Anything
-// else would never match a row and confuse operators.
+// isWellFormedPrincipal accepts the principal shapes the RBAC engine
+// resolves: `user:<name>`, the legacy-role `group:<role>@<realm>`, and a
+// directory group `group:<oidc|ldap>:<realm>/<group>`
+// (auth.DirectoryGroupPrincipal). Anything else would never match a row and
+// confuse operators.
 func isWellFormedPrincipal(p string) bool {
 	switch {
 	case strings.HasPrefix(p, "user:") && len(p) > len("user:"):
 		return true
 	case strings.HasPrefix(p, "group:"):
 		body := p[len("group:"):]
+		if strings.HasPrefix(body, "oidc:") || strings.HasPrefix(body, "ldap:") {
+			if realm, group, ok := strings.Cut(body, "/"); ok && strings.Contains(realm, ":") &&
+				!strings.HasSuffix(realm, ":") && group != "" {
+				return true
+			}
+		}
 		if i := strings.IndexByte(body, '@'); i > 0 && i < len(body)-1 {
 			return true
 		}
@@ -398,13 +421,13 @@ func filterBindings(all []corrosion.RoleBindingRecord, keep func(corrosion.RoleB
 	return out
 }
 
-func filterBindingsForCaller(all []corrosion.RoleBindingRecord, caller, realm string) []corrosion.RoleBindingRecord {
+func filterBindingsForCaller(all []corrosion.RoleBindingRecord, caller, realm string, groups ...string) []corrosion.RoleBindingRecord {
 	if caller == "" {
 		return nil
 	}
 	out := make([]corrosion.RoleBindingRecord, 0, len(all))
 	for _, b := range all {
-		if isSelfPrincipal(b.Principal, caller, realm) {
+		if isSelfPrincipal(b.Principal, caller, realm) || isCallerGroupPrincipal(b.Principal, realm, groups) {
 			out = append(out, b)
 		}
 	}
@@ -420,6 +443,21 @@ func isSelfPrincipal(principal, caller, realm string) bool {
 		realm = "local"
 	}
 	return principal == "user:"+caller || principal == "user:"+caller+"@"+realm
+}
+
+// isCallerGroupPrincipal reports whether principal is one of the caller's
+// session directory groups (group:<realm>/<g>), so a caller can see the
+// bindings that apply to them through a group.
+func isCallerGroupPrincipal(principal, realm string, groups []string) bool {
+	if realm == "" || realm == "local" {
+		return false
+	}
+	for _, g := range groups {
+		if principal == auth.DirectoryGroupPrincipal(realm, g) {
+			return true
+		}
+	}
+	return false
 }
 
 func bindingToPB(b corrosion.RoleBindingRecord) *pb.RoleBinding {

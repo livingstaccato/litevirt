@@ -1154,7 +1154,8 @@ lv role revoke <binding-id>
 lv role ls [--principal user:alice] [--role <role>]
 ```
 
-Principals are `user:<name>` or `group:<name>@<realm>`. Paths are RBAC
+Principals are `user:<name>`, `group:<role>@<realm>` (a legacy role), or a
+directory group `group:<realm>/<group>` (an LDAP group is its DN). Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
 

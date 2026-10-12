@@ -138,10 +138,10 @@ func TestLDAPRealm_HappyPath(t *testing.T) {
 	if p.Email != "alice@example.test" {
 		t.Errorf("Email = %q", p.Email)
 	}
-	wantGroups := map[string]bool{"engineers": true, "ops": true}
+	wantGroups := map[string]bool{"cn=engineers,ou=groups,dc=corp,dc=example": true, "cn=ops,ou=groups,dc=corp,dc=example": true}
 	for _, g := range p.Groups {
 		if !wantGroups[g] {
-			t.Errorf("unexpected group %q (raw memberOf list should be normalized)", g)
+			t.Errorf("unexpected group %q (memberOf DNs should be normalized, not shortened)", g)
 		}
 	}
 	if len(p.Groups) != 2 {
@@ -237,23 +237,97 @@ func TestLDAPRealm_DialFailure_Unavailable(t *testing.T) {
 	}
 }
 
-// TestLDAPRealm_NormalizeGroupsFromMemberOf isolates the DN→short-name
-// transform so AD-style memberOf lists end up as ["engineers", "ops"].
+// TestLDAPRealm_NormalizeGroupsFromMemberOf: groups are keyed by their full
+// normalized DN (review I2). Spellings of one DN are one group; a group of the
+// same cn in another container is ANOTHER group (it used to collapse onto the
+// first by its short name); a bare name, which names no container, is dropped.
 func TestLDAPRealm_NormalizeGroupsFromMemberOf(t *testing.T) {
 	groups := []string{
 		"CN=engineers,OU=Groups,DC=corp,DC=example",
-		"cn=ops,ou=Groups,dc=corp,dc=example", // case-mixed
-		"engineers",                           // already short
-		"CN=engineers,OU=Other,DC=x",          // duplicate by short name
+		"cn=ops, ou=Groups,dc=corp,dc=example", // case-mixed, spaced
+		"engineers",                            // not a DN
+		"CN=Engineers,OU=Groups,DC=Corp,DC=Example",
+		"CN=engineers,OU=Other,DC=x", // same cn, another container
 	}
-	out := normalizeGroups(groups, "cn")
-	want := []string{"engineers", "ops"}
+	out := normalizeGroupDNs(groups, "")
+	want := []string{"cn=engineers,ou=groups,dc=corp,dc=example", "cn=ops,ou=groups,dc=corp,dc=example", "cn=engineers,ou=other,dc=x"}
 	if len(out) != len(want) {
 		t.Fatalf("normalized = %v, want %v", out, want)
 	}
 	for i, g := range want {
 		if out[i] != g {
 			t.Errorf("normalized[%d] = %q, want %q", i, out[i], g)
+		}
+	}
+}
+
+// TestLDAPRealm_GroupsScopedToGroupBaseDN (review I2): with group_base_dn
+// set, memberOf groups outside it do not count — a helpdesk-created
+// `CN=lv-admins` in another OU is not the managed lv-admins — and the group
+// search's results are keyed by DN too.
+func TestLDAPRealm_GroupsScopedToGroupBaseDN(t *testing.T) {
+	userDN := "uid=alice,ou=Users,dc=corp,dc=example"
+	conn := &fakeLDAPConn{
+		userPasswords: map[string]string{"cn=svc,dc=corp,dc=example": "svc-pw", userDN: "alice-pw"},
+		userEntries: map[string]*ldap.Entry{
+			"(&(objectClass=person)(|(uid=alice)(sAMAccountName=alice)))": makeUserEntry(
+				userDN, "Alice", "alice@example.test",
+				[]string{
+					"CN=lv-admins,OU=Groups,DC=corp,DC=example",
+					"CN=lv-admins,OU=Helpdesk,DC=corp,DC=example",
+				},
+			),
+			"(member=" + ldap.EscapeFilter(userDN) + ")": {DN: "CN=lv-operators, OU=Groups,DC=corp,DC=example"},
+		},
+	}
+	realm, err := NewLDAPRealm(LDAPConfig{
+		ShortName: "corp", URL: "ldaps://ad.example",
+		BindDN: "cn=svc,dc=corp,dc=example", BindPassword: "svc-pw",
+		UserBaseDN: "ou=Users,dc=corp,dc=example", GroupBaseDN: "ou=Groups,dc=corp,dc=example",
+		GroupFilter: "(member=%s)",
+		Dialer:      &fakeDialer{conn: conn},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := realm.Authenticate(context.Background(), Credentials{Username: "alice", Password: "alice-pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"cn=lv-admins,ou=groups,dc=corp,dc=example": true, "cn=lv-operators,ou=groups,dc=corp,dc=example": true}
+	if len(p.Groups) != len(want) {
+		t.Fatalf("groups %v, want %v", p.Groups, want)
+	}
+	for _, g := range p.Groups {
+		if !want[g] {
+			t.Fatalf("group %q outside group_base_dn or not normalized (all: %v)", g, p.Groups)
+		}
+	}
+	if ids := p.GroupPrincipalIDs(); ids[0] != "group:ldap:corp/"+p.Groups[0] {
+		t.Fatalf("principal %v", ids)
+	}
+}
+
+// TestNormalizeGroupDNs_RDNBoundaries (re-review m5): group_base_dn scoping
+// compares RDNs, not text — a DN whose string ends with the base's but whose
+// RDNs do not (an escaped comma, a value swallowing the base's text) is not
+// under it — and one multi-valued RDN in two orders is one group.
+func TestNormalizeGroupDNs_RDNBoundaries(t *testing.T) {
+	base := "ou=Groups,dc=corp,dc=example"
+	out := normalizeGroupDNs([]string{
+		`cn=lv-admins,ou=evil\,ou=Groups,dc=corp,dc=example`, // escaped comma: ou is "evil,ou=Groups"
+		"cn=lv-admins,ou=Groups,dc=corp,dc=example",
+		"cn=ops+uid=7,ou=Groups,dc=corp,dc=example",
+		"uid=7+cn=ops,ou=Groups,dc=corp,dc=example",
+		"cn=x,ou=Groups,dc=corp,dc=example,dc=evil", // the base's text, not its position
+	}, base)
+	want := []string{"cn=lv-admins,ou=groups,dc=corp,dc=example", "cn=ops+uid=7,ou=groups,dc=corp,dc=example"}
+	if len(out) != len(want) {
+		t.Fatalf("normalized %v, want %v", out, want)
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("normalized %v, want %v", out, want)
 		}
 	}
 }

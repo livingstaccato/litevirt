@@ -522,7 +522,13 @@ import (
 //	     host_runtime; the hosts columns stay current for a node rolled back
 //	     one release until host_runtime_retire_v1 latches, and are never
 //	     cleared. No created_at, for the v56 reason. One new table.
-const CurrentSchemaVersion = 65
+//	v66: session_groups (session_id PK; realm, groups_json, recorded_at): the
+//	     directory groups an external-realm login verified (the OIDC groups
+//	     claim, the LDAP group search), so `group:<realm>/<g>` role bindings
+//	     apply to that session. Written in the session's own batch, like
+//	     session_factors, and only with the release feature login_policy; left
+//	     out of anti-entropy like sessions. No row = no groups. One new table.
+const CurrentSchemaVersion = 66
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1856,7 +1862,7 @@ var schemaDDL = []string{
 
 	// Path × role × principal bindings. principal is one of:
 	//   user:<username>           — direct user binding
-	//   group:<group>@<realm>     — group binding from realm sync
+	//   group:<realm>/<group>     — a directory group (group:<role>@<realm>: a legacy role)
 	`CREATE TABLE IF NOT EXISTS role_bindings (
 		id           TEXT PRIMARY KEY,
 		path         TEXT NOT NULL,
@@ -2986,6 +2992,16 @@ var schemaDDL = []string{
 		updated_at           TEXT NOT NULL,
 		deleted_at           TEXT
 	)`,
+	// v66 the directory groups a session's external-realm login verified; see
+	// session_groups.go. No row = no groups.
+	`CREATE TABLE IF NOT EXISTS session_groups (
+		session_id  TEXT PRIMARY KEY,
+		realm       TEXT NOT NULL,
+		groups_json TEXT NOT NULL DEFAULT '[]',
+		recorded_at TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3185,6 +3201,7 @@ var tablePrimaryKeys = map[string][]string{
 	"user_enrollment_codes":   {"username"},
 	"user_identity_bindings":  {"username", "realm", "external_id"},
 	"host_runtime":            {"host_name"},
+	"session_groups":          {"session_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3562,6 +3579,7 @@ var createTableUnits = []struct {
 	{64, "user_lifecycle"}, {64, "session_factors"}, {64, "user_enrollment_codes"},
 	{64, "user_identity_bindings"},
 	{65, "host_runtime"},
+	{66, "session_groups"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

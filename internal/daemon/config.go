@@ -561,6 +561,34 @@ func (a AutoUpgradeConfig) Interval() time.Duration {
 // AuthConfig is the YAML wrapper around auth.RealmConfig. We delegate
 // to the auth package's typed struct so the YAML tags live next to
 // the constructor logic.
+//
+// MaxSessionHardExpiry caps auth.session_hard_expiry. A session carries the
+// directory groups its login verified until it ends, and nothing outside the
+// session (no back-channel) can take a group away mid-session, so the cap is
+// the longest a removed group can keep granting to a session nobody revoked.
+const MaxSessionHardExpiry = 30 * 24 * time.Hour
+
+// clampSessionHardExpiry lowers a session_hard_expiry above
+// MaxSessionHardExpiry to the maximum, with a startup warning naming the
+// configured and the effective value. It never refuses: a value the previous
+// release accepted must not stop a node from starting (secure the feature,
+// never brick the upgrade). An unparsable value keeps its old treatment (a
+// logged warning and the default, parseDurationOr).
+func clampSessionHardExpiry(a *AuthConfig) {
+	if a.SessionHardExpiry == "" {
+		return
+	}
+	d, err := time.ParseDuration(a.SessionHardExpiry)
+	if err != nil || d <= MaxSessionHardExpiry {
+		return
+	}
+	effective := MaxSessionHardExpiry.String()
+	slog.Warn("auth.session_hard_expiry is above the maximum and is clamped: a session keeps the directory "+
+		"groups it was minted with until it ends, so its lifetime is capped",
+		"configured", a.SessionHardExpiry, "effective", effective, "maximum", "30 days")
+	a.SessionHardExpiry = effective
+}
+
 type AuthConfig struct {
 	Realms []auth.RealmConfig `yaml:"realms,omitempty"`
 	// Session lifetimes as Go durations (e.g. "8h", "168h"). Empty = built-in
@@ -1057,6 +1085,7 @@ func LoadConfig() (*Config, error) {
 	if _, err := cfg.BackupBandwidthLimits(); err != nil {
 		return nil, err
 	}
+	clampSessionHardExpiry(&cfg.Auth)
 	if _, err := auth.ParseTrustedProxies(cfg.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("config %w", err)
 	}

@@ -734,18 +734,67 @@ old owner, so a second promotion of the same VM is judged by that old owner,
 exactly as the first was; and a row left naming a host the VM has since left
 does not excuse the host the VM was running on.
 
-The remedy is to prove the owner off **before** promoting: once it is powered
-off, `lv host fence-confirm <host>` (a removed host is accepted, see
+The remedy is to prove the owner off: once it is powered off,
+`lv host fence-confirm <host>` (a removed host is accepted, see
 docs/migration-failover.md), or an IPMI fence. A promotion made after that
-reattaches the disk. Confirming a removed host also lets the failover
+reattaches the disk, and so does the next start of a VM already promoted
+without it: `lv restart <vm>`. Confirming a removed host also lets the failover
 coordinator, with recovery claims enforced, recover every workload still
 recorded on it, possibly before your promotion runs. A node still on an older
 build answers "not found" for a removed host, so set `LV_HOST` to an upgraded
-node. No command attaches an existing disk at its path to a VM
-already promoted, and re-running `lv replication promote <vm> --force` over a
-partial promotion is not a remedy: it destroys the promoted domain, then
-rebuilds the disks from their replicas (losing what the promoted VM wrote) or
-refuses the root's live file, which is already there.
+node. Re-running `lv replication promote <vm> --force` over a partial
+promotion is not a remedy: it is refused. The promoted VM runs from live
+disks that promotion built and has written to them since, which no replica on
+that host holds, so a same-name promotion over a VM whose disk rows name such
+a live disk there is refused, `--force` or not, rather than rebuild them from
+a replica and discard those writes. To have both, promote the replica under
+another name (`--new-name`). Every refusal of a promotion comes before the
+domain already defined under the name is destroyed: a `--force` promotion
+replaces that domain only once nothing is left to refuse.
+
+A partial promotion leaves the unattached shared disk's row naming its old
+owner, and every domain built from a VM's disk rows judges such a row the
+same way: the reconciler's start (onboot, or the restart of a VM whose domain
+is gone), an operator's `lv start` or `lv restart` of a VM with a shared disk
+whose row names another host (the domain is redefined from the rows first),
+and a redefine by `lv update` or a device hot-plug. A shared disk whose row
+names another host is attached only when that host is proven powered off,
+as above; otherwise the domain is built without it, the VM starts anyway, and
+the VM records a `vm.shared_disk_withheld` event, a `vm.shared_disk_withheld`
+notification and a durable condition (`vm.shared_disk_withheld`, evaluator
+`shared_disk_start`) that `lv inspect <vm>` shows as `sharedDiskWithheld`
+until a build withholds nothing. It names each disk, why, and the remedy:
+`lv host fence-confirm <host>` once the host is powered off, then
+`lv restart <vm>`. A disk whose row names this host or no host, or that is
+not on shared storage, is attached as before. A withheld boot disk (the disk
+named `root`, or the one at `vda`, `sda` or `hda`) is different: a domain
+without it boots nothing, so the VM is not started at all until its host is
+proven off (a recovery retries; a local start records the VM in error with
+the same text, and `lv start` after the confirmation builds it again). An
+operator's `lv start` of a VM that is already running leaves its definition
+alone. Leaving a disk out can change how the guest numbers the disks after it
+(a domain built from the rows gives them consecutive devices), so a guest
+that mounts by `/dev/vdX` rather than by label or UUID may find a different
+filesystem there until the disk is attached again.
+
+Such a row keeps naming its host through every move of the VM until that
+host is proven off: a failover reschedule, a migration's ownership commit,
+failover's move of a stopped VM, and an owner repair re-point every other
+disk row to the VM's new host, but not a shared disk's row that names a
+third host — neither the one the VM leaves nor the one it goes to — that is
+not proven off. Re-pointed, it would read as the new host's own at the next
+start and be attached unjudged. `lv doctor repair-owner` re-homes such a row
+only when the host it names is active, reachable, and attests that no domain
+defined on it, running or not, uses the disk — the case of a migration whose
+ownership commit declined, whose rows name the source, still in service. The
+host attests under its start lock and records the release, and from then on
+refuses to start any domain using that disk until the VM's own row for it
+names that host again (the VM moved back). Otherwise — the host fenced,
+offline, removed, unreachable, on a build without the attestation, or with a
+domain still using the disk — repair-owner refuses and names
+`lv host fence-confirm <host>`. A `move-volume` of such a disk is refused
+the same way: copying it while its host may still write it would move a
+disk two hosts write.
 
 "Shared" here is one definition, used by this rule and by every shared-disk
 fence check (failover's decision, the promoting host's, the host that starts
@@ -759,8 +808,10 @@ hung NFS mount is given up on, and the root is promoted without it). A
 renamed promotion never attaches it: the disk belongs to the original VM.
 Whenever it is not attached the VM is promoted exactly as main promoted it,
 and the partial report names it as shared at its path, with why, and either
-the remedy above (`lv host fence-confirm <host>` once it is powered off,
-before promoting, and not to re-run the promotion over this one) or, for a
+the remedy above (`lv host fence-confirm <host>` once it is powered off, then
+`lv restart <vm>`, and not to re-run the promotion over this one), with the
+confirmation's side effect: it may also let the failover coordinator recover
+every workload still recorded on that host, or, for a
 renamed promotion, that it belongs to the original and must not be attached
 to the copy.
 

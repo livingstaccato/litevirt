@@ -116,6 +116,14 @@ type Reconciler struct {
 	// pitFeature is this host's pit_overlay release-feature gate
 	// (SetPITOverlayFeature); nil is closed: overlays are held, never settled.
 	pitFeature pitoverlay.Gate
+	// sharedWithheldReport / sharedWithheldClear report a VM started without
+	// a shared disk whose row names an unproven host, and a start that
+	// withheld none (SetSharedDiskWithheldReporter).
+	sharedWithheldReport func(ctx context.Context, vm, detail string)
+	sharedWithheldClear  func(ctx context.Context, vm string)
+	// sharedWithheldReported: the VMs already reported when no reporter is
+	// wired, so a bare reconciler records the event once per VM.
+	sharedWithheldReported sync.Map
 	// pitHeldReported: the holds already reported when no reporter is wired
 	// (reportPITHeld).
 	pitHeldReported sync.Map
@@ -1592,6 +1600,31 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// A shared disk whose row names another host — a partial promotion leaves
+	// one naming the VM's old owner, which was not proven off — is attached
+	// only once that host is proven powered off (review R4-I2): this start
+	// builds the domain from every live row, and attaching it while that host
+	// may still run its qemu is two writers on one disk. Such a disk is left
+	// out and reported, never the whole start refused: main started the VM.
+	_, withheld := corrosion.JudgeSharedDiskRows(ctx, r.db, diskRecords, r.hostName, func(d corrosion.DiskRecord) bool {
+		return corrosion.DiskOnSharedStorage(ctx, r.db, d, r.hostName)
+	})
+	withheldDisk := map[string]bool{}
+	for _, w := range withheld {
+		withheldDisk[w.Disk.DiskName] = true
+	}
+	// A withheld boot disk (review m1): the VM would boot nothing, so the
+	// start waits for the proof instead (a pending transfer retries; a local
+	// start is left in error with the remedy, and `lv start` after the proof
+	// builds it again).
+	if boot, ok := corrosion.WithheldBootDisk(withheld); ok {
+		detail := corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld)
+		r.reportSharedWithheld(ctx, vm.Name, detail)
+		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("not started: its boot disk %s is withheld; %s",
+			boot.Disk.DiskName, detail))
+		return
+	}
+
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {
 		if transfer {
@@ -1663,6 +1696,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 					fmt.Sprintf("disk %s not found at %s (no backing image for auto-pull)", d.DiskName, d.Path))
 				return
 			}
+		}
+		if withheldDisk[d.DiskName] {
+			// Checked for presence like every disk (a missing one refuses
+			// the start, as on main), but not attached.
+			continue
 		}
 		bus := "virtio"
 		if len(spec.Disks) > 0 {
@@ -1754,7 +1792,18 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)
 	}
-	if err := r.virt.StartDomain(vm.Name); err != nil {
+	// A shared disk this host released to another (review c2b) is never
+	// started here again unjudged.
+	releaseGuard, gerr := GuardSharedDiskStart(ctx, r.db, r.dataDir, r.hostName, vm.Name, domXML)
+	if gerr != nil {
+		releaseHW()
+		slog.Warn("reconciler: start refused — a shared disk this host released", "vm", vm.Name, "error", gerr)
+		r.failPendingStart(ctx, vm.Name, proofID, false, gerr.Error())
+		return
+	}
+	startErr := r.virt.StartDomain(vm.Name)
+	releaseGuard()
+	if err := startErr; err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt
@@ -1799,12 +1848,47 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
+	r.reportSharedWithheld(commitCtx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))
 	slog.Info("reconciler: VM started successfully", "vm", vm.Name)
 
 	// Notify LB to refresh backends now that this VM is running.
 	if r.onVMStarted != nil && vm.StackName != "" {
 		go r.onVMStarted(context.Background(), vm.StackName)
 	}
+}
+
+// SetSharedDiskWithheldReporter wires the report of a VM whose domain was
+// built without a shared disk whose row names a host not proven off, and of
+// one built withholding none (grpcapi.Server.ReportSharedDiskWithheld and
+// ClearSharedDiskWithheld: a durable per-VM health condition shown by
+// `lv inspect`, notified when it is raised or changes).
+func (r *Reconciler) SetSharedDiskWithheldReporter(held func(ctx context.Context, vm, detail string), cleared func(ctx context.Context, vm string)) {
+	r.sharedWithheldReport, r.sharedWithheldClear = held, cleared
+}
+
+// reportSharedWithheld reports detail (corrosion.WithheldSharedDiskDetail)
+// for vm through the wired reporter, or clears it when detail is "". Without
+// a reporter (a bare reconciler) it logs and records the event once per VM.
+func (r *Reconciler) reportSharedWithheld(ctx context.Context, vm, detail string) {
+	if detail == "" {
+		r.sharedWithheldReported.Delete(vm)
+		if r.sharedWithheldClear != nil {
+			r.sharedWithheldClear(ctx, vm)
+		}
+		return
+	}
+	if r.sharedWithheldReport != nil {
+		r.sharedWithheldReport(ctx, vm, detail)
+		return
+	}
+	if _, done := r.sharedWithheldReported.LoadOrStore(vm, true); done {
+		return
+	}
+	slog.Error("reconciler: "+detail, "vm", vm)
+	_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+		ID: randid.New(), VMName: vm, HostName: r.hostName, Type: "vm.shared_disk_withheld",
+		Result: "error", Severity: "error", Detail: detail, Username: "reconciler",
+	})
 }
 
 // SetPITOverlayReporter wires the report of a VM the define path holds on an

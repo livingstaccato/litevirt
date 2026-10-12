@@ -700,6 +700,20 @@ path as after `lv host rm --dead`, once the removal and the host's certificate
 revocation have replicated. That can happen before a promotion you run next,
 so confirm a removed host only when you want its workloads recovered.
 
+**An operator's promotion and failover's recovery of the same VM never both
+start it.** With recovery claims enforced, a same-name `lv replication promote`
+of a VM recorded on another host claims the VM's recovery at its current owner
+epoch just before it starts the VM (docs/design/recovery-claims.md §10 item
+43). Whichever is decided first runs the VM. A promotion that comes second is
+refused with the decision it lost to, `<action> to <host> by <coordinator>
+(proof <id>)`, and what to wait for (`lv inspect <vm>` shows where it runs,
+`lv cluster claim vm/<vm>` the decision); a coordinator that comes second
+stands down. The promotion goes ahead unclaimed only when a majority of voters
+still reach the VM's owner, where no recovery can be certified either. Without
+claims, a promotion refuses while this host's replica holds a reschedule or
+promote proof of the VM in flight at its current owner epoch (written within
+the last hour, or with a start recorded): best effort, as a replica can lag.
+
 The confirmation of a removed host needs a node on a build that has it. A
 node still on an older build answers `host "<host>" not found` for a removed
 host, as it always did; during a rolling upgrade, point `lv` at an upgraded
@@ -941,14 +955,22 @@ Recording the host `active` once it serves changes only an `upgrading` host,
 and never its isolation.
 
 The same holds for the proof-grade fence `lv host rm --dead` rests on, which
-counts at any age, and for the one a lost voter's removal and a superseded
-claim rest on. A proof-grade row from before the host was last recorded as it
-is now — admitted (`joining`), booted (`active`), lost unfenced (`offline`),
-drained — is about an earlier life and does not count, so a machine `lv host
-add` put under a removed host's name is not removed on the old machine's
-confirmation: `lv host fence-confirm` it once it is powered off. A host
-recorded `fenced` is exempt, since that write is itself its fence. Rows within
-5 seconds of the state write still count, for the clock between them.
+counts at any age, and for the one a lost voter's removal, a superseded claim
+and the coordinator's recovery of a removed host's workloads rest on. A
+proof-grade row from before the host was last recorded as it is now —
+admitted (`joining`), booted (`active`), lost unfenced (`offline`), drained —
+is about an earlier life and does not count, so a machine `lv host add` put
+under a removed host's name is not removed on the old machine's confirmation:
+`lv host fence-confirm` it once it is powered off. A host recorded `fenced` is
+exempt, since that write is itself its fence. Rows within 5 seconds of the
+state write still count, for the clock between them.
+
+This holds after the host is removed too. The membership row outlives the
+removal, so a removed name's fence from an earlier life is not taken as the
+proof that its workloads may be recovered, or that a claim decided for it may
+move on; it used to be, at any age, once the live hosts row was gone. The
+remedy is `lv host fence-confirm <host>` once it is powered off, which a
+removed host accepts.
 
 ### Resuming a recovery from a confirmation
 

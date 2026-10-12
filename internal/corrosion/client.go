@@ -451,6 +451,10 @@ type Client struct {
 	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
 	// back-pressure a previous-release peer. See recovery_claims_proof.go.
 	recoveryClaimGate atomic.Pointer[func() bool]
+	// startedProofCheck reports whether this node has started a proof it
+	// holds no runtime_action_proofs row for — an operator's claimed
+	// promotion (SetStartedProofCheck). AbandonProof refuses such a proof.
+	startedProofCheck atomic.Pointer[func(string) bool]
 	// claimIncarnationGate reports whether claim_incarnation_v1 has DURABLY
 	// latched (SetClaimIncarnationGate). It is replication-gated, so every
 	// host this node replicates to runs a build that knows every statement

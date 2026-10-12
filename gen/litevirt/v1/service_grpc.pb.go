@@ -289,6 +289,7 @@ const (
 	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
 	LiteVirt_ListRecoveryClaims_FullMethodName         = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
 	LiteVirt_AbandonRecoveryProof_FullMethodName       = "/litevirt.v1.LiteVirt/AbandonRecoveryProof"
+	LiteVirt_AttestSharedDiskUnused_FullMethodName     = "/litevirt.v1.LiteVirt/AttestSharedDiskUnused"
 	LiteVirt_ReleaseLegacyHeldClaim_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseLegacyHeldClaim"
 	LiteVirt_PlanDeadHostRemoval_FullMethodName        = "/litevirt.v1.LiteVirt/PlanDeadHostRemoval"
 	LiteVirt_ForceReconfigureVoters_FullMethodName     = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
@@ -835,6 +836,10 @@ type LiteVirtClient interface {
 	// not executed, and never will, a proof a decided claim named — refused if
 	// it may already have (§3.12).
 	AbandonRecoveryProof(ctx context.Context, in *AbandonRecoveryProofRequest, opts ...grpc.CallOption) (*AbandonRecoveryProofResponse, error)
+	// AttestSharedDiskUnused: peer-only. The host a shared disk's row names
+	// attests, under its start lock, that no domain defined on it uses the
+	// disk, and records the release (review c2b).
+	AttestSharedDiskUnused(ctx context.Context, in *AttestSharedDiskUnusedRequest, opts ...grpc.CallOption) (*AttestSharedDiskUnusedResponse, error)
 	// ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
 	// (admin): the decision an open ha.claim.legacy_held names, stuck in
 	// flight on a live destination, is abandoned by that destination once it
@@ -4047,6 +4052,16 @@ func (c *liteVirtClient) AbandonRecoveryProof(ctx context.Context, in *AbandonRe
 	return out, nil
 }
 
+func (c *liteVirtClient) AttestSharedDiskUnused(ctx context.Context, in *AttestSharedDiskUnusedRequest, opts ...grpc.CallOption) (*AttestSharedDiskUnusedResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AttestSharedDiskUnusedResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AttestSharedDiskUnused_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ReleaseLegacyHeldClaim(ctx context.Context, in *ReleaseLegacyHeldClaimRequest, opts ...grpc.CallOption) (*ReleaseLegacyHeldClaimResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReleaseLegacyHeldClaimResponse)
@@ -5122,6 +5137,10 @@ type LiteVirtServer interface {
 	// not executed, and never will, a proof a decided claim named — refused if
 	// it may already have (§3.12).
 	AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error)
+	// AttestSharedDiskUnused: peer-only. The host a shared disk's row names
+	// attests, under its start lock, that no domain defined on it uses the
+	// disk, and records the release (review c2b).
+	AttestSharedDiskUnused(context.Context, *AttestSharedDiskUnusedRequest) (*AttestSharedDiskUnusedResponse, error)
 	// ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
 	// (admin): the decision an open ha.claim.legacy_held names, stuck in
 	// flight on a live destination, is abandoned by that destination once it
@@ -6153,6 +6172,9 @@ func (UnimplementedLiteVirtServer) ListRecoveryClaims(*ListRecoveryClaimsRequest
 }
 func (UnimplementedLiteVirtServer) AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbandonRecoveryProof not implemented")
+}
+func (UnimplementedLiteVirtServer) AttestSharedDiskUnused(context.Context, *AttestSharedDiskUnusedRequest) (*AttestSharedDiskUnusedResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AttestSharedDiskUnused not implemented")
 }
 func (UnimplementedLiteVirtServer) ReleaseLegacyHeldClaim(context.Context, *ReleaseLegacyHeldClaimRequest) (*ReleaseLegacyHeldClaimResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseLegacyHeldClaim not implemented")
@@ -10853,6 +10875,24 @@ func _LiteVirt_AbandonRecoveryProof_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AttestSharedDiskUnused_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AttestSharedDiskUnusedRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AttestSharedDiskUnused(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AttestSharedDiskUnused_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AttestSharedDiskUnused(ctx, req.(*AttestSharedDiskUnusedRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ReleaseLegacyHeldClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReleaseLegacyHeldClaimRequest)
 	if err := dec(in); err != nil {
@@ -12783,6 +12823,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbandonRecoveryProof",
 			Handler:    _LiteVirt_AbandonRecoveryProof_Handler,
+		},
+		{
+			MethodName: "AttestSharedDiskUnused",
+			Handler:    _LiteVirt_AttestSharedDiskUnused_Handler,
 		},
 		{
 			MethodName: "ReleaseLegacyHeldClaim",

@@ -594,6 +594,13 @@ message VM {
     // the root disk. Empty when the newest promotion was complete, or there
     // was none. Set by InspectVM/GetVM.
     string                         promoted_partial = 20;
+    // shared_disk_withheld says, when the VM's domain was last built from its
+    // disk rows (a start by the reconciler or onboot, an operator's start or
+    // restart that re-judged it, a redefine) without a shared disk whose row
+    // names another host not proven powered off, which disks, why, and how
+    // to attach them. Empty when the last such build withheld none. Set by
+    // InspectVM/GetVM.
+    string                         shared_disk_withheld = 21;
 }
 
 message VMStrandedDisk {

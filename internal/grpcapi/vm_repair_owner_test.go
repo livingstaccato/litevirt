@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -46,6 +47,15 @@ func TestRepairVMOwner_MovesTheDiskRows(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	fake.SetState("o4", libvirtfake.StateRunning)
+	// Review I1: a shared row naming a host not proven off is not re-homed;
+	// repair-owner refuses and names fence-confirm. Confirmed off, it moves.
+	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "o4", Host: "host-a"}); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "`lv host fence-confirm failed-host`") {
+		t.Fatalf("RepairVMOwner over an unproven failed-host = %v, want a refusal naming fence-confirm", err)
+	}
+	if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{ID: "c", HostName: "failed-host", Method: "manual", Result: "manual-confirmed"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "o4", Host: "host-a"}); err != nil {
 		t.Fatalf("RepairVMOwner: %v", err)
 	}

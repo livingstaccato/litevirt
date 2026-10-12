@@ -1127,6 +1127,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetSettleVerifier(svc.VerifySettleProof)
 	reconciler.SetPITOverlayReporter(svc.ReportPITOverlayHeld, svc.ClearPITOverlayHold)
 	reconciler.SetPITOverlayFeature(svc.PITOverlayFeature)
+	reconciler.SetSharedDiskWithheldReporter(svc.ReportSharedDiskWithheld, svc.ClearSharedDiskWithheld)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

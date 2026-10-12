@@ -110,8 +110,20 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 			return
 		}
 	}
+	// A shared disk whose row names a third host not proven off is left out
+	// (review I1: the re-key no longer re-points such a row).
+	_, withheld := corrosion.JudgeSharedDiskRows(ctx, r.db, disks, r.hostName, func(d corrosion.DiskRecord) bool {
+		return corrosion.DiskOnSharedStorage(ctx, r.db, d, r.hostName)
+	})
+	withheldDisk := map[string]bool{}
+	for _, w := range withheld {
+		withheldDisk[w.Disk.DiskName] = true
+	}
 	var diskConfigs []lv.DiskConfig
 	for _, d := range disks {
+		if withheldDisk[d.DiskName] {
+			continue
+		}
 		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
 			r.noteRekeyOnce(vm.Name, "a shared disk is not visible on this host", "disk", d.DiskName, "path", d.Path)
 			return
@@ -149,6 +161,7 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 	r.rekeyDefined[vm.Name] = fresh.UpdatedAt
 	delete(r.rekeyLogged, vm.Name)
 	r.rekeyMu.Unlock()
+	r.reportSharedWithheld(ctx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, r.hostName, withheld))
 	slog.Info("reconciler: defined a stopped VM failover moved here; it stays stopped until started",
 		"vm", vm.Name, "from", fresh.StateDetail[len(corrosion.StoppedRekeyDetailPrefix):])
 }

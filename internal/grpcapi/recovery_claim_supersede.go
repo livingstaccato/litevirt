@@ -161,6 +161,22 @@ func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKe
 	if err != nil {
 		return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
+	// One decision with an operator promotion's start fence on this host
+	// (fenceOperatorStart): a value it has started is never abandoned, and
+	// one abandoned is never started (review I2).
+	s.operatorClaimMu.Lock()
+	defer s.operatorClaimMu.Unlock()
+	if s.operatorStartRecorded(proofID) {
+		return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition,
+			"%v: proof %s is an operator's promotion that %s has started", corrosion.ErrProofExecuted, proofID, s.hostName)
+	}
+	// Belt and braces (review I-1, m1): nothing is abandoned here while a
+	// domain of the workload is active on this host, or libvirt cannot say it
+	// is not — whatever the records say, it may be running the proof.
+	if !foreignOnly && key.TargetKind == "vm" && s.virt != nil && !s.domainPositivelyInactive(key.TargetName) {
+		return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition,
+			"%v: a domain of %s is active on %s, or libvirt cannot say it is not", corrosion.ErrProofExecuted, key.TargetName, s.hostName)
+	}
 	abandon := s.db.AbandonProof
 	if foreignOnly {
 		abandon = s.db.AbandonForeignProof

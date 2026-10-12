@@ -1153,19 +1153,43 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 	}
 
+	// An operator's same-name promotion is serialized with failover's recovery
+	// of the same VM (review PB-F1; promote_serialize.go): it refuses while a
+	// recovery of it is in flight at its current owner epoch, and, with
+	// recovery claims enforced, claims the VM's recovery just before it starts
+	// the domain. The coordinator's own promotion carries a proof and is
+	// claimed where it is minted (claimPromote); a relay the coordinator
+	// marked is its too.
+	operatorPromote := !renamed && req.Proof == nil && !automated && !req.Automated && !started
+	if operatorPromote {
+		if err := s.refuseWhileRecoveryInFlight(ctx, vm); err != nil {
+			return err
+		}
+	}
+	// A domain already defined here under the name is replaced only with
+	// --force, and only just before the new one is defined: every refusal and
+	// every failure on the way there — a live disk already at the root's
+	// path, a disk that cannot be built, a bridge that cannot be had — leaves
+	// it exactly as it was. Destroying it first, as before, left a VM
+	// undefined by a promotion that then refused.
+	// (If this proof already reached "started", the existing domain is OUR OWN
+	// prior promotion — never destroy it on resume; fall through to persist.)
+	replaceDomain := false
 	if s.virt.DomainExists(targetName) && !started {
-		// (If this proof already reached "started", the existing domain is OUR OWN
-		// prior promotion — never destroy it on resume; fall through to persist.)
 		if !req.Force {
 			return status.Errorf(codes.AlreadyExists, "domain %q already defined on %q; pass --force or --new-name", targetName, s.hostName)
 		}
-		// Force takeover: the domain may be actively running on THIS host
-		// (same-host promote). Stop it first — UndefineDomain alone only drops
-		// the persistent config, leaving the live domain to collide on UUID at
-		// DefineDomain. (In a real failover the VM ran on the fenced host, so
-		// the promotion host has no such domain and this is a no-op.)
-		_ = s.virt.DestroyDomain(targetName)
-		_ = s.virt.UndefineDomain(targetName, false)
+		replaceDomain = true
+	}
+	// A VM an earlier promotion brought to this host runs from live disks it
+	// built from replicas, and has written to them since: those writes are in
+	// no replica here (the replicas this host holds are of the host the VM
+	// left). Rebuilding over them from a replica discards them, so a
+	// same-name promotion over such a VM is refused, --force or not.
+	if !renamed && !started && vm.HostName == s.hostName {
+		if err := s.refuseRebuildOverPromotedDisks(ctx, vm, replica); err != nil {
+			return err
+		}
 	}
 
 	// Build the live disk from the replica.
@@ -1245,7 +1269,6 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return o
 		}
 		var o sharedOwner
-		o.host, o.err = corrosion.GetHost(ctx, s.db, name)
 		// A `fenced` state is proof only over a proof-grade fence record
 		// (corrosion.HostProvedOff's rule, colonelpanik/litevirt#253), and a
 		// removed host, or one with no row, is no proof at all (review
@@ -1253,18 +1276,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// daemon died may still run its qemu. fencing_log rows outlive the
 		// tombstone, and `lv host fence-confirm` records one for a removed host.
 		// For a removed host only a fence of its LAST life counts (review
-		// R4-I1): a removal writes no fence row, so the newest one can be about
-		// the machine removed under the name before it was re-added, or the
-		// same machine before it came back. A `fenced` state is written in one
-		// entry with its own row, so its newest row is always of this life.
-		if o.err == nil {
-			switch {
-			case o.host == nil || o.host.State == "removed":
-				o.provedOff, o.err = corrosion.RemovedHostProvedOff(ctx, s.db, name)
-			case o.host.State == "fenced":
-				o.provedOff, o.err = corrosion.FenceRecordProvesOff(ctx, s.db, name)
-			}
-		}
+		// R4-I1). The one reading every start built from the disk rows shares
+		// (corrosion.JudgeSharedDiskRows, review R4-I2).
+		o.host, o.provedOff, o.err = corrosion.SharedDiskOwnerProvedOff(ctx, s.db, name)
 		owners[name] = o
 		return o
 	}
@@ -1481,11 +1495,46 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		})
 	}
 
+	// The operator's claim, after every other refusal and the disk builds and
+	// just before anything is destroyed or started: decided, it holds the
+	// VM's recovery at this owner epoch, so a coordinator recovering the same
+	// VM learns it and stands down; a recovery already decided, or in flight,
+	// refuses this promotion instead. Only a takeover of a VM recorded on
+	// another host: no coordinator recovers a VM off a host that is up, and a
+	// voter never certifies the eviction of the host asking.
+	// A claim that never gets as far as starting the VM is released on the
+	// way out (review I2), so the failover coordinator can move past it;
+	// the start fence just before StartDomain makes it unreleasable.
+	var opClaim *operatorClaim
+	if operatorPromote && vm.HostName != "" && vm.HostName != s.hostName && s.RecoveryClaimEnforced(ctx) {
+		oc, err := s.claimOperatorPromote(ctx, vm)
+		if err != nil {
+			removeLive()
+			return err
+		}
+		opClaim = oc
+		defer func() {
+			if retErr != nil {
+				s.releaseOperatorClaim(context.WithoutCancel(ctx), opClaim, retErr.Error())
+			}
+		}()
+	}
+
 	// Define + start — skipped on a resume where the domain was already started by
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	compose.ApplyDiskTuning(diskCfg, &spec)
 	compose.ApplyNICTuningByPosition(netCfg, &spec)
 	if !started {
+		if replaceDomain {
+			// Force takeover, now that nothing is left to refuse: the domain
+			// may be actively running on THIS host (same-host promote). Stop it
+			// first — UndefineDomain alone only drops the persistent config,
+			// leaving the live domain to collide on UUID at DefineDomain. (In a
+			// real failover the VM ran on the fenced host, so the promotion
+			// host has no such domain and this is a no-op.)
+			_ = s.virt.DestroyDomain(targetName)
+			_ = s.virt.UndefineDomain(targetName, false)
+		}
 		// attempt defines and starts the domain on disks; stage names the
 		// step that failed.
 		attempt := func(disks []lv.DiskConfig) (string, error) {
@@ -1529,11 +1578,36 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			if err := s.writePromoteMarker(targetName, proofID); err != nil {
 				return "marker", err
 			}
-			if err := s.virt.StartDomain(targetName); err != nil {
+			if opClaim != nil {
+				if err := s.fenceOperatorStart(ctx, opClaim); err != nil {
+					_ = s.virt.UndefineDomain(targetName, false)
+					s.removePromoteMarker(targetName)
+					return "operator claim", err
+				}
+			}
+			releaseGuard, gerr := s.guardSharedDiskStart(ctx, targetName, domXML)
+			if gerr != nil {
+				_ = s.virt.UndefineDomain(targetName, false)
+				s.removePromoteMarker(targetName)
+				if opClaim != nil {
+					s.unfenceOperatorStart(opClaim)
+				}
+				return "shared disk released", status.Error(codes.FailedPrecondition, gerr.Error())
+			}
+			startErr := s.virt.StartDomain(targetName)
+			releaseGuard()
+			if err := startErr; err != nil {
 				_ = s.virt.UndefineDomain(targetName, false) // wipe by design: half-built promote
 				// Don't leak the marker: we tore the half-built domain down, so a later --force
 				// retry must not treat a same-name stranger as our adopted prior promotion.
 				s.removePromoteMarker(targetName)
+				// Nothing runs: the claim may be released again — but only on
+				// libvirt's positive answer (review I-1). A dropped connection
+				// can fail the start after qemu was launched, and fails every
+				// read after it; the fence then stays, and the claim with it.
+				if opClaim != nil && s.domainPositivelyInactive(targetName) {
+					s.unfenceOperatorStart(opClaim)
+				}
 				return "start domain", err
 			}
 			return "", nil
@@ -1577,6 +1651,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", proofID, err)
 			case "marker":
 				return status.Errorf(codes.Internal, "record promote marker: %v", err)
+			case "operator claim", "shared disk released":
+				return err
 			default:
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}

@@ -2029,6 +2029,15 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	// A VM with a shared disk whose row names another host (a partial
+	// promotion's, review R4-I2) has its domain redefined from its rows first,
+	// which judges that host again: a disk it withheld is attached once the
+	// host is proven off (`lv host fence-confirm`, then `lv restart`), and one
+	// a definition has without that proof is left out. A redefine that fails
+	// leaves the definition as it was, and the VM starts on it, as on main.
+	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
+		return nil, err
+	}
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.
@@ -2041,7 +2050,16 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, pbVM, hspec)
 
-	if err := s.virt.StartDomain(vm.Name); err != nil {
+	// A shared disk this host released to another (review c2b) refuses the
+	// start of a domain that uses it.
+	releaseGuard, gerr := s.guardSharedDiskStart(ctx, vm.Name, "")
+	if gerr != nil {
+		releasePreflight()
+		return nil, status.Error(codes.FailedPrecondition, gerr.Error())
+	}
+	startErr := s.virt.StartDomain(vm.Name)
+	releaseGuard()
+	if err := startErr; err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an
 		// RPC that mutated libvirt but failed before writing state). Reconcile
@@ -2925,6 +2943,9 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	pbVM.PitOverlayHeld = s.pitOverlayHeldReason(ctx, vm.Name)
 	// Whether its newest promotion recovered it without its whole replica set.
 	pbVM.PromotedPartial = s.promotedPartialReason(ctx, vm.Name)
+	// Whether its domain was last built without a shared disk whose owner is
+	// not proven off.
+	pbVM.SharedDiskWithheld = s.sharedDiskWithheldReason(ctx, vm.Name)
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)
@@ -5076,6 +5097,15 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	for _, d := range dbDisks {
 		pathByName[d.DiskName] = d.Path
 	}
+	// A shared disk whose row names another host not proven off is left out
+	// of the redefined domain (review R4-I2): a later start of this
+	// definition would otherwise attach it unjudged.
+	var withheldShared []corrosion.WithheldSharedDisk
+	dbDisks, withheldShared = s.judgeSharedDiskRows(ctx, dbDisks)
+	withheldName := map[string]bool{}
+	for _, w := range withheldShared {
+		withheldName[w.Disk.DiskName] = true
+	}
 	var diskConfigs []lv.DiskConfig
 	seenDisk := make(map[string]bool)
 	if len(spec.Disks) > 0 {
@@ -5085,6 +5115,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				name = "root"
 			}
 			seenDisk[name] = true
+			if withheldName[name] {
+				continue
+			}
 			bus := d.Bus
 			if bus == "" {
 				bus = "virtio"
@@ -5287,6 +5320,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if regenerated {
 		s.ensureSparePCIeRootPorts(req.Name)
 	}
+	s.ReportSharedDiskWithheld(ctx, req.Name, corrosion.WithheldSharedDiskDetail(req.Name, s.hostName, withheldShared))
 
 	// Pin the resolved machine type. The redefine just resolved any alias
 	// ("q35") to a concrete versioned type in the persistent domain; re-read it and

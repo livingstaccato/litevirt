@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -1240,8 +1241,16 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 // disks, so a disk row naming any other host is stale. A cold firmware
 // migration commits its handoff through it too: its disks are on shared
 // storage, so only their host moves, together with the VM, in one transaction.
-func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
+//
+// released names disks (ReleasedDiskKey) whose rows move even though
+// SharedRowKeepsOwner would keep them: the host they name attested that no
+// domain there uses them (repair-owner, review c2b).
+func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64, released ...string) error {
 	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	source, err := vmHostOf(ctx, c, name)
 	if err != nil {
 		return err
 	}
@@ -1256,6 +1265,9 @@ func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, st
 	for _, d := range disks {
 		if d.HostName == hostName {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep && !slices.Contains(released, ReleasedDiskKey(d)) {
+			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,
@@ -1940,6 +1952,9 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 		Params: []interface{}{targetHost, finalState, now, vmName},
 	}}
 	for _, d := range expected {
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, sourceHost, targetHost); keep {
+			continue // its unproven owner keeps the row (review I1); the guard accepts it unchanged
+		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,
 			Params: []interface{}{targetHost, now, vmName, d.DiskName},
@@ -2058,11 +2073,18 @@ func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state stri
 	if err != nil {
 		return err
 	}
+	source, err := vmHostOf(ctx, c, name)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
 	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{hostName, state, now, name}}}
 	for _, d := range disks {
 		if d.HostName == hostName {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, source, hostName); keep {
+			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{
 			SQL:    vmDiskHostMoveSQL,

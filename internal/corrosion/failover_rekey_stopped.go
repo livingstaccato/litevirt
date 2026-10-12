@@ -61,6 +61,9 @@ func RekeyStoppedVM(ctx context.Context, c *Client, name, fromHost, destHost, st
 		if d.HostName == destHost {
 			continue
 		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
+			continue // its unproven owner keeps the row (review I1)
+		}
 		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
 	}
 	stmts = append(stmts, Statement{SQL: vmStateUpdateSQL, Params: []interface{}{state, StoppedRekeyDetail(fromHost), c.NowTS(), name}})
@@ -103,6 +106,9 @@ func RekeyStoppedVMClaimed(ctx context.Context, c *Client, name, fromHost, destH
 	for _, d := range disks {
 		if d.HostName == destHost {
 			continue
+		}
+		if keep, _ := SharedRowKeepsOwner(ctx, c, d, fromHost, destHost); keep {
+			continue // its unproven owner keeps the row (review I1)
 		}
 		stmts = append(stmts, Statement{SQL: vmDiskHostMoveSQL, Params: []interface{}{destHost, now, name, d.DiskName}})
 	}

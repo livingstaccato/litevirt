@@ -3752,8 +3752,15 @@ type VM struct {
 	// the root disk. Empty when the newest promotion was complete, or there
 	// was none. Set by InspectVM/GetVM.
 	PromotedPartial string `protobuf:"bytes,20,opt,name=promoted_partial,json=promotedPartial,proto3" json:"promoted_partial,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// shared_disk_withheld says, when the VM's domain was last built from its
+	// disk rows (a start by the reconciler or onboot, an operator's start or
+	// restart that re-judged it, a redefine) without a shared disk whose row
+	// names another host not proven powered off, which disks, why, and how
+	// to attach them. Empty when the last such build withheld none. Set by
+	// InspectVM/GetVM.
+	SharedDiskWithheld string `protobuf:"bytes,21,opt,name=shared_disk_withheld,json=sharedDiskWithheld,proto3" json:"shared_disk_withheld,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -3922,6 +3929,13 @@ func (x *VM) GetPitOverlayHeld() string {
 func (x *VM) GetPromotedPartial() string {
 	if x != nil {
 		return x.PromotedPartial
+	}
+	return ""
+}
+
+func (x *VM) GetSharedDiskWithheld() string {
+	if x != nil {
+		return x.SharedDiskWithheld
 	}
 	return ""
 }
@@ -6624,7 +6638,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xa9\x06\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xdb\x06\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6654,7 +6668,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0estranded_disks\x18\x11 \x03(\v2\x1b.litevirt.v1.VMStrandedDiskR\rstrandedDisks\x12#\n" +
 	"\rfailover_held\x18\x12 \x01(\tR\ffailoverHeld\x12(\n" +
 	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\x12)\n" +
-	"\x10promoted_partial\x18\x14 \x01(\tR\x0fpromotedPartial\"v\n" +
+	"\x10promoted_partial\x18\x14 \x01(\tR\x0fpromotedPartial\x120\n" +
+	"\x14shared_disk_withheld\x18\x15 \x01(\tR\x12sharedDiskWithheld\"v\n" +
 	"\x0eVMStrandedDisk\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x12\n" +

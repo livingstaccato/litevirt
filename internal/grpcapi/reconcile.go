@@ -70,6 +70,9 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	// (GetVMDisks does not order); the patch path keys by target dev so order
 	// there is irrelevant.
 	sort.SliceStable(dbDisks, func(i, j int) bool { return dbDisks[i].TargetDev < dbDisks[j].TargetDev })
+	// A shared disk whose row names another host not proven off is left out
+	// (review R4-I2), and reported once the domain is defined.
+	dbDisks, withheldShared := s.judgeSharedDiskRows(ctx, dbDisks)
 	var diskConfigs []lv.DiskConfig
 	var wantDisks []lv.WantDisk
 	for idx, d := range dbDisks {
@@ -262,6 +265,7 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 	if !usePatch {
 		s.ensureSparePCIeRootPorts(vm.Name)
 	}
+	s.ReportSharedDiskWithheld(ctx, vm.Name, corrosion.WithheldSharedDiskDetail(vm.Name, s.hostName, withheldShared))
 	return nil
 }
 

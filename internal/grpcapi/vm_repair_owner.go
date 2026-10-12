@@ -113,13 +113,48 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	}
 
 	prev := vm.HostName
+	// A shared disk whose row names a third host not proven off — a partial
+	// promotion's, or one a move left behind — is not re-homed here (review
+	// I1): this host running the VM says nothing about whether that host is
+	// still writing the disk, and a row naming this host is attached unjudged
+	// at the next start.
+	disks, derr := corrosion.GetVMDisks(ctx, s.db, req.GetName())
+	if derr != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the disks of %q: %v", req.GetName(), derr)
+	}
+	var released []string
+	for _, d := range disks {
+		keep, why := corrosion.SharedRowKeepsOwner(ctx, s.db, d, prev, s.hostName)
+		if !keep {
+			continue
+		}
+		// An ACTIVE host the row names — the source of a migration whose
+		// commit declined — may attest under its start lock that no domain
+		// there uses the disk (review c2b), and the row is then re-homed.
+		// Anything else needs the proof: fence-confirm.
+		attest := ""
+		if h, herr := corrosion.GetHost(ctx, s.db, d.HostName); herr == nil && h != nil && h.State == "active" {
+			aerr := s.attestSharedDiskUnused(ctx, d.HostName, req.GetName(), d)
+			if aerr == nil {
+				released = append(released, corrosion.ReleasedDiskKey(d))
+				continue
+			}
+			attest = fmt.Sprintf("; it is active, and %v", aerr)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"vm %q's shared disk %s (at %s) has a row naming %s, which is not proven powered off (%s)%s; repair-owner "+
+				"re-homes it only once %s attests no domain there uses it, or is proven off: once %s is powered off, "+
+				"`lv host fence-confirm %s`, then re-run",
+			req.GetName(), d.DiskName, d.Path, d.HostName, why, attest, d.HostName, d.HostName, d.HostName)
+	}
+
 	// Phase 4: repair is an ownership transition, so it advances the owner
 	// epoch through the CAS primitive — closing the "repair-owner writes
 	// ownership without a generation bump" gap. The expected epoch is the row
 	// just read; a concurrent transition loses the CAS and the operator
 	// re-runs against fresh state instead of silently overwriting it.
 	if err := s.publishRunningMinted(ctx, req.GetName(), func(ctx context.Context) error {
-		return corrosion.TransferVMOwnerWithDisks(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch)
+		return corrosion.TransferVMOwnerWithDisks(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch, released...)
 	}); err != nil {
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			return nil, status.Errorf(codes.Aborted,

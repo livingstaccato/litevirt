@@ -963,6 +963,9 @@ local (never picks an owner by value) and defers to runtime repair.
 - **Manual.** `lv doctor repair-owner <vm> <host>` forwards to `<host>`, which
   re-stamps ownership only if it confirms the VM runs there locally. Use it for
   the segmented case, or to force a specific owner the operator knows is correct.
+  It refuses while a shared disk's row names a third host that is not proven
+  powered off (`vm.shared_disk_withheld`, docs/backups.md), and names
+  `lv host fence-confirm <host>`.
 
 Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
 unresolved tracking. Both also move the VM's `vm_disks` rows to the host that
@@ -970,7 +973,12 @@ runs it, in the same write. Failover moves them with the VM too. Builds before
 that re-keyed only the `vms` row, so a VM recovered by one of them can still
 have disk rows naming the host it left. Running `lv doctor repair-owner <vm>
 <host-that-runs-it>` once realigns them. A migration also commits over such a
-row, as long as the row has not changed since the migration began.
+row, as long as the row has not changed since the migration began. A row of a
+disk on shared storage moves, by either, only once the host it names is
+proven powered off (`lv host fence-confirm <host>` first), or, for repair-owner,
+once that host is active and attests that no domain on it uses the disk:
+until then it keeps naming that host, and repair-owner refuses
+(docs/backups.md).
 
 A migration whose ownership commit is refused after the cutover (a disk row
 changed while it ran) moves the `vms` row to the target, where the guest now
@@ -1377,6 +1385,23 @@ it with `lv resolve-pit-overlay <vm> <disk>`; `lv backup restore-from
 (a host that cannot see the disk never resolves it). Run that
 command without `--confirm` first: it prints the verdict, the disk's identity
 then and now, and what `--commit` and `--discard` would each do.
+
+### A VM started without a shared disk (`vm.shared_disk_withheld`)
+
+Evaluator `shared_disk_start`, subject kind `vm`, subject the VM's name,
+severity warning. Raised by the host that built the VM's domain from its disk
+rows — a reconciler or onboot start, an operator's start or restart that
+re-judged it, a redefine — without a shared disk whose row names another host
+that is not proven powered off (a partial promotion leaves such a row naming
+the VM's old owner; docs/backups.md). The VM was started, or defined, without
+that disk. The evidence names each disk, why, and the remedy: once that host
+is powered off, `lv host fence-confirm <host>`, then `lv restart <vm>`. Until
+then no move of the VM re-points that disk's row, and `lv doctor repair-owner`
+refuses to (docs/backups.md). `lv inspect <vm>` shows the same
+text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
+and notification) when raised or when its text changes, and resolves when the
+next build of the VM's domain withholds nothing.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

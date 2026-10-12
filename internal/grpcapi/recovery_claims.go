@@ -704,6 +704,17 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 // ev is the supersede evidence a key past attempt 0 needs (§3.12), nil at
 // attempt 0.
 func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64, ev *corrosion.SupersedeEvidence) (claims.Outcome, error) {
+	return s.decideRecoveryClaim(ctx, key, proposal, startRound, ev, 0, true)
+}
+
+// decideRecoveryClaim is DecideRecoveryClaim with the proposer's ballot
+// budget (maxRounds, 0 for the default) and round reuse made explicit. An
+// operator's promotion (claimOperatorPromote) tries a single ballot at the
+// lowest round and never retries above a higher promise: it waits for a
+// recovery in flight instead of preempting it. (At an equal round the name
+// tie-break may still rank it higher; Paxos keeps that safe.)
+func (s *Server) decideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64,
+	ev *corrosion.SupersedeEvidence, maxRounds int, reuseRound bool) (claims.Outcome, error) {
 	if !key.IsWorkload() {
 		return claims.Outcome{}, fmt.Errorf("%s is not a workload key", key)
 	}
@@ -721,10 +732,11 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
 		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
 		StartRound: startRound,
+		MaxRounds:  maxRounds,
 		// A coordinator re-proposing the value the voters refused because the
 		// owner was reachable retries at the same round (§3.13 step 6); the
 		// proposer's per-round binding refuses a different value there.
-		ReuseRound: true,
+		ReuseRound: reuseRound,
 		Supersede:  ev,
 	}
 	if key.Incarnation != "" {

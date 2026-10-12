@@ -179,13 +179,15 @@ func TestFenceConfirm_ARemovedHostThenPromoteReattaches(t *testing.T) {
 }
 
 // Review R3-m2: the partial report names the remedy that works — prove the
-// owner off with `lv host fence-confirm <owner>` before promoting (pinned by
-// TestFenceConfirm_ARemovedHostThenPromoteReattaches) — and warns against the
-// one that does not: re-running the promotion over a partial one destroys
-// the promoted domain and rebuilds or refuses its disks. It no longer
-// suggests that removing the host is enough.
+// owner off with `lv host fence-confirm <owner>`, then restart the VM (pinned
+// by TestRestart_AttachesAPartialPromotionsSharedDiskOnceItsOwnerIsProvenOff)
+// — and that re-running the promotion over a partial one is refused. It no
+// longer suggests that removing the host is enough. Review PB-m3: it names
+// the confirmation's side effect too, the coordinator's recovery of the
+// owner's other workloads.
 //
 // Mutation "round 4 advice" (the old "…or removed" wording restored) — red.
+// Mutation "no side effect named" (the PB-m3 sentence dropped) — red.
 func TestPromote_ThePartialAdviceNamesTheRealRemedy(t *testing.T) {
 	s := testServer(t)
 	nfsDisk := nfsPromoteVM(t, s, "fenced")
@@ -195,7 +197,9 @@ func TestPromote_ThePartialAdviceNamesTheRealRemedy(t *testing.T) {
 	p := eventDetail(t, s, "db", vmEventPromotedPartial)
 	for _, want := range []string{
 		"once dead-host is powered off, `lv host fence-confirm dead-host`",
-		"Do not re-run `lv replication promote db --force` over this promotion",
+		// Review PB-m3: the confirmation's side effect is named where it is advised.
+		"The confirmation may also let the failover coordinator recover every workload still recorded on dead-host",
+		"Re-running `lv replication promote db --force` over this promotion does not attach it: it is refused",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("partial = %q, want %q", p, want)

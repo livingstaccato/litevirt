@@ -528,7 +528,19 @@ import (
 //	     apply to that session. Written in the session's own batch, like
 //	     session_factors, and only with the release feature login_policy; left
 //	     out of anti-entropy like sessions. No row = no groups. One new table.
-const CurrentSchemaVersion = 66
+//	v67: the redfish fence strategy — host_fence_redfish (host_name PK;
+//	     endpoint, username, password, system_id, auth, ca_pem): a host's
+//	     Redfish BMC settings and password, fenced through by
+//	     fence_strategy = 'redfish'. On the sensitive lane beside
+//	     host_fence_credentials (sensitiveTableNames), so the operator-safe
+//	     state dump never carries the password, and never on the hosts row.
+//	     One row, written whole, with its own updated_at: nothing compares it
+//	     with the hosts row's clock. A previous-release node cannot decode the
+//	     table's statements, and would fence a 'redfish' host as best-effort
+//	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
+//	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
+//	     One new table.
+const CurrentSchemaVersion = 67
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -3002,6 +3014,20 @@ var schemaDDL = []string{
 		updated_at  TEXT NOT NULL,
 		deleted_at  TEXT
 	)`,
+	// v67 a host's Redfish BMC settings and password, on the sensitive lane
+	// beside host_fence_credentials; see host_fence_redfish.go. One row per
+	// host, written whole, only with the release feature redfish_fence.
+	`CREATE TABLE IF NOT EXISTS host_fence_redfish (
+		host_name  TEXT PRIMARY KEY,
+		endpoint   TEXT NOT NULL DEFAULT '',
+		username   TEXT NOT NULL DEFAULT '',
+		password   TEXT NOT NULL DEFAULT '',
+		system_id  TEXT NOT NULL DEFAULT '',
+		auth       TEXT NOT NULL DEFAULT '',
+		ca_pem     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3202,6 +3228,7 @@ var tablePrimaryKeys = map[string][]string{
 	"user_identity_bindings":  {"username", "realm", "external_id"},
 	"host_runtime":            {"host_name"},
 	"session_groups":          {"session_id"},
+	"host_fence_redfish":      {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3580,6 +3607,7 @@ var createTableUnits = []struct {
 	{64, "user_identity_bindings"},
 	{65, "host_runtime"},
 	{66, "session_groups"},
+	{67, "host_fence_redfish"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

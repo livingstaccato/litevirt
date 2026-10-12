@@ -201,6 +201,14 @@ var firstShapeAcks = map[string]string{
 		"is in capabilities.replicationGated, so the latch is confirmed against every memberlist recipient, a " +
 		"maintenance host on the previous build included, rather than the voting members only. The writers " +
 		"above it (automatic genesis and `lv cluster voter init|add|rm|reset`) refuse before the latch too",
+	"host_fence_redfish": "the only writer is grpcapi.hostFenceRedfishStatement, called only inside " +
+		"ConfigureHost's WithReleaseFeature closure, which writes the row only with " +
+		"a capabilities.FeatureGrant for FeatureRedfishFence, which only health.Checker.WithFeature mints: " +
+		"the release token release_2026_11_v1 DURABLY latched — mandatory, so advertised by every build carrying " +
+		"this table and by none that does not, and in capabilities.replicationGated, so confirmed against every " +
+		"memberlist recipient — and the feature's use recorded and acknowledged by every recipient first. " +
+		"release_guard_test.go checks the writer takes and checks the grant. The local retirement on a host's " +
+		"removal or re-admission (retireFenceRedfish) runs in the apply transaction and is never logged",
 	"host_membership": "every writer (UpdateHostState, UpdateHostStartup, InsertHost, AdmitHost, IsolateHost, " +
 		"ClearHostIsolation and corrosion.SplitHostMembership) goes through Client.withMembershipWrite or " +
 		"checks Client.MayWriteHostMembership, and writes only the hosts columns, in their previous-release " +

@@ -98,7 +98,7 @@ func fenceRetryDelay(n int) time.Duration {
 // host but the caller itself, and the coordinator never fences itself.
 func retryableFenceMethod(method string) bool {
 	switch method {
-	case "ipmi", "ssh":
+	case "ipmi", "redfish", "ssh":
 		return true
 	}
 	return false
@@ -106,14 +106,15 @@ func retryableFenceMethod(method string) bool {
 
 // retryStrategy is the strategy a retry of a failed `failed` fence of a host
 // whose strategy is now `current` runs. The operator's current strategy wins
-// when it is one a retry can run — `ipmi` or `ssh`, so configuring working
-// BMC credentials after an SSH fence failed is honoured on the next retry.
+// when it is one a retry can run — `ipmi`, `redfish` or `ssh`, so configuring
+// working BMC credentials after an SSH fence failed is honoured on the next
+// retry.
 // Otherwise (best-effort, watchdog, unset) the method that failed is
 // repeated: a host switched to best-effort since an IPMI fence failed would
 // otherwise "recover" on a failed best-effort fence, which proceeds anyway.
 func retryStrategy(current, failed string) string {
 	switch s := fence.ResolveStrategy(current); s {
-	case "ipmi", "ssh":
+	case "ipmi", "redfish", "ssh":
 		return s
 	}
 	return failed
@@ -193,7 +194,7 @@ func (c *Coordinator) fenceRetryDue(ctx context.Context, h *corrosion.HostRecord
 	// the operator's answer to the failure).
 	// Gate on the strategy the retry would RUN, not the method that failed: a
 	// host whose watchdog or manual fence failed and that the operator has
-	// since given ipmi or ssh is retried with it.
+	// since given ipmi, redfish or ssh is retried with it.
 	strategy := retryStrategy(h.FenceStrategy, newestFailedMethod)
 	if newestFailed.IsZero() || newestFailed.Before(settled) || !retryableFenceMethod(strategy) {
 		return fenceRetry{}

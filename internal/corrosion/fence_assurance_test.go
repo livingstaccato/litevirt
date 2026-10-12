@@ -46,7 +46,7 @@ func TestFenceAssurance_ClassifiesEveryWrittenPair(t *testing.T) {
 // strategy that forgot to extend the classification must not be counted as
 // having powered anything off.
 func TestFenceAssurance_UnrecognisedIsUnknown(t *testing.T) {
-	for _, p := range [][2]string{{"redfish", "fenced"}, {"ssh", "weird"}, {"", ""}} {
+	for _, p := range [][2]string{{"drac", "fenced"}, {"ssh", "weird"}, {"", ""}} {
 		if got := FenceAssurance(p[0], p[1]); got != FenceUnknown {
 			t.Errorf("FenceAssurance(%q, %q) = %q, want %q", p[0], p[1], got, FenceUnknown)
 		}
@@ -67,7 +67,9 @@ func TestFenceProofGrade_IsUnchangedAndAgreesWithAssurance(t *testing.T) {
 		{"best-effort-ssh", "fenced"}:  false,
 		{"watchdog", "fenced"}:         false,
 		{"watchdog", "partial"}:        false,
-		{"redfish", "fenced"}:          false,
+		{"redfish", "fenced"}:          true,
+		{"redfish", "partial"}:         false,
+		{"drac", "fenced"}:             false,
 	}
 	for p, want := range proof {
 		if got := FenceProofGrade(p[0], p[1]); got != want {

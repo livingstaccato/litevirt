@@ -113,6 +113,8 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureContainerReplication: {Token: Release202611V1, Description: "Container replication to a replica host", Writers: containerReplicationWriters},
 	FeaturePITOverlay: {Token: Release202611V1, Description: "Point-in-time copies of a running VM's disk through an external-snapshot overlay (replication and volume moves; used by default whenever a backup session cannot be made)",
 		Writers: []string{"internal/pitoverlay.OpenWindow", "internal/grpcapi.Server.openPITWindow"}},
+	FeatureRedfishFence: {Token: Release202611V1, Description: "The redfish fence strategy: a host fenced through its BMC's Redfish service, with the BMC settings and password on the sensitive lane",
+		Writers: []string{"internal/grpcapi.hostFenceRedfishStatement"}},
 	FeatureISCSILUNClaim: {Token: Release202611V1, Description: "Cluster-wide voter claim of each iSCSI LUN by one disk; iSCSI disk creates, rebuilds and recreates wait for it",
 		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
 			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
@@ -163,6 +165,7 @@ const (
 	FeatureContainerReplication Feature = "container_replication"
 	FeatureISCSILUNClaim        Feature = "iscsi_lun_claim"
 	FeaturePITOverlay           Feature = "pit_overlay"
+	FeatureRedfishFence         Feature = "redfish_fence"
 )
 
 // LookupFeature returns a declared feature's token and description.

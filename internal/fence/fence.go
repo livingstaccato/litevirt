@@ -34,6 +34,8 @@ type HostConfig struct {
 	IPMIAddress string
 	IPMIUser    string
 	IPMIPass    string
+	// Redfish — only used when FenceStrategy = "redfish"
+	Redfish RedfishConfig
 	// Watchdog — only used when FenceStrategy = "watchdog" (self-fencing)
 	WatchdogDev string
 	// IsSelf reports that this process is running ON the host being fenced.
@@ -49,6 +51,8 @@ type HostConfig struct {
 //	"best-effort"  – try an SSH forced power-off; succeed regardless (never blocks failover)
 //	"ssh"          – SSH forced (immediate) power-off; report failure if unreachable
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
+//	"redfish"      – Redfish/BMC ComputerSystem.Reset ForceOff over HTTPS, then
+//	                 PowerState Off observed; must succeed (redfish.go)
 //	"manual"       – log an alert and return Success=false; the coordinator will NOT
 //	                 reschedule until an operator confirms via `lv host fence-confirm`
 //	"watchdog"     – write to /dev/watchdog to stop heartbeat. SELF-fencing only:
@@ -64,6 +68,8 @@ func Execute(ctx context.Context, h HostConfig) Result {
 	switch strategy {
 	case "ipmi":
 		return fenceIPMI(ctx, h)
+	case "redfish":
+		return fenceRedfish(ctx, h)
 	case "ssh":
 		return fenceSSH(ctx, h, false)
 	case "manual":
@@ -87,7 +93,7 @@ func Execute(ctx context.Context, h HostConfig) Result {
 			return Result{
 				Method: "watchdog",
 				Detail: fmt.Sprintf("fence_strategy=watchdog is self-only and %q is not this host; "+
-					"a watchdog fence arms the CALLING node. Configure ipmi (or ssh) for a remotely "+
+					"a watchdog fence arms the CALLING node. Configure ipmi or redfish (or ssh) for a remotely "+
 					"fenceable host, or confirm manually with `lv host fence-confirm %s`", h.Name, h.Name),
 				Success: false,
 			}
@@ -108,7 +114,7 @@ func Execute(ctx context.Context, h HostConfig) Result {
 // otherwise slip past a literal "best-effort" comparison).
 func ResolveStrategy(raw string) string {
 	switch s := strings.ToLower(strings.TrimSpace(raw)); s {
-	case "ipmi", "ssh", "manual", "watchdog":
+	case "ipmi", "redfish", "ssh", "manual", "watchdog":
 		return s
 	default:
 		return "best-effort"
@@ -316,9 +322,11 @@ var (
 	powerOffPollInterval  = 2 * time.Second
 )
 
-// WorstCasePowerOff is the longest a single fenceIPMI call can legitimately
-// take: the power-off command's own per-call budget plus the full verification
-// budget, which runs after it. A caller that bounds a fence by less than this
+// WorstCasePowerOff is the longest a single fenceIPMI or fenceRedfish call can
+// legitimately take: the power-off command's own per-call budget plus the full
+// verification budget, which runs after it. (A Redfish fence splits the
+// per-call budget between the request phase and its session logout, so the
+// same figure bounds it.) A caller that bounds a fence by less than this
 // converts a slow-but-successful power-off into an UNCONFIRMED one — the
 // chassis goes down, the context expires mid-verify, and the result is reported
 // as a failed fence, so the VMs on that host are never rescheduled.

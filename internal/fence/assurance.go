@@ -28,7 +28,8 @@ const (
 // host, as opposed to what its result string says happened.
 const (
 	// AssuranceVerified: the host was powered off AND observed off afterwards
-	// (IPMI: chassis power off, then a power-status read that says off).
+	// (IPMI: chassis power off, then a power-status read that says off;
+	// Redfish: a ForceOff reset, then a PowerState read that says Off).
 	AssuranceVerified = "verified"
 	// AssuranceOperatorConfirmed: a human ran `lv host fence-confirm` after
 	// ensuring the host is down.
@@ -64,12 +65,12 @@ func Assurance(method, result string) string {
 		return AssuranceAwaitingConfirmation
 	case result == LogPartial:
 		switch method {
-		case "ipmi", "ssh", "watchdog", "best-effort-ssh":
+		case "ipmi", "redfish", "ssh", "watchdog", "best-effort-ssh":
 			return AssuranceFailed
 		}
 	case result == LogFenced:
 		switch method {
-		case "ipmi":
+		case "ipmi", "redfish":
 			return AssuranceVerified
 		case "ssh", "watchdog":
 			return AssuranceRequested

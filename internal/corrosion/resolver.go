@@ -441,6 +441,9 @@ var capabilityMap = map[string]tableResolver{
 	"host_fence_credentials": {category: "policy", chain: policyChain()},
 	"user_credentials":       {category: "policy", chain: policyChain()},
 	"token_credentials":      {category: "policy", chain: policyChain()},
+	// v67 Redfish BMC settings: a tie naming two different BMCs or passwords
+	// is never coin-flipped either.
+	"host_fence_redfish": {category: "policy", chain: policyChain()},
 
 	// Auth factor/code tables — per-table converging rules, then fail-to-human.
 	"user_2fa": {category: "auth", chain: []tieRule{

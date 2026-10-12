@@ -4662,8 +4662,16 @@ type Host struct {
 	// not, or what to do, in words; empty when there is nothing to say.
 	FailbackStarted bool   `protobuf:"varint,23,opt,name=failback_started,json=failbackStarted,proto3" json:"failback_started,omitempty"`
 	FailbackNote    string `protobuf:"bytes,24,opt,name=failback_note,json=failbackNote,proto3" json:"failback_note,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The host's Redfish BMC, when it has one: the endpoint, the
+	// ComputerSystem id and the auth mode. Never the user, password or CA.
+	RedfishEndpoint string `protobuf:"bytes,25,opt,name=redfish_endpoint,json=redfishEndpoint,proto3" json:"redfish_endpoint,omitempty"`
+	RedfishSystemId string `protobuf:"bytes,26,opt,name=redfish_system_id,json=redfishSystemId,proto3" json:"redfish_system_id,omitempty"`
+	RedfishAuth     string `protobuf:"bytes,27,opt,name=redfish_auth,json=redfishAuth,proto3" json:"redfish_auth,omitempty"`
+	// Whether a Redfish CA bundle is configured (the bundle itself is not
+	// returned); false means the system roots.
+	RedfishCaConfigured bool `protobuf:"varint,28,opt,name=redfish_ca_configured,json=redfishCaConfigured,proto3" json:"redfish_ca_configured,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *Host) Reset() {
@@ -4862,6 +4870,34 @@ func (x *Host) GetFailbackNote() string {
 		return x.FailbackNote
 	}
 	return ""
+}
+
+func (x *Host) GetRedfishEndpoint() string {
+	if x != nil {
+		return x.RedfishEndpoint
+	}
+	return ""
+}
+
+func (x *Host) GetRedfishSystemId() string {
+	if x != nil {
+		return x.RedfishSystemId
+	}
+	return ""
+}
+
+func (x *Host) GetRedfishAuth() string {
+	if x != nil {
+		return x.RedfishAuth
+	}
+	return ""
+}
+
+func (x *Host) GetRedfishCaConfigured() bool {
+	if x != nil {
+		return x.RedfishCaConfigured
+	}
+	return false
 }
 
 type Image struct {
@@ -6725,7 +6761,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xe3\a\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\x91\t\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -6756,7 +6792,11 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"certSerial\x12,\n" +
 	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x12)\n" +
 	"\x10failback_started\x18\x17 \x01(\bR\x0ffailbackStarted\x12#\n" +
-	"\rfailback_note\x18\x18 \x01(\tR\ffailbackNote\x1a9\n" +
+	"\rfailback_note\x18\x18 \x01(\tR\ffailbackNote\x12)\n" +
+	"\x10redfish_endpoint\x18\x19 \x01(\tR\x0fredfishEndpoint\x12*\n" +
+	"\x11redfish_system_id\x18\x1a \x01(\tR\x0fredfishSystemId\x12!\n" +
+	"\fredfish_auth\x18\x1b \x01(\tR\vredfishAuth\x122\n" +
+	"\x15redfish_ca_configured\x18\x1c \x01(\bR\x13redfishCaConfigured\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

@@ -476,7 +476,7 @@ type SupersedeEvidence struct {
 }
 
 // HostProofGradeFence returns the newest proof-grade fencing_log row for host
-// (an IPMI power-off or an operator's `lv host fence-confirm`) of the host's
+// (an IPMI or Redfish power-off or an operator's `lv host fence-confirm`) of the host's
 // LAST life, however old: the supersede evidence, `lv host rm --dead` and the
 // coordinator's recovery of a removed host's workloads (recoverRemovedHosts)
 // ask whether the host was proven off, alongside its removal and revocation.
@@ -534,7 +534,7 @@ func RemovedHostEvidence(ctx context.Context, c *Client, pkiDir, host string) er
 	if _, ok, err := HostProofGradeFence(ctx, c, host); err != nil {
 		return err
 	} else if !ok {
-		return fmt.Errorf("%s has no proof-grade fence of its last life recorded (IPMI power-off or `lv host fence-confirm %s` "+
+		return fmt.Errorf("%s has no proof-grade fence of its last life recorded (IPMI or Redfish power-off, or `lv host fence-confirm %s` "+
 			"once it is powered off)", host, host)
 	}
 	if h, err := GetHost(ctx, c, host); err != nil {

@@ -248,6 +248,13 @@ func (s *Server) handleConfigureHost(w http.ResponseWriter, r *http.Request) {
 		IpmiUser:      r.FormValue("ipmi_user"),
 		IpmiPass:      r.FormValue("ipmi_pass"),
 		WatchdogDev:   r.FormValue("watchdog_dev"),
+
+		RedfishEndpoint: r.FormValue("redfish_endpoint"),
+		RedfishUser:     r.FormValue("redfish_user"),
+		RedfishPass:     r.FormValue("redfish_pass"),
+		RedfishSystemId: r.FormValue("redfish_system_id"),
+		RedfishAuth:     r.FormValue("redfish_auth"),
+		RedfishCaPem:    r.FormValue("redfish_ca_pem"),
 	})
 	if err != nil {
 		rpcWriteFailed(w, "Configure", err)

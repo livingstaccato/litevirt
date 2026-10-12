@@ -110,7 +110,7 @@ func FenceAssurance(method, result string) string {
 // FenceProofGrade reports whether a fencing_log (method, result) pair PROVES the
 // old owner is actually powered off. It accepts ONLY a confirmed power-off:
 //
-//   - result "fenced" + method "ipmi": IPMI/BMC power-off with verify.
+//   - result "fenced" + method "ipmi" or "redfish": BMC power-off with verify.
 //   - result "manual-confirmed": an operator ran `lv host fence-confirm` after
 //     physically powering the host off.
 //

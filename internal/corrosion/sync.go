@@ -478,6 +478,9 @@ var sensitiveTableNames = []string{
 	"host_fence_credentials",
 	"user_credentials",
 	"token_credentials",
+	// v67 a host's Redfish BMC settings and password. Written only with the
+	// release feature redfish_fence (host_fence_redfish.go).
+	"host_fence_redfish",
 }
 
 func tableSet(tables []string) map[string]bool {

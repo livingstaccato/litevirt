@@ -104,6 +104,11 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 	if _, err := c.SplitCredentials(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// v67 Redfish BMC settings and password.
+	if err := c.Execute(ctx, HostFenceRedfishUpsertSQL, "host-a", "https://10.0.9.1", "admin",
+		"redfish-bmc-secret", "", "", "", c.NowTS()); err != nil {
+		t.Fatal(err)
+	}
 
 	publicPayload, err := decompressPayload(c.DumpStateBytes())
 	if err != nil {
@@ -115,7 +120,7 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 		}
 	}
 	plain, _ := json.Marshal(publicPayload)
-	for _, secret := range []string{"super-secret-token", "hook.example/secret", "JBSWY3DPEHPK3PXP-totp-secret", "$2a$10$hashone", "reloc-bearer-secret"} {
+	for _, secret := range []string{"super-secret-token", "hook.example/secret", "JBSWY3DPEHPK3PXP-totp-secret", "$2a$10$hashone", "reloc-bearer-secret", "redfish-bmc-secret"} {
 		if strings.Contains(string(plain), secret) {
 			t.Fatalf("public dump leaked sensitive row data (%q): %s", secret, plain)
 		}

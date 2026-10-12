@@ -213,7 +213,7 @@ message SupersededDisksResponse {
 }
 message ConfigureHostRequest {
     string name = 1;
-    string fence_strategy = 2;  // ssh | ipmi | watchdog
+    string fence_strategy = 2;  // ssh | ipmi | redfish | watchdog | manual | best-effort
     string ipmi_address = 3;
     string ipmi_user = 4;
     string ipmi_pass = 5;
@@ -243,6 +243,32 @@ message ConfigureHostRequest {
     // the field ignores it: alone it answers "no fields to update", and a
     // client must check the returned host's ipmi_address is empty.
     bool clear_ipmi = 13;
+    // Redfish BMC settings, for fence_strategy "redfish". As for ipmi_*, an
+    // empty field means "leave alone", and the rest of the host's settings are
+    // kept. redfish_endpoint is the BMC's base URL, https://host[:port];
+    // redfish_system_id picks the ComputerSystem when the BMC has several;
+    // redfish_auth is "session" (default) or "basic"; redfish_ca_pem is the
+    // PEM bundle the BMC's certificate must chain to (empty: the system
+    // roots). They are stored on the sensitive lane, never on the hosts row,
+    // and are the release feature redfish_fence: refused with
+    // FailedPrecondition until every host runs a build that knows it. A
+    // server that predates them ignores them and refuses fence_strategy
+    // "redfish"; a client must check the returned host's redfish_endpoint.
+    string redfish_endpoint  = 14;
+    string redfish_user      = 15;
+    string redfish_pass      = 16;
+    string redfish_system_id = 17;
+    string redfish_auth      = 18;
+    string redfish_ca_pem    = 19;
+    // Clear the host's Redfish settings. Refused together with any redfish_*
+    // field, and while the host would be left fencing by "redfish".
+    bool clear_redfish = 20;
+    // Unset one Redfish setting, keeping the rest: the system id (back to
+    // "the BMC's only ComputerSystem") or the CA bundle (back to the system
+    // roots). An empty field cannot say this, since it means "leave alone".
+    // Each is refused together with a value for the same setting.
+    bool clear_redfish_system_id = 21;
+    bool clear_redfish_ca        = 22;
 }
 
 // ── VMs ──

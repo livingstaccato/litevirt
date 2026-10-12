@@ -268,6 +268,13 @@ const (
 // is by the TYPED error code only (IsDeviceMissing), so nothing that merely reads
 // like "not found" — a dead connection, a vanished domain — can pass for done.
 //
+// An error does NOT always mean "nothing changed". On the fallback path the LIVE
+// request can be accepted and the CONFIG call then fail with something other than
+// DEVICE_MISSING. That needs the persistent copy to regain the device between the
+// first call and the CONFIG call, which the caller's per-VM operation barrier
+// excludes for litevirt's own writers; a caller that maps any error to a "nothing
+// applied" terminal failure relies on that barrier.
+//
 // Not covered: a device element libvirt cannot match at all (a NIC described by a
 // MAC with no source fails XML validation, VIR_ERR_XML_ERROR, before matching), so
 // callers still describe the device as it stands in the copy that holds it.

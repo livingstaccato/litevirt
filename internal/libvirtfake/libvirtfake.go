@@ -1148,8 +1148,21 @@ func (f *Fake) DetachDisk(domainName, targetDev string) error {
 //     applies at once.
 //
 // skipConfig is a scenario's SkipConfigOn*Mutation knob: the config half is
-// neither checked nor applied. Not modeled: libvirt refuses AFFECT_LIVE on a
-// domain that is not running (VIR_ERR_OPERATION_INVALID). Caller holds f.mu.
+// neither checked nor applied.
+//
+// A guest that ignores every request is DeferLiveUnplug with
+// HonorUnplugOnRequest 0: each LIVE request is parked, none applies until
+// AckLiveUnplug.
+//
+// Not modeled:
+//   - libvirt refuses AFFECT_LIVE on a domain that is not running
+//     (VIR_ERR_OPERATION_INVALID);
+//   - QEMU >= 6.2 refuses a device_del for a PCIe device already "in the process
+//     of unplug" for ~5 s after the last request, a non-DEVICE_MISSING error. The
+//     fake accepts every re-request. Callers' re-request loops already treat a
+//     failed re-request as non-fatal (waitDeviceGone), so no test depends on it.
+//
+// Caller holds f.mu.
 func (f *Fake) detachFlagsLocked(domain string, flags uint32, skipConfig, inLive, inConfig bool,
 	liveMissing, configMissing string, removeLive, removeConfig func()) error {
 	config := flags&libvirt.ModifyConfig != 0 && !skipConfig

@@ -2395,8 +2395,14 @@ func without(ss []string, drop string) []string {
 // reconciler restarted the VM, and the tombstone then left a running domain
 // with no record. So the delete holds the lease, renewed, from before it
 // touches the domain until after the tombstone: a start that already holds
-// it refuses the delete (retryable, nothing touched), and one that comes
-// later finds the lease held and, once it is free, no row.
+// it is waited for, bounded (delete_lease.go), and one that comes later
+// finds the lease held and, once it is free, no row.
+//
+// A daemon that crashes mid-delete leaves the lease behind. A retried delete
+// re-takes it at once — it runs on the same host, so it is the same holder —
+// but the reconciler and the restart policy are other holders, so the VM is
+// not restarted until the delete is retried or the lease expires (vmLockTTL,
+// 10 minutes).
 //
 // The holder is distinct from every start path's, so none can re-take it. An
 // older peer reads it as any other holder's unexpired lease, so its start
@@ -2568,10 +2574,10 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// until the row is tombstoned (lab 2 run c713, N-2; deleteLockHolder).
 	// A peer-search probe is exempt: its host is not the row's, so no start
 	// path there acts on this VM, and its lease write would contend with the
-	// one the probing host already holds.
+	// one the probing host already holds. A start holding the lease is waited
+	// for, bounded (delete_lease.go).
 	if !localOnly {
-		releaseLease, lerr := s.holdStartLease(ctx, deleteLockHolder(s.hostName), req.Name,
-			"so it is not deleted", "delete it", true)
+		releaseLease, lerr := s.holdDeleteStartLease(ctx, req.Name)
 		if lerr != nil {
 			return nil, lerr
 		}

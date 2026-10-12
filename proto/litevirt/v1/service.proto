@@ -4859,6 +4859,10 @@ message GetSpiceInfoResponse {
     string host = 1;       // host the VM runs on
     int32  port = 2;       // SPICE TCP port (libvirt-assigned)
     string uri  = 3;       // convenience: "spice://<host>:<port>"
+    // The password the VM's SPICE console requires ("" when it requires
+    // none; docs/ui.md "Console passwords"). Returned only to a caller that
+    // passed the vm.console check, and never logged.
+    string password = 4;
 }
 
 // ── Rebalancer messages ──

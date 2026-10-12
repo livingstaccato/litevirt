@@ -58,6 +58,10 @@ type LibvirtBackend interface {
 	// VNC / SPICE.
 	GetVMVNCPort(name string) (int, error)
 	GetVMSpicePort(name string) (int, error)
+	// ConsolePassword is the password the RUNNING domain's console of kind
+	// ("vnc" or "spice") requires, "" for none — read from the live secure
+	// definition (docs/ui.md "Console passwords"). Never log it.
+	ConsolePassword(name, kind string) (string, error)
 	ConsolePTYPath(name string) (string, error)
 
 	// Hot-plug.

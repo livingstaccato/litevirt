@@ -328,7 +328,7 @@ enforcement:
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
   audit_signature: true       # DEFAULT ON — unset means on, as for digest_v2 above and
-                              # recovery_claim and partition_pause below. Sign every audit row this host writes with its cluster key
+                              # recovery_claim, partition_pause and console_password below. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -442,6 +442,20 @@ enforcement:
                               # is the kill switch: that host pauses nothing and recovers an
                               # assumed fence at once, as before. See
                               # design/partition-pause.md.
+  console_password: true      # DEFAULT ON. Give the VNC and SPICE consoles of every domain
+                              # this host defines a fresh per-VM password, so a local process
+                              # or user on the host can no longer open a console on its
+                              # 127.0.0.1 listener. Only the daemon on the VM's own host
+                              # presents it: the web UI and `lv` reach VNC through it as
+                              # before, and `lv spice` / the UI's .vv file carry the SPICE
+                              # one. Applied at each define, and only once
+                              # console_password_v1 has latched (an older build cannot
+                              # present a password), so a VM running when it latches picks
+                              # it up at its next define or start. The token is advertised
+                              # on the build, not this flag: presenting is unconditional,
+                              # so no host relies on a peer's flag. An explicit false is the
+                              # kill switch: this host's next define of each domain drops
+                              # its passwords. See ui.md "Console passwords".
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

@@ -91,6 +91,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
+	s.wireConsolePasswordPolicy()
 	return s
 }
 

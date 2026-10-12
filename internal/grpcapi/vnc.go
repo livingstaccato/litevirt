@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -13,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/rfb"
 )
 
 // ProxyVNC provides a bidirectional byte stream to the VNC port of a running VM.
@@ -66,6 +68,15 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		return status.Errorf(codes.FailedPrecondition, "VNC is not enabled for VM %q", vmName)
 	}
 
+	// The console's password, if it has one (docs/ui.md "Console
+	// passwords"). Read from the RUNNING domain, so it is the one the guest
+	// started with, wherever it was defined or migrated from. Never logged.
+	password, err := s.virt.ConsolePassword(vmName, "vnc")
+	if err != nil {
+		slog.Warn("vnc console password unreadable", "vm", vmName, "error", err)
+		return status.Errorf(codes.Internal, "read the VNC console's password for VM %q: %v", vmName, err)
+	}
+
 	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return status.Errorf(codes.Internal, "connect to VNC port %d: %v", port, err)
@@ -74,7 +85,23 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
 
-	slog.Info("VNC proxy session started", "vm", vmName, "port", port)
+	viewer := &vncViewerStream{stream: stream}
+	if password != "" {
+		// This host authenticates to the listener, then offers the viewer
+		// security type None: the viewer, and every daemon relaying to it,
+		// never sees the password, and an older relay needs no change.
+		_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
+		if err := rfb.Authenticate(conn, password); err != nil {
+			slog.Warn("vnc console authentication failed", "vm", vmName, "error", err)
+			return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, err)
+		}
+		_ = conn.SetDeadline(time.Time{})
+		if err := rfb.ServeNoAuth(viewer); err != nil {
+			return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
+		}
+	}
+
+	slog.Info("VNC proxy session started", "vm", vmName, "port", port, "authenticated", password != "")
 
 	errCh := make(chan error, 2)
 
@@ -100,20 +127,24 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		}
 	}()
 
-	// gRPC stream → VNC TCP
+	// gRPC stream → VNC TCP. Through the viewer reader, which hands over
+	// first whatever the handshake read past its end.
 	go func() {
+		buf := make([]byte, 16384)
 		for {
-			msg, err := stream.Recv()
+			n, err := viewer.Read(buf)
+			if n > 0 {
+				if _, werr := conn.Write(buf[:n]); werr != nil {
+					errCh <- werr
+					return
+				}
+			}
 			if err != nil {
 				if err != io.EOF {
 					errCh <- err
 				} else {
 					errCh <- nil
 				}
-				return
-			}
-			if _, err := conn.Write(msg.Data); err != nil {
-				errCh <- err
 				return
 			}
 		}
@@ -133,6 +164,37 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		return status.Errorf(codes.Internal, "VNC proxy error: %v", err)
 	}
 	return nil
+}
+
+// vncAuthTimeout bounds the handshake with a local VNC listener.
+const vncAuthTimeout = 10 * time.Second
+
+// vncViewerStream is the viewer side of a ProxyVNC stream as a byte stream,
+// for the RFB handshake this host runs with the viewer (rfb.ServeNoAuth) and
+// the relay after it.
+type vncViewerStream struct {
+	stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]
+	buf    []byte
+}
+
+func (v *vncViewerStream) Read(p []byte) (int, error) {
+	for len(v.buf) == 0 {
+		msg, err := v.stream.Recv()
+		if err != nil {
+			return 0, err
+		}
+		v.buf = msg.Data
+	}
+	n := copy(p, v.buf)
+	v.buf = v.buf[n:]
+	return n, nil
+}
+
+func (v *vncViewerStream) Write(p []byte) (int, error) {
+	if err := v.stream.Send(&pb.VNCData{Data: append([]byte(nil), p...)}); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // forwardVNC relays a ProxyVNC stream to a remote daemon.

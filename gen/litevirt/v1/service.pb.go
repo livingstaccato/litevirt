@@ -35161,10 +35161,14 @@ func (x *GetSpiceInfoRequest) GetVmName() string {
 }
 
 type GetSpiceInfoResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`  // host the VM runs on
-	Port          int32                  `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"` // SPICE TCP port (libvirt-assigned)
-	Uri           string                 `protobuf:"bytes,3,opt,name=uri,proto3" json:"uri,omitempty"`    // convenience: "spice://<host>:<port>"
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Host  string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`  // host the VM runs on
+	Port  int32                  `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"` // SPICE TCP port (libvirt-assigned)
+	Uri   string                 `protobuf:"bytes,3,opt,name=uri,proto3" json:"uri,omitempty"`    // convenience: "spice://<host>:<port>"
+	// The password the VM's SPICE console requires ("" when it requires
+	// none; docs/ui.md "Console passwords"). Returned only to a caller that
+	// passed the vm.console check, and never logged.
+	Password      string `protobuf:"bytes,4,opt,name=password,proto3" json:"password,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -35216,6 +35220,13 @@ func (x *GetSpiceInfoResponse) GetPort() int32 {
 func (x *GetSpiceInfoResponse) GetUri() string {
 	if x != nil {
 		return x.Uri
+	}
+	return ""
+}
+
+func (x *GetSpiceInfoResponse) GetPassword() string {
+	if x != nil {
+		return x.Password
 	}
 	return ""
 }
@@ -43658,11 +43669,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\".\n" +
 	"\x13GetSpiceInfoRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"P\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"l\n" +
 	"\x14GetSpiceInfoResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\x05R\x04port\x12\x10\n" +
-	"\x03uri\x18\x03 \x01(\tR\x03uri\"\xbe\x02\n" +
+	"\x03uri\x18\x03 \x01(\tR\x03uri\x12\x1a\n" +
+	"\bpassword\x18\x04 \x01(\tR\bpassword\"\xbe\x02\n" +
 	"\x11RebalanceProposal\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x19\n" +

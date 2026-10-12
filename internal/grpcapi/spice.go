@@ -24,6 +24,10 @@ import (
 // HOST rather than to a VM (`lv ssh` connects to a VM). Bundling a
 // browser-based SPICE client (spice-html5) is a future enhancement; this
 // RPC is the minimum viable surface to make SPICE usable today.
+//
+// Because SPICE is not proxied, the response carries the console's password
+// (docs/ui.md "Console passwords") for the client to present — to a caller
+// that passed vm.console, and never logged.
 func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (*pb.GetSpiceInfoResponse, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -64,6 +68,15 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 			"SPICE not available for %q: %v", req.VmName, err)
 	}
 
+	// The console's password, if it has one (docs/ui.md "Console
+	// passwords"). SPICE is not proxied, so the client presents it itself;
+	// this caller passed the vm.console check above on its entry host. Read
+	// from the RUNNING domain, and never logged.
+	password, err := s.virt.ConsolePassword(req.VmName, "spice")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the SPICE console's password for %q: %v", req.VmName, err)
+	}
+
 	host, err := corrosion.GetHost(ctx, s.db, vm.HostName)
 	if err != nil || host == nil {
 		return nil, status.Errorf(codes.Internal, "lookup host %q: %v", vm.HostName, err)
@@ -74,8 +87,9 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	// Host/Port are still returned unbracketed for callers that build their own.
 	uri := fmt.Sprintf("spice://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 	return &pb.GetSpiceInfoResponse{
-		Host: host.Address,
-		Port: int32(port),
-		Uri:  uri,
+		Host:     host.Address,
+		Port:     int32(port),
+		Uri:      uri,
+		Password: password,
 	}, nil
 }

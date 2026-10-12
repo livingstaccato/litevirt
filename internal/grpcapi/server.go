@@ -317,6 +317,10 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
+	// enfConsolePassword is enforcement.console_password (default on): this
+	// host gives the consoles of each domain it defines a password, once
+	// console_password_v1 has latched (ConsolePasswordActive).
+	enfConsolePassword atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -1480,6 +1484,35 @@ func (s *Server) hardwareV2Ready() bool {
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 
+// SetConsolePassword sets enforcement.console_password: whether this host
+// gives the consoles of each domain it defines a password (once
+// console_password_v1 has latched).
+func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
+
+// ConsolePasswordActive reports whether a domain defined on this host now gets
+// console passwords: enforcement.console_password AND the console_password_v1
+// latch, so no password is set while any host could still be on a build that
+// cannot present one. It is the policy the libvirt client applies to every
+// define (wireConsolePasswordPolicy), and it reads only in-memory state.
+func (s *Server) ConsolePasswordActive() bool {
+	return s.enfConsolePassword.Load() && s.gate != nil && s.gate.Latched(capabilities.ConsolePasswordV1)
+}
+
+// consolePasswordPolicySetter is the libvirt backend's hook for that policy
+// (libvirt.Client.SetConsolePasswordPolicy, and the fleet fake's).
+type consolePasswordPolicySetter interface {
+	SetConsolePasswordPolicy(func() bool)
+}
+
+// wireConsolePasswordPolicy hands the backend ConsolePasswordActive, so every
+// DefineDomain on this host — whichever path calls it, the health reconciler's
+// included, since it shares the client — applies it.
+func (s *Server) wireConsolePasswordPolicy() {
+	if p, ok := s.virt.(consolePasswordPolicySetter); ok {
+		p.SetConsolePasswordPolicy(s.ConsolePasswordActive)
+	}
+}
+
 // SetAllowUnencryptedStorageMigration sets migration.allow_unencrypted_storage:
 // whether this node, as a migration source, may send a storage copy in
 // plaintext.
@@ -1636,6 +1669,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOperationProtocol
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize
+	case capabilities.ConsolePasswordV1:
+		return s.enfConsolePassword.Load()
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity
 	case capabilities.ProjectAuthorityV1:
@@ -2133,6 +2168,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
+	s.wireConsolePasswordPolicy()
 	if db != nil {
 		db.SetStartedProofCheck(s.operatorStartRecorded)
 	}

@@ -1059,6 +1059,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	// Console passwords: every define on this host (grpcapi's and the health
+	// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
+	// this flag AND the console_password_v1 latch. NewServer wired the hook.
+	svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	svc.SetMigrationNetwork(d.cfg.Migration.Network)
 	svc.SetMigrationAddress(d.cfg.Migration.Address)

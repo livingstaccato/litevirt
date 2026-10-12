@@ -1045,6 +1045,11 @@ func (c *Coordinator) run(ctx context.Context) {
 		// counts (recentlyFencedAfter): a host a failed fence left 'offline'
 		// is no longer dated by its activation, and a previous outage's fence
 		// would otherwise hold the retry back for up to recentFenceWindow.
+		// On a retry this catches only a success that replicated (or an
+		// operator's fence that landed) after fenceRetryDue read the log this
+		// cycle: fenceRetryDue already declined a retry for any success newer
+		// than FailedAt. It is that race check, not the retry's guard against
+		// fencing twice, which is the backoff (fenceRetryDelay).
 		recent := false
 		switch {
 		case afresh:

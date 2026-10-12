@@ -1160,8 +1160,10 @@ func (l *lab) restore(b baseline) {
 			}
 		}
 	}
-	// 5. Every host active. A host the drill fenced stays fenced until an
-	//    operator undrains it (partition-pause.md F6, recovery-claims.md).
+	// 5. Every host active. A host the drill fenced and that booted again
+	//    records itself active on its own; one that answered again without
+	//    restarting needs `lv host undrain` (migration-failover.md, "What a
+	//    fence records"; partition-pause.md F6).
 	l.waitAllActive(via, 6*time.Minute)
 	// 6. Every host a voter again, one member per generation.
 	if _, voters, err := l.voterSet(via); err == nil {

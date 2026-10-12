@@ -45,7 +45,8 @@ name more.
 
 --restore <copy> puts the copy back as its VM's disk. The VM must be stopped on
 this host: to run a VM on the real disk a failover left on a host, wait for the
-host to be active (a host that boots again records itself active; one that
+host to be active (a host that boots again turns active on its own, after
+upgrading if it booted into a pending upgrade; one that
 answered again without restarting stays fenced or offline until
 ` + "`lv host undrain <host>`" + `), stop the VM, move it there with
 ` + "`lv migrate <vm> <host> --cold`" + `, restore the copy and start it. The disk

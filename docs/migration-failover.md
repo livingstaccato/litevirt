@@ -906,9 +906,11 @@ off it.
 That covers a host that answers again **without having restarted**: the host
 an unverified fence may never have powered off, or one cut off by a partition.
 A host whose daemon starts again — the machine booting after a power-off, or
-its daemon restarted — records itself `active` from its own boot write,
-whatever the cluster recorded for it, and needs no `lv host undrain`
-([upgrades](upgrades.md) says the same). It does not run the workloads that
+its daemon restarted — turns `active` on its own, whatever the cluster
+recorded for it, and needs no `lv host undrain` ([upgrades](upgrades.md) says
+the same). Its boot write records it `active`, or `upgrading` first when it
+booted into a pending upgrade or a graceful restart, and then `active` once
+it serves. It does not run the workloads that
 moved off it: they are recorded on their new hosts, and the copies of their
 disks it still holds are set aside as superseded (`lv host superseded-disks`).
 
@@ -1024,8 +1026,9 @@ that fails again after coming back is fenced anew, without waiting out the
 (30 s, doubling to 5 minutes) too: the failed fence records the host
 `offline`, so its activation no longer dates its life, and a retry counts
 only a fence row newer than the attempt it repeats. Before this, the previous
-outage's fence held every retry back until it was 5 minutes old. A row newer than the host's last activation still counts, which is
-the race the window exists for. Likewise, a health observation older than the
+outage's fence held every retry back until it was 5 minutes old. A row newer
+than the host's last activation still counts, which is the race the window
+exists for. Likewise, a health observation older than the
 moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not
 probed at all until its daemon's first boot records it `active`. A newer
@@ -1350,7 +1353,8 @@ These need the admin role and are audited:
   file it replaces is not deleted: it is set aside and retained in turn.
 
 To run a VM on the real disk a failover left on a host, once that host is
-back and `active` — a host that booted again records itself `active`; one that
+back and `active` — a host that booted again turns `active` on its own
+(after `upgrading`, if it booted into a pending upgrade); one that
 answered again without restarting stays `fenced` or `offline` until
 `lv host undrain <host>`, and a migration onto it needs it active:
 
@@ -1422,8 +1426,9 @@ so freeing capacity afterwards does not re-run it. Such a VM stays down until
 one of these happens:
 
 - the host comes back. A host whose daemon starts again — it boots after the
-  fence powered it off, or its daemon is restarted — records itself `active`,
-  with no `lv host undrain`. One that answers again without having restarted
+  fence powered it off, or its daemon is restarted — turns `active` on its
+  own (after `upgrading`, if it booted into a pending upgrade), with no
+  `lv host undrain`. One that answers again without having restarted
   stays `fenced` or `offline` if failover moved anything off it, and
   `lv host undrain <host>` makes it active again;
 - an operator promotes a replica of it, `lv replication promote <vm>`;

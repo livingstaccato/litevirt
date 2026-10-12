@@ -1172,6 +1172,54 @@ that was removed while it was down and re-added with its data directory
 intact brings its row back on every node with its first boot, even though
 every other node retired the old one when it applied the re-admission.
 
+Its `hosts` row converges too. On its old database the host's own row is
+still live, so its daemon re-records its new certificate serial instead of
+re-admitting, and every write it makes from then on is newer than the
+re-admission, which that host therefore never applies; every other host
+applies the same writes over the re-admission's reset row. The two rows end
+up under one `updated_at` with different content, which used to be an
+unresolved `control_plane` tie for good, with the host keeping the removed
+machine's labels, region, role, fence settings and `grpc_port`. A
+re-admission now records its own time as the row's `created_at`, on every host
+that applies it, and a tie between two `hosts` rows whose `created_at` differ
+by more than five minutes goes to the later one, whole: the re-admitted row,
+with every write the host has made since. Anti-entropy pulls whole rows, so a
+host that pulled the re-added host's row before its writes arrived used to
+take the stale row outright — it is newer — and where every survivor did, the
+cluster settled on it with no tie to report. A host holding the re-admitted
+row now keeps it against a row whose `created_at` is more than five minutes
+earlier; the re-added host's writes still reach it by replication.
+
+The five minutes are the clock skew the cluster's hybrid clock already
+tolerates (`hlc.MaxSkewMS`). The re-admission's time is the cluster's clock,
+which can run up to that far ahead of a host's own, while a host re-added on
+an empty database stamps its row with its own clock when it first starts; its
+row is the newer one and keeps its own settings, its `grpc_port` among them.
+The cost is narrow: a host that was added and then removed and re-admitted
+within five minutes falls back to plain last-writer-wins, as before this
+change.
+
+Mid-roll, this needs at least one host on this build to have applied the
+re-admission, and that is necessary rather than sufficient. A host on a build
+with the re-admission reset but without this change settles a tie between a
+stamped and an unstamped row on the stamped one only where the two rows
+otherwise agree; one that pulled the stale row whole (it has no such guard)
+differs in control-plane columns too, and leaves the tie unresolved until it
+is upgraded. A host on a build without the reset (v1.9.0 and earlier) leaves
+the tie unresolved, as before. An older-build host can also erase the stamp by
+pulling a newer, unstamped row from another older-build host. Where no host
+stamped, the tie stays as it was.
+
+The two `created_at` values come from two hosts' clocks. If the host's
+original `created_at` is later than the re-admission's — a clock skew larger
+than its whole first membership — the stale row wins whole, on every host.
+
+The re-added host publishes a missing capability label again (`litevirt.lxc`,
+`litevirt.tpm`, `litevirt.secureboot`) within a minute of the re-admitted row
+reaching it; it does not need a restart. A label set to another value with
+`lv host label` is an override, and the daemon leaves it alone until its next
+start, which publishes what its probes find, as it always has.
+
 **Rollback.** Both tokens ship in the same build, so a binary rolled back
 below them is below both. It enters WAL quarantine at startup, as below every
 latched token, emits no replicated writes, and cannot decode the

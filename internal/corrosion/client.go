@@ -47,7 +47,7 @@ type SyncMetrics interface {
 	ObserveLegacyTransformed(transformer string)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
 	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
-	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
+	// lb_generation, incarnation}; winner ∈ {local, incoming}. (Tombstone ties go to
 	// ObserveTombstoneTie instead.)
 	ObserveTieBreak(table, resolver, winner string)
 	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per
@@ -119,6 +119,9 @@ type Client struct {
 	// pool above reaps idle connections (openTestDB). Nil outside tests.
 	memKeeper *sql.DB
 	mu        sync.RWMutex
+	// incarnationRefusals rate-limits the hosts merge floor's warning, per
+	// row (host_incarnation_floor.go). Its zero value is ready.
+	incarnationRefusals refusalLogLimiter
 	// dsn is what db was opened with; tableGens counts the row changes every
 	// connection of that database reports (digest_cache.go), and digests is
 	// the anti-entropy digest cache they invalidate. tableGens is nil for a

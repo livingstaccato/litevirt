@@ -202,9 +202,15 @@ func probeVNCPassword(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	_ = vnc.SetDeadline(deadline)
-	aerr := rfb.Authenticate(vnc, password)
+	// AuthenticateVNC, not Authenticate: a display that asks for no password
+	// at all (security type None) would let anything in, so it is "cannot
+	// enforce", not "can".
+	aerr := rfb.AuthenticateVNC(vnc, password)
 	_ = vnc.Close()
 	_ = q.run("quit", nil)
+	if errors.Is(aerr, rfb.ErrNoVNCAuth) {
+		return fmt.Sprintf("%s does not enforce a VNC password: %v", filepath.Base(bin), aerr), false
+	}
 	if aerr != nil {
 		return fmt.Sprintf("%s cannot authenticate a VNC password: %v", filepath.Base(bin), aerr), false
 	}

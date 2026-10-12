@@ -56,7 +56,7 @@ func TestStart_BackstopFallsBackOnTheFIPSKernel(t *testing.T) {
 	fipsEnabledPath = f
 
 	m := &startModel{inactive: passworded}
-	unknown := errors.New("internal error: qemu unexpectedly closed the monitor: qemu-system-x86_64: some message no one has seen")
+	unknown := errors.New("internal error: qemu unexpectedly closed the monitor: qemu-system-x86_64: -vnc unix:/run/x/vnc.sock,password=on: some message no one has seen")
 	m.failFirst = unknown
 	var reason string
 	if err := startWithConsoleBackstop(m, StartGuard{}, "web", PolicySet, func(r string) { reason = r }); err != nil {

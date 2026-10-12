@@ -391,6 +391,37 @@ func IsConsolePasswordRefusal(err error) bool {
 	return false
 }
 
+var reConsoleWord = regexp.MustCompile(`(?i)\b(vnc|spice|password)\b`)
+
+// isConsoleStartFailure reports whether a start failed on QEMU's console:
+// one of its messages is about its -vnc or -spice option, or names VNC,
+// SPICE or a password. It does not say why (that is
+// IsConsolePasswordRefusal's question); on a FIPS-mode kernel it is enough to
+// try the start again without the passwords. A disk that will not open, a
+// network that is missing, is not one.
+func isConsoleStartFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	for _, m := range reQEMUMessage.FindAllStringSubmatch(err.Error(), -1) {
+		text := m[1]
+		if strings.HasPrefix(text, "-") {
+			opt, msg, ok := strings.Cut(text, ": ")
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(opt, "-vnc ") || strings.HasPrefix(opt, "-spice ") {
+				return true
+			}
+			text = msg
+		}
+		if reConsoleWord.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
 // startWithConsoleBackstop starts name, and when the start fails because QEMU
 // cannot do the domain's console password — its own message says so, or the
 // kernel is in FIPS mode and the domain has one — redefines the domain
@@ -409,7 +440,7 @@ func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, policy C
 		return err
 	}
 	refused := IsConsolePasswordRefusal(err)
-	if !refused && !fipsEnabled() {
+	if !refused && !(fipsEnabled() && isConsoleStartFailure(err)) {
 		return err
 	}
 	dom, lerr := v.DomainLookupByName(name)

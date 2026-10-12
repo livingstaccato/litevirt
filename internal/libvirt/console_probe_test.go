@@ -24,6 +24,7 @@ import (
 // refuses the display at startup instead.
 type fakeProbeQEMU struct {
 	authWorks  bool
+	offerNone  bool // the display asks for no password at all (security type None)
 	exitStderr string
 
 	mu       sync.Mutex
@@ -113,6 +114,14 @@ func (q *fakeProbeQEMU) serveVNC(ln net.Listener) {
 	_, _ = conn.Write([]byte("RFB 003.008\n"))
 	ver := make([]byte, 12)
 	if _, err := io.ReadFull(conn, ver); err != nil {
+		return
+	}
+	if q.offerNone {
+		_, _ = conn.Write([]byte{1, 1})
+		pick := make([]byte, 1)
+		if _, err := io.ReadFull(conn, pick); err == nil && pick[0] == 1 {
+			_, _ = conn.Write([]byte{0, 0, 0, 0})
+		}
 		return
 	}
 	_, _ = conn.Write([]byte{1, 2})

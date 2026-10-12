@@ -152,9 +152,10 @@ migration:
 
 - At startup the daemon asks its own QEMU: it starts a password-protected
   display on a private socket (`-machine none`), sets a password over QMP and
-  authenticates to it, as the console proxy would. Only a successful
-  authentication counts: current QEMU starts such a display on a FIPS host and
-  fails only at authentication. A kernel in FIPS mode
+  authenticates to it, as the console proxy would. Only a successful VNC
+  authentication counts (a display that asks for no password at all does not
+  enforce one, and counts as unable): current QEMU starts such a display on a
+  FIPS host and fails only at authentication. A kernel in FIPS mode
   (`/proc/sys/crypto/fips_enabled` = 1) counts as unable whatever QEMU says. A
   host that cannot sets no VNC passwords; SPICE keeps its own. It logs why, and
   reports `console_password_v1` in `PingResponse.not_enforcing`.
@@ -165,10 +166,11 @@ migration:
   probe was inconclusive) is taken as able, and if its QEMU then refuses, the
   migration fails cleanly and the guest stays on the source.
 - If a start still fails over a console password litevirt set (QEMU says so,
-  or the kernel is in FIPS mode), the daemon redefines the domain without its
-  console passwords, starts it once more, logs it, and sets no VNC passwords
-  from then on. Before the latch it never does this: a password then is an
-  operator's, and that start fails as it always did.
+  or the kernel is in FIPS mode and QEMU's failure is about its console), the
+  daemon redefines the domain without its console passwords, starts it once
+  more, logs it, and sets no VNC passwords from then on. Before the latch it
+  never does this: a password then is an operator's, and that start fails as
+  it always did.
 
 Limits:
 

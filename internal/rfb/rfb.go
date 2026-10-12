@@ -132,6 +132,20 @@ func AuthResponse(challenge [16]byte, password string) ([16]byte, error) {
 // authentication challenge with password. On success the listener expects
 // ClientInit next. A listener offering None is accepted as it is.
 func Authenticate(rw io.ReadWriter, password string) error {
+	return authenticate(rw, password, false)
+}
+
+// ErrNoVNCAuth is a listener that does not offer VNC authentication.
+var ErrNoVNCAuth = errors.New("the listener does not offer VNC authentication")
+
+// AuthenticateVNC is Authenticate that accepts only VNC authentication: a
+// listener offering None (no password asked for) fails with ErrNoVNCAuth. It
+// is what proves a password is ENFORCED, not merely accepted.
+func AuthenticateVNC(rw io.ReadWriter, password string) error {
+	return authenticate(rw, password, true)
+}
+
+func authenticate(rw io.ReadWriter, password string, requireVNC bool) error {
 	ver := make([]byte, 12)
 	if _, err := io.ReadFull(rw, ver); err != nil {
 		return fmt.Errorf("read the listener's protocol version: %w", err)
@@ -182,9 +196,15 @@ func Authenticate(rw io.ReadWriter, password string) error {
 			return fmt.Errorf("the listener offers no security type the console proxy supports (offered %s); "+
 				"a VNC console with TLS or SASL (vnc_tls / vnc_sasl in qemu.conf) is not supported", secTypeNames(types))
 		}
+		if requireVNC && sec != secVNCAuth {
+			return fmt.Errorf("%w (offered %s)", ErrNoVNCAuth, secTypeNames(types))
+		}
 		if _, err := rw.Write([]byte{sec}); err != nil {
 			return fmt.Errorf("send security type: %w", err)
 		}
+	}
+	if requireVNC && sec != secVNCAuth {
+		return fmt.Errorf("%w (offered %s)", ErrNoVNCAuth, secTypeNames([]byte{sec}))
 	}
 
 	switch sec {

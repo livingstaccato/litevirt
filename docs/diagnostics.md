@@ -1755,6 +1755,25 @@ it changes. `lv host lun-holds <host>` lists them. Discard one only after the
 check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
 a second VM off a LUN whose re-created VM's rows are still on their way.
 
+### An iSCSI pool has no session (`iscsi_session_missing`)
+
+Each host checks, at start and every 30 s, that it has a session to the target
+of each of its iscsi pools through the pool's portal, and logs in when one is
+missing (after a reboot, with node records at `node.startup = manual`). When
+the login fails, the host records the pool's state as `degraded` and raises
+`iscsi_session_missing` (evaluator `iscsi_pool`, subject
+`host/<pool>@<host>`, warning; observed on the first failing pass, confirmed
+on the next). The evidence carries iscsiadm's reason (the portal does not
+answer, an authorization failure, no node record and a discovery that failed).
+Nothing is refused on it: a VM whose disk is on the LUN cannot open the
+device, and its start fails as it did before.
+
+Fix what the reason names: the portal's reachability from the host, the node
+record's CHAP settings (`iscsiadm -m node -T <target> -p <portal>`), or the
+target's ACL for this initiator. The next pass logs in, and the pool returns
+to `active` and the condition resolves. Deleting the pool resolves it too.
+See [storage.md](storage.md#iscsi-one-lun-one-disk).
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

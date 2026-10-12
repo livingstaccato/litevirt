@@ -1171,6 +1171,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	svc.ReconcileCephSecrets(ctx)
 	go d.runCephSecretReconcile(ctx)
+	// The iscsi pools' sessions: a host reboot drops them, and node records
+	// at node.startup = manual bring none back. Logged back in now and kept
+	// (grpcapi.ReconcileISCSISessions), off the start path: a portal that
+	// does not answer must not hold the daemon's start.
+	go d.runISCSISessionReconcile(ctx)
 	// Before this daemon serves: no cold-migration copy can be in flight yet.
 	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
@@ -2213,6 +2218,14 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		if len(opts) > 0 {
 			rec.Options = opts
 		}
+		// An iscsi pool's state is its session's, which the session reconcile
+		// records (grpcapi.ReconcileISCSISessions): kept, not reset to active.
+		if strings.EqualFold(p.Driver, "iscsi") {
+			if cur, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, p.Name); err == nil && ok &&
+				strings.EqualFold(cur.Driver, "iscsi") && cur.State != "" {
+				rec.State = cur.State
+			}
+		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
 			if err := syscall.Statfs(p.Target, &st); err == nil {
@@ -2461,6 +2474,25 @@ func (d *Daemon) runCephSecretReconcile(ctx context.Context) {
 				scan()
 				d.svc.ReconcileCephSecrets(ctx)
 			}
+		}
+	}
+}
+
+// runISCSISessionReconcile checks this host's iscsi pools' sessions at once,
+// then every grpcapi.ISCSISessionReconcileInterval, until ctx is cancelled.
+func (d *Daemon) runISCSISessionReconcile(ctx context.Context) {
+	if d.svc == nil {
+		return
+	}
+	d.svc.ReconcileISCSISessions(ctx)
+	ticker := time.NewTicker(grpcapi.ISCSISessionReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.svc.ReconcileISCSISessions(ctx)
 		}
 	}
 }

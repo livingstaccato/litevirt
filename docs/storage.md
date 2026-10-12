@@ -1620,6 +1620,32 @@ or keeping the name when it does not resolve): the device path is spelled from
 the option, and udev names the device `ip-<address>:<port>-iscsi-…`. Pools
 created before keep the spelling their disks were recorded with.
 
+**Sessions after a reboot.** A LUN's device exists only while the host has a
+session to the pool's target, and a reboot drops every session; node records
+are usually `node.startup = manual`, so open-iscsi does not log back in. The
+daemon does, for every iscsi pool of its host: at start and every 30 s it
+lists the sessions (`iscsiadm -m session`) and, for a pool whose target has
+none through its portal, logs in with `iscsiadm -m node -T <target> -p
+<portal> --login`. Pools from the daemon config use the portal of their config
+entry. A start of a VM whose iSCSI device is missing makes the same login
+first, and waits up to 10 s for udev to create the device; it refuses nothing
+(a disk whose device is still missing fails the start, as before).
+
+The login goes through the node record as it is: the record holds the
+session's settings, CHAP credentials included, so no secret is put on a
+command line or in a log. litevirt never rewrites, deletes or logs out of an
+operator's record, and leaves `node.startup` as it is. Only a target with no
+record at all is discovered first, with `iscsiadm -m discovery -t st -p
+<portal> -o new`, which adds records and changes none.
+
+While a pool's session is missing and the login fails, its row's state is
+`degraded` (`lv pool ls`, `lv pool inspect`), not `active`, and its host
+raises `iscsi_session_missing` with the login's reason
+([diagnostics.md](diagnostics.md#an-iscsi-pool-has-no-session-iscsi_session_missing)).
+Both clear on the first pass that has the session. A degraded pool refuses
+nothing; the state is a diagnostic. An older build shows the state as it is
+recorded.
+
 **Not implemented: LVM on an iSCSI LUN.** Proxmox's usual shared-SAN layout is
 one big LUN with a shared LVM volume group on it, carved into one logical
 volume per disk. litevirt has no such driver — `lvm-thin` is a host-local

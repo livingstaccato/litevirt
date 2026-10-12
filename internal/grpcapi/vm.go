@@ -1976,6 +1976,10 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if err := s.refreshUSBHostdevsForStart(ctx, vm); err != nil {
 		return releasePreflight, err
 	}
+	// An iSCSI disk is a device only while the host has a session to its
+	// target, and a host reboot drops the sessions: one whose device is
+	// missing is logged back in first. Best effort, never a refusal.
+	s.ensureISCSISessionsForVM(ctx, vm)
 	// A ceph disk is opened through its pool's libvirt secret, which a
 	// libvirtd restart drops (it is ephemeral): put back before every start,
 	// on every start path, so none waits for the daemon's reconcile.

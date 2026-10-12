@@ -20,6 +20,7 @@ type fakeISCSIAdm struct {
 	loginErr  string            // non-empty: every login fails with this output
 	pending   bool              // a login is in progress in iscsid: "already present", no session listed
 	listErr   string            // non-empty: `-m session` fails with this output
+	staleTag  bool              // a stale-tag record beside the good one: the login opens the session and exits 19
 	calls     [][]string
 }
 
@@ -38,10 +39,10 @@ func (f *fakeISCSIAdm) run(_ context.Context, name string, args ...string) ([]by
 	switch {
 	case a == "-m session":
 		if f.listErr != "" {
-			return []byte(f.listErr), errors.New("exit status 1")
+			return []byte(f.listErr), exitErr(1)
 		}
 		if len(f.sessions) == 0 {
-			return []byte("iscsiadm: No active sessions."), errors.New("exit status 21")
+			return []byte("iscsiadm: No active sessions."), exitErr(21)
 		}
 		var b strings.Builder
 		for i, s := range f.sessions {
@@ -55,27 +56,32 @@ func (f *fakeISCSIAdm) run(_ context.Context, name string, args ...string) ([]by
 			f.records[portal+" "+t] = true
 			return []byte(portal + ",1 " + t), nil
 		}
-		return []byte("iscsiadm: cannot make connection to " + portal), errors.New("exit status 4")
+		return []byte("iscsiadm: cannot make connection to " + portal), exitErr(4)
 	case strings.HasPrefix(a, "-m node -o new"):
 		f.records[argAfter(args, "-p")+" "+argAfter(args, "-T")] = true
 		return []byte("New iSCSI node [tcp:[hw=,ip=,net_if=,iscsi_if=default] " + argAfter(args, "-p") + "," + argAfter(args, "-T") + "] added"), nil
 	case strings.HasPrefix(a, "-m node") && strings.HasSuffix(a, "--login"):
 		portal, target := argAfter(args, "-p"), argAfter(args, "-T")
 		if f.pending {
-			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), errors.New("exit status 15")
+			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), exitErr(15)
 		}
 		if f.loginErr != "" {
-			return []byte(f.loginErr), errors.New("exit status 8")
+			return []byte(f.loginErr), exitErr(8)
 		}
 		if !f.records[portal+" "+target] {
-			return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			return []byte("iscsiadm: No records found"), exitErr(21)
 		}
 		for _, s := range f.sessions {
 			if s == portal+" "+target {
-				return []byte("iscsiadm: default: 1 session requested, but 1 already present."), errors.New("exit status 15")
+				return []byte("iscsiadm: default: 1 session requested, but 1 already present."), exitErr(15)
 			}
 		}
 		f.sessions = append(f.sessions, portal+" "+target)
+		if f.staleTag {
+			return []byte("Login to [iface: default, target: " + target + ", portal: " + portal + ",2] successful.\n" +
+				"iscsiadm: Could not login to [iface: default, target: " + target + ", portal: " + portal + ",1].\n" +
+				"iscsiadm: initiator reported error (19 - encountered non-retryable iSCSI login failure)"), exitErr(19)
+		}
 		return []byte("Login to [iface: default, target: " + target + ", portal: " + portal + "] successful."), nil
 	}
 	return []byte("unexpected"), errors.New("unexpected iscsiadm call: " + a)
@@ -247,5 +253,19 @@ func TestEnsureISCSISession_FromPoolConfig(t *testing.T) {
 	}
 	if _, err := EnsureISCSISession(context.Background(), Config{Driver: "nfs", Source: "x:/y"}); err == nil {
 		t.Fatal("an nfs pool has no iSCSI session; want an error")
+	}
+}
+
+// A stale-tag record beside the good one (an add-only discovery leaves it):
+// the login opens the session through the good one and exits 19 for the
+// stale one. The session is listed, so the pool has its session; reporting
+// it missing would degrade the pool for one pass.
+func TestEnsureISCSISession_LoginErrorWithTheSessionListedIsUp(t *testing.T) {
+	f := newFakeISCSIAdm()
+	f.records["10.0.0.5:3260 "+tgt] = true
+	f.staleTag = true
+	in, err := ensureISCSISession(context.Background(), f.run, tgt, "10.0.0.5:3260")
+	if err != nil || !in {
+		t.Fatalf("login with a stale-tag record: loggedIn=%v err=%v, want true, nil", in, err)
 	}
 }

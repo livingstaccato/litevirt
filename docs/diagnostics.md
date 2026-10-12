@@ -1810,9 +1810,10 @@ start fails as it did before. The evidence carries the reason:
   no node record and one could not be created): fix what iscsiadm's output
   names, which is the portal's reachability from the host, the CHAP settings
   (in iscsid.conf, or in the node record: `iscsiadm -m node -T <target> -p
-  <portal>`; a pool or disk create's discovery resets a record's settings to
-  iscsid.conf's), or the target's ACL for this initiator. The login is
-  retried every 30 s.
+  <portal>`; a pool or disk create keeps a record's settings unless the
+  target refuses them, see
+  [storage.md](storage.md#iscsi-one-lun-one-disk)), or the target's ACL for
+  this initiator. The login is retried every 30 s.
 - **a login is in progress in iscsid**: an earlier login is still being
   retried by iscsid; the next check sees how it ended.
 

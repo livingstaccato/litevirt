@@ -22,9 +22,10 @@ import (
 // without a secret on litevirt's command lines or in its logs. A login goes
 // through the record as it is; only when the target has no record at all is
 // one created, for that target alone (-m node -o new). node.startup is left
-// as the operator set it. (A pool create's Prepare is another matter: its
-// plain sendtargets discovery refreshes the portal's records from
-// iscsid.conf.)
+// as the operator set it. (A pool create's Prepare also logs in through the
+// record as it is; it refreshes a record from iscsid.conf only when the
+// target refused it, and puts it back when the refresh is refused too: see
+// iscsi_prepare.go.)
 
 // The bounds of the iscsiadm calls a session check makes. A login to a
 // portal that does not answer otherwise waits out iscsid's own retries.
@@ -95,6 +96,9 @@ func loginISCSISession(ctx context.Context, run cmdRunner, target, portal string
 	if target == "" {
 		return fmt.Errorf("iscsi pool has no target")
 	}
+	// A Prepare of the target may be refreshing its record (deleted, then
+	// remade or put back): the login waits for it.
+	defer lockISCSITarget(target)()
 	out, err := iscsiLogin(ctx, run, target, portal)
 	if err != nil && strings.Contains(string(out), "No records found") {
 		// No record of this target through this portal: this target's
@@ -113,6 +117,12 @@ func loginISCSISession(ctx context.Context, run cmdRunner, target, portal string
 		out, err = iscsiLogin(ctx, run, target, portal)
 	}
 	if err != nil && !strings.Contains(string(out), "already present") {
+		// One of the target's records can fail while another opens the
+		// session (a stale portal group tag beside the current one, which
+		// an add-only discovery leaves): the session is what counts.
+		if up, lerr := iscsiSessionUp(ctx, run, target, portal); lerr == nil && up {
+			return nil
+		}
 		return fmt.Errorf("no session to iSCSI target %s through %s, and the login failed: %w: %s",
 			target, portal, err, trimISCSIOutput(out))
 	}

@@ -25,26 +25,48 @@ func (c *Client) AttachDisk(domainName string, path, targetDev, bus string) erro
 // The device element carries the disk's REAL type and source, read from the live
 // domain, for the reason libvirt gives: the supplied description "should be as
 // specific as its definition in the domain XML", and a partial one "may lead to
-// unexpected results" — the same trap DetachNIC fell into. Falls back to the
-// target-only shape when the disk cannot be found, where the detach is a no-op
-// anyway.
+// unexpected results" — the same trap DetachNIC fell into. The live domain is read
+// first, then the persistent definition, because a retry can find the disk left in
+// only one of them (see DetachLiveAndConfig). Falls back to the target-only shape
+// when neither holds it, where the detach is a no-op anyway.
 //
 // Note this only makes the REQUEST specific. The unplug itself is asynchronous and
 // needs the guest's cooperation, so a nil return means "requested", not "gone";
 // callers verify absence by waiting (see grpcapi's verifyDiskDetached).
 func (c *Client) DetachDisk(domainName, targetDev string) error {
+	return c.detachDeviceXML(domainName, diskForDetach(targetDev, c.domainCopies(domainName)...))
+}
+
+// domainCopies reads a running domain's live XML, then its persistent XML: the
+// order a detach looks for the device to describe in.
+func (c *Client) domainCopies(domainName string) []func() (string, error) {
+	return []func() (string, error){
+		func() (string, error) { return c.DumpXML(domainName) },
+		func() (string, error) { return c.DumpXMLInactive(domainName) },
+	}
+}
+
+// diskForDetach is the <disk> element DetachDisk sends: the disk's type and
+// source from the first copy that holds targetDev (an unreadable copy is
+// skipped), or the target-only shape when none does.
+func diskForDetach(targetDev string, copies ...func() (string, error)) diskDevice {
 	disk := diskDevice{
 		Type:   "file",
 		Device: "disk",
 		Target: diskTarget{Dev: targetDev},
 	}
-	if xmlText, err := c.DumpXML(domainName); err == nil {
+	for _, read := range copies {
+		xmlText, err := read()
+		if err != nil {
+			continue
+		}
 		if typ, src, ok := DiskSourceByTarget(xmlText, targetDev); ok {
 			disk.Type = typ
 			disk.Source = src
+			break
 		}
 	}
-	return c.detachDeviceXML(domainName, disk)
+	return disk
 }
 
 // AttachNIC hot-attaches a network interface to a running domain.
@@ -60,22 +82,36 @@ func (c *Client) AttachNIC(domainName, bridge, model, mac string) error {
 // 'bridge' in element 'source'" — an error that describes the XML we sent, not
 // anything the operator did. Reading the live domain and reusing the
 // interface's own type/source keeps the element valid (and correct for a
-// non-bridge source). Falls back to the MAC-only shape when the interface
-// cannot be found in the live domain — callers guard against that case first
+// non-bridge source). The live domain is read first, then the persistent
+// definition: a retry can find the NIC left in only the persistent copy (see
+// DetachLiveAndConfig), and the element must still be valid then. Falls back to
+// the MAC-only shape when NEITHER holds it — callers guard against that case first
 // (see detachNICIfPresent), so the fallback exists only for callers that skip
 // the guard, and libvirt's validation error is the honest outcome there.
 func (c *Client) DetachNIC(domainName, mac string) error {
+	return c.detachDeviceXML(domainName, interfaceForDetach(mac, c.domainCopies(domainName)...))
+}
+
+// interfaceForDetach is the <interface> element DetachNIC sends: the
+// interface's type and source from the first copy that holds mac (an unreadable
+// copy is skipped), or the MAC-only shape when none does.
+func interfaceForDetach(mac string, copies ...func() (string, error)) interfaceDevice {
 	iface := interfaceDevice{
 		Type: "bridge",
 		MAC:  ifaceMAC{Address: mac},
 	}
-	if xmlText, err := c.DumpXML(domainName); err == nil {
+	for _, read := range copies {
+		xmlText, err := read()
+		if err != nil {
+			continue
+		}
 		if typ, src, ok := InterfaceSourceByMAC(xmlText, mac); ok {
 			iface.Type = typ
 			iface.Source = src
+			break
 		}
 	}
-	return c.detachDeviceXML(domainName, iface)
+	return iface
 }
 
 // AttachHostdev hot-attaches a PCI device to a running domain.
@@ -191,9 +227,60 @@ func (c *Client) detachDeviceXML(domainName string, device any) error {
 	if err != nil {
 		return fmt.Errorf("marshal device XML: %w", err)
 	}
-	flags := uint32(golibvirt.DomainDeviceModifyLive | golibvirt.DomainDeviceModifyConfig)
-	if err := c.virt.DomainDetachDeviceFlags(dom, string(data), flags); err != nil {
+	err = DetachLiveAndConfig(func(flags uint32) error {
+		return c.virt.DomainDetachDeviceFlags(dom, string(data), flags)
+	})
+	if err != nil {
 		return fmt.Errorf("detach device from %s: %w", domainName, err)
+	}
+	return nil
+}
+
+// The virDomainModificationImpact flags a detach addresses: the running domain,
+// its persistent definition, or both.
+const (
+	ModifyLive   = uint32(golibvirt.DomainDeviceModifyLive)
+	ModifyConfig = uint32(golibvirt.DomainDeviceModifyConfig)
+)
+
+// DetachLiveAndConfig runs one device detach, given as detach(flags), against a
+// running domain's live instance AND its persistent definition, and detaches from
+// whichever of the two still holds the device.
+//
+// A single LIVE|CONFIG call is not enough on a retry. libvirt applies it
+// all-or-nothing (qemuDomainDetachDeviceLiveAndConfig): when either copy lacks the
+// device the whole call fails with VIR_ERR_DEVICE_MISSING and the other half is not
+// applied. The copies diverge in exactly the case a retry exists for: the first
+// detach removes the device from the persistent definition at once but only
+// REQUESTS the live unplug, and a guest still booting drops that eject. From then on
+// every LIVE|CONFIG retry fails on the config half and the live unplug is never
+// re-issued (lab finding N1: the VM's operation barrier held for >9 minutes until a
+// manual `virsh detach-interface --live`). The opposite divergence, live gone and
+// persistent copy left, fails the same way on the live half.
+//
+// So: try LIVE|CONFIG (the common case, one call). Only on VIR_ERR_DEVICE_MISSING,
+// ask each copy on its own, and treat DEVICE_MISSING from that copy as "this copy
+// is already clear". Every other error is returned as it stands.
+//
+// A nil return therefore means libvirt accepted the detach for every copy that held
+// the device, or both copies reported it missing. It never means "gone": the live
+// half only requests the unplug, and callers still verify absence. Classification
+// is by the TYPED error code only (IsDeviceMissing), so nothing that merely reads
+// like "not found" — a dead connection, a vanished domain — can pass for done.
+//
+// Not covered: a device element libvirt cannot match at all (a NIC described by a
+// MAC with no source fails XML validation, VIR_ERR_XML_ERROR, before matching), so
+// callers still describe the device as it stands in the copy that holds it.
+func DetachLiveAndConfig(detach func(flags uint32) error) error {
+	err := detach(ModifyLive | ModifyConfig)
+	if err == nil || !IsDeviceMissing(err) {
+		return err
+	}
+	if lerr := detach(ModifyLive); lerr != nil && !IsDeviceMissing(lerr) {
+		return lerr
+	}
+	if cerr := detach(ModifyConfig); cerr != nil && !IsDeviceMissing(cerr) {
+		return cerr
 	}
 	return nil
 }

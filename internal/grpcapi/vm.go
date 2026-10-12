@@ -3908,6 +3908,13 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	outcome := recreateNotAttempted
 	defer func() { lunDone(outcome) }()
 
+	// The image the VM is created again from is held from before the teardown
+	// until the create has returned: in between, no disk and no live row
+	// records it, and lv image rm must not take the file the create needs.
+	if spec.Image != "" {
+		defer s.holdImage(spec.Image)()
+	}
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -3945,6 +3952,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
 	s.retireNICGuards(ctx, req.Name)
+	if hook := s.recreateTornDown; hook != nil {
+		hook(req.Name)
+	}
 
 	// Recreate the VM using the stored spec. The create carries the identity
 	// of the VM just tombstoned: the host it lands on may not have applied

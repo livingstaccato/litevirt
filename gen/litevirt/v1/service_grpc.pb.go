@@ -99,6 +99,7 @@ const (
 	LiteVirt_PushImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PushImage"
 	LiteVirt_BuildImage_FullMethodName                 = "/litevirt.v1.LiteVirt/BuildImage"
 	LiteVirt_PruneImages_FullMethodName                = "/litevirt.v1.LiteVirt/PruneImages"
+	LiteVirt_RemoveImage_FullMethodName                = "/litevirt.v1.LiteVirt/RemoveImage"
 	LiteVirt_BackupVM_FullMethodName                   = "/litevirt.v1.LiteVirt/BackupVM"
 	LiteVirt_RestoreVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestoreVM"
 	LiteVirt_ImportVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ImportVM"
@@ -487,6 +488,10 @@ type LiteVirtClient interface {
 	PushImage(ctx context.Context, in *PushImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PushImageProgress], error)
 	BuildImage(ctx context.Context, in *BuildImageRequest, opts ...grpc.CallOption) (*BuildImageResponse, error)
 	PruneImages(ctx context.Context, in *PruneImagesRequest, opts ...grpc.CallOption) (*PruneImagesResponse, error)
+	// RemoveImage deletes an image (as DeleteImage) and then removes its files
+	// on every host where nothing uses them, reporting each host's outcome:
+	// lv image rm.
+	RemoveImage(ctx context.Context, in *RemoveImageRequest, opts ...grpc.CallOption) (*RemoveImageResponse, error)
 	// ── Backup ──
 	BackupVM(ctx context.Context, in *BackupVMRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupChunk], error)
 	RestoreVM(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RestoreVMRequest, VM], error)
@@ -1985,6 +1990,16 @@ func (c *liteVirtClient) PruneImages(ctx context.Context, in *PruneImagesRequest
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PruneImagesResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_PruneImages_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RemoveImage(ctx context.Context, in *RemoveImageRequest, opts ...grpc.CallOption) (*RemoveImageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveImageResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RemoveImage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4801,6 +4816,10 @@ type LiteVirtServer interface {
 	PushImage(*PushImageRequest, grpc.ServerStreamingServer[PushImageProgress]) error
 	BuildImage(context.Context, *BuildImageRequest) (*BuildImageResponse, error)
 	PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error)
+	// RemoveImage deletes an image (as DeleteImage) and then removes its files
+	// on every host where nothing uses them, reporting each host's outcome:
+	// lv image rm.
+	RemoveImage(context.Context, *RemoveImageRequest) (*RemoveImageResponse, error)
 	// ── Backup ──
 	BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error
 	RestoreVM(grpc.ClientStreamingServer[RestoreVMRequest, VM]) error
@@ -5619,6 +5638,9 @@ func (UnimplementedLiteVirtServer) BuildImage(context.Context, *BuildImageReques
 }
 func (UnimplementedLiteVirtServer) PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PruneImages not implemented")
+}
+func (UnimplementedLiteVirtServer) RemoveImage(context.Context, *RemoveImageRequest) (*RemoveImageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveImage not implemented")
 }
 func (UnimplementedLiteVirtServer) BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error {
 	return status.Error(codes.Unimplemented, "method BackupVM not implemented")
@@ -7660,6 +7682,24 @@ func _LiteVirt_PruneImages_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).PruneImages(ctx, req.(*PruneImagesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RemoveImage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveImageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RemoveImage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RemoveImage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RemoveImage(ctx, req.(*RemoveImageRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -12193,6 +12233,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PruneImages",
 			Handler:    _LiteVirt_PruneImages_Handler,
+		},
+		{
+			MethodName: "RemoveImage",
+			Handler:    _LiteVirt_RemoveImage_Handler,
 		},
 		{
 			MethodName: "CreateSnapshot",

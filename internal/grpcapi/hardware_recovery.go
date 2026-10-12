@@ -572,12 +572,31 @@ func (s *Server) recoverDiskDetach(ctx context.Context, vm *corrosion.VMRecord, 
 	diskName := art["disk_name"]
 
 	if running {
-		if srcs, e := s.virt.DomainDiskSources(vm.Name); e == nil {
-			if _, present := srcs[targetDev]; present {
-				if e := s.virt.DetachDisk(vm.Name, targetDev); e != nil {
-					slog.Error("hardware op recovery: disk detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
-					return
-				}
+		// Detach while EITHER copy still holds the disk: a first detach can leave
+		// the live copy (a dropped eject) or the persistent one, and DetachDisk
+		// clears whichever remains (libvirt.DetachLiveAndConfig). Skipping on a
+		// live-only check left a persistent remnant that verifyDiskDetached then
+		// refused on every pass.
+		// Both membership reads fail closed, as the NIC and PCI branches do: an
+		// unreadable copy is not an absent one.
+		srcs, e := s.virt.DomainDiskSources(vm.Name)
+		if e != nil {
+			slog.Error("hardware op recovery: disk detach live read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+			return
+		}
+		_, present := srcs[targetDev]
+		if !present {
+			inactive, e := s.virt.DumpXMLInactive(vm.Name)
+			if e != nil {
+				slog.Error("hardware op recovery: disk detach persistent read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+				return
+			}
+			present = diskDevInXML(inactive, targetDev)
+		}
+		if present {
+			if e := s.virt.DetachDisk(vm.Name, targetDev); e != nil {
+				slog.Error("hardware op recovery: disk detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+				return
 			}
 		}
 		if !s.retrySoftDeleteDisk(ctx, vm.Name, diskName) {
@@ -618,11 +637,11 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 	dualWrite := !latched
 
 	if running {
-		if live, e := s.virt.DumpXML(vm.Name); e == nil && nicMacInXML(live, mac) {
-			if e := s.detachNICIfPresent(vm.Name, mac); e != nil {
-				slog.Error("hardware op recovery: nic detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
-				return
-			}
+		// Detach from whichever copy (live, persistent) still holds the NIC; a
+		// read failure leaves the op recoverable rather than reading as "gone".
+		if e := s.detachNICIfPresent(vm.Name, mac); e != nil {
+			slog.Error("hardware op recovery: nic detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+			return
 		}
 		if !s.retryNICRowTombstone(ctx, vm.Name, mac, nicID, dualWrite) {
 			slog.Error("hardware op recovery: nic detach row tombstone failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID)
@@ -704,13 +723,29 @@ func (s *Server) recoverPCIDetach(ctx context.Context, vm *corrosion.VMRecord, v
 			slog.Error("hardware op recovery: pci detach live read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
 			return
 		}
+		// The persistent copy counts too: a first detach can leave either copy
+		// holding the hostdev, and DetachHostdev clears whichever remains
+		// (libvirt.DetachLiveAndConfig). Fail closed on this read like the live one.
+		inactive, e := s.virt.DumpXMLInactive(vm.Name)
+		if e != nil {
+			slog.Error("hardware op recovery: pci detach persistent read failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
+			return
+		}
 		for i, addr := range memberAddrs {
-			if hostdevAliasInXML(live, memberAliases[i]) {
+			if hostdevAliasInXML(live, memberAliases[i]) || hostdevAliasInXML(inactive, memberAliases[i]) {
 				if e := s.virt.DetachHostdev(vm.Name, addr); e != nil {
 					slog.Error("hardware op recovery: pci detach live-detach failed — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", e)
 					return
 				}
 			}
+		}
+		// Release only once the guest has let go: a nil DetachHostdev only REQUESTED
+		// the unplug (waitPCILiveGone). A guest that keeps dropping the eject leaves
+		// the op recoverable with nothing released and the realizations intact, so
+		// the next pass still knows its members.
+		if err := s.waitPCILiveGone(ctx, vm.Name, memberAliases, memberAddrs); err != nil {
+			slog.Error("hardware op recovery: pci detach hostdev still in the live domain — nothing released, left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
+			return
 		}
 		// Strict release (unbind by vfio ground truth + owner-release, all-or-nothing
 		// recoverable) — matches executePCIDetach's running branch. Any failure leaves the op

@@ -66,3 +66,21 @@ func IsPCISlotsExhausted(err error) bool {
 		strings.Contains(msg, "no more available pci addresses") ||
 		strings.Contains(msg, "no more free pci slots")
 }
+
+// IsDeviceMissing reports whether err is libvirt's VIR_ERR_DEVICE_MISSING (99,
+// "device not found: ..."): the device a hot-plug call described is not in the
+// definition that call addressed. Like IsNoDomain it is TYPED ONLY, with no text
+// fallback, because DetachLiveAndConfig reads "missing from every copy" as "the
+// detach is already done" — a substring match would let a dropped connection or a
+// "domain not found" pass for that.
+//
+// libvirt raises it from both halves of a detach, so on its own it does not say
+// WHICH copy lacked the device; DetachLiveAndConfig works that out by asking each
+// copy separately. The lab saw it for a NIC whose persistent copy was already gone:
+//
+//	device not found: no device found at address '(<null>)' matching MAC address
+//	'52:54:00:d4:32:65' and alias '(<null>)'
+func IsDeviceMissing(err error) bool {
+	var e golibvirt.Error
+	return errors.As(err, &e) && e.Code == uint32(golibvirt.ErrDeviceMissing)
+}

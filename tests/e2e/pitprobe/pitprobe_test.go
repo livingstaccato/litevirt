@@ -136,3 +136,52 @@ func TestWindowTokenCmd_Shape(t *testing.T) {
 		t.Fatalf("WindowTokenCmd = %q: want --absolute-names and stderr kept apart", c)
 	}
 }
+
+// runHMPQemuIO runs HMPQemuIO's command with virsh replaced by a function
+// that appends logAppend to the domain log (where qemu 8.2 / libvirt 10 put
+// qemu-io's output) and prints reply (the HMP reply). The log starts with
+// logBefore, an earlier command's output.
+func runHMPQemuIO(t *testing.T, reply, logBefore, logAppend string) string {
+	t.Helper()
+	dir := t.TempDir()
+	old := DomainLogDir
+	DomainLogDir = dir
+	t.Cleanup(func() { DomainLogDir = old })
+	if err := os.WriteFile(filepath.Join(dir, "vm.log"), []byte(logBefore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pre := `virsh() { printf '%s' "$APPEND" >> ` + shq(filepath.Join(dir, "vm.log")) + `; printf '%s' "$REPLY"; }; `
+	cmd := exec.Command("sh", "-c", pre+HMPQemuIO(shq("vm"), QemuIODevice("virtio-disk0"), "write -P 1 0 512"))
+	cmd.Env = append(os.Environ(), "APPEND="+logAppend, "REPLY="+reply)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("HMPQemuIO command: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// qemu 8.2 / libvirt 10: the HMP reply is empty and qemu-io's output goes to
+// the domain log. The result is the lines appended by this command, not an
+// earlier command's "wrote" (lab 2 run 1012).
+func TestHMPQemuIO_ReadsTheDomainLogWhenTheReplyIsEmpty(t *testing.T) {
+	const before = "wrote 512/512 bytes at offset 0\n"
+	if out := runHMPQemuIO(t, "", before, "wrote 512/512 bytes at offset 4096\n"); !Wrote(out) || strings.Count(out, "wrote ") != 1 || !strings.Contains(out, "offset 4096") {
+		t.Fatalf("success: output %q; want only this command's log lines", out)
+	}
+	if out := runHMPQemuIO(t, "", before, "write failed: Input/output error\n"); Wrote(out) {
+		t.Fatalf("failure: output %q reads as a completed write (an earlier command's log line leaked in)", out)
+	}
+}
+
+// A reply that is not empty is the result, as on a qemu that answers over
+// HMP; a stale log line does not turn a failed reply into a write.
+func TestHMPQemuIO_PrefersANonEmptyReply(t *testing.T) {
+	const before = "wrote 512/512 bytes at offset 0\n"
+	out := runHMPQemuIO(t, "Device does not have a block device backend", before, "wrote 512/512 bytes at offset 4096\n")
+	if Wrote(out) || !strings.Contains(out, "Device does not have") {
+		t.Fatalf("output %q: want the HMP reply alone", out)
+	}
+	if out := runHMPQemuIO(t, "wrote 512/512 bytes at offset 4096", "", ""); !Wrote(out) {
+		t.Fatalf("output %q: a replied write must read as written", out)
+	}
+}

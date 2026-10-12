@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,7 +49,9 @@ import (
 // scratch directory is replaced by a file (any backup or backup session on
 // that node fails meanwhile), and this test's own pool directory is made
 // immutable. So they run only on a node pinned with E2E_PIT_EXCLUSIVE_NODE
-// (the operator asserting nothing else runs there), under a node-side lock
+// (the operator asserting nothing else runs there; the test then uses that
+// node throughout, and with no pin it uses the first up node and skips the
+// legs, saying why), under a node-side lock
 // (/run/lv-e2e-pit.lock, skipped if held), with a systemd-run watchdog armed
 // first that restores both after 30 minutes even if this test is killed, and
 // every restore is verified and logged.
@@ -61,7 +64,16 @@ import (
 //	  go test ./tests/e2e/ -run TestReplicateVolume_RunningVMIsPointInTime -v -timeout 40m
 func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	l := newLab(t)
-	h := labUpHosts(l, 1)[0]
+	up := labUpHosts(l, 1)
+	h := up[0]
+	// A pinned node is the node under test, so the forced legs can never
+	// skip for want of a match between the pin and the pick.
+	if pin := os.Getenv("E2E_PIT_EXCLUSIVE_NODE"); pin != "" {
+		if !slices.Contains(up, pin) {
+			t.Skipf("E2E_PIT_EXCLUSIVE_NODE=%s is not an up lab node (up: %v)", pin, up)
+		}
+		h = pin
+	}
 	if out, err := l.ssh(h, 20*time.Second, "command -v chattr"); err != nil {
 		t.Skipf("%s has no chattr: %s", h, strings.TrimSpace(out))
 	}
@@ -93,6 +105,11 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 
 	stack := uniqueName("pitrep")
 	vm := stack + "-1"
+	// Runs last: the node-side files this test leaves in /tmp and /var/tmp
+	// (the compose file, the writers' pid and log files, the raw check copy).
+	t.Cleanup(func() {
+		l.ssh(h, 30*time.Second, fmt.Sprintf("rm -f /tmp/%[1]s.yaml /tmp/%[1]s-*.pid /tmp/%[1]s-*.log /var/tmp/%[1]s-check.raw", stack))
+	})
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), srcPool, h)
 	file := "/tmp/" + stack + ".yaml"
@@ -325,7 +342,7 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	forced := false
 	t.Run("forced layers 2 and 3", func(st *testing.T) {
 		if os.Getenv("E2E_PIT_EXCLUSIVE_NODE") != h {
-			st.Skipf("set E2E_PIT_EXCLUSIVE_NODE=%s to pin legs 2 and 3 to this node (no other e2e or backup may run there)", h)
+			st.Skipf("legs 2 and 3 skipped: E2E_PIT_EXCLUSIVE_NODE is %q, and this run uses %s; set E2E_PIT_EXCLUSIVE_NODE=%s (the operator asserts no other e2e or backup runs there)", os.Getenv("E2E_PIT_EXCLUSIVE_NODE"), h, h)
 		}
 		if out, err := l.ssh(h, 20*time.Second, "mkdir /run/lv-e2e-pit.lock"); err != nil {
 			st.Skipf("another run holds /run/lv-e2e-pit.lock on %s: %s", h, out)

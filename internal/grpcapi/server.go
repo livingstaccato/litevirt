@@ -1489,27 +1489,52 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 // console_password_v1 has latched).
 func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
 
-// ConsolePasswordActive reports whether a domain defined on this host now gets
-// console passwords: enforcement.console_password AND the console_password_v1
-// latch, so no password is set while any host could still be on a build that
-// cannot present one. It is the policy the libvirt client applies to every
-// define (wireConsolePasswordPolicy), and it reads only in-memory state.
-func (s *Server) ConsolePasswordActive() bool {
-	return s.enfConsolePassword.Load() && s.gate != nil && s.gate.Latched(capabilities.ConsolePasswordV1)
+// ConsolePasswordPolicy is what this host's defines do to a domain's console
+// passwords. Until console_password_v1 has latched, nothing (PolicyLeave):
+// a host on a build that cannot present a password could still be handed
+// the guest, and an operator-set password on an imported domain stays as it
+// was. Once latched, enforcement.console_password decides: fresh passwords
+// (PolicySet) or none (PolicyStrip, the kill switch). It reads only
+// in-memory state; the libvirt client applies it to every define
+// (wireConsolePasswordPolicy).
+func (s *Server) ConsolePasswordPolicy() lv.ConsolePolicy {
+	if s.gate == nil || !s.gate.Latched(capabilities.ConsolePasswordV1) {
+		return lv.PolicyLeave
+	}
+	if s.enfConsolePassword.Load() {
+		return lv.PolicySet
+	}
+	return lv.PolicyStrip
 }
 
 // consolePasswordPolicySetter is the libvirt backend's hook for that policy
 // (libvirt.Client.SetConsolePasswordPolicy, and the fleet fake's).
 type consolePasswordPolicySetter interface {
-	SetConsolePasswordPolicy(func() bool)
+	SetConsolePasswordPolicy(func() lv.ConsolePolicy)
 }
 
-// wireConsolePasswordPolicy hands the backend ConsolePasswordActive, so every
+// vncPasswordReporter is the backend's answer to whether this host's QEMU
+// can do VNC password authentication (libvirt.Client.VNCPasswordUnavailable:
+// the startup probe or a refused start).
+type vncPasswordReporter interface {
+	VNCPasswordUnavailable() string
+}
+
+// vncPasswordUnavailable is why this host cannot set VNC passwords, "" when
+// it can (or the backend cannot say).
+func (s *Server) vncPasswordUnavailable() string {
+	if r, ok := s.virt.(vncPasswordReporter); ok {
+		return r.VNCPasswordUnavailable()
+	}
+	return ""
+}
+
+// wireConsolePasswordPolicy hands the backend ConsolePasswordPolicy, so every
 // DefineDomain on this host — whichever path calls it, the health reconciler's
 // included, since it shares the client — applies it.
 func (s *Server) wireConsolePasswordPolicy() {
 	if p, ok := s.virt.(consolePasswordPolicySetter); ok {
-		p.SetConsolePasswordPolicy(s.ConsolePasswordActive)
+		p.SetConsolePasswordPolicy(s.ConsolePasswordPolicy)
 	}
 }
 

@@ -14,13 +14,13 @@ import (
 // DefineDomain creates a persistent domain from XML.
 //
 // Every define goes through the console password policy
-// (SetConsolePasswordPolicy): with it on, each VNC/SPICE console gets a fresh
-// password; with it off, none. This is the one place every define path
-// passes — create, a redefine on update or start, a restore, a clone, a
-// failover define, a cold migration's target — so none of them can define a
-// console that skipped it.
+// (SetConsolePasswordPolicy): once in force, each VNC/SPICE console gets a
+// fresh password, or none under the kill switch. This is the one place every
+// define path passes — create, a redefine on update or start, a restore, a
+// clone, a failover define, a cold migration's target — so none of them can
+// define a console that skipped it.
 func (c *Client) DefineDomain(xmlConfig string) error {
-	xmlConfig, err := c.applyConsolePolicy(xmlConfig)
+	xmlConfig, err := c.applyConsolePolicy(xmlConfig, true)
 	if err != nil {
 		return fmt.Errorf("define domain: %w", err)
 	}
@@ -36,12 +36,17 @@ func (c *Client) DefineDomain(xmlConfig string) error {
 // It goes through the start guard (SetStartGuard): whatever must be in force
 // before the guest's first frame — its NIC guards — is, or the domain is not
 // started.
+//
+// A start QEMU refuses because it cannot do a console password (a FIPS-mode
+// host has no DES for VNC authentication) is retried once without the
+// passwords, and the host stops setting VNC passwords
+// (startWithConsoleBackstop): this feature never newly fails a start.
 func (c *Client) StartDomain(name string) error {
 	g, err := c.guard(name)
 	if err != nil {
 		return fmt.Errorf("start domain %s: %w", name, err)
 	}
-	return startDomainGuarded(c.virt, g, name)
+	return startWithConsoleBackstop(c.virt, g, name, c.SetVNCPasswordUnavailable)
 }
 
 // startDomainGuarded starts name through g.
@@ -621,6 +626,11 @@ func (c *Client) SetBootOrder(domainName, bootOrder string) error {
 	// Map litevirt's keyword (disk|cdrom|network) to a valid libvirt boot dev
 	// (hd|cdrom|network); "disk" is rejected by libvirt.
 	updated := patchBootDev(xmlDesc, libvirtBootDev(bootOrder))
+	// Keep the console passwords it has, unless the kill switch or a host
+	// without VNC passwords says otherwise.
+	if updated, err = c.applyConsolePolicy(updated, false); err != nil {
+		return fmt.Errorf("redefine domain %s: %w", domainName, err)
+	}
 
 	if _, err := c.virt.DomainDefineXML(updated); err != nil {
 		return fmt.Errorf("redefine domain %s: %w", domainName, err)

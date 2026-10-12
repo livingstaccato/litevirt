@@ -347,7 +347,7 @@ func TestFleet_ConsolePassword_LiveMigrationKeepsTheConsole(t *testing.T) {
 	// migratable definition as it is (no define of ours runs there), and the
 	// source domain is gone (VIR_MIGRATE_UNDEFINE_SOURCE).
 	src.Virt.OnMigrateToTarget = func(name, _ string, _ lv.MigrateParams) error {
-		x, err := src.Virt.DumpXML(name)
+		x, err := src.Virt.DumpXMLSecure(name)
 		if err != nil {
 			return err
 		}

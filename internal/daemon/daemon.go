@@ -784,6 +784,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
 	go d.virt.StartReconnectLoop(ctx)
 
+	// Can this host's QEMU do a VNC console password? A FIPS-mode host has no
+	// DES for VNC authentication and would refuse every passworded start, so
+	// it sets none and reports console_password_v1 in not_enforcing
+	// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
+	// refused start is still caught by the start backstop.
+	go func() {
+		if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {
+			d.virt.SetVNCPasswordUnavailable(reason)
+			slog.Warn("this host cannot give VNC consoles a password; they stay open here (SPICE keeps its own)",
+				"reason", reason)
+		}
+	}()
+
 	// Register domain event callback for immediate VM death detection (#44).
 	eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
 	eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)

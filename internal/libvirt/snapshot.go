@@ -257,7 +257,7 @@ func (c *Client) RevertToSnapshot(domainName, snapshotName string, restorePreDef
 	if err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
-	return revertToSnapshot(c.virt, domainName, snapshotName, restorePreDefine, g)
+	return revertToSnapshot(keepConsoleSnapshotAPI{c.virt, c}, domainName, snapshotName, restorePreDefine, g)
 }
 
 func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePreDefine func() error, g StartGuard) error {
@@ -283,7 +283,9 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	}
 
 	// Current (live) domain XML has the overlay paths the snapshot cut over to.
-	domXML, err := v.DomainGetXMLDesc(dom, 0)
+	// Secure: it is the fallback definition below, so it must keep the console
+	// password.
+	domXML, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure)
 	if err != nil {
 		return fmt.Errorf("get domain XML: %w", err)
 	}
@@ -731,7 +733,7 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 	if err != nil {
 		return fmt.Errorf("revert %s: %w", domainName, err)
 	}
-	return revertToLiveSnapshot(c.virt, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved, g)
+	return revertToLiveSnapshot(keepConsoleSnapshotAPI{c.virt, c}, domainName, snapshotName, vmstatePath, restorePreDefine, rewriteSaved, g)
 }
 
 func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath string, restorePreDefine func() error, rewriteSaved func(savedXML string) (string, error), g StartGuard) error {
@@ -771,8 +773,9 @@ func revertToLiveSnapshot(v snapshotAPI, domainName, snapshotName, vmstatePath s
 	}
 
 	// The saved image's domain XML references the overlay paths — keep it as-is
-	// for the persistent redefine after restore.
-	savedXML, err := v.DomainSaveImageGetXMLDesc(vmstatePath, 0)
+	// for the persistent redefine after restore. Secure: that redefine must keep
+	// the console password the image carries.
+	savedXML, err := v.DomainSaveImageGetXMLDesc(vmstatePath, uint32(golibvirt.DomainSaveImageXMLSecure))
 	if err != nil {
 		return fmt.Errorf("read saved image XML: %w", err)
 	}

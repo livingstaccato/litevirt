@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,7 +145,7 @@ func TestServeNoAuth_EveryVersionGetsNone(t *testing.T) {
 	for _, minor := range []int{3, 7, 8} {
 		proxy, client := net.Pipe()
 		done := make(chan error, 1)
-		go func() { done <- ServeNoAuth(proxy) }()
+		go func() { done <- ServeNoAuth(proxy, nil) }()
 		types, err := viewer(client, minor)
 		if err != nil {
 			t.Fatalf("3.%d viewer: %v", minor, err)
@@ -163,7 +164,7 @@ func TestServeNoAuth_EveryVersionGetsNone(t *testing.T) {
 func TestServeNoAuth_ViewerPickingAnotherTypeIsRefused(t *testing.T) {
 	proxy, client := net.Pipe()
 	done := make(chan error, 1)
-	go func() { done <- ServeNoAuth(proxy) }()
+	go func() { done <- ServeNoAuth(proxy, nil) }()
 	go func() {
 		ver := make([]byte, 12)
 		_, _ = io.ReadFull(client, ver)
@@ -177,4 +178,71 @@ func TestServeNoAuth_ViewerPickingAnotherTypeIsRefused(t *testing.T) {
 		t.Fatal("ServeNoAuth accepted a viewer that picked VNC auth, which it never offered")
 	}
 	client.Close()
+}
+
+// The backend (the proxy's authentication to the listener) runs only once the
+// viewer has chosen None, and a refusal there reaches a 3.8 viewer as a failed
+// security result, not a silently dropped connection.
+//
+// Mutation "authenticate before the viewer handshake" — red (ran too early).
+// Mutation "ignore the backend's error" — red.
+func TestServeNoAuth_BackendRunsAfterThePickAndItsRefusalIsReported(t *testing.T) {
+	proxy, client := net.Pipe()
+	defer client.Close()
+	picked := make(chan struct{})
+	var ranEarly bool
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeNoAuth(proxy, func() error {
+			select {
+			case <-picked:
+			default:
+				ranEarly = true
+			}
+			return ErrAuthFailed
+		})
+	}()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	ver := make([]byte, 12)
+	if _, err := io.ReadFull(client, ver); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = client.Write([]byte("RFB 003.008\n"))
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(client, hdr); err != nil {
+		t.Fatal(err)
+	}
+	close(picked)
+	_, _ = client.Write([]byte{1})
+	var res [4]byte
+	if _, err := io.ReadFull(client, res[:]); err != nil {
+		t.Fatalf("no security result after a refused backend: %v", err)
+	}
+	if binary.BigEndian.Uint32(res[:]) == 0 {
+		t.Fatal("the viewer was told OK although the listener refused")
+	}
+	go func() { _, _ = io.Copy(io.Discard, client) }()
+	if err := <-done; !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("ServeNoAuth returned %v, want the backend's error", err)
+	}
+	if ranEarly {
+		t.Error("the backend ran before the viewer had chosen a security type")
+	}
+}
+
+// A listener with TLS or SASL configured gets an error that names the cause.
+func TestAuthenticate_UnsupportedTypesAreNamed(t *testing.T) {
+	proxy, qemu := net.Pipe()
+	go func() {
+		defer qemu.Close()
+		_, _ = qemu.Write([]byte("RFB 003.008\n"))
+		ver := make([]byte, 12)
+		_, _ = io.ReadFull(qemu, ver)
+		_, _ = qemu.Write([]byte{1, 19})
+		_, _ = io.Copy(io.Discard, qemu)
+	}()
+	err := Authenticate(proxy, "x")
+	if err == nil || !strings.Contains(err.Error(), "VeNCrypt (19)") || !strings.Contains(err.Error(), "vnc_tls") {
+		t.Fatalf("err = %v, want it to name VeNCrypt and vnc_tls", err)
+	}
 }

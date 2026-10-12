@@ -791,7 +791,10 @@ const (
 	//
 	// Config-gated (enforcement.console_password, DEFAULT TRUE) and
 	// reversible: false makes this host's next define of each domain drop
-	// its passwords. ReplicationGated: a host parked in maintenance on an
+	// its passwords. A host whose QEMU cannot do VNC passwords (FIPS: no DES)
+	// still advertises it — it presents whatever a guest it holds has — but
+	// sets no VNC passwords, takes migrations without them, never fails a
+	// start over one, and reports the token in not_enforcing. ReplicationGated: a host parked in maintenance on an
 	// older build still holds VMs it may get back, and could be handed one
 	// by a migration once it returns, so the latch waits for it too.
 	ConsolePasswordV1 = "console_password_v1"

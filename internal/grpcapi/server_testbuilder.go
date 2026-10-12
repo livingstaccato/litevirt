@@ -108,6 +108,10 @@ func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
 	s.observeOneSelfReportedQuarantine(ctx)
 }
 
+// NotEnforcingTokensForTests is what this server would report in
+// PingResponse.not_enforcing, for a fleet scenario to assert on.
+func (s *Server) NotEnforcingTokensForTests() []string { return s.notEnforcingTokens() }
+
 // SetWALQuarantinedForTest makes this server report itself WAL-quarantined, the
 // state the shipped rollback detector produces on a binary below a latched token.
 func (s *Server) SetWALQuarantinedForTest(on bool) {

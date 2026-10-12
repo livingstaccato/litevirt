@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 
@@ -72,9 +73,12 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	// passwords"). SPICE is not proxied, so the client presents it itself;
 	// this caller passed the vm.console check above on its entry host. Read
 	// from the RUNNING domain, and never logged.
+	// A password that cannot be read degrades rather than refuses: the info
+	// goes back without it, and the client prompts.
 	password, err := s.virt.ConsolePassword(req.VmName, "spice")
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read the SPICE console's password for %q: %v", req.VmName, err)
+		slog.Warn("spice console password unreadable; returning the connection info without it", "vm", req.VmName, "error", err)
+		password = ""
 	}
 
 	host, err := corrosion.GetHost(ctx, s.db, vm.HostName)

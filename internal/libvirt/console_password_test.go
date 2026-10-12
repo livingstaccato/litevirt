@@ -31,7 +31,7 @@ func TestGenerateDomainXML_RendersNoConsolePassword(t *testing.T) {
 
 func TestApplyConsolePasswords_OnSetsAFreshPasswordOnEveryConsole(t *testing.T) {
 	x := consoleDomainXML(t)
-	out, err := ApplyConsolePasswords(x, true)
+	out, err := ApplyConsolePasswords(x, ConsoleFresh, false)
 	if err != nil {
 		t.Fatalf("ApplyConsolePasswords: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestApplyConsolePasswords_OnSetsAFreshPasswordOnEveryConsole(t *testing.T) 
 	}
 
 	// A redefine rotates: the same input yields different passwords.
-	again, err := ApplyConsolePasswords(out, true)
+	again, err := ApplyConsolePasswords(out, ConsoleFresh, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestApplyConsolePasswords_OnSetsAFreshPasswordOnEveryConsole(t *testing.T) 
 	}
 
 	// Nothing outside the graphics start tags changes.
-	stripped, err := ApplyConsolePasswords(again, false)
+	stripped, err := ApplyConsolePasswords(again, ConsoleStrip, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestApplyConsolePasswords_OffRemovesAPassword(t *testing.T) {
 		`<graphics type="spice" autoport="yes" passwd="s3cret"/>` +
 		`<graphics type='egl-headless'/>` +
 		`</devices></domain>`
-	out, err := ApplyConsolePasswords(x, false)
+	out, err := ApplyConsolePasswords(x, ConsoleStrip, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestApplyConsolePasswords_OffRemovesAPassword(t *testing.T) {
 		t.Errorf("an unrelated attribute that merely starts with passwd was removed:\n%s", out)
 	}
 	// A graphics type that has no password (egl-headless) is left alone when on.
-	on, err := ApplyConsolePasswords(x, true)
+	on, err := ApplyConsolePasswords(x, ConsoleFresh, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,13 +107,13 @@ func TestApplyConsolePasswords_OffRemovesAPassword(t *testing.T) {
 
 func TestApplyConsolePasswords_NoGraphicsIsUnchanged(t *testing.T) {
 	x := `<domain type='kvm'><name>headless</name><devices><serial type='pty'/></devices></domain>`
-	for _, on := range []bool{true, false} {
-		out, err := ApplyConsolePasswords(x, on)
+	for _, mode := range []ConsolePasswordMode{ConsoleFresh, ConsoleKeep, ConsoleStrip, ConsoleLeave} {
+		out, err := ApplyConsolePasswords(x, mode, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if out != x {
-			t.Errorf("on=%v changed a domain with no console:\n%s", on, out)
+			t.Errorf("mode=%v changed a domain with no console:\n%s", mode, out)
 		}
 	}
 }

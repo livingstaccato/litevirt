@@ -83,9 +83,10 @@ type Fake struct {
 	// Console passwords (libvirt.Client.SetConsolePasswordPolicy): the policy
 	// DefineDomain applies, and the passwords each running guest STARTED
 	// with (domain → kind → password), which a redefine does not change.
-	consolePolicy func() bool
-	liveConsolePw map[string]map[string]string
-	vncPorts      map[string]int // domain → VNC port (SetVNCPort); default 5901
+	consolePolicy  func() libvirt.ConsolePolicy
+	vncUnavailable string // SetVNCPasswordUnavailable
+	liveConsolePw  map[string]map[string]string
+	vncPorts       map[string]int // domain → VNC port (SetVNCPort); default 5901
 
 	// starts counts each domain's StartDomain calls, and taps holds the host
 	// device each NIC was given in one of those runs (keyed by domain, run and
@@ -466,7 +467,7 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	// As libvirt.Client.DefineDomain: every define applies the console
 	// password policy (fresh passwords on, none off).
 	if f.consolePolicy != nil {
-		applied, err := libvirt.ApplyConsolePasswords(xmlConfig, f.consolePolicy())
+		applied, err := libvirt.ApplyConsolePasswords(xmlConfig, libvirt.ConsoleModeFor(f.consolePolicy(), true), f.vncUnavailable != "")
 		if err != nil {
 			return fmt.Errorf("define domain: %w", err)
 		}
@@ -586,7 +587,15 @@ func (f *Fake) StartDomain(name string) error {
 		pause = p
 	}
 	if err := f.startDomain(name, pause); err != nil {
-		return err
+		// As libvirt.Client.StartDomain (startWithConsoleBackstop): a start QEMU
+		// refuses for a console password it cannot do is retried once without
+		// the passwords, and the host stops setting VNC passwords.
+		if !libvirt.IsConsolePasswordRefusal(err) || !f.stripConsoleForBackstop(name, err) {
+			return err
+		}
+		if err := f.startDomain(name, pause); err != nil {
+			return err
+		}
 	}
 	if !pause {
 		f.running(name)
@@ -987,10 +996,10 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.activeXML[name]; ok {
-		return x, nil
+		return withoutConsolePasswords(x), nil
 	}
 	if x, ok := f.xml[name]; ok {
-		return x, nil
+		return withoutConsolePasswords(x), nil
 	}
 	return f.synthesizeXMLLocked(name)
 }
@@ -1029,7 +1038,7 @@ func (f *Fake) DumpXMLInactive(name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.xml[name]; ok {
-		return x, nil
+		return withoutConsolePasswords(x), nil
 	}
 	return f.synthesizeXMLLocked(name)
 }
@@ -1115,10 +1124,69 @@ func (f *Fake) SetVNCPort(name string, port int) {
 }
 
 // SetConsolePasswordPolicy mirrors libvirt.Client.SetConsolePasswordPolicy.
-func (f *Fake) SetConsolePasswordPolicy(fn func() bool) {
+func (f *Fake) SetConsolePasswordPolicy(fn func() libvirt.ConsolePolicy) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consolePolicy = fn
+}
+
+// SetVNCPasswordUnavailable mirrors libvirt.Client.SetVNCPasswordUnavailable:
+// a scenario models a host whose QEMU cannot do VNC passwords (FIPS).
+func (f *Fake) SetVNCPasswordUnavailable(reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vncUnavailable = reason
+}
+
+// VNCPasswordUnavailable mirrors libvirt.Client.VNCPasswordUnavailable.
+func (f *Fake) VNCPasswordUnavailable() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vncUnavailable
+}
+
+// DumpXMLSecure is the live definition WITH its console passwords, as
+// libvirt's VIR_DOMAIN_XML_SECURE dump (and the migratable XML a live
+// migration hands the destination) carries them. DumpXML and DumpXMLInactive
+// leave them out, as libvirt's ordinary dumps do.
+func (f *Fake) DumpXMLSecure(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if x, ok := f.activeXML[name]; ok {
+		return x, nil
+	}
+	if x, ok := f.xml[name]; ok {
+		return x, nil
+	}
+	return f.synthesizeXMLLocked(name)
+}
+
+// withoutConsolePasswords is what an ordinary (not secure) libvirt dump shows.
+func withoutConsolePasswords(x string) string {
+	if out, err := libvirt.StripConsolePasswords(x); err == nil {
+		return out
+	}
+	return x
+}
+
+// stripConsoleForBackstop is startWithConsoleBackstop's redefine: the domain
+// loses its console passwords and the host stops setting VNC ones. False when
+// the domain had none, so the start error stands.
+func (f *Fake) stripConsoleForBackstop(name string, cause error) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	x, ok := f.xml[name]
+	if !ok || !libvirt.HasConsolePassword(x) {
+		return false
+	}
+	stripped, err := libvirt.StripConsolePasswords(x)
+	if err != nil {
+		return false
+	}
+	f.xml[name] = stripped
+	f.vncUnavailable = cause.Error()
+	f.record("console-password-backstop", name, "")
+	return true
 }
 
 // ConsolePassword mirrors libvirt.Client.ConsolePassword: the password the
@@ -1660,6 +1728,9 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s addr=%s direct=%t",
 		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination, p.TargetAddress, p.Direct)
 	note += fmt.Sprintf(" shares_weight=%d target_cgroup=%s", p.SharesWeight, p.TargetCgroup)
+	if p.StripVNCPassword {
+		note += " strip_vnc_password=true"
+	}
 	if len(p.CDROMSources) > 0 {
 		// As libvirt would: the destination definition must still carry each
 		// CD-ROM being pointed elsewhere.
@@ -1686,6 +1757,19 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		note += " rbd=" + strings.Join(names, ",")
 	}
 	f.record("migrate", name, note)
+	// The destination and persistent definitions libvirt.Client.MigrateToTarget
+	// would hand libvirt (from the secure migratable XML), so a hook can land
+	// exactly those. Empty: libvirt carries the domain as it is. Only for a
+	// move that strips the VNC password: the other rewrites resolve against
+	// the host (rbd monitors, the cgroup scale).
+	if p.DestXML == "" && p.StripVNCPassword {
+		dest, persist, err := libvirt.MigrationDefinitionsFor(libvirt.MigrateParams{StripVNCPassword: true},
+			f.liveXMLLocked(name), f.xml[name])
+		if err != nil {
+			return err
+		}
+		p.DestXML, p.PersistXML = dest, persist
+	}
 	if cb := f.OnMigrateToTarget; cb != nil {
 		f.mu.Unlock()
 		err := cb(name, dconnuri, p)

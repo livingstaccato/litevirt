@@ -87,17 +87,40 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 	viewer := &vncViewerStream{stream: stream}
 	if password != "" {
-		// This host authenticates to the listener, then offers the viewer
-		// security type None: the viewer, and every daemon relaying to it,
-		// never sees the password, and an older relay needs no change.
-		_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
-		if err := rfb.Authenticate(conn, password); err != nil {
-			slog.Warn("vnc console authentication failed", "vm", vmName, "error", err)
-			return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, err)
-		}
-		_ = conn.SetDeadline(time.Time{})
-		if err := rfb.ServeNoAuth(viewer); err != nil {
-			return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
+		// This host offers the viewer security type None and, once the viewer
+		// has picked it, authenticates to the listener itself: the viewer,
+		// and every daemon relaying to it, never sees the password, and an
+		// older relay needs no change. The viewer side goes first and is
+		// bounded, so a viewer that stalls never holds an authenticated
+		// listener connection; a refused password reaches a 3.8 viewer as a
+		// failed security result.
+		var backendErr error
+		hs := make(chan error, 1)
+		go func() {
+			hs <- rfb.ServeNoAuth(viewer, func() error {
+				_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
+				backendErr = rfb.Authenticate(conn, password)
+				_ = conn.SetDeadline(time.Time{})
+				return backendErr
+			})
+		}()
+		timer := time.NewTimer(vncHandshakeTimeout)
+		defer timer.Stop()
+		select {
+		case err := <-hs:
+			if backendErr != nil {
+				slog.Warn("vnc console authentication failed", "vm", vmName, "error", backendErr)
+				return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, backendErr)
+			}
+			if err != nil {
+				return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
+			}
+		case <-timer.C:
+			_ = conn.Close()
+			return status.Errorf(codes.DeadlineExceeded, "the viewer did not complete the VNC handshake within %s", vncHandshakeTimeout)
+		case <-ctx.Done():
+			_ = conn.Close()
+			return streamEndError(ctx)
 		}
 	}
 
@@ -168,6 +191,17 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 // vncAuthTimeout bounds the handshake with a local VNC listener.
 const vncAuthTimeout = 10 * time.Second
+
+// vncHandshakeTimeout bounds the whole RFB security handshake with the
+// viewer, the listener's included. A variable for the tests.
+var vncHandshakeTimeout = 15 * time.Second
+
+// vmHasVNCPassword reports whether the running domain's VNC console has a
+// password (read from the live secure definition; the value is not kept).
+func (s *Server) vmHasVNCPassword(vmName string) bool {
+	pw, err := s.virt.ConsolePassword(vmName, "vnc")
+	return err == nil && pw != ""
+}
 
 // vncViewerStream is the viewer side of a ProxyVNC stream as a byte stream,
 // for the RFB handshake this host runs with the viewer (rfb.ServeNoAuth) and

@@ -23,6 +23,7 @@ import (
 	"io"
 	"math/bits"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -30,6 +31,20 @@ const (
 	secNone    = 1
 	secVNCAuth = 2
 )
+
+// secTypeNames names the security types a listener offered, for an error.
+func secTypeNames(types []byte) string {
+	names := map[byte]string{secNone: "None", secVNCAuth: "VNC authentication", 16: "Tight", 18: "TLS", 19: "VeNCrypt", 20: "SASL"}
+	out := make([]string, 0, len(types))
+	for _, t := range types {
+		if n, ok := names[t]; ok {
+			out = append(out, fmt.Sprintf("%s (%d)", n, t))
+		} else {
+			out = append(out, strconv.Itoa(int(t)))
+		}
+	}
+	return strings.Join(out, ", ")
+}
 
 // ErrAuthFailed is the listener refusing the password.
 var ErrAuthFailed = errors.New("VNC authentication failed")
@@ -164,7 +179,8 @@ func Authenticate(rw io.ReadWriter, password string) error {
 			}
 		}
 		if sec == 0 {
-			return fmt.Errorf("the listener offers no supported security type (offered %v)", types)
+			return fmt.Errorf("the listener offers no security type the console proxy supports (offered %s); "+
+				"a VNC console with TLS or SASL (vnc_tls / vnc_sasl in qemu.conf) is not supported", secTypeNames(types))
 		}
 		if _, err := rw.Write([]byte{sec}); err != nil {
 			return fmt.Errorf("send security type: %w", err)
@@ -210,10 +226,14 @@ func Authenticate(rw io.ReadWriter, password string) error {
 }
 
 // ServeNoAuth performs the server half of the RFB handshake toward a viewer,
-// offering security type None only. After it returns nil the viewer sends
-// ClientInit, which belongs to the listener the caller has already
-// authenticated to.
-func ServeNoAuth(rw io.ReadWriter) error {
+// offering security type None only. backend, when not nil, runs after the
+// viewer has chosen and before it is told the result: the caller
+// authenticates to the listener there, so a viewer that never gets this far
+// holds no authenticated listener connection, and a listener that refuses
+// reaches a 3.8 viewer as a failed security result (3.3: a refused
+// connection). backend's error is returned as it is. After ServeNoAuth
+// returns nil the viewer sends ClientInit, which belongs to that listener.
+func ServeNoAuth(rw io.ReadWriter, backend func() error) error {
 	if _, err := rw.Write(versionMessage(8)); err != nil {
 		return fmt.Errorf("send protocol version: %w", err)
 	}
@@ -225,7 +245,20 @@ func ServeNoAuth(rw io.ReadWriter) error {
 	if err != nil {
 		return err
 	}
+	runBackend := func() error {
+		if backend == nil {
+			return nil
+		}
+		return backend()
+	}
+	const refused = "the console could not be opened"
 	if minor == 3 {
+		if err := runBackend(); err != nil {
+			_ = writeU32(rw, secInvalid)
+			_ = writeU32(rw, uint32(len(refused)))
+			_, _ = rw.Write([]byte(refused))
+			return err
+		}
 		return writeU32(rw, secNone)
 	}
 	if _, err := rw.Write([]byte{1, secNone}); err != nil {
@@ -243,6 +276,14 @@ func ServeNoAuth(rw io.ReadWriter) error {
 			_, _ = rw.Write([]byte(reason))
 		}
 		return fmt.Errorf("the viewer chose security type %d, which was not offered", pick[0])
+	}
+	if err := runBackend(); err != nil {
+		if minor >= 8 {
+			_ = writeU32(rw, 1)
+			_ = writeU32(rw, uint32(len(refused)))
+			_, _ = rw.Write([]byte(refused))
+		}
+		return err
 	}
 	if minor >= 8 {
 		return writeU32(rw, 0)

@@ -55,7 +55,10 @@ type Client struct {
 
 	// consolePolicy decides whether DefineDomain gives a domain's consoles
 	// passwords (SetConsolePasswordPolicy, console_password.go).
-	consolePolicy atomic.Pointer[func() bool]
+	consolePolicy atomic.Pointer[func() ConsolePolicy]
+	// vncUnavailable is why this host's QEMU cannot do VNC password
+	// authentication ("" = it can): ProbeVNCPassword or a refused start.
+	vncUnavailable atomic.Pointer[string]
 }
 
 // NewClient connects to the local libvirtd daemon.

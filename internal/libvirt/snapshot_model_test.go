@@ -55,6 +55,24 @@ type libvirt10 struct {
 	saveWithoutManaged bool
 	// onRestore sees the XML a DomainRestoreFlags brings the domain up with.
 	onRestore func(xml string)
+	// consolePasswd is the domain's VNC console password ("" = none). As in
+	// libvirt, a dump carries it only with the secure flag.
+	consolePasswd string
+	// defined is the last XML DomainDefineXML was handed.
+	defined string
+}
+
+// withConsole adds the VNC console to a model dump: with its password only
+// when the dump asked for the secure flag, as libvirt does.
+func (m *libvirt10) withConsole(x string, secure bool) string {
+	if m.consolePasswd == "" {
+		return x
+	}
+	g := "<graphics type='vnc' port='-1' autoport='yes'/>"
+	if secure {
+		g = "<graphics type='vnc' port='-1' autoport='yes' passwd='" + m.consolePasswd + "'/>"
+	}
+	return strings.Replace(x, "</devices>", g+"</devices>", 1)
 }
 
 type modelDomain struct {
@@ -280,14 +298,14 @@ func sortedKeys(m map[string]string) []string {
 	return out
 }
 
-func (m *libvirt10) DomainGetXMLDesc(dom golibvirt.Domain, _ golibvirt.DomainXMLFlags) (string, error) {
+func (m *libvirt10) DomainGetXMLDesc(dom golibvirt.Domain, f golibvirt.DomainXMLFlags) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, err := m.lookup(dom.Name)
 	if err != nil {
 		return "", err
 	}
-	return domainXMLWithChains(d.name, d.disks, d.chainsOf(), d.metadata), nil
+	return m.withConsole(domainXMLWithChains(d.name, d.disks, d.chainsOf(), d.metadata), f&golibvirt.DomainXMLSecure != 0), nil
 }
 
 func (m *libvirt10) DomainDestroy(dom golibvirt.Domain) error {
@@ -328,6 +346,7 @@ func (m *libvirt10) DomainUndefineFlags(dom golibvirt.Domain, _ golibvirt.Domain
 func (m *libvirt10) DomainDefineXML(x string) (golibvirt.Domain, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.defined = x
 	name := xmlName(x)
 	disks := parseDomainDiskSources(x)
 	if m.dom != nil && m.dom.name == name {
@@ -459,14 +478,14 @@ func (m *libvirt10) DomainRestoreFlags(from string, dxml golibvirt.OptString, _ 
 	return nil
 }
 
-func (m *libvirt10) DomainSaveImageGetXMLDesc(file string, _ uint32) (string, error) {
+func (m *libvirt10) DomainSaveImageGetXMLDesc(file string, f uint32) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	x, ok := m.saved[file]
 	if !ok {
 		return "", fmt.Errorf("no saved image %s", file)
 	}
-	return x, nil
+	return m.withConsole(x, f&uint32(golibvirt.DomainSaveImageXMLSecure) != 0), nil
 }
 
 func (m *libvirt10) DomainSnapshotLookupByName(dom golibvirt.Domain, name string, _ uint32) (golibvirt.DomainSnapshot, error) {

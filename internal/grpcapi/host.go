@@ -242,6 +242,14 @@ func (s *Server) notEnforcingTokens() []string {
 // it, so the posture reads the same from either end.
 func (s *Server) notEnforcingWith(advertised []string) []string {
 	out := notEnforcingFrom(advertised, s.tokenEnabled)
+	// console_password_v1 with its flag on is still not enforced in full on a
+	// host whose QEMU cannot do VNC passwords (FIPS): it sets none, and the
+	// daemon logs why. The latch is unaffected — this host presents every
+	// password a guest it holds has — so it is reported, not withheld.
+	if s.enfConsolePassword.Load() && s.vncPasswordUnavailable() != "" &&
+		slices.Contains(advertised, capabilities.ConsolePasswordV1) && !slices.Contains(out, capabilities.ConsolePasswordV1) {
+		out = append(out, capabilities.ConsolePasswordV1)
+	}
 	return append(out, s.withheldStandDowns(advertised)...)
 }
 
@@ -747,7 +755,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		Live: true, CDROMSources: cdromSources,
 		BandwidthMiB: tuning.bandwidthMiB, AutoConverge: tuning.autoConverge, MaxDowntimeMS: tuning.maxDowntimeMS,
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
-		RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+		StripVNCPassword: ens.vncPasswordUnavailable,
+		RBDLocators:      s.rbdLocatorsOf(ctx, vm.Name),
 	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true

@@ -149,7 +149,7 @@ func pitSnapshotXML(domXML, diskPath, overlay string) (string, error) {
 // right after the pivot is known to have pivoted. If it fails, nothing is
 // pivoted: the job is aborted and the domain stays on the overlay.
 func (c *Client) CommitDiskOverlay(domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {
-	return commitDiskOverlay(c.virt, domain, diskPath, overlay, diskFormat, beforePivot)
+	return commitDiskOverlay(keepConsolePITAPI{c.virt, c}, domain, diskPath, overlay, diskFormat, beforePivot)
 }
 
 func commitDiskOverlay(v pitAPI, domain, diskPath, overlay, diskFormat string, beforePivot func() error) error {

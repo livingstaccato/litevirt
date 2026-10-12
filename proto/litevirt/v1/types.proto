@@ -601,6 +601,10 @@ message VM {
     // to attach them. Empty when the last such build withheld none. Set by
     // InspectVM/GetVM.
     string                         shared_disk_withheld = 21;
+    // vnc_password_required: the VM's VNC console (vnc_address, on the
+    // host's 127.0.0.1) requires a password (docs/ui.md "Console passwords").
+    // Reach it through the web UI or `lv vnc <vm> --listen`, which present it.
+    bool                           vnc_password_required = 22;
 }
 
 message VMStrandedDisk {

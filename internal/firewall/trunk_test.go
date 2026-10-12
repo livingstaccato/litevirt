@@ -263,3 +263,82 @@ func TestRender_AllowTagsGuardTreatsVID0AsNative(t *testing.T) {
 		}
 	}
 }
+
+// icmpv6LinkDependent reports the rules of a bridge-family ruleset whose ICMPv6
+// match nft would compile with a link-layer dependency (lab 1 F3). In the
+// bridge family nft gives `icmpv6 ...` an implicit `ether type ip6` check when
+// nothing earlier in the rule has named the network protocol, and on a frame
+// carrying a VLAN tag (VID 0 included) that field reads 0x8100: the rule never
+// matches. `meta protocol ip6`, or any `ip6` header match, ahead of it names
+// the protocol from the kernel's view, which a single tag does not hide.
+func icmpv6LinkDependent(ruleset string) []string {
+	var bad []string
+	for _, line := range strings.Split(ruleset, "\n") {
+		i := strings.Index(line, "icmpv6 ")
+		if i < 0 {
+			continue
+		}
+		before := " " + strings.TrimSpace(line[:i]) + " "
+		if !strings.Contains(before, " meta protocol ip6 ") && !strings.Contains(before, " ip6 ") {
+			bad = append(bad, strings.TrimSpace(line))
+		}
+	}
+	return bad
+}
+
+// TestRender_GuardICMPv6MatchesInsideTags (lab 1 F3): every ICMPv6 match in the
+// per-NIC table names the network protocol before it, so the RA and redirect
+// drop, the ND length caps, the ND link-layer option checks and the NA target
+// checks hold a single-tagged or priority-tagged (VID 0) frame as they hold an
+// untagged one. A guard allowed tags (--allow-vlan-tags) and a trunk guard
+// hold their tagged frames to the RA and ND rules before the boundary, and an
+// allow-tags guard's VID-0 frames reach the NA target checks after it.
+func TestRender_GuardICMPv6MatchesInsideTags(t *testing.T) {
+	guard := func() *NICGuard {
+		return &NICGuard{MAC: "52:54:00:aa:bb:cc", V4: []string{"10.0.0.5"}, V6: []string{"2001:db8::5"}, LinkLocal: []string{"fe80::99"}}
+	}
+	plain := guardedPlan(guard())
+	allow := guardedPlan(guard())
+	allow.NICs[0].AllowVLANTags = true
+	trunk := guardedPlan(guard())
+	trunk.NICs[0].TrunkVIDs = []int{100}
+	for _, c := range []struct {
+		name, boundary string
+		p              Plan
+	}{{"plain", "", plain}, {"allow-vlan-tags", "vlan id != 0 return", allow}, {"trunk", "ether type 8021q return", trunk}} {
+		for _, mode := range []string{NICModeEnforce, NICModeObserve, NICModeGuardsOnly} {
+			c.p.NICMode = mode
+			nic := nicPart(t, c.p)
+			if bad := icmpv6LinkDependent(nic); len(bad) > 0 {
+				t.Errorf("%s, %s: ICMPv6 rules that miss every tagged frame:\n  %s", c.name, mode, strings.Join(bad, "\n  "))
+			}
+			if c.boundary == "" {
+				continue
+			}
+			g := chainBody(t, nic, "guard_vnet3")
+			ret := strings.Index(g, c.boundary)
+			for _, before := range []string{
+				"meta protocol ip6 icmpv6 type { nd-router-advert, nd-redirect } drop",
+				"meta protocol ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } @nh,32,16 > 32 drop",
+				"meta protocol ip6 icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != 0x525400aabbcc drop",
+				"meta protocol ip6 icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != 0x525400aabbcc drop",
+				"meta protocol ip6 icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != 0x525400aabbcc drop",
+			} {
+				if i := strings.Index(g, before); i < 0 || ret < 0 || i > ret {
+					t.Errorf("%s, %s: %q must hold tagged frames (before %q):\n%s", c.name, mode, before, c.boundary, g)
+				}
+			}
+			if c.name != "allow-vlan-tags" {
+				continue
+			}
+			for _, after := range []string{
+				"meta protocol ip6 icmpv6 type nd-neighbor-advert icmpv6 taddr fe80::/10 icmpv6 taddr != { fe80::5054:ff:feaa:bbcc, fe80::99 } drop",
+				"meta protocol ip6 icmpv6 type nd-neighbor-advert icmpv6 taddr != {",
+			} {
+				if i := strings.Index(g, after); i < ret {
+					t.Errorf("%s, %s: %q must judge VID 0 after the boundary (at %d, boundary %d):\n%s", c.name, mode, after, i, ret, g)
+				}
+			}
+		}
+	}
+}

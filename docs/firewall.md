@@ -664,7 +664,9 @@ incarnation it replaces.
 held to the header and one 8-byte option (the link-layer address, or a
 duplicate-address-detection nonce), router solicitations to one option: only
 the first option is checked against the guest's MAC, so a second one could
-otherwise smuggle another.
+otherwise smuggle another. These checks, and the router-advertisement drop,
+hold a frame inside a VLAN tag or a priority tag (VID 0) exactly as they hold
+an untagged one, wherever the frame reaches them (see "VLAN tags").
 
 ## Compose
 

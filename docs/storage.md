@@ -1662,6 +1662,63 @@ or keeping the name when it does not resolve): the device path is spelled from
 the option, and udev names the device `ip-<address>:<port>-iscsi-…`. Pools
 created before keep the spelling their disks were recorded with.
 
+**Sessions after a reboot.** A LUN's device exists only while the host has a
+session to the pool's target, and a reboot drops every session; node records
+are usually `node.startup = manual`, so open-iscsi does not log back in. The
+daemon does, for every iscsi pool of its host: at start and every 30 s it
+lists the sessions (`iscsiadm -m session`) and, for a pool whose target has
+had no session through its portal **since the daemon started**, logs in with
+`iscsiadm -m node -T <target> -p <portal> --login`. Pools from the daemon
+config use the portal of their config entry. A pool counts as having its
+session when `iscsiadm -m session` lists one, including a session iscsid is
+still recovering after the portal dropped; a pool whose portal is a host name
+counts any session to its target.
+
+**A logout while the daemon runs is left alone.** A session the daemon has
+seen up and that then disappears was logged out on purpose (SAN maintenance, a
+LUN re-mapped on the array, a path taken down before an ACL change), so the
+periodic check does not log it back in. The pool is reported `degraded` with
+the reason "logged out while the daemon ran; `lv start` of a VM using it or a
+daemon restart logs it back in". To bring it back: start a VM that uses the
+LUN, restart the daemon, or log in by hand (`iscsiadm -m node -T <target> -p
+<portal> --login`). The cost: a session lost mid-run to a fault rather than a
+logout also stays down until one of those (iscsid normally keeps a session
+whose connection dropped, recovering it in place, so this is rare).
+
+A start of a VM whose iSCSI device is missing logs its session in first, the
+deliberately logged-out one included, and, when it made a login, waits up to
+10 s for udev to create the device. It does not retry a login the periodic
+check saw fail within the last 30 s. It refuses nothing: a disk whose device
+is still missing fails the start, as before.
+
+**What the re-login does to node records.** The check and the start's login go
+through the node record as it is: the record holds the session's settings,
+CHAP credentials included, so no secret is put on a command line or in a log.
+The re-login never rewrites, deletes or logs out of a record, and leaves
+`node.startup` as it is. A target with no record at all gets one for that
+target alone, `iscsiadm -m node -o new -T <target> -p <portal>`, from
+iscsid.conf's defaults.
+
+Other pool operations do touch records:
+
+- **Pool create, and every VM disk create, move or replicate on the pool**
+  (the driver's Prepare) runs a plain sendtargets discovery, `iscsiadm -m
+  discovery -t st -p <portal>`, before its login. That refreshes the portal's
+  existing records from iscsid.conf and removes those the portal no longer
+  returns, so per-record CHAP set by hand (`iscsiadm -m node -o update -n
+  node.session.auth.…`) does not survive it. Keep CHAP in iscsid.conf when
+  you use iscsi pools.
+- **Pool delete** logs the host out of the pool's target and portal, unless
+  another pool of the host uses the same pair.
+
+While a pool's session is missing, its row's state is `degraded` (`lv pool
+ls`, `lv pool inspect`), not `active`, and its host raises
+`iscsi_session_missing` with the reason
+([diagnostics.md](diagnostics.md#an-iscsi-pool-has-no-session-iscsi_session_missing)).
+Both clear on the first check that finds the session. A degraded pool refuses
+nothing; the state is a diagnostic. An older build shows the state as it is
+recorded.
+
 **Not implemented: LVM on an iSCSI LUN.** Proxmox's usual shared-SAN layout is
 one big LUN with a shared LVM volume group on it, carved into one logical
 volume per disk. litevirt has no such driver — `lvm-thin` is a host-local

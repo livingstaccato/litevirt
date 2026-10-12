@@ -1788,6 +1788,37 @@ it changes. `lv host lun-holds <host>` lists them. Discard one only after the
 check in [storage.md](storage.md#iscsi-one-lun-one-disk): a hold is what keeps
 a second VM off a LUN whose re-created VM's rows are still on their way.
 
+### An iSCSI pool has no session (`iscsi_session_missing`)
+
+Each host checks, at start and every 30 s, that it has a session to the target
+of each of its iscsi pools through the pool's portal. A session missing since
+the daemon started (after a reboot, with node records at `node.startup =
+manual`) is logged in. A session the daemon saw up and that then disappeared
+was logged out on purpose and is not logged back in
+([storage.md](storage.md#iscsi-one-lun-one-disk)). While a session is
+missing, the host records the pool's state as `degraded` and raises
+`iscsi_session_missing` (evaluator `iscsi_pool`, subject `host/<pool>@<host>`,
+warning; observed on the first such check, confirmed on the next). Nothing is
+refused on it: a VM whose disk is on the LUN cannot open the device, and its
+start fails as it did before. The evidence carries the reason:
+
+- **logged out while the daemon ran; `lv start` of a VM using it or a daemon
+  restart logs it back in**: someone logged the host out. Start a VM on the
+  pool, restart the daemon, or log in by hand (`iscsiadm -m node -T <target>
+  -p <portal> --login`) when the target should be back.
+- **the login failed** (the portal does not answer, an authorization failure,
+  no node record and one could not be created): fix what iscsiadm's output
+  names, which is the portal's reachability from the host, the CHAP settings
+  (in iscsid.conf, or in the node record: `iscsiadm -m node -T <target> -p
+  <portal>`; a pool or disk create's discovery resets a record's settings to
+  iscsid.conf's), or the target's ACL for this initiator. The login is
+  retried every 30 s.
+- **a login is in progress in iscsid**: an earlier login is still being
+  retried by iscsid; the next check sees how it ended.
+
+The pool returns to `active` and the condition resolves on the first check
+that finds the session. Deleting the pool resolves it too.
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

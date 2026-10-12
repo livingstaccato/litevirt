@@ -673,6 +673,12 @@ type Server struct {
 	cephSecrets cephSecretMarks
 	// cephProofs remembers, briefly, the ceph keys a start proved (ceph_probe.go).
 	cephProofs cephKeyProofs
+	// iscsiMu serialises the iSCSI session reconcile (iscsi_sessions.go) with
+	// an iscsi pool's create and delete, so a pass neither logs a deleted
+	// pool's target back in nor writes its row back.
+	iscsiMu sync.Mutex
+	// iscsiMem is what this daemon has seen of its iSCSI sessions.
+	iscsiMem iscsiSessionMemory
 	// cephTrash is what the last scans of the ceph pools' trash found that no
 	// purge here tracks (ScanCephTrash).
 	cephTrash cephTrashScans

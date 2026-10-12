@@ -226,6 +226,13 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "build driver: %v", err)
 	}
+	// An iscsi pool's login and row write are one step for the session
+	// reconcile (iscsi_sessions.go), which must not record a state from
+	// before the login over the row written after it.
+	if strings.EqualFold(req.Driver, "iscsi") {
+		s.iscsiMu.Lock()
+		defer s.iscsiMu.Unlock()
+	}
 	if err := driver.Prepare(ctx); err != nil {
 		// Surface the underlying error verbatim — most "could not
 		// mount NFS / could not connect to monitor" diagnostics come
@@ -369,6 +376,13 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		}
 	}
 
+	// An iscsi pool's logout and row delete are one step for the session
+	// reconcile (iscsi_sessions.go): it must not log the target back in, or
+	// write the row back, in between.
+	if strings.EqualFold(rec.Driver, "iscsi") {
+		s.iscsiMu.Lock()
+		defer s.iscsiMu.Unlock()
+	}
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
 	// — an operator who hit delete wants the pool gone from inventory even if
 	// cleanup is incomplete — but its refcount PREDICATES are hard guards (never

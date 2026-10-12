@@ -2016,6 +2016,14 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// target, and a host reboot drops the sessions: one whose device is
 	// missing is logged back in first. Best effort, never a refusal.
 	s.ensureISCSISessionsForVM(ctx, vm)
+	// An NFS disk is a file on its pool's export only while the export is
+	// mounted here, and a host reboot unmounts it: one missing since the
+	// daemon started is mounted first; one still missing (unmounted on
+	// purpose, a mount that failed, a mount point holding local files)
+	// refuses the start with the reason, where it failed at qemu's open.
+	if err := s.ensureNFSMountsForVM(ctx, vm); err != nil {
+		return releasePreflight, err
+	}
 	// A ceph disk is opened through its pool's libvirt secret, which a
 	// libvirtd restart drops (it is ephemeral): put back before every start,
 	// on every start path, so none waits for the daemon's reconcile.

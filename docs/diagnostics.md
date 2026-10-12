@@ -1820,6 +1820,37 @@ start fails as it did before. The evidence carries the reason:
 The pool returns to `active` and the condition resolves on the first check
 that finds the session. Deleting the pool resolves it too.
 
+### An NFS pool is not mounted (`nfs_mount_missing`)
+
+Each host checks, at start and every 30 s, that the export of each of its
+`nfs` pools is mounted at the pool's mount point. An export not mounted since
+the daemon started (after a reboot) is mounted. One the daemon saw mounted and
+that then disappeared was unmounted on purpose, and is not mounted back
+([storage.md](storage.md#nfs-pools-after-a-reboot)). While an export is not
+mounted, the host records the pool's state as `degraded` and raises
+`nfs_mount_missing` (evaluator `nfs_pool`, subject `host/<pool>@<host>`,
+warning; observed on the first such check, confirmed on the next). A start of
+a VM with a disk on the pool is refused with the same reason. The evidence
+carries the reason:
+
+- **unmounted while the daemon ran, and litevirt leaves it so**: someone
+  unmounted it. When it should be back, restart the litevirt daemon on the
+  host, or mount it by hand (the pool's next use hardens a hand mount's
+  options in place, see [storage.md](storage.md#host-paths)).
+- **the mount failed** (the server does not answer, the export is not
+  exported to this host, `mount.nfs` refused an option): fix what mount's
+  output names. The mount is retried every 30 s.
+- **the mount point holds local files** (it names up to five of them): they
+  were written while the export was not mounted, so they are not on it, and
+  litevirt does not mount over them. Move them out of the directory; the next
+  check mounts the export.
+- **the mount point is a symlink**: replace it with an empty directory.
+- **the mount point holds another mount** (another export or filesystem):
+  unmount it; the next check mounts the pool's export there.
+
+The pool returns to `active` and the condition resolves on the first check
+that finds the export mounted. Deleting the pool resolves it too.
+
 ### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
 
 Each host reports the workloads **litevirt created** that are still present on

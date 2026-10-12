@@ -42,6 +42,11 @@ import (
 // start was decided from.
 func (r *Reconciler) startRowGone(ctx context.Context, name, createdAt string) (why string, unreadable bool) {
 	row, err := corrosion.GetVM(ctx, r.db, name)
+	if r.startRowReadFault != nil {
+		if ferr := r.startRowReadFault(name); ferr != nil {
+			row, err = nil, ferr
+		}
+	}
 	switch {
 	case err != nil:
 		return "its record could not be re-read: " + err.Error(), true

@@ -100,6 +100,11 @@ type Reconciler struct {
 	// timing race, and lets a test see WHICH context the walk handed down.
 	// Nil in production.
 	startDomainHook func(context.Context)
+	// startRowReadFault, when it returns an error, stands in for a failed
+	// read of the row startRowGone re-reads before the boot. Test-only seam
+	// for the transient read failure a stalled store produces. Nil in
+	// production.
+	startRowReadFault func(name string) error
 	// proofClaimedHook runs right after a pending start has claimed its proof.
 	// Test-only seam: it is the window in which a release of that proof can be
 	// recorded, which the start checkpoint has to catch. Nil in production.
@@ -1801,17 +1806,21 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// moment the domain boots: a delete can tombstone it in the window above
 	// by replication, without this host's start lease (start_row_gone.go).
 	// What this pass defined is its own, so it is taken back, firmware state
-	// kept; a row merely unreadable is retried next pass, accounted like
-	// every other retryable failure here. The read is local and is not cut
-	// short by the walk budget: a pass whose budget ran out here still starts
-	// the VM, as it did before this check.
+	// kept. A row merely unreadable is transient and is retried next pass,
+	// never parked in error: a proof-gated start is re-armed to pending
+	// (failPendingStart, retryable), and a proof-less one — self-heal,
+	// onboot, whose failPendingStart would write "error", a state no pass
+	// re-drives — writes nothing, since its row already reads "starting" and
+	// the walk's starting case re-drives it. The read is local and is not
+	// cut short by the walk budget: a pass whose budget ran out here still
+	// starts the VM, as it did before this check.
 	if why, unreadable := r.startRowGone(context.WithoutCancel(ctx), vm.Name, fresh.CreatedAt); why != "" {
 		releaseHW()
 		slog.Warn("reconciler: not starting the VM — "+why, "vm", vm.Name)
 		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
 			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
 		}
-		if unreadable {
+		if unreadable && proofID != "" {
 			r.failPendingStart(ctx, vm.Name, proofID, true, "not started: "+why)
 		}
 		return

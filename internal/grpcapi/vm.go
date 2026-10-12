@@ -3107,8 +3107,20 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 				att.Name = nic.NetworkName
 				att.Model = nic.Model
 				att.Mac = nic.MAC
-				if sgs := corrosion.DecodeSecurityGroups(nic.SecurityGroups); len(sgs) > 0 {
-					att.SecurityGroups = sgs
+				// The NIC row is the live binding the firewall renders from;
+				// an empty one means "no groups", never "the spec's groups".
+				att.SecurityGroups = corrosion.DecodeSecurityGroups(nic.SecurityGroups)
+				// Likewise the guard: SetNICGuard writes only the nic_guards
+				// row, which the firewall enforces from, so a row beats the
+				// create-time values in the spec. No row: the spec's stand.
+				if g, gerr := corrosion.GetNICGuard(ctx, s.db, name, nic.MAC); gerr != nil {
+					slog.Warn("failed to load NIC guard for spec projection", "vm", name, "mac", nic.MAC, "error", gerr)
+				} else if g != nil {
+					att.SpoofGuard = g.Mode
+					att.AllowedAddresses = g.Allowed
+					att.AllowDhcpServer = g.AllowDHCPServer
+					att.AllowRouterAdvertisement = g.AllowRouterAdvert
+					att.AllowVlanTags = g.AllowVLANTags
 				}
 				specNetwork = append(specNetwork, att)
 			}
@@ -3152,17 +3164,18 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 }
 
 // matchStoredNIC finds the stored-spec attachment for one NIC row: by MAC, else
-// the first unclaimed attachment on the same network that records no MAC (a
-// spec written before the MAC was assigned). -1 when the NIC was attached
-// after create and the spec never described it.
+// (a legacy spec written before MACs were recorded) the unclaimed MAC-less
+// attachment at the NIC's own ordinal on the same network, the position the
+// enforcement side indexes the spec by. -1 when the NIC was attached after
+// create and the spec never described it.
 func matchStoredNIC(stored []*pb.NetworkAttachment, used []bool, nic corrosion.NICRecord) int {
 	for i, a := range stored {
 		if !used[i] && a != nil && a.Mac != "" && strings.EqualFold(a.Mac, nic.MAC) {
 			return i
 		}
 	}
-	for i, a := range stored {
-		if !used[i] && a != nil && a.Mac == "" && a.Name == nic.NetworkName {
+	if i := nic.Ordinal; i >= 0 && i < len(stored) && !used[i] {
+		if a := stored[i]; a != nil && a.Mac == "" && a.Name == nic.NetworkName {
 			return i
 		}
 	}

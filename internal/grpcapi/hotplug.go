@@ -30,6 +30,11 @@ import (
 // return before it could re-attempt the release. Mirrors what recoverPCIDetach does with
 // hostdevAliasInXML on the journaled path — but keys on the source BDF, since legacy
 // hostdevs carry no user alias.
+//
+// Known gap: unlike detachNICIfPresent and recoverPCIDetach, this checks the LIVE
+// copy only, so a hostdev left in the persistent definition alone is skipped and
+// comes back on the next cold boot. Nothing wedges (these paths have no absence
+// verifier), which is why it was left as it is.
 func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
 	present, err := s.liveHostdevPresent(vmName, addr)
 	if err != nil {

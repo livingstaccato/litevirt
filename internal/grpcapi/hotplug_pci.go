@@ -888,6 +888,15 @@ func (s *Server) executePCIDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			}
 			detachedAny = true
 		}
+		// Release only once the guest has let go (waitPCILiveGone). The detach has
+		// already changed the domain (the persistent copy is gone), so a guest that
+		// never answers rolls FORWARD: barrier retained, nothing released, and
+		// recovery re-requests and waits again.
+		if err := s.waitPCILiveGone(ctx, vm.Name, memberAliases, memberAddrs); err != nil {
+			slog.Error("pci detach: hostdev still in the live domain — nothing released, left recoverable", "vm", vm.Name, "op", opID, "error", err)
+			return nil, status.Errorf(codes.Internal,
+				"pci detach for %q requested but the guest has not released the device; nothing released, left recoverable: %v", vm.Name, err)
+		}
 		// FIX-16 (Fix C): release with the STRICT primitive (unbind by vfio ground truth +
 		// owner-release, all-or-nothing recoverable) — the same protocol the stopped path
 		// uses. A RUNNING DetachHostdev removes the device from the guest but NOT the host
@@ -1000,6 +1009,53 @@ func (s *Server) failPCIDetachClean(ctx context.Context, vm *corrosion.VMRecord,
 	return nil, status.Error(code, cause.Error())
 }
 
+// waitPCILiveGone waits until no member's aliased hostdev remains in vmName's LIVE
+// domain, re-requesting the unplug while it waits (hotplug_unplug_wait.go). A
+// multi-function device unplugs as a unit, so the wait is for ALL member aliases;
+// whichever is still there when the timeout expires is the one reported.
+//
+// A running detach must pass this BEFORE it releases the host device. A nil
+// DetachHostdev only REQUESTS the unplug (libvirt returns after its own short wait
+// even when the guest has not let go), and a vfio unbind while QEMU still holds
+// the device blocks in the kernel until it is released; tombstoning the
+// realizations then would leave a later recovery pass with no members to verify,
+// completing the op over a hostdev still in the guest.
+func (s *Server) waitPCILiveGone(ctx context.Context, vmName string, memberAliases, memberAddrs []string) error {
+	var lingering string
+	st, err := waitDeviceGone(ctx, func() (bool, error) {
+		live, rerr := s.virt.DumpXML(vmName)
+		if rerr != nil {
+			return false, fmt.Errorf("read live domain: %w", rerr)
+		}
+		lingering = ""
+		for _, alias := range memberAliases {
+			if hostdevAliasInXML(live, alias) {
+				lingering = alias
+				return false, nil
+			}
+		}
+		return true, nil
+	}, func() error {
+		// Re-request every member: a multi-function device unplugs as a unit,
+		// and the first eject may have been dropped for any of them.
+		var firstErr error
+		for _, addr := range memberAddrs {
+			if rerr := s.virt.DetachHostdev(vmName, addr); rerr != nil && firstErr == nil {
+				firstErr = rerr
+			}
+		}
+		return firstErr
+	})
+	logUnplugWait("pci", vmName, strings.Join(memberAliases, ","), st, err)
+	switch {
+	case errors.Is(err, errUnplugTimeout):
+		return fmt.Errorf("hostdev %s still present in the live domain after detach", lingering)
+	case err != nil:
+		return err
+	}
+	return nil
+}
+
 // verifyPCIDetached asserts every member's aliased hostdev is GONE from the
 // authoritative definition(s), mirroring verifyDiskDetached. On the RUNNING path
 // each alias must be absent from BOTH the live domain AND the persistent (inactive)
@@ -1010,40 +1066,7 @@ func (s *Server) verifyPCIDetached(ctx context.Context, vmName string, memberAli
 		return fmt.Errorf("read inactive definition: %w", ierr)
 	}
 	if running {
-		// Waits for the guest to acknowledge, like the disk and NIC verifiers. A
-		// multi-function device unplugs as a unit, so the wait is for ALL member
-		// aliases to leave; whichever is still there when the timeout expires is the
-		// one reported.
-		var lingering string
-		st, err := waitDeviceGone(ctx, func() (bool, error) {
-			live, rerr := s.virt.DumpXML(vmName)
-			if rerr != nil {
-				return false, fmt.Errorf("read live domain: %w", rerr)
-			}
-			lingering = ""
-			for _, alias := range memberAliases {
-				if hostdevAliasInXML(live, alias) {
-					lingering = alias
-					return false, nil
-				}
-			}
-			return true, nil
-		}, func() error {
-			// Re-request every member: a multi-function device unplugs as a unit,
-			// and the first eject may have been dropped for any of them.
-			var firstErr error
-			for _, addr := range memberAddrs {
-				if rerr := s.virt.DetachHostdev(vmName, addr); rerr != nil && firstErr == nil {
-					firstErr = rerr
-				}
-			}
-			return firstErr
-		})
-		logUnplugWait("pci", vmName, strings.Join(memberAliases, ","), st, err)
-		switch {
-		case errors.Is(err, errUnplugTimeout):
-			return fmt.Errorf("hostdev %s still present in the live domain after detach", lingering)
-		case err != nil:
+		if err := s.waitPCILiveGone(ctx, vmName, memberAliases, memberAddrs); err != nil {
 			return err
 		}
 	}

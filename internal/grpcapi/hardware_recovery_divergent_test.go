@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -215,13 +216,38 @@ func TestRecoverDiskDetach_LiveCopyAlreadyGone(t *testing.T) {
 	assertDiskGone(t, fake, td)
 }
 
+// An unreadable live view is not an absent one (review M1): recovery must leave
+// the op recoverable before it touches the disk row, not fall through to the
+// persistent read and soft-delete the row first.
+func TestRecoverDiskDetach_LiveReadFails_LeavesRecoverable(t *testing.T) {
+	s, fake, ctx, td := seedAttachedDisk(t)
+	opID, _ := wedgeDiskDetach(t, ctx, s, td)
+	fake.SetFailDomainDiskSources(func(string) error { return errors.New("libvirt connection lost") })
+
+	s.RecoverHardwareOperations(ctx)
+
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID != opID {
+		t.Fatalf("operation barrier = %q, want %q still held", vm.ActiveOperationID, opID)
+	}
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if !hasDiskName(disks, "data1") {
+		t.Fatal("the disk row was soft-deleted although the live membership could not be read")
+	}
+}
+
 // ── PCI ──────────────────────────────────────────────────────────────────────
 
 func seedAttachedPCI(t *testing.T) (*Server, *libvirtfake.Fake, context.Context, string, string) {
+	s, fake, ctx, addr, deviceID, _ := seedAttachedPCIWithFS(t)
+	return s, fake, ctx, addr, deviceID
+}
+
+func seedAttachedPCIWithFS(t *testing.T) (*Server, *libvirtfake.Fake, context.Context, string, string, *pciUnbindRecordingFS) {
 	t.Helper()
 	s := hotplugDiskServer(t)
 	enableHardwareV2(t, s)
-	restore := vfio.SetFS(newPCIUnbindRecordingFS())
+	vfs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(vfs)
 	t.Cleanup(restore)
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
@@ -236,7 +262,81 @@ func seedAttachedPCI(t *testing.T) (*Server, *libvirtfake.Fake, context.Context,
 	}
 	fastUnplugWait(t, 2*time.Second)
 	deviceID := liveIntents(t, ctx, s, "vm1")[0].DeviceID
-	return s, fake, ctx, addr, deviceID
+	return s, fake, ctx, addr, deviceID, vfs
+}
+
+// assertPCIStillHeld: nothing was released while the hostdev may still be in the
+// guest — no vfio unbind, the realization rows and the ownership still stand, and
+// the operation is still in flight for a later pass.
+func assertPCIStillHeld(t *testing.T, ctx context.Context, s *Server, vfs *pciUnbindRecordingFS, addr, opID string) {
+	t.Helper()
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID != opID {
+		t.Fatalf("operation barrier = %q, want %q still held (left recoverable)", vm.ActiveOperationID, opID)
+	}
+	if n := vfs.unbindCount(addr); n != 0 {
+		t.Fatalf("vfio unbind of %s ran %d time(s) while the hostdev was still in the live domain", addr, n)
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) == 0 {
+		t.Fatal("realizations tombstoned while the hostdev was still in the live domain")
+	}
+	owned := false
+	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	for _, d := range devs {
+		if d.Address == addr && d.VMName == "vm1" {
+			owned = true
+		}
+	}
+	if !owned {
+		t.Fatalf("%s released while the hostdev was still in the live domain", addr)
+	}
+}
+
+// Review I1: once DetachLiveAndConfig re-requests the live unplug, libvirt answers
+// nil after its own short wait even when the guest has not let go. Releasing then
+// — vfio unbind while QEMU still holds the device, tombstoning the realizations —
+// blocks in the kernel and, on the next pass, leaves recovery with no members to
+// verify. A guest that keeps dropping the eject must leave everything held and
+// the op recoverable; once it answers, the next pass converges.
+func TestRecoverPCIDetach_GuestKeepsDroppingEject_ReleasesNothing(t *testing.T) {
+	s, fake, ctx, addr, deviceID, vfs := seedAttachedPCIWithFS(t)
+	fake.DeferLiveUnplug = true // HonorUnplugOnRequest 0: the guest answers no request on its own
+	if err := s.virt.DetachHostdev("vm1", addr); err != nil {
+		t.Fatalf("first detach: %v", err)
+	}
+	opID, epoch := wedgePCIDetach(t, ctx, s, addr, deviceID)
+
+	s.RecoverHardwareOperations(ctx)
+
+	assertPCIStillHeld(t, ctx, s, vfs, addr, opID)
+	if got := fake.UnplugRequests("vm1"); got < 2 {
+		t.Fatalf("recovery never re-requested the live unplug (requests=%d)", got)
+	}
+
+	fake.AckLiveUnplug("vm1")
+	s.RecoverHardwareOperations(ctx)
+
+	assertDetachRecovered(t, ctx, s, opID, epoch)
+	assertHostdevGone(t, fake, pciMemberAlias(deviceID, "m0"))
+	if n := vfs.unbindCount(addr); n == 0 {
+		t.Fatal("the converged detach never released the device")
+	}
+}
+
+// The same ordering on the live path: executePCIDetach must not release the device
+// while the guest still holds the hostdev.
+func TestDetachPCI_GuestKeepsDroppingEject_ReleasesNothing(t *testing.T) {
+	s, fake, ctx, addr, _, vfs := seedAttachedPCIWithFS(t)
+	fake.DeferLiveUnplug = true
+
+	_, err := s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", PciAddress: addr})
+	if err == nil {
+		t.Fatal("a detach the guest never answered must not report success")
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID == "" {
+		t.Fatalf("detach failed (%v) but cleared the barrier: it must be left recoverable", err)
+	}
+	assertPCIStillHeld(t, ctx, s, vfs, addr, vm.ActiveOperationID)
 }
 
 func wedgePCIDetach(t *testing.T, ctx context.Context, s *Server, addr, deviceID string) (string, int64) {

@@ -44,10 +44,12 @@ age. Narrow it with --older-than.
 name more.
 
 --restore <copy> puts the copy back as its VM's disk. The VM must be stopped on
-this host: to run a VM on the real disk a failover left on a host, undrain the
-host (it comes back fenced: ` + "`lv host undrain <host>`" + `), stop the VM, move it
-there with ` + "`lv migrate <vm> <host> --cold`" + `, restore the copy and start it. The disk the copy replaces is not deleted: it is set aside and
-retained in turn.`,
+this host: to run a VM on the real disk a failover left on a host, wait for the
+host to be active (a host that boots again records itself active; one that
+answered again without restarting stays fenced or offline until
+` + "`lv host undrain <host>`" + `), stop the VM, move it there with
+` + "`lv migrate <vm> <host> --cold`" + `, restore the copy and start it. The disk
+the copy replaces is not deleted: it is set aside and retained in turn.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if olderThan < 0 {

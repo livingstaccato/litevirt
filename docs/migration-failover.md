@@ -896,10 +896,21 @@ verified power-off or an operator's confirmation makes it
 power-off; nothing looked afterwards. Such a fence keeps every bit of the
 authority it had: the coordinator that ran it reschedules on it (subject to the
 safe-fence policy and `litevirt.fence_requires_confirmation`), a successor
-resumes from it (below), and the host is not put back in service behind the
-workloads that moved off it — it is `offline`, and a host whose newest fence
-succeeded is treated exactly like a `fenced` one: only `lv host undrain` brings
-it back, unless the coordinator that fenced it moved nothing off it.
+resumes from it (below), and the coordinator does not put the host back in
+service behind the workloads that moved off it — it is `offline`, and a host
+whose newest fence succeeded is treated exactly like a `fenced` one: once a
+quorum sees it healthy again, it stays out of service until
+`lv host undrain <host>`, unless the coordinator that fenced it moved nothing
+off it.
+
+That covers a host that answers again **without having restarted**: the host
+an unverified fence may never have powered off, or one cut off by a partition.
+A host whose daemon starts again — the machine booting after a power-off, or
+its daemon restarted — records itself `active` from its own boot write,
+whatever the cluster recorded for it, and needs no `lv host undrain`
+([upgrades](upgrades.md) says the same). It does not run the workloads that
+moved off it: they are recorded on their new hosts, and the copies of their
+disks it still holds are set aside as superseded (`lv host superseded-disks`).
 
 Before `fence_state_v1` latches — while any host the cluster replicates to,
 a `maintenance` host included, runs an older build — an unverified fence still
@@ -1339,10 +1350,13 @@ These need the admin role and are audited:
   file it replaces is not deleted: it is set aside and retained in turn.
 
 To run a VM on the real disk a failover left on a host, once that host is
-back:
+back and `active` — a host that booted again records itself `active`; one that
+answered again without restarting stays `fenced` or `offline` until
+`lv host undrain <host>`, and a migration onto it needs it active:
 
 ```bash
-lv host undrain <host>               # it comes back fenced; a migration onto it needs it active
+lv host ls                           # the host must read HOST_ACTIVE
+lv host undrain <host>               # only if it does not: it answered again without restarting
 lv stop <vm>
 lv migrate <vm> <host> --cold        # the stopped VM moves there with its current disk
 lv host superseded-disks <host>      # find the copy
@@ -1407,8 +1421,11 @@ names the VM and why. The coordinator decides a fenced host's recovery once,
 so freeing capacity afterwards does not re-run it. Such a VM stays down until
 one of these happens:
 
-- the host comes back. It returns `fenced` if failover moved anything off it,
-  and `lv host undrain <host>` makes it active again;
+- the host comes back. A host whose daemon starts again — it boots after the
+  fence powered it off, or its daemon is restarted — records itself `active`,
+  with no `lv host undrain`. One that answers again without having restarted
+  stays `fenced` or `offline` if failover moved anything off it, and
+  `lv host undrain <host>` makes it active again;
 - an operator promotes a replica of it, `lv replication promote <vm>`;
 - the host is gone for good, is fenced proof-grade, and is removed with
   `lv host rm --dead <host>` (try `--dry-run` first). With recovery claims on

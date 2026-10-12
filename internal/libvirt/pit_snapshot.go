@@ -230,7 +230,9 @@ func activeCommitAndPivot(v pitAPI, dom golibvirt.Domain, dev, diskPath string, 
 // repairPersistentDisk points a persistent disk entry that names overlay
 // back at diskPath.
 func repairPersistentDisk(v pitAPI, dom golibvirt.Domain, diskPath, overlay, diskFormat string) error {
-	inactive, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	// Secure: the repaired definition is redefined, and a dump without
+	// VIR_DOMAIN_XML_SECURE has no console password to keep.
+	inactive, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive|golibvirt.DomainXMLSecure)
 	if err != nil {
 		return fmt.Errorf("dump persistent domain xml: %w", err)
 	}

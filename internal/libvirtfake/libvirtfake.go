@@ -80,6 +80,13 @@ type Fake struct {
 	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
+	// Console passwords (libvirt.Client.SetConsolePasswordPolicy): the policy
+	// DefineDomain applies, and the passwords each running guest STARTED
+	// with (domain → kind → password), which a redefine does not change.
+	consolePolicy func() bool
+	liveConsolePw map[string]map[string]string
+	vncPorts      map[string]int // domain → VNC port (SetVNCPort); default 5901
+
 	// starts counts each domain's StartDomain calls, and taps holds the host
 	// device each NIC was given in one of those runs (keyed by domain, run and
 	// lower-cased MAC). nextTap is the host-wide vnetN counter. Together they
@@ -456,6 +463,15 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 			}
 		}
 	}
+	// As libvirt.Client.DefineDomain: every define applies the console
+	// password policy (fresh passwords on, none off).
+	if f.consolePolicy != nil {
+		applied, err := libvirt.ApplyConsolePasswords(xmlConfig, f.consolePolicy())
+		if err != nil {
+			return fmt.Errorf("define domain: %w", err)
+		}
+		xmlConfig = applied
+	}
 	if st := f.domains[name]; st != StateRunning && st != StatePaused {
 		// A new persistent definition of an inactive domain is what its next
 		// start opens: it stays on an overlay only if it names it.
@@ -628,6 +644,9 @@ func (f *Fake) startDomain(name string, paused bool) error {
 	if paused {
 		f.domains[name] = StatePaused
 	}
+	// The guest starts with the console passwords its definition carries,
+	// and keeps them until it stops, whatever a later define says.
+	f.captureConsolePasswordsLocked(name, f.liveXMLLocked(name))
 	f.starts[name]++
 	f.record("start", name, "")
 	return nil
@@ -731,6 +750,7 @@ func (f *Fake) ShutdownDomain(name string) error {
 		return nil
 	}
 	f.domains[name] = StateShutdown
+	delete(f.liveConsolePw, name)
 	return nil
 }
 
@@ -746,6 +766,7 @@ func (f *Fake) DestroyDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
 	f.domains[name] = StateShutdown
+	delete(f.liveConsolePw, name)
 	f.record("destroy", name, "")
 	return nil
 }
@@ -762,6 +783,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.domains, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
+	delete(f.liveConsolePw, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
 	delete(f.managedSave, name)
@@ -1073,7 +1095,75 @@ func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 // VNC / SPICE / console — return deterministic placeholders.
 
 func (f *Fake) GetVMVNCPort(name string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p, ok := f.vncPorts[name]; ok {
+		return p, nil
+	}
 	return 5901, nil
+}
+
+// SetVNCPort points a domain's VNC console at port, so a scenario can stand a
+// real listener behind ProxyVNC.
+func (f *Fake) SetVNCPort(name string, port int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.vncPorts == nil {
+		f.vncPorts = map[string]int{}
+	}
+	f.vncPorts[name] = port
+}
+
+// SetConsolePasswordPolicy mirrors libvirt.Client.SetConsolePasswordPolicy.
+func (f *Fake) SetConsolePasswordPolicy(fn func() bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.consolePolicy = fn
+}
+
+// ConsolePassword mirrors libvirt.Client.ConsolePassword: the password the
+// running guest started with, else its definition's. A domain the fake has
+// never heard of has none (its console placeholders answer for any name).
+func (f *Fake) ConsolePassword(name, kind string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if pw, ok := f.liveConsolePw[name]; ok {
+		return pw[kind], nil
+	}
+	x, ok := f.xml[name]
+	if !ok {
+		return "", nil
+	}
+	return libvirt.ConsolePasswordFromXML(x, kind)
+}
+
+// LandMigrated lands a live-migrated guest here as libvirt does: the
+// destination takes the source's secure migratable definition AS IT IS — no
+// define of ours runs, so no console password policy applies — and the guest
+// runs with the passwords it already had.
+func (f *Fake) LandMigrated(domXML string) {
+	name := domainNameFromXML(domXML)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.xml[name] = domXML
+	f.domains[name] = StateRunning
+	f.captureConsolePasswordsLocked(name, domXML)
+	f.record("migrate-in", name, "")
+}
+
+// captureConsolePasswordsLocked records the console passwords a guest runs
+// with. Caller holds f.mu.
+func (f *Fake) captureConsolePasswordsLocked(name, domXML string) {
+	if f.liveConsolePw == nil {
+		f.liveConsolePw = map[string]map[string]string{}
+	}
+	pw := map[string]string{}
+	for _, kind := range []string{"vnc", "spice"} {
+		if p, err := libvirt.ConsolePasswordFromXML(domXML, kind); err == nil && p != "" {
+			pw[kind] = p
+		}
+	}
+	f.liveConsolePw[name] = pw
 }
 func (f *Fake) GetVMSpicePort(name string) (int, error) {
 	return 5930, nil

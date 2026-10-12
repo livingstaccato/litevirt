@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -51,6 +52,10 @@ type Client struct {
 	guardWait  time.Duration
 	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
 	readyOnce  sync.Once
+
+	// consolePolicy decides whether DefineDomain gives a domain's consoles
+	// passwords (SetConsolePasswordPolicy, console_password.go).
+	consolePolicy atomic.Pointer[func() bool]
 }
 
 // NewClient connects to the local libvirtd daemon.

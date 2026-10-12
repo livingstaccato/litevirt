@@ -301,7 +301,9 @@ func revertToSnapshot(v snapshotAPI, domainName, snapshotName string, restorePre
 	// unchanged after the overlays are reset (no path swap), except a disk
 	// moved to a new overlay, which is repointed there with its old
 	// <backingStore> dropped: libvirt would open that chain as written.
-	inactiveXML, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive)
+	// Secure: this definition is redefined below, and a dump without
+	// VIR_DOMAIN_XML_SECURE has no console password to keep.
+	inactiveXML, err := v.DomainGetXMLDesc(dom, golibvirt.DomainXMLInactive|golibvirt.DomainXMLSecure)
 	if err != nil {
 		inactiveXML = domXML
 	}

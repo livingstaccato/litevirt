@@ -12,8 +12,19 @@ import (
 )
 
 // DefineDomain creates a persistent domain from XML.
+//
+// Every define goes through the console password policy
+// (SetConsolePasswordPolicy): with it on, each VNC/SPICE console gets a fresh
+// password; with it off, none. This is the one place every define path
+// passes — create, a redefine on update or start, a restore, a clone, a
+// failover define, a cold migration's target — so none of them can define a
+// console that skipped it.
 func (c *Client) DefineDomain(xmlConfig string) error {
-	_, err := c.virt.DomainDefineXML(xmlConfig)
+	xmlConfig, err := c.applyConsolePolicy(xmlConfig)
+	if err != nil {
+		return fmt.Errorf("define domain: %w", err)
+	}
+	_, err = c.virt.DomainDefineXML(xmlConfig)
 	if err != nil {
 		return fmt.Errorf("define domain: %w", err)
 	}
@@ -599,7 +610,10 @@ func (c *Client) SetBootOrder(domainName, bootOrder string) error {
 		return fmt.Errorf("lookup domain %s: %w", domainName, err)
 	}
 
-	xmlDesc, err := c.virt.DomainGetXMLDesc(dom, 0)
+	// Secure: the definition is written straight back, and a dump without
+	// VIR_DOMAIN_XML_SECURE has no console password, so the redefine would
+	// silently drop it from the domain's next start.
+	xmlDesc, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure)
 	if err != nil {
 		return fmt.Errorf("get domain XML %s: %w", domainName, err)
 	}

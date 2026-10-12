@@ -27,6 +27,8 @@ type pitModel struct {
 	// pivotKeepsPersistent models a libvirt that pivots the live disk but
 	// leaves the persistent definition on the overlay.
 	pivotKeepsPersistent bool
+	// consolePasswd is the domain's VNC console password ("" = none).
+	consolePasswd string
 }
 
 func newPITModel() *pitModel {
@@ -62,10 +64,20 @@ func (m *pitModel) DomainGetState(golibvirt.Domain, uint32) (int32, int32, error
 	return int32(m.state), 0, nil
 }
 func (m *pitModel) DomainGetXMLDesc(_ golibvirt.Domain, f golibvirt.DomainXMLFlags) (string, error) {
+	x := pitDomXML(m.live, nil)
 	if f&golibvirt.DomainXMLInactive != 0 {
-		return pitDomXML(m.inactive, m.backing), nil
+		x = pitDomXML(m.inactive, m.backing)
 	}
-	return pitDomXML(m.live, nil), nil
+	if m.consolePasswd != "" {
+		// As libvirt: the console password is in the dump only when it is
+		// asked for with VIR_DOMAIN_XML_SECURE.
+		g := "<graphics type='vnc' port='-1' autoport='yes'/>"
+		if f&golibvirt.DomainXMLSecure != 0 {
+			g = "<graphics type='vnc' port='-1' autoport='yes' passwd='" + m.consolePasswd + "'/>"
+		}
+		x = strings.Replace(x, "</devices>", g+"</devices>", 1)
+	}
+	return x, nil
 }
 func (m *pitModel) DomainDefineXML(x string) (golibvirt.Domain, error) {
 	m.defined = x
@@ -195,6 +207,29 @@ func TestPITCommit_PersistentDefinitionEndsOnTheDisk(t *testing.T) {
 	}
 	if used, _ := domainUsesFile(m, "web", "/pool/ov"); used {
 		t.Error("the domain still names the overlay")
+	}
+}
+
+// The repaired persistent definition keeps the console password. It is
+// redefined from a dump of itself, and a dump without VIR_DOMAIN_XML_SECURE has
+// no password, so the guest's next start would have an open console.
+//
+// Mutation "dump without DomainXMLSecure" — red.
+func TestPITCommit_RepairKeepsTheConsolePassword(t *testing.T) {
+	m := newPITModel()
+	m.pivotKeepsPersistent = true
+	m.consolePasswd = "Zq3xR8pA"
+	if _, err := snapshotDiskExternal(m, "web", "/pool/web-root.qcow2", "/pool/ov"); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitDiskOverlay(m, "web", "/pool/web-root.qcow2", "/pool/ov", "qcow2", nil); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if m.defined == "" {
+		t.Fatal("fixture: the persistent definition was not repaired")
+	}
+	if pw, _ := ConsolePasswordFromXML(m.defined, "vnc"); pw != m.consolePasswd {
+		t.Errorf("the repaired definition's console password is %q, want %q: %s", pw, m.consolePasswd, m.defined)
 	}
 }
 

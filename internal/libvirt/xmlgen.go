@@ -643,7 +643,10 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		})
 	}
 
-	// VNC graphics (for lv vnc / web UI noVNC viewer)
+	// VNC graphics (for lv vnc / web UI noVNC viewer). No password here: the
+	// console password is applied where the domain is DEFINED
+	// (Client.DefineDomain, console_password.go), the one place every path
+	// passes, and this XML is also logged and compared.
 	if cfg.EnableVNC {
 		dev.Graphics = append(dev.Graphics, graphicsDevice{
 			Type:     "vnc",

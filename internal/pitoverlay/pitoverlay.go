@@ -56,7 +56,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -64,6 +63,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -183,7 +183,7 @@ func SetAsideEvidence(disk string) bool {
 
 // Command builds the qemu-img process. A variable so a test can see the
 // argv or fail it.
-var Command = exec.CommandContext
+var Command = cmdbound.Command
 
 // Owner is the VM disk an overlay belongs to.
 type Owner struct {

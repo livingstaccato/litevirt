@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"sort"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // Status is a disk's SMART verdict.
@@ -84,7 +86,7 @@ type Runner func(ctx context.Context, args ...string) ([]byte, error)
 func ExecRunner(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "smartctl", args...).Output()
+	out, err := cmdbound.Command(ctx, "smartctl", args...).Output()
 	return out, err
 }
 

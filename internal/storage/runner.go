@@ -3,7 +3,8 @@ package storage
 import (
 	"context"
 	"errors"
-	"os/exec"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // ErrUnimplemented is returned by a driver operation that has no implementation
@@ -15,7 +16,10 @@ var ErrUnimplemented = errors.New("storage: operation not implemented")
 // runner lets tests exercise failure/rollback paths without the real binaries.
 type cmdRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
-// realCmd is the production runner: a plain exec with combined output.
+// realCmd is the production runner: an exec with combined output, bounded by
+// ctx (cmdbound): at the deadline the command's whole process group is
+// killed, and a child that still holds the output pipe (mount's mount.nfs,
+// say) does not keep it waiting past cmdbound.WaitDelay.
 func realCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return cmdbound.Command(ctx, name, args...).CombinedOutput()
 }

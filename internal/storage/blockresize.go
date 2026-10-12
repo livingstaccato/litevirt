@@ -3,8 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // IsBlockVolumeDriver reports whether a disk of this storage type is a host
@@ -47,7 +48,7 @@ func GrowBlockVolume(ctx context.Context, storageType, path string, newSize int6
 		if !ok || !zfsDatasetRe.MatchString(ds) || !strings.Contains(ds, "/") || strings.HasPrefix(ds, "-") {
 			return 0, fmt.Errorf("zfs disk path %q is not /dev/zvol/<pool>/<dataset>", path)
 		}
-		if out, err := exec.CommandContext(ctx, "zfs", "set", fmt.Sprintf("volsize=%d", size), ds).CombinedOutput(); err != nil {
+		if out, err := cmdbound.Command(ctx, "zfs", "set", fmt.Sprintf("volsize=%d", size), ds).CombinedOutput(); err != nil {
 			return 0, fmt.Errorf("zfs set volsize %s: %w: %s", ds, err, out)
 		}
 	case "lvm-thin", "lvmthin":
@@ -56,7 +57,7 @@ func GrowBlockVolume(ctx context.Context, storageType, path string, newSize int6
 		if !ok || !ok2 || !lvmNameRe.MatchString(vg) || !lvmNameRe.MatchString(lv) {
 			return 0, fmt.Errorf("lvm disk path %q is not /dev/<vg>/<lv>", path)
 		}
-		if out, err := exec.CommandContext(ctx, "lvextend", "-L", fmt.Sprintf("%db", size), "--", vg+"/"+lv).CombinedOutput(); err != nil {
+		if out, err := cmdbound.Command(ctx, "lvextend", "-L", fmt.Sprintf("%db", size), "--", vg+"/"+lv).CombinedOutput(); err != nil {
 			return 0, fmt.Errorf("lvextend %s/%s: %w: %s", vg, lv, err, out)
 		}
 	default:

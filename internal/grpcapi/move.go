@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
@@ -977,7 +978,7 @@ func convertImageForceShare(ctx context.Context, src, srcFormat string, rule cha
 
 // qemuImgCommand builds the qemu-img process. A variable so a test can see
 // the argv.
-var qemuImgCommand = exec.CommandContext
+var qemuImgCommand = cmdbound.Command
 
 func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error, forceShare bool) error {
 	// qemu-img follows symlinks; on an NFS export mounted without

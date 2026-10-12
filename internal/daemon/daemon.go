@@ -1273,6 +1273,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
 	// a reconciler pass retries stragglers.
 	svc.RecoverHardwareOperations(ctx)
+
+	// Release PCI devices a VM owns but provably does not hold, once the
+	// recoveries above have settled every lease and operation that could
+	// explain one (lab finding L1: a failed SR-IOV attach on an older build
+	// left its VF owned). What it cannot prove it reports and leaves owned.
+	svc.SweepUnattachedPCIOwnership(ctx)
 	go svc.RunHardwareOperationRecovery(ctx)
 
 	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables

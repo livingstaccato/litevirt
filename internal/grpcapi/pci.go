@@ -153,6 +153,9 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 			s.publish("device.reclaimed", s.hostName, addr+" freed: owning VM no longer exists")
 		}
 	}
+	// And devices a live VM owns but provably does not hold: what a failed SR-IOV
+	// attach on an older build left behind (lab finding L1).
+	s.SweepUnattachedPCIOwnership(ctx)
 
 	// Build response.
 	devices, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")

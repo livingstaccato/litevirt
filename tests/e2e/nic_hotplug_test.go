@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/tests/e2e/e2ehelp"
 )
 
 // NIC hot-detach against a real libvirt domain — the regression guard for the
@@ -84,37 +86,33 @@ func waitGuestActive(t *testing.T, domain string, timeout time.Duration) {
 // (x-query-virtio / x-query-virtio-status, QEMU >= 7.2) on the VM's host, so it
 // is a fact about the guest, not litevirt's report of one.
 //
-// It needs no NIC and no guest agent, which is what a VM from `lv run` has
-// neither of: its root disk being driven is the "guest has booted" signal, and
-// a hot-added NIC being driven is the "guest has enumerated the device it will
-// be asked to eject" signal.
+// It needs no NIC and no guest agent, which a VM from `lv run` has neither of.
+// The meaningful use is the hot-added NIC: virtio-net being driven means the
+// guest has enumerated the device it will be asked to eject. The root disk's
+// virtio-blk is a weak "guest booted" signal only, since SeaBIOS and OVMF drive
+// virtio-blk themselves to boot and can set DRIVER_OK while still in firmware.
+//
+// The reply parsing lives in e2ehelp (VirtioDriverOK), where it is unit tested
+// against QEMU's real status strings.
 //
 // An error means the question could not be asked (no shell on the host, no
-// virsh, an older QEMU), never "not ready".
+// virsh, a QEMU older than 7.2, a reply format the parser does not know), never
+// "not ready".
 func virtioDriversOK(host, vm, kind string) (bool, error) {
 	qmp := func(cmd string) (json.RawMessage, error) {
 		out, err := nodeOut(host, "virsh -c qemu:///system qemu-monitor-command "+shellQuote(vm)+" "+shellQuote(cmd))
 		if err != nil {
 			return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
 		}
-		var reply struct {
-			Return json.RawMessage `json:"return"`
-		}
-		if err := json.Unmarshal([]byte(out), &reply); err != nil || reply.Return == nil {
-			return nil, fmt.Errorf("unexpected QMP reply to %s: %.200s", cmd, out)
-		}
-		return reply.Return, nil
+		return e2ehelp.QMPReturn(out)
 	}
 	raw, err := qmp(`{"execute":"x-query-virtio"}`)
 	if err != nil {
 		return false, err
 	}
-	var devs []struct {
-		Path string `json:"path"`
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(raw, &devs); err != nil {
-		return false, fmt.Errorf("x-query-virtio: %v", err)
+	devs, err := e2ehelp.VirtioDevices(raw)
+	if err != nil {
+		return false, err
 	}
 	found := false
 	for _, d := range devs {
@@ -126,7 +124,11 @@ func virtioDriversOK(host, vm, kind string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if !strings.Contains(string(st), `"driver-ok"`) {
+		ok, err := e2ehelp.VirtioDriverOK(st)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
 			return false, nil
 		}
 	}

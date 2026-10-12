@@ -1825,11 +1825,13 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 
 	// RUNNING is the DOMAIN, not the guest. Hot-unplug needs the guest to answer
 	// the eject, and a guest still booting drops it: the lab saw this test detach
-	// ~4 s after RUNNING and fail 3 runs in 3 (lab1-c713, M6). Wait until the
-	// guest is driving its root disk (it has booted), and later until it is
-	// driving the attached NIC (it has enumerated what it will be asked to
-	// eject). Read from QEMU on the VM's host; where that cannot be asked the
-	// CLI-level assertions below carry the test alone.
+	// ~4 s after RUNNING and fail 3 runs in 3 (lab1-c713, M6). The wait that
+	// matters is the one after the attach: until the guest drives the attached
+	// NIC, it has not enumerated what it will be asked to eject. The root-disk
+	// wait here only keeps the attach from landing in the earliest boot; firmware
+	// drives virtio-blk too, so it does not prove the kernel is up. Both are read
+	// from QEMU on the VM's host; where that cannot be asked the CLI-level
+	// assertions below carry the test alone.
 	canAsk := waitVirtioDriversOK(t, host, vmName, "virtio-blk", 4*time.Minute)
 
 	// `lv run --name ... --image ...` makes a VM with no NIC at all, so the VM
@@ -1864,6 +1866,19 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 	if canAsk {
 		waitVirtioDriversOK(t, host, vmName, "virtio-net", 2*time.Minute)
 	}
+	// Whether the domain's definitions can be read is its own question: it needs
+	// only virsh on the host, not the QMP probe above (a QEMU older than 7.2
+	// answers dumpxml but not x-query-virtio). Where it can, the attach must have
+	// put the NIC in both copies.
+	canReadDefs := false
+	if live, config, err := nicCopies(host, vmName, added); err != nil {
+		t.Logf("cannot read %s's definitions on %s (%v); the both-copies check is skipped", vmName, host, err)
+	} else {
+		canReadDefs = true
+		if !live || !config {
+			t.Fatalf("after attach-nic, NIC %s in live domain=%v, persistent definition=%v; want both", added, live, config)
+		}
+	}
 
 	// The detach must succeed outright: `lv detach-nic` waits for the unplug and
 	// re-requests it, so a guest that has booted releases the NIC inside that
@@ -1873,11 +1888,11 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 	assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from inspect", func() bool {
 		return !strings.Contains(lv(t, "inspect", vmName), added)
 	})
-	// inspect reads litevirt's rows. Where the host can be asked, the domain
+	// inspect reads litevirt's rows. Where the definitions can be read, the domain
 	// itself must agree, in BOTH copies: a NIC left in the live domain is still
 	// plugged into the guest, and one left in the persistent definition comes
 	// back on the next cold boot.
-	if canAsk {
+	if canReadDefs {
 		assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from the live domain and the persistent definition", func() bool {
 			live, config, err := nicCopies(host, vmName, added)
 			if err != nil {

@@ -324,14 +324,16 @@ func TestOIDC_LiveIdPSignInThroughTheWebUI(t *testing.T) {
 				t.Fatalf("a callback from a browser that did not begin the login: HTTP %d, session set %v; want 401 and none",
 					r.StatusCode, oidcSessionSet(r) != "")
 			}
-			// ...and the flow is spent: the browser that began it is refused too.
+			// ...and the flow is spent: the browser that began it is refused too,
+			// as an unknown state (ErrOIDCFlowUnknown, Unauthenticated: 401).
 			r, err = beganA.Get(callbackA)
 			if err != nil {
 				t.Fatal(err)
 			}
 			r.Body.Close()
-			if r.StatusCode == http.StatusFound || oidcSessionSet(r) != "" {
-				t.Fatalf("the beginner redeemed a flow a stray callback had already consumed: HTTP %d", r.StatusCode)
+			if r.StatusCode != http.StatusUnauthorized || oidcSessionSet(r) != "" {
+				t.Fatalf("the beginner, redeeming a flow a stray callback had already consumed: HTTP %d, session set %v; want 401 and none",
+					r.StatusCode, oidcSessionSet(r) != "")
 			}
 
 			// ── flow B: the real sign-in ───────────────────────────────────

@@ -1048,6 +1048,30 @@ During a rolling update, creates (scale-up) execute first, then updates are proc
       timeout-sec: 0                # Migration timeout (0 = no timeout)
 ```
 
+`priority` is a whole number from -2147483648 to 2147483647, default `0`;
+a value outside that range is refused at parse. **Higher goes first.** It
+orders three things, each among one host's VMs:
+
+- **Failover.** When a host is fenced, its VMs are recovered highest priority
+  first: auto-promotion, placement and each reschedule run in that order, and
+  placement charges each VM's CPU and memory before the next is placed, so when
+  the survivors cannot hold every VM, the higher-priority ones get the room.
+  A VM that does not fit is left on the fenced host and reported, as any VM
+  without a place is.
+- **Drain.** `lv host drain` picks targets and starts the moves in priority
+  order, so with `--parallel N` the N highest go first.
+- **Starts on the new host.** A host starts the VMs failover sent it, and any
+  other VM it has to start, highest priority first within each pass; a start
+  deferred from the last pass still goes ahead of new ones.
+
+VMs of equal priority go in name order. Priority only orders work that is
+already allowed: quorum, fencing, recovery claims, capacity and every
+placement constraint still decide each VM on its own, and a high priority never
+lets a VM past one of them. It does not order recovery across two hosts that
+fail at once (each host's VMs are recovered in turn), `onboot` starts at host
+boot (those follow `startup-order`), failback, or the rebalancer. See
+[Recovery priority](migration-failover.md#recovery-priority).
+
 ## Backup
 
 Attach a VM to the backup scheduler. The scheduler ticks every minute and

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -500,6 +501,14 @@ func (v *validator) validate(f *File) {
 		if image == "" {
 			v.ps.add(p, "image or iso required", "set image: or iso:")
 			continue
+		}
+
+		// migrate.priority is stored as an int32 (MigrationPolicy.priority):
+		// a value outside it would wrap silently and invert its own ordering.
+		if vm.Migrate != nil && (vm.Migrate.Priority < math.MinInt32 || vm.Migrate.Priority > math.MaxInt32) {
+			v.ps.add(p+".migrate.priority",
+				fmt.Sprintf("priority %d is out of range", vm.Migrate.Priority),
+				fmt.Sprintf("use a whole number from %d to %d; higher is migrated and recovered first", math.MinInt32, math.MaxInt32))
 		}
 
 		// Validate migration + storage consistency

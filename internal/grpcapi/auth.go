@@ -121,13 +121,13 @@ var bearerlessClientAdmin = promauto.NewCounter(prometheus.CounterOpts{
 // mTLS-identity model. When true (and the StrictMTLSIdentityV1 gate is active
 // cluster-wide), a bearerless "client" cert is denied. The flag is the kill
 // switch — false short-circuits enforcement regardless of any latch marker.
-func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity = on }
+func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity.Store(on) }
 
 // SetForwardedIdentity sets this node's enforcement switch for owner-side
 // promotion of a forwarded user identity. When true (and the
 // ForwardedIdentityV1 gate is active cluster-wide), a peer relaying a user's
 // session bearer is authenticated as the real user. The flag is the kill switch.
-func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
+func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity.Store(on) }
 
 // SetTrustRotatedPeerCerts sets this node's RECOVERY switch for the peer
 // certificate-serial pin. When true, a live host row whose recorded serial
@@ -145,7 +145,7 @@ func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts.Sto
 // The flag is the reversible kill switch; realm enforcement in GrantRole is
 // gated by this flag AND the RBACRealmV1 latch (see rbacRealmConfigured /
 // rbacRealmLatched).
-func (s *Server) SetRBACRealm(on bool) { s.rbacRealm = on }
+func (s *Server) SetRBACRealm(on bool) { s.rbacRealm.Store(on) }
 
 // skipAuth lists RPC methods that bypass authentication.
 var skipAuth = map[string]bool{
@@ -530,28 +530,31 @@ func isLoopbackPeer(ctx context.Context) bool {
 // default. The loopback local-root path is never gated on this — it is the
 // on-node escape hatch.
 func (s *Server) strictMTLSEnforced(ctx context.Context) bool {
-	return s.strictMTLSIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.StrictMTLSIdentityV1)
+	g := s.gateV()
+	return s.strictMTLSIdentity.Load() && g != nil && g.Enforced(ctx, capabilities.StrictMTLSIdentityV1)
 }
 
 // forwardedIdentityEnforced reports whether this node promotes a forwarded user
 // bearer to the real user (owner-side). Config flag AND capability gate, like
 // strict mTLS — the flag is the kill switch, short-circuiting the gate.
 func (s *Server) forwardedIdentityEnforced(ctx context.Context) bool {
-	return s.forwardedIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.ForwardedIdentityV1)
+	g := s.gateV()
+	return s.forwardedIdentity.Load() && g != nil && g.Enforced(ctx, capabilities.ForwardedIdentityV1)
 }
 
 // rbacRealmConfigured reports whether the operator has opted this node into
 // realm-aware role-binding grammar (the auth.rbac_realm kill switch). When
 // false the node keeps legacy behavior: a bare user:<name> grant is accepted
 // as-is (inert, but preserved for mixed-version compatibility).
-func (s *Server) rbacRealmConfigured() bool { return s.rbacRealm }
+func (s *Server) rbacRealmConfigured() bool { return s.rbacRealm.Load() }
 
 // rbacRealmLatched reports whether realm-aware grammar is FULLY active: the
 // config flag AND the RBACRealmV1 capability latched cluster-wide. Only then is
 // it safe to auto-resolve a bare grant to canonical form — while any peer might
 // still mint bare bindings (pre-latch), we refuse rather than canonicalize.
 func (s *Server) rbacRealmLatched(ctx context.Context) bool {
-	return s.rbacRealm && s.gate != nil && s.gate.Enforced(ctx, capabilities.RBACRealmV1)
+	g := s.gateV()
+	return s.rbacRealm.Load() && g != nil && g.Enforced(ctx, capabilities.RBACRealmV1)
 }
 
 // fwdBearerFromCtx returns the forwarded user bearer relayed by an entry node

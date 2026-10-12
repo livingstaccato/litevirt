@@ -596,14 +596,15 @@ func requireReplicationPeer(ctx context.Context, sender string) error {
 // refusing legitimate peers during a partition, which is the opposite of what
 // this protects.
 func (s *Server) requireNotIsolated(ctx context.Context, sender string) error {
-	if !s.tokenEnabled(capabilities.IsolationEpochV1) || s.gate == nil {
+	gate := s.gateV()
+	if !s.tokenEnabled(capabilities.IsolationEpochV1) || gate == nil {
 		return nil
 	}
 	// Enforced (not CapabilityActiveForHealth): this is an enforcement
 	// decision, so it takes the same latch-backed path every other gate uses.
 	// The ForHealth variant is positive-cached for the HA monitor and must not
 	// decide whether to refuse a peer.
-	if !s.gate.Enforced(ctx, capabilities.IsolationEpochV1) {
+	if !gate.Enforced(ctx, capabilities.IsolationEpochV1) {
 		return nil
 	}
 	epoch, reason, err := corrosion.HostIsolation(ctx, s.db, sender)

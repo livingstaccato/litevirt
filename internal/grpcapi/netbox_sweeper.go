@@ -1203,7 +1203,7 @@ func (s *Server) hostIsReachable(ctx context.Context, host string) bool {
 	if host == s.hostName {
 		return true
 	}
-	if s.gate == nil {
+	if s.gateV() == nil {
 		return false
 	}
 	return s.peerUp(ctx, host)

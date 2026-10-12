@@ -249,12 +249,13 @@ func (s *Server) notEnforcingWith(advertised []string) []string {
 // flag is off. Only tokens whose stand-down a peer must be told about are
 // considered.
 func (s *Server) withheldStandDowns(advertised []string) []string {
-	if s.gate == nil {
+	gt := s.gateV()
+	if gt == nil {
 		return nil
 	}
 	var out []string
 	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1} {
-		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && s.gate.Latched(tok) {
+		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && gt.Latched(tok) {
 			out = append(out, tok)
 		}
 	}

@@ -463,7 +463,7 @@ func wantForeignNetworkAudit(t *testing.T, s *Server, action, target, network st
 func TestRestoreContainer_RelocationOnForeignNetworkProceedsAndAudits(t *testing.T) {
 	s := newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
 	s.dataDir = t.TempDir()
-	s.gate = fakeServerGate{execOK: true}
+	s.SetGate(fakeServerGate{execOK: true})
 	seedAdmissionNetworks(t, s)
 	rt := &fakeCTRuntime{exportPayload: []byte("rootfs")}
 	s.SetContainerRuntime(rt)
@@ -606,7 +606,7 @@ func seedForeignCTBackup(t *testing.T, network string) (s *Server, repo, ts stri
 	t.Helper()
 	s = newPeerAuthServer(t)
 	s.dataDir = t.TempDir()
-	s.gate = fakeServerGate{execOK: true}
+	s.SetGate(fakeServerGate{execOK: true})
 	seedAdmissionNetworks(t, s)
 	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
 	repo, ts = ctTestRepo(t), "2026-07-03T11:00:00Z"

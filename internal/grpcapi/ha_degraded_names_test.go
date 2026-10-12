@@ -56,7 +56,7 @@ func TestEvaluateHADegraded_NamesTheDegradedTokens(t *testing.T) {
 		capabilities.LWWSkewGuardV1:   false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t)
-	s.gate = g
+	s.SetGate(g)
 	s.SetEnforcementConfig(false, true, false, false, false, false) // lww configured-on
 
 	for i := 0; i < 4; i++ {
@@ -234,7 +234,7 @@ func TestSpendOnePeerOp_PendingTokenCannotStarveTheFreshnessCheck(t *testing.T) 
 	ctx := context.Background()
 	g := &starvationGate{neverLatch: map[string]bool{capabilities.LWWSkewGuardV1: true}}
 	s := testServer(t)
-	s.gate = g
+	s.SetGate(g)
 	// lww configured on and never able to latch; split_brain is mandatory and latches.
 	s.SetEnforcementConfig(false, true, false, false, false, false)
 
@@ -266,7 +266,7 @@ func TestHAMonitorMetrics_DegradedFallsToZeroWhenATokenIsSwitchedOff(t *testing.
 	g := &recordingGate{}
 	g.latched = map[string]bool{capabilities.SplitBrainGateV1: true}
 	g.enforcedTok = map[string]bool{capabilities.SplitBrainGateV1: true}
-	s.gate = g
+	s.SetGate(g)
 	s.SetEnforcementConfig(false, true, false, false, false, false) // lww on, unlatched
 
 	_, degraded := s.evaluateHADegraded(ctx)
@@ -306,7 +306,7 @@ func TestEvaluateHADegraded_QuarantinedNodeDoesNotBlameItsPeers(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
 	g := &recordingGate{}
-	s.gate = g
+	s.SetGate(g)
 	s.SetEnforcementConfig(false, true, false, false, false, false) // lww configured on, unlatched
 
 	reasons, degraded := s.evaluateHADegraded(ctx)

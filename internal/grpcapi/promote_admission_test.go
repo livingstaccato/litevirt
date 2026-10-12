@@ -197,8 +197,8 @@ func TestPromoteReplica_Renamed_FenceRefusalUnwindsTheStartedDomain(t *testing.T
 	ctx := context.Background()
 	fake := libvirtfake.New()
 	s.virt = fake
-	s.enfProjectAuthority = true
-	s.gate = fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.ProjectAuthorityV1: true}}
+	s.enfProjectAuthority.Store(true)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.ProjectAuthorityV1: true}})
 	authorityHost(t, s, "acme") // this host holds acme's authority at epoch 1
 	poolDir := seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
 
@@ -292,7 +292,7 @@ func TestPromoteReplica_RefusesAnUnproducibleLeaseKeyBeforeItPersists(t *testing
 	// A PEER-mTLS caller, because that is who can supply a proof at all: the
 	// block is gated on req.Proof != nil, and requirePeerCert is the only thing
 	// standing in front of it.
-	// A gate must be present, or destSupportsGate fails closed on s.gate == nil
+	// A gate must be present, or destSupportsGate fails closed on s.gateV() == nil
 	// and the refusal never reaches the stamp check this test is about.
 	s.SetGate(fakeServerGate{
 		execOK: true, decideOK: true,

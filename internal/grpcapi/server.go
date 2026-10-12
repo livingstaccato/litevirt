@@ -245,7 +245,7 @@ type Server struct {
 	// strict mTLS-identity model (a bearerless "client" cert is denied; must
 	// `lv login`). Enforcement is this flag AND the StrictMTLSIdentityV1 gate
 	// being active cluster-wide; the flag is also the kill switch. Default false.
-	strictMTLSIdentity bool
+	strictMTLSIdentity atomic.Bool
 
 	// trustRotatedPeerCerts, when true, downgrades the peer certificate-serial pin
 	// to trust-and-log for CA-issued HOST certificates. It is the RECOVERY switch
@@ -266,12 +266,12 @@ type Server struct {
 	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated
 	// by this flag AND the ForwardedIdentityV1 capability active cluster-wide.
 	// Default false; the flag is the kill switch.
-	forwardedIdentity bool
+	forwardedIdentity atomic.Bool
 
 	// rbacRealm, when true, opts this node into realm-aware role-binding grammar
 	// (reject/resolve bare grants). Gated by this flag AND the RBACRealmV1 latch;
 	// the flag is the reversible kill switch. Default false. See rbacRealmActive.
-	rbacRealm bool
+	rbacRealm atomic.Bool
 
 	// enfSafeFence / enfLWWSkew / enfVIPSelfDemote / enfVIPProofReclaim mirror the
 	// split-brain-family enforcement kill-switches (config.Enforcement) so the HA
@@ -280,15 +280,15 @@ type Server struct {
 	// advertisement. The actual enforcement predicates live on the consumers
 	// (Coordinator, daemon closures, vipGateActive); the daemon wires both from one
 	// config source. See SetEnforcementConfig / tokenEnabled. All default false.
-	enfSafeFence          bool
-	enfLWWSkew            bool
-	enfHLCLww             bool
-	enfVIPSelfDemote      bool
-	enfVIPProofReclaim    bool
-	enfSharedStorageFence bool
+	enfSafeFence          atomic.Bool
+	enfLWWSkew            atomic.Bool
+	enfHLCLww             atomic.Bool
+	enfVIPSelfDemote      atomic.Bool
+	enfVIPProofReclaim    atomic.Bool
+	enfSharedStorageFence atomic.Bool
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
-	enfOperationProtocol bool
+	enfOperationProtocol atomic.Bool
 	// enfNetBoxIPAM gates ADVERTISEMENT of netbox_ipam_v1: the token is advertised
 	// only while this flag is set (like operation_protocol), so it can latch only
 	// once every node has opted in. An older binary does not parse the
@@ -297,7 +297,7 @@ type Server struct {
 	// state alone cannot make a bound prefix safe — the latch requires config
 	// uniformity, not just a uniform build. Default false; the flag is the
 	// reversible kill switch.
-	enfNetBoxIPAM bool
+	enfNetBoxIPAM atomic.Bool
 	// enfNetBoxMirror gates ADVERTISEMENT of netbox_mirror_v1 AND the mirror's own
 	// decision to run. It is `netbox.mirror_inventory`, default false: NetBox is
 	// pure IPAM unless an operator asks for the inventory mirror as well.
@@ -313,10 +313,10 @@ type Server struct {
 	// It gates the DECISION too, not only the advertisement: a latch is monotone
 	// and durable, so if the flag stopped mattering once netbox_mirror_v1 formed
 	// the mirror could never be turned off again. See netboxMirrorAuthorized.
-	enfNetBoxMirror bool
+	enfNetBoxMirror atomic.Bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
-	enfLiveResize bool
+	enfLiveResize atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -350,18 +350,18 @@ type Server struct {
 	// operation_protocol) so the token can only latch once every node has opted in —
 	// identity resolution mutates shared state, so it requires config uniformity, not
 	// just a uniform build.
-	enfCanonicalIdentity bool
+	enfCanonicalIdentity atomic.Bool
 	// enfVMReplace gates ADVERTISEMENT of vm_replace_v1 and, with the latch, whether
 	// `lv cutover` may run at all. The guarded replace transition installs receiver
 	// semantics an older peer does not have, so the latch must require CONFIG
 	// uniformity — not just a uniform build.
-	enfVMReplace bool
+	enfVMReplace atomic.Bool
 	// enfProjectAuthority is this node's kill-switch for DELEGATED project-quota
 	// admission; gated by this flag AND the ProjectAuthorityV1 latch. Advertised
 	// CONDITIONALLY on the flag (like operation_protocol): a peer still admitting from
 	// its own replica would bypass the single decider entirely, so serializing against
 	// one is worthless until every node has opted in.
-	enfProjectAuthority bool
+	enfProjectAuthority atomic.Bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
 	// stackMemberDeleteHook is a test-only seam: DeleteStack calls it with
@@ -390,21 +390,21 @@ type Server struct {
 	// flag (like operation_protocol): a peer with it off keeps writing unsigned rows,
 	// which are exactly what a forgery looks like, so the latch must require config
 	// uniformity.
-	enfAuditSignature bool
+	enfAuditSignature atomic.Bool
 	// enfOwnerEpoch + ownerEpochReady gate owner_epoch_v1 advertisement: the flag
 	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
 	// (the health backfill reports it). Both required — the fleet must never
 	// latch across a node whose workloads are ungraduated.
-	enfOwnerEpoch bool
+	enfOwnerEpoch atomic.Bool
 	// enfLeaseTerm + leaseTermReady gate lease_term_v1 advertisement: the flag
 	// is the operator opt-in, readiness is "this node can enforce and the
 	// cluster is big enough that enforcing does not break failover".
-	enfLeaseTerm   bool
-	leaseTermReady func() bool
+	enfLeaseTerm   atomic.Bool
+	leaseTermReady atomic.Pointer[func() bool]
 	// enfRecoveryClaim is enforcement.recovery_claim (default on): the flag
 	// that lets recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
-	enfRecoveryClaim bool
+	enfRecoveryClaim atomic.Bool
 	// enfPartitionPause is enforcement.partition_pause (default on): this node
 	// pauses its recoverable workloads on losing the voter majority, so it may
 	// advertise partition_pause_v1 (docs/design/partition-pause.md §5).
@@ -421,8 +421,8 @@ type Server struct {
 	abstain abstainCache
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
-	enfIsolationEpoch bool
-	ownerEpochReady   func() bool
+	enfIsolationEpoch atomic.Bool
+	ownerEpochReady   atomic.Pointer[func() bool]
 
 	// claims is the per-process recovery-claim state: signing identity,
 	// verifier, proposer, owner-probe cache and last refusals
@@ -960,6 +960,8 @@ type Server struct {
 	// When set + enforced, ApplyLB (VIP takeover) requires local quorum. nil /
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate serverGate
+	// lateGate overrides gate once SetGate has run; see gateV.
+	lateGate atomic.Pointer[gateHolder]
 	// releaseFeatures opens a release feature (WithReleaseFeature): the
 	// checker's WithFeature in production. Nil refuses every feature.
 	releaseFeatures releaseFeatureGate
@@ -1096,7 +1098,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// just a uniform build. Withholding advertisement when the flag is off keeps
 	// the cluster from latching — and relying on the barrier — until every node has
 	// opted in.
-	if !s.enfOperationProtocol {
+	if !s.enfOperationProtocol.Load() {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
@@ -1106,7 +1108,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// across the whole prefix — every node observing the same replicated binding
 	// is not the same thing as every node INTERPRETING it, so the latch requires
 	// CONFIG uniformity, not just a uniform build.
-	if !s.enfNetBoxIPAM {
+	if !s.enfNetBoxIPAM.Load() {
 		caps = withoutCapability(caps, capabilities.NetBoxIPAMV1)
 	}
 	// netbox_mirror_v1 is conditional on the SEPARATE mirror opt-in, so the two
@@ -1114,21 +1116,21 @@ func (s *Server) advertisedCapabilities() []string {
 	// advertises netbox_ipam_v1 and never this one. A cluster that latched this
 	// token across a node whose flag is off would have its inventory rewritten
 	// only while that node was not the `netbox` lease holder.
-	if !s.enfNetBoxMirror {
+	if !s.enfNetBoxMirror.Load() {
 		caps = withoutCapability(caps, capabilities.NetBoxMirrorV1)
 	}
 	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
 	// a peer outright, and a node that isn't enforcing would keep accepting the
 	// isolated node's state and re-inject it — so the latch requires CONFIG
 	// uniformity, not just a uniform build.
-	if !s.enfIsolationEpoch {
+	if !s.enfIsolationEpoch.Load() {
 		caps = withoutCapability(caps, capabilities.IsolationEpochV1)
 	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
 	// flag is off keeps the cluster from latching until every node has opted in.
-	if !s.enfCanonicalIdentity {
+	if !s.enfCanonicalIdentity.Load() {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
 	}
 	// vm_replace_v1 is likewise conditional on its flag. The guarded replace batch
@@ -1136,14 +1138,14 @@ func (s *Server) advertisedCapabilities() []string {
 	// cluster that has not opted in would back-pressure that peer's stream. Withholding
 	// advertisement keeps the latch — and therefore any cutover at all — from happening
 	// until every node has opted in.
-	if !s.enfVMReplace {
+	if !s.enfVMReplace.Load() {
 		caps = withoutCapability(caps, capabilities.VMReplaceV1)
 	}
 	// project_authority_v1 is likewise advertised CONDITIONALLY on its config flag. A
 	// single decider only serializes admissions that all ROUTE through it; a peer with
 	// the flag off keeps deciding from its own replica and races the holder anyway. So
 	// the latch must require CONFIG uniformity, not just a uniform build.
-	if !s.enfProjectAuthority {
+	if !s.enfProjectAuthority.Load() {
 		caps = withoutCapability(caps, capabilities.ProjectAuthorityV1)
 	}
 	// audit_signature_v1 is likewise advertised CONDITIONALLY on its config flag. A
@@ -1151,7 +1153,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// table, and an unsigned row is precisely the shape a forgery takes — so no node
 	// may start REFUSING unsignable writes (and treating "unsigned" as evidence)
 	// until every node has opted in. Config uniformity, not just a uniform build.
-	if !s.enfAuditSignature {
+	if !s.enfAuditSignature.Load() {
 		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
 	}
 	// shared_storage_fence_v1 is deliberately NOT withheld here, and the reason is
@@ -1219,7 +1221,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// token) AND this node is READY — its owned workloads have all graduated
 	// out of the pre-epoch 0. Advertising earlier could latch the fleet across
 	// a node whose runtime markers and generations don.t exist yet.
-	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
+	if !s.enfOwnerEpoch.Load() || !probeReady(&s.ownerEpochReady) {
 		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
 	}
 	// lease_term_v1 (Phase 2) follows the same model: the operator opt-in plus
@@ -1228,7 +1230,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// hardwareV2Ready already documents why anything that Pings from here
 	// recurses. A nil probe is NOT ready: the fleet must not latch a regime
 	// across a node that never proved it could honour it.
-	if !s.enfLeaseTerm || s.leaseTermReady == nil || !s.leaseTermReady() {
+	if !s.enfLeaseTerm.Load() || !probeReady(&s.leaseTermReady) {
 		caps = withoutCapability(caps, capabilities.LeaseTermV1)
 	}
 	// voter_config_v1 is MANDATORY — no flag, because a node with one off would
@@ -1266,7 +1268,7 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this runs inside the Ping handler). See
 	// TestAdvertise_RecoveryClaimWithheldWhileOff and, for the opposite answer
 	// to the same question, TestAdvertise_SharedStorageFenceIsUnconditional.
-	if !s.enfRecoveryClaim || !s.recoveryClaimAdvertisable() {
+	if !s.enfRecoveryClaim.Load() || !s.recoveryClaimAdvertisable() {
 		caps = withoutCapability(caps, capabilities.RecoveryClaimV1)
 	}
 	// partition_pause_v1 is withheld while enforcement.partition_pause is off,
@@ -1279,6 +1281,13 @@ func (s *Server) advertisedCapabilities() []string {
 		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
 	return caps
+}
+
+// probeReady runs a readiness probe wired late through an atomic pointer; an
+// unwired (nil) probe is NOT ready.
+func probeReady(p *atomic.Pointer[func() bool]) bool {
+	fn := p.Load()
+	return fn != nil && *fn != nil && (*fn)()
 }
 
 func withoutCapability(caps []string, drop string) []string {
@@ -1336,30 +1345,45 @@ type serverGate interface {
 }
 
 // SetGate injects the split-brain safety gate.
-func (s *Server) SetGate(g serverGate) { s.gate = g }
+func (s *Server) SetGate(g serverGate) { s.lateGate.Store(&gateHolder{g: g}) }
+
+// gateHolder lets an interface value, nil included, live behind an atomic.Pointer.
+type gateHolder struct{ g serverGate }
+
+// gateV is the gate every reader consults: what SetGate last stored, else the
+// construction-time field. SetGate is called on a running server (the
+// replicator reads the gate through DeclaredCapabilities), so it cannot write
+// the plain field.
+func (s *Server) gateV() serverGate {
+	if h := s.lateGate.Load(); h != nil {
+		return h.g
+	}
+	return s.gate
+}
 
 // SetEnforcementConfig records the split-brain-family kill-switch flags so the HA
 // monitor drives/gates the right tokens. Wired once from config.Enforcement.
 func (s *Server) SetEnforcementConfig(safeFence, lwwSkew, hlcLww, vipSelfDemote, vipProofReclaim, sharedStorageFence bool) {
-	s.enfSafeFence = safeFence
-	s.enfLWWSkew = lwwSkew
-	s.enfHLCLww = hlcLww
-	s.enfVIPSelfDemote = vipSelfDemote
-	s.enfVIPProofReclaim = vipProofReclaim
-	s.enfSharedStorageFence = sharedStorageFence
+	s.enfSafeFence.Store(safeFence)
+	s.enfLWWSkew.Store(lwwSkew)
+	s.enfHLCLww.Store(hlcLww)
+	s.enfVIPSelfDemote.Store(vipSelfDemote)
+	s.enfVIPProofReclaim.Store(vipProofReclaim)
+	s.enfSharedStorageFence.Store(sharedStorageFence)
 }
 
 // sharedStorageFenceActive reports whether this node ENFORCES the shared-storage
 // fence gate: the config kill-switch AND the cluster-wide latch. Mirrors the
 // family's `flag && Enforced` model (strictMTLSActive / forwardedIdentityActive).
 func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
-	return s.enfSharedStorageFence && s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1)
+	g := s.gateV()
+	return s.enfSharedStorageFence.Load() && g != nil && g.Enforced(ctx, capabilities.SharedStorageFenceV1)
 }
 
 // SetOperationProtocol sets this node's kill-switch for relying on the v41 F1
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
-func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol.Store(on) }
 
 // SetDefaultCPUMode sets the cpu_mode a create stamps onto a spec that did not
 // name one (`vm.default_cpu_mode`). Empty restores libvirt.DefaultCPUMode. An
@@ -1375,14 +1399,14 @@ func (s *Server) SetSparePCIeRootPorts(n int) { s.sparePCIeRootPortsCfg = n }
 // SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
 // enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node
 // changes nothing until every node has opted in and the token has latched.
-func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
+func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM.Store(on) }
 
 // SetNetBoxMirrorInventory sets this node's `netbox.mirror_inventory` opt-in
 // (see enfNetBoxMirror). Default false — NetBox is pure IPAM. It must be set
 // before StartNetBoxMirror, which declines outright on a node that has not
 // opted in, and it stays the reversible kill switch after netbox_mirror_v1 has
 // latched.
-func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
+func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror.Store(on) }
 
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
@@ -1429,13 +1453,14 @@ func (s *Server) SetNetBoxSite(name string) { s.netboxSite = name }
 // operation protocol: the config flag AND the cluster-wide latch. Same
 // `flag && Enforced` model as the rest of the family.
 func (s *Server) operationProtocolActive(ctx context.Context) bool {
-	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
+	g := s.gateV()
+	return s.enfOperationProtocol.Load() && g != nil && g.Enforced(ctx, capabilities.OperationProtocolV1)
 }
 
 // SetVMReplaceEnforce opts this node into the guarded VM-name replacement
 // (enforcement.vm_replace): it drives the latch via conditional advertisement and,
 // with the latch, permits `lv cutover`.
-func (s *Server) SetVMReplaceEnforce(on bool) { s.enfVMReplace = on }
+func (s *Server) SetVMReplaceEnforce(on bool) { s.enfVMReplace.Store(on) }
 
 // vmReplaceActive reports whether a cutover may run at all: the operation journal
 // must be active, this node must have opted in, and vm_replace_v1 must be
@@ -1456,7 +1481,8 @@ func (s *Server) vmReplaceActive(ctx context.Context) bool {
 	if !s.operationProtocolActive(ctx) {
 		return false
 	}
-	return s.enfVMReplace && s.gate != nil && s.gate.Enforced(ctx, capabilities.VMReplaceV1)
+	g := s.gateV()
+	return s.enfVMReplace.Load() && g != nil && g.Enforced(ctx, capabilities.VMReplaceV1)
 }
 
 // hardwareV2Latched reports whether the hardware_v2 source-of-truth cutover (VM
@@ -1471,7 +1497,8 @@ func (s *Server) hardwareV2Latched(ctx context.Context) bool {
 	if !s.operationProtocolActive(ctx) {
 		return false
 	}
-	return s.gate != nil && s.gate.Enforced(ctx, capabilities.HardwareV2)
+	g := s.gateV()
+	return g != nil && g.Enforced(ctx, capabilities.HardwareV2)
 }
 
 // hardwareV2Ready reports whether this node may ADVERTISE hardware_v2 (CONTRACT h):
@@ -1488,14 +1515,15 @@ func (s *Server) hardwareV2Ready() bool {
 	if !s.hwV2Ready.Load() {
 		return false
 	}
-	if !s.enfOperationProtocol {
+	if !s.enfOperationProtocol.Load() {
 		return false
 	}
-	return s.gate != nil && s.gate.Latched(capabilities.OperationProtocolV1)
+	g := s.gateV()
+	return g != nil && g.Latched(capabilities.OperationProtocolV1)
 }
 
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
-func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
+func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 
 // SetAllowUnencryptedStorageMigration sets migration.allow_unencrypted_storage:
 // whether this node, as a migration source, may send a storage copy in
@@ -1530,12 +1558,12 @@ func (s *Server) migrationTLSReady() bool {
 // SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
 // resolution (enforcement.canonical_identity). Enforcement is this flag AND the
 // CanonicalIdentityV1 cluster-wide latch; advertisement is withheld while it is off.
-func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity = on }
+func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity.Store(on) }
 
 // SetProjectAuthorityEnforce sets this node's kill-switch for delegated project-quota
 // admission (enforcement.project_authority). Enforcement is this flag AND the
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
-func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
+func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority.Store(on) }
 
 // SetCommitFenceHook installs a TEST-ONLY hook run immediately before a commit
 // fence (reservationLease.allowCommit) is evaluated on a long-running operation
@@ -1564,42 +1592,44 @@ func (s *Server) fireCommitFenceHook(op string) {
 // logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing
 // an unsignable audit write additionally requires the AuditSignatureV1 latch, and
 // advertisement is withheld while the flag is off.
-func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
+func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature.Store(on) }
 
 // SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
-func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch.Store(on) }
 
 // SetLeaseTermEnforce wires the Phase 2 config flag (enforcement.lease_term).
 // It is both the opt-in that lets the fleet latch and the reversible kill
 // switch afterwards — see capabilities.LeaseTermV1.
-func (s *Server) SetLeaseTermEnforce(on bool) { s.enfLeaseTerm = on }
+func (s *Server) SetLeaseTermEnforce(on bool) { s.enfLeaseTerm.Store(on) }
 
 // SetLeaseTermReady wires the readiness probe consulted before advertising
 // lease_term_v1 (nil = never ready).
-func (s *Server) SetLeaseTermReady(fn func() bool) { s.leaseTermReady = fn }
+func (s *Server) SetLeaseTermReady(fn func() bool) { s.leaseTermReady.Store(&fn) }
 
 // leaseTermEnforced reports whether this node refuses proofs on their lease
 // term: the config flag AND the cluster-wide latch, the same model as the rest
 // of the family. The flag is the way back out of a latched cluster that has
 // since shrunk below leaseTermMinVotingHosts.
 func (s *Server) leaseTermEnforced(ctx context.Context) bool {
-	return s.enfLeaseTerm && s.gate != nil && s.gate.Enforced(ctx, capabilities.LeaseTermV1)
+	g := s.gateV()
+	return s.enfLeaseTerm.Load() && g != nil && g.Enforced(ctx, capabilities.LeaseTermV1)
 }
 
 // SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
 // it on and the token latched, this node refuses replication from a host the
 // cluster recorded as isolated.
-func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch = on }
+func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch.Store(on) }
 
 // SetOwnerEpochReady wires the readiness probe consulted before advertising
 // owner_epoch_v1 (nil = never ready).
-func (s *Server) SetOwnerEpochReady(fn func() bool) { s.ownerEpochReady = fn }
+func (s *Server) SetOwnerEpochReady(fn func() bool) { s.ownerEpochReady.Store(&fn) }
 
 // projectAuthorityActive reports whether this node routes project-quota admissions
 // through the project's authority holder: the config flag AND the cluster-wide latch.
 // Same `flag && Enforced` model as the rest of the family.
 func (s *Server) projectAuthorityActive(ctx context.Context) bool {
-	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
+	g := s.gateV()
+	return s.enfProjectAuthority.Load() && g != nil && g.Enforced(ctx, capabilities.ProjectAuthorityV1)
 }
 
 // The audit-signature latch is consulted on the corrosion client (see
@@ -1611,7 +1641,8 @@ func (s *Server) projectAuthorityActive(ctx context.Context) bool {
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
 func (s *Server) liveResizeActive(ctx context.Context) bool {
-	return s.enfLiveResize && s.gate != nil && s.gate.Enforced(ctx, capabilities.LiveResizeV1)
+	g := s.gateV()
+	return s.enfLiveResize.Load() && g != nil && g.Enforced(ctx, capabilities.LiveResizeV1)
 }
 
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
@@ -1630,37 +1661,37 @@ func (s *Server) tokenEnabled(token string) bool {
 	}
 	switch token {
 	case capabilities.SafeFenceDefaultV1:
-		return s.enfSafeFence
+		return s.enfSafeFence.Load()
 	case capabilities.LWWSkewGuardV1:
-		return s.enfLWWSkew
+		return s.enfLWWSkew.Load()
 	case capabilities.HLCLwwV1:
-		return s.enfHLCLww
+		return s.enfHLCLww.Load()
 	case capabilities.VIPDemoteV1:
-		return s.enfVIPSelfDemote
+		return s.enfVIPSelfDemote.Load()
 	case capabilities.VIPReleaseProbeV1:
-		return s.enfVIPProofReclaim
+		return s.enfVIPProofReclaim.Load()
 	case capabilities.StrictMTLSIdentityV1:
-		return s.strictMTLSIdentity
+		return s.strictMTLSIdentity.Load()
 	case capabilities.ForwardedIdentityV1:
-		return s.forwardedIdentity
+		return s.forwardedIdentity.Load()
 	case capabilities.SharedStorageFenceV1:
-		return s.enfSharedStorageFence
+		return s.enfSharedStorageFence.Load()
 	case capabilities.RBACRealmV1:
-		return s.rbacRealm
+		return s.rbacRealm.Load()
 	case capabilities.OperationProtocolV1:
-		return s.enfOperationProtocol
+		return s.enfOperationProtocol.Load()
 	case capabilities.CapacityAdmissionV1:
-		return s.enfOperationProtocol
+		return s.enfOperationProtocol.Load()
 	case capabilities.LiveResizeV1:
-		return s.enfLiveResize
+		return s.enfLiveResize.Load()
 	case capabilities.CanonicalIdentityV1:
-		return s.enfCanonicalIdentity
+		return s.enfCanonicalIdentity.Load()
 	case capabilities.ProjectAuthorityV1:
-		return s.enfProjectAuthority
+		return s.enfProjectAuthority.Load()
 	case capabilities.AuditSignatureV1:
-		return s.enfAuditSignature
+		return s.enfAuditSignature.Load()
 	case capabilities.OwnerEpochV1:
-		return s.enfOwnerEpoch
+		return s.enfOwnerEpoch.Load()
 	case capabilities.CredentialsSplitV1:
 		// No kill switch, for the lease_term_ledger_v1 reason: the token says
 		// this build decodes the credential tables' shapes and reads a secret
@@ -1696,19 +1727,19 @@ func (s *Server) tokenEnabled(token string) bool {
 		// electing the same set.
 		return true
 	case capabilities.LeaseTermV1:
-		return s.enfLeaseTerm
+		return s.enfLeaseTerm.Load()
 	case capabilities.RecoveryClaimV1:
-		return s.enfRecoveryClaim
+		return s.enfRecoveryClaim.Load()
 	case capabilities.PartitionPauseV1:
 		return s.enfPartitionPause.Load()
 	case capabilities.IsolationEpochV1:
-		return s.enfIsolationEpoch
+		return s.enfIsolationEpoch.Load()
 	case capabilities.NetBoxIPAMV1:
-		return s.enfNetBoxIPAM
+		return s.enfNetBoxIPAM.Load()
 	case capabilities.NetBoxMirrorV1:
-		return s.enfNetBoxMirror
+		return s.enfNetBoxMirror.Load()
 	case capabilities.VMReplaceV1:
-		return s.enfVMReplace
+		return s.enfVMReplace.Load()
 	default:
 		return false
 	}
@@ -1851,10 +1882,11 @@ func (s *Server) noteLeaseBarrierIncomplete(key string, answered, peers int) {
 // (split_brain_gate_v1 present on every enforcement-relevant member). Fail-open
 // (false) until then. Recomputed per call.
 func (s *Server) gateActive(ctx context.Context) bool {
-	if s.gate == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return false
 	}
-	return s.gate.Enforced(ctx, capabilities.SplitBrainGateV1)
+	return gate.Enforced(ctx, capabilities.SplitBrainGateV1)
 }
 
 // selfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
@@ -1887,7 +1919,8 @@ func (s *Server) execGateWith(ctx context.Context, markerPresent bool, local fun
 	if s.selfFenced() {
 		return health.ReasonSelfFenced, true
 	}
-	if s.gate == nil {
+	gt := s.gateV()
+	if gt == nil {
 		// A carried proof MARKER with no gate to verify quorum fails CLOSED — we
 		// cannot confirm this host has quorum, and a proof implies enforcement was
 		// active somewhere. Only a truly markerless legacy action proceeds ungated.
@@ -1896,10 +1929,10 @@ func (s *Server) execGateWith(ctx context.Context, markerPresent bool, local fun
 		}
 		return "", false
 	}
-	if !markerPresent && !s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+	if !markerPresent && !gt.Enforced(ctx, capabilities.SplitBrainGateV1) {
 		return "", false
 	}
-	if g := local(s.gate, ctx); !g.OK {
+	if g := local(gt, ctx); !g.OK {
 		return g.Reason, true
 	}
 	return "", false
@@ -1942,13 +1975,14 @@ func (s *Server) decideGateRefused(ctx context.Context) (reason string, refused 
 	if s.selfFenced() {
 		return health.ReasonSelfFenced, true
 	}
-	if s.gate == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return "", false
 	}
-	if !s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+	if !gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
 		return "", false
 	}
-	if g := s.gate.DecisionGate(ctx); !g.OK {
+	if g := gate.DecisionGate(ctx); !g.OK {
 		return g.Reason, true
 	}
 	return "", false
@@ -1960,7 +1994,8 @@ func (s *Server) decideGateRefused(ctx context.Context) (reason string, refused 
 // — proceeding would strand the action or silently drop it to the legacy path on
 // the dest, both defeating the gate. Fail closed: unconfirmed support → false.
 func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
-	if s.gate == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return false
 	}
 	if dest == s.hostName {
@@ -1970,7 +2005,7 @@ func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
 		// proof, matching what peers see.
 		return capabilities.Has(s.advertisedCapabilities(), capabilities.SplitBrainGateV1)
 	}
-	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
+	return gate.PeerSupportsFresh(ctx, dest, capabilities.SplitBrainGateV1)
 }
 
 // destSupportsSharedStorageFence fresh-Pings dest to confirm it advertises
@@ -1978,13 +2013,14 @@ func (s *Server) destSupportsGate(ctx context.Context, dest string) bool {
 // proof-grade requirement the dest must honor on execute. Self-aware + fail
 // closed, mirroring destSupportsGate.
 func (s *Server) destSupportsSharedStorageFence(ctx context.Context, dest string) bool {
-	if s.gate == nil {
+	gate := s.gateV()
+	if gate == nil {
 		return false
 	}
 	if dest == s.hostName {
 		return capabilities.Has(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1)
 	}
-	return s.gate.PeerSupportsFresh(ctx, dest, capabilities.SharedStorageFenceV1)
+	return gate.PeerSupportsFresh(ctx, dest, capabilities.SharedStorageFenceV1)
 }
 
 // lbGateRefused is the markerless execute-gate at the LB-apply chokepoint.

@@ -44,14 +44,7 @@ func (s *Server) holdColdMoveStartLease(ctx context.Context, vmName string) (rel
 // cannot be read ("..., <notDone>: <err>"). With takeOverStale, a lease
 // whose holder is not live (staleStartLease) is taken over instead.
 func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, retry string, takeOverStale bool) (release func(), err error) {
-	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
-	if err == nil && heldBy != holder && takeOverStale {
-		if why := s.staleStartLease(ctx, vmName, heldBy); why != "" {
-			slog.Warn("taking over a stale start lease", "vm", vmName, "held_by", heldBy, "why", why, "holder", holder)
-			health.ReleaseVMStartLease(ctx, s.db, heldBy, vmName)
-			heldBy, err = health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
-		}
-	}
+	heldBy, err := s.takeStartLease(ctx, holder, vmName, takeOverStale)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable,
 			"cannot take the start lease of VM %q, %s: %v", vmName, notDone, err)
@@ -60,6 +53,28 @@ func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, re
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"VM %q is being started on this cluster (its start lease is held by %s); %s once that is done", vmName, heldBy, retry)
 	}
+	return s.keepStartLease(ctx, holder, vmName), nil
+}
+
+// takeStartLease makes one attempt at the VM's start lease for holder and
+// returns the holder the lease names afterwards: holder itself when it was
+// taken. With takeOverStale, a lease whose holder is not live
+// (staleStartLease) is taken over first.
+func (s *Server) takeStartLease(ctx context.Context, holder, vmName string, takeOverStale bool) (string, error) {
+	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
+	if err == nil && heldBy != holder && takeOverStale {
+		if why := s.staleStartLease(ctx, vmName, heldBy); why != "" {
+			slog.Warn("taking over a stale start lease", "vm", vmName, "held_by", heldBy, "why", why, "holder", holder)
+			health.ReleaseVMStartLease(ctx, s.db, heldBy, vmName)
+			heldBy, err = health.TryVMStartLease(ctx, s.db, holder, vmName, time.Now())
+		}
+	}
+	return heldBy, err
+}
+
+// keepStartLease keeps a start lease holder has just taken, renewed, until
+// the returned release is called, which frees it.
+func (s *Server) keepStartLease(ctx context.Context, holder, vmName string) (release func()) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -88,7 +103,7 @@ func (s *Server) holdStartLease(ctx context.Context, holder, vmName, notDone, re
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		health.ReleaseVMStartLease(rctx, s.db, holder, vmName)
-	}, nil
+	}
 }
 
 // staleStartLease says why the VM's start lease held by heldBy has no live

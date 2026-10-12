@@ -212,6 +212,23 @@ fails, the `vm.delete` audit entry has result `error`, and a retry is safe. The
 record is the only thing in the cluster that names the domain, so it is never
 dropped while the domain may still exist.
 
+**Delete holds the start lease.** From before it touches the domain until its
+record is gone, `lv rm` holds the VM's start lease on the host that carries it
+out, so the reconciler cannot read the stopped, undefined domain of a VM still
+recorded `running` as a crashed guest and start it again mid-delete. A delete
+that meets a start already holding the lease (the reconciler bringing the VM
+back, a restart policy, a failover) waits for it, up to 60 seconds, then goes
+ahead. If the lease is still held after that, the delete fails `Aborted`
+before anything is touched, naming the holder; a stack teardown retries it,
+and a retry by hand is safe. A lease with no live holder behind it is taken
+over, as a snapshot restore does.
+
+A daemon that crashes midway through a delete leaves the delete's lease
+behind. Until the delete is retried, or the lease expires after 10 minutes,
+nothing restarts the VM: the reconciler and the restart policy do not take a
+lease over. A retried `lv rm` runs on the same host and is the same holder, so
+it takes the lease back at once and completes the delete.
+
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
 live migration to a host with an equal-or-richer CPU. It matters because the

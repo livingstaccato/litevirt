@@ -204,6 +204,11 @@ type Fake struct {
 	FailDestroyDomain   func(name string) error
 	FailUndefineDomain  func(name string, removeStorage bool) error
 	FailUndefinePreserv func(name string) error
+	// OnUndefined runs after an undefine of name has taken effect (either
+	// flavour), outside the fake's lock, so a scenario can run another
+	// component in the window between a teardown's undefine and its later
+	// steps — e.g. the reconciler racing a DeleteVM (lab 2 run c713, N-2).
+	OnUndefined func(name string)
 	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
 	// fail-closed path that must NOT proceed when the live membership is unreadable
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
@@ -771,6 +776,11 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.managed, name)
 	delete(f.managedInc, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
+	if hook := f.OnUndefined; hook != nil {
+		f.mu.Unlock()
+		hook(name)
+		f.mu.Lock()
+	}
 	return nil
 }
 
@@ -805,6 +815,11 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
 	f.record("undefine", name, "keep_state=true")
+	if hook := f.OnUndefined; hook != nil {
+		f.mu.Unlock()
+		hook(name)
+		f.mu.Lock()
+	}
 	return nil
 }
 

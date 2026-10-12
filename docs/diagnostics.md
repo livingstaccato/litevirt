@@ -1918,6 +1918,27 @@ deleted VM's name and litevirt's disk paths. What stays unrecognised:
 A copy of a litevirt domain's XML (`virsh dumpxml` then `virsh define` under
 another name) carries its stamps with it. It is reported like the original.
 
+**A start that outlived its record.** The reconciler re-reads a VM's record
+right before it boots the domain, and boots nothing when the record is gone,
+was deleted and created again (another `created_at`), or names another host;
+the definition it made in that pass is undefined again, firmware state kept. A
+record can still be deleted while the boot itself runs (a delete replicated
+from another host, or one run by an older binary, which does not hold the
+start lease). Then the reconciler stops the guest it booted a moment ago, and
+gives back the passthrough devices its hardware pre-start claimed. A domain
+with no disks is undefined as well. One with disks is kept, shut off, with the
+managed stamp, so it is reported here (info severity) for the procedure below;
+its disks are never touched. Before this, such a guest ran with no stamp and
+no record, and nothing reported it.
+
+The UEFI vars file is name-keyed (`<data_dir>/nvram/<vm>_VARS.fd`), and a
+create of a Secure Boot or vTPM VM under the name is refused while it exists.
+When the reconciler removes a disk-less domain like this, it also removes the
+vars file if that boot created it (no file before the define, and no record of
+the name left). Vars that were there before are kept, and the log line names
+the file. A `delete --keep-disks` keeps them on purpose. If no kept VM of that
+name needs them, remove the file by hand before you create the name again.
+
 | Raised when | Clears when |
 |---|---|
 | Two consecutive reconcile passes (15 s apart) see a recognised runtime whose name has no live row: `row` is `missing` (no row at all) or `tombstoned`. A single sighting is never reported, because a delete in flight removes the runtime a moment before or after its tombstone lands. **Warning** severity while the runtime is running, **info** otherwise. The evidence carries `runtime_state`, `marker_epoch`, `row`, and for a tombstone the `row_host`, `row_owner_epoch` and `row_deleted_at` it last had. | The first pass that no longer sees it: the runtime is gone, or its name has a live row again. |

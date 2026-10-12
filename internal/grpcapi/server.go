@@ -752,6 +752,10 @@ type Server struct {
 	// once the handoff has committed, before it touches the source
 	// (SetColdMoveAfterHandoffForTest). Nil in production.
 	coldMoveAfterHandoff func(vm string)
+	// deleteLeaseWait is a TEST SEAM for how long a delete waits for a start
+	// lease another holder has (SetDeleteLeaseWaitForTest). Zero in
+	// production means deleteLeaseWaitDefault.
+	deleteLeaseWait time.Duration
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)

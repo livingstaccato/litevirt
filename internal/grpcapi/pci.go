@@ -875,7 +875,16 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 		if uerr := s.vfioHost().Unbind(d.Address, d.Driver); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", d.Address, uerr))
 		} else {
-			slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
+			// The inventory's Driver is what the last scan saw, which after a rescan
+			// of a bound device is "vfio-pci", not where the release put it. Log the
+			// driver the device is on now.
+			final, ferr := vfio.CurrentDriver(d.Address)
+			if ferr != nil {
+				final = "unknown: " + ferr.Error()
+			} else if final == "" {
+				final = "none"
+			}
+			slog.Info("device unbound from vfio-pci", "address", d.Address, "driver", final)
 		}
 	}
 

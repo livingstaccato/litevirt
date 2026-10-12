@@ -745,6 +745,12 @@ func currentDriver(devPath string) (string, error) {
 	return filepath.Base(link), nil
 }
 
+// CurrentDriver returns the driver the PCI device at address is bound to now,
+// "" when none is.
+func CurrentDriver(address string) (string, error) {
+	return currentDriver(filepath.Join(sysDevices, address))
+}
+
 // IsBoundToVFIO reports whether the PCI device at address is CURRENTLY bound to the
 // vfio-pci driver, read from the device's driver symlink. This is the GROUND-TRUTH
 // "is this device claimed by vfio right now" signal — as opposed to inferring

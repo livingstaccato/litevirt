@@ -163,7 +163,7 @@ func (l *lab) probe(host, name, family, hook string, priority int, match string)
 //   - C2: a guest whose egress is denied cannot reach a routed UDP/67 by
 //     using DHCP's ports;
 //   - C3: a tagged frame from an UNGUARDED guest is dropped (and passes once
-//     the NIC is allowed tags);
+//     the NIC and every other NIC on its bridge are allowed tags);
 //   - I2: a trunk NIC is guarded like any other new NIC and carries only the
 //     VLANs its network allows (`lv network set --allowed-vlans`);
 //   - C4: a guarded guest on a DHCP network cannot use a neighbour's address
@@ -394,14 +394,36 @@ vms:
 		if n := count(); n != 0 {
 			t.Errorf("%d tagged frames from an unguarded NIC got past the VLAN rule", n)
 		}
-		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "off", "--allow-vlan-tags")
+		// Positive control. Allowing a to send tags is not enough: a tagged
+		// frame is flooded to the bridge's other ports, and the forward chain
+		// drops it to every guest NIC that was not itself allowed tags (I1),
+		// before this probe at forward priority 100 can count it. So every
+		// other NIC on the bridge is allowed tags too, and the frame goes end to
+		// end.
+		others := []string{"b", "c", "d", "e", "t"}
+		// Restored however this ends, so a failure partway through the loop
+		// below cannot leave b..t allowed tags for I1. `set` replaces the whole
+		// guard, so `--mode on` is the default guard again; this fixture has
+		// no other relaxation to lose.
+		defer func() {
+			for _, n := range append([]string{"a"}, others...) {
+				_, _ = l.lv(host, "firewall", "nic-guard", "set", names[n], "--network", netName, "--mode", "on")
+			}
+			_, _ = l.lv(host, "firewall", "reload")
+		}()
+		for _, n := range append([]string{"a"}, others...) {
+			mode := "on"
+			if n == "a" {
+				mode = "off"
+			}
+			l.mustLV(host, "firewall", "nic-guard", "set", names[n], "--network", netName, "--mode", mode, "--allow-vlan-tags")
+		}
 		l.mustLV(host, "firewall", "reload")
 		try("a", "ping -c 3 -W 1 10.215.0.2; true")
 		if count() == 0 {
-			t.Error("tagged frames from a trunk NIC were dropped too; the zero above proves nothing")
+			t.Error("tagged frames from a NIC allowed tags were dropped too (every other NIC on the bridge is allowed them as well); the zero above proves nothing")
 		}
 		try("a", "sudo ip link del eth0.10; true")
-		l.mustLV(host, "firewall", "nic-guard", "set", names["a"], "--network", netName, "--mode", "on")
 	})
 	t.Run("SpoofedSourceIsDropped", func(t *testing.T) {
 		const spoof = "10.206.0.199"

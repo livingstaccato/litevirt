@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,21 @@ func envOr(key, fallback string) string {
 // ─── Test harness ───────────────────────────────────────────────────────────
 
 func TestMain(m *testing.M) {
+	// Pure helper tests (no cluster, no lv) opt in separately, and only when
+	// -test.run names nothing but them: unit mode must never let a
+	// cluster-touching test run without LITEVIRT_E2E=1 and LV_BIN.
+	if os.Getenv("LITEVIRT_E2E_UNIT") == "1" {
+		flag.Parse() // -test.run is not set until the flags are parsed
+		run := ""
+		if f := flag.Lookup("test.run"); f != nil {
+			run = f.Value.String()
+		}
+		if !unitRunAllowed(run) {
+			fmt.Fprintf(os.Stderr, "E2E: LITEVIRT_E2E_UNIT=1 runs only %v; set -test.run to %s (got %q)\n", pureTests, "^("+strings.Join(pureTests, "|")+")$", run)
+			os.Exit(1)
+		}
+		os.Exit(m.Run())
+	}
 	// Live e2e is OPT-IN. It mutates a real cluster and runs the CLI against
 	// whatever `lv` resolves, so a plain `go test ./...` must never accidentally
 	// touch a stale system `lv`. Require an explicit LITEVIRT_E2E=1, and once
@@ -1772,6 +1788,16 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		"--host", hostNames[0])
 	waitVM(t, vmName, "RUNNING", 2*time.Minute)
 
+	// `lv run --name ... --image ...` makes a VM with no NIC at all, so the VM
+	// starts with none and the NIC this test attaches is the only one. Record
+	// the MACs before, so the assertion is on the one the attach added whatever
+	// the VM started with.
+	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
+	before := map[string]bool{}
+	for _, m := range macRe.FindAllString(lv(t, "inspect", vmName), -1) {
+		before[m] = true
+	}
+
 	lv(t, "attach-nic", vmName, netName)
 
 	out := lv(t, "inspect", vmName)
@@ -1779,16 +1805,23 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		t.Error("attached NIC not in inspect output")
 	}
 
-	// Detach by MAC. This used to run only `if len(macs) >= 2`, which meant a run
-	// that parsed fewer MACs skipped the detach and still passed — the half of
-	// this test with the actual risk in it, silently opted out of. If the MACs
-	// can't be found the attach assertion above was already wrong, so fail.
-	macRe := regexp.MustCompile(`52:54:00:[0-9a-f:]+`)
-	macs := macRe.FindAllString(out, -1)
-	if len(macs) < 2 {
-		t.Fatalf("expected at least 2 MACs in inspect after attaching a NIC, found %d (%v)", len(macs), macs)
+	// Detach by the MAC the attach added. If it cannot be found the attach
+	// assertion above was already wrong, so fail rather than skip the half of
+	// this test with the actual risk in it.
+	var added string
+	for _, m := range macRe.FindAllString(out, -1) {
+		if !before[m] {
+			added = m
+		}
 	}
-	lv(t, "detach-nic", vmName, macs[len(macs)-1])
+	if added == "" {
+		t.Fatalf("no new MAC in inspect after attaching a NIC (before %v):\n%s", before, out)
+	}
+	lv(t, "detach-nic", vmName, added)
+	// The guest acks an unplug asynchronously, so poll rather than read once.
+	assertEventually(t, 30*time.Second, "detached NIC "+added+" gone from inspect", func() bool {
+		return !strings.Contains(lv(t, "inspect", vmName), added)
+	})
 
 	lv(t, "rm", vmName, "--force")
 	lv(t, "network", "rm", netName, "--force")
@@ -2424,12 +2457,20 @@ func assertEventually(t *testing.T, timeout time.Duration, desc string, fn func(
 // if SSH isn't available, so the test degrades gracefully off-cluster.
 func nftTable(t *testing.T, host string) (string, bool) {
 	t.Helper()
+	return nftTableOf(t, host, "inet", "litevirt-fw")
+}
+
+// nftTableOf dumps one nftables table of a cluster host (family and name as nft
+// takes them). Security-group rules render into the per-NIC `bridge
+// litevirt-nic` table; `inet litevirt-fw` holds the routed-traffic tiers.
+func nftTableOf(t *testing.T, host, family, name string) (string, bool) {
+	t.Helper()
 	// By address: cluster host names do not resolve on the nodes.
 	target := envOr("E2E_FW_SSH_"+strings.ReplaceAll(host, "-", "_"), sshTarget(host))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no",
-		target, "nft", "list", "table", "inet", "litevirt-fw")
+		target, "nft", "list", "table", family, name)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Logf("nft dump on %s unavailable (%v); skipping kernel-state assertions", host, err)
@@ -2447,6 +2488,7 @@ func nftTable(t *testing.T, host string) (string, bool) {
 // the rendered kernel ruleset (the same nft path that powers host-isolation),
 // backed by the renderer unit tests for packet-level behaviour.
 func TestFirewall(t *testing.T) {
+	ensureTopology(t)
 	requireImage(t)
 	if skipSlow {
 		t.Skip("E2E_SKIP_SLOW set, skipping firewall test")
@@ -2511,39 +2553,155 @@ vms:
 		}
 	})
 
-	// Kernel proof: the web SG must render into the host's nftables ruleset with
-	// the 8080 accept + DHCP accept + drop, in order, on the guarded VM's NIC
-	// chain — and the forward chain must appear exactly once (regression guard
-	// for the atomic-replace fix: a merge-not-replace bug duplicated it).
+	// Kernel proof: the web SG renders into the per-NIC bridge table
+	// (`bridge litevirt-nic`), as 8080 accept + DHCP accept + drop, in order, in
+	// the bound NIC's nic_in_<tap> chain; the other NIC's chain carries none of
+	// it. The inet table's forward chain must appear exactly once (regression
+	// guard for the atomic-replace fix: a merge-not-replace bug duplicated it).
 	t.Run("RenderedIntoKernel", func(t *testing.T) {
-		var table string
-		rendered := false
+		var nic, inet string
+		var chain string
 		deadline := time.Now().Add(2 * time.Minute) // tap discovery + 30s reconcile + margin
 		for time.Now().Before(deadline) {
-			tbl, ok := nftTable(t, host)
+			tbl, ok := nftTableOf(t, host, "bridge", "litevirt-nic")
 			if !ok {
 				t.Skip("nft inspection unavailable off-cluster")
 			}
-			table = tbl
-			if strings.Contains(tbl, "tcp dport 8080 accept") && strings.Contains(tbl, "udp dport 68 accept") {
-				rendered = true
+			nic = tbl
+			if chain = chainWith(nic, "nic_in_", "tcp dport 8080 accept"); chain != "" {
 				break
 			}
 			time.Sleep(5 * time.Second)
 		}
-		if !rendered {
-			t.Fatalf("web SG never rendered into nftables on %s within 2m:\n%s", host, table)
+		if chain == "" {
+			t.Fatalf("web SG never rendered into a nic_in_ chain of bridge litevirt-nic on %s within 2m:\n%s", host, nic)
 		}
-		// Exactly one forward hook — no duplication (atomic-replace regression guard).
-		if n := strings.Count(table, "hook forward"); n != 1 {
-			t.Errorf("forward chain appears %d times, want 1 (atomic-replace regression):\n%s", n, table)
+		if err := sgChainOrdered(chain); err != nil {
+			t.Errorf("%v:\n%s", err, chain)
 		}
-		// The drop rule must be present (the "block everything else" half).
-		if !strings.Contains(table, "drop") {
-			t.Errorf("web SG drop rule not rendered:\n%s", table)
+		// Scoped to the bound NIC: exactly one nic_in_ chain carries the rule.
+		if n := strings.Count(nic, "tcp dport 8080 accept"); n != 1 {
+			t.Errorf("tcp dport 8080 accept appears %d times in bridge litevirt-nic, want 1 (the unbound NIC must carry none):\n%s", n, nic)
 		}
-		t.Logf("litevirt-fw on %s rendered the web SG correctly (8080 accept + drop, single forward chain)", host)
+		inet, ok := nftTable(t, host)
+		if !ok {
+			t.Skip("nft inspection unavailable off-cluster")
+		}
+		if n := strings.Count(inet, "hook forward"); n != 1 {
+			t.Errorf("forward chain appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", n, inet)
+		}
+		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (8080 accept, DHCP accept, drop; single inet forward chain)", host)
 	})
+}
+
+// sgChainOrdered checks a nic_in_ chain of an nft listing carries the web SG as
+// three consecutive rules: tcp 8080 accept, udp 68 accept, and the SG's own
+// `proto all drop`. Rules in a NIC chain are scoped to the NIC, so they list as
+// `oifname "vnetX" tcp dport 8080 accept` and the drop as `oifname "vnetX" drop`.
+// The drop is matched by its tokens (the NIC match, then only the verdict), and
+// must be the rule right after the DHCP accept: a later drop, such as a cluster
+// default-deny, would not prove the SG's rendered.
+func sgChainOrdered(chain string) error {
+	var rules []string
+	for _, l := range strings.Split(chain, "\n") {
+		if l = strings.TrimSpace(l); l != "" && l != "}" && !strings.HasSuffix(l, "{") && !strings.HasPrefix(l, "type ") {
+			rules = append(rules, l)
+		}
+	}
+	for i, r := range rules {
+		if !strings.HasSuffix(r, "tcp dport 8080 accept") {
+			continue
+		}
+		if i+2 >= len(rules) || !strings.HasSuffix(rules[i+1], "udp dport 68 accept") {
+			return fmt.Errorf("the SG's 8080 accept is not followed by its DHCP accept")
+		}
+		f := strings.Fields(rules[i+2])
+		if len(f) < 2 || f[0] != "oifname" || f[len(f)-1] != "drop" || strings.ContainsAny(rules[i+2], "{}") ||
+			strings.Contains(rules[i+2], "dport") || strings.Contains(rules[i+2], "saddr") || strings.Contains(rules[i+2], "daddr") {
+			return fmt.Errorf("the SG's drop does not follow its DHCP accept (next rule: %q)", rules[i+2])
+		}
+		return nil
+	}
+	return fmt.Errorf("no tcp dport 8080 accept rule")
+}
+
+// pureTests are the tests that touch no cluster and no lv, and so are the only
+// ones LITEVIRT_E2E_UNIT=1 may run.
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed"}
+
+// unitRunAllowed reports whether a -test.run pattern selects only pureTests:
+// the exact form ^(A|B)$ or ^A$, with every name pure.
+func unitRunAllowed(run string) bool {
+	if !strings.HasPrefix(run, "^") || !strings.HasSuffix(run, "$") {
+		return false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(run, "^"), "$")
+	body = strings.TrimSuffix(strings.TrimPrefix(body, "("), ")")
+	for _, n := range strings.Split(body, "|") {
+		ok := false
+		for _, p := range pureTests {
+			ok = ok || n == p
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// TestUnitRunAllowed proves unit mode cannot select a cluster test.
+func TestUnitRunAllowed(t *testing.T) {
+	for run, want := range map[string]bool{
+		"^TestSGChainOrdered$":                      true,
+		"^(TestSGChainOrdered|TestUnitRunAllowed)$": true,
+		"":                                    false,
+		".":                                   false,
+		"TestSGChainOrdered":                  false,
+		"^TestSGChainOrdered|TestFirewall$":   false,
+		"^(TestSGChainOrdered|TestFirewall)$": false,
+		"^TestFirewall$":                      false,
+		"^(TestSGChainOrdered|)$":             false,
+		"^TestSGChainOrdered$|TestVM_AttachDetachNIC": false,
+	} {
+		if got := unitRunAllowed(run); got != want {
+			t.Errorf("unitRunAllowed(%q) = %v, want %v", run, got, want)
+		}
+	}
+}
+
+// TestSGChainOrdered pins sgChainOrdered against a chain as nft lists one.
+// Run it with LITEVIRT_E2E_UNIT=1 -test.run '^TestSGChainOrdered$' (it needs no cluster).
+func TestSGChainOrdered(t *testing.T) {
+	const good = `	chain nic_in_vnet3 {
+		oifname "vnet3" tcp dport 8080 accept
+		oifname "vnet3" udp dport 68 accept
+		oifname "vnet3" drop
+	}`
+	if err := sgChainOrdered(good); err != nil {
+		t.Errorf("a correct chain was refused: %v", err)
+	}
+	for name, bad := range map[string]string{
+		"drop missing, a later default-deny drop": "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 22 accept\ndrop\n",
+		"drop missing":            "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\n",
+		"drop before the accepts": "oifname \"vnet3\" drop\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\n",
+		"accepts out of order":    "oifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" drop\n",
+		"verdict is not a drop":   "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" accept\n",
+	} {
+		if err := sgChainOrdered(bad); err == nil {
+			t.Errorf("%s: an incorrect chain was accepted", name)
+		}
+	}
+}
+
+// chainWith returns the body of the first chain of an nft table dump whose name
+// starts with prefix and whose body contains needle, or "".
+func chainWith(table, prefix, needle string) string {
+	for _, part := range strings.Split(table, "\tchain ")[1:] {
+		if strings.HasPrefix(part, prefix) && strings.Contains(part, needle) {
+			return part
+		}
+	}
+	return ""
 }
 
 // TestFirewallManagementCLI exercises the cluster/host/ipset/default-deny
@@ -2551,6 +2709,9 @@ vms:
 // It uses only accept rules on unused ports and never flips the cluster default
 // to deny, so it cannot disrupt any running workload.
 func TestFirewallManagementCLI(t *testing.T) {
+	// Not every test calls this first: run alone, hostNames is empty and the
+	// host-rule subtest indexes it.
+	ensureTopology(t)
 	t.Run("ClusterRule", func(t *testing.T) {
 		out := lv(t, "firewall", "cluster-rule", "add", "--direction", "ingress",
 			"--proto", "tcp", "--port", "59443", "--action", "accept", "--comment", "e2e-cluster")

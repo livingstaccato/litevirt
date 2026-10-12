@@ -169,3 +169,97 @@ func TestCorrosionPlanLoader_TrunkVLANsTheNetworkAllows(t *testing.T) {
 		t.Errorf("blocked = %+v, want %+v", plan.BlockedTrunks, want)
 	}
 }
+
+// TestRender_AllowTagsGuardHoldsTaggedFramesToTheMAC: a guarded NIC allowed
+// tags with --allow-vlan-tags (not a trunk) is held like a trunk. Its tagged
+// frames are checked for what is knowable — the source MAC, its own MAC in ARP
+// and neighbour discovery, no DHCP-server or router role — and then leave the
+// chain: the addresses it uses inside a VLAN are not litevirt's to know, so the
+// native-VLAN address guards must not judge a tagged frame's inner source (they
+// dropped tagged IPv4 on any other subnet) and tagged ARP must not pass
+// unchecked. Both tag types leave: the table-wide rule lets an 802.1ad outer tag
+// through to this NIC too.
+func TestRender_AllowTagsGuardHoldsTaggedFramesToTheMAC(t *testing.T) {
+	p := guardedPlan(&NICGuard{MAC: "52:54:00:aa:bb:cc", V4: []string{"10.0.0.5"}})
+	p.NICs[0].AllowVLANTags = true
+	g := chainBody(t, nicPart(t, p), "guard_vnet3")
+	ret := strings.Index(g, "vlan id != 0 return")
+	if ret < 0 {
+		t.Fatalf("no native-VLAN boundary in an allow-vlan-tags guard:\n%s", g)
+	}
+	for _, every := range []string{
+		"ether saddr != 52:54:00:aa:bb:cc drop",
+		"meta protocol arp @nh,64,48 != 0x525400aabbcc drop",
+		"meta l4proto udp th sport 67 drop",
+		"meta l4proto udp th dport 68 drop",
+		"icmpv6 type { nd-router-advert, nd-redirect } drop",
+		"ether type 8021ad drop",
+		"meta protocol { 8021q, 8021ad } drop",
+	} {
+		if i := strings.Index(g, every); i < 0 || i > ret {
+			t.Errorf("%q must hold tagged frames too (before the boundary):\n%s", every, g)
+		}
+	}
+	for _, native := range []string{"ip saddr != { 10.0.0.5 } drop", "arp saddr ip != {"} {
+		if i := strings.Index(g, native); i < ret {
+			t.Errorf("%q must hold the native VLAN only:\n%s", native, g)
+		}
+	}
+	if strings.Contains(g, "ether type { 8021q, 8021ad } drop") {
+		t.Errorf("an allow-vlan-tags guard drops its own tags:\n%s", g)
+	}
+}
+
+// TestRender_NoTagsGuardStillDropsTags pins the other side: without the
+// allowance a guarded NIC still drops tagged frames and has no boundary.
+func TestRender_NoTagsGuardStillDropsTags(t *testing.T) {
+	g := chainBody(t, nicPart(t, guardedPlan(&NICGuard{MAC: "52:54:00:aa:bb:cc"})), "guard_vnet3")
+	mustContainAll(t, g, "ether type { 8021q, 8021ad } drop")
+	if strings.Contains(g, "return") {
+		t.Errorf("a plain guard has a native-VLAN boundary:\n%s", g)
+	}
+}
+
+// TestRender_AllowTagsGuardDropsDoubleTags: a guarded allow-vlan-tags NIC may
+// not send a doubled tag (an 802.1ad outer tag, or an 802.1Q tag inside one):
+// after the outer tag the kernel's protocol is 0x8100 and no raw ARP, DHCP, RA
+// or ND check can find its header, so the frame is dropped before the boundary
+// rather than waved through unchecked.
+func TestRender_AllowTagsGuardDropsDoubleTags(t *testing.T) {
+	p := guardedPlan(&NICGuard{MAC: "52:54:00:aa:bb:cc"})
+	p.NICs[0].AllowVLANTags = true
+	g := chainBody(t, nicPart(t, p), "guard_vnet3")
+	ret := strings.Index(g, "vlan id != 0 return")
+	for _, drop := range []string{"ether type 8021ad drop", "meta protocol { 8021q, 8021ad } drop"} {
+		if i := strings.Index(g, drop); i < 0 || ret < 0 || i > ret {
+			t.Errorf("%q must come before the boundary:\n%s", drop, g)
+		}
+	}
+}
+
+// TestRender_AllowTagsGuardTreatsVID0AsNative: a priority-tagged (VID 0) frame
+// is native-VLAN traffic — the receive path and a vlan_filtering bridge treat
+// it as untagged — so it must not leave the chain at the tagged boundary. It
+// falls through to the native IPv4 and IPv6 guards, and its ARP sender address
+// (which nft's arp expression cannot read inside a tag) is held by a raw match.
+func TestRender_AllowTagsGuardTreatsVID0AsNative(t *testing.T) {
+	p := guardedPlan(&NICGuard{MAC: "52:54:00:aa:bb:cc", V4: []string{"10.0.0.5", "10.0.2.0/24"}, ExcludeV4: []string{"10.0.0.99"}})
+	p.NICs[0].AllowVLANTags = true
+	g := chainBody(t, nicPart(t, p), "guard_vnet3")
+	ret := strings.Index(g, "vlan id != 0 return")
+	if ret < 0 {
+		t.Fatalf("the boundary must skip VID 0:\n%s", g)
+	}
+	if strings.Contains(g, "ether type { 8021q, 8021ad } return") || strings.Contains(g, "ether type 8021q return") {
+		t.Errorf("a boundary that returns VID 0 too lets a priority-tagged frame past the address guards:\n%s", g)
+	}
+	for _, want := range []string{
+		"vlan id 0 meta protocol arp @nh,112,32 { 0x0a000063 } drop",
+		"vlan id 0 meta protocol arp @nh,112,32 != { 0x00000000, 0x0a000005, 0x0a000200-0x0a0002ff } drop",
+		"ip saddr != { 10.0.0.5, 10.0.2.0/24 } drop",
+	} {
+		if i := strings.Index(g, want); i < ret {
+			t.Errorf("%q must follow the boundary (found at %d, boundary at %d):\n%s", want, i, ret, g)
+		}
+	}
+}

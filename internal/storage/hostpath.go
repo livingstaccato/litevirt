@@ -209,6 +209,8 @@ var dataDirOwned = []string{
 	"firewall-would-drop.json",  // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
 	"firewall-initial-mode",     // daemon.go firewallInitialModeName: the founder's enforcement decision
 	"nic-guard-held",            // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
+	"promote-started",           // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
+	"shared-disk-released",      // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

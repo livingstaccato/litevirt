@@ -1049,17 +1049,22 @@ During a rolling update, creates (scale-up) execute first, then updates are proc
 ```
 
 `priority` is a whole number from -2147483648 to 2147483647, default `0`;
-a value outside that range is refused at parse. **Higher goes first.** It
-orders three things, each among one host's VMs:
+a value outside that range is clamped to the nearest bound, with a warning, and
+still deploys. **Higher goes first.** It orders three things, each among one
+host's VMs:
 
 - **Failover.** When a host is fenced, its VMs are recovered highest priority
-  first: auto-promotion, placement and each reschedule run in that order, and
-  placement charges each VM's CPU and memory before the next is placed, so when
-  the survivors cannot hold every VM, the higher-priority ones get the room.
-  A VM that does not fit is left on the fenced host and reported, as any VM
-  without a place is.
-- **Drain.** `lv host drain` picks targets and starts the moves in priority
-  order, so with `--parallel N` the N highest go first.
+  first: placement and each reschedule run in that order, and placement charges
+  each VM's CPU and memory before the next is placed, so when the survivors
+  cannot hold every VM, the higher-priority ones get the room. A VM that does
+  not fit is left on the fenced host and reported, as any VM without a place
+  is, and is not recovered later on its own: it waits for its host or an
+  operator. Auto-promotion runs ahead of every placement, so a promoted VM
+  takes its replica host's room whatever its priority; priority orders
+  promotions only among themselves.
+- **Drain.** `lv host drain` starts the moves in priority order, so with
+  `--parallel N` the N highest go first. Targets are chosen per VM without
+  reserving room, so a later VM can still find its target full.
 - **Starts on the new host.** A host starts the VMs failover sent it, and any
   other VM it has to start, highest priority first within each pass; a start
   deferred from the last pass still goes ahead of new ones.

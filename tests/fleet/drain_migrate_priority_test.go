@@ -53,7 +53,9 @@ func (sc *coldStoppedScenario) addPrioritisedStoppedVM(t *testing.T, name, uuid 
 // priority orders a drain, it never drops a VM from one.
 //
 // Mutation: drop the SortVMsByMigratePriority call in DrainHost — the frames
-// come in name order (aa-low, os1, zz-high) and the test goes red.
+// come in the replica's row order, which is insertion order (os1, aa-low,
+// zz-high), and the test goes red. Drop only the name tie-break — the ties
+// come in row order (zz-high, os1, aa-low), red.
 func TestFleet_DrainMovesHigherMigratePriorityFirst(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.addPrioritisedStoppedVM(t, "aa-low", "33333333-4444-4555-8666-777777777777", 0)

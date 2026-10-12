@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -504,11 +503,12 @@ func (v *validator) validate(f *File) {
 		}
 
 		// migrate.priority is stored as an int32 (MigrationPolicy.priority):
-		// a value outside it would wrap silently and invert its own ordering.
-		if vm.Migrate != nil && (vm.Migrate.Priority < math.MinInt32 || vm.Migrate.Priority > math.MaxInt32) {
-			v.ps.add(p+".migrate.priority",
-				fmt.Sprintf("priority %d is out of range", vm.Migrate.Priority),
-				fmt.Sprintf("use a whole number from %d to %d; higher is migrated and recovered first", math.MinInt32, math.MaxInt32))
+		// a value outside it used to wrap silently, so 2147483648 was stored
+		// as the LOWEST priority. Clamped, with a WARN, never refused: such a
+		// file deployed before priorities were read, and must keep deploying —
+		// and redeploying it rewrites a VM stored with the wrapped value.
+		if vm.Migrate != nil {
+			vm.Migrate.Priority = clampMigratePriority(p+".migrate.priority", vm.Migrate.Priority)
 		}
 
 		// Validate migration + storage consistency

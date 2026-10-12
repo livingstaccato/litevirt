@@ -1,9 +1,10 @@
 // Fleet scenario: compose `migrate.priority` orders failover recovery.
 //
 // The value was parsed into the VM spec and stored, and nothing read it: the
-// coordinator recovered a failed host's VMs in name order, so when survivors
-// could hold only some of them, the ones that got capacity were whichever
-// sorted first, whatever priority the operator gave them.
+// coordinator recovered a failed host's VMs in its replica's row order
+// (ListVMs has no ORDER BY: insertion order, which here is also name order),
+// so when survivors could hold only some of them, the ones that got capacity
+// were whichever came first, whatever priority the operator gave them.
 package fleet
 
 import (

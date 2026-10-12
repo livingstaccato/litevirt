@@ -257,11 +257,37 @@ bounded by that mount's timeout (30 s by default), and gives up when its own
 deadline ends. A start whose check gives up goes ahead, as it did before this
 check.
 
+**A server that stops answering while its export is mounted.** A hard NFS
+mount then blocks every stat, open or listing under it until the server
+answers again. litevirt keeps that from holding anything else:
+
+- **Daemon start.** Nothing before the daemon serves gRPC waits on it: the
+  sweeps of stale staging and scratch files run in the background or give up
+  on a directory after 5 s, a pool's statfs gives up after 5 s (the pool reads
+  `error` until it answers, keeping its last capacity), and a step that runs
+  a command against storage (`mount -o remount`, libvirt's pool refresh) is
+  waited for at most 5 s. A daemon (re)start while a server does not answer
+  therefore serves, and its peers do not fence the host.
+- **Pool create.** Whether a new pool overlaps an nfs pool is decided from the
+  mount table first: a mount point names its own directory, with no call on
+  the export. A dir or local pool beside a hung nfs pool is created as usual.
+  An overlap that can only be decided by resolving a path on the hung mount (a
+  pool inside a parent export mounted by hand, say) is refused with
+  `Unavailable` and "cannot verify that the pool does not overlap another
+  pool", never allowed because the check timed out. Try again once the server
+  answers.
+- After one call under a mount has gone unanswered for 5 s, further calls
+  under the same mount fail at once until it returns.
+
 - **Not mounted since the daemon started** (the reboot case): the export is
   mounted, with the pool's mount options and the hardening a create uses
   (`nosuid,nodev,noexec`, plus `nosymfollow` where the kernel has it). The
   journal says `NFS pool's export was not mounted since the daemon started;
-  mounted`. A mount that fails is retried every 30 s.
+  mounted`. A mount that fails is retried every 30 s. A mount still running
+  after 5 s (its server does not answer) marks the pool `degraded` with that
+  reason while it runs; it is given up at its timeout, and `mount`'s whole
+  process group (`mount.nfs` included) is killed then, so a mount cannot
+  finish after litevirt reported it failed.
 - **Unmounted while the daemon ran** (`umount <mount point>`): left unmounted.
   A hard NFS mount of a server that does not answer stays in the mount table,
   so an export that disappears from it was unmounted, and litevirt takes that

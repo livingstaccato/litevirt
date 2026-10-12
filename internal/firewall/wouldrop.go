@@ -23,7 +23,7 @@ type WouldDrop struct {
 // WouldDrops reads the observe-mode counters of the per-NIC table from the
 // kernel. No table (nothing to enforce, or enforce mode) is no counters.
 func WouldDrops(ctx context.Context) ([]WouldDrop, error) {
-	out, err := cmdbound.Command(ctx, "nft", "-j", "list", "table", "bridge", NICTableName).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "nft", "-j", "list", "table", "bridge", NICTableName))
 	if err != nil {
 		return nil, nil
 	}

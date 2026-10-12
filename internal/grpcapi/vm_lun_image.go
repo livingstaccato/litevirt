@@ -83,7 +83,7 @@ var writeImageToDevice = qemuImgWrite
 
 // lunQemuImg runs qemu-img. Tests replace it to see the argv.
 var lunQemuImg = func(ctx context.Context, args ...string) ([]byte, error) {
-	return cmdbound.Command(ctx, "qemu-img", args...).CombinedOutput()
+	return cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", args...))
 }
 
 // qemuImgSource is the json: filename qemu-img opens image (format qcow2 or

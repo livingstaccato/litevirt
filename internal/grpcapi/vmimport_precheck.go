@@ -471,7 +471,7 @@ func importConvertNeed(ctx context.Context, file, format string, virtual uint64)
 // qemuMeasure is the bytes qemu-img says a qcow2 converted from file, opened
 // as format (never probed), needs. file has passed the header check.
 func qemuMeasure(ctx context.Context, file, format string) (uint64, error) {
-	out, err := cmdbound.Command(ctx, "qemu-img", "measure", "--output=json", "-O", "qcow2", "-f", format, "--", file).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "qemu-img", "measure", "--output=json", "-O", "qcow2", "-f", format, "--", file))
 	if err != nil {
 		return 0, fmt.Errorf("measure %s: %w", filepath.Base(file), err)
 	}
@@ -488,7 +488,7 @@ func qemuMeasure(ctx context.Context, file, format string) (uint64, error) {
 // already passed the header check, opened in the format it will be converted
 // from.
 func qemuVirtualSize(ctx context.Context, file, format string) (uint64, error) {
-	out, err := cmdbound.Command(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file))
 	if err != nil {
 		return 0, fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
 	}

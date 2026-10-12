@@ -47,7 +47,7 @@ var cephRunner cmdRunner = cLocaleCmd
 func cLocaleCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := cmdbound.Command(ctx, name, args...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	return cmd.CombinedOutput()
+	return cmdbound.CombinedOutput(ctx, cmd)
 }
 
 // OverrideCephRunnerForTest replaces how ceph drivers built by New run rbd and

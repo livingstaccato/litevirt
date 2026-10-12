@@ -516,7 +516,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 	}
 
 	if format == pbsstore.ContentGuestRaw {
-		if msg, err := cmdbound.Command(ctx, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -537,7 +537,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		return fail(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
 	}
 	if rinfo.BackingFile == "" {
-		if msg, err := cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -553,7 +553,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		if err != nil {
 			return fail(codes.FailedPrecondition, "in_place: %v; restoring it to a new file still works", err)
 		}
-		if msg, err := cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", base, "-F", baseFmt, restored).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", base, "-F", baseFmt, restored)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := namesExactly(restored, base, baseFmt); err != nil {
@@ -574,7 +574,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		}); err != nil {
 			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 		}
-		if msg, err := cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -589,14 +589,14 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 	// Re-point the bytes' header to the disk's own backing WITHOUT opening
 	// what the header named (-u), confirm the header now names exactly that,
 	// and only then let qemu-img read the chain.
-	if msg, err := cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", backing, "-F", backingFmt, restored).CombinedOutput(); err != nil {
+	if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", backing, "-F", backingFmt, restored)); err != nil {
 		return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
 	}
 	if err := namesExactly(restored, backing, backingFmt); err != nil {
 		return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 	}
-	if msg, err := cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
-		"-B", backing, "-F", backingFmt, restored, out).CombinedOutput(); err != nil {
+	if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+		"-B", backing, "-F", backingFmt, restored, out)); err != nil {
 		return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 	}
 	// The rebuilt overlay names exactly the disk's own backing, nothing else.

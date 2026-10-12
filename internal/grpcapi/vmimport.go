@@ -1361,7 +1361,7 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roo
 	}
 	// qemu-img info on this one image only (no --backing-chain: that would
 	// open the backing file before it is judged).
-	out, err := cmdbound.Command(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file))
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)

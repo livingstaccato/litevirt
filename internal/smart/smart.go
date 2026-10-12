@@ -86,7 +86,7 @@ type Runner func(ctx context.Context, args ...string) ([]byte, error)
 func ExecRunner(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	out, err := cmdbound.Command(ctx, "smartctl", args...).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "smartctl", args...))
 	return out, err
 }
 

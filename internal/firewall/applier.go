@@ -61,7 +61,7 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 	}
 	cmd := cmdbound.Command(ctx, n.bin(), "-f", "-")
 	cmd.Stdin = strings.NewReader(preamble + ruleset)
-	out, err := cmd.CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmd)
 	return string(out), err
 }
 
@@ -69,10 +69,10 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 // listing means there is none (or no bridge family to hold one), which is not
 // an error; a failed delete of a table that exists is.
 func (n NftBinary) DropNICTable(ctx context.Context) error {
-	if err := cmdbound.Command(ctx, n.bin(), "list", "table", "bridge", NICTableName).Run(); err != nil {
+	if err := cmdbound.Run(ctx, cmdbound.Command(ctx, n.bin(), "list", "table", "bridge", NICTableName)); err != nil {
 		return nil
 	}
-	if out, err := cmdbound.Command(ctx, n.bin(), "delete", "table", "bridge", NICTableName).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, n.bin(), "delete", "table", "bridge", NICTableName)); err != nil {
 		return fmt.Errorf("delete stale per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -88,7 +88,7 @@ type nicTableDropper interface {
 // uninstall (the typical path is Apply with an empty Plan).
 func (n NftBinary) Flush(ctx context.Context) (string, error) {
 	cmd := cmdbound.Command(ctx, n.bin(), "delete", "table", "inet", TableName)
-	out, err := cmd.CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmd)
 	if err != nil {
 		return string(out), err
 	}
@@ -327,7 +327,7 @@ var (
 )
 
 func runModprobe(ctx context.Context, name string) error {
-	if out, err := cmdbound.Command(ctx, "modprobe", name).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "modprobe", name)); err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

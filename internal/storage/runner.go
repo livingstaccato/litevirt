@@ -21,5 +21,5 @@ type cmdRunner func(ctx context.Context, name string, args ...string) ([]byte, e
 // killed, and a child that still holds the output pipe (mount's mount.nfs,
 // say) does not keep it waiting past cmdbound.WaitDelay.
 func realCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return cmdbound.Command(ctx, name, args...).CombinedOutput()
+	return cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, name, args...))
 }

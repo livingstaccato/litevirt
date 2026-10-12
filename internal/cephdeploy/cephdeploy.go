@@ -98,7 +98,7 @@ func (r *CephadmRunner) Bootstrap(ctx context.Context, spec CephSpec) (string, e
 	if spec.Network != "" {
 		args = append(args, "--cluster-network", spec.Network, "--mon-network", spec.Network)
 	}
-	out, err := cmdbound.Command(ctx, r.bin(), args...).CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), args...))
 	if err != nil {
 		return "", fmt.Errorf("cephadm bootstrap: %w: %s", err, out)
 	}
@@ -127,7 +127,7 @@ func (r *CephadmRunner) AddOSD(ctx context.Context, host, device string) error {
 
 // Status returns a parsed view of `ceph -s --format json`.
 func (r *CephadmRunner) Status(ctx context.Context) (Status, error) {
-	out, err := cmdbound.Command(ctx, r.bin(), "shell", "--", "ceph", "-s", "--format", "json").CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), "shell", "--", "ceph", "-s", "--format", "json"))
 	if err != nil {
 		return Status{}, fmt.Errorf("ceph -s: %w: %s", err, out)
 	}
@@ -152,7 +152,7 @@ func (r *CephadmRunner) Status(ctx context.Context) (Status, error) {
 // OSDTree returns the cluster's CRUSH topology — used by the UI to
 // render a host-by-host placement view.
 func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
-	out, err := cmdbound.Command(ctx, r.bin(), "shell", "--", "ceph", "osd", "tree", "--format", "json").CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), "shell", "--", "ceph", "osd", "tree", "--format", "json"))
 	if err != nil {
 		return OSDTree{}, fmt.Errorf("ceph osd tree: %w: %s", err, out)
 	}
@@ -173,7 +173,7 @@ func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
 
 func (r *CephadmRunner) runCeph(ctx context.Context, args ...string) error {
 	full := append([]string{"shell", "--", "ceph"}, args...)
-	if out, err := cmdbound.Command(ctx, r.bin(), full...).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), full...)); err != nil {
 		return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, out)
 	}
 	return nil

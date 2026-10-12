@@ -2796,7 +2796,7 @@ func (s *Server) reattachVFOnSource(ctx context.Context, vmName, addr string) er
 	default:
 		return fmt.Errorf("claimed by VM %q while it was detached", owner)
 	}
-	if _, err := vfio.Bind(addr); err != nil {
+	if _, err := s.vfioHost().Bind(addr); err != nil {
 		if claimed {
 			// Give back what this call claimed; the strict primitive unbinds
 			// first if the failed bind left it bound.

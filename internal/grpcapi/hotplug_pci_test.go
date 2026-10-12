@@ -890,9 +890,11 @@ func TestDetachDevice_PCINoIntentFallsToLegacy(t *testing.T) {
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
-	// A running VM always has a live domain; seed one so the membership-aware legacy detach
-	// can read it (the address is absent from it → the guest detach is skipped, idempotent).
+	// A running VM always has a live domain and a persistent definition; seed both so the
+	// membership-aware legacy detach can read them (the address is absent from both → the
+	// guest detach is skipped, idempotent).
 	s.virt.(*libvirtfake.Fake).SetActiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices></devices></domain>")
+	s.virt.(*libvirtfake.Fake).SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices></devices></domain>")
 
 	// No vm_pci_intent for this address → legacy detachPCIDevice path. The address is not a
 	// live hostdev, so the membership-aware detach skips the (idempotent) guest detach and

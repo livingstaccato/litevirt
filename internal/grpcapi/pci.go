@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -16,6 +17,16 @@ import (
 	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
+
+// vfioHost is this host's vfio binder, which records each device's previous host
+// driver in the data directory (vfio.HostDriversFileName) so a release rebinds
+// that driver explicitly. With no data directory it keeps no record.
+func (s *Server) vfioHost() *vfio.Host {
+	if s.dataDir == "" {
+		return vfio.HostAt("")
+	}
+	return vfio.HostAt(filepath.Join(s.dataDir, vfio.HostDriversFileName))
+}
 
 // RescanHost triggers a PCI device rescan on the local host and updates the DB.
 func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb.RescanHostResponse, error) {
@@ -574,7 +585,7 @@ func (s *Server) acquireDeviceLeases(ctx context.Context, vmName string, members
 	}
 
 	for _, addr := range addresses {
-		prevDriver, err := vfio.Bind(addr)
+		prevDriver, err := s.vfioHost().Bind(addr)
 		if err != nil {
 			slog.Warn("VFIO bind failed", "address", addr, "error", err)
 			// Roll back ONLY the devices THIS call newly claimed, via the strict all-or-
@@ -804,9 +815,13 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 			continue
 		}
 		if !bound {
-			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+			// Not bound → never Unbind it; only clear a stale vfio-pci override.
+			if rerr := s.vfioHost().ReleaseUnbound(d.Address); rerr != nil {
+				failures = append(failures, rerr)
+			}
+			continue
 		}
-		if uerr := vfio.Unbind(d.Address, d.Driver); uerr != nil {
+		if uerr := s.vfioHost().Unbind(d.Address, d.Driver); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", d.Address, uerr))
 		} else {
 			slog.Info("device unbound from vfio-pci", "address", d.Address, "restored_driver", d.Driver)
@@ -929,9 +944,13 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 			continue
 		}
 		if !bound {
-			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+			// Not bound → never Unbind it; only clear a stale vfio-pci override.
+			if rerr := s.vfioHost().ReleaseUnbound(addr); rerr != nil {
+				failures = append(failures, rerr)
+			}
+			continue
 		}
-		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+		if uerr := s.vfioHost().Unbind(addr, drivers[addr]); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
 		}
 	}
@@ -1068,9 +1087,13 @@ func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs 
 			continue
 		}
 		if !bound {
-			continue // not bound → nothing to unbind (never Unbind a not-bound device)
+			// Not bound → never Unbind it; only clear a stale vfio-pci override.
+			if rerr := s.vfioHost().ReleaseUnbound(addr); rerr != nil {
+				failures = append(failures, rerr)
+			}
+			continue
 		}
-		if uerr := vfio.Unbind(addr, drivers[addr]); uerr != nil {
+		if uerr := s.vfioHost().Unbind(addr, drivers[addr]); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
 		}
 	}

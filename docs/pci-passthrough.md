@@ -25,6 +25,13 @@ echo "vfio-pci" >> /etc/modules-load.d/vfio.conf
 
 3. **Device not bound to host driver** — litevirt handles binding/unbinding automatically.
 
+### How binding and release work
+
+- **Bind.** litevirt claims a device for vfio-pci with `driver_override` only; it never adds a vfio-pci ID. Before it touches the device, it records the driver the device was on in the data directory (`vfio-host-drivers.json`, local to the host and not replicated).
+- **Release.** On detach, stop or delete, the device is bound back to that recorded driver explicitly, so neither driver load order nor a vfio-pci ID can send it back to vfio-pci.
+- **Devices you give vfio-pci yourself.** A device on vfio-pci by your `vfio-pci.ids=` (kernel command line or modprobe.d) before litevirt binds it stays on vfio-pci when it is released.
+- **Hosts upgraded from an older build.** Older builds added a vfio-pci ID for each device they bound. When a device with no record lands back on vfio-pci by such an ID, the release removes the ID (`remove_id`) and returns the device to its host driver. It never removes an ID listed in your `vfio-pci.ids=`.
+
 ## Discovering devices
 
 List PCI devices on a host:

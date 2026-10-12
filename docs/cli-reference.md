@@ -17,6 +17,7 @@ reference is a discovery map, not an exhaustive spec.
 
 ```bash
 lv login                               # Log in with username and password
+lv login --realm oidc:<name>           # Sign in through an OIDC realm (browser + loopback redirect; --no-browser prints the URL)
 lv logout                              # Log out and remove stored credentials
 lv whoami                              # Show current authenticated identity
 lv session ls [--user <name>]          # List active sessions (admin: any user)

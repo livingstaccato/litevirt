@@ -629,7 +629,9 @@ func TestTwoFactorPolicy_ExternalRealmMustPresentTheFactor(t *testing.T) {
 }
 
 // TestTwoFactorPolicy_OIDCNeedsTheCodeWithTheOIDCCode: an OIDC code is single
-// use, so a missing factor is a refusal, not a challenge to come back.
+// use, so a login without the factor gets no session: it is answered with a
+// challenge and an oidc_pending handle (the code cannot be resent), and the
+// factor sent with the code in one call still works.
 func TestTwoFactorPolicy_OIDCNeedsTheCodeWithTheOIDCCode(t *testing.T) {
 	s := policyRealmServer(t, fakeRealm{name: "oidc:corp", subject: "olga"})
 	seedAdmins(t, s)
@@ -642,8 +644,10 @@ func TestTwoFactorPolicy_OIDCNeedsTheCodeWithTheOIDCCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	setPolicy(t, s, "all")
-	_, err = s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: "c", OidcState: "s"})
-	wantCode(t, "OIDC login without the factor", err, codes.Unauthenticated)
+	ch, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: "c", OidcState: "s"})
+	if err != nil || ch.Token != "" || !ch.GetRequires_2Fa() || ch.GetOidcPending() == "" {
+		t.Fatalf("OIDC login without the factor: %+v %v, want a challenge with a handle and no session", ch, err)
+	}
 	r, err := s.Login(ctx, &pb.LoginRequest{Realm: "oidc:corp", OidcCode: "c", OidcState: "s", TotpCode: totpCode(t, enr.SecretBase32)})
 	if err != nil || r.Token == "" {
 		t.Fatalf("OIDC login with the factor: %+v %v", r, err)

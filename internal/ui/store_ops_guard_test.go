@@ -76,6 +76,9 @@ var uiInternalCallPolicy = map[string]func(callee string) bool{
 	// NewTarget parses and validates a target's config; it sends nothing.
 	// Target.Send would fire at the endpoint (see TestNotificationTarget).
 	"notify": allowOnly("NewTarget"),
+	// ClientAddress and PeerTrusted read a request's peer and forwarding header; they hold no
+	// state and touches nothing else in the auth package.
+	"auth": allowOnly("ClientAddress", "PeerTrusted"),
 	// Pure helpers with no state of their own.
 	"randid":      func(string) bool { return true },
 	"auditexport": func(string) bool { return true },

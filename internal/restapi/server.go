@@ -57,6 +57,7 @@
 //	GET    /api/v1/images                              → ListImages
 //	DELETE /api/v1/images/{name}                       → DeleteImage
 //	POST   /api/v1/auth/login                          → Login
+//	POST   /api/v1/auth/oidc/begin                     → BeginOIDCLogin
 //	GET    /api/v1/users                               → ListUsers
 //	POST   /api/v1/users                               → CreateUser
 //	DELETE /api/v1/users/{name}                        → DeleteUser
@@ -73,6 +74,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +87,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // Server is the REST gateway.
@@ -92,7 +95,14 @@ type Server struct {
 	grpc  pb.LiteVirtClient
 	token string // optional static bearer token for auth
 	mux   *http.ServeMux
+	// trustedProxies are the reverse proxies whose X-Forwarded-For names the
+	// client (auth.ClientAddress); empty = the TCP peer, always.
+	trustedProxies []netip.Prefix
 }
+
+// SetTrustedProxies sets the reverse proxies whose X-Forwarded-For header
+// names the client (config trusted_proxies).
+func (s *Server) SetTrustedProxies(p []netip.Prefix) { s.trustedProxies = p }
 
 // maxRequestBodyBytes is deliberately larger than ordinary API payloads while
 // keeping authenticated clients from using JSON decoding as an unbounded
@@ -138,6 +148,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/images", s.wrap(s.handleImages))
 	s.mux.HandleFunc("/api/v1/images/", s.wrap(s.handleImage))
 	s.mux.HandleFunc("/api/v1/auth/login", s.noAuth(s.handleLogin))
+	s.mux.HandleFunc("/api/v1/auth/oidc/begin", s.noAuth(s.handleOIDCBegin))
 	s.mux.HandleFunc("/api/v1/users", s.wrap(s.handleUsers))
 	s.mux.HandleFunc("/api/v1/users/", s.wrap(s.handleUser))
 	s.mux.HandleFunc("/api/v1/tokens", s.wrap(s.handleTokens))
@@ -1093,6 +1104,32 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.grpc.Login(s.grpcCtx(r), &req)
+	if err != nil {
+		grpcHTTPError(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonProto(w, resp)
+}
+
+// handleOIDCBegin starts an OIDC login on this node (BeginOIDCLogin). The
+// caller sends the user to auth_url and completes the login with
+// /api/v1/auth/login on the same node, carrying the code and state.
+func (s *Server) handleOIDCBegin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var req pb.BeginOIDCLoginRequest
+	if err := protoFromJSON(r, &req); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The daemon bounds in-progress logins per client address and takes this
+	// gateway's word for it (it is a loopback caller); the address is the
+	// HTTP peer's (or, from a trusted proxy, the forwarded client's), never
+	// the body's.
+	req.ClientAddress = auth.ClientAddress(r, s.trustedProxies)
+	resp, err := s.grpc.BeginOIDCLogin(s.grpcCtx(r), &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return

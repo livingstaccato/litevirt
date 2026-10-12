@@ -75,7 +75,10 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 
 | Key | Purpose |
 |---|---|
-| `scopes` | Extra scopes to request beyond the defaults. |
+| `redirect_url` | This node's web UI callback, `https://<this node's UI>/oidc/callback`. **Per node**: the login must come back to the node that began it (below). Must be `https` (plain `http` only to a loopback address); a login is refused to begin otherwise. Register every node's URL with the IdP. |
+| `cli_redirect_url` | The loopback address `lv login --realm oidc:<name>` listens on, `http://127.0.0.1:<port>/<path>` (RFC 8252 §7.3): IPv4 loopback, an explicit port, no query. Checked at load. Unset: the CLI sign-in is off for this realm (the web UI still works). Register it with the IdP too. |
+| `ca_file` | PEM CA bundle the IdP's certificate must chain to (discovery, JWKS and the token endpoint). Unset: the system trust store. Verification is never skipped. |
+| `scopes` | Scopes to request. Default `openid profile email groups`; `openid` is always added. |
 | `groups_claim` | Token claim carrying group membership; each value becomes a `group:<name>@<realm>` principal. |
 | `subject_claim` | Claim used as the stable subject — the `user:<subject>@<realm>` principal. Override when `sub` is an opaque id and you want a readable, stable alternative. |
 | `email_claim` | Claim read as the user's email address. |
@@ -84,6 +87,163 @@ required; prefer `client_secret_file` (checked for 0600 at load) over inlining
 The claim overrides exist because IdPs disagree on claim names. Changing
 `subject_claim` on a live realm re-keys every principal id, so existing role
 bindings stop matching — rebind before switching it.
+
+### OIDC sign-in
+
+The flow is the authorization code flow with PKCE (S256 only) and a nonce.
+
+**Web UI.** The login page shows a *Sign in with oidc:&lt;name&gt;* button for
+each OIDC realm (`GET /oidc/login?realm=oidc:<name>`). The node:
+
+1. begins a flow (`BeginOIDCLogin`): 256 random bits of state, a PKCE verifier,
+   a nonce and a separate **binding secret**, held in memory **on that node
+   only**, single-use, for 10 minutes;
+2. binds the flow to the browser: the binding secret goes into a short-lived
+   `HttpOnly`, `SameSite=Lax`, `Path=/` cookie. It is never put in a URL. The
+   cookie's kind follows the realm's `redirect_url` (the URL the browser comes
+   back on), not the request. With an https redirect it is
+   `__Host-lv_oidc_flow`: `Secure`, no `Domain`, so a sibling host cannot
+   plant one. The callback then accepts only that cookie, even when a TLS
+   proxy omits `X-Forwarded-Proto`. A plain-http redirect is allowed only to a
+   loopback address (a developer's own machine). There the cookie is the
+   unprefixed, non-`Secure` `lv_oidc_flow`;
+3. sends the browser to the IdP.
+
+In-progress sign-ins are bounded, and beginning one is never refused:
+
+- **Per client address: 16.** An IPv6 client counts by its /64. An address
+  over its bound loses its own oldest sign-in, so clients sharing an address
+  (a NAT, or a proxy without `trusted_proxies`) cannot lock each other out
+  with a handful of requests.
+- **Per realm: 4096.** When the realm's table is full, one sign-in is
+  dropped. Which one is chosen in three steps:
+  1. the network holding the most sign-ins: an IPv6 /48 or an IPv4 /24;
+  2. within it, the client address (above) holding the most;
+  3. that address's oldest sign-in.
+
+  A flood spread over many addresses of one network therefore counts as one
+  heavy network, and a user from another network outlasts it. Ties go to the
+  candidate whose newest sign-in is the oldest. Among equally loaded
+  networks that is first in, first out, so every sign-in, including one
+  begun during a flood, lasts at least one turnover of the table: about
+  4096/R seconds while sign-ins begin at R per second. The networks are used
+  only to choose what to drop, never to refuse.
+
+  Limits, all availability only (password, LDAP and local logins are
+  unaffected):
+  - A legitimate NAT that shares a /24 with an attacker is dropped along
+    with it.
+  - An attacker holding at least as many networks as the bound (4096 /24s
+    or /48s, for example a botnet or a large IPv6 allocation) keeps every
+    network at one sign-in and ties with everyone. It can then shorten every
+    OIDC sign-in's window to about 4096/R. At a few hundred requests per
+    second that is shorter than a round trip to the IdP, and OIDC sign-in on
+    that node fails while the flood lasts.
+
+The client address is:
+- for the web UI and the REST gateway, the TCP peer. When that peer is in
+  `trusted_proxies` (below), it is the right-most `X-Forwarded-For` hop that is
+  not itself a trusted proxy.
+- for a direct gRPC caller, its own address. A `client_address` it sends is
+  honoured only from a loopback peer. That means this node's own UI and REST
+  gateway, but also any process on the node that holds a cluster certificate.
+  Such a process is trusted for it as it is for everything else: holding a
+  node's certificate on the node is equivalent to root on it.
+
+**Behind a reverse proxy**, list the proxy in `trusted_proxies` (CIDRs or
+addresses, default empty). Without it, every browser arrives from the proxy's
+one address and shares its bound. Two warnings point at this:
+- the daemon warns at startup when an OIDC realm is configured, the UI is
+  bound to loopback, and `trusted_proxies` is empty;
+- the UI warns when a sign-in arrives with `X-Forwarded-For` from a peer
+  that is not listed. This catches a proxy on another host. It warns at most
+  every 10 minutes for each peer, and remembers the last 16 peers, so a
+  client that reaches the UI directly and sends the header cannot hide the
+  proxy's warning.
+
+Requirements on the proxy:
+- It must **append** the client's address to `X-Forwarded-For`, or overwrite
+  the header. A proxy that passes the client's own header through unchanged
+  lets every client choose its own address.
+- Hops are read as addresses, with an `:port` suffix dropped. A hop that is not
+  an address (`unknown`, an obfuscated name) is not believed; the address of
+  the proxy that recorded it is used instead.
+
+Never list an address that clients can reach directly: a forwarding header
+is believed only from a listed proxy. Listing `127.0.0.1`, as a proxy on the
+node itself needs, trusts every local process on that node to name a client
+address to the UI and the REST gateway, with no cluster certificate needed.
+Do it only on a node where local users are trusted that far.
+
+The IdP returns the browser to `redirect_url`. `GET /oidc/callback` then calls
+`Login` with the code, the state and the cookie's binding secret on the same
+node. The node:
+
+- consumes the flow (single use), then refuses it unless the binding secret is
+  the one its beginner was given — before the code is presented to the IdP. A
+  callback from a browser that did not begin the login (login CSRF), or a code
+  and state lifted from a URL or a log, therefore redeem nothing, and the flow
+  is spent;
+- exchanges the code with the verifier and the client secret, and verifies the
+  ID token against the discovery document's JWKS: signature, issuer, audience
+  (`client_id`; `azp`, when present or when there are several audiences, must
+  be `client_id`), expiry, and the flow's nonce.
+- maps the principal (`subject_claim`) and creates the session exactly as a
+  password login does: the external shadow user, the directory identity
+  binding, the account lifecycle, and the login policy below.
+
+The callback answers with `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`. The code, the state, the binding secret and
+the session token are never logged and never put in another URL. The login
+page shows only fixed messages: no text from the IdP (`error`,
+`error_description`, error bodies), from a crafted link, or from the daemon's
+refusal (which can name the account) reaches it — the detail is in the daemon
+log and the audit log.
+
+**Logging out.** `lv logout` and the UI's *Log out* end the litevirt session
+only. The identity provider's own session is untouched, so on a shared
+workstation the next *Sign in with* may sign in as the previous user without a
+prompt. Sign out at the identity provider too, or configure it to always ask
+(`prompt=login`-style policies on its side).
+
+**The login must finish on the node that began it.** A callback that reaches
+another node finds no flow and is refused (`Unauthenticated`, "state unknown
+... on this node"); the code is not presented to the IdP. Give each node its
+own `redirect_url` naming itself. Behind a load balancer, pin `/oidc/` to one
+node (sticky sessions), and list the balancer in `trusted_proxies`.
+
+**CLI.** `lv login --realm oidc:<name>` asks the node it is connected to for a
+CLI flow. The node returns the IdP URL and the realm's `cli_redirect_url`. lv
+then:
+
+- listens on that loopback address;
+- opens the URL in a browser on the same machine (`--no-browser` prints it
+  instead);
+- accepts only the flow's own state on the configured path;
+- keeps the flow's binding secret in memory and sends it with the code.
+
+It completes the login on the same node. The code goes only to the user's
+loopback and to the node; the client secret stays on the node. A remote shell
+needs the loopback forwarded, e.g. `ssh -L 18765:127.0.0.1:18765`. The IdP must
+list `cli_redirect_url` as a redirect URI for the client.
+
+**API.** `BeginOIDCLogin` (REST `POST /api/v1/auth/oidc/begin`,
+`{realm, client}`) returns `auth_url`, `state` and `binding`; then `Login` with
+`oidc_code`, `oidc_state` and `oidc_binding` on the same node. Keep `binding`
+out of URLs and logs. `client` is `web` (the default) or `cli`. The redirect is always the
+realm's configured one for that client; a caller cannot choose it. An
+`oidc_redirect_uri` sent to `Login` must equal it.
+
+**Second factor.** The login policy (below) applies to an OIDC login exactly as
+it does to a password login. litevirt does not read the IdP's `amr`/`acr`
+claims: an IdP that did its own MFA does not stand in for the account's
+litevirt factor. The OIDC code is single-use, so when a covered user with a
+factor signs in without one, `Login` answers `requires_2fa` with an
+`oidc_pending` handle and mints no session. The handle is node-local, lasts 5
+minutes and allows 5 attempts, reserved atomically, so concurrent guesses
+cannot exceed them. Send it back with `realm` and `totp_code` (the
+web UI asks for the code; `lv login` prompts). A client may still send
+`totp_code` together with the code in one call.
 
 ### LDAP / AD realm keys
 
@@ -484,9 +644,9 @@ as `ldap:crop` covers nothing).
 - **A covered user with a factor** must present it at every login, through
   every covered realm. The local realm always did this; the policy extends
   it to LDAP and OIDC. An OIDC code is single-use, so through an OIDC realm
-  the TOTP code has to arrive in the same `Login` call as the OIDC code. No
-  shipped client (CLI or web UI) drives an OIDC login today, so an OIDC client
-  under a covering policy must send both itself. WebAuthn login is itself a
+  the factor is sent either with the code or, after a `requires_2fa` answer,
+  with the `oidc_pending` handle it carries ("OIDC sign-in" above); the web UI
+  and `lv login --realm oidc:<name>` do the second. WebAuthn login is itself a
   second factor.
 - **A login that presents no factor** gets an enrollment-only session
   (`requires_2fa_enrollment`, no role): it can call `Whoami`, `Logout` and

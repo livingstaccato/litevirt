@@ -49,6 +49,14 @@ ui_tls: on
 # when the UI is fronted by a proxy on a different host/port.
 ui_allowed_origins: []
 
+# Reverse proxies in front of the UI and the REST gateway (CIDRs or
+# addresses). From one of them, the client's address is the right-most
+# X-Forwarded-For hop that is not itself a listed proxy; from anyone else,
+# the TCP peer. Used for the per-address bound on in-progress OIDC sign-ins.
+# Empty (default): no forwarding header is believed. See docs/auth.md,
+# "OIDC sign-in".
+trusted_proxies: []
+
 # REST API gateway port. Set to 0 to disable.
 rest_port: 7446
 
@@ -599,20 +607,27 @@ auth:
   # switch. See docs/auth.md.
   rbac_realm: false
   realms:
-    - name: corp                          # realm short name; users login as alice@corp
+    - name: corp                          # realm name oidc:corp
       kind: oidc
-      issuer_url: https://idp.corp/realms/main
-      client_id: litevirt
-      client_secret_file: /etc/litevirt/oidc-secret
-      redirect_url: https://litevirt.corp/oidc/callback
-      groups_claim: groups               # JWT claim that lists group memberships
+      oidc:                               # the per-kind keys sit under oidc: / ldap:
+        issuer_url: https://idp.corp/realms/main
+        client_id: litevirt
+        client_secret_file: /etc/litevirt/oidc-secret
+        # THIS node's UI callback: a login finishes on the node that began it.
+        redirect_url: https://node-1.corp:7445/oidc/callback
+        # Loopback address `lv login --realm oidc:corp` listens on (optional;
+        # unset = no CLI sign-in). http://127.0.0.1:<port>/<path> only.
+        cli_redirect_url: http://127.0.0.1:18765/oidc/callback
+        ca_file: /etc/litevirt/idp-ca.pem  # optional: CA the IdP must chain to
+        groups_claim: groups               # JWT claim that lists group memberships
     - name: ad
       kind: ldap
-      url: ldaps://dc.corp:636
-      bind_dn: CN=svc-litevirt,OU=Service,DC=corp,DC=local
-      bind_password_file: /etc/litevirt/ad-bind-password
-      user_base_dn: OU=Users,DC=corp,DC=local
-      group_base_dn: OU=Groups,DC=corp,DC=local
+      ldap:
+        url: ldaps://dc.corp:636
+        bind_dn: CN=svc-litevirt,OU=Service,DC=corp,DC=local
+        bind_password_file: /etc/litevirt/ad-bind-password
+        user_base_dn: OU=Users,DC=corp,DC=local
+        group_base_dn: OU=Groups,DC=corp,DC=local
 
 # WebAuthn second-factor enrolment. Empty rp_id disables WebAuthn —
 # the gRPC RPCs return Unimplemented and the UI's /account/2fa page

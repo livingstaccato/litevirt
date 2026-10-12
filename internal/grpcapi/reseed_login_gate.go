@@ -24,6 +24,11 @@ var preSessionAuthMethods = map[string]bool{
 	"/litevirt.v1.LiteVirt/Login":               true,
 	"/litevirt.v1.LiteVirt/BeginWebAuthnLogin":  true,
 	"/litevirt.v1.LiteVirt/FinishWebAuthnLogin": true,
+	// BeginOIDCLogin only starts a flow, like BeginWebAuthnLogin, but it is
+	// the first half of a login all the same: a node that would refuse the
+	// Login completing it refuses to start it, rather than sending the user
+	// through the identity provider for nothing.
+	"/litevirt.v1.LiteVirt/BeginOIDCLogin": true,
 }
 
 // admitPreSessionCredentialExchange decides, from ONE reading of the fence,

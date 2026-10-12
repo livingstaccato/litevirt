@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -13,10 +14,39 @@ import (
 
 func newLoginCmd() *cobra.Command {
 	var realm string
+	var noBrowser bool
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Log in to the cluster with username and password",
+		Short: "Log in to the cluster (username and password, or an OIDC realm)",
+		Long: `Log in and store a session for later commands.
+
+With --realm local (the default) or an LDAP realm, prompts for a username and
+password. With --realm oidc:<name>, signs in through that identity provider:
+the node returns the provider's URL, a browser on THIS machine opens it, and
+the provider sends the browser back to the realm's cli_redirect_url, a
+loopback address that this command listens on
+(docs/auth.md, "OIDC sign-in").`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.HasPrefix(realm, "oidc:") {
+				return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+					opts := cli.OIDCLoginOptions{
+						Realm:     realm,
+						Out:       cmd.ErrOrStderr(),
+						UserAgent: "lv",
+						SecondFactor: func() (string, error) {
+							return cli.ReadPassword("2FA code (or recovery code): ")
+						},
+					}
+					if !noBrowser {
+						opts.OpenBrowser = cli.OpenBrowserDefault
+					}
+					resp, err := cli.OIDCLogin(ctx, c, opts)
+					if err != nil {
+						return err
+					}
+					return saveLogin(resp)
+				})
+			}
 			var username string
 			fmt.Fprint(cmd.ErrOrStderr(), "Username: ")
 			if _, err := fmt.Fscanln(cmd.InOrStdin(), &username); err != nil {
@@ -56,27 +86,33 @@ func newLoginCmd() *cobra.Command {
 					}
 				}
 
-				if err := cli.SaveCredential(cli.CredentialEntry{
-					Token:    resp.Token,
-					Username: resp.Username,
-					Role:     resp.Role,
-				}); err != nil {
-					return fmt.Errorf("save credential: %w", err)
-				}
-
-				if resp.GetRequires_2FaEnrollment() {
-					fmt.Printf("Logged in as %s with an ENROLLMENT-ONLY session.\n", resp.Username)
-					fmt.Println("The login policy requires a second factor and your account has none.")
-					fmt.Println("Enroll one with `lv 2fa enroll-totp`, then `lv login` again with its code.")
-					return nil
-				}
-				fmt.Printf("Logged in as %s (role: %s)\n", resp.Username, resp.Role)
-				return nil
+				return saveLogin(resp)
 			})
 		},
 	}
-	cmd.Flags().StringVar(&realm, "realm", "", "Authentication realm (default: local)")
+	cmd.Flags().StringVar(&realm, "realm", "", "Authentication realm: local (default), ldap:<name>, or oidc:<name> for an identity-provider sign-in")
+	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "With an oidc: realm, print the sign-in URL instead of opening a browser")
 	return cmd
+}
+
+// saveLogin stores a minted session and says what it is.
+func saveLogin(resp *pb.LoginResponse) error {
+	if err := cli.SaveCredential(cli.CredentialEntry{
+		Token:    resp.Token,
+		Username: resp.Username,
+		Role:     resp.Role,
+	}); err != nil {
+		return fmt.Errorf("save credential: %w", err)
+	}
+
+	if resp.GetRequires_2FaEnrollment() {
+		fmt.Printf("Logged in as %s with an ENROLLMENT-ONLY session.\n", resp.Username)
+		fmt.Println("The login policy requires a second factor and your account has none.")
+		fmt.Println("Enroll one with `lv 2fa enroll-totp`, then `lv login` again with its code.")
+		return nil
+	}
+	fmt.Printf("Logged in as %s (role: %s)\n", resp.Username, resp.Role)
+	return nil
 }
 
 func newLogoutCmd() *cobra.Command {

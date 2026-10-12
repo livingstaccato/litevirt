@@ -63,10 +63,16 @@ type Config struct {
 	UIPort           int      `yaml:"ui_port"`
 	UIBind           string   `yaml:"ui_bind"`            // listen address for web UI (default "127.0.0.1")
 	UIAllowedOrigins []string `yaml:"ui_allowed_origins"` // WebSocket Origin allowlist (host patterns); empty = strict same-origin
-	DNSPort          int      `yaml:"dns_port"`           // UDP port for embedded DNS (default 5354)
-	DNSDomain        string   `yaml:"dns_domain"`         // base domain, e.g. "litevirt.local"
-	WatchdogDev      string   `yaml:"watchdog_dev"`       // e.g. "/dev/watchdog"; empty = disabled
-	RESTPort         int      `yaml:"rest_port"`          // HTTP REST gateway port (default 7446; 0 = disabled)
+	// TrustedProxies are the reverse proxies (CIDRs or addresses) in front of
+	// the web UI and the REST gateway. From one of them, the client's address
+	// is the right-most X-Forwarded-For hop that is not itself a trusted
+	// proxy; from anyone else, the TCP peer. Empty (the default) believes no
+	// forwarding header. Used for the per-address bound on OIDC sign-ins.
+	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
+	DNSPort        int      `yaml:"dns_port"`     // UDP port for embedded DNS (default 5354)
+	DNSDomain      string   `yaml:"dns_domain"`   // base domain, e.g. "litevirt.local"
+	WatchdogDev    string   `yaml:"watchdog_dev"` // e.g. "/dev/watchdog"; empty = disabled
+	RESTPort       int      `yaml:"rest_port"`    // HTTP REST gateway port (default 7446; 0 = disabled)
 
 	// AntiEntropyIntervalSec is how often the anti-entropy loop compares state
 	// digests with peers and full-syncs on drift. 0 = default (60s). Lower it
@@ -1050,6 +1056,9 @@ func LoadConfig() (*Config, error) {
 	// A typo'd bandwidth limit must fail load, not silently run unlimited.
 	if _, err := cfg.BackupBandwidthLimits(); err != nil {
 		return nil, err
+	}
+	if _, err := auth.ParseTrustedProxies(cfg.TrustedProxies); err != nil {
+		return nil, fmt.Errorf("config %w", err)
 	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly

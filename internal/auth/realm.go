@@ -26,6 +26,9 @@ type Credentials struct {
 	OIDCCode        string // OIDC code-flow callback code
 	OIDCState       string
 	OIDCRedirectURI string
+	// OIDCBinding is the per-flow secret BeginFlow handed whoever began the
+	// login; redeeming the flow must present it.
+	OIDCBinding string
 }
 
 // Principal is the realm-agnostic result of authentication. The

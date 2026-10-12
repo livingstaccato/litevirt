@@ -298,6 +298,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/stacks/export` | GET / POST | `ExportStack` (?name= or body) |
 | `/api/v1/stacks/{name}/migrate-volumes` | POST (SSE) | `MigrateStackVolumes` |
 | `/api/v1/realms` | GET | `ListRealms` |
+| `/api/v1/auth/oidc/begin` | POST (no auth) | `BeginOIDCLogin` (`{realm, client}`; returns `binding`, which `/api/v1/auth/login` on the same node needs as `oidc_binding`; see docs/auth.md) |
 | `/api/v1/sessions` | GET | `ListSessions` |
 | `/api/v1/sessions/{id}` | DELETE | `RevokeSession` |
 | `/api/v1/vms/bind-sgs` | POST | `BindSecurityGroups` (vm in body) |

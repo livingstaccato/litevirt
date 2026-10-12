@@ -252,6 +252,29 @@ func warnPlainUI(bind string, tlsOn bool) {
 		"ui_bind", bind)
 }
 
+// warnOIDCBehindProxy says when OIDC sign-in is configured, the web UI listens
+// on loopback (so every browser arrives through a local reverse proxy, from
+// one address) and no trusted_proxies are set: every browser then shares one
+// address's bound of in-progress sign-ins, so one client can keep evicting
+// the others' sign-ins. Setting trusted_proxies gives each browser its own.
+func warnOIDCBehindProxy(cfg *Config) {
+	if len(cfg.TrustedProxies) > 0 {
+		return
+	}
+	if ip := net.ParseIP(cfg.UIBind); !(ip != nil && ip.IsLoopback() || cfg.UIBind == "localhost") {
+		return
+	}
+	for _, r := range cfg.Auth.Realms {
+		if r.Kind == "oidc" {
+			slog.Warn("OIDC sign-in is configured and the web UI listens on loopback, so it is presumably behind a "+
+				"reverse proxy, but trusted_proxies is empty: every browser shares the proxy's address and its bound "+
+				"of in-progress sign-ins. List the proxy in trusted_proxies so the X-Forwarded-For client address is used.",
+				"ui_bind", cfg.UIBind, "realm", "oidc:"+r.Name)
+			return
+		}
+	}
+}
+
 // startACMEChallengeServer serves the autocert HTTP-01 challenge on :80. autocert
 // only answers /.well-known/acme-challenge/… there; its default handler 302s
 // everything else to https, which is fine. Best-effort: a bind failure (port in

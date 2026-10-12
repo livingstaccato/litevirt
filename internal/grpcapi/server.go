@@ -827,6 +827,10 @@ type Server struct {
 	// (LocalRealm only) — kept for tests that don't wire a registry.
 	realmRegistry *auth.Registry
 
+	// oidcPending holds OIDC logins that verified at the IdP and wait for
+	// litevirt's own second factor (LoginResponse.oidc_pending). Node-local.
+	oidcPending oidcPendingStore
+
 	// fwReconciler is the firewall reconciler the daemon started.
 	// ReloadFirewall calls Reconcile(ctx) on it synchronously to give
 	// `lv firewall reload` push semantics rather than a 30s wait.

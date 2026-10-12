@@ -1657,17 +1657,42 @@ The re-login never rewrites, deletes or logs out of a record, and leaves
 target alone, `iscsiadm -m node -o new -T <target> -p <portal>`, from
 iscsid.conf's defaults.
 
-Other pool operations do touch records:
+**What a pool or disk create does to node records.** Pool create, and every
+VM disk create, move or replicate on the pool (the driver's Prepare), also log
+in through the record as it is. Per-record settings made by hand, such as CHAP
+(`iscsiadm -m node -o update -n node.session.auth.…`) or `node.startup`,
+survive it. In order:
 
-- **Pool create, and every VM disk create, move or replicate on the pool**
-  (the driver's Prepare) runs a plain sendtargets discovery, `iscsiadm -m
-  discovery -t st -p <portal>`, before its login. That refreshes the portal's
-  existing records from iscsid.conf and removes those the portal no longer
-  returns, so per-record CHAP set by hand (`iscsiadm -m node -o update -n
-  node.session.auth.…`) does not survive it. Keep CHAP in iscsid.conf when
-  you use iscsi pools.
-- **Pool delete** logs the host out of the pool's target and portal, unless
-  another pool of the host uses the same pair.
+1. It logs in with `iscsiadm -m node -T <target> -p <portal> --login`. When
+   the record works, or a session is already there, nothing else runs.
+2. When that fails, an add-only discovery runs, `iscsiadm -m discovery -t st
+   -p <portal> -o new`. It adds a record for each target the portal returns
+   that has none, and changes or deletes no existing record. Then it logs in
+   again. This covers a new target, a target on a new portal, and a target
+   that now answers with a new portal group tag (the new record sits beside
+   the stale one, which is left as it was). A session listed after this login
+   counts.
+3. When the target **refused** the existing record (iscsiadm's authorization
+   failure, 24, or a non-retryable login failure, 19), that one record is
+   refreshed from iscsid.conf: it is deleted, made again by the add-only
+   discovery, and logged in through. This keeps a create working after CHAP
+   was rotated in iscsid.conf while the record still held the old secret. The
+   record's files are saved first, from `/etc/iscsi/nodes` or
+   `/var/lib/iscsi/nodes`. If the target refuses the refreshed record too,
+   they are put back as they were and the create fails with both reasons. The
+   refresh is logged as a warning. When it is kept, settings made on that
+   record by hand are iscsid.conf's from then on. A login that fails without
+   a refusal (a portal that does not answer, a timeout) never refreshes
+   anything.
+
+So a record is changed only when the target refused it and accepted
+iscsid.conf's settings. Records of other targets on the portal are never
+touched. On a host whose node database is in neither directory, the record
+cannot be saved: a refused record is still refreshed, so the create succeeds
+as it did before, but a refused refresh leaves it as iscsid.conf's.
+
+**Pool delete** logs the host out of the pool's target and portal, unless
+another pool of the host uses the same pair.
 
 While a pool's session is missing, its row's state is `degraded` (`lv pool
 ls`, `lv pool inspect`), not `active`, and its host raises

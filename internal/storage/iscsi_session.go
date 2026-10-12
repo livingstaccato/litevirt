@@ -22,9 +22,10 @@ import (
 // without a secret on litevirt's command lines or in its logs. A login goes
 // through the record as it is; only when the target has no record at all is
 // one created, for that target alone (-m node -o new). node.startup is left
-// as the operator set it. (A pool create's Prepare is another matter: its
-// plain sendtargets discovery refreshes the portal's records from
-// iscsid.conf.)
+// as the operator set it. (A pool create's Prepare also logs in through the
+// record as it is; it refreshes a record from iscsid.conf only when the
+// target refused it, and puts it back when the refresh is refused too: see
+// iscsi_prepare.go.)
 
 // The bounds of the iscsiadm calls a session check makes. A login to a
 // portal that does not answer otherwise waits out iscsid's own retries.

@@ -43,31 +43,6 @@ func (d *iscsiDriver) Teardown(ctx context.Context) error {
 	return nil
 }
 
-func (d *iscsiDriver) Prepare(ctx context.Context) error {
-	portal := d.opts["portal"]
-	if portal == "" {
-		portal = "127.0.0.1"
-	}
-
-	run := d.run
-	if run == nil {
-		run = realCmd
-	}
-	out, err := run(ctx, "iscsiadm",
-		"-m", "discovery", "-t", "st", "-p", portal)
-	if err != nil {
-		return fmt.Errorf("iscsi discovery %s: %w: %s", portal, err, out)
-	}
-
-	out, err = run(ctx, "iscsiadm",
-		"-m", "node", "-T", d.target, "-p", portal, "--login")
-	if err != nil && !strings.Contains(string(out), "already") {
-		return fmt.Errorf("iscsi login %s: %w: %s", d.target, err, out)
-	}
-	slog.Info("iSCSI target connected", "target", d.target)
-	return nil
-}
-
 // CreateDisk allocates nothing: it names the pool's one LUN. Every disk on the
 // pool gets the same device, so the caller must not hand it to a second disk
 // (FixedDevice; CreateVM refuses a LUN another disk already uses).

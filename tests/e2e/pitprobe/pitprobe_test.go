@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // shq is tests/e2e's shellQuote.
@@ -134,5 +135,109 @@ func TestWindowTokenCmd_Shape(t *testing.T) {
 	c := WindowTokenCmd("'/d'")
 	if !strings.Contains(c, "--absolute-names") || strings.Contains(c, "2>&1") {
 		t.Fatalf("WindowTokenCmd = %q: want --absolute-names and stderr kept apart", c)
+	}
+}
+
+// runHMPQemuIO runs HMPQemuIO's command (a 512-byte write at offset 0) with
+// virsh replaced by a function that, after delay seconds, appends logAppend
+// to the domain log (where qemu 8.2 / libvirt 10 put qemu-io's output; first
+// truncating it when trunc) and prints reply (the HMP reply). The log starts
+// with logBefore, an earlier command's output.
+func runHMPQemuIO(t *testing.T, reply, logBefore, logAppend string, trunc bool, delay string) string {
+	t.Helper()
+	dir := t.TempDir()
+	old := DomainLogDir
+	DomainLogDir = dir
+	t.Cleanup(func() { DomainLogDir = old })
+	lf := filepath.Join(dir, "vm.log")
+	if err := os.WriteFile(lf, []byte(logBefore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pre := `virsh() { sleep ` + delay + `; if [ -n "$TRUNC" ]; then : > ` + shq(lf) + `; fi; printf '%s' "$APPEND" >> ` + shq(lf) + `; printf '%s' "$REPLY"; }; `
+	cmd := exec.Command("sh", "-c", pre+HMPQemuIO(shq("vm"), QemuIODevice("virtio-disk0"), "write -P 1 0 512"))
+	env := append(os.Environ(), "APPEND="+logAppend, "REPLY="+reply)
+	if trunc {
+		env = append(env, "TRUNC=1")
+	}
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("HMPQemuIO command: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+const (
+	mine   = "wrote 512/512 bytes at offset 0\n"
+	others = "wrote 512/512 bytes at offset 4096\n"
+)
+
+// qemu 8.2 / libvirt 10: the HMP reply is empty and qemu-io's output goes to
+// the domain log. The result is this command's line, not an earlier
+// command's "wrote" (lab 2 run 1012).
+func TestHMPQemuIO_ReadsTheDomainLogWhenTheReplyIsEmpty(t *testing.T) {
+	if out := runHMPQemuIO(t, "", others, mine, false, "0"); !Wrote(out) || strings.Count(out, "wrote ") != 1 || !strings.Contains(out, "offset 0") {
+		t.Fatalf("success: output %q; want only this command's line", out)
+	}
+	if out := runHMPQemuIO(t, "", mine, "write failed: Input/output error\n", false, "0"); Wrote(out) {
+		t.Fatalf("failure: output %q reads as a completed write (an earlier command's log line leaked in)", out)
+	}
+}
+
+// Another command's output lands in the log while this one runs: this
+// command's failure must not read as a success on its neighbour's line, and
+// its success is picked out from among the neighbour's.
+func TestHMPQemuIO_IgnoresAConcurrentCommandsOutput(t *testing.T) {
+	if out := runHMPQemuIO(t, "", "", others+"write failed: Input/output error\n", false, "0"); Wrote(out) {
+		t.Fatalf("output %q: this write failed and another's line made it read as written", out)
+	}
+	out := runHMPQemuIO(t, "", "", others+mine+others, false, "0")
+	if !Wrote(out) || strings.Count(out, "wrote ") != 1 || !strings.Contains(out, "offset 0") {
+		t.Fatalf("output %q: want this command's line alone", out)
+	}
+}
+
+// The log is rotated or truncated while the command runs: its line, written
+// to the new file, is still found.
+func TestHMPQemuIO_SurvivesALogTruncation(t *testing.T) {
+	long := strings.Repeat("qemu: some earlier line\n", 50)
+	if out := runHMPQemuIO(t, "", long, mine, true, "0"); !Wrote(out) {
+		t.Fatalf("output %q: the line written after the log was truncated was lost", out)
+	}
+}
+
+// qemu-io's line can arrive well after virsh returns.
+func TestHMPQemuIO_WaitsForALateLine(t *testing.T) {
+	if out := runHMPQemuIO(t, "", "", mine, false, "0"); !Wrote(out) {
+		t.Fatalf("baseline: %q", out)
+	}
+	dir := t.TempDir()
+	old := DomainLogDir
+	DomainLogDir = dir
+	t.Cleanup(func() { DomainLogDir = old })
+	lf := filepath.Join(dir, "vm.log")
+	if err := os.WriteFile(lf, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		_ = os.WriteFile(lf, []byte(mine), 0o600)
+	}()
+	pre := `virsh() { :; }; `
+	out, err := exec.Command("sh", "-c", pre+HMPQemuIO(shq("vm"), QemuIODevice("virtio-disk0"), "write -P 1 0 512")).CombinedOutput()
+	if err != nil || !Wrote(string(out)) {
+		t.Fatalf("output %q, %v: a line 1.5 s late (past the old 0.5 s window) was missed", out, err)
+	}
+}
+
+// A reply that is not empty is the result, as on a qemu that answers over
+// HMP; a stale log line does not turn a failed reply into a write.
+func TestHMPQemuIO_PrefersANonEmptyReply(t *testing.T) {
+	out := runHMPQemuIO(t, "Device does not have a block device backend", mine, mine, false, "0")
+	if Wrote(out) || !strings.Contains(out, "Device does not have") {
+		t.Fatalf("output %q: want the HMP reply alone", out)
+	}
+	if out := runHMPQemuIO(t, "wrote 512/512 bytes at offset 0", "", "", false, "0"); !Wrote(out) {
+		t.Fatalf("output %q: a replied write must read as written", out)
 	}
 }

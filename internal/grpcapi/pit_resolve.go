@@ -121,12 +121,7 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	if activity != activityInactive {
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %q is running or its state is unknown; stop it before resolving its overlay", vm.Name)
 	}
-	repoint := func() error {
-		if s.pitSnapshotter != nil && s.virt != nil && s.virt.DomainExists(vm.Name) {
-			return s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, pitOverlayPath(d.Path), pitDiskFormat, nil)
-		}
-		return nil
-	}
+	repoint := func() error { return s.pointPITDefinitionAtDisk(vm, d) }
 	switch req.GetAction() {
 	case "commit":
 		safe := a.Verdict == pitoverlay.Matches || a.Verdict == pitoverlay.HalfWritten
@@ -159,8 +154,14 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 			}
 			resp.Status = fmt.Sprintf("committed into the disk (verdict %s); the overlay is gone", a.Verdict)
 		} else {
-			if err = pitoverlay.ForceCommit(ctx, disk); err == nil {
-				err = repoint()
+			// The definition is pointed at the disk first: a repoint that
+			// fails leaves the overlay uncommitted and in place, never a
+			// definition naming a removed file (I-2 of the pit-restore
+			// review). A crash after it leaves the overlay beside the disk,
+			// assessed — and held — by the next heal.
+			if err = repoint(); err == nil {
+				resolvePITStep("repointed")
+				err = pitoverlay.ForceCommit(ctx, disk)
 			}
 			resp.Status = fmt.Sprintf("FORCED commit into the disk against verdict %s (%s); the overlay is gone", a.Verdict, a.Reason)
 			if mergedAlready {
@@ -179,12 +180,17 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 				"discard refused: a commit had begun writing %s (verdict %s), so without the overlay the disk would be inconsistent — partly as it was, partly the overlay's writes — and the guest may not boot or may corrupt its filesystem. Restoring the disk from a backup or a replica is the alternative. --accept-torn-disk discards anyway",
 				disk, a.Verdict)
 		}
+		// Repoint first, then remove (I-2 of the pit-restore review): a
+		// failed repoint keeps the overlay, and a crash between the two
+		// leaves it beside the disk, held, for the discard to be run again.
+		if err := repoint(); err != nil {
+			s.audit(ctx, "vm.pit_overlay.discard", vm.Name, fmt.Sprintf("%s: point the definition at %s: %v", resp.Overlay, d.Path, err), "error")
+			return nil, status.Errorf(codes.Internal, "discard %s: point the definition back at %s: %v; the overlay is kept", resp.Overlay, d.Path, err)
+		}
+		resolvePITStep("repointed")
 		if err := pitoverlay.Remove(disk); err != nil {
 			s.audit(ctx, "vm.pit_overlay.discard", vm.Name, fmt.Sprintf("%s: %v", resp.Overlay, err), "error")
 			return nil, status.Errorf(codes.Internal, "discard %s: %v", resp.Overlay, err)
-		}
-		if err := repoint(); err != nil {
-			return nil, status.Errorf(codes.Internal, "discarded, but point the definition back at %s: %v", d.Path, err)
 		}
 		resp.Status = "discarded; the disk is used as it is"
 		if torn {
@@ -198,3 +204,7 @@ func (s *Server) ResolvePITOverlay(ctx context.Context, req *pb.ResolvePITOverla
 	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_resolved", "ok", "warn", "resolved by an admin: "+detail)
 	return resp, nil
 }
+
+// resolvePITStep marks a step of an admin's discard or forced commit; a test
+// makes it crash there.
+var resolvePITStep = func(string) {}

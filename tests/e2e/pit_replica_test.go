@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/tests/e2e/pitprobe"
 )
 
 // A copy of a RUNNING VM's disk is point-in-time (colonelpanik/litevirt#256),
@@ -51,7 +53,11 @@ import (
 // first that restores both after 30 minutes even if this test is killed, and
 // every restore is verified and logged.
 //
+// The node needs chattr (e2fsprogs), getfattr (attr) and virsh; the
+// node-side commands are built and unit-tested in tests/e2e/pitprobe.
+//
 //	LITEVIRT_E2E=1 LV_BIN=/usr/local/bin/litevirt E2E_LAB_DIR=~/litevirt-lab \
+//	  E2E_PIT_EXCLUSIVE_NODE=<node> \
 //	  go test ./tests/e2e/ -run TestReplicateVolume_RunningVMIsPointInTime -v -timeout 40m
 func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	l := newLab(t)
@@ -76,7 +82,7 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	srcPool, copiesPool := "pitsrc-"+suffix, "pitcopies-"+suffix
 	for pool, dir := range map[string]string{srcPool: srcDir, copiesPool: copiesDir} {
 		l.mustSSH(h, 30*time.Second, "mkdir -p "+shellQuote(dir))
-		l.mustLV(h, "pool", "create", pool, "--driver", "dir", "--source", dir, "--host", h)
+		l.mustLV(h, pitprobe.DirPoolCreateArgs(pool, dir, h)...)
 		pool, dir := pool, dir
 		t.Cleanup(func() {
 			l.ssh(h, 30*time.Second, "chattr -i "+shellQuote(dir))
@@ -108,31 +114,39 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	}
 	overlay := filepath.Join(filepath.Dir(root), "."+filepath.Base(root)+".lv-pit")
 
-	// The disk's qdev id, for HMP qemu-io -d.
-	alias := strings.TrimSpace(l.mustSSH(h, 30*time.Second, fmt.Sprintf(
-		`virsh dumpxml %s --xpath "string(//devices/disk[source/@file='%s']/alias/@name)"`, shellQuote(vm), root)))
-	if alias == "" {
-		t.Fatalf("no device alias for %s in %s's live XML", root, vm)
+	// The disk's qdev path, for HMP qemu-io -d (tests/e2e/pitprobe: the live
+	// XML parsed here, not by virsh --xpath, and the virtio-blk backend
+	// under the alias, since a -blockdev disk has no named block backend).
+	alias, err := pitprobe.DiskAlias(l.mustSSH(h, 30*time.Second, pitprobe.DumpXMLCmd(shellQuote(vm))), root)
+	if err != nil {
+		t.Fatalf("device alias of %s in %s's live XML: %v", root, vm, err)
 	}
-	qio := func(cmd string) string {
-		return fmt.Sprintf(`virsh qemu-monitor-command %s --hmp 'qemu-io -d %s "%s"'`, shellQuote(vm), alias, cmd)
-	}
+	dev := pitprobe.QemuIODevice(alias)
+	// HMP returns qemu-io's failures as plain output and virsh exits 0, so
+	// every write is checked for qemu-io's "wrote" (pitprobe.Wrote).
 	for off := low + slot; off < high; off += 64 * mib {
 		n := min(64*mib, high-off)
-		if out := l.mustSSH(h, 2*time.Minute, qio(fmt.Sprintf("write -P 0xab %d %d", off, n))); strings.Contains(strings.ToLower(out), "error") {
-			t.Fatalf("qemu-io fill: %s", out)
+		if out := l.mustSSH(h, 2*time.Minute, pitprobe.HMPQemuIO(shellQuote(vm), dev, fmt.Sprintf("write -P 0xab %d %d", off, n))); !pitprobe.Wrote(out) {
+			t.Fatalf("qemu-io fill at %d on %s: %s", off, dev, out)
 		}
 	}
 
 	pidFile := func(tag string) string { return fmt.Sprintf("/tmp/%s-%s.pid", stack, tag) }
 	startWriter := func(tag, pause string) {
 		t.Helper()
-		script := fmt.Sprintf("for v in $(seq 1 %d); do %s && %s || exit 1; sleep %s; done",
-			rounds, qio(fmt.Sprintf("write -P $v %d %d", low, slot)), qio(fmt.Sprintf("write -P $v %d %d", high, slot)), pause)
-		l.mustSSH(h, 30*time.Second, fmt.Sprintf("nohup sh -c %s > /tmp/%s-%s.log 2>&1 & echo $! > %s",
-			shellQuote(script), stack, tag, pidFile(tag)))
+		// The writer stops at the first write qemu-io does not complete and
+		// logs its reply (pitprobe.WriterScript): a writer that writes
+		// nothing must not look like one that is running.
+		script := pitprobe.WriterScript(shellQuote(vm), dev, rounds, low, high, slot, pause)
+		logFile := fmt.Sprintf("/tmp/%s-%s.log", stack, tag)
+		l.mustSSH(h, 30*time.Second, fmt.Sprintf("nohup sh -c %s > %s 2>&1 & echo $! > %s",
+			shellQuote(script), logFile, pidFile(tag)))
 		t.Cleanup(func() { l.ssh(h, 30*time.Second, fmt.Sprintf("kill $(cat %s) 2>/dev/null", pidFile(tag))) })
 		time.Sleep(3 * time.Second)
+		if _, err := l.ssh(h, 20*time.Second, fmt.Sprintf("kill -0 $(cat %s)", pidFile(tag))); err != nil {
+			log, _ := l.ssh(h, 20*time.Second, "cat "+logFile)
+			t.Fatalf("writer %s stopped within 3 s: %s", tag, log)
+		}
 	}
 	writerAlive := func(what, tag string) {
 		t.Helper()
@@ -162,8 +176,13 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 		defer l.ssh(h, 30*time.Second, "rm -f "+raw)
 		lo, hi := slotByte(raw, low), slotByte(raw, high)
 		l.mark("%s: copy %s has LOW=%d HIGH=%d", what, copyPath, lo, hi)
-		if hi == 0 || hi >= rounds {
-			t.Errorf("%s: HIGH=%d: the copy was not taken while the writer ran", what, hi)
+		// Both slots hold a round's byte, never the empty disk (0), and HIGH
+		// is short of the last round: the copy was taken while the writer
+		// ran, so a smear could show. Layer 3's smear check rests on this.
+		// LOW may hold the last round only mid-round (LOW=rounds,
+		// HIGH=rounds-1), a genuine point-in-time state.
+		if lo == 0 || hi == 0 || hi >= rounds || lo > rounds || (lo == rounds && hi != rounds-1) {
+			t.Errorf("%s: LOW=%d HIGH=%d: the copy was not taken while the writer ran", what, lo, hi)
 		}
 		return lo, hi
 	}
@@ -278,7 +297,7 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 			// snapshot (round 4, N1). On a pool filesystem with user xattrs it
 			// is still there, 32 hex digits; a filesystem without them (NFS
 			// before 4.2) has none, and the binding recorded no_xattr.
-			if tok, err := l.ssh(h, 30*time.Second, "getfattr --only-values -n user.litevirt.pit_window "+shellQuote(root)+" 2>&1"); err != nil {
+			if tok, err := l.ssh(h, 30*time.Second, pitprobe.WindowTokenCmd(shellQuote(root))); err != nil {
 				t.Logf("layer 2: no window token on %s (a filesystem without user xattrs?): %s", root, tok)
 			} else if tok = strings.TrimSpace(tok); len(tok) != 32 {
 				t.Errorf("layer 2: the window token on %s is %q, want 32 hex digits", root, tok)

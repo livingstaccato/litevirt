@@ -59,6 +59,10 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 	op := s.startContainerOp("migrate", req.Name, "target", req.TargetHost, "repo", req.RepoPath)
 	defer func() { op.done(retErr) }()
+	// The container leaves this host: the next admission here reads the
+	// runtime afresh rather than a cached inventory that still lists it
+	// (invalidateInventoryCache; P-3 of lab 2 run c2).
+	defer s.invalidateInventoryCache()
 	if req.TargetHost == s.hostName {
 		return status.Error(codes.InvalidArgument, "source and target host are identical")
 	}

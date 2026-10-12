@@ -58,6 +58,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -84,6 +85,100 @@ func SidecarPath(disk string) string { return Path(disk) + ".id" }
 func Present(disk string) bool {
 	_, err := os.Lstat(Path(disk))
 	return err == nil
+}
+
+// Presence is what this host can say about a disk's overlay: there, gone,
+// or neither established.
+type Presence int
+
+const (
+	// OverlayAbsent: the overlay and its binding both do not exist (ENOENT).
+	OverlayAbsent Presence = iota
+	// OverlayPresent: something is at the overlay's path.
+	OverlayPresent
+	// OverlayUnknown: neither can be established — a stat error other than
+	// ENOENT (EIO, ESTALE, EACCES, …), or a binding with no overlay beside it.
+	OverlayUnknown
+)
+
+// lstat is os.Lstat; a test makes it fail.
+var lstat = os.Lstat
+
+// SetLstatForTest makes PresenceOf stat with f, and returns the restore.
+func SetLstatForTest(f func(string) (os.FileInfo, error)) (restore func()) {
+	prev := lstat
+	lstat = f
+	return func() { lstat = prev }
+}
+
+// PresenceOf says whether disk's overlay is there. Unlike Present, an error
+// is never read as absence. Present keeps its meaning for its callers.
+func PresenceOf(disk string) (Presence, error) {
+	_, err := lstat(Path(disk))
+	switch {
+	case err == nil:
+		return OverlayPresent, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return OverlayUnknown, err
+	}
+	_, err = lstat(SidecarPath(disk))
+	switch {
+	case err == nil:
+		return OverlayUnknown, fmt.Errorf("%s: %w", SidecarPath(disk), ErrLoneBinding)
+	case !errors.Is(err, fs.ErrNotExist):
+		return OverlayUnknown, err
+	}
+	return OverlayAbsent, nil
+}
+
+// ErrLoneBinding is PresenceOf's reason for a binding with no overlay beside
+// it (a crash inside Remove): unknown, but not a fault worth a warning.
+var ErrLoneBinding = errors.New("a binding with no overlay beside it")
+
+// SetAsideEvidence reports whether the overlay of disk's CURRENT window was
+// set aside beside it: an <overlay>.orphan-<stamp> file (SetAside), not its
+// binding alone, bound to the window the disk carries now.
+//
+//   - The disk carries no window token: no window has opened on this file
+//     since it was placed (a restore writes a new file), so any orphan of it
+//     is evidence.
+//   - The disk carries a token: only an orphan whose binding recorded that
+//     very token is. An older window's orphan says nothing about the overlay
+//     a later window made (re-review 1 of the pit-restore branch, I-1).
+//   - The token cannot be read (no user xattrs here, or any other error):
+//     windows cannot be told apart, and nothing counts.
+func SetAsideEvidence(disk string) bool {
+	m, err := filepath.Glob(Path(disk) + ".orphan-*")
+	if err != nil {
+		return false
+	}
+	var orphans []string
+	for _, p := range m {
+		if !strings.HasSuffix(p, ".id") {
+			orphans = append(orphans, p)
+		}
+	}
+	if len(orphans) == 0 {
+		return false
+	}
+	tok, err := getXattr(disk)
+	switch {
+	case errors.Is(err, errNoAttr):
+		return true
+	case err != nil || len(tok) == 0:
+		return false
+	}
+	for _, o := range orphans {
+		data, err := os.ReadFile(o + ".id")
+		if err != nil {
+			continue
+		}
+		var b Binding
+		if json.Unmarshal(data, &b) == nil && b.Token != "" && b.Token == string(tok) {
+			return true
+		}
+	}
+	return false
 }
 
 // Command builds the qemu-img process. A variable so a test can see the
@@ -963,7 +1058,7 @@ func HoldAdvice(vm, diskName string, a Assessment) string {
 		return fmt.Sprintf("The VM ran on its disk without the overlay, so committing it now would write old blocks over newer ones. See the verdict with `%s` (no --confirm); normally the overlay is discarded (--discard, which asks for --accept-torn-disk if a commit had begun).", cmd)
 	}
 	if a.CommitBegan {
-		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, discard the overlay first (`%s --discard --accept-torn-disk --confirm`) and only then put back a backup or replica of the disk — or let `lv backup restore-from --vm %s --disk %s --in-place` do both: it sets the overlay aside, kept, before it writes the disk. Otherwise decide with --force-commit.", cmd, cmd, vm, diskName)
+		return fmt.Sprintf("A commit into the disk had begun, so the disk may be partly written, and it cannot be shown to be the file that commit was writing. See the verdict with `%s` (no --confirm). If the disk cannot be trusted, discard the overlay first (`%s --discard --accept-torn-disk --confirm`) and only then put back a backup or replica of the disk — or let `lv backup restore-from --repo <repo> --vm %s --disk %s --timestamp <timestamp> --in-place` do both (the backup's timestamp from `lv backup repo ls <repo>`): it sets the overlay aside, kept, before it writes the disk. Otherwise decide with --force-commit.", cmd, cmd, vm, diskName)
 	}
 	return fmt.Sprintf("Its writes cannot be verified against the disk. See the verdict and what each action does with `%s` (no --confirm): discarding keeps the disk as it is and loses the overlay's writes; a commit is refused unless forced (--force-commit).", cmd)
 }
@@ -988,14 +1083,14 @@ func (a Assessment) Consequences() (commit, discard string) {
 		discard = "deletes the overlay and the guest's writes in it; the disk stays as it was when the overlay was taken (consistent, but older)"
 	case HalfWritten:
 		commit = "finishes the commit that was cut short: the disk then holds every write, and is whole again"
-		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
+		discard = "REFUSED without --accept-torn-disk: the disk is partly written, and without the overlay it stays inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --repo <repo> --vm <vm> --disk <disk> --timestamp <timestamp> --in-place`, which sets the overlay aside before it writes"
 	case Pivoted:
 		commit = "REFUSED, even with --force-commit (only --overwrite-newer-writes overrides it): the overlay is already in the disk; committing it again writes its old blocks over everything the guest wrote since"
 		discard = "removes the overlay, whose writes are already in the disk: nothing is lost"
 	default:
 		commit = "REFUSED without --force-commit: " + a.Reason + "; a commit could write stale blocks over newer data"
 		if a.CommitBegan {
-			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --in-place`, which sets the overlay aside before it writes"
+			discard = "REFUSED without --accept-torn-disk: a commit into the disk had begun, so without the overlay the disk may be inconsistent. To start over from a backup or a replica instead, discard first (--discard --accept-torn-disk) and then restore the disk, or use `lv backup restore-from --repo <repo> --vm <vm> --disk <disk> --timestamp <timestamp> --in-place`, which sets the overlay aside before it writes"
 		} else {
 			discard = "deletes the overlay and its writes; the disk is used as it is"
 		}

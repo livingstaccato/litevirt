@@ -531,17 +531,36 @@ by the strongest method the host has, tried in this order:
      instead, discard the overlay first (`--discard --accept-torn-disk`) and
      only then restore the disk — a restore over it in place with the overlay
      still beside it is not mistaken for the disk (the end record catches it),
-     but the VM stays held. `lv backup restore-from --in-place` does both: an
-     overlay that holds the VM is set aside (kept, as
-     `.<disk file>.lv-pit.orphan-<time>`) once the restored image has been
-     placed over the disk, and the hold clears then. A restore that fails
-     before (a missing chunk, a cancel), a placement that fails, or a crash
-     between the placement and the set-aside leaves the overlay beside the
-     disk and the VM held: the overlay was taken of the file the restore
-     replaced, so it is never committed into the restored one. If the
-     set-aside itself fails after the placement, the restore says so — the
-     disk is restored, the VM stays held, re-run the restore or resolve the
-     overlay — instead of "restore complete".
+     but the VM stays held.
+     `lv backup restore-from --repo <repo> --vm <vm> --disk <disk> --timestamp <timestamp> --in-place`
+     (the timestamp from `lv backup repo ls <repo>`) does both: once the
+     restored image has been placed over the disk, the VM's definition is
+     pointed back at the restored disk, then an overlay that holds the VM is
+     set aside (kept, as `.<disk file>.lv-pit.orphan-<time>`), and the hold
+     clears. A restore that fails before (a missing chunk, a cancel), a
+     placement that fails, or a crash between the placement and the
+     set-aside leaves the overlay beside the disk and the VM held: the
+     overlay was taken of the file the restore replaced, so it is never
+     committed into the restored one; re-run the restore to finish. If the
+     repoint or the set-aside itself fails after the placement, the restore
+     says so — the disk is restored, the VM stays held, re-run the restore or
+     resolve the overlay — instead of "restore complete". A stopped VM whose
+     definition still names an overlay that a restore by an earlier build set
+     aside without the repoint is pointed back at the disk by its next start,
+     move or copy, with a `disk.pit_definition_repointed` event; the
+     set-aside overlay is kept. That happens only on proof of the set-aside:
+     the overlay and its binding are both gone (not merely unreadable — an
+     I/O or stale-handle error proves nothing) and a
+     `.<disk file>.lv-pit.orphan-*` of the disk's current window lies beside
+     it: when the disk carries a window token (`user.litevirt.pit_window`),
+     only an orphan whose `.id` recorded that token counts, so an older
+     window's orphan says nothing about a later one; without user xattrs
+     nothing counts. An overlay moved
+     anywhere else is not taken as set aside: the definition is left naming
+     it and the start fails, naming the missing file — put the overlay back,
+     then resolve it. `lv resolve-pit-overlay --discard` and a forced
+     `--commit` likewise point the definition at the disk before the overlay
+     goes, so a failure or a crash between the two keeps the overlay.
 
    When a disk is deleted (`lv rm`, rebuild), its overlay and sidecar are
    deleted with it. An import that finds an overlay where its new disk goes

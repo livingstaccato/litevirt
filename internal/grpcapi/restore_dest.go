@@ -397,6 +397,18 @@ func (s *Server) setAsideHeldOverlayForRestore(ctx context.Context, vm *corrosio
 	if err := s.heldOverlayCanBeSetAside(vm, disk, heldErr); err != nil {
 		return nil, err
 	}
+	// The definition is pointed at the restored disk BEFORE the overlay
+	// moves (P-1 of lab 2 run c2: without it the VM could not start). A
+	// crash between the two leaves the overlay beside the disk, still bound
+	// to the file the restore replaced: the VM stays held, the overlay is
+	// never committed into the restored disk, and re-running the restore
+	// sets it aside. The other order would leave, on a crash, a definition
+	// naming a missing overlay and no hold (repointDanglingPITDefinition
+	// still recovers that on the next start).
+	if err := s.pointPITDefinitionAtDisk(vm, disk); err != nil {
+		return nil, fmt.Errorf("%v; and pointing the definition back at the restored disk: %w", heldErr, err)
+	}
+	restorePlaceStep("repointed")
 	path := s.hostDiskFile(disk.Path)
 	to, err := pitSetAside(path, time.Now().UTC().Format("20060102-150405"))
 	if err != nil {

@@ -248,10 +248,14 @@ and every 30 s after. The check reads the mount table
 (`/proc/self/mountinfo`) and does not touch the export. Whether the mount
 point lies inside another NFS mount is judged from its path as written. Only
 when that finds none does the check resolve the symlinks of the mount point's
-parent, which can reach an NFS mount, and that is given up on after 5 s. No
-lock is held while a check runs, so a server that does not answer can delay
-that one pool's check, but not other pools, a pool create or delete, or a VM
-start.
+parent, which can reach an NFS mount, and that is given up on after 5 s. A
+check holds no lock, except the re-check right before a mount, which is bounded
+the same way. So a server that does not answer delays a pass by at most 5 s
+per such pool, and hangs nothing. A pool create or delete, or a VM start that
+needs a mount, waits only for a mount in progress on the host, which is
+bounded by that mount's timeout (30 s by default), and gives up when its own
+deadline ends. A start whose check gives up goes ahead, as it did before this
+check.
 
 - **Not mounted since the daemon started** (the reboot case): the export is
   mounted, with the pool's mount options and the hardening a create uses
@@ -279,7 +283,8 @@ start.
 - **Another NFS mount at the mount point** counts as mounted: the export
   mounted by hand, or spelled another way (a host name where the pool has the
   address). Its files are there. The pool's own check at use then judges
-  whether it is the pool's export (see "Host paths" above).
+  whether it is the pool's export (see "Host paths" above). A mount whose
+  source differs from the pool's spelling is logged once as a warning.
 - **A mount at the mount point that is not NFS** is left alone. Unmount it,
   and the next check mounts the pool's export there.
 - **A pool whose directory lies inside another NFS mount** (a parent export
@@ -316,9 +321,9 @@ that local file instead of the export's. The refusal is answered as
 `Unavailable`, as that failure was. The reconciler (onboot, HA restart,
 failover) tries the start again on its later passes. The VM checker's
 restarts (a guest that stopped, a restart policy) set the VM to `error`, as a
-failed start always did there. Automated refusals are counted under the
-`storage_not_mounted` reason of the gate-refusal metric, not
-`hardware_blocked`. A start does not retry a mount that failed within the last
+failed start always did there. Automated refusals are counted in
+`litevirt_runtime_action_refused_total{reason="storage_not_mounted"}`, not
+under `hardware_blocked`. A start does not retry a mount that failed within the last
 30 s, and gives up waiting for another mount on the host when its own deadline
 ends.
 

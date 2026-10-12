@@ -445,6 +445,13 @@ func TestPrepareHardwareForStart_NFSRejudgesUnderTheLock(t *testing.T) {
 				t.Error(err)
 			}
 		}, "deleted or replaced", 0},
+		{"re-created at another target meanwhile", func(t *testing.T, s *Server, m *hostMounts) {
+			if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+				HostName: s.hostName, Name: "shared", Driver: "nfs", Source: nfsTestSource, Target: t.TempDir(), State: "active",
+			}); err != nil {
+				t.Error(err)
+			}
+		}, "deleted or replaced", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := provableCreateServer(t)
@@ -597,5 +604,42 @@ func TestReconcileNFSMounts_AHungCheckWedgesNothing(t *testing.T) {
 	}
 	if c, ok := mountCondition(t, s, "a-hung"); !ok || !strings.Contains(c.Evidence, "did not finish") {
 		t.Fatalf("a-hung's condition %+v found=%v; want the check's reason", c, ok)
+	}
+}
+
+// nfsMu gives up when the waiter's context ends: while a pool delete holds it
+// (its teardown stalled), a start that needs a mount is refused, and another
+// nfs pool's delete answers Unavailable, both promptly.
+func TestNFSMu_WaitersGiveUpWithTheirContext(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	m := installHostMounts(t)
+	dir := nfsPoolRow(t, s, "shared")
+	vm := nfsDiskVM(t, s, "shared", dir)
+	nfsPoolRowAt(t, s, "held", "10.0.0.41:/held", "")
+	nfsPoolRowAt(t, s, "other", "10.0.0.42:/other", "")
+	release := make(chan struct{})
+	m.gate, m.entered = release, make(chan struct{}, 1)
+	held := make(chan error, 1)
+	go func() {
+		_, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "held"})
+		held <- err
+	}()
+	<-m.entered // the delete holds nfsMu, in its teardown
+	time.AfterFunc(3*time.Second, func() { close(release) })
+	t.Cleanup(func() { <-held })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	_, err := s.PrepareHardwareForStart(ctx, &vm)
+	if err == nil || !strings.Contains(err.Error(), "did not finish in time") || time.Since(t0) > 2*time.Second {
+		t.Fatalf("start while nfsMu is held: err=%v after %v; want a prompt refusal", err, time.Since(t0))
+	}
+	dctx, dcancel := context.WithTimeout(adminCtx(), 300*time.Millisecond)
+	defer dcancel()
+	t0 = time.Now()
+	_, err = s.DeleteStoragePool(dctx, &pb.DeleteStoragePoolRequest{Name: "other"})
+	if status.Code(err) != codes.Unavailable || time.Since(t0) > 2*time.Second {
+		t.Fatalf("delete while nfsMu is held: err=%v after %v; want a prompt Unavailable", err, time.Since(t0))
 	}
 }

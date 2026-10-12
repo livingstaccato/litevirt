@@ -2247,11 +2247,6 @@ func (r *Reconciler) failPendingStart(ctx context.Context, vmName, proofID strin
 	}
 }
 
-// hwPrepareRetryable classifies a hardware pre-start error for the proof lifecycle: a
-// blocked adoption / unacquirable passthrough (FailedPrecondition) or a malformed record
-// (InvalidArgument) is an operator-repair condition that retrying on this host can't fix
-// → non-retryable (terminalize + set error); anything else (a transient read/DB failure,
-// Internal/Unavailable) → retryable, re-armed for the next reconcile tick.
 // hwRefusalReason is the refusal-metric reason of a pre-start refusal: a
 // disk's storage not mounted (ErrStartStorageNotMounted) is not a hardware
 // one.
@@ -2262,6 +2257,11 @@ func hwRefusalReason(err error) string {
 	return ReasonHardwareBlocked
 }
 
+// hwPrepareRetryable classifies a hardware pre-start error for the proof lifecycle: a
+// blocked adoption / unacquirable passthrough (FailedPrecondition) or a malformed record
+// (InvalidArgument) is an operator-repair condition that retrying on this host can't fix
+// → non-retryable (terminalize + set error); anything else (a transient read/DB failure,
+// Internal/Unavailable) → retryable, re-armed for the next reconcile tick.
 func hwPrepareRetryable(err error) bool {
 	switch status.Code(err) {
 	case codes.FailedPrecondition, codes.InvalidArgument:

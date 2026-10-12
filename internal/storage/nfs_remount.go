@@ -238,7 +238,11 @@ func MountNFSPool(ctx context.Context, dataDir string, cfg Config) error {
 		return fmt.Errorf("after the mount, %s holds no NFS mount; the mount point was replaced while it was mounted (a symlink?), so the mount landed elsewhere: check `findmnt -S %s`", dir, cfg.Source)
 	}
 	if late, lerr := listMountPoint(f); lerr == nil && len(late) > 0 {
-		if out, uerr := nfsRunner()(ctx, "umount", "--", dir); uerr != nil {
+		// A fresh bound: the caller's context may be spent by the mount.
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultNFSCommandTimeout)
+		out, uerr := nfsRunner()(uctx, "umount", "--", dir)
+		cancel()
+		if uerr != nil {
 			return fmt.Errorf("%w; it could not be unmounted again (%v: %s), so the export now hides them: umount %s",
 				localFilesError(dir, late), uerr, trimmedNFSCommandOutput(out), dir)
 		}

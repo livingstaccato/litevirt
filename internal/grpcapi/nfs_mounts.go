@@ -120,10 +120,12 @@ func (s *Server) nfsPoolConfig(r corrosion.StoragePoolRecord) storage.Config {
 
 // nfsLock serialises the mounts this daemon makes of nfs pools' exports with
 // an nfs pool's create and delete. It is held only across a mount (with the
-// re-read of the pool's row and of the mount table before it, and the row's
-// write after it), never across a check: a check can stat a path, and a path
-// on an NFS mount whose server does not answer can block. Lock takes a
-// context, so a start or an RPC waiting for it gives up when its own does.
+// re-read of the pool's row and a re-check of the mount table right before
+// it, and the row's write after it). A pass's or a start's first check runs
+// without it: a check can resolve a path's symlinks, which on an NFS mount
+// whose server does not answer can block. The re-check under the lock can
+// too, but only up to the resolution's bound (5 s). Lock takes a context, so
+// a start or an RPC waiting for it gives up when its own does.
 type nfsLock struct {
 	once sync.Once
 	ch   chan struct{}
@@ -248,6 +250,9 @@ func (s *Server) checkNFSMount(cfg storage.Config, dir string) (needMount bool, 
 	case err != nil:
 		return false, err
 	case st.Mounted || st.OnNFS:
+		if st.Other != "" {
+			s.warnOtherNFSMount(dir, cfg.Source, st.Other)
+		}
 		s.nfsMem.up(dir)
 		return false, nil
 	case st.Foreign != "":
@@ -256,6 +261,19 @@ func (s *Server) checkNFSMount(cfg storage.Config, dir string) (needMount bool, 
 		return false, fmt.Errorf("export %s is not mounted at %s: %s", cfg.Source, dir, nfsUnmountedReason)
 	}
 	return true, nil
+}
+
+// warnOtherNFSMount says, once per mount point and source, that a pool's
+// mount point holds an NFS mount whose source is not the pool's export as the
+// pool spells it (a hand mount, another spelling of it, or another export).
+// It counts as mounted, as it did on main at start; the pool's check at use
+// still refuses another export.
+func (s *Server) warnOtherNFSMount(dir, source, other string) {
+	if _, seen := s.nfsOtherWarned.LoadOrStore(dir+"\x00"+other, true); seen {
+		return
+	}
+	slog.Warn("NFS pool's mount point holds an NFS mount of another source; it is used as mounted, and the pool's check at use refuses it if it is not the pool's export",
+		"mountpoint", dir, "source", source, "mounted", other)
 }
 
 // mountNFSLocked mounts a pool's export, under nfsMu: after a fresh look at
@@ -431,7 +449,7 @@ func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg st
 		return err
 	}
 	if pool != "" {
-		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source) {
+		if r, ok, gerr := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool); gerr == nil && (!ok || !strings.EqualFold(r.Driver, "nfs") || r.Source != cfg.Source || r.Target != cfg.Target) {
 			return fmt.Errorf("pool %q was deleted or replaced on this host while the start waited", pool)
 		}
 	}

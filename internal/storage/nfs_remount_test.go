@@ -21,6 +21,7 @@ type rebootMounts struct {
 	mountErr string
 	onMount  func(dir string) // runs after a mount, outside the lock
 	umounts  int
+	landAt   string // set: a mount lands there instead of its mount point
 }
 
 func installRebootMounts(t *testing.T) *rebootMounts {
@@ -75,7 +76,11 @@ func (m *rebootMounts) run(_ context.Context, name string, args ...string) ([]by
 		if mountErr != "" {
 			return []byte(mountErr), errors.New("exit status 32")
 		}
-		m.add(args[6], "nfs4", args[5], "rw,nosuid,nodev,noexec,relatime")
+		at := args[6]
+		if m.landAt != "" {
+			at = m.landAt // the mount point was swapped for a symlink
+		}
+		m.add(at, "nfs4", args[5], "rw,nosuid,nodev,noexec,relatime")
 		if m.onMount != nil {
 			m.onMount(args[6])
 		}
@@ -341,5 +346,49 @@ func TestMountNFSPool_AConcurrentMountIsNotLocalFiles(t *testing.T) {
 	}
 	if m.mounts() != 0 {
 		t.Fatal("mounted again over a mounted export")
+	}
+}
+
+// A mount that lands somewhere else (the mount point swapped for a symlink
+// between the open and the mount) leaves no NFS mount at the mount point,
+// and is refused saying so.
+func TestMountNFSPool_AMountThatLandedElsewhereIsRefused(t *testing.T) {
+	m := installRebootMounts(t)
+	m.landAt = filepath.Join(t.TempDir(), "elsewhere")
+	err := MountNFSPool(context.Background(), t.TempDir(), nfsCfg(""))
+	if err == nil || !strings.Contains(err.Error(), "holds no NFS mount") {
+		t.Fatalf("err = %v; want the landed-elsewhere refusal", err)
+	}
+}
+
+// A resolution that does not finish is run once per path, however many
+// checks ask meanwhile: a server that never answers leaves one stuck
+// goroutine, not one per check.
+func TestCheckNFSPoolMount_AStuckResolutionIsNotStartedAgain(t *testing.T) {
+	installRebootMounts(t)
+	base := t.TempDir()
+	hung := filepath.Join(base, "hung")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var mu sync.Mutex
+	calls := 0
+	t.Cleanup(OverrideNFSPathResolverForTest(func(p string) string {
+		if p == hung {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			<-release
+		}
+		return p
+	}, 100*time.Millisecond))
+	for i := 0; i < 3; i++ {
+		if _, err := CheckNFSPoolMount(base, nfsCfg(filepath.Join(hung, "lv"))); err == nil {
+			t.Fatal("a check whose resolution does not finish returned no error")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("the stuck resolution was started %d times, want once", calls)
 	}
 }

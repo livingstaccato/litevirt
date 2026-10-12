@@ -681,9 +681,12 @@ type Server struct {
 	iscsiMem iscsiSessionMemory
 	// nfsMu serialises the mounts of nfs pools' exports (nfs_mounts.go) with
 	// an nfs pool's create and delete, so neither a pass nor a start mounts a
-	// deleted pool's export back, nor a pass writes its row back. It is
-	// never held across a check of the mount table.
+	// deleted pool's export back, nor a pass writes its row back. Only the
+	// re-check right before a mount runs under it (nfsLock).
 	nfsMu nfsLock
+	// nfsOtherWarned: the mount points already warned about holding an NFS
+	// mount of another source (warnOtherNFSMount).
+	nfsOtherWarned sync.Map
 	// nfsMem is what this daemon has seen of its nfs pools' mounts.
 	nfsMem nfsMountMemory
 	// cephTrash is what the last scans of the ceph pools' trash found that no

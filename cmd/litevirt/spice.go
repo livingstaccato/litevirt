@@ -63,7 +63,12 @@ host's SPICE port isn't externally reachable:
 						return err
 					}
 					fmt.Printf("\nLaunching %s %s\n", path, resp.Uri)
-					return exec.Command(path, spiceLaunchArgs(vv)...).Start()
+					if err := exec.Command(path, spiceLaunchArgs(vv)...).Start(); err != nil {
+						// remote-viewer never read it, so it never deleted it.
+						_ = os.Remove(vv)
+						return err
+					}
+					return nil
 				}
 				return nil
 			})

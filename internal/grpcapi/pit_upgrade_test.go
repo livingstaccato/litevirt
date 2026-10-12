@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -216,9 +217,21 @@ func TestUpgradeHost_AHungDirectoryRefusesWithinTheDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
+	// pitOverlayScan walks each directory in a goroutine it does not wait
+	// for, and reads walkForOverlays when that goroutine starts. Two scans
+	// run below (the swap and the preflight), each over data/disks and the
+	// hung pool, so four walks must have entered and returned before the
+	// seams are restored, or the restore races those reads.
+	var walks sync.WaitGroup
+	walks.Add(4)
 	prevWalk, prevTimeout := walkForOverlays, pitOverlayScanTimeout
+	t.Cleanup(func() {
+		close(release)
+		walks.Wait()
+		walkForOverlays, pitOverlayScanTimeout = prevWalk, prevTimeout
+	})
 	walkForOverlays = func(root string, fn fs.WalkDirFunc) error {
+		defer walks.Done()
 		if root == hung {
 			<-release
 			return nil
@@ -226,7 +239,6 @@ func TestUpgradeHost_AHungDirectoryRefusesWithinTheDeadline(t *testing.T) {
 		return prevWalk(root, fn)
 	}
 	pitOverlayScanTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { walkForOverlays, pitOverlayScanTimeout = prevWalk, prevTimeout })
 
 	start := time.Now()
 	err := upgradeWith(t, s, upgradeScript(false), false)

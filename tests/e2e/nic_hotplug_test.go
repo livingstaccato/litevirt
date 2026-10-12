@@ -1,10 +1,14 @@
 package e2e
 
 import (
+	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/tests/e2e/e2ehelp"
 )
 
 // NIC hot-detach against a real libvirt domain — the regression guard for the
@@ -73,6 +77,101 @@ func waitGuestActive(t *testing.T, domain string, timeout time.Duration) {
 		time.Sleep(10 * time.Second)
 	}
 	t.Logf("guest %s not visible on the network after %s; continuing anyway", domain, timeout)
+}
+
+// virtioDriversOK reports whether vm (on host) has at least one virtio device of
+// the given kind ("virtio-blk", "virtio-net") and a guest driver has taken up
+// every one of them: DRIVER_OK in the device status, which the guest sets once
+// its driver has bound and initialised the device. It asks QEMU directly
+// (x-query-virtio / x-query-virtio-status, QEMU >= 7.2) on the VM's host, so it
+// is a fact about the guest, not litevirt's report of one.
+//
+// It needs no NIC and no guest agent, which a VM from `lv run` has neither of.
+// The meaningful use is the hot-added NIC: virtio-net being driven means the
+// guest has enumerated the device it will be asked to eject. The root disk's
+// virtio-blk is a weak "guest booted" signal only, since SeaBIOS and OVMF drive
+// virtio-blk themselves to boot and can set DRIVER_OK while still in firmware.
+//
+// The reply parsing lives in e2ehelp (VirtioDriverOK), where it is unit tested
+// against QEMU's real status strings.
+//
+// An error means the question could not be asked (no shell on the host, no
+// virsh, a QEMU older than 7.2, a reply format the parser does not know), never
+// "not ready".
+func virtioDriversOK(host, vm, kind string) (bool, error) {
+	qmp := func(cmd string) (json.RawMessage, error) {
+		out, err := nodeOut(host, "virsh -c qemu:///system qemu-monitor-command "+shellQuote(vm)+" "+shellQuote(cmd))
+		if err != nil {
+			return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
+		}
+		return e2ehelp.QMPReturn(out)
+	}
+	raw, err := qmp(`{"execute":"x-query-virtio"}`)
+	if err != nil {
+		return false, err
+	}
+	devs, err := e2ehelp.VirtioDevices(raw)
+	if err != nil {
+		return false, err
+	}
+	found := false
+	for _, d := range devs {
+		if d.Name != kind {
+			continue
+		}
+		found = true
+		st, err := qmp(`{"execute":"x-query-virtio-status","arguments":{"path":"` + d.Path + `"}}`)
+		if err != nil {
+			return false, err
+		}
+		ok, err := e2ehelp.VirtioDriverOK(st)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return found, nil
+}
+
+// waitVirtioDriversOK waits until virtioDriversOK holds and reports whether it
+// could tell. It returns false at once, with the reason logged, when the host
+// cannot be asked: the caller's CLI-level assertions then carry the test alone.
+// A guest that never takes the device up within timeout fails the test.
+func waitVirtioDriversOK(t *testing.T, host, vm, kind string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := virtioDriversOK(host, vm, kind)
+		if err != nil {
+			t.Logf("cannot read the guest's %s driver state on %s (%v); continuing without the guest wait", kind, host, err)
+			return false
+		}
+		if ok {
+			return true
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no guest driver took up %s's %s device(s) within %v", vm, kind, timeout)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// nicCopies reports whether mac is in vm's live domain and in its persistent
+// definition, read with virsh on host.
+func nicCopies(host, vm, mac string) (live, config bool, err error) {
+	q := shellQuote(vm)
+	out, err := nodeOut(host, "V='virsh -c qemu:///system'; echo '##live'; $V dumpxml "+q+"; echo '##config'; $V dumpxml --inactive "+q)
+	if err != nil {
+		return false, false, fmt.Errorf("%v: %.200s", err, out)
+	}
+	liveXML, configXML, ok := strings.Cut(out, "##config")
+	if !ok {
+		return false, false, fmt.Errorf("unexpected dumpxml output: %.200s", out)
+	}
+	has := func(x string) bool { return strings.Contains(strings.ToLower(x), "address='"+strings.ToLower(mac)+"'") }
+	return has(liveXML), has(configXML), nil
 }
 
 // TestVM_DetachNIC_ActuallyRemovesItFromTheDomain attaches a NIC, confirms

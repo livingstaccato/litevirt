@@ -10,6 +10,7 @@ import (
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Store manages local image storage.
@@ -26,9 +27,15 @@ func NewStore(dataDir string) *Store {
 	}
 }
 
-// Init creates required directories.
+// Init creates required directories. One the mount table has as a mount
+// point exists, and is not touched: an operator may mount the image store, or
+// the disk directory, from an NFS server, and a stat there blocks the daemon's
+// start for as long as that server does not answer (lab 2 F-1).
 func (s *Store) Init() error {
 	for _, d := range []string{s.imageDir, s.diskDir} {
+		if storage.IsMountPoint(d) {
+			continue
+		}
 		if err := diskmode.MkdirAll(d); err != nil {
 			return fmt.Errorf("create dir %s: %w", d, err)
 		}

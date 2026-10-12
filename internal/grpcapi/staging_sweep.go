@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // stagingTempPrefixes are the os.CreateTemp prefixes used by streaming
@@ -62,8 +63,16 @@ func sweepLegacyReplicaPartials(dir string, maxAge time.Duration, now time.Time)
 	return sweepStale(dir, maxAge, now, isLegacyReplicaPartial)
 }
 
+// stagingReadDir lists a directory SweepStaleStaging looks into; tests
+// replace it.
+var stagingReadDir = os.ReadDir
+
 func sweepStale(dir string, maxAge time.Duration, now time.Time, match func(string) bool) int {
-	entries, err := os.ReadDir(dir)
+	return sweepStaleWith(os.ReadDir, dir, maxAge, now, match)
+}
+
+func sweepStaleWith(readDir func(string) ([]os.DirEntry, error), dir string, maxAge time.Duration, now time.Time, match func(string) bool) int {
+	entries, err := readDir(dir)
 	if err != nil {
 		return 0
 	}
@@ -97,14 +106,18 @@ func hasStagingPrefix(name string) bool {
 }
 
 // SweepStaleStaging removes leaked operation staging temp files from this host's
-// pool, image, and disk directories. Called once at startup so a daemon that was
-// killed mid-replicate/upload/import/restore doesn't leak staging files forever.
+// pool, image, and disk directories. Called once at startup, in the background
+// (daemon.startStorageSweeps), so a daemon that was killed
+// mid-replicate/upload/import/restore doesn't leak staging files forever. Each
+// directory is swept under its own bound: one on an NFS mount whose server does
+// not answer is skipped (lab 2 F-1).
 // Pool directories additionally lose any stale ".<replica>.partial" an older
 // build's publishReplica left behind (isLegacyReplicaPartial).
 //
 // It is also where a starting daemon records that this host has begun
 // recording pool files (MarkPoolRecords, pool_records.go).
 func (s *Server) SweepStaleStaging(ctx context.Context) {
+	readDir := stagingReadDir
 	s.MarkPoolRecords(ctx)
 	dirs := map[string]struct{}{
 		filepath.Join(s.dataDir, "images"): {},
@@ -125,7 +138,8 @@ func (s *Server) SweepStaleStaging(ctx context.Context) {
 				replicaDirs[dir] = struct{}{}
 				// Replicas are written inside the pool's replica area, one
 				// directory per VM; their staging temps are there too.
-				if owners, rerr := os.ReadDir(filepath.Join(dir, replicaAreaDir)); rerr == nil {
+				area := filepath.Join(dir, replicaAreaDir)
+				if owners, rerr := storage.Bounded("list", area, func() ([]os.DirEntry, error) { return readDir(area) }); rerr == nil {
 					for _, o := range owners {
 						if o.IsDir() {
 							dirs[filepath.Join(dir, replicaAreaDir, o.Name())] = struct{}{}
@@ -135,12 +149,26 @@ func (s *Server) SweepStaleStaging(ctx context.Context) {
 			}
 		}
 	}
+	// Each directory under its own bound (storage.Bounded): a pool on an NFS
+	// mount whose server does not answer blocks its listing in the kernel,
+	// and must not keep the others from being swept. Its sweep finishes on
+	// its own once the server answers; the age guard keeps that safe.
 	total := 0
+	sweep := func(what, dir string, match func(string) bool) {
+		n, err := storage.Bounded(what, dir, func() (int, error) {
+			return sweepStaleWith(readDir, dir, time.Hour, time.Now(), match), nil
+		})
+		if err != nil {
+			slog.Warn("startup: staging temp files not swept from a directory that does not answer", "dir", dir, "error", err)
+			return
+		}
+		total += n
+	}
 	for dir := range dirs {
-		total += sweepStaleStagingTemps(dir, time.Hour, time.Now())
+		sweep("sweep staging temps in", dir, isStagingTemp)
 	}
 	for dir := range replicaDirs {
-		total += sweepLegacyReplicaPartials(dir, time.Hour, time.Now())
+		sweep("sweep legacy replica temps in", dir, isLegacyReplicaPartial)
 	}
 	if total > 0 {
 		slog.Info("startup: swept stale staging temp files (leaked by a prior hard crash)", "removed", total)

@@ -580,8 +580,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetLocalVersion(d.cfg.Version)
 
 	// Register storage pools in the cluster DB and start periodic refresh.
+	// Their statfs and path resolutions are bounded (poolStatfs,
+	// storage.Bounded). The in-place hardening of an NFS mount runs a remount
+	// command, and is waited for only up to startupStepBound
+	// (startup_bound.go).
 	d.registerStoragePools(ctx)
-	d.hardenNFSPoolMounts(ctx)
+	awaitStartupStep("harden NFS pool mounts", startupStepBound, func() { d.hardenNFSPoolMounts(ctx) })
 	d.refreshDBPoolCapacity(ctx)
 	go d.refreshStoragePools(ctx)
 
@@ -728,7 +732,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner.HostAccess.Deny = append(lxcRunner.HostAccess.Deny, d.storeDenyStatic()...)
 	lxcRunner.HostAccess.DenyFunc = d.storeDenyDynamic
 	lxcRunner.HostAccess.BlockInUse = d.vmDiskBlockInUse
-	d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(lxcRunner.HostAccess))
+	// In the background: it stats every protected tree, backup repos
+	// included, and one of those may be on an NFS mount whose server does not
+	// answer (startup_bound.go).
+	go func(ha lxc.HostAccess) { d.noteHostAccessOverlaps(ctx, lxc.HostAccessOverlaps(ha)) }(lxcRunner.HostAccess)
 	go refreshHookPolicies(ctx, lxcRunner)
 	lxcRunner.SubIDSpan = &lxc.IDMap{Base: d.cfg.Containers.IDMapBase, Size: int64(d.cfg.Containers.IDMapRanges) * lxc.IDMapSize}
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
@@ -897,8 +904,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go d.runPeriodicPCIScan(ctx, interval)
 	}
 
-	// Ensure libvirt storage pools exist.
-	d.ensureStoragePools()
+	// Ensure libvirt storage pools exist. libvirtd may stat a pool's
+	// directory to define or refresh it, and block on an NFS server that does
+	// not answer: waited for only up to startupStepBound.
+	awaitStartupStep("ensure libvirt storage pools", startupStepBound, d.ensureStoragePools)
 
 	// Start gRPC server with mTLS
 	tlsCfg, err := pki.ServerTLSConfig(d.cfg.PKIDir)
@@ -1084,9 +1093,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The replacement transition displaced the rows describing what the replaced VM
 	// owned, so its journaled manifest is the only surviving record of the volumes
 	// to free — and nothing else will ever look at it.
-	if err := svc.ResumeVMReplaceCleanups(ctx); err != nil {
-		slog.Warn("cutover: resuming journaled cleanups at startup", "error", err)
-	}
+	// In the background: it removes the replaced VM's volumes, which may be on
+	// an NFS pool whose server does not answer, and it is safe at any time
+	// (each cleanup is taken under its VMs' locks and re-read there).
+	go func() {
+		if err := svc.ResumeVMReplaceCleanups(ctx); err != nil {
+			slog.Warn("cutover: resuming journaled cleanups at startup", "error", err)
+		}
+	}()
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
 	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
@@ -1698,12 +1712,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Sweep staging temp files leaked by a prior hard crash (SIGKILL skips the
 	// deferred cleanup of replicate/upload/import/restore temps — they'd
-	// otherwise accumulate and fill the pool/image dirs).
-	svc.SweepStaleStaging(ctx)
-	// The pool-file records marks SweepStaleStaging wrote are retried until
-	// the replicated rows are writable: on a new cluster failover_scope_v1
-	// latches after the first start (pool_records.go).
-	go svc.RunPoolRecordsMarker(ctx)
+	// otherwise accumulate and fill the pool/image dirs). Then retry the
+	// pool-file records marks SweepStaleStaging wrote until the replicated
+	// rows are writable: on a new cluster failover_scope_v1 latches after the
+	// first start (pool_records.go). Both in the background: they read every
+	// pool directory, and one on an NFS mount whose server does not answer
+	// blocked this start for good (lab 2 F-1; startup_bound.go).
+	startStorageSweeps(ctx, svc)
 	startLegacyImageProvenance(ctx, svc)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
@@ -2119,6 +2134,26 @@ func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 // paths distinct filesystems — every temp dir a test can make sits on one.
 var statfsFn = syscall.Statfs
 
+// poolStatfs is statfsFn under storage.Bounded. A pool's directory can be on
+// an NFS mount (an nfs pool's --target, a dir pool on an fstab mount) whose
+// server does not answer, and a statfs there blocks in the kernel until it
+// does: at daemon start that held the gRPC server from ever serving, and the
+// peers fenced the host (lab 2 F-1). It returns an error a caller treats as a
+// statfs that failed.
+func poolStatfs(path string, st *syscall.Statfs_t) error {
+	statfs := statfsFn
+	got, err := storage.Bounded("statfs", path, func() (syscall.Statfs_t, error) {
+		var s syscall.Statfs_t
+		err := statfs(path, &s)
+		return s, err
+	})
+	if err != nil {
+		return err
+	}
+	*st = got
+	return nil
+}
+
 // sumPoolDiskTotalGiB returns this host's disk capacity in GiB: the statfs
 // total of every filesystem holding one of its storage pools, each filesystem
 // counted once. It is the hosts.disk_total recorded at startup, and the
@@ -2166,7 +2201,7 @@ func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
 	var totalBytes uint64
 	for _, t := range targets {
 		var st syscall.Statfs_t
-		if err := statfsFn(t, &st); err != nil {
+		if err := poolStatfs(t, &st); err != nil {
 			continue
 		}
 		key := fsKey{fsid: st.Fsid}
@@ -2195,7 +2230,7 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 	}
 	// <data_dir>/disks on NFS is an export no pool on any host may hold:
 	// every row this host registers records it (storage.DataDisksExportOption).
-	disksExp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: "dir", Target: filepath.Join(d.cfg.DataDir, "disks")})
+	disksExp, disksErr := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: "dir", Target: filepath.Join(d.cfg.DataDir, "disks")})
 	configured := map[string]bool{}
 	for _, p := range pools {
 		configured[p.Name] = true
@@ -2207,14 +2242,29 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			Target:   p.Target,
 			State:    "active",
 		}
+		// What the row records now, kept where it cannot be judged afresh.
+		cur, curFound, curErr := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, p.Name)
+		if curErr != nil {
+			curFound = false
+		}
 		// A directory pool on an NFS mount records the export it is on, so
 		// other hosts compare their pools against it (storage.NFSExportOption).
+		// One whose directory does not resolve in time (its NFS server does
+		// not answer) keeps the export it recorded, never loses it.
 		opts := map[string]string{}
-		if exp := nfsExportOfDirPool(d.cfg.DataDir, p); exp != "" {
+		exp, expErr := nfsExportOfDirPool(d.cfg.DataDir, p)
+		if expErr != nil && curFound {
+			exp = cur.Options[storage.NFSExportOption]
+		}
+		if exp != "" {
 			opts[storage.NFSExportOption] = exp
 		}
-		if disksExp != "" {
-			opts[storage.DataDisksExportOption] = disksExp
+		dexp := disksExp
+		if disksErr != nil && curFound {
+			dexp = cur.Options[storage.DataDisksExportOption]
+		}
+		if dexp != "" {
+			opts[storage.DataDisksExportOption] = dexp
 		}
 		// A ceph pool's row carries this host's key fingerprint, which the
 		// pool's other hosts compare theirs against (grpcapi/ceph_secrets.go).
@@ -2229,8 +2279,7 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		// An iscsi pool's state is its session's, which the session reconcile
 		// records (grpcapi.ReconcileISCSISessions): kept, not reset to active.
 		if strings.EqualFold(p.Driver, "iscsi") {
-			if cur, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, p.Name); err == nil && ok &&
-				strings.EqualFold(cur.Driver, "iscsi") && cur.State != "" {
+			if curFound && strings.EqualFold(cur.Driver, "iscsi") && cur.State != "" {
 				rec.State = cur.State
 			}
 		}
@@ -2238,18 +2287,21 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		// records (grpcapi.ReconcileNFSMounts): kept, not reset to active —
 		// an unmounted mount point is a local directory statfs measures.
 		if strings.EqualFold(p.Driver, "nfs") {
-			if cur, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, p.Name); err == nil && ok &&
-				strings.EqualFold(cur.Driver, "nfs") && cur.State == grpcapi.PoolStateDegraded {
+			if curFound && strings.EqualFold(cur.Driver, "nfs") && cur.State == grpcapi.PoolStateDegraded {
 				rec.State = cur.State
 			}
 		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
-			if err := syscall.Statfs(p.Target, &st); err == nil {
+			if err := poolStatfs(p.Target, &st); err == nil {
 				rec.TotalBytes = int64(st.Blocks * uint64(st.Bsize))
 				rec.UsedBytes = int64((st.Blocks - st.Bavail) * uint64(st.Bsize))
 			} else {
 				rec.State = "error"
+				if storage.IsFSNoAnswer(err) && curFound {
+					// Not measured: the last measurement stands.
+					rec.TotalBytes, rec.UsedBytes = cur.TotalBytes, cur.UsedBytes
+				}
 				slog.Warn("storage pool statfs failed", "pool", p.Name, "target", p.Target, "error", err)
 			}
 		}
@@ -2350,7 +2402,13 @@ func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[strin
 		if configured[r.Name] {
 			continue
 		}
-		exp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		exp, err := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if err != nil {
+			// Its directory did not resolve in time: the recorded export
+			// stands until it can be judged.
+			slog.Warn("storage pools: cannot judge which NFS export a pool is on; its record is kept", "pool", r.Name, "error", err)
+			continue
+		}
 		if r.Options[storage.NFSExportOption] == exp {
 			continue
 		}
@@ -2388,8 +2446,10 @@ func (d *Daemon) defaultPoolDir(ctx context.Context) string {
 }
 
 // nfsExportOfDirPool is the export a configured directory pool's directory is
-// on ("" when on none, or not a directory pool).
-func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
+// on ("" when on none, or not a directory pool). An error: it cannot be told
+// (the directory did not resolve in time, storage.NFSBackingOf), and the
+// caller keeps what it recorded.
+func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) (string, error) {
 	var dir string
 	switch strings.ToLower(p.Driver) {
 	case "", "local":
@@ -2402,20 +2462,23 @@ func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
 	case "btrfs":
 		dir = p.Source
 	default:
-		return ""
+		return "", nil
 	}
 	if dir == "" {
-		return ""
+		return "", nil
 	}
 	mt, err := storage.ReadMountTable()
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	b, err := mt.NFSBackingOf(dir)
-	if err != nil || b == nil {
-		return ""
+	if storage.IsFSNoAnswer(err) {
+		return "", err
 	}
-	return b.Export.String()
+	if err != nil || b == nil {
+		return "", nil
+	}
+	return b.Export.String(), nil
 }
 
 // hardenNFSPoolMounts hardens in place, at start, every NFS pool of this host
@@ -2548,7 +2611,7 @@ func (d *Daemon) refreshDBPoolCapacity(ctx context.Context) {
 			continue
 		}
 		var st syscall.Statfs_t
-		if err := syscall.Statfs(p.Target, &st); err != nil {
+		if err := poolStatfs(p.Target, &st); err != nil {
 			slog.Warn("refresh pool capacity: statfs", "pool", p.Name, "target", p.Target, "error", err)
 			p.State = "error"
 			_ = corrosion.UpsertStoragePool(ctx, d.db, p)

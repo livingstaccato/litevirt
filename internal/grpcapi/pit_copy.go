@@ -485,7 +485,13 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 		// Only a disk this host sees clears a hold: on a host where the
 		// shared pool is not mounted, "no overlay" says nothing (P7).
 		if _, err := os.Stat(disk); err == nil {
-			s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+			// A stat error on the overlay establishes nothing: the hold
+			// stays (re-review 1, m2), and the definition is not touched.
+			presence, perr := pitoverlay.PresenceOf(disk)
+			s.repointDanglingPITDefinition(ctx, vm, d, presence, perr)
+			if presence != pitoverlay.OverlayUnknown {
+				s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
+			}
 		}
 		return nil
 	}
@@ -521,7 +527,7 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			// A pivot landed and the daemon died before the overlay went: it
 			// is merged. Point a definition that still names it back at the
 			// disk, then remove it.
-			if err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, nil); err != nil {
+			if err := s.pointPITDefinitionAtDisk(vm, d); err != nil {
 				s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 				return fmt.Errorf("%s: point the definition back at %s: %w", d.DiskName, d.Path, err)
 			}
@@ -564,11 +570,9 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			s.reportStrandedOverlay(ctx, vm, d, overlay, err)
 			return fmt.Errorf("%s: commit the point-in-time overlay %s: %w", d.DiskName, overlay, err)
 		}
-		if s.pitSnapshotter != nil && s.virt != nil && s.virt.DomainExists(vm.Name) {
-			if err := s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, overlay, pitDiskFormat, nil); err != nil {
-				s.reportStrandedOverlay(ctx, vm, d, overlay, err)
-				return fmt.Errorf("%s: point the definition back at %s: %w", d.DiskName, d.Path, err)
-			}
+		if err := s.pointPITDefinitionAtDisk(vm, d); err != nil {
+			s.reportStrandedOverlay(ctx, vm, d, overlay, err)
+			return fmt.Errorf("%s: point the definition back at %s: %w", d.DiskName, d.Path, err)
 		}
 		if err := pitoverlay.Remove(disk); err != nil {
 			return fmt.Errorf("%s: remove the committed overlay %s: %w", d.DiskName, overlay, err)
@@ -577,6 +581,79 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 	s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
 	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_overlay_committed", "ok", "info", committed)
 	return nil
+}
+
+// pointPITDefinitionAtDisk points every disk entry of vm's definition that
+// names d's point-in-time overlay back at d's own file (CommitDiskOverlay:
+// the live commit on an active domain, then the persistent entry). It is
+// the one repoint every path that takes an overlay out of use shares — the
+// heal, an admin's resolve and an in-place restore's set-aside. With no
+// snapshotter, or no domain defined here, there is no definition to repoint.
+func (s *Server) pointPITDefinitionAtDisk(vm *corrosion.VMRecord, d *corrosion.DiskRecord) error {
+	if s.pitSnapshotter == nil || s.virt == nil || !s.virt.DomainExists(vm.Name) {
+		return nil
+	}
+	return s.pitSnapshotter.CommitDiskOverlay(vm.Name, d.Path, pitOverlayPath(d.Path), pitDiskFormat, nil)
+}
+
+// repointDanglingPITDefinition points a stopped domain's definition that
+// still names d's overlay at d's own file, when the overlay is PROVABLY set
+// aside: a restore by a build that set it aside without the repoint (lab 2
+// run c2, P-1), or one interrupted between the two. It acts only when
+//
+//   - the overlay and its binding both do not exist (ENOENT): any other stat
+//     error (EIO, ESTALE, EACCES, an unmounted pool) proves nothing, and an
+//     overlay that may still hold the guest's newest writes must never be
+//     bypassed (C-1 of the pit-restore review);
+//   - an orphan of it lies beside the disk, of the window the disk carries
+//     now (pitoverlay.SetAsideEvidence): an overlay moved anywhere else — an
+//     admin's safety copy — is not a set-aside, nor is an older window's
+//     orphan evidence for a later one, and booting the base would fork the
+//     VM away from it;
+//   - the domain is defined here, inactive, and its definition names the
+//     overlay.
+//
+// The filesystem checks come first, so the common case (no orphan) costs no
+// libvirt call. Otherwise nothing is touched and the start fails as it does
+// on main, naming the missing file. Nothing is deleted. A failure is logged
+// and never refuses what the caller does.
+func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, presence pitoverlay.Presence, perr error) {
+	disk := s.hostDiskFile(d.Path)
+	overlay := pitOverlayPath(d.Path)
+	switch presence {
+	case pitoverlay.OverlayAbsent:
+	case pitoverlay.OverlayUnknown:
+		// A binding left without its overlay (a crash inside Remove) is
+		// not a fault: logged quietly, not on every operation (m1).
+		log := slog.Warn
+		if errors.Is(perr, pitoverlay.ErrLoneBinding) {
+			log = slog.Debug
+		}
+		log("point-in-time overlay: cannot tell whether it is there; the domain's definition is left as it is",
+			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", perr)
+		return
+	default:
+		return
+	}
+	if !pitoverlay.SetAsideEvidence(disk) {
+		return
+	}
+	if s.pitSnapshotter == nil || s.virt == nil || !s.virt.DomainExists(vm.Name) || s.domainActivity(vm) != activityInactive {
+		return
+	}
+	used, err := s.pitSnapshotter.DomainUsesFile(vm.Name, overlay)
+	if err != nil || !used {
+		return
+	}
+	if err := s.pointPITDefinitionAtDisk(vm, d); err != nil {
+		slog.Warn("point-in-time overlay: the definition names an overlay that is not there and could not be pointed back at the disk",
+			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", err)
+		return
+	}
+	detail := fmt.Sprintf("%s: the domain's definition named the point-in-time overlay %s, which was set aside; it was pointed back at the disk %s. The set-aside overlay is kept beside the disk as %s.orphan-*",
+		d.DiskName, overlay, d.Path, overlay)
+	slog.Warn("point-in-time overlay: definition pointed back at the disk", "vm", vm.Name, "detail", detail)
+	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_definition_repointed", "warning", "warn", detail)
 }
 
 // pitBind, pitMarkCommitting and pitMarkPivoting are pitoverlay's, as

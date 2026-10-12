@@ -2433,6 +2433,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 	defer releaseLock()
+	// The admission inventory cache (localInventoryTTL) would otherwise keep
+	// a deleted running VM for up to 10 s with no row here to account for
+	// it, charging its memory as runtime-only load against the next create
+	// (lab 2 run c2, P-3). Dropping it only forces a fresh read.
+	defer s.invalidateInventoryCache()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {

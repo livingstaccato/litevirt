@@ -270,3 +270,36 @@ func TestAbortOnMigrateTimeout(t *testing.T) {
 		t.Error("a client disconnect aborted the migration; it should be adopted and finish")
 	}
 }
+
+// M-1 of the pit-restore review: an adopted migration drops the cached
+// admission inventory when it finishes, before it releases the VM's lock —
+// the VM may have left this host, and the next admission reads afresh.
+//
+// Mutation "no invalidation in the adopted goroutine" — red.
+func TestAdoptAbandonedMigration_DropsTheInventoryCache(t *testing.T) {
+	s := testServerWithLocks(t)
+	s.virt = libvirtfake.New()
+	vm := &corrosion.VMRecord{Name: "ghost", HostName: "test-host", State: "migrating"}
+	s.invCacheMu.Lock()
+	s.invCacheAt = time.Now()
+	s.invCacheMu.Unlock()
+
+	done := make(chan error, 1)
+	cleared := make(chan bool, 1)
+	s.adoptAbandonedMigration(context.Background(), vm, "h2", false, nil, done,
+		func() {
+			s.invCacheMu.Lock()
+			cleared <- s.invCacheAt.IsZero()
+			s.invCacheMu.Unlock()
+		}, migrationFinish{})
+	done <- nil
+
+	select {
+	case ok := <-cleared:
+		if !ok {
+			t.Fatal("the adopted migration released its lock with the inventory cache still filled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the adopted migration never released its lock")
+	}
+}

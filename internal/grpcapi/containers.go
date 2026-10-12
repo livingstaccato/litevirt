@@ -639,6 +639,12 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// container that is half deleted.
 	unlock := s.LockContainer(req.Name)
 	defer unlock()
+	// The admission inventory cache (localInventoryTTL) would otherwise list
+	// the deleted container for up to 10 s with no row here to account for
+	// it: an uncapped one then refuses every create on this host as a rogue
+	// (lab 2 run c2, P-3). Dropping the cache only makes the next admission
+	// read the runtime afresh; it never admits anything unread.
+	defer s.invalidateInventoryCache()
 	// A compose recreate's delete forwarded from another entry host: the
 	// create that follows it is judged on this host's disk first, so a
 	// recreate refused there keeps its member (recreate_preflight.go).

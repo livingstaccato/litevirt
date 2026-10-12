@@ -495,7 +495,29 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// failed create left its ceph images behind.
 	createdBy := map[string]storage.Driver{}
 	actualSize := map[string]int64{} // a pool disk's real size, when its driver says
+	// createdSeed is the cloud-init seed this create made, once it has: a
+	// failed create removes it with the disks it made (it holds the
+	// user-data). It is set only once GenerateISO has placed it, after the
+	// orphan sweep below removed whatever an earlier incomplete delete left at
+	// that name, so the file there is this create's own.
+	// createdSeedFile is the file it placed (its identity, from the Stat right
+	// after): a concurrent create of the same name may have placed its own
+	// seed at that name since, and that one is not this create's to remove.
+	var createdSeed string
+	var createdSeedFile os.FileInfo
+	recordSeed := func(path string) {
+		if fi, err := os.Stat(path); err == nil {
+			createdSeed, createdSeedFile = path, fi
+		}
+	}
 	cleanupDisks := func() {
+		if createdSeed != "" {
+			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
+				if rmErr := os.Remove(createdSeed); rmErr != nil && !os.IsNotExist(rmErr) {
+					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
+				}
+			}
+		}
 		for _, p := range createdDiskPaths {
 			if drv := createdBy[p]; drv != nil {
 				// The request may be what failed (cancelled, timed out); the
@@ -1078,6 +1100,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 		}
 		cloudInitISO = isoPath
+		recordSeed(isoPath)
 	} else if spec.Image != "" {
 		// Auto-generate minimal cloud-init for cloud images
 		isoPath := lv.CloudInitISOPath(s.dataDir, spec.Name)
@@ -1092,6 +1115,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// Non-fatal: VM may not need cloud-init
 		} else {
 			cloudInitISO = isoPath
+			recordSeed(isoPath)
 		}
 	}
 

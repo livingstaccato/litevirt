@@ -32,8 +32,10 @@ import (
 //  1. Layer 1 (backup session), lv replicate-volume: point-in-time.
 //  2. Layer 2 (external snapshot), forced by making the session impossible:
 //     the backup scratch directory (/var/lib/litevirt/backup-scratch) is
-//     replaced by a file for the leg, so BeginBackup fails before it reaches
-//     libvirt. No operator knob does this; it is what a host where sessions
+//     made immutable (chattr +i) for the leg, so BeginBackup cannot make its
+//     session directory there and fails before it reaches libvirt. (A file in
+//     its place no longer works: a session sets a root that is not root's
+//     own 0711 directory aside and makes it afresh.) No operator knob does this; it is what a host where sessions
 //     cannot open looks like. Point-in-time, and afterwards libvirt has the
 //     VM on its disk, live and persistent, with no block job and no overlay.
 //  3. Layer 3 (-U), forced by also making the snapshot impossible: the VM's
@@ -43,7 +45,7 @@ import (
 //  4. Scheduled replication (layer 1): point-in-time, recorded so.
 //
 // The leg-2 and leg-3 tricks have two side effects on the node: its backup
-// scratch directory is replaced by a file (any backup or backup session on
+// scratch directory is made immutable (any backup or backup session on
 // that node fails meanwhile), and this test's own pool directory is made
 // immutable. So they run only on a node pinned with E2E_PIT_EXCLUSIVE_NODE
 // (the operator asserting nothing else runs there), under a node-side lock
@@ -217,12 +219,12 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	// (E2E_PIT_EXCLUSIVE_NODE, asserting no other e2e or backup runs there),
 	// under a node-side lock, with a node-side watchdog (systemd-run) that
 	// restores both even if this process is killed; each restore is checked.
-	restore := fmt.Sprintf("[ -f %[1]s ] && rm -f %[1]s && mv %[1]s.e2e-held %[1]s; chattr -i %[2]s; rmdir /run/lv-e2e-pit.lock", scratch, shellQuote(srcDir))
+	restore := fmt.Sprintf("chattr -i %[1]s; chattr -i %[2]s; rmdir /run/lv-e2e-pit.lock", scratch, shellQuote(srcDir))
 	unit := "lv-e2e-pit-restore-" + suffix
 	restoreAndVerify := func() {
 		t.Helper()
 		l.ssh(h, 30*time.Second, restore)
-		if out, err := l.ssh(h, 30*time.Second, fmt.Sprintf("test -d %[1]s && ! test -e %[1]s.e2e-held && ! lsattr -d %[2]s | cut -c1-20 | grep -q i && echo restored", scratch, shellQuote(srcDir))); err != nil || !strings.Contains(out, "restored") {
+		if out, err := l.ssh(h, 30*time.Second, fmt.Sprintf("test -d %[1]s && ! lsattr -d %[1]s | cut -c1-20 | grep -q i && ! lsattr -d %[2]s | cut -c1-20 | grep -q i && echo restored", scratch, shellQuote(srcDir))); err != nil || !strings.Contains(out, "restored") {
 			t.Errorf("leg 2/3 side effects not restored on %s: %v %s", h, err, out)
 		} else {
 			l.mark("legs 2/3: backup scratch and %s restored", srcDir)
@@ -231,7 +233,7 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	}
 	forcedLegs := func() {
 		// Leg 2: no session can open, so an external snapshot.
-		l.mustSSH(h, 30*time.Second, fmt.Sprintf("mv %[1]s %[1]s.e2e-held && touch %[1]s", scratch))
+		l.mustSSH(h, 30*time.Second, fmt.Sprintf("test -d %[1]s && chattr +i %[1]s", scratch))
 		startWriter("l2", "0.25")
 		target, out = replicateVolume("layer 2")
 		writerAlive("layer 2", "l2")

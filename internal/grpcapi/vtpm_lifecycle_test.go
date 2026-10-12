@@ -38,7 +38,7 @@ func firmwareTestServer(t *testing.T, vmName, vmState string) (*Server, *libvirt
 }
 
 // A running disk-only snapshot of an SB/vTPM VM has no consistent firmware-capture
-// point and must be refused (require --with-memory).
+// point and must be refused (require --memory).
 func TestCreateSnapshot_RunningDiskOnlySBTPMRefused(t *testing.T) {
 	s, fake, ctx := firmwareTestServer(t, "vm1", "running")
 	fake.SetState("vm1", libvirtfake.StateRunning)
@@ -47,8 +47,10 @@ func TestCreateSnapshot_RunningDiskOnlySBTPMRefused(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for running disk-only SB/vTPM snapshot, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "--with-memory") {
-		t.Errorf("error should mention --with-memory, got: %v", err)
+	// The flag is `lv snapshot create --memory`; there is no --with-memory
+	// (lab 2 run b: the advice gave "unknown flag").
+	if !strings.Contains(err.Error(), "--memory") || strings.Contains(err.Error(), "--with-memory") {
+		t.Errorf("error should name the CLI flag --memory (and not --with-memory), got: %v", err)
 	}
 }
 

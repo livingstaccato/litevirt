@@ -201,6 +201,44 @@ A narrowing is never what fails an operation: on a filesystem that refuses
 chmod, the file keeps the mode it was made with — already `0600` for every disk
 litevirt makes — and the daemon logs a warning naming it.
 
+The cluster database, `<data_dir>/state.db`, is `0600` and root's, as are the
+`state.db-wal` and `state.db-shm` files SQLite keeps beside it (they take the
+database's mode). It holds every credential the cluster has: password hashes,
+API tokens, the credential tables. It is the one existing file that is
+narrowed in place. Earlier releases made it `0644`, readable by any local
+user, so the daemon narrows it and its `-wal`, `-shm` and `-journal` files at
+every start. Nothing else in the data directory is touched. Nothing but root
+opens the database: the daemon, `lv user reset-admin`, the `lv sg ls`
+fallback, and `litevirt schema-migrate` all run as root. If the narrowing
+fails, the daemon logs a warning naming the file and starts anyway.
+
+A backup session (a backup, a replication, or a point-in-time volume copy of a
+running VM) makes a new directory of its own in each of
+`/var/lib/litevirt/backup-scratch` and `/var/lib/litevirt/backup-sock`: qemu
+creates the fleecing scratch image in one and binds the NBD socket in the
+other, and the daemon reads the disk through that socket. Each name ends in a
+random 16-character suffix and is made with a mkdir that fails if the name
+exists, so a session never uses a directory that was already there. Each
+belongs to the user qemu runs as for that VM (libvirt's DAC label, resolved by
+name when it is one) and is `0700`, so no other local user can reach the socket
+or the scratch. If that user cannot be read from the domain, or the chown is
+refused, the session directory is `01733` instead: every local user may create
+entries in it, so it is made one level further down, inside a fresh root-owned
+`0711` directory that the session makes with its own unguessable name. Nobody
+but root can list either directory, and the fresh one was never readable by
+anyone else, so nobody else can find the session directory, not even a process
+that opened the parent while an earlier release left it `0777`. Both parent
+directories must be root's own `0711` directories. Earlier releases set them to
+`0777` at every session; at daemon start and at every session, root's own directory with
+another mode is narrowed to `0711` in place (safe, because a session never uses
+an entry that was already there). A parent that is another user's, a symlink
+or not a directory is renamed aside to `.backup-scratch.aside-<time>-<id>` (or
+`.backup-sock…`) beside it, kept with everything in it, and made afresh, with a
+warning naming both; remove the set-aside copy once you have looked at it. A
+session's directories are removed when it ends, and a crashed session's
+scratch, or an earlier release's `<vm>-<disk>.scratch`, is removed by the next
+backup of the same disk; that backup's own live session is never touched.
+
 ### Directory pools on NFS
 
 A `local`, `dir` or `btrfs` pool may sit on an NFS mount the host makes itself

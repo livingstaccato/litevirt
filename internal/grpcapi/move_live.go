@@ -79,7 +79,7 @@ func (s *Server) liveMoveVolume(
 	if s.liveMover == nil {
 		return status.Error(codes.Unimplemented,
 			"live storage motion requires a wired LiveMover (running VM); "+
-				"set --skip-live-mover to convert via stop+offline+start")
+				"stop the VM (lv stop), move the volume, then start it again")
 	}
 	if !isFileBasedDriver(src.StorageType) || !isFileBasedDriver(dstPool.Driver) {
 		return status.Error(codes.Unimplemented,

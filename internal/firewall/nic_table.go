@@ -455,9 +455,12 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 	if trunk || vlanOK {
 		// Every frame of a trunk (or of a NIC allowed tags), tagged or not, is
 		// held to the guest's own MAC in ARP and neighbour discovery, and may not answer DHCP or
-		// advertise a router (re-review R2-I1). These match with no network-
-		// header dependency (raw @nh, meta l4proto), because the kernel holds a
-		// single tag outside the frame and nft's ether type then reads the tag.
+		// advertise a router (re-review R2-I1). These match with no link-layer
+		// dependency (raw @nh, meta l4proto, meta protocol), because the kernel
+		// holds a single tag outside the frame and nft's ether type then reads
+		// the tag. Every ICMPv6 match names `meta protocol ip6` first: in the
+		// bridge family a bare `icmpv6` gets an implicit `ether type ip6`, which
+		// misses every tagged frame, VID 0 included (lab 1 F3).
 		fmt.Fprintf(b, "        meta protocol arp @nh,64,48 != %s drop\n", macHex)
 		if !g.AllowDHCPServer {
 			fmt.Fprintf(b, "        meta l4proto udp th sport 67 drop\n")
@@ -466,7 +469,7 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 			fmt.Fprintf(b, "        meta l4proto udp th dport 546 drop\n")
 		}
 		if !g.AllowRouterAdvert {
-			fmt.Fprintf(b, "        icmpv6 type { nd-router-advert, nd-redirect } drop\n")
+			fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-router-advert, nd-redirect } drop\n")
 		}
 		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } @nh,32,16 > 32 drop\n")
 		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-router-solicit @nh,32,16 > 16 drop\n")
@@ -521,7 +524,7 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 		fmt.Fprintf(b, "        ether type ip6 udp dport 546 drop\n")
 	}
 	if !g.AllowRouterAdvert {
-		fmt.Fprintf(b, "        icmpv6 type { nd-router-advert, nd-redirect } drop\n")
+		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-router-advert, nd-redirect } drop\n")
 	}
 	if len(g.ExcludeV4) > 0 {
 		fmt.Fprintf(b, "        ip saddr { %s } drop\n", strings.Join(collapseSetElements(g.ExcludeV4), ", "))
@@ -531,7 +534,9 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 		fmt.Fprintf(b, "        ip saddr != { %s } drop\n", strings.Join(collapseSetElements(g.V4), ", "))
 	}
 
-	// IPv6. The guest's link-local addresses are always knowable — the EUI-64
+	// IPv6. Each ICMPv6 match names `meta protocol ip6` first (see above), so
+	// these hold a priority-tagged (VID 0) frame as they hold an untagged one.
+	// The guest's link-local addresses are always knowable — the EUI-64
 	// one from its MAC, plus any it lists — so they are always held, even when
 	// its global addresses are not: the default router is a link-local
 	// address, and claiming it is how IPv6 traffic is hijacked.
@@ -544,12 +549,12 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 		fmt.Fprintf(b, "        ip6 saddr { %s } drop\n", strings.Join(collapseSetElements(g.ExcludeV6), ", "))
 	}
 	fmt.Fprintf(b, "        ip6 saddr fe80::/10 ip6 saddr != { %s } drop\n", llSet)
-	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert icmpv6 taddr fe80::/10 icmpv6 taddr != { %s } drop\n", llSet)
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-neighbor-advert icmpv6 taddr fe80::/10 icmpv6 taddr != { %s } drop\n", llSet)
 	if g.V6 != nil {
 		own := append(append([]string(nil), g.V6...), ll...)
 		fmt.Fprintf(b, "        ip6 saddr != { %s } drop\n",
 			strings.Join(collapseSetElements(append([]string{"::"}, own...)), ", "))
-		fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert icmpv6 taddr != { %s } drop\n",
+		fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-neighbor-advert icmpv6 taddr != { %s } drop\n",
 			strings.Join(collapseSetElements(own), ", "))
 	}
 	// The link-layer address options of solicitations and advertisements must
@@ -560,8 +565,8 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 	// is at most its header (24 bytes) plus one 8-byte option — the link-layer
 	// address, or a duplicate-address-detection nonce — and a router
 	// solicitation 8 plus one.
-	fmt.Fprintf(b, "        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } ip6 length > 32 drop\n")
-	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit ip6 length > 16 drop\n")
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } ip6 length > 32 drop\n")
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-router-solicit ip6 length > 16 drop\n")
 	renderNDOptionChecks(b, macHex)
 	fmt.Fprintf(b, "    }\n\n")
 }
@@ -569,9 +574,9 @@ func renderGuardChain(b *strings.Builder, dev string, g NICGuard, vlanOK, trunk 
 // renderNDOptionChecks holds the link-layer address option of a guarded
 // guest's router and neighbour solicitations and advertisements to its MAC.
 func renderNDOptionChecks(b *strings.Builder, macHex string) {
-	fmt.Fprintf(b, "        icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != %s drop\n", macHex)
-	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != %s drop\n", macHex)
-	fmt.Fprintf(b, "        icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != %s drop\n", macHex)
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-router-solicit @th,64,16 0x0101 @th,80,48 != %s drop\n", macHex)
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-neighbor-solicit @th,192,16 0x0101 @th,208,48 != %s drop\n", macHex)
+	fmt.Fprintf(b, "        meta protocol ip6 icmpv6 type nd-neighbor-advert @th,192,16 0x0201 @th,208,48 != %s drop\n", macHex)
 }
 
 // v4IntSet renders IPv4 addresses and prefixes as the integers (and integer

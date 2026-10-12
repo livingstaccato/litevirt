@@ -208,6 +208,7 @@ var readMountInfo = func() ([]byte, error) { return os.ReadFile("/proc/self/moun
 // mountEntry is one line of mountinfo: where, the per-mount options, and what
 // is mounted there (filesystem type and source).
 type mountEntry struct {
+	id     string // the mount ID (mountinfo's first field): this mount, not its directory
 	dir    string
 	flags  []string
 	fstype string
@@ -226,7 +227,7 @@ func mounts() ([]mountEntry, error) {
 		if len(f) < 6 {
 			continue
 		}
-		e := mountEntry{dir: filepath.Clean(unescapeMountInfo(f[4])), flags: strings.Split(f[5], ",")}
+		e := mountEntry{id: f[0], dir: filepath.Clean(unescapeMountInfo(f[4])), flags: strings.Split(f[5], ",")}
 		// Optional fields end at "-"; filesystem type and source follow it.
 		if i := slices.Index(f[6:], "-"); i >= 0 && len(f) > 6+i+2 {
 			e.fstype, e.source = f[6+i+1], unescapeMountInfo(f[6+i+2])

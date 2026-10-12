@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -18,8 +19,9 @@ import (
 //
 // Two things keep a server that never answers from costing more than that:
 //
-//   - an identical call (the same op on the same path) still running is
-//     joined, not started again, so each path has at most one stuck goroutine;
+//   - an identical call (the same op on the same path, with the same result
+//     type) still running is joined, not started again, so each path has at
+//     most one stuck goroutine per op;
 //   - once a call under a network mount has gone unanswered, every later call
 //     under that mount (judged from the path as written against the mount
 //     table, with no system call) fails at once, until that call returns. A
@@ -68,27 +70,45 @@ type fsCall struct {
 }
 
 var (
-	fsCalls sync.Map // op + "\x00" + path -> *fsCall
+	fsCalls sync.Map // op, result type and path -> *fsCall
 	fsMu    sync.Mutex
-	fsStuck = map[string]int{} // network mount point -> its unanswered calls still running
+	// fsStuck counts, per network mount, its unanswered calls still running.
+	// It is keyed by the mount itself (its mount ID), not its directory: a
+	// call stuck on a mount that was lazily unmounted stays in the kernel on
+	// that detached mount, and must not fail calls on a new mount made at the
+	// same directory. A daemon restart clears it.
+	fsStuck = map[string]int{}
 )
 
 // Bounded runs fn, an operation op on path, and returns what it returns, or
 // an *FSNoAnswerError when it has not returned within the bound (see above).
+// Only a call of the same op, on the same path, with the same result type T
+// is joined: a joined call returns exactly what that call returns.
 func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
-	v, err := boundedCall(op, path, func() (any, error) { return fn() })
-	t, _ := v.(T)
-	return t, err
+	typ := reflect.TypeFor[T]().String()
+	v, err := boundedCall(op, typ, path, func() (any, error) { return fn() })
+	if err != nil {
+		var zero T
+		if t, ok := v.(T); ok {
+			return t, err
+		}
+		return zero, err
+	}
+	t, ok := v.(T)
+	if !ok && v != nil {
+		return t, fmt.Errorf("%s %s: a call returned %T, not %s", op, path, v, typ)
+	}
+	return t, nil
 }
 
-func boundedCall(op, path string, fn func() (any, error)) (any, error) {
+func boundedCall(op, typ, path string, fn func() (any, error)) (any, error) {
 	bound := fsCallBound
 	path = filepath.Clean(path)
 	mount := networkMountOf(path)
-	if mount != "" && mountUnanswered(mount) {
-		return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount, Earlier: true}
+	if mount.key != "" && mountUnanswered(mount.key) {
+		return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount.dir, Earlier: true}
 	}
-	key := op + "\x00" + path
+	key := op + "\x00" + typ + "\x00" + path
 	c := &fsCall{done: make(chan struct{})}
 	if v, running := fsCalls.LoadOrStore(key, c); running {
 		c = v.(*fsCall)
@@ -96,16 +116,16 @@ func boundedCall(op, path string, fn func() (any, error)) (any, error) {
 		gaveUp := c.timedOut
 		fsMu.Unlock()
 		if gaveUp {
-			return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount, Earlier: true}
+			return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount.dir, Earlier: true}
 		}
 	} else {
 		go func() {
 			val, err := fn()
 			fsMu.Lock()
 			c.val, c.err, c.finished = val, err, true
-			if c.timedOut && mount != "" {
-				if fsStuck[mount]--; fsStuck[mount] <= 0 {
-					delete(fsStuck, mount)
+			if c.timedOut && mount.key != "" {
+				if fsStuck[mount.key]--; fsStuck[mount.key] <= 0 {
+					delete(fsStuck, mount.key)
 				}
 			}
 			fsMu.Unlock()
@@ -128,12 +148,12 @@ func boundedCall(op, path string, fn func() (any, error)) (any, error) {
 	}
 	if !c.timedOut {
 		c.timedOut = true
-		if mount != "" {
-			fsStuck[mount]++
+		if mount.key != "" {
+			fsStuck[mount.key]++
 		}
 	}
 	fsMu.Unlock()
-	return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount, Bound: bound}
+	return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount.dir, Bound: bound}
 }
 
 func mountUnanswered(mount string) bool {
@@ -145,15 +165,19 @@ func mountUnanswered(mount string) bool {
 // networkMountOf is the mount point of the network filesystem path lies on
 // (the deepest mount containing it, as written), or "" when it lies on none
 // or the mount table cannot be read. No system call touches path.
-func networkMountOf(path string) string {
+func networkMountOf(path string) netMount {
 	t, err := ReadMountTable()
 	if err != nil {
-		return ""
+		return netMount{}
 	}
 	return t.networkMountOf(path)
 }
 
-func (t MountTable) networkMountOf(path string) string {
+// netMount is a network mount a path lies on: its directory (for messages)
+// and its key, the mount ID plus the directory (for the latch).
+type netMount struct{ dir, key string }
+
+func (t MountTable) networkMountOf(path string) netMount {
 	var under mountEntry
 	for _, e := range t.all {
 		if within(e.dir, path) && len(e.dir) >= len(under.dir) {
@@ -161,9 +185,9 @@ func (t MountTable) networkMountOf(path string) string {
 		}
 	}
 	if under.dir != "" && isNetworkFstype(under.fstype) {
-		return under.dir
+		return netMount{dir: under.dir, key: under.id + "@" + under.dir}
 	}
-	return ""
+	return netMount{}
 }
 
 // isNetworkFstype reports a filesystem whose calls a remote server answers.

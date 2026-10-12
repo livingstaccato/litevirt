@@ -43,12 +43,15 @@ func TestPassthroughGate_FailsClosedUntilWired(t *testing.T) {
 	}
 }
 
-// promote carries the hot-add band into the domain it defines.
+// Once the release token has latched, promote carries the hot-add band into
+// the domain it defines. (Before it, the band is dropped as main drops it:
+// TestPromoteReplica_ReleaseFeaturesTakeTheCombinedWriter.)
 func TestPromoteReplica_CarriesMemoryHotplug(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	fake := libvirtfake.New()
 	s.virt = fake
+	s.SetReleaseFeatureGate(ioGate{t: t, on: true})
 	ctx := adminCtx()
 	poolDir := t.TempDir()
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})

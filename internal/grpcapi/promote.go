@@ -1020,6 +1020,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		slog.Warn("promote: disk/NIC tuning is not applied to the defined domain",
 			"vm", targetName, "why", ioR.why())
 	}
+	// The limits, hot-add band and USB devices are restricted the same way
+	// (never refusing the promotion); their grants are taken once the
+	// promotion's refusals have passed (relR.grant, below), so the renamed
+	// copy's row is written through the one writer that checks every grant
+	// its spec needs.
+	relR := s.restrictPromotedReleaseFeatures(&spec, renamed)
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1459,6 +1465,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		multiDiskNote = " (" + partialNote + ")"
 	}
 
+	// The release grants for what the spec still carries, now that every
+	// refusal of the promotion has passed (relR.grant): a refused promotion
+	// records no use.
+	relR.grant(ctx, s, &spec)
+
 	var netCfg []lv.NetworkConfig
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics); only persisted on the renamed (new-row) path below
@@ -1518,6 +1529,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				s.releaseOperatorClaim(context.WithoutCancel(ctx), opClaim, retErr.Error())
 			}
 		}()
+	}
+
+	// A renamed promotion is a second VM with fresh MACs: its NICs are new and
+	// guarded by default, as a clone's are (copyNICGuards).
+	var guardRecords []corrosion.NICGuardRecord
+	if renamed {
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+			removeLive()
+			return err
+		}
 	}
 
 	// Define + start — skipped on a resume where the domain was already started by
@@ -1612,6 +1634,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 			return "", nil
 		}
+		if renamed {
+			// The new row is written once the domain runs; until then the
+			// firewall renders its NICs from here (nic_firewall_arming.go).
+			defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
+		}
 		stage, err := attempt(diskCfg)
 		if err != nil && len(diskCfg) > 1 && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
 			// The other disks may be why: the root alone is what main
@@ -1704,7 +1731,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		if err := s.insertVMForSpec(ctx, &spec, ioG, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
+		gs := vmSpecGrants{tuning: ioG, passthrough: relR.passthrough, limits: relR.limits}
+		if err := s.insertVMWithGrants(ctx, &spec, gs, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
@@ -1712,6 +1740,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// nothing here mints a generation; this assigns the first one, marks it,
 		// and publishes the row running.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
+		// The guards apply from the first reconcile that sees the row.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
 		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
@@ -1752,6 +1784,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		op = "failover"
 	}
 	s.auditTuningDropped(ctx, ioR, targetName, op)
+	relR.audit(ctx, s, targetName, op)
 	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,

@@ -44,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -505,9 +506,22 @@ func ResetUserLifecycle(ctx context.Context, c *Client, g capabilities.FeatureGr
 // credential (ReinstatedAdminPasswordHash; re-review 4, m-1): no password
 // matches it and no directory login adopts it, so it is not an admin anyone
 // can log in as. The credential is resolved as AdminLoginState resolves it.
+//
+// Nor, FAIL CLOSED once a clear may have happened, does an admin whose
+// credential this node cannot judge (UserLocalCredential's known=false): an
+// empty old column with no credential row and no evidence that the account is
+// external. Before that such an account is a directory admin and counts. Once
+// credentials_clear_v1 has latched, a reinstated admin's sentinel lives only
+// in its credential row, which replicates separately from the users row, so
+// until it arrives the account would otherwise resolve to "" and count. When
+// such an admin is the only one that might count, the answer is an
+// *AdminCredentialPendingError instead of true: the caller refuses and asks
+// for a retry, and never lets the last admin who can log in go on the
+// strength of an account that may not be able to.
 func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username string, deleting bool) (bool, error) {
 	rows, err := c.Query(ctx,
-		`SELECT u.username, u.password_hash, k.username AS cred_key, k.password_hash AS cred_val
+		`SELECT u.username, u.password_hash, u.created_at, u.updated_at,
+		        k.username AS cred_key, k.password_hash AS cred_val, k.updated_at AS cred_ts
 		   FROM users u LEFT JOIN user_credentials k ON k.username = u.username AND k.deleted_at IS NULL
 		  WHERE u.role = 'admin' AND u.deleted_at IS NULL AND u.username != ?`, username)
 	if err != nil {
@@ -521,22 +535,86 @@ func OtherUnrestrictedAdminExists(ctx context.Context, c *Client, username strin
 	if err != nil {
 		return false, err
 	}
+	var pending []string
+	// Only a clear empties a LOCAL account's old column, so an account this
+	// node cannot judge is in doubt only once credentials_clear_v1 may have
+	// latched: here (MayClearCredentialColumns), or on a peer whose cleared
+	// rows have replicated here (clearEvidence). Before that it is a
+	// directory admin and counts (int-followups review I-1). Asked once, lazily.
+	clearKnown, clearSeen := false, false
+	clearMayHaveHappened := func() (bool, error) {
+		if !clearKnown {
+			clearKnown = true
+			if clearSeen = c.MayClearCredentialColumns(); !clearSeen {
+				ev, err := clearEvidence(ctx, c)
+				if err != nil {
+					clearKnown = false
+					return false, err
+				}
+				clearSeen = ev
+			}
+		}
+		return clearSeen, nil
+	}
 	for _, r := range rows {
 		if amb[NormalizeUsername(r.String("username"))] {
 			continue
 		}
-		if resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash")) == ReinstatedAdminPasswordHash {
+		credKey := r.String("cred_key") != ""
+		if resolveCredential(credKey, r.String("cred_val"), r.String("password_hash")) == ReinstatedAdminPasswordHash {
 			continue
 		}
 		l, err := GetUserLifecycle(ctx, c, r.String("username"))
 		if err != nil {
 			return false, err
 		}
-		if l.Unrestricted() {
-			return true, nil
+		if !l.Unrestricted() {
+			continue
 		}
+		if _, known := c.judgeUserRow(rowIdentity(r), r.String("password_hash"), credKey, r.String("cred_val"), r.String("cred_ts")); !known {
+			cleared, err := clearMayHaveHappened()
+			if err != nil {
+				return false, err
+			}
+			if cleared {
+				pending = append(pending, r.String("username"))
+				continue
+			}
+			// No clear anywhere this node can see: an empty old column is a
+			// directory admin's, which counts, as it always did.
+		}
+		return true, nil
+	}
+	if len(pending) > 0 {
+		return false, &AdminCredentialPendingError{Usernames: pending}
 	}
 	return false, nil
+}
+
+// AdminCredentialPendingError is OtherUnrestrictedAdminExists's answer when
+// the only other admins that might be able to log in are ones whose
+// credential has not reached this node: it cannot tell, so the change that
+// asked must wait (a retry once the row has replicated, or the same request
+// on a node that holds it).
+type AdminCredentialPendingError struct {
+	Usernames []string
+}
+
+func (e *AdminCredentialPendingError) Error() string {
+	if len(e.Usernames) == 1 {
+		return fmt.Sprintf("cannot tell yet whether admin %s can log in: its credential has not reached this node "+
+			"(if it is a directory admin, `lv user mark-external %s` records that)", strconv.Quote(e.Usernames[0]), e.Usernames[0])
+	}
+	return fmt.Sprintf("cannot tell yet whether admins %s can log in: their credentials have not reached this node "+
+		"(for a directory admin, `lv user mark-external <name>` records that)", strings.Join(quoteAll(e.Usernames), ", "))
+}
+
+func quoteAll(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = strconv.Quote(n)
+	}
+	return out
 }
 
 // usableAdmin reports whether username's account can log in now (enabled,

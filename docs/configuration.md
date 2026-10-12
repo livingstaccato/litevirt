@@ -653,8 +653,11 @@ backup_repos:
 # runs into the repo (a scheduled fan-out moves at the repo's rate in total),
 # and covers the disk read and, for a remote backup, the chunks sent to the
 # repo's host. When this host is the repo's sink for a remote backup, it hands
-# its limit to the host that reads the disk. A job's own `--bwlimit` can only
-# lower it. Absent or 0 = no limit; an invalid value refuses to start the
+# its limit to the host that reads the disk. A container replication run is
+# paced by the entry on the OWNER (the host the container runs on) under the
+# target's repo name, shared with that host's backups into a repo of that
+# name; the target host's own entry does not apply to it. A job's own
+# `--bwlimit` can only lower it. Absent or 0 = no limit; an invalid value refuses to start the
 # daemon. See docs/backups.md#bandwidth-limits.
 backup_bwlimits:
   offsite: 100MiB

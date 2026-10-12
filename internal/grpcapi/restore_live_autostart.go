@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -84,10 +86,15 @@ func (s *Server) autoDefineRestoredVM(
 	if ioR.stripped {
 		_ = send(&pb.RestoreLiveProgress{Status: "the backup's disk/NIC tuning is not applied: " + ioR.why()})
 	}
+	if len(ioR.invalid) > 0 {
+		_ = send(&pb.RestoreLiveProgress{Status: "invalid disk/NIC tuning in the backup's spec is not applied: " + strings.Join(ioR.invalid, "; ")})
+	}
 	// A limit in the spec — an operator's --spec or one embedded in a backup,
-	// possibly from a cluster that has latched — is judged as a create's is.
-	if err := s.checkCopiedSpecLimits(ctx, spec); err != nil {
-		return "", "", err
+	// possibly from a cluster that has latched — is dropped, never refused,
+	// where a create's would be refused (restrictRestoredLimits).
+	limDropped := s.restrictRestoredLimits(spec)
+	if len(limDropped) > 0 {
+		_ = send(&pb.RestoreLiveProgress{Status: "CPU/NIC limits in the spec are not applied: " + strings.Join(limDropped, "; ")})
 	}
 
 	originalName := spec.Name
@@ -294,6 +301,16 @@ func (s *Server) autoDefineRestoredVM(
 		})
 	}
 
+	// Restored under a new name, the VM is a second VM with fresh MACs: its
+	// NICs are new and guarded by default, as a clone's are (copyNICGuards).
+	var guardRecords []corrosion.NICGuardRecord
+	if renamed {
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
+			return "", "", err
+		}
+	}
+
 	vmCfg := lv.VMConfig{
 		Name:        targetName,
 		CPU:         int(spec.Cpu),
@@ -335,7 +352,22 @@ func (s *Server) autoDefineRestoredVM(
 	// the domain that holds them is defined.
 	limitsG, err := s.recordLimitedSpec(ctx, spec)
 	if err != nil {
-		return "", "", err
+		// A refusing gate drops the limits, not the restore: the domain is
+		// generated again without them.
+		why := "the vm_limits gate refused: " + status.Convert(err).Message()
+		for _, k := range stripLimits(spec) {
+			d := k + " (" + why + ")"
+			slog.Warn("restored spec: CPU/NIC limit dropped", "vm", targetName, "dropped", d)
+			limDropped = append(limDropped, d)
+		}
+		vmCfg.CPULimit, vmCfg.CPUShares = 0, 0
+		for i := range vmCfg.Networks {
+			vmCfg.Networks[i].RateMBps = 0
+		}
+		if domXML, err = lv.GenerateDomainXML(vmCfg); err != nil {
+			return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		}
+		limitsG = capabilities.FeatureGrant{}
 	}
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
@@ -360,6 +392,11 @@ func (s *Server) autoDefineRestoredVM(
 	// Spare root ports last, as in the reconciler's start: a device the
 	// pre-start patches in would otherwise land on a spare.
 	s.ensureSparePCIeRootPorts(targetName)
+	if len(guardRecords) > 0 {
+		// The row is written once the domain runs; until then the firewall
+		// renders its NICs from here (nic_firewall_arming.go).
+		defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
+	}
 	if err := s.virt.StartDomain(targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can
@@ -434,6 +471,10 @@ func (s *Server) autoDefineRestoredVM(
 		// In the else on purpose: a non-firmware insert failure is NOT fatal on
 		// this path, so an unguarded call would act on a row that does not exist.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
+		// The guards apply from the first reconcile that sees the row.
+		if len(guardRecords) > 0 {
+			s.reconcileLocal(ctx)
+		}
 	}
 	// Only now: the fence has passed and the row is in the cluster, published
 	// running unless assignOwnerEpochAtCreate left it "creating" for the
@@ -446,6 +487,9 @@ func (s *Server) autoDefineRestoredVM(
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
 	s.auditTuningDropped(ctx, ioR, targetName, "restore")
+	if len(limDropped) > 0 {
+		s.audit(ctx, "vm.release_features_dropped", targetName, "restore: not carried: "+strings.Join(limDropped, "; "), "degraded")
+	}
 	return targetName, rootDev, nil
 }
 

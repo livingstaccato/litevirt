@@ -66,3 +66,28 @@ func MutateDesiredSpecWithReleaseFeatures(ctx context.Context, c *Client, tuning
 	}
 	return MutateDesiredSpec(ctx, c, name, fn)
 }
+
+// CheckVMSpecGrants makes the checks InsertVMWithReleaseFeatures and
+// MutateDesiredSpecWithReleaseFeatures make, writing nothing. A caller whose
+// write follows work it cannot cheaply undo (a create that defines and starts
+// the domain first) runs it before that work, so a grant the writer would
+// refuse refuses the request while nothing exists yet. The writers keep their
+// own checks; TestCheckVMSpecGrants_AgreesWithTheWriter pins the two together.
+func CheckVMSpecGrants(tuning, passthrough, limits capabilities.FeatureGrant, needs VMSpecFeatures) error {
+	if needs.Tuning {
+		if err := tuning.Check(capabilities.FeatureVMDiskNICIO); err != nil {
+			return err
+		}
+	}
+	if needs.Passthrough {
+		if err := passthrough.Check(capabilities.FeatureUSBMountsMemory); err != nil {
+			return err
+		}
+	}
+	if needs.Limits {
+		if err := limits.Check(capabilities.FeatureVMLimits); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -277,7 +277,12 @@ cluster-wide immediately before the limit's first data (the `vm_limits` feature
 in `lv cluster upgrade-status`). Files and updates without limits are not affected,
 and clearing a limit (`0`) is always allowed. Once a limit has been set, rolling back
 below the release puts each node into WAL quarantine until it is upgraded again;
-a cluster that never sets one can still roll back.
+a cluster that never sets one can still roll back. A promotion of a replica, or a
+live restore, whose spec carries limits is never refused for them: they are kept
+once the gate grants them; a value a create would refuse is dropped by itself, the
+valid ones kept; and all of them are dropped before the latch or when the gate
+refuses after it. Each drop is logged by name and audited
+(`vm.release_features_dropped`).
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -463,7 +468,11 @@ or promotion of a spec that carries them still works, with the tuning dropped. O
 token has latched, the first write of any of them (an unset discard becomes the
 storage default on a new disk only once the feature is already in use, so a plain create never waits on a first use) records the feature as used; see upgrades.md, *Rolling back after a release token
 latched*, for what a rollback does. A restore whose tuning the gate refuses after the latch
-still completes, with the tuning dropped, a warning and an audit row.
+still completes, with the tuning dropped, a warning and an audit row. So does a restore
+or promotion whose spec carries a value a create would refuse (queues above the limit, a
+total throttle beside a read one): that disk's tuning, or that NIC's queues, is dropped
+with a warning naming each key and an audit row (`vm.tuning_dropped`), and the rest is
+kept.
 The gate has no config flag and, once open, stays open; to stop using the feature, clear
 the settings (`lv disk-io <vm> --clear`, or drop the keys).
 

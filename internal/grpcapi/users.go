@@ -412,6 +412,15 @@ func sessionCutoffRefusal(life corrosion.UserLifecycle, username string) error {
 		"the account was changed moments ago; log in again after %s (in at most %s)", at, corrosion.SessionCutoffSkewMargin)
 }
 
+// lastAdminPendingRefusal is the message of a last-admin refusal made because
+// the only other admins that might log in are ones whose credential has not
+// reached this node (corrosion.AdminCredentialPendingError): the guard fails
+// closed, and the change can be retried once it has.
+func lastAdminPendingRefusal(username string, pend *corrosion.AdminCredentialPendingError) string {
+	return fmt.Sprintf("user %q may be the cluster's last admin account that can log in: %v, so the change is refused "+
+		"for now. Retry in a moment, once it has replicated, or make the change on another node", username, pend)
+}
+
 // lastAdminRefusal is the message of a last-admin refusal. Every way out it
 // names is one the refused caller — a logged-in admin — can take, with its
 // arguments (re-review 3, I1b): create another admin, enable or un-expire a
@@ -935,6 +944,9 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		// is "a live successor that cannot actually log in".
 		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, target.Username, true)
 		if oerr != nil {
+			if pend := (*corrosion.AdminCredentialPendingError)(nil); errors.As(oerr, &pend) {
+				return nil, status.Error(codes.Unavailable, lastAdminPendingRefusal(target.Username, pend))
+			}
 			return nil, status.Errorf(codes.Internal,
 				"check for another admin before deleting %q: %v", req.Username, oerr)
 		}

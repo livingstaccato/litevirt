@@ -9,9 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -77,16 +74,15 @@ func drainRestore(t *testing.T, c *Cluster, n *Node, repo, vm, ts, newName strin
 
 // A backup manifest is untrusted. Before the gate opens a restore that main
 // allows still works and the manifest's tuning is dropped (the older peers would
-// drop it anyway); once open it is rendered; and an invalid value is refused
-// before a domain is defined.
+// drop it anyway); once open it is rendered; and an invalid value is dropped,
+// never refused (a recovery path main allowed), the valid rest kept.
 //
 // Mutations: skip restrictRestoredTuning — the unlatched case renders tuning and
-// the invalid case defines a domain; delete the ApplyDiskTuning/NIC calls in
+// the invalid case renders its queues; delete the ApplyDiskTuning/NIC calls in
 // autoDefineRestoredVM — the latched case goes red.
 func TestFleet_RestoreLiveTreatsAManifestsTuningAsUntrusted(t *testing.T) {
 	c := New(t, Options{Nodes: 1})
 	n := c.Nodes[0]
-	ctx := context.Background()
 	setHostCapacity(t, c, n.Name, 64, 65536)
 	n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
 
@@ -112,19 +108,20 @@ func TestFleet_RestoreLiveTreatsAManifestsTuningAsUntrusted(t *testing.T) {
 		t.Errorf("a latched restore renders throttle=%d discard=%v queues=%v, want 321/true/true", iops, discard, queues)
 	}
 
-	// Latched, a hand-edited manifest: refused before anything is defined.
+	// Latched, a hand-edited manifest: a restore is a recovery path, so it is
+	// not refused. The invalid queues are dropped (never rendered or stored),
+	// and the valid disk tuning is kept.
 	bad := tunedSpec("bk3")
 	bad.Network[0].Queues = 4096
 	repo, ts = seedVMBackupWithSpec(t, bad)
-	err := drainRestore(t, c, n, repo, "bk3", ts, "r-bad")
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("queues 4096 in a manifest: %v, want InvalidArgument", err)
+	if err := drainRestore(t, c, n, repo, "bk3", ts, "r-bad"); err != nil {
+		t.Fatalf("queues 4096 in a manifest: %v, want the restore to go ahead with them dropped", err)
 	}
-	if n.Virt.DomainExists("r-bad") {
-		t.Error("a refused restore defined a domain")
+	if iops, discard, queues := renderedTuning(t, n.Virt.DefinedXML("r-bad")); iops != 321 || !discard || queues {
+		t.Errorf("restore of an invalid manifest renders throttle=%d discard=%v queues=%v, want 321/true/false", iops, discard, queues)
 	}
-	if rec, _ := corrosion.GetVM(ctx, n.DB, "r-bad"); rec != nil {
-		t.Errorf("a refused restore left a VM row (%s)", rec.State)
+	if got := specOn(t, n, "r-bad"); got.Network[0].Queues != 0 || got.Disks[0].Io == nil {
+		t.Errorf("restore of an invalid manifest stored %+v %+v; want the queues dropped and the throttle kept", got.Disks[0], got.Network[0])
 	}
 	_ = io.EOF
 }

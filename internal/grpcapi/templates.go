@@ -177,6 +177,10 @@ func cloneTargetIgnored(req *pb.CloneVMRequest, vm *pb.VM, srcHost string) error
 		return nil
 	}
 	for _, d := range vm.GetDisks() {
+		// A ceph disk is copied inside its own pool, wherever the clone is made.
+		if strings.HasPrefix(d.GetPath(), "rbd:") {
+			continue
+		}
 		if d.GetStorageVolume() != req.TargetPool {
 			return status.Errorf(codes.FailedPrecondition,
 				"%s, where the clone is made, is on an older release that ignores target_pool: "+
@@ -297,7 +301,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		}
 	}
 	// A ceph disk is copied inside its pool (rbd deep cp); there is no file a
-	// linked clone's qcow2 overlay could back on.
+	// linked clone's qcow2 overlay could back on. A target pool does not move
+	// it: only the file disks are placed there, so its space is admitted in
+	// its own pool, as a create's disk is.
+	cephNeed := map[string]int64{}
 	for _, d := range srcDisks {
 		if mode == "linked" && isRBDDisk(d) {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -309,6 +316,12 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			if err := s.admitPoolAttach(ctx, project, s.hostName, d.StorageVolume); err != nil {
 				return nil, err
 			}
+			cephNeed[d.StorageVolume] += d.SizeBytes
+		}
+	}
+	for pool, need := range cephNeed {
+		if err := s.admitPoolCapacity(ctx, s.hostName, pool, need); err != nil {
+			return nil, err
 		}
 	}
 	// Said to the caller (lv clone prints it), as auto may pick either.

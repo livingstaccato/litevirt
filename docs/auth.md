@@ -941,6 +941,17 @@ directory login, so it keeps its disable. Every last-admin refusal names, with
 its arguments, what the refused admin can do instead: create an admin, enable
 one or lift its expiry, resolve a pair, or give an admin the floor reinstated
 with no credential one (`lv user reset-admin --user <name>`, as root).
+Once a credentials clear may have happened (`credentials_clear_v1` has latched
+on the answering node, or a peer's cleared rows have reached it), the guard
+fails closed on an admin whose credential that node cannot judge yet: a users
+row with no password and no credential row, which is then either a directory
+admin whose evidence has not replicated or a local admin — such as one the
+floor reinstated — whose credential row has not. Such an admin does not count,
+and when it is the only one that might, the change is refused as
+`Unavailable`, naming it, to be retried once the row has replicated (or made
+on another node); for a directory admin, `lv user mark-external <name>`
+records what it is. Before any clear, a users row with no password can only be
+a directory admin's, and it counts, as it always did.
 
 **The one credential a disable cannot reach** is the distributable `lv-cli`
 client certificate: it authenticates as the cluster admin with no user behind

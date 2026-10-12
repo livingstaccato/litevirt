@@ -441,12 +441,15 @@ type restoredTuning struct {
 	// stripped: the spec's tuning was dropped.
 	stripped bool
 	// grant is the feature's grant when the tuning is kept: the row this spec is
-	// written to must go through insertVMForSpec with it.
+	// written to must go through insertVMWithGrants with it.
 	grant capabilities.FeatureGrant
 	// refused is the gate's error when the token HAD latched but the gate still
 	// refused (a first use that could not be acknowledged, a host rolled back
 	// after the latch). Nil when the strip is only "the upgrade has not finished".
 	refused error
+	// invalid names each value dropped after the latch because a create would
+	// refuse it ("disk \"root\" io: ..."), the rest of the tuning kept.
+	invalid []string
 }
 
 // why words the strip for a progress line or a log: the two causes differ.
@@ -462,6 +465,9 @@ func (r restoredTuning) why() string {
 // longer be refused, and with the VM's actual name (--new-name included), so a
 // restore that fails later leaves no row and a renamed one names the right VM.
 func (s *Server) auditTuningDropped(ctx context.Context, r restoredTuning, vm, op string) {
+	if len(r.invalid) > 0 {
+		s.audit(ctx, "vm.tuning_dropped", vm, op+": invalid disk/NIC tuning dropped: "+strings.Join(r.invalid, "; "), "degraded")
+	}
 	if r.refused == nil || !r.stripped {
 		return
 	}
@@ -472,20 +478,28 @@ func (s *Server) auditTuningDropped(ctx context.Context, r restoredTuning, vm, o
 // validated create: a backup manifest or a promoted record. When the token has
 // not latched, or has latched but the feature's gate refuses, the tuning is
 // STRIPPED (a restore main allows is never refused; older peers would drop the
-// fields anyway), a warning is logged and the result says which it was; when the
-// gate opens the values are validated like a create's, so a hand-edited
-// manifest cannot define a domain libvirt refuses or open hundreds of queues.
+// fields anyway), a warning is logged and the result says which it was. Once
+// it has latched the values are validated like a create's, so a hand-edited
+// manifest cannot define a domain libvirt refuses or open hundreds of queues —
+// but a value a create would refuse is DROPPED, with a warning naming it, never
+// a refusal: promote and restore are recovery paths main allowed. A disk's
+// tuning is dropped together (discard and detect_zeroes depend on each other),
+// a NIC's queues alone; the valid rest is kept under the feature's grant.
 func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (restoredTuning, error) {
 	var r restoredTuning
 	if !specSetsDiskNICIO(spec) {
 		return r, nil
 	}
 	if s.ReleaseFeatureAvailable(capabilities.FeatureVMDiskNICIO) {
+		r.invalid = dropInvalidTuning(spec)
+		for _, d := range r.invalid {
+			slog.Warn("restored spec: invalid disk/NIC tuning dropped", "vm", spec.GetName(), "dropped", d)
+		}
+		if !specSetsDiskNICIO(spec) {
+			return r, nil // nothing valid left to write
+		}
 		g, gerr := s.ioGrant(ctx)
 		if gerr == nil {
-			if err := validateSpecTuning(spec); err != nil {
-				return r, status.Errorf(codes.InvalidArgument, "restored spec: %v", err)
-			}
 			r.grant = g
 			return r, nil
 		}
@@ -502,16 +516,37 @@ func (s *Server) restrictRestoredTuning(ctx context.Context, spec *pb.VMSpec) (r
 	return r, nil
 }
 
-// insertVMForSpec writes a new VM row. A spec that carries disk or NIC tuning
-// goes through the feature's writer with its grant; any other spec is written
-// exactly as before, so nothing main allows waits on the release token.
-func (s *Server) insertVMForSpec(ctx context.Context, spec *pb.VMSpec, g capabilities.FeatureGrant, vm corrosion.VMRecord,
-	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
-	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
-	if specSetsDiskNICIO(spec) {
-		return corrosion.InsertVMWithTuning(ctx, s.db, g, vm, ifaces, disks, nics, pciIntents, adopt)
+// dropInvalidTuning clears each disk's tuning and each NIC's queues that a
+// create would refuse (validateSpecTuning, item by item) and names every key
+// it cleared, with the reason. It normalizes discard as validation does.
+func dropInvalidTuning(spec *pb.VMSpec) []string {
+	var dropped []string
+	for _, d := range spec.GetDisks() {
+		if d == nil {
+			continue
+		}
+		d.Discard = compose.NormalizeDiscard(d.Discard)
+		err := compose.ValidateDiskTuning(d)
+		if err == nil {
+			continue
+		}
+		for _, k := range []struct {
+			key string
+			set bool
+		}{{"discard", d.Discard != ""}, {"detect_zeroes", d.DetectZeroes != ""}, {"io", d.Io != nil}} {
+			if k.set {
+				dropped = append(dropped, fmt.Sprintf("disk %q %s (%v)", d.Name, k.key, err))
+			}
+		}
+		d.Discard, d.DetectZeroes, d.Io = "", "", nil
 	}
-	return corrosion.InsertVMWithHardware(ctx, s.db, vm, ifaces, disks, nics, pciIntents, adopt)
+	for i, n := range spec.GetNetwork() {
+		if err := compose.ValidateQueues(n.GetModel(), n.GetQueues()); err != nil {
+			dropped = append(dropped, fmt.Sprintf("network %d queues (%v)", i, err))
+			n.Queues = 0
+		}
+	}
+	return dropped
 }
 
 // requestsHardwareTuning reports whether an UpdateVM request redefines the

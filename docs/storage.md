@@ -1086,7 +1086,11 @@ every host. That is how such pools behaved before and is not recommended.
 - **Clone** (`lv clone`) copies a ceph disk inside its pool with `rbd deep cp`
   — nothing passes through the host, and a root disk's copy stays a clone of
   the same base. The copy lands in the same pool, which the clone's project
-  must be allowed to use. `--mode linked` is refused for a VM with a ceph disk
+  must be allowed to use, and its size is admitted against that pool's free
+  space as a create's disk is. A target pool (`--pool`) places only the VM's
+  file disks: a ceph disk is still copied inside its own pool, and is counted
+  neither against the target pool nor against the host's filesystem.
+  `--mode linked` is refused for a VM with a ceph disk
   (there is no file a qcow2 overlay could back on); auto mode copies.
 - **Delete** (`lv rm`) removes the VM's own images. It never removes an
   imported base (`lvimage+…`), an image outside the pool, one that has

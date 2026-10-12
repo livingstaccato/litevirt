@@ -391,6 +391,9 @@ func (s *Server) SetUserAccount(ctx context.Context, req *pb.SetUserAccountReque
 	if user.Role == "admin" && !next.Unrestricted() {
 		other, oerr := corrosion.OtherUnrestrictedAdminExists(ctx, s.db, user.Username, false)
 		if oerr != nil {
+			if pend := (*corrosion.AdminCredentialPendingError)(nil); errors.As(oerr, &pend) {
+				return nil, status.Error(codes.Unavailable, lastAdminPendingRefusal(user.Username, pend))
+			}
 			return nil, status.Errorf(codes.Internal,
 				"check for another admin before restricting %q: %v", user.Username, oerr)
 		}

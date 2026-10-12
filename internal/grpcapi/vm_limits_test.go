@@ -194,8 +194,9 @@ func TestUpdateVMLimits_RefusesANICRateForANICThatMovedOffItsNetwork(t *testing.
 	}
 }
 
-// A restore defines a VM from an operator-supplied or manifest spec; a limit in
-// it is judged like a create's: gated on the token, and validated.
+// checkCopiedSpecLimits (a clone's copied spec) judges a limit like a create's:
+// gated on the token, and validated. A restore drops instead
+// (TestRestoreLive_SpecLimitsAreDroppedNotRefused).
 func TestRestoreSpec_LimitsAreGatedAndValidated(t *testing.T) {
 	ctx := adminCtx()
 	unlatched := serverWithLimitsGate(t, false)
@@ -221,9 +222,10 @@ func TestRestoreSpec_LimitsAreGatedAndValidated(t *testing.T) {
 	}
 }
 
-// autoDefineRestoredVM runs the check on the resolved spec — an operator's
-// --spec and a manifest's embedded spec alike — before it touches a domain.
-func TestAutoDefineRestoredVM_RefusesALimitBeforeTheToken(t *testing.T) {
+// A restore never refuses for the limits in its spec — an operator's --spec
+// and a manifest's embedded spec alike: before the token they are dropped
+// (TestRestoreLive_SpecLimitsAreDroppedNotRefused covers the restored row).
+func TestAutoDefineRestoredVM_DoesNotRefuseALimitBeforeTheToken(t *testing.T) {
 	s := reconfigServer(t)
 	s.SetReleaseFeatureGate(newLimitsGate(t, false))
 	ctx := adminCtx()
@@ -237,8 +239,8 @@ func TestAutoDefineRestoredVM_RefusesALimitBeforeTheToken(t *testing.T) {
 		"manifest spec": {&pb.RestoreLiveRequest{VmName: "r"}, &pbsstore.Manifest{VMSpecJSON: string(embedded)}},
 	} {
 		_, _, err := s.autoDefineRestoredVM(ctx, tc.req, nil, tc.manifest, "/nonexistent/overlay.qcow2", "_default", noop)
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "cluster upgrade") {
-			t.Errorf("%s: err = %v, want the gate's refusal", name, err)
+		if err != nil && strings.Contains(err.Error(), "cluster upgrade") {
+			t.Errorf("%s: refused for its limits: %v", name, err)
 		}
 	}
 }

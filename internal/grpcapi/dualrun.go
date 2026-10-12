@@ -455,7 +455,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	//    marker that is missing, corrupt, unreadable, or unequal to the DB epoch is
 	//    a violation of the regime: this host's runtime cannot prove it belongs to
 	//    the generation the cluster believes is running there.
-	if s.gate != nil && s.gate.Enforced(ctx, capabilities.OwnerEpochV1) {
+	if s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.OwnerEpochV1) {
 		// Every input the epoch check branches on is replicated LWW state, so a
 		// writer with SQL on any peer could switch the check off with ONE write
 		// and nothing to renew. The three corroborations below do not close that

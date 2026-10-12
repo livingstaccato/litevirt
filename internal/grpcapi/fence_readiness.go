@@ -72,9 +72,9 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 		// marker that survives restart — so this read-only diagnostic, run by a
 		// viewer, would permanently latch the capability and then report the
 		// `true` it had just caused. Latched is a pure in-memory marker read.
-		CapabilityLatched: s.gate != nil && s.gate.Latched(capabilities.SharedStorageFenceV1),
+		CapabilityLatched: s.gateV() != nil && s.gateV().Latched(capabilities.SharedStorageFenceV1),
 		// Latched, never Enforced, for the same reason.
-		RecoveryClaimLatched: s.gate != nil && s.gate.Latched(capabilities.RecoveryClaimV1),
+		RecoveryClaimLatched: s.gateV() != nil && s.gateV().Latched(capabilities.RecoveryClaimV1),
 		VmsWithSharedDisk:    int32(len(sharedVMs)),
 		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
 	}
@@ -294,7 +294,7 @@ const recoveryClaimOffDetail = "enforcement.recovery_claim is false on this host
 // it (claimPostureFromPing): its silence does not say what its flag is.
 func (s *Server) selfClaimPosture(ctx context.Context, host string) *pb.FenceHostPosture {
 	p := &pb.FenceHostPosture{Host: host, Reachable: true, PostureKnown: true}
-	if !s.enfRecoveryClaim {
+	if !s.enfRecoveryClaim.Load() {
 		p.Detail = recoveryClaimOffDetail
 		return p
 	}

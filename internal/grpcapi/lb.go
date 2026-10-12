@@ -835,7 +835,7 @@ func (s *Server) RelayCheckVIPParticipant(ctx context.Context, req *pb.RelayChec
 	// Fresh capability Ping: only trust a target that advertises vip_release_probe_v1 (it
 	// answers by-VIP absence probes authoritatively, so its CheckVIPParticipant answer is a
 	// valid release-proof input). Uncached.
-	if s.gate == nil || !s.gate.PeerSupportsFresh(ctx, req.TargetHost, capabilities.VIPReleaseProbeV1) {
+	if s.gateV() == nil || !s.gateV().PeerSupportsFresh(ctx, req.TargetHost, capabilities.VIPReleaseProbeV1) {
 		return unknown, nil
 	}
 	// Fresh CheckVIPParticipant against the target.
@@ -905,7 +905,7 @@ func (s *Server) vipGateActive(ctx context.Context) bool {
 	if s.vipGateFlipped != nil {
 		return s.vipGateFlipped()
 	}
-	return s.gate != nil && s.gate.Enforced(ctx, capabilities.VIPReleaseProbeV1)
+	return s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.VIPReleaseProbeV1)
 }
 
 // vipHAHealthEnabled reports whether VIP HA is active in EITHER direction. A
@@ -1185,7 +1185,7 @@ func (s *Server) participantReachable(ctx context.Context, host string) bool {
 	if s.probeHolder != nil {
 		return s.probeHolder(ctx, host, "").reachable
 	}
-	return s.gate != nil && s.gate.PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1)
+	return s.gateV() != nil && s.gateV().PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1)
 }
 
 // standDownHolder synchronously removes the LB from `host` so its keepalived is stopped
@@ -1299,7 +1299,7 @@ func (s *Server) peerVIPClaims(ctx context.Context, host, vip string) bool {
 	// Ping / CheckVIPParticipant call, NOT at dialPeer — so every step is checked and any
 	// failure falls through to the release-proof resolution below (rather than trusting a
 	// half-open connection or a non-probe-capable peer).
-	if s.gate != nil && s.gate.PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1) {
+	if s.gateV() != nil && s.gateV().PeerSupportsFresh(ctx, host, capabilities.VIPReleaseProbeV1) {
 		if c, closeConn, err := s.dialPeer(ctx, host); err == nil {
 			resp, cerr := c.CheckVIPParticipant(ctx, &pb.CheckVIPParticipantRequest{Vip: vip})
 			closeConn()
@@ -1339,7 +1339,7 @@ const vipManualFenceWindow = 5 * time.Minute
 // this bounds it to the host actually being down. Fail-closed: no db/gate, read error, or a
 // healthy host → not confirmed (the holder is assumed to still claim).
 func (s *Server) manualFenceConfirmedVIP(ctx context.Context, host string) bool {
-	if s.db == nil || s.gate == nil {
+	if s.db == nil || s.gateV() == nil {
 		return false
 	}
 	if s.peerUp(ctx, host) {
@@ -1362,10 +1362,10 @@ type peerLiveness interface {
 // absent from its HealthyPeers. A gate without PeerUp keeps the HealthyPeers
 // reading, which is exact for a gate that probes everyone.
 func (s *Server) peerUp(ctx context.Context, host string) bool {
-	if pl, ok := s.gate.(peerLiveness); ok {
+	if pl, ok := s.gateV().(peerLiveness); ok {
 		return pl.PeerUp(ctx, host)
 	}
-	for _, h := range s.gate.HealthyPeers(ctx) {
+	for _, h := range s.gateV().HealthyPeers(ctx) {
 		if h == host {
 			return true
 		}
@@ -1380,10 +1380,10 @@ func (s *Server) peerUp(ctx context.Context, host string) bool {
 // this node counts toward quorum (HealthyPeers), and reachability is proven by the dial
 // succeeding. No caching, no durable proof — a fresh probe for THIS VIP check only.
 func (s *Server) relayedVIPNoClaims(ctx context.Context, target, vip string) bool {
-	if s.gate == nil {
+	if s.gateV() == nil {
 		return false
 	}
-	for _, relay := range s.gate.HealthyPeers(ctx) {
+	for _, relay := range s.gateV().HealthyPeers(ctx) {
 		if relay == target || relay == s.hostName {
 			continue // never relay to the target itself or to self
 		}

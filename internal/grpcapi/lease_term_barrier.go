@@ -275,7 +275,7 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 // same for the rows as for the threshold: a joiner uses only a sweep that began
 // after it arrived, so a row it reads was reported after it started asking.
 func (s *Server) sweepLeaseTerm(ctx context.Context, key string) leaseSweepResult {
-	if s.gate == nil {
+	if s.gateV() == nil {
 		return leaseSweepResult{}
 	}
 
@@ -353,7 +353,7 @@ func (s *Server) sweepLeaseTerm(ctx context.Context, key string) leaseSweepResul
 func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepResult {
 	// Reuse the quorum every other gate in this path uses. Two different quorum
 	// rules inside one failover decision would be a defect in itself.
-	state, _, needed := s.gate.QuorumProof(ctx)
+	state, _, needed := s.gateV().QuorumProof(ctx)
 	if state != health.QuorumYes {
 		return leaseSweepResult{}
 	}
@@ -362,7 +362,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepRe
 	// that has been down for longer than a probe interval costs nothing here.
 	// What remains is a host that died WITHIN the last interval, which is why
 	// the budget still has to exist.
-	peers := s.gate.HealthyPeers(ctx)
+	peers := s.gateV().HealthyPeers(ctx)
 
 	sctx, cancel := context.WithTimeout(ctx, leaseBarrierBudget)
 	defer cancel()

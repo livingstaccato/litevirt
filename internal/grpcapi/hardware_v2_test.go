@@ -101,7 +101,7 @@ func TestHardwareV2Latched_NilGate(t *testing.T) {
 // tables are populated, so a peer could miss data.
 func TestAdvertiseHardwareV2_GatedOnBackfillReadiness(t *testing.T) {
 	s := testServer(t)
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}})
 	s.SetOperationProtocol(true)
 
 	// Before backfill: op-protocol active but readiness unset → NOT advertised.
@@ -128,20 +128,20 @@ func TestAdvertiseHardwareV2_RequiresOperationProtocol(t *testing.T) {
 	}
 
 	// Readiness set, op-protocol LATCHED, but the config kill-switch is OFF.
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}})
 	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
 		t.Fatal("hardware_v2 must not be advertised while the operation_protocol config flag is off")
 	}
 
 	// Config on but op-protocol NOT latched cluster-wide.
 	s.SetOperationProtocol(true)
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: false}}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: false}})
 	if hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
 		t.Fatal("hardware_v2 must not be advertised while operation_protocol is not latched")
 	}
 
 	// Both on → advertised.
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.OperationProtocolV1: true}})
 	if !hasCap(s.advertisedCapabilities(), capabilities.HardwareV2) {
 		t.Fatal("hardware_v2 must be advertised with readiness + operation_protocol active")
 	}

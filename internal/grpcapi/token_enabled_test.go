@@ -27,19 +27,19 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfVIPProofReclaim = true
 	s.strictMTLSIdentity = true
 	s.forwardedIdentity = true
-	s.enfSharedStorageFence = true
+	s.enfSharedStorageFence.Store(true)
 	s.rbacRealm = true
 	s.enfOperationProtocol = true
 	s.enfLiveResize = true
 	s.enfCanonicalIdentity = true
-	s.enfProjectAuthority = true
+	s.enfProjectAuthority.Store(true)
 	s.enfAuditSignature = true
-	s.enfOwnerEpoch = true
+	s.enfOwnerEpoch.Store(true)
 	s.enfIsolationEpoch = true
 	s.enfNetBoxIPAM = true
 	s.enfNetBoxMirror = true
 	s.enfLeaseTerm = true
-	s.enfRecoveryClaim = true
+	s.enfRecoveryClaim.Store(true)
 	s.enfPartitionPause.Store(true)
 	s.enfVMReplace = true
 	s.hwV2Ready.Store(true)

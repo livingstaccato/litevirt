@@ -167,7 +167,7 @@ func TestLeaseTermBarrier_QuorumUnknownRefuses(t *testing.T) {
 // TestLeaseTermBarrier_NoGateRefuses: nothing wired means nothing established.
 func TestLeaseTermBarrier_NoGateRefuses(t *testing.T) {
 	s := inventoryServer(t)
-	s.gate = nil
+	s.SetGate(nil)
 	if verdict, _ := s.leaseTermBarrier(context.Background(), corrosion.LeaseKeyFailover, 5); verdict != leaseTermUnconfirmed {
 		t.Errorf("verdict = %v with no gate, want unconfirmed", verdict)
 	}

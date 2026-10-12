@@ -164,7 +164,7 @@ func TestLeaseTermReadiness_WithholdsWithoutTheSplitBrainLatch(t *testing.T) {
 // confirm the dependency above, which fails closed like every other unknown.
 func TestLeaseTermReadiness_WithholdsWithNoGate(t *testing.T) {
 	s := leaseTermServer(t, 3)
-	s.gate = nil
+	s.SetGate(nil)
 	if ready, _ := s.LeaseTermReadiness(context.Background()); ready {
 		t.Error("readiness advertised with no gate wired")
 	}

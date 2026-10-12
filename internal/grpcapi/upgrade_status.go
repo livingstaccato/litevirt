@@ -136,9 +136,9 @@ func (s *Server) GetUpgradeStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Up
 	}
 
 	out := &pb.UpgradeStatus{ReleaseToken: capabilities.ReleaseToken}
-	if s.gate != nil {
+	if s.gateV() != nil {
 		for _, tok := range capabilities.All() {
-			if !s.gate.Latched(tok) {
+			if !s.gateV().Latched(tok) {
 				continue
 			}
 			rule := capabilities.RollbackRule(tok)
@@ -148,7 +148,7 @@ func (s *Server) GetUpgradeStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Up
 			ruleAware := rule != capabilities.RollbackSafeIfUnused || usedTokens[tok]
 			out.Tokens = append(out.Tokens, &pb.UpgradeToken{
 				Name:                    tok,
-				Durable:                 s.gate.DurablyLatched(tok),
+				Durable:                 s.gateV().DurablyLatched(tok),
 				Mandatory:               capabilities.Mandatory(tok),
 				RollbackRule:            rule,
 				BlocksRollback:          ruleAware || !capabilities.RuleHonouredBelow(tok),
@@ -199,12 +199,12 @@ func (s *Server) GetUpgradeStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Up
 		out.ReleaseProbation, out.ProbationReason = true, s.db.QuarantineReason()
 	}
 	// The rollout summary the status opens with (UX 2).
-	if s.gate != nil {
+	if s.gateV() != nil {
 		total, on, lagging, err := s.releaseLagging(ctx)
 		if err == nil {
 			out.HostsTotal, out.HostsOnRelease, out.Lagging = int32(total), int32(on), lagging
 		}
-		if !s.gate.Latched(capabilities.ReleaseToken) {
+		if !s.gateV().Latched(capabilities.ReleaseToken) {
 			for _, f := range capabilities.Features() {
 				if info, _ := capabilities.LookupFeature(f); info.Token == capabilities.ReleaseToken {
 					out.FeaturesWaiting++
@@ -690,7 +690,7 @@ func (s *Server) releaseLagging(ctx context.Context) (total, on int, lagging []*
 		wg.Add(1)
 		go func(i int, name string) {
 			defer wg.Done()
-			results[i] = s.gate.PeerSupportsFresh(ctx, name, tok)
+			results[i] = s.gateV().PeerSupportsFresh(ctx, name, tok)
 		}(i, name)
 	}
 	wg.Wait()
@@ -755,7 +755,7 @@ func (s *Server) releaseRolloutLagging(ctx context.Context) (names []string, com
 	}
 	s.releasePeerMu.Unlock()
 	if due != "" {
-		on := s.gate.PeerSupportsFresh(ctx, due, capabilities.ReleaseToken)
+		on := s.gateV().PeerSupportsFresh(ctx, due, capabilities.ReleaseToken)
 		s.releasePeerMu.Lock()
 		a := s.releaseRollout[due]
 		if a == nil {
@@ -799,7 +799,7 @@ func (s *Server) releaseRolloutLagging(ctx context.Context) (names []string, com
 // least once since this node started (m3). Severity info: an upgrade in
 // progress is not a fault, and info does not degrade `lv health`.
 func (s *Server) evaluateReleaseRollout(ctx context.Context) {
-	if s.gate == nil {
+	if s.gateV() == nil {
 		return
 	}
 	tok := capabilities.ReleaseToken
@@ -809,7 +809,7 @@ func (s *Server) evaluateReleaseRollout(ctx context.Context) {
 	}
 	open = open && prev.Lifecycle != corrosion.ConditionResolved
 	var names []string
-	if !s.gate.Latched(tok) {
+	if !s.gateV().Latched(tok) {
 		var complete bool
 		if names, complete, err = s.releaseRolloutLagging(ctx); err != nil || !complete {
 			return

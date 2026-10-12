@@ -136,10 +136,10 @@ func encodeEvidence(detail string, hosts []string) string {
 // is clean. A nil gate (single-node rigs, tests) is valid: there is no quorum
 // to lose.
 func (s *Server) resolveGateValid(ctx context.Context) bool {
-	if s.gate == nil {
+	if s.gateV() == nil {
 		return true
 	}
-	if !s.gate.ExecutionGate(ctx).OK {
+	if !s.gateV().ExecutionGate(ctx).OK {
 		return false
 	}
 	// Under region-scoped failover the execution gate passes on this host's
@@ -152,7 +152,7 @@ func (s *Server) resolveGateValid(ctx context.Context) bool {
 		return false
 	}
 	if scope.Region() {
-		st, _, _ := s.gate.QuorumProof(ctx)
+		st, _, _ := s.gateV().QuorumProof(ctx)
 		return st == health.QuorumYes
 	}
 	return true

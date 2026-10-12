@@ -24,10 +24,10 @@ func enableVMReplace(s *Server) {
 	// operation_protocol_v1 too: the cleanup manifest lives in the operation
 	// journal, and cutover treats a missing journal as not-active.
 	s.SetOperationProtocol(true)
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
 		capabilities.VMReplaceV1:         true,
 		capabilities.OperationProtocolV1: true,
-	}}
+	}})
 }
 
 // A cutover on a cluster that has not latched vm_replace_v1 must refuse, and must
@@ -45,10 +45,10 @@ func TestCutoverRefusedWithoutVMReplaceCapability(t *testing.T) {
 		{"neither flag nor latch", func(*Server) {}},
 		{"flag on, not latched", func(s *Server) {
 			s.SetVMReplaceEnforce(true)
-			s.gate = fakeServerGate{enforcedTok: map[string]bool{}}
+			s.SetGate(fakeServerGate{enforcedTok: map[string]bool{}})
 		}},
 		{"latched, flag off", func(s *Server) {
-			s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}}
+			s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}})
 		}},
 		// The operation journal is a HARD dependency, not an additional safety
 		// check: it is what carries the cleanup manifest across the gap between the
@@ -57,7 +57,7 @@ func TestCutoverRefusedWithoutVMReplaceCapability(t *testing.T) {
 		// naming them, so a missing journal means cutover is not available at all.
 		{"vm_replace latched, no operation journal", func(s *Server) {
 			s.SetVMReplaceEnforce(true)
-			s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}}
+			s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}})
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

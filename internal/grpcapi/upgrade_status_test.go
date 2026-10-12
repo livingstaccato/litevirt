@@ -27,10 +27,10 @@ func upgradeStatusServer(t *testing.T) *Server {
 		"gadgets": {Token: capabilities.ReleaseToken, Description: "Gadgets on every host"},
 	}))
 	s := testServer(t)
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
 		capabilities.SplitBrainGateV1: true,
 		capabilities.ReleaseToken:     true,
-	}}
+	}})
 	s.db.SetClusterPolicyGate(func() bool { return true })
 	return s
 }
@@ -216,7 +216,7 @@ func releasePeerServer(t *testing.T) *Server {
 	t.Helper()
 	s := upgradeStatusServer(t)
 	s.replicator = corrosion.NewReplicator(s.db, "", corrosion.RelayConfig{})
-	s.gate = fakeServerGate{}
+	s.SetGate(fakeServerGate{})
 	if err := corrosion.RecordReleaseFeatureUse(context.Background(), s.db, capabilities.ReleaseToken, "widgets", "test-host", true); err != nil {
 		t.Fatal(err)
 	}
@@ -407,13 +407,13 @@ func rolloutServer(t *testing.T, latched bool) *Server {
 			t.Fatal(err)
 		}
 	}
-	s.gate = fakeServerGate{
+	s.SetGate(fakeServerGate{
 		enforcedTok: map[string]bool{capabilities.SplitBrainGateV1: true, capabilities.ReleaseToken: latched},
 		supportsTok: map[string]map[string]bool{
 			"peer-new": {capabilities.ReleaseToken: true},
 			"peer-old": {capabilities.SplitBrainGateV1: true},
 		},
-	}
+	})
 	return s
 }
 
@@ -456,7 +456,7 @@ func TestReleaseRolloutCondition(t *testing.T) {
 		!slices.Contains(h.Hosts, "peer-old") {
 		t.Fatalf("condition while peer-old lags = %+v ok=%v err=%v, want an open info condition naming peer-old", h, ok, err)
 	}
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.ReleaseToken: true}}
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{capabilities.ReleaseToken: true}})
 	s.evaluateReleaseRollout(ctx)
 	h, _, _ = corrosion.GetHealthCondition(ctx, s.db, releaseRolloutEvaluator, condReleaseRolloutPending, "cluster", capabilities.ReleaseToken)
 	if h.Lifecycle != corrosion.ConditionResolved {
@@ -609,9 +609,9 @@ func TestReleaseRolloutCondition_AsksOnePeerPerCycle(t *testing.T) {
 	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-down", Address: "10.0.0.9", State: "active", Role: "worker"}); err != nil {
 		t.Fatal(err)
 	}
-	g := countingGate{fakeServerGate: s.gate.(fakeServerGate), calls: new(atomic.Int32), per: new(sync.Map),
+	g := countingGate{fakeServerGate: s.gateV().(fakeServerGate), calls: new(atomic.Int32), per: new(sync.Map),
 		down: map[string]bool{"peer-down": true}}
-	s.gate = g
+	s.SetGate(g)
 	const cycles = 6
 	for i := 0; i < cycles; i++ {
 		before := g.calls.Load()

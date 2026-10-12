@@ -41,7 +41,7 @@ func TestPowerOffReaders_AskPeerUpNotHealthyPeers(t *testing.T) {
 	}
 
 	// And a host PeerUp reports down is still down, with the confirmation honoured.
-	s.gate = peerUpGate{up: map[string]bool{}}
+	s.SetGate(peerUpGate{up: map[string]bool{}})
 	if !s.manualFenceConfirmedVIP(ctx, "h") {
 		t.Error("manualFenceConfirmedVIP refused a fresh confirmation for a host PeerUp reports down")
 	}

@@ -225,10 +225,10 @@ func enforceEveryToken(s *Server) {
 	s.enfLiveResize = true
 	s.enfLWWSkew = true
 	s.enfOperationProtocol = true
-	s.enfOwnerEpoch = true
-	s.enfProjectAuthority = true
+	s.enfOwnerEpoch.Store(true)
+	s.enfProjectAuthority.Store(true)
 	s.enfSafeFence = true
-	s.enfSharedStorageFence = true
+	s.enfSharedStorageFence.Store(true)
 	s.enfVIPProofReclaim = true
 	s.enfVIPSelfDemote = true
 	s.forwardedIdentity = true

@@ -212,11 +212,11 @@ func (s *Server) netboxExclusivePass(ctx context.Context, pass func(context.Cont
 // It is a method rather than a captured bool so every pass asks again: a latch
 // closes while the daemon runs, and nothing restarts the mirror when it does.
 func (s *Server) netboxMirrorAuthorized() bool {
-	if !s.enfNetBoxMirror || s.gate == nil {
+	if !s.enfNetBoxMirror || s.gateV() == nil {
 		return false
 	}
-	return s.gate.DurablyLatched(capabilities.NetBoxMirrorV1) &&
-		s.gate.DurablyLatched(capabilities.NetBoxIPAMV1)
+	return s.gateV().DurablyLatched(capabilities.NetBoxMirrorV1) &&
+		s.gateV().DurablyLatched(capabilities.NetBoxIPAMV1)
 }
 
 // netboxMirrorHoldsLease is the lease READ — no write, no renewal — the mirror

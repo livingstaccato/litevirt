@@ -79,7 +79,7 @@ func TestCapacityAdmissionLatched_RequiresConfigAndBothCapabilities(t *testing.T
 			s := testServer(t)
 			s.SetOperationProtocol(tc.configOn)
 			if tc.latched != nil {
-				s.gate = fakeServerGate{enforcedTok: tc.latched}
+				s.SetGate(fakeServerGate{enforcedTok: tc.latched})
 			}
 			if got := s.capacityAdmissionLatched(); got != tc.want {
 				t.Fatalf("capacityAdmissionLatched() = %v, want %v", got, tc.want)

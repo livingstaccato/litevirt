@@ -40,10 +40,10 @@ func hotplugDiskServer(t *testing.T) *Server {
 
 // setDeviceGate latches operation_protocol_v1 and/or hardware_v2 for the disk path.
 func setDeviceGate(s *Server, protocol, hardware bool) {
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
 		capabilities.OperationProtocolV1: protocol,
 		capabilities.HardwareV2:          hardware,
-	}}
+	}})
 	s.SetOperationProtocol(protocol)
 }
 

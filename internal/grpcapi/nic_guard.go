@@ -523,8 +523,8 @@ func (s *Server) requireGuardsWritable(ctx context.Context, what string) error {
 	if s.db.MayWriteClusterPolicy() {
 		return nil
 	}
-	if s.gate != nil {
-		s.gate.Enforced(ctx, capabilities.FailoverScopeV1) // form this host's latch, as a joiner's lags
+	if s.gateV() != nil {
+		s.gateV().Enforced(ctx, capabilities.FailoverScopeV1) // form this host's latch, as a joiner's lags
 	}
 	if s.db.MayWriteClusterPolicy() {
 		return nil

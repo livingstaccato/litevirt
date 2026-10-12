@@ -27,7 +27,7 @@ func localRootCtx(host string) context.Context {
 // It is local root, an operator restore, as from any other CLI.
 func TestRestoreContainer_LocalRootCLIIsAnOperatorRestore(t *testing.T) {
 	s, rt, repo, ts, _, _ := setupProofRestore(t)
-	s.gate = fakeServerGate{execOK: true, enforced: true}
+	s.SetGate(fakeServerGate{execOK: true, enforced: true})
 	// The host's own row: its certificate is a trusted host CN.
 	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "self", Address: "127.0.0.1", State: "active"}); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestRestoreContainer_LocalRootCLIIsAnOperatorRestore(t *testing.T) {
 // A remote peer with no proof under enforcement is still refused.
 func TestRestoreContainer_RemotePeerWithoutProofStillRefused(t *testing.T) {
 	s, _, repo, ts, _, _ := setupProofRestore(t)
-	s.gate = fakeServerGate{execOK: true, enforced: true}
+	s.SetGate(fakeServerGate{execOK: true, enforced: true})
 	authed, aerr := s.authenticate(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""))
 	if aerr != nil || callerPrincipalKind(authed) != principalKindPeer {
 		t.Fatalf("authenticate peer: %v kind=%q", aerr, callerPrincipalKind(authed))
@@ -95,7 +95,7 @@ func TestRestoreContainer_AlreadyExistsNamesWhatWorks(t *testing.T) {
 // peer dials over loopback and classifies as local root.)
 func TestRestoreContainer_AForwardedOperatorReplicaRestorePassesTheGate(t *testing.T) {
 	s, rt, repo, ts, _, _ := setupProofRestore(t)
-	s.gate = fakeServerGate{execOK: true, enforced: true}
+	s.SetGate(fakeServerGate{execOK: true, enforced: true})
 	authed, aerr := s.authenticate(mtlsPeerCtx("peer-1", tcpAddr("10.0.0.9"), ""))
 	if aerr != nil || callerPrincipalKind(authed) != principalKindPeer {
 		t.Fatalf("authenticate peer: %v kind=%q", aerr, callerPrincipalKind(authed))

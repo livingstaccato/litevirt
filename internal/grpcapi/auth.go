@@ -530,14 +530,14 @@ func isLoopbackPeer(ctx context.Context) bool {
 // default. The loopback local-root path is never gated on this — it is the
 // on-node escape hatch.
 func (s *Server) strictMTLSEnforced(ctx context.Context) bool {
-	return s.strictMTLSIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.StrictMTLSIdentityV1)
+	return s.strictMTLSIdentity && s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.StrictMTLSIdentityV1)
 }
 
 // forwardedIdentityEnforced reports whether this node promotes a forwarded user
 // bearer to the real user (owner-side). Config flag AND capability gate, like
 // strict mTLS — the flag is the kill switch, short-circuiting the gate.
 func (s *Server) forwardedIdentityEnforced(ctx context.Context) bool {
-	return s.forwardedIdentity && s.gate != nil && s.gate.Enforced(ctx, capabilities.ForwardedIdentityV1)
+	return s.forwardedIdentity && s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.ForwardedIdentityV1)
 }
 
 // rbacRealmConfigured reports whether the operator has opted this node into
@@ -551,7 +551,7 @@ func (s *Server) rbacRealmConfigured() bool { return s.rbacRealm }
 // it safe to auto-resolve a bare grant to canonical form — while any peer might
 // still mint bare bindings (pre-latch), we refuse rather than canonicalize.
 func (s *Server) rbacRealmLatched(ctx context.Context) bool {
-	return s.rbacRealm && s.gate != nil && s.gate.Enforced(ctx, capabilities.RBACRealmV1)
+	return s.rbacRealm && s.gateV() != nil && s.gateV().Enforced(ctx, capabilities.RBACRealmV1)
 }
 
 // fwdBearerFromCtx returns the forwarded user bearer relayed by an entry node

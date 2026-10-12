@@ -810,7 +810,7 @@ func TestOneClosureSamplesThePowerOffInputOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := &flippingReachabilityGate{}
-	s.gate = g
+	s.SetGate(g)
 
 	sets, unclosed, err := s.closedParticipantSets(ctx)
 	if err != nil || unclosed != "" {
@@ -875,7 +875,7 @@ func TestTheClosureRefusesAPeerThatRejoinedBetweenTwoReachabilitySamples(t *test
 	// No RPC stub is installed, so peer-b cannot answer anything: success can
 	// only mean it was never asked.
 	g := &flippingReachabilityGate{}
-	s.gate = g
+	s.SetGate(g)
 
 	set, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
@@ -917,7 +917,7 @@ func TestBindRefusesAPeerItCouldNotEstablishTheMembershipOf(t *testing.T) {
 		// Unimplemented, which must prevent corroboration.
 		return &answeringPeer{tables: tables}, func() {}, nil
 	}
-	s.gate = &flippingReachabilityGate{}
+	s.SetGate(&flippingReachabilityGate{})
 
 	proven, why, err := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, local)
 	if err != nil {

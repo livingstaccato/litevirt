@@ -150,16 +150,25 @@ FIPS-mode host's QEMU does not have, so QEMU refuses to start a guest whose VNC
 console has a password. litevirt never lets that fail a start, a failover or a
 migration:
 
-- At startup the daemon asks its own QEMU (a password-protected display on a
-  private socket, `-machine none`). A host that cannot sets no VNC passwords;
-  SPICE keeps its own. It logs why, and reports `console_password_v1` in
-  `PingResponse.not_enforcing`.
+- At startup the daemon asks its own QEMU: it starts a password-protected
+  display on a private socket (`-machine none`), sets a password over QMP and
+  authenticates to it, as the console proxy would. Only a successful
+  authentication counts: current QEMU starts such a display on a FIPS host and
+  fails only at authentication. A kernel in FIPS mode
+  (`/proc/sys/crypto/fips_enabled` = 1) counts as unable whatever QEMU says. A
+  host that cannot sets no VNC passwords; SPICE keeps its own. It logs why, and
+  reports `console_password_v1` in `PingResponse.not_enforcing`.
 - A live migration onto such a host moves the guest without its VNC password
   (the target says so when the source prepares it); the guest arrives with an
-  open VNC console.
-- If QEMU still refuses a start for its console password, the daemon redefines
-  the domain without its console passwords, starts it once more, logs it, and
-  sets no VNC passwords from then on.
+  open VNC console. A target whose daemon has only just started waits up to 5
+  s for its probe before answering; one that still has not answered (or whose
+  probe was inconclusive) is taken as able, and if its QEMU then refuses, the
+  migration fails cleanly and the guest stays on the source.
+- If a start still fails over a console password litevirt set (QEMU says so,
+  or the kernel is in FIPS mode), the daemon redefines the domain without its
+  console passwords, starts it once more, logs it, and sets no VNC passwords
+  from then on. Before the latch it never does this: a password then is an
+  operator's, and that start fails as it always did.
 
 Limits:
 
@@ -174,7 +183,10 @@ Limits:
   it opens that port on your machine, carries each connection to the console
   through the daemon (the web UI's path, authorized as you with `vm.console`),
   and your viewer needs no password and no SSH to the host. `lv vnc <vm>` says
-  when a password is required. Root on the host can also read it with
+  when a password is required. **Any other user on the machine where you run
+  it can connect to that port while it runs, and gets the console with your
+  credentials**: use it on a machine only you use, never on a shared jump host.
+  Root on the VM's host can also read the password with
   `virsh dumpxml --security-info <vm>`.
 - A VNC console configured with TLS or SASL in `qemu.conf` (`vnc_tls`,
   `vnc_sasl`) cannot be opened through the console proxy; the error names it.

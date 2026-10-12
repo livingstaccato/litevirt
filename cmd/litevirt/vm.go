@@ -361,7 +361,13 @@ With --listen, opens a local port on this machine that carries the VM's
 console through the daemon (the same path as the web UI's console): point
 any VNC viewer at it, with no password. Each connection is authorized as you
 (vm.console on the VM), and ends when your session does. The address must be
-a loopback one:
+a loopback one.
+
+WARNING: any other user on THIS machine can connect to that port while the
+command runs, and gets the console with your credentials. Use it on a machine
+only you use, never on a shared jump host.
+
+For example:
 
     lv vnc web --listen 127.0.0.1:5900
     vncviewer 127.0.0.1:5900

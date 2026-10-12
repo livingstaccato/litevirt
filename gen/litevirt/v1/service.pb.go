@@ -29630,8 +29630,14 @@ type PingResponse struct {
 	// VM unconditionally, so failback skips a VM whose owner does not say so.
 	// (Tag 11: 9 and 10 belong to the release token.)
 	MigratePreconditions bool `protobuf:"varint,11,opt,name=migrate_preconditions,json=migratePreconditions,proto3" json:"migrate_preconditions,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// delete_force: this build honours DeleteVMRequest.force (it force-stops a
+	// running VM itself, after the delete's own checks, through the stop path that
+	// runs hooks and records the operator stop). An older owner ignores the field,
+	// so a caller that needs the stop first (lv rm --force, a forwarding entry
+	// node) sends StopVM{force} itself when this is false.
+	DeleteForce   bool `protobuf:"varint,12,opt,name=delete_force,json=deleteForce,proto3" json:"delete_force,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -29737,6 +29743,13 @@ func (x *PingResponse) GetVoterGeneration() int64 {
 func (x *PingResponse) GetMigratePreconditions() bool {
 	if x != nil {
 		return x.MigratePreconditions
+	}
+	return false
+}
+
+func (x *PingResponse) GetDeleteForce() bool {
+	if x != nil {
+		return x.DeleteForce
 	}
 	return false
 }
@@ -42812,7 +42825,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xb5\x03\n" +
+	"\vPingRequest\"\xd8\x03\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
@@ -42826,7 +42839,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11release_probation\x18\t \x01(\bR\x10releaseProbation\x12)\n" +
 	"\x10voter_generation\x18\n" +
 	" \x01(\x03R\x0fvoterGeneration\x123\n" +
-	"\x15migrate_preconditions\x18\v \x01(\bR\x14migratePreconditions\"\x0e\n" +
+	"\x15migrate_preconditions\x18\v \x01(\bR\x14migratePreconditions\x12!\n" +
+	"\fdelete_force\x18\f \x01(\bR\vdeleteForce\"\x0e\n" +
 	"\fReadyRequest\"\x95\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +

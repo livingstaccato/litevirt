@@ -184,7 +184,7 @@ lv inspect <vm>                           # VM details
 lv start <vm>                             # Start stopped VM
 lv stop <vm> [--force]                    # Stop VM (--force = hard power off)
 lv restart <vm>                           # Restart VM
-lv rm <vm> [--keep-disks]                 # Delete VM
+lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)
 lv vnc <vm>                               # Show VNC connection info
 lv spice <vm> [--launch]                  # SPICE connection info

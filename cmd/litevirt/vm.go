@@ -285,14 +285,27 @@ func newRmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				// A daemon that honours delete force stops the VM itself,
+				// after every check that can refuse the delete: a stop sent
+				// from here first left a refused delete's VM powered off. One
+				// that predates the field (or cannot be asked) would ignore it
+				// and destroy the VM without the stop hooks or the operator-
+				// stop record, so it gets the old flow: StopVM first.
+				daemonForces := false
+				if force {
+					if resp, perr := c.Ping(ctx, &pb.PingRequest{}); perr == nil && resp.GetDeleteForce() {
+						daemonForces = true
+					} else {
+						// Error ignored: the VM may already be stopped.
+						c.StopVM(ctx, &pb.StopVMRequest{Name: args[0], Force: true}) //nolint:errcheck
+					}
+				}
+
 				var hdr metadata.MD
 				_, err := c.DeleteVM(ctx, &pb.DeleteVMRequest{
 					Name:      args[0],
 					KeepDisks: keepDisks,
-					// The daemon force-stops a running VM itself, after every
-					// check that can refuse the delete: a stop sent from here
-					// first left a refused delete's VM powered off.
-					Force: force,
+					Force:     daemonForces,
 				}, grpc.Header(&hdr))
 				if err != nil {
 					return fmt.Errorf("delete VM: %w", err)

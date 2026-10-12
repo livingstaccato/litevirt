@@ -2451,13 +2451,22 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return s.deleteVMOnRemovedHost(ctx, vm)
 		}
 		releaseLock() // never hold a process lock across a peer RPC
-		client, conn, err := s.peerClient(ctx, vm.HostName)
+		client, closePeer, err := s.dialPeer(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
 		}
-		defer conn.Close()
+		defer closePeer()
 		proxyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
+		// An owner that predates DeleteVMRequest.force ignores it, and would
+		// destroy a running VM without the stop hooks or the operator-stop
+		// record. For it, stop first as the CLI used to (errors ignored: the
+		// VM may already be down) and send a plain delete.
+		if req.Force && !s.peerHonoursDeleteForce(proxyCtx, client) {
+			_, _ = client.StopVM(proxyCtx, &pb.StopVMRequest{Name: req.Name, Force: true})
+			req = proto.Clone(req).(*pb.DeleteVMRequest)
+			req.Force = false
+		}
 		// The owner reports the row it tombstoned in a response header, which
 		// a re-create waiting on this delete takes (vm_recreate_replaces.go).
 		var hdr metadata.MD
@@ -2607,11 +2616,23 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// operator-stop record — under the lock this delete already holds.
 	if req.Force && activeErr == nil && active {
 		if _, err := s.stopVMLocked(ctx, vm, true, 0); err != nil {
-			return nil, status.Errorf(codes.Internal,
-				"cannot delete VM %q: the forced stop failed, so nothing was removed (retry is safe): %v", req.Name, err)
+			// stopVMLocked can fail after the domain was destroyed (the
+			// pre-latch device release, recording the stop). Ask libvirt: a
+			// domain still active means nothing was touched; a stopped one
+			// carries on exactly as a plain delete of a running VM does, so
+			// the stop is recorded (abortDeleteAfterStop) by whatever refuses
+			// the rest of the delete, and a stop that only failed to persist
+			// is completed by the delete.
+			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: the forced stop failed while its domain is still active, so nothing was removed (retry is safe): %v", req.Name, err)
+			}
+			slog.Warn("DeleteVM: forced stop failed after the domain was destroyed; continuing the delete",
+				"vm", req.Name, "error", err)
+		} else {
+			vm.State = "stopped"
 		}
 		destroyed = true
-		vm.State = "stopped"
 		active = false
 	}
 	if vm.State == "running" || activeErr != nil || active {
@@ -3161,6 +3182,14 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 
 	return pbVM, nil
+}
+
+// peerHonoursDeleteForce asks a peer whether its build acts on
+// DeleteVMRequest.force. A peer that cannot be asked is treated as not
+// honouring it: the stop-first flow is safe against either kind.
+func (s *Server) peerHonoursDeleteForce(ctx context.Context, client pb.LiteVirtClient) bool {
+	resp, err := client.Ping(ctx, &pb.PingRequest{})
+	return err == nil && resp.GetDeleteForce()
 }
 
 // matchStoredNIC finds the stored-spec attachment for one NIC row: by MAC, else

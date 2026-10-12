@@ -181,6 +181,8 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		PostureReported: disclosePosture,
 		// This build checks a migration's expect_* preconditions (failback.go).
 		MigratePreconditions: !s.pingWithoutMigratePreconditionsForTest,
+		// This build force-stops inside DeleteVM (DeleteVMRequest.force).
+		DeleteForce: true,
 	}, nil
 }
 

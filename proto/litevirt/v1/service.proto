@@ -3279,6 +3279,12 @@ message PingResponse {
   // VM unconditionally, so failback skips a VM whose owner does not say so.
   // (Tag 11: 9 and 10 belong to the release token.)
   bool migrate_preconditions = 11;
+  // delete_force: this build honours DeleteVMRequest.force (it force-stops a
+  // running VM itself, after the delete's own checks, through the stop path that
+  // runs hooks and records the operator stop). An older owner ignores the field,
+  // so a caller that needs the stop first (lv rm --force, a forwarding entry
+  // node) sends StopVM{force} itself when this is false.
+  bool delete_force = 12;
 }
 
 // Ready: application-level readiness. Ping answers "is this daemon's TLS

@@ -95,6 +95,67 @@ Cross-host routing path:
 
 Daemon-to-daemon forwarding uses mTLS, so the UI server does not need direct network access to every host.
 
+When the console has a password (see [Console passwords](#console-passwords)),
+the daemon on the VM's host authenticates to the VNC port itself and offers the
+viewer an unauthenticated handshake, so noVNC never sees or asks for the
+password.
+
+## Console passwords
+
+A VM's VNC and SPICE consoles listen on its host's `127.0.0.1`. That keeps them
+off the network, but not away from other processes and users on the host. Each
+console therefore gets a per-VM password, which only litevirt presents:
+
+- **VNC**: the daemon on the VM's own host reads the password from the running
+  domain and authenticates to the listener. The browser, the UI server and
+  any daemon that only relays the stream never see it.
+- **SPICE** is not proxied, so the client has to present the password.
+  `GetSpiceInfo` returns it to a caller that holds `vm.console` on the VM, and
+  never logs it. The UI's **Download .vv** file carries it (the modal page
+  itself does not). `lv spice <vm> --launch` hands it to `remote-viewer` in a
+  private (0600) connection file rather than on the command line. `lv spice
+  <vm> --show-password` prints it for a client you start yourself.
+
+The password is stored in libvirt's domain definition (`<graphics
+passwd='...'>`, readable only by root). Libvirt sends it to QEMU over the
+monitor, never on QEMU's command line, and leaves it out of every XML dump that
+does not ask for `VIR_DOMAIN_XML_SECURE`. litevirt does not write it to the
+cluster database. A live migration carries it: libvirt hands the destination
+the secure migratable definition, so the guest keeps its password and the
+destination's daemon reads it from there.
+
+Every define of a domain sets a **fresh** password: a create, a redefine on
+update, a restore, a clone, a failover define, or the target of a cold
+migration. The running guest keeps the password it started with, and the new
+one takes effect at its next start. A VM that is already running when
+passwords come into force has none until its next define or start. Until then
+its console is open as before, and the proxy relays it unchanged.
+
+Passwords are set only when `enforcement.console_password` is on (the default)
+**and** the `console_password_v1` capability has latched. It latches once every
+host, including a maintenance host still receiving replication, runs a build
+that can present a password. An older daemon relays the RFB stream raw, so a
+passworded guest migrated onto it would have a console nobody could open. A
+console opened through an older host acting only as a relay keeps working,
+because the VM's own host does the authentication. Setting
+`console_password: false` on a host makes its next define of each domain drop
+the passwords.
+
+Limits:
+
+- **VNC authentication uses only the first 8 characters** of a password. That
+  comes from the protocol (DES keyed from 8 bytes), so the VNC password is 8
+  random alphanumeric characters (about 47 bits). The protection is the
+  loopback bind and the password together. It is not a defence against root
+  on the host, who can read the domain definition anyway. SPICE passwords are
+  24 characters.
+- A direct VNC client over an SSH tunnel (`ssh -L ...:127.0.0.1:<port>`) now
+  meets a password prompt. Use the web UI, or as root on the host read the
+  password with `virsh dumpxml --security-info <vm>`.
+- An `lv` binary older than this release does not print or pass on the SPICE
+  password, so `lv spice` from it opens a client that prompts for a password.
+  Upgrade the CLI.
+
 ## SPICE Console
 
 VMs configured with `graphics: { spice: true }` in compose expose a SPICE
@@ -110,8 +171,10 @@ connection file that `remote-viewer`/`virt-viewer` opens directly (the same
 flow Proxmox uses).
 
 The daemon does NOT proxy SPICE through the UI/REST gateway — clients reach the
-host's SPICE port directly (via the `.vv` file or `lv spice <vm>`). If the
-host's port isn't reachable externally, tunnel via SSH:
+host's SPICE port directly (via the `.vv` file or `lv spice <vm>`), and present
+the console's password themselves (see [Console passwords](#console-passwords);
+the `.vv` file carries it). If the host's port isn't reachable externally,
+tunnel via SSH:
 
     ssh -L 5901:127.0.0.1:<port> root@<host>
     remote-viewer spice://127.0.0.1:5901

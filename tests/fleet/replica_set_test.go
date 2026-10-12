@@ -163,6 +163,9 @@ func promotedDisks(t *testing.T, c *Cluster, host, victim *Node, vm string, want
 // Mutation "root-only replication": runVMReplication skips the other disks — red.
 func TestFleet_AutoPromote_RecoversEveryDiskOfTheSet(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replicas are point-in-time and failover promotes them.
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sched := replicaSetVM(t, c, victim, replicaHost, "set1")
@@ -189,6 +192,9 @@ func TestFleet_AutoPromote_RecoversEveryDiskOfTheSet(t *testing.T) {
 // disk) — red, the VM is not promoted; "partial not reported" — red.
 func TestFleet_AutoPromote_IncompleteSetRecoversWhatHasAReplicaAndNamesTheRest(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replicas are point-in-time and failover promotes them.
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sched := replicaSetVM(t, c, victim, replicaHost, "set2")
@@ -239,6 +245,9 @@ func TestFleet_AutoPromote_IncompleteSetRecoversWhatHasAReplicaAndNamesTheRest(t
 // call after a successful promotion is removed — red.
 func TestFleet_AutoPromote_RecordsTheDisksLeftOnTheFailedHost(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replicas are point-in-time and failover promotes them.
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sched := replicaSetVM(t, c, victim, replicaHost, "set3")
@@ -284,6 +293,9 @@ func TestFleet_AutoPromote_RecordsTheDisksLeftOnTheFailedHost(t *testing.T) {
 // relayed call trusted as an operator's) — red.
 func TestFleet_AutoPromote_SharedDiskStaysUnattachedWithoutAProvenFence(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replicas are point-in-time and failover promotes them.
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sched := replicaSetVM(t, c, victim, replicaHost, "set4")

@@ -31,6 +31,9 @@ import (
 // red at the restart.
 func TestFleet_PartialPromotionThenOnbootLeavesTheSharedDiskOut(t *testing.T) {
 	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	// The upgrade has finished: pit_overlay is available, so the running
+	// VM's replicas are point-in-time and failover promotes them.
+	latchPITOverlay(t, c)
 	ctx := context.Background()
 	victim, replicaHost, coord := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	sched := replicaSetVM(t, c, victim, replicaHost, "set4")
@@ -125,6 +128,9 @@ func TestFleet_PartialPromotionThenOnbootLeavesTheSharedDiskOut(t *testing.T) {
 func pbf1Fleet(t *testing.T, clock *VirtualClock, withClaims bool) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
 	setup := func(c *Cluster, a, b, victim *Node) {
+		// The upgrade has finished: pit_overlay is available, so the running
+		// VM's replicas are point-in-time and failover promotes them.
+		latchPITOverlay(t, c)
 		ctx := context.Background()
 		sched := replicaSetVM(t, c, victim, a, "db")
 		if err := victim.Server.RunReplication(ctx, sched, time.Now().Add(-10*time.Minute)); err != nil {

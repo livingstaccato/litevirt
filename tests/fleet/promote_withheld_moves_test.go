@@ -125,6 +125,9 @@ func TestFleet_AWithheldSharedDiskStaysWithheldThroughEveryMove(t *testing.T) {
 	for _, arm := range []string{"migrate", "reschedule", "stopped re-key", "repair-owner"} {
 		t.Run(arm, func(t *testing.T) {
 			c := New(t, Options{Nodes: 4, SharedCRDT: true})
+			// The upgrade has finished: pit_overlay is available, so the running
+			// VM's replicas are point-in-time and failover promotes them.
+			latchPITOverlay(t, c)
 			ctx := context.Background()
 			a, b, cn, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
 			data1 := partialOnB(t, c, a, b)

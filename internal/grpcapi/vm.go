@@ -3070,13 +3070,32 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			slog.Warn("failed to load merged NICs for spec projection", "vm", name, "error", err)
 		} else {
 			sort.Slice(nics, func(i, j int) bool { return nics[i].Ordinal < nics[j].Ordinal })
+			// The NIC rows own name, model, MAC and the live security-group
+			// binding; every other field (rate, queues, trunk, IPv6, the guard
+			// fields, ...) lives only in the stored spec, so carry it over
+			// from the attachment that spec holds for the same NIC. Without
+			// this `lv inspect`, the UI and `lv compose diff` saw a NIC with
+			// no rate or queues. The caller already holds vm.read for the
+			// whole stored spec, so nothing here widens what it may read.
+			var stored []*pb.NetworkAttachment
+			if spec != nil {
+				stored = spec.Network
+			}
 			specNetwork := make([]*pb.NetworkAttachment, 0, len(nics))
+			used := make([]bool, len(stored))
 			for _, nic := range nics {
-				specNetwork = append(specNetwork, &pb.NetworkAttachment{
-					Name:  nic.NetworkName,
-					Model: nic.Model,
-					Mac:   nic.MAC,
-				})
+				att := &pb.NetworkAttachment{}
+				if i := matchStoredNIC(stored, used, nic); i >= 0 {
+					used[i] = true
+					att = proto.Clone(stored[i]).(*pb.NetworkAttachment)
+				}
+				att.Name = nic.NetworkName
+				att.Model = nic.Model
+				att.Mac = nic.MAC
+				if sgs := corrosion.DecodeSecurityGroups(nic.SecurityGroups); len(sgs) > 0 {
+					att.SecurityGroups = sgs
+				}
+				specNetwork = append(specNetwork, att)
 			}
 			spec.Network = specNetwork
 		}
@@ -3115,6 +3134,24 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	}
 
 	return pbVM, nil
+}
+
+// matchStoredNIC finds the stored-spec attachment for one NIC row: by MAC, else
+// the first unclaimed attachment on the same network that records no MAC (a
+// spec written before the MAC was assigned). -1 when the NIC was attached
+// after create and the spec never described it.
+func matchStoredNIC(stored []*pb.NetworkAttachment, used []bool, nic corrosion.NICRecord) int {
+	for i, a := range stored {
+		if !used[i] && a != nil && a.Mac != "" && strings.EqualFold(a.Mac, nic.MAC) {
+			return i
+		}
+	}
+	for i, a := range stored {
+		if !used[i] && a != nil && a.Mac == "" && a.Name == nic.NetworkName {
+			return i
+		}
+	}
+	return -1
 }
 
 // formatDiskSizeBytes converts a byte count to a human-readable size string

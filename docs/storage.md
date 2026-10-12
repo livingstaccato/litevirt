@@ -1676,20 +1676,58 @@ survive it. In order:
    failure, 24, or a non-retryable login failure, 19), that one record is
    refreshed from iscsid.conf: it is deleted, made again by the add-only
    discovery, and logged in through. This keeps a create working after CHAP
-   was rotated in iscsid.conf while the record still held the old secret. The
-   record's files are saved first, from `/etc/iscsi/nodes` or
-   `/var/lib/iscsi/nodes`. If the target refuses the refreshed record too,
-   they are put back as they were and the create fails with both reasons. The
-   refresh is logged as a warning. When it is kept, settings made on that
-   record by hand are iscsid.conf's from then on. A login that fails without
-   a refusal (a portal that does not answer, a timeout) never refreshes
-   anything.
+   was rotated in iscsid.conf while the record still held the old secret.
+   Before the delete, the target's records **at this portal** are saved (from
+   `/etc/iscsi/nodes` or `/var/lib/iscsi/nodes`, in memory only). If the
+   target refuses the refreshed record too, they are put back as they were,
+   anything added at that portal in the meantime is removed, and the create
+   fails with both reasons. Each file is put back atomically (a temporary
+   file, synced, renamed over the record), so a concurrent login reads the
+   old record or the saved one, never a partial one. The target's records at
+   other portals are neither saved nor put back. The refresh is logged as a
+   warning. When it is kept, settings made on that record by hand are
+   iscsid.conf's from then on.
+
+The daemon runs one of these per target at a time: Prepares of the same
+target (two pools on two LUNs of it, for example) and the periodic and
+start-time re-login wait for each other, so no login reads a record while a
+refresh has it deleted, and no refresh saves another's half-done one. An
+`iscsiadm` run by hand at the same moment is not covered.
 
 So a record is changed only when the target refused it and accepted
-iscsid.conf's settings. Records of other targets on the portal are never
-touched. On a host whose node database is in neither directory, the record
-cannot be saved: a refused record is still refreshed, so the create succeeds
-as it did before, but a refused refresh leaves it as iscsid.conf's.
+iscsid.conf's settings. Existing records of other targets on the portal are
+never changed. On a host whose node database is in neither directory, or a
+pool whose portal is a host name (the database names records by address), the
+record cannot be saved: a refused record is still refreshed, so the create
+succeeds as it did before, but a refused refresh leaves it as iscsid.conf's.
+The saved copy is kept only in memory, so a daemon killed between the delete
+and the put-back also leaves it as iscsid.conf's.
+
+What differs from builds before this one:
+
+- **Only a refusal refreshes a record.** A login that fails for another
+  reason (a portal that does not answer, a timeout) changes nothing, even
+  when the cause is a setting on the record: a `node.conn[0].timeo.login_timeout`
+  set too short by hand, for example, used to be reset by the create's
+  discovery and now fails the create with the timeout. Fix the setting on the
+  record (`iscsiadm -m node -T <target> -p <portal> -o update -n <name> -v
+  <value>`), or delete the record so the next create makes it from
+  iscsid.conf.
+- **The add-only discovery still adds records for other targets.** A
+  sendtargets discovery returns every target the portal advertises to this
+  initiator, and step 2 makes a record, from iscsid.conf's defaults, for each
+  one that has none. If iscsid.conf sets `node.startup = automatic`, the host
+  logs in to those targets at its next boot. Earlier builds did the same, on
+  every create.
+- **A working record logs in without a discovery.** A target the array no
+  longer advertises but still lets this initiator log in to is used through
+  its existing record, where the old discovery deleted the record and the
+  create failed. Access is the target's CHAP and ACL either way; the
+  advertisement never was.
+- **Records the portal no longer returns are no longer deleted.** A record
+  left with a stale portal group tag stays beside the current one. Each
+  `--login` of the target tries it and it fails; a login that opened the
+  session through the other record still counts, here and in the re-login.
 
 **Pool delete** logs the host out of the pool's target and portal, unless
 another pool of the host uses the same pair.

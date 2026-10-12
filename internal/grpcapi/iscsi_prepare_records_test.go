@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,8 +28,17 @@ type chapISCSIAdm struct {
 	calls    []string
 }
 
+// iscsiExitErr is the error a real iscsiadm's exit status gives: an
+// *exec.ExitError, as the production runner returns it.
+func iscsiExitErr(code int) error {
+	return exec.Command("sh", "-c", "exit "+strconv.Itoa(code)).Run()
+}
+
 func installCHAPISCSIAdm(t *testing.T) *chapISCSIAdm {
 	t.Helper()
+	// The refresh saves the record from the node database first; the
+	// host's own /etc/iscsi is not this test's.
+	t.Cleanup(storage.OverrideISCSINodeDBDirsForTest(t.TempDir()))
 	f := &chapISCSIAdm{conf: "conf:conf-secret", adverts: map[string]string{}, records: map[string]string{}, sessions: map[string]bool{}}
 	t.Cleanup(storage.OverrideISCSICommandForTest(f.run))
 	return f
@@ -56,7 +67,7 @@ func (f *chapISCSIAdm) run(_ context.Context, _ string, args ...string) ([]byte,
 	switch {
 	case a == "-m session":
 		if len(f.sessions) == 0 {
-			return []byte("iscsiadm: No active sessions."), errors.New("exit status 21")
+			return []byte("iscsiadm: No active sessions."), iscsiExitErr(21)
 		}
 		var b strings.Builder
 		for s := range f.sessions {
@@ -68,25 +79,32 @@ func (f *chapISCSIAdm) run(_ context.Context, _ string, args ...string) ([]byte,
 		portal := chapPortal(at("-p"))
 		tg, ok := f.adverts[portal]
 		if !ok {
-			return []byte("iscsiadm: cannot make connection"), errors.New("exit status 4")
+			return []byte("iscsiadm: cannot make connection"), iscsiExitErr(4)
 		}
 		key := portal + " " + tg
 		if _, exists := f.records[key]; !exists || !strings.Contains(a, "-o new") {
 			f.records[key] = f.conf
 		}
 		return []byte(portal + ",1 " + tg), nil
+	case strings.HasPrefix(a, "-m node -o delete"):
+		key := chapPortal(at("-p")) + " " + at("-T")
+		if _, ok := f.records[key]; !ok {
+			return []byte("iscsiadm: No records found"), iscsiExitErr(21)
+		}
+		delete(f.records, key)
+		return nil, nil
 	case strings.HasSuffix(a, "--login"):
 		key := chapPortal(at("-p")) + " " + at("-T")
 		cred, ok := f.records[key]
 		if !ok {
-			return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			return []byte("iscsiadm: No records found"), iscsiExitErr(21)
 		}
 		if f.sessions[key] {
-			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), errors.New("exit status 15")
+			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), iscsiExitErr(15)
 		}
 		if cred != f.accept {
 			return []byte("iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)"),
-				errors.New("exit status 24")
+				iscsiExitErr(24)
 		}
 		f.sessions[key] = true
 		return []byte("Login successful."), nil
@@ -158,5 +176,41 @@ func TestCreateVM_ISCSI_DiskCreateKeepsAnExistingRecordsCHAP(t *testing.T) {
 	}
 	if got := f.record("10.0.0.1:3260 " + lunTestTarget); got != "op:op-secret" {
 		t.Fatalf("the record's CHAP is %q after the disk create, want the operator's", got)
+	}
+}
+
+// CHAP rotated in iscsid.conf while the record still holds the old secret:
+// the target refuses the record, and a pool create and a disk create still
+// succeed, as they did when every create rewrote the record, by refreshing
+// that one record from iscsid.conf.
+func TestCreateStoragePool_ISCSI_RefusedRecordIsRefreshed(t *testing.T) {
+	s := newPoolTestServer(t)
+	f := installCHAPISCSIAdm(t)
+	f.adverts["10.0.0.5:3260"] = sessTarget
+	f.records["10.0.0.5:3260 "+sessTarget] = "conf:old-secret"
+	f.accept = f.conf
+
+	if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{
+		Name: "san", Driver: "iscsi", Source: sessTarget, Options: map[string]string{"portal": "10.0.0.5:3260", "lun": "1"},
+	}); err != nil {
+		t.Fatalf("CreateStoragePool after a CHAP rotation in iscsid.conf: %v; calls %v", err, f.calls)
+	}
+	if got := f.record("10.0.0.5:3260 " + sessTarget); got != f.conf {
+		t.Fatalf("the refused record holds %q, want it refreshed from iscsid.conf", got)
+	}
+}
+
+func TestCreateVM_ISCSI_DiskCreateRefreshesARefusedRecord(t *testing.T) {
+	s := lunTestServer(t)
+	f := installCHAPISCSIAdm(t)
+	f.adverts["10.0.0.1:3260"] = lunTestTarget
+	f.records["10.0.0.1:3260 "+lunTestTarget] = "conf:old-secret"
+	f.accept = f.conf
+
+	if _, err := s.CreateVM(adminCtx(), lunVM("a", "lun0")); err != nil {
+		t.Fatalf("CreateVM after a CHAP rotation in iscsid.conf: %v; calls %v", err, f.calls)
+	}
+	if got := f.record("10.0.0.1:3260 " + lunTestTarget); got != f.conf {
+		t.Fatalf("the refused record holds %q, want it refreshed from iscsid.conf", got)
 	}
 }

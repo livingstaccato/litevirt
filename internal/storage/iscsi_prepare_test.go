@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // recordISCSIAdm is an iscsiadm whose node records are files in a node
@@ -31,6 +34,8 @@ type recordISCSIAdm struct {
 	tpgt     map[string]int           // target -> the portal group tag it answers with
 	sessions map[string]bool          // "portal target"
 	timeout  bool                     // every login times out: the portal stopped answering mid-login
+	terse    bool                     // a refused login prints no reason, only its exit status says why
+	hook     func(args []string)      // runs before each call, outside mu: the test's scheduler
 	calls    []string
 }
 
@@ -45,6 +50,19 @@ const (
 	authUser   = "node.session.auth.username"
 	authPass   = "node.session.auth.password"
 )
+
+// exitErr is the error a real iscsiadm's exit status gives: an
+// *exec.ExitError, as realCmd returns it.
+func exitErr(code int) error {
+	if e, ok := exitErrs.Load(code); ok {
+		return e.(error)
+	}
+	err := exec.Command("sh", "-c", "exit "+strconv.Itoa(code)).Run()
+	exitErrs.Store(code, err)
+	return err
+}
+
+var exitErrs sync.Map
 
 func newRecordISCSIAdm(t *testing.T) *recordISCSIAdm {
 	t.Helper()
@@ -140,6 +158,9 @@ func (f *recordISCSIAdm) recordFile(target, portal string, tpgt int) string {
 }
 
 func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]byte, error) {
+	if f.hook != nil {
+		f.hook(args)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	a := strings.Join(args, " ")
@@ -165,7 +186,7 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 	switch {
 	case a == "-m session":
 		if len(f.sessions) == 0 {
-			return []byte("iscsiadm: No active sessions."), errors.New("exit status 21")
+			return []byte("iscsiadm: No active sessions."), exitErr(21)
 		}
 		var b strings.Builder
 		for s := range f.sessions {
@@ -178,7 +199,7 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 		portal := fakePortal(at("-p"))
 		adv, ok := f.adverts[portal]
 		if !ok {
-			return []byte("iscsiadm: cannot make connection to " + portal + ": No route to host"), errors.New("exit status 4")
+			return []byte("iscsiadm: cannot make connection to " + portal + ": No route to host"), exitErr(4)
 		}
 		plain := len(ops) == 0 // new, update and delete
 		var out strings.Builder
@@ -188,7 +209,7 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 			exists := f.recordFile(ad.target, portal, ad.tpgt) != ""
 			if (!exists && (plain || has("new"))) || (exists && (plain || has("update"))) {
 				if err := f.writeRec(ad.target, portal, ad.tpgt, f.conf); err != nil {
-					return []byte(err.Error()), errors.New("exit status 1")
+					return []byte(err.Error()), exitErr(1)
 				}
 			}
 			fmt.Fprintf(&out, "%s,%d %s\n", portal, ad.tpgt, ad.target)
@@ -209,7 +230,7 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 		target, portal := at("-T"), at("-p")
 		rs := f.recs(target, portal)
 		if len(rs) == 0 {
-			return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			return []byte("iscsiadm: No records found"), exitErr(21)
 		}
 		for _, r := range rs {
 			_ = os.RemoveAll(f.recDir(target, portal, r.tpgt))
@@ -223,7 +244,7 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 		target, portal := at("-T"), at("-p")
 		if len(f.recs(target, portal)) == 0 {
 			if err := f.writeRec(target, portal, -1, f.conf); err != nil {
-				return []byte(err.Error()), errors.New("exit status 1")
+				return []byte(err.Error()), exitErr(1)
 			}
 		}
 		return []byte("New iSCSI node added"), nil
@@ -233,13 +254,13 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 		key := portal + " " + target
 		rs := f.recs(target, portal)
 		if len(rs) == 0 {
-			return []byte("iscsiadm: No records found"), errors.New("exit status 21")
+			return []byte("iscsiadm: No records found"), exitErr(21)
 		}
 		if f.sessions[key] {
-			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), errors.New("exit status 15")
+			return []byte("iscsiadm: default: 1 session requested, but 1 already present."), exitErr(15)
 		}
 		if f.timeout {
-			return []byte("iscsiadm: initiator reported error (8 - connection timed out)"), errors.New("exit status 8")
+			return []byte("iscsiadm: initiator reported error (8 - connection timed out)"), exitErr(8)
 		}
 		var out strings.Builder
 		var last error
@@ -248,11 +269,19 @@ func (f *recordISCSIAdm) run(_ context.Context, name string, args ...string) ([]
 			case r.tpgt != -1 && r.tpgt != f.tpgt[target]:
 				fmt.Fprintf(&out, "iscsiadm: Could not login to [iface: default, target: %s, portal: %s,%d].\n"+
 					"iscsiadm: initiator reported error (19 - encountered non-retryable iSCSI login failure)\n", target, portal, r.tpgt)
-				last = errors.New("exit status 19")
+				last = exitErr(19)
+				if f.terse {
+					out.Reset()
+					out.WriteString("iscsiadm: Could not log into all portals\n")
+				}
 			case r.settings[authUser]+":"+r.settings[authPass] != f.accept[target]:
 				fmt.Fprintf(&out, "iscsiadm: Could not login to [iface: default, target: %s, portal: %s,%d].\n"+
 					"iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)\n", target, portal, r.tpgt)
-				last = errors.New("exit status 24")
+				last = exitErr(24)
+				if f.terse {
+					out.Reset()
+					out.WriteString("iscsiadm: Could not log into all portals\n")
+				}
 			default:
 				f.sessions[key] = true
 				fmt.Fprintf(&out, "Login to [iface: default, target: %s, portal: %s,%d] successful.\n", target, portal, r.tpgt)
@@ -546,5 +575,218 @@ func TestISCSIPrepare_DefaultPortal(t *testing.T) {
 	}
 	if !f.sessions["127.0.0.1:3260 "+prepTarget] {
 		t.Fatalf("no session through the default portal; calls %v", f.calls)
+	}
+}
+
+// A refusal is recognised by iscsiadm's exit status alone, when its output
+// names no reason (wording differs between open-iscsi versions).
+func TestISCSIPrepare_RefusalByExitStatusAlone(t *testing.T) {
+	f := newRecordISCSIAdm(t)
+	f.terse = true
+	f.adverts["10.0.0.5:3260"] = []iscsiAdvert{{prepTarget, 1}}
+	f.tpgt[prepTarget] = 1
+	f.setRecord(t, prepTarget, "10.0.0.5:3260", 1, map[string]string{authUser: "conf", authPass: "old-secret", "node.startup": "manual"})
+	f.accept[prepTarget] = "conf:conf-secret"
+
+	if err := f.prepare("10.0.0.5:3260"); err != nil {
+		t.Fatalf("Prepare after a CHAP rotation in iscsid.conf, terse iscsiadm: %v; calls %v", err, f.calls)
+	}
+	if !f.sessions["10.0.0.5:3260 "+prepTarget] {
+		t.Fatalf("no session; calls %v", f.calls)
+	}
+}
+
+// Two disk creates on two pools of one target (one LUN each, the usual
+// layout) refresh the same record at once, and the target refuses both
+// refreshes. The operator's record must come back: the refreshes are
+// serialised, so neither saves the other's half-done refresh as "the
+// record" and puts that back last.
+//
+// The schedule: A pauses just before its post-refresh login; B then runs up
+// to just after its own delete and pauses; A finishes (puts the record
+// back); B finishes. Unserialised, B saved A's iscsid.conf record and puts
+// that back over the operator's.
+func TestISCSIPrepare_ConcurrentRefusedRefreshesKeepTheRecord(t *testing.T) {
+	f := newRecordISCSIAdm(t)
+	f.adverts["10.0.0.5:3260"] = []iscsiAdvert{{prepTarget, 1}}
+	f.tpgt[prepTarget] = 1
+	f.accept[prepTarget] = "op:rotated-on-the-array"
+	f.setRecord(t, prepTarget, "10.0.0.5:3260", 1, operatorRecord)
+	before := f.recordFile(prepTarget, "10.0.0.5:3260", 1)
+
+	// A spells the portal with its port, B without: the same record, and
+	// the hook can tell the two apart.
+	startB, bDeleted, aDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var aLogins int
+	var bSawDelete bool
+	var once sync.Once
+	wait := func(ch chan struct{}) {
+		select {
+		case <-ch:
+		case <-time.After(time.Second): // serialised: the other side cannot get there
+		}
+	}
+	f.hook = func(args []string) {
+		a := strings.Join(args, " ")
+		switch argAfter(args, "-p") {
+		case "10.0.0.5:3260":
+			if strings.HasSuffix(a, "--login") {
+				aLogins++
+				if aLogins == 3 {
+					close(startB)
+					wait(bDeleted)
+				}
+			}
+		case "10.0.0.5":
+			if strings.Contains(a, "-o delete") {
+				bSawDelete = true
+			} else if bSawDelete && strings.HasPrefix(a, "-m discovery") {
+				once.Do(func() { close(bDeleted) })
+				wait(aDone)
+			}
+		}
+	}
+
+	bErr := make(chan error, 1)
+	go func() {
+		<-startB
+		d := &iscsiDriver{target: prepTarget, opts: map[string]string{"portal": "10.0.0.5", "lun": "2"}, run: f.run}
+		bErr <- d.Prepare(context.Background())
+	}()
+	aErr := f.prepare("10.0.0.5:3260")
+	close(aDone)
+	if aErr == nil {
+		t.Fatal("A: Prepare succeeded with every login refused")
+	}
+	select {
+	case err := <-bErr:
+		if err == nil {
+			t.Fatal("B: Prepare succeeded with every login refused")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("B never finished")
+	}
+	if after := f.recordFile(prepTarget, "10.0.0.5:3260", 1); after != before {
+		t.Fatalf("the operator's record was lost to two concurrent refreshes:\nbefore %q\nafter  %q", before, after)
+	}
+}
+
+// The put-back covers what the refresh deleted, this target's records at
+// this portal, and nothing else: a record of the target at another portal
+// that changed meanwhile keeps the change; a record added at this portal
+// meanwhile is removed; the put-back file keeps its mode and leaves no
+// temporary file behind.
+func TestISCSIPrepare_PutBackIsScopedToThePortal(t *testing.T) {
+	f := newRecordISCSIAdm(t)
+	f.adverts["10.0.0.5:3260"] = []iscsiAdvert{{prepTarget, 1}}
+	f.tpgt[prepTarget] = 1
+	f.accept[prepTarget] = "op:rotated-on-the-array"
+	f.setRecord(t, prepTarget, "10.0.0.5:3260", 1, operatorRecord)
+	f.setRecord(t, prepTarget, "10.0.1.5:3260", 1, operatorRecord)
+	recFile := filepath.Join(f.recDir(prepTarget, "10.0.0.5:3260", 1), "default")
+	if err := os.Chmod(recFile, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before := f.recordFile(prepTarget, "10.0.0.5:3260", 1)
+	changed := map[string]string{authUser: "op", authPass: "op-secret", "node.startup": "onboot"}
+
+	var deleted, injected bool
+	f.hook = func(args []string) {
+		a := strings.Join(args, " ")
+		if strings.Contains(a, "-o delete") {
+			deleted = true
+		}
+		if deleted && !injected && strings.HasSuffix(a, "--login") {
+			injected = true
+			// Meanwhile: the operator updates the other portal's record,
+			// and a record of this portal appears (tag -1, as -m node -o
+			// new makes it).
+			if err := f.writeRec(prepTarget, "10.0.1.5:3260", 1, changed); err != nil {
+				t.Error(err)
+			}
+			if err := f.writeRec(prepTarget, "10.0.0.5:3260", -1, f.conf); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	other := func() string { return f.recordFile(prepTarget, "10.0.1.5:3260", 1) }
+
+	if err := f.prepare("10.0.0.5:3260"); err == nil || !strings.Contains(err.Error(), "put back") {
+		t.Fatalf("Prepare: err=%v, want the refusal and the put-back", err)
+	}
+	if !injected {
+		t.Fatalf("the schedule never ran; calls %v", f.calls)
+	}
+	if after := f.recordFile(prepTarget, "10.0.0.5:3260", 1); after != before {
+		t.Fatalf("the record was not put back:\nbefore %q\nafter  %q", before, after)
+	}
+	if got := other(); !strings.Contains(got, "node.startup = onboot") {
+		t.Fatalf("the other portal's record %q lost the change made meanwhile", got)
+	}
+	if got := f.recordFile(prepTarget, "10.0.0.5:3260", -1); got != "" {
+		t.Fatalf("a record added at this portal during the refresh survived the put-back: %q", got)
+	}
+	if st, err := os.Stat(recFile); err != nil || st.Mode().Perm() != 0o640 {
+		t.Fatalf("put-back file mode: %v %v, want 0640", st, err)
+	}
+	ents, _ := os.ReadDir(filepath.Dir(recFile))
+	for _, e := range ents {
+		if e.Name() != "default" {
+			t.Fatalf("left behind in the record directory: %s", e.Name())
+		}
+	}
+	dbEnts, _ := os.ReadDir(f.db)
+	for _, e := range dbEnts {
+		if !e.IsDir() {
+			t.Fatalf("left behind in the node database: %s", e.Name())
+		}
+	}
+}
+
+// The re-login takes the same per-target lock as Prepare: it does not log in
+// while a Prepare of the target is running (a refresh may have the record
+// deleted at that moment), and logs in once it is done.
+func TestLoginISCSISession_WaitsForAPrepareOfTheTarget(t *testing.T) {
+	f := newRecordISCSIAdm(t)
+	f.adverts["10.0.0.5:3260"] = []iscsiAdvert{{prepTarget, 1}}
+	f.tpgt[prepTarget] = 1
+	f.accept[prepTarget] = "op:op-secret"
+	f.setRecord(t, prepTarget, "10.0.0.5:3260", 1, operatorRecord)
+
+	aIn, release := make(chan struct{}), make(chan struct{})
+	var bLoggedIn sync.WaitGroup
+	var bLogins atomic.Int32
+	f.hook = func(args []string) {
+		if !strings.HasSuffix(strings.Join(args, " "), "--login") {
+			return
+		}
+		if argAfter(args, "-p") == "10.0.0.5:3260" {
+			close(aIn)
+			<-release
+			return
+		}
+		bLogins.Add(1)
+	}
+	aErr := make(chan error, 1)
+	go func() { aErr <- f.prepare("10.0.0.5:3260") }()
+	<-aIn
+	bErr := make(chan error, 1)
+	bLoggedIn.Add(1)
+	go func() {
+		defer bLoggedIn.Done()
+		_, err := ensureISCSISession(context.Background(), f.run, prepTarget, "10.0.0.5")
+		bErr <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	if n := bLogins.Load(); n != 0 {
+		t.Fatalf("the re-login logged in %d time(s) while a Prepare of the target ran", n)
+	}
+	close(release)
+	if err := <-aErr; err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	bLoggedIn.Wait()
+	if err := <-bErr; err != nil {
+		t.Fatalf("re-login after the Prepare: %v", err)
 	}
 }

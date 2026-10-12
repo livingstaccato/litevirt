@@ -96,6 +96,9 @@ func loginISCSISession(ctx context.Context, run cmdRunner, target, portal string
 	if target == "" {
 		return fmt.Errorf("iscsi pool has no target")
 	}
+	// A Prepare of the target may be refreshing its record (deleted, then
+	// remade or put back): the login waits for it.
+	defer lockISCSITarget(target)()
 	out, err := iscsiLogin(ctx, run, target, portal)
 	if err != nil && strings.Contains(string(out), "No records found") {
 		// No record of this target through this portal: this target's
@@ -114,6 +117,12 @@ func loginISCSISession(ctx context.Context, run cmdRunner, target, portal string
 		out, err = iscsiLogin(ctx, run, target, portal)
 	}
 	if err != nil && !strings.Contains(string(out), "already present") {
+		// One of the target's records can fail while another opens the
+		// session (a stale portal group tag beside the current one, which
+		// an add-only discovery leaves): the session is what counts.
+		if up, lerr := iscsiSessionUp(ctx, run, target, portal); lerr == nil && up {
+			return nil
+		}
 		return fmt.Errorf("no session to iSCSI target %s through %s, and the login failed: %w: %s",
 			target, portal, err, trimISCSIOutput(out))
 	}

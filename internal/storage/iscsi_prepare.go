@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 )
 
 // Prepare logs this host in to the pool's target through its portal. It runs
@@ -43,8 +44,13 @@ import (
 //     settings, and the refresh is logged as a warning.
 //
 // No secret is put on a command line or in a log. The saved record is held in
-// memory only, and written back to the node database it came from.
+// memory only, and written back to the node database it came from (never
+// with `iscsiadm -o update`, which would put the CHAP secret on argv). A
+// Prepare holds its target's lock throughout, which the re-login takes too,
+// so no other refresh or login of the target in this daemon runs between
+// the save and the put-back.
 func (d *iscsiDriver) Prepare(ctx context.Context) error {
+	defer lockISCSITarget(d.target)()
 	portal := iscsiPortalOf(d.opts)
 	run := d.run
 	if run == nil {
@@ -115,7 +121,7 @@ func iscsiLoginRefused(out []byte, err error) bool {
 // record. When the new record is refused too, the saved record is put back.
 func (d *iscsiDriver) refreshRefusedRecord(ctx context.Context, run cmdRunner, portal string, refusedOut []byte, refusedErr error) error {
 	refused := fmt.Sprintf("iscsi login %s: %v: %s", d.target, refusedErr, trimISCSIOutput(refusedOut))
-	saved, serr := saveISCSIRecords(d.target)
+	saved, serr := saveISCSIRecords(d.target, portal)
 	if serr != nil {
 		slog.Warn("iSCSI target refused this host's node record; refreshing it from iscsid.conf, with no copy to put back",
 			"target", d.target, "portal", portal, "why_no_copy", serr)
@@ -154,29 +160,69 @@ func (d *iscsiDriver) refreshRefusedRecord(ctx context.Context, run cmdRunner, p
 // on Debian, Ubuntu and SUSE, /var/lib/iscsi on RHEL and Fedora.
 var iscsiNodeDBDirs = []string{"/etc/iscsi/nodes", "/var/lib/iscsi/nodes"}
 
-// savedISCSIRecords is a copy of a target's node records as open-iscsi stores
-// them (<db>/<target>/<portal>,<tpgt>/<iface>, or a file per portal in older
-// layouts), taken from every node database that has the target.
+// OverrideISCSINodeDBDirsForTest points the record save and put-back at
+// test directories instead of the host's node database. It returns the
+// restore.
+func OverrideISCSINodeDBDirsForTest(dirs ...string) func() {
+	prev := iscsiNodeDBDirs
+	iscsiNodeDBDirs = dirs
+	return func() { iscsiNodeDBDirs = prev }
+}
+
+// savedISCSIRecords is a copy of a target's node records at one portal, as
+// open-iscsi stores them: <db>/<target>/<ip>,<port>,<tpgt>/<iface>, or a
+// file <ip>,<port>[,<tpgt>] in older layouts. It covers exactly what the
+// refresh's `-m node -o delete -T <target> -p <portal>` removes: the
+// target's records at other portals are neither saved nor put back, so a
+// change made to them meanwhile is kept.
 type savedISCSIRecords struct {
 	trees []savedTree
 }
 
 type savedTree struct {
-	root    string
+	db      string
+	root    string       // <db>/<target>
+	rootMod fs.FileMode  // the target directory's mode
+	key     string       // "<ip>,<port>": the portal's entries are key and key,*
 	entries []savedEntry // in walk order: a directory before what is in it
 }
 
 type savedEntry struct {
-	rel  string
+	rel  string // relative to root, starting with the portal's entry
 	dir  bool
 	mode fs.FileMode
 	data []byte
 }
 
-// saveISCSIRecords copies every node record of target. The error says why
-// there is no copy: the target has no record in any node database litevirt
-// knows, or an entry is not a plain file or directory.
-func saveISCSIRecords(target string) (*savedISCSIRecords, error) {
+// iscsiPortalRecordKey is how the node database names a portal's records,
+// "<ip>,<port>". A portal that is a host name has no key: iscsiadm names the
+// records by the address it resolved.
+func iscsiPortalRecordKey(portal string) (string, bool) {
+	norm, _ := NormalizeISCSIPortal(portal, nil)
+	i := strings.LastIndex(norm, ":")
+	if i < 0 {
+		return "", false
+	}
+	host := strings.Trim(norm[:i], "[]")
+	if net.ParseIP(host) == nil {
+		return "", false
+	}
+	return host + "," + norm[i+1:], true
+}
+
+func (t *savedTree) owns(name string) bool {
+	return name == t.key || strings.HasPrefix(name, t.key+",")
+}
+
+// saveISCSIRecords copies target's node records at portal. The error says
+// why there is no copy: the portal is a host name, the target has no record
+// at the portal in any node database litevirt knows, or an entry is not a
+// plain file or directory.
+func saveISCSIRecords(target, portal string) (*savedISCSIRecords, error) {
+	key, ok := iscsiPortalRecordKey(portal)
+	if !ok {
+		return nil, fmt.Errorf("portal %q is not an address, and the node database names records by address", portal)
+	}
 	var s savedISCSIRecords
 	for _, db := range iscsiNodeDBDirs {
 		ents, err := os.ReadDir(db)
@@ -188,51 +234,77 @@ func saveISCSIRecords(target string) (*savedISCSIRecords, error) {
 				continue
 			}
 			root := filepath.Join(db, e.Name())
-			tree := savedTree{root: root}
-			werr := filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
-				if err != nil {
-					return err
+			st, err := os.Stat(root)
+			if err != nil {
+				return nil, fmt.Errorf("copy the node records of %s: %w", target, err)
+			}
+			tree := savedTree{db: db, root: root, rootMod: st.Mode().Perm(), key: key}
+			pents, err := os.ReadDir(root)
+			if err != nil {
+				return nil, fmt.Errorf("copy the node records of %s: %w", target, err)
+			}
+			for _, pe := range pents {
+				if !tree.owns(pe.Name()) {
+					continue
 				}
-				rel, err := filepath.Rel(root, path)
-				if err != nil {
-					return err
-				}
-				info, err := de.Info()
-				if err != nil {
-					return err
-				}
-				switch {
-				case info.IsDir():
-					tree.entries = append(tree.entries, savedEntry{rel: rel, dir: true, mode: info.Mode().Perm()})
-				case info.Mode().IsRegular():
-					b, err := os.ReadFile(path)
+				werr := filepath.WalkDir(filepath.Join(root, pe.Name()), func(path string, de fs.DirEntry, err error) error {
 					if err != nil {
 						return err
 					}
-					tree.entries = append(tree.entries, savedEntry{rel: rel, mode: info.Mode().Perm(), data: b})
-				default:
-					return fmt.Errorf("%s is not a plain file", path)
+					rel, err := filepath.Rel(root, path)
+					if err != nil {
+						return err
+					}
+					info, err := de.Info()
+					if err != nil {
+						return err
+					}
+					switch {
+					case info.IsDir():
+						tree.entries = append(tree.entries, savedEntry{rel: rel, dir: true, mode: info.Mode().Perm()})
+					case info.Mode().IsRegular():
+						b, err := os.ReadFile(path)
+						if err != nil {
+							return err
+						}
+						tree.entries = append(tree.entries, savedEntry{rel: rel, mode: info.Mode().Perm(), data: b})
+					default:
+						return fmt.Errorf("%s is not a plain file", path)
+					}
+					return nil
+				})
+				if werr != nil {
+					return nil, fmt.Errorf("copy the node records of %s: %w", target, werr)
 				}
-				return nil
-			})
-			if werr != nil {
-				return nil, fmt.Errorf("copy the node records of %s: %w", target, werr)
 			}
-			s.trees = append(s.trees, tree)
+			if len(tree.entries) > 0 {
+				s.trees = append(s.trees, tree)
+			}
 		}
 	}
 	if len(s.trees) == 0 {
-		return nil, fmt.Errorf("no node record of %s under %s", target, strings.Join(iscsiNodeDBDirs, " or "))
+		return nil, fmt.Errorf("no node record of %s at %s under %s", target, key, strings.Join(iscsiNodeDBDirs, " or "))
 	}
 	return &s, nil
 }
 
-// restore writes the saved records back and removes what was added under the
-// target since, so the target's records are as they were.
+// restore writes the saved records back and removes what was added at the
+// portal since, so the target's records at the portal are as they were.
+// Each file is replaced atomically: written to a temporary file in the node
+// database's top directory (where an entry that is not a directory is no
+// target to iscsiadm, unlike one in a record directory, where it would read
+// as an iface record), synced, renamed over the record, and the directory
+// synced. A reader sees the old record or the saved one, never a partial
+// one, and a crash leaves one of the two.
 func (s *savedISCSIRecords) restore() error {
 	var errs []error
 	for _, t := range s.trees {
+		if err := os.MkdirAll(t.root, t.rootMod); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		keep := make(map[string]bool, len(t.entries))
+		synced := map[string]bool{}
 		for _, e := range t.entries {
 			keep[e.rel] = true
 			p := filepath.Join(t.root, e.rel)
@@ -244,33 +316,107 @@ func (s *savedISCSIRecords) restore() error {
 				}
 				continue
 			}
-			if err := os.WriteFile(p, e.data, e.mode); err != nil {
-				errs = append(errs, err)
-			} else if err := os.Chmod(p, e.mode); err != nil {
+			if err := replaceFileAtomically(t.db, p, e.data, e.mode); err != nil {
 				errs = append(errs, err)
 			}
+			synced[filepath.Dir(p)] = true
+		}
+		ents, err := os.ReadDir(t.root)
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		var extra []string
-		_ = filepath.WalkDir(t.root, func(path string, de fs.DirEntry, err error) error {
-			if err != nil {
+		for _, pe := range ents {
+			if !t.owns(pe.Name()) {
+				continue
+			}
+			_ = filepath.WalkDir(filepath.Join(t.root, pe.Name()), func(path string, de fs.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				rel, rerr := filepath.Rel(t.root, path)
+				if rerr != nil || keep[rel] {
+					return nil
+				}
+				extra = append(extra, path)
+				synced[filepath.Dir(path)] = true
+				if de.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
-			}
-			rel, rerr := filepath.Rel(t.root, path)
-			if rerr != nil || keep[rel] {
-				return nil
-			}
-			extra = append(extra, path)
-			if de.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		})
-		sort.Sort(sort.Reverse(sort.StringSlice(extra)))
+			})
+		}
 		for _, p := range extra {
 			if err := os.RemoveAll(p); err != nil {
 				errs = append(errs, err)
 			}
 		}
+		synced[t.root] = true
+		for d := range synced {
+			if err := syncDir(d); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 	return errors.Join(errs...)
+}
+
+// replaceFileAtomically replaces path with data and mode: a temporary file
+// in tmpDir (on the same file system), synced, then renamed over path.
+func replaceFileAtomically(tmpDir, path string, data []byte, mode fs.FileMode) error {
+	f, err := os.CreateTemp(tmpDir, ".litevirt-record-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	ok = true
+	return syncDir(filepath.Dir(path))
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// iscsiTargetLocks serialise this daemon's writes to one target's node
+// records: Prepare (whose refresh deletes and may put back the record) and
+// the re-login (whose login reads the record, and which makes one when there
+// is none). Keyed by the target lowercased. Taken innermost: nothing is
+// locked while one is held.
+var iscsiTargetLocks sync.Map
+
+func lockISCSITarget(target string) (unlock func()) {
+	m, _ := iscsiTargetLocks.LoadOrStore(strings.ToLower(target), &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }

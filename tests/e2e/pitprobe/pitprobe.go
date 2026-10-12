@@ -65,15 +65,31 @@ var DomainLogDir = "/var/log/libvirt/qemu"
 //
 // On qemu 8.2 / libvirt 10 the HMP reply to qemu-io is empty (virsh exits 0,
 // success or not) and qemu-io's output goes to the domain log. So the command
-// prints the HMP reply when there is one, and otherwise only the log bytes
-// appended after it was sent (the log's size is taken first).
+// prints the HMP reply when there is one, and otherwise reads the log written
+// after it was sent (its size is taken first; a log that shrank is read from
+// the start). For a "write ... <offset> <length>" cmd it waits, up to 30 s,
+// for this command's own line, "wrote <length>/<length> bytes at offset
+// <offset>", and prints that line alone, so another command's output in the
+// same log cannot stand in for it. If the line never comes (or a "failed"
+// line does), it prints the log written since, minus any "wrote " lines.
 func HMPQemuIO(vmQuoted, dev, cmd string) string {
-	return fmt.Sprintf(`V=%s; L=%s/$V.log; n=$(stat -c %%s "$L" 2>/dev/null || echo 0); `+
+	want := ""
+	if f := strings.Fields(cmd); len(f) >= 3 && f[0] == "write" {
+		off, ln := f[len(f)-2], f[len(f)-1]
+		want = fmt.Sprintf("wrote %s/%s bytes at offset %s", ln, ln, off)
+	}
+	return fmt.Sprintf(`V=%s; L=%s/$V.log; W=%q; n=$(stat -c %%s "$L" 2>/dev/null || echo 0); `+
 		`r=$(virsh qemu-monitor-command "$V" --hmp "qemu-io -d %s \"%s\""); `+
 		`if [ -n "$r" ]; then printf '%%s\n' "$r"; else `+
-		`for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.05; o=$(tail -c +$((n+1)) "$L" 2>/dev/null); [ -n "$o" ] && break; done; `+
-		`printf '%%s\n' "$o"; fi`,
-		vmQuoted, DomainLogDir, dev, cmd)
+		`i=0; while [ $i -lt 600 ]; do `+
+		`s=$(stat -c %%s "$L" 2>/dev/null || echo 0); [ "$s" -lt "$n" ] && n=0; `+
+		`o=$(tail -c +$((n+1)) "$L" 2>/dev/null); `+
+		`if [ -n "$W" ]; then m=$(printf '%%s\n' "$o" | grep -F -x -- "$W"); [ -n "$m" ] && { printf '%%s\n' "$m" | head -n 1; exit 0; }; fi; `+
+		`case "$o" in *failed*) break;; esac; `+
+		`[ -z "$W" ] && [ -n "$o" ] && break; `+
+		`sleep 0.05; i=$((i+1)); done; `+
+		`printf '%%s\n' "$o" | grep -v 'wrote '; true; fi`,
+		vmQuoted, DomainLogDir, want, dev, cmd)
 }
 
 // Wrote reports whether HMPQemuIO's output is a completed write. virsh exits

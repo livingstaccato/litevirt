@@ -70,7 +70,7 @@ func TestReplicateVolume_RunningVMIsPointInTime(t *testing.T) {
 	// skip for want of a match between the pin and the pick.
 	if pin := os.Getenv("E2E_PIT_EXCLUSIVE_NODE"); pin != "" {
 		if !slices.Contains(up, pin) {
-			t.Skipf("E2E_PIT_EXCLUSIVE_NODE=%s is not an up lab node (up: %v)", pin, up)
+			t.Fatalf("E2E_PIT_EXCLUSIVE_NODE=%s is not an up lab node (up: %v)", pin, up)
 		}
 		h = pin
 	}

@@ -2384,6 +2384,25 @@ func without(ss []string, drop string) []string {
 	return out
 }
 
+// deleteLockHolder is a VM delete's identity on the per-VM start lease
+// (health.TryVMStartLease).
+//
+// A delete stops and undefines the domain BEFORE it tombstones the row, and
+// the row says "running" the whole time. The VM lock holds off this host's
+// RPCs only; the reconciler reads "running here, no domain" as a crashed
+// guest and restarts it under the start lease. Lab 2 run c713 (N-2): a delete
+// stalled on a dead iSCSI path between its undefine and its tombstone, the
+// reconciler restarted the VM, and the tombstone then left a running domain
+// with no record. So the delete holds the lease, renewed, from before it
+// touches the domain until after the tombstone: a start that already holds
+// it refuses the delete (retryable, nothing touched), and one that comes
+// later finds the lease held and, once it is free, no row.
+//
+// The holder is distinct from every start path's, so none can re-take it. An
+// older peer reads it as any other holder's unexpired lease, so its start
+// paths are held off too.
+func deleteLockHolder(hostName string) string { return hostName + "/delete" }
+
 // deleteLocalOnly reports whether this DeleteVM call is a peer-search probe
 // (carries the x-lv-delete-local-only header), meaning it must act on the local
 // host only and never proxy or fan out to peers.
@@ -2543,6 +2562,36 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			forwardKeptImages(ctx, hdr) // the ceph images the owner left in place
 		}
 		return out, err
+	}
+
+	// This host carries the delete out. Hold the VM's start lease from here
+	// until the row is tombstoned (lab 2 run c713, N-2; deleteLockHolder).
+	// A peer-search probe is exempt: its host is not the row's, so no start
+	// path there acts on this VM, and its lease write would contend with the
+	// one the probing host already holds.
+	if !localOnly {
+		releaseLease, lerr := s.holdStartLease(ctx, deleteLockHolder(s.hostName), req.Name,
+			"so it is not deleted", "delete it", true)
+		if lerr != nil {
+			return nil, lerr
+		}
+		defer releaseLease()
+		// A start that held the lease until a moment ago may have changed
+		// the row since it was read above: decide from the row as it is now.
+		vm, err = corrosion.GetVM(ctx, s.db, req.Name)
+		if err != nil || vm == nil {
+			return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
+		}
+		if err := checkDeleteBinding(req, vm); err != nil {
+			return nil, err
+		}
+		if vm.ActiveOperationID != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot delete %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+		}
+		if vm.HostName != s.hostName {
+			return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-delete; retry", req.Name, vm.HostName)
+		}
 	}
 
 	// Verify the domain actually exists in libvirt on this host. If the

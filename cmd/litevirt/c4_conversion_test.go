@@ -1,24 +1,36 @@
 package main
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestE2E_BackupCreate exercises `backup create`, which streams BackupVM into a
-// file. It needs a writable output path, so it can't live in the static table.
-// The fake BackupVM stream yields EOF immediately → an empty file + a
-// "Backup complete" summary, proving the withClient closure wrapping the
-// file-create + stream-consume body preserved behavior.
-func TestE2E_BackupCreate(t *testing.T) {
+// Lab 2 S-4: `lv backup create` and `lv backup restore` called BackupVM and
+// RestoreVM, the raw full-disk stream retired for the repo-backed paths
+// (Unimplemented since upstream 87278326). They are now the names of those
+// paths: create is `lv backup snapshot`, restore is `lv backup restore-from`.
+//
+// Mutation: either alias dropped — the command is unknown: red. The old raw
+// command restored — BackupVM is called: red.
+func TestBackupCreateAndRestoreCallTheRepoPaths(t *testing.T) {
 	mock := newMockClient()
-	out := filepath.Join(t.TempDir(), "web-1.qcow2")
-	stdout, stderr, err := runCmd(t, mock, "backup", "create", "web-1", "--out", out)
-	if err != nil {
+	if _, stderr, err := runCmd(t, mock, "backup", "create", "web-1", "--repo", "/srv/backup", "--incremental"); err != nil {
 		t.Fatalf("backup create errored: %v (stderr=%s)", err, stderr)
 	}
-	assertContains(t, stdout, "Backup complete")
+	if r := mock.backupSnapshotReq; r == nil || r.VmName != "web-1" || r.RepoPath != "/srv/backup" || !r.Incremental {
+		t.Fatalf("backup create sent %+v, want a snapshot backup of web-1 into /srv/backup", r)
+	}
+	if _, stderr, err := runCmd(t, mock, "backup", "restore", "--repo", "/srv/backup", "--vm", "web-1", "--disk", "root",
+		"--timestamp", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("backup restore errored: %v (stderr=%s)", err, stderr)
+	}
+	if r := mock.restoreFromBackupReq; r == nil || r.VmName != "web-1" || r.RepoPath != "/srv/backup" || r.DiskName != "root" ||
+		r.Timestamp != "2026-01-01T00:00:00Z" {
+		t.Fatalf("backup restore sent %+v, want a restore of web-1's root from /srv/backup", r)
+	}
+	if mock.rawBackupCalled {
+		t.Fatal("a retired raw backup RPC was called")
+	}
 }
 
 // TestVMConfigIP_HonestFlagHelp pins the record-only honesty wording on the

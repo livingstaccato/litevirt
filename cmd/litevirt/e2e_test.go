@@ -39,6 +39,12 @@ type mockClient struct {
 	// firewall management calls) are satisfied without a hand-written stub.
 	pb.LiteVirtClient
 
+	// The backup requests the repo paths were called with, and whether the
+	// retired raw stream RPCs were.
+	backupSnapshotReq    *pb.BackupSnapshotRequest
+	restoreFromBackupReq *pb.RestoreFromBackupRequest
+	rawBackupCalled      bool
+
 	// Canned responses
 	vms          []*pb.VM
 	hosts        []*pb.Host
@@ -346,9 +352,11 @@ func (m *mockClient) BuildImage(_ context.Context, in *pb.BuildImageRequest, _ .
 // ── Backup ──
 
 func (m *mockClient) BackupVM(_ context.Context, _ *pb.BackupVMRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupChunk], error) {
+	m.rawBackupCalled = true
 	return &fakeStream[pb.BackupChunk]{}, nil
 }
 func (m *mockClient) RestoreVM(_ context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.RestoreVMRequest, pb.VM], error) {
+	m.rawBackupCalled = true
 	return nil, nil
 }
 
@@ -450,10 +458,12 @@ func (m *mockClient) ListContainers(_ context.Context, _ *pb.ListContainersReque
 func (m *mockClient) PullOCIImage(_ context.Context, _ *pb.PullOCIImageRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockClient) BackupSnapshot(_ context.Context, _ *pb.BackupSnapshotRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupSnapshotProgress], error) {
+func (m *mockClient) BackupSnapshot(_ context.Context, in *pb.BackupSnapshotRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.BackupSnapshotProgress], error) {
+	m.backupSnapshotReq = in
 	return &fakeStream[pb.BackupSnapshotProgress]{}, nil
 }
-func (m *mockClient) RestoreFromBackup(_ context.Context, _ *pb.RestoreFromBackupRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreFromBackupProgress], error) {
+func (m *mockClient) RestoreFromBackup(_ context.Context, in *pb.RestoreFromBackupRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreFromBackupProgress], error) {
+	m.restoreFromBackupReq = in
 	return &fakeStream[pb.RestoreFromBackupProgress]{}, nil
 }
 func (m *mockClient) RestoreLive(_ context.Context, _ *pb.RestoreLiveRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreLiveProgress], error) {

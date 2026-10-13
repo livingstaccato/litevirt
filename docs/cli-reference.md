@@ -1044,9 +1044,9 @@ lv backup restore-live --repo <p> --vm <v> --disk <d> \
   [--blockpull]       # after start, localize the disk then tear down the NBD server
   [--from-existing]   # fall back to an existing vms record for the VM spec
 
-# Legacy file-export interface (full-disk; no dedup)
-lv backup create <vm> [-o backup.qcow2]
-lv backup restore <file> --name <vm> --cpu 2 --memory 2048
+# Aliases: `lv backup create` is `lv backup snapshot`, `lv backup restore` is `lv backup restore-from`
+lv backup create <vm> --repo <path> [flags as snapshot]
+lv backup restore --repo <p> --vm <v> --disk <d> --timestamp <ts> [flags as restore-from]
 ```
 
 ## Replication

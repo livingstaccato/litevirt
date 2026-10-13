@@ -104,13 +104,23 @@ func TestRecreate_ALegacyGuardOnADirectNICIsLeftOutNotRefused(t *testing.T) {
 }
 
 // A guard on a direct NIC that a user asks for is still refused: the
-// tolerance is for a spec being replayed, not for new input.
+// tolerance is for a spec being replayed, not for new input. That includes
+// the on-node lv CLI (local root: the host certificate over loopback), which
+// passes requirePeerCert but is not a peer's forward (round 5, S2).
 func TestCreate_ANewGuardOnADirectNICIsStillRefused(t *testing.T) {
 	s := legacyGuardServer(t)
-	_, err := s.CreateVM(adminCtx(), &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "fresh", Cpu: 1, MemoryMib: 256,
-		Network: []*pb.NetworkAttachment{{Name: "wan", SpoofGuard: "on"}}}})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "protect nothing") {
-		t.Fatalf("lv run with a guard on a direct NIC: %v, want the refusal", err)
+	localRoot := localRootCtx(s.hostName)
+	if err := s.requirePeerCert(localRoot); err != nil {
+		t.Fatalf("the local-root fixture does not pass requirePeerCert, so it would not pin the peer-kind test: %v", err)
+	}
+	for name, ctx := range map[string]context.Context{"user": adminCtx(), "local root": localRoot} {
+		t.Run(name, func(t *testing.T) {
+			_, err := s.CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{Name: "fresh", Cpu: 1, MemoryMib: 256,
+				Network: []*pb.NetworkAttachment{{Name: "wan", SpoofGuard: "on"}}}})
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "protect nothing") {
+				t.Fatalf("lv run with a guard on a direct NIC: %v, want the refusal", err)
+			}
+		})
 	}
 }
 

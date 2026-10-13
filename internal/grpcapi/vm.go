@@ -128,7 +128,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// never enforce, with a warning; only new input is refused for one. spec
 	// is req.Spec, so a forward carries the result.
 	if guardAdmit == admitRecreate || s.admittedByEntryNode(ctx) {
-		s.leaveOutUnenforcedGuards(ctx, spec)
+		noteLeftOut := s.leaveOutUnenforcedGuards(ctx, spec)
+		defer func() {
+			if retErr == nil {
+				noteLeftOut()
+			}
+		}()
 	}
 	guardDec, err := s.admitNICGuards(ctx, spec.Name, spec.Network, guardAdmit)
 	if err != nil {
@@ -4078,7 +4083,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	}
 	outcome = recreateFailed
 	if err != nil {
-		return nil, s.recreateFailedAfterTeardown("rebuild", req.Name, s.hostName, spec, err, len(lunPreflightKeys(rctx)) > 0)
+		return nil, s.recreateFailedAfterTeardown(rctx, "rebuild", req.Name, s.hostName, spec, err, len(lunPreflightKeys(rctx)) > 0)
 	}
 	outcome = recreateCommitted
 	return out, nil

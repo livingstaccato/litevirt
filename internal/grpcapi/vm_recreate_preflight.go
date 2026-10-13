@@ -20,9 +20,10 @@ import (
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
-// A rebuild (RebuildVM) and a rolling recreate (serverOps.recreateAs) tear a
-// VM down and create it again from a spec. The create judges the spec afresh
-// — the installer ISO included — so a refusal there, after the teardown,
+// A rebuild (RebuildVM), a rolling recreate (serverOps.recreateAs) and an
+// inline compose recreate (recreateInline) tear a VM down and create it
+// again from a spec. The create judges the spec afresh — the installer ISO
+// included — so a refusal there, after the teardown,
 // would lose the VM: its row, its MACs and addresses, everything the rebuild
 // meant to keep. Two things prevent that:
 //

@@ -1017,7 +1017,7 @@ The strategy decides how a change that needs a **new** VM is rolled out — `rec
 
 Strategies:
 
-- `recreate` — (default) Delete then create each VM that needs replacing, one after another. Simple but has downtime, and the replaced VM's disks are destroyed.
+- `recreate` — (default) Delete then create each VM that needs replacing, one after another. Simple but has downtime, and the replaced VM's disks are destroyed. Before it deletes a VM, it makes every check the create will make that the delete does not change (authority, NIC addresses and guards, devices, networks, pools); a refusal fails that VM's update with "nothing was deleted" and leaves the VM as it was.
 - `rolling` / `stop-first` — Replace VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
 - `all-at-once` — Replace all VMs that need it simultaneously. Fast but risky.

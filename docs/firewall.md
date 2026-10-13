@@ -489,12 +489,27 @@ one is reported, not refused: every plan names the guard as not enforced, and
 the create leaves it out (see [compose.md](compose.md#security-groups-and-guards-a-file-does-not-declare)).
 A VM created by an earlier build may carry such settings in its stored spec;
 they were never enforced. A rebuild or a stack's re-create replays that spec,
-so it leaves them out instead of refusing, with a warning in the log and a
-`vm.nic_guard.not_enforced` warning event on the VM. The refusal is for new
-input only. A rebuild or a stack's re-create also makes, before it tears the
-VM down, every admission its create will make that the teardown does not
-change, the guard admission among them, so such a refusal leaves the VM as
-it was.
+so it leaves them out instead of refusing. So does the host that runs a
+create another host forwarded to it: during a rolling upgrade, an entry host
+on an earlier build accepted them, as that build did. Once such a create has
+succeeded, each setting left out is logged as a warning and recorded as a
+`vm.nic_guard.not_enforced` warning event on the VM; a create refused for
+another reason records none. A spec kept after a re-create failed past its
+teardown (see [storage.md](storage.md)) is kept without them, so `lv run`
+accepts it. The refusal is for new input only, `lv` run as root on the host
+itself included.
+
+A rebuild or a stack's re-create also makes, before it tears the VM down,
+every admission its create will make that the teardown does not change, the
+guard admission among them, judged as its create will judge it. That holds
+for a stack's default `recreate` strategy as much as for a rolling one. Such
+a refusal says "nothing was deleted" (or "nothing was changed") and leaves
+the VM as it was. The default compose re-create creates the VM as a new one,
+not as the re-create of the old one, unless the VM has a disk on an iSCSI
+LUN. So a relaxed guard its file declares needs `network.update` on the NIC's
+network there, even when the VM already has it. What the teardown itself
+frees (the name, project quota and host capacity) is still judged by the
+create, after the teardown.
 
 **A re-create keeps each NIC's guard.** A rebuild or a stack's rolling update
 re-creates a VM under a new incarnation. Each of its NICs that is the same NIC

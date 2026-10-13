@@ -26,6 +26,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -74,15 +75,32 @@ func guardUnenforcedOnNetwork(ctx context.Context, db *corrosion.Client, network
 // entry node admitted — the guard settings of each NIC whose network cannot
 // enforce a guard (guardUnenforcedOnNetwork). A create on an older build
 // stored such settings and wrote no record: they were never enforced. They
-// are left out, never refused, and never silently: each is logged and
-// recorded as a warning event of the VM (round 4, R1).
-func (s *Server) leaveOutUnenforcedGuards(ctx context.Context, spec *pb.VMSpec) {
+// are left out, never refused, and never silently: the returned note logs
+// each and records it as a warning event of the VM (round 4, R1). The create
+// calls it once it has succeeded, so a create refused after the strip
+// records nothing about a create that never happened (round 5).
+func (s *Server) leaveOutUnenforcedGuards(ctx context.Context, spec *pb.VMSpec) (note func()) {
 	unenforced := func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) }
-	for _, note := range compose.StripUnenforcedGuards(spec, unenforced) {
-		detail := "guard settings left out of the create, as they were never enforced: " + note
-		slog.Warn("NIC guard: "+detail, "vm", spec.GetName())
-		s.recordVMEventSeverity(ctx, spec.GetName(), "vm.nic_guard.not_enforced", "ok", "warning", detail)
+	notes := compose.StripUnenforcedGuards(spec, unenforced)
+	name := spec.GetName()
+	return func() {
+		for _, n := range notes {
+			detail := "guard settings left out of the create, as they were never enforced: " + n
+			slog.Warn("NIC guard: "+detail, "vm", name)
+			s.recordVMEventSeverity(ctx, name, "vm.nic_guard.not_enforced", "ok", "warning", detail)
+		}
 	}
+}
+
+// withoutUnenforcedGuards is a copy of spec without the guard settings a
+// replayed create leaves out (leaveOutUnenforcedGuards), noting nothing.
+func (s *Server) withoutUnenforcedGuards(ctx context.Context, spec *pb.VMSpec) *pb.VMSpec {
+	if spec == nil {
+		return nil
+	}
+	c := proto.Clone(spec).(*pb.VMSpec)
+	compose.StripUnenforcedGuards(c, func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) })
+	return c
 }
 
 // admittedByEntryNode reports whether ctx is the owner leg of a create a
@@ -98,10 +116,30 @@ func (s *Server) admittedByEntryNode(ctx context.Context) bool {
 // re-create of cur), so that a refusal — a stored guard the create would
 // reject, or one the caller may not carry — leaves the VM as it was.
 func (s *Server) preflightRecreateGuards(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) error {
+	return s.preflightCreateGuards(ctx, spec, cur, true)
+}
+
+// preflightCreateGuards runs, before cur is torn down, the guard admission
+// the create of spec will make, in the create's own mode: as the re-create
+// of cur when the create will carry it (replaced: a rebuild, a rolling
+// re-create, an inline compose re-create of a VM on an iSCSI LUN), else as a
+// fresh create (admitNew: the inline compose re-create). A preflight judged
+// in another mode than the create would pass what the create then refuses
+// with the VM gone, or refuse what it would pass (round 5, S1). It judges the
+// spec the create will judge: a replayed spec without the settings the
+// create leaves out (leaveOutUnenforcedGuards).
+func (s *Server) preflightCreateGuards(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord, replaced bool) error {
 	if cur == nil {
 		return nil
 	}
-	_, err := s.admitNICGuards(withReplacedVM(ctx, cur), spec.GetName(), spec.GetNetwork(), admitRecreate)
+	how := admitNew
+	if replaced {
+		ctx, how = withReplacedVM(ctx, cur), admitRecreate
+	}
+	if replaced || s.admittedByEntryNode(ctx) {
+		spec = s.withoutUnenforcedGuards(ctx, spec)
+	}
+	_, err := s.admitNICGuards(ctx, spec.GetName(), spec.GetNetwork(), how)
 	return err
 }
 

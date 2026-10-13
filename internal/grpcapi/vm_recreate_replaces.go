@@ -381,8 +381,12 @@ func (s *Server) retireReplacedRow(ctx context.Context, name string, snap corros
 // the spec to re-create it from was kept, and the create's own error. luns
 // says the VM kept disks on iSCSI LUNs, which were not torn down: the
 // recovery takes them over as they are (re-review 4, concern 3).
-func (s *Server) recreateFailedAfterTeardown(op, name, where string, spec *pb.VMSpec, cause error, luns bool) error {
-	kept := s.keepRecreateSpec(op, name, spec)
+//
+// The spec kept is the one the create judged: without the guard settings a
+// replayed create leaves out (withoutUnenforcedGuards), so lv run, which
+// refuses them as new input, accepts it as it is.
+func (s *Server) recreateFailedAfterTeardown(ctx context.Context, op, name, where string, spec *pb.VMSpec, cause error, luns bool) error {
+	kept := s.keepRecreateSpec(op, name, s.withoutUnenforcedGuards(context.WithoutCancel(ctx), spec))
 	if luns {
 		kept += " " + lunRecoveryHint
 	}

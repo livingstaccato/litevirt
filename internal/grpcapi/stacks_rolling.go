@@ -156,7 +156,7 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		outcome = recreateCommitted
 	}
 	if err != nil && tornDown {
-		return o.s.recreateFailedAfterTeardown("recreate", target, cur.HostName, spec, err, len(lunPreflightKeys(ctx)) > 0)
+		return o.s.recreateFailedAfterTeardown(ctx, "recreate", target, cur.HostName, spec, err, len(lunPreflightKeys(ctx)) > 0)
 	}
 	return err
 }
@@ -474,7 +474,9 @@ func (s *Server) waitDependsOn(ctx context.Context, action planner.VMAction, str
 
 // recreateInline deletes then re-creates a workload for an update. A delete
 // that could not tear the workload down must NOT be followed by a create: the
-// old runtime may still be alive (the same rule as serverOps.recreateAs). It
+// old runtime may still be alive (the same rule as serverOps.recreateAs).
+// Before the delete, a VM's create is judged as far as it can be with the VM
+// still there (preflightInlineRecreate), so a refusal leaves it as it was. It
 // returns the failed-action error.
 func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f *compose.File, gate *dependsOnGate) error {
 	// A container recreate is judged before anything is deleted: a refused
@@ -547,6 +549,18 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 					return err
 				}
 			}
+			// Every admission the create will make that the delete does not
+			// change, before the delete, and before the LUN claim moves
+			// (round 5, S1). The create carries the VM it replaces only
+			// for a VM on a LUN, so only then is its guard admission a
+			// re-create's.
+			if err := s.preflightInlineRecreate(ctx, action, f, cur, runHost, onLUN); err != nil {
+				slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
+				st := status.Convert(err)
+				err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
 			pctx, done, err := s.preflightLUNs(ctx, spec, cur, runHost)
 			if err != nil {
 				slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
@@ -606,6 +620,32 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	}
 	// A recreated workload is as new to its dependents as a created one.
 	return gate.waitCreated(ctx, action)
+}
+
+// preflightInlineRecreate runs, before an inline compose re-create deletes
+// cur, every refusal its create (deployCreatePlanned → CreateVM) would make
+// that the delete does not change: recreatePreflight — authority, names,
+// tuning, NIC identities, hooks, USB and memory hot-add, project, network,
+// pool and ISO admission — judged for the host the create is pinned to (or
+// cur's when it is not), and the guard admission in the create's own mode
+// (preflightCreateGuards; replaced says the create carries cur). What
+// depends on the delete — the name, quota and host capacity — is left to
+// the create, as for a rebuild. Before this, a refusal among them came after
+// the delete and lost the VM (round 5, S1).
+func (s *Server) preflightInlineRecreate(ctx context.Context, action planner.VMAction, f *compose.File,
+	cur *corrosion.VMRecord, runHost string, replaced bool) error {
+	sp, err := s.plannedCreateSpec(action, f)
+	if err != nil {
+		return err
+	}
+	host := runHost
+	if host == "" {
+		host = cur.HostName
+	}
+	if err := s.recreatePreflight(ctx, sp, host); err != nil {
+		return err
+	}
+	return s.preflightCreateGuards(ctx, sp, cur, replaced)
 }
 
 // createPlanned creates a workload and waits for the condition its dependents

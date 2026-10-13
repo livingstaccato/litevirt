@@ -238,6 +238,55 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 		}
 	})
 
+	// Re-review I-3: a forked host's two chains interleave by seq, so its
+	// rows are unlinked against the walk's tail as a matter of course. A row
+	// deleted inside the seq range the second chain covers leaves no seq
+	// jump; its successor's prev_hash then names no row, an orphan, and the
+	// verdict is tampering, not a fork.
+	//
+	// Mutation: excuse every unlinked row on a forked host (no orphan check)
+	// — the deletion reads as a fork: red.
+	secondChain := func(t *testing.T, ctx context.Context, c *Client) {
+		t.Helper()
+		prev := ""
+		for i, id := range []string{"fork-1", "fork-2", "fork-3"} {
+			f := fork
+			f.ID, f.PrevHash = id, prev
+			f.Timestamp = "2026-10-03T22:16:3" + string(rune('1'+i)) + ".000000000Z"
+			f.ContentHash = HashAuditRow(f)
+			insertRaw(t, ctx, c, f, int64(i+1))
+			prev = f.ContentHash
+		}
+	}
+	t.Run("a fork of several rows is a fork", func(t *testing.T) {
+		ctx, c := seed(t)
+		secondChain(t, ctx, c)
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Forked() || res.Orphaned != 0 || res.SeqDuplicates != 3 {
+			t.Errorf("Forked() = %v, orphaned %d, duplicates %d (gaps %v): want a fork alone", res.Forked(), res.Orphaned, res.SeqDuplicates, res.SeqGaps)
+		}
+	})
+	t.Run("a row deleted inside a fork's seq range is not a fork", func(t *testing.T) {
+		ctx, c := seed(t)
+		secondChain(t, ctx, c)
+		if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id = 'r2'`); err != nil {
+			t.Fatal(err)
+		}
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.SeqGaps) != res.SeqDuplicates {
+			t.Fatalf("setup: the deletion left a seq jump %v; it must hide in the fork's range", res.SeqGaps)
+		}
+		if res.Orphaned == 0 || res.Forked() || !res.Tampered() {
+			t.Errorf("orphaned %d, Forked() %v, Tampered() %v: want the deletion reported as tampering", res.Orphaned, res.Forked(), res.Tampered())
+		}
+	})
+
 	t.Run("an intact chain has no kind", func(t *testing.T) {
 		ctx, c := seed(t)
 		res, err := VerifyAuditChain(ctx, c)

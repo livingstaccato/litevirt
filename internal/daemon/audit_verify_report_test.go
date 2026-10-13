@@ -60,6 +60,10 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 	// node-4 comes later in the walk.
 	forkAndEdit := fork
 	forkAndEdit.ContentBreaks = 1
+	// Re-review I-3: a row deleted on the forked host inside the second
+	// chain's seq range leaves an orphan and no seq jump.
+	forkAndOrphan := fork
+	forkAndOrphan.Orphaned = 1
 
 	for _, tc := range []struct {
 		name          string
@@ -72,6 +76,7 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 		{"an edited row", edited, "evidence of tampering", "forked chain", 0, 1, 0, 0},
 		{"a fork beside a deleted row", forkAndDeletion, "evidence of tampering", "found a forked chain", 1, 0, 1, 1},
 		{"a fork on one host and an edit on another", forkAndEdit, "evidence of tampering", "found a forked chain", 1, 1, 0, 1},
+		{"a fork hiding a deleted row", forkAndOrphan, "evidence of tampering", "found a forked chain", 1, 1, 0, 1},
 	} {
 		buf.Reset()
 		reportAuditVerify("node-1", tc.res)

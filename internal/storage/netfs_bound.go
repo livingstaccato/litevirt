@@ -108,7 +108,9 @@ func boundedCall(op, typ, path string, fn func() (any, error)) (any, error) {
 	if mount.key != "" && mountUnanswered(mount.key) {
 		return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount.dir, Earlier: true}
 	}
-	key := op + "\x00" + typ + "\x00" + path
+	// The mount is in the key too: a call stuck on a lazily unmounted dead
+	// mount must not be joined by a call on a new mount at the same path.
+	key := op + "\x00" + typ + "\x00" + mount.key + "\x00" + path
 	c := &fsCall{done: make(chan struct{})}
 	if v, running := fsCalls.LoadOrStore(key, c); running {
 		c = v.(*fsCall)

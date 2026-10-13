@@ -481,7 +481,22 @@ func (s *Server) computeStoreRecordsEpoch(ctx context.Context, id string) (time.
 	var pools []string
 	cur, unjudged := s.localPoolStoreIDs(ctx)
 	if len(unjudged) > 0 {
-		return time.Time{}, false // which pools are on id is not known now
+		// A pool whose store did not answer is judged by what this host
+		// recorded for it: only a pool recorded on id, or with no record at
+		// all, leaves id's epoch unknown. Every other store keeps its check
+		// — one stalled pool must not turn off the protection everywhere.
+		recorded := map[string]hostStoreEntry{}
+		v, _, err := corrosion.GetPoolRecord(ctx, s.db, hostStoresKey(s.hostName))
+		if err != nil {
+			return time.Time{}, false
+		}
+		_ = json.Unmarshal([]byte(v), &recorded)
+		for pool := range unjudged {
+			e, ok := recorded[pool]
+			if !ok || slices.Contains(e.IDs, id) {
+				return time.Time{}, false // which pools are on id is not known now
+			}
+		}
 	}
 	for pool, ids := range cur {
 		if slices.Contains(ids, id) {

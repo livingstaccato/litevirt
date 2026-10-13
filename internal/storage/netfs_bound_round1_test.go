@@ -63,6 +63,13 @@ func TestBounded_ANewMountAtTheSameDirectoryIsNotLatched(t *testing.T) {
 	if err != nil || v != 1 {
 		t.Fatalf("a call on the new mount at the same directory = %d, %v; want it made", v, err)
 	}
+	// Round 2 R1-M1: the very path whose call is stuck on the old mount, too.
+	// Mutation "join key without the mount" — it joins the stuck call and
+	// fails at once: red.
+	v, err = Bounded("stat", a, func() (int, error) { return 2, nil })
+	if err != nil || v != 2 {
+		t.Fatalf("the same path on the new mount = %d, %v; want it made, not joined to the call stuck on the old one", v, err)
+	}
 }
 
 // R1 I-2: SharedStoreOfErr reports a store that does not answer as an error,

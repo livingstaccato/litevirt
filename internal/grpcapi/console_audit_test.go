@@ -6,6 +6,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -627,5 +628,146 @@ func TestConsoleAudit_AnErrorDuringTheStopStaysAnError(t *testing.T) {
 	c := rowsWith(consoleAuditRows(t, s), "vm.console.close", "serial")
 	if len(c) != 1 || c[0].result != "error" || auditField(c[0].detail, "ended") != "console error: boom" {
 		t.Fatalf("close rows = %+v, want one error row ended=\"console error: boom\"", c)
+	}
+}
+
+// The stop wakes every console handler at once (grpc.Server.Stop cancels
+// their streams), so the flush writes a running session's close while that
+// session's handler is ending it. The close row is built from what the
+// session was when the flush took it, under the registry lock — never from
+// fields the handler is still writing. Run under -race: the hook makes the
+// handler end between the flush's sweep and its write.
+//
+// Mutation "the close row reads the live session outside the lock" — DATA RACE.
+func TestConsoleAudit_TheFlushDoesNotRaceAHandlerTheStopWoke(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	_, end := openConsole(t, s, alice, "vnc")
+	handlerDone := make(chan error, 1)
+	var once sync.Once
+	consoleCloseWriteHook = func() {
+		once.Do(func() {
+			go func() { handlerDone <- end() }()
+			// No synchronisation with the handler: it ends on its own
+			// while this write is under way, as after a real Stop.
+			time.Sleep(200 * time.Millisecond)
+		})
+	}
+	t.Cleanup(func() { consoleCloseWriteHook = nil })
+
+	s.MarkConsoleShutdown()
+	s.FlushConsoleAudit()
+	<-handlerDone
+	closes := rowsWith(consoleAuditRows(t, s), "vm.console.close", "vnc")
+	if len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {
+		t.Fatalf("close rows = %+v, want exactly one, ended=daemon-stop", closes)
+	}
+}
+
+// The flush is bounded: a close row a handler is stuck writing (a stalled
+// database) holds it for consoleFlushTimeout, no longer. It then says so in
+// the log and takes on no row after.
+//
+// Mutation "the flush waits for rows in flight without a deadline" — red.
+func TestConsoleAudit_TheFlushGivesUpAtItsDeadline(t *testing.T) {
+	s := consoleAuditServer(t)
+	old := consoleFlushTimeout
+	consoleFlushTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { consoleFlushTimeout = old })
+	logs := &lockedLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	_, end := openConsole(t, s, alice, "vnc")
+	entered := make(chan struct{})
+	var once sync.Once
+	consoleCloseWriteHook = func() {
+		once.Do(func() {
+			close(entered)
+			time.Sleep(1500 * time.Millisecond) // the database is stalled
+		})
+	}
+	t.Cleanup(func() { consoleCloseWriteHook = nil })
+	ended := make(chan error, 1)
+	go func() { ended <- end() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never began its close row")
+	}
+
+	start := time.Now()
+	s.FlushConsoleAudit()
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("the flush took %s with a %s deadline", d, consoleFlushTimeout)
+	}
+	if !strings.Contains(logs.String(), "console audit flush timed out") || !strings.Contains(logs.String(), "rows=1") {
+		t.Errorf("the flush did not log the row it gave up on:\n%s", logs.String())
+	}
+	s.consoleSessions.mu.Lock()
+	claimed := s.consoleSessions.claimLocked()
+	s.consoleSessions.mu.Unlock()
+	if claimed {
+		t.Error("a row was taken on after the flush")
+	}
+	<-ended
+}
+
+// lockedLog is a goroutine-safe log sink.
+type lockedLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// A session accepted after the flush's first sweep — a relay that got the
+// VM host's header just after the stop — is still closed by the flush: it
+// sweeps again before it lets nothing more be written.
+//
+// Mutation "the flush sweeps once" — red (an open row with no close).
+func TestConsoleAudit_ASessionAcceptedDuringTheFlushIsClosedByIt(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	// A VNC session whose close is being written keeps the flush waiting.
+	_, end := openConsole(t, s, alice, "vnc")
+	entered := make(chan struct{})
+	var once sync.Once
+	consoleCloseWriteHook = func() {
+		once.Do(func() {
+			close(entered)
+			time.Sleep(400 * time.Millisecond)
+		})
+	}
+	t.Cleanup(func() { consoleCloseWriteHook = nil })
+	s.MarkConsoleShutdown()
+	ended := make(chan error, 1)
+	go func() { ended <- end() }()
+	<-entered
+	flushed := make(chan struct{})
+	go func() { s.FlushConsoleAudit(); close(flushed) }()
+	time.Sleep(100 * time.Millisecond) // the flush has swept and is waiting
+
+	late := s.beginConsoleAudit(alice, consoleKindSerial, "desk")
+	late.setOwner(s.hostName)
+	late.accept(nil)
+	<-flushed
+	<-ended
+	rows := consoleAuditRows(t, s)
+	open, closes := rowsWith(rows, "vm.console.open", "serial"), rowsWith(rows, "vm.console.close", "serial")
+	if len(open) != 1 || len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {
+		t.Fatalf("a session accepted during the flush: open %+v, close %+v; want one of each, ended=daemon-stop", open, closes)
 	}
 }

@@ -298,7 +298,8 @@ func (a *consoleAudit) accept(stream grpc.ServerStream) {
 	a.attach()
 	reg := &a.s.consoleSessions
 	reg.mu.Lock()
-	if a.ended || a.accepted {
+	if a.ended || a.accepted || a.sess.closed {
+		// A closed session is frozen: the flush took it during the stop.
 		reg.mu.Unlock()
 		return
 	}
@@ -381,6 +382,12 @@ func (a *consoleAudit) end(err error) {
 		return
 	}
 	sess.active--
+	if sess.closed {
+		// The flush closed it (the stop): its close row is already built,
+		// and the session is frozen.
+		reg.mu.Unlock()
+		return
+	}
 	sess.lastEnd = time.Now()
 	if sess.endClass == "" {
 		switch {
@@ -446,8 +453,9 @@ func (reg *consoleSessions) closeAndClaimLocked(sess *consoleSession) func() {
 	if !reg.claimLocked() {
 		return nil
 	}
+	row := sess.closeRowLocked()
 	return func() {
-		sess.writeClose(sess.ctx)
+		row.write(row.ctx)
 		reg.release()
 	}
 }
@@ -466,17 +474,22 @@ func (reg *consoleSessions) closeLocked(sess *consoleSession) {
 	delete(reg.live, sess)
 }
 
-// writeClose writes the session's close row. Its fields no longer change:
-// the session has left the registry.
-func (sess *consoleSession) writeClose(ctx context.Context) {
-	if consoleCloseWriteHook != nil {
-		consoleCloseWriteHook()
-	}
-	select {
-	case <-sess.written:
-	case <-ctx.Done():
-		return // the flush's deadline passed while the open row was still being written
-	}
+// closeRow is a session's close row, built under reg.mu when the session
+// leaves the registry. The session itself may still change afterwards — the
+// stop wakes its handler, whose end() runs while the flush writes — so the
+// write reads only this snapshot.
+type closeRow struct {
+	s       *Server
+	ctx     context.Context // the session's, for an ordinary close
+	written chan struct{}   // the open row is in
+	actor   string
+	vm      string
+	detail  string
+	result  string
+}
+
+// closeRowLocked builds sess's close row. reg.mu is held.
+func (sess *consoleSession) closeRowLocked() *closeRow {
 	result, ended := "ok", consoleEndedClosed
 	switch sess.endClass {
 	case consoleEndedDaemonStop:
@@ -491,7 +504,20 @@ func (sess *consoleSession) writeClose(ctx context.Context) {
 		d += " channels=" + strconv.Itoa(sess.channels)
 	}
 	d += " ended=" + auditValue(boundAuditValue(ended, consoleAuditMaxReason))
-	sess.s.writeConsoleAudit(ctx, sess.actor, "vm.console.close", sess.vm, d, result)
+	return &closeRow{s: sess.s, ctx: sess.ctx, written: sess.written, actor: sess.actor, vm: sess.vm, detail: d, result: result}
+}
+
+// write writes the close row, once the session's open row is in.
+func (r *closeRow) write(ctx context.Context) {
+	if consoleCloseWriteHook != nil {
+		consoleCloseWriteHook()
+	}
+	select {
+	case <-r.written:
+	case <-ctx.Done():
+		return // the flush's deadline passed while the open row was still being written
+	}
+	r.s.writeConsoleAudit(ctx, r.actor, "vm.console.close", r.vm, r.detail, r.result)
 }
 
 // refused writes the row for a stream that was never accepted.
@@ -643,6 +669,43 @@ func (s *Server) FlushConsoleAudit() {
 	reg := &s.consoleSessions
 	reg.mu.Lock()
 	reg.stopping = true
+	for {
+		writes := reg.sweepLocked(s, ctx)
+		// Done when nothing is open or being written — or out of time, when
+		// the writes in hand only release their claims.
+		done := ctx.Err() != nil || (len(writes) == 0 && reg.inflight == 0)
+		if done {
+			if n := reg.inflight - len(writes); n > 0 {
+				slog.Warn("console audit flush timed out; rows still being written may be lost",
+					"rows", n, "timeout", consoleFlushTimeout)
+			}
+			// No row is taken on after this.
+			reg.flushed = true
+		}
+		reg.mu.Unlock()
+		for _, write := range writes {
+			write()
+		}
+		if done {
+			return
+		}
+		if len(writes) == 0 {
+			// Rows a handler (or a timer) took on: wait for them. A session
+			// accepted meanwhile is swept on the next turn.
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		reg.mu.Lock()
+	}
+}
+
+// sweepLocked closes and claims every session still open and every pending
+// refusal summary, and returns their writes. reg.mu is held. A write whose
+// turn comes after ctx's deadline releases its claim without writing, so the
+// flush does not queue behind a stalled database.
+func (reg *consoleSessions) sweepLocked(s *Server, ctx context.Context) []func() {
 	var writes []func()
 	for sess := range reg.live {
 		if sess.active > 0 {
@@ -654,8 +717,13 @@ func (s *Server) FlushConsoleAudit() {
 		}
 		reg.closeLocked(sess)
 		if reg.claimLocked() {
-			sess := sess
-			writes = append(writes, func() { sess.writeClose(ctx); reg.release() })
+			row := sess.closeRowLocked()
+			writes = append(writes, func() {
+				if ctx.Err() == nil {
+					row.write(ctx)
+				}
+				reg.release()
+			})
 		}
 	}
 	for actor, w := range reg.refusals {
@@ -664,33 +732,16 @@ func (s *Server) FlushConsoleAudit() {
 		}
 		if w.suppressed > 0 && reg.claimLocked() {
 			actor, w := actor, w
-			writes = append(writes, func() { s.writeRefusalSummary(ctx, actor, w); reg.release() })
+			writes = append(writes, func() {
+				if ctx.Err() == nil {
+					s.writeRefusalSummary(ctx, actor, w)
+				}
+				reg.release()
+			})
 		}
 	}
 	reg.refusals = nil
-	reg.mu.Unlock()
-
-	for _, write := range writes {
-		write()
-	}
-	// Then every row a handler (or a timer) took on before this point.
-	for {
-		reg.mu.Lock()
-		if reg.inflight == 0 || ctx.Err() != nil {
-			if reg.inflight > 0 {
-				slog.Warn("console audit flush timed out; rows still being written may be lost",
-					"rows", reg.inflight, "timeout", consoleFlushTimeout)
-			}
-			reg.flushed = true
-			reg.mu.Unlock()
-			return
-		}
-		reg.mu.Unlock()
-		select {
-		case <-ctx.Done():
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
+	return writes
 }
 
 // auditConsoleCredential writes GetSpiceInfo's row. request is the id this

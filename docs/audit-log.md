@@ -270,8 +270,8 @@ under its own budget, so nothing is lost cluster-wide.
 
 **Stopping the daemon.** A graceful stop writes the close row of every session
 still open, `ended=daemon-stop`, and of every SPICE session waiting out its
-linger, and waits for the close rows of the sessions the stop ended, before
-the database closes. Each session gets exactly one close row. The stop marks
+linger, and of any session accepted while it runs, and waits for the close
+rows of the sessions the stop ended, before the database closes. Each session gets exactly one close row. The stop marks
 the console audit before it stops serving, so a session that ends in that
 window (up to 5 seconds, while the daemon lets RPCs finish) without an error
 also reads `ended=daemon-stop`; one that ends with an error keeps it. The

@@ -62,9 +62,20 @@ func InsertVMEvent(ctx context.Context, c *Client, r VMEventRecord) error {
 }
 
 // ListVMEvents returns a VM's events newest-first, capped at limit (default 100,
-// max 1000). When since is non-empty (RFC3339) only events at/after it are
-// returned.
+// max 1000). When since is non-empty only events at/after it are returned; it
+// takes every form ParseTimeWindow does.
 func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, since string) ([]VMEventRecord, error) {
+	w, err := ParseTimeWindow(since, "", time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return ListVMEventsWindow(ctx, c, vmName, limit, w)
+}
+
+// ListVMEventsWindow is ListVMEvents over a parsed window. ts is compared as an
+// instant, not as text: a whole-second bound used to sort after every event
+// inside its own second, and an offset bound was wrong by the offset.
+func ListVMEventsWindow(ctx context.Context, c *Client, vmName string, limit int, w TimeWindow) ([]VMEventRecord, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -80,9 +91,9 @@ func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, sinc
 		where = append(where, "vm_name = ?")
 		args = append(args, vmName)
 	}
-	if since != "" {
-		where = append(where, "ts >= ?")
-		args = append(args, since)
+	if pred, pargs := w.Predicate("ts"); pred != "" {
+		where = append(where, pred)
+		args = append(args, pargs...)
 	}
 	if len(where) > 0 {
 		sql += " WHERE " + strings.Join(where, " AND ")

@@ -1966,11 +1966,12 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// into a partial one. Recovery restores what was already accounted for; only a
 	// human asking for something NEW is admitted.
 	//
-	// Skipped when the VM is already running: `lv start` on a running VM is a
-	// no-op that adds nothing, and must not be refused for capacity it already
-	// occupies. Anything else — stopped, error, mid-transition — is counted
-	// nowhere, so its whole size is admitted as new to the host.
-	if vm.State == "running" {
+	// Skipped when the VM is already running or starting: host usage counts
+	// both (corrosion.SumVMResourcesByHost), and `lv start` must not be
+	// refused for capacity the VM already occupies. Anything else — stopped,
+	// error, pending — is counted nowhere, so its whole size is admitted as
+	// new to the host.
+	if vm.State == "running" || vm.State == "starting" {
 		return nil, nil
 	}
 	if allowOvercommit {

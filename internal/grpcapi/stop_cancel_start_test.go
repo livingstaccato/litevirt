@@ -182,3 +182,51 @@ func TestStartVM_AStartCancelledEarlierIsMadeAgain(t *testing.T) {
 		t.Fatalf("vm_start_cancelled %+v (%v) still open once the VM runs", ev, err)
 	}
 }
+
+// Re-review m-1: a start of a cancelled start re-arms the row and returns,
+// so its capacity reservation is released before the reconciler starts the
+// VM. A "starting" row now counts against its host
+// (corrosion.SumVMResourcesByHost, as placement counts it), so a concurrent
+// start cannot be admitted against the same memory meanwhile.
+//
+// Mutation: "starting" not counted — the second start is admitted: red.
+func TestStartVM_ARearmedStartHoldsItsCapacity(t *testing.T) {
+	s := testServerR2(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", Address: "10.0.0.9", State: "active", CPUTotal: 8, MemTotal: 4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Allocatable 4096-1024 = 3072. vm1 (2048) and vm2 (1024), each with its
+	// qemu overhead, do not both fit.
+	for _, v := range []struct {
+		name string
+		mem  int
+	}{{"vm1", 2048}, {"vm2", 1024}} {
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: v.name, HostName: "test-host", State: "stopped", StateDetail: "operator-stop", CPUActual: 1, MemActual: v.mem,
+			Spec: seedSpecJSON(t, &pb.VMSpec{Name: v.name, Cpu: 1, MemoryMib: int32(v.mem)}),
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>vm2</name><devices></devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := health.RecordStartCancelled(ctx, s.db, "test-host", "vm1", "starting", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("re-armed start of vm1: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "vm1"); vm == nil || vm.State != "starting" {
+		t.Fatalf("vm1 %+v, want re-armed to starting", vm)
+	}
+	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm2"}); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("start of vm2 against memory vm1's start holds = %v, want ResourceExhausted", err)
+	}
+}
+

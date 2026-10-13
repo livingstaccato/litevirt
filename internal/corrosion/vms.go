@@ -973,18 +973,21 @@ type HostResourceUsage struct {
 	// Thin provisioning lets it exceed the host's capacity, so it is never a
 	// numerator for a statfs total (colonelpanik/litevirt#142).
 	DiskAllocatedGiB int
-	// VMCount is how many RUNNING VMs the host carries. Capacity policy charges
+	// VMCount is how many RUNNING (or starting) VMs the host carries. Capacity policy charges
 	// a per-VM qemu overhead on top of configured guest memory, so the count is
 	// part of usage, not a display detail.
 	VMCount int
 }
 
-// SumVMResourcesByHost returns per-host CPU, memory, and disk totals for running VMs.
+// SumVMResourcesByHost returns per-host CPU, memory, and disk totals for running VMs,
+// and for VMs in "starting": a start the reconciler is making (an onboot, a
+// self-heal, an operator's start of a cancelled one) holds no reservation and
+// is about to run, as placement counts it (placement.countsAgainstHost).
 func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResourceUsage, error) {
 	rows, err := c.Query(ctx,
 		`SELECT host_name, COALESCE(SUM(cpu_actual),0) as cpu, COALESCE(SUM(mem_actual),0) as mem,
 		        COUNT(*) as vm_count
-		 FROM vms WHERE deleted_at IS NULL AND state = 'running' GROUP BY host_name`)
+		 FROM vms WHERE deleted_at IS NULL AND state IN ('running', 'starting') GROUP BY host_name`)
 	if err != nil {
 		return nil, err
 	}

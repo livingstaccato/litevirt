@@ -396,13 +396,14 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 // (corrosion.AuditVerifyResult.Forked) is reported as one, and only the other
 // findings as evidence of tampering.
 func reportAuditVerify(host string, res corrosion.AuditVerifyResult) {
-	forked := res.BrokenKind == corrosion.AuditBrokenForked
 	// "ok" means verified clean, so an unverifiable log is not ok — a host that
 	// cannot read its signing key must not report a green gauge — and neither
 	// is a forked chain, which fails `lv audit verify` too.
 	metrics.AuditChainVerified(host, !res.Tampered() && !res.Unverified(), map[string]int{
-		"broken_hash":   boolCount(res.BrokenAt != "" && !forked),
-		"forked_chain":  boolCount(forked),
+		// Every unlinked row, classified: an edit, or a break on a host
+		// with no second genesis, is a broken hash; a fork is a forked chain.
+		"broken_hash":   res.ContentBreaks + res.UnlinkedOutsideForks,
+		"forked_chain":  len(res.ForkedHosts),
 		"bad_signature": len(res.BadSignature),
 		"unknown_key":   len(res.UnknownKeyID),
 		"seq_gap":       len(res.SeqGaps) - res.SeqDuplicates,
@@ -441,6 +442,7 @@ func reportAuditVerify(host string, res corrosion.AuditVerifyResult) {
 			"rows", res.RowsChecked, "broken_at", res.BrokenAt, "broken_kind", res.BrokenKind,
 			"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 			"seq_gaps", len(res.SeqGaps), "seq_duplicates", res.SeqDuplicates, "laundered", len(res.Laundered),
+			"content_breaks", res.ContentBreaks, "unlinked_outside_forks", res.UnlinkedOutsideForks, "forked_hosts", res.ForkedHosts,
 			"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
 			"truncated_hosts", res.TruncatedHosts,
 			// Without it, a verdict resting only on unsigned-after-signed rows
@@ -457,11 +459,4 @@ func reportAuditVerify(host string, res corrosion.AuditVerifyResult) {
 			"rows", res.RowsChecked, "unverifiable", res.Unverifiable,
 			"never_adopted", res.NeverAdopted, "ambiguous", res.Ambiguous)
 	}
-}
-
-func boolCount(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

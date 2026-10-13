@@ -167,6 +167,77 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 		}
 	})
 
+	// Review I-2: a fork on one host must not hide an edited row on another.
+	// Only the first break gets BrokenAt; every break is classified. The
+	// fork is node-3's (walked first); node-4's edited row is a content break,
+	// and the verdict is tampering, not a fork.
+	//
+	// Mutation: classify only the first break (drop ContentBreaks) — Forked()
+	// is true: red.
+	t.Run("a fork on one host and an edited row on another", func(t *testing.T) {
+		ctx, c := seed(t)
+		f := fork
+		f.ContentHash = HashAuditRow(f)
+		insertRaw(t, ctx, c, f, 1)
+		for i, id := range []string{"b1", "b2"} {
+			if err := InsertAuditLog(ctx, c, AuditRecord{
+				ID: id, Username: "admin", HostName: "node-4", Action: "vm.stop",
+				Target: "vm-2", Result: "ok", Timestamp: "2026-10-03T22:17:0" + string(rune('1'+i)) + ".000000000Z",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := c.Execute(ctx, `UPDATE audit_log SET detail = 'tampered' WHERE id = 'b1'`); err != nil {
+			t.Fatal(err)
+		}
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.BrokenKind != AuditBrokenForked || len(res.ForkedHosts) != 1 || res.ContentBreaks != 1 {
+			t.Fatalf("kind %q, forked hosts %v, content breaks %d; want the fork first and one content break", res.BrokenKind, res.ForkedHosts, res.ContentBreaks)
+		}
+		if res.Forked() {
+			t.Error("Forked() = true: an edited row on another host was hidden behind a fork")
+		}
+	})
+
+	// A row deleted on a host with no fork, beside a fork on another: an
+	// unlinked row outside the forked hosts is not part of the fork.
+	t.Run("a fork on one host and a deleted row on another", func(t *testing.T) {
+		ctx, c := seed(t)
+		f := fork
+		f.ContentHash = HashAuditRow(f)
+		insertRaw(t, ctx, c, f, 1)
+		for i, id := range []string{"b1", "b2", "b3"} {
+			if err := InsertAuditLog(ctx, c, AuditRecord{
+				ID: id, Username: "admin", HostName: "node-4", Action: "vm.stop",
+				Target: "vm-2", Result: "ok", Timestamp: "2026-10-03T22:17:0" + string(rune('1'+i)) + ".000000000Z",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Rewritten in place with its own prev_hash blanked: self-consistent,
+		// so not a content break, and on a host with no second genesis.
+		rows, err := c.Query(ctx, `SELECT timestamp FROM audit_log WHERE id = 'b2'`)
+		if err != nil || len(rows) != 1 {
+			t.Fatal(err)
+		}
+		ed := AuditRecord{ID: "b2", Timestamp: rows[0].String("timestamp"), Username: "admin", HostName: "node-4",
+			Action: "vm.stop", Target: "vm-2", Detail: "rewritten", Result: "ok"}
+		if err := c.Execute(ctx, `UPDATE audit_log SET detail = ?, prev_hash = '', content_hash = ? WHERE id = 'b2'`,
+			ed.Detail, HashAuditRow(ed)); err != nil {
+			t.Fatal(err)
+		}
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.UnlinkedOutsideForks == 0 || res.Forked() {
+			t.Errorf("unlinked outside forks %d, Forked() %v: want a break outside the fork, not a fork alone", res.UnlinkedOutsideForks, res.Forked())
+		}
+	})
+
 	t.Run("an intact chain has no kind", func(t *testing.T) {
 		ctx, c := seed(t)
 		res, err := VerifyAuditChain(ctx, c)

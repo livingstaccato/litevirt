@@ -89,35 +89,43 @@ func report(t *testing.T, when string, problems []string) {
 }
 
 // limitsNetwork creates a bridge network for a limits test and registers its
-// cleanup, which also removes the Linux bridge the network provisioned:
-// `lv network rm` deliberately leaves a user-managed bridge behind, so without
-// this every run leaks one per host the VM touched.
+// cleanup, which removes the network and then checks that `lv network rm`
+// removed the Linux bridge it provisioned from every host.
 func limitsNetwork(t *testing.T, subnet string) string {
 	t.Helper()
 	netName := uniqueName("ln")
 	cleanup(t, func() {
 		lvErr(t, "network", "rm", netName, "--force")
-		removeTestBridge(t, netName)
+		assertTestBridgeGone(t, netName)
 	})
 	lv(t, "network", "create", netName, "--type", "bridge", "--subnet", subnet, "--dhcp")
 	return netName
 }
 
-// removeTestBridge deletes, on every cluster host, the Linux bridge that the
-// test's own bridge network (created without --interface) provisioned. The
-// name is derived from a uniqueName, so no bridge the test did not create can
-// match. Best effort: failures are logged, not fatal, in a cleanup.
-func removeTestBridge(t *testing.T, netName string) {
+// assertTestBridgeGone checks, on every cluster host, that the Linux bridge
+// the test's own bridge network (created without --interface) provisioned is
+// gone once the network is removed: litevirt created it, so `lv network rm`
+// removes it on every node within a reconcile pass or two (lab finding P-5).
+//
+// It used to delete the bridge itself, which hid exactly that leak. It now
+// fails the test on a bridge still present after the wait, and only then
+// deletes it, so one leak does not spill into the next run. The name is
+// derived from a uniqueName, so no bridge the test did not create can match.
+func assertTestBridgeGone(t *testing.T, netName string) {
 	t.Helper()
 	br := network.FlatBridgeName(netName)
 	if !strings.HasPrefix(netName, "e2e-") || br == "" {
-		t.Logf("refusing to delete bridge %q of network %q: not a test-created name", br, netName)
+		t.Logf("refusing to check bridge %q of network %q: not a test-created name", br, netName)
 		return
 	}
-	script := "if ip link show " + br + " >/dev/null 2>&1; then ip link del " + br + "; fi"
-	for _, h := range hostNames {
-		if out, err := nodeOut(h, script); err != nil {
-			t.Logf("cleanup: removing bridge %s on %s: %v\n%s", br, h, err, out)
+	failed := waitOnHosts(hostNames, bridgeAbsent(br), netRmPass)
+	if len(failed) == 0 {
+		return
+	}
+	t.Errorf("`lv network rm %s` left bridge %s on %d host(s) after %s: %v", netName, br, len(failed), netRmPass, failed)
+	for h := range failed {
+		if out, err := nodeOut(h, "if ip link show "+br+" >/dev/null 2>&1; then ip link del "+br+"; fi"); err != nil {
+			t.Logf("cleanup: removing leaked bridge %s on %s: %v\n%s", br, h, err, out)
 		}
 	}
 }

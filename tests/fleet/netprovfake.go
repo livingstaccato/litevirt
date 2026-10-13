@@ -34,6 +34,7 @@ type NetProvFake struct {
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
+	failWith      map[string]error // network → the error its Provision returns (FailProvision)
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -44,6 +45,20 @@ func NewNetProvFake() *NetProvFake {
 		flat:         map[string]bool{},
 		subnets:      map[string]string{},
 	}
+}
+
+// FailProvision makes every Provision of network return err; nil clears it.
+func (f *NetProvFake) FailProvision(network string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failWith == nil {
+		f.failWith = map[string]error{}
+	}
+	if err == nil {
+		delete(f.failWith, network)
+		return
+	}
+	f.failWith[network] = err
 }
 
 // SetDHCPConflicts turns on the overlapping-subnet dnsmasq failure (see
@@ -58,6 +73,9 @@ func (f *NetProvFake) Provision(_ context.Context, _ *corrosion.Client, name str
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.failWith[name]; err != nil {
+		return "", err
+	}
 	if f.dhcpConflicts && def.Subnet != "" {
 		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
 			for other, sub := range f.subnets {

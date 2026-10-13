@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -84,4 +85,70 @@ func TestFleet_SameSubnetCreateNamesTheForceDeletedNetworkStillHoldingIt(t *test
 	if _, ok := n.Net.Up("newb"); !ok {
 		t.Errorf("newb not provisioned here after olda's teardown finished")
 	}
+}
+
+// The explanation is a diagnosis, so it must not be attached to a failure the
+// deferred teardown cannot have caused (review M3): a provision error that is
+// not about dnsmasq, a new network that starts no DHCP server, and a deleted
+// network whose device a live network shares (the reconciler never tears that
+// one down, so "once that teardown finishes" would never come). Each keeps the
+// plain error, as on main.
+func TestFleet_DeferredTeardownExplanationIsSelective(t *testing.T) {
+	const subnet = "10.89.0.0/24"
+	setup := func(t *testing.T, iface string) (*Node, pb.LiteVirtClient) {
+		t.Helper()
+		c := New(t, Options{Nodes: 1})
+		n := c.Nodes[0]
+		cl := c.SelfClient(n)
+		if _, err := cl.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
+			Name: "olda", Type: "bridge", Subnet: subnet, Iface: iface,
+		}); err != nil {
+			t.Fatalf("create olda: %v", err)
+		}
+		bridge := "olda"
+		if iface != "" {
+			bridge = iface
+		}
+		n.Net.SetGuestPorts(bridge, "vnet7")
+		if _, err := cl.DeleteNetwork(context.Background(), &pb.DeleteNetworkRequest{Name: "olda", Force: true}); err != nil {
+			t.Fatalf("force delete olda: %v", err)
+		}
+		return n, cl
+	}
+	plain := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("create newb succeeded; the scenario needs it to fail")
+		}
+		if msg := status.Convert(err).Message(); strings.Contains(msg, "deleted network") {
+			t.Errorf("a failure the deferred teardown did not cause was blamed on it:\n%s", msg)
+		}
+		if code := status.Code(err); code != codes.Internal {
+			t.Errorf("code = %v, want Internal (the plain provision failure, as on main)", code)
+		}
+	}
+
+	t.Run("a provision error that is not about DHCP", func(t *testing.T) {
+		n, cl := setup(t, "")
+		n.Net.FailProvision("newb", errors.New(`network "newb" provisioning rolled back: host lost connectivity to gateway 192.0.2.1 after 3 failed checks`))
+		_, err := cl.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{Name: "newb", Type: "bridge", Subnet: subnet})
+		plain(t, err)
+	})
+
+	t.Run("a new network that starts no DHCP server (on a VLAN)", func(t *testing.T) {
+		n, cl := setup(t, "")
+		n.Net.FailProvision("newb", errors.New("start DHCP on newb: dnsmasq on newb exited immediately: exit status 2"))
+		_, err := cl.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{Name: "newb", Type: "bridge", Subnet: subnet, Vlan: 30})
+		plain(t, err)
+	})
+
+	t.Run("a deleted network whose device a live network shares", func(t *testing.T) {
+		n, cl := setup(t, "brshr")
+		if _, err := cl.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{Name: "keep", Type: "bridge", Iface: "brshr"}); err != nil {
+			t.Fatalf("create keep: %v", err)
+		}
+		n.Net.FailProvision("newb", errors.New("start DHCP on newb: dnsmasq on newb exited immediately: exit status 2"))
+		_, err := cl.CreateNetwork(context.Background(), &pb.CreateNetworkRequest{Name: "newb", Type: "bridge", Subnet: subnet})
+		plain(t, err)
+	})
 }

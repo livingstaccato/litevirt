@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/network"
@@ -38,13 +39,38 @@ func (e *deferredTeardownError) Unwrap() error { return e.err }
 // explainProvisionFailure returns provErr, explained by a deferred teardown
 // when one is the likely cause (deferredTeardownError). It only adds
 // information: any read that fails leaves provErr as it was.
+//
+// It is a diagnosis, so it claims only what such a teardown can cause: a
+// DHCP server that would not start (the error is about dnsmasq or DHCP, and
+// the new network is one this host would serve DHCP on), next to a deleted
+// network that still serves an overlapping subnet here because something here
+// uses it. A deleted network whose device a live network shares is never torn
+// down by the reconciler, so it is never named as a teardown to wait for.
 func (s *Server) explainProvisionFailure(ctx context.Context, name string, def compose.NetworkDef, provErr error) error {
 	if provErr == nil || def.Subnet == "" {
+		return provErr
+	}
+	if e := strings.ToLower(provErr.Error()); !strings.Contains(e, "dnsmasq") && !strings.Contains(e, "dhcp") {
+		return provErr
+	}
+	// The host facts are not known here, so take the ones under which this
+	// host would serve: a bridge litevirt makes, the vxlan gateway host.
+	if !network.DHCPWouldServe(def, network.DHCPHostFacts{IsGatewayHost: true}) {
 		return provErr
 	}
 	mine, err := netip.ParsePrefix(def.Subnet)
 	if err != nil {
 		return provErr
+	}
+	liveRows, err := s.db.Query(ctx, `SELECT name, type, config FROM networks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return provErr
+	}
+	liveDevices := map[string]bool{}
+	for _, r := range liveRows {
+		if d, err := networkRowDef(networkRow{name: r.String("name"), typ: r.String("type"), config: r.String("config")}); err == nil {
+			liveDevices[network.BridgeName(r.String("name"), d)] = true
+		}
 	}
 	rows, err := s.db.Query(ctx,
 		`SELECT name, type, config, deleted_at FROM networks WHERE deleted_at IS NOT NULL AND name != ?`, name)
@@ -65,7 +91,11 @@ func (s *Server) explainProvisionFailure(ctx context.Context, name string, def c
 		if err != nil || !p.Overlaps(mine) {
 			continue
 		}
-		what, err := s.networkUseHere(ctx, old.name, network.BridgeName(old.name, oldDef))
+		oldDev := network.BridgeName(old.name, oldDef)
+		if liveDevices[oldDev] {
+			continue // the reconciler leaves it to the live network that shares it
+		}
+		what, err := s.networkUseHere(ctx, old.name, oldDev)
 		if err != nil || what == "" {
 			continue
 		}

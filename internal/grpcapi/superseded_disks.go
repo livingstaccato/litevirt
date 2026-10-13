@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -70,8 +71,13 @@ func (s *Server) SupersededDisks(ctx context.Context, req *pb.SupersededDisksReq
 			return nil, rerr
 		}
 		resp.Restored, resp.RestoredTo, resp.SetAside = got.Restored, got.DiskPath, got.SetAside
-		if copies, err = health.ListSupersededDisks(ctx, s.db, s.dataDir); err != nil {
-			return nil, status.Errorf(codes.Internal, "list superseded disk copies: %v", err)
+		// The restore is done (and audited): a listing that fails now (a
+		// directory whose storage stopped answering meanwhile) must not
+		// report it as failed. The answer carries the restore with no list.
+		if copies, err = supersededRelist(ctx, s.db, s.dataDir); err != nil {
+			slog.Warn("superseded disks: restored, but the copies could not be listed again; the answer has no list",
+				"restored", got.Restored, "to", got.DiskPath, "error", err)
+			copies = nil
 		}
 	case len(req.RemovePaths) > 0:
 		// Named copies only: the purge flag a client sends beside them is for
@@ -182,3 +188,6 @@ func (s *Server) NotifyCTRootfsStranded(ct, host, detail string) {
 		Detail: host + ": " + detail,
 	})
 }
+
+// supersededRelist lists the copies again after a restore; tests make it fail.
+var supersededRelist = health.ListSupersededDisks

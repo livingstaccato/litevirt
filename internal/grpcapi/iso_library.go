@@ -198,8 +198,9 @@ func (s *Server) authorizeISORef(ctx context.Context, project, host, pool, file 
 	// A pool the host refuses offers no ISO. The check reads the pool's host,
 	// so it runs there: on the owner, which a forwarded create always reaches.
 	if host == s.hostName {
+		mctx := storage.WithMountTable(ctx)
 		for _, p := range rows {
-			if err := s.checkPoolForWrite(ctx, p.Name, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}); err != nil {
+			if err := s.checkPoolForWrite(mctx, p.Name, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}); err != nil {
 				return "", err
 			}
 		}

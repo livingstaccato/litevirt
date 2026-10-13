@@ -300,6 +300,13 @@ func (a *consoleAudit) accept(stream grpc.ServerStream) {
 	reg.mu.Lock()
 	if a.ended || a.accepted || a.sess.closed {
 		// A closed session is frozen: the flush took it during the stop.
+		// A session is closed here only by the flush's sweep, so the one
+		// stream that meets it is a SPICE channel attaching to a session
+		// another channel had made live. That channel is not accepted: no
+		// header, and no row of its own (the session's close row is already
+		// built). Its stream was cancelled by the stop; if it ends before
+		// the flush has finished, a Canceled end is its one row, a
+		// vm.console.open error with reason=daemon-stop (refusalRow).
 		reg.mu.Unlock()
 		return
 	}

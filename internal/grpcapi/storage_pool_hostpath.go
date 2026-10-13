@@ -140,13 +140,17 @@ func (s *Server) checkPoolForWrite(ctx context.Context, name string, ref Storage
 // to show any caller of the pool; detail (another pool's name, its directory)
 // is for the log only — the other pool may be another project's.
 func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRef) (error, string) {
+	if isFileBasedDriver(ref.Driver) {
+		ctx = storage.WithMountTable(ctx)
+	}
+	mt := storage.MountSnapshot(ctx)
 	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
-	if err := storage.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
+	if err := mt.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
 		return err, ""
 	}
 	if isFileBasedDriver(ref.Driver) {
 		if d, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
-			if err := storage.CheckWriteRoot(d, s.dataDir, s.pkiDir); err != nil {
+			if err := mt.CheckWriteRoot(d, s.dataDir, s.pkiDir); err != nil {
 				return err, ""
 			}
 		}
@@ -169,7 +173,7 @@ func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRe
 	}
 	// A directory pool on an NFS mount (fstab, an NFS data_dir) is used only
 	// when that mount is hardened.
-	if err := checkDirPoolNFSHardened(s.dataDir, ref); err != nil {
+	if err := checkDirPoolNFSHardened(mt, s.dataDir, ref); err != nil {
 		return err, ""
 	}
 	return nil, ""
@@ -179,7 +183,7 @@ func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRe
 // directory is on an NFS mount lacking nosuid,nodev,noexec,nosymfollow
 // (storage.CheckNFSBackingHardened). On a hardened mount, or no NFS mount at
 // all, it passes.
-func checkDirPoolNFSHardened(dataDir string, ref StoragePoolRef) error {
+func checkDirPoolNFSHardened(mt storage.MountTable, dataDir string, ref StoragePoolRef) error {
 	if !isFileBasedDriver(ref.Driver) || strings.EqualFold(ref.Driver, "nfs") {
 		return nil
 	}
@@ -187,7 +191,7 @@ func checkDirPoolNFSHardened(dataDir string, ref StoragePoolRef) error {
 	if err != nil {
 		return nil
 	}
-	return storage.CheckNFSBackingHardened(d)
+	return mt.CheckNFSBackingHardened(d)
 }
 
 // poolDirForWrite is fileBasedPoolDir for a write: checkPoolForWrite first,
@@ -423,7 +427,7 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 		}
 		project = &stored
 	}
-	var mt storage.MountTable
+	mt := storage.MountSnapshot(ctx)
 	mine, err := s.poolExportOf(&mt, s.hostName, ref)
 	if err != nil {
 		return "", "", err
@@ -454,13 +458,13 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 	if mine != nil {
 		if own, err := s.dataDisksExport(&mt); err != nil {
 			return "", "", err
-		} else if own != nil && !storage.IsDataDirDisks(dir, s.dataDir) {
+		} else if own != nil && !mt.IsDataDirDisks(dir, s.dataDir) {
 			if l, w, hit := compare(s.hostName+"/<data_dir>/disks", *own); hit {
 				return l, w, nil
 			}
 		}
 	}
-	confinedHere := dir != "" && !isNFS && s.dirConfinedAmong(rows, name, dir)
+	confinedHere := dir != "" && !isNFS && s.dirConfinedAmongIn(mt, rows, name, dir)
 	for _, r := range rows {
 		if r.HostName == s.hostName && r.Name == name {
 			continue // this pool's own row
@@ -502,7 +506,7 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 		// Fails closed: an overlap that cannot be verified (an NFS server
 		// that does not answer keeps a path from resolving) refuses, as an
 		// overlap would; a timed-out check never lets a pool sit over another.
-		overlap, oerr := storage.DirsOverlap(dir, d)
+		overlap, oerr := mt.DirsOverlap(dir, d)
 		if oerr != nil {
 			slog.Warn("storage pool check: cannot verify that a pool's directory does not overlap an NFS pool's mount point",
 				"other", label, "error", oerr)
@@ -556,8 +560,14 @@ func samePoolOnAnotherHost(name, project string, ref StoragePoolRef, mine storag
 // dirConfinedAmong reports whether dir is <data_dir>/disks, or overlaps the
 // directory of another directory pool of this host in rows.
 func (s *Server) dirConfinedAmong(rows []corrosion.StoragePoolRecord, name, dir string) bool {
+	return s.dirConfinedAmongIn(storage.MountTable{}, rows, name, dir)
+}
+
+// dirConfinedAmongIn is dirConfinedAmong against mt (an empty one is read
+// when needed).
+func (s *Server) dirConfinedAmongIn(mt storage.MountTable, rows []corrosion.StoragePoolRecord, name, dir string) bool {
 	// One that cannot be told not to be <data_dir>/disks counts: the safe side.
-	if is, err := storage.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
+	if is, err := mt.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
 		return true
 	}
 	for _, r := range rows {
@@ -567,7 +577,7 @@ func (s *Server) dirConfinedAmong(rows []corrosion.StoragePoolRecord, name, dir 
 		if d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target}); err == nil {
 			// An overlap that cannot be verified counts: the content stays
 			// confined, which is the safe side.
-			if overlap, oerr := storage.DirsOverlap(dir, d); overlap || oerr != nil {
+			if overlap, oerr := mt.DirsOverlap(dir, d); overlap || oerr != nil {
 				return true
 			}
 		}

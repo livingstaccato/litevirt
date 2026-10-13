@@ -1994,6 +1994,18 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	if vm == nil {
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
 	}
+	// A cutover that a crash interrupted after its commit owes this name its
+	// runtime handoff: until the resume (which runs in the background, and
+	// waits out storage that does not answer) has put the replacement's
+	// domain here, a start would find no definition, or the old one. Refused
+	// as retryable; the resume needs this VM's lock, so the start does not
+	// wait for it holding that lock.
+	if s.db != nil {
+		if pending, perr := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, vm.Name); perr == nil && pending {
+			return releasePreflight, status.Errorf(codes.Unavailable,
+				"start %q: a cutover of this VM is still being finished on this host (its runtime handoff is owed); retry once it completes", vm.Name)
+		}
+	}
 
 	// qemu reopens the installer ISO at every start, so it is judged again
 	// here, on the host that starts it — every start path runs this hook.

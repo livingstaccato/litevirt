@@ -100,6 +100,9 @@ func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMRepl
 			corrosion.OpStepRedefined); err != nil {
 			return err
 		}
+		// The replacement's domain is defined under the name now: the
+		// hardware audit a backfill deferred for it runs.
+		s.auditAfterVMReplaceHandoff(ctx, cl.Manifest.ReplacedVM)
 	}
 	return corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
 		corrosion.OpStepCompleted)

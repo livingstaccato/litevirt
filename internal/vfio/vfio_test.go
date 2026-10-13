@@ -86,6 +86,11 @@ func (m *memFS) addDevice(address, vendor, device, driver string) {
 	devPath := "/sys/bus/pci/devices/" + address
 	m.files[devPath+"/vendor"] = []byte(vendor + "\n")
 	m.files[devPath+"/device"] = []byte(device + "\n")
+	// A device on vfio-pci here stands for one litevirt bound, which set the override.
+	m.files[devPath+"/driver_override"] = []byte("(null)\n")
+	if driver == "vfio-pci" {
+		m.files[devPath+"/driver_override"] = []byte("vfio-pci\n")
+	}
 	if driver != "" {
 		m.links[devPath+"/driver"] = "/sys/bus/pci/drivers/" + driver
 	}

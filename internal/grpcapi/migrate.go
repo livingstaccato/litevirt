@@ -709,7 +709,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
 		// detach so control falls through to the idempotent release. A DumpXML error still
 		// aborts the migration (fail closed — membership cannot be confirmed).
-		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
+		if err := s.detachHostdevIfPresent(ctx, req.VmName, vf.Address); err != nil {
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
 		abort.detachedVFs = append(abort.detachedVFs, vf)
@@ -2796,7 +2796,7 @@ func (s *Server) reattachVFOnSource(ctx context.Context, vmName, addr string) er
 	default:
 		return fmt.Errorf("claimed by VM %q while it was detached", owner)
 	}
-	if _, err := vfio.Bind(addr); err != nil {
+	if _, err := s.vfioHost().Bind(addr); err != nil {
 		if claimed {
 			// Give back what this call claimed; the strict primitive unbinds
 			// first if the failed bind left it bound.

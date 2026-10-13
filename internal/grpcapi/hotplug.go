@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -17,33 +18,69 @@ import (
 	"github.com/litevirt/litevirt/internal/pci"
 )
 
-// detachHostdevIfPresent detaches the PCI hostdev at addr from vmName's LIVE domain
-// only if it is still a member of it, making a guest-detach idempotent so a retry
-// converges. It FAILS CLOSED on a DumpXML error (membership cannot be confirmed → do
-// NOT assume the device is already gone). When addr is absent from the live domain's
-// hostdev source addresses it returns nil (nothing to do); otherwise it delegates to
-// DetachHostdev.
+// detachHostdevIfPresent detaches the PCI hostdev at addr from running vmName,
+// from whichever of its two copies — the live domain and the persistent
+// definition — still holds it, and returns nil only once NEITHER does. A caller
+// releases the host device after it, so a nil here is the promise that no copy of
+// vmName can take the device back: a hostdev left in the persistent definition
+// alone (lab V2, "pci B": live 0 / inactive 1) would come back on vmName's next
+// cold boot, taking the device from whichever VM claimed it after the release.
 //
-// This removes the non-convergence cause on the un-journaled legacy/migration detach
-// paths: DetachHostdev (DomainDetachDeviceFlags) errors on an already-absent device, so a
-// bare retry after a failed release would error on the (already-detached) device and
-// return before it could re-attempt the release. Mirrors what recoverPCIDetach does with
-// hostdevAliasInXML on the journaled path — but keys on the source BDF, since legacy
-// hostdevs carry no user alias.
+// Membership is by source BDF, since legacy hostdevs carry no user alias, and it
+// is checked in both copies, as detachNICIfPresent does. A device in neither is a
+// no-op, so a retry after a failed release converges: DetachHostdev
+// (DomainDetachDeviceFlags) errors on an already-absent device. DetachHostdev
+// detaches from whichever copy holds it (libvirt.DetachLiveAndConfig).
 //
-// Known gap: unlike detachNICIfPresent and recoverPCIDetach, this checks the LIVE
-// copy only, so a hostdev left in the persistent definition alone is skipped and
-// comes back on the next cold boot. Nothing wedges (these paths have no absence
-// verifier), which is why it was left as it is.
-func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
-	present, err := s.liveHostdevPresent(vmName, addr)
+// Absence is then verified. The persistent copy changes synchronously, so one
+// read decides it. The live half only REQUESTS the unplug, so the live copy is
+// waited for, re-requesting the unplug (waitDeviceGone), as waitPCILiveGone does
+// on the journaled path. Every read FAILS CLOSED: an unreadable copy is never
+// taken as absent.
+//
+// The wait runs under ctx, so a cancelled RPC stops it. A guest that cannot
+// acknowledge an unplug at all — paused or pm-suspended — is refused at once
+// rather than waited on, which matters most in startup device-lease recovery,
+// where each wait would hold the startup barrier: the device stays owned and
+// bound, and the retry path picks it up once the guest runs.
+func (s *Server) detachHostdevIfPresent(ctx context.Context, vmName, addr string) error {
+	live, err := s.liveHostdevPresent(vmName, addr)
 	if err != nil {
 		return err
 	}
-	if present {
-		return s.virt.DetachHostdev(vmName, addr)
+	persistent, err := s.persistentHostdevPresent(vmName, addr)
+	if err != nil {
+		return err
 	}
-	return nil // already detached — nothing to do
+	if !live && !persistent {
+		return nil // already detached from both — nothing to do
+	}
+	if live {
+		st, err := s.virt.DomainStateReason(vmName)
+		if err != nil {
+			return fmt.Errorf("read %s's state before the unplug: %w", vmName, err)
+		}
+		if st.State != "running" && (st.Reason == "paused" || st.Reason == "pmsuspended") {
+			return fmt.Errorf("%s is %s and cannot acknowledge the unplug of hostdev %s; left for a retry once it runs", vmName, st.Reason, addr)
+		}
+	}
+	if err := s.virt.DetachHostdev(vmName, addr); err != nil {
+		return err
+	}
+	if persistent, err = s.persistentHostdevPresent(vmName, addr); err != nil {
+		return err
+	}
+	if persistent {
+		return fmt.Errorf("hostdev %s is still in %s's persistent definition after the detach", addr, vmName)
+	}
+	_, err = waitDeviceGone(ctx, func() (bool, error) {
+		present, rerr := s.liveHostdevPresent(vmName, addr)
+		return !present, rerr
+	}, func() error { return s.virt.DetachHostdev(vmName, addr) })
+	if errors.Is(err, errUnplugTimeout) {
+		return fmt.Errorf("hostdev %s still present in %s's live domain after the detach", addr, vmName)
+	}
+	return err
 }
 
 // liveHostdevPresent reports whether vmName's live domain carries a PCI hostdev
@@ -53,20 +90,36 @@ func (s *Server) liveHostdevPresent(vmName, addr string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return hostdevBDFInXML(live, addr), nil
+}
+
+// persistentHostdevPresent is liveHostdevPresent for vmName's persistent
+// definition, the copy a cold boot loads.
+func (s *Server) persistentHostdevPresent(vmName, addr string) (bool, error) {
+	x, err := s.virt.DumpXMLInactive(vmName)
+	if err != nil {
+		return false, fmt.Errorf("read the persistent definition: %w", err)
+	}
+	return hostdevBDFInXML(x, addr), nil
+}
+
+// hostdevBDFInXML reports whether a domain XML carries a PCI hostdev whose source
+// BDF is addr.
+func hostdevBDFInXML(domainXML, addr string) bool {
 	want, ok := pci.CanonicalBDF(addr)
 	if !ok {
 		want = strings.ToLower(strings.TrimSpace(addr))
 	}
-	for _, raw := range libvirt.HostdevSourcePCIAddresses(live) {
+	for _, raw := range libvirt.HostdevSourcePCIAddresses(domainXML) {
 		got, gok := pci.CanonicalBDF(raw)
 		if !gok {
 			got = strings.ToLower(strings.TrimSpace(raw))
 		}
 		if got == want {
-			return true, nil
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
 // detachHostdevConfigIfPresent is the CONFIG-only counterpart to detachHostdevIfPresent,
@@ -376,7 +429,7 @@ func (s *Server) rollbackLegacyPCIAttach(ctx context.Context, vmName string, att
 	//      rather than clearing it. The safety invariant (a stuck member stays owned + bound,
 	//      never unowned + bound) holds regardless; an operator retry/detach also converges it.
 	for _, a := range attachedAddrs {
-		if derr := s.detachHostdevIfPresent(vmName, a); derr != nil {
+		if derr := s.detachHostdevIfPresent(ctx, vmName, a); derr != nil {
 			slog.Error("legacy pci attach rollback: inverse-detach failed — device(s) left owned+bound (recoverable), lease marked rollback_incomplete",
 				"vm", vmName, "address", a, "error", derr)
 			s.markDeviceLeaseRollbackIncomplete(vmName, addrs)
@@ -459,7 +512,7 @@ func (s *Server) detachPCIDevice(ctx context.Context, vmName, pciAddress string)
 	// guest and a bare DetachHostdev would error ("device not found") and return before
 	// re-attempting the release. detachHostdevIfPresent skips the already-gone detach (and
 	// fails closed on a DumpXML error) so control falls through to the idempotent release.
-	if err := s.detachHostdevIfPresent(vmName, pciAddress); err != nil {
+	if err := s.detachHostdevIfPresent(ctx, vmName, pciAddress); err != nil {
 		return nil, status.Errorf(codes.Internal, "detach PCI device %s: %v", pciAddress, err)
 	}
 

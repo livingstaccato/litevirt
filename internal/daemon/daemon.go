@@ -1950,6 +1950,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Handle shutdown, re-exec, and uninstall signals.
 	shutdownDone := make(chan struct{})
+	grpcStopped := make(chan struct{})
 	reexecRequested := false
 	uninstalled := false
 	go func() {
@@ -1971,17 +1972,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("shutdown requested by uninstall")
 			uninstalled = true
 		}
-		done := make(chan struct{})
-		go func() {
-			d.grpcSrv.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			slog.Warn("graceful shutdown timed out, forcing stop")
-			d.grpcSrv.Stop()
-		}
+		// Bounded whatever the RPCs in flight do: one stuck on storage that
+		// does not answer must not hold the restart (stopGRPC).
+		stopGRPC(d.grpcSrv, grpcGracefulStop, grpcForcedStop)
+		close(grpcStopped)
 		// A drain returns before its failback records are written, and this
 		// is the host it drained: give them a moment to land while the
 		// replicator still runs, and name every VM whose record is lost.
@@ -1998,7 +1992,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		close(shutdownDone)
 	}()
 
-	serveErr := d.grpcSrv.Serve(lis)
+	serveErrs := make(chan error, 1)
+	go func() { serveErrs <- d.grpcSrv.Serve(lis) }()
+	// Serve returns only once a stop has finished, and a stop can wait on a
+	// handler stuck in the kernel: once the shutdown's stop is over, Serve
+	// is waited on only briefly (awaitServe).
+	serveErr := awaitServe(serveErrs, grpcStopped, serveReturnBound)
 
 	// Wait for cleanup to finish (replicator, libvirt, DB) before returning,
 	// but cap at 15s so we don't hang longer than systemd's stop timeout.

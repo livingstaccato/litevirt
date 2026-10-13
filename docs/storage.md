@@ -268,6 +268,12 @@ answers again. litevirt keeps that from holding anything else:
   a command against storage (`mount -o remount`, libvirt's pool refresh) is
   waited for at most 5 s. A daemon (re)start while a server does not answer
   therefore serves, and its peers do not fence the host.
+- **Daemon stop.** A graceful stop (`systemctl restart` or `stop`, an
+  upgrade) gives the requests in flight 5 s, then stops the gRPC server
+  forcibly. A request stuck on the dead mount is not waited for past a
+  further 5 s: the daemon exits within about 35 s of the SIGTERM, well inside
+  the 2 minutes its peers skip an `upgrading` host, whatever requests are
+  still stuck.
 - **Pool create.** Whether a new pool overlaps an nfs pool is decided from the
   mount table first: a mount point names its own directory, with no call on
   the export. A dir or local pool beside a hung nfs pool is created as usual.

@@ -32,3 +32,17 @@ func TestBtrfsPrepare_ASubdirectoryOfABtrfsFilesystemIsAccepted(t *testing.T) {
 		t.Fatalf("Prepare of a directory on ext4 = %v, want it refused as not on btrfs", err)
 	}
 }
+
+// Review m-2: Prepare still refuses a host without the btrfs tool, which the
+// old `btrfs filesystem show` check did as a side effect; every disk
+// operation runs it.
+//
+// Mutation: drop the LookPath — a pool is prepared with no btrfs tool: red.
+func TestBtrfsPrepare_AHostWithoutTheBtrfsToolIsRefused(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Cleanup(statfsInfo.set(func(string) (uint32, string, error) { return btrfsSuperMagic, "0000000100000002", nil }))
+	err := (&btrfsDriver{subvolRoot: filepath.Join(t.TempDir(), "litevirt")}).Prepare(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "btrfs-progs") {
+		t.Fatalf("Prepare without the btrfs tool = %v, want it refused naming btrfs-progs", err)
+	}
+}

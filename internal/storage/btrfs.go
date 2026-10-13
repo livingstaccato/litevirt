@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -43,6 +44,10 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 	}
 	if err := os.MkdirAll(d.subvolRoot, 0755); err != nil {
 		return fmt.Errorf("btrfs: create subvol root: %w", err)
+	}
+	// Every disk operation runs the btrfs tool (btrfs-progs).
+	if _, err := exec.LookPath("btrfs"); err != nil {
+		return fmt.Errorf("btrfs: the btrfs command (btrfs-progs) is not installed on this host: %w", err)
 	}
 	// The kernel says which filesystem the path is on, for any path on it: a
 	// mount point, a directory or a subvolume below one.

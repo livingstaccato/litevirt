@@ -40,6 +40,8 @@ type Server struct {
 	replicationTargets func() []string
 	// relayRoles is handed to the collector; see SetRelayRoles.
 	relayRoles func() map[string]bool
+	// parkedEntries is handed to the collector; see SetParkedEntries.
+	parkedEntries func() map[string]int
 	// mu guards httpSrv and stopped. Start assigns httpSrv from whatever
 	// goroutine the daemon launches it on (`go d.metrics.Start()`), and Stop
 	// runs on the shutdown path — so the two race, and an unsynchronised Stop
@@ -101,6 +103,13 @@ func (s *Server) SetRelayRoles(roles func() map[string]bool) {
 	s.relayRoles = roles
 }
 
+// SetParkedEntries tells the collector how many received changes the
+// replicator holds per sender, for litevirt_replication_parked_entries. Call
+// before Start.
+func (s *Server) SetParkedEntries(counts func() map[string]int) {
+	s.parkedEntries = counts
+}
+
 // NewServer creates a metrics server. bindAddr is the interface to listen on
 // (e.g. "127.0.0.1" to restrict /metrics to loopback); an empty string keeps
 // the historical behaviour of binding all interfaces. ctStat may be nil
@@ -156,6 +165,7 @@ func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	collector.replicationTargets = s.replicationTargets
 	collector.relayRoles = s.relayRoles
+	collector.parkedEntries = s.parkedEntries
 	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
@@ -313,6 +323,10 @@ type collector struct {
 	// relayRoles is the replicator's current relay election (host → relay?).
 	// Nil when not wired; litevirt_relay_role is then not reported.
 	relayRoles func() map[string]bool
+	// parkedEntries is the replicator's held-change count per sender. Nil
+	// when not wired; litevirt_replication_parked_entries is then not reported.
+	parkedEntries func() map[string]int
+	parkedEntry   *prometheus.Desc
 
 	hostVMCount    *prometheus.Desc
 	hostCPUTotal   *prometheus.Desc
@@ -539,6 +553,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Seconds left on each operator relay hold (lv cluster relay-restore --hold): the lease holder will not demote that host until it runs out. Absent for a host with no hold in force",
 			[]string{"member"}, prometheus.Labels{"host": hostName},
 		),
+		parkedEntry: prometheus.NewDesc(
+			"litevirt_replication_parked_entries",
+			"Received changes this node holds because it cannot apply them (a constraint refuses them), per sending node. The sender's stream continues past a held change; it is retried automatically and applies once the conflicting row here allows it. Nonzero means that change has not happened on this node",
+			[]string{"origin"}, prometheus.Labels{"host": hostName},
+		),
 		replicationPeerLag: prometheus.NewDesc(
 			"litevirt_replication_peer_pending_entries",
 			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
@@ -615,6 +634,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.replicationPending
 	ch <- c.replicationAge
 	ch <- c.relayRole
+	ch <- c.parkedEntry
 	ch <- c.relayDemoted
 	ch <- c.relayHold
 	ch <- c.replicationPeerLag
@@ -902,6 +922,14 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				v = 1
 			}
 			ch <- prometheus.MustNewConstMetric(c.relayRole, prometheus.GaugeValue, v, member)
+		}
+	}
+
+	// Received changes held because they cannot apply here (corrosion
+	// parked_entries.go). A sender with nothing held has no series.
+	if c.parkedEntries != nil {
+		for origin, n := range c.parkedEntries() {
+			ch <- prometheus.MustNewConstMetric(c.parkedEntry, prometheus.GaugeValue, float64(n), origin)
 		}
 	}
 

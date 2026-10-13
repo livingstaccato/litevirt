@@ -81,7 +81,7 @@ func TestEvaluateHADegraded_ReportsAQuarantinedNode(t *testing.T) {
 // haReasons, so one left out never appears as a series at all — it would be
 // invisible until the moment it fired, and absent again the moment it cleared.
 func TestHAReasonsIncludesEveryReason(t *testing.T) {
-	for _, r := range []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch} {
+	for _, r := range []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch, haReplicationParked} {
 		found := false
 		for _, known := range haReasons {
 			if known == r {

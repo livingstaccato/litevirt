@@ -239,6 +239,10 @@ type Client struct {
 	// StreamStateDump) are observed too.
 	syncMetrics SyncMetrics
 
+	// held records anti-entropy refusals of identity-table rows, the
+	// restart-surviving half of the held signal (held_refusals.go).
+	held heldRefusals
+
 	// tsMu guards lastTS + durableTS, the monotonic source behind NowTS(). Kept
 	// separate from mu so timestamp generation (called before a write acquires mu)
 	// never contends with or re-enters the main lock.

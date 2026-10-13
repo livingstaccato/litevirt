@@ -742,6 +742,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
 	d.metrics.SetRelayRoles(repl.RelayRoles)
+	d.metrics.SetParkedEntries(repl.ParkedCounts)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
 	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
 	// and bound an EPHEMERAL port on every interface — an unauthenticated

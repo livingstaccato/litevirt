@@ -601,7 +601,17 @@ func (w *chainWalk) walk(path string, self bool, why, who string) error {
 		if depth > maxBackingDepth {
 			return fmt.Errorf("%s: backing chain deeper than %d", path, maxBackingDepth)
 		}
-		backing, qcow, err := layerBacking(path)
+		// One header at a time, under the bound: a layer on storage that
+		// does not answer refuses the prune promptly.
+		type layer struct {
+			backing string
+			qcow    bool
+		}
+		l, err := storage.Bounded("read the backing of", path, func() (layer, error) {
+			b, q, err := layerBacking(path)
+			return layer{b, q}, err
+		})
+		backing, qcow := l.backing, l.qcow
 		if err != nil || backing == "" {
 			return err
 		}
@@ -625,7 +635,7 @@ func (w *chainWalk) inImages(p string) bool {
 // that does not exist), names none. A file with the qcow2 magic whose header
 // does not parse is an error: what it names is unknown.
 func layerBacking(path string) (string, bool, error) {
-	fi, err := os.Stat(path)
+	fi, err := chainStat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false, nil
 	}

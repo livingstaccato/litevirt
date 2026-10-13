@@ -306,11 +306,13 @@ answers again. litevirt keeps that from holding anything else:
   directory is a link onto an NFS mount, say) or a pool directory does not
   answer within 5 s, the prune fails with "nothing is pruned", and
   a snapshot delete or revert is refused with `Unavailable`. Retry once the
-  server answers. **Known gap:** a snapshot delete or revert reads the
-  header chain of every VM disk on the host, and that read is not bounded.
-  While another VM's disk is on a mount whose server does not answer, the
-  delete or revert can wait for it instead of being refused, holding that
-  VM's lock (and a stop of it) until the server answers.
+  server answers. A snapshot delete or revert reads the header chain of
+  every VM disk on the host, each disk's under a 5 s bound, and so does a
+  prune's scan, one header at a time. While another VM's disk is on a mount
+  whose server does not answer, the delete or revert is refused with
+  `Unavailable` (that disk counts as a user of the file, never as "not built
+  on it"), and the prune fails with "nothing is pruned". A VM delete whose
+  kept disk's chain does not answer keeps every file.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 

@@ -276,6 +276,12 @@ answers again. litevirt keeps that from holding anything else:
   `Unavailable` and "cannot verify that the pool does not overlap another
   pool", never allowed because the check timed out. Try again once the server
   answers.
+- **VM start.** A start resolves the pool directories of the host to judge
+  the VM's disk chain. A mount point is judged from the mount table, so a VM
+  on local storage starts while an nfs pool's server does not answer. A VM
+  whose disk is on that pool is refused with `Unavailable` ("its storage does
+  not answer") within 5 s, instead of holding the VM's lock (and a stop of
+  it) for as long as the server does not answer.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 
@@ -293,7 +299,13 @@ answers again. litevirt keeps that from holding anything else:
   so an export that disappears from it was unmounted, and litevirt takes that
   as deliberate. To mount it again, restart the daemon on the host. A VM disk
   create, move or replicate on the pool also mounts it, as it always did, and
-  so does a reboot. (A pool create cannot: the pool already exists.)
+  so does a reboot. (A pool create cannot: the pool already exists.) This
+  holds for a lazy unmount too: `umount -l` of a mount whose server does not
+  answer is an operator's unmount, and the 30 s check does **not** mount the
+  export again — mount it by hand (or restart the daemon). Once it is mounted
+  again, the pool reads `active` at the next check, and calls that are still
+  stuck on the old, detached mount hold nothing on the new one: the
+  per-mount fail-fast below is keyed by the mount itself, not its directory.
 - **Never over anything.** A mount point that is a symlink, is not a
   directory, or holds any file is not mounted over: the mount would hide what
   is there, or land somewhere else. Files in an unmounted mount point were

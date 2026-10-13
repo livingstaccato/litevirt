@@ -198,7 +198,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
 lv ls [--stack <name>] [--host <name>]    # List VMs
 lv inspect <vm>                           # VM details
 lv start <vm>                             # Start stopped VM
-lv stop <vm> [--force]                    # Stop VM (--force = hard power off)
+lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds, recording the stop
 lv restart <vm>                           # Restart VM
 lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)
@@ -392,7 +392,7 @@ lv ct create <name> --network bridge=<br>[,name=eth0,ip=<cidr>,mac=..]   # raw N
 lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-delay 5s]  # auto-restart on unexpected stop
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
-lv ct stop <name>
+lv ct stop <name>                                     # a container already stopped succeeds, recording the stop
 lv ct rm <name>                                       # a stopped container; a running one is refused
 lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls

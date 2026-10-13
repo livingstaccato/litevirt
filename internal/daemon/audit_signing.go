@@ -443,7 +443,7 @@ func reportAuditVerify(host string, res corrosion.AuditVerifyResult) {
 			"rows", res.RowsChecked, "broken_at", res.BrokenAt, "broken_kind", res.BrokenKind,
 			"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 			"seq_gaps", len(res.SeqGaps), "seq_duplicates", res.SeqDuplicates, "laundered", len(res.Laundered),
-			"content_breaks", res.ContentBreaks, "unlinked_outside_forks", res.UnlinkedOutsideForks, "orphaned", res.Orphaned, "forked_hosts", res.ForkedHosts,
+			"content_breaks", res.ContentBreaks, "unlinked_outside_forks", res.UnlinkedOutsideForks, "orphaned", res.Orphaned, "orphans", res.Orphans, "forked_hosts", res.ForkedHosts,
 			"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
 			"truncated_hosts", res.TruncatedHosts,
 			// Without it, a verdict resting only on unsigned-after-signed rows

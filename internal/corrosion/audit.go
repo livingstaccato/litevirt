@@ -559,8 +559,9 @@ type AuditVerifyResult struct {
 	// Orphaned counts unlinked rows on a host with a second genesis whose
 	// stored prev_hash is the hash of no row of that host one seq before them:
 	// their predecessor was deleted (or the row renumbered). A fork does not
-	// excuse them.
+	// excuse them. Orphans names each, as "host: row ID (seq N) ...".
 	Orphaned int
+	Orphans  []string
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
 	Laundered []string
@@ -759,8 +760,8 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	// unlinked rows, neither content nor genesis: excused on a forked host
 	// only when they link to a row of that host (see Orphaned)
 	type unlinkedRow struct {
-		host, prev string
-		seq        int64
+		host, id, prev string
+		seq            int64
 	}
 	var unlinked []unlinkedRow
 	seqOfHash := map[string]map[string]int64{} // per-host stored content_hash -> seq
@@ -835,7 +836,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 					res.ForkedHosts = append(res.ForkedHosts, host)
 				}
 			default:
-				unlinked = append(unlinked, unlinkedRow{host: host, prev: r.String("prev_hash"), seq: r.Int64("seq")})
+				unlinked = append(unlinked, unlinkedRow{host: host, id: rec.ID, prev: r.String("prev_hash"), seq: r.Int64("seq")})
 			}
 		}
 		if run := legacy[host]; run != nil && !linked {
@@ -1028,6 +1029,9 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			continue
 		}
 		res.Orphaned++
+		res.Orphans = append(res.Orphans, fmt.Sprintf(
+			"%s: row %s (seq %d) follows prev_hash %s, which is the hash of no row of %s at seq %d — the row before it was deleted",
+			u.host, u.id, u.seq, u.prev, u.host, u.seq-1))
 	}
 
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {

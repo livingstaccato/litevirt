@@ -199,7 +199,18 @@ grouped by what it means:
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
   cluster CA.
-- **sequence gap** — a run of rows was deleted from one host's chain.
+- **sequence break** — a jump in one host's numbering (a run of rows was
+  deleted from its chain), or a **duplicate**: two rows claiming the same seq,
+  which is a forked chain — a second writer, or a host that appended to a
+  replica still missing its own history — and is labelled as one rather than as
+  a deletion.
+- **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
+  is the hash of no row of that host one seq before it: the row before it was
+  deleted. The two chains of a forked host interleave by seq, so the deletion
+  leaves no sequence break; this lists each such row by host, id and seq. A
+  fork whose only other findings are its duplicate seqs is reported as a
+  forked chain by the hourly check; one with an orphaned row is reported as
+  tampering.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist.
 - **retired key used** — a row signed by a key past the sequence at which it was

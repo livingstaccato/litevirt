@@ -24188,7 +24188,12 @@ type VerifyAuditChainResponse struct {
 	//
 	// Empty when broken_at_id is, and from a daemon older than this field,
 	// which a client reads as "content" — the only label it used to have.
-	BrokenAtKind  string `protobuf:"bytes,20,opt,name=broken_at_kind,json=brokenAtKind,proto3" json:"broken_at_kind,omitempty"`
+	BrokenAtKind string `protobuf:"bytes,20,opt,name=broken_at_kind,json=brokenAtKind,proto3" json:"broken_at_kind,omitempty"`
+	// Rows on a host whose audit chain forked (a second genesis) whose
+	// stored prev_hash is the hash of no row of that host one seq before
+	// them: the row before each was deleted. Its two chains interleave by
+	// seq, so such a deletion leaves no seq gap; this names it.
+	OrphanedRows  []string `protobuf:"bytes,21,rep,name=orphaned_rows,json=orphanedRows,proto3" json:"orphaned_rows,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24354,6 +24359,13 @@ func (x *VerifyAuditChainResponse) GetBrokenAtKind() string {
 		return x.BrokenAtKind
 	}
 	return ""
+}
+
+func (x *VerifyAuditChainResponse) GetOrphanedRows() []string {
+	if x != nil {
+		return x.OrphanedRows
+	}
+	return nil
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
@@ -27885,7 +27897,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xd0\x05\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xf5\x05\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -27909,7 +27921,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"unverified\x18\x11 \x01(\bR\n" +
 	"unverified\x12%\n" +
 	"\x0eambiguous_rows\x18\x13 \x03(\tR\rambiguousRows\x12$\n" +
-	"\x0ebroken_at_kind\x18\x14 \x01(\tR\fbrokenAtKind\"\x8b\x02\n" +
+	"\x0ebroken_at_kind\x18\x14 \x01(\tR\fbrokenAtKind\x12#\n" +
+	"\rorphaned_rows\x18\x15 \x03(\tR\forphanedRows\"\x8b\x02\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +

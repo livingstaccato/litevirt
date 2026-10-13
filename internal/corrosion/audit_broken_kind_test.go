@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -284,6 +285,10 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 		}
 		if res.Orphaned == 0 || res.Forked() || !res.Tampered() {
 			t.Errorf("orphaned %d, Forked() %v, Tampered() %v: want the deletion reported as tampering", res.Orphaned, res.Forked(), res.Tampered())
+		}
+		// Re-review m-3: the orphan is named — r3, whose predecessor r2 is gone.
+		if len(res.Orphans) != res.Orphaned || !strings.Contains(strings.Join(res.Orphans, "\n"), "row r3 (seq 3)") {
+			t.Errorf("orphans %v, want r3 named", res.Orphans)
 		}
 	})
 

@@ -87,7 +87,9 @@ func strandedSubject(vm, host string) string { return vm + "@" + host }
 // strandedFix is what an operator can do about the disks of vm left on host.
 func strandedFix(vm, host string) string {
 	return fmt.Sprintf("%[2]s keeps them as <path>.superseded-<time> while %[1]s exists; `lv host superseded-disks %[2]s` lists them. "+
-		"To run %[1]s on its real disk again once %[2]s is back: `lv host undrain %[2]s` (it comes back fenced), "+
+		"To run %[1]s on its real disk again once %[2]s is back and active (it turns active on its own when it boots again, "+
+		"after upgrading if it booted into a pending upgrade; "+
+		"if it answered again without restarting it stays fenced or offline until `lv host undrain %[2]s`): "+
 		"`lv stop %[1]s`, `lv migrate %[1]s %[2]s --cold`, "+
 		"`lv host superseded-disks %[2]s --restore <copy>` (the disk it replaces is kept the same way), then `lv start %[1]s`. "+
 		"To give the data up: `lv host superseded-disks %[2]s --remove <copy>`", vm, host)
@@ -607,8 +609,9 @@ type HeldForHost struct {
 
 // heldFix is what an operator can do about a restart-same VM held on host.
 func heldFix(vm, host string) string {
-	return fmt.Sprintf("bring %[2]s back: once it is active it starts %[1]s there on its real disk (if it stays fenced, "+
-		"because failover moved other workloads off it, run `lv host undrain %[2]s`). If %[2]s was removed "+
+	return fmt.Sprintf("bring %[2]s back: once it is active it starts %[1]s there on its real disk (it turns active on its own "+
+		"when it boots again, after upgrading if it booted into a pending upgrade; if it answered again without restarting and failover moved other workloads off it, it stays "+
+		"fenced or offline until `lv host undrain %[2]s`). If %[2]s was removed "+
 		"(`lv host rm --dead`), adding the machine back under that name (`lv host add`) brings %[1]s back with it. "+
 		"If %[2]s is gone for good, its data is gone with it: promote a replica if there is one "+
 		"(`lv replication promote %[1]s`), or remove the host first (`lv host rm --dead %[2]s`, try `--dry-run`) and then "+

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"slices"
 	"sort"
@@ -24,9 +25,10 @@ const (
 	haVIPNoHolder       = "vip_no_holder"              // a configured VIP is served by nobody
 	haStrandedPending   = "legacy_pending_stranded"    // a markerless pending VM refused proof_missing forever
 	haRolledBackLatch   = "rolled_back_latch"          // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
+	haReplicationParked = "replication_entry_parked"   // this node holds a received change it cannot apply (corrosion parked_entries.go); the sender's stream continues
 )
 
-var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch, haReleasePeerRefused}
+var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch, haReleasePeerRefused, haReplicationParked}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -216,6 +218,9 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 				detail := haDegradedDetail(r, s.hostName, unsupported)
 				if r == haReleasePeerRefused {
 					detail += " (" + s.releasePeerRefusedDetail() + ")"
+				}
+				if r == haReplicationParked {
+					detail += " (" + s.replicationParkedDetail() + ")"
 				}
 				s.publish("ha.degraded", r, detail)
 				s.pageHADegraded(ctx, r) // route the alertable VIP reasons to notify
@@ -574,6 +579,12 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 	if len(s.releasePeerRefusedNow()) > 0 {
 		out[haReleasePeerRefused] = true
 	}
+	// This node holds a change a peer sent that it cannot apply. The sender's
+	// stream is not stopped by it, but the change has not happened here; the
+	// event detail names the sender, sequence and table.
+	if s.replicator != nil && len(s.replicator.ParkedEntries()) > 0 {
+		out[haReplicationParked] = true
+	}
 	return out, unsupported
 }
 
@@ -763,4 +774,23 @@ func (s *Server) observeOneSelfReportedQuarantine(ctx context.Context) {
 	s.audit(ctx, "host.isolate", peer, "reason=rolled_back_latch (self-reported quarantine)", "ok")
 	slog.Warn("recorded a peer's self-reported quarantine as an isolation — its replication is now refused",
 		"peer", peer, "observer", s.hostName, "fix", "lv host reseed "+peer)
+}
+
+// replicationParkedDetail names what this node holds for the HA event: the
+// oldest few held changes, by sender, sequence, table and failure.
+func (s *Server) replicationParkedDetail() string {
+	if s.replicator == nil {
+		return ""
+	}
+	held := s.replicator.ParkedEntries()
+	const show = 3
+	parts := make([]string, 0, show+1)
+	for i, p := range held {
+		if i == show {
+			parts = append(parts, fmt.Sprintf("and %d more", len(held)-show))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s seq %d on %s: %s", p.Origin, p.Seq, p.Table, p.Error))
+	}
+	return strings.Join(parts, "; ")
 }

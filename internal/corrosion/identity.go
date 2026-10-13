@@ -231,3 +231,119 @@ func identityCollapseUpdate(tx *sql.Tx, table string, setCols []string, setVals 
 	}
 	return false, nil
 }
+
+// A deleted row yields its natural key to a newer row.
+//
+// A snapshot deleted and then re-created under the same name is two rows of
+// one natural key: the deleted one, which every peer keeps as a tombstone
+// (deletes are soft), and the new one. A build that minted a fresh id for the
+// re-create shipped a row that met that tombstone on every peer and failed the
+// natural key's UNIQUE, and nothing could ever apply it (lab 2, F-2). Builds
+// with the fix re-use the tombstone's id (reuseNaturalKeyRow), but entries the
+// older builds already logged are still in their streams, and older senders
+// keep producing them through a rolling upgrade.
+//
+// So a receiver resolves exactly this case, with or without
+// canonical_identity_v1: when the only row holding the incoming row's natural
+// key under a DIFFERENT id is a TOMBSTONE whose updated_at is STRICTLY older
+// than the incoming row's, the tombstone is dead history of the same name and
+// is removed so the incoming row can take the name. Nothing else is touched:
+//
+//   - a live row is never removed. Two live rows under one natural key are
+//     the case canonical_identity_v1 exists for, and stay its decision;
+//   - a tombstone that is as new as or newer than the incoming row stays: a
+//     delete at that name after the incoming write is the newer fact;
+//   - a tombstone a child row still references, an incoming id already bound
+//     to another natural key, and a future-skewed incoming clock all leave the
+//     tombstone in place (the apply then fails as before);
+//   - the removal is local to this receiver's apply transaction, so it rolls
+//     back with it.
+//
+// canonical_identity_v1's collapse would instead re-key the tombstone into the
+// incoming id with a column-preserving UPDATE, and a WAL INSERT does not carry
+// deleted_at — so the re-created row would land still deleted, hidden on
+// every peer and live only on its origin. Yielding first gives both modes the
+// same, correct answer.
+//
+// The mirror case is quieter: anti-entropy offering a tombstone that is
+// strictly older than the different-id row this node holds under the same
+// natural key is skipped (staleIncomingIdentityTombstone) — it is the old
+// incarnation a peer has not yet let go of, and it would otherwise fail the
+// UNIQUE on every pass until that peer catches up.
+//
+// No capability gate: the decision reads only this node's row and the
+// incoming one, so every upgraded node reaches the same state from the same
+// rows, and a node that has not upgraded keeps refusing the entry as before
+// until it does. No node relies on a peer making it.
+
+// identityNaturalRow is the row a node holds under one natural key.
+type identityNaturalRow struct {
+	id, updatedAt string
+	deleted       bool
+}
+
+func lookupIdentityNaturalRow(tx *sql.Tx, table string, natVals []interface{}) (identityNaturalRow, bool, error) {
+	natCols := tableIdentityKeys[table]
+	if len(natCols) == 0 || len(natCols) != len(natVals) {
+		return identityNaturalRow{}, false, nil
+	}
+	where := make([]string, len(natCols))
+	for i, col := range natCols {
+		where[i] = col + " = ?"
+	}
+	var id, updatedAt, deletedAt sql.NullString
+	err := tx.QueryRow("SELECT id, updated_at, deleted_at FROM "+table+" WHERE "+strings.Join(where, " AND "), natVals...).
+		Scan(&id, &updatedAt, &deletedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return identityNaturalRow{}, false, nil
+	}
+	if err != nil {
+		return identityNaturalRow{}, false, fmt.Errorf("identity natural-key lookup on %s: %w", table, err)
+	}
+	return identityNaturalRow{id: id.String, updatedAt: updatedAt.String, deleted: deletedAt.Valid && deletedAt.String != ""}, true, nil
+}
+
+// yieldStaleIdentityTombstone removes the tombstone holding natVals when the
+// incoming row (incomingID, incomingTS) is strictly newer and has a different
+// id; see above. skewed reports whether incomingTS is a future-skewed clock
+// this node would quarantine against a row stamped localTS. It reports
+// whether a tombstone was removed.
+func yieldStaleIdentityTombstone(tx *sql.Tx, table string, natVals []interface{}, incomingID, incomingTS string, skewed func(localTS string) bool) (bool, error) {
+	if incomingID == "" || incomingTS == "" {
+		return false, nil
+	}
+	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
+	if err != nil || !found {
+		return false, err
+	}
+	if local.id == incomingID || !local.deleted || lwwOrder(local.updatedAt, incomingTS) >= 0 {
+		return false, nil
+	}
+	if skewed != nil && skewed(local.updatedAt) {
+		return false, nil
+	}
+	if foreign, fErr := identityIDForeignNaturalKey(tx, table, tableIdentityKeys[table], incomingID, natVals); fErr != nil || foreign {
+		return false, fErr
+	}
+	if child, cErr := identityHasChildReference(tx, table, local.id); cErr != nil || child {
+		return false, cErr
+	}
+	if _, err := tx.Exec("DELETE FROM "+table+" WHERE id = ?", local.id); err != nil {
+		return false, fmt.Errorf("yield stale tombstone on %s: %w", table, err)
+	}
+	return true, nil
+}
+
+// staleIncomingIdentityTombstone reports whether an incoming TOMBSTONE row is
+// strictly older than the different-id row this node holds under the same
+// natural key, and so is to be skipped; see above.
+func staleIncomingIdentityTombstone(tx *sql.Tx, table string, natVals []interface{}, incomingID, incomingTS string) (bool, error) {
+	if incomingID == "" || incomingTS == "" {
+		return false, nil
+	}
+	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
+	if err != nil || !found {
+		return false, err
+	}
+	return local.id != incomingID && lwwOrder(local.updatedAt, incomingTS) > 0, nil
+}

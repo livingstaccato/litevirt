@@ -922,6 +922,20 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 		}
 	}
 
+	// A deleted row yields its natural key to a newer row, and a stale
+	// tombstone of an old incarnation is not brought back over the newer one
+	// (identity.go). Offsets computed once; a dump missing any of them leaves
+	// the rows to the merge as before.
+	yieldIDIdx, yieldTSIdx, yieldDelIdx := -1, -1, -1
+	var yieldNatIdx []int
+	if hasIdentityKey(table.Name) {
+		yieldIDIdx, yieldTSIdx, yieldDelIdx = indexOf(table.Columns, "id"), indexOf(table.Columns, "updated_at"), indexOf(table.Columns, "deleted_at")
+		yieldNatIdx = columnIndexes(table.Columns, tableIdentityKeys[table.Name])
+		if yieldIDIdx < 0 || yieldTSIdx < 0 || yieldDelIdx < 0 || len(yieldNatIdx) != len(tableIdentityKeys[table.Name]) {
+			yieldIDIdx = -1
+		}
+	}
+
 	for _, row := range rows {
 		// A peer dump whose row doesn't match the declared column count is
 		// malformed/corrupt: skip it rather than index out of range below or
@@ -1121,6 +1135,39 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				skipped++
 				c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
 				continue
+			}
+		}
+		if yieldIDIdx >= 0 {
+			natVals := make([]interface{}, len(yieldNatIdx))
+			for i, j := range yieldNatIdx {
+				natVals[i] = row[j]
+			}
+			incomingID, incomingTS := coerceString(row[yieldIDIdx]), coerceString(row[yieldTSIdx])
+			if cellNonEmpty(row[yieldDelIdx]) {
+				stale, sErr := staleIncomingIdentityTombstone(tx, table.Name, natVals, incomingID, incomingTS)
+				if sErr != nil {
+					_ = tx.Rollback()
+					return merged, skipped, sErr
+				}
+				if stale {
+					skipped++
+					continue
+				}
+			}
+			skewed := func(localTS string) bool {
+				return c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow)
+			}
+			yielded, yErr := yieldStaleIdentityTombstone(tx, table.Name, natVals, incomingID, incomingTS, skewed)
+			if yErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, yErr
+			}
+			if yielded {
+				key, tbl := pkKey(natVals), table.Name
+				c.deferAfterCommit(tx, func() {
+					slog.Info("anti-entropy: a deleted row yielded its name to a newer row",
+						"table", tbl, "natural_key", key, "id", incomingID, "path", "ae")
+				})
 			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE

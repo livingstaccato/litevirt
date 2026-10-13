@@ -545,6 +545,9 @@ type AuditVerifyResult struct {
 	// the deletion of a whole run of rows shows up, or a repeated seq, which is
 	// a forked chain and is labelled as a duplicate.
 	SeqGaps []string
+	// SeqDuplicates counts the SeqGaps entries that are a repeated seq (the
+	// forked-chain kind), not a jump.
+	SeqDuplicates int
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
 	Laundered []string
@@ -620,6 +623,18 @@ func (r AuditVerifyResult) Tampered() bool {
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
 		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0 ||
 		len(r.UnsignedAfterSigned) > 0
+}
+
+// Forked reports whether the only tamper finding is a forked chain: the first
+// broken link is a second genesis (AuditBrokenForked) and every sequence break
+// is a repeated seq. It is still Tampered — a fork fails verification — but
+// nothing found says a row was edited, deleted or forged, so the periodic
+// verifier names it a forked chain, as `lv audit verify` does.
+func (r AuditVerifyResult) Forked() bool {
+	return r.BrokenKind == AuditBrokenForked && len(r.SeqGaps) == r.SeqDuplicates &&
+		len(r.BadSignature) == 0 && len(r.UnknownKeyID) == 0 && len(r.Laundered) == 0 &&
+		len(r.TruncatedHosts) == 0 && len(r.RetiredKeyUse) == 0 && len(r.HeadMismatch) == 0 &&
+		len(r.UnsignedAfterSigned) == 0
 }
 
 // Unverified reports a host that declares its rows are signed and demonstrably
@@ -831,6 +846,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s repeats seq %d (duplicate: two rows claim the same position, a forked chain)",
 						host, rec.ID, seq))
+				res.SeqDuplicates++
 			} else if seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))

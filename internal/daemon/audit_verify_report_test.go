@@ -1,0 +1,85 @@
+package daemon
+
+import (
+	"bytes"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// auditFinding is litevirt_audit_chain_findings{kind}, as last published.
+func auditFinding(t *testing.T, kind string) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "litevirt_audit_chain_findings" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "kind" && l.GetValue() == kind {
+					return m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("no litevirt_audit_chain_findings{kind=%q}", kind)
+	return 0
+}
+
+// Lab 1: every node's hourly check logged "evidence of tampering" for a chain
+// `lv audit verify` classifies as a forked chain. The periodic verifier now
+// names a fork a fork, in its log and its findings metric, and still says
+// tampering for a real hash mismatch, or for a fork beside a deleted row.
+//
+// Mutations: Forked ignored (every finding logged as tampering) — red. A
+// fork counted as broken_hash — red. A deletion beside a fork reported as a
+// fork alone (Forked not checking the seq jumps) — red.
+func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	fork := corrosion.AuditVerifyResult{
+		RowsChecked: 6, BrokenAt: "fork-1", BrokenKind: corrosion.AuditBrokenForked,
+		SeqGaps:       []string{"node-3: row fork-1 repeats seq 1 (duplicate: two rows claim the same position, a forked chain)"},
+		SeqDuplicates: 1,
+	}
+	edited := corrosion.AuditVerifyResult{RowsChecked: 6, BrokenAt: "r2", BrokenKind: corrosion.AuditBrokenContent}
+	forkAndDeletion := fork
+	forkAndDeletion.SeqGaps = append([]string{"node-3: row r5 has seq 5 after 3"}, fork.SeqGaps...)
+
+	for _, tc := range []struct {
+		name          string
+		res           corrosion.AuditVerifyResult
+		log, notLog   string
+		forked, hash  float64
+		gaps, repeats float64
+	}{
+		{"a fork", fork, "found a forked chain", "evidence of tampering", 1, 0, 0, 1},
+		{"an edited row", edited, "evidence of tampering", "forked chain", 0, 1, 0, 0},
+		{"a fork beside a deleted row", forkAndDeletion, "evidence of tampering", "found a forked chain", 1, 0, 1, 1},
+	} {
+		buf.Reset()
+		reportAuditVerify("node-1", tc.res)
+		out := buf.String()
+		if !strings.Contains(out, tc.log) || strings.Contains(out, tc.notLog) {
+			t.Errorf("%s: logged %q, want %q and not %q", tc.name, out, tc.log, tc.notLog)
+		}
+		for kind, want := range map[string]float64{
+			"forked_chain": tc.forked, "broken_hash": tc.hash, "seq_gap": tc.gaps, "seq_duplicate": tc.repeats,
+		} {
+			if got := auditFinding(t, kind); got != want {
+				t.Errorf("%s: findings{kind=%q} = %v, want %v", tc.name, kind, got, want)
+			}
+		}
+	}
+}

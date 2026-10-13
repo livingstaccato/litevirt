@@ -20,7 +20,7 @@ const (
 	// — the first row of a second chain opened under a host name that already
 	// had one. A host rebuilt on an
 	// empty database that appended before its history replicated back writes
-	// exactly this (docs/audit-log.md, "Rebuilding a host under its old name").
+	// exactly this.
 	AuditBrokenForked = "forked"
 	// AuditBrokenUnlinked: the row hashes correctly against its own stored
 	// prev_hash, but that is not the hash of the row before it in the walk, and

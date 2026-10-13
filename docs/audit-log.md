@@ -606,9 +606,11 @@ sign the resulting JSON with a separate signing key.
   its own rather than waiting to be asked: a check that only happens when an
   operator types `lv audit verify` finds an intrusion after whatever prompted
   them to look. The outcome is published as
-  `litevirt_audit_chain_last_verified_ok` (1 when the last check found no
-  evidence of tampering), with a per-kind breakdown in
-  `litevirt_audit_chain_findings` and a
+  `litevirt_audit_chain_last_verified_ok` (1 when the last check found the
+  chain intact), with a per-kind breakdown in
+  `litevirt_audit_chain_findings` (a forked chain is `forked_chain` and its
+  repeated seqs `seq_duplicate`, not `broken_hash` and `seq_gap`; its log line
+  says "found a forked chain", not "evidence of tampering") and a
   `litevirt_audit_chain_heads_published_total` counter. Alert on the first
   going to 0; a stalled head counter means truncation detection has quietly
   stopped.

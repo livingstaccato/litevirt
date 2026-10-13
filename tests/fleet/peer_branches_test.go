@@ -38,7 +38,7 @@ func userOn(t *testing.T, c *Cluster, n *Node, user, role string) string {
 	}
 	tok, err := admin.CreateToken(ctx, &pb.CreateTokenRequest{Username: user, Name: user})
 	if err != nil || tok.GetToken() == "" {
-		t.Fatalf("CreateToken %s: %+v %v", user, tok, err)
+		t.Fatalf("CreateToken %s: %s %v", user, credState(tok), err)
 	}
 	return tok.GetToken()
 }

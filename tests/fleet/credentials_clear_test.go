@@ -83,7 +83,7 @@ func assertAuthenticates(t *testing.T, c *Cluster, n *Node, user, password, toke
 	t.Helper()
 	ctx := context.Background()
 	if login, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: user, Password: password}); err != nil || login.Token == "" {
-		t.Errorf("%s: password login for %s: %+v %v", n.Name, user, login, err)
+		t.Errorf("%s: password login for %s: %s %v", n.Name, user, credState(login), err)
 	}
 	if _, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: user, Password: password + "-wrong"}); err == nil {
 		t.Errorf("%s: a wrong password logged in; the check is not reading a hash at all", n.Name)
@@ -92,7 +92,7 @@ func assertAuthenticates(t *testing.T, c *Cluster, n *Node, user, password, toke
 		t.Errorf("%s: API token: %v", n.Name, err)
 	}
 	if h, err := corrosion.GetHost(ctx, n.DB, bmc); err != nil || h == nil || h.IPMIPass != ipmi {
-		t.Errorf("%s: the fencer reads IPMI password %+v (err %v), want %q", n.Name, h, err, ipmi)
+		t.Errorf("%s: the fencer reads IPMI password %s (err %v), want %s", n.Name, redacted(ipmiPassOf(h)), err, redacted(ipmi))
 	}
 }
 
@@ -113,7 +113,7 @@ func TestFleet_CredentialsClear_AfterTheLatchNoPublicRowCarriesASecret(t *testin
 	}
 	tok1, err := c.SelfClient(a).CreateToken(ctx, &pb.CreateTokenRequest{Username: "ivan", Name: "before"})
 	if err != nil || tok1.Token == "" {
-		t.Fatalf("CreateToken: %+v %v", tok1, err)
+		t.Fatalf("CreateToken: %s %v", credState(tok1), err)
 	}
 	configureIPMI(t, c, a, bmc.Name, "bmc-before")
 	c.WaitConverged(t, convergeTimeout)
@@ -128,7 +128,7 @@ func TestFleet_CredentialsClear_AfterTheLatchNoPublicRowCarriesASecret(t *testin
 		dump := publicDump(t, n)
 		for _, secret := range []string{"bmc-before", oldColumn(t, n, `SELECT password_hash FROM user_credentials WHERE username = 'ivan'`)} {
 			if secret == "" || strings.Contains(dump, secret) {
-				t.Errorf("%s: the public dump carries %q after the clear", n.Name, secret)
+				t.Errorf("%s: the public dump carries %s after the clear", n.Name, redacted(secret))
 			}
 		}
 		assertAuthenticates(t, c, n, "ivan", "iv4n-before", tok1.Token, bmc.Name, "bmc-before")
@@ -142,7 +142,7 @@ func TestFleet_CredentialsClear_AfterTheLatchNoPublicRowCarriesASecret(t *testin
 	}
 	tok2, err := c.SelfClient(b).CreateToken(ctx, &pb.CreateTokenRequest{Username: "ivan", Name: "after"})
 	if err != nil || tok2.Token == "" {
-		t.Fatalf("CreateToken after the latch: %+v %v", tok2, err)
+		t.Fatalf("CreateToken after the latch: %s %v", credState(tok2), err)
 	}
 	configureIPMI(t, c, a, bmc.Name, "bmc-after")
 	c.WaitConverged(t, convergeTimeout)
@@ -177,7 +177,7 @@ func TestFleet_CredentialsClear_APreviousBuildNodeAuthenticatesAgainstAClearedPe
 	}
 	tok, err := c.SelfClient(a).CreateToken(ctx, &pb.CreateTokenRequest{Username: "judy", Name: "ci"})
 	if err != nil || tok.Token == "" {
-		t.Fatalf("CreateToken: %+v %v", tok, err)
+		t.Fatalf("CreateToken: %s %v", credState(tok), err)
 	}
 	configureIPMI(t, c, a, bmc.Name, "bmc-one")
 	c.WaitConverged(t, convergeTimeout)
@@ -377,7 +377,7 @@ func TestFleet_CredentialsClear_AnUnlatchedNeighboursRotationReachesAClearedNode
 	}
 	c.WaitConverged(t, convergeTimeout)
 	if login, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "lena", Password: "l3na-after"}); err != nil || login.Token == "" {
-		t.Errorf("%s refuses the rotation an unlatched neighbour made: %+v %v", a.Name, login, err)
+		t.Errorf("%s refuses the rotation an unlatched neighbour made: %s %v", a.Name, credState(login), err)
 	}
 	if _, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "lena", Password: "l3na-before"}); err == nil {
 		t.Errorf("%s still accepts the rotated-out password", a.Name)

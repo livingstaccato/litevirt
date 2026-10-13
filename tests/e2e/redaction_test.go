@@ -44,7 +44,7 @@ func TestRedaction_LvAsKeepsTheTokenOutOfFailures(t *testing.T) {
 		t.Fatal("the fake ssh fails, so lvAs must")
 	}
 	if strings.Contains(out+err.Error(), tok) {
-		t.Fatalf("the token reached lvAs's output or error:\n%s\n%v", out, err)
+		t.Fatalf("the token reached lvAs's output or error (%d and %d bytes, not shown)", len(out), len(err.Error()))
 	}
 	if !strings.Contains(err.Error(), "role grant Admin") {
 		t.Fatalf("redaction must keep the rest of the message: %v", err)
@@ -57,11 +57,11 @@ func TestRedaction_QuietFailureKeepsThePasswordOut(t *testing.T) {
 	args := []string{"user", "create", "bob", "--password", e2eUserPassword}
 	_, err := l.lv("node-2", args...)
 	if err == nil || !strings.Contains(err.Error(), e2eUserPassword) {
-		t.Fatalf("premise: the raw ssh error quotes the command and so the password: %v", err)
+		t.Fatalf("premise: the raw ssh error quotes the command and so the password (error nil: %t)", err == nil)
 	}
 	msg := quietFailure("node-2", args, err, []string{e2eUserPassword})
 	if strings.Contains(msg, e2eUserPassword) {
-		t.Fatalf("the password reached the failure message: %s", msg)
+		t.Fatalf("the password reached the failure message (%d bytes, not shown)", len(msg))
 	}
 	if !strings.Contains(msg, "user create bob") {
 		t.Fatalf("redaction must keep the rest of the message: %s", msg)

@@ -199,6 +199,14 @@ When `max-memory` exceeds `memory`, the VM gets a virtio memory balloon and can 
 inflated/deflated at runtime (`lv set-memory <vm> <MiB>`); `min-memory` is the floor.
 `onboot` VMs are started in `startup-order` when their host boots — a plain daemon
 restart is a no-op (running VMs are left alone), only an actual host reboot triggers it.
+A host boot starts every `onboot` VM that is not running, including one its operator
+stopped (`lv stop`) before the reboot; a plain daemon restart leaves such a VM stopped.
+The daemon tells the two apart by the kernel's boot ID, which it records in its data
+directory (`onboot-boot-id`) once the boot's starts are made. With no record yet (the
+first start of a build that keeps it), a VM its operator stopped is left stopped. A stop
+made by a host drain, or a stopped VM a failover moved to the host, is not started at
+boot either. The start waits through the daemon's warm-up and any loss of quorum, and
+is dropped if its operator stops it again or turns `onboot` off before it is made.
 
 `stop-delay` is the mirror of `start-delay` for an **orderly host shutdown**: running
 `lv host shutdown-workloads <host>` stops that host's VMs in *reverse* `startup-order`

@@ -1416,7 +1416,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go svc.RunDeletedVMMarkerSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
-	// KillMode=process) is a no-op while a host reboot brings them up in order.
+	// KillMode=process) is a no-op while a host reboot brings them up in order;
+	// one its operator stopped only when the kernel's boot ID says the host
+	// booted (health/onboot_boot.go).
 	go reconciler.StartOnbootVMs(ctx)
 
 	// Rebalance executor: leader-gated loop that applies operator-approved

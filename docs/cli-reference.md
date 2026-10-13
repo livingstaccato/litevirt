@@ -944,7 +944,8 @@ lv mapping rm <name>
 
 ```bash
 lv run … --onboot --startup-order 10 --start-delay 5 --stop-delay 0
-# onboot VMs start in startup-order on host boot (not on a plain daemon restart).
+# onboot VMs start in startup-order on host boot (not on a plain daemon restart),
+# including one its operator stopped before the reboot.
 
 lv host shutdown-workloads <host>
 # Gracefully stop every running VM on a host in REVERSE startup-order (highest

@@ -72,7 +72,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 		}, []string{"transformer"}),
 		identityOrphan: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_identity_collapse_orphaned_total",
-			Help: "Natural-key identity collapses whose losing physical row referenced a different host/artifact, potentially leaving that host's snapshot file unreferenced, by table. NOT auto-deleted; the losing id/host/path is logged (WARN) for operator cleanup. Alert on rate.",
+			Help: "Natural-key identity collapses, and anti-entropy in-place tombstones of a live row by a newer delete of its name, whose losing physical row referenced a different host/artifact, potentially leaving that host's snapshot file unreferenced, by table. NOT auto-deleted; the losing id/host/path is logged (WARN) for operator cleanup. Alert on rate.",
 		}, []string{"table"}),
 		digestTables: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_antientropy_digest_tables_total",

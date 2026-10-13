@@ -622,6 +622,13 @@ table with three lifecycle markers:
 - **Revoke** — user-initiated (`lv logout`, `lv session revoke <id>`)
   or admin-initiated.
 
+Each session records the client's address (`lv session ls` IP). For a
+login through the web UI or the REST gateway, which reach the daemon over
+loopback, that is the browser's address as the gateway sees it — the TCP peer,
+or from a `trusted_proxies` peer the forwarded client ("OIDC sign-in", the
+client address) — and the login throttle counts failures against the same
+address. It is not 127.0.0.1 unless the browser itself is on the node.
+
 Both timeouts are configurable in the daemon config under
 `auth.session_idle_timeout` and `auth.session_hard_expiry` (Go duration
 strings, e.g. `8h`, `168h`); the defaults above apply when unset.

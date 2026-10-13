@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -64,14 +65,25 @@ func (s *Server) BeginOIDCLogin(ctx context.Context, req *pb.BeginOIDCLoginReque
 }
 
 // oidcClientAddress is the address the per-address bound on in-progress OIDC
-// logins counts against: the gRPC peer's, unless the peer is this node's own
-// loopback caller (the web UI or the REST gateway, which reach the daemon over
-// 127.0.0.1 and pass the end client's address). A remote caller cannot name an
-// address: it is bounded by its own.
+// logins counts against (forwardedClientAddress).
 func oidcClientAddress(ctx context.Context, claimed string) string {
+	return forwardedClientAddress(ctx, claimed)
+}
+
+// forwardedClientAddress is the end client's address for a login: the gRPC
+// peer's, unless the peer is this node's own loopback caller (the web UI or
+// the REST gateway, which reach the daemon over 127.0.0.1 and pass the end
+// client's address — the HTTP peer, or from a trusted_proxies peer the
+// forwarded client, auth.ClientAddress). A remote caller cannot name an
+// address: it is its own. A claim that is not an IP literal is ignored, so
+// nothing but an address reaches a session row, an audit line or a throttle
+// key.
+func forwardedClientAddress(ctx context.Context, claimed string) string {
 	peer := throttleClientIP(ctx)
 	if ip := net.ParseIP(peer); ip != nil && ip.IsLoopback() && claimed != "" {
-		return claimed
+		if a, err := netip.ParseAddr(claimed); err == nil {
+			return a.Unmap().String()
+		}
 	}
 	return peer
 }

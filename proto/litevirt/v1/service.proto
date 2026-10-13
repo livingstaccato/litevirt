@@ -1082,6 +1082,13 @@ message LoginRequest       {
     // oidc_binding: the secret BeginOIDCLoginResponse.binding returned to whoever
     // began the flow; required with oidc_code + oidc_state. Never in a URL.
     string oidc_binding      = 10;
+    // client_address: the end client's address, recorded on the session
+    // (ListSessions ip) and keying the login throttle. Honoured only from a
+    // loopback caller (this node's web UI or REST gateway, which pass the
+    // browser's address: the HTTP peer, or from a trusted_proxies peer the
+    // forwarded client); any other caller is recorded by its own address. An
+    // address that is not an IP literal is ignored.
+    string client_address    = 11;
 }
 message LoginResponse      {
     string token         = 1;  // bearer; opaque session id (prefix "lvs_") on success

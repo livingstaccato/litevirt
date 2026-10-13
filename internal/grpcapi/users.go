@@ -53,7 +53,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		return nil, status.Errorf(codes.InvalidArgument, "oidc_pending is only for an OIDC realm, not %q", realmName)
 	}
 
-	clientIP := throttleClientIP(ctx)
+	// The browser's address when this node's UI or REST gateway relays the
+	// login, else the caller's own (forwardedClientAddress): recorded on the
+	// session and keying the throttle, which otherwise saw every UI login as
+	// 127.0.0.1.
+	clientIP := forwardedClientAddress(ctx, req.ClientAddress)
 
 	// A node in WAL quarantine accepts no user login (I8).
 	if err := s.refuseUserBearersInQuarantine(); err != nil {

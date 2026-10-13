@@ -156,11 +156,12 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			b = binding
 		}
 		resp, err = s.grpc.Login(r.Context(), &pb.LoginRequest{
-			Realm:       rn,
-			OidcCode:    code,
-			OidcState:   state,
-			OidcBinding: b,
-			UserAgent:   r.UserAgent(),
+			Realm:         rn,
+			OidcCode:      code,
+			OidcState:     state,
+			OidcBinding:   b,
+			UserAgent:     r.UserAgent(),
+			ClientAddress: auth.ClientAddress(r, s.trustedProxies),
 		})
 		if !oidcStateUnknown(err) {
 			break
@@ -287,10 +288,11 @@ func (s *Server) handleOIDCSecondFactor(w http.ResponseWriter, r *http.Request, 
 	}
 	page.Realm = realm
 	resp, err := s.grpc.Login(r.Context(), &pb.LoginRequest{
-		Realm:       realm,
-		OidcPending: pending,
-		TotpCode:    totp,
-		UserAgent:   r.UserAgent(),
+		Realm:         realm,
+		OidcPending:   pending,
+		TotpCode:      totp,
+		UserAgent:     r.UserAgent(),
+		ClientAddress: auth.ClientAddress(r, s.trustedProxies),
 	})
 	if err != nil {
 		slog.Warn("UI OIDC second factor failed", "realm", realm, "code", status.Code(err), "error", status.Convert(err).Message())

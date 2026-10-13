@@ -310,6 +310,39 @@ pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) �
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
 
+#### A deleted name re-used: the tombstone yields
+
+Deletes are soft, so a snapshot that is deleted and then re-created under the
+same name is two rows of one natural key on every peer: the tombstone and the
+new row. A build that minted a fresh id for the re-create shipped a row that
+failed `UNIQUE(vm_name, name)` on every peer, which back-pressured the
+origin's whole replication stream (lab 2, F-2). Two changes close it, neither
+behind a token:
+
+- **The origin re-uses the deleted row's id.** `InsertSnapshot` and
+  `InsertContainerSnapshot` take the id of the row already held under the
+  natural key, and when that row is a tombstone they add the existing
+  per-row-LWW delete shape with a NULL `deleted_at`, stamped after the insert.
+  Every released receiver already applies both statements, so a mixed fleet
+  receives the re-create as an ordinary newer write to the same row.
+- **A receiver lets a strictly older tombstone yield.** On the WAL and on
+  anti-entropy, when the only row holding an incoming row's natural key under a
+  *different* id is a tombstone whose `updated_at` is strictly older, the
+  tombstone is removed so the incoming row can take the name. A live row never
+  yields (two live rows under one name stay `canonical_identity`'s decision),
+  nor does a tombstone as new as the incoming row, one a child references, or
+  one an incoming future-skewed clock would otherwise displace. Anti-entropy
+  also skips an incoming tombstone strictly older than the different-id row
+  held here, so a peer still holding the old incarnation does not bring it
+  back. Logged at INFO as `a deleted row yielded its name to a newer row`.
+
+This is what un-wedges a stream that already carries a fresh-id re-create: the
+entry is still in the sender's log, and an upgraded receiver applies it on the
+next push. It also matters with `canonical_identity` on: its WAL collapse
+re-keys the losing row with a column-preserving `UPDATE`, and a replicated
+`INSERT` does not carry `deleted_at`, so collapsing a tombstone into a
+re-created row would leave that row deleted on every peer.
+
 ### `vm_replace` — `lv cutover`
 
 `lv cutover` gives the `<vm>-next` replacement the name of the VM it replaces. That VM is
@@ -891,6 +924,10 @@ converge the row, so the two paths can never disagree.
   *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
   with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
   divergence`, **not** on its absolute value.
+- `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
+  holds because a constraint refuses them, per sender (see
+  [`replication_entry_parked`](#a-received-change-this-node-cannot-apply-replication_entry_parked)).
+  The sender's stream continues past them. Nonzero means those changes have not happened here.
 - `litevirt_legacy_mutation_transformed_total{transformer}` — **monotonic counter** of prior-
   release WAL statements this node NORMALIZED before applying (a supported historical shape, e.g.
   a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
@@ -930,6 +967,8 @@ increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
 # Replicated writes are being refused faster than they clear (a builder bug, a mixed-version
 # gap, or malformed input). Correlate with replication backlog + divergence, not the raw total.
 rate(litevirt_merge_apply_rejected_total[15m]) > 0
+# A received change is held because it cannot apply here (the sender's stream continues).
+max by (host, origin) (litevirt_replication_parked_entries) > 0
 ```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
@@ -1367,6 +1406,49 @@ destination keeps refusing is the cluster-wide stand-down left:
 recovered, then back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
+
+### A received change this node cannot apply (`replication_entry_parked`)
+
+A received replicated change that a constraint here refuses — most often a
+`UNIQUE` natural key held by a different row — used to roll back the whole
+push, so the sender retried it forever and every later write from that sender
+waited behind it. The node now **holds** such a change instead, when every
+statement in it is an unguarded last-writer-wins row write to a table
+anti-entropy repairs (guarded workload and operation writes, append-only logs,
+retention deletes and the `users`/`hosts` writes with apply-side absorbs still
+back-pressure):
+
+- the rest of the push applies and is acknowledged, so the sender's stream
+  keeps moving; the held change is recorded seen, and a relay forwards it as it
+  forwards any entry;
+- nothing is overwritten to make room for it: the conflicting row here is left
+  exactly as it is;
+- it is retried automatically — after later pushes and every 30 seconds — and
+  applies as soon as the conflict is gone. Each statement is decided by its
+  row's own clock, so applying it late reaches the state applying it in order
+  would have;
+- the sender keeps the row, and anti-entropy keeps offering it, so a daemon
+  restart (which forgets what is held) leaves the same repair path rather than
+  a loss;
+- at most 256 changes are held per node; past that a refusal back-pressures as
+  before.
+
+What an operator sees:
+
+- an ERROR line, `replicator: held a change this node cannot apply; the rest
+  of the sender's stream continues`, naming the sender, sequence, table, SQL
+  and failure; a WARN at most every five minutes per change while it still
+  cannot apply; and an INFO line when it finally applies;
+- `litevirt_replication_parked_entries{origin}`, the count held per sender;
+- `litevirt_ha_degraded{reason="replication_entry_parked"}` and an
+  `ha.degraded` event whose detail names the oldest held changes;
+- `litevirt_merge_apply_rejected_total{path="wal",reason="held"}` per table.
+
+A held change means the row it writes has not changed on this node yet. Look
+at the table in `lv doctor divergence` and resolve the conflict the failure
+names the way the [repair flow](#operational-repair-flow) describes; the held
+change then applies on its own. This is receiver-side only: an older receiver
+still back-pressures, and upgrading it is what releases the sender's stream.
 
 ### A VM held on its point-in-time overlay (`pit_overlay.held`)
 

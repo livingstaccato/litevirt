@@ -74,6 +74,31 @@ func TestPoolWriteCheck_ReadsTheMountTableOncePerOperation(t *testing.T) {
 	}
 }
 
+// A VM start's chain check judges every pool of the host against one read of
+// the mount table, not one per pool. Its other reads are the resolutions it
+// makes itself, each one read: <data_dir>/disks, and each pool directory
+// twice (resolvedStrict, then rootsAsFound).
+//
+// Mutation "no snapshot for the loop" (chainPoolDirs passes ctx, not mctx,
+// to poolRefusal): one read per pool, 13 — red.
+func TestChainPoolDirs_ChecksEveryPoolAgainstOneMountTableRead(t *testing.T) {
+	s := multiPoolServer(t)
+	s.dataDir = t.TempDir()
+	n := countMountInfoReads(t, func() ([]byte, error) { return []byte(onceMountInfo), nil })
+	n.Store(0)
+	dirs, err := s.chainPoolDirs(context.Background(), corrosion.DiskRecord{}, "default")
+	if err != nil {
+		t.Fatalf("chainPoolDirs: %v", err)
+	}
+	if len(dirs) != 4 {
+		t.Fatalf("chainPoolDirs = %v, want the 4 pools' directories", dirs)
+	}
+	const pools = 4
+	if got, want := n.Load(), int64(1+1+2*pools); got != want {
+		t.Errorf("chainPoolDirs over %d pools read the mount table %d times, want %d (one for all the pool checks)", pools, got, want)
+	}
+}
+
 // The snapshot is one operation's: a mount made, or gone, between two
 // operations is what the second one judges by.
 func TestPoolWriteCheck_SeesTheMountTableAsItIsAtEachOperation(t *testing.T) {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -41,7 +42,14 @@ func TestBoundedChecks_ReadTheMountTableOncePerCall(t *testing.T) {
 // it, a dead mount lazily unmounted since the table was read still fails the
 // next call under it at once (the latch is that mount's, by its ID); the next
 // operation reads the table again, finds the mount gone, and is not failed by
-// that latch.
+// that latch, nor is one that finds a new mount (a new mount ID) at the same
+// directory.
+//
+// Mutations: "boundedCall ignores the table it is given" — red at the same
+// operation's step; "latch by directory" — red at the new mount's step.
+// TestBounded_ANewMountAtTheSameDirectoryIsNotLatched pins the new mount ID
+// for Bounded, which reads the table per call; this pins it through a
+// snapshot.
 func TestBoundedIn_JudgesAPathByItsOperationsMountTable(t *testing.T) {
 	root := t.TempDir()
 	installDeadNFS(t, root)
@@ -73,5 +81,18 @@ func TestBoundedIn_JudgesAPathByItsOperationsMountTable(t *testing.T) {
 	_, err = resolveBounded(&fresh, filepath.Join(root, "c"))
 	if !errors.As(err, &e) || e.Earlier || e.Mount != "" {
 		t.Fatalf("a path there in the next operation, the mount gone: %v, want it waited for and judged on no network mount", err)
+	}
+
+	t.Cleanup(OverrideMountInfoForTest(func() ([]byte, error) {
+		return []byte(fmt.Sprintf("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"+
+			"41 1 0:61 / %s %s - nfs4 nas:/export rw\n", root, hardenedFlags)), nil
+	}))
+	remounted, err := ReadMountTable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveBounded(&remounted, filepath.Join(root, "d"))
+	if !errors.As(err, &e) || e.Earlier || e.Mount != root {
+		t.Fatalf("a path there in an operation that finds a new mount at %s: %v, want it attempted on the new mount, not failed by the old one's latch", root, err)
 	}
 }

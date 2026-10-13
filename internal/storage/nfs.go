@@ -440,6 +440,10 @@ type mountTableKey struct{}
 // MountSnapshot hands the checks of one operation, so its bounded calls judge
 // every path against one read instead of a read each. ctx already carrying
 // one, or a mount table that cannot be read, returns ctx as it is.
+//
+// Never attach it to a context that outlives one check, or that is handed to
+// a goroutine which can outlive it: the snapshot is not refreshed, so such a
+// context would judge later paths against a mount table that is gone.
 func WithMountTable(ctx context.Context) context.Context {
 	if _, ok := ctx.Value(mountTableKey{}).(MountTable); ok {
 		return ctx

@@ -196,8 +196,13 @@ func (s *Server) diskChainRule(ctx context.Context, d corrosion.DiskRecord) chai
 func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *diskChain {
 	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}, uploads: map[string]poolRecords{}, recorded: map[string]corrosion.DiskRecord{}}
 	c.project = c.projectOf(d.VMName)
-	c.self = resolvedOr(s.hostDiskFile(d.Path))
-	c.images = s.rootsAsFound(filepath.Join(s.dataDir, "images"))
+	c.self = c.resolve(s.hostDiskFile(d.Path))
+	// The image store is a deny as well as an admission (an image-store
+	// layer may name only another image), so it is not judged on a guess.
+	c.images = []string{c.resolve(filepath.Join(s.dataDir, "images"))}
+	if s.hostDiskRoot != "" {
+		c.images = append(c.images, c.resolve(s.hostDiskFile(filepath.Join(s.dataDir, "images"))))
+	}
 	c.pools = s.chainPoolDirs(ctx, d, c.project)
 	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
 		for _, p := range pools {
@@ -234,9 +239,44 @@ type diskChain struct {
 	// snapNames is d's VM's snapshot names, read once per chain (ownLayer).
 	snapNames     []string
 	snapNamesRead bool
+	// noAnswer is the first resolution of a judgement of this chain that
+	// did not finish in time (resolve). From then on every judgement of the
+	// chain refuses: a record that would refuse a layer may have been
+	// missed.
+	noAnswer error
 }
 
+// resolve is resolvedStrict for a judgement of this chain: a path whose
+// resolution does not answer is taken as given, and remembered (noAnswer),
+// so the judgement that needed it refuses instead of deciding on a guess.
+// A wrong form can miss a claim that refuses a layer (another VM's row on a
+// snapshot base, another project's upload record, the disk's own file), not
+// only one that admits it. The pool directories of the host are resolved
+// with resolvedOr instead: one that does not answer only admits less, and a
+// VM on local storage starts beside a dead nfs pool (lab 2 N-1).
+func (c *diskChain) resolve(p string) string {
+	r, err := resolvedStrict(p)
+	if err != nil {
+		if c.noAnswer == nil {
+			c.noAnswer = err
+		}
+		return filepath.Clean(p)
+	}
+	return r
+}
+
+// answered reports ok when no resolution of this chain has gone unanswered.
+func (c *diskChain) answered(ok bool) bool { return ok && c.noAnswer == nil }
+
 func (c *diskChain) judge(layer, resolved, format string) error {
+	err := c.judgeLayer(layer, resolved, format)
+	if c.noAnswer != nil {
+		return fmt.Errorf("whether %s may name %q cannot be judged: %w", layer, resolved, c.noAnswer)
+	}
+	return err
+}
+
+func (c *diskChain) judgeLayer(layer, resolved, format string) error {
 	inImages := withinAny(resolved, c.images)
 	if withinAny(layer, c.images) && !inImages {
 		// An image is a base: it may be built only on another image in the
@@ -286,8 +326,8 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 // layer naming it (rowsOf).
 func (c *diskChain) recordedBacking(layer, resolved string) bool {
 	for _, r := range c.rowsOf(layer) {
-		if r.BackingDisk != "" && resolvedOr(c.s.hostDiskFile(r.BackingDisk)) == resolved {
-			return true
+		if r.BackingDisk != "" && c.resolve(c.s.hostDiskFile(r.BackingDisk)) == resolved {
+			return c.answered(true)
 		}
 	}
 	return false
@@ -303,16 +343,16 @@ func (c *diskChain) ownedByProject(resolved string) bool {
 	}
 	for _, r := range c.rowsAt(resolved) {
 		if c.projectOf(r.VMName) == c.project {
-			return true
+			return c.answered(true)
 		}
 	}
 	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) == c.project {
-		return true
+		return c.answered(true)
 	}
 	if id, err := fileIdentity(resolved); err == nil {
 		for _, u := range c.uploadRecords(resolved) {
 			if !u.Peer && u.VM == "" && sameProject(u.Project, c.project) && id.describedBy(u) {
-				return true
+				return c.answered(true)
 			}
 		}
 	}
@@ -331,7 +371,7 @@ func (c *diskChain) uploadRecords(resolved string) []poolUpload {
 	}
 	var out []poolUpload
 	for p, recs := range m {
-		if filepath.Base(p) == filepath.Base(resolved) && (resolvedOr(p) == resolved || resolvedOr(c.s.hostDiskFile(p)) == resolved) {
+		if filepath.Base(p) == filepath.Base(resolved) && (c.resolve(p) == resolved || c.resolve(c.s.hostDiskFile(p)) == resolved) {
 			out = append(out, recs...)
 		}
 	}
@@ -374,7 +414,7 @@ func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
 	switch {
 	case layer == c.self || c.ownLayer(layer):
 		for _, r := range c.rowsOf(layer) {
-			if img, ok := relativeImageName(r.BackingImage); ok && resolvedOr(filepath.Join(filepath.Dir(c.self), img)) == resolved {
+			if img, ok := relativeImageName(r.BackingImage); ok && c.resolve(filepath.Join(filepath.Dir(c.self), img)) == resolved {
 				named = true
 				break
 			}
@@ -384,8 +424,8 @@ func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
 		if !ok {
 			break
 		}
-		src := resolvedOr(c.s.hostDiskFile(r.Path))
-		if img, ok := relativeImageName(r.BackingImage); ok && resolvedOr(filepath.Join(filepath.Dir(src), img)) == resolved {
+		src := c.resolve(c.s.hostDiskFile(r.Path))
+		if img, ok := relativeImageName(r.BackingImage); ok && c.resolve(filepath.Join(filepath.Dir(src), img)) == resolved {
 			if project = c.projectOf(r.VMName); project != "" {
 				named = true
 			}
@@ -402,7 +442,7 @@ func (c *diskChain) legacyPoolBase(layer, resolved string) bool {
 	if _, ok := replicaRecordFor(resolved); ok {
 		return false
 	}
-	return !c.s.usedByOtherProject(c.ctx, c.s.recordPath(resolved), replicaKey{VM: c.d.VMName, Disk: c.d.DiskName, Project: project})
+	return c.answered(!c.s.usedByOtherProject(c.ctx, c.s.recordPath(resolved), replicaKey{VM: c.d.VMName, Disk: c.d.DiskName, Project: project}))
 }
 
 // relativeImageName is a row's backing_image when it is a bare relative name
@@ -425,12 +465,12 @@ func relativeImageName(img string) (string, bool) {
 // project's replica record.
 func (c *diskChain) snapshotBase(layer, resolved string) bool {
 	if c.snapshotBaseOf(layer, resolved, c.self, c.d.VMName, c.project) {
-		return true
+		return c.answered(true)
 	}
 	// Under a linked clone, its source disk's own snapshot bases.
 	if r, ok := c.recorded[layer]; ok {
 		if project := c.projectOf(r.VMName); project != "" &&
-			c.snapshotBaseOf(layer, resolved, resolvedOr(c.s.hostDiskFile(r.Path)), r.VMName, project) {
+			c.snapshotBaseOf(layer, resolved, c.resolve(c.s.hostDiskFile(r.Path)), r.VMName, project) && c.answered(true) {
 			c.recorded[resolved] = r
 			return true
 		}
@@ -485,8 +525,8 @@ func (c *diskChain) legacyPromoted(layer, resolved, format string) bool {
 		}
 	}
 	for _, r := range c.rowsOf(layer) {
-		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved, format) {
-			return true
+		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved, format, c.resolve) {
+			return c.answered(true)
 		}
 	}
 	return false
@@ -494,7 +534,8 @@ func (c *diskChain) legacyPromoted(layer, resolved, format string) bool {
 
 // legacyPromotedReplica is legacyPromoted's test for one disk row r of a
 // VM in project, whose file is layer, naming resolved as format.
-func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskRecord, project, layer, resolved, format string) bool {
+// Paths are resolved with resolve (diskChain.resolve).
+func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskRecord, project, layer, resolved, format string, resolve func(string) string) bool {
 	if r.StorageVolume == "" || project == "" || (format != "raw" && format != "qcow2") {
 		return false
 	}
@@ -513,7 +554,7 @@ func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskReco
 		return false
 	} else {
 		for _, o := range rows {
-			if o.Path != "" && resolvedOr(s.hostDiskFile(o.Path)) == resolved {
+			if o.Path != "" && resolve(s.hostDiskFile(o.Path)) == resolved {
 				return false
 			}
 		}
@@ -525,7 +566,7 @@ func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskReco
 		if filepath.Dir(layer) != pd {
 			continue
 		}
-		if filepath.Dir(resolved) == resolvedOr(replicaOwnerDir(pd, project, r.VMName)) {
+		if filepath.Dir(resolved) == resolve(replicaOwnerDir(pd, project, r.VMName)) {
 			return true
 		}
 		if filepath.Dir(resolved) != pd {
@@ -611,7 +652,7 @@ func (c *diskChain) rowsAt(resolved string) []corrosion.DiskRecord {
 			if r.HostName != "" && r.HostName != c.s.hostName && !withinAny(resolved, c.shared) {
 				continue
 			}
-			if r.Path != "" && resolvedOr(c.s.hostDiskFile(r.Path)) == resolved {
+			if r.Path != "" && c.resolve(c.s.hostDiskFile(r.Path)) == resolved {
 				out = append(out, r)
 			}
 		}
@@ -637,11 +678,18 @@ func (c *diskChain) projectOf(vm string) string {
 // host that project may use and that is not refused. A pool whose directory
 // overlaps <data_dir>/disks (a default local pool) adds nothing: that
 // directory holds every project's disks and is judged file by file.
+//
+// A pool whose directory, or <data_dir>/disks, does not answer its
+// resolution adds nothing either: whether it overlaps <data_dir>/disks
+// cannot be told, and leaving it out only admits less.
 func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, project string) []string {
-	disks := resolvedOr(filepath.Join(s.dataDir, "disks"))
+	disks, derr := resolvedStrict(filepath.Join(s.dataDir, "disks"))
 	var dirs []string
 	add := func(dir string) {
-		if rd := resolvedOr(dir); dir == "" || safename.Contains(rd, disks) || safename.Contains(disks, rd) {
+		if dir == "" || derr != nil {
+			return
+		}
+		if rd, err := resolvedStrict(dir); err != nil || safename.Contains(rd, disks) || safename.Contains(disks, rd) {
 			return
 		}
 		dirs = append(dirs, s.rootsAsFound(dir)...)
@@ -705,11 +753,32 @@ func (s *Server) recordPath(resolved string) string {
 // given, as one that cannot be resolved always was. A start chains every
 // pool directory of the host through here (chainPoolDirs), and hung on an
 // nfs pool's dead mount point (lab 2 N-1).
+//
+// Taking a path as given is safe only where a wrong form can only admit
+// less: a backing compared for equality with, or containment in, what may be
+// read. Anything that removes a file, or judges whether a file is in use or
+// claimed, uses resolvedStrict: there a wrong form keeps less, and an image
+// version a stopped VM is built on was removed (re-review 3, R3-I1).
 func resolvedOr(p string) string {
 	if r, err := storage.EvalSymlinksBounded(p); err == nil {
 		return r
 	}
 	return filepath.Clean(p)
+}
+
+// resolvedStrict is resolvedOr for a judgement that must not be made on a
+// guess. A path that cannot be resolved (it does not exist, say) is p as
+// given, as for resolvedOr; one whose resolution does not finish in time is
+// the *storage.FSNoAnswerError, and the caller fails on it.
+func resolvedStrict(p string) (string, error) {
+	r, err := storage.EvalSymlinksBounded(p)
+	if err == nil {
+		return r, nil
+	}
+	if storage.IsFSNoAnswer(err) {
+		return "", err
+	}
+	return filepath.Clean(p), nil
 }
 
 // atOrWithinAny reports dir at or inside one of roots (already resolved).

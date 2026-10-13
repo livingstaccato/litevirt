@@ -293,25 +293,38 @@ const dataDirDisks = "disks"
 // IsDataDirDisks reports whether p is <data_dir>/disks, as written or after
 // resolving symlinks. The resolutions are bounded (resolveBounded): a form a
 // network filesystem that does not answer keeps from being resolved is
-// judged as written only.
+// judged as written only. A caller that confines on the answer uses
+// IsDataDirDisksErr, and confines on its error.
 func IsDataDirDisks(p, dataDir string) bool {
+	is, _ := IsDataDirDisksErr(p, dataDir)
+	return is
+}
+
+// IsDataDirDisksErr is IsDataDirDisks, and an error when it answered false
+// without every form resolved: a resolution did not answer, so p may still
+// be <data_dir>/disks through a symlink. A match on the forms that did
+// resolve is still true, with no error.
+func IsDataDirDisksErr(p, dataDir string) (bool, error) {
 	if dataDir == "" || p == "" {
-		return false
+		return false, nil
 	}
 	var t MountTable
 	if mt, err := ReadMountTable(); err == nil {
 		t = mt
 	}
-	dataForms, _ := pathFormsBounded(&t, dataDir)
-	forms, _ := pathFormsBounded(&t, p)
+	dataForms, errD := pathFormsBounded(&t, dataDir)
+	forms, errP := pathFormsBounded(&t, p)
 	for _, d := range dataForms {
 		for _, c := range forms {
 			if c == filepath.Join(d, dataDirDisks) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	if err := errors.Join(errD, errP); err != nil {
+		return false, fmt.Errorf("cannot tell whether %s is %s: %w", p, filepath.Join(dataDir, dataDirDisks), err)
+	}
+	return false, nil
 }
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,

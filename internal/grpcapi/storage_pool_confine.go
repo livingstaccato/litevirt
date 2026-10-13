@@ -374,8 +374,12 @@ const poolUploadsSubdir = "uploads"
 
 // poolUploadDir is where a user's upload into a pool whose directory is dir
 // lands.
+//
+// A directory that cannot be told not to be <data_dir>/disks (a resolution
+// that does not answer: storage.IsDataDirDisksErr) is taken as it: an upload
+// never lands beside VM disks on a guess.
 func (s *Server) poolUploadDir(dir string) string {
-	if storage.IsDataDirDisks(dir, s.dataDir) {
+	if is, err := storage.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
 		return filepath.Join(dir, poolUploadsSubdir)
 	}
 	return dir
@@ -394,14 +398,15 @@ func (s *Server) poolContentDirs(dir string) []string {
 // poolDirShared reports whether a file pool's directory is not its own: it is
 // <data_dir>/disks, or another live pool on this host uses the same
 // directory, an alias of it, one inside it or one containing it. A lookup
-// error counts as shared (content stays confined).
+// error counts as shared (content stays confined), and so does a resolution
+// that does not answer.
 func (s *Server) poolDirShared(ctx context.Context, rec corrosion.StoragePoolRecord) bool {
 	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
 	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return true
 	}
-	if storage.IsDataDirDisks(dir, s.dataDir) {
+	if is, err := storage.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
 		return true
 	}
 	rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)

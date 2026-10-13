@@ -404,7 +404,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	sort.Strings(liveFiles)
 	users, uerr := s.snapshotFileUsers(ctx, req.VmName, liveFiles)
 	if uerr != nil {
-		return nil, status.Errorf(codes.Internal,
+		return nil, status.Errorf(snapshotFileUsersCode(uerr),
 			"cannot determine whether other VMs back on the disks of %q, so it is not restored: %v", req.VmName, uerr)
 	}
 	if len(users) > 0 {
@@ -671,7 +671,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	} else if ferr == nil {
 		users, uerr := s.snapshotFileUsers(ctx, req.VmName, files)
 		if uerr != nil {
-			return nil, status.Errorf(codes.Internal,
+			return nil, status.Errorf(snapshotFileUsersCode(uerr),
 				"cannot determine whether other VMs back on snapshot %q of %q, so it is not deleted: %v", req.SnapshotName, req.VmName, uerr)
 		}
 		if len(users) > 0 {

@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Pruning image versions.
@@ -60,7 +61,9 @@ const imagePruneDeadline = 2 * time.Minute
 //     nothing new is kept.
 //
 // The view must be whole: a directory, an nfs share, a manifest or a header
-// that cannot be read is an error, and nothing is pruned on it.
+// that cannot be read is an error, and nothing is pruned on it. So is a path
+// whose resolution does not answer (resolvedStrict): a file kept under one
+// form and looked up under another is not kept (re-review 3, R3-I1).
 //
 // A deleted image (deleted: its catalog row is deleted, lv image rm) has no
 // current file to keep: its current file is kept only as any other version
@@ -68,7 +71,11 @@ const imagePruneDeadline = 2 * time.Minute
 //
 // Each kept file maps to why it is kept.
 func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map[string]bool) (*imageUseScan, error) {
-	w := &chainWalk{images: resolvedOr(s.imageStore().ImageDir()), inUse: map[string]string{}, walked: map[string]bool{}}
+	images, err := resolvedStrict(s.imageStore().ImageDir())
+	if err != nil {
+		return nil, fmt.Errorf("resolve the image store: %w", err)
+	}
+	w := &chainWalk{images: images, inUse: map[string]string{}, walked: map[string]bool{}}
 	sc := &imageUseScan{inUse: w.inUse}
 	rows, err := s.db.Query(ctx, `SELECT vm_name, disk_name, host_name, path FROM vm_disks WHERE deleted_at IS NULL`)
 	if err != nil {
@@ -121,7 +128,10 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 	for {
 		grew := false
 		for f, n := range st.StoreFiles() {
-			r := resolvedOr(f)
+			r, err := resolvedStrict(f)
+			if err != nil {
+				return nil, err
+			}
 			if w.walked[r] {
 				continue
 			}
@@ -515,7 +525,10 @@ type chainWalk struct {
 // but not read); a layer below is kept because who is built on it. A missing
 // file names nothing; a header that cannot be read is an error.
 func (w *chainWalk) walk(path string, self bool, why, who string) error {
-	path = resolvedOr(path)
+	path, err := resolvedStrict(path)
+	if err != nil {
+		return err
+	}
 	if self && w.inImages(path) && w.inUse[path] == "" {
 		w.inUse[path] = why
 	}
@@ -621,6 +634,9 @@ func (s *Server) imageFilesInUseBounded(ctx context.Context, keep []string, dele
 	}()
 	select {
 	case r := <-done:
+		if storage.IsFSNoAnswer(r.err) {
+			return nil, fmt.Errorf("the scan of the disk files: %w: nothing is pruned", r.err)
+		}
 		return r.sc, r.err
 	case <-ctx.Done():
 		return nil, fmt.Errorf("the scan of the disk files did not finish within %s (a hung mount?): nothing is pruned", deadline)
@@ -701,11 +717,26 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	if hook := s.imagePrune.afterScan; hook != nil {
 		hook()
 	}
-	for f, n := range st.StoreFiles() {
+	// Every candidate's resolved form first, before anything is removed: the
+	// scan's keeps are by that form, and one that cannot be had is not
+	// guessed (resolvedStrict).
+	files := st.StoreFiles()
+	resolved := map[string]string{}
+	for f, n := range files {
 		if name != "" && n != name {
 			continue
 		}
-		r := resolvedOr(f)
+		r, err := resolvedStrict(f)
+		if err != nil {
+			return out, fmt.Errorf("resolve %s: %w: nothing is pruned", f, err)
+		}
+		resolved[f] = r
+	}
+	for f, n := range files {
+		if name != "" && n != name {
+			continue
+		}
+		r := resolved[f]
 		if !deleted[n] {
 			if f == st.ImagePath(n) || slices.Contains(keep, f) || sc.inUse[r] != "" {
 				if justDeleted && n == name && f == st.ImagePath(n) {
@@ -715,7 +746,7 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 				}
 				continue
 			}
-		} else if why := sc.deletedKeep(f, n, snap[n]); why != "" {
+		} else if why := sc.deletedKeep(f, r, n, snap[n]); why != "" {
 			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
 			continue
 		}
@@ -745,12 +776,12 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	return out, nil
 }
 
-// deletedKeep is why the scan keeps f, a file of deleted image n ("" when
-// nothing does).
-func (sc *imageUseScan) deletedKeep(f, n string, held holdSnap) string {
+// deletedKeep is why the scan keeps f, a file of deleted image n resolved to
+// r ("" when nothing does).
+func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap) string {
 	switch {
-	case sc.inUse[resolvedOr(f)] != "":
-		return sc.inUse[resolvedOr(f)]
+	case sc.inUse[r] != "":
+		return sc.inUse[r]
 	case sc.recorded[n] != "":
 		return sc.recorded[n]
 	case held.held:
@@ -1121,7 +1152,14 @@ func (s *Server) pinBackupBase(id *pbsstore.BaseIdentity) error {
 	if id == nil || !filepath.IsAbs(id.Path) {
 		return nil
 	}
-	if filepath.Dir(id.Path) != resolvedOr(s.imageStore().ImageDir()) {
+	// Whether the base is the store's is not answered on a guess: a store
+	// whose resolution does not answer is an error, and the backup warns
+	// that its base is unpinned (pinBackupBaseOrWarn).
+	images, err := resolvedStrict(s.imageStore().ImageDir())
+	if err != nil {
+		return fmt.Errorf("resolve the image store: %w", err)
+	}
+	if filepath.Dir(id.Path) != images {
 		return nil
 	}
 	if _, ok := image.ImageNameOfFile(id.Path); !ok {

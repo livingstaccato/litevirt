@@ -556,7 +556,8 @@ func samePoolOnAnotherHost(name, project string, ref StoragePoolRef, mine storag
 // dirConfinedAmong reports whether dir is <data_dir>/disks, or overlaps the
 // directory of another directory pool of this host in rows.
 func (s *Server) dirConfinedAmong(rows []corrosion.StoragePoolRecord, name, dir string) bool {
-	if storage.IsDataDirDisks(dir, s.dataDir) {
+	// One that cannot be told not to be <data_dir>/disks counts: the safe side.
+	if is, err := storage.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
 		return true
 	}
 	for _, r := range rows {

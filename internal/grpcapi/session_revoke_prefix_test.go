@@ -173,3 +173,123 @@ func TestRevokeSession_PrefixSkipsRevoked(t *testing.T) {
 		t.Fatal("the one live match was not revoked")
 	}
 }
+
+func sessionAudit(t *testing.T, s *Server, action string) []corrosion.Row {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(),
+		`SELECT target, detail, result FROM audit_log WHERE action = ?`, action)
+	if err != nil {
+		t.Fatalf("query audit_log: %v", err)
+	}
+	return rows
+}
+
+// C1 (round 1): ListSessions never returns a session id, which is the bearer
+// secret. It returns the 12-character handle RevokeSession takes, and marks the
+// caller's own session itself so no client compares tokens.
+func TestListSessions_ReturnsHandlesNeverTheBearer(t *testing.T) {
+	s := testServer(t)
+	seedUser(t, s, "alice", "viewer", "hunter2")
+	a := loginID(t, s, context.Background(), "alice")
+	b := loginID(t, s, context.Background(), "alice")
+
+	ctx := context.WithValue(userCtx("alice", "viewer"), ctxKeySessionID, a)
+	resp, err := s.ListSessions(ctx, &pb.ListSessionsRequest{})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(resp.Sessions) != 2 {
+		t.Fatalf("%d sessions, want 2", len(resp.Sessions))
+	}
+	current := 0
+	for _, ss := range resp.Sessions {
+		if ss.Id == a || ss.Id == b || len(ss.Id) != 12 {
+			t.Fatalf("listed id %q: want a 12-character handle, never the session id", ss.Id)
+		}
+		if ss.Id != a[:12] && ss.Id != b[:12] {
+			t.Fatalf("listed id %q is not a handle of either session", ss.Id)
+		}
+		if ss.Current {
+			current++
+			if ss.Id != a[:12] {
+				t.Errorf("current is %q, want the caller's own %q", ss.Id, a[:12])
+			}
+		}
+	}
+	if current != 1 {
+		t.Errorf("%d sessions marked current, want 1", current)
+	}
+
+	// An admin listing alice's sessions sees handles too, and none is current.
+	resp, err = s.ListSessions(adminCtx(), &pb.ListSessionsRequest{Username: "alice"})
+	if err != nil {
+		t.Fatalf("ListSessions(admin): %v", err)
+	}
+	for _, ss := range resp.Sessions {
+		if len(ss.Id) != 12 || ss.Current {
+			t.Errorf("admin listing: %+v, want a handle and not current", ss)
+		}
+	}
+	// The listed handle revokes the session.
+	if _, err := s.RevokeSession(adminCtx(), &pb.RevokeSessionRequest{Id: resp.Sessions[0].Id}); err != nil {
+		t.Fatalf("RevokeSession(listed handle): %v", err)
+	}
+}
+
+// M1/M2 (round 1): the audit row and the log name the handle, never the
+// secret; a refused revoke is audited as denied.
+func TestRevokeSession_AuditsTheHandleAndDenials(t *testing.T) {
+	s := testServer(t)
+	seedUser(t, s, "alice", "viewer", "hunter2")
+	seedUser(t, s, "bob", "viewer", "hunter2")
+	bob := loginID(t, s, context.Background(), "bob")
+
+	if _, err := s.RevokeSession(userCtx("alice", "viewer"), &pb.RevokeSessionRequest{Id: bob[:12]}); status.Code(err) != codes.NotFound {
+		t.Fatalf("alice revoking bob's prefix: %v", err)
+	}
+	if _, err := s.RevokeSession(userCtx("alice", "viewer"), &pb.RevokeSessionRequest{Id: bob}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("alice revoking bob's full id: %v", err)
+	}
+	if _, err := s.RevokeSession(adminCtx(), &pb.RevokeSessionRequest{Id: bob[:12]}); err != nil {
+		t.Fatalf("admin revoke: %v", err)
+	}
+	var ok, denied int
+	for _, r := range sessionAudit(t, s, "session.revoke") {
+		d := r.String("detail")
+		if strings.Contains(d, bob) || strings.Contains(r.String("target"), bob) {
+			t.Errorf("audit row %q / %q carries the full session id", r.String("target"), d)
+		}
+		if !strings.Contains(d, bob[:12]) {
+			t.Errorf("audit detail %q does not name the handle %s", d, bob[:12])
+		}
+		switch r.String("result") {
+		case "ok":
+			ok++
+		case "denied":
+			denied++
+		}
+	}
+	if ok != 1 || denied != 2 {
+		t.Errorf("session.revoke rows: %d ok, %d denied; want 1 and 2", ok, denied)
+	}
+}
+
+// M7 (round 1): an ambiguous long prefix discloses at most 16 characters of
+// any match.
+func TestRevokeSession_AmbiguousLongPrefixDisclosesLittle(t *testing.T) {
+	s := testServer(t)
+	common := strings.Repeat("ab", 20) // 40 characters
+	a := common + strings.Repeat("1", 24)
+	b := common + strings.Repeat("2", 24)
+	insertSessionWithID(t, s, a, "alice")
+	insertSessionWithID(t, s, b, "bob")
+	_, err := s.RevokeSession(adminCtx(), &pb.RevokeSessionRequest{Id: common})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("ambiguous long prefix: %v", err)
+	}
+	// The caller typed the 40 common characters; the refusal adds none.
+	if msg := status.Convert(err).Message(); strings.Contains(msg, a[:len(common)+1]) || strings.Contains(msg, b[:len(common)+1]) ||
+		!strings.Contains(msg, a[:16]+"…") {
+		t.Errorf("refusal %q: want each match shown as its first 16 characters, nothing past the typed prefix", msg)
+	}
+}

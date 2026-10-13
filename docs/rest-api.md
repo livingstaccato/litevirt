@@ -314,8 +314,8 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/stacks/{name}/migrate-volumes` | POST (SSE) | `MigrateStackVolumes` |
 | `/api/v1/realms` | GET | `ListRealms` |
 | `/api/v1/auth/oidc/begin` | POST (no auth) | `BeginOIDCLogin` (`{realm, client}`; returns `binding`, which `/api/v1/auth/login` on the same node needs as `oidc_binding`; see docs/auth.md) |
-| `/api/v1/sessions` | GET | `ListSessions` |
-| `/api/v1/sessions/{id}` | DELETE | `RevokeSession` |
+| `/api/v1/sessions` | GET | `ListSessions` (?user=; each `id` is a 12-character handle, never the bearer; `current` marks the caller's session) |
+| `/api/v1/sessions/{id}` | DELETE | `RevokeSession` (the listed handle, any unambiguous prefix of 8+ characters, or the full id) |
 | `/api/v1/vms/bind-sgs` | POST | `BindSecurityGroups` (vm in body) |
 | `/api/v1/vms/move-volume` | POST (SSE) | `MoveVolume` (vm in body) |
 | `/api/v1/vms/replicate-volume` | POST (SSE) | `ReplicateVolume` (vm in body) |

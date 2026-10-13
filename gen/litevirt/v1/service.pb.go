@@ -10614,10 +10614,11 @@ type LoginRequest struct {
 	OidcBinding string `protobuf:"bytes,10,opt,name=oidc_binding,json=oidcBinding,proto3" json:"oidc_binding,omitempty"`
 	// client_address: the end client's address, recorded on the session
 	// (ListSessions ip) and keying the login throttle. Honoured only from a
-	// loopback caller (this node's web UI or REST gateway, which pass the
-	// browser's address: the HTTP peer, or from a trusted_proxies peer the
-	// forwarded client); any other caller is recorded by its own address. An
-	// address that is not an IP literal is ignored.
+	// caller presenting a cluster HOST certificate over loopback — this node's
+	// own web UI or REST gateway, which pass the browser's address (the HTTP
+	// peer, or from a trusted_proxies peer the forwarded client). Any other
+	// caller, the distributable lv-cli certificate included, is recorded by its
+	// own address. An address that is not an IP literal is ignored.
 	ClientAddress string `protobuf:"bytes,11,opt,name=client_address,json=clientAddress,proto3" json:"client_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -19234,15 +19235,21 @@ func (x *BindSecurityGroupsRequest) GetSecurityGroups() []string {
 }
 
 type Session struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"` // opaque session id (the bearer wire token)
-	Username      string                 `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
-	Realm         string                 `protobuf:"bytes,3,opt,name=realm,proto3" json:"realm,omitempty"`
-	Ip            string                 `protobuf:"bytes,4,opt,name=ip,proto3" json:"ip,omitempty"`
-	UserAgent     string                 `protobuf:"bytes,5,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
-	CreatedAt     string                 `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	LastUsedAt    string                 `protobuf:"bytes,7,opt,name=last_used_at,json=lastUsedAt,proto3" json:"last_used_at,omitempty"`
-	ExpiresAt     string                 `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// id: a display HANDLE, the first 12 characters of the session id — never
+	// the session id itself, which is the bearer secret (lvs_<id>). It is what
+	// RevokeSession takes. A daemon older than this field returned the full id.
+	Id         string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Username   string `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	Realm      string `protobuf:"bytes,3,opt,name=realm,proto3" json:"realm,omitempty"`
+	Ip         string `protobuf:"bytes,4,opt,name=ip,proto3" json:"ip,omitempty"`
+	UserAgent  string `protobuf:"bytes,5,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
+	CreatedAt  string `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	LastUsedAt string `protobuf:"bytes,7,opt,name=last_used_at,json=lastUsedAt,proto3" json:"last_used_at,omitempty"`
+	ExpiresAt  string `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// current: this is the session the request was made with. Set by the
+	// daemon, so a client never compares its own bearer with a listed id.
+	Current       bool `protobuf:"varint,9,opt,name=current,proto3" json:"current,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -19333,6 +19340,13 @@ func (x *Session) GetExpiresAt() string {
 	return ""
 }
 
+func (x *Session) GetCurrent() bool {
+	if x != nil {
+		return x.Current
+	}
+	return false
+}
+
 type ListSessionsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
@@ -19421,6 +19435,9 @@ func (x *ListSessionsResponse) GetSessions() []*Session {
 	return nil
 }
 
+// id: the full session id, or an unambiguous prefix of at least 8 characters
+// (a ListSessions handle). A prefix resolves only among the sessions the caller
+// may revoke: its own, or anyone's for an admin.
 type RevokeSessionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -42730,7 +42747,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x19BindSecurityGroupsRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12!\n" +
 	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\x12'\n" +
-	"\x0fsecurity_groups\x18\x03 \x03(\tR\x0esecurityGroups\"\xda\x01\n" +
+	"\x0fsecurity_groups\x18\x03 \x03(\tR\x0esecurityGroups\"\xf4\x01\n" +
 	"\aSession\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x14\n" +
@@ -42743,7 +42760,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\flast_used_at\x18\a \x01(\tR\n" +
 	"lastUsedAt\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\b \x01(\tR\texpiresAt\"1\n" +
+	"expires_at\x18\b \x01(\tR\texpiresAt\x12\x18\n" +
+	"\acurrent\x18\t \x01(\bR\acurrent\"1\n" +
 	"\x13ListSessionsRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\"H\n" +
 	"\x14ListSessionsResponse\x120\n" +

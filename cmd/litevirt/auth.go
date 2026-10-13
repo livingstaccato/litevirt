@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -35,10 +37,14 @@ func newSessionListCmd() *cobra.Command {
 					return err
 				}
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-				fmt.Fprintln(w, "ID\tUSER\tREALM\tIP\tLAST USED\tEXPIRES")
+				fmt.Fprintln(w, "\tID\tUSER\tREALM\tIP\tLAST USED\tEXPIRES")
 				for _, s := range resp.Sessions {
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-						shortID(s.Id), s.Username, s.Realm, s.Ip, s.LastUsedAt, s.ExpiresAt)
+					mark := "" // the session this command ran with, as the daemon reports it
+					if s.Current {
+						mark = "*"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						mark, shortID(s.Id), s.Username, s.Realm, s.Ip, s.LastUsedAt, s.ExpiresAt)
 				}
 				return w.Flush()
 			})
@@ -69,6 +75,13 @@ revoke.`,
 			id = strings.TrimSuffix(strings.TrimSuffix(id, "…"), "...")
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: id}); err != nil {
+					// A daemon older than prefix revoke matches only the full id,
+					// which a new daemon never lists.
+					if status.Code(err) == codes.NotFound && len(id) < 64 {
+						return fmt.Errorf("%w (if the session is listed, the daemon is older than prefix revoke and matches "+
+							"only the full session id, which lv session ls does not show: upgrade it, or end the "+
+							"user's sessions with lv user disable)", err)
+					}
 					return err
 				}
 				fmt.Printf("Session %s revoked.\n", id)
@@ -276,8 +289,9 @@ the release, ` + "`lv cluster upgrade-status`" + `).`,
 }
 
 // shortID truncates session IDs for table output. The full id is the
-// session's bearer secret, so it is never printed; lv session revoke accepts
-// the short form (an unambiguous prefix).
+// session's bearer secret: a current daemon lists only a 12-character handle
+// (a no-op here), and this keeps an older daemon's full id off the screen. lv
+// session revoke accepts the short form (an unambiguous prefix).
 func shortID(s string) string {
 	if len(s) > 12 {
 		return s[:12] + "…"

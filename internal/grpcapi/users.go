@@ -57,7 +57,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// login, else the caller's own (forwardedClientAddress): recorded on the
 	// session and keying the throttle, which otherwise saw every UI login as
 	// 127.0.0.1.
-	clientIP := forwardedClientAddress(ctx, req.ClientAddress)
+	clientIP := s.forwardedClientAddress(ctx, req.ClientAddress)
 
 	// A node in WAL quarantine accepts no user login (I8).
 	if err := s.refuseUserBearersInQuarantine(); err != nil {
@@ -85,7 +85,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		throttleKey = loginThrottleKey(p.Subject, clientIP)
 	}
 	if wait := s.loginThrottle.retryAfter(throttleKey); wait > 0 {
-		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" locked out ip="+clientIP, "denied")
+		why := " locked out ip=" + clientIP
+		if s.loginThrottle.accountRetryAfter(throttleKey) > 0 {
+			why = " locked out by the account throttle ip=" + clientIP
+		}
+		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+why, "denied")
 		return nil, status.Errorf(codes.ResourceExhausted,
 			"too many failed login attempts; retry in %s", wait.Round(time.Second))
 	}
@@ -645,7 +649,7 @@ func (s *Server) Logout(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, 
 	}
 	s.kickStreams()
 	slog.Info("user logged out", "username", callerUsername(ctx))
-	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sid, "ok")
+	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sessionHandle(sid), "ok")
 	return &emptypb.Empty{}, nil
 }
 
@@ -670,9 +674,13 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 		return nil, status.Errorf(codes.Internal, "list sessions: %v", err)
 	}
 	resp := &pb.ListSessionsResponse{}
+	own := callerSessionID(ctx)
 	for _, r := range rows {
 		resp.Sessions = append(resp.Sessions, &pb.Session{
-			Id:         r.ID,
+			// The handle, never the id: the id is the session's bearer
+			// secret, and the handle is all RevokeSession needs.
+			Id:         sessionHandle(r.ID),
+			Current:    own != "" && r.ID == own,
 			Username:   r.Username,
 			Realm:      r.Realm,
 			Ip:         r.IP,
@@ -690,7 +698,8 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 //
 // The id may also be an unambiguous prefix of at least sessionIDMinPrefix
 // characters, the short form `lv session ls` shows. The full id is the
-// session's bearer secret, so the CLI never prints it, and without a prefix an
+// session's bearer secret, so nothing returns it (ListSessions gives the
+// 12-character handle, sessionHandle), and without a prefix an
 // admin could not revoke another user's session from what it can see. A
 // prefix resolves only among the sessions the caller may revoke — its own,
 // or every live session for an admin — so a non-admin learns nothing about
@@ -700,27 +709,50 @@ func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "session id required")
 	}
+	// A refused revoke is audited too (by the handle of what was asked for),
+	// so prefix probing and attempts on another user's session are visible.
+	denied := func(target string, err error) (*emptypb.Empty, error) {
+		asked := "session=" + sessionHandle(strings.ToLower(req.Id))
+		if !isHexString(strings.ToLower(req.Id)) {
+			asked = "session=(not a session id)"
+		}
+		s.audit(ctx, "session.revoke", target, asked+" "+status.Convert(err).Message(), "denied")
+		return nil, err
+	}
 	sess, err := corrosion.GetSession(ctx, s.db, req.Id)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
 	}
 	if sess == nil {
 		if sess, err = s.resolveSessionPrefix(ctx, req.Id); err != nil {
-			return nil, err
+			if status.Code(err) == codes.Internal {
+				return nil, err
+			}
+			return denied("", err)
 		}
 	}
 	if sess.Username != callerUsername(ctx) {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, err
+			return denied(sess.Username, err)
 		}
 	}
 	if err := corrosion.RevokeSession(ctx, s.db, sess.ID); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
 	s.kickStreams()
-	slog.Info("session revoked", "id", sess.ID, "username", sess.Username, "by", callerUsername(ctx))
-	s.audit(ctx, "session.revoke", sess.Username, "session="+sess.ID, "ok")
+	// The handle, never the id: the id is a bearer secret and the audit log
+	// is replicated and read by every admin.
+	slog.Info("session revoked", "session", sessionHandle(sess.ID), "username", sess.Username, "by", callerUsername(ctx))
+	s.audit(ctx, "session.revoke", sess.Username, "session="+sessionHandle(sess.ID), "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// sessionHandle is a session's display handle: the first sessionShortLen
+// characters of its id. The id itself is the bearer secret (lvs_<id>), so a
+// handle is what ListSessions returns and what logs and audit rows name;
+// RevokeSession resolves it as a prefix.
+func sessionHandle(id string) string {
+	return id[:min(sessionShortLen, len(id))]
 }
 
 // sessionIDMinPrefix is the shortest id prefix RevokeSession resolves. Ids
@@ -765,7 +797,9 @@ func (s *Server) resolveSessionPrefix(ctx context.Context, prefix string) (*corr
 	case 1:
 		return &rows[0], nil
 	}
-	show := max(sessionShortLen, len(prefix)+4)
+	// Enough to tell the matches apart in the common case, never more than
+	// 16 characters of a secret.
+	show := min(max(sessionShortLen, len(prefix)+4), 16)
 	matches := make([]string, len(rows))
 	for i, r := range rows {
 		matches[i] = fmt.Sprintf("%s… (%s)", r.ID[:min(show, len(r.ID))], r.Username)
@@ -803,7 +837,9 @@ func loginThrottleKey(username, ip string) string {
 	if username == "" {
 		username = "_anon"
 	}
-	return username + "|" + ip
+	// An IPv6 client counts by its /64 (auth.AddressBucket), so rotating
+	// addresses inside one allocation is one bucket.
+	return username + "|" + auth.AddressBucket(ip)
 }
 
 // newSessionID returns a 256-bit random hex string suitable as a session id.

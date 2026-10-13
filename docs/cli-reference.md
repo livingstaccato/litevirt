@@ -24,8 +24,9 @@ lv session ls [--user <name>]          # List active sessions (admin: any user)
 lv session revoke <session-id>         # Revoke a session immediately (the ID ls shows, or any unambiguous prefix of 8+ chars)
 ```
 
-`lv session ls` shows the first 12 characters of each session id; the full id
-is the session's bearer secret and the CLI never prints it. `lv session revoke`
+`lv session ls` shows a 12-character handle for each session (`*` marks your
+current one); the full id is the session's bearer secret and the daemon never
+returns it. `lv session revoke`
 takes that short form: a prefix resolves only among the sessions you may revoke
 (your own; an admin's, anyone's), and one that matches more than one is refused
 with the matches listed.

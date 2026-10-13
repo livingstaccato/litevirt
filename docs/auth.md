@@ -224,10 +224,12 @@ The client address is:
   `trusted_proxies` (below), it is the right-most `X-Forwarded-For` hop that is
   not itself a trusted proxy.
 - for a direct gRPC caller, its own address. A `client_address` it sends is
-  honoured only from a loopback peer. That means this node's own UI and REST
-  gateway, but also any process on the node that holds a cluster certificate.
-  Such a process is trusted for it as it is for everything else: holding a
-  node's certificate on the node is equivalent to root on it.
+  honoured only from a caller presenting a cluster **host** certificate over
+  loopback (the `local-root` identity). That is this node's own UI and REST
+  gateway, which dial with the host certificate; a process that can read a
+  host key on the node is root there anyway. The distributable `lv-cli`
+  certificate, or no certificate, over loopback is an ordinary client: its
+  `client_address` is ignored and it is counted at its own address.
 
 **Behind a reverse proxy**, list the proxy in `trusted_proxies` (CIDRs or
 addresses, default empty). Without it, every browser arrives from the proxy's
@@ -626,8 +628,23 @@ Each session records the client's address (`lv session ls` IP). For a
 login through the web UI or the REST gateway, which reach the daemon over
 loopback, that is the browser's address as the gateway sees it — the TCP peer,
 or from a `trusted_proxies` peer the forwarded client ("OIDC sign-in", the
-client address) — and the login throttle counts failures against the same
-address. It is not 127.0.0.1 unless the browser itself is on the node.
+client address). It is not 127.0.0.1 unless the browser itself is on the node.
+
+Failed logins are throttled per node, in memory:
+
+- **Per account and address: 5 failures** in 15 minutes lock that pair for 15
+  minutes. An IPv6 client counts by its /64. One browser's failures therefore
+  never lock the account for other browsers.
+- **Per account: 30 failures** in 15 minutes, from any mix of addresses, lock
+  the account on that node for 15 minutes (audited as `locked out by the
+  account throttle`). This bounds an attacker who rotates addresses — a botnet,
+  a large address pool — and a success does not reset it. The cost is
+  availability: 30 failures from at least 6 addresses lock the real user out
+  of that node for the lockout.
+- The address is the one above, so an **over-broad `trusted_proxies`** (one
+  that covers the clients themselves, for example `0.0.0.0/0`) lets a client
+  write its own `X-Forwarded-For` and choose its per-address key. The
+  per-account ceiling still holds; list only your proxies.
 
 Both timeouts are configurable in the daemon config under
 `auth.session_idle_timeout` and `auth.session_hard_expiry` (Go duration
@@ -639,8 +656,12 @@ sessions table is small (one row per active login) and reads are an
 indexed primary-key lookup, so the cost is in noise.
 
 `lv session ls` shows your active sessions; `--user <name>` lists
-another user's (admin only). The ID column is the first 12 characters of the
-session id: the whole id is the session's bearer secret, so the CLI never prints it.
+another user's (admin only). `*` marks the session the command ran with. The
+ID column is a 12-character **handle**, the start of the session id: the whole
+id is the session's bearer secret, so neither the API (`ListSessions`, `GET
+/api/v1/sessions`) nor the CLI ever returns it. The daemon sets `current` on
+the caller's own session, so a client never needs to compare its token with a
+listed id (a REST client that did so must use `current` instead).
 `lv session revoke` accepts that short form, or any unambiguous prefix of at
 least 8 characters. A prefix resolves only among the sessions the caller may
 revoke — its own, or anyone's for an admin — so a non-admin's prefix never

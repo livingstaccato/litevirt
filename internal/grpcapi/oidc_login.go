@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -45,7 +44,7 @@ func (s *Server) BeginOIDCLogin(ctx context.Context, req *pb.BeginOIDCLoginReque
 	if !ok {
 		return nil, status.Errorf(codes.InvalidArgument, "realm %q cannot begin an OIDC login", name)
 	}
-	start, err := starter.BeginFlow(req.GetClient(), oidcClientAddress(ctx, req.GetClientAddress()))
+	start, err := starter.BeginFlow(req.GetClient(), s.forwardedClientAddress(ctx, req.GetClientAddress()))
 	switch {
 	case err == nil:
 	case errors.Is(err, auth.ErrOIDCTooManyFlows):
@@ -64,26 +63,31 @@ func (s *Server) BeginOIDCLogin(ctx context.Context, req *pb.BeginOIDCLoginReque
 	}, nil
 }
 
-// oidcClientAddress is the address the per-address bound on in-progress OIDC
-// logins counts against (forwardedClientAddress).
-func oidcClientAddress(ctx context.Context, claimed string) string {
-	return forwardedClientAddress(ctx, claimed)
-}
-
-// forwardedClientAddress is the end client's address for a login: the gRPC
-// peer's, unless the peer is this node's own loopback caller (the web UI or
-// the REST gateway, which reach the daemon over 127.0.0.1 and pass the end
-// client's address — the HTTP peer, or from a trusted_proxies peer the
-// forwarded client, auth.ClientAddress). A remote caller cannot name an
-// address: it is its own. A claim that is not an IP literal is ignored, so
-// nothing but an address reaches a session row, an audit line or a throttle
-// key.
-func forwardedClientAddress(ctx context.Context, claimed string) string {
+// forwardedClientAddress is the end client's address for a login (the
+// session's address, the login throttle's key, the OIDC in-progress bound):
+// the gRPC peer's, unless the caller is this node's own web UI or REST
+// gateway, which reach the daemon over loopback and pass the end client's
+// address (the HTTP peer, or from a trusted_proxies peer the forwarded client,
+// auth.ClientAddress).
+//
+// That caller is recognised by its credential, not only its transport: the UI
+// and the gateway dial with the HOST certificate (pki.ClientTLSConfig on a
+// node), so the caller must classify as local-root — a trusted host CN over
+// loopback, the identity only root on a node holds. The distributable lv-cli
+// certificate, or none, over loopback is an ordinary client: its claim is
+// ignored, or it could choose a fresh throttle key for every guess. A claim
+// that is not an IP literal is ignored too, so nothing but an address reaches
+// a session row, an audit line or a throttle key.
+func (s *Server) forwardedClientAddress(ctx context.Context, claimed string) string {
 	peer := throttleClientIP(ctx)
-	if ip := net.ParseIP(peer); ip != nil && ip.IsLoopback() && claimed != "" {
-		if a, err := netip.ParseAddr(claimed); err == nil {
-			return a.Unmap().String()
-		}
+	if claimed == "" {
+		return peer
+	}
+	if kind, _ := s.classifyBearerlessMTLS(ctx); kind != principalKindLocalRoot {
+		return peer
+	}
+	if a, err := netip.ParseAddr(claimed); err == nil {
+		return a.Unmap().String()
 	}
 	return peer
 }

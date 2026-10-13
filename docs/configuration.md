@@ -54,7 +54,8 @@ ui_allowed_origins: []
 # X-Forwarded-For hop that is not itself a listed proxy; from anyone else,
 # the TCP peer. Used for the per-address bound on in-progress OIDC sign-ins,
 # the address a UI or REST login records on its session, and the login
-# throttle.
+# throttle. List only your proxies: a range that covers the clients lets them
+# write their own X-Forwarded-For and choose their address.
 # Empty (default): no forwarding header is believed. See docs/auth.md,
 # "OIDC sign-in".
 trusted_proxies: []

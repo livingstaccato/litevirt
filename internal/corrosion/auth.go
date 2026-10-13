@@ -346,15 +346,21 @@ func ListSessionsForUser(ctx context.Context, c *Client, username string) ([]Ses
 
 // ListLiveSessionsByIDPrefix returns the sessions not yet revoked whose id
 // begins with prefix (the `lv session ls` short form). The caller decides
-// whose sessions it may act on; this only finds them.
+// whose sessions it may act on; this only finds them. prefix must be lowercase
+// hex, as every id is: the match is a range on the primary key, [prefix,
+// prefix+"g"), since every id starting with prefix sorts below prefix+"g".
 func ListLiveSessionsByIDPrefix(ctx context.Context, c *Client, prefix string) ([]SessionRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT id, username, realm, ip, user_agent, created_at, last_used_at, expires_at
-		 FROM sessions WHERE substr(id, 1, ?) = ? AND revoked_at IS NULL
-		 ORDER BY id`, len(prefix), prefix)
+		 FROM sessions WHERE id >= ? AND id < ? AND revoked_at IS NULL
+		 ORDER BY id`, prefix, prefix+"g")
 	if err != nil {
 		return nil, err
 	}
+	return sessionRecords(rows), nil
+}
+
+func sessionRecords(rows []Row) []SessionRecord {
 	out := make([]SessionRecord, len(rows))
 	for i, r := range rows {
 		out[i] = SessionRecord{
@@ -364,7 +370,7 @@ func ListLiveSessionsByIDPrefix(ctx context.Context, c *Client, prefix string) (
 			ExpiresAt: r.String("expires_at"),
 		}
 	}
-	return out, nil
+	return out
 }
 
 // ────────────────────────────── 2FA ──────────────────────────────

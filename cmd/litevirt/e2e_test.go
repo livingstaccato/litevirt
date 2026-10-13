@@ -71,6 +71,8 @@ type mockClient struct {
 	lastGrantRoleReq *pb.GrantRoleRequest
 	grantRoleResp    *pb.GrantRoleResponse
 	revokedSession   string
+	revokeSessionErr error
+	sessions         []*pb.Session
 }
 
 func newMockClient() *mockClient {
@@ -502,10 +504,13 @@ func (m *mockClient) Logout(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallO
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) ListSessions(_ context.Context, _ *pb.ListSessionsRequest, _ ...grpc.CallOption) (*pb.ListSessionsResponse, error) {
-	return &pb.ListSessionsResponse{}, nil
+	return &pb.ListSessionsResponse{Sessions: m.sessions}, nil
 }
 func (m *mockClient) RevokeSession(_ context.Context, in *pb.RevokeSessionRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	m.revokedSession = in.Id
+	if m.revokeSessionErr != nil {
+		return nil, m.revokeSessionErr
+	}
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) ListTwoFactors(_ context.Context, _ *pb.ListTwoFactorsRequest, _ ...grpc.CallOption) (*pb.ListTwoFactorsResponse, error) {

@@ -1084,10 +1084,11 @@ message LoginRequest       {
     string oidc_binding      = 10;
     // client_address: the end client's address, recorded on the session
     // (ListSessions ip) and keying the login throttle. Honoured only from a
-    // loopback caller (this node's web UI or REST gateway, which pass the
-    // browser's address: the HTTP peer, or from a trusted_proxies peer the
-    // forwarded client); any other caller is recorded by its own address. An
-    // address that is not an IP literal is ignored.
+    // caller presenting a cluster HOST certificate over loopback — this node's
+    // own web UI or REST gateway, which pass the browser's address (the HTTP
+    // peer, or from a trusted_proxies peer the forwarded client). Any other
+    // caller, the distributable lv-cli certificate included, is recorded by its
+    // own address. An address that is not an IP literal is ignored.
     string client_address    = 11;
 }
 message LoginResponse      {
@@ -2193,7 +2194,10 @@ message BindSecurityGroupsRequest {
 }
 
 message Session {
-    string id           = 1;  // opaque session id (the bearer wire token)
+    // id: a display HANDLE, the first 12 characters of the session id — never
+    // the session id itself, which is the bearer secret (lvs_<id>). It is what
+    // RevokeSession takes. A daemon older than this field returned the full id.
+    string id           = 1;
     string username     = 2;
     string realm        = 3;
     string ip           = 4;
@@ -2201,9 +2205,15 @@ message Session {
     string created_at   = 6;
     string last_used_at = 7;
     string expires_at   = 8;
+    // current: this is the session the request was made with. Set by the
+    // daemon, so a client never compares its own bearer with a listed id.
+    bool   current      = 9;
 }
 message ListSessionsRequest  { string username = 1; }  // empty = caller's own
 message ListSessionsResponse { repeated Session sessions = 1; }
+// id: the full session id, or an unambiguous prefix of at least 8 characters
+// (a ListSessions handle). A prefix resolves only among the sessions the caller
+// may revoke: its own, or anyone's for an admin.
 message RevokeSessionRequest { string id = 1; }
 
 // 2FA enrollment & management.

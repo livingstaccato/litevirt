@@ -174,7 +174,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); an NFS export or mount point belongs to one pool", req.Name, what, why)
 	}
-	if err := checkDirPoolNFSHardened(s.dataDir, newRef); err != nil {
+	if err := checkDirPoolNFSHardened(storage.MountTable{}, s.dataDir, newRef); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
 	}
 	// A directory pool on an NFS mount records the export it is on, so a

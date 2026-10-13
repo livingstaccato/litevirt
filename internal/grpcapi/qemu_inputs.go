@@ -737,6 +737,7 @@ func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, proj
 	if err != nil {
 		return dirs, noAnswer
 	}
+	mctx := storage.WithMountTable(ctx)
 	for _, p := range pools {
 		if !isFileBasedDriver(p.Driver) || !tenancy.AdmitAttach(project, p.Project) {
 			continue
@@ -744,7 +745,7 @@ func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, proj
 		ref := StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}
 		// poolUsableForWrite, keeping why: a pool refused because its
 		// checks did not answer is reported.
-		if rerr, _ := s.poolRefusal(ctx, p.Name, ref); rerr != nil {
+		if rerr, _ := s.poolRefusal(mctx, p.Name, ref); rerr != nil {
 			note(rerr)
 			continue
 		}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,7 +10,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -60,73 +58,18 @@ For example:
 On the VM's host itself, or through an SSH tunnel to it, a client can also
 connect directly:
 
-    ssh -L <port>:127.0.0.1:<port> <ssh-user>@<host>
+    ssh -o ExitOnForwardFailure=yes -L <port>:127.0.0.1:<port> <ssh-user>@<host>
     remote-viewer spice://127.0.0.1:<port>
 
 VMs gain SPICE by setting graphics.spice: true in compose.
 `,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			vmName := args[0]
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			return withClient(ctx, func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.GetSpiceInfo(ctx, &pb.GetSpiceInfoRequest{VmName: vmName})
-				if err != nil {
-					return fmt.Errorf("spice info: %w", err)
-				}
-				printSpiceInfo(os.Stdout, vmName, resp, showPassword)
-				if !launch && listen == "" {
-					return nil
-				}
-				var rvPath string
-				if launch {
-					// Before opening anything, so a missing viewer costs nothing.
-					if rvPath, err = exec.LookPath("remote-viewer"); err != nil {
-						return fmt.Errorf("remote-viewer not found in PATH; install virt-viewer, or use --listen with a SPICE client of your own")
-					}
-				}
-				addr := listen
-				if addr == "" {
-					addr = "127.0.0.1:0"
-				}
-				ln, err := listenVNCLoopback(addr)
-				if err != nil {
-					return err
-				}
-				defer ln.Close()
-				if !launch {
-					fmt.Printf("\nSPICE console of %s on spice://%s, carried through litevirt. Ctrl+C to stop.\n", vmName, ln.Addr())
-					return serveSpiceListener(ctx, c, vmName, ln)
-				}
-				vv, err := writeSpiceRelayVV(os.TempDir(), vmName, resp, ln)
-				if err != nil {
-					return err
-				}
-				fmt.Printf("\nLaunching %s on spice://%s, carried through litevirt; this runs until it exits.\n", rvPath, ln.Addr())
-				rv := exec.Command(rvPath, spiceLaunchArgs(vv)...)
-				if err := rv.Start(); err != nil {
-					// remote-viewer never read it, so it never deleted it.
-					_ = os.Remove(vv)
-					return err
-				}
-				// Carry the console while remote-viewer runs: a SPICE client
-				// opens channels throughout its session, not only at start.
-				serveCtx, cancel := context.WithCancel(ctx)
-				defer cancel()
-				waited := make(chan error, 1)
-				go func() {
-					waited <- rv.Wait()
-					cancel()
-				}()
-				if err := serveSpiceListener(serveCtx, c, vmName, ln); err != nil {
-					return err
-				}
-				if ctx.Err() != nil {
-					_ = rv.Process.Kill()
-				}
-				<-waited
-				return nil
+				return runSpice(ctx, c, os.Stdout, args[0],
+					spiceOpts{launch: launch, listen: listen, showPassword: showPassword}, remoteViewer)
 			})
 		},
 	}
@@ -158,6 +101,110 @@ func printSpiceInfo(w io.Writer, vm string, resp *pb.GetSpiceInfoResponse, showP
 	fmt.Fprintf(w, "Open it here with\n  lv spice %s --launch\nor carry it to a local port for a client you start:\n  lv spice %s --listen 127.0.0.1:5930\n", vm, vm)
 }
 
+// spiceOpts are lv spice's flags.
+type spiceOpts struct {
+	launch, showPassword bool
+	listen               string
+}
+
+// viewerProc is a started SPICE viewer.
+type viewerProc interface {
+	Wait() error
+	Kill() error
+}
+
+// spiceViewerLauncher finds and starts the SPICE viewer for --launch; the
+// tests stand in a fake one.
+type spiceViewerLauncher struct {
+	find  func() (string, error)
+	start func(path, vvPath string) (viewerProc, error)
+}
+
+// remoteViewer is virt-viewer's remote-viewer, given the connection file
+// alone as its argv.
+var remoteViewer = spiceViewerLauncher{
+	find: func() (string, error) { return exec.LookPath("remote-viewer") },
+	start: func(path, vvPath string) (viewerProc, error) {
+		cmd := exec.Command(path, spiceLaunchArgs(vvPath)...)
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return execViewer{cmd}, nil
+	},
+}
+
+type execViewer struct{ cmd *exec.Cmd }
+
+func (v execViewer) Wait() error { return v.cmd.Wait() }
+func (v execViewer) Kill() error { return v.cmd.Process.Kill() }
+
+// runSpice is lv spice: print the info, and with --launch or --listen carry
+// the console from a local loopback port through ProxySpice.
+func runSpice(ctx context.Context, c pb.LiteVirtClient, out io.Writer, vmName string, o spiceOpts, viewer spiceViewerLauncher) error {
+	resp, err := c.GetSpiceInfo(ctx, &pb.GetSpiceInfoRequest{VmName: vmName})
+	if err != nil {
+		return fmt.Errorf("spice info: %w", err)
+	}
+	printSpiceInfo(out, vmName, resp, o.showPassword)
+	if !o.launch && o.listen == "" {
+		return nil
+	}
+	var rvPath string
+	if o.launch {
+		// Before opening anything, so a missing viewer costs nothing.
+		if rvPath, err = viewer.find(); err != nil {
+			return fmt.Errorf("remote-viewer not found in PATH; install virt-viewer, or use --listen with a SPICE client of your own")
+		}
+	}
+	addr := o.listen
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
+	ln, err := listenConsoleLoopback(addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	if resp.Password == "" {
+		fmt.Fprintf(out, "\nWarning: this console has no password, so anyone on this machine who connects to %s gets it with your credentials.\n", ln.Addr())
+	}
+	if !o.launch {
+		fmt.Fprintf(out, "\nSPICE console of %s on spice://%s, carried through litevirt. Ctrl+C to stop.\n", vmName, ln.Addr())
+		return serveSpiceListener(ctx, c, vmName, ln)
+	}
+	vv, err := writeSpiceRelayVV(os.TempDir(), vmName, resp, ln)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\nLaunching %s on spice://%s, carried through litevirt; this runs until it exits.\n", rvPath, ln.Addr())
+	rv, err := viewer.start(rvPath, vv)
+	if err != nil {
+		// remote-viewer never read it, so it never deleted it.
+		_ = os.Remove(vv)
+		return err
+	}
+	// Carry the console while remote-viewer runs: a SPICE client opens
+	// channels throughout its session, not only at start.
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waited := make(chan struct{})
+	go func() {
+		_ = rv.Wait()
+		close(waited)
+		cancel()
+	}()
+	serveErr := serveSpiceListener(serveCtx, c, vmName, ln)
+	select {
+	case <-waited:
+	default:
+		// Interrupted, or the local port failed: a viewer left running
+		// would only retry a port nobody serves.
+		_ = rv.Kill()
+		<-waited
+	}
+	return serveErr
+}
+
 // writeSpiceRelayVV writes the connection file for --launch: remote-viewer
 // connects to the local port ln, which litevirt carries to the VM's SPICE
 // listener, never to the host's address (where SPICE does not listen).
@@ -172,31 +219,14 @@ func writeSpiceRelayVV(dir, vm string, resp *pb.GetSpiceInfoResponse, ln net.Lis
 // serveSpiceListener carries each connection on ln — one per SPICE channel —
 // to the VM's SPICE listener through ProxySpice, until ctx ends.
 func serveSpiceListener(ctx context.Context, c pb.LiteVirtClient, vmName string, ln net.Listener) error {
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
+	return serveConsoleListener(ctx, ln, func(ctx context.Context, conn net.Conn) error {
+		return relaySpice(ctx, c, vmName, conn)
+	}, func(err error) {
+		if status.Code(err) == codes.Unimplemented {
+			err = fmt.Errorf("a daemon on the way to the VM's host predates SPICE through litevirt (ProxySpice); upgrade it, or use an SSH tunnel to the host: %w", err)
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := relaySpice(ctx, c, vmName, conn); err != nil {
-				if status.Code(err) == codes.Unimplemented {
-					err = fmt.Errorf("a daemon on the way to the VM's host predates SPICE through litevirt (ProxySpice); upgrade it, or use an SSH tunnel to the host: %w", err)
-				}
-				slog.Warn("spice console connection ended", "vm", vmName, "error", err)
-			}
-		}()
-	}
+		slog.Warn("spice console connection ended", "vm", vmName, "error", err)
+	})
 }
 
 // relaySpice carries one SPICE channel connection over a ProxySpice stream.
@@ -208,44 +238,9 @@ func relaySpice(ctx context.Context, c pb.LiteVirtClient, vmName string, conn ne
 	if err != nil {
 		return err
 	}
-	errCh := make(chan error, 2)
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, rerr := conn.Read(buf)
-			if n > 0 {
-				if serr := st.Send(&pb.SpiceData{Data: append([]byte(nil), buf[:n]...)}); serr != nil {
-					errCh <- serr
-					return
-				}
-			}
-			if rerr != nil {
-				_ = st.CloseSend()
-				if errors.Is(rerr, io.EOF) {
-					rerr = nil
-				}
-				errCh <- rerr
-				return
-			}
-		}
-	}()
-	go func() {
-		for {
-			m, rerr := st.Recv()
-			if rerr != nil {
-				if errors.Is(rerr, io.EOF) {
-					rerr = nil
-				}
-				errCh <- rerr
-				return
-			}
-			if _, werr := conn.Write(m.Data); werr != nil {
-				errCh <- werr
-				return
-			}
-		}
-	}()
-	return <-errCh
+	return relayConsole(conn, st,
+		func(b []byte) *pb.SpiceData { return &pb.SpiceData{Data: b} },
+		(*pb.SpiceData).GetData)
 }
 
 // writeSpiceVV writes a virt-viewer connection file for the console into

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -86,8 +87,8 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	}
 
 	// The console's password, if it has one (docs/ui.md "Console
-	// passwords"). SPICE is not proxied, so the client presents it itself;
-	// this caller passed the vm.console check above on its entry host. Read
+	// passwords"). ProxySpice relays SPICE unchanged, so the client presents
+	// it itself; this caller passed the vm.console check above on its entry host. Read
 	// from the RUNNING domain, and never logged.
 	// A password that cannot be read degrades rather than refuses: the info
 	// goes back without it, and the client prompts.
@@ -170,14 +171,26 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(ctx, func() { _ = conn.Close() })
 
+	user := callerUsername(ctx)
+	slog.Info("SPICE proxy session started", "vm", vmName, "port", port, "user", user)
+	defer slog.Info("SPICE proxy session ended", "vm", vmName, "user", user)
+
 	errCh := make(chan error, 2)
-	// SPICE TCP → gRPC stream.
+	// SPICE TCP → gRPC stream. The only goroutine that Sends; the handler
+	// waits for it (bounded) before returning, so nothing writes to the
+	// stream after the RPC is over.
+	sendDone := make(chan struct{})
+	defer func() {
+		_ = conn.Close() // ends its Read
+		waitRelaySender(sendDone)
+	}()
 	go func() {
+		defer close(sendDone)
 		buf := make([]byte, 32768)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				if sendErr := stream.Send(&pb.SpiceData{Data: buf[:n]}); sendErr != nil {
+				if sendErr := stream.Send(&pb.SpiceData{Data: append([]byte(nil), buf[:n]...)}); sendErr != nil {
 					errCh <- sendErr
 					return
 				}
@@ -229,11 +242,22 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 		return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 	}
 	defer conn.Close()
-	remote, err := client.ProxySpice(metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName)))
+	// The remote leg lives inside this stream's context, so a cut (or this
+	// handler's return) ends it, and the owner then closes its SPICE socket.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	remote, err := client.ProxySpice(metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName)))
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
 	errCh := make(chan error, 2)
+	// remote → incoming is the only goroutine that Sends to the caller; it is
+	// waited for (bounded) once the remote leg is cancelled.
+	sendDone := make(chan struct{})
+	defer func() {
+		cancel()
+		waitRelaySender(sendDone)
+	}()
 	go func() {
 		for {
 			msg, err := incoming.Recv()
@@ -252,6 +276,7 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 		}
 	}()
 	go func() {
+		defer close(sendDone)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {
@@ -273,4 +298,17 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 		return streamEndError(ctx)
 	}
 	return remoteStreamErr(hostName, err)
+}
+
+// relaySenderWait bounds how long a relay handler waits for its sending
+// goroutine after ending its source: a caller that stopped reading can hold
+// a Send in flow control, and the RPC must still end (the interceptor's
+// streamCutGrace covers what is left).
+const relaySenderWait = time.Second
+
+func waitRelaySender(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(relaySenderWait):
+	}
 }

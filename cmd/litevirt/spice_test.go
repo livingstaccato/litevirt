@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,7 +102,7 @@ func TestSpiceInfo_PasswordOnlyWithShowPassword(t *testing.T) {
 func TestSpiceLaunch_ConnectionFilePointsAtTheLocalRelay(t *testing.T) {
 	resp := &pb.GetSpiceInfoResponse{Host: "10.0.0.5", Port: 5930, Uri: "spice://10.0.0.5:5930",
 		Password: "Spice24CharPasswordAbcde"}
-	ln, err := listenVNCLoopback("127.0.0.1:0")
+	ln, err := listenConsoleLoopback("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +171,7 @@ func (c *spiceClientFake) ProxySpice(ctx context.Context, _ ...grpc.CallOption) 
 func TestServeSpiceListener_CarriesAChannelOverProxySpice(t *testing.T) {
 	st := &spiceStreamFake{sent: make(chan []byte, 4), toClient: make(chan []byte, 4)}
 	c := &spiceClientFake{stream: st}
-	ln, err := listenVNCLoopback("127.0.0.1:0")
+	ln, err := listenConsoleLoopback("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,5 +225,183 @@ func TestSpiceInfo_SaysHowToReachTheLoopbackListener(t *testing.T) {
 	}
 	if strings.Contains(b.String(), "spice://10.0.0.5:5930") {
 		t.Errorf("lv spice offers a URI at the host address, where SPICE does not listen:\n%s", b.String())
+	}
+}
+
+// echoSpiceClient answers GetSpiceInfo with resp and gives every ProxySpice
+// call a stream of its own that echoes what it is sent, counting the
+// streams — a SPICE listener behind the daemon, one connection per channel.
+type echoSpiceClient struct {
+	pb.LiteVirtClient
+	resp    *pb.GetSpiceInfoResponse
+	mu      sync.Mutex
+	streams int
+}
+
+func (c *echoSpiceClient) GetSpiceInfo(context.Context, *pb.GetSpiceInfoRequest, ...grpc.CallOption) (*pb.GetSpiceInfoResponse, error) {
+	return c.resp, nil
+}
+
+func (c *echoSpiceClient) ProxySpice(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[pb.SpiceData, pb.SpiceData], error) {
+	c.mu.Lock()
+	c.streams++
+	c.mu.Unlock()
+	return &echoSpiceStream{ctx: ctx, ch: make(chan []byte, 16)}, nil
+}
+
+func (c *echoSpiceClient) opened() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.streams
+}
+
+type echoSpiceStream struct {
+	grpc.ClientStream
+	ctx context.Context
+	ch  chan []byte
+}
+
+func (s *echoSpiceStream) Send(m *pb.SpiceData) error { s.ch <- m.Data; return nil }
+func (s *echoSpiceStream) Recv() (*pb.SpiceData, error) {
+	select {
+	case b := <-s.ch:
+		return &pb.SpiceData{Data: b}, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+func (s *echoSpiceStream) CloseSend() error { return nil }
+
+// fakeViewer reads the connection file it was started with, opens one
+// channel at once and another a while later — as remote-viewer opens
+// channels throughout a session — then exits.
+type fakeViewer struct {
+	vv     string
+	echoes []string
+	errs   []error
+	done   chan struct{}
+	killed bool
+}
+
+func (v *fakeViewer) Wait() error { <-v.done; return nil }
+func (v *fakeViewer) Kill() error { v.killed = true; return nil }
+
+func (v *fakeViewer) run() {
+	defer close(v.done)
+	b, err := os.ReadFile(v.vv)
+	if err != nil {
+		v.errs = append(v.errs, err)
+		return
+	}
+	_ = os.Remove(v.vv) // delete-this-file, as remote-viewer does
+	v.vv = string(b)
+	host, port := "", ""
+	for _, line := range strings.Split(v.vv, "\n") {
+		if h, ok := strings.CutPrefix(line, "host="); ok {
+			host = h
+		}
+		if p, ok := strings.CutPrefix(line, "port="); ok {
+			port = p
+		}
+	}
+	for i, msg := range []string{"main-channel", "display-channel"} {
+		if i > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 2*time.Second)
+		if err != nil {
+			v.errs = append(v.errs, err)
+			continue
+		}
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = conn.Write([]byte(msg))
+		got := make([]byte, len(msg))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			v.errs = append(v.errs, err)
+		} else {
+			v.echoes = append(v.echoes, string(got))
+		}
+		conn.Close()
+	}
+}
+
+// `lv spice --launch` end to end, through runSpice: remote-viewer is handed a
+// file for the LOCAL relay (not the host address), and the relay keeps
+// carrying channels until the viewer exits, not just the first one.
+//
+// Mutation "RunE writes the .vv with resp.Host/resp.Port" — red.
+// Mutation "return right after starting the viewer" — red.
+func TestRunSpice_LaunchCarriesChannelsUntilTheViewerExits(t *testing.T) {
+	c := &echoSpiceClient{resp: &pb.GetSpiceInfoResponse{Host: "192.0.2.10", Port: 5930,
+		Uri: "spice://192.0.2.10:5930", Password: "Spice24CharPasswordAbcde"}}
+	v := &fakeViewer{done: make(chan struct{})}
+	launcher := spiceViewerLauncher{
+		find: func() (string, error) { return "/usr/bin/remote-viewer", nil },
+		start: func(path, vvPath string) (viewerProc, error) {
+			v.vv = vvPath
+			go v.run()
+			return v, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	if err := runSpice(ctx, c, &out, "desk", spiceOpts{launch: true}, launcher); err != nil {
+		t.Fatalf("runSpice --launch: %v\n%s", err, out.String())
+	}
+	<-v.done
+	if !strings.Contains(v.vv, "\nhost=127.0.0.1\n") || !strings.Contains(v.vv, "\npassword=Spice24CharPasswordAbcde\n") {
+		t.Errorf("remote-viewer's connection file does not point at the local relay with the password:\n%s", v.vv)
+	}
+	if len(v.errs) != 0 || len(v.echoes) != 2 {
+		t.Fatalf("the viewer's channels: echoes %q, errors %v; want both channels carried", v.echoes, v.errs)
+	}
+	if n := c.opened(); n != 2 {
+		t.Errorf("ProxySpice opened %d stream(s), want one per channel (2)", n)
+	}
+	if v.killed {
+		t.Error("the viewer was killed although it exited on its own")
+	}
+}
+
+// `lv spice --listen` refuses an address other users could reach, before it
+// opens anything.
+//
+// Mutation "RunE listens with net.Listen" — red.
+func TestRunSpice_ListenRefusesANonLoopbackAddress(t *testing.T) {
+	c := &echoSpiceClient{resp: &pb.GetSpiceInfoResponse{Host: "192.0.2.10", Port: 5930, Password: "p"}}
+	// Bounded, so a --listen that wrongly opens serves only briefly.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	err := runSpice(ctx, c, &out, "desk", spiceOpts{listen: "0.0.0.0:0"}, remoteViewer)
+	if err == nil || !strings.Contains(err.Error(), "not a loopback address") {
+		t.Fatalf("lv spice --listen 0.0.0.0:0: %v, want a refusal", err)
+	}
+	if c.opened() != 0 {
+		t.Errorf("ProxySpice was opened for a refused --listen")
+	}
+}
+
+// A console with no password is open to anyone on this machine who reaches
+// the local port; --listen says so.
+//
+// Mutation "no warning" — red.
+func TestRunSpice_WarnsWhenTheConsoleHasNoPassword(t *testing.T) {
+	c := &echoSpiceClient{resp: &pb.GetSpiceInfoResponse{Host: "192.0.2.10", Port: 5930}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the listener closes at once
+	var out bytes.Buffer
+	if err := runSpice(ctx, c, &out, "desk", spiceOpts{listen: "127.0.0.1:0"}, remoteViewer); err != nil {
+		t.Fatalf("runSpice --listen: %v", err)
+	}
+	if !strings.Contains(out.String(), "no password") {
+		t.Errorf("lv spice --listen on a console with no password does not warn:\n%s", out.String())
+	}
+	c.resp.Password = "p"
+	out.Reset()
+	_ = runSpice(ctx, c, &out, "desk", spiceOpts{listen: "127.0.0.1:0"}, remoteViewer)
+	if strings.Contains(out.String(), "no password") {
+		t.Errorf("a passworded console gets the no-password warning:\n%s", out.String())
 	}
 }

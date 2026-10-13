@@ -24,7 +24,7 @@ func TestSpiceModalAndVV(t *testing.T) {
 		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice-modal")))
 		assertStatus(t, w, http.StatusOK)
 		body := w.Body.String()
-		mustContain(t, body, "lv spice vm1 --launch", "ssh -L 5901:127.0.0.1:5901", "10.0.0.5",
+		mustContain(t, body, "lv spice vm1 --launch", "ssh -o ExitOnForwardFailure=yes -L 5901:127.0.0.1:5901", "10.0.0.5",
 			"spice://127.0.0.1:5901", "/ui/vms/vm1/spice.vv")
 		if strings.Contains(body, "spice://10.0.0.5:5901") {
 			t.Errorf("the modal offers a URI at the host address, where SPICE does not listen:\n%s", body)

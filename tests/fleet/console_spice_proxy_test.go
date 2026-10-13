@@ -17,6 +17,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,9 +34,10 @@ import (
 // 127.0.0.1: every connection gets the greeting, then an echo of what it
 // receives. It counts the connections it accepted.
 type spiceListener struct {
-	ln    net.Listener
-	mu    sync.Mutex
-	conns int
+	ln     net.Listener
+	mu     sync.Mutex
+	conns  int
+	closed int // connections whose far end (the proxy) went away
 }
 
 var spiceGreeting = []byte("REDQ")
@@ -63,6 +65,9 @@ func startSpiceListener(t *testing.T) *spiceListener {
 					return
 				}
 				_, _ = io.Copy(c, c)
+				l.mu.Lock()
+				l.closed++
+				l.mu.Unlock()
 			}()
 		}
 	}()
@@ -70,6 +75,12 @@ func startSpiceListener(t *testing.T) *spiceListener {
 }
 
 func (l *spiceListener) port() int { return l.ln.Addr().(*net.TCPAddr).Port }
+
+func (l *spiceListener) ended() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.closed
+}
 
 func (l *spiceListener) accepted() int {
 	l.mu.Lock()
@@ -181,5 +192,52 @@ func TestFleet_SpiceProxy_StoppedVMRefused(t *testing.T) {
 	eventually(t, 10*time.Second, "ProxySpice for a stopped VM to be refused with FailedPrecondition", func() bool {
 		_, err := spiceChannel(ctx, c, relay, "desk", []byte("x"))
 		return status.Code(err) == codes.FailedPrecondition
+	})
+}
+
+// TestFleet_SpiceProxy_RevokeCutsTheOwnersSocketThroughAPeer: bob opens a
+// SPICE channel entering on relay, for a VM on owner. Revoking bob's session
+// must close the SPICE socket on OWNER — the forwarded leg ends with the
+// entry stream, so no SPICE connection outlives the credential that opened
+// it (docs/auth.md).
+//
+// Mutation "forwarded leg on context.Background(), no select on the cut" — red.
+func TestFleet_SpiceProxy_RevokeCutsTheOwnersSocketThroughAPeer(t *testing.T) {
+	c := consoleCluster(t)
+	relay, owner := c.Nodes[0], c.Nodes[1]
+	createConsoleVM(t, c, relay, "desk", owner.Name, true)
+	l := startSpiceListener(t)
+	owner.Virt.SetSpicePort("desk", l.port())
+	relay.Virt.SetSpicePort("desk", 1)
+	ctx := context.Background()
+	admin := c.SelfClient(relay)
+	if _, err := admin.CreateUser(ctx, &pb.CreateUserRequest{Username: "bob", Password: "bobs-password-0123456789", Role: "operator"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	login, err := admin.Login(ctx, &pb.LoginRequest{Username: "bob", Password: "bobs-password-0123456789"})
+	if err != nil {
+		t.Fatalf("bob's login on %s: %v", relay.Name, err)
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := c.bearerClient(relay, login.Token).ProxySpice(metadata.NewOutgoingContext(sctx, metadata.Pairs("x-vm-name", "desk")))
+	if err != nil {
+		t.Fatalf("ProxySpice as bob: %v", err)
+	}
+	greet := make([]byte, len(spiceGreeting))
+	if _, err := io.ReadFull(&spiceStreamReader{st: st}, greet); err != nil {
+		t.Fatalf("bob's SPICE channel via %s: %v", relay.Name, err)
+	}
+	if l.accepted() != 1 || l.ended() != 0 {
+		t.Fatalf("before the revoke: accepted %d, ended %d; want 1, 0", l.accepted(), l.ended())
+	}
+	id := strings.TrimPrefix(login.Token, "lvs_")
+	if _, err := admin.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: id}); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+	// Inside the interceptor's streamCutGrace (2 s): the handlers must let
+	// go themselves, not wait to have their RPCs ended for them.
+	eventually(t, 1500*time.Millisecond, "the SPICE socket on "+owner.Name+" to close after bob's session was revoked", func() bool {
+		return l.ended() == 1
 	})
 }

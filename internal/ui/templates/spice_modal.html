@@ -19,7 +19,7 @@
       Or use the connection file below on the host itself, or through an SSH tunnel to it:
     </p>
     <div class="form-row">
-      <input type="text" readonly value="ssh -L {{.Port}}:127.0.0.1:{{.Port}} &lt;user&gt;@{{.Host}}" onclick="this.select()" style="width:100%;font-family:monospace">
+      <input type="text" readonly value="ssh -o ExitOnForwardFailure=yes -L {{.Port}}:127.0.0.1:{{.Port}} &lt;user&gt;@{{.Host}}" onclick="this.select()" style="width:100%;font-family:monospace">
     </div>
     <div class="form-row">
       <label>Connection URI (at the tunnel's end)</label>

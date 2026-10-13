@@ -237,13 +237,17 @@ client can reach it at the host's address. There are two ways in:
   Ctrl+C; the address must be a loopback one. Each channel is authorized as
   you (`vm.console` on the VM) and ends when your session does. Unlike `lv
   vnc --listen`, a local user who connects to that port still needs the
-  console's password.
+  console's password, when the console has one. A console with no password
+  (console passwords not in force, or one that could not be read) is open
+  to anyone on your machine who reaches that port, with your credentials, as
+  with `lv vnc --listen`; `lv spice` warns when that is the case.
 - **Directly**, on the VM's host or through an SSH tunnel to its loopback.
-  The modal shows the tunnel command, and its **Download .vv** button gives
+  The modal shows the tunnel command (with `ExitOnForwardFailure=yes`, so
+  ssh stops rather than run on when the local port is already taken), and its **Download .vv** button gives
   a virt-viewer connection file for `127.0.0.1:<port>`, carrying the
   password, that `remote-viewer`/`virt-viewer` opens at the tunnel's end:
 
-      ssh -L <port>:127.0.0.1:<port> <user>@<host>
+      ssh -o ExitOnForwardFailure=yes -L <port>:127.0.0.1:<port> <user>@<host>
       remote-viewer <vm>.vv     # or spice://127.0.0.1:<port>, with the password
 
   Opened on a machine with no such tunnel, the file connects to whatever

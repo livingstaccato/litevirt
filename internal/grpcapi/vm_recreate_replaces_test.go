@@ -397,3 +397,143 @@ func TestReportDeletedVM_InProcessTakesOnlyItsOwnIncarnation(t *testing.T) {
 		t.Fatalf("the deleted row of its own incarnation was not taken: %+v", sink.snap)
 	}
 }
+
+// rowMD is the incoming metadata a peer hands over for an inline compose
+// re-create: the row it deleted, under replacedRowMD (withReplacedRow).
+func rowMD(ctx context.Context, deleted *corrosion.VMRecord, createdAt string) context.Context {
+	b, _ := json.Marshal(map[string]any{
+		"name": deleted.Name, "created_at": createdAt,
+		"host_name": deleted.HostName, "owner_epoch": deleted.OwnerEpoch,
+		"spec_generation": deleted.SpecGeneration, "identity_hash": corrosion.VMIdentityHash(*deleted),
+	})
+	return metadata.NewIncomingContext(ctx, metadata.Pairs(replacedRowMD, string(b)))
+}
+
+// An inline compose re-create names the row it deleted for its create's
+// existence check only (lab 1, 2026-10-13, F1). That exact row is settled —
+// in-process on the entry node, and on the host a peer forwards to — and the
+// create goes ahead.
+//
+// Mutation: settleReplacedVM reading replacedVMFor (full markers only) —
+// AlreadyExists, red.
+func TestReplacedRow_TheRowItDeletedIsSettled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context
+	}{
+		{"in process", func(_ *testing.T, _ *Server, old *corrosion.VMRecord) context.Context {
+			return withReplacedRow(adminCtx(), old)
+		}},
+		{"from a peer", func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context {
+			return rowMD(peerHostCtx(t, s, "host-a"), old, old.CreatedAt)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			old := staleReplacedRow(t, s, "vm1")
+			if _, err := s.CreateVM(tc.ctx(t, s, old), disklessCreateRequest("vm1")); err != nil {
+				t.Fatalf("an inline re-create naming the row it deleted, stale here: %v", err)
+			}
+			if rec := vmRecord(t, s, "vm1"); rec.CreatedAt == old.CreatedAt {
+				t.Fatalf("after the re-create: still the old incarnation %s", rec.CreatedAt)
+			}
+		})
+	}
+}
+
+// The bypass is exact: a live row of another VM of the same name — another
+// incarnation, or the same one moved past what the delete saw — is not the
+// row the inline re-create deleted. It is refused AlreadyExists and left as
+// it is, in process and from a peer.
+//
+// Mutation: match on the name alone in settleReplacedVM (drop the Covers
+// check) — red.
+func TestReplacedRow_AnotherVMOfTheSameNameIsStillRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T, s *Server, deleted *corrosion.VMRecord) context.Context
+	}{
+		{"in process", func(_ *testing.T, _ *Server, deleted *corrosion.VMRecord) context.Context {
+			return withReplacedRow(adminCtx(), deleted)
+		}},
+		{"from a peer", func(t *testing.T, s *Server, deleted *corrosion.VMRecord) context.Context {
+			return rowMD(peerHostCtx(t, s, "host-a"), deleted, deleted.CreatedAt)
+		}},
+	} {
+		for _, other := range []struct {
+			name string
+			move func(deleted *corrosion.VMRecord)
+		}{
+			{"another incarnation", func(d *corrosion.VMRecord) { d.CreatedAt = "2001-01-01T00:00:00.000000001Z" }},
+			{"another identity", func(d *corrosion.VMRecord) {
+				d.Spec = `{"name":"vm1","uuid":"ffffffff-7d2f-4c55-9a1b-5e6f7a8b9c0d"}`
+			}},
+			{"on another host", func(d *corrosion.VMRecord) { d.HostName = "host-z" }},
+		} {
+			t.Run(tc.name+"/"+other.name, func(t *testing.T) {
+				s, _ := provableCreateServer(t)
+				live := staleReplacedRow(t, s, "vm1")
+				deleted := *live
+				other.move(&deleted)
+				if _, err := s.CreateVM(tc.ctx(t, s, &deleted), disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+					t.Fatalf("an inline re-create over a different VM of the same name: got %v, want AlreadyExists", err)
+				}
+				if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != live.CreatedAt || rec.HostName != live.HostName {
+					t.Fatalf("the other vm1 changed: %+v, was %+v", rec, live)
+				}
+			})
+		}
+	}
+}
+
+// A row-only marker is not a re-create: the NIC guard admission and the LUN
+// takeover, which read replacedVMFor, treat the create as new; and a forward
+// hands it over under its own key only, which an older build ignores.
+func TestReplacedRow_IsNotAReCreate(t *testing.T) {
+	vm := &corrosion.VMRecord{Name: "vm1", HostName: "host-a", CreatedAt: "2026-10-13T00:00:00Z",
+		Spec: `{"name":"vm1","uuid":"0b9a3c1e-7d2f-4c55-9a1b-5e6f7a8b9c0d"}`}
+	ctx := withReplacedRow(context.Background(), vm)
+	if _, ok := replacedVMFor(ctx, "vm1"); ok {
+		t.Fatal("replacedVMFor returned a row-only marker: the create would be judged a re-create")
+	}
+	if _, ok := replacedRowFor(ctx, "vm1"); !ok {
+		t.Fatal("replacedRowFor did not return the row-only marker")
+	}
+	md, _ := metadata.FromOutgoingContext(withReplacedVMMD(ctx, "vm1"))
+	if len(md.Get(replacedVMMD)) != 0 || len(md.Get(replacedRowMD)) != 1 {
+		t.Fatalf("forwarded metadata %v: want the row under %s only", md, replacedRowMD)
+	}
+}
+
+// The row key is a peer host's word, and alone: a client (an Admin included)
+// sending it, or a peer sending it beside the full key, names nothing. The
+// create is refused AlreadyExists and the live row is left as it is.
+//
+// Mutations: move the peer-cert check into the full-key branch — "from a
+// client" red; drop the both-keys refusal — "both keys" red.
+func TestReplacedRow_OnlyAPeerAloneNamesOne(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context
+	}{
+		{"from a client", func(_ *testing.T, _ *Server, old *corrosion.VMRecord) context.Context {
+			return rowMD(adminCtx(), old, old.CreatedAt)
+		}},
+		{"both keys", func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context {
+			full, _ := metadata.FromIncomingContext(replacesMD(context.Background(), old, old.CreatedAt))
+			row, _ := metadata.FromIncomingContext(rowMD(context.Background(), old, old.CreatedAt))
+			return metadata.NewIncomingContext(peerHostCtx(t, s, "host-a"), metadata.Join(full, row))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			old := staleReplacedRow(t, s, "vm1")
+			if _, err := s.CreateVM(tc.ctx(t, s, old), disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+				t.Fatalf("a create naming the live row as replaced: got %v, want AlreadyExists", err)
+			}
+			if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != old.CreatedAt || rec.HostName != old.HostName {
+				t.Fatalf("the live vm1 changed: %+v, was %+v", rec, old)
+			}
+		})
+	}
+}

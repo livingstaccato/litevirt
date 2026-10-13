@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // spiceReporter is the backend's answer to whether SPICE can connect on this
@@ -46,7 +47,11 @@ func (s *Server) spiceUnusable() string {
 // way ProxyVNC presents a VNC one), so the response carries the console's
 // password (docs/ui.md "Console passwords") for the client to present — to
 // a caller that passed vm.console, and never logged.
-func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (*pb.GetSpiceInfoResponse, error) {
+func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (resp *pb.GetSpiceInfoResponse, err error) {
+	// It hands out the console's password: every call, refused or not, is
+	// audited (console_audit.go), without the password.
+	owner, request := "", ""
+	defer func() { s.auditConsoleCredential(ctx, req.GetVmName(), owner, request, resp.GetPassword() != "", err) }()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -58,6 +63,7 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
 	}
+	owner = vm.HostName
 	// SPICE is interactive console/graphics access to the guest; require
 	// vm.console on the VM's tenancy project, checked on the entry host where
 	// the caller identity is present (before any forward to the owning host).
@@ -77,7 +83,10 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", vm.HostName, err)
 		}
 		defer conn.Close()
-		return client.GetSpiceInfo(ctx, req)
+		// The VM's host records the call too, under this host; the id joins
+		// its row to this one.
+		request = randid.New()
+		return client.GetSpiceInfo(metadata.AppendToOutgoingContext(ctx, consoleAuditSessionMD, request), req)
 	}
 
 	port, err := s.virt.GetVMSpicePort(req.VmName)
@@ -127,24 +136,30 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 // both still stand. Each stream is authorized as its caller (vm.console on
 // the VM) on the entry host, and is closed when the caller's credential is
 // cut (registerStreamCloser), like a VNC console.
-func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.SpiceData]) error {
-	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
-		return err
-	}
+func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.SpiceData]) (err error) {
 	md, _ := metadataFromStream(stream)
 	vmName := ""
 	if vals := md.Get("x-vm-name"); len(vals) > 0 {
 		vmName = vals[0]
 	}
+	ctx := stream.Context()
+	// Every open, refused or not, is audited; a client's channels are one
+	// session (console_audit.go).
+	ca := s.beginConsoleAudit(ctx, consoleKindSPICE, vmName)
+	defer func() { ca.end(err) }()
+
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return err
+	}
 	if vmName == "" {
 		return status.Error(codes.InvalidArgument, "x-vm-name metadata required")
 	}
-	ctx := stream.Context()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
 	}
+	ca.setOwner(vm.HostName)
 	// Interactive access to the guest: vm.console on THIS VM, checked on the
 	// entry host where the caller's identity is present.
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.console", "operator"); err != nil {
@@ -156,7 +171,7 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 	}
 
 	if vm.HostName != s.hostName {
-		return s.forwardSpice(stream, vmName, vm.HostName)
+		return s.forwardSpice(stream, vmName, vm.HostName, ca)
 	}
 
 	port, err := s.virt.GetVMSpicePort(vmName)
@@ -173,6 +188,7 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 
 	who := consoleCallerAttrs(ctx)
 	slog.Info("SPICE proxy session started", append([]any{"vm", vmName, "port", port}, who...)...)
+	ca.accept(stream)
 	defer slog.Info("SPICE proxy session ended", append([]any{"vm", vmName}, who...)...)
 
 	errCh := make(chan error, 2)
@@ -235,7 +251,7 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 }
 
 // forwardSpice relays a ProxySpice stream to the daemon that owns the VM.
-func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb.SpiceData], vmName, hostName string) error {
+func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb.SpiceData], vmName, hostName string, ca *consoleAudit) error {
 	ctx := incoming.Context()
 	client, conn, err := s.peerClient(ctx, hostName)
 	if err != nil {
@@ -243,11 +259,12 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 	}
 	defer conn.Close()
 	defer logForwardedConsole(ctx, "SPICE", vmName, hostName)()
+	session := ca.attach()
 	// The remote leg lives inside this stream's context, so a cut (or this
 	// handler's return) ends it, and the owner then closes its SPICE socket.
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	remote, err := client.ProxySpice(metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName)))
+	remote, err := client.ProxySpice(metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session)))
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
@@ -278,6 +295,8 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 	}()
 	go func() {
 		defer close(sendDone)
+		// The session is open here only once the VM's host has accepted it.
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

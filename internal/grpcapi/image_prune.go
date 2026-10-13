@@ -1116,16 +1116,63 @@ func (s *Server) PruneImages(ctx context.Context, req *pb.PruneImagesRequest) (*
 		}
 		defer conn.Close()
 		if err := probePruneVersion(ctx, client, req); err != nil {
+			s.auditPrune(ctx, req, nil, err)
 			return nil, err
 		}
-		return client.PruneImages(ctx, req)
+		resp, err := client.PruneImages(ctx, req)
+		s.auditPrune(ctx, req, resp, err)
+		return resp, err
 	}
 	out, err := s.pruneImages(ctx, req.Name, req.DryRun, req.DeletedImage, req.Version)
+	resp := &pb.PruneImagesResponse{HostName: s.hostName, Removed: out.removed, FreedBytes: out.freed,
+		Kept: out.kept, RemovesDeletedImages: true, Version: req.Version}
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "prune images: %v", err)
+		err = status.Errorf(codes.Unavailable, "prune images: %v", err)
+		resp = nil
 	}
-	return &pb.PruneImagesResponse{HostName: s.hostName, Removed: out.removed, FreedBytes: out.freed,
-		Kept: out.kept, RemovesDeletedImages: true, Version: req.Version}, nil
+	// A peer forwarding the call writes the row itself, as its caller: here
+	// the caller is that peer's identity, not the operator.
+	if callerPrincipalKind(ctx) != principalKindPeer {
+		s.auditPrune(ctx, req, resp, err)
+	}
+	return resp, err
+}
+
+// auditPrune records a prune that removes, on the node the operator called,
+// as that operator (review round 2, R-1): image.prune_version for --version,
+// which removes a file on the operator's word that no other host's disk is
+// built on it, and image.prune for a prune that removed files. A dry run, a
+// prune that removed nothing, and lv image rm's per-host part (deleted_image,
+// audited by its own catalog delete) write no row.
+func (s *Server) auditPrune(ctx context.Context, req *pb.PruneImagesRequest, resp *pb.PruneImagesResponse, err error) {
+	if req.DryRun || req.DeletedImage {
+		return
+	}
+	host := req.HostName
+	if host == "" {
+		host = s.hostName
+	}
+	action := "image.prune"
+	if req.Version != "" {
+		action = "image.prune_version"
+	}
+	target := "images"
+	if req.Name != "" {
+		target = "images/" + req.Name
+	}
+	switch {
+	case err != nil:
+		s.audit(ctx, action, target, fmt.Sprintf("host=%s version=%s: %v", host, req.Version, err), "error")
+	case len(resp.GetRemoved()) > 0:
+		s.audit(ctx, action, target, fmt.Sprintf("host=%s version=%s removed=%s bytes=%d",
+			host, req.Version, strings.Join(resp.GetRemoved(), ","), resp.GetFreedBytes()), "success")
+	case req.Version != "":
+		var why []string
+		for _, k := range resp.GetKept() {
+			why = append(why, k.Path+": "+k.Reason)
+		}
+		s.audit(ctx, action, target, fmt.Sprintf("host=%s version=%s kept: %s", host, req.Version, strings.Join(why, "; ")), "kept")
+	}
 }
 
 // probePruneVersion makes sure the host serving client honours a prune of

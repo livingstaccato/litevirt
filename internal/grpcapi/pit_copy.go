@@ -932,18 +932,20 @@ func (s *Server) settleKeptPITOverlays(ctx context.Context, vm *corrosion.VMReco
 		if d.Path == "" {
 			continue
 		}
-		// Only a kept disk is settled, so only a kept disk is looked at: a
-		// disk the delete removes (with its overlay) is not refused for
-		// storage that does not answer here (review round 1, M-3).
+		// Only a kept disk is settled. Whether a disk is kept is asked only
+		// when the answer matters — its overlay is there, or the look did
+		// not answer — since asking reads every disk header on the host
+		// (review round 2, R-3). A disk the delete removes, overlay and all,
+		// is not refused for an overlay check that does not answer (M-3).
+		present, perr := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
+		if perr == nil && !present {
+			continue
+		}
 		if !keepAll && d.DeleteWithVM && !s.diskPathReferencedByOtherVM(ctx, vm.Name, d) {
 			continue
 		}
-		present, err := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
-		if err != nil {
-			return pitNoAnswer(vm, d, err)
-		}
-		if !present {
-			continue
+		if perr != nil {
+			return pitNoAnswer(vm, d, perr)
 		}
 		if err := s.healPITOverlay(ctx, vm, d); err != nil {
 			if _, ok := status.FromError(err); ok {

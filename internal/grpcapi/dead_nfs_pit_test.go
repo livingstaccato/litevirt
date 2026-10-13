@@ -234,6 +234,42 @@ func TestSettleKeptPITOverlays_ADiskTheDeleteRemovesIsNotLookedAt(t *testing.T) 
 	}
 }
 
+// The common delete — no overlay beside its disk — does not ask whether the
+// disk is kept: that reads the header chain of every VM disk on the host
+// (review round 2, R-3).
+//
+// Mutation "ask whether it is kept before looking for the overlay" — the
+// other VM's header is read: red.
+func TestSettleKeptPITOverlays_NoOverlayReadsNoOtherHeader(t *testing.T) {
+	f := newStartChainFixture(t) // bvm's disk is in the global pool
+	disk := filepath.Join(f.pa, "plain-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	vm := f.insertVM(t, "plain", "a", disk, "pa", "")
+	if err := f.s.db.Execute(context.Background(), `UPDATE vm_disks SET delete_with_vm = 1 WHERE vm_name = 'plain'`); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var read []string
+	prev := chainStat
+	chainStat = func(p string) (os.FileInfo, error) {
+		mu.Lock()
+		read = append(read, p)
+		mu.Unlock()
+		return prev(p)
+	}
+	t.Cleanup(func() { chainStat = prev })
+	if err := f.s.settleKeptPITOverlays(context.Background(), vm, false); err != nil {
+		t.Fatalf("settle kept overlays: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(read) != 0 {
+		t.Fatalf("a delete with no overlay read disk headers: %v", read)
+	}
+}
+
 // The start path's other unbounded look at a pool directory (round 3's
 // residual): a VM whose installer ISO is in a library on a dead mount. The
 // ISO's judgement is bounded like the disk checks, and its no-answer is

@@ -48,6 +48,24 @@ func (c *Client) deferAfterCommit(tx *sql.Tx, fn func()) {
 	c.txEffectsMu.Unlock()
 }
 
+// deferredMark is how many effects tx has registered so far, for a caller
+// that may roll part of tx back to a savepoint (truncateDeferred).
+func (c *Client) deferredMark(tx *sql.Tx) int {
+	c.txEffectsMu.Lock()
+	defer c.txEffectsMu.Unlock()
+	return len(c.txEffects[tx])
+}
+
+// truncateDeferred drops the effects tx registered after mark: the work that
+// registered them was rolled back to a savepoint.
+func (c *Client) truncateDeferred(tx *sql.Tx, mark int) {
+	c.txEffectsMu.Lock()
+	defer c.txEffectsMu.Unlock()
+	if fns := c.txEffects[tx]; mark < len(fns) {
+		c.txEffects[tx] = fns[:mark]
+	}
+}
+
 // runDeferredEffects runs and removes every effect registered for tx — call it right AFTER a
 // successful tx.Commit(). Ordering is registration order.
 func (c *Client) runDeferredEffects(tx *sql.Tx) {

@@ -321,20 +321,31 @@ behind a token:
 
 - **The origin re-uses the deleted row's id.** `InsertSnapshot` and
   `InsertContainerSnapshot` take the id of the row already held under the
-  natural key, and when that row is a tombstone they add the existing
-  per-row-LWW delete shape with a NULL `deleted_at`, stamped after the insert.
-  Every released receiver already applies both statements, so a mixed fleet
-  receives the re-create as an ordinary newer write to the same row.
-- **A receiver lets a strictly older tombstone yield.** On the WAL and on
-  anti-entropy, when the only row holding an incoming row's natural key under a
-  *different* id is a tombstone whose `updated_at` is strictly older, the
-  tombstone is removed so the incoming row can take the name. A live row never
-  yields (two live rows under one name stay `canonical_identity`'s decision),
-  nor does a tombstone as new as the incoming row, one a child references, or
-  one an incoming future-skewed clock would otherwise displace. Anti-entropy
-  also skips an incoming tombstone strictly older than the different-id row
-  held here, so a peer still holding the old incarnation does not bring it
-  back. Logged at INFO as `a deleted row yielded its name to a newer row`.
+  natural key (a caller-supplied id is used only when no row holds the name),
+  and when that row is a tombstone they add the existing per-row-LWW delete
+  shape with a NULL `deleted_at`, stamped after the insert. The lookup and the
+  write are one guarded transaction. Every released receiver already applies
+  both statements, so a mixed fleet receives the re-create as an ordinary
+  newer write to the same row.
+- **A receiver decides a collision with a tombstone.** On the WAL and on
+  anti-entropy, when an incoming row's natural key is held here by a row with
+  a *different* id and at least one of the two is a tombstone:
+
+  | here | incoming | outcome |
+  |---|---|---|
+  | tombstone | strictly newer row | the tombstone yields: removed, the incoming row applies |
+  | tombstone | older or equal-time live row | the incoming row is skipped: a newer delete of the name supersedes it (a delete wins an exact tie) |
+  | tombstone | tombstone | the newer stays; an exact tie keeps the smaller id, so every node converges |
+  | live row | older tombstone | the incoming tombstone is stale and is skipped |
+
+  Two live rows under one name are `canonical_identity`'s decision and are
+  never touched. A yield is refused — the apply then proceeds as before — when
+  a child row references the tombstone, when the incoming id is already bound
+  to another name, or when the incoming clock is future-skewed with the skew
+  guard on. The yield and the incoming row's apply share a savepoint: if the
+  incoming row does not land, the tombstone is put back. Logged at INFO as
+  `a deleted row yielded its name to a newer row` or `skipped a row a newer
+  delete of its name supersedes`.
 
 This is what un-wedges a stream that already carries a fresh-id re-create: the
 entry is still in the sender's log, and an upgraded receiver applies it on the
@@ -1409,29 +1420,45 @@ recovered, then back on. See
 
 ### A received change this node cannot apply (`replication_entry_parked`)
 
-A received replicated change that a constraint here refuses — most often a
-`UNIQUE` natural key held by a different row — used to roll back the whole
-push, so the sender retried it forever and every later write from that sender
-waited behind it. The node now **holds** such a change instead, when every
-statement in it is an unguarded last-writer-wins row write to a table
-anti-entropy repairs (guarded workload and operation writes, append-only logs,
-retention deletes and the `users`/`hosts` writes with apply-side absorbs still
-back-pressure):
+A received replicated change that a constraint here refuses used to roll back
+the whole push, so the sender retried it forever and every later write from
+that sender waited behind it. For the natural-key identity tables —
+`snapshots` and `container_snapshots`, the only replicated tables whose rows
+carry a random id beside a `UNIQUE` name — the node now **holds** such a change
+instead, when every statement in it is an unguarded last-writer-wins row
+write to one of those tables. A refusal on any other table, or of any other
+kind, back-pressures as before; no table is holdable unless it is on that
+list.
 
-- the rest of the push applies and is acknowledged, so the sender's stream
-  keeps moving; the held change is recorded seen, and a relay forwards it as it
-  forwards any entry;
-- nothing is overwritten to make room for it: the conflicting row here is left
-  exactly as it is;
-- it is retried automatically — after later pushes and every 30 seconds — and
-  applies as soon as the conflict is gone. Each statement is decided by its
-  row's own clock, so applying it late reaches the state applying it in order
-  would have;
-- the sender keeps the row, and anti-entropy keeps offering it, so a daemon
-  restart (which forgets what is held) leaves the same repair path rather than
-  a loss;
-- at most 256 changes are held per node; past that a refusal back-pressures as
-  before.
+- The held entry is rolled back on its own and the rest of the push applies
+  once and is acknowledged, so the sender's stream keeps moving. The held
+  change is recorded seen, and a relay forwards it as it forwards any entry.
+- Nothing is overwritten to make room for it: the conflicting row here is
+  left exactly as it is.
+- It is retried automatically — after later pushes and every 30 seconds — and
+  applies as soon as the conflict is gone.
+- At most 256 changes are held per node; past that a refusal back-pressures
+  as before.
+
+Its limits:
+
+- **Applying late is not always applying in order.** A later update of the
+  held row from the same sender waits for the row only ten minutes, and not
+  across a restart. Past that, anti-entropy carries the sender's newest row,
+  which is what repairs it.
+- **A delete by name reaches this node's own row.** While a held change
+  conflicts with a different-id row here, a later delete of that name from the
+  sender applies to the row that holds the name *here*. It is tombstoned, not
+  destroyed — any local overlay or vmstate file stays on disk, unreferenced —
+  which is the existing meaning of a by-name statement. Once both rows are
+  tombstones the collision rules above settle them, and the held change
+  releases.
+- **A restart forgets the held entry, not the condition.** The sender keeps
+  offering its row to anti-entropy, and every pass that refuses an identity
+  table's row re-raises the same signal under that row (it clears when the row
+  applies or is superseded, or when no pass has re-raised it for ten minutes).
+  A restart therefore does not turn the alert green while the row is still
+  divergent; expect the signal back within one anti-entropy pass.
 
 What an operator sees:
 
@@ -1439,10 +1466,13 @@ What an operator sees:
   of the sender's stream continues`, naming the sender, sequence, table, SQL
   and failure; a WARN at most every five minutes per change while it still
   cannot apply; and an INFO line when it finally applies;
-- `litevirt_replication_parked_entries{origin}`, the count held per sender;
+- `litevirt_replication_parked_entries{origin}`, the count held per sender
+  (held entries and anti-entropy refusals of identity-table rows, each row
+  once);
 - `litevirt_ha_degraded{reason="replication_entry_parked"}` and an
   `ha.degraded` event whose detail names the oldest held changes;
-- `litevirt_merge_apply_rejected_total{path="wal",reason="held"}` per table.
+- `litevirt_merge_apply_rejected_total{path="wal",reason="held"}` per table
+  (counted when the change is held; the retries are not counted).
 
 A held change means the row it writes has not changed on this node yet. Look
 at the table in `lv doctor divergence` and resolve the conflict the failure

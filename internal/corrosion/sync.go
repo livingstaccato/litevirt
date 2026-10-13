@@ -1142,32 +1142,51 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			for i, j := range yieldNatIdx {
 				natVals[i] = row[j]
 			}
-			incomingID, incomingTS := coerceString(row[yieldIDIdx]), coerceString(row[yieldTSIdx])
-			if cellNonEmpty(row[yieldDelIdx]) {
-				stale, sErr := staleIncomingIdentityTombstone(tx, table.Name, natVals, incomingID, incomingTS)
-				if sErr != nil {
+			in := identityIncoming{
+				table: table.Name, natVals: natVals,
+				id: coerceString(row[yieldIDIdx]), ts: coerceString(row[yieldTSIdx]),
+				deleted: cellNonEmpty(row[yieldDelIdx]), skewGuard: skewGuardOn, now: skewNow,
+			}
+			decision, localID, dErr := decideIdentityCollision(tx, in)
+			if dErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, dErr
+			}
+			key, tbl := pkKey(natVals), table.Name
+			switch decision {
+			case collisionSkipIncoming:
+				skipped++
+				c.deferAfterCommit(tx, func() { c.clearHeldRefusal(tbl, in.id) })
+				continue
+			case collisionYieldLocal:
+				landed, yErr := c.yieldThenApply(tx, table.Name, localID, func() (bool, error) {
+					if identityOn {
+						return c.mergeIdentityRow(tx, table, row, insertSQL, identityIDIdx, updatedAtIdx, identityNatIdx, identityParentIdx, skewGuardOn, skewNow)
+					}
+					rejected, err := c.applyMergeRow(tx, insertSQL, row, table.Name)
+					return !rejected, err
+				})
+				if yErr != nil {
 					_ = tx.Rollback()
-					return merged, skipped, sErr
+					return merged, skipped, yErr
 				}
-				if stale {
+				if !landed {
 					skipped++
+					if !identityOn {
+						origin := identityRowOrigin(table, row)
+						c.deferAfterCommit(tx, func() {
+							c.noteHeldRefusal(tbl, in.id, origin, "refused after the local tombstone would have yielded; the tombstone was kept")
+						})
+					}
 					continue
 				}
-			}
-			skewed := func(localTS string) bool {
-				return c.skewQuarantinesIncoming(skewGuardOn, localTS, incomingTS, skewNow)
-			}
-			yielded, yErr := yieldStaleIdentityTombstone(tx, table.Name, natVals, incomingID, incomingTS, skewed)
-			if yErr != nil {
-				_ = tx.Rollback()
-				return merged, skipped, yErr
-			}
-			if yielded {
-				key, tbl := pkKey(natVals), table.Name
+				merged++
 				c.deferAfterCommit(tx, func() {
+					c.clearHeldRefusal(tbl, in.id)
 					slog.Info("anti-entropy: a deleted row yielded its name to a newer row",
-						"table", tbl, "natural_key", key, "id", incomingID, "path", "ae")
+						"table", tbl, "natural_key", key, "id", in.id, "path", "ae")
 				})
+				continue
 			}
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
@@ -1247,16 +1266,27 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				}
 			}
 		}
-		rejected, execErr := c.applyMergeRow(tx, insertSQL, row, table.Name)
+		rejectErr, execErr := c.applyMergeRowDetail(tx, insertSQL, row, table.Name)
 		if execErr != nil {
 			_ = tx.Rollback()
 			return merged, skipped, execErr
 		}
-		if rejected {
+		if rejectErr != nil {
 			skipped++
+			// A row of a natural-key identity table refused here is a change this
+			// node has not taken: raise the held signal from this refusal, so it
+			// is re-derived on every pass and survives a restart (held_refusals.go).
+			if yieldIDIdx >= 0 {
+				id, origin, msg, tbl := coerceString(row[yieldIDIdx]), identityRowOrigin(table, row), rejectErr.Error(), table.Name
+				c.deferAfterCommit(tx, func() { c.noteHeldRefusal(tbl, id, origin, msg) })
+			}
 			continue
 		}
 		merged++
+		if yieldIDIdx >= 0 {
+			id, tbl := coerceString(row[yieldIDIdx]), table.Name
+			c.deferAfterCommit(tx, func() { c.clearHeldRefusal(tbl, id) })
+		}
 		// Applying a strictly-newer or resolver-chosen incoming row replaces
 		// the local value, so any unresolved tie tracked for this PK is now
 		// stale (this IS the repair path — e.g. repair-owner re-stamping with
@@ -1432,15 +1462,31 @@ func (c *Client) mergeIdentityRow(tx *sql.Tx, table syncTable, row []interface{}
 // returned so the caller rolls back the whole chunk and propagates it, rather than committing
 // a partial chunk and silently dropping the error.
 func (c *Client) applyMergeRow(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejected bool, err error) {
+	rejectErr, err := c.applyMergeRowDetail(tx, insertSQL, row, table)
+	return rejectErr != nil, err
+}
+
+// applyMergeRowDetail is applyMergeRow reporting the constraint that refused
+// the row (rejectErr), for a caller that surfaces it.
+func (c *Client) applyMergeRowDetail(tx *sql.Tx, insertSQL string, row []interface{}, table string) (rejectErr, err error) {
 	if _, execErr := tx.Exec(insertSQL, row...); execErr != nil {
 		if class, kind := classifySQLiteError(execErr); class == classConstraint {
 			slog.Warn("sync: merge row rejected by constraint (keeping local)", "table", table, "error", execErr)
 			c.observeMergeRejected(boundedTableLabel(table), "ae", string(kind)) // unique / not_null / check / foreign_key / constraint
-			return true, nil
+			return execErr, nil
 		}
-		return false, fmt.Errorf("merge row into %s: %w", table, execErr)
+		return nil, fmt.Errorf("merge row into %s: %w", table, execErr)
 	}
-	return false, nil
+	return nil, nil
+}
+
+// identityRowOrigin names the host that wrote an identity-table row: both
+// tables carry host_name.
+func identityRowOrigin(table syncTable, row []interface{}) string {
+	if j := indexOf(table.Columns, "host_name"); j >= 0 && j < len(row) {
+		return coerceString(row[j])
+	}
+	return ""
 }
 
 // proofMergeKeepLocalRow is the anti-entropy monotone decision for a

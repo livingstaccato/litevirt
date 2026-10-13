@@ -1,7 +1,8 @@
 package corrosion
 
 // Held (parked) WAL entries: one change a receiver cannot apply no longer stops
-// every later change from the same sender.
+// every later change from the same sender — for the natural-key identity
+// tables, and only for them.
 //
 // The WAL apply is fail-closed: any statement that fails rolls the whole push
 // back and the sender's watermark stays put, so the sender retries. That is
@@ -14,13 +15,23 @@ package corrosion
 // stopped at that entry; its later writes reached peers only through
 // anti-entropy, minutes late.
 //
-// An entry whose failure is a deterministic constraint violation, and whose
-// every statement is an unguarded, last-writer-wins row write to a table
-// anti-entropy repairs, is HELD instead (entryParkable):
+// SCOPE IS AN ALLOWLIST (parkableTables). Only snapshots and
+// container_snapshots qualify: they are the tables whose rows carry a random
+// id beside a UNIQUE natural key, so two nodes can hold different rows for one
+// name and a refusal is a standing conflict between two rows rather than a
+// malformed write. They are the only replicated tables with a secondary
+// UNIQUE (TestParkableTables_AreTheIdentityTables pins the list against the
+// schema). A table is never holdable by default: a refusal anywhere else —
+// and any constraint other than one of these tables' — back-pressures as
+// before, and a new table joins only by being added here with its reasons.
 //
-//   - the batch is re-applied without it, so the entries before and after it
-//     land; it is recorded seen and acknowledged with them, and relayed by a
-//     relay exactly as an applied entry is;
+// An entry is held (entryParkable) when its failure is a constraint refusal
+// and every statement is an unguarded LWW row write (plain insert, explicit
+// upsert, full-PK update, or per-row-LWW bulk update) to an allowlisted table:
+//
+//   - the entry is rolled back to its own savepoint and the rest of the batch
+//     applies, once; the held entry is recorded seen, acknowledged with the
+//     batch, and relayed by a relay exactly as an applied entry is;
 //   - it is kept here, and retried on its own — after later pushes
 //     (retryParkedSoon) and on a timer (Start) — through the same apply path.
 //     Once it applies it is gone from here;
@@ -29,25 +40,33 @@ package corrosion
 //     litevirt_replication_parked_entries{origin}, and the
 //     replication_entry_parked HA-degraded reason with an event that names it.
 //
-// Why holding such an entry cannot corrupt anything:
+// What holding does NOT guarantee — the honest limits:
 //
-//   - nothing is overwritten to make room for it. The row the constraint
-//     protects is left exactly as it is; the held entry simply has not
-//     happened here yet;
-//   - nothing is reordered in a way the data model can see. Every statement in
-//     a held entry is an LWW row write, decided by the row's own clock, so
-//     applying it later reaches the state applying it in order would have —
-//     a later write to the same row from the same sender wins over it either
-//     way, and an update that reached the row's absence meanwhile is parked
-//     for the row (parked_updates.go) and replayed when the held insert lands.
-//     Guarded, custom-merge, append-only and retention statements carry their
-//     own ordering rule, and an entry holding any of them still back-pressures;
-//   - nothing is lost. The held change is in memory here, and its row is also
-//     on the sender, which offers it to every anti-entropy pass: anti-entropy
-//     already applies the same rule to the same rows (applyMergeRow keeps
-//     local on a constraint and the sender keeps offering the row). A restart
-//     forgets what is held here and leaves exactly that repair path — the
-//     row's merge_rejected count keeps climbing until it applies;
+//   - applying a held entry late is not always the state applying it in order
+//     would have reached on the WAL lane alone. A later full-PK update of the
+//     held row from the same sender parks for the row (parked_updates.go), but
+//     that park ages out after parkedUpdateTTL (10 minutes) and does not
+//     survive a restart; a held entry can wait longer. Anti-entropy then
+//     carries the sender's newest row, which is what repairs it;
+//   - a later statement keyed by the NATURAL key (a by-name delete) is not
+//     held with it: it applies to whatever row holds that name here — in the
+//     live-vs-live conflict, this node's own different-id row, which is then
+//     tombstoned (not destroyed). That is the existing meaning of a by-name
+//     statement;
+//   - a later guarded entry is evaluated against this node's rows as they
+//     stand. No guard today reads an identity-table row, so a held snapshot
+//     row cannot change a guard's answer; a new guard over these tables would
+//     have to be judged against holding.
+//
+// What it does guarantee:
+//
+//   - nothing is overwritten to make room for a held entry: the row the
+//     constraint protects is left exactly as it is;
+//   - nothing is lost: the held entry's row is also on its sender, which
+//     offers it to every anti-entropy pass, and anti-entropy applies it once
+//     the conflict is gone. A restart forgets the held entry, but not the
+//     signal: anti-entropy re-derives it from its own refusal of that row
+//     (held_refusals.go);
 //   - the hold is bounded (parkedEntriesMax). Past it, the next refusal
 //     back-pressures as before rather than drop anything.
 //
@@ -87,26 +106,32 @@ type parkableEntryError struct {
 	origin, hlc string
 	seq         int64
 	table, sql  string
+	rowID       string // the refused row's id, when the failing statement names one
 	err         error
 }
 
 func (e *parkableEntryError) Error() string { return e.err.Error() }
 func (e *parkableEntryError) Unwrap() error { return e.err }
 
-// ParkedEntry is one held entry, as health, metrics and tests see it.
+// ParkedEntry is one held change, as health, metrics and tests see it. Source
+// is "wal" for an entry held here, "ae" for a row anti-entropy refuses
+// (held_refusals.go; Seq and HLC are then empty).
 type ParkedEntry struct {
 	Origin   string
 	Seq      int64
 	HLC      string
 	Table    string
+	RowID    string
 	Error    string
 	HeldAt   time.Time
 	Attempts int
+	Source   string
 }
 
 type parkedEntry struct {
 	entry    *pb.MutationEntry
 	table    string
+	rowID    string
 	sql      string
 	err      string
 	heldAt   time.Time
@@ -125,52 +150,39 @@ type parkState struct {
 
 func parkKey(origin, hlc string) string { return origin + "\x00" + hlc }
 
-// parkWALDenyTables are LWW tables whose WAL apply does more than write the
-// row (secret and membership absorbs, the admin re-mint floor, the host
-// tombstone guard). Their refusals keep back-pressuring.
-var parkWALDenyTables = map[string]bool{
-	"users":            true,
-	"user_credentials": true,
-	"hosts":            true,
-	"host_membership":  true,
-	"host_runtime":     true,
+// parkableTables is the allowlist of tables whose refused writes may be held
+// instead of back-pressured. See the file comment for why these and only
+// these; a table is not holdable unless it is named here.
+var parkableTables = map[string]bool{
+	"snapshots":           true,
+	"container_snapshots": true,
 }
 
-var antiEntropyTableSet = func() map[string]bool {
-	m := make(map[string]bool, len(tableNames))
-	for _, t := range tableNames {
-		m[t] = true
-	}
-	return m
-}()
-
 // entryParkable reports whether an entry that failed with applyErr may be held
-// (see the file comment), and the table its failure names for the report.
-func (r *Replicator) entryParkable(stmts []Statement, applyErr error) (string, bool) {
+// (see the file comment), the table its failure names, and the refused row's
+// id when failed carries one.
+func (r *Replicator) entryParkable(stmts []Statement, failed Statement, applyErr error) (string, string, bool) {
 	if class, _ := classifySQLiteError(applyErr); class != classConstraint {
-		return "", false
+		return "", "", false
 	}
 	if isSchemaMissingError(applyErr) || errors.Is(applyErr, ErrInvalidStmt) {
-		return "", false
+		return "", "", false
 	}
 	table := ""
 	for _, s := range stmts {
 		if s.Guard != nil {
-			return "", false
+			return "", "", false
 		}
 		if _, legacy := legacyTransformerFor(s.SQL); legacy {
-			return "", false
+			return "", "", false
 		}
 		sh, _, err := parseResolved(s.SQL)
-		if err != nil {
-			return "", false
-		}
-		if !antiEntropyTableSet[sh.Table] || parkWALDenyTables[sh.Table] {
-			return "", false
+		if err != nil || !parkableTables[sh.Table] {
+			return "", "", false
 		}
 		entry, ok := LedgerLookup(stmtFingerprint(sh))
 		if !ok {
-			return "", false
+			return "", "", false
 		}
 		disp := entry.Disposition
 		if entry.RequiresCapability != "" && entry.DispositionAfter != "" && r.client.capabilityActive(entry.RequiresCapability) {
@@ -180,19 +192,22 @@ func (r *Replicator) entryParkable(stmts []Statement, applyErr error) (string, b
 		case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate, DispLiveRowUpdate:
 		case DispBulkUpdate:
 			if entry.Category != CatPerRowLWW {
-				return "", false
-			}
-			if cleanup, cErr := isClaimedCreateCleanup(s, sh); cErr != nil || cleanup {
-				return "", false
+				return "", "", false
 			}
 		default:
-			return "", false
+			return "", "", false
 		}
 		if table == "" {
 			table = sh.Table
 		}
 	}
-	return table, table != ""
+	rowID := ""
+	if sh, _, err := parseResolved(failed.SQL); err == nil {
+		if pk, ok := pkValuesFromShape(sh, failed); ok && len(pk) == 1 {
+			rowID = coerceString(pk[0])
+		}
+	}
+	return table, rowID, table != ""
 }
 
 func (r *Replicator) parkedLen() int {
@@ -223,7 +238,7 @@ func (r *Replicator) holdParked(entries []*pb.MutationEntry, held map[string]*pa
 			continue
 		}
 		r.park.byKey[parkKey(e.Origin, e.Hlc)] = &parkedEntry{
-			entry: e, table: pe.table, sql: pe.sql, err: pe.err.Error(), heldAt: now, warnedAt: now,
+			entry: e, table: pe.table, rowID: pe.rowID, sql: pe.sql, err: pe.err.Error(), heldAt: now, warnedAt: now,
 		}
 		r.client.observeMergeRejected(boundedTableLabel(pe.table), string(pathWAL), "held")
 		slog.Error("replicator: held a change this node cannot apply; the rest of the sender's stream continues",
@@ -234,16 +249,27 @@ func (r *Replicator) holdParked(entries []*pb.MutationEntry, held map[string]*pa
 	r.park.mu.Unlock()
 }
 
-// ParkedEntries reports what this node holds, oldest first.
+// ParkedEntries reports every change this node holds, oldest first: the WAL
+// entries held here, and the identity-table rows anti-entropy refuses
+// (held_refusals.go) that no held entry already names.
 func (r *Replicator) ParkedEntries() []ParkedEntry {
 	r.park.mu.Lock()
-	defer r.park.mu.Unlock()
 	out := make([]ParkedEntry, 0, len(r.park.byKey))
+	rows := make(map[string]bool, len(r.park.byKey))
 	for _, p := range r.park.byKey {
 		out = append(out, ParkedEntry{
-			Origin: p.entry.Origin, Seq: p.entry.Seq, HLC: p.entry.Hlc, Table: p.table,
-			Error: p.err, HeldAt: p.heldAt, Attempts: p.attempts,
+			Origin: p.entry.Origin, Seq: p.entry.Seq, HLC: p.entry.Hlc, Table: p.table, RowID: p.rowID,
+			Error: p.err, HeldAt: p.heldAt, Attempts: p.attempts, Source: "wal",
 		})
+		if p.rowID != "" {
+			rows[heldRefusalKey(p.table, p.rowID)] = true
+		}
+	}
+	r.park.mu.Unlock()
+	for _, h := range r.client.HeldRefusals() {
+		if !rows[heldRefusalKey(h.Table, h.RowID)] {
+			out = append(out, h)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].HeldAt.Equal(out[j].HeldAt) {
@@ -252,7 +278,10 @@ func (r *Replicator) ParkedEntries() []ParkedEntry {
 		if out[i].Origin != out[j].Origin {
 			return out[i].Origin < out[j].Origin
 		}
-		return out[i].Seq < out[j].Seq
+		if out[i].Seq != out[j].Seq {
+			return out[i].Seq < out[j].Seq
+		}
+		return out[i].RowID < out[j].RowID
 	})
 	return out
 }
@@ -260,11 +289,9 @@ func (r *Replicator) ParkedEntries() []ParkedEntry {
 // ParkedCounts is the held count per sender, for
 // litevirt_replication_parked_entries.
 func (r *Replicator) ParkedCounts() map[string]int {
-	r.park.mu.Lock()
-	defer r.park.mu.Unlock()
-	out := make(map[string]int, len(r.park.byKey))
-	for _, p := range r.park.byKey {
-		out[p.entry.Origin]++
+	out := map[string]int{}
+	for _, p := range r.ParkedEntries() {
+		out[p.Origin]++
 	}
 	return out
 }
@@ -318,6 +345,9 @@ func (r *Replicator) RetryParked(ctx context.Context) {
 		if err == nil {
 			delete(r.park.byKey, key)
 			r.park.mu.Unlock()
+			if p.rowID != "" {
+				r.client.clearHeldRefusal(p.table, p.rowID)
+			}
 			slog.Info("replicator: a held change applied; it is no longer held",
 				"origin", p.entry.Origin, "seq", p.entry.Seq, "table", p.table,
 				"held_for", time.Since(p.heldAt).Round(time.Second).String())
@@ -348,7 +378,7 @@ func (r *Replicator) applyHeldEntry(ctx context.Context, entry *pb.MutationEntry
 		return err
 	}
 	defer r.client.dropDeferredEffects(tx)
-	if err := r.applyEntry(ctx, tx, entry); err != nil {
+	if err := r.applyEntry(ctx, tx, entry, true); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

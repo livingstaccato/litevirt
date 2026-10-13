@@ -28,22 +28,17 @@ func InsertContainerSnapshot(ctx context.Context, c *Client, s ContainerSnapshot
 	if s.Type == "" {
 		s.Type = "tar"
 	}
-	id, undelete, err := reuseNaturalKeyRow(ctx, c,
+	return insertNaturalKeyRow(ctx, c,
 		`SELECT id, deleted_at FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?`,
-		s.ID, s.HostName, s.CtName, s.Name)
-	if err != nil {
-		return err
-	}
-	s.ID = id
-	stmts := []Statement{{SQL: insertContainerSnapshotSQL, Params: []interface{}{
-		s.ID, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), c.NowTS(),
-	}}}
-	if undelete {
-		stmts = append(stmts, Statement{SQL: deleteContainerSnapshotSQL, Params: []interface{}{
-			nil, c.NowTS(), s.HostName, s.CtName, s.Name,
-		}})
-	}
-	return c.ExecuteBatch(ctx, stmts)
+		[]interface{}{s.HostName, s.CtName, s.Name}, s.ID,
+		func(id string) []Statement {
+			return []Statement{{SQL: insertContainerSnapshotSQL, Params: []interface{}{
+				id, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), c.NowTS(),
+			}}}
+		},
+		func() Statement {
+			return Statement{SQL: deleteContainerSnapshotSQL, Params: []interface{}{nil, c.NowTS(), s.HostName, s.CtName, s.Name}}
+		})
 }
 
 const insertContainerSnapshotSQL = `INSERT OR REPLACE INTO container_snapshots

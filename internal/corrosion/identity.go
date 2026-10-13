@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Natural-key identity resolution (Part H1). Some tables mint a random-UUID PRIMARY KEY but
@@ -232,7 +233,7 @@ func identityCollapseUpdate(tx *sql.Tx, table string, setCols []string, setVals 
 	return false, nil
 }
 
-// A deleted row yields its natural key to a newer row.
+// A deleted row gives up its natural key to a newer row.
 //
 // A snapshot deleted and then re-created under the same name is two rows of
 // one natural key: the deleted one, which every peer keeps as a tombstone
@@ -243,38 +244,42 @@ func identityCollapseUpdate(tx *sql.Tx, table string, setCols []string, setVals 
 // older builds already logged are still in their streams, and older senders
 // keep producing them through a rolling upgrade.
 //
-// So a receiver resolves exactly this case, with or without
-// canonical_identity_v1: when the only row holding the incoming row's natural
-// key under a DIFFERENT id is a TOMBSTONE whose updated_at is STRICTLY older
-// than the incoming row's, the tombstone is dead history of the same name and
-// is removed so the incoming row can take the name. Nothing else is touched:
+// So a receiver decides a natural-key collision between two DIFFERENT ids, on
+// the WAL and on anti-entropy, with or without canonical_identity_v1, whenever
+// at least one of the two rows is a tombstone (decideIdentityCollision):
 //
-//   - a live row is never removed. Two live rows under one natural key are
-//     the case canonical_identity_v1 exists for, and stay its decision;
-//   - a tombstone that is as new as or newer than the incoming row stays: a
-//     delete at that name after the incoming write is the newer fact;
-//   - a tombstone a child row still references, an incoming id already bound
-//     to another natural key, and a future-skewed incoming clock all leave the
-//     tombstone in place (the apply then fails as before);
-//   - the removal is local to this receiver's apply transaction, so it rolls
-//     back with it.
+//	local         incoming      decision
+//	tombstone     newer row     the local tombstone yields (removed; incoming applies)
+//	tombstone     older or      the incoming row is superseded: skipped. A delete of
+//	              equal live    the name newer than the incoming write is the later
+//	                            fact (a delete wins an exact tie: no resurrection)
+//	tombstone     tombstone     the newer one stays; an exact tie keeps the smaller
+//	                            id, so every node converges on one row
+//	live          older         the incoming tombstone is stale: skipped
+//	              tombstone
+//	anything else               no decision: the apply proceeds as before
+//
+// Two LIVE rows under one name are canonical_identity's decision, and are
+// never touched here. A yield is also refused — the apply then proceeds and,
+// if the UNIQUE still refuses it, is held or kept local as before — when the
+// tombstone is referenced by a child row, when the incoming id is already
+// bound to another natural key, or when the incoming clock is future-skewed
+// and the skew guard is on.
+//
+// A yield's DELETE runs inside a SAVEPOINT with the incoming row's apply, and
+// is rolled back unless the incoming row actually lands, so the name is never
+// left empty for an older incarnation to take.
 //
 // canonical_identity_v1's collapse would instead re-key the tombstone into the
 // incoming id with a column-preserving UPDATE, and a WAL INSERT does not carry
 // deleted_at — so the re-created row would land still deleted, hidden on
-// every peer and live only on its origin. Yielding first gives both modes the
-// same, correct answer.
-//
-// The mirror case is quieter: anti-entropy offering a tombstone that is
-// strictly older than the different-id row this node holds under the same
-// natural key is skipped (staleIncomingIdentityTombstone) — it is the old
-// incarnation a peer has not yet let go of, and it would otherwise fail the
-// UNIQUE on every pass until that peer catches up.
+// every peer and live only on its origin. Deciding first gives both modes the
+// same answer.
 //
 // No capability gate: the decision reads only this node's row and the
 // incoming one, so every upgraded node reaches the same state from the same
-// rows, and a node that has not upgraded keeps refusing the entry as before
-// until it does. No node relies on a peer making it.
+// rows, and a node that has not upgraded keeps refusing as before until it
+// does. No node relies on a peer making it.
 
 // identityNaturalRow is the row a node holds under one natural key.
 type identityNaturalRow struct {
@@ -303,47 +308,104 @@ func lookupIdentityNaturalRow(tx *sql.Tx, table string, natVals []interface{}) (
 	return identityNaturalRow{id: id.String, updatedAt: updatedAt.String, deleted: deletedAt.Valid && deletedAt.String != ""}, true, nil
 }
 
-// yieldStaleIdentityTombstone removes the tombstone holding natVals when the
-// incoming row (incomingID, incomingTS) is strictly newer and has a different
-// id; see above. skewed reports whether incomingTS is a future-skewed clock
-// this node would quarantine against a row stamped localTS. It reports
-// whether a tombstone was removed.
-func yieldStaleIdentityTombstone(tx *sql.Tx, table string, natVals []interface{}, incomingID, incomingTS string, skewed func(localTS string) bool) (bool, error) {
-	if incomingID == "" || incomingTS == "" {
-		return false, nil
-	}
-	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
-	if err != nil || !found {
-		return false, err
-	}
-	if local.id == incomingID || !local.deleted || lwwOrder(local.updatedAt, incomingTS) >= 0 {
-		return false, nil
-	}
-	if skewed != nil && skewed(local.updatedAt) {
-		return false, nil
-	}
-	if foreign, fErr := identityIDForeignNaturalKey(tx, table, tableIdentityKeys[table], incomingID, natVals); fErr != nil || foreign {
-		return false, fErr
-	}
-	if child, cErr := identityHasChildReference(tx, table, local.id); cErr != nil || child {
-		return false, cErr
-	}
-	if _, err := tx.Exec("DELETE FROM "+table+" WHERE id = ?", local.id); err != nil {
-		return false, fmt.Errorf("yield stale tombstone on %s: %w", table, err)
-	}
-	return true, nil
+// identityCollision is decideIdentityCollision's answer.
+type identityCollision int
+
+const (
+	collisionNone         identityCollision = iota // no decision; apply as before
+	collisionYieldLocal                            // remove the local tombstone, then apply the incoming row
+	collisionSkipIncoming                          // the incoming row is superseded; apply nothing
+)
+
+// identityIncoming is the incoming row's side of a collision.
+type identityIncoming struct {
+	table     string
+	natVals   []interface{}
+	id, ts    string
+	deleted   bool
+	skewGuard bool
+	now       time.Time
 }
 
-// staleIncomingIdentityTombstone reports whether an incoming TOMBSTONE row is
-// strictly older than the different-id row this node holds under the same
-// natural key, and so is to be skipped; see above.
-func staleIncomingIdentityTombstone(tx *sql.Tx, table string, natVals []interface{}, incomingID, incomingTS string) (bool, error) {
-	if incomingID == "" || incomingTS == "" {
-		return false, nil
+// decideIdentityCollision applies the table above. localID names the local
+// row a yield removes.
+func decideIdentityCollision(tx *sql.Tx, in identityIncoming) (identityCollision, string, error) {
+	if in.id == "" || in.ts == "" || !hasIdentityKey(in.table) {
+		return collisionNone, "", nil
 	}
-	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
-	if err != nil || !found {
+	local, found, err := lookupIdentityNaturalRow(tx, in.table, in.natVals)
+	if err != nil || !found || local.id == in.id || local.updatedAt == "" {
+		return collisionNone, "", err
+	}
+	ord := lwwOrder(local.updatedAt, in.ts) // >0: local newer
+	var d identityCollision
+	switch {
+	case local.deleted && in.deleted:
+		switch {
+		case ord < 0, ord == 0 && in.id < local.id:
+			d = collisionYieldLocal
+		default:
+			d = collisionSkipIncoming
+		}
+	case local.deleted:
+		if ord < 0 {
+			d = collisionYieldLocal
+		} else {
+			d = collisionSkipIncoming
+		}
+	case in.deleted:
+		if ord > 0 {
+			d = collisionSkipIncoming
+		}
+	}
+	if d != collisionYieldLocal {
+		return d, "", nil
+	}
+	if in.skewGuard && tsFutureSkewed(in.ts, in.now) {
+		return collisionNone, "", nil
+	}
+	if foreign, fErr := identityIDForeignNaturalKey(tx, in.table, tableIdentityKeys[in.table], in.id, in.natVals); fErr != nil || foreign {
+		return collisionNone, "", fErr
+	}
+	if child, cErr := identityHasChildReference(tx, in.table, local.id); cErr != nil || child {
+		return collisionNone, "", cErr
+	}
+	return collisionYieldLocal, local.id, nil
+}
+
+// identityYieldSavepoint wraps a yield and the incoming row's apply.
+const identityYieldSavepoint = "lv_identity_yield"
+
+// yieldThenApply removes the local tombstone localID and runs apply inside a
+// savepoint, keeping the removal only if apply reports the incoming row landed.
+// An apply error is returned as is (the caller rolls the whole transaction
+// back); a row that did not land rolls the removal back with it.
+func (c *Client) yieldThenApply(tx *sql.Tx, table, localID string, apply func() (bool, error)) (bool, error) {
+	if _, err := tx.Exec("SAVEPOINT " + identityYieldSavepoint); err != nil {
 		return false, err
 	}
-	return local.id != incomingID && lwwOrder(local.updatedAt, incomingTS) > 0, nil
+	mark := c.deferredMark(tx)
+	if _, err := tx.Exec("DELETE FROM "+table+" WHERE id = ?", localID); err != nil {
+		return false, fmt.Errorf("yield stale tombstone on %s: %w", table, err)
+	}
+	landed, err := apply()
+	if err != nil {
+		return false, err
+	}
+	if !landed {
+		c.truncateDeferred(tx, mark)
+		if _, rbErr := tx.Exec("ROLLBACK TO " + identityYieldSavepoint); rbErr != nil {
+			return false, rbErr
+		}
+	}
+	if _, err := tx.Exec("RELEASE " + identityYieldSavepoint); err != nil {
+		return false, err
+	}
+	return landed, nil
+}
+
+// identityRowLanded reports whether table holds id under natVals.
+func identityRowLanded(tx *sql.Tx, table string, natVals []interface{}, id string) (bool, error) {
+	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
+	return found && local.id == id, err
 }

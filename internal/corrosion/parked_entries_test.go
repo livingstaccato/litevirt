@@ -62,22 +62,22 @@ func TestEntryParkable_Boundaries(t *testing.T) {
 	uniq := uniqueConstraintErr(t, c)
 	ins := Statement{SQL: insertSnapshotSQL, Params: make([]interface{}, 11)}
 
-	if table, ok := r.entryParkable([]Statement{ins}, uniq); !ok || table != "snapshots" {
+	if table, _, ok := r.entryParkable([]Statement{ins}, ins, uniq); !ok || table != "snapshots" {
 		t.Fatalf("a snapshot insert refused by UNIQUE is not holdable: %q %v", table, ok)
 	}
-	if _, ok := r.entryParkable([]Statement{ins}, errors.New("database is locked")); ok {
+	if _, _, ok := r.entryParkable([]Statement{ins}, ins, errors.New("database is locked")); ok {
 		t.Fatal("a non-constraint failure was holdable")
 	}
-	if _, ok := r.entryParkable([]Statement{ins}, fmt.Errorf("x: %w", errors.New("no such column: foo"))); ok {
+	if _, _, ok := r.entryParkable([]Statement{ins}, ins, fmt.Errorf("x: %w", errors.New("no such column: foo"))); ok {
 		t.Fatal("a schema-missing failure was holdable")
 	}
 	guarded := ins
 	guarded.Guard = &MutationGuard{Protocol: workloadCreateGuardV1}
-	if _, ok := r.entryParkable([]Statement{guarded}, uniq); ok {
+	if _, _, ok := r.entryParkable([]Statement{guarded}, guarded, uniq); ok {
 		t.Fatal("a guarded entry was holdable")
 	}
 	users := Statement{SQL: usersInsertSQL}
-	if _, ok := r.entryParkable([]Statement{users}, uniq); ok {
+	if _, _, ok := r.entryParkable([]Statement{users}, users, uniq); ok {
 		t.Fatal("a users write (absorbs and the re-mint floor) was holdable")
 	}
 	for _, s := range []Statement{users, {SQL: insertFenceLogSQL}} {
@@ -92,7 +92,7 @@ func TestEntryParkable_Boundaries(t *testing.T) {
 	// One non-LWW statement anywhere in the entry keeps the whole entry
 	// back-pressuring: it would be applied later, out of its order.
 	appendOnly := Statement{SQL: insertFenceLogSQL}
-	if _, ok := r.entryParkable([]Statement{ins, appendOnly}, uniq); ok {
+	if _, _, ok := r.entryParkable([]Statement{ins, appendOnly}, ins, uniq); ok {
 		t.Fatal("an entry carrying an append-only statement was holdable")
 	}
 }

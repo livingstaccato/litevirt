@@ -20,6 +20,8 @@ package fleet
 
 import (
 	"context"
+	"net"
+	"strconv"
 	"testing"
 
 	"github.com/google/uuid"
@@ -345,4 +347,88 @@ func TestFleet_ContainerSnapshotNameReuse_RecreateReplicates(t *testing.T) {
 	if got := live(b); got != firstID {
 		t.Fatalf("b holds the re-created container snapshot as %q (\"\" = hidden by the tombstone), want %q", got, firstID)
 	}
+}
+
+// The held signal survives a restart. A held WAL entry lives in memory, so a
+// restart (or a crash between the batch's commit and the hold being recorded)
+// forgets it; the signal must come back from state — anti-entropy's own
+// refusal of the row — and stay until the conflict is resolved, so a restart
+// never turns the alert green over a row that is still divergent.
+func TestFleet_HeldChangeSignalSurvivesARestart(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+
+	localID := uuid.New().String()
+	if err := localExec(ctx, b.DB,
+		`INSERT INTO snapshots (id, vm_name, host_name, name, state, size_bytes, type, created_at, updated_at)
+		 VALUES (?, 'svm', ?, 's1', 'ok', 1, 'disk', '2026-10-12T00:00:00Z', '0000000000001-0000-b')`,
+		localID, b.Name); err != nil {
+		t.Fatal(err)
+	}
+	createSnap(t, a, "svm", "s1")
+	aID := liveSnapID(t, a, "svm", "s1")
+	if _, err := pushAll(t, c, a, b); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(b.repl.ParkedEntries()) != 1 {
+		t.Fatalf("the refused change is not held: %+v", b.repl.ParkedEntries())
+	}
+
+	// The restart: a new server and replicator over the same database; the
+	// harness keeps the Client, so drop what the new process would not have.
+	restartForSignal(t, c, b)
+	if p := b.repl.ParkedEntries(); len(p) != 0 {
+		t.Fatalf("the restarted node still remembers the held entry, so this proves nothing: %+v", p)
+	}
+
+	aePass := func() {
+		t.Helper()
+		b.DB.SetMembersForTests(func() []corrosion.PeerInfo { return []corrosion.PeerInfo{{Name: a.Name}} })
+		if !corrosion.NewAntiEntropy(b.DB, b.PKIDir, 0).RunOnce(ctx) {
+			t.Fatal("anti-entropy pass on b did not run")
+		}
+	}
+	aePass()
+	p := b.repl.ParkedEntries()
+	if len(p) != 1 || p[0].Table != "snapshots" || p[0].RowID != aID || p[0].Origin != a.Name {
+		t.Fatalf("after a restart and one anti-entropy pass the held signal is %+v, want %s's row %s", p, a.Name, aID)
+	}
+	if got := liveSnapID(t, b, "svm", "s1"); got != localID {
+		t.Fatalf("b's own row changed: %q", got)
+	}
+
+	// Resolve the conflict: the next pass applies a's row and the signal clears.
+	if err := localExec(ctx, b.DB, `DELETE FROM snapshots WHERE id = ?`, localID); err != nil {
+		t.Fatal(err)
+	}
+	aePass()
+	if got := liveSnapID(t, b, "svm", "s1"); got != aID {
+		t.Fatalf("after the conflict was resolved b holds %q, want %q", got, aID)
+	}
+	if p := b.repl.ParkedEntries(); len(p) != 0 {
+		t.Fatalf("the signal did not clear once the row applied: %+v", p)
+	}
+}
+
+// restartForSignal restarts n's server and replicator over its database, as
+// restartNode does, and forgets the Client's in-memory refusal record, which a
+// real process restart would also lose.
+func restartForSignal(t *testing.T, c *Cluster, n *Node) {
+	t.Helper()
+	if n.replStarted {
+		n.repl.Stop()
+		n.replStarted = false
+	}
+	if n.stopServerLoops != nil {
+		n.stopServerLoops()
+	}
+	n.Stop()
+	l, err := net.Listen("tcp", net.JoinHostPort(n.Address, strconv.Itoa(n.Port)))
+	if err != nil {
+		t.Fatalf("rebind %s: %v", n.Name, err)
+	}
+	n.Listener = l
+	c.buildServer(n)
+	n.DB.ForgetHeldRefusalsForTest()
 }

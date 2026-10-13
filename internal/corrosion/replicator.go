@@ -1276,42 +1276,30 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 	// One entry this node cannot apply used to roll the whole push back and
 	// leave the sender's watermark where it was, so every later write from
 	// that sender queued behind it for good (lab 2, F-2). An entry whose
-	// failure entryParkable accepts is held instead: the batch is re-applied
-	// without it, it is recorded seen and acknowledged with the rest, and it
-	// is retried on its own (parked_entries.go). Anything else still
-	// back-pressures exactly as before.
-	var held map[string]*parkableEntryError
-	for {
-		seq, err := r.applyRemoteBatch(ctx, entries, pushedAsRelay, held)
-		if err == nil {
-			r.holdParked(entries, held)
-			r.retryParkedSoon(ctx)
-			return seq, nil
-		}
-		var pe *parkableEntryError
-		if !errors.As(err, &pe) {
-			return 0, err
-		}
-		if held == nil {
-			held = make(map[string]*parkableEntryError)
-		}
-		if _, dup := held[parkKey(pe.origin, pe.hlc)]; dup || !r.parkRoomFor(len(held)+1) {
-			// Out of room (or, impossibly, the same entry twice): never drop,
-			// back-pressure as before. The held set is bounded so a peer that
-			// sends nothing but refusals cannot grow this node's memory.
-			slog.Error("replicator: apply failed — back-pressuring replication (no room to hold it)",
-				"sql", pe.sql, "origin", pe.origin, "seq", pe.seq, "error", pe.err,
-				"held", r.parkedLen(), "limit", parkedEntriesMax)
-			return 0, pe.err
-		}
-		held[parkKey(pe.origin, pe.hlc)] = pe
+	// failure entryParkable accepts is held instead: it is rolled back to its
+	// own savepoint, the rest of the batch applies, it is recorded seen and
+	// acknowledged with the rest, and it is retried on its own
+	// (parked_entries.go). Anything else still back-pressures exactly as
+	// before.
+	held := map[string]*parkableEntryError{}
+	seq, err := r.applyRemoteBatch(ctx, entries, pushedAsRelay, held)
+	if err != nil {
+		return 0, err
 	}
+	r.holdParked(entries, held)
+	r.retryParkedSoon(ctx)
+	return seq, nil
 }
 
-// applyRemoteBatch is one attempt at applying entries in a single transaction.
-// An entry named in skip is not applied — it is being held — but is recorded
-// seen and relayed like every other entry of the batch.
-func (r *Replicator) applyRemoteBatch(ctx context.Context, entries []*pb.MutationEntry, pushedAsRelay bool, skip map[string]*parkableEntryError) (int64, error) {
+// entrySavepoint brackets one entry of a batch, so a held entry rolls back
+// alone and the batch is applied exactly once.
+const entrySavepoint = "lv_wal_entry"
+
+// applyRemoteBatch applies entries in a single transaction. An entry
+// entryParkable accepts is rolled back to its savepoint and recorded in held
+// (while there is room); it is still recorded seen and relayed like every
+// other entry of the batch.
+func (r *Replicator) applyRemoteBatch(ctx context.Context, entries []*pb.MutationEntry, pushedAsRelay bool, held map[string]*parkableEntryError) (int64, error) {
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
 
@@ -1335,17 +1323,45 @@ func (r *Replicator) applyRemoteBatch(ctx context.Context, entries []*pb.Mutatio
 		if remoteTS, ok := hlc.Parse(entry.Hlc); ok {
 			r.client.clock.Update(remoteTS)
 		}
-		if _, held := skip[parkKey(entry.Origin, entry.Hlc)]; held {
-			continue
-		}
-		if err := r.applyEntry(ctx, tx, entry); err != nil {
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT "+entrySavepoint); err != nil {
 			_ = tx.Rollback()
-			var pe *parkableEntryError
-			if errors.As(err, &pe) {
-				pe.origin, pe.seq, pe.hlc = entry.Origin, entry.Seq, entry.Hlc
-			}
 			return 0, err
 		}
+		mark := r.client.deferredMark(tx)
+		applyErr := r.applyEntry(ctx, tx, entry, false)
+		if applyErr == nil {
+			if _, err := tx.ExecContext(ctx, "RELEASE "+entrySavepoint); err != nil {
+				_ = tx.Rollback()
+				return 0, err
+			}
+			continue
+		}
+		var pe *parkableEntryError
+		if !errors.As(applyErr, &pe) {
+			_ = tx.Rollback()
+			return 0, applyErr
+		}
+		pe.origin, pe.seq, pe.hlc = entry.Origin, entry.Seq, entry.Hlc
+		if _, dup := held[parkKey(entry.Origin, entry.Hlc)]; dup || !r.parkRoomFor(len(held)+1) {
+			// Out of room: never drop, back-pressure as before. The held set
+			// is bounded so a peer that sends nothing but refusals cannot grow
+			// this node's memory.
+			_ = tx.Rollback()
+			slog.Error("replicator: apply failed — back-pressuring replication (no room to hold it)",
+				"sql", pe.sql, "origin", pe.origin, "seq", pe.seq, "error", pe.err,
+				"held", r.parkedLen(), "limit", parkedEntriesMax)
+			return 0, pe.err
+		}
+		r.client.truncateDeferred(tx, mark)
+		if _, err := tx.ExecContext(ctx, "ROLLBACK TO "+entrySavepoint); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE "+entrySavepoint); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		held[parkKey(entry.Origin, entry.Hlc)] = pe
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,
@@ -1391,7 +1407,7 @@ func (r *Replicator) applyRemoteBatch(ctx context.Context, entries []*pb.Mutatio
 
 // applyEntry applies one received mutation entry inside tx. On an error the
 // caller rolls tx back; nothing here does.
-func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.MutationEntry) error {
+func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.MutationEntry, retry bool) error {
 	// Parse statements. An undecodable entry is not silently skipped: back-pressure so
 	// the sender retries rather than the row being lost with the watermark advanced.
 	var stmts []Statement
@@ -1480,7 +1496,11 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			continue
 		}
 		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
-			r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
+			// A held entry's periodic retry is not a new refusal: counting it
+			// would keep the rejected-rate alert firing while it is held.
+			if !retry {
+				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
+			}
 			if isSchemaMissingError(err) {
 				slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
 					"sql", s.SQL, "error", err,
@@ -1493,8 +1513,8 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 			// handed back to the caller to hold (parked_entries.go) instead
 			// of stopping the sender's whole stream behind it. The caller
 			// logs whichever it does.
-			if table, ok := r.entryParkable(stmts, err); ok {
-				return &parkableEntryError{table: table, sql: s.SQL, err: wrapped}
+			if table, rowID, ok := r.entryParkable(stmts, s, err); ok {
+				return &parkableEntryError{table: table, sql: s.SQL, rowID: rowID, err: wrapped}
 			}
 			slog.Error("replicator: apply failed — back-pressuring replication",
 				"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
@@ -3315,11 +3335,11 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	// and back-pressure forever. Only INSERTs are resolved this way; an UPDATE by id keeps the
 	// normal LWW path (it converges once the ids have collapsed).
 	//
-	// Before either path, a strictly older tombstone holding the incoming row's
-	// natural key under another id yields it (identity.go): a name deleted and
-	// then re-created, whatever build minted the new row's id.
+	// Before either path, a natural-key collision with a TOMBSTONE under
+	// another id is decided by decideIdentityCollision (identity.go): a name
+	// deleted and then re-created, whatever build minted the new row's id.
 	if sh.Kind == KindInsert && hasIdentityKey(tableName) {
-		if err := r.yieldTombstoneForInsert(tx, s, sh, tableName); err != nil {
+		if handled, err := r.applyIdentityCollision(ctx, tx, s, sh, tableName, pkCols, incomingHLC); handled || err != nil {
 			return err
 		}
 	}
@@ -3381,13 +3401,14 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	return err
 }
 
-// yieldTombstoneForInsert applies yieldStaleIdentityTombstone to a replicated
-// INSERT into a natural-key identity table. An insert that does not carry the
-// id, the natural key and updated_at is left to the apply as it is.
-func (r *Replicator) yieldTombstoneForInsert(tx *sql.Tx, s Statement, sh StmtShape, tableName string) error {
+// applyIdentityCollision decides a replicated INSERT into a natural-key
+// identity table that collides with a tombstone under another id (identity.go).
+// handled=false leaves the statement to the apply as before. An insert that
+// does not carry the id, the natural key and updated_at is not decided here.
+func (r *Replicator) applyIdentityCollision(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, incomingHLC string) (bool, error) {
 	cols, vals, ok := insertRowFromShape(sh, s)
 	if !ok {
-		return nil
+		return false, nil
 	}
 	at := make(map[string]int, len(cols))
 	for i, c := range cols {
@@ -3396,33 +3417,57 @@ func (r *Replicator) yieldTombstoneForInsert(tx *sql.Tx, s Statement, sh StmtSha
 	idIdx, hasID := at["id"]
 	tsIdx, hasTS := at["updated_at"]
 	if !hasID || !hasTS {
-		return nil
+		return false, nil
 	}
 	natCols := tableIdentityKeys[tableName]
 	natVals := make([]interface{}, len(natCols))
 	for i, col := range natCols {
 		j, has := at[strings.ToLower(col)]
 		if !has {
-			return nil
+			return false, nil
 		}
 		natVals[i] = vals[j]
 	}
-	incomingID, incomingTS := coerceString(vals[idIdx]), coerceString(vals[tsIdx])
-	skewed := func(localTS string) bool {
-		return r.client.skewQuarantinesIncoming(r.client.hlcSkewGuardOn(), localTS, incomingTS, time.Now())
+	in := identityIncoming{
+		table: tableName, natVals: natVals,
+		id: coerceString(vals[idIdx]), ts: coerceString(vals[tsIdx]),
+		skewGuard: r.client.hlcSkewGuardOn(), now: time.Now(),
 	}
-	yielded, err := yieldStaleIdentityTombstone(tx, tableName, natVals, incomingID, incomingTS, skewed)
+	decision, localID, err := decideIdentityCollision(tx, in)
 	if err != nil {
-		return err
+		return true, err
 	}
-	if yielded {
-		key := pkKey(natVals)
+	key := pkKey(natVals)
+	switch decision {
+	case collisionNone:
+		// The insert applies as before. If it lands (this entry commits), any
+		// standing refusal of this row is over.
+		if r.client.hasHeldRefusals() {
+			r.client.deferAfterCommit(tx, func() { r.client.clearHeldRefusal(tableName, in.id) })
+		}
+	case collisionSkipIncoming:
 		r.client.deferAfterCommit(tx, func() {
-			slog.Info("replicator: a deleted row yielded its name to a newer row",
-				"table", tableName, "natural_key", key, "id", incomingID, "path", "wal")
+			r.client.clearHeldRefusal(tableName, in.id)
+			slog.Info("replicator: skipped a row a newer delete of its name supersedes",
+				"table", tableName, "natural_key", key, "id", in.id, "path", "wal")
 		})
+		return true, nil
+	case collisionYieldLocal:
+		landed, err := r.client.yieldThenApply(tx, tableName, localID, func() (bool, error) {
+			if err := r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC); err != nil {
+				return false, err
+			}
+			return identityRowLanded(tx, tableName, natVals, in.id)
+		})
+		if err == nil && landed {
+			r.client.deferAfterCommit(tx, func() {
+				slog.Info("replicator: a deleted row yielded its name to a newer row",
+					"table", tableName, "natural_key", key, "id", in.id, "path", "wal")
+			})
+		}
+		return true, err
 	}
-	return nil
+	return false, nil
 }
 
 // applyIdentityInsert resolves a replicated INSERT into a natural-key identity table by its

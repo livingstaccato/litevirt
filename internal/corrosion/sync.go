@@ -1145,9 +1145,22 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			in := identityIncoming{
 				table: table.Name, natVals: natVals,
 				id: coerceString(row[yieldIDIdx]), ts: coerceString(row[yieldTSIdx]),
-				deleted: cellNonEmpty(row[yieldDelIdx]), skewGuard: skewGuardOn, now: skewNow,
+				deleted: cellNonEmpty(row[yieldDelIdx]), deletedAt: coerceString(row[yieldDelIdx]),
+				skewGuard: skewGuardOn, now: skewNow,
 			}
 			decision, localID, dErr := decideIdentityCollision(tx, in)
+			if dErr == nil && decision == collisionTombstoneLocal {
+				// The incoming by-name delete's effect on the live row here;
+				// then the two tombstones are decided like any others.
+				if dErr = tombstoneLocalInPlace(tx, table.Name, localID, in.deletedAt, in.ts); dErr == nil {
+					tombKey, tombTbl, tombID := pkKey(natVals), table.Name, localID
+					c.deferAfterCommit(tx, func() {
+						slog.Info("anti-entropy: a newer delete of its name tombstoned the row here",
+							"table", tombTbl, "natural_key", tombKey, "id", tombID, "path", "ae")
+					})
+					decision, localID, dErr = decideIdentityCollision(tx, in)
+				}
+			}
 			if dErr != nil {
 				_ = tx.Rollback()
 				return merged, skipped, dErr

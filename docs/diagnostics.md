@@ -337,6 +337,7 @@ behind a token:
   | tombstone | older or equal-time live row | the incoming row is skipped: a newer delete of the name supersedes it (a delete wins an exact tie) |
   | tombstone | tombstone | the newer stays; an exact tie keeps the smaller id, so every node converges |
   | live row | older tombstone | the incoming tombstone is stale and is skipped |
+  | live row | newer or equal-time tombstone | anti-entropy tombstones the row here in place, keeping its id and taking the tombstone's `deleted_at` and `updated_at` (the by-name delete's own effect, which the WAL applies when it carries that delete); the two tombstones are then settled as above |
 
   Two live rows under one name are `canonical_identity`'s decision and are
   never touched. A yield is refused — the apply then proceeds as before — when
@@ -1423,12 +1424,14 @@ recovered, then back on. See
 A received replicated change that a constraint here refuses used to roll back
 the whole push, so the sender retried it forever and every later write from
 that sender waited behind it. For the natural-key identity tables —
-`snapshots` and `container_snapshots`, the only replicated tables whose rows
-carry a random id beside a `UNIQUE` name — the node now **holds** such a change
-instead, when every statement in it is an unguarded last-writer-wins row
-write to one of those tables. A refusal on any other table, or of any other
-kind, back-pressures as before; no table is holdable unless it is on that
-list.
+`snapshots` and `container_snapshots`, whose rows carry a random id beside a
+`UNIQUE` name that a deleted row still occupies — the node now **holds** such a
+change instead, when every statement in it is an unguarded last-writer-wins
+row write to one of those tables. A refusal on any other table, or of any
+other kind, back-pressures as before; no table is holdable unless it is on
+that list. The one other replicated table with a secondary `UNIQUE`,
+`registry_credentials`, was judged not holdable: it is secret-bearing, and its
+`UNIQUE` covers live rows only, so a re-create after a delete cannot collide.
 
 - The held entry is rolled back on its own and the rest of the push applies
   once and is acknowledged, so the sender's stream keeps moving. The held
@@ -1456,7 +1459,8 @@ Its limits:
 - **A restart forgets the held entry, not the condition.** The sender keeps
   offering its row to anti-entropy, and every pass that refuses an identity
   table's row re-raises the same signal under that row (it clears when the row
-  applies or is superseded, or when no pass has re-raised it for ten minutes).
+  applies or is superseded, or when no pass has re-raised it for ten minutes
+  or three anti-entropy intervals, whichever is longer).
   A restart therefore does not turn the alert green while the row is still
   divergent; expect the signal back within one anti-entropy pass.
 
@@ -1468,9 +1472,12 @@ What an operator sees:
   cannot apply; and an INFO line when it finally applies;
 - `litevirt_replication_parked_entries{origin}`, the count held per sender
   (held entries and anti-entropy refusals of identity-table rows, each row
-  once);
+  once). For an anti-entropy refusal, `origin` is the row's `host_name`, the
+  host that wrote it;
 - `litevirt_ha_degraded{reason="replication_entry_parked"}` and an
-  `ha.degraded` event whose detail names the oldest held changes;
+  `ha.degraded` event whose detail names the oldest held changes: a held entry
+  as `<sender> seq <n> on <table>`, an anti-entropy refusal as
+  `<host> row <id> on <table> (anti-entropy)`;
 - `litevirt_merge_apply_rejected_total{path="wal",reason="held"}` per table
   (counted when the change is held; the retries are not counted).
 

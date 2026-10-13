@@ -790,7 +790,18 @@ func (s *Server) replicationParkedDetail() string {
 			parts = append(parts, fmt.Sprintf("and %d more", len(held)-show))
 			break
 		}
-		parts = append(parts, fmt.Sprintf("%s seq %d on %s: %s", p.Origin, p.Seq, p.Table, p.Error))
+		parts = append(parts, parkedEntryDetail(p))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// parkedEntryDetail names one held change for the HA event. A held WAL entry
+// is named by its sender and sequence; a change re-derived from an
+// anti-entropy refusal has no sequence, and is named by the refused row and
+// the host that wrote it.
+func parkedEntryDetail(p corrosion.ParkedEntry) string {
+	if p.Source == "ae" {
+		return fmt.Sprintf("%s row %s on %s (anti-entropy): %s", p.Origin, p.RowID, p.Table, p.Error)
+	}
+	return fmt.Sprintf("%s seq %d on %s: %s", p.Origin, p.Seq, p.Table, p.Error)
 }

@@ -49,3 +49,16 @@ func TestEvaluateHADegraded_ReportsAHeldChange(t *testing.T) {
 		}
 	}
 }
+
+// A change re-derived from an anti-entropy refusal has no sequence: the event
+// names the refused row instead of "seq 0".
+func TestParkedEntryDetail_NamesTheRowForAnAntiEntropyRefusal(t *testing.T) {
+	ae := parkedEntryDetail(corrosion.ParkedEntry{Origin: "node-3", Table: "snapshots", RowID: "cc3197e1", Error: "UNIQUE", Source: "ae"})
+	if !strings.Contains(ae, "row cc3197e1") || !strings.Contains(ae, "anti-entropy") || strings.Contains(ae, "seq") {
+		t.Fatalf("anti-entropy detail = %q", ae)
+	}
+	wal := parkedEntryDetail(corrosion.ParkedEntry{Origin: "node-3", Seq: 197117, Table: "snapshots", Error: "UNIQUE", Source: "wal"})
+	if !strings.Contains(wal, "seq 197117") {
+		t.Fatalf("WAL detail = %q", wal)
+	}
+}

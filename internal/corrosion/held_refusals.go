@@ -16,8 +16,8 @@ package corrosion
 // restart within one pass. A refusal clears when that row applies (by
 // anti-entropy, by the WAL, or by a held entry's retry), when a decision makes
 // it obsolete (decideIdentityCollision skips it), or when no pass has re-
-// recorded it for heldRefusalTTL — several pass intervals — because the
-// sender stopped offering it.
+// recorded it for max(10 minutes, 3 × this node's anti-entropy interval)
+// because the sender stopped offering it.
 //
 // Replicator.ParkedEntries reports these beside the held WAL entries, so
 // litevirt_replication_parked_entries and replication_entry_parked cover both.
@@ -28,9 +28,20 @@ import (
 	"time"
 )
 
-// heldRefusalTTL is how long a refusal stands without being re-recorded. A
-// pass runs every minute by default, so this is several missed passes.
+// heldRefusalTTL is the floor of how long a refusal stands without being
+// re-recorded: several missed passes at the default one-minute interval. A
+// node whose anti-entropy interval is longer stands a refusal for three of its
+// intervals instead (heldRefusalTTLFor), so the signal does not lapse between
+// two passes that would both have re-raised it.
 var heldRefusalTTL = 10 * time.Minute
+
+// heldRefusalTTLFor is max(heldRefusalTTL, 3 × the anti-entropy interval).
+func heldRefusalTTLFor(interval time.Duration) time.Duration {
+	if t := 3 * interval; t > heldRefusalTTL {
+		return t
+	}
+	return heldRefusalTTL
+}
 
 type heldRefusal struct {
 	table, id, origin, err string
@@ -38,8 +49,25 @@ type heldRefusal struct {
 }
 
 type heldRefusals struct {
-	mu sync.Mutex
-	m  map[string]*heldRefusal
+	mu       sync.Mutex
+	m        map[string]*heldRefusal
+	interval time.Duration    // this node's anti-entropy interval; 0 = the default
+	now      func() time.Time // test seam; nil = time.Now
+}
+
+func (h *heldRefusals) clock() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
+}
+
+// setHeldRefusalInterval records this node's anti-entropy interval, which
+// sets how long a refusal stands (heldRefusalTTLFor). NewAntiEntropy calls it.
+func (c *Client) setHeldRefusalInterval(interval time.Duration) {
+	c.held.mu.Lock()
+	c.held.interval = interval
+	c.held.mu.Unlock()
 }
 
 func heldRefusalKey(table, id string) string { return table + "\x00" + id }
@@ -48,9 +76,9 @@ func (c *Client) noteHeldRefusal(table, id, origin, errText string) {
 	if id == "" {
 		return
 	}
-	now := time.Now()
 	c.held.mu.Lock()
 	defer c.held.mu.Unlock()
+	now := c.held.clock()
 	if c.held.m == nil {
 		c.held.m = make(map[string]*heldRefusal)
 	}
@@ -76,12 +104,12 @@ func (c *Client) clearHeldRefusal(table, id string) {
 
 // HeldRefusals reports the anti-entropy refusals still standing, oldest first.
 func (c *Client) HeldRefusals() []ParkedEntry {
-	now := time.Now()
 	c.held.mu.Lock()
 	defer c.held.mu.Unlock()
+	now, ttl := c.held.clock(), heldRefusalTTLFor(c.held.interval)
 	out := make([]ParkedEntry, 0, len(c.held.m))
 	for k, h := range c.held.m {
-		if now.Sub(h.last) > heldRefusalTTL {
+		if now.Sub(h.last) > ttl {
 			delete(c.held.m, k)
 			continue
 		}

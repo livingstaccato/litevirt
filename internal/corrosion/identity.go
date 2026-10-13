@@ -257,6 +257,14 @@ func identityCollapseUpdate(tx *sql.Tx, table string, setCols []string, setVals 
 //	                            id, so every node converges on one row
 //	live          older         the incoming tombstone is stale: skipped
 //	              tombstone
+//	live          newer or      the local row is tombstoned in place (its id kept,
+//	              equal         deleted_at and updated_at taken from the incoming
+//	              tombstone     tombstone), then the two tombstones are decided as
+//	                            above. Every tombstone of these tables is stamped by
+//	                            a by-name delete, and this is that delete's own effect
+//	                            on the row holding the name here: what the WAL does
+//	                            when it carries the delete. Only anti-entropy meets
+//	                            it, since a replicated INSERT is always a live row
 //	anything else               no decision: the apply proceeds as before
 //
 // Two LIVE rows under one name are canonical_identity's decision, and are
@@ -312,9 +320,10 @@ func lookupIdentityNaturalRow(tx *sql.Tx, table string, natVals []interface{}) (
 type identityCollision int
 
 const (
-	collisionNone         identityCollision = iota // no decision; apply as before
-	collisionYieldLocal                            // remove the local tombstone, then apply the incoming row
-	collisionSkipIncoming                          // the incoming row is superseded; apply nothing
+	collisionNone           identityCollision = iota // no decision; apply as before
+	collisionYieldLocal                              // remove the local tombstone, then apply the incoming row
+	collisionSkipIncoming                            // the incoming row is superseded; apply nothing
+	collisionTombstoneLocal                          // tombstone the local live row in place (the by-name delete's effect), then decide again
 )
 
 // identityIncoming is the incoming row's side of a collision.
@@ -323,6 +332,7 @@ type identityIncoming struct {
 	natVals   []interface{}
 	id, ts    string
 	deleted   bool
+	deletedAt string // the incoming tombstone's deleted_at, when deleted
 	skewGuard bool
 	now       time.Time
 }
@@ -356,13 +366,22 @@ func decideIdentityCollision(tx *sql.Tx, in identityIncoming) (identityCollision
 	case in.deleted:
 		if ord > 0 {
 			d = collisionSkipIncoming
+		} else {
+			// A delete of this name at or after the local live row's last
+			// write: what the by-name delete that stamped the incoming
+			// tombstone does to whatever row holds the name. Equal time: a
+			// delete wins the tie, as everywhere in this table.
+			d = collisionTombstoneLocal
 		}
 	}
-	if d != collisionYieldLocal {
+	if d != collisionYieldLocal && d != collisionTombstoneLocal {
 		return d, "", nil
 	}
 	if in.skewGuard && tsFutureSkewed(in.ts, in.now) {
 		return collisionNone, "", nil
+	}
+	if d == collisionTombstoneLocal {
+		return d, local.id, nil
 	}
 	if foreign, fErr := identityIDForeignNaturalKey(tx, in.table, tableIdentityKeys[in.table], in.id, in.natVals); fErr != nil || foreign {
 		return collisionNone, "", fErr
@@ -408,4 +427,15 @@ func (c *Client) yieldThenApply(tx *sql.Tx, table, localID string, apply func() 
 func identityRowLanded(tx *sql.Tx, table string, natVals []interface{}, id string) (bool, error) {
 	local, found, err := lookupIdentityNaturalRow(tx, table, natVals)
 	return found && local.id == id, err
+}
+
+// tombstoneLocalInPlace applies an incoming tombstone's deleted_at and
+// updated_at to the local live row localID (collisionTombstoneLocal). The
+// write is local to the merge transaction, like a yield.
+func tombstoneLocalInPlace(tx *sql.Tx, table, localID, deletedAt, updatedAt string) error {
+	if _, err := tx.Exec("UPDATE "+table+" SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+		deletedAt, updatedAt, localID); err != nil {
+		return fmt.Errorf("tombstone %s row %s in place: %w", table, localID, err)
+	}
+	return nil
 }

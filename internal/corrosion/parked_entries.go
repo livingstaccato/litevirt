@@ -17,13 +17,16 @@ package corrosion
 //
 // SCOPE IS AN ALLOWLIST (parkableTables). Only snapshots and
 // container_snapshots qualify: they are the tables whose rows carry a random
-// id beside a UNIQUE natural key, so two nodes can hold different rows for one
-// name and a refusal is a standing conflict between two rows rather than a
-// malformed write. They are the only replicated tables with a secondary
-// UNIQUE (TestParkableTables_AreTheIdentityTables pins the list against the
-// schema). A table is never holdable by default: a refusal anywhere else —
-// and any constraint other than one of these tables' — back-pressures as
-// before, and a new table joins only by being added here with its reasons.
+// id beside a UNIQUE natural key that a soft-deleted row still occupies, so
+// two nodes can hold different rows for one name and a refusal is a standing
+// conflict between two rows rather than a malformed write. The only other
+// replicated table with a secondary UNIQUE, registry_credentials, was judged
+// not holdable (notHoldableTables says why).
+// TestParkableTables_AreTheIdentityTables scans every replicated table —
+// both anti-entropy lanes and every table the statement ledgers write — and
+// fails until a new secondary UNIQUE is judged into one list or the other. A
+// table is never holdable by default: a refusal anywhere else back-pressures
+// as before.
 //
 // An entry is held (entryParkable) when its failure is a constraint refusal
 // and every statement is an unguarded LWW row write (plain insert, explicit
@@ -156,6 +159,17 @@ func parkKey(origin, hlc string) string { return origin + "\x00" + hlc }
 var parkableTables = map[string]bool{
 	"snapshots":           true,
 	"container_snapshots": true,
+}
+
+// notHoldableTables records each replicated table that has a secondary
+// UNIQUE and was judged NOT holdable, with the reason. Together with
+// parkableTables it must name every replicated table with such a UNIQUE
+// (TestParkableTables_AreTheIdentityTables), so a new UNIQUE is judged
+// rather than joining either list silently.
+var notHoldableTables = map[string]string{
+	"registry_credentials": "secret-bearing (sensitive lane), and its UNIQUE(scope, owner, registry) is partial on live rows " +
+		"(WHERE deleted_at IS NULL), so a re-create after a delete cannot collide with the tombstone; a live-vs-live " +
+		"collision there is a credential conflict an operator must see, not one to hold quietly",
 }
 
 // entryParkable reports whether an entry that failed with applyErr may be held

@@ -1223,11 +1223,14 @@ enabled with no expiry, and until the cluster upgrade has finished (the release 
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice] [--role <role>]
+lv role ls [--principal user:alice@local] [--role <role>]
 ```
 
-Principals are `user:<name>`, `group:<role>@<realm>` (a legacy role), or a
-directory group `group:<realm>/<group>` (an LDAP group is its DN). Paths are RBAC
+Principals are `user:<name>@<realm>` (a local account is `user:<name>@local`),
+`group:<role>@<realm>` (a legacy role), or a directory group
+`group:<realm>/<group>` (an LDAP group is its DN). Callers are matched as
+`user:<name>@<realm>`, so a bare `user:<name>` would grant nothing: `lv role
+grant` and the web UI refuse it, and warn if an older daemon stored one anyway. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
 

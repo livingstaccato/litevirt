@@ -1461,6 +1461,14 @@ The grammar treats a principal as realm-qualified only when the part after the
 last `@` names a realm (`local`, `oidc:*`, `ldap:*`) — so `user:alice@example.com`
 is a bare username (an email), while `user:alice@oidc:corp` is realm-qualified.
 
+`lv role grant` and the web UI's grant form ask the daemon to **refuse** a
+grant that would be stored bare (`refuse_inert_principal`), whatever the flag:
+with it off they get `FailedPrecondition` naming the qualified form instead of
+an inert row, and with it on the grammar above applies unchanged (a latched
+cluster still resolves a known local user). Against an older daemon that stores
+the bare row anyway, `lv role grant` prints a warning with the `lv role revoke`
+to remove it.
+
 Existing bare bindings created before enabling this remain **inert** (they never
 granted access) until rewritten. Once the capability has latched fleet-wide, run
 the one-time idempotent migration `lv role normalize` (supports `--dry-run`) to

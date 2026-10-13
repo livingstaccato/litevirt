@@ -86,6 +86,35 @@ func (p *Principal) PrincipalID() string {
 	return fmt.Sprintf("user:%s@%s", p.Subject, p.Realm)
 }
 
+// ClassifyUserPrincipal splits the body of a `user:<body>` principal into its
+// name and realm. It is realm-QUALIFIED only when the substring after the last
+// '@' names a realm ("local", "oidc:*", or "ldap:*"), so an email address
+// (user:alice@example.com) is treated as a bare username while user:alice@local
+// and user:alice@oidc:corp are qualified. Realms carry a ':' (or are "local")
+// and email domains do not — that is the disambiguation the grammar relies on,
+// which is why a bare "contains @" is not treated as realm-qualified.
+func ClassifyUserPrincipal(body string) (name, realm string, qualified bool) {
+	if i := strings.LastIndexByte(body, '@'); i > 0 && i < len(body)-1 {
+		suffix := body[i+1:]
+		if suffix == "local" || strings.HasPrefix(suffix, "oidc:") || strings.HasPrefix(suffix, "ldap:") {
+			return body[:i], suffix, true
+		}
+	}
+	return body, "", false
+}
+
+// IsBareUserPrincipal reports whether p is a `user:` principal that names no
+// realm. Callers are always matched as user:<name>@<realm> (PrincipalID), so a
+// role binding on a bare user principal never matches anyone.
+func IsBareUserPrincipal(p string) bool {
+	body, ok := strings.CutPrefix(p, "user:")
+	if !ok {
+		return false
+	}
+	_, _, qualified := ClassifyUserPrincipal(body)
+	return !qualified
+}
+
 // GroupPrincipalIDs returns the role-binding principals of this principal's
 // directory groups (DirectoryGroupPrincipal). The local realm has none.
 func (p *Principal) GroupPrincipalIDs() []string {

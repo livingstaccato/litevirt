@@ -68,7 +68,9 @@ type mockClient struct {
 	// removeImageUnimplemented makes RemoveImage answer as an older serving host.
 	removeImageUnimplemented bool
 
-	revokedSession string
+	lastGrantRoleReq *pb.GrantRoleRequest
+	grantRoleResp    *pb.GrantRoleResponse
+	revokedSession   string
 }
 
 func newMockClient() *mockClient {
@@ -455,7 +457,11 @@ func (m *mockClient) RestoreFromBackup(_ context.Context, _ *pb.RestoreFromBacku
 func (m *mockClient) RestoreLive(_ context.Context, _ *pb.RestoreLiveRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreLiveProgress], error) {
 	return &fakeStream[pb.RestoreLiveProgress]{}, nil
 }
-func (m *mockClient) GrantRole(_ context.Context, _ *pb.GrantRoleRequest, _ ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+func (m *mockClient) GrantRole(_ context.Context, in *pb.GrantRoleRequest, _ ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+	m.lastGrantRoleReq = in
+	if m.grantRoleResp != nil {
+		return m.grantRoleResp, nil
+	}
 	return &pb.GrantRoleResponse{Binding: &pb.RoleBinding{}}, nil
 }
 func (m *mockClient) RevokeRole(_ context.Context, _ *pb.RevokeRoleRequest, _ ...grpc.CallOption) (*pb.RevokeRoleResponse, error) {

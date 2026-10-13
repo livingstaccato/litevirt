@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // newRoleCmd is the operator surface for path-based RBAC role
@@ -43,14 +44,19 @@ func newRoleGrantCmd() *cobra.Command {
 		Short: "Grant a role to a user or group at a path scope",
 		Long: `Grant a role at an RBAC path. Principal forms:
 
-  user:<username>
+  user:<username>@<realm>    (a local account is user:<username>@local)
   group:<role>@<realm>       (a legacy role: admin, operator, viewer)
   group:<realm>/<group>      (a directory group; LDAP: its full DN)
 
+A user principal must name its realm: callers are matched as
+user:<username>@<realm>, so a bare user:<username> would grant nothing, and
+the grant is refused. (With auth.rbac_realm latched the daemon resolves a bare
+name of a known local user to @local itself.)
+
 Examples:
-  lv role grant Admin user:alice --path /
+  lv role grant Admin user:alice@local --path /
   lv role grant Operator group:oidc:corp/platform-team --path /projects/acme --propagate
-  lv role grant Viewer user:contractor --path /projects/acme/vms/web-1
+  lv role grant Viewer user:contractor@oidc:corp --path /projects/acme/vms/web-1
 
 --propagate causes the binding to apply to every descendant path scope,
 not just the named one. Without --propagate the binding only matches
@@ -67,6 +73,8 @@ exact path lookups.`,
 					Role:      role,
 					Principal: principal,
 					Propagate: propagate,
+					// Never store a binding that cannot match anyone.
+					RefuseInertPrincipal: true,
 				})
 				if err != nil {
 					return fmt.Errorf("grant role: %w", err)
@@ -74,6 +82,14 @@ exact path lookups.`,
 				fmt.Printf("granted: id=%s path=%s role=%s principal=%s propagate=%v\n",
 					resp.Binding.Id, resp.Binding.Path, resp.Binding.Role,
 					resp.Binding.Principal, resp.Binding.Propagate)
+				// A daemon older than refuse_inert_principal stores the bare
+				// form anyway: say that it grants nothing, and how to fix it.
+				if auth.IsBareUserPrincipal(resp.Binding.Principal) {
+					fmt.Fprintf(os.Stderr, "warning: %s names no realm and will never match anyone "+
+						"(callers are matched as user:<name>@<realm>). Remove it with lv role revoke %s "+
+						"and grant %s@local for a local account (or @oidc:<realm> / @ldap:<realm>).\n",
+						resp.Binding.Principal, resp.Binding.Id, resp.Binding.Principal)
+				}
 				return nil
 			})
 		},

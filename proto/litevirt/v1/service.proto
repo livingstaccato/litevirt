@@ -2247,6 +2247,13 @@ message GrantRoleRequest {
     string role       = 2;
     string principal  = 3;
     bool   propagate  = 4;
+    // refuse_inert_principal: refuse (FailedPrecondition) a grant that would
+    // be stored as a bare user:<name> principal. No caller is ever matched as
+    // a bare user principal (callers are user:<name>@<realm>), so such a
+    // binding grants nothing. Without it a bare principal is stored verbatim
+    // while auth.rbac_realm is off (legacy behavior); with auth.rbac_realm on
+    // the realm grammar already rejects or resolves it.
+    bool   refuse_inert_principal = 5;
 }
 message GrantRoleResponse { RoleBinding binding = 1; }
 

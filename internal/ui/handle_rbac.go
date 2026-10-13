@@ -45,6 +45,8 @@ func (s *Server) handleGrantRole(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := s.grpc.GrantRole(s.uiBearerCtx(r), &pb.GrantRoleRequest{
 		Path: path, Role: role, Principal: principal, Propagate: r.FormValue("propagate") == "on",
+		// A bare user:<name> would be stored as a binding nobody matches.
+		RefuseInertPrincipal: true,
 	})
 	if err != nil {
 		rpcWriteFailed(w, "Grant", err)

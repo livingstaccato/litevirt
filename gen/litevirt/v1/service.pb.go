@@ -19905,13 +19905,20 @@ func (x *RoleBinding) GetUpdatedAt() string {
 }
 
 type GrantRoleRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Role          string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
-	Principal     string                 `protobuf:"bytes,3,opt,name=principal,proto3" json:"principal,omitempty"`
-	Propagate     bool                   `protobuf:"varint,4,opt,name=propagate,proto3" json:"propagate,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Path      string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Role      string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Principal string                 `protobuf:"bytes,3,opt,name=principal,proto3" json:"principal,omitempty"`
+	Propagate bool                   `protobuf:"varint,4,opt,name=propagate,proto3" json:"propagate,omitempty"`
+	// refuse_inert_principal: refuse (FailedPrecondition) a grant that would
+	// be stored as a bare user:<name> principal. No caller is ever matched as
+	// a bare user principal (callers are user:<name>@<realm>), so such a
+	// binding grants nothing. Without it a bare principal is stored verbatim
+	// while auth.rbac_realm is off (legacy behavior); with auth.rbac_realm on
+	// the realm grammar already rejects or resolves it.
+	RefuseInertPrincipal bool `protobuf:"varint,5,opt,name=refuse_inert_principal,json=refuseInertPrincipal,proto3" json:"refuse_inert_principal,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *GrantRoleRequest) Reset() {
@@ -19968,6 +19975,13 @@ func (x *GrantRoleRequest) GetPrincipal() string {
 func (x *GrantRoleRequest) GetPropagate() bool {
 	if x != nil {
 		return x.Propagate
+	}
+	return false
+}
+
+func (x *GrantRoleRequest) GetRefuseInertPrincipal() bool {
+	if x != nil {
+		return x.RefuseInertPrincipal
 	}
 	return false
 }
@@ -42768,12 +42782,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tprincipal\x18\x04 \x01(\tR\tprincipal\x12\x1c\n" +
 	"\tpropagate\x18\x05 \x01(\bR\tpropagate\x12\x1d\n" +
 	"\n" +
-	"updated_at\x18\x06 \x01(\tR\tupdatedAt\"v\n" +
+	"updated_at\x18\x06 \x01(\tR\tupdatedAt\"\xac\x01\n" +
 	"\x10GrantRoleRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x1c\n" +
 	"\tprincipal\x18\x03 \x01(\tR\tprincipal\x12\x1c\n" +
-	"\tpropagate\x18\x04 \x01(\bR\tpropagate\"G\n" +
+	"\tpropagate\x18\x04 \x01(\bR\tpropagate\x124\n" +
+	"\x16refuse_inert_principal\x18\x05 \x01(\bR\x14refuseInertPrincipal\"G\n" +
 	"\x11GrantRoleResponse\x122\n" +
 	"\abinding\x18\x01 \x01(\v2\x18.litevirt.v1.RoleBindingR\abinding\"#\n" +
 	"\x11RevokeRoleRequest\x12\x0e\n" +

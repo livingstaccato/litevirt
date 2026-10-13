@@ -70,8 +70,8 @@ func TestFleet_IndependentReplicas_ContainerRelocationDoesNotStallTheStream(t *t
 			continue
 		}
 		if dst.StateDetail != corrosion.ContainerRelocateRecreateDetail || dst.RelocateToken != "tok-stream" {
-			t.Errorf("%s: target = detail %q token %q, want %q / tok-stream",
-				n.Name, dst.StateDetail, dst.RelocateToken, corrosion.ContainerRelocateRecreateDetail)
+			t.Errorf("%s: target = detail %q token %s, want %q / %s",
+				n.Name, dst.StateDetail, redacted(dst.RelocateToken), corrosion.ContainerRelocateRecreateDetail, redacted("tok-stream"))
 		}
 	}
 	c.WaitConverged(t, convergeTimeout)

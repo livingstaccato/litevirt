@@ -92,7 +92,7 @@ func TestFleet_LeaseTermTieAck_StaysAcknowledgedAndReadsConverged(t *testing.T) 
 		}
 		tok, err := admin.CreateToken(ctx, &pb.CreateTokenRequest{Username: user, Name: "ack"})
 		if err != nil || tok.GetToken() == "" {
-			t.Fatalf("%s: CreateToken: %+v %v", n.Name, tok, err)
+			t.Fatalf("%s: CreateToken: %s %v", n.Name, credState(tok), err)
 		}
 		resp, err := c.bearerClient(n, tok.GetToken()).AcknowledgeLeaseTermTie(ctx,
 			&pb.AcknowledgeLeaseTermTieRequest{Key: key, Term: term})

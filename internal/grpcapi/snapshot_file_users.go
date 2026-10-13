@@ -82,7 +82,19 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 		}
 		for _, d := range disks {
 			file := s.hostDiskFile(d.Path)
-			if uses(d.BackingDisk) || chainReaches(file, s.diskFormatOf(vm, d.Path, formats), uses) {
+			if uses(d.BackingDisk) {
+				out = append(out, vm.Name)
+				break
+			}
+			reached, rerr := chainReaches(file, s.diskFormatOf(vm, d.Path, formats), uses)
+			if rerr != nil {
+				// Not read: in use, and the call fails (Unavailable).
+				if noAnswer == nil {
+					noAnswer = rerr
+				}
+				reached = true
+			}
+			if reached {
 				out = append(out, vm.Name)
 				break
 			}
@@ -133,24 +145,51 @@ func (s *Server) diskFormatOf(vm *corrosion.VMRecord, file string, formats map[s
 // keeps, never one too few, which would delete or merge a file in use
 // (re-review R2-C2). A layer that cannot be read, or a protocol backing,
 // ends the walk.
-func chainReaches(file, topFormat string, hit func(string) bool) bool {
+//
+// The headers are read under storage.Bounded, per disk: a disk on a network
+// filesystem whose server does not answer gets the *storage.FSNoAnswerError
+// within the bound, never false. "Not reached" from a chain that was not
+// read would let a delete merge or remove a file the disk is built on.
+func chainReaches(file, topFormat string, hit func(string) bool) (bool, error) {
 	if file == "" || !filepath.IsAbs(file) {
-		return false
+		return false, nil
 	}
+	stat := chainStat // read here: the walk may outlive this call
+	layers, err := storage.Bounded("read the backing chain ("+topFormat+") of", file, func() ([]string, error) {
+		return chainLayers(stat, file, topFormat), nil
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, l := range layers {
+		if hit(l) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// chainStat stats a layer of a disk's chain (chainLayers, layerBacking); a
+// test replaces it.
+var chainStat = os.Stat
+
+// chainLayers is file and each layer of its backing chain that chainReaches
+// tests, top first: the walk reads only headers and touches nothing else,
+// so it can be left behind when its storage does not answer.
+func chainLayers(stat func(string) (os.FileInfo, error), file, topFormat string) []string {
+	var out []string
 	path, format := file, topFormat
 	for depth := 0; depth <= maxBackingDepth; depth++ {
-		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
-			return false
+		if fi, err := stat(path); err != nil || !fi.Mode().IsRegular() {
+			return out
 		}
-		if hit(path) {
-			return true
-		}
+		out = append(out, path)
 		if format != "" && format != "qcow2" {
-			return false
+			return out
 		}
 		info, err := qcow2.Info(path)
 		if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
-			return false
+			return out
 		}
 		b := info.BackingFile
 		if !filepath.IsAbs(b) {
@@ -158,7 +197,7 @@ func chainReaches(file, topFormat string, hit func(string) bool) bool {
 		}
 		path, format = b, info.BackingFormat
 	}
-	return false
+	return out
 }
 
 // headerUsersKeep reports whether a file vmName's delete would remove must
@@ -336,10 +375,15 @@ func (s *Server) keptDiskFiles(ctx context.Context, vmName string) map[string]bo
 		if d.DeleteWithVM || d.Path == "" {
 			continue
 		}
-		chainReaches(s.hostDiskFile(d.Path), "", func(p string) bool {
+		if _, err := chainReaches(s.hostDiskFile(d.Path), "", func(p string) bool {
 			kept[filepath.Clean(p)] = true
 			return false
-		})
+		}); err != nil {
+			// A chain not read keeps every file: what it is built on is
+			// unknown.
+			slog.Error("delete: cannot read a kept disk's backing chain; keeping every file", "vm", vmName, "disk", d.DiskName, "error", err)
+			return nil
+		}
 		kept[filepath.Clean(s.hostDiskFile(d.Path))] = true
 	}
 	return kept

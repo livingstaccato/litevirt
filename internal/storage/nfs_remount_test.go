@@ -28,10 +28,10 @@ func installRebootMounts(t *testing.T) *rebootMounts {
 	t.Helper()
 	kernelNosymfollow(t, false)
 	m := &rebootMounts{}
-	prevInfo, prevRun := readMountInfo, nfsRemountRun
-	readMountInfo = m.info
+	prevRun := nfsRemountRun
+	restoreInfo := readMountInfo.set(m.info)
 	nfsRemountRun = m.run
-	t.Cleanup(func() { readMountInfo, nfsRemountRun = prevInfo, prevRun })
+	t.Cleanup(func() { restoreInfo(); nfsRemountRun = prevRun })
 	return m
 }
 

@@ -880,13 +880,20 @@ message PushImageRequest   { string name = 1; string target_host = 2; }
 // the call. deleted_image: the caller has just deleted image name; the host
 // waits (bounded) for its own catalog to show the delete before it decides.
 // An older host ignores it and keeps the current file.
+// version: one file of image name (its file name, its path, or the digest
+// after '@'): only that file is judged, and it is removed although the store
+// may be shared with other hosts — the operator asserts no other host's disk
+// is built on it. Every other keep still applies. A host that honours it
+// echoes it in the response's version; an older host does not (it would
+// prune the whole image), so a caller probes with dry_run first.
 message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3;
-    bool deleted_image = 4; }
-// kept: each file of a deleted image the host kept, and why.
+    bool deleted_image = 4; string version = 5; }
+// kept: each file the host kept, and why.
 // removes_deleted_images: the host's build removes a deleted image's current
 // file (false from an older build, which always keeps it).
+// version: the request's version, when this build honoured it.
 message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3;
-    repeated KeptImageFile kept = 4; bool removes_deleted_images = 5; }
+    repeated KeptImageFile kept = 4; bool removes_deleted_images = 5; string version = 6; }
 message KeptImageFile { string path = 1; string reason = 2; }
 message RemoveImageRequest { string name = 1; }
 // hosts: each host's outcome; failed: the hosts that could not be asked, and

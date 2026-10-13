@@ -63,8 +63,8 @@ type NFSPoolMount struct {
 // can still reach one through a symlink, and following that symlink stats
 // the NFS server, which may not answer.
 var (
-	nfsResolveBound  = 5 * time.Second
-	resolveNFSParent = resolveExisting
+	nfsResolveBound  = newTestHook(5 * time.Second)
+	resolveNFSParent = newTestHook(resolveExisting)
 	nfsResolving     sync.Map // path -> *nfsResolveCall
 )
 
@@ -78,7 +78,7 @@ type nfsResolveCall struct {
 // a server that never answers leaves one stuck goroutine per path, not one
 // per check.
 func boundedResolve(p string) (string, error) {
-	resolve, bound := resolveNFSParent, nfsResolveBound
+	resolve, bound := resolveNFSParent.get(), nfsResolveBound.get()
 	v, running := nfsResolving.LoadOrStore(p, &nfsResolveCall{done: make(chan struct{})})
 	c := v.(*nfsResolveCall)
 	if !running {
@@ -311,7 +311,6 @@ func OverrideNFSMountCommandForTest(run func(ctx context.Context, name string, a
 // mount point's parent, and its bound, for tests in other packages. It
 // returns the restore function.
 func OverrideNFSPathResolverForTest(resolve func(string) string, bound time.Duration) func() {
-	prevR, prevB := resolveNFSParent, nfsResolveBound
-	resolveNFSParent, nfsResolveBound = resolve, bound
-	return func() { resolveNFSParent, nfsResolveBound = prevR, prevB }
+	restoreR, restoreB := resolveNFSParent.set(resolve), nfsResolveBound.set(bound)
+	return func() { restoreR(); restoreB() }
 }

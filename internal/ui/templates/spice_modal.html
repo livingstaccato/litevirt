@@ -9,15 +9,21 @@
     <p class="muted" style="font-size:12px;margin-top:8px">SPICE is available only while the VM is running and was created with SPICE enabled.</p>
     {{else}}
     <p class="muted" style="font-size:13px;margin-bottom:12px">
-      Open with <code>virt-viewer</code> / <code>remote-viewer</code>: download the connection file, or copy the URI below.
+      The console listens on <span class="mono">{{.Host}}</span>'s <span class="mono">127.0.0.1</span> only, so a SPICE client cannot reach it at the host's address.
+      From your workstation, open it through litevirt (needs <code>remote-viewer</code>):
     </p>
     <div class="form-row">
-      <label>Connection URI</label>
-      <input type="text" readonly value="{{.Uri}}" onclick="this.select()" style="width:100%;font-family:monospace">
+      <input type="text" readonly value="lv spice {{.Name}} --launch" onclick="this.select()" style="width:100%;font-family:monospace">
     </div>
-    <div style="display:flex;gap:20px;font-size:13px;margin-bottom:8px">
-      <span><span class="muted">Host</span> <span class="mono">{{.Host}}</span></span>
-      <span><span class="muted">Port</span> <span class="mono">{{.Port}}</span></span>
+    <p class="muted" style="font-size:13px;margin-bottom:12px">
+      Or use the connection file below on the host itself, or through an SSH tunnel to it:
+    </p>
+    <div class="form-row">
+      <input type="text" readonly value="ssh -o ExitOnForwardFailure=yes -L {{.Port}}:127.0.0.1:{{.Port}} &lt;user&gt;@{{.Host}}" onclick="this.select()" style="width:100%;font-family:monospace">
+    </div>
+    <div class="form-row">
+      <label>Connection URI (at the tunnel's end)</label>
+      <input type="text" readonly value="{{.Uri}}" onclick="this.select()" style="width:100%;font-family:monospace">
     </div>
     {{if .Warning}}
     <div class="error" style="margin-bottom:8px">A SPICE client may not be able to connect: {{.Warning}}</div>

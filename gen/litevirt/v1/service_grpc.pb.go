@@ -309,6 +309,7 @@ const (
 	LiteVirt_ApproveRebalanceProposal_FullMethodName   = "/litevirt.v1.LiteVirt/ApproveRebalanceProposal"
 	LiteVirt_RejectRebalanceProposal_FullMethodName    = "/litevirt.v1.LiteVirt/RejectRebalanceProposal"
 	LiteVirt_GetSpiceInfo_FullMethodName               = "/litevirt.v1.LiteVirt/GetSpiceInfo"
+	LiteVirt_ProxySpice_FullMethodName                 = "/litevirt.v1.LiteVirt/ProxySpice"
 	LiteVirt_PreflightUpgrade_FullMethodName           = "/litevirt.v1.LiteVirt/PreflightUpgrade"
 	LiteVirt_ListRegions_FullMethodName                = "/litevirt.v1.LiteVirt/ListRegions"
 	LiteVirt_RegionStatus_FullMethodName               = "/litevirt.v1.LiteVirt/RegionStatus"
@@ -896,6 +897,13 @@ type LiteVirtClient interface {
 	RejectRebalanceProposal(ctx context.Context, in *RejectRebalanceProposalRequest, opts ...grpc.CallOption) (*RebalanceProposal, error)
 	// ──: SPICE console info ──
 	GetSpiceInfo(ctx context.Context, in *GetSpiceInfoRequest, opts ...grpc.CallOption) (*GetSpiceInfoResponse, error)
+	// ProxySpice carries ONE SPICE channel connection (a SPICE client opens
+	// several) between the caller and the VM's SPICE listener on its host's
+	// 127.0.0.1, forwarded to the owning host as ProxyVNC is. The VM name is
+	// in the "x-vm-name" metadata. The bytes are relayed unchanged: the
+	// client presents the console's password (GetSpiceInfoResponse.password)
+	// itself. `lv spice --launch` / `--listen` use it.
+	ProxySpice(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SpiceData, SpiceData], error)
 	// ── Upgrade safety: pre-flight ──
 	PreflightUpgrade(ctx context.Context, in *PreflightUpgradeRequest, opts ...grpc.CallOption) (*PreflightUpgradeResponse, error)
 	// ── federation ──
@@ -4261,6 +4269,19 @@ func (c *liteVirtClient) GetSpiceInfo(ctx context.Context, in *GetSpiceInfoReque
 	return out, nil
 }
 
+func (c *liteVirtClient) ProxySpice(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SpiceData, SpiceData], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_ProxySpice_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SpiceData, SpiceData]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ProxySpiceClient = grpc.BidiStreamingClient[SpiceData, SpiceData]
+
 func (c *liteVirtClient) PreflightUpgrade(ctx context.Context, in *PreflightUpgradeRequest, opts ...grpc.CallOption) (*PreflightUpgradeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PreflightUpgradeResponse)
@@ -4293,7 +4314,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[41], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[42], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4462,7 +4483,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[42], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[43], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -5224,6 +5245,13 @@ type LiteVirtServer interface {
 	RejectRebalanceProposal(context.Context, *RejectRebalanceProposalRequest) (*RebalanceProposal, error)
 	// ──: SPICE console info ──
 	GetSpiceInfo(context.Context, *GetSpiceInfoRequest) (*GetSpiceInfoResponse, error)
+	// ProxySpice carries ONE SPICE channel connection (a SPICE client opens
+	// several) between the caller and the VM's SPICE listener on its host's
+	// 127.0.0.1, forwarded to the owning host as ProxyVNC is. The VM name is
+	// in the "x-vm-name" metadata. The bytes are relayed unchanged: the
+	// client presents the console's password (GetSpiceInfoResponse.password)
+	// itself. `lv spice --launch` / `--listen` use it.
+	ProxySpice(grpc.BidiStreamingServer[SpiceData, SpiceData]) error
 	// ── Upgrade safety: pre-flight ──
 	PreflightUpgrade(context.Context, *PreflightUpgradeRequest) (*PreflightUpgradeResponse, error)
 	// ── federation ──
@@ -6268,6 +6296,9 @@ func (UnimplementedLiteVirtServer) RejectRebalanceProposal(context.Context, *Rej
 }
 func (UnimplementedLiteVirtServer) GetSpiceInfo(context.Context, *GetSpiceInfoRequest) (*GetSpiceInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSpiceInfo not implemented")
+}
+func (UnimplementedLiteVirtServer) ProxySpice(grpc.BidiStreamingServer[SpiceData, SpiceData]) error {
+	return status.Error(codes.Unimplemented, "method ProxySpice not implemented")
 }
 func (UnimplementedLiteVirtServer) PreflightUpgrade(context.Context, *PreflightUpgradeRequest) (*PreflightUpgradeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreflightUpgrade not implemented")
@@ -11277,6 +11308,13 @@ func _LiteVirt_GetSpiceInfo_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ProxySpice_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(LiteVirtServer).ProxySpice(&grpc.GenericServerStream[SpiceData, SpiceData]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ProxySpiceServer = grpc.BidiStreamingServer[SpiceData, SpiceData]
+
 func _LiteVirt_PreflightUpgrade_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreflightUpgradeRequest)
 	if err := dec(in); err != nil {
@@ -13343,6 +13381,12 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "ListRecoveryClaims",
 			Handler:       _LiteVirt_ListRecoveryClaims_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "ProxySpice",
+			Handler:       _LiteVirt_ProxySpice_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "CrossRegionMigrate",

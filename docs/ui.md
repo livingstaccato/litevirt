@@ -109,12 +109,16 @@ console therefore gets a per-VM password, which only litevirt presents:
 - **VNC**: the daemon on the VM's own host reads the password from the running
   domain and authenticates to the listener. The browser, the UI server and
   any daemon that only relays the stream never see it.
-- **SPICE** is not proxied, so the client has to present the password.
-  `GetSpiceInfo` returns it to a caller that holds `vm.console` on the VM, and
-  never logs it. The UI's **Download .vv** file carries it (the modal page
-  itself does not). `lv spice <vm> --launch` hands it to `remote-viewer` in a
-  private (0600) connection file rather than on the command line. `lv spice
-  <vm> --show-password` prints it for a client you start yourself.
+- **SPICE**: the client has to present the password. `lv spice` carries the
+  SPICE stream through the daemon unchanged (`ProxySpice`), and a SPICE
+  password travels encrypted to a key the listener makes for each
+  connection, so no relay can present it for the client the way the daemon
+  does for VNC. `GetSpiceInfo` returns it to a caller that holds
+  `vm.console` on the VM, and never logs it. The UI's **Download .vv** file
+  carries it (the modal page itself does not). `lv spice <vm> --launch` hands
+  it to `remote-viewer` in a private (0600) connection file rather than on
+  the command line. `lv spice <vm> --show-password` prints it for a client
+  you start yourself.
 
 The password is stored in libvirt's domain definition (`<graphics
 passwd='...'>`, readable only by root). Libvirt sends it to QEMU over the
@@ -218,19 +222,41 @@ clients like `remote-viewer`, virt-manager, or the GTK SPICE client.
 
 Enable SPICE at VM-create time (the "Enable SPICE console" checkbox) or via
 `graphics: { spice: true }` in compose. A **SPICE** button then appears on the
-detail page of a running SPICE-enabled VM; it opens a modal showing the
-`spice://host:port` URI and a **Download .vv** button — a virt-viewer
-connection file that `remote-viewer`/`virt-viewer` opens directly (the same
-flow Proxmox uses).
+detail page of a running SPICE-enabled VM.
 
-The daemon does NOT proxy SPICE through the UI/REST gateway — clients reach the
-host's SPICE port directly (via the `.vv` file or `lv spice <vm>`), and present
-the console's password themselves (see [Console passwords](#console-passwords);
-the `.vv` file carries it). If the host's port isn't reachable externally,
-tunnel via SSH:
+Like VNC, the SPICE listener is bound to the VM host's `127.0.0.1`, so no
+client can reach it at the host's address. There are two ways in:
 
-    ssh -L 5901:127.0.0.1:<port> root@<host>
-    remote-viewer spice://127.0.0.1:5901
+- **Through litevirt** (from anywhere `lv` reaches the cluster): `lv spice
+  <vm> --launch` opens a loopback port on your machine, carries each SPICE
+  channel from it to the VM's host over `ProxySpice` (the daemon you entered
+  on forwards it to the VM's own host), and starts `remote-viewer` on it
+  with the console's password in a private connection file. It runs until
+  remote-viewer exits. `lv spice <vm> --listen 127.0.0.1:5930` does the same
+  for a SPICE client you start yourself (with `--show-password`), until
+  Ctrl+C; the address must be a loopback one. Each channel is authorized as
+  you (`vm.console` on the VM) and ends when your session does. Unlike `lv
+  vnc --listen`, a local user who connects to that port still needs the
+  console's password, when the console has one. A console with no password
+  (console passwords not in force, or one that could not be read) is open
+  to anyone on your machine who reaches that port, with your credentials, as
+  with `lv vnc --listen`; `lv spice` warns when that is the case.
+- **Directly**, on the VM's host or through an SSH tunnel to its loopback.
+  The modal shows the tunnel command (with `ExitOnForwardFailure=yes`, so
+  ssh stops rather than run on when the local port is already taken), and its **Download .vv** button gives
+  a virt-viewer connection file for `127.0.0.1:<port>`, carrying the
+  password, that `remote-viewer`/`virt-viewer` opens at the tunnel's end:
+
+      ssh -o ExitOnForwardFailure=yes -L <port>:127.0.0.1:<port> <user>@<host>
+      remote-viewer <vm>.vv     # or spice://127.0.0.1:<port>, with the password
+
+  Opened on a machine with no such tunnel, the file connects to whatever
+  listens on that machine's `127.0.0.1:<port>`, if anything, and a process
+  listening there would be handed the console's password. Open it only at
+  the end of the tunnel, or on the VM's host.
+
+The browser cannot open a TCP port, so the UI itself carries no SPICE
+stream; the web gateway serves only VNC (noVNC over `ProxyVNC`).
 
 A bundled in-browser SPICE client (spice-html5) is on the long-term roadmap.
 

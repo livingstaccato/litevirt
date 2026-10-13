@@ -13,20 +13,40 @@ func TestSpiceModalAndVV(t *testing.T) {
 	mock.spiceInfoResp = &pb.GetSpiceInfoResponse{Host: "10.0.0.5", Port: 5901, Uri: "spice://10.0.0.5:5901"}
 	s := newTestUIServer(t, mock)
 
-	t.Run("modal shows uri + download link", func(t *testing.T) {
+	// SPICE listens on the VM host's 127.0.0.1, so the modal leads with the
+	// path that works from anywhere (`lv spice --launch`, carried through
+	// litevirt) and gives the tunnel for the .vv, never a URI at the host
+	// address, which is always "connection refused" (N2 in
+	// vnc-password-lab.md).
+	//
+	// Mutation "modal shows resp.Uri" — red.
+	t.Run("modal shows how to reach the loopback listener + download link", func(t *testing.T) {
 		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice-modal")))
 		assertStatus(t, w, http.StatusOK)
-		mustContain(t, w.Body.String(), "spice://10.0.0.5:5901", "5901", "/ui/vms/vm1/spice.vv")
+		body := w.Body.String()
+		mustContain(t, body, "lv spice vm1 --launch", "ssh -o ExitOnForwardFailure=yes -L 5901:127.0.0.1:5901", "10.0.0.5",
+			"spice://127.0.0.1:5901", "/ui/vms/vm1/spice.vv")
+		if strings.Contains(body, "spice://10.0.0.5:5901") {
+			t.Errorf("the modal offers a URI at the host address, where SPICE does not listen:\n%s", body)
+		}
 	})
 
+	// The .vv points at 127.0.0.1:<port>: the VM's host itself, or the
+	// workstation end of the documented `ssh -L <port>:127.0.0.1:<port>`
+	// tunnel. The lab proved this is the form that connects.
+	//
+	// Mutation ".vv host=resp.Host" — red.
 	t.Run("vv file is a virt-viewer connection file", func(t *testing.T) {
 		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice.vv")))
 		assertStatus(t, w, http.StatusOK)
 		body := w.Body.String()
-		for _, want := range []string{"[virt-viewer]", "type=spice", "host=10.0.0.5", "port=5901"} {
+		for _, want := range []string{"[virt-viewer]", "type=spice", "\nhost=127.0.0.1\n", "\nport=5901\n"} {
 			if !strings.Contains(body, want) {
 				t.Errorf(".vv missing %q:\n%s", want, body)
 			}
+		}
+		if strings.Contains(body, "10.0.0.5") {
+			t.Errorf(".vv points at the host address, where SPICE does not listen:\n%s", body)
 		}
 		if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "vm1.vv") {
 			t.Errorf("Content-Disposition = %q, want attachment vm1.vv", cd)

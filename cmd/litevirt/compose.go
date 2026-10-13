@@ -39,8 +39,9 @@ func newComposeCmd() *cobra.Command {
 
 func newUpCmd() *cobra.Command {
 	var (
-		file string
-		yes  bool
+		file        string
+		yes         bool
+		allowWeaken bool
 	)
 	cmd := &cobra.Command{
 		Use:   "up",
@@ -61,6 +62,7 @@ func newUpCmd() *cobra.Command {
 				dryStream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),
 					DryRun:      true,
+					AllowWeaken: allowWeaken,
 				})
 				if err != nil {
 					return fmt.Errorf("deploy dry-run: %w", err)
@@ -110,6 +112,8 @@ func newUpCmd() *cobra.Command {
 						fmt.Printf("  # %s\n", op.Detail)
 					case "loadbalancer":
 						fmt.Printf("  # %s\n", op.Detail)
+					case "warning":
+						fmt.Printf("  warning: %s\n", op.Detail)
 					default:
 						fmt.Printf("    %s\n", op.Detail)
 					}
@@ -132,6 +136,7 @@ func newUpCmd() *cobra.Command {
 				// Execute via DeployStack RPC (handles VM creation, stack record, LB, etc.).
 				stream, err := c.DeployStack(ctx, &pb.DeployStackRequest{
 					ComposeYaml: string(yamlData),
+					AllowWeaken: allowWeaken,
 				})
 				if err != nil {
 					return fmt.Errorf("deploy stack: %w", err)
@@ -179,6 +184,8 @@ func newUpCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "litevirt-compose.yaml", "Compose file path")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
+	cmd.Flags().BoolVar(&allowWeaken, "allow-weaken", false,
+		"Restore declared NIC security groups, and declared guards looser than the ones enforced now, over runtime changes (lv sg bind, lv firewall nic-guard set)")
 	return cmd
 }
 
@@ -381,123 +388,83 @@ func newPsCmd() *cobra.Command {
 	return cmd
 }
 
-// composeVMState renders a VM state the way the daemon stores it ("error",
-// "creating", …), which is what the planner's transient/error retry check
-// matches on. The proto enum's String() is "VM_ERROR", which matched nothing,
-// so an error-state VM read as unchanged in the diff while the server planned a
-// retry (delete + recreate under the default strategy) for it.
-func composeVMState(s pb.VMState) string {
-	return strings.ToLower(strings.TrimPrefix(s.String(), "VM_"))
-}
-
 func newDiffCmd() *cobra.Command {
-	var file string
+	var (
+		file        string
+		allowWeaken bool
+	)
 	cmd := &cobra.Command{
 		Use:   "diff",
 		Short: "Show what lv compose up would change",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			f, err := compose.Parse(file)
+			yamlData, err := os.ReadFile(file)
 			if err != nil {
+				return fmt.Errorf("read compose file: %w", err)
+			}
+			if _, err := compose.ParseNamed(file, yamlData); err != nil {
 				return err
 			}
-
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.ListVMs(ctx, &pb.ListVMsRequest{StackName: f.Name})
+				// The server's plan, made exactly as lv compose up's (placement,
+				// name collisions, the live NIC security and what the caller may
+				// restore of it), so the diff and the deploy cannot disagree.
+				resp, err := c.DiffStack(ctx, &pb.DiffStackRequest{ComposeYaml: string(yamlData), AllowWeaken: allowWeaken})
 				if err != nil {
-					return fmt.Errorf("list VMs: %w", err)
-				}
-
-				// ListVMs ships a PROJECTION of each spec (labels, uuid, machine,
-				// cpu mode) — no image and no cloud-init. Diffing against the
-				// projection made every VM of a cloud-init stack read as
-				// "image →X cloud-init added", so the full spec comes from
-				// InspectVM. A VM that cannot be inspected fails the diff rather
-				// than being reported as changed.
-				current := make([]compose.CurrentVM, 0, len(resp.Vms))
-				for _, vm := range resp.Vms {
-					full, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: vm.Name})
-					if err != nil {
-						return fmt.Errorf("inspect %s: %w", vm.Name, err)
+					if st, ok := status.FromError(err); ok {
+						return errors.New(st.Message())
 					}
-					cur := compose.CurrentVM{
-						Name:     vm.Name,
-						CPU:      int(vm.CpuActual),
-						MemMiB:   int(vm.MemActualMib),
-						State:    composeVMState(vm.State),
-						HostName: vm.HostName,
-						Spec:     full.Spec,
-					}
-					if full.Spec != nil {
-						cur.Image = full.Spec.Image
-						if ci := full.Spec.CloudInit; ci != nil {
-							cur.CloudInitHash = compose.CloudInitHash(ci.Userdata, ci.Networkconfig)
-						}
-					}
-					current = append(current, cur)
-				}
-
-				plan, err := compose.Build(f, current)
-				if err != nil {
 					return err
 				}
-				if collisions, err := composeDiffNameCollisions(ctx, c, f, plan); err != nil {
-					return err
-				} else if len(collisions) > 0 {
-					return fmt.Errorf("pre-deploy validation failed:\n  - %s", strings.Join(collisions, "\n  - "))
-				}
-
-				fmt.Println(plan.Summary())
-				for _, op := range plan.Ops {
-					switch op.Kind {
-					case compose.OpCreate:
-						fmt.Printf("  + %s\n", op.Detail)
-					case compose.OpUpdate:
-						fmt.Printf("  ~ %s\n", op.Detail)
-					case compose.OpDelete:
-						fmt.Printf("  - %s\n", op.Detail)
-					case compose.OpNoChange:
-						fmt.Printf("    %s\n", op.Detail)
-					}
-					if op.Warning != "" {
-						fmt.Printf("    warning: %s\n", op.Warning)
-					}
-				}
+				printServerDiff(resp)
 				return nil
 			})
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "litevirt-compose.yaml", "Compose file path")
+	cmd.Flags().BoolVar(&allowWeaken, "allow-weaken", false,
+		"Plan as lv compose up --allow-weaken would: restore declared NIC security groups and looser declared guards over runtime changes")
 	return cmd
 }
 
-// composeDiffNameCollisions is the diff's copy of the server plan's name check:
-// a VM the diff would create whose name a VM of another stack (or of no stack)
-// already holds. VM names are cluster-wide, so `lv compose up` would refuse the
-// file; the diff says so instead of showing a create. Containers are left to
-// the server's plan: their names are per host, and only placement knows the
-// host.
-func composeDiffNameCollisions(ctx context.Context, c pb.LiteVirtClient, f *compose.File, plan *compose.Plan) ([]string, error) {
-	var out []string
-	for _, op := range plan.Ops {
-		if op.Kind != compose.OpCreate {
+// printServerDiff prints a DiffStack plan: its warnings, then each entry, then
+// the workload summary.
+func printServerDiff(resp *pb.DiffStackResponse) {
+	var creates, updates, deletes, unchanged int
+	var lines []string
+	for _, e := range resp.GetEntries() {
+		if w, ok := strings.CutPrefix(e.GetDetail(), "⚠ "); ok && e.GetVmName() == "" {
+			fmt.Printf("warning: %s\n", w)
 			continue
 		}
-		if def, _ := compose.FindVMDef(f, op.VMName); def != nil &&
-			(def.Kind == compose.WorkloadKindLXC || def.Kind == compose.WorkloadKindOCI) {
-			continue
+		workload := e.GetVmName() != "" && !strings.HasPrefix(e.GetDetail(), "dns ")
+		mark := "    "
+		switch e.GetOperation() {
+		case pb.DiffOp_DIFF_CREATE:
+			mark = "  + "
+			if workload {
+				creates++
+			}
+		case pb.DiffOp_DIFF_UPDATE:
+			mark = "  ~ "
+			if workload {
+				updates++
+			}
+		case pb.DiffOp_DIFF_DELETE:
+			mark = "  - "
+			if workload {
+				deletes++
+			}
+		default:
+			if workload {
+				unchanged++
+			}
 		}
-		vm, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: op.VMName})
-		if status.Code(err) == codes.NotFound {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("inspect %s: %w", op.VMName, err)
-		}
-		if vm.GetStackName() != f.Name {
-			out = append(out, compose.NameCollision(fmt.Sprintf("vm %q already exists", op.VMName), vm.GetStackName()))
-		}
+		lines = append(lines, mark+e.GetDetail())
 	}
-	return out, nil
+	fmt.Printf("Plan: %d to create, %d to update, %d to delete, %d unchanged\n", creates, updates, deletes, unchanged)
+	for _, l := range lines {
+		fmt.Println(l)
+	}
 }
 
 func newStackLsCmd() *cobra.Command {

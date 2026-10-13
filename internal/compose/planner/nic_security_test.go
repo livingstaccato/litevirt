@@ -43,7 +43,21 @@ func TestResolve_RuntimeNICSecurityDriftIsPlanned(t *testing.T) {
 		Network: "lan", MAC: "52:54:00:00:00:01", SecurityGroups: []string{"isolate"},
 		Guard: &compose.LiveGuard{Mode: "on"},
 	}}}
+	// Without --allow-weaken the rebind and the relaxing guard restore are
+	// withheld, and the plan says so.
 	plan, err := Resolve(context.Background(), nicSecFile(true), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.VMs) != 1 || plan.VMs[0].Kind != OpNoChange {
+		t.Fatalf("planned %+v without --allow-weaken, want no change", plan.VMs)
+	}
+	if w := strings.Join(plan.Warnings, "\n"); !strings.Contains(w, "isolate") || !strings.Contains(w, "--allow-weaken") {
+		t.Errorf("warnings %q do not report the withheld restore", w)
+	}
+
+	state.NICSecurityGate.AllowWeaken = true
+	plan, err = Resolve(context.Background(), nicSecFile(true), state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,10 +86,10 @@ func TestResolve_RuntimeNICSecurityDriftIsPlanned(t *testing.T) {
 	}
 }
 
-// LoadClusterState reads each stack VM's live NIC security: the NIC row's
+// LoadStackNICSecurity reads the planned stack's VMs' live NIC security: the NIC row's
 // binding and the guard record of the VM's incarnation. A record written for
 // another incarnation guards nothing and is not loaded.
-func TestLoadClusterState_LoadsLiveNICSecurity(t *testing.T) {
+func TestLoadStackNICSecurity(t *testing.T) {
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
@@ -102,9 +116,20 @@ func TestLoadClusterState_LoadsLiveNICSecurity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A VM of another stack whose rows are not read: only the planned stack
+	// is loaded.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "else", StackName: "other", HostName: "h1", State: "running", Spec: spec}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	state, err := LoadClusterState(ctx, db, corrosion.CapacityPolicy{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := LoadStackNICSecurity(ctx, db, state, "mystack"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.NICSecurity["else"]; ok {
+		t.Error("another stack's VM was read")
 	}
 	live := state.NICSecurity["web"]
 	if len(live) != 2 {
@@ -116,5 +141,34 @@ func TestLoadClusterState_LoadsLiveNICSecurity(t *testing.T) {
 	}
 	if n := live[1]; n.Guard != nil {
 		t.Errorf("nic 1 guard = %+v, want none (the record is another incarnation's)", n.Guard)
+	}
+}
+
+// I5: an image change recreates the VM from the file. A NIC the file declares
+// no groups for keeps the binding it has now, and the plan says so.
+func TestResolve_ARecreateKeepsAnUndeclaredBinding(t *testing.T) {
+	state := makeState([]corrosion.HostRecord{makeHost("h1", 16, 32768)}, []corrosion.VMRecord{{
+		Name: "web", StackName: "mystack", HostName: "h1", State: "running", Spec: nicSecStored, CPUActual: 1, MemActual: 512,
+	}}, nil)
+	state.NICSecurity = map[string][]compose.LiveNIC{"web": {{
+		Network: "lan", MAC: "52:54:00:00:00:01", SecurityGroups: []string{"isolate"}, Guard: &compose.LiveGuard{Mode: "on"},
+	}}}
+	f := nicSecFile(false)
+	def := f.VMs["web"]
+	def.Image = "debian"
+	def.Update = &compose.UpdateDef{Strategy: "recreate"}
+	f.VMs["web"] = def
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.VMs) != 1 || plan.VMs[0].Apply != compose.ActionRecreate {
+		t.Fatalf("planned %+v, want a recreate", plan.VMs)
+	}
+	if g := plan.VMs[0].Spec.GetNetwork()[0].GetSecurityGroups(); len(g) != 1 || g[0] != "isolate" {
+		t.Errorf("the recreate's NIC groups = %v, want the live isolate binding kept", g)
+	}
+	if w := strings.Join(plan.Warnings, "\n"); !strings.Contains(w, "keeps its security groups [isolate]") {
+		t.Errorf("warnings %q do not say the binding is kept", w)
 	}
 }

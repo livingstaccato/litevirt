@@ -264,7 +264,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	current := buildCurrentVMs(state, f.Name)
 	ctCurrent, ctHost := buildCurrentContainers(state, f.Name)
 	current = append(current, ctCurrent...)
-	vmPlan, err := compose.Build(f, current)
+	vmPlan, err := compose.BuildGated(f, current, state.NICSecurityGate)
 	if err != nil {
 		return nil, fmt.Errorf("build workload plan: %w", err)
 	}
@@ -456,6 +456,15 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			action.TargetHost = br.Host
 			action.Spec = spec
 			vmHostMap[op.VMName] = br.Host
+			if op.Kind == OpUpdate && action.Apply == compose.ActionRecreate && !action.IsContainer && spec != nil {
+				// A recreate makes the NICs from the file; a NIC the file
+				// declares no groups for keeps the binding it has now.
+				if stored := storedSpecByVM[op.VMName]; stored != nil {
+					for _, n := range compose.CarryUndeclaredSecurityGroups(spec, stored) {
+						plan.Warnings = append(plan.Warnings, op.VMName+": "+n)
+					}
+				}
+			}
 
 			// Convert device assignments.
 			for _, d := range br.Devices {
@@ -545,6 +554,7 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 		// falls back to the coarse comparison rather than failing the plan.
 		if ss := storedSpecOf(state, &vm); ss != nil {
 			cur.Spec = ss
+			cur.LiveNICs = state.NICSecurity[vm.Name]
 		}
 		current = append(current, cur)
 	}

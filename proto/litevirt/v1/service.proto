@@ -688,7 +688,13 @@ message VNCData { bytes data = 1; }
 // ── Stacks ──
 message DeployStackRequest { string compose_yaml = 1; string target_vm = 2;
     int32 scale_override = 3; string scale_vm = 4; bool dry_run = 5;
-    string expected_hash = 6; }
+    string expected_hash = 6;
+    // allow_weaken lets the deploy restore a NIC's declared security groups,
+    // or a declared guard that is looser than the one enforced now, over a
+    // runtime change (lv sg bind, lv firewall nic-guard set). Without it such
+    // a restore is withheld and reported. Default false: an older client
+    // never weakens.
+    bool allow_weaken = 7; }
 message DeployProgress     { string phase = 1; string vm_name = 2;
     string host_name = 3; float progress_pct = 4;
     string detail = 5; string error = 6; }
@@ -698,7 +704,9 @@ message ListStacksResponse { repeated StackSummary stacks = 1; }
 message StackSummary       { string name = 1; string state = 2; int32 vm_count = 3;
     int32 running = 4; int32 stopped = 5; int32 error = 6;
     google.protobuf.Timestamp created_at = 7; }
-message DiffStackRequest    { string compose_yaml = 1; }
+message DiffStackRequest    { string compose_yaml = 1;
+    // allow_weaken plans as DeployStackRequest.allow_weaken would.
+    bool allow_weaken = 2; }
 message DiffStackResponse   { repeated DiffEntry entries = 1; }
 message DiffEntry           { string vm_name = 1; DiffOp operation = 2; string detail = 3; }
 message ExportStackRequest  { string name = 1; }

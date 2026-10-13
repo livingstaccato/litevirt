@@ -612,9 +612,11 @@ family that is unrestricted and `unset` for a NIC with no guard.
 
 A guard set at runtime on a stack VM's NIC is drift for `lv compose diff` and
 `lv compose up` only when the file names a guard setting for that NIC. `up`
-then sets the file's guard again, and warns when doing so relaxes the guard
-being enforced. A NIC whose file names no guard setting keeps the runtime
-guard (docs/compose.md, "Security groups and guards a file does not declare").
+sets the file's guard again when that only tightens the guard enforced now.
+When it would loosen it, `up` does so only with `--allow-weaken`; without it,
+the restore is withheld and the plan says so. A NIC whose file names no guard
+setting keeps the runtime guard (docs/compose.md, "Security groups and guards
+a file does not declare").
 
 In compose, per NIC:
 
@@ -864,10 +866,10 @@ missing. Recommended order:
   the VM has no NIC on is refused rather than answered OK.
   A runtime bind of a stack VM's NIC is drift for `lv compose diff` and
   `lv compose up` only when the file declares that NIC's `security-groups:`.
-  `up` then binds the file's list again, and warns when that unbinds a group
-  bound outside the file. A NIC whose file names no groups keeps the runtime
-  binding (docs/compose.md, "Security groups and guards a file does not
-  declare").
+  `up` rebinds the file's list only with `--allow-weaken`; without it, the
+  rebind is withheld and the plan says so. A NIC whose file names no groups
+  keeps the runtime binding, through a recreate too (docs/compose.md,
+  "Security groups and guards a file does not declare").
 - **The chain follows the tap libvirt gives the NIC now.** libvirt hands out
   a new `vnetN` on every start, so the tap recorded at create is stale after
   a stop and start, a migration or a failover. Every tick the reconciler asks

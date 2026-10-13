@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -139,35 +140,81 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 			slices.Equal(p.SecurityGroups, []string{"isolate"}) && p.Guard != nil && p.Guard.Mode == "off"
 	})
 
-	// The plan sees box's drift, says the restore unbinds its isolation group
-	// and relaxes its live guard, and leaves plain alone.
-	var boxOp, plainOp, warnings string
-	for _, p := range dryRunPlan(t, ctx, dc, composeNICSecurity) {
-		switch {
-		case p.Phase == "warning":
-			warnings += p.Detail + "\n"
-		case p.VmName == "box":
-			boxOp = p.Phase + " " + p.Detail
-		case p.VmName == "plain":
-			plainOp = p.Phase + " " + p.Detail
+	// Without --allow-weaken, both of box's restores may remove protection
+	// set outside the file (the isolation group; the guard's allowances), so
+	// the plan withholds them and says how to apply them. plain is left
+	// alone. lv compose diff (DiffStack) shows the same plan as up's dry-run.
+	plan := func(allowWeaken bool) (box, plain, warnings string) {
+		for _, p := range planWith(t, ctx, dc, composeNICSecurity, allowWeaken) {
+			switch {
+			case p.Phase == "warning":
+				warnings += p.Detail + "\n"
+			case p.VmName == "box":
+				box = p.Phase + " " + p.Detail
+			case p.VmName == "plain":
+				plain = p.Phase + " " + p.Detail
+			}
 		}
+		return
 	}
-	if !strings.HasPrefix(boxOp, string(compose.OpUpdate)) || !strings.Contains(boxOp, compose.NICSecurityGroupsFieldPrefix+"0") ||
-		!strings.Contains(boxOp, compose.NICGuardFieldPrefix+"0") {
-		t.Errorf("box planned %q, want an update of its binding and guard", boxOp)
+	diff := func(allowWeaken bool) (box, plain, warnings string) {
+		resp, err := dc.DiffStack(ctx, &pb.DiffStackRequest{ComposeYaml: composeNICSecurity, AllowWeaken: allowWeaken})
+		if err != nil {
+			t.Fatalf("DiffStack: %v", err)
+		}
+		for _, e := range resp.Entries {
+			switch {
+			case strings.HasPrefix(e.Detail, "⚠ "):
+				warnings += strings.TrimPrefix(e.Detail, "⚠ ") + "\n"
+			case e.VmName == "box" && !strings.HasPrefix(e.Detail, "dns "):
+				box = e.Detail
+			case e.VmName == "plain" && !strings.HasPrefix(e.Detail, "dns "):
+				plain = e.Detail
+			}
+		}
+		return
 	}
-	if !strings.Contains(warnings, "box") || !strings.Contains(warnings, "unbinds security group(s) isolate") ||
-		!strings.Contains(warnings, "10.31.0.250") || !strings.Contains(warnings, "vlan") {
-		t.Errorf("warnings %q do not say the restore unbinds box's isolation group and relaxes its live guard", warnings)
+	boxOp, plainOp, warnings := plan(false)
+	if !strings.HasPrefix(boxOp, string(compose.OpNoChange)) {
+		t.Errorf("box planned %q without --allow-weaken, want no change", boxOp)
+	}
+	for _, want := range []string{"box: nic 0 (lan) security groups not restored", "unbinds isolate", "nic 0 (lan) guard not restored",
+		"10.31.0.250", "--allow-weaken"} {
+		if !strings.Contains(warnings, want) {
+			t.Errorf("warnings %q lack %q", warnings, want)
+		}
 	}
 	if !strings.HasPrefix(plainOp, string(compose.OpNoChange)) {
 		t.Errorf("plain planned %q over an undeclared binding and guard, want no change", plainOp)
+	}
+	dBox, _, dWarnings := diff(false)
+	if !strings.Contains(boxOp, dBox) || dWarnings != warnings {
+		t.Errorf("diff and up disagree:\n diff box %q warnings %q\n up   box %q warnings %q", dBox, dWarnings, boxOp, warnings)
+	}
+
+	// A deploy without the opt-in keeps the isolation in place.
+	deployClean(t, ctx, dc, composeNICSecurity)
+	if b := liveSec(t, deployer, "box"); !slices.Equal(b.SecurityGroups, []string{"isolate"}) || b.Guard == nil || len(b.Guard.Allowed) != 0 {
+		t.Fatalf("box after a deploy without --allow-weaken = %+v (guard %+v), want the operator's isolation kept", b, b.Guard)
+	}
+
+	// With it, the plan restores both and still names what it weakens.
+	boxOp, _, warnings = plan(true)
+	if !strings.HasPrefix(boxOp, string(compose.OpUpdate)) || !strings.Contains(boxOp, compose.NICSecurityGroupsFieldPrefix+"0") ||
+		!strings.Contains(boxOp, compose.NICGuardFieldPrefix+"0") {
+		t.Errorf("box planned %q with --allow-weaken, want an update of its binding and guard", boxOp)
+	}
+	if !strings.Contains(warnings, "applied with --allow-weaken") || !strings.Contains(warnings, "unbinds isolate") {
+		t.Errorf("warnings %q do not name the weakening applied", warnings)
+	}
+	if dBox, _, dWarnings := diff(true); !strings.Contains(boxOp, dBox) || dWarnings != warnings {
+		t.Errorf("diff --allow-weaken and up --allow-weaken disagree:\n diff %q %q\n up %q %q", dBox, dWarnings, boxOp, warnings)
 	}
 
 	// The deploy puts box back, on every replica, and leaves plain as the
 	// operator set it.
 	eventsBefore := len(deployer.Virt.EventLog())
-	deployClean(t, ctx, dc, composeNICSecurity)
+	deployWith(t, ctx, dc, composeNICSecurity, true)
 	for _, n := range c.Nodes {
 		eventually(t, 10*time.Second, "box's declared security back on "+n.Name, func() bool {
 			return declaredRestored(liveSec(t, n, "box"))
@@ -182,10 +229,49 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 		}
 	}
 
-	// Converged: the same file plans no change.
-	for _, p := range dryRunPlan(t, ctx, dc, composeNICSecurity) {
-		if (p.VmName == "box" || p.VmName == "plain") && p.Phase != string(compose.OpNoChange) {
-			t.Errorf("after the restore %s planned %q (%s), want no change", p.VmName, p.Phase, p.Detail)
+	// Converged: the same file plans no change, with or without the opt-in.
+	for _, aw := range []bool{false, true} {
+		for _, p := range planWith(t, ctx, dc, composeNICSecurity, aw) {
+			if (p.VmName == "box" || p.VmName == "plain") && p.Phase != string(compose.OpNoChange) {
+				t.Errorf("after the restore %s planned %q (%s), want no change", p.VmName, p.Phase, p.Detail)
+			}
 		}
+	}
+}
+
+// planWith is a dry-run deploy's progress.
+func planWith(t *testing.T, ctx context.Context, client pb.LiteVirtClient, yaml string, allowWeaken bool) []*pb.DeployProgress {
+	t.Helper()
+	return deployRequest(t, ctx, client, &pb.DeployStackRequest{ComposeYaml: yaml, DryRun: true, AllowWeaken: allowWeaken})
+}
+
+// deployWith runs a deploy and fails on an error phase.
+func deployWith(t *testing.T, ctx context.Context, client pb.LiteVirtClient, yaml string, allowWeaken bool) {
+	t.Helper()
+	for _, p := range deployRequest(t, ctx, client, &pb.DeployStackRequest{ComposeYaml: yaml, AllowWeaken: allowWeaken}) {
+		if p.Phase == "error" {
+			t.Fatalf("deploy failed for %s: %s", p.VmName, p.Error)
+		}
+	}
+}
+
+func deployRequest(t *testing.T, ctx context.Context, client pb.LiteVirtClient, req *pb.DeployStackRequest) []*pb.DeployProgress {
+	t.Helper()
+	dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	stream, err := client.DeployStack(dctx, req)
+	if err != nil {
+		t.Fatalf("DeployStack: %v", err)
+	}
+	var out []*pb.DeployProgress
+	for {
+		p, err := stream.Recv()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("DeployStack stream: %v", err)
+		}
+		out = append(out, p)
 	}
 }

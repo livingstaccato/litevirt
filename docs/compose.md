@@ -116,9 +116,8 @@ created outside compose). A VM of the same stack is not a collision; the plan
 updates it. Container names are per host, so a container collides only with a
 container of that name on the host the plan places it on (`container "web"
 already exists on host "node-1" in stack "app" ...`), and VMs and containers do
-not collide with each other. `compose diff` computes its plan without
-placement, so only the server's plan (`compose up`) reports container
-collisions.
+not collide with each other. `compose diff` prints the server's plan, the
+one `compose up` applies, so it reports container collisions too.
 
 `compose up` ends with `Stack "<name>" deployed.` and exit status 0 only when
 every action in the plan succeeded. If any VM action fails, each failure is
@@ -1417,36 +1416,68 @@ Per-NIC security groups can also be bound at runtime with
 A NIC's security groups and its guard can be changed at runtime, with
 `lv sg bind` and `lv firewall nic-guard set`. Those write the rows the firewall
 enforces from, not the VM's stored spec, so `lv compose diff` and
-`lv compose up` compare the file with those rows, the same view `lv inspect`
-shows. The file owns only what it declares:
+`lv compose up` compare the file with those rows: the NIC row's binding, and
+the guard record of the VM's current incarnation (no record is an unguarded
+NIC). The file owns only what it declares:
 
 - **Security groups.** A NIC whose entry has a non-empty `security-groups:`
-  owns its binding. A binding that differs from it is drift: `diff` shows it as
-  `nic_sg_<n> [old]→[new]`, and `up` binds the file's list again, in place,
-  with no restart. A NIC whose entry names no groups keeps whatever it is bound
-  to. `up` never removes a group from it.
+  owns its binding. A binding that differs from it is drift, shown as
+  `nic_sg_<n> [old]→[new]`. A NIC whose entry names no groups keeps whatever
+  it is bound to, and `up` never changes it.
 - **Guards.** A NIC whose entry names any guard setting (`spoof-guard`,
   `allowed-addresses`, `allow-dhcp-server`, `allow-router-advertisement` or
   `allow-vlan-tags`) owns its whole guard. Its mode is on unless the file says
-  `off`, and the settings it leaves out are off. A guard that differs is drift:
-  `nic_guard_<n> {old}→{new}`, put back in place by `up`. A NIC whose entry
-  names none keeps the guard it has, including one an operator turned off. To
-  have `up` keep a NIC guarded, write `spoof-guard: "on"`.
+  `off`, and the settings it leaves out are off. A guard that differs is drift,
+  shown as `nic_guard_<n> {old}→{new}`. A NIC whose entry names none keeps the
+  guard it has, including one an operator turned off. To have `up` keep a NIC
+  guarded, write `spoof-guard: "on"`.
 
-**An update that removes protection says so.** Restoring the file can unbind
-a group that was bound outside the file (an isolation group, say), or relax a
-guard: turn it off, or add an allowed address, a DHCP-server, router-advert or
-VLAN-tag allowance. Such an update is still applied, because it is what the
-file declares. But `diff` and the deploy plan print a warning that names each
-one: `this update removes protection set outside the file: nic 0 (lan): unbinds
-security group(s) isolate, bound outside the file`. To keep an incident
-binding, add the group to the file, or hold the deploy.
+**What `up` restores, and what it withholds.** A restore is made in place, with
+no restart. Some restores can take away protection an operator put on at
+runtime, such as an isolation group bound during an incident. `up` withholds
+those unless it is run with `--allow-weaken`. A withheld restore is not an
+error: the rest of the VM's update is applied, `up` succeeds, and the plan
+prints a warning that names what was withheld and why. For example:
+`web: nic 0 (lan) security groups not restored: it may remove protection set
+outside the file — nic 0 (lan): rebinds security groups [isolate]→[web]
+(unbinds isolate, bound now; binds web); re-run with --allow-weaken to apply
+it`. Without the flag, `up` withholds:
 
-`up` writes these through the same calls as `lv sg bind` and
-`lv firewall nic-guard set`, with the deploying caller's authority, and audits
-them the same way. A guard needs `network.update` over the NIC's network, even
-to tighten it. A security-group binding is written per network, so when a VM
-has two NICs on one network, `up` rebinds only if the file declares the same
-groups for both. Otherwise it refuses the update and leaves both bindings as
-they are. A change of identity that re-creates the VM creates its NICs from the
-file anyway.
+- **every security-group rebind.** Per-NIC rules are first-match across the
+  bound groups, and with `default-deny` a bound group opens what it accepts.
+  So adding, removing or reordering a group can each widen access.
+- **a guard restore that loosens the guard enforced now.** That is one that
+  turns it off, or adds an allowed source address the live guard does not
+  already cover, a DHCP-server or router-advertisement allowance, or VLAN tags.
+
+A guard restore that only tightens is always applied. It needs no more
+authority than creating the NIC with that guard would.
+
+With `--allow-weaken`, those restores are applied, and the plan still names
+each one. They are written through the same calls as `lv sg bind` and
+`lv firewall nic-guard set`, with the deploying caller's authority, and are
+audited the same way.
+
+The plan also withholds, with a warning, any restore the deploy cannot make:
+
+- **The caller's permissions.** A rebind needs `network.update` on the VM, and
+  loosening a guard needs it on the NIC's network.
+- **The cluster upgrade.** Until it finishes (the `nic_guards` release), no
+  guard record can be written.
+- **Two NICs on one network.** A security-group binding is written per
+  network, so when a VM has two NICs on one network, a rebind is made only if
+  the file declares the same groups for every one of them.
+
+`lv compose diff` shows the server's plan for the caller, the same one `up`
+would apply (pass `--allow-weaken` to see what `up --allow-weaken` would do).
+
+**A recreate makes the NICs from the file**, as it always has. A change of
+identity, or a strategy that replaces the VM, applies the file's declared
+groups and guard with no `--allow-weaken` gate. The plan prints a warning when
+that changes what is enforced now. A NIC whose file declares no groups keeps
+its live binding through the recreate (`nic 0 (lan) keeps its security groups
+[isolate] through the recreate`). The guards of undeclared NICs are carried as
+before (docs/firewall.md, "A re-create keeps each NIC's guard").
+
+Containers are out of scope. Compose neither reports nor restores a runtime
+change to a container NIC's security groups or guard.

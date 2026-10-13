@@ -3,7 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
-	"slices"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -12,8 +12,58 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// loadNICSecurityPlanState adds to a plan's cluster state what a compose
+// plan needs to compare and restore NIC security for the caller: the stack's
+// live NIC security, and the gate (nicSecurityGate).
+func (s *Server) loadNICSecurityPlanState(ctx context.Context, state *planner.ClusterState, stack string, allowWeaken bool) error {
+	if err := planner.LoadStackNICSecurity(ctx, s.db, state, stack); err != nil {
+		return status.Errorf(codes.Unavailable, "%v", err)
+	}
+	state.NICSecurityGate = s.nicSecurityGate(ctx, allowWeaken)
+	return nil
+}
+
+// nicSecurityGate is what the caller's deploy may restore of a NIC's security
+// (compose.ApplyNICSecurityGate), decided when the plan is made so that a
+// restore the deploy cannot make is reported in the plan rather than failing
+// the deploy: the release gate guard records need, and the authority
+// BindSecurityGroups and a weakening SetNICGuard check.
+func (s *Server) nicSecurityGate(ctx context.Context, allowWeaken bool) compose.NICSecurityGate {
+	g := compose.NICSecurityGate{AllowWeaken: allowWeaken}
+	if !s.firewallReleaseActive() || !s.db.MayWriteClusterPolicy() {
+		g.GuardsUnwritable = "a guard record cannot be written until the cluster upgrade finishes " +
+			"(nic_guards needs release_2026_11_v1; lv cluster upgrade-status)"
+	}
+	g.CheckBind = func(vm string) error {
+		if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+			return fmt.Errorf("rebinding needs network.update on vm %q: %v", vm, status.Convert(err).Message())
+		}
+		rec, err := corrosion.GetVM(ctx, s.db, vm)
+		if err != nil {
+			return fmt.Errorf("look up vm %q: %v", vm, err)
+		}
+		path := ""
+		if rec != nil {
+			path = vmRBACPath(rec)
+		}
+		if err := s.requirePermResolved(ctx, rec != nil, path, vmRBACPathFor("", vm),
+			"network.update", "operator", "vm "+strconv.Quote(vm)); err != nil {
+			return fmt.Errorf("rebinding needs network.update on vm %q, which the caller lacks", vm)
+		}
+		return nil
+	}
+	g.CheckWeakenGuard = func(network string) error {
+		if err := s.requireGuardAuthority(ctx, network, "restoring the declared NIC guard"); err != nil {
+			return fmt.Errorf("%s", status.Convert(err).Message())
+		}
+		return nil
+	}
+	return g
+}
 
 // nicSecurityField splits a plan's per-NIC security field ("nic_sg_0",
 // "nic_guard_1") into its kind prefix and NIC position.
@@ -27,14 +77,24 @@ func nicSecurityField(f string) (prefix string, i int, ok bool) {
 	return "", 0, false
 }
 
+// nicSecurityWrite is one restore applyDesiredNICSecurity makes.
+type nicSecurityWrite struct {
+	prefix string
+	nic    *compose.LiveNIC
+	want   *pb.NetworkAttachment
+}
+
 // applyDesiredNICSecurity puts the security-group binding and guard a compose
-// file declares back on the NICs the plan names (compose.classifyNICSecurity).
-// They are written exactly as `lv sg bind` and `lv firewall nic-guard set`
-// write them — through those RPCs, with the deploying caller's authority
-// (network.update; a guard needs it over the NIC's network) and their audit
-// rows — onto the rows the firewall enforces from. The stored spec is not
-// rewritten: it records what the NIC was created with, and nothing enforces
-// from it.
+// file declares back on the NICs the plan names. The plan has already
+// withheld what the deploy may not do (compose.ApplyNICSecurityGate); this
+// re-checks against the rows as they are now, and checks every field before
+// it writes any, so a refusal leaves nothing half-restored.
+//
+// A binding is written through BindSecurityGroups, with the deploying
+// caller's authority. A guard that loosens what a default guard allows goes
+// through SetNICGuard's authority check; one that does not needs none, as at
+// create (putNICGuard). Both are audited like their CLI forms. The stored
+// spec is not rewritten: nothing enforces from it.
 //
 // The plan's position i is the stored spec's NIC i, matched to its live NIC
 // the way the plan matched it (compose.MatchLiveNIC).
@@ -56,74 +116,62 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read the NICs of vm %q: %v", name, err)
 	}
-	// positionOf is the stored-spec position of a live NIC, or -1 for one the
-	// spec does not describe (hot-attached).
-	positionOf := func(mac string) int {
-		for j := range stored.Network {
-			if n := compose.MatchLiveNIC(stored.Network, j, live); n != nil && strings.EqualFold(n.MAC, mac) {
-				return j
-			}
-		}
-		return -1
-	}
-	nicAt := func(i int) (*compose.LiveNIC, *pb.NetworkAttachment, error) {
-		n := compose.MatchLiveNIC(stored.Network, i, live)
-		if n == nil || i >= len(desired.Network) || desired.Network[i] == nil {
-			return nil, nil, status.Errorf(codes.FailedPrecondition,
-				"vm %q has no NIC at position %d to apply the file's security groups or guard to", name, i)
-		}
-		return n, desired.Network[i], nil
-	}
+	var writes []nicSecurityWrite
 	bound := map[string]bool{}
 	for _, f := range fields {
 		prefix, i, ok := nicSecurityField(f)
 		if !ok {
 			continue
 		}
-		n, want, err := nicAt(i)
-		if err != nil {
-			return err
+		n := compose.MatchLiveNIC(stored.Network, i, live)
+		if n == nil || i >= len(desired.Network) || desired.Network[i] == nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"vm %q has no NIC at position %d to apply the file's security groups or guard to", name, i)
 		}
-		switch prefix {
-		case compose.NICSecurityGroupsFieldPrefix:
+		if prefix == compose.NICSecurityGroupsFieldPrefix {
 			if bound[n.Network] {
 				continue
 			}
-			// A binding is written for every NIC of the VM on the network
-			// (BindSecurityGroups). Each other NIC there must be one the file
-			// declares the same groups for, or the rebind would change a
-			// binding the file does not own.
-			for _, o := range live {
-				if o.Network != n.Network || strings.EqualFold(o.MAC, n.MAC) {
-					continue
-				}
-				j := positionOf(o.MAC)
-				if j < 0 || j >= len(desired.Network) || !slices.Equal(desired.Network[j].GetSecurityGroups(), want.GetSecurityGroups()) {
-					return status.Errorf(codes.FailedPrecondition,
-						"vm %q: NIC %s and NIC %s are on the same network %q, and a security-group binding is written per network; "+
-							"the file declares %v for one and not the same for the other, so it is not applied "+
-							"(declare the same groups for both, or bind them with lv sg bind)",
-						name, n.MAC, o.MAC, n.Network, want.GetSecurityGroups())
-				}
+			bound[n.Network] = true
+			if why := compose.SharedNetworkConflict(i, desired, stored, live); why != "" {
+				return status.Errorf(codes.FailedPrecondition, "vm %q: nic %d (%s) security groups not restored: %s", name, i, n.Network, why)
 			}
+		}
+		writes = append(writes, nicSecurityWrite{prefix: prefix, nic: n, want: desired.Network[i]})
+	}
+	for _, w := range writes {
+		switch w.prefix {
+		case compose.NICSecurityGroupsFieldPrefix:
 			if _, err := s.BindSecurityGroups(ctx, &pb.BindSecurityGroupsRequest{
-				VmName: name, NetworkName: n.Network, SecurityGroups: want.GetSecurityGroups(),
+				VmName: name, NetworkName: w.nic.Network, SecurityGroups: w.want.GetSecurityGroups(),
 			}); err != nil {
 				return err
 			}
-			bound[n.Network] = true
 		case compose.NICGuardFieldPrefix:
-			mode := want.GetSpoofGuard()
+			mode := w.want.GetSpoofGuard()
 			if mode == "" {
 				mode = corrosion.NICGuardOn // a declared guard is on unless the file says off
 			}
-			if _, err := s.SetNICGuard(ctx, &pb.SetNICGuardRequest{
-				VmName: name, Mac: n.MAC, Mode: mode,
-				AllowedAddresses:         want.GetAllowedAddresses(),
-				AllowDhcpServer:          want.GetAllowDhcpServer(),
-				AllowRouterAdvertisement: want.GetAllowRouterAdvertisement(),
-				AllowVlanTags:            want.GetAllowVlanTags(),
-			}); err != nil {
+			mode, err := normalizeNICGuardMode(mode)
+			if err != nil {
+				return err
+			}
+			req := &pb.SetNICGuardRequest{
+				VmName: name, Mac: w.nic.MAC, Mode: mode,
+				AllowedAddresses:         w.want.GetAllowedAddresses(),
+				AllowDhcpServer:          w.want.GetAllowDhcpServer(),
+				AllowRouterAdvertisement: w.want.GetAllowRouterAdvertisement(),
+				AllowVlanTags:            w.want.GetAllowVlanTags(),
+			}
+			if nicGuardWeakens(mode, req.AllowedAddresses, req.AllowDhcpServer, req.AllowRouterAdvertisement, req.AllowVlanTags) {
+				_, err = s.SetNICGuard(ctx, req)
+			} else {
+				var tgt guardTarget
+				if tgt, err = s.pickVMTarget(ctx, name, w.nic.MAC, ""); err == nil {
+					_, err = s.putNICGuard(ctx, tgt, mode, req)
+				}
+			}
+			if err != nil {
 				return err
 			}
 		}

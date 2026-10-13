@@ -687,6 +687,17 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 	if err := s.requireGuardAuthority(ctx, tgt.nic.NetworkName, "setting a NIC guard"); err != nil {
 		return nil, err
 	}
+	return s.putNICGuard(ctx, tgt, mode, req)
+}
+
+// putNICGuard writes the guard req names onto the NIC tgt, once the caller's
+// authority to do so is settled: SetNICGuard's whatever it sets, or, for a
+// compose deploy restoring a declared guard that loosens nothing, the
+// create path's rule that a guard no weaker than the default needs none
+// (stacks_nic_security.go). The direct/SR-IOV refusal, the release gate and
+// the audit row are the same either way.
+func (s *Server) putNICGuard(ctx context.Context, tgt guardTarget, mode string, req *pb.SetNICGuardRequest) (*pb.NICGuard, error) {
+	ct := req.GetContainerName() != ""
 	if def, _ := lookupNetworkDef(ctx, s.db, tgt.nic.NetworkName); def != nil && (def.Type == "direct" || def.Type == "sriov") {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"NIC %s is on %s network %q, which bypasses the bridge where guards are enforced; a guard there would protect nothing",

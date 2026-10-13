@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -88,7 +91,7 @@ func TestApplyLiveMetadata_RefusesARebindThatWouldReachAnotherNIC(t *testing.T) 
 	}
 	desired := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", SecurityGroups: []string{"web"}}, {Name: "lan"}}}
 	err := s.applyLiveMetadata(admin, "web", desired, []string{compose.NICSecurityGroupsFieldPrefix + "0"})
-	if err == nil || !strings.Contains(err.Error(), "same network") {
+	if err == nil || !strings.Contains(err.Error(), "written per network") {
 		t.Fatalf("err = %v, want a refusal naming the shared network", err)
 	}
 	live, _ := corrosion.LiveNICSecurity(ctx, s.db, "web", "u-1")
@@ -107,5 +110,81 @@ func TestApplyLiveMetadata_RefusesARebindThatWouldReachAnotherNIC(t *testing.T) 
 		if len(n.SecurityGroups) != 1 || n.SecurityGroups[0] != "web" {
 			t.Errorf("NIC %s binding = %v, want web", n.MAC, n.SecurityGroups)
 		}
+	}
+}
+
+// I3: an Operator (no network.update) restores a declared guard that only
+// tightens, as it could create it; a guard that loosens needs the authority
+// SetNICGuard checks; a security-group rebind needs network.update on the VM.
+// The plan's gate says the same before anything runs.
+func TestNICSecurity_ADeployerWithoutNetworkUpdate(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	admin := adminCtxWithEngine(t, s)
+	insertNICSecVM(t, s, &pb.NetworkAttachment{Name: "lan"})
+	if _, err := s.SetNICGuard(admin, &pb.SetNICGuardRequest{VmName: "web", NetworkName: "lan", Mode: "off"}); err != nil {
+		t.Fatal(err)
+	}
+	bob := boundAtCtx(t, s, "bob", "operator", "Operator", "/")
+	field := []string{compose.NICGuardFieldPrefix + "0"}
+
+	on := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "on"}}}
+	if err := s.applyLiveMetadata(bob, "web", on, field); err != nil {
+		t.Fatalf("a tightening restore by an Operator: %v", err)
+	}
+	if live, _ := corrosion.LiveNICSecurity(ctx, s.db, "web", "u-1"); live[0].Guard == nil || live[0].Guard.Mode != "on" {
+		t.Fatalf("guard = %+v, want on", live[0].Guard)
+	}
+	loose := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.250"}}}}
+	if err := s.applyLiveMetadata(bob, "web", loose, field); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("a loosening restore by an Operator: err = %v, want PermissionDenied", err)
+	}
+
+	gate := s.nicSecurityGate(bob, true)
+	if gate.CheckBind("web") == nil {
+		t.Error("the plan gate lets an Operator rebind security groups")
+	}
+	if gate.CheckWeakenGuard("lan") == nil {
+		t.Error("the plan gate lets an Operator loosen a guard")
+	}
+	if gate.GuardsUnwritable != "" {
+		t.Errorf("guards reported unwritable on an upgraded cluster: %s", gate.GuardsUnwritable)
+	}
+	adminGate := s.nicSecurityGate(admin, false)
+	if adminGate.CheckBind("web") != nil || adminGate.CheckWeakenGuard("lan") != nil || adminGate.AllowWeaken {
+		t.Errorf("admin gate = %+v", adminGate)
+	}
+}
+
+// I4b: before the nic_guards release has latched, no guard record can be
+// written, and the plan gate says so.
+func TestNICSecurityGate_GuardsUnwritableBeforeTheRelease(t *testing.T) {
+	s := guardServer(t, false)
+	if g := s.nicSecurityGate(adminCtx(), false); !strings.Contains(g.GuardsUnwritable, "upgrade") {
+		t.Errorf("GuardsUnwritable = %q, want the unfinished upgrade named", g.GuardsUnwritable)
+	}
+}
+
+// I3: every field is checked before any is written, so a refused restore
+// leaves nothing half-applied.
+func TestApplyLiveMetadata_ARefusalWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	s := guardServer(t, true)
+	admin := adminCtxWithEngine(t, s)
+	insertNICSecVM(t, s, &pb.NetworkAttachment{Name: "lan"}, &pb.NetworkAttachment{Name: "lan"})
+	if _, err := s.BindSecurityGroups(admin, &pb.BindSecurityGroupsRequest{VmName: "web", NetworkName: "lan", SecurityGroups: []string{"isolate"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetNICGuard(admin, &pb.SetNICGuardRequest{VmName: "web", Mac: "52:54:00:00:00:01", Mode: "off"}); err != nil {
+		t.Fatal(err)
+	}
+	desired := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "lan", SpoofGuard: "on", SecurityGroups: []string{"web"}}, {Name: "lan"}}}
+	err := s.applyLiveMetadata(admin, "web", desired,
+		[]string{compose.NICGuardFieldPrefix + "0", compose.NICSecurityGroupsFieldPrefix + "0"})
+	if err == nil {
+		t.Fatal("a rebind reaching an undeclared NIC was applied")
+	}
+	if g, _ := corrosion.GetNICGuard(ctx, s.db, "web", "52:54:00:00:00:01"); g == nil || g.Mode != "off" {
+		t.Errorf("guard = %+v, want it left off: the refusal must come before any write", g)
 	}
 }

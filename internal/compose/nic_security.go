@@ -30,10 +30,20 @@ import (
 //     its mode is on unless the file says off. A NIC whose file names none
 //     keeps the guard it has.
 //
-// An update that takes protection away from a NIC as it is enforced now (it
-// unbinds a group bound outside the file, or relaxes or turns off a guard) is
-// still applied — the file is what the operator declared — but never quietly:
-// each one is in ChangePlan.Weakens, which the plan prints as a warning.
+// An in-place restore that may take protection away from a NIC as it is
+// enforced now is withheld unless the deploy opts in (--allow-weaken,
+// NICSecurityGate.AllowWeaken), and the plan says what it withheld. That is
+// every security-group rebind (per-NIC rules are first-match across the bound
+// groups, so adding, removing or reordering a group can each widen access),
+// and a guard restore that turns the guard off or adds an allowance. A guard
+// restore that only tightens is applied. So are restores the deploy can make
+// only with authority it lacks, or that cannot be made per NIC, withheld and
+// reported at plan time rather than failing the deploy (ApplyNICSecurityGate).
+//
+// A recreate creates the NICs from the file, as it always has: nothing is
+// gated, and what it changes from the enforced state is a warning. A NIC
+// whose file declares no groups keeps its live binding through the recreate
+// (CarryUndeclaredSecurityGroups).
 
 // NICSecurityGroupsFieldPrefix and NICGuardFieldPrefix prefix the
 // MetadataChanges field of a NIC's security-group binding and guard; the
@@ -165,7 +175,7 @@ func (g guardView) relaxations(want guardView) []string {
 	}
 	if guarded && want.mode == "on" {
 		for _, a := range want.allowed {
-			if !slices.Contains(g.allowed, a) {
+			if !addressCovered(a, g.allowed) {
 				out = append(out, "allows source "+a)
 			}
 		}
@@ -208,39 +218,85 @@ func canonicalGuardAddresses(in []string) []string {
 	return out
 }
 
-// WeakensWarning is the plan's warning for an update that takes protection
-// away from a NIC as it is enforced now.
-func WeakensWarning(weakens []string) string {
-	return "this update removes protection set outside the file: " + strings.Join(weakens, "; ")
+// addressCovered reports whether addr (an address or prefix) lies inside one
+// of the prefixes or addresses in have.
+func addressCovered(addr string, have []string) bool {
+	want, err := netip.ParsePrefix(addr)
+	if err != nil {
+		a, aerr := netip.ParseAddr(addr)
+		if aerr != nil {
+			return slices.Contains(have, addr)
+		}
+		want = netip.PrefixFrom(a, a.BitLen())
+	}
+	for _, h := range have {
+		p, err := netip.ParsePrefix(h)
+		if err != nil {
+			a, aerr := netip.ParseAddr(h)
+			if aerr != nil {
+				continue
+			}
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		if p.Bits() <= want.Bits() && p.Contains(want.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
-// sgList renders a binding for a delta.
+// NICSecurityChange is one NIC's security-group binding or guard that a plan
+// changes from what is enforced now.
+type NICSecurityChange struct {
+	Field    string // the MetadataChanges field ("nic_sg_0", "nic_guard_0")
+	Position int    // the NIC's position in the desired and stored specs
+	Network  string
+	Guard    bool // a guard change; else a security-group binding
+	// Weakens is what the change may take away from the NIC as enforced
+	// now; empty for a guard restore that only tightens.
+	Weakens []string
+}
+
 func sgList(sgs []string) string { return "[" + strings.Join(sgs, ",") + "]" }
+
+func groupsNotIn(a, b []string) []string {
+	var out []string
+	for _, g := range a {
+		if !slices.Contains(b, g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
 
 // classifyNICSecurity diffs each NIC's declared security-group binding and
 // guard against the live ones the stored spec carries (OverlayLiveNICSecurity),
-// as live changes; a NIC whose position holds another network is a topology
-// change, which the network bucket owns.
+// as live changes. A position whose network differs is a topology change,
+// which the network bucket owns; later positions are still compared.
 func classifyNICSecurity(desired, stored *pb.VMSpec, p *ChangePlan) {
 	for i, dn := range desired.Network {
 		if i >= len(stored.Network) || dn == nil || stored.Network[i] == nil ||
 			dn.GetName() != stored.Network[i].GetName() {
-			break
+			continue
 		}
 		sn := stored.Network[i]
 		if want := dn.GetSecurityGroups(); len(want) > 0 && !slices.Equal(want, sn.GetSecurityGroups()) {
-			p.MetadataChanges = append(p.MetadataChanges, Delta{Field: NICSecurityGroupsFieldPrefix + fmt.Sprint(i),
+			field := NICSecurityGroupsFieldPrefix + fmt.Sprint(i)
+			p.MetadataChanges = append(p.MetadataChanges, Delta{Field: field,
 				Old: sgList(sn.GetSecurityGroups()), New: sgList(want)})
-			var dropped []string
-			for _, g := range sn.GetSecurityGroups() {
-				if !slices.Contains(want, g) {
-					dropped = append(dropped, g)
-				}
+			w := fmt.Sprintf("nic %d (%s): rebinds security groups %s→%s", i, dn.GetName(), sgList(sn.GetSecurityGroups()), sgList(want))
+			var parts []string
+			if d := groupsNotIn(sn.GetSecurityGroups(), want); len(d) > 0 {
+				parts = append(parts, "unbinds "+strings.Join(d, ", ")+", bound now")
 			}
-			if len(dropped) > 0 {
-				p.Weakens = append(p.Weakens, fmt.Sprintf("nic %d (%s): unbinds security group(s) %s, bound outside the file",
-					i, dn.GetName(), strings.Join(dropped, ", ")))
+			if a := groupsNotIn(want, sn.GetSecurityGroups()); len(a) > 0 {
+				parts = append(parts, "binds "+strings.Join(a, ", "))
 			}
+			if len(parts) == 0 {
+				parts = append(parts, "reorders them, and the first matching rule wins")
+			}
+			p.NICSecurity = append(p.NICSecurity, NICSecurityChange{Field: field, Position: i, Network: dn.GetName(),
+				Weakens: []string{w + " (" + strings.Join(parts, "; ") + ")"}})
 		}
 		if !nicGuardDeclared(dn) {
 			continue
@@ -249,11 +305,163 @@ func classifyNICSecurity(desired, stored *pb.VMSpec, p *ChangePlan) {
 		if want.equal(have) {
 			continue
 		}
-		p.MetadataChanges = append(p.MetadataChanges, Delta{Field: NICGuardFieldPrefix + fmt.Sprint(i),
-			Old: have.String(), New: want.String()})
+		field := NICGuardFieldPrefix + fmt.Sprint(i)
+		p.MetadataChanges = append(p.MetadataChanges, Delta{Field: field, Old: have.String(), New: want.String()})
+		c := NICSecurityChange{Field: field, Position: i, Network: dn.GetName(), Guard: true}
 		if r := have.relaxations(want); len(r) > 0 {
-			p.Weakens = append(p.Weakens, fmt.Sprintf("nic %d (%s): the guard as enforced now is relaxed: %s",
-				i, dn.GetName(), strings.Join(r, ", ")))
+			c.Weakens = []string{fmt.Sprintf("nic %d (%s): relaxes the guard enforced now: %s", i, dn.GetName(), strings.Join(r, ", "))}
+		}
+		p.NICSecurity = append(p.NICSecurity, c)
+	}
+}
+
+// Weakens is every weakening the plan's NIC security changes carry.
+func (p ChangePlan) Weakens() []string {
+	var out []string
+	for _, c := range p.NICSecurity {
+		out = append(out, c.Weakens...)
+	}
+	return out
+}
+
+// NICSecurityGate is what a deploy may restore of a NIC's security, decided
+// by the server for the caller before the plan is shown. The zero value is
+// the safe one: nothing that may weaken is applied.
+type NICSecurityGate struct {
+	// AllowWeaken: the caller opted in (--allow-weaken) to restores that may
+	// weaken protection.
+	AllowWeaken bool
+	// GuardsUnwritable, when set, is why no guard record can be written now
+	// (the nic_guards release has not latched); guard restores are withheld.
+	GuardsUnwritable string
+	// CheckBind reports whether the caller may rebind vm's security groups
+	// (lv sg bind's authority). nil: it may.
+	CheckBind func(vm string) error
+	// CheckWeakenGuard reports whether the caller may relax a guard on the
+	// network (lv firewall nic-guard set's authority). nil: it may. A restore
+	// that only tightens needs no such authority, as at create.
+	CheckWeakenGuard func(network string) error
+}
+
+// ApplyNICSecurityGate removes from an in-place plan each NIC security change
+// the deploy will not make, and returns the plan's warnings about them: each
+// withheld change with why, and each weakening that is applied. live is the
+// VM's NICs as enforced now (nil: only the stored spec is known); stored is
+// the overlaid stored spec Classify compared with.
+func ApplyNICSecurityGate(vm string, p *ChangePlan, desired, stored *pb.VMSpec, live []LiveNIC, gate NICSecurityGate) []string {
+	if len(p.NICSecurity) == 0 {
+		return nil
+	}
+	if p.Max() == ActionRecreate || len(p.NotReconfigurable) > 0 {
+		// The recreate makes the NICs from the file, as it always has.
+		var out []string
+		for _, w := range p.Weakens() {
+			out = append(out, "the recreate applies the file's NIC security, which "+w)
+		}
+		return out
+	}
+	var warnings []string
+	withheld := map[string]bool{}
+	withhold := func(c NICSecurityChange, why string) {
+		withheld[c.Field] = true
+		what := "security groups"
+		if c.Guard {
+			what = "guard"
+		}
+		warnings = append(warnings, fmt.Sprintf("nic %d (%s) %s not restored: %s", c.Position, c.Network, what, why))
+	}
+	for _, c := range p.NICSecurity {
+		switch {
+		case !c.Guard && SharedNetworkConflict(c.Position, desired, stored, live) != "":
+			withhold(c, SharedNetworkConflict(c.Position, desired, stored, live))
+		case c.Guard && gate.GuardsUnwritable != "":
+			withhold(c, gate.GuardsUnwritable)
+		case len(c.Weakens) > 0 && !gate.AllowWeaken:
+			withhold(c, "it may remove protection set outside the file — "+strings.Join(c.Weakens, "; ")+
+				"; re-run with --allow-weaken to apply it")
+		case !c.Guard && gate.CheckBind != nil && gate.CheckBind(vm) != nil:
+			withhold(c, gate.CheckBind(vm).Error())
+		case c.Guard && len(c.Weakens) > 0 && gate.CheckWeakenGuard != nil && gate.CheckWeakenGuard(c.Network) != nil:
+			withhold(c, gate.CheckWeakenGuard(c.Network).Error())
+		default:
+			for _, w := range c.Weakens {
+				warnings = append(warnings, "applied with --allow-weaken: "+w)
+			}
 		}
 	}
+	if len(withheld) > 0 {
+		var meta []Delta
+		for _, d := range p.MetadataChanges {
+			if !withheld[d.Field] {
+				meta = append(meta, d)
+			}
+		}
+		p.MetadataChanges = meta
+		var kept []NICSecurityChange
+		for _, c := range p.NICSecurity {
+			if !withheld[c.Field] {
+				kept = append(kept, c)
+			}
+		}
+		p.NICSecurity = kept
+	}
+	return warnings
+}
+
+// SharedNetworkConflict is why NIC i's binding cannot be restored on its own,
+// or "": a binding is written per network, so every other NIC of the VM on
+// that network must be one the file declares the same groups for.
+func SharedNetworkConflict(i int, desired, stored *pb.VMSpec, live []LiveNIC) string {
+	network := desired.Network[i].GetName()
+	want := desired.Network[i].GetSecurityGroups()
+	self := MatchLiveNIC(stored.GetNetwork(), i, live)
+	positionOf := func(mac string) int {
+		for j := range stored.GetNetwork() {
+			if n := MatchLiveNIC(stored.GetNetwork(), j, live); n != nil && strings.EqualFold(n.MAC, mac) {
+				return j
+			}
+		}
+		return -1
+	}
+	conflict := func(j int) bool {
+		return j < 0 || j >= len(desired.Network) || !slices.Equal(desired.Network[j].GetSecurityGroups(), want)
+	}
+	if live != nil {
+		for _, o := range live {
+			if o.Network != network || (self != nil && strings.EqualFold(o.MAC, self.MAC)) {
+				continue
+			}
+			if conflict(positionOf(o.MAC)) {
+				return fmt.Sprintf("a security-group binding is written per network, and NIC %s, also on %q, is not declared with the same groups "+
+					"(declare %s on every NIC of the VM on %q, or bind them all with lv sg bind)", o.MAC, network, sgList(want), network)
+			}
+		}
+		return ""
+	}
+	for j, sn := range stored.GetNetwork() {
+		if j != i && sn.GetName() == network && conflict(j) {
+			return fmt.Sprintf("a security-group binding is written per network, and NIC %d, also on %q, is not declared with the same groups "+
+				"(declare %s on every NIC of the VM on %q, or bind them all with lv sg bind)", j, network, sgList(want), network)
+		}
+	}
+	return ""
+}
+
+// CarryUndeclaredSecurityGroups gives each NIC of a recreate's desired spec
+// whose file declares no security groups the binding its live NIC has (stored
+// is the overlaid stored spec), so a recreate leaves an undeclared binding as
+// it is, as an in-place update does. A NIC whose network changed is a new NIC
+// and carries nothing. It returns a note per carried binding.
+func CarryUndeclaredSecurityGroups(desired, stored *pb.VMSpec) []string {
+	var notes []string
+	for i, dn := range desired.GetNetwork() {
+		if dn == nil || len(dn.GetSecurityGroups()) > 0 || i >= len(stored.GetNetwork()) || stored.Network[i] == nil ||
+			stored.Network[i].GetName() != dn.GetName() || len(stored.Network[i].GetSecurityGroups()) == 0 {
+			continue
+		}
+		dn.SecurityGroups = slices.Clone(stored.Network[i].GetSecurityGroups())
+		notes = append(notes, fmt.Sprintf("nic %d (%s) keeps its security groups %s through the recreate (the file declares none)",
+			i, dn.GetName(), sgList(dn.SecurityGroups)))
+	}
+	return notes
 }

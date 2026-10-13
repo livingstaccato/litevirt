@@ -105,6 +105,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.Internal, "load cluster state: %v", err)
 	}
+	if err := s.loadNICSecurityPlanState(ctx, state, f.Name, req.AllowWeaken); err != nil {
+		return err
+	}
 
 	resolved, err := planner.Resolve(ctx, f, state)
 	if err != nil {
@@ -1595,6 +1598,9 @@ func (s *Server) DiffStack(ctx context.Context, req *pb.DiffStackRequest) (*pb.D
 	state, err := planner.LoadClusterState(ctx, s.db, s.capacity)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "load cluster state: %v", err)
+	}
+	if err := s.loadNICSecurityPlanState(ctx, state, f.Name, req.AllowWeaken); err != nil {
+		return nil, err
 	}
 
 	resolved, err := planner.Resolve(ctx, f, state)

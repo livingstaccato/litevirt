@@ -123,11 +123,10 @@ type ChangePlan struct {
 	// rolling-update strategy) — recorded, not silently ignored, and never a VM
 	// lifecycle action here.
 	Delegated []string
-	// Weakens names each change that takes protection away from a NIC as it
-	// is enforced now: a security group bound outside the file that the
-	// update unbinds, or a guard the update relaxes or turns off. Each is
-	// also a MetadataChanges entry; this is what the plan must say aloud.
-	Weakens []string
+	// NICSecurity are the NIC security-group bindings and guards the plan
+	// restores from what is enforced now (each also a MetadataChanges entry),
+	// with what each may weaken (nic_security.go).
+	NICSecurity []NICSecurityChange
 }
 
 // NICRetarget is one NIC moving from its stack-scoped network to the cluster

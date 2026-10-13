@@ -260,11 +260,12 @@ func identityCollapseUpdate(tx *sql.Tx, table string, setCols []string, setVals 
 //	live          newer or      the local row is tombstoned in place (its id kept,
 //	              equal         deleted_at and updated_at taken from the incoming
 //	              tombstone     tombstone), then the two tombstones are decided as
-//	                            above. Every tombstone of these tables is stamped by
-//	                            a by-name delete, and this is that delete's own effect
-//	                            on the row holding the name here: what the WAL does
-//	                            when it carries the delete. Only anti-entropy meets
-//	                            it, since a replicated INSERT is always a live row
+//	                            above. For a strictly newer tombstone this is the
+//	                            by-name delete's effect; at an exact tie the WAL
+//	                            keeps the live row and anti-entropy tombstones it,
+//	                            and both converge. Not decided for a future-skewed
+//	                            tombstone with the skew guard on. Only anti-entropy
+//	                            meets it: a replicated INSERT is always a live row
 //	anything else               no decision: the apply proceeds as before
 //
 // Two LIVE rows under one name are canonical_identity's decision, and are
@@ -368,9 +369,9 @@ func decideIdentityCollision(tx *sql.Tx, in identityIncoming) (identityCollision
 			d = collisionSkipIncoming
 		} else {
 			// A delete of this name at or after the local live row's last
-			// write: what the by-name delete that stamped the incoming
-			// tombstone does to whatever row holds the name. Equal time: a
-			// delete wins the tie, as everywhere in this table.
+			// write. Strictly newer: the by-name delete's effect. Exact tie:
+			// the WAL keeps the live row, anti-entropy tombstones it, and
+			// both converge.
 			d = collisionTombstoneLocal
 		}
 	}

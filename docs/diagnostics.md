@@ -337,16 +337,23 @@ behind a token:
   | tombstone | older or equal-time live row | the incoming row is skipped: a newer delete of the name supersedes it (a delete wins an exact tie) |
   | tombstone | tombstone | the newer stays; an exact tie keeps the smaller id, so every node converges |
   | live row | older tombstone | the incoming tombstone is stale and is skipped |
-  | live row | newer or equal-time tombstone | anti-entropy tombstones the row here in place, keeping its id and taking the tombstone's `deleted_at` and `updated_at` (the by-name delete's own effect, which the WAL applies when it carries that delete); the two tombstones are then settled as above |
+  | live row | newer or equal-time tombstone | anti-entropy tombstones the row here in place, keeping its id and taking the tombstone's `deleted_at` and `updated_at`; the two tombstones are then settled as above. For a strictly newer tombstone this is the by-name delete's effect. At an exact tie the WAL keeps the live row and anti-entropy tombstones it; both converge |
 
   Two live rows under one name are `canonical_identity`'s decision and are
   never touched. A yield is refused — the apply then proceeds as before — when
   a child row references the tombstone, when the incoming id is already bound
   to another name, or when the incoming clock is future-skewed with the skew
-  guard on. The yield and the incoming row's apply share a savepoint: if the
-  incoming row does not land, the tombstone is put back. Logged at INFO as
-  `a deleted row yielded its name to a newer row` or `skipped a row a newer
-  delete of its name supersedes`.
+  guard on. The in-place tombstone is likewise not decided for a future-skewed
+  tombstone with the skew guard on. The yield and the incoming row's apply
+  share a savepoint: if the incoming row does not land, the tombstone is put
+  back. Logged at INFO as `a deleted row yielded its name to a newer row` or
+  `skipped a row a newer delete of its name supersedes`, and at WARN as
+  `anti-entropy: a newer delete of its name tombstoned the row here`. When
+  that row recorded an artifact path (`vmstate_path`, or `path` for a
+  container snapshot), the file stays on disk and is logged at WARN as
+  `anti-entropy tombstoned a live row whose artifact is now unreferenced (not
+  auto-deleted; needs cleanup)` with its host and path, and counted in
+  `litevirt_identity_collapse_orphaned_total`.
 
 This is what un-wedges a stream that already carries a fresh-id re-create: the
 entry is still in the sender's log, and an upgraded receiver applies it on the

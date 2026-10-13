@@ -313,6 +313,17 @@ func TestParkableTables_AreTheIdentityTables(t *testing.T) {
 	if !replicated["registry_credentials"] || !replicated["snapshots"] {
 		t.Fatalf("the replicated-table scan missed a known table, so it proves nothing: %v", replicated)
 	}
+	// Tables reachable only through the statement ledgers (WAL-only: in
+	// neither anti-entropy lane). Seeing them proves the ledger loop ran.
+	for _, walOnly := range []string{
+		"clock_skew", "container_restarts", "crl_versions", "host_runtime_usage", "leader_election",
+		"netbox_sync_queue", "rebalance_proposals", "session_factors", "session_groups", "sessions",
+		"vm_events", "vm_locks", "vm_restarts",
+	} {
+		if !replicated[walOnly] {
+			t.Fatalf("the replicated-table scan missed WAL-only table %s, so the ledger tables are not being judged", walOnly)
+		}
+	}
 	var withUnique []string
 	for table := range replicated {
 		rows, err := c.DB().Query(`SELECT "unique", origin FROM pragma_index_list(?)`, table)
@@ -597,5 +608,35 @@ func TestPlanNaturalKeyRow_GuardDeclinesAChangedName(t *testing.T) {
 	}
 	if write(c, plan) {
 		t.Fatal("a write planned over a tombstone applied after it was un-deleted")
+	}
+}
+
+// Tombstoning a live row in place leaves its artifact unreferenced by a live
+// row: it is surfaced like a collapse's orphan (metric + WARN), not dropped
+// silently. A row with no artifact path surfaces nothing.
+func TestAntiEntropy_InPlaceTombstoneSurfacesTheOrphanedArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want int
+	}{{"/var/lib/litevirt/vmstate/vm-s1.sav", 1}, {"", 0}} {
+		c := parkTestClient(t)
+		m := &fakeSyncMetrics{}
+		c.SetSyncMetrics(m)
+		seedSnap(t, c, "m", "vm", "s1", tsOld, false, "")
+		if tc.path != "" {
+			if _, err := c.DB().Exec(`UPDATE snapshots SET vmstate_path = ? WHERE id = 'm'`, tc.path); err != nil {
+				t.Fatal(err)
+			}
+		}
+		aeMerge(t, c, aeRow("a", "s1", tsNew, true)) // newer tombstone, smaller id: m is tombstoned, then yields
+		if got := snapsUnder(t, c, "vm", "s1"); len(got) != 1 || got[0].id != "a" || !got[0].deleted {
+			t.Fatalf("path %q: rows = %+v, want the tombstone a", tc.path, got)
+		}
+		m.mu.Lock()
+		n := len(m.identityOrphan)
+		m.mu.Unlock()
+		if n != tc.want {
+			t.Fatalf("path %q: orphan count = %d, want %d", tc.path, n, tc.want)
+		}
 	}
 }

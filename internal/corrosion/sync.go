@@ -1150,13 +1150,26 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			}
 			decision, localID, dErr := decideIdentityCollision(tx, in)
 			if dErr == nil && decision == collisionTombstoneLocal {
-				// The incoming by-name delete's effect on the live row here;
-				// then the two tombstones are decided like any others.
-				if dErr = tombstoneLocalInPlace(tx, table.Name, localID, in.deletedAt, in.ts); dErr == nil {
-					tombKey, tombTbl, tombID := pkKey(natVals), table.Name, localID
+				// Tombstone the live row here in place, then decide the two
+				// tombstones like any others. The row's artifact (read first,
+				// failing closed like the collapse) stays on disk unreferenced
+				// by a live row, so it is surfaced the way a collapse surfaces one.
+				var artHost, artPath string
+				var artFound bool
+				artHost, artPath, artFound, dErr = identityArtifact(tx, table.Name, localID)
+				if dErr == nil {
+					dErr = tombstoneLocalInPlace(tx, table.Name, localID, in.deletedAt, in.ts)
+				}
+				if dErr == nil {
+					tombKey, tombTbl, tombID, byID := pkKey(natVals), table.Name, localID, in.id
 					c.deferAfterCommit(tx, func() {
-						slog.Info("anti-entropy: a newer delete of its name tombstoned the row here",
-							"table", tombTbl, "natural_key", tombKey, "id", tombID, "path", "ae")
+						slog.Warn("anti-entropy: a newer delete of its name tombstoned the row here",
+							"table", tombTbl, "natural_key", tombKey, "id", tombID, "tombstone_id", byID, "path", "ae")
+						if artFound && artPath != "" {
+							c.observeIdentityCollapseOrphan(tombTbl)
+							slog.Warn("anti-entropy tombstoned a live row whose artifact is now unreferenced (not auto-deleted; needs cleanup)",
+								"table", tombTbl, "id", tombID, "host", artHost, "artifact_path", artPath, "tombstone_id", byID)
+						}
 					})
 					decision, localID, dErr = decideIdentityCollision(tx, in)
 				}

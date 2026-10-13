@@ -688,7 +688,13 @@ message VNCData { bytes data = 1; }
 // ── Stacks ──
 message DeployStackRequest { string compose_yaml = 1; string target_vm = 2;
     int32 scale_override = 3; string scale_vm = 4; bool dry_run = 5;
-    string expected_hash = 6; }
+    string expected_hash = 6;
+    // allow_weaken lets the deploy restore a NIC's declared security groups,
+    // or a declared guard that is looser than the one enforced now, over a
+    // runtime change (lv sg bind, lv firewall nic-guard set). Without it such
+    // a restore is withheld and reported. Default false: an older client
+    // never weakens.
+    bool allow_weaken = 7; }
 message DeployProgress     { string phase = 1; string vm_name = 2;
     string host_name = 3; float progress_pct = 4;
     string detail = 5; string error = 6; }
@@ -698,7 +704,9 @@ message ListStacksResponse { repeated StackSummary stacks = 1; }
 message StackSummary       { string name = 1; string state = 2; int32 vm_count = 3;
     int32 running = 4; int32 stopped = 5; int32 error = 6;
     google.protobuf.Timestamp created_at = 7; }
-message DiffStackRequest    { string compose_yaml = 1; }
+message DiffStackRequest    { string compose_yaml = 1;
+    // allow_weaken plans as DeployStackRequest.allow_weaken would.
+    bool allow_weaken = 2; }
 message DiffStackResponse   { repeated DiffEntry entries = 1; }
 message DiffEntry           { string vm_name = 1; DiffOp operation = 2; string detail = 3; }
 message ExportStackRequest  { string name = 1; }
@@ -2442,8 +2450,8 @@ message ListAuditLogRequest {
     string target = 2;   // filter: exact target path (empty = any)
     string action = 3;   // filter: exact, or trailing-* prefix glob e.g. "sg.*" (empty = any)
     string user   = 4;   // filter: exact username (empty = any)
-    string since  = 5;   // filter: timestamp >= since, RFC3339 (empty = open)
-    string until  = 6;   // filter: timestamp <= until, RFC3339 (empty = open)
+    string since  = 5;   // filter: at/after since, as an instant (forms as ExportAuditChainRequest; empty = open)
+    string until  = 6;   // filter: up to the end of until (forms as ExportAuditChainRequest; empty = open)
 }
 message AuditEntry {
     string timestamp = 1;
@@ -2461,7 +2469,7 @@ message ListAuditLogResponse { repeated AuditEntry entries = 1; }
 message ListVMEventsRequest {
     string vm_name = 1;
     int32  limit   = 2;  // default 100, max 1000
-    string since   = 3;  // RFC3339; empty = no lower bound
+    string since   = 3;  // at/after, as an instant (forms as ExportAuditChainRequest); empty = no lower bound
 }
 message VMEvent {
     string id        = 1;
@@ -5355,6 +5363,20 @@ message VerifyAuditChainResponse {
     // the same. A current daemon never writes one. Feeds `unverified`, not
     // `tampered` — an older build may have written the row verbatim.
     repeated string ambiguous_rows = 19;
+    // What kind of break broken_at_id is, so a client can name it rather than
+    // calling every broken link an edit:
+    //   "content"  - the row does not hash to its own stored content_hash,
+    //                even against its own stored prev_hash: it was edited.
+    //   "forked"   - the row hashes correctly against its own stored prev_hash,
+    //                which is empty: it opens a second chain under a host name
+    //                that already has one (a rebuilt host appending before its
+    //                history arrived). Still a finding.
+    //   "unlinked" - the row hashes correctly against its own stored prev_hash,
+    //                but that is not the hash of the row before it: a row
+    //                before it was deleted or rewritten, or the chain branched.
+    // Empty when broken_at_id is, and from a daemon older than this field,
+    // which a client reads as "content" — the only label it used to have.
+    string broken_at_kind = 20;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
@@ -5446,8 +5468,10 @@ message RetireAuditKeyResponse {
 }
 
 message ExportAuditChainRequest {
-    // ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
-    // "from the beginning" / "to the end".
+    // Time bounds, both inclusive, compared as instants: RFC3339 (any offset),
+    // a date or coarser, or a duration ago (corrosion.ParseTimeWindow; until
+    // runs to the end of the unit it names). Unparseable is InvalidArgument.
+    // Empty since/until means "from the beginning" / "to the end".
     //
     // A window that starts mid-chain exports a fragment whose first row links
     // to a row outside it, which cannot be re-verified. Narrow the window to

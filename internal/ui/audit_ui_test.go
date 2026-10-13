@@ -168,3 +168,19 @@ func TestAuditExport_FollowsTheCursorToTheEndOfTheChain(t *testing.T) {
 		t.Error("downloaded export dropped ca_pem")
 	}
 }
+
+// A forked chain is named as one in the toast, not as a hash mismatch: the row
+// hashes correctly, and "hash mismatch" reads as an edit.
+func TestAuditVerify_ForkedChainNamedInToast(t *testing.T) {
+	mock := newDefaultMock()
+	mock.verifyAuditResp = &pb.VerifyAuditChainResponse{
+		RowsChecked: 10, BrokenAtId: "row-77", BrokenAtKind: "forked", Tampered: true,
+	}
+	s := newTestUIServer(t, mock)
+	w := serveRequest(s, withAuth(mustReq(t, "POST", "/ui/audit/verify")))
+	assertStatus(t, w, http.StatusOK)
+	assertToast(t, w, "forked chain at row row-77")
+	if strings.Contains(w.Body.String(), "hash mismatch") {
+		t.Errorf("forked chain reported as a hash mismatch: %s", w.Body.String())
+	}
+}

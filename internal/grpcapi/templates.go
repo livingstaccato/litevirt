@@ -537,7 +537,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		// A NIC on the `trunk:` feature is guarded like any other new NIC,
 		// its VLANs its network's to allow (guardDecision.record, re-review
 		// R2-I1, R3-I1).
-		if !strings.HasPrefix(bridge, "direct:") {
+		// A macvtap or SR-IOV NIC bypasses the bridge where guards are
+		// enforced: no record, rather than one that claims a protection it
+		// lacks (guardUnenforcedOnNetwork, as create decides).
+		if !strings.HasPrefix(bridge, "direct:") && guardUnenforcedOnNetwork(ctx, s.db, n.Name) == "" {
 			guardRecords = append(guardRecords, corrosion.NICGuardRecord{VMName: req.Target, MAC: mac, Mode: corrosion.NICGuardOn,
 				VMUUID: cloneUUID, Network: n.Name, Ordinal: i})
 		}

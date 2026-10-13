@@ -185,6 +185,11 @@ type Reconciler struct {
 	// answer from storage, walked first on the next pass (start_deferral.go).
 	startDeferral func(ctx context.Context, vm *corrosion.VMRecord) error
 	startDeferred startDeferredSet
+	// diskStat / diskLstat are how the reconcile pass looks at a disk file
+	// (disk_stat.go); nil is os.Stat / os.Lstat. Tests stand in a storage
+	// that does not answer.
+	diskStat  func(string) (os.FileInfo, error)
+	diskLstat func(string) (os.FileInfo, error)
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -237,9 +242,24 @@ type Reconciler struct {
 	// them each tick (dropping any now running) so a latched gate can't PERMANENTLY
 	// strand onboot autostart after a reboot — the refusal is a safe gap that closes
 	// when quorum returns. Only VMs that are onboot AND not-running-at-boot ever
-	// enter this set, so a deliberately-stopped VM is never autostarted by the retry.
+	// enter this set. A VM its operator stopped enters it only on a host boot
+	// (onbootOverride); otherwise the retry never autostarts an operator stop.
 	onbootMu      sync.Mutex
 	onbootPending map[string]corrosion.VMRecord
+	// onbootOverride (under onbootMu): the VMs a HOST boot starts although
+	// their operator stopped them, each with the stop it found
+	// (onboot_boot.go); persisted with onbootBootID, this boot's ID, on every
+	// change.
+	onbootOverride map[string]onbootStop
+	onbootBootID   string
+	// bootID reads this boot's ID; nil is the kernel's (onboot_boot.go).
+	bootID func() (string, error)
+	// writeRecord writes the onboot record; nil is writeOnbootRecord. Tests
+	// make it fail.
+	writeRecord func(dataDir string, rec onbootRecord) error
+	// listVMs lists this host's VMs for onboot; nil is corrosion.ListVMs.
+	// Tests make it fail.
+	listVMs func(ctx context.Context) ([]corrosion.VMRecord, error)
 
 	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
 	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
@@ -491,11 +511,12 @@ func (r *Reconciler) Start(ctx context.Context) {
 // running in libvirt, in ascending startup_order, pausing start_delay_sec
 // between each (#10). Run ONCE at daemon startup, not on the periodic tick.
 //
-// Keying on "not running in libvirt" distinguishes a host reboot from a plain
-// daemon restart for free: KillMode=process keeps qemu alive across a daemon
-// restart (domains still running → skipped), whereas a host reboot leaves the
-// domains shut off (→ started here). So deliberately-stopped VMs are only
-// (re)started when the host actually boots.
+// KillMode=process keeps qemu alive across a daemon restart (domains still
+// running → skipped), whereas a host reboot leaves the domains shut off (→
+// started here). A VM its operator stopped is not running either way, so the
+// host boot is told from a daemon restart by the kernel's boot ID
+// (onboot_boot.go): such a VM is started only when the host has booted since
+// onboot last ran, and a plain daemon restart leaves it stopped.
 func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 	// Defensive: this runs in a startup goroutine — a panic here must never take
 	// the daemon down (which would strand the host).
@@ -507,9 +528,28 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 	if r.virt == nil {
 		return
 	}
-	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
+	listVMs := r.listVMs
+	if listVMs == nil {
+		listVMs = func(ctx context.Context) ([]corrosion.VMRecord, error) {
+			return corrosion.ListVMs(ctx, r.db, "", r.hostName)
+		}
+	}
+	vms, err := listOnbootVMs(ctx, listVMs)
+	boot := r.onbootBootState()
 	if err != nil {
-		slog.Error("onboot: list VMs", "error", err)
+		// Fail closed: record this boot owing nothing, so a daemon restart
+		// later in this boot reads "same boot, nothing owed" and honours
+		// every operator stop — never the previous boot's record, which
+		// reads as a host boot and would override a stop made since. The
+		// cost: an operator-stopped onboot VM stays stopped on this boot
+		// (`lv start` starts it).
+		slog.Error("onboot: cannot list this host's VMs; no onboot VM is started, and this boot is recorded owing none, so a VM its operator stopped stays stopped",
+			"error", err, "host_boot", boot.hostBoot)
+		r.onbootMu.Lock()
+		r.onbootBootID = boot.id
+		r.onbootOverride = map[string]onbootStop{}
+		r.persistOnbootLocked()
+		r.onbootMu.Unlock()
 		return
 	}
 	type onbootVM struct {
@@ -517,6 +557,7 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 		order int
 		delay int
 	}
+	overrides := map[string]onbootStop{}
 	var list []onbootVM
 	for _, vm := range vms {
 		if vm.Spec == "" {
@@ -532,8 +573,30 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 				continue
 			}
 		}
+		// An operator's stop is overridden by a host boot only — onboot is
+		// "start at host boot" — or, on a daemon restart later in that boot,
+		// when the boot still owes it (onboot_boot.go). A drain's stop or a
+		// re-key's is not an operator's choice that a reboot answers, and
+		// stays.
+		if IsOperatorStop(vm.StateDetail) {
+			if !onbootOverrides(boot, vm) {
+				slog.Info("onboot: left stopped — not a host boot, a stop made since the boot, or not an operator's stop",
+					"vm", vm.Name, "state_detail", vm.StateDetail, "host_boot", boot.hostBoot)
+				continue
+			}
+			overrides[vm.Name] = onbootStop{VM: vm.Name, State: vm.State, StateDetail: vm.StateDetail}
+		}
 		list = append(list, onbootVM{vm: vm, order: int(spec.StartupOrder), delay: int(spec.StartDelaySec)})
 	}
+	// Every override is registered and recorded before any start is tried
+	// and before any start-delay wait: the reconcile loop runs beside this,
+	// and a restart at any point after reads exactly what is still owed
+	// (review I-1, I-2).
+	r.onbootMu.Lock()
+	r.onbootBootID = boot.id
+	r.onbootOverride = overrides
+	r.persistOnbootLocked()
+	r.onbootMu.Unlock()
 	if len(list) == 0 {
 		return
 	}
@@ -568,10 +631,50 @@ func (r *Reconciler) rememberOnboot(vm corrosion.VMRecord) {
 	r.onbootMu.Unlock()
 }
 
+// clearOnbootPending ends name's onboot duty, and its override with it.
 func (r *Reconciler) clearOnbootPending(name string) {
 	r.onbootMu.Lock()
 	delete(r.onbootPending, name)
+	r.endOnbootOverrideLocked(name)
 	r.onbootMu.Unlock()
+}
+
+// endOnbootOverride ends the host boot's override of name's operator stop.
+// The VM stays owed its onboot start, as any onboot VM is; only a stop it
+// carries from now on is honoured, now and after a daemon restart.
+func (r *Reconciler) endOnbootOverride(name string) {
+	r.onbootMu.Lock()
+	r.endOnbootOverrideLocked(name)
+	r.onbootMu.Unlock()
+}
+
+// endOnbootOverrideLocked ends name's override and records what is left owed.
+func (r *Reconciler) endOnbootOverrideLocked(name string) {
+	if _, ok := r.onbootOverride[name]; !ok {
+		return
+	}
+	delete(r.onbootOverride, name)
+	r.persistOnbootLocked()
+}
+
+// settleOnbootOverride ends the override of name's operator stop once its
+// row no longer carries that stop (a write this process did not make: the
+// start's own "starting" write ends it at once, startPendingVM).
+func (r *Reconciler) settleOnbootOverride(name string, fresh *corrosion.VMRecord) {
+	if IsOperatorStop(fresh.StateDetail) {
+		return
+	}
+	r.endOnbootOverride(name)
+}
+
+// onbootStopOverridden reports whether fresh's operator stop is the one a
+// host boot found and starts name over: the same state and detail. A stop
+// recorded since is a new choice, and stands.
+func (r *Reconciler) onbootStopOverridden(name string, fresh *corrosion.VMRecord) bool {
+	r.onbootMu.Lock()
+	defer r.onbootMu.Unlock()
+	s, ok := r.onbootOverride[name]
+	return ok && fresh.State == s.State && fresh.StateDetail == s.StateDetail
 }
 
 // specOnboot reports whether a VM's stored spec still marks it onboot. An empty or
@@ -593,7 +696,9 @@ func specOnboot(specJSON string) bool {
 // drops the retry — never autostarting — if the VM is already running, its row is
 // gone or reassigned, the operator has since stopped it (operator-stop), or onboot
 // was disabled. So a returning quorum can't resurrect a VM the operator stood down
-// while it was absent. Idempotent: startPendingVM no-ops on an already-running domain.
+// while it was absent. An operator stop a host boot found and overrides is not
+// "since" (onboot_boot.go): the boot's start of it is still owed (lab 2 F-4).
+// Idempotent: startPendingVM no-ops on an already-running domain.
 //
 // The only argument picks which of them this call retries: the ones whose
 // start was deferred for time last pass go before the walk, the rest after
@@ -624,15 +729,32 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 			}
 		}
 		fresh, err := corrosion.GetVM(ctx, r.db, name)
-		if err != nil || fresh == nil || fresh.HostName != r.hostName {
+		if err != nil {
+			// A read that failed (the walk's budget spent, a transient DB
+			// error) says nothing about the VM: the duty is kept for the
+			// next pass, never dropped as "gone" (lab 2 F-5).
+			slog.Warn("reconciler: onboot retry could not read the VM's row; tried again next pass",
+				"vm", name, "error", err)
+			continue
+		}
+		if fresh == nil || fresh.HostName != r.hostName {
+			slog.Info("reconciler: dropping onboot retry — the VM is gone or on another host", "vm", name)
 			r.clearOnbootPending(name) // gone / reassigned — no longer our onboot duty
 			continue
 		}
+		r.settleOnbootOverride(name, fresh)
 		// Operator intent may have changed while quorum was absent: honor it.
-		if IsOperatorStop(fresh.StateDetail) || !specOnboot(fresh.Spec) {
+		if (IsOperatorStop(fresh.StateDetail) && !r.onbootStopOverridden(name, fresh)) || !specOnboot(fresh.Spec) {
 			slog.Info("reconciler: dropping onboot retry — operator intent changed",
 				"vm", name, "state_detail", fresh.StateDetail, "onboot", specOnboot(fresh.Spec))
 			r.clearOnbootPending(name)
+			continue
+		}
+		if fresh.State == "pending" || fresh.State == "starting" {
+			// The walk drives every pending or starting row of this host on
+			// each pass (a deferred start among them), so the retry leaves
+			// it to the walk: driven once per pass, not twice (lab 2 O-8).
+			// The duty stays until the start is made or dropped.
 			continue
 		}
 		r.startPendingVM(ctx, *fresh) // gated + current row; succeeds once quorum returns
@@ -1547,6 +1669,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler"); err != nil {
 		slog.Error("reconciler: failover start-marker write failed", "vm", vm.Name, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
+	} else {
+		// The start is past every gate and its row no longer carries the
+		// stop: a host boot's override of an operator stop has done its
+		// job, and a stop recorded from here on — even one identical to the
+		// stop it overrode — is honoured (review M-1). Not when the write
+		// failed: the row still reads as that stop, and the next retry
+		// would drop the VM (review round 1, m-2).
+		r.endOnbootOverride(vm.Name)
 	}
 
 	// Parse the stored spec to rebuild the domain XML.
@@ -1635,6 +1765,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	for _, d := range diskRecords {
 		if transfer {
 			if _, err := r.setAsideSupersededDisk(ctx, vm.Name, proofID, d); err != nil {
+				if storage.IsFSNoAnswer(err) {
+					// Whether an old copy is at the path cannot be told:
+					// nothing is renamed, and the start waits.
+					r.deferStart(ctx, vm.Name, proofID, transfer, diskNoAnswer(d, err))
+					return
+				}
 				r.failPendingStart(ctx, vm.Name, proofID, true,
 					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
 				return
@@ -1644,7 +1780,21 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		// in the cluster, not on a host, and is never rebuilt here — an
 		// overlay "recreated" in its place would boot the VM on a blank copy
 		// of its image.
-		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
+		//
+		// Bounded (disk_stat.go): a disk whose storage does not answer is
+		// not missing — never refused as gone, never rebuilt — and does not
+		// hold the pass: the start is deferred (lab 2 F-3).
+		var statErr error
+		if !isNetworkDiskPath(d.Path) {
+			_, statErr = r.statDisk(d.Path)
+		}
+		if storage.IsFSNoAnswer(statErr) {
+			slog.Warn("reconciler: a disk's storage does not answer; the start waits",
+				"vm", vm.Name, "disk", d.DiskName, "path", d.Path, "error", statErr)
+			r.deferStart(ctx, vm.Name, proofID, transfer, diskNoAnswer(d, statErr))
+			return
+		}
+		if statErr != nil {
 			if !transfer {
 				// A local start of a VM whose disk is gone: never rebuilt
 				// blank (missing_disk.go).

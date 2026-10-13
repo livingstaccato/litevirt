@@ -1416,7 +1416,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go svc.RunDeletedVMMarkerSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
-	// KillMode=process) is a no-op while a host reboot brings them up in order.
+	// KillMode=process) is a no-op while a host reboot brings them up in order;
+	// one its operator stopped only when the kernel's boot ID says the host
+	// booted (health/onboot_boot.go).
 	go reconciler.StartOnbootVMs(ctx)
 
 	// Rebalance executor: leader-gated loop that applies operator-approved
@@ -2001,17 +2003,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 			uninstalled = true
 		}
 		// Bounded whatever the RPCs in flight do: one stuck on storage that
-		// does not answer must not hold the restart (stopGRPC).
-		stopGRPC(d.grpcSrv, grpcGracefulStop, grpcForcedStop)
-		close(grpcStopped)
-		// A vfio-pci unbind still blocked in the kernel keeps this process alive
-		// past every step below; name the devices so an operator knows which
-		// holder to stop.
-		vfio.LogStuckUnbinds()
-		// A drain returns before its failback records are written, and this
-		// is the host it drained: give them a moment to land while the
-		// replicator still runs, and name every VM whose record is lost.
-		svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+		// does not answer must not hold the restart (stopGRPC). stopServing
+		// closes grpcStopped as soon as that stop returns or is given up on.
+		stopServing(d.grpcSrv, svc, grpcGracefulStop, grpcForcedStop, grpcStopped, func() {
+			// A vfio-pci unbind still blocked in the kernel keeps this process alive
+			// past every step below; name the devices so an operator knows which
+			// holder to stop.
+			vfio.LogStuckUnbinds()
+			// A drain returns before its failback records are written, and this
+			// is the host it drained: give them a moment to land while the
+			// replicator still runs, and name every VM whose record is lost.
+			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+		})
 		if d.fwReconciler != nil {
 			d.fwReconciler.Stop()
 		}

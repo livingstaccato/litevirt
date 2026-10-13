@@ -264,7 +264,12 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	current := buildCurrentVMs(state, f.Name)
 	ctCurrent, ctHost := buildCurrentContainers(state, f.Name)
 	current = append(current, ctCurrent...)
-	vmPlan, err := compose.Build(f, current)
+	// Which networks cannot enforce a guard is the planner's to say, from the
+	// snapshot and the file (a network this deploy creates is not in the
+	// snapshot yet).
+	gate := state.NICSecurityGate
+	gate.GuardUnenforced = guardUnenforcedFrom(state, f)
+	vmPlan, err := compose.BuildGated(f, current, gate)
 	if err != nil {
 		return nil, fmt.Errorf("build workload plan: %w", err)
 	}
@@ -316,8 +321,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		if vm.StackName != f.Name || vm.Spec == "" {
 			continue
 		}
-		ss := &pb.VMSpec{}
-		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+		if ss := storedSpecOf(state, vm); ss != nil {
 			storedSpecByVM[vm.Name] = ss
 		}
 	}
@@ -457,6 +461,23 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			action.TargetHost = br.Host
 			action.Spec = spec
 			vmHostMap[op.VMName] = br.Host
+			if (op.Kind == OpCreate || action.Apply == compose.ActionRecreate) && !action.IsContainer && spec != nil {
+				// A guard the file declares on a NIC that cannot enforce one
+				// is reported, and left out of the create, which would refuse
+				// it (compose.GuardUnenforcedOn).
+				for _, n := range compose.StripUnenforcedGuards(spec, gate.GuardUnenforced) {
+					plan.Warnings = append(plan.Warnings, op.VMName+": "+n)
+				}
+			}
+			if op.Kind == OpUpdate && action.Apply == compose.ActionRecreate && !action.IsContainer && spec != nil {
+				// A recreate makes the NICs from the file; a NIC the file
+				// declares no groups for keeps the binding it has now.
+				if stored := storedSpecByVM[op.VMName]; stored != nil {
+					for _, n := range compose.CarryUndeclaredSecurityGroups(spec, stored) {
+						plan.Warnings = append(plan.Warnings, op.VMName+": "+n)
+					}
+				}
+			}
 
 			// Convert device assignments.
 			for _, d := range br.Devices {
@@ -544,15 +565,32 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 		// The full stored spec lets Build compare every field, not just the
 		// coarse four; a spec that does not parse leaves Spec nil and the VM
 		// falls back to the coarse comparison rather than failing the plan.
-		if vm.Spec != "" {
-			ss := &pb.VMSpec{}
-			if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
-				cur.Spec = ss
-			}
+		if ss := storedSpecOf(state, &vm); ss != nil {
+			cur.Spec = ss
+			cur.LiveNICs = state.NICSecurity[vm.Name]
 		}
 		current = append(current, cur)
 	}
 	return current
+}
+
+// storedSpecOf is the stored spec of vm that a deploy compares the file with:
+// as stored, with each NIC's security-group binding and guard replaced by the
+// ones enforced now (ClusterState.NICSecurity), so a runtime `lv sg bind` or
+// `lv firewall nic-guard set` is seen. nil when it has none or it does not
+// parse.
+func storedSpecOf(state *ClusterState, vm *corrosion.VMRecord) *pb.VMSpec {
+	if vm.Spec == "" {
+		return nil
+	}
+	ss := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), ss); err != nil {
+		return nil
+	}
+	if live, ok := state.NICSecurity[vm.Name]; ok {
+		ss = compose.OverlayLiveNICSecurity(ss, live)
+	}
+	return ss
 }
 
 // buildCurrentContainers converts this stack's current containers (tagged with
@@ -1137,4 +1175,23 @@ func PinAssignedDevices(spec *pb.VMSpec, assigns []DeviceAssignment) {
 		d.Address = a.Address
 		written[a.Index] = true
 	}
+}
+
+// guardUnenforcedFrom is compose.GuardUnenforcedOn over the snapshot's network
+// records and, for a network with no record yet (one the deploy creates), the
+// file's own declaration (by record name); a network neither names is a
+// bridge. An existing record wins over the file, as the executor reads only
+// the record, so the two cannot disagree on a mismatched declaration.
+func guardUnenforcedFrom(state *ClusterState, f *compose.File) func(string) string {
+	types := map[string]string{}
+	for _, n := range state.Networks {
+		types[n.Name] = n.Type
+	}
+	for name, def := range f.Networks {
+		rn := f.ResolveNetworkName(name)
+		if _, recorded := types[rn]; !recorded && def.Type != "" {
+			types[rn] = def.Type
+		}
+	}
+	return func(network string) string { return compose.GuardUnenforcedOn(types[network], network) }
 }

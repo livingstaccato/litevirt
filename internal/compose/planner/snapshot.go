@@ -6,6 +6,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -50,6 +51,19 @@ type ClusterState struct {
 	// retry (one in a transient or error state): what of it was already made,
 	// which a retry repairs rather than replaces.
 	RecordedDisks map[string]int
+
+	// NICSecurity is, for each VM of the stack being planned, its NICs with
+	// the security-group binding and guard the firewall enforces now
+	// (LoadStackNICSecurity). A deploy compares the file with these, not with
+	// the create-time values in the stored spec
+	// (compose.OverlayLiveNICSecurity). A VM missing here is compared with
+	// its stored spec.
+	NICSecurity map[string][]compose.LiveNIC
+
+	// NICSecurityGate is what the deploying caller may restore of a NIC's
+	// security (compose.ApplyNICSecurityGate). The zero value withholds
+	// every restore that may weaken protection.
+	NICSecurityGate compose.NICSecurityGate
 }
 
 // LoadClusterState queries Corrosion once and builds an immutable snapshot.
@@ -173,4 +187,28 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		Capacity:      capacity,
 		Observations:  observations,
 	}, nil
+}
+
+// LoadStackNICSecurity reads the live NIC security of the stack's VMs into
+// state.NICSecurity (corrosion.LiveNICSecurity: the current incarnation's
+// guard record only, none for a NIC without one). Only the planned stack is
+// read, so an unrelated stack's VM cannot fail the plan. A read failure fails
+// the plan rather than comparing with create-time values.
+func LoadStackNICSecurity(ctx context.Context, db *corrosion.Client, state *ClusterState, stack string) error {
+	state.NICSecurity = map[string][]compose.LiveNIC{}
+	for _, vm := range state.VMs {
+		if vm.StackName != stack {
+			continue
+		}
+		var sp struct {
+			UUID string `json:"uuid"`
+		}
+		_ = json.Unmarshal([]byte(vm.Spec), &sp)
+		live, err := corrosion.LiveNICSecurity(ctx, db, vm.Name, sp.UUID)
+		if err != nil {
+			return fmt.Errorf("read the NIC security of %s: %w", vm.Name, err)
+		}
+		state.NICSecurity[vm.Name] = live
+	}
+	return nil
 }

@@ -73,3 +73,18 @@ func TestDrainDeploy_CleanDeployIsNil(t *testing.T) {
 		t.Fatalf("clean deploy: %v", err)
 	}
 }
+
+// A deploy's warnings reach the reconcile log; the deploy is still a success.
+func TestDrainDeploy_ReportsWarnings(t *testing.T) {
+	s := &scriptedDeploy{msgs: []*pb.DeployProgress{
+		{Phase: "warning", Detail: "web: nic 0 (lan) security groups not restored"},
+		{Phase: "done", VmName: "web"},
+	}}
+	var got []string
+	if err := DrainDeployReporting(s, func(w string) { got = append(got, w) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "not restored") {
+		t.Errorf("warnings = %v", got)
+	}
+}

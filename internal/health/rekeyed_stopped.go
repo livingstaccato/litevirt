@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // A stopped VM failover re-keyed onto this host.
@@ -124,9 +124,19 @@ func (r *Reconciler) defineRekeyedStoppedVM(ctx context.Context, vm corrosion.VM
 		if withheldDisk[d.DiskName] {
 			continue
 		}
-		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
-			r.noteRekeyOnce(vm.Name, "a shared disk is not visible on this host", "disk", d.DiskName, "path", d.Path)
-			return
+		// An rbd disk is in the cluster, not a file here. A file is looked
+		// at under the bound (disk_stat.go): one whose storage does not
+		// answer is not "not visible", and the pass goes on without it.
+		if !isNetworkDiskPath(d.Path) {
+			_, err := r.statDisk(d.Path)
+			if storage.IsFSNoAnswer(err) {
+				r.noteRekeyOnce(vm.Name, "a disk's storage does not answer", "disk", d.DiskName, "path", d.Path, "error", err)
+				return
+			}
+			if err != nil {
+				r.noteRekeyOnce(vm.Name, "a shared disk is not visible on this host", "disk", d.DiskName, "path", d.Path)
+				return
+			}
 		}
 		bus := "virtio"
 		for _, sd := range spec.Disks {

@@ -125,7 +125,8 @@ lv audit ls --target /projects/acme --action vm.start
 
 `--target` matches the exact target path; `--action` matches an action,
 with a trailing `*` acting as a prefix glob; `--user` filters by
-username; `--since` takes an RFC3339 timestamp (entries at/after it).
+username; `--since` keeps entries at or after a time (see [Time
+bounds](#time-bounds)).
 
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
@@ -157,6 +158,188 @@ a repo to zstd. Each row names the repo, or `src -> dst` for a sync, and
   [backups.md](backups.md#repo-maintenance-rpcs). The local
   `lv backup repo …` commands write no row (see
   [below](#actions-taken-while-the-daemon-is-down)).
+- Who had a console on VM `web-1`? — `lv audit ls --target web-1 --action 'vm.console.*'`.
+  Every VNC, SPICE and serial console session is an open row and a close row,
+  and a refused open is a row (bounded per caller). See [Console sessions](#console-sessions).
+
+## Console sessions
+
+A console is interactive access to the guest, so every console session is
+audited, whichever way it was opened: the web UI's VNC and serial consoles,
+`lv vnc --listen`, `lv spice --launch` / `--listen` and `lv console`. All of
+them reach the daemon as `ProxyVNC`, `ProxySpice` or `ConsoleVM`, and those
+write the rows. A client that reaches the listener by other means — an SSH
+tunnel to the VM's host, `virsh console` on it — goes around litevirt and is
+not recorded here.
+
+| Action | Result | Written |
+|---|---|---|
+| `vm.console.open` | `ok` | when the session is accepted: on the VM's host once its VNC or SPICE socket or serial PTY is open; on a host relaying to the VM's host, only once the VM's host has accepted the stream |
+| `vm.console.close` | `ok`, `error` | when the session ends |
+| `vm.console.open` | `denied` | the caller lacks `vm.console` on the VM (or the operator role), here or on the VM's host |
+| `vm.console.open` | `error` | not accepted for any other reason: no such VM, not running, that console not enabled, the VM's host unreachable or refusing it, the client gone before it started (`reason="aborted by the client"`) |
+| `vm.console.credential` | `ok`, `denied`, `error` | `GetSpiceInfo` (plain `lv spice`, `--launch` and `--listen`, the UI's SPICE dialog and `.vv` download), which hands out the SPICE password |
+| `vm.console.suppressed` | `denied`, `error` | the end of a window in which refusal rows for one caller were held back (see [Bounds](#bounds-on-refusal-rows)) |
+
+A stream that is never accepted is one `vm.console.open` row with result
+`denied` or `error` and no close row, so `--action vm.console.open` with result
+`ok` counts only sessions that ran. On a relayed stream the host the caller
+entered on waits for the VM's host to accept: a current VM host says so before
+the first console byte, an older one with its first message. A VNC handshake
+that fails after the socket is open (the viewer gives up, the listener refuses
+the password) is a session that closes with result `error`.
+
+The target is the VM's name. The detail is `key=value` pairs, a value quoted
+when it holds a space:
+
+- `kind` — `vnc`, `spice` or `serial`.
+- `entry` — the host the caller connected to; `owner` — the VM's host (empty
+  when the VM was not found).
+- `session` — joins a session's open and close rows.
+- on a close: `duration` (open to end), `ended`, and for SPICE `channels`.
+  `ended` is `closed` (the client closed it), `daemon-stop` (a graceful stop
+  of the daemon ended it), or the error that ended it.
+- on a refusal: `reason`, the error the caller got.
+- on a credential row: `password=yes|no`, whether a password went out.
+
+No row carries a console password, a bearer token or a session id.
+
+A session cut because its user's session was revoked, or the user disabled or
+deleted, closes with result `ok` and `ended` naming the cut — when this host's
+own credential watch cut it. A close with result `error` is a fault: the VM's
+host dropped or ended the stream, the listener failed.
+
+**Who a row names.** Each host names only an identity it authenticated
+itself. A console for a VM on another host enters on one daemon and is carried
+to the VM's host over peer mTLS, so it is recorded twice, once on each host's
+signed sub-chain:
+
+- the host the caller entered on names the user, with `entry` itself and
+  `owner` the VM's host;
+- the VM's host names the relaying host, as user `peer:<host>`, with
+  `via_peer=<host>` and `entry_session=<the entry host's session id>`. It never
+  names a user it has only the peer's word for, and never the peer's `admin`
+  principal. Where forwarded identity is enforced, the VM's host verifies the
+  user's relayed bearer itself, and then names the user.
+
+`entry_session` is what the relaying host said, so join from the entry side:
+find the entry host's row with that `session=` on that host's own sub-chain.
+The two hosts wait out the SPICE linger independently, so one entry session
+can occasionally map to two sessions on the VM's host, never the reverse.
+`GetSpiceInfo` relayed to the VM's host is joined the same way: the entry
+host's credential row has `session=`, the VM's host's `entry_session=`.
+
+A console opened on the node by root over the local host certificate is
+recorded as `admin` with `principal=local-root`.
+
+**What is not a row.** A call refused before any handler runs — an invalid,
+expired or revoked bearer, a client certificate under strict mTLS identity, a
+quarantined node — has no authenticated caller and writes no console row; it
+is in the daemon log. On the VM's host that includes a relayed bearer it
+rejects: the entry host's row is then `vm.console.open denied`.
+
+**SPICE channels.** A SPICE client opens several channels — main, display,
+inputs, cursor and more — each its own `ProxySpice` stream. They are one
+session: the channels one credential has open on one VM are grouped, the open
+row is written when the first is accepted, and the close row once the last has
+ended and no new one followed within 2 seconds, so a reconnect is the same
+session. The close row's timestamp is therefore about 2 seconds after the end;
+`duration` is exact. Two viewers that one user opens on one VM at the same time
+through the same login are one session. VNC and serial streams are a session
+each.
+
+### Bounds on refusal rows
+
+Every refusal row is replicated and signed, so they are bounded per caller:
+
+- a value echoed from the request (the VM name, the reason) is cut to a fixed
+  size, ending `…(+N bytes)`;
+- in each minute, a caller gets at most 10 refusal rows, and one per distinct
+  (console, VM, result, reason) — a SPICE client's refused channels are one row;
+- what is held back is counted, and the minute ends with one
+  `vm.console.suppressed` row:
+  `suppressed=N denied=N error=N since=<time> window=1m0s kinds=<kinds> vms=<up to five>`
+  (a trailing `…` when there were more VMs). Its target is empty, because it
+  can cover several VMs, so look for it by user (`lv audit ls --user <user>
+  --action vm.console.suppressed`), not by target.
+
+The first refusal in every minute is always written. Sessions that ran are
+never held back. On the VM's host, every caller relayed by one entry host
+without forwarded identity is the one actor `peer:<entry host>`, so they
+share that budget there; the entry host still writes each user's own rows
+under its own budget, so nothing is lost cluster-wide.
+
+**Stopping the daemon.** A graceful stop writes the close row of every session
+still open, `ended=daemon-stop`, and of every SPICE session waiting out its
+linger, and of any session accepted while it runs, and waits for the close
+rows of the sessions the stop ended, before the database closes. Each session
+gets exactly one close row. The stop marks the console audit before it stops
+serving, so a session that ends in that window (up to 5 seconds while the
+daemon lets RPCs finish, and up to 5 more while it stops the server outright)
+without an error also reads `ended=daemon-stop`; one that ends with an error
+keeps it. This holds when the daemon gives up on stopping the server because
+a request is stuck on storage that does not answer: every console stream has
+been cancelled by then, and the close rows are written all the same. The
+flush is bounded at 3 seconds, plus at most one row already being written
+when that passes: past that, against a stalled database, rows still being
+written are logged as lost rather than holding up the rest of the shutdown.
+A crash leaves the open row without a close row.
+
+**Writes.** A row that cannot be written (the database failing, its 10-second
+bound) is logged and the session goes on: audit writes here degrade rather than
+refuse, as everywhere in the log. The open row is written before the console's
+first byte, so a slow database delays the start of a session.
+
+**Mixed versions.** No schema change and no new statement: the rows go
+through the same writer as every other audit row. A host on an older build
+writes no console rows. When it is the host the caller entered on, the VM's
+host on this release still records the session, under `peer:<that host>` and
+without `entry_session` — and, without forwarded identity, it cannot tell two
+users' SPICE channels relayed by that host apart, so concurrent ones are one
+session there until the entry host is upgraded. Through a VM host on an older
+build, which sends no accept header, the entry host records a relayed session
+from the VM host's first byte; a serial console that never wrote a byte is
+then recorded, when the client cancels, as `vm.console.open error
+reason="aborted by the client"`, and when it closes cleanly, as an open row
+stamped at its end with a duration near zero.
+
+### Time bounds
+
+`--since` on `lv audit ls` and `lv events <vm>`, and `--since` / `--until` on
+`lv audit export`, are read as times and compared as instants. Each takes:
+
+- an RFC3339 timestamp, with or without a fraction (`.` or `,`), in UTC or with
+  an offset: `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`,
+  `2026-10-03T22:16:30.5Z`;
+- the same without a zone, or with a space for the `T`, read as UTC;
+- a minute, hour, date, month or year: `2026-10-03T22:16`, `2026-10-03T22`,
+  `2026-10-03`, `2026-10`, `2026`;
+- a Unix time in seconds, any bare integer other than a four-digit year:
+  `1791065790`. `--since 0` is the beginning, so it still returns every row;
+- a duration, meaning that long ago: `90m`, `24h`. A duration needs a unit.
+
+A bound covers the whole unit it names: `--since` starts at the beginning of it
+and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
+and `--since 2026-10-03T22:16:30Z` includes a row stamped
+`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row. A bound that lands past
+9999-12-31T23:59:59.999999999Z once converted to UTC (a year-9999 bound with a
+negative offset) is clamped to it: as `--until` it still matches every row, as
+`--since` it matches nothing after that instant.
+Anything else is refused with `InvalidArgument` and a message naming the bound.
+
+The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp
+(`2026-10-03T22:16:30.000000000Z`), so a daemon not yet upgraded, which still
+compares the bound as text, draws the window in the right place too, and a
+relative bound is fixed once for every page of an export. `lv mcp` does the
+same for the `since` / `until` arguments of its tools. A client calling the
+API directly with any other form gets the right answer only from an upgraded
+daemon.
+
+Before this, the bound was compared to the stored stamp as text. The stamps are
+fixed-width UTC with nine fractional digits, and `.` sorts below `Z`, so
+`--since` with a whole second dropped every row inside that second. An offset
+bound was wrong by the offset, and `--since 24h` sorted below every stamp and
+matched every row.
 
 ## Verifying
 
@@ -178,8 +361,29 @@ It does **not** stop at the first problem. One broken id says nothing about
 whether the rest of the log was rewritten too, so every finding is printed,
 grouped by what it means:
 
-- **hash mismatch** — a row was edited, or a row before it was deleted, or a
-  migration replayed the table without rebuilding hashes (operator error).
+- **hash mismatch** — a row was edited, or a migration replayed the table
+  without rebuilding hashes (operator error). The row does not hash to its
+  stored `content_hash` even against its own stored `prev_hash`.
+- **forked chain** — the row has the whole shape of a second genesis: it
+  hashes correctly against its own stored `prev_hash`, that `prev_hash` is
+  empty, and it is a second `seq 1` for a host that already has one. Expect the
+  duplicate seqs under **sequence break**. This is the shape a host rebuilt
+  under its old name writes if it appends before its history has replicated
+  back (see "Rebuilding a host under its old name" below). The hash shows no
+  edit to the row, but it is still a finding, and `verify` still exits
+  non-zero. On an **unsigned** row this is also exactly what a rewrite looks
+  like that blanked `prev_hash`, recomputed the hash and renumbered the row to
+  seq 1: seq is covered only by the signature, so nothing can tell the two
+  apart. A signed row rewritten that way also shows a **bad signature**.
+- **broken link** — the row hashes correctly against its own stored
+  `prev_hash`, but that is not the hash of the row before it, and the row is not
+  a second genesis. A row between them was deleted or rewritten, the chain
+  branched, or this row was rewritten together with its `prev_hash` and hash
+  (possible undetected only on an unsigned row; a signed one also shows a bad
+  signature).
+
+  Only the first broken link is named, under whichever of these three headings
+  fits it. A daemon too old to classify the break is shown as a hash mismatch.
 - **bad signature** — the row was edited by someone without the authoring
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
@@ -671,7 +875,7 @@ no record and nothing is held — the behaviour before this change.
 host chains each row onto the tail of its own sub-chain as its local replica
 holds it, and a rebuilt host's replica holds none of its history until
 anti-entropy delivers it. Appending before then starts a second chain under a
-name that already has one: `seq 1`, an empty `prev_hash`, and a hash mismatch
+name that already has one: `seq 1`, an empty `prev_hash`, and a forked chain
 plus duplicated seqs on every node, permanently, since signed rows are never
 resealed. So when the admission record names history this replica does not
 hold, every row the host audits is **held**: written to `<data_dir>/audit-hold/`,
@@ -719,7 +923,8 @@ systemctl restart litevirt
 
 With no record the daemon holds nothing, and the held rows land on whatever
 tail its replica has. If that is not the host's real tail, they **fork the
-chain**: `verify` reports a hash mismatch and duplicated seqs for this host on
+chain**: `verify` reports a forked chain (or a broken link, if the replica held
+part of the history) and duplicated seqs for this host on
 every node, permanently (see "A chain that already forked stays flagged"
 below). Nothing is lost — the held rows are written — but the finding cannot be
 cleared. While held the host is still reachable for this: reads, `lv audit
@@ -753,7 +958,7 @@ before it first signed, and `verify` reports each as `unsigned after signed`.
 
 **A chain that already forked stays flagged.** A host rebuilt under its old name
 by a build without the hold may already have written a second chain. Those rows
-are signed and append-only: `verify` keeps reporting the hash mismatch, the
+are signed and append-only: `verify` keeps reporting the forked chain, the
 duplicated sequence numbers and any `unsigned after signed` rows, on every node,
 and the hourly check keeps logging them. Nothing repairs them in place and
 nothing backfills them, deliberately — a log that could be rewritten to clear a
@@ -775,7 +980,8 @@ lv audit export --since 2026-06-01T00:00:00Z --until 2026-06-30T23:59:59Z --out 
 `export` emits a JSON document suitable for write-once-read-many
 offload (S3 Object Lock, immutable filesystem snapshot, tape archive).
 `--out <file>` writes the JSON to a file (default stdout); `--since` /
-`--until` bound the export window (both RFC3339, inclusive).
+`--until` bound the export window (both inclusive; every form in [Time
+bounds](#time-bounds) works).
 The export includes every `audit_log` chain field — `seq`, `key_id` and
 `signature` among them — ordered the same way `verify` walks, so an external
 system can recompute each host's hash chain in the right order without

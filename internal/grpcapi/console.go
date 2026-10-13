@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -19,26 +20,30 @@ import (
 // The VM name is passed via incoming metadata key "x-vm-name".
 // It opens the PTY device that libvirt/QEMU allocates for the serial console
 // and bridges it to the gRPC bidirectional stream for web UI terminal access.
-func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.ConsoleOutput]) error {
-	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
-		return err
-	}
+func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.ConsoleOutput]) (err error) {
 	md, _ := metadataFromStream(stream)
 	vmName := ""
 	if vals := md.Get("x-vm-name"); len(vals) > 0 {
 		vmName = vals[0]
 	}
+	ctx := stream.Context()
+	// Every open, refused or not, is audited (console_audit.go).
+	ca := s.beginConsoleAudit(ctx, consoleKindSerial, vmName)
+	defer func() { ca.end(err) }()
+
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return err
+	}
 	if vmName == "" {
 		return status.Error(codes.InvalidArgument, "x-vm-name metadata required")
 	}
-
-	ctx := stream.Context()
 
 	// Verify VM exists, is on this host, and is running.
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
 	}
+	ca.setOwner(vm.HostName)
 	// Path-scoped check on the VM's tenancy project (serial console = root
 	// access to the guest). Enforced on the entry host where the caller's
 	// identity is present, before any forward to the owning host.
@@ -54,7 +59,7 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 
 	// Remote VM: forward to the host that owns it.
 	if vm.HostName != s.hostName {
-		return s.forwardConsole(stream, vmName, vm.HostName)
+		return s.forwardConsole(stream, vmName, vm.HostName, ca)
 	}
 
 	// Get the PTY path from the live domain XML. Libvirt populates
@@ -76,6 +81,7 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 	registerStreamCloser(ctx, func() { _ = ptmx.Close() })
 
 	slog.Info("console session started", "vm", vmName)
+	ca.accept(stream)
 
 	errCh := make(chan error, 2)
 
@@ -141,19 +147,29 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 }
 
 // forwardConsole relays a ConsoleVM stream to the remote host that owns the VM.
-func (s *Server) forwardConsole(incoming grpc.BidiStreamingServer[pb.ConsoleInput, pb.ConsoleOutput], vmName, hostName string) error {
+func (s *Server) forwardConsole(incoming grpc.BidiStreamingServer[pb.ConsoleInput, pb.ConsoleOutput], vmName, hostName string, ca *consoleAudit) error {
 	ctx := incoming.Context()
 	client, conn, err := s.peerClient(ctx, hostName)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 	}
 	defer conn.Close()
+	session := ca.attach()
 
-	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName))
+	// The remote leg ends with this handler, so its header wait (below)
+	// cannot outlive it.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outCtx := metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
 	remote, err := client.ConsoleVM(outCtx)
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
+	sendDone := make(chan struct{})
+	defer func() {
+		cancel()
+		waitRelaySender(sendDone)
+	}()
 
 	errCh := make(chan error, 2)
 
@@ -177,8 +193,11 @@ func (s *Server) forwardConsole(incoming grpc.BidiStreamingServer[pb.ConsoleInpu
 		}
 	}()
 
-	// remote → incoming
+	// remote → incoming. The session is open here only once the VM's host
+	// has accepted it (its header).
 	go func() {
+		defer close(sendDone)
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

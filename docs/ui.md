@@ -273,6 +273,11 @@ From a stopped VM's detail page: **Clone** (linked on shared storage, full
 copy otherwise) and **Convert to template** (an immutable, unstartable clone
 source; **Revert to VM** undoes it). Templates clone with a fresh identity.
 
+Every VNC and text console the UI opens is recorded in the audit log under
+the signed-in user, refused attempts included, and so is every SPICE dialog or
+`.vv` download, since it hands out the SPICE password
+([audit-log.md](audit-log.md#console-sessions)).
+
 ## Text Console
 
 An in-browser terminal is available using xterm.js (vendored as a static asset under `internal/ui/static/`, served by the daemon — no external CDN). It opens as a modal overlay on the VM detail page and is available for any running VM.

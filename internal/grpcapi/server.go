@@ -2329,12 +2329,12 @@ func (s *Server) SetRealmRegistry(r *auth.Registry) {
 // UI to populate the login realm dropdown via availableRealms().
 func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
 
-// SetFirewallReconciler wires the daemon's firewall reconciler so the
-// ReloadFirewall RPC can drive a synchronous Reconcile.
 // SetStartTransferProbe wires how a cancel of a start tells a proof-less
 // transfer parked in "starting" (health.Reconciler.IsDeferredTransfer).
 func (s *Server) SetStartTransferProbe(fn func(vmName string) bool) { s.startTransferProbe = fn }
 
+// SetFirewallReconciler wires the daemon's firewall reconciler so the
+// ReloadFirewall RPC can drive a synchronous Reconcile.
 func (s *Server) SetFirewallReconciler(r FirewallReconciler) {
 	s.fwMu.Lock()
 	defer s.fwMu.Unlock()

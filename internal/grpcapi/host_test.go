@@ -429,8 +429,12 @@ func TestListHosts_ReturnsLabels(t *testing.T) {
 
 	insertTestHost(t, ctx, s.db, "node-1", "active")
 	insertTestHost(t, ctx, s.db, "node-2", "active")
+	// An operator sets a label first; the reported counts land afterwards and
+	// must not replace it.
+	if err := corrosion.SetHostLabels(ctx, s.db, "node-2", map[string]string{"rack": "r12"}, nil); err != nil {
+		t.Fatalf("SetHostLabels (operator): %v", err)
+	}
 	want := hostupdates.Status{Supported: true, Manager: "apt", Pending: 25, Security: 4}.Labels()
-	want["rack"] = "r12" // an operator-set label rides along with the reported ones
 	if err := corrosion.SetHostLabels(ctx, s.db, "node-2", want, nil); err != nil {
 		t.Fatalf("SetHostLabels: %v", err)
 	}

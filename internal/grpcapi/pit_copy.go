@@ -545,11 +545,22 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 	}
 	overlay := pitOverlayPath(d.Path)
 	owner := pitOwner(vm, d)
+	// The overlay's own look (attributes the client may still cache) does
+	// not prove its server answers: the binding, the window token and the
+	// header are read first under the bound, and a no-answer refuses as
+	// the looks above do, before anything below reads or commits them.
+	if _, err := pitoverlay.AssessBounded(disk, owner, false); err != nil {
+		return pitNoAnswer(vm, d, err)
+	}
 	if open, _ := s.PITOverlayFeature(); !open {
 		// Below the pit_overlay feature this host settles no overlay — not
 		// even live: one present was made by a host above it. Held, with
 		// the full verdict for the admin.
-		return s.holdPITOverlay(ctx, vm, d, pitoverlay.AssessAt(s.PITOverlayFeature, disk, owner, false))
+		a, err := pitoverlay.AssessAtBounded(s.PITOverlayFeature, disk, owner, false)
+		if err != nil {
+			return pitNoAnswer(vm, d, err)
+		}
+		return s.holdPITOverlay(ctx, vm, d, a)
 	}
 	committed := fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path)
 	switch s.domainActivity(vm) {
@@ -570,7 +581,10 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			break
 		}
 		// The domain runs on its disk.
-		a := pitoverlay.Assess(disk, owner, true)
+		a, err := pitoverlay.AssessBounded(disk, owner, true)
+		if err != nil {
+			return pitNoAnswer(vm, d, err)
+		}
 		if a.Verdict == pitoverlay.Pivoted {
 			// A pivot landed and the daemon died before the overlay went: it
 			// is merged. Point a definition that still names it back at the
@@ -604,15 +618,19 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 				a = pitoverlay.Assessment{Verdict: pitoverlay.Unknown, Binding: a.Binding, CommitBegan: a.CommitBegan,
 					Current: a.Current, Backing: a.Backing, DiskMtimeNs: a.DiskMtimeNs, OverlayMtimeNs: a.OverlayMtimeNs, OverlayCurrent: a.OverlayCurrent,
 					Reason: fmt.Sprintf("%s (and that could not be recorded: %v)", why, err)}
-			} else {
-				a = pitoverlay.Assess(disk, owner, true)
+			} else if a, err = pitoverlay.AssessBounded(disk, owner, true); err != nil {
+				return pitNoAnswer(vm, d, err)
 			}
 		}
 		return s.holdPITOverlay(ctx, vm, d, a)
 	default:
 		_, err := pitoverlay.CommitOffline(ctx, disk, owner)
 		if errors.Is(err, pitoverlay.ErrNotOurs) {
-			return s.holdPITOverlay(ctx, vm, d, pitoverlay.Assess(disk, owner, false))
+			a, aerr := pitoverlay.AssessBounded(disk, owner, false)
+			if aerr != nil {
+				return pitNoAnswer(vm, d, aerr)
+			}
+			return s.holdPITOverlay(ctx, vm, d, a)
 		}
 		if err != nil {
 			s.reportStrandedOverlay(ctx, vm, d, overlay, err)

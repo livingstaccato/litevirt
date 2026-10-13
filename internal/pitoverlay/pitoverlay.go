@@ -680,6 +680,40 @@ func AssessAt(g Gate, disk string, owner Owner, liveOnDisk bool) Assessment {
 	return a
 }
 
+// AssessBounded is Assess under storage.Bounded: a disk on a network
+// filesystem whose server does not answer gets the *storage.FSNoAnswerError
+// (storage.IsFSNoAnswer), never a verdict. Assess stats the overlay and the
+// disk, reads the binding and the disk's window token, and opens the
+// overlay's header, any of which only the server may answer.
+func AssessBounded(disk string, owner Owner, liveOnDisk bool) (Assessment, error) {
+	assess := assessFn // read here: the call below may outlive its caller
+	return storage.Bounded("assess the point-in-time overlay of", disk, func() (Assessment, error) {
+		return assess(disk, owner, liveOnDisk), nil
+	})
+}
+
+// AssessAtBounded is AssessAt under storage.Bounded (AssessBounded).
+func AssessAtBounded(g Gate, disk string, owner Owner, liveOnDisk bool) (Assessment, error) {
+	a, err := AssessBounded(disk, owner, liveOnDisk)
+	if err != nil {
+		return a, err
+	}
+	if open, why := g.Open(); !open {
+		a.BelowFeature, a.BelowWhy = true, why
+	}
+	return a, nil
+}
+
+// assessFn is Assess; a test makes it block.
+var assessFn = Assess
+
+// SetAssessForTest makes AssessBounded assess with f, and returns the restore.
+func SetAssessForTest(f func(disk string, owner Owner, liveOnDisk bool) Assessment) (restore func()) {
+	prev := assessFn
+	assessFn = f
+	return func() { assessFn = prev }
+}
+
 // Assess judges disk's overlay against owner and the disk file as it is now,
 // whatever this host's pit_overlay gate says (AssessAt marks that): an admin
 // deciding a hold needs the verdict on every host. liveOnDisk says the caller

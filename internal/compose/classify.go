@@ -123,6 +123,10 @@ type ChangePlan struct {
 	// rolling-update strategy) — recorded, not silently ignored, and never a VM
 	// lifecycle action here.
 	Delegated []string
+	// NICSecurity are the NIC security-group bindings and guards the plan
+	// restores from what is enforced now (each also a MetadataChanges entry),
+	// with what each may weaken (nic_security.go).
+	NICSecurity []NICSecurityChange
 }
 
 // NICRetarget is one NIC moving from its stack-scoped network to the cluster
@@ -316,6 +320,10 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 		metaIf(desired.Network[i].GetRateMbSec() != stored.Network[i].GetRateMbSec(), NICRateFieldPrefix+fmt.Sprintf("%d", i),
 			fmt.Sprintf("%g", stored.Network[i].GetRateMbSec()), fmt.Sprintf("%g", desired.Network[i].GetRateMbSec()))
 	}
+
+	// A NIC's security-group binding and guard, as the file declares them,
+	// against the ones enforced now (nic_security.go).
+	classifyNICSecurity(desired, stored, &p)
 
 	// --- Delegated: owned by another path, recorded not ignored ---
 	if desired.Loadbalancer != nil && !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {

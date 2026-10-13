@@ -82,7 +82,7 @@ func (r *Reconciler) setAsideSupersededDisk(ctx context.Context, vmName, proofID
 	if !isHostLocalDisk(d) || d.Path == "" {
 		return "", nil
 	}
-	if _, err := os.Lstat(d.Path); err != nil {
+	if _, err := r.lstatDisk(d.Path); err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}

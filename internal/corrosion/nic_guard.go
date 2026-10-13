@@ -42,8 +42,8 @@ const (
 	NICGuardOff = "off"
 
 	// MaxNICGuardAddresses bounds the allowed list of one NIC, so one record
-	// cannot bloat every host's ruleset.
-	MaxNICGuardAddresses = 64
+	// cannot bloat every host's ruleset (compose.MaxGuardAddresses).
+	MaxNICGuardAddresses = compose.MaxGuardAddresses
 )
 
 // ErrUnknownNICGuardMode is a mode this build does not implement.
@@ -139,33 +139,10 @@ func ParseContainerGuardOwner(owner string) (host, ct string, ok bool) {
 // canonical form (masked prefixes, canonical addresses, sorted, deduplicated).
 // An entry that is not an IP address or prefix, carries a zone, or exceeds
 // MaxNICGuardAddresses is refused: it would otherwise reach every host's
-// renderer, which refuses the whole ruleset on one.
+// renderer, which refuses the whole ruleset on one. It is
+// compose.NormalizeGuardAddresses, the one validator the plan shares.
 func NormalizeNICGuardAddresses(in []string) ([]string, error) {
-	seen := map[string]bool{}
-	var out []string
-	for _, raw := range in {
-		s := strings.TrimSpace(raw)
-		if s == "" {
-			continue
-		}
-		var canon string
-		if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
-			canon = p.Masked().String()
-		} else if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
-			canon = a.String()
-		} else {
-			return nil, fmt.Errorf("%q is not an IP address or prefix", raw)
-		}
-		if !seen[canon] {
-			seen[canon] = true
-			out = append(out, canon)
-		}
-	}
-	if len(out) > MaxNICGuardAddresses {
-		return nil, fmt.Errorf("%d addresses; at most %d per NIC", len(out), MaxNICGuardAddresses)
-	}
-	sort.Strings(out)
-	return out, nil
+	return compose.NormalizeGuardAddresses(in)
 }
 
 // normalizeNICGuard checks and canonicalises a record before it is written.
@@ -714,4 +691,32 @@ func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) 
 		return ErrClusterPolicyGateClosed
 	}
 	return c.Execute(ctx, clusterPolicyUpsertSQL, key, value, setBy, c.NowTS())
+}
+
+// LiveNICSecurity is each NIC of vmName, in ordinal order, with the
+// security-group binding its row holds and the guard record the firewall
+// enforces for it: only a record of the incarnation vmUUID names (an earlier
+// VM of the same name and MAC left one that guards nothing), and none for a
+// NIC that has no record (unguarded). A compose deploy compares the file with
+// this, not with the create-time values in the stored spec.
+func LiveNICSecurity(ctx context.Context, c *Client, vmName, vmUUID string) ([]compose.LiveNIC, error) {
+	nics, err := MergedVMNICs(ctx, c, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]compose.LiveNIC, 0, len(nics))
+	for _, n := range nics {
+		ln := compose.LiveNIC{Network: n.NetworkName, MAC: n.MAC, Ordinal: n.Ordinal,
+			SecurityGroups: decodeSGs(n.SecurityGroups)}
+		rec, err := GetNICGuard(ctx, c, vmName, n.MAC)
+		if err != nil {
+			return nil, fmt.Errorf("read the guard of NIC %s: %w", n.MAC, err)
+		}
+		if rec != nil && (rec.VMUUID == "" || vmUUID == "" || rec.VMUUID == vmUUID) {
+			ln.Guard = &compose.LiveGuard{Mode: rec.Mode, Allowed: rec.Allowed,
+				AllowDHCPServer: rec.AllowDHCPServer, AllowRouterAdvert: rec.AllowRouterAdvert, AllowVLANTags: rec.AllowVLANTags}
+		}
+		out = append(out, ln)
+	}
+	return out, nil
 }

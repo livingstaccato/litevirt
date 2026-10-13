@@ -477,8 +477,39 @@ with `lv firewall nic-guard set`. A clone's NICs are new NICs: each gets the
 default guard, not its source's relaxations or its source's lack of a record.
 So do the NICs of a renamed promotion (`lv replication promote --new-name`) and of a live
 restore under a new name: a second VM beside the original, with fresh MACs. A
-promotion or restore under the VM's own name is unchanged. A macvtap (`direct`) NIC bypasses
-the bridge and gets no guard; setting one is refused.
+promotion or restore under the VM's own name is unchanged.
+
+**A direct or SR-IOV NIC has no guard.** A macvtap (`direct`) or SR-IOV NIC
+bypasses the bridge where guards are enforced, so it never gets a guard record:
+not at create, `lv attach-nic`, a clone, an import, or a renamed promotion or
+restore. Guard settings asked for on such a NIC are refused rather than
+accepted for a NIC that would silently have none: `lv run`, `lv attach-nic`
+and `lv firewall nic-guard set` all refuse them. A compose file that declares
+one is reported, not refused: every plan names the guard as not enforced, and
+the create leaves it out (see [compose.md](compose.md#security-groups-and-guards-a-file-does-not-declare)).
+A VM created by an earlier build may carry such settings in its stored spec;
+they were never enforced. A rebuild or a stack's re-create replays that spec,
+so it leaves them out instead of refusing. So does the host that runs a
+create another host forwarded to it: during a rolling upgrade, an entry host
+on an earlier build accepted them, as that build did. Once such a create has
+succeeded, each setting left out is logged as a warning and recorded as a
+`vm.nic_guard.not_enforced` warning event on the VM; a create refused for
+another reason records none. A spec kept after a re-create failed past its
+teardown (see [storage.md](storage.md)) is kept without them, so `lv run`
+accepts it. The refusal is for new input only, `lv` run as root on the host
+itself included.
+
+A rebuild or a stack's re-create also makes, before it tears the VM down,
+every admission its create will make that the teardown does not change, the
+guard admission among them, judged as its create will judge it. That holds
+for a stack's default `recreate` strategy as much as for a rolling one. Such
+a refusal says "nothing was deleted" (or "nothing was changed") and leaves
+the VM as it was. The default compose re-create creates the VM as a new one,
+not as the re-create of the old one, unless the VM has a disk on an iSCSI
+LUN. So a relaxed guard its file declares needs `network.update` on the NIC's
+network there, even when the VM already has it. What the teardown itself
+frees (the name, project quota and host capacity) is still judged by the
+create, after the teardown.
 
 **A re-create keeps each NIC's guard.** A rebuild or a stack's rolling update
 re-creates a VM under a new incarnation. Each of its NICs that is the same NIC
@@ -609,6 +640,14 @@ lv import vm.ova --name legacy --spoof-guard off
 
 `--allow` replaces the whole list. `lv firewall nic-guard ls` shows `any` for a
 family that is unrestricted and `unset` for a NIC with no guard.
+
+A guard set at runtime on a stack VM's NIC is drift for `lv compose diff` and
+`lv compose up` only when the file names a guard setting for that NIC. `up`
+sets the file's guard again when that only tightens the guard enforced now.
+When it would loosen it, `up` does so only with `--allow-weaken`; without it,
+the restore is withheld and the plan says so. A NIC whose file names no guard
+setting keeps the runtime guard (docs/compose.md, "Security groups and guards
+a file does not declare").
 
 In compose, per NIC:
 
@@ -856,6 +895,12 @@ missing. Recommended order:
   rewrites the NIC's `vm_nics` row (and its `vm_interfaces` row, for peers on
   an older build), so the next reconcile applies it. A bind naming a network
   the VM has no NIC on is refused rather than answered OK.
+  A runtime bind of a stack VM's NIC is drift for `lv compose diff` and
+  `lv compose up` only when the file declares that NIC's `security-groups:`.
+  `up` rebinds the file's list only with `--allow-weaken`; without it, the
+  rebind is withheld and the plan says so. A NIC whose file names no groups
+  keeps the runtime binding, through a recreate too (docs/compose.md,
+  "Security groups and guards a file does not declare").
 - **The chain follows the tap libvirt gives the NIC now.** libvirt hands out
   a new `vnetN` on every start, so the tap recorded at create is stale after
   a stop and start, a migration or a failover. Every tick the reconciler asks

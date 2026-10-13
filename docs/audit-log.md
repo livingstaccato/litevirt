@@ -125,7 +125,8 @@ lv audit ls --target /projects/acme --action vm.start
 
 `--target` matches the exact target path; `--action` matches an action,
 with a trailing `*` acting as a prefix glob; `--user` filters by
-username; `--since` takes an RFC3339 timestamp (entries at/after it).
+username; `--since` keeps entries at or after a time (see [Time
+bounds](#time-bounds)).
 
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
@@ -309,6 +310,44 @@ then recorded, when the client cancels, as `vm.console.open error
 reason="aborted by the client"`, and when it closes cleanly, as an open row
 stamped at its end with a duration near zero.
 
+### Time bounds
+
+`--since` on `lv audit ls` and `lv events <vm>`, and `--since` / `--until` on
+`lv audit export`, are read as times and compared as instants. Each takes:
+
+- an RFC3339 timestamp, with or without a fraction (`.` or `,`), in UTC or with
+  an offset: `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`,
+  `2026-10-03T22:16:30.5Z`;
+- the same without a zone, or with a space for the `T`, read as UTC;
+- a minute, hour, date, month or year: `2026-10-03T22:16`, `2026-10-03T22`,
+  `2026-10-03`, `2026-10`, `2026`;
+- a Unix time in seconds, any bare integer other than a four-digit year:
+  `1791065790`. `--since 0` is the beginning, so it still returns every row;
+- a duration, meaning that long ago: `90m`, `24h`. A duration needs a unit.
+
+A bound covers the whole unit it names: `--since` starts at the beginning of it
+and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
+and `--since 2026-10-03T22:16:30Z` includes a row stamped
+`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row. A bound that lands past
+9999-12-31T23:59:59.999999999Z once converted to UTC (a year-9999 bound with a
+negative offset) is clamped to it: as `--until` it still matches every row, as
+`--since` it matches nothing after that instant.
+Anything else is refused with `InvalidArgument` and a message naming the bound.
+
+The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp
+(`2026-10-03T22:16:30.000000000Z`), so a daemon not yet upgraded, which still
+compares the bound as text, draws the window in the right place too, and a
+relative bound is fixed once for every page of an export. `lv mcp` does the
+same for the `since` / `until` arguments of its tools. A client calling the
+API directly with any other form gets the right answer only from an upgraded
+daemon.
+
+Before this, the bound was compared to the stored stamp as text. The stamps are
+fixed-width UTC with nine fractional digits, and `.` sorts below `Z`, so
+`--since` with a whole second dropped every row inside that second. An offset
+bound was wrong by the offset, and `--since 24h` sorted below every stamp and
+matched every row.
+
 ## Verifying
 
 ```bash
@@ -329,8 +368,29 @@ It does **not** stop at the first problem. One broken id says nothing about
 whether the rest of the log was rewritten too, so every finding is printed,
 grouped by what it means:
 
-- **hash mismatch** — a row was edited, or a row before it was deleted, or a
-  migration replayed the table without rebuilding hashes (operator error).
+- **hash mismatch** — a row was edited, or a migration replayed the table
+  without rebuilding hashes (operator error). The row does not hash to its
+  stored `content_hash` even against its own stored `prev_hash`.
+- **forked chain** — the row has the whole shape of a second genesis: it
+  hashes correctly against its own stored `prev_hash`, that `prev_hash` is
+  empty, and it is a second `seq 1` for a host that already has one. Expect the
+  duplicate seqs under **sequence break**. This is the shape a host rebuilt
+  under its old name writes if it appends before its history has replicated
+  back (see "Rebuilding a host under its old name" below). The hash shows no
+  edit to the row, but it is still a finding, and `verify` still exits
+  non-zero. On an **unsigned** row this is also exactly what a rewrite looks
+  like that blanked `prev_hash`, recomputed the hash and renumbered the row to
+  seq 1: seq is covered only by the signature, so nothing can tell the two
+  apart. A signed row rewritten that way also shows a **bad signature**.
+- **broken link** — the row hashes correctly against its own stored
+  `prev_hash`, but that is not the hash of the row before it, and the row is not
+  a second genesis. A row between them was deleted or rewritten, the chain
+  branched, or this row was rewritten together with its `prev_hash` and hash
+  (possible undetected only on an unsigned row; a signed one also shows a bad
+  signature).
+
+  Only the first broken link is named, under whichever of these three headings
+  fits it. A daemon too old to classify the break is shown as a hash mismatch.
 - **bad signature** — the row was edited by someone without the authoring
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
@@ -822,7 +882,7 @@ no record and nothing is held — the behaviour before this change.
 host chains each row onto the tail of its own sub-chain as its local replica
 holds it, and a rebuilt host's replica holds none of its history until
 anti-entropy delivers it. Appending before then starts a second chain under a
-name that already has one: `seq 1`, an empty `prev_hash`, and a hash mismatch
+name that already has one: `seq 1`, an empty `prev_hash`, and a forked chain
 plus duplicated seqs on every node, permanently, since signed rows are never
 resealed. So when the admission record names history this replica does not
 hold, every row the host audits is **held**: written to `<data_dir>/audit-hold/`,
@@ -870,7 +930,8 @@ systemctl restart litevirt
 
 With no record the daemon holds nothing, and the held rows land on whatever
 tail its replica has. If that is not the host's real tail, they **fork the
-chain**: `verify` reports a hash mismatch and duplicated seqs for this host on
+chain**: `verify` reports a forked chain (or a broken link, if the replica held
+part of the history) and duplicated seqs for this host on
 every node, permanently (see "A chain that already forked stays flagged"
 below). Nothing is lost — the held rows are written — but the finding cannot be
 cleared. While held the host is still reachable for this: reads, `lv audit
@@ -904,7 +965,7 @@ before it first signed, and `verify` reports each as `unsigned after signed`.
 
 **A chain that already forked stays flagged.** A host rebuilt under its old name
 by a build without the hold may already have written a second chain. Those rows
-are signed and append-only: `verify` keeps reporting the hash mismatch, the
+are signed and append-only: `verify` keeps reporting the forked chain, the
 duplicated sequence numbers and any `unsigned after signed` rows, on every node,
 and the hourly check keeps logging them. Nothing repairs them in place and
 nothing backfills them, deliberately — a log that could be rewritten to clear a
@@ -926,7 +987,8 @@ lv audit export --since 2026-06-01T00:00:00Z --until 2026-06-30T23:59:59Z --out 
 `export` emits a JSON document suitable for write-once-read-many
 offload (S3 Object Lock, immutable filesystem snapshot, tape archive).
 `--out <file>` writes the JSON to a file (default stdout); `--since` /
-`--until` bound the export window (both RFC3339, inclusive).
+`--until` bound the export window (both inclusive; every form in [Time
+bounds](#time-bounds) works).
 The export includes every `audit_log` chain field — `seq`, `key_id` and
 `signature` among them — ordered the same way `verify` walks, so an external
 system can recompute each host's hash chain in the right order without

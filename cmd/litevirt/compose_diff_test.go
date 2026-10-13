@@ -15,178 +15,87 @@ import (
 	"github.com/litevirt/litevirt/internal/cli"
 )
 
-// projectionClient answers ListVMs the way the daemon does — with a PROJECTION
-// of each spec that carries no image and no cloud-init — and InspectVM with the
-// full spec. `lv compose diff` used to build its current state off the
-// projection alone, so every VM in a cloud-init stack read as "image →X
-// cloud-init added" even when nothing had changed.
-type projectionClient struct {
+// diffStackClient answers DiffStack with a fixed server plan, and records the
+// request it was asked.
+type diffStackClient struct {
 	pb.LiteVirtClient
-	full []*pb.VM
+	resp *pb.DiffStackResponse
+	err  error
+	got  *pb.DiffStackRequest
 }
 
-func (p *projectionClient) ListVMs(_ context.Context, in *pb.ListVMsRequest, _ ...grpc.CallOption) (*pb.ListVMsResponse, error) {
-	var out []*pb.VM
-	for _, vm := range p.full {
-		if vm.StackName != in.StackName {
-			continue
-		}
-		out = append(out, &pb.VM{
-			Name: vm.Name, StackName: vm.StackName, HostName: vm.HostName, State: vm.State,
-			CpuActual: vm.CpuActual, MemActualMib: vm.MemActualMib,
-			Spec: &pb.VMSpec{Uuid: vm.Spec.Uuid, Machine: vm.Spec.Machine},
-		})
-	}
-	return &pb.ListVMsResponse{Vms: out}, nil
+func (d *diffStackClient) DiffStack(_ context.Context, in *pb.DiffStackRequest, _ ...grpc.CallOption) (*pb.DiffStackResponse, error) {
+	d.got = in
+	return d.resp, d.err
 }
 
-func (p *projectionClient) InspectVM(_ context.Context, in *pb.InspectVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
-	for _, vm := range p.full {
-		if vm.Name == in.Name {
-			return vm, nil
-		}
-	}
-	return nil, status.Errorf(codes.NotFound, "VM %q not found", in.Name)
-}
-
-func TestComposeDiff_UnchangedCloudInitStackIsNoChange(t *testing.T) {
-	userdata := "#cloud-config\nusers:\n  - name: ubuntu\n"
-	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n    cpu: 4\n    memory: 8192\n" +
-		"    cloud-init:\n      userdata: |\n        #cloud-config\n        users:\n          - name: ubuntu\n"
-	file := filepath.Join(t.TempDir(), "litevirt.yaml")
-	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	origConnect := cli.Connect
-	t.Cleanup(func() { cli.Connect = origConnect })
-	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
-		return &projectionClient{full: []*pb.VM{{
-			Name: "box-1", StackName: "devs", HostName: "h1", State: pb.VMState_VM_RUNNING,
-			CpuActual: 4, MemActualMib: 8192,
-			Spec: &pb.VMSpec{
-				Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1", Machine: "q35",
-				GuestAgent: true, Boot: "disk", CpuMode: "host-model",
-				CloudInit: &pb.CloudInitSpec{Userdata: userdata},
-			},
-		}}}, func() {}, nil
-	}
-
-	out := captureStdout(t, func() {
-		cmd := newDiffCmd()
-		cmd.SetArgs([]string{"-f", file})
-		if err := cmd.Execute(); err != nil {
-			t.Errorf("diff: %v", err)
-		}
-	})
-	if !strings.Contains(out, "0 to update") || !strings.Contains(out, "1 unchanged") {
-		t.Errorf("diff of an unchanged cloud-init stack should be a no-op, got:\n%s", out)
-	}
-	if strings.Contains(out, "cloud-init added") || strings.Contains(out, "image →") {
-		t.Errorf("diff reports phantom changes from the ListVMs projection:\n%s", out)
-	}
-}
-
-// The daemon plans a retry (an update, delete + recreate by default) for a VM
-// in error state. The CLI diff fed the planner the proto enum name
-// ("VM_ERROR") where it expects the stored state ("error"), so the same VM
-// read as unchanged — hiding a destructive step the server would take.
-func TestComposeDiff_ErrorStateVMIsRetried(t *testing.T) {
-	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n    cpu: 4\n    memory: 8192\n"
+func runDiff(t *testing.T, c *diffStackClient, args ...string) (string, error) {
+	t.Helper()
+	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n"
 	file := filepath.Join(t.TempDir(), "litevirt.yaml")
 	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	origConnect := cli.Connect
 	t.Cleanup(func() { cli.Connect = origConnect })
-	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
-		return &projectionClient{full: []*pb.VM{{
-			Name: "box-1", StackName: "devs", HostName: "h1", State: pb.VMState_VM_ERROR,
-			CpuActual: 4, MemActualMib: 8192,
-			Spec: &pb.VMSpec{Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1", GuestAgent: true, Boot: "disk"},
-		}}}, func() {}, nil
-	}
-	out := captureStdout(t, func() {
-		cmd := newDiffCmd()
-		cmd.SetArgs([]string{"-f", file})
-		if err := cmd.Execute(); err != nil {
-			t.Errorf("diff: %v", err)
-		}
-	})
-	if !strings.Contains(out, "1 to update") || !strings.Contains(out, "retry box-1") {
-		t.Errorf("an error-state VM must show as a retry, got:\n%s", out)
-	}
-}
-
-// With cpu/memory/image/cloud-init unchanged, an edit to any other spec field
-// (cpu-mode here) must still show as an update in the diff.
-func TestComposeDiff_CPUModeEditIsUpdate(t *testing.T) {
-	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n    cpu: 4\n    memory: 8192\n    cpu-mode: host-passthrough\n"
-	file := filepath.Join(t.TempDir(), "litevirt.yaml")
-	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	origConnect := cli.Connect
-	t.Cleanup(func() { cli.Connect = origConnect })
-	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
-		return &projectionClient{full: []*pb.VM{{
-			Name: "box-1", StackName: "devs", HostName: "h1", State: pb.VMState_VM_RUNNING,
-			CpuActual: 4, MemActualMib: 8192,
-			Spec: &pb.VMSpec{Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1",
-				GuestAgent: true, Boot: "disk", CpuMode: "host-model", Machine: "q35"},
-		}}}, func() {}, nil
-	}
-	out := captureStdout(t, func() {
-		cmd := newDiffCmd()
-		cmd.SetArgs([]string{"-f", file})
-		if err := cmd.Execute(); err != nil {
-			t.Errorf("diff: %v", err)
-		}
-	})
-	if !strings.Contains(out, "1 to update") || !strings.Contains(out, "cpu-mode") {
-		t.Errorf("a cpu-mode edit must show as an update naming the reason, got:\n%s", out)
-	}
-}
-
-// VM names are cluster-wide: a create whose name a VM of another stack holds
-// is refused by the diff as the server's plan refuses it, instead of showing
-// "+ create". A VM of no stack collides the same way; a new name does not.
-func TestComposeDiff_CreateCollidingWithAnotherStackIsRefused(t *testing.T) {
-	yaml := "name: app_v2\nvms:\n  v1:\n    image: LTS-24.04\n  lone:\n    image: LTS-24.04\n  fresh:\n    image: LTS-24.04\n"
-	file := filepath.Join(t.TempDir(), "litevirt.yaml")
-	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	origConnect := cli.Connect
-	t.Cleanup(func() { cli.Connect = origConnect })
-	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
-		return &projectionClient{full: []*pb.VM{
-			{Name: "v1", StackName: "app", HostName: "h1", State: pb.VMState_VM_RUNNING, Spec: &pb.VMSpec{Name: "v1"}},
-			{Name: "lone", HostName: "h1", State: pb.VMState_VM_RUNNING, Spec: &pb.VMSpec{Name: "lone"}},
-		}}, func() {}, nil
-	}
+	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) { return c, func() {}, nil }
 	var err error
 	out := captureStdout(t, func() {
 		cmd := newDiffCmd()
-		cmd.SetArgs([]string{"-f", file})
+		cmd.SetArgs(append([]string{"-f", file}, args...))
 		cmd.SilenceUsage, cmd.SilenceErrors = true, true
 		err = cmd.Execute()
 	})
-	if err == nil {
-		t.Fatalf("diff of a file whose v1 is another stack's VM passed:\n%s", out)
+	if c.got != nil && !strings.Contains(c.got.ComposeYaml, "box-1") {
+		t.Errorf("DiffStack was not sent the file: %q", c.got.ComposeYaml)
+	}
+	return out, err
+}
+
+// `lv compose diff` prints the server's plan, the one `lv compose up` applies:
+// the client no longer computes its own from InspectVM, which disagreed with
+// the server on the NIC security it compares (lab c713 N2, review I2).
+func TestComposeDiff_PrintsTheServersPlan(t *testing.T) {
+	c := &diffStackClient{resp: &pb.DiffStackResponse{Entries: []*pb.DiffEntry{
+		{Operation: pb.DiffOp_DIFF_UNCHANGED, Detail: "⚠ box-1: nic 0 (lan) security groups not restored: re-run with --allow-weaken"},
+		{Operation: pb.DiffOp_DIFF_UNCHANGED, Detail: "network lan (type=bridge)"},
+		{VmName: "box-1", Operation: pb.DiffOp_DIFF_UPDATE, Detail: "update box-1: labels changed — applied in place, no restart"},
+		{VmName: "box-2", Operation: pb.DiffOp_DIFF_UNCHANGED, Detail: "box-2: no changes"},
+		{VmName: "box-1", Operation: pb.DiffOp_DIFF_CREATE, Detail: "dns box-1.example → pending (DHCP)"},
+	}}}
+	out, err := runDiff(t, c)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
 	}
 	for _, want := range []string{
-		`vm "v1" already exists in stack "app" — rename it in this file or delete it there`,
-		`vm "lone" already exists outside any stack — rename it in this file or delete it there`,
+		"warning: box-1: nic 0 (lan) security groups not restored: re-run with --allow-weaken",
+		"Plan: 0 to create, 1 to update, 0 to delete, 1 unchanged",
+		"  ~ update box-1: labels changed",
+		"    box-2: no changes",
 	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("diff error %q\nwant it to contain %q", err, want)
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(err.Error(), `"fresh"`) {
-		t.Errorf("fresh collides with nothing but was reported: %v", err)
+	if c.got.AllowWeaken {
+		t.Error("diff asked for --allow-weaken without the flag")
 	}
-	if strings.Contains(out, "+ create v1") {
-		t.Errorf("diff still shows the colliding create:\n%s", out)
+	if _, err := runDiff(t, c, "--allow-weaken"); err != nil || !c.got.AllowWeaken {
+		t.Errorf("--allow-weaken not passed to the server plan (err %v)", err)
+	}
+}
+
+// A plan the server refuses (a name collision) is the diff's error, worded as
+// the server words it.
+func TestComposeDiff_ServerRefusalIsTheError(t *testing.T) {
+	c := &diffStackClient{err: status.Error(codes.FailedPrecondition,
+		"pre-deploy validation failed:\n  - vm \"box-1\" already exists in stack \"app\" — rename it in this file or delete it there")}
+	out, err := runDiff(t, c)
+	if err == nil || !strings.Contains(err.Error(), `vm "box-1" already exists in stack "app"`) ||
+		strings.Contains(err.Error(), "rpc error") {
+		t.Fatalf("err = %v, want the server's refusal as written", err)
+	}
+	if strings.Contains(out, "Plan:") {
+		t.Errorf("a refused plan was printed:\n%s", out)
 	}
 }

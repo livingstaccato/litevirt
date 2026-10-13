@@ -697,7 +697,7 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			// Error, not warn: this is the one finding in the daemon that means
 			// someone has altered the record of what happened on this cluster.
 			slog.Error("audit chain verification found evidence of tampering",
-				"rows", res.RowsChecked, "broken_at", res.BrokenAt,
+				"rows", res.RowsChecked, "broken_at", res.BrokenAt, "broken_kind", res.BrokenKind,
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
 				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,

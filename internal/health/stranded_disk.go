@@ -412,12 +412,14 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// The VM runs here again on the disk at that path.
 		return false, d
 	}
-	fi, err := os.Lstat(d.Path)
+	fi, err := r.lstatDisk(d.Path)
 	if err != nil {
 		// Missing is not deleted: a volume not mounted (yet) — its mount
 		// point absent, or present and empty — reads exactly like a file
 		// gone. Nothing confirms a deletion, so the entry is kept and looked
-		// at again next pass; it clears with its VM.
+		// at again next pass; it clears with its VM. A volume that does not
+		// answer is the same, and the bounded look (disk_stat.go) does not
+		// hold the pass on it.
 		return true, d
 	}
 	if !fi.Mode().IsRegular() {

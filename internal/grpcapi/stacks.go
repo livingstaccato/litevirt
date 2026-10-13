@@ -38,7 +38,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err := RequireRole(stream.Context(), "operator"); err != nil {
 		return err
 	}
-	ctx := stream.Context()
+	// The deploy's opt-in travels to the executor, which re-checks each NIC
+	// security restore against the rows as they are when it writes.
+	ctx := withAllowWeaken(stream.Context(), req.AllowWeaken)
 
 	if req.ComposeYaml == "" {
 		return status.Error(codes.InvalidArgument, "compose_yaml required")
@@ -105,6 +107,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err != nil {
 		return status.Errorf(codes.Internal, "load cluster state: %v", err)
 	}
+	if err := s.loadNICSecurityPlanState(ctx, state, f.Name, req.AllowWeaken); err != nil {
+		return err
+	}
 
 	resolved, err := planner.Resolve(ctx, f, state)
 	if err != nil {
@@ -118,6 +123,14 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	if req.DryRun {
 		return s.streamResolvedPlan(stream, resolved)
+	}
+
+	// The plan's warnings (a withheld NIC security restore among them) reach
+	// a caller that did not dry-run first too (the UI, REST, gitops).
+	for _, w := range resolved.Warnings {
+		if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w}); err != nil {
+			return err
+		}
 	}
 
 	// ── Execute phase: walk the plan deterministically ──
@@ -1596,6 +1609,9 @@ func (s *Server) DiffStack(ctx context.Context, req *pb.DiffStackRequest) (*pb.D
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "load cluster state: %v", err)
 	}
+	if err := s.loadNICSecurityPlanState(ctx, state, f.Name, req.AllowWeaken); err != nil {
+		return nil, err
+	}
 
 	resolved, err := planner.Resolve(ctx, f, state)
 	if err != nil {
@@ -1717,6 +1733,13 @@ func (s *Server) plannedVMSpec(action planner.VMAction, f *compose.File) (*pb.VM
 		spec, err = compose.BuildVMSpec(action.VMName, baseName, vmDef, f)
 		if err != nil {
 			return nil, fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
+		}
+		// As the planner's spec: a guard its NIC's network cannot enforce is
+		// left out, not handed to a create that refuses it.
+		for _, note := range compose.StripUnenforcedGuards(spec, func(n string) string {
+			return guardUnenforcedOnNetwork(context.Background(), s.db, n)
+		}) {
+			slog.Warn("compose: "+note, "vm", action.VMName)
 		}
 	}
 

@@ -1535,7 +1535,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// guarded by default, as a clone's are (copyNICGuards).
 	var guardRecords []corrosion.NICGuardRecord
 	if renamed {
-		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords, func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) })
 		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
 			removeLive()
 			return err

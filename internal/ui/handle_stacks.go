@@ -104,6 +104,7 @@ func (s *Server) handleDeployStack(w http.ResponseWriter, r *http.Request) {
 	// Consume the stream to completion so the deployment actually runs.
 	// A refusal arrives on the first Recv, so only io.EOF means it ran.
 	var lastErr string
+	var warnings []string
 	for {
 		p, err := stream.Recv()
 		if err != nil {
@@ -117,6 +118,9 @@ func (s *Server) handleDeployStack(w http.ResponseWriter, r *http.Request) {
 		if p.Error != "" {
 			lastErr = p.Error
 		}
+		if p.Phase == "warning" {
+			warnings = append(warnings, p.Detail)
+		}
 	}
 	if lastErr != "" {
 		slog.Error("UI: deploy stream error", "error", lastErr)
@@ -126,6 +130,13 @@ func (s *Server) handleDeployStack(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("HX-Redirect", "/stacks")
+	if len(warnings) > 0 {
+		// A withheld NIC security restore (or another plan warning) is not
+		// lost: the deploy succeeded, but the operator is told.
+		sendToast(w, fmt.Sprintf("Stack deployed with %d warning(s): %s", len(warnings), warnings[0]), "warning")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	sendToast(w, "Stack deployed", "success")
 	w.WriteHeader(http.StatusOK)
 }

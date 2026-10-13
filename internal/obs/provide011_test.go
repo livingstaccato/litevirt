@@ -1,0 +1,216 @@
+package obs
+
+import (
+	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// provide-telemetry 0.11 treats `version` as a reserved wire name: with a
+// service version configured it stamps service.version and drops a caller's
+// bare `version` attribute. The four litevirt call sites that logged a CRL
+// number, a schema number and a path under that key were renamed; this pins
+// that the new names survive on a record while the bare key does not.
+func TestDaemonLog_RenamedVersionFieldsSurvive(t *testing.T) {
+	lines := captureDaemonStderr(t, Config{ServiceName: "litevirt", Version: "v9.9.9", HostName: "node-3"}, func() {
+		slog.Warn("cluster CRL published", "crl_version", 7, "installed_locally", true)
+		slog.Warn("installed the cluster CRL union", "crl_version", 8, "members", 3)
+		slog.Info("schema initialized", "schema_version", 42, "ledger", 5)
+		slog.Error("image pointer missing", "image", "ubuntu", "image_version_path", "/images/ubuntu/x.qcow2")
+		slog.Info("bare version key", "version", "caller-supplied")
+	})
+	for _, c := range []struct{ msg, key, val string }{
+		{"cluster CRL published", "crl_version", "7"},
+		{"installed the cluster CRL union", "crl_version", "8"},
+		{"schema initialized", "schema_version", "42"},
+		{"image pointer missing", "image_version_path", "/images/ubuntu/x.qcow2"},
+	} {
+		line := lineWith(lines, c.msg)
+		if line == "" {
+			t.Fatalf("no journal line for %q in %q", c.msg, lines)
+		}
+		if got := logfmtFields(line)[c.key]; got != c.val {
+			t.Errorf("%q: %s=%q, want %q (line %q)", c.msg, c.key, got, c.val, line)
+		}
+	}
+	// The reason for the rename: the vendor owns the bare key once a version
+	// is configured, so a caller value cannot be relied on to survive.
+	line := lineWith(lines, "bare version key")
+	if strings.Contains(line, "caller-supplied") {
+		t.Errorf("caller's bare version survived; the reserved-field premise changed, revisit the renames: %q", line)
+	}
+	// The build version logged bare at startup is carried by the stamp.
+	if !strings.Contains(line, "v9.9.9") {
+		t.Errorf("stamped service version v9.9.9 missing from record: %q", line)
+	}
+}
+
+// provide-telemetry reserves service, env, version, trace_id and span_id: a
+// caller attribute with one of those keys is dropped once the matching stamped
+// field exists. No litevirt log call may use them as an attribute key. The scan
+// is AST based, so it covers package-level slog functions, *slog.Logger
+// methods, slog.Log/LogAttrs, With and Group arguments and the slog.String/Int/
+// Any... attr constructors, multi-line calls included. The one exception is
+// named exactly: the daemon's startup line logs before obs.Setup runs, so the
+// default logger keeps the key.
+func TestNoReservedSlogKeys(t *testing.T) {
+	reserved := map[string]bool{"service": true, "env": true, "version": true, "trace_id": true, "span_id": true}
+	logFuncs := map[string]bool{
+		"Debug": true, "Info": true, "Warn": true, "Error": true,
+		"DebugContext": true, "InfoContext": true, "WarnContext": true, "ErrorContext": true,
+		"Log": true, "LogAttrs": true, "With": true, "Group": true,
+		"String": true, "Int": true, "Int64": true, "Uint64": true, "Float64": true,
+		"Bool": true, "Duration": true, "Time": true, "Any": true,
+	}
+	// file | first string literal argument (the message) of the exempt call.
+	allowed := map[string]bool{
+		"cmd/litevirt/daemon.go|starting litevirt daemon": true,
+	}
+	root := filepath.Join("..", "..")
+	fset := token.NewFileSet()
+	scanned := 0
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if n := d.Name(); n == ".git" || n == "gen" || n == ".claude" || n == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, p, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		scanned++
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !logFuncs[sel.Sel.Name] {
+				return true
+			}
+			var first string
+			for i, a := range call.Args {
+				lit, ok := a.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				v, uerr := strconv.Unquote(lit.Value)
+				if uerr != nil {
+					continue
+				}
+				if i == 0 || first == "" {
+					first = v
+				}
+				if i > 0 && reserved[v] && !allowed[rel+"|"+first] {
+					t.Errorf("%s: %s(...) uses reserved key %q; provide-telemetry drops it when the stamped field exists. Use a specific key (crl_version, build_version, ...)",
+						fset.Position(call.Pos()), sel.Sel.Name, v)
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned < 100 {
+		t.Fatalf("scanned only %d files; the walk root is wrong", scanned)
+	}
+}
+
+// log_level CRITICAL was accepted before provide-telemetry 0.8 and meant ERROR.
+// Since 0.8 it is a level above ERROR that litevirt never emits, so it would
+// silence every line. obs maps it to ERROR (from config and from env) and says so.
+func TestSetup_CriticalLogLevelMappedToError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		env  map[string]string
+	}{
+		{"config", Config{ServiceName: "litevirt", LogLevel: "CRITICAL"}, nil},
+		{"litevirt env", Config{ServiceName: "litevirt"}, map[string]string{"LITEVIRT_LOG_LEVEL": "critical"}},
+		{"vendor env", Config{ServiceName: "litevirt"}, map[string]string{"PROVIDE_LOG_LEVEL": "CRITICAL"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			// The WARN goes through the pre-Setup default logger.
+			var pre bytes.Buffer
+			prev := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			slog.SetDefault(slog.New(slog.NewTextHandler(&pre, nil)))
+			lines := captureDaemonStderrEnv(t, tc.cfg, func() {
+				slog.Info("info below error")
+				slog.Error("an error line", "k", "v")
+			})
+			if n := countWith(lines, "an error line"); n != 1 {
+				t.Fatalf("ERROR record emitted %d times under CRITICAL, want 1 (silenced?): %q", n, lines)
+			}
+			if n := countWith(lines, "info below error"); n != 0 {
+				t.Errorf("INFO record emitted under a CRITICAL->ERROR level: %q", lines)
+			}
+			if got := os.Getenv("PROVIDE_LOG_LEVEL"); got != "ERROR" {
+				t.Errorf("PROVIDE_LOG_LEVEL=%q, want ERROR", got)
+			}
+			if n := strings.Count(pre.String(), "treated as ERROR"); n != 1 {
+				t.Errorf("startup WARN count=%d, want 1: %q", n, pre.String())
+			}
+		})
+	}
+}
+
+// PROVIDE_LOG_INCLUDE_CALLER defaults true in provide-telemetry 0.9+, which
+// adds filename/lineno to every record. Through litevirt's gRPC and stdlib log
+// bridges that reports adapter frames and lengthens every journald line, so
+// obs defaults it off; an operator can still opt in.
+func TestSetup_IncludeCallerDefaultsOff(t *testing.T) {
+	lines := captureDaemonStderr(t, Config{ServiceName: "litevirt", HostName: "node-3"}, func() {
+		slog.Info("caller probe")
+	})
+	line := lineWith(lines, "caller probe")
+	if line == "" {
+		t.Fatalf("no journal line: %q", lines)
+	}
+	f := logfmtFields(line)
+	if _, ok := f["filename"]; ok {
+		t.Errorf("filename on a default record: %q", line)
+	}
+	if _, ok := f["lineno"]; ok {
+		t.Errorf("lineno on a default record: %q", line)
+	}
+	if v, ok := os.LookupEnv("PROVIDE_LOG_INCLUDE_CALLER"); !ok || v != "false" {
+		t.Errorf("PROVIDE_LOG_INCLUDE_CALLER=%q (set=%v), want the obs default false", v, ok)
+	}
+}
+
+func TestSetup_IncludeCallerOperatorOptIn(t *testing.T) {
+	cleanEnv(t)
+	t.Setenv("PROVIDE_LOG_INCLUDE_CALLER", "true")
+	lines := captureDaemonStderrEnv(t, Config{ServiceName: "litevirt", HostName: "node-3"}, func() {
+		slog.Info("caller probe")
+	})
+	line := lineWith(lines, "caller probe")
+	f := logfmtFields(line)
+	if f["filename"] == "" || f["lineno"] == "" {
+		t.Errorf("operator opt-in produced no filename/lineno: %q", line)
+	}
+}

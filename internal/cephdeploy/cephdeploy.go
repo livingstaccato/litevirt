@@ -134,7 +134,7 @@ func (r *CephadmRunner) Status(ctx context.Context) (Status, error) {
 		return Status{}, fmt.Errorf("ceph -s: %w", err)
 	}
 	var raw cephStatusJSON
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := decodeFirst(out, &raw); err != nil {
 		return Status{}, fmt.Errorf("parse ceph -s json: %w", err)
 	}
 	return Status{
@@ -159,7 +159,7 @@ func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
 		return OSDTree{}, fmt.Errorf("ceph osd tree: %w", err)
 	}
 	var raw cephOSDTreeJSON
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := decodeFirst(out, &raw); err != nil {
 		return OSDTree{}, fmt.Errorf("parse osd tree: %w", err)
 	}
 	out2 := OSDTree{}
@@ -177,9 +177,10 @@ func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
 // the JSON document it printed. cephadm writes its own banner ("Inferring
 // fsid …", "Inferring config …", "Using ceph image …") to stderr, and a
 // version may print such lines on stdout too: only stdout is read (stderr
-// goes into the error of a failed call), and anything before the line the
+// goes into the error of a failed call), anything before the line the
 // document starts on is dropped (lab 2 N-3: the JSON parse failed on the
-// banner's "I").
+// banner's "I"), and the caller reads only the first JSON value
+// (decodeFirst), whatever follows it.
 func (r *CephadmRunner) jsonOutput(ctx context.Context, args ...string) ([]byte, error) {
 	full := append(append([]string{"shell", "--", "ceph"}, args...), "--format", "json")
 	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, r.bin(), full...))
@@ -191,6 +192,12 @@ func (r *CephadmRunner) jsonOutput(ctx context.Context, args ...string) ([]byte,
 		return nil, err
 	}
 	return jsonDocument(out), nil
+}
+
+// decodeFirst decodes the first JSON value in out into v. Anything after it
+// (a line a version prints on stdout once the command is done) is ignored.
+func decodeFirst(out []byte, v any) error {
+	return json.NewDecoder(bytes.NewReader(out)).Decode(v)
 }
 
 // jsonDocument is out from the first line that starts a JSON object or array

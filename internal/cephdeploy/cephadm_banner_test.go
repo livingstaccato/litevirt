@@ -77,3 +77,39 @@ func TestJSONDocument(t *testing.T) {
 		}
 	}
 }
+
+// fakeCephadmTrailing prints, on stdout, a line after the JSON document, as
+// a version that reports on stdout once the command is done might.
+const fakeCephadmTrailing = `#!/bin/sh
+case "$*" in
+*" -s "*) echo '{"fsid":"0b1e6d6a","health":{"status":"HEALTH_OK","checks":{}},"monmap":{"num_mons":3},"osdmap":{"num_osds":3,"num_up_osds":3,"num_in_osds":3},"pgmap":{"num_pgs":33,"bytes_avail":1000,"bytes_used":24}}'; echo "Releasing lock" ;;
+*"osd tree"*) echo "Inferring fsid 0b1e6d6a"; echo '{"nodes":[{"id":-1,"name":"default","type":"root","children":[0]},{"id":0,"name":"osd.0","type":"osd","status":"up","reweight":1}],"stray":[]}'; echo "[done]" ;;
+esac
+`
+
+// Re-review 3: what ceph printed parses when stdout carries anything after
+// the JSON document too: only the first JSON value is read.
+//
+// Mutation: json.Unmarshal of the whole remainder — "invalid character":
+// red.
+func TestCephadm_StatusAndOSDTreeParseWithTrailingStdout(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "cephadm")
+	if err := os.WriteFile(bin, []byte(fakeCephadmTrailing), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &CephadmRunner{Bin: bin}
+	st, err := r.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status with a line after the JSON: %v", err)
+	}
+	if st.Health != "HEALTH_OK" || st.OSDsUp != 3 {
+		t.Fatalf("status = %+v", st)
+	}
+	tree, err := r.OSDTree(context.Background())
+	if err != nil {
+		t.Fatalf("osd tree with a line after the JSON: %v", err)
+	}
+	if len(tree.Nodes) != 2 || tree.Nodes[1].Name != "osd.0" {
+		t.Fatalf("osd tree = %+v", tree)
+	}
+}

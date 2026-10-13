@@ -185,6 +185,11 @@ type Reconciler struct {
 	// answer from storage, walked first on the next pass (start_deferral.go).
 	startDeferral func(ctx context.Context, vm *corrosion.VMRecord) error
 	startDeferred startDeferredSet
+	// diskStat / diskLstat are how the reconcile pass looks at a disk file
+	// (disk_stat.go); nil is os.Stat / os.Lstat. Tests stand in a storage
+	// that does not answer.
+	diskStat  func(string) (os.FileInfo, error)
+	diskLstat func(string) (os.FileInfo, error)
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -1635,6 +1640,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	for _, d := range diskRecords {
 		if transfer {
 			if _, err := r.setAsideSupersededDisk(ctx, vm.Name, proofID, d); err != nil {
+				if storage.IsFSNoAnswer(err) {
+					// Whether an old copy is at the path cannot be told:
+					// nothing is renamed, and the start waits.
+					r.deferStart(ctx, vm.Name, proofID, transfer, diskNoAnswer(d, err))
+					return
+				}
 				r.failPendingStart(ctx, vm.Name, proofID, true,
 					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
 				return
@@ -1644,7 +1655,21 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		// in the cluster, not on a host, and is never rebuilt here — an
 		// overlay "recreated" in its place would boot the VM on a blank copy
 		// of its image.
-		if _, err := os.Stat(d.Path); err != nil && !isNetworkDiskPath(d.Path) {
+		//
+		// Bounded (disk_stat.go): a disk whose storage does not answer is
+		// not missing — never refused as gone, never rebuilt — and does not
+		// hold the pass: the start is deferred (lab 2 F-3).
+		var statErr error
+		if !isNetworkDiskPath(d.Path) {
+			_, statErr = r.statDisk(d.Path)
+		}
+		if storage.IsFSNoAnswer(statErr) {
+			slog.Warn("reconciler: a disk's storage does not answer; the start waits",
+				"vm", vm.Name, "disk", d.DiskName, "path", d.Path, "error", statErr)
+			r.deferStart(ctx, vm.Name, proofID, transfer, diskNoAnswer(d, statErr))
+			return
+		}
+		if statErr != nil {
 			if !transfer {
 				// A local start of a VM whose disk is gone: never rebuilt
 				// blank (missing_disk.go).

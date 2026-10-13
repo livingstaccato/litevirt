@@ -304,6 +304,17 @@ answers again. litevirt keeps that from holding anything else:
   waits in `starting` (a failover in `pending`, its proof kept) and the next
   pass starts it once the storage answers, and the overlay sweep at daemon start passes the VM over
   instead of holding its lock.
+- **The reconcile pass.** One pass on a host serves all of its VMs, so no
+  look it makes at a disk file waits on the server. The check that each disk
+  of a VM it starts is there, the set-aside of an old copy at a host-local
+  disk's path on a failover onto the host, the define of a stopped VM a
+  failover moved to the host, and the set-aside of a disk a failover left on
+  the host each give up after 5 s. A disk that does not answer is never
+  taken as missing: no start is refused as "disk missing" and no disk is
+  rebuilt from its image for it. The start is deferred as above, and nothing
+  is defined or renamed until a later pass gets an answer. The VMs after it
+  in the pass are reconciled as usual, so one dead pool costs the pass about
+  5 s, not the length of the outage.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
   disk's chain does not answer, or listing the image store (a store whose

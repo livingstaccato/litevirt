@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"sort"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // pipeCmds wires `<binA> <argsA> | <binB> <argsB>`, optionally
@@ -19,12 +21,12 @@ import (
 //
 // Errors include the exit details of whichever side failed.
 func pipeCmds(ctx context.Context, sshTarget, binA string, argsA []string, binB string, argsB []string) ([]byte, error) {
-	a := exec.CommandContext(ctx, binA, argsA...)
+	a := cmdbound.Command(ctx, binA, argsA...)
 	var b *exec.Cmd
 	if sshTarget != "" {
-		b = exec.CommandContext(ctx, "ssh", append([]string{sshTarget, binB}, argsB...)...)
+		b = cmdbound.Command(ctx, "ssh", append([]string{sshTarget, binB}, argsB...)...)
 	} else {
-		b = exec.CommandContext(ctx, binB, argsB...)
+		b = cmdbound.Command(ctx, binB, argsB...)
 	}
 
 	out, err := a.StdoutPipe()

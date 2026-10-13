@@ -159,6 +159,10 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"pool %q: %v; an NFS server must resolve so its export can be told apart from every other pool's", req.Name, err)
 	}
+	if errors.Is(err, errOverlapUnverified) || storage.IsFSNoAnswer(err) {
+		return nil, status.Errorf(codes.Unavailable,
+			"pool %q: %v; a pool is not created while its overlap with another pool cannot be verified — try again once that pool's storage answers", req.Name, err)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
 	}
@@ -678,20 +682,16 @@ func pathFormsOf(p string) []string {
 }
 
 func refuseOverlap(dir, libDir, other string) error {
-	forms := func(p string) []string {
-		out := []string{filepath.Clean(p)}
-		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
-			out = append(out, r)
-		}
-		return out
+	// Bounded, and closed when it cannot be verified: the library may be an
+	// nfs pool whose server does not answer (storage.DirsOverlap).
+	overlap, err := storage.DirsOverlap(dir, libDir)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"pool directory %s: %v; a pool is not created while its overlap with pool %q cannot be verified — try again once its storage answers", dir, err, other)
 	}
-	for _, a := range forms(dir) {
-		for _, b := range forms(libDir) {
-			if pathWithin(a, b) || pathWithin(b, a) {
-				return status.Errorf(codes.InvalidArgument,
-					"pool directory %s overlaps the directory %s of pool %q, and the global ISO library's directory is its own; choose another directory", dir, libDir, other)
-			}
-		}
+	if overlap {
+		return status.Errorf(codes.InvalidArgument,
+			"pool directory %s overlaps the directory %s of pool %q, and the global ISO library's directory is its own; choose another directory", dir, libDir, other)
 	}
 	return nil
 }

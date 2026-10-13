@@ -35,6 +35,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // coldDiskChunk is the most file data one ReceiveMigrationDisk frame carries.
@@ -807,8 +808,21 @@ var coldScratchName = regexp.MustCompile(`^\..+(` + regexp.QuoteMeta(coldRecvScr
 // startup, before this daemon serves, when no copy can be in flight. Only the
 // host-local roots are swept — the disks dir and local/dir pools — never a
 // shared (nfs) pool, where another host's copy may be running.
+//
+// Each root is judged and listed under a bound (storage.Bounded): a local or
+// dir pool whose directory is on an NFS mount (fstab) whose server does not
+// answer would block its check or listing in the kernel, and this runs
+// before the daemon serves gRPC. Such a root is skipped. Nothing is removed
+// from it later: only a listing that finished here is acted on, and its
+// scratch names are unique to the copy that made them, so a removal that
+// completes late cannot reach a copy started after the daemon serves.
 func (s *Server) SweepColdMigrationScratch() {
-	roots := []string{filepath.Join(s.dataDir, "disks")}
+	type root struct {
+		dir  string
+		pool string // "" for <data_dir>/disks
+		ref  StoragePoolRef
+	}
+	roots := []root{{dir: filepath.Join(s.dataDir, "disks")}}
 	s.storagePoolsMu.RLock()
 	pools := make(map[string]StoragePoolRef, len(s.storagePools))
 	for n, pr := range s.storagePools {
@@ -819,30 +833,43 @@ func (s *Server) SweepColdMigrationScratch() {
 		if !isHostLocalDiskDriver(strings.ToLower(pr.Driver)) && pr.Driver != "" {
 			continue
 		}
-		if !s.poolUsableForWrite(context.Background(), n, pr) {
-			continue
-		}
 		if dir, err := fileBasedPoolDir(s.dataDir, pr); err == nil {
-			roots = append(roots, dir)
+			roots = append(roots, root{dir: dir, pool: n, ref: pr})
 		}
 	}
+	readDir := coldScratchReadDir
 	seen := map[string]bool{}
-	for _, root := range roots {
-		root = s.hostDiskFile(root)
-		if seen[root] {
+	for _, r := range roots {
+		dir := s.hostDiskFile(r.dir)
+		if seen[dir] {
 			continue
 		}
-		seen[root] = true
-		ents, err := os.ReadDir(root)
-		if err != nil {
-			continue
-		}
-		for _, e := range ents {
-			if !e.Type().IsRegular() || !isColdMigrationScratch(e.Name()) {
-				continue
+		scratch, err := storage.Bounded("list cold migration scratch in", dir, func() ([]string, error) {
+			if r.pool != "" && !s.poolUsableForWrite(context.Background(), r.pool, r.ref) {
+				return nil, errColdScratchPoolUnusable
 			}
-			p := filepath.Join(root, e.Name())
-			if err := os.Remove(p); err != nil {
+			ents, err := readDir(dir)
+			if err != nil {
+				return nil, nil
+			}
+			var out []string
+			for _, e := range ents {
+				if e.Type().IsRegular() && isColdMigrationScratch(e.Name()) {
+					out = append(out, filepath.Join(dir, e.Name()))
+				}
+			}
+			return out, nil
+		})
+		if errors.Is(err, errColdScratchPoolUnusable) {
+			continue // another pool on the same directory may still sweep it
+		}
+		seen[dir] = true
+		if err != nil {
+			slog.Warn("cold migration: scratch files not swept from a directory that does not answer", "dir", dir, "error", err)
+			continue
+		}
+		for _, p := range scratch {
+			if _, err := storage.Bounded("remove", p, func() (struct{}, error) { return struct{}{}, os.Remove(p) }); err != nil {
 				slog.Warn("cold migration: could not remove a scratch file left by an interrupted copy", "path", p, "error", err)
 				continue
 			}
@@ -850,6 +877,14 @@ func (s *Server) SweepColdMigrationScratch() {
 		}
 	}
 }
+
+// coldScratchReadDir lists a root SweepColdMigrationScratch sweeps; tests
+// replace it.
+var coldScratchReadDir = os.ReadDir
+
+// errColdScratchPoolUnusable: a pool SweepColdMigrationScratch does not sweep
+// (its check refuses it).
+var errColdScratchPoolUnusable = errors.New("pool refused by its check")
 
 // oldTargetBundleRequired is how a target built before stopped-VM cold
 // migration refuses a domain definition sent without a firmware bundle: the

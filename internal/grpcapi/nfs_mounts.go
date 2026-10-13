@@ -211,8 +211,7 @@ func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StorageP
 		return
 	}
 	defer s.nfsMu.Unlock()
-	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, listed.Name)
-	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") || rec.Source != listed.Source || rec.Target != listed.Target {
+	if _, ok := s.currentNFSPoolRow(ctx, listed.Name, listed.Source, listed.Target); !ok {
 		return // deleted, or replaced, since the list: the next pass judges it afresh
 	}
 	if needMount {
@@ -224,6 +223,28 @@ func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StorageP
 	if mountErr != nil {
 		slog.Warn("NFS pool's export is not mounted; its disks are not available on this host", "pool", listed.Name, "error", mountErr)
 	}
+	s.recordNFSPoolOutcome(ctx, listed.Name, listed.Source, listed.Target, mountErr)
+}
+
+// currentNFSPoolRow re-reads this host's row of nfs pool name, and reports
+// whether it is still the pool with that source and target.
+func (s *Server) currentNFSPoolRow(ctx context.Context, name, source, target string) (corrosion.StoragePoolRecord, bool) {
+	rec, found, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, name)
+	if err != nil || !found || !strings.EqualFold(rec.Driver, "nfs") || rec.Source != source || rec.Target != target {
+		return rec, false
+	}
+	return rec, true
+}
+
+// recordNFSPoolOutcome writes, from a fresh read of its row, an nfs pool's
+// state (degraded while mountErr, active again once it is nil) when it
+// changed, and raises or resolves its condition. A pool deleted or replaced
+// meanwhile is not written back.
+func (s *Server) recordNFSPoolOutcome(ctx context.Context, name, source, target string, mountErr error) {
+	rec, ok := s.currentNFSPoolRow(ctx, name, source, target)
+	if !ok {
+		return
+	}
 	want := rec.State
 	switch {
 	case mountErr != nil:
@@ -234,10 +255,63 @@ func (s *Server) reconcileNFSPool(ctx context.Context, listed corrosion.StorageP
 	if want != rec.State {
 		rec.State = want
 		if err := corrosion.UpsertStoragePool(ctx, s.db, rec); err != nil {
-			slog.Warn("NFS mounts: record the pool's state", "pool", listed.Name, "error", err)
+			slog.Warn("NFS mounts: record the pool's state", "pool", name, "error", err)
 		}
 	}
-	s.judgeNFSMount(ctx, listed.Name, mountErr)
+	s.judgeNFSMount(ctx, name, mountErr)
+}
+
+// nfsMountSlowAfter is how long a mount of a pool's export may run before
+// the pool is reported degraded while it still runs; tests shorten it.
+var nfsMountSlowAfter = 5 * time.Second
+
+// nfsOutcomeWriteBound bounds the row and condition writes of a mount's
+// outcome, made on a fresh context.
+const nfsOutcomeWriteBound = 10 * time.Second
+
+// OverrideNFSMountSlowAfterForTest sets nfsMountSlowAfter, for tests in other
+// packages. It returns the restore function.
+func OverrideNFSMountSlowAfterForTest(d time.Duration) func() {
+	prev := nfsMountSlowAfter
+	nfsMountSlowAfter = d
+	return func() { nfsMountSlowAfter = prev }
+}
+
+// watchNFSMount reports pool degraded, with the reason, once a mount of its
+// export has run for nfsMountSlowAfter without finishing (lab 2 F-3: against
+// a server that does not answer, a mount runs to its timeout, and the pool
+// read active, with no condition, the whole time). The caller records the
+// mount's outcome after stop, which ends the watch and waits for a report it
+// is writing. A stack volume (pool "") has no row, and is not watched.
+func (s *Server) watchNFSMount(ctx context.Context, pool, source, target, dir string) (stop func()) {
+	if pool == "" || s.db == nil {
+		return func() {}
+	}
+	after := nfsMountSlowAfter
+	started := time.Now().UTC()
+	done, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTimer(after)
+		defer t.Stop()
+		select {
+		case <-done:
+			return
+		case <-t.C:
+		}
+		err := fmt.Errorf("a mount of export %s at %s has been running since %s without finishing (does its server answer?); it is given up when its command timeout ends, and retried every %v",
+			source, dir, started.Format(time.RFC3339), NFSMountReconcileInterval)
+		slog.Warn("NFS pool's export is still being mounted; the pool is degraded until it is", "pool", pool, "error", err)
+		// A fresh, bounded context: the mount's own may be all but spent
+		// (a start waited for nfsMu out of its 45 s).
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nfsOutcomeWriteBound)
+		defer cancel()
+		s.recordNFSPoolOutcome(wctx, pool, source, target, err)
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 // checkNFSMount is a pass's verdict on a pool's mount, made with no lock
@@ -284,7 +358,10 @@ func (s *Server) mountNFSLocked(ctx context.Context, pool string, cfg storage.Co
 	if need, err := s.checkNFSMount(cfg, dir); !need {
 		return err
 	}
-	if err := storage.MountNFSPool(ctx, s.dataDir, cfg); err != nil {
+	stop := s.watchNFSMount(ctx, pool, cfg.Source, cfg.Target, dir)
+	err := storage.MountNFSPool(ctx, s.dataDir, cfg)
+	stop()
+	if err != nil {
 		err = fmt.Errorf("export %s is not mounted at %s: %w; the mount is retried every %v", cfg.Source, dir, err, NFSMountReconcileInterval)
 		s.nfsMem.mountFailed(dir, err)
 		return err
@@ -453,7 +530,17 @@ func (s *Server) ensureNFSMountForStart(ctx context.Context, pool string, cfg st
 			return fmt.Errorf("pool %q was deleted or replaced on this host while the start waited", pool)
 		}
 	}
-	if err := storage.MountNFSPool(mctx, s.dataDir, cfg); err != nil {
+	stop := s.watchNFSMount(mctx, pool, cfg.Source, cfg.Target, dir)
+	err = storage.MountNFSPool(mctx, s.dataDir, cfg)
+	stop()
+	if pool != "" {
+		// The pool's row says so at once, not at the next pass: degraded
+		// with the reason, or active again.
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nfsOutcomeWriteBound)
+		s.recordNFSPoolOutcome(wctx, pool, cfg.Source, cfg.Target, err)
+		cancel()
+	}
+	if err != nil {
 		s.nfsMem.mountFailed(dir, err)
 		return err
 	}

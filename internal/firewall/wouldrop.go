@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // WouldDrop is one observe-mode counter: what the per-NIC rules would have
@@ -22,7 +23,7 @@ type WouldDrop struct {
 // WouldDrops reads the observe-mode counters of the per-NIC table from the
 // kernel. No table (nothing to enforce, or enforce mode) is no counters.
 func WouldDrops(ctx context.Context) ([]WouldDrop, error) {
-	out, err := exec.CommandContext(ctx, "nft", "-j", "list", "table", "bridge", NICTableName).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "nft", "-j", "list", "table", "bridge", NICTableName))
 	if err != nil {
 		return nil, nil
 	}

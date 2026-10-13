@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // NftRunner is the shell-out boundary so tests can drive applier
@@ -58,9 +59,9 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 	if strings.Contains(ruleset, "table bridge "+NICTableName+" {\n") {
 		preamble += fmt.Sprintf("table bridge %s {}\ndelete table bridge %s\n", NICTableName, NICTableName)
 	}
-	cmd := exec.CommandContext(ctx, n.bin(), "-f", "-")
+	cmd := cmdbound.Command(ctx, n.bin(), "-f", "-")
 	cmd.Stdin = strings.NewReader(preamble + ruleset)
-	out, err := cmd.CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmd)
 	return string(out), err
 }
 
@@ -68,10 +69,10 @@ func (n NftBinary) Apply(ctx context.Context, ruleset string) (string, error) {
 // listing means there is none (or no bridge family to hold one), which is not
 // an error; a failed delete of a table that exists is.
 func (n NftBinary) DropNICTable(ctx context.Context) error {
-	if err := exec.CommandContext(ctx, n.bin(), "list", "table", "bridge", NICTableName).Run(); err != nil {
+	if err := cmdbound.Run(ctx, cmdbound.Command(ctx, n.bin(), "list", "table", "bridge", NICTableName)); err != nil {
 		return nil
 	}
-	if out, err := exec.CommandContext(ctx, n.bin(), "delete", "table", "bridge", NICTableName).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, n.bin(), "delete", "table", "bridge", NICTableName)); err != nil {
 		return fmt.Errorf("delete stale per-NIC table: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -86,8 +87,8 @@ type nicTableDropper interface {
 // Flush drops the entire table — operators only need this on
 // uninstall (the typical path is Apply with an empty Plan).
 func (n NftBinary) Flush(ctx context.Context) (string, error) {
-	cmd := exec.CommandContext(ctx, n.bin(), "delete", "table", "inet", TableName)
-	out, err := cmd.CombinedOutput()
+	cmd := cmdbound.Command(ctx, n.bin(), "delete", "table", "inet", TableName)
+	out, err := cmdbound.CombinedOutput(ctx, cmd)
 	if err != nil {
 		return string(out), err
 	}
@@ -326,7 +327,7 @@ var (
 )
 
 func runModprobe(ctx context.Context, name string) error {
-	if out, err := exec.CommandContext(ctx, "modprobe", name).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "modprobe", name)); err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil

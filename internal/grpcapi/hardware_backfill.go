@@ -70,6 +70,16 @@ func (s *Server) BackfillHardwareTables(ctx context.Context) error {
 		if err := s.backfillVMDiskBuses(ctx, vm); err != nil {
 			slog.Warn("hardware backfill: disk-bus backfill failed", "vm", vm.Name, "error", err)
 		}
+		// A cutover a crash interrupted owes this name its runtime handoff:
+		// the domain here is not the VM's yet, and a verdict on it ("no
+		// inactive domain definition") would block the VM until the next
+		// daemon start (lab 2 N-2). It is audited when the handoff
+		// completes (auditAfterVMReplaceHandoff).
+		if pending, perr := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, vm.Name); perr != nil || pending {
+			slog.Info("hardware backfill: VM's audit deferred until its cutover handoff completes", "vm", vm.Name, "error", perr)
+			s.hwAuditDeferred.Store(vm.Name, true)
+			continue
+		}
 		if adopted, reason := s.auditVMPCICompatibility(ctx, vm); !adopted {
 			slog.Info("hardware backfill: VM PCI adoption blocked", "vm", vm.Name, "reason", reason)
 		}
@@ -84,6 +94,24 @@ func (s *Server) BackfillHardwareTables(ctx context.Context) error {
 	// keep the whole node from reading the tables it did populate.
 	s.hwV2Ready.Store(true)
 	return nil
+}
+
+// auditAfterVMReplaceHandoff runs the hardware audit the backfill deferred
+// for vmName while its cutover handoff was owed (BackfillHardwareTables), now
+// that the replacement's domain is defined under the name: what the backfill
+// would have found had the handoff finished before it, as it did when the
+// cutover resume ran before the daemon served.
+func (s *Server) auditAfterVMReplaceHandoff(ctx context.Context, vmName string) {
+	if _, deferred := s.hwAuditDeferred.LoadAndDelete(vmName); !deferred {
+		return
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil || vm.HostName != s.hostName {
+		return
+	}
+	if adopted, reason := s.auditVMPCICompatibility(ctx, vm); !adopted {
+		slog.Info("hardware backfill: VM PCI adoption blocked", "vm", vm.Name, "reason", reason)
+	}
 }
 
 // ErrBackfillReplicaNotCaughtUp is BackfillHardwareTables declining to run

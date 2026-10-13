@@ -1029,6 +1029,9 @@ type Server struct {
 	// fleet-wide while this node could still miss data. Stored atomically: the daemon
 	// sets it from the startup backfill goroutine while the Ping/HA paths read it.
 	hwV2Ready atomic.Bool
+	// hwAuditDeferred names the VMs whose hardware audit the backfill left
+	// for their owed cutover handoff to complete (auditAfterVMReplaceHandoff).
+	hwAuditDeferred sync.Map // vm name -> true
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client

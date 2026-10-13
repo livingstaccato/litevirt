@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -16,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -45,7 +45,7 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 		return fmt.Errorf("btrfs: create subvol root: %w", err)
 	}
 	// `btrfs filesystem show <path>` confirms the path lives on btrfs.
-	out, err := exec.CommandContext(ctx, "btrfs", "filesystem", "show", "--", d.subvolRoot).CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "filesystem", "show", "--", d.subvolRoot))
 	if err != nil {
 		return fmt.Errorf("btrfs filesystem show %s: %w: %s", d.subvolRoot, err, out)
 	}
@@ -54,7 +54,7 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 
 func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {
 	subvol := filepath.Join(d.subvolRoot, fmt.Sprintf("%s-%s", opts.VMName, opts.DiskName))
-	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", "--", subvol).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "subvolume", "create", "--", subvol)); err != nil {
 		return "", fmt.Errorf("btrfs subvolume create %s: %w: %s", subvol, err, out)
 	}
 	// The new subvolume holds one disk: searchable, not listable, as every
@@ -83,7 +83,7 @@ func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string,
 		// the name taken).
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if out, derr := exec.CommandContext(dctx, "btrfs", "subvolume", "delete", "--", subvol).CombinedOutput(); derr != nil {
+		if out, derr := cmdbound.CombinedOutput(dctx, cmdbound.Command(dctx, "btrfs", "subvolume", "delete", "--", subvol)); derr != nil {
 			slog.Warn("a failed disk create left its new btrfs subvolume", "path", subvol, "error", derr, "output", strings.TrimSpace(string(out)))
 		}
 		return "", err
@@ -453,7 +453,7 @@ func (d *btrfsDriver) DeleteDisk(ctx context.Context, path string) error {
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return nil
 	}
-	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "delete", "--", cleanParent).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "subvolume", "delete", "--", cleanParent)); err != nil {
 		// Non-fatal: caller may have created the file directly without
 		// a wrapping subvolume.
 		slog.Warn("btrfs subvolume delete failed", "subvol", cleanParent, "error", err, "output", string(out))

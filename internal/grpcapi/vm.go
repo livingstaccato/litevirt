@@ -1970,10 +1970,14 @@ func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) err
 
 // PrepareHardwareForStart runs the hardware_v2 pre-start obligations shared by EVERY
 // (re)start path — the manual RPCs (via startVMLocked) AND the automated
-// failover/reconciler/health/promote/restore paths that bypass startVMLocked. It is a
-// strict NO-OP unless hardware_v2 is latched (the adoption gate short-circuits on the
-// same latch, and the preflight block is latch-gated), so on a fleet where the feature
-// is off every caller behaves byte-for-behavior exactly as before.
+// failover/reconciler/health/promote/restore paths that bypass startVMLocked. Its
+// hardware obligations are a NO-OP unless hardware_v2 is latched (the adoption gate
+// short-circuits on the same latch, and the preflight block is latch-gated), so on a
+// fleet where the feature is off they change nothing. It is not a no-op as a whole:
+// whatever the latch, a start whose cutover runtime handoff is still owed on this host
+// (VMReplaceHandoffPending, one DB read) is refused as retryable Unavailable, and the
+// start checks below the hardware ones (installer ISO, disk chains and image bases,
+// USB passthrough, iSCSI sessions, NFS mounts) run.
 //
 // When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
 // per-VM compatibility audit on this host) must not (re)start until the operator repairs
@@ -1993,6 +1997,18 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	releasePreflight := func() {}
 	if vm == nil {
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
+	}
+	// A cutover that a crash interrupted after its commit owes this name its
+	// runtime handoff: until the resume (which runs in the background, and
+	// waits out storage that does not answer) has put the replacement's
+	// domain here, a start would find no definition, or the old one. Refused
+	// as retryable; the resume needs this VM's lock, so the start does not
+	// wait for it holding that lock.
+	if s.db != nil {
+		if pending, perr := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, vm.Name); perr == nil && pending {
+			return releasePreflight, status.Errorf(codes.Unavailable,
+				"start %q: a cutover of this VM is still being finished on this host (its runtime handoff is owed); retry once it completes", vm.Name)
+		}
 	}
 
 	// qemu reopens the installer ISO at every start, so it is judged again
@@ -5644,26 +5660,47 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 			continue
 		}
 		file := s.hostDiskFile(d.Path)
-		info, err := qcow2.Info(file)
-		if err != nil || info.BackingFile == "" {
-			continue
+		// The disk's own file and its chain are read under a bound: a disk
+		// on a network filesystem whose server does not answer is refused,
+		// saying so, instead of holding this start — and, behind its VM
+		// lock, the VM's stop — for as long as the server does not answer
+		// (lab 2 N-1).
+		_, err := storage.BoundedOuter("judge the start chain of", file, func() (struct{}, error) {
+			return struct{}{}, s.verifyImageBaseForStart(ctx, vm, d, file)
+		})
+		if storage.IsFSNoAnswer(err) {
+			slog.Warn("start refused: a disk's storage does not answer", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
+			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v",
+				d.DiskName, vm.Name, filepath.Base(file), err)
 		}
-		// The whole chain, layer by layer, by the rule every copy path
-		// judges it by (verifyDiskChainForStart).
-		if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+		if err != nil {
 			return err
 		}
-		b := info.BackingFile
-		if !filepath.IsAbs(b) {
-			b = filepath.Join(filepath.Dir(file), b)
-		}
-		if s.images == nil || !s.images.Contains(b) {
-			continue
-		}
-		if err := s.images.AssertBase(b); err != nil {
-			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
-			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
-		}
+	}
+	return nil
+}
+
+// verifyImageBaseForStart is verifyImageBasesForStart for one disk.
+func (s *Server) verifyImageBaseForStart(ctx context.Context, vm *corrosion.VMRecord, d corrosion.DiskRecord, file string) error {
+	info, err := qcow2.Info(file)
+	if err != nil || info.BackingFile == "" {
+		return nil
+	}
+	// The whole chain, layer by layer, by the rule every copy path
+	// judges it by (verifyDiskChainForStart).
+	if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+		return err
+	}
+	b := info.BackingFile
+	if !filepath.IsAbs(b) {
+		b = filepath.Join(filepath.Dir(file), b)
+	}
+	if s.images == nil || !s.images.Contains(b) {
+		return nil
+	}
+	if err := s.images.AssertBase(b); err != nil {
+		slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
+		return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
 	}
 	return nil
 }

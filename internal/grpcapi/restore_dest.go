@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/image"
@@ -516,7 +516,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 	}
 
 	if format == pbsstore.ContentGuestRaw {
-		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -537,7 +537,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		return fail(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
 	}
 	if rinfo.BackingFile == "" {
-		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -553,28 +553,20 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		if err != nil {
 			return fail(codes.FailedPrecondition, "in_place: %v; restoring it to a new file still works", err)
 		}
-		if msg, err := exec.CommandContext(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", base, "-F", baseFmt, restored).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", base, "-F", baseFmt, restored)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := namesExactly(restored, base, baseFmt); err != nil {
 			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 		}
-		// The re-pointed file names exactly the recorded base; below it, the
-		// disk's own rule.
-		top := resolvedOr(restored)
-		rule := s.diskChainRule(ctx, *dest.disk)
-		if _, err := precheckChain(restored, func(layer, resolved, format string) error {
-			if layer == top {
-				if resolved != base || format != baseFmt {
-					return fmt.Errorf("%s names %q (%s), not the recorded base %q (%s)", layer, resolved, format, base, baseFmt)
-				}
-				return nil
+		if err := s.judgeRepointedChain(ctx, restored, base, baseFmt, *dest.disk); err != nil {
+			code := codes.FailedPrecondition
+			if storage.IsFSNoAnswer(err) {
+				code = codes.Unavailable
 			}
-			return rule(layer, resolved, format)
-		}); err != nil {
-			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
+			return fail(code, "in_place: the re-pointed disk file is refused: %v", err)
 		}
-		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+		if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out)); err != nil {
 			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 		}
 		if err := qcow2.AssertStandalone(out); err != nil {
@@ -589,14 +581,14 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 	// Re-point the bytes' header to the disk's own backing WITHOUT opening
 	// what the header named (-u), confirm the header now names exactly that,
 	// and only then let qemu-img read the chain.
-	if msg, err := exec.CommandContext(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", backing, "-F", backingFmt, restored).CombinedOutput(); err != nil {
+	if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", backing, "-F", backingFmt, restored)); err != nil {
 		return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
 	}
 	if err := namesExactly(restored, backing, backingFmt); err != nil {
 		return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 	}
-	if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
-		"-B", backing, "-F", backingFmt, restored, out).CombinedOutput(); err != nil {
+	if msg, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+		"-B", backing, "-F", backingFmt, restored, out)); err != nil {
 		return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
 	}
 	// The rebuilt overlay names exactly the disk's own backing, nothing else.
@@ -743,6 +735,31 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 		return "", "", fmt.Errorf("the disk's raw backing %q is not a regular file", resolved)
 	}
 	return resolved, format, nil
+}
+
+// judgeRepointedChain judges the chain of restored, re-pointed at exactly
+// the recorded base (base, baseFmt): its top layer must name exactly that
+// base, and every layer below is judged by disk's own rule. Which layer is
+// the top is resolved strictly (resolvedStrict): a form taken as given on no
+// answer would route the top to the disk's broader rule, which may admit
+// more than exactly the recorded base (re-review 4, R4-M1). A resolution
+// that does not answer is the error.
+func (s *Server) judgeRepointedChain(ctx context.Context, restored, base, baseFmt string, disk corrosion.DiskRecord) error {
+	top, err := resolvedStrict(restored)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", restored, err)
+	}
+	rule := s.diskChainRule(ctx, disk)
+	_, err = precheckChain(restored, func(layer, resolved, format string) error {
+		if layer == top {
+			if resolved != base || format != baseFmt {
+				return fmt.Errorf("%s names %q (%s), not the recorded base %q (%s)", layer, resolved, format, base, baseFmt)
+			}
+			return nil
+		}
+		return rule(layer, resolved, format)
+	})
+	return err
 }
 
 // belowOwnLayers follows resolved, the backing of d's file self, down through

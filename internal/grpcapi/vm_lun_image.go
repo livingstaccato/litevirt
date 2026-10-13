@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -83,7 +83,7 @@ var writeImageToDevice = qemuImgWrite
 
 // lunQemuImg runs qemu-img. Tests replace it to see the argv.
 var lunQemuImg = func(ctx context.Context, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "qemu-img", args...).CombinedOutput()
+	return cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "qemu-img", args...))
 }
 
 // qemuImgSource is the json: filename qemu-img opens image (format qcow2 or

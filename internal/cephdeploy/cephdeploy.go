@@ -12,6 +12,7 @@
 package cephdeploy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,8 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/cmdbound"
 )
 
 // CephSpec carries the operator's intent: which interface the
@@ -97,7 +100,7 @@ func (r *CephadmRunner) Bootstrap(ctx context.Context, spec CephSpec) (string, e
 	if spec.Network != "" {
 		args = append(args, "--cluster-network", spec.Network, "--mon-network", spec.Network)
 	}
-	out, err := exec.CommandContext(ctx, r.bin(), args...).CombinedOutput()
+	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), args...))
 	if err != nil {
 		return "", fmt.Errorf("cephadm bootstrap: %w: %s", err, out)
 	}
@@ -126,12 +129,12 @@ func (r *CephadmRunner) AddOSD(ctx context.Context, host, device string) error {
 
 // Status returns a parsed view of `ceph -s --format json`.
 func (r *CephadmRunner) Status(ctx context.Context) (Status, error) {
-	out, err := exec.CommandContext(ctx, r.bin(), "shell", "--", "ceph", "-s", "--format", "json").CombinedOutput()
+	out, err := r.jsonOutput(ctx, "-s")
 	if err != nil {
-		return Status{}, fmt.Errorf("ceph -s: %w: %s", err, out)
+		return Status{}, fmt.Errorf("ceph -s: %w", err)
 	}
 	var raw cephStatusJSON
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := decodeFirst(out, &raw); err != nil {
 		return Status{}, fmt.Errorf("parse ceph -s json: %w", err)
 	}
 	return Status{
@@ -151,12 +154,12 @@ func (r *CephadmRunner) Status(ctx context.Context) (Status, error) {
 // OSDTree returns the cluster's CRUSH topology — used by the UI to
 // render a host-by-host placement view.
 func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
-	out, err := exec.CommandContext(ctx, r.bin(), "shell", "--", "ceph", "osd", "tree", "--format", "json").CombinedOutput()
+	out, err := r.jsonOutput(ctx, "osd", "tree")
 	if err != nil {
-		return OSDTree{}, fmt.Errorf("ceph osd tree: %w: %s", err, out)
+		return OSDTree{}, fmt.Errorf("ceph osd tree: %w", err)
 	}
 	var raw cephOSDTreeJSON
-	if err := json.Unmarshal(out, &raw); err != nil {
+	if err := decodeFirst(out, &raw); err != nil {
 		return OSDTree{}, fmt.Errorf("parse osd tree: %w", err)
 	}
 	out2 := OSDTree{}
@@ -170,9 +173,54 @@ func (r *CephadmRunner) OSDTree(ctx context.Context) (OSDTree, error) {
 	return out2, nil
 }
 
+// jsonOutput runs `cephadm shell -- ceph <args> --format json` and returns
+// the JSON document it printed. cephadm writes its own banner ("Inferring
+// fsid …", "Inferring config …", "Using ceph image …") to stderr, and a
+// version may print such lines on stdout too: only stdout is read (stderr
+// goes into the error of a failed call), anything before the line the
+// document starts on is dropped (lab 2 N-3: the JSON parse failed on the
+// banner's "I"), and the caller reads only the first JSON value
+// (decodeFirst), whatever follows it.
+func (r *CephadmRunner) jsonOutput(ctx context.Context, args ...string) ([]byte, error) {
+	full := append(append([]string{"shell", "--", "ceph"}, args...), "--format", "json")
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, r.bin(), full...))
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, err
+	}
+	return jsonDocument(out), nil
+}
+
+// decodeFirst decodes the first JSON value in out into v. Anything after it
+// (a line a version prints on stdout once the command is done) is ignored.
+func decodeFirst(out []byte, v any) error {
+	return json.NewDecoder(bytes.NewReader(out)).Decode(v)
+}
+
+// jsonDocument is out from the first line that starts a JSON object or array
+// on: lines before it are banners.
+func jsonDocument(out []byte) []byte {
+	rest := out
+	for len(rest) > 0 {
+		line := rest
+		next := []byte(nil)
+		if i := bytes.IndexByte(rest, '\n'); i >= 0 {
+			line, next = rest[:i], rest[i+1:]
+		}
+		if t := bytes.TrimLeft(line, " \t\r"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
+			return rest
+		}
+		rest = next
+	}
+	return out
+}
+
 func (r *CephadmRunner) runCeph(ctx context.Context, args ...string) error {
 	full := append([]string{"shell", "--", "ceph"}, args...)
-	if out, err := exec.CommandContext(ctx, r.bin(), full...).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, r.bin(), full...)); err != nil {
 		return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, out)
 	}
 	return nil

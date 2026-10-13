@@ -9,7 +9,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -1214,7 +1214,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}()
 	args := []string{"convert", "-p", "-O", "qcow2", "-f", srcFormat, src, tmp}
 
-	cmd := exec.CommandContext(ctx, "qemu-img", args...)
+	cmd := cmdbound.Command(ctx, "qemu-img", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
@@ -1361,7 +1361,7 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roo
 	}
 	// qemu-img info on this one image only (no --backing-chain: that would
 	// open the backing file before it is judged).
-	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
+	out, err := cmdbound.Output(ctx, cmdbound.Command(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file))
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)

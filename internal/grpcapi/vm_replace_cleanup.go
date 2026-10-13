@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // The destruction half of `lv cutover`, driven entirely from the journaled
@@ -98,6 +100,9 @@ func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMRepl
 			corrosion.OpStepRedefined); err != nil {
 			return err
 		}
+		// The replacement's domain is defined under the name now: the
+		// hardware audit a backfill deferred for it runs.
+		s.auditAfterVMReplaceHandoff(ctx, cl.Manifest.ReplacedVM)
 	}
 	return corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
 		corrosion.OpStepCompleted)
@@ -842,6 +847,29 @@ func (s *Server) lockedFinishVMReplace(ctx context.Context, cl corrosion.VMRepla
 	return nil // finished by whoever held the locks first
 }
 
+// vmReplaceCleanupStorageAnswers stats, under storage.Bounded, the directory
+// of every volume and file a cleanup still has to free. An error
+// (storage.IsFSNoAnswer) means one does not answer.
+func (s *Server) vmReplaceCleanupStorageAnswers(cl corrosion.VMReplaceCleanup) error {
+	if cl.CleanupDone {
+		return nil
+	}
+	paths := append([]string(nil), cl.Manifest.Paths...)
+	for _, d := range cl.Manifest.Disks {
+		paths = append(paths, d.Path)
+	}
+	for _, p := range paths {
+		if p == "" || !filepath.IsAbs(p) {
+			continue
+		}
+		dir := filepath.Dir(s.hostDiskFile(p))
+		if _, err := storage.Bounded("stat", dir, func() (os.FileInfo, error) { return os.Stat(dir) }); storage.IsFSNoAnswer(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // ResumeVMReplaceCleanups finishes the destruction for every cutover on this host
 // whose transition COMMITTED and whose cleanup was never recorded as done — the
 // work a daemon that died mid-cutover left behind.
@@ -855,8 +883,21 @@ func (s *Server) ResumeVMReplaceCleanups(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	var firstErr, deferred error
 	for _, cl := range pending {
+		// The cleanup runs under both VMs' locks and frees the replaced VM's
+		// volumes first. One on a pool whose server does not answer would
+		// hold both locks for as long as it does not: probe each volume's
+		// directory first, under a bound, and leave the cleanup journaled
+		// for a later attempt when one does not answer.
+		if err := s.vmReplaceCleanupStorageAnswers(cl); err != nil {
+			slog.Warn("cutover: a committed cleanup is deferred; storage it frees does not answer",
+				"replaced_vm", cl.Manifest.ReplacedVM, "operation", cl.OperationID, "error", err)
+			if deferred == nil {
+				deferred = err
+			}
+			continue
+		}
 		slog.Info("cutover: resuming a committed cleanup left by an interrupted attempt",
 			"replaced_vm", cl.Manifest.ReplacedVM, "operation", cl.OperationID,
 			"disks", len(cl.Manifest.Disks))
@@ -867,6 +908,9 @@ func (s *Server) ResumeVMReplaceCleanups(ctx context.Context) error {
 				firstErr = cErr
 			}
 		}
+	}
+	if deferred != nil {
+		return errors.Join(deferred, firstErr) // deferred first: the caller retries
 	}
 	return firstErr
 }

@@ -1840,6 +1840,10 @@ carries the reason:
 - **the mount failed** (the server does not answer, the export is not
   exported to this host, `mount.nfs` refused an option): fix what mount's
   output names. The mount is retried every 30 s.
+- **a mount has been running since … without finishing**: the server does
+  not answer. Raised 5 s into the mount, while it still runs; the mount is
+  given up at its timeout (30 s by default) and the reason then becomes the
+  mount's error. Fix the server or the network path to it.
 - **the mount point holds local files** (it names up to five of them): they
   were written while the export was not mounted, so they are not on it, and
   litevirt does not mount over them. Move them out of the directory; the next

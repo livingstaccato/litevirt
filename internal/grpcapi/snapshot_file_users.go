@@ -9,8 +9,11 @@ import (
 	"sort"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // snapshotFileUsers names the VMs, other than vmName, whose disks use one of
@@ -26,21 +29,41 @@ import (
 // A disk this host cannot read is not one of them: the files are this
 // host's, and a chain that cannot be read here does not reach them. A
 // database error is returned as is; the caller treats "cannot tell" as "in
-// use".
+// use". So is a path whose resolution does not answer (resolvedStrict): a
+// file named in one form and reached in another would be missed, and merged
+// or removed under the VM built on it.
 func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []string) ([]string, error) {
 	mine := map[string]bool{}
 	for _, f := range files {
 		if f == "" {
 			continue
 		}
+		r, err := resolvedStrict(f)
+		if err != nil {
+			return nil, err
+		}
 		mine[filepath.Clean(f)] = true
-		mine[resolvedOr(f)] = true
+		mine[r] = true
 	}
 	if len(mine) == 0 {
 		return nil, nil
 	}
+	var noAnswer error
 	uses := func(p string) bool {
-		return p != "" && (mine[filepath.Clean(p)] || mine[resolvedOr(s.hostDiskFile(p))])
+		if p == "" {
+			return false
+		}
+		if mine[filepath.Clean(p)] {
+			return true
+		}
+		r, err := resolvedStrict(s.hostDiskFile(p))
+		if err != nil {
+			if noAnswer == nil {
+				noAnswer = err
+			}
+			return true // cannot tell: in use
+		}
+		return mine[r]
 	}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
@@ -65,8 +88,21 @@ func (s *Server) snapshotFileUsers(ctx context.Context, vmName string, files []s
 			}
 		}
 	}
+	if noAnswer != nil {
+		return nil, noAnswer
+	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// snapshotFileUsersCode is the status code of a refusal because
+// snapshotFileUsers could not tell: Unavailable (retry once it answers) when
+// storage did not answer, Internal otherwise.
+func snapshotFileUsersCode(err error) codes.Code {
+	if storage.IsFSNoAnswer(err) {
+		return codes.Unavailable
+	}
+	return codes.Internal
 }
 
 // diskFormatOf is the driver type vm's domain on this host gives file

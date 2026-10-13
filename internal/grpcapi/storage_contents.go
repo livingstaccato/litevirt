@@ -666,6 +666,11 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	marked := caller.view != viewReplicas
 	if marked {
 		if err := markUpload(dest); err != nil {
+			if storage.IsFSNoAnswer(err) {
+				// Nothing was written there, and a removal would wait on
+				// the same store that does not answer.
+				return status.Errorf(codes.Unavailable, "mark upload: %v", err)
+			}
 			unmarkUpload(dest)
 			return status.Errorf(codes.Internal, "mark upload: %v", err)
 		}

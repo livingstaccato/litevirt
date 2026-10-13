@@ -338,6 +338,12 @@ func dirEntriesSample(dir string, n int) []string {
 // server, so could not tell its export apart from another pool's.
 var errNFSUnresolved = errors.New("an NFS server does not resolve")
 
+// errOverlapUnverified marks a shared-storage check that could not tell
+// whether two pools' directories overlap: a path did not resolve in time
+// (storage.DirsOverlap), as on an NFS mount whose server does not answer. It
+// refuses, as an overlap would.
+var errOverlapUnverified = errors.New("cannot verify that the pool does not overlap another pool")
+
 // poolExportOf is a pool's identity as NFS storage, or nil when it has none:
 // an nfs pool's export; for a directory pool (local, dir, btrfs) the export
 // its directory is on plus the path below the mount — read from this host's
@@ -490,7 +496,19 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 			continue // two directory pools may share a directory
 		}
 		d, err := fileBasedPoolDir(s.dataDir, rref)
-		if err == nil && storage.DirsOverlap(dir, d) {
+		if err != nil {
+			continue
+		}
+		// Fails closed: an overlap that cannot be verified (an NFS server
+		// that does not answer keeps a path from resolving) refuses, as an
+		// overlap would; a timed-out check never lets a pool sit over another.
+		overlap, oerr := storage.DirsOverlap(dir, d)
+		if oerr != nil {
+			slog.Warn("storage pool check: cannot verify that a pool's directory does not overlap an NFS pool's mount point",
+				"other", label, "error", oerr)
+			return "", "", fmt.Errorf("%w: %v", errOverlapUnverified, oerr)
+		}
+		if overlap {
 			return label, "a directory under an NFS pool's mount point, or one containing it", nil
 		}
 	}
@@ -538,15 +556,20 @@ func samePoolOnAnotherHost(name, project string, ref StoragePoolRef, mine storag
 // dirConfinedAmong reports whether dir is <data_dir>/disks, or overlaps the
 // directory of another directory pool of this host in rows.
 func (s *Server) dirConfinedAmong(rows []corrosion.StoragePoolRecord, name, dir string) bool {
-	if storage.IsDataDirDisks(dir, s.dataDir) {
+	// One that cannot be told not to be <data_dir>/disks counts: the safe side.
+	if is, err := storage.IsDataDirDisksErr(dir, s.dataDir); is || err != nil {
 		return true
 	}
 	for _, r := range rows {
 		if r.HostName != s.hostName || r.Name == name || !isFileBasedDriver(r.Driver) || strings.EqualFold(r.Driver, "nfs") {
 			continue
 		}
-		if d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target}); err == nil && storage.DirsOverlap(dir, d) {
-			return true
+		if d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target}); err == nil {
+			// An overlap that cannot be verified counts: the content stays
+			// confined, which is the safe side.
+			if overlap, oerr := storage.DirsOverlap(dir, d); overlap || oerr != nil {
+				return true
+			}
 		}
 	}
 	return false

@@ -56,7 +56,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -64,6 +63,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -183,7 +183,7 @@ func SetAsideEvidence(disk string) bool {
 
 // Command builds the qemu-img process. A variable so a test can see the
 // argv or fail it.
-var Command = exec.CommandContext
+var Command = cmdbound.Command
 
 // Owner is the VM disk an overlay belongs to.
 type Owner struct {
@@ -846,11 +846,11 @@ func commitInto(ctx context.Context, disk string) error {
 		return fmt.Errorf("%s: %w (its backing file is %q, not this disk; it is never repointed at another file)", Path(disk), ErrNotOurs, info.BackingFile)
 	}
 	if info.BackingFile != disk && filepath.Join(filepath.Dir(disk), info.BackingFile) != disk {
-		if out, err := Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2", "-b", disk, Path(disk)).CombinedOutput(); err != nil {
+		if out, err := cmdbound.CombinedOutput(ctx, Command(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-F", "qcow2", "-b", disk, Path(disk))); err != nil {
 			return fmt.Errorf("point %s at %s: %v: %s", Path(disk), disk, err, out)
 		}
 	}
-	if out, err := Command(ctx, "qemu-img", "commit", "-f", "qcow2", Path(disk)).CombinedOutput(); err != nil {
+	if out, err := cmdbound.CombinedOutput(ctx, Command(ctx, "qemu-img", "commit", "-f", "qcow2", Path(disk))); err != nil {
 		return fmt.Errorf("qemu-img commit %s into %s: %v: %s", Path(disk), disk, err, out)
 	}
 	return nil

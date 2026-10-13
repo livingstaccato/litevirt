@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -20,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -45,9 +45,9 @@ var cephRunner cmdRunner = cLocaleCmd
 // strerror, which glibc translates under the host's locale (systemd hands a
 // service the system's), and ProbeDisk reads that text.
 func cLocaleCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := cmdbound.Command(ctx, name, args...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
-	return cmd.CombinedOutput()
+	return cmdbound.CombinedOutput(ctx, cmd)
 }
 
 // OverrideCephRunnerForTest replaces how ceph drivers built by New run rbd and

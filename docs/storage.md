@@ -317,6 +317,18 @@ answers again. litevirt keeps that from holding anything else:
   `Unavailable` (that disk counts as a user of the file, never as "not built
   on it"), and the prune fails with "nothing is pruned". A VM delete whose
   kept disk's chain does not answer keeps every file.
+- **Superseded disk copies.** The hourly sweep and `lv host superseded-disks`
+  list the copies in every host-local disk directory, and each listing,
+  lookup, removal and rename of a copy (the set-aside on a failover onto the
+  host, on a host's return, and on `--restore`) gives up after 5 s. A
+  directory or copy that does not answer is never taken as empty or gone:
+  the sweep removes nothing under it, sweeps the directories that answered,
+  and logs `superseded disk sweep` with the no-answer; `lv host
+  superseded-disks` (a list, `--purge`, `--remove` or `--restore`) fails with
+  it rather than show a list missing those copies. A rename that gave up may
+  still land once the server answers: the copy then sits under its
+  set-aside name, where the listing finds it and the retention keeps it
+  while its VM exists.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 

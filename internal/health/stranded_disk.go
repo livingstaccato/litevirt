@@ -14,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Stranded disks: the real disk a failover left behind.
@@ -453,7 +454,7 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		}
 	}
 	aside := supersededName(d.Path, r.now())
-	if err := os.Rename(d.Path, aside); err != nil {
+	if err := renameSetAside(d.Path, aside); err != nil {
 		slog.Error("reconciler: could not set aside a disk a failover left on this host; it stays at its path",
 			"vm", vm.Name, "path", d.Path, "error", err)
 		return true, d
@@ -551,9 +552,15 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		return RestoredCopy{}, fmt.Errorf("%w: %s is not a host-local disk of VM %s", ErrRestoreRefused, c.DiskPath, vm.Name)
 	}
 	out := RestoredCopy{VM: vm.Name, Disk: disk.DiskName, DiskPath: c.DiskPath, Restored: c.Path}
-	if _, err := os.Lstat(c.DiskPath); err == nil {
+	if _, err := lstatSetAside(c.DiskPath); err == nil {
 		out.SetAside = supersededName(c.DiskPath, now)
-		if err := os.Rename(c.DiskPath, out.SetAside); err != nil {
+		if err := renameSetAside(c.DiskPath, out.SetAside); err != nil {
+			if storage.IsFSNoAnswer(err) {
+				// The rename may still land: the disk is then kept as
+				// out.SetAside, which the listing finds by its name.
+				return RestoredCopy{}, fmt.Errorf("set aside the disk at %s as %s: %w; nothing more was done (if the rename lands later, lv host superseded-disks lists the disk as that copy)",
+					c.DiskPath, out.SetAside, err)
+			}
 			return RestoredCopy{}, fmt.Errorf("set aside the disk at %s: %w", c.DiskPath, err)
 		}
 		if _, err := noteStrandedCopy(ctx, db, hostName, vm.Name, hostName, disk.DiskName, c.DiskPath, out.SetAside, now); err != nil {
@@ -563,18 +570,18 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		return RestoredCopy{}, err
 	}
 	// Link, then unlink: a link never replaces an existing file.
-	if err := linkFile(c.Path, c.DiskPath); err != nil {
+	if err := linkSetAside(c.Path, c.DiskPath); err != nil {
 		// Never leave the VM with no disk at its path: put back the one set
 		// aside above.
 		if out.SetAside != "" {
-			if rerr := os.Rename(out.SetAside, c.DiskPath); rerr != nil {
+			if rerr := renameSetAside(out.SetAside, c.DiskPath); rerr != nil {
 				return out, fmt.Errorf("put %s back at %s: %w; the disk that was there is kept at %s (moving it back failed: %v)",
 					c.Path, c.DiskPath, err, out.SetAside, rerr)
 			}
 		}
 		return out, fmt.Errorf("put %s back at %s: %w; nothing was changed", c.Path, c.DiskPath, err)
 	}
-	if err := os.Remove(c.Path); err != nil {
+	if err := removeSetAside(c.Path); err != nil {
 		slog.Warn("restore: the copy is in place, but its old name could not be removed", "copy", c.Path, "error", err)
 	}
 	dropStrandedCopy(ctx, db, hostName, c.Path, now)

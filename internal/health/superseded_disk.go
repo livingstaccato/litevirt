@@ -92,7 +92,7 @@ func (r *Reconciler) setAsideSupersededDisk(ctx context.Context, vmName, proofID
 		return "", nil
 	}
 	aside := supersededName(d.Path, time.Now())
-	if err := os.Rename(d.Path, aside); err != nil {
+	if err := renameSetAside(d.Path, aside); err != nil {
 		return "", err
 	}
 	slog.Warn("reconciler: a failover onto this host found an old copy of the VM's disk; set it aside and will not boot it",

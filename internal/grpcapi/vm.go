@@ -2251,12 +2251,21 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
-	// A no-op stop of a VM whose row holds its set-aside disk copies (error,
-	// pending, starting: a failover start that failed or is under way may
-	// need them put back) leaves the row as it is. Writing stopped/
+	// A no-op stop of a VM whose row holds its set-aside disk copies (error:
+	// a failover start that failed may need them put back) leaves the row as
+	// it is. Writing stopped/
 	// operator-stop over it would end that hold (health.supersededHoldStates)
 	// on a stop that stopped nothing. The answer is still success, marked as
 	// a no-op in the VM's event.
+	// pending/starting: a start is under way (a failover's, an onboot's, a
+	// self-heal's), and the reconciler will start the domain. A success here
+	// would be overridden by that start, so the stop is refused, and nothing
+	// is changed. (Main answered Internal: nothing that worked is refused.)
+	if noop && (vm.State == "pending" || vm.State == "starting") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)",
+			vm.Name, vm.State, vm.Name, vm.Name)
+	}
 	if noop && stopNoopKeepsRow[vm.State] {
 		detail := fmt.Sprintf("already stopped: the domain was not running; the row is left %s, which holds its set-aside disk copies", vm.State)
 		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", detail)
@@ -2314,9 +2323,10 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 }
 
 // stopNoopKeepsRow are the VM states a stop that found the domain already
-// not running leaves alone: the states that hold a VM's set-aside disk
-// copies (health.supersededHoldStates).
-var stopNoopKeepsRow = map[string]bool{"error": true, "pending": true, "starting": true}
+// not running leaves alone, answering success: of the states that hold a
+// VM's set-aside disk copies (health.supersededHoldStates), the one no start
+// is under way in. pending and starting are refused before it is read.
+var stopNoopKeepsRow = map[string]bool{"error": true}
 
 func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

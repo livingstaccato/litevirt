@@ -97,49 +97,90 @@ func TestStopVM_AnAlreadyStoppedVMIsStopped(t *testing.T) {
 	}
 }
 
-// Review M6: a VM in error, pending or starting holds its set-aside disk
-// copies (a failover start that failed or is under way may need one put
-// back). A stop that finds its domain already not running stopped nothing,
-// so it must not end that hold by writing stopped/operator-stop: the row is
-// left as it was, the copy stays held, and the answer is still success, with
-// the no-op in the VM's event.
+// heldVM seeds vm1 in state with a host-local disk and a set-aside copy beside
+// it (which state holds), its domain shut off and refusing a stop as libvirt
+// does. It returns the copy's path.
+func heldVM(t *testing.T, s *Server, state string) string {
+	t.Helper()
+	fake := s.virt.(*libvirtfake.Fake)
+	path := filepath.Join(s.dataDir, "disks", "vm1-root.qcow2")
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: state, Spec: seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512}),
+	}, nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: path, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	copyPath := path + ".superseded-20261001T000000.000000000Z"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(copyPath, []byte("the only copy of the VM's data from before the failover"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	notRunningLikeLibvirt(fake, nil)
+	return copyPath
+}
+
+// heldUntouched fails unless vm1's row is still state and its copy still held.
+func heldUntouched(t *testing.T, s *Server, state, copyPath string) {
+	t.Helper()
+	vm, err := corrosion.GetVM(context.Background(), s.db, "vm1")
+	if err != nil || vm == nil || vm.State != state || vm.StateDetail == "operator-stop" {
+		t.Fatalf("%s: row %+v (%v), want it left %s", state, vm, err, state)
+	}
+	copies, err := health.ListSupersededDisks(context.Background(), s.db, s.dataDir)
+	if err != nil || len(copies) != 1 || copies[0].Path != copyPath || copies[0].Held == "" {
+		t.Fatalf("%s: copies %+v (%v), want %s still held", state, copies, err, copyPath)
+	}
+}
+
+// Review M6: a VM in error holds its set-aside disk copies (a failover start
+// that failed may need one put back). A stop that finds its domain already
+// not running stopped nothing, so it must not end that hold by writing
+// stopped/operator-stop: the row is left as it was, the copy stays held, and
+// the answer is still success, with the no-op in the VM's event.
 //
 // Mutation: the no-op writes operator-stop over a holding row — the row reads
 // stopped and the copy is no longer held: red.
 func TestStopVM_ANoOpStopKeepsTheHoldOnSetAsideCopies(t *testing.T) {
-	for _, state := range []string{"error", "pending", "starting"} {
-		s := hotplugDiskServer(t)
-		ctx := adminCtx()
-		fake := s.virt.(*libvirtfake.Fake)
-		path := filepath.Join(s.dataDir, "disks", "vm1-root.qcow2")
-		if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
-			Name: "vm1", HostName: "test-host", State: state, Spec: seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512}),
-		}, nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: path, StorageType: "local"}}); err != nil {
-			t.Fatal(err)
-		}
-		copyPath := path + ".superseded-20261001T000000.000000000Z"
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(copyPath, []byte("the only copy of the VM's data from before the failover"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		fake.SetState("vm1", libvirtfake.StateShutdown)
-		notRunningLikeLibvirt(fake, nil)
+	s := hotplugDiskServer(t)
+	copyPath := heldVM(t, s, "error")
+	if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("stop of an errored VM whose domain is not running: %v", err)
+	}
+	heldUntouched(t, s, "error", copyPath)
+	if d := stoppedEventDetail(t, s, "vm1"); !strings.Contains(d, "already stopped") {
+		t.Fatalf("the vm.stopped event %q does not say the stop was a no-op", d)
+	}
+}
 
-		if _, err := s.StopVM(ctx, &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
-			t.Fatalf("%s: stop of a VM whose domain is not running: %v", state, err)
-		}
-		vm, err := corrosion.GetVM(context.Background(), s.db, "vm1")
-		if err != nil || vm == nil || vm.State != state || vm.StateDetail == "operator-stop" {
-			t.Fatalf("%s: row %+v (%v), want it left %s", state, vm, err, state)
-		}
-		copies, err := health.ListSupersededDisks(context.Background(), s.db, s.dataDir)
-		if err != nil || len(copies) != 1 || copies[0].Path != copyPath || copies[0].Held == "" {
-			t.Fatalf("%s: copies %+v (%v), want %s still held", state, copies, err, copyPath)
-		}
-		if d := stoppedEventDetail(t, s, "vm1"); !strings.Contains(d, "already stopped") {
-			t.Fatalf("%s: the vm.stopped event %q does not say the stop was a no-op", state, d)
+// Fix round 2: a VM in pending or starting is being started (a failover's,
+// an onboot's or a self-heal's start), and the reconciler will start its
+// domain. A stop that finds the domain not running yet answers
+// FailedPrecondition, saying the stop was not applied and what to do: a
+// success the start then overrides would be a false answer. Nothing is
+// changed: the row, the held copy, no vm.stopped event. (Main answered
+// Internal.)
+//
+// Mutation: pending/starting answered as a no-op success again — red.
+func TestStopVM_AVMBeingStartedRefusesTheStop(t *testing.T) {
+	for _, state := range []string{"pending", "starting"} {
+		for _, force := range []bool{false, true} {
+			s := hotplugDiskServer(t)
+			copyPath := heldVM(t, s, state)
+			_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: force})
+			if status.Code(err) != codes.FailedPrecondition ||
+				!strings.Contains(err.Error(), "being started") || !strings.Contains(err.Error(), "not applied") ||
+				!strings.Contains(err.Error(), "lv stop vm1") {
+				t.Fatalf("%s force=%v: stop = %v, want FailedPrecondition saying it is being started, the stop was not applied, and to stop it once it runs", state, force, err)
+			}
+			heldUntouched(t, s, state, copyPath)
+			evs, _ := corrosion.ListVMEvents(context.Background(), s.db, "vm1", 50, "")
+			for _, e := range evs {
+				if e.Type == "vm.stopped" {
+					t.Fatalf("%s force=%v: a refused stop recorded %+v", state, force, e)
+				}
+			}
 		}
 	}
 }

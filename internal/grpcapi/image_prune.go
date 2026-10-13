@@ -127,7 +127,11 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 	st := s.imageStore()
 	for {
 		grew := false
-		for f, n := range st.StoreFiles() {
+		listed, err := s.storeFiles(st)
+		if err != nil {
+			return nil, err
+		}
+		for f, n := range listed {
 			r, err := resolvedStrict(f)
 			if err != nil {
 				return nil, err
@@ -165,6 +169,10 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 			break
 		}
 	}
+	// The store's filesystem keeps every file a disk here is not built on
+	// when other hosts may share it (deletedKeep, and pruneImages for the
+	// versions of an image that is not deleted).
+	sc.storeFS = s.imageStoreShared(st)
 	if len(deleted) > 0 {
 		if err := s.scanDeletedImageUse(ctx, st, deleted, sc); err != nil {
 			return nil, err
@@ -173,18 +181,55 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string, deleted map
 	return sc, nil
 }
 
+// storeFiles is the image store's files (image.Store.ListStoreFiles), listed
+// with the prune's directory reader under storage.Bounded: a listing that
+// fails, or does not answer (a store on a network filesystem whose server
+// does not, lab 2 N-6), is an error, never an empty store. What a prune
+// removes and keeps is decided from what is listed.
+func (s *Server) storeFiles(st *image.Store) (map[string]string, error) {
+	readDir := s.imagePrune.readDirFn()
+	files, err := storage.Bounded("list the image store", st.ImageDir(), func() (map[string]string, error) {
+		return st.ListStoreFiles(readDir)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list the image store %s: %w", st.ImageDir(), err)
+	}
+	return files, nil
+}
+
+// imageStoreShared says why the image store's files may be other hosts'
+// too: it is on a network filesystem (another host's disks, which this host
+// cannot see, may be built on its files), or its filesystem cannot be told.
+// "" for a store on a local filesystem. The filesystem is read under a
+// bound: one that does not answer cannot be told.
+func (s *Server) imageStoreShared(st *image.Store) string {
+	storeFS := s.imagePrune.storeFSFn()
+	fsName, err := storage.Bounded("statfs (image store)", st.ImageDir(), func() (string, error) {
+		return storeFS(st.ImageDir())
+	})
+	switch {
+	case err != nil:
+		return fmt.Sprintf("cannot tell whether the image store is on a filesystem other hosts share: %v", err)
+	case fsName != "":
+		return fmt.Sprintf("the image store is on a network filesystem (%s): another host's disks, which this host cannot see, may be built on its files", fsName)
+	}
+	return ""
+}
+
 // imageUseScan is what a prune's scan saw.
 type imageUseScan struct {
 	// inUse is every store file (resolved) kept, and why.
 	inUse map[string]string
+	// storeFS says why every file no disk here is built on is kept, a
+	// deleted image's or not, when the image store may be shared with other
+	// hosts (imageStoreShared).
+	storeFS string
 	// The rest is read only when a deleted image is pruned:
 	// missingDisk says why every deleted image's files are kept, when a disk
 	// recorded on this host cannot be read here.
 	missingDisk string
 	// unscanned says why, when a staging directory could not all be read.
 	unscanned string
-	// storeFS says why, when the image store may be shared with other hosts.
-	storeFS string
 	// recorded is, per deleted image, a VM in the cluster that records it.
 	recorded map[string]string
 	// open is, per store file of a deleted image, the process holding it
@@ -202,7 +247,7 @@ var stagingDirs = []string{"imports", "restore-staging", "backup-staging", "repl
 // four levels down. A directory on another filesystem (a mount) is not
 // entered and is an error: the files on it would be unseen.
 func (s *Server) stagedDiskFiles() ([]string, error) {
-	readDir := s.imagePrune.readDirFn()
+	readDir := s.imagePrune.boundedReadDir()
 	var out []string
 	var list func(d string, dev uint64, depth int) error
 	list = func(d string, dev uint64, depth int) error {
@@ -281,18 +326,17 @@ func devOf(p string) (uint64, bool) {
 // a failover, a recreate or a migration elsewhere may need this host's copy),
 // and the processes holding a file open (a running qemu).
 func (s *Server) scanDeletedImageUse(ctx context.Context, st *image.Store, deleted map[string]bool, sc *imageUseScan) error {
-	if fsName, err := s.imagePrune.storeFSFn()(st.ImageDir()); err != nil {
-		sc.storeFS = fmt.Sprintf("cannot tell whether the image store is on a filesystem other hosts share: %v", err)
-	} else if fsName != "" {
-		sc.storeFS = fmt.Sprintf("the image store is on a network filesystem (%s): another host's disks, which this host cannot see, may be built on its files", fsName)
-	}
 	recorded, err := s.imageRecordedUsers(ctx, deleted)
 	if err != nil {
 		return err
 	}
 	sc.recorded = recorded
+	listed, err := s.storeFiles(st)
+	if err != nil {
+		return err
+	}
 	var files []string
-	for f, n := range st.StoreFiles() {
+	for f, n := range listed {
 		if deleted[n] {
 			files = append(files, f)
 		}
@@ -435,11 +479,14 @@ func (s *Server) poolDiskFiles(ctx context.Context) ([]string, error) {
 			dirs = append(dirs, dir{path: d, nfs: drv == "nfs", perDisk: drv == "btrfs"})
 		}
 	}
-	readDir := s.imagePrune.readDirFn()
+	readDir := s.imagePrune.boundedReadDir()
 	var out []string
-	var list func(d string, sub bool) error
-	list = func(d string, sub bool) error {
+	var list func(d string, sub, top bool) error
+	list = func(d string, sub, top bool) error {
 		ents, err := readDir(d)
+		if top && errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("list %s: %w", d, err)
 		}
@@ -448,7 +495,7 @@ func (s *Server) poolDiskFiles(ctx context.Context) ([]string, error) {
 			case e.Type().IsRegular():
 				out = append(out, filepath.Join(d, e.Name()))
 			case sub && e.IsDir():
-				if err := list(filepath.Join(d, e.Name()), false); err != nil {
+				if err := list(filepath.Join(d, e.Name()), false, false); err != nil {
 					return err
 				}
 			}
@@ -457,19 +504,33 @@ func (s *Server) poolDiskFiles(ctx context.Context) ([]string, error) {
 	}
 	for _, d := range dirs {
 		if d.nfs {
-			mounted, err := s.imagePrune.mountedFn()(d.path)
-			if err != nil || !mounted {
-				return nil, fmt.Errorf("nfs pool directory %s is not mounted (%v): the disks on the share cannot be seen", d.path, err)
+			if err := s.nfsPoolDirMounted(d.path); err != nil {
+				return nil, err
 			}
 		}
-		if _, err := os.Lstat(d.path); errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err := list(d.path, d.perDisk); err != nil {
+		// A directory that does not exist holds no disk.
+		if err := list(d.path, d.perDisk, true); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
+}
+
+// nfsPoolDirMounted refuses an nfs pool directory that is not mounted: an
+// unmounted share reads as an empty directory, and the disks on it would be
+// unseen. A directory the mount table has as a mount point is mounted, with
+// no call on it (on a mount whose server does not answer, a stat would wait
+// as long, lab 2); any other is judged by stat, under a bound.
+func (s *Server) nfsPoolDirMounted(dir string) error {
+	if storage.IsMountPoint(dir) {
+		return nil
+	}
+	mountedFn := s.imagePrune.mountedFn()
+	mounted, err := storage.Bounded("judge whether it is mounted", dir, func() (bool, error) { return mountedFn(dir) })
+	if err != nil || !mounted {
+		return fmt.Errorf("nfs pool directory %s is not mounted (%v): the disks on the share cannot be seen", dir, err)
+	}
+	return nil
 }
 
 // backupBaseFiles is the base every backup manifest in a backup repo on this
@@ -661,7 +722,12 @@ func (s *Server) pruneImageVersions(ctx context.Context, name string, dryRun boo
 
 // pruneImages removes, on this host, the files of image name (every image
 // when name is "") that the prune need not keep (imageFilesInUse) and that no
-// in-flight disk create holds (holdImage).
+// in-flight disk create holds (holdImage). On an image store other hosts may
+// share (a network filesystem, or one whose filesystem cannot be told) no
+// version is removed: another host's disk may be built on it, and this host
+// cannot see that disk (lab 2 N-7). Each is reported kept, with the reason.
+// Nothing is removed unless the store, and every directory the scan reads,
+// can be listed within the bound (storeFiles, boundedReadDir).
 //
 // The files of a deleted image (its catalog row is deleted: lv image rm) are
 // all candidates, its current file too, and each is removed only when none of
@@ -695,7 +761,11 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	// Only the deleted images with files here are this prune's: a host with
 	// no file of name does not wait for its delete.
 	present := map[string]bool{}
-	for _, n := range st.StoreFiles() {
+	listed, err := s.storeFiles(st)
+	if err != nil {
+		return out, fmt.Errorf("%w: nothing is pruned", err)
+	}
+	for _, n := range listed {
 		present[n] = true
 	}
 	deleted, err := s.deletedImages(ctx, name, justDeleted && present[name])
@@ -720,7 +790,10 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	// Every candidate's resolved form first, before anything is removed: the
 	// scan's keeps are by that form, and one that cannot be had is not
 	// guessed (resolvedStrict).
-	files := st.StoreFiles()
+	files, err := s.storeFiles(st)
+	if err != nil {
+		return out, fmt.Errorf("%w: nothing is pruned", err)
+	}
 	resolved := map[string]string{}
 	for f, n := range files {
 		if name != "" && n != name {
@@ -744,6 +817,13 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 						"the image's catalog record is not deleted on %s (the delete has not replicated here yet, or the image was pulled again): lv image prune %s --host %s removes it once it is",
 						s.hostName, n, s.hostName)})
 				}
+				continue
+			}
+			// A version no disk here is built on may still be another
+			// host's base when the store is shared (lab 2 N-7): kept, as a
+			// deleted image's files are (deletedKeep).
+			if sc.storeFS != "" {
+				out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: sc.storeFS})
 				continue
 			}
 		} else if why := sc.deletedKeep(f, r, n, snap[n]); why != "" {
@@ -1102,6 +1182,17 @@ func (p *imagePruneState) readDirFn() func(string) ([]os.DirEntry, error) {
 		return p.readDir
 	}
 	return os.ReadDir
+}
+
+// boundedReadDir is readDirFn under storage.Bounded: a directory whose
+// listing does not answer (a network filesystem whose server does not)
+// fails the scan within the bound, with an *storage.FSNoAnswerError, instead
+// of holding it to its deadline.
+func (p *imagePruneState) boundedReadDir() func(string) ([]os.DirEntry, error) {
+	readDir := p.readDirFn()
+	return func(d string) ([]os.DirEntry, error) {
+		return storage.Bounded("list", d, func() ([]os.DirEntry, error) { return readDir(d) })
+	}
 }
 
 func (p *imagePruneState) mountedFn() func(string) (bool, error) {

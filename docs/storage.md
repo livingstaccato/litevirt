@@ -302,7 +302,9 @@ answers again. litevirt keeps that from holding anything else:
   instead of holding its lock.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
-  disk's chain does not answer, the prune fails with "nothing is pruned", and
+  disk's chain does not answer, or listing the image store (a store whose
+  directory is a link onto an NFS mount, say) or a pool directory does not
+  answer within 5 s, the prune fails with "nothing is pruned", and
   a snapshot delete or revert is refused with `Unavailable`. Retry once the
   server answers. **Known gap:** a snapshot delete or revert reads the
   header chain of every VM disk on the host, and that read is not bounded.

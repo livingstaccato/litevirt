@@ -655,7 +655,14 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   Needs image.import. Nothing is removed unless the whole view can be read
 #   within 2 minutes: a pool directory, a disk header, an nfs share that is
 #   not mounted or a backup repo that cannot be read refuses the prune,
-#   saying which. A refresh prunes the image's older unused versions by
+#   saying which. A directory (the image store's own included) whose
+#   listing does not answer within 5 s refuses it at once, with "nothing is
+#   pruned". On an image store on a network filesystem (nfs, cifs, ceph,
+#   fuse, ...), or one whose filesystem cannot be told, no version is
+#   removed: other hosts may share the store, and a disk on their own
+#   storage, which this host cannot see, may be built on it. Each such
+#   version is listed as kept, with that reason.
+#   A refresh prunes the image's older unused versions by
 #   itself, in the background, keeping the one it superseded.
 #   A deleted image (lv image rm) has no current version to keep: prune
 #   removes all its files, under the rules lv image rm lists below, and

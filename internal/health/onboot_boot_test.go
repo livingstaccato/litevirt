@@ -428,3 +428,105 @@ func TestOnboot_AStopAfterTheStartPassedTheGateIsHonoured(t *testing.T) {
 		t.Fatal("ob was started over a stop its operator made after the boot's start passed the gate")
 	}
 }
+
+// Review round 1, m-1. A record that could not be written must fail SAFE, as
+// every other record that cannot be trusted does: here the host boot's
+// up-front write fails, ob1 starts anyway, and its operator stops it. A
+// daemon restart in the same boot must not read the previous boot's record
+// (a host boot) and start ob1 over that stop: the record is removed, so the
+// restart reads "no record" and honours the stop.
+//
+// Mutation "a failed write leaves the old record": red.
+func TestOnboot_ARecordThatCannotBeWrittenFailsSafe(t *testing.T) {
+	db, fake, r, dataDir := onbootFixture(t, bootBefore, bootNow)
+	ctx := context.Background()
+	r.writeRecord = func(string, onbootRecord) error { return os.ErrPermission }
+	r.StartOnbootVMs(ctx)
+	if !hwStarted(fake, "ob") {
+		t.Fatal("the host boot did not start ob (a failed record write must not cost the boot's start)")
+	}
+	if boot, _ := record(t, dataDir); boot != "" {
+		t.Fatalf("a record that could not be rewritten was left in place, naming %q", boot)
+	}
+	stopByOperator(t, db, fake, "ob")
+
+	r2 := restartedReconciler(db, fake, dataDir, bootNow)
+	r2.StartOnbootVMs(ctx)
+	r2.reconcile(ctx)
+	if n := starts(fake, "ob"); n != 1 {
+		t.Fatalf("a daemon restart after a failed record write started ob again (%d starts) over its operator's stop", n)
+	}
+}
+
+// Review round 1, m-2. The override ends at the start's "starting" write
+// only when that write lands: a failed one leaves the row at the operator
+// stop the boot overrides, and ending the override then made the next retry
+// drop the VM as "operator intent changed" — the F-4 symptom. Here every
+// "starting" write fails while the disk does not answer; once both clear,
+// the boot's start is made.
+//
+// Mutation "the override ends whatever the write did": red.
+func TestOnboot_AFailedStartingWriteKeepsTheOverride(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	fake := libvirtfake.New()
+	disk := filepath.Join(t.TempDir(), "ob-root.qcow2")
+	if err := os.WriteFile(disk, []byte("the disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "ob", HostName: "node-a", State: "stopped", StateDetail: operatorStopDetail, Spec: `{"name":"ob","onboot":true}`,
+	}, nil, []corrosion.DiskRecord{{VMName: "ob", DiskName: "root", HostName: "node-a", Path: disk, SizeBytes: 1 << 20, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `CREATE TRIGGER inject_starting_fail BEFORE UPDATE OF state ON vms
+		WHEN NEW.name = 'ob' AND NEW.state = 'starting' BEGIN SELECT RAISE(ABORT, 'inject'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	writeRecord(t, dataDir, bootBefore)
+	r := restartedReconciler(db, fake, dataDir, bootNow)
+	s := stallStorage(t, disk)
+	s.wire(r)
+
+	r.StartOnbootVMs(ctx)
+	vm := requireState(t, db, "ob", "stopped")
+	if vm.StateDetail != operatorStopDetail {
+		t.Fatalf("state detail %q, want the stop the failed writes left", vm.StateDetail)
+	}
+	requireRecord(t, dataDir, bootNow, "ob")
+
+	if err := db.Execute(ctx, `DROP TRIGGER inject_starting_fail`); err != nil {
+		t.Fatal(err)
+	}
+	s.answer()
+	s.answered(t, disk)
+	r.reconcile(ctx)
+	if !hwStarted(fake, "ob") {
+		t.Fatal("the boot's start of ob was dropped after its \"starting\" write failed")
+	}
+}
+
+// Review round 1, m-4. A daemon that died between writing the record's
+// temp file and renaming it leaves the temp file behind; the next start
+// removes it, and nothing else in the data dir.
+//
+// Mutation "no sweep": red.
+func TestOnboot_LeftoverTempRecordsAreSwept(t *testing.T) {
+	_, _, r, dataDir := onbootFixture(t, bootNow, bootNow)
+	leftover := filepath.Join(dataDir, onbootBootFile+".tmp-123456")
+	other := filepath.Join(dataDir, "onboot-boot-id-not-ours")
+	for _, p := range []string{leftover, other} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.StartOnbootVMs(context.Background())
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Fatalf("the leftover temp record %s is still there (err %v)", leftover, err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("the sweep removed a file that is not a temp record: %v", err)
+	}
+	requireRecord(t, dataDir, bootNow)
+}

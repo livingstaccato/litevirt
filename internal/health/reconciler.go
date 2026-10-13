@@ -254,6 +254,9 @@ type Reconciler struct {
 	onbootBootID   string
 	// bootID reads this boot's ID; nil is the kernel's (onboot_boot.go).
 	bootID func() (string, error)
+	// writeRecord writes the onboot record; nil is writeOnbootRecord. Tests
+	// make it fail.
+	writeRecord func(dataDir string, rec onbootRecord) error
 
 	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
 	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
@@ -1629,11 +1632,15 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler"); err != nil {
 		slog.Error("reconciler: failover start-marker write failed", "vm", vm.Name, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
+	} else {
+		// The start is past every gate and its row no longer carries the
+		// stop: a host boot's override of an operator stop has done its
+		// job, and a stop recorded from here on — even one identical to the
+		// stop it overrode — is honoured (review M-1). Not when the write
+		// failed: the row still reads as that stop, and the next retry
+		// would drop the VM (review round 1, m-2).
+		r.endOnbootOverride(vm.Name)
 	}
-	// The start is past every gate: a host boot's override of an operator
-	// stop has done its job, and a stop recorded from here on — even one
-	// identical to the stop it overrode — is honoured (review M-1).
-	r.endOnbootOverride(vm.Name)
 
 	// Parse the stored spec to rebuild the domain XML.
 	spec := &pb.VMSpec{}

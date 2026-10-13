@@ -107,6 +107,7 @@ type onbootBoot struct {
 // dir), an unreadable or corrupt record — is NOT a host boot: an operator
 // stop is honoured, as before this record existed.
 func (r *Reconciler) onbootBootState() onbootBoot {
+	r.sweepOnbootTemps()
 	read := r.bootID
 	if read == nil {
 		read = readKernelBootID
@@ -161,12 +162,37 @@ func (r *Reconciler) persistOnbootLocked() {
 		rec.Owed = append(rec.Owed, s)
 	}
 	sort.Slice(rec.Owed, func(i, j int) bool { return rec.Owed[i].VM < rec.Owed[j].VM })
-	if err := writeOnbootRecord(r.dataDir, rec); err != nil {
-		// A daemon restart in this boot then reads the previous record: an
-		// older owed set, or none (a host boot) — it may start an onboot VM
-		// whose operator stopped it since.
-		slog.Error("onboot: could not record this boot and the onboot starts it owes; a daemon restart before it is recorded may start an onboot VM its operator stopped",
-			"error", err)
+	write := r.writeRecord
+	if write == nil {
+		write = writeOnbootRecord
+	}
+	if err := write(r.dataDir, rec); err != nil {
+		// Fail safe (review round 1, m-1): the record left behind names the
+		// previous boot or an older owed set, and a daemon restart in this
+		// boot would override an operator stop made since. With no record a
+		// restart honours every operator stop, as with any record it cannot
+		// trust; only an onboot start still owed by this boot is lost then.
+		path := filepath.Join(r.dataDir, onbootBootFile)
+		rerr := os.Remove(path)
+		if rerr != nil && !os.IsNotExist(rerr) {
+			slog.Error("onboot: could not record this boot, nor remove the old record; a daemon restart in this boot may start an onboot VM its operator stopped since",
+				"file", path, "error", err, "remove_error", rerr)
+			return
+		}
+		slog.Error("onboot: could not record this boot; the old record is removed, so a daemon restart in this boot starts no VM its operator stopped",
+			"file", path, "error", err)
+	}
+}
+
+// sweepOnbootTemps removes temp files of the record a daemon that died
+// between writing and renaming one left behind (review round 1, m-4). Run
+// before anything writes the record in this process.
+func (r *Reconciler) sweepOnbootTemps() {
+	leftovers, _ := filepath.Glob(filepath.Join(r.dataDir, onbootBootFile+".tmp-*"))
+	for _, p := range leftovers {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			slog.Warn("onboot: could not remove a leftover temp record", "file", p, "error", err)
+		}
 	}
 }
 

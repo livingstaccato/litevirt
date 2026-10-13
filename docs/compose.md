@@ -212,7 +212,13 @@ drain, or a stopped VM a failover moved to the host, is not started at boot eith
 The start waits through the daemon's warm-up and any loss of quorum. While it waits, it
 is dropped if `onboot` is turned off or the VM's stop is replaced by a different one (a
 drain's, say). A second `lv stop` of the still-stopped VM records the same stop, so it
-does not cancel the boot's start: turn `onboot` off for that.
+does not cancel the boot's start. Nor does an `lv start` then `lv stop` made before the
+boot reaches the VM: a VM behind earlier VMs' `start-delay`s waits the sum of those
+delays, and a stop made in that wait reads exactly like the one the boot found, so the
+boot (or a daemon restart in that wait) still starts it. Turn `onboot` off to cancel a
+boot start. If the daemon cannot write its record, it removes the old one and logs an
+error: a restart later in that boot then honours every operator stop, so an onboot VM
+the boot had not started yet stays stopped until started by hand.
 
 A VM whose `lv rm` failed after its stop step (an undefine or a device release that
 failed) is recorded as stopped by its operator, the same as `lv stop`, so a host boot

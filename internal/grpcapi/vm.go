@@ -1970,10 +1970,14 @@ func (s *Server) hardwareAdoptionRefused(ctx context.Context, vmName string) err
 
 // PrepareHardwareForStart runs the hardware_v2 pre-start obligations shared by EVERY
 // (re)start path — the manual RPCs (via startVMLocked) AND the automated
-// failover/reconciler/health/promote/restore paths that bypass startVMLocked. It is a
-// strict NO-OP unless hardware_v2 is latched (the adoption gate short-circuits on the
-// same latch, and the preflight block is latch-gated), so on a fleet where the feature
-// is off every caller behaves byte-for-behavior exactly as before.
+// failover/reconciler/health/promote/restore paths that bypass startVMLocked. Its
+// hardware obligations are a NO-OP unless hardware_v2 is latched (the adoption gate
+// short-circuits on the same latch, and the preflight block is latch-gated), so on a
+// fleet where the feature is off they change nothing. It is not a no-op as a whole:
+// whatever the latch, a start whose cutover runtime handoff is still owed on this host
+// (VMReplaceHandoffPending, one DB read) is refused as retryable Unavailable, and the
+// start checks below the hardware ones (installer ISO, disk chains and image bases,
+// USB passthrough, iSCSI sessions, NFS mounts) run.
 //
 // When latched it (1) applies the adoption gate — a "blocked" VM (hardware failed its
 // per-VM compatibility audit on this host) must not (re)start until the operator repairs

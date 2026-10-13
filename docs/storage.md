@@ -278,10 +278,20 @@ answers again. litevirt keeps that from holding anything else:
   answers.
 - **VM start.** A start resolves the pool directories of the host to judge
   the VM's disk chain. A mount point is judged from the mount table, so a VM
-  on local storage starts while an nfs pool's server does not answer. A VM
-  whose disk is on that pool is refused with `Unavailable` ("its storage does
-  not answer") within 5 s, instead of holding the VM's lock (and a stop of
-  it) for as long as the server does not answer.
+  on local storage starts while an nfs pool's server does not answer. The
+  other pool directories are resolved all at once, each under its own 5 s
+  bound, so several pools on dead mounts delay a start by about 5 s in all,
+  not 5 s each. A VM whose disk is on the dead pool is refused with
+  `Unavailable` ("its storage does not answer") instead of holding the VM's
+  lock (and a stop of it) for as long as the server does not answer. The
+  first refusal can take up to 20 s, the start check's own bound, because
+  reading the disk's header waits that long; while that mount is known not
+  to answer, later ones are immediate.
+- **Image prune and snapshot delete or revert.** Whether a file is in use is
+  never decided on a guess. When resolving a path in the image store or a
+  disk's chain does not answer, the prune fails with "nothing is pruned", and
+  a snapshot delete or revert is refused with `Unavailable`. Retry once the
+  server answers.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 

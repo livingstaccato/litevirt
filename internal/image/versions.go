@@ -69,7 +69,7 @@ func (s *Store) currentVersion(name string) (string, bool) {
 	p := filepath.Join(s.imageDir, t)
 	if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() {
 		slog.Error("image: the current version the pointer names is missing; new disks fall back to the image's first file",
-			"image", name, "version", p)
+			"image", name, "image_version_path", p)
 		return "", false
 	}
 	return p, true

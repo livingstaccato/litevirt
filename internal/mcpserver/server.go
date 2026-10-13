@@ -202,7 +202,7 @@ func (s *Server) registerTools(m *mcp.Server) {
 	s.addTool(m, "vm_stats", "Fetch live stats for one VM.", objectSchema(map[string]any{"name": stringSchema("VM name.")}, "name"), s.handleVMStats)
 	s.addTool(m, "list_vm_events", "List bounded VM events with detail redacted.", objectSchema(map[string]any{
 		"vm_name": stringSchema("Optional VM name filter."),
-		"since":   stringSchema("Optional lower bound: RFC3339 (any offset), a date such as 2026-06-01, or a duration ago such as 24h."),
+		"since":   stringSchema("Optional lower bound, from the start of the unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
 		"limit":   integerSchema("Maximum events to return."),
 	}), s.handleListVMEvents)
 	s.addTool(m, "list_containers", "List containers. The current litevirt API supports host filtering only.", objectSchema(map[string]any{
@@ -223,8 +223,8 @@ func (s *Server) registerTools(m *mcp.Server) {
 		"action": stringSchema("Optional action filter."),
 		"target": stringSchema("Optional target path filter."),
 		"user":   stringSchema("Optional username filter."),
-		"since":  stringSchema("Optional lower bound: RFC3339 (any offset), a date such as 2026-06-01, or a duration ago such as 24h."),
-		"until":  stringSchema("Optional upper bound, inclusive of the whole unit it names: RFC3339 (any offset), a date such as 2026-06-30, or a duration ago."),
+		"since":  stringSchema("Optional lower bound, from the start of the unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
+		"until":  stringSchema("Optional upper bound, inclusive of the whole unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
 		"limit":  integerSchema("Maximum entries to return."),
 	}), s.handleListAuditLog)
 	s.addTool(m, "list_rebalance_proposals", "List rebalance proposals with bounded output.", objectSchema(map[string]any{

@@ -77,7 +77,7 @@ func (w TimeWindow) IsOpen() bool { return w.Since.IsZero() && w.Until.IsZero() 
 // year 10000 would be rendered with five digits, which sort as text below every
 // real stamp: an until there matched nothing and a since everything. Both are
 // clamped to maxStamp, so an until there still matches every row and a since
-// matches nothing past it.
+// matches nothing after that instant.
 //
 // Anything else names no instant and is an error that says which bound it was.
 func ParseTimeWindow(since, until string, now time.Time) (TimeWindow, error) {

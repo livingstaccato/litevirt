@@ -180,7 +180,7 @@ and `--since 2026-10-03T22:16:30Z` includes a row stamped
 `22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row. A bound that lands past
 9999-12-31T23:59:59.999999999Z once converted to UTC (a year-9999 bound with a
 negative offset) is clamped to it: as `--until` it still matches every row, as
-`--since` it matches nothing.
+`--since` it matches nothing after that instant.
 Anything else is refused with `InvalidArgument` and a message naming the bound.
 
 The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp

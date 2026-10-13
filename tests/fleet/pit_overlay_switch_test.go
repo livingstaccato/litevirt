@@ -37,7 +37,8 @@ func latchPITOverlay(t *testing.T, c *Cluster) {
 }
 
 // reseedPeers marks every node's peers freshly healthy in its checker, after
-// one quorum reading has taken in the stall.
+// one quorum reading. The gates run the stall heartbeat (gateFor), so a slow
+// step before this is not a stall; this only refreshes the seeded view.
 func reseedPeers(ctx context.Context, c *Cluster, gates map[string]*health.Checker) {
 	for _, n := range c.Nodes {
 		gates[n.Name].QuorumProof(ctx)

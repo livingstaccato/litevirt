@@ -90,7 +90,8 @@ func (g recreateISOGrant) hostPath() bool {
 // recreatePreflight runs, before a VM is torn down to be created again from
 // in on host, the create's refusals that the teardown does not change. Quota
 // and placement are not among them: the VM being torn down still holds its
-// share of both until it is gone.
+// share of both until it is gone. The guard admission, which judges the
+// spec as a re-create of that VM, is preflightRecreateGuards.
 func (s *Server) recreatePreflight(ctx context.Context, in *pb.VMSpec, host string) error {
 	_, err := s.recreatePreflightSpec(ctx, in, host)
 	return err
@@ -125,7 +126,15 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 	if err := validateSpecNames(spec); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	if err := validateSpecTuning(spec); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
+		return nil, err
+	}
+	// As createVM: the VM's own NICs are its name's, so only another
+	// owner's address or MAC refuses — which it would after the teardown too.
+	if err := s.checkNICIdentities(ctx, spec.Project, spec.Network, spec.Name); err != nil {
 		return nil, err
 	}
 	if hooksDefined(spec.Hooks) {
@@ -133,6 +142,14 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 			return nil, status.Error(codes.PermissionDenied,
 				"defining VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
 		}
+	}
+	// USB passthrough and memory hot-add: the release gate, the caller's
+	// authority over each device and the shapes, after the resource defaults
+	// as in createVM (round 4, R1: a raw device an Operator may not pass
+	// through was refused only after the teardown).
+	compose.NormalizeVMSpecResources(spec)
+	if err := s.admitCreateUSBAndHotplug(ctx, spec); err != nil {
+		return nil, err
 	}
 	project := tenancy.NormalizeProject(spec.Project)
 	if project != tenancy.Default {

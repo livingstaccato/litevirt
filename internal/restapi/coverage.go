@@ -252,7 +252,6 @@ type stackDeleteResult struct {
 	Name     string               `json:"name"`
 	Deleted  []string             `json:"deleted"`
 	Failures []stackDeleteFailure `json:"failures"`
-	Warnings []string             `json:"warnings,omitempty"`
 	Error    string               `json:"error,omitempty"`
 }
 

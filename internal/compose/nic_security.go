@@ -396,27 +396,57 @@ func GuardNotEnforcedNote(i int, network, why string) string {
 		"(leave the guard settings out, or use a bridge network)", i, network, why)
 }
 
+// MaxGuardAddresses bounds the allowed list of one NIC's guard, so one record
+// cannot bloat every host's ruleset.
+const MaxGuardAddresses = 64
+
+// NormalizeGuardAddresses validates a guard's allowed (or known) list and
+// returns it in canonical form: masked prefixes, canonical addresses, sorted,
+// deduplicated. An entry that is not an IP address or prefix, or carries a
+// zone, and a list of more than MaxGuardAddresses distinct entries, are
+// refused: they would otherwise reach every host's renderer, which refuses
+// the whole ruleset on one. It is the one validator: the guard record store
+// (corrosion.NormalizeNICGuardAddresses), create, the plan and the deploy's
+// executor all use it.
+func NormalizeGuardAddresses(in []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range in {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		var canon string
+		if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+			canon = p.Masked().String()
+		} else if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+			canon = a.String()
+		} else {
+			return nil, fmt.Errorf("%q is not an IP address or prefix", raw)
+		}
+		if !seen[canon] {
+			seen[canon] = true
+			out = append(out, canon)
+		}
+	}
+	if len(out) > MaxGuardAddresses {
+		return nil, fmt.Errorf("%d addresses; at most %d per NIC", len(out), MaxGuardAddresses)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // InvalidDeclaredGuard is why a NIC entry's declared guard cannot be written
-// (a mode other than on or off, an allowed entry that is not an address or
-// prefix), or "": the checks create applies.
+// (a mode other than on or off; allowed addresses NormalizeGuardAddresses
+// refuses), or "": the checks create applies, by the same validator.
 func InvalidDeclaredGuard(att *pb.NetworkAttachment) string {
 	switch strings.ToLower(strings.TrimSpace(att.GetSpoofGuard())) {
 	case "", "on", "off":
 	default:
 		return fmt.Sprintf("spoof-guard %q: want on or off", att.GetSpoofGuard())
 	}
-	for _, a := range att.GetAllowedAddresses() {
-		s := strings.TrimSpace(a)
-		if s == "" {
-			continue
-		}
-		if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
-			continue
-		}
-		if ad, err := netip.ParseAddr(s); err == nil && ad.Zone() == "" {
-			continue
-		}
-		return fmt.Sprintf("allowed address %q is not an IP address or prefix", a)
+	if _, err := NormalizeGuardAddresses(att.GetAllowedAddresses()); err != nil {
+		return "allowed addresses: " + err.Error()
 	}
 	return ""
 }

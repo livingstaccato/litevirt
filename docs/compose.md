@@ -1483,9 +1483,9 @@ bypasses the bridge where guards are enforced; the NIC has no guard`).
 Creating the VM leaves the settings out, and redeploying the unchanged file
 plans no change. `lv run`, `lv attach-nic` and `lv firewall nic-guard set` refuse guard
 settings on such a NIC outright. A declared guard that create would refuse,
-such as a `spoof-guard:` other than `on` or `off`, or an `allowed-addresses:`
-entry that is not an address or prefix, is withheld from a restore with that
-reason.
+such as a `spoof-guard:` other than `on` or `off`, an `allowed-addresses:`
+entry that is not an address or prefix, or more than 64 distinct allowed
+addresses, is withheld from a restore with that reason.
 
 The plan and the deploy decide by the same rules. When `up` comes to restore
 a VM's NIC security, it checks every restore again against the rows as they

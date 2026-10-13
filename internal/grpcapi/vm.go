@@ -123,6 +123,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if _, recreate := replacedVMFor(ctx, spec.Name); recreate {
 		guardAdmit = admitRecreate
 	}
+	// A spec replayed rather than asked for (a re-create, or the owner leg of
+	// a create its entry node admitted) loses a guard its NIC's network could
+	// never enforce, with a warning; only new input is refused for one. spec
+	// is req.Spec, so a forward carries the result.
+	if guardAdmit == admitRecreate || s.admittedByEntryNode(ctx) {
+		s.leaveOutUnenforcedGuards(ctx, spec)
+	}
 	guardDec, err := s.admitNICGuards(ctx, spec.Name, spec.Network, guardAdmit)
 	if err != nil {
 		return nil, err
@@ -3968,6 +3975,18 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	}
 	if err := s.judgeRecreateOn(rctx, spec, host); err != nil {
 		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+	// The create's guard admission, as the re-create of this VM it will be,
+	// and — unplaced — its PCI devices' placement with what this VM holds
+	// released: both refusals the create would otherwise make after the
+	// teardown (round 4, R1; a stack's re-create runs both too).
+	perr := s.preflightRecreateGuards(rctx, spec, vm)
+	if perr == nil && !placed {
+		perr = s.preflightRecreateDevices(rctx, spec, vm)
+	}
+	if perr != nil {
+		st := status.Convert(perr)
 		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
 	}
 	// Its iSCSI LUNs too: the claim is judged now and moved to an allocation

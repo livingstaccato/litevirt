@@ -1734,6 +1734,13 @@ func (s *Server) plannedVMSpec(action planner.VMAction, f *compose.File) (*pb.VM
 		if err != nil {
 			return nil, fmt.Errorf("build VM spec for %q: %w", action.VMName, err)
 		}
+		// As the planner's spec: a guard its NIC's network cannot enforce is
+		// left out, not handed to a create that refuses it.
+		for _, note := range compose.StripUnenforcedGuards(spec, func(n string) string {
+			return guardUnenforcedOnNetwork(context.Background(), s.db, n)
+		}) {
+			slog.Warn("compose: "+note, "vm", action.VMName)
+		}
 	}
 
 	// Pin placement to the planner-resolved host.

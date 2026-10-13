@@ -2,6 +2,7 @@ package compose
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -407,11 +408,22 @@ func TestGate_AGuardOnAnUnenforcedNetworkIsNoDrift(t *testing.T) {
 // A declared guard create would refuse (a bad mode, an address that does not
 // parse) is withheld with why, not planned for the executor to refuse.
 func TestGate_AnInvalidDeclaredGuardIsWithheld(t *testing.T) {
-	for _, att := range []*pb.NetworkAttachment{{SpoofGuard: "enabled"}, {AllowedAddresses: []string{"not-an-ip"}}} {
+	// Round 4, R2: more allowed addresses than a record may hold is refused
+	// by the record store, so it is withheld too — by the same validator.
+	var tooMany []string
+	for i := 0; i <= MaxGuardAddresses; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("10.9.%d.%d", i/256, i%256))
+	}
+	for _, att := range []*pb.NetworkAttachment{{SpoofGuard: "enabled"}, {AllowedAddresses: []string{"not-an-ip"}},
+		{AllowedAddresses: tooMany}} {
 		p, w := gated(nicSpec(att), nicSpec(&pb.NetworkAttachment{}), nil, NICSecurityGate{AllowWeaken: true})
 		if len(p.MetadataChanges) != 0 || !strings.Contains(w, "the file's guard is invalid") {
 			t.Errorf("%v: plan %+v warnings %q", att, p.MetadataChanges, w)
 		}
+	}
+	// Exactly the cap is a valid guard.
+	if why := InvalidDeclaredGuard(&pb.NetworkAttachment{AllowedAddresses: tooMany[:MaxGuardAddresses]}); why != "" {
+		t.Errorf("%d addresses refused: %s", MaxGuardAddresses, why)
 	}
 }
 

@@ -193,9 +193,6 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 			if w.mode, err = normalizeNICGuardMode(mode); err != nil {
 				return refuse(i, n.Network, "guard", status.Convert(err).Message())
 			}
-			if _, err := corrosion.NormalizeNICGuardAddresses(want.GetAllowedAddresses()); err != nil {
-				return refuse(i, n.Network, "guard", "allowed addresses: "+err.Error())
-			}
 			if why := gate.GuardUnenforced(n.Network); why != "" {
 				// The plan reports such a guard as not enforced and plans
 				// nothing for it; this is the backstop.

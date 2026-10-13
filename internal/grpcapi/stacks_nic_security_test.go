@@ -400,4 +400,10 @@ func TestAdmitNICGuards_RefusesAGuardOnADirectNIC(t *testing.T) {
 	if _, err := s.admitNICGuards(admin, "x", []*pb.NetworkAttachment{{Name: "wan"}}, admitNew); err != nil {
 		t.Errorf("a direct NIC with no guard settings: %v", err)
 	}
+	// Round 4, R1: a re-create replays a stored spec, which an older build
+	// may have stored with such a guard: it is no record, never a refusal.
+	dec, err := s.admitNICGuards(admin, "x", []*pb.NetworkAttachment{{Name: "wan", SpoofGuard: "on"}}, admitRecreate)
+	if err != nil || len(dec) != 1 || dec[0].carry != nil {
+		t.Errorf("a re-create replaying a guard on a direct NIC: %+v %v, want no refusal and nothing carried", dec, err)
+	}
 }

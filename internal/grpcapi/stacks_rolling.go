@@ -82,6 +82,11 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 				perr = o.s.recreatePreflight(ctx, spec, host)
 			}
 		}
+		// The create's guard admission, as the re-create of cur it will be
+		// (round 4, R1).
+		if perr == nil {
+			perr = o.s.preflightRecreateGuards(ctx, spec, cur)
+		}
 		// A placed re-create was placed with its devices already.
 		if perr == nil && decision == nil {
 			perr = o.s.preflightRecreateDevices(ctx, spec, cur)

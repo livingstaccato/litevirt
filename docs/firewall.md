@@ -477,8 +477,24 @@ with `lv firewall nic-guard set`. A clone's NICs are new NICs: each gets the
 default guard, not its source's relaxations or its source's lack of a record.
 So do the NICs of a renamed promotion (`lv replication promote --new-name`) and of a live
 restore under a new name: a second VM beside the original, with fresh MACs. A
-promotion or restore under the VM's own name is unchanged. A macvtap (`direct`) NIC bypasses
-the bridge and gets no guard; setting one is refused.
+promotion or restore under the VM's own name is unchanged.
+
+**A direct or SR-IOV NIC has no guard.** A macvtap (`direct`) or SR-IOV NIC
+bypasses the bridge where guards are enforced, so it never gets a guard record:
+not at create, `lv attach-nic`, a clone, an import, or a renamed promotion or
+restore. Guard settings asked for on such a NIC are refused rather than
+accepted for a NIC that would silently have none: `lv run`, `lv attach-nic`
+and `lv firewall nic-guard set` all refuse them. A compose file that declares
+one is reported, not refused: every plan names the guard as not enforced, and
+the create leaves it out (see [compose.md](compose.md#security-groups-and-guards-a-file-does-not-declare)).
+A VM created by an earlier build may carry such settings in its stored spec;
+they were never enforced. A rebuild or a stack's re-create replays that spec,
+so it leaves them out instead of refusing, with a warning in the log and a
+`vm.nic_guard.not_enforced` warning event on the VM. The refusal is for new
+input only. A rebuild or a stack's re-create also makes, before it tears the
+VM down, every admission its create will make that the teardown does not
+change, the guard admission among them, so such a refusal leaves the VM as
+it was.
 
 **A re-create keeps each NIC's guard.** A rebuild or a stack's rolling update
 re-creates a VM under a new incarnation. Each of its NICs that is the same NIC

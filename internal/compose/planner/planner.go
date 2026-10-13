@@ -1178,16 +1178,19 @@ func PinAssignedDevices(spec *pb.VMSpec, assigns []DeviceAssignment) {
 }
 
 // guardUnenforcedFrom is compose.GuardUnenforcedOn over the snapshot's network
-// records and the file's own networks (by record name); a network neither
-// names is a bridge.
+// records and, for a network with no record yet (one the deploy creates), the
+// file's own declaration (by record name); a network neither names is a
+// bridge. An existing record wins over the file, as the executor reads only
+// the record, so the two cannot disagree on a mismatched declaration.
 func guardUnenforcedFrom(state *ClusterState, f *compose.File) func(string) string {
 	types := map[string]string{}
 	for _, n := range state.Networks {
 		types[n.Name] = n.Type
 	}
 	for name, def := range f.Networks {
-		if def.Type != "" {
-			types[f.ResolveNetworkName(name)] = def.Type
+		rn := f.ResolveNetworkName(name)
+		if _, recorded := types[rn]; !recorded && def.Type != "" {
+			types[rn] = def.Type
 		}
 	}
 	return func(network string) string { return compose.GuardUnenforcedOn(types[network], network) }

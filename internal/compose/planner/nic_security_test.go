@@ -209,3 +209,20 @@ func TestResolve_AGuardOnADirectNICIsReportedNotPlanned(t *testing.T) {
 		}
 	}
 }
+
+// Round 4 nit: an existing network's record decides whether a guard can be
+// enforced on it, as the executor decides; the file's type counts only for a
+// network the deploy creates.
+func TestGuardUnenforcedFrom_TheRecordWinsOverTheFile(t *testing.T) {
+	f := &compose.File{Name: "st", Networks: map[string]compose.NetworkDef{
+		"lan": {Type: "direct"}, "wan": {Type: "direct"}}}
+	lan, wan := f.ResolveNetworkName("lan"), f.ResolveNetworkName("wan")
+	state := &ClusterState{Networks: []corrosion.NetworkRecord{{Name: lan, Type: "bridge"}}}
+	why := guardUnenforcedFrom(state, f)
+	if why(lan) != "" {
+		t.Errorf("a recorded bridge network judged by the file's type: %q", why(lan))
+	}
+	if why(wan) == "" {
+		t.Error("a network the deploy creates as direct is judged a bridge")
+	}
+}

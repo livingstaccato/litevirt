@@ -28,18 +28,35 @@ func InsertContainerSnapshot(ctx context.Context, c *Client, s ContainerSnapshot
 	if s.Type == "" {
 		s.Type = "tar"
 	}
-	return insertNaturalKeyRow(ctx, c,
-		`SELECT id, deleted_at FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?`,
-		[]interface{}{s.HostName, s.CtName, s.Name}, s.ID,
-		func(id string) []Statement {
-			return []Statement{{SQL: insertContainerSnapshotSQL, Params: []interface{}{
-				id, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), c.NowTS(),
-			}}}
-		},
-		func() Statement {
-			return Statement{SQL: deleteContainerSnapshotSQL, Params: []interface{}{nil, c.NowTS(), s.HostName, s.CtName, s.Name}}
-		})
+	natural := []interface{}{s.HostName, s.CtName, s.Name}
+	for attempt := 0; attempt < naturalKeyAttempts; attempt++ {
+		plan, err := planNaturalKeyRow(ctx, c, containerSnapshotNaturalKeySQL, natural, s.ID)
+		if err != nil {
+			return err
+		}
+		var applied bool
+		if plan.undelete {
+			applied, err = c.ExecuteBatchGuarded(ctx, plan.guard, []Statement{
+				{SQL: insertContainerSnapshotSQL, Params: []interface{}{
+					plan.id, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), c.NowTS(),
+				}},
+				{SQL: deleteContainerSnapshotSQL, Params: []interface{}{nil, c.NowTS(), s.HostName, s.CtName, s.Name}},
+			})
+		} else {
+			applied, err = c.ExecuteBatchGuarded(ctx, plan.guard, []Statement{
+				{SQL: insertContainerSnapshotSQL, Params: []interface{}{
+					plan.id, s.CtName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.Path, nowRFC3339(), c.NowTS(),
+				}},
+			})
+		}
+		if err != nil || applied {
+			return err
+		}
+	}
+	return errNaturalKeyChanged(natural)
 }
+
+const containerSnapshotNaturalKeySQL = `SELECT id, deleted_at FROM container_snapshots WHERE host_name = ? AND ct_name = ? AND name = ?`
 
 const insertContainerSnapshotSQL = `INSERT OR REPLACE INTO container_snapshots
 		   (id, ct_name, host_name, name, state, size_bytes, type, path, created_at, updated_at)

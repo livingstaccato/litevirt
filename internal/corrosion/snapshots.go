@@ -39,34 +39,51 @@ func InsertSnapshot(ctx context.Context, c *Client, s SnapshotRecord) error {
 	if s.Type == "" {
 		s.Type = "disk"
 	}
-	return insertNaturalKeyRow(ctx, c,
-		`SELECT id, deleted_at FROM snapshots WHERE vm_name = ? AND name = ?`,
-		[]interface{}{s.VMName, s.Name}, s.ID,
-		func(id string) []Statement {
-			stmts := []Statement{{SQL: insertSnapshotSQL, Params: []interface{}{
-				id, s.VMName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.VMStatePath, s.VMStateBytes, nowRFC3339(), c.NowTS(),
-			}}}
-			return stmts
-		},
-		// The registered tombstone shape with a NULL deleted_at, stamped after
-		// the insert. The insert alone does not clear a peer's tombstone: a
-		// receiver applies a replicated INSERT as a column-preserving upsert,
-		// and deleted_at is not among its columns. Every released receiver
-		// already applies this shape (per-row LWW by natural key).
-		func() Statement {
-			return Statement{SQL: deleteSnapshotSQL, Params: []interface{}{nil, c.NowTS(), s.VMName, s.Name}}
-		})
+	natural := []interface{}{s.VMName, s.Name}
+	for attempt := 0; attempt < naturalKeyAttempts; attempt++ {
+		plan, err := planNaturalKeyRow(ctx, c, snapshotNaturalKeySQL, natural, s.ID)
+		if err != nil {
+			return err
+		}
+		var applied bool
+		if plan.undelete {
+			// The registered tombstone shape with a NULL deleted_at, stamped
+			// after the insert. The insert alone does not clear a peer's
+			// tombstone: a receiver applies a replicated INSERT as a
+			// column-preserving upsert, and deleted_at is not among its
+			// columns. Every released receiver already applies this shape
+			// (per-row LWW by natural key).
+			applied, err = c.ExecuteBatchGuarded(ctx, plan.guard, []Statement{
+				{SQL: insertSnapshotSQL, Params: []interface{}{
+					plan.id, s.VMName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.VMStatePath, s.VMStateBytes, nowRFC3339(), c.NowTS(),
+				}},
+				{SQL: deleteSnapshotSQL, Params: []interface{}{nil, c.NowTS(), s.VMName, s.Name}},
+			})
+		} else {
+			applied, err = c.ExecuteBatchGuarded(ctx, plan.guard, []Statement{
+				{SQL: insertSnapshotSQL, Params: []interface{}{
+					plan.id, s.VMName, s.HostName, s.Name, s.State, s.SizeBytes, s.Type, s.VMStatePath, s.VMStateBytes, nowRFC3339(), c.NowTS(),
+				}},
+			})
+		}
+		if err != nil || applied {
+			return err
+		}
+	}
+	return errNaturalKeyChanged(natural)
 }
+
+const snapshotNaturalKeySQL = `SELECT id, deleted_at FROM snapshots WHERE vm_name = ? AND name = ?`
 
 const insertSnapshotSQL = `INSERT OR REPLACE INTO snapshots (id, vm_name, host_name, name, state, size_bytes, type, vmstate_path, vmstate_size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 const deleteSnapshotSQL = `UPDATE snapshots SET deleted_at = ?, updated_at = ? WHERE vm_name = ? AND name = ?`
 
-// insertNaturalKeyRow writes a natural-key identity table's row under the id
-// of the row this node already holds for that natural key, live or deleted,
-// and un-deletes it when it is a tombstone (undelete, appended after the
-// insert). Only when no row holds the name does it use callerID, or mint one.
+// naturalKeyPlan is how a natural-key identity table's insert is written:
+// under the id of the row this node already holds for that natural key, live
+// or deleted, un-deleting it when it is a tombstone. Only when no row holds the
+// name does it use the caller's id, or mint one.
 //
 // Re-using the id is what makes delete-then-recreate replicate: the new row is
 // the same primary key every peer already holds, so it applies under ordinary
@@ -74,42 +91,45 @@ const deleteSnapshotSQL = `UPDATE snapshots SET deleted_at = ?, updated_at = ? W
 // id is not honoured over an existing row for the same reason — a different id
 // over a tombstone is exactly the write an older peer can never apply.
 //
-// The lookup and the write are one transaction: the write's guard re-reads the
-// natural key and declines if another writer changed it in between, and the
-// decision is made again (at most a few times) from what it then finds.
-func insertNaturalKeyRow(ctx context.Context, c *Client, lookup string, natural []interface{}, callerID string,
-	build func(id string) []Statement, undelete func() Statement) error {
-	for attempt := 0; attempt < 3; attempt++ {
-		prior, deleted, found, err := naturalKeyRow(ctx, c, lookup, natural)
-		if err != nil {
-			return err
-		}
-		id := prior
-		if !found {
-			id = callerID
-			if id == "" {
-				id = uuid.New().String()
-			}
-		}
-		stmts := build(id)
-		if found && deleted {
-			stmts = append(stmts, undelete())
-		}
-		applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-			var gotID, gotDeleted sql.NullString
-			err := tx.QueryRow(lookup, natural...).Scan(&gotID, &gotDeleted)
-			if errors.Is(err, sql.ErrNoRows) {
-				return !found, nil
-			}
-			if err != nil {
-				return false, err
-			}
-			return found && gotID.String == prior && (gotDeleted.Valid && gotDeleted.String != "") == deleted, nil
-		}, stmts)
-		if err != nil || applied {
-			return err
+// The lookup and the write are one transaction: guard re-reads the natural key
+// inside the write's transaction and declines if another writer changed it in
+// between; the caller then plans again (naturalKeyAttempts times at most). The
+// statements are spelled out at each call site so stmtshapecheck can see them.
+type naturalKeyPlan struct {
+	id       string
+	undelete bool
+	guard    func(tx *sql.Tx) (bool, error)
+}
+
+const naturalKeyAttempts = 3
+
+func planNaturalKeyRow(ctx context.Context, c *Client, lookup string, natural []interface{}, callerID string) (naturalKeyPlan, error) {
+	prior, deleted, found, err := naturalKeyRow(ctx, c, lookup, natural)
+	if err != nil {
+		return naturalKeyPlan{}, err
+	}
+	id := prior
+	if !found {
+		id = callerID
+		if id == "" {
+			id = uuid.New().String()
 		}
 	}
+	guard := func(tx *sql.Tx) (bool, error) {
+		var gotID, gotDeleted sql.NullString
+		err := tx.QueryRow(lookup, natural...).Scan(&gotID, &gotDeleted)
+		if errors.Is(err, sql.ErrNoRows) {
+			return !found, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return found && gotID.String == prior && (gotDeleted.Valid && gotDeleted.String != "") == deleted, nil
+	}
+	return naturalKeyPlan{id: id, undelete: found && deleted, guard: guard}, nil
+}
+
+func errNaturalKeyChanged(natural []interface{}) error {
 	return fmt.Errorf("record %v: the name kept changing under a concurrent writer", natural)
 }
 

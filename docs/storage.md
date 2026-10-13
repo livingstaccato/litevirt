@@ -1090,7 +1090,9 @@ seconds.
 If the create fails after the teardown for any reason, the error says what was
 torn down and where, and the spec the create was given is kept on that node
 under `<data_dir>/recreate-failed/`, one file per failure, readable by root
-only, to re-create the VM from. The directory keeps the newest 50 files and
+only, to re-create the VM from. Guard settings on a NIC that cannot be guarded
+(a direct or SR-IOV NIC, docs/firewall.md) are left out of it, as the create
+left them out. The directory keeps the newest 50 files and
 none older than 30 days; copy out a spec you still need.
 
 A disk on an iSCSI LUN is not torn down: the LUN keeps the guest's data. Create

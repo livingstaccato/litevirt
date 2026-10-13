@@ -83,10 +83,19 @@ type CurrentVM struct {
 	// it only those four are compared and an edit to any other field
 	// (cpu-mode, labels, disk topology, …) is invisible.
 	Spec *pb.VMSpec
+	// LiveNICs are the VM's NICs as the firewall enforces them now, when the
+	// caller has them; Spec then carries their security (planner).
+	LiveNICs []LiveNIC
 }
 
 // Build produces an execution plan by diffing desired (compose file) vs current state.
 func Build(f *File, current []CurrentVM) (*Plan, error) {
+	return BuildGated(f, current, NICSecurityGate{})
+}
+
+// BuildGated is Build with the deploy's NIC security gate: what it may
+// restore of a NIC's security groups and guard (ApplyNICSecurityGate).
+func BuildGated(f *File, current []CurrentVM, gate NICSecurityGate) (*Plan, error) {
 	plan := &Plan{StackName: f.Name}
 
 	// Index current VMs by name for fast lookup.
@@ -146,6 +155,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			changed := false
 			detail := ""
 			var change ChangePlan
+			var nicWarnings []string
 			classified := cur.Spec != nil
 			if classified {
 				desired, err := BuildVMSpec(instanceName, baseName, &vmDef, f)
@@ -153,6 +163,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 					return nil, fmt.Errorf("build spec for %s: %w", instanceName, err)
 				}
 				change = Classify(desired, cur.Spec, StoredDisksFromSpec(cur.Spec))
+				nicWarnings = ApplyNICSecurityGate(instanceName, &change, desired, cur.Spec, cur.LiveNICs, gate)
 				if change.Max() != ActionNoChange {
 					detail = " " + change.Reasons()
 					changed = true
@@ -184,6 +195,12 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			warning := ""
 			if vmDef.CloudInit == nil && (cur.Spec.GetCloudInit() != nil || (cur.Spec == nil && cur.CloudInitHash != "")) {
 				warning = cloudInitKeptWarning
+			}
+			for _, w := range nicWarnings {
+				if warning != "" {
+					warning += "; "
+				}
+				warning += w
 			}
 
 			// VMs in transient or error states are not in a stable steady

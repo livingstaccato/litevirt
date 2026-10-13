@@ -218,4 +218,32 @@ vms:
 	if got := spiceLink(t, addr, password+"x"); got == spiceLinkOK {
 		t.Fatal("a SPICE link with a WRONG password through lv spice --listen was accepted: the relay must add no access")
 	}
+
+	// The console is in the audit log (docs/audit-log.md "Console
+	// sessions"): the info call that handed out the password, and the
+	// session's open and close rows (the close lands once no channel has
+	// been open for 2 s). No row carries the password.
+	var rows string
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		rows = lv(t, "audit", "ls", "--target", vm, "--action", "vm.console.*", "--limit", "100")
+		if (strings.Contains(rows, "vm.console.credential") && strings.Contains(rows, "vm.console.open") &&
+			strings.Contains(rows, "vm.console.close")) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	for _, want := range []string{"vm.console.credential", "vm.console.open", "vm.console.close", "kind=spice", "owner=" + host} {
+		if !strings.Contains(rows, want) {
+			t.Errorf("lv audit ls for %s has no %q:\n%s", vm, want, rows)
+		}
+	}
+	if strings.Contains(rows, password) {
+		t.Error("a console audit row carries the SPICE password")
+	}
+	// The VM's host records the session it carried for this one, naming the
+	// relay (as the user only when it verified a forwarded bearer itself).
+	if host != localHost && !strings.Contains(rows, "via_peer="+localHost) {
+		t.Errorf("the VM's host %s recorded no session relayed by %s (via_peer=%s):\n%s", host, localHost, localHost, rows)
+	}
 }

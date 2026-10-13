@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -136,7 +138,15 @@ func (s *Server) FinishWebAuthnLogin(ctx context.Context, req *pb.FinishWebAuthn
 		username = u.Username
 	}
 	if err := s.webauthn.FinishLogin(ctx, username, req.AssertionJson); err != nil {
-		s.loginThrottle.fail(throttleKey)
+		// A finish with no ceremony in flight evaluated no assertion, so it is
+		// not a guess and is not counted: counting it would let fresh usernames
+		// grow the throttle table at request rate, with no bcrypt cost behind
+		// them. A ceremony exists only for an account with an enrolled
+		// credential (BeginLogin), so the entries this path adds are bounded by
+		// those accounts, each held to its ceiling.
+		if !errors.Is(err, auth.ErrNoWebAuthnCeremony) {
+			s.loginThrottle.fail(throttleKey)
+		}
 		s.audit(ctx, "auth.login", req.Username, "webauthn invalid assertion ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Unauthenticated, "finish login: %v", err)
 	}

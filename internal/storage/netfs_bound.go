@@ -28,7 +28,7 @@ import (
 //     caller is delayed once per mount, not once per path or per pass.
 
 // fsCallBound is how long Bounded waits; tests shorten it.
-var fsCallBound = 5 * time.Second
+var fsCallBound = newTestHook(5 * time.Second)
 
 // FSNoAnswerError is a call Bounded stopped waiting for.
 type FSNoAnswerError struct {
@@ -85,7 +85,7 @@ var (
 // Only a call of the same op, on the same path, with the same result type T
 // is joined: a joined call returns exactly what that call returns.
 func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
-	return boundedFor(fsCallBound, op, path, fn)
+	return boundedFor(fsCallBound.get(), op, path, fn)
 }
 
 // BoundedOuter is Bounded for a call that itself makes bounded calls (a VM
@@ -93,7 +93,7 @@ func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
 // four bounds, so the calls inside it give up, and it goes on past them,
 // before it does.
 func BoundedOuter[T any](op, path string, fn func() (T, error)) (T, error) {
-	return boundedFor(4*fsCallBound, op, path, fn)
+	return boundedFor(4*fsCallBound.get(), op, path, fn)
 }
 
 func boundedFor[T any](bound time.Duration, op, path string, fn func() (T, error)) (T, error) {
@@ -233,7 +233,7 @@ func (t MountTable) isMountPoint(dir string) bool {
 }
 
 // resolvePathFn is how a path's symlinks are resolved; tests replace it.
-var resolvePathFn = resolveExisting
+var resolvePathFn = newTestHook(resolveExisting)
 
 // resolveBounded is resolveExisting without letting a network filesystem
 // that does not answer hold the caller. A path the mount table has as a mount
@@ -251,12 +251,12 @@ func resolveBounded(t *MountTable, p string) (string, error) {
 	if t != nil && t.isMountPoint(clean) {
 		return clean, nil
 	}
-	resolve := resolvePathFn
+	resolve := resolvePathFn.get()
 	return Bounded("resolve the symlinks of", clean, func() (string, error) { return resolve(clean), nil })
 }
 
 // evalSymlinksFn is filepath.EvalSymlinks; tests replace it.
-var evalSymlinksFn = filepath.EvalSymlinks
+var evalSymlinksFn = newTestHook(filepath.EvalSymlinks)
 
 // EvalSymlinksBounded is filepath.EvalSymlinks without letting a network
 // filesystem that does not answer hold the caller (lab 2 N-1: every VM start
@@ -270,7 +270,7 @@ func EvalSymlinksBounded(p string) (string, error) {
 	if t, err := ReadMountTable(); err == nil && t.isMountPoint(clean) {
 		return clean, nil
 	}
-	eval := evalSymlinksFn
+	eval := evalSymlinksFn.get()
 	return Bounded("evaluate the symlinks of", clean, func() (string, error) { return eval(clean) })
 }
 
@@ -304,9 +304,7 @@ func PrimeBounded(paths ...string) {
 // OverrideEvalSymlinksForTest replaces how EvalSymlinksBounded evaluates a
 // path, for tests in other packages. It returns the restore function.
 func OverrideEvalSymlinksForTest(eval func(string) (string, error)) func() {
-	prev := evalSymlinksFn
-	evalSymlinksFn = eval
-	return func() { evalSymlinksFn = prev }
+	return evalSymlinksFn.set(eval)
 }
 
 // pathFormsBounded is pathForms under resolveBounded: p cleaned, plus what it
@@ -327,9 +325,7 @@ func pathFormsBounded(t *MountTable, p string) ([]string, error) {
 // OverrideFSCallBoundForTest sets how long Bounded waits, for tests in other
 // packages. It returns the restore function.
 func OverrideFSCallBoundForTest(d time.Duration) func() {
-	prev := fsCallBound
-	fsCallBound = d
-	return func() { fsCallBound = prev }
+	return fsCallBound.set(d)
 }
 
 // OverridePathResolverForTest replaces how a path's symlinks are resolved by
@@ -337,7 +333,5 @@ func OverrideFSCallBoundForTest(d time.Duration) func() {
 // IsDataDirDisks), for tests in other packages. It returns the restore
 // function.
 func OverridePathResolverForTest(resolve func(string) string) func() {
-	prev := resolvePathFn
-	resolvePathFn = resolve
-	return func() { resolvePathFn = prev }
+	return resolvePathFn.set(resolve)
 }

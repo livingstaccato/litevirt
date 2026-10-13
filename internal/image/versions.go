@@ -248,11 +248,24 @@ func (s *Store) EnsureProvenance(path string, publishedAt time.Time) (Provenance
 }
 
 // StoreFiles is every image file in the store, with the image it belongs to.
+// A store whose directory cannot be listed reads as empty: a caller that
+// decides anything from what is NOT listed uses ListStoreFiles.
 func (s *Store) StoreFiles() map[string]string {
+	out, _ := s.ListStoreFiles(os.ReadDir)
+	return out
+}
+
+// ListStoreFiles is StoreFiles, listing the directory with readDir, and
+// reporting a listing that failed (an empty map with the error). A store
+// directory that does not exist yet holds no files: that is no error.
+func (s *Store) ListStoreFiles(readDir func(string) ([]os.DirEntry, error)) (map[string]string, error) {
 	out := map[string]string{}
-	ents, err := os.ReadDir(s.imageDir)
+	ents, err := readDir(s.imageDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return out, nil
+	}
 	if err != nil {
-		return out
+		return out, err
 	}
 	for _, e := range ents {
 		if !e.Type().IsRegular() {
@@ -263,7 +276,7 @@ func (s *Store) StoreFiles() map[string]string {
 			out[p] = name
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ImageDir is the store's image directory.

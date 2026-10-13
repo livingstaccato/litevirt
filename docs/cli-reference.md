@@ -21,8 +21,15 @@ lv login --realm oidc:<name>           # Sign in through an OIDC realm (browser 
 lv logout                              # Log out and remove stored credentials
 lv whoami                              # Show current authenticated identity
 lv session ls [--user <name>]          # List active sessions (admin: any user)
-lv session revoke <session-id>         # Revoke a session immediately
+lv session revoke <session-id>         # Revoke a session immediately (the ID ls shows, or any unambiguous prefix of 8+ chars)
 ```
+
+`lv session ls` shows a 12-character handle for each session (`*` marks your
+current one); the full id is the session's bearer secret and the daemon never
+returns it. `lv session revoke`
+takes that short form: a prefix resolves only among the sessions you may revoke
+(your own; an admin's, anyone's), and one that matches more than one is refused
+with the matches listed.
 
 ## Two-factor authentication
 
@@ -642,7 +649,7 @@ lv image import <file> --name <name>
 #   sha256 recorded when it was published is put back from byte-identical
 #   content (the reconciler fetches it from a peer); any other content becomes
 #   a new version, and an unhealable base under disks is logged at ERROR.
-lv image prune [<image>] [--host <host>] [--dry-run]
+lv image prune [<image>] [--host <host>] [--dry-run] [--version <file>]
 #   Removes, on one host, the image files no disk there is built on — judged
 #   from every visible disk's backing header, never from the image's name —
 #   keeping each image's current version, every version a kept image is
@@ -655,8 +662,25 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   Needs image.import. Nothing is removed unless the whole view can be read
 #   within 2 minutes: a pool directory, a disk header, an nfs share that is
 #   not mounted or a backup repo that cannot be read refuses the prune,
-#   saying which. A refresh prunes the image's older unused versions by
-#   itself, in the background, keeping the one it superseded.
+#   saying which. A directory (the image store's own included) whose
+#   listing does not answer within 5 s refuses it at once, with "nothing is
+#   pruned". On an image store on a network filesystem (nfs, cifs, ceph,
+#   fuse, ...), or one whose filesystem cannot be told, no version is
+#   removed: other hosts may share the store, and a disk on their own
+#   storage, which this host cannot see, may be built on it. Each such
+#   version is listed as kept, with that reason. This protects only once
+#   every host sharing the store runs a build with it: an older host still
+#   prunes by its own disks alone.
+#   --version <file> removes that one file of <image> (its name as listed,
+#   or at least 8 digits of the digest after '@') even on such a store: you
+#   assert that no other host's disk is built on it. Every other rule above
+#   still keeps it, saying why. A daemon that does not know --version is
+#   detected with a dry run first, and nothing is removed.
+#   A refresh prunes the image's older unused versions by
+#   itself, in the background, keeping the one it superseded. What it keeps
+#   only because the store may be shared is logged at WARN after every
+#   refresh, with the bytes, and notified (image.versions_kept) at most
+#   daily per image.
 #   A deleted image (lv image rm) has no current version to keep: prune
 #   removes all its files, under the rules lv image rm lists below, and
 #   lists each one it keeps with the reason.
@@ -1217,11 +1241,14 @@ enabled with no expiry, and until the cluster upgrade has finished (the release 
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice] [--role <role>]
+lv role ls [--principal user:alice@local] [--role <role>]
 ```
 
-Principals are `user:<name>`, `group:<role>@<realm>` (a legacy role), or a
-directory group `group:<realm>/<group>` (an LDAP group is its DN). Paths are RBAC
+Principals are `user:<name>@<realm>` (a local account is `user:<name>@local`),
+`group:<role>@<realm>` (a legacy role), or a directory group
+`group:<realm>/<group>` (an LDAP group is its DN). Callers are matched as
+`user:<name>@<realm>`, so a bare `user:<name>` would grant nothing: `lv role
+grant` and the web UI refuse it, and warn if an older daemon stored one anyway. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
 

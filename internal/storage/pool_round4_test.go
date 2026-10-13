@@ -15,12 +15,10 @@ import (
 // of fstype with per-mount options flags.
 func mountInfoWith(t *testing.T, dir, flags, fstype, source string) {
 	t.Helper()
-	prev := readMountInfo
-	readMountInfo = func() ([]byte, error) {
+	t.Cleanup(readMountInfo.set(func() ([]byte, error) {
 		return []byte(fmt.Sprintf("36 1 0:50 / %s %s shared:7 - %s %s rw,vers=4.2\n",
 			strings.ReplaceAll(dir, " ", "\\040"), flags, fstype, source)), nil
-	}
-	t.Cleanup(func() { readMountInfo = prev })
+	}))
 }
 
 const hardenedFlags = "rw,nosuid,nodev,noexec,nosymfollow,relatime"
@@ -170,13 +168,11 @@ func TestNFSBackingOf(t *testing.T) {
 	if err := os.Symlink(filepath.Join(nfs, "sub"), link); err != nil {
 		t.Fatal(err)
 	}
-	prev := readMountInfo
-	readMountInfo = func() ([]byte, error) {
+	defer readMountInfo.set(func() ([]byte, error) {
 		return []byte(fmt.Sprintf("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"+
 			"40 1 0:60 / %s %s - nfs4 NAS:/bravo/ rw\n"+
 			"41 40 8:2 / %s rw - ext4 /dev/sdb1 rw\n", nfs, hardenedFlags, inner)), nil
-	}
-	defer func() { readMountInfo = prev }()
+	})()
 	mt, err := ReadMountTable()
 	if err != nil {
 		t.Fatal(err)

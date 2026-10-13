@@ -1,19 +1,6 @@
 package daemon
 
-import (
-	"log/slog"
-	"time"
-)
-
-// gracefulStopWait is how long a shutdown lets in-flight RPCs finish before
-// the gRPC server is stopped outright.
-const gracefulStopWait = 5 * time.Second
-
-// grpcStopper is the gRPC server, as stopServing stops it.
-type grpcStopper interface {
-	GracefulStop()
-	Stop()
-}
+import "time"
 
 // consoleAuditFlusher is the console audit, as stopServing ends it
 // (grpcapi.Server: docs/audit-log.md "Console sessions").
@@ -27,25 +14,31 @@ type consoleAuditFlusher interface {
 //
 //  1. MarkConsoleShutdown: a console session that ends from here on ended
 //     because of the stop;
-//  2. GracefulStop, or Stop after grace (console streams never end on their
-//     own, so with one open this always takes the full grace);
-//  3. afterStop (what must still run with the database open);
-//  4. FlushConsoleAudit: every open session's close row, and every row a
+//  2. stopGRPC: GracefulStop, then Stop once graceful has passed (console
+//     streams never end on their own, so with one open this always takes the
+//     full graceful bound). It returns within graceful+forced whatever the
+//     handlers do: a Stop that is itself stuck behind a handler in the kernel
+//     (lab 2 N-5) is given up on and left running, with that handler;
+//  3. close(stopped): Run's awaitServe stops waiting on Serve, which returns
+//     only once a stop has finished — so it is closed on both of stopGRPC's
+//     exits, before anything below can wait;
+//  4. afterStop (what must still run with the database open);
+//  5. FlushConsoleAudit: every open session's close row, and every row a
 //     handler ended by the stop is still writing, before the caller closes
-//     the database. It is bounded (grpcapi.consoleFlushTimeout).
-func stopServing(srv grpcStopper, consoles consoleAuditFlusher, grace time.Duration, afterStop func()) {
+//     the database. It is bounded (grpcapi.consoleFlushTimeout), and safe when
+//     step 2 gave up: a console handler still running is either still live
+//     (the flush closes it, and its later end finds it closed) or holds a
+//     claim the flush waits for, and a row it decides after the flush is
+//     refused.
+//
+// There is no Stop call here outside stopGRPC: an inline Stop after the
+// graceful bound can block on the server's mutex behind GracefulStop's wait
+// for a stuck handler, which is the hang stopGRPC bounds.
+func stopServing(srv grpcStopper, consoles consoleAuditFlusher, graceful, forced time.Duration,
+	stopped chan<- struct{}, afterStop func()) {
 	consoles.MarkConsoleShutdown()
-	done := make(chan struct{})
-	go func() {
-		srv.GracefulStop()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(grace):
-		slog.Warn("graceful shutdown timed out, forcing stop")
-		srv.Stop()
-	}
+	stopGRPC(srv, graceful, forced)
+	close(stopped)
 	afterStop()
 	consoles.FlushConsoleAudit()
 }

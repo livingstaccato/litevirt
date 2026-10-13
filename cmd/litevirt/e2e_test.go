@@ -67,6 +67,12 @@ type mockClient struct {
 
 	// removeImageUnimplemented makes RemoveImage answer as an older serving host.
 	removeImageUnimplemented bool
+
+	lastGrantRoleReq *pb.GrantRoleRequest
+	grantRoleResp    *pb.GrantRoleResponse
+	revokedSession   string
+	revokeSessionErr error
+	sessions         []*pb.Session
 }
 
 func newMockClient() *mockClient {
@@ -453,7 +459,11 @@ func (m *mockClient) RestoreFromBackup(_ context.Context, _ *pb.RestoreFromBacku
 func (m *mockClient) RestoreLive(_ context.Context, _ *pb.RestoreLiveRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreLiveProgress], error) {
 	return &fakeStream[pb.RestoreLiveProgress]{}, nil
 }
-func (m *mockClient) GrantRole(_ context.Context, _ *pb.GrantRoleRequest, _ ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+func (m *mockClient) GrantRole(_ context.Context, in *pb.GrantRoleRequest, _ ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+	m.lastGrantRoleReq = in
+	if m.grantRoleResp != nil {
+		return m.grantRoleResp, nil
+	}
 	return &pb.GrantRoleResponse{Binding: &pb.RoleBinding{}}, nil
 }
 func (m *mockClient) RevokeRole(_ context.Context, _ *pb.RevokeRoleRequest, _ ...grpc.CallOption) (*pb.RevokeRoleResponse, error) {
@@ -494,9 +504,13 @@ func (m *mockClient) Logout(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallO
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) ListSessions(_ context.Context, _ *pb.ListSessionsRequest, _ ...grpc.CallOption) (*pb.ListSessionsResponse, error) {
-	return &pb.ListSessionsResponse{}, nil
+	return &pb.ListSessionsResponse{Sessions: m.sessions}, nil
 }
-func (m *mockClient) RevokeSession(_ context.Context, _ *pb.RevokeSessionRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (m *mockClient) RevokeSession(_ context.Context, in *pb.RevokeSessionRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.revokedSession = in.Id
+	if m.revokeSessionErr != nil {
+		return nil, m.revokeSessionErr
+	}
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) ListTwoFactors(_ context.Context, _ *pb.ListTwoFactorsRequest, _ ...grpc.CallOption) (*pb.ListTwoFactorsResponse, error) {

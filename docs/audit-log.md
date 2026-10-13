@@ -271,13 +271,18 @@ under its own budget, so nothing is lost cluster-wide.
 **Stopping the daemon.** A graceful stop writes the close row of every session
 still open, `ended=daemon-stop`, and of every SPICE session waiting out its
 linger, and of any session accepted while it runs, and waits for the close
-rows of the sessions the stop ended, before the database closes. Each session gets exactly one close row. The stop marks
-the console audit before it stops serving, so a session that ends in that
-window (up to 5 seconds, while the daemon lets RPCs finish) without an error
-also reads `ended=daemon-stop`; one that ends with an error keeps it. The
-flush is bounded at 3 seconds: past that, against a stalled database, rows
-still being written are logged as lost rather than holding up the rest of the
-shutdown. A crash leaves the open row without a close row.
+rows of the sessions the stop ended, before the database closes. Each session
+gets exactly one close row. The stop marks the console audit before it stops
+serving, so a session that ends in that window (up to 5 seconds while the
+daemon lets RPCs finish, and up to 5 more while it stops the server outright)
+without an error also reads `ended=daemon-stop`; one that ends with an error
+keeps it. This holds when the daemon gives up on stopping the server because
+a request is stuck on storage that does not answer: every console stream has
+been cancelled by then, and the close rows are written all the same. The
+flush is bounded at 3 seconds, plus at most one row already being written
+when that passes: past that, against a stalled database, rows still being
+written are logged as lost rather than holding up the rest of the shutdown.
+A crash leaves the open row without a close row.
 
 **Writes.** A row that cannot be written (the database failing, its 10-second
 bound) is logged and the session goes on: audit writes here degrade rather than
@@ -1033,6 +1038,24 @@ of actions, today just `user.reset-admin` (see
 [auth.md](auth.md#recovering-the-admin-account-lv-user-reset-admin)). An entry
 for any other action, or one that does not parse, is renamed to `<id>.rejected`,
 left beside the journal for whoever investigates, and logged at error level.
+
+## Image prune
+
+A prune that removes image files writes a row on the node the operator
+called, as that operator (a peer the call is forwarded to writes none):
+
+| Action | When | Detail | Result |
+|---|---|---|---|
+| `image.prune_version` | `lv image prune <image> --version <file>`: one file removed on the operator's word that no other host's disk is built on it, although the store may be shared | `host=`, `version=`, `removed=`, `bytes=`; or why the file was kept; or the error | `success`, `kept` or `error` |
+| `image.prune` | `lv image prune` removed at least one file | `host=`, `removed=`, `bytes=`; or the error | `success` or `error` |
+
+Target is `images/<image>` (`images` for a prune of every image). A dry run, a
+prune that removed nothing, a refresh's background prune and each host's part
+of `lv image rm` write no row.
+
+```bash
+lv audit ls --action image.prune_version
+```
 
 ## Operational notes
 

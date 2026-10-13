@@ -661,8 +661,15 @@ var consoleCloseWriteHook func()
 // still running) and every pending refusal summary, and waits for every row
 // a handler had already taken on — the close of a session its handler ended
 // during the stop is that handler's to write, exactly once. Nothing is
-// written after it. It returns within consoleFlushTimeout. Call it after the
-// gRPC server has stopped and before the database closes.
+// written after it. It returns within consoleFlushTimeout, plus at most one
+// write already inside the audit insert when that passes. Call it once the
+// gRPC server's stop has returned or been given up on (daemon stopGRPC: a
+// Stop stuck behind a handler in the kernel is left running), and before the
+// database closes. A stop given up on is safe here: Stop has cancelled every
+// console stream before it can block, and a console handler still running
+// is either still live, so this closes it daemon-stop and its later end finds
+// it closed, or holds a claim this waits for; anything it decides after this
+// returns is refused.
 func (s *Server) FlushConsoleAudit() {
 	ctx, cancel := context.WithTimeout(context.Background(), consoleFlushTimeout)
 	defer cancel()

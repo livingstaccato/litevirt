@@ -15,6 +15,7 @@ type recorder struct {
 	mu    sync.Mutex
 	steps []string
 	stop  chan struct{} // GracefulStop blocks until Stop when set
+	hang  chan struct{} // GracefulStop and Stop both block on it when set: a stop stuck behind a handler in the kernel
 }
 
 func (r *recorder) add(s string) {
@@ -25,12 +26,20 @@ func (r *recorder) add(s string) {
 
 func (r *recorder) GracefulStop() {
 	r.add("GracefulStop")
+	if r.hang != nil {
+		<-r.hang
+		return
+	}
 	if r.stop != nil {
 		<-r.stop
 	}
 }
 func (r *recorder) Stop() {
 	r.add("Stop")
+	if r.hang != nil {
+		<-r.hang
+		return
+	}
 	if r.stop != nil {
 		close(r.stop)
 	}
@@ -44,29 +53,82 @@ func (r *recorder) got() string {
 	return strings.Join(r.steps, " ")
 }
 
-// stopServing marks the console audit before the gRPC server stops, and
-// flushes it after the server has stopped (outright, when a console holds
-// the graceful stop) and after afterStop. The flush is the last step, so the
-// caller's database close comes after it.
+// afterStop is the afterStop Run would pass: it records "after", or
+// "after(stopped still open)" when stopServing has not yet closed stopped
+// for Run's awaitServe.
+func (r *recorder) afterStop(stopped <-chan struct{}) func() {
+	return func() {
+		select {
+		case <-stopped:
+			r.add("after")
+		default:
+			r.add("after(stopped still open)")
+		}
+	}
+}
+
+// runStopServing runs stopServing and fails, instead of hanging the package,
+// when it does not return within limit.
+func runStopServing(t *testing.T, r *recorder, graceful, forced, limit time.Duration) time.Duration {
+	t.Helper()
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		stopServing(r, r, graceful, forced, stopped, r.afterStop(stopped))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		t.Fatalf("stopServing did not return within %s (graceful %s, forced %s); steps so far %q",
+			limit, graceful, forced, r.got())
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("stopServing returned without closing stopped: Run's awaitServe would wait on Serve unbounded")
+	}
+	return time.Since(start)
+}
+
+// stopServing marks the console audit before the gRPC server stops, closes
+// stopped for Run's awaitServe once the stop has returned or been given up
+// on, and flushes after that and after afterStop. The flush is the last
+// step, so the caller's database close comes after it.
 //
 // Mutation "flush before the server stops" — red. Mutation "no Mark" — red.
+// Mutation "no close(stopped)" — red. Mutation "Stop waited on unbounded"
+// (lab 2 N-5) — red, in "the stop never returns".
 func TestStopServing_MarksThenStopsThenFlushes(t *testing.T) {
 	t.Run("graceful", func(t *testing.T) {
 		r := &recorder{}
-		stopServing(r, r, time.Second, func() { r.add("after") })
+		runStopServing(t, r, time.Second, time.Second, 5*time.Second)
 		if got := r.got(); got != "Mark GracefulStop after Flush" {
 			t.Fatalf("steps = %q", got)
 		}
 	})
 	t.Run("a console holds the graceful stop", func(t *testing.T) {
 		r := &recorder{stop: make(chan struct{})}
-		start := time.Now()
-		stopServing(r, r, 50*time.Millisecond, func() { r.add("after") })
+		if d := runStopServing(t, r, 50*time.Millisecond, 50*time.Millisecond, 5*time.Second); d > 2*time.Second {
+			t.Fatalf("stopServing took %s with a 50ms graceful bound", d)
+		}
 		if got := r.got(); got != "Mark GracefulStop Stop after Flush" {
 			t.Fatalf("steps = %q", got)
 		}
-		if d := time.Since(start); d > 2*time.Second {
-			t.Fatalf("stopServing took %s with a 50ms grace", d)
+	})
+	t.Run("the stop never returns", func(t *testing.T) {
+		// A handler stuck in the kernel holds GracefulStop, and Stop blocks
+		// behind it (lab 2 N-5): the shutdown must give up on both, still
+		// close stopped and still flush, within graceful+forced.
+		r := &recorder{hang: make(chan struct{})}
+		t.Cleanup(func() { close(r.hang) })
+		const graceful, forced = 50 * time.Millisecond, 50 * time.Millisecond
+		if d := runStopServing(t, r, graceful, forced, 5*time.Second); d > graceful+forced+time.Second {
+			t.Fatalf("stopServing took %s with graceful %s + forced %s", d, graceful, forced)
+		}
+		if got := r.got(); got != "Mark GracefulStop Stop after Flush" {
+			t.Fatalf("steps = %q", got)
 		}
 	})
 }

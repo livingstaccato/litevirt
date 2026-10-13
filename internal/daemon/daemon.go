@@ -1978,6 +1978,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Handle shutdown, re-exec, and uninstall signals.
 	shutdownDone := make(chan struct{})
+	grpcStopped := make(chan struct{})
 	reexecRequested := false
 	uninstalled := false
 	go func() {
@@ -1999,7 +2000,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("shutdown requested by uninstall")
 			uninstalled = true
 		}
-		stopServing(d.grpcSrv, svc, gracefulStopWait, func() {
+		// Bounded whatever the RPCs in flight do: one stuck on storage that
+		// does not answer must not hold the restart (stopGRPC). stopServing
+		// closes grpcStopped as soon as that stop returns or is given up on.
+		stopServing(d.grpcSrv, svc, grpcGracefulStop, grpcForcedStop, grpcStopped, func() {
 			// A vfio-pci unbind still blocked in the kernel keeps this process alive
 			// past every step below; name the devices so an operator knows which
 			// holder to stop.
@@ -2021,7 +2025,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		close(shutdownDone)
 	}()
 
-	serveErr := d.grpcSrv.Serve(lis)
+	serveErrs := make(chan error, 1)
+	go func() { serveErrs <- d.grpcSrv.Serve(lis) }()
+	// Serve returns only once a stop has finished, and a stop can wait on a
+	// handler stuck in the kernel: once the shutdown's stop is over, Serve
+	// is waited on only briefly (awaitServe).
+	serveErr := awaitServe(serveErrs, grpcStopped, serveReturnBound)
 
 	// Wait for cleanup to finish (replicator, libvirt, DB) before returning,
 	// but cap at 15s so we don't hang longer than systemd's stop timeout.

@@ -143,6 +143,7 @@ type mockGRPC struct {
 	lastCreateVMReq        *pb.CreateVMRequest
 	lastUpdateVMReq        *pb.UpdateVMRequest
 	lastLoginReq           *pb.LoginRequest
+	lastGrantRoleReq       *pb.GrantRoleRequest
 	lastDeleteImageName    string
 	deleteImageCalled      bool
 	lastCreateUserReq      *pb.CreateUserRequest
@@ -462,7 +463,8 @@ func (m *mockGRPC) RestoreLive(_ context.Context, in *pb.RestoreLiveRequest, _ .
 		{Phase: pb.RestoreLiveProgress_DONE, Status: "localized"},
 	}}, nil
 }
-func (m *mockGRPC) GrantRole(context.Context, *pb.GrantRoleRequest, ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+func (m *mockGRPC) GrantRole(_ context.Context, in *pb.GrantRoleRequest, _ ...grpc.CallOption) (*pb.GrantRoleResponse, error) {
+	m.lastGrantRoleReq = in
 	return &pb.GrantRoleResponse{Binding: &pb.RoleBinding{}}, nil
 }
 func (m *mockGRPC) RevokeRole(context.Context, *pb.RevokeRoleRequest, ...grpc.CallOption) (*pb.RevokeRoleResponse, error) {

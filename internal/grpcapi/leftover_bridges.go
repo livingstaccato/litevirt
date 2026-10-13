@@ -20,9 +20,13 @@ import (
 //   - on this host it is a bridge with no ports and no address beyond an
 //     IPv6 link-local one (NetworkProvisioner.RemoveUnusedBridge checks that).
 //
-// litevirt keeps no marker saying it created a bridge, so this pattern is the
-// proof. An operator's own bridge would need an operator to have pointed a
-// litevirt NIC at it by that stack-scoped name AND to have nothing on it.
+// This pattern is the proof here, independent of the record EnsureBridge now
+// keeps of the bridges it creates (network.RemoveCreatedBridgeIfUnused): flat
+// bridges an older build made have no record, and this sweep must still find
+// them. An operator's own bridge would need an operator to have pointed a
+// litevirt NIC at it by that stack-scoped name AND to have nothing on it. A
+// bridge removed here loses its record too (RemoveBridgeIfUnused drops it), so
+// a later bridge of the same name is never mistaken for litevirt's.
 
 // removeLeftoverStackBridges scans for flat stack bridges no NIC uses and
 // removes the ones this host has.

@@ -62,6 +62,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `disk.smart.warning` | warn | a disk passes SMART but reports a non-failure warning (NVMe temperature above its threshold: check cooling) |
 | `disk.smart.prefail` | warn | a disk still passes SMART but a prefailure attribute has tripped or the NVMe critical-warning flag is set |
 | `disk.smart.recovered` | info | a disk that was prefail/failing reports healthy again |
+| `image.versions_kept` | warn | a refresh's background prune kept unused versions of an image only because the image store is on a filesystem other hosts may share (nfs, cifs, ceph, fuse, ...), whose disks may be built on them; names the count and bytes. At most daily per image. Subject is `<host>:<image>`; `lv image prune <image> --version <file> --host <host>` removes one once no host uses it |
 | `test.notification` | info | `lv notify test` / the UI "Test" button |
 
 > **Route the `ha.vip.*` kinds if you enable VIP HA** (`enforcement.vip_self_demote` /

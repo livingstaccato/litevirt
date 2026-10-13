@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"fmt"
+	"net/netip"
 	"sort"
 	"sync"
 
@@ -26,6 +28,12 @@ type NetProvFake struct {
 	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
 	busy         map[string]bool   // flat bridges a scenario says have a port attached
 	guestPorts   map[string][]string
+	subnets      map[string]string // network → subnet, while provisioned with one
+	// dhcpConflicts makes Provision fail the way the real dnsmasq does when
+	// another network provisioned on this node already serves an overlapping
+	// subnet: both listen on the same gateway address, so the second one
+	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
+	dhcpConflicts bool
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -34,14 +42,35 @@ func NewNetProvFake() *NetProvFake {
 		provisions:   map[string]int{},
 		deprovisions: map[string]int{},
 		flat:         map[string]bool{},
+		subnets:      map[string]string{},
 	}
+}
+
+// SetDHCPConflicts turns on the overlapping-subnet dnsmasq failure (see
+// NetProvFake.dhcpConflicts).
+func (f *NetProvFake) SetDHCPConflicts(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dhcpConflicts = on
 }
 
 func (f *NetProvFake) Provision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _, _ string) (string, error) {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.dhcpConflicts && def.Subnet != "" {
+		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
+			for other, sub := range f.subnets {
+				if p, err := netip.ParsePrefix(sub); other != name && err == nil && p.Overlaps(mine) {
+					return "", fmt.Errorf("start DHCP on %s: dnsmasq on %s exited immediately: exit status 2", dev, dev)
+				}
+			}
+		}
+	}
 	f.up[name] = dev
+	if def.Subnet != "" {
+		f.subnets[name] = def.Subnet
+	}
 	f.provisions[name]++
 	return dev, nil
 }
@@ -50,6 +79,7 @@ func (f *NetProvFake) Deprovision(_ context.Context, _ *corrosion.Client, name s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.up, name)
+	delete(f.subnets, name)
 	f.deprovisions[name]++
 	return nil
 }
@@ -68,6 +98,7 @@ func (f *NetProvFake) Lose(network string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.up, network)
+	delete(f.subnets, network)
 }
 
 // EnsureBridge is a Server.SetBridgeEnsure seam that records the flat bridges

@@ -217,7 +217,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 			continue
 		}
 		if _, err := prov.Provision(ctx, s.db, r.name, def, localIP, s.hostName); err != nil {
-			s.noteNetworkReconcileErr(st, r.name, err)
+			s.noteNetworkReconcileErr(st, r.name, s.explainProvisionFailure(ctx, r.name, def, err))
 			continue
 		}
 		delete(st.lastErr, r.name)

@@ -436,3 +436,81 @@ func TestStart_APoolOnAnUnansweringDataDisksAdmitsNothing(t *testing.T) {
 		t.Fatal("a's disk on b's disk was admitted while <data_dir>/disks did not answer")
 	}
 }
+
+// Re-review 4, R4-M1: an in-place restore re-points the backed-up overlay at
+// exactly the recorded base, and only its top layer is held to that; the
+// layers below go by the disk's broader rule. Which layer is the top is not
+// decided on a guess: when resolving the restored file does not answer, the
+// restore is refused, not judged by the broader rule — which here would admit
+// another image-store file than the recorded base.
+//
+// Mutation: the top resolved leniently (resolvedOr) — the other image is
+// admitted: red.
+func TestRestore_ARepointedTopThatDoesNotAnswerIsRefused(t *testing.T) {
+	f := newStartChainFixture(t)
+	images := filepath.Join(f.s.dataDir, "images")
+	if err := os.MkdirAll(images, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recorded := filepath.Join(images, "ubuntu.qcow2")
+	other := filepath.Join(images, "debian.qcow2")
+	for _, p := range []string{recorded, other} {
+		if err := qcow2.Create(p, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorded, _ = filepath.EvalSymlinks(recorded)
+	vm := f.mainEraVM(t, "web", f.pa, "pa")
+	disks, err := corrosion.GetVMDisks(context.Background(), f.s.db, vm.Name)
+	if err != nil || len(disks) != 1 {
+		t.Fatalf("disks %v: %v", disks, err)
+	}
+	staging, _ := symlinkedDataDir(t)
+	restored := filepath.Join(staging, "restored.qcow2")
+	if err := qcow2.CreateWithBacking(restored, other, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.judgeRepointedChain(context.Background(), restored, recorded, "qcow2", disks[0]); err == nil {
+		t.Fatal("setup: a top naming another image than the recorded base was accepted")
+	}
+	stallResolutionsUnder(t, staging)
+	err = within(t, 10*time.Second, "an in-place restore's chain judgement", func() error {
+		return f.s.judgeRepointedChain(context.Background(), restored, recorded, "qcow2", disks[0])
+	})
+	if err == nil || !storage.IsFSNoAnswer(err) {
+		t.Fatalf("a re-pointed top whose resolution does not answer: %v; want the no-answer refusal", err)
+	}
+}
+
+// Re-review 4, R4-M2: a backing in a pool whose directory does not answer
+// is refused as retryable Unavailable ("its storage does not answer"), not
+// as a backing outside every pool the project may use.
+//
+// Mutation: chainPoolDirs does not report the no-answer — FailedPrecondition:
+// red.
+func TestStart_ABackingInAPoolThatDoesNotAnswerIsUnavailable(t *testing.T) {
+	f := newStartChainFixture(t)
+	link, real := symlinkedDataDir(t)
+	if err := corrosion.UpsertStoragePool(context.Background(), f.s.db, corrosion.StoragePoolRecord{
+		HostName: f.s.hostName, Name: "pl", Driver: "dir", Target: link, Project: "a", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(real, "base.qcow2")
+	if err := qcow2.Create(base, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(f.pa, "web-root.qcow2")
+	if err := qcow2.CreateWithBacking(disk, base, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	vm := f.insertVM(t, "web", "a", disk, "pa", "")
+	startAllowed(t, f.s, vm, "setup: a backing in a pool of the project")
+	stallResolutionsUnder(t, link)
+	err := within(t, 10*time.Second, "a start whose backing's pool does not answer", func() error {
+		return f.s.verifyImageBasesForStart(context.Background(), vm)
+	})
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "does not answer") {
+		t.Fatalf("a backing in a pool that does not answer: %v; want Unavailable saying its storage does not answer", err)
+	}
+}

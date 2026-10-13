@@ -291,7 +291,11 @@ answers again. litevirt keeps that from holding anything else:
   never decided on a guess. When resolving a path in the image store or a
   disk's chain does not answer, the prune fails with "nothing is pruned", and
   a snapshot delete or revert is refused with `Unavailable`. Retry once the
-  server answers.
+  server answers. **Known gap:** a snapshot delete or revert reads the
+  header chain of every VM disk on the host, and that read is not bounded.
+  While another VM's disk is on a mount whose server does not answer, the
+  delete or revert can wait for it instead of being refused, holding that
+  VM's lock (and a stop of it) until the server answers.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 

@@ -204,7 +204,7 @@ func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *disk
 	if s.hostDiskRoot != "" {
 		c.images = append(c.images, c.resolve(s.hostDiskFile(filepath.Join(s.dataDir, "images"))))
 	}
-	c.pools = s.chainPoolDirs(ctx, d, c.project)
+	c.pools, c.poolsNoAnswer = s.chainPoolDirs(ctx, d, c.project)
 	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
 		for _, p := range pools {
 			if strings.EqualFold(p.Driver, "nfs") {
@@ -245,6 +245,11 @@ type diskChain struct {
 	// chain refuses: a record that would refuse a layer may have been
 	// missed.
 	noAnswer error
+	// poolsNoAnswer is why a pool was left out of pools: its directory, a
+	// check of it, or <data_dir>/disks did not answer (chainPoolDirs). It
+	// does not refuse what another rule admits — a VM on local storage
+	// starts beside a dead pool (lab 2 N-1) — only what nothing admits.
+	poolsNoAnswer error
 }
 
 // resolve is resolvedStrict for a judgement of this chain: a path whose
@@ -318,6 +323,10 @@ func (c *diskChain) judgeLayer(layer, resolved, format string) error {
 	}
 	if withinAny(resolved, c.own) && (c.ownedByProject(resolved) || c.snapshotBase(layer, resolved) || c.legacyPoolBase(layer, resolved)) {
 		return nil
+	}
+	if c.poolsNoAnswer != nil {
+		return fmt.Errorf("backing %q is outside the image store and every pool project %q may use that answered, and a pool that might hold it does not answer: %w",
+			resolved, c.project, c.poolsNoAnswer)
 	}
 	return fmt.Errorf("backing %q is outside the image store and every pool project %q may use, and is not a file that project owns by record",
 		resolved, c.project)
@@ -683,14 +692,33 @@ func (c *diskChain) projectOf(vm string) string {
 // A pool whose directory, or <data_dir>/disks, does not answer its
 // resolution adds nothing either: whether it overlaps <data_dir>/disks
 // cannot be told, and leaving it out only admits less.
-func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, project string) []string {
+//
+// The error is the first no-answer that left a pool out (re-review 4,
+// R4-M2): the chain then refuses a backing no other rule admits as
+// retryable, saying its storage does not answer, not as outside every pool.
+func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, project string) ([]string, error) {
 	disks, derr := resolvedStrict(filepath.Join(s.dataDir, "disks"))
 	var dirs []string
+	var noAnswer error
+	note := func(err error) {
+		if noAnswer == nil && storage.IsFSNoAnswer(err) {
+			noAnswer = err
+		}
+	}
 	add := func(dir string) {
-		if dir == "" || derr != nil {
+		if dir == "" {
 			return
 		}
-		if rd, err := resolvedStrict(dir); err != nil || safename.Contains(rd, disks) || safename.Contains(disks, rd) {
+		if derr != nil {
+			note(derr)
+			return
+		}
+		rd, err := resolvedStrict(dir)
+		if err != nil {
+			note(err)
+			return
+		}
+		if safename.Contains(rd, disks) || safename.Contains(disks, rd) {
 			return
 		}
 		dirs = append(dirs, s.rootsAsFound(dir)...)
@@ -703,25 +731,28 @@ func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, proj
 		}
 	}
 	if project == "" {
-		return dirs
+		return dirs, noAnswer
 	}
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
 	if err != nil {
-		return dirs
+		return dirs, noAnswer
 	}
 	for _, p := range pools {
 		if !isFileBasedDriver(p.Driver) || !tenancy.AdmitAttach(project, p.Project) {
 			continue
 		}
 		ref := StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}
-		if !s.poolUsableForWrite(ctx, p.Name, ref) {
+		// poolUsableForWrite, keeping why: a pool refused because its
+		// checks did not answer is reported.
+		if rerr, _ := s.poolRefusal(ctx, p.Name, ref); rerr != nil {
+			note(rerr)
 			continue
 		}
 		if dir, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
 			add(dir)
 		}
 	}
-	return dirs
+	return dirs, noAnswer
 }
 
 // primePoolDirResolutions resolves, all at once, every directory a judgement

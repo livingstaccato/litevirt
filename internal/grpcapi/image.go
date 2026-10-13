@@ -66,7 +66,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	}()
 	// A pull brings a deleted name back, as an import does; one whose row
 	// is deleted while it runs records nothing.
-	startDeleted, err := s.imageOpStart(stream.Context(), req.Name, imageOpPull)
+	ticket, err := s.imageOpStart(stream.Context(), req.Name, imageOpPull)
 	if err != nil {
 		return err
 	}
@@ -80,7 +80,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// Create the catalog + per-host rows up front (visible in ListImages during the
 	// pull). These are not cosmetic: a lost write leaves an image on disk that
 	// placement/failover cannot see, so fail closed rather than pull invisibly.
-	if err := s.recordImage(bgCtx, imageOpPull, startDeleted, corrosion.ImageRecord{
+	if err := s.recordImage(bgCtx, imageOpPull, ticket, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
@@ -113,7 +113,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			return
 		}
 		// Persist final result with a background context — stream ctx may be cancelled.
-		if err := s.persistImageRecord(req, pub, startDeleted); err != nil {
+		if err := s.persistImageRecord(req, pub, ticket); err != nil {
 			slog.Error("image record persist failed after pull", "name", req.Name, "error", err)
 			if uerr := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); uerr != nil {
 				s.noteStateWriteFail(corrosion.OpImageHost, uerr)
@@ -162,7 +162,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 // persistImageRecord writes the image and image_host records after a successful pull.
 // The recorded checksum is the published content's own sha256 — what disks
 // built on it now are built on — whether or not the request named one.
-func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Published, startDeleted string) error {
+func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Published, ticket *imageTicket) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -176,7 +176,7 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Publishe
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := s.recordImage(ctx, imageOpPull, startDeleted, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, imageOpPull, ticket, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,

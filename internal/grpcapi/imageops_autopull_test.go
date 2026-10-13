@@ -80,6 +80,9 @@ func TestAutoPullImage_PrefersLiveSourceOverDead(t *testing.T) {
 	// A dead holder sorts before a live one; selection must pick the live
 	// host. The dial then fails (no real peer in unit tests), and that error
 	// must name the LIVE host — proving the dead one was skipped.
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2"}); err != nil {
+		t.Fatal(err)
+	}
 	for _, h := range []struct{ name, state string }{
 		{"aaa-fenced", "fenced"},
 		{"zzz-live", "active"},
@@ -129,6 +132,9 @@ func TestAutoPullImage_CorruptLocalFileDoesNotShortCircuit(t *testing.T) {
 		Name: "live-holder", Address: "127.0.0.1", State: "active",
 	}); err != nil {
 		t.Fatalf("insert host: %v", err)
+	}
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2"}); err != nil {
+		t.Fatal(err)
 	}
 	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: "ubuntu", HostName: "live-holder",

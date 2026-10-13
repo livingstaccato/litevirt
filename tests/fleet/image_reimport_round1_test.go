@@ -338,3 +338,68 @@ func TestFleet_ImageRm_AnOperatorsPushOfADeletedNameIsACopy(t *testing.T) {
 	}
 	deletedEverywhere(t, c, "imgx")
 }
+
+// Re-review 1, R-m2, a rolling upgrade: an operator's lv image push from a
+// source on an earlier build carries no copy mark, and under forwarded
+// identity the target authenticates the operator. It is still a copy: it came
+// over a peer's transport. A push of a name the target reads deleted is
+// refused, and the name stays deleted.
+func TestFleet_ImageRm_AnUnmarkedPushFromAnEarlierBuildIsACopy(t *testing.T) {
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
+	latchForwardedIdentity(t, c)
+	n0, n2 := c.Nodes[0], c.Nodes[2]
+	n0.Server.SetImagePushUnmarkedForTest(true)
+	tok := userOn(t, c, n0, "pusher", "operator")
+	importImageSizedOn(t, c, n0, "imgx", 64<<20)
+	c.WaitConverged(t, convergeTimeout)
+	if err := corrosion.DeleteImage(context.Background(), c.Nodes[1].DB, "imgx"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	stream, err := c.bearerClient(n0, tok).PushImage(context.Background(), &pb.PushImageRequest{Name: "imgx", TargetHost: n2.Name})
+	if err == nil {
+		for {
+			if _, err = stream.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an unmarked push of a deleted name under forwarded identity: %v, want FailedPrecondition", err)
+	}
+	deletedEverywhere(t, c, "imgx")
+}
+
+// Re-review 1, R-m1: lv image rm on node-1, stamped after an import on node-0
+// began, reaches node-0 only after the import has recorded (the links into
+// node-0 are blocked, and nothing waits for the delete). The record was
+// written at clocks reserved as the import began, so the delete is newer and
+// wins on every host once the links heal.
+func TestFleet_ImageRm_StampedAfterAnImportBeganWinsThoughItArrivesLate(t *testing.T) {
+	c, n0 := liveImageCluster(t, "imgx")
+	n1, n2 := c.Nodes[1], c.Nodes[2]
+	c.SetLinkFault(n1, n0, LinkFault{Block: true})
+	c.SetLinkFault(n2, n0, LinkFault{Block: true})
+	var deleted atomic.Bool
+	n0.Server.SetImageRecordHookForTest(func(n string) {
+		if n == "imgx" && deleted.CompareAndSwap(false, true) {
+			if err := corrosion.DeleteImage(context.Background(), n1.DB, "imgx"); err != nil {
+				t.Errorf("lv image rm on %s: %v", n1.Name, err)
+			}
+		}
+	})
+	t.Cleanup(func() { n0.Server.SetImageRecordHookForTest(nil) })
+
+	importImageSizedOn(t, c, n0, "imgx", 96<<20)
+	if !deleted.Load() {
+		t.Fatal("the import never reached its record")
+	}
+	if d, _ := corrosion.ImageDeletedAt(context.Background(), n0.DB, "imgx"); d != "" {
+		t.Fatal("precondition: node-0 applied the delete through a blocked link before the import recorded")
+	}
+	c.ClearLinkFaults()
+	deletedEverywhere(t, c, "imgx")
+}

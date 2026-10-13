@@ -49,6 +49,7 @@ var guarded = map[string]bool{
 	"InsertImageHost":               true,
 	"ReviveImageHost":               true,
 	"ReviveImage":                   true,
+	"RecordImage":                   true,
 	"UpdateImageHostStatus":         true,
 	"SetContainerState":             true,
 	"SetContainerStateStrict":       true,

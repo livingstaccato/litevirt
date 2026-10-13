@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 )
 
 // ImageRecord represents a VM base image.
@@ -36,9 +38,15 @@ const imageDeletedAtSQL = `UPDATE images SET deleted_at = ?, updated_at = ? WHER
 const imageInsertSQL = `INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`
 
-func imageInsert(c *Client, img ImageRecord) Statement {
+func imageInsert(img ImageRecord, updatedAt string) Statement {
 	return Statement{SQL: imageInsertSQL,
-		Params: []interface{}{img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), c.NowTS()}}
+		Params: []interface{}{img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), updatedAt}}
+}
+
+// imageRevive is DeleteImage's statement with a NULL deleted_at: it makes the
+// row live on every host that applies it (ReviveImage).
+func imageRevive(name, updatedAt string) Statement {
+	return Statement{SQL: imageDeletedAtSQL, Params: []interface{}{nil, updatedAt, name}}
 }
 
 // InsertImage creates or replaces an image record WITHOUT reviving a deleted
@@ -49,7 +57,7 @@ func imageInsert(c *Client, img ImageRecord) Statement {
 // refuses outright when the row already reads deleted here (grpcapi
 // Server.recordImage).
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
-	return c.ExecuteBatch(ctx, []Statement{imageInsert(c, img)})
+	return c.ExecuteBatch(ctx, []Statement{imageInsert(img, c.NowTS())})
 }
 
 // ReviveImage is InsertImage that also makes the image live on every host, a
@@ -77,12 +85,60 @@ func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
 // is a new statement shape and would need the release latch, as
 // imageHostReviveSQL does.
 func ReviveImage(ctx context.Context, c *Client, img ImageRecord) error {
-	ins := imageInsert(c, img)
-	revived := c.NowTS() // strictly after the insert's: the receiver's LWW gate applies both
-	return c.ExecuteBatch(ctx, []Statement{
-		ins,
-		{SQL: imageDeletedAtSQL, Params: []interface{}{nil, revived, img.Name}},
-	})
+	clk := ReserveImageClocks(c)
+	return c.ExecuteBatch(ctx, []Statement{imageInsert(img, clk.Insert), imageRevive(img.Name, clk.Revive)})
+}
+
+// ImageClocks are the two clocks of one write of an image's catalog row: its
+// insert's and its revive's, Insert strictly before Revive.
+type ImageClocks struct{ Insert, Revive string }
+
+// ReserveImageClocks takes, now, the clocks a later RecordImage writes the
+// catalog row at (review re-review 1, R-m1). An operation reserves them as it
+// begins, so a delete stamped after that — on any host — is newer than the
+// record, and LWW and anti-entropy keep the delete on every replica even
+// when it reaches the recording host only after the record is written.
+func ReserveImageClocks(c *Client) ImageClocks {
+	ins := c.NowTS()
+	return ImageClocks{Insert: ins, Revive: c.NowTS()} // NowTS is strictly monotonic
+}
+
+// RecordImage writes image img's catalog row at clocks clk reserved as the
+// operation began: the insert alone (a copy from a peer), or with the revive
+// (revive: an operator's import, pull, build or compose download).
+//
+// It writes only if, in the same transaction, the row still reads as it did
+// when the operation began: its deleted_at is startDeleted ("" live or absent),
+// and no write here is newer than clk.Insert. Otherwise it writes nothing and
+// reports applied false: a delete applied here since the operation began
+// (lv image rm), or a newer record of the image, wins. A record at reserved
+// clocks over a newer row would regress it here while every peer kept the
+// newer one.
+//
+// What remains (the reservation is a clock, not a lock): a delete stamped
+// BEFORE the clocks were reserved, but not yet applied here when the record
+// is written, is older than the record and loses to the revive everywhere.
+// "Before" is by two hosts' clocks, so a delete issued just after the
+// operation began on a host whose clock runs behind by more than that gap
+// loses too.
+func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (bool, error) {
+	stmts := []Statement{imageInsert(img, clk.Insert)}
+	if revive {
+		stmts = append(stmts, imageRevive(img.Name, clk.Revive))
+	}
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var deletedAt, updatedAt string
+		err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(deleted_at, ''), COALESCE(updated_at, '') FROM images WHERE name = ?`, img.Name).
+			Scan(&deletedAt, &updatedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return startDeleted == "", nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return deletedAt == startDeleted && lwwOrder(updatedAt, clk.Insert) < 0, nil
+	}, stmts)
 }
 
 // ImageDeletedAt is the deleted_at of image name's row here: "" when the row
@@ -206,11 +262,16 @@ func GetImage(ctx context.Context, c *Client, name string) (*ImageRecord, error)
 	}, nil
 }
 
-// GetImageHosts returns hosts that have a copy of an image (all statuses).
+// GetImageHosts returns hosts that have a copy of an image (all statuses) —
+// of a live image only: a host row live under a deleted catalog row (a copy
+// recorded on a host lv image rm had not reached yet) names no source, so an
+// auto-pull, a compose deploy and placement do not count it (review re-review
+// 1, R-m5).
 func GetImageHosts(ctx context.Context, c *Client, imageName string) ([]ImageHostRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT image_name, host_name, path, status, pulled_at, COALESCE(progress_pct, 0) as progress_pct
-		 FROM image_hosts WHERE image_name = ? AND deleted_at IS NULL`,
+		`SELECT ih.image_name, ih.host_name, ih.path, ih.status, ih.pulled_at, COALESCE(ih.progress_pct, 0) as progress_pct
+		 FROM image_hosts ih JOIN images i ON i.name = ih.image_name AND i.deleted_at IS NULL
+		 WHERE ih.image_name = ? AND ih.deleted_at IS NULL`,
 		imageName)
 	if err != nil {
 		return nil, err

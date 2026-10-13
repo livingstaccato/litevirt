@@ -958,17 +958,18 @@ const imageDeleteMarginFloor = time.Duration(hlc.MaxSkewMS) * time.Millisecond
 
 // imageDeleteMargin is how far apart the deleting host's clock and this
 // host's may be: the larger of imageDeleteMarginFloor and the largest clock
-// skew any host recorded against a peer in the last 10 minutes (clock_skew).
-// The measurement records only skew over a second, and a row ages out, so a
+// skew in any clock_skew row this host still holds — kept up to
+// ClockSkewRetention (1 hour), however old (review re-review 1, R-m3). The
+// skew that matters is the one at the time of the delete, which may since
+// have been corrected; an old row can only widen the margin, toward keeping.
+// The measurement records only skew over a second and rows age out, so a
 // missing row says nothing and never lowers the floor.
 func (s *Server) imageDeleteMargin(ctx context.Context) time.Duration {
 	m := imageDeleteMarginFloor
 	if d := s.imagePrune.deleteMargin.Load(); d > 0 {
 		m = time.Duration(d)
 	}
-	cutoff := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
-	rows, err := s.db.Query(ctx,
-		`SELECT COALESCE(MAX(ABS(skew_seconds)), 0) AS s FROM clock_skew WHERE updated_at > ?`, cutoff)
+	rows, err := s.db.Query(ctx, `SELECT COALESCE(MAX(ABS(skew_seconds)), 0) AS s FROM clock_skew`)
 	if err == nil && len(rows) == 1 {
 		if sk := time.Duration(rows[0].Float("s") * float64(time.Second)); sk > m {
 			m = sk
@@ -1411,6 +1412,7 @@ type imagePruneState struct {
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
 	deleteMargin atomic.Int64                              // test seam (ns); imageDeleteMarginFloor when 0
 	recordHook   atomic.Pointer[func(name string)]         // test seam: runs as recordImage begins
+	pushUnmarked atomic.Bool                               // test seam: PushImage omits its copy mark, as an earlier build's does
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }

@@ -201,3 +201,9 @@ func (s *Server) SetImageRecordHookForTest(fn func(name string)) {
 	}
 	s.imagePrune.recordHook.Store(&fn)
 }
+
+// SetImagePushUnmarkedForTest makes PushImage omit its copy mark, as a build
+// before it did: the target must still take the push for a copy.
+func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
+	s.imagePrune.pushUnmarked.Store(unmarked)
+}

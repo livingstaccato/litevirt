@@ -96,26 +96,36 @@ func TestPublishedAfterDelete_ReadsTheRepublish(t *testing.T) {
 	}
 }
 
-// imageDeleteMargin: the floor (hlc.MaxSkewMS) unless a fresher measured skew
-// is larger; a stale measurement does not count.
+// imageDeleteMargin: the floor (hlc.MaxSkewMS) unless a larger skew is in any
+// clock_skew row this host still holds, however old (review re-review 1,
+// R-m3): a skew that was large when the image was deleted and has since been
+// corrected still widens the margin.
 func TestImageDeleteMargin(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	if m := s.imageDeleteMargin(ctx); m != imageDeleteMarginFloor {
 		t.Fatalf("no measured skew: margin %s, want the floor %s", m, imageDeleteMarginFloor)
 	}
-	stale := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
-	fresh := time.Now().UTC().Format(time.RFC3339)
-	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',900,?)`, stale); err != nil {
+	// 40 minutes ago a peer ran 15 minutes ahead; NTP has since fixed it, so
+	// no fresh row says so.
+	corrected := time.Now().UTC().Add(-40 * time.Minute).Format(time.RFC3339)
+	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',900,?)`, corrected); err != nil {
 		t.Fatal(err)
 	}
-	if m := s.imageDeleteMargin(ctx); m != imageDeleteMarginFloor {
-		t.Fatalf("only a stale measurement: margin %s, want the floor", m)
+	if m := s.imageDeleteMargin(ctx); m != 15*time.Minute {
+		t.Fatalf("a 900 s skew measured 40 minutes ago and since corrected: margin %s, want 15m", m)
 	}
+	fresh := time.Now().UTC().Format(time.RFC3339)
 	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','c',-420,?)`, fresh); err != nil {
 		t.Fatal(err)
 	}
+	if m := s.imageDeleteMargin(ctx); m != 15*time.Minute {
+		t.Fatalf("a fresh 420 s skew beside the older 900 s: margin %s, want the larger, 15m", m)
+	}
+	if err := s.db.Execute(ctx, `DELETE FROM clock_skew WHERE target = 'b'`); err != nil {
+		t.Fatal(err)
+	}
 	if m := s.imageDeleteMargin(ctx); m != 7*time.Minute {
-		t.Fatalf("a fresh 420 s skew: margin %s, want 7m", m)
+		t.Fatalf("only a 420 s skew: margin %s, want 7m", m)
 	}
 }

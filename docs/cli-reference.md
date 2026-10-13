@@ -737,12 +737,17 @@ lv image rm <image>
 #   background, and logs each host's outcome.
 #   An import, pull or build under a deleted image's name, or a compose
 #   deploy's download of it, makes it a live image again on every host. A
-#   copy from a peer (lv image push, a VM create's or the reconciler's copy)
-#   does not: one of a deleted name is refused. Any of them that lv image rm
-#   lands in records nothing and leaves its copy for lv image prune. The
-#   host's own record of its copy (the image's hosts in lv image ls, which
-#   peers pull from and placement reads) is revived on the other hosts only
-#   once the cluster upgrade has finished (lv cluster upgrade-status). Before
+#   compose deploy lv gitops runs does too, for a deleted image the compose
+#   file still declares. A copy from a peer (lv image push, a VM create's or
+#   the reconciler's copy) does not: one of a deleted name is refused.
+#   An lv image rm stamped after one of them began wins on every host: where
+#   the delete has already arrived, the operation records nothing and leaves
+#   its copy for lv image prune. An lv image rm stamped before it began that
+#   has not reached its host when it records loses to it; "before" is by the
+#   two hosts' clocks. The host's own record of its copy (the image's hosts
+#   in lv image ls, which peers pull from and placement reads) is revived on
+#   the other hosts only once the cluster upgrade has finished
+#   (lv cluster upgrade-status). Before
 #   that the record reads deleted on every host, this one too once
 #   anti-entropy runs, so no peer pulls the copy and placement does not see
 #   it; the host logs this at WARN, and importing the image again after the

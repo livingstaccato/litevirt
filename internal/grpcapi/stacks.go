@@ -2146,7 +2146,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		defer release()
 		// A compose download brings a deleted name back, as an import does;
 		// one whose row is deleted while it runs records nothing.
-		startDeleted, err := s.imageOpStart(ctx, img, imageOpCompose)
+		ticket, err := s.imageOpStart(ctx, img, imageOpCompose)
 		if err != nil {
 			return err
 		}
@@ -2176,7 +2176,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		s.imagePublished(ctx, img, pub)
 		// Persist image + image_host records.
 		now := time.Now().UTC().Format(time.RFC3339)
-		if err := s.recordImage(ctx, imageOpCompose, startDeleted, corrosion.ImageRecord{
+		if err := s.recordImage(ctx, imageOpCompose, ticket, corrosion.ImageRecord{
 			Name:      img,
 			Format:    def.Format,
 			SourceURL: def.Source,

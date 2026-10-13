@@ -225,6 +225,9 @@ func TestAutoPullImage_PeerExists_DialFails(t *testing.T) {
 		GRPCPort: 7443,
 		State:    "active",
 	})
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2"}); err != nil {
+		t.Fatal(err)
+	}
 	corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: "ubuntu",
 		HostName:  "peer-host",

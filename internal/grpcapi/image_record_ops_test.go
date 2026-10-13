@@ -146,3 +146,43 @@ func streamHas(t *testing.T, s *Server, after int, stmt string) bool {
 	}
 	return false
 }
+
+// A compose deploy naming a deleted image downloads it even when another
+// host's record of a copy reads live under the deleted catalog row (review
+// re-review 1, R-m5): that copy names no source.
+func TestAutoPullImages_AHostRecordUnderADeletedImageIsNoSource(t *testing.T) {
+	var hits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("fake-qcow2-data"))
+	}))
+	defer ts.Close()
+	s := testServer(t)
+	s.images = image.NewStore(t.TempDir())
+	if err := s.images.Init(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "myimg", Format: "qcow2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteImage(ctx, s.db, "myimg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.ReviveImageHost(ctx, s.db, corrosion.ImageHostRecord{ImageName: "myimg", HostName: "node-2", Path: "/x", Status: "ready", PulledAt: "2026-10-13T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	f := &compose.File{
+		Images: map[string]compose.ImageDef{"myimg": {Source: ts.URL + "/myimg.qcow2", Format: "qcow2"}},
+		VMs:    map[string]compose.VMDef{"web": {Image: "myimg"}},
+	}
+	if err := s.autoPullImages(ctx, f, &mockDeployStream{ctx: ctx}); err != nil {
+		t.Fatalf("compose deploy: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("the deploy took a host record under a deleted image as a source and did not download it")
+	}
+	if rowDeleted(t, s, "myimg") {
+		t.Fatal("the deploy's download did not bring the image back")
+	}
+}

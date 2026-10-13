@@ -40,8 +40,8 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		total    int64
 		// An operator's import may bring a deleted name back; a peer's
 		// copy (lv image push, an auto-pull, a heal) never does.
-		op           = imageOpImport
-		startDeleted string
+		op     = imageOpImport
+		ticket *imageTicket
 	)
 	if isImageCopy(ctx) {
 		op = imageOpCopy
@@ -77,7 +77,7 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			if err != nil {
 				return err
 			}
-			startDeleted = sd
+			ticket = sd
 
 			destDir := filepath.Join(s.dataDir, "images")
 			os.MkdirAll(destDir, 0755)
@@ -143,7 +143,7 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := s.recordImage(ctx, op, startDeleted, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, op, ticket, corrosion.ImageRecord{
 		Name:      name,
 		Format:    format,
 		Checksum:  got,
@@ -218,7 +218,11 @@ func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImag
 
 	// Open ImportImage stream on the target, marked a copy: it never brings
 	// a deleted image's name back there (isImageCopy).
-	importStream, err := client.ImportImage(metadata.AppendToOutgoingContext(ctx, imageCopyMDKey, "push"))
+	importCtx := metadata.AppendToOutgoingContext(ctx, imageCopyMDKey, "push")
+	if s.imagePrune.pushUnmarked.Load() {
+		importCtx = ctx
+	}
+	importStream, err := client.ImportImage(importCtx)
 	if err != nil {
 		return status.Errorf(codes.Internal, "open ImportImage stream on %s: %v", req.TargetHost, err)
 	}
@@ -473,7 +477,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 
 	// A build brings a deleted name back, as an import does; one whose row
 	// is deleted while it runs records nothing.
-	startDeleted, err := s.imageOpStart(ctx, req.ImageName, imageOpBuild)
+	ticket, err := s.imageOpStart(ctx, req.ImageName, imageOpBuild)
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +540,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := s.recordImage(ctx, imageOpBuild, startDeleted, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, imageOpBuild, ticket, corrosion.ImageRecord{
 		Name:      req.ImageName,
 		Format:    "qcow2",
 		SourceURL: "build:" + req.VmName,

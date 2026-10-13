@@ -100,8 +100,8 @@ func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 			s := testServer(t)
 			ih := testImageHost(s)
 
-			// A live (here: absent) row: the write, reviving only for an import.
-			if err := s.recordImage(ctx, op, "", img, ih); err != nil {
+			// A live (here: absent) row: the write, reviving for an operator's op.
+			if err := s.recordImage(ctx, op, nil, img, ih); err != nil {
 				t.Fatal(err)
 			}
 			rows, _ := s.db.Query(ctx, `SELECT stmts FROM mutation_log ORDER BY seq DESC LIMIT 2`)
@@ -114,11 +114,15 @@ func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 			}
 
 			// lv image rm while the operation ran: nothing recorded.
+			ticket, err := s.imageOpStart(ctx, "imgr", op)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := corrosion.DeleteImage(ctx, s.db, "imgr"); err != nil {
 				t.Fatal(err)
 			}
 			before := streamLen(t, s)
-			err := s.recordImage(ctx, op, "", img, ih)
+			err = s.recordImage(ctx, op, ticket, img, ih)
 			if status.Code(err) != codes.Aborted {
 				t.Fatalf("%s over a row deleted while it ran: %v, want Aborted", op, err)
 			}
@@ -127,12 +131,12 @@ func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 			}
 
 			// The row read deleted as the operation began.
-			deletedAt, err := s.imageOpStart(ctx, "imgr", op)
+			ticket, err = s.imageOpStart(ctx, "imgr", op)
 			if !revives {
 				if status.Code(err) != codes.FailedPrecondition {
 					t.Fatalf("%s of a deleted name began: %v, want FailedPrecondition", op, err)
 				}
-				if err := s.recordImage(ctx, op, deletedAt, img, ih); status.Code(err) != codes.FailedPrecondition {
+				if err := s.recordImage(ctx, op, nil, img, ih); status.Code(err) != codes.FailedPrecondition {
 					t.Fatalf("%s recorded over a deleted name: %v, want FailedPrecondition", op, err)
 				}
 				if n := streamLen(t, s); n != before {
@@ -143,7 +147,7 @@ func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s of a deleted name refused to begin: %v", op, err)
 			}
-			if err := s.recordImage(ctx, op, deletedAt, img, ih); err != nil {
+			if err := s.recordImage(ctx, op, ticket, img, ih); err != nil {
 				t.Fatalf("%s of a deleted name: %v", op, err)
 			}
 			if d, _ := corrosion.ImageDeletedAt(ctx, s.db, "imgr"); d != "" {
@@ -153,9 +157,9 @@ func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 	}
 }
 
-// isImageCopy: PushImage's mark, or a peer under its own identity, is a copy;
-// an operator — directly, on the node, or relayed by a peer as themselves —
-// imports.
+// isImageCopy: PushImage's mark, or any call over a peer's transport — as
+// the peer, or as an operator the peer relays — is a copy (review re-review
+// 1, R-m2); an operator directly, or root on the node, imports.
 func TestIsImageCopy(t *testing.T) {
 	bare := context.Background()
 	peer := context.WithValue(context.WithValue(bare, ctxKeyPrincipalKind, principalKindPeer), ctxKeyAuthMethod, authMethodMTLS)
@@ -169,7 +173,7 @@ func TestIsImageCopy(t *testing.T) {
 	}{
 		{"a session", bare, false},
 		{"a peer as itself (an earlier build's push)", peer, true},
-		{"an operator relayed by a peer", relayed, false},
+		{"an operator relayed by a peer (an earlier build's push under forwarded identity)", relayed, true},
 		{"root on the node", localRoot, false},
 		{"PushImage's mark", marked, true},
 	} {

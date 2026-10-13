@@ -2220,15 +2220,16 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 
 	// A stop of a domain that is already not running is done, not an error
 	// (lab 2 O-4: libvirt answers "domain is not running"), as a start of a
-	// running one is (startVMLocked): the stop is recorded below like any
-	// other. A failure while the domain is active, or when whether it is
-	// cannot be read, is still the error it was.
+	// running one is (startVMLocked). A failure while the domain is active,
+	// or when whether it is cannot be read, is still the error it was.
+	noop := false
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
 		if aerr != nil || active {
 			return false
 		}
-		slog.Info("StopVM: the domain is already not running; recording the stop", "vm", vm.Name, "op", op, "error", err)
+		slog.Info("StopVM: the domain is already not running; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+		noop = true
 		return true
 	}
 	if force {
@@ -2248,6 +2249,20 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 				_ = s.virt.DestroyDomain(vm.Name)
 			}
 		}
+	}
+
+	// A no-op stop of a VM whose row holds its set-aside disk copies (error,
+	// pending, starting: a failover start that failed or is under way may
+	// need them put back) leaves the row as it is. Writing stopped/
+	// operator-stop over it would end that hold (health.supersededHoldStates)
+	// on a stop that stopped nothing. The answer is still success, marked as
+	// a no-op in the VM's event.
+	if noop && stopNoopKeepsRow[vm.State] {
+		detail := fmt.Sprintf("already stopped: the domain was not running; the row is left %s, which holds its set-aside disk copies", vm.State)
+		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", detail)
+		pbVM.State = pb.VMState_VM_STOPPED
+		hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
+		return s.vmToProto(ctx, vm.Name)
 	}
 
 	// PCI passthrough on stop: under the active hardware_v2 regime a stopped VM
@@ -2283,7 +2298,11 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", "")
+	evDetail := ""
+	if noop {
+		evDetail = "already stopped: the domain was not running; the operator's stop is recorded"
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
 
 	// Refresh LB backends so stopped VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)
@@ -2293,6 +2312,11 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 
 	return s.vmToProto(ctx, vm.Name)
 }
+
+// stopNoopKeepsRow are the VM states a stop that found the domain already
+// not running leaves alone: the states that hold a VM's set-aside disk
+// copies (health.supersededHoldStates).
+var stopNoopKeepsRow = map[string]bool{"error": true, "pending": true, "starting": true}
 
 func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

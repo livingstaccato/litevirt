@@ -198,7 +198,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
 lv ls [--stack <name>] [--host <name>]    # List VMs
 lv inspect <vm>                           # VM details
 lv start <vm>                             # Start stopped VM
-lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds, recording the stop
+lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds as a no-op, recording the stop unless it is error/pending/starting (those keep their set-aside disk copies held)
 lv restart <vm>                           # Restart VM
 lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)

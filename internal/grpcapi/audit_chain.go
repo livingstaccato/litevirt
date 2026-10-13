@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -41,6 +42,7 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 	resp := &pb.VerifyAuditChainResponse{
 		RowsChecked:      int32(res.RowsChecked),
 		BrokenAtId:       res.BrokenAt,
+		BrokenAtKind:     res.BrokenKind,
 		UnsignedRows:     int32(res.Unsigned),
 		UnverifiableRows: int32(res.Unverifiable),
 		BadSignature:     res.BadSignature,
@@ -88,6 +90,12 @@ type exportCursor struct {
 	Seq  int64  `json:"s"`
 	TS   string `json:"t"`
 	ID   string `json:"i"`
+	// Now is the clock reading a relative bound (--since 24h) was resolved
+	// against on the first page. Every later page resolves it against the same
+	// instant, so the pages of one export answer one window rather than one
+	// that slides while the client pages. Absent from a cursor an older daemon
+	// minted; such a page resolves against its own clock, as before.
+	Now string `json:"n,omitempty"`
 }
 
 func (c exportCursor) encode() string {
@@ -121,6 +129,16 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	now := time.Now().UTC()
+	if after.Now != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, after.Now); perr == nil {
+			now = t
+		}
+	}
+	window, err := parseTimeWindow(req.Since, req.Until, now)
+	if err != nil {
+		return nil, err
+	}
 	limit := int(req.Limit)
 	if limit <= 0 {
 		limit = exportPageDefault
@@ -138,18 +156,22 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	//
 	// The cursor predicate is the ORDER BY written out longhand rather than a row
 	// value, which not every SQLite build accepts.
+	//
+	// The window is applied as instants, not text (corrosion.TimeWindow).
+	where := `(? = '' OR host_name > ? OR (host_name = ? AND (seq > ? OR (seq = ? AND (timestamp > ? OR (timestamp = ? AND id > ?))))))`
+	args := []any{req.Cursor, after.Host, after.Host, after.Seq, after.Seq, after.TS, after.TS, after.ID}
+	if pred, pargs := window.Predicate("timestamp"); pred != "" {
+		where = pred + " AND " + where
+		args = append(pargs, args...)
+	}
 	rows, err := s.db.Query(ctx,
 		`SELECT id, timestamp, username, host_name, action, target, detail, result,
 		        prev_hash, content_hash, key_id, signature, seq
 		 FROM audit_log
-		 WHERE (? = '' OR timestamp >= ?)
-		   AND (? = '' OR timestamp <= ?)
-		   AND (? = '' OR host_name > ? OR (host_name = ? AND (seq > ? OR (seq = ? AND (timestamp > ? OR (timestamp = ? AND id > ?))))))
+		 WHERE `+where+`
 		 ORDER BY host_name ASC, seq ASC, timestamp ASC, id ASC
 		 LIMIT ?`,
-		req.Since, req.Since, req.Until, req.Until,
-		req.Cursor, after.Host, after.Host, after.Seq, after.Seq, after.TS, after.TS, after.ID,
-		limit+1)
+		append(args, limit+1)...)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list audit_log: %v", err)
 	}
@@ -178,7 +200,7 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	// That row is in the table; calling it missing tells the operator rows were
 	// deleted. Under a window, only the seqs not in the table outside it are
 	// reported.
-	windowed := req.Since != "" || req.Until != ""
+	windowed := !window.IsOpen()
 	var gaps []map[string]string
 	prevHost, prevSeq := after.Host, after.Seq
 	for _, r := range rows {
@@ -189,7 +211,7 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 		if host == prevHost && prevSeq > 0 && seq > prevSeq+1 {
 			missing := [][2]int64{{prevSeq + 1, seq - 1}}
 			if windowed {
-				if missing, err = s.seqsAbsentOutsideWindow(ctx, host, prevSeq+1, seq-1, req.Since, req.Until); err != nil {
+				if missing, err = s.seqsAbsentOutsideWindow(ctx, host, prevSeq+1, seq-1, window); err != nil {
 					return nil, err
 				}
 			}
@@ -224,6 +246,7 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 		last = exportCursor{
 			Host: r.String("host_name"), Seq: r.Int64("seq"),
 			TS: r.String("timestamp"), ID: r.String("id"),
+			Now: now.Format(time.RFC3339Nano),
 		}
 	}
 
@@ -252,17 +275,39 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	return resp, nil
 }
 
+// parseTimeWindow reads a request's since/until bounds (corrosion.ParseTimeWindow)
+// and refuses one that names no instant. It used to be compared to the stored
+// stamps verbatim, as text, which returned a silently wrong listing instead.
+//
+// now is what a relative bound (24h) counts back from.
+func parseTimeWindow(since, until string, now time.Time) (corrosion.TimeWindow, error) {
+	w, err := corrosion.ParseTimeWindow(since, until, now)
+	if err != nil {
+		return w, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	return w, nil
+}
+
 // seqsAbsentOutsideWindow returns, as inclusive ranges, the seqs in [from, to]
 // that host has no row for OUTSIDE the since/until window — the part of a
 // windowed export's hole that is a real gap rather than rows the window left
 // out.
-func (s *Server) seqsAbsentOutsideWindow(ctx context.Context, host string, from, to int64, since, until string) ([][2]int64, error) {
+//
+// The window has to be drawn exactly where the export drew it, or a row the
+// export left out reads here as inside the window, is not found "outside" it,
+// and is reported as a deletion. Both therefore take the same TimeWindow.
+func (s *Server) seqsAbsentOutsideWindow(ctx context.Context, host string, from, to int64, window corrosion.TimeWindow) ([][2]int64, error) {
+	pred, pargs := window.Predicate("timestamp")
+	if pred == "" {
+		// No window: nothing is outside it, so every seq in the hole is absent.
+		pred = "1"
+	}
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT seq FROM audit_log
 		 WHERE host_name = ? AND seq BETWEEN ? AND ?
-		   AND NOT ((? = '' OR timestamp >= ?) AND (? = '' OR timestamp <= ?))
+		   AND NOT (`+pred+`)
 		 ORDER BY seq ASC`,
-		host, from, to, since, since, until, until)
+		append([]any{host, from, to}, pargs...)...)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list audit_log outside the window: %v", err)
 	}

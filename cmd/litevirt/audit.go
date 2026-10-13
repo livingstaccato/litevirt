@@ -65,7 +65,7 @@ func newAuditLsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&target, "target", "", "filter by exact target path")
 	cmd.Flags().StringVar(&action, "action", "", "filter by action; trailing * is a prefix glob (e.g. sg.*)")
 	cmd.Flags().StringVar(&user, "user", "", "filter by username")
-	cmd.Flags().StringVar(&since, "since", "", "filter to entries at/after this RFC3339 timestamp")
+	cmd.Flags().StringVar(&since, "since", "", "filter to entries at/after this time (RFC3339, a date like 2026-06-01, or a duration ago like 24h)")
 	return cmd
 }
 
@@ -171,7 +171,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 
 	fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
 	if resp.BrokenAtId != "" {
-		fmt.Fprintf(w, "\nhash mismatch (row content does not match its recorded hash):\n  %s\n", resp.BrokenAtId)
+		fmt.Fprintf(w, "\n%s\n  %s\n", brokenLinkHeading(resp.BrokenAtKind), resp.BrokenAtId)
 	}
 	for _, g := range []struct {
 		title string
@@ -212,6 +212,25 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	}
 	reportAmbiguousRows(w, resp)
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
+}
+
+// brokenLinkHeading names the first broken link by what the daemon found it to
+// be. Every kind is a finding and fails the command; the heading only stops a
+// forked chain — a row that hashes correctly but opens a second chain for its
+// host — from reading as an edited row, which is what sent the lab 1
+// investigation looking for tampering that had not happened.
+func brokenLinkHeading(kind string) string {
+	switch kind {
+	case "forked":
+		return "forked chain (the row hashes correctly but starts a second chain — empty prev_hash — " +
+			"for a host that already has one; see the duplicate seqs under sequence break):"
+	case "unlinked":
+		return "broken link (the row hashes correctly against its own prev_hash, but it does not link to " +
+			"the row before it — a row between them was deleted or rewritten, or the chain branched):"
+	default:
+		// "content", and a daemon older than broken_at_kind, which sends none.
+		return "hash mismatch (row content does not match its recorded hash):"
+	}
 }
 
 // reportAmbiguousRows lists rows with a NUL byte in a hashed field. The content
@@ -269,8 +288,8 @@ func newAuditExportCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().StringVar(&since, "since", "", "filter from this RFC3339 timestamp (inclusive)")
-	cmd.Flags().StringVar(&until, "until", "", "filter up to this RFC3339 timestamp (inclusive)")
+	cmd.Flags().StringVar(&since, "since", "", "filter from this time, inclusive (RFC3339, a date like 2026-06-01, or a duration ago like 24h)")
+	cmd.Flags().StringVar(&until, "until", "", "filter up to this time, inclusive of the whole unit it names (RFC3339, a date, or a duration ago)")
 	cmd.Flags().StringVar(&outPath, "out", "", "write to file (default: stdout)")
 	cmd.Flags().BoolVar(&allowGaps, "allow-gaps", false,
 		"export a chain with seq gaps (rows missing from a host's chain), listing them under seq_gaps, instead of refusing; for investigation, not attestation")

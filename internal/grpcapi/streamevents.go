@@ -373,11 +373,12 @@ func (s *Server) ListAuditLog(ctx context.Context, req *pb.ListAuditLogRequest) 
 	if req.User != "" {
 		conds, args = append(conds, "username = ?"), append(args, req.User)
 	}
-	if req.Since != "" {
-		conds, args = append(conds, "timestamp >= ?"), append(args, req.Since)
+	window, err := parseTimeWindow(req.Since, req.Until, time.Now())
+	if err != nil {
+		return nil, err
 	}
-	if req.Until != "" {
-		conds, args = append(conds, "timestamp <= ?"), append(args, req.Until)
+	if pred, pargs := window.Predicate("timestamp"); pred != "" {
+		conds, args = append(conds, pred), append(args, pargs...)
 	}
 	q := `SELECT timestamp, username, host_name, action, target, detail, result FROM audit_log`
 	if len(conds) > 0 {

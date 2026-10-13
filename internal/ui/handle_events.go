@@ -158,7 +158,14 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 	var parts []string
 	if resp.BrokenAtId != "" {
-		parts = append(parts, "hash mismatch at row "+resp.BrokenAtId)
+		switch resp.BrokenAtKind {
+		case "forked":
+			parts = append(parts, "forked chain at row "+resp.BrokenAtId)
+		case "unlinked":
+			parts = append(parts, "broken link at row "+resp.BrokenAtId)
+		default:
+			parts = append(parts, "hash mismatch at row "+resp.BrokenAtId)
+		}
 	}
 	for _, c := range []struct {
 		label string

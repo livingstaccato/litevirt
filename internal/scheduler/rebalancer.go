@@ -429,16 +429,14 @@ func buildPlacementRequest(vm corrosion.VMRecord, spec *pb.VMSpec, pol vmPolicy,
 		req.Spread = p.Spread
 		req.MaxPerNode = int(p.MaxPerNode)
 	}
+	// The same conversion CreateVM makes, so a destination honours every
+	// selector: a mapping, an exact address, a model, SR-IOV and its parent.
 	for _, d := range spec.Devices {
-		count := int(d.Count)
-		if count <= 0 {
-			count = 1
+		dr := placement.DeviceRequestFor(d)
+		if dr.Count <= 0 {
+			dr.Count = 1
 		}
-		req.Devices = append(req.Devices, placement.DeviceRequest{
-			Type:   d.Type,
-			Count:  count,
-			Vendor: d.Vendor,
-		})
+		req.Devices = append(req.Devices, dr)
 	}
 	// A Secure-Boot/vTPM VM may only be rebalanced onto a capable host (G1) — its
 	// migration would otherwise be refused at execution. Require the matching

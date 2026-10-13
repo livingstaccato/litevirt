@@ -585,12 +585,10 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 		placementReq.PreferLabels = p.Prefer
 		placementReq.Spread = p.Spread
 	}
+	// The same conversion CreateVM makes, so the target honours every
+	// selector: a mapping, an exact address, a model, SR-IOV and its parent.
 	for _, dev := range spec.Devices {
-		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  int(dev.Count),
-			Vendor: dev.Vendor,
-		})
+		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequestFor(dev))
 	}
 	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
 	addCapabilityLabels(&placementReq, spec)

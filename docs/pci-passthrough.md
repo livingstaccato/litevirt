@@ -87,9 +87,18 @@ The placement engine selects a host with enough free devices matching the criter
 
 ```yaml
     devices:
-      - type: "gpu"
-        address: "0000:41:00.0"
+      - address: "0000:41:00.0"
 ```
+
+Name the address alone. The VM is placed on the host that has that device free
+(with no other member of its IOMMU group held by another VM), and takes exactly
+that device. Add a `placement.host` when more than one host has a device at
+that address.
+
+A device's selector is read in a fixed order: `mapping`, then `sriov`, then
+`type` / `vendor`, then `address`. The first one set decides, and the fields
+after it are ignored. So `type: "gpu"` with an `address` is a request for any
+free GPU, not for that address.
 
 ### Common vendor IDs
 
@@ -293,6 +302,14 @@ Reference it from a VM via the compose device spec:
 Mappings are CRDT-replicated (the `resource_mappings` table), so every daemon and the
 `/resource-mappings` UI page see a consistent view. Placement/migration eligibility
 checks that a candidate host has a device registered under each mapping the VM needs.
+
+On a host with more than one device under a mapping, the mapping resolves to
+its **lowest** address there, and that device must be free. A VM keeps the
+device it took when it was created: an update applied to the running VM (a
+live change, or a reconfigure and restart) does not resolve its mapping again.
+A recreate does, so after adding a lower address that another VM holds, a
+recreate on that host is refused, before anything is deleted, until the
+mapping is changed back or the device is freed.
 
 Every mapping change goes through the daemon, which checks `resourcemap.write` at
 `/` and writes one signed audit row naming the caller, the mapping, and the state

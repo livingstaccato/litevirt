@@ -170,23 +170,64 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 // peer — after the teardown it is gone, and main's Select did not see it.
 // No host is preferred for being this one.
 func (s *Server) placeRecreate(ctx context.Context, in *pb.VMSpec, cur *corrosion.VMRecord) (string, error) {
-	spec, err := normalizeCreateVMSpec(in, s.defaultCPUModeCfg)
+	req, err := s.recreatePlacementRequest(ctx, in, cur)
 	if err != nil {
 		return "", err
-	}
-	compose.NormalizeVMSpecResources(spec)
-	req := s.createVMPlacementRequest(ctx, spec, false)
-	if cur != nil {
-		req.Replaces = placement.VMAllocation(*cur)
-		self := func(n string) bool { return n == spec.Name || n == cur.Name }
-		req.AntiAffinity = slices.DeleteFunc(slices.Clone(req.AntiAffinity), self)
-		req.Affinity = slices.DeleteFunc(slices.Clone(req.Affinity), self)
 	}
 	host, err := placement.Select(ctx, s.db, req)
 	if err != nil {
 		return "", placementSelectionError(err)
 	}
 	return host, nil
+}
+
+// recreatePlacementRequest is the request createVM builds for in, as a
+// replacement of cur: what cur holds — its CPU, memory, VM slot and replica
+// count (Replaces) and its PCI devices (ReuseDevicesOf) — is released, since
+// the teardown releases it before the create re-takes it, and cur is not its
+// own (anti-)affinity peer.
+func (s *Server) recreatePlacementRequest(ctx context.Context, in *pb.VMSpec, cur *corrosion.VMRecord) (placement.Request, error) {
+	spec, err := normalizeCreateVMSpec(in, s.defaultCPUModeCfg)
+	if err != nil {
+		return placement.Request{}, err
+	}
+	compose.NormalizeVMSpecResources(spec)
+	req := s.createVMPlacementRequest(ctx, spec, false)
+	if cur != nil {
+		req.Replaces = placement.VMAllocation(*cur)
+		req.ReuseDevicesOf = cur.Name
+		self := func(n string) bool { return n == spec.Name || n == cur.Name }
+		req.AntiAffinity = slices.DeleteFunc(slices.Clone(req.AntiAffinity), self)
+		req.Affinity = slices.DeleteFunc(slices.Clone(req.Affinity), self)
+	}
+	return req, nil
+}
+
+// preflightRecreateDevices refuses, before cur is torn down, a re-create of a
+// VM with PCI devices that placement would refuse once cur is gone: the
+// devices the spec names (an address or a mapping bound exactly, a type
+// counted free) must be placeable on the host the create goes to, or on some
+// host when it is not pinned. The create runs the same placement after the
+// teardown, so a refusal here is one the create would have made with the VM
+// already deleted. A VM with no PCI device is left to the create, as before.
+func (s *Server) preflightRecreateDevices(ctx context.Context, in *pb.VMSpec, cur *corrosion.VMRecord) error {
+	if cur == nil || len(in.GetDevices()) == 0 {
+		return nil
+	}
+	req, err := s.recreatePlacementRequest(ctx, in, cur)
+	if err != nil {
+		return err
+	}
+	if host := req.PinHost; host != "" {
+		if err := placement.ValidatePinned(ctx, s.db, req, host); err != nil {
+			return placementValidationError(err)
+		}
+		return nil
+	}
+	if _, err := placement.Select(ctx, s.db, req); err != nil {
+		return placementSelectionError(err)
+	}
+	return nil
 }
 
 // judgeRecreateOn runs, before the teardown, every judgement the create on

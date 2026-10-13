@@ -202,6 +202,42 @@ func (s *ClusterSnapshot) releaseAllocation(req *Request) bool {
 	return s.adjustAllocation(req, -1)
 }
 
+// ownDevice is one pool entry releaseOwnDevices freed.
+type ownDevice struct {
+	host  string
+	index int
+}
+
+// releaseOwnDevices frees, for req's own evaluation, every pooled PCI device
+// assigned to req.ReuseDevicesOf (see Request). It returns what it freed, for
+// reclaimOwnDevices.
+func (s *ClusterSnapshot) releaseOwnDevices(req *Request) []ownDevice {
+	if req.ReuseDevicesOf == "" {
+		return nil
+	}
+	var freed []ownDevice
+	for host, pool := range s.Devices {
+		for i := range pool {
+			if pool[i].VMName == req.ReuseDevicesOf {
+				pool[i].VMName = ""
+				freed = append(freed, ownDevice{host, i})
+			}
+		}
+	}
+	return freed
+}
+
+// reclaimOwnDevices gives req back every device releaseOwnDevices freed that
+// the evaluation did not reserve: the VM still holds it, so a later request
+// of the same batch must not see it free.
+func (s *ClusterSnapshot) reclaimOwnDevices(req *Request, freed []ownDevice) {
+	for _, d := range freed {
+		if pool := s.Devices[d.host]; d.index < len(pool) && pool[d.index].VMName == "" {
+			pool[d.index].VMName = req.ReuseDevicesOf
+		}
+	}
+}
+
 // restoreAllocation undoes releaseAllocation for a request that was not placed:
 // the workload keeps what it held.
 func (s *ClusterSnapshot) restoreAllocation(req *Request) {

@@ -252,8 +252,8 @@ func TestPlacementDeviceRequestPreservesSelectorPrecedence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := placementDeviceRequest(tt.spec); got != tt.want {
-				t.Fatalf("placementDeviceRequest() = %+v, want %+v", got, tt.want)
+			if got := placement.DeviceRequestFor(tt.spec); got != tt.want {
+				t.Fatalf("DeviceRequestFor() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

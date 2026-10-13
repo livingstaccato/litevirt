@@ -249,6 +249,15 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	if cfg.LogLevel != "" {
 		setEnvDefault("PROVIDE_LOG_LEVEL", cfg.LogLevel)
 	}
+	// provide-telemetry 0.8+ gives CRITICAL its own level above ERROR, and
+	// litevirt never emits at it, so CRITICAL would silence every line including
+	// errors. It is still an accepted setting (it meant ERROR before), so map it
+	// to ERROR. Covers config, LITEVIRT_LOG_LEVEL and PROVIDE_LOG_LEVEL. The WARN
+	// goes through the pre-Setup default logger: it would be filtered at ERROR.
+	if lv, ok := os.LookupEnv("PROVIDE_LOG_LEVEL"); ok && strings.EqualFold(strings.TrimSpace(lv), "CRITICAL") {
+		_ = os.Setenv("PROVIDE_LOG_LEVEL", "ERROR")
+		slog.Warn("telemetry: log level CRITICAL treated as ERROR (litevirt emits nothing above ERROR)")
+	}
 	// Default to "console" (human-readable text), matching the pre-telemetry
 	// daemon's stdlib text handler so an upgrade does not silently flip fleet log
 	// format and break journalctl/grep/alerts. Operators opt into structured logs

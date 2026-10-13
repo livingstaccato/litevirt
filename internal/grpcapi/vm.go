@@ -1954,8 +1954,8 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	}
 
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
-	// usage counts running VMs only, so a stopped VM contributes nothing until
-	// now. Without this, create-time admission is trivially sidestepped: create a
+	// usage counts running and starting VMs only (corrosion.SumVMResourcesByHost),
+	// so a stopped VM contributes nothing until now. Without this, create-time admission is trivially sidestepped: create a
 	// pile of VMs (each fitting at the time), then start them all.
 	//
 	// Deliberately on the OPERATOR paths, not inside startVMLocked. The automated
@@ -1966,13 +1966,23 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// into a partial one. Recovery restores what was already accounted for; only a
 	// human asking for something NEW is admitted.
 	//
-	// Skipped when the VM is already running or starting: host usage counts
-	// both (corrosion.SumVMResourcesByHost), and `lv start` must not be
-	// refused for capacity the VM already occupies. Anything else — stopped,
-	// error, pending — is counted nowhere, so its whole size is admitted as
-	// new to the host.
-	if vm.State == "running" || vm.State == "starting" {
+	// Skipped when the VM is already running: `lv start` must not be refused
+	// for capacity the VM already occupies. A VM in starting is counted too
+	// (countedAgainstHost), at its row's actuals: only what cpu/memMiB add to
+	// those is admitted — a repair that grows it (UpdateVM) — as a grow,
+	// through the same overcommit permission and audit as any start. Anything
+	// else — stopped, error, pending — is counted nowhere, so its whole size
+	// is admitted as new to the host.
+	if vm.State == "running" {
 		return nil, nil
+	}
+	intent := intentVMResident
+	if countedAgainstHost(vm.State) {
+		cpu, memMiB = posOnly(cpu-vm.CPUActual), posOnly(memMiB-vm.MemActual)
+		if cpu == 0 && memMiB == 0 {
+			return nil, nil
+		}
+		intent = intentResourceGrow
 	}
 	if allowOvercommit {
 		if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
@@ -1981,17 +1991,23 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 		s.audit(ctx, "vm.start", vm.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				vm.HostName, cpu, memMiB), "allow-overcommit")
-		return s.reserveWithoutCheck(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB)
+		return s.reserveWithoutCheckFor(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intent)
 	}
 	// Reserve-then-verify (F2): publish this start's demand before deciding,
 	// so a concurrent start on another node sees it instead of both reading a
 	// view containing neither.
 	//
-	// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+	// intentVMResident: a stopped VM contributes nothing to usage OR to the
 	// per-VM overhead subtraction, so starting it adds both its guest memory
-	// and a new qemu overhead.
-	return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intentVMResident)
+	// and a new qemu overhead. A starting one already carries its overhead.
+	return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intent)
 }
+
+// countedAgainstHost reports whether a VM in state is already in its host's
+// usage (corrosion.SumVMResourcesByHost counts running and starting VMs, at
+// their rows' actuals, each with its qemu overhead), so bringing it up again
+// at the same size adds nothing to admit.
+func countedAgainstHost(state string) bool { return state == "running" || state == "starting" }
 
 // hardwareAdoptionRefused fails closed when the active hardware_v2 regime finds a VM
 // in the "blocked" adoption state — its hardware failed the per-VM compatibility

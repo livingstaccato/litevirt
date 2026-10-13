@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -158,15 +159,25 @@ func TestSupersededSweep_StorageThatDoesNotAnswerHoldsNothingAndIsNeverEmpty(t *
 }
 
 // A copy whose removal does not answer is not counted removed, and the sweep
-// or the operator's --remove reports it rather than waiting on it.
+// or the operator's --remove reports it rather than waiting on it. The sweep
+// goes on past it: an eligible copy after it, in a directory that answers, is
+// removed in the same pass (review M2).
 //
 // Mutations: the remove unbounded — red on the time limit; a remove error
-// read as already gone — no error and the copy counted: red.
+// read as already gone — no error and the copy counted: red; the sweep stops
+// at the no-answer — the later copy stays: red.
 func TestSupersededSweep_ARemoveThatDoesNotAnswerIsNotCounted(t *testing.T) {
 	ctx := context.Background()
 	db, dataDir, _ := retentionFixture(t)
 	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
 	gone := supersededAt(t, filepath.Join(dataDir, "disks", "deleted-root.qcow2"), now.Add(-8*24*time.Hour))
+	// Eligible too, listed after gone (set aside later), in a directory that
+	// answers: the sweep removes it this pass all the same.
+	later := supersededAt(t, filepath.Join(t.TempDir(), "pool", "deleted-root.qcow2"), now.Add(-15*24*time.Hour/2))
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "other", HostName: "node-a", State: "running", Spec: "{}"},
+		nil, []corrosion.DiskRecord{{VMName: "other", DiskName: "root", HostName: "node-a", Path: filepath.Join(filepath.Dir(later), "other-root.qcow2"), StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
 	deadSetAsideOps(t, "remove", gone)
 
 	var removed []SupersededCopy
@@ -174,8 +185,8 @@ func TestSupersededSweep_ARemoveThatDoesNotAnswerIsNotCounted(t *testing.T) {
 	setAsideReturnsWithin(t, 3*time.Second, "PurgeSupersededDisks", func() {
 		removed, err = PurgeSupersededDisks(ctx, db, dataDir, 7*24*time.Hour, now)
 	})
-	if !storage.IsFSNoAnswer(err) || len(removed) != 0 {
-		t.Errorf("PurgeSupersededDisks = %+v, %v; want nothing removed and the no-answer", removed, err)
+	if !storage.IsFSNoAnswer(err) || len(removed) != 1 || removed[0].Path != later || exists(later) {
+		t.Errorf("PurgeSupersededDisks = %+v, %v; want only %s removed (after the one that did not answer) and the no-answer", removed, err, later)
 	}
 	setAsideReturnsWithin(t, 3*time.Second, "RemoveSupersededDisks", func() {
 		removed, err = RemoveSupersededDisks(ctx, db, dataDir, []string{gone})
@@ -245,16 +256,22 @@ func TestTendStrandedDisks_ARenameThatDoesNotAnswerHoldsNoPass(t *testing.T) {
 // does not answer holds no RPC.
 //
 // Mutations: the lstat, the rename or the link unbounded — red on the time
-// limit.
+// limit; the look's no-answer read as "nothing there" — the link is tried
+// and fails EEXIST, not the no-answer: red; the link's no-answer reported as
+// "nothing was changed" — red.
 func TestRestoreSupersededDisk_StorageThatDoesNotAnswerHoldsNoRPC(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		op   string // the call that does not answer; "" = every call
+		msg  string // the error says so
 	}{
-		{"the disk's path does not answer", ""},
-		{"the rename after the look does not answer", "rename"},
+		{"the disk's path does not answer", "", "cannot be told"},
+		// Only the look: read as "nothing there", the link would be tried
+		// (and fail on the file that is there) — review M1.
+		{"only the look at the disk's path does not answer", "lstat", "cannot be told"},
+		{"the rename after the look does not answer", "rename", "lands later"},
 		// The disk is renamed back over the link that did not answer.
-		{"the link of the copy into place does not answer", "link"},
+		{"the link of the copy into place does not answer", "link", "may still land"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testReconcilerDB(t)
@@ -274,8 +291,8 @@ func TestRestoreSupersededDisk_StorageThatDoesNotAnswerHoldsNoRPC(t *testing.T) 
 			setAsideReturnsWithin(t, 3*time.Second, "RestoreSupersededDisk", func() {
 				_, err = RestoreSupersededDisk(ctx, db, dataDir, "node-a", copyPath, func(string) bool { return false }, time.Now())
 			})
-			if !storage.IsFSNoAnswer(err) {
-				t.Fatalf("RestoreSupersededDisk error = %v, want the no-answer", err)
+			if !storage.IsFSNoAnswer(err) || !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("RestoreSupersededDisk error = %v, want the no-answer, saying %q", err, tc.msg)
 			}
 			if b, _ := os.ReadFile(path); string(b) != "rebuilt blank" || !exists(copyPath) {
 				t.Fatalf("a restore that could not look changed the disk (%q) or the copy", b)

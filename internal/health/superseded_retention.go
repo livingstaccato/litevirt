@@ -241,8 +241,10 @@ func PurgeSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir str
 	return removed, err
 }
 
-func purgeSuperseded(copies []SupersededCopy, olderThan time.Duration, now time.Time) ([]SupersededCopy, error) {
-	var removed []SupersededCopy
+// purgeSuperseded removes the copies of copies the purge may remove. A
+// removal that does not answer is skipped, not waited on and not counted,
+// and the first such no-answer is returned once the rest are done.
+func purgeSuperseded(copies []SupersededCopy, olderThan time.Duration, now time.Time) (removed []SupersededCopy, noAnswer error) {
 	for _, c := range copies {
 		if c.Held != "" || c.Retained != "" || now.Sub(c.SetAsideAt) < olderThan {
 			continue
@@ -251,13 +253,21 @@ func purgeSuperseded(copies []SupersededCopy, olderThan time.Duration, now time.
 			if os.IsNotExist(err) {
 				continue
 			}
+			if storage.IsFSNoAnswer(err) {
+				// Nothing is removed on a no-answer; the copies after it,
+				// in directories that answer, are still swept this pass.
+				if noAnswer == nil {
+					noAnswer = fmt.Errorf("remove %s: %w", c.Path, err)
+				}
+				continue
+			}
 			return removed, fmt.Errorf("remove %s: %w", c.Path, err)
 		}
 		slog.Info("removed a superseded disk copy", "path", c.Path, "disk", c.DiskPath, "vm", c.VM,
 			"set_aside_at", c.SetAsideAt.Format(time.RFC3339), "bytes", c.SizeBytes)
 		removed = append(removed, c)
 	}
-	return removed, nil
+	return removed, noAnswer
 }
 
 // RemoveSupersededDisks removes the set-aside copies on this host named by

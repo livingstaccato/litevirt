@@ -552,7 +552,13 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		return RestoredCopy{}, fmt.Errorf("%w: %s is not a host-local disk of VM %s", ErrRestoreRefused, c.DiskPath, vm.Name)
 	}
 	out := RestoredCopy{VM: vm.Name, Disk: disk.DiskName, DiskPath: c.DiskPath, Restored: c.Path}
-	if _, err := lstatSetAside(c.DiskPath); err == nil {
+	_, lerr := lstatSetAside(c.DiskPath)
+	if storage.IsFSNoAnswer(lerr) {
+		// Never "nothing there": the copy is not linked over a disk whose
+		// presence cannot be told.
+		return RestoredCopy{}, fmt.Errorf("whether a disk is at %s cannot be told: %w; nothing was changed", c.DiskPath, lerr)
+	}
+	if lerr == nil {
 		out.SetAside = supersededName(c.DiskPath, now)
 		if err := renameSetAside(c.DiskPath, out.SetAside); err != nil {
 			if storage.IsFSNoAnswer(err) {
@@ -566,8 +572,8 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		if _, err := noteStrandedCopy(ctx, db, hostName, vm.Name, hostName, disk.DiskName, c.DiskPath, out.SetAside, now); err != nil {
 			slog.Warn("restore: could not record the copy it set aside; it is kept and listed", "copy", out.SetAside, "error", err)
 		}
-	} else if !os.IsNotExist(err) {
-		return RestoredCopy{}, err
+	} else if !os.IsNotExist(lerr) {
+		return RestoredCopy{}, lerr
 	}
 	// Link, then unlink: a link never replaces an existing file.
 	if err := linkSetAside(c.Path, c.DiskPath); err != nil {
@@ -578,6 +584,13 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 				return out, fmt.Errorf("put %s back at %s: %w; the disk that was there is kept at %s (moving it back failed: %v)",
 					c.Path, c.DiskPath, err, out.SetAside, rerr)
 			}
+		}
+		if storage.IsFSNoAnswer(err) {
+			// The link may still land once the server answers: the disk
+			// path is then a second name of the copy, which stays at its
+			// own name too.
+			return out, fmt.Errorf("put %s back at %s: %w; the link may still land once the server answers, as a second name of the copy at %s (the copy is kept at %s)",
+				c.Path, c.DiskPath, err, c.DiskPath, c.Path)
 		}
 		return out, fmt.Errorf("put %s back at %s: %w; nothing was changed", c.Path, c.DiskPath, err)
 	}

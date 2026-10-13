@@ -430,23 +430,23 @@ func recordedImageName(backing string, names map[string]bool) string {
 }
 
 // deletedImages is the images (name's alone, when set) whose catalog row is
-// deleted on this host. With wait, it waits — up to deletedImageWait — for
-// the row of name to read deleted here: lv image rm deletes it on the host it
-// asks, and asks every host at once.
-func (s *Server) deletedImages(ctx context.Context, name string, wait bool) (map[string]bool, error) {
+// deleted on this host, each with its row's deleted_at. With wait, it waits —
+// up to deletedImageWait — for the row of name to read deleted here: lv image
+// rm deletes it on the host it asks, and asks every host at once.
+func (s *Server) deletedImages(ctx context.Context, name string, wait bool) (map[string]string, error) {
 	deadline := time.Now().Add(s.imagePrune.deleteWaitOr())
 	for {
-		rows, err := s.db.Query(ctx, `SELECT name FROM images WHERE deleted_at IS NOT NULL`)
+		rows, err := s.db.Query(ctx, `SELECT name, deleted_at FROM images WHERE deleted_at IS NOT NULL`)
 		if err != nil {
 			return nil, fmt.Errorf("read the image catalog: %w", err)
 		}
-		out := map[string]bool{}
+		out := map[string]string{}
 		for _, r := range rows {
 			if n := r.String("name"); name == "" || n == name {
-				out[n] = true
+				out[n] = r.String("deleted_at")
 			}
 		}
-		if !wait || name == "" || out[name] || !time.Now().Before(deadline) {
+		if _, ok := out[name]; !wait || name == "" || ok || !time.Now().Before(deadline) {
 			return out, nil
 		}
 		select {
@@ -826,13 +826,14 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	for _, n := range listed {
 		present[n] = true
 	}
-	deleted, err := s.deletedImages(ctx, name, justDeleted && present[name])
+	deletedAt, err := s.deletedImages(ctx, name, justDeleted && present[name])
 	if err != nil {
 		return out, err
 	}
-	for n := range deleted {
-		if !present[n] {
-			delete(deleted, n)
+	deleted := map[string]bool{}
+	for n := range deletedAt {
+		if present[n] {
+			deleted[n] = true
 		}
 	}
 	if hook := s.imagePrune.afterCatalog; hook != nil {
@@ -908,6 +909,9 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 				out.noteSharedKept(f)
 				continue
 			}
+		} else if why := publishedAfterDelete(n, f, deletedAt[n]); why != "" {
+			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
+			continue
 		} else if why := sc.deletedKeep(f, r, n, snap[n], version != ""); why != "" {
 			if why == sc.storeFS {
 				why += sharedKeptHint(n, f, s.hostName)
@@ -940,6 +944,50 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	slices.Sort(out.removed)
 	slices.SortFunc(out.kept, func(a, b *pb.KeptImageFile) int { return strings.Compare(a.Path, b.Path) })
 	return out, nil
+}
+
+// publishedAfterDelete is why file f of a deleted image is not the delete's
+// to remove: it was published after the image's row was deleted (deletedAt).
+// A delete removes what existed when it was made; a file published since
+// belongs to an import of the name after it — one whose revival of the row
+// has not reached this replica, or never will (an older build's import left
+// every replica on a stale tombstone: lab 2 F-1, where a prune took a live
+// image's current file). "" when f was published before the delete.
+//
+// Fail closed: a delete time or a publish time that cannot be read keeps f.
+// The publish time is f's provenance record, else its mtime (a file an
+// earlier build published). A delete recorded to the second covers that
+// whole second, so a file published within it counts as older: the import
+// that revives a row is written after its file is published. The two clocks
+// are two hosts' wall clocks; a re-import closer to the delete than their
+// skew is not told apart, and the replicated revival (corrosion.InsertImage)
+// is what keeps such an image.
+func publishedAfterDelete(name, f, deletedAt string) string {
+	del, err := time.Parse(time.RFC3339Nano, deletedAt)
+	if err != nil {
+		return fmt.Sprintf("its image's delete time %q cannot be read, so whether the file is older than the delete cannot be told", deletedAt)
+	}
+	before := del
+	if del.Equal(del.Truncate(time.Second)) {
+		before = del.Add(time.Second)
+	}
+	var published time.Time
+	if p, ok := image.RecordedProvenance(f); ok && !p.PublishedAt.IsZero() {
+		published = p.PublishedAt
+	} else {
+		fi, err := os.Lstat(f)
+		if err != nil {
+			return fmt.Sprintf("its publish time cannot be read (%v), so whether the file is older than its image's delete cannot be told", err)
+		}
+		published = fi.ModTime()
+	}
+	if published.Before(before) {
+		return ""
+	}
+	return fmt.Sprintf("it was published at %s, after its image was deleted at %s: the delete is not this file's. "+
+		"The image was imported again under its name and this host's catalog still reads the older delete; "+
+		"if the image is meant to be gone, lv image rm %s again removes it",
+		published.UTC().Format(time.RFC3339Nano), deletedAt, name)
 }
 
 // deletedKeep is why the scan keeps f, a file of deleted image n resolved to

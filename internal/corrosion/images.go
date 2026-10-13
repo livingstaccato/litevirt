@@ -25,14 +25,37 @@ type ImageHostRecord struct {
 	ProgressPct float32
 }
 
-// InsertImage creates a new image record.
+// imageDeletedAtSQL is the images row's one write of deleted_at: DeleteImage
+// sets it, and InsertImage clears it (a NULL deleted_at) behind its insert.
+const imageDeletedAtSQL = `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`
+
+// InsertImage creates or replaces an image record, and makes it a live image
+// on every host, a deleted image's name included (lab 2 F-1).
+//
+// The insert alone does not do that. INSERT OR REPLACE writes a whole new row
+// here, but a peer applies the replicated insert as a column-preserving upsert
+// of the columns it names (insertUpsertRewrite), and deleted_at is not one of
+// them: a peer holding the name's tombstone kept it, with the import's
+// checksum and clock, and anti-entropy then took the tombstone back to this
+// host's row. The image left `lv image ls` everywhere, and a prune removed
+// its current file as a deleted image's.
+//
+// So the insert is followed, in the same entry and at a later clock, by
+// DeleteImage's own statement with a NULL deleted_at. Every build since the
+// statement shape ledger knows that shape (a full-PK LWW update), so a peer on
+// an older build revives the row exactly as one on this build: no capability
+// gates it, and none is needed. A peer whose row is newer than both keeps its
+// own, as for any LWW write. A peer that has no row yet gets it from the
+// insert, and the update then changes nothing.
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+	inserted := c.NowTS()
+	revived := c.NowTS() // strictly after inserted: the receiver's LWW gate applies both
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: `INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), now,
-	)
+			Params: []interface{}{img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), inserted}},
+		{SQL: imageDeletedAtSQL, Params: []interface{}{nil, revived, img.Name}},
+	})
 }
 
 // InsertImageHost records that a host has a copy of an image.
@@ -135,11 +158,13 @@ func GetImageHosts(ctx context.Context, c *Client, imageName string) ([]ImageHos
 	return hosts, nil
 }
 
-// DeleteImage tombstones an image.
+// DeleteImage tombstones an image. Its deleted_at is to the nanosecond: a
+// prune keeps a file published after it (grpcapi publishedAfterDelete), and a
+// delete recorded to the second has to cover the whole second.
 func DeleteImage(ctx context.Context, c *Client, name string) error {
 	now := c.NowTS()
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
+		{SQL: imageDeletedAtSQL, Params: []interface{}{nowRFC3339Nano(), now, name}},
 		{SQL: `UPDATE image_hosts SET deleted_at = ?, updated_at = ? WHERE image_name = ?`, Params: []interface{}{nowRFC3339(), now, name}},
 	})
 }

@@ -716,7 +716,11 @@ lv image rm <image>
 #     - a disk create, pull, import or build of the image is in flight, or a
 #       rebuild, rolling recreate or compose deploy update that recreates a VM
 #       from it: each holds the image it creates from, from before its
-#       teardown until its create returns.
+#       teardown until its create returns;
+#     - the file was published after the delete: it belongs to an import of
+#       the name since, which this host's catalog does not show yet (or never
+#       will, when an older build imported it). A delete time or publish time
+#       that cannot be read keeps the file too. lv image rm again removes it.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>

@@ -709,14 +709,16 @@ func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "session id required")
 	}
-	// A refused revoke is audited too (by the handle of what was asked for),
-	// so prefix probing and attempts on another user's session are visible.
+	// A refused revoke is audited too, by the handle of what was asked for and
+	// a fixed reason — never the user-facing message, which can echo a long
+	// prefix — so prefix probing and attempts on another user's session are
+	// visible and the audit log still names no more than a handle.
 	denied := func(target string, err error) (*emptypb.Empty, error) {
 		asked := "session=" + sessionHandle(strings.ToLower(req.Id))
 		if !isHexString(strings.ToLower(req.Id)) {
 			asked = "session=(not a session id)"
 		}
-		s.audit(ctx, "session.revoke", target, asked+" "+status.Convert(err).Message(), "denied")
+		s.audit(ctx, "session.revoke", target, asked+" reason="+revokeDenialReason(err, req.Id), "denied")
 		return nil, err
 	}
 	sess, err := corrosion.GetSession(ctx, s.db, req.Id)
@@ -745,6 +747,24 @@ func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest
 	slog.Info("session revoked", "session", sessionHandle(sess.ID), "username", sess.Username, "by", callerUsername(ctx))
 	s.audit(ctx, "session.revoke", sess.Username, "session="+sessionHandle(sess.ID), "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// revokeDenialReason is the fixed audit reason for a refused revoke of id.
+// resolveSessionPrefix refuses a short prefix and an ambiguous one with the
+// same code; the id's length tells them apart.
+func revokeDenialReason(err error, id string) string {
+	switch status.Code(err) {
+	case codes.NotFound:
+		return "not-found"
+	case codes.PermissionDenied:
+		return "permission-denied"
+	case codes.InvalidArgument:
+		if len(id) < sessionIDMinPrefix {
+			return "too-short"
+		}
+		return "ambiguous"
+	}
+	return status.Code(err).String()
 }
 
 // sessionHandle is a session's display handle: the first sessionShortLen
@@ -828,18 +848,14 @@ func (s *Server) verifyTOTP(ctx context.Context, username, code string) (bool, e
 }
 
 // loginThrottleKey identifies a brute-force bucket. An empty username (OIDC
-// code-flow, which carries no username) falls back to IP-only so the bucket
-// is still meaningful.
-func loginThrottleKey(username, ip string) string {
+// code-flow, which carries no username) is the anonymous, address-only
+// bucket.
+func loginThrottleKey(username, ip string) loginKey {
 	// Normalized like every account lookup, so `ALICE` and `alice ` share
-	// alice's bucket instead of each getting a fresh allowance (I2).
-	username = corrosion.NormalizeUsername(username)
-	if username == "" {
-		username = "_anon"
-	}
-	// An IPv6 client counts by its /64 (auth.AddressBucket), so rotating
-	// addresses inside one allocation is one bucket.
-	return username + "|" + auth.AddressBucket(ip)
+	// alice's bucket instead of each getting a fresh allowance (I2). An IPv6
+	// client counts by its /64 (auth.AddressBucket), so rotating addresses
+	// inside one allocation is one bucket.
+	return loginKey{account: corrosion.NormalizeUsername(username), addr: auth.AddressBucket(ip)}
 }
 
 // newSessionID returns a 256-bit random hex string suitable as a session id.

@@ -646,6 +646,24 @@ Failed logins are throttled per node, in memory:
   write its own `X-Forwarded-For` and choose its per-address key. The
   per-account ceiling still holds; list only your proxies.
 
+A failure counts against exactly the account name the attempt gave
+(normalized: trimmed and lower-cased). Failing as `admin|1` names another,
+nonexistent account and never counts against `admin`; two OIDC subjects such
+as `auth0|abc` and `auth0|xyz` have separate ceilings.
+
+Both limits cover **every login path** to the account on that node: the web
+UI, REST, a direct `lv login` (also over mTLS), the second-factor step
+(including an OIDC login's) and WebAuthn. While an account is locked:
+
+- its **existing sessions keep working**, and new logins are refused with
+  `too many failed login attempts; retry in …`;
+- **on-node root still works**: `lv` run as root on a node presents the host
+  certificate and needs no login (`lv user reset-admin` too);
+- other nodes are unaffected: the state is per node.
+
+To clear it early, restart the daemon on that node (the state is in memory);
+otherwise it ends by itself after the 15-minute lockout.
+
 Both timeouts are configurable in the daemon config under
 `auth.session_idle_timeout` and `auth.session_hard_expiry` (Go duration
 strings, e.g. `8h`, `168h`); the defaults above apply when unset.

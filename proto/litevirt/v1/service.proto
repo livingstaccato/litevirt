@@ -4679,6 +4679,13 @@ service LiteVirt {
 
     // ──: SPICE console info ──
     rpc GetSpiceInfo(GetSpiceInfoRequest) returns (GetSpiceInfoResponse);
+    // ProxySpice carries ONE SPICE channel connection (a SPICE client opens
+    // several) between the caller and the VM's SPICE listener on its host's
+    // 127.0.0.1, forwarded to the owning host as ProxyVNC is. The VM name is
+    // in the "x-vm-name" metadata. The bytes are relayed unchanged: the
+    // client presents the console's password (GetSpiceInfoResponse.password)
+    // itself. `lv spice --launch` / `--listen` use it.
+    rpc ProxySpice(stream SpiceData) returns (stream SpiceData);
 
     // ── Upgrade safety: pre-flight ──
     rpc PreflightUpgrade(PreflightUpgradeRequest) returns (PreflightUpgradeResponse);
@@ -4881,10 +4888,16 @@ message PreflightFinding {
     string message  = 3;       // human-readable detail
 }
 
+// SpiceData is a chunk of one SPICE channel's byte stream (ProxySpice).
+message SpiceData { bytes data = 1; }
+
 message GetSpiceInfoRequest  { string vm_name = 1; }
+// The SPICE listener is bound to the VM host's 127.0.0.1, so host:port is
+// reachable only on that host itself (or through a tunnel to it). A client
+// elsewhere reaches it through ProxySpice.
 message GetSpiceInfoResponse {
-    string host = 1;       // host the VM runs on
-    int32  port = 2;       // SPICE TCP port (libvirt-assigned)
+    string host = 1;       // host the VM runs on (its address, NOT where SPICE listens)
+    int32  port = 2;       // SPICE TCP port (libvirt-assigned) on that host's 127.0.0.1
     string uri  = 3;       // convenience: "spice://<host>:<port>"
     // The password the VM's SPICE console requires ("" when it requires
     // none; docs/ui.md "Console passwords"). Returned only to a caller that

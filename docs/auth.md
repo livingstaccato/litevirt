@@ -899,16 +899,19 @@ with what it holds, in `streamHandlerAudit` (internal/grpcapi), and a test
 fails when one is added without an entry. Exec (`lv exec`, the UI exec page)
 is one RPC per command, each authenticated on its own.
 
-**SPICE is not cut.** SPICE is not proxied through the daemon: it listens on
-the host's `127.0.0.1` and is reached through an SSH tunnel (`lv spice`), so
-an open SPICE session lives as long as that tunnel, whatever happens to the
+**SPICE through litevirt is cut; SPICE through an SSH tunnel is not.** `lv
+spice --launch` and `lv spice --listen` carry each SPICE channel over
+`ProxySpice`, which holds the socket to the VM's SPICE listener for its
+caller and is closed at the cut like a VNC console. A client that reaches the
+listener directly instead (on the VM's host, or through an SSH tunnel to its
+`127.0.0.1`, which the UI's `.vv` file is for) never passes through the
+daemon, so that session lives as long as the tunnel, whatever happens to the
 account. To end one when disabling a user, revoke the user's SSH access to
 the host and kill their SSH session there (`pkill -u <ssh-user> sshd`), which
 ends the tunnel and the SPICE connection in it; restarting the VM also ends
-it. `lv user disable` alone stops only new `lv spice` calls. The console's
-password (ui.md "Console passwords") rotates at the VM's next define, so a
-disabled user who kept a `.vv` file or a printed password can use it only
-until the VM is next defined and restarted.
+it. The console's password (ui.md "Console passwords") rotates at the VM's
+next define, so a disabled user who kept a `.vv` file or a printed password
+can use it only until the VM is next defined and restarted.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that can log in, enabled with no expiry — `lv user delete` applies the same rule — and

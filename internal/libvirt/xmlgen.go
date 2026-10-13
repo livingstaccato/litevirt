@@ -665,7 +665,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	}
 	// SPICE graphics — higher-fidelity console; works with `lv spice <vm>` or
 	// any external client (`remote-viewer`, virt-manager). Listens on
-	// localhost; the daemon proxies connections via ProxySPICE.
+	// localhost; `lv spice --launch` carries it through the daemon (ProxySpice).
 	if cfg.EnableSPICE {
 		dev.Graphics = append(dev.Graphics, graphicsDevice{
 			Type:     "spice",

@@ -379,7 +379,7 @@ A handful of RPCs remain gRPC-only because they're bidirectional
 streams that don't map cleanly onto SSE / chunked HTTP. These will
 move to WebSocket in a later iteration:
 
-- `StreamEvents`, `GetVMLogs`, `ConsoleVM`, `ProxyVNC` — bidirectional or
+- `StreamEvents`, `GetVMLogs`, `ConsoleVM`, `ProxyVNC`, `ProxySpice` — bidirectional or
   WebSocket-shaped. (`ExecContainer` IS wired in REST —
   `POST /api/v1/containers/exec`, with the container name in the body.)
 - `RestoreLive` — keeps an NBD server alive for the duration of the

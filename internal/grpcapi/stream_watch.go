@@ -412,6 +412,8 @@ var streamHandlerAudit = map[string]string{
 		"and the handler selects on its context; a forwarded leg's outgoing stream derives from it",
 	"/litevirt.v1.LiteVirt/ProxyVNC": "holds a TCP socket to the VM's VNC port: closer registered (conn.Close), " +
 		"and the handler selects on its context; a forwarded leg's outgoing stream derives from it",
+	"/litevirt.v1.LiteVirt/ProxySpice": "holds a TCP socket to the VM's SPICE port: closer registered (conn.Close), " +
+		"and the handler selects on its context; a forwarded leg's outgoing stream derives from it",
 	"/litevirt.v1.LiteVirt/GetVMLogs": "holds the VM log file in follow mode: closer registered (f.Close); " +
 		"the follow loop also checks its context",
 	"/litevirt.v1.LiteVirt/StreamEvents":       "holds an event-bus subscription only; its loop selects on the context",

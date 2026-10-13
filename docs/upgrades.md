@@ -1405,6 +1405,17 @@ A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
 
+### SPICE through the daemon
+
+`lv spice --launch` and `--listen` now carry the SPICE console through the
+daemon (`ProxySpice`), because the VM's SPICE listener is on its host's
+`127.0.0.1` and a client never reached it at the host's address. Both the
+host you enter on and the VM's host must run this release; through an older
+one, each connection is refused and `lv spice` says the daemon predates
+`ProxySpice`. Mid-roll, use an SSH tunnel to the VM's host instead
+([ui.md](ui.md#spice-console)). No capability token gates it: an older host
+simply lacks the RPC, and nothing is written.
+
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 
 This release enforces per-NIC policy — security groups, the cluster and host

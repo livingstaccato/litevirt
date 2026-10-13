@@ -111,13 +111,20 @@ func (r *Reconciler) cancelledTransfer(ctx context.Context, vmName string) bool 
 	return err == nil && ev != nil && ev.Transfer
 }
 
-// cancelledSinceStart reports whether vmName's row, re-read now, says its
-// operator stopped it: once startPendingVM has written "starting", that is a
-// stop made while the start was under way, which the start must not
-// override. The read is local and not cut short by the walk budget.
-func (r *Reconciler) cancelledSinceStart(ctx context.Context, vmName string) bool {
-	fresh, err := corrosion.GetVM(context.WithoutCancel(ctx), r.db, vmName)
-	return err == nil && fresh != nil && fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail)
+// cancelledSinceStart reports whether the row of entry (the row the start
+// was decided from), re-read now, says its operator stopped it since the
+// start began — a stop the start must not override. It is one when this
+// pass's "starting" write landed (wroteStarting), or when entry was not
+// itself such a stop. When the write failed and entry was one — a host
+// boot's onboot start over the operator stop it overrides — the row still
+// reads as that stop, which is not a cancel. The read is local and not cut
+// short by the walk budget.
+func (r *Reconciler) cancelledSinceStart(ctx context.Context, entry corrosion.VMRecord, wroteStarting bool) bool {
+	fresh, err := corrosion.GetVM(context.WithoutCancel(ctx), r.db, entry.Name)
+	if err != nil || fresh == nil || fresh.State != "stopped" || !IsOperatorStop(fresh.StateDetail) {
+		return false
+	}
+	return wroteStarting || !(entry.State == "stopped" && IsOperatorStop(entry.StateDetail))
 }
 
 // cancelledStarts is the open vm_start_cancelled records, by VM: the host

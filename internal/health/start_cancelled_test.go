@@ -191,3 +191,34 @@ func TestStartPendingVM_AFailedStartingWriteIsNotACancel(t *testing.T) {
 		t.Fatal("the boot's start of ob was abandoned as a cancel after its own \"starting\" write failed")
 	}
 }
+
+// Re-review 2 m-2: a markerless pending start whose "starting" write failed
+// is still cancelled by a forced stop made while it runs: its entry row was
+// not an operator stop, so a stop the row says now is a cancel. The VM is
+// left stopped, not started over the operator's stop.
+//
+// Mutation: no cancel unless the write landed — the VM is started: red.
+func TestStartPendingVM_ACancelAfterAFailedStartingWriteStands(t *testing.T) {
+	db, fake, r, _ := supersededFixture(t, "pending")
+	ctx := context.Background()
+	if err := db.Execute(ctx, `CREATE TRIGGER inject_starting_fail BEFORE UPDATE OF state ON vms
+		WHEN NEW.name = 'vm1' AND NEW.state = 'starting' BEGIN SELECT RAISE(ABORT, 'inject'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	r.diskStat = func(p string) (os.FileInfo, error) {
+		if err := corrosion.UpdateVMStateStrict(context.Background(), db, "vm1", "stopped", "operator-stop"); err != nil {
+			t.Error(err)
+		}
+		return os.Stat(p)
+	}
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+	for _, e := range fake.EventLog() {
+		if e.Domain == "vm1" && e.Op == "start" {
+			t.Fatal("a start cancelled while it ran was made after its starting write failed")
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, db, "vm1"); vm.State != "stopped" || vm.StateDetail != "operator-stop" {
+		t.Fatalf("row %q/%q, want the stop kept", vm.State, vm.StateDetail)
+	}
+}

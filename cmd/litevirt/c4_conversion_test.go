@@ -60,7 +60,7 @@ func TestC4_ConvertedCommandsRun(t *testing.T) {
 		{"project usage", []string{"project", "usage", "/acme"}, "vCPU used"},
 		// role.go
 		{"role ls", []string{"role", "ls"}, ""},
-		{"role grant", []string{"role", "grant", "Admin", "user:alice", "--path", "/"}, "granted"},
+		{"role grant", []string{"role", "grant", "Admin", "user:alice@local", "--path", "/"}, "granted"},
 		{"role revoke", []string{"role", "revoke", "b1"}, "revoked"},
 		// audit.go
 		{"audit ls", []string{"audit", "ls"}, ""},

@@ -53,7 +53,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		return nil, status.Errorf(codes.InvalidArgument, "oidc_pending is only for an OIDC realm, not %q", realmName)
 	}
 
-	clientIP := throttleClientIP(ctx)
+	// The browser's address when this node's UI or REST gateway relays the
+	// login, else the caller's own (forwardedClientAddress): recorded on the
+	// session and keying the throttle, which otherwise saw every UI login as
+	// 127.0.0.1.
+	clientIP := s.forwardedClientAddress(ctx, req.ClientAddress)
 
 	// A node in WAL quarantine accepts no user login (I8).
 	if err := s.refuseUserBearersInQuarantine(); err != nil {
@@ -81,7 +85,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		throttleKey = loginThrottleKey(p.Subject, clientIP)
 	}
 	if wait := s.loginThrottle.retryAfter(throttleKey); wait > 0 {
-		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" locked out ip="+clientIP, "denied")
+		why := " locked out ip=" + clientIP
+		if s.loginThrottle.accountRetryAfter(throttleKey) > 0 {
+			why = " locked out by the account throttle ip=" + clientIP
+		}
+		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+why, "denied")
 		return nil, status.Errorf(codes.ResourceExhausted,
 			"too many failed login attempts; retry in %s", wait.Round(time.Second))
 	}
@@ -641,7 +649,7 @@ func (s *Server) Logout(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, 
 	}
 	s.kickStreams()
 	slog.Info("user logged out", "username", callerUsername(ctx))
-	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sid, "ok")
+	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sessionHandle(sid), "ok")
 	return &emptypb.Empty{}, nil
 }
 
@@ -666,9 +674,13 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 		return nil, status.Errorf(codes.Internal, "list sessions: %v", err)
 	}
 	resp := &pb.ListSessionsResponse{}
+	own := callerSessionID(ctx)
 	for _, r := range rows {
 		resp.Sessions = append(resp.Sessions, &pb.Session{
-			Id:         r.ID,
+			// The handle, never the id: the id is the session's bearer
+			// secret, and the handle is all RevokeSession needs.
+			Id:         sessionHandle(r.ID),
+			Current:    own != "" && r.ID == own,
 			Username:   r.Username,
 			Realm:      r.Realm,
 			Ip:         r.IP,
@@ -683,29 +695,130 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 
 // RevokeSession terminates a session by id. The owning user can revoke
 // their own; admins can revoke anyone's.
+//
+// The id may also be an unambiguous prefix of at least sessionIDMinPrefix
+// characters, the short form `lv session ls` shows. The full id is the
+// session's bearer secret, so nothing returns it (ListSessions gives the
+// 12-character handle, sessionHandle), and without a prefix an
+// admin could not revoke another user's session from what it can see. A
+// prefix resolves only among the sessions the caller may revoke — its own,
+// or every live session for an admin — so a non-admin learns nothing about
+// another user's sessions: theirs are NotFound, and never make its own
+// prefix ambiguous.
 func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest) (*emptypb.Empty, error) {
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "session id required")
+	}
+	// A refused revoke is audited too (by the handle of what was asked for),
+	// so prefix probing and attempts on another user's session are visible.
+	denied := func(target string, err error) (*emptypb.Empty, error) {
+		asked := "session=" + sessionHandle(strings.ToLower(req.Id))
+		if !isHexString(strings.ToLower(req.Id)) {
+			asked = "session=(not a session id)"
+		}
+		s.audit(ctx, "session.revoke", target, asked+" "+status.Convert(err).Message(), "denied")
+		return nil, err
 	}
 	sess, err := corrosion.GetSession(ctx, s.db, req.Id)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
 	}
 	if sess == nil {
-		return nil, status.Error(codes.NotFound, "session not found")
+		if sess, err = s.resolveSessionPrefix(ctx, req.Id); err != nil {
+			if status.Code(err) == codes.Internal {
+				return nil, err
+			}
+			return denied("", err)
+		}
 	}
 	if sess.Username != callerUsername(ctx) {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, err
+			return denied(sess.Username, err)
 		}
 	}
-	if err := corrosion.RevokeSession(ctx, s.db, req.Id); err != nil {
+	if err := corrosion.RevokeSession(ctx, s.db, sess.ID); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
 	s.kickStreams()
-	slog.Info("session revoked", "id", req.Id, "username", sess.Username, "by", callerUsername(ctx))
-	s.audit(ctx, "session.revoke", sess.Username, "session="+req.Id, "ok")
+	// The handle, never the id: the id is a bearer secret and the audit log
+	// is replicated and read by every admin.
+	slog.Info("session revoked", "session", sessionHandle(sess.ID), "username", sess.Username, "by", callerUsername(ctx))
+	s.audit(ctx, "session.revoke", sess.Username, "session="+sessionHandle(sess.ID), "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// sessionHandle is a session's display handle: the first sessionShortLen
+// characters of its id. The id itself is the bearer secret (lvs_<id>), so a
+// handle is what ListSessions returns and what logs and audit rows name;
+// RevokeSession resolves it as a prefix.
+func sessionHandle(id string) string {
+	return id[:min(sessionShortLen, len(id))]
+}
+
+// sessionIDMinPrefix is the shortest id prefix RevokeSession resolves. Ids
+// are 64 random hex characters; 8 of them (32 bits) leave a collision among
+// live sessions vanishingly unlikely, and an ambiguous one is refused anyway.
+// `lv session ls` shows 12.
+const sessionIDMinPrefix = 8
+
+// sessionShortLen is how much of an id a message may show: what
+// `lv session ls` shows.
+const sessionShortLen = 12
+
+// resolveSessionPrefix finds the one live session, among those the caller may
+// revoke, whose id begins with prefix.
+func (s *Server) resolveSessionPrefix(ctx context.Context, prefix string) (*corrosion.SessionRecord, error) {
+	prefix = strings.ToLower(prefix)
+	if !isHexString(prefix) || len(prefix) >= 64 {
+		return nil, status.Error(codes.NotFound, "session not found")
+	}
+	if len(prefix) < sessionIDMinPrefix {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"session id %q is too short: give at least %d characters of it (lv session ls shows %d)",
+			prefix, sessionIDMinPrefix, sessionShortLen)
+	}
+	rows, err := corrosion.ListLiveSessionsByIDPrefix(ctx, s.db, prefix)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
+	}
+	if RequireRole(ctx, "admin") != nil {
+		caller := callerUsername(ctx)
+		own := rows[:0]
+		for _, r := range rows {
+			if r.Username == caller {
+				own = append(own, r)
+			}
+		}
+		rows = own
+	}
+	switch len(rows) {
+	case 0:
+		return nil, status.Error(codes.NotFound, "session not found")
+	case 1:
+		return &rows[0], nil
+	}
+	// Enough to tell the matches apart in the common case, never more than
+	// 16 characters of a secret.
+	show := min(max(sessionShortLen, len(prefix)+4), 16)
+	matches := make([]string, len(rows))
+	for i, r := range rows {
+		matches[i] = fmt.Sprintf("%s… (%s)", r.ID[:min(show, len(r.ID))], r.Username)
+	}
+	return nil, status.Errorf(codes.InvalidArgument,
+		"session id prefix %q matches %d sessions: %s; give more of the id",
+		prefix, len(rows), strings.Join(matches, ", "))
+}
+
+func isHexString(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, c := range v {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyTOTP delegates to the auth package's TOTP verifier. A successful
@@ -724,7 +837,9 @@ func loginThrottleKey(username, ip string) string {
 	if username == "" {
 		username = "_anon"
 	}
-	return username + "|" + ip
+	// An IPv6 client counts by its /64 (auth.AddressBucket), so rotating
+	// addresses inside one allocation is one bucket.
+	return username + "|" + auth.AddressBucket(ip)
 }
 
 // newSessionID returns a 256-bit random hex string suitable as a session id.

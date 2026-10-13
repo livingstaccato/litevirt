@@ -10611,7 +10611,15 @@ type LoginRequest struct {
 	OidcPending string `protobuf:"bytes,9,opt,name=oidc_pending,json=oidcPending,proto3" json:"oidc_pending,omitempty"`
 	// oidc_binding: the secret BeginOIDCLoginResponse.binding returned to whoever
 	// began the flow; required with oidc_code + oidc_state. Never in a URL.
-	OidcBinding   string `protobuf:"bytes,10,opt,name=oidc_binding,json=oidcBinding,proto3" json:"oidc_binding,omitempty"`
+	OidcBinding string `protobuf:"bytes,10,opt,name=oidc_binding,json=oidcBinding,proto3" json:"oidc_binding,omitempty"`
+	// client_address: the end client's address, recorded on the session
+	// (ListSessions ip) and keying the login throttle. Honoured only from a
+	// caller presenting a cluster HOST certificate over loopback — this node's
+	// own web UI or REST gateway, which pass the browser's address (the HTTP
+	// peer, or from a trusted_proxies peer the forwarded client). Any other
+	// caller, the distributable lv-cli certificate included, is recorded by its
+	// own address. An address that is not an IP literal is ignored.
+	ClientAddress string `protobuf:"bytes,11,opt,name=client_address,json=clientAddress,proto3" json:"client_address,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10712,6 +10720,13 @@ func (x *LoginRequest) GetOidcPending() string {
 func (x *LoginRequest) GetOidcBinding() string {
 	if x != nil {
 		return x.OidcBinding
+	}
+	return ""
+}
+
+func (x *LoginRequest) GetClientAddress() string {
+	if x != nil {
+		return x.ClientAddress
 	}
 	return ""
 }
@@ -19220,15 +19235,21 @@ func (x *BindSecurityGroupsRequest) GetSecurityGroups() []string {
 }
 
 type Session struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"` // opaque session id (the bearer wire token)
-	Username      string                 `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
-	Realm         string                 `protobuf:"bytes,3,opt,name=realm,proto3" json:"realm,omitempty"`
-	Ip            string                 `protobuf:"bytes,4,opt,name=ip,proto3" json:"ip,omitempty"`
-	UserAgent     string                 `protobuf:"bytes,5,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
-	CreatedAt     string                 `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	LastUsedAt    string                 `protobuf:"bytes,7,opt,name=last_used_at,json=lastUsedAt,proto3" json:"last_used_at,omitempty"`
-	ExpiresAt     string                 `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// id: a display HANDLE, the first 12 characters of the session id — never
+	// the session id itself, which is the bearer secret (lvs_<id>). It is what
+	// RevokeSession takes. A daemon older than this field returned the full id.
+	Id         string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Username   string `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	Realm      string `protobuf:"bytes,3,opt,name=realm,proto3" json:"realm,omitempty"`
+	Ip         string `protobuf:"bytes,4,opt,name=ip,proto3" json:"ip,omitempty"`
+	UserAgent  string `protobuf:"bytes,5,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
+	CreatedAt  string `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	LastUsedAt string `protobuf:"bytes,7,opt,name=last_used_at,json=lastUsedAt,proto3" json:"last_used_at,omitempty"`
+	ExpiresAt  string `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// current: this is the session the request was made with. Set by the
+	// daemon, so a client never compares its own bearer with a listed id.
+	Current       bool `protobuf:"varint,9,opt,name=current,proto3" json:"current,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -19319,6 +19340,13 @@ func (x *Session) GetExpiresAt() string {
 	return ""
 }
 
+func (x *Session) GetCurrent() bool {
+	if x != nil {
+		return x.Current
+	}
+	return false
+}
+
 type ListSessionsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
@@ -19407,6 +19435,9 @@ func (x *ListSessionsResponse) GetSessions() []*Session {
 	return nil
 }
 
+// id: the full session id, or an unambiguous prefix of at least 8 characters
+// (a ListSessions handle). A prefix resolves only among the sessions the caller
+// may revoke: its own, or anyone's for an admin.
 type RevokeSessionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -19891,13 +19922,20 @@ func (x *RoleBinding) GetUpdatedAt() string {
 }
 
 type GrantRoleRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Role          string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
-	Principal     string                 `protobuf:"bytes,3,opt,name=principal,proto3" json:"principal,omitempty"`
-	Propagate     bool                   `protobuf:"varint,4,opt,name=propagate,proto3" json:"propagate,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Path      string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	Role      string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Principal string                 `protobuf:"bytes,3,opt,name=principal,proto3" json:"principal,omitempty"`
+	Propagate bool                   `protobuf:"varint,4,opt,name=propagate,proto3" json:"propagate,omitempty"`
+	// refuse_inert_principal: refuse (FailedPrecondition) a grant that would
+	// be stored as a bare user:<name> principal. No caller is ever matched as
+	// a bare user principal (callers are user:<name>@<realm>), so such a
+	// binding grants nothing. Without it a bare principal is stored verbatim
+	// while auth.rbac_realm is off (legacy behavior); with auth.rbac_realm on
+	// the realm grammar already rejects or resolves it.
+	RefuseInertPrincipal bool `protobuf:"varint,5,opt,name=refuse_inert_principal,json=refuseInertPrincipal,proto3" json:"refuse_inert_principal,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *GrantRoleRequest) Reset() {
@@ -19954,6 +19992,13 @@ func (x *GrantRoleRequest) GetPrincipal() string {
 func (x *GrantRoleRequest) GetPropagate() bool {
 	if x != nil {
 		return x.Propagate
+	}
+	return false
+}
+
+func (x *GrantRoleRequest) GetRefuseInertPrincipal() bool {
+	if x != nil {
+		return x.RefuseInertPrincipal
 	}
 	return false
 }
@@ -41991,7 +42036,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\abackend\x18\x02 \x01(\tR\abackend\"]\n" +
 	"\x14DrainBackendResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12-\n" +
-	"\x12active_connections\x18\x02 \x01(\x03R\x11activeConnections\"\xc6\x02\n" +
+	"\x12active_connections\x18\x02 \x01(\x03R\x11activeConnections\"\xed\x02\n" +
 	"\fLoginRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12\x1a\n" +
 	"\bpassword\x18\x02 \x01(\tR\bpassword\x12\x14\n" +
@@ -42005,7 +42050,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11oidc_redirect_uri\x18\b \x01(\tR\x0foidcRedirectUri\x12!\n" +
 	"\foidc_pending\x18\t \x01(\tR\voidcPending\x12!\n" +
 	"\foidc_binding\x18\n" +
-	" \x01(\tR\voidcBinding\"\xf2\x01\n" +
+	" \x01(\tR\voidcBinding\x12%\n" +
+	"\x0eclient_address\x18\v \x01(\tR\rclientAddress\"\xf2\x01\n" +
 	"\rLoginResponse\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x12\n" +
@@ -42749,7 +42795,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x19BindSecurityGroupsRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12!\n" +
 	"\fnetwork_name\x18\x02 \x01(\tR\vnetworkName\x12'\n" +
-	"\x0fsecurity_groups\x18\x03 \x03(\tR\x0esecurityGroups\"\xda\x01\n" +
+	"\x0fsecurity_groups\x18\x03 \x03(\tR\x0esecurityGroups\"\xf4\x01\n" +
 	"\aSession\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x14\n" +
@@ -42762,7 +42808,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\flast_used_at\x18\a \x01(\tR\n" +
 	"lastUsedAt\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\b \x01(\tR\texpiresAt\"1\n" +
+	"expires_at\x18\b \x01(\tR\texpiresAt\x12\x18\n" +
+	"\acurrent\x18\t \x01(\bR\acurrent\"1\n" +
 	"\x13ListSessionsRequest\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\"H\n" +
 	"\x14ListSessionsResponse\x120\n" +
@@ -42801,12 +42848,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tprincipal\x18\x04 \x01(\tR\tprincipal\x12\x1c\n" +
 	"\tpropagate\x18\x05 \x01(\bR\tpropagate\x12\x1d\n" +
 	"\n" +
-	"updated_at\x18\x06 \x01(\tR\tupdatedAt\"v\n" +
+	"updated_at\x18\x06 \x01(\tR\tupdatedAt\"\xac\x01\n" +
 	"\x10GrantRoleRequest\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x1c\n" +
 	"\tprincipal\x18\x03 \x01(\tR\tprincipal\x12\x1c\n" +
-	"\tpropagate\x18\x04 \x01(\bR\tpropagate\"G\n" +
+	"\tpropagate\x18\x04 \x01(\bR\tpropagate\x124\n" +
+	"\x16refuse_inert_principal\x18\x05 \x01(\bR\x14refuseInertPrincipal\"G\n" +
 	"\x11GrantRoleResponse\x122\n" +
 	"\abinding\x18\x01 \x01(\v2\x18.litevirt.v1.RoleBindingR\abinding\"#\n" +
 	"\x11RevokeRoleRequest\x12\x0e\n" +

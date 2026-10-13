@@ -1674,7 +1674,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
 
+	// wroteStarting: this pass's own "starting" write landed, so a stop the
+	// row says from here on was made while the start was under way (the
+	// re-reads before the define and the boot). A failed write leaves the
+	// row as it was — an onboot override's operator stop among them — and
+	// those re-reads are not made.
+	wroteStarting := true
 	if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler"); err != nil {
+		wroteStarting = false
 		slog.Error("reconciler: failover start-marker write failed", "vm", vm.Name, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	} else {
@@ -1937,7 +1944,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// A start the operator cancelled meanwhile (`lv stop --force`) is not
 	// made: the start lease can run out under a slow start (vmLockTTL),
 	// so the cancel may have run inside this one.
-	if r.cancelledSinceStart(ctx, vm.Name) {
+	if wroteStarting && r.cancelledSinceStart(ctx, vm.Name) {
 		slog.Warn("reconciler: not defining the VM — its start was cancelled while it was being made", "vm", vm.Name)
 		return
 	}
@@ -2002,7 +2009,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	}
 	// Again just before the boot: what this pass defined is taken back,
 	// firmware state kept, so the VM is as the cancel found it.
-	if r.cancelledSinceStart(ctx, vm.Name) {
+	if wroteStarting && r.cancelledSinceStart(ctx, vm.Name) {
 		releaseHW()
 		slog.Warn("reconciler: not starting the VM — its start was cancelled while it was being made", "vm", vm.Name)
 		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {

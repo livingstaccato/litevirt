@@ -153,3 +153,41 @@ func TestStartPendingVM_AStopDuringTheStartIsNotOverridden(t *testing.T) {
 		}
 	})
 }
+
+// Re-review m-2: the re-reads before the define and the boot are made only
+// when this pass's own "starting" write landed. A host boot's onboot start
+// of a VM its operator had stopped enters with the row at that stop; when
+// its "starting" write fails, the row still reads stopped/operator-stop,
+// which is not a cancel. The start is made, not abandoned with the domain
+// it found taken down.
+//
+// Mutation: the re-reads made whatever the write did — the VM is not
+// started: red.
+func TestStartPendingVM_AFailedStartingWriteIsNotACancel(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	fake := libvirtfake.New()
+	disk := filepath.Join(t.TempDir(), "ob-root.qcow2")
+	if err := os.WriteFile(disk, []byte("the disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "ob", HostName: "node-a", State: "stopped", StateDetail: operatorStopDetail, Spec: `{"name":"ob","onboot":true}`,
+	}, nil, []corrosion.DiskRecord{{VMName: "ob", DiskName: "root", HostName: "node-a", Path: disk, SizeBytes: 1 << 20, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.DefineDomain(`<domain type='kvm'><name>ob</name><devices></devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `CREATE TRIGGER inject_starting_fail BEFORE UPDATE OF state ON vms
+		WHEN NEW.name = 'ob' AND NEW.state = 'starting' BEGIN SELECT RAISE(ABORT, 'inject'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	writeRecord(t, dataDir, bootBefore)
+	r := restartedReconciler(db, fake, dataDir, bootNow)
+	r.StartOnbootVMs(ctx)
+	if !hwStarted(fake, "ob") {
+		t.Fatal("the boot's start of ob was abandoned as a cancel after its own \"starting\" write failed")
+	}
+}

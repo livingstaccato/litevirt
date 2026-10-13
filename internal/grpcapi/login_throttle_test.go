@@ -18,7 +18,7 @@ func TestLoginThrottle_LocksAfterMaxFailures(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	th := newLoginThrottle()
 	th.now = func() time.Time { return now }
-	key := "bob|10.0.0.1"
+	key := loginThrottleKey("bob", "10.0.0.1")
 
 	for i := 0; i < defaultLoginMaxFailures-1; i++ {
 		if d := th.fail(key); d != 0 {
@@ -37,7 +37,7 @@ func TestLoginThrottle_LocksAfterMaxFailures(t *testing.T) {
 	}
 
 	// A different key is unaffected.
-	if w := th.retryAfter("alice|10.0.0.1"); w != 0 {
+	if w := th.retryAfter(loginThrottleKey("alice", "10.0.0.1")); w != 0 {
 		t.Fatal("unrelated key should not be locked")
 	}
 
@@ -50,7 +50,7 @@ func TestLoginThrottle_LocksAfterMaxFailures(t *testing.T) {
 
 func TestLoginThrottle_SuccessClears(t *testing.T) {
 	th := newLoginThrottle()
-	key := "bob|10.0.0.1"
+	key := loginThrottleKey("bob", "10.0.0.1")
 	for i := 0; i < defaultLoginMaxFailures-1; i++ {
 		th.fail(key)
 	}
@@ -65,11 +65,11 @@ func TestLoginThrottle_SuccessClears(t *testing.T) {
 
 func TestLoginThrottle_NilIsNoop(t *testing.T) {
 	var th *loginThrottle // nil
-	if w := th.retryAfter("x"); w != 0 {
+	if w := th.retryAfter(loginThrottleKey("x", "")); w != 0 {
 		t.Fatal("nil throttle should never lock out")
 	}
-	th.fail("x")    // must not panic
-	th.success("x") // must not panic
+	th.fail(loginThrottleKey("x", ""))    // must not panic
+	th.success(loginThrottleKey("x", "")) // must not panic
 }
 
 // TestLogin_LocksOutAfterRepeatedFailures drives the real Login RPC: after

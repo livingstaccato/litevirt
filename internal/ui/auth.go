@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 )
 
 // withBearerToken attaches the UI's session cookie to outgoing gRPC
@@ -290,10 +291,12 @@ func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := s.grpc.Login(r.Context(), &pb.LoginRequest{
-		Username: username,
-		Password: password,
-		Realm:    realm,
-		TotpCode: totp,
+		Username:      username,
+		Password:      password,
+		Realm:         realm,
+		TotpCode:      totp,
+		UserAgent:     r.UserAgent(),
+		ClientAddress: auth.ClientAddress(r, s.trustedProxies),
 	})
 	if err != nil {
 		slog.Warn("UI login failed", "username", username, "realm", realm, "error", err)

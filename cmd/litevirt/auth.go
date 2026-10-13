@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -34,10 +37,14 @@ func newSessionListCmd() *cobra.Command {
 					return err
 				}
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-				fmt.Fprintln(w, "ID\tUSER\tREALM\tIP\tLAST USED\tEXPIRES")
+				fmt.Fprintln(w, "\tID\tUSER\tREALM\tIP\tLAST USED\tEXPIRES")
 				for _, s := range resp.Sessions {
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-						shortID(s.Id), s.Username, s.Realm, s.Ip, s.LastUsedAt, s.ExpiresAt)
+					mark := "" // the session this command ran with, as the daemon reports it
+					if s.Current {
+						mark = "*"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+						mark, shortID(s.Id), s.Username, s.Realm, s.Ip, s.LastUsedAt, s.ExpiresAt)
 				}
 				return w.Flush()
 			})
@@ -51,17 +58,54 @@ func newSessionRevokeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "revoke <session-id>",
 		Short: "Revoke an active session",
-		Args:  cobra.ExactArgs(1),
+		Long: `Revoke an active session by the ID that lv session ls shows.
+
+The ID column shows a 12-character handle, the start of the session id: the
+full id is the session's bearer secret and the daemon never returns it. Any unambiguous prefix of
+at least 8 characters names the session (a trailing "…" pasted from the table
+is ignored); a prefix that matches more than one session is refused and the
+matches are listed.
+
+You may revoke your own sessions. An admin may revoke anyone's: list them with
+lv session ls --user <name>. A prefix only ever matches sessions you may
+revoke.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			id = strings.TrimSuffix(strings.TrimSuffix(id, "…"), "...")
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: args[0]}); err != nil {
+				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: id}); err != nil {
+					// A daemon older than prefix revoke matches only the full id.
+					// Say so only when this daemon is one; against a current one a
+					// NotFound is just that (a typo, or a session that is not yours).
+					if status.Code(err) == codes.NotFound && len(id) < 64 && daemonListsFullSessionIDs(ctx, c) {
+						return fmt.Errorf("%w (this daemon is older than prefix revoke and matches only the full "+
+							"session id: upgrade it, or end the user's sessions with lv user disable)", err)
+					}
 					return err
 				}
-				fmt.Printf("Session %s revoked.\n", args[0])
+				fmt.Printf("Session %s revoked.\n", id)
 				return nil
 			})
 		},
 	}
+}
+
+// daemonListsFullSessionIDs reports whether the daemon is older than
+// session handles: it lists full 64-character session ids, where a current
+// daemon lists 12-character handles (and resolves them in RevokeSession). It
+// asks about the caller's own sessions only; false when that cannot be told.
+func daemonListsFullSessionIDs(ctx context.Context, c pb.LiteVirtClient) bool {
+	resp, err := c.ListSessions(ctx, &pb.ListSessionsRequest{})
+	if err != nil {
+		return false
+	}
+	for _, s := range resp.Sessions {
+		if len(s.Id) > 12 {
+			return true
+		}
+	}
+	return false
 }
 
 func newTwoFactorCmd() *cobra.Command {
@@ -261,8 +305,10 @@ the release, ` + "`lv cluster upgrade-status`" + `).`,
 	return cmd
 }
 
-// shortID truncates session IDs for table output. Full id is required to
-// revoke, but the short form is enough to recognise.
+// shortID truncates session IDs for table output. The full id is the
+// session's bearer secret: a current daemon lists only a 12-character handle
+// (a no-op here), and this keeps an older daemon's full id off the screen. lv
+// session revoke accepts the short form (an unambiguous prefix).
 func shortID(s string) string {
 	if len(s) > 12 {
 		return s[:12] + "…"

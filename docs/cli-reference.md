@@ -21,8 +21,15 @@ lv login --realm oidc:<name>           # Sign in through an OIDC realm (browser 
 lv logout                              # Log out and remove stored credentials
 lv whoami                              # Show current authenticated identity
 lv session ls [--user <name>]          # List active sessions (admin: any user)
-lv session revoke <session-id>         # Revoke a session immediately
+lv session revoke <session-id>         # Revoke a session immediately (the ID ls shows, or any unambiguous prefix of 8+ chars)
 ```
+
+`lv session ls` shows a 12-character handle for each session (`*` marks your
+current one); the full id is the session's bearer secret and the daemon never
+returns it. `lv session revoke`
+takes that short form: a prefix resolves only among the sessions you may revoke
+(your own; an admin's, anyone's), and one that matches more than one is refused
+with the matches listed.
 
 ## Two-factor authentication
 
@@ -1217,11 +1224,14 @@ enabled with no expiry, and until the cluster upgrade has finished (the release 
 ```bash
 lv role grant <role> <principal> --path <path> [--propagate]
 lv role revoke <binding-id>
-lv role ls [--principal user:alice] [--role <role>]
+lv role ls [--principal user:alice@local] [--role <role>]
 ```
 
-Principals are `user:<name>`, `group:<role>@<realm>` (a legacy role), or a
-directory group `group:<realm>/<group>` (an LDAP group is its DN). Paths are RBAC
+Principals are `user:<name>@<realm>` (a local account is `user:<name>@local`),
+`group:<role>@<realm>` (a legacy role), or a directory group
+`group:<realm>/<group>` (an LDAP group is its DN). Callers are matched as
+`user:<name>@<realm>`, so a bare `user:<name>` would grant nothing: `lv role
+grant` and the web UI refuse it, and warn if an older daemon stored one anyway. Paths are RBAC
 scopes (`/`, `/projects/acme`, `/projects/acme/vms/web-1`). See
 `docs/auth.md` for the role catalog and propagation semantics.
 

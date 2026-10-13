@@ -490,7 +490,7 @@ func (s *Server) revokeUserSessions(ctx context.Context, username string) int {
 	for _, sess := range sessions {
 		if err := corrosion.RevokeSession(ctx, s.db, sess.ID); err != nil {
 			slog.Warn("could not end a session; it is refused at authentication anyway",
-				"username", username, "session", sess.ID, "error", err)
+				"username", username, "session", sessionHandle(sess.ID), "error", err)
 			continue
 		}
 		n++
@@ -604,7 +604,7 @@ func (s *Server) SetLoginPolicy(ctx context.Context, req *pb.SetLoginPolicyReque
 				continue
 			}
 			if rerr := corrosion.RevokeSession(ctx, s.db, sess.ID); rerr != nil {
-				slog.Warn("could not end a session the policy newly covers", "session", sess.ID, "error", rerr)
+				slog.Warn("could not end a session the policy newly covers", "session", sessionHandle(sess.ID), "error", rerr)
 				continue
 			}
 			revoked++

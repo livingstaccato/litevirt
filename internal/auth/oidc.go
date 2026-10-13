@@ -747,6 +747,10 @@ func flowAggregate(key string) string {
 	return key
 }
 
+// AddressBucket is how a client address is counted by a per-address limit
+// (the OIDC sign-in bound, the login throttle): flowAddrKey.
+func AddressBucket(addr string) string { return flowAddrKey(addr) }
+
 // flowAddrKey is the key the per-address bound counts by: an IPv4 address
 // (an IPv4-mapped IPv6 one in its IPv4 form) as itself, an IPv6 address by
 // its /64 — one subscriber's allocation — so a single site cannot spread a

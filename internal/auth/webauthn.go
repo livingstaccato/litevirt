@@ -149,6 +149,11 @@ func (s *WebAuthnService) StoreRegistration(ctx context.Context, username string
 	})
 }
 
+// ErrNoWebAuthnCeremony: FinishLogin found no login ceremony in flight for
+// the user (BeginLogin was not called, the user has no credential, or it was
+// already finished). No assertion was evaluated, so it is not a guess.
+var ErrNoWebAuthnCeremony = errors.New("no in-flight login session")
+
 // BeginLogin mirrors BeginRegistration for the assertion (login)
 // dance.
 func (s *WebAuthnService) BeginLogin(ctx context.Context, username string) ([]byte, error) {
@@ -172,7 +177,7 @@ func (s *WebAuthnService) BeginLogin(ctx context.Context, username string) ([]by
 func (s *WebAuthnService) FinishLogin(ctx context.Context, username string, assertion []byte) error {
 	sess := s.takeSession(username)
 	if sess == nil {
-		return errors.New("no in-flight login session")
+		return ErrNoWebAuthnCeremony
 	}
 	user, err := s.loadUser(ctx, username)
 	if err != nil {

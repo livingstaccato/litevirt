@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/peer"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
@@ -203,8 +202,11 @@ func TestOIDCLogin_SecondFactorHandleHasAnAttemptBound(t *testing.T) {
 	wantCode(t, "the right factor after the attempt bound", err, codes.Unauthenticated)
 }
 
+// peerAt is a caller at ip presenting the host certificate test-host (a
+// trusted host once the test inserts its row): from loopback that is this
+// node's UI or REST gateway, from elsewhere a peer.
 func peerAt(ip string) context.Context {
-	return peer.NewContext(context.Background(), &peer.Peer{Addr: tcpAddr(ip)})
+	return mtlsPeerCtx("test-host", tcpAddr(ip), "")
 }
 
 // beginAt begins a web flow on s as peer, naming claimed as the client
@@ -235,6 +237,9 @@ func beginAt(t *testing.T, s *Server, idp *oidctest.Provider, peerIP, claimed st
 // browser's flood leaves another browser's sign-in alone. Nothing refuses.
 func TestBeginOIDCLogin_BoundPerClientAddress(t *testing.T) {
 	s, idp := oidcServer(t)
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "test-host", Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
 	own := beginAt(t, s, idp, "10.0.0.9", "192.0.2.1")
 	for i := 0; i < 40; i++ {
 		beginAt(t, s, idp, "10.0.0.9", fmt.Sprintf("192.0.2.%d", i+2))
@@ -248,6 +253,30 @@ func TestBeginOIDCLogin_BoundPerClientAddress(t *testing.T) {
 	}
 	if !victim() {
 		t.Fatal("one browser's flood through the UI evicted another browser's sign-in")
+	}
+
+	// Round 1, I1: the lv-cli certificate over loopback is not the UI; its
+	// claimed addresses are ignored and its flood evicts its own flow.
+	cli := func(claimed string) *pb.BeginOIDCLoginResponse {
+		b, err := s.BeginOIDCLogin(mtlsPeerCtx("lv-cli", tcpAddr("127.0.0.1"), ""), &pb.BeginOIDCLoginRequest{Realm: "oidc:corp", ClientAddress: claimed})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	first := cli("192.0.2.200")
+	for i := 0; i < 40; i++ {
+		cli(fmt.Sprintf("192.0.2.%d", i+100))
+	}
+	resp, err := idp.BrowserClient().Get(first.AuthUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	if _, err := s.Login(context.Background(), &pb.LoginRequest{Realm: "oidc:corp",
+		OidcCode: loc.Query().Get("code"), OidcState: first.State, OidcBinding: first.Binding}); err == nil {
+		t.Fatal("the lv-cli certificate rotating client_address was not bounded by its own address")
 	}
 }
 

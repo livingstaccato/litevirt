@@ -79,6 +79,16 @@ func (s *Server) GrantRole(ctx context.Context, req *pb.GrantRoleRequest) (*pb.G
 		}
 		principal = resolved
 	}
+	// What is about to be stored is a bare user principal only while the
+	// realm grammar is off (it rejects or resolves one). No caller is matched
+	// as one, so the binding would be inert: a caller that asks is told so
+	// instead of getting a row that silently grants nothing.
+	if req.RefuseInertPrincipal && auth.IsBareUserPrincipal(principal) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s names no realm and would never match: a caller is matched as user:<name>@<realm>. "+
+				"Grant %s@local for a local account, or %s@oidc:<realm> / %s@ldap:<realm> for a directory one",
+			principal, principal, principal, principal)
+	}
 
 	path := req.Path
 	delegated := adminErr != nil
@@ -339,21 +349,10 @@ func bindingKey(path, role, principal string, propagate bool) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%t", path, role, principal, propagate)
 }
 
-// classifyUserPrincipal splits the body of a `user:<body>` principal into its
-// name and realm. It is realm-QUALIFIED only when the substring after the last
-// '@' names a realm ("local", "oidc:*", or "ldap:*"), so an email address
-// (user:alice@example.com) is treated as a bare username while user:alice@local
-// and user:alice@oidc:corp are qualified. Realms carry a ':' (or are "local")
-// and email domains do not — that is the disambiguation the grammar relies on,
-// which is why we don't treat a bare "contains @" as realm-qualified.
+// classifyUserPrincipal is auth.ClassifyUserPrincipal: the realm grammar the
+// CLI's inert-principal check shares.
 func classifyUserPrincipal(body string) (name, realm string, qualified bool) {
-	if i := strings.LastIndexByte(body, '@'); i > 0 && i < len(body)-1 {
-		suffix := body[i+1:]
-		if suffix == "local" || strings.HasPrefix(suffix, "oidc:") || strings.HasPrefix(suffix, "ldap:") {
-			return body[:i], suffix, true
-		}
-	}
-	return body, "", false
+	return auth.ClassifyUserPrincipal(body)
 }
 
 // resolveGrantPrincipal applies realm-aware grammar to a well-formed principal

@@ -530,6 +530,9 @@ type AuditVerifyResult struct {
 	// BrokenAt is the first row whose content hash does not match a
 	// recomputation. Empty when every chain links correctly.
 	BrokenAt string
+	// BrokenKind says what kind of break BrokenAt is: AuditBrokenContent,
+	// AuditBrokenForked or AuditBrokenUnlinked. Empty when BrokenAt is.
+	BrokenKind string
 	// Unsigned counts rows carrying no signature: written by a host that was not
 	// signing at the time — before it adopted a key, after it retired one, or on
 	// a build older than signing. They are chain-checked only. It includes the
@@ -692,6 +695,36 @@ func (r AuditVerifyResult) Unverified() bool {
 	return len(r.NeverAdopted) > 0 || len(r.Ambiguous) > 0
 }
 
+// brokenLinkKind classifies a row that does not link to the walk's running tail
+// by re-hashing it against the prev_hash it STORED. A row that does not hash
+// even against that was edited.
+//
+// A row that does hash is called a fork only when it has the whole shape of
+// one: an empty prev_hash AND seq 1 repeating a seq 1 the host already has
+// (repeatsSeq1) — a second genesis, which is what a host rebuilt on an empty
+// database writes. Anything else self-consistent is a broken link. That matters
+// because a stored prev_hash is as writable as the content: an edit to an
+// unsigned row mid-chain that blanks prev_hash and recomputes the hash is
+// self-consistent too, and calling IT a fork would tell the operator the one
+// thing that is false. Every kind is still a finding.
+//
+// That holds only while seq is honest. seq is not in the content hash, only
+// under the signature, so on an UNSIGNED row it is as writable as prev_hash: a
+// rewrite that also renumbers the row to seq 1 has exactly a fork's shape and
+// is labelled one. No check can tell the two apart there. A signed row
+// rewritten that way also shows a bad signature.
+func brokenLinkKind(rec AuditRecord, storedPrev, stored string, repeatsSeq1 bool) string {
+	rec.PrevHash = storedPrev
+	switch {
+	case !strings.EqualFold(HashAuditRow(rec), stored):
+		return AuditBrokenContent
+	case storedPrev == "" && repeatsSeq1:
+		return AuditBrokenForked
+	default:
+		return AuditBrokenUnlinked
+	}
+}
+
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
 //
 // Unlike the pre-v45 version it does NOT stop at the first problem. Stopping
@@ -799,6 +832,9 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		linked := strings.EqualFold(HashAuditRow(rec), stored)
 		if !linked && res.BrokenAt == "" {
 			res.BrokenAt = rec.ID
+			last, seen := seqByHost[host]
+			res.BrokenKind = brokenLinkKind(rec, r.String("prev_hash"), stored,
+				r.Int64("seq") == 1 && seen && last == 1)
 		}
 		if run := legacy[host]; run != nil && !linked {
 			run.broken = true

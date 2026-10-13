@@ -769,9 +769,9 @@ func TestFleet_Failback_WaitsForTheReleaseToken(t *testing.T) {
 	// A drain now records what it moved, and the undrain, with the policy on,
 	// fails that VM back; w, drained before the upgrade, has no record and stays.
 	f.addVM(t, "w2", f.a, nil)
-	// The quorum view enforceGate seeded predates the gap since the checker's
-	// last beat, which it reads as a stall; the HA monitor beats and probes in
-	// production. One beat first, then a fresh view.
+	// A fresh quorum view, as the HA monitor's probes keep one in production.
+	// (The gates run the stall heartbeat, so the time since enforceGate seeded
+	// them is not read as a stall.)
 	for _, n := range f.c.Nodes {
 		gates[n.Name].QuorumProof(ctx)
 		peers := map[string]bool{}

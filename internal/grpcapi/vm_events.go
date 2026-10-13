@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -68,11 +69,11 @@ const vmEventsHardLimit = 1000
 // RPC can resume from), the equivalent is to re-ask for a geometrically
 // larger slice of the SAME newest-first window until either the page fills
 // or corrosion returns fewer rows than asked (the table is exhausted).
-func (s *Server) listVMEventsFiltered(ctx context.Context, vmName string, limit int, since string, canRead func(corrosion.VMEventRecord) bool) ([]corrosion.VMEventRecord, error) {
+func (s *Server) listVMEventsFiltered(ctx context.Context, vmName string, limit int, window corrosion.TimeWindow, canRead func(corrosion.VMEventRecord) bool) ([]corrosion.VMEventRecord, error) {
 	fetchLimit := limit
 	var filtered []corrosion.VMEventRecord
 	for {
-		rows, err := corrosion.ListVMEvents(ctx, s.db, vmName, fetchLimit, since)
+		rows, err := corrosion.ListVMEventsWindow(ctx, s.db, vmName, fetchLimit, window)
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +128,11 @@ func (s *Server) ListVMEvents(ctx context.Context, req *pb.ListVMEventsRequest) 
 	canRead := func(r corrosion.VMEventRecord) bool {
 		return req.VmName != "" || s.canReadVM(ctx, r.VMName)
 	}
-	rows, err := s.listVMEventsFiltered(ctx, req.VmName, limit, req.Since, canRead)
+	window, err := parseTimeWindow(req.Since, "", time.Now())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.listVMEventsFiltered(ctx, req.VmName, limit, window, canRead)
 	if err != nil {
 		return nil, err
 	}

@@ -552,9 +552,10 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
 	// Record the guard before the NIC can carry traffic, so it is never live
-	// unguarded. A macvtap NIC bypasses the bridge where guards are enforced
-	// and gets no record.
-	if !strings.HasPrefix(bridge, "direct:") {
+	// unguarded. A macvtap or SR-IOV NIC bypasses the bridge where guards are
+	// enforced and gets no record (guardUnenforcedOnNetwork; an SR-IOV
+	// network's bridge name is its PF, with no direct: prefix).
+	if !strings.HasPrefix(bridge, "direct:") && guardUnenforcedOnNetwork(ctx, s.db, spec.Name) == "" {
 		if rec := dec.record(vm.Name, specUUID(vm.Spec), ordinal, mac, spec); rec != nil {
 			if err := s.writeNewNICGuards(ctx, []corrosion.NICGuardRecord{*rec}); err != nil {
 				code, cause := gateFailure(err)

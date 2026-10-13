@@ -305,7 +305,7 @@ func (s *Server) autoDefineRestoredVM(
 	// NICs are new and guarded by default, as a clone's are (copyNICGuards).
 	var guardRecords []corrosion.NICGuardRecord
 	if renamed {
-		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords)
+		guardRecords = copyNICGuards(targetName, spec.Uuid, ifaceRecords, func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) })
 		if err := s.writeNewNICGuards(ctx, guardRecords); err != nil {
 			return "", "", err
 		}

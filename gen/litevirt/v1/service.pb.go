@@ -6251,6 +6251,12 @@ type DeployStackRequest struct {
 	ScaleVm       string                 `protobuf:"bytes,4,opt,name=scale_vm,json=scaleVm,proto3" json:"scale_vm,omitempty"`
 	DryRun        bool                   `protobuf:"varint,5,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
 	ExpectedHash  string                 `protobuf:"bytes,6,opt,name=expected_hash,json=expectedHash,proto3" json:"expected_hash,omitempty"`
+	// allow_weaken lets the deploy restore a NIC's declared security groups,
+	// or a declared guard that is looser than the one enforced now, over a
+	// runtime change (lv sg bind, lv firewall nic-guard set). Without it such
+	// a restore is withheld and reported. Default false: an older client
+	// never weakens.
+	AllowWeaken   bool `protobuf:"varint,7,opt,name=allow_weaken,json=allowWeaken,proto3" json:"allow_weaken,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6325,6 +6331,13 @@ func (x *DeployStackRequest) GetExpectedHash() string {
 		return x.ExpectedHash
 	}
 	return ""
+}
+
+func (x *DeployStackRequest) GetAllowWeaken() bool {
+	if x != nil {
+		return x.AllowWeaken
+	}
+	return false
 }
 
 type DeployProgress struct {
@@ -6660,8 +6673,10 @@ func (x *StackSummary) GetCreatedAt() *timestamppb.Timestamp {
 }
 
 type DiffStackRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ComposeYaml   string                 `protobuf:"bytes,1,opt,name=compose_yaml,json=composeYaml,proto3" json:"compose_yaml,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ComposeYaml string                 `protobuf:"bytes,1,opt,name=compose_yaml,json=composeYaml,proto3" json:"compose_yaml,omitempty"`
+	// allow_weaken plans as DeployStackRequest.allow_weaken would.
+	AllowWeaken   bool `protobuf:"varint,2,opt,name=allow_weaken,json=allowWeaken,proto3" json:"allow_weaken,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6701,6 +6716,13 @@ func (x *DiffStackRequest) GetComposeYaml() string {
 		return x.ComposeYaml
 	}
 	return ""
+}
+
+func (x *DiffStackRequest) GetAllowWeaken() bool {
+	if x != nil {
+		return x.AllowWeaken
+	}
+	return false
 }
 
 type DiffStackResponse struct {
@@ -41680,14 +41702,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x121\n" +
 	"\x06limits\x18\x03 \x01(\v2\x19.litevirt.v1.DiskIOLimitsR\x06limits\"\x1d\n" +
 	"\aVNCData\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"\xd4\x01\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"\xf7\x01\n" +
 	"\x12DeployStackRequest\x12!\n" +
 	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\x12\x1b\n" +
 	"\ttarget_vm\x18\x02 \x01(\tR\btargetVm\x12%\n" +
 	"\x0escale_override\x18\x03 \x01(\x05R\rscaleOverride\x12\x19\n" +
 	"\bscale_vm\x18\x04 \x01(\tR\ascaleVm\x12\x17\n" +
 	"\adry_run\x18\x05 \x01(\bR\x06dryRun\x12#\n" +
-	"\rexpected_hash\x18\x06 \x01(\tR\fexpectedHash\"\xad\x01\n" +
+	"\rexpected_hash\x18\x06 \x01(\tR\fexpectedHash\x12!\n" +
+	"\fallow_weaken\x18\a \x01(\bR\vallowWeaken\"\xad\x01\n" +
 	"\x0eDeployProgress\x12\x14\n" +
 	"\x05phase\x18\x01 \x01(\tR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x1b\n" +
@@ -41713,9 +41736,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\astopped\x18\x05 \x01(\x05R\astopped\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\x05R\x05error\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"5\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"X\n" +
 	"\x10DiffStackRequest\x12!\n" +
-	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\"E\n" +
+	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\x12!\n" +
+	"\fallow_weaken\x18\x02 \x01(\bR\vallowWeaken\"E\n" +
 	"\x11DiffStackResponse\x120\n" +
 	"\aentries\x18\x01 \x03(\v2\x16.litevirt.v1.DiffEntryR\aentries\"o\n" +
 	"\tDiffEntry\x12\x17\n" +

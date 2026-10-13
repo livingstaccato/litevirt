@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -24,7 +25,15 @@ type DeployStream interface {
 // planned after the failure is abandoned, stack record included. Returning at
 // the first error message therefore turned one failed VM into a half-applied
 // stack (pinned by TestFleet_ComposeAbandonedDeployStreamCancelsTheRestOfTheDeploy).
+//
+// The plan's warnings (a withheld NIC security restore among them) are logged,
+// so a reconcile that applied cleanly still shows what it left alone.
 func DrainDeploy(stream DeployStream) error {
+	return DrainDeployReporting(stream, func(w string) { slog.Warn("gitops: deploy warning", "detail", w) })
+}
+
+// DrainDeployReporting is DrainDeploy handing each warning to warn.
+func DrainDeployReporting(stream DeployStream, warn func(string)) error {
 	var failures []string
 	for {
 		p, err := stream.Recv()
@@ -38,6 +47,9 @@ func DrainDeploy(stream DeployStream) error {
 				return fmt.Errorf("deploy: %s; then the stream ended: %w", strings.Join(failures, "; "), err)
 			}
 			return fmt.Errorf("stream: %w", err)
+		}
+		if p.Phase == "warning" && warn != nil {
+			warn(p.Detail)
 		}
 		if p.Error != "" {
 			name := p.VmName

@@ -461,7 +461,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			}
 			continue
 		}
-		if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && def.Subnet != "" && def.Type != "direct" && def.Type != "sriov" {
+		if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && def.Subnet != "" && guardUnenforcedOnNetwork(ctx, s.db, n.Network) == "" {
 			importGuards = append(importGuards, corrosion.NICGuardRecord{VMName: name, MAC: n.MAC, Mode: corrosion.NICGuardOn,
 				VMUUID: spec.Uuid, Network: n.Network, Ordinal: i})
 		}

@@ -661,8 +661,9 @@ func TestAuditFlags(t *testing.T) {
 func TestComposeUpFlags(t *testing.T) {
 	cmd := newUpCmd()
 	checkFlags(t, cmd, map[string]string{
-		"file": "litevirt-compose.yaml",
-		"yes":  "false",
+		"file":         "litevirt-compose.yaml",
+		"yes":          "false",
+		"allow-weaken": "false",
 	})
 	f := cmd.Flags().Lookup("file")
 	if f.Shorthand != "f" {
@@ -693,7 +694,8 @@ func TestComposePsFlags(t *testing.T) {
 func TestComposeDiffFlags(t *testing.T) {
 	cmd := newDiffCmd()
 	checkFlags(t, cmd, map[string]string{
-		"file": "litevirt-compose.yaml",
+		"file":         "litevirt-compose.yaml",
+		"allow-weaken": "false",
 	})
 }
 

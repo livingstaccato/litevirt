@@ -158,6 +158,13 @@ func identityPath(path string) string { return path + ".sha256" }
 type Provenance struct {
 	SHA256      string    `json:"sha256"`
 	PublishedAt time.Time `json:"published_at"`
+	// RepublishedAt is the last time this same content was published again
+	// under the image — a re-import or pull of identical bytes, which reuses
+	// the file (Publish) — or zero. PublishedAt stays when the file was
+	// written: a restore asks whether the file is unchanged since a backup,
+	// and a republish changes nothing in it. A prune asks whether the file
+	// belongs to an import since the image's delete, and reads both.
+	RepublishedAt time.Time `json:"republished_at,omitempty"`
 }
 
 // RecordedProvenance is path's provenance record; ok is false when it has
@@ -213,6 +220,18 @@ func recordProvenance(path string, p Provenance) error {
 
 func recordDigest(path, digest string) error {
 	return recordProvenance(path, Provenance{SHA256: digest, PublishedAt: time.Now().UTC()})
+}
+
+// recordRepublished stamps path's provenance with RepublishedAt now: digest
+// was published again under the image and the file reused (review round 1,
+// m-2). Its sha256 and PublishedAt stay.
+func recordRepublished(path, digest string) error {
+	p, ok := RecordedProvenance(path)
+	if !ok || p.SHA256 != digest {
+		return fmt.Errorf("%s has no provenance record of this content", path)
+	}
+	p.RepublishedAt = time.Now().UTC()
+	return recordProvenance(path, p)
 }
 
 // EnsureProvenance gives a store file an earlier build published — one with
@@ -358,6 +377,9 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 
 	if rec, ok := RecordedDigest(cur); cur != "" && ok && rec == digest {
 		_ = os.Remove(tmp)
+		if err := recordRepublished(cur, digest); err != nil {
+			return Published{}, fmt.Errorf("record the republish of %s: %w", cur, err)
+		}
 		return Published{Path: cur, Healed: healed, Digest: digest}, nil
 	}
 
@@ -372,6 +394,9 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 			return Published{}, fmt.Errorf("image %q: %s exists and is not this content; refusing", name, ver)
 		}
 		_ = os.Remove(tmp)
+		if err := recordRepublished(ver, digest); err != nil {
+			return Published{}, fmt.Errorf("record the republish of %s: %w", ver, err)
+		}
 	} else if err := recordDigest(ver, digest); err != nil {
 		return Published{}, fmt.Errorf("record identity of %s: %w", ver, err)
 	}

@@ -719,10 +719,13 @@ lv image rm <image>
 #       rebuild, rolling recreate or compose deploy update that recreates a VM
 #       from it: each holds the image it creates from, from before its
 #       teardown until its create returns;
-#     - the file was published after the delete: it belongs to an import of
-#       the name since, which this host's catalog does not show yet (or never
-#       will, when an older build imported it). A delete time or publish time
-#       that cannot be read keeps the file too. lv image rm again removes it.
+#     - the file was published (or the same content imported again) less
+#       than 5 minutes before the delete, or after it — more when hosts have
+#       measured a larger clock skew: the deleting host's clock and this
+#       one's may differ by that much, so it may belong to an import of the
+#       name since the delete. A delete time or publish time that cannot be
+#       read keeps the file too. lv image rm again, after the time the reason
+#       names, removes it.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>
@@ -732,10 +735,14 @@ lv image rm <image>
 #   again) keeps the file. The delete itself is never refused. The REST and
 #   web UI delete (DeleteImage) removes the files the same way, in the
 #   background, and logs each host's outcome.
-#   An import, pull or build under a deleted image's name makes it a live
-#   image again on every host. The host's own record of its copy (the image's
-#   hosts in lv image ls, which peers pull from and placement reads) is
-#   revived on the other hosts only once the cluster upgrade has finished
+#   lv image import under a deleted image's name makes it a live image again
+#   on every host. Nothing else does: lv image pull, lv image build, a compose
+#   deploy's download and lv image push of a deleted name are refused, and
+#   one of them (or a VM create's or the reconciler's copy from a peer) that
+#   lv image rm lands in records nothing and leaves its copy for lv image
+#   prune. The importing host's own record of its copy (the image's hosts in
+#   lv image ls, which peers pull from and placement reads) is revived on the
+#   other hosts only once the cluster upgrade has finished
 #   (lv cluster upgrade-status). Before that the record reads deleted on
 #   every host, this one too once anti-entropy runs, so no peer pulls the
 #   copy and placement does not see it; the import logs this at WARN, and

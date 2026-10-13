@@ -183,3 +183,21 @@ func OpenFilesOfThisProcessForTest(paths []string) (map[string]string, error) {
 	self := strconv.Itoa(os.Getpid())
 	return processesHoldingIn("/proc", func(pid string) bool { return pid == self }, paths)
 }
+
+// SetImageDeleteMarginForTest sets the margin the prune keeps a deleted
+// image's file within (imageDeleteMargin's floor): a fleet test that removes an
+// image moments after importing it removes the file at once.
+func (s *Server) SetImageDeleteMarginForTest(d time.Duration) {
+	s.imagePrune.deleteMargin.Store(int64(d))
+}
+
+// SetImageRecordHookForTest runs fn as an image operation begins recording
+// its copy (recordImage), before it reads the catalog row: a test deletes the
+// image there to land lv image rm inside the operation.
+func (s *Server) SetImageRecordHookForTest(fn func(name string)) {
+	if fn == nil {
+		s.imagePrune.recordHook.Store(nil)
+		return
+	}
+	s.imagePrune.recordHook.Store(&fn)
+}

@@ -30,6 +30,10 @@ func pruneServer(t *testing.T) *Server {
 	s.images = image.NewStore(s.dataDir)
 	_ = s.images.Init()
 	t.Cleanup(s.waitImagePrunes)
+	// A test removes an image moments after publishing it: the margin a
+	// prune keeps a deleted image's file within (imageDeleteMargin) is one
+	// nanosecond, not the clock-skew floor. Its own tests set it.
+	s.SetImageDeleteMarginForTest(time.Nanosecond)
 	return s
 }
 

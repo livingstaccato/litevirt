@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,8 @@ func TestRemoveImage_IsGatedAsDeleteImage(t *testing.T) {
 	_ = s.images.Init()
 	t.Cleanup(s.waitImagePrunes)
 	noSeams(s)
+	// Removed moments after its import: no clock-skew margin.
+	s.SetImageDeleteMarginForTest(time.Nanosecond)
 	carol := userCtx("carol", "operator") // bound VMOperator on one VM only
 	if err := s.RequirePerm(carol, "/", "image.import", "operator"); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("the test needs an operator without image.import on /: %v", err)
@@ -293,40 +296,38 @@ func standaloneQcow2(t *testing.T) []byte {
 	return b
 }
 
-// I3: a pull of the deleted image that begins after the prune read the
-// catalog — reviving the row the prune holds as deleted — keeps the file.
-func TestPruneImages_APullDuringThePruneKeepsTheImage(t *testing.T) {
+// I3: an operator's import of the deleted image that runs after the prune
+// read the catalog — reviving the row the prune holds as deleted — keeps the
+// file. (A pull no longer revives a deleted name: review round 1 of the F-1
+// fix, I-1.)
+func TestPruneImages_AnImportDuringThePruneKeepsTheImage(t *testing.T) {
 	s := pruneServer(t)
 	noSeams(s)
 	f := deletedImage(t, s, "ubuntu")
-	url, started, release := blockingSource(t, standaloneQcow2(t))
-	done := make(chan error, 1)
 	s.imagePrune.afterCatalog = func() {
-		go func() {
-			done <- s.PullImage(&pb.PullImageRequest{Name: "ubuntu", SourceUrl: url, Format: "qcow2"}, &mockPullStreamR2{ctx: adminCtx()})
-		}()
-		<-started
+		src := filepath.Join(t.TempDir(), "n.qcow2")
+		filledQcow2(t, src, "N ")
+		b, _ := os.ReadFile(src)
+		if err := s.ImportImage(&mockImportImageStream{ctx: adminCtx(), msgs: []*pb.ImportImageRequest{{Name: "ubuntu", Format: "qcow2", Chunk: b}}}); err != nil {
+			t.Errorf("import: %v", err)
+		}
 	}
 	resp, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"})
-	release()
-	if perr := <-done; perr != nil {
-		t.Fatalf("pull: %v", perr)
-	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r := keptFor(resp, f); len(resp.Removed) != 0 || !strings.Contains(r, "pull") {
-		t.Fatalf("removed %v, reason %q; want the file kept for the pull", resp.Removed, keptFor(resp, f))
+	if r := keptFor(resp, f); len(resp.Removed) != 0 || !strings.Contains(r, "import") {
+		t.Fatalf("removed %v, reason %q; want the file kept for the import", resp.Removed, keptFor(resp, f))
 	}
 }
 
-// I3: a compose deploy's auto-pull of the image in flight holds it: its
-// catalog row is written only after the download.
-func TestPruneImages_AComposeAutoPullInFlightHoldsADeletedImage(t *testing.T) {
+// I3, as review round 1 of the F-1 fix changed it: a compose deploy's
+// download never brings a deleted image back (I-1), so it is refused before
+// anything is downloaded and holds nothing; the prune removes the deleted
+// image's older version.
+func TestPruneImages_AComposeDownloadOfADeletedImageIsRefusedAndHoldsNothing(t *testing.T) {
 	s := pruneServer(t)
 	noSeams(s)
-	// An older version of the image is here and no current one: the deploy
-	// pulls the image, and the prune judges the older version.
 	older := publishVersion(t, s, "ubuntu", "O ", "")
 	if err := os.Remove(filepath.Join(s.images.ImageDir(), "ubuntu.current")); err != nil {
 		t.Fatal(err)
@@ -338,24 +339,25 @@ func TestPruneImages_AComposeAutoPullInFlightHoldsADeletedImage(t *testing.T) {
 	if err := corrosion.DeleteImage(ctx, s.db, "ubuntu"); err != nil {
 		t.Fatal(err)
 	}
-	url, started, release := blockingSource(t, standaloneQcow2(t))
+	url, started, _ := blockingSource(t, standaloneQcow2(t))
 	cf := &compose.File{
 		Images: map[string]compose.ImageDef{"ubuntu": {Source: url, Format: "qcow2"}},
 		VMs:    map[string]compose.VMDef{"web": {Image: "ubuntu"}},
 	}
-	done := make(chan error, 1)
-	go func() { done <- s.autoPullImages(ctx, cf, &mockDeployStream{ctx: ctx}) }()
-	<-started
-	resp, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"})
-	release()
-	if perr := <-done; perr != nil {
-		t.Fatalf("auto-pull: %v", perr)
+	if err := s.autoPullImages(ctx, cf, &mockDeployStream{ctx: ctx}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a compose download of a deleted image: %v, want FailedPrecondition", err)
 	}
+	select {
+	case <-started:
+		t.Fatal("a compose deploy downloaded a deleted image")
+	default:
+	}
+	resp, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Removed) != 0 || !strings.Contains(keptFor(resp, older), "in flight") {
-		t.Fatalf("removed %v, reason %q; want the file kept for the auto-pull in flight", resp.Removed, keptFor(resp, older))
+	if !slices.Contains(resp.Removed, older) {
+		t.Fatalf("removed %v, kept %v; want the deleted image's older version removed", resp.Removed, resp.Kept)
 	}
 }
 

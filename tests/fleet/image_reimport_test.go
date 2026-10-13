@@ -210,7 +210,7 @@ func TestFleet_ImageReimport_PruneKeepsAFilePublishedAfterTheDelete(t *testing.T
 			reason = k.GetReason()
 		}
 	}
-	if !strings.Contains(reason, "after its image was deleted") {
+	if !strings.Contains(reason, "it may belong to an import of the name since the delete") {
 		t.Errorf("kept reason for %s = %q, want it to say the file was published after the delete", f, reason)
 	}
 	for _, req := range []*pb.PruneImagesRequest{{Name: "imgq"}, {}} {

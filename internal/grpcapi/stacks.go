@@ -2144,6 +2144,13 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		// of the image is removed as a deleted image's (holdImagePublish).
 		release := s.holdImagePublish(img)
 		defer release()
+		// A compose download never brings a deleted name back (only lv
+		// image import does), and one whose row is deleted while it runs
+		// records nothing.
+		startDeleted, err := s.imageOpStart(ctx, img, imageOpCompose)
+		if err != nil {
+			return err
+		}
 		s.recordImageProvenance(ctx, img)
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)
@@ -2170,24 +2177,19 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		s.imagePublished(ctx, img, pub)
 		// Persist image + image_host records.
 		now := time.Now().UTC().Format(time.RFC3339)
-		if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+		if err := s.recordImage(ctx, imageOpCompose, startDeleted, corrosion.ImageRecord{
 			Name:      img,
 			Format:    def.Format,
 			SourceURL: def.Source,
 			Checksum:  recordedChecksum(def.Checksum, pub.Digest),
-		}); err != nil {
-			s.noteStateWriteFail(corrosion.OpImage, err)
-			return status.Errorf(codes.Internal, "record auto-pulled image %q: %v", img, err)
-		}
-		if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
+		}, corrosion.ImageHostRecord{
 			ImageName: img,
 			HostName:  s.hostName,
 			Path:      pub.Path,
 			Status:    "ready",
 			PulledAt:  now,
 		}); err != nil {
-			s.noteStateWriteFail(corrosion.OpImageHost, err)
-			return status.Errorf(codes.Internal, "record auto-pulled image host %q: %v", img, err)
+			return status.Errorf(status.Code(err), "record auto-pulled image %q: %v", img, status.Convert(err).Message())
 		}
 
 		slog.Info("image auto-pulled successfully", "image", img)

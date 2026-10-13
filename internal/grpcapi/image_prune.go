@@ -23,6 +23,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -836,6 +837,10 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 			deleted[n] = true
 		}
 	}
+	var margin time.Duration
+	if len(deleted) > 0 {
+		margin = s.imageDeleteMargin(ctx)
+	}
 	if hook := s.imagePrune.afterCatalog; hook != nil {
 		hook()
 	}
@@ -909,7 +914,7 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 				out.noteSharedKept(f)
 				continue
 			}
-		} else if why := publishedAfterDelete(n, f, deletedAt[n]); why != "" {
+		} else if why := publishedAfterDelete(n, f, deletedAt[n], margin); why != "" {
 			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
 			continue
 		} else if why := sc.deletedKeep(f, r, n, snap[n], version != ""); why != "" {
@@ -946,34 +951,63 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	return out, nil
 }
 
+// imageDeleteMarginFloor is the least margin publishedAfterDelete keeps a
+// deleted image's file within: hlc.MaxSkewMS, the skew between two hosts'
+// clocks litevirt tolerates before it refuses a peer's timestamps.
+const imageDeleteMarginFloor = time.Duration(hlc.MaxSkewMS) * time.Millisecond
+
+// imageDeleteMargin is how far apart the deleting host's clock and this
+// host's may be: the larger of imageDeleteMarginFloor and the largest clock
+// skew any host recorded against a peer in the last 10 minutes (clock_skew).
+// The measurement records only skew over a second, and a row ages out, so a
+// missing row says nothing and never lowers the floor.
+func (s *Server) imageDeleteMargin(ctx context.Context) time.Duration {
+	m := imageDeleteMarginFloor
+	if d := s.imagePrune.deleteMargin.Load(); d > 0 {
+		m = time.Duration(d)
+	}
+	cutoff := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	rows, err := s.db.Query(ctx,
+		`SELECT COALESCE(MAX(ABS(skew_seconds)), 0) AS s FROM clock_skew WHERE updated_at > ?`, cutoff)
+	if err == nil && len(rows) == 1 {
+		if sk := time.Duration(rows[0].Float("s") * float64(time.Second)); sk > m {
+			m = sk
+		}
+	}
+	return m
+}
+
 // publishedAfterDelete is why file f of a deleted image is not the delete's
-// to remove: it was published after the image's row was deleted (deletedAt).
-// A delete removes what existed when it was made; a file published since
-// belongs to an import of the name after it — one whose revival of the row
-// has not reached this replica, or never will (an older build's import left
-// every replica on a stale tombstone: lab 2 F-1, where a prune took a live
-// image's current file). "" when f was published before the delete.
+// to remove ("" when it is). A delete removes what existed when it was made;
+// a file published since belongs to an import of the name after it — one
+// whose revival of the row has not reached this replica, or never will (an
+// older build's import left every replica on a stale tombstone: lab 2 F-1,
+// where a prune took a live image's current file).
+//
+// The two times are two hosts' wall clocks — deletedAt the deleting host's,
+// the publish time this host's — which may be apart by up to margin
+// (imageDeleteMargin). So the file is the delete's only when it was published
+// more than margin before the delete; one published at or after
+// deletedAt-margin is kept (review round 1, I-3). A delete recorded to the
+// second (an earlier build's) is read as its second's first instant, the
+// earliest it can have been made.
 //
 // Fail closed: a delete time or a publish time that cannot be read keeps f.
-// The publish time is f's provenance record, else its mtime (a file an
-// earlier build published). A delete recorded to the second covers that
-// whole second, so a file published within it counts as older: the import
-// that revives a row is written after its file is published. The two clocks
-// are two hosts' wall clocks; a re-import closer to the delete than their
-// skew is not told apart, and the replicated revival (corrosion.InsertImage)
-// is what keeps such an image.
-func publishedAfterDelete(name, f, deletedAt string) string {
+// The publish time is the latest of f's provenance record's publish and
+// republish (a re-import of the same content, image.Store.Publish), else its
+// mtime (a file an earlier build published). A file kept only by this rule is
+// removed by lv image rm again once margin has passed since it was published.
+func publishedAfterDelete(name, f, deletedAt string, margin time.Duration) string {
 	del, err := time.Parse(time.RFC3339Nano, deletedAt)
 	if err != nil {
 		return fmt.Sprintf("its image's delete time %q cannot be read, so whether the file is older than the delete cannot be told", deletedAt)
 	}
-	before := del
-	if del.Equal(del.Truncate(time.Second)) {
-		before = del.Add(time.Second)
-	}
 	var published time.Time
-	if p, ok := image.RecordedProvenance(f); ok && !p.PublishedAt.IsZero() {
+	if p, ok := image.RecordedProvenance(f); ok && (!p.PublishedAt.IsZero() || !p.RepublishedAt.IsZero()) {
 		published = p.PublishedAt
+		if p.RepublishedAt.After(published) {
+			published = p.RepublishedAt
+		}
 	} else {
 		fi, err := os.Lstat(f)
 		if err != nil {
@@ -981,13 +1015,12 @@ func publishedAfterDelete(name, f, deletedAt string) string {
 		}
 		published = fi.ModTime()
 	}
-	if published.Before(before) {
+	if published.Before(del.Add(-margin)) {
 		return ""
 	}
-	return fmt.Sprintf("it was published at %s, after its image was deleted at %s: the delete is not this file's. "+
-		"The image was imported again under its name and this host's catalog still reads the older delete; "+
-		"if the image is meant to be gone, lv image rm %s again removes it",
-		published.UTC().Format(time.RFC3339Nano), deletedAt, name)
+	return fmt.Sprintf("it was published at %s, within %s of its image's delete at %s or after it (two hosts' clocks may be that far apart): "+
+		"it may belong to an import of the name since the delete. If the image is meant to be gone, lv image rm %s again after %s removes it",
+		published.UTC().Format(time.RFC3339Nano), margin, deletedAt, name, published.Add(margin).UTC().Format(time.RFC3339))
 }
 
 // deletedKeep is why the scan keeps f, a file of deleted image n resolved to
@@ -1376,6 +1409,8 @@ type imagePruneState struct {
 	afterCatalog func()                                    // test seam: runs after the catalog is read
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
+	deleteMargin atomic.Int64                              // test seam (ns); imageDeleteMarginFloor when 0
+	recordHook   atomic.Pointer[func(name string)]         // test seam: runs as recordImage begins
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }

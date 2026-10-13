@@ -26,36 +26,76 @@ type ImageHostRecord struct {
 }
 
 // imageDeletedAtSQL is the images row's one write of deleted_at: DeleteImage
-// sets it, and InsertImage clears it (a NULL deleted_at) behind its insert.
+// sets it, and ReviveImage clears it (a NULL deleted_at) behind its insert.
 const imageDeletedAtSQL = `UPDATE images SET deleted_at = ?, updated_at = ? WHERE name = ?`
 
-// InsertImage creates or replaces an image record, and makes it a live image
-// on every host, a deleted image's name included (lab 2 F-1).
-//
-// The insert alone does not do that. INSERT OR REPLACE writes a whole new row
-// here, but a peer applies the replicated insert as a column-preserving upsert
-// of the columns it names (insertUpsertRewrite), and deleted_at is not one of
-// them: a peer holding the name's tombstone kept it, with the import's
-// checksum and clock, and anti-entropy then took the tombstone back to this
-// host's row. The image left `lv image ls` everywhere, and a prune removed
-// its current file as a deleted image's.
-//
-// So the insert is followed, in the same entry and at a later clock, by
-// DeleteImage's own statement with a NULL deleted_at. Every build since the
-// statement shape ledger knows that shape (a full-PK LWW update), so a peer on
-// an older build revives the row exactly as one on this build: no capability
-// gates it, and none is needed. A peer whose row is newer than both keeps its
-// own, as for any LWW write. A peer that has no row yet gets it from the
-// insert, and the update then changes nothing.
+// imageInsertSQL is the images row's insert. On this host INSERT OR REPLACE
+// writes a whole new row; a peer applies it as a column-preserving upsert of
+// the columns it names (insertUpsertRewrite), and deleted_at is not one of
+// them, so a peer's tombstone survives it.
+const imageInsertSQL = `INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+func imageInsert(c *Client, img ImageRecord) Statement {
+	return Statement{SQL: imageInsertSQL,
+		Params: []interface{}{img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), c.NowTS()}}
+}
+
+// InsertImage creates or replaces an image record WITHOUT reviving a deleted
+// one: a peer that holds the name's tombstone keeps it, and anti-entropy then
+// takes it back to this host's row, so a delete wins. Every write that is not
+// an operator's import is this one — a peer's push, an auto-pull or heal, a
+// pull, a build — so a copy that finishes after lv image rm never brings the
+// image back (review round 1, I-1). The caller refuses outright when the row
+// already reads deleted here (grpcapi Server.recordImage).
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
-	inserted := c.NowTS()
-	revived := c.NowTS() // strictly after inserted: the receiver's LWW gate applies both
+	return c.ExecuteBatch(ctx, []Statement{imageInsert(c, img)})
+}
+
+// ReviveImage is InsertImage that also makes the image live on every host, a
+// deleted image's name included (lab 2 F-1): an operator's import under that
+// name. The insert alone leaves each peer's tombstone in place (see
+// imageInsertSQL); anti-entropy then took the tombstone back to this host's
+// row, the image left `lv image ls` everywhere, and a prune removed its
+// current file as a deleted image's.
+//
+// So the insert is followed, in the same entry and at a strictly later clock,
+// by DeleteImage's own statement with a NULL deleted_at. Every supported build
+// applies that shape as a full-PK LWW update (v1.3.0 emits it itself), so a
+// peer on an older build revives the row exactly as one on this build: no
+// capability gates it. A peer whose row is newer than both keeps its own, as
+// for any LWW write. A peer with no row yet gets it from the insert, and the
+// update then changes nothing.
+//
+// One window converges to a mixed row (review round 1, m-1): a delete stamped
+// strictly between the insert's clock T1 and the revive's T2 — about one
+// clock tick apart. A peer then skips the insert (its delete is newer than
+// T1) and applies the revive (T2 is newer), so it ends live with the OLD
+// content's checksum, format and size at T2 while this host holds the new
+// content at T2; anti-entropy settles the tie by content and may pick the old
+// checksum everywhere. A revive carrying the full row would close it, but that
+// is a new statement shape and would need the release latch, as
+// imageHostReviveSQL does.
+func ReviveImage(ctx context.Context, c *Client, img ImageRecord) error {
+	ins := imageInsert(c, img)
+	revived := c.NowTS() // strictly after the insert's: the receiver's LWW gate applies both
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `INSERT OR REPLACE INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			Params: []interface{}{img.Name, img.Format, img.SourceURL, img.Checksum, img.SizeBytes, nowRFC3339(), inserted}},
+		ins,
 		{SQL: imageDeletedAtSQL, Params: []interface{}{nil, revived, img.Name}},
 	})
+}
+
+// ImageDeletedAt is the deleted_at of image name's row here: "" when the row
+// is live or absent.
+func ImageDeletedAt(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx, `SELECT COALESCE(deleted_at, '') AS d FROM images WHERE name = ?`, name)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].String("d"), nil
 }
 
 // InsertImageHost records that a host has a copy of an image.
@@ -78,7 +118,8 @@ func InsertImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
 // A host on a build before release_2026_11_v1 does not know this shape, and
 // an unknown shape back-pressures the sender's whole stream to it. So it is
 // written only once the release token has durably latched (grpcapi
-// Server.recordImageHost), exactly as the replication compare-and-set is.
+// Server.recordImageHost), exactly as the replication compare-and-set is, and
+// it is listed in latchGatedShapes, which pins every such shape per token.
 const imageHostReviveSQL = `INSERT INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(image_name, host_name) DO UPDATE SET
@@ -88,27 +129,15 @@ const imageHostReviveSQL = `INSERT INTO image_hosts (image_name, host_name, path
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`
 
-// ReviveImageHost is InsertImageHost over a deleted row: it records that a
-// host has a copy of an image, and clears the row's tombstone on every host
-// that applies it. Only once the release token has latched (see
-// imageHostReviveSQL).
+// ReviveImageHost is InsertImageHost that also clears the row's tombstone on
+// every host that applies it. Only once the release token has latched (see
+// imageHostReviveSQL); after that it is every image_hosts write's form,
+// whatever the row reads here — the delete may not have reached this host
+// yet (review round 1, I-2).
 func ReviveImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
 	return c.Execute(ctx, imageHostReviveSQL,
 		ih.ImageName, ih.HostName, ih.Path, ih.Status, ih.PulledAt, c.NowTS(),
 	)
-}
-
-// ImageHostDeleted reports whether host's row for image is here and deleted:
-// the row lv image rm left, which a plain InsertImageHost cannot revive on a
-// peer.
-func ImageHostDeleted(ctx context.Context, c *Client, imageName, hostName string) (bool, error) {
-	rows, err := c.Query(ctx,
-		`SELECT 1 AS one FROM image_hosts WHERE image_name = ? AND host_name = ? AND deleted_at IS NOT NULL`,
-		imageName, hostName)
-	if err != nil {
-		return false, err
-	}
-	return len(rows) > 0, nil
 }
 
 // UpdateImageHostProgress updates the download progress for a pulling image.

@@ -64,6 +64,12 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			release()
 		}
 	}()
+	// A pull never brings a deleted name back (only lv image import does),
+	// and one whose row is deleted while it runs records nothing.
+	startDeleted, err := s.imageOpStart(stream.Context(), req.Name, imageOpPull)
+	if err != nil {
+		return err
+	}
 	s.recordImageProvenance(stream.Context(), req.Name)
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
@@ -74,23 +80,18 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// Create the catalog + per-host rows up front (visible in ListImages during the
 	// pull). These are not cosmetic: a lost write leaves an image on disk that
 	// placement/failover cannot see, so fail closed rather than pull invisibly.
-	if err := corrosion.InsertImage(bgCtx, s.db, corrosion.ImageRecord{
+	if err := s.recordImage(bgCtx, imageOpPull, startDeleted, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
-	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImage, err)
-		return status.Errorf(codes.Internal, "record image: %v", err)
-	}
-	if err := s.recordImageHost(bgCtx, corrosion.ImageHostRecord{
+	}, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      s.images.ImagePath(req.Name),
 		Status:    "pulling",
 		PulledAt:  now,
 	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImageHost, err)
-		return status.Errorf(codes.Internal, "record image host: %v", err)
+		return err
 	}
 
 	// Create a progress channel
@@ -112,7 +113,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			return
 		}
 		// Persist final result with a background context — stream ctx may be cancelled.
-		if err := s.persistImageRecord(req, pub); err != nil {
+		if err := s.persistImageRecord(req, pub, startDeleted); err != nil {
 			slog.Error("image record persist failed after pull", "name", req.Name, "error", err)
 			if uerr := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); uerr != nil {
 				s.noteStateWriteFail(corrosion.OpImageHost, uerr)
@@ -158,39 +159,10 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	return nil
 }
 
-// recordImageHost writes this host's image_hosts row for a copy it now
-// holds. Over the row lv image rm left here — the image was deleted and is
-// imported, pulled or built again under its name — it writes the reviving
-// form (corrosion.ReviveImageHost), which clears the tombstone on every peer;
-// the plain insert would leave it there, and anti-entropy would delete this
-// host's row again (lab 2 F-1). The reviving form is a statement shape a host
-// before release_2026_11_v1 cannot apply, so until the release token has
-// durably latched here the plain insert is written and the gap logged: the
-// image lists, but the copy's record reads deleted on every host (this one
-// too, once anti-entropy runs) until it is imported again after the upgrade.
-func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostRecord) error {
-	deleted, err := corrosion.ImageHostDeleted(ctx, s.db, ih.ImageName, ih.HostName)
-	if err != nil {
-		return fmt.Errorf("read this host's record of image %q: %w", ih.ImageName, err)
-	}
-	if !deleted {
-		return corrosion.InsertImageHost(ctx, s.db, ih)
-	}
-	if s.ReleaseTokenLatched() {
-		return corrosion.ReviveImageHost(ctx, s.db, ih)
-	}
-	slog.Warn("image: this host's copy of an image imported again under a deleted image's name is recorded, "+
-		"but the record reads deleted on the other hosts, and on this one once anti-entropy runs, until the cluster "+
-		"upgrade finishes (lv cluster upgrade-status): no peer pulls the copy and placement does not see it; "+
-		"import it again after the upgrade",
-		"image", ih.ImageName, "host", ih.HostName)
-	return corrosion.InsertImageHost(ctx, s.db, ih)
-}
-
 // persistImageRecord writes the image and image_host records after a successful pull.
 // The recorded checksum is the published content's own sha256 — what disks
 // built on it now are built on — whether or not the request named one.
-func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Published) error {
+func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Published, startDeleted string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -204,26 +176,20 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Publishe
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, imageOpPull, startDeleted, corrosion.ImageRecord{
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
 		Checksum:  recordedChecksum(req.Checksum, pub.Digest),
 		SizeBytes: sizeBytes,
-	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImage, err)
-		return fmt.Errorf("persist image record: %w", err)
-	}
-
-	if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
+	}, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      path,
 		Status:    "ready",
 		PulledAt:  now,
 	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImageHost, err)
-		return fmt.Errorf("persist image_host record: %w", err)
+		return fmt.Errorf("persist image records: %w", err)
 	}
 
 	slog.Info("image record persisted", "name", req.Name)

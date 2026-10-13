@@ -376,7 +376,7 @@ For example:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vmName := args[0]
 			if listen != "" {
-				ln, err := listenVNCLoopback(listen)
+				ln, err := listenConsoleLoopback(listen)
 				if err != nil {
 					return err
 				}

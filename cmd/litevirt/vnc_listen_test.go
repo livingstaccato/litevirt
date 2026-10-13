@@ -21,12 +21,12 @@ import (
 // Mutation "accept any address" — red.
 func TestListenVNCLoopback_RefusesANonLoopbackAddress(t *testing.T) {
 	for _, addr := range []string{"0.0.0.0:0", "192.0.2.10:0", ":0"} {
-		if ln, err := listenVNCLoopback(addr); err == nil {
+		if ln, err := listenConsoleLoopback(addr); err == nil {
 			ln.Close()
 			t.Errorf("--listen %s was accepted", addr)
 		}
 	}
-	ln, err := listenVNCLoopback("127.0.0.1:0")
+	ln, err := listenConsoleLoopback("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("--listen 127.0.0.1:0: %v", err)
 	}
@@ -78,7 +78,7 @@ func (c *vncClientFake) ProxyVNC(ctx context.Context, _ ...grpc.CallOption) (grp
 func TestServeVNCListener_CarriesAViewerOverProxyVNC(t *testing.T) {
 	st := &vncStreamFake{sent: make(chan []byte, 4), toViewer: make(chan []byte, 4)}
 	c := &vncClientFake{stream: st}
-	ln, err := listenVNCLoopback("127.0.0.1:0")
+	ln, err := listenConsoleLoopback("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

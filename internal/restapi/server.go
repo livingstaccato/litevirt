@@ -1103,6 +1103,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The daemon records this gateway's client_address on the session and
+	// keys the login throttle on it (it is a loopback caller), so it is the
+	// HTTP peer's (or, from a trusted proxy, the forwarded client's), never
+	// the body's.
+	req.ClientAddress = auth.ClientAddress(r, s.trustedProxies)
 	resp, err := s.grpc.Login(s.grpcCtx(r), &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)

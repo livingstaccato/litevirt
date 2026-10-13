@@ -53,7 +53,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		return nil, status.Errorf(codes.InvalidArgument, "oidc_pending is only for an OIDC realm, not %q", realmName)
 	}
 
-	clientIP := throttleClientIP(ctx)
+	// The browser's address when this node's UI or REST gateway relays the
+	// login, else the caller's own (forwardedClientAddress): recorded on the
+	// session and keying the throttle, which otherwise saw every UI login as
+	// 127.0.0.1.
+	clientIP := s.forwardedClientAddress(ctx, req.ClientAddress)
 
 	// A node in WAL quarantine accepts no user login (I8).
 	if err := s.refuseUserBearersInQuarantine(); err != nil {
@@ -64,14 +68,24 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// locked out from too many recent failures. Keyed on the attempted
 	// username so a correct password can't be ground out, and on IP so one
 	// attacker can't lock a victim's account from afar.
-	throttleKey := loginThrottleKey(req.Username, clientIP)
+	//
+	// An OIDC realm takes no username from the client: the account is what
+	// the IdP proves. Its failures are charged to the anonymous bucket (or,
+	// resuming, to the subject the IdP proved, below), never to whatever a
+	// client put in the username field, which would let a failed exchange
+	// charge a real account's ceiling.
+	throttleUser := req.Username
+	if strings.HasPrefix(realmName, "oidc:") {
+		throttleUser = ""
+	}
+	throttleKey := loginThrottleKey(throttleUser, clientIP)
 	var pending *auth.Principal
 	if oidcResume {
 		// The principal the IdP proved is held on this node under the
 		// handle; nothing about it comes from this request.
 		p, ok := s.oidcPending.reserve(req.OidcPending, realmName)
 		if !ok {
-			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle", "denied")
+			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated,
 				"this OIDC login is unknown or expired on this node (or used up its attempts); log in again")
 		}
@@ -81,7 +95,11 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		throttleKey = loginThrottleKey(p.Subject, clientIP)
 	}
 	if wait := s.loginThrottle.retryAfter(throttleKey); wait > 0 {
-		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" locked out ip="+clientIP, "denied")
+		why := " locked out ip=" + clientIP
+		if s.loginThrottle.accountRetryAfter(throttleKey) > 0 {
+			why = " locked out by the account throttle ip=" + clientIP
+		}
+		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+why, "denied")
 		return nil, status.Errorf(codes.ResourceExhausted,
 			"too many failed login attempts; retry in %s", wait.Round(time.Second))
 	}
@@ -124,7 +142,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			// flow is now spent and the code was never presented. Not counted
 			// against the shared anonymous bucket (that would let a stray
 			// callback lock out every OIDC user of this node), but audited.
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" OIDC login redeemed by a client that did not begin it", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" OIDC login redeemed by a client that did not begin it ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, err.Error())
 		}
 		if errors.Is(err, auth.ErrOIDCFlowUnknown) {
@@ -132,19 +150,19 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			// does not count against the shared anonymous bucket — a stray
 			// or replayed callback must not lock every OIDC user of this
 			// node out.
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unknown OIDC state", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unknown OIDC state ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, err.Error())
 		}
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			s.loginThrottle.fail(throttleKey)
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 		}
 		if errors.Is(err, auth.ErrRealmUnavailable) {
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unavailable", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unavailable ip="+clientIP, "denied")
 			return nil, status.Errorf(codes.Unavailable, "realm unavailable: %v", err)
 		}
-		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" error", "denied")
+		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" error ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Internal, "authenticate: %v", err)
 	}
 
@@ -159,7 +177,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		for _, id := range entryIDs(principal) {
 			own, berr := corrosion.IdentityOwner(ctx, s.db, realmName, id)
 			if berr != nil {
-				s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+				s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable ip="+clientIP, "denied")
 				return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
 			}
 			if own.Contested() {
@@ -181,7 +199,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// `lv role grant`.
 	if realmName != "local" {
 		if err := auth.EnsureUserShadow(ctx, s.db, principal, "viewer"); err != nil {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" shadow refused", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" shadow refused ip="+clientIP, "denied")
 			switch {
 			case errors.Is(err, auth.ErrShadowPending):
 				return nil, status.Errorf(codes.Unavailable, "retry: %v", err)
@@ -198,7 +216,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// normalizes (corrosion.NormalizeUsername): from here on the subject is
 	// the stored name, so `ALICE` is checked as the account `alice` is (I2).
 	if u, uerr := corrosion.GetUser(ctx, s.db, principal.Subject); uerr != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed", "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Internal, "look up account: %v", uerr)
 	} else if u != nil {
 		principal.Subject = u.Username
@@ -208,7 +226,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// no second-factor prompt either. Checked only after the credentials
 	// verified, so it tells nothing to someone who does not hold them.
 	if err := s.refuseInactiveAccount(ctx, principal.Subject); err != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message(), "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message()+" ip="+clientIP, "denied")
 		return nil, err
 	}
 
@@ -227,7 +245,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if bindID != "" {
 		res, berr := corrosion.ResolveIdentityBinding(ctx, s.db, principal.Subject, realmName)
 		if berr != nil {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable ip="+clientIP, "denied")
 			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
 		}
 		if res.Contested() {
@@ -268,7 +286,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// with none gets an enrollment-only session rather than no session.
 	required, enrolled, perr := s.secondFactorRequirement(ctx, principal.Subject, realmName)
 	if perr != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable", "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Unavailable, "evaluate the second-factor policy: %v", perr)
 	}
 	oidcLogin := (hasOIDCCode || oidcResume) && !hasPassword
@@ -292,7 +310,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 				}
 				handle = h
 			}
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor required", "pending")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor required ip="+clientIP, "pending")
 			return &pb.LoginResponse{Requires_2Fa: true, OidcPending: handle}, nil
 		}
 		return &pb.LoginResponse{Requires_2Fa: true}, nil
@@ -304,7 +322,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 		if !ok {
 			s.loginThrottle.fail(throttleKey)
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid second factor")
 		}
 	}
@@ -641,7 +659,7 @@ func (s *Server) Logout(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, 
 	}
 	s.kickStreams()
 	slog.Info("user logged out", "username", callerUsername(ctx))
-	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sid, "ok")
+	s.audit(ctx, "auth.logout", callerUsername(ctx), "session="+sessionHandle(sid), "ok")
 	return &emptypb.Empty{}, nil
 }
 
@@ -666,9 +684,13 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 		return nil, status.Errorf(codes.Internal, "list sessions: %v", err)
 	}
 	resp := &pb.ListSessionsResponse{}
+	own := callerSessionID(ctx)
 	for _, r := range rows {
 		resp.Sessions = append(resp.Sessions, &pb.Session{
-			Id:         r.ID,
+			// The handle, never the id: the id is the session's bearer
+			// secret, and the handle is all RevokeSession needs.
+			Id:         sessionHandle(r.ID),
+			Current:    own != "" && r.ID == own,
 			Username:   r.Username,
 			Realm:      r.Realm,
 			Ip:         r.IP,
@@ -683,29 +705,150 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 
 // RevokeSession terminates a session by id. The owning user can revoke
 // their own; admins can revoke anyone's.
+//
+// The id may also be an unambiguous prefix of at least sessionIDMinPrefix
+// characters, the short form `lv session ls` shows. The full id is the
+// session's bearer secret, so nothing returns it (ListSessions gives the
+// 12-character handle, sessionHandle), and without a prefix an
+// admin could not revoke another user's session from what it can see. A
+// prefix resolves only among the sessions the caller may revoke — its own,
+// or every live session for an admin — so a non-admin learns nothing about
+// another user's sessions: theirs are NotFound, and never make its own
+// prefix ambiguous.
 func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest) (*emptypb.Empty, error) {
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "session id required")
+	}
+	// A refused revoke is audited too, by the handle of what was asked for and
+	// a fixed reason — never the user-facing message, which can echo a long
+	// prefix — so prefix probing and attempts on another user's session are
+	// visible and the audit log still names no more than a handle.
+	denied := func(target string, err error) (*emptypb.Empty, error) {
+		asked := "session=" + sessionHandle(strings.ToLower(req.Id))
+		if !isHexString(strings.ToLower(req.Id)) {
+			asked = "session=(not a session id)"
+		}
+		s.audit(ctx, "session.revoke", target, asked+" reason="+revokeDenialReason(err, req.Id), "denied")
+		return nil, err
 	}
 	sess, err := corrosion.GetSession(ctx, s.db, req.Id)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
 	}
 	if sess == nil {
-		return nil, status.Error(codes.NotFound, "session not found")
+		if sess, err = s.resolveSessionPrefix(ctx, req.Id); err != nil {
+			if status.Code(err) == codes.Internal {
+				return nil, err
+			}
+			return denied("", err)
+		}
 	}
 	if sess.Username != callerUsername(ctx) {
 		if err := RequireRole(ctx, "admin"); err != nil {
-			return nil, err
+			return denied(sess.Username, err)
 		}
 	}
-	if err := corrosion.RevokeSession(ctx, s.db, req.Id); err != nil {
+	if err := corrosion.RevokeSession(ctx, s.db, sess.ID); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
 	s.kickStreams()
-	slog.Info("session revoked", "id", req.Id, "username", sess.Username, "by", callerUsername(ctx))
-	s.audit(ctx, "session.revoke", sess.Username, "session="+req.Id, "ok")
+	// The handle, never the id: the id is a bearer secret and the audit log
+	// is replicated and read by every admin.
+	slog.Info("session revoked", "session", sessionHandle(sess.ID), "username", sess.Username, "by", callerUsername(ctx))
+	s.audit(ctx, "session.revoke", sess.Username, "session="+sessionHandle(sess.ID), "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// revokeDenialReason is the fixed audit reason for a refused revoke of id.
+// resolveSessionPrefix refuses a short prefix and an ambiguous one with the
+// same code; the id's length tells them apart.
+func revokeDenialReason(err error, id string) string {
+	switch status.Code(err) {
+	case codes.NotFound:
+		return "not-found"
+	case codes.PermissionDenied:
+		return "permission-denied"
+	case codes.InvalidArgument:
+		if len(id) < sessionIDMinPrefix {
+			return "too-short"
+		}
+		return "ambiguous"
+	}
+	return status.Code(err).String()
+}
+
+// sessionHandle is a session's display handle: the first sessionShortLen
+// characters of its id. The id itself is the bearer secret (lvs_<id>), so a
+// handle is what ListSessions returns and what logs and audit rows name;
+// RevokeSession resolves it as a prefix.
+func sessionHandle(id string) string {
+	return id[:min(sessionShortLen, len(id))]
+}
+
+// sessionIDMinPrefix is the shortest id prefix RevokeSession resolves. Ids
+// are 64 random hex characters; 8 of them (32 bits) leave a collision among
+// live sessions vanishingly unlikely, and an ambiguous one is refused anyway.
+// `lv session ls` shows 12.
+const sessionIDMinPrefix = 8
+
+// sessionShortLen is how much of an id a message may show: what
+// `lv session ls` shows.
+const sessionShortLen = 12
+
+// resolveSessionPrefix finds the one live session, among those the caller may
+// revoke, whose id begins with prefix.
+func (s *Server) resolveSessionPrefix(ctx context.Context, prefix string) (*corrosion.SessionRecord, error) {
+	prefix = strings.ToLower(prefix)
+	if !isHexString(prefix) || len(prefix) >= 64 {
+		return nil, status.Error(codes.NotFound, "session not found")
+	}
+	if len(prefix) < sessionIDMinPrefix {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"session id %q is too short: give at least %d characters of it (lv session ls shows %d)",
+			prefix, sessionIDMinPrefix, sessionShortLen)
+	}
+	rows, err := corrosion.ListLiveSessionsByIDPrefix(ctx, s.db, prefix)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
+	}
+	if RequireRole(ctx, "admin") != nil {
+		caller := callerUsername(ctx)
+		own := rows[:0]
+		for _, r := range rows {
+			if r.Username == caller {
+				own = append(own, r)
+			}
+		}
+		rows = own
+	}
+	switch len(rows) {
+	case 0:
+		return nil, status.Error(codes.NotFound, "session not found")
+	case 1:
+		return &rows[0], nil
+	}
+	// Enough to tell the matches apart in the common case, never more than
+	// 16 characters of a secret.
+	show := min(max(sessionShortLen, len(prefix)+4), 16)
+	matches := make([]string, len(rows))
+	for i, r := range rows {
+		matches[i] = fmt.Sprintf("%s… (%s)", r.ID[:min(show, len(r.ID))], r.Username)
+	}
+	return nil, status.Errorf(codes.InvalidArgument,
+		"session id prefix %q matches %d sessions: %s; give more of the id",
+		prefix, len(rows), strings.Join(matches, ", "))
+}
+
+func isHexString(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, c := range v {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyTOTP delegates to the auth package's TOTP verifier. A successful
@@ -715,16 +858,14 @@ func (s *Server) verifyTOTP(ctx context.Context, username, code string) (bool, e
 }
 
 // loginThrottleKey identifies a brute-force bucket. An empty username (OIDC
-// code-flow, which carries no username) falls back to IP-only so the bucket
-// is still meaningful.
-func loginThrottleKey(username, ip string) string {
+// code-flow, which carries no username) is the anonymous, address-only
+// bucket.
+func loginThrottleKey(username, ip string) loginKey {
 	// Normalized like every account lookup, so `ALICE` and `alice ` share
-	// alice's bucket instead of each getting a fresh allowance (I2).
-	username = corrosion.NormalizeUsername(username)
-	if username == "" {
-		username = "_anon"
-	}
-	return username + "|" + ip
+	// alice's bucket instead of each getting a fresh allowance (I2). An IPv6
+	// client counts by its /64 (auth.AddressBucket), so rotating addresses
+	// inside one allocation is one bucket.
+	return loginKey{account: corrosion.NormalizeUsername(username), addr: auth.AddressBucket(ip)}
 }
 
 // newSessionID returns a 256-bit random hex string suitable as a session id.

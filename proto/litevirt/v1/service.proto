@@ -888,13 +888,20 @@ message PushImageRequest   { string name = 1; string target_host = 2; }
 // the call. deleted_image: the caller has just deleted image name; the host
 // waits (bounded) for its own catalog to show the delete before it decides.
 // An older host ignores it and keeps the current file.
+// version: one file of image name (its file name, its path, or the digest
+// after '@'): only that file is judged, and it is removed although the store
+// may be shared with other hosts — the operator asserts no other host's disk
+// is built on it. Every other keep still applies. A host that honours it
+// echoes it in the response's version; an older host does not (it would
+// prune the whole image), so a caller probes with dry_run first.
 message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3;
-    bool deleted_image = 4; }
-// kept: each file of a deleted image the host kept, and why.
+    bool deleted_image = 4; string version = 5; }
+// kept: each file the host kept, and why.
 // removes_deleted_images: the host's build removes a deleted image's current
 // file (false from an older build, which always keeps it).
+// version: the request's version, when this build honoured it.
 message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3;
-    repeated KeptImageFile kept = 4; bool removes_deleted_images = 5; }
+    repeated KeptImageFile kept = 4; bool removes_deleted_images = 5; string version = 6; }
 message KeptImageFile { string path = 1; string reason = 2; }
 message RemoveImageRequest { string name = 1; }
 // hosts: each host's outcome; failed: the hosts that could not be asked, and
@@ -1090,6 +1097,14 @@ message LoginRequest       {
     // oidc_binding: the secret BeginOIDCLoginResponse.binding returned to whoever
     // began the flow; required with oidc_code + oidc_state. Never in a URL.
     string oidc_binding      = 10;
+    // client_address: the end client's address, recorded on the session
+    // (ListSessions ip) and keying the login throttle. Honoured only from a
+    // caller presenting a cluster HOST certificate over loopback — this node's
+    // own web UI or REST gateway, which pass the browser's address (the HTTP
+    // peer, or from a trusted_proxies peer the forwarded client). Any other
+    // caller, the distributable lv-cli certificate included, is recorded by its
+    // own address. An address that is not an IP literal is ignored.
+    string client_address    = 11;
 }
 message LoginResponse      {
     string token         = 1;  // bearer; opaque session id (prefix "lvs_") on success
@@ -2194,7 +2209,10 @@ message BindSecurityGroupsRequest {
 }
 
 message Session {
-    string id           = 1;  // opaque session id (the bearer wire token)
+    // id: a display HANDLE, the first 12 characters of the session id — never
+    // the session id itself, which is the bearer secret (lvs_<id>). It is what
+    // RevokeSession takes. A daemon older than this field returned the full id.
+    string id           = 1;
     string username     = 2;
     string realm        = 3;
     string ip           = 4;
@@ -2202,9 +2220,15 @@ message Session {
     string created_at   = 6;
     string last_used_at = 7;
     string expires_at   = 8;
+    // current: this is the session the request was made with. Set by the
+    // daemon, so a client never compares its own bearer with a listed id.
+    bool   current      = 9;
 }
 message ListSessionsRequest  { string username = 1; }  // empty = caller's own
 message ListSessionsResponse { repeated Session sessions = 1; }
+// id: the full session id, or an unambiguous prefix of at least 8 characters
+// (a ListSessions handle). A prefix resolves only among the sessions the caller
+// may revoke: its own, or anyone's for an admin.
 message RevokeSessionRequest { string id = 1; }
 
 // 2FA enrollment & management.
@@ -2248,6 +2272,13 @@ message GrantRoleRequest {
     string role       = 2;
     string principal  = 3;
     bool   propagate  = 4;
+    // refuse_inert_principal: refuse (FailedPrecondition) a grant that would
+    // be stored as a bare user:<name> principal. No caller is ever matched as
+    // a bare user principal (callers are user:<name>@<realm>), so such a
+    // binding grants nothing. Without it a bare principal is stored verbatim
+    // while auth.rbac_realm is off (legacy behavior); with auth.rbac_realm on
+    // the realm grammar already rejects or resolves it.
+    bool   refuse_inert_principal = 5;
 }
 message GrantRoleResponse { RoleBinding binding = 1; }
 
@@ -4687,6 +4718,13 @@ service LiteVirt {
 
     // ──: SPICE console info ──
     rpc GetSpiceInfo(GetSpiceInfoRequest) returns (GetSpiceInfoResponse);
+    // ProxySpice carries ONE SPICE channel connection (a SPICE client opens
+    // several) between the caller and the VM's SPICE listener on its host's
+    // 127.0.0.1, forwarded to the owning host as ProxyVNC is. The VM name is
+    // in the "x-vm-name" metadata. The bytes are relayed unchanged: the
+    // client presents the console's password (GetSpiceInfoResponse.password)
+    // itself. `lv spice --launch` / `--listen` use it.
+    rpc ProxySpice(stream SpiceData) returns (stream SpiceData);
 
     // ── Upgrade safety: pre-flight ──
     rpc PreflightUpgrade(PreflightUpgradeRequest) returns (PreflightUpgradeResponse);
@@ -4889,10 +4927,16 @@ message PreflightFinding {
     string message  = 3;       // human-readable detail
 }
 
+// SpiceData is a chunk of one SPICE channel's byte stream (ProxySpice).
+message SpiceData { bytes data = 1; }
+
 message GetSpiceInfoRequest  { string vm_name = 1; }
+// The SPICE listener is bound to the VM host's 127.0.0.1, so host:port is
+// reachable only on that host itself (or through a tunnel to it). A client
+// elsewhere reaches it through ProxySpice.
 message GetSpiceInfoResponse {
-    string host = 1;       // host the VM runs on
-    int32  port = 2;       // SPICE TCP port (libvirt-assigned)
+    string host = 1;       // host the VM runs on (its address, NOT where SPICE listens)
+    int32  port = 2;       // SPICE TCP port (libvirt-assigned) on that host's 127.0.0.1
     string uri  = 3;       // convenience: "spice://<host>:<port>"
     // The password the VM's SPICE console requires ("" when it requires
     // none; docs/ui.md "Console passwords"). Returned only to a caller that

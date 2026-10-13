@@ -436,7 +436,22 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 	if err != nil {
 		return nil
 	}
-	updated, err := s.judgedCDROMDefinition(vm, domXML)
+	// Judging an ISO stats, resolves and opens it, and a library on a
+	// network filesystem whose server does not answer would hold the start
+	// — and the VM's lock — for as long: judged under a bound, keyed by the
+	// first CD-ROM's path so a mount known not to answer fails at once.
+	key := "/" + vm.Name
+	if cdroms, _ := s.domainInstallerISOsErr(vm.Name, domXML); len(cdroms) > 0 {
+		key = cdroms[0]
+	}
+	judge := judgeCDROMs // read here: the call below may outlive this start
+	updated, err := storage.BoundedOuter("judge the installer CD-ROMs of "+vm.Name+" at", key, func() (string, error) {
+		return judge(s, vm, domXML)
+	})
+	if storage.IsFSNoAnswer(err) {
+		slog.Warn("start refused: the installer ISO's storage does not answer", "vm", vm.Name, "error", err)
+		return status.Errorf(codes.Unavailable, "start %q: its installer ISO cannot be judged: its storage does not answer: %v; retry once it answers", vm.Name, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -449,6 +464,10 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 	slog.Info("installer ISO: domain pointed at the file resolved on this host", "vm", vm.Name, "iso", vmSpecFor(vm).GetIso())
 	return nil
 }
+
+// judgeCDROMs is how a start judges its domain's installer CD-ROMs
+// (judgedCDROMDefinition); a test replaces it.
+var judgeCDROMs = (*Server).judgedCDROMDefinition
 
 // judgedCDROMDefinition judges, on this host, the installer CD-ROMs a domain
 // definition of vm carries (installerISOResolution) and returns the definition

@@ -120,6 +120,12 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 				heldPrefix = def.NetBoxPrefixID
 			}
 		}
+		var deferred *deferredTeardownError
+		if heldPrefix == 0 && errors.As(err, &deferred) {
+			// The network exists; what blocks it here is a state the operator
+			// can change, and the message says which.
+			return nil, status.Error(codes.FailedPrecondition, deferred.Error())
+		}
 		if heldPrefix != 0 {
 			return nil, status.Errorf(codes.Internal,
 				"provision network: %v (NetBox prefix %d is STILL BOUND — its release also failed; clear it by hand before rebinding that prefix)",
@@ -249,9 +255,14 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	// still uses it (a --force delete). Then the network reconciler tears it
 	// down here once nothing on this host uses it, as on every other host.
 	def := networkRecordToDef(nr)
+	auditDetail := ""
 	if what, err := s.networkUseHere(ctx, req.Name, network.BridgeName(req.Name, def)); err != nil || what != "" {
 		slog.Warn("network deleted; its teardown on this host waits until nothing here uses it",
 			"network", req.Name, "in_use_by", what, "error", err)
+		if err != nil {
+			what = "unknown: " + err.Error()
+		}
+		auditDetail = fmt.Sprintf("teardown on %s waits until nothing there uses it (in use by %s)", s.hostName, what)
 	} else if err := s.networkProvisioner().Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
@@ -307,7 +318,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 		s.audit(ctx, "network.delete", req.Name, "netbox binding release failed: "+relErr.Error(), "error")
 		return nil, relErr
 	}
-	s.audit(ctx, "network.delete", req.Name, "", "ok")
+	s.audit(ctx, "network.delete", req.Name, auditDetail, "ok")
 	return &emptypb.Empty{}, nil
 }
 
@@ -423,7 +434,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 
 	localIP := getLocalIP()
 	if _, err := s.networkProvisioner().Provision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
-		return nil, err
+		return nil, s.explainProvisionFailure(ctx, name, def, err)
 	}
 	// Fail closed: don't report a provisioned network while its host-isolation/NAT
 	// rules haven't applied.

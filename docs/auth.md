@@ -224,10 +224,12 @@ The client address is:
   `trusted_proxies` (below), it is the right-most `X-Forwarded-For` hop that is
   not itself a trusted proxy.
 - for a direct gRPC caller, its own address. A `client_address` it sends is
-  honoured only from a loopback peer. That means this node's own UI and REST
-  gateway, but also any process on the node that holds a cluster certificate.
-  Such a process is trusted for it as it is for everything else: holding a
-  node's certificate on the node is equivalent to root on it.
+  honoured only from a caller presenting a cluster **host** certificate over
+  loopback (the `local-root` identity). That is this node's own UI and REST
+  gateway, which dial with the host certificate; a process that can read a
+  host key on the node is root there anyway. The distributable `lv-cli`
+  certificate, or no certificate, over loopback is an ordinary client: its
+  `client_address` is ignored and it is counted at its own address.
 
 **Behind a reverse proxy**, list the proxy in `trusted_proxies` (CIDRs or
 addresses, default empty). Without it, every browser arrives from the proxy's
@@ -622,6 +624,51 @@ table with three lifecycle markers:
 - **Revoke** — user-initiated (`lv logout`, `lv session revoke <id>`)
   or admin-initiated.
 
+Each session records the client's address (`lv session ls` IP). For a
+login through the web UI or the REST gateway, which reach the daemon over
+loopback, that is the browser's address as the gateway sees it — the TCP peer,
+or from a `trusted_proxies` peer the forwarded client ("OIDC sign-in", the
+client address). It is not 127.0.0.1 unless the browser itself is on the node.
+
+Failed logins are throttled per node, in memory:
+
+- **Per account and address: 5 failures** in 15 minutes lock that pair for 15
+  minutes. An IPv6 client counts by its /64. One browser's failures therefore
+  never lock the account for other browsers.
+- **Per account: 30 failures** in 15 minutes, from any mix of addresses, lock
+  the account on that node for 15 minutes (audited as `locked out by the
+  account throttle`). This bounds an attacker who rotates addresses — a botnet,
+  a large address pool — and a success does not reset it. The cost is
+  availability: 30 failures from at least 6 addresses lock the real user out
+  of that node for the lockout.
+- The address is the one above, so an **over-broad `trusted_proxies`** (one
+  that covers the clients themselves, for example `0.0.0.0/0`) lets a client
+  write its own `X-Forwarded-For` and choose its per-address key. The
+  per-account ceiling still holds; list only your proxies.
+
+A failure counts against exactly the account name the attempt gave
+(normalized: trimmed and lower-cased) — for a password or LDAP login. An OIDC
+login names no account the client can choose: a failed exchange counts in the
+anonymous per-address bucket (which has no account ceiling), and a failed
+second factor against the subject the IdP proved; a `username` sent with an
+OIDC login is ignored. A WebAuthn finish counts only when a ceremony was in
+flight (an assertion was actually checked). Failing as `admin|1` names another,
+nonexistent account and never counts against `admin`; two OIDC subjects such
+as `auth0|abc` and `auth0|xyz` have separate ceilings.
+
+Both limits cover **every login path** to the account on that node: the web
+UI, REST, a direct `lv login` (also over mTLS), the second-factor step
+(including an OIDC login's) and WebAuthn. While an account is locked:
+
+- its **existing sessions keep working**, and new logins are refused with
+  `too many failed login attempts; retry in …`;
+- **on-node root still works**: `lv` run as root on a node presents the host
+  certificate and needs no login (`lv user reset-admin` too);
+- other nodes are unaffected: the state is per node.
+
+To clear it early, restart the daemon on that node (the state is in memory);
+otherwise it ends by itself after the 15-minute lockout.
+
 Both timeouts are configurable in the daemon config under
 `auth.session_idle_timeout` and `auth.session_hard_expiry` (Go duration
 strings, e.g. `8h`, `168h`); the defaults above apply when unset.
@@ -632,7 +679,17 @@ sessions table is small (one row per active login) and reads are an
 indexed primary-key lookup, so the cost is in noise.
 
 `lv session ls` shows your active sessions; `--user <name>` lists
-another user's (admin only).
+another user's (admin only). `*` marks the session the command ran with. The
+ID column is a 12-character **handle**, the start of the session id: the whole
+id is the session's bearer secret, so neither the API (`ListSessions`, `GET
+/api/v1/sessions`) nor the CLI ever returns it. The daemon sets `current` on
+the caller's own session, so a client never needs to compare its token with a
+listed id (a REST client that did so must use `current` instead).
+`lv session revoke` accepts that short form, or any unambiguous prefix of at
+least 8 characters. A prefix resolves only among the sessions the caller may
+revoke — its own, or anyone's for an admin — so a non-admin's prefix never
+reaches, or reveals, another user's session; a prefix matching more than one
+is refused and the matches are listed.
 
 ## API tokens
 
@@ -899,16 +956,19 @@ with what it holds, in `streamHandlerAudit` (internal/grpcapi), and a test
 fails when one is added without an entry. Exec (`lv exec`, the UI exec page)
 is one RPC per command, each authenticated on its own.
 
-**SPICE is not cut.** SPICE is not proxied through the daemon: it listens on
-the host's `127.0.0.1` and is reached through an SSH tunnel (`lv spice`), so
-an open SPICE session lives as long as that tunnel, whatever happens to the
+**SPICE through litevirt is cut; SPICE through an SSH tunnel is not.** `lv
+spice --launch` and `lv spice --listen` carry each SPICE channel over
+`ProxySpice`, which holds the socket to the VM's SPICE listener for its
+caller and is closed at the cut like a VNC console. A client that reaches the
+listener directly instead (on the VM's host, or through an SSH tunnel to its
+`127.0.0.1`, which the UI's `.vv` file is for) never passes through the
+daemon, so that session lives as long as the tunnel, whatever happens to the
 account. To end one when disabling a user, revoke the user's SSH access to
 the host and kill their SSH session there (`pkill -u <ssh-user> sshd`), which
 ends the tunnel and the SPICE connection in it; restarting the VM also ends
-it. `lv user disable` alone stops only new `lv spice` calls. The console's
-password (ui.md "Console passwords") rotates at the VM's next define, so a
-disabled user who kept a `.vv` file or a printed password can use it only
-until the VM is next defined and restarted.
+it. The console's password (ui.md "Console passwords") rotates at the VM's
+next define, so a disabled user who kept a `.vv` file or a printed password
+can use it only until the VM is next defined and restarted.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that can log in, enabled with no expiry — `lv user delete` applies the same rule — and
@@ -1447,6 +1507,14 @@ the flag is the reversible kill switch (default false):
 The grammar treats a principal as realm-qualified only when the part after the
 last `@` names a realm (`local`, `oidc:*`, `ldap:*`) — so `user:alice@example.com`
 is a bare username (an email), while `user:alice@oidc:corp` is realm-qualified.
+
+`lv role grant` and the web UI's grant form ask the daemon to **refuse** a
+grant that would be stored bare (`refuse_inert_principal`), whatever the flag:
+with it off they get `FailedPrecondition` naming the qualified form instead of
+an inert row, and with it on the grammar above applies unchanged (a latched
+cluster still resolves a known local user). Against an older daemon that stores
+the bare row anyway, `lv role grant` prints a warning with the `lv role revoke`
+to remove it.
 
 Existing bare bindings created before enabling this remain **inert** (they never
 granted access) until rewritten. Once the capability has latched fleet-wide, run

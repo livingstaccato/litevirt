@@ -95,8 +95,7 @@ func TestNFSMountRetriesWithoutNosymfollowOnlyForTheOption(t *testing.T) {
 func fakeMountInfo(t *testing.T, mounts map[string]string) *map[string]string {
 	t.Helper()
 	cur := mounts
-	prev := readMountInfo
-	readMountInfo = func() ([]byte, error) {
+	restore := readMountInfo.set(func() ([]byte, error) {
 		var b strings.Builder
 		i := 100
 		for dir, opts := range cur {
@@ -104,8 +103,8 @@ func fakeMountInfo(t *testing.T, mounts map[string]string) *map[string]string {
 			i++
 		}
 		return []byte(b.String()), nil
-	}
-	t.Cleanup(func() { readMountInfo = prev })
+	})
+	t.Cleanup(restore)
 	return &cur
 }
 

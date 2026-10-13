@@ -268,6 +268,14 @@ answers again. litevirt keeps that from holding anything else:
   a command against storage (`mount -o remount`, libvirt's pool refresh) is
   waited for at most 5 s. A daemon (re)start while a server does not answer
   therefore serves, and its peers do not fence the host.
+- **Daemon stop.** A graceful stop (`systemctl restart` or `stop`, an
+  upgrade) gives the requests in flight 5 s, then stops the gRPC server
+  forcibly. A request stuck on the dead mount is not waited for past a
+  further 5 s: the daemon exits within about 35 s of the SIGTERM, well inside
+  the 2 minutes its peers skip an `upgrading` host, while requests are still
+  stuck in an NFS RPC wait (a killable wait, as on lab 2). A thread stuck in
+  an uninterruptible wait (writeback, an unmount) can still hold the exit
+  until the kernel lets it go.
 - **Pool create.** Whether a new pool overlaps an nfs pool is decided from the
   mount table first: a mount point names its own directory, with no call on
   the export. A dir or local pool beside a hung nfs pool is created as usual.
@@ -286,16 +294,29 @@ answers again. litevirt keeps that from holding anything else:
   lock (and a stop of it) for as long as the server does not answer. The
   first refusal can take up to 20 s, the start check's own bound, because
   reading the disk's header waits that long; while that mount is known not
-  to answer, later ones are immediate.
+  to answer, later ones are immediate. The first thing a start (and a
+  define, move, migrate, backup, copy or delete) does is look for the disk's
+  point-in-time overlay, under the VM's lock; that look gives up after 5 s
+  too. Whether an overlay is there is then unknown, and the start is refused
+  with `Unavailable` rather than made on a disk that may lack the guest's
+  newest writes. The reconciler's start of such a VM (a failover, an onboot
+  autostart, a restart of a VM whose domain died) is deferred instead: the VM
+  waits in `starting` (a failover in `pending`, its proof kept) and the next
+  pass starts it once the storage answers, and the overlay sweep at daemon start passes the VM over
+  instead of holding its lock.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
-  disk's chain does not answer, the prune fails with "nothing is pruned", and
+  disk's chain does not answer, or listing the image store (a store whose
+  directory is a link onto an NFS mount, say) or a pool directory does not
+  answer within 5 s, the prune fails with "nothing is pruned", and
   a snapshot delete or revert is refused with `Unavailable`. Retry once the
-  server answers. **Known gap:** a snapshot delete or revert reads the
-  header chain of every VM disk on the host, and that read is not bounded.
-  While another VM's disk is on a mount whose server does not answer, the
-  delete or revert can wait for it instead of being refused, holding that
-  VM's lock (and a stop of it) until the server answers.
+  server answers. A snapshot delete or revert reads the header chain of
+  every VM disk on the host, each disk's under a 5 s bound, and so does a
+  prune's scan, one header at a time. While another VM's disk is on a mount
+  whose server does not answer, the delete or revert is refused with
+  `Unavailable` (that disk counts as a user of the file, never as "not built
+  on it"), and the prune fails with "nothing is pruned". A VM delete whose
+  kept disk's chain does not answer keeps every file.
 - After one call under a mount has gone unanswered for 5 s, further calls
   under the same mount fail at once until it returns.
 

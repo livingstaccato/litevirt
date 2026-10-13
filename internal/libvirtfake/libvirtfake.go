@@ -87,7 +87,9 @@ type Fake struct {
 	vncUnavailable string // SetVNCPasswordUnavailable
 	spiceUnusable  string // SetSpiceUnusable
 	liveConsolePw  map[string]map[string]string
-	vncPorts       map[string]int // domain → VNC port (SetVNCPort); default 5901
+	vncPorts       map[string]int    // domain → VNC port (SetVNCPort); default 5901
+	spicePorts     map[string]int    // SetSpicePort
+	consolePTYs    map[string]string // SetConsolePTYPath
 
 	// starts counts each domain's StartDomain calls, and taps holds the host
 	// device each NIC was given in one of those runs (keyed by domain, run and
@@ -1269,9 +1271,42 @@ func (f *Fake) captureConsolePasswordsLocked(name, domXML string) {
 	f.liveConsolePw[name] = pw
 }
 func (f *Fake) GetVMSpicePort(name string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p, ok := f.spicePorts[name]; ok {
+		return p, nil
+	}
 	return 5930, nil
 }
+
+// SetSpicePort points a domain's SPICE console at port, so a scenario can
+// stand a real listener behind ProxySpice.
+func (f *Fake) SetSpicePort(name string, port int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.spicePorts == nil {
+		f.spicePorts = map[string]int{}
+	}
+	f.spicePorts[name] = port
+}
+
+// SetConsolePTYPath points a domain's serial console at path (a FIFO, say),
+// so a scenario can carry a real serial console through ConsoleVM.
+func (f *Fake) SetConsolePTYPath(name, path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.consolePTYs == nil {
+		f.consolePTYs = map[string]string{}
+	}
+	f.consolePTYs[name] = path
+}
+
 func (f *Fake) ConsolePTYPath(name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p, ok := f.consolePTYs[name]; ok {
+		return p, nil
+	}
 	return "/dev/pts/fake", nil
 }
 

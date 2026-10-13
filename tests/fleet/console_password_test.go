@@ -14,8 +14,9 @@
 //     peer Pings over mTLS;
 //   - a live migration keeps the console working: the password travels in
 //     the migratable definition and the destination reads it from there;
-//   - SPICE, which is not proxied, hands the password to a caller that passed
-//     vm.console, through whichever host it entered on.
+//   - SPICE, whose stream ProxySpice relays unchanged (the client presents
+//     the password), hands the password to a caller that passed vm.console,
+//     through whichever host it entered on.
 package fleet
 
 import (
@@ -164,10 +165,17 @@ func (r *vncStreamReader) Read(p []byte) (int, error) {
 // and, when None was among them, the ServerInit it then received.
 func viewVNC(t *testing.T, c *Cluster, entry *Node, vm string) (offered []byte, init []byte, err error) {
 	t.Helper()
+	return viewVNCVia(t, c.SelfClient(entry), vm)
+}
+
+// viewVNCVia is viewVNC through a client of the caller's choosing (a user's
+// bearer, say).
+func viewVNCVia(t *testing.T, client pb.LiteVirtClient, vm string) (offered []byte, init []byte, err error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vm))
-	st, err := c.SelfClient(entry).ProxyVNC(ctx)
+	st, err := client.ProxyVNC(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -385,8 +393,8 @@ func TestFleet_ConsolePassword_LiveMigrationKeepsTheConsole(t *testing.T) {
 	}
 }
 
-// TestFleet_ConsolePassword_SpiceInfoCarriesItAcrossHosts: SPICE is not
-// proxied, so GetSpiceInfo hands the password to the caller (who passed
+// TestFleet_ConsolePassword_SpiceInfoCarriesItAcrossHosts: SPICE is relayed
+// unchanged, so GetSpiceInfo hands the password to the caller (who passed
 // vm.console), forwarded from the owning host through whichever host the
 // caller entered on.
 //

@@ -1405,6 +1405,32 @@ A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
 passwords, takes incoming live migrations without them, and reports
 `console_password_v1` in `not_enforcing`; it never fails a start over one.
 
+### SPICE through the daemon
+
+`lv spice --launch` and `--listen` now carry the SPICE console through the
+daemon (`ProxySpice`), because the VM's SPICE listener is on its host's
+`127.0.0.1` and a client never reached it at the host's address. Both the
+host you enter on and the VM's host must run this release; through an older
+one, each connection is refused and `lv spice` says the daemon predates
+`ProxySpice`. Mid-roll, use an SSH tunnel to the VM's host instead
+([ui.md](ui.md#spice-console)). No capability token gates it: an older host
+simply lacks the RPC, and nothing is written.
+
+### Console sessions in the audit log
+
+Every VNC, SPICE and serial console session is now an open and a close row in
+the audit log, and every refused open a row
+([audit-log.md](audit-log.md#console-sessions)). There is no schema change and
+no capability token: the rows go through the ordinary audit writer, and an
+older host simply writes none. Mid-roll, a console entering on an older host
+for a VM on an upgraded one is recorded only on the VM's host, under
+`peer:<entry host>` rather than the user, and two users' concurrent SPICE
+consoles relayed by that older host are one session there. Through an older
+VM host, the upgraded entry host records a relayed session from the VM host's
+first byte rather than its explicit accept, so a serial console that never
+printed anything reads as a refusal (`aborted by the client`) or a session of
+near-zero duration.
+
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 
 This release enforces per-NIC policy — security groups, the cluster and host

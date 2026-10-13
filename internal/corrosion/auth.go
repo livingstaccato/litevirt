@@ -344,6 +344,35 @@ func ListSessionsForUser(ctx context.Context, c *Client, username string) ([]Ses
 	return out, nil
 }
 
+// ListLiveSessionsByIDPrefix returns the sessions not yet revoked whose id
+// begins with prefix (the `lv session ls` short form). The caller decides
+// whose sessions it may act on; this only finds them. prefix must be lowercase
+// hex, as every id is: the match is a range on the primary key, [prefix,
+// prefix+"g"), since every id starting with prefix sorts below prefix+"g".
+func ListLiveSessionsByIDPrefix(ctx context.Context, c *Client, prefix string) ([]SessionRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, username, realm, ip, user_agent, created_at, last_used_at, expires_at
+		 FROM sessions WHERE id >= ? AND id < ? AND revoked_at IS NULL
+		 ORDER BY id`, prefix, prefix+"g")
+	if err != nil {
+		return nil, err
+	}
+	return sessionRecords(rows), nil
+}
+
+func sessionRecords(rows []Row) []SessionRecord {
+	out := make([]SessionRecord, len(rows))
+	for i, r := range rows {
+		out[i] = SessionRecord{
+			ID: r.String("id"), Username: r.String("username"), Realm: r.String("realm"),
+			IP: r.String("ip"), UserAgent: r.String("user_agent"),
+			CreatedAt: r.String("created_at"), LastUsedAt: r.String("last_used_at"),
+			ExpiresAt: r.String("expires_at"),
+		}
+	}
+	return out
+}
+
 // ────────────────────────────── 2FA ──────────────────────────────
 
 // User2FARecord is one enrolled second factor.

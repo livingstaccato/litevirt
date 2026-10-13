@@ -165,6 +165,24 @@ with the cluster's network table every 30 seconds, and at startup:
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
+Tearing down a bridge network removes the Linux bridge itself only when
+litevirt created it on that host. Each daemon records the bridges it creates
+under `/run/litevirt/bridges` (one file per bridge holding its interface index;
+it goes at reboot, along with the bridge). A bridge deleted and made again
+under the same name has a new index, so its old record is dropped, not
+trusted. The bridge is removed once it has no ports and no
+address other than the kernel's IPv6 link-local one, and no other live network
+names it. An operator's bridge that litevirt found already there, such as
+`br0` named with `--interface`, is never removed. Neither is a bridge made by an
+older build, which kept no record.
+
+While a `--force`-deleted network waits for its guests, its `dnsmasq` still
+holds the gateway address. A new network on an overlapping subnet is still
+created, but when its DHCP server cannot start on that host the create fails
+there with `FailedPrecondition`. The
+error names the deleted network and what still uses it. That host provisions
+the new network itself on the first pass after the old teardown finishes.
+
 The same pass removes a leftover flat stack bridge: a bridge named
 `<stack>_<name>` that a NIC was once plugged into because that name had no
 network, and that no NIC uses now. It is removed only when no network has that

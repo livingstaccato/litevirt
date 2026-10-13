@@ -89,9 +89,9 @@ func TestVM_DiskDiscardIOLimitsAndNICQueues(t *testing.T) {
 	cleanup(t, func() {
 		lvErr(t, "compose", "down", "--name", stack, "-y")
 		lvErr(t, "network", "rm", netName, "--force")
-		// `network rm` leaves a user-managed bridge behind; remove the one this
-		// test created on every host the VM touched.
-		removeTestBridge(t, netName)
+		// litevirt created the bridge, so `network rm` must remove it on
+		// every host; a leak fails the test.
+		assertTestBridgeGone(t, netName)
 	})
 	lv(t, "network", "create", netName, "--type", "bridge", "--subnet", "172.31.7.0/24", "--dhcp")
 

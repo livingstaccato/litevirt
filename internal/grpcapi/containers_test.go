@@ -41,7 +41,10 @@ type fakeCTRuntime struct {
 	deleteErr error
 	// startErr, hostAccessErr and rebuildErr are what StartContainer,
 	// SetContainerHostAccess and RebuildContainerConfig return, when set.
-	startErr      error
+	startErr error
+	// stopErr is what StopContainer returns, the state left as it was (lxc-stop
+	// of a container that is not running fails so).
+	stopErr       error
 	hostAccessErr error
 	rebuildErr    error
 
@@ -162,6 +165,9 @@ func (f *fakeCTRuntime) StopContainer(_ context.Context, name string, timeoutSec
 		Name    string
 		Timeout int
 	}{name, timeoutSec})
+	if f.stopErr != nil {
+		return f.stopErr
+	}
 	f.setRunState(name, "stopped")
 	if f.stopHook != nil {
 		f.stopHook()

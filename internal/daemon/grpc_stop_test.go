@@ -78,8 +78,13 @@ func stuckRPCServer(t *testing.T, calls int) (*grpc.Server, <-chan error) {
 // show, so the shutdown is run many times; each must finish within its
 // bound.
 //
+// This composes stopGRPC, the close and awaitServe itself, as stopServing and
+// Run do; it never runs Run. That Run hands awaitServe the channel
+// stopServing closes, and runs Serve in a goroutine, is
+// TestRunWiresItsStopToItsServeWait.
+//
 // Mutations: "Stop called inline after the graceful bound" — the shutdown
-// hangs: red. "Run waits on Serve unbounded" — red.
+// hangs: red. "awaitServe waits on Serve unbounded after the stop" — red.
 func TestShutdown_HandlersStuckOnStorageDoNotHoldTheDaemon(t *testing.T) {
 	const graceful, forced, serveBound = 100 * time.Millisecond, 300 * time.Millisecond, 200 * time.Millisecond
 	for _, calls := range []int{1, 2} {

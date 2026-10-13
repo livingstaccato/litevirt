@@ -20,8 +20,9 @@ type consoleAuditFlusher interface {
 //     handlers do: a Stop that is itself stuck behind a handler in the kernel
 //     (lab 2 N-5) is given up on and left running, with that handler;
 //  3. close(stopped): Run's awaitServe stops waiting on Serve, which returns
-//     only once a stop has finished — so it is closed on both of stopGRPC's
-//     exits, before anything below can wait;
+//     only once a stop has finished — so it is closed on every one of
+//     stopGRPC's exits (graceful done, forced done, given up), before
+//     anything below can wait;
 //  4. afterStop (what must still run with the database open);
 //  5. FlushConsoleAudit: every open session's close row, and every row a
 //     handler ended by the stop is still writing, before the caller closes

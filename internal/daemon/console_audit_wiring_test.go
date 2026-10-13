@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -206,4 +207,122 @@ func TestRunStopsServingBeforeTheDatabaseCloses(t *testing.T) {
 	if !(idx["stopServing"] < idx["repl.Stop"] && idx["repl.Stop"] < idx["db.Close"]) {
 		t.Fatalf("shutdown order: stopServing %d, repl.Stop %d, db.Close %d", idx["stopServing"], idx["repl.Stop"], idx["db.Close"])
 	}
+}
+
+// Lab 2 N-5 at Run's level: Serve returns only once a stop has finished, and
+// a stop can be stuck behind a handler in the kernel, so Run must stop
+// waiting on Serve once stopServing's stop is over. That rests on one channel
+// crossing a function boundary: the one stopServing closes is the one
+// awaitServe waits on. Run opens libvirt and binds sockets, so no behavioural
+// test reaches it; this pins the wiring in its source:
+//
+//   - stopServing's stopped argument and awaitServe's stopped argument are
+//     the same variable of Run (not a fresh channel, not a shadowed one);
+//   - Run never closes it itself (stopServing does, once);
+//   - Serve runs only in a goroutine, which sends its answer on the channel
+//     awaitServe reads.
+//
+// Mutations: stopServing given make(chan struct{}) — red; awaitServe given a
+// different channel — red; grpcStopped shadowed in the shutdown goroutine —
+// red; Serve called synchronously — red; Run closing grpcStopped — red.
+func TestRunWiresItsStopToItsServeWait(t *testing.T) {
+	run := parseRun(t)
+	var stopped, awaited, serveChan ast.Expr
+	var closed []ast.Expr
+	var serves, goServes int
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.GoStmt:
+			ast.Inspect(x.Call, func(m ast.Node) bool {
+				if s, ok := m.(*ast.SendStmt); ok {
+					if c, ok := s.Value.(*ast.CallExpr); ok && isMethodCall(c, "Serve") {
+						goServes++
+						serveChan = s.Chan
+					}
+				}
+				return true
+			})
+		case *ast.CallExpr:
+			switch {
+			case isFuncCall(x, "stopServing"):
+				if len(x.Args) < 5 {
+					t.Fatalf("stopServing called with %d arguments", len(x.Args))
+				}
+				stopped = x.Args[4]
+			case isFuncCall(x, "awaitServe"):
+				if len(x.Args) < 2 {
+					t.Fatalf("awaitServe called with %d arguments", len(x.Args))
+				}
+				awaited = x.Args[1]
+				if a, b := runVar(x.Args[0]), runVar(serveChan); a == nil || a != b {
+					t.Errorf("awaitServe does not read the channel Serve's goroutine answers on")
+				}
+			case isFuncCall(x, "close") && len(x.Args) == 1:
+				closed = append(closed, x.Args[0])
+			case isMethodCall(x, "Serve"):
+				serves++
+			}
+		}
+		return true
+	})
+	if stopped == nil || awaited == nil {
+		t.Fatalf("Run calls stopServing (%v) and awaitServe (%v)", stopped != nil, awaited != nil)
+	}
+	obj := runVar(stopped)
+	if obj == nil || obj != runVar(awaited) {
+		t.Fatalf("stopServing closes %s, awaitServe waits on %s, and they are not the same variable of Run: Run would wait on Serve past the stop (lab 2 N-5)",
+			exprString(stopped), exprString(awaited))
+	}
+	for _, c := range closed {
+		if runVar(c) == obj {
+			t.Errorf("Run closes %s itself; stopServing does, once the stop is over", obj.Name)
+		}
+	}
+	if serves != 1 || goServes != 1 {
+		t.Errorf("Serve is called %d times, %d of them in a goroutine sending on a channel: want once, in a goroutine, so Run can stop waiting on it", serves, goServes)
+	}
+}
+
+// parseRun parses daemon.go and returns (*Daemon).Run.
+func parseRun(t *testing.T) *ast.FuncDecl {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "daemon.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse daemon.go: %v", err)
+	}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Name.Name == "Run" {
+			return fn
+		}
+	}
+	t.Fatal("no (*Daemon).Run in daemon.go")
+	return nil
+}
+
+func isFuncCall(c *ast.CallExpr, name string) bool {
+	id, ok := c.Fun.(*ast.Ident)
+	return ok && id.Name == name
+}
+
+func isMethodCall(c *ast.CallExpr, name string) bool {
+	sel, ok := c.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == name
+}
+
+// runVar is the variable e names, as the parser resolved it (one object per
+// declaration, so a shadowing declaration is another object); nil when e is
+// not a plain variable.
+func runVar(e ast.Expr) *ast.Object {
+	id, ok := e.(*ast.Ident)
+	if !ok || id.Obj == nil || id.Obj.Kind != ast.Var {
+		return nil
+	}
+	return id.Obj
+}
+
+func exprString(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return fmt.Sprintf("%T", e)
 }

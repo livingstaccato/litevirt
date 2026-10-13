@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -247,7 +246,7 @@ func (l *lab) createLabVM(via, prefix, host, pool string, failback bool) string 
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    guest-agent: true\n%s    placement:\n      host: %s\n      failback: %t\n",
 		stack, name, drillImage(), drillMemory(), disks, host, failback)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(via, file, yaml)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{host: name}) })
 	l.mustLVf(via, "compose up", "compose", "up", "-f", file, "-y")
 	if !l.waitDomainState(host, name, "running", 4*time.Minute) {

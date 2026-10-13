@@ -32,6 +32,10 @@ import (
 //	E2E_LAB_DIR        the lab checkout (lab.sh, cluster_key). Enables lab mode.
 //	E2E_LAB_NODES      node count (default 5): nodes are node-1..node-N.
 //	E2E_LAB_PORT_BASE  node N's SSH is 127.0.0.1:(base+N) (default 2230).
+//	E2E_LAB_EXCLUDE    comma-separated node numbers the harness leaves alone
+//	                   (e.g. 3): never baselined, restored, powered on or picked.
+//	E2E_LAB_SOCKET_DIR where the SSH control sockets live (default
+//	                   $E2E_LAB_DIR/.e2e-ssh).
 //	LV_BIN             in lab mode, the lv binary ON THE NODES
 //	                   (e.g. /usr/local/bin/litevirt).
 //	E2E_EVIDENCE_DIR   where each drill writes its samples and timeline.
@@ -115,7 +119,9 @@ type lab struct {
 	dir      string
 	key      string
 	portBase int
-	hosts    []string          // node-1..node-N
+	hosts    []string          // node-1..node-N, less E2E_LAB_EXCLUDE
+	total    int               // N, counting excluded nodes
+	excluded map[string]bool   // nodes E2E_LAB_EXCLUDE leaves alone
 	num      map[string]int    // node name → N
 	ip       map[string]string // node name → cluster address
 	lvPath   string
@@ -127,6 +133,17 @@ type lab struct {
 	// undone (a delete issued into a live partition fails); newLab's own
 	// cleanup runs whatever is left if restore never ran.
 	pending []func()
+}
+
+// exceptExcluded drops the E2E_LAB_EXCLUDE nodes from hs.
+func (l *lab) exceptExcluded(hs []string) []string {
+	var out []string
+	for _, h := range hs {
+		if !l.excluded[h] {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // onRestore queues fn to run inside restore, after the faults are undone.
@@ -160,19 +177,44 @@ func newLab(t *testing.T) *lab {
 			t.Fatalf("E2E_LAB_PORT_BASE=%q: %v", v, err)
 		}
 	}
-	cm, err := os.MkdirTemp("/tmp", "e2ecm")
+	excluded := map[string]bool{}
+	for _, f := range strings.Split(os.Getenv("E2E_LAB_EXCLUDE"), ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		x, err := strconv.Atoi(f)
+		if err != nil || x < 1 || x > n {
+			t.Fatalf("E2E_LAB_EXCLUDE entry %q: need a node number in 1..%d", f, n)
+		}
+		excluded[fmt.Sprintf("node-%d", x)] = true
+	}
+	if n-len(excluded) < 1 {
+		t.Fatalf("E2E_LAB_EXCLUDE leaves no node to drive")
+	}
+	sockRoot := os.Getenv("E2E_LAB_SOCKET_DIR")
+	if sockRoot == "" {
+		sockRoot = filepath.Join(labDir, ".e2e-ssh")
+	}
+	if err := os.MkdirAll(sockRoot, 0o700); err != nil {
+		t.Fatalf("ssh control socket dir: %v", err)
+	}
+	cm, err := os.MkdirTemp(sockRoot, "e2ecm")
 	if err != nil {
 		t.Fatalf("ssh control dir: %v", err)
 	}
 	l := &lab{
 		t: t, dir: labDir, key: filepath.Join(labDir, "cluster_key"), portBase: base,
 		num: map[string]int{}, ip: map[string]string{}, lvPath: lvBin, cmDir: cm,
+		total: n, excluded: excluded,
 	}
 	for i := 1; i <= n; i++ {
 		h := fmt.Sprintf("node-%d", i)
-		l.hosts = append(l.hosts, h)
 		l.num[h] = i
 		l.ip[h] = fmt.Sprintf("10.77.0.%d", 10+i)
+		if !excluded[h] {
+			l.hosts = append(l.hosts, h)
+		}
 	}
 	t.Cleanup(func() {
 		l.runPending()
@@ -351,7 +393,7 @@ func (l *lab) labsh(timeout time.Duration, env []string, args ...string) (string
 	defer cancel()
 	c := exec.CommandContext(ctx, "./lab.sh", args...)
 	c.Dir = l.dir
-	c.Env = append(append(os.Environ(), fmt.Sprintf("NODES=%d", len(l.hosts))), env...)
+	c.Env = append(append(os.Environ(), fmt.Sprintf("NODES=%d", l.total)), env...)
 	c.WaitDelay = 5 * time.Second
 	out, err := c.CombinedOutput()
 	if err != nil {
@@ -852,6 +894,13 @@ func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) ma
 }
 
 // createStackOf is createStack with an image and memory of its own.
+// putFile writes content to path on host and removes it when the test ends.
+func (l *lab) putFile(host, path, content string) {
+	l.t.Helper()
+	l.mustSSH(host, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(content))+" | base64 -d > "+shellQuote(path))
+	l.t.Cleanup(func() { l.ssh(host, 30*time.Second, "rm -f "+shellQuote(path)) })
+}
+
 func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory string, hosts ...string) map[string]string {
 	l.t.Helper()
 	stack := uniqueName(prefix)
@@ -864,8 +913,7 @@ func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory str
 		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, h)
 	}
 	file := "/tmp/" + stack + ".yaml"
-	enc := base64.StdEncoding.EncodeToString([]byte(b.String()))
-	l.mustSSH(via, 30*time.Second, "echo "+enc+" | base64 -d > "+file)
+	l.putFile(via, file, b.String())
 	l.onRestore(func() { l.deleteVMs(stack, names) })
 	if out, err := l.lv(via, "compose", "up", "-f", file, "-y"); err != nil {
 		if errOut := err.Error() + out; roomOnly && strings.Contains(errOut, "no eligible host") {
@@ -1064,6 +1112,7 @@ func (l *lab) requireBaseline() baseline {
 	if err != nil {
 		l.t.Fatalf("baseline: %v", err)
 	}
+	voters = l.exceptExcluded(voters)
 	if strings.Join(voters, ",") != strings.Join(l.hosts, ",") {
 		l.t.Fatalf("baseline: voters %v, want every host %v", voters, l.hosts)
 	}
@@ -1374,7 +1423,7 @@ func (l *lab) verifyRest(via string, b baseline) {
 			l.t.Errorf("rest: %s left %s", h, states[h])
 		}
 	}
-	if gen, voters, err := l.voterSet(via); err != nil || strings.Join(voters, ",") != strings.Join(b.voters, ",") {
+	if gen, voters, err := l.voterSet(via); err != nil || strings.Join(l.exceptExcluded(voters), ",") != strings.Join(b.voters, ",") {
 		l.t.Errorf("rest: voters %v (generation %d, err %v), want %v", voters, gen, err, b.voters)
 	}
 	for _, h := range l.hosts {

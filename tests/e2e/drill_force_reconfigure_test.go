@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -635,7 +634,7 @@ func (d *d6) putBack() bool {
 			continue
 		}
 		file := "/tmp/e2e-d6-restore-" + stack + ".yaml"
-		l.mustSSH(d.via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(y))+" | base64 -d > "+file)
+		l.putFile(d.via, file, y)
 		plan, err := l.lv(d.via, "compose", "diff", "-f", file)
 		if err != nil || !regexp.MustCompile(`Plan: \d+ to create, 0 to update, 0 to delete`).MatchString(plan) {
 			l.t.Errorf("restore stack %s: plan is not create-only (err %v):\n%s", stack, err, plan)
@@ -736,7 +735,7 @@ func (l *lab) leastLoaded(via string, hosts []string) string {
 	best, bestUsed := "", -1
 	for _, line := range strings.Split(l.mustLV(via, "host", "ls"), "\n") {
 		f := strings.Fields(line)
-		if len(f) < 5 || !contains(hosts, f[0]) {
+		if len(f) < 5 || !contains(hosts, f[0]) || l.excluded[f[0]] {
 			continue
 		}
 		used, _, ok := strings.Cut(f[4], "/")

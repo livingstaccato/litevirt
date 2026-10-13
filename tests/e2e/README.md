@@ -146,6 +146,8 @@ drive a local `lv`).
 | `E2E_LAB_DIR` | (required) | lab checkout with `lab.sh` and `cluster_key`; turns lab mode on |
 | `LV_BIN` | (required) | in lab mode, the `lv` path on the nodes |
 | `E2E_LAB_NODES` | `5` | nodes are `node-1`..`node-N` |
+| `E2E_LAB_EXCLUDE` | (none) | comma-separated node numbers (`3`, `2,4`) the harness leaves alone: they are not baselined, restored, powered on or picked, and are ignored in the voter-set check. For a lab with a node deliberately frozen or wedged |
+| `E2E_LAB_SOCKET_DIR` | `$E2E_LAB_DIR/.e2e-ssh` | where the SSH control sockets are made (a short path: unix sockets cap near 100 characters) |
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |

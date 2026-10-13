@@ -400,7 +400,7 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 func (l *lab) except(skip ...string) []string {
 	var hs []string
 	for _, h := range l.hosts {
-		if !contains(skip, h) {
+		if !contains(skip, h) && !l.excluded[h] {
 			hs = append(hs, h)
 		}
 	}

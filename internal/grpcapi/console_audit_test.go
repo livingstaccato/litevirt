@@ -1,0 +1,429 @@
+package grpcapi
+
+// Console opens are audited (docs/audit-log.md "Console sessions"): every
+// VNC, SPICE and serial console session a host carries is an open row and a
+// close row on that host's own sub-chain, and every refused open is a row.
+
+import (
+	"context"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
+)
+
+// auditVirt is libvirtfake with a real serial console (a FIFO), VNC and
+// SPICE listeners, and a SPICE password.
+type auditVirt struct {
+	*libvirtfake.Fake
+	pty       string
+	vnc       int
+	spice     int
+	spicePass string
+}
+
+func (v auditVirt) ConsolePTYPath(string) (string, error) { return v.pty, nil }
+func (v auditVirt) GetVMVNCPort(string) (int, error)      { return v.vnc, nil }
+func (v auditVirt) GetVMSpicePort(string) (int, error)    { return v.spice, nil }
+func (v auditVirt) ConsolePassword(_, kind string) (string, error) {
+	if kind == "spice" {
+		return v.spicePass, nil
+	}
+	return "", nil
+}
+
+// holdListener accepts connections and keeps them open (reading and
+// discarding) until the test ends.
+func holdListener(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					if _, err := c.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// consoleAuditServer is a server whose running VM "desk" (project acme) has
+// all three consoles behind real endpoints.
+func consoleAuditServer(t *testing.T) *Server {
+	t.Helper()
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.5", State: "active"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "desk", HostName: s.hostName, State: "running", Spec: "{}", Project: "acme",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fifo := filepath.Join(t.TempDir(), "console")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	// A writer held open, so the console never reads EOF on its own.
+	w, err := os.OpenFile(fifo, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { w.Close() })
+	s.virt = auditVirt{
+		Fake: libvirtfake.New(), pty: fifo,
+		vnc: holdListener(t), spice: holdListener(t), spicePass: "spice-secret-0123456789ab",
+	}
+	shortLinger(t)
+	return s
+}
+
+func shortLinger(t *testing.T) {
+	t.Helper()
+	old := consoleSessionLinger
+	consoleSessionLinger = 300 * time.Millisecond
+	t.Cleanup(func() { consoleSessionLinger = old })
+}
+
+// openConsole starts the real handler for kind ("vnc", "spice", "serial")
+// on "desk" as the caller in ctx. It returns at once if the handler refused
+// (with its error), else after 300 ms with the session still open and a
+// function that ends it and returns the handler's result.
+func openConsole(t *testing.T, s *Server, ctx context.Context, kind string) (refused error, end func() error) {
+	t.Helper()
+	ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("x-vm-name", "desk"))
+	ts := &transportStream{ctx: ctx, transport: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		switch kind {
+		case "vnc":
+			done <- s.ProxyVNC(&grpc.GenericServerStream[pb.VNCData, pb.VNCData]{ServerStream: ts})
+		case "spice":
+			done <- s.ProxySpice(&grpc.GenericServerStream[pb.SpiceData, pb.SpiceData]{ServerStream: ts})
+		case "serial":
+			done <- s.ConsoleVM(&grpc.GenericServerStream[pb.ConsoleInput, pb.ConsoleOutput]{ServerStream: ts})
+		}
+	}()
+	select {
+	case err := <-done:
+		close(ts.transport)
+		if err == nil {
+			t.Fatalf("%s: the handler ended at once with no error", kind)
+		}
+		return err, nil
+	case <-time.After(300 * time.Millisecond):
+	}
+	var once sync.Once
+	return nil, func() error {
+		once.Do(func() { close(ts.transport) })
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the handler did not end 5s after its stream did", kind)
+			return nil
+		}
+	}
+}
+
+type consoleAuditRow struct {
+	user, host, action, target, detail, result string
+}
+
+func consoleAuditRows(t *testing.T, s *Server) []consoleAuditRow {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(),
+		`SELECT username, host_name, action, target, detail, result FROM audit_log
+		 WHERE action LIKE 'vm.console.%' ORDER BY seq`)
+	if err != nil {
+		t.Fatalf("read audit_log: %v", err)
+	}
+	var out []consoleAuditRow
+	for _, r := range rows {
+		out = append(out, consoleAuditRow{r.String("username"), r.String("host_name"), r.String("action"),
+			r.String("target"), r.String("detail"), r.String("result")})
+	}
+	return out
+}
+
+func rowsWith(rows []consoleAuditRow, action, kind string) []consoleAuditRow {
+	var out []consoleAuditRow
+	for _, r := range rows {
+		if r.action == action && auditField(r.detail, "kind") == kind {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// auditField is key's value in a console row's detail (key=value pairs, a
+// value quoted when it has a space).
+func auditField(detail, key string) string {
+	m := regexp.MustCompile(`(?:^| )` + regexp.QuoteMeta(key) + `=("(?:[^"\\]|\\.)*"|\S*)`).FindStringSubmatch(detail)
+	if m == nil {
+		return ""
+	}
+	if v, err := strconv.Unquote(m[1]); err == nil {
+		return v
+	}
+	return m[1]
+}
+
+func waitRows(t *testing.T, s *Server, what string, ok func([]consoleAuditRow) bool) []consoleAuditRow {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rows := consoleAuditRows(t, s)
+		if ok(rows) {
+			return rows
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s; console audit rows:\n%+v", what, rows)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A refused open is a row: the caller, the VM, the console, and "denied".
+//
+// Mutation "no row for a refused open" — red.
+func TestConsoleAudit_ARefusedOpenIsADeniedRow(t *testing.T) {
+	for _, kind := range []string{"vnc", "spice", "serial"} {
+		t.Run(kind+" without vm.console on the VM", func(t *testing.T) {
+			s := consoleAuditServer(t)
+			ctx := boundAtCtx(t, s, "mallory", "operator", "Operator", "/projects/beta")
+			if err, _ := openConsole(t, s, ctx, kind); status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("open as mallory: %v, want PermissionDenied", err)
+			}
+			rows := waitRows(t, s, "no denied row", func(r []consoleAuditRow) bool { return len(r) > 0 })
+			if len(rows) != 1 {
+				t.Fatalf("want exactly one row, got %+v", rows)
+			}
+			r := rows[0]
+			if r.action != "vm.console.open" || r.result != "denied" || r.user != "mallory" || r.target != "desk" ||
+				r.host != s.hostName || auditField(r.detail, "kind") != kind || auditField(r.detail, "owner") != s.hostName {
+				t.Fatalf("denied row = %+v", r)
+			}
+		})
+	}
+	t.Run("vnc below the operator role", func(t *testing.T) {
+		s := consoleAuditServer(t)
+		if err, _ := openConsole(t, s, userCtx("vic", "viewer"), "vnc"); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("open as a viewer: %v, want PermissionDenied", err)
+		}
+		rows := waitRows(t, s, "no denied row", func(r []consoleAuditRow) bool { return len(r) > 0 })
+		if len(rows) != 1 || rows[0].result != "denied" || rows[0].user != "vic" || rows[0].target != "desk" {
+			t.Fatalf("rows = %+v", rows)
+		}
+	})
+	t.Run("a stopped VM is an error row", func(t *testing.T) {
+		s := consoleAuditServer(t)
+		if err := corrosion.UpdateVMState(context.Background(), s.db, "desk", "stopped", ""); err != nil {
+			t.Fatal(err)
+		}
+		ctx := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+		if err, _ := openConsole(t, s, ctx, "serial"); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("open on a stopped VM: %v, want FailedPrecondition", err)
+		}
+		rows := waitRows(t, s, "no error row", func(r []consoleAuditRow) bool { return len(r) > 0 })
+		if len(rows) != 1 || rows[0].action != "vm.console.open" || rows[0].result != "error" ||
+			!strings.Contains(auditField(rows[0].detail, "reason"), "not running") {
+			t.Fatalf("rows = %+v", rows)
+		}
+	})
+}
+
+// A session is an open row when it starts and a close row when it ends,
+// joined by the session id, the close carrying how long it lasted.
+//
+// Mutation "no open row" — red. Mutation "no close row" — red.
+func TestConsoleAudit_ASessionIsAnOpenAndACloseRow(t *testing.T) {
+	for _, kind := range []string{"vnc", "spice", "serial"} {
+		t.Run(kind, func(t *testing.T) {
+			s := consoleAuditServer(t)
+			ctx := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+			err, end := openConsole(t, s, ctx, kind)
+			if err != nil {
+				t.Fatalf("open as alice: %v", err)
+			}
+			rows := waitRows(t, s, "no open row while the session is open", func(r []consoleAuditRow) bool {
+				return len(rowsWith(r, "vm.console.open", kind)) == 1
+			})
+			if n := len(rowsWith(rows, "vm.console.close", kind)); n != 0 {
+				t.Fatalf("a close row while the session is still open: %+v", rows)
+			}
+			if err := end(); err != nil {
+				t.Fatalf("the session ended with %v", err)
+			}
+			rows = waitRows(t, s, "no close row after the session ended", func(r []consoleAuditRow) bool {
+				return len(rowsWith(r, "vm.console.close", kind)) == 1
+			})
+			open, closed := rowsWith(rows, "vm.console.open", kind)[0], rowsWith(rows, "vm.console.close", kind)[0]
+			for _, r := range []consoleAuditRow{open, closed} {
+				if r.user != "alice" || r.target != "desk" || r.result != "ok" || r.host != s.hostName ||
+					auditField(r.detail, "entry") != s.hostName || auditField(r.detail, "owner") != s.hostName {
+					t.Errorf("row = %+v", r)
+				}
+			}
+			if id := auditField(open.detail, "session"); id == "" || auditField(closed.detail, "session") != id {
+				t.Errorf("open and close are not one session: %q / %q", open.detail, closed.detail)
+			}
+			d, err := time.ParseDuration(auditField(closed.detail, "duration"))
+			if err != nil || d < 250*time.Millisecond {
+				t.Errorf("close duration = %q (%v), want at least the 300ms the session was open", auditField(closed.detail, "duration"), err)
+			}
+			if len(rows) != 2 {
+				t.Errorf("want exactly an open and a close, got %+v", rows)
+			}
+		})
+	}
+}
+
+// A SPICE client opens several channels, each its own ProxySpice stream.
+// They are one session: one open row when the first starts, one close row
+// once the last has ended and none followed within the linger. Another
+// user's channels are a session of their own, and so is a reconnect after
+// the linger. Repeated refusals of one client's channels are one row.
+//
+// Mutation "no grouping: every channel is a session" — red.
+func TestConsoleAudit_SpiceChannelsOfOneClientAreOneSession(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	bob := boundAtCtx(t, s, "bob", "operator", "Operator", "/projects/acme")
+
+	var ends []func() error
+	for i := 0; i < 4; i++ {
+		err, end := openConsole(t, s, alice, "spice")
+		if err != nil {
+			t.Fatalf("alice's channel %d: %v", i, err)
+		}
+		ends = append(ends, end)
+	}
+	_, bobEnd := openConsole(t, s, bob, "spice")
+	// Two of alice's channels end, a fifth opens: still the same session.
+	_ = ends[0]()
+	_ = ends[1]()
+	_, fifth := openConsole(t, s, alice, "spice")
+	ends = append(ends[2:], fifth)
+	for _, end := range ends {
+		_ = end()
+	}
+	_ = bobEnd()
+
+	rows := waitRows(t, s, "no close rows for the two sessions", func(r []consoleAuditRow) bool {
+		return len(rowsWith(r, "vm.console.close", "spice")) >= 2
+	})
+	time.Sleep(2 * consoleSessionLinger)
+	rows = consoleAuditRows(t, s)
+	byUser := map[string][2]int{}
+	for _, r := range rows {
+		c := byUser[r.user]
+		if r.action == "vm.console.open" {
+			c[0]++
+		} else if r.action == "vm.console.close" {
+			c[1]++
+			if r.user == "alice" && auditField(r.detail, "channels") != "5" {
+				t.Errorf("alice's close row: channels = %q, want 5: %q", auditField(r.detail, "channels"), r.detail)
+			}
+		}
+		byUser[r.user] = c
+	}
+	if byUser["alice"] != [2]int{1, 1} || byUser["bob"] != [2]int{1, 1} {
+		t.Fatalf("open/close rows per user = %v, want one of each for alice and for bob:\n%+v", byUser, rows)
+	}
+
+	// A reconnect after the linger is a new session.
+	_, again := openConsole(t, s, alice, "spice")
+	_ = again()
+	waitRows(t, s, "no second session for alice after the linger", func(r []consoleAuditRow) bool {
+		n := 0
+		for _, x := range r {
+			if x.user == "alice" && x.action == "vm.console.close" {
+				n++
+			}
+		}
+		return n == 2
+	})
+
+	// Three refused channels in a burst: one row.
+	mallory := boundAtCtx(t, s, "mallory", "operator", "Operator", "/projects/beta")
+	for i := 0; i < 3; i++ {
+		if err, _ := openConsole(t, s, mallory, "spice"); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("mallory's channel %d: %v", i, err)
+		}
+	}
+	n := 0
+	for _, r := range consoleAuditRows(t, s) {
+		if r.user == "mallory" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("mallory's three refused channels wrote %d rows, want 1", n)
+	}
+}
+
+// GetSpiceInfo hands out the console's password, so it is a row of its own
+// — saying whether a password went out, never what it was.
+//
+// Mutation "no row for GetSpiceInfo" — red.
+func TestConsoleAudit_SpiceInfoIsACredentialRow(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	resp, err := s.GetSpiceInfo(alice, &pb.GetSpiceInfoRequest{VmName: "desk"})
+	if err != nil || resp.Password == "" {
+		t.Fatalf("GetSpiceInfo as alice: %v (password %q)", err, resp.GetPassword())
+	}
+	mallory := boundAtCtx(t, s, "mallory", "operator", "Operator", "/projects/beta")
+	if _, err := s.GetSpiceInfo(mallory, &pb.GetSpiceInfoRequest{VmName: "desk"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("GetSpiceInfo as mallory: %v, want PermissionDenied", err)
+	}
+	rows := consoleAuditRows(t, s)
+	if len(rows) != 2 {
+		t.Fatalf("want two rows, got %+v", rows)
+	}
+	for _, r := range rows {
+		if strings.Contains(r.detail, resp.Password) {
+			t.Fatalf("a row carries the SPICE password: %+v", r)
+		}
+		if r.action != "vm.console.credential" || r.target != "desk" || auditField(r.detail, "kind") != "spice" {
+			t.Errorf("row = %+v", r)
+		}
+	}
+	if r := rows[0]; r.user != "alice" || r.result != "ok" || auditField(r.detail, "password") != "yes" {
+		t.Errorf("alice's row = %+v", r)
+	}
+	if r := rows[1]; r.user != "mallory" || r.result != "denied" {
+		t.Errorf("mallory's row = %+v", r)
+	}
+}

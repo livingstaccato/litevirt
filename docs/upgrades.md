@@ -1416,6 +1416,16 @@ one, each connection is refused and `lv spice` says the daemon predates
 ([ui.md](ui.md#spice-console)). No capability token gates it: an older host
 simply lacks the RPC, and nothing is written.
 
+### Console sessions in the audit log
+
+Every VNC, SPICE and serial console session is now an open and a close row in
+the audit log, and every refused open a row
+([audit-log.md](audit-log.md#console-sessions)). There is no schema change and
+no capability token: the rows go through the ordinary audit writer, and an
+older host simply writes none. Mid-roll, a console entering on an older host
+for a VM on an upgraded one is recorded only on the VM's host, under
+`peer:<entry host>` rather than the user.
+
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 
 This release enforces per-NIC policy — security groups, the cluster and host

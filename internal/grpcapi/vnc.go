@@ -23,25 +23,29 @@ import (
 // ProxyVNC provides a bidirectional byte stream to the VNC port of a running VM.
 // The VM name is passed via incoming metadata key "x-vm-name".
 // If the VM is on a remote host, this handler forwards to the remote daemon.
-func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) error {
-	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
-		return err
-	}
+func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) (err error) {
 	md, _ := metadataFromStream(stream)
 	vmName := ""
 	if vals := md.Get("x-vm-name"); len(vals) > 0 {
 		vmName = vals[0]
 	}
+	ctx := stream.Context()
+	// Every open, refused or not, is audited (console_audit.go).
+	ca := s.beginConsoleAudit(ctx, consoleKindVNC, vmName)
+	defer func() { ca.end(err) }()
+
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return err
+	}
 	if vmName == "" {
 		return status.Error(codes.InvalidArgument, "x-vm-name metadata required")
 	}
-
-	ctx := stream.Context()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
 	}
+	ca.setOwner(vm.HostName)
 	// Path-scoped check on the VM's tenancy project — a console is interactive
 	// root access to the guest, so a broad operator role isn't enough; the
 	// caller must hold vm.console on THIS VM. Enforced on the entry host where
@@ -59,7 +63,7 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 	// Remote VM: forward to the host that owns it.
 	if vm.HostName != s.hostName {
-		return s.forwardVNC(stream, vmName, vm.HostName)
+		return s.forwardVNC(stream, vmName, vm.HostName, ca)
 	}
 
 	// Local VM: connect to the VNC port. A missing VNC graphics device means
@@ -124,6 +128,7 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 	who := consoleCallerAttrs(ctx)
 	slog.Info("VNC proxy session started", append([]any{"vm", vmName, "port", port, "authenticated", password != ""}, who...)...)
+	ca.start()
 
 	errCh := make(chan error, 2)
 
@@ -306,7 +311,7 @@ func (v *vncViewerStream) Write(p []byte) (int, error) {
 }
 
 // forwardVNC relays a ProxyVNC stream to a remote daemon.
-func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNCData], vmName, hostName string) error {
+func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNCData], vmName, hostName string, ca *consoleAudit) error {
 	ctx := incoming.Context()
 	client, conn, err := s.peerClient(ctx, hostName)
 	if err != nil {
@@ -314,9 +319,11 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 	}
 	defer conn.Close()
 	defer logForwardedConsole(ctx, "VNC", vmName, hostName)()
+	session := ca.start()
 
-	// Forward x-vm-name metadata to the remote daemon.
-	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName))
+	// Forward x-vm-name metadata to the remote daemon, and this host's
+	// console session id for the owner's audit row to name.
+	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
 	remote, err := client.ProxyVNC(outCtx)
 	if err != nil {
 		return remoteStreamErr(hostName, err)

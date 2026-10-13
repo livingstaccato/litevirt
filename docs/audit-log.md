@@ -157,6 +157,79 @@ a repo to zstd. Each row names the repo, or `src -> dst` for a sync, and
   [backups.md](backups.md#repo-maintenance-rpcs). The local
   `lv backup repo …` commands write no row (see
   [below](#actions-taken-while-the-daemon-is-down)).
+- Who had a console on VM `web-1`? — `lv audit ls --target web-1 --action 'vm.console.*'`.
+  Every VNC, SPICE and serial console session is an open row and a close row,
+  and every refused open is a row. See [Console sessions](#console-sessions).
+
+## Console sessions
+
+A console is interactive access to the guest, so every console session is
+audited, whichever way it was opened: the web UI's VNC and serial consoles,
+`lv vnc --listen`, `lv spice --launch` / `--listen` and `lv console`. All of
+them reach the daemon as `ProxyVNC`, `ProxySpice` or `ConsoleVM`, and those
+write the rows. A client that reaches the listener by other means — an SSH
+tunnel to the VM's host, `virsh console` on it — goes around litevirt and is
+not recorded here.
+
+| Action | Result | Written |
+|---|---|---|
+| `vm.console.open` | `ok` | when the session starts: the VNC handshake is done, the SPICE or serial socket is open, or, on the host the caller entered on, the relay to the VM's host is open |
+| `vm.console.close` | `ok`, `error` | when the session ends |
+| `vm.console.open` | `denied` | the caller lacks `vm.console` on the VM (or the operator role) |
+| `vm.console.open` | `error` | refused for any other reason: no such VM, not running, that console not enabled, the VM's host unreachable |
+| `vm.console.credential` | `ok`, `denied`, `error` | `GetSpiceInfo` (plain `lv spice`, `--launch` and `--listen`, the UI's SPICE dialog and `.vv` download), which hands out the SPICE password |
+
+The target is the VM's name. The detail is `key=value` pairs, a value quoted
+when it holds a space:
+
+- `kind` — `vnc`, `spice` or `serial`.
+- `entry` — the host the caller connected to; `owner` — the VM's host.
+- `session` — joins a session's open and close rows.
+- on a close: `duration` (open to end), `ended` (`closed`, or why it ended),
+  and for SPICE `channels`.
+- on a refusal: `reason`, the error the caller got.
+- on a credential row: `password=yes|no`, whether a password went out.
+
+No row carries a console password, a bearer token or a session id.
+
+A session cut because its user's session was revoked, or the user disabled or
+deleted, closes with result `ok` and `ended` naming the cut. A close row with
+result `error` is a fault: the VM's host dropped, the listener failed.
+
+**Who a row names.** Each host names only an identity it authenticated
+itself. A console for a VM on another host enters on one daemon and is carried
+to the VM's host over peer mTLS, so it is recorded twice, once on each host's
+signed sub-chain:
+
+- the host the caller entered on names the user, with `entry` itself and
+  `owner` the VM's host;
+- the VM's host names the relaying host, as user `peer:<host>`, with
+  `via_peer=<host>` and `entry_session=<the entry host's session id>`, so the
+  two pairs can be joined. It never names a user it has only the peer's word
+  for, and never the peer's `admin` principal. Where forwarded identity is
+  enforced, the VM's host verifies the user's relayed bearer itself, and then
+  names the user.
+
+A console opened on the node by root over the local host certificate is
+recorded as `admin` with `principal=local-root`.
+
+**SPICE channels.** A SPICE client opens several channels — main, display,
+inputs, cursor and more — each its own `ProxySpice` stream. They are one
+session: the channels one credential has open on one VM are grouped, the open
+row is written when the first starts, and the close row once the last has
+ended and no new one followed within 2 seconds. The close row's timestamp is
+therefore about 2 seconds after the end; `duration` is exact. Two viewers
+that one user opens on one VM at the same time through the same login are
+one session. A burst of identical refusals of one client's channels within
+those 2 seconds is one row. VNC and serial streams are a session each.
+
+A daemon stopped during a session leaves its open row without a close row.
+
+**Mixed versions.** No schema change and no new statement: the rows go
+through the same writer as every other audit row. A host on an older build
+writes no console rows. When it is the host the caller entered on, the VM's
+host on this release still records the session, under `peer:<that host>` and
+without `entry_session`.
 
 ## Verifying
 

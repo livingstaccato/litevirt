@@ -91,6 +91,9 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	defer conn.Close()
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
+	// The session is open: audited, and the header sent before the
+	// handshake's first byte, so a relaying host records it too.
+	ca.accept(stream)
 
 	viewer := newVNCViewerStream(ctx, stream)
 	if password != "" {
@@ -128,7 +131,6 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 	who := consoleCallerAttrs(ctx)
 	slog.Info("VNC proxy session started", append([]any{"vm", vmName, "port", port, "authenticated", password != ""}, who...)...)
-	ca.start()
 
 	errCh := make(chan error, 2)
 
@@ -319,15 +321,23 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 	}
 	defer conn.Close()
 	defer logForwardedConsole(ctx, "VNC", vmName, hostName)()
-	session := ca.start()
+	session := ca.attach()
 
 	// Forward x-vm-name metadata to the remote daemon, and this host's
-	// console session id for the owner's audit row to name.
-	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
+	// console session id for the owner's audit row to name. The remote leg
+	// ends with this handler, so its header wait (below) cannot outlive it.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outCtx := metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
 	remote, err := client.ProxyVNC(outCtx)
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
+	sendDone := make(chan struct{})
+	defer func() {
+		cancel()
+		waitRelaySender(sendDone)
+	}()
 
 	errCh := make(chan error, 2)
 
@@ -351,8 +361,11 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 		}
 	}()
 
-	// remote → incoming
+	// remote → incoming. The session is open here only once the VM's host
+	// has accepted it (its header).
 	go func() {
+		defer close(sendDone)
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

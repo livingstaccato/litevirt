@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -80,7 +81,7 @@ func (s *Server) ConsoleVM(stream grpc.BidiStreamingServer[pb.ConsoleInput, pb.C
 	registerStreamCloser(ctx, func() { _ = ptmx.Close() })
 
 	slog.Info("console session started", "vm", vmName)
-	ca.start()
+	ca.accept(stream)
 
 	errCh := make(chan error, 2)
 
@@ -153,13 +154,22 @@ func (s *Server) forwardConsole(incoming grpc.BidiStreamingServer[pb.ConsoleInpu
 		return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 	}
 	defer conn.Close()
-	session := ca.start()
+	session := ca.attach()
 
-	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
+	// The remote leg ends with this handler, so its header wait (below)
+	// cannot outlive it.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outCtx := metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
 	remote, err := client.ConsoleVM(outCtx)
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
+	sendDone := make(chan struct{})
+	defer func() {
+		cancel()
+		waitRelaySender(sendDone)
+	}()
 
 	errCh := make(chan error, 2)
 
@@ -183,8 +193,11 @@ func (s *Server) forwardConsole(incoming grpc.BidiStreamingServer[pb.ConsoleInpu
 		}
 	}()
 
-	// remote → incoming
+	// remote → incoming. The session is open here only once the VM's host
+	// has accepted it (its header).
 	go func() {
+		defer close(sendDone)
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

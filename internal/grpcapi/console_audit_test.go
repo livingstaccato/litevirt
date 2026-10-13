@@ -427,3 +427,134 @@ func TestConsoleAudit_SpiceInfoIsACredentialRow(t *testing.T) {
 		t.Errorf("mallory's row = %+v", r)
 	}
 }
+
+// A SPICE client that closes every channel and opens another within the
+// linger (a reconnect) is still one session.
+//
+// Mutation "close a grouped session as soon as its last channel ends" — red.
+func TestConsoleAudit_SpiceRejoinWithinTheLingerIsTheSameSession(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	// openConsole holds a stream 300ms before returning; the linger is
+	// stretched so the rejoin lands well inside it.
+	consoleSessionLinger = 2 * time.Second
+	_, end := openConsole(t, s, alice, "spice")
+	_ = end()
+	_, end = openConsole(t, s, alice, "spice")
+	_ = end()
+	rows := waitRows(t, s, "no close row", func(r []consoleAuditRow) bool {
+		return len(rowsWith(r, "vm.console.close", "spice")) > 0
+	})
+	time.Sleep(500 * time.Millisecond)
+	rows = consoleAuditRows(t, s)
+	open, closed := rowsWith(rows, "vm.console.open", "spice"), rowsWith(rows, "vm.console.close", "spice")
+	if len(open) != 1 || len(closed) != 1 || auditField(closed[0].detail, "channels") != "2" {
+		t.Fatalf("a rejoin within the linger: want one session of 2 channels, got\n%+v", rows)
+	}
+}
+
+// A session cut because its user's session was revoked ran and was ended on
+// purpose: its close row is ok, and says why it ended.
+//
+// Mutation "a cut is an error close" — red.
+func TestConsoleAudit_ACutSessionClosesOkNamingTheCut(t *testing.T) {
+	s, v := consoleServer(t)
+	v.vnc = holdListener(t)
+	s.virt = v
+	token := login(t, s, "bob", "bob-pw").Token
+	done, _ := runRealStream(t, s, token, "/litevirt.v1.LiteVirt/ProxyVNC", "web1", func(ss grpc.ServerStream) error {
+		return s.ProxyVNC(&grpc.GenericServerStream[pb.VNCData, pb.VNCData]{ServerStream: ss})
+	})
+	waitRows(t, s, "no open row", func(r []consoleAuditRow) bool { return len(rowsWith(r, "vm.console.open", "vnc")) == 1 })
+	if _, err := s.RevokeSession(adminCtx(), &pb.RevokeSessionRequest{Id: strings.TrimPrefix(token, SessionTokenPrefix)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("VNC ended with %v, want Unauthenticated", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the VNC session was not cut")
+	}
+	rows := waitRows(t, s, "no close row", func(r []consoleAuditRow) bool { return len(rowsWith(r, "vm.console.close", "vnc")) == 1 })
+	c := rowsWith(rows, "vm.console.close", "vnc")[0]
+	if c.result != "ok" || c.user != "bob" || auditField(c.detail, "ended") == "closed" || auditField(c.detail, "ended") == "" {
+		t.Fatalf("close row of a cut session = %+v", c)
+	}
+}
+
+// A graceful stop writes every open session's close row before it returns —
+// the database closes right after (daemon.Run) — and a session the stop
+// ended says so. Nothing is written after the flush.
+//
+// Mutation "FlushConsoleAudit writes nothing" — red.
+// Mutation "MarkConsoleShutdown does nothing" — red (serial ended=closed).
+func TestConsoleAudit_DaemonStopClosesEverySession(t *testing.T) {
+	s := consoleAuditServer(t)
+	consoleSessionLinger = time.Hour // the SPICE close would never come on its own
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	_, endVNC := openConsole(t, s, alice, "vnc")
+	_, endSerial := openConsole(t, s, alice, "serial")
+	_, endSpice := openConsole(t, s, alice, "spice")
+	_ = endSpice() // ended by its client, lingering
+
+	s.MarkConsoleShutdown()
+	_ = endSerial() // its handler returns during the stop
+	s.FlushConsoleAudit()
+
+	rows := consoleAuditRows(t, s)
+	for kind, want := range map[string]string{"vnc": "daemon-stop", "serial": "daemon-stop", "spice": "closed"} {
+		c := rowsWith(rows, "vm.console.close", kind)
+		if len(c) != 1 || c[0].result != "ok" || auditField(c[0].detail, "ended") != want {
+			t.Errorf("%s: close rows after the flush = %+v, want one, ended=%s", kind, c, want)
+		}
+	}
+	_ = endVNC() // after the flush: nothing more
+	time.Sleep(100 * time.Millisecond)
+	if n := len(consoleAuditRows(t, s)); n != len(rows) {
+		t.Errorf("%d rows written after the flush", n-len(rows))
+	}
+}
+
+// Refusal rows are bounded: an echoed VM name is cut, a caller gets at most
+// consoleRefusalBurst refusal rows per window, and the window ends with one
+// row counting what was held back. The next window starts with a row again.
+//
+// Mutation "no per-caller budget" — red. Mutation "no truncation" — red.
+// Mutation "no summary row" — red.
+func TestConsoleAudit_RefusalsAreBoundedPerCaller(t *testing.T) {
+	s := consoleAuditServer(t)
+	oldW, oldB := consoleRefusalWindow, consoleRefusalBurst
+	consoleRefusalWindow, consoleRefusalBurst = 500*time.Millisecond, 3
+	t.Cleanup(func() { consoleRefusalWindow, consoleRefusalBurst = oldW, oldB })
+
+	refuse := func(name string) {
+		ctx := metadata.NewIncomingContext(userCtx("vic", "viewer"), metadata.Pairs("x-vm-name", name))
+		ts := &transportStream{ctx: ctx, transport: make(chan struct{})}
+		close(ts.transport)
+		if err := s.ProxyVNC(&grpc.GenericServerStream[pb.VNCData, pb.VNCData]{ServerStream: ts}); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("a viewer's ProxyVNC: %v, want PermissionDenied", err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		refuse(strings.Repeat("x", 100<<10) + strconv.Itoa(i))
+	}
+	rows := consoleAuditRows(t, s)
+	if len(rows) != 3 {
+		t.Fatalf("8 refusals in one window wrote %d rows, want 3", len(rows))
+	}
+	for _, r := range rows {
+		if len(r.target) > consoleAuditMaxTarget+32 || len(r.detail) > 1024 || !strings.Contains(r.target, "bytes)") {
+			t.Fatalf("a refusal row is not bounded: target %d bytes, detail %d bytes", len(r.target), len(r.detail))
+		}
+	}
+	sum := waitRows(t, s, "no summary row", func(r []consoleAuditRow) bool { return len(r) == 4 })[3]
+	if sum.action != "vm.console.suppressed" || sum.user != "vic" || sum.result != "denied" || auditField(sum.detail, "suppressed") != "5" {
+		t.Fatalf("summary row = %+v", sum)
+	}
+	refuse("again")
+	if rows := consoleAuditRows(t, s); len(rows) != 5 || rows[4].target != "again" {
+		t.Fatalf("the first refusal of a new window was not written: %+v", rows)
+	}
+}

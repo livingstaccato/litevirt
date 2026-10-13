@@ -1424,7 +1424,10 @@ the audit log, and every refused open a row
 no capability token: the rows go through the ordinary audit writer, and an
 older host simply writes none. Mid-roll, a console entering on an older host
 for a VM on an upgraded one is recorded only on the VM's host, under
-`peer:<entry host>` rather than the user.
+`peer:<entry host>` rather than the user, and two users' concurrent SPICE
+consoles relayed by that older host are one session there. Through an older
+VM host, the upgraded entry host records a relayed session from the VM host's
+first byte rather than its explicit accept.
 
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 

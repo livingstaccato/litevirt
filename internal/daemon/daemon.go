@@ -1999,6 +1999,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("shutdown requested by uninstall")
 			uninstalled = true
 		}
+		// A console session the stop ends is recorded as ended by the stop,
+		// not by its client (docs/audit-log.md "Console sessions").
+		svc.MarkConsoleShutdown()
 		done := make(chan struct{})
 		go func() {
 			d.grpcSrv.GracefulStop()
@@ -2018,6 +2021,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// is the host it drained: give them a moment to land while the
 		// replicator still runs, and name every VM whose record is lost.
 		svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+		// Every console session still open, or waiting out its SPICE linger,
+		// gets its close row now, while the database is still open.
+		svc.FlushConsoleAudit()
 		if d.fwReconciler != nil {
 			d.fwReconciler.Stop()
 		}

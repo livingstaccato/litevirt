@@ -21,7 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -90,6 +93,8 @@ func sessionRows(rows []consoleRow, host, kind string) (open, closed []consoleRo
 func TestFleet_ConsoleAudit_ARelayedSessionIsAuditedAsTheUserOnTheEntryHost(t *testing.T) {
 	c := consoleCluster(t)
 	relay, owner := c.Nodes[0], c.Nodes[1]
+	signNode(t, relay)
+	signNode(t, owner)
 	createConsoleVM(t, c, relay, "desk", owner.Name, true)
 	sl := startSpiceListener(t)
 	owner.Virt.SetSpicePort("desk", sl.port())
@@ -222,6 +227,18 @@ func TestFleet_ConsoleAudit_ARelayedSessionIsAuditedAsTheUserOnTheEntryHost(t *t
 	if len(cred) != 2 {
 		t.Errorf("credential rows = %+v, want one on each host", cred)
 	}
+	// The two credential rows are joined: the owner's names the entry's id.
+	var entryReq, ownerReq string
+	for _, r := range cred {
+		if r.host == relay.Name {
+			entryReq = rowField(r.detail, "session")
+		} else {
+			ownerReq = rowField(r.detail, "entry_session")
+		}
+	}
+	if entryReq == "" || ownerReq != entryReq {
+		t.Errorf("credential rows not joined: entry session %q, owner entry_session %q", entryReq, ownerReq)
+	}
 	for _, r := range cred {
 		want := "bob"
 		if r.host == owner.Name {
@@ -244,4 +261,155 @@ func TestFleet_ConsoleAudit_ARelayedSessionIsAuditedAsTheUserOnTheEntryHost(t *t
 		}
 	}
 	_ = os.Remove(fifo)
+
+	// Signed, and the chain verifies, on both hosts' sub-chains.
+	if n := rowCount(t, relay, `SELECT count(*) AS n FROM audit_log
+		WHERE action LIKE 'vm.console.%' AND (signature IS NULL OR signature = '')`); n != 0 {
+		t.Errorf("%d console rows are unsigned", n)
+	}
+	if res := verifyOn(t, relay); res.BrokenAt != "" || len(res.BadSignature) != 0 || len(res.SeqGaps) != 0 || len(res.UnsignedAfterSigned) != 0 {
+		t.Errorf("the audit chain does not verify: %+v", res)
+	}
+}
+
+// openRelayed opens kind's console stream for vm as client and returns the
+// error the stream ends with (nil when it is still open after 2s).
+func openRelayed(t *testing.T, client pb.LiteVirtClient, kind, vm string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), metadata.Pairs("x-vm-name", vm)), 2*time.Second)
+	defer cancel()
+	var recv func() error
+	switch kind {
+	case "vnc":
+		st, err := client.ProxyVNC(ctx)
+		if err != nil {
+			return err
+		}
+		recv = func() error { _, err := st.Recv(); return err }
+	case "spice":
+		st, err := client.ProxySpice(ctx)
+		if err != nil {
+			return err
+		}
+		recv = func() error { _, err := st.Recv(); return err }
+	case "serial":
+		st, err := client.ConsoleVM(ctx)
+		if err != nil {
+			return err
+		}
+		recv = func() error { _, err := st.Recv(); return err }
+	}
+	for {
+		if err := recv(); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// noHeaderStream is a VM host on an older build: it sends no accept header,
+// so its header goes with its first message.
+type noHeaderStream struct{ grpc.ServerStream }
+
+func (noHeaderStream) SendHeader(metadata.MD) error { return nil }
+
+// TestFleet_ConsoleAudit_ARelayTheVMHostRefusedIsARefusalOnTheEntryHost: a
+// console entering on relay for a VM on owner is a session on relay only
+// once owner has accepted it. Refused on owner — by its handler, by its
+// interceptor (a rejected forwarded bearer), or unreachable — it is one
+// refusal row on relay, never an open ok and a close. An older owner, which
+// sends no accept header, still gives a session (its header comes with its
+// first message).
+//
+// Mutation "a relay accepts when the peer client is obtained" — red.
+func TestFleet_ConsoleAudit_ARelayTheVMHostRefusedIsARefusalOnTheEntryHost(t *testing.T) {
+	c := consoleCluster(t)
+	relay, owner := c.Nodes[0], c.Nodes[1]
+	createConsoleVM(t, c, relay, "desk", owner.Name, true)
+	owner.Virt.SetConsolePTYPath("desk", filepath.Join(t.TempDir(), "no-such-pty"))
+	vl := startVNCListener(t, consolePassword(t, owner, "desk", "vnc"))
+	owner.Virt.SetVNCPort("desk", vl.port())
+	ctx := context.Background()
+	admin := c.SelfClient(relay)
+	if _, err := admin.CreateUser(ctx, &pb.CreateUserRequest{Username: "bob", Password: "bobs-password-0123456789", Role: "operator"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	login, err := admin.Login(ctx, &pb.LoginRequest{Username: "bob", Password: "bobs-password-0123456789"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob := c.bearerClient(relay, login.Token)
+
+	// The VM's host's handler refuses (no PTY).
+	if err := openRelayed(t, bob, "serial", "desk"); err == nil {
+		t.Fatal("a serial console with no PTY on the VM's host was not refused")
+	}
+	// The VM's host's interceptor refuses, as it does a revoked forwarded bearer.
+	owner.HookStream("ProxyVNC", func(any, grpc.ServerStream, grpc.StreamHandler) error {
+		return status.Error(codes.Unauthenticated, "forwarded identity: session revoked")
+	})
+	if err := openRelayed(t, bob, "vnc", "desk"); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("a relayed VNC the VM's host refused: %v, want Unauthenticated", err)
+	}
+	// The VM's host unreachable.
+	owner.HookStream("ProxySpice", func(any, grpc.ServerStream, grpc.StreamHandler) error {
+		return status.Error(codes.Unavailable, "connection refused")
+	})
+	if err := openRelayed(t, bob, "spice", "desk"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("a relayed SPICE to an unreachable host: %v, want Unavailable", err)
+	}
+
+	var rows []consoleRow
+	eventually(t, 10*time.Second, "a refusal row per console on relay", func() bool {
+		rows = consoleRows(t, relay)
+		n := 0
+		for _, r := range rows {
+			if r.host == relay.Name && r.action == "vm.console.open" && r.result != "ok" {
+				n++
+			}
+		}
+		return n == 3
+	})
+	time.Sleep(500 * time.Millisecond)
+	rows = consoleRows(t, relay)
+	want := map[string]string{"serial": "error", "vnc": "denied", "spice": "error"}
+	for kind, result := range want {
+		open, closed := sessionRows(rows, relay.Name, kind)
+		if len(open) != 1 || len(closed) != 0 || open[0].result != result || open[0].user != "bob" {
+			t.Errorf("%s on %s: open %+v, close %+v; want one open %s row and no close", kind, relay.Name, open, closed, result)
+		}
+	}
+	if o, _ := sessionRows(rows, owner.Name, "serial"); len(o) != 1 || o[0].result != "error" || o[0].user != "peer:"+relay.Name {
+		t.Errorf("serial on %s: %+v, want one open error row under peer:%s", owner.Name, o, relay.Name)
+	}
+
+	// An older VM host: no accept header. Its header comes with its first
+	// message (the RFB greeting), and the session is open on relay from then
+	// — while it runs, not only once it has ended.
+	owner.HookStream("ProxyVNC", func(srv any, ss grpc.ServerStream, h grpc.StreamHandler) error {
+		return h(srv, noHeaderStream{ss})
+	})
+	vctx, vcancel := context.WithTimeout(metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", "desk")), 15*time.Second)
+	defer vcancel()
+	st, err := bob.ProxyVNC(vctx)
+	if err != nil {
+		t.Fatalf("ProxyVNC through an older VM host: %v", err)
+	}
+	ver := make([]byte, 12)
+	if _, err := io.ReadFull(&vncStreamReader{st: st}, ver); err != nil {
+		t.Fatalf("the RFB greeting through an older VM host: %v", err)
+	}
+	eventually(t, 10*time.Second, "an open ok row on relay while the VNC session through the older host runs", func() bool {
+		open, _ := sessionRows(consoleRows(t, relay), relay.Name, "vnc")
+		for _, r := range open {
+			if r.result == "ok" {
+				return true
+			}
+		}
+		return false
+	})
+	_ = st.CloseSend()
+	vcancel()
 }

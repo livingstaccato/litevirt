@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // spiceReporter is the backend's answer to whether SPICE can connect on this
@@ -49,8 +50,8 @@ func (s *Server) spiceUnusable() string {
 func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (resp *pb.GetSpiceInfoResponse, err error) {
 	// It hands out the console's password: every call, refused or not, is
 	// audited (console_audit.go), without the password.
-	owner := ""
-	defer func() { s.auditConsoleCredential(ctx, req.GetVmName(), owner, resp.GetPassword() != "", err) }()
+	owner, request := "", ""
+	defer func() { s.auditConsoleCredential(ctx, req.GetVmName(), owner, request, resp.GetPassword() != "", err) }()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
@@ -82,7 +83,10 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", vm.HostName, err)
 		}
 		defer conn.Close()
-		return client.GetSpiceInfo(ctx, req)
+		// The VM's host records the call too, under this host; the id joins
+		// its row to this one.
+		request = randid.New()
+		return client.GetSpiceInfo(metadata.AppendToOutgoingContext(ctx, consoleAuditSessionMD, request), req)
 	}
 
 	port, err := s.virt.GetVMSpicePort(req.VmName)
@@ -184,7 +188,7 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 
 	who := consoleCallerAttrs(ctx)
 	slog.Info("SPICE proxy session started", append([]any{"vm", vmName, "port", port}, who...)...)
-	ca.start()
+	ca.accept(stream)
 	defer slog.Info("SPICE proxy session ended", append([]any{"vm", vmName}, who...)...)
 
 	errCh := make(chan error, 2)
@@ -255,7 +259,7 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 	}
 	defer conn.Close()
 	defer logForwardedConsole(ctx, "SPICE", vmName, hostName)()
-	session := ca.start()
+	session := ca.attach()
 	// The remote leg lives inside this stream's context, so a cut (or this
 	// handler's return) ends it, and the owner then closes its SPICE socket.
 	rctx, cancel := context.WithCancel(ctx)
@@ -291,6 +295,8 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 	}()
 	go func() {
 		defer close(sendDone)
+		// The session is open here only once the VM's host has accepted it.
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

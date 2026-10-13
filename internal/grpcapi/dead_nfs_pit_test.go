@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
@@ -172,4 +173,30 @@ func TestSettleKeptPITOverlays_ANoAnswerRefusesTheDelete(t *testing.T) {
 		return f.s.settleKeptPITOverlays(context.Background(), vm, true)
 	})
 	wantNoAnswer(t, "settle kept overlays", err)
+}
+
+// The start path's other unbounded look at a pool directory (round 3's
+// residual): a VM whose installer ISO is in a library on a dead mount. The
+// ISO's judgement is bounded like the disk checks, and its no-answer is
+// refused as retryable.
+//
+// Mutation "the CD-ROMs judged unbounded" — the start hangs: red.
+func TestStart_AnInstallerISOOnADeadMountIsRefusedNotWaitedOn(t *testing.T) {
+	f, mnt, _ := startChainWithDeadNFS(t)
+	iso := filepath.Join(mnt, "isos", "installer.iso")
+	vm := f.insertVM(t, "isovm", "a", filepath.Join(f.pa, "isovm-root.qcow2"), "pa", "")
+	if err := f.s.virt.DefineDomain(`<domain type='kvm'><name>isovm</name><devices>` +
+		`<disk type='file' device='cdrom'><source file='` + iso + `'/></disk></devices></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prev := judgeCDROMs
+	judgeCDROMs = func(s *Server, vm *corrosion.VMRecord, domXML string) (string, error) {
+		<-release // the ISO's stat on the dead mount
+		return prev(s, vm, domXML)
+	}
+	t.Cleanup(func() { judgeCDROMs = prev })
+	err := within(t, 10*time.Second, "the start's ISO check", func() error { return f.s.verifyVMISOForStart(vm) })
+	wantNoAnswer(t, "ISO check", err)
 }

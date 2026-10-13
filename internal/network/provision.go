@@ -37,6 +37,37 @@ func IsolatedBridgeName(networkName string) string {
 	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
 }
 
+// BridgeName returns the host device a NIC on networkName attaches to: the
+// same name Provision returns for def.
+//
+// A "direct" network answers "direct:<iface>", as Provision does. A network
+// missing the field its type keys on (vni, pf, interface) falls back to its
+// own name, which is the flat-bridge answer.
+func BridgeName(networkName string, def compose.NetworkDef) string {
+	switch def.Type {
+	case "vxlan":
+		if def.VNI != 0 {
+			return vxlanBridgeName(def.VNI)
+		}
+	case "isolated":
+		return IsolatedBridgeName(networkName)
+	case "sriov":
+		if def.PF != "" {
+			return def.PF
+		}
+		return networkName
+	case "direct":
+		if def.Interface != "" {
+			return "direct:" + def.Interface
+		}
+		return networkName
+	}
+	if def.Interface != "" {
+		return def.Interface
+	}
+	return networkName
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string
@@ -330,7 +361,9 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		if def.VLAN > 0 {
 			RemoveBridgeVLAN(bridge, def.VLAN, def.Underlay)
 		}
-		// Don't delete user-managed bridges — they may be shared with other stacks.
+		// The bridge itself goes only when litevirt created it here and no
+		// other live network names it; an operator's bridge is never deleted.
+		removeCreatedBridge(ctx, db, networkName, bridge)
 		return nil
 
 	case "vxlan":
@@ -376,6 +409,55 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 
 	default:
 		return fmt.Errorf("unknown network type %q", def.Type)
+	}
+}
+
+// removeCreatedBridge removes bridge, the device of bridge network
+// networkName that is being torn down, when this host's record says
+// EnsureBridge created it (RemoveCreatedBridgeIfUnused) and no OTHER live
+// network uses it as its device. networkName itself does not count: its own
+// delete deprovisions before it tombstones the row.
+//
+// It is best effort and never fails the teardown: a bridge it cannot prove
+// unshared, or cannot remove, stays, as every bridge network's bridge did
+// before. Without a database there is no way to prove the bridge unshared, so
+// it stays.
+func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName, bridge string) {
+	if db == nil {
+		return
+	}
+	live, err := corrosion.ListNetworks(ctx, db)
+	if err != nil {
+		slog.Warn("network teardown: cannot read the live networks, so the bridge stays",
+			"network", networkName, "bridge", bridge, "error", err)
+		return
+	}
+	for _, r := range live {
+		if r.Name == networkName {
+			continue
+		}
+		var def compose.NetworkDef
+		if r.Config != "" {
+			if err := json.Unmarshal([]byte(r.Config), &def); err != nil {
+				slog.Warn("network teardown: a live network's config is unreadable, so the bridge stays",
+					"network", networkName, "bridge", bridge, "live_network", r.Name, "error", err)
+				return
+			}
+		}
+		def.Type = r.Type
+		if BridgeName(r.Name, def) == bridge || (def.Interface == "" && r.Name == bridge) {
+			slog.Info("network teardown: another live network uses the bridge, so it stays",
+				"network", networkName, "bridge", bridge, "live_network", r.Name)
+			return
+		}
+	}
+	removed, err := RemoveCreatedBridgeIfUnused(bridge)
+	switch {
+	case err != nil:
+		slog.Warn("network teardown: removing the bridge litevirt created failed; it stays",
+			"network", networkName, "bridge", bridge, "error", err)
+	case removed:
+		slog.Info("network teardown: removed the bridge litevirt created", "network", networkName, "bridge", bridge)
 	}
 }
 

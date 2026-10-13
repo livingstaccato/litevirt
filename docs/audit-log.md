@@ -164,18 +164,28 @@ a repo to zstd. Each row names the repo, or `src -> dst` for a sync, and
 `--since` on `lv audit ls` and `lv events <vm>`, and `--since` / `--until` on
 `lv audit export`, are read as times and compared as instants. Each takes:
 
-- an RFC3339 timestamp, with or without a fraction, in UTC or with an offset:
-  `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`, `2026-10-03T22:16:30.5Z`;
+- an RFC3339 timestamp, with or without a fraction (`.` or `,`), in UTC or with
+  an offset: `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`,
+  `2026-10-03T22:16:30.5Z`;
 - the same without a zone, or with a space for the `T`, read as UTC;
-- a minute, date, month or year: `2026-10-03T22:16`, `2026-10-03`, `2026-10`,
-  `2026`;
-- a duration, meaning that long ago: `90m`, `24h`.
+- a minute, hour, date, month or year: `2026-10-03T22:16`, `2026-10-03T22`,
+  `2026-10-03`, `2026-10`, `2026`;
+- a Unix time in seconds, any bare integer other than a four-digit year:
+  `1791065790`. `--since 0` is the beginning, so it still returns every row;
+- a duration, meaning that long ago: `90m`, `24h`. A duration needs a unit.
 
 A bound covers the whole unit it names: `--since` starts at the beginning of it
 and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
 and `--since 2026-10-03T22:16:30Z` includes a row stamped
-`22:16:30.767241380Z`. Anything else is refused with `InvalidArgument` and a
-message naming the bound.
+`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row.
+Anything else is refused with `InvalidArgument` and a message naming the bound.
+
+The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp
+(`2026-10-03T22:16:30.000000000Z`), so a daemon not yet upgraded, which still
+compares the bound as text, draws the window in the right place too, and a
+relative bound is fixed once for every page of an export. A client calling the
+API directly with any other form gets the right answer only from an upgraded
+daemon.
 
 Before this, the bound was compared to the stored stamp as text. The stamps are
 fixed-width UTC with nine fractional digits, and `.` sorts below `Z`, so
@@ -206,16 +216,20 @@ grouped by what it means:
 - **hash mismatch** — a row was edited, or a migration replayed the table
   without rebuilding hashes (operator error). The row does not hash to its
   stored `content_hash` even against its own stored `prev_hash`.
-- **forked chain** — the row hashes correctly against its own stored
-  `prev_hash`, but that `prev_hash` is empty: the row opens a second chain for a
-  host that already has one. Expect duplicate seqs for the same host under
-  **sequence break**. This is the shape a host rebuilt under its old name writes
-  if it appends before its history has replicated back (see "Rebuilding a host
-  under its old name" below). No row was edited, but it is still a finding, and
-  `verify` still exits non-zero.
+- **forked chain** — the row has the whole shape of a second genesis: it
+  hashes correctly against its own stored `prev_hash`, that `prev_hash` is
+  empty, and it is a second `seq 1` for a host that already has one. Expect the
+  duplicate seqs under **sequence break**. This is the shape a host rebuilt
+  under its old name writes if it appends before its history has replicated
+  back (see "Rebuilding a host under its old name" below). The hash shows no
+  edit to the row, but it is still a finding, and `verify` still exits
+  non-zero.
 - **broken link** — the row hashes correctly against its own stored
-  `prev_hash`, but that is not the hash of the row before it. A row between them
-  was deleted or rewritten, or the chain branched.
+  `prev_hash`, but that is not the hash of the row before it, and the row is not
+  a second genesis. A row between them was deleted or rewritten, the chain
+  branched, or this row was rewritten together with its `prev_hash` and hash
+  (possible undetected only on an unsigned row; a signed one also shows a bad
+  signature).
 
   Only the first broken link is named, under whichever of these three headings
   fits it. A daemon too old to classify the break is shown as a hash mismatch.

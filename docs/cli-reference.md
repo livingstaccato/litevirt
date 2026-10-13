@@ -1357,7 +1357,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since TS]   # Audit log (default 50 entries)
+lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics
 ```

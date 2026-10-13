@@ -36,6 +36,12 @@ func TestParseTimeWindow_Forms(t *testing.T) {
 		{"2026-10-03", day, day.Add(24*time.Hour - 1)},
 		{"2026-10", time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC).Add(-1)},
 		{"2026", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC).Add(-1)},
+		{"2026-10-03T22", T.Add(-16*time.Minute - 30*time.Second), T.Add(43*time.Minute + 30*time.Second - 1)},
+		{"2026-10-03 22", T.Add(-16*time.Minute - 30*time.Second), T.Add(43*time.Minute + 30*time.Second - 1)},
+		{"2026-10-03T22:16:30,5Z", T.Add(500 * time.Millisecond), T.Add(600*time.Millisecond - 1)},
+		{"0", time.Unix(0, 0).UTC(), time.Unix(1, 0).UTC().Add(-1)},
+		{"1791065790", T, T.Add(time.Second - 1)},
+		{"9999", time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)},
 		{"90m", now.Add(-90 * time.Minute), now.Add(-90 * time.Minute)},
 		{"0s", now, now},
 	} {
@@ -103,7 +109,8 @@ func TestTimeWindow_PredicateIsTimeOrder(t *testing.T) {
 	bounds := []string{
 		"", "2026-10-03T22:16:30Z", "2026-10-04T00:16:30+02:00", "2026-10-03T22:16:30.5Z",
 		"2026-10-03T22:16:30.767241380Z", "2026-10-03T22:16:30.77Z", "2026-10-03T22:16:31Z",
-		"2026-10-03", "2026-10-03T22:16",
+		"2026-10-03", "2026-10-03T22:16", "2026-10-03T22", "0",
+		"9999", "9999-12-31", "9999-12-31T23:59:59Z",
 	}
 	for _, since := range bounds {
 		for _, until := range bounds {

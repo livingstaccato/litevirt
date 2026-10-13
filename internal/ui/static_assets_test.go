@@ -2,6 +2,7 @@ package ui
 
 import (
 	"io/fs"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -16,10 +17,12 @@ var consoleTemplates = []string{
 	"templates/console_modal.html",
 }
 
-// buildFetchedPrefixes are the static paths `make vendor-js` downloads at build
-// time instead of committing (see the Makefile and .gitignore). A plain
-// `go test` tree does not have them, so only the all-templates check skips
-// them; the console module graph must never depend on one.
+// buildFetchedPrefixes are the static directories `make vendor-js` downloads at
+// build time instead of committing (see the Makefile and .gitignore). A plain
+// `go test` tree does not have them, so the all-references check skips a
+// prefix only while its directory is absent on disk; once vendor-js has run
+// (as in CI), every reference into it must resolve. The console module graph
+// must never depend on one.
 var buildFetchedPrefixes = []string{
 	"static/vendor/htmx/",
 	"static/vendor/uplot/",
@@ -27,8 +30,10 @@ var buildFetchedPrefixes = []string{
 }
 
 var (
-	// <script src="...">, <link href="..."> and CSS url("...") under /static/.
+	// <script src="..."> and <link href="..."> under /static/.
 	htmlStaticRef = regexp.MustCompile(`(?:src|href)\s*=\s*["'](/static/[^"']+)["']`)
+	// CSS url("...") under /static/ (the fonts, from style.css).
+	cssStaticRef = regexp.MustCompile(`url\(\s*["']?(/static/[^"')\s]+)["']?\s*\)`)
 	// Static and dynamic ES module specifiers:
 	//   import X from "s";  import {a} from 's';  import "s";
 	//   export {a} from "s";  import("s")
@@ -132,49 +137,105 @@ func TestConsoleModuleGraphIsEmbedded(t *testing.T) {
 		t.Errorf("console module graph imports %d file(s) that are not embedded, so the browser gets 404 and noVNC never loads:\n  %s",
 			len(missing), strings.Join(missing, "\n  "))
 	}
-	// noVNC's inflator/deflator pull in pako; a walk that never reached it
-	// would pass vacuously if the import syntax stopped matching.
+	// A walk that stopped following imports would pass vacuously, so require
+	// the files the console cannot work without: noVNC's entry point and the
+	// pako modules its inflator and deflator import.
+	reached := map[string]bool{}
+	for _, p := range visited {
+		reached[p] = true
+	}
+	for _, anchor := range []string{
+		"static/novnc/rfb.js",
+		"static/vendor/pako/lib/zlib/inflate.js",
+		"static/vendor/pako/lib/zlib/deflate.js",
+		"static/vendor/pako/lib/zlib/zstream.js",
+	} {
+		if !reached[anchor] {
+			t.Errorf("walk did not reach embedded %s", anchor)
+		}
+	}
 	if len(visited) < 40 {
 		t.Errorf("walk visited only %d files; the import pattern has probably stopped matching noVNC's imports", len(visited))
 	}
 }
 
 // TestTemplateStaticRefsAreEmbedded checks every /static/ reference in every
-// template, except the assets `make vendor-js` fetches at build time.
+// template and every embedded stylesheet. References into a build-fetched
+// directory are checked whenever that directory exists on disk, and skipped
+// (with a log line) only while `make vendor-js` has not run.
 func TestTemplateStaticRefsAreEmbedded(t *testing.T) {
+	type source struct {
+		fsys     fs.FS
+		name     string
+		patterns []*regexp.Regexp
+	}
+	var sources []source
 	tmpls, err := fs.Glob(templateFS, "templates/*.html")
 	if err != nil || len(tmpls) == 0 {
 		t.Fatalf("glob templates: %v (%d)", err, len(tmpls))
 	}
-	var missing []string
 	for _, tmpl := range tmpls {
-		data, err := fs.ReadFile(templateFS, tmpl)
-		if err != nil {
-			t.Fatalf("read %s: %v", tmpl, err)
+		sources = append(sources, source{templateFS, tmpl, []*regexp.Regexp{htmlStaticRef, moduleSpecifier}})
+	}
+	css, err := fs.Glob(staticFS, "static/*.css")
+	if err != nil || len(css) == 0 {
+		t.Fatalf("glob stylesheets: %v (%d)", err, len(css))
+	}
+	for _, c := range css {
+		sources = append(sources, source{staticFS, c, []*regexp.Regexp{cssStaticRef}})
+	}
+
+	// Build-fetched directories present on disk. The test runs in the package
+	// directory, which is where go:embed reads static/ from, so a directory
+	// present now was present when the test binary embedded static/*.
+	fetched := map[string]bool{}
+	for _, pre := range buildFetchedPrefixes {
+		if st, err := os.Stat(strings.TrimSuffix(pre, "/")); err == nil && st.IsDir() {
+			fetched[pre] = true
 		}
-		refs := htmlStaticRef.FindAllStringSubmatch(string(data), -1)
-		refs = append(refs, moduleSpecifier.FindAllStringSubmatch(string(data), -1)...)
+	}
+
+	var missing []string
+	skipped := map[string]int{}
+	checked := 0
+	for _, src := range sources {
+		data, err := fs.ReadFile(src.fsys, src.name)
+		if err != nil {
+			t.Fatalf("read %s: %v", src.name, err)
+		}
+		var refs [][]string
+		for _, re := range src.patterns {
+			refs = append(refs, re.FindAllStringSubmatch(string(data), -1)...)
+		}
 	ref:
 		for _, m := range refs {
 			if strings.Contains(m[1], "{{") {
 				continue // templated (e.g. grafana/{{.Filename}})
 			}
-			p, ok := staticPath(tmpl, m[1])
+			p, ok := staticPath(src.name, m[1])
 			if !ok {
 				continue
 			}
 			for _, pre := range buildFetchedPrefixes {
-				if strings.HasPrefix(p, pre) {
+				if strings.HasPrefix(p, pre) && !fetched[pre] {
+					skipped[pre]++
 					continue ref
 				}
 			}
+			checked++
 			if _, err := fs.Stat(staticFS, p); err != nil {
-				missing = append(missing, "/"+p+" (referenced by "+tmpl+")")
+				missing = append(missing, "/"+p+" (referenced by "+src.name+")")
 			}
 		}
 	}
+	for pre, n := range skipped {
+		t.Logf("skipped %d reference(s) into %s: not fetched (run `make vendor-js` to check them)", n, pre)
+	}
+	if checked == 0 {
+		t.Fatalf("no /static/ reference was checked; the patterns have stopped matching")
+	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		t.Errorf("templates reference %d static file(s) that are not embedded:\n  %s", len(missing), strings.Join(missing, "\n  "))
+		t.Errorf("%d static reference(s) are not embedded:\n  %s", len(missing), strings.Join(missing, "\n  "))
 	}
 }

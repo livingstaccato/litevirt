@@ -131,6 +131,14 @@ func (c *Checker) InStallGrace() bool {
 	return inGrace(stallAt, now)
 }
 
+// RunStallHeartbeatForTests runs this checker's stall heartbeat until ctx
+// ends, as Start does, without the probe loop. Test seam for scenarios
+// (tests/fleet) that drive a real Checker's gate with seeded probe results:
+// without the heartbeat the checker beats only when it is read, so an idle
+// spell longer than stallThreshold between two reads looks like a stall.
+// Production never calls it.
+func (c *Checker) RunStallHeartbeatForTests(ctx context.Context) { c.runStallHeartbeat(ctx) }
+
 // runStallHeartbeat beats until ctx ends. Started by Start, before probing.
 func (c *Checker) runStallHeartbeat(ctx context.Context) {
 	t := time.NewTicker(stallBeat)

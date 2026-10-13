@@ -575,6 +575,11 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 				// The VM this update replaces is the row its owner's delete
 				// tombstoned, as the owner reports it (re-review 3, m-4).
 				deleteCtx, deleted = withDeletedVMSink(deleteCtx, cur.Name, cur.CreatedAt)
+			} else {
+				// The row the create names for its existence check is the
+				// one the owner's delete tombstoned, as the owner reports it:
+				// this node's copy may be behind it.
+				deleteCtx, deleted = withDeletedVMReport(deleteCtx, cur.Name, cur.CreatedAt)
 			}
 		}
 	}
@@ -588,7 +593,12 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			defer s.holdImage(sp.GetImage())()
 		}
 	}
-	if delErr := s.deleteWorkloadIgnoringGone(deleteCtx, action); delErr != nil {
+	delErr := s.deleteWorkload(deleteCtx, action)
+	tornDown := delErr == nil
+	if status.Code(delErr) == codes.NotFound {
+		delErr = nil
+	}
+	if delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
@@ -603,6 +613,20 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			createCtx = withReplacedVM(createCtx, cur)
 		}
 		createCtx = s.withReplacedLUNs(createCtx, cur)
+	} else if cur != nil && tornDown {
+		// The delete ran on the VM's owner, and the create may run on a host
+		// — this one included — whose replica has not applied its tombstone
+		// yet. It names the row it deleted, for its existence check only, so
+		// that host does not refuse it for that row and lose the VM (lab 1,
+		// 2026-10-13, F1); any other row of the name is still refused. Only
+		// when this delete tore it down: NotFound deleted nothing. The row
+		// is the one the owner reports it deleted, or this node's copy when
+		// the owner (an older build) reports nothing.
+		if deleted != nil && deleted.snap != nil {
+			createCtx = withReplacedRowSnapshot(createCtx, cur.Name, *deleted.snap)
+		} else {
+			createCtx = withReplacedRow(createCtx, cur)
+		}
 	}
 	vmErr := s.deployCreatePlanned(createCtx, action, f)
 	outcome = recreateFailed
@@ -612,6 +636,11 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	if vmErr != nil && len(lunKeys) > 0 {
 		st := status.Convert(vmErr)
 		vmErr = status.Errorf(st.Code(), "%s. %s", st.Message(), lunRecoveryHint)
+	} else if vmErr != nil && cur != nil && tornDown {
+		// The VM was torn down and its create failed: say so, and keep the
+		// spec the create was given, as a rebuild and a rolling recreate do.
+		sp, _ := s.plannedVMSpec(action, f)
+		vmErr = s.recreateFailedAfterTeardown(ctx, "recreate", action.VMName, cur.HostName, sp, vmErr, false)
 	}
 	if vmErr != nil {
 		slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)

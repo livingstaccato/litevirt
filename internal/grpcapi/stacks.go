@@ -492,26 +492,9 @@ func (s *Server) streamResolvedPlan(stream grpc.ServerStreamingServer[pb.DeployP
 // assignments. The spec's Placement.Host is pinned so CreateVM skips placement, and
 // device addresses are set so allocateDevices uses exact pinning.
 func (s *Server) deployCreatePlanned(ctx context.Context, action planner.VMAction, f *compose.File) error {
-	spec, err := s.plannedVMSpec(action, f)
+	spec, err := s.plannedCreateSpec(action, f)
 	if err != nil {
 		return err
-	}
-
-	// Pin pre-resolved device addresses so allocateDevices uses exact binding. SR-IOV
-	// devices are intentionally left UNPINNED (Address empty) so the on-demand VF
-	// allocator (create/reuse per policy) runs; placement emits no assignment for them,
-	// so the assignment list aligns with the non-SR-IOV spec devices in order.
-	if len(action.Devices) > 0 {
-		ai := 0
-		for i := range spec.Devices {
-			if spec.Devices[i].Sriov {
-				continue
-			}
-			if ai < len(action.Devices) {
-				spec.Devices[i].Address = action.Devices[ai].Address
-				ai++
-			}
-		}
 	}
 
 	// workloads dispatcher: containers (kind: lxc | oci) route through the
@@ -1744,6 +1727,18 @@ func (s *Server) plannedVMSpec(action planner.VMAction, f *compose.File) (*pb.VM
 		}
 		spec.Placement.Host = action.TargetHost
 	}
+	return spec, nil
+}
+
+// plannedCreateSpec is the spec deployCreatePlanned creates a VM from: the
+// planned spec with the planner's device assignments recorded on it, each on
+// the device entry it was made for (planner.PinAssignedDevices).
+func (s *Server) plannedCreateSpec(action planner.VMAction, f *compose.File) (*pb.VMSpec, error) {
+	spec, err := s.plannedVMSpec(action, f)
+	if err != nil {
+		return nil, err
+	}
+	planner.PinAssignedDevices(spec, action.Devices)
 	return spec, nil
 }
 

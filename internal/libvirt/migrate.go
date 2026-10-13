@@ -60,6 +60,12 @@ type MigrateParams struct {
 	// the TARGET's <shares>, not the value this host rendered.
 	SharesWeight int
 	TargetCgroup string
+	// StripVNCPassword moves the guest WITHOUT its VNC console password: the
+	// target's QEMU cannot do VNC password authentication (a FIPS-mode host,
+	// EnsureDisksResponse.vnc_password_unavailable), and a guest carrying one
+	// would fail to start there. It lands with an open VNC console, as every
+	// guest that host defines does; SPICE keeps its own.
+	StripVNCPassword bool
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -300,7 +306,7 @@ func MigrationDomainXML(live, persist string, p MigrateParams) (dest, persistOut
 func migrationDefinitions(p MigrateParams, live, persist func() (string, error)) (string, string, error) {
 	v2 := cgroupV2()
 	retarget := shareRetargetNeeded(p, v2)
-	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 && !retarget {
+	if len(p.CDROMSources) == 0 && len(p.RBDLocators) == 0 && !retarget && !p.StripVNCPassword {
 		return "", "", nil
 	}
 	l, err := live()
@@ -321,6 +327,15 @@ func migrationDefinitions(p MigrateParams, live, persist func() (string, error))
 	// on whichever definitions the steps above produced.
 	if d, pr, ok := MigrationShareXML(dest, persistOut, p.SharesWeight, p.TargetCgroup, v2); ok {
 		dest, persistOut = d, pr
+	}
+	// No VNC password on a target that cannot do one (StripVNCPassword).
+	if p.StripVNCPassword {
+		if dest, err = StripVNCPassword(dest); err != nil {
+			return "", "", err
+		}
+		if persistOut, err = StripVNCPassword(persistOut); err != nil {
+			return "", "", err
+		}
 	}
 	return dest, persistOut, nil
 }
@@ -414,4 +429,13 @@ func sameHosts(a, b []diskSourceHost) bool {
 		}
 	}
 	return true
+}
+
+// MigrationDefinitionsFor is migrationDefinitions over definitions already in
+// hand (the live and persistent secure XML), for a fake that must hand a
+// destination exactly what MigrateToTarget would.
+func MigrationDefinitionsFor(p MigrateParams, live, persist string) (string, string, error) {
+	return migrationDefinitions(p,
+		func() (string, error) { return live, nil },
+		func() (string, error) { return persist, nil })
 }

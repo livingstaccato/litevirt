@@ -778,7 +778,7 @@ func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
 	}
 
 	// A different VM claiming the same BDF must FAIL, and must NOT reassign or bind.
-	if _, _, err := s.acquireDeviceLeases(ctx, "vm2", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound); err == nil {
+	if _, _, err := s.acquireDeviceLeases(ctx, "vm2", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound, nil); err == nil {
 		t.Fatal("acquiring a device owned by another VM must fail, got nil error")
 	}
 	if o := ownerOf("0000:41:00.0"); o != "vm1" {
@@ -790,7 +790,7 @@ func TestAcquireDeviceLeases_ConflictFailsClosed(t *testing.T) {
 
 	// The incumbent re-acquiring its own device is an idempotent self-claim → OK, and
 	// claims NOTHING new (self-owned → skipped), so the returned freshly-claimed set is empty.
-	finish, claimed, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound)
+	finish, claimed, err := s.acquireDeviceLeases(ctx, "vm1", []ResolvedMember{{Address: "0000:41:00.0"}}, deviceLeaseStageBound, nil)
 	if err != nil {
 		t.Fatalf("idempotent self-claim must succeed, got %v", err)
 	}
@@ -890,9 +890,11 @@ func TestDetachDevice_PCINoIntentFallsToLegacy(t *testing.T) {
 	defer restore()
 	ctx := adminCtx()
 	seedNICVM(t, s, "vm1", "running")
-	// A running VM always has a live domain; seed one so the membership-aware legacy detach
-	// can read it (the address is absent from it → the guest detach is skipped, idempotent).
+	// A running VM always has a live domain and a persistent definition; seed both so the
+	// membership-aware legacy detach can read them (the address is absent from both → the
+	// guest detach is skipped, idempotent).
 	s.virt.(*libvirtfake.Fake).SetActiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices></devices></domain>")
+	s.virt.(*libvirtfake.Fake).SetInactiveXML("vm1", "<domain type='kvm'><name>vm1</name><devices></devices></domain>")
 
 	// No vm_pci_intent for this address → legacy detachPCIDevice path. The address is not a
 	// live hostdev, so the membership-aware detach skips the (idempotent) guest detach and

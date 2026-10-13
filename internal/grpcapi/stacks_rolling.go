@@ -82,6 +82,10 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 				perr = o.s.recreatePreflight(ctx, spec, host)
 			}
 		}
+		// A placed re-create was placed with its devices already.
+		if perr == nil && decision == nil {
+			perr = o.s.preflightRecreateDevices(ctx, spec, cur)
+		}
 		if perr == nil {
 			// Unplaced, the create goes wherever CreateVM places it: no run
 			// host is named, and a LUN found now refuses (preflightLUNs).
@@ -495,6 +499,22 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	defer func() { lunDone(outcome) }()
 	if !action.IsContainer {
 		cur, _ = corrosion.GetVM(ctx, s.db, action.VMName)
+		// The spec the create will be made from, devices pinned as it will
+		// pin them, must be placeable before the VM it replaces is deleted: a
+		// create that then refuses it has already lost the VM.
+		if cur != nil {
+			sp, err := s.plannedCreateSpec(action, f)
+			if err == nil {
+				err = s.preflightRecreateDevices(ctx, sp, cur)
+			}
+			if err != nil {
+				slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
+				st := status.Convert(err)
+				err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
+		}
 		if cur != nil {
 			spec, err := s.plannedVMSpec(action, f)
 			if err != nil {

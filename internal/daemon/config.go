@@ -638,7 +638,7 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature, PartitionPause and RecoveryClaim, which LoadConfig defaults to
+// AuditSignature, PartitionPause, RecoveryClaim and ConsolePassword, which LoadConfig defaults to
 // true. DigestV2 (not a capability token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
@@ -688,6 +688,21 @@ type EnforcementConfig struct {
 	// latched cluster-wide (every peer must support it, else the field could be
 	// dropped by an old peer's spec rewrite). Default false; reversible kill switch.
 	LiveResize bool `yaml:"live_resize,omitempty"`
+	// ConsolePassword: give the VNC and SPICE consoles of every domain this
+	// host defines a fresh per-VM password (capabilities.ConsolePasswordV1,
+	// docs/ui.md "Console passwords"). The consoles listen on 127.0.0.1, which
+	// every local process and user on the host can reach; with a password,
+	// only this daemon's console proxy — which reads it from the running
+	// domain — gets in. Applied at each define, so a running VM picks it up
+	// at its next define or start, and only once console_password_v1 has
+	// latched: an older build cannot present a password.
+	//
+	// DEFAULT TRUE (LoadConfig sets it before parsing; an explicit
+	// `console_password: false` wins). The token is advertised on the build,
+	// not this flag: presenting a password is unconditional, so no host
+	// relies on a peer setting them. An explicit false is the kill switch:
+	// this host's next define of each domain drops its passwords.
+	ConsolePassword bool `yaml:"console_password,omitempty"`
 	// DigestV2: emit the order-invariant anti-entropy row digest (digest_v2) so
 	// column-order-only differences (fresh CREATE vs ALTER ADD COLUMN) stop showing as
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
@@ -984,10 +999,10 @@ func LoadConfig() (*Config, error) {
 		PCI: PCIConfig{SparePCIeRootPorts: 4},
 
 		// The enforcement flags that default ON — see EnforcementConfig.
-		// AuditSignature, PartitionPause, RecoveryClaim and DigestV2. An
+		// AuditSignature, PartitionPause, RecoveryClaim, ConsolePassword and DigestV2. An
 		// explicit false still wins (TestLoadConfig_RecoveryClaimDefaultsOn and
 		// its siblings pin both halves).
-		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true},
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, RecoveryClaim: true, DigestV2: true, ConsolePassword: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

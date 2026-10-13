@@ -110,3 +110,45 @@ func TestRecentFence_ANewLifeIsFencedWithoutWaitingOutTheWindow(t *testing.T) {
 		t.Fatalf("the host, failing after it came back, was fenced %d times, want 1", fences)
 	}
 }
+
+// A retry of a failed fence counts only fence rows newer than the attempt it
+// repeats (recentlyFencedAfter). The host is 'offline' by then, so nothing
+// dates its current life, and the previous outage's success — two minutes
+// old here — would hold the retry back until it was five (lab 1, R1). A
+// success newer than the failure still counts: it replicated after the retry
+// was planned, and the next cycle resumes from it. One in the failure's own
+// second does not, as fenceRetryDue lets a failure win that tie.
+//
+// Mutations: drop the floor (the old row counts); count no row on a retry
+// (the newer success is ignored); compare with Before instead of !After (the
+// same-second success counts).
+func TestRecentFence_ARetryCountsOnlyRowsNewerThanTheFailureItRepeats(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	liveMembership(t, db)
+	c := newTestCoordinator("coordinator", db)
+	now := time.Now().UTC().Truncate(time.Second)
+	c.Now = func() time.Time { return now }
+	failedAt := now.Add(-time.Minute)
+
+	fenceRowAt(t, db, "prev-outage", "redfish", "fenced", now.Add(-2*time.Minute))
+	fenceRowAt(t, db, "this-outage", "redfish", "partial", failedAt)
+	if err := corrosion.UpdateHostState(ctx, db, "down", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	if !c.recentlyFenced(ctx, "down") {
+		t.Fatal("fixture: with the host offline, the previous outage's success counts without a floor")
+	}
+	if c.recentlyFencedAfter(ctx, "down", failedAt) {
+		t.Error("a retry is held back by a success older than the failure it repeats")
+	}
+
+	fenceRowAt(t, db, "same-second", "manual", "manual-confirmed", failedAt)
+	if c.recentlyFencedAfter(ctx, "down", failedAt) {
+		t.Error("a success in the failure's own second holds the retry back; the failure wins that tie")
+	}
+
+	fenceRowAt(t, db, "newer", "redfish", "fenced", failedAt.Add(10*time.Second))
+	if !c.recentlyFencedAfter(ctx, "down", failedAt) {
+		t.Error("a success newer than the failed attempt does not stop its retry")
+	}
+}

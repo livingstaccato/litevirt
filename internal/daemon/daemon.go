@@ -55,6 +55,7 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/ui"
+	"github.com/litevirt/litevirt/internal/vfio"
 	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
@@ -791,6 +792,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
 	go d.virt.StartReconnectLoop(ctx)
 
+	// Can this host's QEMU do a VNC console password? A FIPS-mode host has no
+	// DES for VNC authentication and would refuse every passworded start, so
+	// it sets none and reports console_password_v1 in not_enforcing
+	// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
+	// refused start is still caught by the start backstop.
+	if reason := libvirt.SpiceUnusableReason(); reason != "" {
+		slog.Warn("SPICE consoles cannot connect on this host; VMs still run and VNC still works", "reason", reason)
+	}
+	go func() {
+		defer d.virt.MarkVNCProbed()
+		if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {
+			d.virt.SetVNCPasswordUnavailable(reason)
+			slog.Warn("this host cannot give VNC consoles a password; they stay open here (SPICE keeps its own)",
+				"reason", reason)
+		}
+	}()
+
 	// Register domain event callback for immediate VM death detection (#44).
 	eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
 	eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
@@ -1068,6 +1086,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	// Console passwords: every define on this host (grpcapi's and the health
+	// reconciler's, which share d.virt) applies svc.ConsolePasswordActive —
+	// this flag AND the console_password_v1 latch. NewServer wired the hook.
+	svc.SetConsolePassword(d.cfg.Enforcement.ConsolePassword)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	svc.SetMigrationNetwork(d.cfg.Migration.Network)
 	svc.SetMigrationAddress(d.cfg.Migration.Address)
@@ -1290,6 +1312,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// after DB + libvirt + journal init (uses the host-local journal artifacts), and
 	// a reconciler pass retries stragglers.
 	svc.RecoverHardwareOperations(ctx)
+
+	// Release PCI devices a VM owns but provably does not hold, once the
+	// recoveries above have settled every lease and operation that could
+	// explain one (lab finding L1: a failed SR-IOV attach on an older build
+	// left its VF owned). What it cannot prove it reports and leaves owned.
+	svc.SweepUnattachedPCIOwnership(ctx)
 	go svc.RunHardwareOperationRecovery(ctx)
 
 	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
@@ -1976,6 +2004,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// does not answer must not hold the restart (stopGRPC).
 		stopGRPC(d.grpcSrv, grpcGracefulStop, grpcForcedStop)
 		close(grpcStopped)
+		// A vfio-pci unbind still blocked in the kernel keeps this process alive
+		// past every step below; name the devices so an operator knows which
+		// holder to stop.
+		vfio.LogStuckUnbinds()
 		// A drain returns before its failback records are written, and this
 		// is the host it drained: give them a moment to land while the
 		// replicator still runs, and name every VM whose record is lost.

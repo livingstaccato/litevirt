@@ -1040,7 +1040,25 @@ func (c *Coordinator) run(ctx context.Context) {
 		//
 		// Not for a fresh fence on a confirmation: the recent row is the
 		// operator's confirmation itself, and no attempt has followed it.
-		if !afresh && c.recentlyFenced(ctx, target) {
+		//
+		// For a retry, only a row newer than the failed attempt it repeats
+		// counts (recentlyFencedAfter): a host a failed fence left 'offline'
+		// is no longer dated by its activation, and a previous outage's fence
+		// would otherwise hold the retry back for up to recentFenceWindow.
+		// On a retry this catches only a success that replicated (or an
+		// operator's fence that landed) after fenceRetryDue read the log this
+		// cycle: fenceRetryDue already declined a retry for any success newer
+		// than FailedAt. It is that race check, not the retry's guard against
+		// fencing twice, which is the backoff (fenceRetryDelay).
+		recent := false
+		switch {
+		case afresh:
+		case retry:
+			recent = c.recentlyFencedAfter(ctx, target, retryPlan.FailedAt)
+		default:
+			recent = c.recentlyFenced(ctx, target)
+		}
+		if recent {
 			slog.Info("failover: host has recent fence record, skipping", "host", target)
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrRecentlyFenced)
 			continue
@@ -1677,6 +1695,32 @@ func (c *Coordinator) recentlyFenced(ctx context.Context, host string) bool {
 	return c.fenceWithinWindow(ctx, host, false)
 }
 
+// recentlyFencedAfter is recentlyFenced counting only rows stamped after
+// failedAt: the recent-fence check of a RETRY of the fence attempt that failed
+// at failedAt (fenceRetryDue's FailedAt).
+//
+// fenceRowCutoff dates a row against the moment the host last turned active,
+// and a failed fence records the host 'offline', so from the first failed
+// attempt of an outage on there is no such moment to judge by and every row
+// under recentFenceWindow counted again — a successful fence or a
+// confirmation of the host's PREVIOUS outage included. On lab 1 (2026-10-12,
+// the Redfish drill, R1) that held every retry of a failed fence back until
+// the previous outage's row was five minutes old, against a 30 s backoff.
+//
+// The failed attempt is the one boundary that outlasts the state change, and
+// it is the right one: fenceRetryDue offers a retry only when the newest
+// attempt on record failed, so any success or confirmation it read is older
+// than the failure and already answered by it. One newer than the failure —
+// it replicated here after fenceRetryDue read the log, or an operator fenced
+// the host in between — still counts and skips the retry, and the next cycle
+// resumes from it (recordedFence, resumeFromConfirmation). A row in the
+// failure's own second does not count, as fenceRetryDue lets a failure win a
+// same-second tie. What bounds the retries is not this check but the backoff,
+// read from fencing_log by every coordinator alike (fenceRetryDelay).
+func (c *Coordinator) recentlyFencedAfter(ctx context.Context, host string, failedAt time.Time) bool {
+	return c.fenceWithinWindowAfter(ctx, host, false, failedAt)
+}
+
 // manualFenceConfirmed returns true if an operator has written a
 // "manual-confirmed" row in fencing_log for this host within the recent
 // fence window. The CLI command `lv host fence-confirm <host>` writes this
@@ -1722,6 +1766,12 @@ func (c *Coordinator) sharedStorageFenceEnforced(ctx context.Context) bool {
 // normalization of the Z suffix also differs between the CLI and the pure-Go
 // (modernc) engine the daemon links, so neither SQL form is reliable here.
 func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manualOnly bool) bool {
+	return c.fenceWithinWindowAfter(ctx, host, manualOnly, time.Time{})
+}
+
+// fenceWithinWindowAfter is fenceWithinWindow counting, when after is set,
+// only rows stamped after it (recentlyFencedAfter).
+func (c *Coordinator) fenceWithinWindowAfter(ctx context.Context, host string, manualOnly bool, after time.Time) bool {
 	rows, err := c.db.Query(ctx,
 		`SELECT result, timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
@@ -1746,6 +1796,9 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		}
 		if lifeKnown && ts.Before(life) {
 			continue // an earlier life of the host (fenceRowCutoff)
+		}
+		if !after.IsZero() && !ts.After(after) {
+			continue // answered by a later failed attempt (recentlyFencedAfter)
 		}
 		if ts.After(cutoff) {
 			return true
@@ -2888,6 +2941,15 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.noteHold(h.Name, "recovery could not list the host's VMs: "+err.Error())
 		return
 	}
+	// Highest compose migrate.priority first, ties by name (ListVMs returns
+	// this replica's insertion order, which another coordinator's need not
+	// share).
+	// Everything below follows this order: auto-promote, the batch placement
+	// (SelectBatch commits each request's capacity before the next is
+	// scored, so a higher-priority VM is placed before the room runs out),
+	// and the claim and proof mint of each reschedule. It only orders work:
+	// every gate below still decides each VM on its own.
+	corrosion.SortVMsByMigratePriority(vms)
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)

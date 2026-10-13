@@ -242,6 +242,14 @@ func (s *Server) notEnforcingTokens() []string {
 // it, so the posture reads the same from either end.
 func (s *Server) notEnforcingWith(advertised []string) []string {
 	out := notEnforcingFrom(advertised, s.tokenEnabled)
+	// console_password_v1 with its flag on is still not enforced in full on a
+	// host whose QEMU cannot do VNC passwords (FIPS): it sets none, and the
+	// daemon logs why. The latch is unaffected — this host presents every
+	// password a guest it holds has — so it is reported, not withheld.
+	if s.enfConsolePassword.Load() && s.vncPasswordUnavailable() != "" &&
+		slices.Contains(advertised, capabilities.ConsolePasswordV1) && !slices.Contains(out, capabilities.ConsolePasswordV1) {
+		out = append(out, capabilities.ConsolePasswordV1)
+	}
 	return append(out, s.withheldStandDowns(advertised)...)
 }
 
@@ -409,6 +417,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	if len(toMigrate) == 0 {
 		return nil
 	}
+	// Highest compose migrate.priority first, ties in name order: targets are
+	// chosen, and the moves handed to the workers, in this order, so a
+	// higher-priority VM starts moving — and takes a target's room — before a
+	// lower one. Every move is still refused or admitted on its own.
+	corrosion.SortVMsByMigratePriority(toMigrate)
 
 	// Use placement engine to select targets per VM, respecting constraints.
 	// Build placement requests from each VM's stored spec.
@@ -572,12 +585,10 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 		placementReq.PreferLabels = p.Prefer
 		placementReq.Spread = p.Spread
 	}
+	// The same conversion CreateVM makes, so the target honours every
+	// selector: a mapping, an exact address, a model, SR-IOV and its parent.
 	for _, dev := range spec.Devices {
-		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  int(dev.Count),
-			Vendor: dev.Vendor,
-		})
+		placementReq.Devices = append(placementReq.Devices, placement.DeviceRequestFor(dev))
 	}
 	// A Secure-Boot/vTPM VM may only drain onto a capable host (G1).
 	addCapabilityLabels(&placementReq, spec)
@@ -748,7 +759,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		Live: true, CDROMSources: cdromSources,
 		BandwidthMiB: tuning.bandwidthMiB, AutoConverge: tuning.autoConverge, MaxDowntimeMS: tuning.maxDowntimeMS,
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
-		RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+		StripVNCPassword: ens.vncPasswordUnavailable,
+		RBDLocators:      s.rbdLocatorsOf(ctx, vm.Name),
 	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true
@@ -760,6 +772,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
 	// The target's NIC guards are armed for the guest (armMigrationTarget).
 	armed.apply(&mp)
+	logVNCPasswordStrip(vm.Name, target.Name, mp.StripVNCPassword)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).

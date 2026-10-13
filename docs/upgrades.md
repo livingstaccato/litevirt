@@ -1376,6 +1376,35 @@ the lease holder from demoting the host again until the hold runs out. A
 binary rolled back below the latched token enters WAL quarantine, as below
 every latched token. Roll forward.
 
+### Console passwords start after the roll
+
+This release gives each VM's VNC and SPICE consoles a per-VM password
+([ui.md](ui.md#console-passwords)). The daemon on the VM's host presents it. A
+host on the previous release relays the console stream raw, so a passworded
+guest that reached it by a live migration would have a console nobody could
+open. So no host sets a password until the `console_password_v1` capability
+token has latched. It latches on its own once every host the cluster
+replicates to, including one parked in `maintenance`, runs this release.
+Nothing changes mid-roll. A console opened through a previous-release host
+that only relays it keeps working, because the VM's own host does the
+authentication.
+
+After the latch, each VM gets its passwords at its next define or start; a VM
+already running keeps an open console until then. `enforcement.console_password`
+(default on) is a per-host choice. The token is advertised whatever the flag
+says, because presenting a password does not depend on it, so a host with the
+flag off still opens every passworded console and only stops setting new
+passwords. A binary rolled back below the latched token enters WAL quarantine,
+as below every latched token. It also cannot present a password, so every
+passworded guest on that host has a console nobody can open (the guests
+themselves keep running). Roll forward; if you must run the older build, set
+`enforcement.console_password: false` on every host first and restart each
+guest, so their next start has no password.
+
+A FIPS-mode host (whose QEMU has no DES for VNC authentication) sets no VNC
+passwords, takes incoming live migrations without them, and reports
+`console_password_v1` in `not_enforcing`; it never fails a start over one.
+
 ### Firewall: per-NIC rules move to the bridge, observed until enforced
 
 This release enforces per-NIC policy — security groups, the cluster and host

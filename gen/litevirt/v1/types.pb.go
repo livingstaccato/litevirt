@@ -3759,8 +3759,12 @@ type VM struct {
 	// to attach them. Empty when the last such build withheld none. Set by
 	// InspectVM/GetVM.
 	SharedDiskWithheld string `protobuf:"bytes,21,opt,name=shared_disk_withheld,json=sharedDiskWithheld,proto3" json:"shared_disk_withheld,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// vnc_password_required: the VM's VNC console (vnc_address, on the
+	// host's 127.0.0.1) requires a password (docs/ui.md "Console passwords").
+	// Reach it through the web UI or `lv vnc <vm> --listen`, which present it.
+	VncPasswordRequired bool `protobuf:"varint,22,opt,name=vnc_password_required,json=vncPasswordRequired,proto3" json:"vnc_password_required,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -3938,6 +3942,13 @@ func (x *VM) GetSharedDiskWithheld() string {
 		return x.SharedDiskWithheld
 	}
 	return ""
+}
+
+func (x *VM) GetVncPasswordRequired() bool {
+	if x != nil {
+		return x.VncPasswordRequired
+	}
+	return false
 }
 
 type VMStrandedDisk struct {
@@ -6674,7 +6685,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xdb\x06\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\x8f\a\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -6705,7 +6716,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rfailover_held\x18\x12 \x01(\tR\ffailoverHeld\x12(\n" +
 	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\x12)\n" +
 	"\x10promoted_partial\x18\x14 \x01(\tR\x0fpromotedPartial\x120\n" +
-	"\x14shared_disk_withheld\x18\x15 \x01(\tR\x12sharedDiskWithheld\"v\n" +
+	"\x14shared_disk_withheld\x18\x15 \x01(\tR\x12sharedDiskWithheld\x122\n" +
+	"\x15vnc_password_required\x18\x16 \x01(\bR\x13vncPasswordRequired\"v\n" +
 	"\x0eVMStrandedDisk\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x12\n" +

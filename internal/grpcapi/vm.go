@@ -3206,6 +3206,9 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
 				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 			}
+			// Whether that listener asks for a password (docs/ui.md "Console
+			// passwords"); never the password itself.
+			pbVM.VncPasswordRequired = s.vmHasVNCPassword(name)
 		}
 	}
 

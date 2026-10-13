@@ -16,7 +16,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/placement"
 )
 
@@ -91,7 +90,7 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 	addCapabilityLabels(&req, spec)
 	applyUSBPlacement(&req, spec, spec.GetPlacement().GetHost())
 	for _, dev := range spec.Devices {
-		req.Devices = append(req.Devices, placementDeviceRequest(dev))
+		req.Devices = append(req.Devices, placement.DeviceRequestFor(dev))
 	}
 	for _, nic := range spec.Network {
 		if nic.Name == "" {
@@ -107,50 +106,6 @@ func (s *Server) createVMPlacementRequest(ctx context.Context, spec *pb.VMSpec, 
 		})
 	}
 	return req
-}
-
-// placementDeviceRequest converts one protobuf device request into the exact
-// selector semantics the allocator will use. In particular, Address can be a
-// frozen resolution artifact on a portable mapping/SR-IOV/type selector; it
-// must not outrank that selector during placement revalidation.
-func placementDeviceRequest(dev *pb.DeviceSpec) placement.DeviceRequest {
-	if dev == nil {
-		return placement.DeviceRequest{}
-	}
-	count := int(dev.Count)
-	kind, _ := corrosion.ClassifyPCISelector(dev)
-	switch kind {
-	case "mapping":
-		return placement.DeviceRequest{
-			Mapping: dev.Mapping,
-			Count:   count,
-		}
-	case "sriov":
-		return placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  count,
-			Vendor: dev.Vendor,
-			Model:  dev.Model,
-			Sriov:  true,
-			Parent: dev.Parent,
-		}
-	case "type":
-		return placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  count,
-			Vendor: dev.Vendor,
-			Model:  dev.Model,
-		}
-	default:
-		address := dev.Address
-		if canonical, ok := pci.CanonicalBDF(address); ok {
-			address = canonical
-		}
-		return placement.DeviceRequest{
-			Count:   count,
-			Address: address,
-		}
-	}
 }
 
 func placementValidationError(err error) error {

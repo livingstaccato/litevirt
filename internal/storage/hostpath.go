@@ -211,6 +211,7 @@ var dataDirOwned = []string{
 	"nic-guard-held",            // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards
 	"promote-started",           // grpcapi/promote_serialize.go: an operator promotion's recorded start, per proof
 	"shared-disk-released",      // health/shared_disk_release.go sharedReleaseDir: shared disks released for a start
+	"vfio-host-drivers.json",    // vfio.HostDriversFileName (grpcapi/pci.go vfioHost): each bound device's previous host driver (its .tmp is a dot-name)
 }
 
 // dataDirOwnedPrefixes are owned by name prefix, each judged within one path

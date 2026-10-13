@@ -85,6 +85,11 @@ type DeviceAssignment struct {
 	Address string
 	Vendor  string
 	Device  string
+	// Index is the position, in the action's Spec.Devices, of the device
+	// entry this assignment was made for: a `count: N` entry gets N
+	// assignments with one Index, an SR-IOV entry none. Pair by it, never by
+	// position in the list.
+	Index int
 }
 
 // NetworkAction covers network creation, deletion, or updates.
@@ -363,8 +368,30 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			// The update replaces what the VM holds — unless its strategy
 			// runs the new VM beside the old one until a cutover, which
 			// needs room for both.
-			if vm, ok := vmRecordByName[op.VMName]; ok && !surgesBeside(f, op, spec, storedSpecByVM[op.VMName], state) {
+			beside := surgesBeside(f, op, spec, storedSpecByVM[op.VMName], state)
+			if vm, ok := vmRecordByName[op.VMName]; ok && !beside {
 				req.Replaces = placement.VMAllocation(vm)
+			}
+			// Likewise the PCI devices it holds. An update applied to the
+			// same VM (live, or reconfigure and restart) keeps them: a device
+			// change is always a recreate, so its devices are what it already
+			// holds, and nothing is acquired. Placing them would only re-judge
+			// a selector the VM resolved long ago — a mapping since given a
+			// lower address on this host, held by another VM, refused a label
+			// edit. A recreate takes its devices again after the delete, so
+			// the ones it holds are free to it — unless it runs beside the old
+			// VM, which keeps them. Counted as taken, a VM holding the only
+			// matching device on its host could plan no recreate at all.
+			stored := storedSpecByVM[op.VMName]
+			// A repair of a half-made VM may yet have to take its devices,
+			// so it is placed with them, as a recreate is.
+			apply, _, repair := updateMechanism(op, VMAction{Plan: updatePlan(op, spec, stored)},
+				stored != nil, state.RecordedDisks[op.VMName] > 0)
+			switch {
+			case apply != compose.ActionRecreate && !repair:
+				req.Devices = nil
+			case !beside:
+				req.ReuseDevicesOf = op.VMName
 			}
 		}
 		placementReqs = append(placementReqs, req)
@@ -372,7 +399,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	}
 
 	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
-	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem,
+	placements, err := placement.SelectBatchWithMappings(state.Hosts, state.VMs, devicePool(state, placementReqs), state.Mappings, ctMem,
 		state.Observations, time.Now(), placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
@@ -438,6 +465,9 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 					Address: d.Address,
 					Vendor:  d.Vendor,
 					Device:  d.Device,
+					// buildPlacementRequest makes one device request per
+					// spec device, in order.
+					Index: d.Request,
 				})
 			}
 
@@ -914,16 +944,41 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 			req.VMBaseName = vmBaseName(spec.Name)
 		}
 	}
+	// The same conversion CreateVM's placement makes. A hand-copied subset of
+	// the fields dropped address, mapping and model, so an address-only or
+	// mapping device reached placement with no selector and no host took it.
 	for _, dev := range spec.Devices {
-		req.Devices = append(req.Devices, placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  int(dev.Count),
-			Vendor: dev.Vendor,
-			Sriov:  dev.Sriov,
-			Parent: dev.Parent,
-		})
+		req.Devices = append(req.Devices, placement.DeviceRequestFor(dev))
 	}
 	return req
+}
+
+// devicePool is the PCI device pool the batch is placed against: every free
+// device, plus the devices each updated VM holds itself, which its own update
+// may reuse (Request.ReuseDevicesOf) and every other request sees as taken.
+// state is not modified.
+func devicePool(state *ClusterState, reqs []placement.Request) map[string][]corrosion.PCIDeviceRecord {
+	owners := map[string]bool{}
+	for _, r := range reqs {
+		if r.ReuseDevicesOf != "" {
+			owners[r.ReuseDevicesOf] = true
+		}
+	}
+	if len(owners) == 0 {
+		return state.Devices
+	}
+	pool := make(map[string][]corrosion.PCIDeviceRecord, len(state.Devices))
+	for h, devs := range state.Devices {
+		pool[h] = append([]corrosion.PCIDeviceRecord(nil), devs...)
+	}
+	for h, devs := range state.HeldDevices {
+		for _, d := range devs {
+			if owners[d.VMName] {
+				pool[h] = append(pool[h], d)
+			}
+		}
+	}
+	return pool
 }
 
 // vmBaseName strips a trailing "-N" replica suffix.
@@ -1050,4 +1105,36 @@ func expandAntiAffinity(refs []string, selfName string, composeInstances map[str
 		}
 	}
 	return expanded
+}
+
+// PinAssignedDevices records on spec the devices placement assigned it. Each
+// assignment is paired with the spec device it was made for (its Index),
+// never by position: a `count: 2` entry has two assignments, an SR-IOV entry
+// none, so a positional pairing gave the entry after a `count: 2` one the
+// second GPU, and an address-only entry was re-pinned to it.
+//
+// Only a type/vendor entry is written, with the first device of its group.
+// Its allocator ignores the address (the type selector outranks it), so it is
+// a record of what the plan chose, nothing more. An address, a mapping or an
+// SR-IOV entry keeps its own selector and is never overwritten: an address
+// written there would be bound exactly.
+func PinAssignedDevices(spec *pb.VMSpec, assigns []DeviceAssignment) {
+	if spec == nil {
+		return
+	}
+	written := map[int]bool{}
+	for _, a := range assigns {
+		if a.Index < 0 || a.Index >= len(spec.Devices) || written[a.Index] {
+			continue
+		}
+		d := spec.Devices[a.Index]
+		if d == nil {
+			continue
+		}
+		if kind, _ := corrosion.ClassifyPCISelector(d); kind != "type" {
+			continue
+		}
+		d.Address = a.Address
+		written[a.Index] = true
+	}
 }

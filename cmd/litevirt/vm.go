@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -347,12 +349,45 @@ func newConsoleCmd() *cobra.Command {
 }
 
 func newVNCCmd() *cobra.Command {
-	return &cobra.Command{
+	var listen string
+	cmd := &cobra.Command{
 		Use:   "vnc <vm>",
-		Short: "Fetch VNC address for a VM",
-		Args:  cobra.ExactArgs(1),
+		Short: "Fetch VNC address for a VM, or open its console on a local port",
+		Long: `Without --listen, prints the VM's VNC address. The listener is bound to the
+host's 127.0.0.1 and, once console passwords are in force (docs/ui.md
+"Console passwords"), requires a password only litevirt presents.
+
+With --listen, opens a local port on this machine that carries the VM's
+console through the daemon (the same path as the web UI's console): point
+any VNC viewer at it, with no password. Each connection is authorized as you
+(vm.console on the VM), and ends when your session does. The address must be
+a loopback one.
+
+WARNING: any other user on THIS machine can connect to that port while the
+command runs, and gets the console with your credentials. Use it on a machine
+only you use, never on a shared jump host.
+
+For example:
+
+    lv vnc web --listen 127.0.0.1:5900
+    vncviewer 127.0.0.1:5900
+`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vmName := args[0]
+			if listen != "" {
+				ln, err := listenVNCLoopback(listen)
+				if err != nil {
+					return err
+				}
+				defer ln.Close()
+				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+				defer stop()
+				return withClient(ctx, func(ctx context.Context, c pb.LiteVirtClient) error {
+					fmt.Printf("VNC console of %s on %s — point a VNC viewer at it (no password). Ctrl+C to stop.\n", vmName, ln.Addr())
+					return serveVNCListener(ctx, c, vmName, ln)
+				})
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				vm, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: vmName})
 				if err != nil {
@@ -362,11 +397,13 @@ func newVNCCmd() *cobra.Command {
 				if vm.VncAddress == "" {
 					return fmt.Errorf("VNC not available for %s (VM may not be running or VNC not enabled)", vmName)
 				}
-				fmt.Printf("VNC: %s\n", vm.VncAddress)
+				printVNCInfo(os.Stdout, vmName, vm)
 				return nil
 			})
 		},
 	}
+	cmd.Flags().StringVar(&listen, "listen", "", "Open the console on this local loopback address (e.g. 127.0.0.1:5900) through the daemon, with no password")
+	return cmd
 }
 
 // execExitError maps a guest command's exit status onto the CLI's own, using

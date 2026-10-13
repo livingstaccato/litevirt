@@ -2,9 +2,11 @@ package grpcapi
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -15,13 +17,14 @@ import (
 // pciUnbindRecordingFS is a vfio.SysFS that models BOTH a vfio bind and a vfio
 // UNBIND (pciBindFakeFS only models bind), and records every Unbind so a detach test
 // can assert whether a device was actually unbound. A bind flips the driver symlink
-// to vfio-pci; an unbind honors vfio.Unbind's real sequence — the .../driver/unbind
-// write clears the vfio-pci binding, and the driver_override clear that Unbind performs
-// unconditionally on EVERY call is recorded per address as the unambiguous
-// "Unbind was invoked" signal (nothing else writes an empty driver_override). Because
-// Unbind clears the override before its drivers_probe, that probe rebinds to the
-// ORIGINAL driver (not vfio-pci), so an unbound device stays unbound and Unbind's own
-// verify passes.
+// to vfio-pci; an unbind honors vfio.Unbind's real sequence — driver_override is
+// cleared the way the kernel takes it (a zero-length write is ignored, "\n" clears it,
+// and it reads back as "(null)"), the clear Unbind performs first on EVERY call is
+// recorded per address as the "Unbind was invoked" signal, and the .../driver/unbind
+// write clears the vfio-pci binding and fires onUnbind. Because Unbind clears the
+// override before its drivers_probe, that probe binds the device's native host driver
+// (setHostDriver), or nothing when it has none, never vfio-pci, so Unbind's own verify
+// passes. An explicit drivers/<x>/bind takes only the native driver.
 type pciUnbindRecordingFS struct {
 	mu         sync.Mutex
 	bound      map[string]bool   // address -> bound to vfio-pci
@@ -31,7 +34,19 @@ type pciUnbindRecordingFS struct {
 	failBind   map[string]bool   // address -> the vfio-pci bind never takes (models a device that won't bind)
 	vf         map[string]bool   // address -> device is an SR-IOV VF (has a physfn symlink)
 	binds      int               // count of vfio-pci bind writes
-	onUnbind   func(addr string) // fired once per unbind (at the driver_override clear), if set
+	onUnbind   func(addr string) // fired once per unbind (at the driver/unbind write), if set
+	native     map[string]string // address -> the host driver whose own ID table matches it
+	host       map[string]string // address -> the host (non-vfio) driver currently bound
+	absent     map[string]bool   // address -> gone from sysfs (a VF that did not come back, a pulled card)
+}
+
+// setAbsent removes addr from sysfs: every read under it is ENOENT.
+func (f *pciUnbindRecordingFS) setAbsent(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.absent[addr] = true
+	f.bound[addr] = false
+	f.host[addr] = ""
 }
 
 func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
@@ -42,7 +57,42 @@ func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
 		failUnbind: map[string]bool{},
 		failBind:   map[string]bool{},
 		vf:         map[string]bool{},
+		native:     map[string]string{},
+		host:       map[string]string{},
+		absent:     map[string]bool{},
 	}
+}
+
+// setHostDriver gives addr a native host driver and binds it there, so a test can
+// follow the device off and back onto it (vfio.Host records it at Bind and binds
+// it explicitly on release).
+func (f *pciUnbindRecordingFS) setHostDriver(addr, driver string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.native[addr] = driver
+	f.host[addr] = driver
+}
+
+// hostDriver returns the host driver addr is bound to ("" for none or vfio-pci).
+func (f *pciUnbindRecordingFS) hostDriver(addr string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.host[addr]
+}
+
+// setStaleOverride leaves addr driverless with driver_override=vfio-pci, the
+// state an older build's failed Bind left behind.
+func (f *pciUnbindRecordingFS) setStaleOverride(addr string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bound[addr] = false
+	f.override[addr] = true
+}
+
+func (f *pciUnbindRecordingFS) overrideSet(addr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.override[addr]
 }
 
 // setBound marks a device as currently bound to vfio-pci WITHOUT running a bind (used
@@ -102,6 +152,17 @@ func (f *pciUnbindRecordingFS) ReadFile(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/device") {
 		return []byte("0x1572\n"), nil
 	}
+	if strings.HasSuffix(path, "/driver_override") {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.absent[f.devAddr(path, "/driver_override")] {
+			return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.ENOENT}
+		}
+		if f.override[f.devAddr(path, "/driver_override")] {
+			return []byte("vfio-pci\n"), nil
+		}
+		return []byte("(null)\n"), nil // how the kernel shows a cleared override
+	}
 	return nil, fmt.Errorf("pciUnbindRecordingFS: no file %s", path)
 }
 
@@ -112,26 +173,36 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 	switch {
 	case strings.HasSuffix(path, "/driver_override"):
 		a := f.devAddr(path, "/driver_override")
-		if val == "vfio-pci" {
+		switch {
+		case len(data) == 0:
+			// The kernel ignores a zero-length write: the override stays as it was.
+		case val == "vfio-pci":
 			f.override[a] = true
-		} else {
-			// vfio.Unbind clears the override on EVERY call → the unbind signal.
+		default:
+			// vfio.Unbind clears the override first, on EVERY call, bound or not → the
+			// "Unbind was invoked" signal. (Bind's rollback after a failed bind clears it
+			// too; no test counts unbinds of a device whose bind failed.)
 			f.override[a] = false
 			f.unbinds[a]++
-			if f.onUnbind != nil {
-				// Fires AFTER the .../driver/unbind write already flipped the device
-				// unbound but BEFORE the caller's post-unbind ReleasePCIDevice loop — lets a
-				// test model a fault that appears only once the hardware mutation is done.
-				f.onUnbind(a)
-			}
 		}
 	case strings.HasSuffix(path, "/driver/unbind"):
 		if f.failUnbind[val] {
 			// Model a stuck unbind: the write fails and the device stays bound.
 			return fmt.Errorf("pciUnbindRecordingFS: injected unbind failure for %s", val)
 		}
+		if !f.bound[val] {
+			// Bind taking the device off its host driver.
+			f.host[val] = ""
+			break
+		}
 		// Unbind from the current (vfio-pci) driver: the device is now driverless.
 		f.bound[val] = false
+		if f.onUnbind != nil {
+			// Fires AFTER the .../driver/unbind write flipped the device unbound but
+			// BEFORE the caller's post-unbind ReleasePCIDevice loop — lets a test model a
+			// fault that appears only once the hardware mutation is done.
+			f.onUnbind(val)
+		}
 	case strings.Contains(path, "vfio-pci/bind"):
 		if f.failBind[val] {
 			// The bind never takes → the device stays unbound and vfio.Bind's verify fails.
@@ -145,15 +216,26 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 			break
 		}
 		// The kernel reprobes: to vfio-pci only if the override still selects it,
-		// otherwise to the original driver (leaving it unbound from vfio-pci).
+		// otherwise to the device's native host driver, if it has one.
 		if f.override[val] {
 			f.bound[val] = true
 			f.binds++
 		} else {
 			f.bound[val] = false
+			if f.host[val] == "" {
+				f.host[val] = f.native[val]
+			}
 		}
+	case strings.HasPrefix(path, "/sys/bus/pci/drivers/") && strings.HasSuffix(path, "/bind"):
+		// An explicit host-driver bind: it matches only the device's native driver,
+		// with no override set, on a device bound to nothing.
+		drv := strings.TrimSuffix(strings.TrimPrefix(path, "/sys/bus/pci/drivers/"), "/bind")
+		if f.bound[val] || f.host[val] != "" || f.override[val] || f.native[val] != drv {
+			return fmt.Errorf("pciUnbindRecordingFS: %s does not take %s", drv, val)
+		}
+		f.host[val] = drv
 	}
-	// Any other write (new_id, a restore-driver bind) is a no-op.
+	// Any other write (new_id, remove_id) is a no-op.
 	return nil
 }
 
@@ -161,8 +243,12 @@ func (f *pciUnbindRecordingFS) Readlink(path string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.HasSuffix(path, "/driver") {
-		if f.bound[f.devAddr(path, "/driver")] {
+		a := f.devAddr(path, "/driver")
+		if f.bound[a] {
 			return "/sys/bus/pci/drivers/vfio-pci", nil
+		}
+		if f.host[a] != "" {
+			return "/sys/bus/pci/drivers/" + f.host[a], nil
 		}
 		// No driver bound → model real sysfs (ENOENT); IsBoundToVFIO reads this as
 		// "not bound" (false, nil), not an unexpected FS error.

@@ -664,7 +664,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	// budget runs out on every pass; a start whose storage did not answer
 	// goes after those deferred for time (start_deferral.go).
 	deferred := r.startDeferred.take()
-	vms = deferredFirst(vms, deferred)
+	vms = walkOrder(vms, deferred)
 	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {

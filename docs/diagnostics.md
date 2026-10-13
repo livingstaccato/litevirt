@@ -2124,7 +2124,7 @@ down host that no other host runs.
 
 | Raised when | Clears when |
 |---|---|
-| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that comes back `fenced` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+| Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
 ### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
 

@@ -195,8 +195,8 @@ lv stop <vm> [--force]                    # Stop VM (--force = hard power off)
 lv restart <vm>                           # Restart VM
 lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)
-lv vnc <vm>                               # Show VNC connection info
-lv spice <vm> [--launch]                  # SPICE connection info
+lv vnc <vm> [--listen 127.0.0.1:5900]      # VNC connection info; --listen opens the console on a local port (no password)
+lv spice <vm> [--launch] [--show-password] # SPICE connection info (password via --launch or --show-password)
 lv exec <vm> <cmd> [args...]              # Run command via guest agent
 lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)

@@ -567,6 +567,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	var cdromSources map[string]string
 	// targetCgroup: the target's cgroup version when it reported one.
 	var targetCgroup string
+	// stripVNC: the target cannot do VNC passwords (MigrateParams.StripVNCPassword).
+	var stripVNC bool
 	useTLS := false
 	// route is where the migration's data goes: the cluster address, or the
 	// target's address in migration.network (migration_network.go).
@@ -580,6 +582,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return err
 		}
 		createdStubs, dstTLS, cdromSources, targetCgroup = ens.created, ens.tlsReady, ens.remap, ens.cgroupMode
+		stripVNC = ens.vncPasswordUnavailable
 		abort.createdStubs = createdStubs
 		useTLS = srcTLS && dstTLS
 		kind := routeStorage
@@ -606,6 +609,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			return eerr
 		}
 		cdromSources, targetCgroup = ens.remap, ens.cgroupMode
+		stripVNC = ens.vncPasswordUnavailable
 		if fwVM || coldStopped {
 			route = s.chooseMigrationRoute(ctx, vm.Name, *targetHost, ens.migAddr, routeCold, true)
 		} else {
@@ -709,7 +713,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
 		// detach so control falls through to the idempotent release. A DumpXML error still
 		// aborts the migration (fail closed — membership cannot be confirmed).
-		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
+		if err := s.detachHostdevIfPresent(ctx, req.VmName, vf.Address); err != nil {
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
 		abort.detachedVFs = append(abort.detachedVFs, vf)
@@ -754,17 +758,19 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// an IP SAN (`lv host init`/`add` issue it for the same address
 			// peers dial). The name it is checked against stays that address
 			// even when the data goes to another one, which is in no SAN.
-			TLS:            useTLS || route.direct,
-			TLSDestination: targetHost.Address,
-			Direct:         route.direct,
-			CDROMSources:   cdromSources,
-			SharesWeight:   sharesWeight,
-			TargetCgroup:   targetCgroup,
+			TLS:              useTLS || route.direct,
+			TLSDestination:   targetHost.Address,
+			Direct:           route.direct,
+			CDROMSources:     cdromSources,
+			SharesWeight:     sharesWeight,
+			TargetCgroup:     targetCgroup,
+			StripVNCPassword: stripVNC,
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
 		}
 		armed.apply(&params)
+		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
 		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	}()
 
@@ -1271,7 +1277,10 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if s.isoResolvedWithheld {
 		isoResolved = nil
 	}
-	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved, CgroupMode: lv.CgroupMode()}
+	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning, InstallerIsoResolved: isoResolved, CgroupMode: lv.CgroupMode(),
+		// A live migration onto this host moves a guest without its VNC
+		// password when this QEMU cannot do one (docs/ui.md "Console passwords").
+		VncPasswordUnavailable: s.vncPasswordUnavailableForMigration() != ""}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -2168,6 +2177,10 @@ type ensureOutcome struct {
 	// cgroupMode is the target's cgroup version ("v2"/"v1"), "" when it did
 	// not say (an older target, or no call was made).
 	cgroupMode string
+	// vncPasswordUnavailable: the target's QEMU cannot do VNC password
+	// authentication (FIPS), so a live migration strips the guest's VNC
+	// password (MigrateParams.StripVNCPassword). False when it did not say.
+	vncPasswordUnavailable bool
 }
 
 // ensureDisksOnTargetNet is ensureDisksOnTargetISO that also asks for the
@@ -2185,7 +2198,11 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	// (MigrateParams.SharesWeight). That ask alone is best effort: an
 	// unanswered one leaves the domain as it is, as before.
 	hasRBD := s.vmHasRBDDisk(ctx, vmName)
-	shareOnly := runtime && s.vmSharesWeight(ctx, vmName) > 0 && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
+	// A runtime move of a guest whose VNC console has a password also asks:
+	// a target whose QEMU cannot do one (FIPS) must get the guest without it,
+	// or the guest fails to start there. Best effort, like the cgroup ask.
+	hasVNCPassword := runtime && s.vmHasVNCPassword(vmName)
+	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
 		s.migrationNetwork == "" && !hasRBD
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD {
 		return ensureOutcome{}, nil
@@ -2243,7 +2260,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 			slog.Info("migration: the target opens the installer ISO at its own file", "vm", vmName, "target", targetHost, "here", from, "there", to)
 		}
 	}
-	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode()}, nil
+	return ensureOutcome{created: resp.GetCreatedPaths(), tlsReady: wantTLS && resp.GetMigrationTlsReady(), remap: remap, migAddr: resp.GetMigrationAddress(), cgroupMode: resp.GetCgroupMode(), vncPasswordUnavailable: resp.GetVncPasswordUnavailable()}, nil
 }
 
 // olderTargetISORemap points, for a move to an older target, the CD-ROM that
@@ -2796,7 +2813,7 @@ func (s *Server) reattachVFOnSource(ctx context.Context, vmName, addr string) er
 	default:
 		return fmt.Errorf("claimed by VM %q while it was detached", owner)
 	}
-	if _, err := vfio.Bind(addr); err != nil {
+	if _, err := s.vfioHost().Bind(addr); err != nil {
 		if claimed {
 			// Give back what this call claimed; the strict primitive unbinds
 			// first if the failed bind left it bound.

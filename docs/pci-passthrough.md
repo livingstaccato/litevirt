@@ -25,6 +25,27 @@ echo "vfio-pci" >> /etc/modules-load.d/vfio.conf
 
 3. **Device not bound to host driver** — litevirt handles binding/unbinding automatically.
 
+### How binding and release work
+
+- **Bind.** litevirt claims a device for vfio-pci with `driver_override` only; it never adds a vfio-pci ID. Before it touches the device, it records the driver the device was on in the data directory (`vfio-host-drivers.json`, local to the host and not replicated).
+- **Release.** On detach, stop or delete, the device is bound back to that recorded driver explicitly, so neither driver load order nor a vfio-pci ID can send it back to vfio-pci.
+- **Devices you give vfio-pci yourself.** These stay on vfio-pci when they are released:
+  - a device on vfio-pci with no `driver_override` before litevirt binds it, for example by your `vfio-pci.ids=`;
+  - a device pinned to vfio-pci with driverctl (`/etc/driverctl.d/pci-<address>`).
+- **Your configuration wins over the record.** Say litevirt recorded a host driver for a device, and you have since added that device's ID to `vfio-pci.ids=` (on the kernel command line or in modprobe.d). The device then stays on vfio-pci when it is released.
+- **Hosts upgraded from an older build.**
+  - **Recognising them.** An older build's device has no record and has `driver_override=vfio-pci`. litevirt records that fact before it clears the override, so a release that fails halfway is still recognised on retry.
+  - **The leftover ID.** Older builds also added a vfio-pci ID for each device they bound. If such a device lands back on vfio-pci by that ID, the release removes the ID (`remove_id`) and returns the device to its host driver.
+  - **IDs that are left alone.** The release never removes an ID listed in your `vfio-pci.ids=`. It never removes the ID of a device that litevirt did not bind either.
+- **Devices that are gone.** A released device no longer present in sysfs, such as a VF that did not come back after a reboot, is released without error.
+- **Paused guests.** A detach refuses a guest that is paused or suspended, because it cannot acknowledge the unplug. The device stays with its VM until a retry once the guest runs.
+- **Devices still open.** The kernel will not let a device leave vfio-pci while any process has it open, such as a QEMU that has not exited. The unbind would block until that process lets go.
+  - **Before the unbind.** The release looks for a process holding the device's `/dev/vfio/<group>` or `/dev/vfio/devices/vfioN`. If one still does after two seconds, the release is refused with the process's pid and name.
+  - **During the unbind.** If the kernel still blocks it, the release gives up after 20 seconds.
+  - **Either way.** The device stays bound and owned by its VM. Until the blocked unbind returns, further operations on that device fail at once instead of waiting behind it. Retry once the holder has exited.
+  - **Stopping the daemon.** A blocked unbind cannot be cancelled, so while one is pending the daemon cannot exit. A stop or restart waits until the holder lets go. On shutdown the daemon logs each such device, and `dmesg` shows the blocked write ("Device is currently in use"). Find the process holding the device with `lsof /dev/vfio/*` or by looking for vfio entries under `/proc/*/fd`, and stop it to let the daemon exit.
+- **Failed SR-IOV attaches.** A failed attach releases every VF it allocated. On an upgraded host, VFs that an older build's failed attach left owned are released at startup and on `lv host rescan`. A VF is only released this way when nothing could still be using it: its VM holds it in neither copy of the domain, has no operation in progress and no PCI intents, and the VF is off vfio-pci. A VM that does not meet these conditions is skipped without a message. A warning, with the `lv detach-pci` command that releases the VF, is logged only for a VF that is in neither copy of the domain but still cannot be released, for example because it is still bound to vfio-pci.
+
 ## Discovering devices
 
 List PCI devices on a host:
@@ -66,9 +87,18 @@ The placement engine selects a host with enough free devices matching the criter
 
 ```yaml
     devices:
-      - type: "gpu"
-        address: "0000:41:00.0"
+      - address: "0000:41:00.0"
 ```
+
+Name the address alone. The VM is placed on the host that has that device free
+(with no other member of its IOMMU group held by another VM), and takes exactly
+that device. Add a `placement.host` when more than one host has a device at
+that address.
+
+A device's selector is read in a fixed order: `mapping`, then `sriov`, then
+`type` / `vendor`, then `address`. The first one set decides, and the fields
+after it are ignored. So `type: "gpu"` with an `address` is a request for any
+free GPU, not for that address.
 
 ### Common vendor IDs
 
@@ -272,6 +302,14 @@ Reference it from a VM via the compose device spec:
 Mappings are CRDT-replicated (the `resource_mappings` table), so every daemon and the
 `/resource-mappings` UI page see a consistent view. Placement/migration eligibility
 checks that a candidate host has a device registered under each mapping the VM needs.
+
+On a host with more than one device under a mapping, the mapping resolves to
+its **lowest** address there, and that device must be free. A VM keeps the
+device it took when it was created: an update applied to the running VM (a
+live change, or a reconfigure and restart) does not resolve its mapping again.
+A recreate does, so after adding a lower address that another VM holds, a
+recreate on that host is refused, before anything is deleted, until the
+mapping is changed back or the device is freed.
 
 Every mapping change goes through the daemon, which checks `resourcemap.write` at
 `/` and writes one signed audit row naming the caller, the mapping, and the state

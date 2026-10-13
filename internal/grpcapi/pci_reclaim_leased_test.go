@@ -101,10 +101,10 @@ func TestReclaimLeasedDevices_VMExists_DetachesFromGuestFirst(t *testing.T) {
 			t.Fatalf("assign addr to vm-a: %v", err)
 		}
 		fs.setBound(addr)
-		fake.SetActiveXML("vm-a", "<domain><name>vm-a</name><devices>"+
-			"<hostdev mode='subsystem' type='pci'><source>"+
-			"<address domain='0x0000' bus='0x00' slot='0x00' function='0x0'/></source></hostdev>"+
-			"</devices></domain>")
+		// A real attach applies to the live domain AND the persistent definition.
+		if err := fake.AttachHostdev("vm-a", addr); err != nil {
+			t.Fatalf("seed the hostdev in vm-a: %v", err)
+		}
 
 		// Record the guest-detach count observed AT the moment of unbind, to prove the
 		// detach ran BEFORE the unbind.

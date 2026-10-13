@@ -395,7 +395,10 @@ func TestFenceWake_RetryHonoursAFixedStrategy(t *testing.T) {
 //
 // Mutation M12: drop the LocalStall gate — local-stall retries.
 // Mutation M13: drop the QuorumRegain gate — quorum-regain retries.
-// Mutation M14: drop the recentlyFenced gate — recently-fenced retries.
+//
+// The recent-fence gate holds a retry back only for a fence newer than the
+// failure it repeats (TestRecentFence_ARetryCountsOnlyRowsNewerThanTheFailureItRepeats);
+// an older one no longer does (TestFenceWake_AnOlderFenceDoesNotHoldARetryBack).
 func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -406,15 +409,6 @@ func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
 		}},
 		{"quorum-regain", func(_ *testing.T, _ *corrosion.Client, _ context.Context, c *Coordinator) {
 			c.QuorumRegain = func(context.Context, string) bool { return true }
-		}},
-		{"recently-fenced", func(t *testing.T, db *corrosion.Client, ctx context.Context, _ *Coordinator) {
-			// A success four minutes ago, older than the failure: the newest
-			// attempt still failed, so the retry is due, but a fence is recent.
-			if err := db.Execute(ctx,
-				`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES ('older-ok', 'down', 'ssh', 'fenced', ?, 'earlier')`,
-				time.Now().Add(-4*time.Minute).UTC().Format(time.RFC3339)); err != nil {
-				t.Fatalf("seed older success: %v", err)
-			}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -431,6 +425,31 @@ func TestFenceWake_FenceGatesHoldARetryBack(t *testing.T) {
 				t.Errorf("a due retry ran under the %s gate (%d fences)", tc.name, fences)
 			}
 		})
+	}
+}
+
+// A successful fence four minutes old, older than the failure — the host's
+// previous outage on lab 1 (R1) — does not hold back the retry of the failed
+// fence: the newest attempt failed, and the retry runs on its backoff, not
+// when the old row leaves the five-minute window.
+//
+// Mutation: count every row on a retry again (recentlyFenced) — no retry.
+func TestFenceWake_AnOlderFenceDoesNotHoldARetryBack(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFailedFence, sshFence))
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, fenceRetryBase+time.Second)
+	c.lastFenceAt = nil
+	if err := db.Execute(ctx,
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES ('older-ok', 'down', 'ssh', 'fenced', ?, 'earlier')`,
+		time.Now().Add(-4*time.Minute).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed older success: %v", err)
+	}
+	c.run(ctx)
+	if fences != 2 {
+		t.Errorf("the due retry ran %d time(s) beside a success older than the failure, want 1 (%d fences)", fences-1, fences)
 	}
 }
 

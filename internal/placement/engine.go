@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pci"
 )
 
 // Request describes what a VM needs and where it should (not) go.
@@ -93,6 +94,16 @@ type Request struct {
 	// is released while this request is evaluated, and the new one is committed
 	// in its place — "replace", never "add".
 	Replaces *Allocation
+
+	// ReuseDevicesOf names the existing VM this placement updates or
+	// re-creates — never a workload that runs beside it. The PCI devices
+	// assigned to that VM count as free to this request, as its CPU and
+	// memory do through Replaces: the update keeps them, the re-create's
+	// teardown releases them first. Without it a VM holding the only matching
+	// device on its host could plan no update at all, not even a label change.
+	// It is set apart from Replaces because a stopped VM holds devices but no
+	// Allocation. "" frees nothing.
+	ReuseDevicesOf string
 
 	// Container marks a container workload. A container holds host MEMORY only:
 	// its cpu_limit is a cap in cores, never a vCPU reservation (the
@@ -298,6 +309,7 @@ func Select(ctx context.Context, db *corrosion.Client, req Request) (string, err
 		}
 	}
 	snap.releaseAllocation(&req)
+	snap.releaseOwnDevices(&req)
 
 	candidates, err := scoreCandidates(snap, &req, false)
 	if err != nil {
@@ -322,6 +334,7 @@ func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host
 		return err
 	}
 	snap.releaseAllocation(&req)
+	snap.releaseOwnDevices(&req)
 	_, err = scoreCandidates(snap, &req, false)
 	return err
 }
@@ -708,6 +721,10 @@ type BatchDevice struct {
 	Address string
 	Vendor  string
 	Device  string
+	// Request is the index, in the placed Request's Devices, of the device
+	// request this assignment was made for. A type request with Count N gets
+	// N assignments with the same index; an SR-IOV request gets none.
+	Request int
 }
 
 // SelectBatch resolves placements for multiple VMs in one pass, working
@@ -736,7 +753,27 @@ func SelectBatch(
 	now time.Time,
 	requests []Request,
 ) (map[string]BatchResult, error) {
+	return SelectBatchWithMappings(hosts, vms, devices, nil, containerMemMiB, capacity, now, requests)
+}
+
+// SelectBatchWithMappings is SelectBatch for a batch whose device requests may
+// name a resource mapping. mappings is mapping name → host → that host's
+// addresses under it, in address order (the snapshot's MappingDevices); a
+// mapping request is eligible only where its first address is, as the
+// allocator's ResolveMappingAddress resolves it. With nil mappings every
+// mapping request is ineligible everywhere, which is all SelectBatch can say.
+func SelectBatchWithMappings(
+	hosts []corrosion.HostRecord,
+	vms []corrosion.VMRecord,
+	devices map[string][]corrosion.PCIDeviceRecord,
+	mappings map[string]map[string][]string,
+	containerMemMiB map[string]int,
+	capacity []corrosion.HostCapacityObservation,
+	now time.Time,
+	requests []Request,
+) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
+	snap.MappingDevices = mappings
 	// Containers hold host memory as surely as VMs do; fold them in exactly
 	// like the single-VM Select path (BuildSnapshot) does.
 	snap.AddContainerMemory(containerMemMiB)
@@ -787,12 +824,14 @@ func SelectBatch(
 		// per request, not up front for the whole batch: the requests evaluated
 		// before this one still see the old allocation, which is still there.
 		released := snap.releaseAllocation(&req)
+		freedOwn := snap.releaseOwnDevices(&req)
 
 		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
 			if released {
 				snap.restoreAllocation(&req)
 			}
+			snap.reclaimOwnDevices(&req, freedOwn)
 			// One infeasible VM must not fail the WHOLE batch: failover needs
 			// per-VM isolation (strand the one VM nothing can hold, recover the
 			// rest), and compose re-checks per-VM below. An empty-Host result is
@@ -807,7 +846,8 @@ func SelectBatch(
 		}
 		chosen := pickBest(candidates)
 
-		devAssign := assignDevices(snap.Devices, chosen, req.Devices)
+		devAssign := assignDevicesMapped(snap.Devices, snap.MappingDevices, chosen, req.Devices)
+		snap.reclaimOwnDevices(&req, freedOwn)
 		results[req.VMName] = BatchResult{Host: chosen, Devices: devAssign}
 		if req.Container {
 			snap.commitContainer(chosen, req.VMName, req.VMBaseName, req.MemMiBNeeded)
@@ -821,6 +861,24 @@ func SelectBatch(
 
 // assignDevices selects and removes devices from the mutable pool for a host.
 func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, reqs []DeviceRequest) []BatchDevice {
+	return assignDevicesMapped(devPool, nil, host, reqs)
+}
+
+// batchReserved marks a pool entry an earlier request of the batch took. It
+// holds a NUL byte, so it can never be the name of a VM: ReuseDevicesOf frees
+// entries by VM name, and a VM named like the marker would free devices other
+// requests reserved.
+const batchReserved = "\x00batch-reserved"
+
+// assignDevicesMapped is assignDevices with the resource mappings a mapping
+// request resolves through. It follows scoreHostDevicesForHost's precedence
+// (mapping → SR-IOV → type/vendor → exact address). A mapping or an exact
+// address takes the one device it names; a type/vendor request takes Count
+// matching free devices. Every device taken is reserved in the pool, so a later
+// request of the same batch cannot be placed onto it as well, and each
+// assignment names the request it was made for (BatchDevice.Request), so a
+// consumer pairs it with that request and never with a neighbour.
+func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mappings map[string]map[string][]string, host string, reqs []DeviceRequest) []BatchDevice {
 	if len(reqs) == 0 {
 		return nil
 	}
@@ -828,11 +886,46 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 	pool := devPool[host]
 	var assigned []BatchDevice
 
-	for _, req := range reqs {
+	take := func(i, request int) {
+		assigned = append(assigned, BatchDevice{
+			Type:    pool[i].Type,
+			Address: pool[i].Address,
+			Vendor:  pool[i].VendorName,
+			Device:  pool[i].DeviceName,
+			Request: request,
+		})
+		pool[i].VMName = batchReserved // mark as taken in-memory
+	}
+	takeExact := func(address string, request int) {
+		want, wantOK := pci.CanonicalBDF(address)
+		for i := range pool {
+			got, gotOK := pci.CanonicalBDF(pool[i].Address)
+			if (wantOK && gotOK && got == want) || (!wantOK && pool[i].Address == address) {
+				take(i, request)
+				return
+			}
+		}
+	}
+
+	for ri, req := range reqs {
+		if req.Mapping != "" {
+			if addresses := mappings[req.Mapping][host]; len(addresses) > 0 {
+				takeExact(addresses[0], ri)
+			}
+			continue
+		}
+
 		// SR-IOV requests are resolved on-demand by the owner's allocator (create or
 		// reuse a VF); placement neither pins a concrete VF address nor consumes one
 		// from the pool. Eligibility was already gated in scoreHostDevices.
 		if req.Sriov {
+			continue
+		}
+
+		if req.Type == "" && req.Vendor == "" {
+			if req.Address != "" {
+				takeExact(req.Address, ri)
+			}
 			continue
 		}
 
@@ -841,14 +934,20 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 			count = 1
 		}
 
-		// Filter by type and unassigned.
+		// Free devices this type/vendor request matches, as scoring matched
+		// them: an empty type with a vendor matches every type.
 		var typed []corrosion.PCIDeviceRecord
 		for _, d := range pool {
-			if d.Type == req.Type && d.VMName == "" {
-				if req.Vendor == "" || d.VendorID == req.Vendor || d.VendorName == req.Vendor {
-					typed = append(typed, d)
-				}
+			if d.VMName != "" || (req.Type != "" && d.Type != req.Type) {
+				continue
 			}
+			if req.Vendor != "" && d.VendorID != req.Vendor && d.VendorName != req.Vendor {
+				continue
+			}
+			if req.Model != "" && d.DeviceName != req.Model {
+				continue
+			}
+			typed = append(typed, d)
 		}
 
 		// Use topology scoring to pick best devices.
@@ -870,14 +969,8 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 			taken[addr] = true
 		}
 		for i := range pool {
-			if taken[pool[i].Address] {
-				assigned = append(assigned, BatchDevice{
-					Type:    pool[i].Type,
-					Address: pool[i].Address,
-					Vendor:  pool[i].VendorName,
-					Device:  pool[i].DeviceName,
-				})
-				pool[i].VMName = "reserved" // mark as taken in-memory
+			if taken[pool[i].Address] && pool[i].VMName == "" {
+				take(i, ri)
 			}
 		}
 	}

@@ -203,7 +203,7 @@ func warnNoNosymfollow(dir string) {
 }
 
 // readMountInfo returns /proc/self/mountinfo; tests replace it.
-var readMountInfo = func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") }
+var readMountInfo = newTestHook(func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") })
 
 // mountEntry is one line of mountinfo: where, the per-mount options, and what
 // is mounted there (filesystem type and source).
@@ -217,7 +217,7 @@ type mountEntry struct {
 
 // mounts parses mountinfo, in order (a later mount on the same point is on top).
 func mounts() ([]mountEntry, error) {
-	data, err := readMountInfo()
+	data, err := readMountInfo.get()()
 	if err != nil {
 		return nil, err
 	}
@@ -522,9 +522,7 @@ func CheckNFSBackingHardened(dir string) error {
 // OverrideMountInfoForTest replaces how mounts are inspected, for tests in
 // other packages. It returns the restore function.
 func OverrideMountInfoForTest(mountinfo func() ([]byte, error)) func() {
-	prev := readMountInfo
-	readMountInfo = mountinfo
-	return func() { readMountInfo = prev }
+	return readMountInfo.set(mountinfo)
 }
 
 // OverrideNFSRemountForTest replaces how CheckNFSMountHardened runs the

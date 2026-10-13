@@ -895,6 +895,24 @@ of actions, today just `user.reset-admin` (see
 for any other action, or one that does not parse, is renamed to `<id>.rejected`,
 left beside the journal for whoever investigates, and logged at error level.
 
+## Image prune
+
+A prune that removes image files writes a row on the node the operator
+called, as that operator (a peer the call is forwarded to writes none):
+
+| Action | When | Detail | Result |
+|---|---|---|---|
+| `image.prune_version` | `lv image prune <image> --version <file>`: one file removed on the operator's word that no other host's disk is built on it, although the store may be shared | `host=`, `version=`, `removed=`, `bytes=`; or why the file was kept; or the error | `success`, `kept` or `error` |
+| `image.prune` | `lv image prune` removed at least one file | `host=`, `removed=`, `bytes=`; or the error | `success` or `error` |
+
+Target is `images/<image>` (`images` for a prune of every image). A dry run, a
+prune that removed nothing, a refresh's background prune and each host's part
+of `lv image rm` write no row.
+
+```bash
+lv audit ls --action image.prune_version
+```
+
 ## Operational notes
 
 - **The rows are per-cluster; the hash chain is per-host.** Audit rows

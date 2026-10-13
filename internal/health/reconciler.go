@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -1757,7 +1758,15 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// After the start checkpoint (a host that abandoned the proof has
 	// returned above): settle any point-in-time overlay into the disk before
 	// the domain is defined on it.
-	if failure := r.settlePITOverlays(ctx, vm, spec, diskConfigs); failure != "" {
+	failure, deferred := r.settlePITOverlays(ctx, vm, spec, diskConfigs)
+	if deferred != nil {
+		// Not a failure: the disk's storage did not answer. Re-driven next
+		// pass — never parked in error, as the hardware pre-start's
+		// deferral below.
+		r.deferStart(ctx, vm.Name, proofID, transfer, deferred)
+		return
+	}
+	if failure != "" {
 		r.failPendingStart(ctx, vm.Name, proofID, true, failure)
 		return
 	}
@@ -1958,30 +1967,52 @@ func (r *Reconciler) SetPITOverlayFeature(g pitoverlay.Gate) { r.pitFeature = g 
 // (lv resolve-pit-overlay). Nothing replicated records an overlay; its fixed
 // name beside the disk is what finds it. A failure is the start's failure,
 // retried; a disk settled or without an overlay clears its hold.
-func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
+//
+// A disk whose storage does not answer whether an overlay is there (lab 2
+// N-4) is not a failure: deferred is then set (it errors.Is
+// ErrStartDeferred), with failure saying why, and the caller defers the
+// start (deferStart) — a proof-less start (onboot, self-heal) waits in
+// "starting", which the next pass re-drives, instead of being parked in
+// error. The pass is not held by it.
+func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) (failure string, deferred error) {
 	for _, dc := range diskConfigs {
 		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
-		out, err := pitoverlay.Settle(ctx, r.pitFeature, dc.Path, owner)
-		switch {
-		case out == pitoverlay.Held:
-			detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.AssessAt(r.pitFeature, dc.Path, owner, false))
-			r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
-			return detail
-		case err != nil:
-			slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
-				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
-			return fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err)
-		case out == pitoverlay.Committed:
-			slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
-				"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+		// Looked for under a bound first: on storage that does not answer
+		// whether an overlay is there is unknown, never "none".
+		presence, perr := pitoverlay.PresenceOfBounded(dc.Path)
+		if storage.IsFSNoAnswer(perr) {
+			slog.Warn("reconciler: a disk's storage does not answer; whether it has a point-in-time overlay cannot be told, so the start waits",
+				"vm", vm.Name, "disk", dc.Name, "error", perr)
+			why := fmt.Sprintf("disk %s: whether a point-in-time overlay %s holds writes the disk lacks cannot be told: its storage does not answer: %v",
+				dc.Name, pitoverlay.Path(dc.Path), perr)
+			return why, fmt.Errorf("%w: %s", ErrStartProbeFailed, why)
+		}
+		// Established absent (overlay and binding ENOENT): nothing to settle,
+		// and no second, unbounded look (Settle's own lstat).
+		if presence != pitoverlay.OverlayAbsent {
+			out, err := pitoverlay.Settle(ctx, r.pitFeature, dc.Path, owner)
+			switch {
+			case out == pitoverlay.Held:
+				detail := pitoverlay.HoldDetail(vm.Name, dc.Name, dc.Path, pitoverlay.AssessAt(r.pitFeature, dc.Path, owner, false))
+				r.reportPITHeld(ctx, vm.Name, dc.Name, detail)
+				return detail, nil
+			case err != nil:
+				slog.Error("reconciler: a point-in-time overlay holds writes the disk lacks and could not be committed; not defining the VM",
+					"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path), "error", err)
+				return fmt.Sprintf("disk %s: commit its point-in-time overlay %s: %v", dc.Name, pitoverlay.Path(dc.Path), err), nil
+			case out == pitoverlay.Committed:
+				slog.Warn("reconciler: committed a point-in-time overlay into the disk before defining the VM",
+					"vm", vm.Name, "disk", dc.Name, "overlay", pitoverlay.Path(dc.Path))
+			}
 		}
 		// A disk this host cannot see (a shared pool not mounted here) reads
 		// as "no overlay" too: only a disk that is here clears a hold.
-		if _, serr := os.Stat(dc.Path); serr == nil && r.pitCleared != nil {
+		_, serr := storage.Bounded("stat", dc.Path, func() (os.FileInfo, error) { return os.Stat(dc.Path) })
+		if serr == nil && r.pitCleared != nil {
 			r.pitCleared(ctx, vm.Name, dc.Name)
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // reportPITHeld reports a hold through the wired reporter, which keeps it as

@@ -312,8 +312,9 @@ func formatBytes(b int64) string {
 
 func newImagePruneCmd() *cobra.Command {
 	var (
-		host   string
-		dryRun bool
+		host    string
+		dryRun  bool
+		version string
 	)
 	cmd := &cobra.Command{
 		Use:   "prune [image]",
@@ -324,8 +325,25 @@ func newImagePruneCmd() *cobra.Command {
 			if len(args) == 1 {
 				name = args[0]
 			}
+			if version != "" && name == "" {
+				return fmt.Errorf("--version needs the image's name")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.PruneImages(ctx, &pb.PruneImagesRequest{Name: name, HostName: host, DryRun: dryRun})
+				req := &pb.PruneImagesRequest{Name: name, HostName: host, DryRun: dryRun, Version: version}
+				if version != "" && !dryRun {
+					// An older daemon ignores --version and would prune every
+					// unused file of the image: ask a dry run first, which
+					// removes nothing anywhere, and go on only if it is
+					// honoured.
+					probe, err := c.PruneImages(ctx, &pb.PruneImagesRequest{Name: name, HostName: host, DryRun: true, Version: version})
+					if err != nil {
+						return fmt.Errorf("prune images: %w", err)
+					}
+					if probe.GetVersion() != version {
+						return fmt.Errorf("prune images: the daemon serving the call runs an older build that cannot prune one version (it would prune every unused file of %s); nothing was removed", name)
+					}
+				}
+				resp, err := c.PruneImages(ctx, req)
 				if err != nil {
 					return fmt.Errorf("prune images: %w", err)
 				}
@@ -346,5 +364,6 @@ func newImagePruneCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&host, "host", "", "Host whose image store to prune (default: the host serving the call)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "List what would be removed, remove nothing")
+	cmd.Flags().StringVar(&version, "version", "", "Remove only this file of the image (its name as listed, or the digest after '@'), even on an image store other hosts may share: you assert no other host's disk is built on it")
 	return cmd
 }

@@ -649,7 +649,7 @@ lv image import <file> --name <name>
 #   sha256 recorded when it was published is put back from byte-identical
 #   content (the reconciler fetches it from a peer); any other content becomes
 #   a new version, and an unhealable base under disks is logged at ERROR.
-lv image prune [<image>] [--host <host>] [--dry-run]
+lv image prune [<image>] [--host <host>] [--dry-run] [--version <file>]
 #   Removes, on one host, the image files no disk there is built on — judged
 #   from every visible disk's backing header, never from the image's name —
 #   keeping each image's current version, every version a kept image is
@@ -662,8 +662,25 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   Needs image.import. Nothing is removed unless the whole view can be read
 #   within 2 minutes: a pool directory, a disk header, an nfs share that is
 #   not mounted or a backup repo that cannot be read refuses the prune,
-#   saying which. A refresh prunes the image's older unused versions by
-#   itself, in the background, keeping the one it superseded.
+#   saying which. A directory (the image store's own included) whose
+#   listing does not answer within 5 s refuses it at once, with "nothing is
+#   pruned". On an image store on a network filesystem (nfs, cifs, ceph,
+#   fuse, ...), or one whose filesystem cannot be told, no version is
+#   removed: other hosts may share the store, and a disk on their own
+#   storage, which this host cannot see, may be built on it. Each such
+#   version is listed as kept, with that reason. This protects only once
+#   every host sharing the store runs a build with it: an older host still
+#   prunes by its own disks alone.
+#   --version <file> removes that one file of <image> (its name as listed,
+#   or at least 8 digits of the digest after '@') even on such a store: you
+#   assert that no other host's disk is built on it. Every other rule above
+#   still keeps it, saying why. A daemon that does not know --version is
+#   detected with a dry run first, and nothing is removed.
+#   A refresh prunes the image's older unused versions by
+#   itself, in the background, keeping the one it superseded. What it keeps
+#   only because the store may be shared is logged at WARN after every
+#   refresh, with the bytes, and notified (image.versions_kept) at most
+#   daily per image.
 #   A deleted image (lv image rm) has no current version to keep: prune
 #   removes all its files, under the rules lv image rm lists below, and
 #   lists each one it keeps with the reason.

@@ -75,3 +75,15 @@ func TestUpdateVM_GrowingAStartingVMIsAdmitted(t *testing.T) {
 	}
 }
 
+// Re-review 2 m-1: a VM in starting is counted against its host, so a
+// restart of a stuck start adds nothing and is admitted on a host with no
+// room for a second copy of it (countedAgainstHost).
+//
+// Mutation: RestartVM admits everything not running — ResourceExhausted: red.
+func TestRestartVM_AStuckStartIsAdmittedOnANearFullHost(t *testing.T) {
+	s := reconfigServer(t)
+	startingVM(t, s)
+	if _, err := s.RestartVM(adminCtx(), &pb.RestartVMRequest{Name: "hb"}); status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("restart of a VM in starting, already counted on its host = %v", err)
+	}
+}

@@ -2524,7 +2524,8 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	// RUNNING VM is net-zero (destroy+start of consumption already counted,
 	// overhead included) and deliberately admits nothing: a full host must
 	// always be able to restart what it already runs.
-	if vm.State != "running" {
+	// A VM in starting is counted already too (countedAgainstHost).
+	if !countedAgainstHost(vm.State) {
 		var spec pb.VMSpec
 		if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 			return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)

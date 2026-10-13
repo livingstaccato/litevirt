@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build proto lint test test-fleet test-fleet-race test-filerestore-vm test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
+.PHONY: all build vendor-js verify-pako vendor-pako proto lint test test-fleet test-fleet-race test-filerestore-vm test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -10,6 +10,17 @@ HTMX_VERSION := 2.0.0
 HTMX_SSE_VERSION := 2.2.2
 HTMX_DIR := internal/ui/static/vendor/htmx
 FONTS_DIR := internal/ui/static/fonts
+# internal/ui/static/novnc is noVNC v$(NOVNC_VERSION)'s core/, committed. Its
+# inflator.js and deflator.js import ../vendor/pako/, noVNC's own ES-module port
+# of pako 1.0.3, which ships in the same noVNC release. pako is committed too,
+# pinned file by file in $(PAKO_SUMS); `make vendor-pako` re-fetches it from
+# that release. Bumping NOVNC_VERSION means re-copying core/ and updating the
+# sums file in the same change.
+NOVNC_VERSION := 1.5.0
+PAKO_DIR := internal/ui/static/vendor/pako
+PAKO_SUMS := scripts/vendor-js/pako.sha256
+PAKO_URL := https://cdn.jsdelivr.net/gh/novnc/noVNC@v$(NOVNC_VERSION)/vendor/pako
+SHA256SUM := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo 'shasum -a 256')
 
 all: proto vendor-js build
 
@@ -26,8 +37,25 @@ build-litevirt:
 
 # vendor-js fetches the front-end assets that ship embedded in the single binary
 # (go:embed static/*). They are gitignored and pulled at build so no CDN is hit at
-# RUNTIME — the daemon serves htmx, uPlot, and the fonts itself.
-vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js $(HTMX_DIR)/htmx.min.js $(FONTS_DIR)/source-sans-3.woff2
+# RUNTIME — the daemon serves htmx, uPlot, and the fonts itself. pako is the
+# exception: it is committed, and vendor-js only checks it against its pins.
+vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js $(HTMX_DIR)/htmx.min.js $(FONTS_DIR)/source-sans-3.woff2 verify-pako
+
+# verify-pako checks the committed pako against the pinned sha256 sums (offline).
+verify-pako:
+	cd $(PAKO_DIR) && $(SHA256SUM) -c $(CURDIR)/$(PAKO_SUMS)
+
+# vendor-pako re-fetches pako from the noVNC v$(NOVNC_VERSION) release, verifies
+# every file against $(PAKO_SUMS) before touching the tree, and replaces
+# $(PAKO_DIR). A file whose sum does not match aborts with the tree unchanged.
+vendor-pako:
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	for f in $$(awk '{print $$2}' $(PAKO_SUMS)); do \
+		mkdir -p "$$tmp/$$(dirname "$$f")" && \
+		curl -sSfL "$(PAKO_URL)/$$f" -o "$$tmp/$$f" || exit 1; \
+	done && \
+	(cd "$$tmp" && $(SHA256SUM) -c $(CURDIR)/$(PAKO_SUMS)) && \
+	rm -rf $(PAKO_DIR) && mkdir -p $(PAKO_DIR) && cp -R "$$tmp"/. $(PAKO_DIR)/
 
 $(UPLOT_DIR)/uPlot.iife.min.js:
 	@mkdir -p $(UPLOT_DIR)

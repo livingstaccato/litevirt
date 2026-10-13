@@ -1411,3 +1411,42 @@ cluster denying, with fewer accepts, until the next one succeeds.
 Per-NIC security groups can also be bound at runtime with
 `lv sg bind <vm> --network <name> --sg <name>`. See
 [`docs/firewall.md`](firewall.md) for the three-tier model and CLI surface.
+
+#### Security groups and guards a file does not declare
+
+A NIC's security groups and its guard can be changed at runtime, with
+`lv sg bind` and `lv firewall nic-guard set`. Those write the rows the firewall
+enforces from, not the VM's stored spec, so `lv compose diff` and
+`lv compose up` compare the file with those rows, the same view `lv inspect`
+shows. The file owns only what it declares:
+
+- **Security groups.** A NIC whose entry has a non-empty `security-groups:`
+  owns its binding. A binding that differs from it is drift: `diff` shows it as
+  `nic_sg_<n> [old]→[new]`, and `up` binds the file's list again, in place,
+  with no restart. A NIC whose entry names no groups keeps whatever it is bound
+  to. `up` never removes a group from it.
+- **Guards.** A NIC whose entry names any guard setting (`spoof-guard`,
+  `allowed-addresses`, `allow-dhcp-server`, `allow-router-advertisement` or
+  `allow-vlan-tags`) owns its whole guard. Its mode is on unless the file says
+  `off`, and the settings it leaves out are off. A guard that differs is drift:
+  `nic_guard_<n> {old}→{new}`, put back in place by `up`. A NIC whose entry
+  names none keeps the guard it has, including one an operator turned off. To
+  have `up` keep a NIC guarded, write `spoof-guard: "on"`.
+
+**An update that removes protection says so.** Restoring the file can unbind
+a group that was bound outside the file (an isolation group, say), or relax a
+guard: turn it off, or add an allowed address, a DHCP-server, router-advert or
+VLAN-tag allowance. Such an update is still applied, because it is what the
+file declares. But `diff` and the deploy plan print a warning that names each
+one: `this update removes protection set outside the file: nic 0 (lan): unbinds
+security group(s) isolate, bound outside the file`. To keep an incident
+binding, add the group to the file, or hold the deploy.
+
+`up` writes these through the same calls as `lv sg bind` and
+`lv firewall nic-guard set`, with the deploying caller's authority, and audits
+them the same way. A guard needs `network.update` over the NIC's network, even
+to tighten it. A security-group binding is written per network, so when a VM
+has two NICs on one network, `up` rebinds only if the file declares the same
+groups for both. Otherwise it refuses the update and leaves both bindings as
+they are. A change of identity that re-creates the VM creates its NICs from the
+file anyway.

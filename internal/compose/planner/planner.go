@@ -316,8 +316,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		if vm.StackName != f.Name || vm.Spec == "" {
 			continue
 		}
-		ss := &pb.VMSpec{}
-		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+		if ss := storedSpecOf(state, vm); ss != nil {
 			storedSpecByVM[vm.Name] = ss
 		}
 	}
@@ -544,15 +543,31 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 		// The full stored spec lets Build compare every field, not just the
 		// coarse four; a spec that does not parse leaves Spec nil and the VM
 		// falls back to the coarse comparison rather than failing the plan.
-		if vm.Spec != "" {
-			ss := &pb.VMSpec{}
-			if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
-				cur.Spec = ss
-			}
+		if ss := storedSpecOf(state, &vm); ss != nil {
+			cur.Spec = ss
 		}
 		current = append(current, cur)
 	}
 	return current
+}
+
+// storedSpecOf is the stored spec of vm that a deploy compares the file with:
+// as stored, with each NIC's security-group binding and guard replaced by the
+// ones enforced now (ClusterState.NICSecurity), so a runtime `lv sg bind` or
+// `lv firewall nic-guard set` is seen. nil when it has none or it does not
+// parse.
+func storedSpecOf(state *ClusterState, vm *corrosion.VMRecord) *pb.VMSpec {
+	if vm.Spec == "" {
+		return nil
+	}
+	ss := &pb.VMSpec{}
+	if err := json.Unmarshal([]byte(vm.Spec), ss); err != nil {
+		return nil
+	}
+	if live, ok := state.NICSecurity[vm.Name]; ok {
+		ss = compose.OverlayLiveNICSecurity(ss, live)
+	}
+	return ss
 }
 
 // buildCurrentContainers converts this stack's current containers (tagged with

@@ -610,6 +610,12 @@ lv import vm.ova --name legacy --spoof-guard off
 `--allow` replaces the whole list. `lv firewall nic-guard ls` shows `any` for a
 family that is unrestricted and `unset` for a NIC with no guard.
 
+A guard set at runtime on a stack VM's NIC is drift for `lv compose diff` and
+`lv compose up` only when the file names a guard setting for that NIC. `up`
+then sets the file's guard again, and warns when doing so relaxes the guard
+being enforced. A NIC whose file names no guard setting keeps the runtime
+guard (docs/compose.md, "Security groups and guards a file does not declare").
+
 In compose, per NIC:
 
 ```yaml
@@ -856,6 +862,12 @@ missing. Recommended order:
   rewrites the NIC's `vm_nics` row (and its `vm_interfaces` row, for peers on
   an older build), so the next reconcile applies it. A bind naming a network
   the VM has no NIC on is refused rather than answered OK.
+  A runtime bind of a stack VM's NIC is drift for `lv compose diff` and
+  `lv compose up` only when the file declares that NIC's `security-groups:`.
+  `up` then binds the file's list again, and warns when that unbinds a group
+  bound outside the file. A NIC whose file names no groups keeps the runtime
+  binding (docs/compose.md, "Security groups and guards a file does not
+  declare").
 - **The chain follows the tap libvirt gives the NIC now.** libvirt hands out
   a new `vnetN` on every start, so the tap recorded at create is stale after
   a stop and start, a migration or a failover. Every tick the reconciler asks

@@ -715,3 +715,31 @@ func SetClusterPolicy(ctx context.Context, c *Client, key, value, setBy string) 
 	}
 	return c.Execute(ctx, clusterPolicyUpsertSQL, key, value, setBy, c.NowTS())
 }
+
+// LiveNICSecurity is each NIC of vmName, in ordinal order, with the
+// security-group binding its row holds and the guard record the firewall
+// enforces for it: only a record of the incarnation vmUUID names (an earlier
+// VM of the same name and MAC left one that guards nothing), and none for a
+// NIC that has no record (unguarded). A compose deploy compares the file with
+// this, not with the create-time values in the stored spec.
+func LiveNICSecurity(ctx context.Context, c *Client, vmName, vmUUID string) ([]compose.LiveNIC, error) {
+	nics, err := MergedVMNICs(ctx, c, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]compose.LiveNIC, 0, len(nics))
+	for _, n := range nics {
+		ln := compose.LiveNIC{Network: n.NetworkName, MAC: n.MAC, Ordinal: n.Ordinal,
+			SecurityGroups: decodeSGs(n.SecurityGroups)}
+		rec, err := GetNICGuard(ctx, c, vmName, n.MAC)
+		if err != nil {
+			return nil, fmt.Errorf("read the guard of NIC %s: %w", n.MAC, err)
+		}
+		if rec != nil && (rec.VMUUID == "" || vmUUID == "" || rec.VMUUID == vmUUID) {
+			ln.Guard = &compose.LiveGuard{Mode: rec.Mode, Allowed: rec.Allowed,
+				AllowDHCPServer: rec.AllowDHCPServer, AllowRouterAdvert: rec.AllowRouterAdvert, AllowVLANTags: rec.AllowVLANTags}
+		}
+		out = append(out, ln)
+	}
+	return out, nil
+}

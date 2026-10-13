@@ -6,6 +6,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -50,6 +51,13 @@ type ClusterState struct {
 	// retry (one in a transient or error state): what of it was already made,
 	// which a retry repairs rather than replaces.
 	RecordedDisks map[string]int
+
+	// NICSecurity is, for each stack VM, its NICs with the security-group
+	// binding and guard the firewall enforces now (corrosion.LiveNICSecurity).
+	// A deploy compares the file with these, not with the create-time values
+	// in the stored spec (compose.OverlayLiveNICSecurity). A VM missing here
+	// is compared with its stored spec.
+	NICSecurity map[string][]compose.LiveNIC
 }
 
 // LoadClusterState queries Corrosion once and builds an immutable snapshot.
@@ -159,7 +167,27 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		recordedDisks[vm.Name] = len(disks)
 	}
 
+	// The live NIC security of this cluster's stack VMs: a deploy compares a
+	// file's declared groups and guards with what is enforced now. A read
+	// failure fails the plan rather than comparing with create-time values.
+	nicSecurity := map[string][]compose.LiveNIC{}
+	for _, vm := range vms {
+		if vm.StackName == "" {
+			continue
+		}
+		var sp struct {
+			UUID string `json:"uuid"`
+		}
+		_ = json.Unmarshal([]byte(vm.Spec), &sp)
+		live, err := corrosion.LiveNICSecurity(ctx, db, vm.Name, sp.UUID)
+		if err != nil {
+			return nil, fmt.Errorf("read the NIC security of %s: %w", vm.Name, err)
+		}
+		nicSecurity[vm.Name] = live
+	}
+
 	return &ClusterState{
+		NICSecurity:   nicSecurity,
 		RecordedDisks: recordedDisks,
 		Hosts:         hosts,
 		VMs:           vms,

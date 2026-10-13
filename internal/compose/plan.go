@@ -185,6 +185,13 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			if vmDef.CloudInit == nil && (cur.Spec.GetCloudInit() != nil || (cur.Spec == nil && cur.CloudInitHash != "")) {
 				warning = cloudInitKeptWarning
 			}
+			if len(change.Weakens) > 0 {
+				w := WeakensWarning(change.Weakens)
+				if warning != "" {
+					w = warning + "; " + w
+				}
+				warning = w
+			}
 
 			// VMs in transient or error states are not in a stable steady
 			// state — even if their spec matches, the previous deploy didn't

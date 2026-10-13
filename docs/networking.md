@@ -911,8 +911,8 @@ which is why the unlinked shape is the default rather than an error.
 reads NetBox sites, racks, power feeds or cables, and litevirt does not model
 physical topology. Placement depends only on cluster state, so a NetBox outage
 or an incomplete DCIM model can never stop a VM from being placed or recovered.
-Express rack or site constraints with host labels (`lv host label set`) and
-the placement rules in [placement.md](placement.md).
+Express rack or site constraints with host labels (`lv host label set`) and a
+VM's `require:` and `prefer:` placement rules ([compose.md](compose.md)).
 
 Templates are never mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
 deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.

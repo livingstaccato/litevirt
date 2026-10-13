@@ -647,7 +647,12 @@ Failed logins are throttled per node, in memory:
   per-account ceiling still holds; list only your proxies.
 
 A failure counts against exactly the account name the attempt gave
-(normalized: trimmed and lower-cased). Failing as `admin|1` names another,
+(normalized: trimmed and lower-cased) — for a password or LDAP login. An OIDC
+login names no account the client can choose: a failed exchange counts in the
+anonymous per-address bucket (which has no account ceiling), and a failed
+second factor against the subject the IdP proved; a `username` sent with an
+OIDC login is ignored. A WebAuthn finish counts only when a ceremony was in
+flight (an assertion was actually checked). Failing as `admin|1` names another,
 nonexistent account and never counts against `admin`; two OIDC subjects such
 as `auth0|abc` and `auth0|xyz` have separate ceilings.
 

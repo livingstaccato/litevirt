@@ -60,8 +60,8 @@ func newSessionRevokeCmd() *cobra.Command {
 		Short: "Revoke an active session",
 		Long: `Revoke an active session by the ID that lv session ls shows.
 
-The ID column shows the first 12 characters of the session id: the full id is
-the session's bearer secret and is never displayed. Any unambiguous prefix of
+The ID column shows a 12-character handle, the start of the session id: the
+full id is the session's bearer secret and the daemon never returns it. Any unambiguous prefix of
 at least 8 characters names the session (a trailing "…" pasted from the table
 is ignored); a prefix that matches more than one session is refused and the
 matches are listed.
@@ -75,12 +75,12 @@ revoke.`,
 			id = strings.TrimSuffix(strings.TrimSuffix(id, "…"), "...")
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: id}); err != nil {
-					// A daemon older than prefix revoke matches only the full id,
-					// which a new daemon never lists.
-					if status.Code(err) == codes.NotFound && len(id) < 64 {
-						return fmt.Errorf("%w (if the session is listed, the daemon is older than prefix revoke and matches "+
-							"only the full session id, which lv session ls does not show: upgrade it, or end the "+
-							"user's sessions with lv user disable)", err)
+					// A daemon older than prefix revoke matches only the full id.
+					// Say so only when this daemon is one; against a current one a
+					// NotFound is just that (a typo, or a session that is not yours).
+					if status.Code(err) == codes.NotFound && len(id) < 64 && daemonListsFullSessionIDs(ctx, c) {
+						return fmt.Errorf("%w (this daemon is older than prefix revoke and matches only the full "+
+							"session id: upgrade it, or end the user's sessions with lv user disable)", err)
 					}
 					return err
 				}
@@ -89,6 +89,23 @@ revoke.`,
 			})
 		},
 	}
+}
+
+// daemonListsFullSessionIDs reports whether the daemon is older than
+// session handles: it lists full 64-character session ids, where a current
+// daemon lists 12-character handles (and resolves them in RevokeSession). It
+// asks about the caller's own sessions only; false when that cannot be told.
+func daemonListsFullSessionIDs(ctx context.Context, c pb.LiteVirtClient) bool {
+	resp, err := c.ListSessions(ctx, &pb.ListSessionsRequest{})
+	if err != nil {
+		return false
+	}
+	for _, s := range resp.Sessions {
+		if len(s.Id) > 12 {
+			return true
+		}
+	}
+	return false
 }
 
 func newTwoFactorCmd() *cobra.Command {

@@ -35,8 +35,17 @@ const (
 	// defaultLoginMaxEntries is a sweep THRESHOLD, not a cap: above it, stale
 	// entries are swept at most once per loginThrottleSweepInterval. Live
 	// entries are never evicted (that would let an attacker flush its own
-	// record), so the table is bounded by login throughput over a window plus
-	// a lockout, which the bcrypt cost of every attempt bounds in turn.
+	// record), so the table holds what failed within one window plus one
+	// lockout. What bounds that, per path:
+	//   - password Login: every counted failure costs a bcrypt compare (an
+	//     unknown user burns the dummy hash), so new keys arrive no faster than
+	//     the node can hash;
+	//   - OIDC: failures are charged to the anonymous bucket by address, or to
+	//     a subject the IdP proved — never to a client-named account;
+	//   - WebAuthn: only a finish that evaluated an assertion counts, which
+	//     needs a ceremony begun for an account with an enrolled credential;
+	//     each such account adds at most its ceiling's worth of address keys
+	//     before the ceiling refuses it outright.
 	defaultLoginMaxEntries     = 65536
 	loginThrottleSweepInterval = time.Minute
 )

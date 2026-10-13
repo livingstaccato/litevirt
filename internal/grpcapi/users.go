@@ -68,14 +68,24 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// locked out from too many recent failures. Keyed on the attempted
 	// username so a correct password can't be ground out, and on IP so one
 	// attacker can't lock a victim's account from afar.
-	throttleKey := loginThrottleKey(req.Username, clientIP)
+	//
+	// An OIDC realm takes no username from the client: the account is what
+	// the IdP proves. Its failures are charged to the anonymous bucket (or,
+	// resuming, to the subject the IdP proved, below), never to whatever a
+	// client put in the username field, which would let a failed exchange
+	// charge a real account's ceiling.
+	throttleUser := req.Username
+	if strings.HasPrefix(realmName, "oidc:") {
+		throttleUser = ""
+	}
+	throttleKey := loginThrottleKey(throttleUser, clientIP)
 	var pending *auth.Principal
 	if oidcResume {
 		// The principal the IdP proved is held on this node under the
 		// handle; nothing about it comes from this request.
 		p, ok := s.oidcPending.reserve(req.OidcPending, realmName)
 		if !ok {
-			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle", "denied")
+			s.audit(ctx, "auth.login", "", "realm="+realmName+" unknown or expired second-factor handle ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated,
 				"this OIDC login is unknown or expired on this node (or used up its attempts); log in again")
 		}
@@ -132,7 +142,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			// flow is now spent and the code was never presented. Not counted
 			// against the shared anonymous bucket (that would let a stray
 			// callback lock out every OIDC user of this node), but audited.
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" OIDC login redeemed by a client that did not begin it", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" OIDC login redeemed by a client that did not begin it ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, err.Error())
 		}
 		if errors.Is(err, auth.ErrOIDCFlowUnknown) {
@@ -140,19 +150,19 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			// does not count against the shared anonymous bucket — a stray
 			// or replayed callback must not lock every OIDC user of this
 			// node out.
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unknown OIDC state", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unknown OIDC state ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, err.Error())
 		}
 		if errors.Is(err, auth.ErrInvalidCredentials) {
 			s.loginThrottle.fail(throttleKey)
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" invalid credentials ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 		}
 		if errors.Is(err, auth.ErrRealmUnavailable) {
-			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unavailable", "denied")
+			s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" unavailable ip="+clientIP, "denied")
 			return nil, status.Errorf(codes.Unavailable, "realm unavailable: %v", err)
 		}
-		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" error", "denied")
+		s.audit(ctx, "auth.login", req.Username, "realm="+realmName+" error ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Internal, "authenticate: %v", err)
 	}
 
@@ -167,7 +177,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		for _, id := range entryIDs(principal) {
 			own, berr := corrosion.IdentityOwner(ctx, s.db, realmName, id)
 			if berr != nil {
-				s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+				s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable ip="+clientIP, "denied")
 				return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
 			}
 			if own.Contested() {
@@ -189,7 +199,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// `lv role grant`.
 	if realmName != "local" {
 		if err := auth.EnsureUserShadow(ctx, s.db, principal, "viewer"); err != nil {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" shadow refused", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" shadow refused ip="+clientIP, "denied")
 			switch {
 			case errors.Is(err, auth.ErrShadowPending):
 				return nil, status.Errorf(codes.Unavailable, "retry: %v", err)
@@ -206,7 +216,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// normalizes (corrosion.NormalizeUsername): from here on the subject is
 	// the stored name, so `ALICE` is checked as the account `alice` is (I2).
 	if u, uerr := corrosion.GetUser(ctx, s.db, principal.Subject); uerr != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed", "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" account lookup failed ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Internal, "look up account: %v", uerr)
 	} else if u != nil {
 		principal.Subject = u.Username
@@ -216,7 +226,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// no second-factor prompt either. Checked only after the credentials
 	// verified, so it tells nothing to someone who does not hold them.
 	if err := s.refuseInactiveAccount(ctx, principal.Subject); err != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message(), "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" "+status.Convert(err).Message()+" ip="+clientIP, "denied")
 		return nil, err
 	}
 
@@ -235,7 +245,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	if bindID != "" {
 		res, berr := corrosion.ResolveIdentityBinding(ctx, s.db, principal.Subject, realmName)
 		if berr != nil {
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" identity binding unreadable ip="+clientIP, "denied")
 			return nil, status.Errorf(codes.Unavailable, "read the directory identity binding: %v", berr)
 		}
 		if res.Contested() {
@@ -276,7 +286,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// with none gets an enrollment-only session rather than no session.
 	required, enrolled, perr := s.secondFactorRequirement(ctx, principal.Subject, realmName)
 	if perr != nil {
-		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable", "denied")
+		s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second-factor policy unreadable ip="+clientIP, "denied")
 		return nil, status.Errorf(codes.Unavailable, "evaluate the second-factor policy: %v", perr)
 	}
 	oidcLogin := (hasOIDCCode || oidcResume) && !hasPassword
@@ -300,7 +310,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 				}
 				handle = h
 			}
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor required", "pending")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" second factor required ip="+clientIP, "pending")
 			return &pb.LoginResponse{Requires_2Fa: true, OidcPending: handle}, nil
 		}
 		return &pb.LoginResponse{Requires_2Fa: true}, nil
@@ -312,7 +322,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 		}
 		if !ok {
 			s.loginThrottle.fail(throttleKey)
-			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor", "denied")
+			s.audit(ctx, "auth.login", principal.Subject, "realm="+realmName+" invalid second factor ip="+clientIP, "denied")
 			return nil, status.Error(codes.Unauthenticated, "invalid second factor")
 		}
 	}

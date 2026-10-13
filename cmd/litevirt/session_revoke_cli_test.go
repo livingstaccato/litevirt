@@ -47,13 +47,32 @@ func TestSessionLs_MarksTheCurrentSession(t *testing.T) {
 	}
 }
 
-// M6 (round 1): a short id NotFound from a daemon too old to resolve prefixes
-// says so instead of only "session not found".
-func TestSessionRevoke_ShortIdNotFoundHintsAtAnOlderDaemon(t *testing.T) {
-	m := newMockClient()
-	m.revokeSessionErr = status.Error(codes.NotFound, "session not found")
-	_, _, err := runCmd(t, m, "session", "revoke", "abcdef123456")
-	if err == nil || !strings.Contains(err.Error(), "older") || !strings.Contains(err.Error(), "full session id") {
-		t.Fatalf("err %v: want a hint about an older daemon needing the full session id", err)
+// M6 (round 1), F1 (round 3): a short-id NotFound carries the older-daemon
+// hint only when the daemon is older (it lists full session ids); against a
+// current daemon (it lists handles) it is a plain not-found.
+func TestSessionRevoke_OlderDaemonHintOnlyAgainstAnOlderDaemon(t *testing.T) {
+	notFound := status.Error(codes.NotFound, "session not found")
+
+	older := newMockClient()
+	older.revokeSessionErr = notFound
+	older.sessions = []*pb.Session{{Id: strings.Repeat("a", 64), Username: "alice"}}
+	_, _, err := runCmd(t, older, "session", "revoke", "abcdef123456")
+	if err == nil || !strings.Contains(err.Error(), "older") || !strings.Contains(err.Error(), "full") {
+		t.Fatalf("older daemon: err %v, want the older-daemon hint", err)
+	}
+
+	current := newMockClient()
+	current.revokeSessionErr = notFound
+	current.sessions = []*pb.Session{{Id: "aaaaaaaaaaaa", Username: "alice", Current: true}}
+	_, _, err = runCmd(t, current, "session", "revoke", "abcdef123456")
+	if err == nil || strings.Contains(err.Error(), "older") || !strings.Contains(err.Error(), "session not found") {
+		t.Fatalf("current daemon: err %v, want a plain not-found", err)
+	}
+
+	none := newMockClient()
+	none.revokeSessionErr = notFound
+	_, _, err = runCmd(t, none, "session", "revoke", "abcdef123456")
+	if err == nil || strings.Contains(err.Error(), "older") {
+		t.Fatalf("no sessions listed: err %v, want a plain not-found", err)
 	}
 }

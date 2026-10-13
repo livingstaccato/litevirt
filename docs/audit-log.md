@@ -177,13 +177,17 @@ a repo to zstd. Each row names the repo, or `src -> dst` for a sync, and
 A bound covers the whole unit it names: `--since` starts at the beginning of it
 and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
 and `--since 2026-10-03T22:16:30Z` includes a row stamped
-`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row.
+`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row. A bound that lands past
+9999-12-31T23:59:59.999999999Z once converted to UTC (a year-9999 bound with a
+negative offset) is clamped to it: as `--until` it still matches every row, as
+`--since` it matches nothing.
 Anything else is refused with `InvalidArgument` and a message naming the bound.
 
 The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp
 (`2026-10-03T22:16:30.000000000Z`), so a daemon not yet upgraded, which still
 compares the bound as text, draws the window in the right place too, and a
-relative bound is fixed once for every page of an export. A client calling the
+relative bound is fixed once for every page of an export. `lv mcp` does the
+same for the `since` / `until` arguments of its tools. A client calling the
 API directly with any other form gets the right answer only from an upgraded
 daemon.
 
@@ -223,7 +227,10 @@ grouped by what it means:
   under its old name writes if it appends before its history has replicated
   back (see "Rebuilding a host under its old name" below). The hash shows no
   edit to the row, but it is still a finding, and `verify` still exits
-  non-zero.
+  non-zero. On an **unsigned** row this is also exactly what a rewrite looks
+  like that blanked `prev_hash`, recomputed the hash and renumbered the row to
+  seq 1: seq is covered only by the signature, so nothing can tell the two
+  apart. A signed row rewritten that way also shows a **bad signature**.
 - **broken link** — the row hashes correctly against its own stored
   `prev_hash`, but that is not the hash of the row before it, and the row is not
   a second genesis. A row between them was deleted or rewritten, the chain

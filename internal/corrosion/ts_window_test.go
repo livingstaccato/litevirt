@@ -20,6 +20,7 @@ import (
 func TestParseTimeWindow_Forms(t *testing.T) {
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
 	T := time.Date(2026, 10, 3, 22, 16, 30, 0, time.UTC)
+	maxTS := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 	day := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		in        string
@@ -42,6 +43,10 @@ func TestParseTimeWindow_Forms(t *testing.T) {
 		{"0", time.Unix(0, 0).UTC(), time.Unix(1, 0).UTC().Add(-1)},
 		{"1791065790", T, T.Add(time.Second - 1)},
 		{"9999", time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)},
+		// Past the last representable stamp once converted to UTC: clamped to it,
+		// so an until there still matches everything and a since nothing.
+		{"9999-12-31T23:59:59-01:00", maxTS, maxTS},
+		{"9999-12-31T23:00:00-05:00", maxTS, maxTS},
 		{"90m", now.Add(-90 * time.Minute), now.Add(-90 * time.Minute)},
 		{"0s", now, now},
 	} {
@@ -111,6 +116,7 @@ func TestTimeWindow_PredicateIsTimeOrder(t *testing.T) {
 		"2026-10-03T22:16:30.767241380Z", "2026-10-03T22:16:30.77Z", "2026-10-03T22:16:31Z",
 		"2026-10-03", "2026-10-03T22:16", "2026-10-03T22", "0",
 		"9999", "9999-12-31", "9999-12-31T23:59:59Z",
+		"9999-12-31T23:59:59-01:00", "9999-12-31T23:00:00-05:00",
 	}
 	for _, since := range bounds {
 		for _, until := range bounds {
@@ -146,6 +152,31 @@ func TestTimeWindow_PredicateIsTimeOrder(t *testing.T) {
 			if fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Errorf("since=%q until=%q:\n got %v\nwant %v", since, until, got, want)
 			}
+		}
+	}
+}
+
+// TestTimeWindow_BoundsNeverPassTheMax: a bound past 9999-12-31T23:59:59Z once
+// converted to UTC (a year-9999 "forever" written with a negative offset) must
+// never be rendered as a year-10000 stamp. Five digits sort as text BELOW every
+// real stamp, so an until there matched nothing and a since everything — on
+// this daemon through the predicate, and on an older daemon through the stamp
+// the CLI and `lv mcp` send it.
+func TestTimeWindow_BoundsNeverPassTheMax(t *testing.T) {
+	w, err := ParseTimeWindow("9999-12-31T23:00:00-05:00", "9999-12-31T23:59:59-01:00", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	since, until := w.Bounds()
+	for _, b := range []string{since, until} {
+		if b != "9999-12-31T23:59:59.999999999Z" {
+			t.Errorf("bound rendered as %q, want the last representable stamp", b)
+		}
+	}
+	pred, args := w.Predicate("ts")
+	for _, a := range args {
+		if s, ok := a.(string); ok && strings.HasPrefix(s, "10000") {
+			t.Errorf("predicate %s carries a year-10000 argument %q", pred, s)
 		}
 	}
 }

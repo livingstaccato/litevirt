@@ -707,6 +707,12 @@ func (r AuditVerifyResult) Unverified() bool {
 // unsigned row mid-chain that blanks prev_hash and recomputes the hash is
 // self-consistent too, and calling IT a fork would tell the operator the one
 // thing that is false. Every kind is still a finding.
+//
+// That holds only while seq is honest. seq is not in the content hash, only
+// under the signature, so on an UNSIGNED row it is as writable as prev_hash: a
+// rewrite that also renumbers the row to seq 1 has exactly a fork's shape and
+// is labelled one. No check can tell the two apart there. A signed row
+// rewritten that way also shows a bad signature.
 func brokenLinkKind(rec AuditRecord, storedPrev, stored string, repeatsSeq1 bool) string {
 	rec.PrevHash = storedPrev
 	switch {

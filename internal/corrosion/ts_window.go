@@ -40,8 +40,9 @@ type TimeWindow struct {
 func (w TimeWindow) IsOpen() bool { return w.Since.IsZero() && w.Until.IsZero() }
 
 // ParseTimeWindow reads a user-supplied since/until pair, as `lv audit ls`, `lv
-// audit export` and `lv events <vm>` pass them. An empty string leaves that
-// bound open.
+// audit export`, `lv events <vm>` and the `lv mcp` tools take them (and resolve
+// them with Bounds before sending), and as the daemon receives them. An empty
+// string leaves that bound open.
 //
 // These used to be compared to the stored stamps as TEXT, verbatim. The stamps
 // are fixed-width UTC with nine fractional digits, and '.' sorts below 'Z', so
@@ -52,11 +53,14 @@ func (w TimeWindow) IsOpen() bool { return w.Since.IsZero() && w.Until.IsZero() 
 // Every form that gave a sensible answer under the text comparison is still
 // accepted, with the answer it was meant to give:
 //
-//   - RFC3339, with or without a fraction, in UTC or with an offset;
+//   - RFC3339, with or without a fraction ('.' or ','), in UTC or with an
+//     offset;
 //   - the same without a zone, or with a space for the 'T', read as UTC (the
 //     stamps are UTC, which is what the text comparison assumed);
-//   - minute, date, month and year precision (2026-06-01T12:30, 2026-06-01,
-//     2026-06, 2026);
+//   - minute, hour, date, month and year precision (2026-06-01T12:30,
+//     2026-06-01T12, 2026-06-01, 2026-06, 2026);
+//   - a bare integer other than a four-digit year, as Unix seconds; "0" is
+//     therefore the beginning, which is what `--since 0` returned as text;
 //   - a Go duration (90m, 24h), meaning that long before now. Under the text
 //     comparison "1h" sorted below every stamp, so it was accepted and meant
 //     nothing (every stamp sorted above it); it now means what an operator
@@ -67,6 +71,13 @@ func (w TimeWindow) IsOpen() bool { return w.Since.IsZero() && w.Until.IsZero() 
 // of 30 June and `--until 22:16:30Z` all of that second. The second case is
 // what the text comparison happened to do, and the export docs' own example
 // (`--until 2026-06-30T23:59:59Z`) depends on it.
+//
+// No bound lies past the last representable stamp, 9999-12-31T23:59:59.999999999Z
+// (maxStamp). One written with a negative offset can, once converted to UTC, and
+// year 10000 would be rendered with five digits, which sort as text below every
+// real stamp: an until there matched nothing and a since everything. Both are
+// clamped to maxStamp, so an until there still matches every row and a since
+// matches nothing past it.
 //
 // Anything else names no instant and is an error that says which bound it was.
 func ParseTimeWindow(since, until string, now time.Time) (TimeWindow, error) {
@@ -108,8 +119,23 @@ var timeBoundForms = []struct {
 	{"2006", func(t time.Time) time.Time { return t.AddDate(1, 0, 0) }},
 }
 
-// parseTimeBound returns the first and the last instant s covers.
+// maxStamp is the last instant a fixed-width stamp can carry.
+var maxStamp = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
+
+// parseTimeBound returns the first and the last instant s covers, never past
+// maxStamp.
 func parseTimeBound(s string, now time.Time) (first, last time.Time, err error) {
+	first, last, err = parseTimeBoundUnclamped(s, now)
+	if first.After(maxStamp) {
+		first = maxStamp
+	}
+	if last.After(maxStamp) {
+		last = maxStamp
+	}
+	return first, last, err
+}
+
+func parseTimeBoundUnclamped(s string, now time.Time) (first, last time.Time, err error) {
 	for _, f := range timeBoundForms {
 		t, perr := time.Parse(f.layout, s)
 		if perr != nil {
@@ -138,7 +164,8 @@ func parseTimeBound(s string, now time.Time) (first, last time.Time, err error) 
 		return t, t, nil
 	}
 	return first, last, fmt.Errorf("cannot read %q as a time: want an RFC3339 timestamp "+
-		"(2026-06-01T00:00:00Z, or with an offset), a date (2026-06-01), or a duration ago (24h)", s)
+		"(2026-06-01T00:00:00Z, or with an offset), a coarser one (2026-06-01T12:30, 2026-06-01T12, "+
+		"2026-06-01, 2026-06, 2026), Unix seconds (1780272000), or a duration ago (24h)", s)
 }
 
 // maxUnixBound is the last Unix second a stamp can carry (9999-12-31T23:59:59Z).

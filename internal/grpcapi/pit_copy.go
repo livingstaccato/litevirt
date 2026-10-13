@@ -932,14 +932,17 @@ func (s *Server) settleKeptPITOverlays(ctx context.Context, vm *corrosion.VMReco
 		if d.Path == "" {
 			continue
 		}
+		// Only a kept disk is settled, so only a kept disk is looked at: a
+		// disk the delete removes (with its overlay) is not refused for
+		// storage that does not answer here (review round 1, M-3).
+		if !keepAll && d.DeleteWithVM && !s.diskPathReferencedByOtherVM(ctx, vm.Name, d) {
+			continue
+		}
 		present, err := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
 		if err != nil {
 			return pitNoAnswer(vm, d, err)
 		}
 		if !present {
-			continue
-		}
-		if !keepAll && d.DeleteWithVM && !s.diskPathReferencedByOtherVM(ctx, vm.Name, d) {
 			continue
 		}
 		if err := s.healPITOverlay(ctx, vm, d); err != nil {
@@ -987,10 +990,35 @@ func (s *Server) SweepPITOverlays(ctx context.Context, caughtUp func() (bool, st
 		slog.Warn("point-in-time overlay sweep: list VMs", "error", err)
 		return
 	}
+	var waiting []string
 	for i := range vms {
-		s.sweepPITOverlaysOf(ctx, vms[i].Name)
+		if s.sweepPITOverlaysOf(ctx, vms[i].Name) {
+			waiting = append(waiting, vms[i].Name)
+		}
+	}
+	// A VM passed over because its storage did not answer is swept again,
+	// slowly, until it is settled (review round 1, M-2): the sweep is what
+	// settles a running VM a dead daemon left on its overlay, which no start
+	// of it would.
+	for len(waiting) > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(pitSweepRetry):
+		}
+		var still []string
+		for _, name := range waiting {
+			if s.sweepPITOverlaysOf(ctx, name) {
+				still = append(still, name)
+			}
+		}
+		waiting = still
 	}
 }
+
+// pitSweepRetry is how often the start-up sweep tries again a VM it passed
+// over because its storage did not answer. A variable so tests do not wait.
+var pitSweepRetry = time.Minute
 
 // PITSweepReady is the start-up sweep's readiness: this host's replica is
 // trusted (corrosion.ReplicaTrusted — caught up with a peer, or this host is
@@ -1004,27 +1032,31 @@ func (s *Server) pitSweepReady(ctx context.Context, caughtUp func() (bool, strin
 	return func() (bool, string) { return corrosion.ReplicaTrusted(ctx, s.db, s.hostName, caughtUp) }
 }
 
-func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
+//
+// It reports whether a disk of the VM was passed over because its storage
+// did not answer: the sweep then tries the VM again later.
+func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) (passedOver bool) {
 	unlock := s.lockVM(name)
 	defer unlock()
 	vm, err := corrosion.GetVM(ctx, s.db, name)
 	if err != nil || vm == nil || vm.HostName != s.hostName {
 		slog.Info("point-in-time overlay sweep: not this host's VM any more; left to its owner", "vm", name)
-		return
+		return false
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, name)
 	if err != nil {
 		slog.Warn("point-in-time overlay sweep: list disks", "vm", name, "error", err)
-		return
+		return false
 	}
 	for i := range disks {
 		d := &disks[i]
 		// Under the VM's lock, which every start and stop of it needs: a
 		// disk whose storage does not answer is passed over, not waited on
-		// (lab 2 O-3). Its start settles it once it answers.
+		// (lab 2 O-3), and tried again later.
 		present, perr := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
 		if perr != nil {
-			slog.Warn("point-in-time overlay sweep: a disk's storage does not answer; left for its start", "vm", name, "disk", d.DiskName, "error", perr)
+			slog.Warn("point-in-time overlay sweep: a disk's storage does not answer; tried again later", "vm", name, "disk", d.DiskName, "error", perr)
+			passedOver = true
 			continue
 		}
 		if !present {
@@ -1038,8 +1070,12 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 		}
 		if err := s.healPITOverlay(ctx, vm, d); err != nil {
 			slog.Error("point-in-time overlay sweep: not settled", "vm", name, "error", err)
+			if status.Code(err) == codes.Unavailable {
+				passedOver = true // its storage stopped answering: tried again later
+			}
 		}
 	}
+	return passedOver
 }
 
 // notPITKey names one disk of one VM incarnation: a VM re-created under the

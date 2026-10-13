@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,19 +146,52 @@ func TestSettlePITOverlays_ANoAnswerIsNeverNoOverlay(t *testing.T) {
 // sweep goes on, and the lock — which every start and stop of the VM needs —
 // is not held for as long as the server does not answer (lab 2 O-3).
 //
-// Mutation "the sweep looks for the overlay unbounded" — red.
+// The VM passed over is swept again, slowly, until its storage answers
+// (review round 1, M-2): the sweep is what settles a running VM a dead
+// daemon left on its overlay.
+//
+// Mutations: "the sweep looks for the overlay unbounded" — the start waits
+// on the lock: red. "no retry" — the sweep ends while the storage is still
+// dead: red.
 func TestSweepPITOverlays_PassesOverAVMWhoseOverlayDoesNotAnswer(t *testing.T) {
 	f, mnt, _ := deadPoolVM(t)
-	blockPITLstat(t, func(p string) bool { return pathWithin(mnt, p) })
-	within(t, 5*time.Second, "the start-up overlay sweep", func() struct{} {
-		f.s.SweepPITOverlays(context.Background(), func() (bool, string) { return true, "" })
-		return struct{}{}
-	})
-	err := within(t, 5*time.Second, "a start after the sweep", func() error {
+	prevRetry := pitSweepRetry
+	pitSweepRetry = 50 * time.Millisecond
+	t.Cleanup(func() { pitSweepRetry = prevRetry })
+	release := make(chan struct{})
+	var once sync.Once
+	answer := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(answer)
+	t.Cleanup(pitoverlay.SetLstatForTest(func(p string) (os.FileInfo, error) {
+		if pathWithin(mnt, p) {
+			<-release
+		}
+		return os.Lstat(p)
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		f.s.SweepPITOverlays(ctx, func() (bool, string) { return true, "" })
+	}()
+	// The lock is not held: a start is refused at once.
+	err := within(t, 5*time.Second, "a start during the sweep", func() error {
 		_, err := f.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "nvm"})
 		return err
 	})
-	wantNoAnswer(t, "start after the sweep", err)
+	wantNoAnswer(t, "start during the sweep", err)
+	select {
+	case <-swept:
+		t.Fatal("the sweep gave up on the VM while its storage did not answer")
+	case <-time.After(500 * time.Millisecond):
+	}
+	answer()
+	select {
+	case <-swept:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sweep did not finish the VM once its storage answered")
+	}
 }
 
 // A delete settles the overlays of the disks it keeps: one whose overlay
@@ -173,6 +207,31 @@ func TestSettleKeptPITOverlays_ANoAnswerRefusesTheDelete(t *testing.T) {
 		return f.s.settleKeptPITOverlays(context.Background(), vm, true)
 	})
 	wantNoAnswer(t, "settle kept overlays", err)
+}
+
+// A delete that keeps nothing (the disk goes with the VM, overlay and all)
+// is not refused because the overlay check does not answer: only kept disks
+// are looked at (review round 1, M-3).
+//
+// Mutation "look before deciding what is kept" — red.
+func TestSettleKeptPITOverlays_ADiskTheDeleteRemovesIsNotLookedAt(t *testing.T) {
+	f := newStartChainFixture(t)
+	t.Cleanup(storage.OverrideFSCallBoundForTest(300 * time.Millisecond))
+	disk := filepath.Join(f.pa, "gone-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	vm := f.insertVM(t, "gone", "a", disk, "pa", "")
+	if err := f.s.db.Execute(context.Background(), `UPDATE vm_disks SET delete_with_vm = 1 WHERE vm_name = 'gone'`); err != nil {
+		t.Fatal(err)
+	}
+	blockPITLstat(t, func(p string) bool { return p == pitoverlay.Path(disk) })
+	err := within(t, 5*time.Second, "settling the kept overlays of a delete that keeps nothing", func() error {
+		return f.s.settleKeptPITOverlays(context.Background(), vm, false)
+	})
+	if err != nil {
+		t.Fatalf("a delete that keeps no disk was refused: %v", err)
+	}
 }
 
 // The start path's other unbounded look at a pool directory (round 3's
@@ -192,9 +251,11 @@ func TestStart_AnInstallerISOOnADeadMountIsRefusedNotWaitedOn(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	prev := judgeCDROMs
-	judgeCDROMs = func(s *Server, vm *corrosion.VMRecord, domXML string) (string, error) {
+	judgeCDROMs = func(*Server, *corrosion.VMRecord, string) (string, error) {
 		<-release // the ISO's stat on the dead mount
-		return prev(s, vm, domXML)
+		// Released at cleanup, after the test: no real judgement then, which
+		// would read other tests' ISO hooks and this test's closed DB.
+		return "", errors.New("released")
 	}
 	t.Cleanup(func() { judgeCDROMs = prev })
 	err := within(t, 10*time.Second, "the start's ISO check", func() error { return f.s.verifyVMISOForStart(vm) })

@@ -276,9 +276,16 @@ gets exactly one close row. The stop marks the console audit before it stops
 serving, so a session that ends in that window (up to 5 seconds while the
 daemon lets RPCs finish, and up to 5 more while it stops the server outright)
 without an error also reads `ended=daemon-stop`; one that ends with an error
-keeps it. This holds when the daemon gives up on stopping the server because
-a request is stuck on storage that does not answer: every console stream has
-been cancelled by then, and the close rows are written all the same. The
+keeps it. A session the server stop cuts (the second window) while the VM is
+sending it output usually ends with an error, because the send to the
+viewer fails first: its close row has `result=error` and, for VNC,
+`ended="VNC proxy error: rpc error: code = Unavailable desc = transport is
+closing"` (the serial console's and SPICE's say `console error:` and `SPICE
+proxy error:`). A session that is idle when it is cut reads
+`ended=daemon-stop`. This holds when the daemon gives up on stopping the
+server because a request is stuck on storage that does not answer: every
+console stream has been cancelled by then, and the close rows are written as
+on any other stop. The
 flush is bounded at 3 seconds, plus at most one row already being written
 when that passes: past that, against a stalled database, rows still being
 written are logged as lost rather than holding up the rest of the shutdown.

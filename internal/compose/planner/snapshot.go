@@ -22,7 +22,14 @@ type ClusterState struct {
 	Networks   []corrosion.NetworkRecord
 	LBs        []corrosion.LBConfigRecord
 	Devices    map[string][]corrosion.PCIDeviceRecord // host → available devices
-	ImageHosts map[string][]string                    // imageName → hosts that have it (status=ready)
+
+	// HeldDevices is host → the PCI devices assigned to a VM. Only an update of
+	// the VM that holds one sees it: Resolve adds a VM's own devices to its
+	// update's pool (placement.Request.ReuseDevicesOf). Nothing else is
+	// placed against them.
+	HeldDevices map[string][]corrosion.PCIDeviceRecord
+
+	ImageHosts map[string][]string // imageName → hosts that have it (status=ready)
 
 	// Mappings is every resource mapping as name → host → its addresses on
 	// that host (address order), the form placement resolves a mapping
@@ -77,6 +84,7 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 
 	// Load available PCI devices per host.
 	devices := make(map[string][]corrosion.PCIDeviceRecord, len(hosts))
+	held := make(map[string][]corrosion.PCIDeviceRecord, len(hosts))
 	for _, h := range hosts {
 		if h.State != "active" {
 			continue
@@ -86,6 +94,15 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 			continue
 		}
 		devices[h.Name] = devs
+		all, err := corrosion.ListPCIDevices(ctx, db, h.Name, "")
+		if err != nil {
+			continue
+		}
+		for _, d := range all {
+			if d.VMName != "" {
+				held[h.Name] = append(held[h.Name], d)
+			}
+		}
 	}
 
 	rms, err := corrosion.ListResourceMappings(ctx, db)
@@ -151,6 +168,7 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		LBs:           lbs,
 		Devices:       devices,
 		Mappings:      mappings,
+		HeldDevices:   held,
 		ImageHosts:    imageHosts,
 		Capacity:      capacity,
 		Observations:  observations,

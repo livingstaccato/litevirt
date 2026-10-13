@@ -95,6 +95,16 @@ type Request struct {
 	// in its place — "replace", never "add".
 	Replaces *Allocation
 
+	// ReuseDevicesOf names the existing VM this placement updates or
+	// re-creates — never a workload that runs beside it. The PCI devices
+	// assigned to that VM count as free to this request, as its CPU and
+	// memory do through Replaces: the update keeps them, the re-create's
+	// teardown releases them first. Without it a VM holding the only matching
+	// device on its host could plan no update at all, not even a label change.
+	// It is set apart from Replaces because a stopped VM holds devices but no
+	// Allocation. "" frees nothing.
+	ReuseDevicesOf string
+
 	// Container marks a container workload. A container holds host MEMORY only:
 	// its cpu_limit is a cap in cores, never a vCPU reservation (the
 	// snapshot, host admission and the capacity sampler all leave container CPU
@@ -299,6 +309,7 @@ func Select(ctx context.Context, db *corrosion.Client, req Request) (string, err
 		}
 	}
 	snap.releaseAllocation(&req)
+	snap.releaseOwnDevices(&req)
 
 	candidates, err := scoreCandidates(snap, &req, false)
 	if err != nil {
@@ -323,6 +334,7 @@ func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host
 		return err
 	}
 	snap.releaseAllocation(&req)
+	snap.releaseOwnDevices(&req)
 	_, err = scoreCandidates(snap, &req, false)
 	return err
 }
@@ -808,12 +820,14 @@ func SelectBatchWithMappings(
 		// per request, not up front for the whole batch: the requests evaluated
 		// before this one still see the old allocation, which is still there.
 		released := snap.releaseAllocation(&req)
+		freedOwn := snap.releaseOwnDevices(&req)
 
 		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
 			if released {
 				snap.restoreAllocation(&req)
 			}
+			snap.reclaimOwnDevices(&req, freedOwn)
 			// One infeasible VM must not fail the WHOLE batch: failover needs
 			// per-VM isolation (strand the one VM nothing can hold, recover the
 			// rest), and compose re-checks per-VM below. An empty-Host result is
@@ -829,6 +843,7 @@ func SelectBatchWithMappings(
 		chosen := pickBest(candidates)
 
 		devAssign := assignDevicesMapped(snap.Devices, snap.MappingDevices, chosen, req.Devices)
+		snap.reclaimOwnDevices(&req, freedOwn)
 		results[req.VMName] = BatchResult{Host: chosen, Devices: devAssign}
 		if req.Container {
 			snap.commitContainer(chosen, req.VMName, req.VMBaseName, req.MemMiBNeeded)

@@ -177,6 +177,37 @@ func TestLoadClusterState_LoadsResourceMappings(t *testing.T) {
 	}
 }
 
+// LoadClusterState keeps free devices in Devices and devices a VM holds in
+// HeldDevices, where only that VM's own update reuses them.
+func TestLoadClusterState_SplitsFreeAndHeldDevices(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "h1", Address: "10.0.0.1", State: "active", CPUTotal: 8, MemTotal: 16384}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	for _, d := range []corrosion.PCIDeviceRecord{
+		{HostName: "h1", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: -1, VMName: "hwv"},
+		{HostName: "h1", Address: "0000:42:00.0", Type: "gpu", IOMMUGroup: -1},
+	} {
+		if err := corrosion.UpsertPCIDevice(ctx, db, d); err != nil {
+			t.Fatalf("UpsertPCIDevice: %v", err)
+		}
+	}
+	state, err := LoadClusterState(ctx, db, corrosion.CapacityPolicy{})
+	if err != nil {
+		t.Fatalf("LoadClusterState: %v", err)
+	}
+	if free := state.Devices["h1"]; len(free) != 1 || free[0].Address != "0000:42:00.0" {
+		t.Errorf("Devices[h1] = %+v, want only the free 0000:42:00.0", free)
+	}
+	if held := state.HeldDevices["h1"]; len(held) != 1 || held[0].Address != "0000:41:00.0" || held[0].VMName != "hwv" {
+		t.Errorf("HeldDevices[h1] = %+v, want only hwv's 0000:41:00.0", held)
+	}
+}
+
 func findAction(t *testing.T, plan *ResolvedPlan, name string) VMAction {
 	t.Helper()
 	for _, vm := range plan.VMs {

@@ -178,6 +178,9 @@ func (s *Server) placeRecreate(ctx context.Context, in *pb.VMSpec, cur *corrosio
 	req := s.createVMPlacementRequest(ctx, spec, false)
 	if cur != nil {
 		req.Replaces = placement.VMAllocation(*cur)
+		// The teardown releases cur's PCI devices before the create re-takes
+		// them, so what cur holds is free to its own re-create.
+		req.ReuseDevicesOf = cur.Name
 		self := func(n string) bool { return n == spec.Name || n == cur.Name }
 		req.AntiAffinity = slices.DeleteFunc(slices.Clone(req.AntiAffinity), self)
 		req.Affinity = slices.DeleteFunc(slices.Clone(req.Affinity), self)

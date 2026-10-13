@@ -363,8 +363,16 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			// The update replaces what the VM holds — unless its strategy
 			// runs the new VM beside the old one until a cutover, which
 			// needs room for both.
-			if vm, ok := vmRecordByName[op.VMName]; ok && !surgesBeside(f, op, spec, storedSpecByVM[op.VMName], state) {
+			beside := surgesBeside(f, op, spec, storedSpecByVM[op.VMName], state)
+			if vm, ok := vmRecordByName[op.VMName]; ok && !beside {
 				req.Replaces = placement.VMAllocation(vm)
+			}
+			// Likewise the PCI devices it holds: an update keeps them or
+			// re-takes them, so the device it already has satisfies it.
+			// Counted as taken, a VM holding the only matching device on its
+			// host could plan no update at all.
+			if !beside {
+				req.ReuseDevicesOf = op.VMName
 			}
 		}
 		placementReqs = append(placementReqs, req)
@@ -372,7 +380,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	}
 
 	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
-	placements, err := placement.SelectBatchWithMappings(state.Hosts, state.VMs, state.Devices, state.Mappings, ctMem,
+	placements, err := placement.SelectBatchWithMappings(state.Hosts, state.VMs, devicePool(state, placementReqs), state.Mappings, ctMem,
 		state.Observations, time.Now(), placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
@@ -921,6 +929,34 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 		req.Devices = append(req.Devices, placement.DeviceRequestFor(dev))
 	}
 	return req
+}
+
+// devicePool is the PCI device pool the batch is placed against: every free
+// device, plus the devices each updated VM holds itself, which its own update
+// may reuse (Request.ReuseDevicesOf) and every other request sees as taken.
+// state is not modified.
+func devicePool(state *ClusterState, reqs []placement.Request) map[string][]corrosion.PCIDeviceRecord {
+	owners := map[string]bool{}
+	for _, r := range reqs {
+		if r.ReuseDevicesOf != "" {
+			owners[r.ReuseDevicesOf] = true
+		}
+	}
+	if len(owners) == 0 {
+		return state.Devices
+	}
+	pool := make(map[string][]corrosion.PCIDeviceRecord, len(state.Devices))
+	for h, devs := range state.Devices {
+		pool[h] = append([]corrosion.PCIDeviceRecord(nil), devs...)
+	}
+	for h, devs := range state.HeldDevices {
+		for _, d := range devs {
+			if owners[d.VMName] {
+				pool[h] = append(pool[h], d)
+			}
+		}
+	}
+	return pool
 }
 
 // vmBaseName strips a trailing "-N" replica suffix.

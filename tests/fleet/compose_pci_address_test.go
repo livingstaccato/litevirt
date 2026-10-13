@@ -135,3 +135,71 @@ func TestFleet_ComposeAddressOnlyPCIDeviceIsPlacedWhereItIs(t *testing.T) {
 		}
 	}
 }
+
+const composeOwnGPU = `name: gpus
+
+vms:
+  ml:
+    image: test
+    cpu: 1
+    memory: 512
+    devices:
+      - type: gpu
+        mapping: accel
+`
+
+// An update of a type+mapping GPU VM on a host whose only GPU it holds itself
+// is planned onto that GPU. With the VM's own device counted as taken, the
+// planner found no free GPU for the update and refused even a label change.
+func TestFleet_ComposeUpdateOfAGPUVMReusesItsOwnDevice(t *testing.T) {
+	const gpu = "0000:41:00.0"
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	defer vfio.SetFS(vfioBoundSysfs{})()
+
+	if err := corrosion.UpsertPCIDevice(ctx, node.DB, corrosion.PCIDeviceRecord{
+		HostName: node.Name, Address: gpu, VendorID: "10de", DeviceID: "2236",
+		Type: "gpu", Driver: "nvidia", IOMMUGroup: 7,
+	}); err != nil {
+		t.Fatalf("seed GPU: %v", err)
+	}
+	if err := corrosion.CreateResourceMapping(ctx, node.DB, "accel", ""); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if err := corrosion.AddMappingDevice(ctx, node.DB, "accel", node.Name, gpu, "10de", ""); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
+
+	deployClean(t, ctx, client, composeOwnGPU)
+	waitRunning(t, ctx, node, "ml")
+	owner := func() string {
+		devs, err := corrosion.ListPCIDevices(ctx, node.DB, node.Name, "")
+		if err != nil {
+			t.Fatalf("ListPCIDevices: %v", err)
+		}
+		for _, d := range devs {
+			if d.Address == gpu {
+				return d.VMName
+			}
+		}
+		return ""
+	}
+	if o := owner(); o != "ml" {
+		t.Fatalf("GPU owned by %q after the deploy, want ml", o)
+	}
+
+	labelled := edit(t, composeOwnGPU, "    devices:\n", "    labels:\n      tier: gpu\n    devices:\n")
+	before := len(node.Virt.EventLog())
+	deployClean(t, ctx, client, labelled)
+	for _, e := range node.Virt.EventLog()[before:] {
+		if e.Domain == "ml" && (e.Op == "undefine" || e.Op == "destroy") {
+			t.Errorf("a label change recreated ml: %s", e.Op)
+		}
+	}
+	if got := storedSpec(t, ctx, node, "ml").Labels["tier"]; got != "gpu" {
+		t.Errorf("label tier = %q after the update, want gpu", got)
+	}
+	if o := owner(); o != "ml" {
+		t.Errorf("GPU owned by %q after the update, want ml", o)
+	}
+}

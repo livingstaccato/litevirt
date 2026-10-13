@@ -624,7 +624,7 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 		}
 		return s.holdPITOverlay(ctx, vm, d, a)
 	default:
-		_, err := pitoverlay.CommitOffline(ctx, disk, owner)
+		_, err := pitCommitOffline(ctx, disk, owner)
 		if errors.Is(err, pitoverlay.ErrNotOurs) {
 			a, aerr := pitoverlay.AssessBounded(disk, owner, false)
 			if aerr != nil {
@@ -726,13 +726,15 @@ func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion
 	return nil
 }
 
-// pitBind, pitMarkCommitting and pitMarkPivoting are pitoverlay's, as
-// variables so a test can make them fail.
+// pitBind, pitMarkCommitting, pitMarkPivoting, pitMarkDiverged and
+// pitCommitOffline are pitoverlay's, as variables so a test can make them
+// fail or see them called.
 var (
 	pitBind           = pitoverlay.BindWindow
 	pitMarkCommitting = pitoverlay.MarkCommitting
 	pitMarkPivoting   = pitoverlay.MarkPivoting
 	pitMarkDiverged   = pitoverlay.MarkDiverged
+	pitCommitOffline  = pitoverlay.CommitOffline
 )
 
 // The health condition of a disk held on its overlay: one per disk, subject

@@ -1,8 +1,10 @@
 package grpcapi
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,4 +79,46 @@ func TestStart_AVMWhoseOverlayAssessmentDoesNotAnswerIsRefused(t *testing.T) {
 		_, err := f.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "nvm", Force: true})
 		return err
 	})
+}
+
+// Re-review m-3: the same with the pit_overlay feature open and no domain,
+// the branch that commits the overlay (CommitOffline, which reads and writes
+// the pool unbounded). The bounded judgement before it refuses the start;
+// the commit is never reached.
+//
+// Mutation: drop only the pre-read ahead of the feature gate — the commit
+// is reached and hangs: red.
+func TestStart_AnOverlayIsNotCommittedWhenItsJudgementDoesNotAnswer(t *testing.T) {
+	f, mnt, disk := deadPoolVM(t)
+	f.s.SetReleaseFeatureGate(&pitFeatureGate{available: true, t: t})
+	if open, _ := f.s.PITOverlayFeature(); !open {
+		t.Fatal("setup: the pit_overlay feature is not open")
+	}
+	if err := os.WriteFile(pitoverlay.Path(disk), []byte("overlay"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(pitoverlay.SetAssessForTest(func(d string, o pitoverlay.Owner, live bool) pitoverlay.Assessment {
+		if pathWithin(mnt, d) {
+			<-release
+		}
+		return pitoverlay.Assess(d, o, live)
+	}))
+	var committed atomic.Bool
+	prev := pitCommitOffline
+	pitCommitOffline = func(ctx context.Context, d string, o pitoverlay.Owner) (bool, error) {
+		committed.Store(true)
+		<-release // as on a server that does not answer
+		return prev(ctx, d, o)
+	}
+	t.Cleanup(func() { pitCommitOffline = prev })
+	t.Cleanup(func() { close(release) })
+	err := within(t, 10*time.Second, "a start of a VM with an overlay on the dead pool, feature open", func() error {
+		_, err := f.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "nvm"})
+		return err
+	})
+	wantNoAnswer(t, "start", err)
+	if committed.Load() {
+		t.Fatal("the overlay's commit was reached on storage that did not answer its judgement")
+	}
 }

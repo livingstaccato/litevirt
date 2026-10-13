@@ -907,6 +907,13 @@ named by `netbox.cluster_name` (or the local cluster name when that is unset).
 Hosts inventoried by a bare-metal provisioner typically carry no cluster at all,
 which is why the unlinked shape is the default rather than an error.
 
+**DCIM is read for that link and nothing else, by design.** The scheduler never
+reads NetBox sites, racks, power feeds or cables, and litevirt does not model
+physical topology. Placement depends only on cluster state, so a NetBox outage
+or an incomplete DCIM model can never stop a VM from being placed or recovered.
+Express rack or site constraints with host labels (`lv host label set`) and
+the placement rules in [placement.md](placement.md).
+
 Templates are never mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
 deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.
 

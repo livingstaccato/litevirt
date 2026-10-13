@@ -10,6 +10,13 @@ swapped without touching call sites.
 metrics there avoids a duplicate metrics system. `obs` handles logs + traces
 only.
 
+**Push exporters and a log store are non-goals.** litevirt does not push metrics
+to InfluxDB, Graphite or any other time-series database, and it does not ship a
+log analytics product. Prometheus pull and OTLP push are the two integration
+points: anything that scrapes Prometheus (Telegraf, Grafana Agent, a Prometheus
+with `remote_write`) can forward metrics anywhere, and logs and traces land in
+whatever collector you point OTLP at.
+
 | Signal | System | Protocol | Endpoint |
 |---|---|---|---|
 | Metrics | Prometheus (`internal/metrics`) | pull | `:7444/metrics` — **no auth, no TLS**, binds all interfaces by default ([exposure](configuration.md#metrics-endpoint-exposure)) |

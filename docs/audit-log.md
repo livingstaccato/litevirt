@@ -108,12 +108,37 @@ lv audit ls --target /projects/acme --action vm.start
 
 `--target` matches the exact target path; `--action` matches an action,
 with a trailing `*` acting as a prefix glob; `--user` filters by
-username; `--since` takes an RFC3339 timestamp (entries at/after it).
+username; `--since` keeps entries at or after a time (see [Time
+bounds](#time-bounds)).
 
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
 - What did `alice` do today? — `lv audit ls --user alice --limit 200`
 - What touched the firewall recently? — `lv audit ls --action 'sg.*' --since 2026-06-01T00:00:00Z`
+
+### Time bounds
+
+`--since` on `lv audit ls` and `lv events <vm>`, and `--since` / `--until` on
+`lv audit export`, are read as times and compared as instants. Each takes:
+
+- an RFC3339 timestamp, with or without a fraction, in UTC or with an offset:
+  `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`, `2026-10-03T22:16:30.5Z`;
+- the same without a zone, or with a space for the `T`, read as UTC;
+- a minute, date, month or year: `2026-10-03T22:16`, `2026-10-03`, `2026-10`,
+  `2026`;
+- a duration, meaning that long ago: `90m`, `24h`.
+
+A bound covers the whole unit it names: `--since` starts at the beginning of it
+and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
+and `--since 2026-10-03T22:16:30Z` includes a row stamped
+`22:16:30.767241380Z`. Anything else is refused with `InvalidArgument` and a
+message naming the bound.
+
+Before this, the bound was compared to the stored stamp as text. The stamps are
+fixed-width UTC with nine fractional digits, and `.` sorts below `Z`, so
+`--since` with a whole second dropped every row inside that second. An offset
+bound was wrong by the offset, and `--since 24h` sorted below every stamp and
+matched every row.
 
 ## Verifying
 
@@ -135,8 +160,20 @@ It does **not** stop at the first problem. One broken id says nothing about
 whether the rest of the log was rewritten too, so every finding is printed,
 grouped by what it means:
 
-- **hash mismatch** — a row was edited, or a row before it was deleted, or a
-  migration replayed the table without rebuilding hashes (operator error).
+- **hash mismatch** — a row was edited, or a migration replayed the table
+  without rebuilding hashes (operator error). The row does not hash to its
+  stored `content_hash` even against its own stored `prev_hash`.
+- **forked chain** — the row hashes correctly against its own stored
+  `prev_hash`, but that `prev_hash` is empty: the row opens a second chain for a
+  host that already has one. Expect duplicate seqs for the same host under
+  **sequence break**. No row was edited, but it is still a finding, and
+  `verify` still exits non-zero.
+- **broken link** — the row hashes correctly against its own stored
+  `prev_hash`, but that is not the hash of the row before it. A row between them
+  was deleted or rewritten, or the chain branched.
+
+  Only the first broken link is named, under whichever of these three headings
+  fits it. A daemon too old to classify the break is shown as a hash mismatch.
 - **bad signature** — the row was edited by someone without the authoring
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
@@ -460,7 +497,8 @@ lv audit export --since 2026-06-01T00:00:00Z --until 2026-06-30T23:59:59Z --out 
 `export` emits a JSON document suitable for write-once-read-many
 offload (S3 Object Lock, immutable filesystem snapshot, tape archive).
 `--out <file>` writes the JSON to a file (default stdout); `--since` /
-`--until` bound the export window (both RFC3339, inclusive).
+`--until` bound the export window (both inclusive; every form in [Time
+bounds](#time-bounds) works).
 The export includes every `audit_log` chain field — `seq`, `key_id` and
 `signature` among them — ordered the same way `verify` walks, so an external
 system can recompute each host's hash chain in the right order without

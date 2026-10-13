@@ -204,3 +204,41 @@ func TestAuditVerifyAmbiguousRowsFailWithoutClaimingTampering(t *testing.T) {
 		t.Errorf("a named finding fell through to the unspecified message: %q", got)
 	}
 }
+
+// The first broken link is named for what it is. A forked chain — a second
+// chain opened at seq 1 with an empty prev_hash under a host name that already
+// had one — hashes correctly and is not an edit; printing it under "row content
+// does not match its recorded hash" sent the lab 1 investigation looking for
+// tampering that had not happened. It still fails the command.
+func TestAuditVerifyNamesTheKindOfBreak(t *testing.T) {
+	const contentLabel = "row content does not match its recorded hash"
+	for _, tc := range []struct {
+		kind      string
+		want      string
+		notWanted string
+	}{
+		{"forked", "forked chain", contentLabel},
+		{"unlinked", "does not link to the row before it", contentLabel},
+		{"content", contentLabel, "forked chain"},
+		// A daemon older than broken_at_kind sends none; its only label was the
+		// content one, and that is what an empty kind still prints.
+		{"", contentLabel, "forked chain"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			var out strings.Builder
+			err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+				RowsChecked: 12, BrokenAtId: "b9fbdd30", BrokenAtKind: tc.kind, Tampered: true,
+			})
+			if err == nil {
+				t.Fatal("a broken link must still exit non-zero")
+			}
+			got := out.String()
+			if !strings.Contains(got, tc.want) || !strings.Contains(got, "b9fbdd30") {
+				t.Errorf("kind %q: output lacks %q or the row id:\n%s", tc.kind, tc.want, got)
+			}
+			if strings.Contains(got, tc.notWanted) {
+				t.Errorf("kind %q: output says %q:\n%s", tc.kind, tc.notWanted, got)
+			}
+		})
+	}
+}

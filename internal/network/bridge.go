@@ -1,7 +1,9 @@
 package network
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -61,6 +63,63 @@ func BridgeHasUplink(bridge string) bool {
 
 // EnsureBridge idempotently creates a Linux bridge and brings it up.
 // If the bridge already exists, this is a no-op.
+// createdBridgeDir records the bridges EnsureBridge created on this host: one
+// empty file per bridge, named after it. It is how Deprovision tells a bridge
+// litevirt made (removed with its network) from an operator's bridge litevirt
+// found already there (never removed). It lives under /run on purpose: a
+// bridge made with `ip link add` does not survive a reboot, and neither does
+// its record. A bridge made by a build that kept no record has none, and stays
+// as it did before. A variable only so a test can point it at a temp dir.
+var createdBridgeDir = "/run/litevirt/bridges"
+
+func createdBridgeRecord(name string) string { return filepath.Join(createdBridgeDir, name) }
+
+// recordCreatedBridge notes that EnsureBridge created bridge name. Best
+// effort: without the record the bridge outlives its network, which is what
+// every bridge did before the record existed.
+func recordCreatedBridge(name string) {
+	err := os.MkdirAll(createdBridgeDir, 0o755)
+	if err == nil {
+		err = os.WriteFile(createdBridgeRecord(name), nil, 0o644)
+	}
+	if err != nil {
+		slog.Warn("could not record a bridge litevirt created; it will outlive its network",
+			"bridge", name, "error", err)
+	}
+}
+
+// RemoveCreatedBridgeIfUnused deletes bridge name when EnsureBridge created
+// it on this host and RemoveBridgeIfUnused finds it unused (a bridge with no
+// ports and no address). It reports whether it removed it. A bridge with no
+// record — an operator's, or one an older build made — is left alone. The
+// record goes with the bridge, and with a bridge that is already gone; a
+// bridge kept because something is on it keeps its record, so a later
+// teardown can still remove it.
+func RemoveCreatedBridgeIfUnused(name string) (bool, error) {
+	if validLinkName(name) != nil {
+		return false, nil // no interface can carry it, so no record names one
+	}
+	rec := createdBridgeRecord(name)
+	if _, err := os.Stat(rec); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := os.Stat(filepath.Join(sysClassNet, name)); errors.Is(err, fs.ErrNotExist) {
+		_ = os.Remove(rec) // the bridge is gone already
+		return false, nil
+	}
+	removed, err := RemoveBridgeIfUnused(name)
+	if err != nil || !removed {
+		return false, err
+	}
+	if err := os.Remove(rec); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("removed a bridge litevirt created but not its record", "bridge", name, "error", err)
+	}
+	return true, nil
+}
+
 func EnsureBridge(name string) error {
 	if len(name) > 15 {
 		return fmt.Errorf("create bridge %s: interface name exceeds 15-character Linux limit (%d chars)", name, len(name))
@@ -73,6 +132,11 @@ func EnsureBridge(name string) error {
 	out, err := execCommand("ip", "link", "add", name, "type", "bridge")
 	if err != nil && !isFileExists(out) {
 		return fmt.Errorf("create bridge %s: %w: %s", name, err, out)
+	}
+	if err == nil {
+		// This call made it. "File exists" means someone else did between
+		// the check above and the add, and that bridge is not ours to remove.
+		recordCreatedBridge(name)
 	}
 
 	out, err = execCommand("ip", "link", "set", name, "up")

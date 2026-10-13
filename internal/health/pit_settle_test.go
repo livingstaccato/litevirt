@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestSettlePITOverlays_ClearsOnlyADiskThisHostSees(t *testing.T) {
 	if err := os.WriteFile(seen, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	failure := r.settlePITOverlays(context.Background(), corrosion.VMRecord{Name: "web"}, &pb.VMSpec{}, []lv.DiskConfig{
+	failure, _ := r.settlePITOverlays(context.Background(), corrosion.VMRecord{Name: "web"}, &pb.VMSpec{}, []lv.DiskConfig{
 		{Name: "root", Path: seen},
 		{Name: "data", Path: "/nonexistent-pool-not-mounted-here/web-data.qcow2"},
 	})
@@ -69,14 +70,19 @@ func TestSettlePITOverlays_AStorageThatDoesNotAnswerIsAFailureNotNoOverlay(t *te
 		return os.Lstat(p)
 	}))
 	t.Cleanup(func() { close(release) })
-	done := make(chan string, 1)
+	type res struct {
+		failure  string
+		deferred error
+	}
+	done := make(chan res, 1)
 	go func() {
-		done <- r.settlePITOverlays(context.Background(), corrosion.VMRecord{Name: "web"}, &pb.VMSpec{}, []lv.DiskConfig{{Name: "root", Path: disk}})
+		f, d := r.settlePITOverlays(context.Background(), corrosion.VMRecord{Name: "web"}, &pb.VMSpec{}, []lv.DiskConfig{{Name: "root", Path: disk}})
+		done <- res{f, d}
 	}()
 	select {
-	case failure := <-done:
-		if !strings.Contains(failure, "does not answer") {
-			t.Fatalf("settle on storage that does not answer: %q; want a failure saying so", failure)
+	case got := <-done:
+		if !strings.Contains(got.failure, "does not answer") || !errors.Is(got.deferred, ErrStartDeferred) {
+			t.Fatalf("settle on storage that does not answer: %q, %v; want a deferral saying so", got.failure, got.deferred)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the reconciler's overlay settle waited on storage that does not answer")

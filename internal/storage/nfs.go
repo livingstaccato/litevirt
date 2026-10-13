@@ -434,6 +434,30 @@ func CheckNFSMountHardened(dataDir string, cfg Config) error {
 // many times (one per pool row).
 type MountTable struct{ all []mountEntry }
 
+type mountTableKey struct{}
+
+// WithMountTable returns ctx carrying the mount table read now, which
+// MountSnapshot hands the checks of one operation, so its bounded calls judge
+// every path against one read instead of a read each. ctx already carrying
+// one, or a mount table that cannot be read, returns ctx as it is.
+func WithMountTable(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(mountTableKey{}).(MountTable); ok {
+		return ctx
+	}
+	t, err := ReadMountTable()
+	if err != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, mountTableKey{}, t)
+}
+
+// MountSnapshot is the mount table ctx carries (WithMountTable), or an empty
+// one, which every MountTable check reads when it needs it.
+func MountSnapshot(ctx context.Context) MountTable {
+	t, _ := ctx.Value(mountTableKey{}).(MountTable)
+	return t
+}
+
 // ReadMountTable reads the mount table.
 func ReadMountTable() (MountTable, error) {
 	all, err := mounts()
@@ -504,9 +528,18 @@ func (t MountTable) NFSBackingOf(dir string) (*NFSBacking, error) {
 // binary, a device node, an executable or a symlink followed as root. The
 // refusal names the mount point and the options it lacks, never the export.
 func CheckNFSBackingHardened(dir string) error {
-	t, err := ReadMountTable()
-	if err != nil {
-		return err
+	return MountTable{}.CheckNFSBackingHardened(dir)
+}
+
+// CheckNFSBackingHardened is CheckNFSBackingHardened against this table (an
+// empty one is read now).
+func (t MountTable) CheckNFSBackingHardened(dir string) error {
+	if t.Empty() {
+		mt, err := ReadMountTable()
+		if err != nil {
+			return err
+		}
+		t = mt
 	}
 	b, err := t.NFSBackingOf(dir)
 	if err != nil || b == nil {

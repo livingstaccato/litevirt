@@ -83,13 +83,13 @@ func (t MountTable) SharedStoreOfErr(dir string) (SharedStore, error) {
 			continue
 		}
 		var serr error
-		if out, serr = sharedStoreOfMount(under, rel, dir); serr != nil {
+		if out, serr = sharedStoreOfMount(&t, under, rel, dir); serr != nil {
 			return SharedStore{Shared: true}, serr
 		}
 	}
 	if !out.Shared {
 		info := statfsInfo.get()
-		magic, err := Bounded("statfs (magic)", dir, func() (uint32, error) {
+		magic, err := boundedIn(&t, "statfs (magic)", dir, func() (uint32, error) {
 			m, _, err := info(dir)
 			return m, err
 		})
@@ -105,12 +105,12 @@ func (t MountTable) SharedStoreOfErr(dir string) (SharedStore, error) {
 
 // sharedStoreOfMount is the store of the path rel below mount e. A CephFS
 // statfs that does not answer is an error.
-func sharedStoreOfMount(e mountEntry, rel, dir string) (SharedStore, error) {
+func sharedStoreOfMount(t *MountTable, e mountEntry, rel, dir string) (SharedStore, error) {
 	if e.fstype == "ceph" {
 		// The kernel client's f_fsid folds the cluster's fsid with the
 		// filesystem's id within it: the same on every client.
 		info := statfsInfo.get()
-		fsid, err := Bounded("statfs (fsid)", dir, func() (string, error) {
+		fsid, err := boundedIn(t, "statfs (fsid)", dir, func() (string, error) {
 			_, id, err := info(dir)
 			return id, err
 		})

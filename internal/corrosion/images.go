@@ -43,18 +43,18 @@ func imageInsert(c *Client, img ImageRecord) Statement {
 
 // InsertImage creates or replaces an image record WITHOUT reviving a deleted
 // one: a peer that holds the name's tombstone keeps it, and anti-entropy then
-// takes it back to this host's row, so a delete wins. Every write that is not
-// an operator's import is this one — a peer's push, an auto-pull or heal, a
-// pull, a build — so a copy that finishes after lv image rm never brings the
-// image back (review round 1, I-1). The caller refuses outright when the row
-// already reads deleted here (grpcapi Server.recordImage).
+// takes it back to this host's row, so a delete wins. A copy from a peer — a
+// push, an auto-pull or heal — writes this one, so a copy that finishes after
+// lv image rm never brings the image back (review round 1, I-1). The caller
+// refuses outright when the row already reads deleted here (grpcapi
+// Server.recordImage).
 func InsertImage(ctx context.Context, c *Client, img ImageRecord) error {
 	return c.ExecuteBatch(ctx, []Statement{imageInsert(c, img)})
 }
 
 // ReviveImage is InsertImage that also makes the image live on every host, a
-// deleted image's name included (lab 2 F-1): an operator's import under that
-// name. The insert alone leaves each peer's tombstone in place (see
+// deleted image's name included (lab 2 F-1): an operator's import, pull,
+// build or compose download under that name. The insert alone leaves each peer's tombstone in place (see
 // imageInsertSQL); anti-entropy then took the tombstone back to this host's
 // row, the image left `lv image ls` everywhere, and a prune removed its
 // current file as a deleted image's.

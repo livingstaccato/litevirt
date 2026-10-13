@@ -2144,9 +2144,8 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		// of the image is removed as a deleted image's (holdImagePublish).
 		release := s.holdImagePublish(img)
 		defer release()
-		// A compose download never brings a deleted name back (only lv
-		// image import does), and one whose row is deleted while it runs
-		// records nothing.
+		// A compose download brings a deleted name back, as an import does;
+		// one whose row is deleted while it runs records nothing.
 		startDeleted, err := s.imageOpStart(ctx, img, imageOpCompose)
 		if err != nil {
 			return err

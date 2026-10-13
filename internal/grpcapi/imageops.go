@@ -471,8 +471,8 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		return client.BuildImage(ctx, req)
 	}
 
-	// A build never brings a deleted name back (only lv image import does),
-	// and one whose row is deleted while it runs records nothing.
+	// A build brings a deleted name back, as an import does; one whose row
+	// is deleted while it runs records nothing.
 	startDeleted, err := s.imageOpStart(ctx, req.ImageName, imageOpBuild)
 	if err != nil {
 		return nil, err

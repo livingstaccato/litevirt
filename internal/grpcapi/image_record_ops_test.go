@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -39,10 +40,10 @@ func rowDeleted(t *testing.T, s *Server, name string) bool {
 	return d != ""
 }
 
-// lv image build (review round 1, I-1): a build whose row is deleted while it
-// runs records nothing, and a build under a deleted name is refused before it
-// reads the VM's disk.
-func TestBuildImage_NeverRevivesADeletedName(t *testing.T) {
+// lv image build (review round 2): a build whose row is deleted while it runs
+// records nothing (Aborted), and a build under a deleted name brings it back,
+// as on main.
+func TestBuildImage_RevivesADeletedNameUnlessDeletedWhileItRan(t *testing.T) {
 	s := pruneServer(t)
 	noSeams(s)
 	src, err := s.images.CreateEmptyDisk("vm1", "root", "1M")
@@ -65,20 +66,25 @@ func TestBuildImage_NeverRevivesADeletedName(t *testing.T) {
 		t.Fatalf("a build lv image rm landed in: %v, want Aborted", err)
 	}
 	if !rowDeleted(t, s, "golden") {
-		t.Fatal("the build brought the deleted image back")
+		t.Fatal("a build lv image rm landed in brought the image back")
 	}
 	s.SetImageRecordHookForTest(nil)
-	if err := build(); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a build under a deleted name: %v, want FailedPrecondition", err)
+	before := streamLen(t, s)
+	if err := build(); err != nil {
+		t.Fatalf("a build under a deleted name: %v, want it to bring the image back", err)
 	}
-	if !rowDeleted(t, s, "golden") {
-		t.Fatal("a build under a deleted name brought it back")
+	if rowDeleted(t, s, "golden") {
+		t.Fatal("a build under a deleted name left it deleted")
+	}
+	if !streamHas(t, s, before, reviveStmt) {
+		t.Fatal("a build under a deleted name revived it here only: the catalog revive is not on the stream")
 	}
 }
 
-// A compose deploy's download (review round 1, I-1): one whose row is deleted
-// while it downloads records nothing, and a deleted name is not downloaded.
-func TestAutoPullImages_NeverRevivesADeletedName(t *testing.T) {
+// A compose deploy's download (review round 2): one whose row is deleted
+// while it downloads records nothing (Aborted), and a deploy naming a deleted
+// image downloads it and brings it back, as on main.
+func TestAutoPullImages_RevivesADeletedNameUnlessDeletedWhileItRan(t *testing.T) {
 	var hits atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -104,20 +110,39 @@ func TestAutoPullImages_NeverRevivesADeletedName(t *testing.T) {
 		t.Fatalf("a compose download lv image rm landed in: %v, want Aborted", err)
 	}
 	if !rowDeleted(t, s, "myimg") {
-		t.Fatal("the compose download brought the deleted image back")
+		t.Fatal("a compose download lv image rm landed in brought the image back")
 	}
 	s.SetImageRecordHookForTest(nil)
 	if err := s.images.RemoveDeletedImageFile("myimg", s.images.ImagePath("myimg")); err != nil {
 		t.Fatal(err)
 	}
-	before := hits.Load()
-	if err := s.autoPullImages(ctx, f, &mockDeployStream{ctx: ctx}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a compose download of a deleted name: %v, want FailedPrecondition", err)
+	before, hitsBefore := streamLen(t, s), hits.Load()
+	if err := s.autoPullImages(ctx, f, &mockDeployStream{ctx: ctx}); err != nil {
+		t.Fatalf("a compose deploy naming a deleted image: %v, want it downloaded and brought back", err)
 	}
-	if hits.Load() != before {
-		t.Error("a compose deploy downloaded a deleted name")
+	if hits.Load() == hitsBefore {
+		t.Fatal("a compose deploy naming a deleted image did not download it")
 	}
-	if !rowDeleted(t, s, "myimg") {
-		t.Fatal("a compose download of a deleted name brought it back")
+	if rowDeleted(t, s, "myimg") {
+		t.Fatal("a compose download under a deleted name left it deleted")
 	}
+	if !streamHas(t, s, before, reviveStmt) {
+		t.Fatal("a compose download under a deleted name revived it here only: the catalog revive is not on the stream")
+	}
+}
+
+// streamHas reports whether an entry this node put on its stream after the
+// first `after` entries contains stmt.
+func streamHas(t *testing.T, s *Server, after int, stmt string) bool {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(), `SELECT stmts FROM mutation_log ORDER BY seq LIMIT -1 OFFSET ?`, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if strings.Contains(r.String("stmts"), stmt) {
+			return true
+		}
+	}
+	return false
 }

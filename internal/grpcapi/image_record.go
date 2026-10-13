@@ -16,25 +16,30 @@ import (
 type imageOp string
 
 const (
-	// imageOpImport is lv image import by an operator: the one operation that
-	// may bring a deleted image's name back (lab 2 F-1).
+	// imageOpImport is lv image import.
 	imageOpImport imageOp = "import"
 	// imageOpCopy is a peer's push into this host: lv image push, an
 	// auto-pull for a VM create, the reconciler's heal (both autoPullImage).
 	imageOpCopy imageOp = "copy from a peer"
 	// imageOpPull is lv image pull.
 	imageOpPull imageOp = "pull"
-	// imageOpBuild is lv image build.
+	// imageOpBuild is lv image build (forwarded to the VM's host as the
+	// operator's own request).
 	imageOpBuild imageOp = "build"
 	// imageOpCompose is a compose deploy's download of an image it names.
 	imageOpCompose imageOp = "compose download"
 )
 
-// revives reports whether op may revive a deleted image's catalog row. Only
-// an operator's import does (review round 1, I-1): a copy, pull or build that
-// finishes after lv image rm must never undo the delete — an image is removed
-// for a reason, a vulnerable base among them.
-func (o imageOp) revives() bool { return o == imageOpImport }
+// revives reports whether op may revive a deleted image's catalog row: every
+// operation an operator asks for — lv image import, pull, build, a compose
+// deploy's download — does, as each did on main (review round 2, which
+// corrects round 1's I-1). Nothing calls them on its own: the CLI, the web
+// UI and the REST API do, and a build forwarded to the VM's host is still the
+// operator's request. A copy from a peer never does (review round 1, I-1):
+// lv image push, a VM create's auto-pull and the reconciler's heal are the
+// cluster moving bytes, not an operator asking for the image, so one that
+// finishes after lv image rm must not undo the delete.
+func (o imageOp) revives() bool { return o != imageOpCopy }
 
 // imageCopyMDKey marks an ImportImage stream as a peer's copy (PushImage):
 // lv image push, an auto-pull, a heal. Its absence does not make a bare peer
@@ -54,9 +59,9 @@ func isImageCopy(ctx context.Context) bool {
 }
 
 // imageOpStart reads, as op begins, image name's catalog row: its deleted_at
-// ("" when live or absent), which recordImage compares against at the end. An
-// op that may not revive refuses a name that already reads deleted here, so
-// nothing is downloaded or built for it.
+// ("" when live or absent), which recordImage compares against at the end. A
+// copy from a peer refuses a name that already reads deleted here, so nothing
+// is streamed for it.
 func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (string, error) {
 	d, err := corrosion.ImageDeletedAt(ctx, s.db, name)
 	if err != nil {
@@ -64,7 +69,7 @@ func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (str
 	}
 	if d != "" && !op.revives() {
 		return d, status.Errorf(codes.FailedPrecondition,
-			"image %q was deleted (lv image rm, at %s): a %s does not bring it back; lv image import <file> --name %s does",
+			"image %q was deleted (lv image rm, at %s): a %s does not bring it back; lv image import, pull or build of %s does",
 			name, d, op, name)
 	}
 	return d, nil
@@ -77,12 +82,12 @@ func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (str
 //   - A row deleted since op began (lv image rm while it ran, here or applied
 //     from a peer) records nothing: Aborted. The copy is left for lv image
 //     prune.
-//   - A row that reads deleted refuses every op but an operator's import:
+//   - A row that reads deleted refuses a copy from a peer:
 //     FailedPrecondition.
-//   - An operator's import writes the reviving catalog row
-//     (corrosion.ReviveImage); every other op the plain one, so a delete this
-//     host has not applied yet still wins everywhere through LWW and
-//     anti-entropy.
+//   - An operator's operation (import, pull, build, compose download) writes
+//     the reviving catalog row (corrosion.ReviveImage); a copy the plain one,
+//     so a delete this host has not applied yet still wins everywhere through
+//     LWW and anti-entropy.
 func (s *Server) recordImage(ctx context.Context, op imageOp, startDeleted string, img corrosion.ImageRecord, ih corrosion.ImageHostRecord) error {
 	if hook := s.imagePrune.recordHook.Load(); hook != nil {
 		(*hook)(img.Name)
@@ -98,7 +103,7 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, startDeleted strin
 			img.Name, now, op)
 	case now != "" && !op.revives():
 		return status.Errorf(codes.FailedPrecondition,
-			"image %q was deleted (lv image rm, at %s): a %s does not bring it back; lv image import <file> --name %s does",
+			"image %q was deleted (lv image rm, at %s): a %s does not bring it back; lv image import, pull or build of %s does",
 			img.Name, now, op, img.Name)
 	}
 	write := corrosion.InsertImage
@@ -140,7 +145,7 @@ func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostReco
 		return corrosion.ReviveImageHost(ctx, s.db, ih)
 	}
 	if reviving {
-		slog.Warn("image: this host's copy of an image imported again under a deleted image's name is recorded, "+
+		slog.Warn("image: this host's copy of an image imported, pulled or built again under a deleted image's name is recorded, "+
 			"but the record reads deleted on the other hosts, and on this one once anti-entropy runs, until the cluster "+
 			"upgrade finishes (lv cluster upgrade-status): no peer pulls the copy and placement does not see it; "+
 			"import it again after the upgrade",

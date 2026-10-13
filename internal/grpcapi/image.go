@@ -64,8 +64,8 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			release()
 		}
 	}()
-	// A pull never brings a deleted name back (only lv image import does),
-	// and one whose row is deleted while it runs records nothing.
+	// A pull brings a deleted name back, as an import does; one whose row
+	// is deleted while it runs records nothing.
 	startDeleted, err := s.imageOpStart(stream.Context(), req.Name, imageOpPull)
 	if err != nil {
 		return err

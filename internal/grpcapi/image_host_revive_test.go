@@ -85,17 +85,18 @@ func TestRecordImageHost_LatchedAlwaysRevives(t *testing.T) {
 
 const reviveStmt = "UPDATE images SET deleted_at = ?"
 
-// Only an operator's import writes the catalog revive (review round 1, I-1):
-// a copy from a peer (push, auto-pull, heal), a pull, a build and a compose
-// download write the plain insert, refuse a name that reads deleted, and
-// record nothing when the row was deleted while they ran. An import revives a
-// name that read deleted as it began, and records nothing when it was deleted
-// again while it ran.
-func TestRecordImage_OnlyAnOperatorImportRevives(t *testing.T) {
+// Every operation an operator asks for — import, pull, build, a compose
+// download — writes the catalog revive and brings back a name that read
+// deleted as it began (review round 2). A copy from a peer (push, auto-pull,
+// heal) writes the plain insert and refuses a name that reads deleted (round
+// 1, I-1). Every operation records nothing when its row was deleted while it
+// ran.
+func TestRecordImage_OnlyACopyFromAPeerNeverRevives(t *testing.T) {
 	ctx := context.Background()
 	img := corrosion.ImageRecord{Name: "imgr", Format: "qcow2", Checksum: "sha256:ab"}
 	for _, op := range []imageOp{imageOpImport, imageOpCopy, imageOpPull, imageOpBuild, imageOpCompose} {
 		t.Run(string(op), func(t *testing.T) {
+			revives := op != imageOpCopy // stated here, not read from op.revives()
 			s := testServer(t)
 			ih := testImageHost(s)
 
@@ -108,8 +109,8 @@ func TestRecordImage_OnlyAnOperatorImportRevives(t *testing.T) {
 			if !strings.Contains(catalog, "INSERT OR REPLACE INTO images") {
 				t.Fatalf("the catalog write is not the images insert: %s", catalog)
 			}
-			if got := strings.Contains(catalog, reviveStmt); got != op.revives() {
-				t.Fatalf("%s wrote the catalog revive=%v, want %v: %s", op, got, op.revives(), catalog)
+			if got := strings.Contains(catalog, reviveStmt); got != revives {
+				t.Fatalf("%s wrote the catalog revive=%v, want %v: %s", op, got, revives, catalog)
 			}
 
 			// lv image rm while the operation ran: nothing recorded.
@@ -127,7 +128,7 @@ func TestRecordImage_OnlyAnOperatorImportRevives(t *testing.T) {
 
 			// The row read deleted as the operation began.
 			deletedAt, err := s.imageOpStart(ctx, "imgr", op)
-			if !op.revives() {
+			if !revives {
 				if status.Code(err) != codes.FailedPrecondition {
 					t.Fatalf("%s of a deleted name began: %v, want FailedPrecondition", op, err)
 				}
@@ -140,13 +141,13 @@ func TestRecordImage_OnlyAnOperatorImportRevives(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("an import of a deleted name refused to begin: %v", err)
+				t.Fatalf("%s of a deleted name refused to begin: %v", op, err)
 			}
 			if err := s.recordImage(ctx, op, deletedAt, img, ih); err != nil {
-				t.Fatalf("an import of a deleted name: %v", err)
+				t.Fatalf("%s of a deleted name: %v", op, err)
 			}
 			if d, _ := corrosion.ImageDeletedAt(ctx, s.db, "imgr"); d != "" {
-				t.Fatalf("the import left the row deleted (%s)", d)
+				t.Fatalf("%s left the row deleted (%s)", op, d)
 			}
 		})
 	}

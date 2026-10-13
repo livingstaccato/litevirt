@@ -23,10 +23,11 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
-// Review round 1 of the F-1 fix. Only an operator's import may bring a deleted
-// image's name back: a copy, auto-pull or heal, a pull, or a build that
-// finishes after lv image rm never does, and one whose row is deleted while it
-// runs records nothing (I-1). Once the release token has latched, an import
+// Review rounds 1 and 2 of the F-1 fix. Only an operator's own request — lv
+// image import, pull, build, a compose download — may bring a deleted image's
+// name back; a copy from a peer (lv image push, an auto-pull or heal) never
+// does, and any operation whose row is deleted while it runs records nothing
+// (I-1, as round 2 corrected it). Once the release token has latched, an import
 // on a host the delete has not reached yet is listed on every host (I-2). A
 // deleted image's file published within the clock-skew margin of the delete
 // is kept (I-3).
@@ -167,8 +168,8 @@ func TestFleet_ImageRm_DuringAnAutoPullOrHealKeepsTheImageDeleted(t *testing.T) 
 }
 
 // lv image pull: one whose row is deleted while it downloads records nothing,
-// and a pull of a deleted name is refused before anything is downloaded.
-func TestFleet_ImageRm_DuringAPullKeepsTheImageDeleted(t *testing.T) {
+// and a pull of a deleted name brings it back on every host, as on main.
+func TestFleet_ImageRm_DuringAPullKeepsTheImageDeletedAndAPullAfterRevives(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "img.qcow2")
 	if err := qcow2.Create(src, 64<<20, nil); err != nil {
 		t.Fatal(err)
@@ -214,14 +215,26 @@ func TestFleet_ImageRm_DuringAPullKeepsTheImageDeleted(t *testing.T) {
 	})
 	deletedEverywhere(t, c, "imgp")
 
+	n0.Server.SetImageRecordHookForTest(nil)
 	before := hits.Load()
-	if err := pull(); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a pull of a deleted name: %v, want FailedPrecondition", err)
+	if err := pull(); err != nil {
+		t.Fatalf("a pull of a deleted name: %v, want it to bring the image back", err)
 	}
-	if hits.Load() != before {
-		t.Error("a pull of a deleted name downloaded it")
+	if hits.Load() == before {
+		t.Fatal("a pull of a deleted name did not download it")
 	}
-	deletedEverywhere(t, c, "imgp")
+	eventually(t, convergeTimeout, "the pull to record its copy", func() bool {
+		hosts, err := n0.DB.Query(context.Background(), `SELECT status FROM image_hosts WHERE image_name = 'imgp' AND host_name = ?`, n0.Name)
+		return err == nil && len(hosts) == 1 && hosts[0].String("status") == "ready"
+	})
+	antiEntropyEverywhere(t, c)
+	c.WaitConverged(t, convergeTimeout)
+	antiEntropyEverywhere(t, c)
+	for _, n := range c.Nodes {
+		if img := listedImage(t, c, n, "imgp"); img == nil {
+			t.Errorf("%s does not list imgp after a pull brought it back", n.Name)
+		}
+	}
 }
 
 // I-2: with the release token latched, an operator re-imports on node-0

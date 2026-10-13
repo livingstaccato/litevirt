@@ -105,7 +105,18 @@ func withReplacedRow(ctx context.Context, vm *corrosion.VMRecord) context.Contex
 	if vm == nil || vm.Name == "" || vm.CreatedAt == "" {
 		return ctx
 	}
-	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: vm.Name, snap: corrosion.SnapshotForDelete(*vm), rowOnly: true})
+	return withReplacedRowSnapshot(ctx, vm.Name, corrosion.SnapshotForDelete(*vm))
+}
+
+// withReplacedRowSnapshot is withReplacedRow for the row as snap describes
+// it: the one the deleting host reported it tombstoned (deletedVMSink), which
+// the entry's own copy may be behind (a resize or a migration not yet
+// replicated here).
+func withReplacedRowSnapshot(ctx context.Context, name string, snap corrosion.VMDeleteSnapshot) context.Context {
+	if name == "" || snap.CreatedAt == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: name, snap: snap, rowOnly: true})
 }
 
 // replacedVMFor returns the replaced VM ctx carries when it is named name,
@@ -149,8 +160,8 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 // isRecreateDelete reports whether ctx is a rebuild's or recreate's delete
 // of the VM it re-creates (it carries a deleted-VM sink).
 func isRecreateDelete(ctx context.Context) bool {
-	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
-	return ok
+	sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok && !sink.reportOnly
 }
 
 // deletedVMSinkKey carries a *deletedVMSink in a context.
@@ -163,12 +174,24 @@ type deletedVMSinkKey struct{}
 type deletedVMSink struct {
 	name, createdAt string
 	snap            *corrosion.VMDeleteSnapshot
+	// reportOnly: the sink only takes the report; the delete is otherwise a
+	// plain one (isRecreateDelete is false), as an inline compose re-create
+	// of a VM on no LUN is (withDeletedVMReport).
+	reportOnly bool
 }
 
 // withDeletedVMSink returns ctx with a sink for the delete of name, whose
 // incarnation in the caller's copy is createdAt.
 func withDeletedVMSink(ctx context.Context, name, createdAt string) (context.Context, *deletedVMSink) {
 	sink := &deletedVMSink{name: name, createdAt: createdAt}
+	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
+}
+
+// withDeletedVMReport is withDeletedVMSink for a delete that is otherwise a
+// plain one: it takes the deleting host's report of the row and changes
+// nothing else about the delete.
+func withDeletedVMReport(ctx context.Context, name, createdAt string) (context.Context, *deletedVMSink) {
+	sink := &deletedVMSink{name: name, createdAt: createdAt, reportOnly: true}
 	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
 }
 

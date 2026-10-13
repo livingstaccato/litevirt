@@ -17,6 +17,8 @@ package fleet
 
 import (
 	"context"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -138,4 +140,75 @@ func TestFleet_AComposeRecreateEnteredOnANodeCutOffFromTheTombstoneKeepsTheVM(t 
 	assertReCreated(t, c, "web", before, n0)
 	assertUserdata(t, n0, "second")
 	assertUserdata(t, n1, "second")
+}
+
+// The entry's copy of the row is behind the owner's: an ownership write on
+// node-0 (owner epoch +1, as a migration makes) is still on its way to the
+// entry node-1 when the deploy runs there. The delete tombstones node-0's
+// row; node-1 then applies that write, and only later the tombstone. The row
+// the create names must be the one node-0 reports it deleted: named by
+// node-1's stale copy, the row ahead of it is refused and the VM is lost.
+//
+// Mutation: name node-1's own copy (withReplacedRow(cur)) — red.
+func TestFleet_AComposeRecreateEnteredOnANodeBehindTheOwnerKeepsTheVM(t *testing.T) {
+	c, before := newRecreateRemoteFleet(t, 1, "node-0")
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	lagFrom(c, n0, n1, n2)
+	if err := corrosion.TransferVMOwnerFresh(ctx, n0.DB, "web", n0.Name, before.State); err != nil {
+		t.Fatalf("ownership write on %s: %v", n0.Name, err)
+	}
+	// The ownership write reaches node-1 well before the tombstone does.
+	time.Sleep(raceLag / 2)
+	if stale, _ := corrosion.GetVM(ctx, n1.DB, "web"); stale == nil || stale.OwnerEpoch != before.OwnerEpoch {
+		t.Fatalf("%s is not behind the owner: %+v", n1.Name, stale)
+	}
+
+	msgs := deployCollect(t, ctx, c.SelfClient(n1), recreateRemoteYAML("node-0", "second"))
+	if p := errorPhaseFor(msgs, "web"); p != nil {
+		t.Fatalf("compose re-create entered on %s, behind %s's row: %s; %s", n1.Name, n0.Name, p.Error, whereIs(c, "web"))
+	}
+	assertReCreated(t, c, "web", before, n0)
+	assertOnlyDeleterTombstoned(t, c, n0)
+	assertUserdata(t, n0, "second")
+}
+
+var keptSpecRE = regexp.MustCompile(`Its spec is kept on (\S+) at (\S+\.json)`)
+
+// A create that fails after the teardown says the VM was torn down and keeps
+// the spec it was given, as a rebuild and a rolling recreate do. Another VM
+// of the name appears between the delete and the create, so the create is
+// refused AlreadyExists.
+//
+// Mutation: drop the recreateFailedAfterTeardown wrap in recreateInline — red.
+func TestFleet_AComposeRecreateWhoseCreateFailsAfterTheTeardownKeepsTheSpec(t *testing.T) {
+	c, _ := newRecreateRemoteFleet(t, 0, "node-0")
+	n0 := c.Nodes[0]
+	ctx := context.Background()
+	n0.Server.SetRecreateTornDownHookForTest(func(name string) {
+		if err := corrosion.InsertVM(ctx, n0.DB, corrosion.VMRecord{
+			Name: name, HostName: n0.Name, State: "stopped",
+			Spec: `{"name":"web","uuid":"7e1f0c2d-3b4a-4c5d-8e6f-9a0b1c2d3e4f"}`,
+		}, nil, nil); err != nil {
+			t.Errorf("insert another web: %v", err)
+		}
+	})
+	t.Cleanup(func() { n0.Server.SetRecreateTornDownHookForTest(nil) })
+
+	msgs := deployCollect(t, ctx, c.SelfClient(n0), recreateRemoteYAML("node-0", "second"))
+	p := errorPhaseFor(msgs, "web")
+	if p == nil {
+		t.Fatal("the re-create succeeded over another VM of the same name")
+	}
+	if !strings.Contains(p.Error, "already exists") || !strings.Contains(p.Error, "torn down on node-0") {
+		t.Fatalf("error %q: want the AlreadyExists cause and that the VM was torn down on node-0", p.Error)
+	}
+	m := keptSpecRE.FindStringSubmatch(p.Error)
+	if m == nil || m[1] != n0.Name {
+		t.Fatalf("error %q does not name the spec kept on %s", p.Error, n0.Name)
+	}
+	b, err := os.ReadFile(m[2])
+	if err != nil || !strings.Contains(string(b), "second") {
+		t.Fatalf("kept spec %s: %v; want the file's new cloud-init in it (%d bytes)", m[2], err, len(b))
+	}
 }

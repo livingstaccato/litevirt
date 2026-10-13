@@ -504,3 +504,36 @@ func TestReplacedRow_IsNotAReCreate(t *testing.T) {
 		t.Fatalf("forwarded metadata %v: want the row under %s only", md, replacedRowMD)
 	}
 }
+
+// The row key is a peer host's word, and alone: a client (an Admin included)
+// sending it, or a peer sending it beside the full key, names nothing. The
+// create is refused AlreadyExists and the live row is left as it is.
+//
+// Mutations: move the peer-cert check into the full-key branch — "from a
+// client" red; drop the both-keys refusal — "both keys" red.
+func TestReplacedRow_OnlyAPeerAloneNamesOne(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context
+	}{
+		{"from a client", func(_ *testing.T, _ *Server, old *corrosion.VMRecord) context.Context {
+			return rowMD(adminCtx(), old, old.CreatedAt)
+		}},
+		{"both keys", func(t *testing.T, s *Server, old *corrosion.VMRecord) context.Context {
+			full, _ := metadata.FromIncomingContext(replacesMD(context.Background(), old, old.CreatedAt))
+			row, _ := metadata.FromIncomingContext(rowMD(context.Background(), old, old.CreatedAt))
+			return metadata.NewIncomingContext(peerHostCtx(t, s, "host-a"), metadata.Join(full, row))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := provableCreateServer(t)
+			old := staleReplacedRow(t, s, "vm1")
+			if _, err := s.CreateVM(tc.ctx(t, s, old), disklessCreateRequest("vm1")); status.Code(err) != codes.AlreadyExists {
+				t.Fatalf("a create naming the live row as replaced: got %v, want AlreadyExists", err)
+			}
+			if rec := vmRecord(t, s, "vm1"); rec.CreatedAt != old.CreatedAt || rec.HostName != old.HostName {
+				t.Fatalf("the live vm1 changed: %+v, was %+v", rec, old)
+			}
+		})
+	}
+}

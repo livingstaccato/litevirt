@@ -154,8 +154,9 @@ func chainReaches(file, topFormat string, hit func(string) bool) (bool, error) {
 	if file == "" || !filepath.IsAbs(file) {
 		return false, nil
 	}
+	stat := chainStat // read here: the walk may outlive this call
 	layers, err := storage.Bounded("read the backing chain ("+topFormat+") of", file, func() ([]string, error) {
-		return chainLayers(file, topFormat), nil
+		return chainLayers(stat, file, topFormat), nil
 	})
 	if err != nil {
 		return false, err
@@ -175,11 +176,11 @@ var chainStat = os.Stat
 // chainLayers is file and each layer of its backing chain that chainReaches
 // tests, top first: the walk reads only headers and touches nothing else,
 // so it can be left behind when its storage does not answer.
-func chainLayers(file, topFormat string) []string {
+func chainLayers(stat func(string) (os.FileInfo, error), file, topFormat string) []string {
 	var out []string
 	path, format := file, topFormat
 	for depth := 0; depth <= maxBackingDepth; depth++ {
-		if fi, err := chainStat(path); err != nil || !fi.Mode().IsRegular() {
+		if fi, err := stat(path); err != nil || !fi.Mode().IsRegular() {
 			return out
 		}
 		out = append(out, path)

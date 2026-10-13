@@ -607,8 +607,9 @@ func (w *chainWalk) walk(path string, self bool, why, who string) error {
 			backing string
 			qcow    bool
 		}
+		stat := chainStat
 		l, err := storage.Bounded("read the backing of", path, func() (layer, error) {
-			b, q, err := layerBacking(path)
+			b, q, err := layerBacking(stat, path)
 			return layer{b, q}, err
 		})
 		backing, qcow := l.backing, l.qcow
@@ -634,8 +635,8 @@ func (w *chainWalk) inImages(p string) bool {
 // not a qcow2, or a qcow2 with no local backing (none, a protocol, a file
 // that does not exist), names none. A file with the qcow2 magic whose header
 // does not parse is an error: what it names is unknown.
-func layerBacking(path string) (string, bool, error) {
-	fi, err := chainStat(path)
+func layerBacking(stat func(string) (os.FileInfo, error), path string) (string, bool, error) {
+	fi, err := stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false, nil
 	}

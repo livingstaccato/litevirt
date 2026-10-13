@@ -444,8 +444,9 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 	if cdroms, _ := s.domainInstallerISOsErr(vm.Name, domXML); len(cdroms) > 0 {
 		key = cdroms[0]
 	}
+	judge := judgeCDROMs // read here: the call below may outlive this start
 	updated, err := storage.BoundedOuter("judge the installer CD-ROMs of "+vm.Name+" at", key, func() (string, error) {
-		return judgeCDROMs(s, vm, domXML)
+		return judge(s, vm, domXML)
 	})
 	if storage.IsFSNoAnswer(err) {
 		slog.Warn("start refused: the installer ISO's storage does not answer", "vm", vm.Name, "error", err)

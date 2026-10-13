@@ -522,25 +522,18 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 	if !present {
 		// Only a disk this host sees clears a hold: on a host where the
 		// shared pool is not mounted, "no overlay" says nothing (P7).
-		_, serr := storage.Bounded("stat", disk, func() (os.FileInfo, error) { return pitDiskStat(disk) })
+		stat := pitDiskStat
+		_, serr := storage.Bounded("stat", disk, func() (os.FileInfo, error) { return stat(disk) })
 		if storage.IsFSNoAnswer(serr) {
 			return pitNoAnswer(vm, d, serr)
 		}
 		if serr == nil {
 			// A stat error on the overlay establishes nothing: the hold
 			// stays (re-review 1, m2), and the definition is not touched.
-			type presenceOf struct {
-				p   pitoverlay.Presence
-				err error
+			presence, perr := pitoverlay.PresenceOfBounded(disk)
+			if storage.IsFSNoAnswer(perr) {
+				return pitNoAnswer(vm, d, perr)
 			}
-			po, berr := storage.Bounded("look for the point-in-time overlay and its binding", pitoverlay.Path(disk), func() (presenceOf, error) {
-				p, err := pitoverlay.PresenceOf(disk)
-				return presenceOf{p, err}, nil
-			})
-			if berr != nil {
-				return pitNoAnswer(vm, d, berr)
-			}
-			presence, perr := po.p, po.err
 			s.repointDanglingPITDefinition(ctx, vm, d, presence, perr)
 			if presence != pitoverlay.OverlayUnknown {
 				s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)

@@ -83,7 +83,9 @@ func Path(disk string) string {
 func SidecarPath(disk string) string { return Path(disk) + ".id" }
 
 // Present reports whether disk has an overlay (anything at its path).
-func Present(disk string) bool {
+func Present(disk string) bool { return presentWith(lstat, disk) }
+
+func presentWith(lstat func(string) (os.FileInfo, error), disk string) bool {
 	_, err := lstat(Path(disk))
 	return err == nil
 }
@@ -94,9 +96,30 @@ func Present(disk string) bool {
 // newest writes is there is then unknown, and a caller that took it as "no
 // overlay" would start, copy or define the disk without them.
 func PresentBounded(disk string) (bool, error) {
+	stat := lstat // read here: the call below may outlive its caller
 	return storage.Bounded("look for the point-in-time overlay", Path(disk), func() (bool, error) {
-		return Present(disk), nil
+		return presentWith(stat, disk), nil
 	})
+}
+
+// PresenceOfBounded is PresenceOf under storage.Bounded. A disk whose
+// storage does not answer gets OverlayUnknown with the
+// *storage.FSNoAnswerError (storage.IsFSNoAnswer); PresenceOf's own errors
+// are never that.
+func PresenceOfBounded(disk string) (Presence, error) {
+	stat := lstat
+	type presence struct {
+		p   Presence
+		err error
+	}
+	got, err := storage.Bounded("look for the point-in-time overlay and its binding", Path(disk), func() (presence, error) {
+		p, err := presenceOfWith(stat, disk)
+		return presence{p, err}, nil
+	})
+	if err != nil {
+		return OverlayUnknown, err
+	}
+	return got.p, got.err
 }
 
 // Presence is what this host can say about a disk's overlay: there, gone,
@@ -126,7 +149,9 @@ func SetLstatForTest(f func(string) (os.FileInfo, error)) (restore func()) {
 
 // PresenceOf says whether disk's overlay is there. Unlike Present, an error
 // is never read as absence. Present keeps its meaning for its callers.
-func PresenceOf(disk string) (Presence, error) {
+func PresenceOf(disk string) (Presence, error) { return presenceOfWith(lstat, disk) }
+
+func presenceOfWith(lstat func(string) (os.FileInfo, error), disk string) (Presence, error) {
 	_, err := lstat(Path(disk))
 	switch {
 	case err == nil:

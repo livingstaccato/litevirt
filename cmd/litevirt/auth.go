@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -51,13 +52,26 @@ func newSessionRevokeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "revoke <session-id>",
 		Short: "Revoke an active session",
-		Args:  cobra.ExactArgs(1),
+		Long: `Revoke an active session by the ID that lv session ls shows.
+
+The ID column shows the first 12 characters of the session id: the full id is
+the session's bearer secret and is never displayed. Any unambiguous prefix of
+at least 8 characters names the session (a trailing "…" pasted from the table
+is ignored); a prefix that matches more than one session is refused and the
+matches are listed.
+
+You may revoke your own sessions. An admin may revoke anyone's: list them with
+lv session ls --user <name>. A prefix only ever matches sessions you may
+revoke.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			id = strings.TrimSuffix(strings.TrimSuffix(id, "…"), "...")
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: args[0]}); err != nil {
+				if _, err := c.RevokeSession(ctx, &pb.RevokeSessionRequest{Id: id}); err != nil {
 					return err
 				}
-				fmt.Printf("Session %s revoked.\n", args[0])
+				fmt.Printf("Session %s revoked.\n", id)
 				return nil
 			})
 		},
@@ -261,8 +275,9 @@ the release, ` + "`lv cluster upgrade-status`" + `).`,
 	return cmd
 }
 
-// shortID truncates session IDs for table output. Full id is required to
-// revoke, but the short form is enough to recognise.
+// shortID truncates session IDs for table output. The full id is the
+// session's bearer secret, so it is never printed; lv session revoke accepts
+// the short form (an unambiguous prefix).
 func shortID(s string) string {
 	if len(s) > 12 {
 		return s[:12] + "…"

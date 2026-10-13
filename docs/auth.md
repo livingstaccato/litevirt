@@ -632,7 +632,13 @@ sessions table is small (one row per active login) and reads are an
 indexed primary-key lookup, so the cost is in noise.
 
 `lv session ls` shows your active sessions; `--user <name>` lists
-another user's (admin only).
+another user's (admin only). The ID column is the first 12 characters of the
+session id: the whole id is the session's bearer secret, so the CLI never prints it.
+`lv session revoke` accepts that short form, or any unambiguous prefix of at
+least 8 characters. A prefix resolves only among the sessions the caller may
+revoke — its own, or anyone's for an admin — so a non-admin's prefix never
+reaches, or reveals, another user's session; a prefix matching more than one
+is refused and the matches are listed.
 
 ## API tokens
 

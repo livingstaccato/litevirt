@@ -67,6 +67,8 @@ type mockClient struct {
 
 	// removeImageUnimplemented makes RemoveImage answer as an older serving host.
 	removeImageUnimplemented bool
+
+	revokedSession string
 }
 
 func newMockClient() *mockClient {
@@ -496,7 +498,8 @@ func (m *mockClient) Logout(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallO
 func (m *mockClient) ListSessions(_ context.Context, _ *pb.ListSessionsRequest, _ ...grpc.CallOption) (*pb.ListSessionsResponse, error) {
 	return &pb.ListSessionsResponse{}, nil
 }
-func (m *mockClient) RevokeSession(_ context.Context, _ *pb.RevokeSessionRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (m *mockClient) RevokeSession(_ context.Context, in *pb.RevokeSessionRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.revokedSession = in.Id
 	return &emptypb.Empty{}, nil
 }
 func (m *mockClient) ListTwoFactors(_ context.Context, _ *pb.ListTwoFactorsRequest, _ ...grpc.CallOption) (*pb.ListTwoFactorsResponse, error) {

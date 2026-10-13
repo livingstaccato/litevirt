@@ -683,6 +683,15 @@ func (s *Server) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) 
 
 // RevokeSession terminates a session by id. The owning user can revoke
 // their own; admins can revoke anyone's.
+//
+// The id may also be an unambiguous prefix of at least sessionIDMinPrefix
+// characters, the short form `lv session ls` shows. The full id is the
+// session's bearer secret, so the CLI never prints it, and without a prefix an
+// admin could not revoke another user's session from what it can see. A
+// prefix resolves only among the sessions the caller may revoke — its own,
+// or every live session for an admin — so a non-admin learns nothing about
+// another user's sessions: theirs are NotFound, and never make its own
+// prefix ambiguous.
 func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest) (*emptypb.Empty, error) {
 	if req.Id == "" {
 		return nil, status.Error(codes.InvalidArgument, "session id required")
@@ -692,20 +701,86 @@ func (s *Server) RevokeSession(ctx context.Context, req *pb.RevokeSessionRequest
 		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
 	}
 	if sess == nil {
-		return nil, status.Error(codes.NotFound, "session not found")
+		if sess, err = s.resolveSessionPrefix(ctx, req.Id); err != nil {
+			return nil, err
+		}
 	}
 	if sess.Username != callerUsername(ctx) {
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return nil, err
 		}
 	}
-	if err := corrosion.RevokeSession(ctx, s.db, req.Id); err != nil {
+	if err := corrosion.RevokeSession(ctx, s.db, sess.ID); err != nil {
 		return nil, status.Errorf(codes.Internal, "revoke session: %v", err)
 	}
 	s.kickStreams()
-	slog.Info("session revoked", "id", req.Id, "username", sess.Username, "by", callerUsername(ctx))
-	s.audit(ctx, "session.revoke", sess.Username, "session="+req.Id, "ok")
+	slog.Info("session revoked", "id", sess.ID, "username", sess.Username, "by", callerUsername(ctx))
+	s.audit(ctx, "session.revoke", sess.Username, "session="+sess.ID, "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// sessionIDMinPrefix is the shortest id prefix RevokeSession resolves. Ids
+// are 64 random hex characters; 8 of them (32 bits) leave a collision among
+// live sessions vanishingly unlikely, and an ambiguous one is refused anyway.
+// `lv session ls` shows 12.
+const sessionIDMinPrefix = 8
+
+// sessionShortLen is how much of an id a message may show: what
+// `lv session ls` shows.
+const sessionShortLen = 12
+
+// resolveSessionPrefix finds the one live session, among those the caller may
+// revoke, whose id begins with prefix.
+func (s *Server) resolveSessionPrefix(ctx context.Context, prefix string) (*corrosion.SessionRecord, error) {
+	prefix = strings.ToLower(prefix)
+	if !isHexString(prefix) || len(prefix) >= 64 {
+		return nil, status.Error(codes.NotFound, "session not found")
+	}
+	if len(prefix) < sessionIDMinPrefix {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"session id %q is too short: give at least %d characters of it (lv session ls shows %d)",
+			prefix, sessionIDMinPrefix, sessionShortLen)
+	}
+	rows, err := corrosion.ListLiveSessionsByIDPrefix(ctx, s.db, prefix)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "lookup session: %v", err)
+	}
+	if RequireRole(ctx, "admin") != nil {
+		caller := callerUsername(ctx)
+		own := rows[:0]
+		for _, r := range rows {
+			if r.Username == caller {
+				own = append(own, r)
+			}
+		}
+		rows = own
+	}
+	switch len(rows) {
+	case 0:
+		return nil, status.Error(codes.NotFound, "session not found")
+	case 1:
+		return &rows[0], nil
+	}
+	show := max(sessionShortLen, len(prefix)+4)
+	matches := make([]string, len(rows))
+	for i, r := range rows {
+		matches[i] = fmt.Sprintf("%s… (%s)", r.ID[:min(show, len(r.ID))], r.Username)
+	}
+	return nil, status.Errorf(codes.InvalidArgument,
+		"session id prefix %q matches %d sessions: %s; give more of the id",
+		prefix, len(rows), strings.Join(matches, ", "))
+}
+
+func isHexString(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, c := range v {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyTOTP delegates to the auth package's TOTP verifier. A successful

@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func TestTendStrandedDisks_ClearsACancelledStartOnceTheVMRuns(t *testing.T) {
 	if err := db.Execute(ctx, `UPDATE vms SET host_name = 'node-a', state = 'stopped', state_detail = 'operator-stop', updated_at = ? WHERE name = 'web'`, db.NowTS()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RecordStartCancelled(ctx, db, "node-a", "web", "starting", time.Now()); err != nil {
+	if _, err := RecordStartCancelled(ctx, db, "node-a", "web", "starting", false, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	r := NewReconciler("node-a", dataDir, db, fake)
@@ -68,5 +69,43 @@ func TestTendStrandedDisks_ClearsACancelledStartOnceTheVMRuns(t *testing.T) {
 	r.tendStrandedDisks(ctx)
 	if open() {
 		t.Fatal("still open once the VM runs on its host")
+	}
+}
+
+// Review I-1: a cancelled proof-less transfer, made again by `lv start`
+// (re-armed to "starting"), is still that transfer: the old copy at the disk
+// path is set aside, as the cancelled start would have, although nothing in
+// memory (deferredTransfers) remembers it after a daemon restart.
+//
+// Mutation: drop cancelledTransfer from startPendingVM's transfer test — the
+// re-armed start is a local start, the old copy stays the disk: red.
+func TestStartPendingVM_ACancelledTransferMadeAgainSetsTheOldCopyAside(t *testing.T) {
+	db, fake, r, path := supersededFixture(t, "starting")
+	ctx := context.Background()
+	if _, err := RecordStartCancelled(ctx, db, "node-a", "vm1", "pending", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	r.startPendingVM(ctx, *fresh)
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("vm1 was not started")
+	}
+	if aside, _ := filepath.Glob(path + ".superseded-*"); len(aside) != 1 {
+		t.Fatalf("set-aside copies = %v, want the old copy the transfer found", aside)
+	}
+}
+
+// A cancel of a start cancelled before keeps the transfer it recorded.
+func TestRecordStartCancelled_KeepsATransfer(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if _, err := RecordStartCancelled(ctx, db, "node-a", "vm1", "pending", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordStartCancelled(ctx, db, "node-a", "vm1", "starting", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if ev, err := StartCancelledOf(ctx, db, "vm1", "node-a"); err != nil || ev == nil || !ev.Transfer {
+		t.Fatalf("record %+v (%v), want the transfer kept", ev, err)
 	}
 }

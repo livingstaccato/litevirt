@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // heldVMNoDomain is heldVM with no domain defined, as a start deferred
@@ -87,6 +89,11 @@ func TestStopVM_ForceCancelsAStartWithNoDomainAndKeepsTheHold(t *testing.T) {
 		if _, err := health.RemoveSupersededDisks(context.Background(), s.db, s.dataDir, []string{copyPath}); err == nil {
 			t.Fatalf("%s: the copy of a cancelled start was removed by name", state)
 		}
+		// A pending row is a transfer onto this host, and the record says so
+		// (review I-1); the starting one is not (no probe says it is).
+		if ev, err := health.StartCancelledOf(context.Background(), s.db, "vm1", s.hostName); err != nil || ev == nil || ev.Transfer != (state == "pending") {
+			t.Fatalf("%s: record %+v (%v), want transfer=%v", state, ev, err, state == "pending")
+		}
 		// The start lease is released: a later start is not locked out.
 		holder := health.OperatorStartLockHolder(s.hostName)
 		if by, err := health.TryVMStartLease(context.Background(), s.db, holder, "vm1", time.Now()); err != nil || by != holder {
@@ -130,5 +137,48 @@ func TestStopVM_ForceDoesNotCancelAStartInFlightOrAFailoversStart(t *testing.T) 
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "vm2"); vm == nil || vm.State != "pending" || vm.PendingActionID != "p-1" {
 		t.Fatalf("a refused cancel changed the row: %+v", vm)
+	}
+}
+
+// Review I-1: after a forced stop cancelled a start with no domain, `lv start`
+// starts the VM again. Its domain was never defined, so the start re-arms the
+// row to "starting" and the reconciler's start defines and starts it, as the
+// cancelled start would have. The copies stay held until the VM runs, and
+// vm_start_cancelled clears once it does.
+//
+// Mutation: no re-arm (StartVM starts the undefined domain) — Internal
+// "domain not found": red.
+func TestStartVM_AStartCancelledEarlierIsMadeAgain(t *testing.T) {
+	s := hotplugDiskServer(t)
+	ctx := context.Background()
+	copyPath := heldVMNoDomain(t, s, "starting")
+	if err := qcow2.Create(filepath.Join(s.dataDir, "disks", "vm1-root.qcow2"), 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s.virt.(*libvirtfake.Fake).FailShutdownDomain, s.virt.(*libvirtfake.Fake).FailDestroyDomain = nil, nil
+	if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if _, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "vm1"}); err != nil {
+		t.Fatalf("start of a VM whose start was cancelled: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "vm1"); vm == nil || vm.State != "starting" {
+		t.Fatalf("row %+v, want re-armed to starting", vm)
+	}
+	if copies, err := health.ListSupersededDisks(ctx, s.db, s.dataDir); err != nil || len(copies) != 1 || copies[0].Path != copyPath || copies[0].Held == "" {
+		t.Fatalf("copies %+v (%v), want still held while the start is made", copies, err)
+	}
+
+	r := health.NewReconciler(s.hostName, s.dataDir, s.db, s.virt.(*libvirtfake.Fake))
+	r.ReconcileOnce(ctx)
+	if vm, _ := corrosion.GetVM(ctx, s.db, "vm1"); vm == nil || vm.State != "running" {
+		t.Fatalf("row %+v after a reconcile pass, want running", vm)
+	}
+	if active, err := s.virt.DomainIsActive("vm1"); err != nil || !active {
+		t.Fatalf("domain active=%v (%v), want running", active, err)
+	}
+	r.ReconcileOnce(ctx)
+	if ev, err := health.StartCancelledOf(ctx, s.db, "vm1", s.hostName); err != nil || ev != nil {
+		t.Fatalf("vm_start_cancelled %+v (%v) still open once the VM runs", ev, err)
 	}
 }

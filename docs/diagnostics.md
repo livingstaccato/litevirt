@@ -2264,7 +2264,7 @@ they were while the start was under way: `lv host superseded-disks <host>
 
 | Raised when | Clears when |
 |---|---|
-| A forced stop cancels a start that had no domain. | The VM runs on that host again (`lv start <vm>`), or is on another host, or is deleted. |
+| A forced stop cancels a start that had no domain. | The VM runs on that host again, or is on another host, or is deleted. `lv start <vm>` makes the cancelled start again: the VM goes back to `starting`, and the reconciler defines and starts it as it would have (a transfer still sets aside an old copy at the disk path). |
 
 ### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
 

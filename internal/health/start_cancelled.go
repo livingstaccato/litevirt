@@ -27,11 +27,15 @@ const CondVMStartCancelled = "vm_start_cancelled"
 
 // StartCancelled is the evidence of vm_start_cancelled.
 type StartCancelled struct {
-	VM     string `json:"vm"`
-	Host   string `json:"host"`
-	State  string `json:"state"` // the state the start was cancelled in
-	At     string `json:"at"`
-	Detail string `json:"detail"`
+	VM    string `json:"vm"`
+	Host  string `json:"host"`
+	State string `json:"state"` // the state the start was cancelled in
+	// Transfer: the start cancelled was a proof-less transfer onto Host
+	// (deferredTransfers), whose start sets aside an old copy found at the
+	// disk path. A start of the VM made again is the same transfer.
+	Transfer bool   `json:"transfer,omitempty"`
+	At       string `json:"at"`
+	Detail   string `json:"detail"`
 }
 
 // CancelStartLockHolder is the per-VM start lease identity of an operator's
@@ -41,11 +45,11 @@ func CancelStartLockHolder(hostName string) string { return hostName + "/cancel-
 
 // RecordStartCancelled records that the start of vmName on host, in state,
 // was cancelled, and returns the detail for the caller's event.
-func RecordStartCancelled(ctx context.Context, db *corrosion.Client, host, vmName, state string, now time.Time) (string, error) {
+func RecordStartCancelled(ctx context.Context, db *corrosion.Client, host, vmName, state string, transfer bool, now time.Time) (string, error) {
 	ts := now.UTC().Format(time.RFC3339)
-	ev := StartCancelled{VM: vmName, Host: host, State: state, At: ts}
+	ev := StartCancelled{VM: vmName, Host: host, State: state, Transfer: transfer, At: ts}
 	ev.Detail = fmt.Sprintf("start cancelled: %s was %s on %s with no domain defined, and an operator's forced stop cancelled the start; "+
-		"it stays stopped until `lv start %s`, and the disk copies a failover set aside for it stay held until it runs", vmName, state, host, vmName)
+		"it stays stopped until `lv start %s` makes the start again, and the disk copies a failover set aside for it stay held until it runs", vmName, state, host, vmName)
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return "", err
@@ -53,6 +57,16 @@ func RecordStartCancelled(ctx context.Context, db *corrosion.Client, host, vmNam
 	row, had, err := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMStartCancelled, "vm", strandedSubject(vmName, host))
 	if err != nil {
 		return "", err
+	}
+	if had && row.Lifecycle != corrosion.ConditionResolved {
+		// A start cancelled again is still the transfer it was.
+		var prev StartCancelled
+		if json.Unmarshal([]byte(row.Evidence), &prev) == nil && prev.Transfer && !ev.Transfer {
+			ev.Transfer = true
+			if b, err = json.Marshal(ev); err != nil {
+				return "", err
+			}
+		}
 	}
 	if !had || row.Lifecycle == corrosion.ConditionResolved {
 		row = corrosion.HealthCondition{
@@ -68,6 +82,33 @@ func RecordStartCancelled(ctx context.Context, db *corrosion.Client, host, vmNam
 		return "", err
 	}
 	return ev.Detail, nil
+}
+
+// StartCancelledOf returns the open vm_start_cancelled record of vmName on
+// host, or nil.
+func StartCancelledOf(ctx context.Context, db *corrosion.Client, vmName, host string) (*StartCancelled, error) {
+	row, had, err := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMStartCancelled, "vm", strandedSubject(vmName, host))
+	if err != nil || !had || row.Lifecycle == corrosion.ConditionResolved {
+		return nil, err
+	}
+	var ev StartCancelled
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil || ev.VM != vmName || ev.Host != host {
+		return nil, err
+	}
+	return &ev, nil
+}
+
+// IsDeferredTransfer reports whether vmName's start, parked in "starting",
+// is a proof-less transfer onto this host (deferredTransfers), for a cancel
+// of it to record.
+func (r *Reconciler) IsDeferredTransfer(vmName string) bool { return r.deferredTransfers.has(vmName) }
+
+// cancelledTransfer reports whether a start of vmName in "starting" makes
+// again a proof-less transfer an operator cancelled on this host: its open
+// vm_start_cancelled says so. Durable, unlike deferredTransfers.
+func (r *Reconciler) cancelledTransfer(ctx context.Context, vmName string) bool {
+	ev, err := StartCancelledOf(ctx, r.db, vmName, r.hostName)
+	return err == nil && ev != nil && ev.Transfer
 }
 
 // cancelledStarts is the open vm_start_cancelled records, by VM: the host

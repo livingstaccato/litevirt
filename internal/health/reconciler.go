@@ -1432,7 +1432,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// A proof-less transfer whose image pull outlived the walk is parked in
 	// "starting" (deferPendingStart) and is still that transfer.
 	transfer := fresh.State == "pending" || proofID != "" ||
-		(fresh.State == "starting" && r.deferredTransfers.has(vm.Name))
+		(fresh.State == "starting" && (r.deferredTransfers.has(vm.Name) || r.cancelledTransfer(ctx, vm.Name)))
 
 	// A proof MARKER present with NO gate wired fails CLOSED: we can't verify quorum,
 	// and a marker implies enforcement was active when it was stamped. (Production

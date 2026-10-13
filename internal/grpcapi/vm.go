@@ -1834,7 +1834,45 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	// The reservation must outlive startVMLocked's state write.
 	defer lease.release(ctx)
+	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
+		return nil, err
+	} else if rearmed {
+		return s.vmToProto(ctx, vm.Name)
+	}
 	return s.startVMLocked(ctx, vm)
+}
+
+// restartCancelledStartLocked makes again a start an operator cancelled
+// (`lv stop --force`, cancelStartLocked): the VM is stopped by its operator,
+// its open vm_start_cancelled names this host, and no domain is defined for
+// it, which a start of the defined domain cannot start. The row is re-armed
+// to "starting", the state the reconciler's start defines and starts it from
+// (a markerless "pending" is refused as proof_missing under the split-brain
+// gate), as the cancelled start would have; a transfer stays one through the
+// record (Reconciler.cancelledTransfer). The record stays open, holding the
+// VM's set-aside disk copies, until the VM runs. It reports whether it
+// re-armed the row. The caller holds the VM lock.
+func (s *Server) restartCancelledStartLocked(ctx context.Context, vm *corrosion.VMRecord) (bool, error) {
+	if vm.State != "stopped" || vm.StateDetail != "operator-stop" || s.db == nil || s.virt == nil {
+		return false, nil
+	}
+	ev, err := health.StartCancelledOf(ctx, s.db, vm.Name, s.hostName)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "start %q: read its cancelled start: %v", vm.Name, err)
+	}
+	if ev == nil {
+		return false, nil
+	}
+	if _, aerr := s.virt.DomainIsActive(vm.Name); !lv.IsNoDomain(aerr) {
+		return false, nil // a domain is defined: started as any other
+	}
+	if err := s.persistVMState(ctx, vm.Name, "starting", "operator start: the start cancelled earlier is made again", corrosion.OpVMState); err != nil {
+		return false, status.Errorf(codes.Internal, "start %q: re-arm its cancelled start: %v", vm.Name, err)
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.start_rearmed", "ok",
+		fmt.Sprintf("the start cancelled on %s is made again: the reconciler defines and starts the VM (`lv inspect %s`)", s.hostName, vm.Name))
+	slog.Info("StartVM: re-armed a cancelled start; the reconciler makes it", "vm", vm.Name, "transfer", ev.Transfer)
+	return true, nil
 }
 
 // takeRepairLease refuses a compose repair of vm while another operation is
@@ -2401,7 +2439,10 @@ func (s *Server) cancelStartLocked(ctx context.Context, vm *corrosion.VMRecord) 
 	if _, aerr := s.virt.DomainIsActive(vm.Name); !lv.IsNoDomain(aerr) {
 		return fail(status.Errorf(codes.Aborted, "VM %q has a domain now: its start went on while the stop ran, and the stop was not applied; retry", vm.Name))
 	}
-	detail, err := health.RecordStartCancelled(ctx, s.db, s.hostName, vm.Name, vm.State, time.Now())
+	// A pending row is a transfer onto this host; a starting one is when the
+	// reconciler parked it as one.
+	transfer := vm.State == "pending" || (s.startTransferProbe != nil && s.startTransferProbe(vm.Name))
+	detail, err := health.RecordStartCancelled(ctx, s.db, s.hostName, vm.Name, vm.State, transfer, time.Now())
 	if err != nil {
 		return fail(status.Errorf(codes.Internal, "cancel the start of %q: record the hold on its set-aside disk copies: %v", vm.Name, err))
 	}

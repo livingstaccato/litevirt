@@ -1032,7 +1032,7 @@ func (s *Server) pitSweepReady(ctx context.Context, caughtUp func() (bool, strin
 	return func() (bool, string) { return corrosion.ReplicaTrusted(ctx, s.db, s.hostName, caughtUp) }
 }
 
-//
+// sweepPITOverlaysOf settles the overlays of one VM's disks under its lock.
 // It reports whether a disk of the VM was passed over because its storage
 // did not answer: the sweep then tries the VM again later.
 func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) (passedOver bool) {

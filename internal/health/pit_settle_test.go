@@ -2,9 +2,9 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
-	"errors"
 	"strings"
 	"testing"
 	"time"

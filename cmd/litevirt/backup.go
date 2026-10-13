@@ -265,6 +265,15 @@ func newBackupRestoreFromCmd() *cobra.Command {
 		Use:     "restore-from",
 		Aliases: []string{"restore"},
 		Short:   "Restore a snapshot from a backup repo into a new file, or in place over the VM's stopped disk",
+		// No positional argument: the retired `lv backup restore <file>`
+		// form must fail, not restore from a repo with the file ignored.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("%s takes no argument (got %q): it restores from a backup repo, named by --repo, --vm, --disk and --timestamp; "+
+					"a disk file is no longer restored from", cmd.CommandPath(), args[0])
+			}
+			return nil
+		},
 		Long: `Restore one disk from a backup manifest.
 
 By default the daemon writes a new file of its own under <data_dir>/disks and

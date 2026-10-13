@@ -31,6 +31,16 @@ func TestBackupCreateAndRestoreCallTheRepoPaths(t *testing.T) {
 	if mock.rawBackupCalled {
 		t.Fatal("a retired raw backup RPC was called")
 	}
+
+	// Review m-3: the retired form, with a file, fails and restores nothing.
+	mock.restoreFromBackupReq = nil
+	if _, _, err := runCmd(t, mock, "backup", "restore", "old.qcow2", "--repo", "/srv/backup", "--vm", "web-1",
+		"--disk", "root", "--timestamp", "2026-01-01T00:00:00Z"); err == nil || !strings.Contains(err.Error(), "takes no argument") {
+		t.Fatalf("backup restore <file> = %v, want it refused", err)
+	}
+	if mock.restoreFromBackupReq != nil {
+		t.Fatalf("backup restore <file> restored %+v", mock.restoreFromBackupReq)
+	}
 }
 
 // TestVMConfigIP_HonestFlagHelp pins the record-only honesty wording on the

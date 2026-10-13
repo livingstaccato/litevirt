@@ -129,3 +129,17 @@ func TestAuditCLI_SendsResolvedBounds(t *testing.T) {
 		t.Errorf("an unparseable bound still reached the daemon")
 	}
 }
+
+// A "forever" bound written with a negative offset is past the last
+// representable stamp in UTC. The CLI sends that last stamp, never a year-10000
+// one, which an older daemon's text comparison would sort below every row.
+func TestAuditCLI_ClampsABoundPastTheMax(t *testing.T) {
+	rec := &boundsRecorder{}
+	boundsCLIDaemon(t, rec)
+	if err := runBoundsCmd(t, newAuditExportCmd(), "--until", "9999-12-31T23:59:59-01:00"); err != nil {
+		t.Fatalf("lv audit export: %v", err)
+	}
+	if len(rec.until) != 1 || rec.until[0] != "9999-12-31T23:59:59.999999999Z" {
+		t.Fatalf("sent until=%v, want [9999-12-31T23:59:59.999999999Z]", rec.until)
+	}
+}

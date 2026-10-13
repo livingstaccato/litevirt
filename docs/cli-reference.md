@@ -799,7 +799,7 @@ lv audit ls [--limit N] \
     [--target <path>] [--action <a>] [--user <u>] [--since <time>]   # Tail/filter recent audit entries
   #   --action supports a trailing-* prefix glob (e.g. sg.*)
 lv audit verify                                # Walk the SHA-256 hash chain
-lv audit export [--since <ts>] [--until <ts>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
+lv audit export [--since <time>] [--until <time>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
   #   --allow-gaps exports a chain with seq gaps, listed under seq_gaps (investigation, not attestation)
 ```
 

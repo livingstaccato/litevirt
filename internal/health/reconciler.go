@@ -1407,6 +1407,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}
+	// A start decided from a pending or starting row that an operator has
+	// since cancelled (`lv stop --force`, start_cancelled.go) is not made.
+	if (vm.State == "pending" || vm.State == "starting") && fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail) {
+		slog.Info("reconciler: VM's start was cancelled after the walk read it; not starting it",
+			"vm", vm.Name, "state", fresh.State, "detail", fresh.StateDetail)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
 	// Releasing the lease is CLEANUP, and cleanup must not inherit the caller's
 	// deadline. reconcilePass bounds this walk with reconcileWalkBudget; on the
 	// very case that budget exists for, it expires mid-start and the DELETE

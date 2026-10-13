@@ -2234,9 +2234,17 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	// (lab 2 O-4: libvirt answers "domain is not running"), as a start of a
 	// running one is (startVMLocked). A failure while the domain is active,
 	// or when whether it is cannot be read, is still the error it was.
-	noop := false
+	noop, noDomain := false, false
+	beingStarted := vm.State == "pending" || vm.State == "starting"
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
+		if aerr != nil && beingStarted && lv.IsNoDomain(aerr) {
+			// A start deferred before its define (storage that does not
+			// answer) leaves no domain: nothing runs.
+			slog.Info("StopVM: a VM being started has no domain yet; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+			noop, noDomain = true, true
+			return true
+		}
 		if aerr != nil || active {
 			return false
 		}
@@ -2273,10 +2281,26 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	// self-heal's), and the reconciler will start the domain. A success here
 	// would be overridden by that start, so the stop is refused, and nothing
 	// is changed. (Main answered Internal: nothing that worked is refused.)
-	if noop && (vm.State == "pending" || vm.State == "starting") {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)",
-			vm.Name, vm.State, vm.Name, vm.Name)
+	// With --force and no domain defined at all, the stop cancels the start
+	// (cancelStartLocked): the row is written stopped/operator-stop, so no
+	// start path starts it, and its set-aside disk copies stay held.
+	cancelled := ""
+	if noop && beingStarted {
+		if !noDomain || !force {
+			cancel := ""
+			if noDomain {
+				cancel = fmt.Sprintf(", or cancel the start (`lv stop --force %s`)", vm.Name)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)%s",
+				vm.Name, vm.State, vm.Name, vm.Name, cancel)
+		}
+		release, detail, err := s.cancelStartLocked(ctx, vm)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		cancelled = detail
 	}
 	if noop && stopNoopKeepsRow[vm.State] {
 		detail := fmt.Sprintf("already stopped: the domain was not running; the row is left %s, which holds its set-aside disk copies", vm.State)
@@ -2320,7 +2344,10 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
 	evDetail := ""
-	if noop {
+	switch {
+	case cancelled != "":
+		evDetail = cancelled
+	case noop:
 		evDetail = "already stopped: the domain was not running; the operator's stop is recorded"
 	}
 	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
@@ -2332,6 +2359,53 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
 
 	return s.vmToProto(ctx, vm.Name)
+}
+
+// cancelStartLocked cancels the start of vm, a local VM in pending or
+// starting whose domain is not defined, before a forced stop writes it
+// stopped/operator-stop. It takes the VM's start lease, so no start path is
+// in flight or starts it meanwhile, and checks again under it that the row is
+// still being started, by no proof-gated action, with no domain. It then
+// records vm_start_cancelled, which keeps the VM's set-aside disk copies held
+// (health.CancelStartLockHolder, RecordStartCancelled), and returns the
+// lease's release and the detail for the VM's event. The caller holds the VM
+// lock.
+func (s *Server) cancelStartLocked(ctx context.Context, vm *corrosion.VMRecord) (func(), string, error) {
+	if vm.PendingActionID != "" {
+		return nil, "", status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s) by action %s, a failover's: a stop does not cancel it; wait until it runs or fails (`lv inspect %s`)",
+			vm.Name, vm.State, vm.PendingActionID, vm.Name)
+	}
+	holder := health.CancelStartLockHolder(s.hostName)
+	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
+	if err != nil {
+		return nil, "", status.Errorf(codes.Unavailable, "cancel the start of %q: take its start lease: %v", vm.Name, err)
+	}
+	if heldBy != holder {
+		return nil, "", status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s) and %s holds its start lease: the start is in flight, and the stop was not applied; retry in a moment",
+			vm.Name, vm.State, heldBy)
+	}
+	release := func() { health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name) }
+	fail := func(err error) (func(), string, error) {
+		release()
+		return nil, "", err
+	}
+	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
+	switch {
+	case err != nil:
+		return fail(status.Errorf(codes.Internal, "cancel the start of %q: read it: %v", vm.Name, err))
+	case fresh == nil || fresh.HostName != s.hostName || fresh.State != vm.State || fresh.PendingActionID != "":
+		return fail(status.Errorf(codes.Aborted, "VM %q changed while its start was being cancelled; retry", vm.Name))
+	}
+	if _, aerr := s.virt.DomainIsActive(vm.Name); !lv.IsNoDomain(aerr) {
+		return fail(status.Errorf(codes.Aborted, "VM %q has a domain now: its start went on while the stop ran, and the stop was not applied; retry", vm.Name))
+	}
+	detail, err := health.RecordStartCancelled(ctx, s.db, s.hostName, vm.Name, vm.State, time.Now())
+	if err != nil {
+		return fail(status.Errorf(codes.Internal, "cancel the start of %q: record the hold on its set-aside disk copies: %v", vm.Name, err))
+	}
+	return release, detail, nil
 }
 
 // stopNoopKeepsRow are the VM states a stop that found the domain already

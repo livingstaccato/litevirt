@@ -95,7 +95,8 @@ type SupersededCopy struct {
 }
 
 // supersededHoldStates are the VM states that hold a copy: a failover start
-// that failed (error) or is still under way (pending, starting).
+// that failed (error) or is still under way (pending, starting). A start an
+// operator cancelled holds them too (start_cancelled.go).
 var supersededHoldStates = map[string]bool{"error": true, "pending": true, "starting": true}
 
 // supersededDirs is where set-aside copies can be: next to every host-local
@@ -147,6 +148,10 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the recorded stranded disks: %w", err)
 	}
+	cancelled, err := cancelledStarts(ctx, db)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the cancelled starts: %w", err)
+	}
 	unanswered := func(err error) {
 		slog.Warn("superseded disk copies: storage does not answer; what is there is not looked at", "error", err)
 		if noAnswer == nil {
@@ -194,6 +199,8 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 				c.VM, c.VMState = vm.Name, vm.State
 				if supersededHoldStates[vm.State] {
 					c.Held = fmt.Sprintf("VM %s is %s on %s", vm.Name, vm.State, vm.HostName)
+				} else {
+					c.Held = startCancelledHeld(cancelled, vm)
 				}
 				break
 			}

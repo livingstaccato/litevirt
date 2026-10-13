@@ -24,6 +24,12 @@ type ClusterState struct {
 	Devices    map[string][]corrosion.PCIDeviceRecord // host → available devices
 	ImageHosts map[string][]string                    // imageName → hosts that have it (status=ready)
 
+	// Mappings is every resource mapping as name → host → its addresses on
+	// that host (address order), the form placement resolves a mapping
+	// selector with. ResolveMappingAddress, which the owner allocates with,
+	// takes the first address, and so does placement.
+	Mappings map[string]map[string][]string
+
 	// Capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	Capacity corrosion.CapacityPolicy
 
@@ -82,6 +88,22 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		devices[h.Name] = devs
 	}
 
+	rms, err := corrosion.ListResourceMappings(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	mappings := make(map[string]map[string][]string, len(rms))
+	for _, m := range rms {
+		byHost := map[string][]string{}
+		for _, d := range m.Devices { // address order within a host
+			if d.Address == "" { // ResolveMappingAddress skips these too
+				continue
+			}
+			byHost[d.HostName] = append(byHost[d.HostName], d.Address)
+		}
+		mappings[m.Name] = byHost
+	}
+
 	// Effective-capacity observations. Best-effort: a missing set degrades to
 	// the DB-only arithmetic (exactly what the snapshot had before), never to
 	// a failed plan.
@@ -128,6 +150,7 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		Networks:      networks,
 		LBs:           lbs,
 		Devices:       devices,
+		Mappings:      mappings,
 		ImageHosts:    imageHosts,
 		Capacity:      capacity,
 		Observations:  observations,

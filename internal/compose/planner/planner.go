@@ -372,7 +372,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	}
 
 	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
-	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem,
+	placements, err := placement.SelectBatchWithMappings(state.Hosts, state.VMs, state.Devices, state.Mappings, ctMem,
 		state.Observations, time.Now(), placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
@@ -914,14 +914,11 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 			req.VMBaseName = vmBaseName(spec.Name)
 		}
 	}
+	// The same conversion CreateVM's placement makes. A hand-copied subset of
+	// the fields dropped address, mapping and model, so an address-only or
+	// mapping device reached placement with no selector and no host took it.
 	for _, dev := range spec.Devices {
-		req.Devices = append(req.Devices, placement.DeviceRequest{
-			Type:   dev.Type,
-			Count:  int(dev.Count),
-			Vendor: dev.Vendor,
-			Sriov:  dev.Sriov,
-			Parent: dev.Parent,
-		})
+		req.Devices = append(req.Devices, placement.DeviceRequestFor(dev))
 	}
 	return req
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pci"
 )
 
 // Request describes what a VM needs and where it should (not) go.
@@ -736,7 +737,27 @@ func SelectBatch(
 	now time.Time,
 	requests []Request,
 ) (map[string]BatchResult, error) {
+	return SelectBatchWithMappings(hosts, vms, devices, nil, containerMemMiB, capacity, now, requests)
+}
+
+// SelectBatchWithMappings is SelectBatch for a batch whose device requests may
+// name a resource mapping. mappings is mapping name → host → that host's
+// addresses under it, in address order (the snapshot's MappingDevices); a
+// mapping request is eligible only where its first address is, as the
+// allocator's ResolveMappingAddress resolves it. With nil mappings every
+// mapping request is ineligible everywhere, which is all SelectBatch can say.
+func SelectBatchWithMappings(
+	hosts []corrosion.HostRecord,
+	vms []corrosion.VMRecord,
+	devices map[string][]corrosion.PCIDeviceRecord,
+	mappings map[string]map[string][]string,
+	containerMemMiB map[string]int,
+	capacity []corrosion.HostCapacityObservation,
+	now time.Time,
+	requests []Request,
+) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
+	snap.MappingDevices = mappings
 	// Containers hold host memory as surely as VMs do; fold them in exactly
 	// like the single-VM Select path (BuildSnapshot) does.
 	snap.AddContainerMemory(containerMemMiB)
@@ -807,7 +828,7 @@ func SelectBatch(
 		}
 		chosen := pickBest(candidates)
 
-		devAssign := assignDevices(snap.Devices, chosen, req.Devices)
+		devAssign := assignDevicesMapped(snap.Devices, snap.MappingDevices, chosen, req.Devices)
 		results[req.VMName] = BatchResult{Host: chosen, Devices: devAssign}
 		if req.Container {
 			snap.commitContainer(chosen, req.VMName, req.VMBaseName, req.MemMiBNeeded)
@@ -821,6 +842,17 @@ func SelectBatch(
 
 // assignDevices selects and removes devices from the mutable pool for a host.
 func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, reqs []DeviceRequest) []BatchDevice {
+	return assignDevicesMapped(devPool, nil, host, reqs)
+}
+
+// assignDevicesMapped is assignDevices with the resource mappings a mapping
+// request resolves through. It follows scoreHostDevicesForHost's precedence
+// (mapping → SR-IOV → type/vendor → exact address), and a mapping or an exact
+// address takes the one device it names: reserved in the pool, so a later
+// request of the same batch cannot be placed onto it as well, and reported as
+// one assignment, so the assignments stay aligned with the non-SR-IOV devices
+// of the spec (deployCreatePlanned pairs them up in order).
+func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mappings map[string]map[string][]string, host string, reqs []DeviceRequest) []BatchDevice {
 	if len(reqs) == 0 {
 		return nil
 	}
@@ -828,11 +860,42 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 	pool := devPool[host]
 	var assigned []BatchDevice
 
+	takeExact := func(address string) {
+		want, wantOK := pci.CanonicalBDF(address)
+		for i := range pool {
+			got, gotOK := pci.CanonicalBDF(pool[i].Address)
+			if (wantOK && gotOK && got == want) || (!wantOK && pool[i].Address == address) {
+				assigned = append(assigned, BatchDevice{
+					Type:    pool[i].Type,
+					Address: pool[i].Address,
+					Vendor:  pool[i].VendorName,
+					Device:  pool[i].DeviceName,
+				})
+				pool[i].VMName = "reserved" // mark as taken in-memory
+				return
+			}
+		}
+	}
+
 	for _, req := range reqs {
+		if req.Mapping != "" {
+			if addresses := mappings[req.Mapping][host]; len(addresses) > 0 {
+				takeExact(addresses[0])
+			}
+			continue
+		}
+
 		// SR-IOV requests are resolved on-demand by the owner's allocator (create or
 		// reuse a VF); placement neither pins a concrete VF address nor consumes one
 		// from the pool. Eligibility was already gated in scoreHostDevices.
 		if req.Sriov {
+			continue
+		}
+
+		if req.Type == "" && req.Vendor == "" {
+			if req.Address != "" {
+				takeExact(req.Address)
+			}
 			continue
 		}
 

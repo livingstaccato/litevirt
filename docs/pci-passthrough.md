@@ -81,9 +81,18 @@ The placement engine selects a host with enough free devices matching the criter
 
 ```yaml
     devices:
-      - type: "gpu"
-        address: "0000:41:00.0"
+      - address: "0000:41:00.0"
 ```
+
+Name the address alone. The VM is placed on the host that has that device free
+(with no other member of its IOMMU group held by another VM), and takes exactly
+that device. Add a `placement.host` when more than one host has a device at
+that address.
+
+A device's selector is read in a fixed order: `mapping`, then `sriov`, then
+`type` / `vendor`, then `address`. The first one set decides, and the fields
+after it are ignored. So `type: "gpu"` with an `address` is a request for any
+free GPU, not for that address.
 
 ### Common vendor IDs
 

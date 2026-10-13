@@ -201,12 +201,22 @@ inflated/deflated at runtime (`lv set-memory <vm> <MiB>`); `min-memory` is the f
 restart is a no-op (running VMs are left alone), only an actual host reboot triggers it.
 A host boot starts every `onboot` VM that is not running, including one its operator
 stopped (`lv stop`) before the reboot; a plain daemon restart leaves such a VM stopped.
-The daemon tells the two apart by the kernel's boot ID, which it records in its data
-directory (`onboot-boot-id`) once the boot's starts are made. With no record yet (the
-first start of a build that keeps it), a VM its operator stopped is left stopped. A stop
-made by a host drain, or a stopped VM a failover moved to the host, is not started at
-boot either. The start waits through the daemon's warm-up and any loss of quorum, and
-is dropped if its operator stops it again or turns `onboot` off before it is made.
+The daemon tells the two apart by the kernel's boot ID. It records the boot in its data
+directory (`onboot-boot-id`) as soon as it decides, together with each VM whose operator
+stop the boot still has to override. A daemon restart later in the same boot starts only
+those VMs, and only while their row still carries that stop; once the boot's start of a
+VM is under way, a stop made after it is kept, across restarts too. With no record (the
+first start of a build that keeps it), or a record that cannot be read or is damaged, a
+VM its operator stopped is left stopped, and the daemon logs why. A stop made by a host
+drain, or a stopped VM a failover moved to the host, is not started at boot either.
+The start waits through the daemon's warm-up and any loss of quorum. While it waits, it
+is dropped if `onboot` is turned off or the VM's stop is replaced by a different one (a
+drain's, say). A second `lv stop` of the still-stopped VM records the same stop, so it
+does not cancel the boot's start: turn `onboot` off for that.
+
+A VM whose `lv rm` failed after its stop step (an undefine or a device release that
+failed) is recorded as stopped by its operator, the same as `lv stop`, so a host boot
+starts it again if it is `onboot`. Its disks are intact; retry the delete.
 
 `stop-delay` is the mirror of `start-delay` for an **orderly host shutdown**: running
 `lv host shutdown-workloads <host>` stops that host's VMs in *reverse* `startup-order`

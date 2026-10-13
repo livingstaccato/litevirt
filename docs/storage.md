@@ -314,7 +314,13 @@ answers again. litevirt keeps that from holding anything else:
   rebuilt from its image for it. The start is deferred as above, and nothing
   is defined or renamed until a later pass gets an answer. The VMs after it
   in the pass are reconciled as usual, so one dead pool costs the pass about
-  5 s, not the length of the outage.
+  5 s, not the length of the outage, when the disks' paths lie under the
+  pool's mount as written: the first look that goes unanswered marks the
+  mount, and every later look under it gives up at once. A disk reached
+  through a symlink into the mount is not recognised as on it, so each such
+  path costs its own 5 s the first time it is looked at (N of them, about
+  5·N s in that pass); later passes give up on them at once while those
+  looks are still stuck.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
   disk's chain does not answer, or listing the image store (a store whose

@@ -98,9 +98,11 @@ func within(t *testing.T, d time.Duration, what string, fn func()) {
 // the pass goes on to the next VM, and the start runs once the storage
 // answers.
 //
-// Mutation "the disk stat unbounded again" — every case is red on the time
-// limit. Mutation "a no-answer is a missing disk" — self-heal and onboot are
-// parked in error, the transfer is rebuilt: red.
+// Mutation "the disk stat unbounded again" — red on the time limit in every
+// case that reaches the stat (the host-local transfer defers on its bounded
+// lstat first; mutation "the set-aside lstat unbounded" covers it).
+// Mutation "a no-answer is a missing disk" — self-heal and onboot are
+// parked in error, the shared-pool transfer is rebuilt: red.
 func TestReconcile_ADiskThatDoesNotAnswerDefersItsStartAndHoldsNoOtherVM(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

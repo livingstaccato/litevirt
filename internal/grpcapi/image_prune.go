@@ -837,9 +837,12 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 			deleted[n] = true
 		}
 	}
-	var margin time.Duration
-	if len(deleted) > 0 {
-		margin = s.imageDeleteMargin(ctx)
+	// Each delete's margin, from its own time (imageDeleteMargin); one that
+	// cannot be had keeps the image's files.
+	margins := map[string]time.Duration{}
+	marginErr := map[string]error{}
+	for n := range deleted {
+		margins[n], marginErr[n] = s.imageDeleteMargin(ctx, deletedAt[n])
 	}
 	if hook := s.imagePrune.afterCatalog; hook != nil {
 		hook()
@@ -914,7 +917,11 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 				out.noteSharedKept(f)
 				continue
 			}
-		} else if why := publishedAfterDelete(n, f, deletedAt[n], margin); why != "" {
+		} else if err := marginErr[n]; err != nil {
+			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: fmt.Sprintf(
+				"the clock skews this host has seen cannot be read (%v), so whether the file was published before its image's delete cannot be told", err)})
+			continue
+		} else if why := publishedAfterDelete(n, f, deletedAt[n], margins[n]); why != "" {
 			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
 			continue
 		} else if why := sc.deletedKeep(f, r, n, snap[n], version != ""); why != "" {
@@ -955,28 +962,6 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 // deleted image's file within: hlc.MaxSkewMS, the skew between two hosts'
 // clocks litevirt tolerates before it refuses a peer's timestamps.
 const imageDeleteMarginFloor = time.Duration(hlc.MaxSkewMS) * time.Millisecond
-
-// imageDeleteMargin is how far apart the deleting host's clock and this
-// host's may be: the larger of imageDeleteMarginFloor and the largest clock
-// skew in any clock_skew row this host still holds — kept up to
-// ClockSkewRetention (1 hour), however old (review re-review 1, R-m3). The
-// skew that matters is the one at the time of the delete, which may since
-// have been corrected; an old row can only widen the margin, toward keeping.
-// The measurement records only skew over a second and rows age out, so a
-// missing row says nothing and never lowers the floor.
-func (s *Server) imageDeleteMargin(ctx context.Context) time.Duration {
-	m := imageDeleteMarginFloor
-	if d := s.imagePrune.deleteMargin.Load(); d > 0 {
-		m = time.Duration(d)
-	}
-	rows, err := s.db.Query(ctx, `SELECT COALESCE(MAX(ABS(skew_seconds)), 0) AS s FROM clock_skew`)
-	if err == nil && len(rows) == 1 {
-		if sk := time.Duration(rows[0].Float("s") * float64(time.Second)); sk > m {
-			m = sk
-		}
-	}
-	return m
-}
 
 // publishedAfterDelete is why file f of a deleted image is not the delete's
 // to remove ("" when it is). A delete removes what existed when it was made;
@@ -1411,7 +1396,8 @@ type imagePruneState struct {
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
 	deleteMargin atomic.Int64                              // test seam (ns); imageDeleteMarginFloor when 0
-	recordHook   atomic.Pointer[func(name string)]         // test seam: runs as recordImage begins
+	recordHook   atomic.Pointer[func(name, clock string)]  // test seam: runs as recordImage begins
+	skew         imageSkewHistory                          // the clock skews this host has seen (imageDeleteMargin)
 	pushUnmarked atomic.Bool                               // test seam: PushImage omits its copy mark, as an earlier build's does
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)

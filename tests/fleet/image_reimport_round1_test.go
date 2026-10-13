@@ -377,9 +377,26 @@ func TestFleet_ImageRm_AnUnmarkedPushFromAnEarlierBuildIsACopy(t *testing.T) {
 // began, reaches node-0 only after the import has recorded (the links into
 // node-0 are blocked, and nothing waits for the delete). The record was
 // written at clocks reserved as the import began, so the delete is newer and
-// wins on every host once the links heal.
+// wins on every host once the links heal — for node-0's own image_hosts row
+// too (re-review 2, m-1), in either form of that row.
 func TestFleet_ImageRm_StampedAfterAnImportBeganWinsThoughItArrivesLate(t *testing.T) {
-	c, n0 := liveImageCluster(t, "imgx")
+	t.Run("plain host row", func(t *testing.T) {
+		c, n0 := liveImageCluster(t, "imgx")
+		rmStampedAfterAnImportBegan(t, c, n0)
+	})
+	t.Run("reviving host row (release latched)", func(t *testing.T) {
+		c, gates := latchedFleet(t, 3, 0)
+		latchReleaseToken(t, c, gates)
+		imageRmFleet(c)
+		n0 := c.Nodes[0]
+		importImageSizedOn(t, c, n0, "imgx", 64<<20)
+		c.WaitConverged(t, convergeTimeout)
+		rmStampedAfterAnImportBegan(t, c, n0)
+	})
+}
+
+func rmStampedAfterAnImportBegan(t *testing.T, c *Cluster, n0 *Node) {
+	t.Helper()
 	n1, n2 := c.Nodes[1], c.Nodes[2]
 	c.SetLinkFault(n1, n0, LinkFault{Block: true})
 	c.SetLinkFault(n2, n0, LinkFault{Block: true})
@@ -402,4 +419,11 @@ func TestFleet_ImageRm_StampedAfterAnImportBeganWinsThoughItArrivesLate(t *testi
 	}
 	c.ClearLinkFaults()
 	deletedEverywhere(t, c, "imgx")
+	for _, n := range c.Nodes {
+		rows, err := n.DB.Query(context.Background(),
+			`SELECT host_name FROM image_hosts WHERE image_name = 'imgx' AND deleted_at IS NULL`)
+		if err != nil || len(rows) != 0 {
+			t.Errorf("%s: imgx's image_hosts rows read live after the delete: %v (err %v)", n.Name, rows, err)
+		}
+	}
 }

@@ -199,6 +199,17 @@ func (s *Server) SetImageRecordHookForTest(fn func(name string)) {
 		s.imagePrune.recordHook.Store(nil)
 		return
 	}
+	s.SetImageRecordClockHookForTest(func(name, _ string) { fn(name) })
+}
+
+// SetImageRecordClockHookForTest is SetImageRecordHookForTest whose fn also
+// gets the catalog insert clock the record is about to be written at, reserved
+// as the operation began: a test orders two operations' records by it.
+func (s *Server) SetImageRecordClockHookForTest(fn func(name, clock string)) {
+	if fn == nil {
+		s.imagePrune.recordHook.Store(nil)
+		return
+	}
 	s.imagePrune.recordHook.Store(&fn)
 }
 
@@ -206,4 +217,11 @@ func (s *Server) SetImageRecordHookForTest(fn func(name string)) {
 // before it did: the target must still take the push for a copy.
 func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
 	s.imagePrune.pushUnmarked.Store(unmarked)
+}
+
+// AutoPullFromPeerForTest is an auto-pull's transfer from source (what
+// AutoPullImage runs once it has found no usable local file): two auto-pulls
+// that both checked before either published each run it.
+func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source string) error {
+	return s.pullImageFromPeer(ctx, name, source)
 }

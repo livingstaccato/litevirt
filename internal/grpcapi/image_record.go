@@ -103,6 +103,10 @@ func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (*im
 	return t, nil
 }
 
+// imageRecordRetries bounds how often an operator's record is written again
+// at fresh clocks when a newer record of the image keeps landing first.
+const imageRecordRetries = 3
+
 // recordImage writes, for op, image name's catalog row and this host's
 // image_hosts row, once op has published its copy here. t is what op took as
 // it began (imageOpStart).
@@ -113,12 +117,20 @@ func (s *Server) imageOpStart(ctx context.Context, name string, op imageOp) (*im
 //     the reviving catalog row; a copy the plain one.
 //   - The catalog row is written at the clocks reserved as op began, and only
 //     if, in the same transaction, it still reads as it did then
-//     (corrosion.RecordImage). A delete applied here since op began, or a
-//     newer record, wins: nothing is recorded (Aborted), and the copy is left
-//     for lv image prune. A delete stamped after op began that reaches this
-//     host only later still wins everywhere, through LWW and anti-entropy. A
-//     delete stamped before op began that has not reached this host when op
-//     records does not: the record is newer (corrosion.RecordImage).
+//     (corrosion.RecordImage). A delete applied here since op began wins:
+//     nothing is recorded (Aborted), and the copy is left for lv image prune.
+//     A delete stamped after op began that reaches this host only later still
+//     wins everywhere, through LWW and anti-entropy. A delete stamped before
+//     op began that has not reached this host when op records does not: the
+//     record is newer (corrosion.RecordImage).
+//   - A newer live record of the image here (another copy, pull or import of
+//     it, begun after op) is not a delete (re-review 2, I-1). A copy then
+//     leaves the catalog row to it and records only this host's row. An
+//     operator's operation writes its row again at fresh clocks, so the newest
+//     operator content is the one recorded; in that case alone a delete stamped
+//     after op began that has not reached this host by then loses to it.
+//   - This host's row is written at the clock reserved with the catalog row's,
+//     unless a write to it here is newer (corrosion.RecordImageHost).
 func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, img corrosion.ImageRecord, ih corrosion.ImageHostRecord) error {
 	if t == nil {
 		var err error
@@ -127,7 +139,11 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 		}
 	}
 	if hook := s.imagePrune.recordHook.Load(); hook != nil {
-		(*hook)(img.Name)
+		clock := ""
+		if len(t.clocks) > 0 {
+			clock = t.clocks[0].Insert
+		}
+		(*hook)(img.Name, clock)
 	}
 	if t.deleted != "" && !op.revives() {
 		return status.Errorf(codes.FailedPrecondition,
@@ -138,27 +154,38 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 	if !ok {
 		return status.Errorf(codes.Internal, "image %q: this %s has no reserved record clocks left", img.Name, op)
 	}
-	applied, err := corrosion.RecordImage(ctx, s.db, img, op.revives(), t.deleted, clk)
-	if err != nil {
-		s.noteStateWriteFail(corrosion.OpImage, err)
-		return status.Errorf(codes.Internal, "record image: %v", err)
-	}
-	if !applied {
-		now, _ := corrosion.ImageDeletedAt(ctx, s.db, img.Name)
-		if now != "" && now != t.deleted {
-			return status.Errorf(codes.Aborted,
-				"image %q was deleted (lv image rm, at %s) while this %s ran: nothing is recorded, and the copy here is left for lv image prune",
-				img.Name, now, op)
+	outcome := corrosion.ImageRecordWritten
+	for attempt := 0; ; attempt++ {
+		var err error
+		outcome, err = corrosion.RecordImage(ctx, s.db, img, op.revives(), t.deleted, clk)
+		if err != nil {
+			s.noteStateWriteFail(corrosion.OpImage, err)
+			return status.Errorf(codes.Internal, "record image: %v", err)
 		}
+		if outcome != corrosion.ImageRecordSuperseded || !op.revives() || attempt >= imageRecordRetries {
+			break
+		}
+		clk = corrosion.ReserveImageClocks(s.db) // an operator's content is the newest: record it again, now
+	}
+	switch outcome {
+	case corrosion.ImageRecordDeleted:
+		now, _ := corrosion.ImageDeletedAt(ctx, s.db, img.Name)
 		return status.Errorf(codes.Aborted,
-			"image %q's catalog record changed while this %s ran: nothing is recorded, and the copy here is left for lv image prune",
-			img.Name, op)
+			"image %q was deleted (lv image rm, at %s) while this %s ran: nothing is recorded, and the copy here is left for lv image prune",
+			img.Name, now, op)
+	case corrosion.ImageRecordSuperseded:
+		if op.revives() {
+			return status.Errorf(codes.Aborted,
+				"image %q's catalog record kept changing while this %s ran: nothing is recorded, and the copy here is left for lv image prune",
+				img.Name, op)
+		}
+		// A copy: the newer record describes the image; this host holds a copy.
 	}
 	reviving := t.deleted != ""
 	if op.revives() {
 		t.deleted = "" // this record made the row live: the operation's next record begins from it
 	}
-	if err := s.recordImageHost(ctx, ih, reviving); err != nil {
+	if err := s.recordImageHost(ctx, ih, reviving, clk.Host); err != nil {
 		s.noteStateWriteFail(corrosion.OpImageHost, err)
 		return status.Errorf(codes.Internal, "record image host: %v", err)
 	}
@@ -166,6 +193,9 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 }
 
 // recordImageHost writes this host's image_hosts row for a copy it holds.
+//
+// It is written at, the clock the operation reserved as it began, unless a
+// write to the row here is newer (corrosion.RecordImageHost).
 //
 // Once the release token has durably latched here it is always the reviving
 // form (corrosion.ReviveImageHost), whatever the row reads here (review round
@@ -181,14 +211,17 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 // host until it is imported again after the upgrade.
 //
 // One race is left to the catalog row: a copy recorded while the image's
-// delete has not reached this host leaves this row live under a deleted
-// catalog row. lv image ls does not list the image, and GetImageHosts names
+// delete has not reached this host, where the delete is older than this row's
+// clock, leaves this row live under a deleted catalog row. That is a delete
+// stamped before the operation began, or, when the row was written here after
+// that (a pull's progress, or a record written again at fresh clocks), before
+// that write. lv image ls does not list the image, and GetImageHosts names
 // no host of a deleted image, so no auto-pull, compose deploy or placement
 // counts this one. The row and its file stay until lv image rm runs again
 // (the prune keeps a file published within its margin of the delete).
-func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostRecord, reviving bool) error {
+func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostRecord, reviving bool, at string) error {
 	if s.ReleaseTokenLatched() {
-		return corrosion.ReviveImageHost(ctx, s.db, ih)
+		return corrosion.RecordImageHost(ctx, s.db, ih, true, at)
 	}
 	if reviving {
 		slog.Warn("image: this host's copy of an image imported, pulled or built again under a deleted image's name is recorded, "+
@@ -197,5 +230,5 @@ func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostReco
 			"import it again after the upgrade",
 			"image", ih.ImageName, "host", ih.HostName)
 	}
-	return corrosion.InsertImageHost(ctx, s.db, ih)
+	return corrosion.RecordImageHost(ctx, s.db, ih, false, at)
 }

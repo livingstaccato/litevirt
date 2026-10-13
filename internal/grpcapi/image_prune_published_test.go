@@ -98,34 +98,49 @@ func TestPublishedAfterDelete_ReadsTheRepublish(t *testing.T) {
 
 // imageDeleteMargin: the floor (hlc.MaxSkewMS) unless a larger skew is in any
 // clock_skew row this host still holds, however old (review re-review 1,
-// R-m3): a skew that was large when the image was deleted and has since been
+// R-m3), or in the history of skews measured around the delete (re-review 2,
+// m-2): a skew that was large when the image was deleted and has since been
 // corrected still widens the margin.
 func TestImageDeleteMargin(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
-	if m := s.imageDeleteMargin(ctx); m != imageDeleteMarginFloor {
+	now := time.Now().UTC()
+	margin := func(del time.Time) time.Duration {
+		t.Helper()
+		m, err := s.imageDeleteMargin(ctx, del.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if m := margin(now); m != imageDeleteMarginFloor {
 		t.Fatalf("no measured skew: margin %s, want the floor %s", m, imageDeleteMarginFloor)
 	}
 	// 40 minutes ago a peer ran 15 minutes ahead; NTP has since fixed it, so
 	// no fresh row says so.
-	corrected := time.Now().UTC().Add(-40 * time.Minute).Format(time.RFC3339)
+	corrected := now.Add(-40 * time.Minute).Format(time.RFC3339)
 	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',900,?)`, corrected); err != nil {
 		t.Fatal(err)
 	}
-	if m := s.imageDeleteMargin(ctx); m != 15*time.Minute {
+	if m := margin(now); m != 15*time.Minute {
 		t.Fatalf("a 900 s skew measured 40 minutes ago and since corrected: margin %s, want 15m", m)
 	}
-	fresh := time.Now().UTC().Format(time.RFC3339)
+	fresh := now.Format(time.RFC3339)
 	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','c',-420,?)`, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if m := s.imageDeleteMargin(ctx); m != 15*time.Minute {
+	if m := margin(now); m != 15*time.Minute {
 		t.Fatalf("a fresh 420 s skew beside the older 900 s: margin %s, want the larger, 15m", m)
 	}
 	if err := s.db.Execute(ctx, `DELETE FROM clock_skew WHERE target = 'b'`); err != nil {
 		t.Fatal(err)
 	}
-	if m := s.imageDeleteMargin(ctx); m != 7*time.Minute {
-		t.Fatalf("only a 420 s skew: margin %s, want 7m", m)
+	if m := margin(now); m != 15*time.Minute {
+		t.Fatalf("the 900 s row gone, for a delete while it was measured: margin %s, want 15m still", m)
+	}
+	// A delete 3 hours on: the 900 s skew was measured more than
+	// ClockSkewRetention plus itself before it, and only the fresh row counts.
+	if m := margin(now.Add(3 * time.Hour)); m != 7*time.Minute {
+		t.Fatalf("a delete 3 hours after the 900 s skew, with a fresh 420 s row: margin %s, want 7m", m)
 	}
 }

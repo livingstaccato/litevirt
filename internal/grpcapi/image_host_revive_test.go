@@ -49,7 +49,7 @@ func TestRecordImageHost_UnlatchedWritesThePlainInsert(t *testing.T) {
 	ctx := context.Background()
 	for _, reviving := range []bool{false, true} {
 		before := streamLen(t, s)
-		if err := s.recordImageHost(ctx, testImageHost(s), reviving); err != nil {
+		if err := s.recordImageHost(ctx, testImageHost(s), reviving, s.db.NowTS()); err != nil {
 			t.Fatal(err)
 		}
 		if n := streamLen(t, s); n != before+1 {
@@ -71,7 +71,7 @@ func TestRecordImageHost_LatchedAlwaysRevives(t *testing.T) {
 	latchRelease(t, s)
 	for _, reviving := range []bool{false, true} {
 		before := streamLen(t, s)
-		if err := s.recordImageHost(ctx, testImageHost(s), reviving); err != nil {
+		if err := s.recordImageHost(ctx, testImageHost(s), reviving, s.db.NowTS()); err != nil {
 			t.Fatal(err)
 		}
 		if n := streamLen(t, s); n != before+1 {

@@ -723,9 +723,14 @@ lv image rm <image>
 #       than 5 minutes before the delete, or after it — more when hosts have
 #       measured a larger clock skew: the deleting host's clock and this
 #       one's may differ by that much, so it may belong to an import of the
-#       name since the delete. A delete time or publish time that cannot be
-#       read keeps the file too. lv image rm again, after the time the reason
-#       names, removes it.
+#       name since the delete. A skew counts for a delete made up to an hour
+#       (plus the skew) after it was last measured. Each host keeps the
+#       skews it has seen in image-delete-skew.json in its data directory,
+#       so a skew still counts after its measurements age out (an hour) and
+#       across a restart. A delete time or publish time that cannot be read
+#       keeps the file too, and so does that file when it cannot be read
+#       (remove it to start it afresh). lv image rm again, after the time the
+#       reason names, removes it.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>
@@ -744,7 +749,17 @@ lv image rm <image>
 #   the delete has already arrived, the operation records nothing and leaves
 #   its copy for lv image prune. An lv image rm stamped before it began that
 #   has not reached its host when it records loses to it; "before" is by the
-#   two hosts' clocks. The host's own record of its copy (the image's hosts
+#   two hosts' clocks. Two exceptions, where the operation's host has not
+#   received the delete when it records:
+#     - another import, pull, build, compose download or copy of the image,
+#       begun after this one, recorded first: an import, pull, build or
+#       compose download then records at that moment, and wins over a delete
+#       stamped before then. (A copy from a peer leaves the image's record
+#       to the newer one and records only its host's copy.)
+#     - lv image pull: its host's record of its copy is rewritten as the
+#       download progresses. The image stays deleted, but that host record,
+#       and the file, stay until lv image rm runs again when the delete was
+#       stamped before the last such rewrite. The host's own record of its copy (the image's hosts
 #   in lv image ls, which peers pull from and placement reads) is revived on
 #   the other hosts only once the cluster upgrade has finished
 #   (lv cluster upgrade-status). Before

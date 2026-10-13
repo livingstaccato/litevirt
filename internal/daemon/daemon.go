@@ -1414,6 +1414,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Remove the owner-epoch markers of VMs deleted while this host was not
 	// asked (in maintenance, unreachable), each time it becomes active.
 	go svc.RunDeletedVMMarkerSweep(ctx)
+	// Remember the clock skews this host sees past their rows' retention: the
+	// margin lv image prune keeps a deleted image's file within reads them.
+	go svc.RunImageSkewRecorder(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;

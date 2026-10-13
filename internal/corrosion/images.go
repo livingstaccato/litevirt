@@ -89,18 +89,48 @@ func ReviveImage(ctx context.Context, c *Client, img ImageRecord) error {
 	return c.ExecuteBatch(ctx, []Statement{imageInsert(img, clk.Insert), imageRevive(img.Name, clk.Revive)})
 }
 
-// ImageClocks are the two clocks of one write of an image's catalog row: its
-// insert's and its revive's, Insert strictly before Revive.
-type ImageClocks struct{ Insert, Revive string }
+// ImageClocks are the clocks of one record of an image: its catalog insert's
+// and revive's, Insert strictly before Revive, and this host's image_hosts
+// row's (Host).
+type ImageClocks struct{ Insert, Revive, Host string }
 
-// ReserveImageClocks takes, now, the clocks a later RecordImage writes the
-// catalog row at (review re-review 1, R-m1). An operation reserves them as it
-// begins, so a delete stamped after that — on any host — is newer than the
-// record, and LWW and anti-entropy keep the delete on every replica even
-// when it reaches the recording host only after the record is written.
+// ReserveImageClocks takes, now, the clocks a later RecordImage and
+// RecordImageHost write at (review re-review 1, R-m1). An operation reserves
+// them as it begins, so a delete stamped after that — on any host — is newer
+// than the record, and LWW and anti-entropy keep the delete on every replica
+// even when it reaches the recording host only after the record is written.
 func ReserveImageClocks(c *Client) ImageClocks {
 	ins := c.NowTS()
-	return ImageClocks{Insert: ins, Revive: c.NowTS()} // NowTS is strictly monotonic
+	rev := c.NowTS() // NowTS is strictly monotonic
+	return ImageClocks{Insert: ins, Revive: rev, Host: c.NowTS()}
+}
+
+// ImageRecordOutcome is what RecordImage did.
+type ImageRecordOutcome int
+
+const (
+	// ImageRecordWritten: the catalog row was written at the reserved clocks.
+	ImageRecordWritten ImageRecordOutcome = iota
+	// ImageRecordSuperseded: nothing was written. The row here is not
+	// deleted since the operation began, but was written at or after its
+	// reserved insert clock: a newer record of the image (another copy, pull
+	// or import of it).
+	ImageRecordSuperseded
+	// ImageRecordDeleted: nothing was written. The row here was deleted
+	// since the operation began (lv image rm).
+	ImageRecordDeleted
+)
+
+func (o ImageRecordOutcome) String() string {
+	switch o {
+	case ImageRecordWritten:
+		return "written"
+	case ImageRecordSuperseded:
+		return "superseded"
+	case ImageRecordDeleted:
+		return "deleted"
+	}
+	return "unknown"
 }
 
 // RecordImage writes image img's catalog row at clocks clk reserved as the
@@ -108,12 +138,16 @@ func ReserveImageClocks(c *Client) ImageClocks {
 // (revive: an operator's import, pull, build or compose download).
 //
 // It writes only if, in the same transaction, the row still reads as it did
-// when the operation began: its deleted_at is startDeleted ("" live or absent),
-// and no write here is newer than clk.Insert. Otherwise it writes nothing and
-// reports applied false: a delete applied here since the operation began
-// (lv image rm), or a newer record of the image, wins. A record at reserved
-// clocks over a newer row would regress it here while every peer kept the
-// newer one.
+// when the operation began. It reports:
+//   - ImageRecordDeleted when the row reads deleted with a deleted_at other
+//     than startDeleted ("" live or absent): a delete applied here since the
+//     operation began.
+//   - ImageRecordSuperseded when it is not, but a write here is at or after
+//     clk.Insert: a newer record of the image.
+//   - ImageRecordWritten otherwise, having written.
+//
+// A record at reserved clocks over a newer row would regress it here while
+// every peer kept the newer one, so neither case writes.
 //
 // What remains (the reservation is a clock, not a lock): a delete stamped
 // BEFORE the clocks were reserved, but not yet applied here when the record
@@ -121,24 +155,35 @@ func ReserveImageClocks(c *Client) ImageClocks {
 // "Before" is by two hosts' clocks, so a delete issued just after the
 // operation began on a host whose clock runs behind by more than that gap
 // loses too.
-func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (bool, error) {
+func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (ImageRecordOutcome, error) {
 	stmts := []Statement{imageInsert(img, clk.Insert)}
 	if revive {
 		stmts = append(stmts, imageRevive(img.Name, clk.Revive))
 	}
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	outcome := ImageRecordWritten
+	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var deletedAt, updatedAt string
 		err := tx.QueryRowContext(ctx,
 			`SELECT COALESCE(deleted_at, ''), COALESCE(updated_at, '') FROM images WHERE name = ?`, img.Name).
 			Scan(&deletedAt, &updatedAt)
 		if errors.Is(err, sql.ErrNoRows) {
-			return startDeleted == "", nil
+			return true, nil
 		}
 		if err != nil {
 			return false, err
 		}
-		return deletedAt == startDeleted && lwwOrder(updatedAt, clk.Insert) < 0, nil
+		switch {
+		case deletedAt != "" && deletedAt != startDeleted:
+			outcome = ImageRecordDeleted
+		case lwwOrder(updatedAt, clk.Insert) >= 0:
+			outcome = ImageRecordSuperseded
+		}
+		return outcome == ImageRecordWritten, nil
 	}, stmts)
+	if err != nil {
+		return 0, err
+	}
+	return outcome, nil
 }
 
 // ImageDeletedAt is the deleted_at of image name's row here: "" when the row
@@ -154,14 +199,52 @@ func ImageDeletedAt(ctx context.Context, c *Client, name string) (string, error)
 	return rows[0].String("d"), nil
 }
 
+// imageHostInsertSQL is InsertImageHost's write.
+const imageHostInsertSQL = `INSERT OR REPLACE INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+
 // InsertImageHost records that a host has a copy of an image.
 func InsertImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
-	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		ih.ImageName, ih.HostName, ih.Path, ih.Status, ih.PulledAt, now,
-	)
+	return c.ExecuteBatch(ctx, []Statement{imageHostWrite(ih, false, c.NowTS())})
+}
+
+// imageHostWrite is this host's image_hosts row for ih at updatedAt: the
+// reviving form (ReviveImageHost) or the plain insert (InsertImageHost).
+func imageHostWrite(ih ImageHostRecord, revive bool, updatedAt string) Statement {
+	params := []interface{}{ih.ImageName, ih.HostName, ih.Path, ih.Status, ih.PulledAt, updatedAt}
+	if revive {
+		return Statement{SQL: imageHostReviveSQL, Params: params}
+	}
+	return Statement{SQL: imageHostInsertSQL, Params: params}
+}
+
+// RecordImageHost writes ih, an image operation's record of its copy here, in
+// the reviving form (revive, ReviveImageHost) or the plain insert
+// (InsertImageHost), at the clock the operation reserved as it began (at,
+// ImageClocks.Host): a delete stamped after the start is then newer than the
+// row on every host, this one too (re-review 2, m-1). When a write here to
+// the row is already at or after at — a pull's progress, or another
+// operation's record — it writes at a fresh clock instead, so the row never
+// regresses here while a peer keeps the newer one; a delete stamped before
+// that write then loses to the row.
+func RecordImageHost(ctx context.Context, c *Client, ih ImageHostRecord, revive bool, at string) error {
+	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var updatedAt string
+		err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(updated_at, '') FROM image_hosts WHERE image_name = ? AND host_name = ?`, ih.ImageName, ih.HostName).
+			Scan(&updatedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return lwwOrder(updatedAt, at) < 0, nil
+	}, []Statement{imageHostWrite(ih, revive, at)})
+	if err != nil || ok {
+		return err
+	}
+	return c.ExecuteBatch(ctx, []Statement{imageHostWrite(ih, revive, c.NowTS())})
 }
 
 // imageHostReviveSQL is InsertImageHost's write as an explicit upsert that
@@ -191,9 +274,7 @@ const imageHostReviveSQL = `INSERT INTO image_hosts (image_name, host_name, path
 // whatever the row reads here — the delete may not have reached this host
 // yet (review round 1, I-2).
 func ReviveImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
-	return c.Execute(ctx, imageHostReviveSQL,
-		ih.ImageName, ih.HostName, ih.Path, ih.Status, ih.PulledAt, c.NowTS(),
-	)
+	return c.ExecuteBatch(ctx, []Statement{imageHostWrite(ih, true, c.NowTS())})
 }
 
 // UpdateImageHostProgress updates the download progress for a pulling image.

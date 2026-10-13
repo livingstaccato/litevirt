@@ -5641,26 +5641,47 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 			continue
 		}
 		file := s.hostDiskFile(d.Path)
-		info, err := qcow2.Info(file)
-		if err != nil || info.BackingFile == "" {
-			continue
+		// The disk's own file and its chain are read under a bound: a disk
+		// on a network filesystem whose server does not answer is refused,
+		// saying so, instead of holding this start — and, behind its VM
+		// lock, the VM's stop — for as long as the server does not answer
+		// (lab 2 N-1).
+		_, err := storage.BoundedOuter("judge the start chain of", file, func() (struct{}, error) {
+			return struct{}{}, s.verifyImageBaseForStart(ctx, vm, d, file)
+		})
+		if storage.IsFSNoAnswer(err) {
+			slog.Warn("start refused: a disk's storage does not answer", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
+			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v",
+				d.DiskName, vm.Name, filepath.Base(file), err)
 		}
-		// The whole chain, layer by layer, by the rule every copy path
-		// judges it by (verifyDiskChainForStart).
-		if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+		if err != nil {
 			return err
 		}
-		b := info.BackingFile
-		if !filepath.IsAbs(b) {
-			b = filepath.Join(filepath.Dir(file), b)
-		}
-		if s.images == nil || !s.images.Contains(b) {
-			continue
-		}
-		if err := s.images.AssertBase(b); err != nil {
-			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
-			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
-		}
+	}
+	return nil
+}
+
+// verifyImageBaseForStart is verifyImageBasesForStart for one disk.
+func (s *Server) verifyImageBaseForStart(ctx context.Context, vm *corrosion.VMRecord, d corrosion.DiskRecord, file string) error {
+	info, err := qcow2.Info(file)
+	if err != nil || info.BackingFile == "" {
+		return nil
+	}
+	// The whole chain, layer by layer, by the rule every copy path
+	// judges it by (verifyDiskChainForStart).
+	if err := s.verifyDiskChainForStart(ctx, vm, d, file); err != nil {
+		return err
+	}
+	b := info.BackingFile
+	if !filepath.IsAbs(b) {
+		b = filepath.Join(filepath.Dir(file), b)
+	}
+	if s.images == nil || !s.images.Contains(b) {
+		return nil
+	}
+	if err := s.images.AssertBase(b); err != nil {
+		slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
+		return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
 	}
 	return nil
 }

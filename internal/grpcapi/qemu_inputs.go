@@ -11,6 +11,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -154,7 +155,7 @@ func confineTo(resolved string, roots ...string) error {
 		if r == "" {
 			continue
 		}
-		if rr, err := filepath.EvalSymlinks(r); err == nil {
+		if rr, err := storage.EvalSymlinksBounded(r); err == nil {
 			r = rr
 		}
 		if resolved != r && safename.Contains(r, resolved) {
@@ -698,8 +699,14 @@ func (s *Server) recordPath(resolved string) string {
 }
 
 // resolvedOr is p resolved through symlinks, or p as given when it cannot be.
+// The resolution is bounded (storage.EvalSymlinksBounded): a mount point is
+// its own resolution, with no system call, and a path whose resolution does
+// not finish in time (a network filesystem that does not answer) is taken as
+// given, as one that cannot be resolved always was. A start chains every
+// pool directory of the host through here (chainPoolDirs), and hung on an
+// nfs pool's dead mount point (lab 2 N-1).
 func resolvedOr(p string) string {
-	if r, err := filepath.EvalSymlinks(p); err == nil {
+	if r, err := storage.EvalSymlinksBounded(p); err == nil {
 		return r
 	}
 	return filepath.Clean(p)

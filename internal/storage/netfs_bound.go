@@ -85,8 +85,20 @@ var (
 // Only a call of the same op, on the same path, with the same result type T
 // is joined: a joined call returns exactly what that call returns.
 func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
+	return boundedFor(fsCallBound, op, path, fn)
+}
+
+// BoundedOuter is Bounded for a call that itself makes bounded calls (a VM
+// start's chain check resolves every pool directory of the host): it waits
+// four bounds, so the calls inside it give up, and it goes on past them,
+// before it does.
+func BoundedOuter[T any](op, path string, fn func() (T, error)) (T, error) {
+	return boundedFor(4*fsCallBound, op, path, fn)
+}
+
+func boundedFor[T any](bound time.Duration, op, path string, fn func() (T, error)) (T, error) {
 	typ := reflect.TypeFor[T]().String()
-	v, err := boundedCall(op, typ, path, func() (any, error) { return fn() })
+	v, err := boundedCall(bound, op, typ, path, func() (any, error) { return fn() })
 	if err != nil {
 		var zero T
 		if t, ok := v.(T); ok {
@@ -101,8 +113,7 @@ func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
 	return t, nil
 }
 
-func boundedCall(op, typ, path string, fn func() (any, error)) (any, error) {
-	bound := fsCallBound
+func boundedCall(bound time.Duration, op, typ, path string, fn func() (any, error)) (any, error) {
 	path = filepath.Clean(path)
 	mount := networkMountOf(path)
 	if mount.key != "" && mountUnanswered(mount.key) {
@@ -242,6 +253,33 @@ func resolveBounded(t *MountTable, p string) (string, error) {
 	}
 	resolve := resolvePathFn
 	return Bounded("resolve the symlinks of", clean, func() (string, error) { return resolve(clean), nil })
+}
+
+// evalSymlinksFn is filepath.EvalSymlinks; tests replace it.
+var evalSymlinksFn = filepath.EvalSymlinks
+
+// EvalSymlinksBounded is filepath.EvalSymlinks without letting a network
+// filesystem that does not answer hold the caller (lab 2 N-1: every VM start
+// resolved every pool directory of the host, the nfs pool's mount point
+// included, and hung while its server did not answer). A path the mount
+// table has as a mount point is its own resolution, with no system call; any
+// other is evaluated under Bounded, and an *FSNoAnswerError when it does not
+// finish in time.
+func EvalSymlinksBounded(p string) (string, error) {
+	clean := filepath.Clean(p)
+	if t, err := ReadMountTable(); err == nil && t.isMountPoint(clean) {
+		return clean, nil
+	}
+	eval := evalSymlinksFn
+	return Bounded("evaluate the symlinks of", clean, func() (string, error) { return eval(clean) })
+}
+
+// OverrideEvalSymlinksForTest replaces how EvalSymlinksBounded evaluates a
+// path, for tests in other packages. It returns the restore function.
+func OverrideEvalSymlinksForTest(eval func(string) (string, error)) func() {
+	prev := evalSymlinksFn
+	evalSymlinksFn = eval
+	return func() { evalSymlinksFn = prev }
 }
 
 // pathFormsBounded is pathForms under resolveBounded: p cleaned, plus what it

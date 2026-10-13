@@ -230,3 +230,22 @@ func TestStartVM_ARearmedStartHoldsItsCapacity(t *testing.T) {
 	}
 }
 
+// Re-review m-4: a starting row the reconciler parked as a proof-less
+// transfer (the probe the daemon wires to Reconciler.IsDeferredTransfer)
+// is recorded as a transfer, so the start made again sets the old copy
+// aside.
+//
+// Mutation: the probe not consulted — Transfer false: red.
+func TestStopVM_ForceCancelOfAParkedTransferRecordsIt(t *testing.T) {
+	s := hotplugDiskServer(t)
+	heldVMNoDomain(t, s, "starting")
+	var asked []string
+	s.SetStartTransferProbe(func(vm string) bool { asked = append(asked, vm); return true })
+	if _, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: true}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	ev, err := health.StartCancelledOf(context.Background(), s.db, "vm1", s.hostName)
+	if err != nil || ev == nil || !ev.Transfer || len(asked) == 0 || asked[0] != "vm1" {
+		t.Fatalf("record %+v (%v), probe asked for %v; want a transfer the probe said vm1 was", ev, err, asked)
+	}
+}

@@ -35,7 +35,7 @@ import (
 //	E2E_LAB_EXCLUDE    comma-separated node numbers the harness leaves alone
 //	                   (e.g. 3): never baselined, restored, powered on or picked.
 //	E2E_LAB_SOCKET_DIR where the SSH control sockets live (default
-//	                   $E2E_LAB_DIR/.e2e-ssh).
+//	                   <user cache dir>/litevirt-e2e-ssh, outside the lab checkout).
 //	LV_BIN             in lab mode, the lv binary ON THE NODES
 //	                   (e.g. /usr/local/bin/litevirt).
 //	E2E_EVIDENCE_DIR   where each drill writes its samples and timeline.
@@ -194,7 +194,11 @@ func newLab(t *testing.T) *lab {
 	}
 	sockRoot := os.Getenv("E2E_LAB_SOCKET_DIR")
 	if sockRoot == "" {
-		sockRoot = filepath.Join(labDir, ".e2e-ssh")
+		base, cerr := os.UserCacheDir()
+		if cerr != nil {
+			base = os.TempDir()
+		}
+		sockRoot = filepath.Join(base, "litevirt-e2e-ssh")
 	}
 	if err := os.MkdirAll(sockRoot, 0o700); err != nil {
 		t.Fatalf("ssh control socket dir: %v", err)
@@ -893,14 +897,16 @@ func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) ma
 	return l.createStackOf(via, prefix, roomOnly, drillImage(), drillMemory(), hosts...)
 }
 
-// createStackOf is createStack with an image and memory of its own.
-// putFile writes content to path on host and removes it when the test ends.
+// putFile writes content to path on host and removes it in restore, once the
+// faults are undone and the host answers again (a partitioned, frozen or
+// powered-off node could not be reached sooner).
 func (l *lab) putFile(host, path, content string) {
 	l.t.Helper()
 	l.mustSSH(host, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(content))+" | base64 -d > "+shellQuote(path))
-	l.t.Cleanup(func() { l.ssh(host, 30*time.Second, "rm -f "+shellQuote(path)) })
+	l.onRestore(func() { l.ssh(host, 30*time.Second, "rm -f "+shellQuote(path)) })
 }
 
+// createStackOf is createStack with an image and memory of its own.
 func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory string, hosts ...string) map[string]string {
 	l.t.Helper()
 	stack := uniqueName(prefix)

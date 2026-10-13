@@ -140,7 +140,7 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 	b := l.requireBaseline()
 	l.restoreOnCleanup(b)
 
-	n := len(l.hosts)
+	n := l.total // an excluded node is still a voter
 	q := l.hosts[0]
 	second := l.leastLoaded(q, l.except(q))
 	first := l.pick(func(h string) bool { return h != q && h != second }, true)
@@ -304,7 +304,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	}
 	l.saveEvidence("claim-during.txt", claim)
 	refusals := strings.Count(claim, health.ReasonClaimOwnerReachable)
-	need := len(l.hosts) - (len(l.hosts)/2 + 1) + 1 // enough refusals that no majority can accept
+	need := l.total - (l.total/2 + 1) + 1 // enough refusals that no majority can accept
 	if refusals < need {
 		t.Errorf("%s: %d voters refused with %s, want at least %d (all that reach the owner):\n%s", key, refusals, health.ReasonClaimOwnerReachable, need, claim)
 	}

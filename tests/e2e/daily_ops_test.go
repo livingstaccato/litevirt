@@ -175,6 +175,7 @@ func TestLab_MigrationNetworkCarriesTheStorageCopy(t *testing.T) {
 
 	// Sample the source's established migration connections while the move runs.
 	sample := "for i in $(seq 1 240); do ss -Htn state established '( dport >= :49152 and dport <= :49215 )'; sleep 0.25; done > /tmp/mignet.ss 2>&1 &"
+	l.onRestore(func() { l.ssh(src, 20*time.Second, "rm -f /tmp/mignet.ss") })
 	l.mustSSH(src, 20*time.Second, "rm -f /tmp/mignet.ss; "+sample+" echo started")
 	out, err := l.lv(q, "migrate", vm, dst, "--with-storage")
 	if err != nil {
@@ -411,6 +412,7 @@ func TestLab_MigrationNetworkCarriesMemoryOnlyOverTLS(t *testing.T) {
 	vm := l.createSharedVM(q, "mignetmem", src, pool, false)
 
 	sample := "for i in $(seq 1 240); do ss -Htn state established '( dport >= :49152 and dport <= :49215 ) or ( dport = :16514 )'; sleep 0.25; done > /tmp/mignetmem.ss 2>&1 &"
+	l.onRestore(func() { l.ssh(src, 20*time.Second, "rm -f /tmp/mignetmem.ss") })
 	l.mustSSH(src, 20*time.Second, "rm -f /tmp/mignetmem.ss; "+sample+" echo started")
 	out, err := l.lv(q, "migrate", vm, dst)
 	if err != nil {

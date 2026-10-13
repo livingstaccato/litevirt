@@ -152,7 +152,7 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 		}
 		d := at.Sub(start)
 		l.mark("drill1: %s replacement executing at +%v on %v", k, d.Round(time.Millisecond), s.last().executing(k))
-		if min := earliestReplacement(len(l.hosts)); d < min {
+		if min := earliestReplacement(l.total); d < min {
 			t.Errorf("%s replacement executed %v after the split, before (F−1)·P + W = %v: the majority did not wait out the pause", k, d, min)
 		}
 		if p, ok := pausedAt[k]; ok && !at.After(p) {

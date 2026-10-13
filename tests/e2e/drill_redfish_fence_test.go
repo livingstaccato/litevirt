@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"context"
-	"encoding/base64"
 	"os"
 	"os/exec"
 	"strings"
@@ -94,8 +93,7 @@ func TestDrill_RedfishFenceRecordsFencedAndRecovers(t *testing.T) {
 	}
 	if cfg.CACert != "" {
 		const caPath = "/tmp/e2e-redfish-ca.pem"
-		l.mustSSH(q, 20*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(cfg.CACert))+
-			" | base64 -d > "+caPath)
+		l.putFile(q, caPath, cfg.CACert)
 		args = append(args, "--redfish-ca-file", caPath)
 	}
 	if out, err := l.lvWithStdin(q, cfg.Pass+"\n", args...); err != nil {

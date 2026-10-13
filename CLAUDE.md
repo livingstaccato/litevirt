@@ -50,6 +50,14 @@ race:
 go test -race -timeout 45m ./internal/health/
 ```
 
+**`tests/fleet` needs `-timeout 60m` even without `-race`.** The full suite
+takes about 24 minutes on an idle kvm003 and runs past 40 when several suites
+share the host, so Go's 10-minute default kills it:
+
+```bash
+go test -count=1 -timeout 60m ./tests/fleet/
+```
+
 Do not pipe a race run through `tail -N`. That discards the `panic: test timed
 out` header and leaves only a goroutine dump, which is exactly the evidence you
 need to tell the two apart. Redirect to a file and grep it.
@@ -120,9 +128,10 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**. There are three
-  exceptions, which default **true**, and an explicit `false` is the kill
-  switch of each:
+- each has an `enforcement.*` config flag, default **false**. There are five
+  exceptions, which default **true** (the preset in `LoadConfig`,
+  `internal/daemon/config.go`), and an explicit `false` is the kill switch of
+  each:
   - `enforcement.audit_signature`: each host signs only its own rows, so no
     node relies on a peer, and a key that fails to load leaves the daemon
     running and reports its unsigned rows as evidence (docs/audit-log.md,
@@ -140,6 +149,15 @@ Hardening features are gated on cluster-wide capability tokens
     an older one only with an explicit `true`. That older build is not
     WAL-quarantined after a rollback and reads a missing key as false
     (docs/design/recovery-claims.md §5.1, §5.5, §5.6).
+  - `enforcement.console_password`: each define gives the VM's VNC and SPICE
+    consoles a fresh per-VM password, once `console_password_v1` has latched
+    (an older build cannot present one). The token is advertised on the build,
+    not the flag: presenting a password is unconditional, so no host relies on
+    a peer setting them (docs/ui.md, "Console passwords").
+  - `enforcement.digest_v2`: not a capability token. The order-invariant
+    anti-entropy row digest is negotiated pairwise by wire-field presence, so a
+    non-uniform rollout is safe; with it off, replicas founded at different
+    schema versions disagree about identical rows forever.
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore
@@ -188,8 +206,11 @@ There are exceptions, of two different kinds, and neither is "the one":
   one place, `capabilities.mandatory` (read it; prose copies of it have gone
   stale twice). They are reserved for a token stating a *fact about the binary*
   rather than a policy — at the time of writing `split_brain_gate_v1`,
-  `lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
-  `failover_scope_v1` and `voter_config_v1`, but trust the declaration, not
+  `lease_term_ledger_v1`, `credentials_split_v1`, `credentials_clear_v1`,
+  `host_membership_split_v1`, `host_membership_retire_v1`,
+  `host_runtime_split_v1`, `host_runtime_retire_v1`, `failover_scope_v1`,
+  `voter_config_v1`, `claim_incarnation_v1`, `fence_state_v1`,
+  `relay_health_v1` and `release_2026_11_v1`, but trust the declaration, not
   this list. A mandatory token has no flag to turn off in an incident — see
   the per-token stand-down notes beside that declaration.
   `credentials_split_v1` has none at all. Once latched, hosts dual-write the

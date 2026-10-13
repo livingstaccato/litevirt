@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -108,4 +109,47 @@ func TestRecordStartCancelled_KeepsATransfer(t *testing.T) {
 	if ev, err := StartCancelledOf(ctx, db, "vm1", "node-a"); err != nil || ev == nil || !ev.Transfer {
 		t.Fatalf("record %+v (%v), want the transfer kept", ev, err)
 	}
+}
+
+// Review m-1: the start lease can run out under a slow start, and a cancel
+// (`lv stop --force`) then takes it and writes stopped/operator-stop while
+// the start goes on. The start reads the row again before the define and
+// again before the boot, and makes nothing: no define in the first case;
+// in the second, what it defined is taken back and the domain never runs.
+//
+// Mutations: no check before the define — defined: red. No check before the
+// boot — started: red.
+func TestStartPendingVM_AStopDuringTheStartIsNotOverridden(t *testing.T) {
+	stop := func(t *testing.T, db *corrosion.Client) {
+		t.Helper()
+		if err := corrosion.UpdateVMStateStrict(context.Background(), db, "vm1", "stopped", "operator-stop"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("before the define", func(t *testing.T) {
+		db, fake, r, _ := supersededFixture(t, "starting")
+		r.diskStat = func(p string) (os.FileInfo, error) { stop(t, db); return os.Stat(p) }
+		fresh, _ := corrosion.GetVM(context.Background(), db, "vm1")
+		r.startPendingVM(context.Background(), *fresh)
+		if startedOrDefined(fake, "vm1") {
+			t.Fatal("a start stopped before its define defined or started the VM")
+		}
+	})
+	t.Run("before the boot", func(t *testing.T) {
+		db, fake, r, _ := supersededFixture(t, "starting")
+		r.startDomainHook = func(context.Context) { stop(t, db) }
+		fresh, _ := corrosion.GetVM(context.Background(), db, "vm1")
+		r.startPendingVM(context.Background(), *fresh)
+		for _, e := range fake.EventLog() {
+			if e.Domain == "vm1" && e.Op == "start" {
+				t.Fatal("a start stopped before its boot started the VM")
+			}
+		}
+		if fake.DomainExists("vm1") {
+			t.Fatal("the definition this start made was left behind")
+		}
+		if vm, _ := corrosion.GetVM(context.Background(), db, "vm1"); vm.State != "stopped" || vm.StateDetail != "operator-stop" {
+			t.Fatalf("row %q/%q, want the stop kept", vm.State, vm.StateDetail)
+		}
+	})
 }

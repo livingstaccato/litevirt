@@ -111,6 +111,15 @@ func (r *Reconciler) cancelledTransfer(ctx context.Context, vmName string) bool 
 	return err == nil && ev != nil && ev.Transfer
 }
 
+// cancelledSinceStart reports whether vmName's row, re-read now, says its
+// operator stopped it: once startPendingVM has written "starting", that is a
+// stop made while the start was under way, which the start must not
+// override. The read is local and not cut short by the walk budget.
+func (r *Reconciler) cancelledSinceStart(ctx context.Context, vmName string) bool {
+	fresh, err := corrosion.GetVM(context.WithoutCancel(ctx), r.db, vmName)
+	return err == nil && fresh != nil && fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail)
+}
+
 // cancelledStarts is the open vm_start_cancelled records, by VM: the host
 // each start was cancelled on.
 func cancelledStarts(ctx context.Context, db *corrosion.Client) (map[string]string, error) {

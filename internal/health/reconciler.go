@@ -1934,6 +1934,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// own to remove (start_row_gone.go).
 	nvramBefore := nvramExists(r.dataDir, vm.Name)
 
+	// A start the operator cancelled meanwhile (`lv stop --force`) is not
+	// made: the start lease can run out under a slow start (vmLockTTL),
+	// so the cancel may have run inside this one.
+	if r.cancelledSinceStart(ctx, vm.Name) {
+		slog.Warn("reconciler: not defining the VM — its start was cancelled while it was being made", "vm", vm.Name)
+		return
+	}
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1989,6 +1997,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 		if unreadable && proofID != "" {
 			r.failPendingStart(ctx, vm.Name, proofID, true, "not started: "+why)
+		}
+		return
+	}
+	// Again just before the boot: what this pass defined is taken back,
+	// firmware state kept, so the VM is as the cancel found it.
+	if r.cancelledSinceStart(ctx, vm.Name) {
+		releaseHW()
+		slog.Warn("reconciler: not starting the VM — its start was cancelled while it was being made", "vm", vm.Name)
+		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
+			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
 		}
 		return
 	}

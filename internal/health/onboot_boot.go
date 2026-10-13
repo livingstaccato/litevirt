@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -224,4 +226,25 @@ func writeOnbootRecord(dataDir string, rec onbootRecord) error {
 		return fmt.Errorf("record the boot: %w", err)
 	}
 	return nil
+}
+
+// listOnbootVMs reads the VM list for onboot with the retry policy of the
+// publish read (rowForPublish): 4 attempts, a backoff of attempt×100ms
+// before each retry, and none after the last; a cancelled ctx stops it.
+func listOnbootVMs(ctx context.Context, list func(context.Context) ([]corrosion.VMRecord, error)) ([]corrosion.VMRecord, error) {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, errors.Join(err, ctx.Err())
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			}
+		}
+		var vms []corrosion.VMRecord
+		if vms, err = list(ctx); err == nil {
+			return vms, nil
+		}
+	}
+	return nil, err
 }

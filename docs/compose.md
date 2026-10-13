@@ -218,7 +218,10 @@ delays, and a stop made in that wait reads exactly like the one the boot found, 
 boot (or a daemon restart in that wait) still starts it. Turn `onboot` off to cancel a
 boot start. If the daemon cannot write its record, it removes the old one and logs an
 error: a restart later in that boot then honours every operator stop, so an onboot VM
-the boot had not started yet stays stopped until started by hand.
+the boot had not started yet stays stopped until started by hand. Likewise, if the
+daemon cannot read its VM list at boot (retried 4 times over about 0.6 s), it starts no
+`onboot` VM, logs an error, and records the boot owing nothing: a VM its operator
+stopped stays stopped on that boot.
 
 A VM whose `lv rm` failed after its stop step (an undefine or a device release that
 failed) is recorded as stopped by its operator, the same as `lv stop`, so a host boot

@@ -257,6 +257,9 @@ type Reconciler struct {
 	// writeRecord writes the onboot record; nil is writeOnbootRecord. Tests
 	// make it fail.
 	writeRecord func(dataDir string, rec onbootRecord) error
+	// listVMs lists this host's VMs for onboot; nil is corrosion.ListVMs.
+	// Tests make it fail.
+	listVMs func(ctx context.Context) ([]corrosion.VMRecord, error)
 
 	// prepareHardwareForStart, when wired (the daemon passes the gRPC Server's
 	// PrepareHardwareForStart), runs the hardware_v2 adoption gate + PCI start-preflight
@@ -525,12 +528,30 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 	if r.virt == nil {
 		return
 	}
-	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
+	listVMs := r.listVMs
+	if listVMs == nil {
+		listVMs = func(ctx context.Context) ([]corrosion.VMRecord, error) {
+			return corrosion.ListVMs(ctx, r.db, "", r.hostName)
+		}
+	}
+	vms, err := listOnbootVMs(ctx, listVMs)
+	boot := r.onbootBootState()
 	if err != nil {
-		slog.Error("onboot: list VMs", "error", err)
+		// Fail closed: record this boot owing nothing, so a daemon restart
+		// later in this boot reads "same boot, nothing owed" and honours
+		// every operator stop — never the previous boot's record, which
+		// reads as a host boot and would override a stop made since. The
+		// cost: an operator-stopped onboot VM stays stopped on this boot
+		// (`lv start` starts it).
+		slog.Error("onboot: cannot list this host's VMs; no onboot VM is started, and this boot is recorded owing none, so a VM its operator stopped stays stopped",
+			"error", err, "host_boot", boot.hostBoot)
+		r.onbootMu.Lock()
+		r.onbootBootID = boot.id
+		r.onbootOverride = map[string]onbootStop{}
+		r.persistOnbootLocked()
+		r.onbootMu.Unlock()
 		return
 	}
-	boot := r.onbootBootState()
 	type onbootVM struct {
 		vm    corrosion.VMRecord
 		order int

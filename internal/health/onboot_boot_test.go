@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -529,4 +530,61 @@ func TestOnboot_LeftoverTempRecordsAreSwept(t *testing.T) {
 		t.Fatalf("the sweep removed a file that is not a temp record: %v", err)
 	}
 	requireRecord(t, dataDir, bootNow)
+}
+
+// Round 3 (ruling on the ListVMs failure). The VM list at a host boot is
+// read with the same 4-attempt backoff as the publish read (rowForPublish):
+// a transient failure costs nothing, and the boot's starts are made.
+//
+// Mutation "one attempt": red.
+func TestOnboot_ATransientListFailureAtBootIsRetried(t *testing.T) {
+	_, fake, r, dataDir := onbootFixture(t, bootBefore, bootNow)
+	ctx := context.Background()
+	calls := 0
+	r.listVMs = func(ctx context.Context) ([]corrosion.VMRecord, error) {
+		calls++
+		if calls < 3 {
+			return nil, errors.New("database is locked")
+		}
+		return corrosion.ListVMs(ctx, r.db, "", r.hostName)
+	}
+	r.StartOnbootVMs(ctx)
+	if !hwStarted(fake, "ob") {
+		t.Fatalf("the host boot did not start ob after %d list attempts", calls)
+	}
+	requireRecord(t, dataDir, bootNow)
+}
+
+// Round 3. A VM list that fails every attempt at a host boot fails CLOSED:
+// the boot is recorded owing nothing (Error logged), so a daemon restart
+// later in this boot reads "same boot, nothing owed" and honours every
+// operator stop — never the previous boot's record, which would read as a
+// host boot and override a stop made since. The cost, accepted: an
+// operator-stopped onboot VM stays stopped on that boot.
+//
+// Mutation "a failed list records nothing" (the old return): red.
+// Mutation "the failed list is not retried": red on the attempt count.
+func TestOnboot_AListThatNeverAnswersAtBootRecordsTheBootOwingNothing(t *testing.T) {
+	db, fake, r, dataDir := onbootFixture(t, bootBefore, bootNow)
+	ctx := context.Background()
+	calls := 0
+	r.listVMs = func(context.Context) ([]corrosion.VMRecord, error) {
+		calls++
+		return nil, errors.New("database is locked")
+	}
+	r.StartOnbootVMs(ctx)
+	if calls != 4 {
+		t.Fatalf("the VM list was tried %d times, want 4", calls)
+	}
+	if hwStarted(fake, "ob") {
+		t.Fatal("ob started although the VM list never answered")
+	}
+	requireRecord(t, dataDir, bootNow)
+
+	r2 := restartedReconciler(db, fake, dataDir, bootNow)
+	r2.StartOnbootVMs(ctx)
+	r2.reconcile(ctx)
+	if hwStarted(fake, "ob") {
+		t.Fatal("a daemon restart after the failed boot list started ob over its operator's stop")
+	}
 }

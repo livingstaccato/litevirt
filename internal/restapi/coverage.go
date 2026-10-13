@@ -136,6 +136,10 @@ func (s *Server) handleStackDeploy(w http.ResponseWriter, r *http.Request) {
 			if p.VmName != "" {
 				res.Done = append(res.Done, p.VmName)
 			}
+		case "warning":
+			// The plan's warnings, a withheld NIC security restore among
+			// them: the deploy succeeded, but the caller is told.
+			res.Warnings = append(res.Warnings, p.Detail)
 		}
 	}
 	if len(res.Failures) > 0 {
@@ -159,6 +163,7 @@ type stackDeployResult struct {
 	Name     string               `json:"name"`
 	Done     []string             `json:"done"`
 	Failures []stackDeleteFailure `json:"failures"`
+	Warnings []string             `json:"warnings,omitempty"`
 	Error    string               `json:"error,omitempty"`
 }
 

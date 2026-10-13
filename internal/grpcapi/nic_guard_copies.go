@@ -8,10 +8,15 @@ import "github.com/litevirt/litevirt/internal/corrosion"
 // create's and a clone's do (the source's relaxations are not copied: relaxing
 // a guard needs network authority the caller may not hold). They are written
 // through writeNewNICGuards, the nic_guards gate (merge checklist M8), which
-// never fails or slows the operation for a default guard.
-func copyNICGuards(vm, uuid string, ifaces []corrosion.InterfaceRecord) []corrosion.NICGuardRecord {
+// never fails or slows the operation for a default guard. A NIC on a network
+// that cannot enforce a guard (unenforced, guardUnenforcedOnNetwork: macvtap
+// or SR-IOV) gets none, as at create.
+func copyNICGuards(vm, uuid string, ifaces []corrosion.InterfaceRecord, unenforced func(network string) string) []corrosion.NICGuardRecord {
 	out := make([]corrosion.NICGuardRecord, 0, len(ifaces))
 	for _, f := range ifaces {
+		if unenforced != nil && unenforced(f.NetworkName) != "" {
+			continue
+		}
 		out = append(out, corrosion.NICGuardRecord{VMName: vm, MAC: f.MAC, Mode: corrosion.NICGuardOn,
 			VMUUID: uuid, Network: f.NetworkName, Ordinal: f.Ordinal})
 	}

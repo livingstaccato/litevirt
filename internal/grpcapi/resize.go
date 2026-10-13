@@ -499,6 +499,27 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 			}
 		}
 	}
+	// A NIC's security-group binding and guard live on the rows the firewall
+	// enforces from, which those RPCs write; nothing is left for the spec.
+	var nicSec, rest []string
+	for _, f := range fields {
+		if _, _, ok := nicSecurityField(f); ok {
+			nicSec = append(nicSec, f)
+		} else {
+			rest = append(rest, f)
+		}
+	}
+	if len(nicSec) > 0 {
+		if err := s.applyDesiredNICSecurity(ctx, name, desired, nicSec); err != nil {
+			return err
+		}
+		if len(rest) == 0 {
+			slog.Info("vm live metadata applied", "vm", name, "fields", fields)
+			s.recordVMEvent(ctx, name, "vm.updated", "ok", fmt.Sprintf("live metadata: %v", fields))
+			return nil
+		}
+	}
+	patch := rest
 	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
@@ -506,7 +527,7 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 				return "", uerr
 			}
 		}
-		for _, f := range fields {
+		for _, f := range patch {
 			switch f {
 			case "disk_io":
 				// applied and recorded by applyDesiredDiskIO above

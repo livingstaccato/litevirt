@@ -165,10 +165,17 @@ func (r *vncStreamReader) Read(p []byte) (int, error) {
 // and, when None was among them, the ServerInit it then received.
 func viewVNC(t *testing.T, c *Cluster, entry *Node, vm string) (offered []byte, init []byte, err error) {
 	t.Helper()
+	return viewVNCVia(t, c.SelfClient(entry), vm)
+}
+
+// viewVNCVia is viewVNC through a client of the caller's choosing (a user's
+// bearer, say).
+func viewVNCVia(t *testing.T, client pb.LiteVirtClient, vm string) (offered []byte, init []byte, err error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vm))
-	st, err := c.SelfClient(entry).ProxyVNC(ctx)
+	st, err := client.ProxyVNC(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

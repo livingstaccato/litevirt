@@ -122,7 +122,8 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		}
 	}
 
-	slog.Info("VNC proxy session started", "vm", vmName, "port", port, "authenticated", password != "")
+	who := consoleCallerAttrs(ctx)
+	slog.Info("VNC proxy session started", append([]any{"vm", vmName, "port", port, "authenticated", password != ""}, who...)...)
 
 	errCh := make(chan error, 2)
 
@@ -177,10 +178,10 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	case err = <-errCh:
 	case <-ctx.Done():
 		_ = conn.Close()
-		slog.Info("VNC proxy session ended: its stream was cut", "vm", vmName)
+		slog.Info("VNC proxy session ended: its stream was cut", append([]any{"vm", vmName}, who...)...)
 		return streamEndError(ctx)
 	}
-	slog.Info("VNC proxy session ended", "vm", vmName)
+	slog.Info("VNC proxy session ended", append([]any{"vm", vmName}, who...)...)
 	if err != nil {
 		return status.Errorf(codes.Internal, "VNC proxy error: %v", err)
 	}
@@ -312,6 +313,7 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 		return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 	}
 	defer conn.Close()
+	defer logForwardedConsole(ctx, "VNC", vmName, hostName)()
 
 	// Forward x-vm-name metadata to the remote daemon.
 	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName))

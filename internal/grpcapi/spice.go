@@ -171,9 +171,9 @@ func (s *Server) ProxySpice(stream grpc.BidiStreamingServer[pb.SpiceData, pb.Spi
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(ctx, func() { _ = conn.Close() })
 
-	user := callerUsername(ctx)
-	slog.Info("SPICE proxy session started", "vm", vmName, "port", port, "user", user)
-	defer slog.Info("SPICE proxy session ended", "vm", vmName, "user", user)
+	who := consoleCallerAttrs(ctx)
+	slog.Info("SPICE proxy session started", append([]any{"vm", vmName, "port", port}, who...)...)
+	defer slog.Info("SPICE proxy session ended", append([]any{"vm", vmName}, who...)...)
 
 	errCh := make(chan error, 2)
 	// SPICE TCP → gRPC stream. The only goroutine that Sends; the handler
@@ -242,6 +242,7 @@ func (s *Server) forwardSpice(incoming grpc.BidiStreamingServer[pb.SpiceData, pb
 		return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 	}
 	defer conn.Close()
+	defer logForwardedConsole(ctx, "SPICE", vmName, hostName)()
 	// The remote leg lives inside this stream's context, so a cut (or this
 	// handler's return) ends it, and the owner then closes its SPICE socket.
 	rctx, cancel := context.WithCancel(ctx)

@@ -175,8 +175,24 @@ vms:
 	lv(t, "compose", "up", "-f", f, "-y")
 	waitVM(t, vm, "RUNNING", 2*time.Minute)
 
-	// The output carries the password: never log it whole.
-	info := lv(t, "spice", vm, "--show-password")
+	// Poll the info call itself, not `lv inspect`: the entry host's own row
+	// can still read "creating" for a moment after inspect (answered by the
+	// VM's host) reports RUNNING, and GetSpiceInfo refuses until it does
+	// not (lab-1 F1). The output carries the password: never log it whole.
+	var info string
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		out, err := lvErr(t, "spice", vm, "--show-password")
+		if err == nil {
+			info = out
+			break
+		}
+		if time.Now().After(deadline) || !strings.Contains(out, "is not running") {
+			// A failed info call printed no password, only its error.
+			t.Fatalf("lv spice %s: %v\n%s", vm, err, out)
+		}
+		time.Sleep(time.Second)
+	}
 	password, shown := "", []string{}
 	for _, line := range strings.Split(info, "\n") {
 		if p, ok := strings.CutPrefix(line, "Password: "); ok {

@@ -30,11 +30,9 @@ type liveMountTable struct {
 func newLiveMountTable(t *testing.T, dir, flags string) *liveMountTable {
 	t.Helper()
 	m := &liveMountTable{dir: dir, flags: flags}
-	prev := readMountInfo
-	readMountInfo = func() ([]byte, error) {
+	t.Cleanup(readMountInfo.set(func() ([]byte, error) {
 		return []byte(fmt.Sprintf("40 1 0:60 / %s %s - nfs4 nas:/x rw,vers=4.2\n", m.dir, m.flags)), nil
-	}
-	t.Cleanup(func() { readMountInfo = prev })
+	}))
 	return m
 }
 

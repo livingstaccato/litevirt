@@ -88,7 +88,7 @@ func (t MountTable) SharedStoreOfErr(dir string) (SharedStore, error) {
 		}
 	}
 	if !out.Shared {
-		info := statfsInfo
+		info := statfsInfo.get()
 		magic, err := Bounded("statfs (magic)", dir, func() (uint32, error) {
 			m, _, err := info(dir)
 			return m, err
@@ -109,7 +109,7 @@ func sharedStoreOfMount(e mountEntry, rel, dir string) (SharedStore, error) {
 	if e.fstype == "ceph" {
 		// The kernel client's f_fsid folds the cluster's fsid with the
 		// filesystem's id within it: the same on every client.
-		info := statfsInfo
+		info := statfsInfo.get()
 		fsid, err := Bounded("statfs (fsid)", dir, func() (string, error) {
 			_, id, err := info(dir)
 			return id, err
@@ -209,7 +209,5 @@ func cephSourcePath(src string) (string, bool) {
 // f_fsid are read, for tests in other packages. It returns the restore
 // function.
 func OverrideStatfsForTest(f func(path string) (uint32, string, error)) func() {
-	prev := statfsInfo
-	statfsInfo = f
-	return func() { statfsInfo = prev }
+	return statfsInfo.set(f)
 }

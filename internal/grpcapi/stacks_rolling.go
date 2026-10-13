@@ -588,7 +588,12 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			defer s.holdImage(sp.GetImage())()
 		}
 	}
-	if delErr := s.deleteWorkloadIgnoringGone(deleteCtx, action); delErr != nil {
+	delErr := s.deleteWorkload(deleteCtx, action)
+	tornDown := delErr == nil
+	if status.Code(delErr) == codes.NotFound {
+		delErr = nil
+	}
+	if delErr != nil {
 		slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 		gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 		return fmt.Errorf("delete before recreate: %w", delErr)
@@ -603,6 +608,14 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 			createCtx = withReplacedVM(createCtx, cur)
 		}
 		createCtx = s.withReplacedLUNs(createCtx, cur)
+	} else if cur != nil && tornDown {
+		// The delete ran on the VM's owner, and the create may run on a host
+		// — this one included — whose replica has not applied its tombstone
+		// yet. It names the row it deleted, for its existence check only, so
+		// that host does not refuse it for that row and lose the VM (lab 1,
+		// 2026-10-13, F1); any other row of the name is still refused. Only
+		// when this delete tore it down: NotFound deleted nothing.
+		createCtx = withReplacedRow(createCtx, cur)
 	}
 	vmErr := s.deployCreatePlanned(createCtx, action, f)
 	outcome = recreateFailed

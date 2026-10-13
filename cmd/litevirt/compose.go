@@ -147,6 +147,7 @@ func newUpCmd() *cobra.Command {
 				// failed action is not "deployed".
 				var deployErr error
 				var failed []string
+				withheld := 0
 				seenFailed := map[string]bool{}
 				for {
 					p, err := stream.Recv()
@@ -165,6 +166,12 @@ func newUpCmd() *cobra.Command {
 						}
 					case "done":
 						fmt.Printf("  %s: done\n", p.VmName)
+					case "warning":
+						// Printed in the plan above; counted here so a withheld
+						// restore is not lost above a long deploy log.
+						if strings.Contains(p.Detail, " not restored: ") {
+							withheld++
+						}
 					default:
 						fmt.Printf("  %s: %s\n", p.VmName, p.Detail)
 					}
@@ -178,6 +185,9 @@ func newUpCmd() *cobra.Command {
 				}
 
 				fmt.Printf("\nStack %q deployed.\n", f.Name)
+				if withheld > 0 {
+					fmt.Printf("%d VM(s) had NIC security restores withheld; see the warnings in the plan above.\n", withheld)
+				}
 				return nil
 			})
 		},

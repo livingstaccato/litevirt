@@ -224,19 +224,19 @@ func TestGate_AWeakeningRestoreNeedsAllowWeaken(t *testing.T) {
 	}
 }
 
-// A guard restore that only tightens is applied without the opt-in, and
-// without guard authority (as at create); only a weakening one needs it.
+// A guard restore to a plain "on" is applied without the opt-in and without
+// guard authority (as at create); a declared guard that is off needs it.
 func TestGate_ATighteningGuardRestoreProceeds(t *testing.T) {
 	desired := nicSpec(&pb.NetworkAttachment{SpoofGuard: "on"})
 	live := nicSpec(&pb.NetworkAttachment{SpoofGuard: "off"})
 	noAuthority := func(string) error { return errors.New("needs network.update on /") }
-	p, w := gated(desired, live, nil, NICSecurityGate{CheckWeakenGuard: noAuthority})
+	p, w := gated(desired, live, nil, NICSecurityGate{CheckGuardAuthority: noAuthority})
 	if _, ok := metaFields(p)[NICGuardFieldPrefix+"0"]; !ok || w != "" {
 		t.Errorf("a tightening restore was withheld: %+v %q", p.MetadataChanges, w)
 	}
 	desired = nicSpec(&pb.NetworkAttachment{SpoofGuard: "off"})
 	live = nicSpec(&pb.NetworkAttachment{SpoofGuard: "on"})
-	p, w = gated(desired, live, nil, NICSecurityGate{AllowWeaken: true, CheckWeakenGuard: noAuthority})
+	p, w = gated(desired, live, nil, NICSecurityGate{AllowWeaken: true, CheckGuardAuthority: noAuthority})
 	if len(p.MetadataChanges) != 0 || !strings.Contains(w, "needs network.update") {
 		t.Errorf("a weakening the caller may not make was not withheld: %+v %q", p.MetadataChanges, w)
 	}
@@ -312,8 +312,8 @@ func TestCarryUndeclaredSecurityGroups(t *testing.T) {
 	if len(desired.Network[2].SecurityGroups) != 0 {
 		t.Error("a NIC whose network changed carried a binding")
 	}
-	if len(notes) != 1 || !strings.Contains(notes[0], "isolate") {
-		t.Errorf("notes = %v", notes)
+	if len(notes) != 2 || !strings.Contains(notes[0], "isolate") || !strings.Contains(notes[1], "drops the security groups [y]") {
+		t.Errorf("notes = %v, want the carry and the dropped binding named", notes)
 	}
 }
 
@@ -330,5 +330,56 @@ func TestBuild_AWeakeningRestoreIsWithheldAndReported(t *testing.T) {
 	}
 	if w := plan.Ops[0].Warning; !strings.Contains(w, "isolate") || !strings.Contains(w, "--allow-weaken") {
 		t.Errorf("warning %q does not name the withheld unbind and the opt-in", w)
+	}
+}
+
+// Round 2, N1: guard authority is asked for every declared guard weaker than
+// the default (off, or any allowance), whatever the live guard: one that
+// tightens a wider live guard, or is put on a NIC with no record, still needs
+// it, because the executor writes it under the same rule.
+func TestGate_GuardAuthorityIsAskedForEveryGuardWeakerThanTheDefault(t *testing.T) {
+	noAuthority := func(string) error { return errors.New("needs network.update on /") }
+	for _, c := range []struct {
+		name           string
+		declared, live *pb.NetworkAttachment
+		withheld       bool
+	}{
+		{"allowance over no record", &pb.NetworkAttachment{SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.5"}}, &pb.NetworkAttachment{}, true},
+		{"narrower than a wider live prefix", &pb.NetworkAttachment{SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.5"}},
+			&pb.NetworkAttachment{SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.0/24"}}, true},
+		{"off over no record", &pb.NetworkAttachment{SpoofGuard: "off"}, &pb.NetworkAttachment{}, true},
+		{"plain on over no record", &pb.NetworkAttachment{SpoofGuard: "on"}, &pb.NetworkAttachment{}, false},
+	} {
+		p, w := gated(nicSpec(c.declared), nicSpec(c.live), nil, NICSecurityGate{CheckGuardAuthority: noAuthority})
+		if got := len(p.MetadataChanges) == 0; got != c.withheld {
+			t.Errorf("%s: withheld = %v (%q), want %v", c.name, got, w, c.withheld)
+		}
+		if c.withheld && !strings.Contains(w, "needs network.update") {
+			t.Errorf("%s: warnings %q do not name the permission", c.name, w)
+		}
+		if DeclaredGuardNeedsAuthority(nicSpec(c.declared).Network[0]) != c.withheld {
+			t.Errorf("%s: DeclaredGuardNeedsAuthority disagrees", c.name)
+		}
+	}
+}
+
+// Round 2, M3: the carry matches a NIC by its network and its place among the
+// NICs on that network, so a NIC inserted before it does not lose its
+// binding; a binding whose NIC the file no longer has is named.
+func TestCarryUndeclaredSecurityGroups_SurvivesAnInsertedNIC(t *testing.T) {
+	desired := baseSpec()
+	desired.Network = []*pb.NetworkAttachment{{Name: "new"}, {Name: "lan"}, {Name: "lan"}}
+	stored := baseSpec()
+	stored.Network = []*pb.NetworkAttachment{{Name: "lan", SecurityGroups: []string{"isolate"}}, {Name: "lan"},
+		{Name: "gone", SecurityGroups: []string{"quarantine"}}}
+	notes := strings.Join(CarryUndeclaredSecurityGroups(desired, stored), "\n")
+	if g := desired.Network[1].SecurityGroups; len(g) != 1 || g[0] != "isolate" {
+		t.Errorf("the first lan NIC (now position 1) = %v, want isolate carried", g)
+	}
+	if len(desired.Network[0].SecurityGroups) != 0 || len(desired.Network[2].SecurityGroups) != 0 {
+		t.Errorf("a binding was carried onto the wrong NIC: %v", desired.Network)
+	}
+	if !strings.Contains(notes, "drops the security groups [quarantine]") {
+		t.Errorf("notes %q do not name the dropped binding", notes)
 	}
 }

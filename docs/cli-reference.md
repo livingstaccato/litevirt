@@ -498,6 +498,7 @@ lv compose down --name <stack> [-y]                # Tear down by stack name
 lv compose ps [-f litevirt-compose.yaml]           # List stack VMs
 lv compose diff [-f litevirt-compose.yaml]         # Preview changes
 lv compose up --allow-weaken                       # Also restore declared NIC security groups / looser guards over runtime changes
+lv compose diff --allow-weaken                     # Preview what up --allow-weaken would change
 lv compose ls                                      # List all stacks
 lv compose export <stack> [-o file.yaml]           # Export stack compose YAML
 ```

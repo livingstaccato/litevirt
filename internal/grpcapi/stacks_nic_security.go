@@ -56,8 +56,8 @@ func (s *Server) nicSecurityGate(ctx context.Context, allowWeaken bool) compose.
 		}
 		return nil
 	}
-	g.CheckWeakenGuard = func(network string) error {
-		if err := s.requireGuardAuthority(ctx, network, "restoring the declared NIC guard"); err != nil {
+	g.CheckGuardAuthority = func(network string) error {
+		if err := s.requireGuardAuthority(ctx, network, "restoring a declared NIC guard that is off or has allowances"); err != nil {
 			return fmt.Errorf("%s", status.Convert(err).Message())
 		}
 		return nil
@@ -77,24 +77,42 @@ func nicSecurityField(f string) (prefix string, i int, ok bool) {
 	return "", 0, false
 }
 
+// allowWeakenKey carries a deploy's --allow-weaken to its executor.
+type allowWeakenKey struct{}
+
+// withAllowWeaken marks ctx with the deploy's opt-in to weakening restores.
+func withAllowWeaken(ctx context.Context, allow bool) context.Context {
+	return context.WithValue(ctx, allowWeakenKey{}, allow)
+}
+
+// allowWeakenFrom is the deploy's opt-in, false when ctx carries none.
+func allowWeakenFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(allowWeakenKey{}).(bool)
+	return v
+}
+
 // nicSecurityWrite is one restore applyDesiredNICSecurity makes.
 type nicSecurityWrite struct {
 	prefix string
 	nic    *compose.LiveNIC
 	want   *pb.NetworkAttachment
+	mode   string
 }
 
 // applyDesiredNICSecurity puts the security-group binding and guard a compose
 // file declares back on the NICs the plan names. The plan has already
-// withheld what the deploy may not do (compose.ApplyNICSecurityGate); this
-// re-checks against the rows as they are now, and checks every field before
-// it writes any, so a refusal leaves nothing half-restored.
+// withheld what the deploy may not do (compose.ApplyNICSecurityGate). This
+// checks every write again, against the rows as they are now and with the
+// same gate (nicSecurityGate) and the same authority rule
+// (compose.DeclaredGuardNeedsAuthority), and refuses the whole set before the
+// first write if any is refused: nothing is left half-restored. A write that
+// has become a weakening since the plan (the rows changed in between) is
+// refused unless the deploy opted in (allowWeakenFrom).
 //
-// A binding is written through BindSecurityGroups, with the deploying
-// caller's authority. A guard that loosens what a default guard allows goes
-// through SetNICGuard's authority check; one that does not needs none, as at
-// create (putNICGuard). Both are audited like their CLI forms. The stored
-// spec is not rewritten: nothing enforces from it.
+// Bindings are written through BindSecurityGroups, guards through putNICGuard
+// (the direct/SR-IOV refusal, the release gate, the audit row), each once the
+// authority above is settled. The stored spec is not rewritten: nothing
+// enforces from it.
 //
 // The plan's position i is the stored spec's NIC i, matched to its live NIC
 // the way the plan matched it (compose.MatchLiveNIC).
@@ -116,6 +134,12 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read the NICs of vm %q: %v", name, err)
 	}
+	allow := allowWeakenFrom(ctx)
+	gate := s.nicSecurityGate(ctx, allow)
+	refuse := func(i int, network, what, why string) error {
+		return status.Errorf(codes.FailedPrecondition, "vm %q: nic %d (%s) %s not restored, and nothing else of its NIC security was: %s",
+			name, i, network, what, why)
+	}
 	var writes []nicSecurityWrite
 	bound := map[string]bool{}
 	for _, f := range fields {
@@ -128,16 +152,51 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 			return status.Errorf(codes.FailedPrecondition,
 				"vm %q has no NIC at position %d to apply the file's security groups or guard to", name, i)
 		}
-		if prefix == compose.NICSecurityGroupsFieldPrefix {
+		want := desired.Network[i]
+		w := nicSecurityWrite{prefix: prefix, nic: n, want: want}
+		switch prefix {
+		case compose.NICSecurityGroupsFieldPrefix:
 			if bound[n.Network] {
 				continue
 			}
 			bound[n.Network] = true
 			if why := compose.SharedNetworkConflict(i, desired, stored, live); why != "" {
-				return status.Errorf(codes.FailedPrecondition, "vm %q: nic %d (%s) security groups not restored: %s", name, i, n.Network, why)
+				return refuse(i, n.Network, "security groups", why)
+			}
+			if !allow {
+				return refuse(i, n.Network, "security groups", "a rebind may remove protection set outside the file, and the deploy was not run with --allow-weaken")
+			}
+			if err := gate.CheckBind(name); err != nil {
+				return refuse(i, n.Network, "security groups", err.Error())
+			}
+		case compose.NICGuardFieldPrefix:
+			if gate.GuardsUnwritable != "" {
+				return refuse(i, n.Network, "guard", gate.GuardsUnwritable)
+			}
+			if r := compose.GuardRestoreWeakens(n, want); len(r) > 0 && !allow {
+				return refuse(i, n.Network, "guard", "it now relaxes the guard enforced ("+strings.Join(r, ", ")+
+					"), and the deploy was not run with --allow-weaken")
+			}
+			if compose.DeclaredGuardNeedsAuthority(want) {
+				if err := gate.CheckGuardAuthority(n.Network); err != nil {
+					return refuse(i, n.Network, "guard", err.Error())
+				}
+			}
+			mode := want.GetSpoofGuard()
+			if mode == "" {
+				mode = corrosion.NICGuardOn // a declared guard is on unless the file says off
+			}
+			if w.mode, err = normalizeNICGuardMode(mode); err != nil {
+				return refuse(i, n.Network, "guard", status.Convert(err).Message())
+			}
+			if _, err := corrosion.NormalizeNICGuardAddresses(want.GetAllowedAddresses()); err != nil {
+				return refuse(i, n.Network, "guard", "allowed addresses: "+err.Error())
+			}
+			if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && (def.Type == "direct" || def.Type == "sriov") {
+				return refuse(i, n.Network, "guard", "the NIC is on a "+def.Type+" network, which bypasses the bridge where guards are enforced")
 			}
 		}
-		writes = append(writes, nicSecurityWrite{prefix: prefix, nic: n, want: desired.Network[i]})
+		writes = append(writes, w)
 	}
 	for _, w := range writes {
 		switch w.prefix {
@@ -148,30 +207,17 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 				return err
 			}
 		case compose.NICGuardFieldPrefix:
-			mode := w.want.GetSpoofGuard()
-			if mode == "" {
-				mode = corrosion.NICGuardOn // a declared guard is on unless the file says off
-			}
-			mode, err := normalizeNICGuardMode(mode)
+			tgt, err := s.pickVMTarget(ctx, name, w.nic.MAC, "")
 			if err != nil {
 				return err
 			}
-			req := &pb.SetNICGuardRequest{
-				VmName: name, Mac: w.nic.MAC, Mode: mode,
+			if _, err := s.putNICGuard(ctx, tgt, w.mode, &pb.SetNICGuardRequest{
+				VmName: name, Mac: w.nic.MAC, Mode: w.mode,
 				AllowedAddresses:         w.want.GetAllowedAddresses(),
 				AllowDhcpServer:          w.want.GetAllowDhcpServer(),
 				AllowRouterAdvertisement: w.want.GetAllowRouterAdvertisement(),
 				AllowVlanTags:            w.want.GetAllowVlanTags(),
-			}
-			if nicGuardWeakens(mode, req.AllowedAddresses, req.AllowDhcpServer, req.AllowRouterAdvertisement, req.AllowVlanTags) {
-				_, err = s.SetNICGuard(ctx, req)
-			} else {
-				var tgt guardTarget
-				if tgt, err = s.pickVMTarget(ctx, name, w.nic.MAC, ""); err == nil {
-					_, err = s.putNICGuard(ctx, tgt, mode, req)
-				}
-			}
-			if err != nil {
+			}); err != nil {
 				return err
 			}
 		}

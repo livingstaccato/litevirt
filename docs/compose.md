@@ -1450,8 +1450,12 @@ it`. Without the flag, `up` withholds:
   turns it off, or adds an allowed source address the live guard does not
   already cover, a DHCP-server or router-advertisement allowance, or VLAN tags.
 
-A guard restore that only tightens is always applied. It needs no more
-authority than creating the NIC with that guard would.
+A guard restore that only tightens is applied without `--allow-weaken`. It
+needs the same authority as creating the NIC with that guard would: none for
+a plain `spoof-guard: "on"`, and `network.update` on the NIC's network for a
+declared guard that is `off` or has any allowance, whatever the guard enforced
+now. A restore the caller lacks that authority for is withheld with the rest
+below.
 
 With `--allow-weaken`, those restores are applied, and the plan still names
 each one. They are written through the same calls as `lv sg bind` and
@@ -1461,7 +1465,8 @@ audited the same way.
 The plan also withholds, with a warning, any restore the deploy cannot make:
 
 - **The caller's permissions.** A rebind needs `network.update` on the VM, and
-  loosening a guard needs it on the NIC's network.
+  a declared guard that is `off` or has allowances needs it on the NIC's
+  network.
 - **The cluster upgrade.** Until it finishes (the `nic_guards` release), no
   guard record can be written.
 - **Two NICs on one network.** A security-group binding is written per
@@ -1470,13 +1475,23 @@ The plan also withholds, with a warning, any restore the deploy cannot make:
 
 `lv compose diff` shows the server's plan for the caller, the same one `up`
 would apply (pass `--allow-weaken` to see what `up --allow-weaken` would do).
+The plan and the deploy decide by the same rules. When `up` comes to restore
+a VM's NIC security, it checks every restore again against the rows as they
+are then, before it writes any. If one is refused (the rows changed since the
+plan so that it would now weaken without `--allow-weaken`, or the caller's
+permissions changed), none is written, and the VM's update fails with the
+reason. The warnings are also sent when the deploy runs, so the UI and other
+callers that do not ask for the plan first see them too.
 
 **A recreate makes the NICs from the file**, as it always has. A change of
 identity, or a strategy that replaces the VM, applies the file's declared
 groups and guard with no `--allow-weaken` gate. The plan prints a warning when
 that changes what is enforced now. A NIC whose file declares no groups keeps
 its live binding through the recreate (`nic 0 (lan) keeps its security groups
-[isolate] through the recreate`). The guards of undeclared NICs are carried as
+[isolate] through the recreate`). A NIC is matched by its network and its
+place among the VM's NICs on that network, so inserting or removing a NIC on
+another network does not lose it. A binding whose NIC the file no longer has
+is dropped with the NIC, and the plan says so. The guards of undeclared NICs are carried as
 before (docs/firewall.md, "A re-create keeps each NIC's guard").
 
 Containers are out of scope. Compose neither reports nor restores a runtime

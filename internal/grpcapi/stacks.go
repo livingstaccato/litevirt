@@ -38,7 +38,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	if err := RequireRole(stream.Context(), "operator"); err != nil {
 		return err
 	}
-	ctx := stream.Context()
+	// The deploy's opt-in travels to the executor, which re-checks each NIC
+	// security restore against the rows as they are when it writes.
+	ctx := withAllowWeaken(stream.Context(), req.AllowWeaken)
 
 	if req.ComposeYaml == "" {
 		return status.Error(codes.InvalidArgument, "compose_yaml required")
@@ -121,6 +123,14 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	if req.DryRun {
 		return s.streamResolvedPlan(stream, resolved)
+	}
+
+	// The plan's warnings (a withheld NIC security restore among them) reach
+	// a caller that did not dry-run first too (the UI, REST, gitops).
+	for _, w := range resolved.Warnings {
+		if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: w}); err != nil {
+			return err
+		}
 	}
 
 	// ── Execute phase: walk the plan deterministically ──

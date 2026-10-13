@@ -192,8 +192,21 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 		t.Errorf("diff and up disagree:\n diff box %q warnings %q\n up   box %q warnings %q", dBox, dWarnings, boxOp, warnings)
 	}
 
-	// A deploy without the opt-in keeps the isolation in place.
-	deployClean(t, ctx, dc, composeNICSecurity)
+	// A deploy without the opt-in keeps the isolation in place, and its own
+	// stream (not only the dry-run's) says what it withheld, for a caller
+	// that does not plan first (the UI, REST, gitops).
+	sawWithheld := false
+	for _, p := range deployRequest(t, ctx, dc, &pb.DeployStackRequest{ComposeYaml: composeNICSecurity}) {
+		if p.Phase == "error" {
+			t.Fatalf("deploy failed for %s: %s", p.VmName, p.Error)
+		}
+		if p.Phase == "warning" && strings.Contains(p.Detail, "box: nic 0 (lan) security groups not restored") {
+			sawWithheld = true
+		}
+	}
+	if !sawWithheld {
+		t.Error("the executing deploy's stream did not report the withheld restore")
+	}
 	if b := liveSec(t, deployer, "box"); !slices.Equal(b.SecurityGroups, []string{"isolate"}) || b.Guard == nil || len(b.Guard.Allowed) != 0 {
 		t.Fatalf("box after a deploy without --allow-weaken = %+v (guard %+v), want the operator's isolation kept", b, b.Guard)
 	}

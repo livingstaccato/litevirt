@@ -324,6 +324,30 @@ func (p ChangePlan) Weakens() []string {
 	return out
 }
 
+// DeclaredGuardNeedsAuthority reports whether the guard a NIC entry declares
+// is weaker than the default one: off, or with any allowance. Writing such a
+// guard needs network.update over the NIC's network, at create and at
+// restore alike, whatever the guard enforced now; a plain "on" needs none.
+// The plan gate (ApplyNICSecurityGate) and the deploy's executor both decide
+// by this one function, so the plan withholds exactly what the executor
+// would refuse.
+func DeclaredGuardNeedsAuthority(att *pb.NetworkAttachment) bool {
+	g := desiredGuard(att)
+	return g.mode != "on" || len(g.allowed) > 0 || g.dhcp || g.ra || g.vlan
+}
+
+// GuardRestoreWeakens is what writing att's declared guard over the live
+// NIC's guard would relax, now: the executor re-checks it against the rows
+// as they are when it writes.
+func GuardRestoreWeakens(live *LiveNIC, att *pb.NetworkAttachment) []string {
+	have := guardView{}
+	if live != nil && live.Guard != nil {
+		have = guardView{mode: strings.ToLower(strings.TrimSpace(live.Guard.Mode)), allowed: canonicalGuardAddresses(live.Guard.Allowed),
+			dhcp: live.Guard.AllowDHCPServer, ra: live.Guard.AllowRouterAdvert, vlan: live.Guard.AllowVLANTags}
+	}
+	return have.relaxations(desiredGuard(att))
+}
+
 // NICSecurityGate is what a deploy may restore of a NIC's security, decided
 // by the server for the caller before the plan is shown. The zero value is
 // the safe one: nothing that may weaken is applied.
@@ -337,10 +361,11 @@ type NICSecurityGate struct {
 	// CheckBind reports whether the caller may rebind vm's security groups
 	// (lv sg bind's authority). nil: it may.
 	CheckBind func(vm string) error
-	// CheckWeakenGuard reports whether the caller may relax a guard on the
-	// network (lv firewall nic-guard set's authority). nil: it may. A restore
-	// that only tightens needs no such authority, as at create.
-	CheckWeakenGuard func(network string) error
+	// CheckGuardAuthority reports whether the caller may write, on the
+	// network, a guard weaker than the default one (lv firewall nic-guard
+	// set's authority). nil: it may. It is asked exactly for the guards
+	// DeclaredGuardNeedsAuthority names, by the plan and by the executor.
+	CheckGuardAuthority func(network string) error
 }
 
 // ApplyNICSecurityGate removes from an in-place plan each NIC security change
@@ -381,8 +406,9 @@ func ApplyNICSecurityGate(vm string, p *ChangePlan, desired, stored *pb.VMSpec, 
 				"; re-run with --allow-weaken to apply it")
 		case !c.Guard && gate.CheckBind != nil && gate.CheckBind(vm) != nil:
 			withhold(c, gate.CheckBind(vm).Error())
-		case c.Guard && len(c.Weakens) > 0 && gate.CheckWeakenGuard != nil && gate.CheckWeakenGuard(c.Network) != nil:
-			withhold(c, gate.CheckWeakenGuard(c.Network).Error())
+		case c.Guard && DeclaredGuardNeedsAuthority(desired.Network[c.Position]) && gate.CheckGuardAuthority != nil &&
+			gate.CheckGuardAuthority(c.Network) != nil:
+			withhold(c, gate.CheckGuardAuthority(c.Network).Error())
 		default:
 			for _, w := range c.Weakens {
 				warnings = append(warnings, "applied with --allow-weaken: "+w)
@@ -450,18 +476,44 @@ func SharedNetworkConflict(i int, desired, stored *pb.VMSpec, live []LiveNIC) st
 // CarryUndeclaredSecurityGroups gives each NIC of a recreate's desired spec
 // whose file declares no security groups the binding its live NIC has (stored
 // is the overlaid stored spec), so a recreate leaves an undeclared binding as
-// it is, as an in-place update does. A NIC whose network changed is a new NIC
-// and carries nothing. It returns a note per carried binding.
+// it is, as an in-place update does. A desired NIC is the stored NIC at the
+// same occurrence on the same network (the second NIC on lan is the old second
+// NIC on lan), so a NIC inserted or removed elsewhere does not shift it. It
+// returns a note per binding carried, and one per live binding of an
+// undeclared NIC the recreate cannot carry (its network's NIC is gone).
 func CarryUndeclaredSecurityGroups(desired, stored *pb.VMSpec) []string {
 	var notes []string
+	storedOn := map[string][]*pb.NetworkAttachment{}
+	for _, sn := range stored.GetNetwork() {
+		if sn != nil {
+			storedOn[sn.GetName()] = append(storedOn[sn.GetName()], sn)
+		}
+	}
+	seen := map[string]int{}
+	used := map[*pb.NetworkAttachment]bool{}
 	for i, dn := range desired.GetNetwork() {
-		if dn == nil || len(dn.GetSecurityGroups()) > 0 || i >= len(stored.GetNetwork()) || stored.Network[i] == nil ||
-			stored.Network[i].GetName() != dn.GetName() || len(stored.Network[i].GetSecurityGroups()) == 0 {
+		if dn == nil {
 			continue
 		}
-		dn.SecurityGroups = slices.Clone(stored.Network[i].GetSecurityGroups())
+		k := seen[dn.GetName()]
+		seen[dn.GetName()]++
+		if k >= len(storedOn[dn.GetName()]) {
+			continue
+		}
+		sn := storedOn[dn.GetName()][k]
+		used[sn] = true
+		if len(dn.GetSecurityGroups()) > 0 || len(sn.GetSecurityGroups()) == 0 {
+			continue
+		}
+		dn.SecurityGroups = slices.Clone(sn.GetSecurityGroups())
 		notes = append(notes, fmt.Sprintf("nic %d (%s) keeps its security groups %s through the recreate (the file declares none)",
 			i, dn.GetName(), sgList(dn.SecurityGroups)))
+	}
+	for _, sn := range stored.GetNetwork() {
+		if sn != nil && !used[sn] && len(sn.GetSecurityGroups()) > 0 {
+			notes = append(notes, fmt.Sprintf("the recreate drops the security groups %s bound now to the NIC on %s, which the file no longer has",
+				sgList(sn.GetSecurityGroups()), sn.GetName()))
+		}
 	}
 	return notes
 }

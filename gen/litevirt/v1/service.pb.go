@@ -8237,12 +8237,19 @@ func (x *PushImageRequest) GetTargetHost() string {
 // the call. deleted_image: the caller has just deleted image name; the host
 // waits (bounded) for its own catalog to show the delete before it decides.
 // An older host ignores it and keeps the current file.
+// version: one file of image name (its file name, its path, or the digest
+// after '@'): only that file is judged, and it is removed although the store
+// may be shared with other hosts — the operator asserts no other host's disk
+// is built on it. Every other keep still applies. A host that honours it
+// echoes it in the response's version; an older host does not (it would
+// prune the whole image), so a caller probes with dry_run first.
 type PruneImagesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	HostName      string                 `protobuf:"bytes,2,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
 	DryRun        bool                   `protobuf:"varint,3,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
 	DeletedImage  bool                   `protobuf:"varint,4,opt,name=deleted_image,json=deletedImage,proto3" json:"deleted_image,omitempty"`
+	Version       string                 `protobuf:"bytes,5,opt,name=version,proto3" json:"version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8305,9 +8312,17 @@ func (x *PruneImagesRequest) GetDeletedImage() bool {
 	return false
 }
 
-// kept: each file of a deleted image the host kept, and why.
+func (x *PruneImagesRequest) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+// kept: each file the host kept, and why.
 // removes_deleted_images: the host's build removes a deleted image's current
 // file (false from an older build, which always keeps it).
+// version: the request's version, when this build honoured it.
 type PruneImagesResponse struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	HostName             string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
@@ -8315,6 +8330,7 @@ type PruneImagesResponse struct {
 	FreedBytes           int64                  `protobuf:"varint,3,opt,name=freed_bytes,json=freedBytes,proto3" json:"freed_bytes,omitempty"`
 	Kept                 []*KeptImageFile       `protobuf:"bytes,4,rep,name=kept,proto3" json:"kept,omitempty"`
 	RemovesDeletedImages bool                   `protobuf:"varint,5,opt,name=removes_deleted_images,json=removesDeletedImages,proto3" json:"removes_deleted_images,omitempty"`
+	Version              string                 `protobuf:"bytes,6,opt,name=version,proto3" json:"version,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -8382,6 +8398,13 @@ func (x *PruneImagesResponse) GetRemovesDeletedImages() bool {
 		return x.RemovesDeletedImages
 	}
 	return false
+}
+
+func (x *PruneImagesResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
 }
 
 type KeptImageFile struct {
@@ -41756,19 +41779,21 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x10PushImageRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1f\n" +
 	"\vtarget_host\x18\x02 \x01(\tR\n" +
-	"targetHost\"\x83\x01\n" +
+	"targetHost\"\x9d\x01\n" +
 	"\x12PruneImagesRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\thost_name\x18\x02 \x01(\tR\bhostName\x12\x17\n" +
 	"\adry_run\x18\x03 \x01(\bR\x06dryRun\x12#\n" +
-	"\rdeleted_image\x18\x04 \x01(\bR\fdeletedImage\"\xd3\x01\n" +
+	"\rdeleted_image\x18\x04 \x01(\bR\fdeletedImage\x12\x18\n" +
+	"\aversion\x18\x05 \x01(\tR\aversion\"\xed\x01\n" +
 	"\x13PruneImagesResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aremoved\x18\x02 \x03(\tR\aremoved\x12\x1f\n" +
 	"\vfreed_bytes\x18\x03 \x01(\x03R\n" +
 	"freedBytes\x12.\n" +
 	"\x04kept\x18\x04 \x03(\v2\x1a.litevirt.v1.KeptImageFileR\x04kept\x124\n" +
-	"\x16removes_deleted_images\x18\x05 \x01(\bR\x14removesDeletedImages\";\n" +
+	"\x16removes_deleted_images\x18\x05 \x01(\bR\x14removesDeletedImages\x12\x18\n" +
+	"\aversion\x18\x06 \x01(\tR\aversion\";\n" +
 	"\rKeptImageFile\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"(\n" +

@@ -24,6 +24,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -719,7 +720,12 @@ func (s *Server) imageFilesInUseBounded(ctx context.Context, keep []string, dele
 type pruneOutcome struct {
 	removed []string
 	freed   int64
-	kept    []*pb.KeptImageFile // the files of a deleted image kept, and why
+	kept    []*pb.KeptImageFile // the files kept, and why
+	// sharedKept is the files kept only because the store may be shared
+	// with other hosts (imageStoreShared), and sharedBytes their size, as
+	// far as it could be read within the bound.
+	sharedKept  []string
+	sharedBytes int64
 }
 
 // pruneImageVersions removes, on this host, the files of image name (every
@@ -727,8 +733,40 @@ type pruneOutcome struct {
 // returns the files it removed (or, with dryRun, would remove) and their
 // bytes.
 func (s *Server) pruneImageVersions(ctx context.Context, name string, dryRun bool, keep ...string) ([]string, int64, error) {
-	out, err := s.pruneImages(ctx, name, dryRun, false, keep...)
+	out, err := s.pruneImages(ctx, name, dryRun, false, "", keep...)
 	return out.removed, out.freed, err
+}
+
+// noteSharedKept records f as kept only because the store may be shared,
+// with its size when that can be read within the bound.
+func (o *pruneOutcome) noteSharedKept(f string) {
+	o.sharedKept = append(o.sharedKept, f)
+	if fi, err := storage.Bounded("stat", f, func() (os.FileInfo, error) { return os.Lstat(f) }); err == nil {
+		o.sharedBytes += fi.Size()
+	}
+}
+
+// sharedKeptHint is what a file kept only because the store may be shared
+// adds to its reason: how an operator who knows no other host uses it
+// removes it.
+func sharedKeptHint(image, f, host string) string {
+	return fmt.Sprintf("; if no other host's disk is built on it, lv image prune %s --version %s --host %s removes it",
+		image, filepath.Base(f), host)
+}
+
+// matchesVersion reports whether store file f is the version an operator
+// named: its path, its file name, or the digest after '@' (a prefix of it,
+// at least 8 hex digits, as `lv image prune` and the kept list print it).
+func matchesVersion(f, version string) bool {
+	if version == "" {
+		return false
+	}
+	base := filepath.Base(f)
+	if f == version || base == version {
+		return true
+	}
+	_, digest, ok := strings.Cut(strings.TrimSuffix(base, filepath.Ext(base)), "@")
+	return ok && len(version) >= 8 && strings.HasPrefix(digest, version)
 }
 
 // pruneImages removes, on this host, the files of image name (every image
@@ -762,8 +800,17 @@ func (s *Server) pruneImageVersions(ctx context.Context, name string, dryRun boo
 // justDeleted (deleted_image): the caller has just deleted name's row, and
 // this host waits for its catalog to show it (deletedImages); if it never
 // does, name's current file is kept and that reported.
-func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDeleted bool, keep ...string) (pruneOutcome, error) {
+//
+// version (lv image prune <image> --version <file>): only that one file of
+// image name is judged, and the store's being shared does not keep it — the
+// operator asserts that no other host's disk is built on it, which this host
+// cannot see (review round 1, I-2). Every other keep still applies, and a
+// version kept for one is reported with the reason.
+func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDeleted bool, version string, keep ...string) (pruneOutcome, error) {
 	var out pruneOutcome
+	if version != "" && name == "" {
+		return out, fmt.Errorf("a version to remove needs its image's name")
+	}
 	st := s.imageStore()
 	// The snapshot comes first: a pull or import that completes after it —
 	// reviving the catalog row this prune may already have read as deleted —
@@ -805,9 +852,17 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	if err != nil {
 		return out, fmt.Errorf("%w: nothing is pruned", err)
 	}
+	// The candidates: name's files (every image's when name is ""), or the
+	// one version named.
+	candidate := func(f, n string) bool {
+		if name != "" && n != name {
+			return false
+		}
+		return version == "" || matchesVersion(f, version)
+	}
 	resolved := map[string]string{}
 	for f, n := range files {
-		if name != "" && n != name {
+		if !candidate(f, n) {
 			continue
 		}
 		r, err := resolvedStrict(f)
@@ -816,28 +871,48 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 		}
 		resolved[f] = r
 	}
+	if version != "" && len(resolved) != 1 {
+		return out, fmt.Errorf("image %s has %d files on %s matching version %q; name one file (as lv image prune %s lists them)",
+			name, len(resolved), s.hostName, version, name)
+	}
 	for f, n := range files {
-		if name != "" && n != name {
+		if !candidate(f, n) {
 			continue
 		}
 		r := resolved[f]
 		if !deleted[n] {
 			if f == st.ImagePath(n) || slices.Contains(keep, f) || sc.inUse[r] != "" {
-				if justDeleted && n == name && f == st.ImagePath(n) {
+				switch {
+				case justDeleted && n == name && f == st.ImagePath(n):
 					out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: fmt.Sprintf(
 						"the image's catalog record is not deleted on %s (the delete has not replicated here yet, or the image was pulled again): lv image prune %s --host %s removes it once it is",
 						s.hostName, n, s.hostName)})
+				case version != "":
+					// The one file the operator named: say why it stays.
+					why := sc.inUse[r]
+					if f == st.ImagePath(n) {
+						why = "it is the image's current version"
+					} else if why == "" {
+						why = "a refresh of the image has just published or superseded it"
+					}
+					out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
 				}
 				continue
 			}
 			// A version no disk here is built on may still be another
 			// host's base when the store is shared (lab 2 N-7): kept, as a
-			// deleted image's files are (deletedKeep).
-			if sc.storeFS != "" {
-				out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: sc.storeFS})
+			// deleted image's files are (deletedKeep) — unless the operator
+			// named it.
+			if sc.storeFS != "" && version == "" {
+				out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: sc.storeFS + sharedKeptHint(n, f, s.hostName)})
+				out.noteSharedKept(f)
 				continue
 			}
-		} else if why := sc.deletedKeep(f, r, n, snap[n]); why != "" {
+		} else if why := sc.deletedKeep(f, r, n, snap[n], version != ""); why != "" {
+			if why == sc.storeFS {
+				why += sharedKeptHint(n, f, s.hostName)
+				out.noteSharedKept(f)
+			}
 			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
 			continue
 		}
@@ -869,7 +944,10 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 
 // deletedKeep is why the scan keeps f, a file of deleted image n resolved to
 // r ("" when nothing does).
-func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap) string {
+//
+// named: the operator named f (lv image prune --version): the store's being
+// shared does not keep it.
+func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap, named bool) string {
 	switch {
 	case sc.inUse[r] != "":
 		return sc.inUse[r]
@@ -881,7 +959,7 @@ func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap) string {
 		return sc.missingDisk
 	case sc.unscanned != "":
 		return sc.unscanned
-	case sc.storeFS != "":
+	case sc.storeFS != "" && !named:
 		return sc.storeFS
 	case sc.open[f] != "":
 		return sc.open[f] + " holds it open"
@@ -981,10 +1059,36 @@ func (s *Server) pruneAfterRefresh(name string, keep ...string) {
 	s.imagePrune.bg.Add(1)
 	go func() {
 		defer s.imagePrune.bg.Done()
-		if _, _, err := s.pruneImageVersions(context.Background(), name, false, keep...); err != nil {
+		ctx := context.Background()
+		out, err := s.pruneImages(ctx, name, false, false, "", keep...)
+		if err != nil {
 			slog.Warn("image: pruning unused versions after a refresh skipped", "image", name, "error", err)
+			return
 		}
+		s.reportSharedKept(ctx, name, out)
 	}()
+}
+
+// reportSharedKept says what a refresh's background prune kept only because
+// the image store may be shared with other hosts (review round 1, I-2):
+// each refresh adds a version there that nothing removes by itself, and a
+// full share is an outage for every disk on it. A Warn every time, and an
+// image.versions_kept notification at most daily per image.
+func (s *Server) reportSharedKept(ctx context.Context, name string, out pruneOutcome) {
+	if len(out.sharedKept) == 0 {
+		return
+	}
+	slog.Warn("image: unused versions kept: the image store may be shared with other hosts, whose disks this host cannot see",
+		"image", name, "versions", len(out.sharedKept), "bytes", out.sharedBytes, "files", out.sharedKept)
+	if last, ok := s.imagePrune.sharedNotified.Load(name); ok && time.Since(last.(time.Time)) < 24*time.Hour {
+		return
+	}
+	s.imagePrune.sharedNotified.Store(name, time.Now())
+	s.notify(ctx, notify.Notification{
+		Kind: "image.versions_kept", Severity: notify.SevWarn, Subject: s.hostName + ":" + name,
+		Detail: fmt.Sprintf("%d unused version(s) of image %s (%d bytes) kept on %s: the image store is on a filesystem other hosts may share, and their disks may be built on them. Once no host's disk is, lv image prune %s --version <file> --host %s removes one (lv image prune %s --host %s --dry-run lists them)",
+			len(out.sharedKept), name, out.sharedBytes, s.hostName, name, s.hostName, name, s.hostName),
+	})
 }
 
 // PruneImages removes the image-store files no disk on the host is built on
@@ -1002,20 +1106,48 @@ func (s *Server) PruneImages(ctx context.Context, req *pb.PruneImagesRequest) (*
 	if req.DeletedImage && req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "deleted_image needs the image's name")
 	}
+	if req.Version != "" && req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "a version to remove needs its image's name")
+	}
 	if req.HostName != "" && req.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, req.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", req.HostName, err)
 		}
 		defer conn.Close()
+		if err := probePruneVersion(ctx, client, req); err != nil {
+			return nil, err
+		}
 		return client.PruneImages(ctx, req)
 	}
-	out, err := s.pruneImages(ctx, req.Name, req.DryRun, req.DeletedImage)
+	out, err := s.pruneImages(ctx, req.Name, req.DryRun, req.DeletedImage, req.Version)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "prune images: %v", err)
 	}
 	return &pb.PruneImagesResponse{HostName: s.hostName, Removed: out.removed, FreedBytes: out.freed,
-		Kept: out.kept, RemovesDeletedImages: true}, nil
+		Kept: out.kept, RemovesDeletedImages: true, Version: req.Version}, nil
+}
+
+// probePruneVersion makes sure the host serving client honours a prune of
+// one version before it is asked for one that removes: an older build
+// ignores the field and would prune every unused file of the image. It asks
+// a dry run first, which removes nothing on any build, and refuses unless
+// the answer echoes the version.
+func probePruneVersion(ctx context.Context, client pb.LiteVirtClient, req *pb.PruneImagesRequest) error {
+	if req.Version == "" || req.DryRun {
+		return nil
+	}
+	probe := &pb.PruneImagesRequest{Name: req.Name, HostName: req.HostName, DryRun: true, Version: req.Version}
+	resp, err := client.PruneImages(ctx, probe)
+	if err != nil {
+		return err
+	}
+	if resp.GetVersion() != req.Version {
+		return status.Errorf(codes.FailedPrecondition,
+			"host %s runs an older build that cannot prune one version (it would prune every unused file of %s); nothing was removed",
+			resp.GetHostName(), req.Name)
+	}
+	return nil
 }
 
 // imageRemoveTimeout bounds one host's part of lv image rm: the wait for its
@@ -1105,7 +1237,7 @@ func (s *Server) removeImageFiles(ctx context.Context, name string) *pb.RemoveIm
 // removeImageFilesOn is host's part of removeImageFiles.
 func (s *Server) removeImageFilesOn(ctx context.Context, host, name string) (*pb.PruneImagesResponse, error) {
 	if host == s.hostName {
-		out, err := s.pruneImages(ctx, name, false, true)
+		out, err := s.pruneImages(ctx, name, false, true, "")
 		if err != nil {
 			return nil, err
 		}
@@ -1149,6 +1281,8 @@ type imagePruneState struct {
 	afterCatalog func()                                    // test seam: runs after the catalog is read
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
+
+	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }
 
 func (p *imagePruneState) recreateGraceOr() time.Duration {

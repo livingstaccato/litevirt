@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 const reconcileInterval = 15 * time.Second
@@ -1961,6 +1962,15 @@ func (r *Reconciler) SetPITOverlayFeature(g pitoverlay.Gate) { r.pitFeature = g 
 func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecord, spec *pb.VMSpec, diskConfigs []lv.DiskConfig) string {
 	for _, dc := range diskConfigs {
 		owner := pitoverlay.Owner{VM: vm.Name, VMUUID: spec.GetUuid(), Disk: dc.Name}
+		// Looked for under a bound first: on storage that does not answer
+		// whether an overlay is there is unknown, never "none" (lab 2 N-4),
+		// and the pass is not held by it.
+		if _, perr := pitoverlay.PresentBounded(dc.Path); perr != nil {
+			slog.Warn("reconciler: a disk's storage does not answer; whether it has a point-in-time overlay cannot be told, so the VM is not defined yet",
+				"vm", vm.Name, "disk", dc.Name, "error", perr)
+			return fmt.Sprintf("disk %s: whether a point-in-time overlay %s holds writes the disk lacks cannot be told: its storage does not answer: %v",
+				dc.Name, pitoverlay.Path(dc.Path), perr)
+		}
 		out, err := pitoverlay.Settle(ctx, r.pitFeature, dc.Path, owner)
 		switch {
 		case out == pitoverlay.Held:
@@ -1977,7 +1987,8 @@ func (r *Reconciler) settlePITOverlays(ctx context.Context, vm corrosion.VMRecor
 		}
 		// A disk this host cannot see (a shared pool not mounted here) reads
 		// as "no overlay" too: only a disk that is here clears a hold.
-		if _, serr := os.Stat(dc.Path); serr == nil && r.pitCleared != nil {
+		_, serr := storage.Bounded("stat", dc.Path, func() (os.FileInfo, error) { return os.Stat(dc.Path) })
+		if serr == nil && r.pitCleared != nil {
 			r.pitCleared(ctx, vm.Name, dc.Name)
 		}
 	}

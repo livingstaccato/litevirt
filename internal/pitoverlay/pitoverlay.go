@@ -65,6 +65,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Suffix ends every overlay's name.
@@ -83,8 +84,19 @@ func SidecarPath(disk string) string { return Path(disk) + ".id" }
 
 // Present reports whether disk has an overlay (anything at its path).
 func Present(disk string) bool {
-	_, err := os.Lstat(Path(disk))
+	_, err := lstat(Path(disk))
 	return err == nil
+}
+
+// PresentBounded is Present under storage.Bounded. A disk on a network
+// filesystem whose server does not answer gets the *storage.FSNoAnswerError
+// (storage.IsFSNoAnswer), never false: whether an overlay holding the guest's
+// newest writes is there is then unknown, and a caller that took it as "no
+// overlay" would start, copy or define the disk without them.
+func PresentBounded(disk string) (bool, error) {
+	return storage.Bounded("look for the point-in-time overlay", Path(disk), func() (bool, error) {
+		return Present(disk), nil
+	})
 }
 
 // Presence is what this host can say about a disk's overlay: there, gone,
@@ -104,7 +116,8 @@ const (
 // lstat is os.Lstat; a test makes it fail.
 var lstat = os.Lstat
 
-// SetLstatForTest makes PresenceOf stat with f, and returns the restore.
+// SetLstatForTest makes Present and PresenceOf stat with f, and returns the
+// restore.
 func SetLstatForTest(f func(string) (os.FileInfo, error)) (restore func()) {
 	prev := lstat
 	lstat = f

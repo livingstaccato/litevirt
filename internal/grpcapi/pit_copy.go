@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Point-in-time copies of a VM disk (colonelpanik/litevirt#256).
@@ -464,6 +465,28 @@ func (s *Server) reportStrandedOverlay(ctx context.Context, vm *corrosion.VMReco
 	})
 }
 
+// pitDiskStat stats a disk's own file for healPITOverlay; a test replaces it
+// (overridePITDiskStat).
+var pitDiskStat = os.Stat
+
+// pitNoAnswer refuses what was to be done with d (a start, a define, a
+// move, a copy) because whether its point-in-time overlay is there cannot be
+// told: retryable, never taken as "no overlay", which would read or start
+// the disk without the guest's newest writes.
+func pitNoAnswer(vm *corrosion.VMRecord, d *corrosion.DiskRecord, err error) error {
+	slog.Warn("point-in-time overlay: its storage does not answer; refused", "vm", vm.Name, "disk", d.DiskName, "error", err)
+	return status.Errorf(codes.Unavailable,
+		"disk %q of %q: whether a point-in-time overlay holds writes its file lacks cannot be told: its storage does not answer: %v; retry once it answers",
+		d.DiskName, vm.Name, err)
+}
+
+// overridePITDiskStat replaces pitDiskStat and returns the restore.
+func overridePITDiskStat(f func(string) (os.FileInfo, error)) func() {
+	prev := pitDiskStat
+	pitDiskStat = f
+	return func() { pitDiskStat = prev }
+}
+
 // healPITOverlay settles an overlay an earlier layer-2 copy of d left (a
 // failed commit, a daemon that died mid-window, a failover that carried the
 // disk to this host). An overlay that may hold data is never deleted:
@@ -489,13 +512,35 @@ func (s *Server) reportStrandedOverlay(ctx context.Context, vm *corrosion.VMReco
 // in it.
 func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord) error {
 	disk := s.hostDiskFile(d.Path)
-	if !pitoverlay.Present(disk) {
+	// Every look at the disk and its overlay is bounded: on storage that
+	// does not answer whether an overlay is there is unknown, and that is
+	// never taken as "no overlay" (lab 2 N-4).
+	present, err := pitoverlay.PresentBounded(disk)
+	if err != nil {
+		return pitNoAnswer(vm, d, err)
+	}
+	if !present {
 		// Only a disk this host sees clears a hold: on a host where the
 		// shared pool is not mounted, "no overlay" says nothing (P7).
-		if _, err := os.Stat(disk); err == nil {
+		_, serr := storage.Bounded("stat", disk, func() (os.FileInfo, error) { return pitDiskStat(disk) })
+		if storage.IsFSNoAnswer(serr) {
+			return pitNoAnswer(vm, d, serr)
+		}
+		if serr == nil {
 			// A stat error on the overlay establishes nothing: the hold
 			// stays (re-review 1, m2), and the definition is not touched.
-			presence, perr := pitoverlay.PresenceOf(disk)
+			type presenceOf struct {
+				p   pitoverlay.Presence
+				err error
+			}
+			po, berr := storage.Bounded("look for the point-in-time overlay and its binding", pitoverlay.Path(disk), func() (presenceOf, error) {
+				p, err := pitoverlay.PresenceOf(disk)
+				return presenceOf{p, err}, nil
+			})
+			if berr != nil {
+				return pitNoAnswer(vm, d, berr)
+			}
+			presence, perr := po.p, po.err
 			s.repointDanglingPITDefinition(ctx, vm, d, presence, perr)
 			if presence != pitoverlay.OverlayUnknown {
 				s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
@@ -863,8 +908,14 @@ func (s *Server) settlePITOverlays(ctx context.Context, vm *corrosion.VMRecord) 
 		return status.Errorf(codes.Internal, "list disks: %v", err)
 	}
 	for i := range disks {
-		if disks[i].HostName != "" && disks[i].HostName != s.hostName && !pitoverlay.Present(s.hostDiskFile(disks[i].Path)) {
-			continue
+		if disks[i].HostName != "" && disks[i].HostName != s.hostName {
+			present, err := pitoverlay.PresentBounded(s.hostDiskFile(disks[i].Path))
+			if err != nil {
+				return pitNoAnswer(vm, &disks[i], err)
+			}
+			if !present {
+				continue
+			}
 		}
 		if err := s.healPITOverlay(ctx, vm, &disks[i]); err != nil {
 			if _, ok := status.FromError(err); ok {
@@ -885,7 +936,14 @@ func (s *Server) settleKeptPITOverlays(ctx context.Context, vm *corrosion.VMReco
 	}
 	for i := range disks {
 		d := &disks[i]
-		if d.Path == "" || !pitoverlay.Present(s.hostDiskFile(d.Path)) {
+		if d.Path == "" {
+			continue
+		}
+		present, err := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
+		if err != nil {
+			return pitNoAnswer(vm, d, err)
+		}
+		if !present {
 			continue
 		}
 		if !keepAll && d.DeleteWithVM && !s.diskPathReferencedByOtherVM(ctx, vm.Name, d) {
@@ -968,7 +1026,15 @@ func (s *Server) sweepPITOverlaysOf(ctx context.Context, name string) {
 	}
 	for i := range disks {
 		d := &disks[i]
-		if !pitoverlay.Present(s.hostDiskFile(d.Path)) {
+		// Under the VM's lock, which every start and stop of it needs: a
+		// disk whose storage does not answer is passed over, not waited on
+		// (lab 2 O-3). Its start settles it once it answers.
+		present, perr := pitoverlay.PresentBounded(s.hostDiskFile(d.Path))
+		if perr != nil {
+			slog.Warn("point-in-time overlay sweep: a disk's storage does not answer; left for its start", "vm", name, "disk", d.DiskName, "error", perr)
+			continue
+		}
+		if !present {
 			continue
 		}
 		if s.diskOnSharedStorage(ctx, *d) && (s.virt == nil || !s.virt.DomainExists(name)) {

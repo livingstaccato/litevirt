@@ -292,7 +292,14 @@ answers again. litevirt keeps that from holding anything else:
   lock (and a stop of it) for as long as the server does not answer. The
   first refusal can take up to 20 s, the start check's own bound, because
   reading the disk's header waits that long; while that mount is known not
-  to answer, later ones are immediate.
+  to answer, later ones are immediate. The first thing a start (and a
+  define, move, migrate, backup, copy or delete) does is look for the disk's
+  point-in-time overlay, under the VM's lock; that look gives up after 5 s
+  too. Whether an overlay is there is then unknown, and the start is refused
+  with `Unavailable` rather than made on a disk that may lack the guest's
+  newest writes. The reconciler's restart of such a VM fails the same way
+  and is retried, and the overlay sweep at daemon start passes the VM over
+  instead of holding its lock.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
   disk's chain does not answer, the prune fails with "nothing is pruned", and

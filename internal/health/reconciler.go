@@ -729,7 +729,16 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 			}
 		}
 		fresh, err := corrosion.GetVM(ctx, r.db, name)
-		if err != nil || fresh == nil || fresh.HostName != r.hostName {
+		if err != nil {
+			// A read that failed (the walk's budget spent, a transient DB
+			// error) says nothing about the VM: the duty is kept for the
+			// next pass, never dropped as "gone" (lab 2 F-5).
+			slog.Warn("reconciler: onboot retry could not read the VM's row; tried again next pass",
+				"vm", name, "error", err)
+			continue
+		}
+		if fresh == nil || fresh.HostName != r.hostName {
+			slog.Info("reconciler: dropping onboot retry — the VM is gone or on another host", "vm", name)
 			r.clearOnbootPending(name) // gone / reassigned — no longer our onboot duty
 			continue
 		}
@@ -739,6 +748,13 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 			slog.Info("reconciler: dropping onboot retry — operator intent changed",
 				"vm", name, "state_detail", fresh.StateDetail, "onboot", specOnboot(fresh.Spec))
 			r.clearOnbootPending(name)
+			continue
+		}
+		if fresh.State == "pending" || fresh.State == "starting" {
+			// The walk drives every pending or starting row of this host on
+			// each pass (a deferred start among them), so the retry leaves
+			// it to the walk: driven once per pass, not twice (lab 2 O-8).
+			// The duty stays until the start is made or dropped.
 			continue
 		}
 		r.startPendingVM(ctx, *fresh) // gated + current row; succeeds once quorum returns

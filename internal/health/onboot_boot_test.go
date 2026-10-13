@@ -588,3 +588,86 @@ func TestOnboot_AListThatNeverAnswersAtBootRecordsTheBootOwingNothing(t *testing
 		t.Fatal("a daemon restart after the failed boot list started ob over its operator's stop")
 	}
 }
+
+// Lab 2 F-5. The onboot retry dropped a VM's onboot duty whenever reading
+// its row failed — an expired walk context, a transient DB error — as if
+// the VM were gone or reassigned, with no log line: the VM was stranded.
+// A failed read keeps the duty (Warn logged); only a read that succeeds
+// and shows the VM gone, on another host, or onboot off ends it.
+//
+// Mutation "a failed read drops the duty" (the old rule): red.
+func TestOnboot_AFailedRowReadKeepsTheOnbootDuty(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "zob", HostName: "node-a", State: "stopped", Spec: `{"name":"zob","onboot":true}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New()
+	r := restartedReconciler(db, fake, t.TempDir(), bootNow)
+	gate := &mutableGate{active: true} // warm-up
+	r.SetGate(gate)
+	r.StartOnbootVMs(ctx)
+
+	// A pass whose walk budget is already spent: every read fails.
+	expired, cancel := context.WithCancel(ctx)
+	cancel()
+	r.retryOnbootPending(expired, func(string) bool { return true }, nil)
+	r.onbootMu.Lock()
+	_, owed := r.onbootPending["zob"]
+	r.onbootMu.Unlock()
+	if !owed {
+		t.Fatal("a failed read of zob's row dropped its onboot duty")
+	}
+
+	gate.setExecOK(true)
+	r.reconcile(ctx)
+	if !hwStarted(fake, "zob") {
+		t.Fatal("zob, whose onboot duty survived a failed read, was not started once the gate opened")
+	}
+}
+
+// Lab 2 O-8. A deferred onboot VM was driven twice per pass: once by the
+// onboot retry and once by the walk's "starting" case, so every deferral
+// was logged and gated twice. The walk drives every pending or starting
+// row; the retry leaves those to it.
+//
+// Mutation "the retry also drives a starting row": red on the count.
+func TestOnboot_ADeferredOnbootVMIsDrivenOncePerPass(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	fake := libvirtfake.New()
+	disk := filepath.Join(t.TempDir(), "onb-root.qcow2")
+	if err := os.WriteFile(disk, []byte("the disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "onb", HostName: "node-a", State: "stopped", Spec: `{"name":"onb","onboot":true}`,
+	}, nil, []corrosion.DiskRecord{{VMName: "onb", DiskName: "root", HostName: "node-a", Path: disk, SizeBytes: 1 << 20, StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	r := restartedReconciler(db, fake, t.TempDir(), bootNow)
+	s := stallStorage(t, disk)
+	s.wire(r)
+	drives := 0
+	r.SetStartDeferral(func(_ context.Context, vm *corrosion.VMRecord) error {
+		if vm.Name == "onb" {
+			drives++
+		}
+		return nil
+	})
+
+	r.StartOnbootVMs(ctx)
+	requireState(t, db, "onb", "starting")
+	drives = 0
+	r.reconcile(ctx)
+	if drives != 1 {
+		t.Fatalf("the deferred onboot VM was driven %d times in one pass, want 1", drives)
+	}
+	r.onbootMu.Lock()
+	_, owed := r.onbootPending["onb"]
+	r.onbootMu.Unlock()
+	if !owed {
+		t.Fatal("the deferred onboot VM lost its onboot duty")
+	}
+}

@@ -58,6 +58,7 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 		NeverAdopted:        res.NeverAdopted,
 		NotSigningHosts:     res.NotSigning,
 		AmbiguousRows:       res.Ambiguous,
+		OrphanedRows:        res.Orphans,
 
 		Tampered:   res.Tampered(),
 		Unverified: res.Unverified(),

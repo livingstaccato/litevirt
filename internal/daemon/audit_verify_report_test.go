@@ -64,6 +64,7 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 	// chain's seq range leaves an orphan and no seq jump.
 	forkAndOrphan := fork
 	forkAndOrphan.Orphaned = 1
+	forkAndOrphan.Orphans = []string{"node-3: row r3 (seq 3) follows prev_hash abc, which is the hash of no row of node-3 at seq 2"}
 
 	for _, tc := range []struct {
 		name          string
@@ -83,6 +84,12 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 		out := buf.String()
 		if !strings.Contains(out, tc.log) || strings.Contains(out, tc.notLog) {
 			t.Errorf("%s: logged %q, want %q and not %q", tc.name, out, tc.log, tc.notLog)
+		}
+		// Re-review m-3: the hourly check names an orphaned row, not a count.
+		for _, o := range tc.res.Orphans {
+			if !strings.Contains(out, "row r3 (seq 3)") {
+				t.Errorf("%s: logged %q, want the orphan %q named", tc.name, out, o)
+			}
 		}
 		for kind, want := range map[string]float64{
 			"forked_chain": tc.forked, "broken_hash": tc.hash, "seq_gap": tc.gaps, "seq_duplicate": tc.repeats,

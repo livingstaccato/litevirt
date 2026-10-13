@@ -26,9 +26,11 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 )
@@ -55,6 +57,90 @@ func nicGuardExplicit(att *pb.NetworkAttachment) bool {
 // a default guard does.
 func nicGuardWeakens(mode string, allowed []string, dhcp, ra, vlan bool) bool {
 	return mode == corrosion.NICGuardOff || len(allowed) > 0 || dhcp || ra || vlan
+}
+
+// guardUnenforcedOnNetwork is why no guard can be enforced on a NIC of the
+// named network (compose.GuardUnenforcedOn over its record), or "". Create,
+// SetNICGuard, the compose plan and its executor all decide by it.
+func guardUnenforcedOnNetwork(ctx context.Context, db *corrosion.Client, network string) string {
+	typ := ""
+	if def, _ := lookupNetworkDef(ctx, db, network); def != nil {
+		typ = def.Type
+	}
+	return compose.GuardUnenforcedOn(typ, network)
+}
+
+// leaveOutUnenforcedGuards removes, from a spec that is replayed rather than
+// asked for — a re-create of a stored spec, or the owner leg of a create its
+// entry node admitted — the guard settings of each NIC whose network cannot
+// enforce a guard (guardUnenforcedOnNetwork). A create on an older build
+// stored such settings and wrote no record: they were never enforced. They
+// are left out, never refused, and never silently: the returned note logs
+// each and records it as a warning event of the VM (round 4, R1). The create
+// calls it once it has succeeded, so a create refused after the strip
+// records nothing about a create that never happened (round 5).
+func (s *Server) leaveOutUnenforcedGuards(ctx context.Context, spec *pb.VMSpec) (note func()) {
+	unenforced := func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) }
+	notes := compose.StripUnenforcedGuards(spec, unenforced)
+	name := spec.GetName()
+	return func() {
+		for _, n := range notes {
+			detail := "guard settings left out of the create, as they were never enforced: " + n
+			slog.Warn("NIC guard: "+detail, "vm", name)
+			s.recordVMEventSeverity(ctx, name, "vm.nic_guard.not_enforced", "ok", "warning", detail)
+		}
+	}
+}
+
+// withoutUnenforcedGuards is a copy of spec without the guard settings a
+// replayed create leaves out (leaveOutUnenforcedGuards), noting nothing.
+func (s *Server) withoutUnenforcedGuards(ctx context.Context, spec *pb.VMSpec) *pb.VMSpec {
+	if spec == nil {
+		return nil
+	}
+	c := proto.Clone(spec).(*pb.VMSpec)
+	compose.StripUnenforcedGuards(c, func(n string) string { return guardUnenforcedOnNetwork(ctx, s.db, n) })
+	return c
+}
+
+// admittedByEntryNode reports whether ctx is the owner leg of a create a
+// peer host forwarded: its entry node admitted the request, refusing new
+// guard settings where none can be enforced if it is a build that does, so
+// what reaches here is replayed, not asked for.
+func (s *Server) admittedByEntryNode(ctx context.Context) bool {
+	return callerPrincipalKind(ctx) == principalKindPeer && s.requirePeerCert(ctx) == nil
+}
+
+// preflightRecreateGuards runs, before cur is torn down to be created again
+// from spec, the guard admission the create will make (admitNICGuards, as a
+// re-create of cur), so that a refusal — a stored guard the create would
+// reject, or one the caller may not carry — leaves the VM as it was.
+func (s *Server) preflightRecreateGuards(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord) error {
+	return s.preflightCreateGuards(ctx, spec, cur, true)
+}
+
+// preflightCreateGuards runs, before cur is torn down, the guard admission
+// the create of spec will make, in the create's own mode: as the re-create
+// of cur when the create will carry it (replaced: a rebuild, a rolling
+// re-create, an inline compose re-create of a VM on an iSCSI LUN), else as a
+// fresh create (admitNew: the inline compose re-create). A preflight judged
+// in another mode than the create would pass what the create then refuses
+// with the VM gone, or refuse what it would pass (round 5, S1). It judges the
+// spec the create will judge: a replayed spec without the settings the
+// create leaves out (leaveOutUnenforcedGuards).
+func (s *Server) preflightCreateGuards(ctx context.Context, spec *pb.VMSpec, cur *corrosion.VMRecord, replaced bool) error {
+	if cur == nil {
+		return nil
+	}
+	how := admitNew
+	if replaced {
+		ctx, how = withReplacedVM(ctx, cur), admitRecreate
+	}
+	if replaced || s.admittedByEntryNode(ctx) {
+		spec = s.withoutUnenforcedGuards(ctx, spec)
+	}
+	_, err := s.admitNICGuards(ctx, spec.GetName(), spec.GetNetwork(), how)
+	return err
 }
 
 // requireGuardAuthority is the check every weakening needs: authority over
@@ -321,6 +407,22 @@ func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.N
 		}
 		if !nicGuardExplicit(att) {
 			continue
+		}
+		// A guard asked for where none can be enforced is refused, never
+		// created as a NIC that silently has none (the compose plan reports
+		// it and leaves the settings out: compose.StripUnenforcedGuards).
+		// Only new input is refused: a re-create replays a stored spec, which
+		// a create before this refusal existed may have stored with such a
+		// guard. Its create leaves the settings out with a warning
+		// (leaveOutUnenforcedGuards); here they are no record, as they always
+		// were — never a refusal, which a rebuild would meet after its
+		// teardown (round 4, R1).
+		if why := guardUnenforcedOnNetwork(ctx, s.db, att.GetName()); why != "" {
+			if how == admitRecreate {
+				continue
+			}
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"network %q: NIC guard settings were given, but %s; leave them out (a guard there would protect nothing)", att.GetName(), why)
 		}
 		if !s.db.MayWriteClusterPolicy() {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -687,10 +789,20 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 	if err := s.requireGuardAuthority(ctx, tgt.nic.NetworkName, "setting a NIC guard"); err != nil {
 		return nil, err
 	}
-	if def, _ := lookupNetworkDef(ctx, s.db, tgt.nic.NetworkName); def != nil && (def.Type == "direct" || def.Type == "sriov") {
+	return s.putNICGuard(ctx, tgt, mode, req)
+}
+
+// putNICGuard writes the guard req names onto the NIC tgt, once the caller's
+// authority to do so is settled: SetNICGuard's whatever it sets, or, for a
+// compose deploy restoring a declared guard that loosens nothing, the
+// create path's rule that a guard no weaker than the default needs none
+// (stacks_nic_security.go). The direct/SR-IOV refusal, the release gate and
+// the audit row are the same either way.
+func (s *Server) putNICGuard(ctx context.Context, tgt guardTarget, mode string, req *pb.SetNICGuardRequest) (*pb.NICGuard, error) {
+	ct := req.GetContainerName() != ""
+	if why := guardUnenforcedOnNetwork(ctx, s.db, tgt.nic.NetworkName); why != "" {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"NIC %s is on %s network %q, which bypasses the bridge where guards are enforced; a guard there would protect nothing",
-			tgt.nic.MAC, def.Type, tgt.nic.NetworkName)
+			"NIC %s is on network %q: %s; a guard there would protect nothing", tgt.nic.MAC, tgt.nic.NetworkName, why)
 	}
 	// Refused here, before the gate records any use (switch review m1).
 	if _, err := corrosion.NormalizeNICGuardAddresses(req.GetAllowedAddresses()); err != nil {

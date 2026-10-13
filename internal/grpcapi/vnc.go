@@ -23,25 +23,29 @@ import (
 // ProxyVNC provides a bidirectional byte stream to the VNC port of a running VM.
 // The VM name is passed via incoming metadata key "x-vm-name".
 // If the VM is on a remote host, this handler forwards to the remote daemon.
-func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) error {
-	if err := s.requirePermPrecheck(stream.Context(), "operator"); err != nil {
-		return err
-	}
+func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) (err error) {
 	md, _ := metadataFromStream(stream)
 	vmName := ""
 	if vals := md.Get("x-vm-name"); len(vals) > 0 {
 		vmName = vals[0]
 	}
+	ctx := stream.Context()
+	// Every open, refused or not, is audited (console_audit.go).
+	ca := s.beginConsoleAudit(ctx, consoleKindVNC, vmName)
+	defer func() { ca.end(err) }()
+
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return err
+	}
 	if vmName == "" {
 		return status.Error(codes.InvalidArgument, "x-vm-name metadata required")
 	}
-
-	ctx := stream.Context()
 
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", vmName)
 	}
+	ca.setOwner(vm.HostName)
 	// Path-scoped check on the VM's tenancy project — a console is interactive
 	// root access to the guest, so a broad operator role isn't enough; the
 	// caller must hold vm.console on THIS VM. Enforced on the entry host where
@@ -59,7 +63,7 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 
 	// Remote VM: forward to the host that owns it.
 	if vm.HostName != s.hostName {
-		return s.forwardVNC(stream, vmName, vm.HostName)
+		return s.forwardVNC(stream, vmName, vm.HostName, ca)
 	}
 
 	// Local VM: connect to the VNC port. A missing VNC graphics device means
@@ -87,6 +91,9 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	defer conn.Close()
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
+	// The session is open: audited, and the header sent before the
+	// handshake's first byte, so a relaying host records it too.
+	ca.accept(stream)
 
 	viewer := newVNCViewerStream(ctx, stream)
 	if password != "" {
@@ -306,7 +313,7 @@ func (v *vncViewerStream) Write(p []byte) (int, error) {
 }
 
 // forwardVNC relays a ProxyVNC stream to a remote daemon.
-func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNCData], vmName, hostName string) error {
+func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNCData], vmName, hostName string, ca *consoleAudit) error {
 	ctx := incoming.Context()
 	client, conn, err := s.peerClient(ctx, hostName)
 	if err != nil {
@@ -314,13 +321,23 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 	}
 	defer conn.Close()
 	defer logForwardedConsole(ctx, "VNC", vmName, hostName)()
+	session := ca.attach()
 
-	// Forward x-vm-name metadata to the remote daemon.
-	outCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("x-vm-name", vmName))
+	// Forward x-vm-name metadata to the remote daemon, and this host's
+	// console session id for the owner's audit row to name. The remote leg
+	// ends with this handler, so its header wait (below) cannot outlive it.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	outCtx := metadata.NewOutgoingContext(rctx, metadata.Pairs("x-vm-name", vmName, consoleAuditSessionMD, session))
 	remote, err := client.ProxyVNC(outCtx)
 	if err != nil {
 		return remoteStreamErr(hostName, err)
 	}
+	sendDone := make(chan struct{})
+	defer func() {
+		cancel()
+		waitRelaySender(sendDone)
+	}()
 
 	errCh := make(chan error, 2)
 
@@ -344,8 +361,11 @@ func (s *Server) forwardVNC(incoming grpc.BidiStreamingServer[pb.VNCData, pb.VNC
 		}
 	}()
 
-	// remote → incoming
+	// remote → incoming. The session is open here only once the VM's host
+	// has accepted it (its header).
 	go func() {
+		defer close(sendDone)
+		ca.acceptRelayed(remote, incoming)
 		for {
 			msg, err := remote.Recv()
 			if err != nil {

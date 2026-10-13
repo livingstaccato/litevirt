@@ -41,6 +41,10 @@ type Server struct {
 	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
 
+	// consoleSessions groups a SPICE client's channels into one audited
+	// session (console_audit.go).
+	consoleSessions consoleSessions
+
 	hostName string
 	dataDir  string
 	// fenceExec, when set, replaces fence.Execute for FenceHost (tests only;

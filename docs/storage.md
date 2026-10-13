@@ -304,6 +304,23 @@ answers again. litevirt keeps that from holding anything else:
   waits in `starting` (a failover in `pending`, its proof kept) and the next
   pass starts it once the storage answers, and the overlay sweep at daemon start passes the VM over
   instead of holding its lock.
+- **The reconcile pass.** One pass on a host serves all of its VMs, so no
+  look it makes at a disk file waits on the server. The check that each disk
+  of a VM it starts is there, the set-aside of an old copy at a host-local
+  disk's path on a failover onto the host, the define of a stopped VM a
+  failover moved to the host, and the set-aside of a disk a failover left on
+  the host each give up after 5 s. A disk that does not answer is never
+  taken as missing: no start is refused as "disk missing" and no disk is
+  rebuilt from its image for it. The start is deferred as above, and nothing
+  is defined or renamed until a later pass gets an answer. The VMs after it
+  in the pass are reconciled as usual, so one dead pool costs the pass about
+  5 s, not the length of the outage, when the disks' paths lie under the
+  pool's mount as written: the first look that goes unanswered marks the
+  mount, and every later look under it gives up at once. A disk reached
+  through a symlink into the mount is not recognised as on it, so each such
+  path costs its own 5 s the first time it is looked at (N of them, about
+  5·N s in that pass); later passes give up on them at once while those
+  looks are still stuck.
 - **Image prune and snapshot delete or revert.** Whether a file is in use is
   never decided on a guess. When resolving a path in the image store or a
   disk's chain does not answer, or listing the image store (a store whose
@@ -1090,7 +1107,9 @@ seconds.
 If the create fails after the teardown for any reason, the error says what was
 torn down and where, and the spec the create was given is kept on that node
 under `<data_dir>/recreate-failed/`, one file per failure, readable by root
-only, to re-create the VM from. The directory keeps the newest 50 files and
+only, to re-create the VM from. Guard settings on a NIC that cannot be guarded
+(a direct or SR-IOV NIC, docs/firewall.md) are left out of it, as the create
+left them out. The directory keeps the newest 50 files and
 none older than 30 days; copy out a spec you still need.
 
 A disk on an iSCSI LUN is not torn down: the LUN keeps the guest's data. Create

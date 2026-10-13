@@ -57,7 +57,7 @@ WebAuthn enrollment is browser-only; use the `/account/2fa` page.
 ```bash
 lv status                          # Cluster overview (JSON)
 lv events [--type <filter>]        # Stream cluster events live
-lv events <vm> [--limit N] [--since <RFC3339>]   # One VM's activity history (lifecycle + backup outcomes)
+lv events <vm> [--limit N] [--since <time>]   # One VM's activity history (lifecycle + backup outcomes)
 lv top [--interval 3s]             # Live resource dashboard
 lv ui [--open]                     # Show web UI URL
 lv mcp [--max-list-items N] [--allow-write]  # Run the stdio MCP server for operator assistants
@@ -504,6 +504,8 @@ lv compose down [-f litevirt-compose.yaml] [-y]    # Tear down stack
 lv compose down --name <stack> [-y]                # Tear down by stack name
 lv compose ps [-f litevirt-compose.yaml]           # List stack VMs
 lv compose diff [-f litevirt-compose.yaml]         # Preview changes
+lv compose up --allow-weaken                       # Also restore declared NIC security groups / looser guards over runtime changes
+lv compose diff --allow-weaken                     # Preview what up --allow-weaken would change
 lv compose ls                                      # List all stacks
 lv compose export <stack> [-o file.yaml]           # Export stack compose YAML
 ```
@@ -944,7 +946,8 @@ lv mapping rm <name>
 
 ```bash
 lv run … --onboot --startup-order 10 --start-delay 5 --stop-delay 0
-# onboot VMs start in startup-order on host boot (not on a plain daemon restart).
+# onboot VMs start in startup-order on host boot (not on a plain daemon restart),
+# including one its operator stopped before the reboot.
 
 lv host shutdown-workloads <host>
 # Gracefully stop every running VM on a host in REVERSE startup-order (highest
@@ -1341,10 +1344,10 @@ See `docs/firewall.md` for the three-tier model, where each tier is enforced
 
 ```bash
 lv audit ls [--limit N] \
-    [--target <path>] [--action <a>] [--user <u>] [--since <RFC3339>]   # Tail/filter recent audit entries
+    [--target <path>] [--action <a>] [--user <u>] [--since <time>]   # Tail/filter recent audit entries
   #   --action supports a trailing-* prefix glob (e.g. sg.*)
 lv audit verify                                # Walk the SHA-256 hash chain
-lv audit export [--since <ts>] [--until <ts>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
+lv audit export [--since <time>] [--until <time>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
   #   --allow-gaps exports a chain with seq gaps, listed under seq_gaps (investigation, not attestation)
 ```
 
@@ -1357,7 +1360,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since TS]   # Audit log (default 50 entries)
+lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics
 ```

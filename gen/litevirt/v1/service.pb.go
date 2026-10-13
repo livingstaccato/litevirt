@@ -6251,6 +6251,12 @@ type DeployStackRequest struct {
 	ScaleVm       string                 `protobuf:"bytes,4,opt,name=scale_vm,json=scaleVm,proto3" json:"scale_vm,omitempty"`
 	DryRun        bool                   `protobuf:"varint,5,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
 	ExpectedHash  string                 `protobuf:"bytes,6,opt,name=expected_hash,json=expectedHash,proto3" json:"expected_hash,omitempty"`
+	// allow_weaken lets the deploy restore a NIC's declared security groups,
+	// or a declared guard that is looser than the one enforced now, over a
+	// runtime change (lv sg bind, lv firewall nic-guard set). Without it such
+	// a restore is withheld and reported. Default false: an older client
+	// never weakens.
+	AllowWeaken   bool `protobuf:"varint,7,opt,name=allow_weaken,json=allowWeaken,proto3" json:"allow_weaken,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6325,6 +6331,13 @@ func (x *DeployStackRequest) GetExpectedHash() string {
 		return x.ExpectedHash
 	}
 	return ""
+}
+
+func (x *DeployStackRequest) GetAllowWeaken() bool {
+	if x != nil {
+		return x.AllowWeaken
+	}
+	return false
 }
 
 type DeployProgress struct {
@@ -6660,8 +6673,10 @@ func (x *StackSummary) GetCreatedAt() *timestamppb.Timestamp {
 }
 
 type DiffStackRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ComposeYaml   string                 `protobuf:"bytes,1,opt,name=compose_yaml,json=composeYaml,proto3" json:"compose_yaml,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ComposeYaml string                 `protobuf:"bytes,1,opt,name=compose_yaml,json=composeYaml,proto3" json:"compose_yaml,omitempty"`
+	// allow_weaken plans as DeployStackRequest.allow_weaken would.
+	AllowWeaken   bool `protobuf:"varint,2,opt,name=allow_weaken,json=allowWeaken,proto3" json:"allow_weaken,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6701,6 +6716,13 @@ func (x *DiffStackRequest) GetComposeYaml() string {
 		return x.ComposeYaml
 	}
 	return ""
+}
+
+func (x *DiffStackRequest) GetAllowWeaken() bool {
+	if x != nil {
+		return x.AllowWeaken
+	}
+	return false
 }
 
 type DiffStackResponse struct {
@@ -21568,8 +21590,8 @@ type ListAuditLogRequest struct {
 	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"` // filter: exact target path (empty = any)
 	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"` // filter: exact, or trailing-* prefix glob e.g. "sg.*" (empty = any)
 	User          string                 `protobuf:"bytes,4,opt,name=user,proto3" json:"user,omitempty"`     // filter: exact username (empty = any)
-	Since         string                 `protobuf:"bytes,5,opt,name=since,proto3" json:"since,omitempty"`   // filter: timestamp >= since, RFC3339 (empty = open)
-	Until         string                 `protobuf:"bytes,6,opt,name=until,proto3" json:"until,omitempty"`   // filter: timestamp <= until, RFC3339 (empty = open)
+	Since         string                 `protobuf:"bytes,5,opt,name=since,proto3" json:"since,omitempty"`   // filter: at/after since, as an instant (forms as ExportAuditChainRequest; empty = open)
+	Until         string                 `protobuf:"bytes,6,opt,name=until,proto3" json:"until,omitempty"`   // filter: up to the end of until (forms as ExportAuditChainRequest; empty = open)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -21788,7 +21810,7 @@ type ListVMEventsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
 	Limit         int32                  `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"` // default 100, max 1000
-	Since         string                 `protobuf:"bytes,3,opt,name=since,proto3" json:"since,omitempty"`  // RFC3339; empty = no lower bound
+	Since         string                 `protobuf:"bytes,3,opt,name=since,proto3" json:"since,omitempty"`  // at/after, as an instant (forms as ExportAuditChainRequest); empty = no lower bound
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -38560,6 +38582,22 @@ type VerifyAuditChainResponse struct {
 	// the same. A current daemon never writes one. Feeds `unverified`, not
 	// `tampered` — an older build may have written the row verbatim.
 	AmbiguousRows []string `protobuf:"bytes,19,rep,name=ambiguous_rows,json=ambiguousRows,proto3" json:"ambiguous_rows,omitempty"`
+	// What kind of break broken_at_id is, so a client can name it rather than
+	// calling every broken link an edit:
+	//
+	//	"content"  - the row does not hash to its own stored content_hash,
+	//	             even against its own stored prev_hash: it was edited.
+	//	"forked"   - the row hashes correctly against its own stored prev_hash,
+	//	             which is empty: it opens a second chain under a host name
+	//	             that already has one (a rebuilt host appending before its
+	//	             history arrived). Still a finding.
+	//	"unlinked" - the row hashes correctly against its own stored prev_hash,
+	//	             but that is not the hash of the row before it: a row
+	//	             before it was deleted or rewritten, or the chain branched.
+	//
+	// Empty when broken_at_id is, and from a daemon older than this field,
+	// which a client reads as "content" — the only label it used to have.
+	BrokenAtKind  string `protobuf:"bytes,20,opt,name=broken_at_kind,json=brokenAtKind,proto3" json:"broken_at_kind,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -38725,6 +38763,13 @@ func (x *VerifyAuditChainResponse) GetAmbiguousRows() []string {
 		return x.AmbiguousRows
 	}
 	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetBrokenAtKind() string {
+	if x != nil {
+		return x.BrokenAtKind
+	}
+	return ""
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
@@ -38954,8 +38999,10 @@ func (x *RetireAuditKeyResponse) GetRetiredAtSeq() int64 {
 
 type ExportAuditChainRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
-	// "from the beginning" / "to the end".
+	// Time bounds, both inclusive, compared as instants: RFC3339 (any offset),
+	// a date or coarser, or a duration ago (corrosion.ParseTimeWindow; until
+	// runs to the end of the unit it names). Unparseable is InvalidArgument.
+	// Empty since/until means "from the beginning" / "to the end".
 	//
 	// A window that starts mid-chain exports a fragment whose first row links
 	// to a row outside it, which cannot be re-verified. Narrow the window to
@@ -41680,14 +41727,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\tdisk_name\x18\x02 \x01(\tR\bdiskName\x121\n" +
 	"\x06limits\x18\x03 \x01(\v2\x19.litevirt.v1.DiskIOLimitsR\x06limits\"\x1d\n" +
 	"\aVNCData\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"\xd4\x01\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"\xf7\x01\n" +
 	"\x12DeployStackRequest\x12!\n" +
 	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\x12\x1b\n" +
 	"\ttarget_vm\x18\x02 \x01(\tR\btargetVm\x12%\n" +
 	"\x0escale_override\x18\x03 \x01(\x05R\rscaleOverride\x12\x19\n" +
 	"\bscale_vm\x18\x04 \x01(\tR\ascaleVm\x12\x17\n" +
 	"\adry_run\x18\x05 \x01(\bR\x06dryRun\x12#\n" +
-	"\rexpected_hash\x18\x06 \x01(\tR\fexpectedHash\"\xad\x01\n" +
+	"\rexpected_hash\x18\x06 \x01(\tR\fexpectedHash\x12!\n" +
+	"\fallow_weaken\x18\a \x01(\bR\vallowWeaken\"\xad\x01\n" +
 	"\x0eDeployProgress\x12\x14\n" +
 	"\x05phase\x18\x01 \x01(\tR\x05phase\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x1b\n" +
@@ -41713,9 +41761,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\astopped\x18\x05 \x01(\x05R\astopped\x12\x14\n" +
 	"\x05error\x18\x06 \x01(\x05R\x05error\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"5\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"X\n" +
 	"\x10DiffStackRequest\x12!\n" +
-	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\"E\n" +
+	"\fcompose_yaml\x18\x01 \x01(\tR\vcomposeYaml\x12!\n" +
+	"\fallow_weaken\x18\x02 \x01(\bR\vallowWeaken\"E\n" +
 	"\x11DiffStackResponse\x120\n" +
 	"\aentries\x18\x01 \x03(\v2\x16.litevirt.v1.DiffEntryR\aentries\"o\n" +
 	"\tDiffEntry\x12\x17\n" +
@@ -44313,7 +44362,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xd6\x05\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xfc\x05\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -44337,7 +44386,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"unverified\x18\x11 \x01(\bR\n" +
 	"unverified\x12*\n" +
 	"\x11not_signing_hosts\x18\x12 \x03(\tR\x0fnotSigningHosts\x12%\n" +
-	"\x0eambiguous_rows\x18\x13 \x03(\tR\rambiguousRows\"\x8b\x02\n" +
+	"\x0eambiguous_rows\x18\x13 \x03(\tR\rambiguousRows\x12$\n" +
+	"\x0ebroken_at_kind\x18\x14 \x01(\tR\fbrokenAtKind\"\x8b\x02\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +

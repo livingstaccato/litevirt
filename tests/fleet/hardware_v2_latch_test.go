@@ -55,6 +55,21 @@ func gateFor(t *testing.T, c *Cluster, n *Node) *health.Checker {
 	ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 	ch.SetPeerPinger(n.Server.PeerCapabilities)
 	ch.SetActivationMarker(markerBase(c, n))
+	// The stall heartbeat runs, as it does in the daemon (Checker.Start): the
+	// checker then reads a gap as a stall only when this process really
+	// stopped, not whenever a scenario step outlasts a probe tick between two
+	// gate reads (gate_heartbeat_test.go). Stopped before the cluster closes
+	// the node's DB: cleanups run last-registered first.
+	hbCtx, hbStop := context.WithCancel(context.Background())
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		ch.RunStallHeartbeatForTests(hbCtx)
+	}()
+	t.Cleanup(func() {
+		hbStop()
+		<-hbDone
+	})
 	// The server sees the checker THROUGH the fleet's reachability overlay, so a
 	// scenario can model a host rejoining (see Node.Rejoin). The overlay is empty
 	// unless a scenario adds to it, so every decision here is the checker's own.

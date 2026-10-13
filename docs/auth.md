@@ -905,7 +905,10 @@ an open SPICE session lives as long as that tunnel, whatever happens to the
 account. To end one when disabling a user, revoke the user's SSH access to
 the host and kill their SSH session there (`pkill -u <ssh-user> sshd`), which
 ends the tunnel and the SPICE connection in it; restarting the VM also ends
-it. `lv user disable` alone stops only new `lv spice` calls.
+it. `lv user disable` alone stops only new `lv spice` calls. The console's
+password (ui.md "Console passwords") rotates at the VM's next define, so a
+disabled user who kept a `.vv` file or a printed password can use it only
+until the VM is next defined and restarted.
 
 Admin only, audited as `user.account`. Refused for the cluster's last admin
 that can log in, enabled with no expiry — `lv user delete` applies the same rule — and

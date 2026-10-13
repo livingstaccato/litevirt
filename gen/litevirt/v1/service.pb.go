@@ -30961,9 +30961,16 @@ type EnsureDisksResponse struct {
 	// the destination definition's <shares> for this host's scale. An older
 	// target never sets it ("" = unknown), and the source migrates the domain
 	// unchanged, as before.
-	CgroupMode    string `protobuf:"bytes,6,opt,name=cgroup_mode,json=cgroupMode,proto3" json:"cgroup_mode,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CgroupMode string `protobuf:"bytes,6,opt,name=cgroup_mode,json=cgroupMode,proto3" json:"cgroup_mode,omitempty"`
+	// vnc_password_unavailable: this host's QEMU cannot do VNC password
+	// authentication (a FIPS-mode host has no DES; docs/ui.md "Console
+	// passwords"). A live migration onto it moves the guest without its VNC
+	// password, which would otherwise fail the guest's start here. An older
+	// target never sets it, and none can hold a passworded guest: no password
+	// is set before console_password_v1 latches.
+	VncPasswordUnavailable bool `protobuf:"varint,7,opt,name=vnc_password_unavailable,json=vncPasswordUnavailable,proto3" json:"vnc_password_unavailable,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *EnsureDisksResponse) Reset() {
@@ -31036,6 +31043,13 @@ func (x *EnsureDisksResponse) GetCgroupMode() string {
 		return x.CgroupMode
 	}
 	return ""
+}
+
+func (x *EnsureDisksResponse) GetVncPasswordUnavailable() bool {
+	if x != nil {
+		return x.VncPasswordUnavailable
+	}
+	return false
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -35394,10 +35408,19 @@ func (x *GetSpiceInfoRequest) GetVmName() string {
 }
 
 type GetSpiceInfoResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`  // host the VM runs on
-	Port          int32                  `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"` // SPICE TCP port (libvirt-assigned)
-	Uri           string                 `protobuf:"bytes,3,opt,name=uri,proto3" json:"uri,omitempty"`    // convenience: "spice://<host>:<port>"
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Host  string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`  // host the VM runs on
+	Port  int32                  `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"` // SPICE TCP port (libvirt-assigned)
+	Uri   string                 `protobuf:"bytes,3,opt,name=uri,proto3" json:"uri,omitempty"`    // convenience: "spice://<host>:<port>"
+	// The password the VM's SPICE console requires ("" when it requires
+	// none; docs/ui.md "Console passwords"). Returned only to a caller that
+	// passed the vm.console check, and never logged.
+	Password string `protobuf:"bytes,4,opt,name=password,proto3" json:"password,omitempty"`
+	// warning: why a SPICE client may be unable to connect on the VM's host
+	// ("" when nothing is known), e.g. a FIPS-mode kernel, under which
+	// spice-server cannot make the RSA key every SPICE link needs. Nothing is
+	// refused because of it; VNC still works.
+	Warning       string `protobuf:"bytes,5,opt,name=warning,proto3" json:"warning,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -35449,6 +35472,20 @@ func (x *GetSpiceInfoResponse) GetPort() int32 {
 func (x *GetSpiceInfoResponse) GetUri() string {
 	if x != nil {
 		return x.Uri
+	}
+	return ""
+}
+
+func (x *GetSpiceInfoResponse) GetPassword() string {
+	if x != nil {
+		return x.Password
+	}
+	return ""
+}
+
+func (x *GetSpiceInfoResponse) GetWarning() string {
+	if x != nil {
+		return x.Warning
 	}
 	return ""
 }
@@ -43567,7 +43604,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bDiskStub\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xa7\x03\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\xe1\x03\n" +
 	"\x13EnsureDisksResponse\x12#\n" +
 	"\rcreated_paths\x18\x01 \x03(\tR\fcreatedPaths\x12.\n" +
 	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\x122\n" +
@@ -43575,7 +43612,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16installer_iso_resolved\x18\x04 \x03(\v2:.litevirt.v1.EnsureDisksResponse.InstallerIsoResolvedEntryR\x14installerIsoResolved\x12+\n" +
 	"\x11migration_address\x18\x05 \x01(\tR\x10migrationAddress\x12\x1f\n" +
 	"\vcgroup_mode\x18\x06 \x01(\tR\n" +
-	"cgroupMode\x1aG\n" +
+	"cgroupMode\x128\n" +
+	"\x18vnc_password_unavailable\x18\a \x01(\bR\x16vncPasswordUnavailable\x1aG\n" +
 	"\x19InstallerIsoResolvedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x84\x02\n" +
@@ -43905,11 +43943,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\".\n" +
 	"\x13GetSpiceInfoRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"P\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x86\x01\n" +
 	"\x14GetSpiceInfoResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\x05R\x04port\x12\x10\n" +
-	"\x03uri\x18\x03 \x01(\tR\x03uri\"\xbe\x02\n" +
+	"\x03uri\x18\x03 \x01(\tR\x03uri\x12\x1a\n" +
+	"\bpassword\x18\x04 \x01(\tR\bpassword\x12\x18\n" +
+	"\awarning\x18\x05 \x01(\tR\awarning\"\xbe\x02\n" +
 	"\x11RebalanceProposal\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x19\n" +

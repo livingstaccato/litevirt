@@ -1,10 +1,14 @@
 package grpcapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -13,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/rfb"
 )
 
 // ProxyVNC provides a bidirectional byte stream to the VNC port of a running VM.
@@ -66,6 +71,15 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		return status.Errorf(codes.FailedPrecondition, "VNC is not enabled for VM %q", vmName)
 	}
 
+	// The console's password, if it has one (docs/ui.md "Console
+	// passwords"). Read from the RUNNING domain, so it is the one the guest
+	// started with, wherever it was defined or migrated from. Never logged.
+	password, err := s.virt.ConsolePassword(vmName, "vnc")
+	if err != nil {
+		slog.Warn("vnc console password unreadable", "vm", vmName, "error", err)
+		return status.Errorf(codes.Internal, "read the VNC console's password for VM %q: %v", vmName, err)
+	}
+
 	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return status.Errorf(codes.Internal, "connect to VNC port %d: %v", port, err)
@@ -74,7 +88,41 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	// Released at the cut even if this handler is blocked elsewhere (m-2).
 	registerStreamCloser(stream.Context(), func() { _ = conn.Close() })
 
-	slog.Info("VNC proxy session started", "vm", vmName, "port", port)
+	viewer := newVNCViewerStream(ctx, stream)
+	if password != "" {
+		// This host offers the viewer security type None and, once the viewer
+		// has picked it, authenticates to the listener itself: the viewer,
+		// and every daemon relaying to it, never sees the password, and an
+		// older relay needs no change. The viewer side goes first and is
+		// bounded, so a viewer that stalls never holds an authenticated
+		// listener connection; a refused password reaches a 3.8 viewer as a
+		// failed security result. It runs on this goroutine: nothing that
+		// writes to the stream outlives the handler.
+		var backendErr error
+		viewer.setDeadline(time.Now().Add(vncHandshakeTimeout))
+		err := rfb.ServeNoAuth(viewer, func() error {
+			_ = conn.SetDeadline(time.Now().Add(vncAuthTimeout))
+			backendErr = rfb.Authenticate(conn, password)
+			_ = conn.SetDeadline(time.Time{})
+			return backendErr
+		})
+		viewer.setDeadline(time.Time{})
+		switch {
+		case backendErr != nil:
+			slog.Warn("vnc console authentication failed", "vm", vmName, "error", backendErr)
+			return status.Errorf(codes.Internal, "authenticate to the VNC console of VM %q: %v", vmName, backendErr)
+		case errors.Is(err, errVNCHandshakeTimeout):
+			_ = conn.Close()
+			return status.Errorf(codes.DeadlineExceeded, "the viewer did not complete the VNC handshake within %s", vncHandshakeTimeout)
+		case err != nil && ctx.Err() != nil:
+			_ = conn.Close()
+			return streamEndError(ctx)
+		case err != nil:
+			return status.Errorf(codes.Aborted, "VNC handshake with the viewer: %v", err)
+		}
+	}
+
+	slog.Info("VNC proxy session started", "vm", vmName, "port", port, "authenticated", password != "")
 
 	errCh := make(chan error, 2)
 
@@ -100,20 +148,24 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		}
 	}()
 
-	// gRPC stream → VNC TCP
+	// gRPC stream → VNC TCP. Through the viewer reader, which hands over
+	// first whatever the handshake read past its end.
 	go func() {
+		buf := make([]byte, 16384)
 		for {
-			msg, err := stream.Recv()
+			n, err := viewer.Read(buf)
+			if n > 0 {
+				if _, werr := conn.Write(buf[:n]); werr != nil {
+					errCh <- werr
+					return
+				}
+			}
 			if err != nil {
 				if err != io.EOF {
 					errCh <- err
 				} else {
 					errCh <- nil
 				}
-				return
-			}
-			if _, err := conn.Write(msg.Data); err != nil {
-				errCh <- err
 				return
 			}
 		}
@@ -133,6 +185,123 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 		return status.Errorf(codes.Internal, "VNC proxy error: %v", err)
 	}
 	return nil
+}
+
+// vncAuthTimeout bounds the handshake with a local VNC listener.
+const vncAuthTimeout = 10 * time.Second
+
+// vncHandshakeTimeout bounds the whole RFB security handshake with the
+// viewer, the listener's included. A variable for the tests.
+var vncHandshakeTimeout = 15 * time.Second
+
+// logVNCPasswordStrip says, on the source, that a live migration moves the
+// guest without its VNC console password because the target cannot do one
+// (EnsureDisksResponse.vnc_password_unavailable; docs/ui.md "Console
+// passwords"). The guest arrives with an open VNC console; SPICE keeps its
+// password.
+func logVNCPasswordStrip(vmName, target string, strip bool) {
+	if !strip {
+		return
+	}
+	slog.Warn("live migration moves the guest without its VNC console password: the target cannot do VNC passwords",
+		"vm", vmName, "target", target, "strip_vnc_password", true)
+}
+
+// vmHasVNCPassword reports whether the running domain's VNC console has a
+// password (read from the live secure definition; the value is not kept).
+func (s *Server) vmHasVNCPassword(vmName string) bool {
+	pw, err := s.virt.ConsolePassword(vmName, "vnc")
+	return err == nil && pw != ""
+}
+
+// vncViewerStream is the viewer side of a ProxyVNC stream as a byte stream,
+// for the RFB handshake this host runs with the viewer (rfb.ServeNoAuth) and
+// the relay after it.
+//
+// One goroutine (pump) is the stream's only reader; Read takes from it, so a
+// read can give up at a deadline without leaving a Recv behind that a later
+// read would race. The pump ends when the stream does (its context is
+// cancelled when the handler returns).
+type vncViewerStream struct {
+	stream   grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]
+	ctx      context.Context
+	recv     chan vncRecv
+	buf      []byte
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+type vncRecv struct {
+	data []byte
+	err  error
+}
+
+// errVNCHandshakeTimeout is a viewer read that passed its deadline.
+var errVNCHandshakeTimeout = errors.New("the viewer did not answer in time")
+
+func newVNCViewerStream(ctx context.Context, stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData]) *vncViewerStream {
+	v := &vncViewerStream{stream: stream, ctx: ctx, recv: make(chan vncRecv)}
+	go v.pump()
+	return v
+}
+
+func (v *vncViewerStream) pump() {
+	for {
+		msg, err := v.stream.Recv()
+		r := vncRecv{err: err}
+		if err == nil {
+			r.data = msg.Data
+		}
+		select {
+		case v.recv <- r:
+		case <-v.ctx.Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (v *vncViewerStream) setDeadline(t time.Time) {
+	v.mu.Lock()
+	v.deadline = t
+	v.mu.Unlock()
+}
+
+func (v *vncViewerStream) Read(p []byte) (int, error) {
+	for len(v.buf) == 0 {
+		v.mu.Lock()
+		deadline := v.deadline
+		v.mu.Unlock()
+		var expired <-chan time.Time
+		if !deadline.IsZero() {
+			t := time.NewTimer(time.Until(deadline))
+			defer t.Stop()
+			expired = t.C
+		}
+		select {
+		case r := <-v.recv:
+			if r.err != nil {
+				return 0, r.err
+			}
+			v.buf = r.data
+		case <-expired:
+			return 0, errVNCHandshakeTimeout
+		case <-v.ctx.Done():
+			return 0, v.ctx.Err()
+		}
+	}
+	n := copy(p, v.buf)
+	v.buf = v.buf[n:]
+	return n, nil
+}
+
+func (v *vncViewerStream) Write(p []byte) (int, error) {
+	if err := v.stream.Send(&pb.VNCData{Data: append([]byte(nil), p...)}); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // forwardVNC relays a ProxyVNC stream to a remote daemon.

@@ -25,6 +25,7 @@ func TestLateWiringIsSafeAgainstDeclaredCapabilities(t *testing.T) {
 			default:
 				_ = s.DeclaredCapabilities()
 				_ = s.notEnforcingTokens()
+				_ = s.ConsolePasswordPolicy() // every define on the host reads it
 			}
 		}
 	}()
@@ -45,6 +46,7 @@ func TestLateWiringIsSafeAgainstDeclaredCapabilities(t *testing.T) {
 		s.SetLeaseTermEnforce(on)
 		s.SetIsolationEpochEnforce(on)
 		s.SetLiveResize(on)
+		s.SetConsolePassword(on)
 		s.SetStrictMTLSIdentity(on)
 		s.SetForwardedIdentity(on)
 		s.SetRBACRealm(on)

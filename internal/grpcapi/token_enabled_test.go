@@ -31,6 +31,7 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.rbacRealm.Store(true)
 	s.enfOperationProtocol.Store(true)
 	s.enfLiveResize.Store(true)
+	s.enfConsolePassword.Store(true)
 	s.enfCanonicalIdentity.Store(true)
 	s.enfProjectAuthority.Store(true)
 	s.enfAuditSignature.Store(true)

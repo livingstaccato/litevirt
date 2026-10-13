@@ -223,6 +223,7 @@ func enforceEveryToken(s *Server) {
 	s.enfHLCLww.Store(true)
 	s.enfIsolationEpoch.Store(true)
 	s.enfLiveResize.Store(true)
+	s.enfConsolePassword.Store(true)
 	s.enfLWWSkew.Store(true)
 	s.enfOperationProtocol.Store(true)
 	s.enfOwnerEpoch.Store(true)

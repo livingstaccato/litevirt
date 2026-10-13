@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 
@@ -12,6 +13,21 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// spiceReporter is the backend's answer to whether SPICE can connect on this
+// host at all (libvirt.Client.SpiceUnusable: a FIPS-mode kernel cannot).
+type spiceReporter interface {
+	SpiceUnusable() string
+}
+
+// spiceUnusable is why a SPICE client cannot connect to a console on this
+// host, "" when nothing says so.
+func (s *Server) spiceUnusable() string {
+	if r, ok := s.virt.(spiceReporter); ok {
+		return r.SpiceUnusable()
+	}
+	return ""
+}
 
 // GetSpiceInfo returns the SPICE host:port for a running VM that has SPICE
 // graphics enabled. Operators connect with `remote-viewer spice://<uri>`
@@ -24,6 +40,10 @@ import (
 // HOST rather than to a VM (`lv ssh` connects to a VM). Bundling a
 // browser-based SPICE client (spice-html5) is a future enhancement; this
 // RPC is the minimum viable surface to make SPICE usable today.
+//
+// Because SPICE is not proxied, the response carries the console's password
+// (docs/ui.md "Console passwords") for the client to present — to a caller
+// that passed vm.console, and never logged.
 func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (*pb.GetSpiceInfoResponse, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
@@ -64,6 +84,18 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 			"SPICE not available for %q: %v", req.VmName, err)
 	}
 
+	// The console's password, if it has one (docs/ui.md "Console
+	// passwords"). SPICE is not proxied, so the client presents it itself;
+	// this caller passed the vm.console check above on its entry host. Read
+	// from the RUNNING domain, and never logged.
+	// A password that cannot be read degrades rather than refuses: the info
+	// goes back without it, and the client prompts.
+	password, err := s.virt.ConsolePassword(req.VmName, "spice")
+	if err != nil {
+		slog.Warn("spice console password unreadable; returning the connection info without it", "vm", req.VmName, "error", err)
+		password = ""
+	}
+
 	host, err := corrosion.GetHost(ctx, s.db, vm.HostName)
 	if err != nil || host == nil {
 		return nil, status.Errorf(codes.Internal, "lookup host %q: %v", vm.HostName, err)
@@ -74,8 +106,10 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 	// Host/Port are still returned unbracketed for callers that build their own.
 	uri := fmt.Sprintf("spice://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 	return &pb.GetSpiceInfoResponse{
-		Host: host.Address,
-		Port: int32(port),
-		Uri:  uri,
+		Host:     host.Address,
+		Port:     int32(port),
+		Uri:      uri,
+		Password: password,
+		Warning:  s.spiceUnusable(),
 	}, nil
 }

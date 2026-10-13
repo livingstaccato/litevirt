@@ -765,6 +765,40 @@ const (
 	// advertisement or the mirror could never be turned off again.
 	NetBoxMirrorV1 = "netbox_mirror_v1"
 
+	// ConsolePasswordV1 gates giving a VM's VNC and SPICE consoles a per-VM
+	// password (docs/ui.md "Console passwords"). The consoles listen on the
+	// host's 127.0.0.1, which every local process and user on that host can
+	// reach; with a password, only the daemon on the VM's own host — which
+	// reads it from the running domain and authenticates its console proxy
+	// (internal/rfb) — gets in.
+	//
+	// It states a fact about the BINARY: this build PRESENTS a console's
+	// password, whatever its own flag says. A host on an older build relays
+	// the RFB stream raw from a listener that now asks for a password, so a
+	// guest that reached it — by a live migration, which carries the password
+	// in the migratable XML — would have a console nobody can open. So no
+	// host sets a password until this token has latched.
+	//
+	// Advertised UNCONDITIONALLY, and the reason is where the guarantee is
+	// enforced. Presenting is unconditional in the build, so a flag-off peer
+	// still opens every console another host passworded; the flag only
+	// decides whether THIS host sets passwords when it defines a domain. No
+	// host relies on a peer's flag, so withholding the token on a flag-off
+	// host would buy nothing, and would let one opted-out host (a witness, an
+	// operator who wants open consoles on one machine) hold the protection
+	// off fleet-wide. A latched token therefore proves a uniform build, not
+	// that every host sets passwords.
+	//
+	// Config-gated (enforcement.console_password, DEFAULT TRUE) and
+	// reversible: false makes this host's next define of each domain drop
+	// its passwords. A host whose QEMU cannot do VNC passwords (FIPS: no DES)
+	// still advertises it — it presents whatever a guest it holds has — but
+	// sets no VNC passwords, takes migrations without them, never fails a
+	// start over one, and reports the token in not_enforcing. ReplicationGated: a host parked in maintenance on an
+	// older build still holds VMs it may get back, and could be handed one
+	// by a migration once it returns, so the latch waits for it too.
+	ConsolePasswordV1 = "console_password_v1"
+
 	// Release202611V1 is the RELEASE TOKEN of the 2026-11 release train: one
 	// mandatory, ReplicationGated token that every feature of the release
 	// gates on, in place of one token per feature. Its claim is the one
@@ -1167,6 +1201,11 @@ var supported = []string{
 	// defeating the quarantine. Withholding advertisement while the flag is off
 	// keeps the cluster from latching until every node has opted in.
 	IsolationEpochV1,
+	// ConsolePasswordV1 is advertised UNCONDITIONALLY: it says "this build
+	// presents a console's password", a fact about the binary. The flag
+	// decides only whether this host SETS passwords, and no host relies on a
+	// peer setting them. See ConsolePasswordV1.
+	ConsolePasswordV1,
 	// Release202611V1 is advertised UNCONDITIONALLY: it says "this build
 	// decodes, keeps and honours every field and shape of its release", a fact
 	// about the binary. What opens a feature is WithFeature, not a flag.
@@ -1176,7 +1215,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, Release202611V1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, FenceStateV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1, RelayHealthV1, CredentialsClearV1, HostMembershipRetireV1, HostRuntimeSplitV1, HostRuntimeRetireV1, ConsolePasswordV1, Release202611V1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -1263,6 +1302,12 @@ var replicationGated = map[string]bool{
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
 	RecoveryClaimV1: true,
+	// Confirmed against every replication recipient: not a decode claim but a
+	// READ one — every host that may hold a passworded guest, a maintenance
+	// host on an older build included, must read the password from the domain
+	// to open its console. Holding the latch for it costs only time. See
+	// ConsolePasswordV1.
+	ConsolePasswordV1: true,
 	// Confirmed against every replication recipient: a feature of the release
 	// may write what a previous-release peer cannot decode or would drop on a
 	// rewrite. See Release202611V1.

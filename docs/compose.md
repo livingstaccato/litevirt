@@ -589,7 +589,9 @@ lv spice <vm> --launch  # spawn remote-viewer if installed
 
 Today SPICE traffic is not proxied through the daemon; clients must reach
 the host's SPICE port directly. Use `ssh -L 5901:127.0.0.1:<port>` to
-tunnel if needed. See [`docs/ui.md`](ui.md) for the in-browser console
+tunnel if needed. Both consoles carry a per-VM password (`--launch` and the
+UI's `.vv` file pass the SPICE one; see
+[`docs/ui.md`](ui.md#console-passwords)). See [`docs/ui.md`](ui.md) for the in-browser console
 options (VNC via noVNC; SPICE-in-browser is on the roadmap).
 
 ## Cloud-init

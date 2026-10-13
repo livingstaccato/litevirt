@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -51,6 +52,17 @@ type Client struct {
 	guardWait  time.Duration
 	guardNeeds func(name string) bool // RequireStartGuard's scope; nil = every start
 	readyOnce  sync.Once
+
+	// consolePolicy decides whether DefineDomain gives a domain's consoles
+	// passwords (SetConsolePasswordPolicy, console_password.go).
+	consolePolicy atomic.Pointer[func() ConsolePolicy]
+	// vncUnavailable is why this host's QEMU cannot do VNC password
+	// authentication ("" = it can): ProbeVNCPassword or a refused start.
+	vncUnavailable atomic.Pointer[string]
+	// vncProbed is closed once the startup probe has answered
+	// (MarkVNCProbed); nil on a client built without NewClient.
+	vncProbed     chan struct{}
+	vncProbedOnce sync.Once
 }
 
 // NewClient connects to the local libvirtd daemon.
@@ -59,7 +71,7 @@ func NewClient() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{virt: virt}, nil
+	return &Client{virt: virt, vncProbed: make(chan struct{})}, nil
 }
 
 func dialLibvirt() (*golibvirt.Libvirt, error) {

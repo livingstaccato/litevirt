@@ -317,6 +317,10 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize atomic.Bool
+	// enfConsolePassword is enforcement.console_password (default on): this
+	// host gives the consoles of each domain it defines a password, once
+	// console_password_v1 has latched (ConsolePasswordPolicy).
+	enfConsolePassword atomic.Bool
 	// allowPlaintextStorageMigration is this node's
 	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
@@ -1525,6 +1529,81 @@ func (s *Server) hardwareV2Ready() bool {
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize.Store(on) }
 
+// SetConsolePassword sets enforcement.console_password: whether this host
+// gives the consoles of each domain it defines a password (once
+// console_password_v1 has latched).
+func (s *Server) SetConsolePassword(on bool) { s.enfConsolePassword.Store(on) }
+
+// ConsolePasswordPolicy is what this host's defines do to a domain's console
+// passwords. Until console_password_v1 has latched, nothing (PolicyLeave):
+// a host on a build that cannot present a password could still be handed
+// the guest, and an operator-set password on an imported domain stays as it
+// was. Once latched, enforcement.console_password decides: fresh passwords
+// (PolicySet) or none (PolicyStrip, the kill switch). It reads only
+// in-memory state; the libvirt client applies it to every define
+// (wireConsolePasswordPolicy).
+func (s *Server) ConsolePasswordPolicy() lv.ConsolePolicy {
+	if g := s.gateV(); g == nil || !g.Latched(capabilities.ConsolePasswordV1) {
+		return lv.PolicyLeave
+	}
+	if s.enfConsolePassword.Load() {
+		return lv.PolicySet
+	}
+	return lv.PolicyStrip
+}
+
+// consolePasswordPolicySetter is the libvirt backend's hook for that policy
+// (libvirt.Client.SetConsolePasswordPolicy, and the fleet fake's).
+type consolePasswordPolicySetter interface {
+	SetConsolePasswordPolicy(func() lv.ConsolePolicy)
+}
+
+// vncPasswordReporter is the backend's answer to whether this host's QEMU
+// can do VNC password authentication (libvirt.Client.VNCPasswordUnavailable:
+// the startup probe or a refused start).
+type vncPasswordReporter interface {
+	VNCPasswordUnavailable() string
+}
+
+// vncPasswordUnavailable is why this host cannot set VNC passwords, "" when
+// it can (or the backend cannot say).
+func (s *Server) vncPasswordUnavailable() string {
+	if r, ok := s.virt.(vncPasswordReporter); ok {
+		return r.VNCPasswordUnavailable()
+	}
+	return ""
+}
+
+// vncProbeWaiter lets a target wait for its startup probe
+// (libvirt.Client.WaitVNCProbe).
+type vncProbeWaiter interface {
+	WaitVNCProbe(time.Duration)
+}
+
+// vncProbeWait bounds how long a migration target waits for its startup
+// probe before answering whether it can take a guest's VNC password.
+const vncProbeWait = 5 * time.Second
+
+// vncPasswordUnavailableForMigration is vncPasswordUnavailable for a target
+// being prepared for a live migration: a daemon that has just started waits
+// (briefly) for its probe, so it does not say "can" before it knows and then
+// fail the guest's arrival at its QEMU.
+func (s *Server) vncPasswordUnavailableForMigration() string {
+	if w, ok := s.virt.(vncProbeWaiter); ok {
+		w.WaitVNCProbe(vncProbeWait)
+	}
+	return s.vncPasswordUnavailable()
+}
+
+// wireConsolePasswordPolicy hands the backend ConsolePasswordPolicy, so every
+// DefineDomain on this host — whichever path calls it, the health reconciler's
+// included, since it shares the client — applies it.
+func (s *Server) wireConsolePasswordPolicy() {
+	if p, ok := s.virt.(consolePasswordPolicySetter); ok {
+		p.SetConsolePasswordPolicy(s.ConsolePasswordPolicy)
+	}
+}
+
 // SetAllowUnencryptedStorageMigration sets migration.allow_unencrypted_storage:
 // whether this node, as a migration source, may send a storage copy in
 // plaintext.
@@ -1684,6 +1763,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOperationProtocol.Load()
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize.Load()
+	case capabilities.ConsolePasswordV1:
+		return s.enfConsolePassword.Load()
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity.Load()
 	case capabilities.ProjectAuthorityV1:
@@ -2186,6 +2267,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 	}
 	s.wireCertificateVerifier()
 	s.wireReplicationReleaseGates()
+	s.wireConsolePasswordPolicy()
 	if db != nil {
 		db.SetStartedProofCheck(s.operatorStartRecorded)
 	}

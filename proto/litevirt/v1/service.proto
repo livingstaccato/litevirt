@@ -3510,6 +3510,13 @@ message EnsureDisksResponse {
     // target never sets it ("" = unknown), and the source migrates the domain
     // unchanged, as before.
     string cgroup_mode = 6;
+    // vnc_password_unavailable: this host's QEMU cannot do VNC password
+    // authentication (a FIPS-mode host has no DES; docs/ui.md "Console
+    // passwords"). A live migration onto it moves the guest without its VNC
+    // password, which would otherwise fail the guest's start here. An older
+    // target never sets it, and none can hold a passworded guest: no password
+    // is set before console_password_v1 latches.
+    bool vnc_password_unavailable = 7;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -4879,6 +4886,15 @@ message GetSpiceInfoResponse {
     string host = 1;       // host the VM runs on
     int32  port = 2;       // SPICE TCP port (libvirt-assigned)
     string uri  = 3;       // convenience: "spice://<host>:<port>"
+    // The password the VM's SPICE console requires ("" when it requires
+    // none; docs/ui.md "Console passwords"). Returned only to a caller that
+    // passed the vm.console check, and never logged.
+    string password = 4;
+    // warning: why a SPICE client may be unable to connect on the VM's host
+    // ("" when nothing is known), e.g. a FIPS-mode kernel, under which
+    // spice-server cannot make the RSA key every SPICE link needs. Nothing is
+    // refused because of it; VNC still works.
+    string warning = 5;
 }
 
 // ── Rebalancer messages ──

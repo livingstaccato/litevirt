@@ -168,7 +168,44 @@ func TestResolve_ARecreateKeepsAnUndeclaredBinding(t *testing.T) {
 	if g := plan.VMs[0].Spec.GetNetwork()[0].GetSecurityGroups(); len(g) != 1 || g[0] != "isolate" {
 		t.Errorf("the recreate's NIC groups = %v, want the live isolate binding kept", g)
 	}
-	if w := strings.Join(plan.Warnings, "\n"); !strings.Contains(w, "keeps its security groups [isolate]") {
+	if w := strings.Join(plan.Warnings, "\n"); !strings.Contains(w, "keeps the security groups [isolate]") {
 		t.Errorf("warnings %q do not say the binding is kept", w)
+	}
+}
+
+// Round 3, N2: a guard the file declares on a direct NIC is no drift for an
+// existing VM, and is left out of a new VM's create (which would refuse it);
+// the plan says it is not enforced in both cases.
+func TestResolve_AGuardOnADirectNICIsReportedNotPlanned(t *testing.T) {
+	stored := `{"image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true,"network":[{"name":"wan","mac":"52:54:00:00:00:01","spoof_guard":"on"}]}`
+	state := makeState([]corrosion.HostRecord{makeHost("h1", 16, 32768)}, []corrosion.VMRecord{{
+		Name: "web", StackName: "mystack", HostName: "h1", State: "running", Spec: stored, CPUActual: 1, MemActual: 512,
+	}}, nil)
+	state.Networks = []corrosion.NetworkRecord{{Name: "wan", Type: "direct"}}
+	state.NICSecurity = map[string][]compose.LiveNIC{"web": {{Network: "wan", MAC: "52:54:00:00:00:01"}}} // no record
+	def := compose.VMDef{Image: "ubuntu", CPU: 1, Memory: 512, Network: []compose.NetworkAttachment{{Name: "wan", SpoofGuard: "on"}}}
+	f := makeFile("mystack", map[string]compose.VMDef{"web": def, "new": def})
+	f.Networks = map[string]compose.NetworkDef{"wan": {External: true}}
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := strings.Join(plan.Warnings, "\n")
+	for _, a := range plan.VMs {
+		switch a.VMName {
+		case "web":
+			if a.Kind != OpNoChange {
+				t.Errorf("web planned %v (%s), want no change", a.Kind, a.Detail)
+			}
+		case "new":
+			if a.Kind != OpCreate || a.Spec.GetNetwork()[0].GetSpoofGuard() != "" {
+				t.Errorf("new = %v with guard %q, want a create without the guard", a.Kind, a.Spec.GetNetwork()[0].GetSpoofGuard())
+			}
+		}
+	}
+	for _, vm := range []string{"web", "new"} {
+		if !strings.Contains(w, vm+": nic 0 (wan) declares a guard that is not enforced") {
+			t.Errorf("warnings %q lack the note for %s", w, vm)
+		}
 	}
 }

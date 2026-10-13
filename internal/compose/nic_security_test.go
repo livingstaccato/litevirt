@@ -383,3 +383,93 @@ func TestCarryUndeclaredSecurityGroups_SurvivesAnInsertedNIC(t *testing.T) {
 		t.Errorf("notes %q do not name the dropped binding", notes)
 	}
 }
+
+// Round 3, N2: a guard declared on a NIC whose network cannot enforce one
+// (direct, SR-IOV) is no drift: create wrote no record, so there is nothing
+// to restore. The plan says it is not enforced, and does not count it as a
+// withheld restore.
+func TestGate_AGuardOnAnUnenforcedNetworkIsNoDrift(t *testing.T) {
+	desired := nicSpec(&pb.NetworkAttachment{SpoofGuard: "on"})
+	live := nicSpec(&pb.NetworkAttachment{})
+	unenforced := func(n string) string { return GuardUnenforcedOn("direct", n) }
+	p, w := gated(desired, live, nil, NICSecurityGate{GuardUnenforced: unenforced})
+	if p.Max() != ActionNoChange {
+		t.Errorf("a guard on a direct NIC planned %+v", p.MetadataChanges)
+	}
+	if !strings.Contains(w, "declares a guard that is not enforced") || strings.Contains(w, "not restored") {
+		t.Errorf("warnings %q, want the not-enforced note and no withheld restore", w)
+	}
+	if GuardUnenforcedOn("sriov", "x") == "" || GuardUnenforcedOn("", "direct:eth0") == "" || GuardUnenforcedOn("bridge", "lan") != "" {
+		t.Error("GuardUnenforcedOn misjudges a network type")
+	}
+}
+
+// A declared guard create would refuse (a bad mode, an address that does not
+// parse) is withheld with why, not planned for the executor to refuse.
+func TestGate_AnInvalidDeclaredGuardIsWithheld(t *testing.T) {
+	for _, att := range []*pb.NetworkAttachment{{SpoofGuard: "enabled"}, {AllowedAddresses: []string{"not-an-ip"}}} {
+		p, w := gated(nicSpec(att), nicSpec(&pb.NetworkAttachment{}), nil, NICSecurityGate{AllowWeaken: true})
+		if len(p.MetadataChanges) != 0 || !strings.Contains(w, "the file's guard is invalid") {
+			t.Errorf("%v: plan %+v warnings %q", att, p.MetadataChanges, w)
+		}
+	}
+}
+
+// A create's spec loses a guard its network cannot enforce, and the plan
+// says so; other NICs keep theirs.
+func TestStripUnenforcedGuards(t *testing.T) {
+	spec := baseSpec()
+	spec.Network = []*pb.NetworkAttachment{{Name: "wan", SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.5"}}, {Name: "lan", SpoofGuard: "on"}}
+	notes := StripUnenforcedGuards(spec, func(n string) string {
+		if n == "wan" {
+			return GuardUnenforcedOn("direct", n)
+		}
+		return ""
+	})
+	if spec.Network[0].SpoofGuard != "" || len(spec.Network[0].AllowedAddresses) != 0 || spec.Network[1].SpoofGuard != "on" {
+		t.Errorf("network = %v", spec.Network)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "nic 0 (wan) declares a guard that is not enforced") {
+		t.Errorf("notes = %v", notes)
+	}
+}
+
+// Round 3, m1: a NIC removed on the same network makes the pairing
+// ambiguous: nothing is carried there (the remaining NIC must not gain the
+// removed one's groups), and each binding is named as dropped.
+func TestCarry_ARemovedNICOnTheSameNetworkCarriesNothing(t *testing.T) {
+	desired := baseSpec()
+	desired.Network = []*pb.NetworkAttachment{{Name: "lan"}}
+	stored := baseSpec()
+	stored.Network = []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:00:00:01", SecurityGroups: []string{"web"}},
+		{Name: "lan", Mac: "52:54:00:00:00:02"}}
+	notes := strings.Join(CarryUndeclaredSecurityGroups(desired, stored), "\n")
+	if len(desired.Network[0].SecurityGroups) != 0 {
+		t.Errorf("the remaining NIC took %v", desired.Network[0].SecurityGroups)
+	}
+	if !strings.Contains(notes, "drops the security groups [web]") || !strings.Contains(notes, "changes how many NICs are on lan") {
+		t.Errorf("notes %q", notes)
+	}
+	// Inserted on the same network: the same.
+	desired.Network = []*pb.NetworkAttachment{{Name: "lan"}, {Name: "lan"}, {Name: "lan"}}
+	CarryUndeclaredSecurityGroups(desired, stored)
+	for i, n := range desired.Network {
+		if len(n.SecurityGroups) != 0 {
+			t.Errorf("nic %d took %v from an ambiguous pairing", i, n.SecurityGroups)
+		}
+	}
+}
+
+// A NIC the file names by MAC takes the binding of the NIC with that MAC,
+// wherever it now sits.
+func TestCarry_MatchesByMAC(t *testing.T) {
+	desired := baseSpec()
+	desired.Network = []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:00:00:02"}, {Name: "lan", Mac: "52:54:00:00:00:01"}}
+	stored := baseSpec()
+	stored.Network = []*pb.NetworkAttachment{{Name: "lan", Mac: "52:54:00:00:00:01", SecurityGroups: []string{"isolate"}},
+		{Name: "lan", Mac: "52:54:00:00:00:02"}}
+	CarryUndeclaredSecurityGroups(desired, stored)
+	if len(desired.Network[0].SecurityGroups) != 0 || len(desired.Network[1].SecurityGroups) != 1 || desired.Network[1].SecurityGroups[0] != "isolate" {
+		t.Errorf("network = %v, want isolate on the NIC with MAC :01", desired.Network)
+	}
+}

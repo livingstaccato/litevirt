@@ -23,6 +23,8 @@ images:
 networks:
   lan:
     external: true
+  wan:
+    external: true
 
 security-groups:
   web:
@@ -42,6 +44,17 @@ vms:
         spoof-guard: "on"
         allowed-addresses: [10.31.0.250]
         allow-vlan-tags: true
+    placement:
+      host: node-0
+  dvm:
+    image: test
+    cpu: 1
+    memory: 256
+    disks:
+      root: 1G
+    network:
+      - name: wan
+        spoof-guard: "on"
     placement:
       host: node-0
   plain:
@@ -104,7 +117,14 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 		Config: `{"Type":"bridge","Interface":"br-lan"}`}); err != nil {
 		t.Fatal(err)
 	}
+	// A direct (macvtap) network, which cannot enforce a guard: dvm declares
+	// one there (round 3, N2).
+	if err := corrosion.UpsertNetwork(ctx, deployer.DB, corrosion.NetworkRecord{Name: "wan", Type: "direct",
+		Config: `{"type":"direct","interface":"lo"}`}); err != nil {
+		t.Fatal(err)
+	}
 	dc, oc := c.SelfClient(deployer), c.SelfClient(operator)
+	sawDirectNote := false
 
 	deployClean(t, ctx, dc, composeNICSecurity)
 	if l := liveSec(t, deployer, "box"); !declaredRestored(l) {
@@ -114,6 +134,27 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 		v, _ := corrosion.GetVM(ctx, operator.DB, "plain")
 		return v != nil && declaredRestored(liveSec(t, operator, "box"))
 	})
+
+	// dvm was created, its guard left out and reported, not refused; and an
+	// unchanged file plans no change for it, now and on every later deploy.
+	if v, _ := corrosion.GetVM(ctx, deployer.DB, "dvm"); v == nil {
+		t.Fatal("dvm, which declares a guard on a direct NIC, was not created")
+	}
+	if l := liveSec(t, deployer, "dvm"); l.Guard != nil {
+		t.Errorf("dvm's direct NIC has a guard record %+v; none can be enforced there", l.Guard)
+	}
+	for _, p := range planWith(t, ctx, dc, composeNICSecurity, false) {
+		if p.VmName == "dvm" && p.Phase != string(compose.OpNoChange) {
+			t.Errorf("dvm planned %q (%s) for an unchanged file, want no change", p.Phase, p.Detail)
+		}
+		if p.Phase == "warning" && strings.Contains(p.Detail, "dvm: nic 0 (wan) declares a guard that is not enforced") {
+			sawDirectNote = true
+		}
+	}
+	if !sawDirectNote {
+		t.Error("the plan does not say dvm's guard is not enforced")
+	}
+	deployWith(t, ctx, dc, composeNICSecurity, false) // an unchanged file redeploys cleanly
 
 	// The operator's runtime changes, through the other node: box is moved
 	// to an isolation group and loses its guard's allowances; plain is
@@ -245,7 +286,7 @@ func TestFleet_ComposeRestoresDeclaredNICSecurityAndLeavesTheRest(t *testing.T) 
 	// Converged: the same file plans no change, with or without the opt-in.
 	for _, aw := range []bool{false, true} {
 		for _, p := range planWith(t, ctx, dc, composeNICSecurity, aw) {
-			if (p.VmName == "box" || p.VmName == "plain") && p.Phase != string(compose.OpNoChange) {
+			if (p.VmName == "box" || p.VmName == "plain" || p.VmName == "dvm") && p.Phase != string(compose.OpNoChange) {
 				t.Errorf("after the restore %s planned %q (%s), want no change", p.VmName, p.Phase, p.Detail)
 			}
 		}

@@ -264,7 +264,12 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	current := buildCurrentVMs(state, f.Name)
 	ctCurrent, ctHost := buildCurrentContainers(state, f.Name)
 	current = append(current, ctCurrent...)
-	vmPlan, err := compose.BuildGated(f, current, state.NICSecurityGate)
+	// Which networks cannot enforce a guard is the planner's to say, from the
+	// snapshot and the file (a network this deploy creates is not in the
+	// snapshot yet).
+	gate := state.NICSecurityGate
+	gate.GuardUnenforced = guardUnenforcedFrom(state, f)
+	vmPlan, err := compose.BuildGated(f, current, gate)
 	if err != nil {
 		return nil, fmt.Errorf("build workload plan: %w", err)
 	}
@@ -456,6 +461,14 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			action.TargetHost = br.Host
 			action.Spec = spec
 			vmHostMap[op.VMName] = br.Host
+			if (op.Kind == OpCreate || action.Apply == compose.ActionRecreate) && !action.IsContainer && spec != nil {
+				// A guard the file declares on a NIC that cannot enforce one
+				// is reported, and left out of the create, which would refuse
+				// it (compose.GuardUnenforcedOn).
+				for _, n := range compose.StripUnenforcedGuards(spec, gate.GuardUnenforced) {
+					plan.Warnings = append(plan.Warnings, op.VMName+": "+n)
+				}
+			}
 			if op.Kind == OpUpdate && action.Apply == compose.ActionRecreate && !action.IsContainer && spec != nil {
 				// A recreate makes the NICs from the file; a NIC the file
 				// declares no groups for keeps the binding it has now.
@@ -1162,4 +1175,20 @@ func PinAssignedDevices(spec *pb.VMSpec, assigns []DeviceAssignment) {
 		d.Address = a.Address
 		written[a.Index] = true
 	}
+}
+
+// guardUnenforcedFrom is compose.GuardUnenforcedOn over the snapshot's network
+// records and the file's own networks (by record name); a network neither
+// names is a bridge.
+func guardUnenforcedFrom(state *ClusterState, f *compose.File) func(string) string {
+	types := map[string]string{}
+	for _, n := range state.Networks {
+		types[n.Name] = n.Type
+	}
+	for name, def := range f.Networks {
+		if def.Type != "" {
+			types[f.ResolveNetworkName(name)] = def.Type
+		}
+	}
+	return func(network string) string { return compose.GuardUnenforcedOn(types[network], network) }
 }

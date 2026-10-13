@@ -29,6 +29,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 )
@@ -55,6 +56,17 @@ func nicGuardExplicit(att *pb.NetworkAttachment) bool {
 // a default guard does.
 func nicGuardWeakens(mode string, allowed []string, dhcp, ra, vlan bool) bool {
 	return mode == corrosion.NICGuardOff || len(allowed) > 0 || dhcp || ra || vlan
+}
+
+// guardUnenforcedOnNetwork is why no guard can be enforced on a NIC of the
+// named network (compose.GuardUnenforcedOn over its record), or "". Create,
+// SetNICGuard, the compose plan and its executor all decide by it.
+func guardUnenforcedOnNetwork(ctx context.Context, db *corrosion.Client, network string) string {
+	typ := ""
+	if def, _ := lookupNetworkDef(ctx, db, network); def != nil {
+		typ = def.Type
+	}
+	return compose.GuardUnenforcedOn(typ, network)
 }
 
 // requireGuardAuthority is the check every weakening needs: authority over
@@ -321,6 +333,13 @@ func (s *Server) admitNICGuards(ctx context.Context, vmName string, atts []*pb.N
 		}
 		if !nicGuardExplicit(att) {
 			continue
+		}
+		// A guard asked for where none can be enforced is refused, never
+		// created as a NIC that silently has none (the compose plan reports
+		// it and leaves the settings out: compose.StripUnenforcedGuards).
+		if why := guardUnenforcedOnNetwork(ctx, s.db, att.GetName()); why != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"network %q: NIC guard settings were given, but %s; leave them out (a guard there would protect nothing)", att.GetName(), why)
 		}
 		if !s.db.MayWriteClusterPolicy() {
 			return nil, status.Errorf(codes.FailedPrecondition,
@@ -698,10 +717,9 @@ func (s *Server) SetNICGuard(ctx context.Context, req *pb.SetNICGuardRequest) (*
 // the audit row are the same either way.
 func (s *Server) putNICGuard(ctx context.Context, tgt guardTarget, mode string, req *pb.SetNICGuardRequest) (*pb.NICGuard, error) {
 	ct := req.GetContainerName() != ""
-	if def, _ := lookupNetworkDef(ctx, s.db, tgt.nic.NetworkName); def != nil && (def.Type == "direct" || def.Type == "sriov") {
+	if why := guardUnenforcedOnNetwork(ctx, s.db, tgt.nic.NetworkName); why != "" {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"NIC %s is on %s network %q, which bypasses the bridge where guards are enforced; a guard there would protect nothing",
-			tgt.nic.MAC, def.Type, tgt.nic.NetworkName)
+			"NIC %s is on network %q: %s; a guard there would protect nothing", tgt.nic.MAC, tgt.nic.NetworkName, why)
 	}
 	// Refused here, before the gate records any use (switch review m1).
 	if _, err := corrosion.NormalizeNICGuardAddresses(req.GetAllowedAddresses()); err != nil {

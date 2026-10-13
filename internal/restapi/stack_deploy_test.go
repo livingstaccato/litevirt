@@ -23,7 +23,8 @@ type stackDeployBody struct {
 		Name  string `json:"name"`
 		Error string `json:"error"`
 	} `json:"failures"`
-	Error string `json:"error"`
+	Error    string   `json:"error"`
+	Warnings []string `json:"warnings"`
 }
 
 func postStackDeploy(t *testing.T, msgs []*pb.DeployProgress) (int, stackDeployBody, string, *mockServerStreamingClient[pb.DeployProgress]) {
@@ -78,5 +79,18 @@ func TestStackDeploy_AFailedActionIsNotOK(t *testing.T) {
 	}
 	if !strings.Contains(body.Error, "1 of 2") || !strings.Contains(body.Error, "degraded") {
 		t.Fatalf("error summary %q should say 1 of 2 actions failed and the stack is degraded", body.Error)
+	}
+}
+
+// The plan's warnings (a withheld NIC security restore among them) are in the
+// non-SSE answer, which is still a success.
+func TestStackDeploy_ReturnsThePlansWarnings(t *testing.T) {
+	msgs := []*pb.DeployProgress{
+		{Phase: "warning", Detail: "hb-1: nic 0 (lan) security groups not restored: re-run with --allow-weaken"},
+		{Phase: "done", VmName: "hb-1"},
+	}
+	code, body, raw, _ := postStackDeploy(t, msgs)
+	if code != http.StatusOK || len(body.Warnings) != 1 || !strings.Contains(body.Warnings[0], "not restored") {
+		t.Fatalf("code %d body %s, want 200 with the warning", code, raw)
 	}
 }

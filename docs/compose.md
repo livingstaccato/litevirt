@@ -1475,23 +1475,43 @@ The plan also withholds, with a warning, any restore the deploy cannot make:
 
 `lv compose diff` shows the server's plan for the caller, the same one `up`
 would apply (pass `--allow-weaken` to see what `up --allow-weaken` would do).
+**A guard on a direct or SR-IOV NIC is not enforced.** Such a NIC bypasses
+the bridge where guards are enforced, so it has no guard record. A file that
+declares a guard on one is not refused. Instead, every plan says so (`nic 0
+(wan) declares a guard that is not enforced: a direct (macvtap) network
+bypasses the bridge where guards are enforced; the NIC has no guard`).
+Creating the VM leaves the settings out, and redeploying the unchanged file
+plans no change. `lv run`, `lv attach-nic` and `lv firewall nic-guard set` refuse guard
+settings on such a NIC outright. A declared guard that create would refuse,
+such as a `spoof-guard:` other than `on` or `off`, or an `allowed-addresses:`
+entry that is not an address or prefix, is withheld from a restore with that
+reason.
+
 The plan and the deploy decide by the same rules. When `up` comes to restore
 a VM's NIC security, it checks every restore again against the rows as they
 are then, before it writes any. If one is refused (the rows changed since the
 plan so that it would now weaken without `--allow-weaken`, or the caller's
 permissions changed), none is written, and the VM's update fails with the
-reason. The warnings are also sent when the deploy runs, so the UI and other
-callers that do not ask for the plan first see them too.
+reason. The warnings are also sent when the deploy runs, so callers that do not ask
+for the plan first see them too: the UI shows them in its toast, the REST
+deploy answer has a `warnings` list, and `lv gitops` logs them.
 
 **A recreate makes the NICs from the file**, as it always has. A change of
 identity, or a strategy that replaces the VM, applies the file's declared
 groups and guard with no `--allow-weaken` gate. The plan prints a warning when
 that changes what is enforced now. A NIC whose file declares no groups keeps
-its live binding through the recreate (`nic 0 (lan) keeps its security groups
-[isolate] through the recreate`). A NIC is matched by its network and its
-place among the VM's NICs on that network, so inserting or removing a NIC on
-another network does not lose it. A binding whose NIC the file no longer has
-is dropped with the NIC, and the plan says so. The guards of undeclared NICs are carried as
+its live binding through the recreate (`nic 0 (lan) keeps the security groups
+[isolate] its NIC (52:54:00:…) has now through the recreate`), but only when
+it is known which new NIC is that NIC:
+
+- A NIC whose entry names a `mac:` is the NIC with that MAC.
+- Otherwise, on a network where the file has as many NICs as the VM has now,
+  the first NIC on that network is the first NIC, and so on. Inserting or
+  removing a NIC on another network does not change this.
+- When the file adds or removes a NIC on a network, it is not known which new
+  NIC is which, so no binding is carried there. Each binding is dropped with
+  its NIC, and the plan names it. To keep a binding through such a change,
+  declare `security-groups:` on the NICs, or name their `mac:`. The guards of undeclared NICs are carried as
 before (docs/firewall.md, "A re-create keeps each NIC's guard").
 
 Containers are out of scope. Compose neither reports nor restores a runtime

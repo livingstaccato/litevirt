@@ -239,11 +239,18 @@ func TestNICSecurity_PlanAndExecutorAgreeOnGuardAuthority(t *testing.T) {
 			&pb.NetworkAttachment{Name: "lan", SpoofGuard: "on", AllowedAddresses: []string{"10.0.0.5"}}, false},
 		{"unset live, declared off", nil, &pb.NetworkAttachment{Name: "lan", SpoofGuard: "off"}, false},
 		{"off live, declared plain on", &pb.SetNICGuardRequest{Mode: "off"}, &pb.NetworkAttachment{Name: "lan", SpoofGuard: "on"}, true},
+		// Round 3, N2: a direct NIC has no record (create writes none) and
+		// cannot have one: the plan reports it and the executor refuses it.
+		{"direct NIC, declared plain on", nil, &pb.NetworkAttachment{Name: "wan", SpoofGuard: "on"}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := guardServer(t, true)
 			admin := adminCtxWithEngine(t, s)
-			insertNICSecVM(t, s, &pb.NetworkAttachment{Name: "lan"})
+			if err := corrosion.UpsertNetwork(context.Background(), s.db, corrosion.NetworkRecord{Name: "wan", Type: "direct",
+				Config: `{"type":"direct","interface":"lo"}`}); err != nil {
+				t.Fatal(err)
+			}
+			insertNICSecVM(t, s, &pb.NetworkAttachment{Name: c.declared.Name})
 			if c.live != nil {
 				c.live.VmName, c.live.NetworkName = "web", "lan"
 				if _, err := s.SetNICGuard(admin, c.live); err != nil {
@@ -260,7 +267,11 @@ func TestNICSecurity_PlanAndExecutorAgreeOnGuardAuthority(t *testing.T) {
 				t.Fatalf("applied = %v (err %v, withheld %q), want %v", err == nil, err, withheld, c.applied)
 			}
 			if !c.applied {
-				if !strings.Contains(strings.Join(withheld, ";"), "network.update") {
+				want := "network.update"
+				if c.declared.Name == "wan" {
+					want = "not enforced"
+				}
+				if !strings.Contains(strings.Join(withheld, ";"), want) {
 					t.Errorf("withheld %q does not name the missing permission", withheld)
 				}
 				after, _ := corrosion.GetNICGuard(context.Background(), s.db, "web", "52:54:00:00:00:01")
@@ -370,5 +381,23 @@ func TestApplyLiveMetadata_NoRebindWithoutAllowWeaken(t *testing.T) {
 	}
 	if live, _ := corrosion.LiveNICSecurity(ctx, s.db, "web", "u-1"); live[0].SecurityGroups[0] != "isolate" {
 		t.Errorf("binding = %v, want isolate kept", live[0].SecurityGroups)
+	}
+}
+
+// Round 3, N2: create refuses a guard asked for on a NIC that cannot enforce
+// one, rather than creating the NIC silently unguarded.
+func TestAdmitNICGuards_RefusesAGuardOnADirectNIC(t *testing.T) {
+	s := guardServer(t, true)
+	admin := adminCtxWithEngine(t, s)
+	if err := corrosion.UpsertNetwork(context.Background(), s.db, corrosion.NetworkRecord{Name: "wan", Type: "direct",
+		Config: `{"type":"direct","interface":"lo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.admitNICGuards(admin, "x", []*pb.NetworkAttachment{{Name: "wan", SpoofGuard: "on"}}, admitNew)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "protect nothing") {
+		t.Fatalf("err = %v, want a refusal", err)
+	}
+	if _, err := s.admitNICGuards(admin, "x", []*pb.NetworkAttachment{{Name: "wan"}}, admitNew); err != nil {
+		t.Errorf("a direct NIC with no guard settings: %v", err)
 	}
 }

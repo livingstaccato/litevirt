@@ -992,7 +992,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		})
 		// A macvtap NIC bypasses the bridge, where guards are enforced, so it
 		// gets no record rather than one that claims a protection it lacks.
-		if !strings.HasPrefix(bridge, "direct:") {
+		if !strings.HasPrefix(bridge, "direct:") && guardUnenforcedOnNetwork(ctx, s.db, n.Name) == "" {
 			if rec := guardDec[i].record(spec.Name, spec.Uuid, i, mac, n); rec != nil {
 				guardRecords = append(guardRecords, *rec)
 			}

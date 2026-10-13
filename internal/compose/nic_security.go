@@ -36,7 +36,9 @@ import (
 // every security-group rebind (per-NIC rules are first-match across the bound
 // groups, so adding, removing or reordering a group can each widen access),
 // and a guard restore that turns the guard off or adds an allowance. A guard
-// restore that only tightens is applied. So are restores the deploy can make
+// restore that only tightens is applied without the opt-in, with the
+// authority creating that guard would need (DeclaredGuardNeedsAuthority). So
+// are restores the deploy can make
 // only with authority it lacks, or that cannot be made per NIC, withheld and
 // reported at plan time rather than failing the deploy (ApplyNICSecurityGate).
 //
@@ -366,6 +368,57 @@ type NICSecurityGate struct {
 	// set's authority). nil: it may. It is asked exactly for the guards
 	// DeclaredGuardNeedsAuthority names, by the plan and by the executor.
 	CheckGuardAuthority func(network string) error
+	// GuardUnenforced is why no guard can be enforced on a network's NICs
+	// (GuardUnenforcedOn), or "". A guard the file declares there is no
+	// drift: create writes no record for it, so nothing is restored, and the
+	// plan says the guard is not enforced. nil: every network enforces.
+	GuardUnenforced func(network string) string
+}
+
+// GuardUnenforcedOn is why a guard cannot be enforced on a NIC of a network of
+// type netType named name, or "": a direct (macvtap) or SR-IOV NIC bypasses
+// the bridge where guards are enforced. Create, the guard RPC, the plan and
+// the deploy's executor all decide by this one function.
+func GuardUnenforcedOn(netType, name string) string {
+	switch {
+	case netType == "direct" || strings.HasPrefix(name, "direct:"):
+		return "a direct (macvtap) network bypasses the bridge where guards are enforced"
+	case netType == "sriov":
+		return "an SR-IOV network bypasses the bridge where guards are enforced"
+	}
+	return ""
+}
+
+// GuardNotEnforcedNote is the plan's note for a NIC whose file declares a
+// guard on a network that cannot enforce one.
+func GuardNotEnforcedNote(i int, network, why string) string {
+	return fmt.Sprintf("nic %d (%s) declares a guard that is not enforced: %s; the NIC has no guard "+
+		"(leave the guard settings out, or use a bridge network)", i, network, why)
+}
+
+// InvalidDeclaredGuard is why a NIC entry's declared guard cannot be written
+// (a mode other than on or off, an allowed entry that is not an address or
+// prefix), or "": the checks create applies.
+func InvalidDeclaredGuard(att *pb.NetworkAttachment) string {
+	switch strings.ToLower(strings.TrimSpace(att.GetSpoofGuard())) {
+	case "", "on", "off":
+	default:
+		return fmt.Sprintf("spoof-guard %q: want on or off", att.GetSpoofGuard())
+	}
+	for _, a := range att.GetAllowedAddresses() {
+		s := strings.TrimSpace(a)
+		if s == "" {
+			continue
+		}
+		if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+			continue
+		}
+		if ad, err := netip.ParseAddr(s); err == nil && ad.Zone() == "" {
+			continue
+		}
+		return fmt.Sprintf("allowed address %q is not an IP address or prefix", a)
+	}
+	return ""
 }
 
 // ApplyNICSecurityGate removes from an in-place plan each NIC security change
@@ -387,6 +440,10 @@ func ApplyNICSecurityGate(vm string, p *ChangePlan, desired, stored *pb.VMSpec, 
 	}
 	var warnings []string
 	withheld := map[string]bool{}
+	notEnforced := func(c NICSecurityChange, why string) {
+		withheld[c.Field] = true
+		warnings = append(warnings, GuardNotEnforcedNote(c.Position, c.Network, why))
+	}
 	withhold := func(c NICSecurityChange, why string) {
 		withheld[c.Field] = true
 		what := "security groups"
@@ -397,6 +454,10 @@ func ApplyNICSecurityGate(vm string, p *ChangePlan, desired, stored *pb.VMSpec, 
 	}
 	for _, c := range p.NICSecurity {
 		switch {
+		case c.Guard && gate.GuardUnenforced != nil && gate.GuardUnenforced(c.Network) != "":
+			notEnforced(c, gate.GuardUnenforced(c.Network))
+		case c.Guard && InvalidDeclaredGuard(desired.Network[c.Position]) != "":
+			withhold(c, "the file's guard is invalid: "+InvalidDeclaredGuard(desired.Network[c.Position]))
 		case !c.Guard && SharedNetworkConflict(c.Position, desired, stored, live) != "":
 			withhold(c, SharedNetworkConflict(c.Position, desired, stored, live))
 		case c.Guard && gate.GuardsUnwritable != "":
@@ -476,43 +537,103 @@ func SharedNetworkConflict(i int, desired, stored *pb.VMSpec, live []LiveNIC) st
 // CarryUndeclaredSecurityGroups gives each NIC of a recreate's desired spec
 // whose file declares no security groups the binding its live NIC has (stored
 // is the overlaid stored spec), so a recreate leaves an undeclared binding as
-// it is, as an in-place update does. A desired NIC is the stored NIC at the
-// same occurrence on the same network (the second NIC on lan is the old second
-// NIC on lan), so a NIC inserted or removed elsewhere does not shift it. It
-// returns a note per binding carried, and one per live binding of an
-// undeclared NIC the recreate cannot carry (its network's NIC is gone).
+// it is, as an in-place update does. A binding is carried only to the NIC it
+// is known to belong to:
+//
+//   - a desired NIC that names a MAC is the stored NIC with that MAC;
+//   - otherwise, on a network where the file and the VM have the same number
+//     of NICs that name no MAC in the file, the k-th such NIC is the k-th
+//     unmatched stored NIC on that network. When the counts differ (a NIC was
+//     added or removed on that network) the pairing is ambiguous, and nothing
+//     is carried there: each binding is dropped, and named.
+//
+// It returns a note per binding carried and per binding dropped.
 func CarryUndeclaredSecurityGroups(desired, stored *pb.VMSpec) []string {
 	var notes []string
-	storedOn := map[string][]*pb.NetworkAttachment{}
-	for _, sn := range stored.GetNetwork() {
-		if sn != nil {
-			storedOn[sn.GetName()] = append(storedOn[sn.GetName()], sn)
-		}
-	}
-	seen := map[string]int{}
+	pair := map[int]*pb.NetworkAttachment{} // desired position → its stored NIC
 	used := map[*pb.NetworkAttachment]bool{}
 	for i, dn := range desired.GetNetwork() {
-		if dn == nil {
+		if dn == nil || dn.GetMac() == "" {
 			continue
 		}
-		k := seen[dn.GetName()]
-		seen[dn.GetName()]++
-		if k >= len(storedOn[dn.GetName()]) {
+		for _, sn := range stored.GetNetwork() {
+			if sn != nil && !used[sn] && sn.GetName() == dn.GetName() && strings.EqualFold(sn.GetMac(), dn.GetMac()) {
+				pair[i], used[sn] = sn, true
+				break
+			}
+		}
+	}
+	ambiguous := map[string]bool{}
+	byNet := map[string][]int{}
+	for i, dn := range desired.GetNetwork() {
+		if dn != nil && dn.GetMac() == "" {
+			byNet[dn.GetName()] = append(byNet[dn.GetName()], i)
+		}
+	}
+	for network, idx := range byNet {
+		var free []*pb.NetworkAttachment
+		for _, sn := range stored.GetNetwork() {
+			if sn != nil && !used[sn] && sn.GetName() == network {
+				free = append(free, sn)
+			}
+		}
+		if len(free) != len(idx) {
+			ambiguous[network] = true
 			continue
 		}
-		sn := storedOn[dn.GetName()][k]
-		used[sn] = true
-		if len(dn.GetSecurityGroups()) > 0 || len(sn.GetSecurityGroups()) == 0 {
+		for k, i := range idx {
+			pair[i], used[free[k]] = free[k], true
+		}
+	}
+	for i, dn := range desired.GetNetwork() {
+		sn := pair[i]
+		if dn == nil || sn == nil || sn.GetName() != dn.GetName() ||
+			len(dn.GetSecurityGroups()) > 0 || len(sn.GetSecurityGroups()) == 0 {
 			continue
 		}
 		dn.SecurityGroups = slices.Clone(sn.GetSecurityGroups())
-		notes = append(notes, fmt.Sprintf("nic %d (%s) keeps its security groups %s through the recreate (the file declares none)",
-			i, dn.GetName(), sgList(dn.SecurityGroups)))
+		notes = append(notes, fmt.Sprintf("nic %d (%s) keeps the security groups %s its NIC (%s) has now through the recreate (the file declares none)",
+			i, dn.GetName(), sgList(dn.SecurityGroups), nicLabel(sn)))
 	}
 	for _, sn := range stored.GetNetwork() {
-		if sn != nil && !used[sn] && len(sn.GetSecurityGroups()) > 0 {
-			notes = append(notes, fmt.Sprintf("the recreate drops the security groups %s bound now to the NIC on %s, which the file no longer has",
-				sgList(sn.GetSecurityGroups()), sn.GetName()))
+		if sn == nil || used[sn] || len(sn.GetSecurityGroups()) == 0 {
+			continue
+		}
+		why := "which the file no longer has"
+		if ambiguous[sn.GetName()] {
+			why = "because the file changes how many NICs are on " + sn.GetName() + ", so which new NIC is that NIC is unknown " +
+				"(declare security-groups: on the NICs, or name their mac:, to keep a binding)"
+		}
+		notes = append(notes, fmt.Sprintf("the recreate drops the security groups %s bound now to the NIC (%s) on %s, %s",
+			sgList(sn.GetSecurityGroups()), nicLabel(sn), sn.GetName(), why))
+	}
+	return notes
+}
+
+func nicLabel(n *pb.NetworkAttachment) string {
+	if n.GetMac() != "" {
+		return n.GetMac()
+	}
+	return "no MAC recorded"
+}
+
+// StripUnenforcedGuards removes the guard settings from each NIC of a create's
+// spec whose network cannot enforce a guard (unenforced, GuardUnenforcedOn),
+// so the create does not refuse a file that declares one, and returns the
+// plan's note for each: the setting is reported, never dropped silently.
+func StripUnenforcedGuards(spec *pb.VMSpec, unenforced func(network string) string) []string {
+	if unenforced == nil {
+		return nil
+	}
+	var notes []string
+	for i, n := range spec.GetNetwork() {
+		if n == nil || !nicGuardDeclared(n) {
+			continue
+		}
+		if why := unenforced(n.GetName()); why != "" {
+			n.SpoofGuard, n.AllowedAddresses = "", nil
+			n.AllowDhcpServer, n.AllowRouterAdvertisement, n.AllowVlanTags = false, false, false
+			notes = append(notes, GuardNotEnforcedNote(i, n.GetName(), why))
 		}
 	}
 	return notes

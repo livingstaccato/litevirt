@@ -56,6 +56,7 @@ func (s *Server) nicSecurityGate(ctx context.Context, allowWeaken bool) compose.
 		}
 		return nil
 	}
+	g.GuardUnenforced = func(network string) string { return guardUnenforcedOnNetwork(ctx, s.db, network) }
 	g.CheckGuardAuthority = func(network string) error {
 		if err := s.requireGuardAuthority(ctx, network, "restoring a declared NIC guard that is off or has allowances"); err != nil {
 			return fmt.Errorf("%s", status.Convert(err).Message())
@@ -170,6 +171,9 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 				return refuse(i, n.Network, "security groups", err.Error())
 			}
 		case compose.NICGuardFieldPrefix:
+			if why := compose.InvalidDeclaredGuard(want); why != "" {
+				return refuse(i, n.Network, "guard", "the file's guard is invalid: "+why)
+			}
 			if gate.GuardsUnwritable != "" {
 				return refuse(i, n.Network, "guard", gate.GuardsUnwritable)
 			}
@@ -192,8 +196,10 @@ func (s *Server) applyDesiredNICSecurity(ctx context.Context, name string, desir
 			if _, err := corrosion.NormalizeNICGuardAddresses(want.GetAllowedAddresses()); err != nil {
 				return refuse(i, n.Network, "guard", "allowed addresses: "+err.Error())
 			}
-			if def, _ := lookupNetworkDef(ctx, s.db, n.Network); def != nil && (def.Type == "direct" || def.Type == "sriov") {
-				return refuse(i, n.Network, "guard", "the NIC is on a "+def.Type+" network, which bypasses the bridge where guards are enforced")
+			if why := gate.GuardUnenforced(n.Network); why != "" {
+				// The plan reports such a guard as not enforced and plans
+				// nothing for it; this is the backstop.
+				return refuse(i, n.Network, "guard", why)
 			}
 		}
 		writes = append(writes, w)

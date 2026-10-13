@@ -274,6 +274,33 @@ func EvalSymlinksBounded(p string) (string, error) {
 	return Bounded("evaluate the symlinks of", clean, func() (string, error) { return eval(clean) })
 }
 
+// PrimeBounded resolves every path at once — as EvalSymlinksBounded does and
+// as the bounded checks (DirsOverlap, CheckWriteRoot, NFSBackingOf,
+// SharedStoreOf, IsDataDirDisks) do — each under its own bound, and returns
+// when all have answered or been given up on. A caller about to make those
+// calls one path after another primes the paths first: a path that does not
+// answer is then already given up on (its mount latched, or its call joined
+// as unanswered), and the calls that follow fail on it at once, so several
+// dead mounts cost one bound in all, not one bound each.
+func PrimeBounded(paths ...string) {
+	var t *MountTable
+	if mt, err := ReadMountTable(); err == nil {
+		t = &mt
+	}
+	var wg sync.WaitGroup
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" || !filepath.IsAbs(p) || seen[filepath.Clean(p)] {
+			continue
+		}
+		seen[filepath.Clean(p)] = true
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = EvalSymlinksBounded(p) }()
+		go func() { defer wg.Done(); _, _ = resolveBounded(t, p) }()
+	}
+	wg.Wait()
+}
+
 // OverrideEvalSymlinksForTest replaces how EvalSymlinksBounded evaluates a
 // path, for tests in other packages. It returns the restore function.
 func OverrideEvalSymlinksForTest(eval func(string) (string, error)) func() {

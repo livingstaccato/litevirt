@@ -322,6 +322,43 @@ func TestStart_AChainJudgedOnAStalledResolutionIsRefused(t *testing.T) {
 	}
 }
 
+// Re-review 3 caveat (a): a local-disk VM's start is not refused because its
+// check crosses several dead mounts. Each pool directory below a dead mount
+// costs one bound, but they are given up on at once, not one after another
+// (where five of them outlast the start check's own bound of four).
+//
+// Mutation: the pool directories resolved one after another — the local VM
+// is refused: red.
+func TestStart_ALocalDiskVMStartsBesideSeveralDeadMounts(t *testing.T) {
+	f := newStartChainFixture(t)
+	lines := []string{"22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw"}
+	var mnts []string
+	for i := range 5 {
+		mnt := t.TempDir()
+		mnts = append(mnts, mnt)
+		src := "nas" + string(rune('a'+i)) + ":/vm"
+		lines = append(lines, nfsMountLine(mnt, src))
+		if err := corrosion.UpsertStoragePool(context.Background(), f.s.db, corrosion.StoragePoolRecord{
+			HostName: f.s.hostName, Name: "inner" + string(rune('a'+i)), Driver: "nfs", Source: src + "/inner",
+			Target: filepath.Join(mnt, "inner"), State: "active",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overrideMounts(t, lines...)
+	deadMountSeams(t, mnts...)
+	vm := f.mainEraVM(t, "web", f.pa, "pa")
+	if err := qcow2.Create(filepath.Join(f.pa, "ubuntu"), 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	err := within(t, 20*time.Second, "a local-disk VM's start checks", func() error {
+		return f.s.verifyImageBasesForStart(context.Background(), vm)
+	})
+	if err != nil {
+		t.Fatalf("start of a local-disk VM beside five dead mounts: %v", err)
+	}
+}
+
 // IsDataDirDisks is a confinement judgement: a pool on <data_dir>/disks
 // holds every VM's disks, and its content is confined to what its project
 // owns by record. A pool directory reached through a symlink whose

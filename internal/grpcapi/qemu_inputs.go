@@ -196,6 +196,7 @@ func (s *Server) diskChainRule(ctx context.Context, d corrosion.DiskRecord) chai
 func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *diskChain {
 	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}, uploads: map[string]poolRecords{}, recorded: map[string]corrosion.DiskRecord{}}
 	c.project = c.projectOf(d.VMName)
+	s.primePoolDirResolutions(ctx, d)
 	c.self = c.resolve(s.hostDiskFile(d.Path))
 	// The image store is a deny as well as an admission (an image-store
 	// layer may name only another image), so it is not judged on a guess.
@@ -721,6 +722,41 @@ func (s *Server) chainPoolDirs(ctx context.Context, d corrosion.DiskRecord, proj
 		}
 	}
 	return dirs
+}
+
+// primePoolDirResolutions resolves, all at once, every directory a judgement
+// of d's chain resolves before it judges a layer: each file-based pool's of
+// this host (and d's own pool's), <data_dir>/disks and the image store. Each
+// is under its own bound (storage.PrimeBounded), so the checks that follow
+// one after another find a directory that does not answer already given up
+// on: a start beside several dead mounts waits one bound for all of them,
+// not one per mount, and a VM on local storage is not refused because they
+// outlast its start check's own bound (re-review 3, caveat a).
+func (s *Server) primePoolDirResolutions(ctx context.Context, d corrosion.DiskRecord) {
+	dirs := []string{filepath.Join(s.dataDir, "disks"), filepath.Join(s.dataDir, "images")}
+	if d.StorageVolume != "" {
+		if ref, ok := s.resolvePool(ctx, d.StorageVolume); ok {
+			if dir, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
+		for _, p := range pools {
+			if !isFileBasedDriver(p.Driver) {
+				continue
+			}
+			if dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}); err == nil {
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	if s.hostDiskRoot != "" {
+		for _, dir := range dirs {
+			dirs = append(dirs, s.hostDiskFile(dir))
+		}
+	}
+	storage.PrimeBounded(dirs...)
 }
 
 // rootsAsFound is dir resolved through symlinks, and under the hostDiskRoot

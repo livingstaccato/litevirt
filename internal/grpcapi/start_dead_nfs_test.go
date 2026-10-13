@@ -16,21 +16,24 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
-// deadMountSeams makes every symlink resolution under mnt block until the
-// test ends, as a stat on a hard NFS mount whose server does not answer
+// deadMountSeams makes every symlink resolution under any of mnts block until
+// the test ends, as a stat on a hard NFS mount whose server does not answer
 // does, and records what it blocked.
-func deadMountSeams(t *testing.T, mnt string) (touched func() []string) {
+func deadMountSeams(t *testing.T, mnts ...string) (touched func() []string) {
 	t.Helper()
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	var mu sync.Mutex
 	var seen []string
 	block := func(p string) {
-		if pathWithin(mnt, p) {
-			mu.Lock()
-			seen = append(seen, p)
-			mu.Unlock()
-			<-release
+		for _, mnt := range mnts {
+			if pathWithin(mnt, p) {
+				mu.Lock()
+				seen = append(seen, p)
+				mu.Unlock()
+				<-release
+				return
+			}
 		}
 	}
 	t.Cleanup(storage.OverrideFSCallBoundForTest(300 * time.Millisecond))

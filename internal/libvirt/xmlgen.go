@@ -242,6 +242,14 @@ func MaxVCPUFromXML(domXML string) int {
 // a device with no source address is skipped. Returns nil on an unparseable
 // document (the caller treats that as "no trustworthy inactive definition").
 func HostdevSourcePCIAddresses(domXML string) []string {
+	out, _ := ParseHostdevSourcePCIAddresses(domXML)
+	return out
+}
+
+// ParseHostdevSourcePCIAddresses is HostdevSourcePCIAddresses that returns the
+// parse error, for a caller that must not read an unparseable document as one
+// with no hostdevs.
+func ParseHostdevSourcePCIAddresses(domXML string) ([]string, error) {
 	var d struct {
 		Hostdevs []struct {
 			Type   string `xml:"type,attr"`
@@ -256,7 +264,7 @@ func HostdevSourcePCIAddresses(domXML string) []string {
 		} `xml:"devices>hostdev"`
 	}
 	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
-		return nil
+		return nil, err
 	}
 	var out []string
 	for _, h := range d.Hostdevs {
@@ -270,7 +278,7 @@ func HostdevSourcePCIAddresses(domXML string) []string {
 		strip := func(v string) string { return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), "0x") }
 		out = append(out, strip(a.Domain)+":"+strip(a.Bus)+":"+strip(a.Slot)+"."+strip(a.Function))
 	}
-	return out
+	return out, nil
 }
 
 // isQ35Machine reports whether m is the q35 machine family, in either the

@@ -599,7 +599,12 @@ func (h *Host) ReleaseUnbound(address string) error {
 	if recorded && rec != vfioDriver && rec != legacyBind {
 		hostDriver = rec
 	}
-	if !stale && hostDriver == "" {
+	// An older build's device left driverless (its unbind landed after the release
+	// gave up on it) still has that build's vfio-pci dynamic ID to answer: dropping
+	// the marker without a reprobe would let the next probe hand the unowned device
+	// to vfio-pci.
+	legacyDriverless := recorded && rec == legacyBind && cur == ""
+	if !stale && hostDriver == "" && !legacyDriverless {
 		if recorded {
 			return h.forget(address)
 		}
@@ -618,7 +623,13 @@ func (h *Host) ReleaseUnbound(address string) error {
 		if err != nil {
 			return err
 		}
-		if final == vfioDriver {
+		if final == vfioDriver && legacyDriverless {
+			// The older build's ID took it: remove that ID and return the device.
+			if final, err = h.releaseFromDynamicID(devPath, address, ""); err != nil {
+				return fmt.Errorf("release %s: %w", address, err)
+			}
+		}
+		if final == vfioDriver && !legacyDriverless {
 			return fmt.Errorf("release %s: a reprobe bound it to vfio-pci (a dynamic vfio-pci ID matches it)", address)
 		}
 		slog.Info("released device's stale vfio state cleared", "address", address, "driver", final)
@@ -636,6 +647,43 @@ func (h *Host) ReleaseUnbound(address string) error {
 // device until that write returns. The device is still bound to vfio-pci, so the
 // caller keeps its ownership and retries later.
 var ErrUnbindBlocked = errors.New("vfio-pci unbind blocked: the device is still open")
+
+// ErrDeviceInUse is returned when the unbind is refused up front because a
+// process still holds the device's vfio files open.
+var ErrDeviceInUse = errors.New("device in use")
+
+// IsBlocked reports whether err is a release that something holding the device
+// open stopped (ErrUnbindBlocked or ErrDeviceInUse). A caller releasing several
+// devices stops at the first one: the release is all-or-nothing, and each further
+// device would cost another bounded wait under the caller's locks.
+func IsBlocked(err error) bool {
+	return errors.Is(err, ErrUnbindBlocked) || errors.Is(err, ErrDeviceInUse)
+}
+
+// LogStuckUnbinds logs, at error level, every device whose vfio-pci unbind is
+// still in the kernel, and returns how many there are. The daemon calls it on
+// shutdown: such a write keeps the process from exiting until whatever holds the
+// device open lets go, and without this a stop just hangs unexplained.
+func LogStuckUnbinds() int {
+	stuck := StuckUnbinds()
+	for addr, since := range stuck {
+		slog.Error("a vfio-pci unbind is still blocked in the kernel; this process cannot exit until whatever holds the device open (see dmesg: \"Device is currently in use\") closes it",
+			"address", addr, "since", since.UTC().Format(time.RFC3339), "waiting", time.Since(since).Round(time.Second))
+	}
+	return len(stuck)
+}
+
+// StuckUnbinds returns each device whose vfio-pci unbind is still blocked in the
+// kernel, with when it started. A process with one cannot exit until it returns.
+func StuckUnbinds() map[string]time.Time {
+	inFlightMu.Lock()
+	defer inFlightMu.Unlock()
+	out := make(map[string]time.Time, len(inFlight))
+	for a, t := range inFlight {
+		out[a] = t
+	}
+	return out
+}
 
 var (
 	// unbindTimeout bounds how long a release waits for the kernel to finish a
@@ -799,8 +847,8 @@ func refuseIfHeld(devPath, address string) error {
 			for i, h := range holders {
 				names[i] = h.String()
 			}
-			return fmt.Errorf("%s is in use: %s; not unbinding it from vfio-pci, which would block until that process lets go; it stays bound and owned, retry once it exits",
-				address, strings.Join(names, ", "))
+			return fmt.Errorf("%w: %s: %s; not unbinding it from vfio-pci, which would block until that process lets go; it stays bound and owned, retry once it exits",
+				ErrDeviceInUse, address, strings.Join(names, ", "))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

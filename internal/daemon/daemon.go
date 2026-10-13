@@ -55,6 +55,7 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/ui"
+	"github.com/litevirt/litevirt/internal/vfio"
 	"github.com/litevirt/litevirt/internal/watchdog"
 )
 
@@ -1970,6 +1971,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Warn("graceful shutdown timed out, forcing stop")
 			d.grpcSrv.Stop()
 		}
+		// A vfio-pci unbind still blocked in the kernel keeps this process alive
+		// past every step below; name the devices so an operator knows which
+		// holder to stop.
+		vfio.LogStuckUnbinds()
 		// A drain returns before its failback records are written, and this
 		// is the host it drained: give them a moment to land while the
 		// replicator still runs, and name every VM whose record is lost.

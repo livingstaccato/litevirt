@@ -7,6 +7,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
 
@@ -21,7 +22,8 @@ type hangingUnbindFS struct {
 }
 
 func (f *hangingUnbindFS) WriteFile(path string, data []byte, perm os.FileMode) error {
-	if strings.HasSuffix(path, "/driver/unbind") && strings.TrimSpace(string(data)) == f.addr && f.isBound(f.addr) {
+	a := strings.TrimSpace(string(data))
+	if strings.HasSuffix(path, "/driver/unbind") && (a == f.addr || f.addr == "*") && f.isBound(a) {
 		f.entered <- struct{}{}
 		<-f.gate
 	}
@@ -118,5 +120,45 @@ func TestDetachPCI_ABlockedUnbindDoesNotWedgeTheDaemon(t *testing.T) {
 	}
 	if inner.hostDriver(addr) != "igbvf" {
 		t.Fatalf("host driver = %q, want igbvf", inner.hostDriver(addr))
+	}
+}
+
+// TestReleaseDevices_StopsAtTheFirstBlockedUnbind (review M1): the release is
+// all-or-nothing, so once one device's unbind is blocked there is no point
+// unbinding the rest — and each would cost another bounded wait under the VM
+// lock. The release must stop at the first, with one write in the kernel.
+func TestReleaseDevices_StopsAtTheFirstBlockedUnbind(t *testing.T) {
+	s := hotplugDiskServer(t)
+	inner := newPCIUnbindRecordingFS()
+	fs := &hangingUnbindFS{pciUnbindRecordingFS: inner, addr: "*", gate: make(chan struct{}), entered: make(chan struct{}, 8)}
+	defer vfio.SetFS(fs)()
+	t.Cleanup(func() {
+		close(fs.gate)
+		// Let the stuck writes land, so no later test finds these addresses busy.
+		deadline := time.Now().Add(5 * time.Second)
+		for len(vfio.StuckUnbinds()) > 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	ctx := adminCtx()
+	for _, a := range []string{"0000:50:00.0", "0000:51:00.0", "0000:52:00.0"} {
+		seedPCIGPU(t, s, a, -1)
+		if err := corrosion.AssignPCIDevice(ctx, s.db, "test-host", a, "vm1"); err != nil {
+			t.Fatalf("assign: %v", err)
+		}
+		inner.setBound(a)
+	}
+	defer vfio.SetUnbindTimeout(150 * time.Millisecond)()
+
+	if err := s.releaseDevices(ctx, "vm1"); err == nil {
+		t.Fatal("releaseDevices succeeded with every unbind blocked")
+	}
+	if got := len(fs.entered); got != 1 {
+		t.Fatalf("%d unbind writes reached the kernel, want 1 (stop at the first blocked one)", got)
+	}
+	for _, a := range []string{"0000:50:00.0", "0000:51:00.0", "0000:52:00.0"} {
+		if o := pciOwnerOf(t, ctx, s, a); o != "vm1" {
+			t.Fatalf("%s owner = %q, want vm1", a, o)
+		}
 	}
 }

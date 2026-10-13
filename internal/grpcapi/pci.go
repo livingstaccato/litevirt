@@ -874,6 +874,9 @@ func (s *Server) releaseDevices(ctx context.Context, vmName string) error {
 		}
 		if uerr := s.vfioHost().Unbind(d.Address, d.Driver); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", d.Address, uerr))
+			if vfio.IsBlocked(uerr) {
+				break // all-or-nothing: no further bounded waits under the VM lock
+			}
 		} else {
 			// The inventory's Driver is what the last scan saw, which after a rescan
 			// of a bound device is "vfio-pci", not where the release put it. Log the
@@ -1012,6 +1015,9 @@ func (s *Server) unbindAndReleaseOwnership(ctx context.Context, vmName string, a
 		}
 		if uerr := s.vfioHost().Unbind(addr, drivers[addr]); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+			if vfio.IsBlocked(uerr) {
+				break // all-or-nothing: no further bounded waits under the VM lock
+			}
 		}
 	}
 
@@ -1159,6 +1165,9 @@ func (s *Server) reclaimLeasedDevices(ctx context.Context, vmName string, addrs 
 		}
 		if uerr := s.vfioHost().Unbind(addr, drivers[addr]); uerr != nil {
 			failures = append(failures, fmt.Errorf("unbind %s from vfio-pci: %w", addr, uerr))
+			if vfio.IsBlocked(uerr) {
+				break // all-or-nothing: no further bounded waits under the VM lock
+			}
 		}
 	}
 	if len(failures) > 0 {

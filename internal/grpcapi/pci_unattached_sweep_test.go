@@ -1,7 +1,9 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -43,15 +45,26 @@ func TestSweepUnattachedPCIOwnership_ReleasesAnOlderBuildsLeak(t *testing.T) {
 	}
 }
 
-// Every case in which the device is not provably a leak: it must stay owned and
-// be reported, never released.
+// Every case in which the device is not provably a leak: it must stay owned,
+// never released. Only a device PROVEN absent from both copies of the domain that
+// still cannot be released (here: still bound to vfio-pci) is reported; a VM the
+// sweep skips (in use, mid-operation, hardware_v2 intents, unreadable domain) is
+// skipped silently, since a report there would tell the operator to detach a
+// device a guest may be using (review S1).
 func TestSweepUnattachedPCIOwnership_KeepsWhatItCannotProve(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(t *testing.T, s *Server, fake *libvirtfake.Fake, fs *pciBindFakeFS, vf string)
-		// silent: the device is in use, so there is nothing to report either.
+		// silent: nothing may be reported.
 		silent bool
 	}{
+		{"the live domain does not parse", func(t *testing.T, _ *Server, fake *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
+			fake.SetActiveXML("vm1", `<domain type='kvm'><name>vm1</name><devices><hostdev`)
+		}, true},
+		{"the persistent domain does not parse", func(t *testing.T, _ *Server, fake *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
+			fake.SetActiveXML("vm1", `<domain type='kvm'><name>vm1</name><devices></devices></domain>`)
+			fake.SetInactiveXML("vm1", `<domain type='kvm'><name>vm1</name><devices><hostdev`)
+		}, true},
 		{"in the live and persistent copies", func(t *testing.T, s *Server, fake *libvirtfake.Fake, _ *pciBindFakeFS, vf string) {
 			if err := fake.AttachHostdev("vm1", vf); err != nil {
 				t.Fatal(err)
@@ -77,7 +90,7 @@ func TestSweepUnattachedPCIOwnership_KeepsWhatItCannotProve(t *testing.T) {
 			if err := s.db.Execute(context.Background(), `UPDATE vms SET active_operation_id = ? WHERE name = ?`, "op-1", "vm1"); err != nil {
 				t.Fatal(err)
 			}
-		}, false},
+		}, true},
 		{"a device lease is open", func(t *testing.T, s *Server, _ *libvirtfake.Fake, _ *pciBindFakeFS, vf string) {
 			if err := s.opJournal.Write(opjournal.Entry{
 				OperationID: deviceLeaseOpID("vm1"), ResourceID: "vm1", Kind: deviceLeaseKind,
@@ -85,24 +98,24 @@ func TestSweepUnattachedPCIOwnership_KeepsWhatItCannotProve(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-		}, false},
+		}, true},
 		{"the VM lock is held", func(t *testing.T, s *Server, _ *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
 			t.Cleanup(s.lockVM("vm1"))
-		}, false},
+		}, true},
 		{"still bound to vfio-pci", func(t *testing.T, _ *Server, _ *libvirtfake.Fake, fs *pciBindFakeFS, vf string) {
 			fs.bound[vf] = true
 		}, false},
 		{"the VM has PCI intents", func(t *testing.T, s *Server, _ *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
 			seedAddressIntent(t, s, "vm1", "dev-1", "0000:42:00.0")
-		}, false},
+		}, true},
 		{"the domain cannot be read", func(t *testing.T, _ *Server, fake *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
 			fake.FailDumpXMLInactive = func(string) error { return errString("libvirt down") }
-		}, false},
+		}, true},
 		{"the VM is migrating", func(t *testing.T, s *Server, _ *libvirtfake.Fake, _ *pciBindFakeFS, _ string) {
 			if err := s.db.Execute(context.Background(), `UPDATE vms SET state = ? WHERE name = ?`, "migrating", "vm1"); err != nil {
 				t.Fatal(err)
 			}
-		}, false},
+		}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,6 +137,37 @@ func TestSweepUnattachedPCIOwnership_KeepsWhatItCannotProve(t *testing.T) {
 				t.Fatalf("reported = %v; want one report naming %s", reported, vf)
 			}
 		})
+	}
+}
+
+// TestSweepUnattachedPCIOwnership_AHardwareV2VMsHeldDevicesRaiseNoWarning is
+// review S1's regression check: on a hardware_v2 cluster every VM has PCI
+// intents, and the sweep used to WARN for each of their devices — including ones
+// a running guest holds — telling the operator to `lv detach-pci` them, on every
+// daemon start and every rescan.
+func TestSweepUnattachedPCIOwnership_AHardwareV2VMsHeldDevicesRaiseNoWarning(t *testing.T) {
+	s, fake, fs, vf := unattachedRig(t)
+	ctx := adminCtx()
+	seedAddressIntent(t, s, "vm1", "dev-1", vf)
+	if err := fake.AttachHostdevWithAlias("vm1", vf, "ua-dev-1-m0"); err != nil {
+		t.Fatal(err)
+	}
+	fs.bound[vf] = true
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	released, reported := s.SweepUnattachedPCIOwnership(ctx)
+	slog.SetDefault(prev)
+
+	if len(released) != 0 || len(reported) != 0 {
+		t.Fatalf("released %v, reported %v; want neither for a device its guest holds", released, reported)
+	}
+	if strings.Contains(buf.String(), "level=WARN") {
+		t.Fatalf("the sweep warned about a device its guest holds:\n%s", buf.String())
+	}
+	if !ownedBy(t, ctx, s, "vm1")[vf] {
+		t.Fatalf("%s lost its owner", vf)
 	}
 }
 

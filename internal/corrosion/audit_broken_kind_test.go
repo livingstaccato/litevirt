@@ -110,8 +110,35 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 			if !res.Tampered() {
 				t.Errorf("a broken link must still fail verification")
 			}
+			if res.Forked() != (tc.kind == AuditBrokenForked) {
+				t.Errorf("Forked() = %v for a %s break", res.Forked(), tc.kind)
+			}
 		})
 	}
+
+	// A fork beside a deleted row is not a fork alone: the jump in seq is a
+	// deletion, and the verdict stays tampering.
+	//
+	// Mutation: Forked not checking the seq jumps — red.
+	t.Run("a fork beside a deleted row is not a fork alone", func(t *testing.T) {
+		ctx, c := seed(t)
+		f := fork
+		f.ContentHash = HashAuditRow(f)
+		insertRaw(t, ctx, c, f, 1)
+		if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id = 'r2'`); err != nil {
+			t.Fatal(err)
+		}
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.BrokenKind != AuditBrokenForked || res.SeqDuplicates != 1 || len(res.SeqGaps) != 2 {
+			t.Fatalf("setup: kind %q, %d duplicates of %v", res.BrokenKind, res.SeqDuplicates, res.SeqGaps)
+		}
+		if res.Forked() || !res.Tampered() {
+			t.Errorf("Forked() = %v, Tampered() = %v: want a tamper verdict, not a fork alone", res.Forked(), res.Tampered())
+		}
+	})
 
 	// A seq-1 row with an empty prev_hash is a fork only when it REPEATS a seq 1
 	// the host already has. The first numbered row after a host's seq-0 legacy

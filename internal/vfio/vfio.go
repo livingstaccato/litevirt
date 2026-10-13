@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
 )
@@ -125,6 +126,11 @@ func Unbind(address, restoreDriver string) error { return HostAt("").Unbind(addr
 // driver with the override cleared, and its error says where the device ended.
 func (h *Host) Bind(address string) (previousDriver string, err error) {
 	devPath := filepath.Join(sysDevices, address)
+	// A device whose earlier unbind is still in the kernel reads as bound, and
+	// would be handed to a guest just before that unbind lands.
+	if err := unbindInFlight(address); err != nil {
+		return "", err
+	}
 
 	previousDriver, err = currentDriver(devPath)
 	if err != nil {
@@ -272,6 +278,9 @@ func (h *Host) restoreAfterFailedBind(devPath, address, previousDriver string) (
 //     for the device never had one.
 func (h *Host) Unbind(address, restoreDriver string) error {
 	devPath := filepath.Join(sysDevices, address)
+	if err := unbindInFlight(address); err != nil {
+		return err
+	}
 
 	current, err := currentDriver(devPath)
 	if err != nil {
@@ -331,6 +340,14 @@ func (h *Host) Unbind(address, restoreDriver string) error {
 		return h.forget(address)
 	}
 
+	// A device something still holds open would block the unbind in the kernel:
+	// refuse it now, before anything changes.
+	if current == vfioDriver {
+		if err := refuseIfHeld(devPath, address); err != nil {
+			return err
+		}
+	}
+
 	// 2. Clear the override and prove it cleared, before the binding changes.
 	if err := clearDriverOverride(devPath, address); err != nil {
 		return err
@@ -339,10 +356,12 @@ func (h *Host) Unbind(address, restoreDriver string) error {
 		return h.forget(address) // on a host driver already; nothing to release
 	}
 
-	// 3. Unbind from vfio-pci.
+	// 3. Unbind from vfio-pci, waiting a bounded time for the kernel.
 	if current == vfioDriver {
-		unbindPath := filepath.Join(devPath, "driver", "unbind")
-		if err := sysfs.WriteFile(unbindPath, []byte(address), 0200); err != nil {
+		if err := unbindFromVFIO(devPath, address); err != nil {
+			if errors.Is(err, ErrUnbindBlocked) {
+				return err
+			}
 			return fmt.Errorf("unbind %s from vfio-pci: %w", address, err)
 		}
 	}
@@ -448,8 +467,8 @@ func (h *Host) releaseFromDynamicID(devPath, address, want string) (string, erro
 		return vfioDriver, fmt.Errorf("a vfio-pci dynamic ID (%s) that is not the operator's matched it, and removing it failed: %v (%s)", id, err, remedy)
 	}
 	slog.Warn("removed a vfio-pci dynamic ID an older litevirt build added", "address", address, "id", id)
-	if err := sysfs.WriteFile(filepath.Join(devPath, "driver", "unbind"), []byte(address), 0200); err != nil {
-		return vfioDriver, fmt.Errorf("unbind after removing vfio-pci's dynamic ID %s: %v (%s)", id, err, remedy)
+	if err := unbindFromVFIO(devPath, address); err != nil {
+		return vfioDriver, fmt.Errorf("unbind after removing vfio-pci's dynamic ID %s: %w (%s)", id, err, remedy)
 	}
 	if err := bindOrProbe(address, want); err != nil {
 		return "", err
@@ -550,6 +569,9 @@ func operatorVfioIDs() (map[string]bool, error) {
 // A device with no override and no record is not written to at all.
 func (h *Host) ReleaseUnbound(address string) error {
 	devPath := filepath.Join(sysDevices, address)
+	if err := unbindInFlight(address); err != nil {
+		return err
+	}
 	cur, err := currentDriver(devPath)
 	if err != nil {
 		return fmt.Errorf("read the driver of %s: %w", address, err)
@@ -577,7 +599,12 @@ func (h *Host) ReleaseUnbound(address string) error {
 	if recorded && rec != vfioDriver && rec != legacyBind {
 		hostDriver = rec
 	}
-	if !stale && hostDriver == "" {
+	// An older build's device left driverless (its unbind landed after the release
+	// gave up on it) still has that build's vfio-pci dynamic ID to answer: dropping
+	// the marker without a reprobe would let the next probe hand the unowned device
+	// to vfio-pci.
+	legacyDriverless := recorded && rec == legacyBind && cur == ""
+	if !stale && hostDriver == "" && !legacyDriverless {
 		if recorded {
 			return h.forget(address)
 		}
@@ -596,7 +623,13 @@ func (h *Host) ReleaseUnbound(address string) error {
 		if err != nil {
 			return err
 		}
-		if final == vfioDriver {
+		if final == vfioDriver && legacyDriverless {
+			// The older build's ID took it: remove that ID and return the device.
+			if final, err = h.releaseFromDynamicID(devPath, address, ""); err != nil {
+				return fmt.Errorf("release %s: %w", address, err)
+			}
+		}
+		if final == vfioDriver && !legacyDriverless {
 			return fmt.Errorf("release %s: a reprobe bound it to vfio-pci (a dynamic vfio-pci ID matches it)", address)
 		}
 		slog.Info("released device's stale vfio state cleared", "address", address, "driver", final)
@@ -605,6 +638,220 @@ func (h *Host) ReleaseUnbound(address string) error {
 		return h.forget(address)
 	}
 	return nil
+}
+
+// ── the bounded vfio-pci unbind ──
+
+// ErrUnbindBlocked is returned for a device whose vfio-pci unbind the kernel is
+// holding (something still has the device open), and for every later call on that
+// device until that write returns. The device is still bound to vfio-pci, so the
+// caller keeps its ownership and retries later.
+var ErrUnbindBlocked = errors.New("vfio-pci unbind blocked: the device is still open")
+
+// ErrDeviceInUse is returned when the unbind is refused up front because a
+// process still holds the device's vfio files open.
+var ErrDeviceInUse = errors.New("device in use")
+
+// IsBlocked reports whether err is a release that something holding the device
+// open stopped (ErrUnbindBlocked or ErrDeviceInUse). A caller releasing several
+// devices stops at the first one: the release is all-or-nothing, and each further
+// device would cost another bounded wait under the caller's locks.
+func IsBlocked(err error) bool {
+	return errors.Is(err, ErrUnbindBlocked) || errors.Is(err, ErrDeviceInUse)
+}
+
+// LogStuckUnbinds logs, at error level, every device whose vfio-pci unbind is
+// still in the kernel, and returns how many there are. The daemon calls it on
+// shutdown: such a write keeps the process from exiting until whatever holds the
+// device open lets go, and without this a stop just hangs unexplained.
+func LogStuckUnbinds() int {
+	stuck := StuckUnbinds()
+	for addr, since := range stuck {
+		slog.Error("a vfio-pci unbind is still blocked in the kernel; this process cannot exit until whatever holds the device open (see dmesg: \"Device is currently in use\") closes it",
+			"address", addr, "since", since.UTC().Format(time.RFC3339), "waiting", time.Since(since).Round(time.Second))
+	}
+	return len(stuck)
+}
+
+// StuckUnbinds returns each device whose vfio-pci unbind is still blocked in the
+// kernel, with when it started. A process with one cannot exit until it returns.
+func StuckUnbinds() map[string]time.Time {
+	inFlightMu.Lock()
+	defer inFlightMu.Unlock()
+	out := make(map[string]time.Time, len(inFlight))
+	for a, t := range inFlight {
+		out[a] = t
+	}
+	return out
+}
+
+var (
+	// unbindTimeout bounds how long a release waits for the kernel to finish a
+	// vfio-pci unbind. vfio-pci's remove waits, uninterruptibly, for every open
+	// device fd to close, so a QEMU that has not exited or any other holder blocks
+	// the write for as long as it holds the fd. A normal unbind takes milliseconds.
+	unbindTimeout = 20 * time.Second
+
+	// inUseGrace is how long the up-front check waits for a holder of the device's
+	// vfio files to let go before it refuses: a QEMU that has just unplugged the
+	// device may still be closing them.
+	inUseGrace = 2 * time.Second
+
+	// procRoot is where the open-fd check looks for processes.
+	procRoot = "/proc"
+)
+
+// SetUnbindTimeout replaces the bounded wait for a vfio-pci unbind (for testing).
+// Returns a restore function.
+func SetUnbindTimeout(d time.Duration) func() {
+	old := unbindTimeout
+	unbindTimeout = d
+	return func() { unbindTimeout = old }
+}
+
+// inFlight is the unbind write still in the kernel for each device, at most one:
+// the write cannot be cancelled, so a timed-out one keeps its goroutine until the
+// kernel returns, and no second write is started behind it.
+var (
+	inFlightMu sync.Mutex
+	inFlight   = map[string]time.Time{} // address → when its stuck write started
+)
+
+// unbindInFlight returns ErrUnbindBlocked while a write to unbind address is still
+// in the kernel.
+func unbindInFlight(address string) error {
+	inFlightMu.Lock()
+	since, ok := inFlight[address]
+	inFlightMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("%w: an unbind of %s from vfio-pci has been blocked in the kernel since %s, so something still holds the device open; it stays bound and owned, retry once the holder exits",
+		ErrUnbindBlocked, address, since.UTC().Format(time.RFC3339))
+}
+
+// unbindFromVFIO writes address to devPath's driver/unbind and waits at most
+// unbindTimeout for the kernel. A write that has not returned by then is left to
+// finish on its own goroutine, holding no lock, and the device is reported
+// ErrUnbindBlocked until it does. The caller holds nothing of this package's
+// across the write: the record's lock is taken only around the record itself.
+func unbindFromVFIO(devPath, address string) error {
+	inFlightMu.Lock()
+	if _, busy := inFlight[address]; busy {
+		inFlightMu.Unlock()
+		return unbindInFlight(address)
+	}
+	started := time.Now()
+	inFlight[address] = started
+	inFlightMu.Unlock()
+
+	timeout := unbindTimeout
+	fsys := sysfs
+	unbindPath := filepath.Join(devPath, "driver", "unbind")
+	done := make(chan error, 1) // buffered: a late write never blocks on the send
+	go func() {
+		err := fsys.WriteFile(unbindPath, []byte(address), 0200)
+		inFlightMu.Lock()
+		delete(inFlight, address)
+		inFlightMu.Unlock()
+		if waited := time.Since(started); waited >= timeout {
+			slog.Warn("a blocked vfio-pci unbind returned", "address", address, "after", waited.Round(time.Millisecond), "error", err)
+		}
+		done <- err
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		slog.Error("vfio-pci unbind is blocked in the kernel; the device stays bound and owned", "address", address, "waited", timeout)
+		return fmt.Errorf("%w: unbind %s from vfio-pci did not return within %s; the kernel waits for every open fd of the device to close (a QEMU that has not exited, or another process); it stays bound and owned, retry once the holder exits",
+			ErrUnbindBlocked, address, timeout)
+	}
+}
+
+// vfioHolder is a process with one of a device's vfio files open.
+type vfioHolder struct {
+	pid  string
+	comm string
+	path string
+}
+
+func (v vfioHolder) String() string {
+	return fmt.Sprintf("pid %s (%s) holds %s", v.pid, v.comm, v.path)
+}
+
+// vfioHolders returns the processes that have devPath's vfio group
+// (/dev/vfio/<group>) or its iommufd cdev (/dev/vfio/devices/vfioN) open. A
+// device fd is only obtained through one of them, and while a device fd is open
+// vfio-pci's remove blocks. What cannot be read is skipped: this check only turns
+// a known hang into a clear refusal, and the bounded write is the backstop.
+func vfioHolders(devPath string) []vfioHolder {
+	want := map[string]bool{}
+	if link, err := sysfs.Readlink(filepath.Join(devPath, "iommu_group")); err == nil {
+		want["/dev/vfio/"+filepath.Base(link)] = true
+	}
+	if entries, err := sysfs.ReadDir(filepath.Join(devPath, "vfio-dev")); err == nil {
+		for _, e := range entries {
+			want["/dev/vfio/devices/"+e.Name()] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	procs, err := sysfs.ReadDir(procRoot)
+	if err != nil {
+		return nil
+	}
+	self := fmt.Sprint(os.Getpid())
+	var holders []vfioHolder
+	for _, p := range procs {
+		pid := p.Name()
+		if pid == "" || strings.Trim(pid, "0123456789") != "" || pid == self {
+			continue
+		}
+		fdDir := filepath.Join(procRoot, pid, "fd")
+		fds, err := sysfs.ReadDir(fdDir)
+		if err != nil {
+			continue // gone, or not ours to read
+		}
+		for _, fd := range fds {
+			target, err := sysfs.Readlink(filepath.Join(fdDir, fd.Name()))
+			if err != nil || !want[target] {
+				continue
+			}
+			comm := readTrimmed(filepath.Join(procRoot, pid, "comm"))
+			if comm == "" {
+				comm = "?"
+			}
+			holders = append(holders, vfioHolder{pid: pid, comm: comm, path: target})
+			break
+		}
+	}
+	return holders
+}
+
+// refuseIfHeld fails while a process has devPath's vfio files open, after giving
+// it inUseGrace to let go, so an unbind that would block is refused up front.
+func refuseIfHeld(devPath, address string) error {
+	deadline := time.Now().Add(inUseGrace)
+	for {
+		holders := vfioHolders(devPath)
+		if len(holders) == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			names := make([]string, len(holders))
+			for i, h := range holders {
+				names[i] = h.String()
+			}
+			return fmt.Errorf("%w: %s: %s; not unbinding it from vfio-pci, which would block until that process lets go; it stays bound and owned, retry once it exits",
+				ErrDeviceInUse, address, strings.Join(names, ", "))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // ── the host-driver record ──
@@ -743,6 +990,12 @@ func currentDriver(devPath string) (string, error) {
 		return "", err
 	}
 	return filepath.Base(link), nil
+}
+
+// CurrentDriver returns the driver the PCI device at address is bound to now,
+// "" when none is.
+func CurrentDriver(address string) (string, error) {
+	return currentDriver(filepath.Join(sysDevices, address))
 }
 
 // IsBoundToVFIO reports whether the PCI device at address is CURRENTLY bound to the

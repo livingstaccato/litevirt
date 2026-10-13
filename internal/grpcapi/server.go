@@ -2335,6 +2335,25 @@ func (s *Server) lockVM(vmName string) func() {
 	return mu.Unlock
 }
 
+// tryLockVM is lockVM without the wait: it returns the unlock function and
+// true when it took the lock, or nil and false when someone else holds it.
+func (s *Server) tryLockVM(vmName string) (func(), bool) {
+	s.vmLocksMu.Lock()
+	if s.vmLocks == nil {
+		s.vmLocks = map[string]*sync.Mutex{}
+	}
+	mu, ok := s.vmLocks[vmName]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.vmLocks[vmName] = mu
+	}
+	s.vmLocksMu.Unlock()
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
 // markBackupActive / clearBackupActive bracket a backup operation so the
 // reconciler (via BackupInProgress) can distinguish a live backup from a stuck
 // "backing-up" state row.

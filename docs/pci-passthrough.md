@@ -39,6 +39,12 @@ echo "vfio-pci" >> /etc/modules-load.d/vfio.conf
   - **IDs that are left alone.** The release never removes an ID listed in your `vfio-pci.ids=`. It never removes the ID of a device that litevirt did not bind either.
 - **Devices that are gone.** A released device no longer present in sysfs, such as a VF that did not come back after a reboot, is released without error.
 - **Paused guests.** A detach refuses a guest that is paused or suspended, because it cannot acknowledge the unplug. The device stays with its VM until a retry once the guest runs.
+- **Devices still open.** The kernel will not let a device leave vfio-pci while any process has it open, such as a QEMU that has not exited. The unbind would block until that process lets go.
+  - **Before the unbind.** The release looks for a process holding the device's `/dev/vfio/<group>` or `/dev/vfio/devices/vfioN`. If one still does after two seconds, the release is refused with the process's pid and name.
+  - **During the unbind.** If the kernel still blocks it, the release gives up after 20 seconds.
+  - **Either way.** The device stays bound and owned by its VM. Until the blocked unbind returns, further operations on that device fail at once instead of waiting behind it. Retry once the holder has exited.
+  - **Stopping the daemon.** A blocked unbind cannot be cancelled, so while one is pending the daemon cannot exit. A stop or restart waits until the holder lets go. On shutdown the daemon logs each such device, and `dmesg` shows the blocked write ("Device is currently in use"). Find the process holding the device with `lsof /dev/vfio/*` or by looking for vfio entries under `/proc/*/fd`, and stop it to let the daemon exit.
+- **Failed SR-IOV attaches.** A failed attach releases every VF it allocated. On an upgraded host, VFs that an older build's failed attach left owned are released at startup and on `lv host rescan`. A VF is only released this way when nothing could still be using it: its VM holds it in neither copy of the domain, has no operation in progress and no PCI intents, and the VF is off vfio-pci. A VM that does not meet these conditions is skipped without a message. A warning, with the `lv detach-pci` command that releases the VF, is logged only for a VF that is in neither copy of the domain but still cannot be released, for example because it is still bound to vfio-pci.
 
 ## Discovering devices
 

@@ -1,9 +1,12 @@
 package grpcapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -98,6 +101,50 @@ func TestReleaseDevices_ClearsAStaleOverrideOnAnUnboundDevice(t *testing.T) {
 	}
 	if o := pciOwnerOf(t, ctx, s, addr); o != "" {
 		t.Fatalf("owner = %q, want released", o)
+	}
+}
+
+// TestReleaseDevices_LogsTheDriverTheDeviceLandedOn (lab note N1): the release's
+// log line printed the inventory's driver as "restored_driver", which after a
+// rescan of a bound device is "vfio-pci", while the device had gone to igbvf. It
+// must name the driver the device is on after the release.
+func TestReleaseDevices_LogsTheDriverTheDeviceLandedOn(t *testing.T) {
+	const addr = "0000:50:00.0"
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	fs.setHostDriver(addr, "igbvf")
+	defer vfio.SetFS(fs)()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, addr, -1)
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Type: "gpu"},
+	}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if err := corrosion.ObservePCIDevice(ctx, s.db, corrosion.PCIDeviceRecord{
+		HostName: "test-host", Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, Driver: "vfio-pci",
+	}); err != nil {
+		t.Fatalf("rescan: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	err := s.releaseDevices(ctx, "vm1")
+	slog.SetDefault(prev)
+	if err != nil {
+		t.Fatalf("releaseDevices: %v", err)
+	}
+	var line string
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(l, `msg="device unbound from vfio-pci"`) && strings.Contains(l, addr) {
+			line = l
+		}
+	}
+	if !strings.Contains(line, "driver=igbvf") {
+		t.Fatalf("release log line = %q, want it to name igbvf, the driver the device is on", line)
 	}
 }
 

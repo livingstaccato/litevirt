@@ -47,6 +47,7 @@ var guarded = map[string]bool{
 	"CommitMigrationOwnership":      true,
 	"InsertImage":                   true,
 	"InsertImageHost":               true,
+	"ReviveImageHost":               true,
 	"UpdateImageHostStatus":         true,
 	"SetContainerState":             true,
 	"SetContainerStateStrict":       true,

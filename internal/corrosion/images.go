@@ -68,6 +68,49 @@ func InsertImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
 	)
 }
 
+// imageHostReviveSQL is InsertImageHost's write as an explicit upsert that
+// clears the row's deleted_at: a host's copy of an image imported again under
+// a deleted image's name. Its insert shape alone leaves a peer's tombstone in
+// place (the peer applies it column-preserving), and anti-entropy then takes
+// the tombstone back to the writer's row (lab 2 F-1): the image lists on no
+// host, no peer pulls it, and placement refuses it.
+//
+// A host on a build before release_2026_11_v1 does not know this shape, and
+// an unknown shape back-pressures the sender's whole stream to it. So it is
+// written only once the release token has durably latched (grpcapi
+// Server.recordImageHost), exactly as the replication compare-and-set is.
+const imageHostReviveSQL = `INSERT INTO image_hosts (image_name, host_name, path, status, pulled_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(image_name, host_name) DO UPDATE SET
+		   path = excluded.path,
+		   status = excluded.status,
+		   pulled_at = excluded.pulled_at,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`
+
+// ReviveImageHost is InsertImageHost over a deleted row: it records that a
+// host has a copy of an image, and clears the row's tombstone on every host
+// that applies it. Only once the release token has latched (see
+// imageHostReviveSQL).
+func ReviveImageHost(ctx context.Context, c *Client, ih ImageHostRecord) error {
+	return c.Execute(ctx, imageHostReviveSQL,
+		ih.ImageName, ih.HostName, ih.Path, ih.Status, ih.PulledAt, c.NowTS(),
+	)
+}
+
+// ImageHostDeleted reports whether host's row for image is here and deleted:
+// the row lv image rm left, which a plain InsertImageHost cannot revive on a
+// peer.
+func ImageHostDeleted(ctx context.Context, c *Client, imageName, hostName string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 1 AS one FROM image_hosts WHERE image_name = ? AND host_name = ? AND deleted_at IS NOT NULL`,
+		imageName, hostName)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
 // UpdateImageHostProgress updates the download progress for a pulling image.
 func UpdateImageHostProgress(ctx context.Context, c *Client, imageName, hostName string, pct float32) error {
 	now := c.NowTS()

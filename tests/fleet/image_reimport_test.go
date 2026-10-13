@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,18 +79,28 @@ func listedImage(t *testing.T, c *Cluster, n *Node, name string) *pb.Image {
 	return nil
 }
 
-// The catalog row comes back on every host through a statement every build
-// applies, and the file is safe.
+// Before the release token latches: the catalog row comes back on every host
+// through a statement every build applies, and the file is safe. This host's
+// image_hosts row is not revived on its peers yet (recordImageHost).
 func TestFleet_ImageReimport_SameNameIsLiveOnEveryHost(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
 	c.WaitConverged(t, convergeTimeout)
-	reimportScenario(t, c)
+	reimportScenario(t, c, false)
+}
+
+// Once the release token has latched, the importing host's copy is listed on
+// every host as well: peers pull it and placement sees it.
+func TestFleet_ImageReimport_HostRecordIsLiveOnEveryHostOnceTheReleaseLatched(t *testing.T) {
+	c, gates := latchedFleet(t, 3, 0)
+	latchReleaseToken(t, c, gates)
+	reimportScenario(t, c, true)
 }
 
 // reimportScenario imports imgr on node-0, removes it with lv image rm,
 // imports it again with other content, lets replication and anti-entropy
-// run, and checks every host.
-func reimportScenario(t *testing.T, c *Cluster) {
+// run, and checks every host. hosts: also check that every host lists
+// node-0 as holding the re-import.
+func reimportScenario(t *testing.T, c *Cluster, hosts bool) {
 	t.Helper()
 	imageRmFleet(c)
 	n0 := c.Nodes[0]
@@ -138,6 +149,9 @@ func reimportScenario(t *testing.T, c *Cluster) {
 		}
 		if img.GetChecksum() != want {
 			t.Errorf("%s lists imgr with checksum %q, want the re-import's %q", n.Name, img.GetChecksum(), want)
+		}
+		if hosts && !slices.Contains(img.GetHosts(), n0.Name) {
+			t.Errorf("%s lists imgr on hosts %v, want %s, which holds the re-import", n.Name, img.GetHosts(), n0.Name)
 		}
 	}
 

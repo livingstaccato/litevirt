@@ -82,7 +82,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 		s.noteStateWriteFail(corrosion.OpImage, err)
 		return status.Errorf(codes.Internal, "record image: %v", err)
 	}
-	if err := corrosion.InsertImageHost(bgCtx, s.db, corrosion.ImageHostRecord{
+	if err := s.recordImageHost(bgCtx, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      s.images.ImagePath(req.Name),
@@ -158,6 +158,35 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	return nil
 }
 
+// recordImageHost writes this host's image_hosts row for a copy it now
+// holds. Over the row lv image rm left here — the image was deleted and is
+// imported, pulled or built again under its name — it writes the reviving
+// form (corrosion.ReviveImageHost), which clears the tombstone on every peer;
+// the plain insert would leave it there, and anti-entropy would delete this
+// host's row again (lab 2 F-1). The reviving form is a statement shape a host
+// before release_2026_11_v1 cannot apply, so until the release token has
+// durably latched here the plain insert is written and the gap logged: the
+// image lists, but the copy's record reads deleted on every host (this one
+// too, once anti-entropy runs) until it is imported again after the upgrade.
+func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostRecord) error {
+	deleted, err := corrosion.ImageHostDeleted(ctx, s.db, ih.ImageName, ih.HostName)
+	if err != nil {
+		return fmt.Errorf("read this host's record of image %q: %w", ih.ImageName, err)
+	}
+	if !deleted {
+		return corrosion.InsertImageHost(ctx, s.db, ih)
+	}
+	if s.ReleaseTokenLatched() {
+		return corrosion.ReviveImageHost(ctx, s.db, ih)
+	}
+	slog.Warn("image: this host's copy of an image imported again under a deleted image's name is recorded, "+
+		"but the record reads deleted on the other hosts, and on this one once anti-entropy runs, until the cluster "+
+		"upgrade finishes (lv cluster upgrade-status): no peer pulls the copy and placement does not see it; "+
+		"import it again after the upgrade",
+		"image", ih.ImageName, "host", ih.HostName)
+	return corrosion.InsertImageHost(ctx, s.db, ih)
+}
+
 // persistImageRecord writes the image and image_host records after a successful pull.
 // The recorded checksum is the published content's own sha256 — what disks
 // built on it now are built on — whether or not the request named one.
@@ -186,7 +215,7 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Publishe
 		return fmt.Errorf("persist image record: %w", err)
 	}
 
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
 		Path:      path,

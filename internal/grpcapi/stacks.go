@@ -2156,7 +2156,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 			s.noteStateWriteFail(corrosion.OpImage, err)
 			return status.Errorf(codes.Internal, "record auto-pulled image %q: %v", img, err)
 		}
-		if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+		if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
 			ImageName: img,
 			HostName:  s.hostName,
 			Path:      pub.Path,

@@ -730,6 +730,14 @@ lv image rm <image>
 #   again) keeps the file. The delete itself is never refused. The REST and
 #   web UI delete (DeleteImage) removes the files the same way, in the
 #   background, and logs each host's outcome.
+#   An import, pull or build under a deleted image's name makes it a live
+#   image again on every host. The host's own record of its copy (the image's
+#   hosts in lv image ls, which peers pull from and placement reads) is
+#   revived on the other hosts only once the cluster upgrade has finished
+#   (lv cluster upgrade-status). Before that the record reads deleted on
+#   every host, this one too once anti-entropy runs, so no peer pulls the
+#   copy and placement does not see it; the import logs this at WARN, and
+#   importing the image again after the upgrade publishes the copy.
 ```
 
 `pull` and `import` accept only standalone images. A qcow2 that names a

@@ -140,7 +140,7 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		s.noteStateWriteFail(corrosion.OpImage, err)
 		return status.Errorf(codes.Internal, "record image: %v", err)
 	}
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
 		ImageName: name,
 		HostName:  s.hostName,
 		Path:      destPath,
@@ -526,7 +526,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		s.noteStateWriteFail(corrosion.OpImage, err)
 		return nil, status.Errorf(codes.Internal, "record image: %v", err)
 	}
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	if err := s.recordImageHost(ctx, corrosion.ImageHostRecord{
 		ImageName: req.ImageName,
 		HostName:  s.hostName,
 		Path:      destPath,

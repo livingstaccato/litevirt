@@ -13,10 +13,12 @@ import (
 // reservation table or renewable lease — a nonterminal operation holds its
 // reservation until it terminates (completed/failed/cancelled/superseded).
 //
-// Deltas are ADDITIVE over committed state (running-VM actuals) so summing running
-// actuals + nonterminal reservations never double-counts: a create/start reserves
-// the FULL VM size (the VM isn't in the running-actuals sum yet); a resize-grow
-// reserves only the POSITIVE delta (the VM's current actuals are already counted).
+// Deltas are ADDITIVE over committed state (the actuals of running and starting
+// VMs, SumVMResourcesByHost) so summing those actuals + nonterminal reservations
+// never double-counts: a create, or a start of a VM counted nowhere (stopped,
+// error, pending), reserves the FULL VM size; a resize-grow, or a grow of a VM in
+// starting, reserves only the POSITIVE delta (the VM's current actuals are
+// already counted).
 // SourceHost capacity is released at COMMIT (migration), so it is not a reserve.
 type ReservationVector struct {
 	Project       string `json:"project,omitempty"`
@@ -501,7 +503,8 @@ func ProjectReserved(ctx context.Context, c *Client, project string) (cpu, memMi
 
 // HostFreeCapacity reports a host's free CPU and memory (MiB): ALLOCATABLE (see
 // HostAllocatable — physical, adjusted by overcommit ratios and host reserves)
-// minus committed running-VM actuals, running-container memory, per-VM qemu
+// minus the committed actuals of running and starting VMs (SumVMResourcesByHost),
+// running-container memory, per-VM qemu
 // overhead, and in-flight nonterminal reservations. Negative values are
 // clamped to 0 (an overcommitted
 // host has no free capacity). Returns ok=false when the host is unknown.

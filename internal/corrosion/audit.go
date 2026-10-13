@@ -652,16 +652,22 @@ func (r AuditVerifyResult) Unverified() bool {
 
 // brokenLinkKind classifies a row that does not link to the walk's running tail
 // by re-hashing it against the prev_hash it STORED. A row that does not hash
-// even against that was edited. One that does was not: it either opens a new
-// chain (an empty stored prev_hash, a fork) or names a predecessor that is not
-// the row before it. The classification only names the break; every kind is
-// still a finding, because a stored prev_hash is as writable as the content.
-func brokenLinkKind(rec AuditRecord, storedPrev, stored string) string {
+// even against that was edited.
+//
+// A row that does hash is called a fork only when it has the whole shape of
+// one: an empty prev_hash AND seq 1 repeating a seq 1 the host already has
+// (repeatsSeq1) — a second genesis, which is what a host rebuilt on an empty
+// database writes. Anything else self-consistent is a broken link. That matters
+// because a stored prev_hash is as writable as the content: an edit to an
+// unsigned row mid-chain that blanks prev_hash and recomputes the hash is
+// self-consistent too, and calling IT a fork would tell the operator the one
+// thing that is false. Every kind is still a finding.
+func brokenLinkKind(rec AuditRecord, storedPrev, stored string, repeatsSeq1 bool) string {
 	rec.PrevHash = storedPrev
 	switch {
 	case !strings.EqualFold(HashAuditRow(rec), stored):
 		return AuditBrokenContent
-	case storedPrev == "":
+	case storedPrev == "" && repeatsSeq1:
 		return AuditBrokenForked
 	default:
 		return AuditBrokenUnlinked
@@ -768,7 +774,9 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		linked := strings.EqualFold(HashAuditRow(rec), stored)
 		if !linked && res.BrokenAt == "" {
 			res.BrokenAt = rec.ID
-			res.BrokenKind = brokenLinkKind(rec, r.String("prev_hash"), stored)
+			last, seen := seqByHost[host]
+			res.BrokenKind = brokenLinkKind(rec, r.String("prev_hash"), stored,
+				r.Int64("seq") == 1 && seen && last == 1)
 		}
 		if run := legacy[host]; run != nil && !linked {
 			run.broken = true

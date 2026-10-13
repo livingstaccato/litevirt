@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,14 +16,17 @@ const (
 	// written.
 	AuditBrokenContent = "content"
 	// AuditBrokenForked: the row hashes correctly against its own stored
-	// prev_hash, and that prev_hash is empty — it is the first row of a second
-	// chain opened under a host name that already had one. A host rebuilt on an
+	// prev_hash, that prev_hash is empty, and it is a second seq 1 for its host
+	// — the first row of a second chain opened under a host name that already
+	// had one. A host rebuilt on an
 	// empty database that appended before its history replicated back writes
 	// exactly this (docs/audit-log.md, "Rebuilding a host under its old name").
 	AuditBrokenForked = "forked"
 	// AuditBrokenUnlinked: the row hashes correctly against its own stored
-	// prev_hash, but that is not the hash of the row before it in the walk — a
-	// row between them was deleted or rewritten, or the chain branched.
+	// prev_hash, but that is not the hash of the row before it in the walk, and
+	// it is not a second genesis — a row between them was deleted or
+	// rewritten, the chain branched, or this row was itself rewritten together
+	// with its prev_hash and hash.
 	AuditBrokenUnlinked = "unlinked"
 )
 
@@ -97,6 +101,8 @@ var timeBoundForms = []struct {
 	{"2006-01-02 15:04:05", nil},
 	{"2006-01-02T15:04", func(t time.Time) time.Time { return t.Add(time.Minute) }},
 	{"2006-01-02 15:04", func(t time.Time) time.Time { return t.Add(time.Minute) }},
+	{"2006-01-02T15", func(t time.Time) time.Time { return t.Add(time.Hour) }},
+	{"2006-01-02 15", func(t time.Time) time.Time { return t.Add(time.Hour) }},
 	{"2006-01-02", func(t time.Time) time.Time { return t.AddDate(0, 0, 1) }},
 	{"2006-01", func(t time.Time) time.Time { return t.AddDate(0, 1, 0) }},
 	{"2006", func(t time.Time) time.Time { return t.AddDate(1, 0, 0) }},
@@ -115,6 +121,15 @@ func parseTimeBound(s string, now time.Time) (first, last time.Time, err error) 
 		}
 		return t, t.Add(fractionUnit(s) - time.Nanosecond), nil
 	}
+	// A bare integer other than a 4-digit year is a Unix time in seconds. "0"
+	// is therefore the beginning: under the text comparison `--since 0` sorted
+	// below every stamp and returned every row, and it still does.
+	if isDigits(s) {
+		if n, nerr := strconv.ParseInt(s, 10, 64); nerr == nil && n <= maxUnixBound {
+			t := time.Unix(n, 0).UTC()
+			return t, t.Add(time.Second - time.Nanosecond), nil
+		}
+	}
 	if d, derr := time.ParseDuration(s); derr == nil {
 		if d < 0 {
 			return first, last, fmt.Errorf("%q is a negative duration; a relative bound is how long AGO, e.g. 24h", s)
@@ -126,12 +141,28 @@ func parseTimeBound(s string, now time.Time) (first, last time.Time, err error) 
 		"(2026-06-01T00:00:00Z, or with an offset), a date (2026-06-01), or a duration ago (24h)", s)
 }
 
+// maxUnixBound is the last Unix second a stamp can carry (9999-12-31T23:59:59Z).
+const maxUnixBound = 253402300799
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // fractionUnit is the smallest step the seconds field of s was written to: one
 // second with no fraction, 100ms for ".5", 1ns for nine digits.
 func fractionUnit(s string) time.Duration {
 	// The seconds field is the 18th-19th byte in every accepted layout with
 	// seconds, so a fraction starts at index 19.
-	if len(s) <= 19 || s[19] != '.' {
+	// time.Parse accepts ',' as the fraction separator as well as '.'.
+	if len(s) <= 19 || (s[19] != '.' && s[19] != ',') {
 		return time.Second
 	}
 	digits := 0
@@ -170,10 +201,34 @@ func (w TimeWindow) Predicate(col string) (string, []any) {
 	}
 	if !w.Until.IsZero() {
 		u := w.Until.UTC()
-		conds = append(conds, fmt.Sprintf("(%s < ? AND %s <= ?)", col, norm))
-		args = append(args, u.Truncate(time.Second).Add(time.Second).Format("2006-01-02T15:04:05"), u.Format(nowTSLayout))
+		if next := u.Truncate(time.Second).Add(time.Second); next.Year() <= 9999 {
+			conds = append(conds, fmt.Sprintf("(%s < ? AND %s <= ?)", col, norm))
+			args = append(args, next.Format("2006-01-02T15:04:05"), u.Format(nowTSLayout))
+		} else {
+			// The second after a bound in the last second of year 9999 is year
+			// 10000, which formats with five digits and sorts as text BELOW
+			// every real stamp — `--until 9999-12-31` would match nothing. No
+			// stamp can lie past it, so the exact part alone is the bound.
+			conds = append(conds, fmt.Sprintf("(%s <= ?)", norm))
+			args = append(args, u.Format(nowTSLayout))
+		}
 	}
 	return strings.Join(conds, " AND "), args
+}
+
+// Bounds renders w as the fixed-width UTC stamps the tables store ("" for an
+// open bound): Since as its first instant, Until as its last. A client sends
+// these instead of what the user typed, so that even a daemon that compares
+// the bound as text — one older than ParseTimeWindow — draws the window in the
+// right place, and a relative bound is resolved once, on the client.
+func (w TimeWindow) Bounds() (since, until string) {
+	if !w.Since.IsZero() {
+		since = w.Since.UTC().Format(nowTSLayout)
+	}
+	if !w.Until.IsZero() {
+		until = w.Until.UTC().Format(nowTSLayout)
+	}
+	return since, until
 }
 
 // normalisedTSExpr is col rewritten to nowTSLayout: a fixed-width stamp as is, a

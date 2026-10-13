@@ -66,6 +66,10 @@ func TestListAuditLog_WindowIsTimeNotText(t *testing.T) {
 		{"since a sub-second instant", "2026-10-03T22:16:30.5Z", "", []string{"w-b", "w-c"}},
 		{"since a date", "2026-10-03", "", []string{"w-a", "w-b", "w-c"}},
 		{"until a date covers the whole day", "", "2026-10-03", []string{"w-a", "w-b", "w-c"}},
+		{"until the end of time matches everything", "", "9999-12-31T23:59:59Z", []string{"w-a", "w-b", "w-c"}},
+		{"until year 9999 matches everything", "", "9999", []string{"w-a", "w-b", "w-c"}},
+		{"since 0 is the beginning", "0", "", []string{"w-a", "w-b", "w-c"}},
+		{"since an hour", "2026-10-03T22", "", []string{"w-a", "w-b", "w-c"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, err := s.ListAuditLog(ctx, &pb.ListAuditLogRequest{Since: tc.since, Until: tc.until, Limit: 50})

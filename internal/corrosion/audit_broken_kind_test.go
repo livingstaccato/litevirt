@@ -70,6 +70,24 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 			f.Detail = "tampered"
 			insertRaw(t, ctx, c, f, 1)
 		}, "fork-1", AuditBrokenContent},
+		// An edit to an unsigned row mid-chain that also blanks prev_hash and
+		// recomputes the hash is self-consistent, like a fork. It is not a
+		// second genesis (seq 2, no repeated seq 1), and it must not be given
+		// the label that says no row was edited.
+		{"a mid-chain row rewritten with its prev_hash blanked", func(t *testing.T, ctx context.Context, c *Client) {
+			rows, err := c.Query(ctx, `SELECT id, timestamp, username, host_name, action, target, detail, result FROM audit_log WHERE id = 'r2'`)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("read r2: %v", err)
+			}
+			r := rows[0]
+			ed := AuditRecord{ID: "r2", Timestamp: r.String("timestamp"), Username: r.String("username"),
+				HostName: r.String("host_name"), Action: r.String("action"), Target: r.String("target"),
+				Detail: "rewritten", Result: r.String("result")}
+			if err := c.Execute(ctx, `UPDATE audit_log SET detail = ?, prev_hash = '', content_hash = ? WHERE id = 'r2'`,
+				ed.Detail, HashAuditRow(ed)); err != nil {
+				t.Fatal(err)
+			}
+		}, "r2", AuditBrokenUnlinked},
 		{"a row missing before it", func(t *testing.T, ctx context.Context, c *Client) {
 			if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id = 'r2'`); err != nil {
 				t.Fatal(err)
@@ -94,6 +112,34 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 			}
 		})
 	}
+
+	// A seq-1 row with an empty prev_hash is a fork only when it REPEATS a seq 1
+	// the host already has. The first numbered row after a host's seq-0 legacy
+	// rows, rewritten with its prev_hash blanked and its hash recomputed, is
+	// seq 1 with an empty prev_hash too, and it is not a second genesis.
+	t.Run("a first numbered row rewritten with its prev_hash blanked", func(t *testing.T) {
+		ctx := context.Background()
+		c := newAuditTestClient(t)
+		prev := ""
+		for i, id := range []string{"legacy-1", "legacy-2"} {
+			r := AuditRecord{ID: id, Timestamp: "2026-09-15T06:39:0" + string(rune('1'+i)) + "Z", Username: "admin",
+				HostName: "node-3", Action: "vm.start", Target: "vm-1", Result: "ok", PrevHash: prev}
+			r.ContentHash = HashAuditRow(r)
+			insertRaw(t, ctx, c, r, 0)
+			prev = r.ContentHash
+		}
+		r1 := AuditRecord{ID: "r1", Timestamp: "2026-10-03T22:16:01.000000000Z", Username: "admin",
+			HostName: "node-3", Action: "vm.start", Target: "vm-1", Detail: "rewritten", Result: "ok"}
+		r1.ContentHash = HashAuditRow(r1) // PrevHash "" where legacy-2's hash belongs
+		insertRaw(t, ctx, c, r1, 1)
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.BrokenAt != "r1" || res.BrokenKind != AuditBrokenUnlinked {
+			t.Errorf("BrokenAt=%q BrokenKind=%q, want r1 / %q", res.BrokenAt, res.BrokenKind, AuditBrokenUnlinked)
+		}
+	})
 
 	t.Run("an intact chain has no kind", func(t *testing.T) {
 		ctx, c := seed(t)

@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auditexport"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func newAuditCmd() *cobra.Command {
@@ -37,6 +39,10 @@ func newAuditLsCmd() *cobra.Command {
 		Use:   "ls",
 		Short: "Show audit log (most recent first)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			since, _, err := resolveTimeBounds(since, "")
+			if err != nil {
+				return err
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.ListAuditLog(ctx, &pb.ListAuditLogRequest{
 					Limit:  limit,
@@ -212,6 +218,23 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
 }
 
+// resolveTimeBounds turns --since/--until as typed into the fixed-width UTC
+// stamps the daemon stores, before anything is sent.
+//
+// The daemon parses bounds itself, but a daemon older than that compares
+// whatever it is sent to its stamps as TEXT. A fixed-width UTC stamp is the one
+// form that comparison gets right, so resolving here makes `--since 24h`, an
+// offset or a date correct against a node not yet upgraded too. It also pins a
+// relative bound to one instant for every page of an export.
+func resolveTimeBounds(since, until string) (string, string, error) {
+	w, err := corrosion.ParseTimeWindow(since, until, time.Now())
+	if err != nil {
+		return "", "", fmt.Errorf("--%w", err)
+	}
+	s, u := w.Bounds()
+	return s, u, nil
+}
+
 // brokenLinkHeading names the first broken link by what the daemon found it to
 // be. Every kind is a finding and fails the command; the heading only stops a
 // forked chain — a row that hashes correctly but opens a second chain for its
@@ -255,6 +278,10 @@ func newAuditExportCmd() *cobra.Command {
 		Use:   "export",
 		Short: "Export the audit log as a WORM-suitable JSON blob",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			since, until, err := resolveTimeBounds(since, until)
+			if err != nil {
+				return err
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				return writeAuditExport(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
 					return c.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{

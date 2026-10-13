@@ -514,7 +514,7 @@ func TestAssignDevices_SingleGPU(t *testing.T) {
 	// Verify device was marked as reserved in pool.
 	reserved := 0
 	for _, d := range pool["node1"] {
-		if d.VMName == "reserved" {
+		if d.VMName == batchReserved {
 			reserved++
 		}
 	}
@@ -714,7 +714,7 @@ func TestAssignDevices_SRIOV_NoPin(t *testing.T) {
 		t.Fatalf("SR-IOV request must not pin a device, got %v", result)
 	}
 	for _, d := range pool["node1"] {
-		if d.VMName == "reserved" {
+		if d.VMName == batchReserved {
 			t.Error("SR-IOV request must not consume/reserve a device from the pool")
 		}
 	}

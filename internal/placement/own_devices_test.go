@@ -1,6 +1,7 @@
 package placement
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -34,6 +35,58 @@ func TestSelectBatch_ReuseDevicesOfFreesOnlyThatVMsDevices(t *testing.T) {
 	res, err = SelectBatch(hosts, nil, ownPool(), nil, nil, time.Time{}, []Request{other})
 	if err != nil || res["web"].Host != "" {
 		t.Fatalf("web reusing its own devices got db's: %+v %v", res["web"], err)
+	}
+}
+
+// The in-batch reservation marker can be no VM's name: an update of a VM
+// named "reserved" must not free a device an earlier request of the batch
+// reserved.
+func TestSelectBatch_TheReservationMarkerIsNoVMName(t *testing.T) {
+	pool := map[string][]corrosion.PCIDeviceRecord{"node-1": {
+		{HostName: "node-1", Address: "0000:41:00.0", Type: "gpu", IOMMUGroup: -1},
+	}}
+	dev := []DeviceRequest{{Address: "0000:41:00.0", Count: 1}}
+	res, err := SelectBatch(labHosts()[:1], nil, pool, nil, nil, time.Time{}, []Request{
+		{VMName: "first", Devices: dev},
+		{VMName: "reserved", ReuseDevicesOf: "reserved", Devices: dev},
+	})
+	if err != nil {
+		t.Fatalf("SelectBatch: %v", err)
+	}
+	if res["first"].Host != "node-1" || res["reserved"].Host != "" {
+		t.Fatalf("first = %+v, reserved = %+v; want only first placed on 0000:41:00.0", res["first"], res["reserved"])
+	}
+}
+
+// Select and ValidatePinned, from the database, free the VM's own assigned
+// GPU to a request with ReuseDevicesOf, refuse it without, and never free
+// another VM's.
+func TestSelectAndValidatePinned_ReuseDevicesOf(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	insertHost(t, db, corrosion.HostRecord{Name: "gpu-node", Address: "10.0.0.1", State: "active", CPUTotal: 32, MemTotal: 65536})
+	insertDevice(t, db, corrosion.PCIDeviceRecord{
+		HostName: "gpu-node", Address: "0000:41:00.0", Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: "db",
+	})
+	req := func(name, reuse string) Request {
+		return Request{VMName: name, ReuseDevicesOf: reuse, Devices: []DeviceRequest{{Address: "0000:41:00.0", Count: 1}}}
+	}
+	for _, c := range []struct {
+		name, reuse string
+		ok          bool
+	}{
+		{"db", "db", true},
+		{"db", "", false},
+		{"web", "web", false},
+	} {
+		host, err := Select(ctx, db, req(c.name, c.reuse))
+		if c.ok != (err == nil && host == "gpu-node") {
+			t.Errorf("Select %s reusing %q: host %q err %v, want ok=%v", c.name, c.reuse, host, err, c.ok)
+		}
+		err = ValidatePinned(ctx, db, req(c.name, c.reuse), "gpu-node")
+		if c.ok != (err == nil) {
+			t.Errorf("ValidatePinned %s reusing %q: err %v, want ok=%v", c.name, c.reuse, err, c.ok)
+		}
 	}
 }
 

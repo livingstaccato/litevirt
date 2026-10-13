@@ -721,6 +721,10 @@ type BatchDevice struct {
 	Address string
 	Vendor  string
 	Device  string
+	// Request is the index, in the placed Request's Devices, of the device
+	// request this assignment was made for. A type request with Count N gets
+	// N assignments with the same index; an SR-IOV request gets none.
+	Request int
 }
 
 // SelectBatch resolves placements for multiple VMs in one pass, working
@@ -860,13 +864,20 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 	return assignDevicesMapped(devPool, nil, host, reqs)
 }
 
+// batchReserved marks a pool entry an earlier request of the batch took. It
+// holds a NUL byte, so it can never be the name of a VM: ReuseDevicesOf frees
+// entries by VM name, and a VM named like the marker would free devices other
+// requests reserved.
+const batchReserved = "\x00batch-reserved"
+
 // assignDevicesMapped is assignDevices with the resource mappings a mapping
 // request resolves through. It follows scoreHostDevicesForHost's precedence
-// (mapping → SR-IOV → type/vendor → exact address), and a mapping or an exact
-// address takes the one device it names: reserved in the pool, so a later
-// request of the same batch cannot be placed onto it as well, and reported as
-// one assignment, so the assignments stay aligned with the non-SR-IOV devices
-// of the spec (deployCreatePlanned pairs them up in order).
+// (mapping → SR-IOV → type/vendor → exact address). A mapping or an exact
+// address takes the one device it names; a type/vendor request takes Count
+// matching free devices. Every device taken is reserved in the pool, so a later
+// request of the same batch cannot be placed onto it as well, and each
+// assignment names the request it was made for (BatchDevice.Request), so a
+// consumer pairs it with that request and never with a neighbour.
 func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mappings map[string]map[string][]string, host string, reqs []DeviceRequest) []BatchDevice {
 	if len(reqs) == 0 {
 		return nil
@@ -875,27 +886,31 @@ func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mapping
 	pool := devPool[host]
 	var assigned []BatchDevice
 
-	takeExact := func(address string) {
+	take := func(i, request int) {
+		assigned = append(assigned, BatchDevice{
+			Type:    pool[i].Type,
+			Address: pool[i].Address,
+			Vendor:  pool[i].VendorName,
+			Device:  pool[i].DeviceName,
+			Request: request,
+		})
+		pool[i].VMName = batchReserved // mark as taken in-memory
+	}
+	takeExact := func(address string, request int) {
 		want, wantOK := pci.CanonicalBDF(address)
 		for i := range pool {
 			got, gotOK := pci.CanonicalBDF(pool[i].Address)
 			if (wantOK && gotOK && got == want) || (!wantOK && pool[i].Address == address) {
-				assigned = append(assigned, BatchDevice{
-					Type:    pool[i].Type,
-					Address: pool[i].Address,
-					Vendor:  pool[i].VendorName,
-					Device:  pool[i].DeviceName,
-				})
-				pool[i].VMName = "reserved" // mark as taken in-memory
+				take(i, request)
 				return
 			}
 		}
 	}
 
-	for _, req := range reqs {
+	for ri, req := range reqs {
 		if req.Mapping != "" {
 			if addresses := mappings[req.Mapping][host]; len(addresses) > 0 {
-				takeExact(addresses[0])
+				takeExact(addresses[0], ri)
 			}
 			continue
 		}
@@ -909,7 +924,7 @@ func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mapping
 
 		if req.Type == "" && req.Vendor == "" {
 			if req.Address != "" {
-				takeExact(req.Address)
+				takeExact(req.Address, ri)
 			}
 			continue
 		}
@@ -919,14 +934,20 @@ func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mapping
 			count = 1
 		}
 
-		// Filter by type and unassigned.
+		// Free devices this type/vendor request matches, as scoring matched
+		// them: an empty type with a vendor matches every type.
 		var typed []corrosion.PCIDeviceRecord
 		for _, d := range pool {
-			if d.Type == req.Type && d.VMName == "" {
-				if req.Vendor == "" || d.VendorID == req.Vendor || d.VendorName == req.Vendor {
-					typed = append(typed, d)
-				}
+			if d.VMName != "" || (req.Type != "" && d.Type != req.Type) {
+				continue
 			}
+			if req.Vendor != "" && d.VendorID != req.Vendor && d.VendorName != req.Vendor {
+				continue
+			}
+			if req.Model != "" && d.DeviceName != req.Model {
+				continue
+			}
+			typed = append(typed, d)
 		}
 
 		// Use topology scoring to pick best devices.
@@ -948,14 +969,8 @@ func assignDevicesMapped(devPool map[string][]corrosion.PCIDeviceRecord, mapping
 			taken[addr] = true
 		}
 		for i := range pool {
-			if taken[pool[i].Address] {
-				assigned = append(assigned, BatchDevice{
-					Type:    pool[i].Type,
-					Address: pool[i].Address,
-					Vendor:  pool[i].VendorName,
-					Device:  pool[i].DeviceName,
-				})
-				pool[i].VMName = "reserved" // mark as taken in-memory
+			if taken[pool[i].Address] && pool[i].VMName == "" {
+				take(i, ri)
 			}
 		}
 	}

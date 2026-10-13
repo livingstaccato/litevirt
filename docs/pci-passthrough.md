@@ -297,6 +297,14 @@ Mappings are CRDT-replicated (the `resource_mappings` table), so every daemon an
 `/resource-mappings` UI page see a consistent view. Placement/migration eligibility
 checks that a candidate host has a device registered under each mapping the VM needs.
 
+On a host with more than one device under a mapping, the mapping resolves to
+its **lowest** address there, and that device must be free. A VM keeps the
+device it took when it was created: an update applied to the running VM (a
+live change, or a reconfigure and restart) does not resolve its mapping again.
+A recreate does, so after adding a lower address that another VM holds, a
+recreate on that host is refused, before anything is deleted, until the
+mapping is changed back or the device is freed.
+
 Every mapping change goes through the daemon, which checks `resourcemap.write` at
 `/` and writes one signed audit row naming the caller, the mapping, and the state
 before and after:

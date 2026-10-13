@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,6 +123,27 @@ type consoleSessions struct {
 	refusals map[string]*refusalWindow    // per actor
 	stopping bool                         // the daemon is stopping (MarkConsoleShutdown)
 	flushed  bool                         // FlushConsoleAudit ran: write nothing more
+	// inflight counts the rows decided on and not yet written. A row is
+	// decided under mu (claimLocked) and released after its write, so the
+	// flush can wait for every row a handler already took on — a close
+	// being written by its own handler is not in live any more.
+	inflight int
+}
+
+// claimLocked takes on one row to write; false once the flush is over.
+// reg.mu is held. Every true must be followed by release after the write.
+func (reg *consoleSessions) claimLocked() bool {
+	if reg.flushed {
+		return false
+	}
+	reg.inflight++
+	return true
+}
+
+func (reg *consoleSessions) release() {
+	reg.mu.Lock()
+	reg.inflight--
+	reg.mu.Unlock()
 }
 
 // consoleSession is one audited console session.
@@ -153,7 +175,10 @@ type refusalWindow struct {
 	written    int
 	seen       map[string]bool // refusals written in this window
 	suppressed int
-	denied     int // of the suppressed
+	denied     int             // of the suppressed
+	kinds      map[string]bool // of the suppressed
+	vms        map[string]bool // of the suppressed, at most consoleSuppressedListMax
+	moreVMs    bool
 	timer      *time.Timer
 }
 
@@ -294,12 +319,13 @@ func (a *consoleAudit) accept(stream grpc.ServerStream) {
 		}
 		reg.live[sess] = struct{}{}
 	}
-	flushed := reg.flushed
+	claimed := first && reg.claimLocked()
 	reg.mu.Unlock()
 
 	if first {
-		if !flushed {
+		if claimed {
 			a.s.writeConsoleAudit(sess.ctx, sess.actor, "vm.console.open", sess.vm, sess.base+" session="+sess.id, "ok")
+			reg.release()
 		}
 		close(sess.written)
 	}
@@ -358,9 +384,10 @@ func (a *consoleAudit) end(err error) {
 	sess.lastEnd = time.Now()
 	if sess.endClass == "" {
 		switch {
-		case reg.stopping:
-			sess.endClass = consoleEndedDaemonStop
 		case err == nil || status.Code(err) == codes.Canceled:
+			if reg.stopping {
+				sess.endClass = consoleEndedDaemonStop
+			}
 		case streamCutCause(a.ctx) != nil:
 			// This host's own watcher cut the caller's credential: the
 			// session ran and was ended on purpose.
@@ -392,8 +419,7 @@ func (reg *consoleSessions) settleLocked(sess *consoleSession) func() {
 		return nil
 	}
 	if sess.key == "" {
-		reg.closeLocked(sess)
-		return sess.writeClose
+		return reg.closeAndClaimLocked(sess)
 	}
 	var t *time.Timer
 	t = time.AfterFunc(consoleSessionLinger, func() {
@@ -402,12 +428,28 @@ func (reg *consoleSessions) settleLocked(sess *consoleSession) func() {
 			reg.mu.Unlock()
 			return // a channel joined in the meantime
 		}
-		reg.closeLocked(sess)
+		finish := reg.closeAndClaimLocked(sess)
 		reg.mu.Unlock()
-		sess.writeClose()
+		if finish != nil {
+			finish()
+		}
 	})
 	sess.timer = t
 	return nil
+}
+
+// closeAndClaimLocked takes sess out of the registry and claims its close
+// row; the returned func writes it, after reg.mu is released (nil once the
+// flush is over: the flush wrote it, or the database is closing).
+func (reg *consoleSessions) closeAndClaimLocked(sess *consoleSession) func() {
+	reg.closeLocked(sess)
+	if !reg.claimLocked() {
+		return nil
+	}
+	return func() {
+		sess.writeClose(sess.ctx)
+		reg.release()
+	}
 }
 
 // closeLocked takes sess out of the registry; its close row is the caller's
@@ -426,8 +468,15 @@ func (reg *consoleSessions) closeLocked(sess *consoleSession) {
 
 // writeClose writes the session's close row. Its fields no longer change:
 // the session has left the registry.
-func (sess *consoleSession) writeClose() {
-	<-sess.written
+func (sess *consoleSession) writeClose(ctx context.Context) {
+	if consoleCloseWriteHook != nil {
+		consoleCloseWriteHook()
+	}
+	select {
+	case <-sess.written:
+	case <-ctx.Done():
+		return // the flush's deadline passed while the open row was still being written
+	}
 	result, ended := "ok", consoleEndedClosed
 	switch sess.endClass {
 	case consoleEndedDaemonStop:
@@ -442,7 +491,7 @@ func (sess *consoleSession) writeClose() {
 		d += " channels=" + strconv.Itoa(sess.channels)
 	}
 	d += " ended=" + auditValue(boundAuditValue(ended, consoleAuditMaxReason))
-	sess.s.writeConsoleAudit(sess.ctx, sess.actor, "vm.console.close", sess.vm, d, result)
+	sess.s.writeConsoleAudit(ctx, sess.actor, "vm.console.close", sess.vm, d, result)
 }
 
 // refused writes the row for a stream that was never accepted.
@@ -464,15 +513,14 @@ func (s *Server) refusalRow(ctx context.Context, actor, action, kind, vm, detail
 	if status.Code(err) == codes.Canceled {
 		reason = "aborted by the client"
 	}
+	// Bounded before anything keeps them: the row, and the window's memory.
+	vm = boundAuditValue(vm, consoleAuditMaxTarget)
 	reg := &s.consoleSessions
 	reg.mu.Lock()
 	if reg.stopping && status.Code(err) == codes.Canceled {
 		reason = consoleEndedDaemonStop
 	}
-	if reg.flushed {
-		reg.mu.Unlock()
-		return
-	}
+	reason = boundAuditValue(reason, consoleAuditMaxReason)
 	w := reg.refusals[actor]
 	if w == nil {
 		if reg.refusals == nil {
@@ -480,27 +528,49 @@ func (s *Server) refusalRow(ctx context.Context, actor, action, kind, vm, detail
 		}
 		w = &refusalWindow{start: time.Now(), seen: map[string]bool{}}
 		reg.refusals[actor] = w
-		w.timer = time.AfterFunc(consoleRefusalWindow, func() { s.endRefusalWindow(context.Background(), actor, w) })
+		w.timer = time.AfterFunc(consoleRefusalWindow, func() { s.endRefusalWindow(actor, w) })
 	}
 	sig := strings.Join([]string{action, kind, vm, result, reason}, "\x00")
 	if w.seen[sig] || w.written >= consoleRefusalBurst {
-		w.suppressed++
-		if result == "denied" {
-			w.denied++
-		}
+		w.suppress(kind, vm, result)
+		reg.mu.Unlock()
+		return
+	}
+	if !reg.claimLocked() {
 		reg.mu.Unlock()
 		return
 	}
 	w.seen[sig] = true
 	w.written++
 	reg.mu.Unlock()
-	s.writeConsoleAudit(context.WithoutCancel(ctx), actor, action, boundAuditValue(vm, consoleAuditMaxTarget),
-		detail+" reason="+auditValue(boundAuditValue(reason, consoleAuditMaxReason)), result)
+	s.writeConsoleAudit(context.WithoutCancel(ctx), actor, action, vm, detail+" reason="+auditValue(reason), result)
+	reg.release()
+}
+
+// consoleSuppressedListMax bounds the kinds and VMs a summary row names.
+const consoleSuppressedListMax = 5
+
+// suppress counts a refusal held back, keeping a few of the kinds and VMs it
+// was for, for the summary.
+func (w *refusalWindow) suppress(kind, vm, result string) {
+	w.suppressed++
+	if result == "denied" {
+		w.denied++
+	}
+	if w.kinds == nil {
+		w.kinds, w.vms = map[string]bool{}, map[string]bool{}
+	}
+	w.kinds[kind] = true
+	if len(w.vms) < consoleSuppressedListMax {
+		w.vms[boundAuditValue(vm, consoleAuditMaxID)] = true
+	} else if !w.vms[boundAuditValue(vm, consoleAuditMaxID)] {
+		w.moreVMs = true
+	}
 }
 
 // endRefusalWindow closes actor's refusal window w and writes its summary
 // row when it held anything back.
-func (s *Server) endRefusalWindow(ctx context.Context, actor string, w *refusalWindow) {
+func (s *Server) endRefusalWindow(actor string, w *refusalWindow) {
 	reg := &s.consoleSessions
 	reg.mu.Lock()
 	if reg.refusals[actor] != w {
@@ -508,29 +578,42 @@ func (s *Server) endRefusalWindow(ctx context.Context, actor string, w *refusalW
 		return
 	}
 	delete(reg.refusals, actor)
-	flushed := reg.flushed
+	claimed := w.suppressed > 0 && reg.claimLocked()
 	reg.mu.Unlock()
-	if !flushed {
-		s.writeRefusalSummary(ctx, actor, w)
+	if claimed {
+		s.writeRefusalSummary(context.Background(), actor, w)
+		reg.release()
 	}
 }
 
+// writeRefusalSummary writes window w's vm.console.suppressed row. Its target
+// is empty (it may cover several VMs): it names up to five of them.
 func (s *Server) writeRefusalSummary(ctx context.Context, actor string, w *refusalWindow) {
-	if w.suppressed == 0 {
-		return
-	}
 	result := "error"
 	if w.denied > 0 {
 		result = "denied"
 	}
-	d := fmt.Sprintf("suppressed=%d denied=%d error=%d since=%s window=%s", w.suppressed, w.denied,
-		w.suppressed-w.denied, w.start.UTC().Format(time.RFC3339), consoleRefusalWindow)
-	s.writeConsoleAudit(context.WithoutCancel(ctx), actor, "vm.console.suppressed", "", d, result)
+	kinds, vms := joinSortedKeys(w.kinds), joinSortedKeys(w.vms)
+	if w.moreVMs {
+		vms += ",…"
+	}
+	d := fmt.Sprintf("suppressed=%d denied=%d error=%d since=%s window=%s kinds=%s vms=%s", w.suppressed, w.denied,
+		w.suppressed-w.denied, w.start.UTC().Format(time.RFC3339), consoleRefusalWindow, auditValue(kinds), auditValue(vms))
+	s.writeConsoleAudit(ctx, actor, "vm.console.suppressed", "", d, result)
+}
+
+func joinSortedKeys(m map[string]bool) string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }
 
 // MarkConsoleShutdown tells console auditing the daemon is stopping: a
-// session that ends from now on ended because of the stop, not its client.
-// Call it before stopping the gRPC server.
+// session that ends from now on without an error ended because of the stop,
+// not its client. Call it before stopping the gRPC server.
 func (s *Server) MarkConsoleShutdown() {
 	reg := &s.consoleSessions
 	reg.mu.Lock()
@@ -538,16 +621,29 @@ func (s *Server) MarkConsoleShutdown() {
 	reg.mu.Unlock()
 }
 
+// consoleFlushTimeout bounds FlushConsoleAudit as a whole — its own writes and
+// its wait for the rows handlers are writing — so a stalled database cannot
+// hold the rest of the shutdown. A variable for the tests.
+var consoleFlushTimeout = 3 * time.Second
+
+// consoleCloseWriteHook, when set, runs before every close row is written
+// (tests only: it holds a handler mid-close).
+var consoleCloseWriteHook func()
+
 // FlushConsoleAudit writes, before the database closes, the close row of
 // every session still open or lingering (ended=daemon-stop for one that was
-// still running) and every pending refusal summary. Nothing is written after
-// it. Call it after the gRPC server has stopped and before the database
-// closes.
+// still running) and every pending refusal summary, and waits for every row
+// a handler had already taken on — the close of a session its handler ended
+// during the stop is that handler's to write, exactly once. Nothing is
+// written after it. It returns within consoleFlushTimeout. Call it after the
+// gRPC server has stopped and before the database closes.
 func (s *Server) FlushConsoleAudit() {
+	ctx, cancel := context.WithTimeout(context.Background(), consoleFlushTimeout)
+	defer cancel()
 	reg := &s.consoleSessions
 	reg.mu.Lock()
 	reg.stopping = true
-	var closes []*consoleSession
+	var writes []func()
 	for sess := range reg.live {
 		if sess.active > 0 {
 			// Still running: the stop ended it, whatever its handler later says.
@@ -557,31 +653,44 @@ func (s *Server) FlushConsoleAudit() {
 			}
 		}
 		reg.closeLocked(sess)
-		closes = append(closes, sess)
+		if reg.claimLocked() {
+			sess := sess
+			writes = append(writes, func() { sess.writeClose(ctx); reg.release() })
+		}
 	}
-	type summary struct {
-		actor string
-		w     *refusalWindow
-	}
-	var sums []summary
 	for actor, w := range reg.refusals {
 		if w.timer != nil {
 			w.timer.Stop()
 		}
-		sums = append(sums, summary{actor, w})
+		if w.suppressed > 0 && reg.claimLocked() {
+			actor, w := actor, w
+			writes = append(writes, func() { s.writeRefusalSummary(ctx, actor, w); reg.release() })
+		}
 	}
 	reg.refusals = nil
 	reg.mu.Unlock()
 
-	for _, sess := range closes {
-		sess.writeClose()
+	for _, write := range writes {
+		write()
 	}
-	for _, sm := range sums {
-		s.writeRefusalSummary(context.Background(), sm.actor, sm.w)
+	// Then every row a handler (or a timer) took on before this point.
+	for {
+		reg.mu.Lock()
+		if reg.inflight == 0 || ctx.Err() != nil {
+			if reg.inflight > 0 {
+				slog.Warn("console audit flush timed out; rows still being written may be lost",
+					"rows", reg.inflight, "timeout", consoleFlushTimeout)
+			}
+			reg.flushed = true
+			reg.mu.Unlock()
+			return
+		}
+		reg.mu.Unlock()
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
-	reg.mu.Lock()
-	reg.flushed = true
-	reg.mu.Unlock()
 }
 
 // auditConsoleCredential writes GetSpiceInfo's row. request is the id this
@@ -597,25 +706,23 @@ func (s *Server) auditConsoleCredential(ctx context.Context, vm, owner, request 
 		s.refusalRow(ctx, a.actor, "vm.console.credential", consoleKindSPICE, vm, d, err)
 		return
 	}
-	d += " password=" + map[bool]string{true: "yes", false: "no"}[password]
-	s.writeConsoleAudit(context.WithoutCancel(ctx), a.actor, "vm.console.credential", boundAuditValue(vm, consoleAuditMaxTarget), d, "ok")
-}
-
-func (s *Server) writeConsoleAudit(ctx context.Context, actor, action, vm, detail, result string) {
-	if s.consoleAuditFlushed() {
-		slog.Debug("console audit row after the flush, not written", "action", action, "vm", vm)
+	reg := &s.consoleSessions
+	reg.mu.Lock()
+	claimed := reg.claimLocked()
+	reg.mu.Unlock()
+	if !claimed {
 		return
 	}
+	d += " password=" + map[bool]string{true: "yes", false: "no"}[password]
+	s.writeConsoleAudit(context.WithoutCancel(ctx), a.actor, "vm.console.credential", boundAuditValue(vm, consoleAuditMaxTarget), d, "ok")
+	reg.release()
+}
+
+// writeConsoleAudit writes one row the caller has claimed (claimLocked).
+func (s *Server) writeConsoleAudit(ctx context.Context, actor, action, vm, detail, result string) {
 	ctx, cancel := context.WithTimeout(ctx, consoleAuditWriteTimeout)
 	defer cancel()
 	s.auditAs(ctx, actor, action, vm, detail, result)
-}
-
-func (s *Server) consoleAuditFlushed() bool {
-	reg := &s.consoleSessions
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	return reg.flushed
 }
 
 // boundAuditValue is v cut to at most max bytes (never inside a rune), with

@@ -526,7 +526,8 @@ func TestConsoleAudit_DaemonStopClosesEverySession(t *testing.T) {
 func TestConsoleAudit_RefusalsAreBoundedPerCaller(t *testing.T) {
 	s := consoleAuditServer(t)
 	oldW, oldB := consoleRefusalWindow, consoleRefusalBurst
-	consoleRefusalWindow, consoleRefusalBurst = 500*time.Millisecond, 3
+	// A window that never ends on its own: the test ends it (no timing).
+	consoleRefusalWindow, consoleRefusalBurst = time.Hour, 3
 	t.Cleanup(func() { consoleRefusalWindow, consoleRefusalBurst = oldW, oldB })
 
 	refuse := func(name string) {
@@ -538,7 +539,7 @@ func TestConsoleAudit_RefusalsAreBoundedPerCaller(t *testing.T) {
 		}
 	}
 	for i := 0; i < 8; i++ {
-		refuse(strings.Repeat("x", 100<<10) + strconv.Itoa(i))
+		refuse(strconv.Itoa(i) + strings.Repeat("x", 100<<10)) // distinct within the kept prefix
 	}
 	rows := consoleAuditRows(t, s)
 	if len(rows) != 3 {
@@ -549,12 +550,82 @@ func TestConsoleAudit_RefusalsAreBoundedPerCaller(t *testing.T) {
 			t.Fatalf("a refusal row is not bounded: target %d bytes, detail %d bytes", len(r.target), len(r.detail))
 		}
 	}
-	sum := waitRows(t, s, "no summary row", func(r []consoleAuditRow) bool { return len(r) == 4 })[3]
-	if sum.action != "vm.console.suppressed" || sum.user != "vic" || sum.result != "denied" || auditField(sum.detail, "suppressed") != "5" {
+	s.consoleSessions.mu.Lock()
+	w := s.consoleSessions.refusals["vic"]
+	s.consoleSessions.mu.Unlock()
+	if w == nil {
+		t.Fatal("no refusal window for vic")
+	}
+	w.timer.Stop()
+	s.endRefusalWindow("vic", w)
+	rows = consoleAuditRows(t, s)
+	if len(rows) != 4 {
+		t.Fatalf("no summary row: %+v", rows)
+	}
+	sum := rows[3]
+	if sum.action != "vm.console.suppressed" || sum.user != "vic" || sum.result != "denied" ||
+		auditField(sum.detail, "suppressed") != "5" || auditField(sum.detail, "kinds") != "vnc" ||
+		!strings.Contains(auditField(sum.detail, "vms"), "bytes)") || len(sum.detail) > 1024 {
 		t.Fatalf("summary row = %+v", sum)
 	}
 	refuse("again")
 	if rows := consoleAuditRows(t, s); len(rows) != 5 || rows[4].target != "again" {
 		t.Fatalf("the first refusal of a new window was not written: %+v", rows)
+	}
+}
+
+// The flush waits for a close row its handler is already writing: a session
+// whose handler is mid-close when the stop begins has exactly one close row
+// when FlushConsoleAudit returns, and nothing is written after it.
+//
+// Mutation "the flush does not wait for rows in flight" — red.
+func TestConsoleAudit_FlushWaitsForACloseItsHandlerIsWriting(t *testing.T) {
+	s := consoleAuditServer(t)
+	alice := boundAtCtx(t, s, "alice", "operator", "Operator", "/projects/acme")
+	_, end := openConsole(t, s, alice, "vnc")
+	entered := make(chan struct{})
+	var once sync.Once
+	consoleCloseWriteHook = func() {
+		once.Do(func() {
+			close(entered)
+			time.Sleep(300 * time.Millisecond) // the handler is mid-close
+		})
+	}
+	t.Cleanup(func() { consoleCloseWriteHook = nil })
+
+	s.MarkConsoleShutdown()
+	ended := make(chan error, 1)
+	go func() { ended <- end() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never began its close row")
+	}
+	s.FlushConsoleAudit()
+	closes := rowsWith(consoleAuditRows(t, s), "vm.console.close", "vnc")
+	if len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {
+		t.Fatalf("close rows when the flush returned = %+v, want exactly one, ended=daemon-stop", closes)
+	}
+	<-ended
+	time.Sleep(200 * time.Millisecond)
+	if n := len(rowsWith(consoleAuditRows(t, s), "vm.console.close", "vnc")); n != 1 {
+		t.Fatalf("%d close rows after the flush, want still 1", n)
+	}
+}
+
+// During the stop, a session that ends with an error keeps its error: only a
+// plain or cancelled end reads as daemon-stop.
+//
+// Mutation "stopping outranks the error" — red.
+func TestConsoleAudit_AnErrorDuringTheStopStaysAnError(t *testing.T) {
+	s := consoleAuditServer(t)
+	a := s.beginConsoleAudit(userCtx("alice", "admin"), consoleKindSerial, "desk")
+	a.setOwner(s.hostName)
+	a.accept(nil)
+	s.MarkConsoleShutdown()
+	a.end(status.Error(codes.Internal, "console error: boom"))
+	c := rowsWith(consoleAuditRows(t, s), "vm.console.close", "serial")
+	if len(c) != 1 || c[0].result != "error" || auditField(c[0].detail, "ended") != "console error: boom" {
+		t.Fatalf("close rows = %+v, want one error row ended=\"console error: boom\"", c)
 	}
 }

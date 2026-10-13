@@ -1999,31 +1999,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("shutdown requested by uninstall")
 			uninstalled = true
 		}
-		// A console session the stop ends is recorded as ended by the stop,
-		// not by its client (docs/audit-log.md "Console sessions").
-		svc.MarkConsoleShutdown()
-		done := make(chan struct{})
-		go func() {
-			d.grpcSrv.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			slog.Warn("graceful shutdown timed out, forcing stop")
-			d.grpcSrv.Stop()
-		}
-		// A vfio-pci unbind still blocked in the kernel keeps this process alive
-		// past every step below; name the devices so an operator knows which
-		// holder to stop.
-		vfio.LogStuckUnbinds()
-		// A drain returns before its failback records are written, and this
-		// is the host it drained: give them a moment to land while the
-		// replicator still runs, and name every VM whose record is lost.
-		svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
-		// Every console session still open, or waiting out its SPICE linger,
-		// gets its close row now, while the database is still open.
-		svc.FlushConsoleAudit()
+		stopServing(d.grpcSrv, svc, gracefulStopWait, func() {
+			// A vfio-pci unbind still blocked in the kernel keeps this process alive
+			// past every step below; name the devices so an operator knows which
+			// holder to stop.
+			vfio.LogStuckUnbinds()
+			// A drain returns before its failback records are written, and this
+			// is the host it drained: give them a moment to land while the
+			// replicator still runs, and name every VM whose record is lost.
+			svc.FinishDrainRecords(grpcapi.DrainRecordStopWait)
+		})
 		if d.fwReconciler != nil {
 			d.fwReconciler.Stop()
 		}

@@ -256,15 +256,28 @@ Every refusal row is replicated and signed, so they are bounded per caller:
 - in each minute, a caller gets at most 10 refusal rows, and one per distinct
   (console, VM, result, reason) — a SPICE client's refused channels are one row;
 - what is held back is counted, and the minute ends with one
-  `vm.console.suppressed` row: `suppressed=N denied=N error=N since=<time>`.
+  `vm.console.suppressed` row:
+  `suppressed=N denied=N error=N since=<time> window=1m0s kinds=<kinds> vms=<up to five>`
+  (a trailing `…` when there were more VMs). Its target is empty, because it
+  can cover several VMs, so look for it by user (`lv audit ls --user <user>
+  --action vm.console.suppressed`), not by target.
 
 The first refusal in every minute is always written. Sessions that ran are
-never held back.
+never held back. On the VM's host, every caller relayed by one entry host
+without forwarded identity is the one actor `peer:<entry host>`, so they
+share that budget there; the entry host still writes each user's own rows
+under its own budget, so nothing is lost cluster-wide.
 
 **Stopping the daemon.** A graceful stop writes the close row of every session
 still open, `ended=daemon-stop`, and of every SPICE session waiting out its
-linger, before the database closes. A crash leaves the open row without a
-close row.
+linger, and waits for the close rows of the sessions the stop ended, before
+the database closes. Each session gets exactly one close row. The stop marks
+the console audit before it stops serving, so a session that ends in that
+window (up to 5 seconds, while the daemon lets RPCs finish) without an error
+also reads `ended=daemon-stop`; one that ends with an error keeps it. The
+flush is bounded at 3 seconds: past that, against a stalled database, rows
+still being written are logged as lost rather than holding up the rest of the
+shutdown. A crash leaves the open row without a close row.
 
 **Writes.** A row that cannot be written (the database failing, its 10-second
 bound) is logged and the session goes on: audit writes here degrade rather than
@@ -277,7 +290,12 @@ writes no console rows. When it is the host the caller entered on, the VM's
 host on this release still records the session, under `peer:<that host>` and
 without `entry_session` — and, without forwarded identity, it cannot tell two
 users' SPICE channels relayed by that host apart, so concurrent ones are one
-session there until the entry host is upgraded.
+session there until the entry host is upgraded. Through a VM host on an older
+build, which sends no accept header, the entry host records a relayed session
+from the VM host's first byte; a serial console that never wrote a byte is
+then recorded, when the client cancels, as `vm.console.open error
+reason="aborted by the client"`, and when it closes cleanly, as an open row
+stamped at its end with a duration near zero.
 
 ## Verifying
 

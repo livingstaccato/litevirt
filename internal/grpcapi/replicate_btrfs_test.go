@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Native btrfs send/receive in ReplicateVolume, restored with the safety the
@@ -88,6 +89,16 @@ exit 0
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	// The pools' directories are on whatever the test host has: the kernel
+	// says btrfs for them (storage's btrfs Prepare reads the statfs type),
+	// with each filesystem's own fsid.
+	t.Cleanup(storage.OverrideStatfsForTest(func(p string) (uint32, string, error) {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(p, &st); err != nil {
+			return 0, "", err
+		}
+		return 0x9123683E, fmt.Sprintf("%08x%08x", uint32(st.Fsid.X__val[0]), uint32(st.Fsid.X__val[1])), nil
+	}))
 	return logPath, subvols
 }
 

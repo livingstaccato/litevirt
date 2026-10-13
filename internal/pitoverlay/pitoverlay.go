@@ -185,8 +185,32 @@ var ErrLoneBinding = errors.New("a binding with no overlay beside it")
 //     a later window made (re-review 1 of the pit-restore branch, I-1).
 //   - The token cannot be read (no user xattrs here, or any other error):
 //     windows cannot be told apart, and nothing counts.
-func SetAsideEvidence(disk string) bool {
-	m, err := filepath.Glob(Path(disk) + ".orphan-*")
+func SetAsideEvidence(disk string) bool { return setAsideEvidenceWith(glob, disk) }
+
+// SetAsideEvidenceBounded is SetAsideEvidence under storage.Bounded: a disk
+// on a network filesystem whose server does not answer gets the
+// *storage.FSNoAnswerError (storage.IsFSNoAnswer), never false. The look
+// lists the disk's directory, which a hard NFS mount answers only from its
+// server, even where a stat of the disk is answered from the attribute cache.
+func SetAsideEvidenceBounded(disk string) (bool, error) {
+	g := glob // read here: the call below may outlive its caller
+	return storage.Bounded("look for set-aside point-in-time overlays of", disk, func() (bool, error) {
+		return setAsideEvidenceWith(g, disk), nil
+	})
+}
+
+// glob is filepath.Glob; a test makes it block.
+var glob = filepath.Glob
+
+// SetGlobForTest makes SetAsideEvidence list with f, and returns the restore.
+func SetGlobForTest(f func(string) ([]string, error)) (restore func()) {
+	prev := glob
+	glob = f
+	return func() { glob = prev }
+}
+
+func setAsideEvidenceWith(glob func(string) ([]string, error), disk string) bool {
+	m, err := glob(Path(disk) + ".orphan-*")
 	if err != nil {
 		return false
 	}

@@ -51,11 +51,15 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 	fork := corrosion.AuditVerifyResult{
 		RowsChecked: 6, BrokenAt: "fork-1", BrokenKind: corrosion.AuditBrokenForked,
 		SeqGaps:       []string{"node-3: row fork-1 repeats seq 1 (duplicate: two rows claim the same position, a forked chain)"},
-		SeqDuplicates: 1,
+		SeqDuplicates: 1, ForkedHosts: []string{"node-3"},
 	}
-	edited := corrosion.AuditVerifyResult{RowsChecked: 6, BrokenAt: "r2", BrokenKind: corrosion.AuditBrokenContent}
+	edited := corrosion.AuditVerifyResult{RowsChecked: 6, BrokenAt: "r2", BrokenKind: corrosion.AuditBrokenContent, ContentBreaks: 1}
 	forkAndDeletion := fork
 	forkAndDeletion.SeqGaps = append([]string{"node-3: row r5 has seq 5 after 3"}, fork.SeqGaps...)
+	// Review I-2: the first break is the fork on node-3; an edited row on
+	// node-4 comes later in the walk.
+	forkAndEdit := fork
+	forkAndEdit.ContentBreaks = 1
 
 	for _, tc := range []struct {
 		name          string
@@ -67,6 +71,7 @@ func TestReportAuditVerify_AForkIsReportedAsAForkedChain(t *testing.T) {
 		{"a fork", fork, "found a forked chain", "evidence of tampering", 1, 0, 0, 1},
 		{"an edited row", edited, "evidence of tampering", "forked chain", 0, 1, 0, 0},
 		{"a fork beside a deleted row", forkAndDeletion, "evidence of tampering", "found a forked chain", 1, 0, 1, 1},
+		{"a fork on one host and an edit on another", forkAndEdit, "evidence of tampering", "found a forked chain", 1, 1, 0, 1},
 	} {
 		buf.Reset()
 		reportAuditVerify("node-1", tc.res)

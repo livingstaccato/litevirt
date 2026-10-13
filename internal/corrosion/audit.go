@@ -592,6 +592,14 @@ type AuditVerifyResult struct {
 	// SeqDuplicates counts the SeqGaps entries that are a repeated seq (the
 	// forked-chain kind), not a jump.
 	SeqDuplicates int
+	// Every unlinked row is classified, not only the first (BrokenAt):
+	// ContentBreaks counts those whose content does not hash to their stored
+	// hash (an edit); ForkedHosts lists the hosts with a second genesis
+	// (AuditBrokenForked); UnlinkedOutsideForks counts the other unlinked
+	// rows on hosts with no second genesis (a deleted or rewritten row).
+	ContentBreaks        int
+	ForkedHosts          []string
+	UnlinkedOutsideForks int
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
 	Laundered []string
@@ -669,13 +677,15 @@ func (r AuditVerifyResult) Tampered() bool {
 		len(r.UnsignedAfterSigned) > 0
 }
 
-// Forked reports whether the only tamper finding is a forked chain: the first
-// broken link is a second genesis (AuditBrokenForked) and every sequence break
-// is a repeated seq. It is still Tampered — a fork fails verification — but
+// Forked reports whether the only tamper finding is a forked chain: some host
+// has a second genesis (AuditBrokenForked), no row's content fails its hash,
+// every other unlinked row is on a host with a second genesis, and every
+// sequence break is a repeated seq. It is still Tampered — a fork fails verification — but
 // nothing found says a row was edited, deleted or forged, so the periodic
 // verifier names it a forked chain, as `lv audit verify` does.
 func (r AuditVerifyResult) Forked() bool {
-	return r.BrokenKind == AuditBrokenForked && len(r.SeqGaps) == r.SeqDuplicates &&
+	return len(r.ForkedHosts) > 0 && r.ContentBreaks == 0 && r.UnlinkedOutsideForks == 0 &&
+		len(r.SeqGaps) == r.SeqDuplicates &&
 		len(r.BadSignature) == 0 && len(r.UnknownKeyID) == 0 && len(r.Laundered) == 0 &&
 		len(r.TruncatedHosts) == 0 && len(r.RetiredKeyUse) == 0 && len(r.HeadMismatch) == 0 &&
 		len(r.UnsignedAfterSigned) == 0
@@ -790,6 +800,8 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	lastUnsigned := map[string]bool{}  // is the host's latest row unsigned?
 	prevByHost := map[string]string{}  // per-host running tail
 	seqByHost := map[string]int64{}    // per-host last seq seen
+	forkedHost := map[string]bool{}    // hosts with a second genesis
+	unlinkedByHost := map[string]int{} // per-host unlinked rows, neither content nor genesis
 	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
 	// Unsigned seq-0 rows of a contracted host, held until the chain says where
 	// they sit. See "seq 0 under a contract" below.
@@ -845,11 +857,24 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			PrevHash:  prevByHost[host],
 		}
 		linked := strings.EqualFold(HashAuditRow(rec), stored)
-		if !linked && res.BrokenAt == "" {
-			res.BrokenAt = rec.ID
+		if !linked {
 			last, seen := seqByHost[host]
-			res.BrokenKind = brokenLinkKind(rec, r.String("prev_hash"), stored,
+			kind := brokenLinkKind(rec, r.String("prev_hash"), stored,
 				r.Int64("seq") == 1 && seen && last == 1)
+			if res.BrokenAt == "" {
+				res.BrokenAt, res.BrokenKind = rec.ID, kind
+			}
+			switch kind {
+			case AuditBrokenContent:
+				res.ContentBreaks++
+			case AuditBrokenForked:
+				if !forkedHost[host] {
+					forkedHost[host] = true
+					res.ForkedHosts = append(res.ForkedHosts, host)
+				}
+			default:
+				unlinkedByHost[host]++
+			}
 		}
 		if run := legacy[host]; run != nil && !linked {
 			run.broken = true
@@ -1024,6 +1049,12 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	for _, host := range legacyOrder {
 		if run := legacy[host]; !run.resolved && run.broken {
 			flagLegacy(host)
+		}
+	}
+
+	for host, n := range unlinkedByHost {
+		if !forkedHost[host] {
+			res.UnlinkedOutsideForks += n
 		}
 	}
 

@@ -789,6 +789,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// it sets none and reports console_password_v1 in not_enforcing
 	// (docs/ui.md "Console passwords"). Asynchronous: until it answers, a
 	// refused start is still caught by the start backstop.
+	if reason := libvirt.SpiceUnusableReason(); reason != "" {
+		slog.Warn("SPICE consoles cannot connect on this host; VMs still run and VNC still works", "reason", reason)
+	}
 	go func() {
 		defer d.virt.MarkVNCProbed()
 		if reason := libvirt.ProbeVNCPassword(ctx); reason != "" {

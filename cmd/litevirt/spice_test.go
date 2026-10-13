@@ -46,6 +46,19 @@ func TestSpiceLaunch_PasswordInA0600FileNotArgv(t *testing.T) {
 	}
 }
 
+// A host where SPICE cannot connect (a FIPS-mode kernel) is named in the
+// output; the info is still printed.
+//
+// Mutation "warning not printed" — red.
+func TestSpiceInfo_PrintsTheHostsWarning(t *testing.T) {
+	var b bytes.Buffer
+	printSpiceInfo(&b, "desk", &pb.GetSpiceInfoResponse{Host: "h", Port: 5930, Uri: "spice://h:5930",
+		Warning: "the kernel is in FIPS mode: no SPICE client can connect"}, false)
+	if !strings.Contains(b.String(), "Warning:") || !strings.Contains(b.String(), "FIPS") || !strings.Contains(b.String(), "Port: 5930") {
+		t.Errorf("lv spice output lacks the warning or the info:\n%s", b.String())
+	}
+}
+
 // The password is printed only on request.
 //
 // Mutation "always print the password" — red.

@@ -14,6 +14,21 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// spiceReporter is the backend's answer to whether SPICE can connect on this
+// host at all (libvirt.Client.SpiceUnusable: a FIPS-mode kernel cannot).
+type spiceReporter interface {
+	SpiceUnusable() string
+}
+
+// spiceUnusable is why a SPICE client cannot connect to a console on this
+// host, "" when nothing says so.
+func (s *Server) spiceUnusable() string {
+	if r, ok := s.virt.(spiceReporter); ok {
+		return r.SpiceUnusable()
+	}
+	return ""
+}
+
 // GetSpiceInfo returns the SPICE host:port for a running VM that has SPICE
 // graphics enabled. Operators connect with `remote-viewer spice://<uri>`
 // or any SPICE client (virt-manager, looking-glass, etc.).
@@ -95,5 +110,6 @@ func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) 
 		Port:     int32(port),
 		Uri:      uri,
 		Password: password,
+		Warning:  s.spiceUnusable(),
 	}, nil
 }

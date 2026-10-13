@@ -35415,7 +35415,12 @@ type GetSpiceInfoResponse struct {
 	// The password the VM's SPICE console requires ("" when it requires
 	// none; docs/ui.md "Console passwords"). Returned only to a caller that
 	// passed the vm.console check, and never logged.
-	Password      string `protobuf:"bytes,4,opt,name=password,proto3" json:"password,omitempty"`
+	Password string `protobuf:"bytes,4,opt,name=password,proto3" json:"password,omitempty"`
+	// warning: why a SPICE client may be unable to connect on the VM's host
+	// ("" when nothing is known), e.g. a FIPS-mode kernel, under which
+	// spice-server cannot make the RSA key every SPICE link needs. Nothing is
+	// refused because of it; VNC still works.
+	Warning       string `protobuf:"bytes,5,opt,name=warning,proto3" json:"warning,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -35474,6 +35479,13 @@ func (x *GetSpiceInfoResponse) GetUri() string {
 func (x *GetSpiceInfoResponse) GetPassword() string {
 	if x != nil {
 		return x.Password
+	}
+	return ""
+}
+
+func (x *GetSpiceInfoResponse) GetWarning() string {
+	if x != nil {
+		return x.Warning
 	}
 	return ""
 }
@@ -43931,12 +43943,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x03 \x01(\tR\amessage\".\n" +
 	"\x13GetSpiceInfoRequest\x12\x17\n" +
-	"\avm_name\x18\x01 \x01(\tR\x06vmName\"l\n" +
+	"\avm_name\x18\x01 \x01(\tR\x06vmName\"\x86\x01\n" +
 	"\x14GetSpiceInfoResponse\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\x05R\x04port\x12\x10\n" +
 	"\x03uri\x18\x03 \x01(\tR\x03uri\x12\x1a\n" +
-	"\bpassword\x18\x04 \x01(\tR\bpassword\"\xbe\x02\n" +
+	"\bpassword\x18\x04 \x01(\tR\bpassword\x12\x18\n" +
+	"\awarning\x18\x05 \x01(\tR\awarning\"\xbe\x02\n" +
 	"\x11RebalanceProposal\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x19\n" +

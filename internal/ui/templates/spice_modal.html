@@ -19,6 +19,9 @@
       <span><span class="muted">Host</span> <span class="mono">{{.Host}}</span></span>
       <span><span class="muted">Port</span> <span class="mono">{{.Port}}</span></span>
     </div>
+    {{if .Warning}}
+    <div class="error" style="margin-bottom:8px">A SPICE client may not be able to connect: {{.Warning}}</div>
+    {{end}}
     {{if .HasPassword}}
     <p class="muted" style="font-size:12px;margin-bottom:8px">
       This console requires a password. The .vv file carries it, and remote-viewer deletes the file once it has read it.

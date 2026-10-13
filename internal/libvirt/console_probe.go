@@ -217,6 +217,24 @@ func probeVNCPassword(ctx context.Context) (string, bool) {
 	return "", true
 }
 
+// SpiceUnusableReason is why SPICE consoles cannot connect on this host, ""
+// when nothing says so. On a FIPS-mode kernel spice-server generates an
+// RSA-1024 key for every SPICE link, which FIPS refuses ("Failed to generate
+// 1024 bits RSA key", lab 2 on QEMU 8.2.2): the guest runs and VNC works,
+// but every SPICE connection is closed, with or without a password. Nothing
+// is refused because of it; the host says so (daemon WARN at startup,
+// GetSpiceInfo's warning).
+func SpiceUnusableReason() string {
+	if fipsEnabled() {
+		return "the kernel is in FIPS mode: spice-server makes an RSA-1024 key for every SPICE link, " +
+			"which FIPS refuses, so no SPICE client can connect to a console on this host (VNC works)"
+	}
+	return ""
+}
+
+// SpiceUnusable is SpiceUnusableReason for this client's host.
+func (c *Client) SpiceUnusable() string { return SpiceUnusableReason() }
+
 // MarkVNCProbed records that the startup probe has answered (whatever it
 // found), releasing WaitVNCProbe.
 func (c *Client) MarkVNCProbed() {

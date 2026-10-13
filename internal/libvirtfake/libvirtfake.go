@@ -85,6 +85,7 @@ type Fake struct {
 	// with (domain → kind → password), which a redefine does not change.
 	consolePolicy  func() libvirt.ConsolePolicy
 	vncUnavailable string // SetVNCPasswordUnavailable
+	spiceUnusable  string // SetSpiceUnusable
 	liveConsolePw  map[string]map[string]string
 	vncPorts       map[string]int // domain → VNC port (SetVNCPort); default 5901
 
@@ -1151,6 +1152,21 @@ func (f *Fake) SetVNCPasswordUnavailable(reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.vncUnavailable = reason
+}
+
+// SetSpiceUnusable models a host where SPICE cannot connect (a FIPS-mode
+// kernel), as libvirt.Client.SpiceUnusable reports it.
+func (f *Fake) SetSpiceUnusable(reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spiceUnusable = reason
+}
+
+// SpiceUnusable mirrors libvirt.Client.SpiceUnusable.
+func (f *Fake) SpiceUnusable() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.spiceUnusable
 }
 
 // VNCPasswordUnavailable mirrors libvirt.Client.VNCPasswordUnavailable.

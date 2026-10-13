@@ -770,6 +770,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
 		}
 		armed.apply(&params)
+		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)
 		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, params)
 	}()
 

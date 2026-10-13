@@ -774,6 +774,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	hooks.Run(ctx, hooks.PreMigrate, pbVM, hspec)
 	// The target's NIC guards are armed for the guest (armMigrationTarget).
 	armed.apply(&mp)
+	logVNCPasswordStrip(vm.Name, target.Name, mp.StripVNCPassword)
 	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, mp)
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).

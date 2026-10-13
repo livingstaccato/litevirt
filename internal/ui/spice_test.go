@@ -62,6 +62,19 @@ func TestSpiceModalAndVV(t *testing.T) {
 		mustContain(t, m.Body.String(), "requires a password")
 	})
 
+	// A host where SPICE cannot connect (FIPS) is named in the modal, which
+	// still offers the .vv.
+	//
+	// Mutation "warning not rendered" — red.
+	t.Run("modal shows the host's SPICE warning", func(t *testing.T) {
+		wm := newDefaultMock()
+		wm.spiceInfoResp = &pb.GetSpiceInfoResponse{Host: "10.0.0.5", Port: 5901, Uri: "spice://10.0.0.5:5901",
+			Warning: "the kernel is in FIPS mode: no SPICE client can connect"}
+		ws := newTestUIServer(t, wm)
+		w := serveRequest(ws, withAuth(mustReq(t, "GET", "/ui/vms/vm1/spice-modal")))
+		mustContain(t, w.Body.String(), "may not be able to connect", "FIPS mode", "/ui/vms/vm1/spice.vv")
+	})
+
 	t.Run("modal surfaces unavailable error", func(t *testing.T) {
 		em := newDefaultMock()
 		em.spiceInfoErr = errSimulated

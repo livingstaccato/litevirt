@@ -194,6 +194,19 @@ const vncAuthTimeout = 10 * time.Second
 // viewer, the listener's included. A variable for the tests.
 var vncHandshakeTimeout = 15 * time.Second
 
+// logVNCPasswordStrip says, on the source, that a live migration moves the
+// guest without its VNC console password because the target cannot do one
+// (EnsureDisksResponse.vnc_password_unavailable; docs/ui.md "Console
+// passwords"). The guest arrives with an open VNC console; SPICE keeps its
+// password.
+func logVNCPasswordStrip(vmName, target string, strip bool) {
+	if !strip {
+		return
+	}
+	slog.Warn("live migration moves the guest without its VNC console password: the target cannot do VNC passwords",
+		"vm", vmName, "target", target, "strip_vnc_password", true)
+}
+
 // vmHasVNCPassword reports whether the running domain's VNC console has a
 // password (read from the live secure definition; the value is not kept).
 func (s *Server) vmHasVNCPassword(vmName string) bool {

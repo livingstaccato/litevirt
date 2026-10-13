@@ -86,6 +86,9 @@ func printSpiceInfo(w io.Writer, vm string, resp *pb.GetSpiceInfoResponse, showP
 	fmt.Fprintf(w, "Host: %s\n", resp.Host)
 	fmt.Fprintf(w, "Port: %d\n", resp.Port)
 	fmt.Fprintf(w, "URI:  %s\n", resp.Uri)
+	if resp.Warning != "" {
+		fmt.Fprintf(w, "Warning: a SPICE client may not be able to connect: %s\n", resp.Warning)
+	}
 	switch {
 	case resp.Password == "":
 	case showPassword:

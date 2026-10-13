@@ -459,11 +459,17 @@ func startWithConsoleBackstop(v snapshotAPI, g StartGuard, name string, policy C
 		return err
 	}
 	reason := firstLine(err.Error())
-	if !refused {
-		reason = "the kernel is in FIPS mode and a start with a console password failed: " + reason
+	if refused {
+		slog.Warn("QEMU refused the console password; starting the domain without it, and setting no VNC passwords on this host",
+			"domain", name, "reason", reason)
+	} else {
+		// Not a refusal QEMU named: a failure on its console option (the
+		// lab's was a VNC port collision) on a FIPS-mode host. Say that, not
+		// that a password was refused.
+		reason = "the kernel is in FIPS mode and a start with a console password failed on QEMU's console: " + reason
+		slog.Warn("the domain's console option failed on a FIPS-mode host; starting it without its console passwords, and setting no VNC passwords on this host",
+			"domain", name, "reason", reason)
 	}
-	slog.Warn("QEMU refused the console password; starting the domain without it, and setting no VNC passwords on this host",
-		"domain", name, "reason", reason)
 	if unavailable != nil {
 		unavailable(reason)
 	}

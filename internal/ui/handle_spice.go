@@ -20,6 +20,7 @@ func (s *Server) handleSpiceModal(w http.ResponseWriter, r *http.Request) {
 	s.renderFragment(w, "spice_modal.html", map[string]any{
 		"Name": name, "Host": resp.Host, "Port": resp.Port, "Uri": resp.Uri,
 		"HasPassword": resp.Password != "",
+		"Warning":     resp.Warning,
 	})
 }
 

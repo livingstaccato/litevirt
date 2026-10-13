@@ -172,6 +172,19 @@ migration:
   never does this: a password then is an operator's, and that start fails as
   it always did.
 
+Treating a FIPS-mode kernel as unable is **conservative**. On the QEMU tested
+(8.2.2), VNC password authentication still works under FIPS, so such a host
+gives up VNC passwords it could have had. It is kept that way because whether
+DES is available under FIPS differs between QEMU builds and crypto backends.
+
+**SPICE does not work at all on a FIPS-mode host.** spice-server makes an
+RSA-1024 key for every SPICE link, which FIPS refuses ("Failed to generate 1024
+bits RSA key"), so every SPICE connection is closed, with or without a
+password. The guest still runs and its VNC console still works; nothing is
+refused because of it. The daemon logs a warning at startup ("SPICE consoles
+cannot connect on this host"), and `lv spice` and the UI's SPICE dialog show
+the reason for a VM on such a host.
+
 Limits:
 
 - **VNC authentication uses only the first 8 characters** of a password. That

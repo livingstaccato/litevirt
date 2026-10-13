@@ -4890,6 +4890,11 @@ message GetSpiceInfoResponse {
     // none; docs/ui.md "Console passwords"). Returned only to a caller that
     // passed the vm.console check, and never logged.
     string password = 4;
+    // warning: why a SPICE client may be unable to connect on the VM's host
+    // ("" when nothing is known), e.g. a FIPS-mode kernel, under which
+    // spice-server cannot make the RSA key every SPICE link needs. Nothing is
+    // refused because of it; VNC still works.
+    string warning = 5;
 }
 
 // ── Rebalancer messages ──

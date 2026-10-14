@@ -122,7 +122,7 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 		}
 	}
 	if h, err := corrosion.GetHost(ctx, a.DB, victim.Name); err != nil || h == nil || h.IPMIPass != "bmc-pass-2" {
-		t.Fatalf("%s serves IPMI password %+v (err %v) before its pass, want the rotated bmc-pass-2", a.Name, h, err)
+		t.Fatalf("%s serves IPMI password %s (err %v) before its pass, want the rotated one (%s)", a.Name, redacted(ipmiPassOf(h)), err, redacted("bmc-pass-2"))
 	}
 	// a's periodic pass.
 	if _, err := a.DB.SplitCredentials(ctx); err != nil {
@@ -167,8 +167,8 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 		t.Fatalf("expected one fence of %s, got %+v", victim.Name, fences)
 	}
 	if fences[0].IPMIPass != "bmc-pass-3" {
-		t.Fatalf("%s fenced %s with IPMI password %q, want the current bmc-pass-3 — a fence "+
-			"that authenticates with anything else fails closed", fences[0].By, victim.Name, fences[0].IPMIPass)
+		t.Fatalf("%s fenced %s with IPMI password %s, want the current one (%s) — a fence "+
+			"that authenticates with anything else fails closed", fences[0].By, victim.Name, redacted(fences[0].IPMIPass), redacted("bmc-pass-3"))
 	}
 }
 
@@ -248,7 +248,7 @@ func TestFleet_CredentialsSplit_DualWriteKeepsBothCopies(t *testing.T) {
 	}
 	tok1, err := admin.CreateToken(ctx, &pb.CreateTokenRequest{Username: "dave", Name: "before"})
 	if err != nil || tok1.Id == "" {
-		t.Fatalf("CreateToken: %+v %v", tok1, err)
+		t.Fatalf("CreateToken: %s %v", credState(tok1), err)
 	}
 	configureIPMI(t, c, a, bmc.Name, "bmc-before")
 	c.WaitConverged(t, convergeTimeout)
@@ -286,7 +286,7 @@ func TestFleet_CredentialsSplit_DualWriteKeepsBothCopies(t *testing.T) {
 	}
 	tok2, err := c.SelfClient(b).CreateToken(ctx, &pb.CreateTokenRequest{Username: "dave", Name: "after"})
 	if err != nil || tok2.Id == "" {
-		t.Fatalf("CreateToken after the latch: %+v %v", tok2, err)
+		t.Fatalf("CreateToken after the latch: %s %v", credState(tok2), err)
 	}
 	configureIPMI(t, c, a, bmc.Name, "bmc-after")
 	c.WaitConverged(t, convergeTimeout)
@@ -350,7 +350,7 @@ func TestFleet_CredentialsSplit_AnUnlatchedWriteIsServedWithoutWaitingForAPass(t
 			t.Errorf("%s accepted the rotated-out password", n.Name)
 		}
 		if login, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "rotated-pass"}); err != nil || login.Token == "" {
-			t.Errorf("%s refused the rotated password: %+v %v", n.Name, login, err)
+			t.Errorf("%s refused the rotated password: %s %v", n.Name, credState(login), err)
 		}
 	}
 }
@@ -391,7 +391,7 @@ func TestFleet_CredentialsSplit_APreviousReleaseReaderAuthenticatesAfterTheLatch
 	}
 	tok, err := c.SelfClient(b).CreateToken(ctx, &pb.CreateTokenRequest{Username: "grace", Name: "ci"})
 	if err != nil || tok.Token == "" {
-		t.Fatalf("CreateToken: %+v %v", tok, err)
+		t.Fatalf("CreateToken: %s %v", credState(tok), err)
 	}
 	configureIPMI(t, c, b, bmc.Name, "bmc-after")
 	c.WaitConverged(t, convergeTimeout)
@@ -434,7 +434,7 @@ func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheSplit(t *testing.T) {
 	}
 	tok, err := admin.CreateToken(ctx, &pb.CreateTokenRequest{Username: "carol", Name: "ci"})
 	if err != nil || tok.Token == "" {
-		t.Fatalf("CreateToken: %+v %v", tok, err)
+		t.Fatalf("CreateToken: %s %v", credState(tok), err)
 	}
 	c.WaitConverged(t, convergeTimeout)
 
@@ -447,7 +447,7 @@ func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheSplit(t *testing.T) {
 
 	login, err := c.SelfClient(b).Login(ctx, &pb.LoginRequest{Username: "carol", Password: "c4rol-pass"})
 	if err != nil || login.Token == "" {
-		t.Fatalf("password login on %s after the split: %+v %v", b.Name, login, err)
+		t.Fatalf("password login on %s after the split: %s %v", b.Name, credState(login), err)
 	}
 	if _, err := c.SelfClient(b).Login(ctx, &pb.LoginRequest{Username: "carol", Password: "wrong"}); err == nil {
 		t.Fatal("a wrong password logged in; the login check is not reading a hash at all")
@@ -561,6 +561,6 @@ func TestFleet_CredentialsSplit_SensitiveAntiEntropyHealsAMissedAbsorb(t *testin
 		t.Errorf("%s still accepts the rotated-out password after sensitive anti-entropy", x.Name)
 	}
 	if login, err := c.SelfClient(x).Login(ctx, &pb.LoginRequest{Username: "hana", Password: "after-pass"}); err != nil || login.Token == "" {
-		t.Errorf("%s refuses the rotated password after sensitive anti-entropy: %+v %v", x.Name, login, err)
+		t.Errorf("%s refuses the rotated password after sensitive anti-entropy: %s %v", x.Name, credState(login), err)
 	}
 }

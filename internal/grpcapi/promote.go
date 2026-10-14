@@ -1127,13 +1127,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return err
 		}
 	} else {
-		// A same-name takeover of a VM the ledger already counts as RUNNING ON
-		// THIS HOST (a same-host rebuild) re-homes consumption headroom already
+		// A same-name takeover of a VM the ledger already counts ON THIS HOST
+		// (running or starting, countedAgainstHost: a same-host rebuild) re-homes consumption headroom already
 		// accounts for; charging the full size again would refuse a legal
 		// recovery. Every other fresh promotion is a full-sized VM appearing
 		// here. The zero-delta admission still runs the residency safety gate.
 		admitCPU, admitMem := int(spec.Cpu), int(spec.MemoryMib)
-		if !renamed && vm.HostName == s.hostName && vm.State == "running" {
+		if !renamed && vm.HostName == s.hostName && countedAgainstHost(vm.State) {
 			admitCPU, admitMem = 0, 0
 		}
 		hostLease, aerr := s.admitHostWithReservation(ctx, "PromoteReplica", s.hostName, vm.Project, "vm:"+targetName, admitCPU, admitMem, intentVMResident)

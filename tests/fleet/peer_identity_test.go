@@ -112,7 +112,7 @@ func TestFleet_PeerIdentity_TheOwnerJudgesAForwardedCallAsTheUser(t *testing.T) 
 	}
 	login, err := c.SelfClient(entry).Login(ctx, &pb.LoginRequest{Username: "op", Password: "op-password-0123456789"})
 	if err != nil || !strings.HasPrefix(login.GetToken(), grpcapi.SessionTokenPrefix) {
-		t.Fatalf("Login: %+v %v", login, err)
+		t.Fatalf("Login: %s %v", credState(login), err)
 	}
 	for _, vm := range []string{"fw-ok", "fw-revoked"} {
 		if err := corrosion.InsertVM(ctx, owner.DB, corrosion.VMRecord{

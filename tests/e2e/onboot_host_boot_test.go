@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -33,7 +32,7 @@ func TestLab_OnbootStartsAnOperatorStoppedVMOnlyAtHostBoot(t *testing.T) {
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    onboot: true\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), victim)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(q, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(q, file, yaml)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{victim: vm}) })
 	if out, err := l.lv(q, "compose", "up", "-f", file, "-y"); err != nil {
 		t.Fatalf("compose up %s: %v\n%s", stack, err, out)

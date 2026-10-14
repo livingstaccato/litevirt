@@ -190,7 +190,7 @@ func (s *Server) forwardCreateVM(ctx context.Context, req *pb.CreateVMRequest, t
 		return out, err
 	}
 	out, err := send()
-	if _, replacing := replacedVMFor(ctx, req.GetSpec().GetName()); !replacing {
+	if _, replacing := replacedRowFor(ctx, req.GetSpec().GetName()); !replacing {
 		return out, err
 	}
 	// A re-create of a VM this node has deleted. A host on an older build

@@ -310,6 +310,58 @@ pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) �
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
 
+#### A deleted name re-used: the tombstone yields
+
+Deletes are soft, so a snapshot that is deleted and then re-created under the
+same name is two rows of one natural key on every peer: the tombstone and the
+new row. A build that minted a fresh id for the re-create shipped a row that
+failed `UNIQUE(vm_name, name)` on every peer, which back-pressured the
+origin's whole replication stream (lab 2, F-2). Two changes close it, neither
+behind a token:
+
+- **The origin re-uses the deleted row's id.** `InsertSnapshot` and
+  `InsertContainerSnapshot` take the id of the row already held under the
+  natural key (a caller-supplied id is used only when no row holds the name),
+  and when that row is a tombstone they add the existing per-row-LWW delete
+  shape with a NULL `deleted_at`, stamped after the insert. The lookup and the
+  write are one guarded transaction. Every released receiver already applies
+  both statements, so a mixed fleet receives the re-create as an ordinary
+  newer write to the same row.
+- **A receiver decides a collision with a tombstone.** On the WAL and on
+  anti-entropy, when an incoming row's natural key is held here by a row with
+  a *different* id and at least one of the two is a tombstone:
+
+  | here | incoming | outcome |
+  |---|---|---|
+  | tombstone | strictly newer row | the tombstone yields: removed, the incoming row applies |
+  | tombstone | older or equal-time live row | the incoming row is skipped: a newer delete of the name supersedes it (a delete wins an exact tie) |
+  | tombstone | tombstone | the newer stays; an exact tie keeps the smaller id, so every node converges |
+  | live row | older tombstone | the incoming tombstone is stale and is skipped |
+  | live row | newer or equal-time tombstone | anti-entropy tombstones the row here in place, keeping its id and taking the tombstone's `deleted_at` and `updated_at`; the two tombstones are then settled as above. For a strictly newer tombstone this is the by-name delete's effect. At an exact tie the WAL keeps the live row and anti-entropy tombstones it; both converge |
+
+  Two live rows under one name are `canonical_identity`'s decision and are
+  never touched. A yield is refused — the apply then proceeds as before — when
+  a child row references the tombstone, when the incoming id is already bound
+  to another name, or when the incoming clock is future-skewed with the skew
+  guard on. The in-place tombstone is likewise not decided for a future-skewed
+  tombstone with the skew guard on. The yield and the incoming row's apply
+  share a savepoint: if the incoming row does not land, the tombstone is put
+  back. Logged at INFO as `a deleted row yielded its name to a newer row` or
+  `skipped a row a newer delete of its name supersedes`, and at WARN as
+  `anti-entropy: a newer delete of its name tombstoned the row here`. When
+  that row recorded an artifact path (`vmstate_path`, or `path` for a
+  container snapshot), the file stays on disk and is logged at WARN as
+  `anti-entropy tombstoned a live row whose artifact is now unreferenced (not
+  auto-deleted; needs cleanup)` with its host and path, and counted in
+  `litevirt_identity_collapse_orphaned_total`.
+
+This is what un-wedges a stream that already carries a fresh-id re-create: the
+entry is still in the sender's log, and an upgraded receiver applies it on the
+next push. It also matters with `canonical_identity` on: its WAL collapse
+re-keys the losing row with a column-preserving `UPDATE`, and a replicated
+`INSERT` does not carry `deleted_at`, so collapsing a tombstone into a
+re-created row would leave that row deleted on every peer.
+
 ### `vm_replace` — `lv cutover`
 
 `lv cutover` gives the `<vm>-next` replacement the name of the VM it replaces. That VM is
@@ -891,6 +943,10 @@ converge the row, so the two paths can never disagree.
   *attempts*, a permanent fault re-increments every cycle — so alert on its **rate**, correlated
   with replication backlog (`litevirt_replication_min_watermark_seq`) and `lv doctor
   divergence`, **not** on its absolute value.
+- `litevirt_replication_parked_entries{origin}` — **gauge**: received changes this node
+  holds because a constraint refuses them, per sender (see
+  [`replication_entry_parked`](#a-received-change-this-node-cannot-apply-replication_entry_parked)).
+  The sender's stream continues past them. Nonzero means those changes have not happened here.
 - `litevirt_legacy_mutation_transformed_total{transformer}` — **monotonic counter** of prior-
   release WAL statements this node NORMALIZED before applying (a supported historical shape, e.g.
   a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
@@ -930,6 +986,8 @@ increase(litevirt_runtime_owner_assert_total{result="split_brain"}[10m]) > 0
 # Replicated writes are being refused faster than they clear (a builder bug, a mixed-version
 # gap, or malformed input). Correlate with replication backlog + divergence, not the raw total.
 rate(litevirt_merge_apply_rejected_total[15m]) > 0
+# A received change is held because it cannot apply here (the sender's stream continues).
+max by (host, origin) (litevirt_replication_parked_entries) > 0
 ```
 
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
@@ -1367,6 +1425,74 @@ destination keeps refusing is the cluster-wide stand-down left:
 recovered, then back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
+
+### A received change this node cannot apply (`replication_entry_parked`)
+
+A received replicated change that a constraint here refuses used to roll back
+the whole push, so the sender retried it forever and every later write from
+that sender waited behind it. For the natural-key identity tables —
+`snapshots` and `container_snapshots`, whose rows carry a random id beside a
+`UNIQUE` name that a deleted row still occupies — the node now **holds** such a
+change instead, when every statement in it is an unguarded last-writer-wins
+row write to one of those tables. A refusal on any other table, or of any
+other kind, back-pressures as before; no table is holdable unless it is on
+that list. The one other replicated table with a secondary `UNIQUE`,
+`registry_credentials`, was judged not holdable: it is secret-bearing, and its
+`UNIQUE` covers live rows only, so a re-create after a delete cannot collide.
+
+- The held entry is rolled back on its own and the rest of the push applies
+  once and is acknowledged, so the sender's stream keeps moving. The held
+  change is recorded seen, and a relay forwards it as it forwards any entry.
+- Nothing is overwritten to make room for it: the conflicting row here is
+  left exactly as it is.
+- It is retried automatically — after later pushes and every 30 seconds — and
+  applies as soon as the conflict is gone.
+- At most 256 changes are held per node; past that a refusal back-pressures
+  as before.
+
+Its limits:
+
+- **Applying late is not always applying in order.** A later update of the
+  held row from the same sender waits for the row only ten minutes, and not
+  across a restart. Past that, anti-entropy carries the sender's newest row,
+  which is what repairs it.
+- **A delete by name reaches this node's own row.** While a held change
+  conflicts with a different-id row here, a later delete of that name from the
+  sender applies to the row that holds the name *here*. It is tombstoned, not
+  destroyed — any local overlay or vmstate file stays on disk, unreferenced —
+  which is the existing meaning of a by-name statement. Once both rows are
+  tombstones the collision rules above settle them, and the held change
+  releases.
+- **A restart forgets the held entry, not the condition.** The sender keeps
+  offering its row to anti-entropy, and every pass that refuses an identity
+  table's row re-raises the same signal under that row (it clears when the row
+  applies or is superseded, or when no pass has re-raised it for ten minutes
+  or three anti-entropy intervals, whichever is longer).
+  A restart therefore does not turn the alert green while the row is still
+  divergent; expect the signal back within one anti-entropy pass.
+
+What an operator sees:
+
+- an ERROR line, `replicator: held a change this node cannot apply; the rest
+  of the sender's stream continues`, naming the sender, sequence, table, SQL
+  and failure; a WARN at most every five minutes per change while it still
+  cannot apply; and an INFO line when it finally applies;
+- `litevirt_replication_parked_entries{origin}`, the count held per sender
+  (held entries and anti-entropy refusals of identity-table rows, each row
+  once). For an anti-entropy refusal, `origin` is the row's `host_name`, the
+  host that wrote it;
+- `litevirt_ha_degraded{reason="replication_entry_parked"}` and an
+  `ha.degraded` event whose detail names the oldest held changes: a held entry
+  as `<sender> seq <n> on <table>`, an anti-entropy refusal as
+  `<host> row <id> on <table> (anti-entropy)`;
+- `litevirt_merge_apply_rejected_total{path="wal",reason="held"}` per table
+  (counted when the change is held; the retries are not counted).
+
+A held change means the row it writes has not changed on this node yet. Look
+at the table in `lv doctor divergence` and resolve the conflict the failure
+names the way the [repair flow](#operational-repair-flow) describes; the held
+change then applies on its own. This is receiver-side only: an older receiver
+still back-pressures, and upgrading it is what releases the sender's stream.
 
 ### A VM held on its point-in-time overlay (`pit_overlay.held`)
 
@@ -2125,6 +2251,20 @@ down host that no other host runs.
 | Raised when | Clears when |
 |---|---|
 | Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
+
+### A start an operator cancelled (`vm_start_cancelled`)
+
+`lv stop --force <vm>` of a VM in `pending` or `starting` with no domain
+defined (a start deferred because its storage did not answer) cancels the
+start: the VM is recorded stopped by its operator. The stop raises
+`vm_start_cancelled` (evaluator `vm_disk`, subject `vm/<name>@<host>`, info).
+While it is open, the disk copies a failover set aside for the VM stay held, as
+they were while the start was under way: `lv host superseded-disks <host>
+--remove` refuses them.
+
+| Raised when | Clears when |
+|---|---|
+| A forced stop cancels a start that had no domain. | The VM runs on that host again, or is on another host, or is deleted. `lv start <vm>` makes the cancelled start again: the VM goes back to `starting`, and the reconciler defines and starts it as it would have (a transfer still sets aside an old copy at the disk path). |
 
 ### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
 

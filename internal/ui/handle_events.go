@@ -183,6 +183,7 @@ func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 		{"retired key use", len(resp.RetiredKeyUse)},
 		{"chain head mismatch", len(resp.HeadMismatch)},
 		{"unsigned row after signing began", len(resp.UnsignedAfterSigned)},
+		{"orphaned row", len(resp.OrphanedRows)},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s(s)", c.n, c.label))

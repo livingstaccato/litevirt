@@ -299,7 +299,13 @@ const dataDirDisks = "disks"
 // judged as written only. A caller that confines on the answer uses
 // IsDataDirDisksErr, and confines on its error.
 func IsDataDirDisks(p, dataDir string) bool {
-	is, _ := IsDataDirDisksErr(p, dataDir)
+	return MountTable{}.IsDataDirDisks(p, dataDir)
+}
+
+// IsDataDirDisks is IsDataDirDisks against this table (an empty one is read
+// when needed).
+func (t MountTable) IsDataDirDisks(p, dataDir string) bool {
+	is, _ := t.IsDataDirDisksErr(p, dataDir)
 	return is
 }
 
@@ -308,12 +314,19 @@ func IsDataDirDisks(p, dataDir string) bool {
 // be <data_dir>/disks through a symlink. A match on the forms that did
 // resolve is still true, with no error.
 func IsDataDirDisksErr(p, dataDir string) (bool, error) {
+	return MountTable{}.IsDataDirDisksErr(p, dataDir)
+}
+
+// IsDataDirDisksErr is IsDataDirDisksErr against this table (an empty one is
+// read when needed).
+func (t MountTable) IsDataDirDisksErr(p, dataDir string) (bool, error) {
 	if dataDir == "" || p == "" {
 		return false, nil
 	}
-	var t MountTable
-	if mt, err := ReadMountTable(); err == nil {
-		t = mt
+	if t.Empty() {
+		if mt, err := ReadMountTable(); err == nil {
+			t = mt
+		}
 	}
 	dataForms, errD := pathFormsBounded(&t, dataDir)
 	forms, errP := pathFormsBounded(&t, p)
@@ -339,6 +352,12 @@ func IsDataDirDisksErr(p, dataDir string) (bool, error) {
 // both the path as written and the path it resolves to must pass, so a link
 // planted at an innocent name cannot reach a refused directory.
 func CheckWriteRoot(p, dataDir, pkiDir string) error {
+	return MountTable{}.CheckWriteRoot(p, dataDir, pkiDir)
+}
+
+// CheckWriteRoot is CheckWriteRoot against this table (an empty one is read
+// when needed).
+func (t MountTable) CheckWriteRoot(p, dataDir, pkiDir string) error {
 	if p == "" {
 		return errors.New("an empty path names no directory")
 	}
@@ -348,7 +367,7 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 	// Resolved under a bound (resolveBounded): a pool directory below an NFS
 	// mount whose server does not answer is refused, as one that cannot be
 	// checked, instead of holding the caller (lab 2 F-2).
-	forms, err := pathFormsBounded(nil, p)
+	forms, err := pathFormsBounded(&t, p)
 	if err != nil {
 		return fmt.Errorf("%q cannot be checked: %w", p, err)
 	}
@@ -439,11 +458,17 @@ func CheckDaemonStatePath(p, dataDir, pkiDir string) error {
 // configuration writes into, and refuses an NFS source that would derive a
 // mount directory outside <data_dir>/mounts.
 func CheckConfig(cfg Config, dataDir, pkiDir string) error {
+	return MountTable{}.CheckConfig(cfg, dataDir, pkiDir)
+}
+
+// CheckConfig is CheckConfig against this table (an empty one is read when
+// needed).
+func (t MountTable) CheckConfig(cfg Config, dataDir, pkiDir string) error {
 	if err := ValidateSource(cfg); err != nil {
 		return err
 	}
 	for _, p := range HostPathsOf(cfg).WriteRoots {
-		if err := CheckWriteRoot(p, dataDir, pkiDir); err != nil {
+		if err := t.CheckWriteRoot(p, dataDir, pkiDir); err != nil {
 			return err
 		}
 	}
@@ -526,13 +551,20 @@ func inPoolArea(dataDir, p string) bool {
 // whether two pools may coexist must treat the error as "cannot verify",
 // never as "no overlap".
 func DirsOverlap(a, b string) (bool, error) {
+	return MountTable{}.DirsOverlap(a, b)
+}
+
+// DirsOverlap is DirsOverlap against this table (an empty one is read when
+// needed).
+func (t MountTable) DirsOverlap(a, b string) (bool, error) {
 	ca, cb := filepath.Clean(a), filepath.Clean(b)
 	if within(ca, cb) || within(cb, ca) {
 		return true, nil
 	}
-	var t MountTable
-	if mt, err := ReadMountTable(); err == nil {
-		t = mt
+	if t.Empty() {
+		if mt, err := ReadMountTable(); err == nil {
+			t = mt
+		}
 	}
 	xs, errA := pathFormsBounded(&t, a)
 	ys, errB := pathFormsBounded(&t, b)

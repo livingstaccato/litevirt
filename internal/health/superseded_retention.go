@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // Retention of superseded disk copies.
@@ -94,7 +95,8 @@ type SupersededCopy struct {
 }
 
 // supersededHoldStates are the VM states that hold a copy: a failover start
-// that failed (error) or is still under way (pending, starting).
+// that failed (error) or is still under way (pending, starting). A start an
+// operator cancelled holds them too (start_cancelled.go).
 var supersededHoldStates = map[string]bool{"error": true, "pending": true, "starting": true}
 
 // supersededDirs is where set-aside copies can be: next to every host-local
@@ -119,35 +121,69 @@ func supersededDirs(ctx context.Context, db *corrosion.Client, dataDir string) (
 }
 
 // ListSupersededDisks lists the set-aside disk copies on this host, oldest
-// first.
+// first. A directory or copy whose storage does not answer
+// (superseded_bound.go) fails the listing with that no-answer: a list
+// missing the copies there would read as complete (replica pruning keeps
+// every listed copy's backing file).
 func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]SupersededCopy, error) {
+	out, noAnswer, err := listSupersededDisks(ctx, db, dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if noAnswer != nil {
+		return nil, fmt.Errorf("list superseded disk copies: %w", noAnswer)
+	}
+	return out, nil
+}
+
+// listSupersededDisks is ListSupersededDisks that goes on past storage that
+// does not answer: it lists the copies it could see, and returns the first
+// no-answer separately.
+func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string) (out []SupersededCopy, noAnswer, err error) {
 	dirs, err := supersededDirs(ctx, db, dataDir)
 	if err != nil {
-		return nil, fmt.Errorf("list disk directories: %w", err)
+		return nil, nil, fmt.Errorf("list disk directories: %w", err)
 	}
 	recorded, err := strandedCopies(ctx, db)
 	if err != nil {
-		return nil, fmt.Errorf("read the recorded stranded disks: %w", err)
+		return nil, nil, fmt.Errorf("read the recorded stranded disks: %w", err)
 	}
-	var out []SupersededCopy
+	cancelled, err := cancelledStarts(ctx, db)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the cancelled starts: %w", err)
+	}
+	unanswered := func(err error) {
+		slog.Warn("superseded disk copies: storage does not answer; what is there is not looked at", "error", err)
+		if noAnswer == nil {
+			noAnswer = err
+		}
+	}
 	for _, dir := range dirs {
-		matches, err := filepath.Glob(filepath.Join(dir, "*"+supersededInfix+"*"))
+		matches, err := globSetAside(dir)
 		if err != nil {
-			return nil, err
+			if storage.IsFSNoAnswer(err) {
+				unanswered(err)
+				continue
+			}
+			return nil, nil, err
 		}
 		for _, p := range matches {
 			diskPath, at, ok := parseSupersededName(p)
 			if !ok {
 				continue
 			}
-			fi, err := os.Lstat(p)
+			fi, err := lstatSetAside(p)
+			if storage.IsFSNoAnswer(err) {
+				unanswered(err)
+				continue
+			}
 			if err != nil || !fi.Mode().IsRegular() {
 				continue
 			}
 			c := SupersededCopy{Path: p, DiskPath: diskPath, SetAsideAt: at, SizeBytes: fi.Size()}
 			refs, err := corrosion.DisksReferencingPath(ctx, db, diskPath)
 			if err != nil {
-				return nil, fmt.Errorf("read the disks at %s: %w", diskPath, err)
+				return nil, nil, fmt.Errorf("read the disks at %s: %w", diskPath, err)
 			}
 			for _, d := range refs {
 				if d.Path != diskPath {
@@ -155,7 +191,7 @@ func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 				}
 				vm, err := corrosion.GetVM(ctx, db, d.VMName)
 				if err != nil {
-					return nil, fmt.Errorf("read VM %s: %w", d.VMName, err)
+					return nil, nil, fmt.Errorf("read VM %s: %w", d.VMName, err)
 				}
 				if vm == nil {
 					continue
@@ -163,6 +199,8 @@ func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 				c.VM, c.VMState = vm.Name, vm.State
 				if supersededHoldStates[vm.State] {
 					c.Held = fmt.Sprintf("VM %s is %s on %s", vm.Name, vm.State, vm.HostName)
+				} else {
+					c.Held = startCancelledHeld(cancelled, vm)
 				}
 				break
 			}
@@ -171,7 +209,7 @@ func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 				// another path (stranded_disk.go) is still that VM's.
 				if vm := recorded[p]; vm != "" {
 					if row, err := corrosion.GetVM(ctx, db, vm); err != nil {
-						return nil, fmt.Errorf("read VM %s: %w", vm, err)
+						return nil, nil, fmt.Errorf("read VM %s: %w", vm, err)
 					} else if row != nil {
 						c.VM, c.VMState = row.Name, row.State
 					}
@@ -189,25 +227,45 @@ func ListSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 		}
 		return out[i].Path < out[j].Path
 	})
-	return out, nil
+	return out, noAnswer, nil
 }
 
 // PurgeSupersededDisks removes the set-aside copies on this host that are
 // older than olderThan at now and neither retained nor held, and returns
 // them. olderThan 0 removes every such copy. It is both the hourly sweep and
-// a bare `--purge`.
+// a bare `--purge`. Storage that does not answer holds none of it: the copies
+// under it are left alone, the others are swept, and the no-answer is
+// returned once they are.
 func PurgeSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir string, olderThan time.Duration, now time.Time) ([]SupersededCopy, error) {
-	copies, err := ListSupersededDisks(ctx, db, dataDir)
+	copies, noAnswer, err := listSupersededDisks(ctx, db, dataDir)
 	if err != nil {
 		return nil, err
 	}
-	var removed []SupersededCopy
+	removed, err := purgeSuperseded(copies, olderThan, now)
+	if err == nil && noAnswer != nil {
+		err = fmt.Errorf("the copies under storage that does not answer were not looked at: %w", noAnswer)
+	}
+	return removed, err
+}
+
+// purgeSuperseded removes the copies of copies the purge may remove. A
+// removal that does not answer is skipped, not waited on and not counted,
+// and the first such no-answer is returned once the rest are done.
+func purgeSuperseded(copies []SupersededCopy, olderThan time.Duration, now time.Time) (removed []SupersededCopy, noAnswer error) {
 	for _, c := range copies {
 		if c.Held != "" || c.Retained != "" || now.Sub(c.SetAsideAt) < olderThan {
 			continue
 		}
-		if err := os.Remove(c.Path); err != nil {
+		if err := removeSetAside(c.Path); err != nil {
 			if os.IsNotExist(err) {
+				continue
+			}
+			if storage.IsFSNoAnswer(err) {
+				// Nothing is removed on a no-answer; the copies after it,
+				// in directories that answer, are still swept this pass.
+				if noAnswer == nil {
+					noAnswer = fmt.Errorf("remove %s: %w", c.Path, err)
+				}
 				continue
 			}
 			return removed, fmt.Errorf("remove %s: %w", c.Path, err)
@@ -216,7 +274,7 @@ func PurgeSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir str
 			"set_aside_at", c.SetAsideAt.Format(time.RFC3339), "bytes", c.SizeBytes)
 		removed = append(removed, c)
 	}
-	return removed, nil
+	return removed, noAnswer
 }
 
 // RemoveSupersededDisks removes the set-aside copies on this host named by
@@ -242,7 +300,7 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 		if c.Held != "" {
 			return removed, fmt.Errorf("%s is held (%s): a failed or unfinished start may need it", p, c.Held)
 		}
-		if err := os.Remove(c.Path); err != nil && !os.IsNotExist(err) {
+		if err := removeSetAside(c.Path); err != nil && !os.IsNotExist(err) {
 			return removed, fmt.Errorf("remove %s: %w", c.Path, err)
 		}
 		slog.Warn("removed a superseded disk copy by operator request", "path", c.Path, "disk", c.DiskPath, "vm", c.VM,

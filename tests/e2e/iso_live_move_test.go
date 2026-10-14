@@ -1,8 +1,8 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +69,7 @@ func isoVM(l *lab, via, host string) string {
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    iso: %s/x.iso\n    placement:\n      host: %s\n",
 		stack, name, drillImage(), drillMemory(), isoLinkDir, host)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(via, file, yaml)
 	l.t.Cleanup(func() { l.deleteVMs(stack, map[string]string{host: name}) })
 	if out, err := l.lv(via, "compose", "up", "-f", file, "-y"); err != nil {
 		l.t.Fatalf("compose up %s: %v\n%s", stack, err, out)
@@ -214,29 +214,35 @@ func TestLab_ISOMemoryRevertOpensTheJudgedFile(t *testing.T) {
 	vm := isoVM(l, h, h)
 	requireISOOpened(l, h, vm, isoFileOf(h))
 
-	t.Run("memory-revert", func(t *testing.T) {
-		// A VNC password the saved image must carry back. qemu takes at most
-		// 8 characters (a 10-character one fails this setup on its own).
-		const pw = "e2eisopw"
-		l.mustSSH(h, 30*time.Second, fmt.Sprintf(
-			"virsh -c qemu:///system dumpxml --security-info %[1]s | sed -n '/<graphics type=.vnc./,/<\\/graphics>/p' | sed -e 's#<graphics #<graphics passwd=\"%[2]s\" #' -e 's#passwd=\"[^\"]*\" passwd=#passwd=#' > /tmp/%[1]s-gfx.xml && virsh -c qemu:///system update-device %[1]s /tmp/%[1]s-gfx.xml --live",
-			shellQuote(vm), pw))
-		if out, err := l.lv(h, "snapshot", "create", vm, "iso-mem", "--memory"); err != nil {
-			t.Fatalf("memory snapshot of %s: %v\n%s", vm, err, out)
-		}
-		// The link now names another file on this node: the revert must open
-		// that one (judged now), not the one the image was saved with.
-		l.mustSSH(h, 30*time.Second, fmt.Sprintf("ln -sfn %s %s/x.iso", shellQuote(isoFileOf(other)), isoLinkDir))
-		if out, err := l.lv(h, "snapshot", "restore", vm, "iso-mem"); err != nil {
-			t.Fatalf("revert %s to its memory snapshot: %v\n%s", vm, err, out)
-		}
-		if !l.waitDomainState(h, vm, "running", 3*time.Minute) {
-			t.Fatalf("%s is not running after the revert", vm)
-		}
-		requireISOOpened(l, h, vm, isoFileOf(other))
-		sec := l.mustSSH(h, 30*time.Second, "virsh -c qemu:///system dumpxml --security-info "+shellQuote(vm))
-		if !strings.Contains(sec, `passwd='`+pw+`'`) && !strings.Contains(sec, `passwd="`+pw+`"`) {
-			t.Fatalf("the reverted domain lost its VNC password:\n%s", sec)
-		}
-	})
+	// A VNC password the saved image must carry back. qemu takes at most
+	// 8 characters (a 10-character one fails this setup on its own).
+	const pw = "e2eisopw"
+	l.t.Cleanup(func() { l.ssh(h, 30*time.Second, "rm -f /tmp/"+shellQuote(vm)+"-gfx.xml") })
+	// The password goes over stdin, so no error text that quotes the command carries it.
+	if out, err := l.sshInput(h, 30*time.Second, fmt.Sprintf(
+		"read -r PW; virsh -c qemu:///system dumpxml --security-info %[1]s | sed -n '/<graphics type=.vnc./,/<\\/graphics>/p' | sed -e 's# passwd=[^ >]*##' -e \"s#<graphics #<graphics passwd=\\\"$PW\\\" #\" > /tmp/%[1]s-gfx.xml && virsh -c qemu:///system update-device %[1]s /tmp/%[1]s-gfx.xml --live",
+		shellQuote(vm)), pw+"\n"); err != nil {
+		t.Fatalf("set the VNC password on %s: %v\n%s", vm, err, out)
+	}
+	if out, err := l.lv(h, "snapshot", "create", vm, "iso-mem", "--memory"); err != nil {
+		t.Fatalf("memory snapshot of %s: %v\n%s", vm, err, out)
+	}
+	// The link now names another file on this node: the revert must open
+	// that one (judged now), not the one the image was saved with.
+	l.mustSSH(h, 30*time.Second, fmt.Sprintf("ln -sfn %s %s/x.iso", shellQuote(isoFileOf(other)), isoLinkDir))
+	if out, err := l.lv(h, "snapshot", "restore", vm, "iso-mem"); err != nil {
+		t.Fatalf("revert %s to its memory snapshot: %v\n%s", vm, err, out)
+	}
+	if !l.waitDomainState(h, vm, "running", 3*time.Minute) {
+		t.Fatalf("%s is not running after the revert", vm)
+	}
+	requireISOOpened(l, h, vm, isoFileOf(other))
+	sec := l.mustSSH(h, 30*time.Second, "virsh -c qemu:///system dumpxml --security-info "+shellQuote(vm))
+	if !strings.Contains(sec, `passwd='`+pw+`'`) && !strings.Contains(sec, `passwd="`+pw+`"`) {
+		t.Fatalf("the reverted domain lost its VNC password:\n%s", vncPasswd.ReplaceAllString(sec, "passwd=${1}***${1}"))
+	}
 }
+
+// vncPasswd matches a quoted passwd attribute in a dumpxml --security-info
+// document, so a failure message can carry the XML without the live password.
+var vncPasswd = regexp.MustCompile(`passwd=(['"])[^'"]*['"]`)

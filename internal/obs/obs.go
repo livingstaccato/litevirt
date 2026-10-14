@@ -239,6 +239,15 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	if cfg.LogLevel != "" {
 		setEnvDefault("PROVIDE_LOG_LEVEL", cfg.LogLevel)
 	}
+	// provide-telemetry 0.8+ gives CRITICAL its own level above ERROR, and
+	// litevirt never emits at it, so CRITICAL would silence every line including
+	// errors. It is still an accepted setting (it meant ERROR before), so map it
+	// to ERROR. Covers config, LITEVIRT_LOG_LEVEL and PROVIDE_LOG_LEVEL. The WARN
+	// goes through the pre-Setup default logger: it would be filtered at ERROR.
+	if lv, ok := os.LookupEnv("PROVIDE_LOG_LEVEL"); ok && strings.EqualFold(strings.TrimSpace(lv), "CRITICAL") {
+		_ = os.Setenv("PROVIDE_LOG_LEVEL", "ERROR")
+		slog.Warn("telemetry: log level CRITICAL treated as ERROR (litevirt emits nothing above ERROR)")
+	}
 	// Default to "console": one key=value text line per record (level=,
 	// message=, then each attribute), the shape the daemon's journal lines
 	// already had. Operators opt into one JSON object per record with
@@ -375,6 +384,12 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	// PROVIDE_LOG_SANITIZE=true. Must be set before SetupTelemetry, which reads
 	// it at logger-construction time.
 	setEnvDefault("PROVIDE_LOG_SANITIZE", "false")
+	// provide-telemetry 0.9+ defaults PROVIDE_LOG_INCLUDE_CALLER to true, adding
+	// filename= and lineno= to every record. Off here: litevirt's gRPC log
+	// bridge (grpclog.go) and the stdlib log bridge would report their own
+	// adapter frames rather than the real caller, and every journald line would
+	// grow. An operator can opt in with PROVIDE_LOG_INCLUDE_CALLER=true.
+	setEnvDefault("PROVIDE_LOG_INCLUDE_CALLER", "false")
 
 	_, err := telemetry.SetupTelemetry(setupOpts...)
 	// SetupTelemetry has now read the OTLP auth headers into the built exporters,

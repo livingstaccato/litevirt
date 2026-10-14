@@ -65,6 +65,10 @@ type Replicator struct {
 	// the token would otherwise wrongly receive proofs after the flip). Dropped
 	// proofs reconverge via the peer-only sensitive AE net once the peer gains support.
 	proofReplicaGate func(ctx context.Context, peer string) bool
+
+	// park holds received entries this node could not apply but did not let
+	// stop the sender's stream (parked_entries.go).
+	park parkState
 }
 
 // SetProofReplicaGate injects the per-peer capability gate for proof-table WAL
@@ -132,6 +136,13 @@ func (r *Replicator) Start(ctx context.Context) {
 	go func() {
 		defer r.wg.Done()
 		r.fallbackLoop(ctx)
+	}()
+
+	// Held-entry retry, for a sender that went quiet (parked_entries.go).
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.parkRetryLoop(ctx)
 	}()
 }
 
@@ -1262,7 +1273,33 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 	if len(entries) == 0 {
 		return 0, nil
 	}
+	// One entry this node cannot apply used to roll the whole push back and
+	// leave the sender's watermark where it was, so every later write from
+	// that sender queued behind it for good (lab 2, F-2). An entry whose
+	// failure entryParkable accepts is held instead: it is rolled back to its
+	// own savepoint, the rest of the batch applies, it is recorded seen and
+	// acknowledged with the rest, and it is retried on its own
+	// (parked_entries.go). Anything else still back-pressures exactly as
+	// before.
+	held := map[string]*parkableEntryError{}
+	seq, err := r.applyRemoteBatch(ctx, entries, pushedAsRelay, held)
+	if err != nil {
+		return 0, err
+	}
+	r.holdParked(entries, held)
+	r.retryParkedSoon(ctx)
+	return seq, nil
+}
 
+// entrySavepoint brackets one entry of a batch, so a held entry rolls back
+// alone and the batch is applied exactly once.
+const entrySavepoint = "lv_wal_entry"
+
+// applyRemoteBatch applies entries in a single transaction. An entry
+// entryParkable accepts is rolled back to its savepoint and recorded in held
+// (while there is room); it is still recorded seen and relayed like every
+// other entry of the batch.
+func (r *Replicator) applyRemoteBatch(ctx context.Context, entries []*pb.MutationEntry, pushedAsRelay bool, held map[string]*parkableEntryError) (int64, error) {
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
 
@@ -1286,153 +1323,45 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		if remoteTS, ok := hlc.Parse(entry.Hlc); ok {
 			r.client.clock.Update(remoteTS)
 		}
-
-		// Parse statements. An undecodable entry is not silently skipped: back-pressure so
-		// the sender retries rather than the row being lost with the watermark advanced.
-		var stmts []Statement
-		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT "+entrySavepoint); err != nil {
 			_ = tx.Rollback()
-			r.client.observeMergeRejected("unknown", "wal", "decode")
-			slog.Error("replicator: undecodable mutation entry — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq, "error", err)
-			return 0, fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			return 0, err
 		}
-		// A valid but empty statement list ([] or null) is not a legitimate mutation — a
-		// correct sender never records one. Back-pressure rather than record it seen, so a
-		// malformed/truncated entry surfaces instead of being silently acknowledged.
-		if len(stmts) == 0 {
-			_ = tx.Rollback()
-			r.client.observeMergeRejected("unknown", "wal", "empty")
-			slog.Error("replicator: mutation entry has no statements — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq)
-			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
-		}
-		if err := validateReceivedMutationEntry(stmts); err != nil {
-			_ = tx.Rollback()
-			r.client.observeMergeRejected("unknown", "wal", "guard")
-			return 0, fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
-				entry.Origin, entry.Seq, err)
-		}
-		if err := validateGuardedOperationClaim(ctx, tx, stmts); err != nil {
-			_ = tx.Rollback()
-			r.client.observeMergeRejected("operations", "wal", "guard")
-			return 0, fmt.Errorf("validate guarded operation claim (origin=%s seq=%d): %w",
-				entry.Origin, entry.Seq, err)
-		}
-		legacyDelete, applyLegacy, err := legacyWorkloadDeleteEntryDecision(ctx, tx, stmts)
-		if err != nil {
-			_ = tx.Rollback()
-			r.client.observeMergeRejected("unknown", "wal", "legacy_delete")
-			return 0, fmt.Errorf("validate legacy workload delete entry (origin=%s seq=%d): %w",
-				entry.Origin, entry.Seq, err)
-		}
-		if legacyDelete && !applyLegacy {
-			// The retained pre-authority wire shape cannot identify a v44
-			// recreate. Skip its entire historical batch—including child
-			// tombstones—while still acknowledging the entry below.
-			//
-			// This is the site that actually fires for a complete pre-authority
-			// delete batch (the per-statement DispLegacyWorkloadDelete branch is
-			// bypassed by this continue). It was silent, which is how a dropped
-			// tombstone stayed invisible: the entry is ACKNOWLEDGED, so nothing
-			// back-pressures and the sender believes it replicated. Naming the
-			// sender is the point — the fix is to upgrade it.
-			// stmts[0] is the parent tombstone (the entry decision enforces
-			// legacyIndex == 0), so the metric can carry the real table — an
-			// operator filtering on table="containers" must see these.
-			r.client.observeMergeRejected(structuralTableLabel(stmts[0].SQL), "wal", "pre_authority_delete")
-			slog.Warn("replicator: skipped a pre-authority workload delete batch (rows kept live here)",
-				"sender", entry.Origin, "seq", entry.Seq,
-				"reason", "the pre-authority shape cannot prove the local row is the same workload it deleted",
-				"fix", "upgrade "+entry.Origin+" so it emits the authority-bearing tombstone")
+		mark := r.client.deferredMark(tx)
+		applyErr := r.applyEntry(ctx, tx, entry, false)
+		if applyErr == nil {
+			if _, err := tx.ExecContext(ctx, "RELEASE "+entrySavepoint); err != nil {
+				_ = tx.Rollback()
+				return 0, err
+			}
 			continue
 		}
-
-		// Apply each statement fail-closed. ANY failure — schema-missing, a constraint
-		// (e.g. a secondary-UNIQUE collision the PK-aware upsert now surfaces instead of
-		// silently deleting), an operational fault, or an invalid/unprovable statement —
-		// rolls back the whole batch and stalls the watermark so nothing is dropped or
-		// recorded as seen. A permanent fault surfaces via replication backlog; the sender
-		// retries. Logs carry s.SQL (never s.Params, which hold row data).
-		//
-		// A users row the admin re-mint floor refuses takes its credential
-		// statement in this entry with it (users_admin_guard.go). Decided
-		// before anything applies, against the rows the entry found.
-		refusedRemints, err := r.refusedRemintsInEntry(ctx, tx, stmts)
-		if err != nil {
+		var pe *parkableEntryError
+		if !errors.As(applyErr, &pe) {
 			_ = tx.Rollback()
-			r.client.observeMergeRejected("users", "wal", walRejectReason(err))
-			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			return 0, applyErr
 		}
-		// A use of a release feature this binary does not know quarantines
-		// it BEFORE anything else in this entry — or any later entry of the
-		// batch, which may carry the feature's data — is applied
-		// (release_features.go).
-		r.client.noteReleaseUseStatements(stmts)
-		for _, s := range stmts {
-			if releaseUseApplyHook != nil {
-				releaseUseApplyHook(s)
-			}
-			if remintCredentialStatement(s, refusedRemints) {
-				r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
-				continue
-			}
-			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
-				_ = tx.Rollback()
-				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
-				if isSchemaMissingError(err) {
-					slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
-						"sql", s.SQL, "error", err,
-						"hint", "upgrade this daemon to match the sender")
-					return 0, fmt.Errorf("schema-missing on receiver (upgrade required): %w", err)
-				}
-				slog.Error("replicator: apply failed — back-pressuring replication",
-					"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
-				return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
-			}
-			// A row this statement created may be one an earlier update
-			// is parked on. Replayed here, inside the batch, so the rest of
-			// the batch applies on top of it. See parked_updates.go.
-			r.replayParked(ctx, tx, s)
-		}
-		// A secret written by a node that had not latched credentials_split_v1
-		// reaches this node in its old column only; absorb it into the
-		// credential row readers use (credentials_absorb.go). A users row the
-		// re-mint floor refused did not apply here, so it has nothing to absorb.
-		if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(stmts, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
+		pe.origin, pe.seq, pe.hlc = entry.Origin, entry.Seq, entry.Hlc
+		if _, dup := held[parkKey(entry.Origin, entry.Hlc)]; dup || !r.parkRoomFor(len(held)+1) {
+			// Out of room: never drop, back-pressure as before. The held set
+			// is bounded so a peer that sends nothing but refusals cannot grow
+			// this node's memory.
 			_ = tx.Rollback()
-			slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq, "error", err)
-			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			slog.Error("replicator: apply failed — back-pressuring replication (no room to hold it)",
+				"sql", pe.sql, "origin", pe.origin, "seq", pe.seq, "error", pe.err,
+				"held", r.parkedLen(), "limit", parkedEntriesMax)
+			return 0, pe.err
 		}
-		// A host re-admitted over its tombstone takes no fence credential
-		// from the machine removed under its name (host_readmit.go).
-		if err := retireReadmittedCredentials(ctx, tx, stmts); err != nil {
+		r.client.truncateDeferred(tx, mark)
+		if _, err := tx.ExecContext(ctx, "ROLLBACK TO "+entrySavepoint); err != nil {
 			_ = tx.Rollback()
-			slog.Error("replicator: retiring a re-admitted host's credential failed — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq, "error", err)
-			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			return 0, err
 		}
-		// A state or isolation write to hosts from a node that was not writing
-		// host_membership yet is absorbed into it here, locally
-		// (host_membership.go). Back-pressured on failure, like the secret
-		// absorb: swallowed, it would lose a fence on this node.
-		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
+		if _, err := tx.ExecContext(ctx, "RELEASE "+entrySavepoint); err != nil {
 			_ = tx.Rollback()
-			slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq, "error", err)
-			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			return 0, err
 		}
-		// A runtime report written to hosts alone, by a node that was not
-		// writing host_runtime yet, is absorbed into it here, locally
-		// (host_runtime.go). Back-pressured on failure, like the other absorbs.
-		if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts); err != nil {
-			_ = tx.Rollback()
-			slog.Error("replicator: absorbing an unlatched runtime write failed — back-pressuring replication",
-				"origin", entry.Origin, "seq", entry.Seq, "error", err)
-			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
-		}
-
+		held[parkKey(entry.Origin, entry.Hlc)] = pe
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,
@@ -1474,6 +1403,163 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 	// new entries followed by already-seen entries would replay the trailing
 	// duplicates forever.
 	return entries[len(entries)-1].Seq, nil
+}
+
+// applyEntry applies one received mutation entry inside tx. On an error the
+// caller rolls tx back; nothing here does.
+func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.MutationEntry, retry bool) error {
+	// Parse statements. An undecodable entry is not silently skipped: back-pressure so
+	// the sender retries rather than the row being lost with the watermark advanced.
+	var stmts []Statement
+	if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
+		r.client.observeMergeRejected("unknown", "wal", "decode")
+		slog.Error("replicator: undecodable mutation entry — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq, "error", err)
+		return fmt.Errorf("decode mutation entry (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// A valid but empty statement list ([] or null) is not a legitimate mutation — a
+	// correct sender never records one. Back-pressure rather than record it seen, so a
+	// malformed/truncated entry surfaces instead of being silently acknowledged.
+	if len(stmts) == 0 {
+		r.client.observeMergeRejected("unknown", "wal", "empty")
+		slog.Error("replicator: mutation entry has no statements — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq)
+		return fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
+	}
+	if err := validateReceivedMutationEntry(stmts); err != nil {
+		r.client.observeMergeRejected("unknown", "wal", "guard")
+		return fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
+			entry.Origin, entry.Seq, err)
+	}
+	if err := validateGuardedOperationClaim(ctx, tx, stmts); err != nil {
+		r.client.observeMergeRejected("operations", "wal", "guard")
+		return fmt.Errorf("validate guarded operation claim (origin=%s seq=%d): %w",
+			entry.Origin, entry.Seq, err)
+	}
+	legacyDelete, applyLegacy, err := legacyWorkloadDeleteEntryDecision(ctx, tx, stmts)
+	if err != nil {
+		r.client.observeMergeRejected("unknown", "wal", "legacy_delete")
+		return fmt.Errorf("validate legacy workload delete entry (origin=%s seq=%d): %w",
+			entry.Origin, entry.Seq, err)
+	}
+	if legacyDelete && !applyLegacy {
+		// The retained pre-authority wire shape cannot identify a v44
+		// recreate. Skip its entire historical batch—including child
+		// tombstones—while still acknowledging the entry below.
+		//
+		// This is the site that actually fires for a complete pre-authority
+		// delete batch (the per-statement DispLegacyWorkloadDelete branch is
+		// bypassed by this continue). It was silent, which is how a dropped
+		// tombstone stayed invisible: the entry is ACKNOWLEDGED, so nothing
+		// back-pressures and the sender believes it replicated. Naming the
+		// sender is the point — the fix is to upgrade it.
+		// stmts[0] is the parent tombstone (the entry decision enforces
+		// legacyIndex == 0), so the metric can carry the real table — an
+		// operator filtering on table="containers" must see these.
+		r.client.observeMergeRejected(structuralTableLabel(stmts[0].SQL), "wal", "pre_authority_delete")
+		slog.Warn("replicator: skipped a pre-authority workload delete batch (rows kept live here)",
+			"sender", entry.Origin, "seq", entry.Seq,
+			"reason", "the pre-authority shape cannot prove the local row is the same workload it deleted",
+			"fix", "upgrade "+entry.Origin+" so it emits the authority-bearing tombstone")
+		return nil
+	}
+
+	// Apply each statement fail-closed. ANY failure — schema-missing, a constraint
+	// (e.g. a secondary-UNIQUE collision the PK-aware upsert now surfaces instead of
+	// silently deleting), an operational fault, or an invalid/unprovable statement —
+	// rolls back the whole batch and stalls the watermark so nothing is dropped or
+	// recorded as seen. A permanent fault surfaces via replication backlog; the sender
+	// retries. The one exception is a constraint refusal of an entry that can wait
+	// for its own retry (entryParkable): ApplyRemoteMutationsFrom holds that entry
+	// and re-applies the batch without it (parked_entries.go). Logs carry s.SQL
+	// (never s.Params, which hold row data).
+	//
+	// A users row the admin re-mint floor refuses takes its credential
+	// statement in this entry with it (users_admin_guard.go). Decided
+	// before anything applies, against the rows the entry found.
+	refusedRemints, err := r.refusedRemintsInEntry(ctx, tx, stmts)
+	if err != nil {
+		r.client.observeMergeRejected("users", "wal", walRejectReason(err))
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// A use of a release feature this binary does not know quarantines
+	// it BEFORE anything else in this entry — or any later entry of the
+	// batch, which may carry the feature's data — is applied
+	// (release_features.go).
+	r.client.noteReleaseUseStatements(stmts)
+	for _, s := range stmts {
+		if releaseUseApplyHook != nil {
+			releaseUseApplyHook(s)
+		}
+		if remintCredentialStatement(s, refusedRemints) {
+			r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
+			continue
+		}
+		if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
+			// A held entry's periodic retry is not a new refusal: counting it
+			// would keep the rejected-rate alert firing while it is held.
+			if !retry {
+				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
+			}
+			if isSchemaMissingError(err) {
+				slog.Error("replicator: schema-missing on receiver — back-pressuring replication",
+					"sql", s.SQL, "error", err,
+					"hint", "upgrade this daemon to match the sender")
+				return fmt.Errorf("schema-missing on receiver (upgrade required): %w", err)
+			}
+			wrapped := fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+			// A change this node cannot take, of a kind that can wait for
+			// its own retry without changing what anything else means, is
+			// handed back to the caller to hold (parked_entries.go) instead
+			// of stopping the sender's whole stream behind it. The caller
+			// logs whichever it does.
+			if table, rowID, ok := r.entryParkable(stmts, s, err); ok {
+				return &parkableEntryError{table: table, sql: s.SQL, rowID: rowID, err: wrapped}
+			}
+			slog.Error("replicator: apply failed — back-pressuring replication",
+				"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return wrapped
+		}
+		// A row this statement created may be one an earlier update
+		// is parked on. Replayed here, inside the batch, so the rest of
+		// the batch applies on top of it. See parked_updates.go.
+		r.replayParked(ctx, tx, s)
+	}
+	// A secret written by a node that had not latched credentials_split_v1
+	// reaches this node in its old column only; absorb it into the
+	// credential row readers use (credentials_absorb.go). A users row the
+	// re-mint floor refused did not apply here, so it has nothing to absorb.
+	if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(stmts, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
+		slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq, "error", err)
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// A host re-admitted over its tombstone takes no fence credential
+	// from the machine removed under its name (host_readmit.go).
+	if err := retireReadmittedCredentials(ctx, tx, stmts); err != nil {
+		slog.Error("replicator: retiring a re-admitted host's credential failed — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq, "error", err)
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// A state or isolation write to hosts from a node that was not writing
+	// host_membership yet is absorbed into it here, locally
+	// (host_membership.go). Back-pressured on failure, like the secret
+	// absorb: swallowed, it would lose a fence on this node.
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership(), r.client.hostsCopyFrozen()); err != nil {
+		slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq, "error", err)
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+	// A runtime report written to hosts alone, by a node that was not
+	// writing host_runtime yet, is absorbed into it here, locally
+	// (host_runtime.go). Back-pressured on failure, like the other absorbs.
+	if err := absorbUnlatchedRuntimeWrite(ctx, tx, stmts); err != nil {
+		slog.Error("replicator: absorbing an unlatched runtime write failed — back-pressuring replication",
+			"origin", entry.Origin, "seq", entry.Seq, "error", err)
+		return fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+	}
+
+	return nil
 }
 
 // filterUnseen returns entries not yet in the mutation_seen dedup table.
@@ -3248,6 +3334,15 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	// object, and gating by id alone would let the incoming row collide on the secondary UNIQUE
 	// and back-pressure forever. Only INSERTs are resolved this way; an UPDATE by id keeps the
 	// normal LWW path (it converges once the ids have collapsed).
+	//
+	// Before either path, a natural-key collision with a TOMBSTONE under
+	// another id is decided by decideIdentityCollision (identity.go): a name
+	// deleted and then re-created, whatever build minted the new row's id.
+	if sh.Kind == KindInsert && hasIdentityKey(tableName) {
+		if handled, err := r.applyIdentityCollision(ctx, tx, s, sh, tableName, pkCols, incomingHLC); handled || err != nil {
+			return err
+		}
+	}
 	if sh.Kind == KindInsert && r.client.canonicalIdentityOn() && hasIdentityKey(tableName) {
 		return r.applyIdentityInsert(ctx, tx, s, sh, tableName, pkCols)
 	}
@@ -3304,6 +3399,75 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
 	}
 	return err
+}
+
+// applyIdentityCollision decides a replicated INSERT into a natural-key
+// identity table that collides with a tombstone under another id (identity.go).
+// handled=false leaves the statement to the apply as before. An insert that
+// does not carry the id, the natural key and updated_at is not decided here.
+func (r *Replicator) applyIdentityCollision(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, incomingHLC string) (bool, error) {
+	cols, vals, ok := insertRowFromShape(sh, s)
+	if !ok {
+		return false, nil
+	}
+	at := make(map[string]int, len(cols))
+	for i, c := range cols {
+		at[strings.ToLower(c)] = i
+	}
+	idIdx, hasID := at["id"]
+	tsIdx, hasTS := at["updated_at"]
+	if !hasID || !hasTS {
+		return false, nil
+	}
+	natCols := tableIdentityKeys[tableName]
+	natVals := make([]interface{}, len(natCols))
+	for i, col := range natCols {
+		j, has := at[strings.ToLower(col)]
+		if !has {
+			return false, nil
+		}
+		natVals[i] = vals[j]
+	}
+	in := identityIncoming{
+		table: tableName, natVals: natVals,
+		id: coerceString(vals[idIdx]), ts: coerceString(vals[tsIdx]),
+		skewGuard: r.client.hlcSkewGuardOn(), now: time.Now(),
+	}
+	decision, localID, err := decideIdentityCollision(tx, in)
+	if err != nil {
+		return true, err
+	}
+	key := pkKey(natVals)
+	switch decision {
+	case collisionNone:
+		// The insert applies as before. If it lands (this entry commits), any
+		// standing refusal of this row is over.
+		if r.client.hasHeldRefusals() {
+			r.client.deferAfterCommit(tx, func() { r.client.clearHeldRefusal(tableName, in.id) })
+		}
+	case collisionSkipIncoming:
+		r.client.deferAfterCommit(tx, func() {
+			r.client.clearHeldRefusal(tableName, in.id)
+			slog.Info("replicator: skipped a row a newer delete of its name supersedes",
+				"table", tableName, "natural_key", key, "id", in.id, "path", "wal")
+		})
+		return true, nil
+	case collisionYieldLocal:
+		landed, err := r.client.yieldThenApply(tx, tableName, localID, func() (bool, error) {
+			if err := r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC); err != nil {
+				return false, err
+			}
+			return identityRowLanded(tx, tableName, natVals, in.id)
+		})
+		if err == nil && landed {
+			r.client.deferAfterCommit(tx, func() {
+				slog.Info("replicator: a deleted row yielded its name to a newer row",
+					"table", tableName, "natural_key", key, "id", in.id, "path", "wal")
+			})
+		}
+		return true, err
+	}
+	return false, nil
 }
 
 // applyIdentityInsert resolves a replicated INSERT into a natural-key identity table by its

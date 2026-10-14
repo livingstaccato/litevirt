@@ -589,6 +589,23 @@ type AuditVerifyResult struct {
 	// the deletion of a whole run of rows shows up, or a repeated seq, which is
 	// a forked chain and is labelled as a duplicate.
 	SeqGaps []string
+	// SeqDuplicates counts the SeqGaps entries that are a repeated seq (the
+	// forked-chain kind), not a jump.
+	SeqDuplicates int
+	// Every unlinked row is classified, not only the first (BrokenAt):
+	// ContentBreaks counts those whose content does not hash to their stored
+	// hash (an edit); ForkedHosts lists the hosts with a second genesis
+	// (AuditBrokenForked); UnlinkedOutsideForks counts the other unlinked
+	// rows on hosts with no second genesis (a deleted or rewritten row).
+	ContentBreaks        int
+	ForkedHosts          []string
+	UnlinkedOutsideForks int
+	// Orphaned counts unlinked rows on a host with a second genesis whose
+	// stored prev_hash is the hash of no row of that host one seq before them:
+	// their predecessor was deleted (or the row renumbered). A fork does not
+	// excuse them. Orphans names each, as "host: row ID (seq N) ...".
+	Orphaned int
+	Orphans  []string
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
 	Laundered []string
@@ -664,6 +681,21 @@ func (r AuditVerifyResult) Tampered() bool {
 		len(r.SeqGaps) > 0 || len(r.Laundered) > 0 || len(r.TruncatedHosts) > 0 ||
 		len(r.RetiredKeyUse) > 0 || len(r.HeadMismatch) > 0 ||
 		len(r.UnsignedAfterSigned) > 0
+}
+
+// Forked reports whether the only tamper finding is a forked chain: some host
+// has a second genesis (AuditBrokenForked), no row's content fails its hash,
+// every other unlinked row is on a host with a second genesis and links to a
+// row of that host (no Orphaned), and every
+// sequence break is a repeated seq. It is still Tampered — a fork fails verification — but
+// nothing found says a row was edited, deleted or forged, so the periodic
+// verifier names it a forked chain, as `lv audit verify` does.
+func (r AuditVerifyResult) Forked() bool {
+	return len(r.ForkedHosts) > 0 && r.ContentBreaks == 0 && r.UnlinkedOutsideForks == 0 && r.Orphaned == 0 &&
+		len(r.SeqGaps) == r.SeqDuplicates &&
+		len(r.BadSignature) == 0 && len(r.UnknownKeyID) == 0 && len(r.Laundered) == 0 &&
+		len(r.TruncatedHosts) == 0 && len(r.RetiredKeyUse) == 0 && len(r.HeadMismatch) == 0 &&
+		len(r.UnsignedAfterSigned) == 0
 }
 
 // Unverified reports a host that declares its rows are signed and demonstrably
@@ -775,7 +807,16 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	lastUnsigned := map[string]bool{}  // is the host's latest row unsigned?
 	prevByHost := map[string]string{}  // per-host running tail
 	seqByHost := map[string]int64{}    // per-host last seq seen
-	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
+	forkedHost := map[string]bool{}    // hosts with a second genesis
+	// unlinked rows, neither content nor genesis: excused on a forked host
+	// only when they link to a row of that host (see Orphaned)
+	type unlinkedRow struct {
+		host, id, prev string
+		seq            int64
+	}
+	var unlinked []unlinkedRow
+	seqOfHash := map[string]map[string]int64{} // per-host stored content_hash -> seq
+	hashedByHost := map[string]bool{}          // has this host produced a hashed row yet?
 	// Unsigned seq-0 rows of a contracted host, held until the chain says where
 	// they sit. See "seq 0 under a contract" below.
 	legacy := map[string]*legacyRun{}
@@ -830,11 +871,24 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			PrevHash:  prevByHost[host],
 		}
 		linked := strings.EqualFold(HashAuditRow(rec), stored)
-		if !linked && res.BrokenAt == "" {
-			res.BrokenAt = rec.ID
+		if !linked {
 			last, seen := seqByHost[host]
-			res.BrokenKind = brokenLinkKind(rec, r.String("prev_hash"), stored,
+			kind := brokenLinkKind(rec, r.String("prev_hash"), stored,
 				r.Int64("seq") == 1 && seen && last == 1)
+			if res.BrokenAt == "" {
+				res.BrokenAt, res.BrokenKind = rec.ID, kind
+			}
+			switch kind {
+			case AuditBrokenContent:
+				res.ContentBreaks++
+			case AuditBrokenForked:
+				if !forkedHost[host] {
+					forkedHost[host] = true
+					res.ForkedHosts = append(res.ForkedHosts, host)
+				}
+			default:
+				unlinked = append(unlinked, unlinkedRow{host: host, id: rec.ID, prev: r.String("prev_hash"), seq: r.Int64("seq")})
+			}
 		}
 		if run := legacy[host]; run != nil && !linked {
 			run.broken = true
@@ -850,6 +904,10 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 		hashedByHost[host] = true
 		prevByHost[host] = stored
+		if seqOfHash[host] == nil {
+			seqOfHash[host] = map[string]int64{}
+		}
+		seqOfHash[host][strings.ToLower(stored)] = r.Int64("seq")
 
 		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
 
@@ -882,6 +940,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s repeats seq %d (duplicate: two rows claim the same position, a forked chain)",
 						host, rec.ID, seq))
+				res.SeqDuplicates++
 			} else if seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
@@ -1009,6 +1068,38 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		if run := legacy[host]; !run.resolved && run.broken {
 			flagLegacy(host)
 		}
+	}
+
+	// On a host with a second genesis its two chains interleave by seq, so
+	// rows there are unlinked against the walk's running tail as a matter of
+	// course. Only a row that links to a row of its own host, one seq before
+	// it, is part of a chain; one whose stored prev_hash names no such row
+	// lost its predecessor — deleted inside the seq range the other chain
+	// covers, where no seq jump shows it — and is an orphan.
+	for _, u := range unlinked {
+		if !forkedHost[u.host] {
+			res.UnlinkedOutsideForks++
+			continue
+		}
+		if u.prev == "" && u.seq == 1 {
+			continue // a genesis
+		}
+		pseq, ok := seqOfHash[u.host][strings.ToLower(u.prev)]
+		if ok && (u.seq == 0 || pseq == u.seq-1) {
+			continue
+		}
+		res.Orphaned++
+		var why string
+		switch {
+		case ok:
+			why = fmt.Sprintf("which is the hash of row seq %d of %s, not seq %d — renumbered or relinked", pseq, u.host, u.seq-1)
+		case u.seq == 0:
+			why = fmt.Sprintf("which is the hash of no row of %s — a seq-0 row whose predecessor is gone", u.host)
+		default:
+			why = fmt.Sprintf("which is the hash of no row of %s at seq %d — the row before it was deleted", u.host, u.seq-1)
+		}
+		res.Orphans = append(res.Orphans, fmt.Sprintf("%s: row %s (seq %d) follows prev_hash %s, %s",
+			u.host, u.id, u.seq, u.prev, why))
 	}
 
 	for _, host := range hostOrder {

@@ -382,6 +382,11 @@ type Server struct {
 	// has matched target_path to the VM's own disk and before it takes the VM
 	// lock, so a test can change the record in between.
 	restoreTargetResolvedHook func(vmName string)
+	// startTransferProbe reports whether a VM's start parked in "starting" is
+	// a proof-less transfer (health.Reconciler.IsDeferredTransfer), for a
+	// cancel of it to record. Nil: none is.
+	startTransferProbe func(vmName string) bool
+
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)
@@ -2323,6 +2328,10 @@ func (s *Server) SetRealmRegistry(r *auth.Registry) {
 // RealmRegistry returns the configured registry (or nil). Used by the
 // UI to populate the login realm dropdown via availableRealms().
 func (s *Server) RealmRegistry() *auth.Registry { return s.realmRegistry }
+
+// SetStartTransferProbe wires how a cancel of a start tells a proof-less
+// transfer parked in "starting" (health.Reconciler.IsDeferredTransfer).
+func (s *Server) SetStartTransferProbe(fn func(vmName string) bool) { s.startTransferProbe = fn }
 
 // SetFirewallReconciler wires the daemon's firewall reconciler so the
 // ReloadFirewall RPC can drive a synchronous Reconcile.

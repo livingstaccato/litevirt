@@ -1407,6 +1407,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}
+	// A start decided from a pending or starting row that an operator has
+	// since cancelled (`lv stop --force`, start_cancelled.go) is not made.
+	if (vm.State == "pending" || vm.State == "starting") && fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail) {
+		slog.Info("reconciler: VM's start was cancelled after the walk read it; not starting it",
+			"vm", vm.Name, "state", fresh.State, "detail", fresh.StateDetail)
+		r.releaseVMLock(ctx, vm.Name)
+		return
+	}
 	// Releasing the lease is CLEANUP, and cleanup must not inherit the caller's
 	// deadline. reconcilePass bounds this walk with reconcileWalkBudget; on the
 	// very case that budget exists for, it expires mid-start and the DELETE
@@ -1424,7 +1432,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// A proof-less transfer whose image pull outlived the walk is parked in
 	// "starting" (deferPendingStart) and is still that transfer.
 	transfer := fresh.State == "pending" || proofID != "" ||
-		(fresh.State == "starting" && r.deferredTransfers.has(vm.Name))
+		(fresh.State == "starting" && (r.deferredTransfers.has(vm.Name) || r.cancelledTransfer(ctx, vm.Name)))
 
 	// A proof MARKER present with NO gate wired fails CLOSED: we can't verify quorum,
 	// and a marker implies enforcement was active when it was stamped. (Production
@@ -1666,7 +1674,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.virt.UndefineDomainPreservingState(vm.Name)
 	}
 
+	// wroteStarting: this pass's own "starting" write landed, so a stop the
+	// row says from here on was made while the start was under way (the
+	// re-reads before the define and the boot, cancelledSinceStart). A failed
+	// write leaves the row as it was, which for an onboot override is the
+	// operator stop the boot starts over.
+	wroteStarting := true
 	if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "starting", "reconciler"); err != nil {
+		wroteStarting = false
 		slog.Error("reconciler: failover start-marker write failed", "vm", vm.Name, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	} else {
@@ -1926,6 +1941,14 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// own to remove (start_row_gone.go).
 	nvramBefore := nvramExists(r.dataDir, vm.Name)
 
+	// A start the operator cancelled meanwhile (`lv stop --force`) is not
+	// made: the start lease can run out under a slow start (vmLockTTL),
+	// so the cancel may have run inside this one.
+	if r.cancelledSinceStart(ctx, vm, wroteStarting) {
+		slog.Warn("reconciler: not defining the VM — its start was cancelled while it was being made", "vm", vm.Name)
+		return
+	}
+
 	// Define and start the domain.
 	if err := r.virt.DefineDomain(domXML); err != nil {
 		slog.Error("reconciler: define domain", "vm", vm.Name, "error", err)
@@ -1981,6 +2004,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 		if unreadable && proofID != "" {
 			r.failPendingStart(ctx, vm.Name, proofID, true, "not started: "+why)
+		}
+		return
+	}
+	// Again just before the boot: what this pass defined is taken back,
+	// firmware state kept, so the VM is as the cancel found it.
+	if r.cancelledSinceStart(ctx, vm, wroteStarting) {
+		releaseHW()
+		slog.Warn("reconciler: not starting the VM — its start was cancelled while it was being made", "vm", vm.Name)
+		if err := r.virt.UndefineDomainPreservingState(vm.Name); err != nil {
+			slog.Warn("reconciler: could not take back the definition of a VM not started", "vm", vm.Name, "error", err)
 		}
 		return
 	}

@@ -53,7 +53,8 @@ func hostDiskFromPools(pools []*pb.StoragePool, recordedTotalGiB int64) (usedGiB
 }
 
 // hostUsageWithContainers is per-host resource usage as the OPERATOR-FACING views
-// should report it: running-VM CPU/memory and declared disk allocation, plus
+// should report it: the CPU/memory of running and starting VMs
+// (corrosion.SumVMResourcesByHost) and declared disk allocation, plus
 // memory held by running containers.
 //
 // Admission counts container memory against host capacity. A display that counts

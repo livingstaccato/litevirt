@@ -285,3 +285,26 @@ func TestAuditVerifyNamesTheKindOfBreak(t *testing.T) {
 		})
 	}
 }
+
+// Re-review m-3: an orphaned row (a deletion a fork hides) is named, under
+// its own heading, so the operator can act on the finding the hourly check
+// reports.
+//
+// Mutation: the orphaned group not printed — red.
+func TestAuditVerifyNamesOrphanedRows(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true,
+		SeqGaps:      []string{"node-3: row fork-1 repeats seq 1 (duplicate: two rows claim the same position, a forked chain)"},
+		OrphanedRows: []string{"node-3: row r3 (seq 3) follows prev_hash abc, which is the hash of no row of node-3 at seq 2 — the row before it was deleted"},
+	})
+	if err == nil {
+		t.Fatal("an orphaned row must fail the command")
+	}
+	got := out.String()
+	for _, want := range []string{"orphaned (on a forked host, the row before it was deleted, or it was relinked", "node-3: row r3 (seq 3)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q:\n%s", want, got)
+		}
+	}
+}

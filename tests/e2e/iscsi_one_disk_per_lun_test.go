@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -151,7 +150,7 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 		yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n%s    placement:\n      host: %s\n",
 			stack, vm, drillImage(), drillMemory(), disks, host)
 		file := "/tmp/" + stack + ".yaml"
-		l.mustSSH(host, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+		l.putFile(host, file, yaml)
 		t.Cleanup(func() { l.deleteVMs(stack, map[string]string{host: vm}) })
 		out, err := l.lv(host, "compose", "up", "-f", file, "-y")
 		if err != nil {

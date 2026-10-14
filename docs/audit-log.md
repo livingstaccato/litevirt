@@ -277,9 +277,16 @@ gets exactly one close row. The stop marks the console audit before it stops
 serving, so a session that ends in that window (up to 5 seconds while the
 daemon lets RPCs finish, and up to 5 more while it stops the server outright)
 without an error also reads `ended=daemon-stop`; one that ends with an error
-keeps it. This holds when the daemon gives up on stopping the server because
-a request is stuck on storage that does not answer: every console stream has
-been cancelled by then, and the close rows are written all the same. The
+keeps it. A session the server stop cuts (the second window) while the VM is
+sending it output usually ends with an error, because the send to the
+viewer fails first: its close row has `result=error` and, for VNC,
+`ended="VNC proxy error: rpc error: code = Unavailable desc = transport is
+closing"` (the serial console's and SPICE's say `console error:` and `SPICE
+proxy error:`). A session that is idle when it is cut reads
+`ended=daemon-stop`. This holds when the daemon gives up on stopping the
+server because a request is stuck on storage that does not answer: every
+console stream has been cancelled by then, and the close rows are written as
+on any other stop. The
 flush is bounded at 3 seconds, plus at most one row already being written
 when that passes: past that, against a stalled database, rows still being
 written are logged as lost rather than holding up the rest of the shutdown.
@@ -393,6 +400,13 @@ grouped by what it means:
   which is a forked chain — a second writer, or a host that appended to a
   replica still missing its own history (see "Rebuilding a host under its old
   name" below) — and is labelled as one rather than as a deletion.
+- **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
+  is the hash of no row of that host one seq before it: the row before it was
+  deleted, or the row was renumbered or relinked. The two chains of a forked host interleave by seq, so the deletion
+  leaves no sequence break; this lists each such row by host, id and seq. A
+  fork whose only other findings are its duplicate seqs is reported as a
+  forked chain by the hourly check; one with an orphaned row is reported as
+  tampering.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist,
   or a host's seq-0 legacy anchor names a hash that no seq-0 row of that host
@@ -1143,9 +1157,11 @@ lv audit ls --action image.prune_version
   its own rather than waiting to be asked: a check that only happens when an
   operator types `lv audit verify` finds an intrusion after whatever prompted
   them to look. The outcome is published as
-  `litevirt_audit_chain_last_verified_ok` (1 when the last check found no
-  evidence of tampering), with a per-kind breakdown in
-  `litevirt_audit_chain_findings` and a
+  `litevirt_audit_chain_last_verified_ok` (1 when the last check found the
+  chain intact), with a per-kind breakdown in
+  `litevirt_audit_chain_findings` (a forked chain is `forked_chain` and its
+  repeated seqs `seq_duplicate`, not `broken_hash` and `seq_gap`; its log line
+  says "found a forked chain", not "evidence of tampering") and a
   `litevirt_audit_chain_heads_published_total` counter. Alert on the first
   going to 0; a stalled head counter means truncation detection has quietly
   stopped.

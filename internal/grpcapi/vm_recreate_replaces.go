@@ -80,6 +80,11 @@ type replacedVM struct {
 	// that hold stands.
 	holdToken string
 	holdHost  string
+	// rowOnly: the create names this row only so that its existence check
+	// does not refuse it (withReplacedRow) — it is not a re-create of the
+	// incarnation in any other way: replacedVMFor does not return it, so its
+	// NIC guards are admitted and its LUNs claimed as a new VM's.
+	rowOnly bool
 }
 
 // withReplacedVM returns ctx carrying vm's identity into the create that
@@ -91,8 +96,42 @@ func withReplacedVM(ctx context.Context, vm *corrosion.VMRecord) context.Context
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: vm.Name, snap: corrosion.SnapshotForDelete(*vm)})
 }
 
-// replacedVMFor returns the replaced VM ctx carries when it is named name.
+// withReplacedRow returns ctx carrying vm's row into the create that
+// re-creates it, for its existence check only (replacedVM.rowOnly): an inline
+// compose re-create, which creates from the file as a new VM, deletes the VM
+// on its owner and then creates on a host whose replica may still hold the
+// row (lab 1, 2026-10-13, F1). Call it only once vm's delete has torn it down.
+func withReplacedRow(ctx context.Context, vm *corrosion.VMRecord) context.Context {
+	if vm == nil || vm.Name == "" || vm.CreatedAt == "" {
+		return ctx
+	}
+	return withReplacedRowSnapshot(ctx, vm.Name, corrosion.SnapshotForDelete(*vm))
+}
+
+// withReplacedRowSnapshot is withReplacedRow for the row as snap describes
+// it: the one the deleting host reported it tombstoned (deletedVMSink), which
+// the entry's own copy may be behind (a resize or a migration not yet
+// replicated here).
+func withReplacedRowSnapshot(ctx context.Context, name string, snap corrosion.VMDeleteSnapshot) context.Context {
+	if name == "" || snap.CreatedAt == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: name, snap: snap, rowOnly: true})
+}
+
+// replacedVMFor returns the replaced VM ctx carries when it is named name,
+// and the create re-creates it (not a row named for its existence check only).
 func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
+	r, ok := replacedRowFor(ctx, name)
+	if !ok || r.rowOnly {
+		return replacedVM{}, false
+	}
+	return r, true
+}
+
+// replacedRowFor returns the replaced VM ctx carries when it is named name,
+// of either kind: what the create's existence check settles.
+func replacedRowFor(ctx context.Context, name string) (replacedVM, bool) {
 	r, ok := ctx.Value(replacedVMKey{}).(replacedVM)
 	if !ok || name == "" || r.name != name || r.snap.CreatedAt == "" {
 		return replacedVM{}, false
@@ -121,8 +160,8 @@ func withReplacedSnapshot(ctx context.Context, name string, snap corrosion.VMDel
 // isRecreateDelete reports whether ctx is a rebuild's or recreate's delete
 // of the VM it re-creates (it carries a deleted-VM sink).
 func isRecreateDelete(ctx context.Context) bool {
-	_, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
-	return ok
+	sink, ok := ctx.Value(deletedVMSinkKey{}).(*deletedVMSink)
+	return ok && !sink.reportOnly
 }
 
 // deletedVMSinkKey carries a *deletedVMSink in a context.
@@ -135,12 +174,24 @@ type deletedVMSinkKey struct{}
 type deletedVMSink struct {
 	name, createdAt string
 	snap            *corrosion.VMDeleteSnapshot
+	// reportOnly: the sink only takes the report; the delete is otherwise a
+	// plain one (isRecreateDelete is false), as an inline compose re-create
+	// of a VM on no LUN is (withDeletedVMReport).
+	reportOnly bool
 }
 
 // withDeletedVMSink returns ctx with a sink for the delete of name, whose
 // incarnation in the caller's copy is createdAt.
 func withDeletedVMSink(ctx context.Context, name, createdAt string) (context.Context, *deletedVMSink) {
 	sink := &deletedVMSink{name: name, createdAt: createdAt}
+	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
+}
+
+// withDeletedVMReport is withDeletedVMSink for a delete that is otherwise a
+// plain one: it takes the deleting host's report of the row and changes
+// nothing else about the delete.
+func withDeletedVMReport(ctx context.Context, name, createdAt string) (context.Context, *deletedVMSink) {
+	sink := &deletedVMSink{name: name, createdAt: createdAt, reportOnly: true}
 	return context.WithValue(ctx, deletedVMSinkKey{}, sink), sink
 }
 
@@ -235,6 +286,12 @@ func (s *Server) withReplacedLUNs(ctx context.Context, vm *corrosion.VMRecord) c
 // (acceptReplacedVMMD), which hands one over only for a VM it has deleted.
 const replacedVMMD = "x-litevirt-recreate-replaces"
 
+// replacedRowMD hands over a row-only replaced VM (withReplacedRow) under a
+// key of its own, so a host on an older build ignores it — and refuses
+// AlreadyExists until its replica has the tombstone, which the entry's
+// forward retries past — rather than take it for a full re-create.
+const replacedRowMD = "x-litevirt-recreate-replaces-row"
+
 type replacedVMWire struct {
 	Name           string            `json:"name"`
 	CreatedAt      string            `json:"created_at"`
@@ -253,9 +310,19 @@ type replacedVMWire struct {
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
 // to its outgoing metadata, or ctx unchanged when it holds none.
 func withReplacedVMMD(ctx context.Context, name string) context.Context {
-	r, ok := replacedVMFor(ctx, name)
+	r, ok := replacedRowFor(ctx, name)
 	if !ok {
 		return ctx
+	}
+	if r.rowOnly {
+		b, err := json.Marshal(replacedVMWire{
+			Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
+			OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
+		})
+		if err != nil {
+			return ctx
+		}
+		return metadata.AppendToOutgoingContext(ctx, replacedRowMD, string(b))
 	}
 	b, err := json.Marshal(replacedVMWire{
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
@@ -277,7 +344,13 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	if !ok {
 		return ctx
 	}
-	vals := md.Get(replacedVMMD)
+	vals, rows := md.Get(replacedVMMD), md.Get(replacedRowMD)
+	rowOnly := len(vals) == 0 && len(rows) == 1
+	if rowOnly {
+		vals = rows
+	} else if len(rows) != 0 {
+		return ctx
+	}
 	if len(vals) != 1 || s.requirePeerCert(ctx) != nil {
 		return ctx
 	}
@@ -287,6 +360,12 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	if err := json.Unmarshal([]byte(vals[0]), &w); err != nil || w.Name == "" || w.CreatedAt == "" ||
 		w.HostName == "" || w.IdentityHash == "" {
 		return ctx
+	}
+	if rowOnly {
+		return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
+			CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
+			SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+		}, rowOnly: true})
 	}
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
@@ -308,7 +387,7 @@ func (s *Server) replacedTombstoneWaitBound() time.Duration {
 // itself after waiting — and false when it is anything else, which the create
 // refuses AlreadyExists as before.
 func (s *Server) settleReplacedVM(ctx context.Context, existing *corrosion.VMRecord) (bool, error) {
-	r, ok := replacedVMFor(ctx, existing.Name)
+	r, ok := replacedRowFor(ctx, existing.Name)
 	if !ok || !r.snap.Covers(*existing) {
 		return false, nil
 	}

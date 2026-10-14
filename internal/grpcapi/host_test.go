@@ -430,6 +430,11 @@ func TestListHosts_ReturnsLabels(t *testing.T) {
 
 	insertTestHost(t, ctx, s.db, "node-1", "active")
 	insertTestHost(t, ctx, s.db, "node-2", "active")
+	// An operator sets a label first; the reported counts land afterwards and
+	// must not replace it.
+	if err := corrosion.SetHostLabels(ctx, s.db, "node-2", map[string]string{"rack": "r12"}, nil); err != nil {
+		t.Fatalf("SetHostLabels (operator): %v", err)
+	}
 	want := hostupdates.Status{Supported: true, Manager: "apt", Pending: 25, Security: 4}.Labels()
 	if err := corrosion.SetHostLabels(ctx, s.db, "node-2", want, nil); err != nil {
 		t.Fatalf("SetHostLabels: %v", err)
@@ -445,6 +450,9 @@ func TestListHosts_ReturnsLabels(t *testing.T) {
 	}
 	if got["node-2"][hostupdates.LabelPending] != "25" || got["node-2"][hostupdates.LabelSecurity] != "4" {
 		t.Errorf("node-2 labels = %v, want %s=25 and %s=4", got["node-2"], hostupdates.LabelPending, hostupdates.LabelSecurity)
+	}
+	if got["node-2"]["rack"] != "r12" {
+		t.Errorf("node-2 operator label rack = %q, want r12 (labels %v)", got["node-2"]["rack"], got["node-2"])
 	}
 	if len(got["node-1"]) != 0 {
 		t.Errorf("node-1 labels = %v, want none", got["node-1"])

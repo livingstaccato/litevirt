@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -71,7 +70,7 @@ func TestLab_CephVMDisks(t *testing.T) {
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), pool, pool, src)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(src, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(src, file, yaml)
 	clone := stack + "-copy"
 	t.Cleanup(func() {
 		l.lv(src, "rm", "--force", clone)
@@ -256,7 +255,7 @@ func TestLab_CephVMDisks(t *testing.T) {
 	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		badStack, bad, drillImage(), drillMemory(), pool, elsewhere, src)
 	badFile := "/tmp/" + badStack + ".yaml"
-	l.mustSSH(src, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(badYAML))+" | base64 -d > "+badFile)
+	l.putFile(src, badFile, badYAML)
 	t.Cleanup(func() { l.deleteVMs(badStack, map[string]string{src: bad}) })
 	since := l.nodeNow(src)
 	out, err := l.lv(src, "compose", "up", "-f", badFile, "-y")

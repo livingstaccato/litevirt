@@ -6,6 +6,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"os"
@@ -151,9 +152,31 @@ func openConsole(t *testing.T, s *Server, ctx context.Context, kind string) (ref
 		case err := <-done:
 			return err
 		case <-time.After(5 * time.Second):
-			t.Fatalf("%s: the handler did not end 5s after its stream did", kind)
-			return nil
+			// Errorf, not Fatalf: end may run on a goroutine a test spawned,
+			// where Fatalf would end only that goroutine and leave the test
+			// waiting on it until the package timeout.
+			t.Errorf("%s: the handler did not end 5s after its stream did", kind)
+			return errHandlerDidNotEnd
 		}
+	}
+}
+
+// errHandlerDidNotEnd is what an openConsole end returns when the handler
+// has not ended 5s after its stream did.
+var errHandlerDidNotEnd = errors.New("the console handler did not end")
+
+// awaitEnd waits for an end() a test ran on a goroutine of its own, and fails
+// the test, from the test goroutine, if that end failed or never returned:
+// a regression fails the test at once instead of hanging the package.
+func awaitEnd(t *testing.T, ended <-chan error) {
+	t.Helper()
+	select {
+	case err := <-ended:
+		if errors.Is(err, errHandlerDidNotEnd) {
+			t.Fatal("the console handler did not end")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("end() did not return within 10s")
 	}
 }
 
@@ -607,7 +630,7 @@ func TestConsoleAudit_FlushWaitsForACloseItsHandlerIsWriting(t *testing.T) {
 	if len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {
 		t.Fatalf("close rows when the flush returned = %+v, want exactly one, ended=daemon-stop", closes)
 	}
-	<-ended
+	awaitEnd(t, ended)
 	time.Sleep(200 * time.Millisecond)
 	if n := len(rowsWith(consoleAuditRows(t, s), "vm.console.close", "vnc")); n != 1 {
 		t.Fatalf("%d close rows after the flush, want still 1", n)
@@ -657,7 +680,7 @@ func TestConsoleAudit_TheFlushDoesNotRaceAHandlerTheStopWoke(t *testing.T) {
 
 	s.MarkConsoleShutdown()
 	s.FlushConsoleAudit()
-	<-handlerDone
+	awaitEnd(t, handlerDone)
 	closes := rowsWith(consoleAuditRows(t, s), "vm.console.close", "vnc")
 	if len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {
 		t.Fatalf("close rows = %+v, want exactly one, ended=daemon-stop", closes)
@@ -712,7 +735,7 @@ func TestConsoleAudit_TheFlushGivesUpAtItsDeadline(t *testing.T) {
 	if claimed {
 		t.Error("a row was taken on after the flush")
 	}
-	<-ended
+	awaitEnd(t, ended)
 }
 
 // lockedLog is a goroutine-safe log sink.
@@ -755,7 +778,11 @@ func TestConsoleAudit_ASessionAcceptedDuringTheFlushIsClosedByIt(t *testing.T) {
 	s.MarkConsoleShutdown()
 	ended := make(chan error, 1)
 	go func() { ended <- end() }()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never began its close row")
+	}
 	flushed := make(chan struct{})
 	go func() { s.FlushConsoleAudit(); close(flushed) }()
 	time.Sleep(100 * time.Millisecond) // the flush has swept and is waiting
@@ -763,8 +790,12 @@ func TestConsoleAudit_ASessionAcceptedDuringTheFlushIsClosedByIt(t *testing.T) {
 	late := s.beginConsoleAudit(alice, consoleKindSerial, "desk")
 	late.setOwner(s.hostName)
 	late.accept(nil)
-	<-flushed
-	<-ended
+	select {
+	case <-flushed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the flush did not return within 10s")
+	}
+	awaitEnd(t, ended)
 	rows := consoleAuditRows(t, s)
 	open, closes := rowsWith(rows, "vm.console.open", "serial"), rowsWith(rows, "vm.console.close", "serial")
 	if len(open) != 1 || len(closes) != 1 || auditField(closes[0].detail, "ended") != "daemon-stop" {

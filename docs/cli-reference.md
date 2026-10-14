@@ -197,8 +197,8 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
 
 lv ls [--stack <name>] [--host <name>]    # List VMs
 lv inspect <vm>                           # VM details
-lv start <vm>                             # Start stopped VM
-lv stop <vm> [--force]                    # Stop VM (--force = hard power off)
+lv start <vm>                             # Start stopped VM; one whose start a forced stop cancelled goes back to starting, and the reconciler defines and starts it
+lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds as a no-op, recording the stop (an error VM is left as it is, its set-aside disk copies held); one being started (pending/starting) is refused until it runs; with --force, one being started with no domain defined has its start cancelled (stopped, its set-aside disk copies still held)
 lv restart <vm>                           # Restart VM
 lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)
@@ -392,7 +392,7 @@ lv ct create <name> --network bridge=<br>[,name=eth0,ip=<cidr>,mac=..]   # raw N
 lv ct create <name> --restart on-failure [--restart-max-attempts 5 --restart-delay 5s]  # auto-restart on unexpected stop
 lv ct create <name> --on-host-failure image-recreate   # rebuild on a surviving host if this one is fenced
 lv ct start <name>
-lv ct stop <name>
+lv ct stop <name>                                     # a container already stopped succeeds, recording the stop
 lv ct rm <name>                                       # a stopped container; a running one is refused
 lv ct rm <name> --force                               # a running container: stopped, then deleted
 lv ct ls
@@ -1091,9 +1091,9 @@ lv backup restore-live --repo <p> --vm <v> --disk <d> \
   [--blockpull]       # after start, localize the disk then tear down the NBD server
   [--from-existing]   # fall back to an existing vms record for the VM spec
 
-# Legacy file-export interface (full-disk; no dedup)
-lv backup create <vm> [-o backup.qcow2]
-lv backup restore <file> --name <vm> --cpu 2 --memory 2048
+# Aliases: `lv backup create` is `lv backup snapshot`, `lv backup restore` is `lv backup restore-from`
+lv backup create <vm> --repo <path> [flags as snapshot]
+lv backup restore --repo <p> --vm <v> --disk <d> --timestamp <ts> [flags as restore-from]
 ```
 
 ## Replication

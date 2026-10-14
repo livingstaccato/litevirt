@@ -85,7 +85,7 @@ var (
 // Only a call of the same op, on the same path, with the same result type T
 // is joined: a joined call returns exactly what that call returns.
 func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
-	return boundedFor(fsCallBound.get(), op, path, fn)
+	return boundedFor(nil, fsCallBound.get(), op, path, fn)
 }
 
 // BoundedOuter is Bounded for a call that itself makes bounded calls (a VM
@@ -93,12 +93,18 @@ func Bounded[T any](op, path string, fn func() (T, error)) (T, error) {
 // four bounds, so the calls inside it give up, and it goes on past them,
 // before it does.
 func BoundedOuter[T any](op, path string, fn func() (T, error)) (T, error) {
-	return boundedFor(4*fsCallBound.get(), op, path, fn)
+	return boundedFor(nil, 4*fsCallBound.get(), op, path, fn)
 }
 
-func boundedFor[T any](bound time.Duration, op, path string, fn func() (T, error)) (T, error) {
+// boundedIn is Bounded judging path against t, the mount table of the
+// operation it is part of; a nil or empty t is read now.
+func boundedIn[T any](t *MountTable, op, path string, fn func() (T, error)) (T, error) {
+	return boundedFor(t, fsCallBound.get(), op, path, fn)
+}
+
+func boundedFor[T any](mt *MountTable, bound time.Duration, op, path string, fn func() (T, error)) (T, error) {
 	typ := reflect.TypeFor[T]().String()
-	v, err := boundedCall(bound, op, typ, path, func() (any, error) { return fn() })
+	v, err := boundedCall(mt, bound, op, typ, path, func() (any, error) { return fn() })
 	if err != nil {
 		var zero T
 		if t, ok := v.(T); ok {
@@ -113,9 +119,9 @@ func boundedFor[T any](bound time.Duration, op, path string, fn func() (T, error
 	return t, nil
 }
 
-func boundedCall(bound time.Duration, op, typ, path string, fn func() (any, error)) (any, error) {
+func boundedCall(t *MountTable, bound time.Duration, op, typ, path string, fn func() (any, error)) (any, error) {
 	path = filepath.Clean(path)
-	mount := networkMountOf(path)
+	mount := networkMountOf(t, path)
 	if mount.key != "" && mountUnanswered(mount.key) {
 		return nil, &FSNoAnswerError{Op: op, Path: path, Mount: mount.dir, Earlier: true}
 	}
@@ -176,14 +182,18 @@ func mountUnanswered(mount string) bool {
 }
 
 // networkMountOf is the mount point of the network filesystem path lies on
-// (the deepest mount containing it, as written), or "" when it lies on none
-// or the mount table cannot be read. No system call touches path.
-func networkMountOf(path string) netMount {
-	t, err := ReadMountTable()
+// (the deepest mount containing it, as written) in t, or in the mount table
+// read now when t is nil or empty, or "" when it lies on none or the mount
+// table cannot be read. No system call touches path.
+func networkMountOf(t *MountTable, path string) netMount {
+	if t != nil && !t.Empty() {
+		return t.networkMountOf(path)
+	}
+	mt, err := ReadMountTable()
 	if err != nil {
 		return netMount{}
 	}
-	return t.networkMountOf(path)
+	return mt.networkMountOf(path)
 }
 
 // netMount is a network mount a path lies on: its directory (for messages)
@@ -252,7 +262,7 @@ func resolveBounded(t *MountTable, p string) (string, error) {
 		return clean, nil
 	}
 	resolve := resolvePathFn.get()
-	return Bounded("resolve the symlinks of", clean, func() (string, error) { return resolve(clean), nil })
+	return boundedIn(t, "resolve the symlinks of", clean, func() (string, error) { return resolve(clean), nil })
 }
 
 // evalSymlinksFn is filepath.EvalSymlinks; tests replace it.
@@ -266,12 +276,23 @@ var evalSymlinksFn = newTestHook(filepath.EvalSymlinks)
 // other is evaluated under Bounded, and an *FSNoAnswerError when it does not
 // finish in time.
 func EvalSymlinksBounded(p string) (string, error) {
+	return evalSymlinksIn(nil, p)
+}
+
+// evalSymlinksIn is EvalSymlinksBounded against t (a nil or empty one is read
+// now).
+func evalSymlinksIn(t *MountTable, p string) (string, error) {
 	clean := filepath.Clean(p)
-	if t, err := ReadMountTable(); err == nil && t.isMountPoint(clean) {
+	if t == nil || t.Empty() {
+		if mt, err := ReadMountTable(); err == nil {
+			t = &mt
+		}
+	}
+	if t != nil && t.isMountPoint(clean) {
 		return clean, nil
 	}
 	eval := evalSymlinksFn.get()
-	return Bounded("evaluate the symlinks of", clean, func() (string, error) { return eval(clean) })
+	return boundedIn(t, "evaluate the symlinks of", clean, func() (string, error) { return eval(clean) })
 }
 
 // PrimeBounded resolves every path at once — as EvalSymlinksBounded does and
@@ -295,7 +316,7 @@ func PrimeBounded(paths ...string) {
 		}
 		seen[filepath.Clean(p)] = true
 		wg.Add(2)
-		go func() { defer wg.Done(); _, _ = EvalSymlinksBounded(p) }()
+		go func() { defer wg.Done(); _, _ = evalSymlinksIn(t, p) }()
 		go func() { defer wg.Done(); _, _ = resolveBounded(t, p) }()
 	}
 	wg.Wait()

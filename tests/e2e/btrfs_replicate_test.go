@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -45,7 +44,9 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 	l.mustSSH(h, 2*time.Minute, fmt.Sprintf(
 		"umount %[1]s 2>/dev/null; rm -f %[2]s && truncate -s 3G %[2]s && mkfs.btrfs -q -f %[2]s && mkdir -p %[1]s && mount -o loop %[2]s %[1]s && mkdir %[3]s %[4]s",
 		btrfsE2EMount, img, srcDir, copiesDir))
-	t.Cleanup(func() { l.ssh(h, 60*time.Second, fmt.Sprintf("umount %s; rm -f %s", btrfsE2EMount, img)) })
+	t.Cleanup(func() {
+		l.ssh(h, 60*time.Second, fmt.Sprintf("umount %s; rmdir %s; rm -f %s", btrfsE2EMount, btrfsE2EMount, img))
+	})
 
 	suffix := strings.TrimPrefix(uniqueName("btr"), "e2e-")
 	srcPool, copiesPool := "btrsrc-"+suffix, "btrcopies-"+suffix
@@ -60,7 +61,7 @@ func TestLab_BtrfsNativeReplicate(t *testing.T) {
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), srcPool, srcPool, h)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(h, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(h, file, yaml)
 	t.Cleanup(func() { l.deleteVMs(stack, map[string]string{h: vm}) })
 	if out, err := l.lv(h, "compose", "up", "-f", file, "-y"); err != nil {
 		t.Fatalf("compose up %s: %v\n%s", stack, err, out)

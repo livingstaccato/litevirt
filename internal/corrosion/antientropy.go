@@ -84,6 +84,9 @@ func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *Anti
 	if interval == 0 {
 		interval = 60 * time.Second
 	}
+	// A refusal this node's passes raise must outlast the gap between them
+	// (held_refusals.go).
+	client.setHeldRefusalInterval(interval)
 	return &AntiEntropy{
 		client:   client,
 		pkiDir:   pkiDir,

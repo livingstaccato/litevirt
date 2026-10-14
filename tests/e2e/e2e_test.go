@@ -1146,7 +1146,7 @@ func TestUser_TokenCreateRevoke(t *testing.T) {
 	if out == "" {
 		t.Fatal("token-create returned empty")
 	}
-	t.Logf("token output: %s", strings.TrimSpace(out))
+	t.Logf("token output: %s", redacted(strings.TrimSpace(out)))
 
 	lv(t, "user", "delete", username)
 }
@@ -1168,7 +1168,7 @@ func TestUser_RBACEnforcement(t *testing.T) {
 			break
 		}
 	}
-	t.Logf("viewer token: %s", token)
+	t.Logf("viewer token: %s", redacted(token))
 
 	// Verify viewer can list but not create users via REST.
 	if restURL == "" || token == "" {
@@ -1715,12 +1715,15 @@ func TestVM_BackupRestore(t *testing.T) {
 	requireImage(t)
 
 	name := uniqueName("bk")
-	restoredName := uniqueName("rs")
-	backupFile := fmt.Sprintf("/tmp/e2e-backup-%d.qcow2", os.Getpid())
+	repo := fmt.Sprintf("/var/tmp/e2e-backup-%d", os.Getpid())
+	ts := time.Now().UTC().Format(time.RFC3339)
+	var restored string
 	cleanup(t, func() {
 		lvErr(t, "rm", name, "--force")
-		lvErr(t, "rm", restoredName, "--force")
-		os.Remove(backupFile)
+		if restored != "" {
+			os.Remove(restored)
+		}
+		os.RemoveAll(repo)
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
@@ -1728,18 +1731,20 @@ func TestVM_BackupRestore(t *testing.T) {
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
-	lv(t, "backup", "create", name, "-o", backupFile)
-
-	if _, err := os.Stat(backupFile); os.IsNotExist(err) {
-		t.Fatal("backup file not created")
+	// `backup create` and `backup restore` are the repo-backed snapshot
+	// and restore-from (the raw full-disk stream they used is retired).
+	lv(t, "backup", "repo", "init", repo)
+	if out := lv(t, "backup", "create", name, "--repo", repo, "--quiesce", "off", "--timestamp", ts); !strings.Contains(out, "[done] manifest="+ts) {
+		t.Fatalf("backup create printed no [done] line for %s:\n%s", ts, out)
 	}
-
-	lv(t, "backup", "restore", backupFile, "--name", restoredName,
-		"--cpu", "1", "--memory", "1024")
-	waitVM(t, restoredName, "RUNNING", 2*time.Minute)
+	out := lv(t, "backup", "restore", "--repo", repo, "--vm", name, "--disk", "root", "--timestamp", ts)
+	m := regexp.MustCompile(`restored to (\S+)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("backup restore printed no target:\n%s", out)
+	}
+	restored = m[1]
 
 	lv(t, "rm", name, "--force")
-	lv(t, "rm", restoredName, "--force")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

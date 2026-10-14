@@ -742,6 +742,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
 	d.metrics.SetReplicationTargets(repl.Targets)
 	d.metrics.SetRelayRoles(repl.RelayRoles)
+	d.metrics.SetParkedEntries(repl.ParkedCounts)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
 	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
 	// and bound an EPHEMERAL port on every interface — an unauthenticated
@@ -1244,6 +1245,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)
+	// A cancel of a start records whether it was a proof-less transfer.
+	svc.SetStartTransferProbe(reconciler.IsDeferredTransfer)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)

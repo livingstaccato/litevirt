@@ -8,6 +8,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // TestVMNeedsFailover pins the rule for "would this coordinator ever move this VM
@@ -580,5 +581,54 @@ func TestRun_UnreadableLeaseLeavesTheStrandedGaugeAlone(t *testing.T) {
 		t.Fatalf("an unreadable lease published stranded_workloads = %d (%d write(s)); "+
 			"publishing 0 asserts that nothing is stranded, and this node knows nothing",
 			fm.stranded, fm.strandedSets)
+	}
+}
+
+// quorumNoGate reads a definite No for the cluster-wide quorum.
+type quorumNoGate struct{ fakeFailoverGate }
+
+func (quorumNoGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
+	return health.QuorumNo, 1, 2
+}
+
+// TestRun_LostMajorityLeavesTheStrandedGaugeAlone: a leader that loses the
+// voter majority stops renewing the failover lease, but that is not "another
+// node holds it". When no node has a majority, nobody holds it, and every
+// node clearing stranded_workloads to 0 would clear the alert in exactly the
+// incident it exists for. The former leader keeps its last value.
+//
+// Mutation: return (false, nil) from acquireLeaseResult's quorum branch — the
+// gauge is stepped down to 0 and this goes red.
+func TestRun_LostMajorityLeavesTheStrandedGaugeAlone(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, h := range []struct{ name, state string }{{"stale", "fenced"}, {"coord", "active"}} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h.name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: h.state, FenceStrategy: "best-effort",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "stale", State: "running", Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	c := newTestCoordinator("coord", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.run(ctx)
+	if fm.stranded != 1 {
+		t.Fatalf("premise: gauge = %d while leader, want 1", fm.stranded)
+	}
+
+	c.Gate = quorumNoGate{}
+	c.run(ctx)
+	if c.LeaseTerm() != 0 {
+		t.Fatalf("still holding a lease term %d with the voter majority lost", c.LeaseTerm())
+	}
+	if fm.stranded != 1 {
+		t.Fatalf("gauge = %d after the leader lost the voter majority, want its last value 1", fm.stranded)
 	}
 }

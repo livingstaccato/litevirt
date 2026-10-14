@@ -632,7 +632,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		// store problem is fleet-wide -- the case where workloads are most
 		// likely to be stranded -- every node takes this path, max() across
 		// instances reads 0, and the alert clears exactly when it should fire.
-		// Same rule the strandedWorkloads branch below already follows.
+		// Same rule the strandedWorkloads branch below already follows. It
+		// covers a node standing down for want of the voter majority too
+		// (errLeaseNoQuorum): with none anywhere, nobody holds the lease.
 		if leaseErr == nil {
 			c.stepDownGauges()
 		}
@@ -1394,7 +1396,12 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		}
 		c.leaseTerm.Store(0)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNoQuorum)
-		return false, nil
+		// Not (false, nil): that is "another node holds the lease", on which
+		// run steps this node's gauges down. When every node has lost its
+		// majority nobody holds it, and every node publishing
+		// stranded_workloads = 0 would clear the alert in exactly the
+		// incident it is for. The former leader keeps its last values.
+		return false, errLeaseNoQuorum
 	}
 	if c.leaseQuorumLost.Swap(false) {
 		slog.Info("failover: the voter majority is back; contending for the failover lease again")
@@ -1420,11 +1427,22 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// errLeaseNoQuorum is acquireLeaseResult standing down because this node has
+// lost every voter majority it could decide on.
+var errLeaseNoQuorum = errors.New("this node has lost the voter majority")
+
 // lostEveryDecisionQuorum is health.LostEveryDecisionQuorum over this
 // coordinator's gate: a node that has lost every voter majority it could
 // decide a failover on neither takes nor renews the failover lease. A
 // coordinator with no gate keeps today's behaviour, and one whose gate cannot
 // answer the regional question counts no region.
+//
+// The failover lease asks more of a reading than the other leases do: a
+// scope holds only on a Yes outside its quorum-regain grace (QuorumRegain).
+// Unknown is not a Yes, so a holder that restarts inside a partition does not
+// renew during its warmup, and one whose quorum flaps renews only once a Yes
+// has lasted the grace. Either would otherwise keep refreshing its lease on a
+// node bridging the halves.
 func (c *Coordinator) lostEveryDecisionQuorum(ctx context.Context) bool {
 	if c.Gate == nil {
 		return false
@@ -1433,7 +1451,10 @@ func (c *Coordinator) lostEveryDecisionQuorum(ctx context.Context) bool {
 	if rg, ok := c.Gate.(RegionGate); ok {
 		region = rg.RegionQuorumProof
 	}
-	return health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region)
+	held := func(ctx context.Context, st health.QuorumState, scope string) bool {
+		return st == health.QuorumYes && (c.QuorumRegain == nil || !c.QuorumRegain(ctx, scope))
+	}
+	return health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region, held)
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,

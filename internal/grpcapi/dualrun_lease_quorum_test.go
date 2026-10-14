@@ -5,6 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -45,5 +49,22 @@ func TestDualRunLease_NotTakenOrRenewedWithoutQuorum(t *testing.T) {
 	}
 	if _, again, err := corrosion.ReadLeaseRow(ctx, s.db, dualRunLeaseKey); err != nil || again != first {
 		t.Fatalf("the lease's expiry moved from %s to %s (%v) with the voter majority lost", first, again, err)
+	}
+}
+
+// TestRunRebalance_RefusedWithoutQuorum: on a node that has lost the voter
+// majority the rebalancer takes no lease, so RunRebalance says so instead of
+// reporting zero proposals as if the cluster were balanced.
+//
+// Mutation: drop the LeaseQuorumLost check in RunRebalance — the call
+// succeeds with no proposals and this goes red.
+func TestRunRebalance_RefusedWithoutQuorum(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+	seedAutoImbalance(t, ctx, s.db)
+	s.SetGate(fakeServerGate{execOK: true, quorum: health.QuorumNo, live: 1, needed: 2})
+	_, err := s.RunRebalance(ctx, &pb.RunRebalanceRequest{DryRun: true})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("RunRebalance without the voter majority: %v, want FailedPrecondition", err)
 	}
 }

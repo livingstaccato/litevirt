@@ -303,7 +303,7 @@ func (s *Server) LeaseQuorumLost(ctx context.Context) bool {
 	}); ok {
 		region = rg.RegionQuorumProof
 	}
-	return health.LostEveryDecisionQuorum(ctx, s.db, g.QuorumProof, region)
+	return health.LostEveryDecisionQuorum(ctx, s.db, g.QuorumProof, region, nil)
 }
 
 // detectDualRunPass runs one detector pass: gather runtime across workload-capable hosts,

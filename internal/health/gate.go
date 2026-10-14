@@ -270,14 +270,19 @@ func (c *Checker) InQuorumRegainGraceFor(ctx context.Context, scope string) bool
 // whose word that the lease is live refuses every majority takeover for as
 // long as the partition lasts. Giving a lease up only removes authority.
 //
-// Only a definite cluster-wide No starts the check: Unknown (warmup, an
-// unreadable voter set) is not lost. After a No, a failover scope or voter
+// held says whether one reading of scope's quorum holds it. nil holds every
+// reading but a definite No, so Unknown (warmup, an unreadable voter set) is
+// not lost. After the cluster-wide reading fails, a failover scope or voter
 // regions that cannot be read count as lost, as the coordinator decides
 // nothing on them either, and a nil region reading answers for no region.
 func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 	cluster func(context.Context) (QuorumState, int, int),
-	region func(context.Context, string) (QuorumState, int, int)) bool {
-	if st, _, _ := cluster(ctx); st != QuorumNo {
+	region func(context.Context, string) (QuorumState, int, int),
+	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
+	if held == nil {
+		held = func(_ context.Context, st QuorumState, _ string) bool { return st != QuorumNo }
+	}
+	if st, _, _ := cluster(ctx); held(ctx, st, QuorumScopeCluster) {
 		return false
 	}
 	scope, err := corrosion.GetFailoverScope(ctx, db)
@@ -292,7 +297,7 @@ func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 		if len(vr.In(r)) == 0 {
 			continue
 		}
-		if st, _, _ := region(ctx, r); st != QuorumNo {
+		if st, _, _ := region(ctx, r); held(ctx, st, RegionQuorumScope(r)) {
 			return false
 		}
 	}
@@ -302,7 +307,7 @@ func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 // LostEveryDecisionQuorum is LostEveryDecisionQuorum over this daemon's own
 // probes.
 func (c *Checker) LostEveryDecisionQuorum(ctx context.Context) bool {
-	return LostEveryDecisionQuorum(ctx, c.db, c.QuorumProof, c.RegionQuorumProof)
+	return LostEveryDecisionQuorum(ctx, c.db, c.QuorumProof, c.RegionQuorumProof, nil)
 }
 
 // RegionQuorumProof is QuorumProof over one region's voters: the members of

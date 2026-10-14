@@ -189,34 +189,50 @@ func TestFleet_PartitionPause_ASuccessorResumesPastANonVoter(t *testing.T) {
 // TestFleet_LeaseHeldInTheMinority_MajorityTakesOverPastANonVoter: the
 // failover lease is held by n1 at the cut. n1 has lost the voter majority, so
 // it must stop renewing; once its lease lapses on n5, a majority coordinator
-// takes it over and recovers n0's VM after the wait.
+// takes it over and recovers n0's VM after the wait. The control cuts n5 off
+// from the minority as well, so nothing bridges the halves: it passes with or
+// without the fix, which shows the bridge is what the fix is about.
 //
 // Mutation: drop the quorum gate in front of the lease (acquireLeaseResult) —
 // n1 keeps renewing, n5 keeps reporting the lease live for node-1, and no
-// majority node ever holds it.
+// majority node ever holds it (the bridged arm goes red; the control stays
+// green).
 func TestFleet_LeaseHeldInTheMinority_MajorityTakesOverPastANonVoter(t *testing.T) {
-	ctx := context.Background()
-	c, s, rs := bridgeFleet(t, ppOpts{
-		coordinators:     map[string]bool{"node-1": true, "node-2": true},
-		lateCoordinators: map[string]bool{"node-2": true},
-	})
-	n1, n2 := c.Nodes[1], c.Nodes[2]
-	eventually(t, time.Minute, "node-1 to hold the failover lease on every node", func() bool {
-		for _, n := range c.Nodes {
-			if h, _, err := corrosion.ReadLeaseRow(ctx, n.DB, "failover"); err != nil || h != n1.Name {
-				return false
+	for _, bridged := range []bool{true, false} {
+		t.Run(map[bool]string{true: "bridged", false: "control"}[bridged], func(t *testing.T) {
+			ctx := context.Background()
+			c, s, rs := bridgeFleet(t, ppOpts{
+				coordinators:     map[string]bool{"node-1": true, "node-2": true},
+				lateCoordinators: map[string]bool{"node-2": true},
+			})
+			n1, n2, n5 := c.Nodes[1], c.Nodes[2], c.Nodes[5]
+			eventually(t, time.Minute, "node-1 to hold the failover lease on every node", func() bool {
+				for _, n := range c.Nodes {
+					if h, _, err := corrosion.ReadLeaseRow(ctx, n.DB, "failover"); err != nil || h != n1.Name {
+						return false
+					}
+				}
+				return true
+			})
+			s.startCoordinator(s.node(n2), 0)
+			minority, majority := c.Nodes[:2], c.Nodes[2:5]
+			if !bridged {
+				majority = c.Nodes[2:]
 			}
-		}
-		return true
-	})
-	s.startCoordinator(s.node(n2), 0)
-	minority, majority := c.Nodes[:2], c.Nodes[2:5]
-	c.SplitGossip(minority, majority)
+			c.SplitGossip(minority, majority)
 
-	eventually(t, 45*time.Second+time.Minute, "a majority coordinator to take the failover lease over", func() bool {
-		h, _, err := corrosion.ReadLeaseRow(ctx, n2.DB, "failover")
-		return err == nil && h == n2.Name
-	})
-	dest := waitRecovered(t, c, minority)
-	assertRecoveredOnce(t, c, s, rs, dest, minority)
+			// The majority's own replica, and the bridge's: n5's copy of the
+			// minority's lease was what refused every takeover.
+			eventually(t, 45*time.Second+time.Minute, "a majority coordinator to take the failover lease over", func() bool {
+				for _, n := range []*Node{n2, n5} {
+					if h, _, err := corrosion.ReadLeaseRow(ctx, n.DB, "failover"); err != nil || h != n2.Name {
+						return false
+					}
+				}
+				return true
+			})
+			dest := waitRecovered(t, c, minority)
+			assertRecoveredOnce(t, c, s, rs, dest, minority)
+		})
+	}
 }

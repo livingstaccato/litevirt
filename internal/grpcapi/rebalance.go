@@ -134,6 +134,12 @@ func (s *Server) RunRebalance(ctx context.Context, req *pb.RunRebalanceRequest) 
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
+	// A node without the voter majority does not take the rebalancer lease,
+	// so the cycle below would emit nothing; say why instead.
+	if s.LeaseQuorumLost(ctx) {
+		return nil, status.Error(codes.FailedPrecondition,
+			"no_quorum: this node has lost the voter majority and cannot lead a rebalance; run it on a node in the majority")
+	}
 	r := scheduler.NewRebalancer(s.hostName, s.db)
 	r.SetCapacityPolicy(s.capacity)
 	r.QuorumLost = s.LeaseQuorumLost

@@ -136,3 +136,38 @@ func TestPrepareTargetPoolStatus(t *testing.T) {
 		t.Errorf("mount failure -> %v, want FailedPrecondition", c)
 	}
 }
+
+// An nfs pool not yet mounted is mounted as on main: on the caller's context,
+// within the pool's command_timeout, and not refused when the mount takes
+// longer than the bound. Only a pool the mount table already has mounted is
+// prepared under the bound (the test above).
+//
+// Mutation: "always bounded" — the slow mount is refused as not answering,
+// red.
+func TestPrepareTargetPool_AFreshMountIsNotCutShortByTheBound(t *testing.T) {
+	mnt := t.TempDir()
+	overrideMounts(t, "22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw")
+	t.Cleanup(storage.OverrideFSCallBoundForTest(100 * time.Millisecond))
+	var mounts atomic.Int32
+	t.Cleanup(storage.OverrideNFSMountCommandForTest(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "mountpoint":
+			return nil, errors.New("not a mountpoint")
+		case "mount":
+			time.Sleep(400 * time.Millisecond)
+			mounts.Add(1)
+		}
+		return nil, nil
+	}))
+	drv, err := storage.New(t.TempDir(), storage.Config{Driver: "nfs", Source: "nas:/vm", Target: mnt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := prepareTargetPool(context.Background(), drv, mnt); err != nil {
+		t.Fatalf("a fresh mount slower than the bound = %v, want it mounted", err)
+	}
+	if el := time.Since(start); el < 400*time.Millisecond || mounts.Load() != 1 {
+		t.Fatalf("returned after %v with %d mounts; want the mount waited for", el, mounts.Load())
+	}
+}

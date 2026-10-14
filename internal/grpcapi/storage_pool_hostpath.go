@@ -211,12 +211,12 @@ func (s *Server) poolDirForWrite(ctx context.Context, name string, ref StoragePo
 			return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 		}
 		if err := prepareTargetPool(ctx, drv, dir); err != nil {
-			slog.Error("storage pool write refused: its NFS export could not be mounted hardened", "pool", name, "error", err)
-			code := codes.FailedPrecondition
 			if storage.IsFSNoAnswer(err) {
-				code = codes.Unavailable
+				slog.Error("storage pool write refused: its NFS export did not answer", "pool", name, "error", err)
+				return "", status.Errorf(codes.Unavailable, "pool %q: %v", name, err)
 			}
-			return "", status.Errorf(code, "pool %q: mount: %v", name, err)
+			slog.Error("storage pool write refused: its NFS export could not be mounted hardened", "pool", name, "error", err)
+			return "", status.Errorf(codes.FailedPrecondition, "pool %q: mount: %v", name, err)
 		}
 		return dir, nil
 	}
@@ -227,18 +227,29 @@ func (s *Server) poolDirForWrite(ctx context.Context, name string, ref StoragePo
 	return dir, nil
 }
 
-// prepareTargetPool runs a write target pool's Prepare under storage.Bounded,
-// keyed on the pool's directory dir. On an NFS pool whose server does not
+// prepareTargetPool runs a write target pool's Prepare. A pool whose
+// directory the mount table already has as a mount point (an NFS pool's
+// mounted export) or that needs no mount (a directory pool) is prepared under
+// storage.Bounded, keyed on dir: on an NFS mount whose server does not
 // answer, Prepare's "mountpoint" blocks in the kernel past its own command
 // timeout (lab 2: about 120 s, until the server answered again), and a
 // replication schedule behind it waited as long. Bounded gives up after its
 // bound and latches the mount, so a later call there refuses at once. A pool
 // that does not answer is refused, never treated as ready.
 //
-// Prepare runs on a context without the caller's cancellation: a call that
-// joins one still running gets that call's own outcome, not the end of
-// another caller's request. The driver's command timeout still bounds it.
+// An NFS pool not yet mounted is mounted as on main, on the caller's context
+// and within the pool's command_timeout: a mount that takes longer than the
+// bound is not refused for it, and a mount command, unlike a stat on a dead
+// mount, ends when its timeout does.
+//
+// The bounded Prepare runs on a context without the caller's cancellation, so
+// a call that joins one still running gets that call's own outcome, not the
+// end of another caller's request. The bound limits only the caller's wait: a
+// Prepare stuck in the kernel goes on until the server answers.
 func prepareTargetPool(ctx context.Context, drv storage.Driver, dir string) error {
+	if strings.EqualFold(drv.String(), "nfs") && !storage.IsMountPoint(dir) {
+		return drv.Prepare(ctx)
+	}
 	pctx := context.WithoutCancel(ctx)
 	_, err := storage.Bounded("prepare the pool at", dir, func() (struct{}, error) {
 		return struct{}{}, drv.Prepare(pctx)

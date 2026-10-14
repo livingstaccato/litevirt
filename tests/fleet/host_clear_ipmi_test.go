@@ -36,8 +36,8 @@ func TestFleet_ClearIPMIReachesEveryNode(t *testing.T) {
 			t.Fatalf("%s: GetHost: %v", n.Name, err)
 		}
 		if h.IPMIAddress != "" || h.IPMIUser != "" || h.IPMIPass != "" || h.FenceStrategy != "ssh" {
-			t.Errorf("%s still holds IPMI settings after the clear: %s %q / %q @ %q", n.Name,
-				h.FenceStrategy, h.IPMIUser, h.IPMIPass, h.IPMIAddress)
+			t.Errorf("%s still holds IPMI settings after the clear: %s %q / %s @ %q", n.Name,
+				h.FenceStrategy, h.IPMIUser, redacted(h.IPMIPass), h.IPMIAddress)
 		}
 		assertBothCopies(t, n, "hosts.ipmi_pass", "",
 			`SELECT ipmi_pass FROM hosts WHERE name = ?`,

@@ -402,11 +402,12 @@ grouped by what it means:
   name" below) — and is labelled as one rather than as a deletion.
 - **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
   is the hash of no row of that host one seq before it: the row before it was
-  deleted, or the row was renumbered or relinked. The two chains of a forked host interleave by seq, so the deletion
-  leaves no sequence break; this lists each such row by host, id and seq. A
+  deleted or rewritten, or the row was renumbered or relinked. The two chains
+  of a forked host interleave by seq, so the deletion leaves no sequence
+  break; this lists each such row by host, id and seq. A
   fork whose only other findings are its duplicate seqs is reported as a
-  forked chain by the hourly check; one with an orphaned row is reported as
-  tampering.
+  forked chain by the hourly check and headed `AUDIT CHAIN FORKED` by
+  `lv audit verify`; one with an orphaned row is reported as tampering.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist,
   or a host's seq-0 legacy anchor names a hash that no seq-0 row of that host
@@ -420,7 +421,8 @@ grouped by what it means:
 - **unsigned after signed** — a host under a signing contract (see below)
   produced a row with no signature.
 
-Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
+Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`, except a fork
+whose only other findings are its duplicate seqs, which prints `AUDIT CHAIN FORKED`.
 
 There is a **third outcome** between intact and tampered, currently holding two
 findings — `never adopted`, below, and **ambiguous**: a row with a NUL byte in

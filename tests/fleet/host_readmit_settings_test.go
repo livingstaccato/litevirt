@@ -226,7 +226,8 @@ func TestFleet_ReaddedHostInheritsNoSettings(t *testing.T) {
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
 		if fs := fenceSettingsOf(t, n, d.Name); fs.user != "probe" || fs.pass != oldPass || fs.credRow != oldPass {
-			t.Fatalf("fixture: %s holds %+v for %s, want the configured IPMI credentials", n.Name, fs, d.Name)
+			t.Fatalf("fixture: %s holds user %q, pass %s, credential row %s for %s, want the configured IPMI credentials",
+				n.Name, fs.user, redacted(fs.pass), redacted(fs.credRow), d.Name)
 		}
 	}
 

@@ -1370,6 +1370,36 @@ func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string
 	return true, ""
 }
 
+// startedDetail is the state_detail a reconciler start records on success: why
+// the VM was started. A start an operator re-armed (`lv start` after `lv stop
+// --force`) is told by its open vm_start_cancelled record, which the
+// reconciler does not rewrite (the row's own detail is overwritten by a
+// deferral or a retry); a row that reads running with no domain is a
+// self-heal restart; an onboot-owed VM is an onboot start; anything else is
+// the failover/reschedule start this detail was written for.
+func (r *Reconciler) startedDetail(ctx context.Context, vm corrosion.VMRecord) string {
+	if strings.HasPrefix(vm.StateDetail, "operator start") {
+		return "started by reconciler: operator start re-armed"
+	}
+	// Only a row in starting: a re-armed start is entered in that state, while an
+	// onboot start (stopped) or a self-heal (running) can find a record still open.
+	if vm.State == "starting" {
+		if ev, err := StartCancelledOf(ctx, r.db, vm.Name, r.hostName); err == nil && ev != nil {
+			return "started by reconciler: operator start re-armed"
+		}
+	}
+	if vm.State == "running" {
+		return "restarted by reconciler: the domain was not running"
+	}
+	r.onbootMu.Lock()
+	_, onboot := r.onbootPending[vm.Name]
+	r.onbootMu.Unlock()
+	if onboot {
+		return "started by reconciler: onboot"
+	}
+	return "started by reconciler after failover"
+}
+
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
 	// A start that would be deferred for want of time is left as it is
 	// before anything is done for it — no lease, no proof claimed, no
@@ -2073,7 +2103,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				"vm", vm.Name, "proof", proofID, "error", err)
 		}
 	} else if err := r.publishRunning(commitCtx, vm.Name, "running", func(ctx context.Context) error {
-		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
+		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", r.startedDetail(ctx, vm))
 	}); err != nil {
 		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)

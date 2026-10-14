@@ -5382,6 +5382,12 @@ message VerifyAuditChainResponse {
     // them: the row before each was deleted. Its two chains interleave by
     // seq, so such a deletion leaves no seq gap; this names it.
     repeated string orphaned_rows = 21;
+    // True when tampered is set and the only finding is a forked chain: a
+    // second chain opened under a host name that already had one, with no
+    // edited, deleted or forged row found. Still a failure; it only changes
+    // how a client names it. Absent from an older daemon, which a client
+    // reads as false and so keeps the tampered wording.
+    bool forked = 22;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

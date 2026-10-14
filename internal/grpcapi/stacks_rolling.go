@@ -633,14 +633,21 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	if vmErr == nil {
 		outcome = recreateCommitted
 	}
-	if vmErr != nil && len(lunKeys) > 0 {
-		st := status.Convert(vmErr)
-		vmErr = status.Errorf(st.Code(), "%s. %s", st.Message(), lunRecoveryHint)
-	} else if vmErr != nil && cur != nil && tornDown {
+	if vmErr != nil && cur != nil && tornDown {
 		// The VM was torn down and its create failed: say so, and keep the
 		// spec the create was given, as a rebuild and a rolling recreate do.
+		// The host named is the one the delete ran on: the owner's row as its
+		// delete reported it, else this node's copy. A VM on iSCSI LUNs also
+		// gets the recovery for its disks.
+		where := cur.HostName
+		if deleted != nil && deleted.snap != nil && deleted.snap.HostName != "" {
+			where = deleted.snap.HostName
+		}
 		sp, _ := s.plannedVMSpec(action, f)
-		vmErr = s.recreateFailedAfterTeardown(ctx, "recreate", action.VMName, cur.HostName, sp, vmErr, false)
+		vmErr = s.recreateFailedAfterTeardown(ctx, "recreate", action.VMName, where, sp, vmErr, len(lunKeys) > 0)
+	} else if vmErr != nil && len(lunKeys) > 0 {
+		st := status.Convert(vmErr)
+		vmErr = status.Errorf(st.Code(), "%s. %s", st.Message(), lunRecoveryHint)
 	}
 	if vmErr != nil {
 		slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)

@@ -66,7 +66,7 @@ func (s *Server) verifyDiskChainForStart(ctx context.Context, vm *corrosion.VMRe
 			// Not judged on a guess (diskChain.resolve): retryable.
 			slog.Warn("start refused: a resolution its chain judgement needs does not answer", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
 			return status.Errorf(codes.Unavailable,
-				"disk %q of %q (%s) cannot be started: its storage does not answer: %v", d.DiskName, vm.Name, filepath.Base(file), err)
+				"disk %q of %q (%s) cannot be started: its storage does not answer: %v; retry once it answers", d.DiskName, vm.Name, filepath.Base(file), err)
 		}
 		slog.Error("start refused: a disk's backing chain names a file the VM may not read", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
 		return status.Errorf(codes.FailedPrecondition,

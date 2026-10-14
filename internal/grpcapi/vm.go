@@ -1955,8 +1955,9 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
 	// usage counts running and starting VMs only (corrosion.SumVMResourcesByHost),
-	// so a stopped VM contributes nothing until now. Without this, create-time admission is trivially sidestepped: create a
-	// pile of VMs (each fitting at the time), then start them all.
+	// so a stopped VM contributes nothing until now. Without this, create-time
+	// admission is trivially sidestepped: create a pile of VMs (each fitting at
+	// the time), then start them all.
 	//
 	// Deliberately on the OPERATOR paths, not inside startVMLocked. The automated
 	// failover / reconciler / health-restart paths bypass startVMLocked (see
@@ -5884,7 +5885,7 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 		})
 		if storage.IsFSNoAnswer(err) {
 			slog.Warn("start refused: a disk's storage does not answer", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
-			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v",
+			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v; retry once it answers",
 				d.DiskName, vm.Name, filepath.Base(file), err)
 		}
 		if err != nil {

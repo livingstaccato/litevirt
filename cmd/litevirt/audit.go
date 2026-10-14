@@ -175,7 +175,18 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		return fmt.Errorf("audit chain verification incomplete: a host declares signed rows it cannot sign")
 	}
 
-	fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
+	forkOnly := resp.Forked && len(resp.BadSignature) == 0 && len(resp.UnknownKeyId) == 0 &&
+		len(resp.Laundered) == 0 && len(resp.RetiredKeyUse) == 0 && len(resp.HeadMismatch) == 0 &&
+		len(resp.UnsignedAfterSigned) == 0 && len(resp.OrphanedRows) == 0 && len(resp.TruncatedHosts) == 0
+	if forkOnly {
+		// Nothing found says a row was edited, deleted or forged: a second chain was
+		// opened under a host name that already had one. It still fails the command.
+		// The daemon's verdict is not trusted alone: any tamper finding listed
+		// below keeps the TAMPERED headline.
+		fmt.Fprintf(w, "AUDIT CHAIN FORKED — %d rows checked (no edited, deleted or forged row found)\n", resp.RowsChecked)
+	} else {
+		fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
+	}
 	if resp.BrokenAtId != "" {
 		fmt.Fprintf(w, "\n%s\n  %s\n", brokenLinkHeading(resp.BrokenAtKind), resp.BrokenAtId)
 	}
@@ -190,7 +201,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
 		{"unsigned after signed (a host that had begun signing produced an unsigned row):", resp.UnsignedAfterSigned},
-		{"orphaned (on a forked host, the row before it was deleted, or it was relinked; no seq gap shows it):", resp.OrphanedRows},
+		{"orphaned (on a forked host, the row before it was deleted or rewritten, or it was renumbered or relinked; no seq gap shows it):", resp.OrphanedRows},
 	} {
 		if len(g.rows) == 0 {
 			continue
@@ -218,6 +229,9 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		}
 	}
 	reportAmbiguousRows(w, resp)
+	if forkOnly {
+		return fmt.Errorf("audit chain verification failed: the log holds a forked chain")
+	}
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
 }
 

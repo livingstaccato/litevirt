@@ -146,8 +146,9 @@ func TestStart_AVMOnADeadNFSPoolIsRefusedWithinTheBound(t *testing.T) {
 	err := within(t, 10*time.Second, "a dead-pool VM's start checks", func() error {
 		return f.s.verifyImageBasesForStart(context.Background(), vm)
 	})
-	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "does not answer") {
-		t.Fatalf("start of a VM whose disk is on a dead mount: %v; want Unavailable saying its storage does not answer", err)
+	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "does not answer") ||
+		!strings.Contains(err.Error(), "retry once it answers") {
+		t.Fatalf("start of a VM whose disk is on a dead mount: %v; want Unavailable saying its storage does not answer and to retry", err)
 	}
 	if took := time.Since(t0); took > 3*time.Second {
 		t.Fatalf("the refusal took %v", took)

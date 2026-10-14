@@ -302,9 +302,45 @@ func TestAuditVerifyNamesOrphanedRows(t *testing.T) {
 		t.Fatal("an orphaned row must fail the command")
 	}
 	got := out.String()
-	for _, want := range []string{"orphaned (on a forked host, the row before it was deleted, or it was relinked", "node-3: row r3 (seq 3)"} {
+	for _, want := range []string{"orphaned (on a forked host, the row before it was deleted or rewritten, or it was renumbered or relinked", "node-3: row r3 (seq 3)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// A chain whose only finding is a fork must not be headlined TAMPERED: nothing
+// found says a row was edited, deleted or forged. It still fails the command,
+// and the row is still named. Any other finding keeps the TAMPERED headline.
+//
+// Mutation: header ignores resp.Forked — red.
+func TestAuditVerifyHeaderMatchesTheClassification(t *testing.T) {
+	fork := &pb.VerifyAuditChainResponse{
+		RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true, Forked: true,
+		SeqGaps: []string{"node-3: row fork-1 repeats seq 1 (duplicate: two rows claim the same position, a forked chain)"},
+	}
+	var out strings.Builder
+	if err := reportAuditVerify(&out, fork); err == nil {
+		t.Fatal("a forked chain must still exit non-zero")
+	}
+	got := out.String()
+	if strings.Contains(got, "TAMPERED") || !strings.Contains(got, "AUDIT CHAIN FORKED") || !strings.Contains(got, "fork-1") {
+		t.Errorf("fork-only output is mislabelled:\n%s", got)
+	}
+
+	// A real tamper finding keeps its headline, including when the response
+	// also claims Forked (the CLI does not trust that flag alone).
+	for _, forked := range []bool{false, true} {
+		real := &pb.VerifyAuditChainResponse{
+			RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true, Forked: forked,
+			BadSignature: []string{"row-8: signature does not verify"},
+		}
+		out.Reset()
+		if err := reportAuditVerify(&out, real); err == nil {
+			t.Fatal("tampering must exit non-zero")
+		}
+		if got := out.String(); !strings.Contains(got, "AUDIT CHAIN TAMPERED") || strings.Contains(got, "FORKED —") {
+			t.Errorf("forked=%v: a real tamper finding lost its headline:\n%s", forked, got)
 		}
 	}
 }

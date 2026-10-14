@@ -31,3 +31,11 @@ func ipmiPassOf(h *corrosion.HostRecord) string {
 	}
 	return h.IPMIPass
 }
+
+// relocateTokenOf is a container's relocation token, empty for a nil row.
+func relocateTokenOf(c *corrosion.ContainerRecord) string {
+	if c == nil {
+		return ""
+	}
+	return c.RelocateToken
+}

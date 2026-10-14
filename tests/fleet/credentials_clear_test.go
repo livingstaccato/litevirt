@@ -118,7 +118,7 @@ func TestFleet_CredentialsClear_AfterTheLatchNoPublicRowCarriesASecret(t *testin
 	configureIPMI(t, c, a, bmc.Name, "bmc-before")
 	c.WaitConverged(t, convergeTimeout)
 	if got := oldColumn(t, b, `SELECT ipmi_pass FROM hosts WHERE name = ?`, bmc.Name); got != "bmc-before" {
-		t.Fatalf("%s: hosts.ipmi_pass = %q before the latch; the scenario would prove nothing", b.Name, got)
+		t.Fatalf("%s: hosts.ipmi_pass = %s before the latch; the scenario would prove nothing", b.Name, redacted(got))
 	}
 
 	latchAndClear(t, c.Nodes...)
@@ -276,7 +276,7 @@ func TestFleet_CredentialsClear_AMaintenanceHostOnThePreviousBuildHoldsTheLatchO
 		t.Fatal(err)
 	}
 	if got := oldColumn(t, a, `SELECT ipmi_pass FROM hosts WHERE name = ?`, old.Name); got != "bmc-held" {
-		t.Fatalf("%s emptied hosts.ipmi_pass (%q) with the clear held off", a.Name, got)
+		t.Fatalf("%s emptied hosts.ipmi_pass (%s) with the clear held off", a.Name, redacted(got))
 	}
 
 	held.Store(false) // the maintenance host is upgraded
@@ -287,7 +287,7 @@ func TestFleet_CredentialsClear_AMaintenanceHostOnThePreviousBuildHoldsTheLatchO
 		t.Fatal(err)
 	}
 	if got := oldColumn(t, a, `SELECT ipmi_pass FROM hosts WHERE name = ?`, old.Name); got != "" {
-		t.Errorf("%s: hosts.ipmi_pass = %q after the latch formed and the pass ran", a.Name, got)
+		t.Errorf("%s: hosts.ipmi_pass = %s after the latch formed and the pass ran", a.Name, redacted(got))
 	}
 }
 

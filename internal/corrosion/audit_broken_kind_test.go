@@ -290,6 +290,64 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 		if len(res.Orphans) != res.Orphaned || !strings.Contains(strings.Join(res.Orphans, "\n"), "row r3 (seq 3)") {
 			t.Errorf("orphans %v, want r3 named", res.Orphans)
 		}
+		// Re-review 3 m-2: no row of node-3 has r3's prev_hash, so it reads as a deletion.
+		if got := strings.Join(res.Orphans, "\n"); !strings.Contains(got, "is the hash of no row of node-3 at seq 2 — the row before it was deleted") {
+			t.Errorf("orphans %v, want r3's predecessor reported deleted", res.Orphans)
+		}
+	})
+
+	// Re-review 3 m-2: an orphan whose prev_hash names a row of its host at
+	// another seq was renumbered or relinked, not orphaned by a deletion; a
+	// seq-0 orphan has no seq before it to name.
+	//
+	// Mutation: one "deleted ... at seq N-1" message for every orphan: red.
+	orphanLines := func(t *testing.T, ctx context.Context, c *Client) []string {
+		t.Helper()
+		res, err := VerifyAuditChain(ctx, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Forked() || !res.Tampered() || len(res.Orphans) != res.Orphaned {
+			t.Fatalf("Forked() %v, Tampered() %v, orphans %v: want orphans reported as tampering", res.Forked(), res.Tampered(), res.Orphans)
+		}
+		return res.Orphans
+	}
+	t.Run("a row relinked to a row at another seq is named relinked", func(t *testing.T) {
+		ctx, c := seed(t)
+		secondChain(t, ctx, c)
+		rows, err := c.Query(ctx, `SELECT id, timestamp, content_hash FROM audit_log WHERE id IN ('r1', 'r3') ORDER BY id`)
+		if err != nil || len(rows) != 2 {
+			t.Fatal(err)
+		}
+		r1Hash := rows[0].String("content_hash")
+		ed := AuditRecord{ID: "r3", Timestamp: rows[1].String("timestamp"), Username: "admin", HostName: "node-3",
+			Action: "vm.start", Target: "vm-1", Result: "ok", PrevHash: r1Hash}
+		if err := c.Execute(ctx, `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = 'r3'`, r1Hash, HashAuditRow(ed)); err != nil {
+			t.Fatal(err)
+		}
+		got := strings.Join(orphanLines(t, ctx, c), "\n")
+		if !strings.Contains(got, "row r3 (seq 3) follows prev_hash "+r1Hash+", which is the hash of row seq 1 of node-3, not seq 2 — renumbered or relinked") {
+			t.Errorf("orphans %q, want r3 named as linking to seq 1", got)
+		}
+		if strings.Contains(got, "row r3 (seq 3) follows prev_hash "+r1Hash+", which is the hash of no row") {
+			t.Errorf("orphans %q: r3's predecessor exists at seq 1, yet it is reported deleted", got)
+		}
+	})
+	t.Run("a seq-0 orphan names no seq before it", func(t *testing.T) {
+		ctx, c := seed(t)
+		secondChain(t, ctx, c)
+		z := fork
+		z.ID, z.PrevHash = "zero", strings.Repeat("ab", 32)
+		z.Timestamp = "2026-10-03T22:15:00.000000000Z"
+		z.ContentHash = HashAuditRow(z)
+		insertRaw(t, ctx, c, z, 0)
+		got := strings.Join(orphanLines(t, ctx, c), "\n")
+		if !strings.Contains(got, "row zero (seq 0) follows prev_hash "+z.PrevHash+", which is the hash of no row of node-3 — a seq-0 row whose predecessor is gone") {
+			t.Errorf("orphans %q, want the seq-0 row named without a seq before it", got)
+		}
+		if strings.Contains(got, "seq -1") {
+			t.Errorf("orphans %q name seq -1", got)
+		}
 	})
 
 	t.Run("an intact chain has no kind", func(t *testing.T) {

@@ -259,7 +259,7 @@ func TestAuditVerifyNamesOrphanedRows(t *testing.T) {
 		t.Fatal("an orphaned row must fail the command")
 	}
 	got := out.String()
-	for _, want := range []string{"orphaned (on a forked host, the row before it was deleted", "node-3: row r3 (seq 3)"} {
+	for _, want := range []string{"orphaned (on a forked host, the row before it was deleted, or it was relinked", "node-3: row r3 (seq 3)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q:\n%s", want, got)
 		}

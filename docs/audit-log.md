@@ -206,7 +206,7 @@ grouped by what it means:
   a deletion.
 - **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
   is the hash of no row of that host one seq before it: the row before it was
-  deleted. The two chains of a forked host interleave by seq, so the deletion
+  deleted, or the row was renumbered or relinked. The two chains of a forked host interleave by seq, so the deletion
   leaves no sequence break; this lists each such row by host, id and seq. A
   fork whose only other findings are its duplicate seqs is reported as a
   forked chain by the hourly check; one with an orphaned row is reported as

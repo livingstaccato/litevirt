@@ -1029,9 +1029,17 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			continue
 		}
 		res.Orphaned++
-		res.Orphans = append(res.Orphans, fmt.Sprintf(
-			"%s: row %s (seq %d) follows prev_hash %s, which is the hash of no row of %s at seq %d — the row before it was deleted",
-			u.host, u.id, u.seq, u.prev, u.host, u.seq-1))
+		var why string
+		switch {
+		case ok:
+			why = fmt.Sprintf("which is the hash of row seq %d of %s, not seq %d — renumbered or relinked", pseq, u.host, u.seq-1)
+		case u.seq == 0:
+			why = fmt.Sprintf("which is the hash of no row of %s — a seq-0 row whose predecessor is gone", u.host)
+		default:
+			why = fmt.Sprintf("which is the hash of no row of %s at seq %d — the row before it was deleted", u.host, u.seq-1)
+		}
+		res.Orphans = append(res.Orphans, fmt.Sprintf("%s: row %s (seq %d) follows prev_hash %s, %s",
+			u.host, u.id, u.seq, u.prev, why))
 	}
 
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {

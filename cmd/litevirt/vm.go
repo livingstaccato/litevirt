@@ -324,6 +324,17 @@ func newRmCmd() *cobra.Command {
 					fmt.Printf("Kept ceph image %s (disk %s) in its pool: %s\n  It is named by the health condition ceph_image_leftover; see who has it open with: rbd status %s\n",
 						k.Image, k.Disk, k.Reason, k.Image)
 				}
+				// A disk file the delete did not remove (whether another VM
+				// uses it could not be told, or it was not this delete's to
+				// remove) is kept: named here, and by the health condition.
+				for _, v := range hdr.Get(grpcapi.KeptDiskMD) {
+					var k grpcapi.KeptDisk
+					if json.Unmarshal([]byte(v), &k) != nil {
+						continue
+					}
+					fmt.Printf("Kept disk %s (disk %s) on %s: %s\n  It is named by the health condition disk_leftover; check nothing uses it, then remove it by hand\n",
+						k.Path, k.Disk, k.Host, k.Reason)
+				}
 				return nil
 			})
 		},

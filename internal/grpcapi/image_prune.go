@@ -1078,6 +1078,32 @@ func (s *Server) holdImage(name string) (release func()) {
 	return s.imagePrune.hold(name, false)
 }
 
+// RecreateOverlayDisk builds disk diskName of vmName again as an overlay on
+// image imageName's current file, at size (the backing image's when ""): the
+// failover reconciler's rebuild of a disk missing on this host. It is a disk
+// create like any other, in this host's one image store: it holds the image
+// (holdImage) from before the file is resolved until the overlay is written,
+// so no prune removes the file it is built on in between. Once written, the
+// overlay is a regular file in <data_dir>/disks, which every prune's scan
+// walks.
+//
+// The hold is taken within recreateHoldWait: a prune holds the hold lock
+// across an unlink (removeUnheldImageFile), and one on an image store that
+// does not answer must not stall the reconciler's whole pass. Not taken in
+// time, the rebuild fails transiently, and a later pass retries it.
+func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
+	release, ok := s.imagePrune.holdWithinShared(imageName, recreateHoldWait)
+	if !ok {
+		return "", fmt.Errorf("image %q: an image prune on this host has held the image lock for %s (its image store may not be answering); the rebuild is retried",
+			imageName, recreateHoldWait)
+	}
+	defer release()
+	return s.imageStore().CreateOverlayDisk(vmName, diskName, imageName, size)
+}
+
+// recreateHoldWait bounds RecreateOverlayDisk's wait for the hold lock.
+var recreateHoldWait = 30 * time.Second
+
 // holdImagePublish marks a pull, import or build of image name in flight
 // until release is called: from before its content is published until its
 // catalog row is written, no file of name is removed as a deleted image's.
@@ -1090,6 +1116,63 @@ func (s *Server) holdImagePublish(name string) (release func()) {
 func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.holdLocked(name, publish)
+}
+
+// holdWithinShared is holdWithin, except that once one wait has run out the
+// lock is taken only at once, without waiting, until a recreateHoldWait has
+// passed since: a reconciler pass with many disks to rebuild while a prune
+// is stuck waits once, not once per disk, and the rest are retried by a
+// later pass (m-8).
+func (p *imagePruneState) holdWithinShared(name string, d time.Duration) (release func(), ok bool) {
+	if until := p.holdStuckUntil.Load(); until != 0 && time.Now().UnixNano() < until {
+		d = 0
+	}
+	release, ok = p.holdWithin(name, d)
+	if !ok {
+		p.holdStuckUntil.Store(time.Now().Add(recreateHoldWait).UnixNano())
+	}
+	return release, ok
+}
+
+// holdWithin is a disk create's hold, taken only if the lock is had within
+// d. Its release does not wait on the lock either: one it cannot take at
+// once is done in the background (the hold then lasts a little longer,
+// which is the safe direction).
+func (p *imagePruneState) holdWithin(name string, d time.Duration) (release func(), ok bool) {
+	deadline := time.Now().Add(d)
+	for !p.mu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return nil, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = p.holdLocked(name, false) // released below, without waiting on the lock
+	p.mu.Unlock()
+	dec := func() { // p.mu held
+		if p.holds[name]--; p.holds[name] <= 0 {
+			delete(p.holds, name)
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if p.mu.TryLock() {
+				dec()
+				p.mu.Unlock()
+				return
+			}
+			go func() {
+				p.mu.Lock()
+				dec()
+				p.mu.Unlock()
+			}()
+		})
+	}, true
+}
+
+// holdLocked is hold with p.mu held.
+func (p *imagePruneState) holdLocked(name string, publish bool) (release func()) {
 	if p.holds == nil {
 		p.holds, p.pubs, p.gens, p.cgens = map[string]int{}, map[string]int{}, map[string]uint64{}, map[string]uint64{}
 	}
@@ -1413,6 +1496,10 @@ type imagePruneState struct {
 	recordHook   atomic.Pointer[func(name, clock string)]  // test seam: runs as recordImage begins
 	skew         imageSkewHistory                          // the clock skews this host has seen (imageDeleteMargin)
 	pushUnmarked atomic.Bool                               // test seam: PushImage omits its copy mark, as an earlier build's does
+
+	// holdStuckUntil is until when a rebuild does not wait for the hold
+	// (holdWithinShared), in unix ns.
+	holdStuckUntil atomic.Int64
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }

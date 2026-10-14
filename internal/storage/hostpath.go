@@ -208,6 +208,7 @@ var dataDirOwned = []string{
 	"split_brain_activated",     // health/capability.go ActivationMarkerBase (markers are .<token>)
 	"ceph-trash-purges.json",    // storage/ceph_trash.go cephPurgeStateFile (ResumeCephPurges(dir): set aside as .unreadable-<time>, dataDirOwnedPrefixes)
 	"ceph-kept-images.json",     // grpcapi/ceph_kept.go cephKeptFile
+	"kept-disks.json",           // grpcapi/disk_kept.go diskKeptFile
 	"firewall-would-drop.json",  // daemon.go: firewall.NewWouldDropTally (its .tmp, dataDirOwnedPrefixes)
 	"firewall-initial-mode",     // daemon.go firewallInitialModeName: the founder's enforcement decision
 	"nic-guard-held",            // grpcapi/nic_guard_held.go heldGuestDir: guests held paused for their guards

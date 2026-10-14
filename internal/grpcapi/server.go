@@ -711,6 +711,8 @@ type Server struct {
 	// cephKept is the ceph images a VM delete left in their pool (a client
 	// still had one open), named until gone or reattached (ceph_kept.go).
 	cephKept cephKeptImages
+	// diskKept is the disk files a VM delete kept and named (disk_kept.go).
+	diskKept diskKeptFiles
 
 	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
 	// (storage_pool_confine.go).

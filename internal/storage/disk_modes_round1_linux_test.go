@@ -64,3 +64,49 @@ func TestBtrfsCreateDisk_AFailedCreateLeavesNoSubvolume(t *testing.T) {
 		t.Errorf("the failed create left its subvolume: %v", err)
 	}
 }
+
+// F-5 (lab 2): a disk's own subvolume that `btrfs subvolume delete` could not
+// delete was only logged, and the VM delete reported the disk removed with
+// the subvolume left. A subvolume that is still there is an error to the
+// caller; a file not in a subvolume of its own is still removed quietly.
+//
+// Mutation: return nil on a failed subvolume delete again — red.
+func TestBtrfsDeleteDisk_ASubvolumeLeftBehindIsAnError(t *testing.T) {
+	bin := t.TempDir()
+	// "subvolume delete" fails; "subvolume show" answers for a directory
+	// named like a disk's subvolume only.
+	script := "#!/bin/sh\ncase \"$1 $2\" in\n\"subvolume delete\") echo busy >&2; exit 1;;\n\"subvolume show\") case \"$4\" in *-root) exit 0;; esac; exit 1;;\nesac\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "btrfs"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	root := t.TempDir()
+	d := &btrfsDriver{subvolRoot: root}
+
+	own := filepath.Join(root, "vm-root")
+	if err := os.MkdirAll(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(own, "vm-root.qcow2")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteDisk(context.Background(), file); err == nil {
+		t.Error("a disk whose subvolume could not be deleted was reported deleted")
+	}
+	if _, err := os.Lstat(file); !os.IsNotExist(err) {
+		t.Errorf("the disk file itself was not removed: %v", err)
+	}
+
+	plain := filepath.Join(root, "staging")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pf := filepath.Join(plain, "copy.qcow2")
+	if err := os.WriteFile(pf, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteDisk(context.Background(), pf); err != nil {
+		t.Errorf("a file in a plain directory: %v, want it removed quietly", err)
+	}
+}

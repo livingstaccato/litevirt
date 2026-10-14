@@ -149,3 +149,53 @@ func TestRm_ForceStopsFirstAgainstADaemonThatIgnoresIt(t *testing.T) {
 		}
 	}
 }
+
+// keptDiskSpy answers DeleteVM with the kept-disk header a daemon sends.
+type keptDiskSpy struct {
+	keptDeleteSpy
+	disks []string
+}
+
+func (c *keptDiskSpy) DeleteVM(_ context.Context, _ *pb.DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	for _, o := range opts {
+		if h, ok := o.(grpc.HeaderCallOption); ok {
+			md := metadata.MD{}
+			for _, k := range c.disks {
+				md.Append(grpcapi.KeptDiskMD, k)
+			}
+			*h.HeaderAddr = md
+		}
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// F-5 (lab 2). A disk file a VM delete kept — whether another VM uses it
+// could not be told — is never left unnamed: `lv rm` succeeds (as main) and
+// prints it with its host, reason and the health condition naming it.
+//
+// Mutation: drop the KeptDiskMD loop — the path is not printed: red.
+func TestRm_NamesEachDiskFileKept(t *testing.T) {
+	spy := &keptDiskSpy{disks: []string{
+		`{"path":"/var/lib/litevirt/disks/web-root.qcow2","disk":"root","host":"node-3","reason":"whether another VM uses it cannot be told (no answer)"}`,
+	}}
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	t.Cleanup(func() { withClient = orig })
+	cmd := newRmCmd()
+	cmd.SetArgs([]string{"web"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	var err error
+	out := captureStdout(t, func() { err = cmd.Execute() })
+	if err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	for _, want := range []string{"VM web deleted", "/var/lib/litevirt/disks/web-root.qcow2", "disk root", "node-3", "cannot be told", "disk_leftover"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output %q does not name %q", out, want)
+		}
+	}
+}

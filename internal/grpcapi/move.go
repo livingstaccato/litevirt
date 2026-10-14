@@ -741,23 +741,41 @@ func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, cand
 }
 
 func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string, d *corrosion.DiskRecord) bool {
-	if s.headerUsersKeep(ctx, vmName, s.hostDiskFile(d.Path)) {
-		return true
-	}
-	refs, err := corrosion.DisksReferencingPath(ctx, s.db, d.Path)
+	used, err := s.diskUsedByOtherVM(ctx, vmName, d)
 	if err != nil {
 		slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
 			"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
 		return true
+	}
+	return used
+}
+
+// diskUsedByOtherVM is diskPathReferencedByOtherVM with "cannot tell" kept
+// apart: err is set when whether another VM uses the disk could not be read
+// (its records, or another VM's qcow2 chain: storage.IsFSNoAnswer when that
+// chain's storage did not answer). A caller that must not report a disk
+// removed when it was kept on a guess (DeleteVM) refuses on it.
+func (s *Server) diskUsedByOtherVM(ctx context.Context, vmName string, d *corrosion.DiskRecord) (bool, error) {
+	path := s.hostDiskFile(d.Path)
+	users, err := s.snapshotFileUsers(ctx, vmName, []string{path})
+	if err != nil {
+		return false, fmt.Errorf("read whether another VM backs on it: %w", err)
+	}
+	if len(users) > 0 {
+		slog.Warn("delete: another VM backs on a disk file of this VM; keeping it",
+			"vm", vmName, "path", path, "users", users)
+		return true, nil
+	}
+	refs, err := corrosion.DisksReferencingPath(ctx, s.db, d.Path)
+	if err != nil {
+		return false, fmt.Errorf("read the disk records that name it: %w", err)
 	}
 	// An rbd image is named by its spec, whatever options a row's locator
 	// carries: two rows can name one image with different suffixes.
 	if l, ok := storage.ParseCephLocator(d.Path); ok {
 		more, err := corrosion.DisksNamingRBDImage(ctx, s.db, l.Spec)
 		if err != nil {
-			slog.Warn("delete: shared-disk check failed; keeping disk to avoid removing a shared volume",
-				"vm", vmName, "disk", d.DiskName, "path", d.Path, "error", err)
-			return true
+			return false, fmt.Errorf("read the disk records that name its rbd image: %w", err)
 		}
 		refs = append(refs, more...)
 	}
@@ -769,9 +787,9 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		slog.Warn("delete: disk path still referenced by another VM — NOT deleting",
 			"vm", vmName, "path", d.Path,
 			"referenced_by_vm", r.VMName, "referenced_by_disk", r.DiskName, "as", rel)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // diskPathReferencedByAnyLiveVM is the cleanup-time variant: it exempts NO VM.

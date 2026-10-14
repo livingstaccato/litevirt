@@ -25,8 +25,9 @@ type Store struct {
 	// removal (lockName).
 	names     nameLocks
 	testHooks struct {
-		nameContended   func(name string) // a lockName that has to wait
-		withdrawChecked func()            // Withdraw found its file current, under the lock
+		nameContended   func(name string)    // a lockName that has to wait
+		withdrawChecked func()               // Withdraw found its file current, under the lock
+		overlayResolved func(backing string) // CreateOverlayDisk resolved its backing file, before the overlay is written
 	}
 }
 
@@ -223,11 +224,23 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 	if err := s.assertStoreBase(backingPath); err != nil {
 		return "", fmt.Errorf("base image %q: %w", backingImage, err)
 	}
+	if hook := s.testHooks.overlayResolved; hook != nil {
+		hook(backingPath)
+	}
 	if err := qcow2.CreateWithBacking(diskPath, backingPath, sizeBytes, nil); err != nil {
 		return "", fmt.Errorf("create overlay disk: %w", err)
 	}
 
 	return diskPath, nil
+}
+
+// SetOverlayResolvedForTest runs fn in CreateOverlayDisk once it has resolved
+// the image's file and before it writes the overlay on it: the window an image
+// prune must not remove that file in. Tests only.
+func (s *Store) SetOverlayResolvedForTest(fn func(backing string)) (restore func()) {
+	prev := s.testHooks.overlayResolved
+	s.testHooks.overlayResolved = fn
+	return func() { s.testHooks.overlayResolved = prev }
 }
 
 // CreateEmptyDisk creates an empty qcow2 disk.

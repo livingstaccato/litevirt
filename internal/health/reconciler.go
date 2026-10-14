@@ -141,6 +141,11 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+
+	// recreateOverlay rebuilds a missing disk as an overlay of its image
+	// (SetRecreateOverlay); nil builds it in a store of its own, unheld.
+	recreateOverlay func(vmName, diskName, imageName, size string) (string, error)
+
 	// sparePCIeRootPortsCfg is `pci.spare_pcie_root_ports` (see
 	// daemon.PCIConfig.SparePCIeRootPorts), set via SetSparePCIeRootPorts.
 	sparePCIeRootPortsCfg int
@@ -457,6 +462,15 @@ func (r *Reconciler) SetVMStartObserver(o VMStartObserver) { r.vmStartObserver =
 // SetAutoPullImage registers a callback to pull images from peers when missing locally.
 func (r *Reconciler) SetAutoPullImage(fn func(ctx context.Context, imageName string) error) {
 	r.autoPullImage = fn
+}
+
+// SetRecreateOverlay registers how a missing disk is rebuilt as an overlay of
+// its backing image: the daemon's Server.RecreateOverlayDisk, which builds it
+// in the daemon's image store under an image hold, so an image prune cannot
+// remove the file between its resolve and the overlay (m-6). Unset (tests),
+// the overlay is built in a store of the reconciler's own, with no hold.
+func (r *Reconciler) SetRecreateOverlay(fn func(vmName, diskName, imageName, size string) (string, error)) {
+	r.recreateOverlay = fn
 }
 
 // SetBackupInProgress registers a predicate reporting whether a backup is
@@ -1876,12 +1890,15 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				// recorded size: left empty, the overlay inherits the backing
 				// image's virtual size (a 20 GiB root came back at 112 MiB).
 				// A row with no recorded size still inherits it.
-				imgStore := image.NewStore(r.dataDir)
 				size := ""
 				if d.SizeBytes > 0 {
 					size = strconv.FormatInt(d.SizeBytes, 10)
 				}
-				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, size)
+				recreate := r.recreateOverlay
+				if recreate == nil {
+					recreate = image.NewStore(r.dataDir).CreateOverlayDisk
+				}
+				newPath, createErr := recreate(vm.Name, d.DiskName, d.BackingImage, size)
 				if createErr != nil {
 					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
 					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: retry the overlay build

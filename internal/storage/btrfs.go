@@ -470,8 +470,13 @@ func (d *btrfsDriver) DeleteDisk(ctx context.Context, path string) error {
 		return nil
 	}
 	if out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "subvolume", "delete", "--", cleanParent)); err != nil {
-		// Non-fatal: caller may have created the file directly without
-		// a wrapping subvolume.
+		// Non-fatal when the file was not in a subvolume of its own (a
+		// caller may have created it directly in a directory). A disk's own
+		// subvolume that is still there is the disk left behind (lab 2 F-5):
+		// the caller is told, never "deleted".
+		if IsBtrfsSubvolume(ctx, cleanParent) {
+			return fmt.Errorf("btrfs subvolume delete %s: %w: %s", cleanParent, err, strings.TrimSpace(string(out)))
+		}
 		slog.Warn("btrfs subvolume delete failed", "subvol", cleanParent, "error", err, "output", string(out))
 		return nil
 	}

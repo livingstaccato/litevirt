@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -367,9 +368,41 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 // are written, and only when the new config drops default-deny, so a
 // redeploy that fails part way never leaves the cluster default-allow
 // (switch re-review 2, R1).
+//
+// The cluster default is one row, owned by the stack that set it; another
+// stack asking for deny while it is in force leaves it as it is. So when
+// another live stack's file asks for default-deny, the row is handed to that
+// stack (the first by name) rather than removed, and while any live stack's
+// file cannot be read the row is kept: it may ask for deny, and a deny
+// removed in error fails the cluster open.
 func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) error {
 	if stack == "" {
 		return nil
+	}
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil {
+		return err
+	}
+	if cur != nil && cur.DefaultDeny && cur.StackName == stack {
+		others, unreadable, err := otherStackFiles(ctx, c, stack)
+		if err != nil {
+			return err
+		}
+		handed := false
+		for _, o := range others {
+			if fd := o.file.FirewallDefaults; fd != nil && fd.DefaultDeny {
+				if err := SetFirewallDefault(ctx, c, "cluster", true, o.name); err != nil {
+					return err
+				}
+				handed = true
+				break
+			}
+		}
+		if !handed && len(unreadable) > 0 {
+			slog.Warn("stack teardown: the cluster default-deny stays, owned by the stack: the compose files of other stacks cannot be read, and one may ask for it",
+				"stack", stack, "unreadable", unreadable)
+			return nil
+		}
 	}
 	now := c.NowTS()
 	wall := nowRFC3339()

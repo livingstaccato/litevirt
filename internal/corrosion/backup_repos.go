@@ -4,6 +4,21 @@ import (
 	"context"
 )
 
+// GetBackupRepo returns the live registration of name, or nil if there is
+// none.
+func GetBackupRepo(ctx context.Context, c *Client, name string) (*BackupRepo, error) {
+	rows, err := c.Query(ctx,
+		`SELECT name, path, stack_name FROM backup_repos WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	r := rows[0]
+	return &BackupRepo{Name: r.String("name"), Path: r.String("path"), StackName: r.String("stack_name")}, nil
+}
+
 // BackupRepo is a logical backup-repo name → on-disk path mapping, registered
 // at runtime (e.g. from a compose `backup-repos:` block) and CRDT-replicated so
 // every host can resolve the name. Daemon config `backup_repos:` is the static
@@ -54,9 +69,37 @@ func ListBackupRepos(ctx context.Context, c *Client) ([]BackupRepo, error) {
 }
 
 // DeleteStackBackupRepos tombstones the repos a compose stack registered.
+// A repo another live stack's file also names is handed to that stack (the
+// first by name), at the path it has, instead: that stack uses it, and a
+// deploy never takes a repo over from its owner.
 func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string) error {
 	if stack == "" {
 		return nil
+	}
+	repos, err := ListBackupRepos(ctx, c)
+	if err != nil {
+		return err
+	}
+	var others []stackFile
+	loaded := false
+	for _, r := range repos {
+		if r.StackName != stack {
+			continue
+		}
+		if !loaded {
+			if others, _, err = otherStackFiles(ctx, c, stack); err != nil {
+				return err
+			}
+			loaded = true
+		}
+		for _, o := range others {
+			if d, ok := o.file.BackupRepos[r.Name]; ok && d.Path != "" {
+				if err := UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: o.name}); err != nil {
+					return err
+				}
+				break
+			}
+		}
 	}
 	now := c.NowTS()
 	return c.Execute(ctx,

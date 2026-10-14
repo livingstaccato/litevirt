@@ -146,22 +146,29 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// new rows down: a security group left behind holds its name against the
 	// next deploy of the same file. The rows THIS request inserted are taken
 	// back then (undoFailedFirstDeploy), by id, and nothing else: never the
-	// default-deny row, never a backup repo, never a row of a stack that had
-	// any before. Once a workload action has been issued the rows stay, for
-	// `compose down`, which finds the stack's workloads by their stack_name.
+	// default-deny row, never a backup repo, never a row of a stack that has a
+	// record. That includes rows a persist that failed part way had already
+	// inserted, so the undo is in place before the persist runs. Rows an
+	// earlier failed attempt left behind do not turn it off: a stack with no
+	// record was never deployed, and this persist replaces them. Once a
+	// workload action has been issued the rows stay, for `compose down`,
+	// which finds the stack's workloads by their stack_name.
 	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
-	priorSGs, sgErr := corrosion.ListSecurityGroups(ctx, s.db, f.Name)
 	written := &stackFirewallWrites{}
-	if err := s.persistStackFirewallTracked(ctx, f, written); err != nil {
-		return stackFirewallErr(err)
-	}
 	workloadPhase := false
-	if priorErr == nil && prior == nil && sgErr == nil && len(priorSGs) == 0 {
+	if priorErr == nil && prior == nil {
 		defer func() {
-			if err != nil && !workloadPhase {
+			if err == nil {
+				return
+			}
+			if !workloadPhase {
 				s.undoFailedFirstDeploy(context.WithoutCancel(ctx), f.Name, written)
 			}
+			err = s.withStackDefaultDenyNote(context.WithoutCancel(ctx), f.Name, err)
 		}()
+	}
+	if err := s.persistStackFirewallTracked(ctx, f, written); err != nil {
+		return stackFirewallErr(err)
 	}
 
 	// Register the stack's backup repos (logical name → path), so a VM's
@@ -176,6 +183,29 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		repo := f.BackupRepos[name]
 		if repo.Path == "" {
 			return status.Errorf(codes.InvalidArgument, "backup-repo %q: path required", name)
+		}
+		// A repo another stack (or the operator) registered is used as it
+		// is, never taken over: re-owned, its path could move under the
+		// owner's backups, and this stack's down would unregister it. It is
+		// handed to this stack only when its owner goes
+		// (corrosion.DeleteStackBackupRepos).
+		cur, err := corrosion.GetBackupRepo(ctx, s.db, name)
+		if err != nil {
+			return status.Errorf(codes.Internal, "register backup-repo %q: %v", name, err)
+		}
+		if cur != nil && cur.StackName != f.Name {
+			if cur.Path != repo.Path {
+				owner := "outside a stack"
+				if cur.StackName != "" {
+					owner = "by stack " + strconv.Quote(cur.StackName)
+				}
+				if err := stream.Send(&pb.DeployProgress{Phase: "warning", Detail: fmt.Sprintf(
+					"backup-repo %q is registered %s at %s; this stack uses it there, not at %s",
+					name, owner, cur.Path, repo.Path)}); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{
 			Name: name, Path: repo.Path, StackName: f.Name,
@@ -275,7 +305,7 @@ type stackFirewallWrites struct {
 
 // undoFailedFirstDeploy tombstones the security groups (and their rules), ip
 // sets and cluster rules a failed first deploy of stack inserted, by the ids
-// it recorded. It touches nothing else: not the default-deny row, which may be
+// it recorded (also when its persist failed part way). It touches nothing else: not the default-deny row, which may be
 // an operator's or another stack's and whose removal would fail the cluster
 // open, and not a backup repo, which may be another stack's (a leftover repo
 // registration of a failed deploy is harmless; the next deploy upserts it).
@@ -307,6 +337,21 @@ func (s *Server) undoFailedFirstDeploy(ctx context.Context, stack string, w *sta
 			slog.Warn("stack deploy failed: take back a cluster rule", "stack", stack, "rule", id, "error", err)
 		}
 	}
+}
+
+// withStackDefaultDenyNote adds to a failed first deploy's error that the
+// cluster default-deny it left in force, as its own row, stays on: the undo
+// never removes it (a removed deny fails the cluster open), and with no stack
+// record nothing else will.
+func (s *Server) withStackDefaultDenyNote(ctx context.Context, stack string, err error) error {
+	d, gerr := corrosion.GetFirewallDefault(ctx, s.db, "cluster")
+	if gerr != nil || d == nil || !d.DefaultDeny || d.StackName != stack {
+		return err
+	}
+	st := status.Convert(err)
+	return status.Errorf(st.Code(),
+		"%s; the cluster default-deny this stack asked for stays on: a later `lv compose up` of the stack keeps it, `lv firewall default-deny off` turns it off",
+		st.Message())
 }
 
 // Stack record states. "deleting" is set by DeleteStack and retried by the

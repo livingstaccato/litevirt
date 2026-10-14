@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,9 +40,16 @@ func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 		createdBridgeDir = filepath.Join(t.TempDir(), "bridges")
 		interfaceAddrs = func(string) ([]net.Addr, error) { return nil, nil }
 		var dels []string
+		ifindex := 6
 		execCommand = func(name string, args ...string) ([]byte, error) {
-			if name == "ip" && len(args) >= 3 && args[0] == "link" && args[1] == "add" && ipLinkAddOut != "" {
-				return []byte(ipLinkAddOut), errors.New("exit status 2")
+			if name == "ip" && len(args) >= 3 && args[0] == "link" && args[1] == "add" {
+				if ipLinkAddOut != "" {
+					return []byte(ipLinkAddOut), errors.New("exit status 2")
+				}
+				// The kernel makes the bridge: it appears in sysfs with a
+				// fresh ifindex, as on a real host.
+				ifindex++
+				writeSysBridge(t, sys, args[2], ifindex)
 			}
 			if name == "ip" && len(args) == 3 && args[0] == "link" && args[1] == "del" {
 				dels = append(dels, args[2])
@@ -62,13 +70,12 @@ func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 		}
 		return env{db: db, deleted: func() []string { return dels }, sys: sys}
 	}
-	// The bridge as sysfs shows it once EnsureBridge made it.
+	// The bridge as sysfs shows it: created by the stubbed `ip link add`, or
+	// already there (an operator's), plus any ports.
 	mkBridge := func(t *testing.T, e env, name string, ports ...string) {
 		t.Helper()
-		for _, d := range []string{"bridge", "brif"} {
-			if err := os.MkdirAll(filepath.Join(e.sys, name, d), 0o755); err != nil {
-				t.Fatal(err)
-			}
+		if _, err := os.Stat(filepath.Join(e.sys, name)); errors.Is(err, os.ErrNotExist) {
+			writeSysBridge(t, e.sys, name, 100)
 		}
 		for _, p := range ports {
 			if err := os.WriteFile(filepath.Join(e.sys, name, "brif", p), nil, 0o644); err != nil {
@@ -168,4 +175,94 @@ func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 			t.Fatalf("ip link del issued for %q, want %q", got, br)
 		}
 	})
+
+	recordGone := func(t *testing.T) {
+		t.Helper()
+		if _, err := os.Stat(filepath.Join(createdBridgeDir, br)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the created-bridge record for %s is still there (stat err %v)", br, err)
+		}
+	}
+
+	t.Run("a recorded bridge carrying an address: kept, record kept", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+		interfaceAddrs = func(string) ([]net.Addr, error) {
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("192.0.2.10").To4(), Mask: net.CIDRMask(24, 32)}}, nil
+		}
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("ip link del issued for %v while the bridge carries an address", got)
+		}
+		if _, err := os.Stat(filepath.Join(createdBridgeDir, br)); err != nil {
+			t.Errorf("the record was dropped while the bridge stayed: %v", err)
+		}
+	})
+
+	t.Run("the bridge is already gone: its record goes", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Join(e.sys, br)); err != nil {
+			t.Fatal(err)
+		}
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("ip link del issued for %v for a bridge that is gone", got)
+		}
+		recordGone(t)
+	})
+
+	t.Run("a bridge recreated under a recorded name: kept, stale record dropped", func(t *testing.T) {
+		// litevirt made it; someone deleted it and made their own of the
+		// same name (a new ifindex). The record no longer describes it.
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Join(e.sys, br)); err != nil {
+			t.Fatal(err)
+		}
+		writeSysBridge(t, e.sys, br, 4242)
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("ip link del issued for %v: a bridge litevirt did not create (new ifindex) was removed", got)
+		}
+		recordGone(t)
+	})
+
+	t.Run("RemoveBridgeIfUnused drops the record too", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		removed, err := RemoveBridgeIfUnused(br)
+		if err != nil || !removed {
+			t.Fatalf("RemoveBridgeIfUnused = %v, %v; want removed", removed, err)
+		}
+		_ = e
+		recordGone(t)
+	})
+}
+
+// writeSysBridge makes name a bridge in the fake sysfs tree, with ifindex.
+func writeSysBridge(t *testing.T, sys, name string, ifindex int) {
+	t.Helper()
+	for _, d := range []string{"bridge", "brif"} {
+		if err := os.MkdirAll(filepath.Join(sys, name, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(sys, name, "ifindex"), []byte(strconv.Itoa(ifindex)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }

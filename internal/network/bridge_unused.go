@@ -86,13 +86,6 @@ func RemoveBridgeIfUnused(name string) (bool, error) {
 		}
 		return false, err
 	}
-	ports, err := os.ReadDir(filepath.Join(sysClassNet, name, "brif"))
-	if err != nil {
-		return false, err
-	}
-	if len(ports) > 0 {
-		return false, nil
-	}
 	hasAddr, err := bridgeHasAddress(name)
 	if err != nil {
 		return false, err
@@ -100,8 +93,22 @@ func RemoveBridgeIfUnused(name string) (bool, error) {
 	if hasAddr {
 		return false, nil
 	}
+	// The ports are read last, right before the delete: a guest plugged in
+	// between this read and the delete would be detached by it, so the window
+	// is kept as short as one sysfs read. Nothing here can close it outright
+	// (the kernel deletes a bridge with ports).
+	ports, err := os.ReadDir(filepath.Join(sysClassNet, name, "brif"))
+	if err != nil {
+		return false, err
+	}
+	if len(ports) > 0 {
+		return false, nil
+	}
 	if out, err := execCommand("ip", "link", "del", name); err != nil && !isNoSuchDevice(out) {
 		return false, fmt.Errorf("ip link del %s: %w: %s", name, err, out)
 	}
+	// Whatever deleted it, a record that litevirt created this bridge no
+	// longer describes anything; a bridge made later under the name is new.
+	forgetCreatedBridge(name)
 	return true, nil
 }

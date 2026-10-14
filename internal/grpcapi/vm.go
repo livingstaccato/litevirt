@@ -1558,14 +1558,28 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
 
+	// A stop of a domain that is already not running is done, not an error
+	// (lab 2 O-4: libvirt answers "domain is not running"), as a start of a
+	// running one is (startVMLocked): the stop is recorded below like any
+	// other. A failure while the domain is active, or when whether it is
+	// cannot be read, is still the error it was.
+	alreadyStopped := func(op string, err error) bool {
+		active, aerr := s.virt.DomainIsActive(vm.Name)
+		if aerr != nil || active {
+			return false
+		}
+		slog.Info("StopVM: the domain is already not running; recording the stop", "vm", vm.Name, "op", op, "error", err)
+		return true
+	}
 	if force {
-		if err := s.virt.DestroyDomain(vm.Name); err != nil {
+		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
-	} else {
-		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
+	} else if err := s.virt.ShutdownDomain(vm.Name); err != nil {
+		if !alreadyStopped("shutdown", err) {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)
 		}
+	} else {
 		// Wait for graceful shutdown with timeout, then force-kill.
 		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {

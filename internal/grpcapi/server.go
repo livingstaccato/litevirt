@@ -812,6 +812,9 @@ type Server struct {
 	// vmReadBackHook, when set, fails the read of a VM a start has just
 	// started (startedVMProto) with its error. Test seam only.
 	vmReadBackHook func(name string) error
+	// stateWriteHook, when set, fails a VM state write (persistVMStateDirect)
+	// with its error before it is made. Test seam only.
+	stateWriteHook func(name, state string) error
 	// cancelledStarts is this host's durable record of held starts `lv
 	// stop --force` cancelled (cancelled_starts.go).
 	cancelledStarts cancelledStarts
@@ -1952,6 +1955,12 @@ func (s *Server) persistVMState(ctx context.Context, name, state, detail, op str
 // (operator-stop, whose loss lets HA restart a stopped VM) or merely observed (a
 // "running" state the reconciler heals from libvirt).
 func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, op string) error {
+	if s.stateWriteHook != nil {
+		if err := s.stateWriteHook(name, state); err != nil {
+			s.noteStateWriteFail(op, err)
+			return err
+		}
+	}
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		//runningcheck:allow routed by its only caller — persistVMStateDirect is the body

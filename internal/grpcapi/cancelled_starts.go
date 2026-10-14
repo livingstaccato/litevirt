@@ -34,8 +34,10 @@ import (
 // seen shut off (or gone) once its start could no longer complete (the
 // held-start wait plus a margin after the record was made), or whose row
 // says anything else (the operator started the VM again, deleted it, or it
-// moved), is dropped and nothing is destroyed. The file is local: no replicated statement, nothing for a peer
-// of any version to read.
+// moved), is dropped and nothing is destroyed. A later start of the VM on
+// this host removes the entry before it starts the domain
+// (endCancelledStartForStart). The file is local: no replicated statement,
+// nothing for a peer of any version to read.
 const cancelledStartsFile = "cancelled-starts.json"
 
 // cancelledStartRecord is one entry of the file.
@@ -275,4 +277,28 @@ func (s *Server) cancelledStartWindowOver(r cancelledStartRecord) bool {
 		return false
 	}
 	return time.Since(created) > s.startDomainWaitOrDefault()+s.cancelledStartMarginOrDefault()
+}
+
+// endCancelledStartForStart removes vm's record before a new start of the VM
+// starts its domain: the operator's start supersedes the cancel, and the
+// sweep must never destroy what it started. It fails, and the start must
+// not be made, when the record is there and the file cannot be rewritten
+// without it. An unreadable file names nothing the sweep acts on, so it does
+// not hold a start.
+func (s *Server) endCancelledStartForStart(vm string) error {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	m := s.cancelledStartsLocked()
+	r, ok := m[vm]
+	if !ok || s.cancelledStarts.loadErr != nil {
+		return nil
+	}
+	delete(m, vm)
+	if err := s.saveCancelledStartsLocked(); err != nil {
+		m[vm] = r
+		return fmt.Errorf("the record of its earlier cancelled start could not be removed from %s, and a start with it there could be undone: %w",
+			cancelledStartsFile, err)
+	}
+	slog.Info("StartVM: a start supersedes the VM's cancelled start; its record is removed", "vm", vm)
+	return nil
 }

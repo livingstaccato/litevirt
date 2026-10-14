@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -214,5 +215,92 @@ func TestCancelledStart_TheRecordCarriesItsCreationTime(t *testing.T) {
 	created, err := time.Parse(time.RFC3339Nano, recs[0].Created)
 	if err != nil || created.Before(before) || created.After(time.Now()) {
 		t.Fatalf("the record's created %q (%v), want the time of the cancel", recs[0].Created, err)
+	}
+}
+
+// Re-review R-1: after a restart, a cancel's record and an operator's new
+// `lv start` of the same VM. The start succeeds but its running write fails,
+// so the row still says stopped by its operator, with the domain running:
+// the shape of the cancelled start's late success. The sweep must not
+// destroy a VM its operator started again, so a start drops the VM's record,
+// durably, before it starts the domain.
+//
+// Mutation: the record not dropped by the start — the sweep destroys the VM
+// just started: red.
+func TestCancelledStart_AStartAfterTheCancelEndsTheRecordBeforeItStarts(t *testing.T) {
+	st := newStuckStart(t)
+	st.restartedAt(t, "stopped", "operator-stop", time.Now())
+	fake := st.s.virt.(*libvirtfake.Fake)
+	fake.SetState("web", libvirtfake.StateShutdown)
+	close(st.release)
+	st.s.stateWriteHook = func(name, state string) error {
+		if state == "running" {
+			return errors.New("corrosion: write failed")
+		}
+		return nil
+	}
+	if _, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"}); err != nil {
+		t.Fatalf("lv start: %v", err)
+	}
+	if vm := st.row(t); vm.State != "stopped" || !st.domainActive(t) {
+		t.Fatalf("setup: row %s with the domain active=%v, want stopped over a running domain", vm.State, st.domainActive(t))
+	}
+	st.sweep(t)
+	if !st.domainActive(t) {
+		t.Fatal("the sweep destroyed the VM its operator had just started")
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("the cancel's record outlived a start of the VM: %+v", recs)
+	}
+}
+
+// A start refuses rather than run with the record on disk when it cannot
+// remove it: the sweep would destroy what it started.
+func TestCancelledStart_AStartThatCannotEndTheRecordIsRefused(t *testing.T) {
+	st := newStuckStart(t)
+	st.restartedAt(t, "stopped", "operator-stop", time.Now())
+	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
+	close(st.release)
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory")
+	}
+	if err := os.Chmod(st.s.dataDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(st.s.dataDir, 0o700) })
+	_, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
+	if err == nil || !strings.Contains(err.Error(), cancelledStartsFile) {
+		t.Fatalf("start with a record it cannot remove = %v, want a refusal naming %s", err, cancelledStartsFile)
+	}
+	if st.calls.Load() != 0 {
+		t.Fatal("libvirt was asked to start the VM")
+	}
+}
+
+// Re-review R-6: a cancel whose record cannot be written is refused, and
+// nothing changes: the row still says starting and the start goes on.
+func TestCancelledStart_ACancelWhoseRecordCannotBeWrittenIsRefused(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only directory")
+	}
+	st := heldStart(t)
+	if err := os.Chmod(st.s.dataDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(st.s.dataDir, 0o700) })
+	_, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true})
+	if err == nil || !strings.Contains(err.Error(), "was not cancelled") {
+		t.Fatalf("stop --force whose record cannot be written = %v, want a refusal saying the start was not cancelled", err)
+	}
+	if vm := st.row(t); vm.State != "starting" {
+		t.Fatalf("web's row after the refused cancel: %s, want starting", vm.State)
+	}
+	if err := os.Chmod(st.s.dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	close(st.release)
+	st.waitLockFree(t, "after libvirt answered")
+	if vm := st.row(t); vm.State != "running" {
+		t.Fatalf("web after libvirt answered the start that was not cancelled: %s, want running", vm.State)
 	}
 }

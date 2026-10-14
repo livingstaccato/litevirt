@@ -2227,6 +2227,15 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 		releasePreflight()
 		return nil, status.Error(codes.FailedPrecondition, gerr.Error())
 	}
+	// This start supersedes a start of the VM cancelled earlier: its record
+	// goes, durably, before the domain is started, so the sweep never takes
+	// this start's domain for the cancelled one's (cancelled_starts.go),
+	// even when the running write below fails.
+	if err := s.endCancelledStartForStart(vm.Name); err != nil {
+		releaseGuard()
+		releasePreflight()
+		return nil, status.Errorf(codes.Internal, "start %q: %v", vm.Name, err)
+	}
 	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
 		releaseGuard()
 		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)

@@ -174,7 +174,13 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		return fmt.Errorf("audit chain verification incomplete: a host declares signed rows it cannot sign")
 	}
 
-	fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
+	if resp.Forked {
+		// Nothing found says a row was edited, deleted or forged: a second chain was
+		// opened under a host name that already had one. It still fails the command.
+		fmt.Fprintf(w, "AUDIT CHAIN FORKED — %d rows checked (no edited, deleted or forged row found)\n", resp.RowsChecked)
+	} else {
+		fmt.Fprintf(w, "AUDIT CHAIN TAMPERED — %d rows checked\n", resp.RowsChecked)
+	}
 	if resp.BrokenAtId != "" {
 		fmt.Fprintf(w, "\n%s\n  %s\n", brokenLinkHeading(resp.BrokenAtKind), resp.BrokenAtId)
 	}
@@ -216,6 +222,9 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		}
 	}
 	reportAmbiguousRows(w, resp)
+	if resp.Forked {
+		return fmt.Errorf("audit chain verification failed: the log holds a forked chain")
+	}
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
 }
 

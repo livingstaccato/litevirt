@@ -91,3 +91,21 @@ func TestLease_ClusterScope_IgnoresTheOwnRegion(t *testing.T) {
 		t.Fatalf("cluster scope, cluster-wide majority held: lease held=%v err=%v, want held", held, err)
 	}
 }
+
+// TestLease_RegionScope_OwnRegionInItsRegainGraceStandsDown: the failover
+// lease holds a scope only on a Yes outside that scope's quorum-regain
+// grace, and the scope for the own-region check is the region's, not the
+// cluster's.
+//
+// Mutation: key the own-region reading's grace to the cluster scope in
+// health.LostOwnRegionQuorum — the grace is not seen and the lease is taken.
+func TestLease_RegionScope_OwnRegionInItsRegainGraceStandsDown(t *testing.T) {
+	ctx := context.Background()
+	db := regionFixture(t, corrosion.FailoverScopeRegion)
+	c := newTestCoordinator("coordinator", db)
+	c.Gate = regionReadingGate{region: map[string]health.QuorumState{"east": health.QuorumYes, "west": health.QuorumYes}}
+	c.QuorumRegain = func(_ context.Context, scope string) bool { return scope == health.RegionQuorumScope("east") }
+	if held, err := c.acquireLeaseResult(ctx); held || !errors.Is(err, errLeaseNoQuorum) {
+		t.Fatalf("own region east inside its regain grace: lease held=%v err=%v, want a stand-down", held, err)
+	}
+}

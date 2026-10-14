@@ -156,6 +156,12 @@ type Coordinator struct {
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
 	leaseQuorumLost atomic.Bool
+	// recoverOnly, while a recovery of a host runs, limits it to the workloads
+	// listed for that host ("kind/name", health.PauseKindVM or
+	// health.PauseKindContainer): a self-paused host answering through a
+	// bridge is recovered only for what it reported pausing
+	// (selfPauseStillStands). No entry recovers everything.
+	recoverOnly map[string]map[string]bool
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -1425,6 +1431,35 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true, nil
+}
+
+// onlyReportedPausedFilter keeps the items of kind that a recovery limited to
+// only may move: those listed there, which the host reported pausing. A nil
+// only keeps everything. dropped names the rest.
+func onlyReportedPausedFilter[T any](only map[string]bool, kind string, items []T, name func(T) string) (keep []T, dropped []string) {
+	if only == nil {
+		return items, nil
+	}
+	for _, it := range items {
+		if only[kind+"/"+name(it)] {
+			keep = append(keep, it)
+		} else {
+			dropped = append(dropped, name(it))
+		}
+	}
+	return keep, dropped
+}
+
+// noteNotReportedPaused says, for each workload a limited recovery left on
+// host, why: the host answered through a bridge and did not report pausing
+// it, so it may still be running there. It stays for an operator.
+func (c *Coordinator) noteNotReportedPaused(host, kind string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	slog.Warn("failover: not recovering workloads the host answering through a bridge did not report pausing; they may still run there",
+		"host", host, "kind", kind, "workloads", names)
+	c.noteHold(host, "recovery left "+kind+" "+strings.Join(names, ",")+": the host did not report pausing them and may still run them")
 }
 
 // errLeaseNoQuorum is acquireLeaseResult standing down because this node has
@@ -3019,6 +3054,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	// and the claim and proof mint of each reschedule. It only orders work:
 	// every gate below still decides each VM on its own.
 	corrosion.SortVMsByMigratePriority(vms)
+	vms, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindVM, vms,
+		func(v corrosion.VMRecord) string { return v.Name })
+	c.noteNotReportedPaused(h.Name, health.PauseKindVM, notPaused)
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)
@@ -3520,6 +3558,9 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		c.mCt(ActionRelocate, ResultError, ErrDBError)
 		return
 	}
+	cts, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindContainer, cts,
+		func(ct corrosion.ContainerRecord) string { return ct.Name })
+	c.noteNotReportedPaused(h.Name, health.PauseKindContainer, notPaused)
 	for _, ct := range cts {
 		// A stopped container is not a failover candidate either
 		// (ContainerRecoverableOnHostFailure): relocating it recreates and

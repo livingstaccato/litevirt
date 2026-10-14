@@ -257,3 +257,54 @@ func TestSelfPauseExplicit_ASuccessorResumesPastABridge(t *testing.T) {
 		t.Fatalf("VM on %q after the successor's own wait; a bridged self-pause record must be resumed", got)
 	}
 }
+
+// One voter that has been failing down for an hour (a broken route of its
+// own) does not date the outage: the host cannot have lost its majority
+// before n−q+1 = 3 voters stopped answering, so the anchor is the third
+// earliest run, at the cut. A condition raised half an hour ago predates it.
+//
+// Mutation: anchor on the earliest run in outageStart — the hour-old run
+// admits the half-hour-old condition and the VM moves.
+func TestSelfPauseExplicit_ALongFailingObserverCannotPullTheAnchorBack(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	if err := db.Execute(ctx,
+		`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES ('v4', 'down', 'suspect', ?, ?, ?)`, 1800,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	got := atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedCondition(t, db, time.Now().Add(-30*time.Minute))
+	})
+	if got != "down" {
+		t.Fatalf("VM recovered to %q on a condition older than the outage, dated by one long-failing voter", got)
+	}
+}
+
+// Under a bridge the host's word covers what it reported pausing and nothing
+// more: a second VM it did not list stays where it is.
+//
+// Mutation: ignore recoverOnly in recoverWorkloads — vm2 moves too.
+func TestSelfPauseExplicit_OnlyReportedPausedWorkloadsAreRecovered(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm2", HostName: "down", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedCondition(t, db, time.Now()) // lists vm/vm only
+	})
+	if got != "alive" {
+		t.Fatalf("setup: the reported VM is on %q, want it recovered", got)
+	}
+	vm2, err := corrosion.GetVM(ctx, db, "vm2")
+	if err != nil || vm2 == nil {
+		t.Fatalf("GetVM vm2: %v", err)
+	}
+	if vm2.HostName != "down" {
+		t.Fatalf("vm2 recovered to %q although down did not report pausing it", vm2.HostName)
+	}
+}

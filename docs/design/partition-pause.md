@@ -504,11 +504,17 @@ All of this is in the failover coordinator (`internal/failover`).
      direction only (§7 F4). So once any observer has seen the host answer
      since the fence, the majority recovers only on the host's own word: its
      replicated `partition_paused` condition (§3.6), open and raised no
-     earlier than the start of the observer failing run the fence rests on.
-     Not "after the fence": a host pauses `T_pause` after it loses the
-     majority, which can be well before a coordinator decides, as when the
-     lease had to move first. A host that never paused never raised it, and
-     is refused. On top of that, the voters whose latest verdict about the
+     earlier than the outage began, and then only the workloads its evidence
+     lists as paused; any other stays where it is, for an operator. The
+     outage begins, for a voter set of `n` with majority `q`, at the
+     `(n−q+1)`-th earliest start among its voters' failing runs that span the
+     fence: the host cannot have lost its majority before that many voters
+     stopped answering, and one observer that has failed it for long, or a
+     non-voter, cannot move it earlier. Fewer such runs refuse; with several
+     voter sets the latest answer counts. Not "after the fence": a host
+     pauses `T_pause` after it loses the majority, which can be well before
+     a coordinator decides, as when the lease had to move first. A host that
+     never paused never raised it, and is refused. On top of that, the voters whose latest verdict about the
      host is an answer (healthy or unready, of any age), counting the host
      itself when it is a voter, must not be a majority of the adopted voter
      set (the host's region's under region scope) nor of any newer

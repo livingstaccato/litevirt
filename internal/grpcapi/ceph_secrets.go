@@ -512,7 +512,8 @@ func (s *Server) ReconcileCephSecrets(ctx context.Context) {
 	if s.db != nil {
 		s.judgeCephTrash(ctx)
 		s.judgeCephImages(ctx)
-		s.judgeKeptDisks(ctx) // disk_kept.go: not a ceph check, but run on the same pass
+		s.judgeKeptDisks(ctx)       // disk_kept.go: not a ceph check, but run on the same pass
+		s.sweepCancelledStarts(ctx) // cancelled_starts.go: likewise; it does not wait for libvirt
 	}
 	if s.virt == nil || s.db == nil {
 		return

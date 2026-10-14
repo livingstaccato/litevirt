@@ -136,8 +136,8 @@ func TestStartVM_AStartLibvirtDoesNotAnswerReturnsAndKeepsTheVMHeld(t *testing.T
 		unlock()
 		t.Fatal("web's lock was let go while libvirt has not answered its start")
 	}
-	if vm := st.row(t); vm.State != "stopped" {
-		t.Fatalf("web's row while the start is in flight: %s", vm.State)
+	if vm := st.row(t); vm.State != "starting" {
+		t.Fatalf("web's row while the start is in flight: %s, want starting", vm.State)
 	}
 	if n := st.openReservations(t); n != 1 {
 		t.Fatalf("web's capacity reservations open while the start is in flight: %d, want 1", n)
@@ -236,8 +236,8 @@ func TestStartVM_ALateFailureIsRecorded(t *testing.T) {
 	wantStartInFlight(t, "start", err)
 	close(st.release)
 	st.waitLockFree(t, "after libvirt's late failure")
-	if vm := st.row(t); vm.State != "stopped" {
-		t.Fatalf("web after a late failure: %s, want stopped", vm.State)
+	if vm := st.row(t); vm.State != "stopped" || vm.StateDetail != "operator-stop" {
+		t.Fatalf("web after a late failure: %s/%s, want stopped/operator-stop, as before the start", vm.State, vm.StateDetail)
 	}
 	evs, _ := corrosion.ListVMEvents(context.Background(), st.s.db, "web", 50, "")
 	found := false

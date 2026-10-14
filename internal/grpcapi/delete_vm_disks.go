@@ -316,6 +316,7 @@ func diskLeftoversError(vmName string, leftovers []diskLeftover) error {
 	return status.Errorf(code,
 		"cannot delete VM %q: its domain is gone but not every disk was removed — %s. "+
 			"Its record is kept and each disk is named by the health condition %s; a retry of the delete "+
-			"removes what it can and names what it cannot",
-		vmName, strings.Join(parts, "; "), condDiskLeftover)
+			"removes what it can and names what it cannot, and `lv rm --keep-disks %s` completes the delete "+
+			"leaving those disks to be removed by hand",
+		vmName, strings.Join(parts, "; "), condDiskLeftover, vmName)
 }

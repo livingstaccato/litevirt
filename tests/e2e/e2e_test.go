@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -399,6 +400,10 @@ var setupOnce sync.Once
 // Discovery is idempotent, so making it lazy costs nothing and removes the trap.
 func ensureTopology(t *testing.T) {
 	t.Helper()
+	// Before the Once: in lab mode every lv call skips its test, and a skip
+	// inside the Once would consume it with hostNames still empty, leaving every
+	// later caller to index an empty slice.
+	requireNotLabMode(t)
 	setupOnce.Do(func() { discoverTopology(t) })
 }
 
@@ -503,8 +508,92 @@ func TestCluster_Version(t *testing.T) {
 	}
 }
 
+// suiteStart is when this test binary began: a health condition first seen
+// after it was not there before the run.
+var suiteStart = time.Now()
+
+// conditionsSince returns the condition rows of `lv health` output whose SINCE
+// (the last column; RFC3339 or "2006-01-02 15:04:05") is at or after t, or
+// cannot be read: an unreadable time is treated as new, never as old.
+func conditionsSince(out string, t time.Time) []string {
+	var fresh []string
+	inConds := false
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "conditions:"):
+			inConds = true
+			continue
+		case line != "" && !strings.HasPrefix(line, " "):
+			inConds = false
+		}
+		f := strings.Fields(line)
+		if !inConds || len(f) < 2 || f[0] == "SEVERITY" {
+			continue
+		}
+		var ts time.Time
+		var err error = errors.New("no time")
+		for _, cand := range []string{f[len(f)-1], strings.Join(f[max(0, len(f)-2):], " ")} {
+			for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
+				if ts, err = time.Parse(layout, cand); err == nil {
+					break
+				}
+			}
+			if err == nil {
+				break
+			}
+		}
+		if err != nil || !ts.Before(t) {
+			fresh = append(fresh, line)
+		}
+	}
+	return fresh
+}
+
+// TestConditionsSince pins which health conditions count as new.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestConditionsSince(t *testing.T) {
+	start := time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
+	out := "overall: DEGRADED\n\nconditions:\n  SEVERITY  LIFECYCLE  CODE  SUBJECT  HOSTS  SINCE\n" +
+		"  warning  active  vm_settled  vm/a  node-1  2026-10-03T10:00:00Z\n" +
+		"  warning  active  vm_settled  vm/b  node-1  2026-10-03 10:00:00\n\nevaluators:\n  x  y 2026-10-14T10:00:00Z\n"
+	if f := conditionsSince(out, start); len(f) != 0 {
+		t.Errorf("old conditions counted as new: %v", f)
+	}
+	for name, row := range map[string]string{
+		"new":        "  warning  active  vm_dual_run  vm/c  node-2  2026-10-14T09:30:00Z\n",
+		"unreadable": "  warning  active  vm_dual_run  vm/c  node-2  yesterday\n",
+	} {
+		if f := conditionsSince(out+"", start); len(f) != 0 {
+			t.Fatalf("setup: %v", f)
+		}
+		o := strings.Replace(out, "\nevaluators:", row+"\nevaluators:", 1)
+		if f := conditionsSince(o, start); len(f) != 1 {
+			t.Errorf("%s condition was not reported: %v", name, f)
+		}
+	}
+}
+
 func TestCluster_Health(t *testing.T) {
-	out := lv(t, "health")
+	// `lv health` exits 1 when the overall state is DEGRADED (and 2 when
+	// CRITICAL): the report is still printed in full. This test pins that the
+	// report names the cluster's hosts, so a DEGRADED cluster, whose old
+	// conditions this test did not create, is a valid report. Only a report that
+	// was not produced at all (an error, no "overall:" line) or one that says
+	// CRITICAL fails here.
+	out, err := lvErr(t, "health")
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 1 || !strings.HasPrefix(out, "overall: DEGRADED") {
+			t.Fatalf("lv health failed, or reports something worse than DEGRADED: %v\n%s", err, out)
+		}
+		// Only conditions that predate this run are excused: one raised since
+		// the suite started could be this run's own doing or a regression.
+		if fresh := conditionsSince(out, suiteStart); len(fresh) > 0 {
+			t.Fatalf("the cluster is DEGRADED by conditions first seen since this run began (%s) or with an unreadable SINCE:\n%s",
+				suiteStart.UTC().Format(time.RFC3339), strings.Join(fresh, "\n"))
+		}
+		t.Logf("cluster is DEGRADED (exit 1) by older conditions only; checking the report still names the hosts:\n%s", out)
+	}
 	// At least the local/connected host should appear.
 	found := false
 	for _, h := range hostNames {
@@ -658,8 +747,65 @@ func TestHost_DrainUndrain(t *testing.T) {
 func TestHost_Config(t *testing.T) {
 	requireHosts(t, 1)
 	host := hostNames[0]
+	// The setting is cluster state: left at "ssh" it makes a later drill's
+	// powered-off victim unrecoverable (an unreachable host cannot be
+	// SSH-fenced). Read it first and put it back in Cleanup, which runs even
+	// when the test fails or is skipped partway.
+	prev := inspectFenceStrategy(lv(t, "host", "inspect", host))
+	if prev == "" {
+		t.Skipf("cannot read %s's host record, so its fence strategy could not be restored", host)
+	}
+	t.Cleanup(func() {
+		if out, err := lvErr(t, "host", "config", host, "--fence-strategy", prev); err != nil {
+			t.Errorf("restoring %s's fence strategy to %q failed: %v\n%s", host, prev, err, out)
+		}
+	})
 	lv(t, "host", "config", host, "--fence-strategy", "ssh")
 	t.Log("host config set fence-strategy=ssh")
+}
+
+// inspectVMCPU reads spec.cpu out of `lv inspect <vm>` output, 0 when absent.
+func inspectVMCPU(inspect string) int {
+	var obj struct {
+		Spec struct {
+			CPU int `json:"cpu"`
+		} `json:"spec"`
+	}
+	if json.Unmarshal([]byte(inspect), &obj) != nil {
+		return 0
+	}
+	return obj.Spec.CPU
+}
+
+// inspectFenceStrategy reads fenceStrategy out of `lv host inspect` output, ""
+// only when the output is not JSON. An absent field is an unset strategy, which
+// the product treats as best-effort (the JSON omits empty fields), and
+// `--fence-strategy ""` cannot restore an empty value, so it reads as that.
+func inspectFenceStrategy(inspect string) string {
+	var obj struct {
+		FenceStrategy string `json:"fenceStrategy"`
+	}
+	if json.Unmarshal([]byte(inspect), &obj) != nil {
+		return ""
+	}
+	if obj.FenceStrategy == "" {
+		return "best-effort"
+	}
+	return obj.FenceStrategy
+}
+
+// TestInspectFenceStrategy pins the parse TestHost_Config restores from.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestInspectFenceStrategy(t *testing.T) {
+	for in, want := range map[string]string{
+		`{"name":"node-1","fenceStrategy":"best-effort"}`: "best-effort",
+		`{"name":"node-1"}`: "best-effort",
+		`not json`:          "",
+	} {
+		if got := inspectFenceStrategy(in); got != want {
+			t.Errorf("inspectFenceStrategy(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1099,8 +1245,11 @@ vms:
       root: 5G
     replicas: 2
     update:
-      strategy: start-first
-      max-parallel: 1
+      strategy: rolling
+      max-unavailable: 1
+      max-surge: 1
+      order: start-first
+      health-wait: 30s
 `, stackName, vmBase, testImage, cpu)
 		f := fmt.Sprintf("/tmp/e2e-compose-%d.yaml", os.Getpid())
 		os.WriteFile(f, []byte(compose), 0644)
@@ -1117,6 +1266,20 @@ vms:
 	lv(t, "compose", "up", "-f", f, "-y")
 	waitVM(t, vmBase+"-1", "RUNNING", 3*time.Minute)
 	waitVM(t, vmBase+"-2", "RUNNING", 3*time.Minute)
+
+	// The update must have taken effect on every replica: cpu 1 -> 2.
+	for _, vm := range []string{vmBase + "-1", vmBase + "-2"} {
+		var got int
+		for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(5 * time.Second) {
+			got = inspectVMCPU(lv(t, "inspect", vm))
+			if got == 2 || time.Now().After(deadline) {
+				break
+			}
+		}
+		if got != 2 {
+			t.Errorf("%s has cpu %d after the rolling update to cpu 2", vm, got)
+		}
+	}
 
 	lv(t, "compose", "down", "--name", stackName, "-y")
 }
@@ -2657,6 +2820,20 @@ vms:
 	// it. The inet table's forward chain must appear exactly once (regression
 	// guard for the atomic-replace fix: a merge-not-replace bug duplicated it).
 	t.Run("RenderedIntoKernel", func(t *testing.T) {
+		// The SG's drop renders as a drop in enforce mode and, in observe mode
+		// (`lv firewall enforce off`), as a counter that returns, carrying an
+		// "lv-wd" comment: the shape depends on the cluster's per-NIC mode, so
+		// read the mode and assert the shape that mode promises. The cluster mode
+		// is only ever enforce or observe; anything else means the status line
+		// was not understood, which must not skip the test.
+		var observe bool
+		switch mode := nicEnforcementMode(lv(t, "firewall", "enforce", "status")); mode {
+		case "enforce":
+		case "observe":
+			observe = true
+		default:
+			t.Fatalf("cannot read the per-NIC enforcement mode (got %q) from `lv firewall enforce status`", mode)
+		}
 		var nic, inet string
 		var chain string
 		deadline := time.Now().Add(2 * time.Minute) // tap discovery + 30s reconcile + margin
@@ -2674,7 +2851,7 @@ vms:
 		if chain == "" {
 			t.Fatalf("web SG never rendered into a nic_in_ chain of bridge litevirt-nic on %s within 2m:\n%s", host, nic)
 		}
-		if err := sgChainOrdered(chain); err != nil {
+		if err := sgChainOrdered(chain, observe); err != nil {
 			t.Errorf("%v:\n%s", err, chain)
 		}
 		// Scoped to the bound NIC: exactly one nic_in_ chain carries the rule.
@@ -2688,18 +2865,37 @@ vms:
 		if n := strings.Count(inet, "hook forward"); n != 1 {
 			t.Errorf("forward chain appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", n, inet)
 		}
-		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (8080 accept, DHCP accept, drop; single inet forward chain)", host)
+		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (observe=%v: 8080 accept, DHCP accept, drop or would-drop counter; single inet forward chain)", host, observe)
 	})
+}
+
+// nicEnforcementMode parses the mode out of `lv firewall enforce status`
+// ("per-NIC enforcement: enforce|observe|guards-only ..."), "" when absent.
+func nicEnforcementMode(status string) string {
+	_, rest, ok := strings.Cut(status, "per-NIC enforcement:")
+	if !ok {
+		return ""
+	}
+	f := strings.Fields(rest)
+	if len(f) == 0 {
+		return ""
+	}
+	return f[0]
 }
 
 // sgChainOrdered checks a nic_in_ chain of an nft listing carries the web SG as
 // three consecutive rules: tcp 8080 accept, udp 68 accept, and the SG's own
 // `proto all drop`. Rules in a NIC chain are scoped to the NIC, so they list as
-// `oifname "vnetX" tcp dport 8080 accept` and the drop as `oifname "vnetX" drop`.
-// The drop is matched by its tokens (the NIC match, then only the verdict), and
-// must be the rule right after the DHCP accept: a later drop, such as a cluster
-// default-deny, would not prove the SG's rendered.
-func sgChainOrdered(chain string) error {
+// `oifname "vnetX" tcp dport 8080 accept`.
+//
+// In enforce mode the drop is `oifname "vnetX" drop`, matched by its tokens
+// (the NIC match, then only the verdict). In observe mode the product renders
+// every drop as a counter that returns, labelled with an "lv-wd" comment
+// (internal/firewall/nic_table.go): `oifname "vnetX" counter ... return comment
+// "lv-wd vnetX in sg:web#2"`, and it must NOT be a drop. Either way the verdict
+// rule must be the rule right after the DHCP accept: a later drop, such as a
+// cluster default-deny, would not prove the SG's rendered.
+func sgChainOrdered(chain string, observe bool) error {
 	var rules []string
 	for _, l := range strings.Split(chain, "\n") {
 		if l = strings.TrimSpace(l); l != "" && l != "}" && !strings.HasSuffix(l, "{") && !strings.HasPrefix(l, "type ") {
@@ -2713,10 +2909,23 @@ func sgChainOrdered(chain string) error {
 		if i+2 >= len(rules) || !strings.HasSuffix(rules[i+1], "udp dport 68 accept") {
 			return fmt.Errorf("the SG's 8080 accept is not followed by its DHCP accept")
 		}
-		f := strings.Fields(rules[i+2])
-		if len(f) < 2 || f[0] != "oifname" || f[len(f)-1] != "drop" || strings.ContainsAny(rules[i+2], "{}") ||
-			strings.Contains(rules[i+2], "dport") || strings.Contains(rules[i+2], "saddr") || strings.Contains(rules[i+2], "daddr") {
-			return fmt.Errorf("the SG's drop does not follow its DHCP accept (next rule: %q)", rules[i+2])
+		v := rules[i+2]
+		f := strings.Fields(v)
+		// The match part, before any comment text (which may hold anything).
+		match, comment, _ := strings.Cut(v, " comment ")
+		mf := strings.Fields(match)
+		if len(f) < 2 || f[0] != "oifname" || strings.ContainsAny(match, "{}") ||
+			strings.Contains(match, "dport") || strings.Contains(match, "saddr") || strings.Contains(match, "daddr") {
+			return fmt.Errorf("the SG's verdict does not follow its DHCP accept (next rule: %q)", v)
+		}
+		if !observe {
+			if f[len(f)-1] != "drop" {
+				return fmt.Errorf("enforce mode: the SG's drop does not follow its DHCP accept (next rule: %q)", v)
+			}
+			return nil
+		}
+		if mf[len(mf)-1] != "return" || !strings.Contains(match, "counter") || !strings.HasPrefix(comment, `"lv-wd `) || !strings.Contains(comment, " in sg:") {
+			return fmt.Errorf("observe mode: the SG's drop is not an lv-wd counter-return (next rule: %q)", v)
 		}
 		return nil
 	}
@@ -2725,7 +2934,7 @@ func sgChainOrdered(chain string) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.
@@ -2775,8 +2984,25 @@ func TestSGChainOrdered(t *testing.T) {
 		oifname "vnet3" udp dport 68 accept
 		oifname "vnet3" drop
 	}`
-	if err := sgChainOrdered(good); err != nil {
+	if err := sgChainOrdered(good, false); err != nil {
 		t.Errorf("a correct chain was refused: %v", err)
+	}
+	const observed = `	chain nic_in_vnet3 {
+		oifname "vnet3" tcp dport 8080 accept
+		oifname "vnet3" udp dport 68 accept
+		oifname "vnet3" counter packets 0 bytes 0 return comment "lv-wd vnet3 in sg:web#2"
+	}`
+	if err := sgChainOrdered(observed, true); err != nil {
+		t.Errorf("a correct observe-mode chain was refused: %v", err)
+	}
+	if err := sgChainOrdered(observed, false); err == nil {
+		t.Error("an observe-mode chain was accepted as an enforce-mode one")
+	}
+	if err := sgChainOrdered(good, true); err == nil {
+		t.Error("an enforce-mode chain was accepted as an observe-mode one")
+	}
+	if nicEnforcementMode("per-NIC enforcement: observe (since x)\n") != "observe" || nicEnforcementMode("nothing") != "" {
+		t.Error("nicEnforcementMode misparses the status line")
 	}
 	for name, bad := range map[string]string{
 		"drop missing, a later default-deny drop": "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 22 accept\ndrop\n",
@@ -2785,7 +3011,7 @@ func TestSGChainOrdered(t *testing.T) {
 		"accepts out of order":    "oifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" drop\n",
 		"verdict is not a drop":   "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" accept\n",
 	} {
-		if err := sgChainOrdered(bad); err == nil {
+		if err := sgChainOrdered(bad, false); err == nil {
 			t.Errorf("%s: an incorrect chain was accepted", name)
 		}
 	}
@@ -2829,6 +3055,7 @@ func TestFirewallManagementCLI(t *testing.T) {
 	})
 
 	t.Run("HostRule", func(t *testing.T) {
+		requireHosts(t, 1) // skips, rather than indexing an empty hostNames
 		out := lv(t, "firewall", "host-rule", "add", "--host", hostNames[0], "--direction", "ingress",
 			"--proto", "tcp", "--port", "59444", "--action", "accept")
 		t.Log(out)

@@ -1565,11 +1565,23 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	// Batch-load all interfaces in a single query instead of per-VM N+1.
 	allIfaces, _ := corrosion.BatchGetVMInterfaces(ctx, s.db)
 
+	// One libvirt that does not answer must not hang the list: each local
+	// VM's live state is waited for a bounded time (vm_live_state.go).
+	liveBudget := s.newLiveStateBudget()
 	for _, vm := range vms {
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
-		if vm.HostName == s.hostName && s.virt != nil {
-			if liveState, err := s.liveVMState(vm.Name); err == nil {
+		stateDetail := ""
+		if inFlight := s.startUnanswered(vm.Name); inFlight != "" && vm.HostName == s.hostName {
+			// A start libvirt has not answered yet is under way here: the
+			// VM is starting (or stopping, the start cancelled), whatever
+			// the row or libvirt says meanwhile (vm_start_bound.go), and
+			// libvirt is not asked.
+			state = inFlight
+		} else if vm.HostName == s.hostName && s.virt != nil {
+			if liveState, err := s.liveVMStateBounded(vm.Name, liveBudget); errors.Is(err, errLiveStateNoAnswer) {
+				state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
+			} else if err == nil {
 				switch {
 				case vm.State == "stopped" && liveState == "running":
 					// Graceful shutdown in progress — trust DB, except for
@@ -1603,6 +1615,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 			StackName:    vm.StackName,
 			HostName:     vm.HostName,
 			State:        vmStateToPB(state),
+			StateDetail:  stateDetail,
 			CpuActual:    int32(vm.CPUActual),
 			MemActualMib: int32(vm.MemActual),
 			IsTemplate:   vm.IsTemplate,
@@ -1794,8 +1807,18 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// concurrent ownership transfer or state change is observed before we act. If
 	// ownership moved off this host in that window, abort for retry rather than
 	// forward while holding the lock (never hold a process lock across a peer RPC).
-	unlock := s.lockVM(req.Name)
-	defer unlock()
+	//
+	// The lock is held until the start has settled: a start libvirt does
+	// not answer within the wait answers the caller and goes on holding it
+	// (startDomainWithin), and a start that finds one of those answers the
+	// same at once (lockVMForStart).
+	unlock, err := s.lockVMForStart(ctx, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	held := &heldForStart{}
+	held.hold(unlock)
+	defer held.release()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
@@ -1822,7 +1845,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 				"%q was moved here by failover while stopped and %s is defining its domain; retry in a moment",
 				req.Name, heldBy)
 		}
-		defer health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name)
+		held.hold(func() { health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name) })
 	}
 
 	spec := &pb.VMSpec{}
@@ -1836,13 +1859,15 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, err
 	}
 	// The reservation must outlive startVMLocked's state write.
-	defer lease.release(ctx)
+	held.hold(func() { lease.release(ctx) })
 	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
 		return nil, err
 	} else if rearmed {
 		return s.vmToProto(ctx, vm.Name)
 	}
-	return s.startVMLocked(ctx, vm)
+	out, err := s.startVMLockedWithin(ctx, vm, s.startDomainWaitOrDefault())
+	held.handOff(err)
+	return out, err
 }
 
 // restartCancelledStartLocked makes again a start an operator cancelled
@@ -2166,6 +2191,14 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	return s.startVMLockedWithin(ctx, vm, 0)
+}
+
+// startVMLockedWithin is startVMLocked waiting at most wait (zero: as long as
+// it takes) for libvirt to answer the start. Past it, the start goes on and a
+// startInFlightError is returned; the caller must hold the VM lock until its
+// settled is closed (heldForStart), not let it go on return.
+func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the
@@ -2194,8 +2227,32 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 		releasePreflight()
 		return nil, status.Error(codes.FailedPrecondition, gerr.Error())
 	}
-	startErr := s.virt.StartDomain(vm.Name)
-	releaseGuard()
+	// This start supersedes a start of the VM cancelled earlier: its record
+	// goes, durably, before the domain is started, so the sweep never takes
+	// this start's domain for the cancelled one's (cancelled_starts.go),
+	// even when the running write below fails.
+	if err := s.endCancelledStartForStart(vm.Name); err != nil {
+		releaseGuard()
+		releasePreflight()
+		return nil, status.Errorf(codes.Internal, "start %q: %v", vm.Name, err)
+	}
+	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
+		releaseGuard()
+		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+	}
+	if wait <= 0 {
+		return finish(ctx, s.virt.StartDomain(vm.Name))
+	}
+	finishCancelled := func(ctx context.Context, startErr error, since, cancelled time.Time) {
+		releaseGuard()
+		s.finishCancelledStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec, since, cancelled)
+	}
+	return s.startDomainWithin(ctx, vm, wait, finish, finishCancelled)
+}
+
+// finishStartLocked records the answer libvirt gave startVMLocked's start.
+func (s *Server) finishStartLocked(ctx context.Context, vm *corrosion.VMRecord, startErr error,
+	releasePreflight func(), pbVM *pb.VM, hspec *pb.HooksSpec) (*pb.VM, error) {
 	if err := startErr; err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an
@@ -2211,7 +2268,7 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", vm.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
-			return s.vmToProto(ctx, vm.Name)
+			return s.startedVMProto(ctx, vm.Name)
 		}
 		// The start genuinely failed (not an already-running desync): release the PCI
 		// leases this start's preflight acquired so a failed start leaves no VM bound to
@@ -2244,7 +2301,23 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 
-	return s.vmToProto(ctx, vm.Name)
+	return s.startedVMProto(ctx, vm.Name)
+}
+
+// startedVMProto is vmToProto for a VM libvirt has just said it started: the
+// state is running, which a live-state read that libvirt does not answer in
+// time (VM_UNKNOWN, vm_live_state.go) does not overrule.
+func (s *Server) startedVMProto(ctx context.Context, name string) (*pb.VM, error) {
+	if s.vmReadBackHook != nil {
+		if err := s.vmReadBackHook(name); err != nil {
+			return nil, status.Errorf(codes.Internal, "get VM: %v", err)
+		}
+	}
+	out, err := s.vmToProto(ctx, name)
+	if err == nil && out.State == pb.VMState_VM_UNKNOWN {
+		out.State, out.StateDetail = pb.VMState_VM_RUNNING, ""
+	}
+	return out, err
 }
 
 func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, error) {
@@ -2270,7 +2343,24 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return client.StopVM(ctx, req)
 	}
 
-	unlock := s.lockVM(req.Name)
+	// A start held past its wait (vm_start_bound.go) holds the lock for as
+	// long as libvirt does not answer it: the stop answers rather than
+	// queueing behind it, and --force cancels the start.
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	if held != nil {
+		if !req.Force {
+			if out, done, err := s.heldStartAlreadyCancelled(ctx, req.Name, held); done {
+				return out, err
+			}
+			return nil, startHeldRefusal("stop", req.Name, held)
+		}
+		if out, done, err := s.cancelHeldStart(ctx, req.Name, held); done {
+			return out, err
+		}
+		// libvirt answered meanwhile: the start is settling. Stop the VM
+		// as usual once it has.
+		unlock = s.lockVM(req.Name)
+	}
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2287,6 +2377,12 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 // timeout then force-kill). The caller MUST hold the VM lock, have re-read vm under
 // it, and confirmed local ownership; it never locks or forwards.
 func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
+	return s.stopVMLockedNote(ctx, vm, force, timeoutSec, "")
+}
+
+// stopVMLockedNote is stopVMLocked recording note as the stop event's detail
+// when the stop has none of its own.
+func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
@@ -2403,7 +2499,7 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	evDetail := ""
+	evDetail := note
 	switch {
 	case cancelled != "":
 		evDetail = cancelled
@@ -2499,7 +2595,12 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return client.RestartVM(ctx, req)
 	}
 
-	unlock := s.lockVM(req.Name)
+	// A start held past its wait holds the lock for as long as libvirt does
+	// not answer it: the restart answers rather than queueing behind it.
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	if held != nil {
+		return nil, startHeldRefusal("restart", req.Name, held)
+	}
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2937,6 +3038,23 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// never removed on a guess. A disk whose removal fails fails the
 		// delete, and the record stays.
 		if !req.KeepDisks {
+			// A row being started (pending/starting: a failover's start, or
+			// one re-armed after a cancel) is one the reconciler starts, and
+			// a transfer start rebuilds a missing disk from its image. A
+			// delete that removes some disks and then fails would leave it
+			// to boot the VM being deleted on blank disks. So, before any
+			// disk is removed, the row is recorded stopped by its operator,
+			// as a delete that fails after its stop leaves it
+			// (abortDeleteAfterStop): no start path starts it, whatever
+			// this delete then manages. Nothing is removed when that write
+			// fails.
+			if (vm.State == "pending" || vm.State == "starting") && vm.HostName == s.hostName {
+				if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+					return nil, status.Errorf(codes.Internal,
+						"cannot delete VM %q: it is being started (%s), and recording its stop before its disks are removed failed; nothing was removed: %v",
+						req.Name, vm.State, werr)
+				}
+			}
 			_, derr := s.virt.DomainIsActive(req.Name)
 			domainGone := lv.IsNoDomain(derr)
 			cephKept, keptDisks, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) (bool, string, string) {
@@ -3366,9 +3484,21 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// Only override DB state if the DB hasn't been explicitly set by an operator action
 	// (e.g., "stopped" from StopVM). This avoids showing stale libvirt state during
 	// graceful shutdown where libvirt still reports "running" briefly.
-	state := vm.State
-	if vm.HostName == s.hostName && s.virt != nil {
-		if liveState, err := s.liveVMState(name); err == nil {
+	state, stateDetail := vm.State, vm.StateDetail
+	if inFlight := s.startUnanswered(name); inFlight != "" && vm.HostName == s.hostName {
+		// A start libvirt has not answered yet is under way here
+		// (vm_start_bound.go): the VM is starting (or stopping, the start
+		// cancelled), and libvirt is not asked.
+		state = inFlight
+	} else if vm.HostName == s.hostName && s.virt != nil {
+		if liveState, err := s.liveVMStateBounded(name, s.newLiveStateBudget()); errors.Is(err, errLiveStateNoAnswer) {
+			// libvirt has not answered (vm_live_state.go): the read says
+			// so, with what the record says, rather than waiting on it.
+			state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
+			if vm.StateDetail != "" {
+				stateDetail += " (" + vm.StateDetail + ")"
+			}
+		} else if err == nil {
 			// Trust libvirt for running detection (catches unexpected starts/crashes),
 			// but trust DB for operator-initiated stops/starts.
 			switch {
@@ -3392,7 +3522,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		StackName:    vm.StackName,
 		HostName:     vm.HostName,
 		State:        vmStateToPB(state),
-		StateDetail:  vm.StateDetail,
+		StateDetail:  stateDetail,
 		CpuActual:    int32(vm.CPUActual),
 		MemActualMib: int32(vm.MemActual),
 		IsTemplate:   vm.IsTemplate,

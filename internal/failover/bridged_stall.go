@@ -43,7 +43,9 @@ type bridgedEvidence struct {
 }
 
 // noteBridgedStall raises ha.recovery.bridged for h, whose recovery at the
-// deadline of a self-pause fence at `at` was refused for why. A host with no
+// deadline of a self-pause fence at `at` was refused for why (refusePauseWait,
+// on each change of reason; retryPauseWait resolves it once the deadline goes
+// ahead). A host with no
 // recoverable workload on it holds nothing back, and raises nothing.
 func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRecord, at time.Time, why string) {
 	derived := c.derivedVoterSet(ctx)
@@ -54,7 +56,7 @@ func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRec
 	c.raiseBridged(ctx, h.Name, c.answeredSinceObservers(ctx, h.Name, at), derived,
 		fmt.Sprintf("the partition-pause deadline of %s passed and its workloads were not recovered: %s. "+
 			"Observers outside the majority still see it answer, as a host reaching both halves of a split relays; "+
-			"the cluster is on %s. Nothing ran twice; the workloads stay paused on %s",
+			"the cluster is on %s. Nothing ran twice; the workloads stay paused on %s, and the deadline is re-checked every cycle",
 			h.Name, why, set, h.Name))
 }
 

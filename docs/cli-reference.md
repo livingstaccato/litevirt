@@ -198,7 +198,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
 lv ls [--stack <name>] [--host <name>]    # List VMs
 lv inspect <vm>                           # VM details
 lv start <vm>                             # Start stopped VM; one whose start a forced stop cancelled goes back to starting, and the reconciler defines and starts it
-lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds as a no-op, recording the stop (an error VM is left as it is, its set-aside disk copies held); one being started (pending/starting) is refused until it runs; with --force, one being started with no domain defined has its start cancelled (stopped, its set-aside disk copies still held)
+lv stop <vm> [--force]                    # Stop VM (--force = hard power off); a VM already stopped succeeds as a no-op, recording the stop (an error VM is left as it is, its set-aside disk copies held); one being started (pending/starting) is refused until it runs; with --force, one being started with no domain defined has its start cancelled (stopped, its set-aside disk copies still held); an `lv start` libvirt has not answered within its wait is refused at once (Unavailable), and with --force cancelled: the VM is recorded stopped now and a domain libvirt starts for it is destroyed when it answers
 lv restart <vm>                           # Restart VM
 lv rm <vm> [--keep-disks] [--force]       # Delete VM (--force = hard power off a running VM, only once the delete's checks pass)
 lv console <vm>                           # Serial console (Ctrl+] to exit)
@@ -1391,7 +1391,7 @@ See `docs/firewall.md` for the three-tier model, where each tier is enforced
 
 ```bash
 lv audit ls [--limit N] \
-    [--target <path>] [--action <a>] [--user <u>] [--since <time>]   # Tail/filter recent audit entries
+    [--target <path>] [--action <a>] [--user <u>] [--since <time>] [--until <time>]   # Tail/filter recent audit entries
   #   --action supports a trailing-* prefix glob (e.g. sg.*)
 lv audit verify                                # Walk the SHA-256 hash chain
 lv audit export [--since <time>] [--until <time>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
@@ -1407,7 +1407,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>]   # Audit log (default 50 entries)
+lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics
 ```

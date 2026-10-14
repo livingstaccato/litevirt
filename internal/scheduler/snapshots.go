@@ -70,9 +70,82 @@ type SnapshotScheduler struct {
 	ReplRunner   ReplicationRunner // optional; handles type='replication' rows
 	PollInterval time.Duration     // default 60s
 	Now          func() time.Time
+	// RunHoldBound is how long one run holds the pass that dispatched it
+	// (default DefaultRunHoldBound). See runHeld.
+	RunHoldBound time.Duration
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
+
+	// running holds each run that has not returned, by runKey, with when
+	// it started: one is never started again until it has (runHeld).
+	runningMu sync.Mutex
+	running   map[string]time.Time
+}
+
+// DefaultRunHoldBound is how long a run holds the pass that dispatched it
+// before the pass goes on without it. Runs are made one after another, so a
+// copy whose target stopped answering mid-write (an NFS server that died;
+// the write waits in the kernel for as long as the server is gone) held
+// every other schedule of the host for the whole outage. A run past the
+// bound goes on in its own goroutine and records its outcome when it
+// returns; until then it is never started a second time.
+const DefaultRunHoldBound = 5 * time.Minute
+
+func (s *SnapshotScheduler) runHoldBound() time.Duration {
+	if s.RunHoldBound > 0 {
+		return s.RunHoldBound
+	}
+	return DefaultRunHoldBound
+}
+
+// runKey names one run of a schedule: the row it came from (a fan-out's
+// Origin), the VM it is for, its repo or pool, and its type.
+func runKey(sched corrosion.BackupScheduleRecord) string {
+	return sched.Type + "\x00" + sched.Origin + "\x00" + sched.VMName + "\x00" + sched.Repo
+}
+
+// runHeld runs fn, the run of sched dispatched at runAt, unless the same
+// run (runKey) has not returned yet, in which case it is not started and
+// false is returned. The caller waits for fn at most the hold bound; past
+// it, fn goes on in its own goroutine and the run stays marked running until
+// fn has returned, its outcome recorded by fn itself, so it is neither
+// started twice nor recorded twice.
+func (s *SnapshotScheduler) runHeld(sched corrosion.BackupScheduleRecord, runAt time.Time, fn func()) bool {
+	key := runKey(sched)
+	s.runningMu.Lock()
+	if since, busy := s.running[key]; busy {
+		s.runningMu.Unlock()
+		slog.Warn("snapshot scheduler: run not started, because its previous run has not returned",
+			"type", sched.Type, "vm", sched.VMName, "repo", sched.Repo, "previous_started", since.UTC().Format(time.RFC3339))
+		return false
+	}
+	if s.running == nil {
+		s.running = map[string]time.Time{}
+	}
+	started := time.Now()
+	s.running[key] = started
+	s.runningMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			s.runningMu.Lock()
+			delete(s.running, key)
+			s.runningMu.Unlock()
+		}()
+		fn()
+	}()
+	bound := s.runHoldBound()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.Warn("snapshot scheduler: run has not returned within its hold; it goes on, and the other schedules no longer wait for it",
+			"type", sched.Type, "vm", sched.VMName, "repo", sched.Repo, "run_at", runAt.UTC().Format(time.RFC3339), "held", bound)
+	}
+	return true
 }
 
 // NewSnapshotScheduler returns a configured scheduler with sensible defaults.
@@ -228,9 +301,11 @@ func (s *SnapshotScheduler) dispatchPointInTimeRetries(ctx context.Context, sche
 			fanout.PoolName = ""
 			fanout.ProjectName = ""
 			if r.PointInTimeRetryDue(fanout) {
-				if err := s.ReplRunner.RunReplication(ctx, fanout, now); err != nil {
-					slog.Warn("snapshot scheduler: point-in-time retry failed", "vm", vmName, "repo", sched.Repo, "error", err)
-				}
+				s.runHeld(fanout, now, func() {
+					if err := s.ReplRunner.RunReplication(ctx, fanout, now); err != nil {
+						slog.Warn("snapshot scheduler: point-in-time retry failed", "vm", vmName, "repo", sched.Repo, "error", err)
+					}
+				})
 			}
 		}
 		return
@@ -307,7 +382,15 @@ func (s *SnapshotScheduler) containerOwner(ctx context.Context, name, project st
 // dispatch fires one backup and records the outcome. The runAt
 // timestamp is the scheduler's view of "now" so virtual-time tests are
 // reproducible.
+//
+// The run holds the pass at most the hold bound (runHeld): one that does not
+// return goes on by itself and records its outcome when it does.
 func (s *SnapshotScheduler) dispatch(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) {
+	s.runHeld(sched, runAt, func() { s.runAndRecord(ctx, sched, runAt) })
+}
+
+// runAndRecord makes one run and records its outcome on the schedule row.
+func (s *SnapshotScheduler) runAndRecord(ctx context.Context, sched corrosion.BackupScheduleRecord, runAt time.Time) {
 	var err error
 	if sched.Type == "replication" {
 		if s.ReplRunner == nil {

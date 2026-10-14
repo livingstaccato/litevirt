@@ -2,9 +2,14 @@ package failover
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -58,14 +63,25 @@ func writeGen(t *testing.T, db *corrosion.Client, gen int64, members ...string) 
 	}
 }
 
-// pausedCondition is down's own partition_paused condition, raised at at.
+// pausedCondition is down's own partition_paused condition, raised at at,
+// listing vm/vm as paused.
 func pausedCondition(t *testing.T, db *corrosion.Client, at time.Time) {
 	t.Helper()
+	pausedConditionListing(t, db, at, "vm/vm")
+}
+
+// pausedConditionListing is down's partition_paused condition, raised at at,
+// listing keys as paused.
+func pausedConditionListing(t *testing.T, db *corrosion.Client, at time.Time, keys ...string) {
+	t.Helper()
+	b, _ := json.Marshal(struct {
+		Paused []string `json:"paused"`
+	}{keys})
 	ts := at.UTC().Format(time.RFC3339)
 	if err := corrosion.UpsertHealthCondition(context.Background(), db, corrosion.HealthCondition{
 		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondPartitionPaused,
 		SubjectKind: "host", SubjectID: "down", Lifecycle: corrosion.ConditionConfirmed,
-		Severity: corrosion.SeverityWarning, FirstSeen: ts, LastSeen: ts, Evidence: `{"paused":["vm/vm"]}`,
+		Severity: corrosion.SeverityWarning, FirstSeen: ts, LastSeen: ts, Evidence: string(b),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -162,9 +178,10 @@ func TestSelfPauseExplicit_AVoterMajorityAnsweringIsRefused(t *testing.T) {
 	healthRow(t, db, "v4", "healthy", 0, time.Now().Add(time.Second))
 	pausedCondition(t, db, time.Now())
 	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
-	if !c.retryPauseWait(ctx, "down") {
+	if _, ok := c.pauseWaits["down"]; !ok {
 		t.Fatal("setup: down had no pending pause wait")
 	}
+	c.retryPauseWait(ctx, "down")
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("VM recovered to %q although down, v4 and v5 (3 of 5 voters) last saw it answer", got)
 	}
@@ -255,5 +272,192 @@ func TestSelfPauseExplicit_ASuccessorResumesPastABridge(t *testing.T) {
 	succ.run(ctx)
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Fatalf("VM on %q after the successor's own wait; a bridged self-pause record must be resumed", got)
+	}
+}
+
+// failingSince is observer failing down since since (its run's last_seen),
+// its row written at written.
+func failingSince(t *testing.T, db *corrosion.Client, observer string, since, written time.Time) {
+	t.Helper()
+	if err := db.Execute(context.Background(),
+		`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES (?, 'down', 'suspect', ?, ?, ?)`, observer, 1800,
+		since.UTC().Format(time.RFC3339Nano), written.UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The outage is dated by the voters: with n = 5 and q = 3, the host cannot
+// have lost its majority before n−q+1 = 3 of the other voters stopped
+// answering. Here v4 has failed down for an hour, v5 for twenty minutes, a
+// non-voter for two hours, and coordinator and alive since the cut, so the
+// outage begins at the cut and a condition raised ten minutes ago predates it.
+//
+// Mutations: anchor on the earliest run (an hour ago), or on the (n−q)-th
+// (twenty minutes ago, one short), or count non-voters' runs (the third
+// earliest becomes twenty minutes ago) — each admits the condition and the VM
+// moves.
+func TestSelfPauseExplicit_TheOutageBeginsAtTheVotersNMinusQPlus1thRun(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	now := time.Now()
+	failingSince(t, db, "v4", now.Add(-time.Hour), now)
+	failingSince(t, db, "v5", now.Add(-20*time.Minute), now)
+	failingSince(t, db, "far-non-voter", now.Add(-2*time.Hour), now)
+	got := atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedCondition(t, db, time.Now().Add(-10*time.Minute))
+	})
+	if got != "down" {
+		t.Fatalf("VM recovered to %q on a condition raised before the third voter lost the host", got)
+	}
+}
+
+// The same voters with the condition raised after the cut: recovered, so the
+// test above refuses on the anchor and nothing else.
+func TestSelfPauseExplicit_AConditionAfterTheVotersAnchorIsRecovered(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	now := time.Now()
+	failingSince(t, db, "v4", now.Add(-time.Hour), now)
+	failingSince(t, db, "v5", now.Add(-20*time.Minute), now)
+	failingSince(t, db, "far-non-voter", now.Add(-2*time.Hour), now)
+	got := atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedCondition(t, db, time.Now())
+	})
+	if got != "alive" {
+		t.Fatalf("VM on %q; a condition raised after the cut must be accepted", got)
+	}
+}
+
+// Fewer than n−q+1 voters still fail down with a run spanning the fence (v4's
+// row has gone stale): the outage cannot be dated, and nothing is recovered.
+// Through run() down would no longer be a fence candidate at all, so the
+// deadline check is called directly, as a coordinator that still listed it
+// would.
+//
+// Mutation: drop the too-few-runs refusal in outageStart — it indexes past
+// the runs it has and the test goes red.
+func TestSelfPauseExplicit_TooFewVoterRunsToDateTheOutageAreRefused(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	c.run(ctx)
+	if m, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceSelfPaused {
+		t.Fatalf("setup: fence recorded %s (%s), want self_paused", m, a)
+	}
+	failingSince(t, db, "v4", time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+	bridgeAnswer(t, db)
+	pausedCondition(t, db, time.Now())
+	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
+	if _, ok := c.pauseWaits["down"]; !ok {
+		t.Fatal("setup: down had no pending pause wait")
+	}
+	c.retryPauseWait(ctx, "down")
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q with only two voters' runs to date the outage by", got)
+	}
+}
+
+// unlistedWorkloads adds to explicitPause's down a second VM, vm2, and two
+// relocatable containers, ct1 and ct2, with alive able to take them all.
+func unlistedWorkloads(t *testing.T, db *corrosion.Client) {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm2", HostName: "down", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `UPDATE hosts SET cpu_total = 64, mem_total = 65536 WHERE name = 'alive'`); err != nil {
+		t.Fatal(err)
+	}
+	runsContainers(t, db, "alive")
+	for _, ct := range []string{"ct1", "ct2"} {
+		if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+			HostName: "down", Name: ct, State: "running", Image: "alpine:3.19",
+			CPULimit: 1, MemMiB: 128, Project: "p1", OnHostFailure: "image-recreate",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// assertLimited checks the listed workloads (vm, ct1) left down and the
+// unlisted ones (vm2, ct2) did not.
+func assertLimited(t *testing.T, db *corrosion.Client) {
+	t.Helper()
+	ctx := context.Background()
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("the reported VM is on %q, want it recovered", got)
+	}
+	if g, _ := corrosion.GetContainer(ctx, db, "down", "ct1"); g != nil {
+		t.Fatalf("the reported container ct1 is still on down: %+v", g)
+	}
+	vm2, err := corrosion.GetVM(ctx, db, "vm2")
+	if err != nil || vm2 == nil {
+		t.Fatalf("GetVM vm2: %v", err)
+	}
+	if vm2.HostName != "down" {
+		t.Fatalf("vm2 recovered to %q although down did not report pausing it", vm2.HostName)
+	}
+	if g, _ := corrosion.GetContainer(ctx, db, "down", "ct2"); g == nil {
+		t.Fatal("ct2 relocated although down did not report pausing it")
+	}
+}
+
+// Under a bridge the host's word covers what it reported pausing and nothing
+// more: a VM and a container it did not list stay where they are.
+//
+// Mutations: ignore recoverOnly in recoverWorkloads — vm2 moves; ignore it in
+// relocateContainers — ct2 moves.
+func TestSelfPauseExplicit_OnlyReportedPausedWorkloadsAreRecovered(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	unlistedWorkloads(t, db)
+	atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedConditionListing(t, db, time.Now(), "vm/vm", "ct/ct1")
+	})
+	assertLimited(t, db)
+}
+
+// The limit holds for the whole down-episode, not one recovery pass: a
+// refused recovery claim makes the next tick re-run the host's recovery
+// (retryClaims), which must not move what the host did not report pausing.
+//
+// Mutation: lift the limit after the deadline's own pass (as the first cut
+// did) — the claim retry moves vm2 and ct2 while down may still run them.
+func TestSelfPauseExplicit_AClaimRetryKeepsTheLimit(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	unlistedWorkloads(t, db)
+	db.SetRecoveryClaimGate(func() bool { return true })
+	refused := false
+	cl := &fakeClaimer{decide: func(key corrosion.ClaimKey, v corrosion.ClaimValue) (claims.Outcome, error) {
+		if !refused {
+			refused = true
+			return claims.Outcome{}, errors.New("a voter did not answer in time")
+		}
+		return decideOurs(key, v)
+	}}
+	c.Claimer = cl
+	c.RecoveryClaimEnforced = func(context.Context) bool { return true }
+	c.Gate = fakeFailoverGate{
+		supports: map[string]bool{"alive": true},
+		enforced: map[string]bool{capabilities.SplitBrainGateV1: true},
+	}
+	atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedConditionListing(t, db, time.Now(), "vm/vm", "ct/ct1")
+	})
+	if !refused {
+		t.Fatal("setup: no recovery claim was refused at the deadline")
+	}
+	if !c.claimRetry["down"] {
+		t.Fatal("setup: the refused claim scheduled no retry of down's recovery")
+	}
+	c.run(ctx)
+	c.run(ctx)
+	assertLimited(t, db)
+	// The stall alert keeps naming what was held back, whatever newer hold
+	// reason the retries recorded.
+	if held := c.unpausedHeldReason("down"); !strings.Contains(held, "vm/vm2") || !strings.Contains(held, "ct/ct2") {
+		t.Fatalf("the held workloads are no longer named for the stall alert: %q", held)
 	}
 }

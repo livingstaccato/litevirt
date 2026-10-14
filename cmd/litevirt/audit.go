@@ -34,12 +34,12 @@ func newAuditCmd() *cobra.Command {
 
 func newAuditLsCmd() *cobra.Command {
 	var limit int32
-	var target, action, user, since string
+	var target, action, user, since, until string
 	cmd := &cobra.Command{
 		Use:   "ls",
 		Short: "Show audit log (most recent first)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			since, _, err := resolveTimeBounds(since, "")
+			since, until, err := resolveTimeBounds(since, until)
 			if err != nil {
 				return err
 			}
@@ -50,6 +50,7 @@ func newAuditLsCmd() *cobra.Command {
 					Action: action,
 					User:   user,
 					Since:  since,
+					Until:  until,
 				})
 				if err != nil {
 					return fmt.Errorf("list audit log: %w", err)
@@ -72,6 +73,7 @@ func newAuditLsCmd() *cobra.Command {
 	cmd.Flags().StringVar(&action, "action", "", "filter by action; trailing * is a prefix glob (e.g. sg.*)")
 	cmd.Flags().StringVar(&user, "user", "", "filter by username")
 	cmd.Flags().StringVar(&since, "since", "", "filter to entries at/after this time (RFC3339, a date like 2026-06-01, or a duration ago like 24h)")
+	cmd.Flags().StringVar(&until, "until", "", "filter up to this time, inclusive of the whole unit it names (RFC3339, a date, or a duration ago)")
 	return cmd
 }
 

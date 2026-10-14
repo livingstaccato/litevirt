@@ -504,11 +504,28 @@ All of this is in the failover coordinator (`internal/failover`).
      direction only (§7 F4). So once any observer has seen the host answer
      since the fence, the majority recovers only on the host's own word: its
      replicated `partition_paused` condition (§3.6), open and raised no
-     earlier than the start of the observer failing run the fence rests on.
-     Not "after the fence": a host pauses `T_pause` after it loses the
-     majority, which can be well before a coordinator decides, as when the
-     lease had to move first. A host that never paused never raised it, and
-     is refused. On top of that, the voters whose latest verdict about the
+     earlier than the outage began, and then only the workloads its evidence
+     lists as paused. Every recovery of the host in that episode, a claim
+     retry included, keeps to the list until the host is back, an operator
+     confirms it off, a fence proves it off (IPMI or Redfish verified; a
+     best-effort or SSH fence does not), or the host is removed with such a
+     proof. A later deadline at which no observer has seen the host answer,
+     a successor's after the bridge has gone say, still keeps to the list
+     while that condition is readable. When it finds none from this outage
+     (absent, resolved, listing nothing, raised before the outage, or too
+     few fresh voter runs to date the outage), it keeps
+     the list this coordinator already holds, and recovers everything, as
+     without a bridge, only when it holds none. A read error of the
+     condition or of the voters' runs refuses the deadline. The
+     outage begins, for a voter set of `n` with majority `q`, at the
+     `(n−q+1)`-th earliest start among its voters' failing runs that span the
+     fence: the host cannot have lost its majority before that many voters
+     stopped answering, and one observer that has failed it for long, or a
+     non-voter, cannot move it earlier. Fewer such runs refuse; with several
+     voter sets the latest answer counts. Not "after the fence": a host
+     pauses `T_pause` after it loses the majority, which can be well before
+     a coordinator decides, as when the lease had to move first. A host that
+     never paused never raised it, and is refused. On top of that, the voters whose latest verdict about the
      host is an answer (healthy or unready, of any age), counting the host
      itself when it is a voter, must not be a majority of the adopted voter
      set (the host's region's under region scope) nor of any newer
@@ -519,12 +536,25 @@ All of this is in the failover coordinator (`internal/failover`).
      (`fenceStillStands`). So does any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never
-     stopped.
+     stopped. When one of these deadlines passes quiet while this
+     coordinator already keeps the host to a list, it keeps to the list as
+     above.
 
-   If either check fails, the wait is dropped and nothing is recovered. The
-   host came back, it will resume itself (§3.5), and `recoverHosts` reactivates
-   it.
-4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
+   If the host is no longer `fenced` or `offline`, the wait is dropped and
+   nothing is recovered. The host came back, it will resume itself (§3.5), and
+   `recoverHosts` reactivates it. If `selfPauseStillStands` refuses, whether
+   for a read error or on its rule, nothing is recovered and the wait is
+   kept: every later cycle re-checks the deadline under the whole rule, so a
+   condition that replicates late or a read that recovers lets it go ahead.
+   Meanwhile only an operator confirmation or a newer fence reaches the host,
+   and either ends the wait (a fence that relies on the pause starts its own).
+   A claim retry does not run while a wait is pending or refused, and one owed
+   to an earlier outage or an older fence is dropped with it.
+   The stall alert names the refusal and its reason.
+4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
+   Nor has one that takes the lease back after a gap (it stopped holding it,
+   or retakes it at a new term): it forgets every host's outage, its waits,
+   limits and claim retries included, and starts as a successor. It
    resumes from the relied-on fence record through `resumeActionFor` →
    `recoverFenced`, and starts a fresh wait anchored at its own first sight of
    the record. That is later than the original `t_d`, so it is safe. It

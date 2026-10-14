@@ -152,10 +152,27 @@ type Coordinator struct {
 	// future-proofing rather than a fix for a live race — unlike the
 	// rebalancer's, which has two concurrent callers.
 	leaseTerm atomic.Int64
+	// leaseGap is set whenever this coordinator stops holding the lease (or
+	// cannot show it does), and when it takes the lease at a new term: another
+	// node may have led in between. The next cycle that holds the lease then
+	// forgets every host's outage (forgetEpisodes) and re-derives it from the
+	// replicated records, as a successor would.
+	leaseGap atomic.Bool
 	// leaseQuorumLost is whether the last lease attempt stood down because this
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
 	leaseQuorumLost atomic.Bool
+	// recoverOnly limits every recovery of a host to the workloads listed for
+	// it ("kind/name", health.PauseKindVM or health.PauseKindContainer): a
+	// self-paused host answering through a bridge is recovered only for what
+	// it reported pausing (selfPauseStillStands). It lasts for the
+	// down-episode (limitRecovery, unlimitRecovery). No entry recovers
+	// everything.
+	recoverOnly map[string]map[string]bool
+	// unpausedHeld names, per host, the workloads a limited recovery has left
+	// on it, so the stall alert keeps naming them whatever newer hold reason
+	// is recorded. It lasts as recoverOnly does.
+	unpausedHeld map[string]map[string]bool
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -352,7 +369,7 @@ type Coordinator struct {
 	// row named another). The next tick re-proposes THAT value — same proof
 	// ID, same token — so it can retry at the same round: nothing was
 	// contending, so nothing should have to outrank it (§3.13 step 6).
-	claimRetryProposals map[corrosion.ClaimKey]corrosion.ActionProof
+	claimRetryProposals map[corrosion.ClaimKey]claimRetryProposal
 	// PartitionPauseEnforced is the majority's reliance predicate for partition
 	// pause (docs/design/partition-pause.md §4.3): enforcement.partition_pause
 	// on this node AND partition_pause_v1 latched. When it holds, an assumed
@@ -390,8 +407,8 @@ type Coordinator struct {
 	// (health.Checker.LastContact), the second anchor of the pause deadline.
 	// nil anchors on the decision alone.
 	LastContact func(host string) (time.Time, bool)
-	// pauseWaits holds recoveries waiting out a host's partition pause
-	// (partition_pause.go). In memory: a successor re-derives the wait from
+	// pauseWaits holds recoveries waiting out a host's partition pause, or
+	// re-checking a deadline that refused (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.
 	pauseWaits map[string]pauseWait
 
@@ -640,6 +657,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 		return
 	}
+	if c.leaseGap.Swap(false) {
+		c.forgetEpisodes()
+	}
 	if c.VoterGenesis != nil {
 		c.VoterGenesis(ctx, c.LeaseTerm())
 	}
@@ -852,7 +872,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		// it is recorded terminal (confirmationFencesAfresh).
 		afresh := false
 		if c.fenced[target] {
-			// A recovery waiting out the host's partition pause continues here.
+			// A recovery waiting out the host's partition pause continues
+			// here; one whose deadline refused falls through, re-checked next
+			// cycle.
 			if c.retryPauseWait(ctx, target) {
 				continue
 			}
@@ -885,6 +907,10 @@ func (c *Coordinator) run(ctx context.Context) {
 				continue
 			}
 			delete(c.fenced, target)
+			// The fence path decides afresh; neither a refused wait nor a
+			// claim retry owed to the older fence outlives it.
+			delete(c.pauseWaits, target)
+			c.forgetClaimRetries(target)
 		}
 
 		// Skip if this host is already in a terminal state.
@@ -1191,6 +1217,35 @@ func (c *Coordinator) stepDownGauges() {
 	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
+// dropLeaseTerm records that this coordinator does not hold the lease, or
+// cannot show it does (leaseGap).
+func (c *Coordinator) dropLeaseTerm() {
+	c.leaseTerm.Store(0)
+	c.leaseGap.Store(true)
+}
+
+// forgetEpisodes drops what this coordinator remembers of each host's outage,
+// on taking the lease back after a gap (leaseGap). Another node may have led
+// meanwhile: the host may have come back, failed again and been fenced
+// afresh, or not at all, and nothing remembered from the earlier tenure
+// speaks for that. Each host then goes down the path a fresh successor takes,
+// from the replicated fence records (recordedFence, resumeActionFor), which
+// re-derives any pause wait, recovery limit and claim retry from them.
+func (c *Coordinator) forgetEpisodes() {
+	c.fenced = make(map[string]bool)
+	c.fenceRelocated = make(map[string]bool)
+	c.confirmResumed = make(map[string]string)
+	c.fencedOn, c.lastFenceAt = nil, nil
+	c.pauseWaits = nil
+	c.claimRetry, c.claimRetryProposals = nil, nil
+	c.recoverOnly, c.unpausedHeld = nil, nil
+	c.relocDeferred = nil
+	c.retrying = nil
+	c.retryNotified, c.retryRefusedLogged = nil, nil
+	c.resumeDeclined = nil
+	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
+}
+
 // resolvePendingRelocations re-derives every relocate-restore marker in the
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
 // independent of the fence cycle. Leader-gated by run's lease.
@@ -1356,7 +1411,6 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
-			delete(c.pauseWaits, host)
 			c.forgetHost(host)
 		}
 	}
@@ -1395,7 +1449,7 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		if !c.leaseQuorumLost.Swap(true) {
 			slog.Warn("failover: this node has lost the voter majority; neither taking nor renewing the failover lease until it is back")
 		}
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNoQuorum)
 		// Not (false, nil): that is "another node holds the lease", on which
 		// run steps this node's gauges down. When every node has lost its
@@ -1414,18 +1468,97 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		// read-back failing — which reported this same metric triple.
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return false, err
 	}
 	if !held {
 		// Another coordinator holds it — the normal non-leader case.
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false, nil
+	}
+	if prev := c.leaseTerm.Load(); prev != 0 && term != prev {
+		// A new incarnation: another holder may have led since this one's.
+		c.leaseGap.Store(true)
 	}
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true, nil
+}
+
+// onlyReportedPausedFilter keeps the items of kind that a recovery limited to
+// only may move: those listed there, which the host reported pausing. A nil
+// only keeps everything. dropped names the rest.
+func onlyReportedPausedFilter[T any](only map[string]bool, kind string, items []T, name func(T) string) (keep []T, dropped []string) {
+	if only == nil {
+		return items, nil
+	}
+	for _, it := range items {
+		if only[kind+"/"+name(it)] {
+			keep = append(keep, it)
+		} else {
+			dropped = append(dropped, name(it))
+		}
+	}
+	return keep, dropped
+}
+
+// noteNotReportedPaused says, for each workload a limited recovery left on
+// host, why: the host answered through a bridge and did not report pausing
+// it, so it may still be running there. It stays for an operator.
+func (c *Coordinator) noteNotReportedPaused(host, kind string, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	if c.unpausedHeld == nil {
+		c.unpausedHeld = map[string]map[string]bool{}
+	}
+	if c.unpausedHeld[host] == nil {
+		c.unpausedHeld[host] = map[string]bool{}
+	}
+	for _, n := range names {
+		c.unpausedHeld[host][kind+"/"+n] = true
+	}
+	slog.Warn("failover: not recovering workloads the host answering through a bridge did not report pausing; they may still run there",
+		"host", host, "kind", kind, "workloads", names)
+	c.noteHold(host, "recovery left "+kind+" "+strings.Join(names, ",")+": the host did not report pausing them and may still run them")
+}
+
+// limitRecovery limits every recovery of host to only, for the rest of its
+// down-episode; nil lifts the limit. A new list replaces the held names too:
+// the next recovery names again what the new list still leaves.
+func (c *Coordinator) limitRecovery(host string, only map[string]bool) {
+	if only == nil {
+		c.unlimitRecovery(host)
+		return
+	}
+	if c.recoverOnly == nil {
+		c.recoverOnly = map[string]map[string]bool{}
+	}
+	c.recoverOnly[host] = only
+	delete(c.unpausedHeld, host)
+}
+
+// unlimitRecovery lifts host's recovery limit: it is back in service, or an
+// operator's confirmation or a fence that proves it off (fence.ProofGrade)
+// vouches for every workload on it.
+func (c *Coordinator) unlimitRecovery(host string) {
+	delete(c.recoverOnly, host)
+	delete(c.unpausedHeld, host)
+}
+
+// unpausedHeldReason names the workloads a limited recovery has left on
+// host, "" when none.
+func (c *Coordinator) unpausedHeldReason(host string) string {
+	if len(c.unpausedHeld[host]) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(c.unpausedHeld[host]))
+	for k := range c.unpausedHeld[host] {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return "held for an operator, not reported paused by the host and possibly still running there: " + strings.Join(names, ",")
 }
 
 // errLeaseNoQuorum is acquireLeaseResult standing down because this node has
@@ -1497,6 +1630,11 @@ func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) 
 	if !c.acquireLease(ctx) {
 		return 0, false
 	}
+	if c.leaseGap.Load() {
+		// Renewed at a new term: this cycle's view of each host predates
+		// whoever may have led in between. The next cycle starts afresh.
+		return 0, false
+	}
 	left, ok = c.leaseRemaining(ctx)
 	if !ok || left <= need {
 		return 0, false
@@ -1526,7 +1664,7 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 	if err != nil {
 		slog.Error("failover: lease read", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	if len(rows) == 0 {
@@ -1537,18 +1675,18 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 		// poll, and must keep tripping the result="error" alert.
 		slog.Warn("failover: lease row missing")
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	if rows[0].String("holder") != c.hostName {
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
 		slog.Error("failover: lease expiry unparseable", "value", rows[0].String("expires_at"))
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	return expiresAt.Sub(c.now()), true
@@ -1996,10 +2134,14 @@ const fenceSkewMargin = 5 * time.Second
 //     host that answered after a best-effort one was never off.
 func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time.Time) (string, bool) {
 	if !c.observerStreakSpans(ctx, host, at) {
-		return "no observer has watched the host stay down since the fence", false
+		return whyNoStreakSpans, false
 	}
 	return c.answeredSince(ctx, host, at)
 }
+
+// whyNoStreakSpans is fenceStillStands' refusal reason when no observer's
+// failing run spans the fence.
+const whyNoStreakSpans = "no observer has watched the host stay down since the fence"
 
 // whyHealthUnreadable is the refusal reason when host_health cannot be read.
 const whyHealthUnreadable = "host_health unreadable"
@@ -2437,6 +2579,14 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationResumed)
 	c.fenced[target] = true
 	c.confirmResumed[target] = rec.ID
+	c.unlimitRecovery(target) // an operator confirmed the host off
+	delete(c.pauseWaits, target)
+	// The recovery rests on the recorded fence as well as the confirmation:
+	// a claim it has refused is retried under that fence (retryClaims), not
+	// mistaken for one owed to an older fence.
+	if rec, _, ok := c.recordedFence(ctx, h); ok {
+		c.noteFencedOn(target, rec.ID)
+	}
 	c.recoverWorkloads(ctx, h)
 	return true
 }
@@ -2962,6 +3112,13 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 		return
 	}
 	delete(c.pauseWaits, h.Name)
+	if fr.ProvedOff() {
+		// A fence that proves the host off answers for every workload on it.
+		// One that does not (best-effort in either form, a plain SSH request)
+		// keeps a bridged host's limit: it says nothing about the workloads
+		// the host was seen running and did not report pausing.
+		c.unlimitRecovery(h.Name)
+	}
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.
@@ -3020,6 +3177,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	// and the claim and proof mint of each reschedule. It only orders work:
 	// every gate below still decides each VM on its own.
 	corrosion.SortVMsByMigratePriority(vms)
+	vms, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindVM, vms,
+		func(v corrosion.VMRecord) string { return v.Name })
+	c.noteNotReportedPaused(h.Name, health.PauseKindVM, notPaused)
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)
@@ -3521,6 +3681,9 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		c.mCt(ActionRelocate, ResultError, ErrDBError)
 		return
 	}
+	cts, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindContainer, cts,
+		func(ct corrosion.ContainerRecord) string { return ct.Name })
+	c.noteNotReportedPaused(h.Name, health.PauseKindContainer, notPaused)
 	for _, ct := range cts {
 		// A stopped container is not a failover candidate either
 		// (ContainerRecoverableOnHostFailure): relocating it recreates and

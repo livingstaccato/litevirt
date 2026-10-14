@@ -455,14 +455,21 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	return networkRecordToInfo(nr), nil
 }
 
-// deprovisionNetworkByName looks up a network record and tears down its infra.
+// deprovisionNetworkByName looks up a network record, tears down its infra on
+// this host, and deletes the record. As in DeleteNetwork, the teardown here
+// waits while something on this host still uses the network (networkUseHere):
+// the record is deleted anyway, and the network reconciler tears it down here
+// once nothing on this host uses it.
 func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) error {
 	nr, err := corrosion.GetNetwork(ctx, s.db, name)
 	if err != nil || nr == nil {
 		return nil // nothing to deprovision
 	}
 	def := networkRecordToDef(nr)
-	if err := s.networkProvisioner().Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
+	if what, err := s.networkUseHere(ctx, name, network.BridgeName(name, def)); err != nil || what != "" {
+		slog.Warn("stack network deleted; its teardown on this host waits until nothing here uses it",
+			"network", name, "in_use_by", what, "error", err)
+	} else if err := s.networkProvisioner().Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now

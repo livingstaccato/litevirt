@@ -111,3 +111,23 @@ func TestAuditCLI_ClampsABoundPastTheMax(t *testing.T) {
 		t.Fatalf("sent until=%v, want [9999-12-31T23:59:59.999999999Z]", rec.until)
 	}
 }
+
+// `lv audit ls` takes --until as export and MCP do, resolved the same way:
+// a date runs to the end of that day, and a bad bound is refused naming the
+// flag before anything reaches the daemon.
+func TestAuditCLI_LsSendsResolvedUntil(t *testing.T) {
+	rec := &boundsRecorder{}
+	sgCLIDaemon(t, rec, nil, "")
+	if err := runBoundsCmd(t, newAuditLsCmd(), "--since", "2026-10-04T00:16:30+02:00", "--until", "2026-10-03"); err != nil {
+		t.Fatalf("lv audit ls: %v", err)
+	}
+	if len(rec.since) != 1 || rec.since[0] != "2026-10-03T22:16:30.000000000Z" || rec.until[0] != "2026-10-03T23:59:59.999999999Z" {
+		t.Fatalf("sent since=%v until=%v, want [2026-10-03T22:16:30.000000000Z] / [2026-10-03T23:59:59.999999999Z]", rec.since, rec.until)
+	}
+	if err := runBoundsCmd(t, newAuditLsCmd(), "--until", "tomorrow"); err == nil || !strings.Contains(err.Error(), "until") {
+		t.Errorf("lv audit ls --until tomorrow = %v, want an error naming --until", err)
+	}
+	if len(rec.since) != 1 {
+		t.Errorf("an unparseable bound still reached the daemon")
+	}
+}

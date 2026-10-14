@@ -678,7 +678,8 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 // that the delete does not change: recreatePreflight — authority, names,
 // tuning, NIC identities, hooks, USB and memory hot-add, project, network,
 // pool and ISO admission — judged for the host the create is pinned to (or
-// cur's when it is not), and the guard admission in the create's own mode
+// cur's when it is not), by that host too when the spec has an installer ISO
+// (judgeRecreateOn), and the guard admission in the create's own mode
 // (preflightCreateGuards; replaced says the create carries cur). What
 // depends on the delete — the name, quota and host capacity — is left to
 // the create, as for a rebuild. Before this, a refusal among them came after
@@ -693,7 +694,16 @@ func (s *Server) preflightInlineRecreate(ctx context.Context, action planner.VMA
 	if host == "" {
 		host = cur.HostName
 	}
-	if err := s.recreatePreflight(ctx, sp, host); err != nil {
+	// Only that host can tell whether an installer ISO resolves there, and
+	// its create judges it after the delete: ask it first, as a rebuild and
+	// a rolling recreate do (compose-guard re-review 5, M1). The inline
+	// create carries no ISO grant, so none is handed over. Without an ISO,
+	// nothing the host would judge differs from this node's judgement.
+	judge := s.recreatePreflight
+	if sp.GetIso() != "" {
+		judge = s.judgeRecreateOn
+	}
+	if err := judge(ctx, sp, host); err != nil {
 		return err
 	}
 	return s.preflightCreateGuards(ctx, sp, cur, replaced)

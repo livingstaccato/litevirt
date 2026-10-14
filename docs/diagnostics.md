@@ -1280,9 +1280,10 @@ is raised in one of two forms:
   wait passed, and its workloads were not recovered because observers had
   seen it answer since the fence. On a derived voter set (no generation
   adopted) any such observer holds the recovery; on an adopted generation it
-  is held when the host had not reported its pause by the deadline. Nothing
-  re-checks the host while the split lasts, except a new failover lease
-  holder, which waits out the pause again.
+  is held while the host has not reported its pause. The deadline is
+  re-checked every cycle; the condition resolves when it goes ahead, and
+  workloads its limit leaves on the host are named by the
+  `host.recovery.stalled` notification instead.
 - **Before any fence.** The host has kept `partition_paused` open for longer
   than the pause wait and is no fence candidate: some voters see it down, but
   the observers that see it answer leave too few voters failing it for a
@@ -2244,8 +2245,11 @@ delete ran on records it in `<data_dir>/kept-disks.json` and raises
 evidence gives each path, its host, the VM and disk, when, and the reason.
 litevirt removes none of them: check that nothing uses each one (another VM's
 disk, a process holding it open), then remove it by hand. A file on that host
-is forgotten once it is gone; a disk is not named while a VM's disk names its
-path again. To stop naming a disk you keep on purpose, or one recorded on
+is forgotten once it is gone; a disk is not named while another VM's disk
+names its path again. A VM of the same name does not count (a delete that
+failed keeps its record, which still names its disks), so a disk adopted by a
+VM re-created under the deleted one's name stays named until its entry is
+removed as below. To stop naming a disk you keep on purpose, or one recorded on
 another host, check it and remove its entry from `<data_dir>/kept-disks.json`
 on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks

@@ -170,8 +170,9 @@ func TestBridgedStall_AVoterMajorityAnsweringIsNotRaised(t *testing.T) {
 	healthRow(t, db, "v4", "healthy", 0, time.Now().Add(time.Second))
 	pausedCondition(t, db, time.Now())
 	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
-	if !c.retryPauseWait(ctx, "down") {
-		t.Fatal("setup: down had no pending pause wait")
+	c.retryPauseWait(ctx, "down") // a refusal keeps the wait and reports false
+	if _, ok := c.pauseWaits["down"]; !ok {
+		t.Fatal("setup: down had no pending pause wait, or its deadline went ahead")
 	}
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("setup: VM recovered to %q", got)
@@ -357,5 +358,48 @@ func TestBridgedStall_BeforeAnyFenceADeferredCandidateIsNotRaised(t *testing.T) 
 	}
 	if bridgedOpen(t, db, ctx) {
 		t.Fatalf("%s raised for a fence candidate whose fence was deferred", CondRecoveryBridged)
+	}
+}
+
+// A bridged refusal is re-checked every cycle (refusePauseWait): the
+// condition is written once per reason, not on every re-check, and it
+// resolves when the deadline goes ahead on the host's late report, though
+// the limit leaves an unlisted workload behind (named by the stall alert).
+//
+// Mutations: raise on every re-check — the observe count climbs; drop the
+// resolve on the deadline going ahead — still open after the recovery.
+func TestBridgedStall_ARecheckedRefusalWritesOnceAndResolvesWhenTheDeadlineGoesAhead(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm2", HostName: "down", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `UPDATE hosts SET cpu_total = 64, mem_total = 65536 WHERE name = 'alive'`); err != nil {
+		t.Fatal(err)
+	}
+	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
+		t.Fatalf("setup: VM recovered to %q", got)
+	}
+	row, _, ok := bridgedCond(t, db, ctx)
+	if !ok || row.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("setup: %s not raised at a bridged refusal: %+v", CondRecoveryBridged, row)
+	}
+	first := row.ObserveCount
+	c.run(ctx)
+	c.run(ctx)
+	if row, _, _ := bridgedCond(t, db, ctx); row.ObserveCount != first {
+		t.Fatalf("%s rewritten on each re-check of the same refusal: observe count %d, want %d", CondRecoveryBridged, row.ObserveCount, first)
+	}
+	pausedCondition(t, db, time.Now()) // lists vm/vm only
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("setup: VM on %q after down's condition arrived", got)
+	}
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s still open after the deadline went ahead", CondRecoveryBridged)
+	}
+	if held := c.unpausedHeldReason("down"); !strings.Contains(held, "vm/vm2") {
+		t.Fatalf("the stall alert does not name the workload the limit left: %q", held)
 	}
 }

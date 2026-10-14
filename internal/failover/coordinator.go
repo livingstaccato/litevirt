@@ -152,6 +152,12 @@ type Coordinator struct {
 	// future-proofing rather than a fix for a live race — unlike the
 	// rebalancer's, which has two concurrent callers.
 	leaseTerm atomic.Int64
+	// leaseGap is set whenever this coordinator stops holding the lease (or
+	// cannot show it does), and when it takes the lease at a new term: another
+	// node may have led in between. The next cycle that holds the lease then
+	// forgets every host's outage (forgetEpisodes) and re-derives it from the
+	// replicated records, as a successor would.
+	leaseGap atomic.Bool
 	// leaseQuorumLost is whether the last lease attempt stood down because this
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
@@ -650,6 +656,9 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.stepDownGauges()
 		}
 		return
+	}
+	if c.leaseGap.Swap(false) {
+		c.forgetEpisodes()
 	}
 	if c.VoterGenesis != nil {
 		c.VoterGenesis(ctx, c.LeaseTerm())
@@ -1207,6 +1216,35 @@ func (c *Coordinator) stepDownGauges() {
 	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
+// dropLeaseTerm records that this coordinator does not hold the lease, or
+// cannot show it does (leaseGap).
+func (c *Coordinator) dropLeaseTerm() {
+	c.leaseTerm.Store(0)
+	c.leaseGap.Store(true)
+}
+
+// forgetEpisodes drops what this coordinator remembers of each host's outage,
+// on taking the lease back after a gap (leaseGap). Another node may have led
+// meanwhile: the host may have come back, failed again and been fenced
+// afresh, or not at all, and nothing remembered from the earlier tenure
+// speaks for that. Each host then goes down the path a fresh successor takes,
+// from the replicated fence records (recordedFence, resumeActionFor), which
+// re-derives any pause wait, recovery limit and claim retry from them.
+func (c *Coordinator) forgetEpisodes() {
+	c.fenced = make(map[string]bool)
+	c.fenceRelocated = make(map[string]bool)
+	c.confirmResumed = make(map[string]string)
+	c.fencedOn, c.lastFenceAt = nil, nil
+	c.pauseWaits = nil
+	c.claimRetry, c.claimRetryProposals = nil, nil
+	c.recoverOnly, c.unpausedHeld = nil, nil
+	c.relocDeferred = nil
+	c.retrying = nil
+	c.retryNotified, c.retryRefusedLogged = nil, nil
+	c.resumeDeclined = nil
+	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
+}
+
 // resolvePendingRelocations re-derives every relocate-restore marker in the
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
 // independent of the fence cycle. Leader-gated by run's lease.
@@ -1410,7 +1448,7 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		if !c.leaseQuorumLost.Swap(true) {
 			slog.Warn("failover: this node has lost the voter majority; neither taking nor renewing the failover lease until it is back")
 		}
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNoQuorum)
 		// Not (false, nil): that is "another node holds the lease", on which
 		// run steps this node's gauges down. When every node has lost its
@@ -1429,14 +1467,18 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		// read-back failing — which reported this same metric triple.
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return false, err
 	}
 	if !held {
 		// Another coordinator holds it — the normal non-leader case.
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false, nil
+	}
+	if prev := c.leaseTerm.Load(); prev != 0 && term != prev {
+		// A new incarnation: another holder may have led since this one's.
+		c.leaseGap.Store(true)
 	}
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
@@ -1587,6 +1629,11 @@ func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) 
 	if !c.acquireLease(ctx) {
 		return 0, false
 	}
+	if c.leaseGap.Load() {
+		// Renewed at a new term: this cycle's view of each host predates
+		// whoever may have led in between. The next cycle starts afresh.
+		return 0, false
+	}
 	left, ok = c.leaseRemaining(ctx)
 	if !ok || left <= need {
 		return 0, false
@@ -1616,7 +1663,7 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 	if err != nil {
 		slog.Error("failover: lease read", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	if len(rows) == 0 {
@@ -1627,18 +1674,18 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 		// poll, and must keep tripping the result="error" alert.
 		slog.Warn("failover: lease row missing")
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	if rows[0].String("holder") != c.hostName {
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
 		slog.Error("failover: lease expiry unparseable", "value", rows[0].String("expires_at"))
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		c.leaseTerm.Store(0)
+		c.dropLeaseTerm()
 		return 0, false
 	}
 	return expiresAt.Sub(c.now()), true
@@ -2529,6 +2576,12 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	c.confirmResumed[target] = rec.ID
 	c.unlimitRecovery(target) // an operator confirmed the host off
 	delete(c.pauseWaits, target)
+	// The recovery rests on the recorded fence as well as the confirmation:
+	// a claim it has refused is retried under that fence (retryClaims), not
+	// mistaken for one owed to an older fence.
+	if rec, _, ok := c.recordedFence(ctx, h); ok {
+		c.noteFencedOn(target, rec.ID)
+	}
 	c.recoverWorkloads(ctx, h)
 	return true
 }

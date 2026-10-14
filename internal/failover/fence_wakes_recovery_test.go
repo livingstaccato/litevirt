@@ -42,6 +42,18 @@ func operatorFences(t *testing.T, db *corrosion.Client, ctx context.Context) {
 	}
 }
 
+// holdLeaseThrough extends this coordinator's failover lease to cover at, as
+// the renewals of a leader polling through that time would. A test that moves
+// its clock past leaseDuration without them models a lapse, after which the
+// coordinator takes the lease back as a successor (forgetEpisodes).
+func holdLeaseThrough(t *testing.T, db *corrosion.Client, ctx context.Context, at time.Time) {
+	t.Helper()
+	if err := db.Execute(ctx, `UPDATE leader_election SET expires_at = ? WHERE key = 'failover'`,
+		at.Add(leaseDuration).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("hold the lease: %v", err)
+	}
+}
+
 // countingFencer returns a fencer that reports results in order (the last one
 // repeats) and counts the fences it runs.
 func countingFencer(n *int, results ...fence.Result) Fencer {
@@ -255,6 +267,7 @@ func TestFenceWake_StalledRecoveryAlertsOnceThenAtABoundedInterval(t *testing.T)
 		t.Fatalf("alerted %v on the cycle that fenced, want nothing before %v", alerts, recoveryStallAfter)
 	}
 	now = now.Add(recoveryStallAfter + time.Second)
+	holdLeaseThrough(t, db, ctx, now)
 	c.run(ctx)
 	if len(alerts) != 1 {
 		t.Fatalf("alerts = %v once the recovery had stalled %v, want exactly one", alerts, recoveryStallAfter)
@@ -273,11 +286,13 @@ func TestFenceWake_StalledRecoveryAlertsOnceThenAtABoundedInterval(t *testing.T)
 	}
 
 	now = now.Add(time.Minute)
+	holdLeaseThrough(t, db, ctx, now)
 	c.run(ctx)
 	if len(alerts) != 1 {
 		t.Fatalf("alerted again %v after the first; the repeat is bounded by %v", alerts[1:], recoveryStallRepeat)
 	}
 	now = now.Add(recoveryStallRepeat)
+	holdLeaseThrough(t, db, ctx, now)
 	c.run(ctx)
 	if len(alerts) != 2 {
 		t.Errorf("alerts = %d after %v more, want the repeat", len(alerts), recoveryStallRepeat)
@@ -581,6 +596,7 @@ func TestFenceWake_StallReasonIsWhatHoldsTheRecoveryNow(t *testing.T) {
 	operatorFences(t, db, ctx)
 	c.run(ctx)
 	now = now.Add(recoveryStallAfter + time.Second)
+	holdLeaseThrough(t, db, ctx, now)
 	c.run(ctx)
 	if len(reasons) != 1 || !strings.Contains(reasons[0], "no eligible host") || strings.Contains(reasons[0], "fence failed") {
 		t.Errorf("stall reasons = %q, want the recovery's own (no eligible host), not the stale failed fence", reasons)

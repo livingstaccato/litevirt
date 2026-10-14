@@ -551,7 +551,10 @@ All of this is in the failover coordinator (`internal/failover`).
    A claim retry does not run while a wait is pending or refused, and one owed
    to an earlier outage or an older fence is dropped with it.
    The stall alert names the refusal and its reason.
-4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
+4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
+   Nor has one that takes the lease back after a gap (it stopped holding it,
+   or retakes it at a new term): it forgets every host's outage, its waits,
+   limits and claim retries included, and starts as a successor. It
    resumes from the relied-on fence record through `resumeActionFor` →
    `recoverFenced`, and starts a fresh wait anchored at its own first sight of
    the record. That is later than the original `t_d`, so it is safe. It

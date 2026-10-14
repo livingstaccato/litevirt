@@ -282,20 +282,13 @@ func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string,
 	}
 	var out []string
 	for _, vm := range vms {
-		if !vmNeedsFailover(vm, enrolled[vm.Name]) {
-			continue
+		would, err := c.wouldRecoverVM(ctx, vm, enrolled)
+		if err != nil {
+			return nil, err
 		}
-		// As strandedByHost: a stopped VM on a host-local disk stays by design.
-		if vm.State == "stopped" {
-			disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
-			if err != nil {
-				return nil, err
-			}
-			if corrosion.VMHasHostLocalDisk(disks) {
-				continue
-			}
+		if would {
+			out = append(out, "vm/"+vm.Name)
 		}
-		out = append(out, "vm/"+vm.Name)
 	}
 	cts, err := corrosion.ListContainers(ctx, c.db, host)
 	if err != nil {
@@ -308,6 +301,26 @@ func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string,
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// wouldRecoverVM reports whether a failover would move vm off its host, by
+// strandedByHost's rules: a failover candidate (vmNeedsFailover), and not a
+// stopped VM on a host-local disk, which stays by design. enrolled is
+// autoPromoteEnrolled.
+func (c *Coordinator) wouldRecoverVM(ctx context.Context, vm corrosion.VMRecord, enrolled map[string]bool) (bool, error) {
+	if !vmNeedsFailover(vm, enrolled[vm.Name]) {
+		return false, nil
+	}
+	if vm.State == "stopped" {
+		disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+		if err != nil {
+			return false, err
+		}
+		if corrosion.VMHasHostLocalDisk(disks) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func capList(in []string) []string {

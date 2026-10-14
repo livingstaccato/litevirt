@@ -1553,8 +1553,8 @@ func (c *Coordinator) ownTenureLive(ctx context.Context) bool {
 
 // onlyReportedPausedFilter keeps the items of kind that a recovery limited to
 // only may move: those listed there, which the host reported pausing. A nil
-// only keeps everything. dropped names the rest.
-func onlyReportedPausedFilter[T any](only map[string]bool, kind string, items []T, name func(T) string) (keep []T, dropped []string) {
+// only keeps everything. dropped is the rest.
+func onlyReportedPausedFilter[T any](only map[string]bool, kind string, items []T, name func(T) string) (keep, dropped []T) {
 	if only == nil {
 		return items, nil
 	}
@@ -1562,10 +1562,43 @@ func onlyReportedPausedFilter[T any](only map[string]bool, kind string, items []
 		if only[kind+"/"+name(it)] {
 			keep = append(keep, it)
 		} else {
-			dropped = append(dropped, name(it))
+			dropped = append(dropped, it)
 		}
 	}
 	return keep, dropped
+}
+
+// heldVMNames names the VMs a limited recovery dropped that it would
+// otherwise have recovered (wouldRecoverVM): the ones the host may still run
+// and that wait for an operator. A VM never to be recovered (stopped by
+// intent, on_host_failure=none, firmware state) is not one. A read error
+// names the VM.
+func (c *Coordinator) heldVMNames(ctx context.Context, dropped []corrosion.VMRecord) []string {
+	if len(dropped) == 0 {
+		return nil
+	}
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	var names []string
+	for _, vm := range dropped {
+		if err == nil {
+			if would, werr := c.wouldRecoverVM(ctx, vm, enrolled); werr == nil && !would {
+				continue
+			}
+		}
+		names = append(names, vm.Name)
+	}
+	return names
+}
+
+// heldContainerNames is heldVMNames for containers.
+func heldContainerNames(dropped []corrosion.ContainerRecord) []string {
+	var names []string
+	for _, ct := range dropped {
+		if containerNeedsFailover(ct) {
+			names = append(names, ct.Name)
+		}
+	}
+	return names
 }
 
 // noteNotReportedPaused says, for each workload a limited recovery left on
@@ -3297,7 +3330,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	corrosion.SortVMsByMigratePriority(vms)
 	vms, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindVM, vms,
 		func(v corrosion.VMRecord) string { return v.Name })
-	c.noteNotReportedPaused(h.Name, health.PauseKindVM, notPaused)
+	c.noteNotReportedPaused(h.Name, health.PauseKindVM, c.heldVMNames(ctx, notPaused))
 
 	// Step 4: Verify healthy hosts exist before attempting rescheduling.
 	candidates, err := c.healthyHosts(ctx, h.Name)
@@ -3801,7 +3834,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 	}
 	cts, notPaused := onlyReportedPausedFilter(c.recoverOnly[h.Name], health.PauseKindContainer, cts,
 		func(ct corrosion.ContainerRecord) string { return ct.Name })
-	c.noteNotReportedPaused(h.Name, health.PauseKindContainer, notPaused)
+	c.noteNotReportedPaused(h.Name, health.PauseKindContainer, heldContainerNames(notPaused))
 	for _, ct := range cts {
 		// A stopped container is not a failover candidate either
 		// (ContainerRecoverableOnHostFailure): relocating it recreates and

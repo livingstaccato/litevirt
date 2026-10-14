@@ -461,3 +461,44 @@ func TestSelfPauseExplicit_AClaimRetryKeepsTheLimit(t *testing.T) {
 		t.Fatalf("the held workloads are no longer named for the stall alert: %q", held)
 	}
 }
+
+// A limited recovery names, as possibly still running on the host, only what
+// it would otherwise have recovered: a VM stopped by intent, one with
+// on_host_failure=none, one with firmware state, and a stopped container are
+// never paused by the host and never moved, and are not named.
+//
+// Mutation: name every workload the limit drops — the stall alert names
+// them.
+func TestSelfPauseExplicit_ALimitNamesOnlyWhatWouldBeRecovered(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	unlistedWorkloads(t, db)
+	for _, vm := range []corrosion.VMRecord{
+		{Name: "stoppedvm", HostName: "down", Spec: `{"on_host_failure":"restart-any"}`, State: "stopped", StateDetail: "operator-stop"},
+		{Name: "nonevm", HostName: "down", Spec: `{"on_host_failure":"none"}`, State: "running"},
+		{Name: "tpmvm", HostName: "down", Spec: `{"on_host_failure":"restart-any","tpm":true}`, State: "running"},
+	} {
+		if err := corrosion.InsertVM(ctx, db, vm, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "down", Name: "stoppedct", State: "stopped", Image: "alpine:3.19",
+		CPULimit: 1, MemMiB: 128, Project: "p1", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	atDeadline(t, c, ctx, mono, db, func() {
+		bridgeAnswer(t, db)
+		pausedConditionListing(t, db, time.Now(), "vm/vm", "ct/ct1")
+	})
+	assertLimited(t, db)
+	held := c.unpausedHeldReason("down")
+	if !strings.Contains(held, "vm/vm2") || !strings.Contains(held, "ct/ct2") {
+		t.Fatalf("the held recoverable workloads are not named: %q", held)
+	}
+	for _, never := range []string{"stoppedvm", "nonevm", "tpmvm", "stoppedct"} {
+		if strings.Contains(held, never) {
+			t.Errorf("the stall alert names %s, which would never be recovered, as possibly still running: %q", never, held)
+		}
+	}
+}

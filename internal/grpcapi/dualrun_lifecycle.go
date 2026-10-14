@@ -211,8 +211,8 @@ func (s *Server) applyConditionLifecycle(
 			row.ObserveCount++
 			row.CleanCount = 0
 			row.LastSeen = now
-			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
-			if row.ObserveCount >= dualRunDebounce {
+			row.Hosts, row.Evidence, row.Reporter = unionHosts(row.Hosts, evidenceHosts[f]), evidence, s.hostName
+			if row.ObserveCount >= dualRunDebounce && (!rc.observeOnly || rc.ownPrev[f]) {
 				row.Lifecycle = corrosion.ConditionConfirmed
 				row.Severity = confirmedSeverity(f.kind)
 				row.ConfirmedAt = now
@@ -228,7 +228,7 @@ func (s *Server) applyConditionLifecycle(
 			row.ObserveCount++
 			row.CleanCount = 0
 			row.LastSeen = now
-			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
+			row.Hosts, row.Evidence, row.Reporter = unionHosts(row.Hosts, evidenceHosts[f]), evidence, s.hostName
 		}
 		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 			slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
@@ -240,7 +240,10 @@ func (s *Server) applyConditionLifecycle(
 	// decision gate and complete coverage of the hosts that could hold the
 	// condition's subject. A quorum-less scan, or one blind to such a host,
 	// proves nothing about absence, so it neither resolves nor resets anything.
-	gateOK := s.resolveGateValid(ctx)
+	// An observe-only pass skips this whole loop rather than leaning on the
+	// gate: it began without the majority, and a majority that returned
+	// mid-pass would otherwise let it resolve from a snapshot taken without.
+	gateOK := !rc.observeOnly && s.resolveGateValid(ctx)
 	for f, row := range byIdentity {
 		if current[f] {
 			continue
@@ -273,11 +276,14 @@ func (s *Server) applyConditionLifecycle(
 	if !rc.complete {
 		coverage = corrosion.CoveragePartial
 	}
-	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
-		Reporter: s.hostName, Detail: coverageDetail,
-	}); err != nil {
-		slog.Warn("dual-run detector: persist evaluator status", "error", err)
+	// The scan status is the leader's; a pass without the lease is not one.
+	if !rc.observeOnly {
+		if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+			Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
+			Reporter: s.hostName, Detail: coverageDetail,
+		}); err != nil {
+			slog.Warn("dual-run detector: persist evaluator status", "error", err)
+		}
 	}
 
 	// Gauges rebuild from the CONFIRMED conditions (the durable state), so a
@@ -305,4 +311,25 @@ func detectedLabels(confirmed map[finding]bool) []metrics.DualRunLabel {
 		labels = append(labels, metrics.DualRunLabel{Kind: dualRunKindLabel(f.kind), Target: f.target})
 	}
 	return labels
+}
+
+// unionHosts is the hosts a standing condition names after a refresh: every
+// host it named before, then this pass's new ones. Admission refuses growth
+// on each, so a refresh never narrows them: a pass that saw only part of the
+// cluster (a node without the majority, or the leader with one copy across
+// a cut) must not lift the block on a host only another pass saw. A condition
+// raised again after it resolved starts a new row from that pass's hosts.
+func unionHosts(prev, seen []string) []string {
+	out := append([]string(nil), prev...)
+	have := make(map[string]bool, len(prev)+len(seen))
+	for _, h := range prev {
+		have[h] = true
+	}
+	for _, h := range seen {
+		if !have[h] {
+			have[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
 }

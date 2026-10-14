@@ -304,6 +304,47 @@ func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 	return true
 }
 
+// LostOwnRegionQuorum reports whether, under region-scoped failover, self's
+// own region has at least three voters and region's reading of that region's
+// quorum does not hold it (held, as for LostEveryDecisionQuorum; nil holds
+// every reading but a definite No).
+//
+// It is the failover lease's second stand-down, on top of
+// LostEveryDecisionQuorum: a holder cut off from its own region's majority
+// can decide nothing about that region, while that majority may need the
+// lease to fence the holder itself. A holder that still reaches another
+// region's majority would otherwise keep the lease, and any host reaching
+// both sides keeps its renewals live for the region it left
+// (docs/design/region-scoped-failover.md §2.3). A region with fewer than three
+// voters cannot fence its own hosts (§3), so nothing there waits on the lease.
+//
+// Cluster scope, a nil region reading, and a scope or voter set that cannot
+// be read are not lost: LostEveryDecisionQuorum still applies to them.
+func LostOwnRegionQuorum(ctx context.Context, db *corrosion.Client, self string,
+	region func(context.Context, string) (QuorumState, int, int),
+	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
+	if region == nil {
+		return false
+	}
+	if held == nil {
+		held = func(_ context.Context, st QuorumState, _ string) bool { return st != QuorumNo }
+	}
+	scope, err := corrosion.GetFailoverScope(ctx, db)
+	if err != nil || !scope.Region() {
+		return false
+	}
+	vr, err := corrosion.VoterRegions(ctx, db)
+	if err != nil {
+		return false
+	}
+	own := vr.Region(self)
+	if len(vr.In(own)) < 3 {
+		return false
+	}
+	st, _, _ := region(ctx, own)
+	return !held(ctx, st, RegionQuorumScope(own))
+}
+
 // LostEveryDecisionQuorum is LostEveryDecisionQuorum over this daemon's own
 // probes.
 func (c *Checker) LostEveryDecisionQuorum(ctx context.Context) bool {

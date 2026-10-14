@@ -1571,6 +1571,10 @@ var errLeaseNoQuorum = errors.New("this node has lost the voter majority")
 // coordinator with no gate keeps today's behaviour, and one whose gate cannot
 // answer the regional question counts no region.
 //
+// Under region scope it stands down too when it has lost its own region's
+// majority (health.LostOwnRegionQuorum), whatever it reaches elsewhere: that
+// majority may need the lease to fence this node.
+//
 // The failover lease asks more of a reading than the other leases do: a
 // scope holds only on a Yes outside its quorum-regain grace (QuorumRegain).
 // Unknown is not a Yes, so a holder that restarts inside a partition does not
@@ -1588,7 +1592,8 @@ func (c *Coordinator) lostEveryDecisionQuorum(ctx context.Context) bool {
 	held := func(ctx context.Context, st health.QuorumState, scope string) bool {
 		return st == health.QuorumYes && (c.QuorumRegain == nil || !c.QuorumRegain(ctx, scope))
 	}
-	return health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region, held)
+	return health.LostOwnRegionQuorum(ctx, c.db, c.hostName, region, held) ||
+		health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region, held)
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,

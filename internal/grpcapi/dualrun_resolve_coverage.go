@@ -101,6 +101,12 @@ type resolutionCoverage struct {
 	vmOwner   map[string]string
 	vmCreated map[string]string
 	now       time.Time
+	// observeOnly marks a pass run without the lease
+	// (observeDualRunWithoutLease): its absence proves nothing, and it
+	// confirms only the findings in ownPrev, what this node's own previous
+	// observe-only pass found.
+	observeOnly bool
+	ownPrev     map[finding]bool
 }
 
 // canResolve reports whether this pass's absence of f proves anything about f.

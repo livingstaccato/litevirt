@@ -803,6 +803,12 @@ type Server struct {
 	startFlightsMu  sync.Mutex
 	startFlights    map[string]*startFlight
 	startDomainWait time.Duration
+	// liveStateCalls holds each live-state read of a local domain libvirt
+	// has not answered yet (vm_live_state.go); liveStateWait is how long a
+	// read waits for one (zero: defaultLiveStateWait).
+	liveStateMu    sync.Mutex
+	liveStateCalls map[string]*liveStateCall
+	liveStateWait  time.Duration
 	// operatorClaimMu makes an operator promotion's start fence and every
 	// abandonment of a proof on this host one decision (promote_serialize.go).
 	operatorClaimMu sync.Mutex

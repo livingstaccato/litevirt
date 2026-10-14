@@ -1565,11 +1565,17 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	// Batch-load all interfaces in a single query instead of per-VM N+1.
 	allIfaces, _ := corrosion.BatchGetVMInterfaces(ctx, s.db)
 
+	// One libvirt that does not answer must not hang the list: each local
+	// VM's live state is waited for a bounded time (vm_live_state.go).
+	liveBudget := s.newLiveStateBudget()
 	for _, vm := range vms {
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
+		stateDetail := ""
 		if vm.HostName == s.hostName && s.virt != nil {
-			if liveState, err := s.liveVMState(vm.Name); err == nil {
+			if liveState, err := s.liveVMStateBounded(vm.Name, liveBudget); errors.Is(err, errLiveStateNoAnswer) {
+				state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
+			} else if err == nil {
 				switch {
 				case vm.State == "stopped" && liveState == "running":
 					// Graceful shutdown in progress — trust DB, except for
@@ -1603,6 +1609,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 			StackName:    vm.StackName,
 			HostName:     vm.HostName,
 			State:        vmStateToPB(state),
+			StateDetail:  stateDetail,
 			CpuActual:    int32(vm.CPUActual),
 			MemActualMib: int32(vm.MemActual),
 			IsTemplate:   vm.IsTemplate,
@@ -3397,9 +3404,16 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// Only override DB state if the DB hasn't been explicitly set by an operator action
 	// (e.g., "stopped" from StopVM). This avoids showing stale libvirt state during
 	// graceful shutdown where libvirt still reports "running" briefly.
-	state := vm.State
+	state, stateDetail := vm.State, vm.StateDetail
 	if vm.HostName == s.hostName && s.virt != nil {
-		if liveState, err := s.liveVMState(name); err == nil {
+		if liveState, err := s.liveVMStateBounded(name, s.newLiveStateBudget()); errors.Is(err, errLiveStateNoAnswer) {
+			// libvirt has not answered (vm_live_state.go): the read says
+			// so, with what the record says, rather than waiting on it.
+			state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
+			if vm.StateDetail != "" {
+				stateDetail += " (" + vm.StateDetail + ")"
+			}
+		} else if err == nil {
 			// Trust libvirt for running detection (catches unexpected starts/crashes),
 			// but trust DB for operator-initiated stops/starts.
 			switch {
@@ -3423,7 +3437,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		StackName:    vm.StackName,
 		HostName:     vm.HostName,
 		State:        vmStateToPB(state),
-		StateDetail:  vm.StateDetail,
+		StateDetail:  stateDetail,
 		CpuActual:    int32(vm.CPUActual),
 		MemActualMib: int32(vm.MemActual),
 		IsTemplate:   vm.IsTemplate,

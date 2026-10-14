@@ -189,12 +189,12 @@ func (s *Server) moveOneVolume(
 	if err != nil {
 		return status.Errorf(codes.Internal, "construct target driver: %v", err)
 	}
-	if err := drv.Prepare(ctx); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
-	}
 	dstDir, err := fileBasedPoolDir(s.dataDir, dstPool)
 	if err != nil {
 		return status.Errorf(codes.Internal, "resolve target dir: %v", err)
+	}
+	if err := prepareTargetPool(ctx, drv, dstDir); err != nil {
+		return prepareTargetPoolStatus(err)
 	}
 	dstPath := filepath.Join(dstDir, fmt.Sprintf("%s-%s.qcow2", vm.Name, src.DiskName))
 	if dstPath == src.Path {

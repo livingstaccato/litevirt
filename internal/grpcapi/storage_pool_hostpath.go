@@ -206,16 +206,53 @@ func (s *Server) poolDirForWrite(ctx context.Context, name string, ref StoragePo
 		if err != nil {
 			return "", status.Errorf(codes.FailedPrecondition, "pool %q: %v", name, err)
 		}
-		if err := drv.Prepare(ctx); err != nil {
-			slog.Error("storage pool write refused: its NFS export could not be mounted hardened", "pool", name, "error", err)
-			return "", status.Errorf(codes.FailedPrecondition, "pool %q: mount: %v", name, err)
+		dir, err := fileBasedPoolDir(s.dataDir, ref)
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 		}
+		if err := prepareTargetPool(ctx, drv, dir); err != nil {
+			slog.Error("storage pool write refused: its NFS export could not be mounted hardened", "pool", name, "error", err)
+			code := codes.FailedPrecondition
+			if storage.IsFSNoAnswer(err) {
+				code = codes.Unavailable
+			}
+			return "", status.Errorf(code, "pool %q: mount: %v", name, err)
+		}
+		return dir, nil
 	}
 	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
 	return dir, nil
+}
+
+// prepareTargetPool runs a write target pool's Prepare under storage.Bounded,
+// keyed on the pool's directory dir. On an NFS pool whose server does not
+// answer, Prepare's "mountpoint" blocks in the kernel past its own command
+// timeout (lab 2: about 120 s, until the server answered again), and a
+// replication schedule behind it waited as long. Bounded gives up after its
+// bound and latches the mount, so a later call there refuses at once. A pool
+// that does not answer is refused, never treated as ready.
+//
+// Prepare runs on a context without the caller's cancellation: a call that
+// joins one still running gets that call's own outcome, not the end of
+// another caller's request. The driver's command timeout still bounds it.
+func prepareTargetPool(ctx context.Context, drv storage.Driver, dir string) error {
+	pctx := context.WithoutCancel(ctx)
+	_, err := storage.Bounded("prepare the pool at", dir, func() (struct{}, error) {
+		return struct{}{}, drv.Prepare(pctx)
+	})
+	return err
+}
+
+// prepareTargetPoolStatus is prepareTargetPool's refusal as an RPC status:
+// Unavailable for a pool that does not answer, FailedPrecondition otherwise.
+func prepareTargetPoolStatus(err error) error {
+	if storage.IsFSNoAnswer(err) {
+		return status.Errorf(codes.Unavailable, "prepare target pool: %v", err)
+	}
+	return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
 }
 
 // poolWriteDir is poolDirForWrite for a pool row.

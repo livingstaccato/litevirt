@@ -496,6 +496,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// only below: until then no prune removes a file of the image.
 	if spec.Image != "" {
 		defer s.holdImage(spec.Image)()
+		if err := s.refuseDeletedImage(ctx, spec.Name, spec.Image); err != nil {
+			return nil, err
+		}
 	}
 
 	// Prepare disks — track created paths for cleanup on failure.

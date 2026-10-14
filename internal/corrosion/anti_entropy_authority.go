@@ -450,9 +450,12 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 				// two tombstones differing in a column the authority does not
 				// cover (hardware_adoption_state, lab 1 F2) were exchanged by
 				// pulls in both directions and never settled. No sweep: the
-				// local tombstone's own delete or merge tombstoned the
-				// children, and a live child arriving later is fenced by the
-				// child-table authority.
+				// local tombstone's own delete batch (deleteVMGuardedFrom),
+				// or the merge that brought it, tombstoned the children. A
+				// stray live child that lands under the tombstone later — a
+				// replicated child upsert is not fenced against a tombstoned
+				// parent — is out of scope here; the old path swept one only
+				// when the two tombstones happened to differ.
 				return mergeAuthorityNormal, nil
 			}
 			return mergeAuthorityApplyIncomingAndSweep, nil

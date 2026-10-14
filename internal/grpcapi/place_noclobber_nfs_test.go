@@ -290,3 +290,55 @@ func TestPlaceColdDisk_ALinkAnsweredEEXISTForItsOwnLinkIsPlaced(t *testing.T) {
 		t.Fatalf("the existing file now holds %q", got)
 	}
 }
+
+// Link first, a rename refused EPERM or EXDEV after an unsupported link is
+// still "unsupported", as on main: the import takes its copy fallback, which
+// never replaces a file either, rather than refusing a placement main made.
+//
+// Mutation: judge that rename with renameUnsupported — the import is
+// refused, red.
+func TestPlaceNoReplace_ARenameRefusedAfterAnUnsupportedLinkStillCopies(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EPERM, syscall.EXDEV} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			renameNoReplaceAnswers(t, errno)
+			coldLink = func(o, n string) error { return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.EPERM} }
+			countLinks(t)
+
+			tmp, dst := noClobberFixture(t)
+			if unsupported, err := linkOrRenameNoReplace(tmp, dst); !unsupported || err == nil {
+				t.Fatalf("linkOrRenameNoReplace = %v, %v; want unsupported", unsupported, err)
+			}
+			if err := placeNoReplace(context.Background(), tmp, dst, nil); err != nil {
+				t.Fatalf("placeNoReplace where link answers EPERM and renameat2 %v = %v, want the copy placed", errno, err)
+			}
+			if got, _ := os.ReadFile(dst); string(got) != "new" {
+				t.Fatalf("dst holds %q", got)
+			}
+
+			tmp, dst = noClobberFixture(t)
+			if err := os.WriteFile(dst, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := placeNoReplace(context.Background(), tmp, dst, nil); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("placeNoReplace over a file = %v, want ErrExist", err)
+			}
+			if got, _ := os.ReadFile(dst); string(got) != "old" {
+				t.Fatalf("the existing file now holds %q", got)
+			}
+		})
+	}
+}
+
+// Link first, a rename refused for another reason is returned with the link
+// error that led to it.
+//
+// Mutation: return the rename's error alone — red.
+func TestLinkOrRenameNoReplace_ARenameErrorKeepsTheLinkError(t *testing.T) {
+	renameNoReplaceAnswers(t, syscall.EIO)
+	coldLink = func(o, n string) error { return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.ENOTSUP} }
+	tmp, dst := noClobberFixture(t)
+	unsupported, err := linkOrRenameNoReplace(tmp, dst)
+	if unsupported || !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), syscall.ENOTSUP.Error()) {
+		t.Fatalf("linkOrRenameNoReplace = %v, %v; want the rename's EIO with the link's error in it", unsupported, err)
+	}
+}

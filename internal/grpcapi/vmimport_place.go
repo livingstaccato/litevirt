@@ -37,7 +37,7 @@ func placeNoReplace(ctx context.Context, src, dst string, w *importDiskWrites) e
 // src) or renameat2(RENAME_NOREPLACE) (noReplacePlace, link first).
 // unsupported is a filesystem that can do neither; err then says why.
 func linkOrRenameNoReplace(src, dst string) (unsupported bool, err error) {
-	return noReplacePlace(src, dst, true)
+	return noReplacePlace(src, dst, true, "import: placed a file by a hard link but could not remove its temporary name")
 }
 
 // placeCopy copies a file's bytes for copyIntoPlace; a variable so a test can

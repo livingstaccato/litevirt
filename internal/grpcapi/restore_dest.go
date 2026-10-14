@@ -180,7 +180,7 @@ func existAsAlreadyExists(err error) error {
 // hard link where the filesystem cannot do the flag, as on NFS), so a file
 // created between a check and the placement is not replaced either.
 func placeNoClobber(tmp, dst string) error {
-	unsupported, err := noReplacePlace(tmp, dst, false)
+	unsupported, err := noReplacePlace(tmp, dst, false, "placed a file by a hard link but could not remove its temporary name")
 	switch {
 	case err == nil:
 		return nil

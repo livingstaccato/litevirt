@@ -22,16 +22,26 @@ import (
 // refused because the filesystem cannot do it (linkUnsupported,
 // renameUnsupported); any other refusal is returned as it is. unsupported
 // reports a filesystem that can do neither; err then names both refusals.
-// A plain rename, which could replace a file, is never used.
-func noReplacePlace(tmp, dst string, linkFirst bool) (unsupported bool, err error) {
+// A plain rename, which could replace a file, is never used. leftWarn is the
+// warning logged when a link placed the file but its temporary name could
+// not be removed.
+//
+// Link first, the rename after an unsupported link is judged as before the
+// two orderings shared this code: EPERM and EXDEV from it count as
+// unsupported too, so a caller with its own fallback (the import's copy,
+// which never replaces a file either) still takes it there, as it did.
+func noReplacePlace(tmp, dst string, linkFirst bool, leftWarn string) (unsupported bool, err error) {
 	if linkFirst {
-		lerr := linkIntoPlace(tmp, dst)
+		lerr := linkIntoPlace(tmp, dst, leftWarn)
 		if lerr == nil || errors.Is(lerr, fs.ErrExist) || !linkUnsupported(lerr) {
 			return false, lerr
 		}
 		rerr := coldRenameNoReplace(tmp, dst)
-		if rerr == nil || errors.Is(rerr, fs.ErrExist) || !renameUnsupported(rerr) {
-			return false, rerr
+		if rerr == nil {
+			return false, nil
+		}
+		if errors.Is(rerr, fs.ErrExist) || !linkUnsupported(rerr) {
+			return false, fmt.Errorf("link: %v; renameat2: %w", lerr, rerr)
 		}
 		return true, neitherPlacement(dst, lerr, rerr)
 	}
@@ -39,7 +49,7 @@ func noReplacePlace(tmp, dst string, linkFirst bool) (unsupported bool, err erro
 	if rerr == nil || errors.Is(rerr, fs.ErrExist) || !renameUnsupported(rerr) {
 		return false, rerr
 	}
-	lerr := linkIntoPlace(tmp, dst)
+	lerr := linkIntoPlace(tmp, dst, leftWarn)
 	if lerr == nil || errors.Is(lerr, fs.ErrExist) || !linkUnsupported(lerr) {
 		return false, lerr
 	}
@@ -53,7 +63,7 @@ func noReplacePlace(tmp, dst string, linkFirst bool) (unsupported bool, err erro
 // Once the link has given the file its name it is placed: a tmp name that
 // then cannot be removed is logged and left for the sweep of its pattern, so
 // a retry is not refused over a file that is the copy itself.
-func linkIntoPlace(tmp, dst string) error {
+func linkIntoPlace(tmp, dst, leftWarn string) error {
 	err := coldLink(tmp, dst)
 	if err != nil && errors.Is(err, fs.ErrExist) && sameFileAt(tmp, dst) {
 		err = nil
@@ -62,8 +72,7 @@ func linkIntoPlace(tmp, dst string) error {
 		return err
 	}
 	if rerr := coldRemove(tmp); rerr != nil {
-		slog.Warn("placed a file by a hard link but could not remove its temporary name",
-			"temp", tmp, "path", dst, "error", rerr)
+		slog.Warn(leftWarn, "scratch", tmp, "path", dst, "error", rerr)
 	}
 	return nil
 }
@@ -88,9 +97,9 @@ func linkUnsupported(err error) bool {
 
 // renameUnsupported is a renameat2(RENAME_NOREPLACE) refused because the
 // filesystem cannot do the flag (the Linux NFS client and most others answer
-// EINVAL). EPERM and EXDEV are not: they come from permissions or a
-// cross-mount rename, which a link would not get past either, and are
-// returned as they are.
+// EINVAL), when it is tried first. EPERM and EXDEV are not: they come from
+// permissions or a cross-mount rename, which a link would not get past
+// either, and are returned as they are.
 func renameUnsupported(err error) bool {
 	return errnoIn(err, syscall.EINVAL, syscall.ENOSYS, syscall.ENOTSUP, syscall.EOPNOTSUPP)
 }

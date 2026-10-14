@@ -727,7 +727,7 @@ func (s *Server) requireDiskSpace(dir, shownDir, what string, need uint64) error
 // scratch name then cannot be removed it is only logged — the startup sweep
 // takes it — so a retry is not refused over a file that is the copy itself.
 func placeColdDisk(tmp, dst string) error {
-	unsupported, err := noReplacePlace(tmp, dst, true)
+	unsupported, err := noReplacePlace(tmp, dst, true, "cold migration: placed the received disk but could not remove its scratch name")
 	if unsupported {
 		return fmt.Errorf("%v; a received disk is never placed with a rename that could overwrite one", err)
 	}

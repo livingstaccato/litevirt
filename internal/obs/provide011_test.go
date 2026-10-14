@@ -3,26 +3,43 @@ package obs
 import (
 	"bytes"
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// Nothing in litevirt may log a bare "version" slog key again, except the two
-// call sites that log the build version, which the stamped service.version
-// already carries. Scans slog calls (also multi-line) across the repo.
-func TestNoBareVersionSlogKey(t *testing.T) {
-	re := regexp.MustCompile(`(?s)slog\.(?:Debug|Info|Warn|Error)\((?:[^()]|\([^()]*\))*?"version"\s*,`)
+// provide-telemetry reserves service, env, version, trace_id and span_id: a
+// caller attribute with one of those keys is dropped once the matching stamped
+// field exists. No litevirt log call may use them as an attribute key. The scan
+// is AST based, so it covers package-level slog functions, *slog.Logger
+// methods, slog.Log/LogAttrs, With and Group arguments and the slog.String/Int/
+// Any... attr constructors, multi-line calls included. The one exception is
+// named exactly: the daemon's startup line logs before obs.Setup runs, so the
+// default logger keeps the key.
+func TestNoReservedSlogKeys(t *testing.T) {
+	reserved := map[string]bool{"service": true, "env": true, "version": true, "trace_id": true, "span_id": true}
+	logFuncs := map[string]bool{
+		"Debug": true, "Info": true, "Warn": true, "Error": true,
+		"DebugContext": true, "InfoContext": true, "WarnContext": true, "ErrorContext": true,
+		"Log": true, "LogAttrs": true, "With": true, "Group": true,
+		"String": true, "Int": true, "Int64": true, "Uint64": true, "Float64": true,
+		"Bool": true, "Duration": true, "Time": true, "Any": true,
+	}
+	// file | first string literal argument (the message) of the exempt call.
 	allowed := map[string]bool{
-		"cmd/litevirt/daemon.go":              true,
-		"internal/daemon/watchdog_upgrade.go": true,
+		"cmd/litevirt/daemon.go|starting litevirt daemon": true,
 	}
 	root := filepath.Join("..", "..")
+	fset := token.NewFileSet()
+	scanned := 0
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -36,18 +53,92 @@ func TestNoBareVersionSlogKey(t *testing.T) {
 		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
 			return nil
 		}
+		f, perr := parser.ParseFile(fset, p, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		scanned++
 		rel, _ := filepath.Rel(root, p)
-		b, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
-		}
-		if re.Match(b) && !allowed[filepath.ToSlash(rel)] {
-			t.Errorf("%s logs a bare \"version\" slog key; provide-telemetry >= 0.11 drops it when a service version is set. Rename it (crl_version, schema_version, ...)", rel)
-		}
+		rel = filepath.ToSlash(rel)
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !logFuncs[sel.Sel.Name] {
+				return true
+			}
+			var first string
+			for i, a := range call.Args {
+				lit, ok := a.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				v, uerr := strconv.Unquote(lit.Value)
+				if uerr != nil {
+					continue
+				}
+				if i == 0 || first == "" {
+					first = v
+				}
+				if i > 0 && reserved[v] && !allowed[rel+"|"+first] {
+					t.Errorf("%s: %s(...) uses reserved key %q; provide-telemetry drops it when the stamped field exists. Use a specific key (crl_version, build_version, ...)",
+						fset.Position(call.Pos()), sel.Sel.Name, v)
+				}
+			}
+			return true
+		})
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if scanned < 100 {
+		t.Fatalf("scanned only %d files; the walk root is wrong", scanned)
+	}
+}
+
+// log_level CRITICAL was accepted before provide-telemetry 0.8 and meant ERROR.
+// Since 0.8 it is a level above ERROR that litevirt never emits, so it would
+// silence every line. obs maps it to ERROR (from config and from env) and says so.
+func TestSetup_CriticalLogLevelMappedToError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		env  map[string]string
+	}{
+		{"config", Config{ServiceName: "litevirt", LogLevel: "CRITICAL"}, nil},
+		{"litevirt env", Config{ServiceName: "litevirt"}, map[string]string{"LITEVIRT_LOG_LEVEL": "critical"}},
+		{"vendor env", Config{ServiceName: "litevirt"}, map[string]string{"PROVIDE_LOG_LEVEL": "CRITICAL"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			// The WARN goes through the pre-Setup default logger.
+			var pre bytes.Buffer
+			prev := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			slog.SetDefault(slog.New(slog.NewTextHandler(&pre, nil)))
+			lines := captureDaemonStderrEnv(t, tc.cfg, func() {
+				slog.Info("info below error")
+				slog.Error("an error line", "k", "v")
+			})
+			if n := countWith(lines, "an error line"); n != 1 {
+				t.Fatalf("ERROR record emitted %d times under CRITICAL, want 1 (silenced?): %q", n, lines)
+			}
+			if n := countWith(lines, "info below error"); n != 0 {
+				t.Errorf("INFO record emitted under a CRITICAL->ERROR level: %q", lines)
+			}
+			if got := os.Getenv("PROVIDE_LOG_LEVEL"); got != "ERROR" {
+				t.Errorf("PROVIDE_LOG_LEVEL=%q, want ERROR", got)
+			}
+			if n := strings.Count(pre.String(), "treated as ERROR"); n != 1 {
+				t.Errorf("startup WARN count=%d, want 1: %q", n, pre.String())
+			}
+		})
 	}
 }
 
@@ -121,6 +212,17 @@ func captureDaemonStderrEnv(t *testing.T, cfg Config, emit func()) []string {
 	out := <-done
 	_ = r.Close()
 	return strings.Split(strings.TrimSpace(string(bytes.TrimSpace(out))), "\n")
+}
+
+// countWith counts the lines containing needle.
+func countWith(lines []string, needle string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, needle) {
+			n++
+		}
+	}
+	return n
 }
 
 func lineWith(lines []string, needle string) string {

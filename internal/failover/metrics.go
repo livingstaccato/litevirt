@@ -19,8 +19,9 @@ type Metrics interface {
 	//
 	// It is the LEASE HOLDER's view — every node calls this, and a node that is
 	// not driving failover reports 0 (see stepDownGauges), so a fleet-wide alert
-	// must take the max across instances or join on litevirt_failover_leader
-	// rather than averaging. Zero is the normal value; a sustained non-zero needs
+	// must take the max across instances rather than averaging. Not a join on
+	// litevirt_failover_leader: with no node holding the voter majority nobody
+	// leads, the join is empty, and the last leader's value is the only one. Zero is the normal value; a sustained non-zero needs
 	// a human, and what they should do depends on WHY the host is down — see
 	// strandedWorkloads.
 	StrandedWorkloads(n int)

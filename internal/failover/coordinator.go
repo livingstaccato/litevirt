@@ -752,6 +752,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	if aerr != nil {
 		slog.Warn("failover: read when hosts turned active", "error", aerr)
 	}
+	// fenceTimes caches each target's fence-log timestamps for this cycle
+	// (inheritedRunGrace).
+	fenceTimes := map[string][]time.Time{}
 	freshObservers := map[string]map[string]struct{}{}
 	// clusterObservers is the cluster-wide count, kept under region scope only
 	// to report a host it would have fenced and the region count does not.
@@ -768,7 +771,8 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
-		if since, ok := activeSince[t]; ok && !countedSinceActive(r.Int("consecutive_failures"), r.String("last_seen"), inst, since) {
+		if since, ok := activeSince[t]; ok && !countedSinceActiveWithin(r.Int("consecutive_failures"), r.String("last_seen"), inst, since,
+			c.inheritedRunGrace(ctx, t, since, fenceTimes)) {
 			continue
 		}
 		if c.scope.region && countsAsVote(voters, o, t) {

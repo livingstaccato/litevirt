@@ -1224,10 +1224,10 @@ genesis cannot write generation 1 of the explicit voter set: a host is in
 cluster so it never freezes a host out of the voter set because it happened to
 be away when the token latched. The evidence names each host, its state and
 what clears it; the condition resolves on the tick genesis succeeds. While a
-witness or a host in maintenance exists, the severity is critical and the
-evidence names those hosts: until genesis completes, a split of the voters
-that one of them reaches both halves of stalls failover
-(`ha.recovery.bridged`).
+witness that is up or a host in maintenance exists, the evidence names it:
+until genesis completes, a split of the voters that it reaches both halves of
+stalls failover (`ha.recovery.bridged`). With a witness the severity is
+critical; a host in maintenance alone keeps it a warning.
 
 For a cluster that cannot become clean — a host that is dead for good and has
 not been removed — `lv cluster voter init --members <hosts>` proposes the
@@ -1270,24 +1270,35 @@ with the reason: valid signatures do not make a false claim of loss true.
 ### A recovery held by a bridged split (`ha.recovery.bridged`)
 
 Evaluator `failover`, subject the host, severity critical, written by the
-failover lease holder. The host was fenced relying on its partition pause, the
-wait passed, and its workloads were not recovered because observers outside
-the voter majority still saw it answer: a host that reaches both halves of a
-split of the voters (a witness, or a host in maintenance) relays the
-minority's view. On a derived voter set (no generation adopted) any such
-observer holds the recovery; on an adopted generation it is held until the
-host reports that it paused. Nothing runs twice: the workloads stay paused on
-the host. Nothing re-checks the host while the split lasts.
+failover lease holder. A host's recoverable workloads stay paused, and nothing
+recovers them, because observers outside the voter majority still see the host
+answer: a host that reaches both halves of a split of the voters (a witness,
+or a host in maintenance) relays the minority's view. Nothing runs twice. It
+is raised in one of two forms:
 
-The evidence names the paused `workloads`, the `observers` that saw the host
+- **At the deadline.** The host was fenced relying on its partition pause, the
+  wait passed, and its workloads were not recovered because observers had
+  seen it answer since the fence. On a derived voter set (no generation
+  adopted) any such observer holds the recovery; on an adopted generation it
+  is held when the host had not reported its pause by the deadline. Nothing
+  re-checks the host while the split lasts, except a new failover lease
+  holder, which waits out the pause again.
+- **Before any fence.** The host has kept `partition_paused` open for longer
+  than the pause wait and is no fence candidate: some voters see it down, but
+  the observers that see it answer leave too few voters failing it for a
+  quorum. This is a witness bridge on a derived voter set, where the witness
+  votes. Nothing is fenced or recovered.
+
+The evidence names the paused `workloads`, the `observers` that see the host
 answer, whether the cluster is on a `derived_voter_set`, and the `remedy`:
 heal the partition, and the host returns and resumes its workloads; or, once
-the host is powered off, `lv host fence-confirm <host>`, and the recovery
-resumes from it. On a derived set, complete voter genesis once every host is
-back (clear what `ha.voter.genesis_pending` names, or
+the host is powered off, `lv host fence-confirm <host>`, and the coordinator
+recovers its workloads. On a derived set, complete voter genesis once every host is back
+(clear what `ha.voter.genesis_pending` names, or
 `lv cluster voter init --members <hosts>`) so the next split does not stall.
-The condition resolves once the host is back in service or removed, or has no
-recoverable workload left on it.
+The condition resolves once the host is removed; a fenced or offline host
+once no recoverable workload is left on it; any other host once it is no
+longer held (a quorum of voters sees it answer, or its pause is over).
 
 ### A failed re-fence (`refence_failed`)
 

@@ -795,10 +795,11 @@ func genesisRefusals(err error, members []string) map[string]string {
 }
 
 // applyGenesisPending raises ha.voter.genesis_pending with one line per
-// blocking host, or resolves it when blocked is empty. It is critical, with a
-// line saying so, while some host can bridge a split of the derived voter set
-// (genesisBridges): failover then stalls on such a split until genesis
-// completes. The lease holder is the
+// blocking host, or resolves it when blocked is empty. While some host can
+// bridge a split of the derived voter set (genesisBridges) a line says that
+// failover stalls on such a split until genesis completes; it is critical
+// when a witness can, which is persistent, and a warning when only a host in
+// maintenance can, which is already a blocker the operator is ending. The lease holder is the
 // only writer, which is what the LWW row merge assumes.
 func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]string) {
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -829,8 +830,10 @@ func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]str
 	sort.Strings(lines)
 	detail := "automatic voter genesis is waiting for a clean cluster: " + strings.Join(lines, "; ")
 	severity := corrosion.SeverityWarning
-	if bridges := s.genesisBridges(ctx); len(bridges) > 0 {
-		severity = corrosion.SeverityCritical
+	if bridges, witness := s.genesisBridges(ctx); len(bridges) > 0 {
+		if witness {
+			severity = corrosion.SeverityCritical
+		}
 		detail += fmt.Sprintf(". Until genesis completes the voter set is derived, and %s can reach both halves of a "+
 			"split of the voters: then the majority does not recover the minority's paused workloads while the split "+
 			"lasts (ha.recovery.bridged is raised for each host so held)", strings.Join(bridges, ", "))
@@ -854,25 +857,27 @@ func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]str
 }
 
 // genesisBridges names each host that can reach both halves of a split of the
-// derived voter set without being split itself: witnesses, and hosts in
-// maintenance (up, but outside the voter set), each with why it can.
-// Sorted; nil on a read error.
-func (s *Server) genesisBridges(ctx context.Context) []string {
+// derived voter set without being split itself: a witness that is up (a
+// witness is a voter there, so no fence quorum forms against the minority it
+// reaches), and a host in maintenance (up, but outside the voter set), each
+// with why it can. witness reports whether a witness is among them. Sorted;
+// nil on a read error.
+func (s *Server) genesisBridges(ctx context.Context) (bridges []string, witness bool) {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	var out []string
 	for _, h := range hosts {
 		switch {
-		case h.IsWitness():
-			out = append(out, h.Name+" (witness)")
+		case h.IsWitness() && h.State != "offline" && h.State != "fenced":
+			bridges = append(bridges, h.Name+" (witness)")
+			witness = true
 		case h.State == "maintenance":
-			out = append(out, h.Name+" (in maintenance)")
+			bridges = append(bridges, h.Name+" (in maintenance)")
 		}
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(bridges)
+	return bridges, witness
 }
 
 // genesisPendingDetail is the active condition's text, "" when none.

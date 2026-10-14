@@ -8,12 +8,15 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// ha.voter.genesis_pending is critical, and says a split can stall failover,
-// while a host that can bridge a split of the derived voter set exists: a
-// witness, or a host in maintenance. Its identity does not change.
+// ha.voter.genesis_pending says a split can stall failover while a host that
+// can bridge a split of the derived voter set exists, and is critical while
+// that host is a witness that is up. A host in maintenance gets the line at
+// warning. Its identity does not change.
 //
-// Mutations: keep the severity at warning — the critical checks go red; drop
-// the maintenance case from genesisBridges — the maintenance arm goes red.
+// Mutations: keep the severity at warning — the witness check goes red; make
+// a maintenance-only bridge critical — the maintenance arm goes red; drop the
+// maintenance case from genesisBridges — the maintenance arm goes red; count
+// an offline witness — the offline-witness arm goes red.
 func TestGenesisPending_LouderWhileAHostCanBridgeASplit(t *testing.T) {
 	ctx := context.Background()
 	s := testServer(t)
@@ -57,16 +60,29 @@ func TestGenesisPending_LouderWhileAHostCanBridgeASplit(t *testing.T) {
 		t.Fatalf("the blocker line or the lifecycle changed: %+v", row)
 	}
 
-	// The witness is a worker again, and another host is in maintenance.
+	// An offline witness reaches nothing.
+	if err := corrosion.UpdateHostState(ctx, s.db, "w", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	s.VoterGenesisTick(ctx, 0)
+	if row := read(); row.Severity != corrosion.SeverityWarning || strings.Contains(row.Evidence, stall) {
+		t.Fatalf("with the witness offline: severity %s, evidence %s; want warning and no stall line", row.Severity, row.Evidence)
+	}
+
+	// The witness is an active worker again, and another host is in
+	// maintenance: the line, at warning.
 	if err := corrosion.UpdateHostRole(ctx, s.db, "w", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateHostState(ctx, s.db, "w", "active"); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.UpdateHostState(ctx, s.db, "a", "maintenance"); err != nil {
 		t.Fatal(err)
 	}
 	s.VoterGenesisTick(ctx, 0)
-	if row := read(); row.Severity != corrosion.SeverityCritical || !strings.Contains(row.Evidence, "a (in maintenance) "+stall) {
-		t.Fatalf("with a host in maintenance: severity %s, evidence %s; want critical naming a", row.Severity, row.Evidence)
+	if row := read(); row.Severity != corrosion.SeverityWarning || !strings.Contains(row.Evidence, "a (in maintenance) "+stall) {
+		t.Fatalf("with a host in maintenance: severity %s, evidence %s; want warning naming a", row.Severity, row.Evidence)
 	}
 
 	// Neither: warning again.

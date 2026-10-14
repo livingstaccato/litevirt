@@ -205,3 +205,157 @@ func TestBridgedStall_APauseThatFailedIsNotRaised(t *testing.T) {
 		t.Fatalf("%s raised for a host whose pause failed", CondRecoveryBridged)
 	}
 }
+
+// beforeFence is the pre-fence form on a derived voter set {coordinator,
+// alive, down} (quorum 2): alive fails down, but the coordinator, a voter
+// (a witness bridging the split), sees it answer, so down is no fence
+// candidate. Its verdict is an hour old: a checker does not re-stamp a
+// steadily healthy edge. down reports its pause, raised pausedFor ago.
+func beforeFence(t *testing.T, pausedFor time.Duration) (*Coordinator, *corrosion.Client, context.Context, *monoClock) {
+	t.Helper()
+	c, db, ctx, mono := pauseCoordinator(t, true)
+	healthRow(t, db, "alive", "suspect", offlineThreshold, time.Now())
+	healthRow(t, db, "coordinator", "healthy", 0, time.Now().Add(-time.Hour))
+	pausedCondition(t, db, time.Now().Add(-pausedFor))
+	c.run(ctx)
+	if len(fenceResults(t, db, ctx)) != 0 {
+		t.Fatalf("setup: down was fenced: %v", fenceResults(t, db, ctx))
+	}
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("setup: VM moved to %q", got)
+	}
+	return c, db, ctx, mono
+}
+
+// fenceResults lists down's fencing_log results.
+func fenceResults(t *testing.T, db *corrosion.Client, ctx context.Context) []string {
+	t.Helper()
+	rows, err := db.Query(ctx, `SELECT result FROM fencing_log WHERE host_name = 'down'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("result"))
+	}
+	return out
+}
+
+// A host paused longer than the wait that is no fence candidate, with a
+// voter failing it and observers answering it, is raised before any fence.
+//
+// Mutations: drop the noteBridgedBeforeFence call from the cycle — nothing is
+// raised; count only fresh answering verdicts — nothing is raised; drop the
+// paused-longer-than-the-wait check — the fresh-pause test goes red.
+func TestBridgedStall_BeforeAnyFenceIsRaised(t *testing.T) {
+	_, db, ctx, _ := beforeFence(t, time.Hour)
+	row, ev, ok := bridgedCond(t, db, ctx)
+	if !ok || row.Lifecycle != corrosion.ConditionConfirmed || row.Severity != corrosion.SeverityCritical {
+		t.Fatalf("%s not raised for a host held before any fence: %+v (found %v)", CondRecoveryBridged, row, ok)
+	}
+	if !slices.Equal(ev.Workloads, []string{"vm/vm"}) || !slices.Equal(ev.Observers, []string{"coordinator"}) || !ev.DerivedVoterSet {
+		t.Errorf("evidence %s: want vm/vm, observer coordinator, derived", row.Evidence)
+	}
+	for _, want := range []string{"lv host fence-confirm down", "heal the partition", "no fence candidate"} {
+		if !strings.Contains(ev.Remedy+" "+ev.Detail, want) {
+			t.Errorf("evidence %s does not say %q", row.Evidence, want)
+		}
+	}
+}
+
+// A pause younger than the wait is the ordinary wait for a fence quorum.
+func TestBridgedStall_BeforeAnyFenceNotWithinTheWait(t *testing.T) {
+	_, db, ctx, _ := beforeFence(t, 0)
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s raised for a pause younger than the wait", CondRecoveryBridged)
+	}
+}
+
+// The partition heals: a quorum of voters answers down, and the condition
+// resolves — here on a successor coordinator, from the replica.
+//
+// Mutations: drop the voter-quorum check in bridgedBeforeFence — it stays
+// open; drop the not-held case from resolveBridgedSettled — it stays open.
+func TestBridgedStall_BeforeAnyFenceClearsOnASuccessor(t *testing.T) {
+	_, db, ctx, _ := beforeFence(t, time.Hour)
+	if !bridgedOpen(t, db, ctx) {
+		t.Fatal("setup: not raised")
+	}
+	healthRow(t, db, "alive", "healthy", 0, time.Now())
+	if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
+		t.Fatal(err)
+	}
+	succ := newTestCoordinator("alive", db)
+	succ.PartitionPauseEnforced = func(context.Context) bool { return true }
+	succ.PeerPausesOnLoss = func(string) bool { return true }
+	succ.run(ctx)
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s still open on the successor after a quorum answered down", CondRecoveryBridged)
+	}
+	row, _, _ := bridgedCond(t, db, ctx)
+	if row.Reporter != "alive" {
+		t.Errorf("resolved by %q, want the successor", row.Reporter)
+	}
+}
+
+// The way out the condition names: the operator powers down off (now every
+// voter fails it) and runs `lv host fence-confirm`. The recovery follows —
+// on the confirmation, or after the coordinator's own fence and wait — and
+// the condition resolves with it.
+func TestBridgedStall_BeforeAnyFenceTheWayOutRecovers(t *testing.T) {
+	c, db, ctx, mono := beforeFence(t, time.Hour)
+	if !bridgedOpen(t, db, ctx) {
+		t.Fatal("setup: not raised")
+	}
+	healthRow(t, db, "coordinator", "suspect", offlineThreshold, time.Now())
+	operatorConfirms(t, db, ctx, "down")
+	c.run(ctx)
+	if vmHost(t, db, ctx) != "alive" {
+		mono.Advance(health.PartitionPauseWaitFor(2) + time.Second)
+		c.run(ctx)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM on %q after the operator powered down off and confirmed it", got)
+	}
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s still open after the recovery", CondRecoveryBridged)
+	}
+}
+
+// A voter quorum answering down is a host coming back, about to resume, not
+// one a bridge holds: not raised. Five voters (quorum 3): alive fails down,
+// coordinator, v4 and v5 see it answer.
+//
+// Mutation: drop the voter-quorum check in bridgedBeforeFence — raised.
+func TestBridgedStall_BeforeAnyFenceAVoterQuorumAnsweringIsNotRaised(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	for _, v := range []string{"v4", "v5"} {
+		ensureVoter(t, db, v)
+		healthRow(t, db, v, "healthy", 0, time.Now().Add(-time.Hour))
+	}
+	healthRow(t, db, "alive", "suspect", offlineThreshold, time.Now())
+	healthRow(t, db, "coordinator", "healthy", 0, time.Now().Add(-time.Hour))
+	pausedCondition(t, db, time.Now().Add(-time.Hour))
+	c.run(ctx)
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s raised for a host a quorum of voters sees answer", CondRecoveryBridged)
+	}
+}
+
+// A fence candidate whose fence this cycle deferred (here: this node was
+// itself stalled moments ago) is not "no fence candidate": not raised.
+//
+// Mutation: drop the fence-candidate check in bridgedBeforeFence — raised.
+func TestBridgedStall_BeforeAnyFenceADeferredCandidateIsNotRaised(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	c.LocalStall = func() bool { return true }
+	healthRow(t, db, "bystander", "healthy", 0, time.Now().Add(-time.Hour))
+	pausedCondition(t, db, time.Now().Add(-time.Hour))
+	c.run(ctx)
+	if len(fenceResults(t, db, ctx)) != 0 || hostState(t, db, ctx) != "active" {
+		t.Fatalf("setup: the fence of down was not deferred: %v %s", fenceResults(t, db, ctx), hostState(t, db, ctx))
+	}
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s raised for a fence candidate whose fence was deferred", CondRecoveryBridged)
+	}
+}

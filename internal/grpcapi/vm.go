@@ -1969,20 +1969,22 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// Skipped when the VM is already running: `lv start` must not be refused
 	// for capacity the VM already occupies. A VM in starting is counted too
 	// (countedAgainstHost), at its row's actuals: only what cpu/memMiB add to
-	// those is admitted — a repair that grows it (UpdateVM) — as a grow,
-	// through the same overcommit permission and audit as any start. Anything
-	// else — stopped, error, pending — is counted nowhere, so its whole size
-	// is admitted as new to the host.
+	// those is admitted — a repair that grows it (UpdateVM) — through the same
+	// overcommit permission and audit as any start. Its domain is not running
+	// yet, so even at zero growth the start makes it resident and the host
+	// safety gate runs (intentStartingResident). Anything else — stopped,
+	// error, pending — is counted nowhere, so its whole size is admitted as
+	// new to the host.
 	if vm.State == "running" {
 		return nil, nil
 	}
 	intent := intentVMResident
 	if countedAgainstHost(vm.State) {
 		cpu, memMiB = posOnly(cpu-vm.CPUActual), posOnly(memMiB-vm.MemActual)
+		intent = intentStartingResident
 		if cpu == 0 && memMiB == 0 {
-			return nil, nil
+			return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, 0, 0, intent)
 		}
-		intent = intentResourceGrow
 	}
 	if allowOvercommit {
 		if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
@@ -2524,14 +2526,20 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	// RUNNING VM is net-zero (destroy+start of consumption already counted,
 	// overhead included) and deliberately admits nothing: a full host must
 	// always be able to restart what it already runs.
-	// A VM in starting is counted already too (countedAgainstHost).
-	if !countedAgainstHost(vm.State) {
-		var spec pb.VMSpec
-		if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
-			return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+	// A VM in starting is counted already too (countedAgainstHost), so it
+	// admits a zero delta — but its domain is not running yet, so the restart
+	// makes it resident and the host safety gate runs (intentStartingResident).
+	if vm.State != "running" {
+		cpu, memMiB, intent := 0, 0, intentStartingResident
+		if !countedAgainstHost(vm.State) {
+			var spec pb.VMSpec
+			if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+			}
+			cpu, memMiB, intent = int(spec.Cpu), int(spec.MemoryMib), intentVMResident
 		}
 		lease, aerr := s.admitHostWithReservation(ctx, "RestartVM", vm.HostName, vm.Project,
-			"vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+			"vm:"+vm.Name, cpu, memMiB, intent)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -5194,11 +5202,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if repair {
 				// A repair ends in a start, so it passes StartVM's gates first
 				// (startGatesLocked) — before anything of the VM is touched, so a
-				// refusal leaves it exactly as it was. The VM is in error or
-				// mid-transition and counted nowhere, so the host admits its
-				// WHOLE size as new, not the desired-minus-stored delta (zero for
-				// an unchanged spec). Quota still charges only the grow: the
-				// stored spec already counts toward the project.
+				// refusal leaves it exactly as it was. A VM in starting is
+				// already counted at its row's actuals (countedAgainstHost), so
+				// the host admits only what the new size adds to those, and runs
+				// the safety gate even when that is nothing. A VM in error,
+				// creating, stopping or any other state is counted nowhere, so
+				// the host admits its WHOLE size as new. Quota still charges only
+				// the grow: the stored spec already counts toward the project.
 				releaseStartLease, err := s.takeRepairLease(ctx, fresh)
 				if err != nil {
 					return nil, err

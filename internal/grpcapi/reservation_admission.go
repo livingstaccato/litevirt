@@ -44,6 +44,11 @@ var (
 	// intentResourceGrow: a delta on a workload already resident and counted,
 	// overhead included.
 	intentResourceGrow = admissionIntent{}
+	// intentStartingResident: a VM in starting brought up — counted in usage
+	// with its overhead (countedAgainstHost), but its domain is not running
+	// yet, so the start makes it resident: full residency safety, no second
+	// overhead.
+	intentStartingResident = admissionIntent{newResidency: true}
 )
 
 // quotaSubject is the workload a project-quota admission is FOR: its identity

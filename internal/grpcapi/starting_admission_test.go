@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -86,4 +87,82 @@ func TestRestartVM_AStuckStartIsAdmittedOnANearFullHost(t *testing.T) {
 	if _, err := s.RestartVM(adminCtx(), &pb.RestartVMRequest{Name: "hb"}); status.Code(err) == codes.ResourceExhausted {
 		t.Fatalf("restart of a VM in starting, already counted on its host = %v", err)
 	}
+}
+
+// Re-review 3 I-1: a start, restart or zero-growth repair of a VM in starting
+// adds no capacity, but it still makes the VM resident, so it passes the
+// host-safety gate: an active ownership condition on the VM, or an incomplete
+// local inventory, refuses it before anything is started.
+//
+// Mutation: the zero-delta `return nil, nil` in startGatesLocked, or the
+// RestartVM skip of admission for a counted VM — the start goes ahead: red.
+func TestStartingVM_OperatorStartsRunTheHostSafetyGate(t *testing.T) {
+	ops := []struct {
+		name string
+		call func(s *Server) error
+	}{
+		{"StartVM", func(s *Server) error {
+			_, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "hb"})
+			return err
+		}},
+		{"RestartVM", func(s *Server) error {
+			_, err := s.RestartVM(adminCtx(), &pb.RestartVMRequest{Name: "hb"})
+			return err
+		}},
+		{"UpdateVM repair", func(s *Server) error {
+			_, err := s.UpdateVM(adminCtx(), &pb.UpdateVMRequest{Name: "hb", MemoryMib: 1024, AllowRestart: proto.Bool(true)})
+			return err
+		}},
+	}
+	type condition struct {
+		name, want string
+		seed       func(t *testing.T, s *Server, fake *libvirtfake.Fake)
+	}
+	var conditions []condition
+	for _, code := range []string{"vm_dual_run", "runtime_owner_mismatch", "owner_epoch_mismatch"} {
+		conditions = append(conditions, condition{code, "ownership condition", func(t *testing.T, s *Server, _ *libvirtfake.Fake) {
+			seedOwnershipCondition(t, s, code, "vm", "hb", "h-a", "h-b")
+		}})
+	}
+	conditions = append(conditions, condition{"incomplete inventory", "inventory is incomplete", func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+		fake.FailListDomains = func() error { return errors.New("libvirtd unreachable") }
+		s.invalidateInventoryCache()
+	}})
+	for _, c := range conditions {
+		for _, op := range ops {
+			t.Run(c.name+"/"+op.name, func(t *testing.T) {
+				s := serverWithEngine(t)
+				fake := startingVM(t, s)
+				c.seed(t, s, fake)
+				err := op.call(s)
+				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), c.want) {
+					t.Fatalf("%s of a VM in starting with %s = %v, want FailedPrecondition naming %q", op.name, c.name, err, c.want)
+				}
+				if st, _ := fake.RawState("hb"); st == libvirtfake.StateRunning {
+					t.Fatalf("refused %s still started the domain", op.name)
+				}
+			})
+		}
+	}
+}
+
+// Re-review 3 nit: a same-host promote takeover of a VM in starting admits a
+// zero delta (countedAgainstHost) but still runs the residency safety gate.
+//
+// Mutation: skip the takeover's admission when its delta is zero — the
+// promotion goes ahead under an active ownership condition: red.
+func TestPromoteReplica_SameHostTakeoverOfAStartingVMRunsTheSafetyGate(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	poolDir := seedPromotableVM(t, s, s.hostName, "", "", 1, 1024)
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET state = 'starting' WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	seedOwnershipCondition(t, s, "vm_dual_run", "vm", "vm1", "h-a", "h-b")
+	err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "ownership condition") {
+		t.Fatalf("same-host promote of a VM in starting under an active vm_dual_run = %v, want FailedPrecondition", err)
+	}
+	assertNoPromotedArtifacts(t, s, poolDir, "vm1")
 }

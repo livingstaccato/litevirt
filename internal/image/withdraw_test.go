@@ -54,3 +54,63 @@ func TestWithdraw_TheNamePointsAgainAtWhatWasCurrent(t *testing.T) {
 		t.Fatalf("withdraw of a file not current: ImagePath %s err=%v, want %s kept", s.ImagePath("ubuntu"), err, prev)
 	}
 }
+
+// A Publish of new content that lands while a Withdraw runs is not reverted:
+// Withdraw's check that the stale file is still current, and its re-point,
+// are one step against any Publish of the name. The Publish begins after
+// Withdraw has found the stale file current; it either waits for Withdraw
+// (the name's lock) or, without one, re-points the name first and is then
+// reverted.
+func TestWithdraw_AConcurrentPublishIsNotReverted(t *testing.T) {
+	s := NewStore(t.TempDir())
+	_ = s.Init()
+	v1, stale, v3 := []byte("version one"), []byte("stale copy"), []byte("version three")
+	p1, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps, err := s.Publish("ubuntu", stage(t, s, stale), digestOf(stale))
+	if err != nil || s.ImagePath("ubuntu") != ps.Path {
+		t.Fatalf("publish the stale copy: %+v err=%v", ps, err)
+	}
+
+	tmp3 := stage(t, s, v3)
+	contended := make(chan struct{}, 1)
+	s.testHooks.nameContended = func(string) {
+		select {
+		case contended <- struct{}{}:
+		default:
+		}
+	}
+	type result struct {
+		pub Published
+		err error
+	}
+	done := make(chan result, 1)
+	s.testHooks.withdrawChecked = func() {
+		go func() {
+			pub, err := s.Publish("ubuntu", tmp3, digestOf(v3))
+			done <- result{pub, err}
+		}()
+		select {
+		case r := <-done: // no lock held it back: it re-pointed the name first
+			done <- r
+		case <-contended: // it waits for this Withdraw
+		}
+	}
+	if err := s.Withdraw("ubuntu", ps.Path, p1.Path); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if got := s.ImagePath("ubuntu"); got != r.pub.Path {
+		t.Fatalf("after a Publish during a Withdraw, ImagePath = %s, want the published %s", got, r.pub.Path)
+	}
+	for _, f := range []string{r.pub.Path, ps.Path, p1.Path} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("%s is gone: %v", f, err)
+		}
+	}
+}

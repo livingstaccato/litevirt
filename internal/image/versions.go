@@ -368,6 +368,9 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 		healed = append(healed, f)
 	}
 
+	// From reading the current file to re-pointing the name, one step
+	// against a Withdraw of the name (lockName).
+	defer s.lockName(name)()
 	cur := s.ImagePath(name)
 	if _, err := os.Lstat(cur); errors.Is(err, fs.ErrNotExist) {
 		cur = "" // the image's first content: nothing is superseded
@@ -476,8 +479,15 @@ func (s *Store) Withdraw(name, path, prev string) error {
 	if prev == path {
 		return nil // Publish made nothing current: the content was already
 	}
+	// The check that path is still current and the re-point are one step
+	// against a Publish of the name (lockName), which a re-point here would
+	// otherwise revert.
+	defer s.lockName(name)()
 	if cur, ok := s.currentVersion(name); !ok || cur != path {
 		return nil
+	}
+	if hook := s.testHooks.withdrawChecked; hook != nil {
+		hook()
 	}
 	if prev != "" && isVersionFile(name, filepath.Base(prev)) && filepath.Dir(prev) == filepath.Clean(s.imageDir) {
 		if fi, err := os.Lstat(prev); err == nil && fi.Mode().IsRegular() {

@@ -162,12 +162,12 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	}); err != nil {
 		if isStaleImageCopy(err) {
 			// Older content than the image's record (re-review 3, m-2): no
-			// new disk here is built on it. It stays as a superseded version
-			// until the prune finds nothing built on it.
+			// new disk here is built on it. It stays as a superseded version,
+			// left to the next refresh's prune or lv image prune: a create
+			// may have resolved it while it was current.
 			if werr := s.images.Withdraw(name, pub.Path, prev); werr != nil {
 				slog.Warn("image: a copy of older content than the image's record is still its current file here", "image", name, "path", pub.Path, "error", werr)
 			}
-			s.pruneAfterRefresh(name, s.images.ImagePath(name))
 		}
 		return err
 	}

@@ -48,7 +48,9 @@ var (
 )
 
 // TestDrill1_SplitTwoThree is drill 1 of the kvm003 drills: {node-1, node-2} |
-// {node-3, node-4, node-5}.
+// {node-3, node-4, node-5}. A witness (lab 1's node-6) is named by neither side
+// and goes with the majority (lab.partition): left out it would reach both sides
+// and report the failover lease live for a minority holder, so nothing recovers.
 //
 //   - the minority pauses its recoverable workloads no sooner than T_pause and
 //     no later than minorityPauseBy after the link broke;

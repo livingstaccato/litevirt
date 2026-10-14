@@ -227,6 +227,25 @@ func (s *BackupSession) ReadAt(p []byte, offset int64) (int, error) {
 	return len(p), nil
 }
 
+// IOFault asks libvirt whether qemu has reported an I/O error on any disk of
+// the domain, and names those disks. Best effort: empty when none is reported
+// or libvirt cannot say. A session whose NBD export died of a read error on
+// the disk shows only a broken pipe, and this is where the cause is.
+func (s *BackupSession) IOFault() string {
+	errs, n, err := s.c.virt.DomainGetDiskErrors(s.dom, 64, 0)
+	if err != nil || n <= 0 {
+		return ""
+	}
+	var disks []string
+	for _, e := range errs {
+		disks = append(disks, e.Disk)
+	}
+	if len(disks) == 0 {
+		return ""
+	}
+	return "an I/O error on disk " + strings.Join(disks, ", ")
+}
+
 // Close ends the NBD connection and the qemu backup job and removes the
 // scratch file. Safe to call once.
 func (s *BackupSession) Close() error {

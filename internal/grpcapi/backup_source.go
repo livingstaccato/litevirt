@@ -1,9 +1,14 @@
 package grpcapi
 
 import (
+	"fmt"
 	"io"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -16,6 +21,35 @@ type BackupReader interface {
 	Incremental() bool
 	ChangedExtents() ([][2]int64, error)
 	Close() error
+}
+
+// backupIOFaulter is implemented by a BackupReader that can ask qemu whether it
+// reported an I/O error on the disk being read (libvirt's disk errors). A read
+// that fails mid-backup surfaces as a broken NBD pipe; this is the only place
+// the real cause lives.
+type backupIOFaulter interface {
+	IOFault() string
+}
+
+// backupPushError is the error of a failed guest-content push. It names the
+// VM disk that was being read and, when qemu reported one, the I/O error, and
+// keeps the original error's text.
+func backupPushError(vm string, disk *corrosion.DiskRecord, src BackupReader, err error) error {
+	where := fmt.Sprintf("disk %q of %q (%s", disk.DiskName, vm, disk.Path)
+	if disk.StorageType != "" {
+		where += ", storage " + disk.StorageType
+		if disk.StorageVolume != "" {
+			where += " " + disk.StorageVolume
+		}
+	}
+	where += ")"
+	msg := fmt.Sprintf("push: reading %s: %v", where, err)
+	if f, ok := src.(backupIOFaulter); ok {
+		if fault := f.IOFault(); fault != "" {
+			msg += "; qemu reported: " + fault
+		}
+	}
+	return status.Error(codes.Internal, msg)
 }
 
 // BackupSource opens guest-content backup sessions and prunes the libvirt

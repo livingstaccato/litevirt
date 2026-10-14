@@ -23,8 +23,9 @@ import (
 // for that host until health.PartitionPauseWaitFor has passed since its
 // decision, measured on this process's monotonic clock from the later of the
 // decision and its own last contact with the host. At the deadline it
-// recovers only if the host is still down and no observer has seen it answer
-// since the fence. Unlatched, nothing here runs and failover is unchanged.
+// recovers only if the host is still down and cannot hold a voter majority
+// (selfPauseStillStands). Unlatched, nothing here runs and failover is
+// unchanged.
 
 // pauseWait is one host's pending recovery, held until its deadline.
 type pauseWait struct {
@@ -176,8 +177,8 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		return true
 	}
 	delete(c.pauseWaits, host)
-	if why, ok := c.fenceStillStands(ctx, host, w.fenceAt); !ok {
-		slog.Warn("failover: partition-pause deadline passed, but the host has answered since the fence; recovering nothing",
+	if why, ok := c.selfPauseStillStands(ctx, h, w.fenceAt); !ok {
+		slog.Warn("failover: partition-pause deadline passed, but the host may not have paused or has come back; recovering nothing",
 			"host", host, "why", why)
 		return true
 	}
@@ -185,6 +186,122 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		"host", host, "waited", w.wait, "assurance", corrosion.FenceSelfPaused)
 	c.recoverWorkloads(ctx, h)
 	return true
+}
+
+// selfPauseStillStands is fenceStillStands for a self-pause fence at its
+// deadline (docs/design/partition-pause.md §4.2 step 3).
+//
+// A self-paused host is meant to be up: it is paused, not off. The one thing
+// that keeps a minority host from pausing is its own count of a voter majority
+// (§3.1), so the deadline does not ask whether anybody has seen the host
+// answer since the fence. A non-voter that still reaches it has, and so have
+// the other voters in its minority; neither shows that it holds a majority.
+// The deadline asks whether the voters seen answering could have handed it
+// one: the host itself when it is a voter, plus every voter whose latest
+// verdict about it is an answer, of any age. A minority voter that never lost
+// the host may never have written a newer verdict, and it is still part of
+// the host's count. If they make a majority of any voter set the host may be
+// counting over, the host may never have paused, or has come back, and
+// nothing is recovered.
+//
+// Two cases keep fenceStillStands' rule, where any observer that has seen the
+// host answer since the fence refuses:
+//
+//   - the pause can no longer be relied on (relyOnPartitionPause): the host
+//     has reported its pause failed, or no longer says it pauses, so a host
+//     that answered was never stopped;
+//   - the voter set is derived (no adopted generation with members). It is
+//     computed from each node's own replica of host state, so the host's set
+//     can differ from this node's by every host fenced or taken offline while
+//     they were apart.
+func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (string, bool) {
+	if !c.relyOnPartitionPause(ctx, h) {
+		return c.fenceStillStands(ctx, h.Name, at)
+	}
+	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
+	if err != nil {
+		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return "voter set unreadable", false
+	}
+	if !explicit {
+		return c.fenceStillStands(ctx, h.Name, at)
+	}
+	if !c.observerStreakSpans(ctx, h.Name, at) {
+		return "no observer has watched the host stay down since the fence", false
+	}
+	return c.answeredByAVoterMajority(ctx, h.Name, sets)
+}
+
+// answeredByAVoterMajority reports false, and why, when the voters whose
+// latest verdict about host is an answer (healthy or unready, the verdicts
+// answeredSince reads as one), counting host itself when it is a voter, are
+// a majority of any of sets. It fails closed on a read error.
+func (c *Coordinator) answeredByAVoterMajority(ctx context.Context, host string, sets []map[string]bool) (string, bool) {
+	rows, err := c.db.Query(ctx,
+		`SELECT observer, status, consecutive_failures FROM host_health WHERE target = ?`, host)
+	if err != nil {
+		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return "host_health unreadable", false
+	}
+	answered := map[string]bool{}
+	for _, r := range rows {
+		if r.String("observer") == host {
+			continue
+		}
+		if r.Int("consecutive_failures") == 0 || r.String("status") == health.StatusUnready {
+			answered[r.String("observer")] = true
+		}
+	}
+	for _, set := range sets {
+		if len(set) == 0 {
+			continue
+		}
+		var live []string
+		for v := range set {
+			if v == host || answered[v] {
+				live = append(live, v)
+			}
+		}
+		if len(live) >= len(set)/2+1 {
+			sort.Strings(live)
+			return fmt.Sprintf("voters %s last saw the host answer, %d of %d counting itself: it may hold its majority",
+				strings.Join(live, ","), len(live), len(set)), false
+		}
+	}
+	return "", true
+}
+
+// pauseVoterSets is every voter set host's pauser may be counting its
+// majority over, from this node's replica: the set this cycle decides on
+// (c.scope.voters, host's region's under region scope) and each newer
+// generation with members that this node has not adopted yet (§4.4 counts a
+// change mid-way the same way). Checking the host's count against each can
+// only refuse more. explicit is false while the voter set is derived.
+func (c *Coordinator) pauseVoterSets(ctx context.Context, host string) (sets []map[string]bool, explicit bool, err error) {
+	adopted, err := corrosion.AdoptedVoterConfig(ctx, c.db)
+	if err != nil || !adopted.Explicit() {
+		return nil, false, err
+	}
+	cfgs, err := corrosion.ListVoterConfigs(ctx, c.db)
+	if err != nil {
+		return nil, false, err
+	}
+	sets = []map[string]bool{c.scope.voters(host)}
+	for _, cfg := range cfgs {
+		if cfg == nil || cfg.Generation <= adopted.Generation || !cfg.Explicit() {
+			continue
+		}
+		set := map[string]bool{}
+		for _, m := range cfg.Members {
+			if !c.scope.region || c.scope.regionOf(m.Name) == c.scope.regionOf(host) {
+				set[m.Name] = true
+			}
+		}
+		sets = append(sets, set)
+	}
+	return sets, true, nil
 }
 
 // ── one-way partitions (docs/design/partition-pause.md §7 F4) ──────────────

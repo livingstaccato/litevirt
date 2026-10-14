@@ -2841,13 +2841,17 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// Probe every other active host with a local-only flag (so the peer does
 		// NOT proxy back / re-search), each with a bounded timeout so an
 		// unreachable peer can't stall the delete.
-		hosts, _ := corrosion.ListHosts(ctx, s.db)
+		hosts, herr := corrosion.ListHosts(ctx, s.db)
+		// everyPeerSaidNo: every active peer answered that it has no such
+		// domain — what lets the cleanup below free this host's own disks.
+		everyPeerSaidNo := herr == nil
 		for _, h := range hosts {
 			if h.Name == s.hostName || h.State != "active" {
 				continue
 			}
 			client, conn, peerErr := s.peerClient(ctx, h.Name)
 			if peerErr != nil {
+				everyPeerSaidNo = false
 				continue
 			}
 			probeCtx, cancel := context.WithTimeout(
@@ -2860,6 +2864,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 				forwardKeptImages(ctx, phdr)
 				slog.Info("DeleteVM: domain found and deleted on peer", "vm", req.Name, "peer", h.Name)
 				return &emptypb.Empty{}, nil
+			}
+			if status.Code(peerErr) == codes.FailedPrecondition {
+				// The peer has the domain and refused its delete: the
+				// record is the only handle on that VM, and stays.
+				return nil, peerErr
+			}
+			if status.Code(peerErr) != codes.NotFound {
+				everyPeerSaidNo = false
 			}
 			// NotFound/unreachable on this peer — keep trying.
 		}
@@ -2885,6 +2897,27 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// class the local FIX-21/22 release guards against, one host over).
 		if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
 			return nil, err
+		}
+		// The VM's own disks on this host go with it, as a delete of a VM
+		// whose domain is here frees them — among them those an earlier
+		// attempt of this delete could not free after it had undefined the
+		// domain (lab 2 F-5), and those of a VM no domain was defined for
+		// (a stopped VM placed here by a failover). Only when the row is this
+		// host's and every active peer said it has no such domain, and only
+		// files on this host's own storage: a disk on storage other hosts
+		// share may be in use where this host cannot see. A disk not freed
+		// fails the delete, and the record stays.
+		if !req.KeepDisks && vm.HostName == s.hostName && everyPeerSaidNo {
+			kept, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) bool {
+				return d.HostName == s.hostName && !corrosion.DiskOnSharedStorage(ctx, s.db, *d, s.hostName)
+			})
+			setKeptHeader(ctx, kept)
+			if leftovers = stillLeft(leftovers); len(leftovers) > 0 {
+				err := diskLeftoversError(req.Name, leftovers)
+				slog.Error("DeleteVM: disks of a VM with no domain not removed; keeping its record", "vm", req.Name, "error", err)
+				s.audit(ctx, "vm.delete", req.Name, "disks not removed: "+err.Error(), "error")
+				return nil, err
+			}
 		}
 		// Give the addresses back BEFORE the row goes. The lease outlives the VM
 		// row, and once the row is gone the sweeper's live-lease veto — correct,
@@ -2947,6 +2980,13 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// committed live. One that cannot be verified refuses the delete.
 	if err := s.settleKeptPITOverlays(ctx, vm, req.KeepDisks); err != nil {
 		return nil, err
+	}
+	// A disk whose use by another VM cannot be told would be kept, with the
+	// VM reported deleted (lab 2 F-5): refused now, with nothing changed.
+	if !req.KeepDisks {
+		if err := s.preflightDiskRemoval(ctx, req.Name); err != nil {
+			return nil, probeRefusal(localOnly, err)
+		}
 	}
 
 	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
@@ -3078,11 +3118,15 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
 	// (driver-dispatched, so non-default pools and block backends are released)
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
+	var diskLeftovers []diskLeftover
 	if !req.KeepDisks {
 		// The VM is deleted even when a disk is not freed (a ceph image a
 		// client still has open), as on main; each image left in its pool is
-		// named in the response and by ceph_image_leftover.
-		setKeptHeader(ctx, s.deleteRecordedVMDiskVolumes(ctx, req.Name))
+		// named in the response and by ceph_image_leftover. Any other disk
+		// not freed fails the delete below, before the record goes.
+		var kept []KeptCephImage
+		kept, diskLeftovers = s.freeRecordedVMDisks(ctx, req.Name, nil)
+		setKeptHeader(ctx, kept)
 		s.sweepVMDiskDebris(ctx, req.Name)
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
@@ -3102,6 +3146,14 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
 			slog.Warn("failed to write retained-firmware marker", "vm", req.Name, "error", err)
 		}
+	}
+	// A disk the delete set out to free and did not: the record stays, the
+	// cluster's only handle on it, and a retry frees it (lab 2 F-5).
+	if diskLeftovers = stillLeft(diskLeftovers); len(diskLeftovers) > 0 {
+		err := diskLeftoversError(req.Name, diskLeftovers)
+		slog.Error("DeleteVM: disks not removed; keeping the VM record", "vm", req.Name, "error", err)
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "disks not removed: "+err.Error())
+		return nil, probeRefusal(localOnly, err)
 	}
 
 	// The owner-epoch marker goes UNCONDITIONALLY, --keep-disks included: that

@@ -24,8 +24,9 @@ import (
 //
 // EnsureBridge now records the bridges it created, and Deprovision removes a
 // bridge only when that record says litevirt made it, nothing is plugged into
-// it, it carries no address, and no live network still names it. An operator's
-// bridge — one litevirt found already there — is never removed.
+// it, it carries no address, no live network still names it, and no VM or
+// container on this host has a NIC on it. An operator's bridge — one litevirt
+// found already there — is never removed.
 func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 	type env struct {
 		db      *corrosion.Client
@@ -170,6 +171,169 @@ func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 		if got := strings.Join(e.deleted(), ","); got != br {
 			t.Fatalf("ip link del issued for %q, want %q", got, br)
 		}
+	})
+
+	// A workload on this host whose NIC attaches to the bridge keeps it, even
+	// with no port on it: a stopped VM has no tap, and a VM start does not
+	// re-create its bridge, so removing it would leave the VM unable to start.
+	seedVM := func(t *testing.T, e env, vm, host, netName string) {
+		t.Helper()
+		if err := corrosion.InsertVM(ctx, e.db, corrosion.VMRecord{Name: vm, HostName: host, State: "stopped", Spec: "{}"},
+			[]corrosion.InterfaceRecord{{VMName: vm, NetworkName: netName, Ordinal: 0, MAC: "52:54:00:00:00:01"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedCT := func(t *testing.T, e env, ct, spec string) {
+		t.Helper()
+		if err := corrosion.UpsertContainer(ctx, e.db, corrosion.ContainerRecord{
+			HostName: "h", Name: ct, State: "stopped", CreateSpec: spec,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	created := func(t *testing.T, e env) {
+		t.Helper()
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+	}
+	kept := func(t *testing.T, e env, why string) {
+		t.Helper()
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("ip link del issued for %v while %s", got, why)
+		}
+		if _, err := os.Stat(filepath.Join(createdBridgeDir, br)); err != nil {
+			t.Errorf("the created-bridge record was dropped while the bridge stayed: %v", err)
+		}
+	}
+	removed := func(t *testing.T, e env, why string) {
+		t.Helper()
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := strings.Join(e.deleted(), ","); got != br {
+			t.Fatalf("ip link del issued for %q, want %q: %s", got, br, why)
+		}
+	}
+
+	t.Run("a stopped VM on this host on the deleted network (rm --force): kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		seedVM(t, e, "vm1", "h", "nr")
+		kept(t, e, "a stopped VM on this host is on the network")
+	})
+
+	t.Run("a stopped VM on this host whose NIC names the bridge itself: kept", func(t *testing.T) {
+		// `lv create --network <bridge>`: the NIC row names the bridge, not
+		// the network, and the VM's domain keeps that bridge.
+		e := setup(t, "")
+		created(t, e)
+		seedVM(t, e, "vm1", "h", br)
+		kept(t, e, "a stopped VM on this host names the bridge")
+	})
+
+	t.Run("a VM whose typed NIC (vm_nics) names the bridge: kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		if err := corrosion.InsertVM(ctx, e.db, corrosion.VMRecord{Name: "vm1", HostName: "h", State: "stopped", Spec: "{}"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.Execute(ctx,
+			`INSERT INTO vm_nics (vm_name, id, network_name, mac, ordinal, updated_at)
+			 VALUES ('vm1', 'n0', ?, '52:54:00:00:00:02', 0, '2026-01-01T00:00:00Z')`, br); err != nil {
+			t.Fatal(err)
+		}
+		kept(t, e, "a VM on this host has a typed NIC on the bridge")
+	})
+
+	t.Run("a VM on another deleted network whose device is the bridge: kept", func(t *testing.T) {
+		// Network "old" (also on the bridge) was deleted with --force; its VM
+		// is still defined against the bridge.
+		e := setup(t, "")
+		created(t, e)
+		if err := corrosion.UpsertNetwork(ctx, e.db, corrosion.NetworkRecord{
+			Name: "old", Type: "bridge", Config: `{"interface":"` + br + `"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteNetwork(ctx, e.db, "old"); err != nil {
+			t.Fatal(err)
+		}
+		seedVM(t, e, "vm1", "h", "old")
+		kept(t, e, "a VM on this host is on a deleted network on the same bridge")
+	})
+
+	t.Run("a container on this host with an interface row on the network: kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		seedCT(t, e, "ct1", "")
+		if err := corrosion.UpsertContainerInterface(ctx, e.db, corrosion.ContainerInterfaceRecord{
+			HostName: "h", CtName: "ct1", NetworkName: "nr", Ordinal: 0, MAC: "52:54:00:00:00:03",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		kept(t, e, "a container on this host is on the network")
+	})
+
+	t.Run("a stopped container on this host with a raw bridge NIC on it: kept", func(t *testing.T) {
+		// A raw `bridge=` NIC has no interface row; only the create spec has it.
+		e := setup(t, "")
+		created(t, e)
+		seedCT(t, e, "ct1", `{"networks":[{"name":"eth0","bridge":"`+br+`"}]}`)
+		kept(t, e, "a container on this host has a raw bridge NIC on it")
+	})
+
+	t.Run("a container whose create spec cannot be read: kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		seedCT(t, e, "ct1", `{"networks":[`)
+		kept(t, e, "this host's container NICs could not be read")
+	})
+
+	t.Run("a VM on a network whose config cannot be read: kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		if err := corrosion.UpsertNetwork(ctx, e.db, corrosion.NetworkRecord{
+			Name: "odd", Type: "bridge", Config: `{"interface":`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteNetwork(ctx, e.db, "odd"); err != nil {
+			t.Fatal(err)
+		}
+		seedVM(t, e, "vm1", "h", "odd")
+		kept(t, e, "the device of a network a VM here is on could not be read")
+	})
+
+	t.Run("the workload tables cannot be read: kept", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		if err := e.db.Execute(ctx, `DROP TABLE container_interfaces`); err != nil {
+			t.Fatal(err)
+		}
+		kept(t, e, "this host's workload NICs could not be read")
+	})
+
+	t.Run("a VM on another host on the network: removed here", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		seedVM(t, e, "vm1", "other", "nr")
+		removed(t, e, "a VM on another host kept this host's bridge")
+	})
+
+	t.Run("a deleted VM on this host, and an unrelated container: removed", func(t *testing.T) {
+		e := setup(t, "")
+		created(t, e)
+		seedVM(t, e, "vm1", "h", br)
+		if err := corrosion.DeleteVM(ctx, e.db, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		seedCT(t, e, "ct1", `{"networks":[{"name":"eth0","bridge":"lvtother0"}]}`)
+		removed(t, e, "a deleted VM or a container on another bridge kept it")
 	})
 
 	recordGone := func(t *testing.T) {

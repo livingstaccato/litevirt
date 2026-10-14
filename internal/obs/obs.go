@@ -385,6 +385,13 @@ func Setup(ctx context.Context, cfg Config) (func(context.Context) error, error)
 		setEnvDefault("PROVIDE_LOG_SANITIZE", "false")
 	}
 
+	// provide-telemetry 0.9+ defaults PROVIDE_LOG_INCLUDE_CALLER to true, adding
+	// filename= and lineno= to every record. Off here: the stdlib log bridge
+	// would report its own adapter frame rather than the real caller, and every
+	// journald line would grow. An operator can opt in with
+	// PROVIDE_LOG_INCLUDE_CALLER=true.
+	setEnvDefault("PROVIDE_LOG_INCLUDE_CALLER", "false")
+
 	_, err := telemetry.SetupTelemetry(setupOpts...)
 	// SetupTelemetry has now read the OTLP auth headers into the built exporters,
 	// so the header env vars are no longer needed. Scrub them from the process

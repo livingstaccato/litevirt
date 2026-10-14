@@ -289,10 +289,24 @@ func (s *Server) cancelHeldStart(ctx context.Context, name string, f *startFligh
 	if stopNoopKeepsRow[prevState] {
 		state, detail = prevState, prevDetail
 	}
+	now := time.Now()
+	if state == "stopped" {
+		// The duty to undo the start outlives this daemon (a restart
+		// before libvirt answers): recorded on this host first, and the
+		// cancel is not made when it cannot be (cancelled_starts.go). A
+		// row left error needs none: the reconciler records a running
+		// domain under an error row as running.
+		if err := s.recordCancelledStart(name, f.since, now); err != nil {
+			return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the cancel on this host failed: %v", name, err)
+		}
+	}
 	if err := s.persistVMState(ctx, name, state, detail, corrosion.OpVMState); err != nil {
+		if state == "stopped" {
+			s.dropCancelledStart(name)
+		}
 		return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the stop failed: %v", name, err)
 	}
-	f.cancelled = time.Now()
+	f.cancelled = now
 	ev := fmt.Sprintf("start cancelled: libvirt had not answered the start asked for at %s; when it answers, a domain it started is destroyed",
 		f.since.UTC().Format(time.RFC3339))
 	if state != "stopped" {
@@ -328,6 +342,9 @@ func (s *Server) heldStartAlreadyCancelled(ctx context.Context, name string, f *
 // The caller holds the VM lock.
 func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.VMRecord, startErr error,
 	releasePreflight func(), pbVM *pb.VM, hspec *pb.HooksSpec, since, cancelled time.Time) {
+	// Handled here, whatever the outcome: the durable record of the cancel
+	// is no longer needed (cancelled_starts.go).
+	defer s.dropCancelledStart(vm.Name)
 	asked := since.UTC().Format(time.RFC3339)
 	running := func() bool {
 		st, err := s.virt.DomainState(vm.Name)

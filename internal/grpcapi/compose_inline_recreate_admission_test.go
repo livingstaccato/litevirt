@@ -220,3 +220,39 @@ func TestComposeInlineRecreate_OnALUNTheGuardPreflightIsARecreates(t *testing.T)
 		t.Fatal("the VM is gone")
 	}
 }
+
+// An inline re-create of a VM on an iSCSI LUN whose create fails after the
+// teardown says the VM was torn down and where its spec was kept, as the
+// rolling path does, and still carries the LUN recovery hint. A failure that
+// named neither left the operator with the create's bare error and a VM gone.
+//
+// Mutation: the LUN branch of recreateInline appends only lunRecoveryHint — red.
+func TestComposeInlineRecreate_OnALUNAFailedCreateSaysTheVMWasTornDown(t *testing.T) {
+	s := lunTestServer(t)
+	s.dataDir = t.TempDir()
+	ctx := context.Background()
+	if _, err := s.CreateVM(adminCtx(), lunVM("web", "lun0")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Another VM of the name appears between the delete and the create.
+	s.recreateTornDown = func(name string) {
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: name, HostName: s.hostName, State: "stopped",
+			Spec: `{"name":"web","uuid":"7e1f0c2d-3b4a-4c5d-8e6f-9a0b1c2d3e4f"}`,
+		}, nil, nil); err != nil {
+			t.Errorf("insert another web: %v", err)
+		}
+	}
+	spec := lunVM("web", "lun0").Spec
+	a := planner.VMAction{Kind: planner.OpUpdate, VMName: "web", TargetHost: s.hostName, Spec: spec}
+	f := &compose.File{Name: "st"}
+	err := s.recreateInline(deployerCtx(t, s), a, f, newDependsOnGate(s, f, []planner.VMAction{a}, nil))
+	if err == nil {
+		t.Fatal("the re-create succeeded over another VM of the same name")
+	}
+	for _, want := range []string{"torn down on " + s.hostName, "spec is kept", "iSCSI LUNs"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+}

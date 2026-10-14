@@ -1015,7 +1015,8 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	// course. Only a row that links to a row of its own host, one seq before
 	// it, is part of a chain; one whose stored prev_hash names no such row
 	// lost its predecessor — deleted inside the seq range the other chain
-	// covers, where no seq jump shows it — and is an orphan.
+	// covers, where no seq jump shows it — or was relinked to a row at another
+	// seq, and is an orphan.
 	for _, u := range unlinked {
 		if !forkedHost[u.host] {
 			res.UnlinkedOutsideForks++
@@ -1036,7 +1037,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		case u.seq == 0:
 			why = fmt.Sprintf("which is the hash of no row of %s — a seq-0 row whose predecessor is gone", u.host)
 		default:
-			why = fmt.Sprintf("which is the hash of no row of %s at seq %d — the row before it was deleted", u.host, u.seq-1)
+			why = fmt.Sprintf("which is the hash of no row of %s at seq %d — the row before it was deleted (or rewritten)", u.host, u.seq-1)
 		}
 		res.Orphans = append(res.Orphans, fmt.Sprintf("%s: row %s (seq %d) follows prev_hash %s, %s",
 			u.host, u.id, u.seq, u.prev, why))

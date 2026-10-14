@@ -291,7 +291,7 @@ func TestVerifyAuditChain_NamesWhatKindOfBreak(t *testing.T) {
 			t.Errorf("orphans %v, want r3 named", res.Orphans)
 		}
 		// Re-review 3 m-2: no row of node-3 has r3's prev_hash, so it reads as a deletion.
-		if got := strings.Join(res.Orphans, "\n"); !strings.Contains(got, "is the hash of no row of node-3 at seq 2 — the row before it was deleted") {
+		if got := strings.Join(res.Orphans, "\n"); !strings.Contains(got, "is the hash of no row of node-3 at seq 2 — the row before it was deleted (or rewritten)") {
 			t.Errorf("orphans %v, want r3's predecessor reported deleted", res.Orphans)
 		}
 	})

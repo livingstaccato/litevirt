@@ -181,11 +181,12 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		return true
 	}
 	delete(c.pauseWaits, host)
-	why, only, ok, bridged := c.selfPauseStillStands(ctx, h, w.fenceAt)
-	if !ok {
-		c.refusePauseWait(ctx, h, w, why, bridged)
+	v := c.selfPauseStillStands(ctx, h, w.fenceAt)
+	if !v.ok {
+		c.refusePauseWait(ctx, h, w, v)
 		return false
 	}
+	only := v.only
 	// The deadline went ahead: whatever its limit leaves on the host is named
 	// by the stall alert (unpausedHeld), not as a bridged hold.
 	c.resolveBridged(ctx, host, "the partition-pause deadline went ahead")
@@ -208,22 +209,55 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // the deadline, would otherwise leave the paused workloads running nowhere
 // until the lease moved. The stall alert names the refusal and its reason. A
 // bridged refusal (selfPauseStillStands) also raises ha.recovery.bridged,
-// once per change of reason rather than on every re-check.
-func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostRecord, w pauseWait, why string, bridged bool) {
+// and one that is no longer bridged resolves it, once per change of the
+// refusal's kind (pauseVerdict.key) rather than on every re-check.
+func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostRecord, w pauseWait, v pauseVerdict) {
 	host := h.Name
 	level := slog.LevelWarn
-	if w.refused == why {
+	switch {
+	case w.refused == v.key:
 		level = slog.LevelDebug // the same refusal, re-checked every cycle
-	} else if bridged {
-		c.noteBridgedStall(ctx, h, w.fenceAt, why)
+	case v.bridged:
+		c.noteBridgedStall(ctx, h, v.observers, v.why)
+	default:
+		c.resolveBridged(ctx, host, "the deadline's refusal is no longer a bridge: "+v.why)
 	}
-	w.refused = why
+	w.refused = v.key
 	c.pauseWaits[host] = w
 	slog.Log(ctx, level, "failover: partition-pause deadline passed, but the host may not have paused or has come back; recovering nothing, re-checking every cycle",
-		"host", host, "why", why)
-	c.noteHold(host, "recovery refused at the partition-pause deadline ("+why+"); re-checked every cycle, "+
+		"host", host, "why", v.why)
+	c.noteHold(host, "recovery refused at the partition-pause deadline ("+v.why+"); re-checked every cycle, "+
 		"or 'lv host fence-confirm "+host+"' once it is off")
 }
+
+// pauseVerdict is selfPauseStillStands' answer at a self-pause deadline.
+type pauseVerdict struct {
+	// ok: the deadline goes ahead, recovering only (nil: everything).
+	ok   bool
+	only map[string]bool
+	// why the deadline refused, for the log and the stall alert.
+	why string
+	// key is the kind of refusal: why without the observers it names, which
+	// change with each observer's verdict. A refusal is logged at Warn, and
+	// ha.recovery.bridged raised or resolved, only when its key changes.
+	key string
+	// bridged: the refusal rests only on observers having seen the host
+	// answer since the fence, with no voter majority among them; observers
+	// names them, sorted.
+	bridged   bool
+	observers []string
+}
+
+// refused is a refusal whose reason names no observer.
+func refused(why string) pauseVerdict { return pauseVerdict{why: why, key: why} }
+
+// keyAnswered is the key of a refusal on observers having seen the host
+// answer since the fence (whyAnswered), and keyVoterMajority of one on a
+// voter majority having seen it answer (answeredByAVoterMajority).
+const (
+	keyAnswered      = "observers saw the host answer after the fence"
+	keyVoterMajority = "a voter majority last saw the host answer: it may hold its majority"
+)
 
 // selfPauseStillStands is fenceStillStands for a self-pause fence at its
 // deadline (docs/design/partition-pause.md §4.2 step 3).
@@ -265,60 +299,87 @@ func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostReco
 //
 // bridged reports a refusal that rests only on observers having seen the host
 // answer since the fence, with no voter majority among them: the stall a host
-// reaching both halves of a split causes (ha.recovery.bridged); a read error
-// of host_health is not one. It changes no decision.
-func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (why string, only map[string]bool, ok, bridged bool) {
+// reaching both halves of a split causes (ha.recovery.bridged). A read error,
+// of host_health or of the host's condition, is not one. It changes no
+// decision.
+//
+// host_health about h is read once, and every check here is made over that
+// one read.
+func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) pauseVerdict {
+	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
-		why, only, ok, _ = c.quietFallback(ctx, h.Name, at)
-		return why, only, ok, false
+		v := c.quietFallback(ctx, hr, h.Name, at)
+		v.bridged, v.observers = false, nil
+		return v
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if err != nil {
 		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return "voter set unreadable", nil, false, false
+		return refused("voter set unreadable")
 	}
 	if !explicit {
-		return c.quietFallback(ctx, h.Name, at)
+		return c.quietFallback(ctx, hr, h.Name, at)
 	}
-	if !c.observerStreakSpans(ctx, h.Name, at) {
-		return whyNoStreakSpans, nil, false, false
+	if hr.err != nil {
+		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", h.Name, "error", hr.err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return refused(whyHealthUnreadable)
 	}
-	if why, ok := c.answeredByAVoterMajority(ctx, h.Name, sets); !ok {
-		return why, nil, false, false
+	if !c.streakSpansIn(hr, h.Name, at) {
+		return refused(whyNoStreakSpans)
 	}
-	answered, quiet := c.answeredSince(ctx, h.Name, at)
+	if why, ok := c.answeredByAVoterMajorityIn(hr, h.Name, sets); !ok {
+		v := refused(why)
+		if strings.HasPrefix(why, "voters ") {
+			v.key = keyVoterMajority
+		}
+		return v
+	}
+	answered, observers, quiet := c.answeredSinceIn(hr, h.Name, at)
 	if quiet {
-		why, only, ok = c.pausedThisOutage(ctx, h.Name, at, sets)
-		return why, only, ok, false
+		why, only, ok := c.pausedThisOutageIn(ctx, hr, h.Name, at, sets)
+		if !ok {
+			return refused(why)
+		}
+		return pauseVerdict{ok: true, only: only}
 	}
-	if answered == whyHealthUnreadable {
-		return answered, nil, false, false
+	paused, reason, ok := c.hostReportsItsPauseIn(ctx, hr, h.Name, at, sets)
+	switch {
+	case ok:
+		return pauseVerdict{ok: true, only: paused}
+	case reason == whyPausedUnreadable:
+		// A store error, not a bridge: named on its own.
+		return refused(whyPausedUnreadable)
 	}
-	paused, reason, ok := c.hostReportsItsPause(ctx, h.Name, at, sets)
-	if !ok {
-		return answered + ", and " + reason, nil, false, true
-	}
-	return "", paused, true, false
+	return pauseVerdict{why: answered + ", and " + reason, key: keyAnswered + ", and " + reason,
+		bridged: true, observers: observers}
 }
 
 // quietFallback is fenceStillStands, for a deadline that keeps its rule
-// (selfPauseStillStands). When it holds and this coordinator already limits
-// the host's recovery from earlier in the down-episode, the host's own word
-// still bounds what moves: pausedThisOutage, dating the outage over the voter
-// set this cycle decides on. answered reports a refusal on an observer having
-// seen the host answer since the fence (not a read error): the bridged form
-// selfPauseStillStands reports.
-func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Time) (why string, only map[string]bool, ok, answered bool) {
-	why, ok = c.fenceStillStands(ctx, host, at)
+// (selfPauseStillStands), over host_health rows already read. When it holds
+// and this coordinator already limits the host's recovery from earlier in the
+// down-episode, the host's own word still bounds what moves:
+// pausedThisOutage, dating the outage over the voter set this cycle decides
+// on. A refusal on observers having seen the host answer since the fence
+// (not a read error) is reported bridged: the form selfPauseStillStands
+// raises on a derived voter set.
+func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time) pauseVerdict {
+	why, observers, ok := c.fenceStillStandsIn(hr, host, at)
 	if !ok {
-		return why, nil, false, why != whyNoStreakSpans && why != whyHealthUnreadable
+		if len(observers) > 0 {
+			return pauseVerdict{why: why, key: keyAnswered, bridged: true, observers: observers}
+		}
+		return refused(why)
 	}
 	if c.recoverOnly[host] == nil {
-		return why, nil, true, false
+		return pauseVerdict{ok: true}
 	}
-	why, only, ok = c.pausedThisOutage(ctx, host, at, []map[string]bool{c.scope.voters(host)})
-	return why, only, ok, false
+	why, only, ok := c.pausedThisOutageIn(ctx, hr, host, at, []map[string]bool{c.scope.voters(host)})
+	if !ok {
+		return refused(why)
+	}
+	return pauseVerdict{ok: true, only: only}
 }
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen
@@ -330,7 +391,12 @@ func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Ti
 // everything moves, as without a bridge. A read error, of the condition or
 // of the voters' runs that date the outage, refuses.
 func (c *Coordinator) pausedThisOutage(ctx context.Context, host string, at time.Time, sets []map[string]bool) (string, map[string]bool, bool) {
-	paused, reason, ok := c.hostReportsItsPause(ctx, host, at, sets)
+	return c.pausedThisOutageIn(ctx, c.readHostHealth(ctx, host), host, at, sets)
+}
+
+// pausedThisOutageIn is pausedThisOutage over host_health rows already read.
+func (c *Coordinator) pausedThisOutageIn(ctx context.Context, hr healthRead, host string, at time.Time, sets []map[string]bool) (string, map[string]bool, bool) {
+	paused, reason, ok := c.hostReportsItsPauseIn(ctx, hr, host, at, sets)
 	switch {
 	case ok:
 		return "", paused, true
@@ -354,6 +420,12 @@ const whyPausedUnreadable = "its partition_paused condition is unreadable"
 // majority, which can be well before a coordinator decides, as when the lease
 // first had to move. It fails closed.
 func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at time.Time, sets []map[string]bool) (map[string]bool, string, bool) {
+	return c.hostReportsItsPauseIn(ctx, c.readHostHealth(ctx, host), host, at, sets)
+}
+
+// hostReportsItsPauseIn is hostReportsItsPause, dating the outage over
+// host_health rows already read.
+func (c *Coordinator) hostReportsItsPauseIn(ctx context.Context, hr healthRead, host string, at time.Time, sets []map[string]bool) (map[string]bool, string, bool) {
 	cond, ok, err := corrosion.GetHealthCondition(ctx, c.db, corrosion.PartitionPauseEvaluator,
 		corrosion.CondPartitionPaused, "host", host)
 	if err != nil {
@@ -370,7 +442,7 @@ func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at t
 	if err := json.Unmarshal([]byte(cond.Evidence), &ev); err != nil || len(ev.Paused) == 0 {
 		return nil, "its partition_paused condition names no paused workload", false
 	}
-	start, ok, err := c.outageStart(ctx, host, at, sets)
+	start, ok, err := c.outageStartIn(hr, host, at, sets)
 	if err != nil {
 		slog.Warn("failover: host_health read dating a partition-pause outage failed", "host", host, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
@@ -401,15 +473,20 @@ func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at t
 // With several sets it is the latest of their answers. ok is false when any
 // set has fewer such runs than that; a read error is returned as err.
 func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time, sets []map[string]bool) (time.Time, bool, error) {
-	rows, err := c.db.Query(ctx,
-		`SELECT observer, consecutive_failures, last_seen, updated_at FROM host_health
-		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
-	if err != nil {
-		return time.Time{}, false, err
+	return c.outageStartIn(c.readHostHealth(ctx, host), host, at, sets)
+}
+
+// outageStartIn is outageStart over host_health rows already read.
+func (c *Coordinator) outageStartIn(hr healthRead, host string, at time.Time, sets []map[string]bool) (time.Time, bool, error) {
+	if hr.err != nil {
+		return time.Time{}, false, hr.err
 	}
 	freshCutoff := c.now().Add(-healthFreshness)
 	runs := map[string]time.Time{}
-	for _, r := range rows {
+	for _, r := range hr.rows {
+		if r.String("status") == health.StatusUnready {
+			continue
+		}
 		n := r.Int("consecutive_failures")
 		if n < offlineThreshold {
 			continue
@@ -450,15 +527,19 @@ func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time
 // a majority of any of sets. An empty set, or none, refuses. It fails closed
 // on a read error.
 func (c *Coordinator) answeredByAVoterMajority(ctx context.Context, host string, sets []map[string]bool) (string, bool) {
-	rows, err := c.db.Query(ctx,
-		`SELECT observer, status, consecutive_failures FROM host_health WHERE target = ?`, host)
-	if err != nil {
-		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", host, "error", err)
+	return c.answeredByAVoterMajorityIn(c.readHostHealth(ctx, host), host, sets)
+}
+
+// answeredByAVoterMajorityIn is answeredByAVoterMajority over host_health
+// rows already read.
+func (c *Coordinator) answeredByAVoterMajorityIn(hr healthRead, host string, sets []map[string]bool) (string, bool) {
+	if hr.err != nil {
+		slog.Warn("failover: host_health read for a partition-pause deadline failed", "host", host, "error", hr.err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return whyHealthUnreadable, false
 	}
 	answered := map[string]bool{}
-	for _, r := range rows {
+	for _, r := range hr.rows {
 		if r.String("observer") == host {
 			continue
 		}

@@ -2284,10 +2284,61 @@ const fenceSkewMargin = 5 * time.Second
 //     answered a probe after a verified power-off was powered on again, and a
 //     host that answered after a best-effort one was never off.
 func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time.Time) (string, bool) {
-	if !c.observerStreakSpans(ctx, host, at) {
-		return whyNoStreakSpans, false
+	why, _, ok := c.fenceStillStandsIn(c.readHostHealth(ctx, host), host, at)
+	return why, ok
+}
+
+// fenceStillStandsIn is fenceStillStands over host_health rows already read,
+// also naming the observers that saw host answer since the fence, sorted.
+func (c *Coordinator) fenceStillStandsIn(hr healthRead, host string, at time.Time) (string, []string, bool) {
+	if !c.streakSpansIn(hr, host, at) {
+		return whyNoStreakSpans, nil, false
 	}
-	return c.answeredSince(ctx, host, at)
+	return c.answeredSinceIn(hr, host, at)
+}
+
+// healthRead is one read of host_health about a host (readHostHealth), the
+// rows every check of one decision about that host is made over.
+type healthRead struct {
+	rows []corrosion.Row
+	err  error
+}
+
+// readHostHealth reads every observer's latest verdict about host: observer,
+// status, consecutive_failures, last_seen and updated_at.
+func (c *Coordinator) readHostHealth(ctx context.Context, host string) healthRead {
+	rows, err := c.db.Query(ctx,
+		`SELECT observer, status, consecutive_failures, last_seen, updated_at FROM host_health WHERE target = ?`, host)
+	return healthRead{rows: rows, err: err}
+}
+
+// answeredSinceObserversIn names the observers whose latest verdict about
+// host, healthy or unready, is newer than at less fenceSkewMargin, sorted.
+// host itself is not one.
+func answeredSinceObserversIn(hr healthRead, host string, at time.Time) []string {
+	var out []string
+	for _, r := range hr.rows {
+		if r.String("observer") == host {
+			continue
+		}
+		if r.Int("consecutive_failures") != 0 && r.String("status") != health.StatusUnready {
+			continue
+		}
+		if upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && upd.After(at.Add(-fenceSkewMargin)) {
+			out = append(out, r.String("observer"))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// whyAnswered is the refusal reason naming the observers that saw the host
+// answer since the fence.
+func whyAnswered(observers []string) string {
+	if len(observers) == 1 {
+		return "observer " + observers[0] + " saw the host answer after the fence"
+	}
+	return "observers " + strings.Join(observers, ",") + " saw the host answer after the fence"
 }
 
 // whyNoStreakSpans is fenceStillStands' refusal reason when no observer's
@@ -2308,26 +2359,22 @@ const whyHealthUnreadable = "host_health unreadable"
 // whose clock runs ahead can delay a resume or a retry by at most its skew,
 // never cause one.
 func (c *Coordinator) answeredSince(ctx context.Context, host string, at time.Time) (string, bool) {
-	rows, err := c.db.Query(ctx,
-		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
-	if err != nil {
-		slog.Warn("failover: host_health read for a fence resume failed", "host", host, "error", err)
+	why, _, ok := c.answeredSinceIn(c.readHostHealth(ctx, host), host, at)
+	return why, ok
+}
+
+// answeredSinceIn is answeredSince over host_health rows already read, also
+// returning the observers it names.
+func (c *Coordinator) answeredSinceIn(hr healthRead, host string, at time.Time) (string, []string, bool) {
+	if hr.err != nil {
+		slog.Warn("failover: host_health read for a fence resume failed", "host", host, "error", hr.err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return whyHealthUnreadable, false
+		return whyHealthUnreadable, nil, false
 	}
-	for _, r := range rows {
-		if r.String("observer") == host {
-			continue
-		}
-		if r.Int("consecutive_failures") != 0 && r.String("status") != health.StatusUnready {
-			continue
-		}
-		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
-		if ok && upd.After(at.Add(-fenceSkewMargin)) {
-			return "observer " + r.String("observer") + " saw the host answer after the fence", false
-		}
+	if obs := answeredSinceObserversIn(hr, host, at); len(obs) > 0 {
+		return whyAnswered(obs), obs, false
 	}
-	return "", true
+	return "", nil, true
 }
 
 // refence fences h again before resuming its recovery from rec, an aged or
@@ -2645,16 +2692,21 @@ func (c *Coordinator) attemptIsThisOutage(ctx context.Context, host string, atte
 // so the older build's rows keep the estimate, and the first observer on this
 // build is enough: one spanning row answers the question.
 func (c *Coordinator) observerStreakSpans(ctx context.Context, host string, at time.Time) bool {
-	rows, err := c.db.Query(ctx,
-		`SELECT consecutive_failures, last_seen, updated_at FROM host_health
-		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
-	if err != nil {
-		slog.Warn("failover: host_health read for a fence's outage failed", "host", host, "error", err)
+	return c.streakSpansIn(c.readHostHealth(ctx, host), host, at)
+}
+
+// streakSpansIn is observerStreakSpans over host_health rows already read.
+func (c *Coordinator) streakSpansIn(hr healthRead, host string, at time.Time) bool {
+	if hr.err != nil {
+		slog.Warn("failover: host_health read for a fence's outage failed", "host", host, "error", hr.err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
 		return false
 	}
 	freshCutoff := c.now().Add(-healthFreshness)
-	for _, r := range rows {
+	for _, r := range hr.rows {
+		if r.String("status") == health.StatusUnready {
+			continue
+		}
 		n := r.Int("consecutive_failures")
 		if n < offlineThreshold {
 			continue

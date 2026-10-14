@@ -43,17 +43,19 @@ type bridgedEvidence struct {
 }
 
 // noteBridgedStall raises ha.recovery.bridged for h, whose recovery at the
-// deadline of a self-pause fence at `at` was refused for why (refusePauseWait,
-// on each change of reason; retryPauseWait resolves it once the deadline goes
-// ahead). A host with no
+// deadline of a self-pause fence was refused for why, observers having seen
+// it answer since the fence (refusePauseWait, on each change of the
+// refusal's kind; refusePauseWait resolves it once the refusal is no longer
+// bridged, retryPauseWait once the deadline goes ahead). A host with no
 // recoverable workload on it holds nothing back, and raises nothing.
-func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRecord, at time.Time, why string) {
+func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRecord, observers []string, why string) {
 	derived := c.derivedVoterSet(ctx)
-	set := "an adopted voter generation"
+	set := "an adopted voter generation, on which a host seen answering is recovered on its own report that it " +
+		"paused, raised during this outage; the reason above says which part of that is missing"
 	if derived {
 		set = "a derived voter set (no voter generation adopted), on which any observer that sees a self-paused host answer holds its recovery"
 	}
-	c.raiseBridged(ctx, h.Name, c.answeredSinceObservers(ctx, h.Name, at), derived,
+	c.raiseBridged(ctx, h.Name, observers, derived,
 		fmt.Sprintf("the partition-pause deadline of %s passed and its workloads were not recovered: %s. "+
 			"Observers outside the majority still see it answer, as a host reaching both halves of a split relays; "+
 			"the cluster is on %s. Nothing ran twice; the workloads stay paused on %s, and the deadline is re-checked every cycle",
@@ -242,31 +244,6 @@ func (c *Coordinator) resolveBridged(ctx context.Context, host, why string) {
 		return
 	}
 	slog.Info("failover: "+CondRecoveryBridged+" resolved", "host", host, "reason", why)
-}
-
-// answeredSinceObservers is every observer answeredSince would name: those
-// whose latest verdict about host, healthy or unready, is newer than `at`
-// less fenceSkewMargin. Sorted; nil on a read error.
-func (c *Coordinator) answeredSinceObservers(ctx context.Context, host string, at time.Time) []string {
-	rows, err := c.db.Query(ctx,
-		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, r := range rows {
-		if r.String("observer") == host {
-			continue
-		}
-		if r.Int("consecutive_failures") != 0 && r.String("status") != health.StatusUnready {
-			continue
-		}
-		if upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && upd.After(at.Add(-fenceSkewMargin)) {
-			out = append(out, r.String("observer"))
-		}
-	}
-	sort.Strings(out)
-	return out
 }
 
 // recoverableOn names the workloads on host a failover would move

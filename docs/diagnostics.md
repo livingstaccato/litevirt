@@ -1280,8 +1280,11 @@ is raised in one of two forms:
   wait passed, and its workloads were not recovered because observers had
   seen it answer since the fence. On a derived voter set (no generation
   adopted) any such observer holds the recovery; on an adopted generation it
-  is held while the host has not reported its pause. The deadline is
-  re-checked every cycle; the condition resolves when it goes ahead, and
+  is held while the host has not reported its pause. A store error reading
+  that report is not a bridge and raises nothing; the
+  `host.recovery.stalled` notification names it. The deadline is re-checked
+  every cycle; the condition resolves when it goes ahead, or when the refusal
+  is no longer a bridge (a voter majority sees the host answer), and
   workloads its limit leaves on the host are named by the
   `host.recovery.stalled` notification instead.
 - **Before any fence.** The host has kept `partition_paused` open for longer

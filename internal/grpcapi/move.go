@@ -1047,7 +1047,7 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 }
 
 // copyNoClobber converts src into a NEW file at dst: into a temp beside dst,
-// then placed with RENAME_NOREPLACE. An existing dst — a file, a symlink, a
+// then placed no-clobber (placeNoClobber). An existing dst — a file, a symlink, a
 // disk another VM uses — is refused with AlreadyExists, never written through,
 // and a failed copy leaves nothing at dst.
 func (s *Server) copyNoClobber(ctx context.Context, src *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) error {

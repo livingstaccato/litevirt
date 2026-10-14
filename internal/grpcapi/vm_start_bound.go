@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hooks"
 )
 
 // defaultStartDomainWait is how long `lv start` waits for libvirt to answer
@@ -290,20 +291,15 @@ func (s *Server) cancelHeldStart(ctx context.Context, name string, f *startFligh
 		state, detail = prevState, prevDetail
 	}
 	now := time.Now()
-	if state == "stopped" {
-		// The duty to undo the start outlives this daemon (a restart
-		// before libvirt answers): recorded on this host first, and the
-		// cancel is not made when it cannot be (cancelled_starts.go). A
-		// row left error needs none: the reconciler records a running
-		// domain under an error row as running.
-		if err := s.recordCancelledStart(name, f.since, now); err != nil {
-			return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the cancel on this host failed: %v", name, err)
-		}
+	// The duty to undo the start outlives this daemon (a restart before
+	// libvirt answers): recorded on this host first, for a row left error as
+	// for one written stopped, and the cancel is not made when it cannot be
+	// (cancelled_starts.go).
+	if err := s.recordCancelledStart(name, f.since, now, state); err != nil {
+		return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the cancel on this host failed: %v", name, err)
 	}
 	if err := s.persistVMState(ctx, name, state, detail, corrosion.OpVMState); err != nil {
-		if state == "stopped" {
-			s.dropCancelledStart(name)
-		}
+		s.dropCancelledStart(name)
 		return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the stop failed: %v", name, err)
 	}
 	f.cancelled = now
@@ -336,7 +332,8 @@ func (s *Server) heldStartAlreadyCancelled(ctx context.Context, name string, f *
 // cancelled while it had not answered (cancelHeldStart). A failed start is
 // recorded as one; the row already says what the cancel wrote. A start that
 // succeeded is stopped at once (a forced stop, as `lv stop --force` asked),
-// and recorded by that stop. If that stop cannot destroy the domain, the VM
+// and recorded by that stop; for a row the cancel left error, the domain is
+// destroyed and the row kept. If that stop cannot destroy the domain, the VM
 // runs: the row is written running, as libvirt says it is, and the failed
 // cancel is recorded, so the row never says stopped over a running domain.
 // The caller holds the VM lock.
@@ -362,7 +359,29 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 	if err == nil && fresh == nil {
 		err = fmt.Errorf("its row is gone")
 	}
-	if err == nil {
+	if err == nil && stopNoopKeepsRow[fresh.State] {
+		// The cancel left the row error, which holds the VM's set-aside disk
+		// copies: the domain is destroyed and the row kept, where a stop
+		// would write it stopped and end that hold.
+		stopHooks := vmHooks(fresh)
+		stopVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_STOPPING}
+		hooks.Run(ctx, hooks.PreStop, stopVM, stopHooks)
+		if err = s.virt.DestroyDomain(vm.Name); err == nil || !running() {
+			if !s.hardwareV2Latched(ctx) { // as a stop releases them (stopVMLockedNote)
+				if rerr := s.releaseDevices(ctx, vm.Name); rerr != nil {
+					slog.Warn("StopVM: a cancelled start's domain was destroyed; releasing its PCI devices failed", "vm", vm.Name, "error", rerr)
+				}
+			}
+			s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok",
+				fmt.Sprintf("start cancelled: libvirt answered the start asked for at %s late, and the domain it started was destroyed; the row is left %s, which holds its set-aside disk copies",
+					asked, fresh.State))
+			stopVM.State = pb.VMState_VM_STOPPED
+			hooks.Run(ctx, hooks.PostStop, stopVM, stopHooks)
+			slog.Info("StopVM: a cancelled start succeeded late; its domain was destroyed", "vm", vm.Name)
+			return
+		}
+		err = status.Errorf(codes.Internal, "destroy: %v", err)
+	} else if err == nil {
 		note := fmt.Sprintf("start cancelled: libvirt answered the start asked for at %s late, and the domain it started was destroyed", asked)
 		if _, err = s.stopVMLockedNote(ctx, fresh, true, 0, note); err == nil {
 			slog.Info("StopVM: a cancelled start succeeded late; its domain was destroyed", "vm", vm.Name)

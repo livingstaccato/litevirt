@@ -8,11 +8,18 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -26,18 +33,32 @@ import (
 //
 // The duty is therefore also kept on this host, in
 // <data_dir>/cancelled-starts.json, written durably before the cancel writes
-// the row. The start's own late answer removes the entry once it has handled
-// it. Otherwise sweepCancelledStarts — at daemon start and on each pass of
-// the host's background reconcile — carries it out: an entry whose VM's row
-// still says stopped by its operator, with its domain running here, has the
-// domain destroyed by a forced stop, recorded once; an entry whose domain is
-// seen shut off (or gone) once its start could no longer complete (the
-// held-start wait plus a margin after the record was made), or whose row
-// says anything else (the operator started the VM again, deleted it, or it
-// moved), is dropped and nothing is destroyed. A later start of the VM on
-// this host removes the entry before it starts the domain
-// (endCancelledStartForStart). The file is local: no replicated statement,
-// nothing for a peer of any version to read.
+// the row, for a row put back to stopped by its operator and for one put back
+// to error alike. The start's own late answer removes the entry once it has
+// handled it. Otherwise sweepCancelledStarts — on each pass of the host's
+// background reconcile — carries it out. An entry is kept until one of these
+// ends it:
+//   - its VM's row says anything but what the cancel wrote (stopped by its
+//     operator, or error), or is on another host, or is gone: the operator
+//     started it again, deleted it, or it moved; nothing is destroyed;
+//   - its domain runs here: libvirt started it late, and it is destroyed by
+//     a forced stop, recorded once, the row left as the cancel wrote it;
+//   - its domain was seen running and is now not: the start it cancelled
+//     has completed, so nothing of it is still pending;
+//   - its domain does not run and the host has booted since the entry was
+//     made (the kernel's boot ID differs): libvirt's queue of jobs does not
+//     survive a boot, so no start can still be pending for it.
+//
+// A held start has no upper bound on when libvirt answers it (a start queued
+// behind another job reads shut off for as long as it waits), so an entry is
+// never ended by its age. A restart of libvirtd alone would also end every
+// pending start, but nothing here tells reliably that it restarted, so it
+// does not end an entry. An entry kept costs a bounded look at its domain on
+// each pass.
+//
+// A later start of the VM on this host removes the entry before it starts the
+// domain (endCancelledStartForStart). The file is local: no replicated
+// statement, nothing for a peer of any version to read.
 const cancelledStartsFile = "cancelled-starts.json"
 
 // cancelledStartRecord is one entry of the file.
@@ -45,22 +66,56 @@ type cancelledStartRecord struct {
 	VM         string `json:"vm"`
 	StartAsked string `json:"start_asked"`
 	Cancelled  string `json:"cancelled"`
-	// Created is when the record was made (RFC 3339, nanoseconds): the
-	// start it cancelled could still complete until the held-start wait
-	// plus the margin after it (judgeCancelledStart).
+	// Created is when the record was made (RFC 3339, nanoseconds); it tells
+	// one record of a VM from a later one.
 	Created string `json:"created"`
+	// BootID is the host's boot ID when the record was made ("" when it
+	// could not be read): a domain shut off in a later boot has no start
+	// pending.
+	BootID string `json:"boot_id,omitempty"`
+	// Row is the row state the cancel wrote: "stopped" (stopped by its
+	// operator; also when empty) or "error".
+	Row string `json:"row,omitempty"`
 }
 
-// defaultCancelledStartMargin is added to the held-start wait to give the
-// window in which a cancelled start may still complete
-// (Server.cancelledStartMargin overrides it).
-const defaultCancelledStartMargin = time.Minute
-
-func (s *Server) cancelledStartMarginOrDefault() time.Duration {
-	if s.cancelledStartMargin > 0 {
-		return s.cancelledStartMargin
+// rowStillCancelled reports whether row still says what the cancel r
+// recorded wrote, on this host.
+func (s *Server) rowStillCancelled(r cancelledStartRecord, row *corrosion.VMRecord) bool {
+	if row == nil || row.HostName != s.hostName {
+		return false
 	}
-	return defaultCancelledStartMargin
+	if r.Row == "error" {
+		return row.State == "error"
+	}
+	return row.State == "stopped" && row.StateDetail == "operator-stop"
+}
+
+func (s *Server) readBootID() string {
+	read := s.bootID
+	if read == nil {
+		read = func() (string, error) {
+			b, err := os.ReadFile(kernelBootIDPath)
+			return strings.TrimSpace(string(b)), err
+		}
+	}
+	id, err := read()
+	if err != nil || !bootIDPattern.MatchString(id) {
+		return ""
+	}
+	return id
+}
+
+// kernelBootIDPath is where Linux publishes the current boot's ID, a random
+// UUID (bootIDPattern); anything of another form is not trusted.
+const kernelBootIDPath = "/proc/sys/kernel/random/boot_id"
+
+var bootIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// bootedSince reports whether the host has booted since r was made: both
+// boot IDs read, and they differ.
+func (s *Server) bootedSince(r cancelledStartRecord) bool {
+	cur := s.readBootID()
+	return cur != "" && bootIDPattern.MatchString(r.BootID) && r.BootID != cur
 }
 
 type cancelledStarts struct {
@@ -69,25 +124,37 @@ type cancelledStarts struct {
 	loadErr error
 	m       map[string]cancelledStartRecord
 	busy    map[string]bool
+	// ran holds, by VM, the Created of the record whose domain a judgement
+	// saw running: its start has completed.
+	ran map[string]string
+	// destroying holds the VMs whose domain a judgement asked libvirt to
+	// destroy and libvirt has not answered yet.
+	destroying map[string]bool
 }
 
 func (s *Server) cancelledStartsPath() string {
 	return filepath.Join(s.dataDir, cancelledStartsFile)
 }
 
-// cancelledStartsLocked returns the entries, reading the file once; mu is
-// held. A file that cannot be read is never written over (loadErr).
+// cancelledStartsLocked returns the entries, reading the file once it reads;
+// mu is held. A file that cannot be read is never written over (loadErr), and
+// is read again on the next call, so a file the operator fixes or removes
+// takes effect then.
 func (s *Server) cancelledStartsLocked() map[string]cancelledStartRecord {
 	c := &s.cancelledStarts
-	if c.loaded {
+	if c.loaded && c.loadErr == nil {
 		return c.m
 	}
-	c.loaded, c.m = true, map[string]cancelledStartRecord{}
+	prevErr := c.loadErr
+	c.loaded, c.loadErr, c.m = true, nil, map[string]cancelledStartRecord{}
 	if s.dataDir == "" {
 		return c.m
 	}
 	raw, err := os.ReadFile(s.cancelledStartsPath())
 	if errors.Is(err, os.ErrNotExist) {
+		if prevErr != nil {
+			slog.Info("StopVM: the record of cancelled starts is gone; starts can be cancelled again", "file", s.cancelledStartsPath())
+		}
 		return c.m
 	}
 	var list []cancelledStartRecord
@@ -96,9 +163,14 @@ func (s *Server) cancelledStartsLocked() map[string]cancelledStartRecord {
 	}
 	if err != nil {
 		c.loadErr = err
-		slog.Error("StopVM: the record of cancelled starts cannot be read; it is not written over, and no start can be cancelled until it reads. Fix or remove it",
-			"file", s.cancelledStartsPath(), "error", err)
+		if prevErr == nil || prevErr.Error() != err.Error() {
+			slog.Error("StopVM: the record of cancelled starts cannot be read; it is not written over, and no start can be cancelled until it reads. Fix or remove it",
+				"file", s.cancelledStartsPath(), "error", err)
+		}
 		return c.m
+	}
+	if prevErr != nil {
+		slog.Info("StopVM: the record of cancelled starts reads again", "file", s.cancelledStartsPath())
 	}
 	for _, r := range list {
 		c.m[r.VM] = r
@@ -128,15 +200,21 @@ func (s *Server) saveCancelledStartsLocked() error {
 }
 
 // recordCancelledStart records, durably, that the start of vm asked for at
-// asked was cancelled at cancelled. It fails when the record cannot be
-// written, and the cancel is then not made.
-func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time) error {
+// asked was cancelled at cancelled, the row put back to rowState ("stopped"
+// or "error"). It fails when the record cannot be written, and the cancel is
+// then not made.
+func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time, rowState string) error {
+	boot := s.readBootID()
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
 	m := s.cancelledStartsLocked()
 	prev, had := m[vm]
+	row := ""
+	if rowState == "error" {
+		row = "error"
+	}
 	m[vm] = cancelledStartRecord{VM: vm, StartAsked: asked.UTC().Format(time.RFC3339), Cancelled: cancelled.UTC().Format(time.RFC3339),
-		Created: time.Now().UTC().Format(time.RFC3339Nano)}
+		Created: time.Now().UTC().Format(time.RFC3339Nano), BootID: boot, Row: row}
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		if had {
 			m[vm] = prev
@@ -148,27 +226,49 @@ func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time) err
 	return nil
 }
 
+// HasCancelledStart reports whether this host holds a cancelled start of vm
+// (or cannot read the record of them, which may name it): a domain that runs
+// under its row is the sweep's to destroy, and the reconciler must not record
+// it running (health.Reconciler.SetCancelledStartProbe).
+func (s *Server) HasCancelledStart(vm string) bool {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	_, ok := s.cancelledStartsLocked()[vm]
+	return ok || s.cancelledStarts.loadErr != nil
+}
+
 // dropCancelledStart removes vm's entry once its cancelled start is settled.
 func (s *Server) dropCancelledStart(vm string) {
+	s.dropCancelledStartIf(vm, "")
+}
+
+// dropCancelledStartIf is dropCancelledStart, of the entry made at created
+// only (any entry when created is ""): a judgement made from one entry never
+// ends a later cancel's.
+func (s *Server) dropCancelledStartIf(vm, created string) {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
 	m := s.cancelledStartsLocked()
-	if _, ok := m[vm]; !ok {
+	r, ok := m[vm]
+	if !ok || (created != "" && r.Created != created) {
 		return
 	}
 	delete(m, vm)
+	delete(s.cancelledStarts.ran, vm)
 	if err := s.saveCancelledStartsLocked(); err != nil {
-		// Kept on disk: the next sweep finds the domain shut off (or the row
-		// changed) and drops it then.
+		// Kept on disk: a later sweep ends it again.
+		m[vm] = r
 		slog.Warn("StopVM: a settled cancelled start's record was not removed from the file", "vm", vm, "error", err)
 	}
 }
 
 // sweepCancelledStarts carries out the cancelled starts whose own start is
 // no longer running in this daemon (see above). Each entry is judged in its
-// own goroutine, one at a time per VM, so a libvirt that does not answer for
-// one domain holds neither the pass nor the others; the returned channel is
-// closed once every judgement started here has finished (tests wait on it).
+// own goroutine, one at a time per VM; every libvirt call a judgement makes
+// is bounded by the live-state wait, so a libvirt that does not answer for
+// one domain holds neither the pass, nor the others, nor the VM's lock. The
+// returned channel is closed once every judgement started here has finished
+// (tests wait on it).
 func (s *Server) sweepCancelledStarts(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	if s.virt == nil || s.db == nil {
@@ -208,8 +308,105 @@ func (s *Server) sweepCancelledStarts(ctx context.Context) <-chan struct{} {
 	return done
 }
 
+func cancelledStartActiveKey(vm string) string  { return "cancelled-start-active\x00" + vm }
+func cancelledStartDestroyKey(vm string) string { return "cancelled-start-destroy\x00" + vm }
+
+// domainActiveBounded is DomainIsActive within the live-state wait
+// (errLiveStateNoAnswer when libvirt has not answered).
+func (s *Server) domainActiveBounded(vm string) (bool, error) {
+	_, st, err := s.boundedVirtCall(cancelledStartActiveKey(vm), nil, func() (string, error) {
+		active, err := s.virt.DomainIsActive(vm)
+		if active {
+			return "active", err
+		}
+		return "", err
+	})
+	return st == "active", err
+}
+
+func (s *Server) markCancelledStartRan(r cancelledStartRecord) {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	if s.cancelledStarts.ran == nil {
+		s.cancelledStarts.ran = map[string]string{}
+	}
+	s.cancelledStarts.ran[r.VM] = r.Created
+}
+
+func (s *Server) cancelledStartRan(r cancelledStartRecord) bool {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	return s.cancelledStarts.ran[r.VM] == r.Created
+}
+
+// cancelledStartCurrent reports whether r is still vm's record (not ended,
+// nor replaced by a later cancel's).
+func (s *Server) cancelledStartCurrent(r cancelledStartRecord) bool {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	cur, ok := s.cancelledStartsLocked()[r.VM]
+	return ok && cur.Created == r.Created
+}
+
+func (s *Server) cancelledStartDestroying(vm string) bool {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	return s.cancelledStarts.destroying[vm]
+}
+
 // judgeCancelledStart carries out one cancelled start (sweepCancelledStarts).
+// libvirt is asked about the domain without the VM lock, within the
+// live-state wait; the lock is taken only to destroy a domain that runs, and
+// that destroy too is waited for within the bound, never past it under the
+// lock. A look libvirt does not answer keeps the entry for a later pass.
 func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord) {
+	if _, live := s.startFlightOf(r.VM); live {
+		return
+	}
+	if s.cancelledStartDestroying(r.VM) {
+		return // its destroy is outstanding: a later pass sees its outcome
+	}
+	row, err := corrosion.GetVM(ctx, s.db, r.VM)
+	if err != nil {
+		return // unknown: kept for the next pass
+	}
+	if !s.rowStillCancelled(r, row) {
+		slog.Info("StopVM: a cancelled start's VM no longer says what the cancel wrote here; nothing to undo", "vm", r.VM)
+		s.dropCancelledStartIf(r.VM, r.Created)
+		return
+	}
+	active, aerr := s.domainActiveBounded(r.VM)
+	switch {
+	case errors.Is(aerr, errLiveStateNoAnswer):
+		slog.Info("StopVM: libvirt has not answered for a cancelled start's domain; looked at again next pass", "vm", r.VM)
+		return
+	case lv.IsNoDomain(aerr) || (aerr == nil && !active):
+		// A domain shut off (or not defined) says nothing about a start
+		// libvirt may still be making. The record ends only on positive
+		// evidence that none is pending (see above).
+		switch {
+		case s.cancelledStartRan(r):
+			slog.Info("StopVM: a cancelled start's domain ran and no longer does; its record is ended", "vm", r.VM)
+			s.dropCancelledStartIf(r.VM, r.Created)
+		case s.bootedSince(r):
+			slog.Info("StopVM: a cancelled start's domain does not run, and the host has booted since the cancel; its record is ended", "vm", r.VM)
+			s.dropCancelledStartIf(r.VM, r.Created)
+		}
+		return
+	case aerr != nil:
+		return // unknown: kept for the next pass
+	}
+	if s.bootedSince(r) {
+		// The host has booted since the cancel: the start it cancelled
+		// cannot have survived the boot, so the domain that runs is some
+		// later start's (an onboot autostart whose running write failed),
+		// never the cancelled one's. Nothing is destroyed.
+		slog.Info("StopVM: a cancelled start's record predates this boot; the domain that runs is not its start's, and the record is ended", "vm", r.VM)
+		s.dropCancelledStartIf(r.VM, r.Created)
+		return
+	}
+	// The domain runs: the start it cancelled has completed.
+	s.markCancelledStartRan(r)
 	unlock, ok := s.tryLockVM(r.VM)
 	if !ok {
 		return // a lifecycle call holds the VM: the next pass
@@ -218,82 +415,133 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	if _, live := s.startFlightOf(r.VM); live {
 		return
 	}
-	row, err := corrosion.GetVM(ctx, s.db, r.VM)
+	if !s.cancelledStartCurrent(r) {
+		// Ended while libvirt was asked (a start of the VM removed it):
+		// the domain that runs is that start's.
+		return
+	}
+	row, err = corrosion.GetVM(ctx, s.db, r.VM)
 	if err != nil {
-		return // unknown: kept for the next pass
-	}
-	if row == nil || row.HostName != s.hostName || row.State != "stopped" || row.StateDetail != "operator-stop" {
-		slog.Info("StopVM: a cancelled start's VM is no longer stopped by its operator here; nothing to undo", "vm", r.VM)
-		s.dropCancelledStart(r.VM)
 		return
 	}
-	active, aerr := s.virt.DomainIsActive(r.VM)
-	switch {
-	case lv.IsNoDomain(aerr) || (aerr == nil && !active):
-		// A domain shut off (or not defined) says nothing about a start
-		// libvirt may still be making: after a restart the daemon cannot
-		// see it. The record is dropped only once the start could no
-		// longer complete; until then it is kept, and a domain that comes
-		// up is destroyed at a later pass.
-		if s.cancelledStartWindowOver(r) {
-			s.dropCancelledStart(r.VM)
-		}
+	if !s.rowStillCancelled(r, row) {
+		s.dropCancelledStartIf(r.VM, r.Created)
 		return
-	case aerr != nil:
-		return // unknown: kept for the next pass
 	}
-	// The cancelled start's domain runs under a row that says stopped by
-	// its operator: libvirt started it after this daemon forgot the start.
 	note := fmt.Sprintf("start cancelled: the start asked for at %s was cancelled at %s, and libvirt started its domain after the daemon restarted; the domain was destroyed",
 		r.StartAsked, r.Cancelled)
-	if _, serr := s.stopVMLockedNote(ctx, row, true, 0, note); serr == nil {
-		slog.Warn("StopVM: destroyed the domain of a start cancelled before the daemon restarted", "vm", r.VM)
-		s.dropCancelledStart(r.VM)
-		return
-	} else if st, e := s.virt.DomainState(r.VM); e == nil && st == "running" {
-		// It runs and cannot be destroyed: the row says so, never stopped
-		// over a running domain, and the failed cancel is recorded once.
-		s.noteVMStarted(r.VM)
-		if werr := s.persistVMState(ctx, r.VM, "running", "", corrosion.OpVMState); werr != nil {
-			slog.Error("StopVM: a cancelled start's domain runs and could not be destroyed; recording it running failed", "vm", r.VM, "error", werr)
-			return // kept: tried again next pass
-		}
-		s.recordVMEvent(ctx, r.VM, "vm.stopped", "error",
-			fmt.Sprintf("the start asked for at %s was cancelled at %s, but libvirt started it after the daemon restarted and destroying the domain failed: %v; the VM runs (`lv stop --force %s`)",
-				r.StartAsked, r.Cancelled, serr, r.VM))
-		s.dropCancelledStart(r.VM)
-	}
-	// Otherwise the domain is not running and its stop's record failed:
-	// kept, and the next pass drops it once it sees the domain shut off.
+	s.undoCancelledStartLocked(ctx, r, row, note)
 }
 
-// cancelledStartWindowOver reports whether the start r cancelled can no
-// longer complete: its record is older than the held-start wait plus
-// the margin. A record whose creation time cannot be read is kept
-// (it ends only with its row, or its domain destroyed).
-func (s *Server) cancelledStartWindowOver(r cancelledStartRecord) bool {
-	created, err := time.Parse(time.RFC3339Nano, r.Created)
-	if err != nil {
-		return false
+// undoCancelledStartLocked destroys the domain a cancelled start brought up
+// after the daemon restarted, and records it: the row is left as the cancel
+// wrote it (stopped by its operator, or error, which holds the VM's set-aside
+// disk copies). The destroy is waited for within the live-state wait; one
+// libvirt has not answered by then keeps the record, and is recorded when it
+// answers. The caller holds the VM lock.
+func (s *Server) undoCancelledStartLocked(ctx context.Context, r cancelledStartRecord, row *corrosion.VMRecord, note string) {
+	if row.State == "error" {
+		note += "; the row is left error, which holds its set-aside disk copies"
 	}
-	return time.Since(created) > s.startDomainWaitOrDefault()+s.cancelledStartMarginOrDefault()
+	hspec := vmHooks(row)
+	pbVM := &pb.VM{Name: row.Name, HostName: row.HostName, State: pb.VMState_VM_STOPPING}
+	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
+	destroyed := func() {
+		if !s.hardwareV2Latched(ctx) {
+			if err := s.releaseDevices(ctx, row.Name); err != nil {
+				slog.Warn("StopVM: a cancelled start's domain was destroyed; releasing its PCI devices failed", "vm", row.Name, "error", err)
+			}
+		}
+		s.recordVMEvent(ctx, row.Name, "vm.stopped", "ok", note)
+		pbVM.State = pb.VMState_VM_STOPPED
+		hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
+		slog.Warn("StopVM: destroyed the domain of a start cancelled before the daemon restarted", "vm", row.Name)
+	}
+	call, _, derr := s.boundedVirtCall(cancelledStartDestroyKey(row.Name), nil, func() (string, error) {
+		return "", s.virt.DestroyDomain(row.Name)
+	})
+	if errors.Is(derr, errLiveStateNoAnswer) {
+		if call == nil {
+			return
+		}
+		// Not waited for under the lock. While it is outstanding a start
+		// of the VM is refused (endCancelledStartForStart) and no pass asks
+		// again. When libvirt answers, the VM lock is taken again and a
+		// destroy that succeeded gets the same bookkeeping as one answered
+		// in time (hooks, device release, event), and the record ends; a
+		// failed one is left to a later pass.
+		s.cancelledStarts.mu.Lock()
+		if s.cancelledStarts.destroying == nil {
+			s.cancelledStarts.destroying = map[string]bool{}
+		}
+		s.cancelledStarts.destroying[row.Name] = true
+		s.cancelledStarts.mu.Unlock()
+		slog.Warn("StopVM: libvirt has not answered the destroy of a cancelled start's domain; its record is kept", "vm", row.Name)
+		go func() {
+			<-call.done
+			defer func() {
+				s.cancelledStarts.mu.Lock()
+				delete(s.cancelledStarts.destroying, row.Name)
+				s.cancelledStarts.mu.Unlock()
+			}()
+			if call.err != nil {
+				slog.Warn("StopVM: the destroy of a cancelled start's domain failed late; a later pass looks again", "vm", row.Name, "error", call.err)
+				return
+			}
+			unlock := s.lockVM(row.Name)
+			defer unlock()
+			destroyed()
+			s.dropCancelledStartIf(r.VM, r.Created)
+		}()
+		return
+	}
+	if derr == nil {
+		destroyed()
+		s.dropCancelledStartIf(r.VM, r.Created)
+		return
+	}
+	active, aerr := s.domainActiveBounded(row.Name)
+	switch {
+	case lv.IsNoDomain(aerr) || (aerr == nil && !active):
+		destroyed()
+		s.dropCancelledStartIf(r.VM, r.Created)
+		return
+	case aerr != nil:
+		return // unknown: kept, and looked at again next pass
+	}
+	// It runs and cannot be destroyed: the row says so, never stopped (or
+	// error) over a running domain, and the failed cancel is recorded once.
+	s.noteVMStarted(row.Name)
+	if werr := s.persistVMState(ctx, row.Name, "running", "", corrosion.OpVMState); werr != nil {
+		slog.Error("StopVM: a cancelled start's domain runs and could not be destroyed; recording it running failed", "vm", row.Name, "error", werr)
+		return // kept: tried again next pass
+	}
+	s.recordVMEvent(ctx, row.Name, "vm.stopped", "error",
+		fmt.Sprintf("the start asked for at %s was cancelled at %s, but libvirt started it after the daemon restarted and destroying the domain failed: %v; the VM runs (`lv stop --force %s`)",
+			r.StartAsked, r.Cancelled, derr, row.Name))
+	s.dropCancelledStartIf(r.VM, r.Created)
 }
 
 // endCancelledStartForStart removes vm's record before a new start of the VM
 // starts its domain: the operator's start supersedes the cancel, and the
 // sweep must never destroy what it started. It fails, and the start must
 // not be made, when the record is there and the file cannot be rewritten
-// without it. An unreadable file names nothing the sweep acts on, so it does
-// not hold a start.
+// without it, or while a destroy the sweep asked of the VM's domain has not
+// been answered. An unreadable file names nothing the sweep acts on, so it
+// does not hold a start.
 func (s *Server) endCancelledStartForStart(vm string) error {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
+	if s.cancelledStarts.destroying[vm] {
+		return status.Errorf(codes.Unavailable, "start %q: libvirt has not answered the destroy of the domain its earlier cancelled start brought up, and the start was not made; retry once it has (`lv events %s`)", vm, vm)
+	}
 	m := s.cancelledStartsLocked()
 	r, ok := m[vm]
 	if !ok || s.cancelledStarts.loadErr != nil {
 		return nil
 	}
 	delete(m, vm)
+	delete(s.cancelledStarts.ran, vm)
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		m[vm] = r
 		return fmt.Errorf("the record of its earlier cancelled start could not be removed from %s, and a start with it there could be undone: %w",

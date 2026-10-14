@@ -41,6 +41,9 @@ type VMChecker struct {
 	// libvirtfake; NewVMChecker keeps a nil *lv.Client a nil interface.
 	virt vmCheckBackend
 	bus  *events.Bus
+	// cancelledStart reports whether this host holds a cancelled start of a
+	// VM (SetCancelledStartProbe); nil: none.
+	cancelledStart func(vm string) bool
 	// now is the clock (nil → time.Now). A test seam: the start grace and the
 	// action backoff are minutes long.
 	now func() time.Time
@@ -180,6 +183,22 @@ func (v *VMChecker) SweepOnce(ctx context.Context) {
 	v.probes.Wait()
 }
 
+// SetCancelledStartProbe wires the probe that says whether this host holds a
+// start of the VM `lv stop --force` cancelled while libvirt had not answered
+// it (grpcapi.Server.HasCancelledStart). Such a VM's row says what the cancel
+// wrote (stopped by its operator, or error), and a domain libvirt starts for
+// it late is the cancelled-starts sweep's to destroy: the restart-policy pass
+// neither records it running nor starts the VM.
+func (v *VMChecker) SetCancelledStartProbe(fn func(vm string) bool) { v.cancelledStart = fn }
+
+// VMCheckBackend is the libvirt surface the checker calls (*lv.Client, or
+// libvirtfake in a test of another package).
+type VMCheckBackend = vmCheckBackend
+
+// SetBackend replaces the checker's libvirt backend. For tests that drive
+// the checker from another package (SweepOnce).
+func (v *VMChecker) SetBackend(b VMCheckBackend) { v.virt = b }
+
 // SetEventBus sets the event bus for publishing health check events.
 func (v *VMChecker) SetEventBus(bus *events.Bus) { v.bus = bus }
 
@@ -307,6 +326,13 @@ func (v *VMChecker) sweep(ctx context.Context) {
 	// Second pass: restart policy for stopped/error VMs.
 	for _, vm := range vms {
 		if vm.State != "stopped" && vm.State != "error" {
+			continue
+		}
+		if v.cancelledStart != nil && v.cancelledStart(vm.Name) {
+			// A start of it was cancelled here while libvirt had not
+			// answered it: its row stays what the cancel wrote, and a
+			// domain libvirt started late is destroyed by the
+			// cancelled-starts sweep, not recorded running or restarted.
 			continue
 		}
 		// Reconcile a state desync first: if libvirt actually has the domain

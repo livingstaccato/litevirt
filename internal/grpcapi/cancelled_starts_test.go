@@ -39,8 +39,19 @@ func (st *stuckStart) restarted(t *testing.T, rowState, rowDetail string) {
 	st.restartedAt(t, rowState, rowDetail, time.Now().Add(-time.Hour))
 }
 
+const (
+	testBootA = "11111111-1111-4111-8111-111111111111"
+	testBootB = "22222222-2222-4222-8222-222222222222"
+)
+
 // restartedAt is restarted with the record created at created.
 func (st *stuckStart) restartedAt(t *testing.T, rowState, rowDetail string, created time.Time) {
+	t.Helper()
+	st.restartedInBoot(t, rowState, rowDetail, created, "")
+}
+
+// restartedInBoot is restartedAt with the record made in boot.
+func (st *stuckStart) restartedInBoot(t *testing.T, rowState, rowDetail string, created time.Time, boot string) {
 	t.Helper()
 	ctx := context.Background()
 	if err := corrosion.UpdateVMState(ctx, st.s.db, "web", rowState, rowDetail); err != nil {
@@ -48,7 +59,7 @@ func (st *stuckStart) restartedAt(t *testing.T, rowState, rowDetail string, crea
 	}
 	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateRunning)
 	raw, _ := json.Marshal([]cancelledStartRecord{{VM: "web", StartAsked: "2026-10-14T15:39:20Z", Cancelled: "2026-10-14T15:45:07Z",
-		Created: created.UTC().Format(time.RFC3339Nano)}})
+		Created: created.UTC().Format(time.RFC3339Nano), BootID: boot}})
 	if err := os.WriteFile(st.s.cancelledStartsPath(), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -131,10 +142,15 @@ func TestCancelledStart_AVMStartedAgainIsLeftRunning(t *testing.T) {
 	}
 }
 
-// A record whose domain is shut off is forgotten, with nothing done.
+// A record made in an earlier boot of the host whose domain is shut off is
+// forgotten, with nothing done: libvirt's queue of jobs did not survive the
+// boot, so no start can still be pending for it.
+//
+// Mutation: the boot not compared (kept on any shut-off domain): red.
 func TestCancelledStart_ADomainShutOffForgetsTheRecord(t *testing.T) {
 	st := newStuckStart(t)
-	st.restarted(t, "stopped", "operator-stop")
+	st.restartedInBoot(t, "stopped", "operator-stop", time.Now().Add(-time.Hour), testBootA)
+	st.s.bootID = func() (string, error) { return testBootB, nil }
 	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
 	st.sweep(t)
 	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
@@ -169,7 +185,6 @@ func TestCancelledStart_TheLateAnswerForgetsTheRecord(t *testing.T) {
 // young record is gone and the domain that comes up runs on: red.
 func TestCancelledStart_AYoungRecordOutlivesAShutOffDomain(t *testing.T) {
 	st := newStuckStart(t) // held-start wait 300ms
-	st.s.cancelledStartMargin = 200 * time.Millisecond
 	fake := st.s.virt.(*libvirtfake.Fake)
 
 	st.restartedAt(t, "stopped", "operator-stop", time.Now())
@@ -189,15 +204,51 @@ func TestCancelledStart_AYoungRecordOutlivesAShutOffDomain(t *testing.T) {
 	}
 }
 
-// A record older than the window is dropped once its domain is seen shut off.
-func TestCancelledStart_AnOldRecordIsDroppedOnAShutOffDomain(t *testing.T) {
+// CR7-0: a held start has no upper bound on when libvirt answers it, so the
+// record of its cancel is not dropped for its age. A start queued in libvirt
+// behind another job reads shut off for as long as it waits, then comes up:
+// the record kept past any window destroys it then.
+//
+// Mutation: the age-based window back (dropped once older than the held-start
+// wait plus a margin): the record is gone and the domain runs on: red.
+func TestCancelledStart_AQueuedStartAfterAnyWindowIsStillUndone(t *testing.T) {
 	st := newStuckStart(t)
-	st.restartedAt(t, "stopped", "operator-stop",
-		time.Now().Add(-(st.s.startDomainWaitOrDefault() + st.s.cancelledStartMarginOrDefault() + time.Second)))
+	fake := st.s.virt.(*libvirtfake.Fake)
+	st.restartedInBoot(t, "stopped", "operator-stop", time.Now().Add(-24*time.Hour), testBootA)
+	st.s.bootID = func() (string, error) { return testBootA, nil }
+	fake.SetState("web", libvirtfake.StateShutdown)
+	st.sweep(t)
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
+		t.Fatalf("a day-old record was dropped on a shut-off domain in the same boot: %+v", recs)
+	}
+	// libvirt finally runs the start it had queued.
+	fake.SetState("web", libvirtfake.StateRunning)
+	st.sweep(t)
+	if st.domainActive(t) {
+		t.Fatal("the domain a queued cancelled start brought up late runs on")
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("the record outlived the destroy: %+v", recs)
+	}
+}
+
+// A record that names no boot (or a boot that cannot be read) is kept on a
+// shut-off domain: only positive evidence ends it.
+func TestCancelledStart_ARecordWithoutABootIsKept(t *testing.T) {
+	st := newStuckStart(t)
+	st.restartedAt(t, "stopped", "operator-stop", time.Now().Add(-time.Hour))
+	st.s.bootID = func() (string, error) { return testBootB, nil }
 	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
 	st.sweep(t)
-	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
-		t.Fatalf("a record older than the start's window was kept on a shut-off domain: %+v", recs)
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
+		t.Fatalf("a record naming no boot was dropped: %+v", recs)
+	}
+	st.restartedInBoot(t, "stopped", "operator-stop", time.Now().Add(-time.Hour), testBootA)
+	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
+	st.s.bootID = func() (string, error) { return "", errors.New("no boot_id") }
+	st.sweep(t)
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
+		t.Fatalf("a record was dropped when this boot's ID cannot be read: %+v", recs)
 	}
 }
 

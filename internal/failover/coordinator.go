@@ -152,12 +152,20 @@ type Coordinator struct {
 	// future-proofing rather than a fix for a live race — unlike the
 	// rebalancer's, which has two concurrent callers.
 	leaseTerm atomic.Int64
-	// leaseGap is set whenever this coordinator stops holding the lease (or
-	// cannot show it does), and when it takes the lease at a new term: another
-	// node may have led in between. The next cycle that holds the lease then
+	// leaseGap is set when another node holds or claims the lease (loseLease),
+	// and when this one takes it as a new tenure (acquireLeaseTenure): another
+	// node may have led in between. A read error or a stand-down alone does
+	// not set it (dropLeaseTerm). The next cycle that holds the lease then
 	// forgets every host's outage (forgetEpisodes) and re-derives it from the
 	// replicated records, as a successor would.
 	leaseGap atomic.Bool
+	// tenureTerm is the term of the last lease incarnation this coordinator
+	// held, kept across a drop (leaseTerm is cleared by one), and everHeld
+	// whether it has held one at all. Together with the lease row as it stands
+	// before a re-take (ownTenureLive) they tell a lease this node never
+	// stopped holding from a new tenure (acquireLeaseTenure).
+	tenureTerm atomic.Int64
+	everHeld   atomic.Bool
 	// leaseQuorumLost is whether the last lease attempt stood down because this
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
@@ -856,12 +864,18 @@ func (c *Coordinator) run(ctx context.Context) {
 	for _, cand := range candidates {
 		// Re-validate lease before each destructive action: long fence runs
 		// (IPMI verify up to 15 s) can outlast the lease without renewal.
-		if !c.holdLease(ctx) {
-			slog.Warn("failover: lease lost mid-cycle, aborting", "host", c.hostName)
+		if _, st := c.holdLeaseFor(ctx, leaseRenewBefore); st != leaseHeld {
+			slog.Warn("failover: lease lost, unshown or renewed as a new tenure mid-cycle, aborting",
+				"host", c.hostName, "lease", st.String())
 			c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 			// Losing the lease is a step-down: the node that takes it owns the
-			// fleet's view from here.
-			c.stepDownGauges()
+			// fleet's view from here. Not being able to show it holds the
+			// lease is not (run's rule for an unreadable lease), and nor is a
+			// renewal as a new tenure: this node still leads, and the next
+			// cycle republishes from what it re-derives.
+			if st == leaseLost {
+				c.stepDownGauges()
+			}
 			return
 		}
 
@@ -1221,15 +1235,26 @@ func (c *Coordinator) stepDownGauges() {
 	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
-// dropLeaseTerm records that this coordinator does not hold the lease, or
-// cannot show it does (leaseGap).
+// dropLeaseTerm records that this coordinator cannot show it holds the
+// lease: a read or write error, a lease row it cannot use, or a stand-down for
+// want of the voter majority. None of these is evidence that another node led,
+// so it marks no gap: the re-take decides that from the lease row
+// (acquireLeaseTenure). A lease that lapsed meanwhile is a new tenure there.
 func (c *Coordinator) dropLeaseTerm() {
+	c.leaseTerm.Store(0)
+}
+
+// loseLease records that another node holds the lease, or claims it: a gap
+// (leaseGap), whatever the lease row shows when this node takes it back.
+func (c *Coordinator) loseLease() {
 	c.leaseTerm.Store(0)
 	c.leaseGap.Store(true)
 }
 
 // forgetEpisodes drops what this coordinator remembers of each host's outage,
-// on taking the lease back after a gap (leaseGap). Another node may have led
+// on taking the lease back after a gap (leaseGap): not after a read error or a
+// stand-down that left the lease row naming this node unexpired at its own
+// term. Another node may have led
 // meanwhile: the host may have come back, failed again and been fenced
 // afresh, or not at all, and nothing remembered from the earlier tenure
 // speaks for that. Each host then goes down the path a fresh successor takes,
@@ -1449,6 +1474,19 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 // acquireLeaseResult takes or renews the failover lease and keeps the failure
 // reason, so a caller can tell a lost election from an unreadable store.
 func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
+	held, _, err := c.acquireLeaseTenure(ctx)
+	return held, err
+}
+
+// acquireLeaseTenure is acquireLeaseResult, also reporting whether the lease
+// was taken as a new tenure: this node has held the lease before, and either
+// the lease row did not show its own unexpired tenure just before the take
+// (ownTenureLive) or the take handed a term other than the one it last held.
+// Another node may have led in between, so a new tenure marks a gap
+// (leaseGap). A take that continues this node's own unexpired tenure at its
+// own term marks none, however the lease was last checked: no other node can
+// have taken a lease whose row still names this node unexpired.
+func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure bool, err error) {
 	if c.lostEveryDecisionQuorum(ctx) {
 		if !c.leaseQuorumLost.Swap(true) {
 			slog.Warn("failover: this node has lost the voter majority; neither taking nor renewing the failover lease until it is back")
@@ -1460,10 +1498,16 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		// majority nobody holds it, and every node publishing
 		// stranded_workloads = 0 would clear the alert in exactly the
 		// incident it is for. The former leader keeps its last values.
-		return false, errLeaseNoQuorum
+		return false, false, errLeaseNoQuorum
 	}
 	if c.leaseQuorumLost.Swap(false) {
 		slog.Info("failover: the voter majority is back; contending for the failover lease again")
+	}
+	// Read before the take, which rewrites the row. Only a node that has held
+	// the lease, and has seen no other holder since, has a tenure to continue.
+	continues := false
+	if c.everHeld.Load() && !c.leaseGap.Load() {
+		continues = c.ownTenureLive(ctx)
 	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
@@ -1473,21 +1517,38 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.dropLeaseTerm()
-		return false, err
+		return false, false, err
 	}
 	if !held {
 		// Another coordinator holds it — the normal non-leader case.
-		c.dropLeaseTerm()
+		c.loseLease()
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
-		return false, nil
+		return false, false, nil
 	}
-	if prev := c.leaseTerm.Load(); prev != 0 && term != prev {
+	if c.everHeld.Load() && (!continues || term != c.tenureTerm.Load()) {
 		// A new incarnation: another holder may have led since this one's.
+		newTenure = true
 		c.leaseGap.Store(true)
 	}
+	c.everHeld.Store(true)
+	c.tenureTerm.Store(term)
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
-	return true, nil
+	return true, newTenure, nil
+}
+
+// ownTenureLive reports whether the failover lease row names this node with
+// an expiry still ahead: the tenure it last held has not lapsed, so no other
+// node can have taken the lease since. A read error, or a row it cannot use,
+// reports false.
+func (c *Coordinator) ownTenureLive(ctx context.Context) bool {
+	rows, err := c.db.Query(ctx,
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
+	if err != nil || len(rows) == 0 || rows[0].String("holder") != c.hostName {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
+	return err == nil && exp.After(c.now())
 }
 
 // onlyReportedPausedFilter keeps the items of kind that a recovery limited to
@@ -1620,6 +1681,37 @@ func (c *Coordinator) holdLease(ctx context.Context) bool {
 	return ok
 }
 
+// leaseHold is holdLeaseFor's answer.
+type leaseHold int
+
+func (st leaseHold) String() string {
+	switch st {
+	case leaseHeld:
+		return "held"
+	case leaseLost:
+		return "lost"
+	case leaseNewTenure:
+		return "new_tenure"
+	}
+	return "unshown"
+}
+
+const (
+	// leaseHeld: the lease is held, with the margin asked for.
+	leaseHeld leaseHold = iota
+	// leaseLost: another node holds the lease, or claims it. A step-down.
+	leaseLost
+	// leaseUnshown: this node cannot show it holds the lease (a read or
+	// write error, a lease row it cannot use, the voter majority lost, or
+	// too short a renewal). Not a step-down: nothing shows another node
+	// leads.
+	leaseUnshown
+	// leaseNewTenure: renewed, but as a new tenure (acquireLeaseTenure).
+	// This node still leads; the cycle's view of each host predates whoever
+	// may have led in between, and the next cycle starts afresh.
+	leaseNewTenure
+)
+
 // holdLeaseAtLeast re-validates the failover lease and guarantees strictly more
 // than `need` remaining on it, renewing when the margin is short. It returns
 // the remaining TTL so a caller can bound a long operation by the authority it
@@ -1629,26 +1721,43 @@ func (c *Coordinator) holdLease(ctx context.Context) bool {
 // means this node no longer holds enough of the lease to finish the work
 // safely, and proceeding would be acting past its own authority.
 func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) (time.Duration, bool) {
-	left, ok := c.leaseRemaining(ctx)
-	if !ok {
-		return 0, false
-	}
-	if left > need {
-		return left, true
-	}
-	if !c.acquireLease(ctx) {
-		return 0, false
+	left, st := c.holdLeaseFor(ctx, need)
+	return left, st == leaseHeld
+}
+
+// holdLeaseFor is holdLeaseAtLeast, saying why when the lease is not held.
+func (c *Coordinator) holdLeaseFor(ctx context.Context, need time.Duration) (time.Duration, leaseHold) {
+	left, st := c.leaseRemaining(ctx)
+	if st != leaseHeld {
+		return 0, st
 	}
 	if c.leaseGap.Load() {
-		// Renewed at a new term: this cycle's view of each host predates
+		// A renewal earlier in this cycle came back as a new tenure; run
+		// clears the mark once the next cycle has started afresh.
+		return 0, leaseNewTenure
+	}
+	if left > need {
+		return left, leaseHeld
+	}
+	held, newTenure, err := c.acquireLeaseTenure(ctx)
+	switch {
+	case !held && err == nil:
+		return 0, leaseLost
+	case !held:
+		return 0, leaseUnshown
+	case newTenure:
+		// Renewed as a new tenure: this cycle's view of each host predates
 		// whoever may have led in between. The next cycle starts afresh.
-		return 0, false
+		return 0, leaseNewTenure
 	}
-	left, ok = c.leaseRemaining(ctx)
-	if !ok || left <= need {
-		return 0, false
+	left, st = c.leaseRemaining(ctx)
+	if st != leaseHeld {
+		return 0, st
 	}
-	return left, true
+	if left <= need {
+		return 0, leaseUnshown
+	}
+	return left, leaseHeld
 }
 
 // leaseRemaining reports how much of the failover lease this node still holds.
@@ -1667,14 +1776,14 @@ func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) 
 //
 // Both callers inherit that: holdLease and the fence-bounding
 // holdLeaseAtLeast read the lease through here and nowhere else.
-func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) {
+func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, leaseHold) {
 	rows, err := c.db.Query(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
 	if err != nil {
 		slog.Error("failover: lease read", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.dropLeaseTerm()
-		return 0, false
+		return 0, leaseUnshown
 	}
 	if len(rows) == 0 {
 		// The lease row is absent while this coordinator believes it may hold
@@ -1685,20 +1794,20 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 		slog.Warn("failover: lease row missing")
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.dropLeaseTerm()
-		return 0, false
+		return 0, leaseUnshown
 	}
 	if rows[0].String("holder") != c.hostName {
-		c.dropLeaseTerm()
-		return 0, false
+		c.loseLease()
+		return 0, leaseLost
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
 		slog.Error("failover: lease expiry unparseable", "value", rows[0].String("expires_at"))
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.dropLeaseTerm()
-		return 0, false
+		return 0, leaseUnshown
 	}
-	return expiresAt.Sub(c.now()), true
+	return expiresAt.Sub(c.now()), leaseHeld
 }
 
 // leaseTermEnforced reports whether this coordinator refuses to stamp on the

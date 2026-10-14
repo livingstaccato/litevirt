@@ -7,6 +7,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -120,5 +121,174 @@ func TestConfirmationResume_RecordsTheFenceSoARefusedClaimIsRetried(t *testing.T
 	c.retryClaims(ctx, "dead")
 	if vm := mustVM(t, db, "vm1"); vm.HostName == "dead" && vm.PendingActionID == "" {
 		t.Fatal("the claim refused in a confirmation resume was not retried")
+	}
+}
+
+// breakLeaseReadOnce makes one holdLease fail on a lease read error, as a
+// transient store fault would, and restores the table.
+func breakLeaseReadOnce(t *testing.T, c *Coordinator, db *corrosion.Client, ctx context.Context) {
+	t.Helper()
+	if err := db.Execute(ctx, `ALTER TABLE leader_election RENAME TO leader_election_away`); err != nil {
+		t.Fatal(err)
+	}
+	if c.holdLease(ctx) {
+		t.Fatal("setup: holdLease held the lease with its table gone")
+	}
+	if err := db.Execute(ctx, `ALTER TABLE leader_election_away RENAME TO leader_election`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A single lease read error on a leader that never lost the lease is no gap:
+// the row still names it unexpired, at its own term, so no other node can
+// have led. The pause wait keeps its deadline and the fence its record of
+// what moved; a reset would re-anchor the wait and leave the host fenced for
+// a manual undrain.
+//
+// Mutation: mark a gap in dropLeaseTerm — the wait is re-anchored.
+func TestLeaseRegain_ATransientLeaseReadErrorKeepsTheEpisode(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	c.run(ctx)
+	w, ok := c.pauseWaits["down"]
+	if !ok {
+		t.Fatal("setup: no pause wait")
+	}
+	_, relocKnown := c.fenceRelocated["down"]
+	breakLeaseReadOnce(t, c, db, ctx)
+	mono.Advance(time.Second)
+	c.run(ctx)
+	got, ok := c.pauseWaits["down"]
+	if !ok || !got.deadline.Equal(w.deadline) {
+		t.Fatalf("pause wait after a transient lease read error: %+v (present %v), want the deadline %v kept",
+			got, ok, w.deadline)
+	}
+	if _, known := c.fenceRelocated["down"]; known != relocKnown {
+		t.Errorf("fenceRelocated[down] known=%v after a transient lease read error, was %v", known, relocKnown)
+	}
+	if !c.fenced["down"] {
+		t.Error("down forgotten as fenced after a transient lease read error")
+	}
+}
+
+// expireLeaseRow makes the failover lease row's expiry a second past, its
+// holder and term unchanged: a lease that lapsed while its holder did not
+// renew it.
+func expireLeaseRow(t *testing.T, db *corrosion.Client, ctx context.Context) {
+	t.Helper()
+	if err := db.Execute(ctx, `UPDATE leader_election SET expires_at = ? WHERE key = 'failover'`,
+		time.Now().Add(-time.Second).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// quorumToggleGate reads the cluster quorum as lost while *lost holds, and
+// enforces nothing.
+type quorumToggleGate struct {
+	fakeFailoverGate
+	lost *bool
+}
+
+func (g quorumToggleGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
+	if *g.lost {
+		return health.QuorumNo, 1, 3
+	}
+	return health.QuorumYes, 2, 3
+}
+
+// A stand-down for want of the voter majority (or inside its regain grace)
+// that ends while the lease row still names this node unexpired is no gap
+// either. One that outlasts the lease is: the row has lapsed, another node
+// may have led, and the episode is forgotten.
+//
+// Mutations: mark a gap on the quorum stand-down — the short blip re-anchors
+// the wait; treat a lapsed own row as continuing (ownTenureLive ignores the
+// expiry) — the long one keeps it.
+func TestLeaseRegain_AQuorumStandDownKeepsTheEpisodeUntilTheLeaseLapses(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	// Before lease_term_ledger_v1 latches no term is minted, so the lease row's
+	// expiry is all that tells a lapse from a lease never let go.
+	db.SetLeaseTermLedgerGate(func() bool { return false })
+	lost := false
+	c.Gate = quorumToggleGate{fakeFailoverGate: fakeFailoverGate{enforced: map[string]bool{}}, lost: &lost}
+	c.run(ctx)
+	w, ok := c.pauseWaits["down"]
+	if !ok {
+		t.Fatal("setup: no pause wait")
+	}
+	lost = true
+	c.run(ctx)
+	lost = false
+	mono.Advance(time.Second)
+	c.run(ctx)
+	if got, ok := c.pauseWaits["down"]; !ok || !got.deadline.Equal(w.deadline) {
+		t.Fatalf("pause wait after a short quorum stand-down: %+v (present %v), want the deadline %v kept",
+			got, ok, w.deadline)
+	}
+
+	lost = true
+	c.run(ctx)
+	// The stand-down outlasts the lease: the row, still naming this node,
+	// has expired.
+	expireLeaseRow(t, db, ctx)
+	lost = false
+	mono.Advance(time.Second)
+	c.run(ctx)
+	if got, ok := c.pauseWaits["down"]; ok && got.deadline.Equal(w.deadline) {
+		t.Fatalf("pause wait kept its deadline %v across a lapsed lease; another node may have led", w.deadline)
+	}
+}
+
+// A renewal mid-cycle that comes back as a new tenure aborts the cycle, as
+// the next starts afresh, but is not a step-down: this node still leads, so
+// stranded_workloads keeps its value rather than reading 0.
+//
+// Mutations: step the gauges down on a new tenure — the gauge reads 0;
+// carry on after it (treat it as held) — down2 is fenced in the same cycle.
+func TestRun_ANewTenureMidCycleAbortsWithoutSteppingDown(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, h := range []struct{ name, state string }{
+		{"stale", "fenced"}, {"down1", "active"}, {"down2", "active"}, {"coord", "active"},
+	} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h.name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: h.state, FenceStrategy: "best-effort",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "stale", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	c := newTestCoordinator("coord", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.run(ctx)
+	if fm.stranded != 1 {
+		t.Fatalf("premise: gauge = %d while leader, want 1", fm.stranded)
+	}
+
+	fenceQuorum(t, ctx, db, []string{"coord", "down1", "down2"}, "down1")
+	fenceQuorum(t, ctx, db, []string{"coord", "down1", "down2"}, "down2")
+	var fenced []string
+	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
+		if len(fenced) == 0 {
+			// This node's own lease lapses during the fence: the next
+			// renewal takes it back as a new tenure.
+			expireLeaseRow(t, db, ctx)
+		}
+		fenced = append(fenced, h.Name)
+		return fence.Result{Method: "test", Detail: "stub", Success: true}
+	})
+	c.run(ctx)
+
+	if len(fenced) != 1 {
+		t.Fatalf("fenced %v in the cycle whose lease renewed as a new tenure; want the cycle aborted after the first", fenced)
+	}
+	if fm.stranded != 1 {
+		t.Errorf("gauge = %d after a renewal as a new tenure, want 1: this node still leads", fm.stranded)
 	}
 }

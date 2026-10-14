@@ -1092,7 +1092,7 @@ func (s *Server) holdImage(name string) (release func()) {
 // does not answer must not stall the reconciler's whole pass. Not taken in
 // time, the rebuild fails transiently, and a later pass retries it.
 func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
-	release, ok := s.imagePrune.holdWithin(imageName, recreateHoldWait)
+	release, ok := s.imagePrune.holdWithinShared(imageName, recreateHoldWait)
 	if !ok {
 		return "", fmt.Errorf("image %q: an image prune on this host has held the image lock for %s (its image store may not be answering); the rebuild is retried",
 			imageName, recreateHoldWait)
@@ -1117,6 +1117,22 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.holdLocked(name, publish)
+}
+
+// holdWithinShared is holdWithin, except that once one wait has run out the
+// lock is taken only at once, without waiting, until a recreateHoldWait has
+// passed since: a reconciler pass with many disks to rebuild while a prune
+// is stuck waits once, not once per disk, and the rest are retried by a
+// later pass (m-8).
+func (p *imagePruneState) holdWithinShared(name string, d time.Duration) (release func(), ok bool) {
+	if until := p.holdStuckUntil.Load(); until != 0 && time.Now().UnixNano() < until {
+		d = 0
+	}
+	release, ok = p.holdWithin(name, d)
+	if !ok {
+		p.holdStuckUntil.Store(time.Now().Add(recreateHoldWait).UnixNano())
+	}
+	return release, ok
 }
 
 // holdWithin is a disk create's hold, taken only if the lock is had within
@@ -1480,6 +1496,10 @@ type imagePruneState struct {
 	recordHook   atomic.Pointer[func(name, clock string)]  // test seam: runs as recordImage begins
 	skew         imageSkewHistory                          // the clock skews this host has seen (imageDeleteMargin)
 	pushUnmarked atomic.Bool                               // test seam: PushImage omits its copy mark, as an earlier build's does
+
+	// holdStuckUntil is until when a rebuild does not wait for the hold
+	// (holdWithinShared), in unix ns.
+	holdStuckUntil atomic.Int64
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }

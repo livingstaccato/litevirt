@@ -109,3 +109,30 @@ func TestRecreateOverlayDisk_DoesNotWaitOnAStuckPrune(t *testing.T) {
 		t.Fatalf("the rebuild once the prune let go: %v", err)
 	}
 }
+
+// m-8: once one rebuild's wait for the hold has run out, the others of the
+// same pass do not wait again: a pass with many disks to rebuild while a
+// prune is stuck waits once, and the rest are retried by a later pass.
+//
+// Mutation: wait for every rebuild (holdWithin) — the second waits too: red.
+func TestRecreateOverlayDisk_WaitsOncePerStuckPrune(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	importVersion(t, s, "ubuntu", "A ")
+	prev := recreateHoldWait
+	recreateHoldWait = 300 * time.Millisecond
+	t.Cleanup(func() { recreateHoldWait = prev })
+
+	s.imagePrune.mu.Lock()
+	defer s.imagePrune.mu.Unlock()
+	if _, err := s.RecreateOverlayDisk("web1", "root", "ubuntu", "1048576"); err == nil {
+		t.Fatal("the first rebuild went ahead without the hold")
+	}
+	start := time.Now()
+	if _, err := s.RecreateOverlayDisk("web2", "root", "ubuntu", "1048576"); err == nil {
+		t.Fatal("the second rebuild went ahead without the hold")
+	}
+	if took := time.Since(start); took >= recreateHoldWait {
+		t.Fatalf("the second rebuild of the pass waited %v for a prune already known stuck", took)
+	}
+}

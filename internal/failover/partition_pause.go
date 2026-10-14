@@ -32,7 +32,7 @@ type pauseWait struct {
 	deadline time.Time // monotonic (c.mono)
 	fenceAt  time.Time // c.now() at the fence, for fenceStillStands
 	wait     time.Duration
-	refused  string // why the deadline last refused, "" before it has
+	refused  string // the kind of the deadline's last refusal (pauseVerdict.key), "" before it has
 }
 
 // mono is the monotonic clock the pause deadline is measured on. It is never

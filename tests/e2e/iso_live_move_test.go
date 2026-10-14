@@ -64,10 +64,17 @@ func prepareISOLinks(l *lab, up []string) {
 // isoVM deploys a small VM pinned to host whose installer ISO is the link.
 func isoVM(l *lab, via, host string) string {
 	l.t.Helper()
+	return isoVMWith(l, via, host, "")
+}
+
+// isoVMWith is isoVM with extra VM-level compose lines (each indented four
+// spaces, newline-terminated), e.g. a stop-grace-period.
+func isoVMWith(l *lab, via, host, extra string) string {
+	l.t.Helper()
 	stack := uniqueName("isomv")
 	name := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    iso: %s/x.iso\n    placement:\n      host: %s\n",
-		stack, name, drillImage(), drillMemory(), isoLinkDir, host)
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    iso: %s/x.iso\n%s    placement:\n      host: %s\n",
+		stack, name, drillImage(), drillMemory(), isoLinkDir, extra, host)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(via, file, yaml)
 	l.t.Cleanup(func() { l.deleteVMs(stack, map[string]string{host: name}) })
@@ -175,11 +182,17 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 	up := labUpHosts(l, 2)
 	via, src := up[0], up[len(up)-1]
 	prepareISOLinks(l, up)
-	vm := isoVM(l, via, src)
+	// The VM's disk is host-local, so the drain moves it cold: it asks the guest
+	// to shut down (ACPI) and waits out the VM's stop timeout (30 s by default,
+	// and a guest that has not shut down by then is NOT forced off: the VM is
+	// "not moved"), then copies the disks. Give the guest a realistic stop
+	// grace period, and the CLI the budget the suite's other drains use
+	// (drainCLITimeout) instead of the 2 minutes of an ordinary lv call.
+	vm := isoVMWith(l, via, src, "    stop-grace-period: 120s\n")
 	requireISOOpened(l, src, vm, isoFileOf(src))
 
 	t.Cleanup(func() { l.lv(via, "host", "undrain", src) })
-	out, err := l.lv(via, "host", "drain", src)
+	out, err := l.lvTimeout(via, drainCLITimeout, "host", "drain", src)
 	if err != nil && !strings.Contains(out, "drain incomplete") {
 		t.Fatalf("drain %s: %v\n%s", src, err, out)
 	}

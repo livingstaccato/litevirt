@@ -194,7 +194,11 @@ func TestContainer_Migrate_RefusesOntoAnOccupiedName(t *testing.T) {
 	repo := filepath.Join(t.TempDir(), "migrate-repo")
 	lv(t, "backup", "repo", "init", repo)
 
-	out, err := lvErr(t, "ct", "migrate", name, target, "--repo", repo)
+	// Both hosts hold a container of this name, so the source must be named
+	// (--source): without it the CLI is refused earlier with "exists on 2
+	// hosts ... pass --host", an ambiguity refusal that never reaches the
+	// target-collision check this test pins.
+	out, err := lvErr(t, "ct", "migrate", name, target, "--source", localHost, "--repo", repo)
 	if err == nil {
 		t.Fatal("migrate onto a name the target already holds succeeded; it must be refused")
 	}

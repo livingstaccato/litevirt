@@ -230,15 +230,28 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	if !virshAvailable() {
 		t.Skip("needs virsh on a cluster node")
 	}
+	// The destination must be ACTIVE, not this host, and have room for the
+	// guest (2 vCPU, 1024 MiB, plus qemu overhead): a host without it refuses
+	// the migration on capacity, which says nothing about the limits.
+	const needMiB = 1024 + 256
 	var target string
+	sawOther := false
 	for _, line := range strings.Split(lv(t, "host", "ls"), "\n") {
 		f := strings.Fields(line)
-		if len(f) > 3 && strings.Contains(line, "ACTIVE") && f[0] != localHost {
-			target = f[0]
-			break
+		if len(f) < 5 || !strings.Contains(line, "ACTIVE") || f[0] == localHost {
+			continue
 		}
+		sawOther = true
+		if free(t, f[3]) < 2 || free(t, f[4]) < needMiB {
+			continue
+		}
+		target = f[0]
+		break
 	}
 	if target == "" {
+		if sawOther {
+			t.Skipf("no other active host has 2 free vCPUs and %d MiB free memory for the guest", needMiB)
+		}
 		t.Skip("needs a second active host")
 	}
 	name := uniqueName("limmig")

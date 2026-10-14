@@ -188,6 +188,27 @@ func TestLimits_Removed(t *testing.T) {
 	}
 }
 
+// Newer libvirt reports a cleared CPU cap as its unlimited sentinel, not -1.
+func TestLimits_RemovedAcceptsLibvirtUnlimitedSentinel(t *testing.T) {
+	gone := strings.NewReplacer(
+		"global_quota   : 150000", "global_quota   : 17592186044415",
+		"cpu_shares     : 400", "cpu_shares     : 100",
+		"cpu.weight=400", "cpu.weight=100",
+		"libvirt/cpu.max=150000 100000", "libvirt/cpu.max=max 100000",
+		"inbound.average: 2000", "inbound.average: 0",
+		"outbound.average: 2000", "outbound.average: 0",
+		"class htb 1:1 root leaf 2: prio 0 rate 16Mbit ceil 16Mbit burst 1600b cburst 1600b \n", "",
+	).Replace(v2Out)
+	if p := ParseLimits("n", gone).RemovedProblems("16Mbit"); len(p) != 0 {
+		t.Fatalf("the unlimited sentinel was reported as a live cap: %v", p)
+	}
+	// A real quota is still a problem.
+	still := strings.Replace(gone, "global_quota   : 17592186044415", "global_quota   : 150000", 1)
+	if p := ParseLimits("n", still).RemovedProblems("16Mbit"); len(p) == 0 {
+		t.Fatal("a live 150000 quota was not reported")
+	}
+}
+
 // libvirt's behaviour on the tap after a clear was never observed. The cap is
 // gone when EITHER domiftune reads 0 OR no class at the old rate remains; only
 // both still showing the old limit is a failure.

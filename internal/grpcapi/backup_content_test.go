@@ -282,7 +282,7 @@ type failingBackupReader struct {
 func (r *failingBackupReader) ReadAt(p []byte, off int64) (int, error) {
 	return 0, errors.New("write unix @->/var/lib/litevirt/backup-sock/x/nbd: write: broken pipe")
 }
-func (r *failingBackupReader) IOFault() string { return r.fault }
+func (r *failingBackupReader) FailureCause() string { return r.fault }
 
 // A guest-content push that fails reading the NBD export names the VM disk it
 // was reading and the I/O error qemu reported, and keeps the original error.
@@ -296,7 +296,7 @@ func TestBackupSnapshot_FailedReadNamesTheDiskAndTheIOError(t *testing.T) {
 	const diskPath = "/mnt/nfs-pool/vm1-root.qcow2"
 	failing := &failingBackupReader{
 		fakeBackupReader: fakeBackupReader{data: make([]byte, CS), extents: [][2]int64{{0, CS}}},
-		fault:            "an I/O error on disk vda",
+		fault:            "the backup job failed: error reading from the disk: Input/output error",
 	}
 	s.SetBackupSource(&deadExportSource{fakeBackupSource: &fakeBackupSource{}, reader: failing})
 
@@ -320,7 +320,7 @@ func TestBackupSnapshot_FailedReadNamesTheDiskAndTheIOError(t *testing.T) {
 	if err == nil {
 		t.Fatal("a backup whose export died succeeded")
 	}
-	for _, want := range []string{diskPath, "nfs-pool", `"vm1"`, "an I/O error on disk vda", "broken pipe", "read source at offset"} {
+	for _, want := range []string{diskPath, "nfs-pool", `"vm1"`, "Input/output error", "cause: the backup job failed", "broken pipe", "read source at offset"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error lacks %q: %v", want, err)
 		}
@@ -334,4 +334,28 @@ type deadExportSource struct {
 
 func (s *deadExportSource) BeginBackup(domain, diskPath, parentCP, newCP string) (BackupReader, error) {
 	return s.reader, nil
+}
+
+// formatBackupPushError always names the disk and keeps the original error,
+// and says plainly when no cause was available instead of implying qemu
+// reported none.
+func TestFormatBackupPushError(t *testing.T) {
+	disk := &corrosion.DiskRecord{DiskName: "root", Path: "/mnt/p/vm1.qcow2", StorageType: "nfs", StorageVolume: "p"}
+	orig := errors.New("read source at offset 12582912: write: broken pipe")
+
+	got := formatBackupPushError("vm1", disk, orig, "the backup job failed: Input/output error")
+	for _, want := range []string{`disk "root" of "vm1"`, "/mnt/p/vm1.qcow2", "storage nfs p", "broken pipe", "cause: the backup job failed: Input/output error"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("with a cause, message lacks %q: %s", want, got)
+		}
+	}
+	got = formatBackupPushError("vm1", &corrosion.DiskRecord{DiskName: "root", Path: "/d"}, orig, "")
+	for _, want := range []string{"/d", "broken pipe", "no cause was available"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("without a cause, message lacks %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, ", storage ") || strings.Contains(got, "; cause: ") {
+		t.Errorf("an empty cause or storage leaked into the message: %s", got)
+	}
 }

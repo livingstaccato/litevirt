@@ -3013,6 +3013,23 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// never removed on a guess. A disk whose removal fails fails the
 		// delete, and the record stays.
 		if !req.KeepDisks {
+			// A row being started (pending/starting: a failover's start, or
+			// one re-armed after a cancel) is one the reconciler starts, and
+			// a transfer start rebuilds a missing disk from its image. A
+			// delete that removes some disks and then fails would leave it
+			// to boot the VM being deleted on blank disks. So, before any
+			// disk is removed, the row is recorded stopped by its operator,
+			// as a delete that fails after its stop leaves it
+			// (abortDeleteAfterStop): no start path starts it, whatever
+			// this delete then manages. Nothing is removed when that write
+			// fails.
+			if (vm.State == "pending" || vm.State == "starting") && vm.HostName == s.hostName {
+				if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+					return nil, status.Errorf(codes.Internal,
+						"cannot delete VM %q: it is being started (%s), and recording its stop before its disks are removed failed; nothing was removed: %v",
+						req.Name, vm.State, werr)
+				}
+			}
 			_, derr := s.virt.DomainIsActive(req.Name)
 			domainGone := lv.IsNoDomain(derr)
 			cephKept, keptDisks, leftovers := s.freeRecordedVMDisks(ctx, req.Name, func(d *corrosion.DiskRecord) (bool, string, string) {

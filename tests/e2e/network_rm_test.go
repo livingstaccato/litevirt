@@ -100,7 +100,7 @@ func delTestLink(t *testing.T, link string) {
 
 // (a) A bridge network created without --interface makes its bridge, and a
 // record of it, on the host that serves the create; `lv network rm` removes
-// both from every host that has them.
+// both from the host that made them.
 func TestNetwork_RmRemovesTheBridgeLitevirtCreated(t *testing.T) {
 	requireHosts(t, 1)
 	name := shortNetName("nb")

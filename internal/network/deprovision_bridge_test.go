@@ -16,16 +16,15 @@ import (
 
 // `lv network rm` of a bridge network litevirt created (`--type bridge` with no
 // --interface, or a compose network) tore down its dnsmasq, gateway address
-// and NAT, and left the Linux bridge itself on EVERY host: Deprovision skipped
-// the delete for every bridge, because it could not tell its own bridge from an
-// operator's infrastructure bridge. The lab removed dozens by hand, on the
-// deleting node and on every peer (the peers' network reconciler calls the
-// same Deprovision on the tombstone).
+// and NAT, and left the Linux bridge itself on the host that served the
+// delete: Deprovision skipped the delete for every bridge, because it could
+// not tell its own bridge from an operator's infrastructure bridge.
 //
 // EnsureBridge now records the bridges it created, and Deprovision removes a
 // bridge only when that record says litevirt made it, nothing is plugged into
-// it, it carries no address, and no live network still names it. An operator's
-// bridge — one litevirt found already there — is never removed.
+// it, it carries no address, no live network still names it, and no VM or
+// container on this host has a NIC on it. An operator's bridge — one litevirt
+// found already there — is never removed.
 func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 	type env struct {
 		db      *corrosion.Client
@@ -173,6 +172,79 @@ func TestDeprovision_RemovesOnlyTheBridgeLitevirtCreated(t *testing.T) {
 		}
 		if got := strings.Join(e.deleted(), ","); got != br {
 			t.Fatalf("ip link del issued for %q, want %q", got, br)
+		}
+	})
+
+	// A workload on this host whose NIC attaches to the bridge keeps it, even
+	// with no port on it: a stopped VM has no tap, and a VM start does not
+	// re-create its bridge, so removing it would leave the VM unable to start.
+	seedVM := func(t *testing.T, e env, vm, host, network string) {
+		t.Helper()
+		if err := corrosion.InsertVM(ctx, e.db, corrosion.VMRecord{Name: vm, HostName: host, State: "stopped", Spec: "{}"},
+			[]corrosion.InterfaceRecord{{VMName: vm, NetworkName: network, Ordinal: 0, MAC: "52:54:00:00:00:01"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keptForWorkload := func(t *testing.T, e env) {
+		t.Helper()
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := e.deleted(); len(got) != 0 {
+			t.Fatalf("ip link del issued for %v while a workload on this host names the bridge", got)
+		}
+		if _, err := os.Stat(filepath.Join(createdBridgeDir, br)); err != nil {
+			t.Errorf("the created-bridge record was dropped while the bridge stayed: %v", err)
+		}
+	}
+
+	t.Run("a stopped VM on this host on the deleted network (rm --force): kept", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+		seedVM(t, e, "vm1", "h", "nr")
+		keptForWorkload(t, e)
+	})
+
+	t.Run("a stopped VM on this host whose NIC names the bridge itself: kept", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+		seedVM(t, e, "vm1", "h", br)
+		keptForWorkload(t, e)
+	})
+
+	t.Run("a container on this host with a raw bridge NIC on it: kept", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+		if err := corrosion.UpsertContainer(ctx, e.db, corrosion.ContainerRecord{
+			HostName: "h", Name: "ct1", State: "stopped",
+			CreateSpec: `{"networks":[{"name":"eth0","bridge":"` + br + `"}]}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		keptForWorkload(t, e)
+	})
+
+	t.Run("a VM on another host on the network: removed here", func(t *testing.T) {
+		e := setup(t, "")
+		if err := EnsureBridge(br); err != nil {
+			t.Fatal(err)
+		}
+		mkBridge(t, e, br)
+		seedVM(t, e, "vm1", "other", "nr")
+		if err := Deprovision(ctx, e.db, "nr", def, "h"); err != nil {
+			t.Fatalf("Deprovision: %v", err)
+		}
+		if got := strings.Join(e.deleted(), ","); got != br {
+			t.Fatalf("ip link del issued for %q, want %q: a VM on another host kept this host's bridge", got, br)
 		}
 	})
 

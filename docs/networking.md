@@ -29,9 +29,15 @@ created it on that host. Each daemon records the bridges it creates under
 goes at reboot, along with the bridge). A bridge deleted and made again under
 the same name has a new index, so its old record is dropped, not trusted. The
 bridge is removed once it has no ports and no address other than the kernel's
-IPv6 link-local one, and no other live network names it. An operator's bridge
-that litevirt found already there, such as `br0` above, is never removed.
-Neither is a bridge made by an older build, which kept no record.
+IPv6 link-local one, no other live network names it, and no VM or container
+on that host has a NIC on it (a stopped VM has no port on the bridge, but
+needs it to start). An operator's bridge that litevirt found already there,
+such as `br0` above, is never removed. Neither is a bridge made by an older
+build, which kept no record.
+
+The teardown runs on the host that serves the delete. Other hosts where the
+network was provisioned (where VMs on it were placed, or a migration brought
+it) keep their bridge, as before.
 
 ### VXLAN
 

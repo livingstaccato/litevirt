@@ -363,7 +363,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		}
 		// The bridge itself goes only when litevirt created it here and no
 		// other live network names it; an operator's bridge is never deleted.
-		removeCreatedBridge(ctx, db, networkName, bridge)
+		removeCreatedBridge(ctx, db, networkName, bridge, hostName)
 		return nil
 
 	case "vxlan":
@@ -414,15 +414,16 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 
 // removeCreatedBridge removes bridge, the device of bridge network
 // networkName that is being torn down, when this host's record says
-// EnsureBridge created it (RemoveCreatedBridgeIfUnused) and no OTHER live
-// network uses it as its device. networkName itself does not count: its own
-// delete deprovisions before it tombstones the row.
+// EnsureBridge created it (RemoveCreatedBridgeIfUnused), no OTHER live
+// network uses it as its device, and no VM or container on this host still
+// names it (bridgeNamedByWorkload). networkName itself does not count as a
+// network: its own delete deprovisions before it tombstones the row.
 //
 // It is best effort and never fails the teardown: a bridge it cannot prove
 // unshared, or cannot remove, stays, as every bridge network's bridge did
 // before. Without a database there is no way to prove the bridge unshared, so
 // it stays.
-func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName, bridge string) {
+func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName, bridge, hostName string) {
 	if db == nil {
 		return
 	}
@@ -451,6 +452,15 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 			return
 		}
 	}
+	if named, who, err := bridgeNamedByWorkload(ctx, db, hostName, networkName, bridge); err != nil {
+		slog.Warn("network teardown: cannot read this host's workload NICs, so the bridge stays",
+			"network", networkName, "bridge", bridge, "error", err)
+		return
+	} else if named {
+		slog.Info("network teardown: a workload on this host still names the bridge, so it stays",
+			"network", networkName, "bridge", bridge, "workload", who)
+		return
+	}
 	removed, err := RemoveCreatedBridgeIfUnused(bridge)
 	switch {
 	case err != nil:
@@ -459,6 +469,62 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 	case removed:
 		slog.Info("network teardown: removed the bridge litevirt created", "network", networkName, "bridge", bridge)
 	}
+}
+
+// bridgeNamedByWorkload reports whether a live VM or container on hostName has
+// a NIC that attaches to bridge: one naming networkName (a `--force` delete
+// leaves its NICs in place) or naming the bridge itself (a flat-bridge NIC,
+// or a container's raw `bridge=` NIC). It returns which workload names it.
+//
+// The bridge's ports cannot answer this: a stopped VM has no tap on it, and
+// a VM start does not re-create its bridge, so removing it would leave that
+// VM unable to start.
+func bridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, networkName, bridge string) (bool, string, error) {
+	names := func(n string) bool { return n == networkName || n == bridge }
+	for _, q := range []string{
+		`SELECT vi.vm_name AS w, vi.network_name AS n FROM vm_interfaces vi
+		   JOIN vms v ON v.name = vi.vm_name
+		  WHERE v.host_name = ? AND v.deleted_at IS NULL AND vi.deleted_at IS NULL`,
+		`SELECT vn.vm_name AS w, vn.network_name AS n FROM vm_nics vn
+		   JOIN vms v ON v.name = vn.vm_name
+		  WHERE v.host_name = ? AND v.deleted_at IS NULL AND vn.deleted_at IS NULL`,
+		`SELECT ci.ct_name AS w, ci.network_name AS n FROM container_interfaces ci
+		   JOIN containers c ON c.host_name = ci.host_name AND c.name = ci.ct_name
+		  WHERE ci.host_name = ? AND c.deleted_at IS NULL AND ci.deleted_at IS NULL`,
+	} {
+		rows, err := db.Query(ctx, q, hostName)
+		if err != nil {
+			return false, "", err
+		}
+		for _, r := range rows {
+			if names(r.String("n")) {
+				return true, r.String("w"), nil
+			}
+		}
+	}
+	// A container's raw-bridge NIC has no interface row; its create spec
+	// holds the bridge.
+	rows, err := db.Query(ctx,
+		`SELECT name, create_spec FROM containers WHERE host_name = ? AND deleted_at IS NULL`, hostName)
+	if err != nil {
+		return false, "", err
+	}
+	for _, r := range rows {
+		raw := r.String("create_spec")
+		if raw == "" {
+			continue
+		}
+		var spec corrosion.ContainerCreateSpec
+		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+			return false, "", fmt.Errorf("container %s: create spec: %w", r.String("name"), err)
+		}
+		for _, n := range spec.Networks {
+			if n.Bridge == bridge || names(n.NetworkName) {
+				return true, r.String("name"), nil
+			}
+		}
+	}
+	return false, "", nil
 }
 
 // fwScopeNet is the host_fw_intent scope key for a network's provisioning

@@ -68,8 +68,9 @@ func validLinkName(name string) error {
 }
 
 // RemoveBridgeIfUnused deletes bridge name from this host when it exists, is
-// a bridge, has no ports and carries no address (IPv4 or IPv6) — the shape of
-// a bridge litevirt created that nothing uses any more. It
+// a bridge, has no ports and carries no address (IPv4, or IPv6 other than the
+// kernel's fe80:: link-local one) — the shape of a bridge litevirt created
+// that nothing uses any more. It
 // reports whether it deleted it; an absent bridge is (false, nil). A name that
 // is not a valid interface name, or a bridge whose addresses cannot be read,
 // is refused with an error.

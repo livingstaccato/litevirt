@@ -253,9 +253,14 @@ func TestSetup_CriticalLogLevelMappedToError(t *testing.T) {
 }
 
 // PROVIDE_LOG_INCLUDE_CALLER defaults true in provide-telemetry 0.9+, which
-// adds filename/lineno to every record. Through litevirt's gRPC and stdlib log
-// bridges that reports adapter frames and lengthens every journald line, so
-// obs defaults it off; an operator can still opt in.
+// adds filename/lineno to every record. Through the stdlib log bridge that
+// reports adapter frames and lengthens every journald line, so obs defaults
+// it off; an operator can still opt in.
+//
+// On the default local path (no endpoint, no explicit level or format) the
+// record reaches stderr re-logged as a message, with no caller fields
+// whatever the setting, so the line checks below hold either way. The
+// environment check is what pins the default: removing it turns this red.
 func TestSetup_IncludeCallerDefaultsOff(t *testing.T) {
 	lines := captureDaemonStderr(t, Config{ServiceName: "litevirt", HostName: "node-3"}, func() {
 		slog.Info("caller probe")

@@ -57,10 +57,20 @@ func TestDrill_SSHFenceRecordsOffline(t *testing.T) {
 		}
 	}
 
-	state := l.mustSQL(q, "SELECT COALESCE((SELECT state FROM host_membership WHERE host_name='"+victim+
-		"'), (SELECT state FROM hosts WHERE name='"+victim+"' AND deleted_at IS NULL))")
+	// q's replica is not ordered against what virsh shows: the coordinator
+	// (not necessarily q) writes the state before the reschedule, and q can
+	// read it a replication cycle after the replacement already runs (lab 2:
+	// `active` once, `lv host ls` HOST_OFFLINE right after). Polled briefly.
+	var state [][]string
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(2 * time.Second) {
+		state = l.mustSQL(q, "SELECT COALESCE((SELECT state FROM host_membership WHERE host_name='"+victim+
+			"'), (SELECT state FROM hosts WHERE name='"+victim+"' AND deleted_at IS NULL))")
+		if (len(state) == 1 && state[0][0] == "offline") || time.Now().After(deadline) {
+			break
+		}
+	}
 	if len(state) != 1 || state[0][0] != "offline" {
-		t.Errorf("%s is recorded %v after its SSH fence, want offline", victim, state)
+		t.Errorf("%s is recorded %v 30s after its SSH fence's recovery, want offline", victim, state)
 	}
 	fences := l.mustSQL(q, "SELECT method, result FROM fencing_log WHERE host_name='"+victim+"' AND timestamp >= '"+since+"'")
 	sshFenced := false

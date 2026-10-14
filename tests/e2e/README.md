@@ -53,11 +53,13 @@ go test ./tests/e2e/ -v -timeout 10m -run TestError
 | `LV_BIN` | (required) | Path to the litevirt/lv binary under test. Enforced so a run can never silently exercise a stale system-wide `lv`. |
 | `LV_HOST` | (required for remote mode) | SSH target for CLI, e.g. `root@10.0.50.10`. Omit when running ON a cluster node. |
 | `E2E_IMAGE` | `ubuntu` | Base image name for test VMs |
+| `E2E_VM_MEMORY` | `512` | Memory (MiB) of a test VM that needs none in particular |
+| `E2E_AGENT_VM_MEMORY` | `1024` | Memory (MiB) of a guest-agent VM (`TestGuestExec`, the networking agents) |
 | `E2E_HOSTS` | (auto-detected) | Comma-separated host names |
 | `E2E_REST_URL` | `http://<first-host>:7446` | REST API base URL |
 | `E2E_REST_TOKEN` | (skip REST tests) | API token for REST tests |
 | `LV_E2E_DR_REPO` | (skip container replication test) | A backup repo name the second host has in `backup_repos`, initialised, to hold container replicas (`container_replication_test.go`). |
-| `E2E_KNOWN_AUDIT_FORK` | (none) | `<row-id>@<host>` of the one audit-log fork already present on the cluster (lab 1's chain id is `b9fbdd30d8a95d0c`; the row is the one `lv audit verify` prints under "forked chain", the host the one named on its `repeats seq` lines). `TestAuditVerifyReportsSigningState` then skips only when verify reports exactly that fork: a second fork, another host, any other break or any tampering still fails it |
+| `E2E_KNOWN_AUDIT_FORK` | (none) | Comma-separated `<row-id>@<host>` of the audit-log forks already present on the cluster (lab 1: `b9fbdd30d8a95d0c@node-3,9bcb8393aec73858@node-4`; a row is one `lv audit verify` prints under "forked chain" or on a `repeats seq` line, the host the one named on that fork's `repeats seq` lines). `TestAuditVerifyReportsSigningState` then skips only when the first broken row is one of the named rows and every duplicate is on a named host: a fork on another host, any other break or any tampering still fails it |
 | `E2E_SKIP_SLOW` | `0` | Set to `1` to skip migration/backup tests |
 | `E2E_CERT_RENEW` | `0` | Set to `1` to run `TestCert_RenewHostCertificateInPlace`: renews a peer's cluster certificate with `lv host renew-cert` (revoking the old one) and checks gRPC (7443) and libvirt (16514) present the successor and the host stays active. Run on the machine holding the cluster CA key |
 | `E2E_UI_CERT` | `0` | Set to `1` to run `TestCert_UICertificateSetAndClear`: installs a custom UI certificate on this node, checks 127.0.0.1:7445 serves it without a restart, then clears it |

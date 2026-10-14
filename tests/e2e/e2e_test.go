@@ -60,6 +60,15 @@ var (
 	localHost string // name of the host we're running on
 )
 
+// vmMemory is the memory (MiB) of a test VM whose test needs none in
+// particular. Lab nodes have about 3 GiB, and the planner charges 128 MiB of
+// qemu overhead on top, so 1 GiB VMs left whole tests unplaceable.
+func vmMemory() string { return envOr("E2E_VM_MEMORY", "512") }
+
+// agentVMMemory is the memory (MiB) of a guest-agent VM, which installs
+// packages at first boot.
+func agentVMMemory() string { return envOr("E2E_AGENT_VM_MEMORY", "1024") }
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -839,7 +848,7 @@ func TestVM_CreateStartStopDelete(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 
 	// Wait for VM to be visible (may take a moment for state to replicate).
@@ -876,7 +885,7 @@ func TestVM_ForceStop(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -893,7 +902,7 @@ func TestVM_Stats(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -912,7 +921,7 @@ func TestVM_Logs(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -933,7 +942,7 @@ func TestVM_Update(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -961,7 +970,7 @@ func TestVM_Snapshots(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1004,7 +1013,7 @@ func TestVM_LiveMigrate(t *testing.T) {
 	dst := hostNames[1]
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", src)
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1033,7 +1042,7 @@ func TestVM_ColdMigrate(t *testing.T) {
 	dst := hostNames[1]
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", src)
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1099,7 +1108,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -1141,7 +1150,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     replicas: 2
@@ -1188,7 +1197,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     replicas: %d
@@ -1240,7 +1249,7 @@ vms:
   %s:
     image: %s
     cpu: %d
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     replicas: 2
@@ -1595,7 +1604,7 @@ func TestREST_VMLifecycle(t *testing.T) {
 
 	// Create via CLI.
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1673,7 +1682,7 @@ func TestCluster_StateConvergence(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1749,7 +1758,7 @@ func TestError_MigrateToSameHost(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1775,12 +1784,12 @@ func TestError_DuplicateVMName(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
 	_, err := lvErr(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	if err == nil {
 		t.Error("expected error creating duplicate VM name")
@@ -1791,7 +1800,7 @@ func TestError_DuplicateVMName(t *testing.T) {
 func TestError_InvalidImage(t *testing.T) {
 	name := uniqueName("vm")
 	_, err := lvErr(t, "run", "--name", name, "--image", "e2e-nonexistent-image-12345",
-		"--cpu", "1", "--memory", "1024", "--disk", "5G")
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G")
 	if err == nil {
 		t.Error("expected error with invalid image")
 		lvErr(t, "rm", name, "--force")
@@ -1852,7 +1861,7 @@ func TestConcurrent_MultipleVMCreate(t *testing.T) {
 			defer wg.Done()
 			host := hostNames[idx%len(hostNames)]
 			_, errs[idx] = lvErr(t, "run", "--name", names[idx], "--image", testImage,
-				"--cpu", "1", "--memory", "1024", "--disk", "5G",
+				"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 				"--host", host)
 		}(i)
 	}
@@ -1903,7 +1912,7 @@ func TestVM_BackupRestore(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -1937,7 +1946,7 @@ func TestVM_AttachDetachDisk(t *testing.T) {
 	})
 
 	lv(t, "run", "--name", name, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
@@ -2000,7 +2009,7 @@ func TestVM_AttachDetachNIC(t *testing.T) {
 		"--subnet", "172.32.0.0/24", "--dhcp")
 
 	lv(t, "run", "--name", vmName, "--image", testImage,
-		"--cpu", "1", "--memory", "1024", "--disk", "5G",
+		"--cpu", "1", "--memory", vmMemory(), "--disk", "5G",
 		"--host", host)
 	waitVM(t, vmName, "RUNNING", 2*time.Minute)
 
@@ -2285,7 +2294,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2345,7 +2354,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2359,7 +2368,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2440,7 +2449,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2464,7 +2473,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2586,9 +2595,9 @@ vms:
   %s:
     image: %s
     cpu: 2
-    memory: 2048
+    memory: `+agentVMMemory()+`
     min-memory: 512
-    max-memory: 2048
+    max-memory: `+agentVMMemory()+`
     guest-agent: true
     disks: {root: 8G}
     network: [{name: %s}]
@@ -2779,7 +2788,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -2790,7 +2799,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:
@@ -3145,7 +3154,7 @@ func TestSnapshotType(t *testing.T) {
 		lvErr(t, "snapshot", "rm", name, "mem-snap")
 		lvErr(t, "rm", name, "--force")
 	})
-	lv(t, "run", "--name", name, "--image", testImage, "--cpu", "1", "--memory", "1024", "--disk", "5G", "--host", hostNames[0])
+	lv(t, "run", "--name", name, "--image", testImage, "--cpu", "1", "--memory", vmMemory(), "--disk", "5G", "--host", hostNames[0])
 	waitVM(t, name, "RUNNING", 2*time.Minute)
 
 	// A memory (live) snapshot should report type=memory.
@@ -3184,7 +3193,7 @@ vms:
   %s:
     image: %s
     cpu: 1
-    memory: 1024
+    memory: `+vmMemory()+`
     disks:
       root: 5G
     network:

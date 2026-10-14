@@ -1370,6 +1370,24 @@ func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string
 	return true, ""
 }
 
+// startedDetail is the state_detail a reconciler start records on success: why
+// the VM was started, read from the row the start was decided from. A start an
+// operator re-armed (`lv start` after `lv stop --force`) and an onboot start
+// are not failovers; anything else is the failover/reschedule start this
+// detail was written for.
+func (r *Reconciler) startedDetail(vm corrosion.VMRecord) string {
+	if strings.HasPrefix(vm.StateDetail, "operator start") {
+		return "started by reconciler: operator start re-armed"
+	}
+	r.onbootMu.Lock()
+	_, onboot := r.onbootPending[vm.Name]
+	r.onbootMu.Unlock()
+	if onboot {
+		return "started by reconciler: onboot"
+	}
+	return "started by reconciler after failover"
+}
+
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
 	// A start that would be deferred for want of time is left as it is
 	// before anything is done for it — no lease, no proof claimed, no
@@ -2073,7 +2091,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				"vm", vm.Name, "proof", proofID, "error", err)
 		}
 	} else if err := r.publishRunning(commitCtx, vm.Name, "running", func(ctx context.Context) error {
-		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
+		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", r.startedDetail(vm))
 	}); err != nil {
 		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)

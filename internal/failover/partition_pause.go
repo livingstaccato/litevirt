@@ -181,11 +181,14 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		return true
 	}
 	delete(c.pauseWaits, host)
-	why, only, ok := c.selfPauseStillStands(ctx, h, w.fenceAt)
+	why, only, ok, bridged := c.selfPauseStillStands(ctx, h, w.fenceAt)
 	if !ok {
-		c.refusePauseWait(ctx, host, w, why)
+		c.refusePauseWait(ctx, h, w, why, bridged)
 		return false
 	}
+	// The deadline went ahead: whatever its limit leaves on the host is named
+	// by the stall alert (unpausedHeld), not as a bridged hold.
+	c.resolveBridged(ctx, host, "the partition-pause deadline went ahead")
 	slog.Info("failover: partition-pause deadline passed; recovering the host's workloads",
 		"host", host, "waited", w.wait, "assurance", corrosion.FenceSelfPaused, "only_reported_paused", only != nil)
 	// The limit lasts for the down-episode, not this one pass: every later
@@ -203,11 +206,16 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // refusePauseWait keeps a wait whose deadline refused, so the next cycle
 // re-checks it: a read error, or a condition that replicates a moment after
 // the deadline, would otherwise leave the paused workloads running nowhere
-// until the lease moved. The stall alert names the refusal and its reason.
-func (c *Coordinator) refusePauseWait(ctx context.Context, host string, w pauseWait, why string) {
+// until the lease moved. The stall alert names the refusal and its reason. A
+// bridged refusal (selfPauseStillStands) also raises ha.recovery.bridged,
+// once per change of reason rather than on every re-check.
+func (c *Coordinator) refusePauseWait(ctx context.Context, h *corrosion.HostRecord, w pauseWait, why string, bridged bool) {
+	host := h.Name
 	level := slog.LevelWarn
 	if w.refused == why {
 		level = slog.LevelDebug // the same refusal, re-checked every cycle
+	} else if bridged {
+		c.noteBridgedStall(ctx, h, w.fenceAt, why)
 	}
 	w.refused = why
 	c.pauseWaits[host] = w
@@ -254,50 +262,63 @@ func (c *Coordinator) refusePauseWait(ctx context.Context, host string, w pauseW
 //
 // In both, a limit this coordinator already holds for the host keeps to the
 // host's listed workloads as above (quietFallback).
-func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (why string, only map[string]bool, ok bool) {
+//
+// bridged reports a refusal that rests only on observers having seen the host
+// answer since the fence, with no voter majority among them: the stall a host
+// reaching both halves of a split causes (ha.recovery.bridged); a read error
+// of host_health is not one. It changes no decision.
+func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (why string, only map[string]bool, ok, bridged bool) {
 	if !c.relyOnPartitionPause(ctx, h) {
-		return c.quietFallback(ctx, h.Name, at)
+		why, only, ok, _ = c.quietFallback(ctx, h.Name, at)
+		return why, only, ok, false
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if err != nil {
 		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return "voter set unreadable", nil, false
+		return "voter set unreadable", nil, false, false
 	}
 	if !explicit {
 		return c.quietFallback(ctx, h.Name, at)
 	}
 	if !c.observerStreakSpans(ctx, h.Name, at) {
-		return "no observer has watched the host stay down since the fence", nil, false
+		return whyNoStreakSpans, nil, false, false
 	}
 	if why, ok := c.answeredByAVoterMajority(ctx, h.Name, sets); !ok {
-		return why, nil, false
+		return why, nil, false, false
 	}
 	answered, quiet := c.answeredSince(ctx, h.Name, at)
 	if quiet {
-		return c.pausedThisOutage(ctx, h.Name, at, sets)
+		why, only, ok = c.pausedThisOutage(ctx, h.Name, at, sets)
+		return why, only, ok, false
 	}
 	if answered == whyHealthUnreadable {
-		return answered, nil, false
+		return answered, nil, false, false
 	}
 	paused, reason, ok := c.hostReportsItsPause(ctx, h.Name, at, sets)
 	if !ok {
-		return answered + ", and " + reason, nil, false
+		return answered + ", and " + reason, nil, false, true
 	}
-	return "", paused, true
+	return "", paused, true, false
 }
 
 // quietFallback is fenceStillStands, for a deadline that keeps its rule
 // (selfPauseStillStands). When it holds and this coordinator already limits
 // the host's recovery from earlier in the down-episode, the host's own word
 // still bounds what moves: pausedThisOutage, dating the outage over the voter
-// set this cycle decides on.
-func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Time) (string, map[string]bool, bool) {
-	why, ok := c.fenceStillStands(ctx, host, at)
-	if !ok || c.recoverOnly[host] == nil {
-		return why, nil, ok
+// set this cycle decides on. answered reports a refusal on an observer having
+// seen the host answer since the fence (not a read error): the bridged form
+// selfPauseStillStands reports.
+func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Time) (why string, only map[string]bool, ok, answered bool) {
+	why, ok = c.fenceStillStands(ctx, host, at)
+	if !ok {
+		return why, nil, false, why != whyNoStreakSpans && why != whyHealthUnreadable
 	}
-	return c.pausedThisOutage(ctx, host, at, []map[string]bool{c.scope.voters(host)})
+	if c.recoverOnly[host] == nil {
+		return why, nil, true, false
+	}
+	why, only, ok = c.pausedThisOutage(ctx, host, at, []map[string]bool{c.scope.voters(host)})
+	return why, only, ok, false
 }
 
 // pausedThisOutage is the limit for a deadline at which no observer has seen

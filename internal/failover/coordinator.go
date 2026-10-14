@@ -1194,6 +1194,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// Name each host whose recovery has stalled, and why
 		// (alertStalledRecoveries).
 		c.alertStalledRecoveries(ctx, byHost)
+		c.resolveBridgedSettled(ctx, byHost, c.noteBridgedBeforeFence(ctx))
 	}
 }
 
@@ -2138,10 +2139,14 @@ const fenceSkewMargin = 5 * time.Second
 //     host that answered after a best-effort one was never off.
 func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time.Time) (string, bool) {
 	if !c.observerStreakSpans(ctx, host, at) {
-		return "no observer has watched the host stay down since the fence", false
+		return whyNoStreakSpans, false
 	}
 	return c.answeredSince(ctx, host, at)
 }
+
+// whyNoStreakSpans is fenceStillStands' refusal reason when no observer's
+// failing run spans the fence.
+const whyNoStreakSpans = "no observer has watched the host stay down since the fence"
 
 // whyHealthUnreadable is the refusal reason when host_health cannot be read.
 const whyHealthUnreadable = "host_health unreadable"
@@ -4317,19 +4322,9 @@ func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error
 	// Read ONCE per cycle, not once per down host: ListBackupSchedules has no
 	// host or vm_name predicate (a full scan), and the map it builds is keyed by
 	// VM name across the whole fleet, so it is byte-identical for every host.
-	// The c.Promoter guard mirrors the reschedule loop's, so a VM is treated as
-	// promotable here exactly when that loop would try to promote it.
-	enrolled := map[string]bool{}
-	if c.Promoter != nil {
-		rows, serr := corrosion.ListBackupSchedules(ctx, c.db)
-		if serr != nil {
-			return nil, serr
-		}
-		for _, r := range rows {
-			if r.Type == "replication" && r.AutoPromote {
-				enrolled[r.VMName] = true
-			}
-		}
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	if err != nil {
+		return nil, err
 	}
 	total := map[string]int{}
 	for _, h := range hosts {
@@ -4368,6 +4363,26 @@ func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error
 		}
 	}
 	return total, nil
+}
+
+// autoPromoteEnrolled is every VM with an auto-promote replication schedule.
+// The c.Promoter guard mirrors the reschedule loop's, so a VM is treated as
+// promotable exactly when that loop would try to promote it.
+func (c *Coordinator) autoPromoteEnrolled(ctx context.Context) (map[string]bool, error) {
+	enrolled := map[string]bool{}
+	if c.Promoter == nil {
+		return enrolled, nil
+	}
+	rows, err := corrosion.ListBackupSchedules(ctx, c.db)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		if r.Type == "replication" && r.AutoPromote {
+			enrolled[r.VMName] = true
+		}
+	}
+	return enrolled, nil
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.

@@ -111,3 +111,45 @@ func TestStackReconciler_DeletesContainersAndKeepsNetworksWhileOneFails(t *testi
 		t.Errorf("deprovisioned %v once the container delete succeeded, want app_lan", c.deprovisioned)
 	}
 }
+
+// A stack the reconciler finishes takes its firewall rows and backup repos
+// with it, as a DeleteStack that completes does. A `compose down` of a stack
+// whose compose up failed part way leaves the stack 'deleting' (the file
+// names a member that was never created), and the reconciler finishing it
+// left the stack's security groups behind: the next deploy of the same file
+// was refused, "security-group ... is already defined by stack" (lab 1 `web`,
+// lab 2 `noicmp`).
+//
+// Mutation: drop the firewall tombstone from the reconciler's last step — the
+// security group outlives the stack.
+func TestStackReconciler_FinishedStackTakesItsFirewallAndRepos(t *testing.T) {
+	db := seedDeletingStack(t, false, false)
+	ctx := context.Background()
+	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg1", Name: "web", StackName: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg2", Name: "admin", StackName: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupRepo(ctx, db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/b", StackName: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	r := NewStackReconciler("node-0", db)
+	r.SetCleaner(&failingStackCleaner{})
+	r.reconcile(ctx)
+	if st, _ := corrosion.GetStack(ctx, db, "app"); st != nil {
+		t.Fatalf("the stack was not finished: %+v", st)
+	}
+	if sgs, _ := corrosion.ListSecurityGroups(ctx, db, "app"); len(sgs) != 0 {
+		t.Errorf("the finished stack's security groups are still live: %+v", sgs)
+	}
+	if sgs, _ := corrosion.ListSecurityGroups(ctx, db, ""); len(sgs) != 1 || sgs[0].Name != "admin" {
+		t.Errorf("security groups of no stack = %+v, want admin kept", sgs)
+	}
+	repos, _ := corrosion.ListBackupRepos(ctx, db)
+	for _, rp := range repos {
+		if rp.StackName == "app" {
+			t.Errorf("the finished stack's backup repo %s is still registered", rp.Name)
+		}
+	}
+}

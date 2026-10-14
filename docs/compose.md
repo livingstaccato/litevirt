@@ -161,7 +161,10 @@ the teardown in the background, and the `stack.delete` audit entry has result
 containers is left, none of its networks is deprovisioned: a deleted network
 is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and
-removes the networks only once they are all gone. The web UI's stack **Destroy** action
+removes the networks only once they are all gone; when it finishes, the stack's
+security groups, ip sets, cluster rules and backup repos go with it. A first
+`compose up` of a stack that fails before it created any workload removes the
+security groups and backup repos it had registered. The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

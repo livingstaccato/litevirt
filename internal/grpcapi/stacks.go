@@ -34,7 +34,7 @@ import (
 // DeployStack parses a compose YAML, runs the declarative planner to resolve all
 // placement, device, network, LB, and DNS decisions up front, then executes the
 // plan. Dry-run streams the full resolved plan without applying changes.
-func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStreamingServer[pb.DeployProgress]) (err error) {
 	if err := RequireRole(stream.Context(), "operator"); err != nil {
 		return err
 	}
@@ -140,8 +140,23 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Done before VM creation so per-NIC SG bindings resolve against existing
 	// groups. Re-deploy is idempotent: the stack's prior firewall rows are
 	// cleared first. A malformed block (e.g. an IPv6 CIDR) aborts the deploy.
+	// A stack with no record before this deploy has nothing that would ever
+	// tear its firewall rows down if the deploy fails from here on with no
+	// workload made: no stack record is written, so `compose down` cannot
+	// read a file for it, and a security group left behind holds its name
+	// against the next deploy of the same file. Its rows, and the backup
+	// repos it registered, are taken back then. A stack that existed keeps
+	// its rows: they are its config.
+	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
 	if err := s.persistStackFirewall(ctx, f); err != nil {
 		return stackFirewallErr(err)
+	}
+	if priorErr == nil && prior == nil {
+		defer func() {
+			if err != nil {
+				s.undoFailedFirstDeploy(context.WithoutCancel(ctx), f.Name)
+			}
+		}()
 	}
 
 	// Register the stack's backup repos (logical name → path), so a VM's
@@ -235,6 +250,26 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
+}
+
+// undoFailedFirstDeploy tombstones the firewall rows and backup repos a failed
+// first deploy of stack wrote, when no workload of the stack exists: with one,
+// its NICs may be bound to the groups and `compose down` (which finds it by
+// its stack_name) is the way out. Best effort, logged.
+func (s *Server) undoFailedFirstDeploy(ctx context.Context, stack string) {
+	vms, verr := corrosion.ListVMs(ctx, s.db, stack, "")
+	cts, cerr := corrosion.ListContainersByStack(ctx, s.db, stack)
+	if verr != nil || cerr != nil || len(vms) > 0 || len(cts) > 0 {
+		slog.Warn("stack deploy failed: its firewall rows are kept, a workload of the stack exists or cannot be ruled out; `lv compose down` removes them",
+			"stack", stack, "vms", len(vms), "containers", len(cts), "vm_error", verr, "container_error", cerr)
+		return
+	}
+	if err := corrosion.DeleteStackFirewall(ctx, s.db, stack); err != nil {
+		slog.Warn("stack deploy failed: take back its firewall rows", "stack", stack, "error", err)
+	}
+	if err := corrosion.DeleteStackBackupRepos(ctx, s.db, stack); err != nil {
+		slog.Warn("stack deploy failed: unregister its backup repos", "stack", stack, "error", err)
+	}
 }
 
 // Stack record states. "deleting" is set by DeleteStack and retried by the

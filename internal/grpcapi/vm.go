@@ -1705,7 +1705,7 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 		client, closeConn, err := s.dialPeer(ctx, vm.HostName)
 		if err == nil {
 			defer closeConn()
-			fctx, cancel := context.WithTimeout(ctx, inspectForwardTimeout)
+			fctx, cancel := context.WithTimeout(ctx, s.inspectForwardBound())
 			resp, ferr := client.InspectVM(fctx, req)
 			cancel()
 			if ferr == nil {
@@ -1723,9 +1723,16 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 	return s.vmToProto(ctx, req.Name)
 }
 
-// inspectForwardTimeout bounds InspectVM's forward to the VM's host. A var
-// only so tests can shrink it.
-var inspectForwardTimeout = 5 * time.Second
+// inspectForwardTimeout bounds InspectVM's forward to the VM's host
+// (Server.inspectForwardTimeout replaces it in tests).
+const inspectForwardTimeout = 5 * time.Second
+
+func (s *Server) inspectForwardBound() time.Duration {
+	if s.inspectForwardTimeout > 0 {
+		return s.inspectForwardTimeout
+	}
+	return inspectForwardTimeout
+}
 
 // InspectStaleHeader is the response header InspectVM sets when it answered
 // from this node's replica because the VM's host could not be reached.

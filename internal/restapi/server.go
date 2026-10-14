@@ -79,6 +79,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
@@ -438,10 +439,16 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case action == "" && r.Method == http.MethodGet:
-		resp, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
+		var hdr metadata.MD
+		resp, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name}, grpc.Header(&hdr))
 		if err != nil {
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
+		}
+		// The daemon answered from its replica because the VM's host did not
+		// (grpcapi.InspectStaleHeader): said in a header, the body unchanged.
+		for _, n := range hdr.Get("x-litevirt-inspect-stale") {
+			w.Header().Add("X-Litevirt-Inspect-Stale", n)
 		}
 		jsonProto(w, resp)
 

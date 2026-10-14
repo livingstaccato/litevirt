@@ -50,6 +50,7 @@ type mockGRPC struct {
 	inspectHostResp *pb.Host
 	listVMsResp     *pb.ListVMsResponse
 	inspectVMResp   *pb.VM
+	inspectVMHeader metadata.MD
 	listStacksResp  *pb.ListStacksResponse
 	startVMResp     *pb.VM
 	stopVMResp      *pb.VM
@@ -220,6 +221,11 @@ func (m *mockGRPC) ListVMs(ctx context.Context, in *pb.ListVMsRequest, opts ...g
 }
 func (m *mockGRPC) InspectVM(ctx context.Context, in *pb.InspectVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
 	m.lastInspectVMName = in.Name
+	for _, o := range opts {
+		if h, ok := o.(grpc.HeaderCallOption); ok && m.inspectVMHeader != nil {
+			*h.HeaderAddr = m.inspectVMHeader
+		}
+	}
 	return m.inspectVMResp, nil
 }
 func (m *mockGRPC) StartVM(ctx context.Context, in *pb.StartVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
@@ -958,6 +964,25 @@ func TestInspectVM_Success(t *testing.T) {
 	}
 	if mock.lastInspectVMName != "vm1" {
 		t.Errorf("inspected VM = %q, want vm1", mock.lastInspectVMName)
+	}
+}
+
+// An inspect the daemon answered from its replica (the VM's host did not
+// answer) says so to a REST client too, in X-Litevirt-Inspect-Stale.
+//
+// Mutation: drop the header pass-through — the response carries no note.
+func TestInspectVM_StaleNotePassedThrough(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.inspectVMHeader = metadata.Pairs("x-litevirt-inspect-stale", "host node-1 did not answer")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/vms/vm1", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Litevirt-Inspect-Stale"); got != "host node-1 did not answer" {
+		t.Errorf("X-Litevirt-Inspect-Stale = %q, want the daemon's note", got)
 	}
 }
 

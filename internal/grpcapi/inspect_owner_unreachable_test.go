@@ -45,9 +45,7 @@ func TestInspectVM_OwnerUnreachableAnswersFromTheReplica(t *testing.T) {
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return hangingInspectPeer{}, func() {}, nil
 	}
-	old := inspectForwardTimeout
-	inspectForwardTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { inspectForwardTimeout = old })
+	s.inspectForwardTimeout = 200 * time.Millisecond
 
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

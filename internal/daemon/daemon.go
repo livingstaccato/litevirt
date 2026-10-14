@@ -1243,6 +1243,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire reconciler callbacks now that gRPC server exists.
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
+	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)

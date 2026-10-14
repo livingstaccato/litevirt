@@ -2240,6 +2240,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.endCancelledStartForStart(vm.Name); err != nil {
 		releaseGuard()
 		releasePreflight()
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "start %q: %v", vm.Name, err)
 	}
 	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {

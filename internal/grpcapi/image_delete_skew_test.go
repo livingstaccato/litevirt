@@ -198,3 +198,40 @@ func TestImageSkewHistory_AnEmptyOrCorruptFileIsUnreadable(t *testing.T) {
 		})
 	}
 }
+
+// A skew measured while the history file was unreadable is saved by the first
+// read of the file that succeeds, not only when a new skew is learned: once
+// its clock_skew rows age out, a restart still has it.
+func TestImageSkewHistory_SkewsHeldWhileUnreadableAreSavedOnceItReads(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, imageSkewHistoryFile)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t)
+	s.dataDir = dataDir
+	captureSlog(t)
+	measured := time.Now().UTC().Add(-70 * time.Minute)
+	if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',900,?)`,
+		measured.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	s.recordImageSkew(ctx)
+
+	ageOutClockSkew(t, s, time.Now())
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	s.recordImageSkew(ctx) // reads the (absent) file; no new skew
+	if fi, err := os.Stat(path); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("the skew held in memory was not saved once the file read: %v (err %v)", fi, err)
+	}
+
+	restarted := testServer(t)
+	restarted.dataDir = dataDir
+	deleted := measured.Add(2 * time.Minute).Format(time.RFC3339Nano)
+	if m, err := restarted.imageDeleteMargin(ctx, deleted); err != nil || m != 15*time.Minute {
+		t.Fatalf("after a restart: margin %s (err %v), want the 15m measured while the file was unreadable", m, err)
+	}
+}

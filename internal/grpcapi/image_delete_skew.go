@@ -44,10 +44,11 @@ type skewSeen struct {
 // keeps it. Only the entries no other entry covers are kept: one with a skew
 // at least as large, seen at least as late.
 type imageSkewHistory struct {
-	mu     sync.Mutex
-	loaded bool
-	warned bool // the file's being unreadable is logged (recordImageSkew), once until it is read
-	seen   []skewSeen
+	mu      sync.Mutex
+	loaded  bool
+	warned  bool // the file's being unreadable is logged (recordImageSkew), once until it is read
+	unsaved bool // seen holds entries the file does not: added while it was unreadable, or a save failed
+	seen    []skewSeen
 }
 
 // load reads the history file into the history, until a read succeeds. A file
@@ -55,7 +56,8 @@ type imageSkewHistory struct {
 // it reached the disk), torn or corrupt — is an error: the prune then keeps
 // every deleted image's file the history decides on, until the file is
 // readable or removed (re-review 3, m-4). What was added in memory meanwhile
-// is kept, and merged with the file once it reads.
+// is kept, merged with the file once it reads, and saved by the next
+// recordImageSkew (unsaved).
 func (h *imageSkewHistory) load(dataDir string) error {
 	if h.loaded || dataDir == "" {
 		return nil
@@ -115,7 +117,11 @@ func (h *imageSkewHistory) save(dataDir string) error {
 	if err := secretfile.Write(filepath.Join(dataDir, imageSkewHistoryFile), b, 0o600); err != nil {
 		return err
 	}
-	return syncDirPath(dataDir)
+	if err := syncDirPath(dataDir); err != nil {
+		return err
+	}
+	h.unsaved = false
+	return nil
 }
 
 // recordImageSkew reads every clock_skew row this host holds into the history
@@ -155,11 +161,12 @@ func (s *Server) recordImageSkew(ctx context.Context) time.Duration {
 			"Remove the file to start the history afresh: the skews measured since this daemon started are kept, and those of the last hour are read again from the cluster",
 			"file", filepath.Join(s.dataDir, imageSkewHistoryFile), "error", lerr)
 	}
-	changed := false
 	for _, e := range seen {
-		changed = h.add(e) || changed
+		if h.add(e) {
+			h.unsaved = true
+		}
 	}
-	if changed && lerr == nil {
+	if h.unsaved && lerr == nil {
 		if err := h.save(s.dataDir); err != nil {
 			slog.Warn("image: the clock skews this host has seen are not saved; a restart forgets them", "error", err)
 		}

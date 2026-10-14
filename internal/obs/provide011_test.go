@@ -19,23 +19,76 @@ import (
 // provide-telemetry reserves service, env, version, trace_id and span_id: a
 // caller attribute with one of those keys is dropped once the matching stamped
 // field exists. No litevirt log call may use them as an attribute key. The scan
-// is AST based, so it covers package-level slog functions, *slog.Logger
-// methods, slog.Log/LogAttrs, With and Group arguments and the slog.String/Int/
-// Any... attr constructors, multi-line calls included. The one exception is
-// named exactly: the daemon's startup line logs before obs.Setup runs, so the
-// default logger keeps the key.
+// is AST based and follows slog's own key/value pairing, so a value that
+// happens to read "version" is not a key. It covers package-level slog
+// functions, *slog.Logger methods, slog.Log/LogAttrs, With arguments, the
+// slog.String/Int/Any... attr constructors (and slog.Group's name) and
+// slog.Attr{Key: ...} literals, multi-line calls included. The constructor
+// names only count on the slog package, so a DB row accessor such as
+// rows[0].Int("version") is not a log call. The one exception is named
+// exactly, by file, message and key: the daemon's startup line logs before
+// obs.Setup runs, so the default logger keeps the key.
 func TestNoReservedSlogKeys(t *testing.T) {
 	reserved := map[string]bool{"service": true, "env": true, "version": true, "trace_id": true, "span_id": true}
-	logFuncs := map[string]bool{
-		"Debug": true, "Info": true, "Warn": true, "Error": true,
-		"DebugContext": true, "InfoContext": true, "WarnContext": true, "ErrorContext": true,
-		"Log": true, "LogAttrs": true, "With": true, "Group": true,
-		"String": true, "Int": true, "Int64": true, "Uint64": true, "Float64": true,
-		"Bool": true, "Duration": true, "Time": true, "Any": true,
+	// Method or function name → index of the message argument; the key/value
+	// arguments follow it. With has no message, so its pairs start at 0.
+	msgIndex := map[string]int{
+		"Debug": 0, "Info": 0, "Warn": 0, "Error": 0,
+		"DebugContext": 1, "InfoContext": 1, "WarnContext": 1, "ErrorContext": 1,
+		"Log": 2, "LogAttrs": 2, "With": -1,
 	}
-	// file | first string literal argument (the message) of the exempt call.
+	// Attr constructors and Group: the first argument is the key (the name).
+	attrFuncs := map[string]bool{
+		"String": true, "Int": true, "Int64": true, "Uint64": true, "Float64": true,
+		"Bool": true, "Duration": true, "Time": true, "Any": true, "Group": true,
+	}
+	// file | message | key of the exempt call.
 	allowed := map[string]bool{
-		"cmd/litevirt/daemon.go|starting litevirt daemon": true,
+		"cmd/litevirt/daemon.go|starting litevirt daemon|version": true,
+	}
+	isSlog := func(e ast.Expr) bool { id, ok := e.(*ast.Ident); return ok && id.Name == "slog" }
+	strLit := func(e ast.Expr) (string, bool) {
+		lit, ok := e.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(lit.Value)
+		return v, err == nil
+	}
+	isAttrType := func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		return ok && isSlog(sel.X) && sel.Sel.Name == "Attr"
+	}
+	// attrLitKey is the key of an slog.Attr composite literal, keyed or positional.
+	attrLitKey := func(x *ast.CompositeLit) string {
+		for i, el := range x.Elts {
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				if id, ok := kv.Key.(*ast.Ident); ok && id.Name == "Key" {
+					k, _ := strLit(kv.Value)
+					return k
+				}
+			} else if i == 0 {
+				k, _ := strLit(el)
+				return k
+			}
+		}
+		return ""
+	}
+	// attrKey returns the literal key of an slog.Attr expression: a
+	// slog.String(...)-style call or a slog.Attr{...} literal.
+	attrKey := func(e ast.Expr) (key string, isAttr bool) {
+		switch x := e.(type) {
+		case *ast.CallExpr:
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok && isSlog(sel.X) && attrFuncs[sel.Sel.Name] && len(x.Args) > 0 {
+				k, _ := strLit(x.Args[0])
+				return k, true
+			}
+		case *ast.CompositeLit:
+			if isAttrType(x.Type) {
+				return attrLitKey(x), true
+			}
+		}
+		return "", false
 	}
 	root := filepath.Join("..", "..")
 	fset := token.NewFileSet()
@@ -60,31 +113,59 @@ func TestNoReservedSlogKeys(t *testing.T) {
 		scanned++
 		rel, _ := filepath.Rel(root, p)
 		rel = filepath.ToSlash(rel)
+		handled := map[ast.Node]bool{}
+		report := func(pos token.Pos, what, msg, key string) {
+			if reserved[key] && !allowed[rel+"|"+msg+"|"+key] {
+				t.Errorf("%s: %s uses reserved key %q; provide-telemetry drops it when the stamped field exists. Use a specific key (crl_version, build_version, ...)",
+					fset.Position(pos), what, key)
+			}
+		}
 		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !logFuncs[sel.Sel.Name] {
-				return true
-			}
-			var first string
-			for i, a := range call.Args {
-				lit, ok := a.(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
+			switch x := n.(type) {
+			case *ast.CallExpr:
+				sel, ok := x.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
 				}
-				v, uerr := strconv.Unquote(lit.Value)
-				if uerr != nil {
-					continue
+				if mi, isLog := msgIndex[sel.Sel.Name]; isLog {
+					msg := ""
+					if mi >= 0 && mi < len(x.Args) {
+						msg, _ = strLit(x.Args[mi])
+					}
+					for i := mi + 1; i < len(x.Args); {
+						arg := x.Args[i]
+						if k, isAttr := attrKey(arg); isAttr {
+							handled[arg] = true
+							report(arg.Pos(), sel.Sel.Name+"(...) attribute", msg, k)
+							i++
+							continue
+						}
+						k, isKey := strLit(arg)
+						if !isKey {
+							break // key/value pairing is unknowable from here
+						}
+						report(arg.Pos(), sel.Sel.Name+"(...)", msg, k)
+						i += 2
+					}
+					return true
 				}
-				if i == 0 || first == "" {
-					first = v
+				if isSlog(sel.X) && attrFuncs[sel.Sel.Name] && !handled[x] {
+					k, _ := attrKey(x)
+					report(x.Pos(), "slog."+sel.Sel.Name+"(...)", "", k)
 				}
-				if i > 0 && reserved[v] && !allowed[rel+"|"+first] {
-					t.Errorf("%s: %s(...) uses reserved key %q; provide-telemetry drops it when the stamped field exists. Use a specific key (crl_version, build_version, ...)",
-						fset.Position(call.Pos()), sel.Sel.Name, v)
+			case *ast.CompositeLit:
+				if at, ok := x.Type.(*ast.ArrayType); ok && isAttrType(at.Elt) {
+					// []slog.Attr{{Key: ...}}: the elements carry no type of their own.
+					for _, el := range x.Elts {
+						if lit, ok := el.(*ast.CompositeLit); ok && lit.Type == nil {
+							handled[lit] = true
+							report(lit.Pos(), "slog.Attr{Key: ...}", "", attrLitKey(lit))
+						}
+					}
+				} else if !handled[x] {
+					if k, isAttr := attrKey(x); isAttr {
+						report(x.Pos(), "slog.Attr{Key: ...}", "", k)
+					}
 				}
 			}
 			return true

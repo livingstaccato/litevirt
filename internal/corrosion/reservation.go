@@ -205,7 +205,7 @@ func reservationStepFacts(facts *ReservationFacts, project string) (string, erro
 
 // nonterminalReservations returns the reservation vector of every operation whose
 // reduced state is NOT terminal — the in-flight capacity claims admission must
-// count on top of committed running-VM actuals.
+// count on top of committed actuals of running and starting VMs.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
 	byID, _, err := nonterminalReservationsByID(ctx, c)
 	if err != nil {
@@ -457,7 +457,7 @@ func MarkReservationAdmitted(ctx context.Context, c *Client, opID string) error 
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations
-// targeting host — the in-flight capacity not yet reflected in running-VM actuals.
+// targeting host — the in-flight capacity not yet reflected in the actuals of running and starting VMs.
 func HostReserved(ctx context.Context, c *Client, host string) (cpu, memMiB int, err error) {
 	rvs, err := nonterminalReservations(ctx, c)
 	if err != nil {

@@ -363,7 +363,7 @@ type Coordinator struct {
 	// row named another). The next tick re-proposes THAT value — same proof
 	// ID, same token — so it can retry at the same round: nothing was
 	// contending, so nothing should have to outrank it (§3.13 step 6).
-	claimRetryProposals map[corrosion.ClaimKey]corrosion.ActionProof
+	claimRetryProposals map[corrosion.ClaimKey]claimRetryProposal
 	// PartitionPauseEnforced is the majority's reliance predicate for partition
 	// pause (docs/design/partition-pause.md §4.3): enforcement.partition_pause
 	// on this node AND partition_pause_v1 latched. When it holds, an assumed
@@ -898,8 +898,10 @@ func (c *Coordinator) run(ctx context.Context) {
 				continue
 			}
 			delete(c.fenced, target)
-			// The fence path decides afresh; a refused wait does not outlive it.
+			// The fence path decides afresh; neither a refused wait nor a
+			// claim retry owed to the older fence outlives it.
 			delete(c.pauseWaits, target)
+			c.forgetClaimRetries(target)
 		}
 
 		// Skip if this host is already in a terminal state.

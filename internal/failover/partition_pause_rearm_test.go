@@ -163,3 +163,91 @@ func TestPartitionPauseRearm_ANewFenceStartsAFreshWait(t *testing.T) {
 		t.Fatalf("the new fence did not start a fresh wait: %+v (present %v)", w, ok)
 	}
 }
+
+// A claim retry owed to down (armed before its deadline, or left from an
+// earlier recovery) does not run while down's recovery waits on a deadline
+// that refused: it would recover everything with no deadline rule and no
+// limit, while down, which never reported pausing, may run it all.
+//
+// Mutation: drop the pause-wait gate in retryClaims — the VM moves at the
+// refused deadline.
+func TestPartitionPauseRearm_AClaimRetryDoesNotBypassARefusedDeadline(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	c.retryClaimsFor("down")
+	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
+		t.Fatalf("VM recovered to %q at a refused deadline on a claim retry", got)
+	}
+	for i := 0; i < 2; i++ {
+		c.run(ctx)
+		if got := vmHost(t, db, ctx); got != "down" {
+			t.Fatalf("VM recovered to %q on cycle %d after a refused deadline, on a claim retry", got, i+2)
+		}
+	}
+}
+
+// A claim retry left from an earlier outage, which healed before the retry
+// ran, does not run in the next: there down's manual fence waits for an
+// operator, and a stale retry would recover it without one.
+//
+// Mutation: drop the claim-retry clear from forgetHost — the VM moves with
+// no confirmation.
+func TestPartitionPauseRearm_AStaleClaimRetryDoesNotRunInTheNextOutage(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(manualFencer())
+	// The earlier outage: down was handled and a claim refused; it came back
+	// (state active) before the retry ran.
+	c.fenced["down"] = true
+	c.retryClaimsFor("down")
+	c.claimRetryProposals = map[corrosion.ClaimKey]claimRetryProposal{
+		{TargetKind: "vm", TargetName: "vm"}:    {source: "down"},
+		{TargetKind: "vm", TargetName: "other"}: {source: "elsewhere"},
+	}
+	for i := 0; i < 3; i++ {
+		c.run(ctx)
+		if got := vmHost(t, db, ctx); got != "down" {
+			t.Fatalf("VM recovered to %q on cycle %d of an outage whose manual fence nobody confirmed", got, i+1)
+		}
+	}
+	if len(c.claimRetryProposals) != 1 {
+		t.Fatalf("claim retry proposals after the outage ended: %v; want only the other host's", c.claimRetryProposals)
+	}
+}
+
+// A fence recorded since this coordinator's recovery takes down back through
+// the fence path ahead of any claim retry owed to the older one, and the
+// retry does not outlive it.
+//
+// Mutations: run retryClaims for a host whose recorded fence is newer than
+// the one it acted on — the claim retry recovers on the new self-pause fence
+// before its wait; drop the claim-retry clear on the fence path — the retry
+// is still owed.
+func TestPartitionPauseRearm_ANewerFenceGoesAheadOfAClaimRetry(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	pausedCondition(t, db, time.Now())
+	if got := atDeadline(t, c, ctx, mono, db, nil); got != "alive" {
+		t.Fatalf("setup: VM on %q after a plain deadline", got)
+	}
+	// Put the VM back on down, as though its recovery's claim were refused
+	// and a retry is owed.
+	if err := db.Execute(ctx, `UPDATE vms SET host_name = 'down' WHERE name = 'vm'`); err != nil {
+		t.Fatal(err)
+	}
+	c.retryClaimsFor("down")
+	if err := db.Execute(ctx, `INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail)
+		VALUES ('other-coordinator-fence', 'down', 'best-effort-ssh', 'fenced', ?, ?)`,
+		time.Now().Add(2*time.Second).UTC().Format(time.RFC3339),
+		corrosion.FencePauseReliance+"ssh unreachable, assumed"); err != nil {
+		t.Fatal(err)
+	}
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q on a claim retry ahead of a newer self-pause fence's wait", got)
+	}
+	if c.claimRetry["down"] {
+		t.Fatal("the claim retry owed to the older fence outlived the newer one")
+	}
+	if _, ok := c.pauseWaits["down"]; !ok {
+		t.Fatal("the newer self-pause fence started no wait")
+	}
+}

@@ -304,6 +304,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
 	delete(c.pauseWaits, host)
+	c.forgetClaimRetries(host)
 	c.unlimitRecovery(host)
 }
 

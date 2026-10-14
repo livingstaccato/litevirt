@@ -546,8 +546,10 @@ All of this is in the failover coordinator (`internal/failover`).
    for a read error or on its rule, nothing is recovered and the wait is
    kept: every later cycle re-checks the deadline under the whole rule, so a
    condition that replicates late or a read that recovers lets it go ahead.
-   Meanwhile an operator confirmation or a newer fence still reaches the host,
+   Meanwhile only an operator confirmation or a newer fence reaches the host,
    and either ends the wait (a fence that relies on the pause starts its own).
+   A claim retry does not run while a wait is pending or refused, and one owed
+   to an earlier outage or an older fence is dropped with it.
    The stall alert names the refusal and its reason.
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
    resumes from the relied-on fence record through `resumeActionFor` →

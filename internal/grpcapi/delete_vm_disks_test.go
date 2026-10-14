@@ -518,16 +518,20 @@ func TestKeptDisks_AHandEditOfTheRecordIsReadWithinAPass(t *testing.T) {
 }
 
 // m-7: a record file that cannot be read is never read as empty nor written
-// over. The disks it named stay named from memory, the condition names the
-// file and the recovery, and once the file is removed what was named is
-// saved again.
+// over. The disks it named stay named from memory, and the condition names
+// the file and the recovery. m-10: once the operator's fix reads, what was
+// recorded while it could not be read is merged in and saved — and an entry
+// the fix removed stays removed.
 //
-// Mutation: read a corrupt file as empty — the disk is no longer named: red.
+// Mutations: read a corrupt file as empty — the disk is no longer named:
+// red. Merge back every entry in memory on the recovery — the removed one
+// comes back: red.
 func TestKeptDisks_ACorruptRecordFailsClosed(t *testing.T) {
 	s, _ := deleteDiskServerWith(t, false)
 	file := filepath.Join(s.dataDir, diskKeptFile)
 	s.recordKeptDisks(context.Background(), "a", []KeptDisk{{Path: "/x/one", Disk: "root", Host: "node-9", Reason: "r1"}})
-	corrupt := []byte("{not json")
+	// The operator removes /x/one by hand, with a typo.
+	corrupt := []byte("[ not json")
 	if err := os.WriteFile(file, corrupt, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -540,16 +544,46 @@ func TestKeptDisks_ACorruptRecordFailsClosed(t *testing.T) {
 	if b, _ := os.ReadFile(file); string(b) != string(corrupt) {
 		t.Fatalf("the unreadable file was written over: %q", b)
 	}
-	if err := os.Remove(file); err != nil {
+	// The fix: /x/one removed, as meant.
+	if err := os.WriteFile(file, []byte("[]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s.judgeKeptDisks(context.Background())
 	b, err := os.ReadFile(file)
-	if err != nil || !strings.Contains(string(b), "/x/one") || !strings.Contains(string(b), "/x/two") {
-		t.Fatalf("after the recovery the record is %q (%v); want both disks saved", b, err)
+	if err != nil || !strings.Contains(string(b), "/x/two") {
+		t.Fatalf("after the fix the record is %q (%v); want the disk recorded meanwhile saved", b, err)
 	}
-	if open, ev := keptDiskCondition(t, s); !open || strings.Contains(ev, "record_unreadable") {
-		t.Fatalf("after the recovery: %v %s", open, ev)
+	if strings.Contains(string(b), "/x/one") {
+		t.Fatalf("the entry the fix removed came back: %q", b)
+	}
+	if open, ev := keptDiskCondition(t, s); !open || strings.Contains(ev, "record_unreadable") || strings.Contains(ev, "/x/one") {
+		t.Fatalf("after the fix: %v %s", open, ev)
+	}
+}
+
+// Nit (concern 1): a hand edit that keeps the file's size and its mtime is
+// still seen — the inode's change time moved.
+//
+// Mutation: compare mtime and size only — the edit is missed: red.
+func TestKeptDisks_AnEditKeepingSizeAndMtimeIsRead(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, false)
+	file := filepath.Join(s.dataDir, diskKeptFile)
+	s.recordKeptDisks(context.Background(), "a", []KeptDisk{{Path: "/x/aaa", Disk: "root", Host: "node-9", Reason: "r"}})
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(file)
+	time.Sleep(20 * time.Millisecond) // a later ctime
+	if err := os.WriteFile(file, []byte(strings.ReplaceAll(string(b), "/x/aaa", "/x/bbb")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	s.judgeKeptDisks(context.Background())
+	if open, ev := keptDiskCondition(t, s); !open || !strings.Contains(ev, "/x/bbb") || strings.Contains(ev, "/x/aaa") {
+		t.Fatalf("an edit keeping size and mtime was missed: %v %s", open, ev)
 	}
 }
 

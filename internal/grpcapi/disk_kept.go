@@ -62,19 +62,29 @@ type diskKeptFiles struct {
 	mu sync.Mutex
 	m  map[string]diskKeptRecord // host + "\x00" + path → record
 	// sig is the file as this process last read or wrote it (present, its
-	// mtime and size); a different one is re-read (syncDiskKeptLocked).
+	// mtime, size, inode and ctime); a different one is re-read
+	// (diskKeptLocked).
 	sig diskKeptSig
 	// unreadable is why the file cannot be read now: nothing is written
 	// over it, and what is recorded meanwhile is kept in memory (unsaved).
 	unreadable error
-	unsaved    bool // m holds entries the file does not
-	warned     bool // unreadable is logged, once until the file reads
+	unsaved    bool            // m holds entries the file does not
+	unsavedKey map[string]bool // which: recorded while the file could not be read, or a save failed
+	warned     bool            // unreadable is logged, once until the file reads
 }
 
 type diskKeptSig struct {
 	known, present bool
 	mod            time.Time
 	size           int64
+	ino            uint64
+	ctime          int64
+}
+
+// diskKeptSigOf is fi's signature.
+func diskKeptSigOf(fi os.FileInfo) diskKeptSig {
+	ino, _ := fileInode(fi)
+	return diskKeptSig{known: true, present: true, mod: fi.ModTime(), size: fi.Size(), ino: ino, ctime: fileCtimeNs(fi)}
 }
 
 func diskKeptKey(host, path string) string { return host + "\x00" + path }
@@ -106,7 +116,7 @@ func (s *Server) diskKeptLocked() map[string]diskKeptRecord {
 	fi, serr := os.Stat(path)
 	switch {
 	case serr == nil:
-		sig.present, sig.mod, sig.size = true, fi.ModTime(), fi.Size()
+		sig = diskKeptSigOf(fi)
 	case !errors.Is(serr, os.ErrNotExist):
 		k.markUnreadable(path, serr)
 		return k.m
@@ -140,10 +150,13 @@ func (s *Server) diskKeptLocked() map[string]diskKeptRecord {
 	k.sig = sig
 	if k.unsaved {
 		// Recorded while the file could not be read, or a save failed:
-		// merged in, and saved.
-		for key, r := range k.m {
-			if _, ok := fromFile[key]; !ok {
-				fromFile[key] = r
+		// those entries alone are merged in, and saved. An entry the
+		// operator removed by the fix stays removed.
+		for key := range k.unsavedKey {
+			if r, ok := k.m[key]; ok {
+				if _, inFile := fromFile[key]; !inFile {
+					fromFile[key] = r
+				}
 			}
 		}
 		k.m = fromFile
@@ -158,15 +171,10 @@ func (s *Server) diskKeptLocked() map[string]diskKeptRecord {
 func (k *diskKeptFiles) markUnreadable(path string, err error) {
 	k.unreadable = err
 	k.sig = diskKeptSig{}
-	// What is named now is merged into the file once it reads, whatever
-	// the fix (an edit, or the file removed): never lost.
-	if len(k.m) > 0 {
-		k.unsaved = true
-	}
 	if !k.warned {
 		k.warned = true
 		slog.Warn("delete: the record of kept disks cannot be read; it is not written over, and the disks it names stay named "+
-			"from memory. Fix the file, or remove it (the disks recorded since this daemon started are kept and saved), so that it reads",
+			"from memory. Fix the file, or remove it (the disks recorded while it cannot be read are kept and saved), so that it reads",
 			"file", path, "error", err)
 	}
 }
@@ -199,9 +207,9 @@ func (s *Server) saveDiskKeptLocked() {
 		slog.Warn("delete: the record of kept disks was not saved; a restart forgets the disks not in it", "error", err)
 		return
 	}
-	k.unsaved = false
+	k.unsaved, k.unsavedKey = false, nil
 	if fi, serr := os.Stat(path); serr == nil {
-		k.sig = diskKeptSig{known: true, present: true, mod: fi.ModTime(), size: fi.Size()}
+		k.sig = diskKeptSigOf(fi)
 	} else {
 		k.sig = diskKeptSig{}
 	}
@@ -217,7 +225,13 @@ func (s *Server) recordKeptDisks(ctx context.Context, vmName string, kept []Kept
 	s.diskKept.mu.Lock()
 	m := s.diskKeptLocked()
 	for _, k := range kept {
-		m[diskKeptKey(k.Host, k.Path)] = diskKeptRecord{KeptDisk: k, VM: vmName, Since: now}
+		key := diskKeptKey(k.Host, k.Path)
+		m[key] = diskKeptRecord{KeptDisk: k, VM: vmName, Since: now}
+		// Merged back on a recovery if this save does not reach the file.
+		if s.diskKept.unsavedKey == nil {
+			s.diskKept.unsavedKey = map[string]bool{}
+		}
+		s.diskKept.unsavedKey[key] = true
 	}
 	s.saveDiskKeptLocked()
 	s.diskKept.mu.Unlock()
@@ -274,9 +288,14 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	for _, r := range records {
 		if r.Host == s.hostName {
 			if p, _ := diskPresence(s.hostDiskFile(r.Path)); p == presenceGone {
+				// Under the lock, only the entry judged: one recorded for the
+				// same path since (a VM of the same name) is kept.
 				s.diskKept.mu.Lock()
-				delete(s.diskKeptLocked(), diskKeptKey(r.Host, r.Path))
-				s.saveDiskKeptLocked()
+				m := s.diskKeptLocked()
+				if cur, ok := m[diskKeptKey(r.Host, r.Path)]; ok && cur == r {
+					delete(m, diskKeptKey(r.Host, r.Path))
+					s.saveDiskKeptLocked()
+				}
 				s.diskKept.mu.Unlock()
 				slog.Info("delete: a disk a VM delete kept is gone", "path", r.Path)
 				continue
@@ -346,7 +365,7 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 	}
 	if unreadable != "" {
 		evidence["record_unreadable"] = fmt.Sprintf("%s cannot be read (%s): it is not written over, and the disks named here are kept from memory; "+
-			"fix the file, or remove it (the disks recorded since this daemon started are kept and saved)", filepath.Join(s.dataDir, diskKeptFile), unreadable)
+			"fix the file, or remove it (the disks recorded while it cannot be read are kept and saved)", filepath.Join(s.dataDir, diskKeptFile), unreadable)
 	}
 	ev, _ := json.Marshal(evidence)
 	row.Evidence = string(ev)

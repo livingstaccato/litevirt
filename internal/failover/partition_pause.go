@@ -32,6 +32,7 @@ type pauseWait struct {
 	deadline time.Time // monotonic (c.mono)
 	fenceAt  time.Time // c.now() at the fence, for fenceStillStands
 	wait     time.Duration
+	refused  string // why the deadline last refused, "" before it has
 }
 
 // mono is the monotonic clock the pause deadline is measured on. It is never
@@ -157,8 +158,11 @@ func (c *Coordinator) pauseDeadlinePassed(ctx context.Context, h *corrosion.Host
 }
 
 // retryPauseWait handles a host whose recovery is waiting out its partition
-// pause. It reports whether the host was such a host (the caller then does
-// nothing more with it this cycle).
+// pause. It reports whether it handled the host this cycle (the caller then
+// does nothing more with it). A deadline that refuses keeps the wait and
+// reports false: the deadline is re-checked on every later cycle, under the
+// whole rule each time, and meanwhile an operator confirmation or a new fence
+// still reaches the host.
 func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	w, ok := c.pauseWaits[host]
 	if !ok {
@@ -179,9 +183,8 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	delete(c.pauseWaits, host)
 	why, only, ok := c.selfPauseStillStands(ctx, h, w.fenceAt)
 	if !ok {
-		slog.Warn("failover: partition-pause deadline passed, but the host may not have paused or has come back; recovering nothing",
-			"host", host, "why", why)
-		return true
+		c.refusePauseWait(ctx, host, w, why)
+		return false
 	}
 	slog.Info("failover: partition-pause deadline passed; recovering the host's workloads",
 		"host", host, "waited", w.wait, "assurance", corrosion.FenceSelfPaused, "only_reported_paused", only != nil)
@@ -195,6 +198,23 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	c.limitRecovery(host, only)
 	c.recoverWorkloads(ctx, h)
 	return true
+}
+
+// refusePauseWait keeps a wait whose deadline refused, so the next cycle
+// re-checks it: a read error, or a condition that replicates a moment after
+// the deadline, would otherwise leave the paused workloads running nowhere
+// until the lease moved. The stall alert names the refusal and its reason.
+func (c *Coordinator) refusePauseWait(ctx context.Context, host string, w pauseWait, why string) {
+	level := slog.LevelWarn
+	if w.refused == why {
+		level = slog.LevelDebug // the same refusal, re-checked every cycle
+	}
+	w.refused = why
+	c.pauseWaits[host] = w
+	slog.Log(ctx, level, "failover: partition-pause deadline passed, but the host may not have paused or has come back; recovering nothing, re-checking every cycle",
+		"host", host, "why", why)
+	c.noteHold(host, "recovery refused at the partition-pause deadline ("+why+"); re-checked every cycle, "+
+		"or 'lv host fence-confirm "+host+"' once it is off")
 }
 
 // selfPauseStillStands is fenceStillStands for a self-pause fence at its

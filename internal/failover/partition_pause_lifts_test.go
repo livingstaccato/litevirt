@@ -178,13 +178,13 @@ func TestRecoveryLimit_LiftsWhenTheHostIsRemovedWithAProofGradeFence(t *testing.
 }
 
 // laterDeadline puts down's recovery behind a second pause wait that has
-// already passed, as a re-fence in the same episode would, and runs it.
+// already passed, as a re-fence in the same episode would, and runs it. A
+// deadline that refuses reports false and keeps the wait, so the result is
+// not checked here.
 func laterDeadline(t *testing.T, c *Coordinator, ctx context.Context, mono *monoClock) {
 	t.Helper()
 	c.pauseWaits["down"] = pauseWait{deadline: mono.Now().Add(-time.Second), fenceAt: time.Now(), wait: time.Minute}
-	if !c.retryPauseWait(ctx, "down") {
-		t.Fatal("setup: down had no pending pause wait")
-	}
+	c.retryPauseWait(ctx, "down")
 }
 
 // bridgeGone is the bridge losing down too: its latest verdict is a failure.

@@ -303,6 +303,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
+	delete(c.pauseWaits, host)
 	c.unlimitRecovery(host)
 }
 

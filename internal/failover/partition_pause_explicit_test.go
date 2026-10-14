@@ -178,9 +178,10 @@ func TestSelfPauseExplicit_AVoterMajorityAnsweringIsRefused(t *testing.T) {
 	healthRow(t, db, "v4", "healthy", 0, time.Now().Add(time.Second))
 	pausedCondition(t, db, time.Now())
 	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
-	if !c.retryPauseWait(ctx, "down") {
+	if _, ok := c.pauseWaits["down"]; !ok {
 		t.Fatal("setup: down had no pending pause wait")
 	}
+	c.retryPauseWait(ctx, "down")
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("VM recovered to %q although down, v4 and v5 (3 of 5 voters) last saw it answer", got)
 	}
@@ -346,9 +347,10 @@ func TestSelfPauseExplicit_TooFewVoterRunsToDateTheOutageAreRefused(t *testing.T
 	bridgeAnswer(t, db)
 	pausedCondition(t, db, time.Now())
 	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
-	if !c.retryPauseWait(ctx, "down") {
+	if _, ok := c.pauseWaits["down"]; !ok {
 		t.Fatal("setup: down had no pending pause wait")
 	}
+	c.retryPauseWait(ctx, "down")
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("VM recovered to %q with only two voters' runs to date the outage by", got)
 	}

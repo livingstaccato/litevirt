@@ -401,8 +401,8 @@ type Coordinator struct {
 	// (health.Checker.LastContact), the second anchor of the pause deadline.
 	// nil anchors on the decision alone.
 	LastContact func(host string) (time.Time, bool)
-	// pauseWaits holds recoveries waiting out a host's partition pause
-	// (partition_pause.go). In memory: a successor re-derives the wait from
+	// pauseWaits holds recoveries waiting out a host's partition pause, or
+	// re-checking a deadline that refused (partition_pause.go). In memory: a successor re-derives the wait from
 	// the self-pause fence record, anchored at its own first sight of it.
 	pauseWaits map[string]pauseWait
 
@@ -863,7 +863,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		// it is recorded terminal (confirmationFencesAfresh).
 		afresh := false
 		if c.fenced[target] {
-			// A recovery waiting out the host's partition pause continues here.
+			// A recovery waiting out the host's partition pause continues
+			// here; one whose deadline refused falls through, re-checked next
+			// cycle.
 			if c.retryPauseWait(ctx, target) {
 				continue
 			}
@@ -896,6 +898,8 @@ func (c *Coordinator) run(ctx context.Context) {
 				continue
 			}
 			delete(c.fenced, target)
+			// The fence path decides afresh; a refused wait does not outlive it.
+			delete(c.pauseWaits, target)
 		}
 
 		// Skip if this host is already in a terminal state.
@@ -1366,7 +1370,6 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
-			delete(c.pauseWaits, host)
 			c.forgetHost(host)
 		}
 	}
@@ -2523,6 +2526,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	c.fenced[target] = true
 	c.confirmResumed[target] = rec.ID
 	c.unlimitRecovery(target) // an operator confirmed the host off
+	delete(c.pauseWaits, target)
 	c.recoverWorkloads(ctx, h)
 	return true
 }

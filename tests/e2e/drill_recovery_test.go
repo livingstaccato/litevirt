@@ -53,7 +53,7 @@ func TestDrill2_FrozenLeaseHolderWhileAHostFails(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	holder := l.leaseHolder(l.hosts[0], "failover")
-	victim := l.leastLoaded(l.hosts[0], l.except(holder))
+	victim := l.leastLoaded(l.hosts[0], l.fenceableWhenOff(l.hosts[0], l.except(holder)))
 	q := l.pick(func(h string) bool { return h != holder && h != victim }, false)
 	test := l.createVMs(q, "d2", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
@@ -142,7 +142,7 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 
 	n := l.total // an excluded node is still a voter
 	q := l.hosts[0]
-	second := l.leastLoaded(q, l.except(q))
+	second := l.leastLoaded(q, l.fenceableWhenOff(q, l.except(q)))
 	first := l.pick(func(h string) bool { return h != q && h != second }, true)
 	test := l.createVMs(q, "d3", second)[second]
 	keys := l.relocatableOn(q, b, second)
@@ -250,8 +250,12 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	owner := l.leastLoaded(l.hosts[0], l.except(coord))
 	keep := l.pick(func(h string) bool { return h != coord && h != owner }, true)
 	q := l.pick(func(h string) bool { return h != owner && h != keep }, false)
+	// The owner is cut from every voter but keep, witnesses outside
+	// E2E_LAB_NODES included: a witness left reaching the owner is one
+	// observer short of the fence quorum (lab 1's node-6), and it may hold
+	// the failover lease, so the journal wait below covers it too.
 	var cut []string
-	for _, h := range l.hosts {
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiderHosts()...) {
 		if h != owner && h != keep {
 			cut = append(cut, h)
 		}
@@ -347,14 +351,17 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	q := l.hosts[0]
-	victim := l.leastLoaded(q, l.except(q))
+	victim := l.leastLoaded(q, l.fenceableWhenOff(q, l.except(q)))
 	test := l.createVMs(q, "d5", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
-	for i, h := range l.hosts {
+	// Every host, witnesses outside E2E_LAB_NODES included: a witness that
+	// still runs claims coordinates certified recoveries (lab 1's node-6).
+	all := append(append([]string{}, l.hosts...), l.outsiderHosts()...)
+	for i, h := range all {
 		if err := l.setEnforcement(h, "recovery_claim", "false"); err != nil {
 			t.Fatalf("recovery_claim off on %s: %v", h, err)
 		}
-		if i < len(l.hosts)-1 {
+		if i < len(all)-1 {
 			time.Sleep(daemonRestartSpacing)
 		}
 	}

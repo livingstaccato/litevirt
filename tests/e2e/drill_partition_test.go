@@ -334,6 +334,24 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 		}
 	}
 
+	// A witness reaching both sides that holds the failover lease reaches the
+	// minority too, and fences it: a voter majority cannot reach those hosts,
+	// and the fence's SSH power-off succeeds through the witness (lab 1's
+	// node-6). That is the product working; bring such a host back before the
+	// heal, as an operator would.
+	var off []string
+	for _, h := range minority {
+		if !l.isUp(h) {
+			off = append(off, h)
+		}
+	}
+	if len(off) > 0 {
+		l.mark("drill1b: minority hosts %v were powered off during the split (fenced through the witness); powering them on", off)
+		if err := l.powerOn(off...); err != nil {
+			t.Errorf("power on %v: %v", off, err)
+		}
+	}
+
 	// Heal: everything must end up executing on exactly one host.
 	l.heal()
 	healed := time.Now()
@@ -417,8 +435,11 @@ func TestDrillBlip_FleetWide(t *testing.T) {
 	}); !ok {
 		t.Fatalf("not every recoverable workload runs at home before the blip:\n  %s", s.last())
 	}
+	// Every node alone, witnesses outside E2E_LAB_NODES included: a witness
+	// no group named would reach every host and fence the isolated ones (no
+	// group is the majority, so joinMajority leaves it out).
 	var alone [][]string
-	for _, h := range l.hosts {
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiderHosts()...) {
 		alone = append(alone, []string{h})
 	}
 

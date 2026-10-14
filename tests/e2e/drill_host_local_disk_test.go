@@ -31,7 +31,7 @@ func TestDrill_HostLocalDiskSurvivesFailoverAndIsRestorable(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	q := l.hosts[0]
-	victim := l.leastLoaded(q, l.except(q))
+	victim := l.leastLoaded(q, l.fenceableWhenOff(q, l.except(q)))
 	vm := l.createVMs(q, "hld", victim)[victim]
 
 	before, err := l.inspectVM(q, vm)

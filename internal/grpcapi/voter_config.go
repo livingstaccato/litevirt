@@ -795,7 +795,10 @@ func genesisRefusals(err error, members []string) map[string]string {
 }
 
 // applyGenesisPending raises ha.voter.genesis_pending with one line per
-// blocking host, or resolves it when blocked is empty. The lease holder is the
+// blocking host, or resolves it when blocked is empty. It is critical, with a
+// line saying so, while some host can bridge a split of the derived voter set
+// (genesisBridges): failover then stalls on such a split until genesis
+// completes. The lease holder is the
 // only writer, which is what the LWW row merge assumes.
 func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]string) {
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -825,6 +828,13 @@ func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]str
 	sort.Strings(hosts)
 	sort.Strings(lines)
 	detail := "automatic voter genesis is waiting for a clean cluster: " + strings.Join(lines, "; ")
+	severity := corrosion.SeverityWarning
+	if bridges := s.genesisBridges(ctx); len(bridges) > 0 {
+		severity = corrosion.SeverityCritical
+		detail += fmt.Sprintf(". Until genesis completes the voter set is derived, and %s can reach both halves of a "+
+			"split of the voters: then the majority does not recover the minority's paused workloads while the split "+
+			"lasts (ha.recovery.bridged is raised for each host so held)", strings.Join(bridges, ", "))
+	}
 	if !found || row.Lifecycle == corrosion.ConditionResolved {
 		row = corrosion.HealthCondition{Evaluator: voterEvaluator, Code: condVoterGenesisPending,
 			SubjectKind: "cluster", SubjectID: voterConditionSubject,
@@ -834,13 +844,35 @@ func (s *Server) applyGenesisPending(ctx context.Context, blocked map[string]str
 	}
 	row.ObserveCount++
 	row.CleanCount = 0
-	row.Severity = corrosion.SeverityWarning
+	row.Severity = severity
 	row.Hosts = hosts
 	row.Evidence = encodeEvidence(detail, hosts)
 	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("voter genesis: persist health condition", "error", err)
 	}
+}
+
+// genesisBridges names each host that can reach both halves of a split of the
+// derived voter set without being split itself: witnesses, and hosts in
+// maintenance (up, but outside the voter set), each with why it can.
+// Sorted; nil on a read error.
+func (s *Server) genesisBridges(ctx context.Context) []string {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, h := range hosts {
+		switch {
+		case h.IsWitness():
+			out = append(out, h.Name+" (witness)")
+		case h.State == "maintenance":
+			out = append(out, h.Name+" (in maintenance)")
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // genesisPendingDetail is the active condition's text, "" when none.

@@ -177,9 +177,13 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		return true
 	}
 	delete(c.pauseWaits, host)
-	if why, ok := c.selfPauseStillStands(ctx, h, w.fenceAt); !ok {
+	if why, ok, bridged := c.selfPauseStillStands(ctx, h, w.fenceAt); !ok {
 		slog.Warn("failover: partition-pause deadline passed, but the host may not have paused or has come back; recovering nothing",
 			"host", host, "why", why)
+		c.noteHold(host, "partition-pause deadline passed, recovering nothing: "+why)
+		if bridged {
+			c.noteBridgedStall(ctx, h, w.fenceAt, why)
+		}
 		return true
 	}
 	slog.Info("failover: partition-pause deadline passed; recovering the host's workloads",
@@ -219,36 +223,44 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 //     has reported its pause failed, or no longer says it pauses;
 //   - the voter set is derived, or a newer generation is a reset
 //     (pauseVoterSets).
-func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (string, bool) {
+//
+// bridged reports a refusal that rests only on observers having seen the host
+// answer since the fence, with no voter majority among them: the stall a host
+// reaching both halves of a split causes (ha.recovery.bridged). It changes no
+// decision.
+func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (why string, ok, bridged bool) {
 	if !c.relyOnPartitionPause(ctx, h) {
-		return c.fenceStillStands(ctx, h.Name, at)
+		why, ok = c.fenceStillStands(ctx, h.Name, at)
+		return why, ok, false
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if err != nil {
 		slog.Warn("failover: voter set read for a partition-pause deadline failed", "host", h.Name, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return "voter set unreadable", false
-	}
-	if !explicit {
-		return c.fenceStillStands(ctx, h.Name, at)
+		return "voter set unreadable", false, false
 	}
 	if !c.observerStreakSpans(ctx, h.Name, at) {
-		return "no observer has watched the host stay down since the fence", false
+		return "no observer has watched the host stay down since the fence", false, false
+	}
+	if !explicit {
+		// fenceStillStands, whose first half has just held.
+		why, ok = c.answeredSince(ctx, h.Name, at)
+		return why, ok, !ok && why != whyHealthUnreadable
 	}
 	if why, ok := c.answeredByAVoterMajority(ctx, h.Name, sets); !ok {
-		return why, false
+		return why, false, false
 	}
 	why, quiet := c.answeredSince(ctx, h.Name, at)
 	if quiet {
-		return "", true
+		return "", true, false
 	}
 	if why == whyHealthUnreadable {
-		return why, false
+		return why, false, false
 	}
 	if reason, ok := c.hostReportsItsPause(ctx, h.Name, at); !ok {
-		return why + ", and " + reason, false
+		return why + ", and " + reason, false, true
 	}
-	return "", true
+	return "", true, false
 }
 
 // hostReportsItsPause reports whether host's own replicated partition_paused

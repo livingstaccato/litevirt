@@ -13,11 +13,15 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -234,5 +238,143 @@ func TestFleet_LeaseHeldInTheMinority_MajorityTakesOverPastANonVoter(t *testing.
 			dest := waitRecovered(t, c, minority)
 			assertRecoveredOnce(t, c, s, rs, dest, minority)
 		})
+	}
+}
+
+// TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly: the same split with
+// NO voter generation adopted, so the voter set is derived. n5 is in
+// maintenance: up, outside the voter set, and in neither half, so it still
+// reaches both. On a derived set the deadline keeps the conservative rule —
+// any observer that sees the host answer holds its recovery — so the
+// majority waits, fences, and then recovers nothing for as long as the split
+// lasts. That stall is safe, and must be visible: ha.recovery.bridged names
+// the host, its workload, the observers, the derived set and the way out,
+// and ha.voter.genesis_pending says a split can stall failover. After the
+// heal everything converges to the one original copy.
+//
+// Mutations: drop the noteBridgedStall call in retryPauseWait — the
+// condition wait goes red; drop resolveBridgedSettled — the resolve wait
+// after the heal goes red.
+func TestFleet_PartitionPause_DerivedSetBridgeStallsVisibly(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 6, IndependentReplicas: true, Relays: 6, RealGossip: true})
+	owner, n2, n5 := c.Nodes[0], c.Nodes[2], c.Nodes[5]
+	insertVMPolicy(t, owner, "pp-vm", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-vm", libvirtfake.StateRunning)
+	if err := corrosion.UpdateHostState(ctx, owner.DB, n5.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "every node's derived voter set to be n0..n4", func() bool {
+		for _, n := range c.Nodes {
+			cfg, err := corrosion.AdoptedVoterConfig(ctx, n.DB)
+			if err != nil || cfg.Explicit() {
+				return false
+			}
+			v, err := corrosion.VoterSet(ctx, n.DB)
+			if err != nil || len(v) != 5 || v[n5.Name] {
+				return false
+			}
+		}
+		return true
+	})
+	s := newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{n2.Name: true}})
+	rs := sampleRunning(t, c, "pp-vm")
+	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
+		return s.node(owner).pauser.HealedForTests()
+	})
+
+	minority, majority := c.Nodes[:2], c.Nodes[2:5]
+	c.SplitGossip(minority, majority)
+
+	// The minority pauses; the majority fences, waits, and holds.
+	eventually(t, ppRecoverBound, "ha.recovery.bridged for node-0 on node-2", func() bool {
+		row, ok, err := corrosion.GetHealthCondition(ctx, n2.DB, failover.RefenceEvaluator,
+			failover.CondRecoveryBridged, "host", owner.Name)
+		return err == nil && ok && row.Lifecycle == corrosion.ConditionConfirmed
+	})
+	if _, ok := firstEvent(owner, "suspend", "pp-vm"); !ok {
+		t.Fatalf("%s never suspended pp-vm", owner.Name)
+	}
+	if len(s.fencesOf(owner.Name)) == 0 {
+		t.Fatalf("no coordinator fenced %s", owner.Name)
+	}
+	row, _, _ := corrosion.GetHealthCondition(ctx, n2.DB, failover.RefenceEvaluator,
+		failover.CondRecoveryBridged, "host", owner.Name)
+	var ev struct {
+		Workloads       []string `json:"workloads"`
+		Observers       []string `json:"observers"`
+		DerivedVoterSet bool     `json:"derived_voter_set"`
+		Remedy          string   `json:"remedy"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatalf("evidence %q: %v", row.Evidence, err)
+	}
+	if !slices.Equal(ev.Workloads, []string{"vm/pp-vm"}) || !ev.DerivedVoterSet ||
+		!strings.Contains(ev.Remedy, "lv host fence-confirm "+owner.Name) || !slices.Contains(ev.Observers, n5.Name) {
+		t.Fatalf("evidence %s: want vm/pp-vm, the bridge %s among the observers, the derived set and the fence-confirm way out",
+			row.Evidence, n5.Name)
+	}
+	for _, o := range ev.Observers {
+		if o == n2.Name || o == c.Nodes[3].Name || o == c.Nodes[4].Name {
+			t.Fatalf("majority voter %s named as seeing %s answer during the split: %v", o, owner.Name, ev.Observers)
+		}
+	}
+
+	// Recovery does not proceed while the split is bridged.
+	time.Sleep(ppWait(4) + 10*time.Second)
+	for _, n := range c.Nodes[1:] {
+		if _, ok := firstEvent(n, "start", "pp-vm"); ok {
+			t.Fatalf("%s started pp-vm while the split was bridged on a derived voter set", n.Name)
+		}
+	}
+	if st, _ := owner.Virt.RawState("pp-vm"); st != libvirtfake.StatePaused {
+		t.Fatalf("%s's copy is %s during the split, want paused", owner.Name, st)
+	}
+	if row, ok, err := corrosion.GetHealthCondition(ctx, n2.DB, failover.RefenceEvaluator,
+		failover.CondRecoveryBridged, "host", owner.Name); err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("ha.recovery.bridged resolved while the stall lasts: %+v (%v)", row, err)
+	}
+
+	// Genesis is pending, and says a split can stall failover.
+	openVoterConfigGates(c)
+	n2.Server.VoterGenesisTick(ctx, 0)
+	gp, ok, err := corrosion.GetHealthCondition(ctx, n2.DB, "voter_config", "ha.voter.genesis_pending", "cluster", "voters")
+	if err != nil || !ok || gp.Lifecycle == corrosion.ConditionResolved || gp.Severity != corrosion.SeverityCritical ||
+		!strings.Contains(gp.Evidence, n5.Name+" (in maintenance) can reach both halves") {
+		t.Fatalf("ha.voter.genesis_pending %+v (%v): want it open, critical, naming %s as a bridge", gp, err, n5.Name)
+	}
+
+	// The heal: one copy, the original, and the condition resolves.
+	c.HealGossip()
+	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
+	eventually(t, ppRecoverBound, "pp-vm to run again on node-0 alone", func() bool {
+		got := runningOn(c, "pp-vm")
+		return len(got) == 1 && got[0] == owner.Name
+	})
+	eventually(t, time.Minute, "ha.recovery.bridged to resolve after the heal", func() bool {
+		row, ok, err := corrosion.GetHealthCondition(ctx, n2.DB, failover.RefenceEvaluator,
+			failover.CondRecoveryBridged, "host", owner.Name)
+		return err == nil && ok && row.Lifecycle == corrosion.ConditionResolved
+	})
+	rs.mu.Lock()
+	maxRun, overlap := rs.max, rs.overlap
+	rs.mu.Unlock()
+	if maxRun > 1 {
+		t.Fatalf("pp-vm ran on more than one host at once: %v", overlap)
+	}
+	for _, n := range c.Nodes[1:] {
+		if _, ok := firstEvent(n, "start", "pp-vm"); ok {
+			t.Fatalf("%s started pp-vm; nothing was recovered, so only the original may run", n.Name)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.fence {
+		for _, m := range minority {
+			if f.by == m.Name {
+				t.Fatalf("minority node %s fenced %s", m.Name, f.target)
+			}
+		}
 	}
 }

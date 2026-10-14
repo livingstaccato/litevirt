@@ -1168,6 +1168,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// Name each host whose recovery has stalled, and why
 		// (alertStalledRecoveries).
 		c.alertStalledRecoveries(ctx, byHost)
+		c.resolveBridgedSettled(ctx, byHost)
 	}
 }
 

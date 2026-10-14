@@ -1223,7 +1223,11 @@ genesis cannot write generation 1 of the explicit voter set: a host is in
 `maintenance`, `offline` or `fenced`, or did not sign. Genesis waits for a clean
 cluster so it never freezes a host out of the voter set because it happened to
 be away when the token latched. The evidence names each host, its state and
-what clears it; the condition resolves on the tick genesis succeeds.
+what clears it; the condition resolves on the tick genesis succeeds. While a
+witness or a host in maintenance exists, the severity is critical and the
+evidence names those hosts: until genesis completes, a split of the voters
+that one of them reaches both halves of stalls failover
+(`ha.recovery.bridged`).
 
 For a cluster that cannot become clean — a host that is dead for good and has
 not been removed — `lv cluster voter init --members <hosts>` proposes the
@@ -1262,6 +1266,28 @@ raised by a node that REFUSED a forced generation — because it can reach a hos
 the generation names lost, or because it is itself named lost and running —
 with the reason: valid signatures do not make a false claim of loss true.
 `lv cluster voter ls` on each host shows which generation it adopted.
+
+### A recovery held by a bridged split (`ha.recovery.bridged`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. The host was fenced relying on its partition pause, the
+wait passed, and its workloads were not recovered because observers outside
+the voter majority still saw it answer: a host that reaches both halves of a
+split of the voters (a witness, or a host in maintenance) relays the
+minority's view. On a derived voter set (no generation adopted) any such
+observer holds the recovery; on an adopted generation it is held until the
+host reports that it paused. Nothing runs twice: the workloads stay paused on
+the host. Nothing re-checks the host while the split lasts.
+
+The evidence names the paused `workloads`, the `observers` that saw the host
+answer, whether the cluster is on a `derived_voter_set`, and the `remedy`:
+heal the partition, and the host returns and resumes its workloads; or, once
+the host is powered off, `lv host fence-confirm <host>`, and the recovery
+resumes from it. On a derived set, complete voter genesis once every host is
+back (clear what `ha.voter.genesis_pending` names, or
+`lv cluster voter init --members <hosts>`) so the next split does not stall.
+The condition resolves once the host is back in service or removed, or has no
+recoverable workload left on it.
 
 ### A failed re-fence (`refence_failed`)
 

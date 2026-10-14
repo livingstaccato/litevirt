@@ -188,10 +188,10 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	// The limit lasts for the down-episode, not this one pass: every later
 	// recovery of the host (a claim retry above all) honours it, until the
 	// host is back, an operator or a proving fence vouches for it, or a later
-	// deadline replaces it. A later deadline at which nobody has seen the host
-	// answer keeps to the host's list while its condition from this outage is
-	// readable, and lifts the limit when there is none, as fenceStillStands
-	// would.
+	// deadline replaces it with the host's newer list. A later deadline at
+	// which nobody has seen the host answer keeps to the host's list while its
+	// condition from this outage is readable, and keeps the limit it finds
+	// when there is none (pausedThisOutage).
 	c.limitRecovery(host, only)
 	c.recoverWorkloads(ctx, h)
 	return true
@@ -215,8 +215,8 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // this outage, and then only the workloads it lists. A host that never paused
 // never raised it. When no observer has seen it answer, this is
 // fenceStillStands as before, except that a condition from this outage that
-// is still readable keeps the recovery to the workloads it lists
-// (pausedThisOutage).
+// is still readable keeps the recovery to the workloads it lists, and a limit
+// already held for the host stands without one (pausedThisOutage).
 //
 // On top of that, the host must not hold a voter majority by this node's
 // count: the voters whose latest verdict about it is an answer, of any age,
@@ -284,8 +284,10 @@ func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Ti
 // host answer since the fence. When host's own partition_paused condition
 // from this outage is readable (hostReportsItsPause), only the workloads it
 // lists move: the host may still run the rest, as when it judged one not
-// recoverable. With no such condition everything moves, as without a bridge.
-// An unreadable condition refuses.
+// recoverable. With no such condition, a limit this coordinator already
+// holds for the host in this down-episode still stands, and with none held
+// everything moves, as without a bridge. A read error, of the condition or
+// of the voters' runs that date the outage, refuses.
 func (c *Coordinator) pausedThisOutage(ctx context.Context, host string, at time.Time, sets []map[string]bool) (string, map[string]bool, bool) {
 	paused, reason, ok := c.hostReportsItsPause(ctx, host, at, sets)
 	switch {
@@ -294,12 +296,12 @@ func (c *Coordinator) pausedThisOutage(ctx context.Context, host string, at time
 	case reason == whyPausedUnreadable:
 		return reason, nil, false
 	default:
-		return "", nil, true
+		return "", c.recoverOnly[host], true
 	}
 }
 
-// whyPausedUnreadable is hostReportsItsPause's reason when the condition
-// cannot be read.
+// whyPausedUnreadable is hostReportsItsPause's reason when the condition, or
+// the voters' runs that date its outage, cannot be read.
 const whyPausedUnreadable = "its partition_paused condition is unreadable"
 
 // hostReportsItsPause reads host's own replicated partition_paused
@@ -327,7 +329,12 @@ func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at t
 	if err := json.Unmarshal([]byte(cond.Evidence), &ev); err != nil || len(ev.Paused) == 0 {
 		return nil, "its partition_paused condition names no paused workload", false
 	}
-	start, ok := c.outageStart(ctx, host, at, sets)
+	start, ok, err := c.outageStart(ctx, host, at, sets)
+	if err != nil {
+		slog.Warn("failover: host_health read dating a partition-pause outage failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return nil, whyPausedUnreadable, false
+	}
 	if !ok {
 		return nil, "too few voters have watched the host fail since before the fence to date the outage", false
 	}
@@ -351,13 +358,13 @@ func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at t
 // and not observed only make the true moment earlier, and one observer that
 // has been failing the host for long, or a non-voter, cannot pull it back.
 // With several sets it is the latest of their answers. ok is false when any
-// set has fewer such runs than that.
-func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time, sets []map[string]bool) (time.Time, bool) {
+// set has fewer such runs than that; a read error is returned as err.
+func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time, sets []map[string]bool) (time.Time, bool, error) {
 	rows, err := c.db.Query(ctx,
 		`SELECT observer, consecutive_failures, last_seen, updated_at FROM host_health
 		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, err
 	}
 	freshCutoff := c.now().Add(-healthFreshness)
 	runs := map[string]time.Time{}
@@ -386,14 +393,14 @@ func (c *Coordinator) outageStart(ctx context.Context, host string, at time.Time
 		}
 		need := len(set) - (len(set)/2 + 1) + 1
 		if need < 1 || len(starts) < need {
-			return time.Time{}, false
+			return time.Time{}, false, nil
 		}
 		sort.Slice(starts, func(i, j int) bool { return starts[i].Before(starts[j]) })
 		if s := starts[need-1]; s.After(latest) {
 			latest = s
 		}
 	}
-	return latest, !latest.IsZero()
+	return latest, !latest.IsZero(), nil
 }
 
 // answeredByAVoterMajority reports false, and why, when the voters whose

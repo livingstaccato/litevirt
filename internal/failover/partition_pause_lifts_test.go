@@ -223,12 +223,26 @@ func TestRecoveryLimit_AQuietFallbackDeadlineKeepsTheHostsList(t *testing.T) {
 	assertLimited(t, db)
 }
 
-// A later quiet deadline with no word from down about this outage (its
-// condition resolved): recovered as without a bridge, everything.
+// assertStillLimited checks the limit from limitedEpisode outlived a later
+// deadline: vm2 and ct2 stay on down, and the stall alert still names vm2.
+func assertStillLimited(t *testing.T, c *Coordinator, db *corrosion.Client) {
+	t.Helper()
+	assertLimited(t, db)
+	if c.recoverOnly["down"] == nil {
+		t.Fatal("the recovery limit was lifted")
+	}
+	if held := c.unpausedHeldReason("down"); !strings.Contains(held, "vm/vm2") {
+		t.Fatalf("vm2 is no longer named as held: %q", held)
+	}
+}
+
+// A later quiet deadline at which down's condition has meanwhile resolved:
+// that is no word that down now runs nothing it did not list, so the list
+// this coordinator holds from this down-episode still bounds what moves.
 //
-// Mutation: keep the limit when the later deadline's list is nil — vm2
-// stays.
-func TestRecoveryLimit_AQuietLaterDeadlineWithoutTheHostsWordLifts(t *testing.T) {
+// Mutation: lift the limit when the later deadline finds no condition (as
+// round 4 did) — vm2 moves while down may still run it.
+func TestRecoveryLimit_AQuietLaterDeadlineWithAResolvedConditionKeepsTheLimit(t *testing.T) {
 	c, db, ctx, mono := limitedEpisode(t)
 	bridgeGone(t, db)
 	ts := time.Now().UTC().Format(time.RFC3339)
@@ -240,10 +254,79 @@ func TestRecoveryLimit_AQuietLaterDeadlineWithoutTheHostsWordLifts(t *testing.T)
 		t.Fatal(err)
 	}
 	laterDeadline(t, c, ctx, mono)
-	if got := vm2Host(t, db); got != "alive" {
-		t.Fatalf("vm2 on %q after a quiet deadline with no word from down; want it recovered", got)
+	assertStillLimited(t, c, db)
+}
+
+// A later quiet deadline at which one voter's row about down has gone stale,
+// so too few voter runs remain to date the outage: the condition cannot be
+// re-established, and the held list still bounds what moves.
+//
+// Mutation: lift the limit when the outage cannot be dated — vm2 moves.
+func TestRecoveryLimit_AQuietLaterDeadlineWithAStaleVoterRowKeepsTheLimit(t *testing.T) {
+	c, db, ctx, mono := limitedEpisode(t)
+	bridgeGone(t, db)
+	failingSince(t, db, "v4", time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+	laterDeadline(t, c, ctx, mono)
+	assertStillLimited(t, c, db)
+}
+
+// The outage cannot be dated because host_health cannot be read: that is a
+// read error, not "too few voters", and it refuses the deadline, as every
+// other read error at a self-pause deadline does. Through a whole deadline
+// the earlier reads of host_health would refuse first, so the outage dating
+// is reached directly.
+//
+// Mutations: report the read error as too few voter runs — the held list
+// comes back and the deadline goes ahead; or, with that, lift the limit (as
+// round 4 did) — nil comes back.
+func TestRecoveryLimit_AnUnreadableOutageRefusesTheDeadline(t *testing.T) {
+	c, db, ctx, _ := limitedEpisode(t)
+	sets, _, err := c.pauseVoterSets(ctx, "down")
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertLifted(t, c)
+	if _, err := db.DB().ExecContext(ctx, `DROP TABLE host_health`); err != nil {
+		t.Fatal(err)
+	}
+	why, only, ok := c.pausedThisOutage(ctx, "down", time.Now(), sets)
+	if ok {
+		t.Fatalf("a deadline whose outage could not be read went ahead (limit %v)", only)
+	}
+	if why != whyPausedUnreadable {
+		t.Fatalf("refused with %q, want %q", why, whyPausedUnreadable)
+	}
+	if c.recoverOnly["down"] == nil {
+		t.Fatal("the recovery limit was lifted")
+	}
+}
+
+// down's condition cannot be read at a later quiet deadline: the deadline is
+// refused, so nothing moves and the limit stands. (The pause-failed read
+// fails too, so this deadline is quietFallback's; the explicit path shares
+// pausedThisOutage.)
+//
+// Mutation: recover on an unreadable condition instead of refusing — the
+// limit is lifted and vm2 moves.
+func TestRecoveryLimit_AnUnreadableConditionRefusesTheDeadline(t *testing.T) {
+	c, db, ctx, mono := limitedEpisode(t)
+	bridgeGone(t, db)
+	if _, err := db.DB().ExecContext(ctx, `DROP TABLE health_conditions`); err != nil {
+		t.Fatal(err)
+	}
+	laterDeadline(t, c, ctx, mono)
+	if got := vm2Host(t, db); got != "down" {
+		t.Fatalf("vm2 recovered to %q although down's condition could not be read", got)
+	}
+	if c.recoverOnly["down"] == nil {
+		t.Fatal("the recovery limit was lifted on an unreadable condition")
+	}
+	sets, _, err := c.pauseVoterSets(ctx, "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if why, only, ok := c.pausedThisOutage(ctx, "down", time.Now(), sets); ok || why != whyPausedUnreadable {
+		t.Fatalf("pausedThisOutage on an unreadable condition = %q, %v, %v; want a refusal", why, only, ok)
+	}
 }
 
 // A later bridged deadline whose list now includes vm2 (down has since

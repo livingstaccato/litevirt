@@ -511,8 +511,12 @@ All of this is in the failover coordinator (`internal/failover`).
      best-effort or SSH fence does not), or the host is removed with such a
      proof. A later deadline at which no observer has seen the host answer,
      a successor's after the bridge has gone say, still keeps to the list
-     while that condition is readable, and recovers everything, as without
-     a bridge, when it is not. The
+     while that condition is readable. When it finds none from this outage
+     (absent, resolved, listing nothing, raised before the outage, or too
+     few fresh voter runs to date the outage), it keeps
+     the list this coordinator already holds, and recovers everything, as
+     without a bridge, only when it holds none. A read error of the
+     condition or of the voters' runs refuses the deadline. The
      outage begins, for a voter set of `n` with majority `q`, at the
      `(n−q+1)`-th earliest start among its voters' failing runs that span the
      fence: the host cannot have lost its majority before that many voters

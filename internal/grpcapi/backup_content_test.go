@@ -364,7 +364,7 @@ func TestFormatBackupPushError(t *testing.T) {
 // written) is not a failure of the VM's disk: the message is the plain push
 // error, with no disk wording and no hint to look at the VM's storage.
 //
-// Mutation: every push failure gets the disk wording (round 1) — red.
+// Mutation: every push failure gets the disk wording — red.
 func TestBackupSnapshot_ARepositoryWriteFailureIsNotBlamedOnTheDisk(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"

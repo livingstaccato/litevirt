@@ -32,7 +32,11 @@ func TestRecordImage_ANewerLiveRecordSupersedesInsteadOfAborting(t *testing.T) {
 			}
 			earlierHost := testImageHost(s)
 			earlierHost.Path = "/x/earlier.qcow2"
-			if err := s.recordImage(ctx, op, earlier, corrosion.ImageRecord{Name: "imgr", Format: "qcow2", Checksum: "sha256:earlier"}, earlierHost); err != nil {
+			earlierSum := "sha256:earlier"
+			if op == imageOpCopy {
+				earlierSum = "sha256:later" // a copy of the same content (other content: TestRecordImage_ACopyOvertakenByOtherContentIsNotReady)
+			}
+			if err := s.recordImage(ctx, op, earlier, corrosion.ImageRecord{Name: "imgr", Format: "qcow2", Checksum: earlierSum}, earlierHost); err != nil {
 				t.Fatalf("the %s begun first and recording last: %v, want it recorded", op, err)
 			}
 			want := "sha256:later" // a copy leaves the catalog row to the newer record

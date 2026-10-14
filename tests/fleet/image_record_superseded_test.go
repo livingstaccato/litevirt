@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -169,4 +170,96 @@ func TestFleet_ImagePull_RacingACopyLeavesThePullsChecksum(t *testing.T) {
 			t.Errorf("%s: imgp's record %+v (err %v), want the pull's checksum %s", n.Name, img, err, newChecksum)
 		}
 	}
+}
+
+// Re-review 3, m-2: a VM create on node-1 copies imgo's old content from
+// node-2 while lv image pull of new content runs on node-0, begun after the
+// copy; the pull's record reaches node-1 before the copy records. The copy is
+// older content than the image's record: it fails, retryably, node-1 records
+// no ready copy of it, and node-1 builds no new disk on it (it is not the
+// image's current file there).
+func TestFleet_ImageAutoPull_OvertakenByARefreshPullIsNotReady(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "new.qcow2")
+	if err := qcow2.Create(src, 96<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(src)
+	sum := sha256.Sum256(body)
+	newChecksum := "sha256:" + hex.EncodeToString(sum[:])
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(ts.Close)
+
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true})
+	c.WaitConverged(t, convergeTimeout)
+	imageRmFleet(c)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	importImageSizedOn(t, c, n2, "imgo", 64<<20)
+	c.WaitConverged(t, convergeTimeout)
+	old, _ := corrosion.GetImage(ctx, n2.DB, "imgo")
+	if old == nil || old.Checksum == "" || old.Checksum == newChecksum {
+		t.Fatalf("precondition: imgo's old record %+v", old)
+	}
+
+	arrivals := make(chan recordArrival, 1)
+	n1.Server.SetImageRecordClockHookForTest(func(name, clock string) {
+		if name != "imgo" {
+			return
+		}
+		a := recordArrival{clock: clock, release: make(chan struct{})}
+		arrivals <- a
+		<-a.release
+	})
+	t.Cleanup(func() { n1.Server.SetImageRecordClockHookForTest(nil) })
+	errs := make(chan error, 1)
+	go func() { errs <- n1.Server.AutoPullFromPeerForTest(ctx, "imgo", n2.Name) }()
+	copying := waitArrival(t, arrivals) // published on node-1, not recorded
+
+	stream, err := c.SelfClient(n0).PullImage(ctx, &pb.PullImageRequest{Name: "imgo", SourceUrl: ts.URL + "/new.qcow2", Format: "qcow2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("pull: %v", err)
+		}
+	}
+	eventually(t, convergeTimeout, "the pull's record to reach node-1", func() bool {
+		img, err := corrosion.GetImage(ctx, n1.DB, "imgo")
+		return err == nil && img != nil && img.Checksum == newChecksum
+	})
+	close(copying.release)
+
+	if err := <-errs; err == nil || !strings.Contains(err.Error(), "older content than the image's newer record") {
+		t.Fatalf("node-1's copy of the old content: %v, want it refused as older content", err)
+	}
+	rows, err := n1.DB.Query(ctx, `SELECT status FROM image_hosts WHERE image_name = 'imgo' AND host_name = ? AND deleted_at IS NULL`, n1.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.String("status") == "ready" {
+			t.Fatalf("node-1 records a ready copy of imgo holding the old content: %v", rows)
+		}
+	}
+	if cur := n1.Server.ImagePathForTests("imgo"); fileExists(cur) {
+		b, _ := os.ReadFile(cur)
+		got := sha256.Sum256(b)
+		if "sha256:"+hex.EncodeToString(got[:]) == old.Checksum {
+			t.Fatalf("node-1's current file of imgo (%s) is the old content: new disks there would be built on it", cur)
+		}
+	}
+	if img, _ := corrosion.GetImage(ctx, n1.DB, "imgo"); img == nil || img.Checksum != newChecksum {
+		t.Fatalf("node-1's catalog row of imgo: %+v, want the pull's", img)
+	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }

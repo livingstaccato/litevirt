@@ -124,3 +124,77 @@ func TestPruneImages_KeepsAFileWithinARememberedSkewOfTheDelete(t *testing.T) {
 		t.Fatalf("the remembered skew was not saved to %s: %v", history, err)
 	}
 }
+
+// Re-review 3, m-4: a history file that is empty (a power loss before a write
+// of it reached the disk) or corrupt cannot be read. The recorder says so at
+// WARN once, naming the file and the recovery; every deleted image's margin is
+// an error meanwhile (the prune keeps its files: fail closed); what is
+// measured meanwhile is kept, not lost; and once the file is removed, the
+// history is saved again — whole, and with no temp file left beside it.
+func TestImageSkewHistory_AnEmptyOrCorruptFileIsUnreadable(t *testing.T) {
+	ctx := context.Background()
+	for name, content := range map[string]string{"empty": "", "corrupt": "{not json"} {
+		t.Run(name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			path := filepath.Join(dataDir, imageSkewHistoryFile)
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s := testServer(t)
+			s.dataDir = dataDir
+			logs := captureSlog(t)
+			measured := time.Now().UTC().Add(-70 * time.Minute)
+			if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',900,?)`,
+				measured.Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			s.recordImageSkew(ctx)
+			s.recordImageSkew(ctx)
+
+			var warns []string
+			for _, l := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(l, "level=WARN") && strings.Contains(l, "cannot be read") {
+					warns = append(warns, l)
+				}
+			}
+			if len(warns) != 1 || !strings.Contains(warns[0], path) || !strings.Contains(warns[0], "Remove the file") {
+				t.Fatalf("WARN lines for the unreadable history: %q, want one naming %s and the recovery", warns, path)
+			}
+			deleted := measured.Add(2 * time.Minute).Format(time.RFC3339Nano)
+			if _, err := s.imageDeleteMargin(ctx, deleted); err == nil {
+				t.Fatal("an unreadable history gave a margin")
+			}
+			if b, _ := os.ReadFile(path); string(b) != content {
+				t.Fatalf("the unreadable file was written over: %q", b)
+			}
+
+			ageOutClockSkew(t, s, time.Now())
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if m, err := s.imageDeleteMargin(ctx, deleted); err != nil || m != 15*time.Minute {
+				t.Fatalf("after the file was removed: margin %s (err %v), want the 15m measured while it was unreadable", m, err)
+			}
+			// Saved whole on the next skew it learns.
+			if err := s.db.Execute(ctx, `INSERT INTO clock_skew (observer, target, skew_seconds, updated_at) VALUES ('a','b',1200,?)`,
+				time.Now().UTC().Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			s.recordImageSkew(ctx)
+			fi, err := os.Stat(path)
+			if err != nil || fi.Mode().Perm() != 0o600 {
+				t.Fatalf("the history was not saved 0600: %v (err %v)", fi, err)
+			}
+			ents, _ := os.ReadDir(dataDir)
+			if len(ents) != 1 {
+				t.Fatalf("the data dir holds %v, want only the history file", ents)
+			}
+			restarted := testServer(t)
+			restarted.dataDir = dataDir
+			// The 1200 s skew seen now covers the 900 s one for this delete.
+			if m, err := restarted.imageDeleteMargin(ctx, deleted); err != nil || m != 20*time.Minute {
+				t.Fatalf("after a restart: margin %s (err %v), want 20m", m, err)
+			}
+		})
+	}
+}

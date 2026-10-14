@@ -463,6 +463,33 @@ func (s *Store) setCurrent(name, base string) error {
 	return nil
 }
 
+// Withdraw takes path, a file of image name that Publish has just made its
+// current file, back from being current: an image operation that published it
+// found it is not the content the image's record names (grpcapi
+// staleImageCopyError). The name points again at prev, the file that was
+// current before (a version), or at the image's first file (prev that file,
+// or "" when there was none: the pointer is removed). The file itself stays,
+// as a superseded version, for the prune to remove once no disk is built on
+// it. When path is no longer the current file (another publish since), nothing
+// changes.
+func (s *Store) Withdraw(name, path, prev string) error {
+	if prev == path {
+		return nil // Publish made nothing current: the content was already
+	}
+	if cur, ok := s.currentVersion(name); !ok || cur != path {
+		return nil
+	}
+	if prev != "" && isVersionFile(name, filepath.Base(prev)) && filepath.Dir(prev) == filepath.Clean(s.imageDir) {
+		if fi, err := os.Lstat(prev); err == nil && fi.Mode().IsRegular() {
+			return s.setCurrent(name, filepath.Base(prev))
+		}
+	}
+	if err := os.Remove(s.pointerPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("withdraw image %q's current version %s: %w", name, path, err)
+	}
+	return nil
+}
+
 // ImageFiles is every file of image name in the store: its first content and
 // each published version.
 func (s *Store) ImageFiles(name string) []string {

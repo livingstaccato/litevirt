@@ -728,8 +728,9 @@ lv image rm <image>
 #       skews it has seen in image-delete-skew.json in its data directory,
 #       so a skew still counts after its measurements age out (an hour) and
 #       across a restart. A delete time or publish time that cannot be read
-#       keeps the file too, and so does that file when it cannot be read
-#       (remove it to start it afresh). lv image rm again, after the time the
+#       keeps the file too, and so does that file when it cannot be read,
+#       empty or corrupt (the host logs it at WARN; remove it to start it
+#       afresh). lv image rm again, after the time the
 #       reason names, removes it.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
@@ -755,15 +756,22 @@ lv image rm <image>
 #       begun after this one, recorded first: an import, pull, build or
 #       compose download then records at that moment, and wins over a delete
 #       stamped before then. (A copy from a peer leaves the image's record
-#       to the newer one and records only its host's copy.)
+#       to the newer one and records only its host's copy, when the newer
+#       record is of the same content. A copy of other content is not
+#       recorded: it fails, and the VM create or heal that made it copies
+#       the image again.) A newer record stamped ahead of this host's clock
+#       by more than 5 minutes fails the import, pull, build or compose
+#       download instead, naming the clock skew to correct.
 #     - lv image pull: its host's record of its copy is rewritten as the
 #       download progresses. The image stays deleted, but that host record,
 #       and the file, stay until lv image rm runs again when the delete was
-#       stamped before the last such rewrite. The host's own record of its copy (the image's hosts
-#   in lv image ls, which peers pull from and placement reads) is revived on
-#   the other hosts only once the cluster upgrade has finished
-#   (lv cluster upgrade-status). Before
-#   that the record reads deleted on every host, this one too once
+#       stamped before the pull finished: its record, or its last progress
+#       write, whichever is later.
+#
+#   The host's own record of its copy (the image's hosts in lv image ls,
+#   which peers pull from and placement reads) is revived on the other hosts
+#   only once the cluster upgrade has finished (lv cluster upgrade-status).
+#   Before that the record reads deleted on every host, this one too once
 #   anti-entropy runs, so no peer pulls the copy and placement does not see
 #   it; the host logs this at WARN, and importing the image again after the
 #   upgrade publishes the copy.

@@ -134,6 +134,10 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	// recorded identity (image.Store.Publish). A peer's push (the
 	// reconciler's heal, autoPullImage) arrives here too.
 	s.recordImageProvenance(ctx, name)
+	prev := s.images.ImagePath(name) // current before the publish, for a stale copy's withdrawal
+	if _, err := os.Lstat(prev); err != nil {
+		prev = ""
+	}
 	pub, err := s.images.Publish(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
 	if err != nil {
 		return status.Errorf(codes.Internal, "publish image: %v", err)
@@ -156,6 +160,15 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		Status:    "ready",
 		PulledAt:  now,
 	}); err != nil {
+		if isStaleImageCopy(err) {
+			// Older content than the image's record (re-review 3, m-2): no
+			// new disk here is built on it. It stays as a superseded version
+			// until the prune finds nothing built on it.
+			if werr := s.images.Withdraw(name, pub.Path, prev); werr != nil {
+				slog.Warn("image: a copy of older content than the image's record is still its current file here", "image", name, "path", pub.Path, "error", werr)
+			}
+			s.pruneAfterRefresh(name, s.images.ImagePath(name))
+		}
 		return err
 	}
 

@@ -2,13 +2,17 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // imageOp names an operation that leaves a copy of an image on this host and
@@ -125,10 +129,15 @@ const imageRecordRetries = 3
 //     record is newer (corrosion.RecordImage).
 //   - A newer live record of the image here (another copy, pull or import of
 //     it, begun after op) is not a delete (re-review 2, I-1). A copy then
-//     leaves the catalog row to it and records only this host's row. An
-//     operator's operation writes its row again at fresh clocks, so the newest
-//     operator content is the one recorded; in that case alone a delete stamped
-//     after op began that has not reached this host by then loses to it.
+//     leaves the catalog row to it and records only this host's row, when the
+//     newer record is of the copy's content; of other content it records
+//     nothing and fails, retryably (staleImageCopyError, re-review 3, m-2).
+//     An operator's operation writes its row again at fresh clocks, after
+//     taking the newer row's stamp into this host's clock (re-review 3, m-1),
+//     so the newest operator content is the one recorded; in that case alone a
+//     delete stamped after op began that has not reached this host by then
+//     loses to it. A row stamped further ahead of this host's clock than the
+//     cluster accepts fails it (FailedPrecondition), naming the skew.
 //   - This host's row is written at the clock reserved with the catalog row's,
 //     unless a write to it here is newer (corrosion.RecordImageHost).
 func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, img corrosion.ImageRecord, ih corrosion.ImageHostRecord) error {
@@ -154,20 +163,33 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 	if !ok {
 		return status.Errorf(codes.Internal, "image %q: this %s has no reserved record clocks left", img.Name, op)
 	}
-	outcome := corrosion.ImageRecordWritten
+	var res corrosion.ImageRecordResult
 	for attempt := 0; ; attempt++ {
 		var err error
-		outcome, err = corrosion.RecordImage(ctx, s.db, img, op.revives(), t.deleted, clk)
+		res, err = corrosion.RecordImage(ctx, s.db, img, op.revives(), t.deleted, clk)
 		if err != nil {
 			s.noteStateWriteFail(corrosion.OpImage, err)
 			return status.Errorf(codes.Internal, "record image: %v", err)
 		}
-		if outcome != corrosion.ImageRecordSuperseded || !op.revives() || attempt >= imageRecordRetries {
+		if res.Outcome != corrosion.ImageRecordSuperseded || !op.revives() || attempt >= imageRecordRetries {
 			break
 		}
-		clk = corrosion.ReserveImageClocks(s.db) // an operator's content is the newest: record it again, now
+		// An operator's content is the newest: record it again, now. The
+		// newer row may be stamped ahead of this host's clock (a peer's that
+		// runs ahead, arrived by anti-entropy, which advances no clock), so
+		// the clock takes its stamp first, as the replicator would have
+		// (re-review 3, m-1). One the clock refuses (hlc.MaxSkewMS) would
+		// supersede every attempt: that is clock skew, not a race.
+		corrosion.ObserveStamp(s.db, res.UpdatedAt)
+		clk = corrosion.ReserveImageClocks(s.db)
+		if !corrosion.LWWNewer(clk.Insert, res.UpdatedAt) {
+			return status.Errorf(codes.FailedPrecondition,
+				"image %q's catalog record here is stamped %s, ahead of this host's clock (%s) by more than the %s of clock skew the cluster accepts from a peer: "+
+					"this %s cannot be recorded over it, and the copy here is left for lv image prune; correct the clock skew (NTP) on the host whose clock runs ahead, or on this one, and run it again",
+				img.Name, res.UpdatedAt, clk.Insert, time.Duration(hlc.MaxSkewMS)*time.Millisecond, op)
+		}
 	}
-	switch outcome {
+	switch res.Outcome {
 	case corrosion.ImageRecordDeleted:
 		now, _ := corrosion.ImageDeletedAt(ctx, s.db, img.Name)
 		return status.Errorf(codes.Aborted,
@@ -179,7 +201,15 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 				"image %q's catalog record kept changing while this %s ran: nothing is recorded, and the copy here is left for lv image prune",
 				img.Name, op)
 		}
-		// A copy: the newer record describes the image; this host holds a copy.
+		// A copy: the newer record describes the image. This host holds a
+		// copy of it only when that record is of the same content; a copy of
+		// older content (a refresh elsewhere, begun after this copy, recorded
+		// first) is not recorded as ready here (re-review 3, m-2).
+		if !sameImageContent(res.Checksum, img.Checksum) {
+			return &staleImageCopyError{st: status.Newf(codes.Aborted,
+				"image %q changed while this copy ran: the copy (%s) is older content than the image's newer record (%q), so it is not recorded here; copy the image again",
+				img.Name, img.Checksum, res.Checksum)}
+		}
 	}
 	reviving := t.deleted != ""
 	if op.revives() {
@@ -190,6 +220,33 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 		return status.Errorf(codes.Internal, "record image host: %v", err)
 	}
 	return nil
+}
+
+// staleImageCopyError is recordImage's refusal of a copy whose content an
+// image's newer record does not describe (re-review 3, m-2). It is Aborted:
+// the copy is retried (autoPullImage tries the next holder). ImportImage
+// takes the copy back from the image's current file (image.Store.Withdraw),
+// so this host does not build disks on it, and the prune removes it once
+// nothing is built on it.
+type staleImageCopyError struct{ st *status.Status }
+
+func (e *staleImageCopyError) Error() string              { return e.st.Err().Error() }
+func (e *staleImageCopyError) GRPCStatus() *status.Status { return e.st }
+
+// isStaleImageCopy reports whether err is recordImage's refusal of a copy of
+// older content than the image's record.
+func isStaleImageCopy(err error) bool {
+	var e *staleImageCopyError
+	return errors.As(err, &e)
+}
+
+// sameImageContent reports whether two recorded checksums name one content:
+// sha256 digests, with or without the sha256: prefix, in either case. An
+// empty one is no content yet (a pull's first record) and matches nothing.
+func sameImageContent(a, b string) bool {
+	norm := func(c string) string { return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(c), "sha256:")) }
+	a, b = norm(a), norm(b)
+	return a != "" && a == b
 }
 
 // recordImageHost writes this host's image_hosts row for a copy it holds.
@@ -213,12 +270,17 @@ func (s *Server) recordImage(ctx context.Context, op imageOp, t *imageTicket, im
 // One race is left to the catalog row: a copy recorded while the image's
 // delete has not reached this host, where the delete is older than this row's
 // clock, leaves this row live under a deleted catalog row. That is a delete
-// stamped before the operation began, or, when the row was written here after
-// that (a pull's progress, or a record written again at fresh clocks), before
-// that write. lv image ls does not list the image, and GetImageHosts names
-// no host of a deleted image, so no auto-pull, compose deploy or placement
-// counts this one. The row and its file stay until lv image rm runs again
-// (the prune keeps a file published within its margin of the delete).
+// stamped before the operation began. When the row was written here after
+// that, it is one stamped before the row's last write: for a pull, before the
+// pull finished (its record, or its last progress write, whichever is later;
+// the record writes at a fresh clock over a progress write, and the last
+// progress write can land after the record); for a record written again at
+// fresh clocks, before that record.
+//
+// lv image ls does not list the image, and GetImageHosts names no host of a
+// deleted image, so no auto-pull, compose deploy or placement counts this
+// one. The row and its file stay until lv image rm runs again (the prune
+// keeps a file published within its margin of the delete).
 func (s *Server) recordImageHost(ctx context.Context, ih corrosion.ImageHostRecord, reviving bool, at string) error {
 	if s.ReleaseTokenLatched() {
 		return corrosion.RecordImageHost(ctx, s.db, ih, true, at)

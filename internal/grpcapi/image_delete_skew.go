@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 // imageSkewHistoryFile, under the data directory, holds the clock skews this
@@ -45,12 +46,16 @@ type skewSeen struct {
 type imageSkewHistory struct {
 	mu     sync.Mutex
 	loaded bool
+	warned bool // the file's being unreadable is logged (recordImageSkew), once until it is read
 	seen   []skewSeen
 }
 
-// load reads the history file, until a read succeeds. A file that cannot be
-// read is an error: the prune then keeps every deleted image's file the
-// history decides on, until the file is readable or removed.
+// load reads the history file into the history, until a read succeeds. A file
+// that cannot be read — empty (a power loss before an earlier build's write of
+// it reached the disk), torn or corrupt — is an error: the prune then keeps
+// every deleted image's file the history decides on, until the file is
+// readable or removed (re-review 3, m-4). What was added in memory meanwhile
+// is kept, and merged with the file once it reads.
 func (h *imageSkewHistory) load(dataDir string) error {
 	if h.loaded || dataDir == "" {
 		return nil
@@ -71,6 +76,7 @@ func (h *imageSkewHistory) load(dataDir string) error {
 		h.add(e)
 	}
 	h.loaded = true
+	h.warned = false
 	return nil
 }
 
@@ -94,7 +100,10 @@ func (h *imageSkewHistory) add(e skewSeen) bool {
 	return true
 }
 
-// save writes the history to its file, replacing it whole.
+// save writes the history to its file, replacing it whole and durably
+// (re-review 3, m-4): the new file is synced before it is renamed into place
+// (secretfile.Write), and the directory after, so a power loss leaves the old
+// history or the new one, never an empty or torn file.
 func (h *imageSkewHistory) save(dataDir string) error {
 	if dataDir == "" {
 		return nil
@@ -103,17 +112,20 @@ func (h *imageSkewHistory) save(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dataDir, imageSkewHistoryFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	if err := secretfile.Write(filepath.Join(dataDir, imageSkewHistoryFile), b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return syncDirPath(dataDir)
 }
 
 // recordImageSkew reads every clock_skew row this host holds into the history
 // and returns the largest skew among them (0 when there is none, or the rows
 // cannot be read).
+//
+// While the history file cannot be read, what it reads is kept in memory and
+// not saved (the file is not written over), and that is logged at WARN once,
+// naming the file and the recovery: removing it. Every deleted image's file
+// is kept by the prune meanwhile (imageDeleteMargin is an error).
 func (s *Server) recordImageSkew(ctx context.Context) time.Duration {
 	rows, err := s.db.Query(ctx, `SELECT ABS(skew_seconds) AS s, updated_at FROM clock_skew`)
 	if err != nil {
@@ -136,14 +148,18 @@ func (s *Server) recordImageSkew(ctx context.Context) time.Duration {
 	h := &s.imagePrune.skew
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.load(s.dataDir) != nil {
-		return largest
+	lerr := h.load(s.dataDir)
+	if lerr != nil && !h.warned {
+		h.warned = true
+		slog.Warn("image: the clock skews this host has seen cannot be read; lv image prune and lv image rm keep every file of a deleted image here until they can. "+
+			"Remove the file to start the history afresh: the skews measured since this daemon started are kept, and those of the last hour are read again from the cluster",
+			"file", filepath.Join(s.dataDir, imageSkewHistoryFile), "error", lerr)
 	}
 	changed := false
 	for _, e := range seen {
 		changed = h.add(e) || changed
 	}
-	if changed {
+	if changed && lerr == nil {
 		if err := h.save(s.dataDir); err != nil {
 			slog.Warn("image: the clock skews this host has seen are not saved; a restart forgets them", "error", err)
 		}

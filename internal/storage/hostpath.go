@@ -188,7 +188,7 @@ var dataDirOwned = []string{
 	"partition-pause",           // health/partition_pause_store.go partitionPauseDir
 	"onboot-boot-id",            // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
 	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
-	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (and its .tmp, dataDirOwnedPrefixes)
+	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
 	"audit-hold",                // corrosion/audit_hold.go AuditHoldDirName
 	"audit-seeded.json",         // corrosion/audit_seeded.go AuditSeededFileName
 	"audit-seeded-assert",       // corrosion/audit_seeded.go AuditSeededAssertFileName

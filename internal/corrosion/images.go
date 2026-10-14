@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // ImageRecord represents a VM base image.
@@ -133,6 +136,16 @@ func (o ImageRecordOutcome) String() string {
 	return "unknown"
 }
 
+// ImageRecordResult is what RecordImage did, and, when it wrote nothing, the
+// row it found.
+type ImageRecordResult struct {
+	Outcome ImageRecordOutcome
+	// UpdatedAt and Checksum are the row's here when Outcome is not
+	// ImageRecordWritten: the stamp of the record that superseded this one,
+	// and that record's content (re-review 3, m-1 and m-2).
+	UpdatedAt, Checksum string
+}
+
 // RecordImage writes image img's catalog row at clocks clk reserved as the
 // operation began: the insert alone (a copy from a peer), or with the revive
 // (revive: an operator's import, pull, build or compose download).
@@ -155,17 +168,17 @@ func (o ImageRecordOutcome) String() string {
 // "Before" is by two hosts' clocks, so a delete issued just after the
 // operation began on a host whose clock runs behind by more than that gap
 // loses too.
-func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (ImageRecordOutcome, error) {
+func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, startDeleted string, clk ImageClocks) (ImageRecordResult, error) {
 	stmts := []Statement{imageInsert(img, clk.Insert)}
 	if revive {
 		stmts = append(stmts, imageRevive(img.Name, clk.Revive))
 	}
-	outcome := ImageRecordWritten
+	res := ImageRecordResult{Outcome: ImageRecordWritten}
 	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var deletedAt, updatedAt string
+		var deletedAt, updatedAt, checksum string
 		err := tx.QueryRowContext(ctx,
-			`SELECT COALESCE(deleted_at, ''), COALESCE(updated_at, '') FROM images WHERE name = ?`, img.Name).
-			Scan(&deletedAt, &updatedAt)
+			`SELECT COALESCE(deleted_at, ''), COALESCE(updated_at, ''), COALESCE(checksum, '') FROM images WHERE name = ?`, img.Name).
+			Scan(&deletedAt, &updatedAt, &checksum)
 		if errors.Is(err, sql.ErrNoRows) {
 			return true, nil
 		}
@@ -174,16 +187,46 @@ func RecordImage(ctx context.Context, c *Client, img ImageRecord, revive bool, s
 		}
 		switch {
 		case deletedAt != "" && deletedAt != startDeleted:
-			outcome = ImageRecordDeleted
+			res.Outcome = ImageRecordDeleted
 		case lwwOrder(updatedAt, clk.Insert) >= 0:
-			outcome = ImageRecordSuperseded
+			res.Outcome = ImageRecordSuperseded
 		}
-		return outcome == ImageRecordWritten, nil
+		if res.Outcome != ImageRecordWritten {
+			res.UpdatedAt, res.Checksum = updatedAt, checksum
+		}
+		return res.Outcome == ImageRecordWritten, nil
 	}, stmts)
 	if err != nil {
-		return 0, err
+		return ImageRecordResult{}, err
 	}
-	return outcome, nil
+	return res, nil
+}
+
+// ObserveStamp advances this host's clock to ts, a row's updated_at another
+// host wrote, as the replicator does for each entry it applies
+// (hlc.Clock.Update): a clock reserved here afterwards (NowTS,
+// ReserveImageClocks) orders after ts. A row that arrived by anti-entropy
+// advanced no clock, so a peer's clock running ahead of this host's left it
+// newer than every clock this host takes (re-review 3, m-1). The clock refuses
+// a stamp more than hlc.MaxSkewMS ahead of this host's wall clock, and one
+// that does not parse changes nothing: the caller compares again (LWWNewer).
+func ObserveStamp(c *Client, ts string) {
+	if c.clock == nil {
+		return
+	}
+	if p, ok := hlc.Parse(ts); ok {
+		c.clock.Update(p)
+		return
+	}
+	at, ok := tsInstant(ts)
+	if !ok {
+		return
+	}
+	ms := at.UnixMilli()
+	if at.After(time.UnixMilli(ms)) {
+		ms++ // an RFC3339 stamp inside a millisecond: the clock takes the next one
+	}
+	c.clock.Update(hlc.Timestamp{PhysicalMS: ms})
 }
 
 // ImageDeletedAt is the deleted_at of image name's row here: "" when the row

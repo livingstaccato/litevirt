@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -176,6 +175,7 @@ func TestLab_MigrationNetworkCarriesTheStorageCopy(t *testing.T) {
 
 	// Sample the source's established migration connections while the move runs.
 	sample := "for i in $(seq 1 240); do ss -Htn state established '( dport >= :49152 and dport <= :49215 )'; sleep 0.25; done > /tmp/mignet.ss 2>&1 &"
+	l.onRestore(func() { l.ssh(src, 20*time.Second, "rm -f /tmp/mignet.ss") })
 	l.mustSSH(src, 20*time.Second, "rm -f /tmp/mignet.ss; "+sample+" echo started")
 	out, err := l.lv(q, "migrate", vm, dst, "--with-storage")
 	if err != nil {
@@ -247,7 +247,7 @@ func (l *lab) createLabVM(via, prefix, host, pool string, failback bool) string 
 	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    guest-agent: true\n%s    placement:\n      host: %s\n      failback: %t\n",
 		stack, name, drillImage(), drillMemory(), disks, host, failback)
 	file := "/tmp/" + stack + ".yaml"
-	l.mustSSH(via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)
+	l.putFile(via, file, yaml)
 	l.onRestore(func() { l.deleteVMs(stack, map[string]string{host: name}) })
 	l.mustLVf(via, "compose up", "compose", "up", "-f", file, "-y")
 	if !l.waitDomainState(host, name, "running", 4*time.Minute) {
@@ -412,6 +412,7 @@ func TestLab_MigrationNetworkCarriesMemoryOnlyOverTLS(t *testing.T) {
 	vm := l.createSharedVM(q, "mignetmem", src, pool, false)
 
 	sample := "for i in $(seq 1 240); do ss -Htn state established '( dport >= :49152 and dport <= :49215 ) or ( dport = :16514 )'; sleep 0.25; done > /tmp/mignetmem.ss 2>&1 &"
+	l.onRestore(func() { l.ssh(src, 20*time.Second, "rm -f /tmp/mignetmem.ss") })
 	l.mustSSH(src, 20*time.Second, "rm -f /tmp/mignetmem.ss; "+sample+" echo started")
 	out, err := l.lv(q, "migrate", vm, dst)
 	if err != nil {

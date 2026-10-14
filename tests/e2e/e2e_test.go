@@ -1146,7 +1146,7 @@ func TestUser_TokenCreateRevoke(t *testing.T) {
 	if out == "" {
 		t.Fatal("token-create returned empty")
 	}
-	t.Logf("token output: %s", strings.TrimSpace(out))
+	t.Logf("token output: %s", redacted(strings.TrimSpace(out)))
 
 	lv(t, "user", "delete", username)
 }
@@ -1168,7 +1168,7 @@ func TestUser_RBACEnforcement(t *testing.T) {
 			break
 		}
 	}
-	t.Logf("viewer token: %s", token)
+	t.Logf("viewer token: %s", redacted(token))
 
 	// Verify viewer can list but not create users via REST.
 	if restURL == "" || token == "" {

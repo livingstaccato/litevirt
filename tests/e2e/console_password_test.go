@@ -219,8 +219,11 @@ func TestVM_ConsolePassword(t *testing.T) {
 	lv(t, "migrate", name, localHost, "--with-storage")
 	waitVM(t, name, "RUNNING", 3*time.Minute)
 	m = reVNCPasswd.FindStringSubmatch(virshDump(t, name, true))
-	if m == nil || m[1] != pw {
-		t.Fatalf("after migrating away and back the VNC password changed or went (%v)", m)
+	if m == nil {
+		t.Fatalf("after migrating away and back the VNC password went")
+	}
+	if m[1] != pw {
+		t.Fatalf("after migrating away and back the VNC password changed")
 	}
 	conn, types = rfbOffered(t, fmt.Sprintf("127.0.0.1:%d", vncLocalPort(t, name)))
 	conn.Close()

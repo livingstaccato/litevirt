@@ -313,6 +313,7 @@ func TestBackfillHardwareTables_TwoPeerConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSharedTestClient A: %v", err)
 	}
+	t.Cleanup(func() { _ = clientA.Close() })
 	if err := corrosion.InitSchema(ctx, clientA); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -320,6 +321,7 @@ func TestBackfillHardwareTables_TwoPeerConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSharedTestClient B: %v", err)
 	}
+	t.Cleanup(func() { _ = clientB.Close() })
 
 	fA, fB := libvirtfake.New(), libvirtfake.New()
 	fA.SetInactiveXML("shared", domainXMLWith("shared"))

@@ -2328,12 +2328,6 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
-	// A no-op stop of a VM whose row holds its set-aside disk copies (error:
-	// a failover start that failed may need them put back) leaves the row as
-	// it is. Writing stopped/
-	// operator-stop over it would end that hold (health.supersededHoldStates)
-	// on a stop that stopped nothing. The answer is still success, marked as
-	// a no-op in the VM's event.
 	// pending/starting: a start is under way (a failover's, an onboot's, a
 	// self-heal's), and the reconciler will start the domain. A success here
 	// would be overridden by that start, so the stop is refused, and nothing
@@ -2359,6 +2353,11 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		defer release()
 		cancelled = detail
 	}
+	// A no-op stop of a VM whose row holds its set-aside disk copies (error:
+	// a failover start that failed may need them put back) leaves the row as
+	// it is: writing stopped/operator-stop over it would end that hold
+	// (health.supersededHoldStates) on a stop that stopped nothing. The answer
+	// is still success, marked as a no-op in the VM's event.
 	if noop && stopNoopKeepsRow[vm.State] {
 		detail := fmt.Sprintf("already stopped: the domain was not running; the row is left %s, which holds its set-aside disk copies", vm.State)
 		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", detail)

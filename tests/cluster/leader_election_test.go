@@ -34,6 +34,7 @@ func sharedTestDB(t *testing.T, hostName, dsnSuffix string) *corrosion.Client {
 	if err != nil {
 		t.Fatalf("NewSharedTestClient: %v", err)
 	}
+	t.Cleanup(func() { _ = c.Close() })
 	if err := corrosion.InitSchema(context.Background(), c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

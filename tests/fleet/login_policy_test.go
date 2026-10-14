@@ -215,7 +215,7 @@ func TestFleet_SessionMintedWhereThePolicyHadNotArrivedIsConfined(t *testing.T) 
 	}
 	login, err := c.SelfClient(cc).Login(ctx, &pb.LoginRequest{Username: "bob", Password: "bobs-password-0123456789"})
 	if err != nil || login.GetRequires_2FaEnrollment() {
-		t.Fatalf("login on the cut-off node: %+v %v, want a plain session (the policy has not arrived)", login, err)
+		t.Fatalf("login on the cut-off node: %s %v, want a plain session (the policy has not arrived)", credState(login), err)
 	}
 	bob := c.bearerClient(cc, login.Token)
 	if _, err := bob.ListHosts(ctx, &pb.ListHostsRequest{}); err != nil {

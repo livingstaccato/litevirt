@@ -278,7 +278,7 @@ func TestFleet_ConsolePassword_ViewerThroughAPeerNeverNeedsIt(t *testing.T) {
 
 	pw := consolePassword(t, owner, "web", "vnc")
 	if len(pw) != lv.VNCPasswordLen {
-		t.Fatalf("the VM's VNC console password is %q, want %d characters", pw, lv.VNCPasswordLen)
+		t.Fatalf("the VM's VNC console password is %d characters, want %d", len(pw), lv.VNCPasswordLen)
 	}
 	l := startVNCListener(t, pw)
 	owner.Virt.SetVNCPort("web", l.port())
@@ -366,7 +366,7 @@ func TestFleet_ConsolePassword_LiveMigrationKeepsTheConsole(t *testing.T) {
 		t.Fatalf("live migrate: %v", err)
 	}
 	if got := consolePassword(t, dst, "web", "vnc"); got != pw {
-		t.Fatalf("after the migration the destination reads console password %q, want the one the guest started with", got)
+		t.Fatalf("after the migration the destination reads console password %s, want the one the guest started with (%s)", redacted(got), redacted(pw))
 	}
 	dst.Virt.SetVNCPort("web", l.port())
 
@@ -379,7 +379,7 @@ func TestFleet_ConsolePassword_LiveMigrationKeepsTheConsole(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := consolePassword(t, dst, "web", "vnc"); got != pw {
-		t.Fatalf("a redefine of the running guest changed the password the console proxy presents (%q -> %q)", pw, got)
+		t.Fatalf("a redefine of the running guest changed the password the console proxy presents (%s -> %s)", redacted(pw), redacted(got))
 	}
 
 	for _, entry := range []*Node{src, dst} {

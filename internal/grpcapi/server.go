@@ -104,6 +104,12 @@ type Server struct {
 	// this struct is a race waiting for its first reader.
 	dualRunLeaseTerm atomic.Int64
 
+	// dualRunOwnSeen is what this node's previous dual-run pass found, when
+	// that pass ran without the lease (observeDualRunWithoutLease), else nil.
+	// Such a pass confirms only what its own previous pass also saw.
+	dualRunOwnMu   sync.Mutex
+	dualRunOwnSeen map[finding]bool
+
 	virt       LibvirtBackend
 	images     *image.Store
 	events     *events.Bus

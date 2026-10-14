@@ -76,7 +76,10 @@ There is still one failover lease. Any coordinator may decide for any region,
 but only on that region's quorum. Across a partition each side can hold the
 partition-local lease (the CRDT lease already behaves that way), and each side
 can act only for the regions whose voters it can reach. A side that reaches no
-region's majority, nor the cluster's, neither takes nor renews it. The rebalancer and
+region's majority, nor the cluster's, neither takes nor renews it. Nor does a
+node cut off from its own region's majority, when that region has at least
+three voters, whatever else it reaches: that majority may need the lease to
+fence it (§3 explains the bound). The rebalancer and
 the other `DecisionGate` consumers keep the cluster-wide gate: they are not
 failover decisions and can move work across regions.
 

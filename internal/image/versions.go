@@ -322,6 +322,10 @@ type Published struct {
 	// Superseded is the file that was current before, when this publish
 	// made a new version current ("" otherwise). It is left where it is.
 	Superseded string
+	// Prev is the image's current file as this publish read it, under the
+	// name's lock ("" when there was none): what Withdraw points the name
+	// back to. It is Path when this publish made nothing current.
+	Prev string
 	// Healed lists the files of the image whose bytes had stopped matching
 	// their recorded identity — this content — and were put back from it.
 	Healed []string
@@ -383,7 +387,7 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 		if err := recordRepublished(cur, digest); err != nil {
 			return Published{}, fmt.Errorf("record the republish of %s: %w", cur, err)
 		}
-		return Published{Path: cur, Healed: healed, Digest: digest}, nil
+		return Published{Path: cur, Prev: cur, Healed: healed, Digest: digest}, nil
 	}
 
 	ver := filepath.Join(s.imageDir, name+"@"+digest[:versionHexLen]+".qcow2")
@@ -406,10 +410,11 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 	if err := s.setCurrent(name, filepath.Base(ver)); err != nil {
 		return Published{}, err
 	}
+	prev := cur
 	if cur == ver {
 		cur = ""
 	}
-	return Published{Path: ver, Superseded: cur, Healed: healed, Digest: digest}, nil
+	return Published{Path: ver, Superseded: cur, Prev: prev, Healed: healed, Digest: digest}, nil
 }
 
 // healWith puts a copy of src over the image file f, whose recorded identity
@@ -469,9 +474,10 @@ func (s *Store) setCurrent(name, base string) error {
 // Withdraw takes path, a file of image name that Publish has just made its
 // current file, back from being current: an image operation that published it
 // found it is not the content the image's record names (grpcapi
-// staleImageCopyError). The name points again at prev, the file that was
-// current before (a version), or at the image's first file (prev that file,
-// or "" when there was none: the pointer is removed). The file itself stays,
+// staleImageCopyError). The name points again at prev — the publish's
+// Published.Prev, the file current as it read it under the name's lock — a
+// version, or the image's first file (prev that file, or "" when there was
+// none: the pointer is removed). The file itself stays,
 // as a superseded version, for the prune to remove once no disk is built on
 // it. When path is no longer the current file (another publish since), nothing
 // changes.

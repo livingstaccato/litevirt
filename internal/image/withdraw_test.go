@@ -114,3 +114,31 @@ func TestWithdraw_AConcurrentPublishIsNotReverted(t *testing.T) {
 		}
 	}
 }
+
+// Published.Prev is the file current as the publish read it: what a
+// withdrawal of it points the name back to. A publish between an operation's
+// start and its own is that file, not what was current when it began.
+func TestPublish_PrevIsTheFileItSuperseded(t *testing.T) {
+	s := NewStore(t.TempDir())
+	_ = s.Init()
+	v1, v3, stale := []byte("version one"), []byte("version three"), []byte("stale copy")
+	p1, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil || p1.Prev != "" {
+		t.Fatalf("first content: %+v err=%v, want no Prev", p1, err)
+	}
+	p3, err := s.Publish("ubuntu", stage(t, s, v3), digestOf(v3))
+	if err != nil || p3.Prev != p1.Path {
+		t.Fatalf("refresh: %+v err=%v, want Prev %s", p3, err, p1.Path)
+	}
+	ps, err := s.Publish("ubuntu", stage(t, s, stale), digestOf(stale))
+	if err != nil || ps.Prev != p3.Path {
+		t.Fatalf("stale copy: %+v err=%v, want Prev %s", ps, err, p3.Path)
+	}
+	if err := s.Withdraw("ubuntu", ps.Path, ps.Prev); err != nil || s.ImagePath("ubuntu") != p3.Path {
+		t.Fatalf("withdrawn to Prev: ImagePath %s err=%v, want %s", s.ImagePath("ubuntu"), err, p3.Path)
+	}
+	re, err := s.Publish("ubuntu", stage(t, s, v3), digestOf(v3))
+	if err != nil || re.Prev != re.Path {
+		t.Fatalf("republish: %+v err=%v, want Prev = Path", re, err)
+	}
+}

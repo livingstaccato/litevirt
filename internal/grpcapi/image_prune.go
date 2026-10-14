@@ -1037,8 +1037,9 @@ func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap, named bool) s
 }
 
 // removeUnheldImageFile removes file f of image n unless a disk create on n
-// is in flight (it may be building on f) or f became n's current file since
-// the scan. A file of a deleted image (deleted) is removed, its current file
+// is in flight or began since the scan's snapshot (it may be building on f,
+// resolved while f was current, unseen by the scan) or f became n's current
+// file since the scan. A file of a deleted image (deleted) is removed, its current file
 // too, only if no create, pull or import of n is in flight or began since the
 // scan's snapshot (held).
 func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSnap, deleted bool) error {
@@ -1049,6 +1050,9 @@ func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSn
 		return fmt.Errorf("a disk create on image %q is in flight", n)
 	}
 	if !deleted {
+		if p.cgens[n] != held.cgen {
+			return fmt.Errorf("a disk create on image %q started during the scan; the next prune decides", n)
+		}
 		if f == st.ImagePath(n) {
 			return fmt.Errorf("it is the current version now")
 		}
@@ -1083,11 +1087,13 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.holds == nil {
-		p.holds, p.pubs, p.gens = map[string]int{}, map[string]int{}, map[string]uint64{}
+		p.holds, p.pubs, p.gens, p.cgens = map[string]int{}, map[string]int{}, map[string]uint64{}, map[string]uint64{}
 	}
 	m := p.holds
 	if publish {
 		m = p.pubs
+	} else {
+		p.cgens[name]++
 	}
 	m[name]++
 	p.gens[name]++
@@ -1106,6 +1112,7 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 // holdSnap is an image's holds as a prune's scan began.
 type holdSnap struct {
 	gen  uint64 // holds ever taken on the image
+	cgen uint64 // disk-create holds ever taken on the image
 	held bool   // one was in flight
 }
 
@@ -1114,7 +1121,7 @@ func (p *imagePruneState) snapshot() map[string]holdSnap {
 	defer p.mu.Unlock()
 	out := map[string]holdSnap{}
 	for n, g := range p.gens {
-		out[n] = holdSnap{gen: g, held: p.holds[n] > 0 || p.pubs[n] > 0}
+		out[n] = holdSnap{gen: g, cgen: p.cgens[n], held: p.holds[n] > 0 || p.pubs[n] > 0}
 	}
 	return out
 }
@@ -1383,6 +1390,7 @@ type imagePruneState struct {
 	holds map[string]int    // image → in-flight disk creates (holdImage)
 	pubs  map[string]int    // image → in-flight pulls, imports, builds (holdImagePublish)
 	gens  map[string]uint64 // image → holds ever taken, either kind
+	cgens map[string]uint64 // image → disk-create holds ever taken (holdImage)
 	bg    sync.WaitGroup    // background prunes after a refresh, and after DeleteImage
 
 	readDir  func(string) ([]os.DirEntry, error) // test seam; os.ReadDir when nil
@@ -1393,6 +1401,7 @@ type imagePruneState struct {
 	storeFS      func(string) (string, error)              // test seam; networkFilesystem when nil
 	afterScan    func()                                    // test seam: runs between the scan and the removals
 	afterCatalog func()                                    // test seam: runs after the catalog is read
+	prePublish   func(name string)                         // test seam: runs as ImportImage is about to publish
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
 	deleteMargin atomic.Int64                              // test seam (ns); imageDeleteMarginFloor when 0

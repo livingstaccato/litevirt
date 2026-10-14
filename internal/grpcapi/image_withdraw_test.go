@@ -84,3 +84,46 @@ func TestImportImage_AStaleCopysFileKeepsADiskCreatedOnIt(t *testing.T) {
 		t.Fatal("removed once the scan could see the disk built on it")
 	}
 }
+
+// A Publish that lands after a stale copy began and before the copy's own
+// Publish (an operator's import of newer content) is the file the copy's
+// withdrawal points the name back to: the copy is withdrawn to what its own
+// Publish superseded, read under the name's lock, not to what was current
+// when the copy began.
+func TestImportImage_AStaleCopyIsWithdrawnToThePublishBeforeIt(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	importVersion(t, s, "ubuntu", "A ")
+	old := s.images.ImagePath("ubuntu")
+
+	var newer string
+	s.imagePrune.prePublish = func(name string) {
+		if newer != "" {
+			return
+		}
+		newer = "pending"
+		// Begun after the copy, so its record supersedes the copy's.
+		importVersion(t, s, name, "N ")
+		newer = s.images.ImagePath(name)
+	}
+	t.Cleanup(func() { s.imagePrune.prePublish = nil })
+
+	src := filepath.Join(t.TempDir(), "stale.qcow2")
+	filledQcow2(t, src, "S ")
+	b, _ := os.ReadFile(src)
+	copyCtx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(imageCopyMDKey, "push"))
+	err := s.ImportImage(&mockImportImageStream{ctx: copyCtx, msgs: []*pb.ImportImageRequest{{Name: "ubuntu", Format: "qcow2", Chunk: b}}})
+	if status.Code(err) != codes.Aborted || !isStaleImageCopy(err) {
+		t.Fatalf("a copy overtaken by an import of other content: %v, want a stale-copy Aborted", err)
+	}
+	s.waitImagePrunes()
+	if newer == "" || newer == "pending" || newer == old {
+		t.Fatalf("the import during the copy did not publish a new version (%q)", newer)
+	}
+	if got := s.images.ImagePath("ubuntu"); got != newer {
+		t.Fatalf("after the stale copy's withdrawal, ImagePath = %s, want the import's %s (the version before it: %s)", got, newer, old)
+	}
+	if !exists(newer) {
+		t.Fatalf("the import's file %s is gone", newer)
+	}
+}

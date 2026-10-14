@@ -809,6 +809,9 @@ type Server struct {
 	liveStateMu    sync.Mutex
 	liveStateCalls map[string]*liveStateCall
 	liveStateWait  time.Duration
+	// vmReadBackHook, when set, fails the read of a VM a start has just
+	// started (startedVMProto) with its error. Test seam only.
+	vmReadBackHook func(name string) error
 	// operatorClaimMu makes an operator promotion's start fence and every
 	// abandonment of a proof on this host one decision (promote_serialize.go).
 	operatorClaimMu sync.Mutex

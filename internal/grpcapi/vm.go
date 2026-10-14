@@ -2259,7 +2259,7 @@ func (s *Server) finishStartLocked(ctx context.Context, vm *corrosion.VMRecord, 
 			slog.Warn("StartVM: domain already running in libvirt, reconciled cluster state", "vm", vm.Name)
 			pbVM.State = pb.VMState_VM_RUNNING
 			hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
-			return s.vmToProto(ctx, vm.Name)
+			return s.startedVMProto(ctx, vm.Name)
 		}
 		// The start genuinely failed (not an already-running desync): release the PCI
 		// leases this start's preflight acquired so a failed start leaves no VM bound to
@@ -2292,7 +2292,23 @@ func (s *Server) finishStartLocked(ctx context.Context, vm *corrosion.VMRecord, 
 	pbVM.State = pb.VMState_VM_RUNNING
 	hooks.Run(ctx, hooks.PostStart, pbVM, hspec)
 
-	return s.vmToProto(ctx, vm.Name)
+	return s.startedVMProto(ctx, vm.Name)
+}
+
+// startedVMProto is vmToProto for a VM libvirt has just said it started: the
+// state is running, which a live-state read that libvirt does not answer in
+// time (VM_UNKNOWN, vm_live_state.go) does not overrule.
+func (s *Server) startedVMProto(ctx context.Context, name string) (*pb.VM, error) {
+	if s.vmReadBackHook != nil {
+		if err := s.vmReadBackHook(name); err != nil {
+			return nil, status.Errorf(codes.Internal, "get VM: %v", err)
+		}
+	}
+	out, err := s.vmToProto(ctx, name)
+	if err == nil && out.State == pb.VMState_VM_UNKNOWN {
+		out.State, out.StateDetail = pb.VMState_VM_RUNNING, ""
+	}
+	return out, err
 }
 
 func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, error) {

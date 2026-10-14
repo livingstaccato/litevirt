@@ -60,13 +60,18 @@ func newHungLiveState(t *testing.T) *hungLiveState {
 
 func (h *hungLiveState) list(t *testing.T) map[string]*pb.VM {
 	t.Helper()
-	resp := within(t, 5*time.Second, "lv ls while libvirt does not answer for one VM", func() *pb.ListVMsResponse {
+	type answer struct {
+		resp *pb.ListVMsResponse
+		err  error
+	}
+	got := within(t, 5*time.Second, "lv ls while libvirt does not answer for one VM", func() answer {
 		resp, err := h.s.ListVMs(adminCtx(), &pb.ListVMsRequest{})
-		if err != nil {
-			t.Fatalf("ListVMs: %v", err)
-		}
-		return resp
+		return answer{resp, err}
 	})
+	if got.err != nil {
+		t.Fatalf("ListVMs: %v", got.err)
+	}
+	resp := got.resp
 	out := map[string]*pb.VM{}
 	for _, vm := range resp.GetVms() {
 		out[vm.GetName()] = vm
@@ -127,13 +132,18 @@ func TestListVMs_ALocalLibvirtThatDoesNotAnswerIsReportedUnknown(t *testing.T) {
 // same way.
 func TestInspectVM_ALocalLibvirtThatDoesNotAnswerIsReportedUnknown(t *testing.T) {
 	h := newHungLiveState(t)
-	vm := within(t, 5*time.Second, "lv inspect while libvirt does not answer", func() *pb.VM {
+	type answer struct {
+		vm  *pb.VM
+		err error
+	}
+	got := within(t, 5*time.Second, "lv inspect while libvirt does not answer", func() answer {
 		vm, err := h.s.InspectVM(adminCtx(), &pb.InspectVMRequest{Name: "web"})
-		if err != nil {
-			t.Fatalf("InspectVM: %v", err)
-		}
-		return vm
+		return answer{vm, err}
 	})
+	if got.err != nil {
+		t.Fatalf("InspectVM: %v", got.err)
+	}
+	vm := got.vm
 	if vm.GetState() != pb.VMState_VM_UNKNOWN || !strings.Contains(vm.GetStateDetail(), "has not answered") {
 		t.Fatalf("inspect web: %v %q, want VM_UNKNOWN saying libvirt has not answered", vm.GetState(), vm.GetStateDetail())
 	}

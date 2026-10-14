@@ -166,3 +166,60 @@ func TestStartVM_AHeldStartThatFailsPutsTheRowBack(t *testing.T) {
 		t.Fatalf("web after a held start failed: %s/%q, want error with its detail", vm.State, vm.StateDetail)
 	}
 }
+
+// Review I-1: a held start libvirt answers late with success, whose read of
+// the VM afterwards fails, used to be taken for a failed start: the row was
+// put back to stopped/operator-stop over the running domain, and a failed
+// start recorded. Only libvirt's answer (or the domain's state) decides
+// whether the start failed.
+//
+// Mutation: restore on finish's error — the row is stopped over a running
+// domain: red.
+func TestStartVM_AHeldStartWhoseReadBackFailsStaysRunning(t *testing.T) {
+	st := newStuckStart(t)
+	_, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
+	wantStartInFlight(t, "start", err)
+	st.s.vmReadBackHook = func(string) error { return errors.New("corrosion: read failed") }
+	close(st.release)
+	st.waitLockFree(t, "after libvirt answered")
+	if active, err := st.s.virt.DomainIsActive("web"); err != nil || !active {
+		t.Fatalf("web's domain after libvirt started it: active=%v (%v)", active, err)
+	}
+	if vm := st.row(t); vm.State != "running" {
+		t.Fatalf("web's row after a late success whose read-back failed: %s/%q, want running", vm.State, vm.StateDetail)
+	}
+	evs, _ := corrosion.ListVMEvents(context.Background(), st.s.db, "web", 50, "")
+	for _, e := range evs {
+		if e.Type == "vm.started" && e.Result == "error" {
+			t.Fatalf("a late success was recorded as a failed start: %+v", e)
+		}
+	}
+}
+
+// Review m-7: StartVM's own answer for a start it has just completed says
+// running, even when libvirt then does not answer the read of its state in
+// time.
+//
+// Mutation: StartVM answers through vmToProto — VM_UNKNOWN: red.
+func TestStartVM_ItsAnswerSaysRunningWhenTheStateReadDoesNotAnswer(t *testing.T) {
+	st := newStuckStart(t)
+	close(st.release)
+	st.s.liveStateWait = 100 * time.Millisecond
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	st.s.virt.(*libvirtfake.Fake).FailDomainState = func(name string) error {
+		// Only the read after libvirt has started it: the start's own
+		// checks before StartDomain read the state too.
+		if name == "web" && st.calls.Load() > 0 {
+			<-hang
+		}
+		return nil
+	}
+	vm, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if vm.GetState() != pb.VMState_VM_RUNNING {
+		t.Fatalf("StartVM answered %v %q for a start libvirt completed, want VM_RUNNING", vm.GetState(), vm.GetStateDetail())
+	}
+}

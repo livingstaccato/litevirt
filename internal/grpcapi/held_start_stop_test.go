@@ -98,13 +98,18 @@ func TestStopVM_AStopOfAHeldStartAnswersAtOnce(t *testing.T) {
 // the row still says starting: red.
 func TestStopVM_ForceCancelsAHeldStartAndUndoesItsLateSuccess(t *testing.T) {
 	st := heldStart(t)
-	out := within(t, 5*time.Second, "lv stop --force while the start is held", func() *pb.VM {
+	type answer struct {
+		out *pb.VM
+		err error
+	}
+	got := within(t, 5*time.Second, "lv stop --force while the start is held", func() answer {
 		out, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true})
-		if err != nil {
-			t.Fatalf("stop --force while the start is held: %v", err)
-		}
-		return out
+		return answer{out, err}
 	})
+	if got.err != nil {
+		t.Fatalf("stop --force while the start is held: %v", got.err)
+	}
+	out := got.out
 	if out.GetState() != pb.VMState_VM_STOPPING || !strings.Contains(out.GetStateDetail(), "start cancelled") {
 		t.Fatalf("stop --force answered %v %q, want VM_STOPPING saying the start is cancelled", out.GetState(), out.GetStateDetail())
 	}

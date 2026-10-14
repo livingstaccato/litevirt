@@ -536,7 +536,23 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 			return
 		}
 		_, err := finish(bg, startErr)
-		s.unmarkStartHeld(bg, name, flight, err != nil)
+		// Whether the start failed is libvirt's answer (or, when that is an
+		// error, whether the domain runs anyway: finishStartLocked heals
+		// that as already running), never finish's own error: a start that
+		// succeeded and whose read-back then failed has its row written
+		// running, which must not be put back over the running domain.
+		failed := startErr != nil
+		if failed {
+			if st, serr := s.virt.DomainState(name); serr == nil && st == "running" {
+				failed = false
+			}
+		}
+		s.unmarkStartHeld(bg, name, flight, failed)
+		if !failed && err != nil {
+			slog.Warn("StartVM: libvirt answered a start late and the VM runs; reading it back failed",
+				"vm", name, "error", status.Convert(err).Message())
+			return
+		}
 		if err != nil {
 			msg := status.Convert(err).Message()
 			slog.Error("StartVM: libvirt answered a start late, with a failure", "vm", name, "error", msg)

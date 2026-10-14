@@ -135,6 +135,11 @@ func (l Limits) NICProblems(kb, mbit string) []string {
 	return append(p, fmt.Sprintf("tc class show dev %s on %s has htb rates %v, want %s: the tap is not shaped", l.Tap, l.Host, l.TC, mbit))
 }
 
+// libvirtUnlimitedQuota is what newer libvirt reports for global_quota once a
+// CPU cap is cleared: its "unlimited" sentinel (2^44-1 us), where older builds
+// report -1 or 0. All three mean no cap is in force.
+const libvirtUnlimitedQuota = "17592186044415"
+
 // RemovedProblems lists where a cleared cap, weight and NIC rate are still in
 // effect. Clearing the weight writes the host's DEFAULT (100) back, never a
 // leftover or a hard-coded number.
@@ -147,7 +152,7 @@ func (l Limits) NICProblems(kb, mbit string) []string {
 // rate AND the old class still shaping the tap.
 func (l Limits) RemovedProblems(oldMbit string) []string {
 	var p []string
-	if q := l.Sched["global_quota"]; q != "-1" && q != "0" {
+	if q := l.Sched["global_quota"]; q != "-1" && q != "0" && q != libvirtUnlimitedQuota {
 		p = append(p, fmt.Sprintf("cap not removed: global_quota = %q", q))
 	}
 	want := strconv.Itoa(HostShares(l.V2, 100))

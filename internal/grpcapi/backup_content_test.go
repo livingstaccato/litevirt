@@ -2,8 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -267,4 +269,69 @@ func TestBackupSnapshot_NoParentIncremental_FullSession(t *testing.T) {
 	if doneFrame(stream.Sent) == nil {
 		t.Fatal("no DONE frame")
 	}
+}
+
+// failingBackupReader is a session whose NBD export died: every read fails
+// with the broken pipe the operator used to see alone, and qemu reports the
+// disk I/O error that killed it.
+type failingBackupReader struct {
+	fakeBackupReader
+	fault string
+}
+
+func (r *failingBackupReader) ReadAt(p []byte, off int64) (int, error) {
+	return 0, errors.New("write unix @->/var/lib/litevirt/backup-sock/x/nbd: write: broken pipe")
+}
+func (r *failingBackupReader) IOFault() string { return r.fault }
+
+// A guest-content push that fails reading the NBD export names the VM disk it
+// was reading and the I/O error qemu reported, and keeps the original error.
+//
+// Mutation: the push error is the bare "push: <err>" again — red.
+func TestBackupSnapshot_FailedReadNamesTheDiskAndTheIOError(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	ctx := context.Background()
+	const CS = pbsstore.ChunkSize
+	const diskPath = "/mnt/nfs-pool/vm1-root.qcow2"
+	failing := &failingBackupReader{
+		fakeBackupReader: fakeBackupReader{data: make([]byte, CS), extents: [][2]int64{{0, CS}}},
+		fault:            "an I/O error on disk vda",
+	}
+	s.SetBackupSource(&deadExportSource{fakeBackupSource: &fakeBackupSource{}, reader: failing})
+
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "host-a", State: "running"}, nil,
+		[]corrosion.DiskRecord{{
+			VMName: "vm1", DiskName: "root", HostName: "host-a", Path: diskPath,
+			SizeBytes: CS, StorageType: "nfs", StorageVolume: "nfs-pool", TargetDev: "vda",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if _, err := pbsstore.Init(repoDir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	stream := &progressStream[pb.BackupSnapshotProgress]{ctx: adminCtx()}
+	err := s.BackupSnapshot(&pb.BackupSnapshotRequest{
+		VmName: "vm1", DiskName: "root", RepoPath: repoDir, Timestamp: "2026-05-10T10:00:00Z",
+	}, stream)
+	if err == nil {
+		t.Fatal("a backup whose export died succeeded")
+	}
+	for _, want := range []string{diskPath, "nfs-pool", `"vm1"`, "an I/O error on disk vda", "broken pipe", "read source at offset"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+}
+
+type deadExportSource struct {
+	*fakeBackupSource
+	reader BackupReader
+}
+
+func (s *deadExportSource) BeginBackup(domain, diskPath, parentCP, newCP string) (BackupReader, error) {
+	return s.reader, nil
 }

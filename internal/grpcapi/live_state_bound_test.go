@@ -148,3 +148,73 @@ func TestInspectVM_ALocalLibvirtThatDoesNotAnswerIsReportedUnknown(t *testing.T)
 		t.Fatalf("inspect web: %v %q, want VM_UNKNOWN saying libvirt has not answered", vm.GetState(), vm.GetStateDetail())
 	}
 }
+
+// CR7-5: the list's live-state budget was charged with the time of every
+// answer, fast ones too, so a busy libvirt that answers each VM in a fraction
+// of the wait ran the budget out part way through a long list, and the rest
+// of its VMs read VM_UNKNOWN although libvirt answered for them. Only a wait
+// that libvirt did not answer is charged now.
+//
+// Mutation: every answer charged — the later VMs read VM_UNKNOWN: red.
+func TestListVMs_FastAnswersDoNotSpendTheBudget(t *testing.T) {
+	s := testServerWithLocks(t)
+	f := libvirtfake.New()
+	s.virt = f
+	ctx := context.Background()
+	const n = 12
+	for i := 0; i < n; i++ {
+		name := "vm" + string(rune('a'+i))
+		if err := f.DefineDomain("<domain><name>" + name + "</name></domain>"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.StartDomain(name); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertVM(ctx, s.db,
+			corrosion.VMRecord{Name: name, HostName: s.hostName, State: "running", Spec: "{}"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Each answer takes a third of the wait: n of them are well over the
+	// budget of two waits, and none is a wait libvirt did not answer.
+	s.liveStateWait = 120 * time.Millisecond
+	f.FailDomainState = func(string) error {
+		time.Sleep(40 * time.Millisecond)
+		return nil
+	}
+	resp, err := s.ListVMs(adminCtx(), &pb.ListVMsRequest{})
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	if len(resp.GetVms()) != n {
+		t.Fatalf("listed %d VMs, want %d", len(resp.GetVms()), n)
+	}
+	for _, vm := range resp.GetVms() {
+		if vm.GetState() != pb.VMState_VM_RUNNING {
+			t.Errorf("%s: %v %q, want VM_RUNNING (libvirt answered for it)", vm.GetName(), vm.GetState(), vm.GetStateDetail())
+		}
+	}
+}
+
+// CR7-13: `lv ls` and `lv inspect` read a VM's live state through one helper
+// and say the same of a VM libvirt has not answered for, the record's detail
+// included.
+//
+// Mutation: the list's copy without the record's detail: red.
+func TestListAndInspect_SayTheSameOfAnUnansweredVM(t *testing.T) {
+	h := newHungLiveState(t)
+	if err := corrosion.UpdateVMState(context.Background(), h.s.db, "web", "running", "reconciler: domain is alive"); err != nil {
+		t.Fatal(err)
+	}
+	listed := h.list(t)["web"]
+	inspected, err := h.s.InspectVM(adminCtx(), &pb.InspectVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if listed.GetState() != pb.VMState_VM_UNKNOWN || inspected.GetState() != pb.VMState_VM_UNKNOWN {
+		t.Fatalf("web: list %v, inspect %v, want VM_UNKNOWN from both", listed.GetState(), inspected.GetState())
+	}
+	if listed.GetStateDetail() != inspected.GetStateDetail() || !strings.Contains(listed.GetStateDetail(), "reconciler: domain is alive") {
+		t.Fatalf("web's detail: list %q, inspect %q, want the same, with the record's detail", listed.GetStateDetail(), inspected.GetStateDetail())
+	}
+}

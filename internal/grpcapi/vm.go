@@ -1569,44 +1569,19 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	// VM's live state is waited for a bounded time (vm_live_state.go).
 	liveBudget := s.newLiveStateBudget()
 	for _, vm := range vms {
-		// Reconcile DB state with libvirt for local VMs.
-		state := vm.State
-		stateDetail := ""
-		if inFlight := s.startUnanswered(vm.Name); inFlight != "" && vm.HostName == s.hostName {
-			// A start libvirt has not answered yet is under way here: the
-			// VM is starting (or stopping, the start cancelled), whatever
-			// the row or libvirt says meanwhile (vm_start_bound.go), and
-			// libvirt is not asked.
-			state = inFlight
-		} else if vm.HostName == s.hostName && s.virt != nil {
-			if liveState, err := s.liveVMStateBounded(vm.Name, liveBudget); errors.Is(err, errLiveStateNoAnswer) {
-				state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
-			} else if err == nil {
-				switch {
-				case vm.State == "stopped" && liveState == "running":
-					// Graceful shutdown in progress — trust DB, except for
-					// a drain's cold move still waiting for its guest.
-					if drainStopInProgress(&vm) {
-						state = "stopping"
-					}
-				case vm.State == "running" && liveState == "stopped":
-					// VM crashed or was stopped externally — trust libvirt. Best-effort
-					// drift heal in a read path; a failed write is re-healed next list.
-					state = liveState
-					// Nobody asked for this stop, so it is recorded as one
-					// (StopDetailOutOfBand), and only while the row still says
-					// running: an `lv stop` that finished since this list read
-					// it has recorded its own, operator, stop.
-					//runningcheck:allow provably not running — this is the
-					// `vm.State == "running" && liveState == "stopped"` case, so liveState
-					// is "stopped" here. The guard cannot see through the switch.
-					if err := corrosion.SyncVMStopIfRunning(ctx, s.db, vm.Name, liveState, corrosion.StopDetailOutOfBand, 0); err != nil &&
-						!errors.Is(err, corrosion.ErrNoRowsAffected) {
-						s.noteStateWriteFail(corrosion.OpVMState, err)
-					}
-				default:
-					state = liveState
-				}
+		// Reconcile DB state with libvirt for local VMs (readVMState).
+		state, stateDetail := s.readVMState(&vm, liveBudget)
+		if vm.HostName == s.hostName && vm.State == "running" && state == "stopped" {
+			// VM crashed or was stopped externally. Best-effort drift heal
+			// in a read path; a failed write is re-healed next list.
+			// Nobody asked for this stop, so it is recorded as one
+			// (StopDetailOutOfBand), and only while the row still says
+			// running: an `lv stop` that finished since this list read it
+			// has recorded its own, operator, stop.
+			//runningcheck:allow provably not running — state is "stopped" here.
+			if err := corrosion.SyncVMStopIfRunning(ctx, s.db, vm.Name, state, corrosion.StopDetailOutOfBand, 0); err != nil &&
+				!errors.Is(err, corrosion.ErrNoRowsAffected) {
+				s.noteStateWriteFail(corrosion.OpVMState, err)
 			}
 		}
 
@@ -3515,37 +3490,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// Only override DB state if the DB hasn't been explicitly set by an operator action
 	// (e.g., "stopped" from StopVM). This avoids showing stale libvirt state during
 	// graceful shutdown where libvirt still reports "running" briefly.
-	state, stateDetail := vm.State, vm.StateDetail
-	if inFlight := s.startUnanswered(name); inFlight != "" && vm.HostName == s.hostName {
-		// A start libvirt has not answered yet is under way here
-		// (vm_start_bound.go): the VM is starting (or stopping, the start
-		// cancelled), and libvirt is not asked.
-		state = inFlight
-	} else if vm.HostName == s.hostName && s.virt != nil {
-		if liveState, err := s.liveVMStateBounded(name, s.newLiveStateBudget()); errors.Is(err, errLiveStateNoAnswer) {
-			// libvirt has not answered (vm_live_state.go): the read says
-			// so, with what the record says, rather than waiting on it.
-			state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
-			if vm.StateDetail != "" {
-				stateDetail += " (" + vm.StateDetail + ")"
-			}
-		} else if err == nil {
-			// Trust libvirt for running detection (catches unexpected starts/crashes),
-			// but trust DB for operator-initiated stops/starts.
-			switch {
-			case vm.State == "stopped" && liveState == "running":
-				// Graceful shutdown in progress — trust DB, except for a
-				// drain's cold move still waiting for its guest.
-				if drainStopInProgress(vm) {
-					state = "stopping"
-				}
-			case vm.State == "running" && liveState == "stopped":
-				// VM crashed or was stopped externally — trust libvirt
-				state = liveState
-			default:
-				state = liveState
-			}
-		}
+	// The live state, as `lv ls` reads it (readVMState); the record's
+	// detail unless the read has its own.
+	state, stateDetail := s.readVMState(vm, s.newLiveStateBudget())
+	if stateDetail == "" {
+		stateDetail = vm.StateDetail
 	}
 
 	pbVM := &pb.VM{

@@ -90,6 +90,30 @@ func TestNoReservedSlogKeys(t *testing.T) {
 		}
 		return "", false
 	}
+	// handled holds the attr expressions already judged. A slog.Group's inner
+	// attributes are keys inside the group, not top-level ones, so they are
+	// marked handled without being judged.
+	handled := map[ast.Node]bool{}
+	var skipNested func(e ast.Expr)
+	skipNested = func(e ast.Expr) {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !isSlog(sel.X) || sel.Sel.Name != "Group" {
+			return
+		}
+		for _, a := range call.Args[min(1, len(call.Args)):] {
+			handled[a] = true
+			if lit, ok := a.(*ast.CompositeLit); ok {
+				for _, el := range lit.Elts {
+					handled[el] = true
+				}
+			}
+			skipNested(a)
+		}
+	}
 	root := filepath.Join("..", "..")
 	fset := token.NewFileSet()
 	scanned := 0
@@ -113,7 +137,6 @@ func TestNoReservedSlogKeys(t *testing.T) {
 		scanned++
 		rel, _ := filepath.Rel(root, p)
 		rel = filepath.ToSlash(rel)
-		handled := map[ast.Node]bool{}
 		report := func(pos token.Pos, what, msg, key string) {
 			if reserved[key] && !allowed[rel+"|"+msg+"|"+key] {
 				t.Errorf("%s: %s uses reserved key %q; provide-telemetry drops it when the stamped field exists. Use a specific key (crl_version, build_version, ...)",
@@ -136,13 +159,18 @@ func TestNoReservedSlogKeys(t *testing.T) {
 						arg := x.Args[i]
 						if k, isAttr := attrKey(arg); isAttr {
 							handled[arg] = true
+							skipNested(arg)
 							report(arg.Pos(), sel.Sel.Name+"(...) attribute", msg, k)
 							i++
 							continue
 						}
 						k, isKey := strLit(arg)
 						if !isKey {
-							break // key/value pairing is unknowable from here
+							// A key held in a variable or constant is not
+							// resolved; assume it pairs with the next argument
+							// and keep reading the rest.
+							i += 2
+							continue
 						}
 						report(arg.Pos(), sel.Sel.Name+"(...)", msg, k)
 						i += 2
@@ -150,6 +178,7 @@ func TestNoReservedSlogKeys(t *testing.T) {
 					return true
 				}
 				if isSlog(sel.X) && attrFuncs[sel.Sel.Name] && !handled[x] {
+					skipNested(x)
 					k, _ := attrKey(x)
 					report(x.Pos(), "slog."+sel.Sel.Name+"(...)", "", k)
 				}

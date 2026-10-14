@@ -5884,7 +5884,7 @@ func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMR
 		})
 		if storage.IsFSNoAnswer(err) {
 			slog.Warn("start refused: a disk's storage does not answer", "vm", vm.Name, "disk", d.DiskName, "file", file, "error", err)
-			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v",
+			return status.Errorf(codes.Unavailable, "disk %q of %q (%s) cannot be started: its storage does not answer: %v; retry once it answers",
 				d.DiskName, vm.Name, filepath.Base(file), err)
 		}
 		if err != nil {

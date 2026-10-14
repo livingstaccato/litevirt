@@ -49,6 +49,33 @@ func TestEnforcementEditScript(t *testing.T) {
 	}
 }
 
+// TestEnforcementEditScriptRefusesAnInlineBlock: a flow-style or valued
+// `enforcement:` header cannot take an inserted child, so the edit must fail
+// and leave the file alone rather than write invalid YAML. A matching line in
+// another section must not satisfy the final verification either.
+func TestEnforcementEditScriptRefusesAnInlineBlock(t *testing.T) {
+	for _, in := range []string{"enforcement: {}\nb: 2\n", "enforcement: {x: true}\n", "enforcement: on\n"} {
+		f := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(f, []byte(in), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("sh", "-c", enforcementEditScript(f, "y", "false")).CombinedOutput(); err == nil {
+			t.Errorf("%q: the edit succeeded:\n%s", in, out)
+		}
+		if got, _ := os.ReadFile(f); string(got) != in {
+			t.Errorf("%q: the file was changed to %q", in, got)
+		}
+	}
+	// No enforcement block at all, the key present elsewhere: must fail.
+	f := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(f, []byte("other:\n  y: false\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command("sh", "-c", enforcementEditScript(f, "y", "false")).CombinedOutput(); err == nil {
+		t.Error("an identical line in another section satisfied the verification")
+	}
+}
+
 // TestJoinMajority pins which side an unnamed host (a witness) lands on.
 // Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
 func TestJoinMajority(t *testing.T) {

@@ -235,6 +235,126 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	})
 }
 
+// TestDrill1b_WitnessReachesBothSides is drill 1's split with the witness left
+// reachable from BOTH sides: {worker-1, worker-2} | {worker-3, worker-4,
+// worker-5}, and the witness cut from nobody (a non-transitive partition,
+// lab.partitionNamedOnly). Drill 1 puts the witness with the majority; this one
+// keeps the topology that stalled the majority on lab 1 ("leader lease: not
+// claiming a new term yet ... peer node-6 reports the lease live for node-2").
+//
+// It asserts only the SAFE outcome:
+//   - the minority pauses its recoverable workloads within minorityPauseBy;
+//   - at no sample does any workload execute on two hosts;
+//   - after the heal every workload executes on exactly one host, none paused.
+//
+// Whether the majority recovers the minority's workloads within recoverBy is
+// LOGGED, not asserted: that liveness is under separate investigation.
+func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
+	l := newLab(t)
+	b := l.requireBaseline()
+	l.restoreOnCleanup(b)
+
+	wit := map[string]bool{}
+	for _, w := range l.witnessNames() {
+		wit[w] = true
+	}
+	var workers []string
+	for _, h := range l.hosts {
+		if !wit[h] {
+			workers = append(workers, h)
+		}
+	}
+	if len(wit) == 0 {
+		t.Skip("the cluster has no witness: there is no node to leave reachable from both sides")
+	}
+	if len(workers) < 5 {
+		t.Skipf("needs 5 worker hosts for a 2|3 split, have %v", workers)
+	}
+	minority, majority := workers[:2], workers[2:]
+	q := majority[0]
+	l.createVMsWhereRoom(q, "d1b", minority...)
+	keys := l.recoverableOn(q, minority...)
+	if len(keys) == 0 {
+		t.Fatalf("no recoverable workload on the minority %v, and no room there for a test VM", minority)
+	}
+	home := map[string]string{}
+	for _, v := range l.vms(q) {
+		home["vm/"+v.Name] = v.HostName
+	}
+	for _, c := range l.containers(q) {
+		home["ct/"+c.Name] = c.Host
+	}
+	l.mark("drill1b: minority %v majority %v, witnesses %v reach both; recoverable: %v", minority, majority, wit, keys)
+
+	s := l.startSampler()
+	if _, ok := s.waitFor(time.Now(), time.Minute, func(r round) bool {
+		for _, k := range keys {
+			if r.state(home[k], k) != "running" {
+				return false
+			}
+		}
+		return true
+	}); !ok {
+		t.Fatalf("not every minority workload runs on its home host before the split:\n  %s", s.last())
+	}
+
+	start, _ := l.partitionNamedOnly(minority, majority)
+
+	// The minority pauses: asserted.
+	pausedAt := waitEach(s, start, 2*minorityPauseBy, keys, func(r round, k string) bool {
+		return pausedState(r.state(home[k], k))
+	})
+	for _, k := range keys {
+		at, ok := pausedAt[k]
+		if !ok {
+			t.Errorf("%s never paused on %s within %v of the split (virsh)\n  %s", k, home[k], 2*minorityPauseBy, s.last())
+			continue
+		}
+		if d := at.Sub(start); d > minorityPauseBy+sampleSlop {
+			t.Errorf("%s paused %v after the split; the design bound is %v (+%v sampling)", k, d, minorityPauseBy, sampleSlop)
+		}
+	}
+
+	// The majority's recovery: logged, not asserted.
+	recoveredAt := waitEach(s, start, recoverBy, keys, func(r round, k string) bool {
+		for _, h := range r.executing(k) {
+			if contains(majority, h) {
+				return true
+			}
+		}
+		return false
+	})
+	for _, k := range keys {
+		if at, ok := recoveredAt[k]; ok {
+			l.mark("drill1b: %s recovered on the majority at +%v (liveness: logged only)", k, at.Sub(start).Round(time.Second))
+		} else {
+			l.mark("drill1b: %s was NOT recovered on the majority within %v (liveness: logged only)", k, recoverBy)
+		}
+	}
+
+	// Heal: everything must end up executing on exactly one host.
+	l.heal()
+	healed := time.Now()
+	if _, ok := s.waitFor(healed, settleBy, func(r round) bool {
+		for _, k := range keys {
+			hs := r.executing(k)
+			if len(hs) != 1 {
+				return false
+			}
+			for _, st := range r.Copies[k] {
+				if pausedState(st) {
+					return false
+				}
+			}
+		}
+		return true
+	}); !ok {
+		t.Errorf("not every workload executes on exactly one host, with no paused copy, %v after the heal:\n  %s", settleBy, s.last())
+	}
+	s.Stop()
+	assertNeverTwice(t, s.snapshot())
+}
+
 // TestDrillBlip_FleetWide cuts every node off from every other node at once.
 //
 //   - a blip shorter than T_pause pauses nothing (G6);

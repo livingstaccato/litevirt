@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -111,12 +112,14 @@ func TestAuditVerifyReportsSigningState(t *testing.T) {
 		// a second chain opened under a host name that already had one (the lab's
 		// known artefact, which no test here made and no test here can heal). The
 		// claim below, that a clean log reads as intact, cannot be made on it. The
-		// run is excused only for a fork the operator named: a NEW fork has another
-		// chain id and still fails.
-		if known := os.Getenv("E2E_KNOWN_AUDIT_FORK"); known != "" && strings.Contains(out, known) {
-			t.Skipf("the log holds the known fork %s, which this test did not create; verify says:\n%s", known, out)
+		// run is excused only for the ONE fork the operator named, as
+		// E2E_KNOWN_AUDIT_FORK=<row-id>@<host>; see knownAuditFork. A second fork
+		// beside it, or any other shape, still fails.
+		if ok, why := knownAuditFork(out, os.Getenv("E2E_KNOWN_AUDIT_FORK")); ok {
+			t.Skipf("the log holds only the known fork %s, which this test did not create; verify says:\n%s", os.Getenv("E2E_KNOWN_AUDIT_FORK"), out)
+		} else {
+			t.Fatalf("the live cluster's audit chain is forked and it is not just the known fork (%s):\n%s", why, out)
 		}
-		t.Fatalf("the live cluster's audit chain is forked (set E2E_KNOWN_AUDIT_FORK to the chain id to excuse a known one):\n%s", out)
 	}
 	if err != nil {
 		if !strings.Contains(out, "TAMPERED") {
@@ -224,4 +227,80 @@ func auditQuery(t *testing.T, query string) string {
 		t.Fatalf("query %q: %v", query, err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// knownAuditFork reports whether a fork-only `lv audit verify` output is
+// exactly the one fork named by spec, "<row-id>@<host>", and nothing more:
+//   - the row printed under the "forked chain" heading (the first broken link,
+//     the only fork the verifier names by id) is the row id, and
+//   - the "sequence break" section holds only `<host>: row <id> repeats seq N`
+//     lines, every one for that host. A same-host fork may grow more such lines
+//     as rows are appended, so the host is the granularity, not the line set.
+//
+// A second fork on another host, a second fork on the known host that is the
+// first break instead, a deleted-rows gap, or no/malformed spec is not known.
+func knownAuditFork(out, spec string) (bool, string) {
+	id, host, ok := strings.Cut(spec, "@")
+	if !ok || id == "" || host == "" {
+		return false, "E2E_KNOWN_AUDIT_FORK is not set as <row-id>@<host>"
+	}
+	lines := strings.Split(out, "\n")
+	section := func(prefix string) (rows []string, found bool) {
+		for i, l := range lines {
+			if !strings.HasPrefix(l, prefix) {
+				continue
+			}
+			for _, r := range lines[i+1:] {
+				if strings.TrimSpace(r) == "" {
+					break
+				}
+				rows = append(rows, strings.TrimSpace(r))
+			}
+			return rows, true
+		}
+		return nil, false
+	}
+	first, found := section("forked chain (")
+	if !found || len(first) != 1 || first[0] != id {
+		return false, fmt.Sprintf("the first broken row is %v, not the known %s", first, id)
+	}
+	gaps, found := section("sequence break (")
+	if !found || len(gaps) == 0 {
+		return false, "no sequence break section naming the fork's host"
+	}
+	for _, g := range gaps {
+		h, rest, _ := strings.Cut(g, ": row ")
+		if h != host || !strings.Contains(rest, " repeats seq ") {
+			return false, fmt.Sprintf("a sequence-break line is not a duplicate on %s: %q", host, g)
+		}
+	}
+	return true, ""
+}
+
+// TestKnownAuditFork pins what the E2E_KNOWN_AUDIT_FORK excuse covers.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestKnownAuditFork(t *testing.T) {
+	const head = "AUDIT CHAIN FORKED \u2014 100 rows checked (no edited, deleted or forged row found)\n\n"
+	const first = "forked chain (the row hashes correctly but starts a second chain \u2014 empty prev_hash \u2014 for a host that already has one; see the duplicate seqs under sequence break):\n  b9fbdd30d8a95d0c\n"
+	gap := func(host, id string) string {
+		return "  " + host + ": row " + id + " repeats seq 7 (duplicate: two rows claim the same position, a forked chain)\n"
+	}
+	const spec = "b9fbdd30d8a95d0c@node-3"
+	known := head + first + "\nsequence break (rows deleted from a host's chain, or a repeated seq \u2014 a forked chain):\n" +
+		gap("node-3", "aaa") + gap("node-3", "bbb")
+	if ok, why := knownAuditFork(known, spec); !ok {
+		t.Errorf("the known fork alone was not excused: %s", why)
+	}
+	for name, c := range map[string]struct{ out, spec string }{
+		"a second fork on another host":  {known + gap("node-4", "ccc"), spec},
+		"the first break is another row": {strings.Replace(known, "b9fbdd30d8a95d0c", "ffffffffffffffff", 1), spec},
+		"a deleted-rows gap":             {known + "  node-3: seq jumps from 4 to 9 (rows deleted)\n", spec},
+		"no spec":                        {known, ""},
+		"spec without a host":            {known, "b9fbdd30d8a95d0c"},
+		"known id only as a later row":   {head + strings.Replace(first, "b9fbdd30d8a95d0c", "1111111111111111", 1) + "\nsequence break (x):\n" + gap("node-3", "b9fbdd30d8a95d0c"), spec},
+	} {
+		if ok, _ := knownAuditFork(c.out, c.spec); ok {
+			t.Errorf("%s: was excused", name)
+		}
+	}
 }

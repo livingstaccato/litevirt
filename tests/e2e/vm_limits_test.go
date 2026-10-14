@@ -241,6 +241,9 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 		if len(f) < 5 || !strings.Contains(line, "ACTIVE") || f[0] == localHost {
 			continue
 		}
+		if witnessHosts(t)[f[0]] {
+			continue // a witness runs no guests, whatever `host ls` shows for it
+		}
 		sawOther = true
 		if free(t, f[3]) < 2 || free(t, f[4]) < needMiB {
 			continue
@@ -278,4 +281,25 @@ func TestVM_NoisyNeighbourLimits_SurviveMigration(t *testing.T) {
 	if out, err := nodeOut(host, "virsh -c qemu:///system domstate "+name); err == nil {
 		t.Errorf("the source still defines the domain after the move: %s", out)
 	}
+}
+
+// witnessHosts is the set of witness hosts, read from this node's state
+// database. Without sqlite3 it is empty: nothing is excluded, as before.
+func witnessHosts(t *testing.T) map[string]bool {
+	t.Helper()
+	set := map[string]bool{}
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		return set
+	}
+	out, err := exec.Command(sqlite, "-readonly", "/var/lib/litevirt/state.db",
+		"SELECT name FROM hosts WHERE deleted_at IS NULL AND role = 'witness'").Output()
+	if err != nil {
+		t.Logf("cannot read the witnesses (%v); none is excluded from the migration target", err)
+		return set
+	}
+	for _, n := range strings.Fields(string(out)) {
+		set[n] = true
+	}
+	return set
 }

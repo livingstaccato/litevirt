@@ -456,24 +456,36 @@ func (l *lab) clearDrops(hosts ...string) error {
 	return nil
 }
 
+// witnessNames lists the cluster's witnesses (role = 'witness'), read from the
+// replicated hosts table. A witness is a voter that runs no workload. A failed
+// read fails the test: carrying on would partition without the witness and
+// bring back the failure the witness handling exists to prevent, unannounced.
+func (l *lab) witnessNames() []string {
+	l.t.Helper()
+	rows, err := l.sql(l.hosts[0], "SELECT name FROM hosts WHERE deleted_at IS NULL AND role = 'witness'")
+	if err != nil {
+		l.t.Fatalf("partition: cannot read the cluster's witnesses: %v", err)
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r[0])
+	}
+	return out
+}
+
 // outsiderHosts returns the cluster's witnesses that are not in l.hosts, e.g.
 // node-6 of a lab with E2E_LAB_NODES=5. A witness is a voter that runs no
 // workload, so a partition that leaves it out reaches both sides and keeps the
 // failover lease on the wrong one; it has to be cut like any other node. They are
-// found from the replicated hosts table (role = 'witness') and addressed by the
-// lab's node-K numbering (SSH port base+K, address from `lv host ls`); a witness
-// that does not follow that naming cannot be reached and is reported.
+// addressed by the lab's node-K numbering (SSH port base+K, address from `lv host
+// ls`); a witness that does not follow that naming cannot be reached and is
+// reported.
 func (l *lab) outsiderHosts() []string {
 	l.t.Helper()
 	if l.outsidersKnown {
 		return l.outsiders
 	}
 	l.outsidersKnown = true
-	rows, err := l.sql(l.hosts[0], "SELECT name FROM hosts WHERE deleted_at IS NULL AND role = 'witness'")
-	if err != nil {
-		l.t.Logf("partition: cannot read the witnesses (%v); only the driven hosts are cut", err)
-		return nil
-	}
 	addr := map[string]string{}
 	if out, err := l.lv(l.hosts[0], "host", "ls"); err == nil {
 		for _, line := range strings.Split(out, "\n") {
@@ -482,8 +494,7 @@ func (l *lab) outsiderHosts() []string {
 			}
 		}
 	}
-	for _, r := range rows {
-		h := r[0]
+	for _, h := range l.witnessNames() {
 		if contains(l.hosts, h) || l.excluded[h] {
 			continue
 		}
@@ -543,7 +554,25 @@ func joinMajority(groups [][]string, universe []string) (group map[string]int) {
 func (l *lab) partition(groups ...[]string) (start, applied time.Time) {
 	l.t.Helper()
 	universe := append(append([]string{}, l.hosts...), l.outsiderHosts()...)
-	group := joinMajority(groups, universe)
+	return l.partitionGroups(universe, joinMajority(groups, universe), groups)
+}
+
+// partitionNamedOnly is partition without the unnamed-host rule: a host no group
+// names (a witness) is left untouched, so it still reaches every side. It is the
+// non-transitive split of TestDrill1b_WitnessReachesBothSides.
+func (l *lab) partitionNamedOnly(groups ...[]string) (start, applied time.Time) {
+	l.t.Helper()
+	group := map[string]int{}
+	for i, g := range groups {
+		for _, h := range g {
+			group[h] = i
+		}
+	}
+	return l.partitionGroups(l.hosts, group, groups)
+}
+
+func (l *lab) partitionGroups(universe []string, group map[string]int, groups [][]string) (start, applied time.Time) {
+	l.t.Helper()
 	start = l.mark("partition: applying %v (hosts %v)", groups, universe)
 	var wg sync.WaitGroup
 	errs := map[string]error{}
@@ -686,6 +715,7 @@ func enforcementEditScript(path, key, value string) string {
 	return fmt.Sprintf(`set -e; f=%[1]s; [ -f $f.e2e-orig ] || cp -p $f $f.e2e-orig
 ind=$(awk '/^enforcement:/{f=1;next} f && /^ +[^ #]/{match($0,/^ +/);print substr($0,1,RLENGTH);exit} f && /^[^ #]/{exit}' $f)
 [ -n "$ind" ] || ind='  '
+grep -qE '^enforcement:[[:space:]]*(#.*)?$' $f || { echo "enforcement: is missing or is not a plain block header (inline value or flow style)" >&2; exit 1; }
 has=$(awk -v p="${ind}%[2]s:" '/^enforcement:/{f=1;next} f && /^[^ #]/{exit} f && index($0,p)==1{print 1;exit}' $f)
 if [ -n "$has" ]; then
   awk -v p="${ind}%[2]s:" -v l="${ind}%[2]s: %[3]s" '/^enforcement:/{f=1;print;next} f && /^[^ #]/{f=0} f && index($0,p)==1{print l;next} {print}' $f > $f.e2e-new
@@ -693,7 +723,7 @@ if [ -n "$has" ]; then
 else
   sed -i "/^enforcement:/a\\${ind}%[2]s: %[3]s" $f
 fi
-grep -q "^${ind}%[2]s: %[3]s$" $f`, path, key, value)
+awk -v l="${ind}%[2]s: %[3]s" '/^enforcement:/{f=1;next} f && /^[^ #]/{f=0} f && $0==l{ok=1} END{exit !ok}' $f`, path, key, value)
 }
 
 // setEnforcement sets enforcement.<key> on host and restarts its daemon. The

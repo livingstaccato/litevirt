@@ -308,3 +308,35 @@ func TestAuditVerifyNamesOrphanedRows(t *testing.T) {
 		}
 	}
 }
+
+// A chain whose only finding is a fork must not be headlined TAMPERED: nothing
+// found says a row was edited, deleted or forged. It still fails the command,
+// and the row is still named. Any other finding keeps the TAMPERED headline.
+//
+// Mutation: header ignores resp.Forked — red.
+func TestAuditVerifyHeaderMatchesTheClassification(t *testing.T) {
+	fork := &pb.VerifyAuditChainResponse{
+		RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true, Forked: true,
+		SeqGaps: []string{"node-3: row fork-1 repeats seq 1 (duplicate: two rows claim the same position, a forked chain)"},
+	}
+	var out strings.Builder
+	if err := reportAuditVerify(&out, fork); err == nil {
+		t.Fatal("a forked chain must still exit non-zero")
+	}
+	got := out.String()
+	if strings.Contains(got, "TAMPERED") || !strings.Contains(got, "AUDIT CHAIN FORKED") || !strings.Contains(got, "fork-1") {
+		t.Errorf("fork-only output is mislabelled:\n%s", got)
+	}
+
+	real := &pb.VerifyAuditChainResponse{
+		RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true,
+		BadSignature: []string{"row-8: signature does not verify"},
+	}
+	out.Reset()
+	if err := reportAuditVerify(&out, real); err == nil {
+		t.Fatal("tampering must exit non-zero")
+	}
+	if got := out.String(); !strings.Contains(got, "AUDIT CHAIN TAMPERED") || strings.Contains(got, "FORKED —") {
+		t.Errorf("a real tamper finding lost its headline:\n%s", got)
+	}
+}

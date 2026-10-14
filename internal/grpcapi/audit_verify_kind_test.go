@@ -47,6 +47,9 @@ func TestVerifyAuditChain_CarriesTheKindOfBreak(t *testing.T) {
 	if !resp.Tampered {
 		t.Error("a forked chain must still fail verification")
 	}
+	if !resp.Forked {
+		t.Error("a fork-only chain must be reported forked, so a client does not call it tampered")
+	}
 }
 
 // Re-review m-3: the RPC names the rows that lost their predecessor on a
@@ -90,5 +93,8 @@ func TestVerifyAuditChain_NamesOrphanedRows(t *testing.T) {
 	}
 	if len(resp.OrphanedRows) != 1 || !strings.Contains(resp.OrphanedRows[0], "row orig-3 (seq 3)") {
 		t.Fatalf("orphaned_rows = %v, want orig-3 named", resp.OrphanedRows)
+	}
+	if resp.Forked {
+		t.Error("a fork that hides a deletion is not a fork alone: forked must be false")
 	}
 }

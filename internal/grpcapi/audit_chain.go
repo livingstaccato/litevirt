@@ -61,6 +61,7 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 		OrphanedRows:        res.Orphans,
 
 		Tampered:   res.Tampered(),
+		Forked:     res.Forked(),
 		Unverified: res.Unverified(),
 	}
 	if err != nil {

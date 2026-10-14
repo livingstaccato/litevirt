@@ -402,8 +402,9 @@ grouped by what it means:
   name" below) — and is labelled as one rather than as a deletion.
 - **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
   is the hash of no row of that host one seq before it: the row before it was
-  deleted, or the row was renumbered or relinked. The two chains of a forked host interleave by seq, so the deletion
-  leaves no sequence break; this lists each such row by host, id and seq. A
+  deleted or rewritten, or the row was renumbered or relinked. The two chains
+  of a forked host interleave by seq, so the deletion leaves no sequence
+  break; this lists each such row by host, id and seq. A
   fork whose only other findings are its duplicate seqs is reported as a
   forked chain by the hourly check and headed `AUDIT CHAIN FORKED` by
   `lv audit verify`; one with an orphaned row is reported as tampering.

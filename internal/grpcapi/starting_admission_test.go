@@ -89,6 +89,37 @@ func TestRestartVM_AStuckStartIsAdmittedOnANearFullHost(t *testing.T) {
 	}
 }
 
+// A zero-growth start or repair of a VM in starting is admitted on a host with
+// no room for a second copy of it: only what the start adds to the row's
+// actuals is admitted, and that is nothing. (The host-safety gate still runs:
+// TestStartingVM_OperatorStartsRunTheHostSafetyGate.)
+//
+// Mutation: the zero-delta call in startGatesLocked admits the VM's full size
+// (cpu, memMiB) instead of 0, 0 — ResourceExhausted: red.
+func TestStartingVM_ZeroGrowthStartIsAdmittedOnANearFullHost(t *testing.T) {
+	for _, op := range []struct {
+		name string
+		call func(s *Server) error
+	}{
+		{"StartVM", func(s *Server) error {
+			_, err := s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "hb"})
+			return err
+		}},
+		{"UpdateVM repair", func(s *Server) error {
+			_, err := s.UpdateVM(adminCtx(), &pb.UpdateVMRequest{Name: "hb", MemoryMib: 1024, AllowRestart: proto.Bool(true)})
+			return err
+		}},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			s := serverWithEngine(t)
+			startingVM(t, s)
+			if err := op.call(s); status.Code(err) == codes.ResourceExhausted {
+				t.Fatalf("%s of a VM in starting at its own size, already counted on its host = %v", op.name, err)
+			}
+		})
+	}
+}
+
 // Re-review 3 I-1: a start, restart or zero-growth repair of a VM in starting
 // adds no capacity, but it still makes the VM resident, so it passes the
 // host-safety gate: an active ownership condition on the VM, or an incomplete

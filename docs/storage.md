@@ -304,6 +304,18 @@ answers again. litevirt keeps that from holding anything else:
   waits in `starting` (a failover in `pending`, its proof kept) and the next
   pass starts it once the storage answers, and the overlay sweep at daemon start passes the VM over
   instead of holding its lock.
+- **A start libvirt does not answer.** These checks cannot see storage that
+  stops answering after they have passed, while libvirt starts the domain. If
+  libvirt has not answered within 5 minutes, `lv start` answers `Unavailable`
+  ("libvirt has not answered the start"). The start is not cancelled: it
+  keeps the VM's lock and start lease, the VM's row says `starting` (on every
+  host), and its outcome (`running`, or the row put back) is recorded and
+  shown in `lv events` when libvirt answers. Meanwhile `lv stop` and
+  `lv restart` answer `Unavailable` at once; `lv stop --force` cancels the
+  start (the VM is recorded stopped now, and a domain libvirt starts for it
+  is destroyed when it answers). Other calls on the VM, `lv rm` among them,
+  wait for the start. `lv ls` and `lv inspect` on that host report a VM
+  libvirt does not answer for as `VM_UNKNOWN` within a few seconds.
 - **The reconcile pass.** One pass on a host serves all of its VMs, so no
   look it makes at a disk file waits on the server. The check that each disk
   of a VM it starts is there, the set-aside of an old copy at a host-local

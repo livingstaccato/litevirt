@@ -93,6 +93,53 @@ func TestStopVM_AnAlreadyStoppedVMIsStopped(t *testing.T) {
 	}
 }
 
+// startingVM seeds vm1 in state, its domain shut off and refusing a stop as
+// libvirt does.
+func startingVM(t *testing.T, s *Server, state string) {
+	t.Helper()
+	fake := s.virt.(*libvirtfake.Fake)
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: state, Spec: seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512}),
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StateShutdown)
+	notRunningLikeLibvirt(fake, nil)
+}
+
+// Fix round 2: a VM in pending or starting is being started (a failover's,
+// an onboot's or a self-heal's start), and the reconciler will start its
+// domain. A stop that finds the domain not running yet answers
+// FailedPrecondition, saying the stop was not applied and what to do: a
+// success the start then overrides would be a false answer. Nothing is
+// changed: the row, no vm.stopped event. (Main answered Internal.)
+//
+// Mutation: pending/starting answered as a no-op success again — red.
+func TestStopVM_AVMBeingStartedRefusesTheStop(t *testing.T) {
+	for _, state := range []string{"pending", "starting"} {
+		for _, force := range []bool{false, true} {
+			s := hotplugDiskServer(t)
+			startingVM(t, s, state)
+			_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: force})
+			if status.Code(err) != codes.FailedPrecondition ||
+				!strings.Contains(err.Error(), "being started") || !strings.Contains(err.Error(), "not applied") ||
+				!strings.Contains(err.Error(), "lv stop vm1") {
+				t.Fatalf("%s force=%v: stop = %v, want FailedPrecondition saying it is being started, the stop was not applied, and to stop it once it runs", state, force, err)
+			}
+			vm, err := corrosion.GetVM(context.Background(), s.db, "vm1")
+			if err != nil || vm == nil || vm.State != state || vm.StateDetail == "operator-stop" {
+				t.Fatalf("%s force=%v: row %+v (%v), want it left %s", state, force, vm, err, state)
+			}
+			evs, _ := corrosion.ListVMEvents(context.Background(), s.db, "vm1", 50, "")
+			for _, e := range evs {
+				if e.Type == "vm.stopped" {
+					t.Fatalf("%s force=%v: a refused stop recorded %+v", state, force, e)
+				}
+			}
+		}
+	}
+}
+
 // stoppedEventDetail is the detail of vm's newest vm.stopped event.
 func stoppedEventDetail(t *testing.T, s *Server, vm string) string {
 	t.Helper()

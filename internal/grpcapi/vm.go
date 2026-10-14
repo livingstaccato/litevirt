@@ -1592,6 +1592,15 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
+	// pending/starting: a start is under way (a failover's, an onboot's, a
+	// self-heal's), and the reconciler will start the domain. A success here
+	// would be overridden by that start, so the stop is refused and nothing is
+	// changed. (Main answered Internal: nothing that worked is refused.)
+	if noop && (vm.State == "pending" || vm.State == "starting") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)",
+			vm.Name, vm.State, vm.Name, vm.Name)
+	}
 	// PCI passthrough on stop: under the active hardware_v2 regime a stopped VM
 	// RETAINS its device reservation (host_pci_devices ownership + vfio bind) so
 	// "assigned while off, realized while running" holds — the device stays reserved

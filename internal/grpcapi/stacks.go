@@ -140,28 +140,40 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Done before VM creation so per-NIC SG bindings resolve against existing
 	// groups. Re-deploy is idempotent: the stack's prior firewall rows are
 	// cleared first. A malformed block (e.g. an IPv6 CIDR) aborts the deploy.
-	// A stack with no record before this deploy has nothing that would ever
-	// tear its firewall rows down if the deploy fails from here on with no
-	// workload made: no stack record is written, so `compose down` cannot
-	// read a file for it, and a security group left behind holds its name
-	// against the next deploy of the same file. Its rows, and the backup
-	// repos it registered, are taken back then. A stack that existed keeps
-	// its rows: they are its config.
+	//
+	// A first deploy of a stack that fails after this, before it issues any
+	// workload action, writes no stack record, so nothing would ever tear its
+	// new rows down: a security group left behind holds its name against the
+	// next deploy of the same file. The rows THIS request inserted are taken
+	// back then (undoFailedFirstDeploy), by id, and nothing else: never the
+	// default-deny row, never a backup repo, never a row of a stack that had
+	// any before. Once a workload action has been issued the rows stay, for
+	// `compose down`, which finds the stack's workloads by their stack_name.
 	prior, priorErr := corrosion.GetStack(ctx, s.db, f.Name)
-	if err := s.persistStackFirewall(ctx, f); err != nil {
+	priorSGs, sgErr := corrosion.ListSecurityGroups(ctx, s.db, f.Name)
+	written := &stackFirewallWrites{}
+	if err := s.persistStackFirewallTracked(ctx, f, written); err != nil {
 		return stackFirewallErr(err)
 	}
-	if priorErr == nil && prior == nil {
+	workloadPhase := false
+	if priorErr == nil && prior == nil && sgErr == nil && len(priorSGs) == 0 {
 		defer func() {
-			if err != nil {
-				s.undoFailedFirstDeploy(context.WithoutCancel(ctx), f.Name)
+			if err != nil && !workloadPhase {
+				s.undoFailedFirstDeploy(context.WithoutCancel(ctx), f.Name, written)
 			}
 		}()
 	}
 
 	// Register the stack's backup repos (logical name → path), so a VM's
 	// `backup: { repo: <name> }` resolves cluster-wide without daemon config.
-	for name, repo := range f.BackupRepos {
+	// In name order, so a refusal part way is the same refusal every time.
+	repoNames := make([]string, 0, len(f.BackupRepos))
+	for name := range f.BackupRepos {
+		repoNames = append(repoNames, name)
+	}
+	sort.Strings(repoNames)
+	for _, name := range repoNames {
+		repo := f.BackupRepos[name]
 		if repo.Path == "" {
 			return status.Errorf(codes.InvalidArgument, "backup-repo %q: path required", name)
 		}
@@ -184,6 +196,9 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Move NICs off a legacy stack-scoped flat bridge in place, before either
 	// executor sees the update: both apply an update by recreating the VM.
 	failures := newDeployFailures(stream)
+	// From here on the deploy issues workload actions, on this host and on
+	// peers, and its firewall rows stay whatever happens (see above).
+	workloadPhase = true
 	if err := s.applyNICRetargets(ctx, resolved, stream, failures); err != nil {
 		return err
 	}
@@ -252,11 +267,21 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	return nil
 }
 
-// undoFailedFirstDeploy tombstones the firewall rows and backup repos a failed
-// first deploy of stack wrote, when no workload of the stack exists: with one,
-// its NICs may be bound to the groups and `compose down` (which finds it by
-// its stack_name) is the way out. Best effort, logged.
-func (s *Server) undoFailedFirstDeploy(ctx context.Context, stack string) {
+// stackFirewallWrites records the firewall rows one persistStackFirewall
+// call inserted, by id.
+type stackFirewallWrites struct {
+	sgIDs, ipSetIDs, clusterRuleIDs []string
+}
+
+// undoFailedFirstDeploy tombstones the security groups (and their rules), ip
+// sets and cluster rules a failed first deploy of stack inserted, by the ids
+// it recorded. It touches nothing else: not the default-deny row, which may be
+// an operator's or another stack's and whose removal would fail the cluster
+// open, and not a backup repo, which may be another stack's (a leftover repo
+// registration of a failed deploy is harmless; the next deploy upserts it).
+// As a last guard it keeps everything when this node already sees a workload
+// of the stack. Best effort, logged.
+func (s *Server) undoFailedFirstDeploy(ctx context.Context, stack string, w *stackFirewallWrites) {
 	vms, verr := corrosion.ListVMs(ctx, s.db, stack, "")
 	cts, cerr := corrosion.ListContainersByStack(ctx, s.db, stack)
 	if verr != nil || cerr != nil || len(vms) > 0 || len(cts) > 0 {
@@ -264,11 +289,23 @@ func (s *Server) undoFailedFirstDeploy(ctx context.Context, stack string) {
 			"stack", stack, "vms", len(vms), "containers", len(cts), "vm_error", verr, "container_error", cerr)
 		return
 	}
-	if err := corrosion.DeleteStackFirewall(ctx, s.db, stack); err != nil {
-		slog.Warn("stack deploy failed: take back its firewall rows", "stack", stack, "error", err)
+	for _, id := range w.sgIDs {
+		if err := corrosion.DeleteSGRules(ctx, s.db, id); err != nil {
+			slog.Warn("stack deploy failed: take back a security group's rules", "stack", stack, "sg", id, "error", err)
+		}
+		if err := corrosion.DeleteSecurityGroup(ctx, s.db, id); err != nil {
+			slog.Warn("stack deploy failed: take back a security group", "stack", stack, "sg", id, "error", err)
+		}
 	}
-	if err := corrosion.DeleteStackBackupRepos(ctx, s.db, stack); err != nil {
-		slog.Warn("stack deploy failed: unregister its backup repos", "stack", stack, "error", err)
+	for _, id := range w.ipSetIDs {
+		if err := corrosion.DeleteIPSet(ctx, s.db, id); err != nil {
+			slog.Warn("stack deploy failed: take back an ip set", "stack", stack, "ipset", id, "error", err)
+		}
+	}
+	for _, id := range w.clusterRuleIDs {
+		if err := corrosion.DeleteClusterFirewallRule(ctx, s.db, id); err != nil {
+			slog.Warn("stack deploy failed: take back a cluster rule", "stack", stack, "rule", id, "error", err)
+		}
 	}
 }
 
@@ -299,6 +336,15 @@ func stackFirewallErr(err error) error {
 // into nftables. It is idempotent — the stack's prior firewall rows are
 // tombstoned first so edits to the compose block take effect on re-deploy.
 func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) error {
+	return s.persistStackFirewallTracked(ctx, f, nil)
+}
+
+// persistStackFirewallTracked is persistStackFirewall recording, in w when it
+// is not nil, the ids of the rows it inserts.
+func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.File, w *stackFirewallWrites) error {
+	if w == nil {
+		w = &stackFirewallWrites{}
+	}
 	hasFirewall := len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil
 	if !hasFirewall {
 		// Still clear any rows a previous deploy of this stack left behind, in
@@ -373,9 +419,19 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	wantDeny := f.FirewallDefaults != nil && f.FirewallDefaults.DefaultDeny
 	if wantDeny {
 		// Compose sets the cluster-wide default; per-host overrides live in
-		// host config (lv firewall default-deny <host>).
-		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
+		// host config (lv firewall default-deny <host>). The cluster default is
+		// one row. A deny already in force that an operator or another stack
+		// wrote is left as it is: re-stamped with this stack's name, this
+		// stack's teardown (or a failed deploy's) would remove the operator's
+		// deny and fail the cluster open. It already denies, as asked.
+		cur, err := corrosion.GetFirewallDefault(ctx, s.db, "cluster")
+		if err != nil {
 			return fmt.Errorf("default-deny: %w", err)
+		}
+		if cur == nil || !cur.DefaultDeny || cur.StackName == f.Name {
+			if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, f.Name); err != nil {
+				return fmt.Errorf("default-deny: %w", err)
+			}
 		}
 	}
 	if err := corrosion.DeleteStackFirewallRows(ctx, s.db, f.Name); err != nil {
@@ -390,6 +446,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 		}); err != nil {
 			return fmt.Errorf("security-group %q: %w", name, err)
 		}
+		w.sgIDs = append(w.sgIDs, sgID)
 		for i, r := range sg.Rules {
 			// Priority follows YAML order (10, 20, …) so an accept-then-drop
 			// sequence renders deterministically — equal priorities would sort
@@ -416,6 +473,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
+		w.ipSetIDs = append(w.ipSetIDs, row.ID)
 	}
 
 	// Cluster-tier rules + default-deny policy.
@@ -431,6 +489,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
+			w.clusterRuleIDs = append(w.clusterRuleIDs, row.ID)
 		}
 	}
 	if !wantDeny {

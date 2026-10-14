@@ -163,8 +163,11 @@ is torn down on every host, and would be pulled out from under that workload.
 The background retry deletes the remaining VMs and containers first, and
 removes the networks only once they are all gone; when it finishes, the stack's
 security groups, ip sets, cluster rules and backup repos go with it. A first
-`compose up` of a stack that fails before it created any workload removes the
-security groups and backup repos it had registered. The web UI's stack **Destroy** action
+`compose up` of a stack that fails before it issues any workload action removes
+the security groups, ip sets and cluster rules it had just written; the
+cluster default-deny and backup repo registrations stay. A `default-deny: true`
+in a file leaves a cluster default-deny that an operator or another stack set
+as it is, owned by them. The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

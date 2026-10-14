@@ -466,9 +466,10 @@ func (s *Server) pushBackup(
 	})
 
 	opts.ContentFormat = pbsstore.ContentGuestRaw
-	m, err := pbsstore.PushFromSource(ctx, repo, session, session.Size(), extents, inheritFrom, opts)
+	rec := &readRecorder{BackupReader: session}
+	m, err := pbsstore.PushFromSource(ctx, repo, rec, session.Size(), extents, inheritFrom, opts)
 	if err != nil {
-		return nil, backupPushError(req.VmName, disk, session, err)
+		return nil, backupPushError(req.VmName, disk, rec, err)
 	}
 
 	// Prune checkpoints no surviving manifest references.

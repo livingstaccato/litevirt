@@ -235,12 +235,29 @@ func (s *BackupSession) ReadAt(p []byte, offset int64) (int, error) {
 // error. Empty when neither source has anything: libvirt then holds no cause.
 func (s *BackupSession) FailureCause() string {
 	if _, params, err := s.c.virt.DomainGetJobStats(s.dom, golibvirt.DomainJobStatsCompleted); err == nil {
-		if msg := jobErrmsg(params); msg != "" {
+		if msg := backupJobErrmsg(params); msg != "" {
 			return "the backup job failed: " + msg
 		}
 	}
 	if errs, n, err := s.c.virt.DomainGetDiskErrors(s.dom, 64, 0); err == nil {
 		return diskErrorsCause(errs, n)
+	}
+	return ""
+}
+
+// backupJobErrmsg is the error message of the completed job when that job was
+// a backup: the completed stats are the domain's last completed job of any
+// kind, and a migration's or a save's error is not this backup's cause.
+func backupJobErrmsg(params []golibvirt.TypedParam) string {
+	for _, p := range params {
+		if p.Field != golibvirt.DomainJobOperationStr {
+			continue
+		}
+		op, ok := p.Value.I.(int32)
+		if !ok || golibvirt.DomainJobOperation(op) != golibvirt.DomainJobOperationStrBackup {
+			return ""
+		}
+		return jobErrmsg(params)
 	}
 	return ""
 }

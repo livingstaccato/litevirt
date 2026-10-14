@@ -359,3 +359,56 @@ func TestFormatBackupPushError(t *testing.T) {
 		t.Errorf("an empty cause or storage leaked into the message: %s", got)
 	}
 }
+
+// A failure on the backup repository's side (the chunk store cannot be
+// written) is not a failure of the VM's disk: the message is the plain push
+// error, with no disk wording and no hint to look at the VM's storage.
+//
+// Mutation: every push failure gets the disk wording (round 1) — red.
+func TestBackupSnapshot_ARepositoryWriteFailureIsNotBlamedOnTheDisk(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	ctx := context.Background()
+	const CS = pbsstore.ChunkSize
+	data := make([]byte, CS)
+	for i := range data {
+		data[i] = 0xAB
+	}
+	s.SetBackupSource(&fakeBackupSource{full: &fakeBackupReader{data: data, extents: [][2]int64{{0, CS}}}})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "host-a", State: "running"}, nil,
+		[]corrosion.DiskRecord{{
+			VMName: "vm1", DiskName: "root", HostName: "host-a", Path: "/mnt/nfs-pool/vm1-root.qcow2",
+			SizeBytes: CS, StorageType: "nfs", StorageVolume: "nfs-pool", TargetDev: "vda",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	if _, err := pbsstore.Init(repoDir); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	// The chunk store cannot be created: a file stands where its directory is.
+	chunks := filepath.Join(repoDir, "chunks")
+	if err := os.RemoveAll(chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(chunks, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stream := &progressStream[pb.BackupSnapshotProgress]{ctx: adminCtx()}
+	err := s.BackupSnapshot(&pb.BackupSnapshotRequest{
+		VmName: "vm1", DiskName: "root", RepoPath: repoDir, Timestamp: "2026-05-10T10:00:00Z",
+	}, stream)
+	if err == nil {
+		t.Fatal("a backup into an unwritable repository succeeded")
+	}
+	for _, bad := range []string{"reading disk", "/mnt/nfs-pool", "kernel log", "cause"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Errorf("a repository-side failure is blamed on the disk (%q): %v", bad, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "push:") || !strings.Contains(err.Error(), "put chunk") {
+		t.Errorf("the push error lost its cause: %v", err)
+	}
+}

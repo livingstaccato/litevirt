@@ -30,12 +30,32 @@ type backupCauser interface {
 	FailureCause() string
 }
 
-// backupPushError is the error of a failed guest-content push: it names the
-// VM disk that was being read and the cause of the failure when libvirt can
-// give one.
-func backupPushError(vm string, disk *corrosion.DiskRecord, src BackupReader, err error) error {
+// readRecorder wraps a BackupReader and records the first error its ReadAt
+// returned, so a failed push can tell a failed read of the VM's disk from a
+// failure on the backup repository's side.
+type readRecorder struct {
+	BackupReader
+	err error
+}
+
+func (r *readRecorder) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.BackupReader.ReadAt(p, off)
+	if err != nil && err != io.EOF && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}
+
+// backupPushError is the error of a failed guest-content push. When the read
+// of the VM's disk failed it names the disk and the cause of the failure when
+// libvirt can give one; any other failure (the repository full, a chunk or
+// manifest write) is a plain `push: <err>`, which says nothing about the disk.
+func backupPushError(vm string, disk *corrosion.DiskRecord, rec *readRecorder, err error) error {
+	if rec == nil || rec.err == nil {
+		return status.Errorf(codes.Internal, "push: %v", err)
+	}
 	cause := ""
-	if c, ok := src.(backupCauser); ok {
+	if c, ok := rec.BackupReader.(backupCauser); ok {
 		cause = c.FailureCause()
 	}
 	return status.Error(codes.Internal, formatBackupPushError(vm, disk, err, cause))

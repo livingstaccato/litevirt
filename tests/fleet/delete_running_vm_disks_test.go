@@ -49,8 +49,8 @@ func TestFleet_DeleteVMOfARunningVMRemovesItsDisks(t *testing.T) {
 }
 
 // A delete whose host has no domain probes its peers; a peer that has the
-// domain and refuses its delete (here: its record says a backup is running,
-// and since F-5 also a disk whose use it cannot tell) answered with an error
+// domain and refuses its delete (here: its record says a backup is running)
+// answered with an error
 // the probing host treated as "not here", and it then removed the record as
 // stale — leaving the VM running on the peer with nothing that names it. The
 // refusal is passed on, and the record stays.

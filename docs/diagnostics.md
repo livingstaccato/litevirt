@@ -2190,6 +2190,26 @@ the image open. An image stops being named as soon as a VM's disk names it
 again, and is forgotten once its pool answers without it (checked every 5
 minutes).
 
+### A VM delete kept a disk file (`disk_leftover`)
+
+A VM delete never removes a disk it cannot prove unused, and never leaves one
+unnamed. It keeps a disk when whether another VM uses it cannot be told (a
+record read failed, or another VM's disk is on storage that does not answer),
+and, for a VM with no domain on any host, any disk that is not a file on this
+host's own storage or that it cannot tell is not in use elsewhere. The VM is
+deleted all the same. A disk whose removal failed fails the delete instead:
+the VM's record is kept, and a retry removes what it can and names the rest.
+
+Each kept disk is named three ways. `lv rm` prints it with its host and the
+reason. The VM gets a `vm.disk_kept` event and an audit entry. The host the
+delete ran on records it in `<data_dir>/kept-disks.json` and raises
+`disk_leftover` (evaluator `vm_delete`, subject `host/<host>`, warning), whose
+evidence gives each path, its host, the VM and disk, when, and the reason.
+litevirt removes none of them: check that nothing uses each one (another VM's
+disk, a process holding it open), then remove it by hand. A file on that host
+is forgotten once it is gone; a disk is not named while a VM's disk names its
+path again.
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

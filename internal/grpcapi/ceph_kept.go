@@ -188,11 +188,14 @@ func setKeptHeader(ctx context.Context, kept []KeptCephImage) {
 	_ = grpc.SetHeader(ctx, md)
 }
 
-// forwardKeptImages hands the kept images a forwarded delete's owner named
-// in hdr back to this delete's own caller.
+// forwardKeptImages hands the kept images and kept disks (KeptDiskMD) a
+// forwarded delete's owner named in hdr back to this delete's own caller.
 func forwardKeptImages(ctx context.Context, hdr metadata.MD) {
 	if vals := hdr.Get(KeptCephImageMD); len(vals) > 0 {
 		_ = grpc.SetHeader(ctx, metadata.MD{KeptCephImageMD: vals})
+	}
+	if vals := hdr.Get(KeptDiskMD); len(vals) > 0 {
+		_ = grpc.SetHeader(ctx, metadata.MD{KeptDiskMD: vals})
 	}
 }
 

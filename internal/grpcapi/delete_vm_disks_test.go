@@ -2,12 +2,17 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -20,6 +25,14 @@ import (
 // deleteDiskServer is a server whose VM "a" runs here, its one disk at disk.
 func deleteDiskServer(t *testing.T, disk string) (*Server, *libvirtfake.Fake) {
 	t.Helper()
+	return deleteDiskServerWith(t, true, corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: disk, SizeBytes: 1 << 20,
+		StorageType: "local", DeleteWithVM: true})
+}
+
+// deleteDiskServerWith is a server with VM "a" and its disks (on this host),
+// its domain defined and running here when withDomain.
+func deleteDiskServerWith(t *testing.T, withDomain bool, disks ...corrosion.DiskRecord) (*Server, *libvirtfake.Fake) {
+	t.Helper()
 	s := testServerWithLocks(t)
 	fake := libvirtfake.New()
 	s.virt = fake
@@ -27,28 +40,101 @@ func deleteDiskServer(t *testing.T, disk string) (*Server, *libvirtfake.Fake) {
 	if err := s.images.Init(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fake.DefineDomain("<domain><name>a</name></domain>"); err != nil {
-		t.Fatal(err)
+	state := "stopped"
+	if withDomain {
+		if err := fake.DefineDomain("<domain><name>a</name></domain>"); err != nil {
+			t.Fatal(err)
+		}
+		fake.SetState("a", libvirtfake.StateRunning)
+		state = "running"
 	}
-	fake.SetState("a", libvirtfake.StateRunning)
-	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, State: "running"}, nil,
-		[]corrosion.DiskRecord{{VMName: "a", DiskName: "root", HostName: s.hostName, Path: disk, SizeBytes: 1 << 20,
-			StorageType: "local", DeleteWithVM: true}}); err != nil {
+	for i := range disks {
+		disks[i].HostName = s.hostName
+	}
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, State: state}, nil, disks); err != nil {
 		t.Fatal(err)
 	}
 	return s, fake
 }
 
+// trailerStream records the header and trailer a handler sets.
+type trailerStream struct{ hdr, trl metadata.MD }
+
+func (h *trailerStream) Method() string { return "/litevirt.v1.LiteVirt/DeleteVM" }
+func (h *trailerStream) SetHeader(md metadata.MD) error {
+	h.hdr = metadata.Join(h.hdr, md)
+	return nil
+}
+func (h *trailerStream) SendHeader(md metadata.MD) error { return h.SetHeader(md) }
+func (h *trailerStream) SetTrailer(md metadata.MD) error {
+	h.trl = metadata.Join(h.trl, md)
+	return nil
+}
+
+// deleteNamed runs DeleteVM of "a" and returns the kept disks its response
+// names.
+func deleteNamed(t *testing.T, s *Server) ([]KeptDisk, error) {
+	t.Helper()
+	st := &trailerStream{}
+	_, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(adminCtx(), st), &pb.DeleteVMRequest{Name: "a"})
+	var out []KeptDisk
+	for _, v := range st.hdr.Get(KeptDiskMD) {
+		var k KeptDisk
+		if jerr := json.Unmarshal([]byte(v), &k); jerr != nil {
+			t.Fatalf("kept disk header %q: %v", v, jerr)
+		}
+		out = append(out, k)
+	}
+	return out, err
+}
+
+// assertNamed checks that path is named three ways: the response (when
+// header), a vm.disk_kept event, and disk_leftover with why in its reason.
+func assertNamed(t *testing.T, s *Server, kept []KeptDisk, header bool, path, why string) {
+	t.Helper()
+	if header {
+		found := false
+		for _, k := range kept {
+			if k.Path == path && strings.Contains(k.Reason, why) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("response names %+v, want %s kept because %q", kept, path, why)
+		}
+	}
+	evs, err := corrosion.ListVMEvents(context.Background(), s.db, "a", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := false
+	for _, e := range evs {
+		if e.Type == "vm.disk_kept" && strings.Contains(e.Detail, path) {
+			event = true
+		}
+	}
+	if !event {
+		t.Errorf("no vm.disk_kept event names %s: %+v", path, evs)
+	}
+	s.judgeKeptDisks(context.Background())
+	row, found, err := corrosion.GetHealthCondition(context.Background(), s.db, diskLeftoverEvaluator, condDiskLeftover, "host", s.hostName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || row.Lifecycle == corrosion.ConditionResolved || !strings.Contains(row.Evidence, path) || !strings.Contains(row.Evidence, why) {
+		t.Errorf("%s does not name %s (%q): found=%v %s", condDiskLeftover, path, why, found, row.Evidence)
+	}
+}
+
 // F-5 (lab 2): `lv rm` printed "deleted" and left the VM's disk file. One way
 // is a disk whose use by another VM cannot be told — here another VM's disk
-// is on storage that does not answer: the delete kept the disk on that guess
-// and reported success. It is refused before anything is torn down: the VM
-// keeps running, with its record and its disk.
+// is on storage that does not answer. The delete goes on, as on main, and the
+// disk is kept — never removed on a guess — and named: in the response, by
+// an event, and by disk_leftover.
 //
-// Mutation: drop preflightDiskRemoval — the VM is torn down, and the delete
-// then fails on the disk it kept (or, with the post-teardown check dropped
-// too, reports success with the disk left: main).
-func TestDeleteVM_ADiskWhoseUseCannotBeToldRefusesBeforeTheTeardown(t *testing.T) {
+// Mutations: drop the "cannot tell" keep (remove on a guess) — the disk is
+// gone: red. Drop the naming — red.
+func TestDeleteVM_ADiskWhoseUseCannotBeToldIsKeptAndNamed(t *testing.T) {
 	disk := filepath.Join(t.TempDir(), "a-root.qcow2")
 	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
 		t.Fatal(err)
@@ -61,32 +147,36 @@ func TestDeleteVM_ADiskWhoseUseCannotBeToldRefusesBeforeTheTeardown(t *testing.T
 	}
 	insertOneDiskVM(t, s, "b", other, true)
 
+	var kept []KeptDisk
 	err := within(t, 10*time.Second, "a delete while another VM's disk does not answer", func() error {
-		_, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"})
+		var err error
+		kept, err = deleteNamed(t, s)
 		return err
 	})
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("DeleteVM: %v, want Unavailable (whether the disk is used cannot be told)", err)
+	if err != nil {
+		t.Fatalf("DeleteVM: %v (a delete main allowed goes on)", err)
 	}
-	if active, _ := fake.DomainIsActive("a"); !active {
-		t.Error("the refused delete stopped the VM")
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm != nil {
+		t.Error("the record survived")
 	}
-	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil || vm.State != "running" {
-		t.Errorf("the refused delete changed the record: %+v", vm)
+	if fake.DomainExists("a") {
+		t.Error("the domain survived")
 	}
 	if !exists(disk) {
-		t.Error("the refused delete removed the disk")
+		t.Fatal("a disk whose use could not be told was removed")
 	}
+	assertNamed(t, s, kept, true, disk, "cannot be told")
 }
 
 // The other way: a disk whose removal fails after the domain is gone. The
-// delete fails and keeps the record — the cluster's only handle on the disk —
-// recorded as stopped; once the cause is gone, the retry (which finds no
-// domain) removes the disk and the record.
+// delete fails and keeps the record — the cluster's handle on the disk —
+// recorded as stopped, and disk_leftover names it at once; once the cause
+// is gone, the retry (which finds no domain) removes the disk and the
+// record, and the condition resolves.
 //
 // Mutations: report success with a disk left (the post-teardown check
-// dropped) — the first delete succeeds: red. Drop the stale-record path's
-// disk removal — the retry deletes the record and leaves the disk: red.
+// dropped) — red. Drop the no-domain path's disk removal — the retry leaves
+// the disk: red.
 func TestDeleteVM_ADiskNotRemovedKeepsTheRecordAndARetryRemovesIt(t *testing.T) {
 	// A non-empty directory where the disk file is recorded: its unlink
 	// fails, as one on storage that refuses it does.
@@ -117,6 +207,7 @@ func TestDeleteVM_ADiskNotRemovedKeepsTheRecordAndARetryRemovesIt(t *testing.T) 
 	if fake.DomainExists("a") {
 		t.Error("the domain is still defined: the failure is not the one after the teardown")
 	}
+	assertNamed(t, s, nil, false, disk, "removal failed")
 
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
@@ -130,22 +221,86 @@ func TestDeleteVM_ADiskNotRemovedKeepsTheRecordAndARetryRemovesIt(t *testing.T) 
 	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm != nil {
 		t.Error("the retried delete left the record")
 	}
+	s.judgeKeptDisks(context.Background())
+	row, _, _ := corrosion.GetHealthCondition(context.Background(), s.db, diskLeftoverEvaluator, condDiskLeftover, "host", s.hostName)
+	if row.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("%s still raised once the disk is gone: %s", condDiskLeftover, row.Evidence)
+	}
+}
+
+// standInBtrfsForDelete puts a btrfs on PATH whose subvolumes are plain
+// directories; "subvolume delete" fails while refuse exists.
+func standInBtrfsForDelete(t *testing.T) (refuse string) {
+	t.Helper()
+	bin := t.TempDir()
+	refuse = filepath.Join(bin, "refuse")
+	script := "#!/bin/sh\ncase \"$1 $2\" in\n" +
+		"\"subvolume delete\") [ -e " + refuse + " ] && { echo 'ERROR: Could not destroy subvolume: Device or resource busy' >&2; exit 1; }; exec rm -rf \"$4\";;\n" +
+		"\"subvolume show\") [ -d \"$4\" ] && exit 0; exit 1;;\nesac\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "btrfs"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(refuse, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return refuse
+}
+
+// I-2: a btrfs-pool disk whose subvolume cannot be deleted. Its qcow2 is
+// removed first, so a check of the file alone found nothing left and the VM
+// was reported deleted with the subvolume behind (lab 2 F-5). The delete
+// fails, keeps the record, and names the subvolume; the retry removes it.
+//
+// Mutation: let stillLeft drop a leftover by its file again — the delete
+// succeeds with the subvolume left: red.
+func TestDeleteVM_ABtrfsSubvolumeLeftBehindFailsTheDelete(t *testing.T) {
+	refuse := standInBtrfsForDelete(t)
+	root := t.TempDir()
+	subvol := filepath.Join(root, "a-root")
+	if err := os.MkdirAll(subvol, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(subvol, "a-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := deleteDiskServerWith(t, true, corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: disk, SizeBytes: 1 << 20,
+		StorageType: "btrfs", StorageVolume: "bt", DeleteWithVM: true})
+	s.addStoragePoolRef("bt", StoragePoolRef{Driver: "btrfs", Source: root})
+
+	_, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"})
+	if err == nil {
+		t.Fatal("the delete reported success with the disk's subvolume left behind")
+	}
+	if !exists(subvol) {
+		t.Fatal("the setup's subvolume is gone: the test proves nothing")
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
+		t.Fatal("the failed delete dropped the record")
+	}
+	assertNamed(t, s, nil, false, subvol, "removal failed")
+
+	if err := os.Remove(refuse); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
+		t.Fatalf("retried delete: %v", err)
+	}
+	if exists(subvol) {
+		t.Error("the retried delete left the subvolume")
+	}
 }
 
 // A VM with no domain anywhere (here: a stopped VM a failover placed on this
 // host, whose domain is defined only when it starts) is deleted through the
-// stale-record path; its own disks on this host go with it, as they do for
-// a VM whose domain is here. A disk on shared storage is not this path's to
-// remove.
+// no-domain path; its own disks on this host go with it, as they do for a VM
+// whose domain is here. A disk on shared storage is not this path's to
+// remove, and is named.
 //
-// Mutation: drop the stale-record path's disk removal — the disk stays: red.
+// Mutations: drop the no-domain path's disk removal — the local disk stays:
+// red. Drop the shared-storage keep — the shared disk is removed: red.
 func TestDeleteVM_AVMWithNoDomainHasItsOwnDisksRemoved(t *testing.T) {
-	s := testServerWithLocks(t)
-	s.virt = libvirtfake.New()
-	s.images = image.NewStore(s.dataDir)
-	if err := s.images.Init(); err != nil {
-		t.Fatal(err)
-	}
 	local := filepath.Join(t.TempDir(), "a-root.qcow2")
 	shared := filepath.Join(t.TempDir(), "a-data.qcow2")
 	for _, f := range []string{local, shared} {
@@ -153,15 +308,12 @@ func TestDeleteVM_AVMWithNoDomainHasItsOwnDisksRemoved(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "a", HostName: s.hostName, State: "stopped"}, nil,
-		[]corrosion.DiskRecord{
-			{VMName: "a", DiskName: "root", HostName: s.hostName, Path: local, StorageType: "local", DeleteWithVM: true},
-			{VMName: "a", DiskName: "data", HostName: s.hostName, Path: shared, StorageType: "nfs", DeleteWithVM: true},
-		}); err != nil {
-		t.Fatal(err)
-	}
+	s, _ := deleteDiskServerWith(t, false,
+		corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: local, StorageType: "local", DeleteWithVM: true},
+		corrosion.DiskRecord{VMName: "a", DiskName: "data", Path: shared, StorageType: "nfs", DeleteWithVM: true})
 
-	if _, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"}); err != nil {
+	kept, err := deleteNamed(t, s)
+	if err != nil {
 		t.Fatalf("DeleteVM: %v", err)
 	}
 	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm != nil {
@@ -171,6 +323,108 @@ func TestDeleteVM_AVMWithNoDomainHasItsOwnDisksRemoved(t *testing.T) {
 		t.Error("the VM's own disk on this host was left behind")
 	}
 	if !exists(shared) {
-		t.Error("a disk on shared storage was removed by the no-domain path")
+		t.Fatal("a disk on shared storage was removed by the no-domain path")
 	}
+	assertNamed(t, s, kept, true, shared, "shared storage")
+}
+
+// I-3 / m-2: a VM with no domain here, while another host does not say
+// whether it runs the VM — an active peer that cannot be reached, or a host
+// not active (a maintenance host still runs VMs). Its disks are neither
+// removed (it may run there) nor left unnamed: the record goes, as on main,
+// and each disk is kept and named with the hosts that did not answer.
+//
+// Mutation: count only answering peers (skip the silent and non-active
+// ones) — the disk is removed: red.
+func TestDeleteVM_AVMWithNoDomainWhileAHostIsSilentKeepsAndNamesItsDisks(t *testing.T) {
+	for _, tc := range []struct{ name, state string }{
+		{"unreachable active peer", "active"},
+		{"maintenance host", "maintenance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			disk := filepath.Join(t.TempDir(), "a-root.qcow2")
+			if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+				t.Fatal(err)
+			}
+			s, _ := deleteDiskServerWith(t, false,
+				corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: disk, StorageType: "local", DeleteWithVM: true})
+			if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+				Name: "peer-x", Address: "203.0.113.9", State: tc.state, CPUTotal: 4, MemTotal: 4096,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			kept, err := deleteNamed(t, s)
+			if err != nil {
+				t.Fatalf("DeleteVM: %v", err)
+			}
+			if !exists(disk) {
+				t.Fatal("a disk was removed while a host did not say whether it runs the VM")
+			}
+			assertNamed(t, s, kept, true, disk, "peer-x")
+		})
+	}
+}
+
+// m-1: a VM whose domain libvirt cannot answer for (here: its state read
+// fails) is not "no domain": no disk of it is removed — the guest may still
+// run on it — and each is named.
+//
+// Mutation: read any libvirt error as "no domain" — the disk is removed: red.
+func TestDeleteVM_ALibvirtErrorIsNotNoDomain(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "a-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s, fake := deleteDiskServerWith(t, false,
+		corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: disk, StorageType: "local", DeleteWithVM: true})
+	fake.FailDomainState = func(string) error { return errors.New("injected: libvirt connection reset") }
+
+	kept, err := deleteNamed(t, s)
+	if err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	if !exists(disk) {
+		t.Fatal("a disk was removed although libvirt could not say the domain is gone")
+	}
+	assertNamed(t, s, kept, true, disk, "connection reset")
+}
+
+// m-3: a peer's local-only probe that finds the domain and refuses its
+// delete marks the refusal (deleteProbeRefusedMD) with its own code, an
+// Unavailable kept Unavailable, so the probing host keeps the record and
+// passes the code on; one that has no domain answers NotFound, unmarked.
+func TestDeleteVM_AProbeMarksItsRefusalAndKeepsItsCode(t *testing.T) {
+	disk := filepath.Join(t.TempDir(), "a-root.qcow2")
+	if err := qcow2.Create(disk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := deleteDiskServer(t, disk)
+	if err := s.db.Execute(adminCtx(), `UPDATE vms SET state = 'backing-up' WHERE name = 'a'`); err != nil {
+		t.Fatal(err)
+	}
+	probe := metadata.NewIncomingContext(adminCtx(), metadata.Pairs("x-lv-delete-local-only", "1"))
+	if md, ok := metadata.FromIncomingContext(adminCtx()); ok {
+		probe = metadata.NewIncomingContext(adminCtx(), metadata.Join(md, metadata.Pairs("x-lv-delete-local-only", "1")))
+	}
+	st := &trailerStream{}
+	_, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(probe, st), &pb.DeleteVMRequest{Name: "a"})
+	if status.Code(err) != codes.FailedPrecondition || len(st.trl.Get(deleteProbeRefusedMD)) == 0 {
+		t.Fatalf("probe of a VM being backed up here: %v, trailer %v; want FailedPrecondition, marked", err, st.trl)
+	}
+
+	st = &trailerStream{}
+	_, err = s.DeleteVM(grpc.NewContextWithServerTransportStream(probe, st), &pb.DeleteVMRequest{Name: "nope"})
+	if status.Code(err) != codes.NotFound || len(st.trl.Get(deleteProbeRefusedMD)) != 0 {
+		t.Fatalf("probe of a VM not here: %v, trailer %v; want NotFound, unmarked", err, st.trl)
+	}
+
+	// Unavailable stays Unavailable: a no-answer of this host's storage.
+	if err := probeNoAnswerCode(); err != codes.Unavailable {
+		t.Fatalf("probeNoAnswer code %v", err)
+	}
+}
+
+func probeNoAnswerCode() codes.Code {
+	return status.Code(probeNoAnswer{status.Error(codes.Unavailable, "x")})
 }

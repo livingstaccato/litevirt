@@ -142,6 +142,19 @@ func requireNotLabMode(t *testing.T) {
 	}
 }
 
+// lvArgsForLog is the argument list as a failure message prints it: the value
+// of --password is not repeated into the test log.
+func lvArgsForLog(args []string) string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i := 0; i+1 < len(out); i++ {
+		if out[i] == "--password" {
+			out[i+1] = "<redacted>"
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 // lv runs the CLI and returns stdout. Fails the test on non-zero exit.
 func lv(t *testing.T, args ...string) string {
 	t.Helper()
@@ -154,7 +167,7 @@ func lv(t *testing.T, args ...string) string {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("lv %s failed: %v\nstdout: %s\nstderr: %s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+		t.Fatalf("lv %s failed: %v\nstdout: %s\nstderr: %s", lvArgsForLog(args), err, stdout.String(), stderr.String())
 	}
 	return stdout.String()
 }
@@ -207,7 +220,7 @@ func lvStdin(t *testing.T, stdin string, args ...string) string {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("lv %s failed: %v\nstdout: %s\nstderr: %s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+		t.Fatalf("lv %s failed: %v\nstdout: %s\nstderr: %s", lvArgsForLog(args), err, stdout.String(), stderr.String())
 	}
 	return stdout.String()
 }

@@ -98,8 +98,8 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM hosts WHERE name = ?`, victim.Name); got != "bmc-pass-1" {
-			t.Fatalf("%s: hosts.ipmi_pass = %q; a previous-release fencer on this node would "+
-				"authenticate with the wrong password", n.Name, got)
+			t.Fatalf("%s: hosts.ipmi_pass = %s; a previous-release fencer on this node would "+
+				"authenticate with the wrong password", n.Name, redacted(got))
 		}
 		assertNoCredentialStatements(t, n)
 	}
@@ -117,8 +117,8 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	// held from a when it wrote. Neither waits for a pass.
 	for _, n := range c.Nodes {
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-2" {
-			t.Fatalf("%s: host_fence_credentials = %q before any pass, want the rotated bmc-pass-2 — "+
-				"an unlatched rotation must be absorbed where it lands, not wait up to a minute", n.Name, got)
+			t.Fatalf("%s: host_fence_credentials = %s before any pass, want the rotated one — "+
+				"an unlatched rotation must be absorbed where it lands, not wait up to a minute", n.Name, redacted(got))
 		}
 	}
 	if h, err := corrosion.GetHost(ctx, a.DB, victim.Name); err != nil || h == nil || h.IPMIPass != "bmc-pass-2" {
@@ -137,11 +137,11 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	c.WaitConverged(t, convergeTimeout, a, b)
 	for _, n := range []*Node{a, b} {
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM hosts WHERE name = ?`, victim.Name); got != "bmc-pass-2" {
-			t.Errorf("%s: hosts.ipmi_pass = %q after both nodes latched, want bmc-pass-2; a host "+
-				"rolled back one release reads only this column", n.Name, got)
+			t.Errorf("%s: hosts.ipmi_pass = %s after both nodes latched, want the rotated one; a host "+
+				"rolled back one release reads only this column", n.Name, redacted(got))
 		}
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-2" {
-			t.Errorf("%s: host_fence_credentials holds %q, want the rotated bmc-pass-2", n.Name, got)
+			t.Errorf("%s: host_fence_credentials holds %s, want the rotated one", n.Name, redacted(got))
 		}
 	}
 
@@ -491,7 +491,7 @@ func TestFleet_CredentialsSplit_AConcurrentUnrelatedHostWriteDoesNotResurrectARo
 		return oldColumn(t, r, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, target) == "bmc-B"
 	})
 	if got := oldColumn(t, r, `SELECT ipmi_pass FROM hosts WHERE name = ?`, target); got != "bmc-A" {
-		t.Fatalf("r's hosts.ipmi_pass = %q; the scenario needs the LWW gate to have refused the T1 hosts half", got)
+		t.Fatalf("r's hosts.ipmi_pass = %s; the scenario needs the LWW gate to have refused the T1 hosts half", redacted(got))
 	}
 
 	if h, err := corrosion.GetHost(ctx, r.DB, target); err != nil || h == nil || h.IPMIPass != "bmc-B" {
@@ -506,8 +506,8 @@ func TestFleet_CredentialsSplit_AConcurrentUnrelatedHostWriteDoesNotResurrectARo
 	time.Sleep(2 * time.Second) // let any copy a pass made replicate
 	for _, n := range c.Nodes {
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, target); got != "bmc-B" {
-			t.Errorf("%s: host_fence_credentials = %q after the passes, want bmc-B: a pass copied the "+
-				"rotated-out password over the credential row", n.Name, got)
+			t.Errorf("%s: host_fence_credentials = %s after the passes, want the rotated-in one: a pass copied the "+
+				"rotated-out password over the credential row", n.Name, redacted(got))
 		}
 	}
 }

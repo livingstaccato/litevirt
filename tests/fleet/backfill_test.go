@@ -51,7 +51,7 @@ func TestFleet_RealmDispatch_RejectsUnknownRealm(t *testing.T) {
 		t.Fatalf("local Login: %v", err)
 	}
 	if !strings.HasPrefix(resp.Token, "lvs_") {
-		t.Errorf("expected lvs_ session token, got %q", resp.Token)
+		t.Errorf("expected lvs_ session token, got %s", redacted(resp.Token))
 	}
 
 	// Unknown realm: must fail with Unimplemented.

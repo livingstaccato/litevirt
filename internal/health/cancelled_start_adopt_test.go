@@ -43,3 +43,24 @@ func TestReconciler_AnErroredVMWithACancelledStartIsNotRecordedRunning(t *testin
 		t.Fatalf("vm-other after a pass: %+v %v, want running", vm, err)
 	}
 }
+
+// Round 1, I-1: the VM checker's restart-policy pass neither heals a VM with
+// a cancelled start here to running nor starts it under its restart policy;
+// a VM without one is still restarted.
+//
+// Mutation: the probe not consulted in the checker — vm-cancelled is
+// restarted: red.
+func TestVMChecker_AVMWithACancelledStartIsNotRestarted(t *testing.T) {
+	db := testStartDB(t)
+	seedRestartPolicyVM(t, db, "vm-cancelled", "node1")
+	seedRestartPolicyVM(t, db, "vm-other", "node1")
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
+	v.SetCancelledStartProbe(func(vm string) bool { return vm == "vm-cancelled" })
+	v.SweepOnce(context.Background())
+	if got := restartAttempts(t, db, "vm-cancelled"); got != 0 {
+		t.Fatalf("vm-cancelled restart attempts = %d, want 0", got)
+	}
+	if got := restartAttempts(t, db, "vm-other"); got == 0 {
+		t.Fatal("vm-other was not restarted: the probe stops more than the VM it names")
+	}
+}

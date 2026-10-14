@@ -319,7 +319,9 @@ answers again. litevirt keeps that from holding anything else:
   (its set-aside disk copies stay held), and a domain libvirt starts for it is
   destroyed the same way. A kept cancel ends once its domain has run and been
   destroyed, or the VM is started, deleted or moved, or the host has booted
-  since; it is not ended by its age. Other calls on the VM, `lv rm` among them,
+  since; it is not ended by its age. While it is kept, a VM in `error` is
+  neither recorded running from a domain that runs nor restarted by its
+  restart policy; `lv start` ends it. Other calls on the VM, `lv rm` among them,
   wait for the start. `lv ls` and `lv inspect` on that host report a VM
   libvirt does not answer for as `VM_UNKNOWN` within a few seconds.
 - **The reconcile pass.** One pass on a host serves all of its VMs, so no

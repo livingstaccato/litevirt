@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hooks"
 )
 
 // defaultStartDomainWait is how long `lv start` waits for libvirt to answer
@@ -362,6 +363,9 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 		// The cancel left the row error, which holds the VM's set-aside disk
 		// copies: the domain is destroyed and the row kept, where a stop
 		// would write it stopped and end that hold.
+		stopHooks := vmHooks(fresh)
+		stopVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_STOPPING}
+		hooks.Run(ctx, hooks.PreStop, stopVM, stopHooks)
 		if err = s.virt.DestroyDomain(vm.Name); err == nil || !running() {
 			if !s.hardwareV2Latched(ctx) { // as a stop releases them (stopVMLockedNote)
 				if rerr := s.releaseDevices(ctx, vm.Name); rerr != nil {
@@ -371,6 +375,8 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 			s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok",
 				fmt.Sprintf("start cancelled: libvirt answered the start asked for at %s late, and the domain it started was destroyed; the row is left %s, which holds its set-aside disk copies",
 					asked, fresh.State))
+			stopVM.State = pb.VMState_VM_STOPPED
+			hooks.Run(ctx, hooks.PostStop, stopVM, stopHooks)
 			slog.Info("StopVM: a cancelled start succeeded late; its domain was destroyed", "vm", vm.Name)
 			return
 		}

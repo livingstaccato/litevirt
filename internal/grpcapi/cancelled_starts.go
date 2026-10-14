@@ -339,6 +339,15 @@ func (s *Server) cancelledStartRan(r cancelledStartRecord) bool {
 	return s.cancelledStarts.ran[r.VM] == r.Created
 }
 
+// cancelledStartCurrent reports whether r is still vm's record (not ended,
+// nor replaced by a later cancel's).
+func (s *Server) cancelledStartCurrent(r cancelledStartRecord) bool {
+	s.cancelledStarts.mu.Lock()
+	defer s.cancelledStarts.mu.Unlock()
+	cur, ok := s.cancelledStartsLocked()[r.VM]
+	return ok && cur.Created == r.Created
+}
+
 func (s *Server) cancelledStartDestroying(vm string) bool {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
@@ -387,6 +396,15 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	case aerr != nil:
 		return // unknown: kept for the next pass
 	}
+	if s.bootedSince(r) {
+		// The host has booted since the cancel: the start it cancelled
+		// cannot have survived the boot, so the domain that runs is some
+		// later start's (an onboot autostart whose running write failed),
+		// never the cancelled one's. Nothing is destroyed.
+		slog.Info("StopVM: a cancelled start's record predates this boot; the domain that runs is not its start's, and the record is ended", "vm", r.VM)
+		s.dropCancelledStartIf(r.VM, r.Created)
+		return
+	}
 	// The domain runs: the start it cancelled has completed.
 	s.markCancelledStartRan(r)
 	unlock, ok := s.tryLockVM(r.VM)
@@ -395,6 +413,11 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	}
 	defer unlock()
 	if _, live := s.startFlightOf(r.VM); live {
+		return
+	}
+	if !s.cancelledStartCurrent(r) {
+		// Ended while libvirt was asked (a start of the VM removed it):
+		// the domain that runs is that start's.
 		return
 	}
 	row, err = corrosion.GetVM(ctx, s.db, r.VM)
@@ -443,8 +466,10 @@ func (s *Server) undoCancelledStartLocked(ctx context.Context, r cancelledStartR
 		}
 		// Not waited for under the lock. While it is outstanding a start
 		// of the VM is refused (endCancelledStartForStart) and no pass asks
-		// again; its answer is recorded when it comes, and the record is
-		// ended by a later pass that sees the domain no longer running.
+		// again. When libvirt answers, the VM lock is taken again and a
+		// destroy that succeeded gets the same bookkeeping as one answered
+		// in time (hooks, device release, event), and the record ends; a
+		// failed one is left to a later pass.
 		s.cancelledStarts.mu.Lock()
 		if s.cancelledStarts.destroying == nil {
 			s.cancelledStarts.destroying = map[string]bool{}
@@ -454,14 +479,19 @@ func (s *Server) undoCancelledStartLocked(ctx context.Context, r cancelledStartR
 		slog.Warn("StopVM: libvirt has not answered the destroy of a cancelled start's domain; its record is kept", "vm", row.Name)
 		go func() {
 			<-call.done
-			if call.err == nil {
-				s.recordVMEvent(ctx, row.Name, "vm.stopped", "ok", note)
-			} else {
+			defer func() {
+				s.cancelledStarts.mu.Lock()
+				delete(s.cancelledStarts.destroying, row.Name)
+				s.cancelledStarts.mu.Unlock()
+			}()
+			if call.err != nil {
 				slog.Warn("StopVM: the destroy of a cancelled start's domain failed late; a later pass looks again", "vm", row.Name, "error", call.err)
+				return
 			}
-			s.cancelledStarts.mu.Lock()
-			delete(s.cancelledStarts.destroying, row.Name)
-			s.cancelledStarts.mu.Unlock()
+			unlock := s.lockVM(row.Name)
+			defer unlock()
+			destroyed()
+			s.dropCancelledStartIf(r.VM, r.Created)
 		}()
 		return
 	}

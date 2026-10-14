@@ -2,8 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -269,5 +273,129 @@ func TestCancelledStart_AFixedFileIsReadAgain(t *testing.T) {
 	}
 	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
 		t.Fatalf("records after the fixed cancel: %+v", recs)
+	}
+}
+
+// Round 1, I-1: the VM checker heals a stopped or error row whose domain runs
+// to running every 10 s. Ticking before the 30 s sweep, it recorded the
+// domain libvirt started late for an errored VM's cancelled start as
+// running, and the sweep then found the row changed and ended the record,
+// destroying nothing. With the cancelled-start probe the checker leaves the
+// VM alone, and the sweep destroys the domain, the row kept error.
+//
+// Mutation: the checker not consulting the probe — the row is healed to
+// running and the domain runs on: red.
+func TestCancelledStart_AnErroredVMsLateDomainIsNotHealedBeforeTheSweep(t *testing.T) {
+	st := erroredHeldStart(t)
+	if _, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
+		t.Fatalf("stop --force: %v", err)
+	}
+	st2 := newStuckStart(t)
+	st2.s.db, st2.s.dataDir = st.s.db, st.s.dataDir
+	fake := st2.s.virt.(*libvirtfake.Fake)
+	fake.SetState("web", libvirtfake.StateRunning) // libvirt started it after the restart
+
+	checker := health.NewVMChecker(st2.s.hostName, t.TempDir(), st2.s.db, nil)
+	checker.SetBackend(fake)
+	checker.SetCancelledStartProbe(st2.s.HasCancelledStart)
+	checker.SweepOnce(context.Background())
+	if vm := st2.row(t); vm.State != "error" {
+		t.Fatalf("web after the VM checker's pass: %s/%q, want error (the cancel's)", vm.State, vm.StateDetail)
+	}
+
+	st2.sweep(t)
+	if st2.domainActive(t) {
+		t.Fatal("the domain of an errored VM's cancelled start runs")
+	}
+	if vm := st2.row(t); vm.State != "error" || vm.StateDetail != "failover start failed: disk missing" {
+		t.Fatalf("web after the sweep: %s/%q, want error with its detail", vm.State, vm.StateDetail)
+	}
+}
+
+// Round 1: a domain that runs under a record made in an earlier boot is not
+// the cancelled start's (it cannot have survived the boot): an onboot
+// autostart whose running write failed, say. It is not destroyed, and the
+// record ends.
+//
+// Mutation: the boot not looked at on a running domain — it is destroyed: red.
+func TestCancelledStart_ADomainRunningAfterABootIsLeftAlone(t *testing.T) {
+	st := newStuckStart(t)
+	st.restartedInBoot(t, "stopped", "operator-stop", time.Now().Add(-time.Hour), testBootA)
+	st.s.bootID = func() (string, error) { return testBootB, nil }
+	st.sweep(t)
+	if !st.domainActive(t) {
+		t.Fatal("the sweep destroyed a domain started after the host booted")
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("a record from an earlier boot outlived the sweep: %+v", recs)
+	}
+}
+
+// Round 1, m-1: the record is checked again under the VM lock. A start of
+// the VM that removed it while the sweep was asking libvirt about the
+// domain made that domain its own, and it is not destroyed, even when its
+// running write failed and the row still says stopped by its operator.
+//
+// Mutation: no check under the lock — the operator's start is destroyed: red.
+func TestCancelledStart_ARecordEndedWhileLibvirtWasAskedDestroysNothing(t *testing.T) {
+	st := newStuckStart(t)
+	st.restarted(t, "stopped", "operator-stop")
+	fake := st.s.virt.(*libvirtfake.Fake)
+	var once sync.Once
+	fake.FailDomainState = func(string) error {
+		once.Do(func() {
+			if err := st.s.endCancelledStartForStart("web"); err != nil {
+				t.Errorf("a start's removal of the record: %v", err)
+			}
+		})
+		return nil
+	}
+	st.sweep(t)
+	if !st.domainActive(t) {
+		t.Fatal("the sweep destroyed the domain of a start that removed the record")
+	}
+}
+
+// Round 1, m-3: a destroy libvirt answers after the bound gets the same
+// bookkeeping as one answered in time: the stop hooks run and the event is
+// recorded, under the VM lock, and the record ends.
+//
+// Mutation: the late completion only records the event — no PostStop hook:
+// red.
+func TestCancelledStart_ALateDestroyRunsTheStopBookkeeping(t *testing.T) {
+	st := newStuckStart(t)
+	st.s.liveStateWait = 100 * time.Millisecond
+	marker := filepath.Join(t.TempDir(), "post-stop")
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256, Hooks: &pb.HooksSpec{PostStop: "touch " + marker}})
+	if err := st.s.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = 'web'`, string(spec)); err != nil {
+		t.Fatal(err)
+	}
+	st.restarted(t, "stopped", "operator-stop")
+	hang := make(chan struct{})
+	st.s.virt.(*libvirtfake.Fake).FailDestroyDomain = func(string) error {
+		<-hang
+		return nil
+	}
+	st.sweepWithin(t, 3*time.Second, "a sweep whose destroy libvirt does not answer")
+	close(hang)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, herr := os.Stat(marker)
+		if herr == nil && len(st.cancelledStartsOnDisk(t)) == 0 && !st.s.cancelledStartDestroying("web") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the late destroy: post-stop hook ran=%v, records %+v", herr == nil, st.cancelledStartsOnDisk(t))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	n := 0
+	for _, e := range st.events(t, "vm.stopped", "ok") {
+		if strings.Contains(e.Detail, "after the daemon restarted") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the late destroy was recorded %d times, want once", n)
 	}
 }

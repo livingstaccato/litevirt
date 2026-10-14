@@ -300,15 +300,16 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 		t.Fatalf("not every minority workload runs on its home host before the split:\n  %s", s.last())
 	}
 
+	since := l.nodeNow(q)
 	start, _ := l.partitionNamedOnly(minority, majority)
 
 	// The minority stops executing: asserted. It pauses, or — the witness
 	// reaching both sides holds the lease and its fence of a minority host
 	// reaches through it — its host is powered off first, which stops the
 	// copy as surely (lab 1 2026-10-14: node-1 fenced 19 s after the split,
-	// 2 s before its pause was due).
+	// 2 s before its pause was due). Only proof counts (minorityCopyStopped).
 	pausedAt := waitEach(s, start, 2*minorityPauseBy, keys, func(r round, k string) bool {
-		return pausedState(r.state(home[k], k)) || !contains(r.executing(k), home[k])
+		return minorityCopyStopped(r, home[k], k)
 	})
 	for _, k := range keys {
 		at, ok := pausedAt[k]
@@ -333,6 +334,21 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 	for _, k := range keys {
 		if at, ok := recoveredAt[k]; ok {
 			l.mark("drill1b: %s recovered on the majority at +%v (liveness: logged only)", k, at.Sub(start).Round(time.Second))
+			// Sooner than the pause wait is safe only on a fence that ran: a
+			// reached SSH power-off, recorded ssh/fenced. A replacement this
+			// early on an assumed fence (a failed best-effort SSH relying on
+			// the pause) would be a regression.
+			if d := at.Sub(start); d < earliestReplacement(l.total) {
+				rows := l.mustSQL(q, "SELECT method, result FROM fencing_log WHERE host_name='"+home[k]+"' AND timestamp >= '"+since+"'")
+				fenced := false
+				for _, f := range rows {
+					fenced = fenced || (len(f) == 2 && f[0] == "ssh" && f[1] == "fenced")
+				}
+				if !fenced {
+					t.Errorf("%s replaced at +%v, before the pause wait %v, with no successful ssh fence of %s on record: %v",
+						k, d.Round(time.Millisecond), earliestReplacement(l.total), home[k], rows)
+				}
+			}
 		} else {
 			l.mark("drill1b: %s was NOT recovered on the majority within %v (liveness: logged only)", k, recoverBy)
 		}
@@ -377,6 +393,19 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 	}
 	s.Stop()
 	assertNeverTwice(t, s.snapshot())
+}
+
+// minorityCopyStopped reports whether r proves key's copy on host is not
+// executing: it is paused, its host was powered off, or the host was read and
+// the copy is in a state that does not execute (absent included). A host that
+// could not be read for any other reason proves nothing: a copy still running
+// there is invisible to the sample.
+func minorityCopyStopped(r round, host, key string) bool {
+	if why, down := r.Down[host]; down {
+		return why == "powered off"
+	}
+	st := r.state(host, key)
+	return pausedState(st) || !executingState(st)
 }
 
 // TestDrillBlip_FleetWide cuts every node off from every other node at once.

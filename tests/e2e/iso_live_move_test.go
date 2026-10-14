@@ -197,10 +197,14 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 	// (it does so before it asks the guest to shut down), the domain is
 	// powered off, as a guest that completes its shutdown powers off. A live
 	// move never records the VM stopped, so it is left alone.
-	done := make(chan struct{})
-	go guestCompletesShutdown(l, src, vm, done)
+	done, exited := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(exited)
+		guestCompletesShutdown(l, src, vm, done)
+	}()
 	out, err := l.lvTimeout(via, drainCLITimeout, "host", "drain", src)
 	close(done)
+	<-exited // it logs through t: it must not outlive the test
 	// "drain incomplete" is on stderr, in err: another VM on src that cannot
 	// move (lab 1's rc5-lcs, whose backing file is gone) fails the drain
 	// without bearing on this VM, whose own line is judged below.

@@ -242,13 +242,16 @@ func auditQuery(t *testing.T, query string) string {
 // A fork on a host the spec does not name, a first break that is not a named
 // row, a deleted-rows gap, or no/malformed spec is not known.
 func knownAuditFork(out, spec string) (bool, string) {
-	ids, hosts := map[string]bool{}, map[string]bool{}
+	type pair struct{ id, host string }
+	var pairs []pair
+	ids, hosts := map[string]string{}, map[string]bool{}
 	for _, e := range strings.Split(spec, ",") {
 		id, host, ok := strings.Cut(strings.TrimSpace(e), "@")
 		if !ok || id == "" || host == "" {
 			return false, "E2E_KNOWN_AUDIT_FORK is not set as <row-id>@<host>[,<row-id>@<host>...]"
 		}
-		ids[id], hosts[host] = true, true
+		pairs = append(pairs, pair{id, host})
+		ids[id], hosts[host] = host, true
 	}
 	lines := strings.Split(out, "\n")
 	section := func(prefix string) (rows []string, found bool) {
@@ -267,17 +270,33 @@ func knownAuditFork(out, spec string) (bool, string) {
 		return nil, false
 	}
 	first, found := section("forked chain (")
-	if !found || len(first) != 1 || !ids[first[0]] {
+	if !found || len(first) != 1 || ids[first[0]] == "" {
 		return false, fmt.Sprintf("the first broken row is %v, not one of the known %s", first, spec)
 	}
 	gaps, found := section("sequence break (")
 	if !found || len(gaps) == 0 {
 		return false, "no sequence break section naming the fork's host"
 	}
+	dupHosts, dupRows := map[string]bool{}, map[pair]bool{}
 	for _, g := range gaps {
 		h, rest, _ := strings.Cut(g, ": row ")
 		if !hosts[h] || !strings.Contains(rest, " repeats seq ") {
 			return false, fmt.Sprintf("a sequence-break line is not a duplicate on a known fork's host (%s): %q", spec, g)
+		}
+		dupHosts[h] = true
+		id, _, _ := strings.Cut(rest, " ")
+		dupRows[pair{id, h}] = true
+	}
+	// Each named fork verify reports is the pair it names: the first break's
+	// host has duplicates, and a named fork whose host has duplicates is
+	// either the first break or one of its own host's duplicate rows. A named
+	// fork whose host shows none is not reported now, which excuses nothing.
+	if !dupHosts[ids[first[0]]] {
+		return false, fmt.Sprintf("the first broken row %s is named for %s, which shows no duplicates", first[0], ids[first[0]])
+	}
+	for _, p := range pairs {
+		if dupHosts[p.host] && p.id != first[0] && !dupRows[p] {
+			return false, fmt.Sprintf("the named fork %s@%s is not what verify reports for that row and host", p.id, p.host)
 		}
 	}
 	return true, ""
@@ -310,6 +329,7 @@ func TestKnownAuditFork(t *testing.T) {
 		"a second fork on another host":  {known + gap("node-4", "ccc"), spec},
 		"a third fork beside two named":  {known + gap("node-4", "ccc") + gap("node-5", "ddd"), both},
 		"a list with a malformed entry":  {known, spec + ",node-4"},
+		"ids and hosts cross-paired":     {known + gap("node-4", "9bcb8393aec73858"), "b9fbdd30d8a95d0c@node-4,9bcb8393aec73858@node-3"},
 		"the first break is another row": {strings.Replace(known, "b9fbdd30d8a95d0c", "ffffffffffffffff", 1), spec},
 		"a deleted-rows gap":             {known + "  node-3: seq jumps from 4 to 9 (rows deleted)\n", spec},
 		"no spec":                        {known, ""},

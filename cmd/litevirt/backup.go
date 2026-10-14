@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -18,8 +17,6 @@ func newBackupCmd() *cobra.Command {
 		Short: "Backup and restore VMs",
 	}
 	cmd.AddCommand(
-		newBackupCreateCmd(),
-		newBackupRestoreCmd(),
 		newBackupRepoCmd(),
 		newBackupSnapshotCmd(),
 		newBackupRestoreFromCmd(),
@@ -190,8 +187,9 @@ func newBackupSnapshotCmd() *cobra.Command {
 	var disk, repo, ts, quiesce, bwlimit string
 	var incremental bool
 	cmd := &cobra.Command{
-		Use:   "snapshot <vm>",
-		Short: "Push a VM's disk into a backup repo (PBS-equivalent dedup chunks)",
+		Use:     "snapshot <vm>",
+		Aliases: []string{"create"},
+		Short:   "Push a VM's disk into a backup repo (PBS-equivalent dedup chunks)",
 		Long: `Push a VM's disk into a backup repo as a content-addressed manifest.
 
 --incremental looks up the most-recent manifest for this VM+disk in
@@ -259,14 +257,23 @@ intact (but disk I/O is full).`,
 }
 
 // newBackupRestoreFromCmd streams a manifest's chunks back into a
-// target disk path. Distinct from `lv backup restore` (legacy) which
-// uses the older full-disk RestoreVM RPC.
+// target disk path. `lv backup restore` is its alias.
 func newBackupRestoreFromCmd() *cobra.Command {
 	var repo, vm, disk, ts, target string
 	var inPlace bool
 	cmd := &cobra.Command{
-		Use:   "restore-from",
-		Short: "Restore a snapshot from a backup repo into a new file, or in place over the VM's stopped disk",
+		Use:     "restore-from",
+		Aliases: []string{"restore"},
+		Short:   "Restore a snapshot from a backup repo into a new file, or in place over the VM's stopped disk",
+		// No positional argument: the retired `lv backup restore <file>`
+		// form must fail, not restore from a repo with the file ignored.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("%s takes no argument (got %q): it restores from a backup repo, named by --repo, --vm, --disk and --timestamp; "+
+					"a disk file is no longer restored from", cmd.CommandPath(), args[0])
+			}
+			return nil
+		},
 		Long: `Restore one disk from a backup manifest.
 
 By default the daemon writes a new file of its own under <data_dir>/disks and
@@ -412,146 +419,5 @@ existing file there is refused, never replaced.`,
 	cmd.Flags().StringVar(&newName, "name", "", "Rename the restored VM (avoids collision with the original)")
 	cmd.Flags().BoolVar(&blockpull, "blockpull", false, "After start, localize the disk via blockpull then stop NBD")
 	cmd.Flags().BoolVar(&fromExisting, "from-existing", false, "Fall back to an existing vms record for the spec")
-	return cmd
-}
-
-func newBackupCreateCmd() *cobra.Command {
-	var outPath string
-	cmd := &cobra.Command{
-		Use:   "create <vm>",
-		Short: "Export a VM's root disk to a file",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				// Default output filename.
-				if outPath == "" {
-					outPath = args[0] + ".qcow2"
-				}
-
-				f, err := os.Create(outPath)
-				if err != nil {
-					return fmt.Errorf("create output file: %w", err)
-				}
-				defer f.Close()
-
-				stream, err := c.BackupVM(ctx, &pb.BackupVMRequest{VmName: args[0]})
-				if err != nil {
-					return fmt.Errorf("backup: %w", err)
-				}
-
-				var written int64
-				var checksum string
-				for {
-					chunk, err := stream.Recv()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						return fmt.Errorf("recv: %w", err)
-					}
-
-					if len(chunk.Data) > 0 {
-						n, wErr := f.Write(chunk.Data)
-						if wErr != nil {
-							return fmt.Errorf("write: %w", wErr)
-						}
-						written += int64(n)
-						if chunk.TotalBytes > 0 {
-							pct := float64(written) / float64(chunk.TotalBytes) * 100
-							fmt.Printf("\r  backup: %.0f%%", pct)
-						}
-					}
-					if chunk.Checksum != "" {
-						checksum = chunk.Checksum
-					}
-				}
-
-				fmt.Printf("\nBackup complete: %s (%d bytes", outPath, written)
-				if checksum != "" {
-					fmt.Printf(", %s", checksum)
-				}
-				fmt.Println(")")
-				return nil
-			})
-		},
-	}
-	cmd.Flags().StringVarP(&outPath, "out", "o", "", "Output file path (default: <vm>.qcow2)")
-	return cmd
-}
-
-func newBackupRestoreCmd() *cobra.Command {
-	var (
-		name    string
-		cpu     int32
-		memMiB  int32
-		network string
-	)
-	cmd := &cobra.Command{
-		Use:   "restore <file>",
-		Short: "Restore a VM from a backup file",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				f, err := os.Open(args[0])
-				if err != nil {
-					return fmt.Errorf("open: %w", err)
-				}
-				defer f.Close()
-
-				info, err := f.Stat()
-				if err != nil {
-					return fmt.Errorf("stat: %w", err)
-				}
-
-				stream, err := c.RestoreVM(ctx)
-				if err != nil {
-					return fmt.Errorf("restore: %w", err)
-				}
-
-				buf := make([]byte, 256*1024)
-				var sent int64
-				first := true
-
-				for {
-					n, readErr := f.Read(buf)
-					if n > 0 {
-						msg := &pb.RestoreVMRequest{Chunk: buf[:n]}
-						if first {
-							msg.Name = name
-							msg.Cpu = cpu
-							msg.MemoryMib = memMiB
-							msg.Network = network
-							first = false
-						}
-						if err := stream.Send(msg); err != nil {
-							return fmt.Errorf("send: %w", err)
-						}
-						sent += int64(n)
-						pct := float64(sent) / float64(info.Size()) * 100
-						fmt.Printf("\r  restoring: %.0f%%", pct)
-					}
-					if readErr == io.EOF {
-						break
-					}
-					if readErr != nil {
-						return fmt.Errorf("read: %w", readErr)
-					}
-				}
-
-				vm, err := stream.CloseAndRecv()
-				if err != nil {
-					return fmt.Errorf("restore: %w", err)
-				}
-				fmt.Printf("\nVM %s restored on %s (state: %s)\n",
-					vm.Name, vm.HostName, vm.State)
-				return nil
-			})
-		},
-	}
-	cmd.Flags().StringVar(&name, "name", "", "VM name (required)")
-	cmd.Flags().Int32Var(&cpu, "cpu", 2, "CPU count")
-	cmd.Flags().Int32Var(&memMiB, "memory", 4096, "Memory in MiB")
-	cmd.Flags().StringVar(&network, "network", "", "Network bridge name (optional)")
-	cmd.MarkFlagRequired("name")
 	return cmd
 }

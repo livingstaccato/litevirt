@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -44,13 +45,28 @@ func (d *btrfsDriver) Prepare(ctx context.Context) error {
 	if err := os.MkdirAll(d.subvolRoot, 0755); err != nil {
 		return fmt.Errorf("btrfs: create subvol root: %w", err)
 	}
-	// `btrfs filesystem show <path>` confirms the path lives on btrfs.
-	out, err := cmdbound.CombinedOutput(ctx, cmdbound.Command(ctx, "btrfs", "filesystem", "show", "--", d.subvolRoot))
+	// Every disk operation runs the btrfs tool (btrfs-progs).
+	if _, err := exec.LookPath("btrfs"); err != nil {
+		return fmt.Errorf("btrfs: the btrfs command (btrfs-progs) is not installed on this host: %w", err)
+	}
+	// The kernel says which filesystem the path is on, for any path on it: a
+	// mount point, a directory or a subvolume below one.
+	info := statfsInfo.get()
+	magic, err := Bounded("statfs", d.subvolRoot, func() (uint32, error) {
+		m, _, err := info(d.subvolRoot)
+		return m, err
+	})
 	if err != nil {
-		return fmt.Errorf("btrfs filesystem show %s: %w: %s", d.subvolRoot, err, out)
+		return fmt.Errorf("btrfs: statfs %s: %w", d.subvolRoot, err)
+	}
+	if magic != btrfsSuperMagic {
+		return fmt.Errorf("btrfs: %s is not on a btrfs filesystem (statfs type 0x%x)", d.subvolRoot, magic)
 	}
 	return nil
 }
+
+// btrfsSuperMagic is BTRFS_SUPER_MAGIC, the statfs type of a btrfs filesystem.
+const btrfsSuperMagic = 0x9123683E
 
 func (d *btrfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, error) {
 	subvol := filepath.Join(d.subvolRoot, fmt.Sprintf("%s-%s", opts.VMName, opts.DiskName))

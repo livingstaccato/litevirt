@@ -55,10 +55,10 @@ func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, m
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
 	}
-	// HostFreeCapacity nets out committed running-VM/container actuals and
-	// in-flight nonterminal operation reservations (reserve-then-verify made
-	// the replicated reservation the ONLY in-flight ledger; the old in-process
-	// one had no writers left and is gone).
+	// HostFreeCapacity nets out committed actuals (running and starting VMs,
+	// running containers) and in-flight nonterminal operation reservations
+	// (reserve-then-verify made the replicated reservation the ONLY in-flight
+	// ledger; the old in-process one had no writers left and is gone).
 	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)

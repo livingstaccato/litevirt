@@ -1834,7 +1834,45 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	// The reservation must outlive startVMLocked's state write.
 	defer lease.release(ctx)
+	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
+		return nil, err
+	} else if rearmed {
+		return s.vmToProto(ctx, vm.Name)
+	}
 	return s.startVMLocked(ctx, vm)
+}
+
+// restartCancelledStartLocked makes again a start an operator cancelled
+// (`lv stop --force`, cancelStartLocked): the VM is stopped by its operator,
+// its open vm_start_cancelled names this host, and no domain is defined for
+// it, which a start of the defined domain cannot start. The row is re-armed
+// to "starting", the state the reconciler's start defines and starts it from
+// (a markerless "pending" is refused as proof_missing under the split-brain
+// gate), as the cancelled start would have; a transfer stays one through the
+// record (Reconciler.cancelledTransfer). The record stays open, holding the
+// VM's set-aside disk copies, until the VM runs. It reports whether it
+// re-armed the row. The caller holds the VM lock.
+func (s *Server) restartCancelledStartLocked(ctx context.Context, vm *corrosion.VMRecord) (bool, error) {
+	if vm.State != "stopped" || vm.StateDetail != "operator-stop" || s.db == nil || s.virt == nil {
+		return false, nil
+	}
+	ev, err := health.StartCancelledOf(ctx, s.db, vm.Name, s.hostName)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "start %q: read its cancelled start: %v", vm.Name, err)
+	}
+	if ev == nil {
+		return false, nil
+	}
+	if _, aerr := s.virt.DomainIsActive(vm.Name); !lv.IsNoDomain(aerr) {
+		return false, nil // a domain is defined: started as any other
+	}
+	if err := s.persistVMState(ctx, vm.Name, "starting", "operator start: the start cancelled earlier is made again", corrosion.OpVMState); err != nil {
+		return false, status.Errorf(codes.Internal, "start %q: re-arm its cancelled start: %v", vm.Name, err)
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.start_rearmed", "ok",
+		fmt.Sprintf("the start cancelled on %s is made again: the reconciler defines and starts the VM (`lv inspect %s`)", s.hostName, vm.Name))
+	slog.Info("StartVM: re-armed a cancelled start; the reconciler makes it", "vm", vm.Name, "transfer", ev.Transfer)
+	return true, nil
 }
 
 // takeRepairLease refuses a compose repair of vm while another operation is
@@ -1916,8 +1954,8 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	}
 
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
-	// usage counts running VMs only, so a stopped VM contributes nothing until
-	// now. Without this, create-time admission is trivially sidestepped: create a
+	// usage counts running and starting VMs only (corrosion.SumVMResourcesByHost),
+	// so a stopped VM contributes nothing until now. Without this, create-time admission is trivially sidestepped: create a
 	// pile of VMs (each fitting at the time), then start them all.
 	//
 	// Deliberately on the OPERATOR paths, not inside startVMLocked. The automated
@@ -1928,12 +1966,25 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// into a partial one. Recovery restores what was already accounted for; only a
 	// human asking for something NEW is admitted.
 	//
-	// Skipped when the VM is already running: `lv start` on a running VM is a
-	// no-op that adds nothing, and must not be refused for capacity it already
-	// occupies. Anything else — stopped, error, mid-transition — is counted
-	// nowhere, so its whole size is admitted as new to the host.
+	// Skipped when the VM is already running: `lv start` must not be refused
+	// for capacity the VM already occupies. A VM in starting is counted too
+	// (countedAgainstHost), at its row's actuals: only what cpu/memMiB add to
+	// those is admitted — a repair that grows it (UpdateVM) — through the same
+	// overcommit permission and audit as any start. Its domain is not running
+	// yet, so even at zero growth the start makes it resident and the host
+	// safety gate runs (intentStartingResident). Anything else — stopped,
+	// error, pending — is counted nowhere, so its whole size is admitted as
+	// new to the host.
 	if vm.State == "running" {
 		return nil, nil
+	}
+	intent := intentVMResident
+	if countedAgainstHost(vm.State) {
+		cpu, memMiB = posOnly(cpu-vm.CPUActual), posOnly(memMiB-vm.MemActual)
+		intent = intentStartingResident
+		if cpu == 0 && memMiB == 0 {
+			return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, 0, 0, intent)
+		}
 	}
 	if allowOvercommit {
 		if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
@@ -1942,17 +1993,23 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 		s.audit(ctx, "vm.start", vm.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				vm.HostName, cpu, memMiB), "allow-overcommit")
-		return s.reserveWithoutCheck(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB)
+		return s.reserveWithoutCheckFor(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intent)
 	}
 	// Reserve-then-verify (F2): publish this start's demand before deciding,
 	// so a concurrent start on another node sees it instead of both reading a
 	// view containing neither.
 	//
-	// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+	// intentVMResident: a stopped VM contributes nothing to usage OR to the
 	// per-VM overhead subtraction, so starting it adds both its guest memory
-	// and a new qemu overhead.
-	return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intentVMResident)
+	// and a new qemu overhead. A starting one already carries its overhead.
+	return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intent)
 }
+
+// countedAgainstHost reports whether a VM in state is already in its host's
+// usage (corrosion.SumVMResourcesByHost counts running and starting VMs, at
+// their rows' actuals, each with its qemu overhead), so bringing it up again
+// at the same size adds nothing to admit.
+func countedAgainstHost(state string) bool { return state == "running" || state == "starting" }
 
 // hardwareAdoptionRefused fails closed when the active hardware_v2 regime finds a VM
 // in the "blocked" adoption state — its hardware failed the per-VM compatibility
@@ -2234,9 +2291,17 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	// (lab 2 O-4: libvirt answers "domain is not running"), as a start of a
 	// running one is (startVMLocked). A failure while the domain is active,
 	// or when whether it is cannot be read, is still the error it was.
-	noop := false
+	noop, noDomain := false, false
+	beingStarted := vm.State == "pending" || vm.State == "starting"
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
+		if aerr != nil && beingStarted && lv.IsNoDomain(aerr) {
+			// A start deferred before its define (storage that does not
+			// answer) leaves no domain: nothing runs.
+			slog.Info("StopVM: a VM being started has no domain yet; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+			noop, noDomain = true, true
+			return true
+		}
 		if aerr != nil || active {
 			return false
 		}
@@ -2265,12 +2330,28 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 
 	// pending/starting: a start is under way (a failover's, an onboot's, a
 	// self-heal's), and the reconciler will start the domain. A success here
-	// would be overridden by that start, so the stop is refused and nothing is
-	// changed. (Main answered Internal: nothing that worked is refused.)
-	if noop && (vm.State == "pending" || vm.State == "starting") {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)",
-			vm.Name, vm.State, vm.Name, vm.Name)
+	// would be overridden by that start, so the stop is refused, and nothing
+	// is changed. (Main answered Internal: nothing that worked is refused.)
+	// With --force and no domain defined at all, the stop cancels the start
+	// (cancelStartLocked): the row is written stopped/operator-stop, so no
+	// start path starts it, and its set-aside disk copies stay held.
+	cancelled := ""
+	if noop && beingStarted {
+		if !noDomain || !force {
+			cancel := ""
+			if noDomain {
+				cancel = fmt.Sprintf(", or cancel the start (`lv stop --force %s`)", vm.Name)
+			}
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)%s",
+				vm.Name, vm.State, vm.Name, vm.Name, cancel)
+		}
+		release, detail, err := s.cancelStartLocked(ctx, vm)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		cancelled = detail
 	}
 	// A no-op stop of a VM whose row holds its set-aside disk copies (error:
 	// a failover start that failed may need them put back) leaves the row as
@@ -2319,7 +2400,10 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
 	evDetail := ""
-	if noop {
+	switch {
+	case cancelled != "":
+		evDetail = cancelled
+	case noop:
 		evDetail = "already stopped: the domain was not running; the operator's stop is recorded"
 	}
 	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
@@ -2331,6 +2415,56 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	hooks.Run(ctx, hooks.PostStop, pbVM, hspec)
 
 	return s.vmToProto(ctx, vm.Name)
+}
+
+// cancelStartLocked cancels the start of vm, a local VM in pending or
+// starting whose domain is not defined, before a forced stop writes it
+// stopped/operator-stop. It takes the VM's start lease, so no start path is
+// in flight or starts it meanwhile, and checks again under it that the row is
+// still being started, by no proof-gated action, with no domain. It then
+// records vm_start_cancelled, which keeps the VM's set-aside disk copies held
+// (health.CancelStartLockHolder, RecordStartCancelled), and returns the
+// lease's release and the detail for the VM's event. The caller holds the VM
+// lock.
+func (s *Server) cancelStartLocked(ctx context.Context, vm *corrosion.VMRecord) (func(), string, error) {
+	if vm.PendingActionID != "" {
+		return nil, "", status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s) by action %s, a failover's: a stop does not cancel it; wait until it runs or fails (`lv inspect %s`)",
+			vm.Name, vm.State, vm.PendingActionID, vm.Name)
+	}
+	holder := health.CancelStartLockHolder(s.hostName)
+	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
+	if err != nil {
+		return nil, "", status.Errorf(codes.Unavailable, "cancel the start of %q: take its start lease: %v", vm.Name, err)
+	}
+	if heldBy != holder {
+		return nil, "", status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s) and %s holds its start lease: the start is in flight, and the stop was not applied; retry in a moment",
+			vm.Name, vm.State, heldBy)
+	}
+	release := func() { health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name) }
+	fail := func(err error) (func(), string, error) {
+		release()
+		return nil, "", err
+	}
+	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
+	switch {
+	case err != nil:
+		return fail(status.Errorf(codes.Internal, "cancel the start of %q: read it: %v", vm.Name, err))
+	case fresh == nil || fresh.HostName != s.hostName || fresh.State != vm.State || fresh.PendingActionID != "":
+		return fail(status.Errorf(codes.Aborted, "VM %q changed while its start was being cancelled; retry", vm.Name))
+	}
+	if _, aerr := s.virt.DomainIsActive(vm.Name); !lv.IsNoDomain(aerr) {
+		return fail(status.Errorf(codes.Aborted, "VM %q has a domain now: its start went on while the stop ran, and the stop was not applied; retry", vm.Name))
+	}
+	// A pending row is a transfer onto this host; a starting one is when the
+	// reconciler parked it as one.
+	transfer := vm.State == "pending" || (s.startTransferProbe != nil && s.startTransferProbe(vm.Name))
+	detail, err := health.RecordStartCancelled(ctx, s.db, s.hostName, vm.Name, vm.State, transfer, time.Now())
+	if err != nil {
+		return fail(status.Errorf(codes.Internal, "cancel the start of %q: record the hold on its set-aside disk copies: %v", vm.Name, err))
+	}
+	return release, detail, nil
 }
 
 // stopNoopKeepsRow are the VM states a stop that found the domain already
@@ -2391,13 +2525,20 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	// RUNNING VM is net-zero (destroy+start of consumption already counted,
 	// overhead included) and deliberately admits nothing: a full host must
 	// always be able to restart what it already runs.
+	// A VM in starting is counted already too (countedAgainstHost), so it
+	// admits a zero delta — but its domain is not running yet, so the restart
+	// makes it resident and the host safety gate runs (intentStartingResident).
 	if vm.State != "running" {
-		var spec pb.VMSpec
-		if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
-			return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+		cpu, memMiB, intent := 0, 0, intentStartingResident
+		if !countedAgainstHost(vm.State) {
+			var spec pb.VMSpec
+			if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+				return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+			}
+			cpu, memMiB, intent = int(spec.Cpu), int(spec.MemoryMib), intentVMResident
 		}
 		lease, aerr := s.admitHostWithReservation(ctx, "RestartVM", vm.HostName, vm.Project,
-			"vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+			"vm:"+vm.Name, cpu, memMiB, intent)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -5060,11 +5201,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if repair {
 				// A repair ends in a start, so it passes StartVM's gates first
 				// (startGatesLocked) — before anything of the VM is touched, so a
-				// refusal leaves it exactly as it was. The VM is in error or
-				// mid-transition and counted nowhere, so the host admits its
-				// WHOLE size as new, not the desired-minus-stored delta (zero for
-				// an unchanged spec). Quota still charges only the grow: the
-				// stored spec already counts toward the project.
+				// refusal leaves it exactly as it was. A VM in starting is
+				// already counted at its row's actuals (countedAgainstHost), so
+				// the host admits only what the new size adds to those, and runs
+				// the safety gate even when that is nothing. A VM in error,
+				// creating, stopping or any other state is counted nowhere, so
+				// the host admits its WHOLE size as new. Quota still charges only
+				// the grow: the stored spec already counts toward the project.
 				releaseStartLease, err := s.takeRepairLease(ctx, fresh)
 				if err != nil {
 					return nil, err

@@ -329,6 +329,10 @@ func (r *Reconciler) tendStrandedDisks(ctx context.Context) {
 			r.resolveHeldForHost(ctx, row)
 			continue
 		}
+		if row.Evaluator == DiskMissingEvaluator && row.Code == CondVMStartCancelled {
+			r.resolveStartCancelled(ctx, row)
+			continue
+		}
 		if row.Evaluator != DiskMissingEvaluator || row.Code != CondVMDiskStranded {
 			continue
 		}

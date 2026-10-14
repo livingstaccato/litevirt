@@ -2252,6 +2252,20 @@ down host that no other host runs.
 |---|---|
 | Failover leaves a restart-same VM with a host-local disk on its failed host. | The host is back and the VM runs there again (a host that boots again turns `active` on its own, after `upgrading` if it booted into a pending upgrade; one that answered again without restarting and stays `fenced` or `offline` needs `lv host undrain <host>` first), or, once the host is back, the VM is on another host or deleted. A record for a host removed from the cluster clears once the VM is deleted or on another host. |
 
+### A start an operator cancelled (`vm_start_cancelled`)
+
+`lv stop --force <vm>` of a VM in `pending` or `starting` with no domain
+defined (a start deferred because its storage did not answer) cancels the
+start: the VM is recorded stopped by its operator. The stop raises
+`vm_start_cancelled` (evaluator `vm_disk`, subject `vm/<name>@<host>`, info).
+While it is open, the disk copies a failover set aside for the VM stay held, as
+they were while the start was under way: `lv host superseded-disks <host>
+--remove` refuses them.
+
+| Raised when | Clears when |
+|---|---|
+| A forced stop cancels a start that had no domain. | The VM runs on that host again, or is on another host, or is deleted. `lv start <vm>` makes the cancelled start again: the VM goes back to `starting`, and the reconciler defines and starts it as it would have (a transfer still sets aside an old copy at the disk path). |
+
 ### A relocated container's own rootfs is on another host (`ct_rootfs_stranded`)
 
 Failover relocated a container off a failed host, recreating it from its image

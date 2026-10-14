@@ -1245,6 +1245,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)
+	// A cancel of a start records whether it was a proof-less transfer.
+	svc.SetStartTransferProbe(reconciler.IsDeferredTransfer)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)

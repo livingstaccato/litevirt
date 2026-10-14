@@ -257,9 +257,9 @@ func TestUserHasSubcommands(t *testing.T) {
 
 func TestBackupHasSubcommands(t *testing.T) {
 	cmd := newBackupCmd()
-	for _, name := range []string{"create", "restore"} {
-		if findSubcommand(cmd, name) == nil {
-			t.Errorf("backup missing subcommand %q", name)
+	for name, is := range map[string]string{"create": "snapshot", "restore": "restore-from", "snapshot": "snapshot", "restore-from": "restore-from"} {
+		if c, _, err := cmd.Find([]string{name}); err != nil || c == cmd || c.Name() != is {
+			t.Errorf("backup %s does not run backup %s", name, is)
 		}
 	}
 }
@@ -858,27 +858,6 @@ func TestVMConfigFlags(t *testing.T) {
 		"ip":      "",
 		"network": "production",
 		"boot":    "",
-	})
-}
-
-func TestBackupCreateFlags(t *testing.T) {
-	cmd := newBackupCreateCmd()
-	checkFlags(t, cmd, map[string]string{
-		"out": "",
-	})
-	f := cmd.Flags().Lookup("out")
-	if f.Shorthand != "o" {
-		t.Errorf("--out shorthand = %q, want %q", f.Shorthand, "o")
-	}
-}
-
-func TestBackupRestoreFlags(t *testing.T) {
-	cmd := newBackupRestoreCmd()
-	checkFlags(t, cmd, map[string]string{
-		"name":    "",
-		"cpu":     "2",
-		"memory":  "4096",
-		"network": "",
 	})
 }
 

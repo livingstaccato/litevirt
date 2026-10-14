@@ -5377,6 +5377,11 @@ message VerifyAuditChainResponse {
     // Empty when broken_at_id is, and from a daemon older than this field,
     // which a client reads as "content" — the only label it used to have.
     string broken_at_kind = 20;
+    // Rows on a host whose audit chain forked (a second genesis) whose
+    // stored prev_hash is the hash of no row of that host one seq before
+    // them: the row before each was deleted. Its two chains interleave by
+    // seq, so such a deletion leaves no seq gap; this names it.
+    repeated string orphaned_rows = 21;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

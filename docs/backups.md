@@ -368,7 +368,7 @@ the VM waits at most for that step:
   the last resort below and is recorded as not point-in-time, with a
   point-in-time retry owed. While the session runs, libvirt refuses or times
   out every other operation that needs a block job or the disk: a migration,
-  a backup (`lv backup create`), a snapshot, `lv replicate-volume`,
+  a backup (`lv backup snapshot`), a snapshot, `lv replicate-volume`,
   `lv move-volume` of a running VM's disk, `lv resize-disk`, a snapshot delete
   that flattens (`lv snapshot rm`), and a detach of that disk. Retry them once
   the run is done;

@@ -534,7 +534,9 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			if storage.IsFSNoAnswer(perr) {
 				return pitNoAnswer(vm, d, perr)
 			}
-			s.repointDanglingPITDefinition(ctx, vm, d, presence, perr)
+			if err := s.repointDanglingPITDefinition(ctx, vm, d, presence, perr); err != nil {
+				return pitNoAnswer(vm, d, err)
+			}
 			if presence != pitoverlay.OverlayUnknown {
 				s.ClearPITOverlayHold(ctx, vm.Name, d.DiskName)
 			}
@@ -543,11 +545,22 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 	}
 	overlay := pitOverlayPath(d.Path)
 	owner := pitOwner(vm, d)
+	// The overlay's own look (attributes the client may still cache) does
+	// not prove its server answers: the binding, the window token and the
+	// header are read first under the bound, and a no-answer refuses as
+	// the looks above do, before anything below reads or commits them.
+	if _, err := pitoverlay.AssessBounded(disk, owner, false); err != nil {
+		return pitNoAnswer(vm, d, err)
+	}
 	if open, _ := s.PITOverlayFeature(); !open {
 		// Below the pit_overlay feature this host settles no overlay — not
 		// even live: one present was made by a host above it. Held, with
 		// the full verdict for the admin.
-		return s.holdPITOverlay(ctx, vm, d, pitoverlay.AssessAt(s.PITOverlayFeature, disk, owner, false))
+		a, err := pitoverlay.AssessAtBounded(s.PITOverlayFeature, disk, owner, false)
+		if err != nil {
+			return pitNoAnswer(vm, d, err)
+		}
+		return s.holdPITOverlay(ctx, vm, d, a)
 	}
 	committed := fmt.Sprintf("%s: an earlier point-in-time overlay %s was committed back into %s", d.DiskName, overlay, d.Path)
 	switch s.domainActivity(vm) {
@@ -568,7 +581,10 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 			break
 		}
 		// The domain runs on its disk.
-		a := pitoverlay.Assess(disk, owner, true)
+		a, err := pitoverlay.AssessBounded(disk, owner, true)
+		if err != nil {
+			return pitNoAnswer(vm, d, err)
+		}
 		if a.Verdict == pitoverlay.Pivoted {
 			// A pivot landed and the daemon died before the overlay went: it
 			// is merged. Point a definition that still names it back at the
@@ -602,15 +618,19 @@ func (s *Server) healPITOverlay(ctx context.Context, vm *corrosion.VMRecord, d *
 				a = pitoverlay.Assessment{Verdict: pitoverlay.Unknown, Binding: a.Binding, CommitBegan: a.CommitBegan,
 					Current: a.Current, Backing: a.Backing, DiskMtimeNs: a.DiskMtimeNs, OverlayMtimeNs: a.OverlayMtimeNs, OverlayCurrent: a.OverlayCurrent,
 					Reason: fmt.Sprintf("%s (and that could not be recorded: %v)", why, err)}
-			} else {
-				a = pitoverlay.Assess(disk, owner, true)
+			} else if a, err = pitoverlay.AssessBounded(disk, owner, true); err != nil {
+				return pitNoAnswer(vm, d, err)
 			}
 		}
 		return s.holdPITOverlay(ctx, vm, d, a)
 	default:
-		_, err := pitoverlay.CommitOffline(ctx, disk, owner)
+		_, err := pitCommitOffline(ctx, disk, owner)
 		if errors.Is(err, pitoverlay.ErrNotOurs) {
-			return s.holdPITOverlay(ctx, vm, d, pitoverlay.Assess(disk, owner, false))
+			a, aerr := pitoverlay.AssessBounded(disk, owner, false)
+			if aerr != nil {
+				return pitNoAnswer(vm, d, aerr)
+			}
+			return s.holdPITOverlay(ctx, vm, d, a)
 		}
 		if err != nil {
 			s.reportStrandedOverlay(ctx, vm, d, overlay, err)
@@ -662,8 +682,9 @@ func (s *Server) pointPITDefinitionAtDisk(vm *corrosion.VMRecord, d *corrosion.D
 // The filesystem checks come first, so the common case (no orphan) costs no
 // libvirt call. Otherwise nothing is touched and the start fails as it does
 // on main, naming the missing file. Nothing is deleted. A failure is logged
-// and never refuses what the caller does.
-func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, presence pitoverlay.Presence, perr error) {
+// and never refuses what the caller does. The one error returned is the
+// look for an orphan going unanswered (storage.IsFSNoAnswer).
+func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion.VMRecord, d *corrosion.DiskRecord, presence pitoverlay.Presence, perr error) error {
 	disk := s.hostDiskFile(d.Path)
 	overlay := pitOverlayPath(d.Path)
 	switch presence {
@@ -677,38 +698,43 @@ func (s *Server) repointDanglingPITDefinition(ctx context.Context, vm *corrosion
 		}
 		log("point-in-time overlay: cannot tell whether it is there; the domain's definition is left as it is",
 			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", perr)
-		return
+		return nil
 	default:
-		return
+		return nil
 	}
-	if !pitoverlay.SetAsideEvidence(disk) {
-		return
+	if evidence, err := pitoverlay.SetAsideEvidenceBounded(disk); err != nil {
+		return err
+	} else if !evidence {
+		return nil
 	}
 	if s.pitSnapshotter == nil || s.virt == nil || !s.virt.DomainExists(vm.Name) || s.domainActivity(vm) != activityInactive {
-		return
+		return nil
 	}
 	used, err := s.pitSnapshotter.DomainUsesFile(vm.Name, overlay)
 	if err != nil || !used {
-		return
+		return nil
 	}
 	if err := s.pointPITDefinitionAtDisk(vm, d); err != nil {
 		slog.Warn("point-in-time overlay: the definition names an overlay that is not there and could not be pointed back at the disk",
 			"vm", vm.Name, "disk", d.DiskName, "overlay", overlay, "error", err)
-		return
+		return nil
 	}
 	detail := fmt.Sprintf("%s: the domain's definition named the point-in-time overlay %s, which was set aside; it was pointed back at the disk %s. The set-aside overlay is kept beside the disk as %s.orphan-*",
 		d.DiskName, overlay, d.Path, overlay)
 	slog.Warn("point-in-time overlay: definition pointed back at the disk", "vm", vm.Name, "detail", detail)
 	s.recordVMEventSeverity(ctx, vm.Name, "disk.pit_definition_repointed", "warning", "warn", detail)
+	return nil
 }
 
-// pitBind, pitMarkCommitting and pitMarkPivoting are pitoverlay's, as
-// variables so a test can make them fail.
+// pitBind, pitMarkCommitting, pitMarkPivoting, pitMarkDiverged and
+// pitCommitOffline are pitoverlay's, as variables so a test can make them
+// fail or see them called.
 var (
 	pitBind           = pitoverlay.BindWindow
 	pitMarkCommitting = pitoverlay.MarkCommitting
 	pitMarkPivoting   = pitoverlay.MarkPivoting
 	pitMarkDiverged   = pitoverlay.MarkDiverged
+	pitCommitOffline  = pitoverlay.CommitOffline
 )
 
 // The health condition of a disk held on its overlay: one per disk, subject

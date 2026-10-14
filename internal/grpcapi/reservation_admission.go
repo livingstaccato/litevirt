@@ -44,6 +44,11 @@ var (
 	// intentResourceGrow: a delta on a workload already resident and counted,
 	// overhead included.
 	intentResourceGrow = admissionIntent{}
+	// intentStartingResident: a VM in starting brought up — counted in usage
+	// with its overhead (countedAgainstHost), but its domain is not running
+	// yet, so the start makes it resident: full residency safety, no second
+	// overhead.
+	intentStartingResident = admissionIntent{newResidency: true}
 )
 
 // quotaSubject is the workload a project-quota admission is FOR: its identity
@@ -344,21 +349,33 @@ func (s *Server) admitHostWithReservation(
 func (s *Server) reserveWithoutCheck(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
+	return s.reserveWithoutCheckFor(ctx, method, host, project, resourceID, cpuDelta, memDelta, intentVMResident)
+}
+
+// reserveWithoutCheckFor is reserveWithoutCheck for intent: a grow of a VM
+// already counted (intentResourceGrow) carries no second qemu overhead.
+func (s *Server) reserveWithoutCheckFor(
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
+) (*reservationLease, error) {
 	// --allow-overcommit bypasses the numeric headroom CHECK only. Host safety
 	// — active ownership conditions, incomplete local inventory — binds the
 	// overcommit path exactly as it binds everything else, and binds it BEFORE
 	// the zero-delta fast path: residency is a safety decision even when the
 	// numeric delta is zero.
 	sub := subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
-	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, true, true); err != nil {
+	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, intent.newResidency, true); err != nil {
 		return nil, err
 	}
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
+	hostMem := memDelta
+	if intent.vmOverhead {
+		hostMem = s.capacity.MemChargeFor(memDelta)
+	}
 	rv := corrosion.ReservationVector{
 		Project:    project,
-		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: s.capacity.MemChargeFor(memDelta),
+		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: hostMem,
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {

@@ -1098,7 +1098,7 @@ admission check cannot disagree.
 
 Admission runs wherever a host's usage can GROW: VM **create**, **start**, live
 **resize**, and a `--restart-if-needed` **reconfigure** that grows the VM. Usage
-counts running VMs, so a stopped VM consumes nothing until it starts — checking
+counts running VMs and those in `starting`, so a stopped VM consumes nothing until it starts — checking
 only at create time would be sidestepped by creating VMs that each fit and then
 starting them all. A shrink never consumes anything and is never refused.
 Automated recovery is deliberately exempt: the failover/reconciler restart paths

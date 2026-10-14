@@ -12,6 +12,8 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
+	"github.com/litevirt/litevirt/internal/apimeta"
 )
 
 // PrintHostInspect prints detailed host info as JSON.
@@ -59,8 +61,8 @@ func PrintVMInspect(ctx context.Context, c pb.LiteVirtClient, name string) error
 		return err
 	}
 	// The daemon answered from its replica because the VM's host did not
-	// (grpcapi.InspectStaleHeader). On stderr, so the JSON stays parseable.
-	for _, n := range hdr.Get("x-litevirt-inspect-stale") {
+	// (apimeta.InspectStaleHeader). On stderr, so the JSON stays parseable.
+	for _, n := range hdr.Get(apimeta.InspectStaleHeader) {
 		fmt.Fprintf(os.Stderr, "note: %s\n", n)
 	}
 	return nil

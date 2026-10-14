@@ -60,6 +60,7 @@
       </div>
     </div>
   </div>
+  {{with .InspectStale}}<div class="alert alert-warn">{{.}}</div>{{end}}
 
   {{if eq .VM.State.String "VM_RUNNING"}}
   <!-- Live resource usage + charts. Kept OUTSIDE #vm-detail and self-refreshing

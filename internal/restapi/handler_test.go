@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -973,7 +974,7 @@ func TestInspectVM_Success(t *testing.T) {
 // Mutation: drop the header pass-through — the response carries no note.
 func TestInspectVM_StaleNotePassedThrough(t *testing.T) {
 	s, mock := newMockServer("test-token")
-	mock.inspectVMHeader = metadata.Pairs("x-litevirt-inspect-stale", "host node-1 did not answer")
+	mock.inspectVMHeader = metadata.Pairs(apimeta.InspectStaleHeader, "host node-1 did not answer")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/vms/vm1", nil)
 	req.Header.Set("Authorization", "Bearer test-token")
 	rec := httptest.NewRecorder()

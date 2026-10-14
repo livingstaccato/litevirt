@@ -11,6 +11,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
+	"github.com/litevirt/litevirt/internal/apimeta"
 )
 
 // hangingInspectPeer is an owner that accepted the connection and never
@@ -61,9 +63,9 @@ func TestInspectVM_OwnerUnreachableAnswersFromTheReplica(t *testing.T) {
 	if vm.Name != "cut-vm" || vm.HostName != "node-1" || vm.State != pb.VMState_VM_STOPPED {
 		t.Errorf("answer = %s on %s (%v), want this node's record: cut-vm on node-1, stopped", vm.Name, vm.HostName, vm.State)
 	}
-	note := strings.Join(st.hdr.Get(InspectStaleHeader), " ")
+	note := strings.Join(st.hdr.Get(apimeta.InspectStaleHeader), " ")
 	if !strings.Contains(note, "node-1") {
-		t.Errorf("header %s = %q, want a note naming the unreachable owner node-1", InspectStaleHeader, note)
+		t.Errorf("header %s = %q, want a note naming the unreachable owner node-1", apimeta.InspectStaleHeader, note)
 	}
 }
 

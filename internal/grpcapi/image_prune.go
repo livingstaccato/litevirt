@@ -1086,10 +1086,23 @@ func (s *Server) holdImage(name string) (release func()) {
 // so no prune removes the file it is built on in between. Once written, the
 // overlay is a regular file in <data_dir>/disks, which every prune's scan
 // walks.
+//
+// The hold is taken within recreateHoldWait: a prune holds the hold lock
+// across an unlink (removeUnheldImageFile), and one on an image store that
+// does not answer must not stall the reconciler's whole pass. Not taken in
+// time, the rebuild fails transiently, and a later pass retries it.
 func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
-	defer s.holdImage(imageName)()
+	release, ok := s.imagePrune.holdWithin(imageName, recreateHoldWait)
+	if !ok {
+		return "", fmt.Errorf("image %q: an image prune on this host has held the image lock for %s (its image store may not be answering); the rebuild is retried",
+			imageName, recreateHoldWait)
+	}
+	defer release()
 	return s.imageStore().CreateOverlayDisk(vmName, diskName, imageName, size)
 }
+
+// recreateHoldWait bounds RecreateOverlayDisk's wait for the hold lock.
+var recreateHoldWait = 30 * time.Second
 
 // holdImagePublish marks a pull, import or build of image name in flight
 // until release is called: from before its content is published until its
@@ -1103,6 +1116,47 @@ func (s *Server) holdImagePublish(name string) (release func()) {
 func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.holdLocked(name, publish)
+}
+
+// holdWithin is a disk create's hold, taken only if the lock is had within
+// d. Its release does not wait on the lock either: one it cannot take at
+// once is done in the background (the hold then lasts a little longer,
+// which is the safe direction).
+func (p *imagePruneState) holdWithin(name string, d time.Duration) (release func(), ok bool) {
+	deadline := time.Now().Add(d)
+	for !p.mu.TryLock() {
+		if !time.Now().Before(deadline) {
+			return nil, false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = p.holdLocked(name, false) // released below, without waiting on the lock
+	p.mu.Unlock()
+	dec := func() { // p.mu held
+		if p.holds[name]--; p.holds[name] <= 0 {
+			delete(p.holds, name)
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if p.mu.TryLock() {
+				dec()
+				p.mu.Unlock()
+				return
+			}
+			go func() {
+				p.mu.Lock()
+				dec()
+				p.mu.Unlock()
+			}()
+		})
+	}, true
+}
+
+// holdLocked is hold with p.mu held.
+func (p *imagePruneState) holdLocked(name string, publish bool) (release func()) {
 	if p.holds == nil {
 		p.holds, p.pubs, p.gens, p.cgens = map[string]int{}, map[string]int{}, map[string]uint64{}, map[string]uint64{}
 	}

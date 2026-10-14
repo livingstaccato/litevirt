@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -67,5 +68,44 @@ func TestRecreateOverlayDisk_HoldsTheImageAgainstAPrune(t *testing.T) {
 	}
 	if !exists(older) {
 		t.Fatal("removed once the scan could see the disk built on it")
+	}
+}
+
+// m-4: a prune holds the hold lock across an unlink, which on an image store
+// that does not answer does not return. The reconciler's rebuild waits for
+// the lock only so long, then fails transiently (a later pass retries),
+// instead of stalling the reconciler's whole pass; it builds nothing.
+//
+// Mutation: take the hold unbounded (holdImage) — the rebuild waits until
+// the lock is let go: red.
+func TestRecreateOverlayDisk_DoesNotWaitOnAStuckPrune(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	importVersion(t, s, "ubuntu", "A ")
+	prev := recreateHoldWait
+	recreateHoldWait = 100 * time.Millisecond
+	t.Cleanup(func() { recreateHoldWait = prev })
+
+	s.imagePrune.mu.Lock() // a prune stuck in an unlink
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			s.imagePrune.mu.Unlock()
+		}
+	}()
+	err := within(t, 5*time.Second, "a rebuild while a prune holds the lock", func() error {
+		_, err := s.RecreateOverlayDisk("web", "root", "ubuntu", "1048576")
+		return err
+	})
+	if err == nil {
+		t.Fatal("the rebuild went ahead without the image's hold")
+	}
+	if exists(s.images.DiskPath("web", "root")) {
+		t.Error("a rebuild that did not get the hold built a disk")
+	}
+	s.imagePrune.mu.Unlock()
+	unlocked = true
+	if _, err := s.RecreateOverlayDisk("web", "root", "ubuntu", "1048576"); err != nil {
+		t.Fatalf("the rebuild once the prune let go: %v", err)
 	}
 }

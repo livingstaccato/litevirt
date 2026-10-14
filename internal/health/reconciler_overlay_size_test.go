@@ -76,3 +76,52 @@ func TestStartPendingVM_RecreatedOverlayKeepsTheRecordedSize(t *testing.T) {
 		})
 	}
 }
+
+// m-6: the rebuild goes through the overlay builder the daemon registers
+// (Server.RecreateOverlayDisk, which holds the image against a prune while it
+// builds), never a store of the reconciler's own.
+//
+// Mutation: build in image.NewStore(r.dataDir) whatever is registered — the
+// registered builder is never called.
+func TestStartPendingVM_RecreatedOverlayUsesTheRegisteredBuilder(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm-rb", HostName: "host-a", State: "pending",
+		Spec: `{"name":"vm-rb","cpu":1,"memory_mib":512}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	store := image.NewStore(dataDir)
+	if err := store.Init(); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	path := store.DiskPath("vm-rb", "root")
+	if err := corrosion.InsertDisk(ctx, db, corrosion.DiskRecord{
+		VMName: "vm-rb", DiskName: "root", HostName: "host-a",
+		Path: path, BackingImage: "base", SizeBytes: 1 << 30,
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("host-a", dataDir, db, fake)
+	r.SetAutoPullImage(func(context.Context, string) error {
+		return qcow2.Create(store.ImagePath("base"), 64<<20, nil)
+	})
+	var calls []string
+	r.SetRecreateOverlay(func(vm, disk, img, size string) (string, error) {
+		calls = append(calls, vm+"/"+disk+"/"+img+"/"+size)
+		return store.CreateOverlayDisk(vm, disk, img, size)
+	})
+
+	r.reconcile(ctx)
+
+	if want := "vm-rb/root/base/1073741824"; len(calls) != 1 || calls[0] != want {
+		t.Fatalf("registered builder calls = %v, want [%s]", calls, want)
+	}
+	if !startedOrDefined(fake, "vm-rb") {
+		vm, _ := corrosion.GetVM(ctx, db, "vm-rb")
+		t.Fatalf("the VM did not start; row = %q / %q", vm.State, vm.StateDetail)
+	}
+}

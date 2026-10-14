@@ -1248,6 +1248,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A cancel of a start records whether it was a proof-less transfer.
 	svc.SetStartTransferProbe(reconciler.IsDeferredTransfer)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
+	reconciler.SetRecreateOverlay(svc.RecreateOverlayDisk) // under an image hold (m-6)
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create

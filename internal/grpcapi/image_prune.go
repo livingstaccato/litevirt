@@ -1078,6 +1078,19 @@ func (s *Server) holdImage(name string) (release func()) {
 	return s.imagePrune.hold(name, false)
 }
 
+// RecreateOverlayDisk builds disk diskName of vmName again as an overlay on
+// image imageName's current file, at size (the backing image's when ""): the
+// failover reconciler's rebuild of a disk missing on this host. It is a disk
+// create like any other, in this host's one image store: it holds the image
+// (holdImage) from before the file is resolved until the overlay is written,
+// so no prune removes the file it is built on in between. Once written, the
+// overlay is a regular file in <data_dir>/disks, which every prune's scan
+// walks.
+func (s *Server) RecreateOverlayDisk(vmName, diskName, imageName, size string) (string, error) {
+	defer s.holdImage(imageName)()
+	return s.imageStore().CreateOverlayDisk(vmName, diskName, imageName, size)
+}
+
 // holdImagePublish marks a pull, import or build of image name in flight
 // until release is called: from before its content is published until its
 // catalog row is written, no file of name is removed as a deleted image's.

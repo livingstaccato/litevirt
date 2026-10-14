@@ -399,7 +399,7 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	}
 	detail := "project=" + project
 	if noop {
-		detail += " already stopped: nothing was running; the operator's stop is recorded"
+		detail += "; already stopped: nothing was running; the operator's stop is recorded"
 	}
 	s.audit(ctx, "ct.stop", req.Name, detail, "ok")
 	return &emptypb.Empty{}, nil

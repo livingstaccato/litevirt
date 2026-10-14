@@ -29,7 +29,7 @@ func notRunningLikeLibvirt(f *libvirtfake.Fake, other error) {
 	f.FailDestroyDomain = fail
 }
 
-// Lab 2 O-4: `lv stop` of a VM that is already stopped returned
+// `lv stop` of a VM that is already stopped returned
 // `Internal … domain is not running`. A stop is now idempotent, as a start of
 // a running VM is (StartVM heals the row and succeeds): the domain is not
 // running, so the stop is done. The operator's stop is recorded, so HA leaves
@@ -37,7 +37,7 @@ func notRunningLikeLibvirt(f *libvirtfake.Fake, other error) {
 //
 // Mutations: no not-running check — Internal: red. Any stop failure taken
 // as done — the running domain whose shutdown fails succeeds: red. The
-// active-state read's error taken as "not active" — red (review M4). The
+// active-state read's error taken as "not active" — red. The
 // no-op not marked in the event — red.
 func TestStopVM_AnAlreadyStoppedVMIsStopped(t *testing.T) {
 	for _, force := range []bool{false, true} {
@@ -72,7 +72,7 @@ func TestStopVM_AnAlreadyStoppedVMIsStopped(t *testing.T) {
 		}
 
 		// Whether the domain is active cannot be read: the stop's failure
-		// stands (review M4).
+		// stands.
 		seedNICVM(t, s, "vm3", "running")
 		fake.SetState("vm3", libvirtfake.StateShutdown)
 		fake.FailShutdownDomain = func(string) error { return errors.New("domain is not running") }
@@ -107,12 +107,13 @@ func startingVM(t *testing.T, s *Server, state string) {
 	notRunningLikeLibvirt(fake, nil)
 }
 
-// Fix round 2: a VM in pending or starting is being started (a failover's,
+// A VM in pending or starting is being started (a failover's,
 // an onboot's or a self-heal's start), and the reconciler will start its
 // domain. A stop that finds the domain not running yet answers
 // FailedPrecondition, saying the stop was not applied and what to do: a
 // success the start then overrides would be a false answer. Nothing is
-// changed: the row, no vm.stopped event. (Main answered Internal.)
+// changed: the row, no vm.stopped event. (Before this change the stop
+// answered Internal.)
 //
 // Mutation: pending/starting answered as a no-op success again — red.
 func TestStopVM_AVMBeingStartedRefusesTheStop(t *testing.T) {
@@ -140,6 +141,28 @@ func TestStopVM_AVMBeingStartedRefusesTheStop(t *testing.T) {
 	}
 }
 
+// A VM in migrating whose source domain is not running here may be running
+// on the target: a migration whose wait gave up can still finish. A stop is
+// refused with FailedPrecondition and nothing is changed. (Before this change
+// the stop answered Internal.)
+//
+// Mutation: migrating answered as a no-op success — red.
+func TestStopVM_AVMBeingMigratedRefusesTheStop(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		s := hotplugDiskServer(t)
+		startingVM(t, s, "migrating")
+		_, err := s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "vm1", Force: force})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "being migrated") ||
+			!strings.Contains(err.Error(), "not applied") {
+			t.Fatalf("force=%v: stop = %v, want FailedPrecondition saying it is being migrated and the stop was not applied", force, err)
+		}
+		vm, err := corrosion.GetVM(context.Background(), s.db, "vm1")
+		if err != nil || vm == nil || vm.State != "migrating" || vm.StateDetail == "operator-stop" {
+			t.Fatalf("force=%v: row %+v (%v), want it left migrating", force, vm, err)
+		}
+	}
+}
+
 // stoppedEventDetail is the detail of vm's newest vm.stopped event.
 func stoppedEventDetail(t *testing.T, s *Server, vm string) string {
 	t.Helper()
@@ -156,7 +179,7 @@ func stoppedEventDetail(t *testing.T, s *Server, vm string) string {
 	return ""
 }
 
-// Lab 2 C2 P-4: `lv ct stop` of a container that is already stopped returned
+// `lv ct stop` of a container that is already stopped returned
 // `Internal … lxc-stop … is not running`. It now succeeds and records the
 // operator's stop; a failed stop of a container that is running is still an
 // error.

@@ -328,15 +328,19 @@ func TestAuditVerifyHeaderMatchesTheClassification(t *testing.T) {
 		t.Errorf("fork-only output is mislabelled:\n%s", got)
 	}
 
-	real := &pb.VerifyAuditChainResponse{
-		RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true,
-		BadSignature: []string{"row-8: signature does not verify"},
-	}
-	out.Reset()
-	if err := reportAuditVerify(&out, real); err == nil {
-		t.Fatal("tampering must exit non-zero")
-	}
-	if got := out.String(); !strings.Contains(got, "AUDIT CHAIN TAMPERED") || strings.Contains(got, "FORKED —") {
-		t.Errorf("a real tamper finding lost its headline:\n%s", got)
+	// A real tamper finding keeps its headline, including when the response
+	// also claims Forked (the CLI does not trust that flag alone).
+	for _, forked := range []bool{false, true} {
+		real := &pb.VerifyAuditChainResponse{
+			RowsChecked: 12, BrokenAtId: "fork-1", BrokenAtKind: "forked", Tampered: true, Forked: forked,
+			BadSignature: []string{"row-8: signature does not verify"},
+		}
+		out.Reset()
+		if err := reportAuditVerify(&out, real); err == nil {
+			t.Fatal("tampering must exit non-zero")
+		}
+		if got := out.String(); !strings.Contains(got, "AUDIT CHAIN TAMPERED") || strings.Contains(got, "FORKED —") {
+			t.Errorf("forked=%v: a real tamper finding lost its headline:\n%s", forked, got)
+		}
 	}
 }

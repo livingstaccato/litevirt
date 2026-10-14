@@ -52,14 +52,27 @@ func (s *Server) removeStackBridgeIfUnused(ctx context.Context, name string) {
 		return
 	}
 	for _, n := range names {
-		s.removeBridgeIfUnusedHere(n)
+		s.removeBridgeIfUnusedHere(ctx, n)
 	}
 }
 
-func (s *Server) removeBridgeIfUnusedHere(netName string) {
+func (s *Server) removeBridgeIfUnusedHere(ctx context.Context, netName string) {
 	// The device is the flat-bridge name for the network: the network's own
 	// name when it fits IFNAMSIZ, a stable hashed form otherwise.
 	name := network.FlatBridgeName(netName)
+	// The NIC rows above are VMs' only. A workload on this host still naming
+	// the bridge — a container on it by an interface row or a raw `bridge=`
+	// NIC, which only its create spec records — keeps it, as it keeps a
+	// network teardown's bridge; so does an answer that cannot be read.
+	if s.db != nil {
+		if who, err := network.BridgeNamedByWorkload(ctx, s.db, s.hostName, netName, name); err != nil {
+			slog.Warn("leftover stack bridge kept: cannot read this host's workload NICs", "bridge", name, "error", err)
+			return
+		} else if who != "" {
+			slog.Debug("leftover stack bridge kept: a workload on this host attaches to it", "bridge", name, "workload", who)
+			return
+		}
+	}
 	removed, err := s.networkProvisioner().RemoveUnusedBridge(name)
 	switch {
 	case err != nil:

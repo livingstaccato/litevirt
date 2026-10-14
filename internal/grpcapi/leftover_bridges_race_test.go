@@ -122,7 +122,7 @@ func TestRemoveBridgeIfUnusedHere_FailureLoggedOnce(t *testing.T) {
 	defer slog.SetDefault(old)
 
 	for i := 0; i < 5; i++ {
-		s.removeBridgeIfUnusedHere("hc_bad")
+		s.removeBridgeIfUnusedHere(adminCtx(), "hc_bad")
 	}
 	if prov.calls != 5 {
 		t.Errorf("removal attempted %d times, want 5 (the pass still retries)", prov.calls)

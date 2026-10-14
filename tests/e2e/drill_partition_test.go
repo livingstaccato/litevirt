@@ -302,14 +302,18 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 
 	start, _ := l.partitionNamedOnly(minority, majority)
 
-	// The minority pauses: asserted.
+	// The minority stops executing: asserted. It pauses, or — the witness
+	// reaching both sides holds the lease and its fence of a minority host
+	// reaches through it — its host is powered off first, which stops the
+	// copy as surely (lab 1 2026-10-14: node-1 fenced 19 s after the split,
+	// 2 s before its pause was due).
 	pausedAt := waitEach(s, start, 2*minorityPauseBy, keys, func(r round, k string) bool {
-		return pausedState(r.state(home[k], k))
+		return pausedState(r.state(home[k], k)) || !contains(r.executing(k), home[k])
 	})
 	for _, k := range keys {
 		at, ok := pausedAt[k]
 		if !ok {
-			t.Errorf("%s never paused on %s within %v of the split (virsh)\n  %s", k, home[k], 2*minorityPauseBy, s.last())
+			t.Errorf("%s never paused or stopped on %s within %v of the split (virsh)\n  %s", k, home[k], 2*minorityPauseBy, s.last())
 			continue
 		}
 		if d := at.Sub(start); d > minorityPauseBy+sampleSlop {
@@ -706,7 +710,17 @@ func (l *lab) createStoppedVM(via, prefix string, hosts ...string) stoppedVM {
 			continue
 		}
 		sv := stoppedVM{name: made[h], host: h}
-		l.mustLV(via, "stop", sv.name)
+		// via's replica may not hold the row yet: the VM was created on h
+		// (NotFound right after a rollout, lab 1 2026-10-14).
+		for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(2 * time.Second) {
+			out, err := l.lv(via, "stop", sv.name)
+			if err == nil {
+				break
+			}
+			if !strings.Contains(out+err.Error(), "NotFound") || time.Now().After(deadline) {
+				l.t.Fatalf("lv stop %s on %s: %v\n%s", sv.name, via, err, out)
+			}
+		}
 		if !l.waitDomainState(h, sv.name, "shut off", 3*time.Minute) {
 			l.t.Fatalf("stopped test VM %s never shut off on %s (virsh)", sv.name, h)
 		}

@@ -201,7 +201,10 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 	go guestCompletesShutdown(l, src, vm, done)
 	out, err := l.lvTimeout(via, drainCLITimeout, "host", "drain", src)
 	close(done)
-	if err != nil && !strings.Contains(out, "drain incomplete") {
+	// "drain incomplete" is on stderr, in err: another VM on src that cannot
+	// move (lab 1's rc5-lcs, whose backing file is gone) fails the drain
+	// without bearing on this VM, whose own line is judged below.
+	if err != nil && !strings.Contains(out+err.Error(), "drain incomplete") {
 		t.Fatalf("drain %s: %v\n%s", src, err, out)
 	}
 	var line string

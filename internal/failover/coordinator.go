@@ -1477,7 +1477,8 @@ func (c *Coordinator) noteNotReportedPaused(host, kind string, names []string) {
 }
 
 // limitRecovery limits every recovery of host to only, for the rest of its
-// down-episode; nil lifts the limit.
+// down-episode; nil lifts the limit. A new list replaces the held names too:
+// the next recovery names again what the new list still leaves.
 func (c *Coordinator) limitRecovery(host string, only map[string]bool) {
 	if only == nil {
 		c.unlimitRecovery(host)
@@ -1487,11 +1488,12 @@ func (c *Coordinator) limitRecovery(host string, only map[string]bool) {
 		c.recoverOnly = map[string]map[string]bool{}
 	}
 	c.recoverOnly[host] = only
+	delete(c.unpausedHeld, host)
 }
 
 // unlimitRecovery lifts host's recovery limit: it is back in service, or an
-// operator's confirmation or a fence that proves it off vouches for every
-// workload on it.
+// operator's confirmation or a fence that proves it off (fence.ProofGrade)
+// vouches for every workload on it.
 func (c *Coordinator) unlimitRecovery(host string) {
 	delete(c.recoverOnly, host)
 	delete(c.unpausedHeld, host)
@@ -3046,8 +3048,11 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 		return
 	}
 	delete(c.pauseWaits, h.Name)
-	if !corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) {
-		// A fence that does not rest on the pause answers for every workload.
+	if fr.ProvedOff() {
+		// A fence that proves the host off answers for every workload on it.
+		// One that does not (best-effort in either form, a plain SSH request)
+		// keeps a bridged host's limit: it says nothing about the workloads
+		// the host was seen running and did not report pausing.
 		c.unlimitRecovery(h.Name)
 	}
 

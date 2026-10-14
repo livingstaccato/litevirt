@@ -189,7 +189,9 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	// recovery of the host (a claim retry above all) honours it, until the
 	// host is back, an operator or a proving fence vouches for it, or a later
 	// deadline replaces it. A later deadline at which nobody has seen the host
-	// answer lifts it, as fenceStillStands would.
+	// answer keeps to the host's list while its condition from this outage is
+	// readable, and lifts the limit when there is none, as fenceStillStands
+	// would.
 	c.limitRecovery(host, only)
 	c.recoverWorkloads(ctx, h)
 	return true
@@ -212,7 +214,9 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 // paused: its replicated partition_paused condition, open, and raised during
 // this outage, and then only the workloads it lists. A host that never paused
 // never raised it. When no observer has seen it answer, this is
-// fenceStillStands as before.
+// fenceStillStands as before, except that a condition from this outage that
+// is still readable keeps the recovery to the workloads it lists
+// (pausedThisOutage).
 //
 // On top of that, the host must not hold a voter majority by this node's
 // count: the voters whose latest verdict about it is an answer, of any age,
@@ -227,10 +231,12 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 //     has reported its pause failed, or no longer says it pauses;
 //   - the voter set is derived, or a newer generation is a reset
 //     (pauseVoterSets).
+//
+// In both, a limit this coordinator already holds for the host keeps to the
+// host's listed workloads as above (quietFallback).
 func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) (why string, only map[string]bool, ok bool) {
 	if !c.relyOnPartitionPause(ctx, h) {
-		why, ok = c.fenceStillStands(ctx, h.Name, at)
-		return why, nil, ok
+		return c.quietFallback(ctx, h.Name, at)
 	}
 	sets, explicit, err := c.pauseVoterSets(ctx, h.Name)
 	if err != nil {
@@ -239,8 +245,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		return "voter set unreadable", nil, false
 	}
 	if !explicit {
-		why, ok = c.fenceStillStands(ctx, h.Name, at)
-		return why, nil, ok
+		return c.quietFallback(ctx, h.Name, at)
 	}
 	if !c.observerStreakSpans(ctx, h.Name, at) {
 		return "no observer has watched the host stay down since the fence", nil, false
@@ -250,7 +255,7 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 	}
 	answered, quiet := c.answeredSince(ctx, h.Name, at)
 	if quiet {
-		return "", nil, true
+		return c.pausedThisOutage(ctx, h.Name, at, sets)
 	}
 	if answered == whyHealthUnreadable {
 		return answered, nil, false
@@ -261,6 +266,41 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 	}
 	return "", paused, true
 }
+
+// quietFallback is fenceStillStands, for a deadline that keeps its rule
+// (selfPauseStillStands). When it holds and this coordinator already limits
+// the host's recovery from earlier in the down-episode, the host's own word
+// still bounds what moves: pausedThisOutage, dating the outage over the voter
+// set this cycle decides on.
+func (c *Coordinator) quietFallback(ctx context.Context, host string, at time.Time) (string, map[string]bool, bool) {
+	why, ok := c.fenceStillStands(ctx, host, at)
+	if !ok || c.recoverOnly[host] == nil {
+		return why, nil, ok
+	}
+	return c.pausedThisOutage(ctx, host, at, []map[string]bool{c.scope.voters(host)})
+}
+
+// pausedThisOutage is the limit for a deadline at which no observer has seen
+// host answer since the fence. When host's own partition_paused condition
+// from this outage is readable (hostReportsItsPause), only the workloads it
+// lists move: the host may still run the rest, as when it judged one not
+// recoverable. With no such condition everything moves, as without a bridge.
+// An unreadable condition refuses.
+func (c *Coordinator) pausedThisOutage(ctx context.Context, host string, at time.Time, sets []map[string]bool) (string, map[string]bool, bool) {
+	paused, reason, ok := c.hostReportsItsPause(ctx, host, at, sets)
+	switch {
+	case ok:
+		return "", paused, true
+	case reason == whyPausedUnreadable:
+		return reason, nil, false
+	default:
+		return "", nil, true
+	}
+}
+
+// whyPausedUnreadable is hostReportsItsPause's reason when the condition
+// cannot be read.
+const whyPausedUnreadable = "its partition_paused condition is unreadable"
 
 // hostReportsItsPause reads host's own replicated partition_paused
 // condition. It holds when the condition is open, lists the workloads the
@@ -276,7 +316,7 @@ func (c *Coordinator) hostReportsItsPause(ctx context.Context, host string, at t
 	if err != nil {
 		slog.Warn("failover: partition_paused read for a partition-pause deadline failed", "host", host, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return nil, "its partition_paused condition is unreadable", false
+		return nil, whyPausedUnreadable, false
 	}
 	if !ok || cond.Lifecycle == corrosion.ConditionResolved {
 		return nil, "the host has not reported pausing anything", false

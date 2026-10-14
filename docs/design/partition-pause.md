@@ -507,9 +507,12 @@ All of this is in the failover coordinator (`internal/failover`).
      earlier than the outage began, and then only the workloads its evidence
      lists as paused. Every recovery of the host in that episode, a claim
      retry included, keeps to the list until the host is back, an operator
-     confirms it off or a fence proves it off. A later deadline at which no
-     observer has seen the host answer, a successor's after the bridge has
-     gone say, recovers everything, as without a bridge. The
+     confirms it off, a fence proves it off (IPMI or Redfish verified; a
+     best-effort or SSH fence does not), or the host is removed with such a
+     proof. A later deadline at which no observer has seen the host answer,
+     a successor's after the bridge has gone say, still keeps to the list
+     while that condition is readable, and recovers everything, as without
+     a bridge, when it is not. The
      outage begins, for a voter set of `n` with majority `q`, at the
      `(n−q+1)`-th earliest start among its voters' failing runs that span the
      fence: the host cannot have lost its majority before that many voters
@@ -529,7 +532,9 @@ All of this is in the failover coordinator (`internal/failover`).
      (`fenceStillStands`). So does any observer once the pause can no longer
      be relied on (§4.3: the host has since reported
      `partition_pause_failed`), since a host that answered was never
-     stopped.
+     stopped. When one of these deadlines passes quiet while this
+     coordinator already keeps the host to a list, it keeps to the list as
+     above.
 
    If either check fails, the wait is dropped and nothing is recovered. The
    host came back, it will resume itself (§3.5), and `recoverHosts` reactivates

@@ -279,17 +279,60 @@ func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 	cluster func(context.Context) (QuorumState, int, int),
 	region func(context.Context, string) (QuorumState, int, int),
 	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
+	return LostEveryDecisionQuorumUnder(ctx, NewDecisionPolicy(db), cluster, region, held)
+}
+
+// DecisionPolicy reads the failover scope and the voter regions at most once
+// each, for every quorum question one decision asks (a failover cycle): the
+// questions agree on one policy, and the reads are not repeated per question.
+// A read error is kept and answered again. Not safe for concurrent use.
+type DecisionPolicy struct {
+	db                     *corrosion.Client
+	scopeRead, regionsRead bool
+	scope                  corrosion.FailoverScopePolicy
+	scopeErr               error
+	regions                corrosion.VoterRegionSets
+	regionsErr             error
+}
+
+// NewDecisionPolicy is a DecisionPolicy over db, read on first use.
+func NewDecisionPolicy(db *corrosion.Client) *DecisionPolicy { return &DecisionPolicy{db: db} }
+
+// Scope is corrosion.GetFailoverScope, read once.
+func (p *DecisionPolicy) Scope(ctx context.Context) (corrosion.FailoverScopePolicy, error) {
+	if !p.scopeRead {
+		p.scope, p.scopeErr = corrosion.GetFailoverScope(ctx, p.db)
+		p.scopeRead = true
+	}
+	return p.scope, p.scopeErr
+}
+
+// VoterRegions is corrosion.VoterRegions, read once.
+func (p *DecisionPolicy) VoterRegions(ctx context.Context) (corrosion.VoterRegionSets, error) {
+	if !p.regionsRead {
+		p.regions, p.regionsErr = corrosion.VoterRegions(ctx, p.db)
+		p.regionsRead = true
+	}
+	return p.regions, p.regionsErr
+}
+
+// LostEveryDecisionQuorumUnder is LostEveryDecisionQuorum reading the failover
+// scope and voter regions through pol.
+func LostEveryDecisionQuorumUnder(ctx context.Context, pol *DecisionPolicy,
+	cluster func(context.Context) (QuorumState, int, int),
+	region func(context.Context, string) (QuorumState, int, int),
+	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
 	if held == nil {
 		held = func(_ context.Context, st QuorumState, _ string) bool { return st != QuorumNo }
 	}
 	if st, _, _ := cluster(ctx); held(ctx, st, QuorumScopeCluster) {
 		return false
 	}
-	scope, err := corrosion.GetFailoverScope(ctx, db)
+	scope, err := pol.Scope(ctx)
 	if err != nil || !scope.Region() || region == nil {
 		return true
 	}
-	vr, err := corrosion.VoterRegions(ctx, db)
+	vr, err := pol.VoterRegions(ctx)
 	if err != nil {
 		return true
 	}
@@ -323,17 +366,25 @@ func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
 func LostOwnRegionQuorum(ctx context.Context, db *corrosion.Client, self string,
 	region func(context.Context, string) (QuorumState, int, int),
 	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
+	return LostOwnRegionQuorumUnder(ctx, NewDecisionPolicy(db), self, region, held)
+}
+
+// LostOwnRegionQuorumUnder is LostOwnRegionQuorum reading the failover scope
+// and voter regions through pol.
+func LostOwnRegionQuorumUnder(ctx context.Context, pol *DecisionPolicy, self string,
+	region func(context.Context, string) (QuorumState, int, int),
+	held func(ctx context.Context, st QuorumState, scope string) bool) bool {
 	if region == nil {
 		return false
 	}
 	if held == nil {
 		held = func(_ context.Context, st QuorumState, _ string) bool { return st != QuorumNo }
 	}
-	scope, err := corrosion.GetFailoverScope(ctx, db)
+	scope, err := pol.Scope(ctx)
 	if err != nil || !scope.Region() {
 		return false
 	}
-	vr, err := corrosion.VoterRegions(ctx, db)
+	vr, err := pol.VoterRegions(ctx)
 	if err != nil {
 		return false
 	}

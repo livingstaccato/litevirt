@@ -166,6 +166,10 @@ type Coordinator struct {
 	// stopped holding from a new tenure (acquireLeaseTenure).
 	tenureTerm atomic.Int64
 	everHeld   atomic.Bool
+	// cyclePolicy is the failover scope and voter regions read once for the
+	// cycle in progress (run), nil outside one. Only the poll goroutine
+	// touches it.
+	cyclePolicy *health.DecisionPolicy
 	// leaseQuorumLost is whether the last lease attempt stood down because this
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
@@ -647,6 +651,11 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.stepDownGauges()
 		return
 	}
+	// One read of the failover scope and voter regions for the whole cycle:
+	// the lease's quorum stand-down, each renewal and the cycle's own
+	// decisions all ask it.
+	c.cyclePolicy = health.NewDecisionPolicy(c.db)
+	defer func() { c.cyclePolicy = nil }()
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
 	held, leaseErr := c.acquireLeaseResult(ctx)
@@ -688,7 +697,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// observers to reach N/2+1. Tightening it further (e.g. requiring fresh
 	// self-probes) creates a bootstrap hole where a just-started coordinator
 	// has no probe rows yet and refuses to act on any failure.
-	vr, err := corrosion.VoterRegions(ctx, c.db)
+	vr, err := c.cyclePolicy.VoterRegions(ctx)
 	if err != nil {
 		slog.Error("failover: read voter set", "error", err)
 		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
@@ -707,7 +716,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// decides against one policy. A policy this build cannot read or does not
 	// know fails the cycle CLOSED — guessing either scope could fence what the
 	// operator meant to protect.
-	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	scope, err := c.cyclePolicy.Scope(ctx)
 	if err != nil {
 		slog.Error("failover: read failover scope; deciding nothing this cycle", "error", err)
 		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
@@ -1690,8 +1699,18 @@ func (c *Coordinator) lostEveryDecisionQuorum(ctx context.Context) bool {
 	held := func(ctx context.Context, st health.QuorumState, scope string) bool {
 		return st == health.QuorumYes && (c.QuorumRegain == nil || !c.QuorumRegain(ctx, scope))
 	}
-	return health.LostOwnRegionQuorum(ctx, c.db, c.hostName, region, held) ||
-		health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region, held)
+	pol := c.policy()
+	return health.LostOwnRegionQuorumUnder(ctx, pol, c.hostName, region, held) ||
+		health.LostEveryDecisionQuorumUnder(ctx, pol, c.Gate.QuorumProof, region, held)
+}
+
+// policy is the failover scope and voter regions this cycle decides on, read
+// once per cycle (cyclePolicy); outside a cycle, a fresh read.
+func (c *Coordinator) policy() *health.DecisionPolicy {
+	if c.cyclePolicy != nil {
+		return c.cyclePolicy
+	}
+	return health.NewDecisionPolicy(c.db)
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,

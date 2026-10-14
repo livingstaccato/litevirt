@@ -190,7 +190,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},
 		{"unsigned after signed (a host that had begun signing produced an unsigned row):", resp.UnsignedAfterSigned},
-		{"orphaned (on a forked host, the row before it was deleted; no seq gap shows it):", resp.OrphanedRows},
+		{"orphaned (on a forked host, the row before it was deleted, or it was relinked; no seq gap shows it):", resp.OrphanedRows},
 	} {
 		if len(g.rows) == 0 {
 			continue

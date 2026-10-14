@@ -51,9 +51,15 @@ func importImageOn(t *testing.T, c *Cluster, n *Node, name string) string {
 // fleet runs without root, and the full read of /proc fails closed on every
 // other user's process, keeping every file. Every node runs in this process,
 // so a file any node holds open is still seen.
+//
+// It also sets the margin a prune keeps a deleted image's file within to one
+// nanosecond: these scenarios remove an image moments after importing it, and
+// the clock-skew floor (5 minutes) would keep every such file. The margin's
+// own fleet test sets it back.
 func imageRmFleet(c *Cluster) {
 	for _, n := range c.Nodes {
 		n.Server.SetImageOpenFilesForTest(grpcapi.OpenFilesOfThisProcessForTest)
+		n.Server.SetImageDeleteMarginForTest(time.Nanosecond)
 	}
 }
 

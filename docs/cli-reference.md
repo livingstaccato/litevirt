@@ -718,7 +718,20 @@ lv image rm <image>
 #     - a disk create, pull, import or build of the image is in flight, or a
 #       rebuild, rolling recreate or compose deploy update that recreates a VM
 #       from it: each holds the image it creates from, from before its
-#       teardown until its create returns.
+#       teardown until its create returns;
+#     - the file was published (or the same content imported again) less
+#       than 5 minutes before the delete, or after it — more when hosts have
+#       measured a larger clock skew: the deleting host's clock and this
+#       one's may differ by that much, so it may belong to an import of the
+#       name since the delete. A skew counts for a delete made up to an hour
+#       (plus the skew) after it was last measured. Each host keeps the
+#       skews it has seen in image-delete-skew.json in its data directory,
+#       so a skew still counts after its measurements age out (an hour) and
+#       across a restart. A delete time or publish time that cannot be read
+#       keeps the file too, and so does that file when it cannot be read,
+#       empty or corrupt (the host logs it at WARN; remove it to start it
+#       afresh). lv image rm again, after the time the
+#       reason names, removes it.
 #   The last check and the removal are one step against a create of the image:
 #   a create that begins afterwards finds no file. Each kept file is printed
 #   with its reason; once nothing uses it, lv image prune <image> --host <host>
@@ -728,6 +741,40 @@ lv image rm <image>
 #   again) keeps the file. The delete itself is never refused. The REST and
 #   web UI delete (DeleteImage) removes the files the same way, in the
 #   background, and logs each host's outcome.
+#   An import, pull or build under a deleted image's name, or a compose
+#   deploy's download of it, makes it a live image again on every host. A
+#   compose deploy lv gitops runs does too, for a deleted image the compose
+#   file still declares. A copy from a peer (lv image push, a VM create's or
+#   the reconciler's copy) does not: one of a deleted name is refused.
+#   An lv image rm stamped after one of them began wins on every host: where
+#   the delete has already arrived, the operation records nothing and leaves
+#   its copy for lv image prune. An lv image rm stamped before it began that
+#   has not reached its host when it records loses to it; "before" is by the
+#   two hosts' clocks. Two exceptions, where the operation's host has not
+#   received the delete when it records:
+#     - another import, pull, build, compose download or copy of the image,
+#       begun after this one, recorded first: an import, pull, build or
+#       compose download then records at that moment, and wins over a delete
+#       stamped before then. (A copy from a peer leaves the image's record
+#       to the newer one and records only its host's copy, when the newer
+#       record is of the same content. A copy of other content is not
+#       recorded: it fails, and the VM create or heal that made it copies
+#       the image again.) A newer record stamped ahead of this host's clock
+#       by more than 5 minutes fails the import, pull, build or compose
+#       download instead, naming the clock skew to correct.
+#     - lv image pull: its host's record of its copy is rewritten as the
+#       download progresses. The image stays deleted, but that host record,
+#       and the file, stay until lv image rm runs again when the delete was
+#       stamped before the pull finished: its record, or its last progress
+#       write, whichever is later.
+#
+#   The host's own record of its copy (the image's hosts in lv image ls,
+#   which peers pull from and placement reads) is revived on the other hosts
+#   only once the cluster upgrade has finished (lv cluster upgrade-status).
+#   Before that the record reads deleted on every host, this one too once
+#   anti-entropy runs, so no peer pulls the copy and placement does not see
+#   it; the host logs this at WARN, and importing the image again after the
+#   upgrade publishes the copy.
 ```
 
 `pull` and `import` accept only standalone images. A qcow2 that names a

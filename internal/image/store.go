@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -17,6 +18,98 @@ import (
 type Store struct {
 	imageDir string
 	diskDir  string
+
+	// names serialises the moves of each image's current pointer: Publish
+	// and Withdraw hold the name's lock from reading which file is current
+	// to re-pointing the name, and RemoveImageFile from its checks to the
+	// removal (lockName).
+	names     nameLocks
+	testHooks struct {
+		nameContended   func(name string) // a lockName that has to wait
+		withdrawChecked func()            // Withdraw found its file current, under the lock
+	}
+}
+
+// nameLocks is a mutex per image name, held only while one exists, and the
+// withdrawal targets pending per name (PublishWithdrawable).
+//
+// Lock order: a caller's lock (the prune's imagePrune.mu) → a name's lock →
+// mu. A name's lock is a leaf to everything outside the store: nothing but mu
+// is taken under it — no other name's lock, no lock of a caller. mu is held
+// only to find or drop a name's entry or a pending target, with no I/O, and
+// never while waiting for a name's lock.
+type nameLocks struct {
+	mu      sync.Mutex
+	m       map[string]*nameLock
+	pending map[string]map[string]int // name → file → withdrawals that may point the name back at it
+}
+
+// addPending records that a withdrawal may point name back at f.
+func (l *nameLocks) addPending(name, f string) (release func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pending == nil {
+		l.pending = map[string]map[string]int{}
+	}
+	if l.pending[name] == nil {
+		l.pending[name] = map[string]int{}
+	}
+	l.pending[name][f]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			if l.pending[name][f]--; l.pending[name][f] <= 0 {
+				delete(l.pending[name], f)
+			}
+			if len(l.pending[name]) == 0 {
+				delete(l.pending, name)
+			}
+		})
+	}
+}
+
+// isPending reports whether a withdrawal may point name back at f.
+func (l *nameLocks) isPending(name, f string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.pending[name][f] > 0
+}
+
+type nameLock struct {
+	sync.Mutex
+	refs int
+}
+
+// lockName takes image name's lock and returns its release.
+func (s *Store) lockName(name string) (unlock func()) {
+	l := &s.names
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*nameLock{}
+	}
+	nl := l.m[name]
+	if nl == nil {
+		nl = &nameLock{}
+		l.m[name] = nl
+	}
+	nl.refs++
+	l.mu.Unlock()
+	if !nl.TryLock() {
+		if hook := s.testHooks.nameContended; hook != nil {
+			hook(name)
+		}
+		nl.Lock()
+	}
+	return func() {
+		nl.Unlock()
+		l.mu.Lock()
+		if nl.refs--; nl.refs == 0 {
+			delete(l.m, name)
+		}
+		l.mu.Unlock()
+	}
 }
 
 // NewStore creates an image store rooted at the given data directory.

@@ -140,3 +140,45 @@ func TestPin_APinnedVersionIsNeverRemoved(t *testing.T) {
 		t.Error("a file outside the store was pinned")
 	}
 }
+
+// A publish that reuses a file — the current content again, or an earlier
+// version made current again — records the republish and keeps the file's
+// sha256 and first publish time (review round 1, m-2).
+func TestPublish_ReuseRecordsTheRepublish(t *testing.T) {
+	s := NewStore(t.TempDir())
+	_ = s.Init()
+	v1, v2 := []byte("version one"), []byte("version two")
+	p1, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := RecordedProvenance(p1.Path)
+	if !first.RepublishedAt.IsZero() {
+		t.Fatalf("a first publish records a republish: %+v", first)
+	}
+	check := func(what string, before Provenance) {
+		t.Helper()
+		got, ok := RecordedProvenance(p1.Path)
+		if !ok || got.SHA256 != first.SHA256 || !got.PublishedAt.Equal(first.PublishedAt) {
+			t.Fatalf("%s changed the record's identity or first publish: %+v, was %+v", what, got, first)
+		}
+		if !got.RepublishedAt.After(before.PublishedAt) || !got.RepublishedAt.After(before.RepublishedAt) {
+			t.Fatalf("%s did not record a later republish: %+v, before %+v", what, got, before)
+		}
+	}
+	// The current content again.
+	if _, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1)); err != nil {
+		t.Fatal(err)
+	}
+	check("publishing the current content again", first)
+	// An earlier version made current again.
+	if _, err := s.Publish("ubuntu", stage(t, s, v2), digestOf(v2)); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := RecordedProvenance(p1.Path)
+	p3, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil || p3.Path != p1.Path {
+		t.Fatalf("version one again = %+v, %v", p3, err)
+	}
+	check("publishing an earlier version again", before)
+}

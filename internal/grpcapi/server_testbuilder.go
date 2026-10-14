@@ -183,3 +183,45 @@ func OpenFilesOfThisProcessForTest(paths []string) (map[string]string, error) {
 	self := strconv.Itoa(os.Getpid())
 	return processesHoldingIn("/proc", func(pid string) bool { return pid == self }, paths)
 }
+
+// SetImageDeleteMarginForTest sets the margin the prune keeps a deleted
+// image's file within (imageDeleteMargin's floor): a fleet test that removes an
+// image moments after importing it removes the file at once.
+func (s *Server) SetImageDeleteMarginForTest(d time.Duration) {
+	s.imagePrune.deleteMargin.Store(int64(d))
+}
+
+// SetImageRecordHookForTest runs fn as an image operation begins recording
+// its copy (recordImage), before it reads the catalog row: a test deletes the
+// image there to land lv image rm inside the operation.
+func (s *Server) SetImageRecordHookForTest(fn func(name string)) {
+	if fn == nil {
+		s.imagePrune.recordHook.Store(nil)
+		return
+	}
+	s.SetImageRecordClockHookForTest(func(name, _ string) { fn(name) })
+}
+
+// SetImageRecordClockHookForTest is SetImageRecordHookForTest whose fn also
+// gets the catalog insert clock the record is about to be written at, reserved
+// as the operation began: a test orders two operations' records by it.
+func (s *Server) SetImageRecordClockHookForTest(fn func(name, clock string)) {
+	if fn == nil {
+		s.imagePrune.recordHook.Store(nil)
+		return
+	}
+	s.imagePrune.recordHook.Store(&fn)
+}
+
+// SetImagePushUnmarkedForTest makes PushImage omit its copy mark, as a build
+// before it did: the target must still take the push for a copy.
+func (s *Server) SetImagePushUnmarkedForTest(unmarked bool) {
+	s.imagePrune.pushUnmarked.Store(unmarked)
+}
+
+// AutoPullFromPeerForTest is an auto-pull's transfer from source (what
+// AutoPullImage runs once it has found no usable local file): two auto-pulls
+// that both checked before either published each run it.
+func (s *Server) AutoPullFromPeerForTest(ctx context.Context, name, source string) error {
+	return s.pullImageFromPeer(ctx, name, source)
+}

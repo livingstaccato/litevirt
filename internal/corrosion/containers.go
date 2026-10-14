@@ -248,6 +248,11 @@ func MintContainerPlacement(ctx context.Context, c *Client, host, name, current 
 	return applied, err
 }
 
+// containerPlacementMintSQL is MintContainerPlacement's compare-and-set: a
+// latch-gated shape (latchGatedShapes).
+const containerPlacementMintSQL = `UPDATE containers SET create_spec = ?, updated_at = ?
+		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND COALESCE(create_spec, '') = ?`
+
 // MintContainerPlacementSpec is MintContainerPlacement returning the create
 // spec it wrote.
 func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, current string) (string, bool, error) {
@@ -255,9 +260,7 @@ func MintContainerPlacementSpec(ctx context.Context, c *Client, host, name, curr
 		return "", false, nil
 	}
 	next, _ := WithNewPlacement(current)
-	n, err := c.ExecuteRowsStrict(ctx,
-		`UPDATE containers SET create_spec = ?, updated_at = ?
-		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND COALESCE(create_spec, '') = ?`,
+	n, err := c.ExecuteRowsStrict(ctx, containerPlacementMintSQL,
 		next, c.NowTS(), host, name, current)
 	if errors.Is(err, ErrNoRowsAffected) {
 		return "", false, nil

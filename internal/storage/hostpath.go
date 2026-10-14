@@ -188,6 +188,7 @@ var dataDirOwned = []string{
 	"partition-pause",           // health/partition_pause_store.go partitionPauseDir
 	"onboot-boot-id",            // health/onboot_boot.go onbootBootFile (and its .tmp, dataDirOwnedPrefixes)
 	"pending-audit",             // corrosion/pending_audit.go PendingAuditDirName
+	"image-delete-skew.json",    // grpcapi/image_delete_skew.go imageSkewHistoryFile (its temp is a dot-name; an earlier build of it left a .tmp, dataDirOwnedPrefixes)
 	"audit-hold",                // corrosion/audit_hold.go AuditHoldDirName
 	"audit-seeded.json",         // corrosion/audit_seeded.go AuditSeededFileName
 	"audit-seeded-assert",       // corrosion/audit_seeded.go AuditSeededAssertFileName
@@ -223,7 +224,7 @@ var dataDirOwned = []string{
 // every dot-name, which is how the daemon names its temp files there
 // (secretfile.Write's .<name>.tmp, storage_pool_confine.go's
 // .pool-uploads.json-*).
-var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "."}
+var dataDirOwnedPrefixes = []string{"state.db-", "split_brain_activated.", "nowts.hwm.", "ct-idmap-ledger.", "onboot-boot-id.", "ceph-trash-purges.json.", "firewall-would-drop.json.", "image-delete-skew.json.", "."}
 
 // DataDirOwned returns the exact names of dataDirOwned.
 func DataDirOwned() []string { return slices.Clone(dataDirOwned) }

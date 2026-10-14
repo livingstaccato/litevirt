@@ -23,6 +23,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -430,23 +431,23 @@ func recordedImageName(backing string, names map[string]bool) string {
 }
 
 // deletedImages is the images (name's alone, when set) whose catalog row is
-// deleted on this host. With wait, it waits — up to deletedImageWait — for
-// the row of name to read deleted here: lv image rm deletes it on the host it
-// asks, and asks every host at once.
-func (s *Server) deletedImages(ctx context.Context, name string, wait bool) (map[string]bool, error) {
+// deleted on this host, each with its row's deleted_at. With wait, it waits —
+// up to deletedImageWait — for the row of name to read deleted here: lv image
+// rm deletes it on the host it asks, and asks every host at once.
+func (s *Server) deletedImages(ctx context.Context, name string, wait bool) (map[string]string, error) {
 	deadline := time.Now().Add(s.imagePrune.deleteWaitOr())
 	for {
-		rows, err := s.db.Query(ctx, `SELECT name FROM images WHERE deleted_at IS NOT NULL`)
+		rows, err := s.db.Query(ctx, `SELECT name, deleted_at FROM images WHERE deleted_at IS NOT NULL`)
 		if err != nil {
 			return nil, fmt.Errorf("read the image catalog: %w", err)
 		}
-		out := map[string]bool{}
+		out := map[string]string{}
 		for _, r := range rows {
 			if n := r.String("name"); name == "" || n == name {
-				out[n] = true
+				out[n] = r.String("deleted_at")
 			}
 		}
-		if !wait || name == "" || out[name] || !time.Now().Before(deadline) {
+		if _, ok := out[name]; !wait || name == "" || ok || !time.Now().Before(deadline) {
 			return out, nil
 		}
 		select {
@@ -826,14 +827,22 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	for _, n := range listed {
 		present[n] = true
 	}
-	deleted, err := s.deletedImages(ctx, name, justDeleted && present[name])
+	deletedAt, err := s.deletedImages(ctx, name, justDeleted && present[name])
 	if err != nil {
 		return out, err
 	}
-	for n := range deleted {
-		if !present[n] {
-			delete(deleted, n)
+	deleted := map[string]bool{}
+	for n := range deletedAt {
+		if present[n] {
+			deleted[n] = true
 		}
+	}
+	// Each delete's margin, from its own time (imageDeleteMargin); one that
+	// cannot be had keeps the image's files.
+	margins := map[string]time.Duration{}
+	marginErr := map[string]error{}
+	for n := range deleted {
+		margins[n], marginErr[n] = s.imageDeleteMargin(ctx, deletedAt[n])
 	}
 	if hook := s.imagePrune.afterCatalog; hook != nil {
 		hook()
@@ -908,6 +917,13 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 				out.noteSharedKept(f)
 				continue
 			}
+		} else if err := marginErr[n]; err != nil {
+			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: fmt.Sprintf(
+				"the clock skews this host has seen cannot be read (%v), so whether the file was published before its image's delete cannot be told", err)})
+			continue
+		} else if why := publishedAfterDelete(n, f, deletedAt[n], margins[n]); why != "" {
+			out.kept = append(out.kept, &pb.KeptImageFile{Path: f, Reason: why})
+			continue
 		} else if why := sc.deletedKeep(f, r, n, snap[n], version != ""); why != "" {
 			if why == sc.storeFS {
 				why += sharedKeptHint(n, f, s.hostName)
@@ -942,6 +958,57 @@ func (s *Server) pruneImages(ctx context.Context, name string, dryRun, justDelet
 	return out, nil
 }
 
+// imageDeleteMarginFloor is the least margin publishedAfterDelete keeps a
+// deleted image's file within: hlc.MaxSkewMS, the skew between two hosts'
+// clocks litevirt tolerates before it refuses a peer's timestamps.
+const imageDeleteMarginFloor = time.Duration(hlc.MaxSkewMS) * time.Millisecond
+
+// publishedAfterDelete is why file f of a deleted image is not the delete's
+// to remove ("" when it is). A delete removes what existed when it was made;
+// a file published since belongs to an import of the name after it — one
+// whose revival of the row has not reached this replica, or never will (an
+// older build's import left every replica on a stale tombstone: lab 2 F-1,
+// where a prune took a live image's current file).
+//
+// The two times are two hosts' wall clocks — deletedAt the deleting host's,
+// the publish time this host's — which may be apart by up to margin
+// (imageDeleteMargin). So the file is the delete's only when it was published
+// more than margin before the delete; one published at or after
+// deletedAt-margin is kept (review round 1, I-3). A delete recorded to the
+// second (an earlier build's) is read as its second's first instant, the
+// earliest it can have been made.
+//
+// Fail closed: a delete time or a publish time that cannot be read keeps f.
+// The publish time is the latest of f's provenance record's publish and
+// republish (a re-import of the same content, image.Store.Publish), else its
+// mtime (a file an earlier build published). A file kept only by this rule is
+// removed by lv image rm again once margin has passed since it was published.
+func publishedAfterDelete(name, f, deletedAt string, margin time.Duration) string {
+	del, err := time.Parse(time.RFC3339Nano, deletedAt)
+	if err != nil {
+		return fmt.Sprintf("its image's delete time %q cannot be read, so whether the file is older than the delete cannot be told", deletedAt)
+	}
+	var published time.Time
+	if p, ok := image.RecordedProvenance(f); ok && (!p.PublishedAt.IsZero() || !p.RepublishedAt.IsZero()) {
+		published = p.PublishedAt
+		if p.RepublishedAt.After(published) {
+			published = p.RepublishedAt
+		}
+	} else {
+		fi, err := os.Lstat(f)
+		if err != nil {
+			return fmt.Sprintf("its publish time cannot be read (%v), so whether the file is older than its image's delete cannot be told", err)
+		}
+		published = fi.ModTime()
+	}
+	if published.Before(del.Add(-margin)) {
+		return ""
+	}
+	return fmt.Sprintf("it was published at %s, within %s of its image's delete at %s or after it (two hosts' clocks may be that far apart): "+
+		"it may belong to an import of the name since the delete. If the image is meant to be gone, lv image rm %s again after %s removes it",
+		published.UTC().Format(time.RFC3339Nano), margin, deletedAt, name, published.Add(margin).UTC().Format(time.RFC3339))
+}
+
 // deletedKeep is why the scan keeps f, a file of deleted image n resolved to
 // r ("" when nothing does).
 //
@@ -970,10 +1037,12 @@ func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap, named bool) s
 }
 
 // removeUnheldImageFile removes file f of image n unless a disk create on n
-// is in flight (it may be building on f) or f became n's current file since
-// the scan. A file of a deleted image (deleted) is removed, its current file
-// too, only if no create, pull or import of n is in flight or began since the
-// scan's snapshot (held).
+// is in flight, was in flight at the scan's snapshot, or began since it (it
+// may be building on f, resolved while f was current, unseen by the scan), or
+// f is n's current file or a pending withdrawal's target now
+// (image.Store.RemoveImageFile). A file of a deleted image (deleted) is
+// removed, its current file too, only if no create, pull or import of n is in
+// flight or began since the scan's snapshot (held).
 func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSnap, deleted bool) error {
 	p := &s.imagePrune
 	p.mu.Lock()
@@ -982,6 +1051,12 @@ func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSn
 		return fmt.Errorf("a disk create on image %q is in flight", n)
 	}
 	if !deleted {
+		if held.cheld {
+			return fmt.Errorf("a disk create on image %q was in flight when the scan began; the next prune decides", n)
+		}
+		if p.cgens[n] != held.cgen {
+			return fmt.Errorf("a disk create on image %q started during the scan; the next prune decides", n)
+		}
 		if f == st.ImagePath(n) {
 			return fmt.Errorf("it is the current version now")
 		}
@@ -1016,11 +1091,13 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.holds == nil {
-		p.holds, p.pubs, p.gens = map[string]int{}, map[string]int{}, map[string]uint64{}
+		p.holds, p.pubs, p.gens, p.cgens = map[string]int{}, map[string]int{}, map[string]uint64{}, map[string]uint64{}
 	}
 	m := p.holds
 	if publish {
 		m = p.pubs
+	} else {
+		p.cgens[name]++
 	}
 	m[name]++
 	p.gens[name]++
@@ -1038,8 +1115,10 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 
 // holdSnap is an image's holds as a prune's scan began.
 type holdSnap struct {
-	gen  uint64 // holds ever taken on the image
-	held bool   // one was in flight
+	gen   uint64 // holds ever taken on the image
+	cgen  uint64 // disk-create holds ever taken on the image
+	held  bool   // one was in flight
+	cheld bool   // a disk-create hold was in flight
 }
 
 func (p *imagePruneState) snapshot() map[string]holdSnap {
@@ -1047,7 +1126,7 @@ func (p *imagePruneState) snapshot() map[string]holdSnap {
 	defer p.mu.Unlock()
 	out := map[string]holdSnap{}
 	for n, g := range p.gens {
-		out[n] = holdSnap{gen: g, held: p.holds[n] > 0 || p.pubs[n] > 0}
+		out[n] = holdSnap{gen: g, cgen: p.cgens[n], held: p.holds[n] > 0 || p.pubs[n] > 0, cheld: p.holds[n] > 0}
 	}
 	return out
 }
@@ -1316,6 +1395,7 @@ type imagePruneState struct {
 	holds map[string]int    // image → in-flight disk creates (holdImage)
 	pubs  map[string]int    // image → in-flight pulls, imports, builds (holdImagePublish)
 	gens  map[string]uint64 // image → holds ever taken, either kind
+	cgens map[string]uint64 // image → disk-create holds ever taken (holdImage)
 	bg    sync.WaitGroup    // background prunes after a refresh, and after DeleteImage
 
 	readDir  func(string) ([]os.DirEntry, error) // test seam; os.ReadDir when nil
@@ -1326,8 +1406,13 @@ type imagePruneState struct {
 	storeFS      func(string) (string, error)              // test seam; networkFilesystem when nil
 	afterScan    func()                                    // test seam: runs between the scan and the removals
 	afterCatalog func()                                    // test seam: runs after the catalog is read
+	prePublish   func(name string)                         // test seam: runs as ImportImage is about to publish
 	deleteWait   atomic.Int64                              // test seam (ns); deletedImageWait when 0
 	recentGrace  atomic.Int64                              // test seam (ns); imageRecreateGrace when 0, none when < 0
+	deleteMargin atomic.Int64                              // test seam (ns); imageDeleteMarginFloor when 0
+	recordHook   atomic.Pointer[func(name, clock string)]  // test seam: runs as recordImage begins
+	skew         imageSkewHistory                          // the clock skews this host has seen (imageDeleteMargin)
+	pushUnmarked atomic.Bool                               // test seam: PushImage omits its copy mark, as an earlier build's does
 
 	sharedNotified sync.Map // image -> time.Time: its last image.versions_kept notification (reportSharedKept)
 }

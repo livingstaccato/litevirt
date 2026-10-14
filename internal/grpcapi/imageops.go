@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -37,7 +38,14 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		tmpFile  *os.File
 		hasher   = sha256.New()
 		total    int64
+		// An operator's import may bring a deleted name back; a peer's
+		// copy (lv image push, an auto-pull, a heal) never does.
+		op     = imageOpImport
+		ticket *imageTicket
 	)
+	if isImageCopy(ctx) {
+		op = imageOpCopy
+	}
 
 	for {
 		req, err := stream.Recv()
@@ -65,6 +73,11 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			// Until the catalog row is written, no file of the image is
 			// removed as a deleted image's (holdImagePublish).
 			defer s.holdImagePublish(name)()
+			sd, err := s.imageOpStart(ctx, name, op)
+			if err != nil {
+				return err
+			}
+			ticket = sd
 
 			destDir := filepath.Join(s.dataDir, "images")
 			os.MkdirAll(destDir, 0755)
@@ -121,34 +134,44 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	// recorded identity (image.Store.Publish). A peer's push (the
 	// reconciler's heal, autoPullImage) arrives here too.
 	s.recordImageProvenance(ctx, name)
-	pub, err := s.images.Publish(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
+	if hook := s.imagePrune.prePublish; hook != nil {
+		hook(name)
+	}
+	// Until the record decides whether this copy is stale, the file it would
+	// be withdrawn to is not removed.
+	pub, releasePrev, err := s.images.PublishWithdrawable(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
 	if err != nil {
 		return status.Errorf(codes.Internal, "publish image: %v", err)
 	}
+	defer releasePrev()
 	destPath := pub.Path
 	s.imagePublished(ctx, name, pub)
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, op, ticket, corrosion.ImageRecord{
 		Name:      name,
 		Format:    format,
 		Checksum:  got,
 		SizeBytes: total,
 		SourceURL: "import",
-	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImage, err)
-		return status.Errorf(codes.Internal, "record image: %v", err)
-	}
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	}, corrosion.ImageHostRecord{
 		ImageName: name,
 		HostName:  s.hostName,
 		Path:      destPath,
 		Status:    "ready",
 		PulledAt:  now,
 	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImageHost, err)
-		return status.Errorf(codes.Internal, "record image host: %v", err)
+		if isStaleImageCopy(err) {
+			// Older content than the image's record (re-review 3, m-2): no
+			// new disk here is built on it. It stays as a superseded version,
+			// left to the next refresh's prune or lv image prune: a create
+			// may have resolved it while it was current.
+			if werr := s.images.Withdraw(name, pub.Path, pub.Prev); werr != nil {
+				slog.Warn("image: a copy of older content than the image's record is still its current file here", "image", name, "path", pub.Path, "error", werr)
+			}
+		}
+		return err
 	}
 
 	slog.Info("image imported", "name", name, "size", total)
@@ -208,8 +231,13 @@ func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImag
 
 	stream.Send(&pb.PushImageProgress{Status: "copying", ProgressPct: 0})
 
-	// Open ImportImage stream on the target.
-	importStream, err := client.ImportImage(ctx)
+	// Open ImportImage stream on the target, marked a copy: it never brings
+	// a deleted image's name back there (isImageCopy).
+	importCtx := metadata.AppendToOutgoingContext(ctx, imageCopyMDKey, "push")
+	if s.imagePrune.pushUnmarked.Load() {
+		importCtx = ctx
+	}
+	importStream, err := client.ImportImage(importCtx)
 	if err != nil {
 		return status.Errorf(codes.Internal, "open ImportImage stream on %s: %v", req.TargetHost, err)
 	}
@@ -256,7 +284,11 @@ func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImag
 	// Close and get response.
 	resp, err := importStream.CloseAndRecv()
 	if err != nil {
-		return status.Errorf(codes.Internal, "ImportImage on %s failed: %v", req.TargetHost, err)
+		code := status.Code(err)
+		if code == codes.Unknown {
+			code = codes.Internal
+		}
+		return status.Errorf(code, "ImportImage on %s failed: %v", req.TargetHost, err)
 	}
 
 	stream.Send(&pb.PushImageProgress{Status: "complete", ProgressPct: 100})
@@ -458,6 +490,13 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		return client.BuildImage(ctx, req)
 	}
 
+	// A build brings a deleted name back, as an import does; one whose row
+	// is deleted while it runs records nothing.
+	ticket, err := s.imageOpStart(ctx, req.ImageName, imageOpBuild)
+	if err != nil {
+		return nil, err
+	}
+
 	// Find the root disk.
 	disks, err := corrosion.GetVMDisks(ctx, s.db, req.VmName)
 	if err != nil || len(disks) == 0 {
@@ -516,25 +555,20 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
+	if err := s.recordImage(ctx, imageOpBuild, ticket, corrosion.ImageRecord{
 		Name:      req.ImageName,
 		Format:    "qcow2",
 		SourceURL: "build:" + req.VmName,
 		Checksum:  "sha256:" + digest,
 		SizeBytes: info.Size(),
-	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImage, err)
-		return nil, status.Errorf(codes.Internal, "record image: %v", err)
-	}
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
+	}, corrosion.ImageHostRecord{
 		ImageName: req.ImageName,
 		HostName:  s.hostName,
 		Path:      destPath,
 		Status:    "ready",
 		PulledAt:  now,
 	}); err != nil {
-		s.noteStateWriteFail(corrosion.OpImageHost, err)
-		return nil, status.Errorf(codes.Internal, "record image host: %v", err)
+		return nil, err
 	}
 
 	slog.Info("image built", "name", req.ImageName, "size", info.Size())

@@ -23,6 +23,10 @@ func TestImageAvailable_AgreesWithThePull(t *testing.T) {
 	}
 	add := func(img, host, status string) {
 		t.Helper()
+		// A host record names a source only under a live catalog row.
+		if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: img, Format: "qcow2"}); err != nil {
+			t.Fatal(err)
+		}
 		if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 			ImageName: img, HostName: host, Path: "/images/" + img, Status: status}); err != nil {
 			t.Fatal(err)

@@ -33,6 +33,8 @@ func TestRemoveImage_IsGatedAsDeleteImage(t *testing.T) {
 	_ = s.images.Init()
 	t.Cleanup(s.waitImagePrunes)
 	noSeams(s)
+	// Removed moments after its import: no clock-skew margin.
+	s.SetImageDeleteMarginForTest(time.Nanosecond)
 	carol := userCtx("carol", "operator") // bound VMOperator on one VM only
 	if err := s.RequirePerm(carol, "/", "image.import", "operator"); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("the test needs an operator without image.import on /: %v", err)

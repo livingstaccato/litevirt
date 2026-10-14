@@ -197,14 +197,17 @@ func RepointContainerReplicationTarget(ctx context.Context, c *Client, g capabil
 	return RepointReplicationTarget(ctx, c, vmName, repo, from, to)
 }
 
+// replicationRepointSQL is RepointReplicationTarget's compare-and-set: a
+// latch-gated shape (latchGatedShapes).
+const replicationRepointSQL = `UPDATE backup_schedules SET target_host = ?, updated_at = ?
+		 WHERE vm_name = ? AND repo = ? AND target_host = ? AND deleted_at IS NULL`
+
 // RepointReplicationTarget sets a replication schedule's target_host to to
 // while it is from, and changes nothing else in the row: a compare-and-set, so
 // a concurrent edit of any other column on another node survives it. applied
 // is false when the row does not target from (any more).
 func RepointReplicationTarget(ctx context.Context, c *Client, vmName, repo, from, to string) (bool, error) {
-	n, err := c.ExecuteRowsStrict(ctx,
-		`UPDATE backup_schedules SET target_host = ?, updated_at = ?
-		 WHERE vm_name = ? AND repo = ? AND target_host = ? AND deleted_at IS NULL`,
+	n, err := c.ExecuteRowsStrict(ctx, replicationRepointSQL,
 		to, c.NowTS(), vmName, repo, from)
 	if errors.Is(err, ErrNoRowsAffected) {
 		return false, nil

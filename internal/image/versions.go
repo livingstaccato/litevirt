@@ -158,6 +158,13 @@ func identityPath(path string) string { return path + ".sha256" }
 type Provenance struct {
 	SHA256      string    `json:"sha256"`
 	PublishedAt time.Time `json:"published_at"`
+	// RepublishedAt is the last time this same content was published again
+	// under the image — a re-import or pull of identical bytes, which reuses
+	// the file (Publish) — or zero. PublishedAt stays when the file was
+	// written: a restore asks whether the file is unchanged since a backup,
+	// and a republish changes nothing in it. A prune asks whether the file
+	// belongs to an import since the image's delete, and reads both.
+	RepublishedAt time.Time `json:"republished_at,omitempty"`
 }
 
 // RecordedProvenance is path's provenance record; ok is false when it has
@@ -213,6 +220,18 @@ func recordProvenance(path string, p Provenance) error {
 
 func recordDigest(path, digest string) error {
 	return recordProvenance(path, Provenance{SHA256: digest, PublishedAt: time.Now().UTC()})
+}
+
+// recordRepublished stamps path's provenance with RepublishedAt now: digest
+// was published again under the image and the file reused (review round 1,
+// m-2). Its sha256 and PublishedAt stay.
+func recordRepublished(path, digest string) error {
+	p, ok := RecordedProvenance(path)
+	if !ok || p.SHA256 != digest {
+		return fmt.Errorf("%s has no provenance record of this content", path)
+	}
+	p.RepublishedAt = time.Now().UTC()
+	return recordProvenance(path, p)
 }
 
 // EnsureProvenance gives a store file an earlier build published — one with
@@ -303,6 +322,10 @@ type Published struct {
 	// Superseded is the file that was current before, when this publish
 	// made a new version current ("" otherwise). It is left where it is.
 	Superseded string
+	// Prev is the image's current file as this publish read it, under the
+	// name's lock ("" when there was none): what Withdraw points the name
+	// back to. It is Path when this publish made nothing current.
+	Prev string
 	// Healed lists the files of the image whose bytes had stopped matching
 	// their recorded identity — this content — and were put back from it.
 	Healed []string
@@ -325,14 +348,28 @@ type Published struct {
 //
 // tmp is consumed (moved, or removed) on success.
 func (s *Store) Publish(name, tmp, digest string) (Published, error) {
+	pub, _, err := s.publish(name, tmp, digest, false)
+	return pub, err
+}
+
+// PublishWithdrawable is Publish for an operation that may yet find its
+// content stale and Withdraw it: until release is called, RemoveImageFile
+// refuses the file it would withdraw to (Published.Prev). release is never
+// nil, and is called once the operation has withdrawn or kept its file.
+func (s *Store) PublishWithdrawable(name, tmp, digest string) (pub Published, release func(), err error) {
+	return s.publish(name, tmp, digest, true)
+}
+
+func (s *Store) publish(name, tmp, digest string, withdrawable bool) (Published, func(), error) {
+	nop := func() {}
 	if err := safename.ValidateImageName(name); err != nil {
-		return Published{}, err
+		return Published{}, nop, err
 	}
 	if !validDigest(digest) {
-		return Published{}, fmt.Errorf("publish image %q: digest %q is not a sha256", name, digest)
+		return Published{}, nop, fmt.Errorf("publish image %q: digest %q is not a sha256", name, digest)
 	}
 	if filepath.Dir(tmp) != filepath.Clean(s.imageDir) {
-		return Published{}, fmt.Errorf("publish image %q: %s is not in the image directory", name, tmp)
+		return Published{}, nop, fmt.Errorf("publish image %q: %s is not in the image directory", name, tmp)
 	}
 	var healed []string
 	for _, f := range s.ImageFiles(name) {
@@ -344,44 +381,60 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 			continue
 		}
 		if err := s.healWith(tmp, f); err != nil {
-			return Published{}, fmt.Errorf("heal %s: %w", f, err)
+			return Published{}, nop, fmt.Errorf("heal %s: %w", f, err)
 		}
 		healed = append(healed, f)
 	}
 
+	// From reading the current file to re-pointing the name, one step
+	// against a Withdraw of the name (lockName).
+	defer s.lockName(name)()
 	cur := s.ImagePath(name)
 	if _, err := os.Lstat(cur); errors.Is(err, fs.ErrNotExist) {
 		cur = "" // the image's first content: nothing is superseded
 	} else if err != nil {
-		return Published{}, err
+		return Published{}, nop, err
 	}
 
 	if rec, ok := RecordedDigest(cur); cur != "" && ok && rec == digest {
 		_ = os.Remove(tmp)
-		return Published{Path: cur, Healed: healed, Digest: digest}, nil
+		if err := recordRepublished(cur, digest); err != nil {
+			return Published{}, nop, fmt.Errorf("record the republish of %s: %w", cur, err)
+		}
+		return Published{Path: cur, Prev: cur, Healed: healed, Digest: digest}, nop, nil
 	}
 
 	ver := filepath.Join(s.imageDir, name+"@"+digest[:versionHexLen]+".qcow2")
 	if err := linkNoReplace(tmp, ver); err != nil {
 		if !errors.Is(err, fs.ErrExist) {
-			return Published{}, err
+			return Published{}, nop, err
 		}
 		// That version is already published: reuse it only if it is this
 		// content by its record.
 		if rec, ok := RecordedDigest(ver); !ok || rec != digest {
-			return Published{}, fmt.Errorf("image %q: %s exists and is not this content; refusing", name, ver)
+			return Published{}, nop, fmt.Errorf("image %q: %s exists and is not this content; refusing", name, ver)
 		}
 		_ = os.Remove(tmp)
+		if err := recordRepublished(ver, digest); err != nil {
+			return Published{}, nop, fmt.Errorf("record the republish of %s: %w", ver, err)
+		}
 	} else if err := recordDigest(ver, digest); err != nil {
-		return Published{}, fmt.Errorf("record identity of %s: %w", ver, err)
+		return Published{}, nop, fmt.Errorf("record identity of %s: %w", ver, err)
 	}
 	if err := s.setCurrent(name, filepath.Base(ver)); err != nil {
-		return Published{}, err
+		return Published{}, nop, err
 	}
+	prev := cur
 	if cur == ver {
 		cur = ""
 	}
-	return Published{Path: ver, Superseded: cur, Healed: healed, Digest: digest}, nil
+	release := nop
+	if withdrawable && prev != "" && prev != ver {
+		// Registered under the name's lock, before any RemoveImageFile of
+		// the name can look.
+		release = s.names.addPending(name, prev)
+	}
+	return Published{Path: ver, Superseded: cur, Prev: prev, Healed: healed, Digest: digest}, release, nil
 }
 
 // healWith puts a copy of src over the image file f, whose recorded identity
@@ -438,6 +491,41 @@ func (s *Store) setCurrent(name, base string) error {
 	return nil
 }
 
+// Withdraw takes path, a file of image name that Publish has just made its
+// current file, back from being current: an image operation that published it
+// found it is not the content the image's record names (grpcapi
+// staleImageCopyError). The name points again at prev — the publish's
+// Published.Prev, the file current as it read it under the name's lock — a
+// version, or the image's first file (prev that file, or "" when there was
+// none: the pointer is removed). The file itself stays,
+// as a superseded version, for the prune to remove once no disk is built on
+// it. When path is no longer the current file (another publish since), nothing
+// changes.
+func (s *Store) Withdraw(name, path, prev string) error {
+	if prev == path {
+		return nil // Publish made nothing current: the content was already
+	}
+	// The check that path is still current and the re-point are one step
+	// against a Publish of the name (lockName), which a re-point here would
+	// otherwise revert.
+	defer s.lockName(name)()
+	if cur, ok := s.currentVersion(name); !ok || cur != path {
+		return nil
+	}
+	if hook := s.testHooks.withdrawChecked; hook != nil {
+		hook()
+	}
+	if prev != "" && isVersionFile(name, filepath.Base(prev)) && filepath.Dir(prev) == filepath.Clean(s.imageDir) {
+		if fi, err := os.Lstat(prev); err == nil && fi.Mode().IsRegular() {
+			return s.setCurrent(name, filepath.Base(prev))
+		}
+	}
+	if err := os.Remove(s.pointerPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("withdraw image %q's current version %s: %w", name, path, err)
+	}
+	return nil
+}
+
 // ImageFiles is every file of image name in the store: its first content and
 // each published version.
 func (s *Store) ImageFiles(name string) []string {
@@ -458,13 +546,20 @@ func (s *Store) ImageFiles(name string) []string {
 }
 
 // RemoveImageFile removes one superseded file of image name and its identity
-// record. The current file is never removed here.
+// record. The current file is never removed here, nor a file a withdrawal may
+// point the name back at (PublishWithdrawable).
 func (s *Store) RemoveImageFile(name, path string) error {
 	if !IsImageFile(s.imageDir, name, path) {
 		return fmt.Errorf("%s is not a file of image %q", path, name)
 	}
+	// The checks and the removal are one step against a Publish or Withdraw
+	// of the name (lockName).
+	defer s.lockName(name)()
 	if path == s.ImagePath(name) {
 		return fmt.Errorf("%s is image %q's current file", path, name)
+	}
+	if s.names.isPending(name, path) {
+		return fmt.Errorf("%s is the file image %q may be withdrawn to (a copy in flight)", path, name)
 	}
 	if Pinned(path) {
 		return fmt.Errorf("%s is pinned: a backup was taken on it", path)

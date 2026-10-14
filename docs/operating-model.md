@@ -218,7 +218,11 @@ of acting — it says nothing about whether the resulting rows have replicated.
   (the cluster-wide one, and under region scope every region's) neither takes
   nor renews the failover lease, nor the rebalancer's or the dual-run
   detector's, so a lease held in a minority lapses even on a host that reaches
-  both sides, and the majority can take it over. Read "only
+  both sides, and the majority can take it over. Under region scope a node
+  cut off from its own region's majority (in a region of at least three
+  voters) does not hold the failover lease either. A node without the
+  majority still runs the dual-run detector without its lease, observe-only:
+  it records what it finds and resolves nothing. Read "only
   one coordinator acts" as the intended end state of the exclusivity work, not
   as something the current code guarantees. What the code *does* guarantee is
   that a split with a healthy network does not last: when several survivors

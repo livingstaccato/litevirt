@@ -212,7 +212,7 @@ func (s *Server) applyConditionLifecycle(
 			row.CleanCount = 0
 			row.LastSeen = now
 			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
-			if row.ObserveCount >= dualRunDebounce {
+			if row.ObserveCount >= dualRunDebounce && (!rc.observeOnly || rc.ownPrev[f]) {
 				row.Lifecycle = corrosion.ConditionConfirmed
 				row.Severity = confirmedSeverity(f.kind)
 				row.ConfirmedAt = now
@@ -240,7 +240,10 @@ func (s *Server) applyConditionLifecycle(
 	// decision gate and complete coverage of the hosts that could hold the
 	// condition's subject. A quorum-less scan, or one blind to such a host,
 	// proves nothing about absence, so it neither resolves nor resets anything.
-	gateOK := s.resolveGateValid(ctx)
+	// An observe-only pass skips this whole loop rather than leaning on the
+	// gate: it began without the majority, and a majority that returned
+	// mid-pass would otherwise let it resolve from a snapshot taken without.
+	gateOK := !rc.observeOnly && s.resolveGateValid(ctx)
 	for f, row := range byIdentity {
 		if current[f] {
 			continue
@@ -273,11 +276,14 @@ func (s *Server) applyConditionLifecycle(
 	if !rc.complete {
 		coverage = corrosion.CoveragePartial
 	}
-	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
-		Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
-		Reporter: s.hostName, Detail: coverageDetail,
-	}); err != nil {
-		slog.Warn("dual-run detector: persist evaluator status", "error", err)
+	// The scan status is the leader's; a pass without the lease is not one.
+	if !rc.observeOnly {
+		if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+			Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
+			Reporter: s.hostName, Detail: coverageDetail,
+		}); err != nil {
+			slog.Warn("dual-run detector: persist evaluator status", "error", err)
+		}
 	}
 
 	// Gauges rebuild from the CONFIRMED conditions (the durable state), so a

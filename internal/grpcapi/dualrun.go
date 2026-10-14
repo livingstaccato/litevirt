@@ -169,13 +169,41 @@ type finding struct {
 // LIFECYCLE needs nothing here — it lives in health_conditions rows, so the new
 // leader's first pass continues the counts exactly where this one left them.
 func (s *Server) stepDownDualRun() {
+	s.setDualRunOwnSeen(nil)
 	s.dualRunMetrics.SetDetected(nil)
 	s.dualRunMetrics.SetProbeFailed(nil)
 }
 
+func (s *Server) setDualRunOwnSeen(seen map[finding]bool) {
+	s.dualRunOwnMu.Lock()
+	s.dualRunOwnSeen = seen
+	s.dualRunOwnMu.Unlock()
+}
+
+func (s *Server) dualRunOwnSeenLast() map[finding]bool {
+	s.dualRunOwnMu.Lock()
+	defer s.dualRunOwnMu.Unlock()
+	return s.dualRunOwnSeen
+}
+
+// observeDualRunWithoutLease is a detector pass on a node that has lost every
+// voter majority, so it holds no lease and none may (LeaseQuorumLost). When no
+// node holds the majority nobody holds the lease, and positive evidence is
+// recorded without quorum (dualrun_lifecycle.go), so each such node records
+// what it can reach. It is observe-only: it writes observed rows and refreshes
+// existing ones, confirms only what its own previous pass also saw, resolves
+// nothing, and leaves the evaluator's scan status to the leader. It can
+// therefore only refuse admission more, never re-open it.
+func (s *Server) observeDualRunWithoutLease(ctx context.Context) {
+	s.dualRunPass(ctx, true)
+}
+
 // RunDualRunDetector runs the leader-gated dual-run detector on a fixed interval. Only
 // the node holding the dual_run_detector lease does work; the rest hold no state and
-// keep their local gauges clear, so the fleet pages once (from the leader).
+// keep their local gauges clear, so the fleet pages once (from the leader). The one
+// exception is a node that has lost every voter majority: it may not hold the lease,
+// so it runs observe-only passes without it (observeDualRunWithoutLease), and while
+// no node holds the majority each such node records what it can reach.
 //
 // Lifecycle state is DURABLE (health_conditions rows), so a leadership handover
 // preserves observation counts and confirmed state: the new leader's first pass picks
@@ -191,11 +219,15 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 		interval = 60 * time.Second
 	}
 	eval := func() {
-		if !s.acquireDualRunLease(ctx, interval) {
-			s.stepDownDualRun()
+		if s.acquireDualRunLease(ctx, interval) {
+			s.detectDualRunPass(ctx)
 			return
 		}
-		s.detectDualRunPass(ctx)
+		if s.LeaseQuorumLost(ctx) {
+			s.observeDualRunWithoutLease(ctx)
+			return
+		}
+		s.stepDownDualRun()
 	}
 	eval()
 	t := time.NewTicker(interval)
@@ -310,6 +342,12 @@ func (s *Server) LeaseQuorumLost(ctx context.Context) bool {
 // cross-reference against the DB, debounce, and emit metrics + set-transition
 // notifications. It NEVER destroys or reconciles anything — alert-only.
 func (s *Server) detectDualRunPass(ctx context.Context) {
+	s.dualRunPass(ctx, false)
+}
+
+// dualRunPass is one detector pass, as the lease holder (detectDualRunPass) or
+// observe-only without the lease (observeDualRunWithoutLease).
+func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	// The tenure this pass belongs to. Everything below is only valid if the
 	// same tenure still holds when the writes happen.
 	passTerm := s.dualRunLeaseTerm.Load()
@@ -618,7 +656,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	// the window in which other nodes were entitled to act, so work from
 	// before it must not be applied after it. Same shape as the failover
 	// coordinator's post-fence lease re-check.
-	if !s.stillDualRunLeader(ctx, passTerm) {
+	if !observeOnly && !s.stillDualRunLeader(ctx, passTerm) {
 		slog.Warn("dual-run detector: lease lost or re-taken during the pass — discarding its findings",
 			"pass_term", passTerm, "current_term", s.dualRunLeaseTerm.Load())
 		return
@@ -633,6 +671,10 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 		vmOwner:      vmOwner,
 		vmCreated:    vmCreated,
 		now:          time.Now(),
+		observeOnly:  observeOnly,
+	}
+	if observeOnly {
+		rc.ownPrev = s.dualRunOwnSeenLast()
 	}
 	for _, h := range targets {
 		rc.probeTargets[h] = true
@@ -656,6 +698,11 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, rc, coverageDetail, probeFailed)
+	if observeOnly {
+		s.setDualRunOwnSeen(current)
+	} else {
+		s.setDualRunOwnSeen(nil)
+	}
 }
 
 // reprobeMultiHolders re-probes, once, every host that a multi-holder VM or

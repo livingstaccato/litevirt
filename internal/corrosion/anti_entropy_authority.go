@@ -443,6 +443,18 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 				})
 				return mergeAuthorityKeepLocal, nil
 			}
+			if localIsDeleted {
+				// Both are this workload's tombstone at one authority: the
+				// authority has nothing to decide, and the row's LWW and its
+				// tie resolver do, as for two live copies. Applied regardless,
+				// two tombstones differing in a column the authority does not
+				// cover (hardware_adoption_state, lab 1 F2) were exchanged by
+				// pulls in both directions and never settled. No sweep: the
+				// local tombstone's own delete or merge tombstoned the
+				// children, and a live child arriving later is fenced by the
+				// child-table authority.
+				return mergeAuthorityNormal, nil
+			}
 			return mergeAuthorityApplyIncomingAndSweep, nil
 		}
 		return mergeAuthorityNormal, nil

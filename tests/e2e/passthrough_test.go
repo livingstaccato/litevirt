@@ -113,6 +113,28 @@ func firstHostUSBDevice() string {
 	return ""
 }
 
+// usbHostdev matches a USB passthrough device, `<hostdev mode='subsystem'
+// type='usb' ...>`, and nothing else: a bare "type='usb'" also matches the xhci
+// `<controller type='usb'>` every domain with a USB bus carries, so it cannot
+// tell a device that is there from one that was cleared.
+var usbHostdev = regexp.MustCompile(`<hostdev\b[^>]*\btype='usb'`)
+
+// TestUsbHostdevPattern pins usbHostdev against the two elements libvirt
+// emits. Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestUsbHostdevPattern(t *testing.T) {
+	const ctrl = "<controller type='usb' index='0' model='qemu-xhci'/>\n"
+	const dev = "<hostdev mode='subsystem' type='usb' managed='yes'>\n<source><vendor id='0x1234'/></source>\n</hostdev>\n"
+	if usbHostdev.MatchString(ctrl) {
+		t.Error("the xhci controller was taken for a hostdev")
+	}
+	if !usbHostdev.MatchString(ctrl + dev) {
+		t.Error("a usb hostdev was not found")
+	}
+	if usbHostdev.MatchString("<hostdev mode='subsystem' type='pci' managed='yes'><source/></hostdev>" + ctrl) {
+		t.Error("a pci hostdev was taken for a usb one")
+	}
+}
+
 // TestVM_USBPassthrough_Definition: a USB device set on a stopped VM lands in
 // libvirt's persistent definition as a usb hostdev, live migration is refused,
 // and --clear-usb removes it. The VM is not started with the device, so no
@@ -140,7 +162,7 @@ func TestVM_USBPassthrough_Definition(t *testing.T) {
 	}
 	vendor, product, _ := strings.Cut(dev, ":")
 	x := virshXML(t, name, true)
-	if !strings.Contains(x, "type='usb'") || !strings.Contains(x, "<vendor id='0x"+vendor+"'/>") || !strings.Contains(x, "<product id='0x"+product+"'/>") {
+	if !usbHostdev.MatchString(x) || !strings.Contains(x, "<vendor id='0x"+vendor+"'/>") || !strings.Contains(x, "<product id='0x"+product+"'/>") {
 		t.Fatalf("the persistent definition has no usb hostdev for %s:\n%s", dev, x)
 	}
 	if len(hostNames) > 1 {
@@ -153,7 +175,7 @@ func TestVM_USBPassthrough_Definition(t *testing.T) {
 		}
 	}
 	lv(t, "update", name, "--clear-usb")
-	if x := virshXML(t, name, true); strings.Contains(x, "type='usb'") {
+	if x := virshXML(t, name, true); usbHostdev.MatchString(x) {
 		t.Fatalf("--clear-usb left a usb hostdev:\n%s", x)
 	}
 }

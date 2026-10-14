@@ -303,6 +303,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
+	c.unlimitRecovery(host)
 }
 
 // alertStalledRecoveries raises the stall alert for every fenced or offline
@@ -355,6 +356,11 @@ func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[st
 				"if it is down, confirm it off with 'lv host fence-confirm " + host + "'"
 		default:
 			reason = "recovery ran and left workloads on the host; see the failover log on " + c.hostName
+		}
+		// Workloads a limited recovery left on the host stay named whatever
+		// newer hold reason replaced the one that named them.
+		if held := c.unpausedHeldReason(host); held != "" {
+			reason = held + "; " + reason
 		}
 		slog.Error("failover: recovery of a fenced host has stalled",
 			"host", host, "coordinator", c.hostName, "pending", n,

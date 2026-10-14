@@ -156,12 +156,17 @@ type Coordinator struct {
 	// node had lost every quorum it could decide on, so the change is logged
 	// once rather than every poll.
 	leaseQuorumLost atomic.Bool
-	// recoverOnly, while a recovery of a host runs, limits it to the workloads
-	// listed for that host ("kind/name", health.PauseKindVM or
-	// health.PauseKindContainer): a self-paused host answering through a
-	// bridge is recovered only for what it reported pausing
-	// (selfPauseStillStands). No entry recovers everything.
+	// recoverOnly limits every recovery of a host to the workloads listed for
+	// it ("kind/name", health.PauseKindVM or health.PauseKindContainer): a
+	// self-paused host answering through a bridge is recovered only for what
+	// it reported pausing (selfPauseStillStands). It lasts for the
+	// down-episode (limitRecovery, unlimitRecovery). No entry recovers
+	// everything.
 	recoverOnly map[string]map[string]bool
+	// unpausedHeld names, per host, the workloads a limited recovery has left
+	// on it, so the stall alert keeps naming them whatever newer hold reason
+	// is recorded. It lasts as recoverOnly does.
+	unpausedHeld map[string]map[string]bool
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -1457,9 +1462,53 @@ func (c *Coordinator) noteNotReportedPaused(host, kind string, names []string) {
 	if len(names) == 0 {
 		return
 	}
+	if c.unpausedHeld == nil {
+		c.unpausedHeld = map[string]map[string]bool{}
+	}
+	if c.unpausedHeld[host] == nil {
+		c.unpausedHeld[host] = map[string]bool{}
+	}
+	for _, n := range names {
+		c.unpausedHeld[host][kind+"/"+n] = true
+	}
 	slog.Warn("failover: not recovering workloads the host answering through a bridge did not report pausing; they may still run there",
 		"host", host, "kind", kind, "workloads", names)
 	c.noteHold(host, "recovery left "+kind+" "+strings.Join(names, ",")+": the host did not report pausing them and may still run them")
+}
+
+// limitRecovery limits every recovery of host to only, for the rest of its
+// down-episode; nil lifts the limit.
+func (c *Coordinator) limitRecovery(host string, only map[string]bool) {
+	if only == nil {
+		c.unlimitRecovery(host)
+		return
+	}
+	if c.recoverOnly == nil {
+		c.recoverOnly = map[string]map[string]bool{}
+	}
+	c.recoverOnly[host] = only
+}
+
+// unlimitRecovery lifts host's recovery limit: it is back in service, or an
+// operator's confirmation or a fence that proves it off vouches for every
+// workload on it.
+func (c *Coordinator) unlimitRecovery(host string) {
+	delete(c.recoverOnly, host)
+	delete(c.unpausedHeld, host)
+}
+
+// unpausedHeldReason names the workloads a limited recovery has left on
+// host, "" when none.
+func (c *Coordinator) unpausedHeldReason(host string) string {
+	if len(c.unpausedHeld[host]) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(c.unpausedHeld[host]))
+	for k := range c.unpausedHeld[host] {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return "held for an operator, not reported paused by the host and possibly still running there: " + strings.Join(names, ",")
 }
 
 // errLeaseNoQuorum is acquireLeaseResult standing down because this node has
@@ -2471,6 +2520,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationResumed)
 	c.fenced[target] = true
 	c.confirmResumed[target] = rec.ID
+	c.unlimitRecovery(target) // an operator confirmed the host off
 	c.recoverWorkloads(ctx, h)
 	return true
 }
@@ -2996,6 +3046,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 		return
 	}
 	delete(c.pauseWaits, h.Name)
+	if !corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) {
+		// A fence that does not rest on the pause answers for every workload.
+		c.unlimitRecovery(h.Name)
+	}
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.

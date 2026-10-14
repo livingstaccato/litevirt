@@ -185,13 +185,12 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	}
 	slog.Info("failover: partition-pause deadline passed; recovering the host's workloads",
 		"host", host, "waited", w.wait, "assurance", corrosion.FenceSelfPaused, "only_reported_paused", only != nil)
-	if only != nil {
-		if c.recoverOnly == nil {
-			c.recoverOnly = map[string]map[string]bool{}
-		}
-		c.recoverOnly[host] = only
-		defer delete(c.recoverOnly, host)
-	}
+	// The limit lasts for the down-episode, not this one pass: every later
+	// recovery of the host (a claim retry above all) honours it, until the
+	// host is back, an operator or a proving fence vouches for it, or a later
+	// deadline replaces it. A later deadline at which nobody has seen the host
+	// answer lifts it, as fenceStillStands would.
+	c.limitRecovery(host, only)
 	c.recoverWorkloads(ctx, h)
 	return true
 }

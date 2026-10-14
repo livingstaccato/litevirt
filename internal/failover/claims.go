@@ -636,6 +636,7 @@ func (c *Coordinator) recoverRemovedHosts(ctx context.Context) {
 			continue
 		}
 		slog.Info("failover: recovering workloads recorded on a host removed for good", "host", host)
+		c.unlimitRecovery(host) // proved off, and removed for good
 		c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: host, State: "removed"})
 	}
 }

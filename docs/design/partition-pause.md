@@ -505,7 +505,11 @@ All of this is in the failover coordinator (`internal/failover`).
      since the fence, the majority recovers only on the host's own word: its
      replicated `partition_paused` condition (§3.6), open and raised no
      earlier than the outage began, and then only the workloads its evidence
-     lists as paused; any other stays where it is, for an operator. The
+     lists as paused. Every recovery of the host in that episode, a claim
+     retry included, keeps to the list until the host is back, an operator
+     confirms it off or a fence proves it off. A later deadline at which no
+     observer has seen the host answer, a successor's after the bridge has
+     gone say, recovers everything, as without a bridge. The
      outage begins, for a voter set of `n` with majority `q`, at the
      `(n−q+1)`-th earliest start among its voters' failing runs that span the
      fence: the host cannot have lost its majority before that many voters

@@ -176,64 +176,20 @@ func existAsAlreadyExists(err error) error {
 }
 
 // placeNoClobber makes tmp visible as dst only if nothing is at dst. The
-// placement itself refuses (renameNoReplaceOrLink), so a file created between
-// a check and the placement is not replaced either.
+// placement itself refuses (noReplacePlace: renameat2 RENAME_NOREPLACE, or a
+// hard link where the filesystem cannot do the flag, as on NFS), so a file
+// created between a check and the placement is not replaced either.
 func placeNoClobber(tmp, dst string) error {
-	if err := renameNoReplaceOrLink(tmp, dst); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return status.Errorf(codes.AlreadyExists, "%q already exists; a restore or copy never replaces a file", dst)
-		}
-		return status.Errorf(codes.Internal, "place %q: %v", dst, err)
+	unsupported, err := noReplacePlace(tmp, dst, false)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		return status.Errorf(codes.AlreadyExists, "%q already exists; a restore or copy never replaces a file", dst)
+	case unsupported:
+		return status.Errorf(codes.FailedPrecondition, "place %q: %v; a file is never placed with a rename that could overwrite one", dst, err)
 	}
-	return nil
-}
-
-// renameNoReplaceOrLink gives tmp the name dst, never replacing a file at
-// dst: an existing dst is an error satisfying errors.Is(err, fs.ErrExist).
-//
-// renameat2(RENAME_NOREPLACE) first. A filesystem that cannot do it — the
-// Linux NFS client answers EINVAL — gets a hard link, which the server refuses
-// atomically when dst exists, and then tmp's own name is removed. A filesystem
-// that can do neither is refused: there is no rename there that cannot
-// replace a file, and a plain rename is never used.
-//
-// Once the link has given the file its name it is placed: a tmp name that
-// then cannot be removed is logged and left for the sweep of its pattern, as
-// placeColdDisk does, so a retry is not refused over a file that is the copy
-// itself.
-func renameNoReplaceOrLink(tmp, dst string) error {
-	rerr := coldRenameNoReplace(tmp, dst)
-	if rerr == nil || errors.Is(rerr, fs.ErrExist) || !placementUnsupported(rerr) {
-		return rerr
-	}
-	lerr := coldLink(tmp, dst)
-	if lerr != nil && errors.Is(lerr, fs.ErrExist) && sameFileAt(tmp, dst) {
-		// An NFS link whose reply was lost is retransmitted and answered
-		// EEXIST although the first one made the link: dst is tmp itself.
-		lerr = nil
-	}
-	if lerr != nil {
-		if errors.Is(lerr, fs.ErrExist) || !placementUnsupported(lerr) {
-			return lerr
-		}
-		return fmt.Errorf("the filesystem holding %s supports neither a rename that cannot replace a file (%v) nor hard links (%v); "+
-			"a file is never placed with a rename that could overwrite one", filepath.Dir(dst), rerr, lerr)
-	}
-	if err := coldRemove(tmp); err != nil {
-		slog.Warn("placed a file by a hard link but could not remove its temporary name",
-			"temp", tmp, "path", dst, "error", err)
-	}
-	return nil
-}
-
-// sameFileAt reports whether a and b are both names of one file.
-func sameFileAt(a, b string) bool {
-	fa, err := os.Lstat(a)
-	if err != nil {
-		return false
-	}
-	fb, err := os.Lstat(b)
-	return err == nil && os.SameFile(fa, fb)
+	return status.Errorf(codes.Internal, "place %q: %v", dst, err)
 }
 
 // place publishes tmp at the destination: over the record's disk for an

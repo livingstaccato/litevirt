@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -18,13 +19,39 @@ import (
 
 // renameNoReplaceAnswers makes renameat2(RENAME_NOREPLACE) answer errno, as
 // the Linux NFS client does (EINVAL) for a rename with flags. link() stays
-// the real one.
+// the real one. The test fails unless the placement went through it: a
+// placement that bypasses the seam (base's direct renameat2) would otherwise
+// pass on a filesystem whose renameat2 works.
 func renameNoReplaceAnswers(t *testing.T, errno syscall.Errno) {
 	t.Helper()
 	l, r, n := coldLink, coldRemove, coldRenameNoReplace
-	t.Cleanup(func() { coldLink, coldRemove, coldRenameNoReplace = l, r, n })
+	var calls atomic.Int32
+	t.Cleanup(func() {
+		coldLink, coldRemove, coldRenameNoReplace = l, r, n
+		if calls.Load() == 0 {
+			t.Errorf("the placement never called renameat2 through its seam")
+		}
+	})
 	coldRenameNoReplace = func(o, nw string) error {
+		calls.Add(1)
 		return &os.LinkError{Op: "renameat2", Old: o, New: nw, Err: errno}
+	}
+}
+
+// countLinks wraps link() (as it is now: the real one, or a test's) with a
+// counter, and fails the test unless the placement linked at least once.
+func countLinks(t *testing.T) {
+	t.Helper()
+	inner := coldLink
+	var calls atomic.Int32
+	t.Cleanup(func() {
+		if calls.Load() == 0 {
+			t.Errorf("the placement never called link() through its seam")
+		}
+	})
+	coldLink = func(o, n string) error {
+		calls.Add(1)
+		return inner(o, n)
 	}
 }
 
@@ -48,6 +75,7 @@ func TestPlaceNoClobber_WithoutRenameNoReplaceLinks(t *testing.T) {
 	for _, errno := range []syscall.Errno{syscall.EINVAL, syscall.ENOSYS, syscall.EOPNOTSUPP} {
 		t.Run(errno.Error(), func(t *testing.T) {
 			renameNoReplaceAnswers(t, errno)
+			countLinks(t)
 
 			tmp, dst := noClobberFixture(t)
 			if err := placeNoClobber(tmp, dst); err != nil {
@@ -77,15 +105,16 @@ func TestPlaceNoClobber_WithoutRenameNoReplaceLinks(t *testing.T) {
 // A filesystem with neither RENAME_NOREPLACE nor hard links is refused,
 // naming the limitation; nothing is placed and the temp keeps its bytes.
 //
-// Mutation: fall back to os.Rename when link is unsupported — dst appears,
-// red.
+// Mutations: fall back to os.Rename when link is unsupported — dst appears,
+// red. Internal for "neither" — red.
 func TestPlaceNoClobber_NeitherRenameNoReplaceNorLinkRefuses(t *testing.T) {
 	renameNoReplaceAnswers(t, syscall.EINVAL)
 	coldLink = func(o, n string) error { return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.EPERM} }
+	countLinks(t)
 	tmp, dst := noClobberFixture(t)
 	err := placeNoClobber(tmp, dst)
-	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "neither a rename that cannot replace a file") {
-		t.Fatalf("placeNoClobber with neither = %v, want an Internal refusal naming the filesystem limitation", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "supports neither hard links") {
+		t.Fatalf("placeNoClobber with neither = %v, want a FailedPrecondition refusal naming the filesystem limitation", err)
 	}
 	if _, serr := os.Lstat(dst); !os.IsNotExist(serr) {
 		t.Fatalf("dst exists after a refused placement (lstat: %v)", serr)
@@ -108,6 +137,7 @@ func TestPlaceNoClobber_ALinkAnsweredEEXISTForItsOwnLinkIsPlaced(t *testing.T) {
 		}
 		return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.EEXIST}
 	}
+	countLinks(t)
 	tmp, dst := noClobberFixture(t)
 	if err := placeNoClobber(tmp, dst); err != nil {
 		t.Fatalf("placeNoClobber after a retransmitted link: %v", err)
@@ -127,6 +157,7 @@ func TestPlaceNoClobber_ALinkAnsweredEEXISTForItsOwnLinkIsPlaced(t *testing.T) {
 func TestPlaceNoClobber_LinkedButTempNotRemovedStillPlaces(t *testing.T) {
 	renameNoReplaceAnswers(t, syscall.EINVAL)
 	coldRemove = func(string) error { return errors.New("injected remove failure") }
+	countLinks(t)
 	tmp, dst := noClobberFixture(t)
 	if err := placeNoClobber(tmp, dst); err != nil {
 		t.Fatalf("placeNoClobber with a failed temp remove = %v, want placed", err)
@@ -140,6 +171,7 @@ func TestPlaceNoClobber_LinkedButTempNotRemovedStillPlaces(t *testing.T) {
 // renameat2 answering EINVAL the replica and its record are published.
 func TestReplicateLocal_PublishesWhereRenameNoReplaceIsUnsupported(t *testing.T) {
 	renameNoReplaceAnswers(t, syscall.EINVAL)
+	countLinks(t)
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "web-1", HostName: s.hostName, State: "running"}, nil, nil); err != nil {
@@ -174,6 +206,7 @@ func TestReplicateLocal_PublishesWhereRenameNoReplaceIsUnsupported(t *testing.T)
 // a file.
 func TestRestorePlace_NewDestinationWhereRenameNoReplaceIsUnsupported(t *testing.T) {
 	renameNoReplaceAnswers(t, syscall.EINVAL)
+	countLinks(t)
 	tmp, dst := noClobberFixture(t)
 	if err := (restoreDest{path: dst}).place(tmp); err != nil {
 		t.Fatalf("restore place where renameat2 answers EINVAL: %v", err)
@@ -189,6 +222,71 @@ func TestRestorePlace_NewDestinationWhereRenameNoReplaceIsUnsupported(t *testing
 		t.Fatalf("restore place over a file: %v, want AlreadyExists", err)
 	}
 	if got, _ := os.ReadFile(dst); string(got) != "new" {
+		t.Fatalf("the existing file now holds %q", got)
+	}
+}
+
+// A renameat2 refused for permissions or a cross-mount rename (EPERM, EXDEV)
+// is not a filesystem without the flag: it is returned as it is, no link is
+// tried, and the refusal does not claim the filesystem supports neither.
+//
+// Mutation: fall back to link on EPERM/EXDEV too (placementUnsupported) —
+// link is called, red.
+func TestPlaceNoClobber_ARenameRefusedForPermissionsIsNotUnsupported(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EPERM, syscall.EXDEV} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			renameNoReplaceAnswers(t, errno)
+			var links atomic.Int32
+			coldLink = func(o, n string) error { links.Add(1); return os.Link(o, n) }
+			tmp, dst := noClobberFixture(t)
+			err := placeNoClobber(tmp, dst)
+			if status.Code(err) != codes.Internal || strings.Contains(err.Error(), "supports neither") || !errors.Is(err, errno) && !strings.Contains(err.Error(), errno.Error()) {
+				t.Fatalf("placeNoClobber where renameat2 answers %v = %v, want that error, Internal, not 'supports neither'", errno, err)
+			}
+			if links.Load() != 0 {
+				t.Fatalf("a link was tried after renameat2 answered %v", errno)
+			}
+			if _, serr := os.Lstat(dst); !os.IsNotExist(serr) {
+				t.Fatalf("dst exists after a refused placement (lstat: %v)", serr)
+			}
+		})
+	}
+}
+
+// The link-first placements (a cold migration's received disk, an import's
+// converted disk) share the lost-reply check: an NFS link answered EEXIST
+// over its own link is placed, and one over another file is still refused.
+//
+// Mutation: placeColdDisk on its own link-then-rename without the shared
+// core's same-file check — red.
+func TestPlaceColdDisk_ALinkAnsweredEEXISTForItsOwnLinkIsPlaced(t *testing.T) {
+	l := coldLink
+	t.Cleanup(func() { coldLink = l })
+	coldLink = func(o, n string) error {
+		if err := os.Link(o, n); err != nil {
+			return err
+		}
+		return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.EEXIST}
+	}
+	countLinks(t)
+	tmp, dst := noClobberFixture(t)
+	if err := placeColdDisk(tmp, dst); err != nil {
+		t.Fatalf("placeColdDisk after a retransmitted link: %v", err)
+	}
+	if _, err := os.Lstat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("the scratch name is still there (lstat: %v)", err)
+	}
+	tmp, dst = noClobberFixture(t)
+	if err := os.WriteFile(dst, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := placeColdDisk(tmp, dst); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("placeColdDisk over another file = %v, want ErrExist", err)
+	}
+	if unsupported, err := linkOrRenameNoReplace(tmp, dst); unsupported || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("linkOrRenameNoReplace over another file = %v, %v; want ErrExist", unsupported, err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "old" {
 		t.Fatalf("the existing file now holds %q", got)
 	}
 }

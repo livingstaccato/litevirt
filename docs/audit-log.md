@@ -118,7 +118,7 @@ Use cases:
 
 ### Time bounds
 
-`--since` on `lv audit ls` and `lv events <vm>`, and `--since` / `--until` on
+`--since` on `lv events <vm>`, and `--since` / `--until` on `lv audit ls` and
 `lv audit export`, are read as times and compared as instants. Each takes:
 
 - an RFC3339 timestamp, with or without a fraction (`.` or `,`), in UTC or with

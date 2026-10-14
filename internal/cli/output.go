@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"golang.org/x/term"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
@@ -48,11 +50,20 @@ func fenceStrategyOrDefault(s string) string {
 
 // PrintVMInspect prints detailed VM info as JSON.
 func PrintVMInspect(ctx context.Context, c pb.LiteVirtClient, name string) error {
-	vm, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
+	var hdr metadata.MD
+	vm, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: name}, grpc.Header(&hdr))
 	if err != nil {
 		return fmt.Errorf("inspect VM: %w", err)
 	}
-	return printJSON(vm)
+	if err := printJSON(vm); err != nil {
+		return err
+	}
+	// The daemon answered from its replica because the VM's host did not
+	// (grpcapi.InspectStaleHeader). On stderr, so the JSON stays parseable.
+	for _, n := range hdr.Get("x-litevirt-inspect-stale") {
+		fmt.Fprintf(os.Stderr, "note: %s\n", n)
+	}
+	return nil
 }
 
 var pjson = protojson.MarshalOptions{

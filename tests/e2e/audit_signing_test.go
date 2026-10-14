@@ -112,11 +112,11 @@ func TestAuditVerifyReportsSigningState(t *testing.T) {
 		// a second chain opened under a host name that already had one (the lab's
 		// known artefact, which no test here made and no test here can heal). The
 		// claim below, that a clean log reads as intact, cannot be made on it. The
-		// run is excused only for the ONE fork the operator named, as
-		// E2E_KNOWN_AUDIT_FORK=<row-id>@<host>; see knownAuditFork. A second fork
-		// beside it, or any other shape, still fails.
+		// run is excused only for the forks the operator named, as
+		// E2E_KNOWN_AUDIT_FORK=<row-id>@<host>[,...]; see knownAuditFork. A fork
+		// on another host, or any other shape, still fails.
 		if ok, why := knownAuditFork(out, os.Getenv("E2E_KNOWN_AUDIT_FORK")); ok {
-			t.Skipf("the log holds only the known fork %s, which this test did not create; verify says:\n%s", os.Getenv("E2E_KNOWN_AUDIT_FORK"), out)
+			t.Skipf("the log holds only the known forks %s, which this test did not create; verify says:\n%s", os.Getenv("E2E_KNOWN_AUDIT_FORK"), out)
 		} else {
 			t.Fatalf("the live cluster's audit chain is forked and it is not just the known fork (%s):\n%s", why, out)
 		}
@@ -229,20 +229,29 @@ func auditQuery(t *testing.T, query string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// knownAuditFork reports whether a fork-only `lv audit verify` output is
-// exactly the one fork named by spec, "<row-id>@<host>", and nothing more:
+// knownAuditFork reports whether a fork-only `lv audit verify` output holds
+// only the forks named by spec, a comma-separated list of "<row-id>@<host>",
+// and nothing more:
 //   - the row printed under the "forked chain" heading (the first broken link,
-//     the only fork the verifier names by id) is the row id, and
+//     the only fork the verifier names by id) is one of the row ids, and
 //   - the "sequence break" section holds only `<host>: row <id> repeats seq N`
-//     lines, every one for that host. A same-host fork may grow more such lines
-//     as rows are appended, so the host is the granularity, not the line set.
+//     lines, every one for one of the named hosts. A same-host fork may grow
+//     more such lines as rows are appended, so the host is the granularity,
+//     not the line set.
 //
-// A second fork on another host, a second fork on the known host that is the
-// first break instead, a deleted-rows gap, or no/malformed spec is not known.
+// A fork on a host the spec does not name, a first break that is not a named
+// row, a deleted-rows gap, or no/malformed spec is not known.
 func knownAuditFork(out, spec string) (bool, string) {
-	id, host, ok := strings.Cut(spec, "@")
-	if !ok || id == "" || host == "" {
-		return false, "E2E_KNOWN_AUDIT_FORK is not set as <row-id>@<host>"
+	type pair struct{ id, host string }
+	var pairs []pair
+	ids, hosts := map[string]string{}, map[string]bool{}
+	for _, e := range strings.Split(spec, ",") {
+		id, host, ok := strings.Cut(strings.TrimSpace(e), "@")
+		if !ok || id == "" || host == "" {
+			return false, "E2E_KNOWN_AUDIT_FORK is not set as <row-id>@<host>[,<row-id>@<host>...]"
+		}
+		pairs = append(pairs, pair{id, host})
+		ids[id], hosts[host] = host, true
 	}
 	lines := strings.Split(out, "\n")
 	section := func(prefix string) (rows []string, found bool) {
@@ -261,17 +270,33 @@ func knownAuditFork(out, spec string) (bool, string) {
 		return nil, false
 	}
 	first, found := section("forked chain (")
-	if !found || len(first) != 1 || first[0] != id {
-		return false, fmt.Sprintf("the first broken row is %v, not the known %s", first, id)
+	if !found || len(first) != 1 || ids[first[0]] == "" {
+		return false, fmt.Sprintf("the first broken row is %v, not one of the known %s", first, spec)
 	}
 	gaps, found := section("sequence break (")
 	if !found || len(gaps) == 0 {
 		return false, "no sequence break section naming the fork's host"
 	}
+	dupHosts, dupRows := map[string]bool{}, map[pair]bool{}
 	for _, g := range gaps {
 		h, rest, _ := strings.Cut(g, ": row ")
-		if h != host || !strings.Contains(rest, " repeats seq ") {
-			return false, fmt.Sprintf("a sequence-break line is not a duplicate on %s: %q", host, g)
+		if !hosts[h] || !strings.Contains(rest, " repeats seq ") {
+			return false, fmt.Sprintf("a sequence-break line is not a duplicate on a known fork's host (%s): %q", spec, g)
+		}
+		dupHosts[h] = true
+		id, _, _ := strings.Cut(rest, " ")
+		dupRows[pair{id, h}] = true
+	}
+	// Each named fork verify reports is the pair it names: the first break's
+	// host has duplicates, and a named fork whose host has duplicates is
+	// either the first break or one of its own host's duplicate rows. A named
+	// fork whose host shows none is not reported now, which excuses nothing.
+	if !dupHosts[ids[first[0]]] {
+		return false, fmt.Sprintf("the first broken row %s is named for %s, which shows no duplicates", first[0], ids[first[0]])
+	}
+	for _, p := range pairs {
+		if dupHosts[p.host] && p.id != first[0] && !dupRows[p] {
+			return false, fmt.Sprintf("the named fork %s@%s is not what verify reports for that row and host", p.id, p.host)
 		}
 	}
 	return true, ""
@@ -291,8 +316,20 @@ func TestKnownAuditFork(t *testing.T) {
 	if ok, why := knownAuditFork(known, spec); !ok {
 		t.Errorf("the known fork alone was not excused: %s", why)
 	}
+	// Lab 1 (2026-10-14): a second fork on node-4 beside the named one, both
+	// named.
+	const both = spec + ",9bcb8393aec73858@node-4"
+	if ok, why := knownAuditFork(known+gap("node-4", "9bcb8393aec73858"), both); !ok {
+		t.Errorf("two named forks were not excused: %s", why)
+	}
+	if ok, why := knownAuditFork(known, both); !ok {
+		t.Errorf("one of two named forks alone was not excused: %s", why)
+	}
 	for name, c := range map[string]struct{ out, spec string }{
 		"a second fork on another host":  {known + gap("node-4", "ccc"), spec},
+		"a third fork beside two named":  {known + gap("node-4", "ccc") + gap("node-5", "ddd"), both},
+		"a list with a malformed entry":  {known, spec + ",node-4"},
+		"ids and hosts cross-paired":     {known + gap("node-4", "9bcb8393aec73858"), "b9fbdd30d8a95d0c@node-4,9bcb8393aec73858@node-3"},
 		"the first break is another row": {strings.Replace(known, "b9fbdd30d8a95d0c", "ffffffffffffffff", 1), spec},
 		"a deleted-rows gap":             {known + "  node-3: seq jumps from 4 to 9 (rows deleted)\n", spec},
 		"no spec":                        {known, ""},

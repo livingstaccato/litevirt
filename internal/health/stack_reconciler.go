@@ -166,6 +166,19 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	_ = corrosion.SoftDeleteLBConfig(ctx, r.db, lbName)
 	corrosion.SoftDeleteLBBackends(ctx, r.db, lbName)
 
+	// The stack's firewall rows and backup repos go with it, as in a
+	// DeleteStack that completes; left behind, a security group holds its name
+	// against the next deploy of the same file. A failure keeps the stack
+	// 'deleting', so the next pass retries.
+	if err := corrosion.DeleteStackFirewall(ctx, r.db, stack.Name); err != nil {
+		slog.Warn("stack-reconciler: tombstone the stack's firewall failed, will retry", "stack", stack.Name, "error", err)
+		return
+	}
+	if err := corrosion.DeleteStackBackupRepos(ctx, r.db, stack.Name); err != nil {
+		slog.Warn("stack-reconciler: unregister the stack's backup repos failed, will retry", "stack", stack.Name, "error", err)
+		return
+	}
+
 	if err := corrosion.DeleteStackRecord(ctx, r.db, stack.Name); err != nil {
 		slog.Error("stack-reconciler: tombstone stack failed", "stack", stack.Name, "error", err)
 		return

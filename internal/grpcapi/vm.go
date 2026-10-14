@@ -1708,17 +1708,48 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
 	}
 	// Forward to the VM's host so local-only operations (disk size discovery,
-	// VNC port, ARP lookup) work correctly.
+	// VNC port, ARP lookup) work correctly. The forward is bounded: the dial is
+	// lazy, so a host cut off by a partition does not fail it, and unbounded it
+	// took the caller's whole deadline (drill 1 on both labs). A host that
+	// cannot be reached, or does not answer in time while the caller is still
+	// waiting, is answered for from this node's replica, and the response says
+	// so (InspectStaleHeader). Any other answer from the host stands.
 	if vm.HostName != s.hostName {
-		client, conn, err := s.peerClient(ctx, vm.HostName)
+		client, closeConn, err := s.dialPeer(ctx, vm.HostName)
 		if err == nil {
-			defer conn.Close()
-			return client.InspectVM(ctx, req)
+			defer closeConn()
+			fctx, cancel := context.WithTimeout(ctx, s.inspectForwardBound())
+			resp, ferr := client.InspectVM(fctx, req)
+			cancel()
+			if ferr == nil {
+				return resp, nil
+			}
+			if c := status.Code(ferr); ctx.Err() != nil || (c != codes.Unavailable && c != codes.DeadlineExceeded) {
+				return nil, ferr
+			}
+			err = ferr
 		}
-		// Fall through to local view if peer unreachable.
+		_ = grpc.SetHeader(ctx, metadata.Pairs(InspectStaleHeader, fmt.Sprintf(
+			"host %s did not answer (%s); this is the replicated record as node %s holds it, without the host's live state",
+			vm.HostName, status.Convert(err).Message(), s.hostName)))
 	}
 	return s.vmToProto(ctx, req.Name)
 }
+
+// inspectForwardTimeout bounds InspectVM's forward to the VM's host
+// (Server.inspectForwardTimeout replaces it in tests).
+const inspectForwardTimeout = 5 * time.Second
+
+func (s *Server) inspectForwardBound() time.Duration {
+	if s.inspectForwardTimeout > 0 {
+		return s.inspectForwardTimeout
+	}
+	return inspectForwardTimeout
+}
+
+// InspectStaleHeader is the response header InspectVM sets when it answered
+// from this node's replica because the VM's host could not be reached.
+const InspectStaleHeader = "x-litevirt-inspect-stale"
 
 // requireVMReadByName resolves name to its VMRecord (if known locally) and
 // authorizes vm.read on its path, with the same existence-oracle protection

@@ -36,13 +36,72 @@ const afreshRun = time.Duration(offlineThreshold-1)*health.ProbeInterval + fence
 // write. Dropping the run outright would never fence a host that turned
 // active and then never answered, because the observers' runs never break.
 func countedSinceActive(n int, lastSeen string, at, since time.Time) bool {
+	return countedSinceActiveWithin(n, lastSeen, at, since, func(time.Time) time.Duration { return afreshRun })
+}
+
+// countedSinceActiveWithin is countedSinceActive with the allowance for a run
+// that began before the activation chosen by grace, from the run's start.
+func countedSinceActiveWithin(n int, lastSeen string, at, since time.Time, grace func(runStart time.Time) time.Duration) bool {
 	if at.Before(since) {
 		return false
 	}
-	if !observerRunStart(n, lastSeen, at).Before(since) {
+	start := observerRunStart(n, lastSeen, at)
+	if !start.Before(since) {
 		return true
 	}
-	return at.Sub(since) >= afreshRun
+	return at.Sub(since) >= grace(start)
+}
+
+// inheritedRunGrace is how long host, recorded active since `since`, must
+// have failed since the activation before an observer's run that began at
+// runStart, before the activation, counts toward its fence.
+//
+// It is afreshRun, unless a fence attempt of host is recorded inside that run
+// (fencing_log, any result, from runStart less fenceSkewMargin up to the
+// activation): then the run has already been acted on, and the host has come
+// back since — powered on after its fence (lab 1, 2026-10-14: node-3 recorded
+// itself active 16 s before its gRPC server listened, and was SSH-powered off
+// again 0.6 s after it did). Such a host gets the allowance a graceful restart
+// gets (upgradingTimeout) to answer before it is fenced again on that run. A
+// run that begins after the activation is unaffected, and a host that comes
+// back and never answers is still fenced, once that allowance has passed.
+// An unreadable log keeps afreshRun.
+func (c *Coordinator) inheritedRunGrace(ctx context.Context, host string, since time.Time, fenceTimes map[string][]time.Time) func(time.Time) time.Duration {
+	return func(runStart time.Time) time.Duration {
+		times, ok := fenceTimes[host]
+		if !ok {
+			times = c.fenceAttemptTimes(ctx, host)
+			fenceTimes[host] = times
+		}
+		from := runStart.Add(-fenceSkewMargin)
+		for _, ts := range times {
+			if !ts.Before(from) && ts.Before(since) {
+				if g := c.upgradingTimeout(); g > afreshRun {
+					return g
+				}
+				return afreshRun
+			}
+		}
+		return afreshRun
+	}
+}
+
+// fenceAttemptTimes lists the timestamps of host's fencing_log rows, of any
+// result. A read error yields none.
+func (c *Coordinator) fenceAttemptTimes(ctx context.Context, host string) []time.Time {
+	rows, err := c.db.Query(ctx, `SELECT timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		slog.Warn("failover: read the fence log of a host that turned active; judging its observers' runs as before",
+			"host", host, "error", err)
+		return nil
+	}
+	var out []time.Time
+	for _, r := range rows {
+		if ts, perr := time.Parse(time.RFC3339, r.String("timestamp")); perr == nil {
+			out = append(out, ts)
+		}
+	}
+	return out
 }
 
 // turnedActiveThisCycle reports whether target turned active after this cycle

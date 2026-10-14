@@ -165,8 +165,10 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 		t.FailNow()
 	}
 	// Every running workload has been recovered by now, so a stopped VM
-	// recovered with them would be defined on the majority already.
-	l.assertStoppedVMStayed(stopped, q, majority)
+	// recovered with them would be defined on the majority already. `lv
+	// inspect` through q is forwarded to the VM's host, which the split cuts
+	// off, so the majority's record is read from q's own state.db.
+	l.assertStoppedVMSkippedDuringSplit(stopped, q, majority, since)
 
 	// ── 3. the replacement disk has the recorded size ───────────────────────
 	r := s.last()
@@ -298,16 +300,21 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 		t.Fatalf("not every minority workload runs on its home host before the split:\n  %s", s.last())
 	}
 
+	since := l.nodeNow(q)
 	start, _ := l.partitionNamedOnly(minority, majority)
 
-	// The minority pauses: asserted.
+	// The minority stops executing: asserted. It pauses, or — the witness
+	// reaching both sides holds the lease and its fence of a minority host
+	// reaches through it — its host is powered off first, which stops the
+	// copy as surely (lab 1 2026-10-14: node-1 fenced 19 s after the split,
+	// 2 s before its pause was due). Only proof counts (minorityCopyStopped).
 	pausedAt := waitEach(s, start, 2*minorityPauseBy, keys, func(r round, k string) bool {
-		return pausedState(r.state(home[k], k))
+		return minorityCopyStopped(r, home[k], k)
 	})
 	for _, k := range keys {
 		at, ok := pausedAt[k]
 		if !ok {
-			t.Errorf("%s never paused on %s within %v of the split (virsh)\n  %s", k, home[k], 2*minorityPauseBy, s.last())
+			t.Errorf("%s never paused or stopped on %s within %v of the split (virsh)\n  %s", k, home[k], 2*minorityPauseBy, s.last())
 			continue
 		}
 		if d := at.Sub(start); d > minorityPauseBy+sampleSlop {
@@ -327,8 +334,41 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 	for _, k := range keys {
 		if at, ok := recoveredAt[k]; ok {
 			l.mark("drill1b: %s recovered on the majority at +%v (liveness: logged only)", k, at.Sub(start).Round(time.Second))
+			// Sooner than the pause wait is safe only on a fence that ran: a
+			// reached SSH power-off, recorded ssh/fenced. A replacement this
+			// early on an assumed fence (a failed best-effort SSH relying on
+			// the pause) would be a regression.
+			if d := at.Sub(start); d < earliestReplacement(l.total) {
+				rows := l.mustSQL(q, "SELECT method, result FROM fencing_log WHERE host_name='"+home[k]+"' AND timestamp >= '"+since+"'")
+				fenced := false
+				for _, f := range rows {
+					fenced = fenced || (len(f) == 2 && f[0] == "ssh" && f[1] == "fenced")
+				}
+				if !fenced {
+					t.Errorf("%s replaced at +%v, before the pause wait %v, with no successful ssh fence of %s on record: %v",
+						k, d.Round(time.Millisecond), earliestReplacement(l.total), home[k], rows)
+				}
+			}
 		} else {
 			l.mark("drill1b: %s was NOT recovered on the majority within %v (liveness: logged only)", k, recoverBy)
+		}
+	}
+
+	// A witness reaching both sides that holds the failover lease reaches the
+	// minority too, and fences it: a voter majority cannot reach those hosts,
+	// and the fence's SSH power-off succeeds through the witness (lab 1's
+	// node-6). That is the product working; bring such a host back before the
+	// heal, as an operator would.
+	var off []string
+	for _, h := range minority {
+		if !l.isUp(h) {
+			off = append(off, h)
+		}
+	}
+	if len(off) > 0 {
+		l.mark("drill1b: minority hosts %v were powered off during the split (fenced through the witness); powering them on", off)
+		if err := l.powerOn(off...); err != nil {
+			t.Errorf("power on %v: %v", off, err)
 		}
 	}
 
@@ -353,6 +393,19 @@ func TestDrill1b_WitnessReachesBothSides(t *testing.T) {
 	}
 	s.Stop()
 	assertNeverTwice(t, s.snapshot())
+}
+
+// minorityCopyStopped reports whether r proves key's copy on host is not
+// executing: it is paused, its host was powered off, or the host was read and
+// the copy is in a state that does not execute (absent included). A host that
+// could not be read for any other reason proves nothing: a copy still running
+// there is invisible to the sample.
+func minorityCopyStopped(r round, host, key string) bool {
+	if why, down := r.Down[host]; down {
+		return why == "powered off"
+	}
+	st := r.state(host, key)
+	return pausedState(st) || !executingState(st)
 }
 
 // TestDrillBlip_FleetWide cuts every node off from every other node at once.
@@ -415,8 +468,11 @@ func TestDrillBlip_FleetWide(t *testing.T) {
 	}); !ok {
 		t.Fatalf("not every recoverable workload runs at home before the blip:\n  %s", s.last())
 	}
+	// Every node alone, witnesses outside E2E_LAB_NODES included: a witness
+	// no group named would reach every host and fence the isolated ones (no
+	// group is the majority, so joinMajority leaves it out).
 	var alone [][]string
-	for _, h := range l.hosts {
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiderHosts()...) {
 		alone = append(alone, []string{h})
 	}
 
@@ -683,7 +739,17 @@ func (l *lab) createStoppedVM(via, prefix string, hosts ...string) stoppedVM {
 			continue
 		}
 		sv := stoppedVM{name: made[h], host: h}
-		l.mustLV(via, "stop", sv.name)
+		// via's replica may not hold the row yet: the VM was created on h
+		// (NotFound right after a rollout, lab 1 2026-10-14).
+		for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(2 * time.Second) {
+			out, err := l.lv(via, "stop", sv.name)
+			if err == nil {
+				break
+			}
+			if !strings.Contains(out+err.Error(), "NotFound") || time.Now().After(deadline) {
+				l.t.Fatalf("lv stop %s on %s: %v\n%s", sv.name, via, err, out)
+			}
+		}
 		if !l.waitDomainState(h, sv.name, "shut off", 3*time.Minute) {
 			l.t.Fatalf("stopped test VM %s never shut off on %s (virsh)", sv.name, h)
 		}
@@ -708,8 +774,62 @@ func (l *lab) createStoppedVM(via, prefix string, hosts ...string) stoppedVM {
 }
 
 // assertStoppedVMStayed checks that no host in others defines sv's domain
-// (virsh) and that litevirt still records it stopped on its own host.
+// (virsh) and that litevirt still records it stopped on its own host. It
+// reads that through `lv inspect`, so it is for a connected cluster; during a
+// split use assertStoppedVMSkippedDuringSplit.
 func (l *lab) assertStoppedVMStayed(sv stoppedVM, via string, others []string) {
+	l.t.Helper()
+	l.assertNotDefinedOn(sv, others)
+	v, err := l.inspectVM(via, sv.name)
+	if err != nil {
+		l.t.Errorf("inspect the stopped VM %s: %v", sv.name, err)
+		return
+	}
+	if v.HostName != sv.host || v.State != "VM_STOPPED" {
+		l.t.Errorf("the stopped VM %s is recorded %s on %s; want VM_STOPPED on %s", sv.name, v.State, v.HostName, sv.host)
+	}
+}
+
+// assertStoppedVMSkippedDuringSplit is assertStoppedVMStayed while sv's host is
+// cut off from via: no host in others defines sv's domain (virsh), via's own
+// state.db still records sv stopped on its host, and the majority's failover
+// coordinator decided to leave it there — a failover.skip audit row for sv
+// since the drill began, which replicates to via within a minute. `lv
+// inspect` is not used: it is forwarded to the host the VM's row names, which
+// is on the other side of the split.
+func (l *lab) assertStoppedVMSkippedDuringSplit(sv stoppedVM, via string, others []string, since string) {
+	l.t.Helper()
+	l.assertNotDefinedOn(sv, others)
+	rows, err := l.sql(via, "SELECT host_name, state FROM vms WHERE name = '"+sv.name+"' AND deleted_at IS NULL")
+	switch {
+	case err != nil:
+		l.t.Errorf("read the stopped VM %s from %s's state.db: %v", sv.name, via, err)
+	case len(rows) != 1 || len(rows[0]) != 2:
+		l.t.Errorf("the stopped VM %s has rows %v in %s's state.db; want one", sv.name, rows, via)
+	case rows[0][0] != sv.host || rows[0][1] != "stopped":
+		l.t.Errorf("%s records the stopped VM %s %s on %s; want stopped on %s", via, sv.name, rows[0][1], rows[0][0], sv.host)
+	}
+	q := "SELECT result, detail FROM audit_log WHERE action = 'failover.skip' AND target = '" + sv.name + "' AND timestamp >= '" + since + "'"
+	deadline := time.Now().Add(time.Minute)
+	for {
+		rows, err := l.sql(via, q)
+		if err == nil && len(rows) > 0 {
+			if rows[0][0] != "skipped" {
+				l.t.Errorf("the failover.skip row for %s on %s is %v; want result skipped", sv.name, via, rows[0])
+			}
+			l.mark("drill1: %s left stopped on %s: failover.skip %q", sv.name, sv.host, rows[0][len(rows[0])-1])
+			return
+		}
+		if time.Now().After(deadline) {
+			l.t.Errorf("no failover.skip audit row for the stopped VM %s on %s since %s (err %v): the coordinator never decided to leave it", sv.name, via, since, err)
+			return
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// assertNotDefinedOn checks that no host in others defines sv's domain (virsh).
+func (l *lab) assertNotDefinedOn(sv stoppedVM, others []string) {
 	l.t.Helper()
 	for _, h := range others {
 		out, err := l.ssh(h, 20*time.Second, "virsh -c qemu:///system list --all --name")
@@ -723,14 +843,6 @@ func (l *lab) assertStoppedVMStayed(sv stoppedVM, via string, others []string) {
 				l.t.Errorf("the stopped VM %s is defined on %s (state %q): failover moved it", sv.name, h, strings.TrimSpace(st))
 			}
 		}
-	}
-	v, err := l.inspectVM(via, sv.name)
-	if err != nil {
-		l.t.Errorf("inspect the stopped VM %s: %v", sv.name, err)
-		return
-	}
-	if v.HostName != sv.host || v.State != "VM_STOPPED" {
-		l.t.Errorf("the stopped VM %s is recorded %s on %s; want VM_STOPPED on %s", sv.name, v.State, v.HostName, sv.host)
 	}
 }
 

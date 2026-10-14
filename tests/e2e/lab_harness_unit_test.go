@@ -96,3 +96,36 @@ func TestJoinMajority(t *testing.T) {
 		t.Errorf("unnamed hosts must join the larger group: %v", got)
 	}
 }
+
+// TestMinorityCopyStopped pins what drill 1b takes as proof that a minority
+// copy stopped executing (review I3): a host the sampler could not read for
+// any reason but a power-off proves nothing.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestMinorityCopyStopped(t *testing.T) {
+	const h, k = "node-1", "vm/a"
+	read := func(st string) round {
+		r := round{Copies: map[string]map[string]string{}, Down: map[string]string{}}
+		if st != "" {
+			r.Copies[k] = map[string]string{h: st}
+		}
+		return r
+	}
+	down := func(why string) round {
+		return round{Copies: map[string]map[string]string{}, Down: map[string]string{h: why}}
+	}
+	for name, c := range map[string]struct {
+		r    round
+		want bool
+	}{
+		"paused":                    {read("paused"), true},
+		"shut off":                  {read("shut_off"), true},
+		"read, guest absent":        {read(""), true},
+		"running":                   {read("running"), false},
+		"host powered off":          {down("powered off"), true},
+		"host read failed over ssh": {down("ssh node-1: timed out after 20s"), false},
+	} {
+		if got := minorityCopyStopped(c.r, h, k); got != c.want {
+			t.Errorf("%s: minorityCopyStopped = %v, want %v", name, got, c.want)
+		}
+	}
+}

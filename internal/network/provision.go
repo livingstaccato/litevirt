@@ -476,7 +476,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 // networkName that is being torn down, when this host's record says
 // EnsureBridge created it (RemoveCreatedBridgeIfUnused), no OTHER live
 // network uses it as its device, and no VM or container on hostName attaches
-// to it (bridgeNamedByWorkload). networkName itself does not count as a
+// to it (BridgeNamedByWorkload). networkName itself does not count as a
 // network: its own delete deprovisions before it tombstones the row.
 //
 // Every teardown of a bridge network reaches the bridge here — `lv network
@@ -516,7 +516,7 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 			return
 		}
 	}
-	if who, err := bridgeNamedByWorkload(ctx, db, hostName, networkName, bridge); err != nil {
+	if who, err := BridgeNamedByWorkload(ctx, db, hostName, networkName, bridge); err != nil {
 		slog.Warn("network teardown: cannot read this host's workload NICs, so the bridge stays",
 			"network", networkName, "bridge", bridge, "error", err)
 		return
@@ -535,7 +535,7 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 	}
 }
 
-// bridgeNamedByWorkload names a live VM or container on hostName with a NIC
+// BridgeNamedByWorkload names a live VM or container on hostName with a NIC
 // that attaches to bridge, or returns "" when there is none. A NIC attaches to
 // it when it names networkName (a `--force` delete leaves its NICs in place),
 // names the bridge itself (a flat-bridge NIC, `--network <bridge>`), names
@@ -547,7 +547,7 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 // VM start does not re-create its bridge, so removing it leaves that VM
 // unable to start. An error means the answer is unknown, and the caller keeps
 // the bridge: a leaked bridge is harmless, a missing one is not.
-func bridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, networkName, bridge string) (string, error) {
+func BridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, networkName, bridge string) (string, error) {
 	// The device each network name resolves to, from every network row,
 	// live or deleted: a VM's domain keeps the bridge it was defined with
 	// after its network is deleted. A name with no row is a flat bridge.

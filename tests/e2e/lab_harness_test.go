@@ -797,6 +797,9 @@ func (l *lab) voterSet(via string) (int, []string, error) {
 // leaseHolder is the failover lease holder in via's replica.
 func (l *lab) leaseHolder(via, key string) string {
 	l.t.Helper()
+	// The holder can be a witness outside E2E_LAB_NODES (lab 1's node-6); the
+	// harness addresses it only once outsiderHosts has registered it.
+	l.outsiderHosts()
 	rows := l.mustSQL(via, "SELECT holder FROM leader_election WHERE key='"+key+"'")
 	if len(rows) == 0 {
 		l.t.Fatalf("no %s lease row on %s", key, via)
@@ -826,6 +829,28 @@ func (l *lab) fenceStrategy(via, host string) string {
 		l.t.Fatalf("host inspect %s: %v", host, err)
 	}
 	return hi.FenceStrategy
+}
+
+// fenceableWhenOff is hosts minus those whose fence strategy cannot fence a
+// powered-off machine: an `ssh` fence of a host that is off cannot connect and
+// fails, and a `manual` one waits for an operator, so a power-off drill that
+// expects its victim's workloads recovered must not pick either. It skips the
+// test when none is left.
+func (l *lab) fenceableWhenOff(via string, hosts []string) []string {
+	l.t.Helper()
+	var out []string
+	for _, h := range hosts {
+		switch l.fenceStrategy(via, h) {
+		case "ssh", "manual":
+			l.mark("victim choice: %s is on an ssh or manual fence, which cannot fence it powered off; not a candidate", h)
+		default:
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		l.t.Skipf("no host among %v has a fence strategy that can fence a powered-off host (best-effort, ipmi, redfish)", hosts)
+	}
+	return out
 }
 
 // vmInfo is the slice of `lv inspect` the drills read.
@@ -1315,13 +1340,21 @@ func (l *lab) restore(b baseline) {
 			t.Errorf("restore: power on %v: %v", down, err)
 		}
 	}
-	for _, h := range l.hosts {
+	for _, h := range l.outsiders {
+		if !l.isUp(h) {
+			if err := l.powerOn(h); err != nil {
+				t.Errorf("restore: power on %s: %v", h, err)
+			}
+		}
+	}
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiders...) {
 		if err := l.waitDaemon(h, 4*time.Minute); err != nil {
 			t.Errorf("restore: %v", err)
 		}
 	}
-	// 3. Original configs, one restart at a time.
-	for _, h := range l.hosts {
+	// 3. Original configs, one restart at a time, witnesses outside
+	//    l.hosts included (a drill may set their enforcement too).
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiders...) {
 		restarted, err := l.restoreConfig(h)
 		if err != nil {
 			t.Errorf("restore: config on %s: %v", h, err)

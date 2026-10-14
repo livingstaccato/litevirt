@@ -185,15 +185,30 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 	// The VM's disk is host-local, so the drain moves it cold: it asks the guest
 	// to shut down (ACPI) and waits out the VM's stop timeout (30 s by default,
 	// and a guest that has not shut down by then is NOT forced off: the VM is
-	// "not moved"), then copies the disks. Give the guest a realistic stop
+	// "not moved"), then copies the disks (guestCompletesShutdown below). Give the guest a realistic stop
 	// grace period, and the CLI the budget the suite's other drains use
 	// (drainCLITimeout) instead of the 2 minutes of an ordinary lv call.
 	vm := isoVMWith(l, via, src, "    stop-grace-period: 120s\n")
 	requireISOOpened(l, src, vm, isoFileOf(src))
 
 	t.Cleanup(func() { l.lv(via, "host", "undrain", src) })
+	// cirros ignores the ACPI shutdown a cold move asks for, so the guest's
+	// part is played here: once the drain has recorded the VM stopped on src
+	// (it does so before it asks the guest to shut down), the domain is
+	// powered off, as a guest that completes its shutdown powers off. A live
+	// move never records the VM stopped, so it is left alone.
+	done, exited := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(exited)
+		guestCompletesShutdown(l, src, vm, done)
+	}()
 	out, err := l.lvTimeout(via, drainCLITimeout, "host", "drain", src)
-	if err != nil && !strings.Contains(out, "drain incomplete") {
+	close(done)
+	<-exited // it logs through t: it must not outlive the test
+	// "drain incomplete" is on stderr, in err: another VM on src that cannot
+	// move (lab 1's rc5-lcs, whose backing file is gone) fails the drain
+	// without bearing on this VM, whose own line is judged below.
+	if err != nil && !strings.Contains(out+err.Error(), "drain incomplete") {
 		t.Fatalf("drain %s: %v\n%s", src, err, out)
 	}
 	var line string
@@ -217,6 +232,30 @@ func TestLab_ISODrainOpensTheTargetsFile(t *testing.T) {
 			t.Fatalf("the drain's line for %s names no strategy: %q", vm, line)
 		}
 	})
+}
+
+// guestCompletesShutdown powers vm's domain off on host once host's replica
+// records the VM stopped while the domain still runs: the drain's cold move
+// has asked the guest to shut down. It returns when done closes.
+func guestCompletesShutdown(l *lab, host, vm string, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		rows, err := l.sql(host, "SELECT state FROM vms WHERE name = '"+vm+"' AND deleted_at IS NULL")
+		if err != nil || len(rows) != 1 || rows[0][0] != "stopped" {
+			continue
+		}
+		out, _ := l.ssh(host, 20*time.Second, "virsh -c qemu:///system domstate "+shellQuote(vm)+" 2>/dev/null")
+		if strings.TrimSpace(out) != "running" {
+			continue
+		}
+		l.mark("iso: the drain asked %s to shut down on %s; powering the domain off for the guest (cirros ignores ACPI)", vm, host)
+		_, _ = l.ssh(host, 30*time.Second, "virsh -c qemu:///system destroy "+shellQuote(vm))
+		return
+	}
 }
 
 func TestLab_ISOMemoryRevertOpensTheJudgedFile(t *testing.T) {

@@ -1391,7 +1391,7 @@ See `docs/firewall.md` for the three-tier model, where each tier is enforced
 
 ```bash
 lv audit ls [--limit N] \
-    [--target <path>] [--action <a>] [--user <u>] [--since <time>]   # Tail/filter recent audit entries
+    [--target <path>] [--action <a>] [--user <u>] [--since <time>] [--until <time>]   # Tail/filter recent audit entries
   #   --action supports a trailing-* prefix glob (e.g. sg.*)
 lv audit verify                                # Walk the SHA-256 hash chain
 lv audit export [--since <time>] [--until <time>] [--out audit.json] [--allow-gaps]   # Export WORM-ready JSON
@@ -1407,7 +1407,7 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
-lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>]   # Audit log (default 50 entries)
+lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics
 ```

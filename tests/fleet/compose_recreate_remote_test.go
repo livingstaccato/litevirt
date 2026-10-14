@@ -68,8 +68,7 @@ func newRecreateRemoteFleet(t *testing.T, deployer int, host string) (*Cluster, 
 	c.WaitConverged(t, 20*time.Second)
 	d := c.Nodes[deployer]
 	deployClean(t, ctx, c.SelfClient(d), recreateRemoteYAML(host, "first"))
-	// Every replica holds web as its host wrote it (vms is compared apart:
-	// waitHistoryApplied).
+	// Every replica holds web as its host wrote it.
 	waitHistoryApplied(t, c, 20*time.Second)
 	var owner *Node
 	for _, n := range c.Nodes {

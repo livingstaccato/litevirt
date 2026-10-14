@@ -1794,8 +1794,18 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// concurrent ownership transfer or state change is observed before we act. If
 	// ownership moved off this host in that window, abort for retry rather than
 	// forward while holding the lock (never hold a process lock across a peer RPC).
-	unlock := s.lockVM(req.Name)
-	defer unlock()
+	//
+	// The lock is held until the start has settled: a start libvirt does
+	// not answer within the wait answers the caller and goes on holding it
+	// (startDomainWithin), and a start that finds one of those answers the
+	// same at once (lockVMForStart).
+	unlock, err := s.lockVMForStart(ctx, req.Name)
+	if err != nil {
+		return nil, err
+	}
+	held := &heldForStart{}
+	held.hold(unlock)
+	defer held.release()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
@@ -1822,7 +1832,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 				"%q was moved here by failover while stopped and %s is defining its domain; retry in a moment",
 				req.Name, heldBy)
 		}
-		defer health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name)
+		held.hold(func() { health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name) })
 	}
 
 	spec := &pb.VMSpec{}
@@ -1836,13 +1846,15 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, err
 	}
 	// The reservation must outlive startVMLocked's state write.
-	defer lease.release(ctx)
+	held.hold(func() { lease.release(ctx) })
 	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
 		return nil, err
 	} else if rearmed {
 		return s.vmToProto(ctx, vm.Name)
 	}
-	return s.startVMLocked(ctx, vm)
+	out, err := s.startVMLockedWithin(ctx, vm, s.startDomainWaitOrDefault())
+	held.handOff(err)
+	return out, err
 }
 
 // restartCancelledStartLocked makes again a start an operator cancelled
@@ -2166,6 +2178,14 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	return s.startVMLockedWithin(ctx, vm, 0)
+}
+
+// startVMLockedWithin is startVMLocked waiting at most wait (zero: as long as
+// it takes) for libvirt to answer the start. Past it, the start goes on and a
+// startInFlightError is returned; the caller must hold the VM lock until its
+// settled is closed (heldForStart), not let it go on return.
+func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration) (*pb.VM, error) {
 	// A VM with a shared disk whose row names another host (a partial
 	// promotion's, review R4-I2) has its domain redefined from its rows first,
 	// which judges that host again: a disk it withheld is attached once the
@@ -2194,8 +2214,19 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 		releasePreflight()
 		return nil, status.Error(codes.FailedPrecondition, gerr.Error())
 	}
-	startErr := s.virt.StartDomain(vm.Name)
-	releaseGuard()
+	finish := func(ctx context.Context, startErr error) (*pb.VM, error) {
+		releaseGuard()
+		return s.finishStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec)
+	}
+	if wait <= 0 {
+		return finish(ctx, s.virt.StartDomain(vm.Name))
+	}
+	return s.startDomainWithin(ctx, vm.Name, wait, finish)
+}
+
+// finishStartLocked records the answer libvirt gave startVMLocked's start.
+func (s *Server) finishStartLocked(ctx context.Context, vm *corrosion.VMRecord, startErr error,
+	releasePreflight func(), pbVM *pb.VM, hspec *pb.HooksSpec) (*pb.VM, error) {
 	if err := startErr; err != nil {
 		// Heal a state desync: if libvirt reports the domain is already
 		// running, the cluster record was stale (an out-of-band start, or an

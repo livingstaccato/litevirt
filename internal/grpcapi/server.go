@@ -797,6 +797,12 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// startFlights holds each start whose StartDomain libvirt has not
+	// answered yet (vm_start_bound.go); startDomainWait is how long StartVM
+	// waits for that answer (zero: defaultStartDomainWait).
+	startFlightsMu  sync.Mutex
+	startFlights    map[string]*startFlight
+	startDomainWait time.Duration
 	// operatorClaimMu makes an operator promotion's start fence and every
 	// abandonment of a proof on this host one decision (promote_serialize.go).
 	operatorClaimMu sync.Mutex

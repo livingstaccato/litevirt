@@ -145,11 +145,7 @@ func assertOnlyDeleterTombstoned(t *testing.T, c *Cluster, deleter *Node) {
 
 // waitHistoryApplied waits until every node has applied every replicated
 // write every other node has made so far — the late tombstone included — and
-// every table but vms agrees. vms is compared by the caller: a create's
-// hardware_adoption_state stays apart between the creating host and its
-// peers on this build whatever the create (the adoption UPDATE carries the
-// insert's own updated_at, which the receivers' LWW gate drops), which is not
-// what these scenarios are about.
+// every table agrees.
 func waitHistoryApplied(t *testing.T, c *Cluster, timeout time.Duration) {
 	t.Helper()
 	ctx := context.Background()
@@ -180,7 +176,7 @@ func waitHistoryApplied(t *testing.T, c *Cluster, timeout time.Duration) {
 			}
 		}
 	}
-	c.WaitConvergedExcept(t, time.Until(deadline), []string{"vms"})
+	c.WaitConverged(t, time.Until(deadline))
 }
 
 // whereIs says what is left of VM name once replication has caught up: its

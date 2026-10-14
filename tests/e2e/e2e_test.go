@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -399,6 +400,10 @@ var setupOnce sync.Once
 // Discovery is idempotent, so making it lazy costs nothing and removes the trap.
 func ensureTopology(t *testing.T) {
 	t.Helper()
+	// Before the Once: in lab mode every lv call skips its test, and a skip
+	// inside the Once would consume it with hostNames still empty, leaving every
+	// later caller to index an empty slice.
+	requireNotLabMode(t)
 	setupOnce.Do(func() { discoverTopology(t) })
 }
 
@@ -504,7 +509,20 @@ func TestCluster_Version(t *testing.T) {
 }
 
 func TestCluster_Health(t *testing.T) {
-	out := lv(t, "health")
+	// `lv health` exits 1 when the overall state is DEGRADED (and 2 when
+	// CRITICAL): the report is still printed in full. This test pins that the
+	// report names the cluster's hosts, so a DEGRADED cluster, whose old
+	// conditions this test did not create, is a valid report. Only a report that
+	// was not produced at all (an error, no "overall:" line) or one that says
+	// CRITICAL fails here.
+	out, err := lvErr(t, "health")
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 1 || !strings.HasPrefix(out, "overall: DEGRADED") {
+			t.Fatalf("lv health failed, or reports something worse than DEGRADED: %v\n%s", err, out)
+		}
+		t.Logf("cluster is DEGRADED (exit 1); checking the report still names the hosts:\n%s", out)
+	}
 	// At least the local/connected host should appear.
 	found := false
 	for _, h := range hostNames {
@@ -1099,8 +1117,11 @@ vms:
       root: 5G
     replicas: 2
     update:
-      strategy: start-first
-      max-parallel: 1
+      strategy: rolling
+      max-unavailable: 1
+      max-surge: 1
+      order: start-first
+      health-wait: 30s
 `, stackName, vmBase, testImage, cpu)
 		f := fmt.Sprintf("/tmp/e2e-compose-%d.yaml", os.Getpid())
 		os.WriteFile(f, []byte(compose), 0644)
@@ -2657,6 +2678,18 @@ vms:
 	// it. The inet table's forward chain must appear exactly once (regression
 	// guard for the atomic-replace fix: a merge-not-replace bug duplicated it).
 	t.Run("RenderedIntoKernel", func(t *testing.T) {
+		// The SG's drop renders as a drop in enforce mode and, in observe mode
+		// (`lv firewall enforce off`), as a counter that returns, carrying an
+		// "lv-wd" comment: the shape depends on the cluster's per-NIC mode, so
+		// read the mode and assert the shape that mode promises.
+		var observe bool
+		switch mode := nicEnforcementMode(lv(t, "firewall", "enforce", "status")); mode {
+		case "enforce":
+		case "observe":
+			observe = true
+		default:
+			t.Skipf("per-NIC enforcement is %q: the SG's per-NIC chain is not rendered in that mode", mode)
+		}
 		var nic, inet string
 		var chain string
 		deadline := time.Now().Add(2 * time.Minute) // tap discovery + 30s reconcile + margin
@@ -2674,7 +2707,7 @@ vms:
 		if chain == "" {
 			t.Fatalf("web SG never rendered into a nic_in_ chain of bridge litevirt-nic on %s within 2m:\n%s", host, nic)
 		}
-		if err := sgChainOrdered(chain); err != nil {
+		if err := sgChainOrdered(chain, observe); err != nil {
 			t.Errorf("%v:\n%s", err, chain)
 		}
 		// Scoped to the bound NIC: exactly one nic_in_ chain carries the rule.
@@ -2688,18 +2721,37 @@ vms:
 		if n := strings.Count(inet, "hook forward"); n != 1 {
 			t.Errorf("forward chain appears %d times in inet litevirt-fw, want 1 (atomic-replace regression):\n%s", n, inet)
 		}
-		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (8080 accept, DHCP accept, drop; single inet forward chain)", host)
+		t.Logf("bridge litevirt-nic on %s rendered the web SG correctly (observe=%v: 8080 accept, DHCP accept, drop or would-drop counter; single inet forward chain)", host, observe)
 	})
+}
+
+// nicEnforcementMode parses the mode out of `lv firewall enforce status`
+// ("per-NIC enforcement: enforce|observe|guards-only ..."), "" when absent.
+func nicEnforcementMode(status string) string {
+	_, rest, ok := strings.Cut(status, "per-NIC enforcement:")
+	if !ok {
+		return ""
+	}
+	f := strings.Fields(rest)
+	if len(f) == 0 {
+		return ""
+	}
+	return f[0]
 }
 
 // sgChainOrdered checks a nic_in_ chain of an nft listing carries the web SG as
 // three consecutive rules: tcp 8080 accept, udp 68 accept, and the SG's own
 // `proto all drop`. Rules in a NIC chain are scoped to the NIC, so they list as
-// `oifname "vnetX" tcp dport 8080 accept` and the drop as `oifname "vnetX" drop`.
-// The drop is matched by its tokens (the NIC match, then only the verdict), and
-// must be the rule right after the DHCP accept: a later drop, such as a cluster
-// default-deny, would not prove the SG's rendered.
-func sgChainOrdered(chain string) error {
+// `oifname "vnetX" tcp dport 8080 accept`.
+//
+// In enforce mode the drop is `oifname "vnetX" drop`, matched by its tokens
+// (the NIC match, then only the verdict). In observe mode the product renders
+// every drop as a counter that returns, labelled with an "lv-wd" comment
+// (internal/firewall/nic_table.go): `oifname "vnetX" counter ... return comment
+// "lv-wd vnetX in sg:web#2"`, and it must NOT be a drop. Either way the verdict
+// rule must be the rule right after the DHCP accept: a later drop, such as a
+// cluster default-deny, would not prove the SG's rendered.
+func sgChainOrdered(chain string, observe bool) error {
 	var rules []string
 	for _, l := range strings.Split(chain, "\n") {
 		if l = strings.TrimSpace(l); l != "" && l != "}" && !strings.HasSuffix(l, "{") && !strings.HasPrefix(l, "type ") {
@@ -2713,10 +2765,23 @@ func sgChainOrdered(chain string) error {
 		if i+2 >= len(rules) || !strings.HasSuffix(rules[i+1], "udp dport 68 accept") {
 			return fmt.Errorf("the SG's 8080 accept is not followed by its DHCP accept")
 		}
-		f := strings.Fields(rules[i+2])
-		if len(f) < 2 || f[0] != "oifname" || f[len(f)-1] != "drop" || strings.ContainsAny(rules[i+2], "{}") ||
-			strings.Contains(rules[i+2], "dport") || strings.Contains(rules[i+2], "saddr") || strings.Contains(rules[i+2], "daddr") {
-			return fmt.Errorf("the SG's drop does not follow its DHCP accept (next rule: %q)", rules[i+2])
+		v := rules[i+2]
+		f := strings.Fields(v)
+		// The match part, before any comment text (which may hold anything).
+		match, comment, _ := strings.Cut(v, " comment ")
+		mf := strings.Fields(match)
+		if len(f) < 2 || f[0] != "oifname" || strings.ContainsAny(match, "{}") ||
+			strings.Contains(match, "dport") || strings.Contains(match, "saddr") || strings.Contains(match, "daddr") {
+			return fmt.Errorf("the SG's verdict does not follow its DHCP accept (next rule: %q)", v)
+		}
+		if !observe {
+			if f[len(f)-1] != "drop" {
+				return fmt.Errorf("enforce mode: the SG's drop does not follow its DHCP accept (next rule: %q)", v)
+			}
+			return nil
+		}
+		if mf[len(mf)-1] != "return" || !strings.Contains(match, "counter") || !strings.HasPrefix(comment, `"lv-wd `) || !strings.Contains(comment, " in sg:") {
+			return fmt.Errorf("observe mode: the SG's drop is not an lv-wd counter-return (next rule: %q)", v)
 		}
 		return nil
 	}
@@ -2725,7 +2790,7 @@ func sgChainOrdered(chain string) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.
@@ -2775,8 +2840,25 @@ func TestSGChainOrdered(t *testing.T) {
 		oifname "vnet3" udp dport 68 accept
 		oifname "vnet3" drop
 	}`
-	if err := sgChainOrdered(good); err != nil {
+	if err := sgChainOrdered(good, false); err != nil {
 		t.Errorf("a correct chain was refused: %v", err)
+	}
+	const observed = `	chain nic_in_vnet3 {
+		oifname "vnet3" tcp dport 8080 accept
+		oifname "vnet3" udp dport 68 accept
+		oifname "vnet3" counter packets 0 bytes 0 return comment "lv-wd vnet3 in sg:web#2"
+	}`
+	if err := sgChainOrdered(observed, true); err != nil {
+		t.Errorf("a correct observe-mode chain was refused: %v", err)
+	}
+	if err := sgChainOrdered(observed, false); err == nil {
+		t.Error("an observe-mode chain was accepted as an enforce-mode one")
+	}
+	if err := sgChainOrdered(good, true); err == nil {
+		t.Error("an enforce-mode chain was accepted as an observe-mode one")
+	}
+	if nicEnforcementMode("per-NIC enforcement: observe (since x)\n") != "observe" || nicEnforcementMode("nothing") != "" {
+		t.Error("nicEnforcementMode misparses the status line")
 	}
 	for name, bad := range map[string]string{
 		"drop missing, a later default-deny drop": "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 22 accept\ndrop\n",
@@ -2785,7 +2867,7 @@ func TestSGChainOrdered(t *testing.T) {
 		"accepts out of order":    "oifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" drop\n",
 		"verdict is not a drop":   "oifname \"vnet3\" tcp dport 8080 accept\noifname \"vnet3\" udp dport 68 accept\noifname \"vnet3\" accept\n",
 	} {
-		if err := sgChainOrdered(bad); err == nil {
+		if err := sgChainOrdered(bad, false); err == nil {
 			t.Errorf("%s: an incorrect chain was accepted", name)
 		}
 	}
@@ -2829,6 +2911,7 @@ func TestFirewallManagementCLI(t *testing.T) {
 	})
 
 	t.Run("HostRule", func(t *testing.T) {
+		requireHosts(t, 1) // skips, rather than indexing an empty hostNames
 		out := lv(t, "firewall", "host-rule", "add", "--host", hostNames[0], "--direction", "ingress",
 			"--proto", "tcp", "--port", "59444", "--action", "accept")
 		t.Log(out)

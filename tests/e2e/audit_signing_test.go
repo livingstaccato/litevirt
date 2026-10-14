@@ -106,6 +106,18 @@ func TestAuditSigningKeyIsNotReadableByOthers(t *testing.T) {
 // ignore the command entirely.
 func TestAuditVerifyReportsSigningState(t *testing.T) {
 	out, err := lvErr(t, "audit", "verify")
+	if err != nil && strings.Contains(out, "AUDIT CHAIN FORKED") && !strings.Contains(out, "TAMPERED") {
+		// A fork alone: the verifier found no edited, deleted or forged row, only
+		// a second chain opened under a host name that already had one (the lab's
+		// known artefact, which no test here made and no test here can heal). The
+		// claim below, that a clean log reads as intact, cannot be made on it. The
+		// run is excused only for a fork the operator named: a NEW fork has another
+		// chain id and still fails.
+		if known := os.Getenv("E2E_KNOWN_AUDIT_FORK"); known != "" && strings.Contains(out, known) {
+			t.Skipf("the log holds the known fork %s, which this test did not create; verify says:\n%s", known, out)
+		}
+		t.Fatalf("the live cluster's audit chain is forked (set E2E_KNOWN_AUDIT_FORK to the chain id to excuse a known one):\n%s", out)
+	}
 	if err != nil {
 		if !strings.Contains(out, "TAMPERED") {
 			t.Fatalf("audit verify failed for a reason other than a finding: %v\n%s", err, out)

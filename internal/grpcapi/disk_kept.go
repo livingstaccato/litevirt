@@ -59,57 +59,151 @@ type diskKeptRecord struct {
 }
 
 type diskKeptFiles struct {
-	mu     sync.Mutex
-	loaded bool
-	m      map[string]diskKeptRecord // host + "\x00" + path → record
+	mu sync.Mutex
+	m  map[string]diskKeptRecord // host + "\x00" + path → record
+	// sig is the file as this process last read or wrote it (present, its
+	// mtime and size); a different one is re-read (syncDiskKeptLocked).
+	sig diskKeptSig
+	// unreadable is why the file cannot be read now: nothing is written
+	// over it, and what is recorded meanwhile is kept in memory (unsaved).
+	unreadable error
+	unsaved    bool // m holds entries the file does not
+	warned     bool // unreadable is logged, once until the file reads
+}
+
+type diskKeptSig struct {
+	known, present bool
+	mod            time.Time
+	size           int64
 }
 
 func diskKeptKey(host, path string) string { return host + "\x00" + path }
 
-// diskKeptLocked loads the record file once; mu is held.
+// diskKeptLocked brings the in-memory record in line with the file and
+// returns it; mu is held.
+//
+// The file is the operator's handle on disk_leftover: an entry removed from
+// it by hand (a disk kept on purpose, one on another host) stops being named
+// once the file is re-read, which is whenever its mtime or size differs from
+// what this process last read or wrote — within one judgeKeptDisks pass. A
+// file removed whole names nothing.
+//
+// A file that cannot be read (corrupt, a bad hand edit, an I/O error) is
+// never written over and never read as empty: the names already in memory
+// are kept, and what is recorded meanwhile is kept in memory too (unsaved);
+// disk_leftover names the file and the recovery (judgeKeptDisks). Once it
+// reads again, what was recorded meanwhile is merged in and saved.
 func (s *Server) diskKeptLocked() map[string]diskKeptRecord {
 	k := &s.diskKept
-	if !k.loaded {
-		k.loaded, k.m = true, map[string]diskKeptRecord{}
-		if s.dataDir != "" {
-			raw, err := os.ReadFile(filepath.Join(s.dataDir, diskKeptFile))
-			switch {
-			case err == nil:
-				var list []diskKeptRecord
-				if jerr := json.Unmarshal(raw, &list); jerr != nil {
-					slog.Warn("delete: the record of kept disks cannot be read", "file", diskKeptFile, "error", jerr)
+	if k.m == nil {
+		k.m = map[string]diskKeptRecord{}
+	}
+	if s.dataDir == "" {
+		return k.m
+	}
+	path := filepath.Join(s.dataDir, diskKeptFile)
+	sig := diskKeptSig{known: true}
+	fi, serr := os.Stat(path)
+	switch {
+	case serr == nil:
+		sig.present, sig.mod, sig.size = true, fi.ModTime(), fi.Size()
+	case !errors.Is(serr, os.ErrNotExist):
+		k.markUnreadable(path, serr)
+		return k.m
+	}
+	if k.unreadable == nil && sig == k.sig {
+		return k.m
+	}
+	fromFile := map[string]diskKeptRecord{}
+	if sig.present {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var list []diskKeptRecord
+			if jerr := json.Unmarshal(raw, &list); jerr != nil {
+				err = jerr
+			}
+			for _, r := range list {
+				if r.Path != "" {
+					fromFile[diskKeptKey(r.Host, r.Path)] = r
 				}
-				for _, r := range list {
-					if r.Path != "" {
-						k.m[diskKeptKey(r.Host, r.Path)] = r
-					}
-				}
-			case !errors.Is(err, os.ErrNotExist):
-				slog.Warn("delete: the record of kept disks cannot be read", "file", diskKeptFile, "error", err)
 			}
 		}
+		if err != nil {
+			k.markUnreadable(path, err)
+			return k.m
+		}
 	}
+	if k.unreadable != nil {
+		slog.Info("delete: the record of kept disks reads again", "file", path)
+	}
+	k.unreadable, k.warned = nil, false
+	k.sig = sig
+	if k.unsaved {
+		// Recorded while the file could not be read, or a save failed:
+		// merged in, and saved.
+		for key, r := range k.m {
+			if _, ok := fromFile[key]; !ok {
+				fromFile[key] = r
+			}
+		}
+		k.m = fromFile
+		s.saveDiskKeptLocked()
+		return k.m
+	}
+	k.m = fromFile
 	return k.m
 }
 
-// saveDiskKeptLocked writes the record file durably; mu is held.
+// markUnreadable records that the file cannot be read; mu is held.
+func (k *diskKeptFiles) markUnreadable(path string, err error) {
+	k.unreadable = err
+	k.sig = diskKeptSig{}
+	// What is named now is merged into the file once it reads, whatever
+	// the fix (an edit, or the file removed): never lost.
+	if len(k.m) > 0 {
+		k.unsaved = true
+	}
+	if !k.warned {
+		k.warned = true
+		slog.Warn("delete: the record of kept disks cannot be read; it is not written over, and the disks it names stay named "+
+			"from memory. Fix the file, or remove it (the disks recorded since this daemon started are kept and saved), so that it reads",
+			"file", path, "error", err)
+	}
+}
+
+// saveDiskKeptLocked writes the record file durably; mu is held. A file that
+// cannot be read is never written over: the record stays in memory.
 func (s *Server) saveDiskKeptLocked() {
+	k := &s.diskKept
 	if s.dataDir == "" {
 		return
 	}
-	list := make([]diskKeptRecord, 0, len(s.diskKept.m))
-	for _, r := range s.diskKept.m {
+	if k.unreadable != nil {
+		k.unsaved = true
+		return
+	}
+	list := make([]diskKeptRecord, 0, len(k.m))
+	for _, r := range k.m {
 		list = append(list, r)
 	}
 	sort.Slice(list, func(i, j int) bool {
 		return diskKeptKey(list[i].Host, list[i].Path) < diskKeptKey(list[j].Host, list[j].Path)
 	})
+	path := filepath.Join(s.dataDir, diskKeptFile)
 	raw, err := json.MarshalIndent(list, "", "  ")
 	if err == nil {
-		err = writeSynced(filepath.Join(s.dataDir, diskKeptFile), raw)
+		err = writeSynced(path, raw)
 	}
 	if err != nil {
-		slog.Warn("delete: the record of kept disks was not saved; a restart forgets them", "error", err)
+		k.unsaved = true
+		slog.Warn("delete: the record of kept disks was not saved; a restart forgets the disks not in it", "error", err)
+		return
+	}
+	k.unsaved = false
+	if fi, serr := os.Stat(path); serr == nil {
+		k.sig = diskKeptSig{known: true, present: true, mod: fi.ModTime(), size: fi.Size()}
+	} else {
+		k.sig = diskKeptSig{}
 	}
 }
 
@@ -150,7 +244,9 @@ func setKeptDiskHeader(ctx context.Context, kept []KeptDisk) {
 	_ = grpc.SetHeader(ctx, md)
 }
 
-func (s *Server) diskKeptRecords() []diskKeptRecord {
+// diskKeptRecords is the record, re-read when the file changed, and why the
+// file cannot be read ("" when it can).
+func (s *Server) diskKeptRecords() ([]diskKeptRecord, string) {
 	s.diskKept.mu.Lock()
 	defer s.diskKept.mu.Unlock()
 	m := s.diskKeptLocked()
@@ -161,7 +257,11 @@ func (s *Server) diskKeptRecords() []diskKeptRecord {
 	sort.Slice(out, func(i, j int) bool {
 		return diskKeptKey(out[i].Host, out[i].Path) < diskKeptKey(out[j].Host, out[j].Path)
 	})
-	return out
+	unreadable := ""
+	if err := s.diskKept.unreadable; err != nil {
+		unreadable = err.Error()
+	}
+	return out, unreadable
 }
 
 // judgeKeptDisks forgets the kept disks on this host that are gone (a
@@ -170,9 +270,10 @@ func (s *Server) diskKeptRecords() []diskKeptRecord {
 // left, resolving it once none is.
 func (s *Server) judgeKeptDisks(ctx context.Context) {
 	var left []diskKeptRecord
-	for _, r := range s.diskKeptRecords() {
+	records, unreadable := s.diskKeptRecords()
+	for _, r := range records {
 		if r.Host == s.hostName {
-			if there, err := diskFileThere(s.hostDiskFile(r.Path)); err == nil && !there {
+			if p, _ := diskPresence(s.hostDiskFile(r.Path)); p == presenceGone {
 				s.diskKept.mu.Lock()
 				delete(s.diskKeptLocked(), diskKeptKey(r.Host, r.Path))
 				s.saveDiskKeptLocked()
@@ -197,7 +298,7 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	if len(left) == 0 {
+	if len(left) == 0 && unreadable == "" {
 		if !found || row.Lifecycle == corrosion.ConditionResolved {
 			return
 		}
@@ -235,12 +336,19 @@ func (s *Server) judgeKeptDisks(ctx context.Context) {
 			hosts = append(hosts, r.Host)
 		}
 	}
-	ev, _ := json.Marshal(map[string]any{
+	evidence := map[string]any{
 		"host": s.hostName, "disks": list,
 		"detail": fmt.Sprintf("%d disk file(s) VM deletes on %s kept, each with its reason; check that nothing uses each one (another VM's disk, "+
 			"a process holding it open) and remove it by hand — litevirt removes none of them. A file on this host is forgotten once it is gone",
 			len(list), s.hostName),
-	})
+		"forget": fmt.Sprintf("to stop naming a disk you keep on purpose, or one on another host, remove its entry from %s on %s; the file is re-read within 30 s",
+			filepath.Join(s.dataDir, diskKeptFile), s.hostName),
+	}
+	if unreadable != "" {
+		evidence["record_unreadable"] = fmt.Sprintf("%s cannot be read (%s): it is not written over, and the disks named here are kept from memory; "+
+			"fix the file, or remove it (the disks recorded since this daemon started are kept and saved)", filepath.Join(s.dataDir, diskKeptFile), unreadable)
+	}
+	ev, _ := json.Marshal(evidence)
 	row.Evidence = string(ev)
 	row.Hosts = hosts
 	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName

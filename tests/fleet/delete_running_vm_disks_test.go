@@ -3,6 +3,7 @@ package fleet
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -89,5 +90,52 @@ func TestFleet_DeleteVMAProbedPeerThatRefusesKeepsTheRecord(t *testing.T) {
 	}
 	if !n1.Virt.DomainExists("web") {
 		t.Error("the refusing peer's domain is gone")
+	}
+}
+
+// m-9: a probed peer that has the domain and refuses its delete with a code
+// other than FailedPrecondition — here its removal of the VM's disk fails
+// after its teardown (Internal) — marks the refusal, and the probing host
+// passes it on with its code and keeps the record, never removing it as
+// stale.
+//
+// Mutation: pass on FailedPrecondition only (ignore the trailer) — the
+// record is removed: red.
+func TestFleet_DeleteVMAProbedPeersMarkedRefusalKeepsTheRecord(t *testing.T) {
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+	c.WaitConverged(t, convergeTimeout)
+	ctx := context.Background()
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	importImageOn(t, c, n1, "ubuntu")
+	if _, err := c.SelfClient(n1).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "web", Image: "ubuntu", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name}}}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 15*time.Second, n0.Name+" to see web", func() bool {
+		vm, err := corrosion.GetVM(ctx, n0.DB, "web")
+		return err == nil && vm != nil
+	})
+	disks, err := corrosion.GetVMDisks(ctx, n1.DB, "web")
+	if err != nil || len(disks) == 0 {
+		t.Fatalf("web's disks on %s: %v %v", n1.Name, disks, err)
+	}
+	// Its disk's unlink fails on n1: a non-empty directory in its place.
+	p := disks[0].Path
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(p, "busy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := localExec(ctx, n0.DB, `UPDATE vms SET host_name = ? WHERE name = 'web'`, n0.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = c.SelfClient(n0).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "web"})
+	if err == nil || status.Code(err) == codes.FailedPrecondition || status.Code(err) == codes.NotFound {
+		t.Fatalf("DeleteVM: %v, want the peer's own refusal passed on", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, n0.DB, "web"); vm == nil {
+		t.Error("the record was removed as stale while the peer that has the VM refused its delete")
 	}
 }

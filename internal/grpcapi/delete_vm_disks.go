@@ -48,9 +48,10 @@ func (e probeNoAnswer) GRPCStatus() *status.Status { return status.Convert(e.err
 type diskLeftover struct {
 	disk, path string
 	// target is what is left on this host: the disk file, or for a btrfs
-	// disk whose driver failed, its subvolume.
-	target string
-	err    error
+	// disk whose driver failed, its subvolume; named is the same, as the
+	// records name it (target is it under hostDiskFile).
+	target, named string
+	err           error
 }
 
 // diskDecision is whether a caller lets freeRecordedVMDisks free d, and if
@@ -69,6 +70,7 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 		return nil, nil, []diskLeftover{{err: fmt.Errorf("list its disks: %w", err)}}
 	}
 	var kept []KeptDisk
+	var cephKeptHere []KeptCephImage
 	var leftovers []diskLeftover
 	errs := make([]error, len(disks))
 	tried := make([]bool, len(disks))
@@ -78,17 +80,27 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 		if d.Path == "" || !d.DeleteWithVM {
 			continue
 		}
+		// keep names a disk kept: a ceph image by ceph_image_leftover,
+		// which rechecks its pool, any other by disk_leftover.
+		keep := func(host, why string) {
+			if strings.HasPrefix(d.Path, "rbd:") {
+				if k, ok := s.recordKeptCephImage(vmName, d, errors.New(why)); ok {
+					cephKeptHere = append(cephKeptHere, k)
+					return
+				}
+			}
+			kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: host, Reason: why})
+		}
 		if decide != nil {
 			if free, why, host := decide(d); !free {
-				kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: host, Reason: why})
+				keep(host, why)
 				continue
 			}
 		}
 		used, uerr := s.diskUsedByOtherVM(ctx, vmName, d)
 		if uerr != nil {
 			// Never removed on a guess, never left unnamed.
-			kept = append(kept, KeptDisk{Path: d.Path, Disk: d.DiskName, Host: s.hostName,
-				Reason: "whether another VM uses it cannot be told (" + uerr.Error() + ")"})
+			keep(s.hostName, "whether another VM uses it cannot be told ("+uerr.Error()+")")
 			continue
 		}
 		if used {
@@ -108,10 +120,10 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 		del()
 	}
 	wg.Wait()
-	cephKept := s.keptFromErrs(vmName, disks, errs)
-	named := map[string]bool{}
+	cephKept := append(cephKeptHere, s.keptFromErrs(vmName, disks, errs)...)
+	cephNamed := map[string]bool{}
 	for _, k := range cephKept {
-		named[k.Disk] = true
+		cephNamed[k.Disk] = true
 	}
 	for i := range disks {
 		d := &disks[i]
@@ -120,14 +132,14 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 		}
 		file := s.hostDiskFile(d.Path)
 		if err := errs[i]; err != nil {
-			if !named[d.DiskName] {
-				target := file
+			if !cephNamed[d.DiskName] {
+				named := d.Path
 				if s.diskDriverName(d) == "btrfs" {
 					// The file may be gone and its subvolume not: what is
 					// left is the subvolume (I-2).
-					target = filepath.Dir(file)
+					named = filepath.Dir(d.Path)
 				}
-				leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: target, err: err})
+				leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: s.hostDiskFile(named), named: named, err: err})
 			}
 			continue
 		}
@@ -135,7 +147,7 @@ func (s *Server) freeRecordedVMDisks(ctx context.Context, vmName string, decide 
 			if err == nil {
 				err = errors.New("its file is still there after its removal")
 			}
-			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, err: err})
+			leftovers = append(leftovers, diskLeftover{disk: d.DiskName, path: d.Path, target: file, named: d.Path, err: err})
 		}
 	}
 	return cephKept, kept, leftovers
@@ -176,15 +188,16 @@ func (s *Server) diskSharedOrUnknown(ctx context.Context, d *corrosion.DiskRecor
 	return ""
 }
 
-// stillLeft is leftovers less each one whose target is gone by now: the
-// debris sweep after the recorded pass takes a file in <data_dir>/disks by
-// its name, and nothing is left behind of it. A target that is not the file
-// itself (a btrfs disk's subvolume) is dropped only when it is gone.
+// stillLeft is leftovers less each one whose target is positively gone by
+// now: the debris sweep after the recorded pass takes a file in
+// <data_dir>/disks by its name, and nothing is left behind of it. A target
+// that cannot be judged here (an rbd locator, storage that does not answer)
+// stays.
 func stillLeft(leftovers []diskLeftover) []diskLeftover {
 	var out []diskLeftover
 	for _, l := range leftovers {
 		if l.target != "" {
-			if there, err := diskFileThere(l.target); err == nil && !there {
+			if p, _ := diskPresence(l.target); p == presenceGone {
 				continue
 			}
 		}
@@ -193,19 +206,57 @@ func stillLeft(leftovers []diskLeftover) []diskLeftover {
 	return out
 }
 
-// keptThere is kept less each disk on this host that is not there at all:
-// nothing is left of it to name.
+// keptThere is kept less each disk on this host that is positively not there
+// at all: nothing is left of it to name. One that cannot be judged here is
+// named.
 func (s *Server) keptThere(kept []KeptDisk) []KeptDisk {
 	var out []KeptDisk
 	for _, k := range kept {
 		if k.Host == s.hostName {
-			if there, err := diskFileThere(s.hostDiskFile(k.Path)); err == nil && !there {
+			if p, _ := diskPresence(s.hostDiskFile(k.Path)); p == presenceGone {
 				continue
 			}
 		}
 		out = append(out, k)
 	}
 	return out
+}
+
+// presence is whether a disk is still there, as this host can judge it.
+type presence int
+
+const (
+	presenceUnknown presence = iota // cannot be judged here
+	presenceGone                    // positively gone
+	presenceThere
+)
+
+// diskPresence judges whether the disk at path is still there: a file, or a
+// block device's node or link under /dev (gone with its volume), by a
+// bounded Lstat. A locator that is no path (rbd:...) cannot be judged here,
+// nor can a path whose storage does not answer: only a positive "gone" ever
+// drops a disk from what is named.
+func diskPresence(path string) (presence, error) {
+	if !filepath.IsAbs(path) {
+		return presenceUnknown, nil
+	}
+	there, err := storage.Bounded("stat", path, func() (bool, error) {
+		_, err := os.Lstat(path)
+		if err == nil {
+			return true, nil
+		}
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	})
+	switch {
+	case err != nil:
+		return presenceUnknown, err
+	case there:
+		return presenceThere, nil
+	}
+	return presenceGone, nil
 }
 
 // leftoversKept is the leftovers as kept disks, for disk_leftover to name
@@ -216,7 +267,7 @@ func (s *Server) leftoversKept(leftovers []diskLeftover) []KeptDisk {
 		if l.disk == "" {
 			continue
 		}
-		path := l.target
+		path := l.named
 		if path == "" {
 			path = l.path
 		}
@@ -226,9 +277,11 @@ func (s *Server) leftoversKept(leftovers []diskLeftover) []KeptDisk {
 }
 
 // diskFileThere reports whether the file (or directory) at path is still
-// there. A path that is not a file (an rbd locator, a block device a driver
-// freed) is never "there": its driver's answer is the truth. Bounded: storage
-// that does not answer is an error, never "gone".
+// there after its driver reported it removed. A path that is not a file (an
+// rbd locator, a block device — an iSCSI LUN's node stays by design) is never
+// "there" here: its driver's answer is the truth. Bounded: storage that does
+// not answer is an error, never "gone". Only this post-removal check uses it;
+// what is named is judged by diskPresence.
 func diskFileThere(path string) (bool, error) {
 	if !filepath.IsAbs(path) || strings.HasPrefix(path, "/dev/") {
 		return false, nil

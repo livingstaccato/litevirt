@@ -419,12 +419,163 @@ func TestDeleteVM_AProbeMarksItsRefusalAndKeepsItsCode(t *testing.T) {
 		t.Fatalf("probe of a VM not here: %v, trailer %v; want NotFound, unmarked", err, st.trl)
 	}
 
-	// Unavailable stays Unavailable: a no-answer of this host's storage.
-	if err := probeNoAnswerCode(); err != codes.Unavailable {
-		t.Fatalf("probeNoAnswer code %v", err)
+}
+
+// I-5: a disk that is no file — an rbd locator the ceph handling cannot
+// name — whose removal fails. "Not a file" read as "gone" let the delete
+// report success with the volume left and nothing named; it fails, and the
+// record is kept.
+//
+// Mutation: read a locator as gone in stillLeft — the delete succeeds: red.
+func TestDeleteVM_AFailedRemovalOfANonFileDiskFailsTheDelete(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, true, corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: "rbd:noslash",
+		StorageType: "ceph", DeleteWithVM: true})
+	_, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"})
+	if err == nil {
+		t.Fatal("the delete reported success while the removal of its rbd disk failed")
+	}
+	if !strings.Contains(err.Error(), "rbd:noslash") {
+		t.Errorf("the failure %q does not name the volume", err)
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
+		t.Fatal("the failed delete dropped the record")
+	}
+	assertNamed(t, s, nil, false, "rbd:noslash", "removal failed")
+}
+
+// I-5: a block volume (here an LVM path, rooted under a test filesystem so
+// its node can be made) whose removal fails, its node still there: the
+// delete fails and names it.
+func TestDeleteVM_AFailedRemovalOfABlockVolumeFailsTheDelete(t *testing.T) {
+	root := t.TempDir()
+	s, _ := deleteDiskServerWith(t, true, corrosion.DiskRecord{VMName: "a", DiskName: "root", Path: "/dev/vgfu/a-root",
+		StorageType: "lvm-thin", DeleteWithVM: true})
+	s.SetHostDiskRootForTest(root)
+	node := filepath.Join(root, "dev", "vgfu", "a-root")
+	if err := os.MkdirAll(filepath.Dir(node), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(node, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.DeleteVM(adminCtx(), &pb.DeleteVMRequest{Name: "a"})
+	if err == nil {
+		t.Fatal("the delete reported success while the removal of its block volume failed")
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
+		t.Fatal("the failed delete dropped the record")
+	}
+	assertNamed(t, s, nil, false, "/dev/vgfu/a-root", "removal failed")
+}
+
+// I-5: a ceph disk a delete keeps (a VM with no domain: on shared storage)
+// is named by the ceph handling, which can recheck its pool — never dropped
+// as "not a file".
+//
+// Mutation: keep it as a disk_leftover entry judged by a stat — it is
+// dropped unnamed: red.
+func TestDeleteVM_AKeptCephDiskIsNamed(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, false, corrosion.DiskRecord{VMName: "a", DiskName: "data",
+		Path: "rbd:lv/a-data:id=litevirt:lvpool=ceph", StorageType: "ceph", StorageVolume: "ceph", DeleteWithVM: true})
+	st := &trailerStream{}
+	if _, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(adminCtx(), st), &pb.DeleteVMRequest{Name: "a"}); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	vals := st.hdr.Get(KeptCephImageMD)
+	if len(vals) != 1 || !strings.Contains(vals[0], "lv/a-data") || !strings.Contains(vals[0], "shared storage") {
+		t.Fatalf("response names %v, want the ceph image kept on shared storage", st.hdr)
+	}
+	found := false
+	for _, r := range s.keptRecords() {
+		if r.Image == "lv/a-data" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("ceph_image_leftover does not record the kept image")
 	}
 }
 
-func probeNoAnswerCode() codes.Code {
-	return status.Code(probeNoAnswer{status.Error(codes.Unavailable, "x")})
+// I-6: disk_leftover is cleared by hand by removing an entry from the record
+// file, which the pass re-reads when it changed — no restart.
+//
+// Mutation: load the file once — the hand edit is ignored: red.
+func TestKeptDisks_AHandEditOfTheRecordIsReadWithinAPass(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, false)
+	other := "/elsewhere/a-root.qcow2"
+	s.recordKeptDisks(context.Background(), "a", []KeptDisk{{Path: other, Disk: "root", Host: "node-9", Reason: "recorded on host node-9"}})
+	s.judgeKeptDisks(context.Background())
+	if open, ev := keptDiskCondition(t, s); !open || !strings.Contains(ev, other) {
+		t.Fatalf("fixture: not named: %v %s", open, ev)
+	}
+	if err := os.WriteFile(filepath.Join(s.dataDir, diskKeptFile), []byte("[]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.judgeKeptDisks(context.Background())
+	if open, ev := keptDiskCondition(t, s); open {
+		t.Fatalf("still named after its entry was removed from the record: %s", ev)
+	}
+}
+
+// m-7: a record file that cannot be read is never read as empty nor written
+// over. The disks it named stay named from memory, the condition names the
+// file and the recovery, and once the file is removed what was named is
+// saved again.
+//
+// Mutation: read a corrupt file as empty — the disk is no longer named: red.
+func TestKeptDisks_ACorruptRecordFailsClosed(t *testing.T) {
+	s, _ := deleteDiskServerWith(t, false)
+	file := filepath.Join(s.dataDir, diskKeptFile)
+	s.recordKeptDisks(context.Background(), "a", []KeptDisk{{Path: "/x/one", Disk: "root", Host: "node-9", Reason: "r1"}})
+	corrupt := []byte("{not json")
+	if err := os.WriteFile(file, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.recordKeptDisks(context.Background(), "a", []KeptDisk{{Path: "/x/two", Disk: "data", Host: "node-9", Reason: "r2"}})
+	s.judgeKeptDisks(context.Background())
+	open, ev := keptDiskCondition(t, s)
+	if !open || !strings.Contains(ev, "/x/one") || !strings.Contains(ev, "/x/two") || !strings.Contains(ev, "record_unreadable") {
+		t.Fatalf("a corrupt record: %v %s; want both disks named, and the file", open, ev)
+	}
+	if b, _ := os.ReadFile(file); string(b) != string(corrupt) {
+		t.Fatalf("the unreadable file was written over: %q", b)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	s.judgeKeptDisks(context.Background())
+	b, err := os.ReadFile(file)
+	if err != nil || !strings.Contains(string(b), "/x/one") || !strings.Contains(string(b), "/x/two") {
+		t.Fatalf("after the recovery the record is %q (%v); want both disks saved", b, err)
+	}
+	if open, ev := keptDiskCondition(t, s); !open || strings.Contains(ev, "record_unreadable") {
+		t.Fatalf("after the recovery: %v %s", open, ev)
+	}
+}
+
+func keptDiskCondition(t *testing.T, s *Server) (bool, string) {
+	t.Helper()
+	row, found, err := corrosion.GetHealthCondition(context.Background(), s.db, diskLeftoverEvaluator, condDiskLeftover, "host", s.hostName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found && row.Lifecycle != corrosion.ConditionResolved, row.Evidence
+}
+
+// m-9: a local-only probe whose libvirt cannot say whether it has the domain
+// answers Unavailable, unmarked: the probing host counts it as no answer,
+// never as a refusal to pass on or as "not here".
+func TestDeleteVM_AProbeThatCannotTellIsUnavailableAndUnmarked(t *testing.T) {
+	s, fake := deleteDiskServerWith(t, false)
+	fake.FailDomainState = func(string) error { return errors.New("injected: libvirt connection reset") }
+	md, _ := metadata.FromIncomingContext(adminCtx())
+	probe := metadata.NewIncomingContext(adminCtx(), metadata.Join(md, metadata.Pairs("x-lv-delete-local-only", "1")))
+	st := &trailerStream{}
+	_, err := s.DeleteVM(grpc.NewContextWithServerTransportStream(probe, st), &pb.DeleteVMRequest{Name: "a"})
+	if status.Code(err) != codes.Unavailable || len(st.trl.Get(deleteProbeRefusedMD)) != 0 {
+		t.Fatalf("probe that cannot tell: %v, trailer %v; want Unavailable, unmarked", err, st.trl)
+	}
+	if vm, _ := corrosion.GetVM(adminCtx(), s.db, "a"); vm == nil {
+		t.Error("the probe removed the record")
+	}
 }

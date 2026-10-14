@@ -2208,7 +2208,11 @@ evidence gives each path, its host, the VM and disk, when, and the reason.
 litevirt removes none of them: check that nothing uses each one (another VM's
 disk, a process holding it open), then remove it by hand. A file on that host
 is forgotten once it is gone; a disk is not named while a VM's disk names its
-path again.
+path again. To stop naming a disk you keep on purpose, or one recorded on
+another host, check it and remove its entry from `<data_dir>/kept-disks.json`
+on the host that raised the condition; the file is re-read within 30 s. A file
+that cannot be read is never written over: the condition says so, the disks
+stay named from memory, and fixing or removing the file recovers.
 
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 

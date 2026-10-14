@@ -196,7 +196,7 @@ func TestFleet_ReaddOfTheOnlyContainerHostIsNotADeadlock(t *testing.T) {
 	}
 	pr, ok, err := corrosion.GetActionProofByToken(ctx, a.DB, moved.RelocateToken)
 	if err != nil || !ok || pr.ClaimCertificate == "" {
-		t.Fatalf("blct's relocation proof: ok=%v err=%v %+v, want one carrying a claim certificate", ok, err, pr)
+		t.Fatalf("blct's relocation proof: ok=%v err=%v certificate %s, want one carrying a claim certificate", ok, err, redacted(pr.ClaimCertificate))
 	}
 	recreatedOn(t, c, e, "blct", survivors)
 	running := 0

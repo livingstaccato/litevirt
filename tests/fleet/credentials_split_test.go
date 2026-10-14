@@ -495,8 +495,8 @@ func TestFleet_CredentialsSplit_AConcurrentUnrelatedHostWriteDoesNotResurrectARo
 	}
 
 	if h, err := corrosion.GetHost(ctx, r.DB, target); err != nil || h == nil || h.IPMIPass != "bmc-B" {
-		t.Errorf("%s fences with %+v (err %v), want the rotated bmc-B: an unrelated write bumped the "+
-			"parent row's updated_at, and the reader took that as the secret's age", r.Name, h, err)
+		t.Errorf("%s fences with %s (err %v), want the rotated one: an unrelated write bumped the "+
+			"parent row's updated_at, and the reader took that as the secret's age", r.Name, redacted(ipmiPassOf(h)), err)
 	}
 	for _, n := range c.Nodes {
 		if _, err := n.DB.SplitCredentials(ctx); err != nil {

@@ -31,9 +31,10 @@ import (
 // the host's background reconcile — carries it out: an entry whose VM's row
 // still says stopped by its operator, with its domain running here, has the
 // domain destroyed by a forced stop, recorded once; an entry whose domain is
-// seen shut off (or gone), or whose row says anything else (the operator
-// started the VM again, deleted it, or it moved), is dropped and nothing is
-// destroyed. The file is local: no replicated statement, nothing for a peer
+// seen shut off (or gone) once its start could no longer complete (the
+// held-start wait plus a margin after the record was made), or whose row
+// says anything else (the operator started the VM again, deleted it, or it
+// moved), is dropped and nothing is destroyed. The file is local: no replicated statement, nothing for a peer
 // of any version to read.
 const cancelledStartsFile = "cancelled-starts.json"
 
@@ -42,7 +43,15 @@ type cancelledStartRecord struct {
 	VM         string `json:"vm"`
 	StartAsked string `json:"start_asked"`
 	Cancelled  string `json:"cancelled"`
+	// Created is when the record was made (RFC 3339, nanoseconds): the
+	// start it cancelled could still complete until the held-start wait
+	// plus cancelledStartMargin after it (judgeCancelledStart).
+	Created string `json:"created"`
 }
+
+// cancelledStartMargin is added to the held-start wait to give the window in
+// which a cancelled start may still complete.
+var cancelledStartMargin = time.Minute
 
 type cancelledStarts struct {
 	mu      sync.Mutex
@@ -116,7 +125,8 @@ func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time) err
 	defer s.cancelledStarts.mu.Unlock()
 	m := s.cancelledStartsLocked()
 	prev, had := m[vm]
-	m[vm] = cancelledStartRecord{VM: vm, StartAsked: asked.UTC().Format(time.RFC3339), Cancelled: cancelled.UTC().Format(time.RFC3339)}
+	m[vm] = cancelledStartRecord{VM: vm, StartAsked: asked.UTC().Format(time.RFC3339), Cancelled: cancelled.UTC().Format(time.RFC3339),
+		Created: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		if had {
 			m[vm] = prev
@@ -210,7 +220,14 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	active, aerr := s.virt.DomainIsActive(r.VM)
 	switch {
 	case lv.IsNoDomain(aerr) || (aerr == nil && !active):
-		s.dropCancelledStart(r.VM)
+		// A domain shut off (or not defined) says nothing about a start
+		// libvirt may still be making: after a restart the daemon cannot
+		// see it. The record is dropped only once the start could no
+		// longer complete; until then it is kept, and a domain that comes
+		// up is destroyed at a later pass.
+		if s.cancelledStartWindowOver(r) {
+			s.dropCancelledStart(r.VM)
+		}
 		return
 	case aerr != nil:
 		return // unknown: kept for the next pass
@@ -238,4 +255,16 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 	}
 	// Otherwise the domain is not running and its stop's record failed:
 	// kept, and the next pass drops it once it sees the domain shut off.
+}
+
+// cancelledStartWindowOver reports whether the start r cancelled can no
+// longer complete: its record is older than the held-start wait plus
+// cancelledStartMargin. A record whose creation time cannot be read is kept
+// (it ends only with its row, or its domain destroyed).
+func (s *Server) cancelledStartWindowOver(r cancelledStartRecord) bool {
+	created, err := time.Parse(time.RFC3339Nano, r.Created)
+	if err != nil {
+		return false
+	}
+	return time.Since(created) > s.startDomainWaitOrDefault()+cancelledStartMargin
 }

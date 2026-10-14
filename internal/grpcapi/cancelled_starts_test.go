@@ -35,12 +35,19 @@ func (st *stuckStart) cancelledStartsOnDisk(t *testing.T) []cancelledStartRecord
 // remembers it.
 func (st *stuckStart) restarted(t *testing.T, rowState, rowDetail string) {
 	t.Helper()
+	st.restartedAt(t, rowState, rowDetail, time.Now().Add(-time.Hour))
+}
+
+// restartedAt is restarted with the record created at created.
+func (st *stuckStart) restartedAt(t *testing.T, rowState, rowDetail string, created time.Time) {
+	t.Helper()
 	ctx := context.Background()
 	if err := corrosion.UpdateVMState(ctx, st.s.db, "web", rowState, rowDetail); err != nil {
 		t.Fatal(err)
 	}
 	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateRunning)
-	raw, _ := json.Marshal([]cancelledStartRecord{{VM: "web", StartAsked: "2026-10-14T15:39:20Z", Cancelled: "2026-10-14T15:45:07Z"}})
+	raw, _ := json.Marshal([]cancelledStartRecord{{VM: "web", StartAsked: "2026-10-14T15:39:20Z", Cancelled: "2026-10-14T15:45:07Z",
+		Created: created.UTC().Format(time.RFC3339Nano)}})
 	if err := os.WriteFile(st.s.cancelledStartsPath(), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -147,5 +154,67 @@ func TestCancelledStart_TheLateAnswerForgetsTheRecord(t *testing.T) {
 	st.waitLockFree(t, "after libvirt answered the cancelled start")
 	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
 		t.Fatalf("the record outlived the late answer that handled it: %+v", recs)
+	}
+}
+
+// Round 2: a domain seen shut off does not end the record while the start it
+// cancelled could still complete — after a restart libvirt may still be
+// working on it, and a shut-off domain says nothing about that. Only a record
+// older than the held-start wait plus a margin is dropped on a shut-off
+// domain; a younger one is kept, and the domain, once libvirt brings it up,
+// is destroyed.
+//
+// Mutation: the age not looked at (dropped on any shut-off domain) — the
+// young record is gone and the domain that comes up runs on: red.
+func TestCancelledStart_AYoungRecordOutlivesAShutOffDomain(t *testing.T) {
+	st := newStuckStart(t) // held-start wait 300ms
+	old := cancelledStartMargin
+	cancelledStartMargin = 200 * time.Millisecond
+	t.Cleanup(func() { cancelledStartMargin = old })
+	fake := st.s.virt.(*libvirtfake.Fake)
+
+	st.restartedAt(t, "stopped", "operator-stop", time.Now())
+	fake.SetState("web", libvirtfake.StateShutdown)
+	st.sweep(t)
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
+		t.Fatalf("a record younger than the start's window was dropped on a shut-off domain: %+v", recs)
+	}
+	// libvirt finishes the start it was still making.
+	fake.SetState("web", libvirtfake.StateRunning)
+	st.sweep(t)
+	if st.domainActive(t) {
+		t.Fatal("the domain the cancelled start brought up late runs on")
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("the record outlived the destroy: %+v", recs)
+	}
+}
+
+// A record older than the window is dropped once its domain is seen shut off.
+func TestCancelledStart_AnOldRecordIsDroppedOnAShutOffDomain(t *testing.T) {
+	st := newStuckStart(t)
+	st.restartedAt(t, "stopped", "operator-stop",
+		time.Now().Add(-(st.s.startDomainWaitOrDefault() + cancelledStartMargin + time.Second)))
+	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
+	st.sweep(t)
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("a record older than the start's window was kept on a shut-off domain: %+v", recs)
+	}
+}
+
+// The record carries when it was made, so the window survives a restart.
+func TestCancelledStart_TheRecordCarriesItsCreationTime(t *testing.T) {
+	st := heldStart(t)
+	before := time.Now().Add(-time.Second)
+	if _, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
+		t.Fatalf("stop --force: %v", err)
+	}
+	recs := st.cancelledStartsOnDisk(t)
+	if len(recs) != 1 {
+		t.Fatalf("records on disk: %+v", recs)
+	}
+	created, err := time.Parse(time.RFC3339Nano, recs[0].Created)
+	if err != nil || created.Before(before) || created.After(time.Now()) {
+		t.Fatalf("the record's created %q (%v), want the time of the cancel", recs[0].Created, err)
 	}
 }

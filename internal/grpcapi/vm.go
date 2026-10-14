@@ -1563,12 +1563,14 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	// running one is (startVMLocked): the stop is recorded below like any
 	// other. A failure while the domain is active, or when whether it is
 	// cannot be read, is still the error it was.
+	noop := false
 	alreadyStopped := func(op string, err error) bool {
 		active, aerr := s.virt.DomainIsActive(vm.Name)
 		if aerr != nil || active {
 			return false
 		}
-		slog.Info("StopVM: the domain is already not running; recording the stop", "vm", vm.Name, "op", op, "error", err)
+		slog.Info("StopVM: the domain is already not running; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+		noop = true
 		return true
 	}
 	if force {
@@ -1623,7 +1625,11 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", "")
+	evDetail := ""
+	if noop {
+		evDetail = "already stopped: the domain was not running; the operator's stop is recorded"
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
 
 	// Refresh LB backends so stopped VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)

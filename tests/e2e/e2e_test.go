@@ -676,8 +676,47 @@ func TestHost_DrainUndrain(t *testing.T) {
 func TestHost_Config(t *testing.T) {
 	requireHosts(t, 1)
 	host := hostNames[0]
+	// The setting is cluster state: left at "ssh" it makes a later drill's
+	// powered-off victim unrecoverable (an unreachable host cannot be
+	// SSH-fenced). Read it first and put it back in Cleanup, which runs even
+	// when the test fails or is skipped partway.
+	prev := inspectFenceStrategy(lv(t, "host", "inspect", host))
+	if prev == "" {
+		t.Skipf("cannot read %s's current fence strategy, so it could not be restored", host)
+	}
+	t.Cleanup(func() {
+		if out, err := lvErr(t, "host", "config", host, "--fence-strategy", prev); err != nil {
+			t.Errorf("restoring %s's fence strategy to %q failed: %v\n%s", host, prev, err, out)
+		}
+	})
 	lv(t, "host", "config", host, "--fence-strategy", "ssh")
 	t.Log("host config set fence-strategy=ssh")
+}
+
+// inspectFenceStrategy reads fenceStrategy out of `lv host inspect` output, ""
+// when it is absent or the output is not JSON.
+func inspectFenceStrategy(inspect string) string {
+	var obj struct {
+		FenceStrategy string `json:"fenceStrategy"`
+	}
+	if json.Unmarshal([]byte(inspect), &obj) != nil {
+		return ""
+	}
+	return obj.FenceStrategy
+}
+
+// TestInspectFenceStrategy pins the parse TestHost_Config restores from.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestInspectFenceStrategy(t *testing.T) {
+	for in, want := range map[string]string{
+		`{"name":"node-1","fenceStrategy":"best-effort"}`: "best-effort",
+		`{"name":"node-1"}`: "",
+		`not json`:          "",
+	} {
+		if got := inspectFenceStrategy(in); got != want {
+			t.Errorf("inspectFenceStrategy(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2790,7 +2829,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

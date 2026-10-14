@@ -1381,8 +1381,12 @@ func (r *Reconciler) startedDetail(ctx context.Context, vm corrosion.VMRecord) s
 	if strings.HasPrefix(vm.StateDetail, "operator start") {
 		return "started by reconciler: operator start re-armed"
 	}
-	if ev, err := StartCancelledOf(ctx, r.db, vm.Name, r.hostName); err == nil && ev != nil {
-		return "started by reconciler: operator start re-armed"
+	// Only a row in starting: a re-armed start is entered in that state, while an
+	// onboot start (stopped) or a self-heal (running) can find a record still open.
+	if vm.State == "starting" {
+		if ev, err := StartCancelledOf(ctx, r.db, vm.Name, r.hostName); err == nil && ev != nil {
+			return "started by reconciler: operator start re-armed"
+		}
 	}
 	if vm.State == "running" {
 		return "restarted by reconciler: the domain was not running"

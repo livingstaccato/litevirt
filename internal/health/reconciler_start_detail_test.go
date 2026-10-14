@@ -98,3 +98,26 @@ func TestReconcilerStart_ARearmedStartDeferredOnceStillSaysOperatorStart(t *test
 		t.Fatalf("after a deferred re-armed start ran: %+v, want running with the operator-start detail", vm)
 	}
 }
+
+// An onboot start of a VM whose operator stop was a cancelled start (its
+// vm_start_cancelled record still open) is an onboot start, not a re-armed
+// operator start.
+//
+// Mutation: the record is consulted whatever the row's state — red.
+func TestReconcilerStart_AnOnbootStartOverACancelRecordSaysOnboot(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: `{"onboot":true}`, State: "stopped"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordStartCancelled(ctx, db, "node-a", "vm1", "starting", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler("node-a", t.TempDir(), db, libvirtfake.New())
+	r.StartOnbootVMs(ctx)
+	vm, _ := corrosion.GetVM(ctx, db, "vm1")
+	if vm == nil || vm.State != "running" || !strings.Contains(vm.StateDetail, "onboot") || strings.Contains(vm.StateDetail, "operator start") {
+		t.Fatalf("an onboot start over an open cancel record: %+v, want running with the onboot detail", vm)
+	}
+}

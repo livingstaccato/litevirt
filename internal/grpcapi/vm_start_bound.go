@@ -53,6 +53,18 @@ type startFlight struct {
 	// with the rest of what it holds); stopRenew ends its renewal.
 	ownsLease bool
 	stopRenew chan struct{}
+	// cancelled is when `lv stop --force` cancelled the start while libvirt
+	// had not answered it (cancelHeldStart); zero when it was not.
+	cancelled time.Time
+}
+
+// heldUnanswered reports whether the flight's caller has been answered past
+// its wait and libvirt has still not answered the start: a lifecycle call
+// queued behind it would wait as long as libvirt does.
+func (f *startFlight) heldUnanswered() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.held && !f.answered
 }
 
 func (s *Server) startDomainWaitOrDefault() time.Duration {
@@ -70,15 +82,24 @@ func (s *Server) startFlightOf(name string) (*startFlight, bool) {
 }
 
 // startUnanswered reports whether a start of name libvirt has not answered
-// yet is under way on this daemon: a read shows the VM starting.
-func (s *Server) startUnanswered(name string) bool {
+// yet is under way on this daemon.
+// It returns the state a read shows: starting, or stopping once the start
+// was cancelled (cancelHeldStart), or "" when there is none.
+func (s *Server) startUnanswered(name string) string {
 	f, ok := s.startFlightOf(name)
 	if !ok {
-		return false
+		return ""
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return !f.answered
+	switch {
+	case f.answered:
+		return ""
+	case !f.cancelled.IsZero():
+		return "stopping"
+	default:
+		return "starting"
+	}
 }
 
 // markAnswered records that libvirt has answered the flight's start.
@@ -113,16 +134,26 @@ func (s *Server) endStartFlight(name string, f *startFlight) {
 // is closed once it has finished; what the caller holds for the start (the
 // VM lock, its admission) is let go only then (heldForStart).
 type startInFlightError struct {
-	name    string
-	since   time.Time
-	settled <-chan struct{}
+	name      string
+	since     time.Time
+	cancelled time.Time
+	settled   <-chan struct{}
 }
 
 func (f *startFlight) inFlightError(name string) *startInFlightError {
-	return &startInFlightError{name: name, since: f.since, settled: f.settled}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &startInFlightError{name: name, since: f.since, cancelled: f.cancelled, settled: f.settled}
 }
 
 func (e *startInFlightError) Error() string {
+	if !e.cancelled.IsZero() {
+		return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago), "+
+			"which `lv stop --force` cancelled at %s; when libvirt answers, a domain it started is destroyed. "+
+			"Start the VM again once that is recorded (`lv events %s`)",
+			e.name, e.since.UTC().Format(time.RFC3339), time.Since(e.since).Round(time.Second),
+			e.cancelled.UTC().Format(time.RFC3339), e.name)
+	}
 	return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago). "+
 		"The start was not cancelled and still holds the VM; this daemon records its outcome when libvirt "+
 		"answers, unless the daemon restarts first. Check `lv inspect %s` and `lv events %s`",
@@ -137,15 +168,28 @@ func (e *startInFlightError) GRPCStatus() *status.Status {
 // the lock and libvirt has not answered it within the wait, it answers that
 // start's startInFlightError rather than queueing behind it, and asks libvirt
 // nothing. It also gives up when ctx is done: the caller is gone.
+func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error) {
+	unlock, held, err := s.lockVMUnlessStartHeld(ctx, name)
+	if held != nil {
+		return nil, held.inFlightError(name)
+	}
+	return unlock, err
+}
+
+// lockVMUnlessStartHeld is lockVM, except that while a start of the VM is
+// held past its wait with libvirt not answering it (heldUnanswered), it
+// returns that start's flight instead of the lock, rather than queueing
+// behind it for as long as libvirt does not answer. A non-nil ctx is watched
+// too: when it is done, its error is returned.
 //
 // The wait for the lock is lockVM's own, in a goroutine, so it queues as
 // every other lifecycle call does (a polled TryLock loses to every blocked
 // waiter while the mutex is starving). Only the flight is looked at every
 // startLockPoll. A lock the goroutine takes after this call has given up is
 // let go at once.
-func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error) {
+func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name string) (func(), *startFlight, error) {
 	if unlock, ok := s.tryLockVM(name); ok {
-		return unlock, nil
+		return unlock, nil, nil
 	}
 	got, abandon := make(chan func()), make(chan struct{})
 	go func() {
@@ -156,22 +200,170 @@ func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error
 			unlock()
 		}
 	}()
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
 	tick := time.NewTicker(startLockPoll)
 	defer tick.Stop()
 	for {
 		select {
 		case unlock := <-got:
-			return unlock, nil
-		case <-ctx.Done():
+			return unlock, nil, nil
+		case <-done:
 			close(abandon)
-			return nil, status.FromContextError(ctx.Err()).Err()
+			return nil, nil, status.FromContextError(ctx.Err()).Err()
 		case <-tick.C:
-			if f, ok := s.startFlightOf(name); ok && time.Since(f.since) >= s.startDomainWaitOrDefault() {
+			if f, ok := s.startFlightOf(name); ok && f.heldUnanswered() {
 				close(abandon)
-				return nil, f.inFlightError(name)
+				return nil, f, nil
 			}
 		}
 	}
+}
+
+// startHeldRefusal is the answer to a stop or restart of a VM whose start is
+// held (lockVMUnlessStartHeld), rather than waiting for as long as libvirt
+// does not answer it.
+func startHeldRefusal(op, name string, f *startFlight) error {
+	f.mu.Lock()
+	since, cancelled := f.since, f.cancelled
+	f.mu.Unlock()
+	if !cancelled.IsZero() {
+		return status.Errorf(codes.Unavailable,
+			"%s %q: its start, asked for at %s, was cancelled at %s and libvirt has still not answered it; "+
+				"the VM is stopped once it does (`lv events %s`), and the %s was not applied",
+			op, name, since.UTC().Format(time.RFC3339), cancelled.UTC().Format(time.RFC3339), name, op)
+	}
+	return status.Errorf(codes.Unavailable,
+		"%s %q: a start of it is in progress: libvirt has not answered the start asked for at %s (%s ago), and the %s was not applied; "+
+			"retry once the start settles (`lv inspect %s`), or cancel the start (`lv stop --force %s`)",
+		op, name, since.UTC().Format(time.RFC3339), time.Since(since).Round(time.Second), op, name, name)
+}
+
+// cancelHeldStart cancels a start of name held past its wait while libvirt
+// has not answered it (`lv stop --force`). libvirt cannot be asked to stop a
+// start it has not answered (a destroy waits on the same domain), so the
+// cancel is recorded now and carried out when libvirt answers: the row is
+// written stopped by its operator (or, for a VM whose row said error before
+// the start, put back to that, which keeps its set-aside disk copies held, as
+// a stop of an errored VM leaves it), so no start path starts it; and the
+// start's late answer (startDomainWithin) destroys a domain it started instead
+// of recording it running (finishCancelledStartLocked). The VM stays held —
+// its lock, lease and reservation — until then, so nothing starts it twice,
+// and the start's outcome is recorded once, when libvirt answers.
+//
+// It reports done=false when libvirt has answered meanwhile: the start is
+// settling, and the caller stops the VM as usual once it has the lock.
+func (s *Server) cancelHeldStart(ctx context.Context, name string, f *startFlight) (*pb.VM, bool, error) {
+	f.mu.Lock()
+	if f.answered {
+		f.mu.Unlock()
+		return nil, false, nil
+	}
+	if !f.cancelled.IsZero() {
+		f.mu.Unlock()
+		out, err := s.vmToProto(ctx, name)
+		return out, true, err
+	}
+	defer f.mu.Unlock()
+	fresh, err := corrosion.GetVM(ctx, s.db, name)
+	switch {
+	case err != nil:
+		return nil, true, status.Errorf(codes.Internal, "cancel the start of %q: read it: %v", name, err)
+	case fresh == nil:
+		return nil, true, status.Errorf(codes.NotFound, "VM %q not found", name)
+	case fresh.HostName != s.hostName:
+		return nil, true, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", name, fresh.HostName)
+	}
+	prevState, prevDetail := fresh.State, fresh.StateDetail
+	if f.marked {
+		prevState, prevDetail = f.prevState, f.prevDetail
+	}
+	if prevState != "stopped" && prevState != "error" {
+		return nil, true, status.Errorf(codes.FailedPrecondition,
+			"cannot cancel the start of %q: it was asked for while the VM was %s, which a stop does not undo; "+
+				"retry once the start settles (`lv inspect %s`)", name, prevState, name)
+	}
+	state, detail := "stopped", "operator-stop"
+	if stopNoopKeepsRow[prevState] {
+		state, detail = prevState, prevDetail
+	}
+	if err := s.persistVMState(ctx, name, state, detail, corrosion.OpVMState); err != nil {
+		return nil, true, status.Errorf(codes.Internal, "the start of %q was not cancelled: recording the stop failed: %v", name, err)
+	}
+	f.cancelled = time.Now()
+	ev := fmt.Sprintf("start cancelled: libvirt had not answered the start asked for at %s; when it answers, a domain it started is destroyed",
+		f.since.UTC().Format(time.RFC3339))
+	if state != "stopped" {
+		ev += "; the row is left " + state + ", which holds its set-aside disk copies"
+	}
+	s.recordVMEvent(ctx, name, "vm.stopped", "ok", ev)
+	slog.Warn("StopVM: cancelled a start libvirt has not answered; it is undone when libvirt answers", "vm", name,
+		"start_asked", f.since.UTC().Format(time.RFC3339))
+	pbVM := &pb.VM{Name: name, HostName: s.hostName, State: pb.VMState_VM_STOPPING, StateDetail: ev}
+	return pbVM, true, nil
+}
+
+// heldStartAlreadyCancelled answers a plain stop of a VM whose held start was
+// cancelled already: the stop asked for is recorded, so it succeeds.
+func (s *Server) heldStartAlreadyCancelled(ctx context.Context, name string, f *startFlight) (*pb.VM, bool, error) {
+	f.mu.Lock()
+	cancelled := f.cancelled
+	f.mu.Unlock()
+	if cancelled.IsZero() {
+		return nil, false, nil
+	}
+	out, err := s.vmToProto(ctx, name)
+	return out, true, err
+}
+
+// finishCancelledStartLocked records libvirt's late answer to a start
+// cancelled while it had not answered (cancelHeldStart). A failed start is
+// recorded as one; the row already says what the cancel wrote. A start that
+// succeeded is stopped at once (a forced stop, as `lv stop --force` asked),
+// and recorded by that stop. If that stop cannot destroy the domain, the VM
+// runs: the row is written running, as libvirt says it is, and the failed
+// cancel is recorded, so the row never says stopped over a running domain.
+// The caller holds the VM lock.
+func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.VMRecord, startErr error,
+	releasePreflight func(), pbVM *pb.VM, hspec *pb.HooksSpec, since, cancelled time.Time) {
+	asked := since.UTC().Format(time.RFC3339)
+	running := func() bool {
+		st, err := s.virt.DomainState(vm.Name)
+		return err == nil && st == "running"
+	}
+	if startErr != nil && !running() {
+		releasePreflight()
+		s.recordVMEvent(ctx, vm.Name, "vm.started", "error",
+			fmt.Sprintf("libvirt answered the start asked for at %s, which was cancelled at %s, late, with a failure: %v; the VM stays stopped",
+				asked, cancelled.UTC().Format(time.RFC3339), startErr))
+		slog.Info("StopVM: a cancelled start failed late; nothing to undo", "vm", vm.Name, "error", startErr)
+		return
+	}
+	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
+	if err == nil && fresh == nil {
+		err = fmt.Errorf("its row is gone")
+	}
+	if err == nil {
+		note := fmt.Sprintf("start cancelled: libvirt answered the start asked for at %s late, and the domain it started was destroyed", asked)
+		if _, err = s.stopVMLockedNote(ctx, fresh, true, 0, note); err == nil {
+			slog.Info("StopVM: a cancelled start succeeded late; its domain was destroyed", "vm", vm.Name)
+			return
+		}
+	}
+	if running() {
+		slog.Error("StopVM: a cancelled start succeeded late and its domain could not be destroyed; the VM runs", "vm", vm.Name, "error", err)
+		_, _ = s.finishStartLocked(ctx, vm, nil, releasePreflight, pbVM, hspec) // records running, as libvirt says
+		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
+			fmt.Sprintf("the start asked for at %s was cancelled, but libvirt started it late and destroying the domain failed: %s; the VM runs (`lv stop --force %s`)",
+				asked, status.Convert(err).Message(), vm.Name))
+		return
+	}
+	slog.Error("StopVM: a cancelled start succeeded late; stopping it did not finish", "vm", vm.Name, "error", err)
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
+		fmt.Sprintf("the start asked for at %s was cancelled, and libvirt started it late; its domain is not running, but recording the stop failed: %s",
+			asked, status.Convert(err).Message()))
 }
 
 // heldForStart is what a start holds — the VM lock first, then what it took
@@ -311,7 +503,8 @@ func (s *Server) unmarkStartHeld(ctx context.Context, name string, flight *start
 // startInFlightError whose settled is closed after that. The caller holds the
 // VM lock until then (heldForStart). Nothing starts the VM a second time.
 func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration,
-	finish func(context.Context, error) (*pb.VM, error)) (*pb.VM, error) {
+	finish func(context.Context, error) (*pb.VM, error),
+	finishCancelled func(ctx context.Context, startErr error, since, cancelled time.Time)) (*pb.VM, error) {
 	name := vm.Name
 	flight := s.beginStartFlight(name)
 	answered := make(chan error, 1)
@@ -331,7 +524,17 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 	go func() {
 		defer s.endStartFlight(name, flight)
 		startErr := <-answered
-		flight.markAnswered()
+		flight.mu.Lock()
+		flight.answered = true
+		cancelled := flight.cancelled
+		flight.mu.Unlock()
+		if !cancelled.IsZero() {
+			// `lv stop --force` cancelled it meanwhile (cancelHeldStart):
+			// the row already says what the cancel wrote.
+			finishCancelled(bg, startErr, flight.since, cancelled)
+			s.unmarkStartHeld(bg, name, flight, false)
+			return
+		}
 		_, err := finish(bg, startErr)
 		s.unmarkStartHeld(bg, name, flight, err != nil)
 		if err != nil {

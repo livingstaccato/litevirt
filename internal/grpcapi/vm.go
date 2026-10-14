@@ -1572,11 +1572,12 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
 		stateDetail := ""
-		if vm.HostName == s.hostName && s.startUnanswered(vm.Name) {
+		if inFlight := s.startUnanswered(vm.Name); inFlight != "" && vm.HostName == s.hostName {
 			// A start libvirt has not answered yet is under way here: the
-			// VM is starting, whatever the row or libvirt says meanwhile
-			// (vm_start_bound.go), and libvirt is not asked.
-			state = "starting"
+			// VM is starting (or stopping, the start cancelled), whatever
+			// the row or libvirt says meanwhile (vm_start_bound.go), and
+			// libvirt is not asked.
+			state = inFlight
 		} else if vm.HostName == s.hostName && s.virt != nil {
 			if liveState, err := s.liveVMStateBounded(vm.Name, liveBudget); errors.Is(err, errLiveStateNoAnswer) {
 				state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
@@ -2233,7 +2234,11 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if wait <= 0 {
 		return finish(ctx, s.virt.StartDomain(vm.Name))
 	}
-	return s.startDomainWithin(ctx, vm, wait, finish)
+	finishCancelled := func(ctx context.Context, startErr error, since, cancelled time.Time) {
+		releaseGuard()
+		s.finishCancelledStartLocked(ctx, vm, startErr, releasePreflight, pbVM, hspec, since, cancelled)
+	}
+	return s.startDomainWithin(ctx, vm, wait, finish, finishCancelled)
 }
 
 // finishStartLocked records the answer libvirt gave startVMLocked's start.
@@ -2313,7 +2318,24 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 		return client.StopVM(ctx, req)
 	}
 
-	unlock := s.lockVM(req.Name)
+	// A start held past its wait (vm_start_bound.go) holds the lock for as
+	// long as libvirt does not answer it: the stop answers rather than
+	// queueing behind it, and --force cancels the start.
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	if held != nil {
+		if !req.Force {
+			if out, done, err := s.heldStartAlreadyCancelled(ctx, req.Name, held); done {
+				return out, err
+			}
+			return nil, startHeldRefusal("stop", req.Name, held)
+		}
+		if out, done, err := s.cancelHeldStart(ctx, req.Name, held); done {
+			return out, err
+		}
+		// libvirt answered meanwhile: the start is settling. Stop the VM
+		// as usual once it has.
+		unlock = s.lockVM(req.Name)
+	}
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2330,6 +2352,12 @@ func (s *Server) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.VM, err
 // timeout then force-kill). The caller MUST hold the VM lock, have re-read vm under
 // it, and confirmed local ownership; it never locks or forwards.
 func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32) (*pb.VM, error) {
+	return s.stopVMLockedNote(ctx, vm, force, timeoutSec, "")
+}
+
+// stopVMLockedNote is stopVMLocked recording note as the stop event's detail
+// when the stop has none of its own.
+func (s *Server) stopVMLockedNote(ctx context.Context, vm *corrosion.VMRecord, force bool, timeoutSec int32, note string) (*pb.VM, error) {
 	hspec := vmHooks(vm)
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
@@ -2446,7 +2474,7 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	evDetail := ""
+	evDetail := note
 	switch {
 	case cancelled != "":
 		evDetail = cancelled
@@ -2542,7 +2570,12 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return client.RestartVM(ctx, req)
 	}
 
-	unlock := s.lockVM(req.Name)
+	// A start held past its wait holds the lock for as long as libvirt does
+	// not answer it: the restart answers rather than queueing behind it.
+	unlock, held, _ := s.lockVMUnlessStartHeld(nil, req.Name)
+	if held != nil {
+		return nil, startHeldRefusal("restart", req.Name, held)
+	}
 	defer unlock()
 	vm, err = corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -3410,10 +3443,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// (e.g., "stopped" from StopVM). This avoids showing stale libvirt state during
 	// graceful shutdown where libvirt still reports "running" briefly.
 	state, stateDetail := vm.State, vm.StateDetail
-	if vm.HostName == s.hostName && s.startUnanswered(name) {
+	if inFlight := s.startUnanswered(name); inFlight != "" && vm.HostName == s.hostName {
 		// A start libvirt has not answered yet is under way here
-		// (vm_start_bound.go): the VM is starting, and libvirt is not asked.
-		state = "starting"
+		// (vm_start_bound.go): the VM is starting (or stopping, the start
+		// cancelled), and libvirt is not asked.
+		state = inFlight
 	} else if vm.HostName == s.hostName && s.virt != nil {
 		if liveState, err := s.liveVMStateBounded(name, s.newLiveStateBudget()); errors.Is(err, errLiveStateNoAnswer) {
 			// libvirt has not answered (vm_live_state.go): the read says

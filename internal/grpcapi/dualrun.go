@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -268,6 +269,10 @@ const dualRunLeaseProbeTTL = 60 * time.Second
 // behaviour: it is alert-only, has no virtual-time scenarios, and changing the
 // clock here is not part of wiring the term.
 func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration) bool {
+	if s.LeaseQuorumLost(ctx) {
+		s.dualRunLeaseTerm.Store(0)
+		return false
+	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, s.db, dualRunLeaseKey, s.hostName, 2*interval, time.Now())
 	if err != nil {
@@ -281,6 +286,24 @@ func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration
 	}
 	s.dualRunLeaseTerm.Store(term)
 	return true
+}
+
+// LeaseQuorumLost reports whether this node has lost every voter majority it
+// could decide on (health.LostEveryDecisionQuorum), so it must neither take
+// nor renew a leader lease: the dual-run detector's, and the rebalancer's.
+// A server with no gate, or a gate that cannot read quorum, has lost nothing.
+func (s *Server) LeaseQuorumLost(ctx context.Context) bool {
+	g := s.gateV()
+	if g == nil {
+		return false
+	}
+	var region func(context.Context, string) (health.QuorumState, int, int)
+	if rg, ok := g.(interface {
+		RegionQuorumProof(context.Context, string) (health.QuorumState, int, int)
+	}); ok {
+		region = rg.RegionQuorumProof
+	}
+	return health.LostEveryDecisionQuorum(ctx, s.db, g.QuorumProof, region, nil)
 }
 
 // detectDualRunPass runs one detector pass: gather runtime across workload-capable hosts,

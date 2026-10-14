@@ -773,6 +773,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// every host. Defaults to dry-run on every VM unless compose says otherwise.
 	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
 	rc.SetCapacityPolicy(capacity)
+	rc.QuorumLost = d.checker.LostEveryDecisionQuorum
 	go rc.Start(ctx)
 
 	// Start snapshot scheduler. Leader-gated like the

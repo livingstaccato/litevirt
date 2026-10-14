@@ -306,7 +306,7 @@ Under symmetric reachability those voters reach it too. A voter that can reach
 the recorded owner refuses to accept its eviction (recovery-claims.md §3.5.1),
 so at most a minority of voters could still accept, and no new claim can be
 decided. Without claims, the coordinator's deadline check refuses a host that
-observers have seen answer since the fence (§4.2).
+enough voters have seen answer to give it a majority (§4.2).
 
 **If any check fails, the workload stays paused.** The pauser logs why, once per
 cause per workload. If a certified claim moved the workload, Layer 3 stops the
@@ -490,16 +490,77 @@ All of this is in the failover coordinator (`internal/failover`).
    handled-host branch, as it already does for `claimRetry`. Once the deadline
    has passed, it re-checks two things before it recovers:
    - the host is still `fenced` or `offline`;
-   - **`fenceStillStands`**: no observer has seen the host answer since the
-     fence.
+   - **the fence still stands for a paused host** (`selfPauseStillStands`).
+     Some observer has watched the host fail without a break since before
+     the fence. A self-paused host is up by design, so an observer that has
+     seen it answer since the fence does not by itself refuse: a non-voter
+     that reaches both halves of a split sees that for as long as the split
+     lasts, and relays the minority's own voters' verdicts too. But it is
+     also all the majority sees of a host that never paused: one counting
+     its majority over a voter set this node does not know (a generation it
+     adopted at a different time, two or more generations apart, or a scope
+     change it has not seen; one generation apart cannot hand it a majority,
+     as adjacent generations' majorities intersect), or one cut off in one
+     direction only (§7 F4). So once any observer has seen the host answer
+     since the fence, the majority recovers only on the host's own word: its
+     replicated `partition_paused` condition (§3.6), open and raised no
+     earlier than the outage began, and then only the workloads its evidence
+     lists as paused. Every recovery of the host in that episode, a claim
+     retry included, keeps to the list until the host is back, an operator
+     confirms it off, a fence proves it off (IPMI or Redfish verified; a
+     best-effort or SSH fence does not), or the host is removed with such a
+     proof. A later deadline at which no observer has seen the host answer,
+     a successor's after the bridge has gone say, still keeps to the list
+     while that condition is readable. When it finds none from this outage
+     (absent, resolved, listing nothing, raised before the outage, or too
+     few fresh voter runs to date the outage), it keeps
+     the list this coordinator already holds, and recovers everything, as
+     without a bridge, only when it holds none. A read error of the
+     condition or of the voters' runs refuses the deadline. The
+     outage begins, for a voter set of `n` with majority `q`, at the
+     `(n−q+1)`-th earliest start among its voters' failing runs that span the
+     fence: the host cannot have lost its majority before that many voters
+     stopped answering, and one observer that has failed it for long, or a
+     non-voter, cannot move it earlier. Fewer such runs refuse; with several
+     voter sets the latest answer counts. Not "after the fence": a host
+     pauses `T_pause` after it loses the majority, which can be well before
+     a coordinator decides, as when the lease had to move first. A host that
+     never paused never raised it, and is refused. On top of that, the voters whose latest verdict about the
+     host is an answer (healthy or unready, of any age), counting the host
+     itself when it is a voter, must not be a majority of the adopted voter
+     set (the host's region's under region scope) nor of any newer
+     generation: a host that has come back is refused. The rule needs an
+     explicit voter set. A derived one, or a newer generation that is a
+     reset, is read from each node's own replica of host state, and then
+     any observer that has seen the host answer since the fence refuses
+     (`fenceStillStands`). So does any observer once the pause can no longer
+     be relied on (§4.3: the host has since reported
+     `partition_pause_failed`), since a host that answered was never
+     stopped. When one of these deadlines passes quiet while this
+     coordinator already keeps the host to a list, it keeps to the list as
+     above.
 
-   If either check fails, the wait is dropped and nothing is recovered. The
-   host came back, it will resume itself (§3.5), and `recoverHosts` reactivates
-   it.
-4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
+   If the host is no longer `fenced` or `offline`, the wait is dropped and
+   nothing is recovered. The host came back, it will resume itself (§3.5), and
+   `recoverHosts` reactivates it. If `selfPauseStillStands` refuses, whether
+   for a read error or on its rule, nothing is recovered and the wait is
+   kept: every later cycle re-checks the deadline under the whole rule, so a
+   condition that replicates late or a read that recovers lets it go ahead.
+   Meanwhile only an operator confirmation or a newer fence reaches the host,
+   and either ends the wait (a fence that relies on the pause starts its own).
+   A claim retry does not run while a wait is pending or refused, and one owed
+   to an earlier outage or an older fence is dropped with it.
+   The stall alert names the refusal and its reason.
+4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
+   Nor has one that takes the lease back after a gap (it stopped holding it,
+   or retakes it at a new term): it forgets every host's outage, its waits,
+   limits and claim retries included, and starts as a successor. It
    resumes from the relied-on fence record through `resumeActionFor` →
    `recoverFenced`, and starts a fresh wait anchored at its own first sight of
-   the record. That is later than the original `t_d`, so it is safe.
+   the record. That is later than the original `t_d`, so it is safe. It
+   resumes while an observer has watched the host stay down since the fence,
+   whoever has seen the paused host answer; the deadline then applies step
+   3.
 
 The recovery itself (claim, proof, destination start) is unchanged. It merely
 starts after the deadline. A verified fence (IPMI) or an operator confirmation
@@ -659,6 +720,12 @@ host it fenced is running a pauser. This is the `recovery_claim_v1` and
   `ReplicationGated` is for latches that claim what a peer can DECODE. This one
   claims what a peer will DO, which is exactly what the voting-member latch
   measures.
+
+  What the majority relies on includes how the minority COUNTS: its pauser's
+  quorum over its own voter set, healthy probes only, itself included, and
+  uncounted voters not live. The deadline's voter count (§4.2 step 3)
+  mirrors that rule, so a change to it (counting unready peers or
+  non-voters, say) changes relied-on behaviour and needs a new token.
 
 **Acting does not wait for the latch.** The pauser runs whenever this node's
 flag is on. It does not wait for the latch.
@@ -833,8 +900,8 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F3 | The daemon restarts during the partition | Its loss clock starts at its own start, so it pauses at most `T_pause` + warmup after the restart. | If the restart lands after the majority's decision, the pause can miss the deadline by up to the restart's length. Layer 3 settles it. |
 | F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began, with that voter still failing M after M saw it healthy. The last clause is what a heal lacks: there the host's new healthy rows are newer than the voters' last failures. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
 | F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
-| F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
-| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
+| F6 | A host comes back before the deadline | The deadline check sees a majority of voters answered by the host (`selfPauseStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
+| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `selfPauseStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
 | F10 | One host's flag is turned off (a restart) while its peers keep theirs on | The first health probe that reaches the restarted daemon records that it does not pause, and from then on no coordinator relies on its pause. It is fenced `assumed` and recovered as before partition pause (§4.3). | If the partition begins before any probe reaches the new run, the coordinator still holds the old run's answer, relies, waits `W` and recovers while the host keeps running. This is F3 with the flag off: the window is at most one probe cycle after the new daemon starts serving. Layer 3 settles it on return. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |

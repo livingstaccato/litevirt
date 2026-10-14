@@ -88,6 +88,7 @@ func (pn *ppNode) setPartitionPause(on bool) {
 
 type ppFence struct {
 	target string
+	by     string
 	at     time.Time
 }
 
@@ -95,6 +96,7 @@ type ppFence struct {
 // real time.
 type ppStack struct {
 	c     *Cluster
+	ctx   context.Context
 	nodes []*ppNode
 	mu    sync.Mutex
 	fence []ppFence
@@ -116,13 +118,16 @@ type ppOpts struct {
 	// timeout is 3 s), which is recovery-claims.md §6's duelling-proposer
 	// liveness case, not what the scenario tests.
 	coordinators map[string]bool
+	// lateCoordinators names nodes whose coordinator is built but not
+	// started; the scenario starts it with startCoordinator.
+	lateCoordinators map[string]bool
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	s := &ppStack{c: c}
+	s := &ppStack{c: c, ctx: ctx}
 	for _, n := range c.Nodes {
 		dataDir := filepath.Join(t.TempDir(), n.Name)
 		chk := health.NewChecker(n.Name, n.PKIDir, n.DB)
@@ -144,7 +149,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		name := n.Name
 		coord.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 			s.mu.Lock()
-			s.fence = append(s.fence, ppFence{target: h.Name, at: time.Now()})
+			s.fence = append(s.fence, ppFence{target: h.Name, by: name, at: time.Now()})
 			s.mu.Unlock()
 			// The drill's fence: SSH cannot reach a partitioned host, and the
 			// best-effort strategy proceeds anyway — assurance assumed.
@@ -192,26 +197,10 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 				}
 			}
 		}()
-		if o.coordinators != nil && !o.coordinators[n.Name] {
+		if (o.coordinators != nil && !o.coordinators[n.Name]) || o.lateCoordinators[n.Name] {
 			continue
 		}
-		go func() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(phase):
-			}
-			tk := time.NewTicker(time.Second)
-			defer tk.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-tk.C:
-					pn.coord.RunOnce(ctx)
-				}
-			}
-		}()
+		s.startCoordinator(pn, phase)
 	}
 	eventually(t, 30*time.Second, "every node's checker to see the voter majority", func() bool {
 		for _, pn := range s.nodes {
@@ -222,6 +211,41 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		return true
 	})
 	return s
+}
+
+// startCoordinator runs pn's coordinator every second, from phase on, until
+// the returned stop is called (a daemon stopping, or its coordinator
+// handing off).
+func (s *ppStack) startCoordinator(pn *ppNode, phase time.Duration) (stop func()) {
+	ctx, cancel := context.WithCancel(s.ctx)
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(phase):
+		}
+		tk := time.NewTicker(time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				pn.coord.RunOnce(ctx)
+			}
+		}
+	}()
+	return cancel
+}
+
+// node is n's partition-pause wiring.
+func (s *ppStack) node(n *Node) *ppNode {
+	for _, pn := range s.nodes {
+		if pn.n == n {
+			return pn
+		}
+	}
+	return nil
 }
 
 func (s *ppStack) fencesOf(target string) []ppFence {

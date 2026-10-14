@@ -406,10 +406,10 @@ func (c *Coordinator) proofSpent(ctx context.Context, proofID string) bool {
 
 // claimAttempt runs one claim at key (attempt included).
 func (c *Coordinator) claimAttempt(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ActionProof, source string, ev *corrosion.SupersedeEvidence) (claimedProof, claims.Outcome, error) {
-	if prev, ok := c.claimRetryProposals[key]; ok && sameClaimIntent(prev, proposal) {
+	if prev, ok := c.claimRetryProposals[key]; ok && sameClaimIntent(prev.proposal, proposal) {
 		// The value the voters refused last time, not a fresh one: the same
 		// round then carries the same value.
-		proposal.ID, proposal.RelocationToken = prev.ID, prev.RelocationToken
+		proposal.ID, proposal.RelocationToken = prev.proposal.ID, prev.proposal.RelocationToken
 	}
 	binding := proposal
 	binding.ClaimCertificate = ""
@@ -423,9 +423,9 @@ func (c *Coordinator) claimAttempt(ctx context.Context, key corrosion.ClaimKey, 
 		c.mAttempt(PhaseClaim, ce.Result, "")
 		if ce.Result == ResultOwnerReachable || ce.Result == ResultSourceMismatch {
 			if c.claimRetryProposals == nil {
-				c.claimRetryProposals = map[corrosion.ClaimKey]corrosion.ActionProof{}
+				c.claimRetryProposals = map[corrosion.ClaimKey]claimRetryProposal{}
 			}
-			c.claimRetryProposals[key] = proposal
+			c.claimRetryProposals[key] = claimRetryProposal{proposal: proposal, source: source}
 		} else {
 			delete(c.claimRetryProposals, key)
 		}
@@ -636,6 +636,8 @@ func (c *Coordinator) recoverRemovedHosts(ctx context.Context) {
 			continue
 		}
 		slog.Info("failover: recovering workloads recorded on a host removed for good", "host", host)
+		c.unlimitRecovery(host) // proved off, and removed for good
+		delete(c.pauseWaits, host)
 		c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: host, State: "removed"})
 	}
 }
@@ -777,16 +779,49 @@ func (c *Coordinator) retryClaimsFor(host string) {
 	c.claimRetry[host] = true
 }
 
+// claimRetryProposal is a refused proposal kept for its retry, with the host
+// it would move the workload off.
+type claimRetryProposal struct {
+	proposal corrosion.ActionProof
+	source   string
+}
+
+// forgetClaimRetries drops every claim retry owed for host: its episode is
+// over, or a newer fence is being decided afresh, and a retry owed to an
+// earlier one must not run under it.
+func (c *Coordinator) forgetClaimRetries(host string) {
+	delete(c.claimRetry, host)
+	for key, p := range c.claimRetryProposals {
+		if p.source == host {
+			delete(c.claimRetryProposals, key)
+		}
+	}
+}
+
 // retryClaims re-runs the recovery of a fenced host whose claims were refused
 // on an earlier tick. recoverWorkloads is idempotent — it re-derives its work
 // from the rows still pointing at the host — so re-running it only picks up
 // what is still there. Reports whether it ran.
+//
+// It does not run while the host's recovery waits on a partition-pause
+// deadline, pending or refused: a retry owed within an episode belongs to a
+// recovery that already passed its deadline, whose wait is gone, and any
+// other would recover past the deadline's rule (retryPauseWait). Nor does it
+// run past a fence recorded since the one this coordinator acted on: the
+// fence path decides that one afresh (fenceAuthorityChanged) and drops the
+// retry.
 func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 	if !c.claimRetry[target] {
 		return false
 	}
+	if _, waiting := c.pauseWaits[target]; waiting {
+		return false
+	}
 	h, err := corrosion.GetHost(ctx, c.db, target)
 	if err != nil || h == nil {
+		return false
+	}
+	if rec, _, ok := c.recordedFence(ctx, h); ok && rec.ID != c.fencedOn[target] {
 		return false
 	}
 	delete(c.claimRetry, target)

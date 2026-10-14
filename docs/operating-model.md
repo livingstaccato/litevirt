@@ -213,7 +213,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   sides of a partition can believe they hold it (`acquireLease` says so in as
   many words). That is why the lease is never sufficient on its own — a decision
   site requires `holdLease()` **and** `DecisionGate.OK`, which is a quorum this
-  daemon probed for itself, and the minority side fails closed there. Read "only
+  daemon probed for itself, and the minority side fails closed there. A node
+  whose own probes show it has lost every voter majority it could decide on
+  (the cluster-wide one, and under region scope every region's) neither takes
+  nor renews the failover lease, nor the rebalancer's or the dual-run
+  detector's, so a lease held in a minority lapses even on a host that reaches
+  both sides, and the majority can take it over. Read "only
   one coordinator acts" as the intended end state of the exclusivity work, not
   as something the current code guarantees. What the code *does* guarantee is
   that a split with a healthy network does not last: when several survivors
@@ -441,6 +446,17 @@ of acting — it says nothing about whether the resulting rows have replicated.
   - Fencing primitives are designed to be idempotent (IPMI on an already-off
     host is a no-op; SSH poweroff likewise). Ensure your fence method has
     this property.
+  - A node that has lost the voter majority neither takes nor renews a
+    leader lease, but only the failover lease waits for a Yes that has lasted
+    the quorum-regain grace: a rebalancer or dual-run detector lease holder
+    whose quorum flaps, or that restarts inside a partition, can keep
+    renewing its lease where a node bridging the halves sees it, which
+    delays that lease's takeover, not failover.
+  - A recovery past a node bridging the halves is dated by the voters of
+    every voter set the coordinator counts over, so a newer generation it
+    has not adopted, with a voter that has no failing run spanning the fence
+    (one added after the cut, say), holds that recovery back until the
+    generation is adopted.
 - VM placement and other state writes use last-writer-wins on the row's
   wall-clock `updated_at`. **The most recent writer (by wall clock) wins**; there
   is no two-phase commit. If two operators concurrently modify the same VM, one
@@ -739,8 +755,11 @@ GAUGE rather than a rate: it counts workloads still assigned to a host in state
 
 It is the lease holder's view. Every node runs a coordinator and serves
 `/metrics`, but a node that is not driving failover publishes `0`, so alert on
-`max()` across instances — or join on `litevirt_failover_leader` — and never on
-`avg()`, which divides the real count by your fleet size.
+`max()` across instances, and never on `avg()`, which divides the real count by
+your fleet size. Do not join on `litevirt_failover_leader`: while no node has
+the voter majority no node holds the lease, the join returns nothing, and the
+alert clears in exactly that incident. The last leader keeps publishing its
+last value then, which `max()` still sees.
 
 Zero is the normal value. Non-zero means workloads are sitting on a host the
 cluster considers down, and **what you should do depends on why it is down.**

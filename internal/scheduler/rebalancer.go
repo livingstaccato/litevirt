@@ -121,6 +121,13 @@ type Rebalancer struct {
 	// assumption that the executor shared this one — it builds its own.
 	leaseTerm atomic.Int64
 
+	// QuorumLost, when set, reports whether this node has lost every voter
+	// majority it could decide on (health.LostEveryDecisionQuorum). While it
+	// has, the rebalancer neither takes nor renews its lease: one renewed in a
+	// minority reaches a node bridging the halves and refuses every majority
+	// takeover for as long as the partition lasts.
+	QuorumLost func(context.Context) bool
+
 	// Now is the time source for lease TTL + proposal-expiry +
 	// audit-row timestamps. Defaults to time.Now; fleet scenarios
 	// override it with a virtual clock so multi-cycle behaviour can
@@ -713,6 +720,10 @@ func (r *Rebalancer) HoldsLease(ctx context.Context) bool {
 // rebalancer's own: the TTL sets how long a dead leader blocks takeover, and
 // r.now() is the virtual clock fleet scenarios override.
 func (r *Rebalancer) acquireLease(ctx context.Context) bool {
+	if r.QuorumLost != nil && r.QuorumLost(ctx) {
+		r.leaseTerm.Store(0)
+		return false
+	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, r.db, r.LeaseKey, r.hostName, 2*r.PollInterval, r.now())
 	if err != nil {

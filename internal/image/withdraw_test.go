@@ -142,3 +142,33 @@ func TestPublish_PrevIsTheFileItSuperseded(t *testing.T) {
 		t.Fatalf("republish: %+v err=%v, want Prev = Path", re, err)
 	}
 }
+
+// Until a withdrawable publish is released, the file it would be withdrawn to
+// is not removed; once released, it is an ordinary superseded version.
+func TestRemoveImageFile_RefusesAPendingWithdrawalsTarget(t *testing.T) {
+	s := NewStore(t.TempDir())
+	_ = s.Init()
+	v1, stale := []byte("version one"), []byte("stale copy")
+	p1, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps, release, err := s.PublishWithdrawable("ubuntu", stage(t, s, stale), digestOf(stale))
+	if err != nil || ps.Prev != p1.Path {
+		t.Fatalf("withdrawable publish: %+v err=%v", ps, err)
+	}
+	if err := s.RemoveImageFile("ubuntu", p1.Path); err == nil {
+		t.Fatal("the pending withdrawal's target was removed")
+	}
+	if err := s.Withdraw("ubuntu", ps.Path, ps.Prev); err != nil || s.ImagePath("ubuntu") != p1.Path {
+		t.Fatalf("withdraw: ImagePath %s err=%v, want %s", s.ImagePath("ubuntu"), err, p1.Path)
+	}
+	release()
+	release() // idempotent
+	if err := s.RemoveImageFile("ubuntu", ps.Path); err != nil {
+		t.Fatalf("the withdrawn file, once released: %v", err)
+	}
+	if err := s.RemoveImageFile("ubuntu", p1.Path); err == nil {
+		t.Fatal("the current file was removed")
+	}
+}

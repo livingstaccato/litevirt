@@ -471,3 +471,44 @@ func TestPruneImages_ACreateDuringTheScanKeepsALiveImagesVersion(t *testing.T) {
 		t.Fatal("removed once the scan could see the disk built on it")
 	}
 }
+
+// A create on a live image already in flight when a prune's snapshot is taken,
+// whose overlay is written after the scan reads the disks and whose hold is
+// released before the removals, keeps the superseded version it is built on.
+func TestPruneImages_ACreateInFlightAtTheSnapshotKeepsALiveImagesVersion(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	importVersion(t, s, "ubuntu", "A ")
+	older := s.images.ImagePath("ubuntu")
+	publishVersion(t, s, "ubuntu", "B ", "")
+	if s.images.ImagePath("ubuntu") == older {
+		t.Fatal("the second version is not current")
+	}
+	disk := s.images.DiskPath("late", "root")
+	release := s.holdImage("ubuntu") // it resolved the version current a moment before
+	s.imagePrune.afterScan = func() {
+		defer release()
+		if err := os.MkdirAll(filepath.Dir(disk), 0o755); err != nil {
+			t.Error(err)
+		}
+		if err := qcow2.CreateWithBacking(disk, older, 0, nil); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"}); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(older) {
+		t.Fatal("the superseded version was removed under a disk whose create was in flight at the scan")
+	}
+	if got := guestView(t, disk); len(got) == 0 || got[0] != 'A' {
+		t.Error("the disk lost its base")
+	}
+	s.imagePrune.afterScan = nil
+	if _, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: "ubuntu"}); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(older) {
+		t.Fatal("removed once the scan could see the disk built on it")
+	}
+}

@@ -1037,11 +1037,12 @@ func (sc *imageUseScan) deletedKeep(f, r, n string, held holdSnap, named bool) s
 }
 
 // removeUnheldImageFile removes file f of image n unless a disk create on n
-// is in flight or began since the scan's snapshot (it may be building on f,
-// resolved while f was current, unseen by the scan) or f became n's current
-// file since the scan. A file of a deleted image (deleted) is removed, its current file
-// too, only if no create, pull or import of n is in flight or began since the
-// scan's snapshot (held).
+// is in flight, was in flight at the scan's snapshot, or began since it (it
+// may be building on f, resolved while f was current, unseen by the scan), or
+// f is n's current file or a pending withdrawal's target now
+// (image.Store.RemoveImageFile). A file of a deleted image (deleted) is
+// removed, its current file too, only if no create, pull or import of n is in
+// flight or began since the scan's snapshot (held).
 func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSnap, deleted bool) error {
 	p := &s.imagePrune
 	p.mu.Lock()
@@ -1050,6 +1051,9 @@ func (s *Server) removeUnheldImageFile(st *image.Store, n, f string, held holdSn
 		return fmt.Errorf("a disk create on image %q is in flight", n)
 	}
 	if !deleted {
+		if held.cheld {
+			return fmt.Errorf("a disk create on image %q was in flight when the scan began; the next prune decides", n)
+		}
 		if p.cgens[n] != held.cgen {
 			return fmt.Errorf("a disk create on image %q started during the scan; the next prune decides", n)
 		}
@@ -1111,9 +1115,10 @@ func (p *imagePruneState) hold(name string, publish bool) (release func()) {
 
 // holdSnap is an image's holds as a prune's scan began.
 type holdSnap struct {
-	gen  uint64 // holds ever taken on the image
-	cgen uint64 // disk-create holds ever taken on the image
-	held bool   // one was in flight
+	gen   uint64 // holds ever taken on the image
+	cgen  uint64 // disk-create holds ever taken on the image
+	held  bool   // one was in flight
+	cheld bool   // a disk-create hold was in flight
 }
 
 func (p *imagePruneState) snapshot() map[string]holdSnap {
@@ -1121,7 +1126,7 @@ func (p *imagePruneState) snapshot() map[string]holdSnap {
 	defer p.mu.Unlock()
 	out := map[string]holdSnap{}
 	for n, g := range p.gens {
-		out[n] = holdSnap{gen: g, cgen: p.cgens[n], held: p.holds[n] > 0 || p.pubs[n] > 0}
+		out[n] = holdSnap{gen: g, cgen: p.cgens[n], held: p.holds[n] > 0 || p.pubs[n] > 0, cheld: p.holds[n] > 0}
 	}
 	return out
 }

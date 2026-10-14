@@ -127,3 +127,60 @@ func TestImportImage_AStaleCopyIsWithdrawnToThePublishBeforeIt(t *testing.T) {
 		t.Fatalf("the import's file %s is gone", newer)
 	}
 }
+
+// While a stale copy is briefly the image's current file, the file it would
+// be withdrawn to (its Published.Prev) is not removed by a prune: the
+// withdrawal lands on it, and it stays.
+func TestImportImage_APruneWhileAStaleCopyIsCurrentKeepsItsPrev(t *testing.T) {
+	s := pruneServer(t)
+	noSeams(s)
+	importVersion(t, s, "ubuntu", "A ")
+
+	var newer string
+	s.imagePrune.prePublish = func(name string) {
+		if newer != "" {
+			return
+		}
+		newer = "pending"
+		importVersion(t, s, name, "N ") // its record supersedes the copy's
+		newer = s.images.ImagePath(name)
+	}
+	pruned := false
+	s.SetImageRecordHookForTest(func(name string) {
+		if pruned || newer == "" || newer == "pending" {
+			return
+		}
+		pruned = true
+		if s.images.ImagePath(name) == newer {
+			t.Errorf("the copy is not current at its record")
+		}
+		// An operator's prune lands while the copy is current: newer is
+		// not current, kept by no list, and nothing is built on it.
+		if _, err := s.PruneImages(adminCtx(), &pb.PruneImagesRequest{Name: name}); err != nil {
+			t.Errorf("prune: %v", err)
+		}
+	})
+	t.Cleanup(func() {
+		s.imagePrune.prePublish = nil
+		s.SetImageRecordHookForTest(nil)
+	})
+
+	src := filepath.Join(t.TempDir(), "stale.qcow2")
+	filledQcow2(t, src, "S ")
+	b, _ := os.ReadFile(src)
+	copyCtx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(imageCopyMDKey, "push"))
+	err := s.ImportImage(&mockImportImageStream{ctx: copyCtx, msgs: []*pb.ImportImageRequest{{Name: "ubuntu", Format: "qcow2", Chunk: b}}})
+	if status.Code(err) != codes.Aborted || !isStaleImageCopy(err) {
+		t.Fatalf("a copy overtaken by an import of other content: %v, want a stale-copy Aborted", err)
+	}
+	s.waitImagePrunes()
+	if !pruned {
+		t.Fatal("no prune ran while the copy was current")
+	}
+	if !exists(newer) {
+		t.Fatalf("the file the copy is withdrawn to, %s, was removed while the copy was current", newer)
+	}
+	if got := s.images.ImagePath("ubuntu"); got != newer {
+		t.Fatalf("after the withdrawal, ImagePath = %s, want %s", got, newer)
+	}
+}

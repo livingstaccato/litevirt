@@ -137,10 +137,13 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	if hook := s.imagePrune.prePublish; hook != nil {
 		hook(name)
 	}
-	pub, err := s.images.Publish(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
+	// Until the record decides whether this copy is stale, the file it would
+	// be withdrawn to is not removed.
+	pub, releasePrev, err := s.images.PublishWithdrawable(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
 	if err != nil {
 		return status.Errorf(codes.Internal, "publish image: %v", err)
 	}
+	defer releasePrev()
 	destPath := pub.Path
 	s.imagePublished(ctx, name, pub)
 

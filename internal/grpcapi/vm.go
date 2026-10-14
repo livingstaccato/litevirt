@@ -1799,7 +1799,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// not answer within the wait answers the caller and goes on holding it
 	// (startDomainWithin), and a start that finds one of those answers the
 	// same at once (lockVMForStart).
-	unlock, err := s.lockVMForStart(req.Name)
+	unlock, err := s.lockVMForStart(ctx, req.Name)
 	if err != nil {
 		return nil, err
 	}

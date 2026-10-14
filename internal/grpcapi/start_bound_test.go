@@ -14,6 +14,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -29,6 +30,12 @@ type stuckStart struct {
 
 func newStuckStart(t *testing.T) *stuckStart {
 	t.Helper()
+	return newStuckStartDetail(t, "operator-stop")
+}
+
+// newStuckStartDetail is newStuckStart with web's row stopped under detail.
+func newStuckStartDetail(t *testing.T, detail string) *stuckStart {
+	t.Helper()
 	s := testServerWithLocks(t)
 	f := libvirtfake.New()
 	s.virt = f
@@ -37,7 +44,7 @@ func newStuckStart(t *testing.T) *stuckStart {
 	}
 	spec, _ := json.Marshal(&pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
 	if err := corrosion.InsertVM(context.Background(), s.db,
-		corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped", StateDetail: "operator-stop", Spec: string(spec)}, nil, nil); err != nil {
+		corrosion.VMRecord{Name: "web", HostName: s.hostName, State: "stopped", StateDetail: detail, Spec: string(spec)}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	s.startDomainWait = 300 * time.Millisecond
@@ -85,6 +92,20 @@ func (st *stuckStart) waitLockFree(t *testing.T, what string) {
 	}
 }
 
+// openReservations counts StartVM's capacity reservations not yet released:
+// a capacity operation of that method with no completed step.
+func (st *stuckStart) openReservations(t *testing.T) int {
+	t.Helper()
+	rows, err := st.s.db.Query(context.Background(),
+		`SELECT o.id FROM operations o WHERE o.resource_kind = 'capacity' AND o.method = 'StartVM' AND NOT EXISTS
+		   (SELECT 1 FROM operation_steps s WHERE s.operation_id = o.id AND s.step_name = ?)`,
+		corrosion.OpStepCompleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows)
+}
+
 func wantStartInFlight(t *testing.T, what string, err error) {
 	t.Helper()
 	if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "has not answered") ||
@@ -118,6 +139,9 @@ func TestStartVM_AStartLibvirtDoesNotAnswerReturnsAndKeepsTheVMHeld(t *testing.T
 	if vm := st.row(t); vm.State != "stopped" {
 		t.Fatalf("web's row while the start is in flight: %s", vm.State)
 	}
+	if n := st.openReservations(t); n != 1 {
+		t.Fatalf("web's capacity reservations open while the start is in flight: %d, want 1", n)
+	}
 
 	// A second start answers the same, at once, and asks libvirt nothing.
 	t0 := time.Now()
@@ -140,6 +164,64 @@ func TestStartVM_AStartLibvirtDoesNotAnswerReturnsAndKeepsTheVMHeld(t *testing.T
 	}
 	if _, ok := st.s.startFlightOf("web"); ok {
 		t.Error("the start is still registered in flight after it settled")
+	}
+	if n := st.openReservations(t); n != 0 {
+		t.Errorf("web's capacity reservations open after the start settled: %d, want 0", n)
+	}
+}
+
+// A VM failover moved here still stopped is started under its start lease
+// (StartVM takes it so the reconciler's define never runs into the start).
+// A start libvirt has not answered keeps that lease, as it keeps the lock,
+// until libvirt answers; then it is let go.
+//
+// Mutation: the lease released at the bound (a plain defer) — another holder
+// takes it while the start is in flight: red.
+func TestStartVM_AStartInFlightKeepsItsStartLease(t *testing.T) {
+	st := newStuckStartDetail(t, corrosion.StoppedRekeyDetailPrefix+"node-x")
+	_, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
+	wantStartInFlight(t, "start", err)
+	ctx := context.Background()
+	if by, err := health.TryVMStartLease(ctx, st.s.db, "other-holder", "web", time.Now()); err != nil || by == "other-holder" {
+		t.Fatalf("web's start lease while the start is in flight: taken by another holder (%q, %v)", by, err)
+	}
+	close(st.release)
+	st.waitLockFree(t, "after libvirt answered")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		by, err := health.TryVMStartLease(ctx, st.s.db, "other-holder", "web", time.Now())
+		if err == nil && by == "other-holder" {
+			health.ReleaseVMStartLease(ctx, st.s.db, "other-holder", "web")
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("web's start lease after the start settled: held by %q (%v)", by, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A start queued behind another lifecycle call gives up when its caller
+// does, rather than starting the VM for a caller that has gone.
+//
+// Mutation: ctx not watched — the start waits on: red.
+func TestStartVM_AQueuedStartGivesUpWithItsCaller(t *testing.T) {
+	st := newStuckStart(t)
+	close(st.release)
+	unlock := st.s.lockVM("web")
+	ctx, cancel := context.WithTimeout(adminCtx(), 200*time.Millisecond)
+	defer cancel()
+	err := within(t, 5*time.Second, "a queued start whose caller has gone", func() error {
+		_, err := st.s.StartVM(ctx, &pb.StartVMRequest{Name: "web"})
+		return err
+	})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("queued start after its caller's deadline = %v, want DeadlineExceeded", err)
+	}
+	unlock()
+	st.waitLockFree(t, "after the abandoned wait")
+	if vm := st.row(t); vm.State != "stopped" || st.calls.Load() != 0 {
+		t.Fatalf("an abandoned start started web: row %s, %d libvirt calls", vm.State, st.calls.Load())
 	}
 }
 

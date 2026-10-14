@@ -22,8 +22,8 @@ import (
 // happens to the VM.
 const defaultStartDomainWait = 5 * time.Minute
 
-// startLockPoll is how often a start waiting for its VM's lock looks again
-// for a start of the VM already past its wait (lockVMForStart).
+// startLockPoll is how often a start waiting for its VM's lock looks for a
+// start of the VM already past its wait (lockVMForStart).
 const startLockPoll = 20 * time.Millisecond
 
 // startFlight is a start of a VM whose StartDomain libvirt has been asked
@@ -83,9 +83,9 @@ func (f *startFlight) inFlightError(name string) *startInFlightError {
 }
 
 func (e *startInFlightError) Error() string {
-	return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago); "+
-		"the start goes on, holding the VM, and its outcome is recorded when libvirt answers "+
-		"(`lv inspect %s`, `lv events %s`)",
+	return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago). "+
+		"The start was not cancelled and still holds the VM; this daemon records its outcome when libvirt "+
+		"answers, unless the daemon restarts first. Check `lv inspect %s` and `lv events %s`",
 		e.name, e.since.UTC().Format(time.RFC3339), time.Since(e.since).Round(time.Second), e.name, e.name)
 }
 
@@ -95,17 +95,42 @@ func (e *startInFlightError) GRPCStatus() *status.Status {
 
 // lockVMForStart is lockVM for a start: while another start of the VM holds
 // the lock and libvirt has not answered it within the wait, it answers that
-// start's startInFlightError at once rather than queueing behind it, and
-// asks libvirt nothing.
-func (s *Server) lockVMForStart(name string) (func(), error) {
+// start's startInFlightError rather than queueing behind it, and asks libvirt
+// nothing. It also gives up when ctx is done: the caller is gone.
+//
+// The wait for the lock is lockVM's own, in a goroutine, so it queues as
+// every other lifecycle call does (a polled TryLock loses to every blocked
+// waiter while the mutex is starving). Only the flight is looked at every
+// startLockPoll. A lock the goroutine takes after this call has given up is
+// let go at once.
+func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error) {
+	if unlock, ok := s.tryLockVM(name); ok {
+		return unlock, nil
+	}
+	got, abandon := make(chan func()), make(chan struct{})
+	go func() {
+		unlock := s.lockVM(name)
+		select {
+		case got <- unlock:
+		case <-abandon:
+			unlock()
+		}
+	}()
+	tick := time.NewTicker(startLockPoll)
+	defer tick.Stop()
 	for {
-		if unlock, ok := s.tryLockVM(name); ok {
+		select {
+		case unlock := <-got:
 			return unlock, nil
+		case <-ctx.Done():
+			close(abandon)
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-tick.C:
+			if f, ok := s.startFlightOf(name); ok && time.Since(f.since) >= s.startDomainWaitOrDefault() {
+				close(abandon)
+				return nil, f.inFlightError(name)
+			}
 		}
-		if f, ok := s.startFlightOf(name); ok && time.Since(f.since) >= s.startDomainWaitOrDefault() {
-			return nil, f.inFlightError(name)
-		}
-		time.Sleep(startLockPoll)
 	}
 }
 

@@ -168,9 +168,7 @@ func TestCancelledStart_TheLateAnswerForgetsTheRecord(t *testing.T) {
 // young record is gone and the domain that comes up runs on: red.
 func TestCancelledStart_AYoungRecordOutlivesAShutOffDomain(t *testing.T) {
 	st := newStuckStart(t) // held-start wait 300ms
-	old := cancelledStartMargin
-	cancelledStartMargin = 200 * time.Millisecond
-	t.Cleanup(func() { cancelledStartMargin = old })
+	st.s.cancelledStartMargin = 200 * time.Millisecond
 	fake := st.s.virt.(*libvirtfake.Fake)
 
 	st.restartedAt(t, "stopped", "operator-stop", time.Now())
@@ -194,7 +192,7 @@ func TestCancelledStart_AYoungRecordOutlivesAShutOffDomain(t *testing.T) {
 func TestCancelledStart_AnOldRecordIsDroppedOnAShutOffDomain(t *testing.T) {
 	st := newStuckStart(t)
 	st.restartedAt(t, "stopped", "operator-stop",
-		time.Now().Add(-(st.s.startDomainWaitOrDefault() + cancelledStartMargin + time.Second)))
+		time.Now().Add(-(st.s.startDomainWaitOrDefault() + st.s.cancelledStartMarginOrDefault() + time.Second)))
 	st.s.virt.(*libvirtfake.Fake).SetState("web", libvirtfake.StateShutdown)
 	st.sweep(t)
 	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {

@@ -45,13 +45,21 @@ type cancelledStartRecord struct {
 	Cancelled  string `json:"cancelled"`
 	// Created is when the record was made (RFC 3339, nanoseconds): the
 	// start it cancelled could still complete until the held-start wait
-	// plus cancelledStartMargin after it (judgeCancelledStart).
+	// plus the margin after it (judgeCancelledStart).
 	Created string `json:"created"`
 }
 
-// cancelledStartMargin is added to the held-start wait to give the window in
-// which a cancelled start may still complete.
-var cancelledStartMargin = time.Minute
+// defaultCancelledStartMargin is added to the held-start wait to give the
+// window in which a cancelled start may still complete
+// (Server.cancelledStartMargin overrides it).
+const defaultCancelledStartMargin = time.Minute
+
+func (s *Server) cancelledStartMarginOrDefault() time.Duration {
+	if s.cancelledStartMargin > 0 {
+		return s.cancelledStartMargin
+	}
+	return defaultCancelledStartMargin
+}
 
 type cancelledStarts struct {
 	mu      sync.Mutex
@@ -259,12 +267,12 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 
 // cancelledStartWindowOver reports whether the start r cancelled can no
 // longer complete: its record is older than the held-start wait plus
-// cancelledStartMargin. A record whose creation time cannot be read is kept
+// the margin. A record whose creation time cannot be read is kept
 // (it ends only with its row, or its domain destroyed).
 func (s *Server) cancelledStartWindowOver(r cancelledStartRecord) bool {
 	created, err := time.Parse(time.RFC3339Nano, r.Created)
 	if err != nil {
 		return false
 	}
-	return time.Since(created) > s.startDomainWaitOrDefault()+cancelledStartMargin
+	return time.Since(created) > s.startDomainWaitOrDefault()+s.cancelledStartMarginOrDefault()
 }

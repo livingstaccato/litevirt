@@ -815,6 +815,11 @@ type Server struct {
 	// cancelledStarts is this host's durable record of held starts `lv
 	// stop --force` cancelled (cancelled_starts.go).
 	cancelledStarts cancelledStarts
+	// startLeaseRenewEvery and cancelledStartMargin override
+	// defaultStartLeaseRenewEvery and defaultCancelledStartMargin (zero:
+	// the defaults). Tests only.
+	startLeaseRenewEvery time.Duration
+	cancelledStartMargin time.Duration
 	// operatorClaimMu makes an operator promotion's start fence and every
 	// abandonment of a proof on this host one decision (promote_serialize.go).
 	operatorClaimMu sync.Mutex

@@ -422,9 +422,16 @@ func startHeldDetail(since time.Time) string {
 	return fmt.Sprintf("operator start: libvirt has not answered the start asked for at %s", since.UTC().Format(time.RFC3339))
 }
 
-// startLeaseRenewEvery is how often a held start re-takes the VM's start
-// lease, well within its TTL.
-var startLeaseRenewEvery = health.VMStartLeaseTTL / 4
+// defaultStartLeaseRenewEvery is how often a held start re-takes the VM's
+// start lease, well within its TTL (Server.startLeaseRenewEvery overrides it).
+const defaultStartLeaseRenewEvery = health.VMStartLeaseTTL / 4
+
+func (s *Server) startLeaseRenewOrDefault() time.Duration {
+	if s.startLeaseRenewEvery > 0 {
+		return s.startLeaseRenewEvery
+	}
+	return defaultStartLeaseRenewEvery
+}
 
 // markStartHeld makes the VM's row say what a start libvirt has not answered
 // within its wait is: starting, where it said stopped (or error), so no
@@ -474,8 +481,9 @@ func (s *Server) markStartHeld(ctx context.Context, vm *corrosion.VMRecord, flig
 	flight.marked, flight.prevState, flight.prevDetail = true, fresh.State, fresh.StateDetail
 	flight.ownsLease = owns
 	flight.stopRenew = make(chan struct{})
+	every := s.startLeaseRenewOrDefault()
 	go func(stop <-chan struct{}) {
-		t := time.NewTicker(startLeaseRenewEvery)
+		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
 			select {

@@ -118,10 +118,8 @@ func TestStartVM_AHeldStartSaysStartingUntilLibvirtAnswers(t *testing.T) {
 //
 // Mutation: no renewal — the lease's expiry does not move: red.
 func TestStartVM_AHeldStartRenewsItsStartLease(t *testing.T) {
-	old := startLeaseRenewEvery
-	startLeaseRenewEvery = 100 * time.Millisecond
-	t.Cleanup(func() { startLeaseRenewEvery = old })
 	st := newStuckStart(t)
+	st.s.startLeaseRenewEvery = 100 * time.Millisecond
 	_, err := st.s.StartVM(adminCtx(), &pb.StartVMRequest{Name: "web"})
 	wantStartInFlight(t, "start", err)
 	_, first := st.leaseHolder(t)

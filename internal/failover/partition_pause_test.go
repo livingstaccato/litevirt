@@ -139,13 +139,17 @@ func TestPartitionPause_ASuccessorWaitsAfresh(t *testing.T) {
 	}
 }
 
-// A host that answered after the fence is not recovered at the deadline: it is
-// back, and it resumes itself.
+// With a derived voter set, a host any observer saw answer after the fence is
+// not recovered at the deadline, even with its own pause reported: the host's
+// derived set can differ from this node's, so the self-pause rule
+// (selfPauseStillStands) does not apply and fenceStillStands decides.
 //
-// Mutation: drop the fenceStillStands re-check in retryPauseWait — the VM moves
-// and this goes red.
+// Mutation: count over this node's derived set in pauseVoterSets as if it
+// were explicit — the bystander's answer passes on the host's condition, the
+// VM moves and this goes red.
 func TestPartitionPause_AHostThatAnsweredIsNotRecovered(t *testing.T) {
 	c, db, ctx, mono := pauseCoordinator(t, true)
+	pausedCondition(t, db, time.Now())
 	c.run(ctx)
 	// An observer (not a voter, so the fence quorum still stands) saw the host
 	// answer after the fence.

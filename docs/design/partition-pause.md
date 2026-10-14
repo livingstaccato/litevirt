@@ -490,26 +490,36 @@ All of this is in the failover coordinator (`internal/failover`).
    handled-host branch, as it already does for `claimRetry`. Once the deadline
    has passed, it re-checks two things before it recovers:
    - the host is still `fenced` or `offline`;
-   - **the host cannot hold a voter majority** (`selfPauseStillStands`).
-     Some observer has watched it fail without a break since before the
-     fence, and the voters whose latest verdict about it is an answer
-     (healthy or unready, of any age), counting the host itself when it is a
-     voter, are not a majority of the adopted voter set (the host's region's
-     under region scope), nor of any newer generation this node has not
-     adopted yet. A self-paused host is up by design, and its pause depends
-     only on its own count of the voters, so a non-voter that reaches it, or
-     the other voters of its minority, do not show that it failed to pause.
-     A generation this node adopted while apart from the host, which the
-     host never saw, is not counted: like a host added inside the minority
-     (§4.4), a voter change across a partition is a second fault. The voter
-     set must be explicit, the generation the
-     cluster decided: a derived set is read from each node's own replica of
-     host state, so the host's can differ from this node's by every host
-     fenced while they were apart, and then any observer that has seen the
-     host answer since the fence refuses (`fenceStillStands`). So does any
-     observer once the pause can no longer be relied on (§4.3: the host has
-     since reported `partition_pause_failed`), since a host that answered
-     was never stopped.
+   - **the fence still stands for a paused host** (`selfPauseStillStands`).
+     Some observer has watched the host fail without a break since before
+     the fence. A self-paused host is up by design, so an observer that has
+     seen it answer since the fence does not by itself refuse: a non-voter
+     that reaches both halves of a split sees that for as long as the split
+     lasts, and relays the minority's own voters' verdicts too. But it is
+     also all the majority sees of a host that never paused: one counting
+     its majority over a voter set this node does not know (a generation it
+     adopted at a different time, two or more generations apart, or a scope
+     change it has not seen; one generation apart cannot hand it a majority,
+     as adjacent generations' majorities intersect), or one cut off in one
+     direction only (§7 F4). So once any observer has seen the host answer
+     since the fence, the majority recovers only on the host's own word: its
+     replicated `partition_paused` condition (§3.6), open and raised no
+     earlier than the start of the observer failing run the fence rests on.
+     Not "after the fence": a host pauses `T_pause` after it loses the
+     majority, which can be well before a coordinator decides, as when the
+     lease had to move first. A host that never paused never raised it, and
+     is refused. On top of that, the voters whose latest verdict about the
+     host is an answer (healthy or unready, of any age), counting the host
+     itself when it is a voter, must not be a majority of the adopted voter
+     set (the host's region's under region scope) nor of any newer
+     generation: a host that has come back is refused. The rule needs an
+     explicit voter set. A derived one, or a newer generation that is a
+     reset, is read from each node's own replica of host state, and then
+     any observer that has seen the host answer since the fence refuses
+     (`fenceStillStands`). So does any observer once the pause can no longer
+     be relied on (§4.3: the host has since reported
+     `partition_pause_failed`), since a host that answered was never
+     stopped.
 
    If either check fails, the wait is dropped and nothing is recovered. The
    host came back, it will resume itself (§3.5), and `recoverHosts` reactivates
@@ -517,7 +527,10 @@ All of this is in the failover coordinator (`internal/failover`).
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
    resumes from the relied-on fence record through `resumeActionFor` →
    `recoverFenced`, and starts a fresh wait anchored at its own first sight of
-   the record. That is later than the original `t_d`, so it is safe.
+   the record. That is later than the original `t_d`, so it is safe. It
+   resumes while an observer has watched the host stay down since the fence,
+   whoever has seen the paused host answer; the deadline then applies step
+   3.
 
 The recovery itself (claim, proof, destination start) is unchanged. It merely
 starts after the deadline. A verified fence (IPMI) or an operator confirmation
@@ -677,6 +690,12 @@ host it fenced is running a pauser. This is the `recovery_claim_v1` and
   `ReplicationGated` is for latches that claim what a peer can DECODE. This one
   claims what a peer will DO, which is exactly what the voting-member latch
   measures.
+
+  What the majority relies on includes how the minority COUNTS: its pauser's
+  quorum over its own voter set, healthy probes only, itself included, and
+  uncounted voters not live. The deadline's voter count (§4.2 step 3)
+  mirrors that rule, so a change to it (counting unready peers or
+  non-voters, say) changes relied-on behaviour and needs a new token.
 
 **Acting does not wait for the latch.** The pauser runs whenever this node's
 flag is on. It does not wait for the latch.

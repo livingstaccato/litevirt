@@ -142,6 +142,50 @@ func TestFleet_PartitionPause_NonVoterReachingBothSidesDoesNotVetoRecovery(t *te
 	assertRecoveredOnce(t, c, s, rs, dest, minority)
 }
 
+// TestFleet_PartitionPause_ASuccessorResumesPastANonVoter: the majority's
+// coordinator fences n0 and stops before its wait ends, as a daemon restart
+// or a lease hand-off does. Its successor finds the self-pause fence record
+// with n5 (and n1, through n5) seeing n0 answer; it must resume from the
+// record, wait afresh, and recover.
+//
+// Mutation: drop the self-pause branch in resumeActionFor — the successor
+// declines the record ("observer node-1 saw the host answer after the fence")
+// and the recovery wait times out.
+func TestFleet_PartitionPause_ASuccessorResumesPastANonVoter(t *testing.T) {
+	c, s, rs := bridgeFleet(t, ppOpts{
+		coordinators:     map[string]bool{"node-2": true, "node-3": true},
+		lateCoordinators: map[string]bool{"node-2": true, "node-3": true},
+	})
+	owner, n2, n3 := c.Nodes[0], c.Nodes[2], c.Nodes[3]
+	stop2 := s.startCoordinator(s.node(n2), 0)
+	eventually(t, time.Minute, "node-2 to hold the failover lease on every node", func() bool {
+		for _, n := range c.Nodes {
+			if h, _, err := corrosion.ReadLeaseRow(context.Background(), n.DB, "failover"); err != nil || h != n2.Name {
+				return false
+			}
+		}
+		return true
+	})
+	minority, majority := c.Nodes[:2], c.Nodes[2:5]
+	c.SplitGossip(minority, majority)
+	eventually(t, ppRecoverBound, "node-2 to fence node-0", func() bool { return len(s.fencesOf(owner.Name)) > 0 })
+	stop2()
+	for _, n := range c.Nodes[1:] {
+		if _, ok := firstEvent(n, "start", "pp-vm"); ok {
+			t.Fatalf("setup: %s started pp-vm before node-2 stopped; its wait had not passed", n.Name)
+		}
+	}
+	s.startCoordinator(s.node(n3), 0)
+
+	dest := waitRecovered(t, c, minority)
+	assertRecoveredOnce(t, c, s, rs, dest, minority)
+	for _, f := range s.fencesOf(owner.Name) {
+		if f.by != n2.Name {
+			t.Fatalf("%s fenced %s again; the successor must resume from the recorded self-pause fence", f.by, owner.Name)
+		}
+	}
+}
+
 // TestFleet_LeaseHeldInTheMinority_MajorityTakesOverPastANonVoter: the
 // failover lease is held by n1 at the cut. n1 has lost the voter majority, so
 // it must stop renewing; once its lease lapses on n5, a majority coordinator

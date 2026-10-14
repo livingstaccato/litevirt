@@ -213,9 +213,11 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 	return s
 }
 
-// startCoordinator runs pn's coordinator every second, from phase on.
-func (s *ppStack) startCoordinator(pn *ppNode, phase time.Duration) {
-	ctx := s.ctx
+// startCoordinator runs pn's coordinator every second, from phase on, until
+// the returned stop is called (a daemon stopping, or its coordinator
+// handing off).
+func (s *ppStack) startCoordinator(pn *ppNode, phase time.Duration) (stop func()) {
+	ctx, cancel := context.WithCancel(s.ctx)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -233,6 +235,7 @@ func (s *ppStack) startCoordinator(pn *ppNode, phase time.Duration) {
 			}
 		}
 	}()
+	return cancel
 }
 
 // node is n's partition-pause wiring.

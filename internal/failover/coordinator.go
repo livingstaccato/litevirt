@@ -1897,6 +1897,9 @@ const (
 //     authority by itself: it closes the "host came back and nobody saw it"
 //     gap without inferring anything from health rows, and it gives the
 //     shared-disk gate (proofGradeFenceRef) a fence inside its window to bind.
+//   - A fence that relied on the host's partition pause is resumed while an
+//     observer has watched the host stay down since it: recoverFenced waits
+//     afresh, and the deadline applies the self-pause rule.
 //   - An UNVERIFIED fence (SSH, best-effort) is resumed from the record while
 //     it still stands, and never re-fenced: a second SSH power-off of a host
 //     that is already off cannot connect and reports a FAILED fence, which
@@ -1908,6 +1911,17 @@ const (
 // they would have to the leader: the successor gets the dead leader's
 // authority and no more.
 func (c *Coordinator) resumeActionFor(ctx context.Context, host string, rec fenceRecord, at time.Time) (resumeAction, string) {
+	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) {
+		// A fence that relied on the host's partition pause. The host is up by
+		// design, so whether anybody has seen it answer is not this point's
+		// question: recoverFenced starts a fresh wait, and the deadline asks
+		// it (selfPauseStillStands). An outage that has ended is still
+		// declined here.
+		if !c.observerStreakSpans(ctx, host, at) {
+			return resumeDecline, "no observer has watched the host stay down since the fence"
+		}
+		return resumeFromRecord, ""
+	}
 	why, stands := c.fenceStillStands(ctx, host, at)
 	if !corrosion.FenceProofGrade(rec.Method, rec.Result) {
 		if stands {
@@ -1965,6 +1979,9 @@ func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time
 	return c.answeredSince(ctx, host, at)
 }
 
+// whyHealthUnreadable is the refusal reason when host_health cannot be read.
+const whyHealthUnreadable = "host_health unreadable"
+
 // answeredSince is fenceStillStands' second half: it reports false, and why,
 // when some observer's latest verdict about host — healthy or unready — is
 // newer than `at` (less fenceSkewMargin). It fails closed on a read error.
@@ -1981,7 +1998,7 @@ func (c *Coordinator) answeredSince(ctx context.Context, host string, at time.Ti
 	if err != nil {
 		slog.Warn("failover: host_health read for a fence resume failed", "host", host, "error", err)
 		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
-		return "host_health unreadable", false
+		return whyHealthUnreadable, false
 	}
 	for _, r := range rows {
 		if r.String("observer") == host {

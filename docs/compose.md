@@ -171,7 +171,10 @@ in a file leaves a cluster default-deny that an operator or another stack set
 as it is, owned by them. When the stack that owns the cluster default-deny goes
 down, or is redeployed without it, the deny passes to another stack whose file
 asks for it, and is removed only when none does; while another stack's stored
-file cannot be read, it stays. The web UI's stack **Destroy** action
+file cannot be read, it stays. A deploy asking for default-deny sets it again
+once its record is written if the cluster no longer denies, and the background
+stack reconciler sets it for any live stack whose file asks for it when the
+cluster has no default at all. The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.
@@ -1384,7 +1387,8 @@ A repo name another stack registered is used as it is: a deploy naming it does
 not take it over or change its path (it warns when its file names a different
 one), and its `compose down` leaves it registered. When the stack that
 registered it goes down, the repo passes, at its path, to another stack whose
-file names it, and is unregistered only when none does.
+file defines it or backs a workload up to it, and is unregistered only when
+none does; while another stack's stored file cannot be read, it stays.
 
 ```yaml
 backup-repos:

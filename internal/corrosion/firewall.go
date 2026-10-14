@@ -351,16 +351,51 @@ func DeleteFirewallDefault(ctx context.Context, c *Client, scope string) error {
 		`UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ?`, nowRFC3339(), now, scope)
 }
 
+// EnsureClusterDefaultDeny sets the cluster default-deny, owned by stack,
+// unless a deny is already in force (whoever owns it keeps it).
+func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) error {
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil {
+		return err
+	}
+	if cur != nil && cur.DefaultDeny {
+		return nil
+	}
+	return SetFirewallDefault(ctx, c, "cluster", true, stack)
+}
+
+// ReassertStackDefaultDeny sets the cluster default-deny, owned by the first
+// live stack (by name) whose deployed file asks for it, when the cluster has
+// no default row at all: a stack's deploy can miss a handoff from an owner
+// that went down while it was in flight. A row an operator set either way is
+// left as it is.
+func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil || cur != nil {
+		return err
+	}
+	wants, _, err := otherStackWants(ctx, c, "", read)
+	if err != nil {
+		return err
+	}
+	for _, w := range wants {
+		if w.defaultDeny {
+			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
+		}
+	}
+	return nil
+}
+
 // ── Stack teardown ───────────────────────────────────────────────────────────
 
 // DeleteStackFirewall tombstones every firewall row a compose stack created:
 // its security groups (+ their rules), ip sets, cluster/host tier rules, and
 // any default-deny policy it set. Called from `compose down`.
-func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
+func DeleteStackFirewall(ctx context.Context, c *Client, stack string, read StackFileWants) error {
 	if err := DeleteStackFirewallRows(ctx, c, stack); err != nil {
 		return err
 	}
-	return DeleteStackFirewallDefaults(ctx, c, stack)
+	return DeleteStackFirewallDefaults(ctx, c, stack, read)
 }
 
 // DeleteStackFirewallDefaults tombstones the firewall_defaults rows a stack
@@ -375,7 +410,7 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 // stack (the first by name) rather than removed, and while any live stack's
 // file cannot be read the row is kept: it may ask for deny, and a deny
 // removed in error fails the cluster open.
-func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) error {
+func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, read StackFileWants) error {
 	if stack == "" {
 		return nil
 	}
@@ -384,13 +419,13 @@ func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) e
 		return err
 	}
 	if cur != nil && cur.DefaultDeny && cur.StackName == stack {
-		others, unreadable, err := otherStackFiles(ctx, c, stack)
+		others, unreadable, err := otherStackWants(ctx, c, stack, read)
 		if err != nil {
 			return err
 		}
 		handed := false
 		for _, o := range others {
-			if fd := o.file.FirewallDefaults; fd != nil && fd.DefaultDeny {
+			if o.defaultDeny {
 				if err := SetFirewallDefault(ctx, c, "cluster", true, o.name); err != nil {
 					return err
 				}

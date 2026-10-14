@@ -283,6 +283,16 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	}); dbErr != nil {
 		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
 	}
+	// The deny this file asks for is re-asserted now that its record is
+	// written: the persist above left a deny another stack owned as it was,
+	// and that owner may have gone down (or dropped it) since, seeing no
+	// record of this stack asking for it. The cluster must not end this
+	// deploy default-allow. A deny in force stays with its owner.
+	if fd := f.FirewallDefaults; fd != nil && fd.DefaultDeny {
+		if dbErr := corrosion.EnsureClusterDefaultDeny(ctx, s.db, f.Name); dbErr != nil {
+			slog.Warn("re-assert the stack's cluster default-deny failed; the stack reconciler retries", "stack", f.Name, "error", dbErr)
+		}
+	}
 
 	if len(failures.names) > 0 {
 		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
@@ -348,10 +358,10 @@ func (s *Server) withStackDefaultDenyNote(ctx context.Context, stack string, err
 	if gerr != nil || d == nil || !d.DefaultDeny || d.StackName != stack {
 		return err
 	}
-	st := status.Convert(err)
-	return status.Errorf(st.Code(),
-		"%s; the cluster default-deny this stack asked for stays on: a later `lv compose up` of the stack keeps it, `lv firewall default-deny off` turns it off",
-		st.Message())
+	// The message grows; the code and any details stay.
+	p := status.Convert(err).Proto()
+	p.Message += "; the cluster default-deny this stack asked for stays on: a later `lv compose up` of the stack keeps it, `lv firewall default-deny off` turns it off"
+	return status.ErrorProto(p)
 }
 
 // Stack record states. "deleting" is set by DeleteStack and retried by the
@@ -394,7 +404,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	if !hasFirewall {
 		// Still clear any rows a previous deploy of this stack left behind, in
 		// case the firewall block was removed from the compose file.
-		return corrosion.DeleteStackFirewall(ctx, s.db, f.Name)
+		return corrosion.DeleteStackFirewall(ctx, s.db, f.Name, compose.StoredStackWants)
 	}
 	// A name another stack or `lv sg create` already holds is refused before
 	// anything is torn down: the firewall holds every NIC bound to a name two
@@ -538,7 +548,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	if !wantDeny {
-		if err := corrosion.DeleteStackFirewallDefaults(ctx, s.db, f.Name); err != nil {
+		if err := corrosion.DeleteStackFirewallDefaults(ctx, s.db, f.Name, compose.StoredStackWants); err != nil {
 			return fmt.Errorf("default-deny: %w", err)
 		}
 	}
@@ -1361,12 +1371,12 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 
 		// Tombstone the stack's distributed-firewall config (SGs, ipsets,
 		// cluster rules, default-deny). The reconciler then drops the rules.
-		if dbErr := corrosion.DeleteStackFirewall(ctx, s.db, req.Name); dbErr != nil {
+		if dbErr := corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants); dbErr != nil {
 			slog.Warn("delete stack firewall failed", "stack", req.Name, "error", dbErr)
 		}
 
 		// Unregister the stack's backup repos.
-		if dbErr := corrosion.DeleteStackBackupRepos(ctx, s.db, req.Name); dbErr != nil {
+		if dbErr := corrosion.DeleteStackBackupRepos(ctx, s.db, req.Name, compose.StoredStackWants); dbErr != nil {
 			slog.Warn("delete stack backup repos failed", "stack", req.Name, "error", dbErr)
 		}
 

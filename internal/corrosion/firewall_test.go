@@ -137,7 +137,7 @@ func TestDeleteStackFirewall(t *testing.T) {
 	}
 
 	// Tear it down.
-	if err := DeleteStackFirewall(ctx, c, stack); err != nil {
+	if err := DeleteStackFirewall(ctx, c, stack, nil); err != nil {
 		t.Fatalf("DeleteStackFirewall: %v", err)
 	}
 

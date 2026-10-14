@@ -246,3 +246,95 @@ func TestDeleteStack_KeepsTheDenyWhileAnotherStacksFileIsUnreadable(t *testing.T
 		t.Errorf("cluster default after a's down with an unreadable stack file = %+v, want deny kept", d)
 	}
 }
+
+// hookDeployStream runs onSend for every progress line before recording it.
+type hookDeployStream struct {
+	mockDeployStream
+	onSend func(*pb.DeployProgress)
+}
+
+func (m *hookDeployStream) Send(p *pb.DeployProgress) error {
+	if m.onSend != nil {
+		m.onSend(p)
+	}
+	return m.mockDeployStream.Send(p)
+}
+
+// cr7 round 1, I1. Stack C's deploy asks for default-deny while stack A owns
+// it, so C's persist leaves A's row alone. A goes down while C's deploy is in
+// flight, and sees no record of C asking. C's deploy must not end with the
+// cluster default-allow.
+//
+// Mutation: drop the re-assert after the stack record is written — the
+// cluster is left default-allow.
+func TestDeployStack_DenyOwnerDownMidDeployLeavesTheClusterDenying(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	putStack(t, ctx, s, "a", denyFile("a"))
+	if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "a"); err != nil {
+		t.Fatal(err)
+	}
+	// The warning about another stack's repo is sent after C's persist: the
+	// point at which A goes down.
+	if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "z"}); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "name: c\nfirewall:\n  default-deny: true\nbackup-repos:\n  nightly: {path: /srv/other}\n"
+	downed := false
+	stream := &hookDeployStream{mockDeployStream: mockDeployStream{ctx: ctx}}
+	stream.onSend = func(p *pb.DeployProgress) {
+		if !downed && p.Phase == "warning" && strings.Contains(p.Detail, "nightly") {
+			downed = true
+			downStack(t, ctx, s, "a")
+			if d := clusterDefault(t, ctx, s); d != nil && d.DefaultDeny {
+				t.Errorf("fixture: a's down mid-deploy left the deny %+v; the test needs it gone", d)
+			}
+		}
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, stream); err != nil {
+		t.Fatalf("deploy of c: %v", err)
+	}
+	if !downed {
+		t.Fatal("fixture: a was never taken down mid-deploy")
+	}
+	if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "c" {
+		t.Errorf("cluster default after c's deploy = %+v, want deny owned by c", d)
+	}
+}
+
+// cr7 round 1, m3. A repo a stack's workload backs up to without defining it
+// is handed to that stack on its owner's down, not unregistered.
+//
+// Mutation: hand a repo only to a stack that defines it — the
+// registration goes.
+func TestDeleteStack_HandsARepoToAStackThatBacksUpToIt(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	putStack(t, ctx, s, "owner", nightlyOwnerYAML)
+	putStack(t, ctx, s, "user", "name: user\nvms:\n  web:\n    image: ubuntu\n    backup: {repo: nightly, schedule: \"0 2 * * *\"}\n")
+	if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	downStack(t, ctx, s, "owner")
+	if path, owner, ok := repoOwner(t, ctx, s, "nightly"); !ok || owner != "user" || path != "/srv/nightly" {
+		t.Errorf("repo nightly after its owner's down = %v %s owned by %q, want /srv/nightly handed to user", ok, path, owner)
+	}
+}
+
+// cr7 round 1, m3. While another stack's stored file cannot be read, a down
+// keeps its repos registered: that stack may back up to them.
+//
+// Mutation: tombstone whatever is unreadable — the registration goes.
+func TestDeleteStack_KeepsReposWhileAnotherStacksFileIsUnreadable(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	putStack(t, ctx, s, "owner", nightlyOwnerYAML)
+	putStack(t, ctx, s, "bad", "vms: [a, b]\n")
+	if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	downStack(t, ctx, s, "owner")
+	if _, _, ok := repoOwner(t, ctx, s, "nightly"); !ok {
+		t.Error("repo nightly was unregistered while another stack's file could not be read")
+	}
+}

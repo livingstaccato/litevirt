@@ -10,6 +10,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // stackFWFailingYAML persists its firewall and then fails the deploy: the
@@ -305,5 +306,27 @@ func TestDeployStack_FailedFirstDeployDoesNotClaimAnOperatorsDeny(t *testing.T) 
 	}
 	if strings.Contains(err.Error(), "stays on") {
 		t.Errorf("error = %q, claims an operator's default-deny as the deploy's", err)
+	}
+}
+
+// cr7 round 1, m5. The note keeps the error's code and status details.
+//
+// Mutation: rebuild the error from code and message — the detail is lost.
+func TestWithStackDefaultDenyNote_KeepsDetails(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "st"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := status.New(codes.FailedPrecondition, "boom").WithDetails(wrapperspb.String("R"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := status.Convert(s.withStackDefaultDenyNote(ctx, "st", st.Err()))
+	if got.Code() != codes.FailedPrecondition || !strings.Contains(got.Message(), "stays on") {
+		t.Fatalf("noted error = %v %q", got.Code(), got.Message())
+	}
+	if len(got.Details()) != 1 {
+		t.Errorf("details after the note = %v, want the detail kept", got.Details())
 	}
 }

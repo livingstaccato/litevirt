@@ -1572,7 +1572,12 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
 		stateDetail := ""
-		if vm.HostName == s.hostName && s.virt != nil {
+		if vm.HostName == s.hostName && s.startUnanswered(vm.Name) {
+			// A start libvirt has not answered yet is under way here: the
+			// VM is starting, whatever the row or libvirt says meanwhile
+			// (vm_start_bound.go), and libvirt is not asked.
+			state = "starting"
+		} else if vm.HostName == s.hostName && s.virt != nil {
 			if liveState, err := s.liveVMStateBounded(vm.Name, liveBudget); errors.Is(err, errLiveStateNoAnswer) {
 				state, stateDetail = "unknown", s.liveStateUnknownDetail(vm.State)
 			} else if err == nil {
@@ -2228,7 +2233,7 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if wait <= 0 {
 		return finish(ctx, s.virt.StartDomain(vm.Name))
 	}
-	return s.startDomainWithin(ctx, vm.Name, wait, finish)
+	return s.startDomainWithin(ctx, vm, wait, finish)
 }
 
 // finishStartLocked records the answer libvirt gave startVMLocked's start.
@@ -3405,7 +3410,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// (e.g., "stopped" from StopVM). This avoids showing stale libvirt state during
 	// graceful shutdown where libvirt still reports "running" briefly.
 	state, stateDetail := vm.State, vm.StateDetail
-	if vm.HostName == s.hostName && s.virt != nil {
+	if vm.HostName == s.hostName && s.startUnanswered(name) {
+		// A start libvirt has not answered yet is under way here
+		// (vm_start_bound.go): the VM is starting, and libvirt is not asked.
+		state = "starting"
+	} else if vm.HostName == s.hostName && s.virt != nil {
 		if liveState, err := s.liveVMStateBounded(name, s.newLiveStateBudget()); errors.Is(err, errLiveStateNoAnswer) {
 			// libvirt has not answered (vm_live_state.go): the read says
 			// so, with what the record says, rather than waiting on it.

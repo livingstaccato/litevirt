@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // defaultStartDomainWait is how long `lv start` waits for libvirt to answer
@@ -32,6 +35,24 @@ const startLockPoll = 20 * time.Millisecond
 type startFlight struct {
 	since   time.Time
 	settled chan struct{}
+
+	// mu guards what follows.
+	mu sync.Mutex
+	// answered is set once libvirt has answered the start.
+	answered bool
+	// held is set once the start was not answered within its wait and the
+	// caller was answered (startDomainWithin). marked says the row was then
+	// written starting (markStartHeld), and prev is the row's state and
+	// detail before it, put back if libvirt answers with a failure.
+	held       bool
+	marked     bool
+	prevState  string
+	prevDetail string
+	// ownsLease says markStartHeld took the VM's start lease itself (a
+	// start of a VM failover re-keyed here holds it already, and lets it go
+	// with the rest of what it holds); stopRenew ends its renewal.
+	ownsLease bool
+	stopRenew chan struct{}
 }
 
 func (s *Server) startDomainWaitOrDefault() time.Duration {
@@ -46,6 +67,25 @@ func (s *Server) startFlightOf(name string) (*startFlight, bool) {
 	defer s.startFlightsMu.Unlock()
 	f, ok := s.startFlights[name]
 	return f, ok
+}
+
+// startUnanswered reports whether a start of name libvirt has not answered
+// yet is under way on this daemon: a read shows the VM starting.
+func (s *Server) startUnanswered(name string) bool {
+	f, ok := s.startFlightOf(name)
+	if !ok {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.answered
+}
+
+// markAnswered records that libvirt has answered the flight's start.
+func (f *startFlight) markAnswered() {
+	f.mu.Lock()
+	f.answered = true
+	f.mu.Unlock()
 }
 
 func (s *Server) beginStartFlight(name string) *startFlight {
@@ -167,14 +207,112 @@ func (h *heldForStart) release() {
 	}()
 }
 
+// startHeldDetail is the state detail of a VM's row while a start libvirt has
+// not answered within its wait goes on.
+func startHeldDetail(since time.Time) string {
+	return fmt.Sprintf("operator start: libvirt has not answered the start asked for at %s", since.UTC().Format(time.RFC3339))
+}
+
+// startLeaseRenewEvery is how often a held start re-takes the VM's start
+// lease, well within its TTL.
+var startLeaseRenewEvery = health.VMStartLeaseTTL / 4
+
+// markStartHeld makes the VM's row say what a start libvirt has not answered
+// within its wait is: starting, where it said stopped (or error), so no
+// reader takes a VM being started for a stopped one. The row is the one every
+// host lists, so it is written, not only shown by this daemon.
+//
+// A starting row is one the reconciler re-drives (an interrupted start), so
+// the VM's start lease is taken first and kept, renewed, until the start
+// settles: no start path starts the VM while this one goes on, and a daemon
+// that restarts mid-start leaves a starting row whose lease lapses, which the
+// reconciler then finishes, recording its outcome. The row is never written
+// running here: only libvirt's answer does that (finishStartLocked). When the
+// lease cannot be taken, or the row says anything else, the row is left as
+// it is, as before.
+func (s *Server) markStartHeld(ctx context.Context, vm *corrosion.VMRecord, flight *startFlight) {
+	flight.mu.Lock()
+	defer flight.mu.Unlock()
+	flight.held = true
+	if s.db == nil {
+		return
+	}
+	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
+	if err != nil || fresh == nil || fresh.HostName != s.hostName {
+		slog.Warn("StartVM: a start held past its wait is not marked starting: its row could not be read here", "vm", vm.Name, "error", err)
+		return
+	}
+	if fresh.State != "stopped" && fresh.State != "error" {
+		return
+	}
+	holder := health.OperatorStartLockHolder(s.hostName)
+	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
+	if err != nil || heldBy != holder {
+		slog.Warn("StartVM: a start held past its wait is not marked starting: its start lease is not ours",
+			"vm", vm.Name, "held_by", heldBy, "error", err)
+		return
+	}
+	// A start of a VM failover re-keyed here took this lease already
+	// (StartVM) and lets it go itself.
+	owns := !corrosion.IsStoppedRekeyDetail(fresh.StateDetail)
+	if err := s.persistVMState(ctx, vm.Name, "starting", startHeldDetail(flight.since), corrosion.OpVMState); err != nil {
+		slog.Warn("StartVM: a start held past its wait is not marked starting: the write failed", "vm", vm.Name, "error", err)
+		if owns {
+			health.ReleaseVMStartLease(ctx, s.db, holder, vm.Name)
+		}
+		return
+	}
+	flight.marked, flight.prevState, flight.prevDetail = true, fresh.State, fresh.StateDetail
+	flight.ownsLease = owns
+	flight.stopRenew = make(chan struct{})
+	go func(stop <-chan struct{}) {
+		t := time.NewTicker(startLeaseRenewEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if by, err := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now()); err != nil || by != holder {
+					slog.Error("StartVM: a held start could not renew the VM's start lease", "vm", vm.Name, "held_by", by, "error", err)
+				}
+			}
+		}
+	}(flight.stopRenew)
+}
+
+// unmarkStartHeld ends what markStartHeld began once the start has settled
+// and its outcome is recorded: the lease renewal, and the lease itself when
+// it took it. With restore (libvirt answered with a failure) it first puts
+// the row back to what it said before the start.
+func (s *Server) unmarkStartHeld(ctx context.Context, name string, flight *startFlight, restore bool) {
+	flight.mu.Lock()
+	defer flight.mu.Unlock()
+	if !flight.marked {
+		return
+	}
+	if restore {
+		if err := s.persistVMState(ctx, name, flight.prevState, flight.prevDetail, corrosion.OpVMState); err != nil {
+			slog.Error("StartVM: a held start failed and its row could not be put back; it still says starting",
+				"vm", name, "state", flight.prevState, "error", err)
+		}
+	}
+	close(flight.stopRenew)
+	if flight.ownsLease {
+		health.ReleaseVMStartLease(ctx, s.db, health.OperatorStartLockHolder(s.hostName), name)
+	}
+	flight.marked = false
+}
+
 // startDomainWithin asks libvirt to start name and waits up to wait for its
 // answer, which finish records. When libvirt has not answered by then, the
 // start goes on: its answer is recorded by finish when it comes, under a
 // context the caller's return does not cancel, and the caller gets a
 // startInFlightError whose settled is closed after that. The caller holds the
 // VM lock until then (heldForStart). Nothing starts the VM a second time.
-func (s *Server) startDomainWithin(ctx context.Context, name string, wait time.Duration,
+func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, wait time.Duration,
 	finish func(context.Context, error) (*pb.VM, error)) (*pb.VM, error) {
+	name := vm.Name
 	flight := s.beginStartFlight(name)
 	answered := make(chan error, 1)
 	go func() { answered <- s.virt.StartDomain(name) }()
@@ -183,14 +321,20 @@ func (s *Server) startDomainWithin(ctx context.Context, name string, wait time.D
 	select {
 	case err := <-answered:
 		defer s.endStartFlight(name, flight)
+		flight.markAnswered()
 		return finish(ctx, err)
 	case <-timer.C:
 	}
 	slog.Warn("StartVM: libvirt has not answered the start; it goes on, holding the VM", "vm", name, "waited", wait)
 	bg := context.WithoutCancel(ctx)
+	s.markStartHeld(bg, vm, flight)
 	go func() {
 		defer s.endStartFlight(name, flight)
-		if _, err := finish(bg, <-answered); err != nil {
+		startErr := <-answered
+		flight.markAnswered()
+		_, err := finish(bg, startErr)
+		s.unmarkStartHeld(bg, name, flight, err != nil)
+		if err != nil {
 			msg := status.Convert(err).Message()
 			slog.Error("StartVM: libvirt answered a start late, with a failure", "vm", name, "error", msg)
 			s.recordVMEvent(bg, name, "vm.started", "error",

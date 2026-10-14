@@ -323,8 +323,10 @@ func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration
 
 // LeaseQuorumLost reports whether this node has lost every voter majority it
 // could decide on (health.LostEveryDecisionQuorum), so it must neither take
-// nor renew a leader lease: the dual-run detector's, and the rebalancer's.
-// A server with no gate, or a gate that cannot read quorum, has lost nothing.
+// nor renew a leader lease: the dual-run detector's, and the rebalancer's on
+// every path that takes it (the daemon's background rebalancer, RunRebalance
+// and the rebalance executor). A server with no gate, or a gate that cannot
+// read quorum, has lost nothing.
 func (s *Server) LeaseQuorumLost(ctx context.Context) bool {
 	g := s.gateV()
 	if g == nil {

@@ -396,12 +396,6 @@ func LostOwnRegionQuorumUnder(ctx context.Context, pol *DecisionPolicy, self str
 	return !held(ctx, st, RegionQuorumScope(own))
 }
 
-// LostEveryDecisionQuorum is LostEveryDecisionQuorum over this daemon's own
-// probes.
-func (c *Checker) LostEveryDecisionQuorum(ctx context.Context) bool {
-	return LostEveryDecisionQuorum(ctx, c.db, c.QuorumProof, c.RegionQuorumProof, nil)
-}
-
 // RegionQuorumProof is QuorumProof over one region's voters: the members of
 // the voter set whose hosts.region is region, counted from THIS daemon's own
 // probes. A region with no voters has nothing to prove and reports No. A read

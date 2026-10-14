@@ -116,6 +116,12 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 	if spec.Image != "" {
 		defer o.s.holdImage(spec.Image)()
 	}
+	// A switch to another image that is already deleted is refused before
+	// anything is deleted (refuseSwitchToDeletedImage).
+	if err := o.s.refuseSwitchToDeletedImage(ctx, spec.Image, cur); err != nil {
+		st := status.Convert(err)
+		return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+	}
 	var curCreated string
 	if cur != nil {
 		curCreated = cur.CreatedAt
@@ -591,6 +597,15 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 	if !action.IsContainer {
 		if sp, perr := s.plannedVMSpec(action, f); perr == nil && sp.GetImage() != "" {
 			defer s.holdImage(sp.GetImage())()
+			// A switch to another image that is already deleted is refused
+			// before anything is deleted (refuseSwitchToDeletedImage).
+			if err := s.refuseSwitchToDeletedImage(ctx, sp.GetImage(), cur); err != nil {
+				slog.Warn("deploy update refused", "workload", action.VMName, "error", err)
+				st := status.Convert(err)
+				err = status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", action.VMName, st.Message())
+				gate.markUnmet(action.VMName, err)
+				return err
+			}
 		}
 	}
 	delErr := s.deleteWorkload(deleteCtx, action)

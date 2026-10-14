@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,6 +28,12 @@ func (s *Server) refuseDeletedImage(ctx context.Context, vmName, img string) err
 	if _, recreate := replacedRowFor(ctx, vmName); recreate {
 		return nil
 	}
+	return s.deletedImageRefusal(ctx, img)
+}
+
+// deletedImageRefusal is FailedPrecondition when img's catalog row is
+// deleted, nil when it is live or the catalog has never recorded it.
+func (s *Server) deletedImageRefusal(ctx context.Context, img string) error {
 	deletedAt, err := corrosion.ImageDeletedAt(ctx, s.db, img)
 	if err != nil {
 		return status.Errorf(codes.Internal, "image %q: read the image catalog: %v", img, err)
@@ -37,4 +44,24 @@ func (s *Server) refuseDeletedImage(ctx context.Context, vmName, img string) err
 	return status.Errorf(codes.FailedPrecondition,
 		"image %q was deleted (lv image rm, at %s) and cannot be used; to use it again, re-import it (lv image import) or pull it (lv image pull)",
 		img, deletedAt)
+}
+
+// refuseSwitchToDeletedImage refuses, before its teardown, a re-create of cur
+// (a rolling recreate, a deploy update) onto image img when img is not the
+// image cur was made from and img's catalog row is already deleted: that is
+// a new use of a deleted name, and the create's re-create exemption
+// (refuseDeletedImage) covers only an lv image rm landing during the
+// operation. A re-create onto cur's own image is not refused here: the VM
+// records it, and a rebuild of it works today.
+func (s *Server) refuseSwitchToDeletedImage(ctx context.Context, img string, cur *corrosion.VMRecord) error {
+	if img == "" || cur == nil {
+		return nil
+	}
+	var spec struct {
+		Image string `json:"image"`
+	}
+	if cur.Spec != "" && json.Unmarshal([]byte(cur.Spec), &spec) == nil && spec.Image == img {
+		return nil
+	}
+	return s.deletedImageRefusal(ctx, img)
 }

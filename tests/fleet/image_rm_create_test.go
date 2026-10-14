@@ -59,3 +59,45 @@ func TestFleet_ImageRm_ACreateOnAHostThatKeptItsCopyIsRefused(t *testing.T) {
 		t.Fatalf("create after a re-import: %v", err)
 	}
 }
+
+// I-4: a deploy update that switches a VM to another image already removed
+// with lv image rm — whose file this host still keeps inside the delete
+// margin — is refused before the VM is deleted: a new use of a deleted name,
+// which the re-create exemption (an rm landing during the operation) does
+// not cover. The VM stays as it was, on its own image.
+//
+// Mutation: drop refuseSwitchToDeletedImage from the deploy update — the
+// update tears the VM down and builds it on the deleted image: red.
+func TestFleet_ImageRm_ADeployUpdateToADeletedImageIsRefusedBeforeTheDelete(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	c.WaitConverged(t, convergeTimeout)
+	n0 := c.Nodes[0]
+	ctx := context.Background()
+	importImageOn(t, c, n0, "ubuntu")
+	noble := importImageOn(t, c, n0, "noble")
+	if p := errorPhaseFor(deployCollect(t, ctx, c.SelfClient(n0), strings.Replace(composeImageSwitch, "IMG", "ubuntu", 1)), "box"); p != nil {
+		t.Fatalf("first deploy: %s", p.Error)
+	}
+	before, err := corrosion.GetVM(ctx, n0.DB, "box")
+	if err != nil || before == nil {
+		t.Fatalf("box after the first deploy: %v %v", before, err)
+	}
+	if _, err := c.SelfClient(n0).RemoveImage(ctx, &pb.RemoveImageRequest{Name: "noble"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fileThere(noble) {
+		t.Fatal("noble's file was not kept within the delete margin: the test's premise is gone")
+	}
+
+	p := errorPhaseFor(deployCollect(t, ctx, c.SelfClient(n0), strings.Replace(composeImageSwitch, "IMG", "noble", 1)), "box")
+	if p == nil || !strings.Contains(p.Error, "deleted") || !strings.Contains(p.Error, "nothing was deleted") {
+		t.Fatalf("the update to the deleted image noble: %v, want it refused before the delete", p)
+	}
+	vm, err := corrosion.GetVM(ctx, n0.DB, "box")
+	if err != nil || vm == nil || vm.CreatedAt != before.CreatedAt || !strings.Contains(vm.Spec, `"image":"ubuntu"`) {
+		t.Errorf("box after the refused update: %+v (err %v); want the same VM, on ubuntu", vm, err)
+	}
+	if !n0.Virt.DomainExists("box") {
+		t.Error("box's domain is gone")
+	}
+}

@@ -361,8 +361,9 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		if def.VLAN > 0 {
 			RemoveBridgeVLAN(bridge, def.VLAN, def.Underlay)
 		}
-		// The bridge itself goes only when litevirt created it here and no
-		// other live network names it; an operator's bridge is never deleted.
+		// The bridge itself goes only when litevirt created it here, no other
+		// live network names it, and no workload on this host attaches to it;
+		// an operator's bridge is never deleted.
 		removeCreatedBridge(ctx, db, networkName, bridge, hostName)
 		return nil
 
@@ -415,9 +416,12 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 // removeCreatedBridge removes bridge, the device of bridge network
 // networkName that is being torn down, when this host's record says
 // EnsureBridge created it (RemoveCreatedBridgeIfUnused), no OTHER live
-// network uses it as its device, and no VM or container on this host still
-// names it (bridgeNamedByWorkload). networkName itself does not count as a
+// network uses it as its device, and no VM or container on hostName attaches
+// to it (bridgeNamedByWorkload). networkName itself does not count as a
 // network: its own delete deprovisions before it tombstones the row.
+//
+// Every teardown of a bridge network reaches the bridge here — `lv network
+// rm` and a stack delete — so the workload check guards both.
 //
 // It is best effort and never fails the teardown: a bridge it cannot prove
 // unshared, or cannot remove, stays, as every bridge network's bridge did
@@ -452,12 +456,12 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 			return
 		}
 	}
-	if named, who, err := bridgeNamedByWorkload(ctx, db, hostName, networkName, bridge); err != nil {
+	if who, err := bridgeNamedByWorkload(ctx, db, hostName, networkName, bridge); err != nil {
 		slog.Warn("network teardown: cannot read this host's workload NICs, so the bridge stays",
 			"network", networkName, "bridge", bridge, "error", err)
 		return
-	} else if named {
-		slog.Info("network teardown: a workload on this host still names the bridge, so it stays",
+	} else if who != "" {
+		slog.Info("network teardown: a workload on this host still attaches to the bridge, so it stays",
 			"network", networkName, "bridge", bridge, "workload", who)
 		return
 	}
@@ -471,43 +475,86 @@ func removeCreatedBridge(ctx context.Context, db *corrosion.Client, networkName,
 	}
 }
 
-// bridgeNamedByWorkload reports whether a live VM or container on hostName has
-// a NIC that attaches to bridge: one naming networkName (a `--force` delete
-// leaves its NICs in place) or naming the bridge itself (a flat-bridge NIC,
-// or a container's raw `bridge=` NIC). It returns which workload names it.
+// bridgeNamedByWorkload names a live VM or container on hostName with a NIC
+// that attaches to bridge, or returns "" when there is none. A NIC attaches to
+// it when it names networkName (a `--force` delete leaves its NICs in place),
+// names the bridge itself (a flat-bridge NIC, `--network <bridge>`), names
+// another network — live or deleted — whose device is the bridge, or is a
+// container's raw `bridge=` NIC, which has no interface row and is found in
+// its create spec.
 //
-// The bridge's ports cannot answer this: a stopped VM has no tap on it, and
-// a VM start does not re-create its bridge, so removing it would leave that
-// VM unable to start.
-func bridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, networkName, bridge string) (bool, string, error) {
-	names := func(n string) bool { return n == networkName || n == bridge }
+// The bridge's ports cannot answer this: a stopped VM has no tap on it, and a
+// VM start does not re-create its bridge, so removing it leaves that VM
+// unable to start. An error means the answer is unknown, and the caller keeps
+// the bridge: a leaked bridge is harmless, a missing one is not.
+func bridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, networkName, bridge string) (string, error) {
+	// The device each network name resolves to, from every network row,
+	// live or deleted: a VM's domain keeps the bridge it was defined with
+	// after its network is deleted. A name with no row is a flat bridge.
+	netRows, err := db.Query(ctx, `SELECT name, type, config FROM networks`)
+	if err != nil {
+		return "", fmt.Errorf("read networks: %w", err)
+	}
+	netDev := map[string]string{}
+	badDef := map[string]error{}
+	for _, r := range netRows {
+		name := r.String("name")
+		var def compose.NetworkDef
+		if c := r.String("config"); c != "" {
+			if err := json.Unmarshal([]byte(c), &def); err != nil {
+				badDef[name] = err
+				continue
+			}
+		}
+		def.Type = r.String("type")
+		netDev[name] = BridgeName(name, def)
+	}
+	attaches := func(n string) (bool, error) {
+		if n == "" {
+			return false, nil
+		}
+		if n == networkName || n == bridge {
+			return true, nil
+		}
+		if err, bad := badDef[n]; bad {
+			return false, fmt.Errorf("network %s: config: %w", n, err)
+		}
+		return netDev[n] == bridge, nil
+	}
+
 	for _, q := range []string{
-		`SELECT vi.vm_name AS w, vi.network_name AS n FROM vm_interfaces vi
+		`SELECT 'VM ' || vi.vm_name AS w, vi.network_name AS n FROM vm_interfaces vi
 		   JOIN vms v ON v.name = vi.vm_name
 		  WHERE v.host_name = ? AND v.deleted_at IS NULL AND vi.deleted_at IS NULL`,
-		`SELECT vn.vm_name AS w, vn.network_name AS n FROM vm_nics vn
+		`SELECT 'VM ' || vn.vm_name AS w, vn.network_name AS n FROM vm_nics vn
 		   JOIN vms v ON v.name = vn.vm_name
 		  WHERE v.host_name = ? AND v.deleted_at IS NULL AND vn.deleted_at IS NULL`,
-		`SELECT ci.ct_name AS w, ci.network_name AS n FROM container_interfaces ci
+		`SELECT 'container ' || ci.ct_name AS w, ci.network_name AS n FROM container_interfaces ci
 		   JOIN containers c ON c.host_name = ci.host_name AND c.name = ci.ct_name
 		  WHERE ci.host_name = ? AND c.deleted_at IS NULL AND ci.deleted_at IS NULL`,
 	} {
 		rows, err := db.Query(ctx, q, hostName)
 		if err != nil {
-			return false, "", err
+			return "", err
 		}
 		for _, r := range rows {
-			if names(r.String("n")) {
-				return true, r.String("w"), nil
+			hit, err := attaches(r.String("n"))
+			if err != nil {
+				return "", fmt.Errorf("%s: %w", r.String("w"), err)
+			}
+			if hit {
+				return r.String("w"), nil
 			}
 		}
 	}
+
 	// A container's raw-bridge NIC has no interface row; its create spec
 	// holds the bridge.
 	rows, err := db.Query(ctx,
-		`SELECT name, create_spec FROM containers WHERE host_name = ? AND deleted_at IS NULL`, hostName)
+		`SELECT name, COALESCE(create_spec, '') AS create_spec FROM containers
+		  WHERE host_name = ? AND deleted_at IS NULL`, hostName)
 	if err != nil {
-		return false, "", err
+		return "", err
 	}
 	for _, r := range rows {
 		raw := r.String("create_spec")
@@ -516,15 +563,22 @@ func bridgeNamedByWorkload(ctx context.Context, db *corrosion.Client, hostName, 
 		}
 		var spec corrosion.ContainerCreateSpec
 		if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-			return false, "", fmt.Errorf("container %s: create spec: %w", r.String("name"), err)
+			return "", fmt.Errorf("container %s: create spec: %w", r.String("name"), err)
 		}
 		for _, n := range spec.Networks {
-			if n.Bridge == bridge || names(n.NetworkName) {
-				return true, r.String("name"), nil
+			if n.Bridge == bridge {
+				return "container " + r.String("name"), nil
+			}
+			hit, err := attaches(n.NetworkName)
+			if err != nil {
+				return "", fmt.Errorf("container %s: %w", r.String("name"), err)
+			}
+			if hit {
+				return "container " + r.String("name"), nil
 			}
 		}
 	}
-	return false, "", nil
+	return "", nil
 }
 
 // fwScopeNet is the host_fw_intent scope key for a network's provisioning

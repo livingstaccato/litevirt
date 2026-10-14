@@ -280,7 +280,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 		return "", err
 	}
 	dest := filepath.Join(dir, name)
-	// Never over a file already there (RENAME_NOREPLACE).
+	// Never over a file already there (placeNoClobber).
 	if err := placeNoClobber(tmpName, dest); err != nil {
 		return "", err
 	}

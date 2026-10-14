@@ -34,33 +34,10 @@ func placeNoReplace(ctx context.Context, src, dst string, w *importDiskWrites) e
 }
 
 // linkOrRenameNoReplace gives src the name dst with link() (then removing
-// src) or renameat2(RENAME_NOREPLACE). unsupported is a filesystem that can do
-// neither; err then says why.
+// src) or renameat2(RENAME_NOREPLACE) (noReplacePlace, link first).
+// unsupported is a filesystem that can do neither; err then says why.
 func linkOrRenameNoReplace(src, dst string) (unsupported bool, err error) {
-	lerr := coldLink(src, dst)
-	if lerr == nil {
-		_ = coldRemove(src)
-		return false, nil
-	}
-	if errors.Is(lerr, os.ErrExist) || !placementUnsupported(lerr) {
-		return false, lerr
-	}
-	rerr := coldRenameNoReplace(src, dst)
-	if rerr == nil || errors.Is(rerr, os.ErrExist) || !placementUnsupported(rerr) {
-		return false, rerr
-	}
-	return true, fmt.Errorf("neither a hard link (%v) nor a rename that cannot replace a file (%v)", lerr, rerr)
-}
-
-// placementUnsupported is a link or rename refused because the filesystem
-// cannot do it, not because of the files.
-func placementUnsupported(err error) bool {
-	for _, e := range []error{syscall.EPERM, syscall.EXDEV, syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.EINVAL, syscall.ENOSYS} {
-		if errors.Is(err, e) {
-			return true
-		}
-	}
-	return false
+	return noReplacePlace(src, dst, true, "import: placed a file by a hard link but could not remove its temporary name")
 }
 
 // placeCopy copies a file's bytes for copyIntoPlace; a variable so a test can

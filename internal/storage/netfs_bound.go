@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -355,4 +357,27 @@ func OverrideFSCallBoundForTest(d time.Duration) func() {
 // function.
 func OverridePathResolverForTest(resolve func(string) string) func() {
 	return resolvePathFn.set(resolve)
+}
+
+// ProbeAnswers asks the filesystem holding dir for its statistics (statfs),
+// under Bounded and its mount latch, and returns the error when it does not
+// answer in time or answers with one. A stat of an NFS pool's mount point
+// may be served from the client's attribute cache while its server is gone,
+// so a Prepare that only stats it can pass, and the write after it then
+// blocks in the kernel (lab 2, 8600a939: nfs4_proc_getattr); a statfs is
+// sent to the server every time, so a pool whose server does not answer is
+// refused within the bound, and at once while that call is still stuck.
+// The path is judged against ctx's mount table (WithMountTable) when it
+// carries one. Off Linux there is no statfs to ask, and nothing is refused.
+func ProbeAnswers(ctx context.Context, dir string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	info := statfsInfo.get()
+	mt := MountSnapshot(ctx)
+	_, err := boundedIn(&mt, "ask the filesystem for its statistics (statfs) at", dir, func() (struct{}, error) {
+		_, _, err := info(dir)
+		return struct{}{}, err
+	})
+	return err
 }

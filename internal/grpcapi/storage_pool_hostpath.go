@@ -198,7 +198,13 @@ func checkDirPoolNFSHardened(mt storage.MountTable, dataDir string, ref StorageP
 // and for an NFS pool the export mounted (hardened) by its Prepare, so nothing
 // is ever written into a bare mount point on the local disk.
 func (s *Server) poolDirForWrite(ctx context.Context, name string, ref StoragePoolRef) (string, error) {
-	if err := s.checkPoolForWrite(ctx, name, ref); err != nil {
+	// One mount table for the check and the probe of a directory pool. Not
+	// handed to the NFS Prepare below, which may outlive this call.
+	mctx := ctx
+	if isFileBasedDriver(ref.Driver) {
+		mctx = storage.WithMountTable(ctx)
+	}
+	if err := s.checkPoolForWrite(mctx, name, ref); err != nil {
 		return "", err
 	}
 	if strings.EqualFold(ref.Driver, "nfs") {
@@ -206,16 +212,96 @@ func (s *Server) poolDirForWrite(ctx context.Context, name string, ref StoragePo
 		if err != nil {
 			return "", status.Errorf(codes.FailedPrecondition, "pool %q: %v", name, err)
 		}
-		if err := drv.Prepare(ctx); err != nil {
+		dir, err := fileBasedPoolDir(s.dataDir, ref)
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		}
+		if err := prepareTargetPool(ctx, drv, dir); err != nil {
+			if storage.IsFSNoAnswer(err) {
+				slog.Error("storage pool write refused: its NFS export did not answer", "pool", name, "error", err)
+				return "", status.Errorf(codes.Unavailable, "pool %q: %v", name, err)
+			}
 			slog.Error("storage pool write refused: its NFS export could not be mounted hardened", "pool", name, "error", err)
 			return "", status.Errorf(codes.FailedPrecondition, "pool %q: mount: %v", name, err)
 		}
+		return dir, nil
 	}
 	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
+	// A directory pool on a network mount (fstab) whose server does not
+	// answer is refused within the bound, not written into (probePoolAnswers).
+	if err := probePoolAnswers(mctx, ref.Driver, dir); err != nil {
+		slog.Error("storage pool write refused: its filesystem did not answer", "pool", name, "error", err)
+		return "", status.Errorf(codes.Unavailable, "pool %q: %v", name, err)
+	}
 	return dir, nil
+}
+
+// prepareTargetPool runs a write target pool's Prepare and then asks the
+// pool's filesystem whether its server answers (probePoolAnswers), so a pool
+// whose server is gone is refused before anything is written into it.
+//
+// A pool whose directory the mount table already has as a mount point (an
+// NFS pool's mounted export) or that needs no mount (a directory pool) is
+// asked first, and then prepared under storage.Bounded, keyed on dir. On an
+// NFS mount whose server does not answer, a stat or a "mountpoint" blocks in
+// the kernel past any command timeout (lab 2: about 120 s, until the server
+// answered again), and a replication schedule behind it waited as long; a
+// stat may also be answered from the client's attribute cache, so Prepare
+// alone can pass while the write after it blocks (lab 2, 8600a939). Bounded
+// gives up after its bound and latches the mount, so a later call there
+// refuses at once. A pool that does not answer is refused, never treated as
+// ready.
+//
+// An NFS pool not yet mounted is mounted as on main, on the caller's context
+// and within the pool's command_timeout: a mount that takes longer than the
+// bound is not refused for it, and a mount command, unlike a stat on a dead
+// mount, ends when its timeout does. The mounted export is then asked too.
+//
+// The bounded Prepare runs on a context without the caller's cancellation, so
+// a call that joins one still running gets that call's own outcome, not the
+// end of another caller's request. The bound limits only the caller's wait: a
+// call stuck in the kernel goes on until the server answers.
+func prepareTargetPool(ctx context.Context, drv storage.Driver, dir string) error {
+	driver := drv.String()
+	if strings.EqualFold(driver, "nfs") && !storage.IsMountPoint(dir) {
+		if err := drv.Prepare(ctx); err != nil {
+			return err
+		}
+		return probePoolAnswers(ctx, driver, dir)
+	}
+	if err := probePoolAnswers(ctx, driver, dir); err != nil {
+		return err
+	}
+	pctx := context.WithoutCancel(ctx)
+	_, err := storage.Bounded("prepare the pool at", dir, func() (struct{}, error) {
+		return struct{}{}, drv.Prepare(pctx)
+	})
+	return err
+}
+
+// probePoolAnswers asks the filesystem holding a pool's directory for its
+// statistics, under the bound and the mount latch (storage.ProbeAnswers). An
+// NFS pool is refused on any error from it; another pool only when its
+// filesystem does not answer (one whose directory a later step creates may
+// not exist yet, and is judged there, as before).
+func probePoolAnswers(ctx context.Context, driver, dir string) error {
+	err := storage.ProbeAnswers(ctx, dir)
+	if err == nil || storage.IsFSNoAnswer(err) || strings.EqualFold(driver, "nfs") {
+		return err
+	}
+	return nil
+}
+
+// prepareTargetPoolStatus is prepareTargetPool's refusal as an RPC status:
+// Unavailable for a pool that does not answer, FailedPrecondition otherwise.
+func prepareTargetPoolStatus(err error) error {
+	if storage.IsFSNoAnswer(err) {
+		return status.Errorf(codes.Unavailable, "prepare target pool: %v", err)
+	}
+	return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
 }
 
 // poolWriteDir is poolDirForWrite for a pool row.

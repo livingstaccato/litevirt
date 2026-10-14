@@ -176,16 +176,20 @@ func existAsAlreadyExists(err error) error {
 }
 
 // placeNoClobber makes tmp visible as dst only if nothing is at dst. The
-// rename itself refuses (RENAME_NOREPLACE), so a file created between a check
-// and the rename is not replaced either.
+// placement itself refuses (noReplacePlace: renameat2 RENAME_NOREPLACE, or a
+// hard link where the filesystem cannot do the flag, as on NFS), so a file
+// created between a check and the placement is not replaced either.
 func placeNoClobber(tmp, dst string) error {
-	if err := renameNoReplace(tmp, dst); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return status.Errorf(codes.AlreadyExists, "%q already exists; a restore or copy never replaces a file", dst)
-		}
-		return status.Errorf(codes.Internal, "place %q: %v", dst, err)
+	unsupported, err := noReplacePlace(tmp, dst, false, "placed a file by a hard link but could not remove its temporary name")
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		return status.Errorf(codes.AlreadyExists, "%q already exists; a restore or copy never replaces a file", dst)
+	case unsupported:
+		return status.Errorf(codes.FailedPrecondition, "place %q: %v; a file is never placed with a rename that could overwrite one", dst, err)
 	}
-	return nil
+	return status.Errorf(codes.Internal, "place %q: %v", dst, err)
 }
 
 // place publishes tmp at the destination: over the record's disk for an

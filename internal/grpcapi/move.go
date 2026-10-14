@@ -189,12 +189,12 @@ func (s *Server) moveOneVolume(
 	if err != nil {
 		return status.Errorf(codes.Internal, "construct target driver: %v", err)
 	}
-	if err := drv.Prepare(ctx); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
-	}
 	dstDir, err := fileBasedPoolDir(s.dataDir, dstPool)
 	if err != nil {
 		return status.Errorf(codes.Internal, "resolve target dir: %v", err)
+	}
+	if err := prepareTargetPool(ctx, drv, dstDir); err != nil {
+		return prepareTargetPoolStatus(err)
 	}
 	dstPath := filepath.Join(dstDir, fmt.Sprintf("%s-%s.qcow2", vm.Name, src.DiskName))
 	if dstPath == src.Path {
@@ -1047,7 +1047,7 @@ func convertImageWith(ctx context.Context, src, srcFormat string, rule chainRule
 }
 
 // copyNoClobber converts src into a NEW file at dst: into a temp beside dst,
-// then placed with RENAME_NOREPLACE. An existing dst — a file, a symlink, a
+// then placed no-clobber (placeNoClobber). An existing dst — a file, a symlink, a
 // disk another VM uses — is refused with AlreadyExists, never written through,
 // and a failed copy leaves nothing at dst.
 func (s *Server) copyNoClobber(ctx context.Context, src *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) error {

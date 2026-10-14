@@ -719,31 +719,19 @@ func (s *Server) requireDiskSpace(dir, shownDir, what string, need uint64) error
 // error satisfying errors.Is(err, os.ErrExist) if dst exists: a hard link, not
 // a rename, so a file at dst is never replaced. The scratch name is removed.
 //
-// A filesystem that cannot hard-link (EPERM, EXDEV, ENOTSUP from link) gets a
-// renameat2(RENAME_NOREPLACE), which never replaces dst either. One that can
-// do neither is refused: there is no rename there that cannot replace a file.
+// A filesystem that cannot hard-link gets a renameat2(RENAME_NOREPLACE),
+// which never replaces dst either. One that can do neither is refused: there
+// is no rename there that cannot replace a file (noReplacePlace, link first).
 //
 // Once the link has given the copy its name, the copy is placed: if the
 // scratch name then cannot be removed it is only logged — the startup sweep
 // takes it — so a retry is not refused over a file that is the copy itself.
 func placeColdDisk(tmp, dst string) error {
-	err := coldLink(tmp, dst)
-	if err == nil {
-		if rerr := coldRemove(tmp); rerr != nil {
-			slog.Warn("cold migration: placed the received disk but could not remove its scratch name",
-				"scratch", tmp, "path", dst, "error", rerr)
-		}
-		return nil
+	unsupported, err := noReplacePlace(tmp, dst, true, "cold migration: placed the received disk but could not remove its scratch name")
+	if unsupported {
+		return fmt.Errorf("%v; a received disk is never placed with a rename that could overwrite one", err)
 	}
-	if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.ENOTSUP) {
-		return err
-	}
-	rerr := coldRenameNoReplace(tmp, dst)
-	if rerr == nil || errors.Is(rerr, os.ErrExist) {
-		return rerr
-	}
-	return fmt.Errorf("the filesystem holding %s supports neither hard links (%v) nor a rename that cannot replace a file (%v); "+
-		"a received disk is never placed with a rename that could overwrite one", filepath.Dir(dst), err, rerr)
+	return err
 }
 
 // coldDiskRecheckEvery is how many bytes a receive writes between re-checks

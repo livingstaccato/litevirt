@@ -248,12 +248,12 @@ func (s *Server) replicateLocalCopy(ctx context.Context, sched corrosion.BackupS
 	if err != nil {
 		return fmt.Errorf("construct target driver: %w", err)
 	}
-	if err := drv.Prepare(ctx); err != nil {
-		return fmt.Errorf("prepare target pool: %w", err)
-	}
 	dstDir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: dstPool.Driver, Source: dstPool.Source, Target: dstPool.Target})
 	if err != nil {
 		return fmt.Errorf("resolve target dir: %w", err)
+	}
+	if err := prepareTargetPool(ctx, drv, dstDir); err != nil {
+		return fmt.Errorf("prepare target pool: %w", err)
 	}
 	// The replica goes into the VM's own directory of the replica area, with a
 	// record naming its project, VM, disk and schedule (replica_records.go).

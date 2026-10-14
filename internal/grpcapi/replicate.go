@@ -131,13 +131,12 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err != nil {
 		return status.Errorf(codes.Internal, "construct target driver: %v", err)
 	}
-	if err := drv.Prepare(ctx); err != nil {
-		return status.Errorf(codes.FailedPrecondition, "prepare target pool: %v", err)
-	}
-
 	dstDir, err := fileBasedPoolDir(s.dataDir, dstPool)
 	if err != nil {
 		return status.Errorf(codes.Internal, "resolve target dir: %v", err)
+	}
+	if err := prepareTargetPool(ctx, drv, dstDir); err != nil {
+		return prepareTargetPoolStatus(err)
 	}
 	// The destination is a new file: daemon-named
 	// ("<vm>-<disk>-copy-<time>-<id>.qcow2") unless an admin named it, and

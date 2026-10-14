@@ -158,32 +158,25 @@ func (g checkerServerGate) DecisionGate(ctx context.Context) health.GateResult {
 	return g.chk.DecisionGate(ctx)
 }
 
-// TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority: four voters split
-// 2|2, so no node holds the majority and none may hold the dual-run
-// detector's lease. A VM then runs on both hosts of one half. The nodes of
-// that half must still record it — positive evidence is recorded without
-// quorum (dualrun_lifecycle.go) — and must not resolve it once one copy
-// stops, as nothing without the majority proves absence.
-//
-// Mutation: drop the lease-less observe-only pass from RunDualRunDetector —
-// no node records the dual run and the first wait times out.
-func TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	c := New(t, Options{Nodes: 4, IndependentReplicas: true, Relays: 4, RealGossip: true})
-	n0, n1 := c.Nodes[0], c.Nodes[1]
+// detectorFleet is n nodes with an explicit voter generation, each with
+// its real checker as the server gate and a dual-run detector looping every
+// 2 s, once every checker sees the voter majority. dr-vm runs on node-0.
+func detectorFleet(t *testing.T, ctx context.Context, n int) (*Cluster, map[string]*health.Checker) {
+	t.Helper()
+	c := New(t, Options{Nodes: n, IndependentReplicas: true, Relays: n, RealGossip: true})
+	n0 := c.Nodes[0]
 	insertVMPolicy(t, n0, "dr-vm", n0.Name, "restart-any")
 	c.WaitConverged(t, convergeTimeout)
 	n0.Virt.SetState("dr-vm", libvirtfake.StateRunning)
 	genesisByTick(t, c, n0)
 
 	chks := map[string]*health.Checker{}
-	for _, n := range c.Nodes {
-		chk := health.NewChecker(n.Name, n.PKIDir, n.DB)
-		chk.SetPeerReadiness(n.Server.PeerReady)
+	for _, nd := range c.Nodes {
+		chk := health.NewChecker(nd.Name, nd.PKIDir, nd.DB)
+		chk.SetPeerReadiness(nd.Server.PeerReady)
 		go chk.Start(ctx)
-		chks[n.Name] = chk
-		n.Server.SetGate(checkerServerGate{chk: chk})
+		chks[nd.Name] = chk
+		nd.Server.SetGate(checkerServerGate{chk: chk})
 	}
 	eventually(t, 30*time.Second, "every node's checker to see the voter majority", func() bool {
 		for _, chk := range chks {
@@ -193,19 +186,41 @@ func TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority(t *testing.T) {
 		}
 		return true
 	})
-	for _, n := range c.Nodes {
-		go n.Server.RunDualRunDetector(ctx, 2*time.Second)
+	for _, nd := range c.Nodes {
+		go nd.Server.RunDualRunDetector(ctx, 2*time.Second)
 	}
+	return c, chks
+}
 
-	c.SplitGossip(c.Nodes[:2], c.Nodes[2:])
-	eventually(t, time.Minute, "every node's checker to lose the voter majority", func() bool {
-		for _, chk := range chks {
-			if st, _, _ := chk.QuorumProof(ctx); st != health.QuorumNo {
+func waitQuorum(t *testing.T, ctx context.Context, what string, chks map[string]*health.Checker, names []string, want health.QuorumState) {
+	t.Helper()
+	eventually(t, time.Minute, what, func() bool {
+		for _, n := range names {
+			if st, _, _ := chks[n].QuorumProof(ctx); st != want {
 				return false
 			}
 		}
 		return true
 	})
+}
+
+// TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority: four voters split
+// 2|2, so no node holds the majority and none may hold the dual-run
+// detector's lease. A VM then runs on both hosts of one half. The nodes of
+// that half must still record it — positive evidence is recorded without
+// quorum (dualrun_lifecycle.go) — and confirm it on their own consecutive
+// scans.
+//
+// Mutation: drop the lease-less observe-only pass from RunDualRunDetector —
+// no node records the dual run and the first wait times out.
+func TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c, chks := detectorFleet(t, ctx, 4)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+
+	c.SplitGossip(c.Nodes[:2], c.Nodes[2:])
+	waitQuorum(t, ctx, "every node's checker to lose the voter majority", chks, names(c.Nodes), health.QuorumNo)
 	n1.Virt.SetState("dr-vm", libvirtfake.StateRunning)
 
 	eventually(t, time.Minute, "a node of the split half to record dr-vm's dual run", func() bool {
@@ -225,7 +240,9 @@ func TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority(t *testing.T) {
 		return false
 	})
 
-	// Nothing without the majority may prove the copy gone.
+	// A regression guard only: with no node holding the majority there is no
+	// leader, so nothing resolves here either way. That an observe-only pass
+	// resolves nothing is pinned by TestDualRunObserve_ResolvesNothing.
 	n1.Virt.SetState("dr-vm", libvirtfake.StateShutdown)
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -235,5 +252,61 @@ func TestFleet_DualRun_RecordedWhileNoNodeHoldsTheMajority(t *testing.T) {
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestFleet_DualRun_MinorityRaisesNoCoverageGap: a 2|3 split. The
+// minority's nodes run observe-only passes, and they cannot reach the
+// majority's hosts, which are healthy and fully seen by the leader. Coverage
+// is the leader's to report: a minority node that raised "could not be
+// probed" for every host across the cut would page once per node per host
+// (N·(N-1) in a fleet blip), and its re-observations would keep the leader
+// from ever resolving them.
+//
+// Mutation: let observe-only passes keep their coverage findings — the
+// minority writes coverage_gap rows for node-2..node-4 and this goes red.
+func TestFleet_DualRun_MinorityRaisesNoCoverageGap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	c, chks := detectorFleet(t, ctx, 5)
+	minority, majority := c.Nodes[:2], c.Nodes[2:]
+
+	c.SplitGossip(minority, majority)
+	waitQuorum(t, ctx, "the minority to lose the voter majority", chks, names(minority), health.QuorumNo)
+	waitQuorum(t, ctx, "the majority to keep it", chks, names(majority), health.QuorumYes)
+
+	// A minority node that held the lease when the cut began is entitled to
+	// one leader pass before its probes fail, and that pass reports the far
+	// side as a gap. Let any such pass (5 s probe timeout) finish, then take
+	// what the minority's replicas hold: from here on only observe-only
+	// passes run there, and they must add or refresh no coverage gap.
+	time.Sleep(8 * time.Second)
+	gaps := func(n *Node) map[string]string {
+		conds, err := corrosion.ListHealthConditions(ctx, n.DB, false)
+		if err != nil {
+			t.Fatalf("%s: ListHealthConditions: %v", n.Name, err)
+		}
+		out := map[string]string{}
+		for _, h := range conds {
+			if h.Evaluator == "dual_run" && h.Code == "coverage_gap" && inSet(h.SubjectID, majority) {
+				out[h.SubjectID] = h.Reporter + "@" + h.LastSeen
+			}
+		}
+		return out
+	}
+	before := map[string]map[string]string{}
+	for _, n := range minority {
+		before[n.Name] = gaps(n)
+	}
+	// Several 2 s intervals of observe-only passes, each probing across the
+	// cut with its 5 s timeout.
+	time.Sleep(20 * time.Second)
+	for _, n := range minority {
+		for subj, now := range gaps(n) {
+			if before[n.Name][subj] != now {
+				t.Fatalf("%s: coverage_gap for %s went from %q to %q while no minority node held the majority",
+					n.Name, subj, before[n.Name][subj], now)
+			}
+		}
 	}
 }

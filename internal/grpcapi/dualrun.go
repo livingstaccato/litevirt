@@ -192,8 +192,9 @@ func (s *Server) dualRunOwnSeenLast() map[finding]bool {
 // recorded without quorum (dualrun_lifecycle.go), so each such node records
 // what it can reach. It is observe-only: it writes observed rows and refreshes
 // existing ones, confirms only what its own previous pass also saw, resolves
-// nothing, and leaves the evaluator's scan status to the leader. It can
-// therefore only refuse admission more, never re-open it.
+// nothing, and leaves the evaluator's scan status to the leader. It never
+// resolves a condition, and it raises no coverage gap: coverage is the
+// leader's to report.
 func (s *Server) observeDualRunWithoutLease(ctx context.Context) {
 	s.dualRunPass(ctx, true)
 }
@@ -351,6 +352,14 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	// The tenure this pass belongs to. Everything below is only valid if the
 	// same tenure still holds when the writes happen.
 	passTerm := s.dualRunLeaseTerm.Load()
+	// An observe-only pass confirms only what its own previous COMPLETED pass
+	// saw. Taking the map clears it, so a pass that returns early breaks the
+	// run of own sightings.
+	var ownPrev map[finding]bool
+	if observeOnly {
+		ownPrev = s.dualRunOwnSeenLast()
+		s.setDualRunOwnSeen(nil)
+	}
 
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
@@ -501,11 +510,23 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	//    unreliable). Both are real coverage gaps and page (debounced). An older binary
 	//    without the GetRuntimeInventory handler is NOT paged — that is expected version skew
 	//    during a rolling upgrade; it still shows in the probe_failed gauge below.
+	//    Coverage is the lease holder's to report. A node without the majority
+	//    already knows it is cut off, and raising a gap for every host across
+	//    the cut would page once per node per host and, re-observed each
+	//    interval, keep the leader from resolving healthy hosts it does see.
+	//    coverage_gap gates no admission, so nothing is lost; the probe_failed
+	//    gauge below still shows them.
 	for _, h := range unreachable {
+		if observeOnly {
+			break
+		}
 		add(kindDualRunCoverage, h, fmt.Sprintf(
 			"host %q could not be probed this pass — dual-run coverage gap; a segmented or down host cannot be checked for split-brain.", h), h)
 	}
 	for _, h := range partialHosts {
+		if observeOnly {
+			break
+		}
 		add(kindDualRunCoverage, h, fmt.Sprintf(
 			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h), h)
 	}
@@ -656,6 +677,14 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	// the window in which other nodes were entitled to act, so work from
 	// before it must not be applied after it. Same shape as the failover
 	// coordinator's post-fence lease re-check.
+	// An observe-only pass has no tenure to re-assert. Its counterpart: it
+	// began without the majority, and one that finishes with the majority
+	// back (a self probe stalled on libvirt) is older than the leader's view
+	// and could re-open what the leader has since resolved.
+	if observeOnly && !s.LeaseQuorumLost(ctx) {
+		slog.Info("dual-run detector: the voter majority returned during a pass without the lease — discarding its findings")
+		return
+	}
 	if !observeOnly && !s.stillDualRunLeader(ctx, passTerm) {
 		slog.Warn("dual-run detector: lease lost or re-taken during the pass — discarding its findings",
 			"pass_term", passTerm, "current_term", s.dualRunLeaseTerm.Load())
@@ -673,9 +702,7 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 		now:          time.Now(),
 		observeOnly:  observeOnly,
 	}
-	if observeOnly {
-		rc.ownPrev = s.dualRunOwnSeenLast()
-	}
+	rc.ownPrev = ownPrev
 	for _, h := range targets {
 		rc.probeTargets[h] = true
 	}

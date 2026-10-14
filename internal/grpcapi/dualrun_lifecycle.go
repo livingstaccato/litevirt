@@ -211,7 +211,7 @@ func (s *Server) applyConditionLifecycle(
 			row.ObserveCount++
 			row.CleanCount = 0
 			row.LastSeen = now
-			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
+			row.Hosts, row.Evidence, row.Reporter = unionHosts(row.Hosts, evidenceHosts[f]), evidence, s.hostName
 			if row.ObserveCount >= dualRunDebounce && (!rc.observeOnly || rc.ownPrev[f]) {
 				row.Lifecycle = corrosion.ConditionConfirmed
 				row.Severity = confirmedSeverity(f.kind)
@@ -228,7 +228,7 @@ func (s *Server) applyConditionLifecycle(
 			row.ObserveCount++
 			row.CleanCount = 0
 			row.LastSeen = now
-			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
+			row.Hosts, row.Evidence, row.Reporter = unionHosts(row.Hosts, evidenceHosts[f]), evidence, s.hostName
 		}
 		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 			slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
@@ -311,4 +311,25 @@ func detectedLabels(confirmed map[finding]bool) []metrics.DualRunLabel {
 		labels = append(labels, metrics.DualRunLabel{Kind: dualRunKindLabel(f.kind), Target: f.target})
 	}
 	return labels
+}
+
+// unionHosts is the hosts a standing condition names after a refresh: every
+// host it named before, then this pass's new ones. Admission refuses growth
+// on each, so a refresh never narrows them: a pass that saw only part of the
+// cluster (a node without the majority, or the leader with one copy across
+// a cut) must not lift the block on a host only another pass saw. A condition
+// raised again after it resolved starts a new row from that pass's hosts.
+func unionHosts(prev, seen []string) []string {
+	out := append([]string(nil), prev...)
+	have := make(map[string]bool, len(prev)+len(seen))
+	for _, h := range prev {
+		have[h] = true
+	}
+	for _, h := range seen {
+		if !have[h] {
+			have[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
 }

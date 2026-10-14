@@ -94,7 +94,8 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 > not hold that VM's condition open — see *Cluster health* in docs/diagnostics.md). Conditions survive detector
 > leadership changes and daemon restarts. A node that has lost the voter majority may not
 > hold the detector's lease, so it scans what it can reach without it: such a scan records
-> and confirms its own findings but resolves nothing. The same rows drive admission refusals
+> and confirms its own findings, but resolves nothing and raises no `ha.dualrun.coverage`
+> (coverage is the leader's to report). The same rows drive admission refusals
 > (`lv health` shows exactly what admission enforces). Route `ha.dualrun.*` at `error` (or
 > `ha.*` broadly). Expect standing `ha.dualrun.coverage` alerts for any host that is
 > genuinely down or network-segmented from the current leader — that is a real coverage

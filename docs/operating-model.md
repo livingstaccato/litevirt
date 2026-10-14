@@ -222,7 +222,8 @@ of acting — it says nothing about whether the resulting rows have replicated.
   cut off from its own region's majority (in a region of at least three
   voters) does not hold the failover lease either. A node without the
   majority still runs the dual-run detector without its lease, observe-only:
-  it records what it finds and resolves nothing. Read "only
+  it records the dual runs it finds, never resolves one, and leaves coverage
+  gaps to the leader. Read "only
   one coordinator acts" as the intended end state of the exclusivity work, not
   as something the current code guarantees. What the code *does* guarantee is
   that a split with a healthy network does not last: when several survivors

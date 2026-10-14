@@ -43,17 +43,19 @@ type bridgedEvidence struct {
 }
 
 // noteBridgedStall raises ha.recovery.bridged for h, whose recovery at the
-// deadline of a self-pause fence at `at` was refused for why (refusePauseWait,
-// on each change of reason; retryPauseWait resolves it once the deadline goes
-// ahead). A host with no
+// deadline of a self-pause fence was refused for why, observers having seen
+// it answer since the fence (refusePauseWait, on each change of the
+// refusal's kind; refusePauseWait resolves it once the refusal is no longer
+// bridged, retryPauseWait once the deadline goes ahead). A host with no
 // recoverable workload on it holds nothing back, and raises nothing.
-func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRecord, at time.Time, why string) {
+func (c *Coordinator) noteBridgedStall(ctx context.Context, h *corrosion.HostRecord, observers []string, why string) {
 	derived := c.derivedVoterSet(ctx)
-	set := "an adopted voter generation"
+	set := "an adopted voter generation, on which a host seen answering is recovered on its own report that it " +
+		"paused, raised during this outage; the reason above says which part of that is missing"
 	if derived {
 		set = "a derived voter set (no voter generation adopted), on which any observer that sees a self-paused host answer holds its recovery"
 	}
-	c.raiseBridged(ctx, h.Name, c.answeredSinceObservers(ctx, h.Name, at), derived,
+	c.raiseBridged(ctx, h.Name, observers, derived,
 		fmt.Sprintf("the partition-pause deadline of %s passed and its workloads were not recovered: %s. "+
 			"Observers outside the majority still see it answer, as a host reaching both halves of a split relays; "+
 			"the cluster is on %s. Nothing ran twice; the workloads stay paused on %s, and the deadline is re-checked every cycle",
@@ -244,31 +246,6 @@ func (c *Coordinator) resolveBridged(ctx context.Context, host, why string) {
 	slog.Info("failover: "+CondRecoveryBridged+" resolved", "host", host, "reason", why)
 }
 
-// answeredSinceObservers is every observer answeredSince would name: those
-// whose latest verdict about host, healthy or unready, is newer than `at`
-// less fenceSkewMargin. Sorted; nil on a read error.
-func (c *Coordinator) answeredSinceObservers(ctx context.Context, host string, at time.Time) []string {
-	rows, err := c.db.Query(ctx,
-		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, r := range rows {
-		if r.String("observer") == host {
-			continue
-		}
-		if r.Int("consecutive_failures") != 0 && r.String("status") != health.StatusUnready {
-			continue
-		}
-		if upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && upd.After(at.Add(-fenceSkewMargin)) {
-			out = append(out, r.String("observer"))
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 // recoverableOn names the workloads on host a failover would move
 // (vm/<name>, ct/<name>), by strandedByHost's rules, sorted.
 func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string, error) {
@@ -282,20 +259,13 @@ func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string,
 	}
 	var out []string
 	for _, vm := range vms {
-		if !vmNeedsFailover(vm, enrolled[vm.Name]) {
-			continue
+		would, err := c.wouldRecoverVM(ctx, vm, enrolled)
+		if err != nil {
+			return nil, err
 		}
-		// As strandedByHost: a stopped VM on a host-local disk stays by design.
-		if vm.State == "stopped" {
-			disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
-			if err != nil {
-				return nil, err
-			}
-			if corrosion.VMHasHostLocalDisk(disks) {
-				continue
-			}
+		if would {
+			out = append(out, "vm/"+vm.Name)
 		}
-		out = append(out, "vm/"+vm.Name)
 	}
 	cts, err := corrosion.ListContainers(ctx, c.db, host)
 	if err != nil {
@@ -308,6 +278,26 @@ func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string,
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// wouldRecoverVM reports whether a failover would move vm off its host, by
+// strandedByHost's rules: a failover candidate (vmNeedsFailover), and not a
+// stopped VM on a host-local disk, which stays by design. enrolled is
+// autoPromoteEnrolled.
+func (c *Coordinator) wouldRecoverVM(ctx context.Context, vm corrosion.VMRecord, enrolled map[string]bool) (bool, error) {
+	if !vmNeedsFailover(vm, enrolled[vm.Name]) {
+		return false, nil
+	}
+	if vm.State == "stopped" {
+		disks, err := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+		if err != nil {
+			return false, err
+		}
+		if corrosion.VMHasHostLocalDisk(disks) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func capList(in []string) []string {

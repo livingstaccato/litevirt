@@ -403,3 +403,111 @@ func TestBridgedStall_ARecheckedRefusalWritesOnceAndResolvesWhenTheDeadlineGoesA
 		t.Fatalf("the stall alert does not name the workload the limit left: %q", held)
 	}
 }
+
+// partitionPausedUnreadable makes every read of down's partition_paused
+// condition fail, as a store error would, while every other condition reads
+// as before: health_conditions becomes a view whose evidence column cannot be
+// computed for that one code. Writes to it fail.
+func partitionPausedUnreadable(t *testing.T, db *corrosion.Client, ctx context.Context) {
+	t.Helper()
+	for _, q := range []string{
+		`ALTER TABLE health_conditions RENAME TO health_conditions_real`,
+		`CREATE VIEW health_conditions AS SELECT evaluator, code, subject_kind, subject_id, lifecycle, severity, hosts,
+			CASE WHEN code = '` + corrosion.CondPartitionPaused + `' THEN json_extract('{' || evidence, '$') ELSE evidence END AS evidence,
+			observe_count, clean_count, first_seen, last_seen, confirmed_at, resolved_at, reporter, created_at, updated_at, deleted_at
+			FROM health_conditions_real`,
+	} {
+		if err := db.Execute(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A store error reading the host's own partition_paused condition, with a
+// bridge seeing the host answer, is not a bridge: the refusal is the read
+// error, named on its own in the stall alert, and not reported bridged.
+//
+// Mutation: report the unreadable refusal bridged — bridged is true here.
+func TestBridgedStall_AnUnreadableConditionIsNotABridge(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	c.run(ctx)
+	w, ok := c.pauseWaits["down"]
+	if !ok {
+		t.Fatal("setup: no pause wait")
+	}
+	bridgeAnswer(t, db)
+	pausedCondition(t, db, time.Now())
+	partitionPausedUnreadable(t, db, ctx)
+	h, err := corrosion.GetHost(ctx, db, "down")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	v := c.selfPauseStillStands(ctx, h, w.fenceAt)
+	if v.ok || v.bridged || v.why != whyPausedUnreadable {
+		t.Fatalf("verdict on an unreadable partition_paused = %+v; want a refusal %q, not bridged", v, whyPausedUnreadable)
+	}
+	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
+	c.retryPauseWait(ctx, "down")
+	if got := c.holdReason["down"]; !strings.Contains(got, whyPausedUnreadable) || strings.Contains(got, "saw the host answer") {
+		t.Fatalf("the stall reason %q does not name the read error on its own", got)
+	}
+}
+
+// refuseAgain re-checks down's refused deadline once.
+func refuseAgain(t *testing.T, c *Coordinator, ctx context.Context) {
+	t.Helper()
+	c.retryPauseWait(ctx, "down")
+	if _, ok := c.pauseWaits["down"]; !ok {
+		t.Fatal("setup: the deadline went ahead, or there is no wait")
+	}
+}
+
+// The same bridged refusal re-checked while the observers seeing the host
+// answer change is one refusal: ha.recovery.bridged is raised once, not
+// rewritten each time the first answering observer is another one.
+//
+// Mutation: de-duplicate on why (which names the observers) instead of the
+// refusal's key — the observe count goes to 2.
+func TestBridgedStall_ChangingObserversDoNotReRaise(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
+		t.Fatalf("setup: VM recovered to %q", got)
+	}
+	row, ev, ok := bridgedCond(t, db, ctx)
+	if !ok || row.ObserveCount != 1 {
+		t.Fatalf("setup: %s not raised once: %+v", CondRecoveryBridged, row)
+	}
+	if !strings.Contains(ev.Detail, "its own report") {
+		t.Errorf("detail %q does not say that under an adopted generation the host's own report is what decides", ev.Detail)
+	}
+	// A second observer sees down answer, and the first one's row is
+	// rewritten (INSERT OR REPLACE re-creates it): the set and its order change.
+	healthRow(t, db, "bridge2", "healthy", 0, time.Now().Add(time.Second))
+	refuseAgain(t, c, ctx)
+	healthRow(t, db, "bridge", "healthy", 0, time.Now().Add(2*time.Second))
+	refuseAgain(t, c, ctx)
+	if row, _, _ := bridgedCond(t, db, ctx); row.ObserveCount != 1 || row.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("%s rewritten as the answering observers changed: observe_count %d, lifecycle %s",
+			CondRecoveryBridged, row.ObserveCount, row.Lifecycle)
+	}
+}
+
+// A refusal that stops being bridged — a voter majority now sees the host
+// answer, so it is coming back — resolves ha.recovery.bridged rather than
+// leaving it saying a bridge holds the host.
+//
+// Mutation: drop the resolve from refusePauseWait — it stays open.
+func TestBridgedStall_ResolvedWhenTheRefusalIsNoLongerBridged(t *testing.T) {
+	c, db, ctx, mono := explicitPause(t)
+	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
+		t.Fatalf("setup: VM recovered to %q", got)
+	}
+	if !bridgedOpen(t, db, ctx) {
+		t.Fatal("setup: not raised")
+	}
+	healthRow(t, db, "v4", "healthy", 0, time.Now().Add(time.Second))
+	refuseAgain(t, c, ctx)
+	if bridgedOpen(t, db, ctx) {
+		t.Fatalf("%s still open after the refusal became a voter majority answering the host", CondRecoveryBridged)
+	}
+}

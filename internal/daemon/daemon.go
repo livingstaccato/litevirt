@@ -769,13 +769,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The relay-health floor is the replicator's own BaseRelays.
 	fc.RelayConfig = relayCfg
 
-	// Start rebalance coordinator. Leader-gated; safe to start on
-	// every host. Defaults to dry-run on every VM unless compose says otherwise.
-	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
-	rc.SetCapacityPolicy(capacity)
-	rc.QuorumLost = d.checker.LostEveryDecisionQuorum
-	go rc.Start(ctx)
-
 	// Start snapshot scheduler. Leader-gated like the
 	// rebalancer; the runner is wired below once the gRPC Server is
 	// constructed (it reuses lockVM + pickDisk).
@@ -967,6 +960,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// Start rebalance coordinator. Leader-gated; safe to start on
+	// every host. Defaults to dry-run on every VM unless compose says otherwise.
+	// Its lease stands down on the server's LeaseQuorumLost, as RunRebalance's
+	// and the rebalance executor's do: one predicate for the one lease.
+	rc := scheduler.NewRebalancer(d.cfg.HostName, d.db)
+	rc.SetCapacityPolicy(capacity)
+	rc.QuorumLost = svc.LeaseQuorumLost
+	go rc.Start(ctx)
 	// Release features (capabilities.Feature) open through the checker's
 	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)

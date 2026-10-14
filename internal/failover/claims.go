@@ -475,7 +475,7 @@ func (c *Coordinator) claimRound() uint64 {
 // holds less the fence margin when that is shorter (§3.13 step 3).
 func (c *Coordinator) claimDeadline(ctx context.Context) time.Duration {
 	d := claimTimeout
-	if left, ok := c.leaseRemaining(ctx); ok && left-leaseFenceMargin > 0 && left-leaseFenceMargin < d {
+	if left, st := c.leaseRemaining(ctx); st == leaseHeld && left-leaseFenceMargin > 0 && left-leaseFenceMargin < d {
 		d = left - leaseFenceMargin
 	}
 	return d

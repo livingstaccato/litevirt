@@ -213,7 +213,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   sides of a partition can believe they hold it (`acquireLease` says so in as
   many words). That is why the lease is never sufficient on its own — a decision
   site requires `holdLease()` **and** `DecisionGate.OK`, which is a quorum this
-  daemon probed for itself, and the minority side fails closed there. Read "only
+  daemon probed for itself, and the minority side fails closed there. A node
+  whose own probes show it has lost every voter majority it could decide on
+  (the cluster-wide one, and under region scope every region's) neither takes
+  nor renews the failover lease, nor the rebalancer's or the dual-run
+  detector's, so a lease held in a minority lapses even on a host that reaches
+  both sides, and the majority can take it over. Read "only
   one coordinator acts" as the intended end state of the exclusivity work, not
   as something the current code guarantees. What the code *does* guarantee is
   that a split with a healthy network does not last: when several survivors

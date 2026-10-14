@@ -152,6 +152,10 @@ type Coordinator struct {
 	// future-proofing rather than a fix for a live race — unlike the
 	// rebalancer's, which has two concurrent callers.
 	leaseTerm atomic.Int64
+	// leaseQuorumLost is whether the last lease attempt stood down because this
+	// node had lost every quorum it could decide on, so the change is logged
+	// once rather than every poll.
+	leaseQuorumLost atomic.Bool
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -1384,6 +1388,17 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 // acquireLeaseResult takes or renews the failover lease and keeps the failure
 // reason, so a caller can tell a lost election from an unreadable store.
 func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
+	if c.lostEveryDecisionQuorum(ctx) {
+		if !c.leaseQuorumLost.Swap(true) {
+			slog.Warn("failover: this node has lost the voter majority; neither taking nor renewing the failover lease until it is back")
+		}
+		c.leaseTerm.Store(0)
+		c.mAttempt(PhaseLease, ResultSkipped, ErrNoQuorum)
+		return false, nil
+	}
+	if c.leaseQuorumLost.Swap(false) {
+		slog.Info("failover: the voter majority is back; contending for the failover lease again")
+	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
 	if err != nil {
@@ -1403,6 +1418,22 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true, nil
+}
+
+// lostEveryDecisionQuorum is health.LostEveryDecisionQuorum over this
+// coordinator's gate: a node that has lost every voter majority it could
+// decide a failover on neither takes nor renews the failover lease. A
+// coordinator with no gate keeps today's behaviour, and one whose gate cannot
+// answer the regional question counts no region.
+func (c *Coordinator) lostEveryDecisionQuorum(ctx context.Context) bool {
+	if c.Gate == nil {
+		return false
+	}
+	var region func(context.Context, string) (health.QuorumState, int, int)
+	if rg, ok := c.Gate.(RegionGate); ok {
+		region = rg.RegionQuorumProof
+	}
+	return health.LostEveryDecisionQuorum(ctx, c.db, c.Gate.QuorumProof, region)
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,

@@ -136,6 +136,7 @@ func (s *Server) RunRebalance(ctx context.Context, req *pb.RunRebalanceRequest) 
 	}
 	r := scheduler.NewRebalancer(s.hostName, s.db)
 	r.SetCapacityPolicy(s.capacity)
+	r.QuorumLost = s.LeaseQuorumLost
 	r.ForceDryRun = req.GetDryRun()
 	before := s.countProposals(ctx)
 	if err := r.RunOnce(ctx); err != nil {

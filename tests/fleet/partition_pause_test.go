@@ -118,6 +118,9 @@ type ppOpts struct {
 	// timeout is 3 s), which is recovery-claims.md §6's duelling-proposer
 	// liveness case, not what the scenario tests.
 	coordinators map[string]bool
+	// lateCoordinators names nodes whose coordinator is built but not
+	// started; the scenario starts it with startCoordinator.
+	lateCoordinators map[string]bool
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -194,7 +197,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 				}
 			}
 		}()
-		if o.coordinators != nil && !o.coordinators[n.Name] {
+		if (o.coordinators != nil && !o.coordinators[n.Name]) || o.lateCoordinators[n.Name] {
 			continue
 		}
 		s.startCoordinator(pn, phase)

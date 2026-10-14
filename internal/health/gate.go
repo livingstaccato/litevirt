@@ -257,6 +257,54 @@ func (c *Checker) InQuorumRegainGraceFor(ctx context.Context, scope string) bool
 	return ok && c.now().Sub(at) < QuorumRegainGrace
 }
 
+// LostEveryDecisionQuorum reports whether cluster and region, a daemon's own
+// quorum readings, say it has lost every voter majority a failover could be
+// decided on: the cluster-wide one, and under region-scoped failover also
+// every region's, since each side of a partition may act for the regions
+// whose voters it reaches (docs/design/region-scoped-failover.md §2.3).
+//
+// It is the gate in front of the leader leases (failover, rebalancer,
+// dual-run detector): a node that has lost every quorum neither takes nor
+// renews one. It could decide nothing under it, and a lease renewed in a
+// minority reaches any node that bridges the halves (a non-voting witness),
+// whose word that the lease is live refuses every majority takeover for as
+// long as the partition lasts. Giving a lease up only removes authority.
+//
+// Only a definite cluster-wide No starts the check: Unknown (warmup, an
+// unreadable voter set) is not lost. After a No, a failover scope or voter
+// regions that cannot be read count as lost, as the coordinator decides
+// nothing on them either, and a nil region reading answers for no region.
+func LostEveryDecisionQuorum(ctx context.Context, db *corrosion.Client,
+	cluster func(context.Context) (QuorumState, int, int),
+	region func(context.Context, string) (QuorumState, int, int)) bool {
+	if st, _, _ := cluster(ctx); st != QuorumNo {
+		return false
+	}
+	scope, err := corrosion.GetFailoverScope(ctx, db)
+	if err != nil || !scope.Region() || region == nil {
+		return true
+	}
+	vr, err := corrosion.VoterRegions(ctx, db)
+	if err != nil {
+		return true
+	}
+	for _, r := range vr.Regions() {
+		if len(vr.In(r)) == 0 {
+			continue
+		}
+		if st, _, _ := region(ctx, r); st != QuorumNo {
+			return false
+		}
+	}
+	return true
+}
+
+// LostEveryDecisionQuorum is LostEveryDecisionQuorum over this daemon's own
+// probes.
+func (c *Checker) LostEveryDecisionQuorum(ctx context.Context) bool {
+	return LostEveryDecisionQuorum(ctx, c.db, c.QuorumProof, c.RegionQuorumProof)
+}
+
 // RegionQuorumProof is QuorumProof over one region's voters: the members of
 // the voter set whose hosts.region is region, counted from THIS daemon's own
 // probes. A region with no voters has nothing to prove and reports No. A read

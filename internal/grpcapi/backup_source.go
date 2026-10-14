@@ -23,18 +23,28 @@ type BackupReader interface {
 	Close() error
 }
 
-// backupIOFaulter is implemented by a BackupReader that can ask qemu whether it
-// reported an I/O error on the disk being read (libvirt's disk errors). A read
-// that fails mid-backup surfaces as a broken NBD pipe; this is the only place
-// the real cause lives.
-type backupIOFaulter interface {
-	IOFault() string
+// backupCauser is implemented by a BackupReader that can say, best effort,
+// why its backup failed. A read that fails mid-backup surfaces as a broken NBD
+// pipe; the cause of the export's death lives in qemu's backup job.
+type backupCauser interface {
+	FailureCause() string
 }
 
-// backupPushError is the error of a failed guest-content push. It names the
-// VM disk that was being read and, when qemu reported one, the I/O error, and
-// keeps the original error's text.
+// backupPushError is the error of a failed guest-content push: it names the
+// VM disk that was being read and the cause of the failure when libvirt can
+// give one.
 func backupPushError(vm string, disk *corrosion.DiskRecord, src BackupReader, err error) error {
+	cause := ""
+	if c, ok := src.(backupCauser); ok {
+		cause = c.FailureCause()
+	}
+	return status.Error(codes.Internal, formatBackupPushError(vm, disk, err, cause))
+}
+
+// formatBackupPushError composes the message: the disk (VM, name, path,
+// storage), the original error's text, and the cause, or a plain statement
+// that none was available. An empty cause does not mean qemu saw no error.
+func formatBackupPushError(vm string, disk *corrosion.DiskRecord, err error, cause string) string {
 	where := fmt.Sprintf("disk %q of %q (%s", disk.DiskName, vm, disk.Path)
 	if disk.StorageType != "" {
 		where += ", storage " + disk.StorageType
@@ -44,12 +54,10 @@ func backupPushError(vm string, disk *corrosion.DiskRecord, src BackupReader, er
 	}
 	where += ")"
 	msg := fmt.Sprintf("push: reading %s: %v", where, err)
-	if f, ok := src.(backupIOFaulter); ok {
-		if fault := f.IOFault(); fault != "" {
-			msg += "; qemu reported: " + fault
-		}
+	if cause != "" {
+		return msg + "; cause: " + cause
 	}
-	return status.Error(codes.Internal, msg)
+	return msg + "; no cause was available from libvirt (the disk's storage may have returned an I/O error to qemu; check the host's kernel log and the storage)"
 }
 
 // BackupSource opens guest-content backup sessions and prunes the libvirt

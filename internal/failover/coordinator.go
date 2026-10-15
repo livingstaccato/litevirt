@@ -258,6 +258,12 @@ type Coordinator struct {
 	// repeat, which recoverWorkloads tolerates: it re-derives its work from the
 	// rows still pointing at the host.
 	confirmResumed map[string]string
+	// afreshConfirm records, per host, the operator confirmation this
+	// coordinator sent the host down the fence path on (confirmationFencesAfresh),
+	// until the next fence decision for the host. The fence it ran then is its
+	// own act on that confirmation, not a sign the host ran since it
+	// (newestProofGradeFenceWhy).
+	afreshConfirm map[string]string
 	// LocalStall reports whether THIS node stopped running within the last
 	// health.StallGrace (implemented by *health.Checker.InStallGrace). While it
 	// is true the coordinator decides no new fence: a node that was suspended,
@@ -1007,6 +1013,13 @@ func (c *Coordinator) run(ctx context.Context) {
 			delete(c.ha.heldRecovery, target)
 		}
 
+		// A fence decision made on anything but the confirmation the host
+		// was fenced afresh on ends that exemption (afreshConfirm); the
+		// later afresh check below records it again when it applies.
+		if !afresh {
+			delete(c.afreshConfirm, target)
+		}
+
 		// Skip if this host is already in a terminal state.
 		h, err := corrosion.GetHost(ctx, c.db, target)
 		if err != nil {
@@ -1367,6 +1380,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.fenced = make(map[string]bool)
 	c.fenceRelocated = make(map[string]bool)
 	c.confirmResumed = make(map[string]string)
+	c.afreshConfirm = nil
 	c.fencedOn, c.lastFenceAt = nil, nil
 	c.pauseWaits = nil
 	c.ha.heldRecovery = nil
@@ -2934,6 +2948,10 @@ func (c *Coordinator) confirmationFencesAfresh(ctx context.Context, h *corrosion
 	slog.Warn("failover: an operator confirmed this host off during the outage in progress, and no fence has run for it; fencing it afresh",
 		"host", h.Name, "confirmation", confirm.ID, "confirmed_at", confirm.TS)
 	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationFence)
+	if c.afreshConfirm == nil {
+		c.afreshConfirm = map[string]string{}
+	}
+	c.afreshConfirm[h.Name] = confirm.ID
 	return true
 }
 
@@ -3115,7 +3133,7 @@ type fenceRecord struct {
 // manual fence finds the operator's "manual-confirmed" row (the fence-time
 // "manual"/"partial" row is not proof-grade). See newestProofGradeFenceWhy.
 func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (fenceRecord, bool) {
-	rec, ok, _ := c.newestProofGradeFenceWhy(ctx, host)
+	rec, ok, _, _ := c.newestProofGradeFenceWhy(ctx, host)
 	return rec, ok
 }
 
@@ -3130,18 +3148,24 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 //     corrosion.FenceRecordProvesOff reads it — and proves nothing about it
 //     now. A "manual" attempt is not one: it is the cluster asking for a
 //     confirmation, and a confirmation made before it (the afresh path) is
-//     judged by the next rule. A row in the same second as the proof-grade
-//     one does not outrank it.
+//     judged by the next rule. Nor is the fence this coordinator ran on the
+//     confirmation it fenced the host afresh on (afreshConfirm): a lenient
+//     best-effort fence of a host already off records success after the
+//     confirmation, and the confirmation is still judged by the next rule. A
+//     row in the same second as the proof-grade one does not outrank it.
 //   - an operator confirmation binds only while it stands for the outage the
 //     host is in now (confirmationStands): nobody, this node's probe
 //     included, has seen the host answer since it. An IPMI or Redfish row in
 //     the same second is preferred: it needs no such judgement.
-func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string) (fenceRecord, bool, string) {
+//
+// retry reports a read error: nothing was judged, and the caller retries
+// rather than spending the transfer.
+func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string) (rec fenceRecord, ok bool, why string, retry bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
 		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
-		return fenceRecord{}, false, ""
+		return fenceRecord{}, false, "the fence log could not be read", true
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
 	life, lifeKnown := c.fenceRowCutoff(ctx, host)
@@ -3176,22 +3200,24 @@ func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string)
 		}
 	}
 	if !found {
-		return fenceRecord{}, false, ""
+		return fenceRecord{}, false, "", false
 	}
-	if newestUnverified.After(best) {
+	ownAfresh := out.Result == "manual-confirmed" && c.afreshConfirm[host] == out.ID
+	if newestUnverified.After(best) && !ownAfresh {
 		return fenceRecord{}, false, "a fence attempt that is not proof-grade (" +
-			newestUnverified.UTC().Format(time.RFC3339) + ") is newer than the proof-grade fence " + out.ID
+			newestUnverified.UTC().Format(time.RFC3339) + ") is newer than the proof-grade fence " + out.ID, false
 	}
 	if out.Result == "manual-confirmed" {
 		if why, stands := c.confirmationStands(ctx, host, best); !stands {
 			if why == "" {
-				why = "it could not be judged this cycle"
+				return fenceRecord{}, false, "whether the operator confirmation " + out.ID +
+					" still stands could not be read", true
 			}
 			return fenceRecord{}, false, "the operator confirmation " + out.ID + " does not stand for this outage: " +
-				strings.Replace(why, "the fence", "the confirmation", 1)
+				strings.Replace(why, "the fence", "the confirmation", 1), false
 		}
 	}
-	return out, true, ""
+	return out, true, "", false
 }
 
 // proofGradeFenceRef returns the fence_epoch binding for the newest proof-grade
@@ -3199,18 +3225,40 @@ func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string)
 // executor re-reads FenceID from fencing_log and re-verifies it (never a stale
 // hosts.state).
 func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
-	ref, _ := c.proofGradeFenceRefWhy(ctx, host)
+	ref, _, _ := c.proofGradeFenceRefWhy(ctx, host)
 	return ref
 }
 
 // proofGradeFenceRefWhy is proofGradeFenceRef, with why a proof-grade row on
-// record does not bind (newestProofGradeFenceWhy) when ref is "".
-func (c *Coordinator) proofGradeFenceRefWhy(ctx context.Context, host string) (string, string) {
-	rec, ok, why := c.newestProofGradeFenceWhy(ctx, host)
+// record does not bind (newestProofGradeFenceWhy) when ref is "", and whether
+// that is a read error to retry.
+func (c *Coordinator) proofGradeFenceRefWhy(ctx context.Context, host string) (ref, why string, retry bool) {
+	rec, ok, why, retry := c.newestProofGradeFenceWhy(ctx, host)
 	if !ok {
-		return "", why
+		return "", why, retry
 	}
-	return corrosion.FenceEpochRef{Host: host, FenceID: rec.ID, TS: rec.TS}.String(), ""
+	return corrosion.FenceEpochRef{Host: host, FenceID: rec.ID, TS: rec.TS}.String(), "", false
+}
+
+// sharedDiskUnproven notes, on host's hold, why a shared-disk VM was not
+// moved off it: no proof-grade fence binds (why, from proofGradeFenceRefWhy).
+// A read error owes a retry of the recovery on the same authority
+// (retryClaims), and the hold says so; anything else names the remedy. It
+// returns the text, for a stopped VM's skip detail.
+func (c *Coordinator) sharedDiskUnproven(host, why string, retry bool) string {
+	var msg string
+	if retry {
+		c.retryClaimsFor(host)
+		msg = "a shared-disk VM transfer is waiting: " + why + "; retrying next cycle"
+	} else {
+		if why == "" {
+			why = "no proof-grade fence of the host is on record"
+		}
+		msg = "a shared-disk VM transfer needs a proof-grade fence of the host, and " + why +
+			"; confirm " + host + " is powered off, then run 'lv host fence-confirm " + host + "', or set an IPMI or Redfish fence strategy"
+	}
+	c.noteHold(host, msg)
+	return msg
 }
 
 // autoPromoteEnabled reports whether vmName has a replication schedule with
@@ -3744,7 +3792,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.noteHAHeldRecovery(h.Name)
 		return
 	}
-	fenceEpoch, fenceEpochWhy := c.proofGradeFenceRefWhy(ctx, h.Name)
+	fenceEpoch, fenceEpochWhy, fenceEpochRetry := c.proofGradeFenceRefWhy(ctx, h.Name)
 	// Recovery is running: whatever held it back before no longer does, and
 	// a refusal below records what holds it now (the stall alert's reason).
 	delete(c.holdReason, h.Name)
@@ -3846,7 +3894,15 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					plans = append(plans, failoverPlan{vm: vm, needsPlacement: true, rekeyStopped: true})
 					continue
 				}
-				c.skipStoppedVM(ctx, h.Name, vm, stoppedVMDetail(h.Name))
+				detail := stoppedVMDetail(h.Name)
+				if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) && c.vmWasCandidate(ctx, vm) &&
+					!vmUsesFirmwareState(vm) && !corrosion.VMHasHostLocalDisk(disks) &&
+					corrosion.VMHasSharedDisk(ctx, c.db, disks, c.hostName) {
+					// Not moved on its shared disks for want of a fence that
+					// binds: say why, as a running VM's hold does.
+					detail += "; not moved on its shared disks: " + c.sharedDiskUnproven(h.Name, fenceEpochWhy, fenceEpochRetry)
+				}
+				c.skipStoppedVM(ctx, h.Name, vm, detail)
 				continue
 			}
 			if corrosion.VMHasHostLocalDisk(disks) {
@@ -3907,12 +3963,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasSharedDisk(ctx, c.db, disks, c.hostName) {
 				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI or Redfish fence strategy",
 					"vm", vm.Name, "old_owner", h.Name, "reason", fenceEpochWhy)
-				why := "no proof-grade fence of the host is on record"
-				if fenceEpochWhy != "" {
-					why = fenceEpochWhy
-				}
-				c.noteHold(h.Name, "a shared-disk VM transfer needs a proof-grade fence of the host, and "+why+
-					"; confirm "+h.Name+" is powered off, then run 'lv host fence-confirm "+h.Name+"', or set an IPMI or Redfish fence strategy")
+				c.sharedDiskUnproven(h.Name, fenceEpochWhy, fenceEpochRetry)
 				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
 				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)
 				continue

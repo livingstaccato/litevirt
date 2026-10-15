@@ -301,6 +301,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.retryNotified, host)
 	delete(c.retryRefusedLogged, host)
 	delete(c.confirmStale, host)
+	delete(c.afreshConfirm, host)
 	delete(c.notRelying, host)
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)

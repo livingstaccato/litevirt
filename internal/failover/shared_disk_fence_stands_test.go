@@ -8,6 +8,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 )
 
 // Re-review 5 I1: the shared-disk transfer binds to the newest proof-grade
@@ -111,5 +112,161 @@ func TestProofGradeFenceRef_AManualFenceRowAfterTheConfirmationStillBinds(t *tes
 	fenceRowAgo(t, db, "ipmi-new", "ipmi", "fenced", 0)
 	if ref, _ := corrosion.ParseFenceEpoch(c.proofGradeFenceRef(ctx, "down")); ref.FenceID != "ipmi-new" {
 		t.Fatalf("an IPMI fence newer than an SSH one does not bind (%+v)", ref)
+	}
+}
+
+// sharedDiskFixture is a best-effort host 'bad' with a shared-disk VM sd and a
+// local-disk VM ld, a peer 'good', a voter quorum failing bad whose runs
+// span the last hour, and the shared-storage fence enforced.
+func sharedDiskFixture(t *testing.T) (*corrosion.Client, context.Context, *Coordinator) {
+	t.Helper()
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, h := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort", CPUTotal: 8, MemTotal: 8192,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	seedVMWithDisk(t, ctx, db, "sd", "bad", "nfs")
+	seedVMWithDisk(t, ctx, db, "ld", "bad", "local")
+	fenceQuorum(t, ctx, db, []string{"coordinator", "good"}, "bad")
+	if err := db.Execute(ctx, `UPDATE host_health SET consecutive_failures = 1000 WHERE target = 'bad'`); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCoordinator("coordinator", db)
+	c.SharedStorageFenceEnforce = true
+	c.Gate = gateEnforcing(capabilities.SharedStorageFenceV1)
+	return db, ctx, c
+}
+
+func badFenceRow(t *testing.T, db *corrosion.Client, id, method, result string, age time.Duration) {
+	t.Helper()
+	if err := db.Execute(context.Background(),
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, 'bad', ?, ?, ?, 'seeded')`,
+		id, method, result, time.Now().Add(-age).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Follow-up re-review N1: the confirm-first order on a best-effort host. The
+// operator powers the host off and confirms it (recorded fenced); this
+// coordinator fences it afresh on that confirmation, and the lenient SSH
+// fence, unable to reach the host that is off, records best-effort-ssh /
+// fenced after the confirmation. That row is this coordinator's own fence on
+// the confirmation, not a sign the host ran since: the shared-disk VM moves
+// in one step, as on main.
+//
+// Mutation: drop the afresh exemption — the newer best-effort row refuses the
+// binding and sd stays on bad.
+func TestSharedDiskFence_ABestEffortHostConfirmedOffFirstMovesInOneStep(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 10*time.Second)
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "best-effort-ssh", Detail: "unreachable; assumed off", Success: true}
+	})
+	c.run(ctx)
+	if fences != 1 {
+		t.Fatalf("setup: %d fences, want the afresh fence", fences)
+	}
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "good" {
+		t.Fatalf("the shared-disk VM of a host confirmed off first did not move in one step: %+v (hold %q)", sd, c.holdReason["bad"])
+	}
+}
+
+// Follow-up re-review m-a: a read error while judging the binding does not
+// spend the transfer. The hold says it retries, and the next cycle, with the
+// rows readable, moves the shared-disk VM without a second confirmation.
+//
+// Mutation: treat the read error as a refusal (no retry owed) — the second
+// cycle moves nothing.
+func TestSharedDiskFence_AReadErrorAtTheBindingRetries(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 10*time.Second)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	c.fenced["bad"] = true
+	c.noteRecoveryAt("bad", time.Now().Add(-10*time.Second), time.Now().Add(-10*time.Second))
+	if _, err := db.DB().ExecContext(ctx, `ALTER TABLE host_health RENAME TO host_health_gone`); err != nil {
+		t.Fatal(err)
+	}
+	c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: "bad", State: "offline"})
+	if _, err := db.DB().ExecContext(ctx, `ALTER TABLE host_health_gone RENAME TO host_health`); err != nil {
+		t.Fatal(err)
+	}
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "bad" {
+		t.Fatalf("the shared-disk VM moved on a binding that could not be judged: %+v", sd)
+	}
+	if hold := c.holdReason["bad"]; !strings.Contains(hold, "retrying") || strings.Contains(hold, "fence-confirm") {
+		t.Fatalf("hold %q: want a retry named, and no confirmation asked for", hold)
+	}
+	fences := 0
+	c.SetFencer(countingFencer(&fences, fence.Result{Method: "test", Success: true}))
+	c.run(ctx)
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "good" || fences != 0 {
+		t.Fatalf("the next cycle did not retry the shared-disk transfer on the same authority: %+v after %d fences (hold %q)",
+			sd, fences, c.holdReason["bad"])
+	}
+}
+
+// Follow-up re-review m-c: a stopped shared-disk VM left on its host because
+// the binding was refused says why, as a running one's hold does.
+//
+// Mutation: skip it with the generic stopped detail — the reason is missing.
+func TestSharedDiskFence_AStoppedVMNamesWhyItWasNotMoved(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	if err := db.Execute(ctx, `UPDATE vms SET state = 'stopped', state_detail = '' WHERE name = 'sd'`); err != nil {
+		t.Fatal(err)
+	}
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 2*time.Minute)
+	badFenceRow(t, db, "ssh-bad", "best-effort-ssh", "fenced", 0)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: "bad", State: "offline"})
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "bad" {
+		t.Fatalf("setup: the stopped shared-disk VM moved: %+v", sd)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, db, "sd", 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range evs {
+		if strings.Contains(e.Detail, "not proof-grade") && strings.Contains(e.Detail, "fence-confirm bad") {
+			return
+		}
+	}
+	t.Fatalf("no skip event names the refused binding and the remedy: %+v", evs)
+}
+
+// The afresh exemption lasts only until the next fence decision for the host
+// that is not afresh. Here a recorded best-effort fence, newer than the
+// confirmation, is resumed: the confirmation is not what this decision was
+// made on, so the newer attempt refuses the binding.
+//
+// Mutation: keep afreshConfirm across that decision — the shared-disk VM
+// moves on the confirmation.
+func TestSharedDiskFence_TheAfreshExemptionEndsAtTheNextDecision(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 2*time.Minute)
+	badFenceRow(t, db, "ssh-bad", "best-effort-ssh", "fenced", time.Minute)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "offline"); err != nil {
+		t.Fatal(err)
+	}
+	c.afreshConfirm = map[string]string{"bad": "op-bad"}
+	c.run(ctx)
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "bad" {
+		t.Fatalf("the shared-disk VM moved on a confirmation the decision was not made on: %+v", sd)
+	}
+	if ld, _ := corrosion.GetVM(ctx, db, "ld"); ld == nil || ld.HostName == "bad" {
+		t.Fatalf("setup: the recorded fence was not resumed (ld on %+v, hold %q)", ld, c.holdReason["bad"])
 	}
 }

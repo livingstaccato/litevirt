@@ -137,6 +137,8 @@ type lab struct {
 	// witness beyond E2E_LAB_NODES): found once, by outsiderHosts.
 	outsiders      []string
 	outsidersKnown bool
+	// clocks are the node clocks a drill stepped (stepClock), by host.
+	clocks map[string]*clockStep
 }
 
 // exceptExcluded drops the E2E_LAB_EXCLUDE nodes from hs.
@@ -1245,7 +1247,12 @@ func (l *lab) liveHost() string {
 
 // baseline is the state every drill starts from and must leave behind.
 type baseline struct {
-	voters     []string
+	voters []string
+	// allVoters is the adopted generation's members, E2E_LAB_EXCLUDE nodes
+	// included: what restore re-initialises after a drill's voter reset.
+	allVoters []string
+	// strategies covers witnesses outside E2E_LAB_NODES too: a drill may set
+	// theirs (TestDrillW3_LeaseChurnDuringAPausedManualHold).
 	strategies map[string]string
 	running    map[string]string // pre-existing running workload key → host
 	cts        map[string]ctInfo
@@ -1267,18 +1274,21 @@ func (l *lab) requireBaseline() baseline {
 			l.t.Fatalf("baseline: %s is %q, want HOST_ACTIVE (lab not at rest: %v)", h, states[h], states)
 		}
 	}
-	_, voters, err := l.voterSet(via)
+	_, allVoters, err := l.voterSet(via)
 	if err != nil {
 		l.t.Fatalf("baseline: %v", err)
 	}
-	voters = l.exceptExcluded(voters)
+	voters := l.exceptExcluded(allVoters)
 	if strings.Join(voters, ",") != strings.Join(l.hosts, ",") {
 		l.t.Fatalf("baseline: voters %v, want every host %v", voters, l.hosts)
 	}
 	if rows, err := l.openOwnershipConditions(via); err != nil || len(rows) > 0 {
 		l.t.Fatalf("baseline: admission-gating conditions open (%v): %v", err, rows)
 	}
-	b := baseline{voters: voters, strategies: map[string]string{}, running: map[string]string{}, lxcHosts: map[string]bool{}}
+	b := baseline{voters: voters, allVoters: allVoters, strategies: map[string]string{}, running: map[string]string{}, lxcHosts: map[string]bool{}}
+	for _, h := range l.outsiderHosts() {
+		b.strategies[h] = l.fenceStrategy(via, h)
+	}
 	for _, h := range l.hosts {
 		out := l.mustSSH(h, 30*time.Second, "nft list tables")
 		if strings.Contains(out, "inet "+drillTable) || regexp.MustCompile(`(?m)^table inet drill$`).MatchString(out) {
@@ -1381,8 +1391,14 @@ func (l *lab) restore(b baseline) {
 	//    restarting needs `lv host undrain` (migration-failover.md, "What a
 	//    fence records"; partition-pause.md F6).
 	l.waitAllActive(via, 6*time.Minute)
-	// 6. Every host a voter again, one member per generation.
-	if _, voters, err := l.voterSet(via); err == nil {
+	// 6. Every host a voter again, one member per generation. A drill that
+	//    reset the cluster to the derived voter set (no members) gets the
+	//    baseline generation back by init, which is the only way out of it.
+	if _, voters, err := l.voterSet(via); err == nil && len(voters) == 0 && len(b.allVoters) > 0 {
+		if err := l.voterInit(via, b.allVoters); err != nil {
+			t.Errorf("restore: %v", err)
+		}
+	} else if err == nil {
 		have := map[string]bool{}
 		for _, v := range voters {
 			have[v] = true
@@ -1456,18 +1472,8 @@ func (l *lab) voterAdd(via, host string) error {
 		return err
 	}
 	l.mark("voter add %s: generation %d %v", host, gen, members)
-	for _, m := range members {
-		ok := false
-		for !ok && time.Now().Before(deadline) {
-			rows, err := l.sql(m, "SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption")
-			ok = err == nil && len(rows) > 0 && rows[0][0] == strconv.Itoa(gen)
-			if !ok {
-				time.Sleep(3 * time.Second)
-			}
-		}
-		if !ok {
-			return fmt.Errorf("voter add %s: %s did not adopt generation %d", host, m, gen)
-		}
+	if err := l.waitAdopted(gen, members, deadline); err != nil {
+		return fmt.Errorf("voter add %s: %v", host, err)
 	}
 	return nil
 }

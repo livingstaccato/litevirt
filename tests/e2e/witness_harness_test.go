@@ -47,14 +47,16 @@ type witnessTopology struct {
 	gen     int      // the adopted voter generation
 	members []string // its members
 	hlc     bool     // hlc_lww_v1 latched
+	lt      leaseTermExpect
 }
 
 // requireWitnessTopology skips unless the lab is the one the design reasons
 // about (witness-drill-design.md §0, §1): five worker hosts node-1..5 with none
 // excluded, exactly one witness outside them that answers, an adopted voter
 // generation whose members are exactly the five workers (so the witness does
-// not vote), and partition_pause_v1, recovery_claim_v1 and lease_term_v1
-// latched.
+// not vote), and partition_pause_v1, recovery_claim_v1 and lease_term_ledger_v1
+// latched. lease_term_v1 is not required: requireLeaseTermMode reads whether
+// the cluster enforces it, and the drills run in either mode.
 func (l *lab) requireWitnessTopology(via string) witnessTopology {
 	l.t.Helper()
 	if len(l.excluded) > 0 {
@@ -81,13 +83,16 @@ func (l *lab) requireWitnessTopology(via string) witnessTopology {
 	}
 	up := l.mustLV(via, "cluster", "upgrade-status")
 	l.saveEvidence("upgrade-status.txt", up)
-	for _, tok := range []string{capabilities.PartitionPauseV1, capabilities.RecoveryClaimV1, capabilities.LeaseTermV1} {
+	// lease_term_ledger_v1 (mandatory) is what mints lease terms, whatever
+	// enforcement.lease_term says: W3, W4a, W4b and W5a compare terms.
+	for _, tok := range []string{capabilities.PartitionPauseV1, capabilities.RecoveryClaimV1, capabilities.LeaseTermLedgerV1} {
 		if !latchparse.TokenLatched(up, tok) {
 			l.t.Skipf("%s is not latched on %s: the drill's expectations rest on it", tok, via)
 		}
 	}
 	w.hlc = latchparse.TokenLatched(up, capabilities.HLCLwwV1)
-	l.mark("witness: %s outside the voters; generation %d %v; hlc_lww_v1 latched=%v", w.witness, gen, members, w.hlc)
+	w.lt = l.requireLeaseTermMode(via)
+	l.mark("witness: %s outside the voters; generation %d %v; hlc_lww_v1 latched=%v; lease_term %s", w.witness, gen, members, w.hlc, w.lt.Mode)
 	return w
 }
 
@@ -1223,4 +1228,203 @@ func assertPausedOn(t *testing.T, rounds []round, key, home string, from, to tim
 			return
 		}
 	}
+}
+
+// ─── Lease-term mode ────────────────────────────────────────────────────────
+
+// leaseTermMode is whether the cluster enforces leader-lease terms
+// (enforcement.lease_term, default off; capabilities.LeaseTermV1). The drills
+// read it from the cluster, never from an operator setting, and run in either
+// mode: the safety they assert (one copy at every moment, one proof) rests on
+// partition_pause and recovery_claim, which stay on in both.
+type leaseTermMode string
+
+const (
+	leaseTermOff   leaseTermMode = "off"
+	leaseTermOn    leaseTermMode = "on"
+	leaseTermMixed leaseTermMode = "mixed"
+)
+
+// leaseTermPosture is one host's own report of lease_term_v1, read from its
+// litevirt_enforcement_config_enabled and litevirt_enforcement_latched gauges
+// (grpcapi ha_health.go, written every cycle for every supported token).
+// PingResponse.not_enforcing cannot carry it: a host withholds lease_term_v1
+// while its flag is off, and not_enforcing names only advertised tokens (and,
+// of the withheld ones, recovery_claim_v1 and partition_pause_v1).
+type leaseTermPosture struct {
+	Host            string
+	Config, Latched bool
+	Err             string // why it could not be read; "" when it was
+}
+
+// enforcing is the executor's and the coordinator's own predicate: the flag
+// AND the latch (grpcapi leaseTermEnforced, failover leaseTermEnforced).
+func (p leaseTermPosture) enforcing() bool { return p.Config && p.Latched }
+
+// leaseTermModeOf is on when every host enforces lease terms, off when none
+// does, and mixed otherwise. It fails when a host could not be read.
+func leaseTermModeOf(ps []leaseTermPosture) (leaseTermMode, error) {
+	if len(ps) == 0 {
+		return "", fmt.Errorf("no host to read")
+	}
+	on := 0
+	for _, p := range ps {
+		if p.Err != "" {
+			return "", fmt.Errorf("%s: %s", p.Host, p.Err)
+		}
+		if p.enforcing() {
+			on++
+		}
+	}
+	switch on {
+	case 0:
+		return leaseTermOff, nil
+	case len(ps):
+		return leaseTermOn, nil
+	}
+	return leaseTermMixed, nil
+}
+
+// parseEnforcementGauges reads feature's config and latch gauges from a
+// /metrics scrape; ok is false unless both are there.
+func parseEnforcementGauges(out, feature string) (config, latched, ok bool) {
+	var haveCfg, haveLatch bool
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		switch f[0] {
+		case `litevirt_enforcement_config_enabled{feature="` + feature + `"}`:
+			config, haveCfg = f[1] == "1", true
+		case `litevirt_enforcement_latched{feature="` + feature + `"}`:
+			latched, haveLatch = f[1] == "1", true
+		}
+	}
+	return config, latched, haveCfg && haveLatch
+}
+
+// leaseTermExpect is what the drills expect of the lease-term regime in one
+// mode. Nothing in it turns off a safety assertion: sampling, never-twice,
+// one proof and the pause bounds are asserted in every mode.
+type leaseTermExpect struct {
+	Mode leaseTermMode
+	// Inert: no host refuses a proof, or a stamp, on its lease term (the
+	// reconciler's gate and the coordinator's precheck both answer "nothing
+	// to check" unless the flag AND the latch hold). A refusal is a failure.
+	Inert bool
+	// TenureStrict: a proof carries the term of the tenure its coordinator
+	// held when it minted it (W5a). With lease_term off a superseded
+	// coordinator's stamp is not refused, so the term is only logged; the
+	// recovery claim keeps it to one proof either way.
+	TenureStrict bool
+}
+
+func leaseTermExpectFor(m leaseTermMode) leaseTermExpect {
+	switch m {
+	case leaseTermOn:
+		return leaseTermExpect{Mode: m, TenureStrict: true}
+	case leaseTermOff:
+		return leaseTermExpect{Mode: m, Inert: true}
+	}
+	return leaseTermExpect{Mode: m}
+}
+
+// leaseTermRefusalPattern matches every journal line with which a host
+// refuses on a lease term: the destination's reconciler gate
+// (health/reconciler.go) and the coordinator's stamp precheck and its
+// abandonment (failover/coordinator.go leaseTermStampAllowed,
+// noteLeaseTermRefusal).
+const leaseTermRefusalPattern = "refused by the lease-term gate|lease term is superseded|holds no usable lease term|refusing to stamp an action proof"
+
+// leaseTermPostures reads every host's lease_term_v1 posture.
+func (l *lab) leaseTermPostures(hosts []string) []leaseTermPosture {
+	var out []leaseTermPosture
+	for _, h := range hosts {
+		p := leaseTermPosture{Host: h}
+		m, err := l.ssh(h, 30*time.Second, "curl -s --max-time 10 http://127.0.0.1:7444/metrics | grep '^litevirt_enforcement_'")
+		if err != nil {
+			p.Err = err.Error()
+		} else if cfg, latched, ok := parseEnforcementGauges(m, capabilities.LeaseTermV1); !ok {
+			p.Err = "no litevirt_enforcement_config_enabled/latched gauge for " + capabilities.LeaseTermV1
+		} else {
+			p.Config, p.Latched = cfg, latched
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// requireLeaseTermMode reads the cluster's lease-term mode, records it, and
+// skips on a cluster that disagrees with itself. With lease_term off it
+// registers a check, run however the drill ends, that no host refused on a
+// lease term from now on.
+func (l *lab) requireLeaseTermMode(via string) leaseTermExpect {
+	l.t.Helper()
+	hosts := l.allBut()
+	ps := l.leaseTermPostures(hosts)
+	var b strings.Builder
+	for _, p := range ps {
+		fmt.Fprintf(&b, "%s config=%v latched=%v enforcing=%v %s\n", p.Host, p.Config, p.Latched, p.enforcing(), p.Err)
+	}
+	m, err := leaseTermModeOf(ps)
+	fmt.Fprintf(&b, "mode=%s err=%v\n", m, err)
+	l.saveEvidence("lease-term-mode.txt", b.String())
+	if err != nil {
+		l.t.Skipf("cannot read the lease_term posture of every host: %v", err)
+	}
+	if m == leaseTermMixed {
+		l.t.Skipf("lease_term is enforced on some hosts and not on others (lease-term-mode.txt):\n%sthe drills expect one mode on every executor and every possible lease holder; set enforcement.lease_term alike everywhere", b.String())
+	}
+	e := leaseTermExpectFor(m)
+	l.mark("lease_term mode: %s (flag AND latch, read from each host's own gauges)", m)
+	if e.Inert {
+		t, since := l.t, l.nodeNow(via)
+		t.Cleanup(func() {
+			for _, h := range hosts {
+				if j := strings.TrimSpace(l.journalSince(h, since, leaseTermRefusalPattern)); j != "" {
+					t.Errorf("lease_term is off, yet %s refused on a lease term (the gate must be inert):\n%s", h, j)
+				}
+			}
+		})
+	}
+	return e
+}
+
+// w4aOutcome is W4a's judgment of the second outage: the outcome's name and,
+// when it fails, why.
+type w4aOutcome struct{ Name, Fail string }
+
+// w4aVerdict judges W4a's second outage. dp is the decided proof (decided
+// tells whether any attempt is), p1 outage 1's accepted value, and gateRefused
+// whether the decided destination logged a lease-term refusal of p1.
+func w4aVerdict(e leaseTermExpect, recovered, decided bool, dp, p1 string, gateRefused bool) w4aOutcome {
+	switch {
+	case recovered && dp == p1:
+		return w4aOutcome{Name: "A"}
+	case recovered && !decided:
+		return w4aOutcome{Name: "B", Fail: "recovered, but no attempt reads decided"}
+	case recovered:
+		return w4aOutcome{Name: "B"}
+	case decided && dp == p1 && gateRefused && e.Inert:
+		return w4aOutcome{Name: "C", Fail: "the lease-term gate refused the adopted value's proof " + p1 + " although lease_term is not enforced"}
+	case decided && dp == p1 && gateRefused:
+		return w4aOutcome{Name: "C", Fail: "outcome C (design Q5): the adopted value's proof " + p1 + " is refused by the lease-term gate and the VM is stranded"}
+	case decided && dp == p1 && e.Inert:
+		return w4aOutcome{Name: "stranded", Fail: "the decided proof is outage 1's " + p1 + " and the VM is not running; lease_term is off, so the lease-term gate is inert and this is not design Q5"}
+	case decided && dp == p1:
+		return w4aOutcome{Name: "stranded", Fail: "the decided proof is outage 1's " + p1 + " and the VM is not running, with no lease-term refusal logged"}
+	}
+	return w4aOutcome{Name: "not recovered", Fail: "not recovered; decided proof " + strconv.Quote(dp)}
+}
+
+// retookBetween reports whether holder took the lease, by the sampled history,
+// at an instant inside [from, to].
+func retookBetween(history []leaseChange, holder string, from, to time.Time) bool {
+	for _, c := range history {
+		if c.Holder == holder && !c.At.Before(from) && !c.At.After(to) {
+			return true
+		}
+	}
+	return false
 }

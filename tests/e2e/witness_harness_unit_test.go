@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,5 +172,121 @@ func TestMintTime(t *testing.T) {
 	}
 	if got := mintTime(stepAt.Add(-time.Minute), "node-2", "node-2", stepAt, false); !got.Equal(stepAt.Add(-time.Minute)) {
 		t.Errorf("a time written before the step was shifted to %v", got)
+	}
+}
+
+// TestParseEnforcementGauges reads one feature's config and latch gauges from a
+// node's /metrics, and refuses a scrape that lacks either.
+func TestParseEnforcementGauges(t *testing.T) {
+	out := `litevirt_enforcement_config_enabled{feature="lease_term_ledger_v1"} 0
+litevirt_enforcement_config_enabled{feature="lease_term_v1"} 1
+litevirt_enforcement_latched{feature="lease_term_ledger_v1"} 1
+litevirt_enforcement_latched{feature="lease_term_v1"} 0
+`
+	cfg, latched, ok := parseEnforcementGauges(out, "lease_term_v1")
+	if !ok || !cfg || latched {
+		t.Errorf("lease_term_v1: config=%v latched=%v ok=%v, want true false true", cfg, latched, ok)
+	}
+	cfg, latched, ok = parseEnforcementGauges(out, "lease_term_ledger_v1")
+	if !ok || cfg || !latched {
+		t.Errorf("lease_term_ledger_v1: config=%v latched=%v ok=%v, want false true true", cfg, latched, ok)
+	}
+	if _, _, ok := parseEnforcementGauges("litevirt_enforcement_config_enabled{feature=\"lease_term_v1\"} 1\n", "lease_term_v1"); ok {
+		t.Errorf("a scrape with no latch gauge was read")
+	}
+}
+
+// TestLeaseTermModeOf takes the mode from every host's own flag and latch:
+// enforcing needs both, so a latch with the flag off is off, and a cluster
+// that disagrees is mixed.
+func TestLeaseTermModeOf(t *testing.T) {
+	p := func(h string, cfg, latched bool) leaseTermPosture {
+		return leaseTermPosture{Host: h, Config: cfg, Latched: latched}
+	}
+	for _, tc := range []struct {
+		name string
+		ps   []leaseTermPosture
+		want leaseTermMode
+	}{
+		{"default: flag off, not latched", []leaseTermPosture{p("node-1", false, false), p("node-6", false, false)}, leaseTermOff},
+		{"latched, then every flag turned off", []leaseTermPosture{p("node-1", false, true), p("node-6", false, true)}, leaseTermOff},
+		{"flag on everywhere, not latched yet", []leaseTermPosture{p("node-1", true, false), p("node-6", true, false)}, leaseTermOff},
+		{"flag on and latched everywhere", []leaseTermPosture{p("node-1", true, true), p("node-6", true, true)}, leaseTermOn},
+		{"the witness alone has its flag off", []leaseTermPosture{p("node-1", true, true), p("node-6", false, true)}, leaseTermMixed},
+	} {
+		got, err := leaseTermModeOf(tc.ps)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %q (%v), want %q", tc.name, got, err, tc.want)
+		}
+	}
+	if _, err := leaseTermModeOf([]leaseTermPosture{p("node-1", true, true), {Host: "node-2", Err: "no gauge"}}); err == nil {
+		t.Errorf("a host whose posture could not be read did not fail the reading")
+	}
+	if _, err := leaseTermModeOf(nil); err == nil {
+		t.Errorf("no hosts did not fail the reading")
+	}
+}
+
+// TestLeaseTermExpectFor selects the drills' lease-term expectations by mode:
+// off, the regime is inert and a proof's term is not held to its tenure; on,
+// the reverse.
+func TestLeaseTermExpectFor(t *testing.T) {
+	off, on := leaseTermExpectFor(leaseTermOff), leaseTermExpectFor(leaseTermOn)
+	if off.Mode != leaseTermOff || !off.Inert || off.TenureStrict {
+		t.Errorf("off: %+v, want inert and not tenure-strict", off)
+	}
+	if on.Mode != leaseTermOn || on.Inert || !on.TenureStrict {
+		t.Errorf("on: %+v, want enforcing and tenure-strict", on)
+	}
+	if m := leaseTermExpectFor(leaseTermMixed); m.Inert || m.TenureStrict {
+		t.Errorf("mixed: %+v asserts a mode", m)
+	}
+}
+
+// TestW4aVerdict judges W4a's second outage under each mode. Outcome C (the
+// adopted earlier-tenure value refused by the lease-term gate) is design Q5
+// with lease_term on; off, the gate must not refuse at all.
+func TestW4aVerdict(t *testing.T) {
+	off, on := leaseTermExpectFor(leaseTermOff), leaseTermExpectFor(leaseTermOn)
+	for _, tc := range []struct {
+		name                        string
+		e                           leaseTermExpect
+		recovered, decided, gateRef bool
+		dp                          string
+		wantName, wantFail, mustSay string
+	}{
+		{"A on", on, true, true, false, "p1", "A", "", ""},
+		{"A off", off, true, true, false, "p1", "A", "", ""},
+		{"B off", off, true, true, false, "p2", "B", "", ""},
+		{"B undecided", on, true, false, false, "", "B", "fail", "no attempt reads decided"},
+		{"C on is Q5", on, false, true, true, "p1", "C", "fail", "design Q5"},
+		{"C off: the gate refused while not enforced", off, false, true, true, "p1", "C", "fail", "not enforced"},
+		{"stranded on, no gate line", on, false, true, false, "p1", "stranded", "fail", "no lease-term refusal"},
+		{"stranded off, gate inert", off, false, true, false, "p1", "stranded", "fail", "inert"},
+		{"not recovered", off, false, false, false, "", "not recovered", "fail", ""},
+	} {
+		v := w4aVerdict(tc.e, tc.recovered, tc.decided, tc.dp, "p1", tc.gateRef)
+		if v.Name != tc.wantName || (v.Fail != "") != (tc.wantFail != "") || !strings.Contains(v.Fail, tc.mustSay) {
+			t.Errorf("%s: got %+v, want outcome %q fail=%v saying %q", tc.name, v, tc.wantName, tc.wantFail != "", tc.mustSay)
+		}
+	}
+}
+
+// TestRetookBetween finds a tenure the holder took inside a window.
+func TestRetookBetween(t *testing.T) {
+	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+	h := []leaseChange{
+		{At: t0, Holder: "node-2", Term: 7},
+		{At: t0.Add(40 * time.Second), Holder: "node-3", Term: 8},
+		{At: t0.Add(100 * time.Second), Holder: "node-2", Term: 9},
+	}
+	if !retookBetween(h, "node-2", t0.Add(30*time.Second), t0.Add(2*time.Minute)) {
+		t.Errorf("node-2's term 9 inside the window was missed")
+	}
+	if retookBetween(h, "node-2", t0.Add(30*time.Second), t0.Add(90*time.Second)) {
+		t.Errorf("node-2's term 7, before the window, counted")
+	}
+	if retookBetween(h, "node-4", t0, t0.Add(time.Hour)) {
+		t.Errorf("a host that never held the lease counted")
 	}
 }

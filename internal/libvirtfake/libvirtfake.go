@@ -255,6 +255,8 @@ type Fake struct {
 	snapshotFiles         map[string]map[string][]string
 	FailDomainState       func(name string) error
 	FailDomainStateReason func(name string) error
+	// conns is the connection model of the state calls (conn_model.go).
+	conns connModel
 	// FailHasManagedSaveImage makes HasManagedSaveImage unreadable, for the
 	// fail-closed paths that must not treat "cannot tell" as "no saved RAM".
 	FailHasManagedSaveImage func(name string) error
@@ -881,7 +883,17 @@ func (f *Fake) DomainIsActive(name string) (bool, error) {
 	return st == StateRunning || st == StatePaused, nil
 }
 
+// DomainState is a call on the Fake's own connection (conn_model.go).
 func (f *Fake) DomainState(name string) (string, error) {
+	var st string
+	var err error
+	if cerr := f.mainConn().call(name, func() { st, err = f.domainState(name) }); cerr != nil {
+		return "unknown", cerr
+	}
+	return st, err
+}
+
+func (f *Fake) domainState(name string) (string, error) {
 	if f.FailDomainState != nil {
 		if err := f.FailDomainState(name); err != nil {
 			return "", err
@@ -957,7 +969,18 @@ func (f *Fake) HasManagedSaveImage(name string) (bool, error) {
 // libvirt.coarseDomainState: shutoff→"stopped", running→"running", else
 // "unknown". Reason defaults to "running" for a running domain (or an injected
 // value via SetStateReason), else "unknown".
+//
+// It is a call on the Fake's own connection (conn_model.go).
 func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
+	var st libvirt.DomainStatus
+	var err error
+	if cerr := f.mainConn().call(name, func() { st, err = f.domainStateReason(name) }); cerr != nil {
+		return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, cerr
+	}
+	return st, err
+}
+
+func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 	if f.FailDomainStateReason != nil {
 		if err := f.FailDomainStateReason(name); err != nil {
 			return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, err

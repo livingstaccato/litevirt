@@ -332,10 +332,24 @@ func (c *Coordinator) priorEvidence(out claims.Outcome) *corrosion.SupersedeEvid
 // for the source itself is not judged here (noteClaimStranded), and neither
 // is a host with no row (supersedeEvidence moves past a removed one) or a
 // value for another action (the site defers to it).
+//
+// The value's lease stamp is judged too, whatever its destination: a value
+// accepted in an earlier outage carries the term of the coordinator that
+// proposed it, and once the lease has moved on, every executor enforcing
+// lease_term_v1 refuses it as stale (judgeProofLeaseTerm). It would stand at
+// its key, written and never run, and the workload would stay pending on its
+// destination for good (witness drill Q5). Its destination's abandonment
+// moves the claim on, as for a destination that cannot take the workload.
 func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, proposal corrosion.ActionProof, source string,
 	fits func(corrosion.HostRecord) string) (string, error) {
 	d := cl.Proof
-	if cl.Ours || d.Action != proposal.Action || d.DestHost == "" || d.DestHost == source || d.DestHost == proposal.DestHost {
+	if cl.Ours || d.Action != proposal.Action || d.DestHost == "" || d.DestHost == source {
+		return "", nil
+	}
+	if p := c.adoptedTermSuperseded(ctx, d, proposal); p != "" {
+		return p, nil
+	}
+	if d.DestHost == proposal.DestHost {
 		return "", nil
 	}
 	h, err := corrosion.GetHost(ctx, c.db, d.DestHost)
@@ -357,6 +371,21 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 		}
 	}
 	return "", nil
+}
+
+// adoptedTermSuperseded says why a decided value this coordinator did not
+// propose carries a lease stamp the executors refuse, or "" when they do
+// not: lease terms are enforced here, this coordinator stamps a term, and
+// the value's stamp is a lower term of the same lease or none at all.
+func (c *Coordinator) adoptedTermSuperseded(ctx context.Context, d, proposal corrosion.ActionProof) string {
+	if proposal.LeaseTerm <= 0 || proposal.LeaseKey == "" || !c.leaseTermEnforced(ctx) {
+		return ""
+	}
+	if d.LeaseKey == proposal.LeaseKey && d.LeaseTerm >= proposal.LeaseTerm {
+		return ""
+	}
+	return fmt.Sprintf("its proof carries lease term %d of %q, below this coordinator's %d, and executors refuse it as stale",
+		d.LeaseTerm, d.LeaseKey, proposal.LeaseTerm)
 }
 
 // vmFitsOn is the reschedule site's placement check of one destination for

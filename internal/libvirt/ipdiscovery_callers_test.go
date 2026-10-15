@@ -17,7 +17,7 @@ import (
 // caller passes the NIC's network.LeaseBridge ("" only when it is unknown), or
 // a MAC with leases on two bridges resolves to whichever is newest. In
 // internal/grpcapi every lookup goes through Server.discoverNICAddress (or
-// discoverNICAddressWithPeers beside it), the one place that derives the
+// discoverNICAddressesWithPeers beside it), the one place that derives the
 // bridge from the NIC's network and the seam tests drive discovery through.
 func TestMACDiscoveryHasOneEntryPoint(t *testing.T) {
 	root := filepath.Join("..", "..")

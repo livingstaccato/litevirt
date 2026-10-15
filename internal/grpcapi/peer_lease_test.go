@@ -85,7 +85,7 @@ func TestBestPeerLease(t *testing.T) {
 		{"outside the subnet", []peerLease{{"a", "192.0.2.5", 900}, {"b", "10.200.0.6", 200}}, "10.200.0.6"},
 		{"not an address", []peerLease{{"a", "nope", 900}}, ""},
 	} {
-		if got := bestPeerLease("10.200.0.0/24", tc.answers); got != tc.want {
+		if got := bestPeerLease("10.200.0.0/24", tc.answers).ip; got != tc.want {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
 		}
 	}

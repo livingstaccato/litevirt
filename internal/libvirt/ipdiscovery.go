@@ -94,19 +94,45 @@ func DiscoverIPForMACOnBridge(mac, bridge string) string {
 
 // DiscoverIPForMACOnBridgeWithPeers is DiscoverIPForMACOnBridge for a NIC
 // whose lease another host may hold (a vxlan network's dnsmasq runs on one of
-// its hosts): peerLease, asked only when this host has no lease, answers from
-// those hosts' leases, and is preferred to this host's ARP table for the same
-// reason this host's lease is. A nil peerLease asks nobody.
-func DiscoverIPForMACOnBridgeWithPeers(mac, bridge string, peerLease func() string) string {
-	if ip := LeaseIPForMACOnBridge(mac, bridge); ip != "" {
-		return ip
-	}
-	if peerLease != nil {
-		if ip := peerLease(); ip != "" {
+// its hosts): peerLease answers with the newest lease those hosts hold for
+// the MAC and its expiry (dnsmasq's, 0 = infinite). A lease — this host's or
+// a peer's — is preferred to this host's ARP table, and of the two leases the
+// one granted most recently wins: this host can still hold an older,
+// unexpired lease from when it was the network's DHCP host. A nil peerLease
+// asks nobody, and with no bridge no peer is asked.
+func DiscoverIPForMACOnBridgeWithPeers(mac, bridge string, peerLease func() (string, int64)) string {
+	if bridge == "" || peerLease == nil {
+		if ip := LeaseIPForMACOnBridge(mac, bridge); ip != "" {
 			return ip
 		}
+		return GetIPFromARP(mac)
+	}
+	lip, lexp := LeaseOnBridge(mac, bridge)
+	pip, pexp := peerLease()
+	switch {
+	case lip != "" && pip != "":
+		if newerLease(pexp, lexp) {
+			return pip
+		}
+		return lip
+	case lip != "":
+		return lip
+	case pip != "":
+		return pip
 	}
 	return GetIPFromARP(mac)
+}
+
+// newerLease reports whether a dnsmasq expiry a is strictly later than b
+// (0 = infinite, later than any date).
+func newerLease(a, b int64) bool {
+	if a == 0 {
+		a = math.MaxInt64
+	}
+	if b == 0 {
+		b = math.MaxInt64
+	}
+	return a > b
 }
 
 // LeaseIPForMACOnBridge is the lease half of DiscoverIPForMACOnBridge: this

@@ -674,7 +674,7 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 	if req.LeaseOnly {
 		// This host's dnsmasq lease for the MAC on the network's bridge, and
 		// nothing else: a peer asks because the lease is authoritative, and an
-		// ARP entry here is not (discoverNICAddressWithPeers). No network
+		// ARP entry here is not (discoverNICAddressesWithPeers). No network
 		// record, no bridge: no lease file to read.
 		if _, err := net.ParseMAC(req.Mac); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "mac %q: %v", req.Mac, err)

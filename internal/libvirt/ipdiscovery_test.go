@@ -193,27 +193,36 @@ func TestLeaseOnBridge_LeaseFileOnlyWithExpiry(t *testing.T) {
 	}
 }
 
-// With peers, the order is this host's lease, then the peers' lease, then
-// this host's ARP table: a peer's lease is authoritative, an ARP entry here
-// may be stale. The peers are asked only when there is no lease here.
+// With peers, a lease is preferred to this host's ARP table — a peer's lease
+// is authoritative, an ARP entry here may be stale — and of this host's lease
+// and the peers', the one granted most recently wins: an old gateway's lease
+// file can outlive its dnsmasq.
 //
-// Mutation: ask ARP before peerLease — red.
+// Mutation: ask ARP before peerLease, or let this host's lease win
+// regardless of expiry — red.
 func TestDiscoverIPForMACOnBridgeWithPeers_Order(t *testing.T) {
 	withARPTable(t, "IP address       HW type     Flags       HW address            Mask     Device\n"+
 		"10.0.9.9         0x1         0x2         52:54:00:aa:bb:01     *        br-b\n")
 	withLeaseClock(t, 2_000_000_000)
 	withLeaseDir(t, "")
-	asked := 0
-	peer := func(ip string) func() string { return func() string { asked++; return ip } }
-	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7")); got != "10.0.2.7" {
+	peer := func(ip string, exp int64) func() (string, int64) { return func() (string, int64) { return ip, exp } }
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000007200)); got != "10.0.2.7" {
 		t.Errorf("no lease here: %q, want the peer's lease 10.0.2.7 over ARP's 10.0.9.9", got)
 	}
-	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("")); got != "10.0.9.9" {
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("", 0)); got != "10.0.9.9" {
 		t.Errorf("no lease anywhere: %q, want ARP's 10.0.9.9", got)
 	}
 	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-b.leases", "2000003600 52:54:00:aa:bb:01 10.0.2.5 web *\n")
-	asked = 0
-	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7")); got != "10.0.2.5" || asked != 0 {
-		t.Errorf("a lease here: %q (peers asked %d times), want 10.0.2.5 without asking", got, asked)
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000007200)); got != "10.0.2.7" {
+		t.Errorf("an older lease here, a newer one on a peer: %q, want the peer's 10.0.2.7", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 2000001800)); got != "10.0.2.5" {
+		t.Errorf("a newer lease here: %q, want this host's 10.0.2.5", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", peer("10.0.2.7", 0)); got != "10.0.2.7" {
+		t.Errorf("an infinite lease on a peer: %q, want the peer's 10.0.2.7", got)
+	}
+	if got := DiscoverIPForMACOnBridgeWithPeers("52:54:00:aa:bb:01", "br-b", nil); got != "10.0.2.5" {
+		t.Errorf("nobody asked: %q, want this host's 10.0.2.5", got)
 	}
 }

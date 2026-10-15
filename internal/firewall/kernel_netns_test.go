@@ -69,7 +69,7 @@ func TestKernel_NICGuard(t *testing.T) {
 	}
 	// Children with their own module list skip on their own when one is
 	// missing (saying which); they must not fail or vanish.
-	for _, child := range []string{"TestKernelChild_CompatCorpusLoads"} {
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_LogFormsLoad"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}
@@ -1241,6 +1241,50 @@ func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 		cmd.Stdin = strings.NewReader(script)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: nft -c refused the corpus ruleset: %v\n%s", mode, err, out)
+		}
+	}
+}
+
+// logFormsModules are the modules the log rulesets make the kernel use beyond
+// the compat corpus's: the log and limit expressions, and the NFLOG logger
+// `log group` binds to (spec §3.7).
+var logFormsModules = append(append([]string(nil), compatCorpusModules...), "nft_log", "nfnetlink_log", "nft_limit")
+
+// TestKernelChild_LogFormsLoad: every log form the renderer writes (spec
+// §3.4) — the named limits in both tables, a log line per NIC side, per
+// family of a split rule, in the tiers and routed_to_port, the default
+// verdict, observe mode, the largest group and budget — makes a ruleset a
+// real nft accepts. `nft -c` changes nothing.
+//
+// Mutation: declare the limit as `limit lv_x { rate 5/second; burst 10
+// packets; }`-style syntax nft does not take, or render `log group` after the
+// prefix — red.
+func TestKernelChild_LogFormsLoad(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules(logFormsModules...); len(missing) > 0 {
+		t.Skipf("the log rulesets would make the kernel load %v, which is not loaded on this host", missing)
+	}
+	budgets := []LogPolicy{
+		{Available: true, Group: 27, Default: true},
+		{Available: true, Group: 65535, Default: true, Rate: MaxLogRate, Burst: MaxLogBurst},
+		{Available: true, Group: 0, Rate: 1, Burst: 1},
+	}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		for _, lp := range budgets {
+			p := goldenLogPlan(mode)
+			p.LogPolicy = lp
+			script, err := Render(p)
+			if err != nil {
+				t.Fatalf("%s %+v: Render: %v", mode, lp, err)
+			}
+			if !strings.Contains(script, " log group ") {
+				t.Fatalf("%s %+v: no log line rendered", mode, lp)
+			}
+			cmd := exec.Command("nft", "-c", "-f", "-")
+			cmd.Stdin = strings.NewReader(script)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("%s %+v: nft -c refused the log ruleset: %v\n%s\n%s", mode, lp, err, out, script)
+			}
 		}
 	}
 }

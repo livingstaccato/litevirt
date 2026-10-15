@@ -119,6 +119,13 @@ type Rule struct {
 	CIDR      string // "10.0.0.0/24" | "" (any) | "@<ipset-name>"
 	Action    Action
 	Comment   string // human-readable; emitted as `# …` on the rule line
+
+	// ID is the stored row's id. It names the rule in its log prefix.
+	ID string
+	// Log logs each packet the rule matches to the daemon (NFLOG), on a line
+	// of its own ahead of the rule's verdict (spec §3.4). It renders only
+	// where Plan.LogPolicy is Available.
+	Log bool
 }
 
 // SecurityGroup is a named set of Rules. NICs reference SGs by name;
@@ -303,6 +310,10 @@ type Plan struct {
 	// network does not allow them (not rendered; reported as a condition).
 	BlockedTrunks []BlockedTrunk
 
+	// LogPolicy is how the host logs: whether it can, to which NFLOG group,
+	// whether the default verdict is logged, and the per-NIC budget.
+	LogPolicy LogPolicy
+
 	// InvalidRows are the stored rows the loader did not render as written
 	// because they fail the rule grammar (not rendered; reported as a
 	// condition). See quarantineRule.
@@ -322,6 +333,32 @@ type LBBackend struct {
 	Port  int
 	Proto string // "tcp" (default) or "udp"
 }
+
+// LogPolicy is a host's firewall logging (spec §3.4). The zero value renders
+// no log line at all.
+type LogPolicy struct {
+	// Available says the host renders log lines: its kernel loads a named
+	// limit and `log group`, and the daemon listens. When false nothing is
+	// logged and no limit is declared, whatever the rules and Default say.
+	Available bool
+	// Group is the NFLOG group every log line sends to (firewall.log_group).
+	Group uint16
+	// Default logs each NIC side's default verdict (DECISION L-7: off until
+	// an operator turns the policy on).
+	Default bool
+	// Rate and Burst are the per-NIC-side budget, records per second and
+	// burst. A value outside 1..MaxLogRate (1..MaxLogBurst) renders the
+	// default.
+	Rate, Burst int
+}
+
+// The per-NIC-side log budget (DECISION L-4).
+const (
+	DefaultLogRate  = 5
+	DefaultLogBurst = 10
+	MaxLogRate      = 10000
+	MaxLogBurst     = 10000
+)
 
 // Per-NIC enforcement modes (Plan.NICMode).
 const (
@@ -386,6 +423,9 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// snapshots the length at call time. Always close before returning.
 	fmt.Fprintf(&b, "table inet %s {\n", TableName)
 	renderIPSets(&b, p.IPSets)
+	if p.LogPolicy.Available && (anyLogged(p.ClusterRules) || anyLogged(p.HostRules)) {
+		renderLogLimit(&b, logLimitRouted, p.LogPolicy)
+	}
 
 	defaultPolicy := "accept"
 	if p.DefaultDeny {
@@ -423,8 +463,8 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	fmt.Fprintf(&b, "        jump host_overrides\n")
 	fmt.Fprintf(&b, "    }\n\n")
 
-	renderTierChain(&b, "cluster_default", p.ClusterRules, v6Sets)
-	renderTierChain(&b, "host_overrides", p.HostRules, v6Sets)
+	renderTierChain(&b, "cluster_default", p.ClusterRules, v6Sets, p.LogPolicy)
+	renderTierChain(&b, "host_overrides", p.HostRules, v6Sets, p.LogPolicy)
 
 	// Infra chains on their own hooks. Emitted only when non-empty so a plan with
 	// no NAT / isolation renders byte-identically to before this feature (and so
@@ -664,10 +704,14 @@ func collapseSetElements(in []string) []string {
 
 // renderTierChain emits a chain whose rules apply to every packet
 // entering it (cluster + host tiers don't filter by NIC). The chain
-// name is the tier name.
-func renderTierChain(b *strings.Builder, name string, rules []Rule, v6Sets map[string]bool) {
+// name is the tier name. A logged rule logs as dev `-` under
+// lv_lg_routed.
+func renderTierChain(b *strings.Builder, name string, rules []Rule, v6Sets map[string]bool, lp LogPolicy) {
 	fmt.Fprintf(b, "    chain %s {\n", name)
 	for _, r := range rules {
+		for _, line := range renderRoutedLog(r, v6Sets, lp) {
+			fmt.Fprintf(b, "        %s\n", line)
+		}
 		for _, line := range renderRules(r, "", v6Sets) {
 			fmt.Fprintf(b, "        %s\n", line)
 		}

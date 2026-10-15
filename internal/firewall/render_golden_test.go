@@ -76,6 +76,18 @@ func TestRenderGolden(t *testing.T) {
 				},
 			},
 		},
+		{
+			// Firewall logging (spec §3.4): per-NIC and routed log lines,
+			// the default verdict, an IPv6 split and a reject.
+			name: "log_enforce",
+			path: "testdata/render_log_enforce.golden",
+			plan: goldenLogPlan(NICModeEnforce),
+		},
+		{
+			name: "log_observe",
+			path: "testdata/render_log_observe.golden",
+			plan: goldenLogPlan(NICModeObserve),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,6 +96,39 @@ func TestRenderGolden(t *testing.T) {
 				t.Fatalf("Render: %v", err)
 			}
 			golden.Assert(t, tc.path, got)
+			assertEveryLogHasGroup(t, got)
 		})
+	}
+}
+
+// goldenLogPlan logs rules in every tier and the default verdict.
+func goldenLogPlan(mode string) Plan {
+	return Plan{
+		DefaultDeny: true,
+		NICMode:     mode,
+		LogPolicy:   LogPolicy{Available: true, Group: 27, Default: true, Rate: 20, Burst: 40},
+		IPSets: []IPSet{
+			{Name: "trusted", CIDRs: []string{"10.0.0.0/24", "fd00::/64"}},
+		},
+		ClusterRules: []Rule{
+			{ID: "c0ffee", Direction: Ingress, Proto: "tcp", PortRange: "25", Action: Reject, Log: true, Comment: "no smtp"},
+			{ID: "c2", Direction: Egress, Proto: "all", CIDR: "10.9.0.0/16", Action: Drop},
+		},
+		HostRules: []Rule{
+			{ID: "h1", Direction: Ingress, Proto: "udp", PortRange: "161", CIDR: "@trusted", Action: Accept, Log: true},
+		},
+		SecurityGroups: []SecurityGroup{
+			{Name: "web", Rules: []Rule{
+				{ID: "s1", Direction: Ingress, Proto: "tcp", PortRange: "22", CIDR: "@trusted", Action: Drop, Log: true},
+				{ID: "s2", Direction: Ingress, Proto: "tcp", PortRange: "443", Action: Accept},
+				{ID: "Not An Id", Direction: Egress, Proto: "udp", PortRange: "53", Action: Accept, Log: true},
+			}},
+		},
+		NICs: []NICBinding{
+			{NICDev: "tap-vm1-0", VMName: "vm1", SecurityGroups: []string{"web"}},
+			{NICDev: "veth.c1", VMName: "c1", ExtraRules: []Rule{
+				{ID: "n1", Direction: Ingress, Proto: "icmp", Action: Drop, Log: true},
+			}},
+		},
 	}
 }

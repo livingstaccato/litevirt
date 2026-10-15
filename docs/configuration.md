@@ -735,9 +735,8 @@ vm_event_prune_hours: 24
 # Disk copies a failover set aside (<disk path>.superseded-<time>, see
 # migration-failover.md "VM failure policies") are kept while the VM they came
 # from exists, whatever its state: only `lv host superseded-disks <host>
-# --remove <copy>` removes one then. `lv rm <vm>` without --keep-disks removes
-# the copies recorded for that VM. Other copies of a VM that is gone are
-# removed by their host when older than this. 0 keeps those until removed
+# --remove <copy>` removes one then. Once the VM is gone, its copies are
+# removed by their host when older than this. 0 keeps every copy until removed
 # with `lv host superseded-disks --purge` or `--remove`.
 superseded_disk_retention_days: 7
 

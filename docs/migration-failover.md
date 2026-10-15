@@ -1410,19 +1410,24 @@ The restart is not silent, and the real disk is not lost:
   running there or holds a saved state.
 - An old copy that a restart sets aside, as above, is recorded the same way on
   the host that holds it.
+- When the VM is deleted (`lv rm`, with or without `--keep-disks`), the host
+  that holds its disk clears the record on its next pass, or once it is back
+  if it was down then. A disk still at its path is renamed to
+  `<disk path>.superseded-<time>` first, so it is kept like any other copy;
+  this waits while a domain of the VM's name runs on that host. The host also
+  removes the VM's cloud-init seed there (`cloudinit/<vm>.iso`).
+
+A cloud-init seed is used only by the VM it was written for: a host that
+holds the seed of a deleted VM writes a new one from the VM's own settings
+when another VM of that name starts there, fails over to it or migrates to it.
 
 A copy is retained while the VM it came from exists, in any state: the host
 never removes it on its own. While that VM is in `error`, `pending` or
 `starting` it is also held, because a restart that failed may need it put
-back. `lv rm <vm>` removes what the VM's records list on each host that
-holds them, and the VM's cloud-init seed there (`cloudinit/<vm>.iso`): the
-host does it on its next reconciler pass, or once it is back if it was down
-during the delete. It removes only what was recorded for the VM it deleted,
-never anything of a VM created again under the same name, and nothing while a
-domain of that name is live on the host. `lv rm --keep-disks` keeps them.
-Other copies of a deleted VM are removed by their host when they are older
-than `superseded_disk_retention_days` (default 7 days; `0` keeps them). The
-host checks hourly; the age comes from the time in the file name. Before this rule a copy was held only while its VM was in `error`,
+back. Once the VM is deleted, its copies are removed by their host when they
+are older than `superseded_disk_retention_days` (default 7 days; `0` keeps
+every copy). The host checks hourly; the age comes from the time in the file
+name. Before this rule a copy was held only while its VM was in `error`,
 `pending` or `starting`, so seven days after the VM was running again on a
 rebuilt disk the only copy of its data from before the failover was deleted.
 

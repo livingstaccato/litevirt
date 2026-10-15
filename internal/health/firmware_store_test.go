@@ -22,6 +22,14 @@ func TestReconciler_FirmwareStore(t *testing.T) {
 	if r.FirmwareStore() != own {
 		t.Fatalf("reconciler uses %+v, not the injected store %+v", r.FirmwareStore(), own)
 	}
+	// The same directory spelled differently is the same directory (review
+	// m-3): no panic.
+	slash := &lv.FirmwareStore{DataDir: "/var/lib/litevirt/", SwtpmBase: own.SwtpmBase}
+	r.SetFirmwareStore(slash)
+	if r.FirmwareStore() != slash {
+		t.Fatalf("a store under %q was not taken", slash.DataDir)
+	}
+	r.SetFirmwareStore(own)
 	// nil is ignored, as the server does (D2-1 review m-4): the reconciler
 	// keeps its store rather than nil-panicking at its next firmware read.
 	r.SetFirmwareStore(nil)

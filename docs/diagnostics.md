@@ -2320,6 +2320,22 @@ on the host that raised the condition; the file is re-read within 30 s. A file
 that cannot be read is never written over: the condition says so, the disks
 stay named from memory, and fixing or removing the file recovers.
 
+### A firmware move record cannot be read (`firmware_migration_record_unreadable`)
+
+A live firmware migration keeps its records under `<data_dir>/fwmig-inflight/`
+(the source) and `<data_dir>/fwmig-hold/` (the target). While a record names a
+VM, its starts, stops, redefines and firmware state writes are refused. A
+record file that cannot be read could name any VM, so the refusal is
+host-wide for every operation that carries a domain uuid (a define, a firmware
+state restore, a wipe), and covers every operation on the VM the file is named
+after. The refusal names the file, and the host raises
+`firmware_migration_record_unreadable` (evaluator `firmware_move`, subject
+`host/<host>`, critical), whose evidence gives each file, why it does not
+read, and every firmware state wipe it refused: that state is still on disk,
+and each such VM also gets a `vm.firmware_wipe_refused` event. Repair the file,
+or move it out of its directory once no firmware move on the host needs it;
+the condition resolves within a pass once every file reads.
+
 ### A VM's disk is missing on its own host (`vm_disk_missing`)
 
 A start on the VM's own host never boots it from a blank disk. This covers the

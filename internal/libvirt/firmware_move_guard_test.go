@@ -3,6 +3,7 @@ package libvirt
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,10 @@ var (
 	fwHoldStates     = []string{"prepared", "verified", "resuming", "released_unconfirmed", "mismatch"}
 )
 
+// fwUnreadable is another VM's record that does not read: the guard cannot
+// tell whether it binds this VM.
+var fwUnreadable = &FirmwareRecordUnreadableError{Path: "/var/lib/litevirt/fwmig-hold/vm9.json", Err: errors.New("unexpected end of JSON input")}
+
 func fwPrePhase(p string) bool { return p == "preparing" || p == "prepared" || p == "migrating" }
 
 // fwState is one column cell: the records the lookup returns, or its error.
@@ -62,7 +67,7 @@ func fwHold(state string) fwState {
 // (a parked one from a pre-cutover and from a post-cutover phase; a cleaning
 // one with and without its retained bundle); a hold in every state.
 func fwStates() []fwState {
-	out := []fwState{{name: "none"}, {name: "unreadable", err: errors.New("fwmig: corrupt record")}}
+	out := []fwState{{name: "none"}, {name: "unreadable", err: fwUnreadable}}
 	for _, p := range fwProgressPhases {
 		out = append(out, fwMarker("marker/"+p, p, fwPrePhase(p), p == "cleaning"))
 	}
@@ -250,6 +255,11 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 				return e.client.RevertToLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil, nil)
 			}},
 			{name: "restore", refuseOnly: true, run: func(e *fwEnv) error { return e.client.restoreWithRetry(fwTestVM, "/nonexistent", "") }},
+			// The memory snapshot's restore: asked before the suspend.
+			{name: "Client.CreateLiveSnapshot", refuseOnly: true, run: func(e *fwEnv) error {
+				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
+				return err
+			}},
 		},
 		OpResume: {
 			{name: "ResumeDomain", dom: paused, run: func(e *fwEnv) error {
@@ -266,6 +276,12 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 				acted: func(e *fwEnv) bool { return e.api.called("destroy") }},
 			{name: "Client.DestroyDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.DestroyDomain(fwTestVM) }},
 			{name: "Client.ShutdownDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.ShutdownDomain(fwTestVM) }},
+			// The memory snapshot's save stops the guest: asked before the
+			// suspend, so a refusal never leaves it saved and stopped.
+			{name: "Client.CreateLiveSnapshot", refuseOnly: true, run: func(e *fwEnv) error {
+				_, _, err := e.client.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
+				return err
+			}},
 		},
 		OpDefine: {
 			{name: "DefineDomain", run: func(e *fwEnv) error {
@@ -273,6 +289,11 @@ func fwPrims() map[FirmwareOp][]fwPrim {
 			}, acted: func(e *fwEnv) bool { return e.api.called("define") }},
 			{name: "Client.DefineDomain", refuseOnly: true, run: func(e *fwEnv) error { return e.client.DefineDomain(fwTestDomXML) }},
 			{name: "Client.SetBootOrder", refuseOnly: true, run: func(e *fwEnv) error { return e.client.SetBootOrder(fwTestVM, "disk") }},
+			// The point-in-time commit ends in a redefine: asked before it
+			// commits anything.
+			{name: "Client.CommitDiskOverlay", refuseOnly: true, run: func(e *fwEnv) error {
+				return e.client.CommitDiskOverlay(fwTestVM, "/pool/d.qcow2", "/pool/ov", "qcow2", nil)
+			}},
 		},
 		OpUndefine: {
 			{name: "UndefineDomain", run: func(e *fwEnv) error { return undefineDomain(e.api, e.guard, fwTestVM, false) },
@@ -348,8 +369,10 @@ func TestFirmwareMoveGuard(t *testing.T) {
 								t.Fatalf("refused, want allowed: err=%v acted=%v calls=%v", err, acted, e.api.calls)
 							case !want && acted && (p.acted != nil || p.bestEffort):
 								t.Fatalf("acted, want refused: err=%v calls=%v", err, e.api.calls)
-							case !want && !p.bestEffort && !errors.Is(err, ErrFirmwareMoveInFlight):
+							case !want && !p.bestEffort && st.err == nil && !errors.Is(err, ErrFirmwareMoveInFlight):
 								t.Fatalf("err = %v, want ErrFirmwareMoveInFlight", err)
+							case !want && !p.bestEffort && st.err != nil && (!errors.Is(err, ErrFirmwareMoveRecordUnreadable) || errors.Is(err, ErrFirmwareMoveInFlight)):
+								t.Fatalf("err = %v, want ErrFirmwareMoveRecordUnreadable and not in flight", err)
 							case !want && len(e.api.calls) > 0:
 								t.Fatalf("refused, but libvirt was called: %v", e.api.calls)
 							}
@@ -390,8 +413,10 @@ func fwExempts() []fwExempt {
 	held := hold("prepared", "verified", "resuming", "mismatch")
 	nvram := []byte("PUSHED")
 	return []fwExempt{
+		// §7 M1p before cutover, and D-5 --accept-source from source_paused
+		// (spec §5.y).
 		{via: ViaResumeFirmwareMoveSource, op: OpResume, dom: golibvirt.DomainPaused,
-			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.PreCutover },
+			allow: func(r FirmwareMoveRecord) bool { return marker(r) && (r.PreCutover || r.State == "source_paused") },
 			run: func(e *fwEnv, id, a string) error {
 				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: id, Attempt: a, Via: ViaResumeFirmwareMoveSource})
 			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
@@ -407,7 +432,10 @@ func fwExempts() []fwExempt {
 		{via: ViaDiscardFirmwareMoveTarget, op: OpStop, dom: golibvirt.DomainPaused, allow: held,
 			run:   func(e *fwEnv, id, a string) error { return discardFirmwareMoveTarget(e.api, e.guard, fwTestVM, id, a) },
 			acted: func(e *fwEnv) bool { return e.api.called("destroy") && e.api.called("undefine") }},
-		{via: ViaStopFirmwareMoveTargetForOperator, op: OpStop, dom: golibvirt.DomainRunning, allow: hold("released_unconfirmed"),
+		// D-5 --stop-target (spec §5.y), and the stop of a
+		// released_unconfirmed guest.
+		{via: ViaStopFirmwareMoveTargetForOperator, op: OpStop, dom: golibvirt.DomainRunning,
+			allow: hold("prepared", "verified", "resuming", "released_unconfirmed"),
 			run: func(e *fwEnv, id, a string) error {
 				return stopFirmwareMoveTargetForOperator(e.api, e.guard, fwTestVM, id, a, true)
 			}, acted: func(e *fwEnv) bool { return e.api.called("destroy") }},
@@ -424,6 +452,10 @@ func fwExempts() []fwExempt {
 			acted: func(e *fwEnv) bool { b, _ := e.nvram(fwTestVM); return b == "PUSHED" }},
 		{via: ViaPushFirmwareMoveNvram, op: OpWriteState, allow: hold("verified", "resuming"),
 			run:   func(e *fwEnv, id, a string) error { return e.store.PushFirmwareMoveNvram(fwTestVM, id, a, nvram) },
+			acted: func(e *fwEnv) bool { b, _ := e.nvram(fwTestVM); return b == "PUSHED" }},
+		// D-5 --push-source-nvram (spec §5.y).
+		{via: ViaPushSourceNvramForOperator, op: OpWriteState, allow: hold("released_unconfirmed"),
+			run:   func(e *fwEnv, id, a string) error { return e.store.PushSourceNvramForOperator(fwTestVM, id, a, nvram) },
 			acted: func(e *fwEnv) bool { b, _ := e.nvram(fwTestVM); return b == "PUSHED" }},
 		{via: ViaWipeFirmwareMoveSource, op: OpWipe,
 			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.State == "cleaning" && r.RetainedBundle },
@@ -491,6 +523,7 @@ func TestFirmwareMoveGuard_ExemptBinding(t *testing.T) {
 		ViaUndefineFirmwareMoveLeftover:      fwMarker("m", "cleaning", false, true),
 		ViaMaterialiseFirmwareMoveNvram:      fwHold("prepared"),
 		ViaPushFirmwareMoveNvram:             fwHold("verified"),
+		ViaPushSourceNvramForOperator:        fwHold("released_unconfirmed"),
 		ViaWipeFirmwareMoveSource:            fwMarker("m", "cleaning", false, true),
 		ViaRemoveFirmwareMoveTargetState:     fwHold("prepared"),
 		ViaQuarantineFirmwareMoveTargetState: fwHold("mismatch"),
@@ -678,11 +711,28 @@ func TestFirmwareMoveGuard_RefusalText(t *testing.T) {
 			t.Errorf("hold refusal %q lacks %q", err, want)
 		}
 	}
-	g = NewFirmwareMoveGuard(fwLookup(fwState{err: errors.New("corrupt")}))
-	if err = g.check(FirmwareCall{Op: OpWipe, UUID: fwTestUUID}); !errors.Is(err, ErrFirmwareMoveInFlight) || !strings.Contains(err.Error(), "cannot be read") {
-		t.Errorf("unreadable: %v", err)
+	// Another VM's unreadable record: the refusal names the file, the
+	// remedy and the condition, and does not call anything in flight.
+	//
+	// Mutation: refuse an unreadable record with the in-flight text — red.
+	g = NewFirmwareMoveGuard(fwLookup(fwState{err: fwUnreadable}))
+	err = g.check(FirmwareCall{Op: OpDefine, Name: "web", UUID: fwTestUUID})
+	var ue *FirmwareRecordUnreadableError
+	if !errors.Is(err, ErrFirmwareMoveRecordUnreadable) || errors.Is(err, ErrFirmwareMoveInFlight) || !errors.As(err, &ue) || ue.Path != fwUnreadable.Path {
+		t.Errorf("unreadable: %v, want ErrFirmwareMoveRecordUnreadable carrying the file, not in flight", err)
 	}
-	if err := NewFirmwareMoveGuard(nil).check(FirmwareCall{Op: OpStart, Name: fwTestVM}); !errors.Is(err, ErrFirmwareMoveInFlight) {
+	for _, want := range []string{"define of web refused", fwUnreadable.Path, "cannot be read", "repaired", "firmware_migration_record_unreadable"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("unreadable refusal %q lacks %q", err, want)
+		}
+	}
+	if err != nil && strings.Contains(err.Error(), "in flight") {
+		t.Errorf("unreadable refusal %q says a move is in flight", err)
+	}
+	if !IsFirmwareMoveRefusal(err) {
+		t.Errorf("IsFirmwareMoveRefusal(%v) = false", err)
+	}
+	if err := NewFirmwareMoveGuard(nil).check(FirmwareCall{Op: OpStart, Name: fwTestVM}); !IsFirmwareMoveRefusal(err) {
 		t.Errorf("nil lookup: %v, want refused", err)
 	}
 	if err := (FirmwareMoveGuard{}).check(FirmwareCall{Op: OpStart, Name: fwTestVM}); err != nil {
@@ -696,5 +746,77 @@ func TestDomainNameFromXML(t *testing.T) {
 	}
 	if got := DomainNameFromXML("<domain/>"); got != "" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// A best-effort wipe refused because a record cannot be read is kept for
+// TakeRefusedWipes, so the daemon reports it (the state is still on disk); one
+// refused because a record names the VM is the guard doing its job and is not.
+//
+// Mutation: record no refused wipe — red.
+func TestFirmwareStore_RefusedWipesForUnreadableRecord(t *testing.T) {
+	e := newFWEnv(t, fwState{err: fwUnreadable}, golibvirt.DomainShutoff)
+	e.store.WipeFirmwareState(fwTestVM, fwTestUUID)
+	e.store.WipeFirmwareStateByUUID(fwTestUUID)
+	got := e.store.TakeRefusedWipes()
+	if len(got) != 2 || got[0].VM != fwTestVM || got[1].UUID != fwTestUUID || !errors.Is(got[0].Err, ErrFirmwareMoveRecordUnreadable) {
+		t.Fatalf("refused wipes = %+v", got)
+	}
+	if again := e.store.TakeRefusedWipes(); len(again) != 0 {
+		t.Fatalf("taken twice: %+v", again)
+	}
+	e = newFWEnv(t, fwMarker("m", "migrating", true, false), golibvirt.DomainShutoff)
+	e.store.WipeFirmwareState(fwTestVM, fwTestUUID)
+	if got := e.store.TakeRefusedWipes(); len(got) != 0 {
+		t.Fatalf("a marker's refusal reported as a leak: %+v", got)
+	}
+}
+
+// WipeFirmwareMoveSource reports a removal that failed, so cleanup keeps its
+// marker over state still on disk (review m-5).
+//
+// Mutation: ignore the removal errors — red.
+func TestWipeFirmwareMoveSource_ReportsFailure(t *testing.T) {
+	e := newFWEnv(t, fwMarker("m", "cleaning", false, true), golibvirt.DomainShutoff)
+	p := e.store.NvramPath(fwTestVM)
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	fwWriteFile(t, filepath.Join(p, "x"), "a directory where the NVRAM was")
+	if err := e.store.WipeFirmwareMoveSource(fwTestVM, fwTestUUID, fwTestAttempt); err == nil {
+		t.Fatal("a failed removal reported success")
+	}
+}
+
+// I-2: a memory snapshot asks the guard for the stop (the RAM save) AND the
+// start (the restore) before it suspends anything; either refusal alone
+// refuses it. The client here has no libvirt connection: a call that got past
+// the guard would panic on it.
+//
+// Mutation: drop either op from CreateLiveSnapshot's check — red.
+func TestCreateLiveSnapshot_AsksStopAndStart(t *testing.T) {
+	for _, only := range []FirmwareOp{OpStop, OpStart} {
+		t.Run(string(only), func(t *testing.T) {
+			refused := errors.New("refused")
+			c := &Client{}
+			c.SetFirmwareMoveGuard(FirmwareMoveGuard{Check: func(fc FirmwareCall) error {
+				if fc.Op == only {
+					return refused
+				}
+				return nil
+			}})
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("reached libvirt: %v", r)
+					}
+				}()
+				_, _, err = c.CreateLiveSnapshot(fwTestVM, "s1", "/nonexistent", nil)
+			}()
+			if !errors.Is(err, refused) {
+				t.Fatalf("err = %v, want the %s refusal before any libvirt call", err, only)
+			}
+		})
 	}
 }

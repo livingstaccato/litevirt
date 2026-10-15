@@ -178,12 +178,49 @@ func TestFwmigWire_Lookup(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Lookup("vm9", ""); err == nil {
-		t.Fatal("corrupt marker read by name without an error")
+	for name, id := range map[string]string{"vm9": "", "": "0b5c44a3-6f7e-4a55-8a09-3c8d8f0f6a21"} {
+		_, err := r.Lookup(name, id)
+		var ue *UnreadableRecordError
+		if !errors.As(err, &ue) || ue.Path != bad {
+			t.Fatalf("Lookup(%q, %q): %v, want an UnreadableRecordError naming %s", name, id, err, bad)
+		}
 	}
-	if _, err := r.Lookup("", "0b5c44a3-6f7e-4a55-8a09-3c8d8f0f6a21"); err == nil {
-		t.Fatal("corrupt marker skipped by a uuid scan")
+	if got := r.Unreadable(); len(got) != 1 || got[0].Path != bad {
+		t.Fatalf("Unreadable() = %+v, want %s", got, bad)
 	}
+}
+
+// The guard's lookup only reads: it sweeps no temp file (review m-1), so a
+// guard check never takes the records' write lock nor deletes anything.
+//
+// Mutation: scan by uuid through ListMarkers — red.
+func TestFwmigWire_LookupDoesNotSweep(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+	tmp := filepath.Join(dir, InflightDir, "vm1.json.tmp-12345")
+	if err := os.MkdirAll(filepath.Dir(tmp), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Lookup(wireVM, wireUUID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		t.Fatalf("the lookup swept a temp file: %v", err)
+	}
+}
+
+// Wire refuses a store with no data dir, where every guarded call would be
+// refused at runtime (review m-2).
+func TestFwmigWire_PanicsWithoutDataDir(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Wire took a store with no data dir")
+		}
+	}()
+	Wire(&recordingVirt{}, &lv.FirmwareStore{SwtpmBase: t.TempDir()})
 }
 
 // A corrupt record is a record present: through Wire every op on the VM is
@@ -204,8 +241,8 @@ func TestFwmigWire_UnreadableRecordRefuses(t *testing.T) {
 		{Op: lv.OpResume, Name: wireVM, UUID: wireUUID, Attempt: wireAttempt, Via: lv.ViaResumeFirmwareMoveTarget},
 		{Op: lv.OpStop, Name: wireVM, UUID: wireUUID, Attempt: wireAttempt, Via: lv.ViaDiscardFirmwareMoveTarget},
 	} {
-		if err := virt.g.Check(c); !errors.Is(err, lv.ErrFirmwareMoveInFlight) {
-			t.Errorf("%+v: %v, want refused", c, err)
+		if err := virt.g.Check(c); !errors.Is(err, lv.ErrFirmwareMoveRecordUnreadable) {
+			t.Errorf("%+v: %v, want refused for the unreadable record", c, err)
 		}
 	}
 }
@@ -326,6 +363,21 @@ func goFiles(t *testing.T, dir string) []string {
 	return out
 }
 
+func allGoFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".go") {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out
+}
+
 func findCalls(calls []astCall, recv, sel string) []astCall {
 	var out []astCall
 	for _, c := range calls {
@@ -414,6 +466,12 @@ func TestFwmigWire_DaemonSharesOneStore(t *testing.T) {
 func TestFwmigWire_DaemonAndFleetUseSameHelper(t *testing.T) {
 	dcalls, _ := parseCalls(t, goFiles(t, "../daemon")...)
 	fcalls, _ := parseCalls(t, "../../tests/fleet/cluster.go")
+	// Every fleet file, the tests included (review m-7): no scenario
+	// installs a guard of its own over the one Wire gave its node.
+	allFleet, _ := parseCalls(t, allGoFiles(t, "../../tests/fleet")...)
+	if sg := findCalls(allFleet, "", "SetFirmwareMoveGuard"); len(sg) != 0 {
+		t.Errorf("a fleet file installs a firmware move guard outside fwmig.Wire: %+v", sg)
+	}
 	for name, calls := range map[string][]astCall{"daemon": dcalls, "fleet": fcalls} {
 		if n := len(findCalls(calls, "fwmig", "Wire")); n != 1 {
 			t.Errorf("%s calls fwmig.Wire %d times, want once", name, n)

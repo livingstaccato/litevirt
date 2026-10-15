@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -409,7 +410,7 @@ func (r *Reconciler) SetFirmwareStore(fw *lv.FirmwareStore) {
 	if fw == nil {
 		return
 	}
-	if fw.DataDir != r.dataDir {
+	if filepath.Clean(fw.DataDir) != filepath.Clean(r.dataDir) {
 		panic(fmt.Sprintf("health: firmware store data dir %q is not the reconciler's %q", fw.DataDir, r.dataDir))
 	}
 	r.fwStore = fw

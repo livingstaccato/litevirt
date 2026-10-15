@@ -3,6 +3,7 @@ package libvirt
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -26,6 +27,34 @@ var ErrFirmwareMoveInFlight = errors.New("live firmware migration in flight")
 // ErrFirmwareMoveNoRecord: an exempt entry point was called for a VM no record
 // names. An exempt entry point acts only for the move a record describes.
 var ErrFirmwareMoveNoRecord = errors.New("no live firmware migration record")
+
+// ErrFirmwareMoveRecordUnreadable: a firmware move record on this host cannot
+// be read, so the guard cannot tell whether it names the VM, and refuses. It
+// names no move in flight: the refusal carries the file
+// (*FirmwareRecordUnreadableError) and what to do about it.
+var ErrFirmwareMoveRecordUnreadable = errors.New("firmware move record unreadable")
+
+// IsFirmwareMoveRefusal reports whether err is a refusal of the firmware move
+// guard: a record names the VM, or a record cannot be read.
+func IsFirmwareMoveRefusal(err error) bool {
+	return errors.Is(err, ErrFirmwareMoveInFlight) || errors.Is(err, ErrFirmwareMoveRecordUnreadable)
+}
+
+// FirmwareRecordUnreadableError is a firmware move record file (or record
+// directory) that cannot be read. A FirmwareMoveLookup returns it; the guard
+// refuses on it, naming the file and the remedy.
+type FirmwareRecordUnreadableError struct {
+	Path string
+	Err  error
+}
+
+func (e *FirmwareRecordUnreadableError) Error() string {
+	return fmt.Sprintf("firmware move record %s cannot be read (%v); until it is repaired, or moved out of %s once no "+
+		"firmware move on this host needs it, every operation it might name is refused here, and the condition "+
+		"firmware_migration_record_unreadable names it", e.Path, e.Err, filepath.Dir(e.Path))
+}
+
+func (e *FirmwareRecordUnreadableError) Unwrap() error { return e.Err }
 
 // FirmwareOp is a class of guarded operation (spec §5.1 table rows).
 type FirmwareOp string
@@ -58,6 +87,7 @@ const (
 	ViaRemoveFirmwareMoveTargetState     FirmwareExemption = "RemoveFirmwareMoveTargetState"
 	ViaQuarantineFirmwareMoveTargetState FirmwareExemption = "QuarantineFirmwareMoveTargetState"
 	ViaStopFirmwareMoveTargetForOperator FirmwareExemption = "StopFirmwareMoveTargetForOperator"
+	ViaPushSourceNvramForOperator        FirmwareExemption = "PushSourceNvramForOperator"
 )
 
 // FirmwareCall is one guarded call.
@@ -81,6 +111,7 @@ const (
 // pin that they agree.
 const (
 	FirmwarePhaseCleaning           = "cleaning"
+	FirmwarePhaseSourcePaused       = "source_paused"
 	FirmwareHoldPrepared            = "prepared"
 	FirmwareHoldVerified            = "verified"
 	FirmwareHoldResuming            = "resuming"
@@ -133,13 +164,18 @@ func checkFirmwareCall(lookup FirmwareMoveLookup, c FirmwareCall) error {
 		who = "uuid " + c.UUID
 	}
 	if lookup == nil {
-		return fmt.Errorf("%w: VM %s: no firmware move records to check, so %s is refused", ErrFirmwareMoveInFlight, who, c.Op)
+		return fmt.Errorf("%w: %s of %s refused: no firmware move records to check", ErrFirmwareMoveRecordUnreadable, c.Op, who)
 	}
 	var recs []FirmwareMoveRecord
 	if c.Name != "" || c.UUID != "" {
 		var err error
 		if recs, err = lookup(c.Name, c.UUID); err != nil {
-			return fmt.Errorf("%w: VM %s: a live firmware migration record cannot be read, so %s is refused: %v", ErrFirmwareMoveInFlight, who, c.Op, err)
+			// Not "in flight": the record may be any VM's. Name the file.
+			var ue *FirmwareRecordUnreadableError
+			if errors.As(err, &ue) {
+				return fmt.Errorf("%w: %s of %s refused: %w", ErrFirmwareMoveRecordUnreadable, c.Op, who, ue)
+			}
+			return fmt.Errorf("%w: %s of %s refused: the firmware move records on this host cannot be read: %w", ErrFirmwareMoveRecordUnreadable, c.Op, who, err)
 		}
 	}
 	if len(recs) == 0 {
@@ -186,7 +222,9 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 	marker, hold := r.Kind == FirmwareMarker, r.Kind == FirmwareHold
 	switch c.Via {
 	case ViaResumeFirmwareMoveSource:
-		return marker && c.Op == OpResume && bound && r.PreCutover
+		// §7 M1p before cutover; and §17 D-5 --accept-source from
+		// source_paused (spec §5.y), which the pauser's rule excludes.
+		return marker && c.Op == OpResume && bound && (r.PreCutover || r.State == FirmwarePhaseSourcePaused)
 	case ViaResumePartitionPaused:
 		// The partition pauser knows the domain's uuid, not the attempt.
 		return marker && c.Op == OpResume && sameUUID(r.UUID, c.UUID) && r.PreCutover
@@ -207,7 +245,17 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 	case ViaQuarantineFirmwareMoveTargetState:
 		return hold && c.Op == OpWipe && bound && heldPaused(r.State)
 	case ViaStopFirmwareMoveTargetForOperator:
-		return hold && c.Op == OpStop && bound && r.State == FirmwareHoldReleasedUnconfirmed
+		// D-5: --stop-target while the hold is prepared, verified or
+		// resuming (spec §5.y), and the stop of a released_unconfirmed guest.
+		switch r.State {
+		case FirmwareHoldPrepared, FirmwareHoldVerified, FirmwareHoldResuming, FirmwareHoldReleasedUnconfirmed:
+			return hold && c.Op == OpStop && bound
+		}
+		return false
+	case ViaPushSourceNvramForOperator:
+		// D-5 --push-source-nvram while the hold is released_unconfirmed
+		// (spec §5.y).
+		return hold && c.Op == OpWriteState && bound && r.State == FirmwareHoldReleasedUnconfirmed
 	}
 	return false
 }
@@ -475,9 +523,10 @@ func undefineFirmwareMoveLeftover(v snapshotAPI, fg FirmwareMoveGuard, name, uui
 	return nil
 }
 
-// StopFirmwareMoveTargetForOperator stops a target guest whose hold is
-// released_unconfirmed, for an operator's D-5 action: destroy when force,
-// else an ACPI shutdown.
+// StopFirmwareMoveTargetForOperator stops a held target guest for an
+// operator's D-5 action (--stop-target, spec §5.y): the hold is prepared,
+// verified, resuming or released_unconfirmed. Destroy when force, else an
+// ACPI shutdown.
 func (c *Client) StopFirmwareMoveTargetForOperator(name, uuid, attempt string, force bool) error {
 	return stopFirmwareMoveTargetForOperator(c.virt, c.firmwareGuard(), name, uuid, attempt, force)
 }

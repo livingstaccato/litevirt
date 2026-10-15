@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/diskmode"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -47,6 +49,33 @@ type FirmwareStore struct {
 	// guard is the firmware move guard (spec §5.1): every write and wipe of
 	// the state asks it first. Installed by fwmig.Wire; none = allow.
 	guard atomic.Pointer[FirmwareMoveGuard]
+
+	// refused holds the best-effort wipes a record that cannot be read
+	// refused, until TakeRefusedWipes collects them to report: a wipe that
+	// silently did nothing would leak the state.
+	refusedMu sync.Mutex
+	refused   []RefusedWipe
+}
+
+// RefusedWipe is a best-effort wipe the firmware move guard refused because a
+// record could not be read: the state it was to remove is still on disk.
+type RefusedWipe struct {
+	VM, UUID string
+	At       time.Time
+	Err      error
+}
+
+// maxRefusedWipes bounds what the store keeps between two collections.
+const maxRefusedWipes = 64
+
+// TakeRefusedWipes returns, and forgets, the wipes refused for an unreadable
+// record since the last call (the oldest dropped past maxRefusedWipes).
+func (f *FirmwareStore) TakeRefusedWipes() []RefusedWipe {
+	f.refusedMu.Lock()
+	defer f.refusedMu.Unlock()
+	out := f.refused
+	f.refused = nil
+	return out
 }
 
 // SetFirmwareMoveGuard installs the firmware move guard every state write
@@ -426,13 +455,26 @@ func (f *FirmwareStore) WipeFirmwareState(vmName, uuid string) {
 	f.wipeByUUID(uuid)
 }
 
-// wipeRefused asks the guard about a best-effort wipe and logs a refusal.
+// wipeRefused asks the guard about a best-effort wipe and logs a refusal. A
+// refusal for an unreadable record is also kept for TakeRefusedWipes, so it
+// is reported (the daemon raises it with the unreadable record), not only
+// logged; a refusal for a record that names the VM is the guard doing its
+// job.
 func (f *FirmwareStore) wipeRefused(c FirmwareCall) bool {
 	err := f.moveGuard().check(c)
-	if err != nil {
-		slog.Warn("firmware state wipe refused", "vm", c.Name, "uuid", c.UUID, "error", err)
+	if err == nil {
+		return false
 	}
-	return err != nil
+	slog.Warn("firmware state wipe refused", "vm", c.Name, "uuid", c.UUID, "error", err)
+	if errors.Is(err, ErrFirmwareMoveRecordUnreadable) {
+		f.refusedMu.Lock()
+		f.refused = append(f.refused, RefusedWipe{VM: c.Name, UUID: c.UUID, At: time.Now(), Err: err})
+		if n := len(f.refused); n > maxRefusedWipes {
+			f.refused = append([]RefusedWipe(nil), f.refused[n-maxRefusedWipes:]...)
+		}
+		f.refusedMu.Unlock()
+	}
+	return true
 }
 
 // WipeNameKeyedFirmwareState removes only the artifacts keyed by the VM's NAME.
@@ -476,18 +518,31 @@ func (f *FirmwareStore) wipeByUUID(uuid string) {
 
 // WipeFirmwareMoveSource wipes a moved VM's source state (spec §6.7 step 4):
 // the marker is the attempt's, in phase cleaning, with its retained bundle on
-// disk.
+// disk. Unlike the best-effort wipes it reports a removal that failed, so
+// cleanup does not drop the marker over state still on disk.
 func (f *FirmwareStore) WipeFirmwareMoveSource(vmName, uuid, attempt string) error {
 	if err := f.moveGuard().check(FirmwareCall{Op: OpWipe, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaWipeFirmwareMoveSource}); err != nil {
 		return fmt.Errorf("wipe source firmware state of %s: %w", vmName, err)
 	}
-	f.wipeNameKeyed(vmName)
-	f.wipeByUUID(uuid)
+	dir, ok := f.swtpmDir(uuid)
+	if !ok {
+		return fmt.Errorf("wipe source firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
+	}
+	for _, p := range []string{f.NvramPath(vmName), f.retainedMarkerPath(vmName)} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("wipe source firmware state of %s: %w", vmName, err)
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("wipe source firmware state of %s: %w", vmName, err)
+	}
 	return nil
 }
 
 // MaterialiseFirmwareMoveNvram writes the target's NVRAM in Prepare (spec
-// §6.2 item 7): the hold is the attempt's, in state prepared.
+// §6.2 item 7): the hold is the attempt's, in state prepared. It takes the
+// request's raw NVRAM bytes, not a bundle (the Prepare request carries
+// bytes), and writes nothing of the swtpm tree.
 func (f *FirmwareStore) MaterialiseFirmwareMoveNvram(vmName, uuid, attempt string, nvram []byte) error {
 	return f.writeMoveNvram(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaMaterialiseFirmwareMoveNvram}, nvram)
 }
@@ -497,6 +552,13 @@ func (f *FirmwareStore) MaterialiseFirmwareMoveNvram(vmName, uuid, attempt strin
 // resuming.
 func (f *FirmwareStore) PushFirmwareMoveNvram(vmName, uuid, attempt string, nvram []byte) error {
 	return f.writeMoveNvram(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaPushFirmwareMoveNvram}, nvram)
+}
+
+// PushSourceNvramForOperator writes the source's final NVRAM to a target
+// guest that is not running, for the D-5 --push-source-nvram action (spec
+// §5.y): the hold is the attempt's, released_unconfirmed.
+func (f *FirmwareStore) PushSourceNvramForOperator(vmName, uuid, attempt string, nvram []byte) error {
+	return f.writeMoveNvram(FirmwareCall{Op: OpWriteState, Name: vmName, UUID: uuid, Attempt: attempt, Via: ViaPushSourceNvramForOperator}, nvram)
 }
 
 // writeMoveNvram replaces the VM's NVRAM with nvram durably: staged file,
@@ -575,7 +637,14 @@ func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt,
 			return fmt.Errorf("quarantine %s: %w", mv.from, err)
 		}
 	}
-	return fsyncPath(dir)
+	// Durable on both sides: the quarantine dir and its parent hold the
+	// moved entries, the parents of the sources lose them.
+	for _, d := range []string{dir, filepath.Dir(dir), filepath.Dir(f.NvramPath(vmName)), filepath.Dir(swtpm)} {
+		if err := fsyncPath(d); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, d, err)
+		}
+	}
+	return nil
 }
 
 // moveIntoQuarantine renames from to to, or, across filesystems, copies it
@@ -596,6 +665,16 @@ func moveIntoQuarantine(from, to string) error {
 		return err
 	}
 	if err := copyQuarantine(from, to); err != nil {
+		_ = os.RemoveAll(to)
+		return err
+	}
+	// The copied directories are durable before the source goes.
+	if err := filepath.WalkDir(to, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return err
+		}
+		return fsyncPath(p)
+	}); err != nil {
 		_ = os.RemoveAll(to)
 		return err
 	}

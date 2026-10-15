@@ -34,6 +34,14 @@ func TestServer_FirmwareStore(t *testing.T) {
 	if s.fw() != own {
 		t.Fatalf("server uses %+v, not the injected store %+v", s.fw(), own)
 	}
+	// The same directory spelled differently is the same directory (review
+	// m-3): no panic.
+	slash := &lv.FirmwareStore{DataDir: s.dataDir + "/", SwtpmBase: own.SwtpmBase}
+	s.SetFirmwareStore(slash)
+	if s.fw() != slash {
+		t.Fatalf("a store under %q was not taken", slash.DataDir)
+	}
+	s.SetFirmwareStore(own)
 	// nil is ignored: the server keeps the store it has (the reconciler
 	// does the same, TestReconciler_FirmwareStore).
 	s.SetFirmwareStore(nil)

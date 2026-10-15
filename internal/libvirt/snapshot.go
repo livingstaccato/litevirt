@@ -643,7 +643,17 @@ func leafNotCurrent(v snapshotAPI, dom golibvirt.Domain, snap golibvirt.DomainSn
 // captureSuspended, when non-nil, is invoked while the guest is frozen (disks
 // snapshotted, guest paused) so firmware state (NVRAM + swtpm) is captured at the
 // SAME instant as the disk+RAM snapshot — see CreateLiveSnapshot (G1).
+//
+// The capture stops the guest (the RAM save) and starts it again (the
+// restore), so the firmware move guard is asked for both, OpStop and OpStart,
+// before the guest is suspended: a refusal after the save would leave it
+// stopped.
 func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+	for _, op := range []FirmwareOp{OpStop, OpStart} {
+		if err := c.firmwareGuard().check(FirmwareCall{Op: op, Name: domainName}); err != nil {
+			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+		}
+	}
 	dom, err := c.virt.DomainLookupByName(domainName)
 	if err != nil {
 		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)

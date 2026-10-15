@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -528,6 +529,11 @@ type Server struct {
 	// struct-literal Server gets that layout through fw(). Read it through
 	// fw().
 	fwStore *lv.FirmwareStore
+	// fwWipesRefused are the firmware state wipes an unreadable firmware move
+	// record refused, named by firmware_migration_record_unreadable until it
+	// resolves (firmware_records_health.go). Guarded by fwRecordsMu.
+	fwRecordsMu    sync.Mutex
+	fwWipesRefused []lv.RefusedWipe
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
@@ -2466,7 +2472,7 @@ func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) {
 	if fw == nil {
 		return
 	}
-	if fw.DataDir != s.dataDir {
+	if filepath.Clean(fw.DataDir) != filepath.Clean(s.dataDir) {
 		panic(fmt.Sprintf("grpcapi: firmware store data dir %q is not the server's %q", fw.DataDir, s.dataDir))
 	}
 	s.fwStore = fw

@@ -2197,6 +2197,13 @@ func (f *Fake) FlattenSnapshot(domainName, snapshotName string) error {
 }
 
 func (f *Fake) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string, captureSuspended func() error) (diskBytes, vmstateBytes int64, err error) {
+	// As libvirt.Client: the capture stops and restarts the guest, so both
+	// are asked before anything is done.
+	for _, op := range []libvirt.FirmwareOp{libvirt.OpStop, libvirt.OpStart} {
+		if err := f.fwCheck(libvirt.FirmwareCall{Op: op, Name: domainName}); err != nil {
+			return 0, 0, fmt.Errorf("memory snapshot of %q: %w", domainName, err)
+		}
+	}
 	f.mu.Lock()
 	if f.snapshots[domainName] == nil {
 		f.snapshots[domainName] = map[string]struct{}{}

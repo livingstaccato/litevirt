@@ -413,7 +413,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	domXML, err := lv.GenerateDomainXML(cfg)
 	if err != nil {
 		cleanupDisks()
-		return status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return renderStatus("generate domain XML", err)
 	}
 
 	// Conditional orphan guard: never undefine a RUNNING same-name domain that

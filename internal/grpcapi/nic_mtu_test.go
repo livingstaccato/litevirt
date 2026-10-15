@@ -165,7 +165,7 @@ func TestCreateVM_NICMTUMustEqualItsBridge(t *testing.T) {
 	for name, mtu := range map[string]int32{"larger": 9000, "smaller": 1400} {
 		_, err := s.CreateVM(adminCtx(), mtuCreate(name, mtu))
 		want := "does not match bridge lo MTU 1500 on host test-host (a guest MTU must equal its bridge's)"
-		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "NIC 0 MTU") {
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "NIC 0 MTU") {
 			t.Errorf("%s: err = %v, want %q", name, err, want)
 		}
 		if x := fake.DefinedXML(name); x != "" {

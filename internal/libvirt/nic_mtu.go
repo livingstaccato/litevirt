@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -31,6 +32,23 @@ func ReadBridgeMTU(bridge string) (int, error) {
 // into are this host's.
 func (c *Client) BridgeMTU(bridge string) (int, error) { return ReadBridgeMTU(bridge) }
 
+// NICMTUError is a NIC MTU this host cannot carry: an explicit MTU its bridge
+// does not equal, a bridge whose MTU cannot be read, or a NIC that takes no
+// MTU. It is the operator's to fix, never an internal failure.
+type NICMTUError struct{ msg string }
+
+func (e *NICMTUError) Error() string { return e.msg }
+
+func nicMTUError(format string, args ...any) error {
+	return &NICMTUError{msg: fmt.Sprintf(format, args...)}
+}
+
+// IsNICMTUError reports whether err is, or wraps, a NICMTUError.
+func IsNICMTUError(err error) bool {
+	var e *NICMTUError
+	return errors.As(err, &e)
+}
+
 // NICMTUMismatch is the refusal for a NIC whose MTU is not its bridge's.
 func NICMTUMismatch(nic, mtu int, bridge string, bridgeMTU int, host string) string {
 	return fmt.Sprintf("NIC %d MTU %d does not match bridge %s MTU %d on host %s (a guest MTU must equal its bridge's)",
@@ -47,13 +65,13 @@ func ResolveNICMTU(nic, mtu int, bridge string, read func(string) (int, error), 
 	}
 	got, err := read(bridge)
 	if err != nil {
-		return 0, fmt.Errorf("NIC %d: read the MTU of bridge %s on host %s: %w", nic, bridge, host, err)
+		return 0, nicMTUError("NIC %d: read the MTU of bridge %s on host %s: %v", nic, bridge, host, err)
 	}
 	if mtu == NICMTUFromBridge {
 		return got, nil
 	}
 	if mtu != got {
-		return 0, fmt.Errorf("%s", NICMTUMismatch(nic, mtu, bridge, got, host))
+		return 0, nicMTUError("%s", NICMTUMismatch(nic, mtu, bridge, got, host))
 	}
 	return mtu, nil
 }
@@ -64,10 +82,10 @@ func nicMTUElement(cfg VMConfig, i int, n NetworkConfig, model string) (*ifaceMT
 		return nil, nil
 	}
 	if n.Direct != "" {
-		return nil, fmt.Errorf("NIC %d: an MTU needs a bridged network (macvtap and SR-IOV networks are not supported)", i)
+		return nil, nicMTUError("NIC %d: an MTU needs a bridged network (macvtap and SR-IOV networks are not supported)", i)
 	}
 	if model != "virtio" {
-		return nil, fmt.Errorf("NIC %d: an MTU needs the virtio model (this NIC is %s)", i, model)
+		return nil, nicMTUError("NIC %d: an MTU needs the virtio model (this NIC is %s)", i, model)
 	}
 	m, err := ResolveNICMTU(i, n.MTU, n.Bridge, cfg.BridgeMTU, cfg.HostName)
 	if err != nil {

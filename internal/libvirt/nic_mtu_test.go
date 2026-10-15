@@ -123,3 +123,25 @@ func TestPatchInactiveNICMTU(t *testing.T) {
 		t.Errorf("replace in libvirt form: err=%v\n%s", err, x)
 	}
 }
+
+// Every refusal of a NIC MTU is typed, so a caller can tell an operator's
+// configuration from an internal failure.
+//
+// Mutation: return a plain error for the mismatch — red.
+func TestNICMTUError_IsTyped(t *testing.T) {
+	read := bridges(map[string]int{"br-j": 9000})
+	for name, n := range map[string]NetworkConfig{
+		"mismatch":   {Bridge: "br-j", Model: "virtio", MTU: 1500},
+		"unreadable": {Bridge: "br-gone", Model: "virtio", MTU: 1},
+		"direct":     {Direct: "bond0", Model: "virtio", MTU: 9000},
+		"e1000":      {Bridge: "br-j", Model: "e1000", MTU: 9000},
+	} {
+		_, err := GenerateDomainXML(VMConfig{Name: "t", CPU: 1, MemoryMiB: 256, Networks: []NetworkConfig{n}, BridgeMTU: read})
+		if err == nil || !IsNICMTUError(err) {
+			t.Errorf("%s: err = %v, want a NICMTUError", name, err)
+		}
+	}
+	if IsNICMTUError(errors.New("x")) {
+		t.Error("a plain error is a NICMTUError")
+	}
+}

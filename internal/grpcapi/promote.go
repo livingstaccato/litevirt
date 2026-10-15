@@ -1647,7 +1647,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
 		}
 		stage, err := attempt(diskCfg)
-		if err != nil && len(diskCfg) > 1 && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
+		// A NIC MTU this host cannot carry is not the other disks' doing.
+		if err != nil && len(diskCfg) > 1 && !lv.IsNICMTUError(err) && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
 			// The other disks may be why: the root alone is what main
 			// promoted, so that is tried before giving up — never a fall back
 			// to a reschedule where main's promotion would have succeeded.
@@ -1687,6 +1688,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Internal, "record promote marker: %v", err)
 			case "operator claim", "shared disk released":
 				return err
+			case "generate domain XML":
+				return renderStatus(stage, err)
 			default:
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}

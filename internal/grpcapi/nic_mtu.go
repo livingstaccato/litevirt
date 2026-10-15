@@ -132,6 +132,17 @@ func (s *Server) restrictRestoredNICMTU(ctx context.Context, spec *pb.VMSpec) re
 	return r
 }
 
+// renderStatus is the status of a failed domain render: a NIC MTU this host
+// cannot carry is the operator's to fix (FailedPrecondition, the renderer's
+// own words); anything else is Internal.
+func renderStatus(what string, err error) error {
+	code := codes.Internal
+	if lv.IsNICMTUError(err) {
+		code = codes.FailedPrecondition
+	}
+	return status.Errorf(code, "%s: %v", what, err)
+}
+
 // bridgeMTUReader reads a bridge's MTU on this host: through the libvirt
 // backend when it answers per node (a test's), else the host's own.
 func (s *Server) bridgeMTUReader() func(string) (int, error) {

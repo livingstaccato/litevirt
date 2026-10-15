@@ -633,7 +633,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		cleanup()
-		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return nil, renderStatus("generate domain XML", err)
 	}
 	// The release gates for what the clone's spec carries, immediately before
 	// the domain that holds them is defined; the row is written through the

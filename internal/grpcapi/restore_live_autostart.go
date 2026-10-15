@@ -349,7 +349,7 @@ func (s *Server) autoDefineRestoredVM(
 	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
-		return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return "", "", renderStatus("generate domain XML", err)
 	}
 
 	_ = send(&pb.RestoreLiveProgress{
@@ -373,7 +373,7 @@ func (s *Server) autoDefineRestoredVM(
 			vmCfg.Networks[i].RateMBps = 0
 		}
 		if domXML, err = lv.GenerateDomainXML(vmCfg); err != nil {
-			return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+			return "", "", renderStatus("generate domain XML", err)
 		}
 		limitsG = capabilities.FeatureGrant{}
 	}

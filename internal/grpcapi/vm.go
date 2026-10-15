@@ -1203,7 +1203,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return nil, renderStatus("generate domain XML", err)
 	}
 
 	// Split-brain gate note (Phase 1): CreateVM is DELIBERATELY NOT gated. Unlike
@@ -5996,7 +5996,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		var gerr error
 		domXML, gerr = lv.GenerateDomainXML(vmCfg)
 		if gerr != nil {
-			return nil, status.Errorf(codes.Internal, "generate domain XML: %v", gerr)
+			return nil, renderStatus("generate domain XML", gerr)
 		}
 	}
 

@@ -4,6 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -64,4 +67,23 @@ func importSmallVMStream(t *testing.T, s *Server, st *fakeImportStream, name str
 	st.frames = append(st.frames, &pb.ImportVMRequest{Name: name, SourceFormat: "proxmox",
 		Chunk: []byte(conf), DiskMap: map[string]string{"scsi0": raw}})
 	return s.ImportVM(st)
+}
+
+// An imported MTU its bridge here does not equal refuses the import as an
+// operator error, naming the bridge, and leaves no row.
+func TestImportVM_NICMTUMismatchIsFailedPrecondition(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	fake := libvirtfake.New()
+	fake.SetBridgeMTU("vmbr0", 1500)
+	s.virt = fake
+	s.SetReleaseFeatureGate(newMTUGate(t, true))
+	err := importSmallVMStream(t, s, &fakeImportStream{ctx: adminCtx()}, "imp-mis", "net0: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr0,mtu=9000")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not match bridge vmbr0 MTU 1500") {
+		t.Errorf("import onto a 1500 bridge: %v", err)
+	}
+	if fake.DomainExists("imp-mis") {
+		t.Error("the refused import left a domain")
+	}
 }

@@ -40,7 +40,10 @@ type VMChecker struct {
 	// interface, not *lv.Client, so a test can drive a restart through
 	// libvirtfake; NewVMChecker keeps a nil *lv.Client a nil interface.
 	virt vmCheckBackend
-	bus  *events.Bus
+	// virtWait bounds the restart pass's reads of libvirt: a domain libvirt
+	// has not answered for is skipped, never decided on (domain_gate.go).
+	virtWait virtWait
+	bus      *events.Bus
 	// cancelledStart reports whether this host holds a cancelled start of a
 	// VM (SetCancelledStartProbe); nil: none.
 	cancelledStart func(name, state, detail string) bool
@@ -335,6 +338,12 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			// answered it: its row stays what the cancel wrote, and a
 			// domain libvirt started late is destroyed by the
 			// cancelled-starts sweep, not recorded running or restarted.
+			continue
+		}
+		// A domain libvirt has not answered for is neither healed nor
+		// restarted this pass: both decide from libvirt's answer
+		// (domain_gate.go).
+		if v.virt != nil && !v.virtWait.domainAnswers(v.virt, "vmcheck", vm.Name) {
 			continue
 		}
 		// Reconcile a state desync first: if libvirt actually has the domain

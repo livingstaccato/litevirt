@@ -114,6 +114,10 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// virtWait bounds the walk's and the sweeps' reads of libvirt: a domain
+	// libvirt has not answered for is skipped, never decided on
+	// (domain_gate.go).
+	virtWait virtWait
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
@@ -593,8 +597,11 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil || !spec.Onboot {
 			continue
 		}
-		// Already running (e.g. survived a daemon restart) → leave it.
-		if r.virt.DomainExists(vm.Name) {
+		// Already running (e.g. survived a daemon restart) → leave it. A
+		// domain libvirt has not answered for is not known to run: it is
+		// owed its start, which startPendingVM leaves until libvirt answers
+		// (the onboot retry asks again each pass).
+		if r.domainAnswers(vm.Name) && r.virt.DomainExists(vm.Name) {
 			if st, sErr := r.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				continue
 			}
@@ -748,6 +755,9 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 	}
 	sort.SliceStable(names, func(i, j int) bool { return rank(names[i]) < rank(names[j]) })
 	for _, name := range names {
+		if r.virt != nil && !r.domainAnswers(name) {
+			continue // the duty is kept; asked again next pass
+		}
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
 				r.clearOnbootPending(name) // already up — duty discharged
@@ -816,6 +826,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
+		// A domain libvirt has not answered for is skipped this pass:
+		// every case below asks libvirt about it, and decides from the
+		// answer (domain_gate.go).
+		if r.virt != nil && !r.domainAnswers(vm.Name) {
+			continue
+		}
 		switch vm.State {
 		case "pending":
 			r.startPendingVM(ctx, vm)
@@ -1211,9 +1227,11 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		return
 	}
 
-	localDomains, err := r.virt.ListDomains()
+	localDomains, err := r.listDomainsBounded("reconciler: self-fence")
 	if err != nil {
-		slog.Error("reconciler: list local domains", "error", err)
+		if !errors.Is(err, errLibvirtNoAnswer) {
+			slog.Error("reconciler: list local domains", "error", err)
+		}
 		return
 	}
 
@@ -1436,6 +1454,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// before anything is done for it — no lease, no proof claimed, no
 	// define — and goes first on the next pass (start_deferral.go).
 	if r.deferredBeforeWork(ctx, vm) {
+		return
+	}
+	// A domain libvirt has not answered for is not started, nor anything
+	// else decided about it (domain_gate.go): the walk skips it already;
+	// this holds for the onboot start too.
+	if r.virt != nil && !r.domainAnswers(vm.Name) {
 		return
 	}
 	// Take a per-VM startup lease before doing anything destructive.

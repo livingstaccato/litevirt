@@ -187,11 +187,15 @@ func (c *Client) UndefineDomainPreservingState(name string) error {
 // pm-suspended all collapse to "stopped" here — callers that need to tell those
 // apart (e.g. the restart engine) use DomainStateReason instead.
 func (c *Client) DomainState(name string) (string, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return domainState(c.virt, name)
+}
+
+func domainState(virt *golibvirt.Libvirt, name string) (string, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return "unknown", fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	state, _, err := c.virt.DomainGetState(dom, 0)
+	state, _, err := virt.DomainGetState(dom, 0)
 	if err != nil {
 		return "unknown", fmt.Errorf("get domain state %s: %w", name, err)
 	}
@@ -215,11 +219,15 @@ type DomainStatus struct {
 // normalized Reason from libvirt's virDomainGetState — the reason int that
 // DomainState discards.
 func (c *Client) DomainStateReason(name string) (DomainStatus, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return domainStateReason(c.virt, name)
+}
+
+func domainStateReason(virt *golibvirt.Libvirt, name string) (DomainStatus, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return DomainStatus{State: "unknown", Reason: "unknown"}, fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	state, reason, err := c.virt.DomainGetState(dom, 0)
+	state, reason, err := virt.DomainGetState(dom, 0)
 	if err != nil {
 		return DomainStatus{State: "unknown", Reason: "unknown"}, fmt.Errorf("get domain state %s: %w", name, err)
 	}

@@ -224,6 +224,31 @@ Multiple networks can be attached to a single VM:
         ip: "172.16.0.10"
 ```
 
+### Per-NIC MTU
+
+A VM NIC can carry a guest MTU: `mtu:` on its network entry in compose, or
+`lv update <vm> --nic-mtu <nic>=<MTU|bridge>`.
+
+| Value | Meaning |
+|---|---|
+| unset, `0` | No `<mtu>`: the guest's default |
+| `bridge` | The bridge's MTU, read when the VM is defined on a host, after its networks are set up there |
+| `576`-`65520` | That MTU. The bridge's MTU on the defining host must be the same |
+
+An explicit MTU that is not its bridge's is refused, larger or smaller:
+`NIC <n> MTU <N> does not match bridge <br> MTU <M> on host <h> (a guest MTU must equal its bridge's)`.
+litevirt does not set a bridge's MTU (VXLAN aside), so set it on the host
+first. Keep a network's bridge MTU the same on every host: a migration to a host
+whose bridge differs is refused before anything moves, and a failover start
+there fails.
+
+Only virtio NICs on a bridged network take an MTU; macvtap (direct) and SR-IOV
+networks do not. `lv attach-nic` takes no MTU: attach the NIC, then set it with
+`lv update <vm> --nic-mtu <nic>=<MTU>` (the VM stopped, or
+`--restart-if-needed`), which also records the hot-attached NIC in the VM's
+spec. The MTU is accepted once the release token has latched (feature
+`nic_mtu`).
+
 ## Container network attachment
 
 Containers attach to the same logical networks as VMs and reach parity on the

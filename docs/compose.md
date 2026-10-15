@@ -559,6 +559,7 @@ is not bounded (libvirt's `group_name` is not supported).
         gateway: "10.0.1.1"
         security-groups: ["web"]    # Per-NIC firewall (see "Firewall" below)
         queues: 4                   # virtio-net multiqueue (1-64, or auto)
+        mtu: 9000                   # guest MTU (576-65520, or bridge); must equal the bridge's
         rate: 12.5                  # Bandwidth cap in MB/s, both directions (0/unset = unlimited). Live
         # NIC guard (anti-spoofing, docs/firewall.md "NIC guards"). A new NIC
         # is guarded by default; anything below but the default needs
@@ -600,6 +601,14 @@ restart: the deploy reconfigures and restarts the same VM, disks kept. An unset
 multiqueue off: write `queues: 1`. `queues: auto` is resolved from `cpu:` when the file
 is read, so changing `cpu:` in the file changes the queue count with it (which makes a
 vCPU grow a restart), and `lv update --cpu` never re-resolves it; write a number to pin it.
+
+`mtu:` sets the guest NIC's MTU (`<mtu size='N'/>`); see
+[networking](networking.md#per-nic-mtu). `mtu: bridge` takes the bridge's own MTU
+when the VM is defined. An explicit value must equal the bridge's MTU on the host
+that defines the VM, or the create, start or migration is refused. Virtio NICs on
+a bridged network of a VM only. A change needs a restart, as `queues:` does, and an
+unset `mtu:` inherits what the VM has: write `mtu: 0` to remove it. It is accepted
+once the release token has latched (feature `nic_mtu`), as the tuning above is.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

@@ -1244,6 +1244,9 @@ lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
 lv detach-pci <vm> <pci-address>
 ```
 
+`lv attach-nic` sets no MTU. Give an attached NIC one with
+`lv update <vm> --nic-mtu <nic>=<MTU|bridge>` ([networking](networking.md#per-nic-mtu)).
+
 `lv detach-disk` removes the disk from the VM but **keeps its file**, on the
 host the VM was running on when it was detached. A migration does not move a
 detached disk: it stays on that host. The file is freed when the VM is deleted

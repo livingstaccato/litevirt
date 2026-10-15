@@ -9,7 +9,6 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -197,9 +196,9 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 		ID: randid.New(), SGID: sg.ID, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority),
 	}
-	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
-	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertSGRuleWithGrant(ctx, s.db, g, row)
+	need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "add security group rule")
 	}

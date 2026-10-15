@@ -124,8 +124,17 @@ var releaseFeatures = map[Feature]FeatureInfo{
 
 	// The firewall extras.
 	FeatureFirewallSynflood:  {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)"},
-	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy"},
-	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses"},
+	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
+	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallRuleWriters},
+}
+
+// firewallRuleWriters write the three rule tables. Each takes one grant per
+// feature a row can need (firewall_ipv6, firewall_log, firewall_tag_groups)
+// and checks each the row needs.
+var firewallRuleWriters = []string{
+	"internal/corrosion.InsertSGRuleWithGrant",
+	"internal/corrosion.InsertClusterFirewallRuleWithGrant",
+	"internal/corrosion.InsertHostFirewallRuleWithGrant",
 }
 
 // containerReplicationWriters write container_replication's data: a container's

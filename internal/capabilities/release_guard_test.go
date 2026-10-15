@@ -232,13 +232,19 @@ func f() {
 var writersPending = map[Feature]bool{
 	FeatureHADisarm: true,
 
-	FeatureFirewallSynflood:  true,
-	FeatureFirewallLog:       true,
-	FeatureFirewallTagGroups: true,
+	FeatureFirewallSynflood: true,
 }
 
+// TestReleaseFeatureWriters_TakeAGrant: a writer listed under several
+// features (review I-4) must Check each of them; one Check on any grant does
+// not cover the others.
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 	root := filepath.Join("..", "..")
+	consts, err := featureConstants(filepath.Join(root, "internal", "capabilities"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listedUnder := map[string][]Feature{}
 	for _, f := range Features() {
 		info, _ := LookupFeature(f)
 		switch {
@@ -248,9 +254,12 @@ func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 			t.Errorf("feature %q lists no writer of its data", f)
 		}
 		for _, w := range info.Writers {
-			if err := writerTakesGrant(root, w); err != nil {
-				t.Errorf("feature %q writer %s: %v", f, w, err)
-			}
+			listedUnder[w] = append(listedUnder[w], f)
+		}
+	}
+	for w, fs := range listedUnder {
+		if err := writerTakesGrant(root, w, fs, consts); err != nil {
+			t.Errorf("features %v writer %s: %v", fs, w, err)
 		}
 	}
 }
@@ -422,31 +431,58 @@ func Bad(n int) error { return nil }
 func NoCheck(g capabilities.FeatureGrant) error { return nil }
 type T struct{}
 func (T) Method(ctx int, g capabilities.FeatureGrant) error { return g.Check("widgets") }
+func Both(g, h capabilities.FeatureGrant) error {
+	if err := g.Check("widgets"); err != nil {
+		return err
+	}
+	return h.Check(capabilities.FeatureGadgets)
+}
+func OnlyOne(g, h capabilities.FeatureGrant) error { return g.Check("widgets") }
+func Crossed(g capabilities.FeatureGrant) error { return g.Check(capabilities.FeatureGadgets) }
 `
 	if err := os.WriteFile(filepath.Join(pkg, "x.go"), []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writerTakesGrant(dir, "internal/x.Good"); err != nil {
+	widgets := []Feature{"widgets"}
+	consts := map[string]Feature{"FeatureWidgets": "widgets", "FeatureGadgets": "gadgets"}
+	if err := writerTakesGrant(dir, "internal/x.Good", widgets, consts); err != nil {
 		t.Errorf("Good: %v", err)
 	}
-	if err := writerTakesGrant(dir, "internal/x.T.Method"); err != nil {
+	if err := writerTakesGrant(dir, "internal/x.T.Method", widgets, consts); err != nil {
 		t.Errorf("T.Method: %v", err)
 	}
-	if writerTakesGrant(dir, "internal/x.Bad") == nil {
+	if writerTakesGrant(dir, "internal/x.Bad", widgets, consts) == nil {
 		t.Error("Bad takes no grant, and passed")
 	}
-	if writerTakesGrant(dir, "internal/x.NoCheck") == nil {
+	if writerTakesGrant(dir, "internal/x.NoCheck", widgets, consts) == nil {
 		t.Error("NoCheck takes a grant and never checks it, and passed")
 	}
-	if writerTakesGrant(dir, "internal/x.Missing") == nil {
+	if writerTakesGrant(dir, "internal/x.Missing", widgets, consts) == nil {
 		t.Error("a writer that does not exist passed")
+	}
+	// A writer listed under two features must Check both (review I-4).
+	both := []Feature{"widgets", "gadgets"}
+	if err := writerTakesGrant(dir, "internal/x.Both", both, consts); err != nil {
+		t.Errorf("Both: %v", err)
+	}
+	if writerTakesGrant(dir, "internal/x.OnlyOne", both, consts) == nil {
+		t.Error("OnlyOne is listed under widgets and gadgets and checks only widgets, and passed")
+	}
+	if err := writerTakesGrant(dir, "internal/x.OnlyOne", widgets, consts); err != nil {
+		t.Errorf("OnlyOne listed under widgets alone: %v", err)
+	}
+	if writerTakesGrant(dir, "internal/x.Crossed", widgets, consts) == nil {
+		t.Error("Crossed is listed under widgets and checks only gadgets, and passed")
 	}
 }
 
 // writerTakesGrant finds writer — "<package dir>.<Func>" or
 // "<package dir>.<Type>.<Method>" — under root and checks it has a parameter of
-// type FeatureGrant (capabilities.FeatureGrant, or FeatureGrant in-package).
-func writerTakesGrant(root, writer string) error {
+// type FeatureGrant (capabilities.FeatureGrant, or FeatureGrant in-package)
+// and, for each of features (those it is listed under), calls Check with that
+// feature on one of its grant parameters. consts maps each Feature constant's
+// name to its value, so a Check(capabilities.FeatureX) argument resolves.
+func writerTakesGrant(root, writer string, features []Feature, consts map[string]Feature) error {
 	dot := strings.Index(writer, ".")
 	if dot < 0 {
 		return fmt.Errorf("malformed writer %q", writer)
@@ -474,18 +510,27 @@ func writerTakesGrant(root, writer string) error {
 			if !ok || fd.Name.Name != fn || recvName(fd) != recv {
 				continue
 			}
+			var grants []string
 			for _, field := range fd.Type.Params.List {
-				if !isGrantType(field.Type) {
-					continue
-				}
-				for _, pn := range field.Names {
-					if callsCheckOn(fd.Body, pn.Name) {
-						return nil
+				if isGrantType(field.Type) {
+					for _, pn := range field.Names {
+						grants = append(grants, pn.Name)
 					}
 				}
+			}
+			if len(grants) == 0 {
+				return fmt.Errorf("%s takes no capabilities.FeatureGrant", writer)
+			}
+			checked := checkedFeatures(fd.Body, grants, consts)
+			if len(checked) == 0 {
 				return fmt.Errorf("%s takes a capabilities.FeatureGrant but never calls its Check", writer)
 			}
-			return fmt.Errorf("%s takes no capabilities.FeatureGrant", writer)
+			for _, feat := range features {
+				if !checked[feat] {
+					return fmt.Errorf("%s is listed under %q but never calls Check(%q) on one of its grants", writer, feat, feat)
+				}
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("%s not found", writer)
@@ -515,24 +560,46 @@ func isGrantType(e ast.Expr) bool {
 	return false
 }
 
-// callsCheckOn reports whether body calls <param>.Check(...).
-func callsCheckOn(body *ast.BlockStmt, param string) bool {
+// checkedFeatures returns the features body passes to <grant>.Check(...) for
+// any of grants. An argument resolves through consts (capabilities.FeatureX
+// or an in-package FeatureX) or is a string literal; any other argument
+// counts as a Check of the empty feature, which no listing names.
+func checkedFeatures(body *ast.BlockStmt, grants []string, consts map[string]Feature) map[Feature]bool {
+	out := map[Feature]bool{}
 	if body == nil {
-		return false
+		return out
 	}
-	found := false
+	isGrant := map[string]bool{}
+	for _, g := range grants {
+		isGrant[g] = true
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && sel.Sel.Name == "Check" {
-			if id, ok := sel.X.(*ast.Ident); ok && id.Name == param {
-				found = true
+		if !ok || sel.Sel.Name != "Check" {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); !ok || !isGrant[id.Name] {
+			return true
+		}
+		var feat Feature
+		if len(call.Args) == 1 {
+			switch a := call.Args[0].(type) {
+			case *ast.SelectorExpr:
+				feat = consts[a.Sel.Name]
+			case *ast.Ident:
+				feat = consts[a.Name]
+			case *ast.BasicLit:
+				if v, err := strconv.Unquote(a.Value); err == nil {
+					feat = Feature(v)
+				}
 			}
 		}
-		return !found
+		out[feat] = true
+		return true
 	})
-	return found
+	return out
 }

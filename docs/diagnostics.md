@@ -2480,3 +2480,17 @@ The three-pass threshold is deliberately per-process state held by the lease
 holder: a daemon restart or a lease handover re-arms it, and three fresh passes
 re-raise the finding. Forgetting is the safe direction for a warning whose whole
 claim is "this has been stuck for a while".
+
+## Cluster HA disarm conditions
+
+`lv cluster ha` disarms and arms automatic fencing and recovery
+([migration-failover.md](migration-failover.md#disarming-ha-for-planned-maintenance)).
+Each condition below is written by the host it is about (subject
+`host/<name>`), and appears in `lv health`.
+
+| Code | Severity | Raised when | Clears when |
+|---|---|---|---|
+| `ha_disarmed` | warning | This host's replica holds a disarm. The evidence names who set it, when and why. | The host's replica holds an arm. |
+| `ha_policy_unreadable` | critical | This host holds an HA policy row it cannot read, or its in-memory copy of the policy has failed to load for five seconds (`HA cache load failing on <host>: <err>`). Its failover coordinator decides nothing, and its health-probe answer holds every other coordinator back. Set the policy again with `lv cluster ha arm` or `disarm`, or fix the host's store. | The row reads again. |
+| `ha_disarm_peer_veto` | warning | The failover lease holder's own replica says armed, and a live voter's answer held a fence or a recovery back. The evidence names each voter and the rule: `disarmed` (it holds a disarm not older than this host's row), `stale` (its answer's probe was sent more than 20 s ago), or `unknown` (it has not loaded the policy). A disarm the lease holder has not received yet looks like this. Fewer than a majority of voters live is an ordinary loss of quorum, counted as `no_quorum`, and does not raise it. | A cycle passes in which no live voter vetoes. |
+

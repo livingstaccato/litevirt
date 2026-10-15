@@ -106,6 +106,14 @@ func TestProtoNumbers_OpsBundle(t *testing.T) {
 		{&pb.HAPolicyStatus{}, 6, "would_be_fenced"},
 		{&pb.HAPolicyStatus{}, 7, "first_use_paid"},
 		{&pb.HAPolicyStatus{}, 8, "regions"},
+		{&pb.HAVoterAnswer{}, 1, "host"},
+		{&pb.HAVoterAnswer{}, 2, "ha_known"},
+		{&pb.HAVoterAnswer{}, 3, "ha_disarmed"},
+		{&pb.HAVoterAnswer{}, 4, "ha_policy_at"},
+		{&pb.HAVoterAnswer{}, 5, "confirmed"},
+		{&pb.HAVoterAnswer{}, 6, "status"},
+		{&pb.HARegionConfirmation{}, 1, "region"},
+		{&pb.HARegionConfirmation{}, 2, "confirmed"},
 	}
 	for _, f := range fields {
 		md := f.msg.ProtoReflect().Descriptor()

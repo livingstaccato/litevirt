@@ -29,6 +29,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterFailoverScopeCmd(),
 		newClusterRelayRestoreCmd(),
 		newClusterFailbackCmd(),
+		newClusterHACmd(),
 		newClusterUpgradeStatusCmd(),
 		newClusterISOLibraryModeCmd(),
 		newClusterVoterCmd(),

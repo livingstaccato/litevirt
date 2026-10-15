@@ -418,6 +418,36 @@ func (c *Checker) RegionQuorumProof(ctx context.Context, region string) (state Q
 // (corrosion.VoterSetWithUncounted: a derived-set voter this node reads as
 // unknown).
 func (c *Checker) quorumOver(voters, uncounted map[string]bool) (state QuorumState, live, needed int) {
+	live = len(c.LiveVoters(voters, uncounted))
+	c.mu.Lock()
+	probed := c.probedOnce
+	started := c.startedAt
+	c.mu.Unlock()
+
+	// The denominator is the voter set, the same one the failover
+	// coordinator's fence and recovery quorums count over; only its members
+	// count toward live.
+	needed = len(voters)/2 + 1
+
+	// Warmup: before the first probe cycle, c.peers is empty/partial, so a
+	// multi-node cluster would read as No purely from missing probes. Report
+	// Unknown (neither proof nor loss) until a probe cycle completes or the
+	// startup grace elapses (then fall through to the fail-closed Yes/No count).
+	if !probed && time.Since(started) < startupGrace {
+		return QuorumUnknown, live, needed
+	}
+	if live >= needed {
+		return QuorumYes, live, needed
+	}
+	return QuorumNo, live, needed
+}
+
+// LiveVoters is the members of voters this daemon counts live right now:
+// itself, when a member, and each member it probed healthy this run since its
+// own last stall. A member of uncounted never counts. It is exactly the set
+// quorumOver counts, and the set the failover coordinator's HA-disarm peer
+// veto reads.
+func (c *Checker) LiveVoters(voters, uncounted map[string]bool) map[string]bool {
 	// A peer this node last saw healthy BEFORE its own most recent stall is not
 	// proven live: the stall is exactly the window in which it may have died,
 	// and the failures that would have said so were withheld (stall.go). It
@@ -427,8 +457,6 @@ func (c *Checker) quorumOver(voters, uncounted map[string]bool) (state QuorumSta
 	stallAt, _ := c.beat(c.now())
 
 	c.mu.Lock()
-	probed := c.probedOnce
-	started := c.startedAt
 	healthy := make(map[string]bool, len(c.peers))
 	for name, ps := range c.peers {
 		// Count a peer toward quorum ONLY on a restart-local fresh probe success.
@@ -443,30 +471,16 @@ func (c *Checker) quorumOver(voters, uncounted map[string]bool) (state QuorumSta
 	}
 	c.mu.Unlock()
 
-	// The denominator is the voter set, the same one the failover
-	// coordinator's fence and recovery quorums count over; only its members
-	// count toward live.
-	needed = len(voters)/2 + 1
+	out := make(map[string]bool, len(voters))
 	for name := range voters {
 		if uncounted[name] {
 			continue
 		}
 		if name == c.hostName || healthy[name] {
-			live++
+			out[name] = true
 		}
 	}
-
-	// Warmup: before the first probe cycle, c.peers is empty/partial, so a
-	// multi-node cluster would read as No purely from missing probes. Report
-	// Unknown (neither proof nor loss) until a probe cycle completes or the
-	// startup grace elapses (then fall through to the fail-closed Yes/No count).
-	if !probed && time.Since(started) < startupGrace {
-		return QuorumUnknown, live, needed
-	}
-	if live >= needed {
-		return QuorumYes, live, needed
-	}
-	return QuorumNo, live, needed
+	return out
 }
 
 // executionQuorum is the quorum ExecutionGate requires: cluster-wide, or this

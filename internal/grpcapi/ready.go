@@ -51,6 +51,10 @@ func (s *Server) Ready(ctx context.Context, _ *pb.ReadyRequest) (*pb.ReadyRespon
 	// certificate: Ping's capabilities already say the same thing to the same
 	// callers, by withholding partition_pause_v1 while the flag is off.
 	resp := &pb.ReadyResponse{HostName: s.hostName, Ready: true, PartitionPause: s.enfPartitionPause.Load()}
+	// The HA policy comes from this node's in-memory cache of its own replica,
+	// never from a read here: the probe must not depend on the database to say
+	// what the database holds (haPolicyCache).
+	resp.HaKnown, resp.HaDisarmed, resp.HaPolicyAt = s.haCache.snapshot()
 	reason := ""
 	rows, finished, err := s.boundedReadyQuery(rctx)
 	switch {
@@ -99,6 +103,15 @@ func (s *Server) PeerReady(ctx context.Context, host, addr string) (bool, string
 	// arrive leaves the last answer standing.
 	if err == nil || status.Code(err) == codes.Unimplemented {
 		s.peerPause.record(host, asked, err == nil && resp.GetHostName() == host && resp.GetPartitionPause())
+		// Likewise its HA policy, stamped with the SEND time: the answer was
+		// produced after it, so its age is never understated. A build without
+		// the fields, or another host answering, says nothing known.
+		if err == nil && resp.GetHostName() == host {
+			s.peerHA.record(host, peerHAAnswer{asked: asked, known: resp.GetHaKnown(),
+				disarmed: resp.GetHaDisarmed(), policyAt: resp.GetHaPolicyAt()})
+		} else {
+			s.peerHA.record(host, peerHAAnswer{asked: asked})
+		}
 	}
 	if err != nil {
 		// Unimplemented means the RPC ARRIVED at a build that predates it. The
@@ -226,6 +239,20 @@ func (a *peerPauseAnswers) record(host string, asked time.Time, on bool) {
 		a.m = map[string]peerPauseAnswer{}
 	}
 	a.m[host] = peerPauseAnswer{asked: asked, pause: on}
+}
+
+// record keeps a as host's answer unless a probe sent later has already
+// answered (as peerPauseAnswers.record).
+func (a *peerHAAnswers) record(host string, ans peerHAAnswer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if prev, ok := a.m[host]; ok && prev.asked.After(ans.asked) {
+		return
+	}
+	if a.m == nil {
+		a.m = map[string]peerHAAnswer{}
+	}
+	a.m[host] = ans
 }
 
 // PeerPausesOnLoss reports whether host's LATEST answer to this node's health

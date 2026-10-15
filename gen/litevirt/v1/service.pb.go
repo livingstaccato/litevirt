@@ -36945,12 +36945,15 @@ func (x *HAPolicyStatus) GetRegions() []*HARegionConfirmation {
 
 // HAVoterAnswer is one voter's latest Ready answer about the HA policy.
 type HAVoterAnswer struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	HaKnown       bool                   `protobuf:"varint,2,opt,name=ha_known,json=haKnown,proto3" json:"ha_known,omitempty"`
-	HaDisarmed    bool                   `protobuf:"varint,3,opt,name=ha_disarmed,json=haDisarmed,proto3" json:"ha_disarmed,omitempty"`
-	HaPolicyAt    string                 `protobuf:"bytes,4,opt,name=ha_policy_at,json=haPolicyAt,proto3" json:"ha_policy_at,omitempty"`
-	Confirmed     bool                   `protobuf:"varint,5,opt,name=confirmed,proto3" json:"confirmed,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Host       string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	HaKnown    bool                   `protobuf:"varint,2,opt,name=ha_known,json=haKnown,proto3" json:"ha_known,omitempty"`
+	HaDisarmed bool                   `protobuf:"varint,3,opt,name=ha_disarmed,json=haDisarmed,proto3" json:"ha_disarmed,omitempty"`
+	HaPolicyAt string                 `protobuf:"bytes,4,opt,name=ha_policy_at,json=haPolicyAt,proto3" json:"ha_policy_at,omitempty"`
+	Confirmed  bool                   `protobuf:"varint,5,opt,name=confirmed,proto3" json:"confirmed,omitempty"`
+	// status is the voter in the peer veto's vocabulary: confirmed, stale,
+	// unknown, older row, newer row, or not counted live.
+	Status        string `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -37018,6 +37021,13 @@ func (x *HAVoterAnswer) GetConfirmed() bool {
 		return x.Confirmed
 	}
 	return false
+}
+
+func (x *HAVoterAnswer) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
 }
 
 // HARegionConfirmation is whether a majority of a region's voters confirmed
@@ -44854,7 +44864,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06voters\x18\x05 \x03(\v2\x1a.litevirt.v1.HAVoterAnswerR\x06voters\x12&\n" +
 	"\x0fwould_be_fenced\x18\x06 \x03(\tR\rwouldBeFenced\x12$\n" +
 	"\x0efirst_use_paid\x18\a \x01(\bR\ffirstUsePaid\x12;\n" +
-	"\aregions\x18\b \x03(\v2!.litevirt.v1.HARegionConfirmationR\aregions\"\x9f\x01\n" +
+	"\aregions\x18\b \x03(\v2!.litevirt.v1.HARegionConfirmationR\aregions\"\xb7\x01\n" +
 	"\rHAVoterAnswer\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x19\n" +
 	"\bha_known\x18\x02 \x01(\bR\ahaKnown\x12\x1f\n" +
@@ -44862,7 +44872,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"haDisarmed\x12 \n" +
 	"\fha_policy_at\x18\x04 \x01(\tR\n" +
 	"haPolicyAt\x12\x1c\n" +
-	"\tconfirmed\x18\x05 \x01(\bR\tconfirmed\"L\n" +
+	"\tconfirmed\x18\x05 \x01(\bR\tconfirmed\x12\x16\n" +
+	"\x06status\x18\x06 \x01(\tR\x06status\"L\n" +
 	"\x14HARegionConfirmation\x12\x16\n" +
 	"\x06region\x18\x01 \x01(\tR\x06region\x12\x1c\n" +
 	"\tconfirmed\x18\x02 \x01(\bR\tconfirmed\"/\n" +

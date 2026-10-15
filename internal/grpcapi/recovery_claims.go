@@ -427,6 +427,18 @@ func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corr
 			return res, nil
 		}
 	}
+	// L3 of HA disarm: while this voter's replica says disarmed, or holds a
+	// policy it cannot read, it accepts no AUTOMATIC workload recovery. A
+	// claim needs a majority of accepts, so after a confirmed disarm none is
+	// certified. Voter-config and LUN values, and an operator's promotion,
+	// are accepted as ever.
+	if v.Proof != nil && v.Config == nil && v.LUN == nil && !corrosion.IsOperatorPromoteValue(*v.Proof) {
+		if why := s.haHoldsAutomaticRecovery(ctx); why != "" {
+			res := corrosion.AcceptResult{Voter: s.hostName, Refusal: corrosion.RefusalHADisarmed, Detail: why}
+			s.noteClaimRefusal(key, res.Refusal, res.Detail)
+			return res, nil
+		}
+	}
 	s.rememberClaimSource(key, v.SourceHost)
 	res, err := s.db.ClaimAccept(ctx, key, b, v, gen, signer, s.probeOwner)
 	if err != nil {
@@ -974,4 +986,21 @@ func (s *Server) legacyValueExcluded(ctx context.Context, key corrosion.ClaimKey
 		return false, fmt.Sprintf("%s's exclusion of proof %s does not verify: %v", dest, v.Proof.ID, err)
 	}
 	return true, ""
+}
+
+// haHoldsAutomaticRecovery says why this voter's replica holds automatic
+// recovery back ("" when it does not): HA is disarmed, its policy cannot be
+// read, or the read failed.
+func (s *Server) haHoldsAutomaticRecovery(ctx context.Context) string {
+	p, err := corrosion.GetHAPolicy(ctx, s.db)
+	switch {
+	case err != nil && !errors.Is(err, corrosion.ErrUnreadableHAPolicy):
+		return fmt.Sprintf("%s cannot read the cluster HA policy (%v), so it accepts no automatic recovery", s.hostName, err)
+	case p.Unreadable:
+		return fmt.Sprintf("%s cannot read the cluster HA policy, so it accepts no automatic recovery", s.hostName)
+	case p.Disarmed():
+		return fmt.Sprintf("HA is disarmed on %s (set by %s at %s), so it accepts no automatic recovery; lv cluster ha arm",
+			s.hostName, p.SetBy, p.UpdatedAt)
+	}
+	return ""
 }

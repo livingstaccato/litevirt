@@ -331,16 +331,114 @@ func TestObserveTick(t *testing.T) {
 		logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
 	t0 := time.Unix(1000, 0)
 	two := map[string]string{"node-2": "node-2", "node-4": "node-4"}
-	w.observeTick(t0, two)
-	w.observeTick(t0.Add(time.Second), map[string]string{"node-4": "node-4"})
-	w.observeTick(t0.Add(2*time.Second), two)
+	w.observeTick(t0, two, nil)
+	w.observeTick(t0.Add(time.Second), map[string]string{"node-4": "node-4"}, nil)
+	w.observeTick(t0.Add(2*time.Second), two, nil)
 	if len(fails) != 0 || len(logs) != 2 {
 		t.Fatalf("a one-tick overlap: fails=%v logs=%v", fails, logs)
 	}
-	w.observeTick(t0.Add(3*time.Second), two)
-	w.observeTick(t0.Add(4*time.Second), two)
+	w.observeTick(t0.Add(3*time.Second), two, nil)
+	w.observeTick(t0.Add(4*time.Second), two, nil)
 	if len(fails) != 1 || !strings.Contains(fails[0], "dual holder") {
 		t.Fatalf("a two-tick dual holder: fails=%v", fails)
+	}
+}
+
+// TestObserveTickUnknown: a failed read of a claimant is unknown. It neither
+// resets nor extends the 2-tick run, so alternating sql errors cannot evade it;
+// persistent unknowns are logged and summarised.
+func TestObserveTickUnknown(t *testing.T) {
+	var fails, logs []string
+	w := &leaseWatch{
+		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) },
+		logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	t0 := time.Unix(1000, 0)
+	two := map[string]string{"node-2": "node-2", "node-4": "node-4"}
+	one := map[string]string{"node-2": "node-2"}
+	w.observeTick(t0, two, nil)                                 // n=1
+	w.observeTick(t0.Add(time.Second), one, []string{"node-4"}) // held, not reset
+	if len(fails) != 0 || w.selfClaim.n != 1 {
+		t.Fatalf("held tick: n=%d fails=%v", w.selfClaim.n, fails)
+	}
+	w.observeTick(t0.Add(2*time.Second), two, nil) // n=2: fails
+	if len(fails) != 1 {
+		t.Fatalf("an unreadable claimant evaded the run: fails=%v", fails)
+	}
+	// An unknown that was NOT a claimant does not hold a run.
+	w = &leaseWatch{fail: func(f string, a ...any) { fails = append(fails, f) }, logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	fails = nil
+	w.observeTick(t0, two, nil)
+	w.observeTick(t0.Add(time.Second), one, []string{"node-9"})
+	w.observeTick(t0.Add(2*time.Second), two, nil)
+	if len(fails) != 0 {
+		t.Fatalf("an unrelated unknown held a run: %v", fails)
+	}
+	// Persistent unknowns are logged once at the threshold and summarised.
+	logs = nil
+	for i := 0; i < 5; i++ {
+		w.observeTick(t0.Add(time.Duration(10+i)*time.Second), nil, []string{"node-3"})
+	}
+	n := 0
+	for _, l := range logs {
+		if strings.Contains(l, "could not be read") {
+			n++
+		}
+	}
+	if n != 1 || !strings.Contains(w.summary(), "node-3 unreadable on 5 tick") {
+		t.Fatalf("persistent unknown: logged %d, summary %q", n, w.summary())
+	}
+}
+
+// TestSampleTick: the change history follows the highest-term usable sample,
+// not the first reader; a self-claim on a lagging replica is left to the window
+// tracker, while one on a caught-up replica still fails at 2 ticks.
+func TestSampleTick(t *testing.T) {
+	var fails []string
+	newW := func() *leaseWatch {
+		fails = nil
+		return &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
+			fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) },
+			logf: func(string, ...any) {}}
+	}
+	terms := map[int]string{50: "node-2", 51: "node-4"}
+	stale := leaseSample{Election: "node-2", Term: 50, Ledger: "node-2", Terms: map[int]string{50: "node-2"}}
+	fresh := leaseSample{Election: "node-4", Term: 51, Ledger: "node-4", Terms: terms}
+	t0 := time.Unix(1000, 0)
+
+	w := newW()
+	w.sampleTick(t0, []readerSample{{Reader: "node-1", S: stale}, {Reader: "node-4", S: fresh}})
+	if h := w.history(); len(h) != 1 || h[0].Holder != "node-4" || h[0].Term != 51 {
+		t.Fatalf("history followed the first reader, not the highest term: %+v", h)
+	}
+	if got := recorderOf([]readerSample{{Reader: "a", Failed: true}, {Reader: "b", S: stale}}); got != "b" {
+		t.Fatalf("a failed read picked as recorder: %q", got)
+	}
+	if got := recorderOf(nil); got != "" {
+		t.Fatalf("no samples: %q", got)
+	}
+
+	// node-2 caught up to nothing yet: its own old row beside node-4's newer term.
+	lagging := leaseSample{Election: "node-2", Term: 51, Ledger: "node-4", Terms: terms}
+	w = newW()
+	for i := 0; i < 2; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("a lagging self-claim failed at 2 ticks: %v", fails)
+	}
+	// The window tracker still catches it when it persists.
+	w.sampleTick(t0.Add(2*time.Second), []readerSample{{Reader: "node-2", S: lagging}, {Reader: "node-4", S: fresh}})
+	if len(fails) != 1 || !strings.Contains(fails[0], "node-2's replica") {
+		t.Fatalf("persistent lag self-claim: %v", fails)
+	}
+	// A caught-up replica self-claiming beside a newer holder still fails at 2 ticks.
+	selfConsistent := stale
+	w = newW()
+	for i := 0; i < 2; i++ {
+		w.sampleTick(t0.Add(time.Duration(i)*time.Second), []readerSample{{Reader: "node-2", S: selfConsistent}, {Reader: "node-4", S: fresh}})
+	}
+	if len(fails) != 1 || !strings.Contains(fails[0], "dual holder") {
+		t.Fatalf("a caught-up self-claim did not fail: %v", fails)
 	}
 }
 

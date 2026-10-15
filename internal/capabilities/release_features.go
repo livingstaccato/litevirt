@@ -118,9 +118,24 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureISCSILUNClaim: {Token: Release202611V1, Description: "Cluster-wide voter claim of each iSCSI LUN by one disk; iSCSI disk creates, rebuilds and recreates wait for it",
 		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
 			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
-	FeatureHADisarm:        {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery"},
+	FeatureHADisarm: {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery",
+		Writers: []string{"internal/corrosion.SetHAPolicy"}},
 	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits", Writers: []string{"internal/corrosion.SetReplicationRate"}},
+
+	// The firewall extras.
+	FeatureFirewallSynflood:  {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)"},
+	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
+	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallRuleWriters},
+}
+
+// firewallRuleWriters write the three rule tables. Each takes one grant per
+// feature a row can need (firewall_ipv6, firewall_log, firewall_tag_groups)
+// and checks each the row needs.
+var firewallRuleWriters = []string{
+	"internal/corrosion.InsertSGRuleWithGrant",
+	"internal/corrosion.InsertClusterFirewallRuleWithGrant",
+	"internal/corrosion.InsertHostFirewallRuleWithGrant",
 }
 
 // containerReplicationWriters write container_replication's data: a container's
@@ -172,6 +187,10 @@ const (
 	FeatureHADisarm             Feature = "ha_disarm"
 	FeatureNICMTU               Feature = "nic_mtu"
 	FeatureReplicationRate      Feature = "replication_rate"
+
+	FeatureFirewallSynflood  Feature = "firewall_synflood"
+	FeatureFirewallLog       Feature = "firewall_log"
+	FeatureFirewallTagGroups Feature = "firewall_tag_groups"
 )
 
 // LookupFeature returns a declared feature's token and description.

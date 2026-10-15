@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -85,5 +86,76 @@ func TestImportVM_NICMTUMismatchIsFailedPrecondition(t *testing.T) {
 	}
 	if fake.DomainExists("imp-mis") {
 		t.Error("the refused import left a domain")
+	}
+}
+
+// stubQemuImgRecording is stubQemuImg that also appends each subcommand it is
+// run with to the returned file, so a test can tell whether a disk was
+// converted.
+func stubQemuImgRecording(t *testing.T) (calls string) {
+	t.Helper()
+	dir := t.TempDir()
+	calls = dir + "/calls"
+	shim := "#!/bin/sh\n" +
+		"echo \"$1\" >> '" + calls + "'\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"if [ \"$1\" = measure ]; then echo '{\"required\":134217728,\"fully-allocated\":134217728}'; exit 0; fi\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatalf("write qemu-img stub: %v", err)
+	}
+	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
+		t.Fatalf("chmod stub: %v", err)
+	}
+	t.Setenv("PATH", dir+":"+envPath())
+	return calls
+}
+
+// An imported MTU this host's bridge does not equal is refused BEFORE any disk
+// is converted, not after a conversion that is then thrown away. Before the
+// latch the same source still imports, its MTU dropped: the early check never
+// refuses what the import accepts today.
+//
+// Mutation: drop the pre-conversion check (leave only the render's) — the
+// latched case converts first and goes red.
+func TestImportVM_NICMTUMismatchRefusedBeforeConversion(t *testing.T) {
+	for name, on := range map[string]bool{"latched": true, "unlatched": false} {
+		t.Run(name, func(t *testing.T) {
+			s := testServer(t)
+			s.dataDir = t.TempDir()
+			admissionHost(t, s)
+			fake := libvirtfake.New()
+			fake.SetBridgeMTU("vmbr0", 1500)
+			s.virt = fake
+			s.SetReleaseFeatureGate(newMTUGate(t, on))
+			calls := stubQemuImgRecording(t)
+			raw := t.TempDir() + "/disk0.raw"
+			if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
+				t.Fatal(err)
+			}
+			conf := "name: imp-early\ncores: 1\nmemory: 512\nscsi0: local-lvm:imp-early-disk-0,size=1G\n" +
+				"net0: virtio=AA:BB:CC:DD:EE:03,bridge=vmbr0,mtu=9000\n"
+			st := &fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{{Name: "imp-early", SourceFormat: "proxmox",
+				Chunk: []byte(conf), DiskMap: map[string]string{"scsi0": raw}}}}
+			err := s.ImportVM(st)
+			converted := false
+			if b, rerr := os.ReadFile(calls); rerr == nil {
+				converted = strings.Contains(string(b), "convert")
+			}
+			if !on {
+				if err != nil || !converted || !fake.DomainExists("imp-early") {
+					t.Fatalf("unlatched: err=%v converted=%v, want the import to succeed with its MTU dropped", err, converted)
+				}
+				return
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not match bridge vmbr0 MTU 1500") {
+				t.Fatalf("latched: %v, want FailedPrecondition naming the bridge", err)
+			}
+			if converted {
+				t.Error("the disk was converted before the NIC MTU was checked")
+			}
+		})
 	}
 }

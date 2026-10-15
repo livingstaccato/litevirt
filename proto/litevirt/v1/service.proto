@@ -2576,6 +2576,55 @@ message SetFirewallDefaultRequest        { string scope = 1; bool default_deny =
 message ListFirewallDefaultsRequest      {}
 message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
 
+// ── Firewall extras: SYN-flood protection, logging, tag groups ──
+// An older daemon answers each of these RPCs Unimplemented.
+message GetFirewallSynfloodRequest {}
+message GetFirewallSynfloodResponse { repeated FirewallSynfloodPolicy policies = 1; }
+message SetFirewallSynfloodRequest {
+    string scope = 1;  // empty = cluster
+    string mode  = 2;  // on | off | inherit (a host scope only)
+    uint32 rate  = 3;  // 0 = the default
+    uint32 burst = 4;  // 0 = the default
+}
+message GetFirewallLogPolicyRequest {}
+message GetFirewallLogPolicyResponse { repeated FirewallLogPolicy policies = 1; }
+message SetFirewallLogPolicyRequest {
+    string scope = 1;  // empty = cluster
+    string mode  = 2;  // on | off | inherit (a host scope only)
+    uint32 rate  = 3;  // 0 = the default
+    uint32 burst = 4;  // 0 = the default
+}
+message ListFirewallLogRequest {
+    string              host       = 1;  // empty = every active host
+    string              workload   = 2;
+    string              since      = 3;  // RFC 3339; empty = no lower bound
+    uint32              limit      = 4;
+    map<string, uint64> after_seq  = 5;  // per host: only entries after this sequence
+    bool                local_only = 6;  // this host only (a peer's fan-out leg)
+}
+message ListFirewallLogResponse {
+    repeated FirewallLogEntry entries = 1;
+    map<string, string>       errors  = 2;  // per host that could not be read
+}
+message ListFirewallTagGroupsRequest  { bool members = 1; }
+message ListFirewallTagGroupsResponse { repeated FirewallTagGroup groups = 1; }
+message SetFirewallTagGroupRequest    { FirewallTagGroup group = 1; }  // set_by, updated_at and members are ignored
+message DeleteFirewallTagGroupRequest { string name = 1; bool force = 2; }
+message ListFirewallTagsRequest {
+    string kind     = 1;  // vm | container; empty = both
+    string workload = 2;  // empty = every workload
+    string host     = 3;  // a container's host
+}
+message ListFirewallTagsResponse { repeated FirewallTags tags = 1; }
+// SetFirewallTagsRequest merges server-side: set, then remove.
+message SetFirewallTagsRequest {
+    string              kind     = 1;  // vm | container
+    string              workload = 2;
+    string              host     = 3;  // a container's host
+    map<string, string> set      = 4;
+    repeated string     remove   = 5;
+}
+
 // ── Security groups: the per-NIC tier ──
 // `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
 // straight from the CLI process, which skipped the daemon's authorization and
@@ -4578,6 +4627,18 @@ service LiteVirt {
     rpc SetFirewallDefault(SetFirewallDefaultRequest)               returns (google.protobuf.Empty);
     rpc ListFirewallDefaults(ListFirewallDefaultsRequest)           returns (ListFirewallDefaultsResponse);
 
+    // ── Firewall extras: SYN-flood protection, logging, tag groups ──
+    rpc GetFirewallSynflood(GetFirewallSynfloodRequest)             returns (GetFirewallSynfloodResponse);
+    rpc SetFirewallSynflood(SetFirewallSynfloodRequest)             returns (FirewallSynfloodPolicy);
+    rpc GetFirewallLogPolicy(GetFirewallLogPolicyRequest)           returns (GetFirewallLogPolicyResponse);
+    rpc SetFirewallLogPolicy(SetFirewallLogPolicyRequest)           returns (FirewallLogPolicy);
+    rpc ListFirewallLog(ListFirewallLogRequest)                     returns (ListFirewallLogResponse);
+    rpc ListFirewallTagGroups(ListFirewallTagGroupsRequest)         returns (ListFirewallTagGroupsResponse);
+    rpc SetFirewallTagGroup(SetFirewallTagGroupRequest)             returns (FirewallTagGroup);
+    rpc DeleteFirewallTagGroup(DeleteFirewallTagGroupRequest)       returns (google.protobuf.Empty);
+    rpc ListFirewallTags(ListFirewallTagsRequest)                   returns (ListFirewallTagsResponse);
+    rpc SetFirewallTags(SetFirewallTagsRequest)                     returns (FirewallTags);
+
     // ── Security groups: the per-NIC tier ──
     rpc CreateSecurityGroup(CreateSecurityGroupRequest)             returns (SecurityGroup);
     rpc DeleteSecurityGroup(DeleteSecurityGroupRequest)             returns (google.protobuf.Empty);
@@ -5114,6 +5175,9 @@ message HAVoterAnswer {
     bool   ha_disarmed  = 3;
     string ha_policy_at = 4;
     bool   confirmed    = 5;
+    // status is the voter in the peer veto's vocabulary: confirmed, stale,
+    // unknown, older row, newer row, or not counted live.
+    string status       = 6;
 }
 
 // HARegionConfirmation is whether a majority of a region's voters confirmed

@@ -147,6 +147,13 @@ const (
 	// ErrStateUnknown: quorum agreed a host failed, but this node has no
 	// membership row for it and cannot read its state, so it is not fenced.
 	ErrStateUnknown = "state_unknown"
+	// ErrHADisarmed: a fence or recovery was held because this node's replica
+	// says cluster HA is disarmed, or holds a policy it cannot read
+	// (ha_disarm.go).
+	ErrHADisarmed = "ha_disarmed"
+	// ErrHAPeerVeto: a fence or recovery was held because a live voter's
+	// latest answer vetoed it (ha_disarm.go, haPeerVeto).
+	ErrHAPeerVeto = "ha_peer_veto"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

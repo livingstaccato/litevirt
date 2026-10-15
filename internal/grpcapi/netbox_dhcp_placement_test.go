@@ -14,7 +14,7 @@ import (
 //
 // THE SHAPE OF THE BUG. The refusal is correct inside Provision — it is hoisted
 // above EnsureBridge, so a refused provision creates nothing and a retry refuses
-// identically. It is nullified at the CALLER: provisionNetworkForVM's error is
+// identically. It is nullified at the CALLER: provisionForVM's error is
 // logged at warn level and the code carries on with the network name as the
 // bridge, and the very next step creates that bridge through ensureBridge. Same
 // shape in clone-from-template, in the reconciler after a failover, and in NIC
@@ -51,7 +51,7 @@ func TestABoundNetworkRefusalDoesNotPreventPlacement(t *testing.T) {
 
 	// Step 1, exactly as CreateVM does it: provision, and keep the error.
 	bridge := dhcpBoundNetworkDef.Interface
-	provBridge, perr := provisionNetworkForVM(ctx, s.db, bridge, s.hostName)
+	provBridge, perr := s.provisionForVM(ctx, bridge)
 	if perr == nil {
 		t.Fatal("precondition: provisioning a bound network litevirt would serve DHCP for must refuse")
 	}

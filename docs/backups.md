@@ -706,7 +706,11 @@ lv replication schedule ls        # RATE column; "-" is unlimited
 - A container schedule's sends are also paced by the owner's `backup_bwlimits`
   entry for its repo; the lower limit wins.
 - Re-adding a schedule without `--bwlimit` keeps its stored limit; `--bwlimit 0`
-  removes it. Removing the schedule removes its limit. A changed limit takes
+  removes it. Removing the schedule removes its limit, and a schedule added
+  again later without `--bwlimit` starts unlimited.
+- A daemon on an older build ignores `--bwlimit`: the command then fails, saying
+  the schedule was added without a limit. Re-run it once every host is
+  upgraded. A changed limit takes
   effect from the next run; a run already going keeps the limit it started
   with.
 - A replication into a pool on the source host itself, or into a shared pool

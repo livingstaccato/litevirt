@@ -250,16 +250,6 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	owner := l.leastLoaded(l.hosts[0], l.except(coord))
 	keep := l.pick(func(h string) bool { return h != coord && h != owner }, true)
 	q := l.pick(func(h string) bool { return h != owner && h != keep }, false)
-	// The owner is cut from every voter but keep, witnesses outside
-	// E2E_LAB_NODES included: a witness left reaching the owner is one
-	// observer short of the fence quorum (lab 1's node-6), and it may hold
-	// the failover lease, so the journal wait below covers it too.
-	var cut []string
-	for _, h := range append(append([]string{}, l.hosts...), l.outsiderHosts()...) {
-		if h != owner && h != keep {
-			cut = append(cut, h)
-		}
-	}
 	test := l.createVMs(q, "d4", owner)[owner]
 	key := "vm/" + test
 	if err := l.setEnforcement(owner, "partition_pause", "false"); err != nil {
@@ -277,25 +267,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	s := l.startSampler()
 	waitAllAt(t, s, []string{key}, owner)
 
-	// Phase 1: the owner is cut off from all but one peer until a coordinator
-	// reaches its fence quorum.
-	if err := l.dropBetween(owner, cut); err != nil {
-		t.Fatal(err)
-	}
-	l.mark("drill4: phase 1, %s drops %v", owner, cut)
-	decider := l.waitJournal(cut, since, journalPair("quorum reached", "host", owner), 3*time.Minute)
-	if decider == "" {
-		t.Fatalf("no coordinator logged a fence quorum for %s within 3m", owner)
-	}
-	// Phase 2: only the deciding coordinator is cut off from the owner.
-	if err := l.clearDrops(owner); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.dropBetween(owner, []string{decider}); err != nil {
-		t.Fatal(err)
-	}
-	phase2 := l.mark("drill4: phase 2, %s (quorum for %s) is the only host cut off from it", decider, owner)
-	time.Sleep(time.Until(phase2.Add(claimWatch)))
+	decider, phase2 := l.ownerReachableClaimRefusal(owner, keep, since, claimWatch)
 	if j := l.journalSince(decider, since, "relying on the host's partition pause.*host="+owner); j != "" {
 		t.Errorf("coordinator %s relied on %s's partition pause although %s runs partition_pause=false: it decided on an answer from before the flag went off (P1), so it waited for a pause that would never happen instead of claiming:\n%s", decider, owner, owner, j)
 	}
@@ -402,6 +374,43 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+// ownerReachableClaimRefusal is drill 4's two phases, shared with the witness
+// drills W4a and W4b. Phase 1 cuts owner off from every host but keep
+// (witnesses outside E2E_LAB_NODES included: a witness left reaching the owner
+// is one observer short of the fence quorum, lab 1's node-6, and it may hold
+// the failover lease, so the journal wait covers it too) until a coordinator
+// logs a fence quorum for it. Phase 2 leaves only that deciding coordinator cut
+// off from the owner, for watch. It returns the decider and phase 2's start.
+func (l *lab) ownerReachableClaimRefusal(owner, keep, since string, watch time.Duration) (decider string, phase2 time.Time) {
+	l.t.Helper()
+	var cut []string
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiderHosts()...) {
+		if h != owner && h != keep {
+			cut = append(cut, h)
+		}
+	}
+	// Phase 1: the owner is cut off from all but one peer until a coordinator
+	// reaches its fence quorum.
+	if err := l.dropBetween(owner, cut); err != nil {
+		l.t.Fatal(err)
+	}
+	l.mark("claim refusal: phase 1, %s drops %v", owner, cut)
+	decider = l.waitJournal(cut, since, journalPair("quorum reached", "host", owner), 3*time.Minute)
+	if decider == "" {
+		l.t.Fatalf("no coordinator logged a fence quorum for %s within 3m", owner)
+	}
+	// Phase 2: only the deciding coordinator is cut off from the owner.
+	if err := l.clearDrops(owner); err != nil {
+		l.t.Fatal(err)
+	}
+	if err := l.dropBetween(owner, []string{decider}); err != nil {
+		l.t.Fatal(err)
+	}
+	phase2 = l.mark("claim refusal: phase 2, %s (quorum for %s) is the only host cut off from it", decider, owner)
+	time.Sleep(time.Until(phase2.Add(watch)))
+	return decider, phase2
+}
 
 // except returns every host but the named ones.
 func (l *lab) except(skip ...string) []string {

@@ -241,6 +241,12 @@ func (s *Server) claimOperatorPromote(ctx context.Context, vm *corrosion.VMRecor
 			// A refused accept may still have left the proposal with a
 			// minority, which a later coordinator learns: released at once.
 			s.releaseOperatorClaim(ctx, &operatorClaim{Key: key, ProofID: proposal.ID}, "its claim was refused")
+			if refusedForHADisarm(err) {
+				// Phase 1 found an automatic value a minority accepted, so this
+				// claim carries that value, and voters holding a disarm refuse
+				// it (docs/migration-failover.md, "Disarming HA").
+				return nil, haDisarmPromoteRefusal(vm.Name)
+			}
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"promote of %s refused: its recovery claim at owner epoch %d could not be decided (%v). Failover may be "+
 					"recovering it now: wait for that to finish (`lv cluster claim vm/%s` shows each voter's state, "+
@@ -327,6 +333,29 @@ func (s *Server) operatorSupersedeEvidence(ctx context.Context, out claims.Outco
 		return ev
 	}
 	return nil
+}
+
+// haDisarmPromoteRefusal is an operator promotion's refusal when it had to
+// re-propose an automatic recovery value that voters holding a disarm refuse.
+func haDisarmPromoteRefusal(vm string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"promote of %s refused: the workload has an automatic recovery claim in flight; HA is disarmed — "+
+			"run lv cluster ha arm, or wait", vm)
+}
+
+// refusedForHADisarm reports whether a voter refused a claim because its
+// replica says HA is disarmed (corrosion.RefusalHADisarmed).
+func refusedForHADisarm(err error) bool {
+	var nm *claims.NoMajorityError
+	if !errors.As(err, &nm) {
+		return false
+	}
+	for _, r := range nm.Refusals {
+		if r.Reason == corrosion.RefusalHADisarmed {
+			return true
+		}
+	}
+	return false
 }
 
 // ownerReachedByMajority reports whether a claim failed because a majority

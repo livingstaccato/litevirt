@@ -32,16 +32,16 @@ func TestIPv6FirewallWrites_NeedAFirewallIPv6Grant(t *testing.T) {
 	writes := func(g capabilities.FeatureGrant, id string) map[string]func() error {
 		return map[string]func() error{
 			"sg rule v6 cidr": func() error {
-				return InsertSGRuleWithGrant(ctx, c, g, SGRule{ID: id + "r1", SGID: "sg", Direction: "ingress", Proto: "tcp", CIDR: "2001:db8::/32"})
+				return InsertSGRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, SGRule{ID: id + "r1", SGID: "sg", Direction: "ingress", Proto: "tcp", CIDR: "2001:db8::/32"})
 			},
 			"sg rule icmpv6 v6 cidr": func() error {
-				return InsertSGRuleWithGrant(ctx, c, g, SGRule{ID: id + "r2", SGID: "sg", Direction: "ingress", Proto: "icmpv6", CIDR: "::/0"})
+				return InsertSGRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, SGRule{ID: id + "r2", SGID: "sg", Direction: "ingress", Proto: "icmpv6", CIDR: "::/0"})
 			},
 			"cluster rule v6": func() error {
-				return InsertClusterFirewallRuleWithGrant(ctx, c, g, FirewallRule{ID: id + "c1", Direction: "ingress", CIDR: "fd00::/8"})
+				return InsertClusterFirewallRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, FirewallRule{ID: id + "c1", Direction: "ingress", CIDR: "fd00::/8"})
 			},
 			"host rule v6": func() error {
-				return InsertHostFirewallRuleWithGrant(ctx, c, g, FirewallRule{ID: id + "h1", HostName: "h", Direction: "egress", CIDR: "::/0"})
+				return InsertHostFirewallRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, FirewallRule{ID: id + "h1", HostName: "h", Direction: "egress", CIDR: "::/0"})
 			},
 			"ipset v6 element": func() error {
 				return InsertIPSetWithGrant(ctx, c, g, IPSet{ID: id + "s1", Name: id + "s", CIDRs: []string{"10.0.0.0/8", "2001:db8::/32"}})
@@ -76,9 +76,9 @@ func TestIPv6FirewallWrites_MalformedRefused(t *testing.T) {
 	c := ipv6FWDB(t)
 	g := capabilities.GrantForTest(t, capabilities.FeatureFirewallIPv6)
 	for name, err := range map[string]error{
-		"bad v6 prefix":   InsertSGRuleWithGrant(ctx, c, g, SGRule{ID: "a", SGID: "sg", Direction: "ingress", CIDR: "2001:db8::/129"}),
-		"zoned":           InsertSGRuleWithGrant(ctx, c, g, SGRule{ID: "b", SGID: "sg", Direction: "ingress", CIDR: "fe80::1%eth0"}),
-		"icmp with v6":    InsertClusterFirewallRuleWithGrant(ctx, c, g, FirewallRule{ID: "c", Direction: "ingress", Proto: "icmp", CIDR: "2001:db8::/32"}),
+		"bad v6 prefix":   InsertSGRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, SGRule{ID: "a", SGID: "sg", Direction: "ingress", CIDR: "2001:db8::/129"}),
+		"zoned":           InsertSGRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, SGRule{ID: "b", SGID: "sg", Direction: "ingress", CIDR: "fe80::1%eth0"}),
+		"icmp with v6":    InsertClusterFirewallRuleWithGrant(ctx, c, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, FirewallRule{ID: "c", Direction: "ingress", Proto: "icmp", CIDR: "2001:db8::/32"}),
 		"bad set element": InsertIPSetWithGrant(ctx, c, g, IPSet{ID: "e", Name: "e", CIDRs: []string{"2001:zz::/32"}}),
 	} {
 		if err == nil {

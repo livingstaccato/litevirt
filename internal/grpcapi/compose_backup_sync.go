@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -29,7 +30,9 @@ func (s *Server) syncComposeBackupSchedule(ctx context.Context, vmName string, v
 		existing, _ := corrosion.ListBackupSchedules(ctx, s.db)
 		for _, e := range existing {
 			if e.VMName == vmName {
-				_ = s.deleteScheduleRow(ctx, e.VMName, e.Repo)
+				if err := s.deleteScheduleRow(ctx, e.VMName, e.Repo); err != nil {
+					slog.Warn("compose: remove backup schedule", "vm", vmName, "repo", e.Repo, "error", err)
+				}
 			}
 		}
 		return nil

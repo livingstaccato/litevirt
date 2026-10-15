@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -38,5 +39,35 @@ func TestDomainXMLFor_NICMTUAgainstThisHostsBridge(t *testing.T) {
 	}
 	if _, failure := render(1500); !strings.Contains(failure, "NIC 0 MTU 1500 does not match bridge br0 MTU 9000 on host node-a") {
 		t.Errorf("explicit 1500 on a 9000 bridge: failure = %q", failure)
+	}
+}
+
+// A bridge whose MTU cannot be read when the reconciler defines the VM here
+// (a bridge being recreated) is a transient start failure, retried on a later
+// pass; a bridge whose MTU differs is the operator's to fix, and is not.
+//
+// Mutation: return retryable=false for every NIC MTU render failure — the
+// unreadable case goes red.
+func TestDomainXMLFor_UnreadableBridgeIsRetryable(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, fake, _ := sharedDiskReconciler(t, db)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running", CPUActual: 1, MemActual: 512}
+	if err := corrosion.InsertVM(ctx, db, vm,
+		[]corrosion.InterfaceRecord{{VMName: "vm1", NetworkName: "br0", MAC: "52:54:00:aa:bb:cc"}}, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "br0", Mac: "52:54:00:aa:bb:cc", Mtu: 9000}}}
+
+	fake.FailBridgeMTU("br0", errors.New("no such network interface"))
+	if _, retryable, failure := r.domainXMLFor(ctx, vm, spec, nil); !retryable || !strings.Contains(failure, "read the MTU of bridge br0") {
+		t.Errorf("unreadable bridge: retryable=%v failure=%q, want a retryable failure naming the bridge", retryable, failure)
+	}
+
+	fake.FailBridgeMTU("br0", nil)
+	fake.SetBridgeMTU("br0", 1500)
+	if _, retryable, failure := r.domainXMLFor(ctx, vm, spec, nil); retryable || !strings.Contains(failure, "does not match bridge br0") {
+		t.Errorf("mismatched bridge: retryable=%v failure=%q, want a non-retryable mismatch", retryable, failure)
 	}
 }

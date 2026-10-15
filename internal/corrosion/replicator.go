@@ -1491,6 +1491,9 @@ func (r *Replicator) applyEntry(ctx context.Context, tx *sql.Tx, entry *pb.Mutat
 		if releaseUseApplyHook != nil {
 			releaseUseApplyHook(s)
 		}
+		if r.client.walPolicyApplyHeld(s) {
+			continue
+		}
 		if remintCredentialStatement(s, refusedRemints) {
 			r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
 			continue

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -12,6 +13,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -33,19 +36,97 @@ func toPbIpSet(s corrosion.IPSet) *pb.IpSet {
 	return &pb.IpSet{Id: s.ID, Name: s.Name, Cidrs: s.CIDRs, StackName: s.StackName}
 }
 
-// writeFirewallRow writes one firewall row: an IPv4 one with no grant, as on
-// main, and an IPv6 one through the release feature firewall_ipv6, which
-// refuses until the release token has latched and records the use first. v6
-// and invalid are the row's corrosion.FirewallRuleFamily (or IPSetFamily): a
-// malformed row is refused as such before the gate is asked.
-func (s *Server) writeFirewallRow(ctx context.Context, v6 bool, invalid error, write func(context.Context, capabilities.FeatureGrant) error) error {
+// firewallGrants are the release-feature grants a firewall row's writer
+// takes, one per feature (capabilities DECISION 0-E).
+type firewallGrants struct {
+	IPv6, Log, Tag capabilities.FeatureGrant
+}
+
+// firewallGrantOrder is the order writeFirewallRow nests the gates in,
+// IPv6 outermost.
+var firewallGrantOrder = []capabilities.Feature{
+	capabilities.FeatureFirewallIPv6,
+	capabilities.FeatureFirewallLog,
+	capabilities.FeatureFirewallTagGroups,
+}
+
+// writeFirewallRow writes one firewall row. A row needing no release feature
+// is written with no grant, as on main; otherwise each feature it needs is
+// taken through its own gate — one WithReleaseFeature per feature, nested with
+// IPv6 outermost — each of which refuses until the release token has latched
+// and records the use first. need and invalid are the row's ruleRowFeatures
+// (or the ip set's ipSetRowFeatures): a malformed row is refused as such
+// before any gate is asked.
+func (s *Server) writeFirewallRow(ctx context.Context, need []capabilities.Feature, invalid error, write func(context.Context, firewallGrants) error) error {
 	if invalid != nil {
 		return invalid
 	}
-	if !v6 {
-		return write(ctx, capabilities.FeatureGrant{})
+	var ordered []capabilities.Feature
+	for _, f := range firewallGrantOrder {
+		if slices.Contains(need, f) {
+			ordered = append(ordered, f)
+		}
 	}
-	return s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, write)
+	for _, f := range need {
+		if !slices.Contains(firewallGrantOrder, f) {
+			return status.Errorf(codes.Internal, "firewall row needs release feature %s, which no firewall writer takes", f)
+		}
+	}
+	var gs firewallGrants
+	var nest func(ctx context.Context, i int) error
+	nest = func(ctx context.Context, i int) error {
+		if i == len(ordered) {
+			return write(ctx, gs)
+		}
+		return s.WithReleaseFeature(ctx, ordered[i], func(ctx context.Context, g capabilities.FeatureGrant) error {
+			switch ordered[i] {
+			case capabilities.FeatureFirewallIPv6:
+				gs.IPv6 = g
+			case capabilities.FeatureFirewallLog:
+				gs.Log = g
+			case capabilities.FeatureFirewallTagGroups:
+				gs.Tag = g
+			}
+			return nest(ctx, i+1)
+		})
+	}
+	return nest(ctx, 0)
+}
+
+// ipSetFeatures is an ip set's release features: firewall_ipv6 when it holds
+// an IPv6 element.
+func ipSetFeatures(cidrs []string) ([]capabilities.Feature, error) {
+	v6, err := corrosion.IPSetFamily(cidrs)
+	if err != nil || !v6 {
+		return nil, err
+	}
+	return []capabilities.Feature{capabilities.FeatureFirewallIPv6}, nil
+}
+
+// ruleRowFeatures is the check every rule a client sends passes before any
+// release gate is asked or anything is stored, and the release features its
+// write then needs (the writeFirewallRow need and invalid arguments). In
+// order: a form a client may not send on this build (a "+" action suffix, a
+// tag-group cidr: corrosion.RefuseClientRuleForm), then the grammar the
+// renderer writes into an nft script (finding F-1), then the row's features
+// (corrosion.FirewallRowFeatures).
+func ruleRowFeatures(direction, proto, port, cidr, action, comment string) ([]capabilities.Feature, error) {
+	if err := corrosion.RefuseClientRuleForm(cidr, action); err != nil {
+		return nil, err
+	}
+	if err := firewall.ValidateRuleFields(direction, proto, port, cidr, action, comment); err != nil {
+		return nil, err
+	}
+	return corrosion.FirewallRowFeatures(cidr, proto, action)
+}
+
+// ipSetRowFeatures is ruleRowFeatures for an ip set: the grammar, then
+// ipSetFeatures.
+func ipSetRowFeatures(name string, cidrs []string) ([]capabilities.Feature, error) {
+	if err := rulefield.IPSet(name, cidrs); err != nil {
+		return nil, err
+	}
+	return ipSetFeatures(cidrs)
 }
 
 // firewallWriteErr is a firewall-row write's error as the handler returns it:
@@ -58,12 +139,17 @@ func firewallWriteErr(err error, def codes.Code, what string) error {
 	return status.Errorf(firewallWriteCode(err, def), "%s: %v", what, err)
 }
 
-// firewallWriteCode maps a firewall-row write error to its gRPC code: an IPv6
-// rule refused for want of a firewall_ipv6 grant is a precondition (it will
+// firewallWriteCode maps a firewall-row write error to its gRPC code: a rule
+// refused for want of a release feature's grant is a precondition (it will
 // succeed once every host is upgraded), anything else keeps def.
 func firewallWriteCode(err error, def codes.Code) codes.Code {
-	if errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) {
+	if errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) || errors.Is(err, corrosion.ErrFirewallLogGateClosed) ||
+		errors.Is(err, corrosion.ErrFirewallTagGroupsGateClosed) {
 		return codes.FailedPrecondition
+	}
+	var fe *rulefield.FieldError
+	if errors.As(err, &fe) {
+		return codes.InvalidArgument
 	}
 	return def
 }
@@ -138,9 +224,10 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 		ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 		CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
-	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
+	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "create cluster rule")
 	}
@@ -194,9 +281,10 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 		ID: randid.New(), HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
-	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertHostFirewallRuleWithGrant(ctx, s.db, g, row)
+	row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
+	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		return corrosion.InsertHostFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.InvalidArgument, "create host rule")
 	}
@@ -243,10 +331,11 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
-	v6, invalid := corrosion.IPSetFamily(row.CIDRs)
-	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
+	// `--cidr 10.0.0.1,10.0.0.2` is two elements (rulefield.NormaliseSetElements).
+	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: rulefield.NormaliseSetElements(req.Cidrs)}
+	need, invalid := ipSetRowFeatures(row.Name, row.CIDRs)
+	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+		return corrosion.InsertIPSetWithGrant(ctx, s.db, g.IPv6, row)
 	}); err != nil {
 		return nil, firewallWriteErr(err, codes.Internal, "create ipset")
 	}

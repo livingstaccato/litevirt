@@ -893,6 +893,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
+	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node
@@ -1427,4 +1428,22 @@ func (n *Node) FailLeaseTombstones(t *testing.T) func() {
 	}
 	t.Cleanup(drop)
 	return drop
+}
+
+// HoldPolicyKey keeps every incoming cluster_policies row whose key is one of
+// keys off this node's replica, by WAL push and by anti-entropy alike, while
+// every other row and all gRPC traffic (Ready probes included) still reach it:
+// a node replication has not delivered one row to yet. The returned release
+// lets the row through again; it then arrives by anti-entropy, since the WAL
+// entries that carried it were acknowledged. Released at cleanup too.
+func (n *Node) HoldPolicyKey(t *testing.T, keys ...string) (release func()) {
+	t.Helper()
+	held := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		held[k] = true
+	}
+	n.DB.SetPolicyApplyHoldForTest(func(key string) bool { return held[key] })
+	release = func() { n.DB.SetPolicyApplyHoldForTest(nil) }
+	t.Cleanup(release)
+	return release
 }

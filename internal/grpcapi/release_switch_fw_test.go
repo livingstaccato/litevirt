@@ -375,7 +375,9 @@ func TestSwitchFix_StackGatesBeforeTeardown(t *testing.T) {
 	s.SetReleaseFeatureGate(g)
 	parse := func(rules string) *compose.File {
 		t.Helper()
-		f, err := compose.ParseBytes([]byte("name: st\nsecurity-groups:\n  web:\n    rules:\n" + rules))
+		// ParseStored: the daemon's own refusal is under test, and the compose
+		// validator now refuses a malformed row before it ever reaches it.
+		f, err := compose.ParseStored([]byte("name: st\nsecurity-groups:\n  web:\n    rules:\n" + rules))
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}

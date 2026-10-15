@@ -26,6 +26,9 @@ type ClaimRequest struct {
 	// the bound NetBox prefix need not be identical, and containment must be
 	// checked against the prefix litevirt actually claims from.
 	PrefixCIDR string
+	// Exclude are further addresses the builtin allocator must not choose:
+	// ones a caller has handed out but whose rows are not written yet.
+	Exclude []string
 }
 
 // ClaimResult is the claimed address. NetBoxIPID is 0 for the builtin allocator.
@@ -78,7 +81,7 @@ func (a *builtinAllocator) Claim(ctx context.Context, req ClaimRequest) (ClaimRe
 		}
 		return ClaimResult{IP: req.ExplicitIP}, nil
 	}
-	ip, err := AllocateIPFor(ctx, a.db, req.Network, req.Subnet, req.MAC, req.OwnerKind, req.OwnerHost, req.Name)
+	ip, err := allocateIPFor(ctx, a.db, req.Network, req.Subnet, req.MAC, req.OwnerKind, req.OwnerHost, req.Name, req.Exclude)
 	if err != nil {
 		return ClaimResult{}, err
 	}

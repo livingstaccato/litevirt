@@ -52,9 +52,10 @@ func countedSinceActiveWithin(n int, lastSeen string, at, since time.Time, grace
 	return at.Sub(since) >= grace(start)
 }
 
-// inheritedRunGrace is how long host, recorded active since `since`, must
-// have failed since the activation before an observer's run that began at
-// runStart, before the activation, counts toward its fence.
+// inheritedRunGrace (inheritedRunGraceFrom, over the times fenceTimesNeeded
+// reads) is how long a host, recorded active since `since`, must have failed
+// since the activation before an observer's run that began at runStart, before
+// the activation, counts toward its fence.
 //
 // It is afreshRun, unless a fence attempt of host is recorded inside that run
 // (fencing_log, any result, from runStart less fenceSkewMargin up to the
@@ -66,30 +67,11 @@ func countedSinceActiveWithin(n int, lastSeen string, at, since time.Time, grace
 // run that begins after the activation is unaffected, and a host that comes
 // back and never answers is still fenced, once that allowance has passed.
 // An unreadable log keeps afreshRun.
-func (c *Coordinator) inheritedRunGrace(ctx context.Context, host string, since time.Time, fenceTimes map[string][]time.Time) func(time.Time) time.Duration {
-	return func(runStart time.Time) time.Duration {
-		times, ok := fenceTimes[host]
-		if !ok {
-			times = c.fenceAttemptTimes(ctx, host)
-			fenceTimes[host] = times
-		}
-		from := runStart.Add(-fenceSkewMargin)
-		for _, ts := range times {
-			if !ts.Before(from) && ts.Before(since) {
-				if g := c.upgradingTimeout(); g > afreshRun {
-					return g
-				}
-				return afreshRun
-			}
-		}
-		return afreshRun
-	}
-}
 
-// fenceAttemptTimes lists the timestamps of host's fencing_log rows, of any
+// fenceAttemptTimesIn lists the timestamps of host's fencing_log rows, of any
 // result. A read error yields none.
-func (c *Coordinator) fenceAttemptTimes(ctx context.Context, host string) []time.Time {
-	rows, err := c.db.Query(ctx, `SELECT timestamp FROM fencing_log WHERE host_name = ?`, host)
+func fenceAttemptTimesIn(ctx context.Context, db *corrosion.Client, host string) []time.Time {
+	rows, err := db.Query(ctx, `SELECT timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
 		slog.Warn("failover: read the fence log of a host that turned active; judging its observers' runs as before",
 			"host", host, "error", err)

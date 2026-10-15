@@ -62,9 +62,11 @@ address; it publishes a `network.vtep_refused` event naming the network and
 the device.
 
 When a host provisions the network it records its VTEP address in the
-replicated cluster database, then reads that table back and installs an
-all-zeros `00:00:00:00:00:00` flood entry for each peer VTEP already listed, so
-BUM traffic is head-end replicated to the peers it knows about; a peer that
+replicated cluster database, then reads that table back and appends each peer
+VTEP already listed to the device's all-zeros `00:00:00:00:00:00` flood entry
+(`bridge fdb append`: the kernel keeps one flood entry with a list of
+destinations), so BUM traffic is head-end replicated to every peer it knows
+about; a peer that
 provisions later can also push its VTEP straight to this host. Unicast
 MAC→VTEP entries are programmed explicitly rather than learned: one for every
 NIC on the network on another host, pointing the NIC's MAC at that host's VTEP.

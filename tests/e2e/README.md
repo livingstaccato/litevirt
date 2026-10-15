@@ -184,6 +184,20 @@ probe constants drift from them.
 | `TestDrillW4b_ClaimRetryOwedToTheLastOutage` | drill 4's refused claim, a 30 s heal with the owner still offline, then its power-off: the same holder retries the claim at the same lease term, with the accepted value's proof when there was one, exactly once | ~15 min |
 | `TestDrillW5_ClockSteps` | node clocks stepped inside the nodes (time sync off, never to the RTC, restored after): the lease holder −20 s mid-wait, a majority voter +45 s, the victim −60 s with the witness bridging it; one proof each, no replacement before the pause wait, exactly once | ~32 min |
 
+The witness drills run with `enforcement.lease_term` off (the default) and on.
+Each reads the mode from every host's own `litevirt_enforcement_config_enabled`
+and `litevirt_enforcement_latched` gauges for `lease_term_v1` (enforcing is
+both), records it in the timeline and `lease-term-mode.txt`, and skips when the
+hosts disagree or while a host has the flag on and no latch yet; a mode that
+changes during the drill fails it. Both modes assert the same safety:
+sampling, never twice, one proof, the pause bounds. Off, no host may log a
+lease-term refusal during the drill or raise
+`litevirt_runtime_action_refused_total{reason="lease_term_unconfirmed"}`, W4a's stranded value cannot be the lease-term gate, and W5a logs rather
+than fails a proof whose term is not its coordinator's tenure. To run the on
+mode, set `enforcement.lease_term: true` on every host, restart each, and wait
+for `lease_term_v1` in `lv cluster upgrade-status`; the latch stays, and
+setting the flag back to false on every host returns the drills to off.
+
 Findings the drills used to skip or work around are fixed on main, and the
 drills now assert them directly: N3 (recovery on a forced 2-voter generation)
 and N4 (a stale claim destination) in drill 6, N7 (disk rows follow the VM)

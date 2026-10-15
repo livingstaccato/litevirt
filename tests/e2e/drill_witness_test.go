@@ -22,6 +22,11 @@ import (
 // Every drill checks the lab is the one the design reasons about
 // (requireWitnessTopology: five workers voting, one witness outside them that
 // does not vote, the tokens latched) and skips, saying why, when it is not.
+// enforcement.lease_term is read from the cluster, not required: every drill
+// runs with it off (the default) and on, and asserts the same safety in both
+// (requireLeaseTermMode). What differs: off, no host may refuse on a lease
+// term; W4a's outcome C cannot be the lease-term gate; and W5a only logs a
+// proof whose term is not the tenure its coordinator held.
 // Every fault registers its undo before it goes in; every drill samples where
 // each workload executes once a second and checks assertNeverTwice over every
 // sample in a cleanup, however it ends (startCheckedSampler). Log lines and
@@ -612,6 +617,8 @@ func (l *lab) powerOnOwnerManual(via, owner, strategy string) {
 //   - C (FAIL, design question Q5): the decided proof is P1, the VM does not
 //     run by recoverBy, and the destination logs "reconciler: pending proof
 //     refused by the lease-term gate" for it (health/reconciler.go:1634).
+//     With lease_term off the gate is inert, so a refusal fails the drill as
+//     the kill switch not honoured, and a stranded P1 is not Q5 (w4aVerdict).
 //
 // A run in which no voter accepted a value in outage 1 is skipped as
 // inconclusive, with the claim view saved.
@@ -619,7 +626,7 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 	l := newLab(t)
 	b := l.requireBaseline()
 	l.restoreOnCleanup(b)
-	l.requireWitnessTopology(l.hosts[0])
+	wt := l.requireWitnessTopology(l.hosts[0])
 	w := l.w4Begin("w4a", claimWatch)
 	via := l.pick(func(h string) bool { return h != w.owner && h != w.decider }, false)
 	p1, acceptors, attempt := l.outage1Value(w, via)
@@ -711,26 +718,26 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 	if decided != nil {
 		dp = decided.decidedProof()
 	}
-	switch {
-	case recovered && dp == p1:
-		l.mark("w4a: outcome A — the accepted value (proof %s) was adopted and decided at attempt %d", p1, decided.N)
+	gateRefused := false
+	if decided != nil && dp == p1 && !recovered {
+		j := strings.TrimSpace(l.journalSince(decided.DecidedDest, w.since, journalPair("reconciler: pending proof refused by the lease-term gate", "proof", p1)))
+		gateRefused = j != ""
+		if gateRefused {
+			l.mark("w4a: %s refused %s by the lease-term gate:\n%s", decided.DecidedDest, p1, j)
+		}
+	}
+	v := w4aVerdict(wt.lt, recovered, decided != nil, dp, p1, gateRefused)
+	switch v.Name {
+	case "A":
+		l.mark("w4a: outcome A — the accepted value (proof %s) was adopted and decided at attempt %d (lease_term %s)", p1, decided.N, wt.lt.Mode)
 		if !l.waitProofStatus(v3, p1, "completed", 2*time.Minute) {
 			t.Errorf("outcome A: the adopted proof %s did not complete (status %q)", p1, l.proofStatus(v3, p1))
 		}
-	case recovered:
-		l.mark("w4a: outcome B — not adopted: decided proof %q, outage 1's was %s", dp, p1)
-		if decided == nil {
-			t.Errorf("%s recovered, but no attempt reads decided:\n%s", w.key, out)
-		}
-	case dp == p1 && decided != nil:
-		j := l.journalSince(decided.DecidedDest, w.since, journalPair("reconciler: pending proof refused by the lease-term gate", "proof", p1))
-		if strings.TrimSpace(j) != "" {
-			t.Errorf("outcome C (design Q5): the adopted value's proof %s is refused by the lease-term gate on %s and the VM is stranded:\n%s", p1, decided.DecidedDest, j)
-		} else {
-			t.Errorf("%s not recovered within %v; the decided proof is outage 1's %s, with no lease-term refusal logged on %s", w.key, recoverBy, p1, decided.DecidedDest)
-		}
-	default:
-		t.Errorf("%s not recovered within %v of its owner losing power (decided proof %q):\n%s", w.key, recoverBy, dp, out)
+	case "B":
+		l.mark("w4a: outcome B — not adopted: decided proof %q, outage 1's was %s (lease_term %s)", dp, p1, wt.lt.Mode)
+	}
+	if v.Fail != "" {
+		t.Errorf("w4a outcome %s, lease_term %s: %s; %s within %v of its owner losing power:\n%s", v.Name, wt.lt.Mode, v.Fail, w.key, recoverBy, out)
 	}
 	if j := strings.TrimSpace(l.journalSince(v3, w.since, "a decided recovery will never execute; moving the claim to the next attempt")); j != "" {
 		l.mark("w4a: claims.go:230 on %s:\n%s", v3, j)
@@ -997,8 +1004,10 @@ func (l *lab) w5HolderBack(w witnessTopology, used []string) string {
 		// skewed holder is expected to lose the lease after minting.
 		var ok bool
 		minted, ok = tenureAt(lw.history(), mintTime(created, ps[0].Coordinator, h, stepAt, w.hlc), ps[0].Coordinator, ps[0].LeaseTerm)
-		if !ok {
+		if !ok && w.lt.TenureStrict {
 			t.Errorf("proof %s was minted by %s at term %d at %s, but the lease then was %+v (history %+v)", ps[0].ID, ps[0].Coordinator, ps[0].LeaseTerm, ps[0].Created, minted, lw.history())
+		} else if !ok {
+			l.mark("w5a: lease_term %s: proof %s carries %s's term %d, not the tenure in force at %s (%+v); a superseded stamp is not refused in this mode, and the recovery claim still allows one proof", w.lt.Mode, ps[0].ID, ps[0].Coordinator, ps[0].LeaseTerm, ps[0].Created, minted)
 		}
 	}
 	for _, ln := range l.journalLines(h, hSince, "lease lost, unshown or renewed as a new tenure mid-cycle, aborting") {
@@ -1010,8 +1019,14 @@ func (l *lab) w5HolderBack(w witnessTopology, used []string) string {
 				continue
 			}
 			// A proof h minted after losing the lease must rest on a tenure h
-			// took afresh after the loss.
-			if minted.Holder != h || minted.At.Before(lostAt.Add(-clockSlack)) {
+			// took afresh after the loss. The coordinator's own lease check
+			// holds that in either mode; with lease_term off the tenure is
+			// found in the history rather than in the proof's term.
+			fresh := minted.Holder == h && !minted.At.Before(lostAt.Add(-clockSlack))
+			if !w.lt.TenureStrict {
+				fresh = freshTenureAt(lw.history(), h, lostAt, mintTime(created, h, h, stepAt, w.hlc))
+			}
+			if !fresh {
 				t.Errorf("%s minted %s at term %d after losing the lease at %s, under no tenure taken since", h, p.ID, p.LeaseTerm, lostAt.UTC().Format("15:04:05"))
 			}
 		}

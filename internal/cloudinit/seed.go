@@ -28,12 +28,48 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 	if err != nil {
 		return "", fmt.Errorf("read NICs of %q: %w", vmName, err)
 	}
+	// Each spec NIC's row: by MAC where the spec records one. A VM created
+	// before the spec recorded generated MACs has none, and takes the row of
+	// its ordinal, else the one row on its network. A NIC whose row cannot be
+	// told has no MAC, and NetworkConfig then writes no network-config.
 	byMAC := map[string]corrosion.InterfaceRecord{}
+	byOrdinal := map[int]corrosion.InterfaceRecord{}
+	byNet := map[string][]corrosion.InterfaceRecord{}
 	for _, r := range rows {
 		byMAC[strings.ToLower(r.MAC)] = r
+		byOrdinal[r.Ordinal] = r
+		byNet[r.NetworkName] = append(byNet[r.NetworkName], r)
+	}
+	// A row is one NIC's: one another spec NIC already took is not taken
+	// again.
+	macs := make([]string, len(spec.Network))
+	taken := map[string]bool{}
+	for i, n := range spec.Network {
+		if m := strings.ToLower(strings.TrimSpace(n.GetMac())); m != "" {
+			macs[i] = m
+			taken[m] = true
+		}
+	}
+	for i, n := range spec.Network {
+		if macs[i] != "" {
+			continue
+		}
+		if r, ok := byOrdinal[i]; ok && r.NetworkName == n.GetName() && !taken[strings.ToLower(r.MAC)] {
+			macs[i] = strings.ToLower(r.MAC)
+		} else if rs := byNet[n.GetName()]; len(rs) == 1 && !taken[strings.ToLower(rs[0].MAC)] {
+			macs[i] = strings.ToLower(rs[0].MAC)
+		}
+		if macs[i] != "" {
+			taken[macs[i]] = true
+		}
 	}
 	nics := make([]NIC, 0, len(spec.Network))
 	for i, n := range spec.Network {
+		mac := strings.TrimSpace(n.GetMac())
+		if mac == "" {
+			mac = macs[i]
+		}
+		row := byMAC[strings.ToLower(mac)]
 		def, err := NetworkDef(ctx, db, n.GetName())
 		if err != nil {
 			return "", err
@@ -45,9 +81,9 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 			bound = true
 		}
 		nics = append(nics, NIC{
-			Ordinal: i, MAC: n.GetMac(),
+			Ordinal: i, MAC: mac,
 			IP: n.GetIp(), Gateway: n.GetGateway(), IPv6: n.GetIpv6(), IPv6Gateway: n.GetIpv6Gateway(),
-			RecordedIP: byMAC[strings.ToLower(n.GetMac())].IP,
+			RecordedIP: row.IP,
 			Net:        def, Bound: bound,
 		})
 	}

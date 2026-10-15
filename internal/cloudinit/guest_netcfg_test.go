@@ -90,7 +90,8 @@ func TestGuestNetworkConfigV2_EveryEntryIsRenamed(t *testing.T) {
 // fallback asks both): sysconfig's DHCPV6C=yes on an IPv4-only network can
 // stall ifup.
 //
-// Mutation: set DHCP6 for every DHCP NIC in NetworkConfig — red.
+// Mutation: set DHCP6 for every DHCP NIC in NetworkConfig — red; drop the
+// Subnet == "" case — the flat-bridge check goes red.
 func TestNetworkConfig_DHCPv6OnlyWhereTheNetworkHasIPv6(t *testing.T) {
 	doc := NetworkConfig([]NIC{
 		{Ordinal: 0, MAC: "52:54:00:00:00:01", Net: &compose.NetworkDef{Type: "bridge", Subnet: "10.0.0.0/24", DHCP: true}},
@@ -100,6 +101,31 @@ func TestNetworkConfig_DHCPv6OnlyWhereTheNetworkHasIPv6(t *testing.T) {
 	golden.Assert(t, "testdata/netconfig_v2_dhcp6.golden", doc)
 	if strings.Count(doc, "dhcp6: true") != 2 {
 		t.Errorf("want dhcp6 on the IPv6 and the unrecorded network only:\n%s", doc)
+	}
+	// Re-review R1-m4: a recorded network with no subnet (a flat bridge to
+	// an external LAN) is the fallback's case too.
+	flat := NetworkConfig([]NIC{
+		{Ordinal: 0, MAC: "52:54:00:00:00:01", Net: &compose.NetworkDef{Type: "bridge", Subnet: "10.0.0.0/24", DHCP: true}},
+		{Ordinal: 1, MAC: "52:54:00:00:00:02", Net: &compose.NetworkDef{Type: "bridge"}},
+	})
+	if strings.Count(flat, "dhcp6: true") != 1 || !strings.Contains(flat, "route-metric: 101\n    dhcp6: true") {
+		t.Errorf("a recorded network with no subnet: want dhcp6 on it:\n%s", flat)
+	}
+}
+
+// Re-review R1-I1: a NIC whose MAC is not known cannot be matched in the
+// guest; a set with one gets no network-config, never an entry with an
+// empty MAC.
+//
+// Mutation: drop the empty-MAC guard — red.
+func TestNetworkConfig_NoMACWritesNone(t *testing.T) {
+	for _, nics := range [][]NIC{
+		{{Ordinal: 0, MAC: "52:54:00:00:00:01"}, {Ordinal: 1}},
+		{{Ordinal: 0, IP: "10.0.0.10"}, {Ordinal: 1, MAC: "52:54:00:00:00:02", IP: "10.0.0.11"}},
+	} {
+		if got := NetworkConfig(nics); got != "" {
+			t.Errorf("a NIC with no MAC: want no network-config, got:\n%s", got)
+		}
 	}
 }
 

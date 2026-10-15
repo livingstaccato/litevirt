@@ -99,3 +99,35 @@ func TestDomainXMLFor_RebuildsTheCreatedSeed(t *testing.T) {
 		t.Errorf("rebuilt seed network-config:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+// Re-review R1-m1: a read that fails while deriving the network-config
+// writes no seed — a seed written without it would be kept by every later
+// pass — and the start is retried.
+//
+// Mutation: log the error and write the seed anyway — a seed exists and the
+// failure is not retryable.
+func TestDomainXMLFor_UnreadableNetworkConfigIsRetried(t *testing.T) {
+	stageSeedGenisoimage(t)
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+		Network: []*pb.NetworkAttachment{{Name: "brnet", Mac: "52:54:00:aa:00:01"}}}
+	specJSON, _ := json.Marshal(spec)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+	if err := corrosion.InsertVM(ctx, db, vm, []corrosion.InterfaceRecord{
+		{VMName: "vm1", NetworkName: "brnet", MAC: "52:54:00:aa:00:01"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Execute(ctx, `DROP TABLE networks`); err != nil {
+		t.Fatal(err)
+	}
+	_, retryable, failure := r.domainXMLFor(ctx, vm, spec, nil)
+	if !retryable || !strings.Contains(failure, "network-config") {
+		t.Errorf("retryable=%v failure=%q, want a retryable failure naming the network-config", retryable, failure)
+	}
+	iso, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm1")
+	if _, err := os.Stat(iso); err == nil {
+		t.Errorf("a seed was written without its network-config")
+	}
+}

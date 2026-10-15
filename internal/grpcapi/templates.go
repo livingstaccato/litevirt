@@ -590,12 +590,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			return nil, status.Errorf(codes.InvalidArgument, "%v", perr)
 		}
 		// The clone's own NICs' network-config, derived as a create derives
-		// it. A source whose spec names its own network-config gives the
-		// clone none, as before: that document names the source's addresses.
-		netCfg := ""
-		if srcSpec.CloudInit == nil || srcSpec.CloudInit.Networkconfig == "" {
-			netCfg = cloudinit.NetworkConfig(seedNICs)
-		}
+		// it. A network-config the source's spec names is the source's —
+		// its addresses — and is not the clone's (nor kept on its spec
+		// below).
+		netCfg := cloudinit.NetworkConfig(seedNICs)
 		if err := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    req.Target, // NEW id forces first-boot (regen SSH host keys, machine-id)
 			LocalHostname: req.Target,
@@ -624,6 +622,17 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			srcSpec.Network[i].Mac = ifaceRecords[i].MAC
 			srcSpec.Network[i].Ip = ifaceRecords[i].IP
 		}
+		// The source's static IPv6 address and gateways are the source's:
+		// a seed rebuilt from the clone's spec must not give them to the
+		// clone (the clone's own seed above has none).
+		srcSpec.Network[i].Ipv6 = ""
+		srcSpec.Network[i].Ipv6Gateway = ""
+		srcSpec.Network[i].Gateway = ""
+	}
+	// Nor the source's own network-config, which names the source's
+	// addresses: the clone's seed is derived from its own NICs.
+	if srcSpec.CloudInit != nil {
+		srcSpec.CloudInit.Networkconfig = ""
 	}
 	specJSON, _ := json.Marshal(&srcSpec)
 

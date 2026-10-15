@@ -25,7 +25,10 @@ type DuplicateAddress struct {
 }
 
 // HostIsolatedDuplicateAddrs lists the addresses on host-isolated networks
-// that more than one workload's live NIC rows hold: VM NICs (vm_nics and
+// whose addresses litevirt gives (compose.NetworkDef.HostIsolatedAddressable:
+// an IPv4 subnet on a type litevirt addresses — elsewhere the IP scanner
+// records whatever a guest leased and never clears it) that more than one
+// workload's live NIC rows hold: VM NICs (vm_nics and
 // vm_interfaces; a NIC both hold is one owner) and container NICs.
 // On such a network every address is litevirt's to give (or the operator's
 // explicit one) and nothing re-reads it from a lease, so two holders are two
@@ -40,8 +43,11 @@ func HostIsolatedDuplicateAddrs(ctx context.Context, c *Client) ([]DuplicateAddr
 	isolated := map[string]bool{}
 	for _, r := range nets {
 		var def compose.NetworkDef
-		if json.Unmarshal([]byte(r.String("config")), &def) == nil && def.HostIsolation {
-			isolated[r.String("name")] = true
+		if json.Unmarshal([]byte(r.String("config")), &def) == nil {
+			def.Type = r.String("type")
+			if def.HostIsolatedAddressable() {
+				isolated[r.String("name")] = true
+			}
 		}
 	}
 	if len(isolated) == 0 {

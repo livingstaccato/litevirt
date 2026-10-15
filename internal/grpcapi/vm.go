@@ -825,9 +825,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// which time its rows hold them or it failed (review m-4).
 	var isoPicks []isoPick
 	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
-	var specVIPs []string // the VIP this VM's own load balancer will take (review I-2)
-	if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
-		specVIPs = append(specVIPs, lb.GetVip())
+	// The VIPs this VM's own load balancer and its stack's will take
+	// (review I-2, R1-m2): their LB rows are written after the stack's VMs.
+	// Read only for a create that makes a host-isolated pick.
+	var specVIPs []string
+	specVIPsRead := false
+	pickVIPs := func() []string {
+		if !specVIPsRead {
+			specVIPsRead = true
+			specVIPs = s.stackVIPs(ctx, spec.GetStackName())
+			if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+				specVIPs = append(specVIPs, lb.GetVip())
+			}
+		}
+		return specVIPs
 	}
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
@@ -1010,7 +1021,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// the guest by the seed's network-config below (docs/compose.md,
 			// "Host isolation"). A NIC that cannot be given one is created as
 			// it always was, with no address, rather than refused.
-			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def, specVIPs); ierr != nil {
+			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def, pickVIPs()); ierr != nil {
 				slog.Warn("host-isolated network: no address for the NIC; the guest gets none",
 					"vm", spec.Name, "network", n.Name, "error", ierr)
 			} else {

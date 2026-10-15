@@ -324,7 +324,76 @@ func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 			if rebuilt != seed {
 				t.Errorf("rebuilt seed differs from the created one\ncreated:\n%s\nrebuilt:\n%s", seed, rebuilt)
 			}
+
+			// Re-review R1-I1: a VM created before the spec recorded
+			// generated MACs has none there. Its rows have them, by
+			// ordinal: the rebuild takes them, and never writes an empty
+			// MAC.
+			for _, n := range spec.Network {
+				n.Mac = ""
+			}
+			macless, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if macless == "" {
+				macless = noNetworkConfig
+			}
+			if macless != seed {
+				t.Errorf("rebuilt from a spec with no MACs, the seed differs\ncreated:\n%s\nrebuilt:\n%s", seed, macless)
+			}
 		})
+	}
+}
+
+// Re-review R1-I1: a spec NIC whose MAC neither the spec nor the NIC rows
+// tell (here one the rows do not have) cannot be matched in the guest: the
+// rebuilt seed carries no network-config at all — the pre-branch rebuild,
+// cloud-init's fallback — and never an entry with an empty MAC.
+//
+// Mutation: drop the empty-MAC guard from cloudinit.NetworkConfig — the
+// document carries `macaddress: ""`.
+func TestSeedNetworkConfig_UnresolvableMACWritesNone(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"brnet": defBridgeDHCP, "hinet": defHostIsolated})
+	createSeeded(t, s, "m",
+		&pb.NetworkAttachment{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:14:01"},
+		&pb.NetworkAttachment{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:14:02"})
+	spec := &pb.VMSpec{Name: "m", Network: []*pb.NetworkAttachment{
+		{Name: "brnet"}, {Name: "hinet"}, {Name: "brnet"}}}
+	got, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, "m", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "" {
+		t.Errorf("an unresolvable NIC: want no network-config, got:\n%s", got)
+	}
+}
+
+// Re-review R1-m2: a VIP another VM of the same stack names is passed over
+// by a later VM's pick, though its LB row is written only after the stack's
+// VMs.
+//
+// Mutation: drop stackVIPs from CreateVM's pick — the second VM gets the VIP.
+func TestCreateVM_HostIsolatedPickSkipsItsStacksVIPs(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
+	a := seedCreateRequest(t, s, "st-a", "")
+	a.Spec.StackName = "st"
+	a.Spec.Network = []*pb.NetworkAttachment{{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:15:01"}}
+	// Not enabled, so CreateVM writes no LB row of its own (it does for an
+	// enabled one, asynchronously): the stack's spec is all that names it,
+	// as in a deploy, which writes its LB rows after its VMs.
+	a.Spec.Loadbalancer = &pb.LBSpec{Enabled: false, Vip: "10.212.0.3/24"}
+	if _, err := s.CreateVM(adminCtx(), a); err != nil {
+		t.Fatal(err)
+	}
+	b := seedCreateRequest(t, s, "st-b", "")
+	b.Spec.StackName = "st"
+	b.Spec.Network = []*pb.NetworkAttachment{{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:15:02"}}
+	if _, err := s.CreateVM(adminCtx(), b); err != nil {
+		t.Fatal(err)
+	}
+	if got := nicIPs(t, s, "st-b")["hinet"]; got != "10.212.0.4" {
+		t.Errorf("second stack VM's address = %q, want 10.212.0.4 (.2 is st-a's, .3 is st-a's VIP)", got)
 	}
 }
 
@@ -332,7 +401,9 @@ func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 // address, and the clone's seed configures it, where before the clone booted
 // on cloud-init's fallback with no address.
 //
-// Mutation: drop the host-isolated branch from cloneVMOnSource — red.
+// Mutation: drop the host-isolated branch from cloneVMOnSource — red; keep
+// the source's ipv6:/gateway: or network-config on the clone's spec — the
+// rebuilt seed differs.
 func TestCloneVM_HostIsolatedNICGetsItsOwnAddress(t *testing.T) {
 	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
 	ctx := adminCtx()
@@ -344,7 +415,9 @@ func TestCloneVM_HostIsolatedNICGetsItsOwnAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "src", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
-		Network: []*pb.NetworkAttachment{{Name: "hinet", Mac: "52:54:00:00:13:01"}}})
+		CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n{}\n", Networkconfig: "version: 1\nconfig: []\n# the source's\n"},
+		Network: []*pb.NetworkAttachment{{Name: "hinet", Mac: "52:54:00:00:13:01",
+			Gateway: "10.212.0.254", Ipv6: "fd00::13", Ipv6Gateway: "fd00::1"}}})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{Name: "src", HostName: "test-host", State: "stopped", Spec: string(specJSON)},
 		[]corrosion.InterfaceRecord{{VMName: "src", NetworkName: "hinet", MAC: "52:54:00:00:13:01", IP: "10.212.0.2"}},
@@ -365,6 +438,18 @@ func TestCloneVM_HostIsolatedNICGetsItsOwnAddress(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "address: "+got+"/24") {
 		t.Errorf("the clone's seed does not give it %s:\n%s", got, b)
+	}
+
+	// Re-review R1-m5: a seed rebuilt from the clone's spec (a failover
+	// before its first boot) is the clone's own: not the source's IPv6
+	// address, gateway or network-config.
+	spec := clonedSpec(t, s, "c1")
+	rebuilt, err := cloudinit.SeedNetworkConfig(ctx, s.db, "c1", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt != string(b) {
+		t.Errorf("the clone's rebuilt seed differs from its own\nclone:\n%s\nrebuilt:\n%s", b, rebuilt)
 	}
 }
 

@@ -14,7 +14,8 @@ import (
 // VM against container — counts a VM whose NIC both VM tables hold once, and leaves
 // other networks (where a stale lease row would be a false alarm) alone.
 //
-// Mutation: drop the isolated filter — the DHCP network's pair is reported.
+// Mutation: drop the isolated filter — the DHCP network's pair is reported;
+// accept any host-isolation network — the subnet-less one's pair is.
 func TestHostIsolatedDuplicateAddrs(t *testing.T) {
 	ctx := context.Background()
 	c := NewTestClientT(t)
@@ -24,6 +25,9 @@ func TestHostIsolatedDuplicateAddrs(t *testing.T) {
 	for name, def := range map[string]compose.NetworkDef{
 		"hi": {Type: "vxlan", Subnet: "10.9.0.0/24", HostIsolation: true},
 		"br": {Type: "bridge", Subnet: "10.8.0.0/24", DHCP: true},
+		// Host-isolated with no subnet: the scanner records what guests
+		// lease from an external server there (re-review R1-m3).
+		"hx": {Type: "bridge", HostIsolation: true},
 	} {
 		cfg, _ := json.Marshal(def)
 		if err := UpsertNetwork(ctx, c, NetworkRecord{Name: name, Type: def.Type, Config: string(cfg)}); err != nil {
@@ -45,6 +49,8 @@ func TestHostIsolatedDuplicateAddrs(t *testing.T) {
 	vm("c", "n1", "52:54:00:00:00:03", "hi", "10.9.0.6")
 	vm("d", "n1", "52:54:00:00:00:04", "br", "10.8.0.7")
 	vm("e", "n2", "52:54:00:00:00:05", "br", "10.8.0.7")
+	vm("f", "n1", "52:54:00:00:00:07", "hx", "192.168.1.9")
+	vm("g", "n2", "52:54:00:00:00:08", "hx", "192.168.1.9")
 	if err := UpsertContainerInterface(ctx, c, ContainerInterfaceRecord{HostName: "n2", CtName: "ct", NetworkName: "hi",
 		MAC: "52:54:00:00:00:06", IP: "10.9.0.6"}); err != nil {
 		t.Fatal(err)

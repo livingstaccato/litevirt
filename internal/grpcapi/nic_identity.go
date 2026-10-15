@@ -10,7 +10,9 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"hash/fnv"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"time"
@@ -312,6 +314,34 @@ func (s *Server) hostIsolatedAddress(ctx context.Context, netName string, def *c
 	}
 	s.isoPending[netName][ip] = time.Now()
 	return ip, nil
+}
+
+// stackVIPs are the load balancer VIPs the stack's VMs already recorded
+// name in their specs: an LB row is written only after its stack's VMs, so
+// a VM created after one that names a VIP must still pass over it. A VIP
+// named by a VM of the stack created later is not known yet
+// (docs/compose.md: list it in reserved-addresses). Read only; a read
+// failure gives none.
+func (s *Server) stackVIPs(ctx context.Context, stack string) []string {
+	if stack == "" {
+		return nil
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, stack, "")
+	if err != nil {
+		slog.Warn("host-isolated pick: could not read the stack's VMs for their VIPs", "stack", stack, "error", err)
+		return nil
+	}
+	var out []string
+	for _, vm := range vms {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) != nil {
+			continue
+		}
+		if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+			out = append(out, lb.GetVip())
+		}
+	}
+	return out
 }
 
 // isoScanOffset is where this host's scan of netName's subnet starts.

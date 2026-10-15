@@ -32,8 +32,16 @@ type NIC struct {
 }
 
 // NetworkConfig is the network-config litevirt writes into a VM's seed for
-// nics, "" for none (see GuestNetworkConfig).
+// nics, "" for none (see GuestNetworkConfig). A NIC whose MAC is not known
+// cannot be matched in the guest, so a set with one gets none at all — the
+// guest boots on cloud-init's fallback, as before litevirt derived a
+// network-config for DHCP NICs.
 func NetworkConfig(nics []NIC) string {
+	for _, n := range nics {
+		if strings.TrimSpace(n.MAC) == "" {
+			return ""
+		}
+	}
 	var guest []GuestNIC
 	for _, n := range nics {
 		ip := n.IP
@@ -46,7 +54,7 @@ func NetworkConfig(nics []NIC) string {
 			// to configure.
 			dhcp := n.Net == nil || !n.Net.HostIsolation
 			guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, DHCP: dhcp,
-				DHCP6: dhcp && (n.Net == nil || subnetIsIPv6(n.Net.Subnet))})
+				DHCP6: dhcp && (n.Net == nil || n.Net.Subnet == "" || subnetIsIPv6(n.Net.Subnet))})
 			continue
 		}
 		address, gateway := StaticAddress(ip, n.Gateway, n.Net)
@@ -78,23 +86,9 @@ func subnetIsIPv6(subnet string) bool {
 }
 
 // HostIsolatedAddressable reports whether a NIC that names no address on
-// network def is given one by litevirt: a host-isolated network runs no DHCP
-// server on any host (network.DHCPWouldServe), so its guests are addressed
-// through cloud-init from the network's subnet (docs/compose.md, "Host
-// isolation"). IPv4 subnets on the types litevirt addresses; sriov and direct
-// attach guests to hardware litevirt does not address, and a NetBox-bound
-// network's addresses are NetBox's.
+// network def is given one by litevirt (compose.NetworkDef.HostIsolatedAddressable).
 func HostIsolatedAddressable(def *compose.NetworkDef) bool {
-	if def == nil || !def.HostIsolation || def.Subnet == "" || def.NetBoxPrefixID != 0 {
-		return false
-	}
-	switch def.Type {
-	case "", "bridge", "vxlan", "isolated":
-	default:
-		return false
-	}
-	p, err := netip.ParsePrefix(strings.TrimSpace(def.Subnet))
-	return err == nil && p.Addr().Is4()
+	return def != nil && def.HostIsolatedAddressable()
 }
 
 // StaticIface is one NIC's static addressing in a network-config.

@@ -2302,9 +2302,9 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		// Regenerate the seed the VM was created with: its user-data, and
 		// the network-config derived from the spec, its NIC rows and its
 		// networks exactly as CreateVM derived it (a cloud image with no
-		// cloud-init in its spec got the empty user-data). A network-config
-		// that cannot be derived is written as none, as before this was
-		// derived at all.
+		// cloud-init in its spec got the empty user-data). A read that fails
+		// writes no seed — one written without its network-config would be
+		// kept by every later pass — and the start is retried.
 		userData := ""
 		if spec.CloudInit != nil {
 			userData = spec.CloudInit.Userdata
@@ -2315,6 +2315,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec)
 		if ncErr != nil {
 			slog.Warn("reconciler: cloud-init network-config could not be derived", "vm", vm.Name, "error", ncErr)
+			return "", true, fmt.Sprintf("derive cloud-init network-config: %v", ncErr) // transient DB
 		}
 		if genErr := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    vm.Name,

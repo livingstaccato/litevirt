@@ -48,7 +48,8 @@ func (c *Coordinator) mono() time.Time {
 // relyOnPartitionPause reports whether this coordinator may rely on h pausing
 // itself: the predicate (flag && partition_pause_v1 latched) holds, and the
 // host has no open partition_pause_failed in this replica. A read error does
-// not rely (§4.3).
+// not rely (§4.3). Why it does not rely is logged once per host and reason
+// (noteNotRelying), not on every cycle that asks.
 func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.HostRecord) bool {
 	if c.PartitionPauseEnforced == nil || !c.PartitionPauseEnforced(ctx) {
 		return false
@@ -57,22 +58,42 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	// changes only with a restart, and the probe reaches each run within a
 	// probe interval, which a cached Ping does not (§4.3).
 	if c.PeerPausesOnLoss == nil || !c.PeerPausesOnLoss(h.Name) {
-		slog.Warn("failover: the host's latest probe answer did not say it pauses on losing the majority; not relying on its pause",
-			"host", h.Name)
+		c.noteNotRelying(h.Name, "no_word", func() {
+			slog.Warn("failover: the host's latest probe answer did not say it pauses on losing the majority; not relying on its pause",
+				"host", h.Name)
+		})
 		return false
 	}
 	failed, err := corrosion.HostPartitionPauseFailed(ctx, c.db, h.Name)
 	if err != nil {
-		slog.Warn("failover: could not read whether the host's partition pause failed; not relying on it",
-			"host", h.Name, "error", err)
+		c.noteNotRelying(h.Name, "read_error", func() {
+			slog.Warn("failover: could not read whether the host's partition pause failed; not relying on it",
+				"host", h.Name, "error", err)
+		})
 		return false
 	}
 	if failed {
-		slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
-			"host", h.Name)
+		c.noteNotRelying(h.Name, "pause_failed", func() {
+			slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
+				"host", h.Name)
+		})
 		return false
 	}
+	delete(c.notRelying, h.Name)
 	return true
+}
+
+// noteNotRelying runs log when host's reason for not relying on its pause is
+// new: it differs from the last one logged, or the pause was relied on since.
+func (c *Coordinator) noteNotRelying(host, reason string, log func()) {
+	if c.notRelying == nil {
+		c.notRelying = map[string]string{}
+	}
+	if c.notRelying[host] == reason {
+		return
+	}
+	c.notRelying[host] = reason
+	log()
 }
 
 // reliesOnPauseIfAssumed is relyOnPartitionPause, decided BEFORE a fence of h
@@ -181,7 +202,7 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 		return true
 	}
 	delete(c.pauseWaits, host)
-	v := c.selfPauseStillStands(ctx, h, w.fenceAt)
+	v := c.selfPauseStillStands(ctx, h, w.fenceAt, w.deadline.Add(-w.wait))
 	if !v.ok {
 		c.refusePauseWait(ctx, h, w, v)
 		return false
@@ -200,6 +221,10 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	// condition from this outage is readable, and keeps the limit it finds
 	// when there is none (pausedThisOutage).
 	c.limitRecovery(host, only)
+	// A claim retry this recovery leaves owed acts on this wait's start, the
+	// moment the fence (or a retry's fresh wait) began it, and no observer
+	// may have seen the host answer since (claimRetryOutageOver).
+	c.noteRecoveryAt(host, w.fenceAt, w.deadline.Add(-w.wait))
 	c.recoverWorkloads(ctx, h)
 	return true
 }
@@ -254,10 +279,20 @@ func refused(why string) pauseVerdict { return pauseVerdict{why: why, key: why} 
 // keyAnswered is the key of a refusal on observers having seen the host
 // answer since the fence (whyAnswered), and keyVoterMajority of one on a
 // voter majority having seen it answer (answeredByAVoterMajority).
+// keyRestarted is the key of a refusal on observers whose failing run began
+// after the fence (whyRestarted), and keyContacted of one on this node having
+// probed the host healthy since its wait began (whyContacted). Neither is a
+// bridge: no observer's latest verdict is an answer.
 const (
 	keyAnswered      = "observers saw the host answer after the fence"
 	keyVoterMajority = "a voter majority last saw the host answer: it may hold its majority"
+	keyRestarted     = "observers' failing runs began after the fence"
+	keyContacted     = "this node probed the host healthy since the wait began"
 )
+
+// whyContacted is the reason a deadline is not quiet when this node has
+// probed the host healthy since the wait began (LastContact).
+const whyContacted = "this node probed the host healthy since the wait began"
 
 // selfPauseStillStands is fenceStillStands for a self-pause fence at its
 // deadline (docs/design/partition-pause.md §4.2 step 3).
@@ -305,7 +340,14 @@ const (
 //
 // host_health about h is read once, and every check here is made over that
 // one read.
-func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at time.Time) pauseVerdict {
+//
+// On the explicit voter set the deadline is quiet only when, besides no
+// observer's latest verdict being an answer, no observer's failing run began
+// after at (restartedSinceObserversIn) and this node has not probed the host
+// healthy since mono, the wait's start on its monotonic clock (LastContact;
+// a zero mono skips that). Either is an answer since the fence overwritten or
+// unseen by the rows, and the host's own word, dated to this outage, decides.
+func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.HostRecord, at, mono time.Time) pauseVerdict {
 	hr := c.readHostHealth(ctx, h.Name)
 	if !c.relyOnPartitionPause(ctx, h) {
 		v := c.quietFallback(ctx, hr, h.Name, at)
@@ -337,6 +379,16 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		return v
 	}
 	answered, observers, quiet := c.answeredSinceIn(hr, h.Name, at)
+	key, bridged := keyAnswered, true
+	if quiet {
+		if r := restartedSinceObserversIn(hr, h.Name, at); len(r) > 0 {
+			answered, observers, quiet = whyRestarted(r), nil, false
+			key, bridged = keyRestarted, false
+		} else if !mono.IsZero() && c.contactedSince(h.Name, mono) {
+			answered, observers, quiet = whyContacted, nil, false
+			key, bridged = keyContacted, false
+		}
+	}
 	if quiet {
 		why, only, ok := c.pausedThisOutageIn(ctx, hr, h.Name, at, sets)
 		if !ok {
@@ -352,8 +404,8 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 		// A store error, not a bridge: named on its own.
 		return refused(whyPausedUnreadable)
 	}
-	return pauseVerdict{why: answered + ", and " + reason, key: keyAnswered + ", and " + reason,
-		bridged: true, observers: observers}
+	return pauseVerdict{why: answered + ", and " + reason, key: key + ", and " + reason,
+		bridged: bridged, observers: observers}
 }
 
 // quietFallback is fenceStillStands, for a deadline that keeps its rule
@@ -361,14 +413,20 @@ func (c *Coordinator) selfPauseStillStands(ctx context.Context, h *corrosion.Hos
 // and this coordinator already limits the host's recovery from earlier in the
 // down-episode, the host's own word still bounds what moves:
 // pausedThisOutage, dating the outage over the voter set this cycle decides
-// on. A refusal on observers having seen the host answer since the fence
-// (not a read error) is reported bridged: the form selfPauseStillStands
-// raises on a derived voter set.
+// on. A refusal on observers whose latest verdict is an answer since the
+// fence is reported bridged: the form selfPauseStillStands raises on a
+// derived voter set. One on failing runs begun after the fence alone, or a
+// read error, is not.
 func (c *Coordinator) quietFallback(ctx context.Context, hr healthRead, host string, at time.Time) pauseVerdict {
 	why, observers, ok := c.fenceStillStandsIn(hr, host, at)
 	if !ok {
-		if len(observers) > 0 {
+		switch {
+		case len(observers) > 0 && len(answeredSinceObserversIn(hr, host, at)) > 0:
 			return pauseVerdict{why: why, key: keyAnswered, bridged: true, observers: observers}
+		case len(observers) > 0:
+			// Failing runs begun after the fence: an answer the rows have
+			// overwritten, not a bridge (keyRestarted).
+			return pauseVerdict{why: why, key: keyRestarted}
 		}
 		return refused(why)
 	}

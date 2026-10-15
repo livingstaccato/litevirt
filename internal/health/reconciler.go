@@ -142,7 +142,8 @@ type Reconciler struct {
 	// pitHeldReported: the holds already reported when no reporter is wired
 	// (reportPITHeld).
 	pitHeldReported sync.Map
-	settleProofs    func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	// settleProofs replaces corrosion.TransferProofs (tests).
+	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	// settleDeclines rate-limits the decline report (settle_declined.go).
 	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
@@ -2341,7 +2342,10 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		slog.Error("reconciler: invalid vm name for cloud-init path", "vm", vm.Name, "error", isoErr)
 		return "", false, fmt.Sprintf("invalid name: %v", isoErr) // non-retryable
 	}
-	if _, err := os.Stat(isoPath); err == nil {
+	// A seed here is reused only when it is this VM's: one left by a deleted
+	// VM of the name would boot its user-data (cloudinit/seed_owner.go).
+	seedOwner := cloudinit.SpecUUID(vm.Spec)
+	if cloudinit.SeedIsFor(isoPath, seedOwner) {
 		cloudInitISO = isoPath
 	} else if spec.CloudInit != nil || spec.Image != "" {
 		// Regenerate the seed the VM was created with: its user-data, and
@@ -2371,6 +2375,11 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {
 			cloudInitISO = isoPath
+		}
+	}
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, seedOwner); err != nil {
+			slog.Warn("reconciler: could not stamp the cloud-init seed with its VM", "vm", vm.Name, "error", err)
 		}
 	}
 

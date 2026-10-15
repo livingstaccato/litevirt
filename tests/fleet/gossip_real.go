@@ -209,9 +209,16 @@ func (c *Cluster) openGossipDB(n *Node) {
 	if err := mkdirAll(cfg.DataDir); err != nil {
 		c.t.Fatalf("mkdir corrosion dir for %s: %v", n.Name, err)
 	}
-	db, err := corrosion.NewClient(cfg, hlc.NewClock(n.Name))
+	clock := hlc.NewClock(n.Name)
+	if c.opts.ClockSeam {
+		clock.SetNowForTests(n.Now)
+	}
+	db, err := corrosion.NewClient(cfg, clock)
 	if err != nil {
 		c.t.Fatalf("open gossiping DB for %s: %v", n.Name, err)
+	}
+	if c.opts.ClockSeam {
+		db.SetWallClockForTests(n.Now)
 	}
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)

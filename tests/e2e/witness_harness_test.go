@@ -2013,3 +2013,47 @@ func freshTenureAt(history []leaseChange, holder string, from, at time.Time) boo
 	}
 	return len(cands) > 1 && last.At.After(at.Add(-clockSlack)) && ok(cands[len(cands)-2])
 }
+
+// settleDeclinedEv is vm_settle_declined's evidence (health/settle_declined.go).
+type settleDeclinedEv struct {
+	ReasonClass string `json:"reason_class"`
+	Reason      string `json:"reason"`
+	RowHost     string `json:"row_host"`
+	Remedy      string `json:"remedy"`
+}
+
+// vmSettleDeclined reads host's vm_settle_declined about vm in via's replica.
+func (l *lab) vmSettleDeclined(via, vm, host string) (string, settleDeclinedEv, string, bool) {
+	rows, err := l.sql(via, fmt.Sprintf(
+		"SELECT lifecycle, hex(evidence) FROM health_conditions WHERE evaluator='%s' AND code='%s' AND subject_kind='vm' AND subject_id='%s@%s' AND deleted_at IS NULL",
+		corrosion.PartitionPauseEvaluator, corrosion.CondVMSettleDeclined, vm, host))
+	if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
+		return "", settleDeclinedEv{}, "", false
+	}
+	var ev settleDeclinedEv
+	b, err := hex.DecodeString(rows[0][1])
+	if err == nil {
+		_ = json.Unmarshal(b, &ev)
+	}
+	return rows[0][0], ev, string(b), true
+}
+
+// uncertifiedDeclineVerdict is nil when ev declines vm's copy because its move
+// to dest completed on a proof with no certificate, and its remedy checks the
+// replacement by dest's runtime and stops the copy with virsh — never through
+// `lv cluster claim`, which has no claim to show on a derived voter set.
+func uncertifiedDeclineVerdict(ev settleDeclinedEv, vm, dest string) error {
+	switch {
+	case ev.ReasonClass != "proof_uncertified":
+		return fmt.Errorf("reason class %q, want proof_uncertified (reason %q)", ev.ReasonClass, ev.Reason)
+	case ev.RowHost != dest:
+		return fmt.Errorf("row host %q, want the replacement's host %q", ev.RowHost, dest)
+	case strings.Contains(ev.Remedy, "lv cluster claim"):
+		return fmt.Errorf("the remedy points at a claim a derived voter set never decided: %s", ev.Remedy)
+	case !strings.Contains(ev.Remedy, "virsh domstate "+vm):
+		return fmt.Errorf("the remedy does not confirm the replacement by its runtime (virsh domstate %s): %s", vm, ev.Remedy)
+	case !strings.Contains(ev.Remedy, "virsh destroy "+vm):
+		return fmt.Errorf("the remedy does not name the stop (virsh destroy %s): %s", vm, ev.Remedy)
+	}
+	return nil
+}

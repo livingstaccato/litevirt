@@ -98,6 +98,9 @@ type ProofRecord struct {
 	ResultCode   string
 	ResultDetail string
 	ExecutorHost string
+	// Tombstoned: ReapSpentProofs has tombstoned the proof (read only by the
+	// listings that include tombstoned proofs).
+	Tombstoned bool
 }
 
 // Terminal reports whether the proof has reached a terminal state.
@@ -527,7 +530,8 @@ func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) 
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
 		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key, claim_certificate,
-		        status, step_state, result_code, result_detail, executor_host
+		        status, step_state, result_code, result_detail, executor_host,
+		        COALESCE(deleted_at, '') AS deleted_at
 		   FROM runtime_action_proofs WHERE id = ?`+live, id)
 	if err != nil {
 		return ProofRecord{}, false, err
@@ -549,7 +553,7 @@ func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) 
 		},
 		Status: r.String("status"), StepState: r.String("step_state"),
 		ResultCode: r.String("result_code"), ResultDetail: r.String("result_detail"),
-		ExecutorHost: r.String("executor_host"),
+		ExecutorHost: r.String("executor_host"), Tombstoned: r.String("deleted_at") != "",
 	}, true, nil
 }
 

@@ -126,6 +126,14 @@ func (c *Clock) SetPersistence(floorMS int64, persist func(ms int64) error, fata
 	c.persistFatal = fatal
 }
 
+// SetNowForTests replaces the clock's wall source, to model a node whose clock
+// runs ahead or behind. Test-only.
+func (c *Clock) SetNowForTests(now func() time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nowFn = now
+}
+
 // PhysicalMS returns the clock's current physical high-water in epoch-ms. Used to
 // bridge the RFC3339 emission path so it never emits below the HLC physical (a safe
 // hlc_lww rollback — see corrosion.Client.NowTS).

@@ -498,6 +498,7 @@ func TestHoldersIn(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
 // TestUncertifiedDeclineVerdict: W1's heal accepts a decline only when it says
 // the move to the destination completed on an uncertified proof and its remedy
 // confirms the replacement by its runtime and stops the copy with virsh, never

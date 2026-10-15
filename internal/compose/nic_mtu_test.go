@@ -3,6 +3,8 @@ package compose
 import (
 	"strings"
 	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func mtuYAML(model, mtu string) string {
@@ -76,5 +78,33 @@ func TestNICMTU_Marshal(t *testing.T) {
 	}
 	if !(NICMTU{}).IsZero() || (NICMTU{N: 1}).IsZero() {
 		t.Error("IsZero: only the unset value is zero")
+	}
+}
+
+// A NIC's mtu bakes into the domain, so a change is restart-class (a
+// redefine), never a recreate; removing the key from the file inherits the
+// stored value, as queues does.
+//
+// Mutation: classify an mtu change as no change — red; treat an unset mtu as
+// a change to 0 — the inherit case goes red.
+func TestClassify_NICMTU(t *testing.T) {
+	stored := baseSpec()
+	stored.Network[0].Mtu = 9000
+	d := desiredFrom(func(s *pb.VMSpec) { s.Network[0].Mtu = NICMTUBridge })
+	p := Classify(d, stored, StoredDisksFromSpec(stored))
+	if p.Max() != ActionRestart || !p.TuningRedefine || len(p.RecreateReasons) != 0 ||
+		!strings.Contains(strings.Join(p.RestartReasons, ";"), "nic 0 mtu 9000→bridge needs a redefine") {
+		t.Errorf("mtu 9000 → bridge: %v %+v", p.Max(), p)
+	}
+	if p := Classify(baseSpec(), stored, StoredDisksFromSpec(stored)); p.Max() != ActionNoChange || p.TuningRedefine {
+		t.Errorf("mtu removed from the file: %v %+v, want the stored value inherited", p.Max(), p)
+	}
+	same := desiredFrom(func(s *pb.VMSpec) { s.Network[0].Mtu = 9000 })
+	if p := Classify(same, stored, StoredDisksFromSpec(stored)); p.Max() != ActionNoChange {
+		t.Errorf("unchanged mtu: %v", p.Max())
+	}
+	set := desiredFrom(func(s *pb.VMSpec) { s.Network[0].Mtu = 9000 })
+	if p := Classify(set, baseSpec(), StoredDisksFromSpec(baseSpec())); p.Max() != ActionRestart || !p.TuningRedefine {
+		t.Errorf("mtu set on an untuned NIC: %v %+v", p.Max(), p)
 	}
 }

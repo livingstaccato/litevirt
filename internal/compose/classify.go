@@ -478,10 +478,10 @@ func networkTopologyEqual(desired, stored []*pb.NetworkAttachment) bool {
 	return true
 }
 
-// classifyTuning diffs the per-disk and per-NIC tuning: discard, detect_zeroes
-// and NIC queues bake into the domain (restart-class); a disk's I/O throttle is
-// applied to the running VM (live, "disk_io"). A disk or NIC the stored spec
-// lacks is a topology change, which the recreate checks own.
+// classifyTuning diffs the per-disk and per-NIC tuning: discard, detect_zeroes,
+// NIC queues and NIC MTUs bake into the domain (restart-class); a disk's I/O
+// throttle is applied to the running VM (live, "disk_io"). A disk or NIC the
+// stored spec lacks is a topology change, which the recreate checks own.
 func classifyTuning(desired, stored *pb.VMSpec, p *ChangePlan) {
 	storedDisks := make(map[string]*pb.DiskSpec, len(stored.Disks))
 	for _, d := range stored.Disks {
@@ -528,6 +528,28 @@ func classifyTuning(desired, stored *pb.VMSpec, p *ChangePlan) {
 			p.TuningRedefine = true
 		}
 	}
+	// A NIC's MTU bakes into the domain too; an unset one inherits.
+	for i, dn := range desired.Network {
+		if dn == nil || dn.Mtu == 0 || i >= len(stored.Network) || stored.Network[i] == nil {
+			continue
+		}
+		if dn.Mtu != stored.Network[i].Mtu {
+			p.RestartReasons = append(p.RestartReasons,
+				fmt.Sprintf("nic %d mtu %s→%s needs a redefine", i, nicMTUWord(stored.Network[i].Mtu), nicMTUWord(dn.Mtu)))
+			p.TuningRedefine = true
+		}
+	}
+}
+
+// nicMTUWord is a stored NIC MTU as the file spells it.
+func nicMTUWord(mtu int32) string {
+	switch mtu {
+	case 0:
+		return "unset"
+	case NICMTUBridge:
+		return "bridge"
+	}
+	return fmt.Sprint(mtu)
 }
 
 // effectiveQueues is what a stored queue count renders: below 2 is the single

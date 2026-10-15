@@ -6,9 +6,11 @@ import (
 	"strings"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
+	"google.golang.org/protobuf/proto"
 )
 
 func putNetwork(t *testing.T, s *Server, name, typ string, def compose.NetworkDef) {
@@ -42,7 +44,7 @@ func TestLBVIPInterface_OnTheNetworksBridge(t *testing.T) {
 		"10.100.0.50":  "br-vni1000",
 		"10.150.0.9":   compose.IsolatedBridgeName("iso"),
 	} {
-		got, err := s.lbVIPInterface(ctx, "", vip)
+		got, err := s.lbVIPInterface(ctx, "", "", vip)
 		if err != nil || got != want {
 			t.Errorf("VIP %s: interface %q, %v; want %q", vip, got, err, want)
 		}
@@ -58,7 +60,7 @@ func TestLBVIPInterface_RefusesWhenTheBridgeIsNotHere(t *testing.T) {
 	s := testServer(t)
 	s.SetBridgeExists(func(string) bool { return false })
 	putNetwork(t, s, "lbr_hinet", "bridge", compose.NetworkDef{Interface: "hinet", Subnet: "10.202.0.0/24", HostIsolation: true})
-	got, err := s.lbVIPInterface(context.Background(), "", "10.202.0.250")
+	got, err := s.lbVIPInterface(context.Background(), "", "", "10.202.0.250")
 	if err == nil {
 		t.Fatalf("VIP placed on %q with the network's bridge absent, want refused", got)
 	}
@@ -75,7 +77,7 @@ func TestLBVIPInterface_OutsideEveryNetwork(t *testing.T) {
 	s := testServer(t)
 	s.SetBridgeExists(func(string) bool { return true })
 	putNetwork(t, s, "lbr_hinet", "bridge", compose.NetworkDef{Interface: "hinet", Subnet: "10.202.0.0/24"})
-	got, err := s.lbVIPInterface(context.Background(), "", "192.0.2.50")
+	got, err := s.lbVIPInterface(context.Background(), "", "", "192.0.2.50")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,10 +143,61 @@ func TestLBVIPInterface_PrefersTheLBsOwnStack(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := s.lbVIPInterface(ctx, "b-lb", "10.10.0.50"); err != nil || got != "br-vni11" {
+	if got, err := s.lbVIPInterface(ctx, "b-lb", "", "10.10.0.50"); err != nil || got != "br-vni11" {
 		t.Errorf("stack b's LB: %q, %v; want stack b's bridge br-vni11", got, err)
 	}
-	if got, err := s.lbVIPInterface(ctx, "", "10.10.0.50"); err != nil || got != "br-vni10" {
+	if got, err := s.lbVIPInterface(ctx, "", "b", "10.10.0.50"); err != nil || got != "br-vni11" {
+		t.Errorf("stack named by a peer apply, no LB row: %q, %v; want br-vni11", got, err)
+	}
+	if got, err := s.lbVIPInterface(ctx, "", "", "10.10.0.50"); err != nil || got != "br-vni10" {
 		t.Errorf("no LB row: %q, %v; want the first by name, br-vni10", got, err)
+	}
+}
+
+// TestApplyLB_HonoursSNAT: a peer apply records SNAT for the LB's network
+// exactly when the request asks for it. A request with no snat field — from a
+// caller on an earlier build — gets SNAT, as every ApplyLB did before the
+// field; snat false records the VIP holes and no SNAT.
+//
+// Mutation: ignore req.Snat in ApplyLB — the false case goes red.
+func TestApplyLB_HonoursSNAT(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		snat *bool
+		want bool
+	}{
+		{"absent (an earlier build)", nil, true},
+		{"false", proto.Bool(false), false},
+		{"true", proto.Bool(true), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			s.SetBridgeExists(func(string) bool { return true })
+			s.lbApplyOverride = func(context.Context, lb.Config) error { return nil }
+			putNetwork(t, s, "lbr_hinet", "bridge", compose.NetworkDef{Interface: "hinet", Subnet: "10.202.0.0/24", HostIsolation: true})
+			ctx := peerCtxFor(t, s, "node-0")
+			if _, err := s.ApplyLB(ctx, &pb.ApplyLBRequest{
+				LbName: "lbr-lb", Vip: "10.202.0.250/24", Hosts: []string{"node-0", s.hostName},
+				Ports: []*pb.LBPort{{Listen: 80, Target: 8080, Protocol: "tcp"}}, Snat: tc.snat, StackName: "lbr",
+			}); err != nil {
+				t.Fatalf("ApplyLB: %v", err)
+			}
+			intents, err := corrosion.ListHostFWIntent(context.Background(), s.db, s.hostName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got *corrosion.HostFWIntent
+			for i := range intents {
+				if intents[i].ScopeKey == "lb:lbr-lb" {
+					got = &intents[i]
+				}
+			}
+			if got == nil || len(got.Exceptions) != 1 {
+				t.Fatalf("LB intent %+v, want the VIP's holes", got)
+			}
+			if (got.SNATVIP != "") != tc.want {
+				t.Errorf("SNAT recorded = %v (vip %q), want %v", got.SNATVIP != "", got.SNATVIP, tc.want)
+			}
+		})
 	}
 }

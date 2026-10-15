@@ -28,13 +28,16 @@ import (
 // A VIP in no network's subnet (an address on the host's own LAN) goes where
 // it always did: on the device whose subnet holds it, else the default-route
 // device (lb.DetectInterfaceForIP).
-func (s *Server) lbVIPInterface(ctx context.Context, lbName, vip string) (string, error) {
+//
+// stack names the LB's stack when the caller knows it (a peer apply carries
+// it, since the LB's row may not have replicated here yet); "" reads it from
+// the LB's row.
+func (s *Server) lbVIPInterface(ctx context.Context, lbName, stack, vip string) (string, error) {
 	addr, err := netip.ParseAddr(strings.TrimSpace(vip))
 	if err != nil {
 		return "", fmt.Errorf("VIP %q is not an address: %w", vip, err)
 	}
-	stack := ""
-	if lbName != "" {
+	if stack == "" && lbName != "" {
 		lrows, err := s.db.Query(ctx, `SELECT COALESCE(stack_name, '') AS stack_name FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName)
 		if err != nil {
 			return "", fmt.Errorf("read load balancer %q to place VIP %s: %w", lbName, vip, err)

@@ -2,8 +2,10 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
@@ -107,5 +109,112 @@ func TestFleet_LBVIPGoesOnTheNetworksBridge(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no LB isolation intent recorded (the lab's snat=false); intents: %+v", intents)
+	}
+}
+
+// composeLBTwoHosts is the lbr stack spread over two LB hosts; %s is the
+// loadbalancer's snat line ("" leaves it unset).
+const composeLBTwoHosts = `name: lbs
+
+images:
+  test:
+    source: file:///dev/null
+
+networks:
+  hinet:
+    type: bridge
+    subnet: 10.203.0.0/24
+    dhcp: true
+    host-isolation: true
+
+vms:
+  lbs1:
+    image: test
+    cpu: 1
+    memory: 512
+    placement:
+      host: node-0
+    network:
+      - name: hinet
+    loadbalancer:
+      enabled: true
+      vip: 10.203.0.250/24
+      ports:
+        - listen: 80
+          target: 8080
+          protocol: tcp
+      hosts:
+        - node-0
+        - node-1
+%s
+  lbs2:
+    image: test
+    cpu: 1
+    memory: 512
+    placement:
+      host: node-1
+    network:
+      - name: hinet
+`
+
+// TestFleet_LBSNATHoldsOnEveryLBHost: a stack LB's `snat:` holds on every LB
+// host, the one that deployed it and the ones it forwards the apply to. With
+// `snat:` unset no host records SNAT — host-isolated guests get no implicit
+// outbound NAT anywhere — and with `snat: true` every host does. The peer
+// apply (ApplyLB) used to force SNAT on, so only the deploying host honoured
+// an unset `snat:`, and with the VIP and gateway now on the bridge the other
+// hosts' guests were NATed out.
+//
+// Mutation: drop snat from forwardLBApply's request, or ignore it in ApplyLB
+// — the unset case goes red on node-1.
+func TestFleet_LBSNATHoldsOnEveryLBHost(t *testing.T) {
+	for _, tc := range []struct {
+		name, line string
+		want       bool
+	}{
+		{"unset", "", false},
+		{"true", "      snat: true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(t, Options{Nodes: 2, IndependentReplicas: true})
+			ctx := context.Background()
+			for _, n := range c.Nodes {
+				if err := corrosion.InsertImage(ctx, n.DB, corrosion.ImageRecord{Name: "test", Format: "qcow2", SourceURL: "file:///dev/null", Checksum: "deadbeef", SizeBytes: 1024}); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeEmptyImageFile(n.Server.ImagePathForTests("test")); err != nil {
+					t.Fatal(err)
+				}
+				n.Server.SetBridgeEnsure(n.Net.EnsureBridge)
+				n.Server.SetBridgeExists(n.Net.HasDevice)
+				n.Server.SetLBApply(func(context.Context, lb.Config) error { return nil })
+			}
+			msgs := deployCollect(t, ctx, c.SelfClient(c.Nodes[0]), fmt.Sprintf(composeLBTwoHosts, tc.line))
+			for _, p := range msgs {
+				if p.Phase == "error" {
+					t.Fatalf("deploy: %s: %s", p.VmName, p.Error)
+				}
+			}
+			for _, n := range c.Nodes {
+				n := n
+				var in corrosion.HostFWIntent
+				eventually(t, 20*time.Second, "the LB's isolation intent on "+n.Name, func() bool {
+					intents, err := corrosion.ListHostFWIntent(ctx, n.DB, n.Name)
+					if err != nil {
+						return false
+					}
+					for _, x := range intents {
+						if x.ScopeKey == "lb:lbs-lb" && len(x.Exceptions) == 1 {
+							in = x
+							return true
+						}
+					}
+					return false
+				})
+				if got := in.SNATVIP != ""; got != tc.want {
+					t.Errorf("%s: SNAT recorded = %v (vip=%q subnet=%q), want %v", n.Name, got, in.SNATVIP, in.SNATSubnet, tc.want)
+				}
+			}
+		})
 	}
 }

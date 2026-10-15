@@ -89,6 +89,22 @@ func ResolveNICMTU(nic, mtu int, bridge string, read func(string) (int, error), 
 	return mtu, nil
 }
 
+// CheckNICMTUs checks every NIC MTU of cfg as GenerateDomainXML would render
+// it, against cfg.BridgeMTU, without rendering the domain: a caller with
+// costly work before its render refuses an MTU this host cannot carry first.
+func CheckNICMTUs(cfg VMConfig) error {
+	for i, n := range cfg.Networks {
+		model := n.Model
+		if model == "" {
+			model = "virtio"
+		}
+		if _, err := nicMTUElement(cfg, i, n, model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // nicMTUElement renders NIC i's <mtu>, nil when it sets none.
 func nicMTUElement(cfg VMConfig, i int, n NetworkConfig, model string) (*ifaceMTU, error) {
 	if n.MTU == 0 {

@@ -562,6 +562,13 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	if signer == nil || signer.Name() != c.hostName {
 		return res, fmt.Errorf("no claim signing key for %s", c.hostName)
 	}
+	if key.IsAutomation() && signer.key == nil {
+		return res, fmt.Errorf("no claim signing key for %s", c.hostName)
+	}
+	if key.IsAutomation() && !signer.AutomationTransportEligible() {
+		res.Refusal = RefusalAutomationUnavailable
+		return res, nil
+	}
 	ownerChecked := false
 	for {
 		res = AcceptResult{Voter: c.hostName}
@@ -603,8 +610,12 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 				res.Detail = fmt.Sprintf("%s already accepted a different value at %s", c.hostName, b)
 				return nil
 			}
-			if row.Accepted.Equal(b) && row.Accept != nil && row.Accept.ConfigGeneration == gen {
+			if row.Accepted.Equal(b) && row.Accept != nil && row.Accept.ConfigGeneration == gen &&
+				(!key.IsAutomation() || len(row.Accept.CertPEM) <= MaxAutomationSignerBytes) {
 				// A repeated Accept: the signed accept is already on disk.
+				// An imported automation acceptance can carry older, larger
+				// signing metadata; re-sign its unchanged value below instead
+				// of emitting a certificate outside the supported frame budget.
 				res.Accepted, res.PromisedBallot, res.Accept = true, row.Promised, row.Accept
 				return nil
 			}

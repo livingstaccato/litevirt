@@ -70,7 +70,7 @@ func automationAuthorityTx(ctx context.Context, tx *LocalTx, self string, gen in
 	if e != nil {
 		return nil, e
 	}
-	if st.adopted != gen || st.cfg == nil || !st.cfg.Explicit() || len(st.cfg.Members) < 3 {
+	if st.adopted != gen || st.cfg == nil || !st.cfg.Explicit() || len(st.cfg.Members) < 3 || automationElectorateBudget(st.cfg.Members) != nil {
 		return nil, errAutomationAuthority
 	}
 	rows, e := tx.Query(ctx, `SELECT generation,members_hash,incarnation,bootstrap_principal,bootstrap_request,provenance FROM local_automation_authority WHERE id=1`)

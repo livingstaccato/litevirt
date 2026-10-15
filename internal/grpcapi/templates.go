@@ -483,6 +483,11 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
 	cloneUUID := uuid.NewString() // the clone's incarnation; its guard records carry it
+	// The clone's seed network-config inputs, one per NIC (cloudinit.NIC),
+	// and its host-isolated picks, in flight until this returns.
+	var seedNICs []cloudinit.NIC
+	var isoPicks []isoPick
+	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := network.FlatBridgeName(n.Name)
@@ -503,6 +508,28 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
 			}
 			ip = rip
+		} else if ip == "" && cloudinit.HostIsolatedAddressable(def) {
+			// A host-isolated network serves no DHCP: the clone's NIC is
+			// given its own address, as a created VM's is.
+			var vips []string
+			if lb := srcSpec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+				vips = append(vips, lb.GetVip())
+			}
+			if hip, herr := s.hostIsolatedAddress(ctx, n.Name, def, vips); herr != nil {
+				slog.Warn("host-isolated network: no address for the clone's NIC; the guest gets none",
+					"vm", req.Target, "network", n.Name, "error", herr)
+			} else {
+				ip = hip
+				isoPicks = append(isoPicks, isoPick{network: n.Name, ip: hip})
+			}
+		}
+		{
+			def, _ := lookupNetworkDef(ctx, s.db, n.Name)
+			in := cloudinit.NIC{Ordinal: i, MAC: mac, RecordedIP: ip, Net: def}
+			if i == 0 {
+				in.IP = req.Ip
+			}
+			seedNICs = append(seedNICs, in)
 		}
 		if strings.HasPrefix(bridge, "direct:") {
 			netConfigs = append(netConfigs, lv.NetworkConfig{Direct: strings.TrimPrefix(bridge, "direct:"), Model: n.Model, MAC: mac, RateMBps: n.RateMbSec})
@@ -562,10 +589,18 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			cleanup()
 			return nil, status.Errorf(codes.InvalidArgument, "%v", perr)
 		}
+		// The clone's own NICs' network-config, derived as a create derives
+		// it. A source whose spec names its own network-config gives the
+		// clone none, as before: that document names the source's addresses.
+		netCfg := ""
+		if srcSpec.CloudInit == nil || srcSpec.CloudInit.Networkconfig == "" {
+			netCfg = cloudinit.NetworkConfig(seedNICs)
+		}
 		if err := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    req.Target, // NEW id forces first-boot (regen SSH host keys, machine-id)
 			LocalHostname: req.Target,
 			UserData:      userData,
+			NetworkConfig: netCfg,
 		}, isoPath); err != nil {
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)

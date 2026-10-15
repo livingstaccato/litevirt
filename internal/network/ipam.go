@@ -71,6 +71,41 @@ func nextFreeIPv4(network net.IP, mask net.IPMask, used map[string]bool) (string
 	return "", fmt.Errorf("ipv4 subnet exhausted")
 }
 
+// NextFreeIPv4From is nextFreeIP for an IPv4 subnet, scanning from the host
+// address at offset (modulo the usable range) and wrapping, instead of from
+// the lowest one. The usable range is as nextFreeIP's: the network address,
+// the gateway (first host) and the broadcast address are never returned.
+// Callers on different hosts start at different offsets so that two of them
+// choosing at once from the same replica state rarely choose alike.
+func NextFreeIPv4From(subnet string, used []string, offset uint64) (string, error) {
+	_, ipNet, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return "", fmt.Errorf("invalid subnet %q: %w", subnet, err)
+	}
+	v4 := ipNet.IP.To4()
+	if v4 == nil {
+		return "", fmt.Errorf("subnet %q is not IPv4", subnet)
+	}
+	usedSet := make(map[string]bool, len(used))
+	for _, ip := range used {
+		usedSet[LeaseAddr(ip)] = true
+	}
+	base := binary.BigEndian.Uint32(v4)
+	broadcast := base | ^binary.BigEndian.Uint32([]byte(ipNet.Mask))
+	if broadcast < base+3 {
+		return "", fmt.Errorf("ipv4 subnet exhausted")
+	}
+	first, n := base+2, uint64(broadcast-(base+2))
+	for k := uint64(0); k < n; k++ {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, first+uint32((offset+k)%n))
+		if c := net.IP(b).String(); !usedSet[c] {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("ipv4 subnet exhausted")
+}
+
 func nextFreeIPv6(network net.IP, mask net.IPMask, used map[string]bool) (string, error) {
 	// Start at network + 2 (skip subnet-router anycast and::1 gateway).
 	candidate := make(net.IP, 16)
@@ -122,6 +157,11 @@ func ipNetContains(network net.IP, mask net.IPMask, ip net.IP) bool {
 // lease. The used-set spans all owners on the network (an IP is taken regardless
 // of who holds it).
 func ComputeCandidateIP(ctx context.Context, db *corrosion.Client, network, subnet string) (string, error) {
+	return computeCandidateIP(ctx, db, network, subnet, nil)
+}
+
+// computeCandidateIP is ComputeCandidateIP that also passes over exclude.
+func computeCandidateIP(ctx context.Context, db *corrosion.Client, network, subnet string, exclude []string) (string, error) {
 	rows, err := db.Query(ctx,
 		`SELECT ip FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, network)
 	if err != nil {
@@ -138,6 +178,7 @@ func ComputeCandidateIP(ctx context.Context, db *corrosion.Client, network, subn
 		return "", fmt.Errorf("query assigned addresses: %w", err)
 	}
 	used = append(used, assigned[network]...)
+	used = append(used, exclude...)
 	return nextFreeIP(subnet, used)
 }
 
@@ -149,8 +190,13 @@ func ComputeCandidateIP(ctx context.Context, db *corrosion.Client, network, subn
 // guarded ON CONFLICT update + a read-back confirm ownership, and a lost race
 // retries a fresh candidate.
 func AllocateIPFor(ctx context.Context, db *corrosion.Client, network, subnet, mac, ownerKind, ownerHost, name string) (string, error) {
+	return allocateIPFor(ctx, db, network, subnet, mac, ownerKind, ownerHost, name, nil)
+}
+
+// allocateIPFor is AllocateIPFor that never chooses an address in exclude.
+func allocateIPFor(ctx context.Context, db *corrosion.Client, network, subnet, mac, ownerKind, ownerHost, name string, exclude []string) (string, error) {
 	for attempt := 0; attempt < 5; attempt++ {
-		ip, err := ComputeCandidateIP(ctx, db, network, subnet) // free or tombstoned (excludes LIVE)
+		ip, err := computeCandidateIP(ctx, db, network, subnet, exclude) // free or tombstoned (excludes LIVE)
 		if err != nil {
 			return "", err
 		}

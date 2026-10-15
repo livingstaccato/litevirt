@@ -2298,17 +2298,29 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	}
 	if _, err := os.Stat(isoPath); err == nil {
 		cloudInitISO = isoPath
-	} else if spec.CloudInit != nil {
-		// Regenerate cloud-init ISO from spec.
-		userData := spec.CloudInit.Userdata
+	} else if spec.CloudInit != nil || spec.Image != "" {
+		// Regenerate the seed the VM was created with: its user-data, and
+		// the network-config derived from the spec, its NIC rows and its
+		// networks exactly as CreateVM derived it (a cloud image with no
+		// cloud-init in its spec got the empty user-data). A network-config
+		// that cannot be derived is written as none, as before this was
+		// derived at all.
+		userData := ""
+		if spec.CloudInit != nil {
+			userData = spec.CloudInit.Userdata
+		}
 		if userData == "" {
 			userData = "#cloud-config\n{}\n"
+		}
+		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec)
+		if ncErr != nil {
+			slog.Warn("reconciler: cloud-init network-config could not be derived", "vm", vm.Name, "error", ncErr)
 		}
 		if genErr := cloudinit.GenerateISO(cloudinit.Config{
 			InstanceID:    vm.Name,
 			LocalHostname: vm.Name,
 			UserData:      userData,
-			NetworkConfig: spec.CloudInit.Networkconfig,
+			NetworkConfig: netCfg,
 		}, isoPath); genErr != nil {
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {

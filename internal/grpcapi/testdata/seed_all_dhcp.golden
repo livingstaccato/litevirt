@@ -3,19 +3,15 @@ ethernets:
   eth0:
     match:
       macaddress: "52:54:00:00:06:01"
+    set-name: eth0
     dhcp4: true
     dhcp4-overrides:
-      route-metric: 100
-    dhcp6: true
-    dhcp6-overrides:
       route-metric: 100
   eth1:
     match:
       macaddress: "52:54:00:00:06:02"
+    set-name: eth1
     dhcp4: true
     dhcp4-overrides:
-      route-metric: 101
-    dhcp6: true
-    dhcp6-overrides:
       route-metric: 101
     optional: true

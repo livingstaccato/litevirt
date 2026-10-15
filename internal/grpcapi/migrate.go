@@ -2483,7 +2483,16 @@ func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string,
 	req := &pb.EnsureCloudInitRequest{VmName: vm.Name}
 	if spec.CloudInit != nil {
 		req.Userdata = spec.CloudInit.Userdata
-		req.Networkconfig = spec.CloudInit.Networkconfig
+	}
+	// The network-config the VM was created with: the spec's, or the one
+	// derived from its NIC rows and networks as CreateVM derived it.
+	if nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec); err != nil {
+		slog.Warn("ensureCloudInitOnTarget: network-config could not be derived", "vm", vm.Name, "error", err)
+		if spec.CloudInit != nil {
+			req.Networkconfig = spec.CloudInit.Networkconfig
+		}
+	} else {
+		req.Networkconfig = nc
 	}
 
 	// Check if the cloud-init ISO exists locally — if not, the VM was created

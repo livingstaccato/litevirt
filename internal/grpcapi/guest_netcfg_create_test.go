@@ -3,15 +3,20 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/testkit/golden"
 )
 
@@ -50,6 +55,10 @@ func netcfgServer(t *testing.T, defs map[string]compose.NetworkDef) *Server {
 	t.Helper()
 	stageNetcfgGenisoimage(t)
 	s, _ := provableCreateServer(t)
+	// Scan host-isolated subnets from the bottom, so addresses are
+	// predictable; TestHostIsolatedAddress_HostsStartApart covers the
+	// default.
+	s.isoOffset = func(string) uint64 { return 0 }
 	s.netProvisioner = &bridgeRemovalProv{}
 	s.bridgeEnsure = func(string) error { return nil }
 	for name, def := range defs {
@@ -141,52 +150,221 @@ func TestCreateVM_HostIsolatedNICIsGivenAStaticAddress(t *testing.T) {
 	}
 }
 
-// The network's gateway and reserved addresses are never handed to a guest,
-// and an address taken by a create still in flight on this host is not handed
-// out twice.
+// The network's gateway, reserved addresses and load balancer VIPs (a live
+// LB's, and the one the workload being created brings) are never handed to a
+// guest, and an address taken by a create still in flight on this host is
+// not handed out twice until that create lets it go.
 //
 // Mutation: drop the Gateway/ReservedAddresses lines from hostIsolatedAddress
-// — the first pick is the reserved address; drop the isoPending record — the
-// two picks collide.
-func TestHostIsolatedAddress_SkipsReservedAndInFlight(t *testing.T) {
+// — the first pick is the gateway; drop the lb_configs VIPs — .5 is picked;
+// drop the vips argument — .6 is picked; drop the isoPending record — the
+// two picks collide; make releaseHostIsolatedPicks a no-op — the released
+// address is not reused.
+func TestHostIsolatedAddress_SkipsReservedVIPsAndInFlight(t *testing.T) {
 	def := compose.NetworkDef{Type: "bridge", Subnet: "10.213.0.0/24", HostIsolation: true,
-		Gateway: "10.213.0.2", ReservedAddresses: []string{"10.213.0.3/24"}}
+		Gateway: "10.213.0.2", ReservedAddresses: []string{"10.213.0.3/24", "10.213.0.4"}}
 	s := netcfgServer(t, map[string]compose.NetworkDef{"hi2": def})
-	a, err := s.hostIsolatedAddress(adminCtx(), "hi2", &def)
-	if err != nil {
+	if err := corrosion.UpsertLBConfig(adminCtx(), s.db, corrosion.LBConfigRecord{
+		Name: "web", VIP: "10.213.0.5", Algorithm: "roundrobin", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.hostIsolatedAddress(adminCtx(), "hi2", &def)
-	if err != nil {
-		t.Fatal(err)
+	pick := func() string {
+		t.Helper()
+		ip, err := s.hostIsolatedAddress(adminCtx(), "hi2", &def, []string{"10.213.0.6"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ip
 	}
-	if a != "10.213.0.4" || b != "10.213.0.5" {
-		t.Errorf("picks = %s, %s; want 10.213.0.4, 10.213.0.5 (gateway .2 and reserved .3 skipped, no double hand-out)", a, b)
+	a, b := pick(), pick()
+	if a != "10.213.0.7" || b != "10.213.0.8" {
+		t.Fatalf("picks = %s, %s; want 10.213.0.7, 10.213.0.8 (gateway, reserved, LB and spec VIPs skipped, no double hand-out)", a, b)
+	}
+	s.releaseHostIsolatedPicks([]isoPick{{network: "hi2", ip: a}})
+	if c := pick(); c != a {
+		t.Errorf("after its create let %s go, the next pick is %s", a, c)
 	}
 }
 
-// Which networks litevirt addresses this way: host-isolated IPv4 subnets on
-// the types it owns the L2 of. Not a network that serves DHCP, not a
-// NetBox-bound one (NetBox allocates there), not hardware it does not address.
-func TestHostIsolatedAddressable(t *testing.T) {
-	for _, tc := range []struct {
-		def  *compose.NetworkDef
-		want bool
-	}{
-		{nil, false},
-		{&defHostIsolated, true},
-		{&compose.NetworkDef{Type: "bridge", Subnet: "10.0.0.0/24", HostIsolation: true}, true},
-		{&compose.NetworkDef{Type: "isolated", Subnet: "10.0.0.0/24", HostIsolation: true}, true},
-		{&defBridgeDHCP, false},
-		{&compose.NetworkDef{Type: "bridge", HostIsolation: true}, false},
-		{&compose.NetworkDef{Type: "bridge", Subnet: "fd00::/64", HostIsolation: true}, false},
-		{&compose.NetworkDef{Type: "sriov", Subnet: "10.0.0.0/24", HostIsolation: true}, false},
-		{&compose.NetworkDef{Type: "direct", Subnet: "10.0.0.0/24", HostIsolation: true}, false},
-		{&compose.NetworkDef{Type: "bridge", Subnet: "10.0.0.0/24", HostIsolation: true, NetBoxPrefixID: 7}, false},
-	} {
-		if got := hostIsolatedAddressable(tc.def); got != tc.want {
-			t.Errorf("hostIsolatedAddressable(%+v) = %v, want %v", tc.def, got, tc.want)
+// Review I-1(b): two hosts picking from the same replica state at once start
+// their scans at different, host-hashed points of the subnet, so they rarely
+// pick alike; every pick is still a usable host address of the subnet.
+//
+// Mutation: return 0 from isoScanOffset — both hosts pick .2.
+func TestHostIsolatedAddress_HostsStartApart(t *testing.T) {
+	def := compose.NetworkDef{Type: "vxlan", VNI: 9, Subnet: "10.214.0.0/24", HostIsolation: true}
+	picks := map[string]bool{}
+	for _, host := range []string{"node-1", "node-2", "node-3"} {
+		s := netcfgServer(t, map[string]compose.NetworkDef{"hi": def})
+		s.isoOffset = nil
+		s.hostName = host
+		ip, err := s.hostIsolatedAddress(adminCtx(), "hi", &def, nil)
+		if err != nil {
+			t.Fatal(err)
 		}
+		a, perr := netip.ParseAddr(ip)
+		if perr != nil || !netip.MustParsePrefix(def.Subnet).Contains(a) ||
+			ip == "10.214.0.0" || ip == "10.214.0.1" || ip == "10.214.0.255" {
+			t.Errorf("host %s picked %q, not a usable host address of %s", host, ip, def.Subnet)
+		}
+		picks[ip] = true
+	}
+	if len(picks) != 3 {
+		t.Errorf("three hosts picked %v from an empty subnet: their scans start together", picks)
+	}
+}
+
+// Review m-4: a create's host-isolated picks leave the in-flight set when
+// the create returns — its rows hold the address on success, and on failure
+// nothing does, so the address is free again at once rather than for ten
+// minutes.
+//
+// Mutation: drop the deferred releaseHostIsolatedPicks from CreateVM — red.
+func TestCreateVM_LetsItsPicksGo(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
+	createSeeded(t, s, "ok", &pb.NetworkAttachment{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:0d:01"})
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailStartDomain = func(string) error { return errors.New("qemu refused") }
+	req := seedCreateRequest(t, s, "bad", "")
+	req.Spec.Network = []*pb.NetworkAttachment{{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:0d:02"}}
+	if _, err := s.CreateVM(adminCtx(), req); err == nil {
+		t.Fatal("the create was meant to fail at its start")
+	}
+	s.dhcpResMu.Lock()
+	left := len(s.isoPending["hinet"])
+	s.dhcpResMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d picks still in flight after both creates returned", left)
+	}
+}
+
+// Review I-2: the VIP a VM's own load balancer brings is not handed to it,
+// though the LB's row is written only after the VMs of its stack.
+func TestCreateVM_HostIsolatedPickSkipsItsOwnVIP(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
+	req := seedCreateRequest(t, s, "lbvm", "")
+	req.Spec.Network = []*pb.NetworkAttachment{{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:0e:01"}}
+	req.Spec.Loadbalancer = &pb.LBSpec{Enabled: true, Vip: "10.212.0.2"}
+	if _, err := s.CreateVM(adminCtx(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got := nicIPs(t, s, "lbvm")["hinet"]; got != "10.212.0.3" {
+		t.Errorf("NIC address = %q, want 10.212.0.3 (.2 is its LB's VIP)", got)
+	}
+}
+
+// Review m-5: a container claiming on a host-isolated network passes over
+// an address a VM create on this host has picked but not yet written.
+//
+// Mutation: drop req.Exclude in resolveContainerNICs — the container gets
+// the VM's address.
+func TestContainerClaim_PassesOverAVMsPickInFlight(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
+	ip, err := s.hostIsolatedAddress(adminCtx(), "hinet", &defHostIsolated, nil)
+	if err != nil || ip != "10.212.0.2" {
+		t.Fatalf("VM pick = %q, %v", ip, err)
+	}
+	plan, err := s.resolveContainerNICs(adminCtx(), "", "ct1",
+		[]*pb.ContainerNetwork{{Name: "eth0", NetworkName: "hinet"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.ifaces[0].IP; got == "10.212.0.2" || got == "" {
+		t.Errorf("container address = %q, want one other than the VM's in-flight .2", got)
+	}
+}
+
+// Review I-3: a seed rebuilt where the VM's ISO is missing (failover,
+// migration) is derived from what the cluster records — the spec, the NIC
+// rows, the networks — and equals the seed CreateVM wrote, for every shape:
+// one DHCP NIC (none), all static (V1), several NICs with a host-isolated
+// pick (V2). A DHCP NIC whose row the IP scanner has since filled stays DHCP.
+//
+// Mutation: read every recorded address as static in cloudinit.NetworkConfig
+// — the rebuilt multi-NIC seed differs once the scanner has written the DHCP
+// NIC's address.
+func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{
+		"brnet": defBridgeDHCP, "isonet": defIsolatedDHCP, "hinet": defHostIsolated,
+	})
+	for _, tc := range []struct {
+		name string
+		nics []*pb.NetworkAttachment
+	}{
+		{"one", []*pb.NetworkAttachment{{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:10:01"}}},
+		{"static", []*pb.NetworkAttachment{
+			{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:11:01", Ip: "172.40.0.30"},
+			{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:11:02"}}},
+		{"multi", []*pb.NetworkAttachment{
+			{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:12:01"},
+			{Name: "isonet", Model: "virtio", Mac: "52:54:00:00:12:02"},
+			{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:12:03"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := createSeeded(t, s, tc.name, tc.nics...)
+			// The IP scanner records the DHCP NIC's lease.
+			if err := s.db.Execute(adminCtx(), `UPDATE vm_interfaces SET ip = '172.40.0.99' WHERE vm_name = ? AND network_name = 'brnet' AND (ip IS NULL OR ip = '')`, tc.name); err != nil {
+				t.Fatal(err)
+			}
+			vm, err := corrosion.GetVM(adminCtx(), s.db, tc.name)
+			if err != nil || vm == nil {
+				t.Fatalf("GetVM: %v", err)
+			}
+			var spec pb.VMSpec
+			if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+				t.Fatal(err)
+			}
+			rebuilt, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rebuilt == "" {
+				rebuilt = noNetworkConfig
+			}
+			if rebuilt != seed {
+				t.Errorf("rebuilt seed differs from the created one\ncreated:\n%s\nrebuilt:\n%s", seed, rebuilt)
+			}
+		})
+	}
+}
+
+// Review I-3: a clone's NIC on a host-isolated network is given its own
+// address, and the clone's seed configures it, where before the clone booted
+// on cloud-init's fallback with no address.
+//
+// Mutation: drop the host-isolated branch from cloneVMOnSource — red.
+func TestCloneVM_HostIsolatedNICGetsItsOwnAddress(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"hinet": defHostIsolated})
+	ctx := adminCtx()
+	srcDisk := s.images.DiskPath("src", "root")
+	if err := os.MkdirAll(filepath.Dir(srcDisk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(srcDisk, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "src", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+		Network: []*pb.NetworkAttachment{{Name: "hinet", Mac: "52:54:00:00:13:01"}}})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "src", HostName: "test-host", State: "stopped", Spec: string(specJSON)},
+		[]corrosion.InterfaceRecord{{VMName: "src", NetworkName: "hinet", MAC: "52:54:00:00:13:01", IP: "10.212.0.2"}},
+		[]corrosion.DiskRecord{{VMName: "src", DiskName: "root", HostName: "test-host", Path: srcDisk, SizeBytes: 1 << 20, StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "src", Target: "c1", Mode: "full"}); err != nil {
+		t.Fatalf("CloneVM: %v", err)
+	}
+	got := nicIPs(t, s, "c1")["hinet"]
+	if got == "" || got == nicIPs(t, s, "src")["hinet"] {
+		t.Fatalf("clone NIC address = %q, want its own (source has %q)", got, nicIPs(t, s, "src")["hinet"])
+	}
+	b, err := os.ReadFile(lv.CloudInitISOPath(s.dataDir, "c1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "address: "+got+"/24") {
+		t.Errorf("the clone's seed does not give it %s:\n%s", got, b)
 	}
 }
 
@@ -195,7 +373,7 @@ func TestHostIsolatedAddressable(t *testing.T) {
 // cloud-init's own fallback (DHCP on that NIC) applies unchanged. A VM whose
 // NICs are all static gets the same V1 document as before.
 //
-// Mutation: make guestNetworkConfig render a single DHCP NIC — the first
+// Mutation: make cloudinit.GuestNetworkConfig render a single DHCP NIC — the first
 // check goes red; render the all-static case through the V2 writer — the
 // golden goes red.
 func TestCreateVM_SeedsThatWorkedAreUnchanged(t *testing.T) {
@@ -231,7 +409,7 @@ func TestCreateVM_SeedsThatWorkedAreUnchanged(t *testing.T) {
 // A VM with more than one NIC now gets a network-config naming every NIC by
 // MAC: DHCP where it names no address, static where it has one.
 //
-// Mutation: return "" from guestNetworkConfig when no NIC is static — the
+// Mutation: return "" from cloudinit.GuestNetworkConfig when no NIC is static — the
 // all-DHCP VM (the lab's own shape) gets no network-config. Treat a
 // host-isolated NIC with no address as DHCP — the subnet-less one appears in
 // the seed.

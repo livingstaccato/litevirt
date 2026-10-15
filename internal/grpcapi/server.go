@@ -942,6 +942,9 @@ type Server struct {
 	// written yet (hostIsolatedAddress): network → address → when. Under
 	// dhcpResMu.
 	isoPending map[string]map[string]time.Time
+	// isoOffset, when set (tests), replaces where a host-isolated address
+	// scan starts (isoScanOffset).
+	isoOffset func(netName string) uint64
 	// Host-local DHCP facts a reservation depends on; nil = the real host
 	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
 	// Test seams: SetDHCPReservationBackend.

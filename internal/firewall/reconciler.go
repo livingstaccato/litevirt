@@ -401,6 +401,13 @@ type LoaderOptions struct {
 	// litevirt_firewall_sg_duplicate_name_nics.
 	OnDuplicateSGs func(nicsByName map[string]int)
 
+	// OnDuplicateAddresses, when set, receives after every pass the
+	// addresses on host-isolated networks that live NIC rows of more than one
+	// workload hold (corrosion.HostIsolatedDuplicateAddrs); nil or empty
+	// means none. A failure to read them is logged and does not fail the
+	// pass. The daemon reports them with DuplicateAddressReporter.
+	OnDuplicateAddresses func(ctx context.Context, dups []corrosion.DuplicateAddress)
+
 	// Arming, when set, names VMs rendered here whatever host their row
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
@@ -574,6 +581,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		assigned, err := corrosion.NetworkAssignedAddrs(ctx, db)
 		if err != nil {
 			return plan, err
+		}
+		if opts.OnDuplicateAddresses != nil {
+			if dups, derr := corrosion.HostIsolatedDuplicateAddrs(ctx, db); derr != nil {
+				slog.Warn("firewall: could not check host-isolated networks for duplicate addresses", "error", derr)
+			} else {
+				opts.OnDuplicateAddresses(ctx, dups)
+			}
 		}
 		// The trunk VLANs recorded at upgrade (re-review R3-I1): once the
 		// recording has run, a trunk carries only what its network allows,

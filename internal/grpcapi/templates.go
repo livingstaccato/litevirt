@@ -629,6 +629,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		cleanup()
 		return nil, err
 	}
+	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		cleanup()
@@ -654,6 +655,13 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			return nil, err
 		}
 		cloneNeeds.Tuning = true
+	}
+	if specSetsNICMTU(&srcSpec) && s.ReleaseFeatureAvailable(capabilities.FeatureNICMTU) {
+		if gs.mtu, err = s.nicMTUGrant(ctx); err != nil {
+			cleanup()
+			return nil, err
+		}
+		cloneNeeds.MTU = true
 	}
 	if vmSpecSetsPassthrough(&srcSpec) && s.ReleaseFeatureAvailable(capabilities.FeatureUSBMountsMemory) {
 		if gs.passthrough, err = s.passthroughGrant(ctx); err != nil {
@@ -736,7 +744,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 	if state == "running" {
 		insertState = "creating"
 	}
-	if err := corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, cloneNeeds, corrosion.VMRecord{
+	if err := corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, gs.mtu, cloneNeeds, corrosion.VMRecord{
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
 		State: insertState, CPUActual: cpu, MemActual: mem, Project: project,
 	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {

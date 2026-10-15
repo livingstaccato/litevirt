@@ -158,6 +158,7 @@ func ApplyNICTuning(nets []libvirt.NetworkConfig, spec *pb.VMSpec) {
 		}
 		if match != nil {
 			nets[i].Queues = int(match.Queues)
+			nets[i].MTU = int(match.Mtu)
 		}
 	}
 }
@@ -172,6 +173,7 @@ func ApplyNICTuningByPosition(nets []libvirt.NetworkConfig, spec *pb.VMSpec) {
 	for i := range nets {
 		if i < len(spec.Network) && spec.Network[i] != nil {
 			nets[i].Queues = int(spec.Network[i].Queues)
+			nets[i].MTU = int(spec.Network[i].Mtu)
 		}
 	}
 }

@@ -38,7 +38,7 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 			return fmt.Errorf("network %d: %w", i, err)
 		}
 	}
-	return nil
+	return validateSpecNICMTU(spec)
 }
 
 // ioFeatureGate is the entry-node check of the disk/NIC tuning feature

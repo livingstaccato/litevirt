@@ -231,7 +231,6 @@ func f() {
 // change, after which the feature must list them.
 var writersPending = map[Feature]bool{
 	FeatureHADisarm:        true,
-	FeatureNICMTU:          true,
 	FeatureReplicationRate: true,
 }
 

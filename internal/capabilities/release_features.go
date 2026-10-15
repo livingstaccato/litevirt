@@ -119,7 +119,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
 			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
 	FeatureHADisarm:        {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery"},
-	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU"},
+	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits"},
 }
 

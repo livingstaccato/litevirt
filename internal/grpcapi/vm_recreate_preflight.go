@@ -109,6 +109,9 @@ func (s *Server) recreatePreflightSpec(ctx context.Context, in *pb.VMSpec, host 
 	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
 		return nil, err
 	}
+	if err := s.refuseUnlatchedNICMTU(ctx, spec); err != nil {
+		return nil, err
+	}
 	if err := s.precheckLimitedSpec(ctx, spec); err != nil {
 		return nil, err
 	}

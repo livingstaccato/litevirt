@@ -149,6 +149,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.refuseUnlatchedDiskNICIO(ctx, spec); err != nil {
 		return nil, err
 	}
+	if err := s.refuseUnlatchedNICMTU(ctx, spec); err != nil {
+		return nil, err
+	}
 	// A limit is refused early on a local read of the release latch, after the
 	// caller is known to be allowed and the spec valid; the use is recorded only
 	// where it is first written, just before the domain is defined.
@@ -490,6 +493,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		ioG = g
 	}
 	ioGranted := ioG.Check(capabilities.FeatureVMDiskNICIO) == nil
+	// A NIC MTU is written by THIS node too: its gate runs here, before
+	// anything is created. A spec with no MTU never asks.
+	var mtuG capabilities.FeatureGrant
+	if specSetsNICMTU(spec) {
+		g, gerr := s.nicMTUGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		mtuG = g
+	}
 
 	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
@@ -1185,6 +1198,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		pciIntents = s.buildPCIIntents(spec.Name, spec.Devices)
 	}
 
+	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		claims.releaseAll(ctx)
@@ -1224,7 +1238,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// is defined and started: the row is written only after the start, and a
 	// refusal there would leave a running domain with no row. One writer for
 	// every release feature the spec carries, each grant checked (M9).
-	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG, mtu: mtuG}
 	if err := gs.refusal(spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
@@ -5725,7 +5739,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// The live write carries limits (and spec-only metadata): the one
 		// writer checks the vm_limits grant whenever it carries a limit (M9).
 		applied, _, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db,
-			capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, liveLimitsG,
+			capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, liveLimitsG, capabilities.FeatureGrant{},
 			corrosion.VMSpecFeatures{Limits: requestSetsLimits(req)}, req.Name, persistSpec)
 		if err != nil {
 			if limitsApplied {
@@ -5952,6 +5966,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
 
+		s.withNICMTU(&vmCfg)
 		var gerr error
 		domXML, gerr = lv.GenerateDomainXML(vmCfg)
 		if gerr != nil {
@@ -6017,7 +6032,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		Passthrough: updateSetsPassthrough(req),
 		Limits:      requestSetsLimits(req),
 	}
-	applied, newGen, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db, ioG, passthroughG, limitsG, updNeeds, req.Name, func(string) (string, error) {
+	applied, newGen, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db, ioG, passthroughG, limitsG, capabilities.FeatureGrant{}, updNeeds, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
 	if err != nil || !applied {

@@ -401,6 +401,10 @@ type Coordinator struct {
 	// cluster latched it: a host whose flag went off after the latch says
 	// otherwise on its next probe. nil never relies.
 	PeerPausesOnLoss func(peer string) bool
+	// PeerHAState returns a peer's latest answer to this node's health probe
+	// about the cluster HA policy, and false when there is none. nil until
+	// wired.
+	PeerHAState func(peer string) (PeerHAAnswer, bool)
 	// PeerRecoveryExclusions says which peers must not be a VM recovery
 	// target while pit_overlay is in use, and why: one whose own Ping says it
 	// is WAL-quarantined (rolled back below a latched token), and one that

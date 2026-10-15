@@ -118,6 +118,9 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureISCSILUNClaim: {Token: Release202611V1, Description: "Cluster-wide voter claim of each iSCSI LUN by one disk; iSCSI disk creates, rebuilds and recreates wait for it",
 		Writers: []string{"internal/grpcapi.Server.decideLUNWith", "internal/grpcapi.Server.learnLUN",
 			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
+	FeatureHADisarm:        {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery"},
+	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU"},
+	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits"},
 }
 
 // containerReplicationWriters write container_replication's data: a container's
@@ -166,6 +169,9 @@ const (
 	FeatureISCSILUNClaim        Feature = "iscsi_lun_claim"
 	FeaturePITOverlay           Feature = "pit_overlay"
 	FeatureRedfishFence         Feature = "redfish_fence"
+	FeatureHADisarm             Feature = "ha_disarm"
+	FeatureNICMTU               Feature = "nic_mtu"
+	FeatureReplicationRate      Feature = "replication_rate"
 )
 
 // LookupFeature returns a declared feature's token and description.

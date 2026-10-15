@@ -1225,6 +1225,10 @@ type NetworkAttachment struct {
 	// allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
 	// trunk). Every other NIC's tagged frames are dropped.
 	AllowVlanTags bool `protobuf:"varint,17,opt,name=allow_vlan_tags,json=allowVlanTags,proto3" json:"allow_vlan_tags,omitempty"`
+	// mtu is the guest NIC's MTU: 0 renders none, 1 means the bridge's MTU
+	// read when the domain is defined, and any other value must equal the
+	// bridge's MTU on the defining host (release feature nic_mtu).
+	Mtu           int32 `protobuf:"varint,18,opt,name=mtu,proto3" json:"mtu,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1369,6 +1373,13 @@ func (x *NetworkAttachment) GetAllowVlanTags() bool {
 		return x.AllowVlanTags
 	}
 	return false
+}
+
+func (x *NetworkAttachment) GetMtu() int32 {
+	if x != nil {
+		return x.Mtu
+	}
+	return 0
 }
 
 type CloudInitSpec struct {
@@ -6437,7 +6448,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	" \x01(\x03R\x0ftotalIopsSecMax\x12)\n" +
 	"\x11read_iops_sec_max\x18\v \x01(\x03R\x0ereadIopsSecMax\x12+\n" +
 	"\x12write_iops_sec_max\x18\f \x01(\x03R\x0fwriteIopsSecMax\x12#\n" +
-	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\x87\x04\n" +
+	"\rburst_seconds\x18\r \x01(\x03R\fburstSeconds\"\x99\x04\n" +
 	"\x11NetworkAttachment\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x0e\n" +
@@ -6456,7 +6467,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x11allowed_addresses\x18\x0e \x03(\tR\x10allowedAddresses\x12*\n" +
 	"\x11allow_dhcp_server\x18\x0f \x01(\bR\x0fallowDhcpServer\x12<\n" +
 	"\x1aallow_router_advertisement\x18\x10 \x01(\bR\x18allowRouterAdvertisement\x12&\n" +
-	"\x0fallow_vlan_tags\x18\x11 \x01(\bR\rallowVlanTags\"m\n" +
+	"\x0fallow_vlan_tags\x18\x11 \x01(\bR\rallowVlanTags\x12\x10\n" +
+	"\x03mtu\x18\x12 \x01(\x05R\x03mtu\"m\n" +
 	"\rCloudInitSpec\x12\x1a\n" +
 	"\buserdata\x18\x01 \x01(\tR\buserdata\x12\x1a\n" +
 	"\bmetadata\x18\x02 \x01(\tR\bmetadata\x12$\n" +

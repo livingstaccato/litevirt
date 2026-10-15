@@ -1818,6 +1818,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (docs/design/recovery-claims.md §4.2). Inert until voter_config_v1 has
 	// durably latched, and once any voter generation exists.
 	fc.VoterGenesis = svc.VoterGenesisTick
+	// Cluster HA disarm: the peers' HA answers for the coordinator, the fence
+	// candidates for the HA policy handler, the cache Ready answers from, and
+	// the lease holder's first-use record of ha_disarm.
+	d.wirePeerHAState(fc, svc)
+	d.wireFenceCandidates(svc)
+	d.startHAPolicyCache(ctx, svc)
+	d.startHADisarmPreRecord(ctx, fc)
 	go fc.Start(ctx)
 	// Adopt each decided voter generation once its certificate verifies,
 	// importing claim state first where this node is a member of it (§4.4).

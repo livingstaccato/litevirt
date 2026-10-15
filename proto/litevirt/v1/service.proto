@@ -667,6 +667,9 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     // memory_hotplug_max_mib sets the virtio-mem hot-add ceiling (0 turns
     // hot-add off). Redefine-class, like usb_devices.
     optional int32 memory_hotplug_max_mib = 42;
+    // nic_mtu sets each listed NIC's MTU (NetworkAttachment.mtu). It takes
+    // effect on the next define, like nic_queues.
+    repeated NICMTUUpdate nic_mtu = 27;
 }
 // DiskTuningUpdate changes one disk's discard / detect_zeroes (an empty value
 // leaves it as stored).
@@ -677,6 +680,9 @@ message NICQueuesUpdate  { int32 ordinal = 1; int32 queues = 2; }
 // NICRateUpdate sets (or, at 0, clears) one NIC's bandwidth cap in MB/s. The NIC
 // is named by its 0-based position in the VM's interface list.
 message NICRateUpdate { int32 ordinal = 1; double rate_mb_sec = 2; }
+// NICMTUUpdate sets one NIC's MTU by its 0-based position in the VM's
+// interface list: 0 removes it, 1 means the bridge's MTU.
+message NICMTUUpdate { int32 ordinal = 1; int32 mtu = 2; }
 // SetVMMemory (#4) sets the running balloon target (and persists it). target_mib
 // must be within [min_memory_mib, max_memory_mib] of the VM's spec; a live VM is
 // ballooned via virtio without a redefine.
@@ -3470,6 +3476,13 @@ message ReadyResponse {
   // latest answer always comes from the run a coordinator last reached. False
   // from a build that predates the field, which therefore is not relied on.
   bool partition_pause = 4;
+  // ha_disarmed is the cluster HA policy as this node's cache holds it, and
+  // ha_policy_at that policy row's updated_at exactly as stored ("" when there
+  // is no row). ha_known is false until the cache has loaded once; a build
+  // that predates the fields answers false for all three.
+  bool ha_disarmed = 5;
+  string ha_policy_at = 6;
+  bool ha_known = 7;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -3523,6 +3536,18 @@ message EnsureDisksRequest {
     // that lies in that network, so the migration's data channel can use it.
     // An older target ignores the field and never answers.
     string migration_network = 8;
+    // nic_mtu lists each NIC's MTU as resolved from the running definition.
+    // The target answers nic_mtu_problem for any NIC whose bridge there has a
+    // different MTU.
+    repeated NICMTUExpectation nic_mtu = 9;
+}
+
+// NICMTUExpectation is one NIC's resolved MTU on the source and the network
+// it attaches to; ordinal is the NIC's position, for the refusal text.
+message NICMTUExpectation {
+    string network = 1;
+    int32  mtu     = 2;
+    int32  ordinal = 3;
 }
 
 message DiskStub {
@@ -3569,6 +3594,9 @@ message EnsureDisksResponse {
     // target never sets it, and none can hold a passworded guest: no password
     // is set before console_password_v1 latches.
     bool vnc_password_unavailable = 7;
+    // nic_mtu_problem names the NICs of the request's nic_mtu whose bridge on
+    // this host has a different MTU. Empty when every one matches.
+    string nic_mtu_problem = 8;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -4767,6 +4795,12 @@ service LiteVirt {
     rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
     rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
+    // GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
+    // confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
+    // fenced and no workload is recovered automatically.
+    rpc GetHAPolicy(google.protobuf.Empty)            returns (HAPolicyStatus);
+    rpc SetHAPolicy(SetHAPolicyRequest)               returns (HAPolicyStatus);
+
     // RestoreRelay clears a relay-health demotion now (admin;
     // colonelpanik/litevirt#175): it writes the host's relay_demoted row back
     // to demoted=false, replicated and audited, and with hold_seconds > 0
@@ -5054,6 +5088,41 @@ message FailoverScopeRegion {
     bool   can_fence_own    = 7;
 }
 
+message SetHAPolicyRequest {
+    string state            = 1;  // "armed" | "disarmed"
+    string reason           = 2;
+    // fence_down_hosts lets an arm proceed although hosts it would fence are
+    // down.
+    bool   fence_down_hosts = 3;
+}
+
+message HAPolicyStatus {
+    string state  = 1;  // "armed" | "disarmed"
+    string set_by = 2;  // "" when there is no row
+    string at     = 3;  // the row's updated_at as stored; "" when there is no row
+    string reason = 4;
+    repeated HAVoterAnswer       voters          = 5;
+    repeated string              would_be_fenced = 6;
+    bool                         first_use_paid  = 7;
+    repeated HARegionConfirmation regions        = 8;
+}
+
+// HAVoterAnswer is one voter's latest Ready answer about the HA policy.
+message HAVoterAnswer {
+    string host         = 1;
+    bool   ha_known     = 2;
+    bool   ha_disarmed  = 3;
+    string ha_policy_at = 4;
+    bool   confirmed    = 5;
+}
+
+// HARegionConfirmation is whether a majority of a region's voters confirmed
+// the policy (region failover scope).
+message HARegionConfirmation {
+    string region    = 1;
+    bool   confirmed = 2;
+}
+
 message SetFailoverScopeRequest {
     string scope = 1;  // "cluster" | "region"
 }
@@ -5264,6 +5333,7 @@ message ReplicationSchedule {
     string last_run_err  = 11;  // "" = success
     bool   incremental   = 12;  // transfer only dirty extents (raw replicas); full-copy fallback
     bool   auto_promote  = 13;  // failover may promote the freshest replica on host loss
+    int64  bwlimit_bytes_per_sec = 14;  // 0 = unlimited
 }
 message CreateReplicationScheduleRequest {
     string vm_name       = 1;
@@ -5277,6 +5347,8 @@ message CreateReplicationScheduleRequest {
     string project_name  = 9;
     bool   incremental   = 10;
     bool   auto_promote  = 11;
+    // bwlimit_bytes_per_sec: unset keeps the stored limit, 0 clears it.
+    optional int64 bwlimit_bytes_per_sec = 12;
 }
 message ListReplicationSchedulesRequest  {}
 message ListReplicationSchedulesResponse { repeated ReplicationSchedule schedules = 1; }

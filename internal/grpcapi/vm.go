@@ -3826,15 +3826,42 @@ func formatDiskSizeBytes(n int64) string {
 // operator — is "paused" rather than the "stopped" coarse state folds it into.
 // A display state only: nothing writes "paused" into a vms row, and the list's
 // drift heal for a running row whose domain is stopped never sees a paused one.
+//
+// It is asked on the backend's StateReader, connections of libvirtd's own
+// for state reads, when it has one: the daemon's one connection can be full
+// of calls libvirt does not answer, and then it answers nothing for any domain
+// (libvirt/state_reader.go). When the reader cannot dial, it asks on the
+// daemon's connection as before.
 func (s *Server) liveVMState(name string) (string, error) {
-	st, err := s.virt.DomainState(name)
+	r := s.stateReads()
+	st, err := r.DomainState(name)
+	if errors.Is(err, lv.ErrStateConnUnavailable) {
+		r = s.virt
+		st, err = r.DomainState(name)
+	}
 	if err != nil || st != "stopped" {
 		return st, err
 	}
-	if r, rerr := s.virt.DomainStateReason(name); rerr == nil && r.State == "stopped" && r.Reason == "paused" {
+	if rs, rerr := r.DomainStateReason(name); rerr == nil && rs.State == "stopped" && rs.Reason == "paused" {
 		return "paused", nil
 	}
 	return st, nil
+}
+
+// domainStateReads is what liveVMState asks for a domain's state.
+type domainStateReads interface {
+	DomainState(name string) (string, error)
+	DomainStateReason(name string) (lv.DomainStatus, error)
+}
+
+// stateReads is the backend's StateReader when it has one, else the backend.
+func (s *Server) stateReads() domainStateReads {
+	if b, ok := s.virt.(interface{ StateReader() *lv.StateReader }); ok {
+		if r := b.StateReader(); r != nil {
+			return r
+		}
+	}
+	return s.virt
 }
 
 // drainStopInProgress reports whether a local VM's row is the stop a drain's

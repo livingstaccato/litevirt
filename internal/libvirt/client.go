@@ -63,6 +63,11 @@ type Client struct {
 	// (MarkVNCProbed); nil on a client built without NewClient.
 	vncProbed     chan struct{}
 	vncProbedOnce sync.Once
+
+	// stateReader asks for domain states on connections of its own
+	// (state_reader.go); made on first use.
+	stateReaderMu sync.Mutex
+	stateReader   *StateReader
 }
 
 // NewClient connects to the local libvirtd daemon.
@@ -167,6 +172,11 @@ func (c *Client) RegisterDomainEventCallback(cb DomainEventCallback) {
 
 // Close disconnects from libvirtd.
 func (c *Client) Close() error {
+	c.stateReaderMu.Lock()
+	if c.stateReader != nil {
+		c.stateReader.Close() //nolint:errcheck // best effort; the main connection's answer is the one returned
+	}
+	c.stateReaderMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.virt == nil {

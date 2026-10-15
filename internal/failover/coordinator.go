@@ -341,6 +341,10 @@ type Coordinator struct {
 	// no longer standing, so the explanation is logged once per fence rather
 	// than once per poll. See noteResumeDeclined.
 	resumeDeclined map[string]string
+	// confirmStale records, per host, the operator confirmation last found no
+	// longer standing, so the refusal is logged once per confirmation rather
+	// than once per poll. See noteConfirmationStale.
+	confirmStale map[string]string
 	// SelfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
 	// waiting to reboot. A doomed node must not drive ANY failover decision during that
 	// window, even if quorum transiently returns first. Wired by the daemon from the
@@ -1041,7 +1045,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			// verified power-off has renewed it (see resumeActionFor).
 			if rec, at, ok := c.recordedFence(ctx, h); ok {
 				recorded = true
-				switch act, why := c.resumeActionFor(ctx, target, rec, at); act {
+				switch act, why := c.resumeActionFor(ctx, h, rec, at); act {
 				case resumeFromRecord:
 					slog.Info("failover: resuming recovery from a fence a previous leader recorded",
 						"host", target, "fence_id", rec.ID, "method", rec.Method)
@@ -1329,7 +1333,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.relocDeferred = nil
 	c.retrying = nil
 	c.retryNotified, c.retryRefusedLogged = nil, nil
-	c.resumeDeclined = nil
+	c.resumeDeclined, c.confirmStale = nil, nil
 	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
@@ -2293,9 +2297,11 @@ const (
 //     authority by itself: it closes the "host came back and nobody saw it"
 //     gap without inferring anything from health rows, and it gives the
 //     shared-disk gate (proofGradeFenceRef) a fence inside its window to bind.
-//   - A fence that relied on the host's partition pause is resumed while an
+//   - A fence that relied on the host's partition pause is resumed, while
+//     that pause may still be relied on (relyOnPartitionPause), once an
 //     observer has watched the host stay down since it: recoverFenced waits
-//     afresh, and the deadline applies the self-pause rule.
+//     afresh, and the deadline applies the self-pause rule. Once the pause
+//     may not be relied on, it is an unverified fence, as below.
 //   - An UNVERIFIED fence (SSH, best-effort) is resumed from the record while
 //     it still stands, and never re-fenced: a second SSH power-off of a host
 //     that is already off cannot connect and reports a FAILED fence, which
@@ -2306,14 +2312,17 @@ const (
 // safe-fence policy and LabelFenceRequiresConfirmation apply to it exactly as
 // they would have to the leader: the successor gets the dead leader's
 // authority and no more.
-func (c *Coordinator) resumeActionFor(ctx context.Context, host string, rec fenceRecord, at time.Time) (resumeAction, string) {
-	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) {
-		// A fence that relied on the host's partition pause. The host is up by
-		// design, so whether anybody has seen it answer is not this point's
-		// question: recoverFenced starts a fresh wait, and the deadline asks
-		// it (selfPauseStillStands). An outage that has ended is still
-		// declined here.
-		if !c.observerStreakSpans(ctx, host, at) {
+func (c *Coordinator) resumeActionFor(ctx context.Context, h *corrosion.HostRecord, rec fenceRecord, at time.Time) (resumeAction, string) {
+	host := h.Name
+	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) && c.relyOnPartitionPause(ctx, h) {
+		// A fence that relied on the host's partition pause, which may still
+		// be relied on. The host is up by design, so whether anybody has seen
+		// it answer is not this point's question: recoverFenced starts a fresh
+		// wait, and the deadline asks it (selfPauseStillStands). An outage
+		// that has ended is still declined here. Once the pause may not be
+		// relied on, the record is the assumed best-effort fence it was
+		// without it, and is judged as one below.
+		if !c.observerStreakSpans(ctx, h.Name, at) {
 			return resumeDecline, "no observer has watched the host stay down since the fence"
 		}
 		return resumeFromRecord, ""
@@ -2646,7 +2655,14 @@ func (c *Coordinator) readNewestFenceAttempt(ctx context.Context, host string) (
 //   - an operator confirmation ("manual-confirmed") at or after the NEWEST such
 //     attempt, so it attests to this outage and not an earlier one;
 //   - h is still quorum-down, which the caller supplies by construction: this
-//     runs only for fence candidates, i.e. hosts a fresh quorum observes failing.
+//     runs only for fence candidates, i.e. hosts a fresh quorum observes failing;
+//   - nobody has seen h answer since the confirmation (confirmationStands). A
+//     quorum observing h down now does not show that: one observer whose path
+//     to h never healed keeps its unbroken run across two outages while the
+//     others saw h come back, so a confirmation of the first outage would
+//     otherwise be spent in the second by a coordinator that has not spent it
+//     (a new lease holder, a restart). Such a confirmation is refused with
+//     the host's hold naming the remedy: confirm again.
 //
 // That answers the objection that withdrew the earlier stranded-workload sweep
 // (397c39f4): fence-confirm has no precondition and runs no fence, so on its
@@ -2678,7 +2694,66 @@ func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostR
 		}
 		return fenceRecord{}, false
 	}
+	if c.confirmResumed[h.Name] == confirm.ID {
+		// Spent by this coordinator: resumeFromConfirmation does not act on it
+		// again, so it is not judged again either.
+		return confirm, true
+	}
+	if why, stands := c.confirmationStands(ctx, h.Name, confirmedAt); !stands {
+		c.noteConfirmationStale(h.Name, confirm, why)
+		return fenceRecord{}, false
+	}
 	return confirm, true
+}
+
+// confirmationStands reports whether an operator confirmation of host at
+// confirmedAt is still authority over the outage host is in now, and when it
+// is not, why. It is fenceStillStandsIn with the confirmation as the fence:
+// some observer has watched the host fail without a break since before it,
+// and nobody has seen it answer since — no observer's latest verdict is an
+// answer newer than it, and no observer's failing run began after it. Nor
+// may this node have probed the host healthy since it (LastContact): the
+// confirmation's time is mapped onto this node's monotonic clock through its
+// wall clock, and counts from fenceSkewMargin before it, as an answered
+// verdict does. A host_health read error does not stand, with no reason: the
+// caller refuses this cycle without calling the confirmation stale.
+func (c *Coordinator) confirmationStands(ctx context.Context, host string, confirmedAt time.Time) (string, bool) {
+	hr := c.readHostHealth(ctx, host)
+	if hr.err != nil {
+		slog.Warn("failover: host_health read for a confirmation resume failed", "host", host, "error", hr.err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return "", false
+	}
+	if why, _, ok := c.fenceStillStandsIn(hr, host, confirmedAt); !ok {
+		return why, false
+	}
+	since := c.mono().Add(-c.now().Sub(confirmedAt)).Add(-fenceSkewMargin)
+	if c.contactedSince(host, since) {
+		return "this node has probed the host healthy since the confirmation", false
+	}
+	return "", true
+}
+
+// noteConfirmationStale records that the operator confirmation confirm of
+// host no longer stands (confirmationStands): the host's hold names it and
+// the remedy every cycle, and it is logged and counted once per confirmation.
+func (c *Coordinator) noteConfirmationStale(host string, confirm fenceRecord, why string) {
+	if why == "" {
+		return
+	}
+	hint := "confirm " + host + " is powered off, then run 'lv host fence-confirm " + host + "' again"
+	c.noteHold(host, "the operator confirmation "+confirm.ID+" does not stand for this outage: "+
+		strings.Replace(why, "the fence", "the confirmation", 1)+"; "+hint)
+	if c.confirmStale == nil {
+		c.confirmStale = map[string]string{}
+	}
+	if c.confirmStale[host] == confirm.ID {
+		return
+	}
+	c.confirmStale[host] = confirm.ID
+	slog.Warn("failover: the host has been seen up since the operator confirmed it off, NOT resuming on the confirmation",
+		"host", host, "confirmation", confirm.ID, "confirmed_at", confirm.TS, "reason", why, "hint", hint)
+	c.mAttempt(PhaseRecovery, ResultRefused, ErrManualUnconfirmed)
 }
 
 // confirmationAndAttempt reads host's fencing_log for the newest operator
@@ -2750,9 +2825,12 @@ func (c *Coordinator) confirmationAndAttempt(ctx context.Context, host string) (
 //   - no earlier attempt belongs to this outage (attemptIsThisOutage), which
 //     would make this a resume rather than a fence;
 //   - the confirmation itself belongs to this outage: some observer has watched
-//     h fail without a break since before it (observerStreakSpans). A
-//     confirmation of an outage h has since recovered from authorises nothing,
-//     exactly as before.
+//     h fail without a break since before it, and nobody has seen h answer
+//     since it (confirmationStands). A confirmation of an outage h has since
+//     recovered from authorises nothing, exactly as before, and is refused
+//     with the host's hold naming the remedy: confirm again. One observer's
+//     unbroken run is not enough on its own: the manual fence this starts
+//     accepts the same confirmation (manualFenceConfirmed).
 //
 // A mistyped hostname reaches only a host a quorum observes down, without a
 // break, since before the confirmation was typed — and that host is then fenced
@@ -2768,7 +2846,8 @@ func (c *Coordinator) confirmationFencesAfresh(ctx context.Context, h *corrosion
 	if !attempt.IsZero() && (!attempt.Before(confirmedAt) || c.attemptIsThisOutage(ctx, h.Name, attempt)) {
 		return false
 	}
-	if !c.observerStreakSpans(ctx, h.Name, confirmedAt) {
+	if why, stands := c.confirmationStands(ctx, h.Name, confirmedAt); !stands {
+		c.noteConfirmationStale(h.Name, confirm, why)
 		return false
 	}
 	slog.Warn("failover: an operator confirmed this host off during the outage in progress, and no fence has run for it; fencing it afresh",
@@ -2792,9 +2871,11 @@ func (c *Coordinator) confirmationFencesAfresh(ctx context.Context, h *corrosion
 //   - it is within recentFenceWindow — the window every other fence-recency
 //     question in the coordinator uses. That alone does NOT show the host
 //     stayed down: it can answer, fail again and lose the record of its return
-//     within five minutes. Here the operator's confirmation, newer than the
-//     attempt, attests that it is off now; a resume with no confirmation
-//     demands the run below whatever the fence's age (fenceStillStands); or
+//     within five minutes. A resume on a confirmation therefore also demands
+//     that nobody has seen the host answer since the confirmation
+//     (confirmationStands), whatever the attempt's age; a resume with no
+//     confirmation demands the run below whatever the fence's age
+//     (fenceStillStands); or
 //   - some observer has watched the host fail WITHOUT A BREAK since before the
 //     attempt (observerStreakSpans). This is what honours an operator who took
 //     twenty minutes to reach the rack.

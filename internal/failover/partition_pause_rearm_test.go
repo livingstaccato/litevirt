@@ -111,6 +111,7 @@ func TestPartitionPauseRearm_AnOperatorConfirmationStillLands(t *testing.T) {
 	if got := atDeadline(t, c, ctx, mono, db, func() { bridgeAnswer(t, db) }); got != "down" {
 		t.Fatalf("setup: VM recovered to %q", got)
 	}
+	poweredOff(t, db, "bridge")
 	operatorConfirms(t, db, ctx, "down")
 	c.run(ctx)
 	if got := vmHost(t, db, ctx); got != "alive" {

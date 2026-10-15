@@ -586,7 +586,9 @@ All of this is in the failover coordinator (`internal/failover`).
    the record. That is later than the original `t_d`, so it is safe. It
    resumes while an observer has watched the host stay down since the fence,
    whoever has seen the paused host answer; the deadline then applies step
-   3.
+   3. That holds only while the host's pause may still be relied on (§4.3).
+   Once it may not, the record is an unverified fence: it is resumed only
+   while it still stands, and is otherwise declined.
 
 The recovery itself (claim, proof, destination start) is unchanged. It merely
 starts after the deadline. A verified fence (IPMI) or an operator confirmation

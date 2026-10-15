@@ -928,7 +928,11 @@ func (c *Coordinator) contactedSince(host string, mono time.Time) bool {
 //     retryPauseWait replaces it when the deadline goes ahead;
 //   - otherwise the retry and the episode's memory are dropped and the host
 //     goes down the fence path a successor would take: resumeActionFor
-//     re-fences a verified fence and declines one that no longer stands.
+//     re-fences a verified fence and declines an unverified one that no
+//     longer stands (fenceStillStands). A self-pause record is judged as an
+//     unverified one while the host's pause may not be relied on
+//     (relyOnPartitionPause); while it may, it is resumed on an observer's
+//     unbroken run alone and waits out a fresh partition-pause deadline.
 //
 // A retry with no moment recorded is judged an outage that is over: nothing
 // says which outage it belongs to.

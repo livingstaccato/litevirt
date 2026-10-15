@@ -1105,7 +1105,7 @@ A recovery refused for want of a confirmation — a `manual` fence, a
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
 `lv host fence-confirm <host>`.
 
-The resume requires four things, not the confirmation alone:
+The resume requires five things, not the confirmation alone:
 
 1. **The cluster itself fenced the host** — a `fencing_log` row with result
    `fenced` or `partial`, which only a fence that ran writes.
@@ -1119,6 +1119,18 @@ The resume requires four things, not the confirmation alone:
 4. **The host is still down now** — a fresh quorum observes it failing. A host
    that has come back, or that an operator has put into `maintenance`, is never
    resumed.
+5. **Nobody has seen the host answer since the confirmation.** Some observer
+   has failed it without a break since at least 5 seconds before the
+   confirmation. No observer's latest verdict is an answer newer than 5
+   seconds before it, and no observer's failing run began more than 5 seconds
+   after it. The coordinator's own node has not probed the host healthy since
+   5 seconds before it. Otherwise the coordinator logs "the host has been seen
+   up since the operator confirmed it off, NOT resuming on the confirmation"
+   once per confirmation (`phase=recovery, error_class=manual_unconfirmed`).
+   The host's stall reason names the confirmation and the remedy. Power the
+   host off, then run `lv host fence-confirm <host>` again. A confirmation
+   typed before the power-off, while a bridge still sees the host, is refused
+   the same way.
 
 An observer's unbroken run of failed probes restarts when that observer's
 daemon restarts, so after every observer has restarted a genuine confirmation
@@ -1127,7 +1139,7 @@ then fences the host for the outage in progress, refuses for want of a
 confirmation, and resumes once you confirm again.
 
 `fence-confirm` has no precondition and runs no fence, so on its own a mistyped
-hostname could otherwise authorise a recovery. With all three required, a
+hostname could otherwise authorise a recovery. With all of these required, a
 mistype can only reach a host the cluster already fenced and still sees down.
 
 **A confirmation before any fence of this outage fences the host afresh.**
@@ -1144,7 +1156,9 @@ fence them first. Now, when all of these hold:
 - no fence attempt is at or after the confirmation, and no earlier attempt
   belongs to this outage;
 - the confirmation belongs to this outage: some observer has probed the host
-  and failed without a break since at least 5 seconds before it,
+  and failed without a break since at least 5 seconds before it, and nobody
+  has seen the host answer since it (item 5 above; a refusal is logged and
+  held the same way),
 
 the coordinator fences the host itself, as it would an `active` one, and logs
 "an operator confirmed this host off during the outage in progress, and no

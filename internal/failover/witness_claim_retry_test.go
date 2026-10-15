@@ -577,3 +577,57 @@ func TestQuietFallback_ARestartedRunIsNotABridge(t *testing.T) {
 		t.Fatalf("refusal on an answer: %+v; want key %q, bridged", v, keyAnswered)
 	}
 }
+
+// Re-review 2 (R2-m1): a successor resumes a self-pause fence record on one
+// observer's unbroken run only while the host's pause may still be relied
+// on. Once it may not, the record is an assumed best-effort fence and is
+// judged as one (fenceStillStands): coordinator's and alive's failing runs
+// began after the fence, so they saw down answer since, and the record is
+// declined for an operator rather than resumed with a fresh wait.
+//
+// Mutation: resume a self-pause record on the streak alone whatever the
+// reliance — the successor starts a wait on the declined subtest.
+func TestResumeActionFor_ASelfPauseRecordNoLongerReliedOnMustStillStand(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		relied   bool
+		wantWait bool
+	}{
+		{"pause still relied on", true, true},
+		{"pause no longer relied on", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, db, ctx, mono := explicitPause(t)
+			c.run(ctx)
+			if _, ok := c.pauseWaits["down"]; !ok {
+				t.Fatal("setup: the self-pause fence started no wait")
+			}
+			t0 := time.Now()
+			failingSince(t, db, "v4", t0.Add(-time.Hour), t0.Add(time.Minute))
+			for _, o := range []string{"coordinator", "alive"} {
+				failingSince(t, db, o, t0.Add(30*time.Second), t0.Add(time.Minute))
+			}
+			if err := db.Execute(ctx, `DELETE FROM leader_election`); err != nil {
+				t.Fatal(err)
+			}
+			succ := newTestCoordinator("alive", db)
+			succ.SetFencer(fencerReturning("best-effort-ssh", true))
+			succ.Mono = mono.Now
+			succ.Now = func() time.Time { return time.Now().Add(time.Minute) }
+			succ.PartitionPauseEnforced = func(context.Context) bool { return tc.relied }
+			succ.PeerPausesOnLoss = func(string) bool { return true }
+
+			succ.run(ctx)
+
+			if got := vmHost(t, db, ctx); got != "down" {
+				t.Fatalf("the successor moved the VM to %q at once", got)
+			}
+			if _, waiting := succ.pauseWaits["down"]; waiting != tc.wantWait {
+				t.Fatalf("successor waiting = %v, want %v", waiting, tc.wantWait)
+			}
+			if !tc.wantWait && !strings.Contains(succ.holdReason["down"], "no longer stands") {
+				t.Errorf("the declined record is not the host's hold: %q", succ.holdReason["down"])
+			}
+		})
+	}
+}

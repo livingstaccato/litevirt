@@ -106,6 +106,7 @@ func TestBridgedStall_ClearsWhenTheRecoveryProceeds(t *testing.T) {
 	if !bridgedOpen(t, db, ctx) {
 		t.Fatal("setup: not raised")
 	}
+	poweredOff(t, db, "bystander")
 	operatorConfirms(t, db, ctx, "down")
 	c.run(ctx)
 	if got := vmHost(t, db, ctx); got != "alive" {

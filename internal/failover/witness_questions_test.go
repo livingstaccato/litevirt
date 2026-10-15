@@ -81,6 +81,7 @@ func TestWitnessQ1_AFailedFenceHeldByABridgeRaisesBridged(t *testing.T) {
 	// the condition stays until the workload moves or the host comes back.
 	// Here: an operator confirms it off and the VM moves; the condition
 	// resolves.
+	poweredOff(t, db, "bridge")
 	operatorConfirms(t, db, ctx, "down")
 	c.run(ctx)
 	c.run(ctx)

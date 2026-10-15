@@ -258,6 +258,7 @@ func slowDomains(t *testing.T, n int) (*Server, *libvirtfake.Fake) {
 // (a fixed bound): the slow host reads incomplete: red.
 func TestRuntimeInventory_ASlowButHealthyHostCompletes(t *testing.T) {
 	s, f := slowDomains(t, 25)
+	s.liveStateWait = 150 * time.Millisecond // stall 150 ms (reads 40 ms: 3.75x), cap 3 s
 	f.FailDomainState = func(string) error { time.Sleep(40 * time.Millisecond); return nil }
 	inv := within(t, 10*time.Second, "an inventory of a slow host", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
@@ -328,34 +329,34 @@ func slowSequence(f *libvirtfake.Fake, delay time.Duration, hook func(string)) {
 
 // Re-review 2, C-1: past the inventory's cap, the domains not yet read were
 // filled in from the last complete inventory and the whole reported
-// complete. vm29, shut off when that inventory was taken and running since,
+// complete. vm69, shut off when that inventory was taken and running since,
 // read defined_stopped: not a disk holder, in a snapshot not partial — a
 // running copy the dual-run detector cannot see. Past the cap the inventory
 // is incomplete now, and never says a domain it has not read holds no disks.
 //
-// Mutation: the list-and-cache answer back past the cap: vm29 reads a
+// Mutation: the list-and-cache answer back past the cap: vm69 reads a
 // complete non-holder: red.
 func TestRuntimeInventory_ADomainStartedSinceNeverReadsAsNotHoldingItsDisks(t *testing.T) {
-	s, f := slowDomains(t, 30)
-	s.liveStateWait = 200 * time.Millisecond // cap 4 s
-	_ = f.DestroyDomain("vm29")
+	s, f := slowDomains(t, 70)
+	s.liveStateWait = 150 * time.Millisecond // stall 150 ms, cap 3 s
+	_ = f.DestroyDomain("vm69")
 	if inv := s.collectRuntimeInventory(context.Background()); !inv.Complete {
 		t.Fatalf("the first inventory: incomplete: %v", inv.Errors)
 	}
-	if err := f.StartDomain("vm29"); err != nil {
+	if err := f.StartDomain("vm69"); err != nil {
 		t.Fatal(err)
 	}
-	slowSequence(f, 150*time.Millisecond, nil) // 30 x 150 ms: past the cap
+	slowSequence(f, 50*time.Millisecond, nil) // 70 x 50 ms (3x under the stall): past the cap
 	inv := within(t, 15*time.Second, "an inventory past its cap", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
 	snap := snapshotFromInventory(inv)
 	holds := false
 	for _, n := range snap.diskHolderVMs {
-		holds = holds || n == "vm29"
+		holds = holds || n == "vm69"
 	}
 	if !snap.partial && !holds {
-		t.Fatalf("vm29, running, reads as not holding its disks in a complete inventory: %+v", inv.Workloads)
+		t.Fatalf("vm69, running, reads as not holding its disks in a complete inventory: %+v", inv.Workloads)
 	}
 	if inv.Complete || !strings.Contains(strings.Join(inv.Errors, ";"), "past its cap") {
 		t.Errorf("past the cap: complete %v, errors %v; want incomplete saying so", inv.Complete, inv.Errors)
@@ -366,27 +367,27 @@ func TestRuntimeInventory_ADomainStartedSinceNeverReadsAsNotHoldingItsDisks(t *t
 // C-1, settle's side: settle stops a source's live copy only when the
 // destination's own runtime says the VM runs there (health/settle.go,
 // destRunsVia), "the last line before stopping what may otherwise be the
-// only copy". vm29 ran on the destination when its last complete inventory
+// only copy". vm69 ran on the destination when its last complete inventory
 // was taken and has stopped since: past the cap it read running from that
 // inventory, and the source would be stopped with no copy running. It reads
 // unknown now.
 //
-// Mutation: the list-and-cache answer back past the cap: vm29 reads running:
+// Mutation: the list-and-cache answer back past the cap: vm69 reads running:
 // red.
 func TestRuntimeInventory_ADestinationStoppedSinceNeverReadsRunning(t *testing.T) {
-	s, f := slowDomains(t, 30)
-	s.liveStateWait = 200 * time.Millisecond
+	s, f := slowDomains(t, 70)
+	s.liveStateWait = 150 * time.Millisecond
 	if inv := s.collectRuntimeInventory(context.Background()); !inv.Complete {
 		t.Fatalf("the first inventory: incomplete: %v", inv.Errors)
 	}
-	_ = f.DestroyDomain("vm29") // shut off, still defined: still listed
-	slowSequence(f, 150*time.Millisecond, nil)
+	_ = f.DestroyDomain("vm69")               // shut off, still defined: still listed
+	slowSequence(f, 50*time.Millisecond, nil) // 70 x 50 ms: past the 3 s cap
 	inv := within(t, 15*time.Second, "an inventory past its cap", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})
-	got := runtimeStateIn(inventoryFromProto(inventoryToProto(inv)), corrosion.WorkloadVM, "vm29")
+	got := runtimeStateIn(inventoryFromProto(inventoryToProto(inv)), corrosion.WorkloadVM, "vm69")
 	if got == health.RuntimeRunning {
-		t.Fatalf("vm29, stopped on the destination, reads %s to a peer's settle", got)
+		t.Fatalf("vm69, stopped on the destination, reads %s to a peer's settle", got)
 	}
 	waitFlightDone(t, s)
 }
@@ -400,8 +401,8 @@ func TestRuntimeInventory_ADestinationStoppedSinceNeverReadsRunning(t *testing.T
 // Mutation: no ctx in the wait: the caller waits for the cap: red.
 func TestRuntimeInventory_ACallerStopsWaitingWhenItsContextIsDone(t *testing.T) {
 	s, f := slowDomains(t, 30)
-	s.liveStateWait = 200 * time.Millisecond // cap 4 s
-	slowSequence(f, 150*time.Millisecond, nil)
+	s.liveStateWait = 300 * time.Millisecond   // stall 300 ms, cap 6 s
+	slowSequence(f, 100*time.Millisecond, nil) // 30 x 100 ms = 3 s
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	t0 := time.Now()
@@ -422,7 +423,7 @@ func TestRuntimeInventory_ACallerStopsWaitingWhenItsContextIsDone(t *testing.T) 
 // Mutation: the collect under invCacheMu: the lock is held meanwhile: red.
 func TestLocalInventoryCached_DoesNotHoldItsLockAcrossTheCollect(t *testing.T) {
 	s, f := slowDomains(t, 10)
-	s.liveStateWait = 200 * time.Millisecond
+	s.liveStateWait = 300 * time.Millisecond
 	slowSequence(f, 100*time.Millisecond, nil)
 	done := make(chan struct{})
 	go func() {
@@ -442,18 +443,18 @@ func TestLocalInventoryCached_DoesNotHoldItsLockAcrossTheCollect(t *testing.T) {
 // it stalled — a domain libvirt does not answer for — not merely that it was
 // slow. Swapping the two checks goes red.
 func TestRuntimeInventory_PastTheCapAndStalledSaysStalled(t *testing.T) {
-	s, f := slowDomains(t, 30)
-	s.liveStateWait = 100 * time.Millisecond // cap 2 s
+	s, f := slowDomains(t, 70)
+	s.liveStateWait = 150 * time.Millisecond // stall 150 ms, cap 3 s
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
-	slowSequence(f, 80*time.Millisecond, func(n string) {
-		if n == "vm28" { // reached at about 2.2 s: past the cap
+	slowSequence(f, 50*time.Millisecond, func(n string) {
+		if n == "vm65" { // reached at about 3.25 s: past the cap
 			<-hang
 		}
 	})
 	t0 := time.Now()
 	_ = s.collectRuntimeInventory(context.Background()) // answered at the cap
-	time.Sleep(time.Until(t0.Add(2800 * time.Millisecond)))
+	time.Sleep(time.Until(t0.Add(4000 * time.Millisecond)))
 	inv := within(t, 5*time.Second, "an inventory past its cap and stalled", func() runtimeInventory {
 		return s.collectRuntimeInventory(context.Background())
 	})

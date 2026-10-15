@@ -1348,6 +1348,14 @@ type MigrationConfig struct {
 	// Default false: such a network would send migration data out the uplink
 	// or the cluster interface, and the daemon refuses to start with one.
 	AllowAnyNetwork bool `yaml:"allow_any_network,omitempty"`
+	// LiveFirmware lets this node take part in live moves of vTPM / Secure
+	// Boot VMs. Default true; false keeps litevirt.fw_live_migrate false.
+	LiveFirmware *bool `yaml:"live_firmware,omitempty"`
+}
+
+// LiveFirmwareEnabled is migration.live_firmware, true when unset.
+func (m MigrationConfig) LiveFirmwareEnabled() bool {
+	return m.LiveFirmware == nil || *m.LiveFirmware
 }
 
 type CapacityConfig struct {

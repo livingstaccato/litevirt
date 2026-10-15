@@ -1001,6 +1001,7 @@ migration:
   network: 10.20.0.0/24              # default empty: the cluster address
   address: 10.20.0.7                 # optional: this host's own address in that network
   allow_any_network: false           # default false: refuse a non-private network, or one holding the cluster address
+  live_firmware: true                # default true
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
@@ -1029,6 +1030,16 @@ contains the host's cluster or default-route address, unless `allow_any_network`
 is `true`. The network carries live moves and the disk stream of cold moves and
 clone copies, and an unencrypted storage copy stays on the cluster address. See
 [migration](migration-failover.md#a-dedicated-migration-network).
+
+`live_firmware` lets this node take part in live moves of vTPM and Secure Boot
+VMs. The daemon publishes the host label `litevirt.fw_live_migrate=true` only
+when it is on, the host has vTPM and Secure Boot support (`litevirt.tpm` and
+`litevirt.secureboot` are `true`), the installed libvirt is at least 10.0.0,
+QEMU 8.2.2, swtpm 0.7.3 and libtpms 0.9.3, and `libvirt-guests` does not save or
+restore guests (the unit enabled or active with `ON_SHUTDOWN=suspend` or
+`ON_BOOT=start`; keys the file does not set default to those values). A version
+that cannot be read counts as below the floor. The label is advisory: each
+condition is checked again when a move starts.
 
 Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
 libvirt's TLS connection, and this setting does not affect them.

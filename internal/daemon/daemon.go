@@ -1625,6 +1625,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return errSwtpm == nil && errSetup == nil
 		}},
 		{key: corrosion.LabelSecureBootCapable, capable: firmwarePaths.SecureBootAvailable},
+		{key: corrosion.LabelFwLiveMigrate, capable: func() bool {
+			probe := libvirt.NewFirmwareCodeProbe(d.fwStore, firmwarePaths, d.virt.LibvirtVersion)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			return fwLiveMigrateCapable(ctx, fwLiveInputs{
+				enabled: d.cfg.Migration.LiveFirmwareEnabled(),
+				tpm: func() bool {
+					_, errSwtpm := exec.LookPath("swtpm")
+					_, errSetup := exec.LookPath("swtpm_setup")
+					return errSwtpm == nil && errSetup == nil
+				},
+				secureBoot: firmwarePaths.SecureBootAvailable,
+				installed:  probe.Installed,
+				guests:     CheckLibvirtGuests,
+			})
+		}},
 	}
 	asserted, err := assertCapabilityLabels(ctx, d.db, d.cfg.HostName, capabilityLabels)
 	if err != nil {

@@ -56,6 +56,10 @@ const (
 	// guarded VM is placed only on such a host.
 	LabelNICGuards         = "litevirt.nic-guards"
 	LabelSecureBootCapable = "litevirt.secureboot"
+	// LabelFwLiveMigrate says the host can take part in a live move of a
+	// vTPM / Secure Boot VM (installed floors, migration.live_firmware,
+	// libvirt-guests). Advisory: every condition is re-checked live.
+	LabelFwLiveMigrate = "litevirt.fw_live_migrate"
 	// LabelUnsafeAutoFailover, when "true" on a host, restores the LEGACY
 	// proceed-anyway behavior for a failed best-effort fence even after the
 	// safe-fence-default policy (capabilities.SafeFenceDefaultV1) is enforced. It

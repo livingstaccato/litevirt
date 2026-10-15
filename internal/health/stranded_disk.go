@@ -47,7 +47,11 @@ import (
 //     (superseded_retention.go): only an operator removes it
 //     (`lv host superseded-disks <host> --remove <copy>`) or puts it back
 //     (`--restore <copy>`, RestoreSupersededDisk), which sets the disk it
-//     replaces aside in turn, so nothing is ever deleted by the swap.
+//     replaces aside in turn, so nothing is ever deleted by the swap;
+//   - once the VM is deleted, the host removes what the record names of it,
+//     and the VM's cloud-init seed, if the delete freed its disks
+//     (deleted_vm_residue.go). A --keep-disks delete keeps them, and the
+//     copies then follow the retention for a deleted VM's.
 //
 // The record is a health condition, one row per VM and host, written by the
 // coordinator while the host is down and by the host itself afterwards. It
@@ -70,6 +74,10 @@ type StrandedDisk struct {
 	// the file is still at Path, which is while the host is down.
 	Copy  string `json:"copy,omitempty"`
 	Since string `json:"since"` // RFC3339: when it was left behind or set aside
+	// Incarnation is the created_at of the VM whose disk it is, when it was
+	// recorded; "" when that could not be read, or by an older release. Only
+	// that incarnation's delete removes it (deleted_vm_residue.go).
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 // StrandedDisks is the evidence of one vm_disk_stranded condition: the
@@ -81,6 +89,9 @@ type StrandedDisks struct {
 	Disks   []StrandedDisk `json:"disks"`
 	Detail  string         `json:"detail"`
 	Fix     string         `json:"fix"`
+	// Deleted is what the VM's delete decided for these disks, written by the
+	// deleting host before its tombstone (NoteStrandedDisksDeleted).
+	Deleted *StrandedDeletion `json:"deleted,omitempty"`
 }
 
 func strandedSubject(vm, host string) string { return vm + "@" + host }
@@ -190,6 +201,7 @@ func RecordStrandedDisks(ctx context.Context, db *corrosion.Client, reporter, vm
 	}
 	ev.VM, ev.Host, ev.MovedTo = vmName, host, movedTo
 	since := now.UTC().Format(time.RFC3339)
+	inc := incarnationOf(ctx, db, vmName)
 	for _, d := range local {
 		listed := false
 		for _, e := range ev.Disks {
@@ -199,13 +211,23 @@ func RecordStrandedDisks(ctx context.Context, db *corrosion.Client, reporter, vm
 			}
 		}
 		if !listed {
-			ev.Disks = append(ev.Disks, StrandedDisk{Disk: d.DiskName, Path: d.Path, Since: since})
+			ev.Disks = append(ev.Disks, StrandedDisk{Disk: d.DiskName, Path: d.Path, Since: since, Incarnation: inc})
 		}
 	}
 	if err := writeStranded(ctx, db, reporter, row, had, ev, now); err != nil {
 		return "", err
 	}
 	return strandedDetail(ev), nil
+}
+
+// incarnationOf is the created_at of vmName's live row, "" when it has none or
+// the read fails: an entry recorded without one is never removed with a VM.
+func incarnationOf(ctx context.Context, db *corrosion.Client, vmName string) string {
+	vm, err := corrosion.GetVM(ctx, db, vmName)
+	if err != nil || vm == nil {
+		return ""
+	}
+	return vm.CreatedAt
 }
 
 // noteStrandedCopy records that host set the disk of vmName at path aside to
@@ -229,7 +251,8 @@ func noteStrandedCopy(ctx context.Context, db *corrosion.Client, reporter, vmNam
 		}
 	}
 	if !noted {
-		ev.Disks = append(ev.Disks, StrandedDisk{Disk: disk, Path: path, Copy: copyPath, Since: since})
+		ev.Disks = append(ev.Disks, StrandedDisk{Disk: disk, Path: path, Copy: copyPath, Since: since,
+			Incarnation: incarnationOf(ctx, db, vmName)})
 	}
 	if err := writeStranded(ctx, db, reporter, row, had, ev, now); err != nil {
 		return "", err
@@ -354,8 +377,7 @@ func (r *Reconciler) tendStrandedDisks(ctx context.Context) {
 		changed := false
 		var kept []StrandedDisk
 		if vm == nil {
-			slog.Info("reconciler: vm_disk_stranded resolved — the VM was deleted; its disk copies here follow the retention for a deleted VM's",
-				"vm", name)
+			kept = r.tendDeletedVMStranded(ctx, name, ev)
 		} else {
 			for _, d := range ev.Disks {
 				keep, set := r.tendStrandedDisk(ctx, vm, d)
@@ -433,19 +455,8 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 	// disk is open, or a resume would need it, and the ownership repair
 	// decides that case, not this. Only a domain shut off with nothing to
 	// resume — the leftover a fenced host comes back with — or none at all.
-	if r.virt != nil && r.virt.DomainExists(vm.Name) {
-		st, serr := r.virt.DomainStateReason(vm.Name)
-		if serr != nil {
-			return true, d
-		}
-		if !cleanableLeftover(st) {
-			if !unknownShutoff(st) {
-				return true, d
-			}
-			if saved, merr := r.virt.HasManagedSaveImage(vm.Name); merr != nil || saved {
-				return true, d
-			}
-		}
+	if r.virt != nil && !r.domainAbsentOrDeadLeftover(vm.Name) {
+		return true, d
 	}
 	// Never a file a workload on this host still uses: a linked clone's base
 	// or another VM's disk at the same path.
@@ -470,6 +481,29 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 	d.Copy, d.Since = aside, r.now().UTC().Format(time.RFC3339)
 	r.surfaceSetAsideEventOnly(ctx, vm.Name, d)
 	return true, d
+}
+
+// domainAbsentOrDeadLeftover reports whether no domain of name is defined
+// here, or the one that is is shut off with nothing to resume: shut off for a
+// reason that keeps no state (cleanableLeftover), or for an unknown reason
+// with no managed-save image. Anything else, or a state that cannot be read,
+// answers no. r.virt must be set.
+func (r *Reconciler) domainAbsentOrDeadLeftover(name string) bool {
+	if !r.virt.DomainExists(name) {
+		return true
+	}
+	st, err := r.virt.DomainStateReason(name)
+	if err != nil {
+		return false
+	}
+	if cleanableLeftover(st) {
+		return true
+	}
+	if !unknownShutoff(st) {
+		return false
+	}
+	saved, err := r.virt.HasManagedSaveImage(name)
+	return err == nil && !saved
 }
 
 // surfaceSetAsideEventOnly is surfaceSetAside for a copy whose record the

@@ -679,6 +679,18 @@ func GetTombstonedVMCreatedAt(ctx context.Context, c *Client, name string) (stri
 	return rows[0].String("created_at"), nil
 }
 
+// GetTombstonedVMDeletion is GetTombstonedVMCreatedAt with the tombstone's
+// deleted_at (an LWW key: read it with ParseUpdatedAt). Both are "" when no
+// tombstoned row of name exists.
+func GetTombstonedVMDeletion(ctx context.Context, c *Client, name string) (createdAt, deletedAt string, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT created_at, deleted_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+	if err != nil || len(rows) == 0 {
+		return "", "", err
+	}
+	return rows[0].String("created_at"), rows[0].String("deleted_at"), nil
+}
+
 // GetVMDisks returns all disks for a VM.
 func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, error) {
 	rows, err := c.Query(ctx,

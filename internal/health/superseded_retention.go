@@ -35,9 +35,11 @@ import (
 //   - while that VM is in error, pending or starting the copy is also held: a
 //     failover start that failed, or one still under way, may need it put
 //     back, so not even a named removal takes it;
-//   - once the VM is gone, the copy is removed when it is older than the
+//   - a delete of the VM that frees its disks removes the copies recorded for
+//     it (deleted_vm_residue.go);
+//   - once the VM is gone, any other copy is removed when it is older than the
 //     retention (superseded_disk_retention_days, default 7; 0 keeps every
-//     copy), by the host that holds it, on the hourly sweep.
+//     such copy), by the host that holds it, on the hourly sweep.
 //
 // Before this rule a copy was held only while its VM was in error, pending or
 // starting, so seven days after the VM was running again on a disk rebuilt

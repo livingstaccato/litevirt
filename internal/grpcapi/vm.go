@@ -3433,6 +3433,22 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// everywhere, as it does the local one above.
 	leftovers := s.planDeletedVMLeftovers(ctx, vm, !req.KeepDisks)
 
+	// What a failover left of this VM on the hosts it moved it off — its real
+	// disk, set aside there, and its seed — is removed by those hosts on their
+	// own pass, from this decision on the record of it, written BEFORE the
+	// tombstone (health/deleted_vm_residue.go). A --keep-disks delete must
+	// replace any decision an earlier attempt left, or fail: kept data would
+	// otherwise go.
+	if err := health.NoteStrandedDisksDeleted(ctx, s.db, s.hostName, req.Name, vm.CreatedAt, req.KeepDisks, time.Now()); err != nil {
+		if req.KeepDisks {
+			return nil, status.Errorf(codes.Internal,
+				"delete %s: could not record that its disks on the hosts a failover moved it off are kept, so the VM was NOT deleted (retry is safe): %v",
+				req.Name, err)
+		}
+		slog.Warn("delete: could not record the delete on the record of the disks a failover left on other hosts; they are kept there",
+			"vm", req.Name, "error", err)
+	}
+
 	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
 	// (the guarded delete declines when the row's authority moved under it, and
 	// only reports that after retrying with a fresh guard) would leave a ghost

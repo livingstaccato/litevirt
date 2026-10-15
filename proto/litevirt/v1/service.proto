@@ -3552,6 +3552,10 @@ message ProvisionNetworkRequest {
 }
 
 // ── Internal: Migration helpers ──
+message AnnounceMigratedGuestRequest {
+    string vm_name = 1;
+}
+
 message EnsureCloudInitRequest {
     string vm_name       = 1;
     string userdata      = 2;
@@ -4696,6 +4700,9 @@ service LiteVirt {
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
+    // Peer only: a live migration of vm_name to this host has completed;
+    // announce the gateway of each of its networks from this host's bridge.
+    rpc AnnounceMigratedGuest(AnnounceMigratedGuestRequest) returns (google.protobuf.Empty);
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);

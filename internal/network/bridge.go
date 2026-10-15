@@ -116,6 +116,20 @@ func forgetCreatedBridge(name string) {
 	}
 }
 
+// bridgeRecorded reports whether this host's record says EnsureBridge
+// created bridge name, the device it has now.
+func bridgeRecorded(name string) bool {
+	if validLinkName(name) != nil {
+		return false
+	}
+	rec, err := os.ReadFile(createdBridgeRecord(name))
+	if err != nil {
+		return false
+	}
+	idx, err := bridgeIfindex(name)
+	return err == nil && strings.TrimSpace(string(rec)) == idx
+}
+
 // RemoveCreatedBridgeIfUnused deletes bridge name when EnsureBridge created
 // it on this host — a record exists and names the bridge's current ifindex —
 // and RemoveBridgeIfUnused finds it unused (no ports, no address). It reports

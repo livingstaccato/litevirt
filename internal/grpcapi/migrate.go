@@ -26,7 +26,6 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -2618,13 +2617,10 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
 	}
 
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	// The target announces each network's gateway to the guest from its own
+	// bridge, so the guest's cached gateway entry moves with it.
+	go s.announceOnTarget(ctx, f.target, vm.Name)
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
 
 	// Update DNS records so VM names resolve correctly after migration.
 	if s.dnsDomain != "" {

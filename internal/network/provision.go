@@ -165,6 +165,13 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		if err := EnsureBridge(bridge); err != nil {
 			return "", err
 		}
+		// A bridge litevirt made (its record says so), with no VLAN and no
+		// uplink, gets the network's MAC, the same on every host
+		// (NetworkBridgeMAC). An operator's bridge, and a bridge that shares
+		// one L2 with the other hosts' (a VLAN, an uplink), keep their own.
+		if def.VLAN == 0 && bridgeRecorded(bridge) && !BridgeHasUplink(bridge) {
+			ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+		}
 
 		// If a VLAN ID is specified, create a VLAN sub-interface on the
 		// default-route interface (or explicit underlay) and attach it to
@@ -328,6 +335,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		out, err = execCommand("ip", "link", "set", bridge, "up")
 		if err != nil && !isFileExists(out) {
 			return "", fmt.Errorf("ip link set %s up: %w: %s", bridge, err, out)
+		}
+		if !BridgeHasUplink(bridge) {
+			ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
 		}
 
 		scope := fwScopeNet(networkName)

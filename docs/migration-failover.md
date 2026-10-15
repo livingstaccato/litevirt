@@ -19,6 +19,11 @@ litevirt uses QEMU's pre-copy memory migration:
 
 Progress is streamed to the CLI in real-time.
 
+Once a live migration completes, the target host sends gratuitous ARPs for the
+gateway of each network the VM has a NIC on (the first address of the
+network's IPv4 subnet), out of its own bridge and from that bridge's MAC, when
+it holds that address there. It needs no `arping`.
+
 ### Requirements
 
 - VM must be in `running` state

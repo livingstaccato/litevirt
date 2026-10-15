@@ -198,6 +198,14 @@ completes it. Each pass also removes a bridge litevirt created on that host
 pending teardown and no VM or container on the host names any more, and that
 has nothing plugged into it, together with its `dnsmasq`.
 
+A bridge litevirt created for a network (recorded under
+`/run/litevirt/bridges`, below) and an isolated network's bridge get a MAC
+derived from the network's name, the same on every host, unless the bridge is
+on a VLAN or has an uplink. Provisioning sets it on a bridge that has another
+MAC, so it reaches existing bridges on the daemon's first pass; an operator's
+bridge keeps its own. A guest that moves to another host then finds its
+gateway at the MAC it already has.
+
 Tearing down a bridge network removes the Linux bridge itself only when
 litevirt created it on that host. Each daemon records the bridges it creates
 under `/run/litevirt/bridges` (one file per bridge holding its interface index;

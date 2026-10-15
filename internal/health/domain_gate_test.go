@@ -187,3 +187,35 @@ func TestVMChecker_ADomainLibvirtHangsOnIsSkippedAndTheOthersChecked(t *testing.
 		t.Errorf("calls naming st on the daemon's connection: %d, want only the start's own", n)
 	}
 }
+
+// Re-review n-4: once the client is closing, its readers are closed, and the
+// gate read their error as an answer: the walk went on to the daemon's
+// connection, also closing, and could decide from a failed read (an errored
+// VM whose domain runs reads "not running"). A closed reader is no answer
+// now, so nothing is decided whatever order shutdown closes things in.
+//
+// Mutation: ErrStateReaderClosed taken as an answer: ok is written running
+// from the daemon's connection: red.
+func TestReconcile_AClosedReaderIsNoAnswer(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	f := libvirtfake.New()
+	if err := f.DefineDomain("<domain><name>ok</name></domain>"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.StartDomain("ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "ok", HostName: "host-a", Spec: `{"cpu":1,"memory":512}`, State: "error", StateDetail: "failover start failed",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.StateReader().Close()
+	r := NewReconciler("host-a", t.TempDir(), db, f)
+	r.virtWait.wait = 200 * time.Millisecond
+	passWithin(t, 5*time.Second, "the reconcile walk", func() { r.reconcile(ctx) })
+	if got := rowState(t, db, "ok"); got != "error" {
+		t.Errorf("ok with its client closing: %s, want error, untouched", got)
+	}
+}

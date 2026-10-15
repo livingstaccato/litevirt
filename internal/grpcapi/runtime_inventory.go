@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -219,36 +220,147 @@ type inventoryVMs struct {
 	errs      []string
 }
 
-// inventoryVMsKey is the single flight of the libvirt half of an inventory,
-// shared by every caller (the capacity sampler, the dual-run detector's
-// self-probe, the GetRuntimeInventory RPC peers call, admission, owner-epoch
-// readiness).
-const inventoryVMsKey = "runtime-inventory"
+// The libvirt half of an inventory is one single flight, shared by every
+// caller (the capacity sampler, the dual-run detector's self-probe, the
+// GetRuntimeInventory RPC peers call, admission, owner-epoch readiness), read
+// on the backend's StateReader: the daemon's connection can be full of calls
+// libvirt does not answer, and each caller's own unbounded list there filled
+// it (mainconn review I-1).
+//
+// A caller waits for the flight while it makes progress: a call that libvirt
+// leaves unanswered for the live-state wait stalls it (a domain libvirt hangs
+// on holds the list and every call naming it), and the caller answers
+// errLiveStateNoAnswer at once, an incomplete inventory, unknown and never
+// absent. A host with many healthy domains, or a busy libvirtd, keeps making
+// progress, so its inventory completes however long it takes, up to
+// inventoryCap (re-review n-1: a fixed bound read such a host incomplete on
+// every call, which refuses admission and pages dual-run coverage).
+//
+// Past the cap, while still making progress, the caller is answered from the
+// flight's own fresh domain list, each domain not yet read filled from the
+// last complete inventory when it is younger than inventoryCacheTTL. Absence
+// is therefore always this flight's: a domain the list does not name is gone.
+// A listed domain the cache does not hold, or no list yet, is no answer.
+type inventoryFlight struct {
+	started time.Time
+	done    chan struct{}
+	res     inventoryVMs // set before done is closed
 
-// inventoryVMsBounded reads every defined domain's state and live XML on the
-// backend's StateReader (the daemon's connection can be full of calls libvirt
-// does not answer), within inventoryWait, as one single-flight call
-// (boundedVirtCallValue): while it has not returned, a later inventory joins
-// it, and once waited out it is latched. libvirt lists only once it can look
-// at every domain, so a domain it hangs on holds it: errLiveStateNoAnswer,
-// which the caller records as an incomplete inventory, unknown and never
-// absent. Each such call costs one outstanding list on a reader connection,
-// not one on the daemon's connection per sampler pass and per peer's RPC.
-func (s *Server) inventoryVMsBounded() (inventoryVMs, error) {
-	_, v, err := s.boundedVirtCallWait(inventoryVMsKey, s.inventoryWait(), nil, func() (any, error) {
-		return s.inventoryVMs(), nil
-	})
-	if err != nil {
-		return inventoryVMs{}, err
-	}
-	vms, _ := v.(inventoryVMs)
-	return vms, nil
+	mu       sync.Mutex
+	progress time.Time                  // when libvirt last answered a call of it
+	listed   []string                   // the flight's list, once answered
+	read     map[string]runtimeWorkload // the domains read so far
+	gone     map[string]bool            // listed, then found undefined
 }
 
-// inventoryWait is how long an inventory waits for libvirt: the live-state
-// wait for each of a few calls, since it reads every domain (a host's many
-// healthy domains answer in milliseconds each).
-func (s *Server) inventoryWait() time.Duration { return 3 * s.liveStateWaitOrDefault() }
+func (f *inventoryFlight) answered() {
+	f.mu.Lock()
+	f.progress = time.Now()
+	f.mu.Unlock()
+}
+
+type inventoryFlights struct {
+	mu     sync.Mutex
+	cur    *inventoryFlight
+	last   map[string]runtimeWorkload // the last complete inventory's VMs
+	lastAt time.Time
+}
+
+// inventoryCap is how long a caller waits for an inventory still making
+// progress before it is answered from the flight's list and the cache.
+func (s *Server) inventoryCap() time.Duration { return 20 * s.liveStateWaitOrDefault() }
+
+// inventoryCacheTTL is how old the last complete inventory may be to fill in
+// the domains a slow flight has not read yet.
+func (s *Server) inventoryCacheTTL() time.Duration { return 40 * s.liveStateWaitOrDefault() }
+
+// inventoryVMsBounded is the libvirt half of an inventory (see above).
+func (s *Server) inventoryVMsBounded() (inventoryVMs, error) {
+	fl := &s.invFlights
+	fl.mu.Lock()
+	f := fl.cur
+	if f == nil {
+		now := time.Now()
+		f = &inventoryFlight{started: now, progress: now, done: make(chan struct{}),
+			read: map[string]runtimeWorkload{}, gone: map[string]bool{}}
+		fl.cur = f
+		go func() {
+			res := s.inventoryVMs(f)
+			fl.mu.Lock()
+			if len(res.errs) == 0 {
+				fl.last = map[string]runtimeWorkload{}
+				for _, w := range res.workloads {
+					fl.last[w.Name] = w
+				}
+				fl.lastAt = time.Now()
+			}
+			if fl.cur == f {
+				fl.cur = nil
+			}
+			f.res = res
+			fl.mu.Unlock()
+			close(f.done)
+		}()
+	}
+	fl.mu.Unlock()
+
+	stall, capAt := s.liveStateWaitOrDefault(), f.started.Add(s.inventoryCap())
+	tick := time.NewTicker(max(stall/10, time.Millisecond))
+	defer tick.Stop()
+	for {
+		f.mu.Lock()
+		stalled := time.Since(f.progress) >= stall
+		f.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.res, nil
+		default:
+		}
+		if stalled {
+			return inventoryVMs{}, errLiveStateNoAnswer
+		}
+		if time.Now().After(capAt) {
+			return s.inventoryFromListAndCache(f)
+		}
+		select {
+		case <-f.done:
+			return f.res, nil
+		case <-tick.C:
+		}
+	}
+}
+
+// inventoryFromListAndCache answers a caller past the cap from the flight's
+// list: each listed domain as read, or as the last complete inventory had it.
+func (s *Server) inventoryFromListAndCache(f *inventoryFlight) (inventoryVMs, error) {
+	fl := &s.invFlights
+	fl.mu.Lock()
+	last, lastAt := fl.last, fl.lastAt
+	fl.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listed == nil || last == nil || time.Since(lastAt) > s.inventoryCacheTTL() {
+		return inventoryVMs{}, errLiveStateNoAnswer
+	}
+	var out inventoryVMs
+	for _, n := range f.listed {
+		if f.gone[n] {
+			continue
+		}
+		w, ok := f.read[n]
+		if !ok {
+			if w, ok = last[n]; !ok {
+				return inventoryVMs{}, errLiveStateNoAnswer
+			}
+		}
+		out.workloads = append(out.workloads, w)
+	}
+	return out, nil
+}
+
+// inventoryWait is how long a caller can wait for libvirt to answer an
+// inventory that does not progress, for the error it reports.
+func (s *Server) inventoryWait() time.Duration { return s.liveStateWaitOrDefault() }
 
 // inventoryReads is what the libvirt half of an inventory reads.
 type inventoryReads interface {
@@ -271,7 +383,7 @@ func (s *Server) inventoryReader() inventoryReads {
 // inventoryVMs reads the libvirt half of an inventory (collectRuntimeInventory
 // has the error discipline). A reader that cannot dial falls back to the
 // daemon's connection for the call that found it so.
-func (s *Server) inventoryVMs() inventoryVMs {
+func (s *Server) inventoryVMs(f *inventoryFlight) inventoryVMs {
 	var out inventoryVMs
 	r := s.inventoryReader()
 	var main inventoryReads = s.virt
@@ -280,8 +392,13 @@ func (s *Server) inventoryVMs() inventoryVMs {
 	if fallback(err) {
 		names, err = main.ListDomains()
 	}
+	f.answered()
 	if err != nil {
 		out.errs = append(out.errs, fmt.Sprintf("list domains: %v", err))
+	} else {
+		f.mu.Lock()
+		f.listed = append([]string{}, names...)
+		f.mu.Unlock()
 	}
 
 	// Every DEFINED domain is listed (a stopped-but-defined domain is
@@ -294,6 +411,7 @@ func (s *Server) inventoryVMs() inventoryVMs {
 		if fallback(err) {
 			st, err = main.DomainState(n)
 		}
+		f.answered()
 		switch {
 		case lv.IsNoDomain(err):
 			// Listed a moment ago, gone now: undefined between the list
@@ -302,6 +420,7 @@ func (s *Server) inventoryVMs() inventoryVMs {
 			// holds nothing — that is proven absence, not a probe error.
 			// See vanishedDomain.
 			vanishedDomain(n, err)
+			f.vanished(n)
 			continue
 		case err != nil:
 			w.State = health.RuntimeUnknown
@@ -317,8 +436,10 @@ func (s *Server) inventoryVMs() inventoryVMs {
 		if fallback(err) {
 			xmlDef, err = main.DumpXML(n)
 		}
+		f.answered()
 		if lv.IsNoDomain(err) {
 			vanishedDomain(n, err)
+			f.vanished(n)
 			continue
 		} else if err != nil {
 			if w.ProbeError == "" {
@@ -336,8 +457,19 @@ func (s *Server) inventoryVMs() inventoryVMs {
 			out.errs = append(out.errs, fmt.Sprintf("vm %s owner-epoch marker unreadable", n))
 		}
 		out.workloads = append(out.workloads, w)
+		if w.ProbeError == "" {
+			f.mu.Lock()
+			f.read[n] = w
+			f.mu.Unlock()
+		}
 	}
 	return out
+}
+
+func (f *inventoryFlight) vanished(n string) {
+	f.mu.Lock()
+	f.gone[n] = true
+	f.mu.Unlock()
 }
 
 // collectRuntimeInventory builds this host's inventory.
@@ -766,25 +898,6 @@ func (s *Server) checkPeerRuntime(ctx context.Context, host, kind, name string) 
 		return health.RuntimeUnknown, nil
 	}
 	return health.RuntimeAbsent, nil
-}
-
-// localVMRuntime maps this host's libvirt state to the shared runtime
-// vocabulary — kept for the local half of owner assertion.
-func (s *Server) localVMRuntime(name string) string {
-	if s.virt == nil {
-		return health.RuntimeUnknown
-	}
-	if !s.virt.DomainExists(name) {
-		return health.RuntimeAbsent
-	}
-	state, err := s.virt.DomainState(name)
-	if err != nil {
-		return health.RuntimeUnknown
-	}
-	if state == "running" {
-		return health.RuntimeRunning
-	}
-	return health.RuntimeDefinedStopped
 }
 
 // snapshotFromInventory derives the dual-run detector's grouping view from an

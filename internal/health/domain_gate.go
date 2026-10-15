@@ -144,6 +144,11 @@ func (w *virtWait) domainState(virt domainStater, name string) (string, error) {
 		return virt.DomainState(name)
 	})
 	st, _ := v.(string)
+	if errors.Is(err, lv.ErrStateReaderClosed) {
+		// The client is closing: libvirt was not asked, so it has not
+		// answered (re-review n-4), and nothing is decided from it.
+		err = errLibvirtNoAnswer
+	}
 	return st, err
 }
 
@@ -228,6 +233,9 @@ func (w *virtWait) listDomains(virt domainLister) ([]string, error) {
 		return virt.ListDomains()
 	})
 	names, _ := v.([]string)
+	if errors.Is(err, lv.ErrStateReaderClosed) {
+		err = errLibvirtNoAnswer
+	}
 	return names, err
 }
 

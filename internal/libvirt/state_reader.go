@@ -83,7 +83,9 @@ type StateConn interface {
 // of its own: the caller may ask on its usual connection instead.
 var ErrStateConnUnavailable = errors.New("no state-read connection to libvirtd")
 
-var errStateReaderClosed = errors.New("state reader closed")
+// ErrStateReaderClosed is a call on a reader that is closed (its client is
+// closing): libvirt was not asked.
+var ErrStateReaderClosed = errors.New("state reader closed")
 
 type readConn struct {
 	conn   StateConn
@@ -314,7 +316,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 	for {
 		if r.closed {
 			r.mu.Unlock()
-			return nil, 0, errStateReaderClosed
+			return nil, 0, ErrStateReaderClosed
 		}
 		if c := r.cur; c != nil {
 			if r.takes(c) {
@@ -354,7 +356,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 		if r.closed {
 			r.mu.Unlock()
 			go conn.Close() //nolint:errcheck // best effort
-			return nil, 0, errStateReaderClosed
+			return nil, 0, ErrStateReaderClosed
 		}
 		r.cur = &readConn{conn: conn, calls: map[uint64]time.Time{}}
 	}
@@ -419,7 +421,7 @@ func (c virtStateConn) Close() error { return c.virt.Disconnect() }
 // closedStateReader is a reader whose every call fails: what a client hands
 // out once it is closed, so nothing dials a connection Close will not close.
 func closedStateReader() *StateReader {
-	r := NewStateReader(func() (StateConn, error) { return nil, errStateReaderClosed }, 0)
+	r := NewStateReader(func() (StateConn, error) { return nil, ErrStateReaderClosed }, 0)
 	r.Close() //nolint:errcheck // it has no connection
 	return r
 }

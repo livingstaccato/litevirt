@@ -2,12 +2,17 @@ package libvirt
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 )
 
 // libvirt's remote protocol procedures the handshake uses
@@ -181,6 +186,32 @@ func TestClientClose_NoReaderIsDialledAfterClose(t *testing.T) {
 		}
 		if r.Dials() != 0 {
 			t.Errorf("a reader asked for after Close dialled %d connections", r.Dials())
+		}
+	}
+}
+
+// IsConnectionLost tells a call whose connection went away under it from an
+// answer of libvirt's (re-review n-3): a held start reads only the former as
+// "no answer" and leaves its row and lease for a later daemon.
+//
+// Mutations: ErrInterrupted not recognised: red. Every error recognised: a
+// libvirt error reads as lost: red.
+func TestIsConnectionLost(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{fmt.Errorf("start domain web: %w", golibvirt.ErrInterrupted), true},
+		{fmt.Errorf("send: %w", net.ErrClosed), true},
+		{fmt.Errorf("read: %w", io.EOF), true},
+		{fmt.Errorf("write: %w", syscall.EPIPE), true},
+		{fmt.Errorf("read: %w", syscall.ECONNRESET), true},
+		{fmt.Errorf("start domain web: %w", golibvirt.Error{Code: uint32(golibvirt.ErrOperationFailed), Message: "failed"}), false},
+		{errors.New("some other failure"), false},
+	} {
+		if got := IsConnectionLost(c.err); got != c.want {
+			t.Errorf("IsConnectionLost(%v) = %v, want %v", c.err, got, c.want)
 		}
 	}
 }

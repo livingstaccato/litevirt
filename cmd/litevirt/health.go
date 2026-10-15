@@ -87,8 +87,10 @@ vip_dual_run, runtime_owner_mismatch, owner_epoch_mismatch,
 owner_epoch_suppressed, coverage_gap, lww_unresolved) can be resolved this
 way. They are the ones that gate admission, and the detector re-derives them
 every pass: one that still holds is raised again, and blocks admission again,
-on its next pass. Resolving proves nothing; use it for a condition the
-detector can no longer clear by itself, such as one on a deleted workload.
+on its next pass. It is refused until the detector has looked and not seen
+the condition: a scan later than its last sighting that completely probed
+every host it names. Resolving proves nothing; use it for a condition the
+detector can no longer clear by itself.
 
 Requires the cluster.health.resolve verb (Admin). The resolution is written
 to the audit log with your principal and --reason, and published as an

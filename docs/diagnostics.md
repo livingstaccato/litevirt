@@ -1151,8 +1151,11 @@ observed → confirmed → resolved lifecycle:
   or a host that answered partially or from an older binary, and it fails
   closed on missing or unparseable evidence, a post-dated `created_at`, or a
   failed DB read. A `runtime_owner_mismatch` or `owner_epoch_mismatch` whose
-  VM has since been deleted has no DB owner left to disagree with: it needs
-  only the hosts it names completely probed and clean. Container and VIP
+  VM has since been deleted can never be raised again, so a clean scan
+  proves nothing about it: it resolves only once every host it names was
+  completely probed and has no domain of that name in any state. A named
+  host that still has one keeps it open; a litevirt-stamped one is also
+  reported as `vm_orphan_runtime` on its host. Container and VIP
   conditions keep the cluster-wide rule (names are not unique; a VIP has no
   creation stamp), so a registered host that is permanently gone still
   freezes those until `lv host rm`;
@@ -1163,7 +1166,12 @@ observed → confirmed → resolved lifecycle:
   condition it can no longer prove, an admin can resolve it by hand:
   `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
   subject as `lv health` prints them. Only the dual-run detector's
-  conditions can be resolved this way. It needs the `cluster.health.resolve`
+  conditions can be resolved this way, and only once the detector has
+  looked and not seen it: its last scan must be later than the condition's
+  last sighting and must have completely probed every host the condition
+  names. Otherwise it is refused, naming what is missing (a scan still
+  pending or still seeing it, no detector lease holder, or a named host the
+  scan could not probe). It needs the `cluster.health.resolve`
   verb (Admin), writes a `health.condition.resolve` audit row with your
   principal and reason, and publishes `ha.condition.resolved`. It proves
   nothing: the detector re-derives its findings every pass, so a condition

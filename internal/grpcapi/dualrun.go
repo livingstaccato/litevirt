@@ -76,7 +76,11 @@ var migrationStates = map[string]bool{
 // inventory (see runtime_inventory.go) — locally for self, via GetRuntimeInventory
 // for a peer.
 type runtimeSnapshot struct {
-	diskHolderVMs  []string
+	diskHolderVMs []string
+	// definedVMs is every VM domain the host reported, in any state (running,
+	// shut off, unknown). Only a deleted VM's mismatch reads it: positive
+	// absence is a host with no domain of that name at all.
+	definedVMs     []string
 	runningCTs     []string
 	kernelVIPs     []string // bare IPs (prefix stripped) so cross-host grouping is consistent
 	unresolvedTies int
@@ -660,8 +664,7 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 		dbIndexOK && ctIndexOK
 	coverageDetail := ""
 	if !coverageComplete {
-		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
-			unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
+		coverageDetail = formatCoverageDetail(unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
 	}
 	// RE-ASSERT LEADERSHIP before acting on what the gather found.
 	//

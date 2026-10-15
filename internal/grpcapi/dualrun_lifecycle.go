@@ -258,7 +258,25 @@ func (s *Server) applyConditionLifecycle(
 		if current[f] {
 			continue
 		}
-		if !gateOK || !rc.canResolve(f, row) {
+		if !gateOK {
+			continue
+		}
+		// A deleted VM's mismatch cannot be raised again, but a named host
+		// still holding the domain is the detector still seeing its subject:
+		// refresh last_seen and keep the streak at zero, so the row reads as
+		// seen this pass (ResolveHealthCondition refuses on that) and does
+		// not age into a resolution.
+		if rc.deletedVMStillOnNamedHost(f, row.Hosts) {
+			row.CleanCount = 0
+			row.LastSeen = now
+			row.Reporter = s.hostName
+			if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+				slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
+			}
+			byIdentity[f] = row
+			continue
+		}
+		if !rc.canResolve(f, row) {
 			continue
 		}
 		row.CleanCount++

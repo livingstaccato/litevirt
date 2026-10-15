@@ -1412,8 +1412,9 @@ lv health [--resolved]                       # Cluster health: overall state, ac
 lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
                                              # Resolve one open dual-run condition by hand, named as
                                              #   `lv health` prints it. Admin (cluster.health.resolve),
-                                             #   audited, ha.condition.resolved event. The detector raises
-                                             #   it again on its next pass if it still holds.
+                                             #   audited, ha.condition.resolved event. Refused until a
+                                             #   detector scan after its last sighting probed every host
+                                             #   it names; raised again next pass if it still holds.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

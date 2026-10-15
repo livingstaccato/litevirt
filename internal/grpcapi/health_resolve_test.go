@@ -19,13 +19,28 @@ func confirmedMismatchServer(t *testing.T) *Server {
 	t.Helper()
 	s := dualRunTestServer(t, 2)
 	seedVM(t, s, "vmA", "h1", "running")
-	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
-		"h1": {}, "h2": {diskHolderVMs: []string{"vmA"}},
-	})
+	s.gatherRuntimeOverride = holdingGather
 	s.detectDualRunPass(context.Background())
 	s.detectDualRunPass(context.Background())
 	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionConfirmed {
 		t.Fatalf("setup: owner mismatch = %q, want confirmed", got)
+	}
+	return s
+}
+
+var holdingGather = fixedGather(map[string]runtimeSnapshot{"h1": {}, "h2": {diskHolderVMs: []string{"vmA"}}})
+
+// clearedMismatchServer is confirmedMismatchServer after the detector LOOKED
+// and did not see the mismatch: last seen in the past, then one complete clean
+// pass, which is not yet the two a resolution needs.
+func clearedMismatchServer(t *testing.T) *Server {
+	t.Helper()
+	s := confirmedMismatchServer(t)
+	backdateLastSeen(t, s, kindOwnerMismatch, "vmA")
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {}})
+	s.detectDualRunPass(context.Background())
+	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionConfirmed {
+		t.Fatalf("setup: owner mismatch = %q after one clean pass, want still confirmed", got)
 	}
 	return s
 }
@@ -57,7 +72,7 @@ func healthResolveAudits(t *testing.T, s *Server) [][2]string {
 // Mutations: skip the upsert — the row stays confirmed; skip the audit — no
 // row; skip the publish — no event.
 func TestResolveHealthCondition_AdminResolvesAudited(t *testing.T) {
-	s := confirmedMismatchServer(t)
+	s := clearedMismatchServer(t)
 	ctx := boundCtx(t, s, "alice", "admin", "Admin")
 	ch, unsub := s.events.Subscribe()
 	defer unsub()
@@ -98,11 +113,12 @@ func TestResolveHealthCondition_AdminResolvesAudited(t *testing.T) {
 // pass, so a mismatch that still holds is raised again — observed, and so
 // admission-gating again — on the very next pass.
 func TestResolveHealthCondition_StillTrueIsRaisedAgain(t *testing.T) {
-	s := confirmedMismatchServer(t)
+	s := clearedMismatchServer(t)
 	ctx := boundCtx(t, s, "alice", "admin", "Admin")
 	if _, err := s.ResolveHealthCondition(ctx, resolveReq()); err != nil {
 		t.Fatalf("ResolveHealthCondition: %v", err)
 	}
+	s.gatherRuntimeOverride = holdingGather
 	s.detectDualRunPass(context.Background())
 	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionObserved {
 		t.Fatalf("lifecycle after a pass that still sees the mismatch = %q, want observed", got)
@@ -146,7 +162,7 @@ func TestResolveHealthCondition_Refusals(t *testing.T) {
 		if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
 			Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondPartitionPaused,
 			SubjectKind: "host", SubjectID: "h1", Lifecycle: corrosion.ConditionConfirmed,
-			Severity: corrosion.SeverityWarning, Reporter: "h1",
+			Severity: corrosion.SeverityWarning, Reporter: "h1", LastSeen: backdated,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -175,4 +191,63 @@ func TestResolveHealthCondition_Refusals(t *testing.T) {
 			t.Errorf("a refused call wrote an audit row")
 		}
 	})
+}
+
+// TestResolveHealthCondition_RefusedUntilTheDetectorLooked: a hand
+// resolution is refused while the detector still sees the condition (its last
+// scan is the one that saw it), while the last scan could not probe a host the
+// condition names, and when no scan is recorded at all. Nothing is written or
+// audited on a refusal.
+//
+// Mutations: drop the last-seen ordering — the first arm resolves; drop the
+// named-host coverage check — the second arm resolves; drop the no-status
+// check — the third arm resolves.
+func TestResolveHealthCondition_RefusedUntilTheDetectorLooked(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) *Server
+		want  string
+	}{
+		{"still seen by the last scan", confirmedMismatchServer, "has not scanned since"},
+		{"a named host was blind in the last scan", func(t *testing.T) *Server {
+			s := confirmedMismatchServer(t)
+			backdateLastSeen(t, s, kindOwnerMismatch, "vmA")
+			s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{"h1": {}}, "h2")
+			s.detectDualRunPass(context.Background())
+			return s
+		}, "h2 (unreachable)"},
+		{"no scan recorded", func(t *testing.T) *Server {
+			s := clearedMismatchServer(t)
+			if err := s.db.Execute(context.Background(), `DELETE FROM health_evaluator_status`); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}, "no dual-run detector scan"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.setup(t)
+			ctx := boundCtx(t, s, "alice", "admin", "Admin")
+			_, err := s.ResolveHealthCondition(ctx, resolveReq())
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want FailedPrecondition naming %q", err, tc.want)
+			}
+			if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionConfirmed {
+				t.Errorf("refused call left the row %q", got)
+			}
+			if len(healthResolveAudits(t, s)) != 0 {
+				t.Errorf("a refused call wrote an audit row")
+			}
+		})
+	}
+}
+
+func TestParseCoverageDetail_RoundTrips(t *testing.T) {
+	d := formatCoverageDetail([]string{"h2", "h4"}, []string{"h3"}, nil, true, false)
+	blind, idx, ok := parseCoverageDetail(d)
+	if !ok || idx || blind["h2"] != "unreachable" || blind["h4"] != "unreachable" || blind["h3"] != "partial" || len(blind) != 3 {
+		t.Fatalf("parse(%q) = %v idx=%v ok=%v", d, blind, idx, ok)
+	}
+	if _, _, ok := parseCoverageDetail("something else"); ok {
+		t.Fatal("an unrecognised detail parsed")
+	}
 }

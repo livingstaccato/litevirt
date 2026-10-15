@@ -39,7 +39,7 @@ func ownerMismatchLifecycle(t *testing.T, n *Node, vm string) string {
 // TestFleet_DualRun_WitnessLeaderResolves: four voters, node-3 a witness and
 // the only node running the detector, so it holds the lease. dr-vm's DB owner
 // is node-0 but it runs on node-1: an owner mismatch. The VM is then deleted
-// and its runtime stopped, as the lab's test cleanup did. Every scan is
+// and its domain removed, as the lab's test cleanup did. Every scan is
 // complete and the witness holds the voter majority, so the condition must
 // resolve.
 //
@@ -81,7 +81,11 @@ func TestFleet_DualRun_WitnessLeaderResolves(t *testing.T) {
 	if err := corrosion.DeleteVM(ctx, n0.DB, "dr-vm"); err != nil {
 		t.Fatalf("DeleteVM: %v", err)
 	}
-	n1.Virt.SetState("dr-vm", libvirtfake.StateShutdown)
+	// The cleanup removes the domain, as the lab's did: a deleted VM's
+	// mismatch resolves only on positive absence from every host it names.
+	if err := n1.Virt.UndefineDomain("dr-vm", false); err != nil {
+		t.Fatalf("undefine dr-vm on %s: %v", n1.Name, err)
+	}
 	c.WaitConverged(t, convergeTimeout)
 
 	eventually(t, time.Minute, "the witness-led detector to resolve the deleted VM's owner mismatch", func() bool {

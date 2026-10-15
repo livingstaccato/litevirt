@@ -1246,6 +1246,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetOnVMStarted(svc.RefreshLBForStack)
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetCancelledStartProbe(svc.HasCancelledStart) // cancelled_starts.go: an error row's late-started domain is the sweep's
+	// A held start whose daemon restarted before libvirt answered it: its
+	// lease is taken over once the domain runs, and its outcome recorded
+	// (health/held_start_orphan.go).
+	reconciler.SetHeldStartProbe(svc.HasStartInFlight)
+	reconciler.SetVMEventRecorder(svc.RecordVMEvent)
 	// A start whose ceph key must be proven, late in a walk with no time left
 	// for it, is left untouched for the next pass rather than half-started.
 	reconciler.SetStartDeferral(svc.CephStartDeferral)

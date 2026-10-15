@@ -146,3 +146,9 @@ func (s *Server) ListVMEvents(ctx context.Context, req *pb.ListVMEventsRequest) 
 	}
 	return resp, nil
 }
+
+// RecordVMEvent is recordVMEvent, for this host's background loops
+// (health.SetVMEventRecorder).
+func (s *Server) RecordVMEvent(ctx context.Context, vmName, evType, result, detail string) {
+	s.recordVMEvent(ctx, vmName, evType, result, detail)
+}

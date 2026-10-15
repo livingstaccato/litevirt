@@ -158,7 +158,7 @@ func (e *startInFlightError) Error() string {
 	}
 	return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago). "+
 		"The start was not cancelled and still holds the VM; this daemon records its outcome when libvirt "+
-		"answers, unless the daemon restarts first. Check `lv inspect %s` and `lv events %s`",
+		"answers (if the daemon restarts first, the VM is recorded running once libvirt has started it). Check `lv inspect %s` and `lv events %s`",
 		e.name, e.since.UTC().Format(time.RFC3339), time.Since(e.since).Round(time.Second), e.name, e.name)
 }
 
@@ -567,7 +567,15 @@ func (h *heldForStart) release() {
 // startHeldDetail is the state detail of a VM's row while a start libvirt has
 // not answered within its wait goes on.
 func startHeldDetail(since time.Time) string {
-	return fmt.Sprintf("operator start: libvirt has not answered the start asked for at %s", since.UTC().Format(time.RFC3339))
+	return health.HeldStartDetail(since)
+}
+
+// HasStartInFlight reports whether a start of name this daemon asked libvirt
+// for has not settled yet: a held start's lease is then its own, and the
+// reconciler does not take it over (health.SetHeldStartProbe).
+func (s *Server) HasStartInFlight(name string) bool {
+	_, ok := s.startFlightOf(name)
+	return ok
 }
 
 // defaultStartLeaseRenewEvery is how often a held start re-takes the VM's

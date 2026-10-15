@@ -114,6 +114,10 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// heldStartLive / recordVMEvent: a held start whose daemon restarted
+	// before libvirt answered it (held_start_orphan.go).
+	heldStartLive func(name string) bool
+	recordVMEvent func(ctx context.Context, vm, typ, result, detail string)
 	// virtWait bounds the walk's and the sweeps' reads of libvirt: a domain
 	// libvirt has not answered for is skipped, never decided on
 	// (domain_gate.go).
@@ -1467,7 +1471,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
 	// on the same VM UUID — the same physical disk gets two QEMU writers
 	// → guaranteed corruption.
-	if !r.acquireVMLock(ctx, vm.Name) {
+	if !r.acquireVMLock(ctx, vm.Name) && !r.takeOverOrphanedHeldStart(ctx, vm) {
 		slog.Info("reconciler: VM lock held by another host, skipping",
 			"vm", vm.Name)
 		return
@@ -1748,6 +1752,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			}); err != nil {
 				LogPublishRefusal("reconciler: already-present running-state write failed", vm.Name, err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
+			} else if fresh.State == "starting" {
+				// A held start whose daemon restarted before libvirt
+				// answered it: its outcome, recorded once, with this move
+				// from starting (held_start_orphan.go).
+				r.recordHeldStartRan(ctx, vm.Name, fresh.StateDetail)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
 			return

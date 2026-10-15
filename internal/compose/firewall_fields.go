@@ -22,8 +22,14 @@ func (v *validator) validateFirewall(f *File) {
 	for _, name := range sortedKeys(f.SecurityGroups) {
 		rules("security-groups."+name+".rules", f.SecurityGroups[name].Rules)
 	}
+	sets := map[string][]string{}
+	for name, set := range f.IPSets {
+		sets[name] = rulefield.NormaliseSetElements(set.CIDRs)
+	}
 	for _, name := range sortedKeys(f.IPSets) {
 		if err := rulefield.IPSet(name, f.IPSets[name].CIDRs); err != nil {
+			v.ps.add("ipsets."+name, err.Error(), "")
+		} else if err := rulefield.CompanionClash(sets, name); err != nil {
 			v.ps.add("ipsets."+name, err.Error(), "")
 		}
 	}

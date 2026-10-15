@@ -67,7 +67,7 @@ const NICTableName = "litevirt-nic"
 
 // ipv6SetSuffix names the ipv6_addr companion of a named ip set that holds
 // IPv6 elements: nft sets are typed, so one name cannot hold both families.
-const ipv6SetSuffix = "_v6"
+const ipv6SetSuffix = rulefield.IPv6SetSuffix
 
 // Direction selects which side of a NIC a rule applies to. The
 // semantics match Proxmox / AWS / GCP / OpenStack:
@@ -616,6 +616,10 @@ func isIPv6Literal(s string) bool {
 // changing what the set matches. An element that does not parse is kept
 // verbatim and never used to drop another: the renderer does not second-guess
 // input it cannot read.
+//
+// A range can overlap a prefix or another range, and nft refuses two elements
+// that share even one address. A set where that remains renders its elements
+// merged (mergeIntervals); every other set renders exactly as before.
 func collapseSetElements(in []string) []string {
 	type elem struct {
 		s  string
@@ -658,8 +662,123 @@ func collapseSetElements(in []string) []string {
 		seen[e.s] = true
 		out = append(out, e.s)
 	}
+	if overlapping(out) {
+		out = mergeIntervals(out)
+	}
 	sort.Strings(out)
 	return out
+}
+
+// interval is the addresses lo..hi an element (or a piece of a stored element
+// that holds commas) matches.
+type interval struct{ lo, hi netip.Addr }
+
+// elementIntervals parses each piece of elems as an address, a prefix (nft
+// masks an unmasked one) or a range A-B; rest is every piece that does not
+// parse (a DNS name), as written.
+func elementIntervals(elems []string) (ivs []interval, rest []string) {
+	for _, e := range elems {
+		for _, piece := range strings.Split(e, ",") {
+			piece = strings.Trim(piece, " \t")
+			if piece == "" {
+				continue
+			}
+			if iv, ok := parseInterval(piece); ok {
+				ivs = append(ivs, iv)
+			} else {
+				rest = append(rest, piece)
+			}
+		}
+	}
+	sort.Slice(ivs, func(i, j int) bool {
+		if c := ivs[i].lo.Compare(ivs[j].lo); c != 0 {
+			return c < 0
+		}
+		return ivs[i].hi.Less(ivs[j].hi)
+	})
+	return ivs, rest
+}
+
+func parseInterval(s string) (interval, bool) {
+	if lo, hi, ok := strings.Cut(s, "-"); ok {
+		a, err1 := netip.ParseAddr(strings.Trim(lo, " \t"))
+		b, err2 := netip.ParseAddr(strings.Trim(hi, " \t"))
+		if err1 != nil || err2 != nil || a.BitLen() != b.BitLen() || b.Less(a) || a.Zone() != "" || b.Zone() != "" {
+			return interval{}, false
+		}
+		return interval{a, b}, true
+	}
+	if p, err := netip.ParsePrefix(s); err == nil && p.Addr().Zone() == "" {
+		p = p.Masked()
+		return interval{p.Addr(), lastAddr(p)}, true
+	}
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return interval{a, a}, true
+	}
+	return interval{}, false
+}
+
+// lastAddr is the highest address in p.
+func lastAddr(p netip.Prefix) netip.Addr {
+	b := p.Addr().AsSlice()
+	for i := p.Bits(); i < len(b)*8; i++ {
+		b[i/8] |= 0x80 >> (i % 8)
+	}
+	a, _ := netip.AddrFromSlice(b)
+	return a
+}
+
+// overlapping reports whether two different elements of an interval set share
+// an address. nft refuses such a set ("conflicting intervals specified"), the
+// same interval written twice it accepts.
+func overlapping(elems []string) bool {
+	ivs, _ := elementIntervals(elems)
+	// Sorted, an interval overlaps an earlier one exactly when it starts at or
+	// below the highest end so far; a repeat of the previous one does not.
+	var maxHi netip.Addr
+	for i, iv := range ivs {
+		if i > 0 && iv != ivs[i-1] && !maxHi.Less(iv.lo) {
+			return true
+		}
+		if i == 0 || maxHi.Less(iv.hi) {
+			maxHi = iv.hi
+		}
+	}
+	return false
+}
+
+// mergeIntervals renders a set whose elements overlap as the union of what
+// they match: overlapping or touching intervals become one element, written
+// as an address, a prefix or a range A-B. A piece that does not parse is kept
+// as written.
+func mergeIntervals(elems []string) []string {
+	ivs, out := elementIntervals(elems)
+	var merged []interval
+	for _, iv := range ivs {
+		if n := len(merged); n > 0 && !merged[n-1].hi.Less(iv.lo) {
+			if merged[n-1].hi.Less(iv.hi) {
+				merged[n-1].hi = iv.hi
+			}
+			continue
+		}
+		merged = append(merged, iv)
+	}
+	for _, iv := range merged {
+		out = append(out, intervalString(iv))
+	}
+	return out
+}
+
+func intervalString(iv interval) string {
+	if iv.lo == iv.hi {
+		return iv.lo.String()
+	}
+	for bits := 0; bits <= iv.lo.BitLen(); bits++ {
+		if p := netip.PrefixFrom(iv.lo, bits); p.Masked().Addr() == iv.lo && lastAddr(p) == iv.hi {
+			return p.String()
+		}
+	}
+	return iv.lo.String() + "-" + iv.hi.String()
 }
 
 // renderTierChain emits a chain whose rules apply to every packet

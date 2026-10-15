@@ -1209,7 +1209,15 @@ var compatCorpusModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_co
 // The corpus's DNS-named CIDR is swapped for an address: resolving a name is
 // nft's dependency on the host's resolver, which the namespace has none of.
 //
-// Mutation: render a port as stored — `dport SSH` is refused, red.
+// It then loads the freeze corpus (loadFreezePlan): every stored row that used
+// to make nft refuse the whole ruleset — overlapping set elements, a set named
+// as another's IPv6 companion, set names nft cannot read, ports nft cannot
+// resolve — rendered as the loader leaves it, in both modes, with the inet
+// and the bridge table each checked on its own as the applier loads them.
+//
+// Mutation: render a port as stored — `dport SSH` is refused, red. Skip the
+// overlap merge, or accept every set name at render — nft refuses the freeze
+// corpus ("conflicting intervals specified", "syntax error"), red.
 func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 	inNetns(t)
 	if missing := missingModules(compatCorpusModules...); len(missing) > 0 {
@@ -1241,6 +1249,23 @@ func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 		cmd.Stdin = strings.NewReader(script)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: nft -c refused the corpus ruleset: %v\n%s", mode, err, out)
+		}
+	}
+	freeze := loadFreezePlan(t)
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		p := freeze
+		p.NICMode = mode
+		p.NICs = []NICBinding{{NICDev: "tap0", VMName: "vm", SecurityGroups: []string{"web"}}}
+		inet, nic, err := RenderParts(p, true)
+		if err != nil {
+			t.Fatalf("%s: RenderParts refused the freeze corpus: %v", mode, err)
+		}
+		for table, script := range map[string]string{"inet": inet, "bridge": nic} {
+			cmd := exec.Command("nft", "-c", "-f", "-")
+			cmd.Stdin = strings.NewReader(script)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("%s: nft -c refused the freeze corpus's %s table: %v\n%s", mode, table, err, out)
+			}
 		}
 	}
 }

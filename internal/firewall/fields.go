@@ -65,6 +65,11 @@ const (
 	// An ip set whose name cannot be rendered is left out; a rule referencing
 	// it cannot be rendered either and is held fail-static.
 	HandlingSetLeftOut = "set left out: its name cannot be rendered"
+	// A set named <x>_v6 while a set x holds IPv6 elements: x's IPv6 elements
+	// render as the set <x>_v6, and nft refuses a second set of that name. The
+	// row so named is left out; a rule referencing it cannot be rendered and
+	// is held fail-static.
+	HandlingSetLeftOutCompanion = "set left out: its name is the IPv6 companion of another set"
 )
 
 // rowMemory is what a loader last rendered for each rule row, by table/id, so
@@ -198,6 +203,14 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 			reasons = append(reasons, err.Error())
 		}
 	}
+	// A port nft cannot resolve on this host (fw-0.4 review I-3): a service
+	// name missing from its services database, a number past 65535, a range
+	// it reads backwards. nft refuses the whole ruleset over one.
+	if rulefield.RenderPort(r.Proto, r.PortRange) == nil {
+		if why := rulefield.PortUnresolvable(r.Proto, r.PortRange); why != "" {
+			reasons = append(reasons, (&rulefield.FieldError{Field: "port", Value: r.PortRange, Reason: why}).Error())
+		}
+	}
 	if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
 		if !rulefield.SetRefOpOK(op) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
@@ -236,23 +249,31 @@ func (q *quarantine) sets() []IPSet {
 }
 
 // quarantineIPSets returns the ip sets the plan renders: each without the
-// elements that cannot be rendered, and none whose name cannot be.
+// elements that cannot be rendered, and none whose name cannot be, nor one
+// named as the IPv6 companion of a set with IPv6 elements.
 //
 // degraded names the sets that lost an element: a negated reference to one is
 // not rendered (quarantine.negatedMissing).
 func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, degraded map[string]bool) {
 	degraded = map[string]bool{}
+	var ids []string // out[i]'s row id
 	for _, s := range sets {
 		if err := rulefield.RenderSetName(s.Name); err != nil {
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: err.Error(), Handling: HandlingSetLeftOut})
 			continue
 		}
+		// The IPv6 elements render as the set <name>_v6, so they need that
+		// name to render too (a 253-byte name's companion is too long).
+		companion := rulefield.RenderSetName(s.Name + ipv6SetSuffix)
 		var keep []string
 		var bad []string
 		for _, e := range s.CIDRs {
 			err := rulefield.RenderSetElement(e)
 			if err == nil && isIPv6Literal(e) && !validAddrOrPrefix(e, true) {
 				err = fmt.Errorf("ip set element %q is not an IPv6 address or prefix", e)
+			}
+			if err == nil && isIPv6Literal(e) && companion != nil {
+				err = fmt.Errorf("ip set element %q: the set's IPv6 companion cannot be named: %v", e, companion)
 			}
 			if err != nil {
 				bad = append(bad, err.Error())
@@ -268,6 +289,52 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 			degraded[s.Name] = true
 		}
 		out = append(out, IPSet{Name: s.Name, CIDRs: keep})
+		ids = append(ids, s.ID)
+	}
+	return leaveOutCompanionClashes(out, ids, inv, degraded)
+}
+
+// leaveOutCompanionClashes leaves out every set row named <x>_v6 while a set
+// x that renders holds IPv6 elements (fw-grammar re-review 3 N-2): x's IPv6
+// elements render as the set <x>_v6, and nft refuses the whole ruleset over a
+// second set of that name. Shorter names are settled first, so a row left out
+// here never makes its own companion clash.
+func leaveOutCompanionClashes(sets []IPSet, ids []string, inv []InvalidRow, degraded map[string]bool) ([]IPSet, []InvalidRow, map[string]bool) {
+	v6 := setsWithIPv6(sets)
+	names := make([]string, 0, len(sets))
+	seen := map[string]bool{}
+	for _, s := range sets {
+		if !seen[s.Name] {
+			seen[s.Name] = true
+			names = append(names, s.Name)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if len(names[i]) != len(names[j]) {
+			return len(names[i]) < len(names[j])
+		}
+		return names[i] < names[j]
+	})
+	kept := map[string]bool{}
+	clashes := map[string]string{} // left-out name → the set whose companion it is
+	for _, n := range names {
+		if base, ok := strings.CutSuffix(n, ipv6SetSuffix); ok && kept[base] && v6[base] {
+			clashes[n] = base
+			continue
+		}
+		kept[n] = true
+	}
+	if len(clashes) == 0 {
+		return sets, inv, degraded
+	}
+	out := sets[:0:0]
+	for i, s := range sets {
+		if base, ok := clashes[s.Name]; ok {
+			inv = append(inv, InvalidRow{Table: "ip_sets", ID: ids[i], Handling: HandlingSetLeftOutCompanion,
+				Reason: fmt.Sprintf("ip set %q holds IPv6 elements, which render as the set %q", base, s.Name)})
+			continue
+		}
+		out = append(out, s)
 	}
 	return out, inv, degraded
 }

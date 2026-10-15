@@ -31,12 +31,36 @@ ipsets:
   office:
     cidrs: ["10.0.0.0/8 accept"]
 `,
+		// fw-grammar re-review 3 N-2: office's IPv6 elements render as the
+		// set office_v6.
+		"ipset companion": `
+ipsets:
+  office:
+    cidrs: ["10.0.0.0/8", "fd00::/8"]
+  office_v6:
+    cidrs: ["10.9.0.0/16"]
+`,
+		"ipset keyword name": `
+ipsets:
+  drop:
+    cidrs: ["10.0.0.0/8"]
+`,
+		"sg unknown service": `
+security-groups:
+  web:
+    rules:
+      - { direction: ingress, proto: tcp, port: "nosuchservice-lv", action: accept }
+`,
 	}
 	want := map[string]string{
 		"sg port":         "security-groups.web.rules[0]",
 		"cluster cidr":    "firewall.cluster-rules[0]",
 		"cluster comment": "firewall.cluster-rules[0]",
 		"ipset element":   "ipsets.office",
+		// Either name of the pair is named.
+		"ipset companion":    "ipsets.office",
+		"ipset keyword name": "ipsets.drop",
+		"sg unknown service": "security-groups.web.rules[0]",
 	}
 	for name, body := range bad {
 		_, err := ParseBytes([]byte("name: s\n" + body))

@@ -17,8 +17,11 @@
 //     text that can add or break nft syntax: anything but the value's own
 //     words (letters, digits and . _ : / - @), an optional relational operator
 //     in front, a braced list, and a range with spaces around its dash. It
-//     does not judge a word: whether `ssh` is a service or a name resolves is
-//     nft's business, exactly as before.
+//     judges a word only where nft would refuse the whole ruleset over it
+//     without asking the network: a set name nft cannot read
+//     (RenderSetName), and a port it cannot resolve from the host's services
+//     database (PortUnresolvable). Whether a DNS name resolves stays nft's
+//     business, as before.
 //
 //   - Grammar (Rule, Direction, Proto, Port, CIDR, Action, Comment, IPSet) is
 //     what every writer checks before a row is stored (corrosion's rule and
@@ -208,15 +211,59 @@ func RenderCIDR(s string) error {
 	return nil
 }
 
-// RenderSetName refuses a set name that is not one nft word.
+// RenderSetName refuses a set name nft cannot read, which would make it refuse
+// the whole ruleset: anything but one nft identifier — a letter, '_' or '.'
+// first, then letters, digits and . _ - /, at most 255 bytes, and not an nft
+// keyword (`drop`, `ip`, `tcp`: nftKeywords) — or a word with ':' that nft
+// reads as an address (`dead:beef`, `a:b:c:d:e:f`, `fe80::1`). Each refusal
+// was checked with `nft -c` (nftables 1.1.6): `1a`, `-a`, `/a`, `:a`,
+// `office:prod` and a 256-byte name fail, as does every keyword.
 func RenderSetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
 	}
+	if len(s) > maxNameLen {
+		return refuse("ipset name", s, "longer than %d bytes", maxNameLen)
+	}
 	if !isWord(s) || strings.Contains(s, "@") {
 		return refuse("ipset name", s, "a set name is one word of letters, digits and . _ - /")
 	}
+	if strings.Contains(s, ":") {
+		if !addressShaped(s) {
+			return refuse("ipset name", s, "nft reads a set name holding ':' only when it is shaped like an address")
+		}
+		return nil
+	}
+	if r := rune(s[0]); !isLetter(r) && r != '_' && r != '.' {
+		return refuse("ipset name", s, "a set name starts with a letter, '_' or '.'")
+	}
+	if nftKeywords[s] {
+		return refuse("ipset name", s, "%q is an nft keyword, which nft does not read as a set name", s)
+	}
 	return nil
+}
+
+// addressShaped is a word nft's scanner reads as one address-like token, so
+// as a name: hex digits and colons, as a class id (hhhh:hhhh), a MAC address
+// or an IPv6 address.
+func addressShaped(s string) bool {
+	if strings.Trim(s, "0123456789abcdefABCDEF:") != "" {
+		return false
+	}
+	groups := strings.Split(s, ":")
+	hexes := func(max int) bool {
+		for _, g := range groups {
+			if g == "" || len(g) > max {
+				return false
+			}
+		}
+		return true
+	}
+	if len(groups) == 2 && hexes(4) || len(groups) == 6 && hexes(2) {
+		return true
+	}
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Is6()
 }
 
 // RenderSetElement refuses a set element that is not nft words or ranges
@@ -445,7 +492,8 @@ func protoElem(e string) string {
 
 // Port accepts, for tcp and udp, "" or a port match: a number 0-65535, a range
 // N-M (N <= M; M may be a service name), a service name, or a braced list of
-// them, after an optional relational operator. For any other protocol the
+// them, after an optional relational operator; every name in this host's
+// services database and every number as nft reads it (PortUnresolvable). For any other protocol the
 // port is never written into a script, and only text that could never be a
 // word is refused.
 func Port(proto, s string) error {
@@ -462,6 +510,9 @@ func Port(proto, s string) error {
 		return err
 	}
 	if why := grammar(s, portElem); why != "" {
+		return refuse("port", s, "%s", why)
+	}
+	if why := PortUnresolvable(proto, s); why != "" {
 		return refuse("port", s, "%s", why)
 	}
 	return nil
@@ -517,15 +568,11 @@ func isPortNum(s string) bool {
 	return isDigits(s)
 }
 
-// portVal is a port number's value: hex after 0x, otherwise decimal (nft
-// reads a leading zero as decimal).
-func portVal(s string) int64 {
-	if h, ok := strings.CutPrefix(strings.ToLower(s), "0x"); ok {
-		n, _ := strconv.ParseInt(h, 16, 64)
-		return n
-	}
-	n, _ := strconv.ParseInt(s, 10, 64)
-	return n
+// portVal is a port number's value as nft reads it (nftPortVal): hex after
+// 0x, octal after a leading zero when every digit is octal, otherwise decimal.
+func portVal(s string) uint64 {
+	v, _, _ := nftPortVal(s)
+	return v
 }
 
 func portNum(s string) string {
@@ -630,7 +677,7 @@ func isDotted(s string) bool {
 }
 
 // SetName accepts an nft set name: a letter, '_' or '.', then letters,
-// digits, '_', '.', '-' or '/', at most 255 bytes.
+// digits, '_', '.', '-' or '/', at most 255 bytes, and not an nft keyword.
 func SetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
@@ -644,6 +691,9 @@ func SetName(s string) error {
 		if !ok {
 			return refuse("ipset name", s, "want a letter, '_' or '.' first, then letters, digits, '_', '.', '-' or '/'")
 		}
+	}
+	if nftKeywords[s] {
+		return refuse("ipset name", s, "%q is an nft keyword, which nft does not read as a set name", s)
 	}
 	return nil
 }
@@ -675,14 +725,51 @@ func SetElement(s string) error {
 	return nil
 }
 
+// IPv6SetSuffix names a set's IPv6 companion: a set holding IPv6 elements
+// renders them as the set <name>_v6.
+const IPv6SetSuffix = "_v6"
+
 // IPSet checks a set's name and every element, returning the first refusal.
+// A set with an IPv6 element needs a name its companion's name fits after.
 func IPSet(name string, elems []string) error {
 	if err := SetName(name); err != nil {
 		return err
 	}
+	v6 := false
 	for _, e := range elems {
 		if err := SetElement(e); err != nil {
 			return err
+		}
+		v6 = v6 || strings.Contains(e, ":")
+	}
+	if v6 && len(name)+len(IPv6SetSuffix) > maxNameLen {
+		return refuse("ipset name", name, "a set with IPv6 elements renders them as %s%s, which is longer than %d bytes",
+			shown(name), IPv6SetSuffix, maxNameLen)
+	}
+	return nil
+}
+
+// CompanionClash refuses a set that would make nft refuse the ruleset beside
+// the others: a set named <x>_v6 while x holds IPv6 elements (or the reverse),
+// since x's IPv6 companion is the set <x>_v6 ("set exists"). sets is every
+// live set's elements by name, name's included; only clashes involving name
+// are reported.
+func CompanionClash(sets map[string][]string, name string) error {
+	hasV6 := func(n string) bool {
+		for _, e := range sets[n] {
+			if strings.Contains(e, ":") {
+				return true
+			}
+		}
+		return false
+	}
+	if _, taken := sets[name+IPv6SetSuffix]; taken && hasV6(name) {
+		return refuse("ipset name", name, "its IPv6 elements render as the set %s%s, which another ip set is named; rename one",
+			shown(name), IPv6SetSuffix)
+	}
+	if base, ok := strings.CutSuffix(name, IPv6SetSuffix); ok && hasV6(base) {
+		if _, live := sets[base]; live {
+			return refuse("ipset name", name, "it is the name of the IPv6 companion of ip set %q, which holds IPv6 elements; rename one", base)
 		}
 	}
 	return nil

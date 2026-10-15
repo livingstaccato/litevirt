@@ -1053,7 +1053,13 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 	// arm of the VM would demand in force (lab 2, C3).
 	if err := s.retireNICGuard(ctx, vm.Name, mac); err != nil {
 		slog.Error("nic detach: guard record not retired — left recoverable", "vm", vm.Name, "op", opID, "mac", mac, "error", err)
-		return nil, status.Errorf(codes.Internal, "nic detach for %q applied but its NIC guard record could not be retired; left recoverable: %v", vm.Name, err)
+		detail := fmt.Sprintf("nic %s detached, but its NIC guard record could not be retired; left recoverable: %v", mac, err)
+		s.recordVMEventSeverity(ctx, vm.Name, "device.detached", "error", "warning", detail)
+		code := codes.Internal
+		if errors.Is(err, corrosion.ErrNICStampSkewed) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Errorf(code, "nic detach for %q applied but its NIC guard record could not be retired; left recoverable: %v", vm.Name, err)
 	}
 
 	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)

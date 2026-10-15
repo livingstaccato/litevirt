@@ -28,9 +28,11 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 const (
@@ -45,6 +47,10 @@ const (
 	// cannot bloat every host's ruleset (compose.MaxGuardAddresses).
 	MaxNICGuardAddresses = compose.MaxGuardAddresses
 )
+
+// ErrNICStampSkewed refuses a write for a NIC behind a stored write for that
+// NIC stamped too far ahead of this host's clock.
+var ErrNICStampSkewed = errors.New("a stored write for this NIC is stamped too far ahead of this host's clock")
 
 // ErrUnknownNICGuardMode is a mode this build does not implement.
 var ErrUnknownNICGuardMode = errors.New("unknown NIC guard mode")
@@ -202,18 +208,18 @@ func PutNICGuard(ctx context.Context, c *Client, g capabilities.FeatureGrant, r 
 // tombstone this write follows; every replica holding both would keep the
 // older one (a re-attached NIC losing its guard).
 func nicGuardStamp(ctx context.Context, c *Client, owner, mac string) (string, error) {
-	floor := ""
-	note := func(ts string) {
+	floor, what := "", ""
+	note := func(ts, src string) {
 		if ts != "" && (floor == "" || lwwOrder(ts, floor) > 0) {
-			floor = ts
+			floor, what = ts, src
 		}
 	}
-	rows, err := c.Query(ctx, `SELECT updated_at FROM cluster_policies WHERE key = ?`, NICGuardKey(owner, strings.ToLower(mac)))
+	rows, err := c.Query(ctx, `SELECT set_by, updated_at FROM cluster_policies WHERE key = ?`, NICGuardKey(owner, strings.ToLower(mac)))
 	if err != nil {
 		return "", err
 	}
 	for _, r := range rows {
-		note(r.String("updated_at"))
+		note(r.String("updated_at"), "guard record (set by "+r.String("set_by")+")")
 	}
 	if !strings.HasPrefix(owner, "ct:") {
 		for _, table := range []string{"vm_nics", "vm_interfaces"} {
@@ -223,12 +229,40 @@ func nicGuardStamp(ctx context.Context, c *Client, owner, mac string) (string, e
 			}
 			for _, n := range nics {
 				if strings.EqualFold(n.MAC, mac) {
-					note(n.UpdatedAt)
+					note(n.UpdatedAt, table+" row")
 				}
 			}
 		}
 	}
-	return c.stampAfter(floor, c.now())
+	return c.nicStampAfter(owner, mac, floor, what)
+}
+
+// nicStampAfter is stampAfter for a write of owner's NIC mac whose newest
+// stored write is floor (what names it). A floor stamped beyond the skew
+// limit is refused as what it is, with the remedy (ErrNICStampSkewed).
+func (c *Client) nicStampAfter(owner, mac, floor, what string) (string, error) {
+	ts, err := c.stampAfter(floor, c.now())
+	if errors.Is(err, ErrHAStampSkewed) {
+		return "", nicStampSkewed(owner, mac, floor, what)
+	}
+	return ts, err
+}
+
+// nicStampSkewed is ErrNICStampSkewed for owner's NIC mac behind its stored
+// write what, stamped floor.
+func nicStampSkewed(owner, mac, floor, what string) error {
+	limit := time.Duration(hlc.MaxSkewMS) * time.Millisecond
+	host := "the stamp does not name the host that wrote it"
+	if p, ok := hlc.Parse(floor); ok && hlc.IsHLC(floor) {
+		host = "written by " + p.NodeID
+	}
+	retry := ""
+	if inst, ok := tsInstant(floor); ok {
+		retry = " (" + inst.Add(-limit).UTC().Format(time.RFC3339) + ")"
+	}
+	return fmt.Errorf("%w: NIC %s of %s: its %s is stamped %s, more than %s ahead of this host's clock (%s); "+
+		"check NTP on the host that wrote it — this write can be retried once this host's clock passes the stamp less %s%s",
+		ErrNICStampSkewed, strings.ToLower(mac), owner, what, floor, limit, host, limit, retry)
 }
 
 // GetNICGuard returns a NIC's record, or nil when it has none (unguarded).
@@ -506,6 +540,8 @@ func SeedFirewallEnforcement(ctx context.Context, c *Client, mode, hostName stri
 // another NIC's address.
 type NetworkGuardInfo struct {
 	Subnet string
+	// Type is the network's type (compose.GuardUnenforcedOn).
+	Type string
 	// AllowedVLANs are the VLANs a trunk NIC created on this release may
 	// carry on the network (compose.NetworkDef.AllowedVLANs).
 	AllowedVLANs []int
@@ -554,7 +590,7 @@ func canonIP(s string) string {
 // networks.config is json.Marshal of compose.NetworkDef; vms.spec is
 // encoding/json of VMSpec.
 func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardInfo, error) {
-	rows, err := c.Query(ctx, `SELECT name, config FROM networks WHERE deleted_at IS NULL`)
+	rows, err := c.Query(ctx, `SELECT name, COALESCE(type, '') AS type, config FROM networks WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +598,11 @@ func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardI
 	for _, r := range rows {
 		var def compose.NetworkDef
 		_ = json.Unmarshal([]byte(r.String("config")), &def)
-		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway(), AllowedVLANs: def.AllowedVLANs}
+		typ := r.String("type")
+		if typ == "" {
+			typ = def.Type
+		}
+		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway(), AllowedVLANs: def.AllowedVLANs, Type: typ}
 		for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
 			if ca := canonIP(a); ca != "" {
 				info.Reserved = append(info.Reserved, ca)
@@ -716,7 +756,15 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 	for _, r := range own {
 		mac := strings.ToLower(r.MAC)
 		if r.Deleted {
-			if _, ok := RetiredGuardOver(r, uuid); ok && live[mac] {
+			row, ok := live[mac]
+			if !ok {
+				continue
+			}
+			typ, err := NetworkType(ctx, c, row.NetworkName)
+			if err != nil {
+				return nil, fmt.Errorf("read network %s of %s, which has a NIC guard record: %w", row.NetworkName, owner, err)
+			}
+			if _, ok := RetiredGuardOver(r, uuid, typ, row.NetworkName); ok {
 				out = append(out, mac)
 			}
 			continue
@@ -742,7 +790,7 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 // nicRowStatesOf maps each lower-case MAC of vm by the MergedVMNICs overlay's
 // winning row: live, or tombstoned (to that tombstone's updated_at). A MAC
 // with no row at all is in neither.
-func nicRowStatesOf(ctx context.Context, c *Client, vm string) (live map[string]bool, removed map[string]string, err error) {
+func nicRowStatesOf(ctx context.Context, c *Client, vm string) (live map[string]NICRecord, removed map[string]string, err error) {
 	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vm)
 	if err != nil {
 		return nil, nil, err
@@ -751,12 +799,12 @@ func nicRowStatesOf(ctx context.Context, c *Client, vm string) (live map[string]
 	if err != nil {
 		return nil, nil, err
 	}
-	live, removed = map[string]bool{}, map[string]string{}
+	live, removed = map[string]NICRecord{}, map[string]string{}
 	for k, w := range nicRowWinners(ifaces, nics) {
 		if w.DeletedAt != "" {
 			removed[k.mac] = w.UpdatedAt
 		} else {
-			live[k.mac] = true
+			live[k.mac] = w
 		}
 	}
 	return live, removed, nil
@@ -812,6 +860,21 @@ func LiveNICSecurity(ctx context.Context, c *Client, vmName, vmUUID string) ([]c
 			ln.Guard = &compose.LiveGuard{Mode: rec.Mode, Allowed: rec.Allowed,
 				AllowDHCPServer: rec.AllowDHCPServer, AllowRouterAdvert: rec.AllowRouterAdvert, AllowVLANTags: rec.AllowVLANTags}
 		}
+		if rec == nil {
+			retired, err := GetRetiredNICGuard(ctx, c, vmName, n.MAC)
+			if err != nil {
+				return nil, fmt.Errorf("read the guard of NIC %s: %w", n.MAC, err)
+			}
+			if retired != nil {
+				typ, err := NetworkType(ctx, c, n.NetworkName)
+				if err != nil {
+					return nil, fmt.Errorf("read network %s: %w", n.NetworkName, err)
+				}
+				if g, ok := RetiredGuardOver(*retired, vmUUID, typ, n.NetworkName); ok {
+					ln.Guard = &compose.LiveGuard{Mode: g.Mode, FailClosed: RetiredGuardNote(vmName, n.MAC)}
+				}
+			}
+		}
 		out = append(out, ln)
 	}
 	return out, nil
@@ -850,10 +913,53 @@ func RetireNICGuard(ctx context.Context, c *Client, owner, mac, setBy string) er
 // that arrived after its record was judged orphaned): the NIC is guarded
 // rather than left unguarded. ok is false for a live record, and for one of
 // another or an unknown incarnation.
-func RetiredGuardOver(r NICGuardRecord, vmUUID string) (NICGuardRecord, bool) {
-	if !r.Deleted || r.VMUUID == "" || r.VMUUID != vmUUID {
+//
+// A NIC on a network that cannot enforce a guard (netType and network, as
+// compose.GuardUnenforcedOn judges them: direct, SR-IOV) gets nothing: no
+// guard could be put in force there.
+func RetiredGuardOver(r NICGuardRecord, vmUUID, netType, network string) (NICGuardRecord, bool) {
+	if !r.Deleted || r.VMUUID == "" || r.VMUUID != vmUUID || compose.GuardUnenforcedOn(netType, network) != "" {
 		return NICGuardRecord{}, false
 	}
 	return NICGuardRecord{VMName: r.VMName, MAC: r.MAC, Mode: NICGuardOn, VMUUID: r.VMUUID,
 		Network: r.Network, Ordinal: r.Ordinal, SetBy: r.SetBy, UpdatedAt: r.UpdatedAt}, true
+}
+
+// RetiredGuardNote says why a NIC runs under the default guard of
+// RetiredGuardOver, and how an operator replaces it.
+func RetiredGuardNote(vm, mac string) string {
+	return "fail-closed default guard: the NIC's guard record of this VM is retired while its NIC row is live " +
+		"(their writes arrived out of order); `lv firewall nic-guard set " + vm + " --mac " + strings.ToLower(mac) +
+		"` records its guard"
+}
+
+// NetworkType is the type of the live network name ("" when it has none, or
+// there is no such network).
+func NetworkType(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx, `SELECT COALESCE(type, '') AS type, config FROM networks WHERE name = ? AND deleted_at IS NULL`, name)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	if t := rows[0].String("type"); t != "" {
+		return t, nil
+	}
+	var def compose.NetworkDef
+	_ = json.Unmarshal([]byte(rows[0].String("config")), &def)
+	return def.Type, nil
+}
+
+// GetRetiredNICGuard returns a NIC's retired record, or nil when it has a
+// live one or none.
+func GetRetiredNICGuard(ctx context.Context, c *Client, vm, mac string) (*NICGuardRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT key, value, set_by, updated_at FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`,
+		NICGuardKey(vm, mac))
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	rec, ok := decodeNICGuard(rows[0])
+	if !ok || !rec.Deleted {
+		return nil, nil
+	}
+	return &rec, nil
 }

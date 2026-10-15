@@ -648,7 +648,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			key := corrosion.NICGuardKey(ifc.VMName, ifc.MAC)
 			rec, ok := guards[key]
 			if !ok {
-				return corrosion.RetiredGuardOver(allGuards[key], ifc.VMUUID)
+				return corrosion.RetiredGuardOver(allGuards[key], ifc.VMUUID, nets[ifc.NetworkName].Type, ifc.NetworkName)
 			}
 			if rec.VMUUID != "" && ifc.VMUUID != "" && rec.VMUUID != ifc.VMUUID {
 				return corrosion.NICGuardRecord{}, false

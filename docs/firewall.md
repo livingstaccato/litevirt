@@ -706,7 +706,13 @@ is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
 domain on that host has its MAC. The owner judges from its own replica, so it
 can retire the record of a NIC whose row has not reached it yet. A retired
 record of the running incarnation still guards, with the default guard, a NIC
-whose row is live.
+whose row is live, unless its network cannot enforce a guard; `lv firewall
+nic-guard ls` and the compose plan name such a NIC, and `lv firewall nic-guard
+set` replaces its guard. A target judges a migration from its own replica, so
+a NIC attached moments before the move can arrive before its record. A guard
+write behind a stored write for that NIC stamped more than 5 minutes ahead of
+this host's clock is refused, naming the stamp; check NTP on the host that
+wrote it.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

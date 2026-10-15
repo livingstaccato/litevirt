@@ -67,7 +67,7 @@ func UpsertNIC(ctx context.Context, c *Client, r NICRecord) error {
 	now := c.NowTS()
 	if floor != "" && !LWWNewer(now, floor) {
 		var err error
-		if now, err = c.stampAfter(floor, c.now()); err != nil {
+		if now, err = c.nicStampAfter(r.VMName, r.MAC, floor, "vm_nics row"); err != nil {
 			return err
 		}
 	}

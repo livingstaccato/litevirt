@@ -2,7 +2,11 @@ package grpcapi
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -220,5 +224,86 @@ func TestAttachNIC_RowTombstoneFailureKeepsTheGuardRecord(t *testing.T) {
 	}
 	if !guardRecordsOf(t, s, "vm1")[retireMAC] {
 		t.Error("a NIC whose row is still live lost its guard record")
+	}
+}
+
+// TestListNICGuards_ShowsTheFailClosedDefaultGuard (re-review n5): a NIC
+// guarded by default under a retired record of its incarnation is listed as
+// guarded, with a note that says why and how to replace it.
+func TestListNICGuards_ShowsTheFailClosedDefaultGuard(t *testing.T) {
+	s, _ := guardHotplugServer(t, "running")
+	ctx := adminCtx()
+	// An incarnation uuid, which a retired record must match to guard.
+	if err := s.db.Execute(ctx, `UPDATE vms SET spec = ? WHERE name = 'vm1'`,
+		seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 4096, Uuid: "u-1"})); err != nil {
+		t.Fatal(err)
+	}
+	attachGuardedNIC(t, s, retireMAC)
+	if err := corrosion.RetireNICGuard(ctx, s.db, "vm1", retireMAC, "t"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.ListNICGuards(ctx, &pb.ListNICGuardsRequest{VmName: "vm1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var g *pb.NICGuard
+	for _, x := range resp.GetGuards() {
+		if x.GetMac() == retireMAC {
+			g = x
+		}
+	}
+	if g == nil {
+		t.Fatal("the NIC is not listed")
+	}
+	if g.GetMode() != corrosion.NICGuardOn || !strings.Contains(g.GetNote(), "default guard") ||
+		!strings.Contains(g.GetNote(), "lv firewall nic-guard set") {
+		t.Errorf("listed as mode %q, note %q; want on, marked as the fail-closed default guard", g.GetMode(), g.GetNote())
+	}
+}
+
+// futureStampGuard stamps vm1's NIC mac's record far in the future, as a
+// host whose clock ran ahead left it.
+func futureStampGuard(t *testing.T, s *Server, mac string) {
+	t.Helper()
+	if err := s.db.Execute(adminCtx(), `UPDATE cluster_policies SET updated_at = ? WHERE key = ?`,
+		"2099-01-01T00:00:00.000000000Z", corrosion.NICGuardKey("vm1", mac)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNICGuard_FutureSkewRefusalIsFailedPreconditionWithItsRemedy (re-review
+// n4): a guard write behind a future-stamped one is refused FailedPrecondition
+// with what it is and the remedy; a detach so refused stays recoverable and
+// records the same text as an event of the VM.
+func TestNICGuard_FutureSkewRefusalIsFailedPreconditionWithItsRemedy(t *testing.T) {
+	s, _ := guardHotplugServer(t, "running")
+	ctx := adminCtx()
+	attachGuardedNIC(t, s, retireMAC)
+	futureStampGuard(t, s, retireMAC)
+
+	_, err := s.SetNICGuard(ctx, &pb.SetNICGuardRequest{VmName: "vm1", Mac: retireMAC, Mode: "on"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "NTP") {
+		t.Errorf("set: %v, want FailedPrecondition naming the remedy", err)
+	}
+
+	_, err = s.DetachDevice(ctx, &pb.DetachDeviceRequest{VmName: "vm1", NicMac: retireMAC})
+	if err == nil || !strings.Contains(err.Error(), "left recoverable") || !strings.Contains(err.Error(), "NTP") {
+		t.Fatalf("detach: %v, want left recoverable with the remedy", err)
+	}
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID == "" {
+		t.Error("the refused detach did not stay recoverable")
+	}
+	evs, eerr := corrosion.ListVMEvents(ctx, s.db, "vm1", 50, "")
+	if eerr != nil {
+		t.Fatal(eerr)
+	}
+	found := false
+	for _, e := range evs {
+		if strings.Contains(e.Detail, "NTP") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no event of the VM carries the refusal and its remedy: %+v", evs)
 	}
 }

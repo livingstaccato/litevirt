@@ -485,3 +485,14 @@ func TestCarry_MatchesByMAC(t *testing.T) {
 		t.Errorf("network = %v, want isolate on the NIC with MAC :01", desired.Network)
 	}
 }
+
+// Re-review n5: a NIC under the fail-closed default guard of a retired
+// record is named in the plan, whether or not anything else changes.
+func TestGate_NamesAFailClosedDefaultGuard(t *testing.T) {
+	spec := nicSpec(&pb.NetworkAttachment{SpoofGuard: "on"})
+	live := []LiveNIC{{Network: "lan", MAC: "52:54:00:00:00:01", Guard: &LiveGuard{Mode: "on", FailClosed: "fail-closed default guard: why"}}}
+	_, w := gated(spec, spec, live, NICSecurityGate{})
+	if !strings.Contains(w, "nic 0 (lan) runs under the fail-closed default guard: why") {
+		t.Errorf("the plan does not name the fail-closed default guard: %q", w)
+	}
+}

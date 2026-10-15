@@ -224,3 +224,43 @@ func TestCorrosionPlanLoader_ARetiredRecordOverALiveNICGuards(t *testing.T) {
 		t.Errorf("another incarnation's retired record guarded a NIC: %+v", g)
 	}
 }
+
+// TestCorrosionPlanLoader_RetiredRecordOverAnUnenforcedNetwork (re-review
+// n6): on a network that cannot enforce a guard, a retired record guards
+// nothing.
+func TestCorrosionPlanLoader_RetiredRecordOverAnUnenforcedNetwork(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: "vf", Type: "sriov", Config: `{"type":"sriov"}`}); err != nil {
+		t.Fatal(err)
+	}
+	const mac = "52:54:00:00:00:03"
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "web", HostName: "host-a", State: "running", Spec: `{"name":"web","uuid":"u-1"}`},
+		[]corrosion.InterfaceRecord{{VMName: "web", NetworkName: "vf", MAC: mac, IP: "10.0.0.12"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{
+		VMName: "web", MAC: mac, Mode: corrosion.NICGuardOn, VMUUID: "u-1", Network: "lan",
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.RetireNICGuard(ctx, db, "web", mac, "test"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"web": {mac: "vnet3"},
+	}))(ctx)
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	for _, n := range plan.NICs {
+		if n.NICDev == "vnet3" && n.Guard != nil {
+			t.Errorf("a NIC on an SR-IOV network was guarded under a retired record: %+v", n.Guard)
+		}
+	}
+}

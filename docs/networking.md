@@ -39,16 +39,24 @@ networks:
 ```
 
 litevirt manages VTEP and forwarding-database (FDB) state itself — there is no
-BGP or EVPN control plane, and no routing daemon to install. When a host
+BGP or EVPN control plane, and no routing daemon to install. A host's VTEP
+address is its cluster address: `advertise_address` when set, otherwise the
+source address of its default route. Without `underlay:`, the tunnel runs over
+the interface that holds that address. A VXLAN device left from an earlier
+provisioning with a different local address or underlay is recreated in place;
+the VNI bridge and the guests on it stay. When a host
 provisions the network it records its VTEP address in the replicated cluster
 database, then reads that table back and installs an all-zeros
 `00:00:00:00:00:00` flood entry for each peer VTEP already listed, so BUM
 traffic is head-end replicated to the peers it knows about; a peer that
 provisions later can also push its VTEP straight to this host, which adds the
-entry on the spot. Those kernel flood entries are only ever added — an
-individual entry is never withdrawn when a host leaves the network (they go away
-only with the local VXLAN device), and nothing re-derives the set from the
-database outside a provisioning pass. A newly-joined host gets into an existing
+entry on the spot. The same pass, and each push, prunes the flood list: an entry
+for an address that is neither a listed VTEP nor a cluster host's address is
+removed, and so is any entry, flood or unicast, that points at one of this
+host's own addresses — such an entry is never installed. Nothing re-derives the
+set from the database outside a provisioning pass or a push. Deleting the
+network tombstones its VTEP rows once every host runs a build that knows that
+write (`lv cluster upgrade-status`). A newly-joined host gets into an existing
 peer's entries through that push, which it makes when its network reconcile
 pass provisions the network (see [Where a network is set up](#where-a-network-is-set-up));
 if the push is lost, it stays absent until that peer next provisions, which a

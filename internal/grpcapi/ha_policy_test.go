@@ -347,3 +347,31 @@ func TestHAPolicyRPC_Status(t *testing.T) {
 		}
 	}
 }
+
+// Review m-1: the arm gate lists only the hosts the coordinator would fence:
+// not one still joining, one whose state is unknown, or one restarting inside
+// the upgrade timeout.
+//
+// Mutation: drop the state filter — w1 (upgrading) is listed and the arm is
+// refused.
+func TestHAPolicyRPC_ArmGateListsOnlyWhatWouldBeFenced(t *testing.T) {
+	ctx := context.Background()
+	s := haServer(t)
+	clk := useHAClock(t)
+	clk.onSleep = func() { answer(t, s, clk, "e2", "e3") }
+	for h, st := range map[string]string{"w1": "upgrading", "w2": corrosion.HostStateJoining} {
+		if err := corrosion.UpdateHostState(ctx, s.db, h, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.SetFenceCandidates(func(context.Context) ([]string, error) { return []string{"w1", "w2"}, nil })
+	if _, err := s.SetHAPolicy(adminCtx(), setHAReq(corrosion.HAArmed)); err != nil {
+		t.Fatalf("arm with only an upgrading and a joining candidate: %v", err)
+	}
+	s.SetFenceCandidates(func(context.Context) ([]string, error) { return []string{"w1", "w2", "e3"}, nil })
+	_, err := s.SetHAPolicy(adminCtx(), setHAReq(corrosion.HAArmed))
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "e3") ||
+		strings.Contains(err.Error(), "w1") || strings.Contains(err.Error(), "w2") {
+		t.Fatalf("arm with e3 down: %v, want a refusal naming e3 alone", err)
+	}
+}

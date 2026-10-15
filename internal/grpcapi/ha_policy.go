@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostboot"
 )
 
 // haConfirmTimeout bounds the wait for a change to be confirmed, haConfirmPoll
@@ -168,8 +169,10 @@ func (s *Server) SetHAPolicy(ctx context.Context, req *pb.SetHAPolicyRequest) (*
 }
 
 // haDownHosts lists the hosts the failover coordinator would fence now
-// (its own candidate function, through the injected hook), less those in
-// maintenance, which are never fenced.
+// (its own candidate function, through the injected hook), less those its
+// cycle skips by state: maintenance, joining, unknown, and upgrading within
+// the upgrade timeout (a snapshot: one still down past it is fenced later
+// without --fence-down-hosts).
 func (s *Server) haDownHosts(ctx context.Context) ([]string, error) {
 	if s.fenceCandidates == nil {
 		return nil, errors.New("this host has no fence-candidate view")
@@ -183,14 +186,27 @@ func (s *Server) haDownHosts(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	state := make(map[string]string, len(hosts))
+	updated := make(map[string]string, len(hosts))
 	for _, h := range hosts {
-		state[h.Name] = h.State
+		state[h.Name], updated[h.Name] = h.State, h.UpdatedAt
 	}
 	var out []string
 	for _, h := range cands {
-		if state[h] != "maintenance" {
-			out = append(out, h)
+		switch state[h] {
+		case "maintenance", corrosion.HostStateJoining, corrosion.HostStateUnknown:
+			continue
+		case "upgrading":
+			// Timed as the coordinator times it: from the state write, else
+			// from the hosts row; unreadable keeps skipping.
+			since, ok := corrosion.ParseUpdatedAt(updated[h])
+			if st, sok, serr := corrosion.HostStateSince(ctx, s.db, h); serr == nil && sok {
+				since, ok = st, true
+			}
+			if !ok || time.Since(since) < hostboot.UpgradingTimeout {
+				continue
+			}
 		}
+		out = append(out, h)
 	}
 	sort.Strings(out)
 	return out, nil

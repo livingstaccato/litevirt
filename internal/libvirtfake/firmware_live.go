@@ -301,7 +301,8 @@ func (f *Fake) migratedOutLocked(name string) {
 // its swtpm tree and NVRAM kept) or when a domain is removed behind the
 // daemon's back. No guard is asked and no firmware file is touched.
 // Scenario helper: UndefineDomain of a running domain leaves it transient,
-// as libvirt does, so it is no stand-in for this.
+// as libvirt does, so it is no stand-in for this. OnUndefined is not called:
+// no undefine of this host's libvirt happens.
 func (f *Fake) VanishDomain(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -34,7 +34,8 @@ import (
 func emulateLibvirtMove(from, to *Node) {
 	from.Virt.FailMigrateToTarget = func(name, _ string) error {
 		to.Virt.SetState(name, libvirtfake.StateRunning)
-		return from.Virt.UndefineDomain(name, false)
+		from.Virt.VanishDomain(name)
+		return nil
 	}
 }
 
@@ -114,9 +115,7 @@ func TestFleet_MigrateBackToBack_ScanAtCutoverDoesNotBlock(t *testing.T) {
 	if !straddled.Load() {
 		t.Fatal("the detector never probed mover on the source; the scan did not straddle anything")
 	}
-	if err := src.Virt.UndefineDomain("mover", false); err != nil { // libvirt's MigrateUndefineSource
-		t.Fatalf("undefine source copy: %v", err)
-	}
+	src.Virt.VanishDomain("mover") // libvirt's MigrateUndefineSource
 	if got := vmDualRunLifecycle(t, src, "mover"); got != "" {
 		t.Fatalf("a scan straddling the cutover recorded vm_dual_run %q for mover", got)
 	}

@@ -171,7 +171,8 @@ func TestFleet_ConsolePassword_LiveMigrationOntoAFIPSHost(t *testing.T) {
 		}
 		landed = x
 		dst.Virt.LandMigrated(x)
-		return src.Virt.UndefineDomain(name, false)
+		src.Virt.VanishDomain(name)
+		return nil
 	}
 	if err := migrateAt(t, c, src, "desk", dst.Name); err != nil {
 		t.Fatalf("live migration onto a host that cannot do VNC passwords: %v", err)

@@ -1002,6 +1002,13 @@ func (f *Fake) destroyDomain(name string) error {
 	return nil
 }
 
+// noDomain is libvirt's VIR_ERR_NO_DOMAIN for a lookup of name, wrapped as
+// libvirt.Client wraps it.
+func noDomain(name string) error {
+	return fmt.Errorf("lookup domain %s: %w", name, golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain),
+		Message: fmt.Sprintf("Domain not found: no domain with matching name '%s'", name)})
+}
+
 // notRunning is libvirt's refusal to stop a domain that is not active
 // (VIR_ERR_OPERATION_INVALID), wrapped as libvirt.Client wraps it.
 func notRunning(op, name string) error {
@@ -1015,20 +1022,22 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	}
 	// As libvirt.Client: the lookup comes first, and an absent name is
 	// libvirt's no-domain error, with nothing deleted (review I-1).
-	f.mu.Lock()
-	st, ok := f.domains[name]
-	f.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("lookup domain %s: %w", name, golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain),
-			Message: fmt.Sprintf("Domain not found: no domain with matching name '%s'", name)})
+	if !f.DomainExists(name) {
+		return noDomain(name)
 	}
 	if f.FailUndefineDomain != nil {
 		if err := f.FailUndefineDomain(name, removeStorage); err != nil {
 			return err
 		}
 	}
+	// The state is read and acted on under one hold of the lock (re-review
+	// N-3): the hook above may have changed it.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return noDomain(name)
+	}
 	if st == StateRunning || st == StatePaused {
 		// An active domain survives as a transient one (see
 		// undefinePreservingState). libvirt unlinks the NVRAM file for

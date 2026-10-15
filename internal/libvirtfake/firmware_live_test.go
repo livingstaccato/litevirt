@@ -584,3 +584,22 @@ func TestFake_VanishDomainModelsProbeA(t *testing.T) {
 		t.Errorf("permall = %q, want kept", got)
 	}
 }
+
+// UndefineDomain acts on the state it reads under the same hold of the lock
+// (re-review N-3): a domain started between the lookup and the undefine (here
+// by the FailUndefineDomain hook) is left transient, not removed.
+//
+// Mutation: act on the state read before the hook — red.
+func TestFake_UndefineReadsStateUnderOneLock(t *testing.T) {
+	f, _ := flSource(t, StateShutdown)
+	f.FailUndefineDomain = func(name string, _ bool) error {
+		f.SetState(name, StateRunning)
+		return nil
+	}
+	if err := f.UndefineDomain(flVM, false); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok := f.RawState(flVM); !ok || st != StateRunning {
+		t.Errorf("domain = %q (defined %v), want still running (transient)", st, ok)
+	}
+}

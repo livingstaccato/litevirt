@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -120,6 +121,27 @@ func TestReplicationScheduleAdd_BwlimitDroppedByTheDaemon(t *testing.T) {
 	for _, flag := range [][]string{nil, {"--bwlimit", "0"}} {
 		if _, err := runRateCmd(t, &rateClient{dropRate: true}, append(append([]string{}, base...), flag...)...); err != nil {
 			t.Errorf("%v answered with no limit: %v", flag, err)
+		}
+	}
+}
+
+// A VM name longer than the old fixed 18-column width must not shift the
+// columns after it: every row's RATE starts at the header's RATE offset.
+func TestReplicationScheduleLs_LongNameKeepsColumnsAligned(t *testing.T) {
+	var buf bytes.Buffer
+	printReplicationSchedules(&buf, []*pb.ReplicationSchedule{
+		{VmName: "e2e-rrate-3023579-2-1", TargetPool: "rrdst", BwlimitBytesPerSec: 20 << 20},
+		{VmName: "short", TargetPool: "rrdst"},
+	})
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want header + 2 rows:\n%s", buf.String())
+	}
+	col := strings.Index(lines[0], "RATE")
+	for i, want := range []string{"20MiB/s", "-"} {
+		line := lines[i+1]
+		if len(line) <= col || !strings.HasPrefix(line[col:], want) {
+			t.Errorf("row %d: RATE column at offset %d is not %q:\n%s", i, col, want, buf.String())
 		}
 	}
 }

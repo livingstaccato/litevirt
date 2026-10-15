@@ -748,9 +748,10 @@ func overlapping(elems []string) bool {
 }
 
 // mergeIntervals renders a set whose elements overlap as the union of what
-// they match: overlapping or touching intervals become one element, written
-// as an address, a prefix or a range A-B. A piece that does not parse is kept
-// as written.
+// they match: intervals that share at least one address (an endpoint
+// included) become one element, written as an address, a prefix or a range
+// A-B; adjacent ones (hi+1 == lo), which nft accepts, stay apart. A piece
+// that does not parse is kept as written.
 func mergeIntervals(elems []string) []string {
 	ivs, out := elementIntervals(elems)
 	var merged []interval

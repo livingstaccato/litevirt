@@ -243,13 +243,19 @@ func TestFieldError_Bounded(t *testing.T) {
 func TestRenderSetName_WhatNftReads(t *testing.T) {
 	for _, v := range []string{"office", "_a", ".a", "a/b", "a.b-c", "last", "filter", "saddr", "dport", "DROP", "Accept",
 		"x_v6", "_", "..", "a:b", "ab:cd", "abc:def", "dead:beef", "fe:80", "1:2", "a:b:c:d:e:f", "aa:bb:cc:dd:ee:ff",
-		"a::b", "fe80::1", "::1", "1:2:3:4:5:6:7:8", strings.Repeat("a", 255)} {
+		"a::b", "fe80::1", "::1", "1:2:3:4:5:6:7:8", strings.Repeat("a", 255),
+		// nft reads a dotted quad as one token (review m-1).
+		"1.2.3.4", "999.1.1.1", "01.2.3.4", "255.255.255.255"} {
 		if err := RenderSetName(v); err != nil {
 			t.Errorf("RenderSetName(%q): %v", shown(v), err)
 		}
 	}
 	for _, v := range []string{"1a", "1abc", "-a", "/a", ":a", "9office", strings.Repeat("a", 256), strings.Repeat("a", 300),
 		"drop", "accept", "ip", "ip6", "tcp", "set", "elements", "auto-merge", "type", ".",
+		// Scanner-only operator words (review I-1): "syntax error, unexpected !=".
+		"ne", "gt", "ge", "xor", "lshift", "rshift",
+		// Digits first but not a dotted quad (review m-1).
+		"1.2.3", "1.2.3.4.5", "1.2.3.4a",
 		"office:prod", "x:y", "a:g", "ab:cd:ef", "dead:beefcafe", "a.b:c"} {
 		if err := RenderSetName(v); err == nil {
 			t.Errorf("RenderSetName(%q) accepted", shown(v))
@@ -305,9 +311,6 @@ func TestSetName_ReservedPrefix(t *testing.T) {
 		err := SetName(name)
 		if err == nil || !strings.Contains(err.Error(), `"lv_"`) || !strings.Contains(err.Error(), "choose another name") {
 			t.Errorf("SetName(%s) = %v, want a refusal naming the reserved prefix and the remedy", name, err)
-		}
-		if err := UserSetName(name); err == nil {
-			t.Errorf("UserSetName(%s) accepted at load", name)
 		}
 	}
 	for _, name := range []string{"lv", "lvx_a", "LV_gw4", "office_lv_"} {

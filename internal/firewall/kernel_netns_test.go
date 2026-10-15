@@ -69,7 +69,7 @@ func TestKernel_NICGuard(t *testing.T) {
 	}
 	// Children with their own module list skip on their own when one is
 	// missing (saying which); they must not fail or vanish.
-	for _, child := range []string{"TestKernelChild_CompatCorpusLoads"} {
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}
@@ -1277,6 +1277,7 @@ func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 		cmd.Stdin = strings.NewReader(nic)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: nft -f refused the freeze corpus's bridge table: %v\n%s", mode, err, out)
+			sh(t, "nft", "flush", "ruleset") // the next mode starts clean (review m-4)
 			continue
 		}
 		got := sh(t, "nft", "list", "set", "bridge", NICTableName, setGateways4)
@@ -1284,5 +1285,62 @@ func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 			t.Errorf("%s: the kernel's %s holds %q, want the gateway only", mode, setGateways4, got)
 		}
 		sh(t, "nft", "flush", "ruleset")
+	}
+}
+
+// mainEraLvModules are the modules TestKernelChild_MainEraLvSetStillDrops's
+// rulesets make the kernel use: the guest lab's, as for the rules-hold test.
+var mainEraLvModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge", "veth"}
+
+// TestKernelChild_MainEraLvSetStillDrops (set-freeze review I-5): a cluster
+// that created an ip set named lv_foo on main, with a drop rule on it, keeps
+// dropping after the upgrade. Writers refuse new lv_ names, but the loader
+// leaves out only a stored set whose name collides with litevirt's own
+// (lv_gw4 here). The rows go through the loader as stored; the frames go
+// through the kernel.
+//
+// Mutation: leave out every stored lv_ set — the ping from 10.20.0.1 gets
+// through, red.
+func TestKernelChild_MainEraLvSetStillDrops(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules(mainEraLvModules...); len(missing) > 0 {
+		t.Skipf("the rulesets would make the kernel load %v, which is not loaded on this host", missing)
+	}
+	l := newGuestLab(t, map[string]string{"ga": "10.20.0.1", "gb": "10.20.0.2", "ge": "10.20.0.5"})
+	db, _ := freezeLoader(t)
+	rawSet(t, db, "s-foo", "lv_foo", `["10.20.0.1"]`)
+	rawSet(t, db, "s-gw4", "lv_gw4", `["10.20.0.5"]`)
+	rawClusterRule(t, db, "r-foo", "icmp", "", "@lv_foo", "drop")
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(context.Background())
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	if _, ok := invalidRow(plan, "ip_sets", "s-gw4"); !ok {
+		t.Error("the stored lv_gw4 is not left out")
+	}
+	plan.NICMode = NICModeEnforce // the loader's default is observe: count, do not drop
+	for _, g := range []string{"ga", "gb", "ge"} {
+		plan.NICs = append(plan.NICs, NICBinding{NICDev: "p" + g, VMName: g, Bridge: "gwbr0"})
+	}
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if l.ping("ga", "10.20.0.2") {
+		t.Error("10.20.0.1 (in lv_foo) reached 10.20.0.2: the drop on @lv_foo no longer applies")
+	}
+	if !l.ping("ge", "10.20.0.2") {
+		t.Error("10.20.0.5 (not in lv_foo) could not reach 10.20.0.2")
+	}
+	if got := sh(t, "nft", "list", "set", "bridge", NICTableName, setGateways4); strings.Contains(got, "10.20.0.5") {
+		t.Errorf("the stored lv_gw4 reached the kernel's gateway set: %s", got)
+	}
+	if t.Failed() {
+		t.Logf("ruleset:\n%s", sh(t, "nft", "list", "ruleset"))
+	}
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), Plan{}); err != nil {
+		t.Fatalf("apply empty: %v", err)
+	}
+	if !l.ping("ga", "10.20.0.2") {
+		t.Error("10.20.0.1 -> 10.20.0.2 still fails with no rules: the drop above was the lab's")
 	}
 }

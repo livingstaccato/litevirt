@@ -62,8 +62,8 @@ const (
 	// An ip set is rendered without the elements that cannot be rendered (they
 	// never worked: each one injected or broke the load).
 	HandlingElementsLeftOut = "rendered without its unreadable elements"
-	// An ip set whose name cannot be rendered, or has the prefix reserved for
-	// litevirt's own sets, is left out; a rule referencing it cannot be
+	// An ip set whose name cannot be rendered, or is the name of one of
+	// litevirt's own sets (userSetName), is left out; a rule referencing it cannot be
 	// rendered either and is held fail-static.
 	HandlingSetLeftOut = "set left out: its name cannot be rendered or is reserved for litevirt"
 	// A set named <x>_v6 while a set x holds IPv6 elements: x's IPv6 elements
@@ -204,19 +204,33 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 			reasons = append(reasons, err.Error())
 		}
 	}
-	// A port nft cannot resolve on this host (fw-0.4 review I-3): a service
-	// name missing from its services database, a number past 65535, a range
-	// it reads backwards. nft refuses the whole ruleset over one.
-	if rulefield.RenderPort(r.Proto, r.PortRange) == nil {
-		if why := rulefield.PortUnresolvable(r.Proto, r.PortRange); why != "" {
-			reasons = append(reasons, (&rulefield.FieldError{Field: "port", Value: r.PortRange, Reason: why}).Error())
+	// What nft would refuse the whole ruleset over, judged on this host
+	// without the network: a port or protocol it cannot resolve (fw-0.4 review
+	// I-3; set-freeze review I-2), an ordering operator in front of a list,
+	// range or prefix (review I-3), an IPv4 address, prefix or range it cannot
+	// read (review m-2). Each only once the field's syntax is sound.
+	field := func(name, value, why string) {
+		if why != "" {
+			reasons = append(reasons, (&rulefield.FieldError{Field: name, Value: value, Reason: why}).Error())
 		}
+	}
+	if rulefield.RenderPort(r.Proto, r.PortRange) == nil && rulefield.RendersPort(r.Proto) && r.PortRange != "" {
+		field("port", r.PortRange, rulefield.RelationalMisuse("port", r.PortRange))
+		field("port", r.PortRange, rulefield.PortUnresolvable(r.Proto, r.PortRange))
+	}
+	if rulefield.RenderProto(r.Proto) == nil && rulefield.RendersProto(r.Proto) {
+		field("proto", r.Proto, rulefield.RelationalMisuse("proto", r.Proto))
+		field("proto", r.Proto, rulefield.ProtoUnresolvable(strings.ToLower(r.Proto)))
+	}
+	if rulefield.RenderCIDR(r.CIDR) == nil && !isIPv6Literal(r.CIDR) && !strings.Contains(r.CIDR, "@") {
+		field("cidr", r.CIDR, rulefield.RelationalMisuse("cidr", r.CIDR))
+		field("cidr", r.CIDR, rulefield.CIDRUnloadable(r.CIDR))
 	}
 	if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
 		if !rulefield.SetRefOpOK(op) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
 		}
-		if err := rulefield.UserSetName(name); err != nil {
+		if err := userSetName(name); err != nil {
 			reasons = append(reasons, err.Error())
 		} else if base, isComp := strings.CutSuffix(name, ipv6SetSuffix); isComp && q.v6Sets[base] && !q.knownSets[name] {
 			reasons = append(reasons, fmt.Sprintf("cidr %q names the IPv6 companion of set %q; reference the set itself", r.CIDR, base))
@@ -259,7 +273,7 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 	degraded = map[string]bool{}
 	var ids []string // out[i]'s row id
 	for _, s := range sets {
-		if err := rulefield.UserSetName(s.Name); err != nil {
+		if err := userSetName(s.Name); err != nil {
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: err.Error(), Handling: HandlingSetLeftOut})
 			continue
 		}
@@ -272,6 +286,9 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 			err := rulefield.RenderSetElement(e)
 			if err == nil && isIPv6Literal(e) && !validAddrOrPrefix(e, true) {
 				err = fmt.Errorf("ip set element %q is not an IPv6 address or prefix", e)
+			}
+			if why := rulefield.SetElementUnloadable(e); err == nil && why != "" {
+				err = fmt.Errorf("ip set element %q: %s", e, why)
 			}
 			if err == nil && isIPv6Literal(e) && companion != nil {
 				err = fmt.Errorf("ip set element %q: the set's IPv6 companion cannot be named: %v", e, companion)
@@ -293,6 +310,37 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 		ids = append(ids, s.ID)
 	}
 	return leaveOutCompanionClashes(out, ids, inv, degraded)
+}
+
+// internalSetNames are the sets the renderer declares itself in the per-NIC
+// bridge table; internalSetPrefixes start the names of the ones it will
+// declare per object (lv_tg_<group>, tag groups). The inet table declares
+// none.
+var (
+	internalSetNames    = map[string]bool{setNICDevs: true, setVLANOK: true, setDHCPSrv: true, setGateways4: true, setGateways6: true, setLB4: true, setLBSrc4: true}
+	internalSetPrefixes = []string{"lv_tg_"}
+)
+
+// userSetName is why a stored user set, or a rule's reference to one, cannot
+// be rendered: nft cannot read the name (rulefield.RenderSetName), or it is a
+// name of the renderer's own sets. A user set of that name would merge into
+// the internal one (lv_gw4: guests may reach its addresses for DHCP and DNS)
+// or, typed differently, make nft refuse the bridge table. Any other lv_
+// name, which writers refuse now but a main-era cluster may hold, renders as
+// it did (review I-5): a deny rule on it keeps denying.
+func userSetName(name string) error {
+	if err := rulefield.RenderSetName(name); err != nil {
+		return err
+	}
+	collides := internalSetNames[name]
+	for _, p := range internalSetPrefixes {
+		collides = collides || strings.HasPrefix(name, p)
+	}
+	if collides {
+		return &rulefield.FieldError{Field: "ipset name", Value: name,
+			Reason: "it is the name of one of litevirt's internal sets, which the prefix \"lv_\" is reserved for; recreate the set under another name"}
+	}
+	return nil
 }
 
 // leaveOutCompanionClashes leaves out every set row named <x>_v6 while a set

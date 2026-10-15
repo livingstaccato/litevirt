@@ -217,7 +217,8 @@ func RenderCIDR(s string) error {
 // keyword (`drop`, `ip`, `tcp`: nftKeywords) — or a word with ':' that nft
 // reads as an address (`dead:beef`, `a:b:c:d:e:f`, `fe80::1`). Each refusal
 // was checked with `nft -c` (nftables 1.1.6): `1a`, `-a`, `/a`, `:a`,
-// `office:prod` and a 256-byte name fail, as does every keyword.
+// `office:prod`, `1.2.3` and a 256-byte name fail, as does every keyword;
+// `1.2.3.4` loads.
 func RenderSetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
@@ -234,7 +235,7 @@ func RenderSetName(s string) error {
 		}
 		return nil
 	}
-	if r := rune(s[0]); !isLetter(r) && r != '_' && r != '.' {
+	if r := rune(s[0]); !isLetter(r) && r != '_' && r != '.' && !dottedQuadShaped(s) {
 		return refuse("ipset name", s, "a set name starts with a letter, '_' or '.'")
 	}
 	if nftKeywords[s] {
@@ -257,13 +258,21 @@ func reservedSetName(s string) error {
 	return nil
 }
 
-// UserSetName is RenderSetName for a set an operator named, or a reference to
-// one: also never a name with the reserved prefix.
-func UserSetName(s string) error {
-	if err := RenderSetName(s); err != nil {
-		return err
+
+// dottedQuadShaped is four dot-separated runs of one to three digits, which
+// nft's scanner reads as one address-like token, so as a name (`1.2.3.4`,
+// `999.1.1.1`); `1.2.3` and `1.2.3.4.5` it does not.
+func dottedQuadShaped(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
 	}
-	return reservedSetName(s)
+	for _, p := range parts {
+		if p == "" || len(p) > 3 || strings.Trim(p, "0123456789") != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // addressShaped is a word nft's scanner reads as one address-like token, so
@@ -494,6 +503,11 @@ func Proto(s string) error {
 	if why := grammar(strings.ToLower(s), protoElem); why != "" {
 		return refuse("proto", s, "%s", why)
 	}
+	for _, why := range []string{RelationalMisuse("proto", s), ProtoUnresolvable(s)} {
+		if why != "" {
+			return refuse("proto", s, "%s", why)
+		}
+	}
 	return nil
 }
 
@@ -535,8 +549,10 @@ func Port(proto, s string) error {
 	if why := grammar(s, portElem); why != "" {
 		return refuse("port", s, "%s", why)
 	}
-	if why := PortUnresolvable(proto, s); why != "" {
-		return refuse("port", s, "%s", why)
+	for _, why := range []string{RelationalMisuse("port", s), PortUnresolvable(proto, s)} {
+		if why != "" {
+			return refuse("port", s, "%s", why)
+		}
 	}
 	return nil
 }
@@ -653,7 +669,102 @@ func CIDR(s string) error {
 	if why := grammar(s, v4Elem); why != "" {
 		return refuse("cidr", s, "%s", why)
 	}
+	if why := RelationalMisuse("cidr", s); why != "" {
+		return refuse("cidr", s, "%s", why)
+	}
 	return nil
+}
+
+// CIDRUnloadable is why nft refuses an IPv4 cidr the renderer writes, judged
+// without the network, or "": an address with an octet past 255 (nft: "Could
+// not resolve hostname"), a prefix length past 32 ("Prefix length 33 is
+// invalid"), or a range that runs backwards ("Range negative size"). A word
+// with a letter (a DNS name) or a leading zero (`010.0.0.1`, which nft reads)
+// is nft's to judge, as before.
+func CIDRUnloadable(s string) string {
+	if s == "" || strings.HasPrefix(trimBlank(s), "@") || strings.Contains(s, ":") {
+		return ""
+	}
+	mask, v := stripMask(trimBlank(blanks(s)))
+	if mask != "" {
+		if why := v4ValueUnloadable(mask); why != "" {
+			return why
+		}
+	}
+	v = stripOp(v)
+	if strings.HasPrefix(v, "@") {
+		return ""
+	}
+	elems := []string{v}
+	if strings.HasPrefix(v, "{") {
+		elems = strings.Split(strings.TrimSuffix(trimBlank(v[1:]), "}"), ",")
+	}
+	for _, e := range elems {
+		if why := v4ValueUnloadable(trimBlank(e)); why != "" {
+			return why
+		}
+	}
+	return ""
+}
+
+// SetElementUnloadable is CIDRUnloadable for a stored ip-set element, which
+// may hold several, comma separated.
+func SetElementUnloadable(s string) string {
+	for _, piece := range strings.Split(blanks(s), ",") {
+		if piece = trimBlank(piece); piece != "" && !strings.Contains(piece, ":") {
+			if why := v4ValueUnloadable(piece); why != "" {
+				return why
+			}
+		}
+	}
+	return ""
+}
+
+func v4ValueUnloadable(e string) string {
+	lo, hi, isRange := cutRange(e)
+	if !isRange && strings.Count(e, "-") == 1 && looksV4Range(e) {
+		lo, hi, _ = strings.Cut(e, "-")
+		isRange = true
+	}
+	for _, w := range []string{lo, hi} {
+		if why := v4WordUnloadable(w); why != "" {
+			return why
+		}
+		if !isRange {
+			break
+		}
+	}
+	if isRange {
+		a, err1 := netip.ParseAddr(lo)
+		b, err2 := netip.ParseAddr(hi)
+		if err1 == nil && err2 == nil && a.Is4() && b.Is4() && b.Less(a) {
+			return fmt.Sprintf("range %s runs backwards (nft: \"Range negative size\")", e)
+		}
+	}
+	return ""
+}
+
+func v4WordUnloadable(w string) string {
+	addr, bits, hasBits := strings.Cut(w, "/")
+	if !dottedQuadShaped(addr) {
+		return ""
+	}
+	for _, o := range strings.Split(addr, ".") {
+		if len(o) > 1 && o[0] == '0' {
+			return "" // nft reads it some other way; its call
+		}
+	}
+	for _, o := range strings.Split(addr, ".") {
+		if n, _ := strconv.Atoi(o); n > 255 {
+			return fmt.Sprintf("address %s has an octet past 255 (nft: \"Could not resolve hostname\")", addr)
+		}
+	}
+	if hasBits && bits != "" && strings.Trim(bits, "0123456789") == "" && bits[0] != '0' {
+		if n, _ := strconv.Atoi(bits); n > 32 || len(bits) > 3 {
+			return fmt.Sprintf("prefix length %s is past 32 (nft: \"Prefix length %s is invalid\")", bits, bits)
+		}
+	}
+	return ""
 }
 
 func v4Elem(e string) string {

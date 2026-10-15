@@ -288,6 +288,12 @@ func loadFreezePlan(t *testing.T) Plan {
 	// Round 0b: user sets named like the bridge table's internal ones.
 	rawSet(t, db, "s-resv-gw4", "lv_gw4", `["10.99.0.0/16"]`)
 	rawSet(t, db, "s-resv-nic", "lv_nic_devs", `["10.98.0.1"]`)
+	// Round 1: an operator keyword (review I-1), elements nft cannot read
+	// (m-2), a dotted-quad name nft reads (m-1), a main-era lv_ set (I-5).
+	rawSet(t, db, "s-ne", "ne", `["10.60.0.1"]`)
+	rawSet(t, db, "s-badelem", "badelem", `["10.61.0.1", "10.61.0.5-10.61.0.1", "10.61.0.0/33", "10.61.0.256"]`)
+	rawSet(t, db, "s-quad", "1.2.3.4", `["10.62.0.1"]`)
+	rawSet(t, db, "s-lvfoo", "lv_foo", `["10.63.0.0/16"]`)
 	for _, r := range [][5]string{
 		{"r-ovl", "tcp", "22", "@ovl", "accept"},
 		{"r-ovl2", "tcp", "22", "!= @ovl2", "drop"},
@@ -304,6 +310,23 @@ func loadFreezePlan(t *testing.T) Plan {
 		{"r-big", "tcp", "70000", "10.50.0.0/16", "drop"},
 		{"r-octal", "tcp", "9-010", "10.50.0.0/16", "drop"},
 		{"r-ssh", "TCP", "SSH", "10.51.0.0/16", "accept"},
+		// Round 1: protocols nft cannot resolve (I-2), ordering operators
+		// before a list, range or prefix (I-3), a ddp-only service (I-4),
+		// IPv4 cidrs nft cannot read (m-2), and rules that keep rendering.
+		{"r-proto", "bogus", "", "10.64.0.0/16", "drop"},
+		{"r-proto-alias", "ipsec-esp", "", "10.64.0.0/16", "drop"},
+		{"r-proto-big", "0400", "", "10.64.0.0/16", "drop"},
+		{"r-rel-port", "tcp", "< { 80, 443 }", "10.65.0.0/16", "drop"},
+		{"r-rel-cidr", "tcp", "22", "< 10.65.0.0/16", "drop"},
+		{"r-rel-proto", "< { 6, 17 }", "", "10.65.0.0/16", "drop"},
+		{"r-ddp", "tcp", "rtmp", "10.66.0.0/16", "drop"},
+		{"r-back", "tcp", "22", "10.67.0.5-10.67.0.1", "drop"},
+		{"r-33", "tcp", "22", "10.67.0.0/33", "drop"},
+		{"r-octet", "tcp", "22", "10.67.0.256", "drop"},
+		{"r-quad", "tcp", "28", "@1.2.3.4", "accept"},
+		{"r-lvfoo", "tcp", "29", "@lv_foo", "drop"},
+		{"r-esp", "esp", "", "10.68.0.0/16", "accept"},
+		{"r-lt", "tcp", "< 1024", "< 10.69.0.1", "accept"},
 	} {
 		rawClusterRule(t, db, r[0], r[1], r[2], r[3], r[4])
 	}
@@ -317,9 +340,19 @@ func loadFreezePlan(t *testing.T) Plan {
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
+	// What must keep rendering is not reported.
+	for _, id := range []string{"s-quad", "s-lvfoo", "r-quad", "r-lvfoo", "r-esp", "r-lt"} {
+		for _, r := range plan.InvalidRows {
+			if r.ID == id {
+				t.Errorf("row %s reported: %+v", id, r)
+			}
+		}
+	}
 	// Non-vacuous: every freeze row reached the loader and was handled.
 	for _, id := range []string{"s-xv6", "s-digit", "s-dash", "s-kw", "s-256", "s-colon", "s-long", "s-resv-gw4", "s-resv-nic",
-		"r-xv6", "r-kw", "r-longneg", "r-bogus", "r-bogus-list", "r-big", "r-octal", "sg-bogus"} {
+		"r-xv6", "r-kw", "r-longneg", "r-bogus", "r-bogus-list", "r-big", "r-octal", "sg-bogus",
+		"s-ne", "s-badelem", "r-proto", "r-proto-alias", "r-proto-big", "r-rel-port", "r-rel-cidr", "r-rel-proto",
+		"r-ddp", "r-back", "r-33", "r-octet"} {
 		found := false
 		for _, r := range plan.InvalidRows {
 			found = found || r.ID == id
@@ -345,13 +378,18 @@ func TestLoadFreezePlan_Renders(t *testing.T) {
 		"elements = { 10.0.0.0/8, 11.20.0.0/24 }", "elements = { 10.21.0.1-10.21.0.9 }",
 		"set dead:beef {", "ip saddr @x accept", "ip6 saddr @x_v6 accept", "tcp dport ssh ip saddr 10.51.0.0/16 accept",
 		"set " + freezeLong + " {",
+		"set 1.2.3.4 {", "tcp dport 29 ip saddr @lv_foo drop", "elements = { 10.63.0.0/16 }",
+		"ip protocol esp ip saddr 10.68.0.0/16 accept", "tcp dport < 1024 ip saddr < 10.69.0.1 accept",
+		"elements = { 10.61.0.1 }",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("want %q in the rendering", shown(want))
 		}
 	}
 	for _, bad := range []string{"10.31.0.0/16", "set 1office", "set -a", "set drop", "set office:prod", "nosuchservice-lv",
-		"dport 70000", "dport 9-010", freezeLong + "_v6", "fd01::/16"} {
+		"dport 70000", "dport 9-010", freezeLong + "_v6", "fd01::/16",
+		"set ne {", "10.61.0.5-10.61.0.1", "10.61.0.256", "bogus", "ipsec-esp", "0400", "< { 80, 443 }", "< 10.65.0.0/16",
+		"< { 6, 17 }", "rtmp", "10.67."} {
 		if strings.Contains(out, bad) {
 			t.Errorf("%q rendered", shown(bad))
 		}
@@ -365,21 +403,34 @@ func TestLoadFreezePlan_Renders(t *testing.T) {
 // referencing one is left out, and the internal sets render exactly as
 // without them.
 //
-// Mutation: render a reserved-name set (drop the check from UserSetName) —
-// the bridge table declares lv_gw4 twice, its elements merged in, red.
+// Any other lv_ name (lv_foo), which writers refuse now but a main-era
+// cluster may hold, renders as it did, so a deny rule on it keeps denying
+// (review I-5); so does a reserved-prefix tag-group name, left out.
+//
+// Mutation: render a reserved-name set (drop the collision check from
+// userSetName) — the bridge table declares lv_gw4 twice, its elements merged
+// in, red. Leave out every lv_ set — lv_foo and its drop rule vanish, red.
 func TestLoader_ReservedSetNamesLeftOut(t *testing.T) {
 	db, _ := freezeLoader(t)
 	rawSet(t, db, "s-gw4", "lv_gw4", `["10.99.0.0/16"]`)
 	rawSet(t, db, "s-nic", "lv_nic_devs", `["10.98.0.1"]`)
 	rawSet(t, db, "s-lb", "lv_lb4", `["10.97.0.1"]`)
+	rawSet(t, db, "s-tg", "lv_tg_web", `["10.96.0.1"]`)
+	rawSet(t, db, "s-foo", "lv_foo", `["10.95.0.0/16"]`)
 	rawClusterRule(t, db, "r-gw4", "tcp", "53", "@lv_gw4", "accept")
+	rawClusterRule(t, db, "r-foo", "tcp", "22", "@lv_foo", "drop")
 	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"s-gw4", "s-nic", "s-lb"} {
+	for _, id := range []string{"s-gw4", "s-nic", "s-lb", "s-tg"} {
 		if r, ok := invalidRow(plan, "ip_sets", id); !ok || r.Handling != HandlingSetLeftOut || !strings.Contains(r.Reason, `"lv_"`) {
 			t.Errorf("set %s not left out as reserved: %+v", id, r)
+		}
+	}
+	for _, r := range plan.InvalidRows {
+		if r.ID == "s-foo" || r.ID == "r-foo" {
+			t.Errorf("%s reported: %+v", r.ID, r)
 		}
 	}
 	if _, ok := invalidRow(plan, "cluster_firewall_rules", "r-gw4"); !ok {
@@ -396,7 +447,12 @@ func TestLoader_ReservedSetNamesLeftOut(t *testing.T) {
 			t.Errorf("set %s declared %d times", name, n)
 		}
 	}
-	for _, bad := range []string{"10.99.0.0/16", "10.98.0.1", "10.97.0.1", "dport 53 ip saddr @lv_gw4"} {
+	for _, want := range []string{"tcp dport 22 ip saddr @lv_foo drop", "elements = { 10.95.0.0/16 }"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("want %q: a deny rule on a main-era lv_ set must keep denying", want)
+		}
+	}
+	for _, bad := range []string{"10.99.0.0/16", "10.98.0.1", "10.97.0.1", "10.96.0.1", "dport 53 ip saddr @lv_gw4"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("%q rendered", bad)
 		}

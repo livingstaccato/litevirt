@@ -452,6 +452,10 @@ func TestSelfPauseExplicit_AClaimRetryKeepsTheLimit(t *testing.T) {
 	if !c.claimRetry["down"] {
 		t.Fatal("setup: the refused claim scheduled no retry of down's recovery")
 	}
+	// The bridge saw down answer after the deadline the retry is owed to,
+	// so the retry waits out a fresh deadline first (claimRetryOutageOver).
+	c.run(ctx)
+	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
 	c.run(ctx)
 	c.run(ctx)
 	assertLimited(t, db)

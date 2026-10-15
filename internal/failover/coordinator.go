@@ -373,9 +373,9 @@ type Coordinator struct {
 	// tick re-runs it; a fenced host is otherwise processed once (claims.go).
 	claimRetry map[string]bool
 	// claimRetryAt records, per host, the moment its last recovery went
-	// ahead (its fence's, or its partition-pause deadline's wait start), on
-	// this coordinator's clock: the authority a claim retry owed to that
-	// recovery acts on (claimRetryOutageOver).
+	// ahead (its fence's, its partition-pause deadline's wait start, or an
+	// operator confirmation's), on this coordinator's clock: the authority a
+	// claim retry owed to that recovery acts on (claimRetryOutageOver).
 	claimRetryAt map[string]time.Time
 	// relocDeferred records, per proof ID, when this coordinator first saw a
 	// container relocation decided for ANOTHER coordinator that it has not
@@ -927,11 +927,11 @@ func (c *Coordinator) run(ctx context.Context) {
 		// fence has run for it, so it goes down the fence path below although
 		// it is recorded terminal (confirmationFencesAfresh).
 		afresh := false
-		if c.fenced[target] {
+		if c.fenced[target] && !c.claimRetryOutageOver(ctx, target) {
 			// A claim retry owed to an outage the host has since come back
 			// from is re-judged before anything runs on that outage's fence
-			// (claimRetryOutageOver).
-			c.claimRetryOutageOver(ctx, target)
+			// (claimRetryOutageOver); a host it could not read is skipped.
+			continue
 		}
 		if c.fenced[target] {
 			// A recovery waiting out the host's partition pause continues
@@ -2866,6 +2866,9 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	if rec, _, ok := c.recordedFence(ctx, h); ok {
 		c.noteFencedOn(target, rec.ID)
 	}
+	// The operator's word is that the host is off now: a claim retry this
+	// recovery leaves owed acts on this moment (claimRetryOutageOver).
+	c.noteRecoveryAt(target, c.now())
 	c.recoverWorkloads(ctx, h)
 	return true
 }

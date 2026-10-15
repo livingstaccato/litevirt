@@ -553,7 +553,10 @@ All of this is in the failover coordinator (`internal/failover`).
    Meanwhile only an operator confirmation or a newer fence reaches the host,
    and either ends the wait (a fence that relies on the pause starts its own).
    A claim retry does not run while a wait is pending or refused, and one owed
-   to an earlier outage or an older fence is dropped with it.
+   to an earlier outage or an older fence is dropped with it. Nor does one run
+   for a host that is not `fenced` or `offline`, or that an observer has seen
+   answer since its recovery went ahead: a host whose pause is relied on then
+   waits out a fresh deadline, and any other is decided afresh.
    The stall alert names the refusal and its reason.
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
    Nor has one that takes the lease back after a gap (it stopped holding it,

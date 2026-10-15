@@ -200,8 +200,9 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	// condition from this outage is readable, and keeps the limit it finds
 	// when there is none (pausedThisOutage).
 	c.limitRecovery(host, only)
-	// A claim retry this recovery leaves owed acts on this deadline, not on
-	// the fence before it (claimRetryOutageOver).
+	// A claim retry this recovery leaves owed acts on this wait's start, the
+	// moment the fence (or a retry's fresh wait) began it, and no observer
+	// may have seen the host answer since (claimRetryOutageOver).
 	c.noteRecoveryAt(host, w.fenceAt)
 	c.recoverWorkloads(ctx, h)
 	return true

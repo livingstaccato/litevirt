@@ -1173,17 +1173,26 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	// stamped ahead count again once the holder's clock reaches them, so the
 	// recovery may come up to the step after the restore.
 	future := journalPair("ignoring a future-dated health observation", "target", v)
-	quorum := journalPair("failover: quorum reached", "host", v)
+	// The fence decision itself (coordinator.go:1164), not the deferral
+	// warnings that share its "quorum reached" prefix.
+	quorum := journalPair("failover: quorum reached — host exceeded failure threshold", "host", v)
 	h, first, ok := l.waitLogLine(l.allBut(v, x), since, "("+future+")|("+quorum+")", stepped.Add(-clockSlack), nil, 2*time.Minute)
 	l.restoreClock(x)
 	restored := time.Now()
+	quorumFirst := ok && !strings.Contains(first.Text, "future-dated")
 	if !ok {
 		t.Errorf("within 2m of the step no holder logged a future-dated row about %s or a fence quorum on it", v)
-	} else if !strings.Contains(first.Text, "future-dated") {
+	} else if quorumFirst {
 		l.mark("w5b: %s reached a fence quorum on %s before any future-dated line; %s restored", h, v, x)
 	}
 	if _, _, ok := l.waitLogLine(l.allBut(v, x), since, future, stepped.Add(-clockSlack), nil, 10*time.Second); !ok {
-		t.Errorf("no non-skewed holder ignored a future-dated row about %s while %s was %v ahead (coordinator.go:836)", v, x, w5VoterStep)
+		if quorumFirst {
+			// x was restored at the fence, perhaps before any holder's tick
+			// saw its row fresh enough to be future-dated: a note, not a failure.
+			t.Logf("W5-NOTE: no future-dated line about %s; the fence quorum came first and %s was restored", v, x)
+		} else {
+			t.Errorf("no non-skewed holder ignored a future-dated row about %s while %s was %v ahead (coordinator.go:836)", v, x, w5VoterStep)
+		}
 	}
 	if _, _, ok := l.waitLogLine([]string{x}, since, regexp.QuoteMeta(notRunningMsg), time.Time{}, nil, time.Minute); !ok {
 		t.Errorf("%s did not log the local stall after stepping forward %v (health/stall.go:120)", x, w5VoterStep)

@@ -270,3 +270,87 @@ func TestSharedDiskFence_TheAfreshExemptionEndsAtTheNextDecision(t *testing.T) {
 		t.Fatalf("setup: the recorded fence was not resumed (ld on %+v, hold %q)", ld, c.holdReason["bad"])
 	}
 }
+
+// Re-review m2-1: the afresh exemption covers only the fence this
+// coordinator ran on the confirmation (fencedOn), not any newer attempt. An
+// operator's `lv host fence` after it, best effort, proves nothing about the
+// host now, and refuses the binding as it would without the exemption.
+//
+// Mutation: exempt every newer attempt while afreshConfirm holds (the code
+// before) — the confirmation still binds.
+func TestSharedDiskFence_TheAfreshExemptionCoversOnlyItsOwnFence(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 2*time.Minute)
+	badFenceRow(t, db, "own-ssh", "best-effort-ssh", "fenced", time.Minute)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	c.afreshConfirm = map[string]string{"bad": "op-bad"}
+	c.noteFencedOn("bad", "own-ssh")
+	if ref, why, _ := c.proofGradeFenceRefWhy(ctx, "bad"); ref == "" {
+		t.Fatalf("control: the confirmation does not bind past this coordinator's own afresh fence: %s", why)
+	}
+	badFenceRow(t, db, "operator-ssh", "best-effort-ssh", "fenced", 0)
+	ref, why, retry := c.proofGradeFenceRefWhy(ctx, "bad")
+	if ref != "" || retry {
+		t.Fatalf("an operator's best-effort fence after the confirmation was exempted: ref %q retry %v", ref, retry)
+	}
+	if !strings.Contains(why, "not proof-grade") {
+		t.Fatalf("why %q: want the newer attempt named", why)
+	}
+}
+
+// Re-review m2-2: the m-a retry in the shape it exists for. A best-effort
+// host confirmed off first is fenced afresh on the confirmation, and the
+// binding then cannot be read. The transfer is not spent: the next cycle
+// retries it on the same fence and the same confirmation, with no second
+// fence and no second confirmation, and the afresh exemption still covers
+// the fence it ran.
+//
+// Mutation: drop the exemption from the retry (clear afreshConfirm when the
+// retry runs) — the second cycle refuses on the coordinator's own fence and
+// sd stays on bad.
+func TestSharedDiskFence_AReadErrorAfterAnAfreshFenceRetriesOnIt(t *testing.T) {
+	db, ctx, c := sharedDiskFixture(t)
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	badFenceRow(t, db, "op-bad", "manual", "manual-confirmed", 10*time.Second)
+	fences := 0
+	broken := false
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		if fences == 1 {
+			// The binding that follows this fence cannot read host_health.
+			if _, err := db.DB().ExecContext(ctx, `ALTER TABLE host_health RENAME TO host_health_gone`); err != nil {
+				t.Error(err)
+			}
+			broken = true
+		}
+		return fence.Result{Method: "best-effort-ssh", Detail: "unreachable; assumed off", Success: true}
+	})
+	c.run(ctx)
+	if broken {
+		if _, err := db.DB().ExecContext(ctx, `ALTER TABLE host_health_gone RENAME TO host_health`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fences != 1 {
+		t.Fatalf("setup: %d fences, want the afresh fence", fences)
+	}
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "bad" {
+		t.Fatalf("setup: the shared-disk VM moved on a binding that could not be judged: %+v", sd)
+	}
+	if hold := c.holdReason["bad"]; !strings.Contains(hold, "retrying") || strings.Contains(hold, "fence-confirm") {
+		t.Fatalf("hold %q: want a retry named, and no confirmation asked for", hold)
+	}
+	c.run(ctx)
+	if sd, _ := corrosion.GetVM(ctx, db, "sd"); sd == nil || sd.HostName != "good" || fences != 1 {
+		t.Fatalf("the next cycle did not retry the transfer on the afresh fence: %+v after %d fences (hold %q)",
+			sd, fences, c.holdReason["bad"])
+	}
+	rows, err := db.Query(ctx, `SELECT id FROM fencing_log WHERE host_name = 'bad' AND result = 'manual-confirmed'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("confirmations %d (%v), want the operator's one", len(rows), err)
+	}
+}

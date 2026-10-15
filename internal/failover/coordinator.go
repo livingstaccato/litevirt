@@ -3152,9 +3152,10 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 //     now. A "manual" attempt is not one: it is the cluster asking for a
 //     confirmation, and a confirmation made before it (the afresh path) is
 //     judged by the next rule. Nor is the fence this coordinator ran on the
-//     confirmation it fenced the host afresh on (afreshConfirm): a lenient
-//     best-effort fence of a host already off records success after the
-//     confirmation, and the confirmation is still judged by the next rule. A
+//     confirmation it fenced the host afresh on (afreshConfirm, and the row
+//     it noted in fencedOn): a lenient best-effort fence of a host already
+//     off records success after the confirmation, and the confirmation is
+//     still judged by the next rule. Any other attempt is not exempt. A
 //     row in the same second as the proof-grade one does not outrank it.
 //   - an operator confirmation binds only while it stands for the outage the
 //     host is in now (confirmationStands): nobody, this node's probe
@@ -3172,7 +3173,12 @@ func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string)
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
 	life, lifeKnown := c.fenceRowCutoff(ctx, host)
-	var best, newestUnverified time.Time
+	var best time.Time
+	type attempt struct {
+		id string
+		ts time.Time
+	}
+	var unverified []attempt
 	var out fenceRecord
 	found := false
 	for _, r := range rows {
@@ -3182,8 +3188,8 @@ func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string)
 		}
 		method, result := r.String("method"), r.String("result")
 		if !corrosion.FenceProofGrade(method, result) {
-			if (result == "fenced" || result == "partial") && method != "manual" && ts.After(newestUnverified) {
-				newestUnverified = ts
+			if (result == "fenced" || result == "partial") && method != "manual" {
+				unverified = append(unverified, attempt{id: r.String("id"), ts: ts})
 			}
 			continue
 		}
@@ -3205,8 +3211,21 @@ func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string)
 	if !found {
 		return fenceRecord{}, false, "", false
 	}
+	// The fence this coordinator ran on the confirmation it fenced the host
+	// afresh on is the one attempt exempt: any other writer's newer attempt
+	// (an operator's `lv host fence`, say) still refuses.
 	ownAfresh := out.Result == "manual-confirmed" && c.afreshConfirm[host] == out.ID
-	if newestUnverified.After(best) && !ownAfresh {
+	var newestUnverified time.Time
+	for _, a := range unverified {
+		if !a.ts.After(best) || !a.ts.After(newestUnverified) {
+			continue
+		}
+		if ownAfresh && a.id != "" && a.id == c.fencedOn[host] {
+			continue
+		}
+		newestUnverified = a.ts
+	}
+	if newestUnverified.After(best) {
 		return fenceRecord{}, false, "a fence attempt that is not proof-grade (" +
 			newestUnverified.UTC().Format(time.RFC3339) + ") is newer than the proof-grade fence " + out.ID, false
 	}

@@ -3,11 +3,13 @@ package daemon
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/hostboot"
 	"github.com/litevirt/litevirt/internal/metrics"
 )
 
@@ -23,9 +25,14 @@ func (d *Daemon) wirePeerHAState(fc *failover.Coordinator, svc *grpcapi.Server) 
 	fc.HAPeerVetoGauge = d.haMetrics().PeerVeto
 }
 
-// wireFenceCandidates installs the server's fence-candidate hook. No-op until
-// HA disarm's RPCs are implemented.
-func (d *Daemon) wireFenceCandidates(svc *grpcapi.Server) {}
+// wireFenceCandidates gives `lv cluster ha arm` the coordinator's own list of
+// hosts it would fence now, computed from fresh reads on the caller's
+// goroutine, so grpcapi does not import failover.
+func (d *Daemon) wireFenceCandidates(svc *grpcapi.Server) {
+	svc.SetFenceCandidates(func(ctx context.Context) ([]string, error) {
+		return failover.CurrentFenceCandidates(ctx, d.db, d.cfg.HostName, time.Now(), hostboot.UpgradingTimeout)
+	})
+}
 
 // startHAPolicyCache starts the refresher of the server's HA policy cache,
 // which Ready answers from, and this node's HA conditions and

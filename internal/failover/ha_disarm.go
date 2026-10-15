@@ -43,17 +43,11 @@ type PeerHAAnswer struct {
 	PolicyAt string // the policy row's updated_at as the peer stores it; "" when it has none
 }
 
-// PeerAnswerWindow (W_L2) bounds how old, from its probe's SEND time, a live
-// voter's answer may be and still be read as what it says:
-// SuspectThreshold × (ProbeInterval + ProbeTimeout) + ProbeInterval +
-// ProbeTimeout = 20 s today. A voter stays counted live for at most 18 s after
-// the probe that last reached it was sent (answered within ProbeTimeout, then
-// SuspectThreshold failed probes, each starting at most ProbeInterval after
-// the previous one ends and lasting at most ProbeTimeout); the rest is margin.
-// An older answer from a voter still counted live vetoes (rule stale), which
-// only ever delays a fence.
-const PeerAnswerWindow = time.Duration(health.SuspectThreshold)*(health.ProbeInterval+health.ProbeTimeout) +
-	health.ProbeInterval + health.ProbeTimeout
+// PeerAnswerWindow (W_L2) is health.PeerAnswerWindow: how old, from its
+// probe's send time, a live voter's answer may be and still be read as what it
+// says. An older answer from a voter still counted live vetoes (rule stale),
+// which only ever delays a fence.
+const PeerAnswerWindow = health.PeerAnswerWindow
 
 // Peer-veto rules, as ha_disarm_peer_veto and `lv cluster ha` name them.
 const (

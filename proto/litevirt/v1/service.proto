@@ -5114,6 +5114,9 @@ message HAVoterAnswer {
     bool   ha_disarmed  = 3;
     string ha_policy_at = 4;
     bool   confirmed    = 5;
+    // status is the voter in the peer veto's vocabulary: confirmed, stale,
+    // unknown, older row, newer row, or not counted live.
+    string status       = 6;
 }
 
 // HARegionConfirmation is whether a majority of a region's voters confirmed

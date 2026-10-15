@@ -41,6 +41,18 @@ const (
 	SuspectThreshold = suspectThreshold
 )
 
+// PeerAnswerWindow (W_L2) bounds how old, from its probe's SEND time, a live
+// voter's Ready answer may be and still be read as what it says:
+// SuspectThreshold × (ProbeInterval + ProbeTimeout) + ProbeInterval +
+// ProbeTimeout = 20 s. A voter stays counted live for at most 18 s after the
+// probe that last reached it was sent (answered within ProbeTimeout, then
+// SuspectThreshold failed probes, each starting at most ProbeInterval after the
+// previous one ends and lasting at most ProbeTimeout); the rest is margin. The
+// failover coordinator's HA-disarm peer veto reads an older answer from a voter
+// still counted live as a veto, and `lv cluster ha` waits this long after a
+// change is confirmed.
+const PeerAnswerWindow = SuspectThreshold*(ProbeInterval+ProbeTimeout) + ProbeInterval + ProbeTimeout
+
 // unreadyFailures is the consecutive_failures an 'unready' row carries, for
 // every unready observation in a run: below any fence threshold, and non-zero
 // so that recovery (which counts consecutive_failures = 0) never reads it as

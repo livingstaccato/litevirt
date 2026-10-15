@@ -4,19 +4,33 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 )
 
-// refuseLocalDst reports, loudly, a forwarding entry whose destination is this
-// host's own address (isLocalAddress). It is never installed: the kernel hands
+// refuseLocalDst reports, loudly, a forwarding entry whose destination is one
+// of this host's addresses (local). It is never installed: the kernel hands
 // such a frame straight back to the vxlan device, so a flood entry like that
 // black-holes the whole VNI and a unicast one black-holes that MAC.
-func refuseLocalDst(vni int, mac, dst string) bool {
-	if !isLocalAddress(dst) {
+func refuseLocalDst(local localAddrs, vni int, mac, dst string) bool {
+	if !local.has(dst) {
 		return false
 	}
-	slog.Error("vxlan: refusing a forwarding entry that points at this host's own address; it would loop the frames back into the overlay",
-		"vni", vni, "mac", mac, "dst", dst)
+	if logOnce(fmt.Sprintf("refuse|%d|%s|%s", vni, mac, dst)) {
+		slog.Warn("vxlan: refusing a forwarding entry that points at this host's own address; it would loop the frames back into the overlay",
+			"vni", vni, "mac", mac, "dst", dst)
+	}
 	return true
+}
+
+// logged holds the keys logOnce has seen.
+var logged sync.Map
+
+// logOnce reports whether key is new, so a condition that every sync meets
+// again — a peer still registering an address of this host's — is logged
+// once per peer and address, not once per pass.
+func logOnce(key string) bool {
+	_, seen := logged.LoadOrStore(key, true)
+	return !seen
 }
 
 // isAlreadyExists returns true if the command output contains "File exists" or "already exists".
@@ -29,7 +43,11 @@ func isAlreadyExists(out []byte) bool {
 // An entry whose remoteVTEP is this host's own address is refused (nil, and
 // nothing installed): see refuseLocalDst.
 func AddFDBEntry(vni int, mac, remoteVTEP string) error {
-	if refuseLocalDst(vni, mac, remoteVTEP) {
+	return addFDB(loadLocalAddrs(), vni, mac, remoteVTEP)
+}
+
+func addFDB(local localAddrs, vni int, mac, remoteVTEP string) error {
+	if refuseLocalDst(local, vni, mac, remoteVTEP) {
 		return nil
 	}
 	out, err := execCommand("bridge", "fdb", "add", mac,
@@ -53,15 +71,7 @@ func DeleteFDBEntry(vni int, mac, remoteVTEP string) error {
 // FloodEntry adds a BUM flood entry: bridge fdb add 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>
 // As with AddFDBEntry, a remoteVTEP of this host's own is refused.
 func FloodEntry(vni int, remoteVTEP string) error {
-	if refuseLocalDst(vni, floodMAC, remoteVTEP) {
-		return nil
-	}
-	out, err := execCommand("bridge", "fdb", "add", floodMAC,
-		"dev", vtepName(vni), "dst", remoteVTEP)
-	if err != nil && !isAlreadyExists(out) {
-		return fmt.Errorf("bridge fdb add flood %s: %w: %s", remoteVTEP, err, out)
-	}
-	return nil
+	return addFDB(loadLocalAddrs(), vni, floodMAC, remoteVTEP)
 }
 
 // DeleteFloodEntry removes a BUM flood entry: bridge fdb del 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>

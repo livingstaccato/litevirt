@@ -58,6 +58,12 @@ func EnsureVXLAN(vni int, underlay, localIP string) (string, error) {
 		// Only the vxlan port goes: the bridge and the guests' taps on it stay,
 		// and steps 3-4 put the new port back on the bridge.
 		if gotLocal, gotDev, ok := vxlanEndpoint(vxlan); ok && (gotLocal != localIP || gotDev != underlay) {
+			// Never trade a device for one whose local address this host
+			// does not hold: the kernel cannot send from it.
+			if !isLocalAddress(localIP) {
+				return "", fmt.Errorf("not recreating %s (local %s dev %s) with local address %s, which no interface of this host holds",
+					vxlan, gotLocal, gotDev, localIP)
+			}
 			slog.Warn("vxlan: recreating a tunnel device whose local address or underlay is not this host's",
 				"device", vxlan, "local", gotLocal, "dev", gotDev, "want_local", localIP, "want_dev", underlay)
 			if out, err := execCommand("ip", "link", "del", vxlan); err != nil && !isNoSuchDevice(out) {

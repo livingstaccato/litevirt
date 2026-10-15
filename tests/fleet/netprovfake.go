@@ -34,8 +34,10 @@ type NetProvFake struct {
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
-	failWith      map[string]error  // network → the error its Provision returns (FailProvision)
-	vteps         map[string]string // network → the VTEP address its last Provision was handed
+	failWith      map[string]error    // network → the error its Provision returns (FailProvision)
+	vteps         map[string]string   // network → the VTEP address its last Provision was handed
+	fdbSyncs      map[string]int      // network → SyncFDB calls
+	flood         map[string][]string // network → flood list at the last SyncFDB
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -220,4 +222,64 @@ func (f *NetProvFake) VTEP(network string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.vteps[network]
+}
+
+// SyncFDB counts the network reconciler's forwarding-entry syncs and, as the
+// real sync does, derives the flood list from the replicated VTEP rows: every
+// other host's VTEP (Flood).
+func (f *NetProvFake) SyncFDB(ctx context.Context, db *corrosion.Client, name string, _ compose.NetworkDef, hostName string) error {
+	vteps, err := network.GetVTEPs(ctx, db, name)
+	if err != nil {
+		return err
+	}
+	var flood []string
+	for _, v := range vteps {
+		if v.HostName != hostName {
+			flood = append(flood, v.VTEPAddr)
+		}
+	}
+	sort.Strings(flood)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fdbSyncs == nil {
+		f.fdbSyncs = map[string]int{}
+		f.flood = map[string][]string{}
+	}
+	f.fdbSyncs[name]++
+	f.flood[name] = flood
+	return nil
+}
+
+// Flood is network's flood list at this node's last SyncFDB, sorted.
+func (f *NetProvFake) Flood(network string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.flood[network]...)
+}
+
+// FDBSyncs counts SyncFDB calls for network on this node.
+func (f *NetProvFake) FDBSyncs(network string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fdbSyncs[network]
+}
+
+// LegacyVTEP is the tunnel address every fleet node resolves before the
+// release token latches: the default-route source address, which the nodes
+// share — they run on one machine, as every lab node sits behind the same
+// qemu NAT (10.0.2.15).
+const LegacyVTEP = "10.0.2.15"
+
+// ResolveVTEP is the fleet stand-in for network.ResolveVTEP (the nodes have
+// no interfaces of their own to read): before the latch, the shared
+// LegacyVTEP on ens3; after it, the node's host address on net1, or a refusal
+// with none.
+func (f *NetProvFake) ResolveVTEP(name string, def compose.NetworkDef, hostAddress string, switched bool) (string, string, error) {
+	if !switched {
+		return LegacyVTEP, "ens3", nil
+	}
+	if hostAddress == "" {
+		return "", "", &network.VTEPRefusal{Network: name, Reason: "this host's address is not known yet"}
+	}
+	return hostAddress, "net1", nil
 }

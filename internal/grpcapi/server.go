@@ -530,9 +530,16 @@ type Server struct {
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
-	// hostAddr is this host's cluster address (SetHostAddress), used as its
-	// VXLAN tunnel endpoint. '' means netutil.HostAddress("").
+	// hostAddr is this host's cluster address (SetHostAddress), its VXLAN
+	// tunnel endpoint once the release token latches. '' = unwired: a vxlan
+	// network is refused.
 	hostAddr string
+	// vtepResolver resolves a vxlan tunnel endpoint (SetVTEPResolver); nil =
+	// network.ResolveVTEP.
+	vtepResolver VTEPResolver
+	// vtepRefused is the last refusal published per network (resolveVTEP).
+	vtepRefusedMu sync.Mutex
+	vtepRefused   map[string]string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
 

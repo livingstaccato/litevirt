@@ -23,7 +23,6 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -153,9 +152,6 @@ type Reconciler struct {
 	// provision sets up a network on this host for a VM start. nil means
 	// network.SafeProvision. Set via SetNetworkProvision.
 	provision network.ProvisionFunc
-	// hostAddr is this host's cluster address, its VXLAN tunnel endpoint
-	// (SetHostAddress). '' means netutil.HostAddress("").
-	hostAddr string
 
 	// Now is the reconciler's clock for vm_lock lease timestamps. Defaults to
 	// time.Now; the fleet harness overrides it so lock-expiry scenarios advance
@@ -421,19 +417,6 @@ func (r *Reconciler) ensureSparePCIeRootPorts(name string) {
 // provisioner the gRPC server uses, so a failover restart and a VM create set
 // a network up the same way; the fleet harness passes its per-node fake.
 func (r *Reconciler) SetNetworkProvision(fn network.ProvisionFunc) { r.provision = fn }
-
-// SetHostAddress sets the address a VM start registers as this host's VXLAN
-// tunnel endpoint: the daemon's host address, advertise_address when set, so
-// a failover restart provisions the same VTEP a VM create does.
-func (r *Reconciler) SetHostAddress(addr string) { r.hostAddr = addr }
-
-// VTEPAddress is the address set by SetHostAddress, or netutil.HostAddress("").
-func (r *Reconciler) VTEPAddress() string {
-	if r.hostAddr != "" {
-		return r.hostAddr
-	}
-	return netutil.HostAddress("")
-}
 
 // publishRunning routes a NON-MINTING transition through the marker chokepoint.
 // See PublishVMRunning for the ordering and why it is the right one here.
@@ -2352,7 +2335,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		if provision == nil {
 			provision = network.SafeProvision
 		}
-		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, r.VTEPAddress(), provision); err != nil {
+		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, provision); err != nil {
 			slog.Warn("reconciler: network provision failed, using raw name",
 				"vm", vm.Name, "network", iface.NetworkName, "error", err)
 		} else if provBridge != "" {

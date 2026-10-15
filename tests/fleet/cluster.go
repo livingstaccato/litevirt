@@ -893,6 +893,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
 	n.Net = NewNetProvFake()
 	n.Server.SetNetworkProvisioner(n.Net)
+	n.Server.SetVTEPResolver(n.Net.ResolveVTEP)
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node

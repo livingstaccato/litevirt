@@ -928,7 +928,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("TLS config: %w", err)
 	}
 
-	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	svc := d.newServer() // host address and release gate: before the first network pass
 	// A guarded VM recovers only onto a host that enforces NIC guards until
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
@@ -968,9 +968,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	rc.SetCapacityPolicy(capacity)
 	rc.QuorumLost = svc.LeaseQuorumLost
 	go rc.Start(ctx)
-	// Release features (capabilities.Feature) open through the checker's
-	// WithFeature: the release token's latch plus the replicated used bit.
-	svc.SetReleaseFeatureGate(d.checker)
 	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
 	// A peer advertising a release token this build does not know is, almost
 	// always, a forward roll: a non-blocking look at its used records, never a
@@ -1256,7 +1253,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
-	d.wireHostAddress(svc, reconciler)                       // the VTEP address for both
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.
@@ -2720,7 +2716,7 @@ func fileBasedPoolDriver(driver string) bool {
 // the source IP toward the default route, which is the wrong answer on a
 // multi-homed host whose cluster network is not the default one.
 //
-// It is also this host's VXLAN tunnel endpoint (wireHostAddress): one rule,
+// It is also this host's VXLAN tunnel endpoint (newServer): one rule,
 // netutil.HostAddress, for all three.
 func (d *Daemon) hostAddress() string {
 	return netutil.HostAddress(d.cfg.AdvertiseAddress)
@@ -2730,16 +2726,25 @@ func getOutboundIP() string {
 	return netutil.HostAddress("")
 }
 
-// wireHostAddress hands this host's address to the gRPC server and the
-// reconciler, which use it as the VXLAN tunnel endpoint and register it in
-// network_vteps. Left to find their own, each picked the default-route source
-// address, which on a multi-homed host is not the cluster address: on a NAT'd
-// lab it was the same 10.0.2.15 on every node, so each host's flood entry
-// pointed at itself and no guest on a vxlan network got a DHCP lease.
-func (d *Daemon) wireHostAddress(svc *grpcapi.Server, rec *health.Reconciler) {
-	addr := d.hostAddress()
-	svc.SetHostAddress(addr)
-	rec.SetHostAddress(addr)
+// newServer builds the gRPC server with what its first network pass needs
+// already wired. The daemon runs that pass (ReconcileNetworksOnce) a few steps
+// later, at startup, and a vxlan network provisioned there takes its tunnel
+// endpoint from both: this host's address, and the release gate, whose latch
+// decides whether that address is in use yet (network.ResolveVTEP). Wired any
+// later, the pass would find neither, and the server refuses a vxlan network
+// with no address rather than guess one.
+func (d *Daemon) newServer() *grpcapi.Server {
+	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	d.wireServer(svc)
+	return svc
+}
+
+// wireServer is newServer's wiring, on a server already built.
+func (d *Daemon) wireServer(svc *grpcapi.Server) {
+	svc.SetHostAddress(d.hostAddress())
+	// Release features (capabilities.Feature) open through the checker's
+	// WithFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.

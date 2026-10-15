@@ -4024,12 +4024,6 @@ func GenerateMAC() string {
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
 }
 
-// provisionNetworkForVM delegates to network.ProvisionForVM.
-// Kept as a local wrapper for backward compatibility within this file.
-func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return network.ProvisionForVM(ctx, db, networkName, hostName)
-}
-
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {

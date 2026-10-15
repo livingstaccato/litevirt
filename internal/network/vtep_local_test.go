@@ -1,14 +1,17 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netutil"
 )
 
 // multiHomedLab models a lab node (lab1-vxlan-dhcp.md): the default route and
@@ -17,14 +20,17 @@ import (
 // advertise address.
 func multiHomedLab(t *testing.T) {
 	t.Helper()
+	setHostAddrs(t, localAddrs{
+		"127.0.0.1":  {Dev: "lo"},
+		"10.0.2.15":  {Dev: "ens3", Carrier: true},
+		"10.77.0.11": {Dev: "net1", Carrier: true},
+	})
+}
+
+func setHostAddrs(t *testing.T, addrs localAddrs) {
+	t.Helper()
 	prev := hostAddrs
-	hostAddrs = func() (map[string]string, error) {
-		return map[string]string{
-			"127.0.0.1":  "lo",
-			"10.0.2.15":  "ens3",
-			"10.77.0.11": "net1",
-		}, nil
-	}
+	hostAddrs = func() (localAddrs, error) { return addrs, nil }
 	t.Cleanup(func() { hostAddrs = prev })
 }
 
@@ -54,40 +60,151 @@ func vtepTestDB(t *testing.T) *corrosion.Client {
 	return db
 }
 
-// TestProvision_VXLAN_UnderlayHoldsTheHostAddress: with no underlay set, the
-// tunnel runs over the interface that holds this host's address — net1 — and
-// not over the default-route interface. On the lab the default route's
-// interface (ens3) carries the NAT address every node shares.
-func TestProvision_VXLAN_UnderlayHoldsTheHostAddress(t *testing.T) {
-	multiHomedLab(t)
-	calls := fakeExec(t, func(cmd string) ([]byte, error) {
+func defaultRouteVia(dev string) func(cmd string) ([]byte, error) {
+	return func(cmd string) ([]byte, error) {
 		if cmd == "ip route show default" {
-			return []byte("default via 10.0.2.2 dev ens3 proto dhcp src 10.0.2.15 metric 100\n"), nil
+			return []byte("default via 10.0.2.2 dev " + dev + " proto dhcp metric 100\n"), nil
 		}
 		return nil, nil
-	})
-
-	def := compose.NetworkDef{Type: "vxlan", Interface: "vxdnet", VNI: 5177}
-	if _, err := Provision(context.Background(), vtepTestDB(t), "vxd_vxdnet", def, "10.77.0.11", "node-1"); err != nil {
-		t.Fatalf("Provision: %v", err)
-	}
-	want := "ip link add vxlan5177 type vxlan id 5177 dstport 4789 local 10.77.0.11 dev net1 nolearning"
-	if !slices.Contains(*calls, want) {
-		t.Fatalf("no %q among the commands:\n%s", want, strings.Join(*calls, "\n"))
 	}
 }
 
-// TestUnderlayFor_FallsBackToTheDefaultRoute: an address no interface holds
-// (or a loopback one) leaves the default-route interface as the underlay.
-func TestUnderlayFor_FallsBackToTheDefaultRoute(t *testing.T) {
+var vxdDef = compose.NetworkDef{Type: "vxlan", Interface: "vxdnet", VNI: 5177}
+
+// TestResolveVTEP_HostAddressOnItsInterface: once switched, the tunnel's local
+// address is the host address and its underlay the interface holding it —
+// net1 — not the default-route interface ens3, whose NAT address every lab
+// node shares.
+func TestResolveVTEP_HostAddressOnItsInterface(t *testing.T) {
 	multiHomedLab(t)
-	fakeExec(t, func(cmd string) ([]byte, error) {
-		return []byte("default via 10.0.2.2 dev ens3\n"), nil
+	fakeExec(t, defaultRouteVia("ens3"))
+	local, dev, err := ResolveVTEP("vxd_vxdnet", vxdDef, "10.77.0.11", true)
+	if err != nil || local != "10.77.0.11" || dev != "net1" {
+		t.Fatalf("ResolveVTEP = %q, %q, %v; want 10.77.0.11 on net1", local, dev, err)
+	}
+}
+
+// TestResolveVTEP_BeforeTheSwitch: before the latch the endpoint is the one
+// every earlier build used — the default-route source address, over the
+// named underlay or the default-route interface.
+func TestResolveVTEP_BeforeTheSwitch(t *testing.T) {
+	multiHomedLab(t)
+	fakeExec(t, defaultRouteVia("ens3"))
+	local, dev, err := ResolveVTEP("vxd_vxdnet", vxdDef, "10.77.0.11", false)
+	if err != nil || local != netutil.HostAddress("") || dev != "ens3" {
+		t.Fatalf("ResolveVTEP = %q, %q, %v; want %s on ens3", local, dev, err, netutil.HostAddress(""))
+	}
+	named := vxdDef
+	named.Underlay = "eth0"
+	if _, dev, _ := ResolveVTEP("vxd_vxdnet", named, "10.77.0.11", false); dev != "eth0" {
+		t.Fatalf("named underlay before the switch: dev %q, want eth0", dev)
+	}
+}
+
+// TestResolveVTEP_NamedUnderlayWins: a network that names its underlay runs
+// the tunnel from an address that device holds — the host address when it is
+// one of them, else the device's own — and a device with no IPv4 address is
+// refused, naming the network and the device.
+func TestResolveVTEP_NamedUnderlayWins(t *testing.T) {
+	setHostAddrs(t, localAddrs{
+		"127.0.0.1":   {Dev: "lo"},
+		"192.168.1.5": {Dev: "eth0", Carrier: true},
+		"fe80::1":     {Dev: "eth0", Carrier: true},
+		"10.77.0.11":  {Dev: "net1", Carrier: true},
+		"fe80::2":     {Dev: "eth9", Carrier: true},
 	})
-	for _, ip := range []string{"203.0.113.9", "127.0.0.1"} {
-		if got := underlayFor(ip); got != "ens3" {
-			t.Errorf("underlayFor(%s) = %q, want the default-route interface ens3", ip, got)
+	fakeExec(t, defaultRouteVia("eth0"))
+	for _, tc := range []struct{ underlay, local string }{
+		{"eth0", "192.168.1.5"}, // the host address is on net1: eth0's own
+		{"net1", "10.77.0.11"},  // the host address is on it
+	} {
+		def := vxdDef
+		def.Underlay = tc.underlay
+		local, dev, err := ResolveVTEP("vxd_vxdnet", def, "10.77.0.11", true)
+		if err != nil || local != tc.local || dev != tc.underlay {
+			t.Errorf("underlay %s: ResolveVTEP = %q, %q, %v; want %s on %s", tc.underlay, local, dev, err, tc.local, tc.underlay)
 		}
+	}
+	def := vxdDef
+	def.Underlay = "eth9"
+	_, _, err := ResolveVTEP("vxd_vxdnet", def, "10.77.0.11", true)
+	var r *VTEPRefusal
+	if !errors.As(err, &r) || r.Network != "vxd_vxdnet" || r.Device != "eth9" {
+		t.Fatalf("underlay with no IPv4 address: %v, want a VTEPRefusal naming vxd_vxdnet and eth9", err)
+	}
+}
+
+// TestResolveVTEP_LoopbackOrDummyHolder: a routed-to-the-host fabric puts the
+// host /32 on lo or a dummy device. That device cannot carry the tunnel; the
+// default-route interface does, from the same address.
+func TestResolveVTEP_LoopbackOrDummyHolder(t *testing.T) {
+	fakeExec(t, defaultRouteVia("eth0"))
+	for _, holder := range []string{"lo", "dummy0"} {
+		setHostAddrs(t, localAddrs{
+			"127.0.0.1":    {Dev: "lo"},
+			"10.1.1.1":     {Dev: holder},
+			"192.168.0.10": {Dev: "eth0", Carrier: true},
+		})
+		local, dev, err := ResolveVTEP("vxd_vxdnet", vxdDef, "10.1.1.1", true)
+		if err != nil || local != "10.1.1.1" || dev != "eth0" {
+			t.Errorf("/32 on %s: ResolveVTEP = %q, %q, %v; want 10.1.1.1 on eth0", holder, local, dev, err)
+		}
+	}
+}
+
+// TestResolveVTEP_RefusesAnAddressItCannotUse: no host address (never
+// wired), or one no interface holds (a 1:1-NAT'd advertise address), is
+// refused — never a tunnel from an address the host cannot send from.
+func TestResolveVTEP_RefusesAnAddressItCannotUse(t *testing.T) {
+	multiHomedLab(t)
+	fakeExec(t, defaultRouteVia("ens3"))
+	for _, tc := range []struct{ addr, reason string }{
+		{"", "not known"},
+		{"203.0.113.9", "no interface holds"},
+	} {
+		var r *VTEPRefusal
+		if _, _, err := ResolveVTEP("vxd_vxdnet", vxdDef, tc.addr, true); !errors.As(err, &r) ||
+			r.Network != "vxd_vxdnet" || !strings.Contains(r.Reason, tc.reason) {
+			t.Errorf("host address %q: %v, want a VTEPRefusal saying %q", tc.addr, err, tc.reason)
+		}
+	}
+}
+
+// TestProvision_VXLAN_RefusesWithoutALocalAddress: Provision does not guess
+// a tunnel address; a caller that resolved none is refused before any device
+// is touched.
+func TestProvision_VXLAN_RefusesWithoutALocalAddress(t *testing.T) {
+	calls := fakeExec(t, nil)
+	if _, err := Provision(context.Background(), vtepTestDB(t), "vxd_vxdnet", vxdDef, "", "node-1"); err == nil {
+		t.Fatal("Provision set up a vxlan network with no local address")
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("commands ran: %v", *calls)
+	}
+}
+
+// TestProvision_VXLAN_DoesNotReviveADeletedNetworksVTEP: a provisioning pass
+// that meets the network's tombstone does not upsert its VTEP row, which
+// would clear deleted_at and bring the row back under a deleted network.
+func TestProvision_VXLAN_DoesNotReviveADeletedNetworksVTEP(t *testing.T) {
+	multiHomedLab(t)
+	fakeExec(t, nil)
+	ctx := context.Background()
+	db := vtepTestDB(t)
+	if err := corrosion.UpsertNetwork(ctx, db, corrosion.NetworkRecord{Name: "vxd_vxdnet", Type: "vxlan", Config: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteNetwork(ctx, db, "vxd_vxdnet"); err != nil {
+		t.Fatal(err)
+	}
+	def := vxdDef
+	def.Underlay = "net1"
+	if _, err := Provision(ctx, db, "vxd_vxdnet", def, "10.77.0.11", "node-1"); err == nil ||
+		!strings.Contains(err.Error(), "was deleted") {
+		t.Fatalf("Provision of a deleted network: %v, want the deleted-network refusal", err)
+	}
+	if v, _ := GetVTEPs(ctx, db, "vxd_vxdnet"); len(v) != 0 {
+		t.Fatalf("live VTEP rows for a deleted network: %+v", v)
 	}
 }
 
@@ -179,6 +296,12 @@ func TestSyncFloodEntries_SkipsSelfAndPrunesStale(t *testing.T) {
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "node-3", Address: "10.77.0.13", State: "active"}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
+	// A host registered without advertise_address on the NAT'd lab: its
+	// address is the shared 10.0.2.15, so it is a live host's address and
+	// this host's own at once. Its own-address entries still go.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "node-5", Address: "10.0.2.15", State: "active"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
 
 	if err := SyncFloodEntries(ctx, db, "vxd_vxdnet", "node-1", 5177); err != nil {
 		t.Fatalf("SyncFloodEntries: %v", err)
@@ -233,6 +356,7 @@ const labVXLANLink = `12: vxlan5177: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 
 // Only the vxlan port goes — the bridge, and the guests' taps on it, stay —
 // and the new port is put back on the bridge.
 func TestEnsureVXLAN_RecreatesADriftedDevice(t *testing.T) {
+	multiHomedLab(t)
 	adds := 0
 	calls := fakeExec(t, func(cmd string) ([]byte, error) {
 		switch {
@@ -289,5 +413,137 @@ func TestEnsureVXLAN_KeepsAMatchingDevice(t *testing.T) {
 	}
 	if slices.Contains(*calls, "ip link del vxlan5177") {
 		t.Fatalf("a device already on this host's address was recreated:\n%s", strings.Join(*calls, "\n"))
+	}
+}
+
+// TestEnsureVXLAN_DoesNotRecreateIntoAnUnheldAddress: a drifted device is
+// kept when the new local address is not one this host holds; the kernel
+// could not send from it.
+func TestEnsureVXLAN_DoesNotRecreateIntoAnUnheldAddress(t *testing.T) {
+	multiHomedLab(t)
+	calls := fakeExec(t, func(cmd string) ([]byte, error) {
+		switch {
+		case strings.HasPrefix(cmd, "ip link add "):
+			return []byte("RTNETLINK answers: File exists\n"), errors.New("exit status 2")
+		case cmd == "ip -d -o link show vxlan5177":
+			return []byte(labVXLANLink), nil
+		}
+		return nil, nil
+	})
+	if _, err := EnsureVXLAN(5177, "net1", "203.0.113.9"); err == nil {
+		t.Fatal("EnsureVXLAN accepted a local address this host does not hold")
+	}
+	if slices.Contains(*calls, "ip link del vxlan5177") {
+		t.Fatal("the working device was deleted for an address this host cannot send from")
+	}
+}
+
+// seedNIC records a live VM NIC (vm_interfaces) or container NIC on network.
+func seedNIC(t *testing.T, db *corrosion.Client, host, owner, mac string, container bool) {
+	t.Helper()
+	ctx := context.Background()
+	if container {
+		if err := db.Execute(ctx, `INSERT INTO container_interfaces (host_name, ct_name, network_name, ordinal, mac, updated_at)
+			VALUES (?, ?, 'vxd_vxdnet', 0, ?, '2026-10-15T00:00:00Z')`, host, owner, mac); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: owner, HostName: host, State: "running", Spec: "{}"},
+		[]corrosion.InterfaceRecord{{VMName: owner, NetworkName: "vxd_vxdnet", Ordinal: 0, MAC: mac}}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSyncFloodEntries_UnicastFollowsTheNICs: every live NIC on the network
+// on another host gets a unicast entry at that host's VTEP — so a recreated
+// device, which starts with none, gets them all back — an entry still at a
+// peer's old VTEP is repointed, and one at an address that is no VTEP is
+// removed. A local NIC gets none; an unknown MAC at a current VTEP is kept.
+func TestSyncFloodEntries_UnicastFollowsTheNICs(t *testing.T) {
+	multiHomedLab(t)
+	ctx := context.Background()
+	db := vtepTestDB(t)
+	for _, v := range []struct{ host, ip string }{
+		{"node-1", "10.77.0.11"}, {"node-2", "10.77.0.12"}, {"node-4", "10.77.0.14"},
+	} {
+		if err := UpsertVTEP(ctx, db, "vxd_vxdnet", v.host, v.ip, 5177); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedNIC(t, db, "node-2", "vxd2", "52:54:00:00:00:02", false)
+	seedNIC(t, db, "node-4", "ct4", "52:54:00:00:00:04", true)
+	seedNIC(t, db, "node-1", "vxd1", "52:54:00:00:00:01", false) // local
+
+	// A recreated device: no entries at all.
+	calls := fakeExec(t, nil)
+	if err := SyncFloodEntries(ctx, db, "vxd_vxdnet", "node-1", 5177); err != nil {
+		t.Fatal(err)
+	}
+	adds, dels := fdbChanges(*calls)
+	want := []string{
+		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
+		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
+		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
+		"52:54:00:00:00:04 dev vxlan5177 dst 10.77.0.14",
+	}
+	if !slices.Equal(adds, want) || len(dels) != 0 {
+		t.Fatalf("on an empty device: added %q removed %q, want added %q", adds, dels, want)
+	}
+
+	// node-2's VTEP moved; this host still points vxd2's MAC at the old one.
+	calls = fakeExec(t, func(cmd string) ([]byte, error) {
+		if cmd == "bridge fdb show dev vxlan5177" {
+			return []byte(`00:00:00:00:00:00 dst 10.77.0.12 self permanent
+00:00:00:00:00:00 dst 10.77.0.14 self permanent
+52:54:00:00:00:02 dst 10.77.0.99 self permanent
+52:54:00:00:00:04 dst 10.77.0.14 self permanent
+52:54:00:00:00:77 dst 10.77.0.14 self permanent
+52:54:00:00:00:88 dst 198.51.100.7 self permanent
+`), nil
+		}
+		return nil, nil
+	})
+	if err := SyncFloodEntries(ctx, db, "vxd_vxdnet", "node-1", 5177); err != nil {
+		t.Fatal(err)
+	}
+	adds, dels = fdbChanges(*calls)
+	wantAdds := []string{
+		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
+		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
+		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
+	}
+	wantDels := []string{
+		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.99",
+		"52:54:00:00:00:88 dev vxlan5177 dst 198.51.100.7",
+	}
+	if !slices.Equal(adds, wantAdds) || !slices.Equal(dels, wantDels) {
+		t.Fatalf("repoint: added %q removed %q, want added %q removed %q", adds, dels, wantAdds, wantDels)
+	}
+}
+
+// TestRefusedEntry_LoggedOncePerAddress: a peer that keeps pushing an address
+// of this host's is refused on every attempt but logged once per address,
+// at Warn, not once per pass.
+func TestRefusedEntry_LoggedOncePerAddress(t *testing.T) {
+	multiHomedLab(t)
+	fakeExec(t, nil)
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for i := 0; i < 3; i++ {
+		_ = FloodEntry(9177, "10.0.2.15")
+	}
+	_ = FloodEntry(9177, "10.77.0.11")
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("logged %d lines for 4 refusals of 2 addresses, want 2:\n%s", len(lines), buf.String())
+	}
+	for _, l := range lines {
+		if !strings.Contains(l, "level=WARN") {
+			t.Errorf("refusal logged as %q, want WARN", l)
+		}
 	}
 }

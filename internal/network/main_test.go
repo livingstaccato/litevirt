@@ -16,8 +16,8 @@ func TestMain(m *testing.M) {
 	createdBridgeDir = dir
 	// The runner's own addresses must not decide whether a test's VTEP is
 	// "this host" (isLocalAddress): only loopback is, unless a test says so.
-	hostAddrs = func() (map[string]string, error) {
-		return map[string]string{"127.0.0.1": "lo"}, nil
+	hostAddrs = func() (localAddrs, error) {
+		return localAddrs{"127.0.0.1": {Dev: "lo"}}, nil
 	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)

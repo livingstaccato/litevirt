@@ -26,10 +26,44 @@ import (
 // the host — but they need a kernel with nf_tables bridge support, the bridge
 // and veth drivers, and nft and ip on PATH. Opt in with
 // LITEVIRT_NFT_NETNS=1; the test re-executes itself inside the namespace.
+//
+// A kernel test that cannot run because a module is not loaded or nft is not
+// installed SKIPs, which reads like a pass. Set LITEVIRT_NFT_REQUIRE=1 (with
+// LITEVIRT_NFT_NETNS=1) and every such skip becomes a failure naming what is
+// missing; use it wherever the kernel tests are meant to prove something.
 const (
 	netnsOptIn = "LITEVIRT_NFT_NETNS"
+	nftRequire = "LITEVIRT_NFT_REQUIRE"
 	netnsChild = "LITEVIRT_NFT_NETNS_CHILD"
 )
+
+// skipper is the part of testing.TB the skip-or-require helpers use.
+type skipper interface {
+	Helper()
+	Skipf(string, ...any)
+	Fatalf(string, ...any)
+}
+
+// skipOrRequire skips the test, or fails it when LITEVIRT_NFT_REQUIRE=1: a
+// kernel test that silently skips proves nothing.
+func skipOrRequire(t skipper, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(nftRequire) == "1" {
+		t.Fatalf("%s=1 but the kernel test cannot run: %s", nftRequire, fmt.Sprintf(format, args...))
+		return
+	}
+	t.Skipf(format, args...)
+}
+
+// skipUnlessModules skips (fails under LITEVIRT_NFT_REQUIRE=1) when any of the
+// modules is neither loaded nor built in, naming them: a test must not make
+// the kernel load one.
+func skipUnlessModules(t skipper, what string, modules ...string) {
+	t.Helper()
+	if missing := missingModules(modules...); len(missing) > 0 {
+		skipOrRequire(t, "%s would make the kernel load %v, which is not loaded on this host", what, missing)
+	}
+}
 
 // TestKernel_NICGuard is the parent: it re-runs the child tests under
 // unshare and reports their output.
@@ -47,9 +81,9 @@ func TestKernel_NICGuard(t *testing.T) {
 	// kernel autoloads one the moment a ruleset uses it. Every module the
 	// rulesets below need must already be loaded (or built in), or the tests
 	// skip, saying which.
-	if missing := missingModules(kernelTestModules...); len(missing) > 0 {
-		t.Skipf("not running the kernel tests: they would make the kernel load %v, which is not loaded on this host; "+
-			"prove these properties on a lab VM instead", missing)
+	skipUnlessModules(t, "the kernel tests", kernelTestModules...)
+	if _, err := exec.LookPath("nft"); err != nil {
+		skipOrRequire(t, "nft is not on PATH")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -68,9 +102,11 @@ func TestKernel_NICGuard(t *testing.T) {
 		}
 	}
 	// Children with their own module list skip on their own when one is
-	// missing (saying which); they must not fail or vanish.
+	// missing (saying which); they must not fail or vanish. Under
+	// LITEVIRT_NFT_REQUIRE=1 they fail instead, so only a pass counts.
 	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_LogFormsLoad"} {
-		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
+		if !strings.Contains(string(out), "--- PASS: "+child) &&
+			(os.Getenv(nftRequire) == "1" || !strings.Contains(string(out), "--- SKIP: "+child)) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}
 	}
@@ -755,9 +791,7 @@ func probeCount(t *testing.T) int {
 //     and loosens nothing routed.
 func TestKernelChild_DefaultDenyAndBypasses(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
-		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
-	}
+	skipUnlessModules(t, "this test", "nf_conntrack_bridge")
 	l := newGuestLab(t, map[string]string{
 		"ga": "10.20.0.1", // may send icmp and udp/67
 		"gb": "10.20.0.2", // may receive icmp; sends nothing
@@ -886,9 +920,7 @@ func taggedType(src net.HardwareAddr, tpid, etype uint16, payload []byte, vids .
 // Each drop is then shown to pass with no table loaded.
 func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
-		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
-	}
+	skipUnlessModules(t, "this test", "nf_conntrack_bridge")
 	apply := func(p Plan) {
 		t.Helper()
 		if _, err := NewApplier(NftBinary{}).Apply(context.Background(), p); err != nil {
@@ -1212,9 +1244,7 @@ var compatCorpusModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_co
 // Mutation: render a port as stored — `dport SSH` is refused, red.
 func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules(compatCorpusModules...); len(missing) > 0 {
-		t.Skipf("the corpus rulesets would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the corpus rulesets", compatCorpusModules...)
 	plan := loadCompatPlan(t)
 	var rules []Rule
 	for _, r := range plan.ClusterRules {
@@ -1262,9 +1292,7 @@ var logFormsModules = append(append([]string(nil), compatCorpusModules...), "nft
 // moving `log group` after the prefix is not a mutation.)
 func TestKernelChild_LogFormsLoad(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules(logFormsModules...); len(missing) > 0 {
-		t.Skipf("the log rulesets would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the log rulesets", logFormsModules...)
 	budgets := []LogPolicy{
 		{Available: true, Group: 27, Default: true},
 		{Available: true, Group: 65535, Default: true, Rate: MaxLogRate, Burst: MaxLogBurst},

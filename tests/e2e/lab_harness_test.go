@@ -716,7 +716,41 @@ func (l *lab) restartDaemon(host string) error {
 		return err
 	}
 	l.mark("daemon: restarted on %s", host)
-	return l.waitDaemon(host, 3*time.Minute)
+	return l.waitServing(host, 3*time.Minute)
+}
+
+// hostStateInLs is host's state in `lv host ls` output ("" when not listed).
+func hostStateInLs(out, host string) string {
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[0] == host && strings.HasPrefix(f[2], "HOST_") {
+			return f[2]
+		}
+	}
+	return ""
+}
+
+// waitServing is waitDaemon plus: the host's own view lists it HOST_ACTIVE. A
+// restarted daemon answers its CLI while still recording HOST_DRAINING (the
+// "upgrading, serving after ~28 s" boot state), and a test that returns then
+// makes the next test's baseline fail. A host its own `host ls` does not list
+// at all (not yet a member) is not held to this.
+func (l *lab) waitServing(host string, timeout time.Duration) error {
+	start := time.Now()
+	if err := l.waitDaemon(host, timeout); err != nil {
+		return err
+	}
+	var state string
+	for time.Now().Before(start.Add(timeout)) {
+		if out, err := l.lv(host, "host", "ls"); err == nil {
+			if state = hostStateInLs(out, host); state == "" || state == "HOST_ACTIVE" {
+				l.mark("daemon: %s serving (%q) %v after the restart", host, state, time.Since(start).Round(time.Second))
+				return nil
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return fmt.Errorf("%s: daemon answers but is %q, not HOST_ACTIVE, %v after the restart", host, state, timeout)
 }
 
 // freezeDaemon SIGSTOPs host's litevirt daemon and returns the thaw. The

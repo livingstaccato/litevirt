@@ -659,9 +659,12 @@ func (w *leaseWatch) sampleOnce() {
 	}
 	w.mu.Unlock()
 	for _, r := range rs {
-		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL)")
-		if err != nil || len(rows) == 0 || len(rows[0]) < 2 {
+		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),'')")
+		if err != nil || len(rows) == 0 || len(rows[0]) < 3 {
 			continue
+		}
+		if !leaseSampleCoherent(rows[0][0], rows[0][2]) {
+			continue // a replica mid-catch-up: its election row and ledger disagree
 		}
 		term, _ := strconv.Atoi(rows[0][1])
 		c := leaseChange{At: time.Now(), Holder: rows[0][0], Term: term}
@@ -676,6 +679,15 @@ func (w *leaseWatch) sampleOnce() {
 		w.mu.Unlock()
 		return
 	}
+}
+
+// leaseSampleCoherent reports whether a replica's election holder and the
+// holder its ledger records for the newest term agree. A replica that has just
+// restarted still holds its own old election row beside a newer ledger term;
+// pairing the two reports a second holder at a term that had one. An empty
+// election holder (the lease is between tenures) pairs with any ledger row.
+func leaseSampleCoherent(electionHolder, ledgerHolder string) bool {
+	return electionHolder == "" || ledgerHolder == "" || electionHolder == ledgerHolder
 }
 
 func (w *leaseWatch) Stop() {
@@ -772,7 +784,9 @@ func (l *lab) handoverByStop(via, holder string, lw *leaseWatch) (leaseChange, b
 	if _, err := l.ssh(holder, time.Minute, "systemctl start litevirt"); err != nil {
 		l.t.Errorf("start litevirt on %s: %v", holder, err)
 	}
-	if err := l.waitDaemon(holder, 3*time.Minute); err != nil {
+	// Keep the holder avoided until it serves: its replica holds its own old
+	// leader_election row for a moment after the restart.
+	if err := l.waitServing(holder, 3*time.Minute); err != nil {
 		l.t.Errorf("%v", err)
 	}
 	l.mark("handover: started litevirt on %s again (new holder %q, moved=%v)", holder, next.Holder, ok)

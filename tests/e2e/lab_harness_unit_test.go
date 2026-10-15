@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestEnforcementEditScript runs the harness's config edit against real files:
@@ -126,6 +127,42 @@ func TestMinorityCopyStopped(t *testing.T) {
 	} {
 		if got := minorityCopyStopped(c.r, h, k); got != c.want {
 			t.Errorf("%s: minorityCopyStopped = %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// TestPollFor pins the wait helper getVMIP uses: it returns as soon as the
+// condition holds, and gives up once the next attempt would pass the bound.
+func TestPollFor(t *testing.T) {
+	n := 0
+	if _, ok := pollFor(time.Second, time.Millisecond, func() bool { n++; return n == 3 }); !ok || n != 3 {
+		t.Fatalf("ok=%v after %d calls, want true after 3", ok, n)
+	}
+	n = 0
+	if _, ok := pollFor(20*time.Millisecond, 5*time.Millisecond, func() bool { n++; return false }); ok || n < 2 {
+		t.Fatalf("ok=%v after %d calls, want false after several", ok, n)
+	}
+}
+
+// TestHostStateInLs pins the parse waitServing relies on.
+func TestHostStateInLs(t *testing.T) {
+	out := "NAME ADDR STATE\nnode-1 10.0.0.1 HOST_DRAINING x\nnode-2 10.0.0.2 HOST_ACTIVE x\n"
+	for host, want := range map[string]string{"node-1": "HOST_DRAINING", "node-2": "HOST_ACTIVE", "node-3": ""} {
+		if got := hostStateInLs(out, host); got != want {
+			t.Errorf("%s: %q, want %q", host, got, want)
+		}
+	}
+}
+
+// TestLeaseSampleCoherent pins the W3 fix: a restarted replica's stale election
+// holder must not be paired with the ledger's newer term.
+func TestLeaseSampleCoherent(t *testing.T) {
+	for _, c := range []struct {
+		election, ledger string
+		want             bool
+	}{{"node-4", "node-4", true}, {"node-2", "node-4", false}, {"", "node-4", true}, {"node-2", "", true}} {
+		if got := leaseSampleCoherent(c.election, c.ledger); got != c.want {
+			t.Errorf("(%q,%q) = %v, want %v", c.election, c.ledger, got, c.want)
 		}
 	}
 }

@@ -58,7 +58,9 @@ func gateFor(t *testing.T, c *Cluster, n *Node) *health.Checker {
 	// The stall heartbeat runs, as it does in the daemon (Checker.Start): the
 	// checker then reads a gap as a stall only when this process really
 	// stopped, not whenever a scenario step outlasts a probe tick between two
-	// gate reads (gate_heartbeat_test.go). Stopped before the cluster closes
+	// gate reads (gate_heartbeat_test.go). A scenario that also calls Start
+	// (runCheckers) still has one heartbeat: a checker's second returns at
+	// once. Stopped before the cluster closes
 	// the node's DB: cleanups run last-registered first.
 	hbCtx, hbStop := context.WithCancel(context.Background())
 	hbDone := make(chan struct{})

@@ -1296,16 +1296,20 @@ failover lease holder. A host's recoverable workloads stay paused, and nothing
 recovers them, because observers outside the voter majority still see the host
 answer: a host that reaches both halves of a split of the voters (a witness,
 or a host in maintenance) relays the minority's view. Nothing runs twice. It
-is raised in one of two forms:
+is raised in one of three forms:
 
 - **At the deadline.** The host was fenced relying on its partition pause, the
   wait passed, and its workloads were not recovered because observers had
   seen it answer since the fence. On a derived voter set (no generation
   adopted) any such observer holds the recovery; on an adopted generation it
-  is held while the host has not reported its pause. A store error reading
-  that report is not a bridge and raises nothing; the
-  `host.recovery.stalled` notification names it. The deadline is re-checked
-  every cycle; the condition resolves when it goes ahead, or when the refusal
+  is held while the host has not reported its pause during this outage. A
+  report stamped more than 5 s before the voters first lost the host counts
+  as an earlier outage's, so a host whose clock runs that far behind is held
+  for as long as the bridge lasts, though it paused; once no observer sees it
+  answer, the deadline recovers it. A store error reading that report is not
+  a bridge and raises nothing; the `host.recovery.stalled` notification names
+  it. The deadline is re-checked every cycle while a quorum of voters fails
+  the host (while fewer do, the notification says so); the condition resolves when it goes ahead, or when the refusal
   is no longer a bridge (a voter majority sees the host answer), and
   workloads its limit leaves on the host are named by the
   `host.recovery.stalled` notification instead.
@@ -1314,6 +1318,12 @@ is raised in one of two forms:
   the observers that see it answer leave too few voters failing it for a
   quorum. This is a witness bridge on a derived voter set, where the witness
   votes. Nothing is fenced or recovered.
+- **After a failed fence.** The host's fence failed (an `ipmi` or `redfish`
+  BMC that did not answer, say), and its retry is refused on every cycle
+  because observers saw the host answer after the attempt. Those observers
+  hold no voter majority, and the host has `partition_paused` open, so its
+  workloads are paused and held by the bridge rather than coming back. The
+  `host.recovery.stalled` notification names the refused retry too.
 
 The evidence names the paused `workloads`, the `observers` that see the host
 answer, whether the cluster is on a `derived_voter_set`, and the `remedy`:

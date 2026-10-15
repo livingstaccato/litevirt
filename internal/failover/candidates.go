@@ -89,8 +89,28 @@ func observationInstant(o HealthObservation, now time.Time) (inst time.Time, fre
 func FenceCandidates(in CandidateInputs) (cands []FenceCandidate, declined []RegionDecline) {
 	q := in.quorumView()
 	clusterQuorum := len(in.Voters.Voters)/2 + 1
-	fresh := map[string]map[string]struct{}{}
-	cluster := map[string]map[string]struct{}{}
+	fresh, cluster := countVoters(in)
+	for t, obs := range fresh {
+		if len(obs) >= q.quorum(t) {
+			cands = append(cands, FenceCandidate{Target: t, Observers: len(obs)})
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].Target < cands[j].Target })
+	for t, obs := range cluster {
+		if len(obs) >= clusterQuorum && len(fresh[t]) < q.quorum(t) {
+			declined = append(declined, RegionDecline{Target: t, ClusterObservers: len(obs), RegionObservers: len(fresh[t])})
+		}
+	}
+	sort.Slice(declined, func(i, j int) bool { return declined[i].Target < declined[j].Target })
+	return cands, declined
+}
+
+// countVoters is FenceCandidates' count: per target, the fresh voters of its
+// scope that report it down, and under region scope the cluster-wide voters.
+func countVoters(in CandidateInputs) (fresh, cluster map[string]map[string]struct{}) {
+	q := in.quorumView()
+	fresh = map[string]map[string]struct{}{}
+	cluster = map[string]map[string]struct{}{}
 	for _, o := range in.Observations {
 		inst, ok, _ := observationInstant(o, in.Now)
 		if !ok {
@@ -114,19 +134,19 @@ func FenceCandidates(in CandidateInputs) (cands []FenceCandidate, declined []Reg
 		}
 		fresh[o.Target][o.Observer] = struct{}{}
 	}
+	return fresh, cluster
+}
+
+// freshVoterCounts is, per target, the number of fresh voters of its scope
+// that report it down, counted exactly as FenceCandidates counts them,
+// including targets short of a quorum. Pure, like FenceCandidates.
+func freshVoterCounts(in CandidateInputs) map[string]int {
+	fresh, _ := countVoters(in)
+	out := make(map[string]int, len(fresh))
 	for t, obs := range fresh {
-		if len(obs) >= q.quorum(t) {
-			cands = append(cands, FenceCandidate{Target: t, Observers: len(obs)})
-		}
+		out[t] = len(obs)
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i].Target < cands[j].Target })
-	for t, obs := range cluster {
-		if len(obs) >= clusterQuorum && len(fresh[t]) < q.quorum(t) {
-			declined = append(declined, RegionDecline{Target: t, ClusterObservers: len(obs), RegionObservers: len(fresh[t])})
-		}
-	}
-	sort.Slice(declined, func(i, j int) bool { return declined[i].Target < declined[j].Target })
-	return cands, declined
+	return out
 }
 
 // inheritedRunGraceFrom is inheritedRunGrace over fence times already read.

@@ -26,19 +26,25 @@ table inet litevirt-fw {
 
     chain input {
         type filter hook input priority filter; policy accept;
-        iifname br-iso-a ct state established,related accept
+        iifname br-iso-a ct direction reply ct mark and 0xfff0000 == 0x8e80000 ct state established,related accept
         iifname br-iso-a ip protocol 112 accept
         iifname br-iso-a ip daddr 10.100.0.50 tcp dport 80 accept
         iifname br-iso-a ip daddr 10.100.0.50 tcp dport 443 accept
         iifname br-iso-a drop
-        iifname br-iso-z ct state established,related accept
+        iifname br-iso-z ct direction reply ct mark and 0xfff0000 == 0xddb0000 ct state established,related accept
         iifname br-iso-z drop
+    }
+
+    chain isolation_output {
+        type filter hook output priority filter; policy accept;
+        oifname br-iso-a ct state new ct mark set ct mark and 0xf000ffff or 0x8e80000
+        oifname br-iso-z ct state new ct mark set ct mark and 0xf000ffff or 0xddb0000
     }
 
     chain isolated_forward {
         type filter hook forward priority filter; policy accept;
-        iifname "br-iso-*" oifname != "br-iso-*" drop
-        oifname "br-iso-*" iifname != "br-iso-*" drop
+        iifgroup 27766 oifgroup != 27766 drop
+        oifgroup 27766 iifgroup != 27766 drop
     }
 
 }

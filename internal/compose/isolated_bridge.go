@@ -6,9 +6,16 @@ import (
 )
 
 // IsolatedBridgePrefix starts the name of every host bridge of an `isolated`
-// network (IsolatedBridgeName). The firewall drops forwarded traffic into and
-// out of any device with this prefix, whatever the database says.
+// network (IsolatedBridgeName). The name says nothing to the firewall: a
+// `bridge` network may have a bridge of that name too.
 const IsolatedBridgePrefix = "br-iso-"
+
+// IsolatedBridgeGroup is the interface group (`ip link set <br> group N`)
+// litevirt gives every bridge it creates for an `isolated` network. The
+// firewall drops anything routed between a device in the group and one
+// outside it, whatever the database says, so a bridge stays held to its host
+// once litevirt has marked it, even after its network row is gone.
+const IsolatedBridgeGroup = 27766
 
 // maxIfaceName is the Linux interface-name limit (IFNAMSIZ - 1).
 const maxIfaceName = 15

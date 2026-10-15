@@ -107,7 +107,7 @@ A NIC on a network with no record attaches to a flat bridge named after the
 network. A name longer than 15 characters (a stack network is `<stack>_<name>`)
 uses a stable hashed `lvf-<11 hex>` bridge instead; shorter names keep their own
 name. A `bridge` network whose bridge name (its `--iface`, or its own name)
-is over 15 characters, or starts with `br-iso-`, is refused at create. The cleanup of leftover flat stack bridges logs a removal that keeps
+is over 15 characters is refused at create. The cleanup of leftover flat stack bridges logs a removal that keeps
 failing once per bridge, not on every pass. The trunk VLANs a NIC on the
 `trunk:` feature may carry on a flat bridge are set with `lv network set
 <bridge> --allowed-vlans` (`network.update` at the cluster root); see
@@ -121,9 +121,10 @@ and two VMs on different hosts can be leased the same address.
 The firewall drops everything the host would route off an isolated bridge or
 onto it, including to another isolated network on the same host, so a guest
 there has no path out even on a host that forwards and whose uplink NATs any
-source. The drop covers every `br-iso-*` device, including one whose network
-row is gone, from the host's first firewall pass (see
-[firewall.md](firewall.md#nat-snat-and-host-isolation)).
+source. litevirt puts every isolated bridge it creates in an interface group
+the firewall matches, so the drop also covers one whose network row is gone;
+a daemon marks bridges an earlier build made when it provisions them again
+on its first pass (see [firewall.md](firewall.md#nat-snat-and-host-isolation)).
 
 ### SR-IOV
 

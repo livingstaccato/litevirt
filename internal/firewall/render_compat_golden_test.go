@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -124,13 +125,19 @@ func TestRenderCompatGolden(t *testing.T) {
 			t.Fatalf("%s: the isolated-network forward chain is missing", mode)
 		}
 		got = strings.Replace(got, iso.String(), "", 1)
-		// So does a host-isolated bridge's accept of replies to the host.
+		// So does a host-isolated bridge's accept of replies to connections
+		// the host opened onto it, and the output chain that marks those.
 		for _, c := range p.HostIsolation {
-			acc := "        iifname " + c.Bridge + " ct state established,related accept\n"
-			if !strings.Contains(got, acc) {
-				t.Fatalf("%s: %q is missing", mode, acc)
+			m := isolationMark(c.Bridge)
+			acc := fmt.Sprintf("        iifname %s ct direction reply ct mark and 0xfff0000 == %#x ct state established,related accept\n", c.Bridge, m)
+			out := fmt.Sprintf("    chain isolation_output {\n        type filter hook output priority filter; policy accept;\n"+
+				"        oifname %s ct state new ct mark set ct mark and 0xf000ffff or %#x\n    }\n\n", c.Bridge, m)
+			for _, piece := range []string{acc, out} {
+				if !strings.Contains(got, piece) {
+					t.Fatalf("%s: %q is missing", mode, piece)
+				}
+				got = strings.Replace(got, piece, "", 1)
 			}
-			got = strings.Replace(got, acc, "", 1)
 		}
 		golden.Assert(t, "testdata/render_compat_"+mode+".golden", got)
 	}

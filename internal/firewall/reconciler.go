@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/nictap"
 )
@@ -418,23 +417,6 @@ type LoaderOptions struct {
 	// Now is the loader's clock (time.Now when nil): how long a rule has
 	// referenced a missing set (emptySetGrace).
 	Now func() time.Time
-
-	// IsolatedBridgeLinks lists the isolated-network bridges that exist on
-	// this host (HostIsolatedBridgeLinks), whatever the network table says:
-	// one whose network was deleted while guests still use it is held to the
-	// host by name too. nil lists none.
-	IsolatedBridgeLinks func() []string
-}
-
-// HostIsolatedBridgeLinks lists this host's network devices whose name has
-// compose.IsolatedBridgePrefix.
-func HostIsolatedBridgeLinks() []string {
-	paths, _ := filepath.Glob("/sys/class/net/" + compose.IsolatedBridgePrefix + "*")
-	out := make([]string, 0, len(paths))
-	for _, p := range paths {
-		out = append(out, filepath.Base(p))
-	}
-	return out
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -797,22 +779,17 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 		}
 		sort.Strings(plan.Gateways)
-		// Every isolated network's bridge, from the network table and from the
-		// host's own links: forwarding off it is dropped (renderIsolatedForward).
+		// Every live isolated network's bridge: forwarding off it is dropped
+		// (renderIsolatedForward), as it is for every bridge in the group.
 		isolated := map[string]bool{}
 		for _, info := range nets {
 			if info.IsolatedBridge != "" {
 				isolated[info.IsolatedBridge] = true
 			}
 		}
-		if opts.IsolatedBridgeLinks != nil {
-			for _, br := range opts.IsolatedBridgeLinks() {
-				isolated[br] = true
-			}
-		}
 		plan.IsolatedBridges = plan.IsolatedBridges[:0:0]
 		for br := range isolated {
-			// The wildcard drop still holds a name the renderer would refuse.
+			// The group lines still hold a name the renderer would refuse.
 			if safeIfName(br) {
 				plan.IsolatedBridges = append(plan.IsolatedBridges, br)
 			}

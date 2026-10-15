@@ -63,7 +63,7 @@ func TestKernel_NICGuard(t *testing.T) {
 	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
 		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
 		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_IsolatedNetworkStaysOnHost",
-		"TestKernelChild_HostIsolationAnswersTheHost"} {
+		"TestKernelChild_HostIsolationAnswersTheHost", "TestKernelChild_HostIsolatedGatewayRoutesWithSNAT"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
@@ -699,7 +699,8 @@ func TestKernelChild_RulesHoldOnEveryPath(t *testing.T) {
 
 // TestKernelHelper_SendUDP is not a test: a kernel test runs it inside a guest
 // namespace to send one UDP datagram from a chosen source port
-// (LV_UDP_SEND="<sport> <daddr> <dport>").
+// (LV_UDP_SEND="<sport> <daddr> <dport> [<saddr> [<payload>]]"; a source
+// address the namespace does not hold is sent with IP_TRANSPARENT).
 func TestKernelHelper_SendUDP(t *testing.T) {
 	spec := os.Getenv("LV_UDP_SEND")
 	if spec == "" {
@@ -708,13 +709,41 @@ func TestKernelHelper_SendUDP(t *testing.T) {
 	f := strings.Fields(spec)
 	sport, _ := strconv.Atoi(f[0])
 	dport, _ := strconv.Atoi(f[2])
+	payload := "litevirt-probe"
+	if len(f) > 4 {
+		payload = f[4]
+	}
+	if len(f) > 3 {
+		// A source the namespace does not hold: IP_TRANSPARENT lets the
+		// socket bind and route from it.
+		lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+			var serr error
+			if err := rc.Control(func(fd uintptr) {
+				serr = syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+			}); err != nil {
+				return err
+			}
+			return serr
+		}}
+		pc, err := lc.ListenPacket(context.Background(), "udp4", net.JoinHostPort(f[3], f[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pc.Close()
+		for i := 0; i < 3; i++ {
+			if _, err := pc.WriteTo([]byte(payload), &net.UDPAddr{IP: net.ParseIP(f[1]), Port: dport}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return
+	}
 	c, err := net.DialUDP("udp4", &net.UDPAddr{Port: sport}, &net.UDPAddr{IP: net.ParseIP(f[1]), Port: dport})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 	for i := 0; i < 3; i++ {
-		_, _ = c.Write([]byte("litevirt-probe"))
+		_, _ = c.Write([]byte(payload))
 	}
 }
 
@@ -725,6 +754,17 @@ func sendUDP(t *testing.T, g string, sport int, daddr string, dport int) {
 	cmd.Env = append(os.Environ(), fmt.Sprintf("LV_UDP_SEND=%d %s %d", sport, daddr, dport))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("send udp from %s: %v\n%s", g, err, out)
+	}
+}
+
+// sendUDPFrom is sendUDP from a source address the guest may not hold, with
+// a payload to tell the datagram apart.
+func sendUDPFrom(t *testing.T, g, saddr string, sport int, daddr string, dport int, payload string) {
+	t.Helper()
+	cmd := exec.Command("ip", "netns", "exec", g, os.Args[0], "-test.run", "^TestKernelHelper_SendUDP$", "-test.count=1")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("LV_UDP_SEND=%d %s %d %s %s", sport, daddr, dport, saddr, payload))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("send udp from %s as %s: %v\n%s", g, saddr, err, out)
 	}
 }
 

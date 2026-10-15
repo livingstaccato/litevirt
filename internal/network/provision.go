@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,9 +48,8 @@ func FlatBridgeName(networkName string) string {
 // ValidateBridgeNetworkName refuses a plain bridge network whose bridge name
 // (its interface, or its own name when none is given) cannot be a Linux
 // interface: over 15 bytes the bridge can never be created, so the network would
-// persist and then fail every VM placed on it. A br-iso-* name is an isolated
-// network's, whose routed traffic the firewall drops. Other types name their
-// device themselves (hashed, VNI or a given interface).
+// persist and then fail every VM placed on it. Other types name their device
+// themselves (hashed, VNI or a given interface).
 func ValidateBridgeNetworkName(netType, networkName, iface string) error {
 	if netType != "" && netType != "bridge" {
 		return nil
@@ -60,9 +60,6 @@ func ValidateBridgeNetworkName(netType, networkName, iface string) error {
 	}
 	if len(dev) > maxIfaceName {
 		return fmt.Errorf("bridge name %q is %d bytes; a Linux interface name is at most %d. Give the network a shorter name or set --iface to a shorter bridge", dev, len(dev), maxIfaceName)
-	}
-	if strings.HasPrefix(dev, compose.IsolatedBridgePrefix) {
-		return fmt.Errorf("bridge name %q starts with %q, which names isolated networks' bridges: the firewall drops everything routed off or onto them. Choose another name", dev, compose.IsolatedBridgePrefix)
 	}
 	return nil
 }
@@ -186,6 +183,18 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				ScopeKey: scope, Bridge: bridge, Isolate: true,
 			}); err != nil {
 				return "", fmt.Errorf("record host-isolation intent for %s: %w", bridge, err)
+			}
+			// The guests' gateway, on a bridge litevirt made: the host routes
+			// for them (an LB's SNAT), as a vxlan network's IRB gateway does,
+			// and the isolation drop keeps every guest off the address itself.
+			// A bridge litevirt did not make, or one on a physical VLAN, has
+			// its router upstream, which this address would collide with.
+			if def.Subnet != "" && !onPhysicalVLAN && bridgeCreatedHere(bridge) {
+				if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil && gw != "" {
+					if out, err := execCommand("ip", "addr", "add", gw, "dev", bridge); err != nil && !isAlreadyExists(out) {
+						return "", fmt.Errorf("ip addr add %s dev %s: %w: %s", gw, bridge, err, out)
+					}
+				}
 			}
 		} else if !onPhysicalVLAN {
 			// Start DHCP only on a litevirt-managed bridge — a pre-existing
@@ -320,6 +329,13 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		out, err := execCommand("ip", "link", "add", bridge, "type", "bridge")
 		if err != nil && !isFileExists(out) {
 			return "", fmt.Errorf("ip link add isolated bridge: %w: %s", err, out)
+		}
+		// The interface group is what the firewall holds the bridge to the
+		// host by (compose.IsolatedBridgeGroup), set before the bridge is up.
+		// Every network is provisioned again on a daemon's first pass, which
+		// marks a bridge an earlier build made.
+		if out, err := execCommand("ip", "link", "set", bridge, "group", strconv.Itoa(compose.IsolatedBridgeGroup)); err != nil {
+			return "", fmt.Errorf("ip link set %s group %d: %w: %s", bridge, compose.IsolatedBridgeGroup, err, out)
 		}
 		out, err = execCommand("ip", "link", "set", bridge, "up")
 		if err != nil && !isFileExists(out) {

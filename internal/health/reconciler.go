@@ -25,6 +25,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pitoverlay"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/storage"
 )
@@ -1909,7 +1910,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						return
 					}
 					slog.Error("reconciler: auto-pull failed", "vm", vm.Name, "image", d.BackingImage, "error", pullErr)
-					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: a peer may return
+					// Transient — a peer may return — unless the image itself
+					// was refused as corrupt: every copy of it is the same
+					// bytes, so a retry can only be refused again.
+					r.failPendingStart(ctx, vm.Name, proofID, !qcow2.IsMisaligned(pullErr),
 						fmt.Sprintf("disk %s not found and image auto-pull failed: %v", d.DiskName, pullErr))
 					return
 				}
@@ -1928,7 +1932,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				newPath, createErr := recreate(vm.Name, d.DiskName, d.BackingImage, size)
 				if createErr != nil {
 					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
-					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: retry the overlay build
+					// Transient — retry the overlay build — unless the base
+					// image is one qemu refuses as corrupt: no retry mends it.
+					r.failPendingStart(ctx, vm.Name, proofID, !qcow2.IsMisaligned(createErr),
 						fmt.Sprintf("recreate disk %s: %v", d.DiskName, createErr))
 					return
 				}
@@ -2445,7 +2451,10 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	domXML, err = lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
-		return "", false, fmt.Sprintf("XML gen: %v", err) // non-retryable (bad config)
+		// Non-retryable (bad config), except a bridge whose MTU could not be
+		// read: a bridge being recreated is a transient failure, retried on a
+		// later pass like any other.
+		return "", lv.IsBridgeMTUReadError(err), fmt.Sprintf("XML gen: %v", err)
 	}
 	return domXML, false, ""
 }

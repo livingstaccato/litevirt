@@ -426,43 +426,52 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			return fmt.Errorf("security-group %q is already defined by %s (id %s); names must be unique", name, owner, held.ID)
 		}
 	}
-	// Every row is validated, and an IPv6 one's release feature taken, before
-	// the stack's rows are torn down (switch review m2, re-review N2): a
-	// refusal leaves them as they were, and a deploy refused for a malformed
+	// Every row is validated, and each release feature a row needs taken,
+	// before the stack's rows are torn down (switch review m2, re-review N2):
+	// a refusal leaves them as they were, and a deploy refused for a malformed
 	// row records no use.
-	anyV6 := false
+	needed := map[capabilities.Feature]bool{}
 	for name, sg := range f.SecurityGroups {
 		for _, r := range sg.Rules {
-			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
 			if err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
-			anyV6 = anyV6 || v6
+			for _, nf := range need {
+				needed[nf] = true
+			}
 		}
 	}
 	for name, set := range f.IPSets {
-		v6, err := corrosion.IPSetFamily(set.CIDRs)
+		need, err := ipSetFeatures(set.CIDRs)
 		if err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
-		anyV6 = anyV6 || v6
+		for _, nf := range need {
+			needed[nf] = true
+		}
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
-			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
 			if err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
-			anyV6 = anyV6 || v6
+			for _, nf := range need {
+				needed[nf] = true
+			}
 		}
 	}
-	if anyV6 {
+	for _, nf := range firewallGrantOrder {
+		if !needed[nf] {
+			continue
+		}
 		// The first use is taken — recorded and acknowledged by every
 		// recipient — before anything is torn down (switch re-review N2): a
 		// first use the gate cannot complete leaves every old row, the
 		// stack's default-deny included, as it was. The rows below then pass
 		// on the recorded use.
-		if err := s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, func(context.Context, capabilities.FeatureGrant) error {
+		if err := s.WithReleaseFeature(ctx, nf, func(context.Context, capabilities.FeatureGrant) error {
 			return nil
 		}); err != nil {
 			return err
@@ -513,9 +522,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
 			}
-			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
-			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g, row)
+			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -525,9 +534,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	// IP sets.
 	for name, set := range f.IPSets {
 		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
-		v6, invalid := corrosion.IPSetFamily(row.CIDRs)
-		if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-			return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
+		need, invalid := ipSetFeatures(row.CIDRs)
+		if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+			return corrosion.InsertIPSetWithGrant(ctx, s.db, g.IPv6, row)
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -541,9 +550,9 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
 			}
-			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
-			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
-				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
+			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
+				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}

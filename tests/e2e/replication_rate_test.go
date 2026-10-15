@@ -71,7 +71,9 @@ func TestReplicationRate_BwlimitPacesAScheduledRun(t *testing.T) {
 		t.Fatalf("root disk of %s: rows %v", vm, rows)
 	}
 	root := rows[0][0]
-	if out, err := l.ssh(h, 10*time.Minute, "qemu-io -f qcow2 -c 'write -P 0x5a 0 2G' "+shellQuote(root)); err != nil || !strings.Contains(out, "wrote") {
+	// The whole 2G disk, in two 1G writes: qemu-io refuses one write longer
+	// than 2147483136 bytes ("length cannot exceed ... without -n").
+	if out, err := l.ssh(h, 10*time.Minute, "qemu-io -f qcow2 -c 'write -P 0x5a 0 1G' -c 'write -P 0x5a 1G 1G' "+shellQuote(root)); err != nil || strings.Count(out, "wrote") != 2 {
 		t.Fatalf("fill %s with qemu-io: %v\n%s", root, err, out)
 	}
 
@@ -88,15 +90,20 @@ func TestReplicationRate_BwlimitPacesAScheduledRun(t *testing.T) {
 		if len(lines) == 0 {
 			t.Fatalf("schedule ls printed nothing")
 		}
-		col := strings.Index(lines[0], "RATE")
-		if col < 0 {
+		// Locate RATE by its position among the header's whitespace fields;
+		// no column before it holds a space, so rows split the same way.
+		idx := -1
+		for i, f := range strings.Fields(lines[0]) {
+			if f == "RATE" {
+				idx = i
+			}
+		}
+		if idx < 0 {
 			t.Fatalf("schedule ls has no RATE column:\n%s", out)
 		}
 		for _, line := range lines[1:] {
-			if strings.HasPrefix(line, vm+" ") && len(line) > col {
-				if f := strings.Fields(line[col:]); len(f) > 0 {
-					return f[0]
-				}
+			if f := strings.Fields(line); len(f) > idx && f[0] == vm {
+				return f[idx]
 			}
 		}
 		t.Fatalf("schedule ls has no row for %s:\n%s", vm, out)
@@ -176,7 +183,7 @@ func TestReplicationRate_BwlimitPacesAScheduledRun(t *testing.T) {
 	add("--bwlimit", "20MiB")
 	l.mustLV(h, "replication", "schedule", "rm", vm, "--target-pool", dstPool)
 	key := "replication_rate/" + vm + "/" + dstPool
-	if rr := l.mustSQL(h, "SELECT value FROM cluster_policies WHERE key = '"+key+"'"); len(rr) != 1 || rr[0][0] != "" {
+	if rr := l.mustSQL(h, "SELECT count(*), quote(value) FROM cluster_policies WHERE key = '"+key+"' AND value = ''"); len(rr) != 1 || rr[0][0] != "1" {
 		t.Errorf("after schedule rm, the rate record %s = %v, want one cleared row", key, rr)
 	}
 }

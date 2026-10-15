@@ -1148,6 +1148,7 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 	// The row is container_replication's data: every host must understand it,
 	// and this node's used record goes on its stream ahead of it. The gate's
 	// refusal ("the cluster upgrade must finish first") is returned as it is.
+	existed := s.scheduleRowLive(ctx, rec.VMName, rec.Repo)
 	ran := false
 	if err := s.WithReleaseFeature(ctx, capabilities.FeatureContainerReplication,
 		func(ctx context.Context, g capabilities.FeatureGrant) error {
@@ -1160,7 +1161,7 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule", ct.Name, "container project="+project+" target="+req.TargetHost+":"+req.TargetPool+" cron="+req.Cron, "ok")
-	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec); err != nil {
+	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec, existed); err != nil {
 		return nil, err
 	}
 	out := replScheduleToPB(rec)

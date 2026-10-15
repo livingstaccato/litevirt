@@ -224,6 +224,14 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 	if err := s.assertStoreBase(backingPath); err != nil {
 		return "", fmt.Errorf("base image %q: %w", backingImage, err)
 	}
+	// An image qemu would refuse as corrupt (an `lv image build` of a disk
+	// over 512 MiB, before its L2 tables were cluster-aligned) gets no new
+	// disk: reported here, by name, rather than as I/O errors in the guest
+	// booted from it. Reported only; the image file is left as it is. A VM
+	// already built on one is not refused its start by this.
+	if err := qcow2.AssertAligned(backingPath); err != nil {
+		return "", fmt.Errorf("base image %q: %w", backingImage, err)
+	}
 	if hook := s.testHooks.overlayResolved; hook != nil {
 		hook(backingPath)
 	}

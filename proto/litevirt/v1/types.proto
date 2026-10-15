@@ -181,6 +181,12 @@ message VMSpec {
     // <cputune><shares>; 1024 is the kernel default, range 2..262144).
     // 0 = leave at the default.
     int32  cpu_shares = 46;
+
+    // firewall_id is the VM's firewall identity, the key of its firewall tags.
+    // Server-owned once firewall tags land, whose writers strip a client's
+    // value (plan task D2b); on this build nothing reads it, and it is stored
+    // as sent.
+    string firewall_id = 47;
 }
 
 // USBDeviceSpec selects one host USB device for passthrough. Exactly one of
@@ -477,6 +483,7 @@ message FirewallRule {
     int32  priority   = 8;
     string comment    = 9;
     string stack_name = 10; // set when created from a compose file
+    bool   log        = 11; // log each packet the rule matches; action stays the plain verdict
 }
 
 // IpSet is a named CIDR list, referenced by rules as cidr = "@<name>".
@@ -512,6 +519,82 @@ message SecurityGroupRule {
     string cidr      = 6;  // CIDR or "@<ipset>"; empty = any
     string action    = 7;  // accept | drop | reject
     int32  priority  = 8;  // lower runs first
+    bool   log       = 9;  // log each packet the rule matches; action stays the plain verdict
+}
+
+// FirewallSynfloodPolicy is the SYN-flood protection policy of one scope.
+message FirewallSynfloodPolicy {
+    string scope      = 1;  // "cluster" | <host name>
+    string mode       = 2;  // on | off
+    uint32 rate       = 3;  // new SYNs per second per (guest NIC, source address)
+    uint32 burst      = 4;  // packets
+    string set_by     = 5;
+    string updated_at = 6;
+    bool   inherited  = 7;  // a host with no row of its own: the cluster policy applies
+}
+
+// FirewallLogPolicy is the firewall log policy of one scope.
+message FirewallLogPolicy {
+    string scope          = 1;  // "cluster" | <host name>
+    bool   default_policy = 2;  // log the default verdict
+    uint32 rate           = 3;  // per-NIC log budget, records per second
+    uint32 burst          = 4;
+    string set_by         = 5;
+    string updated_at     = 6;
+    bool   inherited      = 7;  // a host with no row of its own: the cluster policy applies
+}
+
+// FirewallLogEntry is one logged packet.
+message FirewallLogEntry {
+    string host      = 1;
+    uint64 seq       = 2;   // per-host sequence, the follow cursor
+    string time      = 3;   // RFC 3339
+    string workload  = 4;
+    string mac       = 5;
+    string device    = 6;
+    string side      = 7;   // in | out
+    string rule_id   = 8;   // the rule id, or "default"
+    string tier      = 9;
+    string verdict   = 10;  // accept | drop | reject | would-drop
+    string family    = 11;  // ip | ip6
+    string proto     = 12;
+    string src       = 13;
+    uint32 sport     = 14;
+    string dst       = 15;
+    uint32 dport     = 16;
+    uint32 length    = 17;
+    string tcp_flags = 18;
+}
+
+// FirewallTagGroup is a named selector over firewall tags.
+message FirewallTagGroup {
+    string                      name            = 1;
+    map<string, string>         match           = 2;  // ANDed; an empty value means "has the key"
+    repeated string             networks        = 3;  // limits the group binding; empty = every network
+    repeated string             security_groups = 4;
+    string                      set_by          = 5;
+    string                      updated_at      = 6;
+    repeated FirewallTagMember  members         = 7;  // only when asked for
+}
+
+// FirewallTagMember is one workload a tag group matches.
+message FirewallTagMember {
+    string          kind         = 1;  // vm | container
+    string          workload     = 2;
+    string          host         = 3;
+    repeated string addresses    = 4;
+    string          address_note = 5;  // why a member has no address
+}
+
+// FirewallTags is one workload's firewall tags.
+message FirewallTags {
+    string              kind       = 1;  // vm | container
+    string              workload   = 2;
+    string              host       = 3;
+    string              fw_id      = 4;  // the workload's firewall identity
+    map<string, string> tags       = 5;
+    string              set_by     = 6;
+    string              updated_at = 7;
 }
 
 message PCIDevice {

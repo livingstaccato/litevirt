@@ -240,7 +240,8 @@ An explicit MTU that is not its bridge's is refused, larger or smaller:
 litevirt does not set a bridge's MTU (VXLAN aside), so set it on the host
 first. Keep a network's bridge MTU the same on every host: a migration to a host
 whose bridge differs is refused before anything moves, and a failover start
-there fails.
+there fails. A bridge whose MTU cannot be read there (being recreated, say) is
+retried on a later pass.
 
 Only virtio NICs on a bridged network take an MTU; macvtap (direct) and SR-IOV
 networks do not. `lv attach-nic` takes no MTU: attach the NIC, then set it with

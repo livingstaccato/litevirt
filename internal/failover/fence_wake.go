@@ -303,6 +303,7 @@ func (c *Coordinator) forgetHost(host string) {
 	delete(c.holdReason, host)
 	delete(c.stallSince, host)
 	delete(c.stallAlerted, host)
+	delete(c.stallUnfenced, host)
 	delete(c.pauseWaits, host)
 	delete(c.ha.heldRecovery, host)
 	c.forgetClaimRetries(host)
@@ -312,17 +313,22 @@ func (c *Coordinator) forgetHost(host string) {
 // alertStalledRecoveries raises the stall alert for every fenced or offline
 // host that still has recoverable workloads recoveryStallAfter after its
 // fence record, at most once per recoveryStallRepeat per host. pending is
-// strandedByHost's count, per host.
+// strandedByHost's count, per host, plus heldBeforeFence's: unfenced names
+// those, quorum-down hosts an HA hold kept from being fenced, which are still
+// recorded active.
 //
 // The stall clock starts at the newest fencing_log row of the host when this
 // coordinator first sees it stalled (or now, when there is none), and is held
 // in memory, so retried fences do not restart it. A new leader or a restart
-// starts it again from the newest row, which only ever delays the alert.
-func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[string]int) {
+// starts it again from the newest row, which only ever delays the alert. An
+// unfenced host's clock starts now: a fence row it has is from an earlier
+// outage. Once it is fenced, its clock starts again from that fence.
+func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[string]int, unfenced map[string]bool) {
 	for host := range c.stallSince {
-		if pending[host] == 0 {
+		if pending[host] == 0 || (c.stallUnfenced[host] && !unfenced[host]) {
 			delete(c.stallSince, host)
 			delete(c.stallAlerted, host)
+			delete(c.stallUnfenced, host)
 		}
 	}
 	now := c.now()
@@ -336,7 +342,12 @@ func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[st
 		since, ok := c.stallSince[host]
 		if !ok {
 			since = now
-			if at, found := c.newestFenceRow(ctx, host); found && at.Before(now) {
+			if unfenced[host] {
+				if c.stallUnfenced == nil {
+					c.stallUnfenced = map[string]bool{}
+				}
+				c.stallUnfenced[host] = true
+			} else if at, found := c.newestFenceRow(ctx, host); found && at.Before(now) {
 				since = at
 			}
 			c.stallSince[host] = since
@@ -365,7 +376,11 @@ func (c *Coordinator) alertStalledRecoveries(ctx context.Context, pending map[st
 		if held := c.unpausedHeldReason(host); held != "" {
 			reason = held + "; " + reason
 		}
-		slog.Error("failover: recovery of a fenced host has stalled",
+		msg := "failover: recovery of a fenced host has stalled"
+		if unfenced[host] {
+			msg = "failover: a quorum-down host is held unfenced, and its recovery with it"
+		}
+		slog.Error(msg,
 			"host", host, "coordinator", c.hostName, "pending", n,
 			"since", since.UTC().Format(time.RFC3339), "reason", reason)
 		c.publish(EventRecoveryStalled, host, fmt.Sprintf("coordinator=%s pending=%d since=%s reason=%s",

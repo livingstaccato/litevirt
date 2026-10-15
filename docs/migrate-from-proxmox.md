@@ -145,7 +145,7 @@ relied on is set in the compose file after the import (or with `lv disk-io`):
 | `scsi0: ...,iops_rd=500,iops_wr=500` | `iotune: { read_iops_sec: 500, write_iops_sec: 500 }` |
 | `scsi0: ...,mbps_rd_max=200` | `iotune: { read_bytes_sec: 100M, read_bytes_sec_max: 200M }` |
 | `net0: virtio=...,queues=4` | `network[].queues: 4` (or `auto`) |
-| `net0: virtio=...,mtu=9000` (`mtu=1`: the bridge's) | `network[].mtu: 9000` (`mtu: bridge`); must equal the bridge's MTU. `lv import` carries it once the release token has latched (feature `nic_mtu`) and warns either way; before that it drops it |
+| `net0: virtio=...,mtu=9000` (`mtu=1`: the bridge's) | `network[].mtu: 9000` (`mtu: bridge`); must equal the bridge's MTU. `lv import` carries it once the release token has latched (feature `nic_mtu`) and warns either way; before that it drops it. A kept MTU the target bridge does not equal refuses the import before any disk is converted |
 
 ## Step 4 — Migrate one container
 

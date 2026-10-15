@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -102,11 +103,12 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		Incremental:  req.Incremental,
 		AutoPromote:  req.AutoPromote,
 	}
+	existed := s.scheduleRowLive(ctx, rec.VMName, rec.Repo)
 	if err := corrosion.UpsertBackupSchedule(ctx, s.db, rec); err != nil {
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule", req.VmName, "target="+req.TargetPool+" cron="+req.Cron, "ok")
-	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec); err != nil {
+	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec, existed); err != nil {
 		return nil, err
 	}
 	out := replScheduleToPB(rec)
@@ -122,9 +124,10 @@ func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplica
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
 	}
+	// A listing never fails over the limits: unreadable, they are left out.
 	rates, err := corrosion.ListReplicationRates(ctx, s.db)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list replication rates: %v", err)
+		slog.Warn("list replication schedules: bandwidth limits not read", "error", err)
 	}
 	resp := &pb.ListReplicationSchedulesResponse{}
 	for _, r := range rows {

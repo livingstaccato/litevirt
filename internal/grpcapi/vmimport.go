@@ -209,6 +209,17 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// A NIC MTU from the source is kept only under the nic_mtu grant; before
+	// the feature is open it is dropped with a warning, never refusing the
+	// import. One that is kept and that this host's bridge cannot carry is
+	// refused here, before the conversion, not at the render after it.
+	mtuG := s.importNICMTUGrant(ctx, fv)
+	mtuCfg := fv.ToVMConfig()
+	s.withNICMTU(&mtuCfg)
+	if err := lv.CheckNICMTUs(mtuCfg); err != nil {
+		return renderStatus("check NIC MTUs", err)
+	}
+
 	// ── Convert each data disk → qcow2 in the target pool ──
 	poolDir, err := s.importPoolDir(ctx, first.TargetPool)
 	if err != nil {
@@ -371,11 +382,6 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		defer hostLease.release(ctx)
 	}
-
-	// A NIC MTU from the source is kept only under the nic_mtu grant; before
-	// the feature is open it is dropped with a warning, never refusing the
-	// import.
-	mtuG := s.importNICMTUGrant(ctx, fv)
 
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()

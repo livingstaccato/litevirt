@@ -390,7 +390,20 @@ func (s *Server) nicMTUPreflight(ctx context.Context, vm *corrosion.VMRecord, ta
 	// nothing.
 	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vm.Name, InstallerIsoListed: true, NicMtu: mtus})
 	if err != nil {
-		return status.Errorf(status.Code(err), "%s could not check the NIC MTUs of VM %q: %s", targetHost, vm.Name, status.Convert(err).Message())
+		return nicMTUPreflightError(targetHost, vm.Name, err)
 	}
 	return nicMTURefusal(vm.Name, targetHost, resp.GetNicMtuProblem())
+}
+
+// nicMTUPreflightError is the error of a failed preflight EnsureDisks. Once
+// the MTUs match, the target goes on to its other checks (the installer ISO,
+// the ceph secrets), so an answer is the target refusing the move, in its own
+// words and code; only a target that could not be asked failed the MTU check.
+func nicMTUPreflightError(targetHost, vmName string, err error) error {
+	code, msg := status.Code(err), status.Convert(err).Message()
+	switch code {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return status.Errorf(code, "could not ask %s to check the NIC MTUs of VM %q: %s", targetHost, vmName, msg)
+	}
+	return status.Errorf(code, "%s refused the move of VM %q: %s", targetHost, vmName, msg)
 }

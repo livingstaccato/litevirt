@@ -75,6 +75,9 @@ type haDisarmState struct {
 	// heldRecovery names hosts whose recovery a hold interrupted after its
 	// fence; resumed from the fence loop once the hold lifts.
 	heldRecovery map[string]bool
+	// heldCandidates are this cycle's fence candidates that haHold stopped at
+	// the candidate site, before any fence (heldBeforeFence).
+	heldCandidates map[string]bool
 	// cycleVetoes are this cycle's peer vetoes (no_quorum excluded), by voter.
 	cycleVetoes map[string]haVeto
 	vetoCond    *health.HACondition
@@ -202,6 +205,62 @@ func (c *Coordinator) noteHAHold(target, why string) {
 	if target != "" {
 		c.noteHold(target, why)
 	}
+}
+
+// noteHeldCandidate records that the candidate site held target this cycle.
+func (c *Coordinator) noteHeldCandidate(target string) {
+	if c.ha.heldCandidates == nil {
+		c.ha.heldCandidates = map[string]bool{}
+	}
+	c.ha.heldCandidates[target] = true
+}
+
+// heldBeforeFence counts the recoverable workloads (strandedByHost's rules)
+// on each fence candidate an HA hold stopped this cycle while it is still
+// recorded active, or upgrading past upgradingTimeout (inside it, the host is
+// not fenced armed either): a host that failed while HA was disarmed.
+// Nothing has fenced it, so nothing has written it offline, and
+// strandedByHost, which counts only fenced and offline hosts, never names it.
+// The hold is not recorded in its state: 'offline' is read across the cluster
+// as known down (voter eligibility, a cold move's source, a partition pause's
+// view of its own host), and the coordinator skips an offline host with no
+// fence record for good, so the fence an arm owes it would never run. This
+// only reports. A read error is logged and reports nothing.
+func (c *Coordinator) heldBeforeFence(ctx context.Context) map[string]int {
+	if len(c.ha.heldCandidates) == 0 {
+		return nil
+	}
+	// Read once per cycle, as strandedByHost does: a full scan.
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	if err != nil {
+		slog.Warn("failover: count the workloads of hosts held by HA", "error", err)
+		return nil
+	}
+	held := map[string]int{}
+	for host := range c.ha.heldCandidates {
+		h, err := corrosion.GetHost(ctx, c.db, host)
+		if err != nil {
+			slog.Warn("failover: count the workloads of a host held by HA", "host", host, "error", err)
+			continue
+		}
+		if h == nil || (h.State != "active" && h.State != "upgrading") {
+			continue
+		}
+		if h.State == "upgrading" {
+			if _, within := c.upgradingGrace(ctx, h); within {
+				continue
+			}
+		}
+		w, err := c.recoverableWith(ctx, host, enrolled)
+		if err != nil {
+			slog.Warn("failover: count the workloads of a host held by HA", "host", host, "error", err)
+			continue
+		}
+		if len(w) > 0 {
+			held[host] = len(w)
+		}
+	}
+	return held
 }
 
 // noteHAHeldRecovery remembers that host's recovery was held after its fence,

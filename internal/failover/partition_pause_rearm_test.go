@@ -95,7 +95,7 @@ func TestPartitionPauseRearm_TheStallReasonNamesTheRefusal(t *testing.T) {
 		}
 	}
 	c.stallSince = map[string]time.Time{"down": time.Now().Add(-2 * recoveryStallAfter)}
-	c.alertStalledRecoveries(ctx, map[string]int{"down": 1})
+	c.alertStalledRecoveries(ctx, map[string]int{"down": 1}, nil)
 	if !strings.Contains(got, "refused at the partition-pause deadline") {
 		t.Fatalf("the stall alert reads %q; want the refusal named", got)
 	}

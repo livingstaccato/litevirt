@@ -196,3 +196,94 @@ func TestProto_OpsBundleFieldsRoundTrip(t *testing.T) {
 		t.Errorf("EnsureDisksRequest JSON %s has no nicMtu", js)
 	}
 }
+
+// The firewall extras' fields, messages and RPCs (SYN-flood protection,
+// logging, tag groups) keep the numbers they were given. The numbers were
+// checked free against the integration head and every fork branch.
+func TestProtoNumbers_FirewallExtras(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.FirewallRule{}, 11, "log"},
+		{&pb.SecurityGroupRule{}, 9, "log"},
+		{&pb.VMSpec{}, 47, "firewall_id"},
+
+		{&pb.FirewallSynfloodPolicy{}, 1, "scope"},
+		{&pb.FirewallSynfloodPolicy{}, 2, "mode"},
+		{&pb.FirewallSynfloodPolicy{}, 3, "rate"},
+		{&pb.FirewallSynfloodPolicy{}, 4, "burst"},
+		{&pb.FirewallSynfloodPolicy{}, 5, "set_by"},
+		{&pb.FirewallSynfloodPolicy{}, 6, "updated_at"},
+		{&pb.FirewallSynfloodPolicy{}, 7, "inherited"},
+
+		{&pb.FirewallLogPolicy{}, 1, "scope"},
+		{&pb.FirewallLogPolicy{}, 2, "default_policy"},
+		{&pb.FirewallLogPolicy{}, 3, "rate"},
+		{&pb.FirewallLogPolicy{}, 4, "burst"},
+		{&pb.FirewallLogPolicy{}, 5, "set_by"},
+		{&pb.FirewallLogPolicy{}, 6, "updated_at"},
+		{&pb.FirewallLogPolicy{}, 7, "inherited"},
+
+		{&pb.FirewallLogEntry{}, 1, "host"},
+		{&pb.FirewallLogEntry{}, 2, "seq"},
+		{&pb.FirewallLogEntry{}, 3, "time"},
+		{&pb.FirewallLogEntry{}, 4, "workload"},
+		{&pb.FirewallLogEntry{}, 5, "mac"},
+		{&pb.FirewallLogEntry{}, 6, "device"},
+		{&pb.FirewallLogEntry{}, 7, "side"},
+		{&pb.FirewallLogEntry{}, 8, "rule_id"},
+		{&pb.FirewallLogEntry{}, 9, "tier"},
+		{&pb.FirewallLogEntry{}, 10, "verdict"},
+		{&pb.FirewallLogEntry{}, 11, "family"},
+		{&pb.FirewallLogEntry{}, 12, "proto"},
+		{&pb.FirewallLogEntry{}, 13, "src"},
+		{&pb.FirewallLogEntry{}, 14, "sport"},
+		{&pb.FirewallLogEntry{}, 15, "dst"},
+		{&pb.FirewallLogEntry{}, 16, "dport"},
+		{&pb.FirewallLogEntry{}, 17, "length"},
+		{&pb.FirewallLogEntry{}, 18, "tcp_flags"},
+
+		{&pb.FirewallTagGroup{}, 1, "name"},
+		{&pb.FirewallTagGroup{}, 2, "match"},
+		{&pb.FirewallTagGroup{}, 3, "networks"},
+		{&pb.FirewallTagGroup{}, 4, "security_groups"},
+		{&pb.FirewallTagGroup{}, 5, "set_by"},
+		{&pb.FirewallTagGroup{}, 6, "updated_at"},
+		{&pb.FirewallTagGroup{}, 7, "members"},
+
+		{&pb.FirewallTagMember{}, 1, "kind"},
+		{&pb.FirewallTagMember{}, 2, "workload"},
+		{&pb.FirewallTagMember{}, 3, "host"},
+		{&pb.FirewallTagMember{}, 4, "addresses"},
+		{&pb.FirewallTagMember{}, 5, "address_note"},
+
+		{&pb.FirewallTags{}, 1, "kind"},
+		{&pb.FirewallTags{}, 2, "workload"},
+		{&pb.FirewallTags{}, 3, "host"},
+		{&pb.FirewallTags{}, 4, "fw_id"},
+		{&pb.FirewallTags{}, 5, "tags"},
+		{&pb.FirewallTags{}, 6, "set_by"},
+		{&pb.FirewallTags{}, 7, "updated_at"},
+
+		{&pb.SetFirewallTagsRequest{}, 1, "kind"},
+		{&pb.SetFirewallTagsRequest{}, 2, "workload"},
+		{&pb.SetFirewallTagsRequest{}, 3, "host"},
+		{&pb.SetFirewallTagsRequest{}, 4, "set"},
+		{&pb.SetFirewallTagsRequest{}, 5, "remove"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range firewallExtrasRPCs() {
+		if svc.Methods().ByName(protoreflect.Name(rpc)) == nil {
+			t.Errorf("RPC %s is missing", rpc)
+		}
+	}
+}

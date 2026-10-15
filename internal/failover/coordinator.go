@@ -377,6 +377,14 @@ type Coordinator struct {
 	// operator confirmation's), on this coordinator's clock: the authority a
 	// claim retry owed to that recovery acts on (claimRetryOutageOver).
 	claimRetryAt map[string]time.Time
+	// claimRetryMono is claimRetryAt on this node's monotonic clock, the one
+	// LastContact reports on: a healthy probe of the host by this node after
+	// it ends the outage the retry is owed to (claimRetryOutageOver).
+	claimRetryMono map[string]time.Time
+	// claimRetryHeld records, per host, the state in which an owed claim
+	// retry was last held for not being fenced or offline, so the hold is
+	// logged once per state (claimRetryOutageOver).
+	claimRetryHeld map[string]string
 	// relocDeferred records, per proof ID, when this coordinator first saw a
 	// container relocation decided for ANOTHER coordinator that it has not
 	// seen carried out. It completes that relocation itself only once the
@@ -1315,7 +1323,8 @@ func (c *Coordinator) forgetEpisodes() {
 	c.confirmResumed = make(map[string]string)
 	c.fencedOn, c.lastFenceAt = nil, nil
 	c.pauseWaits = nil
-	c.claimRetry, c.claimRetryProposals, c.claimRetryAt = nil, nil, nil
+	c.claimRetry, c.claimRetryProposals, c.claimRetryAt, c.claimRetryMono = nil, nil, nil, nil
+	c.claimRetryHeld = nil
 	c.recoverOnly, c.unpausedHeld = nil, nil
 	c.relocDeferred = nil
 	c.retrying = nil
@@ -2356,9 +2365,12 @@ const fenceSkewMargin = 5 * time.Second
 //     verdict that it answered is overwritten by the next failing one, and
 //     only the run's start betrays it;
 //   - nobody has seen the host answer since: no observer's latest verdict
-//     about it, healthy or unready, is newer than the fence. A host that
-//     answered a probe after a verified power-off was powered on again, and a
-//     host that answered after a best-effort one was never off.
+//     about it, healthy or unready, is newer than the fence, and no
+//     observer's failing run began after it (restartedSinceObserversIn) — a
+//     run that starts after the fence follows an answer the next failing
+//     verdict overwrote. A host that answered a probe after a verified
+//     power-off was powered on again, and a host that answered after a
+//     best-effort one was never off.
 func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time.Time) (string, bool) {
 	why, _, ok := c.fenceStillStandsIn(c.readHostHealth(ctx, host), host, at)
 	return why, ok
@@ -2370,7 +2382,58 @@ func (c *Coordinator) fenceStillStandsIn(hr healthRead, host string, at time.Tim
 	if !c.streakSpansIn(hr, host, at) {
 		return whyNoStreakSpans, nil, false
 	}
-	return c.answeredSinceIn(hr, host, at)
+	why, obs, ok := c.answeredSinceIn(hr, host, at)
+	if !ok {
+		return why, obs, false
+	}
+	if obs := restartedSinceObserversIn(hr, host, at); len(obs) > 0 {
+		return whyRestarted(obs), obs, false
+	}
+	return "", nil, true
+}
+
+// restartedSinceObserversIn names the observers whose current failing run
+// about host began more than fenceSkewMargin after at, sorted: each saw the
+// host answer after at, and its next failed probe overwrote that verdict, so
+// only the run's start (the row's last_seen) still shows it. host itself is
+// not one. A row with no run start (an older build's, last_seen NULL) is not
+// read: its start is only estimated, and the estimate drifts later the longer
+// the run goes on (observerRunStart). Like answeredSinceObserversIn, any
+// observer counts and a stale row counts too: this only ever refuses. An
+// observer that restarted its own daemon, or began probing the host only
+// after at, also starts a run after at and refuses, for an operator.
+func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []string {
+	var out []string
+	for _, r := range hr.rows {
+		if r.String("observer") == host || r.String("status") == health.StatusUnready {
+			continue
+		}
+		if r.Int("consecutive_failures") <= 0 {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok {
+			continue
+		}
+		started, ok := corrosion.ParseUpdatedAt(r.String("last_seen"))
+		if !ok || started.After(upd) {
+			continue
+		}
+		if started.After(at.Add(fenceSkewMargin)) {
+			out = append(out, r.String("observer"))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// whyRestarted is the refusal reason naming the observers whose failing run
+// began after the fence.
+func whyRestarted(observers []string) string {
+	if len(observers) == 1 {
+		return "observer " + observers[0] + "'s failing run began after the fence, so it saw the host answer since"
+	}
+	return "observers " + strings.Join(observers, ",") + "' failing runs began after the fence, so they saw the host answer since"
 }
 
 // healthRead is one read of host_health about a host (readHostHealth), the
@@ -2868,7 +2931,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	}
 	// The operator's word is that the host is off now: a claim retry this
 	// recovery leaves owed acts on this moment (claimRetryOutageOver).
-	c.noteRecoveryAt(target, c.now())
+	c.noteRecoveryAt(target, c.now(), c.mono())
 	c.recoverWorkloads(ctx, h)
 	return true
 }
@@ -3404,7 +3467,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.
-	c.noteRecoveryAt(h.Name, c.now())
+	c.noteRecoveryAt(h.Name, c.now(), c.mono())
 	c.recoverWorkloads(ctx, h)
 }
 

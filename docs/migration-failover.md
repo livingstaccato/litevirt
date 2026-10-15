@@ -978,12 +978,15 @@ What happens next depends on the fence:
   progress.
 
 **A fence still stands** when some observer has probed the host and failed
-without a break since before the fence, and no observer's latest verdict shows
-the host answering (healthy or unready) since. The first holds however recent
-the fence is. A genuine fence follows a quorum of failing runs, so it always has
-one. A host that answered after its fence and then failed again has had the
-verdict that it answered overwritten, and only the failing runs' start shows the
-return.
+without a break since before the fence, no observer's latest verdict shows
+the host answering (healthy or unready) since, and no observer's failing run
+began after the fence. The first holds however recent the fence is. A genuine
+fence follows a quorum of failing runs, so it always has one. A host that
+answered after its fence and then failed again has had the verdict that it
+answered overwritten, and only the failing runs' start shows the return: a run
+that began more than 5 seconds after the fence counts as an answer. An observer
+that restarted, or began probing the host only after the fence, starts such a
+run too, and the fence then no longer stands.
 
 **When a failing run started** is read from the verdict: an observer's failing
 `host_health` row carries the time of its run's first failed probe in
@@ -997,7 +1000,8 @@ outage until an observer on the current build reports the host.
 **Clock skew.** The fence's time is the leader's clock and each observation is
 its observer's, so both comparisons give 5 seconds, the clock-skew alert
 threshold, to the safe side. A failing run must have begun at least 5 seconds
-before the fence, and an answer counts from 5 seconds before it. Greater skew
+before the fence, an answer counts from 5 seconds before it, and a run begun
+more than 5 seconds after it counts as an answer. Greater skew
 makes the checks refuse more, except in one direction: an observer whose clock
 runs more than 5 seconds **behind** the leader's can make a run look older than
 it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see

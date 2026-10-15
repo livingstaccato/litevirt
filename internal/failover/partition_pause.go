@@ -203,7 +203,7 @@ func (c *Coordinator) retryPauseWait(ctx context.Context, host string) bool {
 	// A claim retry this recovery leaves owed acts on this wait's start, the
 	// moment the fence (or a retry's fresh wait) began it, and no observer
 	// may have seen the host answer since (claimRetryOutageOver).
-	c.noteRecoveryAt(host, w.fenceAt)
+	c.noteRecoveryAt(host, w.fenceAt, w.deadline.Add(-w.wait))
 	c.recoverWorkloads(ctx, h)
 	return true
 }

@@ -168,11 +168,20 @@ func TestWitnessQ3_ARetryIsNotRunOnAHostThatLeftOfflineDuringItsFreshWait(t *tes
 	if err := corrosion.UpdateHostState(ctx, db, "down", "upgrading"); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	relying := strings.Count(buf.String(), "relying on the host's partition pause")
+	for i := 0; i < 4; i++ {
 		c.run(ctx)
 		if got := vmHost(t, db, ctx); got != "down" {
 			t.Fatalf("cycle %d: VM recovered to %q on a retry owed to the earlier outage, off an 'upgrading' host", i+1, got)
 		}
+	}
+	// Round 2 (concern 5): the held retry starts no fresh wait for retryPauseWait
+	// to drop, cycle after cycle, and says it is held once.
+	if n := strings.Count(buf.String(), "relying on the host's partition pause") - relying; n != 0 {
+		t.Fatalf("%d fresh waits started for an 'upgrading' host while its retry is held", n)
+	}
+	if n := strings.Count(buf.String(), "claim retry is held while the host is neither fenced nor offline"); n != 1 {
+		t.Fatalf("the held retry was logged %d times over 4 cycles in one state, want once", n)
 	}
 	if *decides != 1 {
 		t.Fatalf("a retry made a claim (%d in all) for an 'upgrading' host", *decides)
@@ -324,7 +333,7 @@ func TestClaimRetryOutageOver_AReadFailureSkipsTheHost(t *testing.T) {
 	ctx := context.Background()
 	c.fenced["dead"] = true
 	c.retryClaimsFor("dead")
-	c.noteRecoveryAt("dead", time.Now())
+	c.noteRecoveryAt("dead", time.Now(), time.Now())
 	if err := db.Execute(ctx, `ALTER TABLE hosts RENAME TO hosts_away`); err != nil {
 		t.Fatal(err)
 	}
@@ -337,5 +346,97 @@ func TestClaimRetryOutageOver_AReadFailureSkipsTheHost(t *testing.T) {
 	}
 	if !c.claimRetry["dead"] || !c.fenced["dead"] {
 		t.Fatal("a read failure re-judged the retry")
+	}
+}
+
+// Round 2, the I-1 gap: every observer that saw down answer has since
+// started a new failing run, so no latest verdict is an answer, and v4's
+// unbroken run still spans the moment the retry is owed to. A failing run
+// begun after that moment is an answer since it: the observer saw the host
+// answer between the moment and the run's first failed probe. The retry
+// must not run; down's pause is relied on, so it waits out a fresh deadline.
+//
+// Mutation: drop the restarted-run rule from fenceStillStandsIn — the retry
+// runs at once on the first outage's deadline and the VM moves.
+func TestWitnessQ3_ARetryIsNotRunWhenEveryAnsweringObserverHasFailedAgain(t *testing.T) {
+	c, db, ctx, _, decides, offset := q3Outage1(t)
+	t0 := time.Now()
+	*offset = 20 * time.Second
+	failingSince(t, db, "v4", t0.Add(-10*time.Second), t0.Add(*offset))
+	for _, o := range []string{"coordinator", "alive"} {
+		failingSince(t, db, o, t0.Add(*offset-10*time.Second), t0.Add(*offset))
+	}
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q on a retry owed to the earlier outage: the restarted runs were not read as answers", got)
+	}
+	if *decides != 1 {
+		t.Fatalf("the retry made a claim (%d in all) on the earlier outage's deadline", *decides)
+	}
+	if _, ok := c.pauseWaits["down"]; !ok {
+		t.Fatal("the retry owed to the earlier outage started no fresh partition-pause wait")
+	}
+}
+
+// Round 2: the successor's judge agrees. A fence does not still stand when
+// an observer's failing run began after it, whatever another observer's
+// unbroken run says.
+//
+// Mutation: drop the restarted-run rule from fenceStillStandsIn — the fence
+// stands.
+func TestFenceStillStands_AFailingRunBegunAfterTheFenceIsAnAnswer(t *testing.T) {
+	c, db, ctx, _ := explicitPause(t)
+	at := time.Now().Add(-time.Minute)
+	failingSince(t, db, "v4", at.Add(-time.Minute), time.Now())
+	failingSince(t, db, "coordinator", at.Add(-time.Minute), time.Now())
+	failingSince(t, db, "alive", at.Add(-time.Minute), time.Now())
+	if why, ok := c.fenceStillStands(ctx, "down", at); !ok {
+		t.Fatalf("setup: the fence does not stand with every run spanning it: %s", why)
+	}
+	failingSince(t, db, "alive", at.Add(20*time.Second), time.Now())
+	why, ok := c.fenceStillStands(ctx, "down", at)
+	if ok {
+		t.Fatal("the fence still stands although alive's failing run began after it")
+	}
+	if !strings.Contains(why, "alive") {
+		t.Fatalf("the refusal does not name alive: %q", why)
+	}
+}
+
+// Round 2 (m1): a healthy probe of the host by this node since the moment the
+// retry is owed to ends that outage, whatever the observers' rows say: it is
+// read on this node's monotonic clock, so no observer's clock enters it.
+//
+// Mutation: ignore LastContact in claimRetryOutageOver — the retry is left
+// owed on every observer's spanning run.
+func TestClaimRetryOutageOver_AProbeAnswerSinceTheMomentIsAnOutageOver(t *testing.T) {
+	db, c := claimFixture(t, &fakeClaimer{decide: decideOurs})
+	ctx := context.Background()
+	if err := corrosion.UpdateHostState(ctx, db, "dead", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []string{"coord", "live", "other"} {
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'dead', 'suspect', 1800, ?, ?)`, o,
+			time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mono := time.Now()
+	var contact time.Time
+	c.LastContact = func(string) (time.Time, bool) { return contact, !contact.IsZero() }
+	c.fenced["dead"] = true
+	c.retryClaimsFor("dead")
+	c.noteRecoveryAt("dead", time.Now(), mono)
+	contact = mono.Add(-time.Second)
+	c.claimRetryOutageOver(ctx, "dead")
+	if !c.claimRetry["dead"] || !c.fenced["dead"] {
+		t.Fatal("setup: a retry whose outage still stands was re-judged")
+	}
+	contact = mono.Add(time.Second)
+	c.claimRetryOutageOver(ctx, "dead")
+	if c.claimRetry["dead"] || c.fenced["dead"] {
+		t.Fatal("a retry owed to a moment this node has since probed the host healthy after was left owed")
 	}
 }

@@ -554,9 +554,15 @@ All of this is in the failover coordinator (`internal/failover`).
    and either ends the wait (a fence that relies on the pause starts its own).
    A claim retry does not run while a wait is pending or refused, and one owed
    to an earlier outage or an older fence is dropped with it. Nor does one run
-   for a host that is not `fenced` or `offline`, or that an observer has seen
-   answer since its recovery went ahead: a host whose pause is relied on then
-   waits out a fresh deadline, and any other is decided afresh.
+   for a host that is not `fenced` or `offline` (it is held until the host is
+   again), or whose recovery's moment no longer stands: an observer has seen
+   the host answer since, an observer's failing run began after it, or this
+   node has probed the host healthy since. A host whose pause is relied on
+   then waits out a fresh deadline, one partition-pause wait per retry, and
+   under a bridge that sees the host answer each retry waits again. Any other
+   host has its retry dropped and goes down the successor's path (step 4): a
+   verified fence is fenced again, and an unverified one is declined, so its
+   workloads wait for `lv host undrain` or `lv host fence-confirm`.
    The stall alert names the refusal and its reason.
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry.
    Nor has one that takes the lease back after a gap (it stopped holding it,

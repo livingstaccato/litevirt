@@ -821,6 +821,8 @@ type claimRetryProposal struct {
 func (c *Coordinator) forgetClaimRetries(host string) {
 	delete(c.claimRetry, host)
 	delete(c.claimRetryAt, host)
+	delete(c.claimRetryMono, host)
+	delete(c.claimRetryHeld, host)
 	for key, p := range c.claimRetryProposals {
 		if p.source == host {
 			delete(c.claimRetryProposals, key)
@@ -871,12 +873,28 @@ func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 // noteRecoveryAt records at as the moment host's recovery went ahead
 // (claimRetryAt): a fence's, in recoverFenced, a partition-pause deadline's
 // wait start, in retryPauseWait, or an operator confirmation's, in
-// resumeFromConfirmation. It is this coordinator's clock.
-func (c *Coordinator) noteRecoveryAt(host string, at time.Time) {
+// resumeFromConfirmation. at is this coordinator's wall clock, the one the
+// observers' host_health rows are compared against; mono is the same moment
+// on its monotonic clock, the one LastContact reports on.
+func (c *Coordinator) noteRecoveryAt(host string, at, mono time.Time) {
 	if c.claimRetryAt == nil {
 		c.claimRetryAt = map[string]time.Time{}
 	}
+	if c.claimRetryMono == nil {
+		c.claimRetryMono = map[string]time.Time{}
+	}
 	c.claimRetryAt[host] = at
+	c.claimRetryMono[host] = mono
+}
+
+// contactedSince reports whether this node has probed host healthy after
+// mono, on its own monotonic clock (LastContact).
+func (c *Coordinator) contactedSince(host string, mono time.Time) bool {
+	if c.LastContact == nil {
+		return false
+	}
+	lc, ok := c.LastContact(host)
+	return ok && lc.After(mono)
 }
 
 // claimRetryOutageOver re-judges a claim retry owed for target before
@@ -891,9 +909,12 @@ func (c *Coordinator) noteRecoveryAt(host string, at time.Time) {
 // That moment says nothing about the next outage. The retry runs on it only
 // while it would still stand as a fence does (fenceStillStandsIn): some
 // observer has watched the host fail without a break since that moment, AND
-// no observer has seen it answer since. One unbroken run alone is not
-// enough — an observer whose path to the host never healed keeps its run
-// across the outages while the others saw it come back. A host that has
+// no observer has seen it answer since — neither a latest verdict that is an
+// answer nor a failing run begun after the moment. One unbroken run alone is
+// not enough — an observer whose path to the host never healed keeps its run
+// across the outages while the others saw it come back. Nor may this node
+// have probed the host healthy since the moment (LastContact, on its
+// monotonic clock, so no observer's clock enters it). A host that has
 // answered is up, and runs whatever it did not pause; in the next outage it
 // pauses only T_pause after it loses the majority. Run at once, the retry
 // starts a replacement beside it. So the retry is re-judged, as a fence of
@@ -912,6 +933,11 @@ func (c *Coordinator) noteRecoveryAt(host string, at time.Time) {
 // A retry with no moment recorded is judged an outage that is over: nothing
 // says which outage it belongs to.
 //
+// A host that is not fenced or offline (an upgrade's 'upgrading', a drain)
+// is not re-judged: retryClaims does not run for it, and a fresh wait would
+// only be dropped again by retryPauseWait. Its retry is judged when the host
+// is fenced or offline again.
+//
 // It reports false when the host or its host_health rows could not be read:
 // the caller skips the host this cycle, neither running the retry nor
 // re-judging it.
@@ -926,8 +952,21 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	if err != nil || h == nil {
 		return false
 	}
+	if h.State != "fenced" && h.State != "offline" {
+		if c.claimRetryHeld[target] != h.State {
+			if c.claimRetryHeld == nil {
+				c.claimRetryHeld = map[string]string{}
+			}
+			c.claimRetryHeld[target] = h.State
+			slog.Info("failover: a recovery claim retry is held while the host is neither fenced nor offline",
+				"host", target, "state", h.State)
+		}
+		return true
+	}
+	delete(c.claimRetryHeld, target)
 	at, ok := c.claimRetryAt[target]
-	if ok {
+	contacted := ok && c.contactedSince(target, c.claimRetryMono[target])
+	if ok && !contacted {
 		hr := c.readHostHealth(ctx, target)
 		if hr.err != nil {
 			slog.Warn("failover: host_health read for an owed claim retry failed; skipping the host this cycle",
@@ -941,7 +980,7 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	if c.reliesOnPauseIfAssumed(ctx, h) {
 		slog.Warn("failover: a recovery claim retry is owed to an outage this host has come back from; "+
 			"waiting out its partition pause afresh before retrying", "host", target,
-			"authority_at", at.UTC().Format(time.RFC3339), "moment_recorded", ok)
+			"authority_at", at.UTC().Format(time.RFC3339), "moment_recorded", ok, "probed_healthy_since", contacted)
 		if !c.pauseDeadlinePassed(ctx, h) {
 			c.noteHold(target, "a claim retry owed to an earlier outage is waiting out the host's partition pause afresh")
 		}
@@ -949,7 +988,7 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	}
 	slog.Warn("failover: a recovery claim retry is owed to an outage this host has come back from; "+
 		"dropping it and deciding the host afresh", "host", target,
-		"authority_at", at.UTC().Format(time.RFC3339), "moment_recorded", ok)
+		"authority_at", at.UTC().Format(time.RFC3339), "moment_recorded", ok, "probed_healthy_since", contacted)
 	delete(c.fenced, target)
 	delete(c.pauseWaits, target)
 	c.forgetClaimRetries(target)

@@ -17,6 +17,7 @@ type Config struct {
 	LocalHostname string
 	UserData      string // #cloud-config YAML
 	NetworkConfig string // optional netplan config
+	VendorData    string // optional; see SeedVendorData
 }
 
 // GenerateISO creates a NoCloud cloud-init ISO at the given path.
@@ -30,12 +31,13 @@ func GenerateISO(cfg Config, outputPath string) error {
 		MetaData:      fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", cfg.InstanceID, cfg.LocalHostname),
 		UserData:      userData,
 		NetworkConfig: cfg.NetworkConfig,
+		VendorData:    cfg.VendorData,
 	}, outputPath)
 }
 
 // writeISO writes seed's files as a NoCloud seed at outputPath, replacing
-// any file there. A seed with no network-config carries no network-config
-// file.
+// any file there. A seed with no network-config or vendor-data carries no
+// such file.
 func writeISO(seed Seed, outputPath string) error {
 	tmpDir, err := os.MkdirTemp("", "litevirt-cloudinit-")
 	if err != nil {
@@ -52,6 +54,11 @@ func writeISO(seed Seed, outputPath string) error {
 	if seed.NetworkConfig != "" {
 		if err := os.WriteFile(filepath.Join(tmpDir, "network-config"), []byte(seed.NetworkConfig), 0644); err != nil {
 			return fmt.Errorf("write network-config: %w", err)
+		}
+	}
+	if seed.VendorData != "" {
+		if err := os.WriteFile(filepath.Join(tmpDir, "vendor-data"), []byte(seed.VendorData), 0644); err != nil {
+			return fmt.Errorf("write vendor-data: %w", err)
 		}
 	}
 

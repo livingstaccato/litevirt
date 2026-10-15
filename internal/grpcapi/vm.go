@@ -1109,6 +1109,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			VendorData:    cloudinit.SeedVendorData(spec),
 		}, isoPath)
 		if err != nil {
 			claims.releaseAll(ctx)
@@ -1125,6 +1126,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			LocalHostname: spec.Name,
 			UserData:      "#cloud-config\n{}\n",
 			NetworkConfig: staticNetCfg,
+			VendorData:    cloudinit.NetworkUpdatesVendorData,
 		}, isoPath)
 		if err != nil {
 			slog.Warn("failed to generate cloud-init ISO", "error", err)

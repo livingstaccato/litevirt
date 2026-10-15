@@ -231,7 +231,7 @@ func TestRebuildISO_KeepsIdentityAndUserData(t *testing.T) {
 	if s.InstanceID() != "hp-first" || s.NetworkConfig != "version: 1\nconfig: []\n" || s.UserData != "#cloud-config\nhostname: hp\n" {
 		t.Fatalf("ReadSeed: %+v", s)
 	}
-	changed, err := RebuildISO(path, "version: 2\nethernets: {}\n")
+	changed, err := RebuildISO(path, "version: 2\nethernets: {}\n", "")
 	if err != nil || !changed {
 		t.Fatalf("RebuildISO = %v, %v", changed, err)
 	}
@@ -250,14 +250,14 @@ func TestRebuildISO_KeepsIdentityAndUserData(t *testing.T) {
 	}
 	// Unchanged network-config: nothing is rewritten.
 	fi, _ := os.Stat(path)
-	if changed, err := RebuildISO(path, "version: 2\nethernets: {}\n"); err != nil || changed {
+	if changed, err := RebuildISO(path, "version: 2\nethernets: {}\n", ""); err != nil || changed {
 		t.Errorf("same network-config: RebuildISO = %v, %v; want no rewrite", changed, err)
 	}
 	if fi2, _ := os.Stat(path); !os.SameFile(fi, fi2) {
 		t.Error("an unchanged seed was replaced")
 	}
 	// No network-config: the file goes.
-	if _, err := RebuildISO(path, ""); err != nil {
+	if _, err := RebuildISO(path, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if s, _ := ReadSeed(path); s.NetworkConfig != "" || s.InstanceID() != "hp-first" {
@@ -277,10 +277,71 @@ func TestReadSeed_RefusesANonISO(t *testing.T) {
 	if _, err := ReadSeed(path); err == nil {
 		t.Error("a non-ISO read as a seed")
 	}
-	if _, err := RebuildISO(path, "version: 2\n"); err == nil {
+	if _, err := RebuildISO(path, "version: 2\n", ""); err == nil {
 		t.Error("a non-ISO was rebuilt")
 	}
 	if b, _ := os.ReadFile(path); string(b) != "not an iso" {
 		t.Error("a seed that could not be read was replaced")
+	}
+}
+
+// Round 1: a seed whose network-config litevirt writes carries vendor-data
+// that asks cloud-init to apply the network-config again on every boot and
+// on a hot-plug, so a NIC attached since the first boot is configured. The
+// spec's own network-config is the operator's, and gets none. User-data,
+// merged over vendor-data, can still say otherwise.
+//
+// Mutation: return the vendor-data for a spec network-config too — red;
+// return none for a derived one — red.
+func TestSeedVendorData(t *testing.T) {
+	if got := SeedVendorData(&pb.VMSpec{}); got != NetworkUpdatesVendorData {
+		t.Errorf("derived network-config: vendor-data = %q", got)
+	}
+	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n"}}); got != NetworkUpdatesVendorData {
+		t.Errorf("user-data only: vendor-data = %q", got)
+	}
+	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Networkconfig: "version: 2\n"}}); got != "" {
+		t.Errorf("the spec's own network-config: vendor-data = %q, want none", got)
+	}
+	for _, want := range []string{"#cloud-config\n", "updates:\n  network:\n    when: [boot-new-instance, boot, hotplug]\n"} {
+		if !strings.Contains(NetworkUpdatesVendorData, want) {
+			t.Errorf("vendor-data %q lacks %q", NetworkUpdatesVendorData, want)
+		}
+	}
+}
+
+// GenerateISO writes the vendor-data it is given; RebuildISO sets it with
+// the network-config and still keeps meta-data and user-data byte for byte.
+//
+// Mutation: drop the vendor-data file from writeISO — red; keep the old
+// vendor-data on a rebuild — red.
+func TestRebuildISO_SetsVendorData(t *testing.T) {
+	if _, err := exec.LookPath("genisoimage"); err != nil {
+		t.Skip("genisoimage not installed")
+	}
+	path := filepath.Join(t.TempDir(), "vd.iso")
+	if err := GenerateISO(Config{InstanceID: "vd-first", LocalHostname: "vd", UserData: "#cloud-config\nhostname: vd\n",
+		NetworkConfig: "version: 1\nconfig: []\n"}, path); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := ReadSeed(path); err != nil || s.VendorData != "" {
+		t.Fatalf("a seed written without vendor-data: %+v, %v", s, err)
+	}
+	if changed, err := RebuildISO(path, "version: 1\nconfig: []\n", NetworkUpdatesVendorData); err != nil || !changed {
+		t.Fatalf("adding vendor-data: RebuildISO = %v, %v", changed, err)
+	}
+	s, err := ReadSeed(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.VendorData != NetworkUpdatesVendorData || s.InstanceID() != "vd-first" || s.UserData != "#cloud-config\nhostname: vd\n" {
+		t.Errorf("after the rebuild: %+v", s)
+	}
+	path2 := filepath.Join(t.TempDir(), "vd2.iso")
+	if err := GenerateISO(Config{InstanceID: "vd2", LocalHostname: "vd2", VendorData: NetworkUpdatesVendorData}, path2); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := ReadSeed(path2); err != nil || s.VendorData != NetworkUpdatesVendorData {
+		t.Errorf("GenerateISO dropped the vendor-data: %+v, %v", s, err)
 	}
 }

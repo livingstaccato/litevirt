@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
-// Seed is the files of a NoCloud seed. NetworkConfig is "" for a seed with
-// no network-config file.
+// Seed is the files of a NoCloud seed. NetworkConfig and VendorData are ""
+// for a seed with no such file.
 type Seed struct {
-	MetaData, UserData, NetworkConfig string
+	MetaData, UserData, NetworkConfig, VendorData string
 }
 
 // InstanceID is the instance-id the seed's meta-data names, "" for none.
@@ -26,13 +28,13 @@ func (s Seed) InstanceID() string {
 	return ""
 }
 
-// RebuildISO replaces the network-config of the seed at path with
-// networkConfig ("" for none) and keeps its meta-data and user-data byte for
-// byte, so cloud-init never sees a new instance (a new instance-id would run
-// first boot again). It reports whether the seed was rewritten: a seed whose
-// network-config already is networkConfig is left as it is. A seed that
+// RebuildISO replaces the network-config and vendor-data of the seed at path
+// with networkConfig and vendorData ("" for none) and keeps its meta-data and
+// user-data byte for byte, so cloud-init never sees a new instance (a new
+// instance-id would run first boot again). It reports whether the seed was
+// rewritten: a seed that already carries both is left as it is. A seed that
 // cannot be read, or names no instance-id, is left as it is and is an error.
-func RebuildISO(path, networkConfig string) (bool, error) {
+func RebuildISO(path, networkConfig, vendorData string) (bool, error) {
 	seed, err := ReadSeed(path)
 	if err != nil {
 		return false, err
@@ -40,10 +42,10 @@ func RebuildISO(path, networkConfig string) (bool, error) {
 	if seed.InstanceID() == "" {
 		return false, fmt.Errorf("seed %s names no instance-id", path)
 	}
-	if seed.NetworkConfig == networkConfig {
+	if seed.NetworkConfig == networkConfig && seed.VendorData == vendorData {
 		return false, nil
 	}
-	seed.NetworkConfig = networkConfig
+	seed.NetworkConfig, seed.VendorData = networkConfig, vendorData
 	if err := writeISO(seed, path); err != nil {
 		return false, err
 	}
@@ -58,7 +60,7 @@ const (
 
 // ReadSeed reads the NoCloud seed at path, an ISO 9660 image with Rock Ridge
 // names as GenerateISO writes it (genisoimage -rock). meta-data is required;
-// user-data and network-config are "" when the image has none.
+// user-data, network-config and vendor-data are "" when the image has none.
 func ReadSeed(path string) (Seed, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -94,6 +96,9 @@ func ReadSeed(path string) (Seed, error) {
 		return Seed{}, err
 	}
 	if s.NetworkConfig, _, err = read("network-config"); err != nil {
+		return Seed{}, err
+	}
+	if s.VendorData, _, err = read("vendor-data"); err != nil {
 		return Seed{}, err
 	}
 	return s, nil
@@ -170,4 +175,21 @@ func rockRidgeName(su []byte) string {
 		su = su[l:]
 	}
 	return name.String()
+}
+
+// NetworkUpdatesVendorData is the vendor-data of a seed whose network-config
+// litevirt writes. It enables cloud-init's network update events, so the
+// guest applies the seed's network-config again on every boot and on a NIC
+// hot-plug (cloud-init "Events and updates"), not only on a new instance's
+// first boot: a NIC attached since then is configured. cloud-init merges
+// user-data over vendor-data, so `updates:` in the user-data wins.
+const NetworkUpdatesVendorData = "#cloud-config\nupdates:\n  network:\n    when: [boot-new-instance, boot, hotplug]\n"
+
+// SeedVendorData is the vendor-data of spec's seed: NetworkUpdatesVendorData
+// when litevirt writes its network-config, none when the spec names its own.
+func SeedVendorData(spec *pb.VMSpec) string {
+	if spec.GetCloudInit().GetNetworkconfig() != "" {
+		return ""
+	}
+	return NetworkUpdatesVendorData
 }

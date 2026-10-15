@@ -1200,11 +1200,22 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
 	}
+	// The vendor-data follows the VM's spec, read here: the request does not
+	// say whether its network-config is litevirt's or the spec's own. A spec
+	// that cannot be read gets none.
+	vendorData := ""
+	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(rec.Spec), &spec) == nil {
+			vendorData = cloudinit.SeedVendorData(&spec)
+		}
+	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{
 		InstanceID:    req.VmName,
 		LocalHostname: req.VmName,
 		UserData:      userData,
 		NetworkConfig: req.Networkconfig,
+		VendorData:    vendorData,
 	}, isoPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}

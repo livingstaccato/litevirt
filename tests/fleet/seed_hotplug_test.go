@@ -27,11 +27,17 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// Round 1: the owner reloads the running guest's seed cdrom after each
+// rebuild, and both seeds carry the vendor-data that has cloud-init apply the
+// network-config again on boot.
+//
 // Mutation: read the seed's NIC set from the live vm_interfaces rows again —
 // the latched case keeps A and misses B; drop the owner's rebuild on detach —
 // the owner's seed keeps A; drop use-routes for isolated NICs — the
 // isolated-NIC check goes red; rewrite the instance-id or the user-data on a
-// rebuild — the identity check goes red.
+// rebuild — the identity check goes red; drop the reload — the reload count
+// goes red; drop the vendor-data from EnsureCloudInit — the target's seed
+// goes red.
 func TestFleet_SeedFollowsNICHotplug(t *testing.T) {
 	if _, err := exec.LookPath("genisoimage"); err != nil {
 		t.Skip("genisoimage not installed: the scenario reads the seeds back")
@@ -123,6 +129,9 @@ func seedFollowsNICHotplug(t *testing.T, latched bool) {
 		if sd.InstanceID() != "sh" || sd.UserData != userData {
 			t.Errorf("%s: the seed's identity or user-data changed: %q %q", where, sd.MetaData, sd.UserData)
 		}
+		if sd.VendorData != cloudinit.NetworkUpdatesVendorData {
+			t.Errorf("%s: vendor-data = %q, want the network update events", where, sd.VendorData)
+		}
 		got := strings.ToLower(sd.NetworkConfig)
 		for _, gone := range []string{macA, "10.61.0.50"} {
 			if strings.Contains(got, gone) {
@@ -137,6 +146,16 @@ func seedFollowsNICHotplug(t *testing.T, latched bool) {
 		}
 	}
 	assertSeed("owner after attach and detach", srcISO)
+	// The running guest's seed cdrom was reloaded on the owner after each.
+	reloads := 0
+	for _, e := range src.Virt.EventLog() {
+		if e.Op == "reload-cdrom" && e.Domain == "sh" && e.Note == "path="+srcISO {
+			reloads++
+		}
+	}
+	if reloads != 2 {
+		t.Errorf("the owner reloaded sh's seed cdrom %d times, want 2 (attach, detach)", reloads)
+	}
 
 	// A live move: the target builds its own copy of the seed.
 	if _, err := os.Stat(dstISO); err == nil {

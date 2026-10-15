@@ -194,6 +194,8 @@ type Fake struct {
 	// FailAttachNIC / FailDetachNIC are the NIC-hotplug equivalent.
 	FailAttachNIC func(domain, bridge, model, mac string) error
 	FailDetachNIC func(domain, mac string) error
+	// FailReloadCDROM injects a live cdrom media reload failure.
+	FailReloadCDROM func(domain, path string) error
 	// SkipConfigOnDiskMutation, when true, makes AttachDisk/DetachDisk update ONLY the
 	// live view (diskSources) and NOT the persistent (inactive) config — modeling a
 	// libvirt DomainDeviceModifyLive-succeeded-but-Config-not-applied divergence so a
@@ -1590,6 +1592,24 @@ func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
 		}
 	}
 	f.record("set-nic-bridge", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
+	return nil
+}
+
+// ReloadCDROMMedia records a live media reload of the domain's cdrom whose
+// source is path ("reload-cdrom", note "path=<path>"). Like libvirt, it
+// refuses a domain that is not running.
+func (f *Fake) ReloadCDROMMedia(domainName, path string) error {
+	if f.FailReloadCDROM != nil {
+		if err := f.FailReloadCDROM(domainName, path); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.domains[domainName] != StateRunning {
+		return fmt.Errorf("domain %s is not running", domainName)
+	}
+	f.record("reload-cdrom", domainName, "path="+path)
 	return nil
 }
 

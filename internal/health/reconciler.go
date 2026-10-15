@@ -2328,6 +2328,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 			LocalHostname: vm.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
+			VendorData:    cloudinit.SeedVendorData(spec),
 		}, isoPath); genErr != nil {
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {

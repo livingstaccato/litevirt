@@ -131,3 +131,57 @@ func TestDomainXMLFor_UnreadableNetworkConfigIsRetried(t *testing.T) {
 		t.Errorf("a seed was written without its network-config")
 	}
 }
+
+// Round 1: a failover's rebuilt seed carries the vendor-data that has
+// cloud-init apply the network-config again on boot, as the created seed
+// does, unless the spec names its own network-config.
+//
+// Mutation: drop VendorData from the reconciler's GenerateISO — red; write it
+// for a spec network-config too — the override case goes red.
+func TestDomainXMLFor_RebuiltSeedCarriesTheVendorData(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+out=""; src=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -output) out="$2"; shift ;;
+    -volid) shift ;;
+    -*) ;;
+    *) src="$1" ;;
+  esac
+  shift
+done
+if [ -f "$src/vendor-data" ]; then cat "$src/vendor-data" > "$out"; else printf '<no vendor-data>' > "$out"; fi
+`
+	if err := os.WriteFile(filepath.Join(dir, "genisoimage"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	for vm, override := range map[string]string{"vm1": "", "vm2": "version: 1\nconfig: []\n"} {
+		spec := &pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+			CloudInit: &pb.CloudInitSpec{Networkconfig: override}}
+		specJSON, _ := json.Marshal(spec)
+		rec := corrosion.VMRecord{Name: vm, HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+		if err := corrosion.InsertVM(ctx, db, rec, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, failure := r.domainXMLFor(ctx, rec, spec, nil); failure != "" {
+			t.Fatalf("domainXMLFor %s: %s", vm, failure)
+		}
+		iso, _ := lv.SafeCloudInitISOPath(r.dataDir, vm)
+		b, err := os.ReadFile(iso)
+		if err != nil {
+			t.Fatalf("no seed rebuilt for %s: %v", vm, err)
+		}
+		want := cloudinit.NetworkUpdatesVendorData
+		if override != "" {
+			want = "<no vendor-data>"
+		}
+		if string(b) != want {
+			t.Errorf("%s: vendor-data = %q, want %q", vm, b, want)
+		}
+	}
+}

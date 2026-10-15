@@ -621,7 +621,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 			slog.Warn("nic attach: clear journal entry", "vm", vm.Name, "op", opID, "error", err)
 		}
 	}
-	s.rebuildSeedNetworkConfig(ctx, vm)
+	s.rebuildSeedNetworkConfig(ctx, vm, running)
 	s.reconcileLocal(ctx)
 	slog.Info("nic attached", "vm", vm.Name, "network", spec.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.attached", "ok", "nic "+mac)
@@ -1029,7 +1029,7 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			slog.Warn("nic detach: clear journal entry", "vm", vm.Name, "op", opID, "error", err)
 		}
 	}
-	s.rebuildSeedNetworkConfig(ctx, vm)
+	s.rebuildSeedNetworkConfig(ctx, vm, running)
 	slog.Info("nic detached", "vm", vm.Name, "mac", mac)
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "ok", "nic "+mac)
 	s.publish("device.detached", vm.Name, "nic:"+mac)

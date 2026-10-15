@@ -3,7 +3,9 @@ package firewall
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -34,8 +36,8 @@ func TestProbeRuleset_ChecksOnlyAndReturnsRefusal(t *testing.T) {
 		t.Errorf("nft args = %v, want -c -f - (check only)", gotArgs)
 	}
 	table := ProbeTableName()
-	if !strings.HasPrefix(table, "lv_probe_") || table == "lv_probe_" {
-		t.Errorf("probe table = %q, want lv_probe_<pid>", table)
+	if want := "lv_probe_" + strconv.Itoa(os.Getpid()); table != want {
+		t.Errorf("probe table = %q, want %q", table, want)
 	}
 	if !strings.HasPrefix(gotStdin, "table bridge "+table+" {\n") || !strings.Contains(gotStdin, body) {
 		t.Errorf("probe input = %q, want the body inside table bridge %s", gotStdin, table)

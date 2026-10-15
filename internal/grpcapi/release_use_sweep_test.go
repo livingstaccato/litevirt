@@ -57,18 +57,28 @@ func runSweepFor(s *Server, probes []releaseUseProbe, every, d time.Duration) {
 	<-done
 }
 
-// After the latch, the lease holder records, within one interval, the use of
-// a feature whose data is present and whose use is not recorded; a feature
-// with no data is not recorded (DECISION 0-F).
+// After the latch, the lease holder records the use of a feature whose data
+// is present and whose use is not recorded; a feature with no data is not
+// recorded (DECISION 0-F). The loop runs a sweep within one interval.
 //
 // Mutations: skip the data check (record every unrecorded feature) — the tag
-// feature is recorded, red; never run the loop — nothing is recorded, red.
+// feature is recorded, red; never run the loop — the loop records nothing,
+// red.
 func TestReleaseUseSweep_HolderRecordsUseFoundInData(t *testing.T) {
 	s, g, probes, _ := sweepServer(t, "")
 	g.open = true
-	runSweepFor(s, probes, 200*time.Millisecond, 300*time.Millisecond)
-	if len(g.used) == 0 || slices.ContainsFunc(g.used, func(f capabilities.Feature) bool { return f != capabilities.FeatureFirewallLog }) {
-		t.Errorf("uses recorded = %v, want firewall_log only (its data is present), within one interval", g.used)
+	s.sweepReleaseUses(context.Background(), probes)
+	if !slices.Equal(g.used, []capabilities.Feature{capabilities.FeatureFirewallLog}) {
+		t.Errorf("uses recorded by one sweep = %v, want firewall_log only (its data is present)", g.used)
+	}
+
+	// The loop: a sweep within one interval. The window is many intervals
+	// long, so a loaded host still gets a tick in.
+	s2, g2, probes2, _ := sweepServer(t, "")
+	g2.open = true
+	runSweepFor(s2, probes2, 20*time.Millisecond, 400*time.Millisecond)
+	if len(g2.used) == 0 || slices.ContainsFunc(g2.used, func(f capabilities.Feature) bool { return f != capabilities.FeatureFirewallLog }) {
+		t.Errorf("uses recorded by the loop = %v, want firewall_log only", g2.used)
 	}
 }
 

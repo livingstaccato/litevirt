@@ -70,7 +70,11 @@ func (s *Server) sweepReleaseUses(ctx context.Context, probes []releaseUseProbe)
 			continue
 		}
 		used, err := corrosion.ReleaseFeatureUsed(ctx, s.db, info.Token, string(p.feature))
-		if err != nil || used {
+		if err != nil {
+			slog.Warn("release use sweep: could not read a feature's used record", "feature", p.feature, "error", err)
+			continue
+		}
+		if used {
 			continue
 		}
 		present, err := p.present(ctx, s.db)

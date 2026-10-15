@@ -470,7 +470,9 @@ type VMSpec struct {
 	// 0 = leave at the default.
 	CpuShares int32 `protobuf:"varint,46,opt,name=cpu_shares,json=cpuShares,proto3" json:"cpu_shares,omitempty"`
 	// firewall_id is the VM's firewall identity, the key of its firewall tags.
-	// Server-owned: a client's value is ignored.
+	// Server-owned once firewall tags land, whose writers strip a client's
+	// value (plan task D2b); on this build nothing reads it, and it is stored
+	// as sent.
 	FirewallId    string `protobuf:"bytes,47,opt,name=firewall_id,json=firewallId,proto3" json:"firewall_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

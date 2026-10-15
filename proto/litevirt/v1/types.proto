@@ -183,7 +183,9 @@ message VMSpec {
     int32  cpu_shares = 46;
 
     // firewall_id is the VM's firewall identity, the key of its firewall tags.
-    // Server-owned: a client's value is ignored.
+    // Server-owned once firewall tags land, whose writers strip a client's
+    // value (plan task D2b); on this build nothing reads it, and it is stored
+    // as sent.
     string firewall_id = 47;
 }
 

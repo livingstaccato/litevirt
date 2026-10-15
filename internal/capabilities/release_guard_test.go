@@ -564,6 +564,11 @@ func isGrantType(e ast.Expr) bool {
 // any of grants. An argument resolves through consts (capabilities.FeatureX
 // or an in-package FeatureX) or is a string literal; any other argument
 // counts as a Check of the empty feature, which no listing names.
+//
+// It cannot tell WHICH grant a Check is made on: a writer that checks one
+// feature on another feature's grant parameter satisfies it. Slot correctness
+// is the writers' behavioural tests' job (for the rule writers,
+// corrosion TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant).
 func checkedFeatures(body *ast.BlockStmt, grants []string, consts map[string]Feature) map[Feature]bool {
 	out := map[Feature]bool{}
 	if body == nil {

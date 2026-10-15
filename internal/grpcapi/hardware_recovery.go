@@ -353,6 +353,9 @@ func (s *Server) recoverNICAttach(ctx context.Context, vm *corrosion.VMRecord, v
 		vm: vm, opID: view.ActiveOperationID, epoch: view.OwnerEpoch, newGen: view.SpecGeneration,
 		mac: mac, nicID: corrosion.DeterministicNICID(vm.Name, mac), networkName: art["network_name"],
 		running: running, dualWrite: !latched,
+		// The crashed attach may have written the NIC's guard record; the
+		// rollback retires it once the NIC is gone (a no-op when absent).
+		guardRecorded: true,
 	}
 	if running {
 		if live, e := s.virt.DumpXML(vm.Name); e == nil {
@@ -667,7 +670,7 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 		slog.Error("hardware op recovery: nic detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}
-	if err := s.retireDetachedNICGuard(ctx, vm.Name, mac); err != nil {
+	if err := s.retireNICGuard(ctx, vm.Name, mac); err != nil {
 		slog.Error("hardware op recovery: nic detach guard record not retired — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}

@@ -32,11 +32,11 @@ import (
 //   - UpdateVM's regenerate reads GetVMInterfaces again (UpdateVM, latched);
 //   - provisionVMNetworksOnRemote reads GetVMInterfaces again (Migrate,
 //     latched: nc is not provisioned on the target, nb is);
-//   - retireDetachedNICGuard does nothing (every test here, both kinds: the
-//     guard records name the gone NIC, and the start or the migration is
-//     refused because its guard cannot be put in force);
-//   - the detach alone skips it (Failover, UpdateVM and Migrate, both kinds);
+//   - retireNICGuard does nothing (every test here, both kinds: the record of
+//     the detached or never-attached NIC stays live);
+//   - the detach alone skips it (every test that detaches B, both kinds);
 //   - the attach rollback alone skips it (FailedNICAttach, both kinds);
+//   - the start skips retireOrphanNICGuards (StoppedNICDetachWithFailedRelease);
 //   - a same-name promotion builds its NICs from the spec again
 //     (PromoteTakeover, both kinds: the domain has na+nb, and nb, its guard
 //     record retired, would boot with no guard).
@@ -106,6 +106,7 @@ func hotplugged(t *testing.T, c *Cluster, home *Node, vm string) string {
 	}
 	cNIC := mustAttachNIC(t, c, home, vm, "nc")
 	mustDetachNIC(t, c, home, vm, mnB)
+	requireRetired(t, home, vm, mnB)
 	want := map[string]string{mnA: "na", strings.ToLower(cNIC.MAC): "nc"}
 	if got := liveNICSet(t, home, vm); !sameNICSet(got, want) {
 		t.Fatalf("fixture: live NICs after the hotplug = %v, want %v", got, want)
@@ -166,14 +167,32 @@ func bridgesOf(nics map[string]string) map[string]string {
 	return out
 }
 
+// guardedSet is the MACs of vm's live guard records that are on, read from
+// the records themselves (ListNICGuards), not through GuardedMACsOf, which
+// also leaves out a record whose NIC row is tombstoned.
 func guardedSet(t *testing.T, n *Node, vm string) []string {
 	t.Helper()
-	macs, err := corrosion.GuardedMACsOf(context.Background(), n.DB, vm)
+	all, err := corrosion.ListNICGuards(context.Background(), n.DB)
 	if err != nil {
-		t.Fatalf("GuardedMACsOf(%s): %v", vm, err)
+		t.Fatalf("ListNICGuards: %v", err)
+	}
+	var macs []string
+	for _, r := range all {
+		if r.VMName == vm && r.Guarded() {
+			macs = append(macs, strings.ToLower(r.MAC))
+		}
 	}
 	sort.Strings(macs)
 	return macs
+}
+
+// requireRetired fails unless mac of vm has no live guard record.
+func requireRetired(t *testing.T, n *Node, vm, mac string) {
+	t.Helper()
+	rec, err := corrosion.GetNICGuard(context.Background(), n.DB, vm, mac)
+	if err != nil || rec != nil {
+		t.Errorf("%s's NIC %s still has a live guard record %+v (err %v), want it retired", vm, mac, rec, err)
+	}
 }
 
 func wantMACs(nics map[string]string) []string {
@@ -449,4 +468,57 @@ func TestFleet_PromoteTakeoverKeepsHotpluggedNICs_Latched(t *testing.T) {
 
 func TestFleet_PromoteTakeoverKeepsHotpluggedNICs_Unlatched(t *testing.T) {
 	testPromoteKeepsLiveNICs(t, false)
+}
+
+// A stopped VM's detach whose address release fails has already removed the
+// NIC's row and redefined the domain without it; the operation then fails
+// terminally and a retry answers NotFound. The NIC's guard record must not
+// survive that: the VM starts again, and once it has the record is retired.
+func TestFleet_StoppedNICDetachWithFailedReleaseLeavesNoGuardRecord(t *testing.T) {
+	nb, c, gates := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	openNICGuards(t, n)
+	n.Server.SetBridgeEnsure(func(string) error { return nil })
+	wireNodeFirewall(t, n)
+	mustCreateNICLessVM(t, c, n, "vm-1")
+	latchHardwareV2(t, c, gates)
+
+	// A bridge network bound to NetBox: the fleet's orphanNetwork is SR-IOV,
+	// which can enforce no guard, so its NICs get no record.
+	nb.AddPrefix(9, "10.0.9.0/24", orphanVRF, true)
+	if _, err := c.SelfClient(n).CreateNetwork(ctx, &pb.CreateNetworkRequest{
+		Name: "bound-br", Type: "bridge", Subnet: "10.0.9.0/24", Vlan: 30, NetboxPrefixId: 9,
+	}); err != nil {
+		t.Fatalf("CreateNetwork bound-br: %v", err)
+	}
+	nic := mustAttachNIC(t, c, n, "vm-1", "bound-br")
+	if !isNetBoxBand(nic.IP) {
+		t.Fatalf("fixture: the NIC's address %q is not NetBox's", nic.IP)
+	}
+	mac := strings.ToLower(nic.MAC)
+	if rec, err := corrosion.GetNICGuard(ctx, n.DB, "vm-1", mac); err != nil || rec == nil || !rec.Guarded() {
+		t.Fatalf("fixture: the attached NIC has no guard on: %+v, %v", rec, err)
+	}
+	if _, err := c.SelfClient(n).StopVM(ctx, &pb.StopVMRequest{Name: "vm-1", Force: true}); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+	nb.SetDown(true)
+	if err := detachNIC(c, n, "vm-1", nic.MAC); err == nil {
+		t.Fatal("fixture: a stopped detach against an unreachable NetBox must fail its release")
+	}
+	nb.SetDown(false)
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 0 {
+		t.Fatalf("fixture: the stopped detach must have removed the NIC row before the release, got %+v", nics)
+	}
+
+	gates[n.Name].QuorumProof(ctx)
+	gates[n.Name].SeedPeersForTests(map[string]bool{})
+	if _, err := c.SelfClient(n).StartVM(ctx, &pb.StartVMRequest{Name: "vm-1"}); err != nil {
+		t.Fatalf("StartVM after the failed release: %v", err)
+	}
+	requireRetired(t, n, "vm-1", mac)
+	if _, has := domainNICSet(t, n.Virt.DefinedXML("vm-1"))[mac]; has {
+		t.Errorf("the started domain still carries the detached NIC %s", mac)
+	}
 }

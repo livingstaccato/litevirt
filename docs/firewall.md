@@ -702,10 +702,24 @@ and the other guard settings, `on` included), and one a re-create carries from
 the incarnation it replaces, are never dropped: if the gate refuses them, or
 this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
-VM or container is deleted, and a NIC's own record when the NIC is detached or
-its attach is rolled back. A record written for another incarnation of the
+VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
-incarnation it replaces.
+incarnation it replaces. A NIC's record is also retired when `lv detach-nic`
+removes the NIC, once it is gone from the domain, and when an `lv attach-nic`
+that wrote it fails and its NIC is verified gone. A record an earlier build
+left for a NIC the VM no longer has is not demanded in force once the NIC's row
+is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
+`lv migrate` or `lv start`, when no NIC row and neither definition of the
+domain on that host has its MAC. The owner judges from its own replica, so it
+can retire the record of a NIC whose row has not reached it yet. A retired
+record of the running incarnation still guards, with the default guard, a NIC
+whose row is live, unless its network cannot enforce a guard; `lv firewall
+nic-guard ls` and the compose plan name such a NIC, and `lv firewall nic-guard
+set` replaces its guard. A target judges a migration from its own replica, so
+a NIC attached moments before the move can arrive before its record. A guard
+write behind a stored write for that NIC stamped more than 5 minutes ahead of
+this host's clock is refused, naming the stamp; check NTP on the host that
+wrote it.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

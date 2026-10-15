@@ -164,9 +164,35 @@ func (c *Client) stampAfter(after string, now time.Time) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("cannot order a write after the unreadable timestamp %q", after)
 	}
-	next := inst.Add(time.Millisecond).UTC().Format(time.RFC3339Nano)
+	nextT := inst.Add(time.Millisecond).UTC()
+	next := nextT.Format(time.RFC3339Nano)
 	if !LWWNewer(next, after) {
 		return "", fmt.Errorf("cannot order a write after %q", after)
 	}
+	// This host's later keys must order after this one too: a write that
+	// follows it (a detach right after a re-attach) stamped below it would
+	// lose last-writer-wins on every peer.
+	if err := c.raiseWallFloor(nextT); err != nil {
+		return "", err
+	}
 	return next, nil
+}
+
+// raiseWallFloor makes NowWallTS emit only keys after t from now on,
+// committing the durable ceiling first as NowWallTS does. It refuses when the
+// ceiling cannot be persisted past t, rather than emit a key a restart could
+// re-issue below.
+func (c *Client) raiseWallFloor(t time.Time) error {
+	c.tsMu.Lock()
+	defer c.tsMu.Unlock()
+	if !t.After(c.lastTS) {
+		return nil
+	}
+	if c.hwm != nil && t.After(c.durableTS) {
+		if got := c.advanceDurableLWWLocked(t); got.Before(t) {
+			return fmt.Errorf("cannot persist the timestamp ceiling past %s", t.Format(time.RFC3339Nano))
+		}
+	}
+	c.lastTS = t
+	return nil
 }

@@ -29,7 +29,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 |---|---|---|
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
-| `host.recovery.stalled` | error | a `fenced`/`offline` host's recoverable workloads are still on it 60 s after its fence record; names the host, the leader coordinator and why it is not proceeding. Repeats at most every 10 minutes per host |
+| `host.recovery.stalled` | error | a `fenced`/`offline` host's recoverable workloads are still on it 60 s after its fence record, or a host the quorum reports down has been held unfenced by an HA disarm for 60 s; names the host, the leader coordinator and why it is not proceeding. Repeats at most every 10 minutes per host |
 | `replication.failed` | error (warn when the target host is down) | a scheduled replication run starts failing or fails differently; a continuing failure is repeated at most hourly |
 | `replication.recovered` | info | a replication schedule that was failing replicates again |
 | `replication.suspended` | warn | a replication schedule targets the host its workload now runs on, and the move's switch did not arrive within 15 minutes: it does not replicate there |

@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -530,5 +531,94 @@ func TestHADisarm_Fleet_CoordinatorWithoutTheUsedRecordIsVetoed(t *testing.T) {
 	f.cs.Tick(ctx, x)
 	if n := f.fencesOf(d.Name); n != 0 {
 		t.Fatalf("a lease holder without the used record fenced %s %d times during a confirmed disarm", d.Name, n)
+	}
+}
+
+// F1 (lab 1, 3241dda4): a host that fails while HA is disarmed is held before
+// any fence, so it stays recorded active — `lv host ls` keeps showing it
+// active and `lv ls` its VM running, because nothing has decided otherwise.
+// The lease holder's stall alert still names it, held by the disarm, once the
+// hold has lasted recoveryStallAfter. The alert only reports: nothing is
+// fenced, no host state is written on any replica, and the VM stays put.
+//
+// Mutation: drop heldBeforeFence from the stall pass (count only fenced and
+// offline hosts, as before the fix) — no alert names x, and this goes red.
+func TestHADisarm_Fleet_HostDownWhileDisarmedIsNamedHeld(t *testing.T) {
+	ctx := context.Background()
+	f := newHAFleet(t, Options{Nodes: 3, FaultSeed: 1511})
+	a, b, x := f.c.Nodes[0], f.c.Nodes[1], f.c.Nodes[2]
+	insertVM(t, a, "vm-x", x.Name)
+	f.c.WaitConverged(t, convergeTimeout)
+	if err := failover.HADisarmPreRecord(ctx, f.gates[a.Name].WithFeature); err != nil {
+		t.Fatalf("pre-record: %v", err)
+	}
+	if _, err := f.set(a, corrosion.HADisarmed, false); err != nil {
+		t.Fatalf("disarm: %v", err)
+	}
+
+	type alert struct {
+		by, host, reason string
+	}
+	var mu sync.Mutex
+	var alerts []alert
+	for _, n := range f.c.Nodes {
+		by := n.Name
+		f.cs.ByNode[by].OnRecoveryStalled = func(host, _, reason string, _ int, _ time.Time) {
+			mu.Lock()
+			alerts = append(alerts, alert{by, host, reason})
+			mu.Unlock()
+		}
+	}
+	got := func() []alert {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]alert(nil), alerts...)
+	}
+
+	runStart := f.clock.Now()
+	f.down(t, x, a, b)
+	f.cs.Tick(ctx, a)
+	// Hold it past recoveryStallAfter (60 s), re-publishing the observers'
+	// view inside the health freshness bound as the checkers would.
+	for i := 0; i < 4; i++ {
+		f.clock.Advance(20 * time.Second)
+		now := f.clock.Now()
+		PublishHealthRun(t, a, x.Name, 5+i, runStart, now)
+		PublishHealthRun(t, b, x.Name, 5+i, runStart, now)
+		eventually(t, convergeTimeout, b.Name+"'s refreshed view of "+x.Name+" on "+a.Name, func() bool {
+			rows, _ := a.DB.Query(ctx, `SELECT updated_at FROM host_health WHERE observer = ? AND target = ?`, b.Name, x.Name)
+			return len(rows) == 1 && rows[0].String("updated_at") == now.UTC().Format(time.RFC3339Nano)
+		})
+		f.cs.Tick(ctx, a)
+	}
+
+	var named []alert
+	for _, al := range got() {
+		if al.host == x.Name {
+			named = append(named, al)
+		}
+	}
+	if len(named) != 1 || named[0].by != a.Name || named[0].reason != "recovery held: HA disarmed" {
+		t.Fatalf("stall alerts naming %s: %+v, want one from the lease holder %s saying %q",
+			x.Name, named, a.Name, "recovery held: HA disarmed")
+	}
+	if fs := f.cs.Fences(); len(fs) != 0 {
+		t.Fatalf("fences while HA is disarmed: %+v", fs)
+	}
+	for _, n := range f.c.Nodes {
+		if n == x {
+			continue
+		}
+		h, err := corrosion.GetHost(ctx, n.DB, x.Name)
+		if err != nil || h == nil || h.State != "active" {
+			t.Fatalf("%s's record of %s: %+v %v, want it still active (no state is written while disarmed)", n.Name, x.Name, h, err)
+		}
+		if vm := vmOn(t, n, "vm-x"); vm == nil || vm.HostName != x.Name {
+			t.Fatalf("vm-x on %s's replica: %+v, want it still on %s", n.Name, vm, x.Name)
+		}
+		rows, _ := n.DB.Query(ctx, `SELECT id FROM fencing_log WHERE host_name = ?`, x.Name)
+		if len(rows) != 0 {
+			t.Fatalf("%s holds %d fencing_log rows for %s while HA is disarmed", n.Name, len(rows), x.Name)
+		}
 	}
 }

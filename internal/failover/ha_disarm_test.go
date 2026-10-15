@@ -987,3 +987,139 @@ func TestPeerVeto_ArmedClusterWithQuorumStillFences(t *testing.T) {
 		t.Fatalf("armed, quorum live: %d fences, VM on %q", fences, vmHost(t, db, ctx))
 	}
 }
+
+// F1 (lab 1, 3241dda4): a host that fails while HA is disarmed is held at the
+// candidate site, before any fence, so it stays recorded active and
+// strandedByHost (fenced and offline hosts only) never names it. The stall
+// alert still names it, held by the disarm, recoveryStallAfter after the hold
+// was first seen — not from a fence row of an earlier outage. Nothing is
+// fenced, written or moved. Armed again, it is fenced and recovered, and the
+// alert ends.
+//
+// Mutation: pass strandedByHost's count alone to alertStalledRecoveries (no
+// heldBeforeFence) — no alert, and this goes red. Start the unfenced clock
+// from the newest fence row — the alert comes on the first cycle, red.
+func TestHADisarm_StallAlertNamesHostHeldBeforeFence(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	if err := db.Execute(ctx,
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
+		"old", "down", "ssh", "fenced", old, "an earlier outage"); err != nil {
+		t.Fatal(err)
+	}
+	setHA(t, db, corrosion.HADisarmed)
+	clock := time.Now()
+	start := clock
+	c := newTestCoordinator("coordinator", db)
+	c.Now = func() time.Time { return clock }
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFence))
+	type alert struct {
+		host, reason string
+		pending      int
+		since        time.Time
+	}
+	var alerts []alert
+	c.OnRecoveryStalled = func(host, _, reason string, pending int, since time.Time) {
+		alerts = append(alerts, alert{host, reason, pending, since})
+	}
+	tick := func(d time.Duration) {
+		t.Helper()
+		clock = clock.Add(d)
+		holdLeaseThrough(t, db, ctx, clock)
+		if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ? WHERE target = 'down'`,
+			clock.UTC().Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+		c.run(ctx)
+	}
+
+	c.run(ctx)
+	if len(alerts) != 0 {
+		t.Fatalf("alerted on the first held cycle (the clock started from an older fence row?): %+v", alerts)
+	}
+	tick(recoveryStallAfter / 2)
+	if len(alerts) != 0 {
+		t.Fatalf("alerted before recoveryStallAfter: %+v", alerts)
+	}
+	tick(recoveryStallAfter/2 + time.Second)
+	if len(alerts) != 1 {
+		t.Fatalf("stall alerts for a host held before its fence: %+v, want one", alerts)
+	}
+	if a := alerts[0]; a.host != "down" || a.reason != "recovery held: HA disarmed" || a.pending != 1 || !a.since.Equal(start) {
+		t.Fatalf("alert = %+v, want host down, reason %q, pending 1, since %v", a, "recovery held: HA disarmed", start)
+	}
+	if fences != 0 || fenceRows(t, db) != 1 || hostState(t, db, ctx) != "active" || vmHost(t, db, ctx) != "down" {
+		t.Fatalf("disarmed: %d fences, %d fencing_log rows, host %q, VM on %q — the alert must not act",
+			fences, fenceRows(t, db), hostState(t, db, ctx), vmHost(t, db, ctx))
+	}
+	tick(time.Minute)
+	if len(alerts) != 1 {
+		t.Fatalf("alerted again inside recoveryStallRepeat: %+v", alerts)
+	}
+
+	setHA(t, db, corrosion.HAArmed)
+	tick(time.Second)
+	if fences != 1 || vmHost(t, db, ctx) != "alive" {
+		t.Fatalf("armed again: %d fences, VM on %q", fences, vmHost(t, db, ctx))
+	}
+	if len(c.stallSince) != 0 || len(c.stallUnfenced) != 0 {
+		t.Fatalf("the stall clock outlived the recovery: %v %v", c.stallSince, c.stallUnfenced)
+	}
+}
+
+// A host held unfenced, then armed and fenced, starts its stall clock again
+// from that fence: the alert it raised while held does not stand in for the
+// recovery's own, which comes recoveryStallAfter after the fence and names
+// what holds it now.
+//
+// Mutation: keep the held clock across the fence (drop the stallUnfenced
+// reset) — the post-fence alert waits out recoveryStallRepeat, and this goes
+// red.
+func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	setHA(t, db, corrosion.HADisarmed)
+	// fencing_log rows carry the wall clock: start early enough that the
+	// fence, after the held alert, lands at the virtual clock's now.
+	clock := time.Now().Add(-recoveryStallAfter - 2*time.Second)
+	c := newTestCoordinator("coordinator", db)
+	c.Now = func() time.Time { return clock }
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFailedFence))
+	var reasons []string
+	var sinces []time.Time
+	c.OnRecoveryStalled = func(_, _, reason string, _ int, since time.Time) {
+		reasons = append(reasons, reason)
+		sinces = append(sinces, since)
+	}
+	tick := func(d time.Duration) {
+		t.Helper()
+		clock = clock.Add(d)
+		holdLeaseThrough(t, db, ctx, clock)
+		if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ? WHERE target = 'down'`,
+			clock.UTC().Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+		c.run(ctx)
+	}
+	tick(0)
+	tick(recoveryStallAfter + time.Second)
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+		t.Fatalf("held alerts = %q, want one held by the disarm", reasons)
+	}
+
+	setHA(t, db, corrosion.HAArmed)
+	tick(time.Second)
+	if fences != 1 {
+		t.Fatalf("armed: %d fences, want 1", fences)
+	}
+	fencedAt := clock.Add(-3 * time.Second)
+	if len(reasons) != 1 {
+		t.Fatalf("alerted on the cycle that fenced: %q", reasons)
+	}
+	tick(recoveryStallAfter + time.Second)
+	if len(reasons) != 2 || reasons[1] == "recovery held: HA disarmed" || sinces[1].Before(fencedAt) {
+		t.Fatalf("alerts after the fence: %q since %v, want a second one, from the fence at %v, naming what holds it now",
+			reasons, sinces, fencedAt)
+	}
+}

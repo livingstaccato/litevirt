@@ -241,10 +241,16 @@ type Coordinator struct {
 	// alert, per host (alertStalledRecoveries).
 	stallSince   map[string]time.Time
 	stallAlerted map[string]time.Time
+	// stallUnfenced names the hosts whose stall clock started while an HA
+	// hold kept them from being fenced (heldBeforeFence); their fence, once
+	// HA is armed, starts the clock again from its record.
+	stallUnfenced map[string]bool
 	// OnRecoveryStalled, when set, is invoked when a fenced or offline host's
 	// recoverable workloads are still on it recoveryStallAfter after its fence
 	// record, and again at most every recoveryStallRepeat, so the daemon can
-	// emit an operator notification. Best-effort; must not block.
+	// emit an operator notification. Also for a quorum-down host an HA hold
+	// keeps from being fenced, recoveryStallAfter after the hold was first
+	// seen. Best-effort; must not block.
 	OnRecoveryStalled func(host, coordinator, reason string, pending int, since time.Time)
 	// confirmResumed records, per host, the operator confirmation a recovery
 	// was already resumed from in this process, so one confirmation resumes one
@@ -523,6 +529,18 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 		confirmResumed: make(map[string]string),
 		Now:            func() time.Time { return time.Now() },
 	}
+}
+
+// upgradingGrace reports when h, recorded 'upgrading', turned so, and whether
+// it is still inside upgradingTimeout and so not fenced. It is timed from its
+// membership row's state change when it has one, else from the hosts row; an
+// unreadable time counts as inside.
+func (c *Coordinator) upgradingGrace(ctx context.Context, h *corrosion.HostRecord) (time.Time, bool) {
+	upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
+	if since, sok, serr := corrosion.HostStateSince(ctx, c.db, h.Name); serr == nil && sok {
+		upd, ok = since, true
+	}
+	return upd, !ok || c.now().Sub(upd) < c.upgradingTimeout()
 }
 
 // upgradingTimeout is how long a host recorded 'upgrading' is skipped.
@@ -849,6 +867,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	for _, cand := range candidates {
 		c.cycleCandidates[cand.Target] = true
 	}
+	c.ha.heldCandidates = nil
 
 	// Relay health (colonelpanik/litevirt#175): demote a host whose probes
 	// keep failing from relay duty, or restore one, as a replicated row every
@@ -889,6 +908,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// recorded fence, no claim retry or pause wait. All of it is kept,
 		// and runs once HA is armed again.
 		if c.haHold(ctx, target, haSiteCandidate) {
+			c.noteHeldCandidate(target)
 			continue
 		}
 		// afresh: an operator confirmed the host off during this outage and no
@@ -1071,11 +1091,8 @@ func (c *Coordinator) run(ctx context.Context) {
 		// 'upgrading' that kept reporting pushed its own timeout out. A host
 		// with no membership row is timed from the hosts row as before.
 		if h.State == "upgrading" {
-			upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
-			if since, sok, serr := corrosion.HostStateSince(ctx, c.db, target); serr == nil && sok {
-				upd, ok = since, true
-			}
-			if !ok || c.now().Sub(upd) < c.upgradingTimeout() {
+			upd, within := c.upgradingGrace(ctx, h)
+			if within {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue
@@ -1226,8 +1243,22 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 		c.mStranded(n)
 		// Name each host whose recovery has stalled, and why
-		// (alertStalledRecoveries).
-		c.alertStalledRecoveries(ctx, byHost)
+		// (alertStalledRecoveries): the fenced and offline hosts, and the
+		// quorum-down hosts an HA hold kept from being fenced at all
+		// (heldBeforeFence), which are still recorded active.
+		pending, unfenced := byHost, map[string]bool(nil)
+		if held := c.heldBeforeFence(ctx); len(held) > 0 {
+			pending = make(map[string]int, len(byHost)+len(held))
+			for h, k := range byHost {
+				pending[h] = k
+			}
+			unfenced = make(map[string]bool, len(held))
+			for h, k := range held {
+				pending[h] = k
+				unfenced[h] = true
+			}
+		}
+		c.alertStalledRecoveries(ctx, pending, unfenced)
 		c.resolveBridgedSettled(ctx, byHost, c.noteBridgedBeforeFence(ctx))
 	}
 }
@@ -1251,7 +1282,7 @@ func (c *Coordinator) stepDownGauges() {
 	c.mRegionsWithoutQuorum(0)
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
-	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
+	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
 }
 
 // dropLeaseTerm records that this coordinator cannot show it holds the
@@ -1296,7 +1327,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.retrying = nil
 	c.retryNotified, c.retryRefusedLogged = nil, nil
 	c.resumeDeclined = nil
-	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
+	c.stallSince, c.stallAlerted, c.stallUnfenced, c.holdReason = nil, nil, nil, nil
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the

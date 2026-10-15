@@ -1266,7 +1266,12 @@ Partition pause still pauses: a planned whole-cluster network outage pauses
 and resumes every VM while disarmed, and nothing is fenced. The coordinator
 logs `failover: HA disarmed; not fencing <host> (quorum reports it down)` once
 per host, counts the skip as `error_class="ha_disarmed"`, and the stall alert
-for a held host says `recovery held: HA disarmed`. There is no automatic re-arm.
+for a held host says `recovery held: HA disarmed`. A host that fails while
+disarmed is held before any fence, so nothing records it down: `lv host ls`
+keeps showing it active and `lv ls` its VMs running. `lv cluster ha` lists it
+under the hosts arming would fence, and 60 s after the hold began the stall
+alert (`host.recovery.stalled`) names it, held by the disarm. There is no
+automatic re-arm.
 
 **Changing it.** Both directions need the admin role and the connected host's
 voter majority, and wait until a majority of the voters (under region scope, a

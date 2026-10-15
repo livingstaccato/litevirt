@@ -623,6 +623,8 @@ type leaseWatch struct {
 	readers []string
 	avoided map[string]bool
 	changes []leaseChange
+	dropped int
+	incoh   map[string]*incoherenceTracker
 	stop    chan struct{}
 	done    chan struct{}
 }
@@ -631,7 +633,7 @@ type leaseWatch struct {
 // the first of readers that is not avoided and answers (a frozen or stopped
 // node's replica stops applying, so the drill avoids it while it is out).
 func (l *lab) watchLease(readers []string) *leaseWatch {
-	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
+	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, incoh: map[string]*incoherenceTracker{}, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(w.done)
 		tick := time.NewTicker(time.Second)
@@ -663,10 +665,31 @@ func (w *leaseWatch) sampleOnce() {
 		if err != nil || len(rows) == 0 || len(rows[0]) < 3 {
 			continue
 		}
-		if !leaseSampleCoherent(rows[0][0], rows[0][2]) {
-			continue // a replica mid-catch-up: its election row and ledger disagree
-		}
 		term, _ := strconv.Atoi(rows[0][1])
+		if !leaseSampleCoherent(rows[0][0], rows[0][2]) {
+			// Never dropped silently: counted, logged with both holders, and
+			// failed once it persists (see incoherenceTracker).
+			w.mu.Lock()
+			w.dropped++
+			n := w.dropped
+			tr := w.incoh[r]
+			if tr == nil {
+				tr = &incoherenceTracker{}
+				w.incoh[r] = tr
+			}
+			persistent := tr.observe(time.Now(), false)
+			w.mu.Unlock()
+			w.l.mark("lease: INCOHERENT sample #%d on %s: election holder %q, ledger term %d held by %q (streak %d)", n, r, rows[0][0], term, rows[0][2], tr.n)
+			if persistent {
+				w.l.t.Errorf("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: a second holder at one term, not a catching-up replica", r, rows[0][0], term, rows[0][2], tr.n, incoherenceBound)
+			}
+			continue
+		}
+		w.mu.Lock()
+		if tr := w.incoh[r]; tr != nil {
+			tr.observe(time.Now(), true)
+		}
+		w.mu.Unlock()
 		c := leaseChange{At: time.Now(), Holder: rows[0][0], Term: term}
 		w.mu.Lock()
 		n := len(w.changes)
@@ -682,12 +705,42 @@ func (w *leaseWatch) sampleOnce() {
 }
 
 // leaseSampleCoherent reports whether a replica's election holder and the
-// holder its ledger records for the newest term agree. A replica that has just
-// restarted still holds its own old election row beside a newer ledger term;
-// pairing the two reports a second holder at a term that had one. An empty
-// election holder (the lease is between tenures) pairs with any ledger row.
+// holder its ledger records for the newest term agree. A replica catching up
+// holds its own old election row beside a newer ledger term; pairing the two
+// would report a second holder at a term that had one. An incoherent sample is
+// not recorded as a lease change, but incoherenceTracker fails the drill if it
+// persists. An empty election holder (between tenures) pairs with any row.
 func leaseSampleCoherent(electionHolder, ledgerHolder string) bool {
 	return electionHolder == "" || ledgerHolder == "" || electionHolder == ledgerHolder
+}
+
+// incoherenceBound is how long one serving replica may show an election holder
+// that disagrees with its ledger before the drill fails.
+const incoherenceBound = 10 * time.Second
+
+// incoherenceTracker follows one reader's run of incoherent samples.
+type incoherenceTracker struct {
+	since    time.Time
+	n        int
+	reported bool
+}
+
+// observe records a sample and reports, once per run, that the run has lasted
+// incoherenceBound and at least 3 samples. A coherent sample ends the run.
+func (c *incoherenceTracker) observe(now time.Time, coherent bool) bool {
+	if coherent {
+		*c = incoherenceTracker{}
+		return false
+	}
+	if c.n == 0 {
+		c.since = now
+	}
+	c.n++
+	if c.reported || c.n < 3 || now.Sub(c.since) < incoherenceBound {
+		return false
+	}
+	c.reported = true
+	return true
 }
 
 func (w *leaseWatch) Stop() {

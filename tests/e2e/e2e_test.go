@@ -2204,18 +2204,33 @@ func getVMIP(t *testing.T, vmName, stackName, networkName string) string {
 const vmIPWait = 120 * time.Second
 
 // pollFor calls cond every interval until it returns true or timeout passes,
-// and reports how long it took.
+// and reports how long it took. The last attempt is made at the timeout, not
+// an interval before it.
 func pollFor(timeout, interval time.Duration, cond func() bool) (time.Duration, bool) {
 	start := time.Now()
 	for {
 		if cond() {
 			return time.Since(start), true
 		}
-		if time.Since(start)+interval > timeout {
+		left := timeout - time.Since(start)
+		if left <= 0 {
 			return time.Since(start), false
 		}
-		time.Sleep(interval)
+		time.Sleep(min(interval, left))
 	}
+}
+
+// pingVerdict reads the result of a ping run through lv exec. reached says the
+// ping got replies; conclusive is false when the run itself failed (lv exec
+// transport, guest agent) and proves nothing about reachability.
+func pingVerdict(out string, err error) (reached, conclusive bool) {
+	if err == nil {
+		return true, true
+	}
+	if strings.Contains(out, "100% packet loss") || strings.Contains(out, "Unreachable") {
+		return false, true
+	}
+	return false, false
 }
 
 // inspectNICIP is the address `lv inspect` output records for the VM's NIC on
@@ -2475,9 +2490,24 @@ vms:
 	})
 
 	t.Run("Isolated/CrossHostNotReachable", func(t *testing.T) {
+		vm1IP := getVMIP(t, vm1Name, stackName, "isonet")
+		vm3IP := getVMIP(t, vm3Name, stackName, "isonet")
 		vm2IP := getVMIP(t, vm2Name, stackName, "isonet")
-		out, err := execRetry(t, vm1Name, "ping", "-c", "3", "-W", "3", vm2IP)
-		if err == nil {
+		// Each host leases the isolated range independently, so vm2 may hold
+		// the same address as a VM on host 1: a ping to it then proves nothing.
+		if vm2IP == vm1IP || vm2IP == vm3IP {
+			t.Skipf("%s's isolated address %s equals %s's (%s) or %s's (%s) on the other host; a ping to it would be answered locally", vm2Name, vm2IP, vm1Name, vm1IP, vm3Name, vm3IP)
+		}
+		// Control: the guest agent answers, so a failure below is the ping's.
+		if _, err := execRetry(t, vm1Name, "true"); err != nil {
+			t.Fatalf("lv exec on %s does not work, so the cross-host check cannot run: %v", vm1Name, err)
+		}
+		out, err := lvErr(t, "exec", vm1Name, "ping", "-c", "3", "-W", "3", vm2IP)
+		reached, conclusive := pingVerdict(out, err)
+		switch {
+		case !conclusive:
+			t.Fatalf("lv exec ping from %s failed without a ping result, so cross-host unreachability is unproven: %v\n%s", vm1Name, err, out)
+		case reached:
 			t.Errorf("ping from %s (%s) to %s (%s) on the isolated net succeeded across hosts; an isolated network does not span hosts: %s", vm1Name, hostNames[0], vm2Name, vm2IP, out)
 		}
 	})
@@ -3004,7 +3034,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestLeaseSampleCoherent"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestLeaseSampleCoherent", "TestIncoherenceTracker", "TestPingVerdict"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

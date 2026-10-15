@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,17 +140,70 @@ func TestPollFor(t *testing.T) {
 		t.Fatalf("ok=%v after %d calls, want true after 3", ok, n)
 	}
 	n = 0
-	if _, ok := pollFor(20*time.Millisecond, 5*time.Millisecond, func() bool { n++; return false }); ok || n < 2 {
-		t.Fatalf("ok=%v after %d calls, want false after several", ok, n)
+	took, ok := pollFor(50*time.Millisecond, 10*time.Millisecond, func() bool { n++; return false })
+	if ok || took < 50*time.Millisecond || took > time.Second || n < 4 {
+		t.Fatalf("a never-true poll: ok=%v after %v and %d calls, want false at the 50 ms bound", ok, took, n)
 	}
 }
 
 // TestHostStateInLs pins the parse waitServing relies on.
 func TestHostStateInLs(t *testing.T) {
 	out := "NAME ADDR STATE\nnode-1 10.0.0.1 HOST_DRAINING x\nnode-2 10.0.0.2 HOST_ACTIVE x\n"
+	got := parseHostStates(out)
 	for host, want := range map[string]string{"node-1": "HOST_DRAINING", "node-2": "HOST_ACTIVE", "node-3": ""} {
-		if got := hostStateInLs(out, host); got != want {
-			t.Errorf("%s: %q, want %q", host, got, want)
+		if got[host] != want {
+			t.Errorf("%s: %q, want %q", host, got[host], want)
+		}
+	}
+}
+
+// TestIncoherenceTracker: a transient incoherent run is tolerated (and ends on
+// a coherent sample); one that lasts the bound fails, once.
+func TestIncoherenceTracker(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	var c incoherenceTracker
+	for i := 0; i < 5; i++ { // 5 s, under the bound
+		if c.observe(t0.Add(time.Duration(i)*time.Second), false) {
+			t.Fatalf("a %d s run failed", i)
+		}
+	}
+	c.observe(t0.Add(6*time.Second), true)
+	if c.n != 0 {
+		t.Fatal("a coherent sample did not end the run")
+	}
+	var fails int
+	for i := 0; i < 30; i++ { // persistent
+		if c.observe(t0.Add(time.Duration(20+i)*time.Second), false) {
+			fails++
+		}
+	}
+	if fails != 1 {
+		t.Fatalf("a persistent run failed %d times, want once", fails)
+	}
+	// Three fast samples are not enough without the time bound, and the time
+	// bound is not enough with fewer than three samples.
+	var d incoherenceTracker
+	d.observe(t0, false)
+	if d.observe(t0.Add(11*time.Second), false) {
+		t.Fatal("two samples failed")
+	}
+}
+
+// TestPingVerdict: only a ping that ran and lost its packets counts as
+// "unreachable"; a transport failure of lv exec is inconclusive.
+func TestPingVerdict(t *testing.T) {
+	for _, c := range []struct {
+		out         string
+		err         error
+		reached, ok bool
+	}{
+		{"3 packets transmitted, 3 received", nil, true, true},
+		{"3 packets transmitted, 0 received, 100% packet loss", errors.New("exit 1"), false, true},
+		{"From 10.0.0.1 icmp_seq=1 Destination Host Unreachable", errors.New("exit 1"), false, true},
+		{"rpc error: connection refused", errors.New("exit 1"), false, false},
+	} {
+		if r, ok := pingVerdict(c.out, c.err); r != c.reached || ok != c.ok {
+			t.Errorf("%q: reached=%v conclusive=%v, want %v %v", c.out, r, ok, c.reached, c.ok)
 		}
 	}
 }

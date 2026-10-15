@@ -166,6 +166,11 @@ type Coordinator struct {
 	// stopped holding from a new tenure (acquireLeaseTenure).
 	tenureTerm atomic.Int64
 	everHeld   atomic.Bool
+	// unshownSince is when this coordinator last stopped being able to show
+	// it holds the lease (dropLeaseTerm), in c.now() Unix nanoseconds, 0
+	// while it holds it. Before lease terms are minted it bounds how long a
+	// stand-down may last and still continue the tenure (acquireLeaseTenure).
+	unshownSince atomic.Int64
 	// cyclePolicy is the failover scope and voter regions read once for the
 	// cycle in progress (run), nil outside one. Only the poll goroutine
 	// touches it.
@@ -1251,6 +1256,7 @@ func (c *Coordinator) stepDownGauges() {
 // (acquireLeaseTenure). A lease that lapsed meanwhile is a new tenure there.
 func (c *Coordinator) dropLeaseTerm() {
 	c.leaseTerm.Store(0)
+	c.unshownSince.CompareAndSwap(0, c.now().UnixNano())
 }
 
 // loseLease records that another node holds the lease, or claims it: a gap
@@ -1495,6 +1501,13 @@ func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 // (leaseGap). A take that continues this node's own unexpired tenure at its
 // own term marks none, however the lease was last checked: no other node can
 // have taken a lease whose row still names this node unexpired.
+//
+// Neither half rests on this node's clock alone. The row must stay unexpired
+// past fenceSkewMargin from now (ownTenureLive), so a peer whose clock runs
+// that far ahead still sees it live. Before lease terms are minted (term 0),
+// when no term comparison backs the row, a take after a stand-down longer
+// than tenureStandDownBound is a new tenure too: a peer's take may not have
+// replicated back yet.
 func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure bool, err error) {
 	if c.lostEveryDecisionQuorum(ctx) {
 		if !c.leaseQuorumLost.Swap(true) {
@@ -1534,6 +1547,10 @@ func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure b
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false, false, nil
 	}
+	if since := c.unshownSince.Swap(0); since != 0 && term == 0 &&
+		c.now().Sub(time.Unix(0, since)) > tenureStandDownBound {
+		continues = false
+	}
 	if c.everHeld.Load() && (!continues || term != c.tenureTerm.Load()) {
 		// A new incarnation: another holder may have led since this one's.
 		newTenure = true
@@ -1547,9 +1564,10 @@ func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure b
 }
 
 // ownTenureLive reports whether the failover lease row names this node with
-// an expiry still ahead: the tenure it last held has not lapsed, so no other
-// node can have taken the lease since. A read error, or a row it cannot use,
-// reports false.
+// an expiry more than fenceSkewMargin ahead: the tenure it last held has not
+// lapsed even on a peer whose clock runs that far ahead, so no other node can
+// have taken the lease since. A read error, or a row it cannot use, reports
+// false.
 func (c *Coordinator) ownTenureLive(ctx context.Context) bool {
 	rows, err := c.db.Query(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
@@ -1557,8 +1575,13 @@ func (c *Coordinator) ownTenureLive(ctx context.Context) bool {
 		return false
 	}
 	exp, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
-	return err == nil && exp.After(c.now())
+	return err == nil && exp.After(c.now().Add(fenceSkewMargin))
 }
+
+// tenureStandDownBound is how long, before lease terms are minted, this
+// coordinator may be unable to show it holds the lease and still continue its
+// tenure on re-taking it: two polls, so a single failed read is not a gap.
+const tenureStandDownBound = 2 * pollInterval
 
 // onlyReportedPausedFilter keeps the items of kind that a recovery limited to
 // only may move: those listed there, which the host reported pausing. A nil

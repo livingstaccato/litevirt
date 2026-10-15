@@ -292,3 +292,82 @@ func TestRun_ANewTenureMidCycleAbortsWithoutSteppingDown(t *testing.T) {
 		t.Errorf("gauge = %d after a renewal as a new tenure, want 1: this node still leads", fm.stranded)
 	}
 }
+
+// setLeaseExpiry rewrites the failover lease row's expiry, holder and term
+// unchanged.
+func setLeaseExpiry(t *testing.T, db *corrosion.Client, ctx context.Context, at time.Time) {
+	t.Helper()
+	if err := db.Execute(ctx, `UPDATE leader_election SET expires_at = ? WHERE key = 'failover'`,
+		at.UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// briefStandDown runs one cycle with the voter majority lost, then sets the
+// lease row's expiry to expiry before the majority returns and the next cycle
+// re-takes the lease. It reports whether the re-take kept down's pause wait.
+func briefStandDown(t *testing.T, expiryIn time.Duration, ledger bool, after func(*Coordinator)) bool {
+	t.Helper()
+	c, db, ctx, mono := explicitPause(t)
+	if !ledger {
+		db.SetLeaseTermLedgerGate(func() bool { return false })
+	}
+	lost := false
+	c.Gate = quorumToggleGate{fakeFailoverGate: fakeFailoverGate{enforced: map[string]bool{}}, lost: &lost}
+	c.run(ctx)
+	w, ok := c.pauseWaits["down"]
+	if !ok {
+		t.Fatal("setup: no pause wait")
+	}
+	lost = true
+	c.run(ctx)
+	setLeaseExpiry(t, db, ctx, c.now().Add(expiryIn))
+	if after != nil {
+		after(c)
+	}
+	lost = false
+	mono.Advance(time.Second)
+	c.run(ctx)
+	got, ok := c.pauseWaits["down"]
+	return ok && got.deadline.Equal(w.deadline)
+}
+
+// The lease row still names this node, with less than fenceSkewMargin left:
+// a peer whose clock runs that far ahead has seen it expire and may have
+// taken the lease, its take not yet replicated here. The re-take is a gap.
+//
+// Mutation: compare the expiry with this node's clock alone (no margin) —
+// the wait is kept.
+func TestLeaseRegain_ARowAPeerAheadSeesExpiredIsAGap(t *testing.T) {
+	if briefStandDown(t, fenceSkewMargin-2*time.Second, true, nil) {
+		t.Fatal("pause wait kept across a re-take of a lease a peer whose clock runs ahead could have taken")
+	}
+}
+
+// A brief stand-down whose row keeps more than the margin left is no gap.
+//
+// Mutation: a margin larger than the head-room left (2×fenceSkewMargin) — the
+// wait is re-anchored.
+func TestLeaseRegain_ARowLiveBeyondTheMarginIsNoGap(t *testing.T) {
+	if !briefStandDown(t, fenceSkewMargin+3*time.Second, true, nil) {
+		t.Fatal("pause wait re-anchored after a brief stand-down whose lease row stayed live beyond the skew margin")
+	}
+}
+
+// Before lease terms are minted no term comparison backs the row, so a
+// stand-down longer than tenureStandDownBound is a gap even while the row
+// still looks live here.
+//
+// Mutation: drop the stand-down bound — the wait is kept.
+func TestLeaseRegain_AnUnlatchedLongStandDownIsAGap(t *testing.T) {
+	if !briefStandDown(t, leaseDuration, false, nil) {
+		t.Fatal("setup: a brief unlatched stand-down re-anchored the wait")
+	}
+	long := func(c *Coordinator) {
+		shift := tenureStandDownBound + time.Second
+		c.Now = func() time.Time { return time.Now().Add(shift) }
+	}
+	if briefStandDown(t, leaseDuration, false, long) {
+		t.Fatal("pause wait kept across an unlatched stand-down longer than the bound")
+	}
+}

@@ -81,8 +81,11 @@ type Server struct {
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory
 	invCacheAt time.Time
-	pkiDir     string
-	db         *corrosion.Client
+	// invCacheGen counts invalidations: a collect that began before one is
+	// not cached.
+	invCacheGen uint64
+	pkiDir      string
+	db          *corrosion.Client
 
 	// dependsOnWaitTimeout, when > 0, overrides waitForCondition's timeout.
 	// Test seam only (SetDependsOnWaitTimeoutForTests); zero in production.

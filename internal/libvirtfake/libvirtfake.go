@@ -1042,6 +1042,7 @@ func (f *Fake) listDomains() ([]string, error) {
 	for n := range f.domains {
 		out = append(out, n)
 	}
+	sort.Strings(out) // a test can tell which domain a list reaches last
 	return out, nil
 }
 

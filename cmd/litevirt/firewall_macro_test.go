@@ -19,16 +19,22 @@ import (
 // add calls) makes that add fail.
 type macroSpy struct {
 	pb.LiteVirtClient
-	sgAdds      []*pb.SecurityGroupRule
-	clusterAdds []*pb.FirewallRule
-	hostAdds    []*pb.FirewallRule
-	removed     []string
-	adds        int
-	failAt      int
+	sgAdds       []*pb.SecurityGroupRule
+	clusterAdds  []*pb.FirewallRule
+	hostAdds     []*pb.FirewallRule
+	removed      []string
+	adds         int
+	failAt       int
+	removeFail   map[string]bool
+	removeCtxErr []error
+	onAdd        func()
 }
 
 func (m *macroSpy) next() (string, error) {
 	m.adds++
+	if m.onAdd != nil {
+		m.onAdd()
+	}
 	if m.failAt != 0 && m.adds == m.failAt {
 		return "", errors.New("boom")
 	}
@@ -44,9 +50,17 @@ func (m *macroSpy) AddSecurityGroupRule(_ context.Context, in *pb.AddSecurityGro
 	return &pb.SecurityGroupRule{Id: id}, nil
 }
 
-func (m *macroSpy) RemoveSecurityGroupRule(_ context.Context, in *pb.RemoveSecurityGroupRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	m.removed = append(m.removed, in.GetId())
+func (m *macroSpy) remove(ctx context.Context, id string) (*emptypb.Empty, error) {
+	m.removeCtxErr = append(m.removeCtxErr, ctx.Err())
+	if m.removeFail[id] {
+		return nil, errors.New("remove refused")
+	}
+	m.removed = append(m.removed, id)
 	return &emptypb.Empty{}, nil
+}
+
+func (m *macroSpy) RemoveSecurityGroupRule(ctx context.Context, in *pb.RemoveSecurityGroupRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return m.remove(ctx, in.GetId())
 }
 
 func (m *macroSpy) CreateClusterFirewallRule(_ context.Context, in *pb.CreateClusterFirewallRuleRequest, _ ...grpc.CallOption) (*pb.FirewallRule, error) {
@@ -58,9 +72,8 @@ func (m *macroSpy) CreateClusterFirewallRule(_ context.Context, in *pb.CreateClu
 	return &pb.FirewallRule{Id: id}, nil
 }
 
-func (m *macroSpy) DeleteClusterFirewallRule(_ context.Context, in *pb.DeleteClusterFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	m.removed = append(m.removed, in.GetId())
-	return &emptypb.Empty{}, nil
+func (m *macroSpy) DeleteClusterFirewallRule(ctx context.Context, in *pb.DeleteClusterFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return m.remove(ctx, in.GetId())
 }
 
 func (m *macroSpy) CreateHostFirewallRule(_ context.Context, in *pb.CreateHostFirewallRuleRequest, _ ...grpc.CallOption) (*pb.FirewallRule, error) {
@@ -72,12 +85,16 @@ func (m *macroSpy) CreateHostFirewallRule(_ context.Context, in *pb.CreateHostFi
 	return &pb.FirewallRule{Id: id}, nil
 }
 
-func (m *macroSpy) DeleteHostFirewallRule(_ context.Context, in *pb.DeleteHostFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	m.removed = append(m.removed, in.GetId())
-	return &emptypb.Empty{}, nil
+func (m *macroSpy) DeleteHostFirewallRule(ctx context.Context, in *pb.DeleteHostFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	return m.remove(ctx, in.GetId())
 }
 
 func runMacroCLI(t *testing.T, spy *macroSpy, cmd *cobra.Command, args ...string) (string, error) {
+	t.Helper()
+	return runMacroCLICtx(t, context.Background(), spy, cmd, args...)
+}
+
+func runMacroCLICtx(t *testing.T, parent context.Context, spy *macroSpy, cmd *cobra.Command, args ...string) (string, error) {
 	t.Helper()
 	orig := withClient
 	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
@@ -90,7 +107,7 @@ func runMacroCLI(t *testing.T, spy *macroSpy, cmd *cobra.Command, args ...string
 	cmd.SilenceUsage = true
 	cmd.SilenceErrors = true
 	var err error
-	out := captureStdout(t, func() { err = cmd.Execute() })
+	out := captureStdout(t, func() { err = cmd.ExecuteContext(parent) })
 	return out, err
 }
 
@@ -230,5 +247,47 @@ func TestFirewallMacrosCmd_ListsCatalog(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in %q", want, out)
 		}
+	}
+}
+
+// Mutation: remove with the failed call's context (the cancelled one).
+func TestSGRuleAddMacro_RollbackSurvivesCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	spy := &macroSpy{failAt: 2}
+	spy.onAdd = func() {
+		if spy.adds == 2 {
+			cancel()
+		}
+	}
+	_, err := runMacroCLICtx(t, ctx, spy, newSGRuleAddCmd(), "web", "--macro", "DNS")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if len(spy.removed) != 1 || spy.removed[0] != "id-1" {
+		t.Fatalf("removed = %v", spy.removed)
+	}
+	for _, e := range spy.removeCtxErr {
+		if e != nil {
+			t.Fatalf("rollback used a dead context: %v", e)
+		}
+	}
+}
+
+// Mutation: report success when a removal fails; drop the id from the error.
+func TestSGRuleAddMacro_RollbackFailureNamesLeftBehindIDs(t *testing.T) {
+	spy := &macroSpy{failAt: 3, removeFail: map[string]bool{"id-2": true}}
+	out, err := runMacroCLI(t, spy, newSGRuleAddCmd(), "web", "--macro", "Ceph")
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "id-2") || strings.Contains(err.Error(), "id-1:") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(spy.removed) != 1 || spy.removed[0] != "id-1" {
+		t.Fatalf("removed = %v", spy.removed)
+	}
+	if out != "" {
+		t.Fatalf("a failed macro printed %q", out)
 	}
 }

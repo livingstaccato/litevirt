@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -104,7 +105,7 @@ func (rf *ruleFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&rf.action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().StringVar(&rf.comment, "comment", "", "human-readable note rendered on the rule")
 	cmd.Flags().IntVar(&rf.priority, "priority", 100, "lower runs first")
-	cmd.Flags().StringVar(&rf.macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see `lv firewall macros`)")
+	cmd.Flags().StringVar(&rf.macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
 }
 
 // macroComment is the comment a macro's rows carry when none is given.
@@ -426,6 +427,9 @@ func checkMacroFlags(cmd *cobra.Command) error {
 	return nil
 }
 
+// macroRollbackTimeout bounds the removal of a failed macro's rows.
+const macroRollbackTimeout = 30 * time.Second
+
 // runMacroAdd expands a macro client-side into one ordinary rule per row. add
 // creates one row and returns its id; remove deletes one by id; added renders
 // the line printed for each created id. When a row fails, the rows already
@@ -454,9 +458,14 @@ func runMacroAdd(
 		for i, row := range rows {
 			id, err := add(ctx, c, m.Name, row)
 			if err != nil {
+				// The failed call's context may be cancelled or out of time;
+				// the removals get their own, which keeps the caller's values
+				// (the bearer token) but not its cancellation.
+				rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), macroRollbackTimeout)
+				defer cancel()
 				var rbErrs []string
 				for _, done := range ids {
-					if rerr := remove(ctx, c, done); rerr != nil {
+					if rerr := remove(rbCtx, c, done); rerr != nil {
 						rbErrs = append(rbErrs, fmt.Sprintf("%s: %v", done, rerr))
 					}
 				}
@@ -471,6 +480,8 @@ func runMacroAdd(
 				return errors.New(msg)
 			}
 			ids = append(ids, id)
+		}
+		for _, id := range ids {
 			fmt.Print(added(id))
 		}
 		return nil

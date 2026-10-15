@@ -326,7 +326,7 @@ func newSGRuleAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cidr, "cidr", "", "source/dest CIDR or @ipset-name (default: any)")
 	cmd.Flags().StringVar(&action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().IntVar(&priority, "priority", 100, "lower runs first")
-	cmd.Flags().StringVar(&macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see `lv firewall macros`)")
+	cmd.Flags().StringVar(&macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
 	return cmd
 }
 

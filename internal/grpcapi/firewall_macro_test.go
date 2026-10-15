@@ -88,11 +88,12 @@ firewall:
 		"port":    {Direction: "ingress", Macro: "SSH", Port: "2222", Action: "accept"},
 		"unknown": {Direction: "ingress", Macro: "Nope", Action: "accept"},
 		// A grammar refusal on the second rule of the file: no row of the
-		// first (a whole macro) may be written.
+		// first (a whole macro) may be written. The first rule needs the IPv6
+		// gate, so an expansion that ran after the gate loop would ask it.
 		"cidr": {Direction: "ingress", Macro: "DNS", CIDR: "2001:db8::/32 }", Action: "accept"},
 	} {
 		bad := &compose.File{Name: "m", FirewallDefaults: &compose.FirewallDefaultsDef{
-			ClusterRules: []compose.FirewallRuleDef{{Direction: "ingress", Macro: "Web", Action: "accept"}, rule},
+			ClusterRules: []compose.FirewallRuleDef{{Direction: "ingress", Macro: "Web", CIDR: "2001:db8::/32", Action: "accept"}, rule},
 		}}
 		if err := s.persistStackFirewall(ctx, bad); err == nil {
 			t.Errorf("%s: accepted", name)

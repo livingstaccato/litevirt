@@ -106,8 +106,10 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 		return nil, err
 	}
 	// Macros expand after the file is judged (a stored file is not), so no
-	// later stage sees one. A stored stack re-expands on every read.
-	if err := ExpandMacros(&f); err != nil {
+	// later stage sees one. A stored stack re-expands on every read, best
+	// effort: a macro this build cannot resolve (renamed, removed, newer than
+	// this node's catalog) stays as written, and only a deploy refuses it.
+	if err := expandMacros(&f, opts.stored); err != nil {
 		return nil, err
 	}
 	return &f, nil

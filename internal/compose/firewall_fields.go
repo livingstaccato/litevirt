@@ -61,7 +61,17 @@ func checkMacroRule(r FirewallRuleDef) error {
 // file already expanded is too, so it is safe to call again. A rule the
 // catalog does not resolve is an error: it is never left to be written as a
 // rule with no proto or port, which would allow everything.
-func ExpandMacros(f *File) error {
+//
+// ExpandMacros rewrites the rule slices of f in place: the caller's file no
+// longer holds the rows as written, so nothing may rely on the original rows
+// after the call.
+func ExpandMacros(f *File) error { return expandMacros(f, false) }
+
+// expandMacros is ExpandMacros; lenient (a stored stack is read, not judged)
+// leaves a macro rule that does not resolve as written, with no error. The
+// deploy expands strictly and refuses such a rule before it tears anything
+// down.
+func expandMacros(f *File, lenient bool) error {
 	names := make([]string, 0, len(f.SecurityGroups))
 	for name := range f.SecurityGroups {
 		names = append(names, name)
@@ -69,7 +79,7 @@ func ExpandMacros(f *File) error {
 	sort.Strings(names)
 	for _, name := range names {
 		sg := f.SecurityGroups[name]
-		rules, err := expandMacroRules(sg.Rules, false)
+		rules, err := expandMacroRules(sg.Rules, false, lenient)
 		if err != nil {
 			return fmt.Errorf("security-groups.%s.rules: %w", name, err)
 		}
@@ -77,7 +87,7 @@ func ExpandMacros(f *File) error {
 		f.SecurityGroups[name] = sg
 	}
 	if fd := f.FirewallDefaults; fd != nil {
-		rules, err := expandMacroRules(fd.ClusterRules, true)
+		rules, err := expandMacroRules(fd.ClusterRules, true, lenient)
 		if err != nil {
 			return fmt.Errorf("firewall.cluster-rules: %w", err)
 		}
@@ -86,7 +96,7 @@ func ExpandMacros(f *File) error {
 	return nil
 }
 
-func expandMacroRules(in []FirewallRuleDef, label bool) ([]FirewallRuleDef, error) {
+func expandMacroRules(in []FirewallRuleDef, label, lenient bool) ([]FirewallRuleDef, error) {
 	has := false
 	for _, r := range in {
 		if r.Macro != "" {
@@ -108,6 +118,11 @@ func expandMacroRules(in []FirewallRuleDef, label bool) ([]FirewallRuleDef, erro
 			continue
 		}
 		if err := checkMacroRule(r); err != nil {
+			if lenient {
+				r.Priority = prio
+				out = append(out, r)
+				continue
+			}
 			return nil, fmt.Errorf("[%d]: %w", i, err)
 		}
 		m, _ := macro.LookupMacro(r.Macro)

@@ -116,3 +116,38 @@ func TestExpandMacros_Idempotent(t *testing.T) {
 		t.Errorf("rows after a second expansion = %d, want 6", n)
 	}
 }
+
+// A stored stack is read, not judged: a macro this build cannot resolve
+// leaves the stack readable, its other rows intact; the deploy's strict
+// expansion still refuses it.
+func TestMacro_StoredUnknownMacroStillParses(t *testing.T) {
+	const y = `name: s
+security-groups:
+  web:
+    rules:
+      - { direction: ingress, proto: tcp, port: "22", action: accept }
+      - { direction: ingress, macro: FromTheFuture, action: accept }
+      - { direction: ingress, macro: DNS, action: accept }
+firewall:
+  cluster-rules:
+    - { direction: ingress, macro: SSH, port: "1", action: accept }
+`
+	f, err := ParseStored([]byte(y))
+	if err != nil {
+		t.Fatalf("stored stack with an unresolvable macro: %v", err)
+	}
+	rs := f.SecurityGroups["web"].Rules
+	if len(rs) != 4 || rs[0].Port != "22" || rs[1].Macro != "FromTheFuture" || rs[1].Priority != 20 ||
+		rs[2].Port != "53" || rs[2].Priority != 30 || rs[3].Port != "53" {
+		t.Errorf("rows = %+v", rs)
+	}
+	if cr := f.FirewallDefaults.ClusterRules; len(cr) != 1 || cr[0].Macro != "SSH" {
+		t.Errorf("cluster rows = %+v", cr)
+	}
+	if err := ExpandMacros(f); err == nil {
+		t.Error("the strict expansion accepted an unresolvable macro")
+	}
+	if _, err := ParseBytes([]byte(y)); err == nil {
+		t.Error("a deploy parse accepted an unresolvable macro")
+	}
+}

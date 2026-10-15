@@ -463,9 +463,10 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			return plan, err
 		}
 		var badSets []InvalidRow
-		plan.IPSets, badSets = quarantineIPSets(ipsets)
+		var degraded map[string]bool
+		plan.IPSets, badSets, degraded = quarantineIPSets(ipsets)
 		prevRules, emptySince := memory.snapshot()
-		q := newQuarantine(plan.IPSets, prevRules, emptySince, now())
+		q := newQuarantine(plan.IPSets, degraded, prevRules, emptySince, now())
 
 		clusterRules, err := corrosion.ListClusterFirewallRules(ctx, db)
 		if err != nil {

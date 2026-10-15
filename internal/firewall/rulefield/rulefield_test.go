@@ -200,6 +200,18 @@ func TestSyntax_Lists(t *testing.T) {
 	if got := NormaliseSetElements([]string{"10.0.0.1,10.0.0.2", " 10.0.0.5 ,, ", ""}); strings.Join(got, "|") != "10.0.0.1|10.0.0.2|10.0.0.5" {
 		t.Errorf("NormaliseSetElements = %q", got)
 	}
+	// Re-review 2 I-2: a set is compared only with equality or its negation.
+	for _, v := range []string{"@x", "== @x", "eq @x", "!= @x", "!=@x", "ne @x", "==@x"} {
+		if err := CIDR(v); err != nil {
+			t.Errorf("CIDR(%q): %v", v, err)
+		}
+	}
+	for _, v := range []string{"< @x", "<= @x", "> @x", ">= @x", "lt @x", "le @x", "gt @x", "ge @x", "<@x", ">=@x",
+		"{ @x }", "!= { @x }", "& 255.0.0.0 != @x"} {
+		if err := CIDR(v); err == nil {
+			t.Errorf("CIDR(%q) accepted; nft refuses it", v)
+		}
+	}
 	if name, ok := SetRef("!=\t@office"); !ok || name != "office" {
 		t.Errorf("SetRef(!= @office) = %q, %v", name, ok)
 	}

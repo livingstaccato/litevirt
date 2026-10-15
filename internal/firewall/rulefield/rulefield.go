@@ -78,11 +78,30 @@ func refuse(field, value, format string, args ...any) error {
 // SetRef is the ip-set name a CIDR references, after any relational operator
 // ("@x", "!= @x", "!=@x"), and whether it references one.
 func SetRef(cidr string) (string, bool) {
-	v := stripOp(trimBlank(blanks(cidr)))
+	name, _, ok := SetRefOp(cidr)
+	return name, ok
+}
+
+// SetRefOp is SetRef with the relational operator in front of the reference
+// ("" when bare).
+func SetRefOp(cidr string) (name, op string, ok bool) {
+	op, v := cutOp(trimBlank(blanks(cidr)))
 	if name, ok := strings.CutPrefix(v, "@"); ok {
-		return name, true
+		return name, op, true
 	}
-	return "", false
+	return "", "", false
+}
+
+// SetRefOpOK reports whether nft can compare a set reference with op: only
+// equality and its negation. nft refuses `< @x` and the rest ("Relational
+// expression (<) is undefined for set reference expressions"), and refuses
+// the whole ruleset with it.
+func SetRefOpOK(op string) bool {
+	switch op {
+	case "", "==", "eq", "!=", "ne":
+		return true
+	}
+	return false
 }
 
 // NegatedSetRef reports whether cidr is a negated set reference ("!= @x",
@@ -297,17 +316,24 @@ func stripMask(v string) (mask, rest string) {
 
 // stripOp removes one leading relational operator.
 func stripOp(v string) string {
+	_, rest := cutOp(v)
+	return rest
+}
+
+// cutOp splits one leading relational operator ("" when there is none) from
+// the rest.
+func cutOp(v string) (op, rest string) {
 	for _, op := range relOps {
 		if rest, ok := strings.CutPrefix(v, op); ok {
-			return trimBlank(rest)
+			return op, trimBlank(rest)
 		}
 	}
 	for _, w := range relWords {
 		if rest, ok := strings.CutPrefix(v, w+" "); ok {
-			return trimBlank(rest)
+			return w, trimBlank(rest)
 		}
 	}
-	return v
+	return "", v
 }
 
 // cutRange splits "a-b" or "a - b". An element whose dash has no space around
@@ -533,7 +559,10 @@ func CIDR(s string) error {
 	if err := RenderCIDR(s); err != nil {
 		return err
 	}
-	if name, ok := SetRef(s); ok {
+	if name, op, ok := SetRefOp(s); ok {
+		if !SetRefOpOK(op) {
+			return refuse("cidr", s, "a set can be matched only with ==, eq, != or ne, not %s", op)
+		}
 		if err := SetName(name); err != nil {
 			return refuse("cidr", s, "set reference: %s", err.(*FieldError).Reason)
 		}

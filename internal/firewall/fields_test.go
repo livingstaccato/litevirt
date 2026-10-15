@@ -141,6 +141,19 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	cluster("missing", "ingress", "all", "", "@never", "drop", "")
 	cluster("neg-missing", "ingress", "tcp", "22", "!= @gone", "accept", "") // blocklist by accept
 	cluster("neg-drop", "ingress", "tcp", "24", "!=@gone2", "drop", "")      // allowlist by drop
+	// Re-review 2 I-1: sets that lost elements to quarantine, all or some.
+	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-allbad', 'allbad', ?, '', ?, 1), ('set-somebad', 'somebad', ?, '', ?, 1)`,
+		`["10.40.0.0/16 }", ",10.41.0.1"]`, now, `["10.30.0.0/16", "10.31.0.0/16 ;x"]`, now)
+	cluster("neg-allbad", "ingress", "tcp", "25", "!= @allbad", "drop", "")     // allowlist by drop
+	cluster("neg-somebad", "ingress", "tcp", "26", "!= @somebad", "accept", "") // blocklist by accept
+	cluster("pos-somebad", "ingress", "tcp", "27", "@somebad", "drop", "")      // positive: fewer elements narrow it
+	// Re-review 2 I-2 and m-a: set references nft refuses, from an older peer.
+	cluster("lt-set", "ingress", "tcp", "28", "< @office", "accept", "")
+	cluster("ge-set", "ingress", "tcp", "29", "ge @office", "drop", "")
+	cluster("mask-set", "ingress", "tcp", "30", "& 255.0.0.0 != @office", "drop", "")
+	cluster("brace-set", "ingress", "tcp", "31", "{ @office }", "accept", "")
+	cluster("negbrace-set", "ingress", "tcp", "32", "!= { @office }", "drop", "")
 	rawRow(t, db, `INSERT INTO host_firewall_rules
 		(id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		VALUES ('host-bad', 'host-a', 'in', ?, '8080', '203.0.113.7', 'drop', 100, '', '', ?, 1)`, "esp\n"+injectMark, now)
@@ -164,7 +177,9 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 		"ip saddr @never drop",                         // never existed: empty set
 		"tcp dport 22 ip saddr != @office drop",        // neg-flip: kept as last rendered (office still exists)
 	)
-	for _, gone := range []string{"@gone", "@gone2", "@nooffice", "@office2", "10.0.0.9"} {
+	mustContainAll(t, out, "tcp dport 27 ip saddr @somebad drop", "elements = { 10.30.0.0/16 }")
+	for _, gone := range []string{"@gone", "@gone2", "@nooffice", "@office2", "10.0.0.9", "@allbad",
+		"!= @somebad", "dport 28 ", "dport 29 ", "dport 30 ", "dport 31 ", "dport 32 "} {
 		if strings.Contains(out, gone) {
 			t.Errorf("%s rendered: a negated reference to a missing set (or a bad element) reached the script:\n%s", gone, out)
 		}
@@ -197,18 +212,27 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	}
 
 	immediate := map[string]string{
-		"cluster_firewall_rules/flip":        HandlingKeptLast,
-		"cluster_firewall_rules/neg-flip":    HandlingKeptLast,
-		"cluster_firewall_rules/neg-del":     HandlingLeftOut,
-		"cluster_firewall_rules/bad-accept":  HandlingLeftOut,
-		"cluster_firewall_rules/bad-drop":    HandlingLeftOut,
-		"cluster_firewall_rules/bad-verdict": HandlingLeftOut,
-		"cluster_firewall_rules/allow-all":   HandlingLeftOut,
-		"cluster_firewall_rules/neg-missing": HandlingLeftOut,
-		"cluster_firewall_rules/neg-drop":    HandlingLeftOut,
-		"ip_sets/set-bad":                    HandlingElementsLeftOut,
-		"host_firewall_rules/host-bad":       HandlingLeftOut,
-		"sg_rules/sg-bad":                    HandlingLeftOut,
+		"cluster_firewall_rules/flip":         HandlingKeptLast,
+		"cluster_firewall_rules/neg-flip":     HandlingKeptLast,
+		"cluster_firewall_rules/neg-del":      HandlingLeftOut,
+		"cluster_firewall_rules/bad-accept":   HandlingLeftOut,
+		"cluster_firewall_rules/bad-drop":     HandlingLeftOut,
+		"cluster_firewall_rules/bad-verdict":  HandlingLeftOut,
+		"cluster_firewall_rules/allow-all":    HandlingLeftOut,
+		"cluster_firewall_rules/neg-missing":  HandlingLeftOut,
+		"cluster_firewall_rules/neg-drop":     HandlingLeftOut,
+		"cluster_firewall_rules/neg-allbad":   HandlingLeftOut,
+		"cluster_firewall_rules/neg-somebad":  HandlingLeftOut,
+		"cluster_firewall_rules/lt-set":       HandlingLeftOut,
+		"cluster_firewall_rules/ge-set":       HandlingLeftOut,
+		"cluster_firewall_rules/mask-set":     HandlingLeftOut,
+		"cluster_firewall_rules/brace-set":    HandlingLeftOut,
+		"cluster_firewall_rules/negbrace-set": HandlingLeftOut,
+		"ip_sets/set-allbad":                  HandlingElementsLeftOut,
+		"ip_sets/set-somebad":                 HandlingElementsLeftOut,
+		"ip_sets/set-bad":                     HandlingElementsLeftOut,
+		"host_firewall_rules/host-bad":        HandlingLeftOut,
+		"sg_rules/sg-bad":                     HandlingLeftOut,
 	}
 	check := func(plan Plan, want map[string]string) map[string]InvalidRow {
 		t.Helper()
@@ -305,5 +329,73 @@ func TestQuoteComment(t *testing.T) {
 func TestLoader_CompatRowsAreValid(t *testing.T) {
 	if inv := loadCompatPlan(t).InvalidRows; len(inv) != 0 {
 		t.Fatalf("rows that apply today were quarantined: %+v", inv)
+	}
+}
+
+// TestLoader_KeptRenderingRecheckedUnderThisPassSets (re-review 2 m-b): a
+// row's last rendering is kept only if it is still renderable now. Here it
+// referenced x_v6 while x had no IPv6 element; x then gains one, so x_v6 is
+// x's companion and the kept rendering would declare it twice.
+func TestLoader_KeptRenderingRecheckedUnderThisPassSets(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	const now = "2026-10-15T00:00:00Z"
+	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-x', 'x', '["10.0.0.0/8"]', '', ?, 1)`, now)
+	rawRow(t, db, `INSERT INTO cluster_firewall_rules
+		(id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
+		VALUES ('r', 'ingress', 'tcp', '22', '@x_v6', 'accept', 100, '', '', ?, 1)`, now)
+	loader := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})
+	for pass := 1; pass <= 2; pass++ {
+		plan, err := loader(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Render(plan); err != nil {
+			t.Fatalf("pass %d: the plan was refused: %v", pass, err)
+		}
+		if pass == 1 {
+			rawRow(t, db, `UPDATE ip_sets SET cidrs = '["10.0.0.0/8", "fd00::/8"]' WHERE id = 'set-x'`)
+			rawRow(t, db, `UPDATE cluster_firewall_rules SET port_range = '22; x' WHERE id = 'r'`)
+			continue
+		}
+		if len(plan.ClusterRules) != 0 {
+			t.Errorf("the kept rendering was rendered though x_v6 is now x's companion: %+v", plan.ClusterRules)
+		}
+	}
+}
+
+// TestRender_NegatedSetSplitsPerFamily: a negated reference to a set with IPv6
+// elements holds IPv6 traffic too, one line per family, as a positive one
+// does.
+func TestRender_NegatedSetSplitsPerFamily(t *testing.T) {
+	for _, cidr := range []string{"!= @office", "!=@office", "ne @office", "== @office"} {
+		out, err := Render(Plan{
+			IPSets:       []IPSet{{Name: "office", CIDRs: []string{"10.0.0.0/8", "fd00::/8"}}},
+			ClusterRules: []Rule{{Direction: Ingress, Proto: "tcp", PortRange: "22", CIDR: cidr, Action: Drop}},
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", cidr, err)
+		}
+		mustContainAll(t, out, "tcp dport 22 ip saddr "+cidr+" drop", "tcp dport 22 ip6 saddr "+cidr+"_v6 drop")
+	}
+}
+
+// TestRender_RefusesSetOperators (re-review 2 I-2, m-a): nft refuses a set
+// compared with <, <=, >, >= (or the word forms), and a set reference in
+// braces or behind a mask; the renderer refuses them rather than emit them.
+func TestRender_RefusesSetOperators(t *testing.T) {
+	for _, cidr := range []string{"< @s", "<= @s", "> @s", ">= @s", "lt @s", "le @s", "gt @s", "ge @s", "<@s",
+		"{ @s }", "!= { @s }", "& 255.0.0.0 != @s", "& 255.0.0.0 @s"} {
+		_, err := Render(Plan{
+			IPSets:       []IPSet{{Name: "s", CIDRs: []string{"10.0.0.0/8"}}},
+			ClusterRules: []Rule{{Direction: Ingress, Proto: "all", CIDR: cidr, Action: Drop}},
+		})
+		if err == nil {
+			t.Errorf("%q rendered; nft refuses it", cidr)
+		}
 	}
 }

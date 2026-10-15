@@ -98,6 +98,7 @@ type quarantine struct {
 	prev      map[string]Rule // last pass's renderings
 	next      map[string]Rule // this pass's
 	emptySets map[string]bool // missing sets rendered empty
+	degraded  map[string]bool // sets rendered without some of their elements
 	invalid   []InvalidRow
 
 	now       time.Time
@@ -105,8 +106,8 @@ type quarantine struct {
 	emptyNext map[string]time.Time
 }
 
-func newQuarantine(sets []IPSet, prev map[string]Rule, emptyPrev map[string]time.Time, now time.Time) *quarantine {
-	q := &quarantine{knownSets: map[string]bool{}, prev: prev, next: map[string]Rule{},
+func newQuarantine(sets []IPSet, degraded map[string]bool, prev map[string]Rule, emptyPrev map[string]time.Time, now time.Time) *quarantine {
+	q := &quarantine{knownSets: map[string]bool{}, degraded: degraded, prev: prev, next: map[string]Rule{},
 		emptySets: map[string]bool{}, v6Sets: setsWithIPv6(sets),
 		now: now, emptyPrev: emptyPrev, emptyNext: map[string]time.Time{}}
 	for _, s := range sets {
@@ -131,8 +132,11 @@ func (q *quarantine) rule(table, id, direction, proto, port, cidr, action, comme
 	}
 	if why != "" {
 		inv := InvalidRow{Table: table, ID: id, Action: action, Reason: why, Handling: HandlingLeftOut}
+		// The last rendering is kept only while it is still renderable under
+		// this pass's sets (re-review 2 m-b): readable, and, when negated, its
+		// set present and whole.
 		old, ok := q.prev[key]
-		if !ok || q.negatedMissing(old) != "" {
+		if !ok || q.unreadable(old, string(old.Action)) != "" || q.negatedMissing(old) != "" {
 			q.invalid = append(q.invalid, inv)
 			return Rule{}, false
 		}
@@ -161,9 +165,21 @@ func (q *quarantine) rule(table, id, direction, proto, port, cidr, action, comme
 // negatedMissing is why r cannot be rendered against an empty set: its
 // reference to a missing set is negated, and "not in an empty set" is every
 // address — a drop would drop everything, an accept admit everything.
+//
+// A set that lost any element to quarantine counts as missing here too
+// (re-review 2 I-1): "not in" a set rendered without some of its elements
+// matches the addresses it was meant to list, and every address when it lost
+// them all.
 func (q *quarantine) negatedMissing(r Rule) string {
-	if name, ok := rulefield.SetRef(r.CIDR); ok && !q.knownSets[name] && rulefield.NegatedSetRef(r.CIDR) {
+	name, ok := rulefield.SetRef(r.CIDR)
+	if !ok || !rulefield.NegatedSetRef(r.CIDR) {
+		return ""
+	}
+	switch {
+	case !q.knownSets[name]:
 		return fmt.Sprintf("negated reference to ip set %q, which does not exist (it would match every address)", name)
+	case q.degraded[name]:
+		return fmt.Sprintf("negated reference to ip set %q, whose unreadable elements were left out (it would match the addresses the set lists)", name)
 	}
 	return ""
 }
@@ -179,12 +195,19 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 			reasons = append(reasons, err.Error())
 		}
 	}
-	if name, ok := rulefield.SetRef(r.CIDR); ok {
+	if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
+		if !rulefield.SetRefOpOK(op) {
+			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
+		}
 		if err := rulefield.RenderSetName(name); err != nil {
 			reasons = append(reasons, err.Error())
 		} else if base, isComp := strings.CutSuffix(name, ipv6SetSuffix); isComp && q.v6Sets[base] && !q.knownSets[name] {
 			reasons = append(reasons, fmt.Sprintf("cidr %q names the IPv6 companion of set %q; reference the set itself", r.CIDR, base))
 		}
+	} else if strings.Contains(r.CIDR, "@") {
+		// A set reference behind a mask or inside braces (re-review 2 m-a):
+		// nft refuses `{ @x }`, and the set's presence cannot be checked.
+		reasons = append(reasons, fmt.Sprintf("cidr %q references a set other than as @name, != @name or == @name", r.CIDR))
 	} else if isIPv6Literal(r.CIDR) {
 		if !validAddrOrPrefix(r.CIDR, true) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q is not an IPv6 address or prefix", r.CIDR))
@@ -211,9 +234,11 @@ func (q *quarantine) sets() []IPSet {
 
 // quarantineIPSets returns the ip sets the plan renders: each without the
 // elements that cannot be rendered, and none whose name cannot be.
-func quarantineIPSets(sets []corrosion.IPSet) ([]IPSet, []InvalidRow) {
-	var out []IPSet
-	var inv []InvalidRow
+//
+// degraded names the sets that lost an element: a negated reference to one is
+// not rendered (quarantine.negatedMissing).
+func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, degraded map[string]bool) {
+	degraded = map[string]bool{}
 	for _, s := range sets {
 		if err := rulefield.RenderSetName(s.Name); err != nil {
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: err.Error(), Handling: HandlingSetLeftOut})
@@ -237,10 +262,11 @@ func quarantineIPSets(sets []corrosion.IPSet) ([]IPSet, []InvalidRow) {
 				bad = append(bad[:3], fmt.Sprintf("and %d more", len(bad)-3))
 			}
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: strings.Join(bad, "; "), Handling: HandlingElementsLeftOut})
+			degraded[s.Name] = true
 		}
 		out = append(out, IPSet{Name: s.Name, CIDRs: keep})
 	}
-	return out, inv
+	return out, inv, degraded
 }
 
 // warnInvalidRows logs each invalid row of a pass.

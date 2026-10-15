@@ -703,8 +703,12 @@ func ruleFamily(proto string) string {
 // one line, except for a rule referencing a set that holds IPv6 elements: nft
 // sets are typed, so it becomes one line per family, either of which matches.
 // A family the rule's protocol excludes gets no line.
+//
+// A negated or ==-prefixed reference (`!= @x`, `ne @x`) splits the same way:
+// a negated rule must hold IPv6 traffic to the set's IPv6 elements too, not
+// leave it untouched.
 func renderRules(r Rule, nicDev string, v6Sets map[string]bool) []string {
-	if !strings.HasPrefix(r.CIDR, "@") || !v6Sets[strings.TrimPrefix(r.CIDR, "@")] {
+	if name, ok := rulefield.SetRef(r.CIDR); !ok || !v6Sets[name] {
 		return []string{renderRule(r, nicDev, "")}
 	}
 	var out []string
@@ -713,7 +717,7 @@ func renderRules(r Rule, nicDev string, v6Sets map[string]bool) []string {
 	}
 	if ruleFamily(r.Proto) != "ip" {
 		r6 := r
-		r6.CIDR = r.CIDR + ipv6SetSuffix
+		r6.CIDR = strings.TrimRight(r.CIDR, " \t") + ipv6SetSuffix
 		out = append(out, renderRule(r6, nicDev, "ip6"))
 	}
 	return out
@@ -884,10 +888,15 @@ func validate(p Plan) error {
 		}
 		// "!= @name" references a set too; nft refuses the whole ruleset on
 		// one that is not declared.
-		if name, ok := rulefield.SetRef(r.CIDR); ok {
+		if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
 			if name == "" || !ipsets[name] {
 				return fmt.Errorf("rule %d: unknown ipset reference %q", i, r.CIDR)
 			}
+			if !rulefield.SetRefOpOK(op) {
+				return fmt.Errorf("rule %d: %q compares a set with %s, which nft refuses", i, r.CIDR, op)
+			}
+		} else if strings.Contains(r.CIDR, "@") {
+			return fmt.Errorf("rule %d: %q references a set other than as @name, != @name or == @name", i, r.CIDR)
 		}
 	}
 	for _, sg := range p.SecurityGroups {

@@ -37,6 +37,7 @@ func TestFirewallWriters_RefuseUngrammaticalFields(t *testing.T) {
 		{"comment quote", "comment", `x"; accept; #`, &pb.FirewallRule{Direction: "ingress", Comment: `x"; accept; #`}},
 		{"bare port list", "port", "80,443", &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "80,443"}},
 		{"port out of range", "port", "70000", &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "70000"}},
+		{"set compared with <", "cidr", "< @office", &pb.FirewallRule{Direction: "ingress", Cidr: "< @office"}},
 	}
 	wantRefused := func(t *testing.T, err error, field, value string) {
 		t.Helper()

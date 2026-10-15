@@ -765,9 +765,12 @@ file, the problem names the rule's place in the file.
 | `comment` | at most 128 bytes, no double quote |
 
 `proto`, `port` and an IPv4 `cidr` also take a relational operator in front
-(`!= 22`, `< 1024`, `eq 53`, `!= @office`), a bitmask
+(`!= 22`, `< 1024`, `eq 53`), a bitmask
 (`& 255.0.0.0 == 10.0.0.0`) and a braced list (`{ 80, 443 }`; a double or
-trailing comma is fine, a leading one is not). A bare comma list (`80,443`) is
+trailing comma is fine, a leading one is not). A set reference is `@name`,
+`!= @name` or `== @name` (`ne`, `eq`) only: nft refuses `< @name`, a set in
+braces or behind a mask. A rule on a set with IPv6 elements applies to both
+families, negated or not. A bare comma list (`80,443`) is
 refused: nft rejects it, so it never applied — brace it. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
 it would add nft syntax of its own to every host's ruleset.
@@ -783,10 +786,11 @@ before, and nothing is rendered that the row did not ask for:
 - a rule that references an ip set that does not exist (deleted, or not
   replicated yet) as `@name` is rendered against an empty set of that name, so
   it matches nothing;
-- a rule that references a missing set negated, `!= @name`, would match every
-  address against an empty set, so it is held like an unreadable rule: as this
-  host last rendered it while that rendering's set still exists, otherwise left
-  out;
+- a rule that references a set negated, `!= @name`, while that set is missing
+  or was rendered without some of its elements, would match every address (or
+  the addresses the set lists), so it is held like an unreadable rule: as this
+  host last rendered it while that rendering's set is present and whole,
+  otherwise left out;
 - an ip set is rendered without the elements it cannot render.
 
 The host raises the critical condition `firewall.rule.invalid`, which names

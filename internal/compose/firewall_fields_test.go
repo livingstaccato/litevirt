@@ -56,9 +56,10 @@ security-groups:
       - { proto: TCP, port: "{ 80, 443 }", action: accept }
       - { direction: ingress, proto: tcp, port: "!= 22", cidr: "10.0.0.1-10.0.0.9", action: drop }
       - { direction: ingress, proto: tcp, port: 22, cidr: "@office" }
+      - { direction: ingress, proto: tcp, port: "{ 80, 443, }", cidr: "!= @office" }
 ipsets:
   office:
-    cidrs: ["10.0.0.0/24", "10.1.0.1-10.1.0.9"]
+    cidrs: ["10.0.0.0/24", "10.1.0.1-10.1.0.9", "10.2.0.1,10.2.0.2"]
 firewall:
   cluster-rules:
     - { direction: egress, proto: udp, port: "53", cidr: "!= 10.0.0.0/8", comment: "dns" }

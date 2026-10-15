@@ -268,7 +268,8 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
+	// `--cidr 10.0.0.1,10.0.0.2` is two elements (rulefield.NormaliseSetElements).
+	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: rulefield.NormaliseSetElements(req.Cidrs)}
 	v6, invalid := ipSetRowFamily(row.Name, row.CIDRs)
 	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)

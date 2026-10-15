@@ -30,6 +30,12 @@ func loadCompatPlan(t *testing.T) Plan {
 	const now = "2026-10-15T00:00:00Z"
 	exec(`INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
 		VALUES ('set-1', 'trusted', ?, '', ?, 1)`, `["10.0.0.0/24", "10.1.0.1-10.1.0.9", " 10.2.0.0/16"]`, now)
+	// Stored elements holding commas (`lv firewall ipset add --cidr a,b`),
+	// double and trailing ones (review C-2), and an IPv6 set.
+	exec(`INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-2', 'commas', ?, '', ?, 1)`, `["10.3.0.1,10.3.0.2, 10.3.9.0/24", "10.4.0.1,, 10.4.0.5", "10.5.0.1, 10.5.0.5,"]`, now)
+	exec(`INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-3', 'six', ?, '', ?, 1)`, `["fd00::/8", "10.6.0.0/16", "2001:db8::1"]`, now)
 	n := 0
 	cluster := func(dir, proto, port, cidr, action, comment string) {
 		n++
@@ -52,6 +58,21 @@ func loadCompatPlan(t *testing.T) Plan {
 	cluster("ingress", "!= tcp", "", "", "drop", "it's")
 	cluster("ingress", "{ tcp, udp }", "", "198.51.100.0/24", "accept", "")
 	cluster("ingress", "tcp", "8443", "", "accept", "per ticket #42; see wiki { x }") // quoted: # ; { } are text
+	cluster("ingress", "tcp", "{ 80, 443, }", "", "accept", "")                       // trailing comma
+	cluster("ingress", "tcp", "{ 8080,, 8443 }", "", "accept", "")                    // double comma
+	cluster("ingress", "tcp", "0x16", "", "accept", "")                               // hex port
+	cluster("ingress", "tcp", "0x1f90-0x1f9f", "", "accept", "")                      // hex range
+	cluster("ingress", "tcp", "ssh - http", "10.9.0.0/16", "drop", "")                // service range
+	cluster("ingress", "udp", "eq\t53", "", "accept", "")                             // tab after the operator
+	cluster("ingress", "all", "", "& 255.0.0.0 == 10.0.0.0", "accept", "")
+	cluster("ingress", "tcp", "25", "@commas", "drop", "")
+	cluster("ingress", "tcp", "22", "@six", "accept", "") // a set with IPv6 elements: one line per family
+	cluster("ingress", "tcp", "22", "fd00::/8", "accept", "")
+	cluster("ingress", "icmpv6", "", "fd00::/8", "accept", "")
+	cluster("ingress", "icmp", "", "", "accept", "")
+	cluster("ingress", "ipv6-icmp", "", "", "accept", "")
+	cluster("ingress", "47", "", "", "accept", "")
+	cluster("ingress", "47", "", "2001:db8::/32", "drop", "")
 	exec(`INSERT INTO host_firewall_rules
 		(id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		VALUES ('h1', 'host-a', 'EGRESS', 'Udp', 'eq 123', '{ 10.0.0.1, 10.0.0.2 }', 'Drop', 10, '', '', ?, 1)`, now)
@@ -60,7 +81,19 @@ func loadCompatPlan(t *testing.T) Plan {
 	}
 	exec(`INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 		VALUES ('s1', 'sg-1', 'ingress', 'TCP', '{ 8080, 8443 }', '@trusted', 'accept', 10, ?, 1),
-		       ('s2', 'sg-1', 'ingress', 'tcp', '1-1023', '', 'drop', 20, ?, 1)`, now, now)
+		       ('s2', 'sg-1', 'ingress', 'tcp', '1-1023', '', 'drop', 20, ?, 1),
+		       ('s3', 'sg-1', 'egress', 'udp', '{ 53, 5353, }', '', 'accept', 30, ?, 1)`, now, now, now)
+	// NAT and isolation intents, as network provisioning and an LB write them.
+	for _, in := range []corrosion.HostFWIntent{
+		{ScopeKey: "net:prod", Bridge: "br-prod", MasqueradeSubnet: "10.100.0.0/24", Isolate: true,
+			Exceptions: []corrosion.HostFWException{{VIP: "10.100.0.50", Ports: []int{80, 443}}}},
+		{ScopeKey: "lb:web", Bridge: "br-prod", SNATSubnet: "10.100.0.0/24", SNATVIP: "203.0.113.5", SNATOutIface: "eth0"},
+		{ScopeKey: "net:flat", Bridge: "virbr0", MasqueradeSubnet: "192.168.122.0/24"},
+	} {
+		if err := corrosion.UpsertHostFWIntent(ctx, db, "host-a", in); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
 	if err != nil {

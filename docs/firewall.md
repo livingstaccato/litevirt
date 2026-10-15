@@ -758,29 +758,36 @@ file, the problem names the rule's place in the file.
 | Field | Accepted |
 |---|---|
 | `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
-| `port` (tcp, udp) | a port 0-65535, a range `8000-9000`, a service name (`ssh`) |
+| `port` (tcp, udp) | a port 0-65535 (decimal or `0x16`), a range `8000-9000` or `ssh - http`, a service name (`ssh`) |
 | `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
-| ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix |
+| ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
 | `comment` | at most 128 bytes, no double quote |
 
 `proto`, `port` and an IPv4 `cidr` also take a relational operator in front
-(`!= 22`, `< 1024`, `!= @office`) and a braced list (`{ 80, 443 }`). A bare
-comma list (`80,443`) is refused: nft rejects it, so it never applied — brace
-it. Anything else — a second word, a newline, `;`, `#`, a stray brace or quote
-— is refused, because it would add nft syntax of its own to every host's
-ruleset.
+(`!= 22`, `< 1024`, `eq 53`, `!= @office`), a bitmask
+(`& 255.0.0.0 == 10.0.0.0`) and a braced list (`{ 80, 443 }`; a double or
+trailing comma is fine, a leading one is not). A bare comma list (`80,443`) is
+refused: nft rejects it, so it never applied — brace it. Anything else — a
+second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
+it would add nft syntax of its own to every host's ruleset.
 
 A row written by a host on an older build is checked again when it is rendered.
-One that carries such text, references an ip set that is not rendered, or has
-an action other than accept, drop or reject is never rendered as written, and
-no longer stops the host's whole firewall from applying, as it did before: an
-`accept` is left out, a `drop` or `reject` is rendered as a drop without its
-unreadable matches (it drops at least what it asked for), and an ip set with
-such an element is left out whole. The host raises the critical condition
-`firewall.rule.invalid`, which names each row and the command that removes it
-(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...). A row that
-applied before renders exactly as it did.
+A row that applied before renders exactly as it did; one that the renderer
+would refuse no longer stops the host's whole firewall from applying, as it did
+before, and nothing is rendered that the row did not ask for:
+
+- a rule that carries such text, an IPv6 CIDR nft cannot read, or an action
+  other than accept, drop or reject is held as this host last rendered it, or
+  left out when this host never rendered a readable version of it;
+- a rule that references an ip set that does not exist (deleted, or not
+  replicated yet; `@name` or `!= @name`) is rendered against an empty set of
+  that name, so it matches nothing;
+- an ip set is rendered without the elements it cannot render.
+
+The host raises the critical condition `firewall.rule.invalid`, which names
+each row, its stored action and the command that removes it
+(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...).
 
 ## CLI
 

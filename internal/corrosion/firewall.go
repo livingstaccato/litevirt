@@ -70,6 +70,8 @@ func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
 // release feature firewall_ipv6: g must be its grant.
 func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, s IPSet) error {
 	// The name and elements are written into every host's nft script as text.
+	// An element holding commas is stored as the elements it lists.
+	s.CIDRs = rulefield.NormaliseSetElements(s.CIDRs)
 	if err := rulefield.IPSet(s.Name, s.CIDRs); err != nil {
 		return err
 	}

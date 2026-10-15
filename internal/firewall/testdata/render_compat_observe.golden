@@ -2,6 +2,24 @@
 # `nft -f -` consumes this file as an atomic ruleset replace.
 
 table inet litevirt-fw {
+    set commas {
+        type ipv4_addr
+        flags interval
+        elements = { 10.3.0.1,10.3.0.2, 10.3.9.0/24, 10.4.0.1,, 10.4.0.5, 10.5.0.1, 10.5.0.5, }
+    }
+
+    set six {
+        type ipv4_addr
+        flags interval
+        elements = { 10.6.0.0/16 }
+    }
+
+    set six_v6 {
+        type ipv6_addr
+        flags interval
+        elements = { 2001:db8::1, fd00::/8 }
+    }
+
     set trusted {
         type ipv4_addr
         flags interval
@@ -32,10 +50,41 @@ table inet litevirt-fw {
         ip protocol != tcp drop comment "it's"
         ip protocol { tcp, udp } ip saddr 198.51.100.0/24 accept
         tcp dport 8443 accept comment "per ticket #42; see wiki { x }"
+        tcp dport { 80, 443, } accept
+        tcp dport { 8080,, 8443 } accept
+        tcp dport 0x16 accept
+        tcp dport 0x1f90-0x1f9f accept
+        tcp dport ssh - http ip saddr 10.9.0.0/16 drop
+        udp dport eq	53 accept
+        ip saddr & 255.0.0.0 == 10.0.0.0 accept
+        tcp dport 25 ip saddr @commas drop
+        tcp dport 22 ip saddr @six accept
+        tcp dport 22 ip6 saddr @six_v6 accept
+        tcp dport 22 ip6 saddr fd00::/8 accept
+        meta l4proto ipv6-icmp ip6 saddr fd00::/8 accept
+        ip protocol icmp accept
+        ip protocol ipv6-icmp accept
+        ip protocol 47 accept
+        meta l4proto 47 ip6 saddr 2001:db8::/32 drop
     }
 
     chain host_overrides {
         udp dport eq 123 ip daddr { 10.0.0.1, 10.0.0.2 } drop
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname eth0 ip saddr 10.100.0.0/24 snat to 203.0.113.5
+        ip saddr 10.100.0.0/24 oifname != br-prod masquerade
+        ip saddr 192.168.122.0/24 oifname != virbr0 masquerade
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname br-prod ip protocol 112 accept
+        iifname br-prod ip daddr 10.100.0.50 tcp dport 80 accept
+        iifname br-prod ip daddr 10.100.0.50 tcp dport 443 accept
+        iifname br-prod drop
     }
 
 }
@@ -62,6 +111,24 @@ table bridge litevirt-nic {
     set lv_gw6 {
         type ipv6_addr
         flags interval
+    }
+
+    set commas {
+        type ipv4_addr
+        flags interval
+        elements = { 10.3.0.1,10.3.0.2, 10.3.9.0/24, 10.4.0.1,, 10.4.0.5, 10.5.0.1, 10.5.0.5, }
+    }
+
+    set six {
+        type ipv4_addr
+        flags interval
+        elements = { 10.6.0.0/16 }
+    }
+
+    set six_v6 {
+        type ipv6_addr
+        flags interval
+        elements = { 2001:db8::1, fd00::/8 }
     }
 
     set trusted {
@@ -147,6 +214,7 @@ table bridge litevirt-nic {
         # host tier
         iifname tap0 udp dport eq 123 ip daddr { 10.0.0.1, 10.0.0.2 } counter return comment "lv-wd tap0 out host#0"
         # security group "web"
+        iifname tap0 udp dport { 53, 5353, } return
     }
 
     chain nic_in_tap0 {
@@ -163,6 +231,22 @@ table bridge litevirt-nic {
         oifname tap0 ip protocol != tcp counter return comment "lv-wd tap0 in cluster#11"
         oifname tap0 ip protocol { tcp, udp } ip saddr 198.51.100.0/24 accept
         oifname tap0 tcp dport 8443 accept comment "per ticket #42; see wiki { x }"
+        oifname tap0 tcp dport { 80, 443, } accept
+        oifname tap0 tcp dport { 8080,, 8443 } accept
+        oifname tap0 tcp dport 0x16 accept
+        oifname tap0 tcp dport 0x1f90-0x1f9f accept
+        oifname tap0 tcp dport ssh - http ip saddr 10.9.0.0/16 counter return comment "lv-wd tap0 in cluster#18"
+        oifname tap0 udp dport eq	53 accept
+        oifname tap0 ip saddr & 255.0.0.0 == 10.0.0.0 accept
+        oifname tap0 tcp dport 25 ip saddr @commas counter return comment "lv-wd tap0 in cluster#21"
+        oifname tap0 tcp dport 22 ip saddr @six accept
+        oifname tap0 tcp dport 22 ip6 saddr @six_v6 accept
+        oifname tap0 tcp dport 22 ip6 saddr fd00::/8 accept
+        oifname tap0 meta l4proto ipv6-icmp ip6 saddr fd00::/8 accept
+        oifname tap0 ip protocol icmp accept
+        oifname tap0 ip protocol ipv6-icmp accept
+        oifname tap0 ip protocol 47 accept
+        oifname tap0 meta l4proto 47 ip6 saddr 2001:db8::/32 counter return comment "lv-wd tap0 in cluster#28"
         # host tier
         # security group "web"
         oifname tap0 tcp dport { 8080, 8443 } ip saddr @trusted accept

@@ -429,6 +429,7 @@ type LoaderOptions struct {
 // nodes racing, since the CRDT has no UNIQUE.
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	taps := &tapFetcher{}
+	memory := &rowMemory{}
 	tapBridge := opts.TapBridge
 	if tapBridge == nil {
 		tapBridge = sysfsMaster
@@ -441,12 +442,13 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		// + NICs); now they come from the cluster_firewall_rules /
 		// host_firewall_rules / ip_sets / firewall_defaults tables.
 		//
-		// A row that fails the rule grammar (written by a peer on an older
-		// build) is never rendered as written, and never fails the pass: one
+		// A row that cannot be rendered safely (written by a peer on an older
+		// build) is never rendered as written and never fails the pass: one
 		// bad row would otherwise stop every host's firewall from applying,
 		// leaving whatever it last applied — and no chain at all for a NIC
-		// that started since. It is handled fail-closed (quarantineRule) and
-		// reported (Plan.InvalidRows).
+		// that started since. That row alone is held fail-static, and a
+		// reference to a set that does not exist matches nothing (see
+		// quarantine). Each is reported (Plan.InvalidRows).
 		plan.InvalidRows = plan.InvalidRows[:0:0]
 		ipsets, err := corrosion.ListIPSets(ctx, db)
 		if err != nil {
@@ -454,23 +456,19 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		var badSets []InvalidRow
 		plan.IPSets, badSets = quarantineIPSets(ipsets)
-		plan.InvalidRows = append(plan.InvalidRows, badSets...)
-		knownSets := make(map[string]bool, len(plan.IPSets))
-		for _, s := range plan.IPSets {
-			knownSets[s.Name] = true
-		}
+		q := newQuarantine(plan.IPSets, memory.snapshot())
 
 		clusterRules, err := corrosion.ListClusterFirewallRules(ctx, db)
 		if err != nil {
 			return plan, err
 		}
-		plan.ClusterRules = toFWRules(clusterRules, "cluster_firewall_rules", knownSets, &plan.InvalidRows)
+		plan.ClusterRules = toFWRules(q, clusterRules, "cluster_firewall_rules")
 
 		hostRules, err := corrosion.ListHostFirewallRules(ctx, db, hostName)
 		if err != nil {
 			return plan, err
 		}
-		plan.HostRules = toFWRules(hostRules, "host_firewall_rules", knownSets, &plan.InvalidRows)
+		plan.HostRules = toFWRules(q, hostRules, "host_firewall_rules")
 
 		deny, err := corrosion.ResolveDefaultDeny(ctx, db, hostName)
 		if err != nil {
@@ -504,11 +502,9 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			}
 			out := SecurityGroup{Name: sg.Name}
 			for _, r := range rules {
-				rs, inv := quarantineRule("sg_rules", r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, knownSets)
-				if inv != nil {
-					plan.InvalidRows = append(plan.InvalidRows, *inv)
+				if rule, ok := q.rule("sg_rules", r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, ""); ok {
+					out.Rules = append(out.Rules, rule)
 				}
-				out.Rules = append(out.Rules, rs...)
 			}
 			plan.SecurityGroups = append(plan.SecurityGroups, out)
 		}
@@ -723,6 +719,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if opts.OnDuplicateSGs != nil {
 			opts.OnDuplicateSGs(ambiguous)
 		}
+		plan.IPSets = append(plan.IPSets, q.sets()...)
+		plan.InvalidRows = append(append(plan.InvalidRows, badSets...), q.invalid...)
 		warnInvalidRows(plan.InvalidRows)
 
 		// NAT / SNAT / host-isolation infra: read this host's resolved intent
@@ -782,6 +780,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				}
 			}
 		}
+		memory.store(q.next)
 		return plan, nil
 	}
 }
@@ -1177,17 +1176,12 @@ func intentToNATIsolation(intents []corrosion.HostFWIntent) ([]NATRule, []Isolat
 }
 
 // toFWRules converts the on-disk cluster/host-tier rows of table into
-// renderer Rules, preserving the operator-supplied comment. A row that fails
-// the grammar is handled by quarantineRule and appended to invalid.
-func toFWRules(in []corrosion.FirewallRule, table string, knownSets map[string]bool, invalid *[]InvalidRow) []Rule {
+// renderer Rules, preserving the operator-supplied comment. A row that cannot
+// be rendered as written is handled by q.
+func toFWRules(q *quarantine, in []corrosion.FirewallRule, table string) []Rule {
 	out := make([]Rule, 0, len(in))
 	for _, r := range in {
-		rules, inv := quarantineRule(table, r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, knownSets)
-		if inv != nil {
-			*invalid = append(*invalid, *inv)
-		}
-		for _, rule := range rules {
-			rule.Comment = r.Comment
+		if rule, ok := q.rule(table, r.ID, r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); ok {
 			out = append(out, rule)
 		}
 	}

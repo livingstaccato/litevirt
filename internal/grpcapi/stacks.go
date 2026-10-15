@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
@@ -433,7 +434,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	anyV6 := false
 	for name, sg := range f.SecurityGroups {
 		for _, r := range sg.Rules {
-			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			v6, err := ruleRowFamily(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, "")
 			if err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -441,7 +442,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	for name, set := range f.IPSets {
-		v6, err := corrosion.IPSetFamily(set.CIDRs)
+		v6, err := ipSetRowFamily(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -449,7 +450,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
-			v6, err := corrosion.FirewallRuleFamily(r.CIDR, r.Proto)
+			v6, err := ruleRowFamily(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, r.Comment)
 			if err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
@@ -524,7 +525,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 
 	// IP sets.
 	for name, set := range f.IPSets {
-		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
+		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs), StackName: f.Name}
 		v6, invalid := ipSetRowFamily(row.Name, row.CIDRs)
 		if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 			return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)

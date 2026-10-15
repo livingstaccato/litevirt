@@ -882,8 +882,9 @@ func validate(p Plan) error {
 				return fmt.Errorf("rule %d: proto %q is IPv4-only and cannot match IPv6 CIDR %q (use icmpv6)", i, r.Proto, r.CIDR)
 			}
 		}
-		if strings.HasPrefix(r.CIDR, "@") {
-			name := strings.TrimPrefix(r.CIDR, "@")
+		// "!= @name" references a set too; nft refuses the whole ruleset on
+		// one that is not declared.
+		if name, ok := rulefield.SetRef(r.CIDR); ok {
 			if name == "" || !ipsets[name] {
 				return fmt.Errorf("rule %d: unknown ipset reference %q", i, r.CIDR)
 			}

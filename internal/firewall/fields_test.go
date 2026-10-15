@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -17,13 +18,36 @@ func rawRow(t *testing.T, db *corrosion.Client, sql string, args ...any) {
 	}
 }
 
-// TestLoader_InvalidRowsFailClosed (finding F-1, rolling upgrade): rows an
-// older peer wrote that fail the grammar never reach the script as written,
-// never fail the pass — every other rule still applies — and never admit
-// anything the row did not: an accept is left out, a drop is rendered with
-// its unreadable matches removed (it drops more, never less), and an ip set
-// with a bad element is left out whole, so a drop that references it drops
-// everything its other matches cover.
+// unboundedDrops are the rendered tier-chain drops (inet cluster_default /
+// host_overrides) with no address match: a quarantined row must never become
+// one (review C-1: a bare drop takes down all forwarded traffic).
+func unboundedDrops(script string) []string {
+	var out []string
+	in := false
+	for _, line := range strings.Split(script, "\n") {
+		l := strings.TrimSpace(line)
+		switch {
+		case l == "chain cluster_default {" || l == "chain host_overrides {":
+			in = true
+		case l == "}":
+			in = false
+		case in && (strings.HasSuffix(l, " drop") || l == "drop" || strings.Contains(l, " drop comment ")) &&
+			!strings.Contains(l, "saddr") && !strings.Contains(l, "daddr"):
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestLoader_InvalidRowsFailClosed (finding F-1, rolling upgrade; review C-1,
+// C-2, I-2): rows an older peer wrote that cannot be rendered safely never
+// reach the script as written and never fail the pass — every other rule
+// still applies — and never render anything the row did not ask for. Such a
+// row alone is held fail-static: its last rendering on this host, or left out
+// when there is none. A reference to a set that does not exist (plain or
+// negated) renders against an empty set, and a set with an unreadable element
+// renders without it. No quarantined row ever becomes a drop without an
+// address match.
 func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
@@ -36,27 +60,56 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 			(id, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, 100, ?, '', ?, 1)`, id, dir, proto, port, cidr, action, comment, now)
 	}
-	// A good rule that must keep applying.
-	cluster("good", "ingress", "tcp", "443", "", "accept", "web")
-	// An accept carrying an injection: left out.
-	cluster("bad-accept", "ingress", "tcp", "22\n        ip saddr 0.0.0.0/0", "", "accept", "")
-	// A drop with a bad port: rendered as a drop of all tcp from its CIDR.
-	cluster("bad-drop", "ingress", "tcp", "25; "+injectMark, "192.0.2.0/24", "drop", "")
-	// A drop whose verdict is unreadable: rendered as a drop.
-	cluster("bad-verdict", "egress", "udp", "53", "198.51.100.0/24", "drop\n"+injectMark, "")
-	// A drop referencing a set that has a bad element: the set is left out,
-	// the drop loses its CIDR match.
+	var loader PlanLoader // kept across passes: it remembers what it rendered
+	load := func() (Plan, string) {
+		t.Helper()
+		plan, err := loader(ctx)
+		if err != nil {
+			t.Fatalf("loader failed the pass on a bad row: %v", err)
+		}
+		out, err := Render(plan)
+		if err != nil {
+			t.Fatalf("Render refused the plan: one bad row stopped the host's firewall: %v", err)
+		}
+		if strings.Contains(strings.ToUpper(nftOutsideStrings(out)), injectMark) || strings.Contains(out, "0.0.0.0/0") {
+			t.Fatalf("a bad row reached the script as written:\n%s", out)
+		}
+		if d := unboundedDrops(out); len(d) > 0 {
+			t.Fatalf("a drop with no address match was rendered: %q\n%s", d, out)
+		}
+		return plan, out
+	}
+
+	// A row that will turn unreadable after it has been rendered once.
+	cluster("flip", "ingress", "tcp", "8080", "198.51.100.0/24", "drop", "")
+	// A drop on a set that is deleted after it has been rendered once.
 	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
-		VALUES ('set-bad', 'blocked', ?, '', ?, 1)`, `["203.0.113.0/24 } `+injectMark+`"]`, now)
+		VALUES ('set-del', 'blocklist', '["203.0.113.0/24"]', '', ?, 1)`, now)
+	cluster("del-drop", "ingress", "all", "", "@blocklist", "drop", "")
+	loader = CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})
+	if _, out := load(); !strings.Contains(out, "tcp dport 8080 ip saddr 198.51.100.0/24 drop") ||
+		!strings.Contains(out, "ip saddr @blocklist drop") {
+		t.Fatalf("first pass:\n%s", out)
+	}
+
+	// Now the bad rows an older peer writes.
+	rawRow(t, db, `UPDATE cluster_firewall_rules SET port_range = ? WHERE id = 'flip'`, "8080; "+injectMark)
+	if err := corrosion.DeleteIPSet(ctx, db, "set-del"); err != nil {
+		t.Fatal(err)
+	}
+	cluster("good", "ingress", "tcp", "443", "", "accept", "web")
+	cluster("bad-accept", "ingress", "tcp", "22\n        ip saddr 0.0.0.0/0", "", "accept", "")
+	cluster("bad-drop", "ingress", "tcp", "25; "+injectMark, "192.0.2.0/24", "drop", "")
+	cluster("bad-verdict", "egress", "udp", "53", "198.51.100.7", "drop\n"+injectMark, "")
+	cluster("allow-all", "ingress", "all", "", "", "allow", "") // meant "accept everything"
+	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-bad', 'blocked', ?, '', ?, 1)`, `["198.18.0.0/15", "203.0.113.0/24 } `+injectMark+`"]`, now)
 	cluster("set-drop", "ingress", "tcp", "3389", "@blocked", "drop", "")
-	// A host rule with a bad proto and a drop: a drop of everything from
-	// its CIDR. Its direction is never written as text: "in" is read as
-	// ingress, as it always was.
+	cluster("missing", "ingress", "all", "", "@never", "drop", "")
+	cluster("neg-missing", "ingress", "tcp", "22", "!= @gone", "accept", "")
 	rawRow(t, db, `INSERT INTO host_firewall_rules
 		(id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		VALUES ('host-bad', 'host-a', 'in', ?, '8080', '203.0.113.7', 'drop', 100, '', '', ?, 1)`, "esp\n"+injectMark, now)
-	// A security-group accept with a bad proto: left out; the group's good
-	// rule stays.
 	sgID := "sg-1"
 	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: sgID, Name: "web"}); err != nil {
 		t.Fatal(err)
@@ -67,35 +120,32 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	rawRow(t, db, `INSERT INTO sg_rules (id, sg_id, direction, proto, port_range, cidr, action, priority, created_at, updated_at)
 		VALUES ('sg-bad', ?, 'ingress', 'esp; `+injectMark+`', '', '', 'accept', 200, ?, 1)`, sgID, now)
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
-	if err != nil {
-		t.Fatalf("loader failed the pass on a bad row: %v", err)
-	}
-	out, err := Render(plan)
-	if err != nil {
-		t.Fatalf("Render refused the plan: one bad row stopped the host's firewall: %v", err)
-	}
-	if strings.Contains(strings.ToUpper(nftOutsideStrings(out)), injectMark) || strings.Contains(out, "0.0.0.0/0") {
-		t.Fatalf("a bad row reached the script as written:\n%s", out)
-	}
+	plan, out := load()
 	mustContainAll(t, out,
-		`tcp dport 443 accept comment "web"`,         // the good rule still applies
-		"tcp ip saddr 192.0.2.0/24 drop",             // bad port: wider drop
-		"udp dport 53 ip daddr 198.51.100.0/24 drop", // bad verdict: drop
-		"tcp dport 3389 drop",                        // unknown set: drop without the CIDR
+		`tcp dport 443 accept comment "web"`,           // the good rule still applies
+		"tcp dport 8080 ip saddr 198.51.100.0/24 drop", // flip: its last rendering
+		"ip saddr @blocklist drop",                     // deleted set: empty set, matches nothing
+		"tcp dport 3389 ip saddr @blocked drop",        // set with a bad element: rendered without it
+		"elements = { 198.18.0.0/15 }",                 // ...keeping its good one
+		"ip saddr @never drop",                         // never existed: empty set
+		"tcp dport 22 ip saddr != @gone accept",        // negated missing set: empty set
 	)
-	if strings.Contains(out, "set blocked") {
-		t.Errorf("a set with a bad element was rendered:\n%s", out)
-	}
-	// The bad host rule drops everything from its address.
-	if len(plan.HostRules) != 1 || plan.HostRules[0] != (Rule{Direction: Ingress, Proto: "all", CIDR: "203.0.113.7", Action: Drop}) {
-		t.Errorf("host rule with a bad proto: %+v, want a drop of all from 203.0.113.7", plan.HostRules)
-	}
-	// The bad accepts are left out.
-	for _, r := range plan.ClusterRules {
-		if r.Action == Accept && r.PortRange != "443" {
-			t.Errorf("a bad accept was rendered: %+v", r)
+	for _, empty := range []string{"blocklist", "never", "gone"} {
+		i := strings.Index(out, "set "+empty+" {")
+		if i < 0 {
+			t.Fatalf("set %s not declared:\n%s", empty, out)
 		}
+		if body := out[i : i+strings.Index(out[i:], "}")]; strings.Contains(body, "elements") {
+			t.Errorf("set %s should be empty: %q", empty, body)
+		}
+	}
+	for _, gone := range []string{"192.0.2.0/24", "198.51.100.7", "203.0.113.7", "203.0.113.0/24"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("%s rendered: a row left out still reached the script:\n%s", gone, out)
+		}
+	}
+	if len(plan.HostRules) != 0 {
+		t.Errorf("host rules = %+v, want the unreadable one left out", plan.HostRules)
 	}
 	var web SecurityGroup
 	for _, sg := range plan.SecurityGroups {
@@ -107,26 +157,33 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 		t.Errorf("security group web = %+v, want only its good rule", web.Rules)
 	}
 
-	got := map[string]string{}
+	got := map[string]InvalidRow{}
 	for _, r := range plan.InvalidRows {
-		got[r.Table+"/"+r.ID] = r.Handling
+		got[r.Table+"/"+r.ID] = r
 	}
 	want := map[string]string{
+		"cluster_firewall_rules/flip":        HandlingKeptLast,
+		"cluster_firewall_rules/del-drop":    HandlingEmptySet,
 		"cluster_firewall_rules/bad-accept":  HandlingLeftOut,
-		"cluster_firewall_rules/bad-drop":    HandlingWidened,
-		"cluster_firewall_rules/bad-verdict": HandlingWidened,
-		"cluster_firewall_rules/set-drop":    HandlingWidened,
-		"ip_sets/set-bad":                    HandlingSetLeftOut,
-		"host_firewall_rules/host-bad":       HandlingWidened,
+		"cluster_firewall_rules/bad-drop":    HandlingLeftOut,
+		"cluster_firewall_rules/bad-verdict": HandlingLeftOut,
+		"cluster_firewall_rules/allow-all":   HandlingLeftOut,
+		"cluster_firewall_rules/missing":     HandlingEmptySet,
+		"cluster_firewall_rules/neg-missing": HandlingEmptySet,
+		"ip_sets/set-bad":                    HandlingElementsLeftOut,
+		"host_firewall_rules/host-bad":       HandlingLeftOut,
 		"sg_rules/sg-bad":                    HandlingLeftOut,
 	}
 	for k, v := range want {
-		if got[k] != v {
-			t.Errorf("invalid row %s: handling %q, want %q", k, got[k], v)
+		if got[k].Handling != v {
+			t.Errorf("invalid row %s: handling %q, want %q", k, got[k].Handling, v)
 		}
 	}
 	if len(got) != len(want) {
 		t.Errorf("invalid rows = %v, want exactly %v", got, want)
+	}
+	if got["cluster_firewall_rules/allow-all"].Action != "allow" {
+		t.Errorf("the stored action is not reported: %+v", got["cluster_firewall_rules/allow-all"])
 	}
 }
 
@@ -159,6 +216,16 @@ func TestRender_BracedListsRender(t *testing.T) {
 // TestQuoteComment: a double quote never ends the nft string, and the text is
 // cut to nft's limit.
 func TestQuoteComment(t *testing.T) {
+	// Review I-1: a megabyte comment from an older peer is cut in linear
+	// time, not one rune per pass.
+	huge := strings.Repeat("é\x01", 1<<19) // 1.5 MB, every rune escaped or multi-byte
+	start := time.Now()
+	if q := quoteComment(huge); len(q)-2 > 128 {
+		t.Errorf("quoted comment is %d bytes", len(q)-2)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("quoting a 1.5 MB comment took %v", d)
+	}
 	if got := quoteComment(`a"b`); got != `"a'b"` {
 		t.Errorf("quoteComment(a\"b) = %s", got)
 	}

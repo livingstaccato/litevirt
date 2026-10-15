@@ -227,10 +227,13 @@ func invalidRowsText(rows []firewall.InvalidRow) string {
 			parts = append(parts, fmt.Sprintf("and %d more", len(rows)-show))
 			break
 		}
-		parts = append(parts, fmt.Sprintf("%s %s (%s): %s; remove it with `%s`", r.Table, r.ID, r.Reason, r.Handling, removeRowCmd(r)))
+		what := r.Table + " " + r.ID
+		if r.Table != "ip_sets" {
+			what += fmt.Sprintf(" (stored action %q)", r.Action)
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s; %s; remove it with `%s`", what, r.Reason, r.Handling, removeRowCmd(r)))
 	}
-	return "firewall rows that fail the rule grammar are not rendered as written (an accept is left out, " +
-		"a drop drops more, never less): " + strings.Join(parts, "; ")
+	return "firewall rows not rendered as written (none renders more than it asked for): " + strings.Join(parts, "; ")
 }
 
 func removeRowCmd(r firewall.InvalidRow) string {

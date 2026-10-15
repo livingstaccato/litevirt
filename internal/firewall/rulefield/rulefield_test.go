@@ -29,20 +29,24 @@ func TestGrammar(t *testing.T) {
 			[]string{"allow", "log", "drop\n", "accept;", " drop", "drop counter", "accept }"}},
 		{Proto, "proto",
 			[]string{"", "all", "ALL", "tcp", "UDP", "TCP", "icmp", "icmpv6", "ipv6-icmp", "esp", "ESP", "ax.25", "47", "0", "255",
-				" esp", "!=tcp", "!= tcp", "== 6", "{ tcp, udp }", "{tcp,esp}", "!= { 6, 17 }"},
-			[]string{"tcp;", "tcp\n", "esp accept", "256", "3pc", "tcp,udp", "{ tcp", "{}", "{ tcp,, udp }",
+				" esp", "!=tcp", "!= tcp", "== 6", "{ tcp, udp }", "{tcp,esp}", "!= { 6, 17 }", "{ tcp,, udp }", "{ tcp, udp, }"},
+			[]string{"tcp;", "tcp\n", "esp accept", "256", "3pc", "tcp,udp", "{ tcp", "{}", "{ , tcp }",
 				"!=all", "{ all }", "  ", "esp }", "\"esp\"", "esp#"}},
 		{tcpPort, "port",
 			[]string{"", "22", "0", "65535", "8000-9000", "8000 - 9000", "22-22", "20-ssh", "ssh", "http-alt", "x11",
 				" 22 ", "!=22", "!= 22", "< 1024", "<1024", "eq 22", "ne 22",
-				"{ 80, 443 }", "{80,443}", "{ 80, 8000-9000 }", "!= { 80, 443 }", "{ ssh, http }"},
+				"{ 80, 443 }", "{80,443}", "{ 80, 8000-9000 }", "!= { 80, 443 }", "{ ssh, http }",
+				"{ 80, 443, }", "{ 80,, 443 }", "0x16", "0X16", "0x16-0x50", "ssh - http", "eq\t22", "8000\t-\t9000",
+				"& 0xff00 == 0x1600"},
 			[]string{"22 accept\n", "22;", "22 accept", "22\n", "80,443", "80, 443", "70000", "9000-8000",
-				"1-70000", "{ 80", "80 }", "{ }", "  ", "-22", "22-", "3com", "22 }\n{", "\"22\"", "22 - meta mark"}},
+				"1-70000", "{ 80", "80 }", "{ }", "  ", "-22", "22-", "3com", "22 }\n{", "\"22\"", "22 - meta mark",
+				"{ , 80 }", "{ , }", "0x10000", "0x50-0x16", "0xzz"}},
 		{CIDR, "cidr",
 			[]string{"", "10.0.0.0/8", "10.0.0.1", "10.0.0.1/8", " 10.0.0.0/8", "!=10.0.0.0/8", "!= 10.0.0.0/8",
 				"10.0.0.1-10.0.0.9", "10.0.0.1 - 10.0.0.9", " @office", "{ 10.0.0.0/8, 192.168.0.0/16 }", "{ 10.0.0.1-10.0.0.5 }",
 				"@office", "@web-trusted.set", "@_x", "@a/b", "!= @office", "!=@office",
 				"gw.example.com", "my-host", "!= gw.example.com",
+				"{ 10.0.0.1, 10.0.0.2, }", "& 255.0.0.0 == 10.0.0.0", "& 255.0.0.0 10.0.0.0", "& 255.0.0.0 != 10.0.0.0", "!=\t10.0.0.0/8",
 				"2001:db8::/32", "fd00::1", "::ffff:10.0.0.1"},
 			[]string{"10.0.0.0/8 }", "10.0.0.0/8\n", "10.0.0.0/8;", "10.0.0.0/8 accept", "10.0.0.0/33",
 				"10.0.0.0/8,192.168.0.0/16", "10.0.0.9-10.0.0.1", "  ", "1.2.3",
@@ -55,9 +59,11 @@ func TestGrammar(t *testing.T) {
 			[]string{"abc", "A_B9", "a-b", "a/b", "a.b", "_x", ".x", strings.Repeat("a", 255)},
 			[]string{"", "1abc", "-a", "a b", "a\n", "a;", "a{", "a}", `a"`, "@a", strings.Repeat("a", 256)}},
 		{SetElement, "ipset element",
-			[]string{"10.0.0.0/8", "10.0.0.1", " 10.0.0.1", "10.0.0.1-10.0.0.5", "gw.example.com", "fd00::/8", "2001:db8::1"},
-			[]string{"", "  ", "10.0.0.0/8 }", "10.0.0.0/8\n", "10.0.0.0/8 accept", "{ 10.0.0.1 }", "!=10.0.0.1",
-				"@other", "fd00::/8\n", " fd00::1"}},
+			[]string{"10.0.0.0/8", "10.0.0.1", " 10.0.0.1", "10.0.0.1-10.0.0.5", "gw.example.com", "fd00::/8", "2001:db8::1",
+				"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,", "10.0.0.1, fd00::1",
+				" fd00::1"}, // stored trimmed (NormaliseSetElements)
+			[]string{"", "  ", ",", "10.0.0.0/8 }", "10.0.0.0/8\n", "10.0.0.0/8 accept", "{ 10.0.0.1 }", "!=10.0.0.1",
+				"@other", "fd00::/8\n", "10.0.0.1,10.0.0.0/33"}},
 	}
 	for _, c := range cases {
 		for _, v := range c.ok {
@@ -167,5 +173,40 @@ func TestRule_PlanCases(t *testing.T) {
 	// A bare list is refused with the braced form as the way out.
 	if err := Port("tcp", "80,443"); err == nil || !strings.Contains(err.Error(), "{ a, b }") {
 		t.Errorf("bare port list: %v, want a hint to brace it", err)
+	}
+}
+
+// TestSyntax_Lists (review C-2): the list forms that load today pass the
+// renderer: a stored set element holding commas, double and trailing commas.
+func TestSyntax_Lists(t *testing.T) {
+	for _, v := range []string{"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,", ","} {
+		if err := RenderSetElement(v); err != nil {
+			t.Errorf("RenderSetElement(%q): %v", v, err)
+		}
+	}
+	for _, v := range []string{"10.0.0.1, 10.0.0.2 }", "10.0.0.1;10.0.0.2", "10.0.0.1,\n10.0.0.2"} {
+		if err := RenderSetElement(v); err == nil {
+			t.Errorf("RenderSetElement(%q) accepted", v)
+		}
+	}
+	for _, v := range []string{"{ 80, 443, }", "{ 80,, 443 }", "eq\t22", "& 0xff00 == 0x1600"} {
+		if err := RenderPort("tcp", v); err != nil {
+			t.Errorf("RenderPort(%q): %v", v, err)
+		}
+	}
+	if got := NormaliseSetElements([]string{"10.0.0.1,10.0.0.2", " 10.0.0.5 ,, ", ""}); strings.Join(got, "|") != "10.0.0.1|10.0.0.2|10.0.0.5" {
+		t.Errorf("NormaliseSetElements = %q", got)
+	}
+	if name, ok := SetRef("!=\t@office"); !ok || name != "office" {
+		t.Errorf("SetRef(!= @office) = %q, %v", name, ok)
+	}
+}
+
+// TestFieldError_Bounded (review m-3): a megabyte value from an older peer
+// is not repeated whole in errors, logs and health conditions.
+func TestFieldError_Bounded(t *testing.T) {
+	err := Port("tcp", strings.Repeat("9", 1<<20))
+	if err == nil || len(err.Error()) > 200 {
+		t.Fatalf("error is %d bytes", len(err.Error()))
 	}
 }

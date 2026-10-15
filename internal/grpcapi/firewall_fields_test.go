@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
 )
@@ -94,10 +95,59 @@ func TestFirewallWriters_RefuseUngrammaticalFields(t *testing.T) {
 		{Direction: "ingress", Proto: "tcp", Port: "< 1024", Cidr: "!= 10.0.0.0/8", Action: "reject"},
 		{Direction: "egress", Proto: "udp", Port: "53", Cidr: "gw.example.com", Comment: strings.Repeat("c", 127)},
 		{Direction: "in", Proto: "esp"},
+		{Direction: "ingress", Proto: "tcp", Port: "{ 80, 443, }"},
+		{Direction: "ingress", Proto: "tcp", Port: "0x16"},
+		{Direction: "ingress", Proto: "tcp", Port: "ssh - http"},
+		{Direction: "ingress", Cidr: "& 255.0.0.0 == 10.0.0.0"},
 	} {
 		if _, err := s.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: r}); err != nil {
 			t.Errorf("rule %+v refused: %v", r, err)
 		}
+	}
+	// `lv firewall ipset add NAME --cidr 10.0.0.1,10.0.0.2` keeps working
+	// (review C-2), stored one element per entry.
+	set, err := s.CreateIpSet(ctx, &pb.CreateIpSetRequest{Name: "office", Cidrs: []string{"10.0.0.1,10.0.0.2", "10.9.0.0/16,"}})
+	if err != nil {
+		t.Fatalf("CreateIpSet with a comma list: %v", err)
+	}
+	if got := strings.Join(set.Cidrs, "|"); got != "10.0.0.1|10.0.0.2|10.9.0.0/16" {
+		t.Errorf("stored elements %q", got)
+	}
+}
+
+// TestStackFirewall_GrammarBeforeTeardown (review m-1): a stack whose new
+// config holds a refused field is refused before any of its rows are torn
+// down.
+func TestStackFirewall_GrammarBeforeTeardown(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtxWithEngine(t, s)
+	parse := func(rules string) *compose.File {
+		t.Helper()
+		// ParseStored: the daemon's own check is under test; the compose
+		// validator would refuse first.
+		f, err := compose.ParseStored([]byte("name: st\nsecurity-groups:\n  web:\n    rules:\n" + rules))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	if err := s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "80", action: accept}
+`)); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := corrosion.ListSecurityGroups(ctx, s.db, "st")
+	err := s.persistStackFirewall(ctx, parse(`      - {direction: ingress, proto: tcp, port: "443", action: accept}
+      - {direction: ingress, proto: tcp, port: "22; flush ruleset", action: accept}
+`))
+	if err == nil || !strings.Contains(err.Error(), "port") {
+		t.Fatalf("a stack with a refused port: %v", err)
+	}
+	after, _ := corrosion.ListSecurityGroups(ctx, s.db, "st")
+	if len(before) != 1 || len(after) != 1 || after[0].ID != before[0].ID {
+		t.Fatalf("the refused redeploy tore the stack's firewall down: before %+v, after %+v", before, after)
+	}
+	if rules, _ := corrosion.ListSGRules(ctx, s.db, after[0].ID); len(rules) != 1 || rules[0].PortRange != "80" {
+		t.Errorf("the refused redeploy changed the stack's rules: %+v", rules)
 	}
 }
 
@@ -108,14 +158,15 @@ func TestRecordFirewallState_InvalidRows(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	s.RecordFirewallState(ctx, firewall.AppliedState{InvalidRows: []firewall.InvalidRow{
-		{Table: "cluster_firewall_rules", ID: "r1", Reason: "bad port", Handling: firewall.HandlingWidened},
-		{Table: "sg_rules", ID: "r2", Reason: "bad proto", Handling: firewall.HandlingLeftOut},
+		{Table: "cluster_firewall_rules", ID: "r1", Action: "drop", Reason: "bad port", Handling: firewall.HandlingKeptLast},
+		{Table: "sg_rules", ID: "r2", Action: "allow", Reason: "bad action", Handling: firewall.HandlingLeftOut},
 	}})
 	row, ok, err := corrosion.GetHealthCondition(ctx, s.db, FirewallEvaluator, CondFirewallInvalidRows, "host", s.hostName)
 	if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
 		t.Fatalf("condition not raised: %+v %v %v", row, ok, err)
 	}
-	for _, want := range []string{"lv firewall cluster-rule rm r1", "lv sg rule-rm r2", "bad port", firewall.HandlingLeftOut} {
+	for _, want := range []string{"lv firewall cluster-rule rm r1", "lv sg rule-rm r2", "bad port", firewall.HandlingLeftOut,
+		firewall.HandlingKeptLast, `stored action "allow"`} {
 		if !strings.Contains(row.Evidence, want) {
 			t.Errorf("evidence %q lacks %q", row.Evidence, want)
 		}

@@ -40,6 +40,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // FieldError names the field and the value a check refused.
@@ -49,13 +50,60 @@ type FieldError struct {
 	Reason string
 }
 
+// maxShownValue bounds the value an error (and so a log line or a replicated
+// health condition) repeats: a row from a peer on an older build can be
+// megabytes long.
+const maxShownValue = 64
+
 func (e *FieldError) Error() string {
-	return fmt.Sprintf("invalid %s %q: %s", e.Field, e.Value, e.Reason)
+	return fmt.Sprintf("invalid %s %q: %s", e.Field, shown(e.Value), e.Reason)
+}
+
+// shown is v cut to maxShownValue bytes at a rune boundary, marked when cut.
+func shown(v string) string {
+	if len(v) <= maxShownValue {
+		return v
+	}
+	cut := maxShownValue
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + "…"
 }
 
 func refuse(field, value, format string, args ...any) error {
 	return &FieldError{Field: field, Value: value, Reason: fmt.Sprintf(format, args...)}
 }
+
+// SetRef is the ip-set name a CIDR references, after any relational operator
+// ("@x", "!= @x", "!=@x"), and whether it references one.
+func SetRef(cidr string) (string, bool) {
+	v := stripOp(trimBlank(blanks(cidr)))
+	if name, ok := strings.CutPrefix(v, "@"); ok {
+		return name, true
+	}
+	return "", false
+}
+
+// NormaliseSetElements splits every element on ',' and drops the empty
+// pieces and the blanks around them: `--cidr 10.0.0.1,10.0.0.2` is two
+// elements. A stored element holding a comma renders inside nft's element
+// list either way; this keeps what a writer stores one element per entry.
+func NormaliseSetElements(elems []string) []string {
+	var out []string
+	for _, e := range elems {
+		for _, piece := range strings.Split(e, ",") {
+			if piece = trimBlank(piece); piece != "" {
+				out = append(out, piece)
+			}
+		}
+	}
+	return out
+}
+
+// blanks turns tabs into spaces for analysis only: nft separates words with
+// either. The value is always rendered as stored.
+func blanks(s string) string { return strings.ReplaceAll(s, "\t", " ") }
 
 // MaxCommentBytes is nft's limit on a rule comment ("comment too long, 128
 // characters maximum allowed"), counted on the text between the quotes the
@@ -145,10 +193,21 @@ func RenderSetName(s string) error {
 	return nil
 }
 
-// RenderSetElement refuses a set element that is not one nft word or range.
+// RenderSetElement refuses a set element that is not nft words or ranges
+// separated by commas. Inside `elements = { ... }` a comma separates elements,
+// so a stored element holding one, or an empty piece between commas, adds no
+// syntax (and nft accepts double and trailing commas).
 func RenderSetElement(s string) error {
-	if why := syntax(s, false); why != "" {
-		return refuse("ipset element", s, "%s", why)
+	if len(s) > maxValueLen {
+		return refuse("ipset element", s, "longer than %d bytes", maxValueLen)
+	}
+	for _, piece := range strings.Split(blanks(s), ",") {
+		if piece = trimBlank(piece); piece == "" {
+			continue
+		}
+		if why := syntaxElem(piece); why != "" {
+			return refuse("ipset element", s, "%s", why)
+		}
 	}
 	return nil
 }
@@ -160,11 +219,16 @@ func syntax(s string, list bool) string {
 	if len(s) > maxValueLen {
 		return fmt.Sprintf("longer than %d bytes", maxValueLen)
 	}
-	v := trimBlank(s)
+	v := trimBlank(blanks(s))
 	if v == "" {
 		return "blank"
 	}
 	if list {
+		var mask string
+		mask, v = stripMask(v)
+		if mask != "" && !isWord(mask) {
+			return fmt.Sprintf("%q is not a single nft word", mask)
+		}
 		v = stripOp(v)
 	}
 	if list && strings.HasPrefix(v, "{") {
@@ -172,12 +236,12 @@ func syntax(s string, list bool) string {
 		if !ok {
 			return "a list opened with '{' must end with '}'"
 		}
-		inner = trimBlank(inner[1:])
-		if inner == "" {
-			return "an empty list"
-		}
-		for _, e := range strings.Split(inner, ",") {
-			if why := syntaxElem(trimBlank(e)); why != "" {
+		// Empty pieces (a double or trailing comma) add no syntax.
+		for _, e := range strings.Split(inner[1:], ",") {
+			if e = trimBlank(e); e == "" {
+				continue
+			}
+			if why := syntaxElem(e); why != "" {
 				return why
 			}
 		}
@@ -205,6 +269,17 @@ var relOps = []string{"!=", "==", "<=", ">=", "<", ">"}
 
 // relWords are their keyword spellings, which need a space after them.
 var relWords = []string{"eq", "ne", "lt", "gt", "le", "ge"}
+
+// stripMask removes a leading bitmask, "& <mask>", and returns the mask.
+func stripMask(v string) (mask, rest string) {
+	r, ok := strings.CutPrefix(v, "&")
+	if !ok {
+		return "", v
+	}
+	r = trimBlank(r)
+	mask, rest, _ = strings.Cut(r, " ")
+	return mask, trimBlank(rest)
+}
 
 // stripOp removes one leading relational operator.
 func stripOp(v string) string {
@@ -354,12 +429,14 @@ func Port(proto, s string) error {
 
 func portElem(e string) string {
 	lo, hi, isRange := cutRange(e)
-	if !isRange && isDigits(lo) {
+	if !isRange && isPortNum(lo) {
 		return portNum(lo)
 	}
 	if !isRange {
+		// Unspaced, a dash after a number is a range; after a letter it is
+		// part of a service name (nft reads "netbios-ns" as one word).
 		l, h, found := strings.Cut(e, "-")
-		if found && isDigits(l) {
+		if found && isPortNum(l) {
 			lo, hi, isRange = l, h, true
 		}
 	}
@@ -369,29 +446,50 @@ func portElem(e string) string {
 		}
 		return fmt.Sprintf("%q is not a port, a range or a service name", e)
 	}
-	if !isDigits(lo) {
-		return fmt.Sprintf("range %q must start with a port number", e)
-	}
-	if why := portNum(lo); why != "" {
-		return why
-	}
-	if isDigits(hi) {
-		if why := portNum(hi); why != "" {
-			return why
+	for _, end := range []string{lo, hi} {
+		if isPortNum(end) {
+			if why := portNum(end); why != "" {
+				return why
+			}
+		} else if !isName(end) {
+			return fmt.Sprintf("%q is not a port, a range or a service name", e)
 		}
-		if n, _ := strconv.Atoi(lo); n > mustAtoi(hi) {
-			return fmt.Sprintf("range %s runs backwards", e)
+	}
+	if isPortNum(lo) && isPortNum(hi) && portVal(lo) > portVal(hi) {
+		return fmt.Sprintf("range %s runs backwards", e)
+	}
+	return ""
+}
+
+// isPortNum is a decimal or 0x-hex number.
+func isPortNum(s string) bool {
+	if h, ok := strings.CutPrefix(strings.ToLower(s), "0x"); ok {
+		if h == "" || len(h) > 8 {
+			return false
 		}
-		return ""
+		for _, r := range h {
+			if !isDigit(r) && (r < 'a' || r > 'f') {
+				return false
+			}
+		}
+		return true
 	}
-	if isName(hi) {
-		return ""
+	return isDigits(s)
+}
+
+// portVal is a port number's value: hex after 0x, otherwise decimal (nft
+// reads a leading zero as decimal).
+func portVal(s string) int64 {
+	if h, ok := strings.CutPrefix(strings.ToLower(s), "0x"); ok {
+		n, _ := strconv.ParseInt(h, 16, 64)
+		return n
 	}
-	return fmt.Sprintf("%q is not a port, a range or a service name", e)
+	n, _ := strconv.ParseInt(s, 10, 64)
+	return n
 }
 
 func portNum(s string) string {
-	if n, err := strconv.Atoi(s); err != nil || n > 65535 {
+	if portVal(s) > 65535 {
 		return fmt.Sprintf("port %s is outside 0-65535", s)
 	}
 	return ""
@@ -421,8 +519,8 @@ func CIDR(s string) error {
 	if err := RenderCIDR(s); err != nil {
 		return err
 	}
-	if v := stripOp(trimBlank(s)); strings.HasPrefix(v, "@") {
-		if err := SetName(v[1:]); err != nil {
+	if name, ok := SetRef(s); ok {
+		if err := SetName(name); err != nil {
 			return refuse("cidr", s, "set reference: %s", err.(*FieldError).Reason)
 		}
 		return nil
@@ -497,18 +595,27 @@ func SetName(s string) error {
 
 // SetElement accepts one ip-set element: an IPv6 address or prefix exactly as
 // written, or an IPv4 address, prefix, range A-B or DNS name.
+//
+// An element holding commas (`--cidr 10.0.0.1,10.0.0.2`) is several elements,
+// each checked; writers store them split (NormaliseSetElements).
 func SetElement(s string) error {
-	if strings.Contains(s, ":") {
-		if !v6AddrOrPrefix(s) {
-			return refuse("ipset element", s, "not an IPv6 address or prefix")
-		}
-		return nil
-	}
 	if err := RenderSetElement(s); err != nil {
 		return err
 	}
-	if why := v4Elem(trimBlank(s)); why != "" {
-		return refuse("ipset element", s, "%s", why)
+	pieces := NormaliseSetElements([]string{s})
+	if len(pieces) == 0 {
+		return refuse("ipset element", s, "an element cannot be empty")
+	}
+	for _, p := range pieces {
+		if strings.Contains(p, ":") {
+			if !v6AddrOrPrefix(p) {
+				return refuse("ipset element", s, "%q is not an IPv6 address or prefix", p)
+			}
+			continue
+		}
+		if why := v4Elem(p); why != "" {
+			return refuse("ipset element", s, "%s", why)
+		}
 	}
 	return nil
 }
@@ -528,11 +635,26 @@ func IPSet(name string, elems []string) error {
 
 // grammar judges each element of a value that has passed syntax.
 func grammar(s string, elem func(string) string) string {
-	v := stripOp(trimBlank(s))
+	mask, v := stripMask(trimBlank(blanks(s)))
+	if mask != "" {
+		if why := elem(mask); why != "" {
+			return why
+		}
+	}
+	v = stripOp(v)
 	if strings.HasPrefix(v, "{") {
 		inner := strings.TrimSuffix(trimBlank(v[1:]), "}")
-		for _, e := range strings.Split(inner, ",") {
-			if why := elem(trimBlank(e)); why != "" {
+		pieces := strings.Split(inner, ",")
+		// nft takes a double or a trailing comma, not a leading one or none
+		// at all.
+		if trimBlank(pieces[0]) == "" {
+			return "a list cannot start with a comma or be empty"
+		}
+		for _, e := range pieces {
+			if e = trimBlank(e); e == "" {
+				continue
+			}
+			if why := elem(e); why != "" {
 				return why
 			}
 		}
@@ -552,8 +674,6 @@ func isDigits(s string) bool {
 	}
 	return true
 }
-
-func mustAtoi(s string) int { n, _ := strconv.Atoi(s); return n }
 
 // isName is an nft name word: a letter, then letters, digits, '.', '_' or '-'.
 func isName(s string) bool {

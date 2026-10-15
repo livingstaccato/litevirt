@@ -882,7 +882,8 @@ func LiveVMDiskUsesWithPathPrefix(ctx context.Context, c *Client, prefix string)
 // recreate has just deleted held.
 func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) ([]DiskRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT d.vm_name, d.disk_name, d.host_name, d.path
+		`SELECT d.vm_name, d.disk_name, d.host_name, d.path,
+			COALESCE(d.delete_with_vm, 1) AS delete_with_vm
 		 FROM vm_disks d JOIN vms v ON v.name = d.vm_name
 		 WHERE v.name = ? AND v.created_at = ?`, name, createdAt)
 	if err != nil {
@@ -891,7 +892,8 @@ func VMIncarnationDisks(ctx context.Context, c *Client, name, createdAt string) 
 	out := make([]DiskRecord, len(rows))
 	for i, r := range rows {
 		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"),
-			HostName: r.String("host_name"), Path: r.String("path")}
+			HostName: r.String("host_name"), Path: r.String("path"),
+			DeleteWithVM: r.Int("delete_with_vm") == 1}
 	}
 	return out, nil
 }

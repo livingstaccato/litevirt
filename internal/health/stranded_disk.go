@@ -51,8 +51,10 @@ import (
 //   - once the VM is deleted, the host sets aside a disk of it still at its
 //     path, which enters the same retention, removes the VM's own cloud-init
 //     seed when this release stamped it, and resolves the record
-//     (deleted_vm_residue.go). A VM of the name created on the host first
-//     sets such a disk aside the same way (SetAsideStrandedBeforeCreate).
+//     (deleted_vm_residue.go). A disk the delete kept (--keep-disks,
+//     delete_with_vm=false) stays at its path. A VM of the name created on
+//     the host first moves such a disk off a path its debris sweep clears
+//     (SetAsideBeforeCreate).
 //
 // The record is a health condition, one row per VM and host, written by the
 // coordinator while the host is down and by the host itself afterwards. It
@@ -90,6 +92,11 @@ type StrandedDisks struct {
 	Disks   []StrandedDisk `json:"disks"`
 	Detail  string         `json:"detail"`
 	Fix     string         `json:"fix"`
+
+	// KeptByDelete: the VM's delete was `lv rm --keep-disks`, written by
+	// the deleting host before its tombstone (MarkStrandedForDelete). The
+	// host leaves a disk still at its path there (deleted_vm_residue.go).
+	KeptByDelete bool `json:"kept_by_delete,omitempty"`
 }
 
 func strandedSubject(vm, host string) string { return vm + "@" + host }
@@ -256,6 +263,32 @@ func noteStrandedCopy(ctx context.Context, db *corrosion.Client, reporter, vmNam
 		return "", err
 	}
 	return strandedDetail(ev), nil
+}
+
+// MarkStrandedForDelete records, on every open vm_disk_stranded record of
+// vmName, whether the delete about to tombstone it keeps the VM's disks
+// (`lv rm --keep-disks`). The caller writes it before the tombstone, so a
+// host that applies the tombstone has it. A record already saying so is not
+// written again.
+func MarkStrandedForDelete(ctx context.Context, db *corrosion.Client, reporter, vmName string, keep bool, now time.Time) error {
+	open, err := StrandedDisksOf(ctx, db, vmName)
+	if err != nil {
+		return err
+	}
+	for _, o := range open {
+		row, ev, had, err := readStranded(ctx, db, vmName, o.Host)
+		if err != nil {
+			return err
+		}
+		if !had || row.Lifecycle == corrosion.ConditionResolved || len(ev.Disks) == 0 || ev.KeptByDelete == keep {
+			continue
+		}
+		ev.KeptByDelete = keep
+		if err := writeStranded(ctx, db, reporter, row, true, ev, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StrandedDisksOf returns the open vm_disk_stranded records of vmName, one

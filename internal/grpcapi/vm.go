@@ -580,16 +580,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.virt.UndefineDomain(spec.Name, true)
 	}
 
-	// A disk a failover left here of a deleted VM of this name, which this
-	// host has not set aside yet, is kept as a copy for the retention: the
-	// sweep below would unlink it (health/deleted_vm_residue.go).
-	if err := health.SetAsideStrandedBeforeCreate(ctx, s.db, s.hostName, spec.Name, time.Now()); err != nil {
-		return nil, status.Errorf(codes.Unavailable, "create %s: %v; nothing was created", spec.Name, err)
-	}
-
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
-	// incomplete delete, even if the libvirt domain is already gone.
-	s.sweepVMDiskDebris(ctx, spec.Name)
+	// incomplete delete, even if the libvirt domain is already gone. A disk
+	// a deleted VM of this name was kept with, or that a failover left here,
+	// is moved off its path first (clearDiskDebrisBeforeCreate).
+	if err := s.clearDiskDebrisBeforeCreate(ctx, spec.Name, time.Now()); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s refused on %s: %v; nothing was created", spec.Name, s.hostName, err)
+	}
 	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
@@ -3116,7 +3113,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		// node keeps scheduling around. A failure is logged and every NIC named
 		// for the orphan sweep, never swallowed.
 		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
-		deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+		deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 		if err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -3441,7 +3438,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// row every node keeps serving, scheduling around and failing over — the
 	// exact stale-live state the mandatory tombstone exists to kill. The domain
 	// teardown above is idempotent, so the caller can simply retry.
-	deleted, err := corrosion.DeleteVMReporting(ctx, s.db, req.Name)
+	deleted, err := s.tombstoneDeletedVM(ctx, req.Name, req.KeepDisks)
 	if err != nil {
 		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
 		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)

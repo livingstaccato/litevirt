@@ -253,6 +253,11 @@ func (c *Coordinator) recoverableOn(ctx context.Context, host string) ([]string,
 	if err != nil {
 		return nil, err
 	}
+	return c.recoverableWith(ctx, host, enrolled)
+}
+
+// recoverableWith is recoverableOn with autoPromoteEnrolled already read.
+func (c *Coordinator) recoverableWith(ctx context.Context, host string, enrolled map[string]bool) ([]string, error) {
 	vms, err := corrosion.ListVMs(ctx, c.db, "", host)
 	if err != nil {
 		return nil, err

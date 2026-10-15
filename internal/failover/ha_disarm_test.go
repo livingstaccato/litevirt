@@ -1123,3 +1123,48 @@ func TestHADisarm_HeldClockRestartsAtTheFence(t *testing.T) {
 			reasons, sinces, fencedAt)
 	}
 }
+
+// A host restarting for an upgrade is not fenced inside upgradingTimeout
+// armed or not, so a hold over it is no stall: it is named held only once it
+// has sat 'upgrading' past the timeout (stuck), recoveryStallAfter after that.
+//
+// Mutation: admit an 'upgrading' host into heldBeforeFence whatever its age —
+// it alerts inside the upgrade grace, and this goes red.
+func TestHADisarm_UpgradingHostIsNotNamedHeldInsideItsGrace(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	if err := corrosion.UpdateHostState(ctx, db, "down", "upgrading"); err != nil {
+		t.Fatal(err)
+	}
+	setHA(t, db, corrosion.HADisarmed)
+	clock := time.Now()
+	c := newTestCoordinator("coordinator", db)
+	c.Now = func() time.Time { return clock }
+	fences := 0
+	c.SetFencer(countingFencer(&fences, sshFence))
+	var reasons []string
+	c.OnRecoveryStalled = func(_, _, reason string, _ int, _ time.Time) { reasons = append(reasons, reason) }
+	tick := func(d time.Duration) {
+		t.Helper()
+		clock = clock.Add(d)
+		holdLeaseThrough(t, db, ctx, clock)
+		if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ? WHERE target = 'down'`,
+			clock.UTC().Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+		c.run(ctx)
+	}
+	tick(0)
+	tick(recoveryStallAfter + time.Second)
+	tick(30 * time.Second)
+	if len(reasons) != 0 {
+		t.Fatalf("alerted for a host inside its upgrade grace (%v): %q", upgradingTimeout, reasons)
+	}
+	tick(upgradingTimeout - recoveryStallAfter - 30*time.Second) // past the grace: stuck
+	tick(recoveryStallAfter + time.Second)
+	if len(reasons) != 1 || reasons[0] != "recovery held: HA disarmed" {
+		t.Fatalf("a host stuck upgrading past %v: alerts %q, want one held by the disarm", upgradingTimeout, reasons)
+	}
+	if fences != 0 {
+		t.Fatalf("%d fences while disarmed", fences)
+	}
+}

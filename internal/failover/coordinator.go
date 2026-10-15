@@ -531,6 +531,18 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 	}
 }
 
+// upgradingGrace reports when h, recorded 'upgrading', turned so, and whether
+// it is still inside upgradingTimeout and so not fenced. It is timed from its
+// membership row's state change when it has one, else from the hosts row; an
+// unreadable time counts as inside.
+func (c *Coordinator) upgradingGrace(ctx context.Context, h *corrosion.HostRecord) (time.Time, bool) {
+	upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
+	if since, sok, serr := corrosion.HostStateSince(ctx, c.db, h.Name); serr == nil && sok {
+		upd, ok = since, true
+	}
+	return upd, !ok || c.now().Sub(upd) < c.upgradingTimeout()
+}
+
 // upgradingTimeout is how long a host recorded 'upgrading' is skipped.
 func (c *Coordinator) upgradingTimeout() time.Duration {
 	if c.UpgradingTimeout > 0 {
@@ -1079,11 +1091,8 @@ func (c *Coordinator) run(ctx context.Context) {
 		// 'upgrading' that kept reporting pushed its own timeout out. A host
 		// with no membership row is timed from the hosts row as before.
 		if h.State == "upgrading" {
-			upd, ok := corrosion.ParseUpdatedAt(h.UpdatedAt)
-			if since, sok, serr := corrosion.HostStateSince(ctx, c.db, target); serr == nil && sok {
-				upd, ok = since, true
-			}
-			if !ok || c.now().Sub(upd) < c.upgradingTimeout() {
+			upd, within := c.upgradingGrace(ctx, h)
+			if within {
 				slog.Info("failover: target is upgrading, skipping fence", "host", target)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrUpgrading)
 				continue

@@ -353,10 +353,13 @@ of acting — it says nothing about whether the resulting rows have replicated.
   proceeding (a failed fence and its next retry, a host that answered since, a
   confirmation it waits for, a partition pause, a fence that no longer stands,
   no host to place on, a stranded claim, or "not a fence candidate this
-  cycle"). A host the quorum reports down that an HA disarm keeps from being
-  fenced at all is still recorded active; it is named too, 60 s after the
-  hold began, with the line "a quorum-down host is held unfenced, and its
-  recovery with it" and the reason `recovery held: HA disarmed`. It repeats
+  cycle"). A host the quorum reports down that an HA hold (disarmed, a live
+  voter's veto, too few voters counted live, or an unreadable policy) keeps
+  from being fenced at all is still recorded active; it is named too, 60 s
+  after the hold began, with the line "a quorum-down host is held unfenced,
+  and its recovery with it" and a reason naming the hold, such as
+  `recovery held: HA disarmed`. A host restarting for an upgrade is not named
+  inside the upgrade timeout. It repeats
   at most every 10 minutes per host while the condition
   lasts. It ends when the workloads are recovered or leave the host:
   resolve the reason it names, `lv host undrain <host>` or

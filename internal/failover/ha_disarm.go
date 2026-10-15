@@ -217,7 +217,8 @@ func (c *Coordinator) noteHeldCandidate(target string) {
 
 // heldBeforeFence counts the recoverable workloads (strandedByHost's rules)
 // on each fence candidate an HA hold stopped this cycle while it is still
-// recorded active or upgrading: a host that failed while HA was disarmed.
+// recorded active, or upgrading past upgradingTimeout (inside it, the host is
+// not fenced armed either): a host that failed while HA was disarmed.
 // Nothing has fenced it, so nothing has written it offline, and
 // strandedByHost, which counts only fenced and offline hosts, never names it.
 // The hold is not recorded in its state: 'offline' is read across the cluster
@@ -227,6 +228,12 @@ func (c *Coordinator) noteHeldCandidate(target string) {
 // only reports. A read error is logged and reports nothing.
 func (c *Coordinator) heldBeforeFence(ctx context.Context) map[string]int {
 	if len(c.ha.heldCandidates) == 0 {
+		return nil
+	}
+	// Read once per cycle, as strandedByHost does: a full scan.
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	if err != nil {
+		slog.Warn("failover: count the workloads of hosts held by HA", "error", err)
 		return nil
 	}
 	held := map[string]int{}
@@ -239,7 +246,12 @@ func (c *Coordinator) heldBeforeFence(ctx context.Context) map[string]int {
 		if h == nil || (h.State != "active" && h.State != "upgrading") {
 			continue
 		}
-		w, err := c.recoverableOn(ctx, host)
+		if h.State == "upgrading" {
+			if _, within := c.upgradingGrace(ctx, h); within {
+				continue
+			}
+		}
+		w, err := c.recoverableWith(ctx, host, enrolled)
 		if err != nil {
 			slog.Warn("failover: count the workloads of a host held by HA", "host", host, "error", err)
 			continue

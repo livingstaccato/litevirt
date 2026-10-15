@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -119,11 +120,15 @@ func TestStackReconciler_ReassertRespectsTheRemoval(t *testing.T) {
 	})
 }
 
-// afriend c-0006. A reconcile pass sweeps the deny a torn-down stack still
-// owns.
+// afriend c-0006, cr8 round 1 I1. A deny owned by a torn-down stack that no
+// live stack asks for survives every reconcile pass (the unattended sweep
+// never opens the cluster) and raises a health condition naming the stack
+// and `lv firewall default-deny off`; the condition resolves once an operator
+// takes the row over.
 //
-// Mutation: drop the sweep from reconcile — the orphan deny stays.
-func TestStackReconciler_SweepsAnOrphanDeny(t *testing.T) {
+// Mutations: remove the orphan deny in the sweep (the cluster opens); drop
+// the condition (nothing says so).
+func TestStackReconciler_KeepsAndReportsAnOrphanDeny(t *testing.T) {
 	ctx := context.Background()
 	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
@@ -140,8 +145,25 @@ func TestStackReconciler_SweepsAnOrphanDeny(t *testing.T) {
 	}
 	r := NewStackReconciler("node-0", db)
 	r.SetCleaner(&recordingStackCleaner{})
+	for i := 0; i < 3; i++ {
+		r.reconcile(ctx)
+	}
+	if d, _ := corrosion.GetFirewallDefault(ctx, db, "cluster"); d == nil || !d.DefaultDeny {
+		t.Fatalf("deny owned by torn-down b after three reconcile passes = %+v, want kept", d)
+	}
+	cond, found, err := corrosion.GetHealthCondition(ctx, db, orphanDenyEvaluator, orphanDenyCode, orphanDenyKind, orphanDenySubject)
+	if err != nil || !found || cond.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("orphaned default-deny condition = %+v found=%v (%v), want open", cond, found, err)
+	}
+	if !strings.Contains(cond.Evidence, `\"b\"`) || !strings.Contains(cond.Evidence, "lv firewall default-deny off") {
+		t.Errorf("condition evidence = %s, want it to name stack b and the command", cond.Evidence)
+	}
+
+	if err := corrosion.SetFirewallDefault(ctx, db, "cluster", true, ""); err != nil {
+		t.Fatal(err)
+	}
 	r.reconcile(ctx)
-	if d, _ := corrosion.GetFirewallDefault(ctx, db, "cluster"); d != nil && d.DefaultDeny {
-		t.Errorf("deny owned by torn-down b after a reconcile pass = %+v, want removed", d)
+	if cond, _, _ := corrosion.GetHealthCondition(ctx, db, orphanDenyEvaluator, orphanDenyCode, orphanDenyKind, orphanDenySubject); cond.Lifecycle != corrosion.ConditionResolved {
+		t.Errorf("condition after an operator took the deny over = %s, want resolved", cond.Lifecycle)
 	}
 }

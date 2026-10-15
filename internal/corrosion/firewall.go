@@ -3,7 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -449,7 +449,8 @@ func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, r
 			return err
 		}
 		if !handed && len(unreadable) > 0 {
-			slog.Warn("stack teardown: the cluster default-deny stays, owned by the stack: the compose files of other stacks cannot be read, and one may ask for it",
+			warnOnChange("default-deny/"+stack, strings.Join(unreadable, ","),
+				"stack teardown: the cluster default-deny stays, owned by the stack: the compose files of other stacks cannot be read, and one may ask for it",
 				"stack", stack, "unreadable", unreadable)
 			return nil
 		}

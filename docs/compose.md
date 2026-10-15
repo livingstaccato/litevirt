@@ -179,8 +179,12 @@ stack reconciler sets it for a live stack whose file asks for it when the
 cluster has no default, if that stack was recorded after the default was
 removed (a redeploy that drops default-deny is not undone). Stacks going down
 at the same time never hand the deny or a repo to each other: a stack that
-went down is passed over, and the background reconciler hands on or removes
-any such row a torn-down stack still holds. The web UI's stack **Destroy** action
+went down is passed over. The background reconciler hands a deny or repo a
+torn-down stack still holds to a live stack that asks for it. Otherwise it
+unregisters such a repo, unless a backup schedule names it, and keeps such a
+deny: it never turns the cluster default-allow on its own, and raises the
+`firewall.default_deny_orphaned` health condition instead (see
+[diagnostics.md](diagnostics.md)). The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

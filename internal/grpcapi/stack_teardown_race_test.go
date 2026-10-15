@@ -149,16 +149,19 @@ func TestDeleteStackBackupRepos_TwoTeardownsLeaveNoOrphan(t *testing.T) {
 // stack never recorded (a first deploy in flight or failed), and a row
 // written after the owner's tombstone (a new deploy of the name) stay.
 //
-// Mutations: sweep nothing (the orphans stay); ignore the tombstone time
-// (the new deploy's row goes); sweep never-recorded owners (the first
-// deploy's row goes).
+// Mutations: sweep nothing (the orphan repo stays); remove an orphan deny
+// no stack asks for (the cluster opens); ignore the tombstone time (the new
+// deploy's row goes); sweep never-recorded owners (the first deploy's row
+// goes); ignore backup schedules (a scheduled repo goes).
 func TestSweepOrphanStackRows(t *testing.T) {
 	ctx := context.Background()
-	sweep := func(t *testing.T, s *Server) {
+	sweep := func(t *testing.T, s *Server) string {
 		t.Helper()
-		if err := corrosion.SweepOrphanStackRows(ctx, s.db, compose.StoredStackWants); err != nil {
+		orphan, err := corrosion.SweepOrphanStackRows(ctx, s.db, compose.StoredStackWants)
+		if err != nil {
 			t.Fatal(err)
 		}
+		return orphan
 	}
 	tornDown := func(t *testing.T, s *Server, name string) {
 		t.Helper()
@@ -167,7 +170,7 @@ func TestSweepOrphanStackRows(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Run("orphan deny and repo go", func(t *testing.T) {
+	t.Run("orphan deny is kept and reported, orphan repo goes", func(t *testing.T) {
 		s := testServer(t)
 		putStack(t, ctx, s, "b", denyFile("b"))
 		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "b"); err != nil {
@@ -179,12 +182,42 @@ func TestSweepOrphanStackRows(t *testing.T) {
 		if err := corrosion.DeleteStackRecord(ctx, s.db, "b"); err != nil {
 			t.Fatal(err)
 		}
-		sweep(t, s)
-		if d := clusterDefault(t, ctx, s); d != nil && d.DefaultDeny {
-			t.Errorf("deny owned by torn-down b after a sweep = %+v, want removed", d)
+		// cr8 round 1, I1: the unattended sweep never opens the cluster.
+		for i := 0; i < 3; i++ {
+			if orphan := sweep(t, s); orphan != "b" {
+				t.Errorf("sweep %d reported orphaned deny owner %q, want b", i, orphan)
+			}
+		}
+		if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "b" {
+			t.Errorf("deny owned by torn-down b after three sweeps = %+v, want kept", d)
 		}
 		if _, _, ok := repoOwner(t, ctx, s, "nightly"); ok {
 			t.Error("repo owned by torn-down b is still registered after a sweep")
+		}
+		// A stack asking for it later takes it over.
+		putStack(t, ctx, s, "c", denyFile("c"))
+		if orphan := sweep(t, s); orphan != "" {
+			t.Errorf("sweep reported orphan %q after c asked for the deny", orphan)
+		}
+		if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "c" {
+			t.Errorf("deny after c asked = %+v, want handed to c", d)
+		}
+	})
+	t.Run("repo a backup schedule names is kept", func(t *testing.T) {
+		s := testServer(t)
+		putStack(t, ctx, s, "b", nightlyOwnerYAML)
+		if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "b"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{VMName: "vm1", Repo: "nightly", Cron: "0 2 * * *", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteStackRecord(ctx, s.db, "b"); err != nil {
+			t.Fatal(err)
+		}
+		sweep(t, s)
+		if _, _, ok := repoOwner(t, ctx, s, "nightly"); !ok {
+			t.Error("repo a live backup schedule names was unregistered")
 		}
 	})
 	t.Run("orphan deny goes to a live stack asking", func(t *testing.T) {
@@ -208,9 +241,15 @@ func TestSweepOrphanStackRows(t *testing.T) {
 		if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "b"); err != nil {
 			t.Fatal(err)
 		}
+		if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "b"}); err != nil {
+			t.Fatal(err)
+		}
 		sweep(t, s)
 		if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "b" {
 			t.Errorf("deny of b's new deploy after a sweep = %+v, want kept", d)
+		}
+		if _, _, ok := repoOwner(t, ctx, s, "nightly"); !ok {
+			t.Error("repo of b's new deploy was unregistered by a sweep")
 		}
 	})
 	t.Run("never-recorded owner keeps its row", func(t *testing.T) {

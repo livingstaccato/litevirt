@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 )
 
 // StackFileWants reads, from a live stack's deployed compose YAML, whether
@@ -75,70 +77,109 @@ func handOff(ctx context.Context, c *Client, stack string, heirs []string, set f
 	return false, nil
 }
 
-// SweepOrphanStackRows finds the cluster default-deny row and the backup repo
-// registrations owned by a stack that was torn down (its record is a
-// tombstone) and that its teardown left behind, e.g. handed to it by a
-// concurrent teardown that read it as live. Each such owner's rows are handed
-// to a live stack that asks for them, or removed, as that stack's teardown
-// would (DeleteStackFirewallDefaults, DeleteStackBackupRepos). Only a row
-// last written no later than the owner's tombstone counts: a row written
-// after it belongs to a new deploy of that name, which has no record until
-// it ends. A row with no stack name (an operator's) is never touched, and no
-// repo path is.
-func SweepOrphanStackRows(ctx context.Context, c *Client, read StackFileWants) error {
-	type owned struct {
-		deny, repos bool
-		newest      string
-	}
-	owners := map[string]*owned{}
-	note := func(stack, updatedAt string) *owned {
-		o := owners[stack]
-		if o == nil {
-			o = &owned{}
-			owners[stack] = o
-		}
-		if o.newest == "" || lwwOrder(o.newest, updatedAt) < 0 {
-			o.newest = updatedAt
-		}
-		return o
-	}
-	rows, err := c.Query(ctx, `SELECT stack_name, updated_at FROM firewall_defaults
-		WHERE scope = 'cluster' AND deleted_at IS NULL AND default_deny = 1 AND stack_name IS NOT NULL AND stack_name != ''`)
-	if err != nil {
-		return err
-	}
-	for _, r := range rows {
-		note(r.String("stack_name"), r.String("updated_at")).deny = true
-	}
-	rows, err = c.Query(ctx, `SELECT stack_name, updated_at FROM backup_repos
-		WHERE deleted_at IS NULL AND stack_name IS NOT NULL AND stack_name != ''`)
-	if err != nil {
-		return err
-	}
-	for _, r := range rows {
-		note(r.String("stack_name"), r.String("updated_at")).repos = true
-	}
-	for stack, o := range owners {
+// SweepOrphanStackRows looks after the cluster default-deny row and the
+// backup repo registrations still owned by a stack that was torn down (its
+// record is a tombstone), e.g. handed to it by a concurrent teardown that read
+// it as live, or left by an older build's teardown.
+//
+// The deny is handed to a live stack that asks for it, and is otherwise KEPT:
+// the sweep runs unattended, and removing an in-force deny would open the
+// cluster with no one having asked. Its owner is returned as orphanDeny so the
+// caller can say so; `lv firewall default-deny off` removes it.
+//
+// A repo registration is handed on or removed as the owner's teardown would
+// (DeleteStackBackupRepos), but only when no row of that owner was written
+// after its tombstone: such a row belongs to a new deploy of the name, which
+// has no record until it ends. No repo path is touched.
+//
+// A row with no stack name (an operator's), and a row of a stack never
+// recorded (a first deploy, in flight or failed), are never touched.
+func SweepOrphanStackRows(ctx context.Context, c *Client, read StackFileWants) (orphanDeny string, err error) {
+	// tombstoned reports whether stack has a tombstoned record and no live
+	// one, and the tombstone's LWW key.
+	tombstoned := func(stack string) (bool, string, error) {
 		rec, err := c.Query(ctx, `SELECT updated_at, deleted_at FROM stacks WHERE name = ?`, stack)
 		if err != nil {
-			return err
+			return false, "", err
 		}
 		if len(rec) == 0 || rec[0].String("deleted_at") == "" {
-			continue // live, or never recorded (a first deploy, in flight or failed)
+			return false, "", nil // live, or never recorded
 		}
-		if lwwOrder(o.newest, rec[0].String("updated_at")) > 0 {
-			continue // written after the teardown: a new deploy of the name
+		return true, rec[0].String("updated_at"), nil
+	}
+
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil {
+		return "", err
+	}
+	if cur != nil && cur.DefaultDeny && cur.StackName != "" {
+		gone, _, err := tombstoned(cur.StackName)
+		if err != nil {
+			return "", err
 		}
-		if o.deny {
-			if err := DeleteStackFirewallDefaults(ctx, c, stack, read); err != nil {
-				return err
+		if gone {
+			others, _, err := otherStackWants(ctx, c, cur.StackName, read)
+			if err != nil {
+				return "", err
 			}
-		}
-		if o.repos {
-			if err := DeleteStackBackupRepos(ctx, c, stack, read); err != nil {
-				return err
+			var heirs []string
+			for _, o := range others {
+				if o.defaultDeny {
+					heirs = append(heirs, o.name)
+				}
+			}
+			handed, err := handOff(ctx, c, cur.StackName, heirs, func(owner string) error {
+				return SetFirewallDefault(ctx, c, "cluster", true, owner)
+			})
+			if err != nil {
+				return "", err
+			}
+			if !handed {
+				orphanDeny = cur.StackName
 			}
 		}
 	}
-	return nil
+
+	rows, err := c.Query(ctx, `SELECT stack_name, updated_at FROM backup_repos
+		WHERE deleted_at IS NULL AND stack_name IS NOT NULL AND stack_name != ''`)
+	if err != nil {
+		return orphanDeny, err
+	}
+	newest := map[string]string{}
+	for _, r := range rows {
+		st, at := r.String("stack_name"), r.String("updated_at")
+		if n, ok := newest[st]; !ok || lwwOrder(n, at) < 0 {
+			newest[st] = at
+		}
+	}
+	for stack, at := range newest {
+		gone, tomb, err := tombstoned(stack)
+		if err != nil {
+			return orphanDeny, err
+		}
+		if !gone || lwwOrder(at, tomb) > 0 {
+			continue // live, never recorded, or a new deploy of the name
+		}
+		if err := DeleteStackBackupRepos(ctx, c, stack, read); err != nil {
+			return orphanDeny, err
+		}
+	}
+	return orphanDeny, nil
+}
+
+// changeLog logs a warning for key only when what it says changed since the
+// last one for key, so a condition a loop meets on every pass is said once.
+var changeLog = struct {
+	sync.Mutex
+	last map[string]string
+}{last: map[string]string{}}
+
+func warnOnChange(key, state, msg string, args ...any) {
+	changeLog.Lock()
+	same := changeLog.last[key] == state
+	changeLog.last[key] = state
+	changeLog.Unlock()
+	if !same {
+		slog.Warn(msg, args...)
+	}
 }

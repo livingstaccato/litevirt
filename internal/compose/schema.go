@@ -71,6 +71,14 @@ type FirewallRuleDef struct {
 	CIDR      string `yaml:"cidr,omitempty"`   // CIDR or "@ipset"
 	Action    string `yaml:"action,omitempty"` // "accept" | "drop" | "reject"
 	Comment   string `yaml:"comment,omitempty"`
+	// Macro names a rule macro (internal/firewall.Macros) in place of proto
+	// and port. The parser expands it into one ordinary row per macro row,
+	// so no later stage sees a macro.
+	Macro string `yaml:"macro,omitempty"`
+	// Priority is set by macro expansion, never read from YAML: every row of
+	// the rule at index i has (i+1)*10. Zero means the deployer numbers the
+	// row by its position.
+	Priority int `yaml:"-"`
 }
 
 // FirewallDefaultsDef sets cluster-tier rules and the default policy.

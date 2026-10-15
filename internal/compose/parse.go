@@ -105,6 +105,11 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	if err := v.ps.err(); err != nil {
 		return nil, err
 	}
+	// Macros expand after the file is judged (a stored file is not), so no
+	// later stage sees one. A stored stack re-expands on every read.
+	if err := ExpandMacros(&f); err != nil {
+		return nil, err
+	}
 	return &f, nil
 }
 

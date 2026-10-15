@@ -320,10 +320,11 @@ func (s *Server) armMigrationTarget(ctx context.Context, target *corrosion.HostR
 	return am, nil
 }
 
-// apply sets what the move needs in libvirt's parameters.
+// apply sets what the move needs in libvirt's parameters. A firmware move
+// arrives paused whatever its NIC guards need.
 func (am *armedMigration) apply(p *lv.MigrateParams) {
 	if am != nil {
-		p.Paused = am.paused
+		p.Paused = am.paused || p.FirmwareLive
 	}
 }
 

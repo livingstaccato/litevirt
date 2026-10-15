@@ -72,6 +72,13 @@ lv cluster relay-restore <host> [--hold 1h]  # Clear a relay-health demotion now
                                    #   holder from demoting it again (admin, audited; see operating-model.md → Replication)
 lv cluster failback [on|off]       # Show or set whether an undrain moves drained VMs back (see
                                    #   migration-failover.md → Failback after maintenance)
+lv cluster ha                      # Show the cluster HA policy, each voter's answer, unconfirmed regions,
+                                   #   first-use status and, while disarmed, the hosts an arm would fence
+lv cluster ha disarm [--reason "..."]  # Hold every automatic fence and recovery cluster-wide (admin, audited;
+                                   #   returns once confirmed, up to 80 s; see migration-failover.md →
+                                   #   Disarming HA for planned maintenance)
+lv cluster ha arm [--fence-down-hosts] [--reason "..."]  # Resume them; refused while a host is reported
+                                   #   down unless --fence-down-hosts
 lv cluster upgrade-status          # Latched capability tokens on the connected host, whether each blocks a
                                    #   rollback, and which release features are in use (see upgrades.md →
                                    #   Rolling back after a release token latched)

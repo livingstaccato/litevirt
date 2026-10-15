@@ -2200,7 +2200,9 @@ func getVMIP(t *testing.T, vmName, stackName, networkName string) string {
 // vmIPWait bounds how long lv inspect may take to report a guest's address.
 // A guest on a host that is not the network's DHCP host has no local lease, so
 // the address comes from that host's ARP table; 60 s was too short for it, and
-// the bound stays tight enough for a reporting regression to fail.
+// the bound stays tight enough for a total reporting regression to fail. The
+// product fix for cross-host IP reporting is on fix/net-isolation-lb; tighten
+// this bound once it merges.
 const vmIPWait = 120 * time.Second
 
 // pollFor calls cond every interval until it returns true or timeout passes,
@@ -3034,7 +3036,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestLeaseSampleCoherent", "TestIncoherenceTracker", "TestPingVerdict"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseWatchObserve", "TestIncoherenceTracker", "TestPingVerdict"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

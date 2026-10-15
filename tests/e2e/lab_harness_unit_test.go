@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -208,15 +209,86 @@ func TestPingVerdict(t *testing.T) {
 	}
 }
 
-// TestLeaseSampleCoherent pins the W3 fix: a restarted replica's stale election
-// holder must not be paired with the ledger's newer term.
-func TestLeaseSampleCoherent(t *testing.T) {
+// TestClassifyLease: the W3 case (a restarted replica's old election holder
+// beside a newer ledger term) is lag; a holder with no earlier term is not.
+func TestClassifyLease(t *testing.T) {
+	terms := map[int]string{50: "node-2", 51: "node-4"}
 	for _, c := range []struct {
 		election, ledger string
-		want             bool
-	}{{"node-4", "node-4", true}, {"node-2", "node-4", false}, {"", "node-4", true}, {"node-2", "", true}} {
-		if got := leaseSampleCoherent(c.election, c.ledger); got != c.want {
+		want             leaseSampleKind
+	}{{"node-4", "node-4", leaseCoherent}, {"node-2", "node-4", leaseLag}, {"", "node-4", leaseNeutral}, {"node-9", "node-4", leaseUnexplained}} {
+		if got := classifyLease(leaseSample{Election: c.election, Term: 51, Ledger: c.ledger, Terms: terms}); got != c.want {
 			t.Errorf("(%q,%q) = %v, want %v", c.election, c.ledger, got, c.want)
 		}
+	}
+}
+
+// TestLeaseWatchObserve pins the sampler's wiring: per-reader runs, reset by a
+// coherent sample, neutral samples neither reset nor extend, a persistent run
+// and a same-term conflict fail, lag is logged and summarised, not dropped.
+func TestLeaseWatchObserve(t *testing.T) {
+	var fails, logs []string
+	newW := func() *leaseWatch {
+		fails, logs = nil, nil
+		return &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{},
+			fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) },
+			logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	}
+	terms := map[int]string{50: "node-2", 51: "node-4"}
+	lag := leaseSample{Election: "node-2", Term: 51, Ledger: "node-4", Terms: terms}
+	ok := leaseSample{Election: "node-4", Term: 51, Ledger: "node-4", Terms: terms}
+	neutral := leaseSample{Election: "", Term: 51, Ledger: "node-4", Terms: terms}
+	t0 := time.Unix(1000, 0)
+
+	// Transient lag on one reader: logged and summarised, no failure; a coherent sample resets.
+	w := newW()
+	for i := 0; i < 5; i++ {
+		w.observe("a", t0.Add(time.Duration(i)*time.Second), lag, true)
+	}
+	w.observe("a", t0.Add(6*time.Second), ok, true)
+	for i := 7; i < 14; i++ { // a second short run: 7 s after the reset, 14 s after the first
+		w.observe("a", t0.Add(time.Duration(i)*time.Second), lag, true)
+	}
+	if len(fails) != 0 || len(logs) < 5 || !strings.Contains(w.summary(), "12 incoherent") {
+		t.Fatalf("transient lag: fails=%v logs=%d summary=%q", fails, len(logs), w.summary())
+	}
+	if len(w.history()) != 1 || w.history()[0].Holder != "node-4" {
+		t.Fatalf("a lagging sample was recorded as a lease change: %+v", w.history())
+	}
+	// Persistent lag fails, one reader at a time: another reader's coherent
+	// samples must not reset it, and neutral samples must not reset it.
+	w = newW()
+	for i := 0; i < 15; i++ {
+		now := t0.Add(time.Duration(i) * time.Second)
+		w.observe("a", now, lag, true)
+		w.observe("b", now, ok, false)
+		w.observe("a", now, neutral, false)
+	}
+	if len(fails) != 1 || !strings.Contains(fails[0], "a's replica") {
+		t.Fatalf("persistent lag on reader a: fails=%v", fails)
+	}
+	// A reset when the reader is avoided.
+	w.avoided = map[string]bool{}
+	w.avoid("a", true)
+	if _, held := w.incoh["a"]; held {
+		t.Fatal("avoid did not reset the reader's run")
+	}
+	// Two holders for one term fail at once, with no time bound.
+	w = newW()
+	w.observe("a", t0, ok, true)
+	w.observe("b", t0, leaseSample{Election: "node-5", Term: 51, Ledger: "node-5", Terms: map[int]string{51: "node-5"}}, false)
+	if len(fails) != 1 || !strings.Contains(fails[0], "two holders for one term") {
+		t.Fatalf("a same-term conflict: fails=%v", fails)
+	}
+	// Stop prints the summary, once.
+	w = newW()
+	w.stop, w.done = make(chan struct{}), make(chan struct{})
+	close(w.done)
+	w.observe("a", t0, lag, true)
+	logs = nil
+	w.Stop()
+	w.Stop()
+	if len(logs) != 1 || !strings.Contains(logs[0], "1 incoherent") {
+		t.Fatalf("Stop's summary: %v", logs)
 	}
 }

@@ -815,12 +815,16 @@ awk -v l="${ind}%[2]s: %[3]s" '/^enforcement:/{f=1;next} f && /^[^ #]/{f=0} f &&
 
 // setEnforcement sets enforcement.<key> on host and restarts its daemon. The
 // original config is kept beside it and put back by restoreConfig.
-func (l *lab) setEnforcement(host, key, value string) error {
+//
+// The callers (drill_recovery, drill_witness) set it on hosts the baseline has
+// just required HOST_ACTIVE, so it waits for HOST_ACTIVE; pass anyState for a
+// host that may be in maintenance or fenced.
+func (l *lab) setEnforcement(host, key, value string, opts ...restartOpt) error {
 	if _, err := l.ssh(host, 30*time.Second, enforcementEditScript("/etc/litevirt/config.yaml", key, value)); err != nil {
 		return err
 	}
 	l.mark("config: %s enforcement.%s=%s", host, key, value)
-	return l.restartDaemon(host)
+	return l.restartDaemon(host, opts...)
 }
 
 // restoreConfig puts host's original config back and restarts its daemon, if

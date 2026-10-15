@@ -95,6 +95,8 @@ func TestCancelledStart_ADomainStartedAfterARestartIsDestroyed(t *testing.T) {
 		t.Fatalf("the cancel's record on disk: %+v, want web", recs)
 	}
 
+	st.asIfRestarted(t)
+
 	// A fresh daemon on the same host: a second one, sharing the data dir
 	// and the database, with no start in flight.
 	st2 := newStuckStart(t)

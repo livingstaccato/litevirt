@@ -317,11 +317,16 @@ answers again. litevirt keeps that from holding anything else:
   `<data_dir>/cancelled-starts.json`, so this holds across a daemon restart,
   unless the VM was started again since). A VM in `error` stays in `error`
   (its set-aside disk copies stay held), and a domain libvirt starts for it is
-  destroyed the same way. A kept cancel ends once its domain has run and been
-  destroyed, or the VM is started, deleted or moved, or the host has booted
-  since; it is not ended by its age. While it is kept, a VM in `error` is
-  neither recorded running from a domain that runs nor restarted by its
-  restart policy; `lv start` ends it. Other calls on the VM, `lv rm` among them,
+  destroyed the same way. A kept cancel ends once its domain has run (seen
+  running, or libvirt answered the start) and does not run any more, or the VM
+  is started, deleted or moved, or the host has booted, or the libvirt daemon
+  (`libvirtd` or `virtqemud`, when exactly one runs on the host) has
+  restarted since; it is not ended by its age.
+  While it is kept, a VM in `error` is neither recorded running from a domain
+  that runs nor restarted by its restart policy; `lv start` ends it. A cancel
+  kept longer than an hour raises `cancelled_start_kept` on the host, and a
+  `cancelled-starts.json` that cannot be read raises
+  `cancelled_starts_unreadable` (see [diagnostics.md](diagnostics.md)). Other calls on the VM, `lv rm` among them,
   wait for the start. `lv ls` and `lv inspect` on that host report a VM
   libvirt does not answer for as `VM_UNKNOWN` within a few seconds.
 - **The reconcile pass.** One pass on a host serves all of its VMs, so no

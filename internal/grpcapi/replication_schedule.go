@@ -81,6 +81,11 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown scope %q", scope)
 	}
+	// A limit the release gate refuses is refused before the schedule is
+	// written, so no unlimited schedule is left behind.
+	if err := s.precheckReplicationRate(ctx, req.BwlimitBytesPerSec); err != nil {
+		return nil, err
+	}
 
 	rec := corrosion.BackupScheduleRecord{
 		VMName:       corrosion.ScheduleKey(scope, req.VmName, req.PoolName, req.ProjectName),
@@ -101,7 +106,12 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule", req.VmName, "target="+req.TargetPool+" cron="+req.Cron, "ok")
-	return replScheduleToPB(rec), nil
+	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec); err != nil {
+		return nil, err
+	}
+	out := replScheduleToPB(rec)
+	out.BwlimitBytesPerSec = s.replicationRateOf(ctx, rec.VMName, rec.Repo)
+	return out, nil
 }
 
 func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplicationSchedulesRequest) (*pb.ListReplicationSchedulesResponse, error) {
@@ -111,6 +121,10 @@ func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplica
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
+	}
+	rates, err := corrosion.ListReplicationRates(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list replication rates: %v", err)
 	}
 	resp := &pb.ListReplicationSchedulesResponse{}
 	for _, r := range rows {
@@ -124,7 +138,9 @@ func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplica
 		if !s.canReadSchedule(ctx, r) {
 			continue
 		}
-		resp.Schedules = append(resp.Schedules, replScheduleToPB(r))
+		out := replScheduleToPB(r)
+		out.BwlimitBytesPerSec = rates[corrosion.ReplicationRateID{Schedule: r.VMName, Repo: r.Repo}]
+		resp.Schedules = append(resp.Schedules, out)
 	}
 	return resp, nil
 }
@@ -144,7 +160,7 @@ func (s *Server) DeleteReplicationSchedule(ctx context.Context, req *pb.DeleteRe
 		return nil, status.Error(codes.InvalidArgument, "target_pool required")
 	}
 	key := corrosion.ScheduleKey(scope, req.VmName, req.PoolName, req.ProjectName)
-	if err := corrosion.DeleteBackupSchedule(ctx, s.db, key, req.TargetPool); err != nil {
+	if err := s.deleteScheduleRow(ctx, key, req.TargetPool); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete replication schedule: %v", err)
 	}
 	return &emptypb.Empty{}, nil

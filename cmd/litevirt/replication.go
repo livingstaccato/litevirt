@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 func newReplicationCmd() *cobra.Command {
@@ -37,7 +38,7 @@ func newReplicationScheduleCmd() *cobra.Command {
 }
 
 func newReplicationScheduleAddCmd() *cobra.Command {
-	var cron, targetPool, targetHost, scope, poolName, projectName string
+	var cron, targetPool, targetHost, scope, poolName, projectName, bwlimit string
 	var keepReplicas int32
 	var disabled, incremental, autoPromote, container bool
 	cmd := &cobra.Command{
@@ -68,6 +69,12 @@ container's host is lost, through the same recovery claim as a restore from
 backup; the container needs a host-failure policy. --project-name picks the
 container when the name exists in more than one project.
 
+--bwlimit caps the bandwidth of the schedule's runs from each source host, in
+total: every run of the schedule there shares one limit (e.g. 50MiB, 512K; at
+least 64KiB/s). Without --bwlimit, re-adding a schedule keeps its stored limit;
+--bwlimit 0 removes it. A replication into a pool on the source host itself is
+not paced.
+
 After a promotion, a failover or a migrate onto the replica host, the schedule
 replicates back to the host the workload left (docs/backups.md, "Reverse
 replication").`,
@@ -83,18 +90,27 @@ replication").`,
 			if scope == "container" {
 				name = containerScheduleRef(projectName, name)
 			}
+			req := &pb.CreateReplicationScheduleRequest{
+				VmName: name, Cron: cron, TargetPool: targetPool, TargetHost: targetHost,
+				KeepReplicas: keepReplicas, Enabled: !disabled, Scope: scope,
+				PoolName: poolName, ProjectName: projectName,
+				Incremental: incremental, AutoPromote: autoPromote,
+			}
+			// Absent, the field stays unset and the stored limit is kept.
+			if cmd.Flags().Changed("bwlimit") {
+				bps, err := pbsstore.ParseRate(bwlimit)
+				if err != nil {
+					return fmt.Errorf("--bwlimit: %w", err)
+				}
+				req.BwlimitBytesPerSec = &bps
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				s, err := c.CreateReplicationSchedule(ctx, &pb.CreateReplicationScheduleRequest{
-					VmName: name, Cron: cron, TargetPool: targetPool, TargetHost: targetHost,
-					KeepReplicas: keepReplicas, Enabled: !disabled, Scope: scope,
-					PoolName: poolName, ProjectName: projectName,
-					Incremental: incremental, AutoPromote: autoPromote,
-				})
+				s, err := c.CreateReplicationSchedule(ctx, req)
 				if err != nil {
 					return fmt.Errorf("create replication schedule: %w", err)
 				}
-				fmt.Printf("replication schedule %s → %s added (cron=%q, incremental=%v, auto-promote=%v, enabled=%v)\n",
-					s.VmName, s.TargetPool, s.Cron, s.Incremental, s.AutoPromote, s.Enabled)
+				fmt.Printf("replication schedule %s → %s added (cron=%q, incremental=%v, auto-promote=%v, enabled=%v, bwlimit=%s)\n",
+					s.VmName, s.TargetPool, s.Cron, s.Incremental, s.AutoPromote, s.Enabled, pbsstore.FormatRate(s.BwlimitBytesPerSec))
 				return nil
 			})
 		},
@@ -107,6 +123,7 @@ replication").`,
 	cmd.Flags().BoolVar(&incremental, "incremental", false, "transfer only dirty extents (raw replicas)")
 	cmd.Flags().BoolVar(&autoPromote, "auto-promote", false, "failover may promote the freshest replica on host loss")
 	cmd.Flags().BoolVar(&disabled, "disabled", false, "create the schedule disabled")
+	cmd.Flags().StringVar(&bwlimit, "bwlimit", "", "bandwidth limit for every run of this schedule from a source host, in total, per second (e.g. 50MiB, 512K); absent keeps the stored limit, 0 removes it")
 	cmd.Flags().StringVar(&scope, "scope", "vm", "schedule scope: vm | pool | cluster | project | container")
 	cmd.Flags().StringVar(&poolName, "pool-name", "", "pool name (scope=pool)")
 	cmd.Flags().StringVar(&projectName, "project-name", "", "project name (scope=project, or the container's project)")
@@ -129,16 +146,20 @@ func newReplicationScheduleListCmd() *cobra.Command {
 					fmt.Println("(no replication schedules)")
 					return nil
 				}
-				fmt.Printf("%-18s %-12s %-10s %-5s %-5s %-4s %-20s %s\n",
-					"VM", "POOL", "HOST", "INCR", "AUTO", "KEEP", "LAST RUN", "LAST ERR")
+				fmt.Printf("%-18s %-12s %-10s %-5s %-5s %-4s %-12s %-20s %s\n",
+					"VM", "POOL", "HOST", "INCR", "AUTO", "KEEP", "RATE", "LAST RUN", "LAST ERR")
 				for _, s := range resp.Schedules {
 					name := s.VmName
 					if s.Scope == "container" {
 						name = "ct:" + name
 					}
-					fmt.Printf("%-18s %-12s %-10s %-5v %-5v %-4d %-20s %s\n",
+					rate := "-"
+					if s.BwlimitBytesPerSec > 0 {
+						rate = pbsstore.FormatRate(s.BwlimitBytesPerSec)
+					}
+					fmt.Printf("%-18s %-12s %-10s %-5v %-5v %-4d %-12s %-20s %s\n",
 						name, s.TargetPool, defaultStr(s.TargetHost, "-"), s.Incremental, s.AutoPromote,
-						s.KeepReplicas, defaultStr(s.LastRunAt, "-"), defaultStr(s.LastRunErr, "-"))
+						s.KeepReplicas, rate, defaultStr(s.LastRunAt, "-"), defaultStr(s.LastRunErr, "-"))
 				}
 				return nil
 			})

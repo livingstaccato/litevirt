@@ -1110,7 +1110,8 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
   [--disabled]             # create the schedule disabled
   [--scope vm|pool|cluster|project|container] [--pool-name <p>] [--project-name <p>]
   [--container]            # a container: --target-host is the peer, --target-pool the backup repo on it
-lv replication schedule ls
+  [--bwlimit <rate>]       # per-schedule bandwidth limit, shared by its runs on a host (e.g. 50MiB); 0 removes it, absent keeps it
+lv replication schedule ls # RATE column: the limit, "-" for none
 lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
 
 # A container's replicas on its replica host; restore one, or remove set-aside/orphaned ones (admin).

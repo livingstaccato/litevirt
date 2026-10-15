@@ -56,6 +56,9 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 	if vm.HostName != s.hostName {
 		return nil // not ours; the owning host's scheduler handles it
 	}
+	// The schedule's bandwidth limit, read once per run, paces every leg
+	// that sends this run's data to a peer.
+	ctx = withReplicationLimiter(ctx, s.scheduleLimiter(ctx, sched))
 	err = s.runVMReplication(ctx, sched, vm, runAt)
 	s.replicationOutcome(ctx, sched, "vm", vm.Name, tenancy.NormalizeProject(vm.Project), sched.TargetHost, sched.TargetPool, "", err)
 	return err
@@ -396,7 +399,8 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 }
 
 // streamReplicaToPool sends a local file to a peer's pool as the recorded
-// replica rec, over the peer-only PushReplica.
+// replica rec, over the peer-only PushReplica, charging each chunk to the
+// run's limiter.
 func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, rec replicaRecord) (*pb.PushReplicaResponse, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -414,6 +418,9 @@ func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, po
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
+			if err := chargeReplication(ctx, n); err != nil {
+				return nil, err
+			}
 			if err := up.Send(&pb.PushReplicaRequest{Chunk: buf[:n]}); err != nil {
 				return nil, err
 			}
@@ -431,7 +438,8 @@ func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, po
 // streamLegacyReplica sends a local file to an older build's pool as main's
 // runner did: an upload of the runner name to the pool's top level. The
 // content call says it is the daemon's, about k's replicas, so a receiver
-// that knows the marker records it as k's replica.
+// that knows the marker records it as k's replica. Each chunk is charged to
+// the run's limiter.
 func streamLegacyReplica(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, k replicaKey, name string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -449,6 +457,9 @@ func streamLegacyReplica(ctx context.Context, client pb.LiteVirtClient, path, po
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
+			if err := chargeReplication(ctx, n); err != nil {
+				return err
+			}
 			if err := up.Send(&pb.UploadStoragePoolContentRequest{Chunk: buf[:n]}); err != nil {
 				return err
 			}
@@ -729,7 +740,8 @@ func (s *Server) receiveRawReplica(ctx context.Context, pool string, rec replica
 }
 
 // applyIncrementRemote streams the new raw replica to a peer's pool via
-// PushReplicaIncrement (dirty extents only; the peer forks from base).
+// PushReplicaIncrement (dirty extents only; the peer forks from base),
+// charging each extent chunk to the run's limiter.
 func (s *Server) applyIncrementRemote(ctx context.Context, host, pool string, rec replicaRecord, base string, totalSize int64, r io.ReaderAt, extents [][2]int64) error {
 	client, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
@@ -759,6 +771,9 @@ func (s *Server) applyIncrementRemote(ctx context.Context, host, pool string, re
 		return err
 	}
 	if err := forEachExtentChunk(r, extents, totalSize, func(off int64, data []byte) error {
+		if err := chargeReplication(ctx, len(data)); err != nil {
+			return err
+		}
 		return up.Send(&pb.PushReplicaIncrementRequest{Offset: off, Data: data})
 	}); err != nil {
 		return err

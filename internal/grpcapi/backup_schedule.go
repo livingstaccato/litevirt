@@ -205,7 +205,7 @@ func (s *Server) DeleteBackupSchedule(ctx context.Context, req *pb.DeleteBackupS
 	if key == "" {
 		return nil, status.Error(codes.InvalidArgument, "schedule target required")
 	}
-	if err := corrosion.DeleteBackupSchedule(ctx, s.db, key, req.Repo); err != nil {
+	if err := s.deleteScheduleRow(ctx, key, req.Repo); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete schedule: %v", err)
 	}
 	return &emptypb.Empty{}, nil

@@ -159,6 +159,9 @@ func (s *Server) mirrorIncrement(ctx context.Context, host, pool string, k repli
 		return err
 	}
 	if err := each(func(off int64, data []byte) error {
+		if err := chargeReplication(ctx, len(data)); err != nil {
+			return err
+		}
 		return up.Send(&pb.PushReplicaIncrementRequest{Offset: off, Data: data})
 	}); err != nil {
 		return err

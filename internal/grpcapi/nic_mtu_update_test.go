@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -25,6 +26,12 @@ const (
 // hot-plugged second one (lan2), both bridges at 9000.
 func mtuVM(t *testing.T, state string, gate *mtuGate) (*Server, *libvirtfake.Fake, context.Context) {
 	t.Helper()
+	return mtuVMIn(t, state, gate, "")
+}
+
+// mtuVMIn is mtuVM, the VM a member of stack when it is not "".
+func mtuVMIn(t *testing.T, state string, gate *mtuGate, stack string) (*Server, *libvirtfake.Fake, context.Context) {
+	t.Helper()
 	s := reconfigServer(t)
 	s.SetReleaseFeatureGate(gate)
 	fake := s.virt.(*libvirtfake.Fake)
@@ -33,7 +40,7 @@ func mtuVM(t *testing.T, state string, gate *mtuGate) (*Server, *libvirtfake.Fak
 	ctx := adminCtx()
 	spec := &pb.VMSpec{Name: "m", Cpu: 2, MemoryMib: 512,
 		Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio", Mac: mtuMAC0}}}
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "m", HostName: s.hostName, State: state,
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "m", StackName: stack, HostName: s.hostName, State: state,
 		CPUActual: 2, MemActual: 512, Spec: seedSpecJSON(t, spec)},
 		[]corrosion.InterfaceRecord{
 			{VMName: "m", NetworkName: "lan", MAC: mtuMAC0, Ordinal: 0},
@@ -162,5 +169,43 @@ func TestNICMTUUpdates(t *testing.T) {
 	got := nicMTUUpdates(desired, stored)
 	if len(got) != 2 || got[0].GetOrdinal() != 0 || got[0].GetMtu() != compose.NICMTUBridge || got[1].GetOrdinal() != 1 || got[1].GetMtu() != 9000 {
 		t.Errorf("updates = %v, want NIC 0 to bridge and NIC 1 to 9000 only", got)
+	}
+}
+
+// A stack VM's NIC list is its compose file's: --nic-mtu on a NIC the file
+// does not list (a hot-plugged one) is refused, pointing at the file, and the
+// stored list is left as the file's, so the next deploy does not read a
+// topology change and recreate the VM. A NIC the file lists takes it.
+//
+// Mutation: drop the stack refusal — the entry is made and the test goes red.
+func TestUpdateVM_NICMTUOnAStackVMRefusesAnUnlistedNIC(t *testing.T) {
+	s, _, ctx := mtuVMIn(t, "stopped", newMTUGate(t, true), "web")
+	_, err := s.UpdateVM(ctx, mtuReq(&pb.NICMTUUpdate{Ordinal: 1, Mtu: 9000}))
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "set mtu: in the stack's compose file") {
+		t.Errorf("unlisted NIC on a stack VM: %v", err)
+	}
+	if n := len(loadStoredSpec(t, s, "m").Network); n != 1 {
+		t.Errorf("the refused update left %d NIC entries, want the file's 1", n)
+	}
+	if _, err := s.UpdateVM(ctx, mtuReq(&pb.NICMTUUpdate{Ordinal: 0, Mtu: 9000})); err != nil {
+		t.Errorf("a NIC the file lists: %v", err)
+	}
+}
+
+// A NIC MTU the host cannot carry is the operator's to fix on every define
+// path: the render's error maps to FailedPrecondition, anything else stays
+// Internal.
+//
+// Mutation: have renderStatus always answer Internal — red.
+func TestRenderStatus(t *testing.T) {
+	_, err := lv.GenerateDomainXML(lv.VMConfig{Name: "r", CPU: 1, MemoryMiB: 256, HostName: "h",
+		Networks:  []lv.NetworkConfig{{Bridge: "b", Model: "virtio", MAC: "52:54:00:00:30:01", MTU: 9000}},
+		BridgeMTU: func(string) (int, error) { return 1500, nil }})
+	if got := renderStatus("generate domain XML", err); status.Code(got) != codes.FailedPrecondition ||
+		!strings.Contains(got.Error(), "does not match bridge b MTU 1500 on host h") {
+		t.Errorf("mismatch: %v", got)
+	}
+	if got := renderStatus("generate domain XML", errors.New("something else")); status.Code(got) != codes.Internal {
+		t.Errorf("another render error: %v", got)
 	}
 }

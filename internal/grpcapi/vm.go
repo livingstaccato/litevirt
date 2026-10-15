@@ -5331,7 +5331,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// NIC MTUs likewise, each checked against its bridge here before anything
 	// is stopped.
 	if len(req.NicMtu) > 0 {
-		if err := s.applyNICMTURequest(ctx, spec, req); err != nil {
+		if err := s.applyNICMTURequest(ctx, spec, req, vm.StackName); err != nil {
 			return nil, err
 		}
 	}

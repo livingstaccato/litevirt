@@ -174,8 +174,10 @@ func requestSetsNICMTU(req *pb.UpdateVMRequest) bool {
 // checks each against its bridge on this host, so a refusal comes before
 // anything is stopped. A NIC the stored spec does not list (a hot-plugged
 // one) gets its entry, as does every unlisted NIC before it, each made from
-// its NIC record.
-func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest) error {
+// its NIC record — except on a VM of a stack (stack non-empty), whose NIC list
+// is its compose file's: a longer list would read as a topology change and
+// recreate the VM at the next deploy, so such a NIC is refused.
+func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest, stack string) error {
 	nics, err := corrosion.MergedVMNICs(ctx, s.db, req.GetName())
 	if err != nil {
 		return status.Errorf(codes.Internal, "list NICs of %q: %v", req.GetName(), err)
@@ -193,6 +195,11 @@ func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *p
 		seen[o] = true
 		if o < 0 {
 			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), o)
+		}
+		if o >= len(spec.Network) && stack != "" {
+			return status.Errorf(codes.FailedPrecondition,
+				"VM %q belongs to stack %q, whose compose file does not list NIC %d; set mtu: in the stack's compose file",
+				req.GetName(), stack, o)
 		}
 		for len(spec.Network) <= o {
 			ic, ok := byOrdinal[len(spec.Network)]

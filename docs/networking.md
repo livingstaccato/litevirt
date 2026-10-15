@@ -246,7 +246,8 @@ Only virtio NICs on a bridged network take an MTU; macvtap (direct) and SR-IOV
 networks do not. `lv attach-nic` takes no MTU: attach the NIC, then set it with
 `lv update <vm> --nic-mtu <nic>=<MTU>` (the VM stopped, or
 `--restart-if-needed`), which also records the hot-attached NIC in the VM's
-spec. The MTU is accepted once the release token has latched (feature
+spec. A VM of a stack takes its NICs from the compose file: set `mtu:` there,
+as `lv update --nic-mtu` refuses a NIC the file does not list. The MTU is accepted once the release token has latched (feature
 `nic_mtu`).
 
 ## Container network attachment

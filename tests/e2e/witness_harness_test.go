@@ -632,7 +632,10 @@ type leaseWatch struct {
 	logf         func(format string, args ...any)
 	summed       sync.Once
 	selfClaim    selfClaimTracker
-	all          []leaseChange // every reader's tenures, tagged by reader
+	unknownRun   map[string]int // consecutive failed reads per reader
+	unknownTotal map[string]int // all failed reads per reader
+	ticks        int            // ticks sampled
+	all          []leaseChange  // every reader's tenures, tagged by reader
 	lastBy       map[string]leaseChange
 	maxTerm      map[string]int
 	stop         chan struct{}
@@ -670,23 +673,71 @@ func (w *leaseWatch) sampleOnce() {
 		}
 	}
 	w.mu.Unlock()
-	recorded := false // the change history follows one coherent reader per tick
-	claims := map[string]string{}
+	var samples []readerSample
 	for _, r := range rs { // every reader every tick: a later one can be the incoherent one
 		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),''), COALESCE((SELECT group_concat(term || ':' || holder, ',') FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL),'')")
 		if err != nil || len(rows) == 0 || len(rows[0]) < 4 {
+			samples = append(samples, readerSample{Reader: r, Failed: true})
 			continue
 		}
 		term, _ := strconv.Atoi(rows[0][1])
-		smp := leaseSample{Election: rows[0][0], Term: term, Ledger: rows[0][2], Terms: parseTermHolders(rows[0][3])}
-		if w.observe(r, time.Now(), smp, !recorded) {
-			recorded = true
+		samples = append(samples, readerSample{Reader: r, S: leaseSample{Election: rows[0][0], Term: term, Ledger: rows[0][2], Terms: parseTermHolders(rows[0][3])}})
+	}
+	w.sampleTick(time.Now(), samples)
+}
+
+// readerSample is one reader's answer in a tick; Failed is a sql read that
+// gave nothing (the reader's state is unknown, not absent).
+type readerSample struct {
+	Reader string
+	S      leaseSample
+	Failed bool
+}
+
+// recorderOf picks the reader whose sample feeds the change history this
+// tick: the usable (not lagging, not unexplained) sample with the highest
+// ledger term, the first of those on a tie; "" when none is usable. A stale
+// self-consistent replica therefore never stands in for the newest tenure.
+func recorderOf(samples []readerSample) string {
+	best, bestTerm := "", -1
+	for _, rs := range samples {
+		if rs.Failed {
+			continue
 		}
-		if smp.Election == r {
-			claims[r] = smp.Election // the node's own replica names the node itself
+		if k := classifyLease(rs.S); k == leaseLag || k == leaseUnexplained {
+			continue
+		}
+		if rs.S.Term > bestTerm {
+			best, bestTerm = rs.Reader, rs.S.Term
 		}
 	}
-	w.observeTick(time.Now(), claims)
+	return best
+}
+
+// selfClaims reports whether the sample is a claim to count at once: the
+// replica names its own node holder and is not lag-classified. A lagging
+// replica holding its own old election row is catching up, and is counted by
+// the window tracker (observe) instead.
+func selfClaims(r string, s leaseSample) bool {
+	return s.Election == r && classifyLease(s) != leaseLag
+}
+
+// sampleTick takes every reader's answer for one tick.
+func (w *leaseWatch) sampleTick(now time.Time, samples []readerSample) {
+	rec := recorderOf(samples)
+	claims := map[string]string{}
+	var unknown []string
+	for _, rs := range samples {
+		if rs.Failed {
+			unknown = append(unknown, rs.Reader)
+			continue
+		}
+		w.observe(rs.Reader, now, rs.S, rs.Reader == rec)
+		if selfClaims(rs.Reader, rs.S) {
+			claims[rs.Reader] = rs.S.Election // the node's own replica names the node itself
+		}
+	}
+	w.observeTick(now, claims, unknown)
 }
 
 // selfClaimGrace is how long two nodes may each name themselves the holder in
@@ -698,6 +749,8 @@ const (
 
 // selfClaimTracker follows consecutive ticks with two self-claimants.
 type selfClaimTracker struct {
+	held     bool            // a run is being held across an unreadable claimant
+	last     map[string]bool // who claimed on the previous tick (or was carried)
 	n        int
 	since    time.Time
 	reported bool
@@ -707,14 +760,57 @@ type selfClaimTracker struct {
 // different nodes have each been named holder by their OWN replica for 2
 // consecutive ticks or selfClaimGrace. A stale replica of someone else's
 // tenure is lag, not a claim, and never enters here.
-func (w *leaseWatch) observeTick(now time.Time, claims map[string]string) {
+func (w *leaseWatch) observeTick(now time.Time, claims map[string]string, unknown []string) {
 	w.mu.Lock()
 	c := &w.selfClaim
+	persistent := w.noteUnknown(unknown)
+	// A failed read of a node that claimed last tick is unknown: it neither
+	// resets nor extends the run, so intermittent sql errors cannot evade it.
+	carried := 0
+	last := map[string]bool{}
+	for r := range claims {
+		last[r] = true
+	}
+	for _, u := range unknown {
+		if c.last[u] {
+			carried++
+			last[u] = true
+		}
+	}
 	if len(claims) < 2 {
+		if len(claims)+carried >= 2 {
+			// Bound the hold: a claimant unreadable for good is unverifiable.
+			var gone []string
+			for _, u := range unknown {
+				if c.last[u] && w.unknownRun[u] > unknownPersistent+unknownHeldExtra {
+					gone = append(gone, u)
+				}
+			}
+			if len(gone) > 0 {
+				k := w.unknownRun[gone[0]]
+				*c = selfClaimTracker{}
+				w.mu.Unlock()
+				w.reportUnknown(persistent)
+				w.fail("lease: dual claim unverifiable: %v claimed beside another holder, then unreadable %d ticks", gone, k)
+				return
+			}
+			enter := !c.held
+			c.held = true
+			c.last = last
+			w.mu.Unlock()
+			w.reportUnknown(persistent)
+			if enter {
+				w.logf("lease: self-claim run held across an unreadable replica (%v)", unknown)
+			}
+			return
+		}
 		*c = selfClaimTracker{}
 		w.mu.Unlock()
+		w.reportUnknown(persistent)
 		return
 	}
+	c.last = last
+	c.held = false
 	if c.n == 0 {
 		c.since = now
 	}
@@ -725,6 +821,7 @@ func (w *leaseWatch) observeTick(now time.Time, claims map[string]string) {
 	}
 	n := c.n
 	w.mu.Unlock()
+	w.reportUnknown(persistent)
 	names := make([]string, 0, len(claims))
 	for r := range claims {
 		names = append(names, r)
@@ -733,6 +830,63 @@ func (w *leaseWatch) observeTick(now time.Time, claims map[string]string) {
 	w.logf("lease: SELF-CLAIMS by %v at the same tick (tick %d)", names, n)
 	if fail {
 		w.fail("lease: dual holder: %v each hold the lease in their own replica for %d consecutive ticks", names, n)
+	}
+}
+
+// neverReadable lists readers whose sql failed on every sampled tick.
+func (w *leaseWatch) neverReadable() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	if w.ticks < unknownPersistent+unknownHeldExtra {
+		return nil
+	}
+	for r, n := range w.unknownTotal {
+		if n == w.ticks {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unknownPersistent is how many consecutive failed reads of one replica make
+// it worth a log line.
+const unknownPersistent = 3
+
+// unknownHeldExtra is how many ticks past unknownPersistent a held run waits
+// for its unreadable claimant before the drill fails.
+const unknownHeldExtra = 3
+
+// noteUnknown counts consecutive failed reads per reader (w.mu held) and
+// returns the readers that just reached unknownPersistent.
+func (w *leaseWatch) noteUnknown(unknown []string) []string {
+	if w.unknownRun == nil {
+		w.unknownRun = map[string]int{}
+		w.unknownTotal = map[string]int{}
+	}
+	w.ticks++
+	failed := map[string]bool{}
+	var hit []string
+	for _, u := range unknown {
+		failed[u] = true
+		w.unknownRun[u]++
+		w.unknownTotal[u]++
+		if w.unknownRun[u] == unknownPersistent {
+			hit = append(hit, u)
+		}
+	}
+	for r := range w.unknownRun {
+		if !failed[r] {
+			w.unknownRun[r] = 0
+		}
+	}
+	return hit
+}
+
+func (w *leaseWatch) reportUnknown(hit []string) {
+	for _, r := range hit {
+		w.logf("lease: %s's replica could not be read for %d consecutive ticks; its self-claims are unknown", r, unknownPersistent)
 	}
 }
 
@@ -874,13 +1028,24 @@ type leaseIncoherent struct {
 func (w *leaseWatch) summary() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.incohSamples) == 0 {
-		return "lease: no incoherent samples"
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "lease: %d incoherent sample(s):", len(w.incohSamples))
-	for _, o := range w.incohSamples {
-		fmt.Fprintf(&b, "\n  %s on %s: election %q, ledger term %d held by %q (kind %d)", o.At.Format("15:04:05"), o.Reader, o.Sample.Election, o.Sample.Term, o.Sample.Ledger, o.Kind)
+	if len(w.incohSamples) == 0 {
+		b.WriteString("lease: no incoherent samples")
+	} else {
+		fmt.Fprintf(&b, "lease: %d incoherent sample(s):", len(w.incohSamples))
+		for _, o := range w.incohSamples {
+			fmt.Fprintf(&b, "\n  %s on %s: election %q, ledger term %d held by %q (kind %d)", o.At.Format("15:04:05"), o.Reader, o.Sample.Election, o.Sample.Term, o.Sample.Ledger, o.Kind)
+		}
+	}
+	var names []string
+	for r, n := range w.unknownTotal {
+		if n > 0 {
+			names = append(names, r)
+		}
+	}
+	sort.Strings(names)
+	for _, r := range names {
+		fmt.Fprintf(&b, "\nlease: %s unreadable on %d of %d tick(s) (its claims were unknown)", r, w.unknownTotal[r], w.ticks)
 	}
 	return b.String()
 }
@@ -940,7 +1105,12 @@ func (w *leaseWatch) Stop() {
 		close(w.stop)
 	}
 	<-w.done
-	w.summed.Do(func() { w.logf("%s", w.summary()) })
+	w.summed.Do(func() {
+		w.logf("%s", w.summary())
+		for _, r := range w.neverReadable() {
+			w.fail("lease: W3 inconclusive: %s's replica was unreadable on every one of %d sampled ticks", r, w.ticks)
+		}
+	})
 }
 
 func (w *leaseWatch) avoid(h string, on bool) {

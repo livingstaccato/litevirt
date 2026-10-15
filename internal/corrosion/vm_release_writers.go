@@ -8,14 +8,15 @@ import (
 
 // VMSpecFeatures says which release features' data one write of a VM's spec
 // carries: disk/NIC tuning (vm_disk_nic_io), USB devices or memory hot-add
-// (usb_mounts_memory), CPU or NIC limits (vm_limits). One spec can carry any
-// of them together — a create, a restore, a clone or an update that sets
-// several — and each must have passed its own release gate before the spec is
-// written (integration checklist M9).
+// (usb_mounts_memory), CPU or NIC limits (vm_limits), NIC MTUs (nic_mtu). One
+// spec can carry any of them together — a create, a restore, a clone or an
+// update that sets several — and each must have passed its own release gate
+// before the spec is written (integration checklist M9).
 type VMSpecFeatures struct {
 	Tuning      bool
 	Passthrough bool
 	Limits      bool
+	MTU         bool
 }
 
 // InsertVMWithReleaseFeatures is InsertVMWithHardware for a VM spec that may
@@ -23,7 +24,7 @@ type VMSpecFeatures struct {
 // feature and checks every one the spec's data needs (needs), so a spec that
 // carries three features cannot be written on the strength of one grant. A
 // grant the data does not need is not checked (the zero grant is fine there).
-func InsertVMWithReleaseFeatures(ctx context.Context, c *Client, tuning, passthrough, limits capabilities.FeatureGrant,
+func InsertVMWithReleaseFeatures(ctx context.Context, c *Client, tuning, passthrough, limits, mtu capabilities.FeatureGrant,
 	needs VMSpecFeatures, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord,
 	pciIntents []PCIIntentRecord, adopt bool) error {
 	if needs.Tuning {
@@ -41,13 +42,18 @@ func InsertVMWithReleaseFeatures(ctx context.Context, c *Client, tuning, passthr
 			return err
 		}
 	}
+	if needs.MTU {
+		if err := mtu.Check(capabilities.FeatureNICMTU); err != nil {
+			return err
+		}
+	}
 	return InsertVMWithHardware(ctx, c, vm, ifaces, disks, nics, pciIntents, adopt)
 }
 
 // MutateDesiredSpecWithReleaseFeatures is MutateDesiredSpec for an update
 // whose new spec may carry the data of several release features: every grant
 // needs names is checked before anything is written.
-func MutateDesiredSpecWithReleaseFeatures(ctx context.Context, c *Client, tuning, passthrough, limits capabilities.FeatureGrant,
+func MutateDesiredSpecWithReleaseFeatures(ctx context.Context, c *Client, tuning, passthrough, limits, mtu capabilities.FeatureGrant,
 	needs VMSpecFeatures, name string, fn func(oldSpec string) (string, error)) (applied bool, newGen int64, err error) {
 	if needs.Tuning {
 		if err := tuning.Check(capabilities.FeatureVMDiskNICIO); err != nil {
@@ -64,6 +70,11 @@ func MutateDesiredSpecWithReleaseFeatures(ctx context.Context, c *Client, tuning
 			return false, 0, err
 		}
 	}
+	if needs.MTU {
+		if err := mtu.Check(capabilities.FeatureNICMTU); err != nil {
+			return false, 0, err
+		}
+	}
 	return MutateDesiredSpec(ctx, c, name, fn)
 }
 
@@ -73,7 +84,7 @@ func MutateDesiredSpecWithReleaseFeatures(ctx context.Context, c *Client, tuning
 // the domain first) runs it before that work, so a grant the writer would
 // refuse refuses the request while nothing exists yet. The writers keep their
 // own checks; TestCheckVMSpecGrants_AgreesWithTheWriter pins the two together.
-func CheckVMSpecGrants(tuning, passthrough, limits capabilities.FeatureGrant, needs VMSpecFeatures) error {
+func CheckVMSpecGrants(tuning, passthrough, limits, mtu capabilities.FeatureGrant, needs VMSpecFeatures) error {
 	if needs.Tuning {
 		if err := tuning.Check(capabilities.FeatureVMDiskNICIO); err != nil {
 			return err
@@ -86,6 +97,11 @@ func CheckVMSpecGrants(tuning, passthrough, limits capabilities.FeatureGrant, ne
 	}
 	if needs.Limits {
 		if err := limits.Check(capabilities.FeatureVMLimits); err != nil {
+			return err
+		}
+	}
+	if needs.MTU {
+		if err := mtu.Check(capabilities.FeatureNICMTU); err != nil {
 			return err
 		}
 	}

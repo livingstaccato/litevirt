@@ -35,6 +35,7 @@ You want:
 | OIDC / LDAP / TOTP | realms + 2FA | OIDC code flow; LDAP search-then-bind |
 | Live migration | `lv migrate <vm> <host>` | qemu native; storage replicated via `lv replicate-volume` |
 | Live storage motion | `lv move-volume` | libvirt blockdev-mirror, no downtime |
+| Storage replication job `rate=` (MB/s) | `lv replication schedule add <vm> --bwlimit <N>M` | `rate=N` is `--bwlimit NM`, a fractional rate in K (`rate=1.5` is `--bwlimit 1536K`); one limit shared by every run of the schedule on its source host |
 | `cpulimit`, `cpuunits`, NIC `rate=` | `cpu-limit`, `cpu-shares`, `rate:` on a network entry | applied live. `cpu-limit` is total host cores (whole-domain cap, as `cpulimit`), `cpu-shares` is the same 1-10000 cgroup weight as `cpuunits` (default 100), `rate` is MB/s. `lv import` warns about the three and does not carry them — set them with `lv update` — see [compose](compose.md#noisy-neighbour-limits) |
 
 ## What's different (intentionally)
@@ -144,6 +145,7 @@ relied on is set in the compose file after the import (or with `lv disk-io`):
 | `scsi0: ...,iops_rd=500,iops_wr=500` | `iotune: { read_iops_sec: 500, write_iops_sec: 500 }` |
 | `scsi0: ...,mbps_rd_max=200` | `iotune: { read_bytes_sec: 100M, read_bytes_sec_max: 200M }` |
 | `net0: virtio=...,queues=4` | `network[].queues: 4` (or `auto`) |
+| `net0: virtio=...,mtu=9000` (`mtu=1`: the bridge's) | `network[].mtu: 9000` (`mtu: bridge`); must equal the bridge's MTU. `lv import` carries it once the release token has latched (feature `nic_mtu`) and warns either way; before that it drops it |
 
 ## Step 4 — Migrate one container
 

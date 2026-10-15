@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cmdbound"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/diskmode"
@@ -371,8 +372,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		defer hostLease.release(ctx)
 	}
 
+	// A NIC MTU from the source is kept only under the nic_mtu grant; before
+	// the feature is open it is dropped with a warning, never refusing the
+	// import.
+	mtuG := s.importNICMTUGrant(ctx, fv)
+
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
+	s.withNICMTU(&cfg)
 	spec := fv.ToVMSpec(project)
 
 	// An import DEFINES a brand-new domain, so it takes the node's cpu_mode
@@ -406,7 +413,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	domXML, err := lv.GenerateDomainXML(cfg)
 	if err != nil {
 		cleanupDisks()
-		return status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return renderStatus("generate domain XML", err)
 	}
 
 	// Conditional orphan guard: never undefine a RUNNING same-name domain that
@@ -498,15 +505,17 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if first.Start {
 		insertState = "creating"
 	}
-	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
-		Name:      name,
-		HostName:  s.hostName,
-		Spec:      string(specJSON),
-		State:     insertState,
-		CPUActual: fv.CPUs,
-		MemActual: fv.MemoryMiB,
-		Project:   project,
-	}, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
+	var none capabilities.FeatureGrant
+	if err := corrosion.InsertVMWithReleaseFeatures(ctx, s.db, none, none, none, mtuG,
+		corrosion.VMSpecFeatures{MTU: specSetsNICMTU(spec)}, corrosion.VMRecord{
+			Name:      name,
+			HostName:  s.hostName,
+			Spec:      string(specJSON),
+			State:     insertState,
+			CPUActual: fv.CPUs,
+			MemActual: fv.MemoryMiB,
+			Project:   project,
+		}, ifaceRecords, diskRecords, nicRecords, pciIntents, false); err != nil {
 		_ = s.virt.UndefineDomain(name, false)
 		if fwImport {
 			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)

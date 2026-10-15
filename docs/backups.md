@@ -174,7 +174,9 @@ ignores the field and backs up unlimited. A container replication run pushes
 into a backup repo on its target host, so the owner's `backup_bwlimits` entry
 for that repo (the schedule's `--target-pool`) paces it too, sharing the
 repo's limit with backups into it: the archive it reads and the chunks it
-sends. Restores and VM disk replication are not rate-limited.
+sends. A replication schedule has a limit of its own (`--bwlimit`, see
+[Replication bandwidth limit](#replication-bandwidth-limit)). Restores are not
+rate-limited.
 
 A target limit is enforced per host: two hosts backing up into the same repo
 each get the full limit.
@@ -684,6 +686,35 @@ reads only the dirty extents since the last run (via a libvirt backup
 session/dirty-bitmap) and applies them into a sparse **raw** replica forked from
 the previous one on the target — only changed extents cross the wire. Falls back
 to a full copy for a stopped VM / old libvirt / broken chain.
+
+### Replication bandwidth limit
+
+```bash
+lv replication schedule add web-1 --cron "*/15 * * * *" \
+    --target-pool dr --target-host hostB --bwlimit 50MiB
+lv replication schedule ls        # RATE column; "-" is unlimited
+```
+
+- `--bwlimit` takes the same values as `lv backup snapshot --bwlimit` (`50MiB`,
+  `512K`, a byte count per second) and is at least 64 KiB/s.
+- The limit is per schedule and per source host, shared: every run of the
+  schedule on one host (a pool, project or cluster schedule's VMs, two runs at
+  once) moves at the limit in total.
+- It paces every byte a run sends to its target: the full copy, the
+  incremental extents, and the top-level copy written for hosts on an older
+  build.
+- A container schedule's sends are also paced by the owner's `backup_bwlimits`
+  entry for its repo; the lower limit wins.
+- Re-adding a schedule without `--bwlimit` keeps its stored limit; `--bwlimit 0`
+  removes it. Removing the schedule removes its limit. A changed limit takes
+  effect from the next run; a run already going keeps the limit it started
+  with.
+- A replication into a pool on the source host itself, or into a shared pool
+  it writes directly, is not paced.
+- A low limit makes each run take longer, so the newest replica is older when
+  a failover promotes it.
+- The limit is the `replication_rate` release feature: it is refused until
+  every host runs this release (`lv cluster upgrade-status`).
 
 ### Promotion (disaster recovery)
 

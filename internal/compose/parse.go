@@ -583,6 +583,15 @@ func (v *validator) validate(f *File) {
 				if err := ValidateQueues(n.Model, nicQueues(n.Queues, vm.CPU)); err != nil {
 					v.ps.add(fmt.Sprintf("%s.network[%d].queues", p, i), err.Error(), "")
 				}
+				if err := ValidateNICMTU(n.Model, n.MTU.N); err != nil {
+					v.ps.add(fmt.Sprintf("%s.network[%d].mtu", p, i), err.Error(), "")
+				}
+			}
+		} else {
+			for i, n := range vm.Network {
+				if !n.MTU.IsZero() {
+					v.ps.add(fmt.Sprintf("%s.network[%d].mtu", p, i), "mtu applies to VMs only (kind: vm)", "")
+				}
 			}
 		}
 		// Noisy-neighbour limits. The daemon re-checks against the VM's final vCPU

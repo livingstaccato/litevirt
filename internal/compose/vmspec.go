@@ -143,6 +143,7 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 			Ipv6Gateway:    n.IPv6Gateway,
 			SecurityGroups: n.SecurityGroups,
 			Queues:         nicQueues(n.Queues, vm.CPU),
+			Mtu:            n.MTU.N,
 			RateMbSec:      n.Rate,
 
 			SpoofGuard:               n.SpoofGuard,

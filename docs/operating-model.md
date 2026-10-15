@@ -798,8 +798,8 @@ Automatic recovery was built, reviewed and withdrawn, and the reason is worth
 knowing before anyone proposes it again. Acting unattended requires proving the
 host was POWERED OFF, and nothing available to a coordinator proves that.
 A host's recorded state records only that somebody decided it — `lv host fence-confirm`
-writes `fenced` on any host with no precondition, so a mistyped hostname marks a
-live one. Health quorum proves unreachability, which is equally true of a
+refuses a host it can see answering, but writes `fenced` on a partitioned host
+still running its VMs. Health quorum proves unreachability, which is equally true of a
 partitioned host still running its VMs. Evacuating on either gives you two hosts
 writing one shared disk, which is worse than the stranding it fixes. Doing it
 safely needs a fence proof bound to the current outage, and the schema does not

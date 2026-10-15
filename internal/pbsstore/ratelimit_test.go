@@ -130,6 +130,49 @@ func TestCombineLimiters_AppliesEach(t *testing.T) {
 	}
 }
 
+// Combined limiters pace at the LOWER rate, not in series: two 64 KiB/s
+// throttles move 128 KiB in about 2 s (series would take 4 s, half the lower
+// rate), and a cancelled wait refunds every member's reservation.
+//
+// Mutation: wait on the members one after another — about 4 s.
+func TestCombineLimiters_PaceIsTheLowerRate(t *testing.T) {
+	a, b := NewThrottle(MinRate), NewThrottle(MinRate)
+	l := CombineLimiters(a, b)
+	start := time.Now()
+	for range 2 {
+		if err := l.WaitN(context.Background(), 64<<10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d < 1800*time.Millisecond || d > 3*time.Second {
+		t.Fatalf("two 64KiB/s limits moved 128KiB in %v, want about 2s", d)
+	}
+	fast := NewThrottle(1 << 30)
+	start = time.Now()
+	if err := CombineLimiters(NewThrottle(MinRate), fast).WaitN(context.Background(), 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d < 900*time.Millisecond || d > 1500*time.Millisecond {
+		t.Fatalf("64KiB/s with 1GiB/s moved 64KiB in %v, want about 1s", d)
+	}
+
+	// A member's error ends the wait and is returned; the others give back
+	// their slot, so the next wait is not held up by it.
+	c, d := NewThrottle(MinRate), NewThrottle(MinRate)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := CombineLimiters(c, d).WaitN(ctx, 640<<10); err == nil {
+		t.Fatal("a 10 s wait under a 100 ms deadline returned nil")
+	}
+	start = time.Now()
+	if err := CombineLimiters(c, d).WaitN(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 500*time.Millisecond {
+		t.Fatalf("after a cancelled wait the next one waited %v: a reservation was not refunded", el)
+	}
+}
+
 func TestParseRate(t *testing.T) {
 	for in, want := range map[string]int64{
 		"":          0,

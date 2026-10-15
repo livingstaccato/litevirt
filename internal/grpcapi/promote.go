@@ -1026,6 +1026,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// copy's row is written through the one writer that checks every grant
 	// its spec needs.
 	relR := s.restrictPromotedReleaseFeatures(&spec, renamed)
+	mtuR := s.restrictRestoredNICMTU(ctx, &spec)
+	if mtuR.stripped || len(mtuR.invalid) > 0 {
+		slog.Warn("promote: NIC MTUs are not applied to the defined domain",
+			"vm", targetName, "stripped", mtuR.stripped, "invalid", mtuR.invalid)
+	}
 
 	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
 	// and no claim, while the original still holds its addresses — a guaranteed
@@ -1560,7 +1565,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// attempt defines and starts the domain on disks; stage names the
 		// step that failed.
 		attempt := func(disks []lv.DiskConfig) (string, error) {
-			domXML, err := lv.GenerateDomainXML(lv.VMConfig{
+			cfg := lv.VMConfig{
 				Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
 				MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 				GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
@@ -1568,7 +1573,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				// Memory hot-add carried, as every definer does (domainconfig.go).
 				HotplugBaseMiB: int(spec.MemoryHotplugBaseMib), HotplugMaxMiB: int(spec.MemoryHotplugMaxMib),
 				CPULimit: spec.CpuLimit, CPUShares: int(spec.CpuShares),
-			})
+			}
+			s.withNICMTU(&cfg)
+			domXML, err := lv.GenerateDomainXML(cfg)
 			if err != nil {
 				return "generate domain XML", err
 			}
@@ -1640,7 +1647,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			defer s.pendingNICs(targetName, spec.Uuid, ifaceRecords, nil)()
 		}
 		stage, err := attempt(diskCfg)
-		if err != nil && len(diskCfg) > 1 && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
+		// A NIC MTU this host cannot carry is not the other disks' doing.
+		if err != nil && len(diskCfg) > 1 && !lv.IsNICMTUError(err) && (stage == "generate domain XML" || stage == "define domain" || stage == "start domain") {
 			// The other disks may be why: the root alone is what main
 			// promoted, so that is tried before giving up — never a fall back
 			// to a reschedule where main's promotion would have succeeded.
@@ -1680,6 +1688,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				return status.Errorf(codes.Internal, "record promote marker: %v", err)
 			case "operator claim", "shared disk released":
 				return err
+			case "generate domain XML":
+				return renderStatus(stage, err)
 			default:
 				return status.Errorf(codes.Internal, "%s: %v", stage, err)
 			}
@@ -1731,7 +1741,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// PCI passthrough to carry (a disk replica has no hostdev record, so
 		// pciIntents is always nil here), and hardware_adoption_state stays at
 		// its schema default 'pending' for the Phase-6 backfill audit to confirm.
-		gs := vmSpecGrants{tuning: ioG, passthrough: relR.passthrough, limits: relR.limits}
+		gs := vmSpecGrants{tuning: ioG, passthrough: relR.passthrough, limits: relR.limits, mtu: mtuR.grant}
 		if err := s.insertVMWithGrants(ctx, &spec, gs, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}

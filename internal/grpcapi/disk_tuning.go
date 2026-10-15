@@ -38,7 +38,7 @@ func validateSpecTuning(spec *pb.VMSpec) error {
 			return fmt.Errorf("network %d: %w", i, err)
 		}
 	}
-	return nil
+	return validateSpecNICMTU(spec)
 }
 
 // ioFeatureGate is the entry-node check of the disk/NIC tuning feature
@@ -550,9 +550,10 @@ func dropInvalidTuning(spec *pb.VMSpec) []string {
 }
 
 // requestsHardwareTuning reports whether an UpdateVM request redefines the
-// domain for disk/NIC tuning: its payload, or the explicit regenerate flag.
+// domain for disk/NIC tuning or a NIC MTU: its payload, or the explicit
+// regenerate flag.
 func requestsHardwareTuning(req *pb.UpdateVMRequest) bool {
-	return req.GetRedefineHardware() || len(req.GetDiskTuning()) > 0 || len(req.GetNicQueues()) > 0
+	return req.GetRedefineHardware() || len(req.GetDiskTuning()) > 0 || len(req.GetNicQueues()) > 0 || len(req.GetNicMtu()) > 0
 }
 
 // requestsTuningWrite reports whether an UpdateVM adds tuning to the stored

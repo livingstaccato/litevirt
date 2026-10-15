@@ -118,16 +118,33 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// multiLimiter waits on each of its limiters in turn, so the slowest wins.
+// multiLimiter charges n to every one of its limiters at once and returns when
+// the last of them has, so the combined pace is the lowest rate among them.
+// Waiting on them one after another would pace at the harmonic sum: two
+// 64 KiB/s limits would move 32 KiB/s. The first error ends the other waits
+// (each gives back the part of its reservation it did not use) and is
+// returned.
 type multiLimiter []RateLimiter
 
 func (m multiLimiter) WaitN(ctx context.Context, n int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg    sync.WaitGroup
+		once  sync.Once
+		first error
+	)
 	for _, l := range m {
-		if err := l.WaitN(ctx, n); err != nil {
-			return err
-		}
+		wg.Add(1)
+		go func(l RateLimiter) {
+			defer wg.Done()
+			if err := l.WaitN(ctx, n); err != nil {
+				once.Do(func() { first = err; cancel() })
+			}
+		}(l)
 	}
-	return nil
+	wg.Wait()
+	return first
 }
 
 // CombineLimiters returns a RateLimiter that honours every non-nil limiter

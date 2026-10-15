@@ -246,9 +246,10 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 			}
 		}
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, spec.Name, spec.SecureBoot, spec.Tpm)
+		s.withNICMTU(&vmCfg)
 		generated, gerr := lv.GenerateDomainXML(vmCfg)
 		if gerr != nil {
-			return status.Errorf(codes.Internal, "generate domain XML for %q: %v", vm.Name, gerr)
+			return renderStatus("generate domain XML for "+vm.Name, gerr)
 		}
 		newXML = generated
 	}

@@ -1726,7 +1726,10 @@ holder writes.
   partition-pause: paused workload       kind=vm name=<vm> reason="lost the voter majority for 10s (…)"
   partition-pause: resumed workload      kind=vm name=<vm> reason="majority regained; …"
   partition-pause: workload stays paused kind=vm name=<vm> reason="voter node-4 has node-1 HOST_OFFLINE"
+  partition-pause: dropped a pause record that no longer describes a paused workload kind=ct name=<ct> reason="the container no longer exists on this host and has no live row here"
   ```
+  A record whose VM domain is undefined, or whose container has no live row on
+  this host and no longer exists in LXC, is dropped with the last line.
   A host the majority fenced while it was paused stays paused until
   `lv host undrain` (or until failover returns it to active, when its fence
   moved nothing). A workload that a certified claim moved is stopped by the

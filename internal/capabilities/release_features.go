@@ -120,8 +120,8 @@ var releaseFeatures = map[Feature]FeatureInfo{
 			"internal/corrosion.AdvanceLUNResolved", "internal/corrosion.RecordLUNPlainDelete"}},
 	FeatureHADisarm: {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery",
 		Writers: []string{"internal/corrosion.SetHAPolicy"}},
-	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU"},
-	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits"},
+	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
+	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits", Writers: []string{"internal/corrosion.SetReplicationRate"}},
 }
 
 // containerReplicationWriters write container_replication's data: a container's

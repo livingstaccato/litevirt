@@ -147,6 +147,7 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 		// the redefine, so a deploy entering on another node cannot lose them to
 		// a spec it overwrote, and a failed redefine leaves the spec untouched.
 		req.DiskTuning, req.NicQueues = tuningUpdates(desired, stored)
+		req.NicMtu = nicMTUUpdates(desired, stored)
 	}
 	// The limits travel in the same update as the new size: a file that lowers
 	// the cpu count and the cap together must not have the old cap judged

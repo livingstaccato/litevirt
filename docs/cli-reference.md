@@ -143,7 +143,8 @@ lv host rotate-gossip-key                 # Replace the gossip key everywhere, l
   [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
   [--ssh-user root]
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
-lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence (or removed) host
+lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence (or removed) host;
+                                          #   refused while the host still answers health probes
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
 lv host superseded-disks <host>           # List the disk copies a failover set aside
@@ -278,6 +279,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
 lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (live; 0 clears the cap / restores the weight)
 lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
+lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered from 0; must equal the
+                                             # bridge's MTU (VM STOPPED or --restart-if-needed; 0 removes it)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]
@@ -1117,7 +1120,8 @@ lv replication schedule add <vm> --target-pool <pool> --cron "0 */4 * * *"
   [--disabled]             # create the schedule disabled
   [--scope vm|pool|cluster|project|container] [--pool-name <p>] [--project-name <p>]
   [--container]            # a container: --target-host is the peer, --target-pool the backup repo on it
-lv replication schedule ls
+  [--bwlimit <rate>]       # per-schedule bandwidth limit, shared by its runs on a host (e.g. 50MiB); 0 removes it, absent keeps it
+lv replication schedule ls # RATE column: the limit, "-" for none
 lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--container] [--pool-name <p>] [--project-name <p>]
 
 # A container's replicas on its replica host; restore one, or remove set-aside/orphaned ones (admin).
@@ -1248,6 +1252,9 @@ lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
 lv detach-pci <vm> <pci-address>
 ```
+
+`lv attach-nic` sets no MTU. Give an attached NIC one with
+`lv update <vm> --nic-mtu <nic>=<MTU|bridge>` ([networking](networking.md#per-nic-mtu)).
 
 `lv detach-disk` removes the disk from the VM but **keeps its file**, on the
 host the VM was running on when it was detached. A migration does not move a

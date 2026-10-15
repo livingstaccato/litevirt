@@ -229,6 +229,9 @@ it. A container someone else froze is told apart with `lxc-info`'s raw state
 domain's UUID. When the majority is back, a VM record whose domain is gone, is
 no longer paused, or is another domain of the name is dropped: it would
 otherwise hold `partition_paused` open forever and offer Layer 3 a stale epoch.
+A container record is dropped once the container has no live row on this host
+and no longer exists here: `lxc-ls` does not list it and its directory is
+gone. A container still present keeps its record and stays frozen.
 A memory snapshot, which resumes the guest when it finishes, is refused for a VM
 a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 

@@ -764,6 +764,13 @@ records a `manual-confirmed` row in `fencing_log`. This gate prevents
 the coordinator from rescheduling a manually-fenced host's VMs before
 an operator has actually confirmed the fence.
 
+**A host that is still answering is refused.** The confirmation fails with
+`FailedPrecondition` ("Power it off first") while another host's latest
+health verdict about it, healthy or unready, is under 30 seconds old, or while
+the node serving the request reaches it now, or when it names that node
+itself. Power the host off and run it again once it no longer answers. There is
+no override.
+
 **A removed host can be confirmed too.** Removing a host does not power it
 off: `lv host rm --force` asks for no fence, and a host whose daemon died may
 still be running its qemu. So a replica promotion treats a removed owner of a

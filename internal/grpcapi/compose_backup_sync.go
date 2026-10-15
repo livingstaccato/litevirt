@@ -29,7 +29,7 @@ func (s *Server) syncComposeBackupSchedule(ctx context.Context, vmName string, v
 		existing, _ := corrosion.ListBackupSchedules(ctx, s.db)
 		for _, e := range existing {
 			if e.VMName == vmName {
-				_ = corrosion.DeleteBackupSchedule(ctx, s.db, e.VMName, e.Repo)
+				_ = s.deleteScheduleRow(ctx, e.VMName, e.Repo)
 			}
 		}
 		return nil

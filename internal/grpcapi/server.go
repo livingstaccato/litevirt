@@ -530,6 +530,9 @@ type Server struct {
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
+	// hostAddr is this host's cluster address (SetHostAddress), used as its
+	// VXLAN tunnel endpoint. '' means netutil.HostAddress("").
+	hostAddr string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
 

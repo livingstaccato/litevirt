@@ -137,7 +137,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	}
 
 	prov := s.networkProvisioner()
-	localIP := getLocalIP()
+	localIP := s.VTEPAddress()
 	changed := false
 
 	// Tear down first, so a device a tombstone shares with nothing live is

@@ -1256,6 +1256,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetDiskStrandedObserver(svc.NotifyVMDiskStranded)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
 	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
+	d.wireHostAddress(svc, reconciler)                       // the VTEP address for both
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.
@@ -2718,18 +2719,27 @@ func fileBasedPoolDriver(driver string) bool {
 // host certificate does not cover. Falling back to getOutboundIP only reports
 // the source IP toward the default route, which is the wrong answer on a
 // multi-homed host whose cluster network is not the default one.
+//
+// It is also this host's VXLAN tunnel endpoint (wireHostAddress): one rule,
+// netutil.HostAddress, for all three.
 func (d *Daemon) hostAddress() string {
-	if d.cfg.AdvertiseAddress != "" {
-		return d.cfg.AdvertiseAddress
-	}
-	return getOutboundIP()
+	return netutil.HostAddress(d.cfg.AdvertiseAddress)
 }
 
 func getOutboundIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
+	return netutil.HostAddress("")
+}
+
+// wireHostAddress hands this host's address to the gRPC server and the
+// reconciler, which use it as the VXLAN tunnel endpoint and register it in
+// network_vteps. Left to find their own, each picked the default-route source
+// address, which on a multi-homed host is not the cluster address: on a NAT'd
+// lab it was the same 10.0.2.15 on every node, so each host's flood entry
+// pointed at itself and no guest on a vxlan network got a DHCP lease.
+func (d *Daemon) wireHostAddress(svc *grpcapi.Server, rec *health.Reconciler) {
+	addr := d.hostAddress()
+	svc.SetHostAddress(addr)
+	rec.SetHostAddress(addr)
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.

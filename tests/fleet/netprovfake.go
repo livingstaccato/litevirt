@@ -34,7 +34,8 @@ type NetProvFake struct {
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
-	failWith      map[string]error // network → the error its Provision returns (FailProvision)
+	failWith      map[string]error  // network → the error its Provision returns (FailProvision)
+	vteps         map[string]string // network → the VTEP address its last Provision was handed
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -69,13 +70,25 @@ func (f *NetProvFake) SetDHCPConflicts(on bool) {
 	f.dhcpConflicts = on
 }
 
-func (f *NetProvFake) Provision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _, _ string) (string, error) {
+// Provision records the network as set up here. A vxlan network also
+// registers this node's VTEP in network_vteps, as the real Provision does, so
+// the rows replicate and a scenario can see which address each node chose.
+func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.failWith[name]; err != nil {
 		return "", err
 	}
+	if def.Type == "vxlan" && def.VNI != 0 && db != nil {
+		if err := network.UpsertVTEP(ctx, db, name, hostName, localIP, def.VNI); err != nil {
+			return "", fmt.Errorf("upsert vtep: %w", err)
+		}
+	}
+	if f.vteps == nil {
+		f.vteps = map[string]string{}
+	}
+	f.vteps[name] = localIP
 	if f.dhcpConflicts && def.Subnet != "" {
 		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
 			for other, sub := range f.subnets {
@@ -200,4 +213,11 @@ func (f *NetProvFake) FlatBridges() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// VTEP is the VTEP address network's last Provision on this node was handed.
+func (f *NetProvFake) VTEP(network string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vteps[network]
 }

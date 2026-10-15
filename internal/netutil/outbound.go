@@ -34,3 +34,18 @@ func OutboundIP() string {
 	}
 	return addr.IP.String()
 }
+
+// HostAddress is the address this host is known by in the cluster: the
+// configured advertise address when there is one, else the default-route
+// source address (OutboundIP), else "127.0.0.1". It is the one rule behind the
+// host record, gossip and the VXLAN tunnel endpoint, so every peer reaches a
+// host at the same address whichever of the three it uses.
+func HostAddress(advertise string) string {
+	if advertise != "" {
+		return advertise
+	}
+	if ip := OutboundIP(); ip != "" {
+		return ip
+	}
+	return "127.0.0.1"
+}

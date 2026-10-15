@@ -2,6 +2,7 @@ package network
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -41,11 +42,31 @@ func EnsureVXLAN(vni int, underlay, localIP string) (string, error) {
 	bridge := vxlanBridgeName(vni)
 
 	// 1. Create VXLAN interface
-	out, err := execCommand("ip", "link", "add", vxlan, "type", "vxlan",
-		"id", fmt.Sprintf("%d", vni), "dstport", "4789",
-		"local", localIP, "dev", underlay, "nolearning")
+	add := func() ([]byte, error) {
+		return execCommand("ip", "link", "add", vxlan, "type", "vxlan",
+			"id", fmt.Sprintf("%d", vni), "dstport", "4789",
+			"local", localIP, "dev", underlay, "nolearning")
+	}
+	out, err := add()
 	if err != nil && !isFileExists(out) {
 		return "", fmt.Errorf("ip link add %s: %w: %s", vxlan, err, out)
+	}
+	if err != nil {
+		// It exists. A device made with another local address or underlay —
+		// by a build that took both from the default route — is recreated, or
+		// the host keeps tunnelling from the wrong address after an upgrade.
+		// Only the vxlan port goes: the bridge and the guests' taps on it stay,
+		// and steps 3-4 put the new port back on the bridge.
+		if gotLocal, gotDev, ok := vxlanEndpoint(vxlan); ok && (gotLocal != localIP || gotDev != underlay) {
+			slog.Warn("vxlan: recreating a tunnel device whose local address or underlay is not this host's",
+				"device", vxlan, "local", gotLocal, "dev", gotDev, "want_local", localIP, "want_dev", underlay)
+			if out, err := execCommand("ip", "link", "del", vxlan); err != nil && !isNoSuchDevice(out) {
+				return "", fmt.Errorf("ip link del %s: %w: %s", vxlan, err, out)
+			}
+			if out, err := add(); err != nil {
+				return "", fmt.Errorf("ip link add %s: %w: %s", vxlan, err, out)
+			}
+		}
 	}
 
 	// 2. Create bridge
@@ -100,4 +121,36 @@ func DeprovisionVXLAN(vni int) error {
 	}
 
 	return nil
+}
+
+// vxlanEndpoint reads an existing vxlan device's local address and underlay
+// device from `ip -d -o link show`, which prints them as
+// "vxlan id <VNI> local <addr> dev <underlay> ...". ok is false when the
+// device cannot be read, so the caller leaves it alone.
+func vxlanEndpoint(dev string) (local, underlay string, ok bool) {
+	out, err := execCommand("ip", "-d", "-o", "link", "show", dev)
+	if err != nil {
+		return "", "", false
+	}
+	f := strings.Fields(string(out))
+	for i := range f {
+		if f[i] != "vxlan" || i+1 >= len(f) || f[i+1] != "id" {
+			continue
+		}
+		// The endpoint fields come before the port ones; stop there, so a
+		// later section's tokens cannot be read as them.
+	scan:
+		for j := i + 2; j+1 < len(f); j++ {
+			switch f[j] {
+			case "local":
+				local = f[j+1]
+			case "dev":
+				underlay = f[j+1]
+			case "srcport", "dstport":
+				break scan
+			}
+		}
+		return local, underlay, true
+	}
+	return "", "", false
 }

@@ -432,7 +432,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	}
 	s.auditCarriedVLANs(ctx, name, carried)
 
-	localIP := getLocalIP()
+	localIP := s.VTEPAddress()
 	if _, err := s.networkProvisioner().Provision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
 		return nil, s.explainProvisionFailure(ctx, name, def, err)
 	}
@@ -581,7 +581,7 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 		s.auditCarriedVLANs(ctx, req.Name, carried)
 	}
 
-	localIP := getLocalIP()
+	localIP := s.VTEPAddress()
 	if _, err := s.networkProvisioner().Provision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
 	}
@@ -599,13 +599,17 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	return &emptypb.Empty{}, nil
 }
 
-// SyncVTEP adds a flood entry for a remote VTEP on this host.
+// SyncVTEP adds a flood entry for a remote VTEP on this host, and prunes the
+// network's flood list as network.SyncFloodEntries does — so a peer whose VTEP
+// moved does not leave its old address behind here. An address of this
+// host's own is never installed.
 func (s *Server) SyncVTEP(ctx context.Context, req *pb.SyncVTEPRequest) (*emptypb.Empty, error) {
 	// Peer-only: VTEP flood sync is a host-to-host fan-out over peer mTLS.
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	if err := network.FloodEntry(int(req.Vni), req.VtepIp); err != nil {
+	if err := network.SyncPeerVTEP(ctx, s.db, req.NetworkName, s.hostName, int(req.Vni),
+		callerMTLSCommonName(ctx), req.VtepIp); err != nil {
 		return nil, status.Errorf(codes.Internal, "add flood entry: %v", err)
 	}
 	return &emptypb.Empty{}, nil
@@ -718,7 +722,7 @@ func (s *Server) notifyVTEPPeersForNetwork(ctx context.Context, networkName stri
 	if err := json.Unmarshal([]byte(nr.Config), &def); err != nil || def.VNI == 0 {
 		return
 	}
-	localIP := getLocalIP()
+	localIP := s.VTEPAddress()
 	s.notifyVTEPPeers(ctx, networkName, def.VNI, localIP)
 }
 

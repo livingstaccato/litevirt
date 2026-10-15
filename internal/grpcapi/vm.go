@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -4171,14 +4170,6 @@ func splitCIDR(cidr string) [2]string {
 		}
 	}
 	return [2]string{cidr, ""}
-}
-
-// getLocalIP returns the outbound IP of this host.
-func getLocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
 }
 
 // SetVMIP updates the IP address of a VM interface in the state store.

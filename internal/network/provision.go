@@ -242,7 +242,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		}
 		underlay := def.Underlay
 		if underlay == "" {
-			underlay = defaultRouteInterface()
+			underlay = underlayFor(localIP)
 		}
 		if underlay == "" {
 			return "", fmt.Errorf("vxlan network requires underlay interface (could not auto-detect; set 'underlay' explicitly)")
@@ -712,30 +712,96 @@ func isGatewayHost(ctx context.Context, db *corrosion.Client, networkName, hostN
 	return vteps[0].HostName == hostName
 }
 
-// SyncFloodEntries reads all VTEPs for vni from DB and calls FloodEntry for each peer != hostName.
+// SyncFloodEntries brings vxlan<VNI>'s flood list to the network's VTEPs: a
+// flood entry for every peer VTEP of networkName, none for this host. Then it prunes:
+//   - a flood entry for any address that is neither one of those VTEPs nor a
+//     live host's registered address — a peer's VTEP from before it moved, or a
+//     host that has gone;
+//   - every entry, flood or unicast, whose destination is this host's own
+//     address. Such an entry loops the overlay back into itself (refuseLocalDst).
+//     Builds that took the VTEP from the default route wrote one wherever that
+//     address was the same on every host, as on a NAT'd lab.
+//
+// A live host's registered address is kept, though no VTEP row names it yet:
+// a peer that has just provisioned sends its VTEP before its row replicates
+// here, and pruning it would cut this host off from it until the next sync.
+//
+// A peer row naming an address of this host's own is skipped, not an error:
+// during an upgrade a peer on an earlier build still registers its
+// default-route address, and refusing to provision over it would take the
+// network down on every upgraded host.
 func SyncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int) error {
+	return syncFloodEntries(ctx, db, networkName, hostName, vni, "", "")
+}
+
+// SyncPeerVTEP is SyncFloodEntries for a peer that has just sent its VTEP
+// (SyncVTEP): peerAddr stands in for whatever peer's network_vteps row says
+// here, because that row may not have replicated yet — and if it still holds
+// the peer's previous address, re-adding that is exactly the stale entry the
+// prune removes.
+func SyncPeerVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error {
+	return syncFloodEntries(ctx, db, networkName, hostName, vni, peer, peerAddr)
+}
+
+func syncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error {
 	vteps, err := GetVTEPs(ctx, db, networkName)
 	if err != nil {
 		return fmt.Errorf("get vteps: %w", err)
 	}
 
+	want := map[string]bool{}
 	for _, v := range vteps {
-		if v.HostName == hostName {
+		if v.HostName == hostName || v.VTEPAddr == "" || (peerAddr != "" && v.HostName == peer) {
 			continue
 		}
-		if err := FloodEntry(vni, v.VTEPAddr); err != nil {
-			return fmt.Errorf("flood entry %s: %w", v.VTEPAddr, err)
+		want[v.VTEPAddr] = true
+	}
+	if peerAddr != "" {
+		want[peerAddr] = true
+	}
+	addrs := make([]string, 0, len(want))
+	for a := range want {
+		addrs = append(addrs, a)
+	}
+	sort.Strings(addrs)
+	for _, a := range addrs {
+		if err := FloodEntry(vni, a); err != nil {
+			return fmt.Errorf("flood entry %s: %w", a, err)
+		}
+	}
+
+	keep := want
+	if hosts, err := corrosion.ListHosts(ctx, db); err == nil {
+		for _, h := range hosts {
+			if h.Name != hostName && h.Address != "" {
+				keep[h.Address] = true
+			}
+		}
+	} else {
+		slog.Warn("vxlan: list hosts for flood-entry pruning; keeping every entry not proven stale", "error", err)
+		return nil
+	}
+	entries, err := vxlanFDB(vni)
+	if err != nil {
+		slog.Warn("vxlan: read forwarding entries for pruning", "vni", vni, "error", err)
+		return nil
+	}
+	for _, e := range entries {
+		switch {
+		case isLocalAddress(e.Dst):
+			slog.Warn("vxlan: removing a forwarding entry that points at this host's own address",
+				"vni", vni, "mac", e.MAC, "dst", e.Dst)
+			if e.MAC == floodMAC {
+				_ = DeleteFloodEntry(vni, e.Dst)
+			} else {
+				_ = DeleteFDBEntry(vni, e.MAC, e.Dst)
+			}
+		case e.MAC == floodMAC && !keep[e.Dst]:
+			slog.Info("vxlan: removing a stale flood entry", "vni", vni, "dst", e.Dst)
+			_ = DeleteFloodEntry(vni, e.Dst)
 		}
 	}
 	return nil
-}
-
-// LocalIP returns the outbound IP of this host by dialing a UDP socket.
-func LocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
 }
 
 // ProvisionFunc provisions one network on this host and returns the device a
@@ -745,14 +811,16 @@ type ProvisionFunc func(ctx context.Context, db *corrosion.Client, networkName s
 // ProvisionForVM looks up a network definition from corrosion and calls Provision
 // to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB) exists on this host.
 // Returns the bridge name, or "" if no provisioning is needed (flat bridge mode).
-// Shared by grpcapi.CreateVM and health.Reconciler.
+// It knows no advertise address, so its VTEP is netutil.HostAddress(""); the
+// daemon's paths use ProvisionForVMWith with the host's address.
 func ProvisionForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return ProvisionForVMWith(ctx, db, networkName, hostName, SafeProvision)
+	return ProvisionForVMWith(ctx, db, networkName, hostName, netutil.HostAddress(""), SafeProvision)
 }
 
-// ProvisionForVMWith is ProvisionForVM with the provisioning step supplied, so
-// a caller holding a provisioner seam uses the same record lookup.
-func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, hostName string, provision ProvisionFunc) (string, error) {
+// ProvisionForVMWith is ProvisionForVM with this host's address (its VTEP,
+// netutil.HostAddress of its advertise address) and the provisioning step
+// supplied, so a caller holding a provisioner seam uses the same record lookup.
+func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, hostName, localIP string, provision ProvisionFunc) (string, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
 		networkName)
@@ -772,7 +840,6 @@ func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, 
 		def.Interface = networkName
 	}
 
-	localIP := LocalIP()
 	bridge, err := provision(ctx, db, networkName, def, localIP, hostName)
 	if err != nil {
 		return "", err

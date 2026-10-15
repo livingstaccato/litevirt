@@ -5,6 +5,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/network"
 )
 
@@ -75,5 +76,21 @@ func (s *Server) ProvisionNetworkHere(ctx context.Context, db *corrosion.Client,
 // provisionForVM provisions networkName on this host for a NIC and returns its
 // device, or "" when the network has no record (flat bridge mode).
 func (s *Server) provisionForVM(ctx context.Context, networkName string) (string, error) {
-	return network.ProvisionForVMWith(ctx, s.db, networkName, s.hostName, s.networkProvisioner().Provision)
+	return network.ProvisionForVMWith(ctx, s.db, networkName, s.hostName, s.VTEPAddress(), s.networkProvisioner().Provision)
+}
+
+// SetHostAddress sets this host's cluster address: advertise_address when one
+// is configured (the daemon passes its hostAddress). Every VXLAN network on
+// this host uses it as the tunnel's local address, registers it in
+// network_vteps and sends it to the peers' flood lists.
+func (s *Server) SetHostAddress(addr string) { s.hostAddr = addr }
+
+// VTEPAddress is this host's VXLAN tunnel endpoint: the address set by
+// SetHostAddress, or, unwired, netutil.HostAddress("") — the same rule the
+// daemon's host record uses, never a second one.
+func (s *Server) VTEPAddress() string {
+	if s.hostAddr != "" {
+		return s.hostAddr
+	}
+	return netutil.HostAddress("")
 }

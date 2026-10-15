@@ -43,6 +43,7 @@ func TestFleet_FailoverStartProvisionsTheVMsNetworkOnTheNewHost(t *testing.T) {
 
 	rec := health.NewReconciler(survivor.Name, t.TempDir(), survivor.DB, survivor.Virt)
 	rec.SetNetworkProvision(survivor.Net.Provision)
+	rec.SetHostAddress("10.77.0.12") // the survivor's advertise address
 	rec.ReconcileOnce(ctx)
 
 	want := network.IsolatedBridgeName("hc")
@@ -51,5 +52,10 @@ func TestFleet_FailoverStartProvisionsTheVMsNetworkOnTheNewHost(t *testing.T) {
 	}
 	if got := domainBridges(survivor.Virt.DefinedXML("db")); len(got) != 1 || got[0] != want {
 		t.Errorf("db's domain on %s attaches to %v, want [%s]", survivor.Name, got, want)
+	}
+	// A failover start provisions with the survivor's host address as its
+	// VTEP, as a VM create there would — not the default-route source address.
+	if got := survivor.Net.VTEP("hc"); got != "10.77.0.12" {
+		t.Errorf("%s: the failover start provisioned hc with VTEP %q, want the host address 10.77.0.12", survivor.Name, got)
 	}
 }

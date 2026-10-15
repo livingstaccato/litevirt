@@ -187,7 +187,7 @@ func TestTendStrandedDisks_LeavesTheDiskOfADomainStillRunningHere(t *testing.T) 
 //
 // Mutation: never resolve — the test is red.
 func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
-	db, _, r, dataDir, _ := strandedFixture(t)
+	db, _, r, dataDir, path := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
 	r.tendStrandedDisks(ctx)
@@ -203,14 +203,17 @@ func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
 		t.Fatalf("condition %+v, want resolved once the copy is gone", row)
 	}
 
-	// Recorded again, then the VM is deleted.
+	// Recorded again, then the VM is deleted. The disks directory lists
+	// other files, so the path that reads as missing is gone, not on a volume
+	// not mounted yet (deleted_vm_residue.go, mayBeUnmounted).
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "other-vm-root.qcow2"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	recordWeb(t, db, time.Now())
 	if row, _, _ := strandedRow(t, db, "web", "node-a"); row.Lifecycle == corrosion.ConditionResolved {
 		t.Fatal("a new stranding did not reopen the condition")
 	}
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	r.tendStrandedDisks(ctx)
 	if row, _, ok := strandedRow(t, db, "web", "node-a"); !ok || row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("condition %+v, want resolved once the VM is gone", row)

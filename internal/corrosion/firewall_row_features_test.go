@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // firewallRowFeatures (the stored-row classifier the writers use) names every
@@ -85,17 +86,27 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			cidr, action string
 			want         error
 		}{
-			{"logged row, only the IPv6 grant", gV6, none, none, "10.0.0.0/8", "drop+log", ErrFirewallLogGateClosed},
-			{"IPv6 logged row, only the IPv6 grant", gV6, none, none, "2001:db8::/32", "drop+log", ErrFirewallLogGateClosed},
 			{"IPv6 row, only the log grant", none, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
 			{"IPv6 row, the log grant in the IPv6 slot", gLog, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
-			{"logged row, the IPv6 grant in the log slot", none, gV6, none, "10.0.0.0/8", "drop+log", ErrFirewallLogGateClosed},
-			{"tag row, the IPv6 and log grants", gV6, gLog, none, "tag:web", "accept", ErrFirewallTagGroupsGateClosed},
-			{"tag row, the log grant in the tag slot", none, none, gLog, "tag:web", "accept", ErrFirewallTagGroupsGateClosed},
 		}
 		for _, r := range refused {
 			if err := w(r.g, r.gl, r.gt, r.cidr, r.action); !errors.Is(err, r.want) {
 				t.Errorf("%s: %s: %v, want %v", name, r.what, err, r.want)
+			}
+		}
+		// A logged action and a tag-group cidr fail the field grammar on this
+		// build, whatever the grants: nothing renders them yet.
+		for _, r := range []struct {
+			what         string
+			cidr, action string
+		}{
+			{"logged row", "10.0.0.0/8", "drop+log"},
+			{"IPv6 logged row", "2001:db8::/32", "drop+log"},
+			{"tag row", "tag:web", "accept"},
+		} {
+			var fe *rulefield.FieldError
+			if err := w(gV6, gLog, gTag, r.cidr, r.action); !errors.As(err, &fe) {
+				t.Errorf("%s: %s, every grant: %v, want a field-grammar refusal", name, r.what, err)
 			}
 		}
 		for _, ok := range []struct {
@@ -104,9 +115,7 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			cidr, action string
 		}{
 			{"IPv4 row, no grant", none, none, none, "10.0.0.0/8", "accept"},
-			{"logged row, the log grant", none, gLog, none, "10.0.0.0/8", "drop+log"},
-			{"IPv6 logged row, both grants", gV6, gLog, none, "2001:db8::/32", "drop+log"},
-			{"tag row, the tag grant", none, none, gTag, "tag:web", "accept"},
+			{"IPv6 row, the IPv6 grant", gV6, none, none, "2001:db8::/32", "drop"},
 		} {
 			if err := w(ok.g, ok.gl, ok.gt, ok.cidr, ok.action); err != nil {
 				t.Errorf("%s: %s: %v", name, ok.what, err)

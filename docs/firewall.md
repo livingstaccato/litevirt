@@ -745,6 +745,61 @@ vms:
 Rules without a CIDR match `0.0.0.0/0` (any). `cidr: "@<ipset-name>"`
 references a top-level `ipsets:` entry — useful for big admin lists.
 
+## Rule fields
+
+A rule's `proto`, `port` and IPv4 `cidr`, and an ip set's name and elements,
+are written into every host's nft ruleset as text, so each is checked against
+what nft accepts in that position before it is stored — by `lv sg rule-add`,
+`lv firewall cluster-rule add`, `lv firewall host-rule add`,
+`lv firewall ipset add`, the web UI and a stack deploy alike. A refused value is
+an `InvalidArgument` error that names the field and the value; in a compose
+file, the problem names the rule's place in the file.
+
+| Field | Accepted |
+|---|---|
+| `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
+| `port` (tcp, udp) | a port 0-65535 (decimal or `0x16`), a range `8000-9000` or `ssh - http`, a service name (`ssh`) |
+| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
+| ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
+| `action` | `accept`, `drop`, `reject` |
+| `comment` | at most 128 bytes, no double quote |
+
+`proto`, `port` and an IPv4 `cidr` also take a relational operator in front
+(`!= 22`, `< 1024`, `eq 53`), a bitmask
+(`& 255.0.0.0 == 10.0.0.0`) and a braced list (`{ 80, 443 }`; a double or
+trailing comma is fine, a leading one is not). A set reference is `@name`,
+`!= @name` or `== @name` (`ne`, `eq`) only: nft refuses `< @name`, a set in
+braces or behind a mask. A rule on a set with IPv6 elements applies to both
+families, negated or not. A bare comma list (`80,443`) is
+refused: nft rejects it, so it never applied — brace it. Anything else — a
+second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
+it would add nft syntax of its own to every host's ruleset.
+
+A row written by a host on an older build is checked again when it is rendered.
+A row that applied before renders exactly as it did; one that the renderer
+would refuse no longer stops the host's whole firewall from applying, as it did
+before, and nothing is rendered that the row did not ask for:
+
+- a rule that carries such text, an IPv6 CIDR nft cannot read, or an action
+  other than accept, drop or reject is held as this host last rendered it, or
+  left out when this host never rendered a readable version of it;
+- a rule that references an ip set that does not exist (deleted, or not
+  replicated yet) as `@name` is rendered against an empty set of that name, so
+  it matches nothing;
+- a rule that references a set negated, `!= @name`, while that set is missing
+  or was rendered without some of its elements, would match every address (or
+  the addresses the set lists), so it is held like an unreadable rule: as this
+  host last rendered it while that rendering's set is present and whole,
+  otherwise left out;
+- an ip set is rendered without the elements it cannot render.
+
+The host raises the critical condition `firewall.rule.invalid`, which names
+each row, its stored action and the command that removes it
+(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...). A rule
+rendered against an empty set is named only once that has lasted a minute, so
+a rule that replicates just before its set, or a stack redeploy, raises
+nothing.
+
 ## CLI
 
 The CLI lives at `lv sg …` and `lv firewall …`:

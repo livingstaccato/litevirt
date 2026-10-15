@@ -196,7 +196,7 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 		ID: randid.New(), SGID: sg.ID, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority),
 	}
-	need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+	need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
 	if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 		return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 	}); err != nil {

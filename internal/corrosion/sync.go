@@ -946,6 +946,10 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			skipped++
 			continue
 		}
+		if c.mergePolicyApplyHeld(table.Name, table.Columns, row) {
+			skipped++
+			continue
+		}
 		// Workload create commits carry child rows whose schemas predate owner
 		// epochs. Fence them against the source workload identity captured from
 		// this payload and the authority that actually landed locally. This runs

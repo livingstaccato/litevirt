@@ -58,6 +58,7 @@ type connModel struct {
 	mainN    int            // state calls made on the main connection
 	mainFor  map[string]int // modelled calls on the main connection, by domain ("" = the list)
 	secure   *libvirt.StateReader
+	closing  bool // Close was called
 }
 
 // errConnClosed is a call on a connection already closed.
@@ -416,6 +417,16 @@ func (c *fakeConn) ConsolePassword(name, kind string) (string, error) {
 		return "", cerr
 	}
 	return pw, err
+}
+
+// DumpXML is the Fake's DumpXML on c.
+func (c *fakeConn) DumpXML(name string) (string, error) {
+	var x string
+	var err error
+	if cerr := c.callAs(false, "", name, func() { x, err = c.f.dumpXML(name) }); cerr != nil {
+		return "", cerr
+	}
+	return x, err
 }
 
 // Close closes c. Like go-libvirt's Disconnect it is a request first, so it

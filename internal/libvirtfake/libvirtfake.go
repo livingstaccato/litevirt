@@ -1051,6 +1051,13 @@ func (f *Fake) listDomains() ([]string, error) {
 // diverges them). Disk hotplug's live view is tracked separately (diskSources) and
 // never touches activeXML, so this default is unaffected by disk attach/detach.
 func (f *Fake) DumpXML(name string) (string, error) {
+	var x string
+	var err error
+	_ = f.mainConn().callAs(false, "", name, func() { x, err = f.dumpXML(name) })
+	return x, err
+}
+
+func (f *Fake) dumpXML(name string) (string, error) {
 	if f.FailDumpXML != nil {
 		if err := f.FailDumpXML(name); err != nil {
 			return "", err
@@ -2685,7 +2692,20 @@ func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detai
 	cb(domainName, event, detail)
 }
 
-func (f *Fake) Close() error { return nil }
+// Close marks the Fake closed (Closing); its calls go on answering.
+func (f *Fake) Close() error {
+	f.conns.mu.Lock()
+	f.conns.closing = true
+	f.conns.mu.Unlock()
+	return nil
+}
+
+// Closing mirrors libvirt.Client.Closing: whether Close has been called.
+func (f *Fake) Closing() bool {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	return f.conns.closing
+}
 
 // SetDomainOwnerEpoch / GetDomainOwnerEpoch mirror the Phase 4 runtime marker
 // stored in domain metadata. The fake records them per domain so fleet and

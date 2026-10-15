@@ -156,3 +156,31 @@ func TestClientClose_AConnectionLibvirtdDoesNotAnswerClosesInTime(t *testing.T) 
 		t.Fatal("the call waiting on the connection did not fail once Close closed its socket")
 	}
 }
+
+// Review mainconn m-2: a reader asked for after Close was dialled and never
+// closed. Once closed, the client hands out a closed reader, whose calls fail
+// without dialling, and says it is closing.
+//
+// Mutation: no closed check in SecureStateReader: it dials: red.
+func TestClientClose_NoReaderIsDialledAfterClose(t *testing.T) {
+	sock := silentLibvirtd(t)
+	c, err := newClientOn(sock)
+	if err != nil {
+		t.Fatalf("dial the fake libvirtd: %v", err)
+	}
+	prev := clientCloseTimeout
+	clientCloseTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { clientCloseTimeout = prev })
+	_ = c.Close()
+	if !c.Closing() {
+		t.Error("Closing after Close: false")
+	}
+	for _, r := range []*StateReader{c.StateReader(), c.SecureStateReader()} {
+		if _, err := r.VNCPort("x"); err == nil {
+			t.Error("a reader asked for after Close answered")
+		}
+		if r.Dials() != 0 {
+			t.Errorf("a reader asked for after Close dialled %d connections", r.Dials())
+		}
+	}
+}

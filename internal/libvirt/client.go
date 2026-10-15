@@ -2,11 +2,14 @@ package libvirt
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -70,6 +73,9 @@ type Client struct {
 	stateReaderMu sync.Mutex
 	stateReader   *StateReader
 	secureReader  *StateReader
+	// closed is set by Close (under stateReaderMu): a reader asked for after
+	// it is a closed one, and Closing reports it.
+	closed bool
 
 	// conn is the socket under virt, closed by Close when the connection
 	// does not close in time. connMu guards it (not mu, which a call that
@@ -198,6 +204,7 @@ func (c *Client) RegisterDomainEventCallback(cb DomainEventCallback) {
 // which fails every call still waiting on it, and Close reports that.
 func (c *Client) Close() error {
 	c.stateReaderMu.Lock()
+	c.closed = true
 	readers := []*StateReader{c.stateReader, c.secureReader}
 	c.stateReaderMu.Unlock()
 	var wg sync.WaitGroup
@@ -238,6 +245,24 @@ func (c *Client) Close() error {
 		conn.Close() //nolint:errcheck // what is waiting on it fails; that is the point
 	}
 	return fmt.Errorf("libvirt: the connection to libvirtd did not close within %s; its socket was closed", clientCloseTimeout)
+}
+
+// Closing reports whether Close has been called: a call that fails from now
+// on may have failed because Close closed its connection, which says nothing
+// about what libvirt did with it.
+func (c *Client) Closing() bool {
+	c.stateReaderMu.Lock()
+	defer c.stateReaderMu.Unlock()
+	return c.closed
+}
+
+// IsConnectionLost reports whether err is a call's connection to libvirtd
+// going away under it (closed by Close, or libvirtd gone), rather than an
+// answer of libvirt's: what libvirt did with the call is unknown.
+func IsConnectionLost(err error) bool {
+	return errors.Is(err, golibvirt.ErrInterrupted) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
 }
 
 // Libvirt returns the underlying go-libvirt handle for advanced operations.

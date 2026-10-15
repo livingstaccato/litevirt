@@ -75,6 +75,7 @@ type StateConn interface {
 	ListDomains() ([]string, error)
 	VNCPort(name string) (int, error)
 	ConsolePassword(name, kind string) (string, error)
+	DumpXML(name string) (string, error)
 	Close() error
 }
 
@@ -193,6 +194,18 @@ func (r *StateReader) ConsolePassword(name, kind string) (string, error) {
 		return e
 	})
 	return pw, err
+}
+
+// DumpXML is Client.DumpXML (the live XML, without secrets), asked on the
+// reader's connection.
+func (r *StateReader) DumpXML(name string) (string, error) {
+	var x string
+	err := r.do(func(c StateConn) error {
+		var e error
+		x, e = c.DumpXML(name)
+		return e
+	})
+	return x, err
 }
 
 // Dials is how many connections the reader has dialled.
@@ -399,7 +412,17 @@ func (c virtStateConn) ConsolePassword(name, kind string) (string, error) {
 	return consolePassword(c.virt, name, kind)
 }
 
+func (c virtStateConn) DumpXML(name string) (string, error) { return dumpXML(c.virt, name) }
+
 func (c virtStateConn) Close() error { return c.virt.Disconnect() }
+
+// closedStateReader is a reader whose every call fails: what a client hands
+// out once it is closed, so nothing dials a connection Close will not close.
+func closedStateReader() *StateReader {
+	r := NewStateReader(func() (StateConn, error) { return nil, errStateReaderClosed }, 0)
+	r.Close() //nolint:errcheck // it has no connection
+	return r
+}
 
 // dialLibvirtBounded is dialLibvirt on socket, with the dial and the
 // handshake bounded by timeout. go-libvirt puts no deadline on the handshake,
@@ -430,6 +453,9 @@ func dialLibvirtBounded(socket string, timeout time.Duration) (*golibvirt.Libvir
 func (c *Client) StateReader() *StateReader {
 	c.stateReaderMu.Lock()
 	defer c.stateReaderMu.Unlock()
+	if c.closed {
+		return closedStateReader()
+	}
 	if c.stateReader == nil {
 		c.stateReader = NewStateReader(func() (StateConn, error) {
 			v, err := dialLibvirtBounded(readOnlySocket, stateDialTimeout)
@@ -452,6 +478,9 @@ func (c *Client) StateReader() *StateReader {
 func (c *Client) SecureStateReader() *StateReader {
 	c.stateReaderMu.Lock()
 	defer c.stateReaderMu.Unlock()
+	if c.closed {
+		return closedStateReader()
+	}
 	if c.secureReader == nil {
 		c.secureReader = NewStateReader(func() (StateConn, error) {
 			v, err := dialLibvirtBounded(defaultSocket, stateDialTimeout)

@@ -365,11 +365,17 @@ func parseConsolePTYPath(xmlStr, name string) (string, error) {
 // DomainExists checks if a domain is defined.
 // DumpXML returns the full XML description of a domain.
 func (c *Client) DumpXML(name string) (string, error) {
-	dom, err := c.virt.DomainLookupByName(name)
+	return dumpXML(c.virt, name)
+}
+
+// dumpXML is DumpXML on virt: the live XML without its secrets, which a
+// read-only connection is allowed.
+func dumpXML(virt *golibvirt.Libvirt, name string) (string, error) {
+	dom, err := virt.DomainLookupByName(name)
 	if err != nil {
 		return "", fmt.Errorf("lookup domain %s: %w", name, err)
 	}
-	xml, err := c.virt.DomainGetXMLDesc(dom, 0)
+	xml, err := virt.DomainGetXMLDesc(dom, 0)
 	if err != nil {
 		return "", fmt.Errorf("get XML for %s: %w", name, err)
 	}

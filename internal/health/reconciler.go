@@ -115,6 +115,14 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// heldStartLive / recordVMEvent: a held start whose daemon restarted
+	// before libvirt answered it (held_start_orphan.go).
+	heldStartLive func(name string) bool
+	recordVMEvent func(ctx context.Context, vm, typ, result, detail string)
+	// virtWait bounds the walk's and the sweeps' reads of libvirt: a domain
+	// libvirt has not answered for is skipped, never decided on
+	// (domain_gate.go).
+	virtWait virtWait
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
 	settleVerify SettleVerifier
@@ -594,8 +602,11 @@ func (r *Reconciler) StartOnbootVMs(ctx context.Context) {
 		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil || !spec.Onboot {
 			continue
 		}
-		// Already running (e.g. survived a daemon restart) → leave it.
-		if r.virt.DomainExists(vm.Name) {
+		// Already running (e.g. survived a daemon restart) → leave it. A
+		// domain libvirt has not answered for is not known to run: it is
+		// owed its start, which startPendingVM leaves until libvirt answers
+		// (the onboot retry asks again each pass).
+		if r.domainAnswers(vm.Name) && r.virt.DomainExists(vm.Name) {
 			if st, sErr := r.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				continue
 			}
@@ -749,6 +760,9 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context, only func(name stri
 	}
 	sort.SliceStable(names, func(i, j int) bool { return rank(names[i]) < rank(names[j]) })
 	for _, name := range names {
+		if r.virt != nil && !r.domainAnswers(name) {
+			continue // the duty is kept; asked again next pass
+		}
 		if r.virt != nil && r.virt.DomainExists(name) {
 			if st, err := r.virt.DomainState(name); err == nil && st == "running" {
 				r.clearOnbootPending(name) // already up — duty discharged
@@ -804,6 +818,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		return
 	}
 
+	live := make(map[string]bool, len(vms))
+	for _, vm := range vms {
+		live[vm.Name] = true
+	}
+	r.virtWait.prune(live)
+
 	r.resolveDiskMissing(ctx)
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)
@@ -817,6 +837,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.retryOnbootPending(ctx, func(name string) bool { rk, ok := deferred[name]; return ok && rk == rankTime }, deferred)
 
 	for _, vm := range vms {
+		// A domain libvirt has not answered for is skipped this pass:
+		// every case below asks libvirt about it, and decides from the
+		// answer (domain_gate.go).
+		if r.virt != nil && !r.domainAnswers(vm.Name) {
+			continue
+		}
 		switch vm.State {
 		case "pending":
 			r.startPendingVM(ctx, vm)
@@ -1212,9 +1238,11 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		return
 	}
 
-	localDomains, err := r.virt.ListDomains()
+	localDomains, err := r.listDomainsBounded("reconciler: self-fence")
 	if err != nil {
-		slog.Error("reconciler: list local domains", "error", err)
+		if !errors.Is(err, errLibvirtNoAnswer) {
+			slog.Error("reconciler: list local domains", "error", err)
+		}
 		return
 	}
 
@@ -1439,12 +1467,18 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	if r.deferredBeforeWork(ctx, vm) {
 		return
 	}
+	// A domain libvirt has not answered for is not started, nor anything
+	// else decided about it (domain_gate.go): the walk skips it already;
+	// this holds for the onboot start too.
+	if r.virt != nil && !r.domainAnswers(vm.Name) {
+		return
+	}
 	// Take a per-VM startup lease before doing anything destructive.
 	// Without this, two reconcilers on different hosts that both briefly
 	// see vm.HostName=self in CRDT-stale state would both call libvirt.Start
 	// on the same VM UUID — the same physical disk gets two QEMU writers
 	// → guaranteed corruption.
-	if !r.acquireVMLock(ctx, vm.Name) {
+	if !r.acquireVMLock(ctx, vm.Name) && !r.takeOverOrphanedHeldStart(ctx, vm) {
 		slog.Info("reconciler: VM lock held by another host, skipping",
 			"vm", vm.Name)
 		return
@@ -1725,6 +1759,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			}); err != nil {
 				LogPublishRefusal("reconciler: already-present running-state write failed", vm.Name, err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
+			} else if fresh.State == "starting" {
+				// A held start whose daemon restarted before libvirt
+				// answered it: its outcome, recorded once, with this move
+				// from starting (held_start_orphan.go).
+				r.recordHeldStartRan(ctx, vm.Name, fresh.StateDetail)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
 			return

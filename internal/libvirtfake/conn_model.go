@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	golibvirt "github.com/digitalocean/go-libvirt"
+
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -35,17 +37,28 @@ import (
 // it fails, as go-libvirt fails it with ErrInterrupted, once libvirt
 // answers. SetStateDial makes a StateReader's dials fail or wait.
 //
-// Only the two state calls are modelled: every other method answers at once,
-// as before; libvirtd's worker pool is not modelled.
+// Besides the two state calls, the reads a caller makes of a domain while
+// libvirt may hang on another are modelled, on the Fake's connection and a
+// reader's alike: DomainExists, DomainIsActive, the VNC port, the console
+// password and the domain list, which waits on every hung domain (libvirt
+// looks at each domain to list it; lab 2's `virsh list --all` timed out
+// with one hung). A reader's connections are read-only ones, which libvirt
+// refuses the console password (its secure XML); SecureStateReader's are
+// read-write. Every other method answers at once, as before; libvirtd's
+// worker pool is not modelled.
 type connModel struct {
 	mu       sync.Mutex
 	requests int                      // the per-connection cap; 0 = none
 	hung     map[string]chan struct{} // domain → closed when released
+	hungCall map[string]chan struct{} // call kind + "\x00" + domain → closed when released
 	main     *fakeConn
 	reader   *libvirt.StateReader
 	all      []*fakeConn // every connection made, to wake on a new cap
 	dialHook func() error
-	mainN    int // state calls made on the main connection
+	mainN    int            // state calls made on the main connection
+	mainFor  map[string]int // modelled calls on the main connection, by domain ("" = the list)
+	secure   *libvirt.StateReader
+	closing  bool // Close was called
 }
 
 // errConnClosed is a call on a connection already closed.
@@ -58,10 +71,11 @@ type fakeConn struct {
 	cond     *sync.Cond
 	inFlight int
 	closed   bool
+	readOnly bool // a read-only connection (libvirt-sock-ro)
 }
 
-func (f *Fake) newFakeConn() *fakeConn {
-	c := &fakeConn{f: f}
+func (f *Fake) newFakeConn(readOnly bool) *fakeConn {
+	c := &fakeConn{f: f, readOnly: readOnly}
 	c.cond = sync.NewCond(&c.mu)
 	f.conns.mu.Lock()
 	f.conns.all = append(f.conns.all, c)
@@ -102,6 +116,14 @@ func (f *Fake) SetStateDial(hook func() error) {
 	f.conns.mu.Lock()
 	f.conns.dialHook = hook
 	f.conns.mu.Unlock()
+}
+
+// MainConnCallsFor is how many modelled calls naming the domain name were
+// made on the Fake's own connection ("" counts the domain lists).
+func (f *Fake) MainConnCallsFor(name string) int {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	return f.conns.mainFor[name]
 }
 
 // MainConnCalls is how many state calls were made on the Fake's own
@@ -151,6 +173,65 @@ func (f *Fake) waitHung(name string) {
 	}
 }
 
+// HangCall is HangDomain for the calls of one kind only, naming name:
+// CallVNCPort or CallConsolePassword. The domain's other calls answer.
+func (f *Fake) HangCall(kind, name string) (release func()) {
+	key := kind + "\x00" + name
+	ch := make(chan struct{})
+	f.conns.mu.Lock()
+	if f.conns.hungCall == nil {
+		f.conns.hungCall = map[string]chan struct{}{}
+	}
+	f.conns.hungCall[key] = ch
+	f.conns.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.conns.mu.Lock()
+			if f.conns.hungCall[key] == ch {
+				delete(f.conns.hungCall, key)
+			}
+			f.conns.mu.Unlock()
+			close(ch)
+		})
+	}
+}
+
+// The call kinds HangCall takes.
+const (
+	CallVNCPort         = "vnc-port"
+	CallConsolePassword = "console-password"
+)
+
+func (f *Fake) waitHungCall(kind, name string) {
+	if kind == "" {
+		return
+	}
+	f.conns.mu.Lock()
+	ch := f.conns.hungCall[kind+"\x00"+name]
+	f.conns.mu.Unlock()
+	if ch != nil {
+		<-ch
+	}
+}
+
+// waitAllHung waits until no domain is hung, as a domain list does.
+func (f *Fake) waitAllHung() {
+	for {
+		f.conns.mu.Lock()
+		var ch chan struct{}
+		for _, c := range f.conns.hung {
+			ch = c
+			break
+		}
+		f.conns.mu.Unlock()
+		if ch == nil {
+			return
+		}
+		<-ch
+	}
+}
+
 // ConnInFlight is how many state calls are in flight on the Fake's own
 // connection.
 func (f *Fake) ConnInFlight() int {
@@ -164,16 +245,34 @@ func (f *Fake) ConnInFlight() int {
 // for its domain to be released, then calls fn. It returns errConnClosed,
 // without calling fn, on a connection already closed.
 func (c *fakeConn) call(name string, fn func()) error {
+	return c.callAs(true, "", name, fn)
+}
+
+// callAs is call; state says it is a state call (MainConnCalls counts
+// those), and kind names the call for HangCall ("" for none). A name of ""
+// waits on every hung domain (the domain list).
+func (c *fakeConn) callAs(state bool, kind, name string, fn func()) error {
 	if c == c.f.mainConn() {
 		c.f.conns.mu.Lock()
-		c.f.conns.mainN++
+		if state {
+			c.f.conns.mainN++
+		}
+		if c.f.conns.mainFor == nil {
+			c.f.conns.mainFor = map[string]int{}
+		}
+		c.f.conns.mainFor[name]++
 		c.f.conns.mu.Unlock()
 	}
 	if !c.takeSlot() {
 		return errConnClosed
 	}
 	defer c.freeSlot()
-	c.f.waitHung(name)
+	if name == "" {
+		c.f.waitAllHung()
+	} else {
+		c.f.waitHung(name)
+		c.f.waitHungCall(kind, name)
+	}
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
@@ -226,7 +325,22 @@ func (f *Fake) NewStateReader(stallAfter time.Duration) *libvirt.StateReader {
 	return f.newStateReaderLocked(stallAfter)
 }
 
+// SecureStateReader is the Fake's libvirt.SecureStateReader: the real
+// StateReader on read-write fake connections of its own.
+func (f *Fake) SecureStateReader() *libvirt.StateReader {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	if f.conns.secure == nil {
+		f.conns.secure = f.newReaderLocked(0, false)
+	}
+	return f.conns.secure
+}
+
 func (f *Fake) newStateReaderLocked(stallAfter time.Duration) *libvirt.StateReader {
+	return f.newReaderLocked(stallAfter, true)
+}
+
+func (f *Fake) newReaderLocked(stallAfter time.Duration, readOnly bool) *libvirt.StateReader {
 	return libvirt.NewStateReader(func() (libvirt.StateConn, error) {
 		f.conns.mu.Lock()
 		hook := f.conns.dialHook
@@ -236,7 +350,7 @@ func (f *Fake) newStateReaderLocked(stallAfter time.Duration) *libvirt.StateRead
 				return nil, err
 			}
 		}
-		return f.newFakeConn(), nil
+		return f.newFakeConn(readOnly), nil
 	}, stallAfter)
 }
 
@@ -258,6 +372,61 @@ func (c *fakeConn) DomainStateReason(name string) (libvirt.DomainStatus, error) 
 		return libvirt.DomainStatus{State: "unknown", Reason: "unknown"}, cerr
 	}
 	return st, err
+}
+
+// DomainIsActive is the Fake's DomainIsActive on c.
+func (c *fakeConn) DomainIsActive(name string) (bool, error) {
+	var active bool
+	var err error
+	if cerr := c.callAs(false, "", name, func() { active, err = c.f.domainIsActive(name) }); cerr != nil {
+		return false, cerr
+	}
+	return active, err
+}
+
+// ListDomains is the Fake's ListDomains on c.
+func (c *fakeConn) ListDomains() ([]string, error) {
+	var names []string
+	var err error
+	if cerr := c.callAs(false, "", "", func() { names, err = c.f.listDomains() }); cerr != nil {
+		return nil, cerr
+	}
+	return names, err
+}
+
+// VNCPort is the Fake's GetVMVNCPort on c.
+func (c *fakeConn) VNCPort(name string) (int, error) {
+	port := -1
+	var err error
+	if cerr := c.callAs(false, CallVNCPort, name, func() { port, err = c.f.vncPort(name) }); cerr != nil {
+		return -1, cerr
+	}
+	return port, err
+}
+
+// ConsolePassword is the Fake's ConsolePassword on c. libvirt refuses it a
+// read-only connection: it reads the secure XML.
+func (c *fakeConn) ConsolePassword(name, kind string) (string, error) {
+	if c.readOnly {
+		return "", golibvirt.Error{Code: uint32(golibvirt.ErrOperationDenied),
+			Message: "libvirtfake: virDomainGetXMLDesc with secure flag is not allowed on a read-only connection"}
+	}
+	var pw string
+	var err error
+	if cerr := c.callAs(false, CallConsolePassword, name, func() { pw, err = c.f.consolePassword(name, kind) }); cerr != nil {
+		return "", cerr
+	}
+	return pw, err
+}
+
+// DumpXML is the Fake's DumpXML on c.
+func (c *fakeConn) DumpXML(name string) (string, error) {
+	var x string
+	var err error
+	if cerr := c.callAs(false, "", name, func() { x, err = c.f.dumpXML(name) }); cerr != nil {
+		return "", cerr
+	}
+	return x, err
 }
 
 // Close closes c. Like go-libvirt's Disconnect it is a request first, so it

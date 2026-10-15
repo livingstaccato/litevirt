@@ -356,16 +356,32 @@ func cancelledStartActiveKey(vm string) string  { return "cancelled-start-active
 func cancelledStartDestroyKey(vm string) string { return "cancelled-start-destroy\x00" + vm }
 
 // domainActiveBounded is DomainIsActive within the live-state wait
-// (errLiveStateNoAnswer when libvirt has not answered).
+// (errLiveStateNoAnswer when libvirt has not answered), asked on the
+// backend's StateReader when it has one: the daemon's connection can be full
+// of calls libvirt does not answer (libvirt/state_reader.go).
 func (s *Server) domainActiveBounded(vm string) (bool, error) {
 	_, st, err := s.boundedVirtCall(cancelledStartActiveKey(vm), nil, func() (string, error) {
-		active, err := s.virt.DomainIsActive(vm)
+		active, err := s.domainIsActiveRead(vm)
 		if active {
 			return "active", err
 		}
 		return "", err
 	})
 	return st == "active", err
+}
+
+// domainIsActiveRead is DomainIsActive on the backend's StateReader, or on
+// the daemon's connection when it has none or the reader cannot dial.
+func (s *Server) domainIsActiveRead(vm string) (bool, error) {
+	if b, ok := s.virt.(interface{ StateReader() *lv.StateReader }); ok {
+		if r := b.StateReader(); r != nil {
+			active, err := r.DomainIsActive(vm)
+			if !errors.Is(err, lv.ErrStateConnUnavailable) {
+				return active, err
+			}
+		}
+	}
+	return s.virt.DomainIsActive(vm)
 }
 
 // markCancelledStartRan records, in the record, that the start r cancelled

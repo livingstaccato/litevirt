@@ -4432,8 +4432,15 @@ type VM struct {
 	// host's 127.0.0.1) requires a password (docs/ui.md "Console passwords").
 	// Reach it through the web UI or `lv vnc <vm> --listen`, which present it.
 	VncPasswordRequired bool `protobuf:"varint,22,opt,name=vnc_password_required,json=vncPasswordRequired,proto3" json:"vnc_password_required,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// vnc_unknown says, when it is not empty, that libvirt on the VM's host
+	// did not answer the read of its VNC console in time (or answered it
+	// with an error): vnc_address is then empty, or, when the address was
+	// read, vnc_password_required is false without saying the console has
+	// no password. Empty when both were read, or the VM has no console to
+	// read (not running, or on another host). Set by InspectVM/GetVM.
+	VncUnknown    string `protobuf:"bytes,23,opt,name=vnc_unknown,json=vncUnknown,proto3" json:"vnc_unknown,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VM) Reset() {
@@ -4618,6 +4625,13 @@ func (x *VM) GetVncPasswordRequired() bool {
 		return x.VncPasswordRequired
 	}
 	return false
+}
+
+func (x *VM) GetVncUnknown() string {
+	if x != nil {
+		return x.VncUnknown
+	}
+	return ""
 }
 
 type VMStrandedDisk struct {
@@ -7428,7 +7442,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\x8f\a\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xb0\a\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -7460,7 +7474,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x10pit_overlay_held\x18\x13 \x01(\tR\x0epitOverlayHeld\x12)\n" +
 	"\x10promoted_partial\x18\x14 \x01(\tR\x0fpromotedPartial\x120\n" +
 	"\x14shared_disk_withheld\x18\x15 \x01(\tR\x12sharedDiskWithheld\x122\n" +
-	"\x15vnc_password_required\x18\x16 \x01(\bR\x13vncPasswordRequired\"v\n" +
+	"\x15vnc_password_required\x18\x16 \x01(\bR\x13vncPasswordRequired\x12\x1f\n" +
+	"\vvnc_unknown\x18\x17 \x01(\tR\n" +
+	"vncUnknown\"v\n" +
 	"\x0eVMStrandedDisk\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04disk\x18\x02 \x01(\tR\x04disk\x12\x12\n" +

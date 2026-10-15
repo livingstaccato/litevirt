@@ -433,6 +433,9 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 	// disk is open, or a resume would need it, and the ownership repair
 	// decides that case, not this. Only a domain shut off with nothing to
 	// resume — the leftover a fenced host comes back with — or none at all.
+	if r.virt != nil && !r.domainAnswers(vm.Name) {
+		return true, d // libvirt has not answered for it: kept, looked at again next pass
+	}
 	if r.virt != nil && r.virt.DomainExists(vm.Name) {
 		st, serr := r.virt.DomainStateReason(vm.Name)
 		if serr != nil {
@@ -862,9 +865,10 @@ func (r *Reconciler) resolveHeld(ctx context.Context, name string) {
 	}
 }
 
-// domainRunningHere reports whether name's domain runs on this host.
+// domainRunningHere reports whether name's domain runs on this host; not
+// when libvirt has not answered for it (domain_gate.go).
 func (r *Reconciler) domainRunningHere(name string) bool {
-	if r.virt == nil || !r.virt.DomainExists(name) {
+	if r.virt == nil || !r.domainAnswers(name) || !r.virt.DomainExists(name) {
 		return false
 	}
 	st, err := r.virt.DomainStateReason(name)

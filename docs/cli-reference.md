@@ -1347,6 +1347,8 @@ lv sg ls
 lv sg rm <id>
 lv sg rule-add <sg-id-or-name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--priority N]
+lv sg rule-add <sg-id-or-name> --macro <name> [--cidr <c>] [--direction ingress|egress] \
+    [--action accept|drop|reject] [--priority N]    # one rule per macro row; prints every id
 lv sg rule-ls <sg-id-or-name>
 lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
@@ -1363,18 +1365,21 @@ lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a 
   # `lv sg rule-ls` warn, and the firewall reconciler logs it once per rule.
   # Deleting either group removes them (the sg.rm audit row records them).
 
+lv firewall macros            # List the rule macros and their rows
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now
 
 # Cluster-tier rules (apply to every NIC on every host):
 lv firewall cluster-rule add --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall cluster-rule add --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall cluster-rule ls
 lv firewall cluster-rule rm <id>
 
 # Host-tier rules (apply to every NIC on one host):
 lv firewall host-rule add --host <name> --direction ingress|egress --proto tcp \
     --port <p> --cidr <c> [--action accept|drop|reject] [--comment <s>] [--priority N]
+lv firewall host-rule add --host <name> --macro <name> [--direction ...] [--cidr <c>] [--action ...] [--comment <s>]
 lv firewall host-rule ls [--host <name>]
 lv firewall host-rule rm <id>
 

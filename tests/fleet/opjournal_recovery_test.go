@@ -244,9 +244,9 @@ func TestFleet_OpJournalRecovery_ReapedOperationSupersedes(t *testing.T) {
 	}
 	// Negative retention puts the cutoff in the future so the just-terminal
 	// operation is past it — the reaper's normal behaviour, without the wait.
-	reaped, err := corrosion.ReapTerminalOperations(ctx, peer.DB, -time.Minute)
-	if err != nil {
-		t.Fatalf("ReapTerminalOperations: %v", err)
+	reaped, failed, err := corrosion.ReapTerminalOperations(ctx, peer.DB, -time.Minute)
+	if err != nil || len(failed) != 0 {
+		t.Fatalf("ReapTerminalOperations: %v (failed: %v)", err, failed)
 	}
 	if reaped != 1 {
 		t.Fatalf("ReapTerminalOperations reaped %d operations, want 1", reaped)

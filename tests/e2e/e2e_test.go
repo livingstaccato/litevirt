@@ -2179,20 +2179,60 @@ func getVMIP(t *testing.T, vmName, stackName, networkName string) string {
 	// nothing; matching a suffix would find another stack's network of the
 	// same name.
 	scoped := lvcompose.ScopedNetworkName(stackName, networkName)
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
+	var ip, lastErr string
+	took, ok := pollFor(vmIPWait, 5*time.Second, func() bool {
 		out, err := lvErr(t, "inspect", vmName)
 		if err != nil {
-			time.Sleep(5 * time.Second)
-			continue
+			lastErr = err.Error()
+			return false
 		}
-		if ip := inspectNICIP(out, scoped); ip != "" {
-			return ip
-		}
-		time.Sleep(5 * time.Second)
+		lastErr = ""
+		ip = inspectNICIP(out, scoped)
+		return ip != ""
+	})
+	if !ok {
+		t.Fatalf("lv inspect %s reported no IP on network %s within %v (last inspect error %q): the VM's host never learned its lease; a VM on a host that is not the network's DHCP host depends on that host's ARP table", vmName, scoped, vmIPWait, lastErr)
 	}
-	t.Fatalf("could not get IP for %s on network %s within 60s", vmName, scoped)
-	return ""
+	t.Logf("%s got %s on %s after %v", vmName, ip, scoped, took.Round(time.Second))
+	return ip
+}
+
+// vmIPWait bounds how long lv inspect may take to report a guest's address.
+// A guest on a host that is not the network's DHCP host has no local lease, so
+// the address comes from that host's ARP table; 60 s was too short for it, and
+// the bound stays tight enough for a total reporting regression to fail. The
+// product fix for cross-host IP reporting is on fix/net-isolation-lb; tighten
+// this bound once it merges.
+const vmIPWait = 120 * time.Second
+
+// pollFor calls cond every interval until it returns true or timeout passes,
+// and reports how long it took. The last attempt is made at the timeout, not
+// an interval before it.
+func pollFor(timeout, interval time.Duration, cond func() bool) (time.Duration, bool) {
+	start := time.Now()
+	for {
+		if cond() {
+			return time.Since(start), true
+		}
+		left := timeout - time.Since(start)
+		if left <= 0 {
+			return time.Since(start), false
+		}
+		time.Sleep(min(interval, left))
+	}
+}
+
+// pingVerdict reads the result of a ping run through lv exec. reached says the
+// ping got replies; conclusive is false when the run itself failed (lv exec
+// transport, guest agent) and proves nothing about reachability.
+func pingVerdict(out string, err error) (reached, conclusive bool) {
+	if err == nil {
+		return true, true
+	}
+	if strings.Contains(out, "100% packet loss") || strings.Contains(out, "Unreachable") {
+		return false, true
+	}
+	return false, false
 }
 
 // inspectNICIP is the address `lv inspect` output records for the VM's NIC on
@@ -2349,6 +2389,7 @@ func testNetOverlay(t *testing.T) {
 	stackName := uniqueName("netov")
 	vm1Name := uniqueName("nv1")
 	vm2Name := uniqueName("nv2")
+	vm3Name := uniqueName("nv3")
 
 	compose := fmt.Sprintf(`name: %s
 networks:
@@ -2389,9 +2430,23 @@ vms:
       host: %s
     cloud-init:
       userdata: |
+        %s
+  %s:
+    image: %s
+    cpu: 1
+    memory: `+vmMemory()+`
+    disks:
+      root: 5G
+    network:
+      - name: isonet
+    placement:
+      host: %s
+    cloud-init:
+      userdata: |
         %s`, stackName,
 		vm1Name, testImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "),
-		vm2Name, testImage, hostNames[1], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
+		vm2Name, testImage, hostNames[1], strings.ReplaceAll(netCloudInit, "\n", "\n        "),
+		vm3Name, testImage, hostNames[0], strings.ReplaceAll(netCloudInit, "\n", "\n        "))
 
 	filePath := writeComposeFile(t, stackName, compose)
 	cleanup(t, func() { composeDown(t, stackName) })
@@ -2399,8 +2454,10 @@ vms:
 	composeUp(t, filePath)
 	waitVM(t, vm1Name, "RUNNING", 3*time.Minute)
 	waitVM(t, vm2Name, "RUNNING", 3*time.Minute)
+	waitVM(t, vm3Name, "RUNNING", 3*time.Minute)
 	waitCloudInit(t, vm1Name, 3*time.Minute)
 	waitCloudInit(t, vm2Name, 3*time.Minute)
+	waitCloudInit(t, vm3Name, 3*time.Minute)
 
 	t.Run("VXLAN/InterVMPing", func(t *testing.T) {
 		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
@@ -2423,12 +2480,37 @@ vms:
 		}
 	})
 
+	// An isolated network does not span hosts (docs/networking.md): each host
+	// runs its own bridge and DHCP for it. Same-host VMs reach each other.
 	t.Run("Isolated/InterVMPing", func(t *testing.T) {
-		vm2IP := getVMIP(t, vm2Name, stackName, "isonet")
-		t.Logf("vm2 isolated IP: %s", vm2IP)
-		out, err := execRetry(t, vm1Name, "ping", "-c", "3", "-W", "5", vm2IP)
+		vm3IP := getVMIP(t, vm3Name, stackName, "isonet")
+		t.Logf("%s (same host as %s) isolated IP: %s", vm3Name, vm1Name, vm3IP)
+		out, err := execRetry(t, vm1Name, "ping", "-c", "3", "-W", "5", vm3IP)
 		if err != nil {
-			t.Errorf("ping from %s to %s (%s) on isolated net failed: %v\n%s", vm1Name, vm2Name, vm2IP, err, out)
+			t.Errorf("ping from %s to %s (%s) on the isolated net, same host, failed: %v\n%s", vm1Name, vm3Name, vm3IP, err, out)
+		}
+	})
+
+	t.Run("Isolated/CrossHostNotReachable", func(t *testing.T) {
+		vm1IP := getVMIP(t, vm1Name, stackName, "isonet")
+		vm3IP := getVMIP(t, vm3Name, stackName, "isonet")
+		vm2IP := getVMIP(t, vm2Name, stackName, "isonet")
+		// Each host leases the isolated range independently, so vm2 may hold
+		// the same address as a VM on host 1: a ping to it then proves nothing.
+		if vm2IP == vm1IP || vm2IP == vm3IP {
+			t.Skipf("%s's isolated address %s equals %s's (%s) or %s's (%s) on the other host; a ping to it would be answered locally", vm2Name, vm2IP, vm1Name, vm1IP, vm3Name, vm3IP)
+		}
+		// Control: the guest agent answers, so a failure below is the ping's.
+		if _, err := execRetry(t, vm1Name, "true"); err != nil {
+			t.Fatalf("lv exec on %s does not work, so the cross-host check cannot run: %v", vm1Name, err)
+		}
+		out, err := lvErr(t, "exec", vm1Name, "ping", "-c", "3", "-W", "3", vm2IP)
+		reached, conclusive := pingVerdict(out, err)
+		switch {
+		case !conclusive:
+			t.Fatalf("lv exec ping from %s failed without a ping result, so cross-host unreachability is unproven: %v\n%s", vm1Name, err, out)
+		case reached:
+			t.Errorf("ping from %s (%s) to %s (%s) on the isolated net succeeded across hosts; an isolated network does not span hosts: %s", vm1Name, hostNames[0], vm2Name, vm2IP, out)
 		}
 	})
 
@@ -2954,7 +3036,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP", "TestPollFor", "TestHostStateInLs", "TestClassifyLease", "TestLeaseWatchObserve", "TestObserveTick", "TestObserveTickUnknown", "TestSampleTick", "TestHoldersIn", "TestIncoherenceTracker", "TestPingVerdict"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

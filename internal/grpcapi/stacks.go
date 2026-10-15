@@ -404,6 +404,13 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	if w == nil {
 		w = &stackFirewallWrites{}
 	}
+	// A rule that still names a macro (the parser expands them; a File built
+	// another way may not) is expanded first: refuse-form, then the write
+	// grammar, then the release features below, all before any gate is asked
+	// or anything is torn down. A macro that does not expand writes no row.
+	if err := compose.ExpandMacros(f); err != nil {
+		return err
+	}
 	hasFirewall := len(f.SecurityGroups) > 0 || len(f.IPSets) > 0 || f.FirewallDefaults != nil
 	if !hasFirewall {
 		// Still clear any rows a previous deploy of this stack left behind, in
@@ -443,6 +450,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 		}
 	}
+	var stackSets []corrosion.IPSet
 	for name, set := range f.IPSets {
 		need, err := ipSetRowFeatures(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
@@ -451,6 +459,11 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for _, nf := range need {
 			needed[nf] = true
 		}
+		stackSets = append(stackSets, corrosion.IPSet{Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs)})
+	}
+	// Against every live set but this stack's own, which the deploy replaces.
+	if err := corrosion.IPSetCompanionClash(ctx, s.db, f.Name, stackSets); err != nil {
+		return fmt.Errorf("ipset: %w", err)
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
@@ -521,7 +534,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
 			row := corrosion.SGRule{
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
-				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
+				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: rulePriority(r, i),
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
@@ -550,7 +563,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for i, r := range fd.ClusterRules {
 			row := corrosion.FirewallRule{
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
-				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
+				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: rulePriority(r, i),
 			}
 			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
 			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
@@ -568,6 +581,15 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	return nil
+}
+
+// rulePriority is the priority of the rule at position i: the one macro
+// expansion set (every row of a macro shares it), else (i+1)*10.
+func rulePriority(r compose.FirewallRuleDef, i int) int {
+	if r.Priority != 0 {
+		return r.Priority
+	}
+	return (i + 1) * 10
 }
 
 // streamResolvedPlan sends the full resolved plan over the deploy progress stream.

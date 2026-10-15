@@ -22,7 +22,7 @@ func TestFirewallWriters_StoreLowercase(t *testing.T) {
 	if err := InsertHostFirewallRuleWithGrant(ctx, c, none, none, none, FirewallRule{ID: "h", HostName: "h", Direction: "ingress", Proto: "UDP", PortRange: "{ 53, DOMAIN }", Action: "Accept"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := InsertSGRuleWithGrant(ctx, c, none, none, none, SGRule{ID: "s", SGID: "sg", Direction: "ingress", Proto: "Tcp", PortRange: "HTTP-HTTPS", Action: "REJECT"}); err != nil {
+	if err := InsertSGRuleWithGrant(ctx, c, none, none, none, SGRule{ID: "s", SGID: "sg", Direction: "ingress", Proto: "Tcp", PortRange: "HTTP - HTTPS", Action: "REJECT"}); err != nil {
 		t.Fatal(err)
 	}
 	cr, _ := ListClusterFirewallRules(ctx, c)
@@ -34,7 +34,7 @@ func TestFirewallWriters_StoreLowercase(t *testing.T) {
 	if len(hr) != 1 || hr[0].Proto != "udp" || hr[0].PortRange != "{ 53, domain }" || hr[0].Action != "accept" {
 		t.Errorf("host rule stored as %+v", hr)
 	}
-	if len(sr) != 1 || sr[0].Proto != "tcp" || sr[0].PortRange != "http-https" || sr[0].Action != "reject" {
+	if len(sr) != 1 || sr[0].Proto != "tcp" || sr[0].PortRange != "http - https" || sr[0].Action != "reject" {
 		t.Errorf("sg rule stored as %+v", sr)
 	}
 }

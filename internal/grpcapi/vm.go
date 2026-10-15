@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -3493,7 +3492,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	// The live state, as `lv ls` reads it (readVMState); the record's
 	// detail unless the read has its own.
-	state, stateDetail := s.readVMState(vm, s.newLiveStateBudget())
+	budget := s.newLiveStateBudget()
+	state, stateDetail := s.readVMState(vm, budget)
 	if stateDetail == "" {
 		stateDetail = vm.StateDetail
 	}
@@ -3618,14 +3618,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 
 	// VNC address — only available for running VMs on this host
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
-		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
-			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
-			}
-			// Whether that listener asks for a password (docs/ui.md "Console
-			// passwords"); never the password itself.
-			pbVM.VncPasswordRequired = s.vmHasVNCPassword(name)
-		}
+		s.fillVNC(ctx, pbVM, name, budget)
 	}
 
 	// Project the authoritative device tables into the spec's device

@@ -26,6 +26,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -38,6 +39,11 @@ type consoleVirt struct {
 
 func (v consoleVirt) ConsolePTYPath(string) (string, error) { return v.pty, nil }
 func (v consoleVirt) GetVMVNCPort(string) (int, error)      { return v.vnc, nil }
+
+// StateReader and SecureStateReader are none: the console reads go to the
+// overrides above, not to the embedded fake's own readers.
+func (v consoleVirt) StateReader() *libvirt.StateReader       { return nil }
+func (v consoleVirt) SecureStateReader() *libvirt.StateReader { return nil }
 
 // transportStream is a server stream whose context is the caller's bearer
 // context, and whose RecvMsg blocks until the TRANSPORT ends (transport

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -69,8 +70,19 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	// Local VM: connect to the VNC port. A missing VNC graphics device means
 	// the VM was created headless (DisableVnc) — report it as a clear
 	// configuration condition rather than a vague "not available".
-	port, err := s.virt.GetVMVNCPort(vmName)
-	if err != nil || port < 0 {
+	// Both reads are made on connections of their own, within the
+	// live-state wait (fillVNC): the daemon's connection can be full of
+	// calls libvirt does not answer.
+	_, ps, err := s.boundedVirtCall(vncPortKey(vmName), nil, func() (string, error) {
+		p, err := s.vncPortRead(vmName)
+		return strconv.Itoa(p), err
+	})
+	if errors.Is(err, errLiveStateNoAnswer) {
+		return status.Errorf(codes.Unavailable, "the VNC console of VM %q: libvirt on %s has not answered for it (waited %s); retry",
+			vmName, s.hostName, s.liveStateWaitOrDefault())
+	}
+	port, perr := strconv.Atoi(ps)
+	if err != nil || perr != nil || port < 0 {
 		slog.Warn("vnc port unavailable", "vm", vmName, "error", err)
 		return status.Errorf(codes.FailedPrecondition, "VNC is not enabled for VM %q", vmName)
 	}
@@ -78,7 +90,11 @@ func (s *Server) ProxyVNC(stream grpc.BidiStreamingServer[pb.VNCData, pb.VNCData
 	// The console's password, if it has one (docs/ui.md "Console
 	// passwords"). Read from the RUNNING domain, so it is the one the guest
 	// started with, wherever it was defined or migrated from. Never logged.
-	password, err := s.virt.ConsolePassword(vmName, "vnc")
+	password, err := s.boundedConsolePassword(vmName)
+	if errors.Is(err, errLiveStateNoAnswer) {
+		return status.Errorf(codes.Unavailable, "the VNC console of VM %q: libvirt on %s has not answered for its password (waited %s); retry",
+			vmName, s.hostName, s.liveStateWaitOrDefault())
+	}
 	if err != nil {
 		slog.Warn("vnc console password unreadable", "vm", vmName, "error", err)
 		return status.Errorf(codes.Internal, "read the VNC console's password for VM %q: %v", vmName, err)
@@ -217,9 +233,31 @@ func logVNCPasswordStrip(vmName, target string, strip bool) {
 
 // vmHasVNCPassword reports whether the running domain's VNC console has a
 // password (read from the live secure definition; the value is not kept).
+// It is read off the daemon's connection, within the live-state wait; a read
+// libvirt has not answered is taken as a password, so the caller asks what a
+// password needs (a migration asks the target), never assumes none.
 func (s *Server) vmHasVNCPassword(vmName string) bool {
-	pw, err := s.virt.ConsolePassword(vmName, "vnc")
-	return err == nil && pw != ""
+	_, req, err := s.boundedVirtCall(vncPasswordKey(vmName), nil, func() (string, error) {
+		pw, err := s.consolePasswordRead(vmName, "vnc")
+		if pw != "" {
+			return "required", err
+		}
+		return "", err
+	})
+	if errors.Is(err, errLiveStateNoAnswer) {
+		return true
+	}
+	return err == nil && req == "required"
+}
+
+// boundedConsolePassword is the running domain's VNC password, read off the
+// daemon's connection within the live-state wait (errLiveStateNoAnswer when
+// libvirt has not answered). Never logged.
+func (s *Server) boundedConsolePassword(vmName string) (string, error) {
+	_, pw, err := s.boundedVirtCall("vnc-proxy-password\x00"+vmName, nil, func() (string, error) {
+		return s.consolePasswordRead(vmName, "vnc")
+	})
+	return pw, err
 }
 
 // vncViewerStream is the viewer side of a ProxyVNC stream as a byte stream,

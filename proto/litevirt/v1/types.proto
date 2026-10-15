@@ -692,6 +692,13 @@ message VM {
     // host's 127.0.0.1) requires a password (docs/ui.md "Console passwords").
     // Reach it through the web UI or `lv vnc <vm> --listen`, which present it.
     bool                           vnc_password_required = 22;
+    // vnc_unknown says, when it is not empty, that libvirt on the VM's host
+    // did not answer the read of its VNC console in time (or answered it
+    // with an error): vnc_address is then empty, or, when the address was
+    // read, vnc_password_required is false without saying the console has
+    // no password. Empty when both were read, or the VM has no console to
+    // read (not running, or on another host). Set by InspectVM/GetVM.
+    string                         vnc_unknown = 23;
 }
 
 message VMStrandedDisk {

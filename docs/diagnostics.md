@@ -1839,6 +1839,28 @@ naming the prefix and the tree; the daemon log says the same at start.
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
 
+### Operation not reapable (`operation_unreapable`)
+
+Every node runs the operation reaper hourly. It tombstones each finished
+operation, and its steps, once the last step is older than
+`tombstone_gc_retention_hours` (default 24) and no VM barrier names it. A node
+raises `operation_unreapable` (warning) about **itself** when a pass could not
+reap one or more of those operations. The reaper goes on to the next operation,
+so one failure does not hold the others. Each failure is logged once per pass as
+`operation reaper: could not reap an operation`, with `operation_id` and
+`error`, for up to 20 operations; past that, one line,
+`operation reaper: could not reap more operations`, carries `more` and `total`.
+The evidence carries `count`, `operations` (up to 20, each with `id`
+and `error`) and `remedy`.
+
+| Raised when | Clears when |
+|---|---|
+| A reaper pass could not read an operation's steps or write its tombstone. | A complete pass has no failures. A pass that ends early never clears it: WAL quarantine, shutdown, or a failure of the pass's opening reads. A pass that ends early after failures raises it with only the operations reached, so `count` can be low until the next complete pass. |
+
+**If it does not clear,** the `error` of each listed operation says why its
+steps could not be read or its tombstone could not be written. Fix that cause;
+the next pass retries every listed operation.
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

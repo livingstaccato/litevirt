@@ -62,9 +62,15 @@ const (
 	// An ip set is rendered without the elements that cannot be rendered (they
 	// never worked: each one injected or broke the load).
 	HandlingElementsLeftOut = "rendered without its unreadable elements"
-	// An ip set whose name cannot be rendered is left out; a rule referencing
-	// it cannot be rendered either and is held fail-static.
-	HandlingSetLeftOut = "set left out: its name cannot be rendered"
+	// An ip set whose name cannot be rendered, or is the name of one of
+	// litevirt's own sets (userSetName), is left out; a rule referencing it cannot be
+	// rendered either and is held fail-static.
+	HandlingSetLeftOut = "set left out: its name cannot be rendered or is reserved for litevirt"
+	// A set named <x>_v6 while a set x holds IPv6 elements: x's IPv6 elements
+	// render as the set <x>_v6, and nft refuses a second set of that name. The
+	// row so named is left out; a rule referencing it cannot be rendered and
+	// is held fail-static.
+	HandlingSetLeftOutCompanion = "set left out: its name is the IPv6 companion of another set"
 )
 
 // rowMemory is what a loader last rendered for each rule row, by table/id, so
@@ -198,11 +204,33 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 			reasons = append(reasons, err.Error())
 		}
 	}
+	// What nft would refuse the whole ruleset over, judged on this host
+	// without the network: a port or protocol it cannot resolve (fw-0.4 review
+	// I-3; set-freeze review I-2), an ordering operator in front of a list,
+	// range or prefix (review I-3), an IPv4 address, prefix or range it cannot
+	// read (review m-2). Each only once the field's syntax is sound.
+	field := func(name, value, why string) {
+		if why != "" {
+			reasons = append(reasons, (&rulefield.FieldError{Field: name, Value: value, Reason: why}).Error())
+		}
+	}
+	if rulefield.RenderPort(r.Proto, r.PortRange) == nil && rulefield.RendersPort(r.Proto) && r.PortRange != "" {
+		field("port", r.PortRange, rulefield.RelationalMisuse("port", r.PortRange))
+		field("port", r.PortRange, rulefield.PortUnresolvable(r.Proto, r.PortRange))
+	}
+	if rulefield.RenderProto(r.Proto) == nil && rulefield.RendersProto(r.Proto) {
+		field("proto", r.Proto, rulefield.RelationalMisuse("proto", r.Proto))
+		field("proto", r.Proto, rulefield.ProtoUnresolvable(strings.ToLower(r.Proto)))
+	}
+	if rulefield.RenderCIDR(r.CIDR) == nil && !isIPv6Literal(r.CIDR) && !strings.Contains(r.CIDR, "@") {
+		field("cidr", r.CIDR, rulefield.RelationalMisuse("cidr", r.CIDR))
+		field("cidr", r.CIDR, rulefield.CIDRUnloadable(r.CIDR))
+	}
 	if name, op, ok := rulefield.SetRefOp(r.CIDR); ok {
 		if !rulefield.SetRefOpOK(op) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
 		}
-		if err := rulefield.RenderSetName(name); err != nil {
+		if err := userSetName(name); err != nil {
 			reasons = append(reasons, err.Error())
 		} else if base, isComp := strings.CutSuffix(name, ipv6SetSuffix); isComp && q.v6Sets[base] && !q.knownSets[name] {
 			reasons = append(reasons, fmt.Sprintf("cidr %q names the IPv6 companion of set %q; reference the set itself", r.CIDR, base))
@@ -236,23 +264,34 @@ func (q *quarantine) sets() []IPSet {
 }
 
 // quarantineIPSets returns the ip sets the plan renders: each without the
-// elements that cannot be rendered, and none whose name cannot be.
+// elements that cannot be rendered, and none whose name cannot be, nor one
+// named as the IPv6 companion of a set with IPv6 elements.
 //
 // degraded names the sets that lost an element: a negated reference to one is
 // not rendered (quarantine.negatedMissing).
 func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, degraded map[string]bool) {
 	degraded = map[string]bool{}
+	var ids []string // out[i]'s row id
 	for _, s := range sets {
-		if err := rulefield.RenderSetName(s.Name); err != nil {
+		if err := userSetName(s.Name); err != nil {
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: err.Error(), Handling: HandlingSetLeftOut})
 			continue
 		}
+		// The IPv6 elements render as the set <name>_v6, so they need that
+		// name to render too (a 253-byte name's companion is too long).
+		companion := rulefield.RenderSetName(s.Name + ipv6SetSuffix)
 		var keep []string
 		var bad []string
 		for _, e := range s.CIDRs {
 			err := rulefield.RenderSetElement(e)
 			if err == nil && isIPv6Literal(e) && !validAddrOrPrefix(e, true) {
 				err = fmt.Errorf("ip set element %q is not an IPv6 address or prefix", e)
+			}
+			if why := rulefield.SetElementUnloadable(e); err == nil && why != "" {
+				err = fmt.Errorf("ip set element %q: %s", e, why)
+			}
+			if err == nil && isIPv6Literal(e) && companion != nil {
+				err = fmt.Errorf("ip set element %q: the set's IPv6 companion cannot be named: %v", e, companion)
 			}
 			if err != nil {
 				bad = append(bad, err.Error())
@@ -268,6 +307,83 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 			degraded[s.Name] = true
 		}
 		out = append(out, IPSet{Name: s.Name, CIDRs: keep})
+		ids = append(ids, s.ID)
+	}
+	return leaveOutCompanionClashes(out, ids, inv, degraded)
+}
+
+// internalSetNames are the sets the renderer declares itself in the per-NIC
+// bridge table; internalSetPrefixes start the names of the ones it will
+// declare per object (lv_tg_<group>, tag groups). The inet table declares
+// none.
+var (
+	internalSetNames    = map[string]bool{setNICDevs: true, setVLANOK: true, setDHCPSrv: true, setGateways4: true, setGateways6: true, setLB4: true, setLBSrc4: true}
+	internalSetPrefixes = []string{"lv_tg_"}
+)
+
+// userSetName is why a stored user set, or a rule's reference to one, cannot
+// be rendered: nft cannot read the name (rulefield.RenderSetName), or it is a
+// name of the renderer's own sets. A user set of that name would merge into
+// the internal one (lv_gw4: guests may reach its addresses for DHCP and DNS)
+// or, typed differently, make nft refuse the bridge table. Any other lv_
+// name, which writers refuse now but a main-era cluster may hold, renders as
+// it did (review I-5): a deny rule on it keeps denying.
+func userSetName(name string) error {
+	if err := rulefield.RenderSetName(name); err != nil {
+		return err
+	}
+	collides := internalSetNames[name]
+	for _, p := range internalSetPrefixes {
+		collides = collides || strings.HasPrefix(name, p)
+	}
+	if collides {
+		return &rulefield.FieldError{Field: "ipset name", Value: name,
+			Reason: "it is the name of one of litevirt's internal sets, which the prefix \"lv_\" is reserved for; recreate the set under another name"}
+	}
+	return nil
+}
+
+// leaveOutCompanionClashes leaves out every set row named <x>_v6 while a set
+// x that renders holds IPv6 elements (fw-grammar re-review 3 N-2): x's IPv6
+// elements render as the set <x>_v6, and nft refuses the whole ruleset over a
+// second set of that name. Shorter names are settled first, so a row left out
+// here never makes its own companion clash.
+func leaveOutCompanionClashes(sets []IPSet, ids []string, inv []InvalidRow, degraded map[string]bool) ([]IPSet, []InvalidRow, map[string]bool) {
+	v6 := setsWithIPv6(sets)
+	names := make([]string, 0, len(sets))
+	seen := map[string]bool{}
+	for _, s := range sets {
+		if !seen[s.Name] {
+			seen[s.Name] = true
+			names = append(names, s.Name)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if len(names[i]) != len(names[j]) {
+			return len(names[i]) < len(names[j])
+		}
+		return names[i] < names[j]
+	})
+	kept := map[string]bool{}
+	clashes := map[string]string{} // left-out name → the set whose companion it is
+	for _, n := range names {
+		if base, ok := strings.CutSuffix(n, ipv6SetSuffix); ok && kept[base] && v6[base] {
+			clashes[n] = base
+			continue
+		}
+		kept[n] = true
+	}
+	if len(clashes) == 0 {
+		return sets, inv, degraded
+	}
+	out := sets[:0:0]
+	for i, s := range sets {
+		if base, ok := clashes[s.Name]; ok {
+			inv = append(inv, InvalidRow{Table: "ip_sets", ID: ids[i], Handling: HandlingSetLeftOutCompanion,
+				Reason: fmt.Sprintf("ip set %q holds IPv6 elements, which render as the set %q", base, s.Name)})
+			continue
+		}
+		out = append(out, s)
 	}
 	return out, inv, degraded
 }

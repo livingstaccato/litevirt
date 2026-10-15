@@ -158,7 +158,7 @@ func (e *startInFlightError) Error() string {
 	}
 	return fmt.Sprintf("start %q: libvirt has not answered the start it was asked for at %s (%s ago). "+
 		"The start was not cancelled and still holds the VM; this daemon records its outcome when libvirt "+
-		"answers, unless the daemon restarts first. Check `lv inspect %s` and `lv events %s`",
+		"answers (if the daemon restarts first, the VM is recorded running once libvirt has started it). Check `lv inspect %s` and `lv events %s`",
 		e.name, e.since.UTC().Format(time.RFC3339), time.Since(e.since).Round(time.Second), e.name, e.name)
 }
 
@@ -567,7 +567,15 @@ func (h *heldForStart) release() {
 // startHeldDetail is the state detail of a VM's row while a start libvirt has
 // not answered within its wait goes on.
 func startHeldDetail(since time.Time) string {
-	return fmt.Sprintf("operator start: libvirt has not answered the start asked for at %s", since.UTC().Format(time.RFC3339))
+	return health.HeldStartDetail(since)
+}
+
+// HasStartInFlight reports whether a start of name this daemon asked libvirt
+// for has not settled yet: a held start's lease is then its own, and the
+// reconciler does not take it over (health.SetHeldStartProbe).
+func (s *Server) HasStartInFlight(name string) bool {
+	_, ok := s.startFlightOf(name)
+	return ok
 }
 
 // defaultStartLeaseRenewEvery is how often a held start re-takes the VM's
@@ -669,6 +677,32 @@ func (s *Server) unmarkStartHeld(ctx context.Context, name string, flight *start
 	flight.marked = false
 }
 
+// startConnectionLost reports whether a start's error is the daemon's
+// connection to libvirtd going away under it (or the client being closed),
+// not libvirt's answer to the start.
+func (s *Server) startConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	if c, ok := s.virt.(interface{ Closing() bool }); ok && c.Closing() {
+		return true
+	}
+	return lv.IsConnectionLost(err)
+}
+
+// abandonStartHeld ends what markStartHeld began without recording anything:
+// the lease renewal stops, and the row and the lease are left as they are
+// (startConnectionLost).
+func (s *Server) abandonStartHeld(name string, flight *startFlight) {
+	flight.mu.Lock()
+	defer flight.mu.Unlock()
+	if !flight.marked {
+		return
+	}
+	close(flight.stopRenew)
+	flight.marked = false
+}
+
 // startDomainWithin asks libvirt to start name and waits up to wait for its
 // answer, which finish records. When libvirt has not answered by then, the
 // start goes on: its answer is recorded by finish when it comes, under a
@@ -706,6 +740,18 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 			// the row already says what the cancel wrote.
 			finishCancelled(bg, startErr, flight.since, cancelled)
 			s.unmarkStartHeld(bg, name, flight, false)
+			return
+		}
+		if s.startConnectionLost(startErr) {
+			// The daemon's connection went away under the start (Close
+			// at shutdown closes it): that is not libvirt's answer, which
+			// libvirtd still gives. Nothing is recorded, the row is left
+			// starting and the lease standing, for the restarted daemon's
+			// reconciler to take over once the domain runs
+			// (health/held_start_orphan.go).
+			slog.Warn("StartVM: the connection to libvirtd closed under a held start; its outcome is left to the restarted daemon",
+				"vm", name, "error", startErr)
+			s.abandonStartHeld(name, flight)
 			return
 		}
 		_, err := finish(bg, startErr)

@@ -65,9 +65,9 @@ func TestFleet_OperationReap_ConcurrentReapsConverge(t *testing.T) {
 	// a and b reap before either hears of the other's reap. Negative retention
 	// puts the cutoff in the future, as in opjournal_recovery_test.go.
 	for _, n := range []*Node{a, b} {
-		reaped, err := corrosion.ReapTerminalOperations(ctx, n.DB, -time.Minute)
-		if err != nil {
-			t.Fatalf("reap on %s: %v", n.Name, err)
+		reaped, failed, err := corrosion.ReapTerminalOperations(ctx, n.DB, -time.Minute)
+		if err != nil || len(failed) != 0 {
+			t.Fatalf("reap on %s: %v (failed: %v)", n.Name, err, failed)
 		}
 		if reaped != len(ops) {
 			t.Fatalf("reap on %s reaped %d operations, want %d", n.Name, reaped, len(ops))

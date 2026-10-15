@@ -52,7 +52,7 @@ func TestNICHotplug_RebuildsTheSeed(t *testing.T) {
 			s := hotplugDiskServer(t)
 			setDeviceGate(s, true, latched)
 			ctx := adminCtx()
-			spec := &pb.VMSpec{Name: "hp", Cpu: 2, MemoryMib: 4096,
+			spec := &pb.VMSpec{Name: "hp", Uuid: "uuid-hp", Cpu: 2, MemoryMib: 4096,
 				CloudInit: &pb.CloudInitSpec{Userdata: userData},
 				Network: []*pb.NetworkAttachment{
 					{Name: "lan", Mac: macA, Ip: "10.9.0.50"},
@@ -79,12 +79,15 @@ func TestNICHotplug_RebuildsTheSeed(t *testing.T) {
 			fake := s.virt.(*libvirtfake.Fake)
 			fake.SetState("hp", libvirtfake.StateRunning)
 			iso := lv.CloudInitISOPath(s.dataDir, "hp")
-			nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, "hp", spec)
+			nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, "hp", spec, nil)
 			if err != nil || !strings.Contains(nc, macA) {
 				t.Fatalf("create-time network-config: %v\n%s", err, nc)
 			}
 			if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "hp-first", LocalHostname: "hp",
 				UserData: userData, NetworkConfig: nc}, iso); err != nil {
+				t.Fatal(err)
+			}
+			if err := cloudinit.StampSeed(iso, "uuid-hp"); err != nil {
 				t.Fatal(err)
 			}
 			read := func() cloudinit.Seed {
@@ -162,7 +165,7 @@ func hpSeededVM(t *testing.T, s *Server, state string) string {
 	t.Helper()
 	ctx := adminCtx()
 	const mac = "52:54:00:5e:02:01"
-	spec := &pb.VMSpec{Name: "hp", Cpu: 2, MemoryMib: 4096, Network: []*pb.NetworkAttachment{{Name: "lan", Mac: mac}}}
+	spec := &pb.VMSpec{Name: "hp", Uuid: "uuid-hp", Image: "ubuntu", Cpu: 2, MemoryMib: 4096, Network: []*pb.NetworkAttachment{{Name: "lan", Mac: mac}}}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
 		Name: "hp", HostName: "test-host", State: state, CPUActual: 2, MemActual: 4096, Spec: seedSpecJSON(t, spec),
 	}, []corrosion.InterfaceRecord{{VMName: "hp", NetworkName: "lan", MAC: mac}}, nil,
@@ -174,6 +177,9 @@ func hpSeededVM(t *testing.T, s *Server, state string) string {
 	}
 	iso := lv.CloudInitISOPath(s.dataDir, "hp")
 	if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "hp", LocalHostname: "hp"}, iso); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudinit.StampSeed(iso, "uuid-hp"); err != nil {
 		t.Fatal(err)
 	}
 	return iso

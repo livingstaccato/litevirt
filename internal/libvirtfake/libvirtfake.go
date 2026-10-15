@@ -1636,7 +1636,7 @@ func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
 
 // ReloadCDROMMedia records a live media reload of the domain's cdrom whose
 // source is path ("reload-cdrom", note "path=<path>"). Like libvirt, it
-// refuses a domain that is not running.
+// refuses a domain that is not active (running or paused).
 func (f *Fake) ReloadCDROMMedia(domainName, path string) error {
 	if f.FailReloadCDROM != nil {
 		if err := f.FailReloadCDROM(domainName, path); err != nil {
@@ -1645,8 +1645,8 @@ func (f *Fake) ReloadCDROMMedia(domainName, path string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.domains[domainName] != StateRunning {
-		return fmt.Errorf("domain %s is not running", domainName)
+	if st := f.domains[domainName]; st != StateRunning && st != StatePaused {
+		return fmt.Errorf("domain %s is not active", domainName)
 	}
 	f.record("reload-cdrom", domainName, "path="+path)
 	return nil

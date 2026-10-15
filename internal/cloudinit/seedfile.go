@@ -185,10 +185,14 @@ func rockRidgeName(su []byte) string {
 // user-data over vendor-data, so `updates:` in the user-data wins.
 const NetworkUpdatesVendorData = "#cloud-config\nupdates:\n  network:\n    when: [boot-new-instance, boot, hotplug]\n"
 
-// SeedVendorData is the vendor-data of spec's seed: NetworkUpdatesVendorData
-// when litevirt writes its network-config, none when the spec names its own.
-func SeedVendorData(spec *pb.VMSpec) string {
-	if spec.GetCloudInit().GetNetworkconfig() != "" {
+// SeedVendorData is the vendor-data of a seed whose network-config is
+// networkConfig, for a VM with spec (nil for one whose network-config is
+// litevirt's by construction, a clone's): NetworkUpdatesVendorData when
+// litevirt writes that network-config, none when the spec names its own or
+// there is none — a VM litevirt writes none for boots on cloud-init's
+// fallback, which is not re-rendered on every boot.
+func SeedVendorData(spec *pb.VMSpec, networkConfig string) string {
+	if spec.GetCloudInit().GetNetworkconfig() != "" || networkConfig == "" {
 		return ""
 	}
 	return NetworkUpdatesVendorData

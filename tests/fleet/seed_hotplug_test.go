@@ -108,11 +108,14 @@ func seedFollowsNICHotplug(t *testing.T, latched bool) {
 	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 		t.Fatal(err)
 	}
-	nc, err := cloudinit.SeedNetworkConfig(ctx, src.DB, "sh", &spec)
+	nc, err := cloudinit.SeedNetworkConfig(ctx, src.DB, "sh", &spec, nil)
 	if err != nil || !strings.Contains(nc, "10.61.0.50/24") {
 		t.Fatalf("create-time network-config: %v\n%s", err, nc)
 	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{InstanceID: "sh", LocalHostname: "sh", UserData: userData, NetworkConfig: nc}, srcISO); err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudinit.StampSeed(srcISO, cloudinit.SpecUUID(vm.Spec)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,8 +144,13 @@ func seedFollowsNICHotplug(t *testing.T, latched bool) {
 		if !strings.Contains(got, macD) || !strings.Contains(got, strings.ToLower(b.MAC)) || strings.Count(got, "macaddress:") != 2 {
 			t.Errorf("%s: want exactly D and the attached B (%s):\n%s", where, b.MAC, got)
 		}
-		if !strings.Contains(got, strings.ToLower(b.MAC)+"\"\n    set-name: eth1\n    dhcp4: true\n    dhcp4-overrides:\n      route-metric: 101\n      use-routes: false\n") {
-			t.Errorf("%s: the isolated NIC takes routes from its lease:\n%s", where, got)
+		// B was attached while A (eth0) and D (eth1) were there: it took
+		// eth2, and keeps it after A's detach; D keeps eth1 (review I-1).
+		if !strings.Contains(got, strings.ToLower(b.MAC)+"\"\n    set-name: eth2\n    dhcp4: true\n    dhcp4-overrides:\n      route-metric: 101\n      use-routes: false\n") {
+			t.Errorf("%s: the isolated NIC is not eth2, or takes routes from its lease:\n%s", where, got)
+		}
+		if !strings.Contains(got, macD+"\"\n    set-name: eth1\n") {
+			t.Errorf("%s: D was renamed:\n%s", where, got)
 		}
 	}
 	assertSeed("owner after attach and detach", srcISO)

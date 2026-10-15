@@ -89,7 +89,7 @@ func TestDomainXMLFor_RebuildsTheCreatedSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no seed rebuilt: %v", err)
 	}
-	want, err := cloudinit.SeedNetworkConfig(ctx, db, "vm1", spec)
+	want, err := cloudinit.SeedNetworkConfig(ctx, db, "vm1", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,8 @@ func TestDomainXMLFor_UnreadableNetworkConfigIsRetried(t *testing.T) {
 
 // Round 1: a failover's rebuilt seed carries the vendor-data that has
 // cloud-init apply the network-config again on boot, as the created seed
-// does, unless the spec names its own network-config.
+// does, unless the spec names its own network-config. Two NICs, so litevirt
+// writes a network-config (a VM it writes none for gets no vendor-data).
 //
 // Mutation: drop VendorData from the reconciler's GenerateISO — red; write it
 // for a spec network-config too — the override case goes red.
@@ -160,12 +161,18 @@ if [ -f "$src/vendor-data" ]; then cat "$src/vendor-data" > "$out"; else printf 
 	db := testReconcilerDB(t)
 	ctx := context.Background()
 	r, _, _ := sharedDiskReconciler(t, db)
+	r.SetNetworkProvision(func(context.Context, *corrosion.Client, string, compose.NetworkDef, string, string) (string, error) {
+		return "", nil
+	})
 	for vm, override := range map[string]string{"vm1": "", "vm2": "version: 1\nconfig: []\n"} {
+		macs := map[string][2]string{"vm1": {"52:54:00:ab:00:01", "52:54:00:ab:00:02"}, "vm2": {"52:54:00:ab:00:03", "52:54:00:ab:00:04"}}[vm]
 		spec := &pb.VMSpec{Name: vm, Cpu: 1, MemoryMib: 512, Image: "ubuntu",
-			CloudInit: &pb.CloudInitSpec{Networkconfig: override}}
+			CloudInit: &pb.CloudInitSpec{Networkconfig: override},
+			Network:   []*pb.NetworkAttachment{{Name: "na", Mac: macs[0]}, {Name: "nb", Mac: macs[1]}}}
 		specJSON, _ := json.Marshal(spec)
 		rec := corrosion.VMRecord{Name: vm, HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
-		if err := corrosion.InsertVM(ctx, db, rec, nil, nil); err != nil {
+		if err := corrosion.InsertVM(ctx, db, rec, []corrosion.InterfaceRecord{
+			{VMName: vm, NetworkName: "na", MAC: macs[0]}, {VMName: vm, NetworkName: "nb", Ordinal: 1, MAC: macs[1]}}, nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, failure := r.domainXMLFor(ctx, rec, spec, nil); failure != "" {
@@ -183,5 +190,74 @@ if [ -f "$src/vendor-data" ]; then cat "$src/vendor-data" > "$out"; else printf 
 		if string(b) != want {
 			t.Errorf("%s: vendor-data = %q, want %q", vm, b, want)
 		}
+	}
+}
+
+// Review C-1 (failover): a VM whose NICs cannot be told from its spec (a
+// MAC-less spec entry, and a different NIC at its position) gets a seed with
+// no network-config and no vendor-data — nothing that would re-render
+// cloud-init's fallback at every boot — and an event saying why. The start is
+// not retried for it.
+//
+// Mutation: treat the ambiguous result as a read failure — the start is
+// retried and no seed is written; add the vendor-data anyway — red.
+func TestDomainXMLFor_AmbiguousNICsWriteNoNetworkConfig(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+out=""; src=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -output) out="$2"; shift ;;
+    -volid) shift ;;
+    -*) ;;
+    *) src="$1" ;;
+  esac
+  shift
+done
+{ if [ -f "$src/network-config" ]; then echo "nc"; fi; if [ -f "$src/vendor-data" ]; then echo "vd"; fi; echo end; } > "$out"
+`
+	if err := os.WriteFile(filepath.Join(dir, "genisoimage"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	r, _, _ := sharedDiskReconciler(t, db)
+	r.SetNetworkProvision(func(context.Context, *corrosion.Client, string, compose.NetworkDef, string, string) (string, error) {
+		return "", nil
+	})
+	spec := &pb.VMSpec{Name: "vm1", Cpu: 1, MemoryMib: 512, Image: "ubuntu",
+		Network: []*pb.NetworkAttachment{{Name: "n0", Ip: "10.0.0.10"}, {Name: "n1", Ip: "10.1.0.50"}}}
+	specJSON, _ := json.Marshal(spec)
+	vm := corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: string(specJSON), State: "running", CPUActual: 1, MemActual: 512}
+	if err := corrosion.InsertVM(ctx, db, vm, []corrosion.InterfaceRecord{
+		{VMName: "vm1", NetworkName: "n0", MAC: "52:54:00:aa:00:01", IP: "10.0.0.77"}, // not the spec's .10
+		{VMName: "vm1", NetworkName: "n1", Ordinal: 1, MAC: "52:54:00:aa:00:02", IP: "10.1.0.50"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, failure := r.domainXMLFor(ctx, vm, spec, nil); failure != "" {
+		t.Fatalf("domainXMLFor: %s", failure)
+	}
+	iso, _ := lv.SafeCloudInitISOPath(r.dataDir, "vm1")
+	b, err := os.ReadFile(iso)
+	if err != nil {
+		t.Fatalf("no seed written: %v", err)
+	}
+	if string(b) != "end\n" {
+		t.Errorf("seed carries %q, want neither network-config nor vendor-data", b)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, db, "vm1", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.Type == "seed.not_rebuilt" && strings.Contains(e.Detail, "MAC") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no seed.not_rebuilt event: %+v", evs)
 	}
 }

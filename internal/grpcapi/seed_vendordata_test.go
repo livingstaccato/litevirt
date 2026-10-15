@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -58,13 +59,15 @@ func seedVendorData(t *testing.T, s *Server, vm string) string {
 // Mutation: drop VendorData from either CreateVM seed — that case goes red;
 // from CloneVM — the clone goes red; from EnsureCloudInit — the migration
 // case goes red; write it for a spec network-config too — the override cases
-// go red.
+// go red; write it with no network-config — the one-NIC case goes red.
 func TestSeeds_CarryTheNetworkUpdatesVendorData(t *testing.T) {
-	s := netcfgServer(t, map[string]compose.NetworkDef{"brnet": defBridgeDHCP})
+	s := netcfgServer(t, map[string]compose.NetworkDef{"brnet": defBridgeDHCP, "brnet2": {Type: "bridge", Subnet: "172.41.0.0/24", DHCP: true}})
 	stageVendorDataGenisoimage(t)
 	ctx := adminCtx()
+	// Two NICs: litevirt writes a network-config for them (one DHCP NIC gets
+	// none, and no vendor-data either: review m1).
 	nic := func(mac string) []*pb.NetworkAttachment {
-		return []*pb.NetworkAttachment{{Name: "brnet", Model: "virtio", Mac: mac}}
+		return []*pb.NetworkAttachment{{Name: "brnet", Model: "virtio", Mac: mac}, {Name: "brnet2", Model: "virtio", Mac: strings.Replace(mac, ":21:", ":2f:", 1)}}
 	}
 
 	auto := seedCreateRequest(t, s, "auto", "")
@@ -74,6 +77,8 @@ func TestSeeds_CarryTheNetworkUpdatesVendorData(t *testing.T) {
 	own := seedCreateRequest(t, s, "own", "#cloud-config\n{}\n")
 	own.Spec.Network = nic("52:54:00:00:21:03")
 	own.Spec.CloudInit.Networkconfig = "version: 1\nconfig: []\n"
+	one := seedCreateRequest(t, s, "one", "")
+	one.Spec.Network = []*pb.NetworkAttachment{{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:21:05"}}
 	for _, tc := range []struct {
 		req  *pb.CreateVMRequest
 		want string
@@ -81,6 +86,7 @@ func TestSeeds_CarryTheNetworkUpdatesVendorData(t *testing.T) {
 		{auto, cloudinit.NetworkUpdatesVendorData},
 		{ud, cloudinit.NetworkUpdatesVendorData},
 		{own, noVendorData},
+		{one, noVendorData},
 	} {
 		if _, err := s.CreateVM(ctx, tc.req); err != nil {
 			t.Fatalf("CreateVM %s: %v", tc.req.Spec.Name, err)
@@ -103,7 +109,8 @@ func TestSeeds_CarryTheNetworkUpdatesVendorData(t *testing.T) {
 		Network:   nic("52:54:00:00:21:04")})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{Name: "src", HostName: "test-host", State: "stopped", Spec: string(specJSON)},
-		[]corrosion.InterfaceRecord{{VMName: "src", NetworkName: "brnet", MAC: "52:54:00:00:21:04"}},
+		[]corrosion.InterfaceRecord{{VMName: "src", NetworkName: "brnet", MAC: "52:54:00:00:21:04"},
+			{VMName: "src", NetworkName: "brnet2", Ordinal: 1, MAC: "52:54:00:00:2f:04"}},
 		[]corrosion.DiskRecord{{VMName: "src", DiskName: "root", HostName: "test-host", Path: srcDisk, SizeBytes: 1 << 20, StorageType: "local"}},
 	); err != nil {
 		t.Fatal(err)

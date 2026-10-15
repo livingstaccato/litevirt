@@ -1212,13 +1212,17 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	if userData == "" {
 		userData = "#cloud-config\n{}\n"
 	}
-	// The vendor-data follows the VM's spec: the request does not say
-	// whether its network-config is litevirt's or the spec's own. A spec
-	// that cannot be read gets none.
+	// The vendor-data the source decided. A source from before the field
+	// sends none, and the target derives it from the VM's spec; a spec that
+	// cannot be read gets none.
 	vendorData := ""
-	var spec pb.VMSpec
-	if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
-		vendorData = cloudinit.SeedVendorData(&spec)
+	if req.Vendordata != nil {
+		vendorData = *req.Vendordata
+	} else {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
+			vendorData = cloudinit.SeedVendorData(&spec, req.Networkconfig)
+		}
 	}
 	if err := cloudinit.GenerateISO(cloudinit.Config{
 		InstanceID:    req.VmName,
@@ -2511,12 +2515,39 @@ func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRec
 	if spec.CloudInit != nil {
 		req.Userdata = spec.CloudInit.Userdata
 	}
-	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec)
-	if err != nil {
+	// The seed the VM runs on here: its NICs' guest names, and what is sent
+	// when the network-config cannot be derived. One stamped for another VM
+	// is not this VM's.
+	iso := lv.CloudInitISOPath(s.dataDir, vm.Name)
+	own, ownErr := cloudinit.ReadSeed(iso)
+	_, stamped, _ := cloudinit.SeedOwner(iso)
+	ours := ownErr == nil && (cloudinit.SeedIsFor(iso, cloudinit.SpecUUID(vm.Spec)) || !stamped)
+	var prior *cloudinit.Prior
+	if ours {
+		prior = cloudinit.PriorFrom(own.NetworkConfig)
+	}
+	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec, prior)
+	switch {
+	case errors.Is(err, cloudinit.ErrNICsAmbiguous):
+		// Which NIC is which cannot be told: the target gets this host's seed's
+		// network-config and vendor-data as they are, never a seed without
+		// network-config that cloud-init's update events would re-render.
+		var vd string
+		if ours {
+			nc, vd = own.NetworkConfig, own.VendorData
+		} else {
+			nc = ""
+		}
+		s.recordVMEventSeverity(ctx, vm.Name, "seed.not_rebuilt", "ok", "warning", fmt.Sprintf(
+			"the migration target's seed takes this host's network-config as it is: %v (the spec of a VM created before it recorded NIC MACs)", err))
+		req.Networkconfig, req.Vendordata = nc, &vd
+		return req
+	case err != nil:
 		slog.Warn("ensureCloudInitOnTarget: network-config could not be derived; no seed sent", "vm", vm.Name, "error", err)
 		return nil
 	}
-	req.Networkconfig = nc
+	vd := cloudinit.SeedVendorData(&spec, nc)
+	req.Networkconfig, req.Vendordata = nc, &vd
 	return req
 }
 

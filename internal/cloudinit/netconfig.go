@@ -29,6 +29,11 @@ type NIC struct {
 	Net *compose.NetworkDef
 	// Bound: the network is bound to a NetBox prefix, whose claim RecordedIP is.
 	Bound bool
+	// Name is the NIC's guest name, set-name in the document; "" names it by
+	// its place among the document's NICs, as create does. Unnamed matches it
+	// by MAC alone and renames nothing (see Prior).
+	Name    string
+	Unnamed bool
 }
 
 // NetworkConfig is the network-config litevirt writes into a VM's seed for
@@ -53,7 +58,7 @@ func NetworkConfig(nics []NIC) string {
 			// host-isolated network, which serves none, so there is nothing
 			// to configure.
 			dhcp := n.Net == nil || !n.Net.HostIsolation
-			guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, DHCP: dhcp,
+			guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, Name: n.Name, Unnamed: n.Unnamed, DHCP: dhcp,
 				DHCP6:    dhcp && (n.Net == nil || n.Net.Subnet == "" || subnetIsIPv6(n.Net.Subnet)),
 				NoRoutes: noRouter(n.Net)})
 			continue
@@ -73,8 +78,8 @@ func NetworkConfig(nics []NIC) string {
 		if address6 != "" && !strings.Contains(address6, "/") {
 			address6 += "/64"
 		}
-		guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, Static: &StaticIface{
-			MAC: n.MAC, Address: address, Gateway: gateway, DNS: dns,
+		guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, Name: n.Name, Unnamed: n.Unnamed, Static: &StaticIface{
+			MAC: n.MAC, Name: n.Name, Address: address, Gateway: gateway, DNS: dns,
 			Address6: address6, Gateway6: n.IPv6Gateway,
 		}, NoRoutes: n.Gateway == "" && noRouter(n.Net)})
 	}
@@ -102,7 +107,10 @@ func HostIsolatedAddressable(def *compose.NetworkDef) bool {
 
 // StaticIface is one NIC's static addressing in a network-config.
 type StaticIface struct {
-	MAC      string
+	MAC string
+	// Name is the guest name the V1 document gives it; "" is eth<its place
+	// among the static NICs>.
+	Name     string
 	Address  string // CIDR, e.g. "10.100.0.10/24"
 	Gateway  string
 	DNS      []string
@@ -114,6 +122,9 @@ type StaticIface struct {
 type GuestNIC struct {
 	Ordinal int
 	MAC     string
+	// Name and Unnamed are NIC's (see there).
+	Name    string
+	Unnamed bool
 	// Static is the NIC's static addressing, or nil when it has none.
 	Static *StaticIface
 	// DHCP: the NIC has no static address and asks DHCP for one. A NIC that
@@ -143,8 +154,9 @@ type GuestNIC struct {
 // every NIC by MAC (guestNetworkConfigV2).
 func GuestNetworkConfig(nics []GuestNIC) string {
 	var statics []StaticIface
-	dhcp := 0
+	dhcp, unnamed := 0, false
 	for _, n := range nics {
+		unnamed = unnamed || n.Unnamed
 		switch {
 		case n.Static != nil:
 			statics = append(statics, *n.Static)
@@ -152,7 +164,8 @@ func GuestNetworkConfig(nics []GuestNIC) string {
 			dhcp++
 		}
 	}
-	if dhcp == 0 {
+	// A V1 entry always names its device; a NIC matched by MAC alone needs V2.
+	if dhcp == 0 && !unnamed {
 		return BuildV1(statics)
 	}
 	if len(statics) == 0 && len(nics) <= 1 {
@@ -181,7 +194,18 @@ func guestNetworkConfigV2(nics []GuestNIC) string {
 		}
 		optional := !first
 		first = false
-		fmt.Fprintf(&b, "  eth%d:\n    match:\n      macaddress: %q\n    set-name: eth%d\n", n.Ordinal, n.MAC, n.Ordinal)
+		switch {
+		case n.Unnamed:
+			// Matched by MAC alone: cloud-init configures the device it finds
+			// with that MAC under the name it has (network_state, LP #1855945).
+			fmt.Fprintf(&b, "  nic%s:\n    match:\n      macaddress: %q\n", strings.ReplaceAll(strings.ToLower(n.MAC), ":", ""), n.MAC)
+		default:
+			name := n.Name
+			if name == "" {
+				name = fmt.Sprintf("eth%d", n.Ordinal)
+			}
+			fmt.Fprintf(&b, "  %s:\n    match:\n      macaddress: %q\n    set-name: %s\n", name, n.MAC, name)
+		}
 		if n.DHCP {
 			noRoutes := ""
 			if n.NoRoutes {
@@ -246,7 +270,11 @@ func BuildV1(ifaces []StaticIface) string {
 	}
 	cfg := "version: 1\nconfig:\n"
 	for i, iface := range ifaces {
-		cfg += fmt.Sprintf("  - type: physical\n    name: eth%d\n    mac_address: %q\n    subnets:\n", i, iface.MAC)
+		name := iface.Name
+		if name == "" {
+			name = fmt.Sprintf("eth%d", i)
+		}
+		cfg += fmt.Sprintf("  - type: physical\n    name: %s\n    mac_address: %q\n    subnets:\n", name, iface.MAC)
 		if iface.Address != "" {
 			cfg += fmt.Sprintf("      - type: static\n        address: %s\n", iface.Address)
 			if iface.Gateway != "" {

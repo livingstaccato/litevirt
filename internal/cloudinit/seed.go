@@ -3,9 +3,12 @@ package cloudinit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -27,7 +30,7 @@ import (
 // ordinal with one that stayed. For a VM no NIC was attached to or detached
 // from, position is ordinal is spec index, so the document is the one create
 // wrote.
-func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec) (string, error) {
+func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec, prior *Prior) (string, error) {
 	if spec == nil {
 		return "", nil
 	}
@@ -92,7 +95,8 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 	}
 	for i, n := range spec.Network {
 		if !used[i] && strings.TrimSpace(n.GetMac()) == "" && unmatched[pos{i, n.GetName()}] {
-			return "", nil
+			return "", fmt.Errorf("%w: spec NIC %d (network %q) records no MAC, and the NIC at its position records another address",
+				ErrNICsAmbiguous, i, n.GetName())
 		}
 	}
 	nics := make([]NIC, 0, len(rows))
@@ -118,6 +122,7 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 			Net:        def, Bound: bound,
 		})
 	}
+	prior.name(nics)
 	return NetworkConfig(nics), nil
 }
 
@@ -163,4 +168,106 @@ func NetworkDef(ctx context.Context, db *corrosion.Client, name string) (*compos
 	}
 	def.Type = rows[0].String("type")
 	return &def, nil
+}
+
+// ErrNICsAmbiguous is SeedNetworkConfig's answer when a spec NIC that
+// records no MAC (a VM created before the spec recorded generated MACs)
+// cannot be told from the NIC row at its position. There is then no
+// network-config litevirt can stand behind, and a caller keeps the seed it has
+// rather than writing one without it: a seed with no network-config is
+// cloud-init's fallback, DHCP on one NIC, which re-applied at the next boot
+// loses every static address.
+var ErrNICsAmbiguous = errors.New("the VM's NICs cannot all be told from its spec")
+
+// Prior is what the seed a rebuild replaces says about the guest's NIC names.
+// A NIC's guest name never changes once a seed gave it one: cloud-init renames
+// NICs by the seed on every boot it applies it, and a rename breaks whatever
+// in the guest names the interface.
+type Prior struct {
+	// Names maps a folded MAC to the name the seed's network-config gives it,
+	// "" for an entry that matches it by MAC with no set-name. A MAC that is
+	// not a key had no entry.
+	Names map[string]string
+	// Added are the folded MACs of NICs attached since that seed was written.
+	Added map[string]bool
+}
+
+// PriorFrom reads the guest names of networkConfig, a seed's network-config
+// ("" for a seed with none: every NIC named by the guest's kernel), with
+// added the MACs of NICs attached since. A document it cannot read names
+// nothing.
+func PriorFrom(networkConfig string, added ...string) *Prior {
+	p := &Prior{Names: map[string]string{}, Added: map[string]bool{}}
+	for _, m := range added {
+		p.Added[strings.ToLower(strings.TrimSpace(m))] = true
+	}
+	var doc struct {
+		Version int `yaml:"version"`
+		Config  []struct {
+			Type       string `yaml:"type"`
+			Name       string `yaml:"name"`
+			MACAddress string `yaml:"mac_address"`
+		} `yaml:"config"`
+		Ethernets map[string]struct {
+			Match struct {
+				MACAddress string `yaml:"macaddress"`
+			} `yaml:"match"`
+			SetName string `yaml:"set-name"`
+		} `yaml:"ethernets"`
+	}
+	if networkConfig == "" || yaml.Unmarshal([]byte(networkConfig), &doc) != nil {
+		return p
+	}
+	for _, c := range doc.Config {
+		if c.Type == "physical" && c.MACAddress != "" {
+			p.Names[strings.ToLower(c.MACAddress)] = c.Name
+		}
+	}
+	for _, e := range doc.Ethernets {
+		if e.Match.MACAddress != "" {
+			p.Names[strings.ToLower(e.Match.MACAddress)] = e.SetName
+		}
+	}
+	return p
+}
+
+// name gives nics, in position order, the guest names p says they have. A NIC
+// the prior seed names keeps its name; one it matched by MAC alone, or did
+// not list and was not attached since, stays unnamed — matched by MAC, under
+// whatever name the guest gave it. A NIC attached since takes the lowest
+// eth<n> no other NIC holds, counting each unnamed NIC as holding one, so a
+// guest that names its NICs eth<n> itself (net.ifnames=0) has no clash. With
+// no prior (nil) the NICs are named by position, as create names them.
+func (p *Prior) name(nics []NIC) {
+	if p == nil {
+		return
+	}
+	used := map[string]bool{}
+	unnamed := 0
+	var added []int
+	for k := range nics {
+		mac := strings.ToLower(nics[k].MAC)
+		name, listed := p.Names[mac]
+		switch {
+		case listed && name != "":
+			nics[k].Name = name
+			used[name] = true
+		case !listed && p.Added[mac]:
+			added = append(added, k)
+		default:
+			nics[k].Unnamed = true
+			unnamed++
+		}
+	}
+	for i := 0; i < unnamed; i++ {
+		used[fmt.Sprintf("eth%d", i)] = true
+	}
+	for _, k := range added {
+		for i := 0; ; i++ {
+			if n := fmt.Sprintf("eth%d", i); !used[n] {
+				nics[k].Name, used[n] = n, true
+				break
+			}
+		}
+	}
 }

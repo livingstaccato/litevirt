@@ -108,7 +108,7 @@ func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 			hotAttachRows(t, db, latched, "isonet", "52:54:00:00:0c:0c", 2)
 			hotDetachRows(t, db, latched, "52:54:00:00:0a:0a")
 
-			got, err := SeedNetworkConfig(ctx, db, "hp", spec)
+			got, err := SeedNetworkConfig(ctx, db, "hp", spec, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -132,10 +132,11 @@ func TestSeedNetworkConfig_FollowsHotplug(t *testing.T) {
 	}
 }
 
-// A NIC attached on a hardware_v2 cluster can share its ordinal with a NIC
-// that stayed (attach numbers it by the count of NICs left after a detach).
-// Every live NIC still gets its own name, in ordinal order, MAC breaking a
-// tie, so no two entries rename to the same eth<n>.
+// A NIC attached by an earlier build can share its ordinal with a NIC that
+// stayed (attach numbered by the count of NICs left after a detach). Without a
+// prior seed (a rebuild where none is readable) every live NIC still gets its
+// own name, in ordinal order, MAC breaking a tie, so no two entries rename to
+// the same eth<n>.
 //
 // Mutation: name each entry by its row's ordinal — eth1 twice.
 func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
@@ -143,7 +144,7 @@ func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 	ctx := context.Background()
 	hotDetachRows(t, db, true, "52:54:00:00:0a:0a")
 	hotAttachRows(t, db, true, "dnet", "52:54:00:00:0c:0c", 1) // shares B's ordinal 1
-	got, err := SeedNetworkConfig(ctx, db, "hp", spec)
+	got, err := SeedNetworkConfig(ctx, db, "hp", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func TestSeedNetworkConfig_SharedOrdinalGetsItsOwnName(t *testing.T) {
 func TestSeedNetworkConfig_KeptNICKeepsItsSpecAddress(t *testing.T) {
 	db, spec := hotplugSeedDB(t)
 	hotAttachRows(t, db, true, "dnet", "52:54:00:00:0c:0c", 2)
-	got, err := SeedNetworkConfig(context.Background(), db, "hp", spec)
+	got, err := SeedNetworkConfig(context.Background(), db, "hp", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,16 +293,26 @@ func TestReadSeed_RefusesANonISO(t *testing.T) {
 // merged over vendor-data, can still say otherwise.
 //
 // Mutation: return the vendor-data for a spec network-config too — red;
-// return none for a derived one — red.
+// return none for a derived one — red; return it with no network-config —
+// the m1 case goes red.
 func TestSeedVendorData(t *testing.T) {
-	if got := SeedVendorData(&pb.VMSpec{}); got != NetworkUpdatesVendorData {
+	const nc = "version: 2\nethernets: {}\n"
+	if got := SeedVendorData(&pb.VMSpec{}, nc); got != NetworkUpdatesVendorData {
 		t.Errorf("derived network-config: vendor-data = %q", got)
 	}
-	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n"}}); got != NetworkUpdatesVendorData {
+	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n"}}, nc); got != NetworkUpdatesVendorData {
 		t.Errorf("user-data only: vendor-data = %q", got)
 	}
-	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Networkconfig: "version: 2\n"}}); got != "" {
+	if got := SeedVendorData(nil, nc); got != NetworkUpdatesVendorData {
+		t.Errorf("no spec (a clone's own network-config): vendor-data = %q", got)
+	}
+	if got := SeedVendorData(&pb.VMSpec{CloudInit: &pb.CloudInitSpec{Networkconfig: "version: 2\n"}}, "version: 2\n"); got != "" {
 		t.Errorf("the spec's own network-config: vendor-data = %q, want none", got)
+	}
+	// Review m1: litevirt writes no network-config (one DHCP NIC: cloud-init's
+	// fallback) — no vendor-data either.
+	if got := SeedVendorData(&pb.VMSpec{}, ""); got != "" {
+		t.Errorf("no network-config: vendor-data = %q, want none", got)
 	}
 	for _, want := range []string{"#cloud-config\n", "updates:\n  network:\n    when: [boot-new-instance, boot, hotplug]\n"} {
 		if !strings.Contains(NetworkUpdatesVendorData, want) {

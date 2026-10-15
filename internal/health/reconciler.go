@@ -2361,7 +2361,24 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		if userData == "" {
 			userData = "#cloud-config\n{}\n"
 		}
-		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec)
+		// The NICs' guest names come from a seed already here, whoever's: a
+		// name is only taken for a MAC this VM has.
+		var prior *cloudinit.Prior
+		if cur, err := cloudinit.ReadSeed(isoPath); err == nil {
+			prior = cloudinit.PriorFrom(cur.NetworkConfig)
+		}
+		netCfg, ncErr := cloudinit.SeedNetworkConfig(ctx, r.db, vm.Name, spec, prior)
+		if errors.Is(ncErr, cloudinit.ErrNICsAmbiguous) {
+			// No network-config litevirt can stand behind: the seed carries
+			// none, and no vendor-data to re-render cloud-init's fallback.
+			detail := fmt.Sprintf("the seed written on %s carries no network-config: %v (the spec of a VM created before it recorded NIC MACs); configure the VM's NICs in the guest", r.hostName, ncErr)
+			slog.Warn("reconciler: "+detail, "vm", vm.Name)
+			_ = corrosion.InsertVMEvent(ctx, r.db, corrosion.VMEventRecord{
+				ID: randid.New(), VMName: vm.Name, HostName: r.hostName, Type: "seed.not_rebuilt",
+				Result: "ok", Severity: "warning", Detail: detail, Username: "reconciler",
+			})
+			netCfg, ncErr = "", nil
+		}
 		if ncErr != nil {
 			slog.Warn("reconciler: cloud-init network-config could not be derived", "vm", vm.Name, "error", ncErr)
 			return "", true, fmt.Sprintf("derive cloud-init network-config: %v", ncErr) // transient DB
@@ -2371,7 +2388,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 			LocalHostname: vm.Name,
 			UserData:      userData,
 			NetworkConfig: netCfg,
-			VendorData:    cloudinit.SeedVendorData(spec),
+			VendorData:    cloudinit.SeedVendorData(spec, netCfg),
 		}, isoPath); genErr != nil {
 			slog.Warn("reconciler: cloud-init ISO generation failed", "vm", vm.Name, "error", genErr)
 		} else {

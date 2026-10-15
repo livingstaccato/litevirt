@@ -316,7 +316,7 @@ func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 			if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 				t.Fatal(err)
 			}
-			rebuilt, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec)
+			rebuilt, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -334,7 +334,7 @@ func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 			for _, n := range spec.Network {
 				n.Mac = ""
 			}
-			macless, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec)
+			macless, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, tc.name, &spec, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -363,7 +363,7 @@ func TestSeedNetworkConfig_SpecNICWithNoRowIsLeftOut(t *testing.T) {
 		&pb.NetworkAttachment{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:14:02"})
 	spec := &pb.VMSpec{Name: "m", Network: []*pb.NetworkAttachment{
 		{Name: "brnet"}, {Name: "hinet"}, {Name: "brnet"}}}
-	got, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, "m", spec)
+	got, err := cloudinit.SeedNetworkConfig(adminCtx(), s.db, "m", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestCloneVM_HostIsolatedNICGetsItsOwnAddress(t *testing.T) {
 	// before its first boot) is the clone's own: not the source's IPv6
 	// address, gateway or network-config.
 	spec := clonedSpec(t, s, "c1")
-	rebuilt, err := cloudinit.SeedNetworkConfig(ctx, s.db, "c1", spec)
+	rebuilt, err := cloudinit.SeedNetworkConfig(ctx, s.db, "c1", spec, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

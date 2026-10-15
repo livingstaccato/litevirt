@@ -626,8 +626,8 @@ func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt,
 	if !ok {
 		return fmt.Errorf("quarantine target firmware state of %s: invalid swtpm uuid %q", vmName, uuid)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	if err := mkdirAllDurable(dir); err != nil {
+		return fmt.Errorf("quarantine %s: %w", vmName, err)
 	}
 	for _, mv := range []struct{ from, to string }{
 		{f.NvramPath(vmName), filepath.Join(dir, "nvram")},
@@ -640,15 +640,60 @@ func (f *FirmwareStore) QuarantineFirmwareMoveTargetState(vmName, uuid, attempt,
 	// Durable on both sides: the quarantine dir and its parent hold the
 	// moved entries, the parents of the sources lose them.
 	for _, d := range []string{dir, filepath.Dir(dir), filepath.Dir(f.NvramPath(vmName)), filepath.Dir(swtpm)} {
-		if err := fsyncPath(d); err != nil && !os.IsNotExist(err) {
+		if err := quarantineSync(d); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("quarantine %s: fsync %s: %w", vmName, d, err)
 		}
 	}
 	return nil
 }
 
+// The quarantine's rename and directory fsync; variables so a test can fail
+// a step and check what is left.
+var (
+	quarantineRename = os.Rename
+	quarantineSync   = fsyncPath
+)
+
+// mkdirAllDurable creates dir (0700) and every missing parent, then fsyncs
+// each directory it created and the existing one that gained the topmost
+// entry, so the quarantine's directory survives a crash.
+func mkdirAllDurable(dir string) error {
+	var missing []string
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		_, err := os.Lstat(d)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, d)
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	for _, d := range missing {
+		if err := quarantineSync(d); err != nil {
+			return fmt.Errorf("fsync %s: %w", d, err)
+		}
+	}
+	if n := len(missing); n > 0 {
+		if p := filepath.Dir(missing[n-1]); p != missing[n-1] {
+			if err := quarantineSync(p); err != nil {
+				return fmt.Errorf("fsync %s: %w", p, err)
+			}
+		}
+	}
+	return nil
+}
+
 // moveIntoQuarantine renames from to to, or, across filesystems, copies it
-// (files 0600, dirs 0700, each file fsynced) and then removes from.
+// (files 0600, dirs 0700, each file fsynced), makes the copy durable (every
+// copied directory and the directory holding the new entry), and only then
+// removes from: a crash at any point leaves at least one whole copy.
 func moveIntoQuarantine(from, to string) error {
 	if _, err := os.Lstat(from); os.IsNotExist(err) {
 		return nil
@@ -660,7 +705,7 @@ func moveIntoQuarantine(from, to string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	err := os.Rename(from, to)
+	err := quarantineRename(from, to)
 	if err == nil || !errors.Is(err, syscall.EXDEV) {
 		return err
 	}
@@ -668,13 +713,19 @@ func moveIntoQuarantine(from, to string) error {
 		_ = os.RemoveAll(to)
 		return err
 	}
-	// The copied directories are durable before the source goes.
-	if err := filepath.WalkDir(to, func(p string, d os.DirEntry, err error) error {
+	// The copy is durable before the source goes: each copied directory
+	// (the files were fsynced as written) and the directory holding the new
+	// entry. A failure here keeps the source, whole.
+	err = filepath.WalkDir(to, func(p string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return err
 		}
-		return fsyncPath(p)
-	}); err != nil {
+		return quarantineSync(p)
+	})
+	if err == nil {
+		err = quarantineSync(filepath.Dir(to))
+	}
+	if err != nil {
 		_ = os.RemoveAll(to)
 		return err
 	}

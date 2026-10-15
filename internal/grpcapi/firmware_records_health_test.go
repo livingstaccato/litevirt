@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,5 +83,52 @@ func TestFirmwareRecordUnreadable_RaisedNamedAndResolved(t *testing.T) {
 	row, _, _ = corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
 	if row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("after the file was removed: %+v, want resolved", row)
+	}
+}
+
+// m-11: the evidence names at most the newest maxFirmwareWipesNamed refused
+// wipes, with a count of them all, however long a record stays unreadable.
+//
+// Mutation: drop the bound — red.
+func TestFirmwareRecordUnreadable_RefusedWipesBounded(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServerForTests(TestServerOpts{HostName: "h1", DataDir: dir, DB: db})
+	fwmig.Wire(fwNoVirt{}, s.fw())
+	bad := filepath.Join(dir, fwmig.InflightDir, "vm9.json")
+	if err := os.MkdirAll(filepath.Dir(bad), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bad, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for pass := 0; pass < 3; pass++ {
+		for i := 0; i < 50; i++ { // under the store's own bound of 64 per pass
+			s.fw().WipeFirmwareStateByUUID(fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", total))
+			total++
+		}
+		s.judgeFirmwareMoveRecords(ctx)
+	}
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, firmwareMoveEvaluator, condFirmwareRecordUnreadable, "host", "h1")
+	if err != nil || !found {
+		t.Fatalf("no condition: %v", err)
+	}
+	var ev struct {
+		Wipes []lvRefusedWipe `json:"wipes_refused"`
+		Total int             `json:"wipes_refused_total"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if len(ev.Wipes) != maxFirmwareWipesNamed || ev.Total != total {
+		t.Fatalf("evidence names %d wipes, total %d; want %d named, total %d", len(ev.Wipes), ev.Total, maxFirmwareWipesNamed, total)
+	}
+	if last := ev.Wipes[len(ev.Wipes)-1].UUID; last != fmt.Sprintf("aad2e0bb-3311-42a9-92f9-%012d", total-1) {
+		t.Fatalf("the newest wipe is not kept: last named %s", last)
 	}
 }

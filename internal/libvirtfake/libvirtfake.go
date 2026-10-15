@@ -598,6 +598,12 @@ func (f *Fake) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSource})
 }
 
+// ResumeFirmwareMoveSourceForOperator mirrors
+// libvirt.Client.ResumeFirmwareMoveSourceForOperator.
+func (f *Fake) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error {
+	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: libvirt.ViaResumeFirmwareMoveSourceOperator})
+}
+
 // ResumePartitionPaused mirrors libvirt.Client.ResumePartitionPaused.
 func (f *Fake) ResumePartitionPaused(name, uuid string) error {
 	return f.fwExemptResume(libvirt.FirmwareCall{Op: libvirt.OpResume, Name: name, UUID: uuid, Via: libvirt.ViaResumePartitionPaused})

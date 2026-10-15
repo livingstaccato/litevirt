@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -74,7 +75,9 @@ func fwStates() []fwState {
 	out = append(out, fwMarker("marker/cleaning_no_bundle", "cleaning", false, false))
 	for _, p := range fwParkedPhases {
 		for _, from := range []string{"migrating", "cutover"} {
-			out = append(out, fwMarker("marker/"+p+"_from_"+from, p, p != "source_paused" && fwPrePhase(from), false))
+			st := fwMarker("marker/"+p+"_from_"+from, p, p != "source_paused" && fwPrePhase(from), false)
+			st.recs[0].ParkedPreCutover = fwPrePhase(from)
+			out = append(out, st)
 		}
 	}
 	for _, h := range fwHoldStates {
@@ -413,12 +416,20 @@ func fwExempts() []fwExempt {
 	held := hold("prepared", "verified", "resuming", "mismatch")
 	nvram := []byte("PUSHED")
 	return []fwExempt{
-		// §7 M1p before cutover, and D-5 --accept-source from source_paused
-		// (spec §5.y).
+		// §7 M1p and its retry: before cutover only, never source_paused.
 		{via: ViaResumeFirmwareMoveSource, op: OpResume, dom: golibvirt.DomainPaused,
-			allow: func(r FirmwareMoveRecord) bool { return marker(r) && (r.PreCutover || r.State == "source_paused") },
+			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.PreCutover },
 			run: func(e *fwEnv, id, a string) error {
 				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: id, Attempt: a, Via: ViaResumeFirmwareMoveSource})
+			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
+		// D-5 --accept-source: source_paused, parked before cutover only
+		// (spec §5.y); source_paused_from_cutover is refused.
+		{via: ViaResumeFirmwareMoveSourceOperator, op: OpResume, dom: golibvirt.DomainPaused,
+			allow: func(r FirmwareMoveRecord) bool {
+				return marker(r) && r.State == "source_paused" && r.ParkedPreCutover
+			},
+			run: func(e *fwEnv, id, a string) error {
+				return resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: id, Attempt: a, Via: ViaResumeFirmwareMoveSourceOperator})
 			}, acted: func(e *fwEnv) bool { return e.api.called("resume") }},
 		{via: ViaResumePartitionPaused, op: OpResume, dom: golibvirt.DomainPaused,
 			allow: func(r FirmwareMoveRecord) bool { return marker(r) && r.PreCutover },
@@ -516,6 +527,7 @@ func TestFirmwareMoveGuard_Exempt(t *testing.T) {
 func TestFirmwareMoveGuard_ExemptBinding(t *testing.T) {
 	allowing := map[FirmwareExemption]fwState{
 		ViaResumeFirmwareMoveSource:          fwMarker("m", "migrating", true, false),
+		ViaResumeFirmwareMoveSourceOperator:  fwSourcePausedPre(),
 		ViaResumePartitionPaused:             fwMarker("m", "migrating", true, false),
 		ViaResumeFirmwareMoveTarget:          fwHold("resuming"),
 		ViaDiscardFirmwareMoveTarget:         fwHold("verified"),
@@ -819,4 +831,114 @@ func TestCreateLiveSnapshot_AsksStopAndStart(t *testing.T) {
 			}
 		})
 	}
+}
+
+func fwSourcePausedPre() fwState {
+	st := fwMarker("m", "source_paused", false, false)
+	st.recs[0].ParkedPreCutover = true
+	return st
+}
+
+// N-1: the D-5 resume of a source_paused source goes ahead only when the
+// marker was parked before cutover; parked from cutover or later the target's
+// copy is current, and resuming the source would run a second copy. The
+// automatic M1p entry point never resumes a source_paused source.
+//
+// Mutations: drop ParkedPreCutover from the operator cell — red; let the M1p
+// entry point resume source_paused — red.
+func TestFirmwareMoveGuard_SourcePausedResumeOnlyBeforeCutover(t *testing.T) {
+	post := fwMarker("m", "source_paused", false, false) // parked from cutover
+	for name, c := range map[string]struct {
+		st   fwState
+		via  FirmwareExemption
+		want bool
+	}{
+		"operator/parked_pre_cutover":  {fwSourcePausedPre(), ViaResumeFirmwareMoveSourceOperator, true},
+		"operator/parked_post_cutover": {post, ViaResumeFirmwareMoveSourceOperator, false},
+		"m1p/parked_pre_cutover":       {fwSourcePausedPre(), ViaResumeFirmwareMoveSource, false},
+		"m1p/parked_post_cutover":      {post, ViaResumeFirmwareMoveSource, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newFWEnv(t, c.st, golibvirt.DomainPaused)
+			err := resumeDomain(e.api, e.guard, FirmwareCall{Op: OpResume, Name: fwTestVM, UUID: fwTestUUID, Attempt: fwTestAttempt, Via: c.via})
+			if got := err == nil && e.api.called("resume"); got != c.want {
+				t.Fatalf("resumed = %v, want %v (%v)", got, c.want, err)
+			}
+		})
+	}
+}
+
+// N-2: across filesystems the quarantine copies, makes the copy durable, and
+// only then removes the source. Every fsync of the copy happens while the
+// source is still whole; a failed fsync keeps the source and drops the copy.
+//
+// Mutation: remove the source before the copy's fsyncs — red.
+func TestQuarantine_CrossFilesystemKeepsSourceUntilCopyDurable(t *testing.T) {
+	exdev := func(o, n string) error { return &os.LinkError{Op: "rename", Old: o, New: n, Err: syscall.EXDEV} }
+	defer func(r func(string, string) error, s func(string) error) { quarantineRename, quarantineSync = r, s }(quarantineRename, quarantineSync)
+	quarantineRename = exdev
+
+	t.Run("ok", func(t *testing.T) {
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		var synced []string
+		syncedWhileSource := map[string]bool{}
+		entryDurable := false // q fsynced with the swtpm copy in it and the source still whole
+		quarantineSync = func(p string) error {
+			synced = append(synced, p)
+			if _, seen := syncedWhileSource[p]; !seen { // the first fsync of each
+				syncedWhileSource[p] = e.hasSwtpm()
+			}
+			if _, err := os.Stat(filepath.Join(q, "swtpm")); err == nil && p == q && e.hasSwtpm() {
+				entryDurable = true
+			}
+			return fsyncPath(p)
+		}
+		if err := e.store.QuarantineFirmwareMoveTargetState(fwTestVM, fwTestUUID, fwTestAttempt, q); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(filepath.Join(q, "nvram")); err != nil || string(b) != "T0" {
+			t.Fatalf("quarantined nvram = %q, %v", b, err)
+		}
+		if b, err := os.ReadFile(filepath.Join(q, "swtpm", "tpm2", "tpm2-00.permall")); err != nil || string(b) != "P0" {
+			t.Fatalf("quarantined permall = %q, %v", b, err)
+		}
+		if _, ok := e.nvram(fwTestVM); ok || e.hasSwtpm() {
+			t.Fatal("the sources are still there after a completed move")
+		}
+		if !entryDurable {
+			t.Error("the quarantine dir holding the swtpm copy was not fsynced before the source was removed")
+		}
+		for _, d := range []string{filepath.Join(q, "swtpm"), filepath.Join(q, "swtpm", "tpm2"), q, filepath.Dir(q)} {
+			was, ok := syncedWhileSource[d]
+			if !ok {
+				t.Errorf("%s never fsynced (synced %v)", d, synced)
+			} else if !was {
+				t.Errorf("%s fsynced after the swtpm source was removed", d)
+			}
+		}
+	})
+
+	t.Run("fsync_fails", func(t *testing.T) {
+		e := newFWEnv(t, fwHold("mismatch"), golibvirt.DomainShutoff)
+		q := filepath.Join(e.store.DataDir, "fwmig-quarantine", "vm1-x")
+		if err := os.MkdirAll(q, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		quarantineSync = func(p string) error {
+			if p == q {
+				return errors.New("injected fsync failure")
+			}
+			return fsyncPath(p)
+		}
+		if err := e.store.QuarantineFirmwareMoveTargetState(fwTestVM, fwTestUUID, fwTestAttempt, q); err == nil {
+			t.Fatal("a failed fsync of the copy reported success")
+		}
+		if b, ok := e.nvram(fwTestVM); !ok || b != "T0" {
+			t.Fatal("the NVRAM source is gone although its copy was not durable")
+		}
+		if !e.hasSwtpm() {
+			t.Fatal("the swtpm source is gone although its copy was not durable")
+		}
+	})
 }

@@ -532,8 +532,9 @@ type Server struct {
 	// fwWipesRefused are the firmware state wipes an unreadable firmware move
 	// record refused, named by firmware_migration_record_unreadable until it
 	// resolves (firmware_records_health.go). Guarded by fwRecordsMu.
-	fwRecordsMu    sync.Mutex
-	fwWipesRefused []lv.RefusedWipe
+	fwRecordsMu         sync.Mutex
+	fwWipesRefused      []lv.RefusedWipe
+	fwWipesRefusedTotal int
 
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no

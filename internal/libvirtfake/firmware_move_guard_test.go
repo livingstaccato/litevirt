@@ -19,6 +19,7 @@ import (
 type firmwareMoveVirt interface {
 	SetFirmwareMoveGuard(libvirt.FirmwareMoveGuard)
 	ResumeFirmwareMoveSource(name, uuid, attempt string) error
+	ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error
 	ResumePartitionPaused(name, uuid string) error
 	ResumeFirmwareMoveTarget(name, uuid, attempt string) error
 	DiscardFirmwareMoveTarget(name, uuid, attempt string) error
@@ -84,6 +85,9 @@ func TestFake_FirmwareMoveGuardAskedFirst(t *testing.T) {
 		}},
 		{"ResumeFirmwareMoveSource", StatePaused, exempt(libvirt.OpResume, libvirt.ViaResumeFirmwareMoveSource), func(f *Fake) error {
 			return f.ResumeFirmwareMoveSource(fgVM, fgUUID, fgAttempt)
+		}},
+		{"ResumeFirmwareMoveSourceForOperator", StatePaused, exempt(libvirt.OpResume, libvirt.ViaResumeFirmwareMoveSourceOperator), func(f *Fake) error {
+			return f.ResumeFirmwareMoveSourceForOperator(fgVM, fgUUID, fgAttempt)
 		}},
 		{"ResumePartitionPaused", StatePaused, libvirt.FirmwareCall{Op: libvirt.OpResume, Name: fgVM, UUID: fgUUID, Via: libvirt.ViaResumePartitionPaused}, func(f *Fake) error {
 			return f.ResumePartitionPaused(fgVM, fgUUID)

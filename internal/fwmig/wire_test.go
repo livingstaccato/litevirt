@@ -272,6 +272,12 @@ func TestFwmigWire_PartitionPauseResume(t *testing.T) {
 			}
 			m := wireMarker(wireVM, from)
 			pm, err := m.Park(p)
+			if p == PhaseSourcePaused && !pre[from] {
+				if err == nil {
+					t.Fatalf("source_paused parked from %s, after cutover", from)
+				}
+				continue
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -487,5 +493,54 @@ func TestFwmigWire_DaemonAndFleetUseSameHelper(t *testing.T) {
 	set := findCalls(fcalls, "n.Server", "SetFirmwareStore")
 	if len(set) != 1 || set[0].args[0] != "n.FW" || (len(w) == 1 && set[0].pos < w[0].pos) {
 		t.Errorf("fleet hands the server %+v, want the wired n.FW after Wire", set)
+	}
+}
+
+// N-1: a source_paused marker is the M1p park, before cutover. One parked
+// from cutover or later is refused by Park and by Validate (so never
+// written), and the record the guard reads says whether a park came before
+// cutover. Through Wire, the D-5 resume goes ahead from source_paused only;
+// the M1p entry point never does.
+//
+// Mutations: Validate accepting source_paused after cutover — red;
+// ParkedPreCutover not carried — red.
+func TestFwmigWire_SourcePausedOnlyBeforeCutover(t *testing.T) {
+	for _, from := range AllPhases() {
+		if from.Parked() {
+			continue
+		}
+		m := wireMarker(wireVM, PhaseSourcePaused)
+		m.ParkedFrom = from
+		pre := from == PhasePreparing || from == PhasePrepared || from == PhaseMigrating
+		if err := m.Validate(); (err == nil) != pre {
+			t.Errorf("source_paused from %s: Validate = %v, want valid=%v", from, err, pre)
+		}
+		if err := New(t.TempDir()).PutMarker(m); (err == nil) != pre {
+			t.Errorf("source_paused from %s: PutMarker = %v, want written=%v", from, err, pre)
+		}
+	}
+
+	store := &lv.FirmwareStore{DataDir: t.TempDir(), SwtpmBase: t.TempDir()}
+	virt := &recordingVirt{}
+	Wire(virt, store)
+	m, err := wireMarker(wireVM, PhaseMigrating).Park(PhaseSourcePaused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(store.DataDir).PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := New(store.DataDir).Lookup(wireVM, "")
+	if err != nil || len(recs) != 1 || !recs[0].ParkedPreCutover || recs[0].PreCutover {
+		t.Fatalf("record = %+v (%v), want ParkedPreCutover and not PreCutover", recs, err)
+	}
+	call := lv.FirmwareCall{Op: lv.OpResume, Name: wireVM, UUID: wireUUID, Attempt: wireAttempt}
+	call.Via = lv.ViaResumeFirmwareMoveSourceOperator
+	if err := virt.g.Check(call); err != nil {
+		t.Fatalf("D-5 resume from source_paused: %v", err)
+	}
+	call.Via = lv.ViaResumeFirmwareMoveSource
+	if err := virt.g.Check(call); err == nil {
+		t.Fatal("the M1p entry point resumed a source_paused source")
 	}
 }

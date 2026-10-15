@@ -77,6 +77,7 @@ type FirmwareExemption string
 
 const (
 	ViaResumeFirmwareMoveSource          FirmwareExemption = "ResumeFirmwareMoveSource"
+	ViaResumeFirmwareMoveSourceOperator  FirmwareExemption = "ResumeFirmwareMoveSourceForOperator"
 	ViaResumePartitionPaused             FirmwareExemption = "ResumePartitionPaused"
 	ViaResumeFirmwareMoveTarget          FirmwareExemption = "ResumeFirmwareMoveTarget"
 	ViaDiscardFirmwareMoveTarget         FirmwareExemption = "DiscardFirmwareMoveTarget"
@@ -130,6 +131,11 @@ type FirmwareMoveRecord struct {
 	// PreCutover (marker): the phase is before cutover, fwmig's
 	// Marker.BeforeCutover.
 	PreCutover bool
+	// ParkedPreCutover (marker): the marker is parked, and was parked from a
+	// phase before cutover (preparing, prepared, migrating), so the source's
+	// copy is still the current one. Unlike PreCutover it holds for
+	// source_paused too.
+	ParkedPreCutover bool
 	// RetainedBundle (marker): the attempt's retained bundle is on disk.
 	RetainedBundle bool
 }
@@ -222,9 +228,14 @@ func exemptionAllows(r FirmwareMoveRecord, c FirmwareCall) bool {
 	marker, hold := r.Kind == FirmwareMarker, r.Kind == FirmwareHold
 	switch c.Via {
 	case ViaResumeFirmwareMoveSource:
-		// §7 M1p before cutover; and §17 D-5 --accept-source from
-		// source_paused (spec §5.y), which the pauser's rule excludes.
-		return marker && c.Op == OpResume && bound && (r.PreCutover || r.State == FirmwarePhaseSourcePaused)
+		// §7 M1p, and its recovery retry: before cutover only. Never from
+		// source_paused, whose D-5 action discards the target first and has
+		// an entry point of its own.
+		return marker && c.Op == OpResume && bound && r.PreCutover
+	case ViaResumeFirmwareMoveSourceOperator:
+		// §17 D-5 --accept-source from source_paused (spec §5.y), and only
+		// when that park came before cutover: the source's copy is current.
+		return marker && c.Op == OpResume && bound && r.State == FirmwarePhaseSourcePaused && r.ParkedPreCutover
 	case ViaResumePartitionPaused:
 		// The partition pauser knows the domain's uuid, not the attempt.
 		return marker && c.Op == OpResume && sameUUID(r.UUID, c.UUID) && r.PreCutover
@@ -437,10 +448,20 @@ func DomainNameFromXML(domXML string) string {
 // ── Exempt entry points (spec §5.1, I5) ──
 
 // ResumeFirmwareMoveSource resumes the source guest of a move that failed
-// before cutover with the source paused and no target domain (spec §7 M1p).
-// The marker must be the attempt's and before cutover.
+// before cutover with the source paused and no target domain (spec §7 M1p),
+// for the M1p handler and its recovery retry. The marker must be the
+// attempt's and before cutover; source_paused is refused here (the D-5
+// action has ResumeFirmwareMoveSourceForOperator).
 func (c *Client) ResumeFirmwareMoveSource(name, uuid, attempt string) error {
 	return resumeDomain(c.virt, c.firmwareGuard(), FirmwareCall{Op: OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: ViaResumeFirmwareMoveSource})
+}
+
+// ResumeFirmwareMoveSourceForOperator resumes the source guest for the D-5
+// --accept-source action on a source_paused move (spec §5.y), after the
+// action has discarded the target's copy. The marker must be the attempt's,
+// source_paused, and parked before cutover.
+func (c *Client) ResumeFirmwareMoveSourceForOperator(name, uuid, attempt string) error {
+	return resumeDomain(c.virt, c.firmwareGuard(), FirmwareCall{Op: OpResume, Name: name, UUID: uuid, Attempt: attempt, Via: ViaResumeFirmwareMoveSourceOperator})
 }
 
 // ResumePartitionPaused is the partition pauser resuming a guest it paused.

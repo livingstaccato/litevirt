@@ -20,9 +20,12 @@ import (
 // restore, a wipe), so it is raised here, naming the files and the remedy,
 // rather than left to the refusals' error text.
 const (
-	firmwareMoveEvaluator          = "firmware_move"
-	condFirmwareRecordUnreadable   = "firmware_migration_record_unreadable"
-	eventFirmwareStateWipeRefused  = "vm.firmware_wipe_refused"
+	firmwareMoveEvaluator         = "firmware_move"
+	condFirmwareRecordUnreadable  = "firmware_migration_record_unreadable"
+	eventFirmwareStateWipeRefused = "vm.firmware_wipe_refused"
+	// maxFirmwareWipesNamed bounds the refused wipes the evidence lists (the
+	// newest); wipes_refused_total counts them all. Each is also an event.
+	maxFirmwareWipesNamed          = 64
 	firmwareRecordUnreadableRemedy = "repair the file, or move it out of its directory once no firmware move on this host needs it " +
 		"(a marker under fwmig-inflight/ or a hold under fwmig-hold/ is that move's start veto and its record of the state to keep); " +
 		"the condition resolves within a pass once every file reads"
@@ -48,10 +51,14 @@ func (s *Server) judgeFirmwareMoveRecords(ctx context.Context) {
 
 	s.fwRecordsMu.Lock()
 	s.fwWipesRefused = append(s.fwWipesRefused, refused...)
-	if len(bad) == 0 {
-		s.fwWipesRefused = nil
+	s.fwWipesRefusedTotal += len(refused)
+	if n := len(s.fwWipesRefused); n > maxFirmwareWipesNamed {
+		s.fwWipesRefused = append([]lv.RefusedWipe(nil), s.fwWipesRefused[n-maxFirmwareWipesNamed:]...)
 	}
-	wipes := append([]lvRefusedWipe(nil), toRefusedWipes(s.fwWipesRefused)...)
+	if len(bad) == 0 {
+		s.fwWipesRefused, s.fwWipesRefusedTotal = nil, 0
+	}
+	wipes, wipesTotal := toRefusedWipes(s.fwWipesRefused), s.fwWipesRefusedTotal
 	s.fwRecordsMu.Unlock()
 	if s.db == nil {
 		return
@@ -92,7 +99,7 @@ func (s *Server) judgeFirmwareMoveRecords(ctx context.Context) {
 		files = append(files, file{Path: b.Path, Error: fmt.Sprint(b.Err)})
 	}
 	ev, _ := json.Marshal(map[string]any{
-		"host": s.hostName, "files": files, "wipes_refused": wipes,
+		"host": s.hostName, "files": files, "wipes_refused": wipes, "wipes_refused_total": wipesTotal,
 		"detail": fmt.Sprintf("%d firmware move record file(s) under %s cannot be read; until each reads, the firmware move guard refuses "+
 			"every operation such a file might name on %s — any define, firmware state restore or wipe that carries a uuid, and any "+
 			"operation on the VM a file is named after", len(files), fw.DataDir, s.hostName),

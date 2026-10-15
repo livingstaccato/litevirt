@@ -248,6 +248,9 @@ func (m Marker) Park(p Phase) (Marker, error) {
 	if !phaseIn(from, progressPhases) {
 		return Marker{}, fmt.Errorf("marker %s: cannot park %s: no progress phase to park from (%q)", m.VM, m.Phase, from)
 	}
+	if p == PhaseSourcePaused && !preCutover(from) {
+		return Marker{}, fmt.Errorf("marker %s: cannot park source_paused from %s, after cutover", m.VM, from)
+	}
 	m.Phase, m.ParkedFrom = p, from
 	return m, nil
 }
@@ -257,11 +260,16 @@ func (m Marker) Park(p Phase) (Marker, error) {
 // source_paused excepted (spec §5.1). For migrating the caller must still
 // check that the source domain is active.
 func (m Marker) BeforeCutover() bool {
-	pre := func(p Phase) bool { return p == PhasePreparing || p == PhasePrepared || p == PhaseMigrating }
 	if m.Phase.Parked() {
-		return m.Phase != PhaseSourcePaused && pre(m.ParkedFrom)
+		return m.Phase != PhaseSourcePaused && preCutover(m.ParkedFrom)
 	}
-	return pre(m.Phase)
+	return preCutover(m.Phase)
+}
+
+// preCutover: the progress phases before cutover, while the source's copy is
+// the current one.
+func preCutover(p Phase) bool {
+	return p == PhasePreparing || p == PhasePrepared || p == PhaseMigrating
 }
 
 // Validate checks every field's domain.
@@ -281,6 +289,13 @@ func (m Marker) Validate() error {
 	if m.Phase.Parked() {
 		if !phaseIn(m.ParkedFrom, progressPhases) {
 			return fmt.Errorf("marker %s: parked phase %s from %q, want a progress phase", m.VM, m.Phase, m.ParkedFrom)
+		}
+		// source_paused is the M1p park: the source paused before cutover,
+		// its copy current. From cutover on the target's copy is current, and
+		// a source_paused marker there would let the D-5 resume run a second
+		// copy (one copy of a VM at every moment).
+		if m.Phase == PhaseSourcePaused && !preCutover(m.ParkedFrom) {
+			return fmt.Errorf("marker %s: source_paused parked from %s, after cutover", m.VM, m.ParkedFrom)
 		}
 	} else if m.ParkedFrom != "" {
 		return fmt.Errorf("marker %s: parked_from %q on unparked phase %s", m.VM, m.ParkedFrom, m.Phase)

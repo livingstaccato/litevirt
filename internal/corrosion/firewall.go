@@ -369,17 +369,30 @@ func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) erro
 // no default row at all: a stack's deploy can miss a handoff from an owner
 // that went down while it was in flight. A row an operator set either way is
 // left as it is.
+//
+// When the row was removed, only a stack whose record was written after the
+// removal counts: a stack's own redeploy dropping default-deny removes the
+// row before it records its new file, and the old file still in its record
+// must not bring the deny back.
 func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
-	cur, err := GetFirewallDefault(ctx, c, "cluster")
-	if err != nil || cur != nil {
+	rows, err := c.Query(ctx,
+		`SELECT updated_at, deleted_at FROM firewall_defaults WHERE scope = 'cluster'`)
+	if err != nil {
 		return err
+	}
+	removedAt := ""
+	if len(rows) > 0 {
+		if rows[0].String("deleted_at") == "" {
+			return nil // a live row, deny or allow: its owner's decision
+		}
+		removedAt = rows[0].String("updated_at")
 	}
 	wants, _, err := otherStackWants(ctx, c, "", read)
 	if err != nil {
 		return err
 	}
 	for _, w := range wants {
-		if w.defaultDeny {
+		if w.defaultDeny && (removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
 			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
 		}
 	}

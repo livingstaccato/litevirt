@@ -13,6 +13,7 @@ type StackFileWants func(composeYAML string) (defaultDeny bool, repos map[string
 // stackWants is what one other live stack's file asks for.
 type stackWants struct {
 	name        string
+	updatedAt   string // the stack record's LWW key
 	defaultDeny bool
 	repos       map[string]bool
 }
@@ -39,7 +40,7 @@ func otherStackWants(ctx context.Context, c *Client, stack string, read StackFil
 			unreadable = append(unreadable, st.Name)
 			continue
 		}
-		out = append(out, stackWants{name: st.Name, defaultDeny: deny, repos: repos})
+		out = append(out, stackWants{name: st.Name, updatedAt: st.UpdatedAt, defaultDeny: deny, repos: repos})
 	}
 	return out, unreadable, nil
 }

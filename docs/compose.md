@@ -173,8 +173,9 @@ down, or is redeployed without it, the deny passes to another stack whose file
 asks for it, and is removed only when none does; while another stack's stored
 file cannot be read, it stays. A deploy asking for default-deny sets it again
 once its record is written if the cluster no longer denies, and the background
-stack reconciler sets it for any live stack whose file asks for it when the
-cluster has no default at all. The web UI's stack **Destroy** action
+stack reconciler sets it for a live stack whose file asks for it when the
+cluster has no default, if that stack was recorded after the default was
+removed (a redeploy that drops default-deny is not undone). The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -336,5 +337,57 @@ func TestDeleteStack_KeepsReposWhileAnotherStacksFileIsUnreadable(t *testing.T) 
 	downStack(t, ctx, s, "owner")
 	if _, _, ok := repoOwner(t, ctx, s, "nightly"); !ok {
 		t.Error("repo nightly was unregistered while another stack's file could not be read")
+	}
+}
+
+// cr7 round 2, I1-r1. Stack A owns the deny and redeploys without it. Its
+// persist removes the row before its record holds the new file; a reconcile
+// pass in that gap must not bring the deny back from A's old file. The
+// cluster ends default-allow, as the new file says.
+//
+// Mutation: re-assert whatever the removal's time — A's old file re-sets
+// the deny.
+func TestDeployStack_DroppingDenyIsNotUndoneByTheReconcilerMidDeploy(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	putStack(t, ctx, s, "a", denyFile("a"))
+	if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertBackupRepo(ctx, s.db, corrosion.BackupRepo{Name: "nightly", Path: "/srv/nightly", StackName: "z"}); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "name: a\nsecurity-groups:\n  web:\n    rules:\n      - {direction: ingress, proto: tcp, port: \"80\", action: accept}\nbackup-repos:\n  nightly: {path: /srv/other}\n"
+	passed := false
+	stream := &hookDeployStream{mockDeployStream: mockDeployStream{ctx: ctx}}
+	stream.onSend = func(p *pb.DeployProgress) {
+		if !passed && p.Phase == "warning" && strings.Contains(p.Detail, "nightly") {
+			passed = true
+			if d := clusterDefault(t, ctx, s); d != nil && d.DefaultDeny {
+				t.Errorf("fixture: a's persist left the deny %+v", d)
+			}
+			// One stack reconciler pass, mid-deploy.
+			if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, stream); err != nil {
+		t.Fatalf("redeploy of a without default-deny: %v", err)
+	}
+	if !passed {
+		t.Fatal("fixture: no reconcile pass ran mid-deploy")
+	}
+	if d := clusterDefault(t, ctx, s); d != nil && d.DefaultDeny {
+		t.Errorf("cluster default after a's redeploy without deny = %+v, want no deny", d)
+	}
+	// The round-1 case still holds after it: a stack recorded after the
+	// removal and asking for deny gets it back from a pass.
+	putStack(t, ctx, s, "c", denyFile("c"))
+	if err := corrosion.ReassertStackDefaultDeny(ctx, s.db, compose.StoredStackWants); err != nil {
+		t.Fatal(err)
+	}
+	if d := clusterDefault(t, ctx, s); d == nil || !d.DefaultDeny || d.StackName != "c" {
+		t.Errorf("cluster default after c, recorded later, asked for deny = %+v, want deny owned by c", d)
 	}
 }

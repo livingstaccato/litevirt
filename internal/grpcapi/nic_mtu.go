@@ -375,12 +375,7 @@ func (s *Server) nicMTUPreflight(ctx context.Context, vm *corrosion.VMRecord, ta
 	if err != nil || len(mtus) == 0 {
 		return err
 	}
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, ic := range ifaces {
-		if ic.NetworkName != "" {
-			s.provisionNetworkOnRemote(ctx, targetHost, ic.NetworkName)
-		}
-	}
+	s.provisionVMNetworksOnRemote(ctx, vm.Name, targetHost)
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "cannot reach %s to check the NIC MTUs of VM %q: %v", targetHost, vm.Name, err)

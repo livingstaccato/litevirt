@@ -664,6 +664,16 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 		}
 	}
 
+	// The NIC's guard record goes once the NIC is gone from the domain and its
+	// rows: a record left behind names a NIC no host renders, and every later
+	// start of the VM refuses for want of its guard.
+	if rolledBack {
+		if err := s.retireDetachedNICGuard(ctx, rb.vm.Name, rb.mac); err != nil {
+			slog.Error("nic attach rollback: retire the NIC's guard record failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
+			rolledBack = false
+		}
+	}
+
 	// Give the claimed address back — but ONLY once the rows that referenced it
 	// are really gone. Releasing it while a NIC row still names it would hand
 	// the address to another workload while litevirt still points a NIC at it,
@@ -1017,6 +1027,10 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 		slog.Error("nic detach: absence unverifiable — left recoverable", "vm", vm.Name, "op", opID, "error", err)
 		return nil, status.Errorf(codes.Internal, "nic detach for %q could not be verified; left recoverable: %v", vm.Name, err)
 	}
+	if err := s.retireDetachedNICGuard(ctx, vm.Name, mac); err != nil {
+		slog.Error("nic detach: guard record not retired — left recoverable", "vm", vm.Name, "op", opID, "error", err)
+		return nil, status.Errorf(codes.Internal, "nic detach for %q applied but the NIC's guard record could not be retired; left recoverable: %v", vm.Name, err)
+	}
 
 	applied, cerr := s.db.CompleteVMOperation(ctx, vm.Name, opID, epoch, newGen)
 	if cerr != nil || !applied {
@@ -1032,6 +1046,14 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "ok", "nic "+mac)
 	s.publish("device.detached", vm.Name, "nic:"+mac)
 	return s.vmToProto(ctx, vm.Name)
+}
+
+// retireDetachedNICGuard tombstones the guard record of a NIC that is no longer
+// in vmName's domain or rows. The firewall renders only live NICs, so a guard
+// record left for a gone NIC can never be in force, and the start guard
+// (ArmNICsFor) would refuse every later start of the VM.
+func (s *Server) retireDetachedNICGuard(ctx context.Context, vmName, mac string) error {
+	return corrosion.RetireNICGuard(ctx, s.db, vmName, mac, callerUsername(ctx))
 }
 
 // retryNICRowTombstone retries the row bookkeeping a bounded number of times (the

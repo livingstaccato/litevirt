@@ -702,7 +702,8 @@ and the other guard settings, `on` included), and one a re-create carries from
 the incarnation it replaces, are never dropped: if the gate refuses them, or
 this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
-VM or container is deleted, and a record written for another incarnation of the
+VM or container is deleted, and a NIC's own record when the NIC is detached or
+its attach is rolled back. A record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
 incarnation it replaces.
 

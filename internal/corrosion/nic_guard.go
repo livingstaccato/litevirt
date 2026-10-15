@@ -253,6 +253,25 @@ func DeleteNICGuardsOf(ctx context.Context, c *Client, owner, setBy string) erro
 	return nil
 }
 
+// RetireNICGuard tombstones the guard record of one NIC of owner, the NIC
+// itself gone (a detach, a rolled-back attach). Nothing is written when the
+// NIC has no live record, or before the cluster_policies gate opens.
+func RetireNICGuard(ctx context.Context, c *Client, owner, mac, setBy string) error {
+	if !c.MayWriteClusterPolicy() {
+		return nil
+	}
+	r, err := GetNICGuard(ctx, c, owner, mac)
+	if err != nil || r == nil {
+		return err
+	}
+	r.Deleted = true
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, c.NowTS())
+}
+
 // ListNICGuardsWithDeleted is ListNICGuards with the tombstoned records.
 func ListNICGuardsWithDeleted(ctx context.Context, c *Client) (map[string]NICGuardRecord, error) {
 	lo, hi := keyRange(nicGuardKeyPrefix)

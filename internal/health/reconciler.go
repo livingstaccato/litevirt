@@ -2374,11 +2374,14 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 	}
 
-	// Provision networks and build network configs from stored interfaces.
+	// Provision networks and build network configs from the VM's live NICs:
+	// the vm_nics/vm_interfaces overlay, which carries a hot-attached NIC and
+	// drops a detached one on every cluster (a hardware_v2 cluster writes both
+	// to vm_nics alone).
 	// A query failure must NOT be swallowed: starting the VM with zero NICs
 	// brings it up headless (no network) after a failover. Fail it instead,
 	// matching the ListDisks error handling above.
-	ifaces, err := corrosion.GetVMInterfaces(ctx, r.db, vm.Name)
+	ifaces, err := corrosion.MergedVMNICs(ctx, r.db, vm.Name)
 	if err != nil {
 		slog.Error("reconciler: get VM interfaces", "vm", vm.Name, "error", err)
 		return "", true, fmt.Sprintf("get interfaces: %v", err) // transient DB

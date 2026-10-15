@@ -2415,14 +2415,28 @@ func (s *Server) judgedISOSHA256(ctx context.Context, vmName string, isoPaths []
 // moved a cloud-init VM live (lab2c-report.md, bug 2). A failed attempt takes
 // back the ISO with cleanupFailedMigrationTarget.
 func (s *Server) prepareMigrationTarget(ctx context.Context, vm *corrosion.VMRecord, target string) {
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.NetworkName == "" {
+	s.provisionVMNetworksOnRemote(ctx, vm.Name, target)
+	s.ensureCloudInitOnTarget(ctx, target, vm)
+}
+
+// provisionVMNetworksOnRemote sets up on target the network of each of
+// vmName's live NICs (MergedVMNICs): a NIC hot-attached on a hardware_v2
+// cluster has a vm_nics row alone, and a detached one keeps its vm_interfaces
+// row there. Best effort, as each provisionNetworkOnRemote is.
+func (s *Server) provisionVMNetworksOnRemote(ctx context.Context, vmName, target string) {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		slog.Warn("could not read the NICs of a VM to set up its networks on the target", "vm", vmName, "target", target, "error", err)
+		return
+	}
+	done := map[string]bool{}
+	for _, n := range nics {
+		if n.NetworkName == "" || done[n.NetworkName] {
 			continue
 		}
-		s.provisionNetworkOnRemote(ctx, target, iface.NetworkName)
+		done[n.NetworkName] = true
+		s.provisionNetworkOnRemote(ctx, target, n.NetworkName)
 	}
-	s.ensureCloudInitOnTarget(ctx, target, vm)
 }
 
 // migrationTuning is what a VM's stored migration policy asks of a runtime

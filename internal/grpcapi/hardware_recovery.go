@@ -667,6 +667,10 @@ func (s *Server) recoverNICDetach(ctx context.Context, vm *corrosion.VMRecord, v
 		slog.Error("hardware op recovery: nic detach absence unverifiable — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
 		return
 	}
+	if err := s.retireDetachedNICGuard(ctx, vm.Name, mac); err != nil {
+		slog.Error("hardware op recovery: nic detach guard record not retired — left recoverable", "vm", vm.Name, "op", view.ActiveOperationID, "error", err)
+		return
+	}
 	s.completeRecoveredOp(ctx, vm.Name, view, corrosion.OpDeviceDetach)
 }
 

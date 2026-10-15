@@ -5797,8 +5797,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		})
 	}
 
-	// Build network configs from stored interfaces.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.Name)
+	// Build network configs from the VM's live NICs (the vm_nics/vm_interfaces
+	// overlay): a NIC hot-attached or detached on a hardware_v2 cluster is
+	// recorded in vm_nics alone.
+	ifaces, err := liveVMInterfaces(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read NICs for %q: %v", req.Name, err)
+	}
 	var netConfigs []lv.NetworkConfig
 	for _, iface := range ifaces {
 		bridge := resolveBridge(ctx, s.db, iface.NetworkName)

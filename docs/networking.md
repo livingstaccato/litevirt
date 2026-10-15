@@ -188,6 +188,16 @@ with the cluster's network table every 30 seconds, and at startup:
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
+When a network's device changes (a new `interface:` in a redeploy, say), each
+host tears down the old device the way a delete does before it sets up the new
+one, unless another live network uses the old device. While a guest on a host
+is still plugged into the old device, that host refuses the change, naming the
+guest's port, and keeps the old device; restart the guest and the next pass
+completes it. Each pass also removes a bridge litevirt created on that host
+(recorded under `/run/litevirt/bridges`, see below) that no live network, no
+pending teardown and no VM or container on the host names any more, and that
+has nothing plugged into it, together with its `dnsmasq`.
+
 Tearing down a bridge network removes the Linux bridge itself only when
 litevirt created it on that host. Each daemon records the bridges it creates
 under `/run/litevirt/bridges` (one file per bridge holding its interface index;

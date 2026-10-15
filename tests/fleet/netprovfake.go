@@ -29,7 +29,17 @@ type NetProvFake struct {
 	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
 	busy         map[string]bool   // flat bridges a scenario says have a port attached
 	guestPorts   map[string][]string
-	subnets      map[string]string // network → subnet, while provisioned with one
+	// devSubnets is the subnet each device set up here serves (its gateway
+	// address and dnsmasq), keyed by DEVICE: a network re-provisioned on
+	// another device leaves the old one serving until something tears it
+	// down, as on a host.
+	devSubnets map[string]string
+	// created are the bridges Provision made here (litevirt's own, as the
+	// real EnsureBridge records them), minus those torn down or swept;
+	// operator bridges a scenario named (SetOperatorBridge) are never in it.
+	created  map[string]bool
+	operator map[string]bool
+	sweeps   map[string]int // bridge → RemoveOrphanedBridge removals
 	// dhcpConflicts makes Provision fail the way the real dnsmasq does when
 	// another network provisioned on this node already serves an overlapping
 	// subnet: both listen on the same gateway address, so the second one
@@ -48,7 +58,10 @@ func NewNetProvFake() *NetProvFake {
 		provisions:   map[string]int{},
 		deprovisions: map[string]int{},
 		flat:         map[string]bool{},
-		subnets:      map[string]string{},
+		devSubnets:   map[string]string{},
+		created:      map[string]bool{},
+		operator:     map[string]bool{},
+		sweeps:       map[string]int{},
 	}
 }
 
@@ -99,8 +112,8 @@ func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name 
 	f.vteps[name] = localIP
 	if f.dhcpConflicts && def.Subnet != "" {
 		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
-			for other, sub := range f.subnets {
-				if p, err := netip.ParsePrefix(sub); other != name && err == nil && p.Overlaps(mine) {
+			for other, sub := range f.devSubnets {
+				if p, err := netip.ParsePrefix(sub); other != dev && err == nil && p.Overlaps(mine) {
 					return "", fmt.Errorf("start DHCP on %s: dnsmasq on %s exited immediately: exit status 2", dev, dev)
 				}
 			}
@@ -108,19 +121,87 @@ func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name 
 	}
 	f.up[name] = dev
 	if def.Subnet != "" {
-		f.subnets[name] = def.Subnet
+		f.devSubnets[dev] = def.Subnet
+	}
+	if (def.Type == "" || def.Type == "bridge" || def.Type == "isolated") && !f.operator[dev] {
+		f.created[dev] = true
 	}
 	f.provisions[name]++
 	return dev, nil
 }
 
-func (f *NetProvFake) Deprovision(_ context.Context, _ *corrosion.Client, name string, _ compose.NetworkDef, _ string) error {
+// Deprovision tears down what Provision set up for def's device.
+func (f *NetProvFake) Deprovision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _ string) error {
+	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.up, name)
-	delete(f.subnets, name)
+	delete(f.devSubnets, dev)
+	delete(f.created, dev)
 	f.deprovisions[name]++
 	return nil
+}
+
+// CreatedBridges lists the bridges litevirt made here and still has.
+func (f *NetProvFake) CreatedBridges() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.created))
+	for b := range f.created {
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// RemoveOrphanedBridge removes a bridge litevirt made here, with what it
+// served, unless a guest port is on it.
+func (f *NetProvFake) RemoveOrphanedBridge(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.created[name] || len(f.guestPorts[name]) > 0 {
+		return false, nil
+	}
+	delete(f.created, name)
+	delete(f.devSubnets, name)
+	f.sweeps[name]++
+	return true, nil
+}
+
+// RecordCreatedBridge marks name as a bridge litevirt made here outside any
+// network's provisioning: a flat bridge a NIC fell back to.
+func (f *NetProvFake) RecordCreatedBridge(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created[name] = true
+}
+
+// SetOperatorBridge marks name as a bridge an operator made: Provision on it
+// never counts it as litevirt's.
+func (f *NetProvFake) SetOperatorBridge(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.operator[name] = true
+}
+
+// Serving lists the devices that serve a subnet here (gateway address and
+// dnsmasq), sorted.
+func (f *NetProvFake) Serving() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.devSubnets))
+	for d := range f.devSubnets {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Sweeps counts RemoveOrphanedBridge removals of bridge.
+func (f *NetProvFake) Sweeps(bridge string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sweeps[bridge]
 }
 
 // Provisioned answers whether network is still set up on this node.
@@ -136,8 +217,10 @@ func (f *NetProvFake) Provisioned(name string, _ compose.NetworkDef) bool {
 func (f *NetProvFake) Lose(network string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if dev, ok := f.up[network]; ok {
+		delete(f.devSubnets, dev)
+	}
 	delete(f.up, network)
-	delete(f.subnets, network)
 }
 
 // EnsureBridge is a Server.SetBridgeEnsure seam that records the flat bridges

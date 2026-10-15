@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // BridgeExists returns true if a network interface with the given name exists.
@@ -150,6 +151,84 @@ func RemoveCreatedBridgeIfUnused(name string) (bool, error) {
 		return false, nil
 	}
 	return RemoveBridgeIfUnused(name) // drops the record when it deletes
+}
+
+// orphanBridgeGrace is how old a bridge's record must be before
+// RemoveOrphanedBridge removes it: a bridge EnsureBridge has only just made
+// may not be named by its network or workload row yet. A variable so a test
+// can set it.
+var orphanBridgeGrace = 2 * time.Minute
+
+// CreatedBridges lists the bridges this host's records say EnsureBridge
+// created (createdBridgeDir). A record of a bridge since gone is listed too;
+// RemoveOrphanedBridge drops it.
+func CreatedBridges() ([]string, error) {
+	ents, err := os.ReadDir(createdBridgeDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() && validLinkName(e.Name()) == nil {
+			out = append(out, e.Name())
+		}
+	}
+	return out, nil
+}
+
+// RemoveOrphanedBridge removes bridge name, which the caller found no network
+// and no workload names, when EnsureBridge created it on this host (its
+// record names its current ifindex), the record is older than
+// orphanBridgeGrace, and nothing at all is plugged into it. The dnsmasq
+// litevirt ran on it is stopped and its lease and hosts files removed first;
+// its gateway address goes with the bridge. It reports whether it removed it.
+// A bridge without a record — an operator's — is never touched.
+func RemoveOrphanedBridge(name string) (bool, error) {
+	if validLinkName(name) != nil {
+		return false, nil
+	}
+	recPath := createdBridgeRecord(name)
+	rec, err := os.ReadFile(recPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := os.Stat(filepath.Join(sysClassNet, name)); errors.Is(err, fs.ErrNotExist) {
+		forgetCreatedBridge(name) // the bridge is gone already
+		return false, nil
+	}
+	idx, err := bridgeIfindex(name)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(string(rec)) != idx {
+		forgetCreatedBridge(name) // not the device litevirt made
+		return false, nil
+	}
+	if fi, err := os.Stat(recPath); err != nil {
+		return false, err
+	} else if time.Since(fi.ModTime()) < orphanBridgeGrace {
+		return false, nil
+	}
+	ports, err := os.ReadDir(filepath.Join(sysClassNet, name, "brif"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	if len(ports) > 0 {
+		return false, nil
+	}
+	stopDHCPAndForgetLeases(dnsmasqPidFile(name), name)
+	out, err := execCommand("ip", "link", "del", name)
+	if err != nil && !isNoSuchDevice(out) {
+		return false, fmt.Errorf("ip link del %s: %w: %s", name, err, out)
+	}
+	forgetCreatedBridge(name)
+	return true, nil
 }
 
 // EnsureBridge idempotently creates a Linux bridge and brings it up, and

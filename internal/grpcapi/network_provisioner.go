@@ -61,6 +61,14 @@ func (hostNetworkProvisioner) GuestPorts(bridge string) ([]string, error) {
 	return network.BridgeGuestPorts(bridge)
 }
 
+func (hostNetworkProvisioner) CreatedBridges() ([]string, error) {
+	return network.CreatedBridges()
+}
+
+func (hostNetworkProvisioner) RemoveOrphanedBridge(name string) (bool, error) {
+	return network.RemoveOrphanedBridge(name)
+}
+
 func (hostNetworkProvisioner) SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
 	return network.SyncFDB(ctx, db, name, def, hostName)
 }
@@ -88,7 +96,7 @@ func (s *Server) ProvisionNetworkHere(ctx context.Context, db *corrosion.Client,
 			return "", err
 		}
 	}
-	dev, err := s.networkProvisioner().Provision(ctx, db, name, def, localIP, hostName)
+	dev, err := s.provisionDevice(ctx, db, name, def, localIP, hostName)
 	if err == nil {
 		s.pushVTEP(ctx, name, def, localIP)
 	}
@@ -103,7 +111,7 @@ func (s *Server) provisionHere(ctx context.Context, name string, def compose.Net
 	if err != nil {
 		return "", "", err
 	}
-	dev, err = s.networkProvisioner().Provision(ctx, s.db, name, def, vtep, s.hostName)
+	dev, err = s.provisionDevice(ctx, s.db, name, def, vtep, s.hostName)
 	if err == nil {
 		s.pushVTEP(ctx, name, def, vtep)
 	}

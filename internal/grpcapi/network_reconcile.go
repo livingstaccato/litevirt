@@ -173,7 +173,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		if s.teardownWaitsForLocalUse(ctx, st, r.name, network.BridgeName(r.name, def)) {
 			continue // not torn: retried next pass
 		}
-		if err := prov.Deprovision(ctx, s.db, r.name, def, s.hostName); err != nil {
+		if err := s.deprovisionDevice(ctx, r.name, def); err != nil {
 			slog.Warn("network reconcile: tear down deleted network failed (will retry)",
 				"network", r.name, "error", err)
 			continue
@@ -195,7 +195,7 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		if s.teardownWaitsForLocalUse(ctx, st, name, network.BridgeName(name, a.def)) {
 			continue
 		}
-		if err := prov.Deprovision(ctx, s.db, name, a.def, s.hostName); err != nil {
+		if err := s.deprovisionDevice(ctx, name, a.def); err != nil {
 			slog.Warn("network reconcile: tear down vanished network failed (will retry)",
 				"network", name, "error", err)
 			continue
@@ -203,6 +203,11 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		delete(st.applied, name)
 		changed = true
 	}
+
+	// A bridge litevirt made that nothing names any more goes before any
+	// network is provisioned: one still holding a moved network's gateway
+	// address would stop its new device's dnsmasq.
+	s.sweepOrphanedBridges(ctx, st, live, dead)
 
 	for _, r := range live {
 		sig := r.typ + "\x00" + r.config

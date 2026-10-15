@@ -542,6 +542,11 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	if len(req.Ports) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "at least one port required")
 	}
+	// The algorithm and each listener's protocol are rendered into the
+	// root-run HAProxy config.
+	if ps := lb.CheckSettings(lb.SettingsFromPB(req.Algorithm, standaloneProtocols(req.Ports), nil, false)); len(ps) > 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", ps[0])
+	}
 	if len(req.Backends) == 0 && len(req.VmBackends) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "at least one backend required")
 	}
@@ -1499,6 +1504,9 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 
 	algorithm := r.String("algorithm")
 	if req.Algorithm != "" {
+		if err := validLBAlgorithm(req.Algorithm); err != nil {
+			return nil, err
+		}
 		algorithm = req.Algorithm
 	}
 
@@ -1537,6 +1545,9 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 
 	portsStr := r.String("ports")
 	if len(req.Ports) > 0 {
+		if ps := lb.CheckSettings(lb.SettingsFromPB("", standaloneProtocols(req.Ports), nil, false)); len(ps) > 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", ps[0])
+		}
 		p, _ := json.Marshal(req.Ports)
 		portsStr = string(p)
 	}
@@ -1995,7 +2006,7 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 		return
 	}
 
-	settings := lbSettingsFromPB(lbSpec.Algorithm, lbSpec.Ports, lbSpec.Health, lbSpec.StickySessions)
+	settings := lb.SettingsFromPB(lbSpec.Algorithm, lbSpec.Ports, lbSpec.Health, lbSpec.StickySessions)
 
 	lbName := spec.StackName + "-lb"
 	backends := s.collectLBBackends(ctx, spec.StackName, lbSpec)
@@ -2915,7 +2926,7 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 // applyLBForStack is called by DeployStack when a VM def has loadbalancer.enabled = true.
 // It builds the HAProxy + keepalived config and applies it on the designated LB hosts.
-func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settings lbSettings, backends []lb.Backend, lbHosts []string, snat bool) error {
+func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settings lb.Settings, backends []lb.Backend, lbHosts []string, snat bool) error {
 	// Only apply if this host is in the designated LB hosts list.
 	// Callers must resolve empty hosts before calling this function.
 	isLBHost := false
@@ -2928,7 +2939,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settin
 	if !isLBHost {
 		return nil
 	}
-	ports := settings.Ports
+	ports := s.servableLBPorts(lbName, settings.Ports)
 
 	vipIP, vipPrefix, err := lb.ParseVIP(vip)
 	if err != nil {
@@ -2989,43 +3000,90 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settin
 	return nil
 }
 
-// lbSettings is what a stack LB's spec says about its listeners and backends,
-// in lb's terms.
-type lbSettings struct {
-	Algorithm string
-	Ports     []lb.Port
-	Health    *lb.HealthConfig
-	Sticky    bool
-}
-
-// lbSettingsFromPB converts a stack LB's wire settings into what its apply
-// serves (applyLBFromSpec).
-func lbSettingsFromPB(algorithm string, ports []*pb.LBPort, health *pb.LBHealthSpec, sticky bool) lbSettings {
-	out := lbSettings{Algorithm: algorithm, Sticky: sticky}
-	if out.Algorithm == "" {
-		out.Algorithm = "roundrobin"
+// servableLBPorts is ports as this LB can serve them. Ingress refuses a
+// redirect-https that cannot work, but a spec stored before that check may
+// hold one: that port is served without its redirect, and an event says so,
+// rather than the LB failing. A TLS file outside lb.CertDir, which ingress
+// now gives only to an admin, is still served, with an event naming it.
+func (s *Server) servableLBPorts(lbName string, in []lb.Port) []lb.Port {
+	ports := append([]lb.Port(nil), in...)
+	var drop []int
+	for i := range ports {
+		if msg := lb.RedirectProblem(ports, i); msg != "" {
+			drop = append(drop, i)
+			detail := fmt.Sprintf("port %d: redirect-https left out: %s", ports[i].Listen, msg)
+			slog.Warn("lb: "+detail, "lb", lbName)
+			s.publish("lb.redirect_ignored", lbName, detail)
+		}
+	}
+	for _, i := range drop {
+		ports[i].RedirectHTTPS = false
 	}
 	for _, p := range ports {
-		port := lb.Port{
-			Listen:        int(p.Listen),
-			Target:        int(p.Target),
-			Protocol:      p.Protocol,
-			RedirectHTTPS: p.RedirectHttps,
+		if p.TLS == nil {
+			continue
 		}
-		if p.Tls != nil {
-			port.TLS = &lb.TLSConfig{Cert: p.Tls.Cert, Key: p.Tls.Key}
-		}
-		out.Ports = append(out.Ports, port)
-	}
-	if health != nil {
-		out.Health = &lb.HealthConfig{Type: health.Type, Path: health.Path}
-		if health.Interval != "" {
-			if d, err := time.ParseDuration(health.Interval); err == nil {
-				out.Health.IntervalMS = int(d.Milliseconds())
+		for _, f := range []string{p.TLS.Cert, p.TLS.Key} {
+			if lb.TLSPathOutsideCertDir(f) {
+				detail := fmt.Sprintf("port %d: TLS file %s is outside %s; a new spec naming it needs the admin role", p.Listen, f, lb.CertDir)
+				slog.Warn("lb: "+detail, "lb", lbName)
+				s.publish("lb.tls_outside_cert_dir", lbName, detail)
 			}
 		}
 	}
+	return ports
+}
+
+// validateLBSpec refuses a VM spec's load balancer that may not be rendered
+// (lb.CheckSettings).
+func validateLBSpec(spec *pb.LBSpec) error {
+	if spec == nil || !spec.Enabled {
+		return nil
+	}
+	if ps := lb.CheckSettings(lb.SettingsFromPB(spec.Algorithm, spec.Ports, spec.Health, spec.StickySessions)); len(ps) > 0 {
+		return fmt.Errorf("loadbalancer.%s", ps[0].Error())
+	}
+	return nil
+}
+
+// requireAdminForLBTLS: the daemon reads an LB's TLS files as root, so a spec
+// naming one outside lb.CertDir needs the admin role, as hooks do.
+func requireAdminForLBTLS(ctx context.Context, spec *pb.LBSpec) error {
+	if spec == nil || !spec.Enabled {
+		return nil
+	}
+	for _, p := range spec.Ports {
+		if p.Tls == nil {
+			continue
+		}
+		for _, f := range []string{p.Tls.Cert, p.Tls.Key} {
+			if lb.TLSPathOutsideCertDir(f) {
+				if err := RequireRole(ctx, "admin"); err != nil {
+					return status.Errorf(codes.PermissionDenied,
+						"load balancer TLS file %s is outside %s: naming it requires the admin role (it is read as root on every LB host)", f, lb.CertDir)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// standaloneProtocols is ports with only what a standalone LB renders of
+// them (listen, target, protocol), for checking.
+func standaloneProtocols(ports []*pb.LBPort) []*pb.LBPort {
+	out := make([]*pb.LBPort, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, &pb.LBPort{Listen: p.Listen, Target: p.Target, Protocol: p.Protocol})
+	}
 	return out
+}
+
+// validLBAlgorithm refuses an algorithm a new LB may not be given.
+func validLBAlgorithm(a string) error {
+	if ps := lb.CheckSettings(lb.Settings{Algorithm: a}); len(ps) > 0 {
+		return status.Errorf(codes.InvalidArgument, "%v", ps[0])
+	}
+	return nil
 }
 
 // lbSNATSync turns on conntrackd for an LB with snat, which keeps its SNAT'd

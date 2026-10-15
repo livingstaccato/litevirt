@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -104,6 +105,7 @@ func fakeLBBinaries(t *testing.T) string {
 		}
 	}
 	t.Setenv("PATH", dir)
+	resetConntrackdLookup(t)
 	return dir
 }
 
@@ -142,8 +144,13 @@ func TestApply_SNATStartsConntrackd(t *testing.T) {
 		t.Errorf("notify script not written: %v", err)
 	}
 	ka, _ := os.ReadFile(filepath.Join(m.configDir, "snat-lb-keepalived.conf"))
-	if !strings.Contains(string(ka), "notify_master") {
-		t.Errorf("keepalived has no notify hooks:\n%s", ka)
+	// The hooks name the script where this manager wrote it.
+	if !strings.Contains(string(ka), `notify_master "`+filepath.Join(m.configDir, "snat-lb-notify.sh")+` MASTER"`) {
+		t.Errorf("keepalived has no notify hook on %s:\n%s", m.configDir, ka)
+	}
+	notify, _ := os.ReadFile(filepath.Join(m.configDir, "snat-lb-notify.sh"))
+	if !strings.Contains(string(notify), `CONF="`+ctPath+`"`) {
+		t.Errorf("notify script does not name %s:\n%s", ctPath, notify)
 	}
 	calls, _ := os.ReadFile(filepath.Join(bin, "conntrackd.calls"))
 	if got := strings.TrimSpace(string(calls)); got != "-C "+ctPath+" -d" {
@@ -167,5 +174,45 @@ func TestApply_SNATStartsConntrackd(t *testing.T) {
 	ka, _ = os.ReadFile(filepath.Join(m.configDir, "snat-lb-keepalived.conf"))
 	if strings.Contains(string(ka), "notify_master") {
 		t.Errorf("keepalived keeps notify hooks without SNAT:\n%s", ka)
+	}
+}
+
+// resetConntrackdLookup makes the next apply look conntrackd up again.
+func resetConntrackdLookup(t *testing.T) {
+	t.Helper()
+	conntrackdOnce, conntrackdFound = sync.Once{}, false
+	t.Cleanup(func() { conntrackdOnce, conntrackdFound = sync.Once{}, false })
+}
+
+// TestApply_SNATWithoutConntrackd: with conntrackd not installed, an SNAT
+// apply writes its config and starts nothing, and the lookup is made once.
+//
+// Mutation: drop conntrackdInstalled() from startCT — red.
+func TestApply_SNATWithoutConntrackd(t *testing.T) {
+	bin := fakeLBBinaries(t)
+	if err := os.Remove(filepath.Join(bin, "conntrackd")); err != nil {
+		t.Fatal(err)
+	}
+	looks := 0
+	orig := lookConntrackd
+	lookConntrackd = func() error { looks++; return orig() }
+	t.Cleanup(func() { lookConntrackd = orig })
+	m := testManager(t)
+	cfg := Config{
+		Name: "nct-lb", VIP: "10.0.1.200", VIPPrefix: 24, Interface: "br0", VRID: 21, Priority: 100,
+		Backends:    []Backend{{Name: "b1", IP: "10.0.1.10", Port: 8080}},
+		Ports:       []Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
+		SNATEnabled: true, LocalIP: "192.0.2.11", PeerIP: "192.0.2.12", Subnet: "10.0.1.0/24",
+	}
+	for i := 0; i < 2; i++ {
+		if err := m.Apply(context.Background(), cfg); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(bin, "conntrackd.calls")); !os.IsNotExist(err) {
+		t.Errorf("conntrackd run although not installed")
+	}
+	if looks != 1 {
+		t.Errorf("conntrackd looked up %d times over two applies, want once", looks)
 	}
 }

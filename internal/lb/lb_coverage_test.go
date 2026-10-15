@@ -157,7 +157,11 @@ func TestVRIDFromString_Whitespace(t *testing.T) {
 // ── RenderHAProxy edge cases ────────────────────────────────────────────────
 
 func TestRenderHAProxy_EmptyConfig(t *testing.T) {
-	cfg := Config{}
+	// No name names no files: refused.
+	if _, err := RenderHAProxy(Config{}); err == nil {
+		t.Error("a config with no name rendered")
+	}
+	cfg := Config{Name: "empty"}
 	out, err := RenderHAProxy(cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

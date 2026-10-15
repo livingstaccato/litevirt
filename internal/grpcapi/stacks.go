@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +73,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// is pulled, provisioned or registered.
 	if err := s.authorizeComposeHostPaths(ctx, f); err != nil {
 		return err
+	}
+	// An LB's TLS files are read as root on every LB host: outside
+	// lb.CertDir, naming one needs the admin role (requireAdminForLBTLS).
+	for _, name := range slices.Sorted(maps.Keys(f.VMs)) {
+		if err := requireAdminForLBTLS(ctx, compose.BuildLBSpec(f.VMs[name].LoadBalancer)); err != nil {
+			return err
+		}
 	}
 
 	// Auto-pull images defined in the compose images: section that are missing locally.

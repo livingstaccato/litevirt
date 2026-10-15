@@ -1592,6 +1592,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The runtime-inventory collector reads owner-epoch markers from the same
 	// root the container checker converges them into.
 	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
+	// An LB's TLS files are read as root; never from litevirt's own keys.
+	lb.SetProtectedDirs(d.cfg.PKIDir, d.cfg.DataDir)
 
 	// Advertise the host's capabilities as labels so placement puts a workload
 	// only on a host that can run it:

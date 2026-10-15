@@ -108,9 +108,11 @@ type NetworkAction struct {
 
 // LBAction describes load balancer setup or teardown.
 type LBAction struct {
-	Kind        OpKind
-	Name        string
-	VMName      string // the compose VM whose loadbalancer this is (compose.BuildLBSpec)
+	Kind   OpKind
+	Name   string
+	VMName string // the compose VM whose loadbalancer this is (compose.BuildLBSpec)
+	// VIP, Algorithm and Ports are for display (Detail, the plan). The apply
+	// builds the LB from its definition, which carries more than these.
 	VIP         string
 	Algorithm   string
 	Ports       []lb.Port

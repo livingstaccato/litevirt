@@ -46,6 +46,26 @@ type Config struct {
 	// SyncInterface is the device holding LocalIP, which conntrackd syncs
 	// over. Empty: Interface.
 	SyncInterface string
+
+	// ConfigDir is the directory the manager writes this LB's files to, which
+	// the rendered configs name (TLS PEMs, the notify script, conntrackd's
+	// config). Empty: DefaultConfigDir.
+	ConfigDir string
+}
+
+// DefaultConfigDir is where the manager writes LB configs in production.
+const DefaultConfigDir = "/etc/litevirt/lb"
+
+// withDefaults returns cfg ready to render, or an error when it may not be
+// rendered at all (checkRender).
+func withDefaults(cfg Config) (Config, error) {
+	if cfg.ConfigDir == "" {
+		cfg.ConfigDir = DefaultConfigDir
+	}
+	if err := checkRender(cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // HealthConfig configures HAProxy backend health checking.
@@ -101,7 +121,7 @@ defaults
 {{- range .Ports}}
 frontend {{$.Name}}-{{.Listen}}
     {{- if .TLS}}
-    bind {{$.VIP}}:{{.Listen}} ssl crt /etc/litevirt/lb/{{$.Name}}-{{.Listen}}.pem
+    bind {{$.VIP}}:{{.Listen}} ssl crt {{$.ConfigDir}}/{{$.Name}}-{{.Listen}}.pem
     {{- else}}
     bind {{$.VIP}}:{{.Listen}}
     {{- end}}
@@ -165,15 +185,19 @@ vrrp_instance {{.Name}} {
     }
 {{- if .SNATEnabled}}
 
-    notify_master "/etc/litevirt/lb/{{.Name}}-notify.sh MASTER"
-    notify_backup "/etc/litevirt/lb/{{.Name}}-notify.sh BACKUP"
-    notify_fault  "/etc/litevirt/lb/{{.Name}}-notify.sh FAULT"
+    notify_master "{{.ConfigDir}}/{{.Name}}-notify.sh MASTER"
+    notify_backup "{{.ConfigDir}}/{{.Name}}-notify.sh BACKUP"
+    notify_fault  "{{.ConfigDir}}/{{.Name}}-notify.sh FAULT"
 {{- end}}
 }
 `))
 
 // RenderHAProxy produces an haproxy.cfg content string.
 func RenderHAProxy(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.Algorithm == "" {
 		cfg.Algorithm = "roundrobin"
 	}
@@ -206,6 +230,10 @@ func RenderHAProxy(cfg Config) (string, error) {
 // multiple VIPs per instance, parseKeepalivedVIP + DemoteAll must be revisited to
 // enumerate all of them (today "one LB ⇒ one VIP" makes single-address parsing exact).
 func RenderKeepalived(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	var buf bytes.Buffer
 	// Augment cfg with a derived, per-LB VRRP auth password (F6).
 	data := struct {
@@ -220,6 +248,10 @@ func RenderKeepalived(cfg Config) (string, error) {
 
 // RenderConntrackd produces a conntrackd.conf for SNAT conntrack sync between VRRP peers.
 func RenderConntrackd(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	if cfg.LocalIP == "" || cfg.PeerIP == "" {
 		return "", fmt.Errorf("conntrackd requires LocalIP and PeerIP")
 	}
@@ -232,6 +264,10 @@ func RenderConntrackd(cfg Config) (string, error) {
 
 // RenderNotifyScript produces the keepalived notify script for conntrackd state transitions.
 func RenderNotifyScript(cfg Config) (string, error) {
+	cfg, err := withDefaults(cfg)
+	if err != nil {
+		return "", err
+	}
 	var buf bytes.Buffer
 	if err := notifyTmpl.Execute(&buf, cfg); err != nil {
 		return "", fmt.Errorf("render notify script: %w", err)
@@ -268,7 +304,7 @@ General {
 // notifyTmpl drives this LB's conntrackd on a VRRP transition. conntrackd's
 // -C names its CONFIG file, which says where its control socket is.
 var notifyTmpl = template.Must(template.New("notify").Parse(`#!/bin/bash
-CONF="/etc/litevirt/lb/{{.Name}}-conntrackd.conf"
+CONF="{{.ConfigDir}}/{{.Name}}-conntrackd.conf"
 case "$1" in
     MASTER)
         conntrackd -C "$CONF" -c

@@ -47,8 +47,8 @@ vms:
           target: 8080
           protocol: http
           tls:
-            cert: /etc/lbf/cert.pem
-            key: /etc/lbf/key.pem
+            cert: /etc/litevirt/lb-certs/lbf.crt
+            key: /etc/litevirt/lb-certs/lbf.key
       health:
         type: http
         path: /healthz
@@ -116,7 +116,7 @@ func checkFullLBConfig(t *testing.T, round, i int, c lb.Config) {
 	if p := c.Ports[0]; p.Listen != 80 || !p.RedirectHTTPS || p.TLS != nil {
 		t.Errorf("deploy %d apply %d: port 80 %+v, want redirect-https", round, i, p)
 	}
-	if p := c.Ports[1]; p.Listen != 443 || p.TLS == nil || p.TLS.Cert != "/etc/lbf/cert.pem" || p.TLS.Key != "/etc/lbf/key.pem" {
+	if p := c.Ports[1]; p.Listen != 443 || p.TLS == nil || p.TLS.Cert != "/etc/litevirt/lb-certs/lbf.crt" || p.TLS.Key != "/etc/litevirt/lb-certs/lbf.key" {
 		t.Errorf("deploy %d apply %d: port 443 %+v, want TLS with the file's cert and key", round, i, p)
 	}
 }

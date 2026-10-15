@@ -25,7 +25,7 @@ func applySNATLB(t *testing.T, snat bool, hosts []string) lb.Config {
 	var applied []lb.Config
 	s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
 	if err := s.applyLBForStack(ctx, "lbr-lb", "10.202.0.250/24",
-		lbSettings{Algorithm: "roundrobin", Ports: []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}}},
+		lb.Settings{Algorithm: "roundrobin", Ports: []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}}},
 		[]lb.Backend{{Name: "lbr1", IP: "10.202.0.72", Port: 8080}}, hosts, snat); err != nil {
 		t.Fatalf("apply: %v", err)
 	}

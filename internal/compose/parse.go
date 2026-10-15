@@ -12,6 +12,9 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	lbpkg "github.com/litevirt/litevirt/internal/lb"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // Parse reads and validates a compose file from disk. Validation problems name
@@ -426,6 +429,9 @@ func validate(f *File) error {
 func (v *validator) validate(f *File) {
 	if f.Name == "" {
 		v.ps.add("name", "stack name is required", "add 'name: <stack-name>' to your compose file")
+	} else if err := safename.ValidateStackName(f.Name); err != nil {
+		// It names the stack's LB, whose root-owned files are named after it.
+		v.ps.add("name", err.Error(), "")
 	}
 
 	// Validate network definitions.
@@ -498,6 +504,7 @@ func (v *validator) validate(f *File) {
 		}
 	}
 
+	var lbVMs []string // VMs with an enabled loadbalancer
 	for name, vm := range f.VMs {
 		p := v.vm(name)
 
@@ -556,6 +563,12 @@ func (v *validator) validate(f *File) {
 					v.ps.add(pp+".target", "target must be > 0", "")
 				}
 			}
+			// What reaches the root-run haproxy/keepalived configs.
+			spec := BuildLBSpec(vm.LoadBalancer)
+			for _, p := range lbpkg.CheckSettings(lbpkg.SettingsFromPB(spec.Algorithm, spec.Ports, spec.Health, spec.StickySessions)) {
+				v.ps.add(lb+"."+p.Field, p.Msg, "")
+			}
+			lbVMs = append(lbVMs, name)
 		}
 
 		// Healthcheck: a target the checker cannot interpret can never pass,
@@ -634,6 +647,13 @@ func (v *validator) validate(f *File) {
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")
 		}
+	}
+	// A stack has one LB (<stack>-lb): two definitions would each be applied
+	// over the other.
+	if len(lbVMs) > 1 {
+		sort.Strings(lbVMs)
+		v.ps.add(v.vm(lbVMs[1])+".loadbalancer", fmt.Sprintf("a stack has one load balancer; %s already defines it", strings.Join(lbVMs[:1], "")),
+			"keep one loadbalancer section; every VM of the stack is its backend")
 	}
 
 	// Validate depends-on: targets must exist and no cycles.

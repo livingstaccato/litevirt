@@ -829,19 +829,30 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         - listen: 80                    # VIP listener port
           target: 8080                  # Backend VM port
           protocol: "tcp"               # tcp | http
-          redirect-https: false         # Redirect HTTP to HTTPS (not on a tls port)
+          redirect-https: false         # Redirect HTTP to HTTPS (see below)
         - listen: 443
           target: 8443
           protocol: "tcp"
-          tls:                          # TLS termination (optional)
-            cert: "/path/to/cert.pem"
-            key: "/path/to/key.pem"
+          tls:                          # TLS termination (optional; see below)
+            cert: "/etc/litevirt/lb-certs/web.crt"
+            key: "/etc/litevirt/lb-certs/web.key"
       health:
         use-vm-healthcheck: true        # Reuse VM healthcheck for backend health
         type: "http"                    # tcp | http
         path: "/health"                 # HTTP health check path
         interval-ms: 2000               # Check interval in milliseconds
 ```
+
+A stack has at most one `loadbalancer` section. The stack's `name` must use only letters, digits, `_`, `.` and `-`.
+
+Values are checked before anything is deployed:
+
+- `algorithm` is `roundrobin`, `leastconn` or `source`.
+- `protocol` and `health.type` are `tcp` or `http`.
+- `health.path` is one absolute path of visible ASCII, without spaces, quotes, `#`, `\` or braces, at most 512 characters.
+- `redirect-https` needs `protocol: http`, no `tls` on the same port, and a `tls` port on the same load balancer to redirect to. A spec stored before this check with any other redirect is served without that redirect, and a `lb.redirect_ignored` event says so.
+
+**TLS files** are read as root on every LB host, from `/etc/litevirt/lb-certs/`. Naming a file anywhere else needs the admin role. Each file must be a regular file of at most 1 MiB, named directly (not through a symlink, so point at Let's Encrypt's `archive/` copy or copy the files in, rather than naming `live/`). A file under the PKI directory, the data directory or `/etc/litevirt/lb` is always refused. An LB stored before this rule with files elsewhere keeps working, and each apply raises a `lb.tls_outside_cert_dir` event that names the file.
 
 **Where the VIP goes**: a VIP inside a network's subnet is put on that network's
 bridge on each LB host (when several networks' subnets hold it: a network of

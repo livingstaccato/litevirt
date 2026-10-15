@@ -73,7 +73,14 @@ func validateSpecNames(spec *pb.VMSpec) error {
 			return fmt.Errorf("disk %q: %w", d.Name, err)
 		}
 	}
-	return nil
+	// The stack name names the stack's LB, whose root-owned config files and
+	// notify script are named after it.
+	if spec.StackName != "" {
+		if err := safename.ValidateStackName(spec.StackName); err != nil {
+			return err
+		}
+	}
+	return validateLBSpec(spec.Loadbalancer)
 }
 
 func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
@@ -202,6 +209,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			return nil, status.Error(codes.PermissionDenied,
 				"defining VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
 		}
+	}
+	if err := requireAdminForLBTLS(ctx, spec.Loadbalancer); err != nil {
+		return nil, err
 	}
 
 	// Check if VM already exists. A rebuild or recreate whose replica here has

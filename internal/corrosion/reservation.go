@@ -452,8 +452,9 @@ func reservationCounts(id, opID string, rv ReservationVector, admitted bool) boo
 // verify, so it now holds capacity against every later-arriving claimant whatever
 // its id (reservationCounts). The caller writes it BEFORE it releases its
 // admission lock; a claim that fails verify is released instead, never marked.
-func MarkReservationAdmitted(ctx context.Context, c *Client, opID string) error {
-	return AppendOperationStep(ctx, c, OperationStepRecord{OperationID: opID, StepName: OpStepAdmitted})
+// ownerEpoch is the epoch of the operation's header, like every other step.
+func MarkReservationAdmitted(ctx context.Context, c *Client, opID string, ownerEpoch int64) error {
+	return AppendOperationStep(ctx, c, OperationStepRecord{OperationID: opID, OwnerEpoch: ownerEpoch, StepName: OpStepAdmitted})
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations

@@ -165,6 +165,25 @@ type Fake struct {
 	// fwGuard mirrors libvirt.Client.SetFirmwareMoveGuard: every start,
 	// resume, stop, define and undefine asks it first, as the client does.
 	fwGuard libvirt.FirmwareMoveGuard
+	// fwStore is the host's firmware store (SetFirmwareStore): the files
+	// the libvirt model in firmware_live.go acts on. nil: no firmware state.
+	fwStore *libvirt.FirmwareStore
+	// pendingNvram is, per migrated-in guest that has not resumed yet, the
+	// source's final NVRAM its QEMU writes to the file on resume (probe
+	// (d)). offReason is the shut-off reason the model gave a domain
+	// (migrated, or a ShutOffDomain reason); a start clears it.
+	pendingNvram map[string][]byte
+	offReason    map[string]string
+	// Firmware move knobs (spec §15). CorruptLandedPermall makes
+	// LandFirmwareLive on this (target) fake write an altered permall.
+	// FailAfterTargetTree fails LandFirmwareLive once the target's swtpm
+	// tree exists, before any domain is defined here. ReportSourceReasonUnknown
+	// makes this (source) fake report reason unknown, not migrated, for the
+	// shut-off a FirmwareLive migrate leaves; it is called under the fake's
+	// lock and must not call the fake.
+	CorruptLandedPermall      func(name string) bool
+	FailAfterTargetTree       func(name string) error
+	ReportSourceReasonUnknown func(name string) bool
 	// OnRunning, when set, is called (outside the fake's lock) each time a
 	// domain starts running: a start, a resume. A scenario samples what is in
 	// force at the moment a guest runs.
@@ -423,6 +442,12 @@ func (f *Fake) EventLog() []Event {
 func (f *Fake) SetState(name string, s State) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if s != StatePaused {
+		delete(f.pendingNvram, name)
+	}
+	if s != StateShutdown {
+		delete(f.offReason, name)
+	}
 	f.domains[name] = s
 }
 
@@ -810,6 +835,7 @@ func (f *Fake) startDomain(name string, paused bool) error {
 		f.record("shutoff-late", name, "")
 		return fmt.Errorf("libvirtfake: domain %q is already running", name)
 	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateRunning
 	if paused {
 		f.domains[name] = StatePaused
@@ -871,6 +897,7 @@ func (f *Fake) resumeDomain(name string) error {
 	}
 	f.domains[name] = StateRunning
 	f.record("resume", name, "")
+	f.flushPendingNvramLocked(name)
 	defer func() { f.mu.Unlock(); f.running(name); f.mu.Lock() }()
 	return nil
 }
@@ -933,6 +960,7 @@ func (f *Fake) shutdownDomain(name string) error {
 		f.lateWaits[name] = 0
 		return nil
 	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateShutdown
 	delete(f.liveConsolePw, name)
 	return nil
@@ -956,6 +984,7 @@ func (f *Fake) destroyDomain(name string) error {
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
+	f.leftStateLocked(name)
 	f.domains[name] = StateShutdown
 	delete(f.liveConsolePw, name)
 	f.record("destroy", name, "")
@@ -986,7 +1015,10 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
 	delete(f.managedInc, name)
+	f.leftStateLocked(name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
+	// Probe (g): the NVRAM goes with the definition, the swtpm tree stays.
+	f.deleteNvramLocked(name)
 	if hook := f.OnUndefined; hook != nil {
 		f.mu.Unlock()
 		hook(name)
@@ -995,8 +1027,8 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
-// UndefineDomainPreservingState mirrors UndefineDomain for the fake but records
-// that NVRAM/vTPM state is kept (the fake has no real firmware state).
+// UndefineDomainPreservingState mirrors UndefineDomain but keeps the domain's
+// NVRAM and swtpm state (KEEP_NVRAM|KEEP_TPM, probe (b)).
 func (f *Fake) UndefineDomainPreservingState(name string) error {
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
 		return fmt.Errorf("undefine (keep state) domain %s: %w", name, err)
@@ -1032,6 +1064,7 @@ func (f *Fake) undefinePreservingState(name string) error {
 	delete(f.stats, name)
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
+	f.leftStateLocked(name)
 	f.record("undefine", name, "keep_state=true")
 	if hook := f.OnUndefined; hook != nil {
 		f.mu.Unlock()
@@ -1177,6 +1210,9 @@ func (f *Fake) domainStateReason(name string) (libvirt.DomainStatus, error) {
 		coarse = "stopped"
 	}
 	reason := f.reasons[name]
+	if reason == "" && s == StateShutdown {
+		reason = f.offReason[name]
+	}
 	if reason == "" {
 		switch s {
 		case StateRunning:
@@ -1452,13 +1488,25 @@ func (f *Fake) ConsolePassword(name, kind string) (string, error) {
 // define of ours runs, so no console password policy applies — and the guest
 // runs with the passwords it already had.
 func (f *Fake) LandMigrated(domXML string) {
+	f.LandMigratedState(domXML, false)
+}
+
+// LandMigratedState is LandMigrated for a guest that arrives paused when
+// paused is set (VIR_MIGRATE_PAUSED), running otherwise.
+func (f *Fake) LandMigratedState(domXML string, paused bool) {
 	name := domainNameFromXML(domXML)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.leftStateLocked(name)
 	f.xml[name] = domXML
 	f.domains[name] = StateRunning
+	note := ""
+	if paused {
+		f.domains[name] = StatePaused
+		note = "paused=true"
+	}
 	f.captureConsolePasswordsLocked(name, domXML)
-	f.record("migrate-in", name, "")
+	f.record("migrate-in", name, note)
 }
 
 // captureConsolePasswordsLocked records the console passwords a guest runs
@@ -2077,6 +2125,14 @@ func (f *Fake) SetBootOrder(domainName, bootOrder string) error {
 // Migration — record and pretend success.
 
 func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) error {
+	// The flags libvirt.Client would send: what it refuses never reaches
+	// libvirt, a guest it asks libvirt to pause arrives paused (D2-4 m-2),
+	// and a source it does not ask libvirt to undefine stays defined.
+	paused, undefineSource, err := libvirt.MigrationOutcome(p)
+	if err != nil {
+		return fmt.Errorf("domain %q: %w", name, err)
+	}
+	p.Paused = paused
 	if f.FailMigrateToTarget != nil {
 		if err := f.FailMigrateToTarget(name, dconnuri); err != nil {
 			return err
@@ -2109,6 +2165,9 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	if p.Paused {
 		note += " paused=true"
 	}
+	if p.FirmwareLive {
+		note += " firmware_live=true"
+	}
 	if len(p.RBDLocators) > 0 {
 		var names []string
 		for n := range p.RBDLocators {
@@ -2135,7 +2194,15 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 		f.mu.Unlock()
 		err := cb(name, dconnuri, p)
 		f.mu.Lock()
-		return err
+		if err != nil {
+			return err
+		}
+	}
+	// Probe (b): without UNDEFINE_SOURCE the source stays defined, shut off,
+	// reason migrated. The source of an ordinary migrate is not modelled:
+	// the fake leaves it as it was.
+	if !undefineSource {
+		f.migratedOutLocked(name)
 	}
 	return nil
 }

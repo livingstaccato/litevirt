@@ -870,6 +870,9 @@ func (c *Cluster) buildServer(n *Node) {
 	// its store: the daemon's own helper (internal/daemon New).
 	fwmig.Wire(n.Virt, n.FW)
 	n.Server.SetFirmwareStore(n.FW)
+	// The fake's libvirt acts on the same files (probe (g), the live
+	// firmware migrate model).
+	n.Virt.SetFirmwareStore(n.FW)
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
@@ -1077,9 +1080,20 @@ func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grp
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return nil, status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return nil, unknownMethod(info.FullMethod)
 	}
 	return handler(ctx, req)
+}
+
+// unknownMethod is what grpc's server answers for a method it does not have
+// (grpc server.go, handleStream): the code and the text an older
+// build gives.
+func unknownMethod(fullMethod string) error {
+	service, method := "", methodName(fullMethod)
+	if i := strings.LastIndex(fullMethod, "/"); i > 0 {
+		service = strings.TrimPrefix(fullMethod[:i], "/")
+	}
+	return status.Errorf(codes.Unimplemented, "unknown method %v for service %v", method, service)
 }
 
 // answersUnimplemented reports whether this node is pretending not to have the
@@ -1104,12 +1118,60 @@ func (n *Node) DoNotImplement(method string) func() {
 	}
 }
 
+// RefuseRPCs makes this node answer each named RPC as a build without it
+// does (DoNotImplement, for several at once): an older peer in a rolling
+// upgrade. Returns a func that serves them again.
+func (n *Node) RefuseRPCs(names ...string) func() {
+	restores := make([]func(), 0, len(names))
+	for _, m := range names {
+		restores = append(restores, n.DoNotImplement(m))
+	}
+	return func() {
+		for _, r := range restores {
+			r()
+		}
+	}
+}
+
+// LandMigrationsOn lands every live migrate n's fake performs on dst, as
+// libvirt would: a FirmwareLive one through the fake's firmware model
+// (libvirtfake.LandFirmwareLive: dst's store gets the permall, the NVRAM on
+// resume, and the source stays defined and shut off), any other one running,
+// or paused when the migrate asks for it. Every fleet node has the same
+// address, so a hook is how a scenario names the target.
+func (n *Node) LandMigrationsOn(dst *Node) {
+	src := n.Virt
+	src.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		if p.FirmwareLive {
+			return dst.Virt.LandFirmwareLive(src, name, p)
+		}
+		x := p.DestXML
+		if x == "" {
+			var err error
+			if x, err = src.DumpXML(name); err != nil {
+				return err
+			}
+		}
+		dst.Virt.LandMigratedState(x, p.Paused)
+		return nil
+	}
+}
+
+// Reconciler is a health reconciler for this node over the node's own data
+// dir and firmware store, as the daemon builds it: a scenario that runs a
+// reconcile pass sees the firmware state the node's server and fake see.
+func (n *Node) Reconciler() *health.Reconciler {
+	r := health.NewReconciler(n.Name, n.FW.DataDir, n.DB, n.Virt)
+	r.SetFirmwareStore(n.FW)
+	return r
+}
+
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
 	if n.answersUnimplemented(info.FullMethod) {
-		return status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+		return unknownMethod(info.FullMethod)
 	}
 	watches := n.takeStreamWatches(methodName(info.FullMethod))
 	for _, w := range watches {

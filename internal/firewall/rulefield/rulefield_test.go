@@ -50,14 +50,15 @@ func TestGrammar(t *testing.T) {
 				"2001:db8::/32", "fd00::1", "::ffff:10.0.0.1"},
 			[]string{"10.0.0.0/8 }", "10.0.0.0/8\n", "10.0.0.0/8;", "10.0.0.0/8 accept", "10.0.0.0/33",
 				"10.0.0.0/8,192.168.0.0/16", "10.0.0.9-10.0.0.1", "  ", "1.2.3",
-				"@", "@1abc", "@a b", "@a\n", "@a;", "{ @office }",
+				"@", "@1abc", "@a b", "@a\n", "@a;", "{ @office }", "@lv_gw4", "!= @lv_nic_devs",
 				"2001:db8::/300", "fd00::1\n", " fd00::1", "!=fd00::1", "fe80::1%eth0", "not-an-address:"}},
 		{Comment, "comment",
 			[]string{"", "admin ssh", "a # b", "it's", "a } b {", "a; b", "héllo", "a\\b", "a\nb", long, long[:121], long[:127]},
 			[]string{`say "hi"`, `x"; ip saddr 0.0.0.0/0 accept; #`, long + "a", strings.Repeat("\n", 65)}},
 		{SetName, "ipset name",
 			[]string{"abc", "A_B9", "a-b", "a/b", "a.b", "_x", ".x", strings.Repeat("a", 255)},
-			[]string{"", "1abc", "-a", "a b", "a\n", "a;", "a{", "a}", `a"`, "@a", strings.Repeat("a", 256), "drop", "ip", "tcp"}},
+			[]string{"", "1abc", "-a", "a b", "a\n", "a;", "a{", "a}", `a"`, "@a", strings.Repeat("a", 256), "drop", "ip", "tcp",
+				"lv_gw4", "lv_nic_devs", "lv_lb_src4", "lv_office"}},
 		{SetElement, "ipset element",
 			[]string{"10.0.0.0/8", "10.0.0.1", " 10.0.0.1", "10.0.0.1-10.0.0.5", "gw.example.com", "fd00::/8", "2001:db8::1",
 				"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,", "10.0.0.1, fd00::1",
@@ -289,5 +290,33 @@ func TestCompanionClash(t *testing.T) {
 		if err := CompanionClash(sets, name); err != nil {
 			t.Errorf("CompanionClash(%s): %v", name, err)
 		}
+	}
+}
+
+// TestSetName_ReservedPrefix (fw-set-freeze round 0b): litevirt's internal
+// sets are named lv_*. A user set of such a name either freezes the bridge
+// table (lv_nic_devs: another type) or merges into the internal set
+// (lv_gw4: widens guest DHCP/DNS reach), so every writer refuses it and
+// says why.
+//
+// Mutation: drop the reserved-prefix check from SetName — red.
+func TestSetName_ReservedPrefix(t *testing.T) {
+	for _, name := range []string{"lv_gw4", "lv_gw6", "lv_lb_src4", "lv_nic_devs", "lv_vlan_ok", "lv_dhcp_srv", "lv_lb4", "lv_office"} {
+		err := SetName(name)
+		if err == nil || !strings.Contains(err.Error(), `"lv_"`) || !strings.Contains(err.Error(), "choose another name") {
+			t.Errorf("SetName(%s) = %v, want a refusal naming the reserved prefix and the remedy", name, err)
+		}
+		if err := UserSetName(name); err == nil {
+			t.Errorf("UserSetName(%s) accepted at load", name)
+		}
+	}
+	for _, name := range []string{"lv", "lvx_a", "LV_gw4", "office_lv_"} {
+		if err := SetName(name); err != nil {
+			t.Errorf("SetName(%s): %v", name, err)
+		}
+	}
+	// The renderer's own internal names still pass the nft-level check.
+	if err := RenderSetName("lv_gw4"); err != nil {
+		t.Errorf("RenderSetName(lv_gw4): %v", err)
 	}
 }

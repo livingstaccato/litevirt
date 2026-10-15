@@ -62,9 +62,10 @@ const (
 	// An ip set is rendered without the elements that cannot be rendered (they
 	// never worked: each one injected or broke the load).
 	HandlingElementsLeftOut = "rendered without its unreadable elements"
-	// An ip set whose name cannot be rendered is left out; a rule referencing
-	// it cannot be rendered either and is held fail-static.
-	HandlingSetLeftOut = "set left out: its name cannot be rendered"
+	// An ip set whose name cannot be rendered, or has the prefix reserved for
+	// litevirt's own sets, is left out; a rule referencing it cannot be
+	// rendered either and is held fail-static.
+	HandlingSetLeftOut = "set left out: its name cannot be rendered or is reserved for litevirt"
 	// A set named <x>_v6 while a set x holds IPv6 elements: x's IPv6 elements
 	// render as the set <x>_v6, and nft refuses a second set of that name. The
 	// row so named is left out; a rule referencing it cannot be rendered and
@@ -215,7 +216,7 @@ func (q *quarantine) unreadable(r Rule, action string) string {
 		if !rulefield.SetRefOpOK(op) {
 			reasons = append(reasons, fmt.Sprintf("cidr %q compares a set with %s, which nft refuses", r.CIDR, op))
 		}
-		if err := rulefield.RenderSetName(name); err != nil {
+		if err := rulefield.UserSetName(name); err != nil {
 			reasons = append(reasons, err.Error())
 		} else if base, isComp := strings.CutSuffix(name, ipv6SetSuffix); isComp && q.v6Sets[base] && !q.knownSets[name] {
 			reasons = append(reasons, fmt.Sprintf("cidr %q names the IPv6 companion of set %q; reference the set itself", r.CIDR, base))
@@ -258,7 +259,7 @@ func quarantineIPSets(sets []corrosion.IPSet) (out []IPSet, inv []InvalidRow, de
 	degraded = map[string]bool{}
 	var ids []string // out[i]'s row id
 	for _, s := range sets {
-		if err := rulefield.RenderSetName(s.Name); err != nil {
+		if err := rulefield.UserSetName(s.Name); err != nil {
 			inv = append(inv, InvalidRow{Table: "ip_sets", ID: s.ID, Reason: err.Error(), Handling: HandlingSetLeftOut})
 			continue
 		}

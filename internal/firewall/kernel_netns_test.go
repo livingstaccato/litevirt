@@ -1215,6 +1215,9 @@ var compatCorpusModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_co
 // resolve — rendered as the loader leaves it, in both modes, with the inet
 // and the bridge table each checked on its own as the applier loads them.
 //
+// The bridge table is then loaded for real, and the kernel's gateway set must
+// hold the gateway only: a user set named lv_gw4 never merges into it.
+//
 // Mutation: render a port as stored — `dport SSH` is refused, red. Skip the
 // overlap merge, or accept every set name at render — nft refuses the freeze
 // corpus ("conflicting intervals specified", "syntax error"), red.
@@ -1256,16 +1259,30 @@ func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 		p := freeze
 		p.NICMode = mode
 		p.NICs = []NICBinding{{NICDev: "tap0", VMName: "vm", SecurityGroups: []string{"web"}}}
+		p.Gateways = []string{"10.88.0.1"}
 		inet, nic, err := RenderParts(p, true)
 		if err != nil {
 			t.Fatalf("%s: RenderParts refused the freeze corpus: %v", mode, err)
 		}
-		for table, script := range map[string]string{"inet": inet, "bridge": nic} {
+		for _, table := range []struct{ name, script string }{{"inet", inet}, {"bridge", nic}} {
 			cmd := exec.Command("nft", "-c", "-f", "-")
-			cmd.Stdin = strings.NewReader(script)
+			cmd.Stdin = strings.NewReader(table.script)
 			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Errorf("%s: nft -c refused the freeze corpus's %s table: %v\n%s", mode, table, err, out)
+				t.Errorf("%s: nft -c refused the freeze corpus's %s table: %v\n%s", mode, table.name, err, out)
 			}
 		}
+		// Round 0b: the user's lv_gw4 row (10.99.0.0/16) never reaches the
+		// kernel's internal gateway set. Loaded for real in this namespace.
+		cmd := exec.Command("nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(nic)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s: nft -f refused the freeze corpus's bridge table: %v\n%s", mode, err, out)
+			continue
+		}
+		got := sh(t, "nft", "list", "set", "bridge", NICTableName, setGateways4)
+		if !strings.Contains(got, "10.88.0.1") || strings.Contains(got, "10.99.") {
+			t.Errorf("%s: the kernel's %s holds %q, want the gateway only", mode, setGateways4, got)
+		}
+		sh(t, "nft", "flush", "ruleset")
 	}
 }

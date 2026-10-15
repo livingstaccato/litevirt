@@ -285,6 +285,9 @@ func loadFreezePlan(t *testing.T) Plan {
 	rawSet(t, db, "s-colon", "office:prod", `["10.40.0.5"]`)
 	rawSet(t, db, "s-addr", "dead:beef", `["10.40.0.6"]`)
 	rawSet(t, db, "s-long", freezeLong, `["10.41.0.0/16", "fd01::/16"]`)
+	// Round 0b: user sets named like the bridge table's internal ones.
+	rawSet(t, db, "s-resv-gw4", "lv_gw4", `["10.99.0.0/16"]`)
+	rawSet(t, db, "s-resv-nic", "lv_nic_devs", `["10.98.0.1"]`)
 	for _, r := range [][5]string{
 		{"r-ovl", "tcp", "22", "@ovl", "accept"},
 		{"r-ovl2", "tcp", "22", "!= @ovl2", "drop"},
@@ -315,7 +318,7 @@ func loadFreezePlan(t *testing.T) Plan {
 		t.Fatalf("loader: %v", err)
 	}
 	// Non-vacuous: every freeze row reached the loader and was handled.
-	for _, id := range []string{"s-xv6", "s-digit", "s-dash", "s-kw", "s-256", "s-colon", "s-long",
+	for _, id := range []string{"s-xv6", "s-digit", "s-dash", "s-kw", "s-256", "s-colon", "s-long", "s-resv-gw4", "s-resv-nic",
 		"r-xv6", "r-kw", "r-longneg", "r-bogus", "r-bogus-list", "r-big", "r-octal", "sg-bogus"} {
 		found := false
 		for _, r := range plan.InvalidRows {
@@ -352,5 +355,53 @@ func TestLoadFreezePlan_Renders(t *testing.T) {
 		if strings.Contains(out, bad) {
 			t.Errorf("%q rendered", shown(bad))
 		}
+	}
+}
+
+// TestLoader_ReservedSetNamesLeftOut (fw-set-freeze round 0b): a stored user
+// set named lv_* is never rendered. lv_nic_devs (type ifname in the bridge
+// table) would make nft refuse that table; lv_gw4 would merge its elements
+// into the guests' gateway set. Each is left out and reported, a rule
+// referencing one is left out, and the internal sets render exactly as
+// without them.
+//
+// Mutation: render a reserved-name set (drop the check from UserSetName) —
+// the bridge table declares lv_gw4 twice, its elements merged in, red.
+func TestLoader_ReservedSetNamesLeftOut(t *testing.T) {
+	db, _ := freezeLoader(t)
+	rawSet(t, db, "s-gw4", "lv_gw4", `["10.99.0.0/16"]`)
+	rawSet(t, db, "s-nic", "lv_nic_devs", `["10.98.0.1"]`)
+	rawSet(t, db, "s-lb", "lv_lb4", `["10.97.0.1"]`)
+	rawClusterRule(t, db, "r-gw4", "tcp", "53", "@lv_gw4", "accept")
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"s-gw4", "s-nic", "s-lb"} {
+		if r, ok := invalidRow(plan, "ip_sets", id); !ok || r.Handling != HandlingSetLeftOut || !strings.Contains(r.Reason, `"lv_"`) {
+			t.Errorf("set %s not left out as reserved: %+v", id, r)
+		}
+	}
+	if _, ok := invalidRow(plan, "cluster_firewall_rules", "r-gw4"); !ok {
+		t.Error("the rule on @lv_gw4 is not reported")
+	}
+	plan.Gateways = []string{"10.88.0.1"}
+	plan.NICs = []NICBinding{{NICDev: "tap0", VMName: "vm"}}
+	out, err := Render(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"lv_gw4", "lv_nic_devs", "lv_lb4"} {
+		if n := strings.Count(out, "set "+name+" {"); n > 1 {
+			t.Errorf("set %s declared %d times", name, n)
+		}
+	}
+	for _, bad := range []string{"10.99.0.0/16", "10.98.0.1", "10.97.0.1", "dport 53 ip saddr @lv_gw4"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("%q rendered", bad)
+		}
+	}
+	if !strings.Contains(out, "elements = { 10.88.0.1 }") {
+		t.Errorf("the gateway set lost its element:\n%s", out)
 	}
 }

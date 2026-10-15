@@ -3,8 +3,9 @@ package rulefield
 // nftKeywords are the words nft (1.1.6) refuses as a set name: each is a
 // keyword where a set name goes, so `set drop {` fails with "syntax error,
 // unexpected drop" and so does the whole ruleset. Found by loading every word
-// in libnftables as a set name (declared and referenced) with `nft -c`. Case
-// matters: `DROP` is a name.
+// in libnftables as a set name (declared and referenced) with `nft -c`; nft
+// 1.0.9 refuses the same words, less `tunnel`. Case matters: `DROP` is a
+// name.
 var nftKeywords = map[string]bool{}
 
 func init() {

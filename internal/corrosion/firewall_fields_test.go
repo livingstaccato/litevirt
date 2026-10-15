@@ -93,3 +93,27 @@ func TestInsertIPSet_RefusesCompanionClash(t *testing.T) {
 		t.Errorf("stored %+v, want x, z_v6 and z (IPv4)", rows)
 	}
 }
+
+// TestInsertIPSet_RefusesReservedPrefix (fw-set-freeze round 0b): lv_* names
+// are litevirt's internal sets.
+//
+// Mutation: drop the reserved-prefix check from rulefield.SetName — red.
+func TestInsertIPSet_RefusesReservedPrefix(t *testing.T) {
+	ctx := context.Background()
+	c := NewTestClientT(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"lv_gw4", "lv_nic_devs"} {
+		var fe *rulefield.FieldError
+		if err := InsertIPSet(ctx, c, IPSet{ID: name, Name: name, CIDRs: []string{"10.0.0.0/8"}}); !errors.As(err, &fe) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := InsertClusterFirewallRule(ctx, c, FirewallRule{ID: "r", Direction: "ingress", CIDR: "@lv_gw4"}); err == nil {
+		t.Error("a rule referencing @lv_gw4 stored")
+	}
+	if rows, _ := ListIPSets(ctx, c); len(rows) != 0 {
+		t.Errorf("stored %+v", rows)
+	}
+}

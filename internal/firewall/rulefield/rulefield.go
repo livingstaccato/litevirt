@@ -243,6 +243,29 @@ func RenderSetName(s string) error {
 	return nil
 }
 
+// ReservedSetPrefix starts the names of litevirt's own sets (the bridge
+// table's lv_gw4, lv_nic_devs, ...). A user set of such a name would merge its
+// elements into litevirt's set of that name (lv_gw4: guests may reach those
+// addresses for DHCP and DNS) or, typed differently, make nft refuse the
+// table.
+const ReservedSetPrefix = "lv_"
+
+func reservedSetName(s string) error {
+	if strings.HasPrefix(s, ReservedSetPrefix) {
+		return refuse("ipset name", s, "the prefix %q is reserved for litevirt's internal sets; choose another name", ReservedSetPrefix)
+	}
+	return nil
+}
+
+// UserSetName is RenderSetName for a set an operator named, or a reference to
+// one: also never a name with the reserved prefix.
+func UserSetName(s string) error {
+	if err := RenderSetName(s); err != nil {
+		return err
+	}
+	return reservedSetName(s)
+}
+
 // addressShaped is a word nft's scanner reads as one address-like token, so
 // as a name: hex digits and colons, as a class id (hhhh:hhhh), a MAC address
 // or an IPv6 address.
@@ -677,7 +700,8 @@ func isDotted(s string) bool {
 }
 
 // SetName accepts an nft set name: a letter, '_' or '.', then letters,
-// digits, '_', '.', '-' or '/', at most 255 bytes, and not an nft keyword.
+// digits, '_', '.', '-' or '/', at most 255 bytes, not an nft keyword, and
+// not starting with ReservedSetPrefix.
 func SetName(s string) error {
 	if s == "" {
 		return refuse("ipset name", s, "a set name cannot be empty")
@@ -695,7 +719,7 @@ func SetName(s string) error {
 	if nftKeywords[s] {
 		return refuse("ipset name", s, "%q is an nft keyword, which nft does not read as a set name", s)
 	}
-	return nil
+	return reservedSetName(s)
 }
 
 // SetElement accepts one ip-set element: an IPv6 address or prefix exactly as

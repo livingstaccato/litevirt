@@ -33,19 +33,24 @@ ipsets:
 `,
 		// fw-grammar re-review 3 N-2: office's IPv6 elements render as the
 		// set office_v6.
-		"ipset companion": `
+		"ipset companion":     `
 ipsets:
   office:
     cidrs: ["10.0.0.0/8", "fd00::/8"]
   office_v6:
     cidrs: ["10.9.0.0/16"]
 `,
-		"ipset keyword name": `
+		"ipset keyword name":  `
 ipsets:
   drop:
     cidrs: ["10.0.0.0/8"]
 `,
-		"sg unknown service": `
+		"ipset reserved name": `
+ipsets:
+  lv_gw4:
+    cidrs: ["10.0.0.0/8"]
+`,
+		"sg unknown service":  `
 security-groups:
   web:
     rules:
@@ -58,9 +63,10 @@ security-groups:
 		"cluster comment": "firewall.cluster-rules[0]",
 		"ipset element":   "ipsets.office",
 		// Either name of the pair is named.
-		"ipset companion":    "ipsets.office",
-		"ipset keyword name": "ipsets.drop",
-		"sg unknown service": "security-groups.web.rules[0]",
+		"ipset companion":     "ipsets.office",
+		"ipset keyword name":  "ipsets.drop",
+		"ipset reserved name": "ipsets.lv_gw4",
+		"sg unknown service":  "security-groups.web.rules[0]",
 	}
 	for name, body := range bad {
 		_, err := ParseBytes([]byte("name: s\n" + body))

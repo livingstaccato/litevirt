@@ -465,6 +465,12 @@ func vmReplaceStatements(
 			}
 		}
 	}
+	// The row at the name is the replacement VM: it keeps its own firewall
+	// identity, never the replaced VM's (T-8).
+	spec, err := keepFirewallID(TagMemberVM, spec, firewallIDOf(TagMemberVM, source.Spec))
+	if err != nil {
+		return nil, err
+	}
 	adoptionState, _, adoptionErr := GetHardwareAdoptionState(ctx, c, source.Name)
 	if adoptionErr != nil {
 		return nil, adoptionErr

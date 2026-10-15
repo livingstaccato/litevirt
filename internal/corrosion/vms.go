@@ -71,6 +71,10 @@ type VMRecord struct {
 	OwnerEpoch        int64
 	SpecGeneration    int64
 	ActiveOperationID string
+	// FirewallCarry lets a row-INSERT keep the firewall identity of the VM it
+	// re-creates (CarryFirewallID). Zero, the insert stores no identity,
+	// whatever Spec holds. Never read back.
+	FirewallCarry FirewallIDCarry
 }
 
 // InterfaceRecord represents a VM network interface.
@@ -162,6 +166,14 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
 	now := nowRFC3339Nano() // created_at — fresh incarnation stamp (see nowRFC3339Nano)
 	uts := c.NowTS()        // updated_at (monotonic LWW key)
+
+	// A new VM has no firewall identity unless the caller carries the one of
+	// the VM it re-creates; any value in the incoming spec is stripped.
+	spec, err := keepFirewallID(TagMemberVM, vm.Spec, vm.FirewallCarry.idFor(TagMemberVM))
+	if err != nil {
+		return err
+	}
+	vm.Spec = spec
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -1668,8 +1680,13 @@ func execVMRekey(ctx context.Context, c *Client, now string, passes ...vmRekeyPa
 			if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
 				spec["name"] = p.newName
 				if b, mErr := json.Marshal(spec); mErr == nil {
+					// The renamed row is the same VM: it keeps its identity.
+					kept, kErr := keepFirewallID(TagMemberVM, string(b), firewallIDOf(TagMemberVM, vm.Spec))
+					if kErr != nil {
+						return kErr
+					}
 					parent = Statement{SQL: `UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?`,
-						Params: []interface{}{p.newName, string(b), now, p.oldName}}
+						Params: []interface{}{p.newName, kept, now, p.oldName}}
 				}
 			}
 		}

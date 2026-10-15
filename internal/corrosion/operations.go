@@ -252,6 +252,24 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 	if err := validateReservationProject(op.ReservationJSON, op.Project); err != nil {
 		return false, err
 	}
+	// The desired spec keeps the firewall identity of the row the CAS below
+	// binds, read at the expected owner epoch and generation. Only
+	// MintFirewallID changes a live row's identity, and it bumps the
+	// generation, so the CAS refuses a row that changed since. No such row
+	// means the CAS matches nothing either.
+	current, err := c.Query(ctx,
+		`SELECT spec FROM vms WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ? AND spec_generation = ?`,
+		op.ResourceID, expectedOwnerEpoch, expectedSpecGen)
+	if err != nil {
+		return false, err
+	}
+	keep := ""
+	if len(current) > 0 {
+		keep = firewallIDOf(TagMemberVM, current[0].String("spec"))
+	}
+	if desiredSpec, err = keepFirewallID(TagMemberVM, desiredSpec, keep); err != nil {
+		return false, err
+	}
 	now := c.NowTS()
 	guard := func(tx *sql.Tx) (bool, error) {
 		var ownerEpoch, specGen int64

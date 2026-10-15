@@ -110,6 +110,14 @@ func (c *Client) BeginVMCreateOperation(ctx context.Context, op OperationRecord,
 	if err := normalizeCreateIdentity(&op, vm.Name, "vm", vm.OwnerEpoch); err != nil {
 		return false, err
 	}
+	// A new VM has no firewall identity unless the caller carries the one of
+	// the VM it re-creates; any value in the incoming spec is stripped. The
+	// commit binds the same spec (vmCreateIdentityHash), so it strips too.
+	spec, err := keepFirewallID(TagMemberVM, vm.Spec, vm.FirewallCarry.idFor(TagMemberVM))
+	if err != nil {
+		return false, err
+	}
+	vm.Spec = spec
 	vm.OwnerEpoch = op.VMOwnerEpoch
 	if vm.Project == "" {
 		vm.Project = projectOrDefault(op.Project)
@@ -211,6 +219,10 @@ func (c *Client) CommitVMCreateOperation(ctx context.Context, opID string, owner
 	if err != nil || !ok {
 		return false, err
 	}
+	// The spec BeginVMCreateOperation stored, which its guard binds.
+	if vm.Spec, err = keepFirewallID(TagMemberVM, vm.Spec, vm.FirewallCarry.idFor(TagMemberVM)); err != nil {
+		return false, err
+	}
 	now, wall := c.NowTS(), nowRFC3339()
 	commitGuard, err := vmCreateMutationGuard(opID, ownerEpoch, vm, true)
 	if err != nil {
@@ -273,6 +285,14 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 	if err := normalizeCreateIdentity(&op, ct.Name, "container", ct.OwnerEpoch); err != nil {
 		return false, err
 	}
+	// A new container has no firewall identity unless the caller carries the
+	// one of the container it re-creates; any value in the incoming create
+	// spec is stripped. The commit binds the same create spec, so it strips too.
+	createSpec, err := keepFirewallID(TagMemberCT, ct.CreateSpec, ct.FirewallCarry.idFor(TagMemberCT))
+	if err != nil {
+		return false, err
+	}
+	ct.CreateSpec = createSpec
 	desiredRef := containerCreateDesiredRef(ct.HostName, ct.Name)
 	if op.DesiredRef != "" && op.DesiredRef != desiredRef {
 		return false, fmt.Errorf("%w: container desired_ref does not match host/name", ErrOperationIdentityConflict)
@@ -359,6 +379,10 @@ func (c *Client) BeginContainerCreateOperation(ctx context.Context, op Operation
 func (c *Client) CommitContainerCreateOperation(ctx context.Context, opID string, ownerEpoch int64, ct ContainerRecord, ifaces []ContainerInterfaceRecord) (bool, error) {
 	claimHash, ok, err := c.liveOperationClaimHash(ctx, opID)
 	if err != nil || !ok {
+		return false, err
+	}
+	// The create spec BeginContainerCreateOperation stored, which its guard binds.
+	if ct.CreateSpec, err = keepFirewallID(TagMemberCT, ct.CreateSpec, ct.FirewallCarry.idFor(TagMemberCT)); err != nil {
 		return false, err
 	}
 	commitGuard, err := containerCreateMutationGuard(opID, ownerEpoch, ct, true)

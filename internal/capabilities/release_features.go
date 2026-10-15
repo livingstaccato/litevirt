@@ -140,9 +140,11 @@ var firewallRuleWriters = []string{
 }
 
 // firewallTagGroupWriters write firewall_tag_groups' data: the rule tables
-// (a rule matching a tag group) and the tag-group rows.
+// (a rule matching a tag group), the tag-group rows, and a workload's firewall
+// identity.
 var firewallTagGroupWriters = append(slices.Clone(firewallRuleWriters),
 	"internal/corrosion.SetFirewallTagGroup",
+	"internal/corrosion.MintFirewallID",
 )
 
 // containerReplicationWriters write container_replication's data: a container's

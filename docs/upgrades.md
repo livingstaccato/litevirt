@@ -592,6 +592,13 @@ external-snapshot overlay and marks it used. Until the feature opens such a
 copy is made as on the previous release (`qemu-img convert -U`, marked not
 point-in-time), and a copy that could not place an overlay anyway marks
 nothing.
+`ha_disarm` is used by default too: once the release token has latched, the
+failover lease holder records its use with no data write, so a later
+`lv cluster ha disarm` does not need every host reachable. From then on a
+coordinator, armed or not, decides no fence and no recovery for a scope (the
+cluster, or the host's region) in which it counts fewer than a majority of the
+voters live, and the skip is counted as `error_class="no_quorum"`
+([migration-failover.md](migration-failover.md#disarming-ha-for-planned-maintenance)).
 
 **What this does not change.** A binary built before `release_2026_11_v1`
 understands no rollback rule. Rolled back below any token it does not know —

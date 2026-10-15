@@ -1277,9 +1277,12 @@ not confirmed, and the row stays: the change may still take effect as it
 replicates, so check `lv cluster ha`. A host whose policy row cannot be read
 reads it as disarmed and raises `ha_policy_unreadable`.
 
-**Arm.** Arm refuses while any host that is not in maintenance is reported down
-by the quorum (voters, non-voters and witnesses alike), listing them: those
-hosts would be fenced on the next cycle. Bring them back, remove one that is
+**Arm.** Arm refuses while any host is reported down by the quorum (voters,
+non-voters and witnesses alike) that the coordinator would fence, listing
+them: those hosts would be fenced on the next cycle. Hosts in maintenance,
+hosts still joining, hosts whose state this node cannot read, and hosts
+restarting within the upgrade timeout are not listed, because the coordinator
+does not fence them. Bring them back, remove one that is
 never coming back with `lv host rm --dead <host>`, or pass
 `--fence-down-hosts`. The list is a snapshot: a host that goes down after the
 arm is fenced like any other.
@@ -1293,10 +1296,12 @@ included, to acknowledge the `ha_disarm` release feature. Once the release
 token has latched, the failover lease holder pays this in the background;
 until it has, `lv cluster ha` says `first use pending`.
 
-**Armed, too.** Once the `ha_disarm` feature is in use, a coordinator decides no
-fence and no recovery for a scope (the cluster, or the host's region) in which
-it counts fewer than a majority of the voters live at that moment; the skip is
-counted as `no_quorum`.
+**Armed, too.** Once the `ha_disarm` feature is in use — automatically, soon
+after the release token latches — a coordinator decides no fence and no
+recovery for a scope (the cluster, or the host's region) in which it counts
+fewer than a majority of the voters live at that moment; the skip is counted
+as `no_quorum`, and the stall alert points at `lv cluster ha`, which shows the
+voters `not counted live`.
 
 **Limitation.** With recovery claims enforced, an operator promotion that
 must re-propose an automatic recovery value already accepted by a minority of
@@ -1702,6 +1707,9 @@ Scrape `http://<host>:7444/metrics` for:
   `retry_host_answered` (a failed fence not retried because an observer saw the host answer after it),
   `ha_disarmed` (a fence or recovery held because cluster HA is disarmed, or its policy cannot be read),
   `ha_peer_veto` (one held because a live voter's answer says HA is disarmed, or is stale or unknown),
+  `no_quorum` with `phase="quorum"` and `result="refused"` (a fence or recovery held because this
+  coordinator counted fewer than a majority of the decision's voters live at that moment; a lost
+  lease is `lease_lost`),
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions

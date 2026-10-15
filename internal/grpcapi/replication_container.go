@@ -1116,6 +1116,11 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 		}
 		return nil, status.Errorf(codes.FailedPrecondition, "backup repo %q is not usable for replicas on %q: %v", req.TargetPool, req.TargetHost, err)
 	}
+	// A limit the release gate refuses is refused before the schedule is
+	// written, so no unlimited schedule is left behind.
+	if err := s.precheckReplicationRate(ctx, req.BwlimitBytesPerSec); err != nil {
+		return nil, err
+	}
 	key := corrosion.ContainerScheduleKey(project, ct.Name)
 	// A schedule stored under the earlier name-only key keeps its identity.
 	if rows, lerr := corrosion.ListBackupSchedules(ctx, s.db); lerr == nil {
@@ -1153,7 +1158,12 @@ func (s *Server) createContainerReplicationSchedule(ctx context.Context, req *pb
 		return nil, status.Errorf(codes.Internal, "upsert replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule", ct.Name, "container project="+project+" target="+req.TargetHost+":"+req.TargetPool+" cron="+req.Cron, "ok")
-	return replScheduleToPB(rec), nil
+	if err := s.applyReplicationRate(ctx, rec.VMName, rec.Repo, req.BwlimitBytesPerSec); err != nil {
+		return nil, err
+	}
+	out := replScheduleToPB(rec)
+	out.BwlimitBytesPerSec = s.replicationRateOf(ctx, rec.VMName, rec.Repo)
+	return out, nil
 }
 
 // deleteContainerReplicationSchedule removes a container schedule. The row is
@@ -1198,7 +1208,7 @@ func (s *Server) deleteContainerReplicationSchedule(ctx context.Context, req *pb
 		"backup.schedule", "operator", containerWhat(name)); err != nil {
 		return nil, err
 	}
-	if err := corrosion.DeleteBackupSchedule(ctx, s.db, row.VMName, req.TargetPool); err != nil {
+	if err := s.deleteScheduleRow(ctx, row.VMName, req.TargetPool); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete replication schedule: %v", err)
 	}
 	s.audit(ctx, "replication.schedule.delete", name, "container project="+rowProject+" repo="+req.TargetPool, "ok")

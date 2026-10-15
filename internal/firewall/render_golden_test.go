@@ -76,6 +76,16 @@ func TestRenderGolden(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "synflood_enforce",
+			path: "testdata/render_synflood_enforce.golden",
+			plan: synFloodPlan(NICModeEnforce),
+		},
+		{
+			name: "synflood_observe",
+			path: "testdata/render_synflood_observe.golden",
+			plan: synFloodPlan(NICModeObserve),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

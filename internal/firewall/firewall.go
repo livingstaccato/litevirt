@@ -307,6 +307,10 @@ type Plan struct {
 	// because they fail the rule grammar (not rendered; reported as a
 	// condition). See quarantineRule.
 	InvalidRows []InvalidRow
+
+	// SynFlood limits new TCP connections toward guest NICs per (NIC,
+	// source address) in the per-NIC table (synflood.go).
+	SynFlood SynFlood
 }
 
 // BlockedTrunk is a trunk NIC's VLANs its network does not allow.
@@ -927,6 +931,9 @@ func validate(p Plan) error {
 				return fmt.Errorf("NIC %q: trunk VLAN %d is outside 1-4094", n.NICDev, v)
 			}
 		}
+	}
+	if err := validateSynFlood(p.SynFlood); err != nil {
+		return err
 	}
 	// NAT / isolation are IPv4-only (same as the filter rules) and must be
 	// complete — a blank field would emit a malformed rule that poisons the whole

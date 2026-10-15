@@ -172,6 +172,9 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 						key, strings.TrimSpace(v), len(fv.NICs), strings.TrimSpace(v))
 				}
 			}
+			if nic.MTU != 0 {
+				nic.MTU = proxmoxNICMTU(fv, key, nic.MTU)
+			}
 			fv.NICs = append(fv.NICs, nic)
 		} else {
 			fv.Warnf("could not parse network device %q (%q); skipped", key, pc.keys[key])
@@ -344,9 +347,27 @@ func parseProxmoxNIC(val string) (ForeignNIC, bool) {
 			nic.Network = v
 		case "tag":
 			nic.VLAN = atoiSafe(v)
+		case "mtu":
+			nic.MTU = atoiSafe(v)
 		}
 	}
 	return nic, true
+}
+
+// proxmoxNICMTU is the MTU a Proxmox NIC's mtu= imports as, with its warning:
+// 1 (the bridge's MTU) as bridge, N within 576-65520 as N, anything else
+// dropped. The release gate decides later whether it is kept at all.
+func proxmoxNICMTU(fv *ForeignVM, key string, mtu int) int {
+	switch {
+	case mtu == 1:
+		fv.Warnf("%s sets mtu=1 (the bridge's MTU): imported as `mtu: bridge`, so the guest takes the target bridge's MTU", key)
+		return 1
+	case mtu >= 576 && mtu <= 65520:
+		fv.Warnf("%s sets mtu=%d: imported as %d, which must equal the target bridge's MTU (a guest MTU must equal its bridge's)", key, mtu, mtu)
+		return mtu
+	}
+	fv.Warnf("%s sets mtu=%d (not imported): an MTU must be 576 to 65520, or 1 for the bridge's", key, mtu)
+	return 0
 }
 
 // bootDiskKey extracts the first bootable disk device key from the conf:

@@ -140,6 +140,7 @@ func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) e
 // grammar the renderer writes into an nft script is refused before any grant
 // is checked.
 func InsertClusterFirewallRuleWithGrant(ctx context.Context, c *Client, g, gLog, gTag capabilities.FeatureGrant, r FirewallRule) error {
+	r.Proto, r.PortRange, r.Action = rulefield.NormaliseRule(r.Proto, r.PortRange, r.Action)
 	if err := rulefield.StoredRule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
 		return err
 	}
@@ -211,6 +212,7 @@ func InsertHostFirewallRuleWithGrant(ctx context.Context, c *Client, g, gLog, gT
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
 	}
+	r.Proto, r.PortRange, r.Action = rulefield.NormaliseRule(r.Proto, r.PortRange, r.Action)
 	if err := rulefield.StoredRule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
 		return err
 	}

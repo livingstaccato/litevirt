@@ -32,6 +32,10 @@ func TestFirewallRowFeatures(t *testing.T) {
 		{"tag:web", "tcp", "reject+log", []capabilities.Feature{lg, tg}, false},
 		{"tag:", "tcp", "accept", nil, true},
 		{"tag:a:b", "tcp", "accept", nil, true},
+		// The classifier takes exactly the write grammar's tag form
+		// (rulefield.TagCIDRName): no trimming, a set name only.
+		{" tag:web", "tcp", "accept", nil, true},
+		{"tag:a;b", "tcp", "accept", nil, true},
 		{"2001:db8::/129", "tcp", "accept", nil, true},
 	} {
 		got, err := firewallRowFeatures(tc.cidr, tc.proto, tc.action)
@@ -53,7 +57,7 @@ func TestFirewallRowFeatures(t *testing.T) {
 // grant, a tag row with both of those — and writes the row once every feature
 // it needs has its grant. The "+log" action and the tag-group cidr pass the
 // writers' field grammar only through the extensions C2 and D5 fill
-// (rulefield.RuleExtensions); with none, as on this build, both are refused
+// (the rulefield.Extensions hooks); with none, as on this build, both are refused
 // whatever the grants, and with test stand-ins the grant matrix holds.
 //
 // Mutations: check the log feature against g (the IPv6 grant) — the

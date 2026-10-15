@@ -72,3 +72,59 @@ func TestRuleExtensions(t *testing.T) {
 		}
 	}
 }
+
+// A hook can only narrow its form (review m-1): one that takes anything still
+// gets only "tag:<set name>" and "<verdict>+log" past the grammar, so a
+// careless C2 or D5 hook cannot store text the renderer cannot write.
+//
+// Mutations: CIDR returns the hook's verdict without TagCIDRName — tag:x;drop
+// passes, red; StoredRule takes the hook's verdict without LogActionVerdict —
+// "drop;x" passes, red.
+func TestRuleExtensions_HookCannotWiden(t *testing.T) {
+	SetExtensionsForTest(t, Extensions{
+		LogAction: func(a string) (string, bool) { return "drop", true },
+		TagCIDR:   func(string) (bool, error) { return true, nil },
+	})
+	for _, cidr := range []string{"tag:x;drop", "tag:", "tag:a b", "tag:x\n", "10.0.0.0/8; accept", "tag :web"} {
+		if err := StoredRule("ingress", "tcp", "22", cidr, "drop", ""); err == nil {
+			t.Errorf("cidr %q taken by a hook that takes anything", cidr)
+		}
+	}
+	if err := StoredRule("ingress", "tcp", "22", "tag:web-1", "drop", ""); err != nil {
+		t.Errorf("tag:web-1: %v", err)
+	}
+	for _, action := range []string{"drop;x", "accept log", "drop+log;x"} {
+		if err := StoredRule("ingress", "tcp", "22", "tag:web", action, ""); err == nil {
+			t.Errorf("action %q taken by a hook that takes anything", action)
+		}
+	}
+	if err := StoredRule("ingress", "tcp", "22", "tag:web", "Reject+LOG", ""); err != nil {
+		t.Errorf("Reject+LOG: %v", err)
+	}
+}
+
+// The shared predicates name the forms the corrosion classifier uses too.
+func TestTagCIDRNameAndLogActionVerdict(t *testing.T) {
+	for cidr, want := range map[string]bool{"tag:web": true, "tag:web-1.a": true, "tag:": false, "tag:a:b": false,
+		" tag:web": false, "tag:a b": false, "tag:1a": false, "@web": false} {
+		if _, ok := TagCIDRName(cidr); ok != want {
+			t.Errorf("TagCIDRName(%q) = %v, want %v", cidr, ok, want)
+		}
+	}
+	for action, want := range map[string]string{"drop+log": "drop", " DROP+LOG ": "drop", "accept+log": "accept"} {
+		if v, ok := LogActionVerdict(action); !ok || v != want {
+			t.Errorf("LogActionVerdict(%q) = %q, %v; want %q", action, v, ok, want)
+		}
+	}
+	if _, ok := LogActionVerdict("drop"); ok {
+		t.Error("LogActionVerdict(drop) = ok")
+	}
+}
+
+// NormaliseRule lowercases proto, port and action, and nothing else changes.
+func TestNormaliseRule(t *testing.T) {
+	p, port, a := NormaliseRule("TCP", "{ 80, HTTPS } ", "DROP+Log")
+	if p != "tcp" || port != "{ 80, https } " || a != "drop+log" {
+		t.Errorf("NormaliseRule = %q %q %q", p, port, a)
+	}
+}

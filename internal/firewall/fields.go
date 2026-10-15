@@ -13,11 +13,12 @@ import (
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
-// ValidateRuleFields checks a rule's fields against the grammar the renderer
-// can write into an nft script (rulefield): every rule writer calls it before
-// a row is stored, and validate calls it for every rule it renders. The forms
-// a later build adds (the "+log" action suffix, the tag-group cidr) plug in
-// through rulefield.RuleExtensions.
+// ValidateRuleFields checks a rule's fields against the write grammar
+// (rulefield.Rule), which the rule handlers run before a row is stored, with
+// the forms a later build adds (rulefield.Extensions). The renderer never
+// runs it: validate and the loader check stored rows with the syntax checks
+// alone (rulefield.Render*), so a stored row an extension accepted is judged
+// there as any other.
 func ValidateRuleFields(direction, proto, port, cidr, action, comment string) error {
 	return rulefield.Rule(direction, proto, port, cidr, action, comment)
 }

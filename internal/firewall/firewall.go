@@ -760,8 +760,11 @@ func renderRule(r Rule, nicDev, family string) string {
 			//   Ingress: dport (the destination port on the VM)
 			//   Egress:  dport too (the destination port at the remote)
 			// Both are dport — sport is rarely what a security group
-			// wants. nftables port-range syntax is N-M; pass through.
-			parts = append(parts, "dport", r.PortRange)
+			// wants. nftables port-range syntax is N-M; pass through,
+			// lower case: nft resolves a service name only in lower case
+			// (`dport SSH` is refused), and a peer on an older build can
+			// store one as sent.
+			parts = append(parts, "dport", strings.ToLower(r.PortRange))
 		}
 	case "icmp":
 		parts = append(parts, "ip", "protocol", "icmp")

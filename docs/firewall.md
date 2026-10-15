@@ -775,6 +775,10 @@ refused: nft rejects it, so it never applied — brace it. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
 it would add nft syntax of its own to every host's ruleset.
 
+`proto`, `port` and `action` are stored in lower case (`SSH` is stored as
+`ssh`): nft resolves a service name only in lower case. A port an older build
+stored in upper case is rendered in lower case.
+
 A row written by a host on an older build is checked again when it is rendered.
 A row that applied before renders exactly as it did; one that the renderer
 would refuse no longer stops the host's whole firewall from applying, as it did

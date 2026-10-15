@@ -19,9 +19,9 @@ import (
 // firewall_ipv6 gate before the writer's own check refused it.
 const spyGrammarCIDR = "2001:db8::77/128"
 
-// spyGrammar installs a rulefield.RuleExtensions.TagCIDR that refuses
+// spyGrammar installs a rulefield.Extensions.TagCIDR hook that refuses
 // spyGrammarCIDR. Only the write grammar (rulefield.Rule) consults
-// RuleExtensions, so an entry refusing that cidr ran it.
+// the extension hooks, so an entry refusing that cidr ran it.
 func spyGrammar(t *testing.T) {
 	rulefield.SetExtensionsForTest(t, rulefield.Extensions{
 		TagCIDR: func(cidr string) (bool, error) {
@@ -35,7 +35,7 @@ func spyGrammar(t *testing.T) {
 
 // The write grammar (spec §0.4) is one function, rulefield.Rule, and every
 // client entry for a rule runs it — with the extensions C2 and D5 fill in
-// rulefield.RuleExtensions — before any release gate is asked or anything is
+// the rulefield.Extensions hooks — before any release gate is asked or anything is
 // stored or torn down: the cluster, host and security-group rule handlers,
 // the stack deploy (security-group and cluster rules) and the compose
 // validator.

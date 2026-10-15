@@ -12,16 +12,8 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
-
-// logActionSuffix marks a stored rule action as logged ("drop+log"). Only the
-// server's own writers produce it; API readers see the plain verdict plus a
-// log flag.
-const logActionSuffix = "+log"
-
-// tagCIDRPrefix marks a rule cidr matching a tag group's member addresses
-// ("tag:<name>").
-const tagCIDRPrefix = "tag:"
 
 // ErrFirewallLogGateClosed is returned by a write of a logged rule without a
 // firewall_log grant.
@@ -33,21 +25,21 @@ var ErrFirewallLogGateClosed = errors.New("logged firewall rules are written onl
 var ErrFirewallTagGroupsGateClosed = errors.New("firewall rules matching a tag group are written only through the release feature firewall_tag_groups " +
 	"(the cluster upgrade must finish first: a host on an older build cannot render them and would stop applying its firewall)")
 
-// isLoggedAction reports whether a stored rule action carries the log suffix.
+// isLoggedAction reports whether a stored rule action carries the log suffix
+// ("drop+log"): the same form the write grammar takes
+// (rulefield.LogActionVerdict), so the classifier and the grammar agree.
 func isLoggedAction(action string) bool {
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(action)), logActionSuffix)
+	_, ok := rulefield.LogActionVerdict(action)
+	return ok
 }
 
 // isTagCIDR reports whether cidr is exactly one tag-group reference,
-// "tag:<name>" with a name holding no ':', space, ',' or brace. Anything else
-// is judged as an address (and an IPv6-looking one must parse as one).
+// "tag:<name>" with name an nft set name: the same form the write grammar
+// takes (rulefield.TagCIDRName). Anything else is judged as an address (and
+// an IPv6-looking one must parse as one).
 func isTagCIDR(cidr string) bool {
-	cidr = strings.TrimSpace(cidr)
-	if !strings.HasPrefix(cidr, tagCIDRPrefix) {
-		return false
-	}
-	name := cidr[len(tagCIDRPrefix):]
-	return name != "" && !strings.ContainsAny(name, ": \t,{}")
+	_, ok := rulefield.TagCIDRName(cidr)
+	return ok
 }
 
 // ErrFirewallRuleFormUnsupported refuses a rule form a client may not send on

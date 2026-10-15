@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"unicode/utf8"
@@ -81,16 +82,6 @@ func validateAutomationBallot(b Ballot, zeroOK bool) error {
 	return nil
 }
 
-// automationVerifiedEvidence is deliberately private and has no production
-// installer. Task 4/5 must replace this inert seam with certified history,
-// readiness and custody checks. Storage tests install explicit snapshots only.
-type automationVerifiedEvidence struct {
-	Key          ClaimKey
-	Generation   int64
-	ParentDigest string
-	MembersHash  string
-}
-
 func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKey, b Ballot, gen int64, v *ClaimValue) (string, error) {
 	if !key.IsAutomation() {
 		return "", nil
@@ -101,20 +92,66 @@ func (c *Client) admitAutomationTx(ctx context.Context, tx *LocalTx, key ClaimKe
 	if err := validateAutomationBallot(b, false); err != nil {
 		return RefusalInvalidValue, nil
 	}
-	ev := c.automationEvidence
-	if ev == nil || ev.Key != key || ev.Generation != gen {
+	if v != nil {
+		d, err := automationDecision(*v)
+		if err != nil || contract.ValidateSupportedDecision(d) != nil {
+			return RefusalInvalidValue, nil
+		}
+	}
+
+	cfg, err := automationAuthorityTx(ctx, tx, c.hostName, gen)
+	if errors.Is(err, errAutomationAuthority) || cfg == nil && err == nil {
 		return RefusalAutomationUnavailable, nil
 	}
-	st, err := readStandingTx(ctx, tx, c.hostName)
 	if err != nil {
 		return "", err
 	}
-	if st.adopted != gen || st.cfg == nil || !st.cfg.Explicit() || MembersHash(st.cfg.Members) != ev.MembersHash {
+	head, err := automationHeadTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	sequence := uint64(key.OwnerEpoch)
+	if sequence > head.Sequence+1 {
 		return RefusalAutomationUnavailable, nil
 	}
-	if v != nil {
+	if sequence == head.Sequence+1 && head.Sequence > 0 {
+		digest, found, err := automationTrustedDigestTx(ctx, tx, head.Sequence)
+		if err != nil {
+			return "", err
+		}
+		if !found || digest != head.Digest {
+			return RefusalAutomationUnavailable, nil
+		}
+	}
+
+	if sequence <= head.Sequence {
+		digest, found, err := automationTrustedDigestTx(ctx, tx, sequence)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return RefusalAutomationUnavailable, nil
+		}
+		if v != nil {
+			actual, err := v.Digest()
+			if err != nil || actual != digest {
+				return RefusalInvalidValue, nil
+			}
+		}
+	} else if v != nil {
 		d, err := automationDecision(*v)
-		if err != nil || d.ParentDigest != ev.ParentDigest {
+		if err != nil || d.ParentDigest != head.Digest {
+			return RefusalInvalidValue, nil
+		}
+		if sequence == 1 {
+			rows, err := tx.Query(ctx, `SELECT bootstrap_principal,bootstrap_request FROM local_automation_authority WHERE id=1`)
+			if err != nil {
+				return "", err
+			}
+			if len(rows) != 1 || d.Command.PrincipalID != rows[0].String("bootstrap_principal") || d.Command.RequestID != rows[0].String("bootstrap_request") {
+				return RefusalAutomationUnavailable, nil
+			}
+		} else if d.Command.ClusterUID != head.ClusterUID {
 			return RefusalInvalidValue, nil
 		}
 	}

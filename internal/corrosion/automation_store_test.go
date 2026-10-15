@@ -63,7 +63,7 @@ func automationFixture(t *testing.T, seq uint64, parent string) (ClaimKey, Claim
 		kind = "initialize_cluster"
 		cluster = ""
 	}
-	d := contract.Decision{Sequence: seq, ParentDigest: parent, Command: contract.Command{Kind: kind, ClusterUID: cluster, RequestID: "req", Session: 17, Body: []byte("{\n\"version\":1}"), Ciphertext: []byte{0, 255, 3}, SecretIntentTag: []byte{7}, SecretKeyEpoch: "e"}, Assignment: []byte(`{"version":1,"operation":"op"}`)}
+	d := contract.Decision{Sequence: seq, ParentDigest: parent, Command: contract.Command{Kind: kind, ClusterUID: cluster, RequestID: "req", PrincipalID: "fixture", Body: []byte("{\n\"version\":1}")}, Assignment: []byte(`{"version":1,"cluster_uid":"established-cluster","operation_id":"op","recorded_at":"2026-10-15T00:00:00Z"}`)}
 	b, err := contract.EncodeDecision(d)
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,20 @@ func installAutomationEvidence(t *testing.T, c *Client, key ClaimKey, parent str
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.automationEvidence = &automationVerifiedEvidence{Key: key, Generation: gen, ParentDigest: parent, MembersHash: MembersHash(cfg.Members)}
+	incarnation, err := c.VoterIncarnation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.db.Exec(`INSERT OR REPLACE INTO local_automation_authority (id,generation,members_hash,incarnation,bootstrap_principal,bootstrap_request,provenance) VALUES (1,?,?,?,?,?,?)`, gen, MembersHash(cfg.Members), incarnation, "fixture", "req", "test-only:storage-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.OwnerEpoch > 1 {
+		_, err = c.db.Exec(`INSERT OR REPLACE INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?)`, "established-cluster", key.OwnerEpoch-1, parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // Mutation: weaken exclusive alternatives, key binding, complete digest or bounds.
@@ -107,11 +120,11 @@ func TestAutomationValueValidation(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*contract.Decision){
 		"session":        func(d *contract.Decision) { d.Command.Session++ },
-		"ciphertext":     func(d *contract.Decision) { d.Command.Ciphertext[0]++ },
+		"ciphertext":     func(d *contract.Decision) { d.Command.Ciphertext = []byte{1, 255} },
 		"body":           func(d *contract.Decision) { d.Command.Body = []byte(`{"version":1}`) },
 		"assignment":     func(d *contract.Decision) { d.Assignment = []byte(`{"version":1,"operation":"other"}`) },
-		"equality tag":   func(d *contract.Decision) { d.Command.SecretIntentTag[0]++ },
-		"equality epoch": func(d *contract.Decision) { d.Command.SecretKeyEpoch = "other" },
+		"equality tag":   func(d *contract.Decision) { d.Command.SecretIntentTag = []byte{7}; d.Command.SecretKeyEpoch = "e" },
+		"equality epoch": func(d *contract.Decision) { d.Command.SecretIntentTag = []byte{7}; d.Command.SecretKeyEpoch = "other" },
 	} {
 		d, err := contract.DecodeDecision(v.Automation.Envelope)
 		if err != nil {
@@ -246,7 +259,7 @@ func TestAutomationCrashRecovery(t *testing.T) {
 			}
 			c.SetVoterConfigGate(func() bool { return true })
 			voter := &claimTestVoter{c: c, name: "a", inc: inc}
-			adoptHandBuilt(t, 1, []VoterMember{{Name: "a", Incarnation: inc}}, voter)
+			adoptHandBuilt(t, 1, []VoterMember{{Name: "a", Incarnation: inc}, {Name: "b", Incarnation: "fixture-b"}, {Name: "c", Incarnation: "fixture-c"}}, voter)
 			if err = c.Close(); err != nil {
 				t.Fatal(err)
 			}

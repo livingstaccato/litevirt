@@ -540,7 +540,10 @@ import (
 //	     SSH, so nothing writes it, or a 'redfish' fence strategy, without the
 //	     release feature redfish_fence (release_2026_11_v1, ReplicationGated).
 //	     One new table.
-const CurrentSchemaVersion = 67
+//	v68: node-local automation authority, applied prefix, certified history,
+//	     permanent request receipts, authenticated anchors and bounded on-disk
+//	     recovery staging. None participates in CRDT replication.
+const CurrentSchemaVersion = 68
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2849,6 +2852,42 @@ var schemaDDL = []string{
 	// promise a peer could write is not a promise (§3.8). Written only through
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_automation_recovery (
+		id INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,digest TEXT NOT NULL,
+		next_sequence INTEGER NOT NULL,next_digest TEXT NOT NULL,
+		base_sequence INTEGER NOT NULL,base_digest TEXT NOT NULL,
+		generation INTEGER NOT NULL,members_hash TEXT NOT NULL,certificate TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_staging (
+		sequence INTEGER PRIMARY KEY,digest TEXT NOT NULL,value_json TEXT NOT NULL,certificate TEXT NOT NULL
+	)`,
+
+	`CREATE TABLE IF NOT EXISTS local_automation_authority (
+		id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL,
+		members_hash TEXT NOT NULL, incarnation TEXT NOT NULL,
+		bootstrap_principal TEXT NOT NULL, bootstrap_request TEXT NOT NULL,
+		provenance TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_prefix (
+		id INTEGER PRIMARY KEY CHECK(id=1), cluster_uid TEXT NOT NULL,
+		sequence INTEGER NOT NULL, digest TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_anchors (
+		sequence INTEGER PRIMARY KEY, digest TEXT NOT NULL,
+		generation INTEGER NOT NULL, members_hash TEXT NOT NULL, certificate TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_history (
+		sequence INTEGER PRIMARY KEY, digest TEXT NOT NULL,
+		value_json TEXT NOT NULL, certificate TEXT NOT NULL,
+		receipt_json TEXT NOT NULL, anchor_sequence INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_requests (
+		scope TEXT NOT NULL, request_id TEXT NOT NULL, identity BLOB NOT NULL,
+		receipt_json TEXT NOT NULL, operation_id TEXT NOT NULL,
+		PRIMARY KEY(scope,request_id)
+	)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_local_automation_operation ON local_automation_requests(operation_id) WHERE operation_id<>''`,
+
 	`CREATE TABLE IF NOT EXISTS local_recovery_claims (
 		target_kind       TEXT    NOT NULL,
 		target_name       TEXT    NOT NULL,
@@ -3608,6 +3647,9 @@ var createTableUnits = []struct {
 	{65, "host_runtime"},
 	{66, "session_groups"},
 	{67, "host_fence_redfish"},
+	{68, "local_automation_authority"}, {68, "local_automation_prefix"},
+	{68, "local_automation_anchors"}, {68, "local_automation_history"},
+	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

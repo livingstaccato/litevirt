@@ -297,6 +297,8 @@ const (
 	LiteVirt_StreamSensitiveTableRows_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveTableRows"
 	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
 	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
+	LiteVirt_GetAutomationDecision_FullMethodName      = "/litevirt.v1.LiteVirt/GetAutomationDecision"
+	LiteVirt_InstallAutomationDecision_FullMethodName  = "/litevirt.v1.LiteVirt/InstallAutomationDecision"
 	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
 	LiteVirt_AcceptRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
 	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
@@ -861,6 +863,8 @@ type LiteVirtClient interface {
 	// Single-decree Paxos per claim key. Peer-only: the caller must present a
 	// known host certificate, and a ballot must name its sender. A voter
 	// replies only after the state its reply depends on is committed.
+	GetAutomationDecision(ctx context.Context, in *GetAutomationDecisionRequest, opts ...grpc.CallOption) (*GetAutomationDecisionResponse, error)
+	InstallAutomationDecision(ctx context.Context, in *InstallAutomationDecisionRequest, opts ...grpc.CallOption) (*InstallAutomationDecisionResponse, error)
 	PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error)
 	AcceptRecoveryClaim(ctx context.Context, in *AcceptRecoveryClaimRequest, opts ...grpc.CallOption) (*AcceptRecoveryClaimResponse, error)
 	// Read-only: a voter's recorded state for one key, its incarnation and
@@ -4173,6 +4177,26 @@ func (c *liteVirtClient) GetClusterStateDigest(ctx context.Context, in *emptypb.
 	return out, nil
 }
 
+func (c *liteVirtClient) GetAutomationDecision(ctx context.Context, in *GetAutomationDecisionRequest, opts ...grpc.CallOption) (*GetAutomationDecisionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetAutomationDecisionResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetAutomationDecision_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) InstallAutomationDecision(ctx context.Context, in *InstallAutomationDecisionRequest, opts ...grpc.CallOption) (*InstallAutomationDecisionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InstallAutomationDecisionResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_InstallAutomationDecision_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PrepareRecoveryClaimResponse)
@@ -5359,6 +5383,8 @@ type LiteVirtServer interface {
 	// Single-decree Paxos per claim key. Peer-only: the caller must present a
 	// known host certificate, and a ballot must name its sender. A voter
 	// replies only after the state its reply depends on is committed.
+	GetAutomationDecision(context.Context, *GetAutomationDecisionRequest) (*GetAutomationDecisionResponse, error)
+	InstallAutomationDecision(context.Context, *InstallAutomationDecisionRequest) (*InstallAutomationDecisionResponse, error)
 	PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error)
 	AcceptRecoveryClaim(context.Context, *AcceptRecoveryClaimRequest) (*AcceptRecoveryClaimResponse, error)
 	// Read-only: a voter's recorded state for one key, its incarnation and
@@ -6443,6 +6469,12 @@ func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerA
 }
 func (UnimplementedLiteVirtServer) GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterStateDigest not implemented")
+}
+func (UnimplementedLiteVirtServer) GetAutomationDecision(context.Context, *GetAutomationDecisionRequest) (*GetAutomationDecisionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetAutomationDecision not implemented")
+}
+func (UnimplementedLiteVirtServer) InstallAutomationDecision(context.Context, *InstallAutomationDecisionRequest) (*InstallAutomationDecisionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InstallAutomationDecision not implemented")
 }
 func (UnimplementedLiteVirtServer) PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareRecoveryClaim not implemented")
@@ -11321,6 +11353,42 @@ func _LiteVirt_GetClusterStateDigest_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetAutomationDecision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAutomationDecisionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetAutomationDecision(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetAutomationDecision_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetAutomationDecision(ctx, req.(*GetAutomationDecisionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_InstallAutomationDecision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InstallAutomationDecisionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).InstallAutomationDecision(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_InstallAutomationDecision_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).InstallAutomationDecision(ctx, req.(*InstallAutomationDecisionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_PrepareRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PrepareRecoveryClaimRequest)
 	if err := dec(in); err != nil {
@@ -13431,6 +13499,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetClusterStateDigest",
 			Handler:    _LiteVirt_GetClusterStateDigest_Handler,
+		},
+		{
+			MethodName: "GetAutomationDecision",
+			Handler:    _LiteVirt_GetAutomationDecision_Handler,
+		},
+		{
+			MethodName: "InstallAutomationDecision",
+			Handler:    _LiteVirt_InstallAutomationDecision_Handler,
 		},
 		{
 			MethodName: "PrepareRecoveryClaim",

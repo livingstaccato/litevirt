@@ -2974,6 +2974,12 @@ message GetLeaseTermHighWaterResponse {
 
 // ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
 
+// Authenticated internal automation prefix transport. One bounded record only.
+message GetAutomationDecisionRequest { uint64 sequence = 1; }
+message GetAutomationDecisionResponse { bytes record_json = 1; bool found = 2; }
+message InstallAutomationDecisionRequest { bytes record_json = 1; }
+message InstallAutomationDecisionResponse { uint64 applied_sequence = 1; }
+
 message RecoveryClaimKey {
     string target_kind = 1;  // vm | container | voter_config
     string target_name = 2;  // workload name; "" for voter_config
@@ -4760,6 +4766,8 @@ service LiteVirt {
     // Single-decree Paxos per claim key. Peer-only: the caller must present a
     // known host certificate, and a ballot must name its sender. A voter
     // replies only after the state its reply depends on is committed.
+    rpc GetAutomationDecision(GetAutomationDecisionRequest) returns (GetAutomationDecisionResponse);
+    rpc InstallAutomationDecision(InstallAutomationDecisionRequest) returns (InstallAutomationDecisionResponse);
     rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
     rpc AcceptRecoveryClaim(AcceptRecoveryClaimRequest) returns (AcceptRecoveryClaimResponse);
     // Read-only: a voter's recorded state for one key, its incarnation and

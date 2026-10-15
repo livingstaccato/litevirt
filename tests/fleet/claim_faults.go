@@ -113,10 +113,12 @@ type claimLink struct {
 	stats ClaimStats
 }
 
-// faultedClaimMethods are the claim RPCs that carry a ballot.
+// faultedClaimMethods includes ballots and certified automation prefix traffic.
 var faultedClaimMethods = map[string]bool{
-	"PrepareRecoveryClaim": true,
-	"AcceptRecoveryClaim":  true,
+	"GetAutomationDecision":     true,
+	"InstallAutomationDecision": true,
+	"PrepareRecoveryClaim":      true,
+	"AcceptRecoveryClaim":       true,
 }
 
 func (c *Cluster) claimRNG(from, to string) *rand.Rand {

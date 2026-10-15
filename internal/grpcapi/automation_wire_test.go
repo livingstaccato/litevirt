@@ -165,3 +165,98 @@ func TestAutomationLargestRecoveryMessages(t *testing.T) {
 		}
 	}
 }
+
+// This is generic codec/wire capacity evidence, NOT semantic admission or
+// certificate validity evidence. Task5 must budget electorate/certificate size
+// before activation; future real seed handlers must repeat actual admission at
+// their advertised combined limits. Prefix frames include a QUORUM certificate.
+func TestAutomationPrefixCombinedMessageBounds(t *testing.T) {
+	d := contract.Decision{Sequence: 1, Command: contract.Command{Kind: "initialize_cluster", RequestID: "wire-capacity"}}
+	lo, hi := 0, 2<<20
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		d.Command.Ciphertext = make([]byte, mid)
+		if _, err := contract.EncodeDecision(d); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	d.Command.Ciphertext = make([]byte, lo)
+	envelope, err := contract.EncodeDecision(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: envelope}}
+	key, _ := corrosion.AutomationClaimKey(1)
+	ballot := corrosion.Ballot{Round: math.MaxInt64, Coordinator: strings.Repeat("n", 4096), Nonce: make([]byte, 256)}
+	record := corrosion.AutomationRecord{Value: value, Certificate: corrosion.ClaimCertificate{Key: key, Ballot: ballot, ConfigGeneration: math.MaxInt64, ValueDigest: value.MustDigest()}}
+	accept := corrosion.ClaimAccept{Key: key, Ballot: ballot, ConfigGeneration: math.MaxInt64, ValueDigest: record.Certificate.ValueDigest, Voter: strings.Repeat("v", 4096), VoterIncarnation: strings.Repeat("i", 4096), Signature: make([]byte, 256), CertPEM: strings.Repeat("c", 64<<10)}
+	for {
+		record.Certificate.Accepts = append(record.Certificate.Accepts, accept)
+		if _, err := encodeAutomationRecord(record); err != nil {
+			break
+		}
+	}
+	// Fill the final bounded certificate field to the exact complete-record cap.
+	last := len(record.Certificate.Accepts) - 1
+	// If the final accept metadata alone crosses the cap, make room in the
+	// preceding bounded field before filling the last one. Keep the fixture
+	// valid when a cap mutation changes where the final accept lands.
+	record.Certificate.Accepts[last].CertPEM = ""
+	base, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if excess := len(base) - maxAutomationRecordBytes; excess > 0 {
+		previous := &record.Certificate.Accepts[last-1].CertPEM
+		if excess > len(*previous) {
+			t.Fatal("final accept metadata exceeds bounded fixture field")
+		}
+		*previous = (*previous)[:len(*previous)-excess]
+	}
+	lo, hi = 0, 64<<10
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		record.Certificate.Accepts[last].CertPEM = strings.Repeat("c", mid)
+		if _, err := encodeAutomationRecord(record); err == nil {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	record.Certificate.Accepts[last].CertPEM = strings.Repeat("c", lo)
+	encoded, err := encodeAutomationRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != maxAutomationRecordBytes {
+		t.Fatalf("fixture did not reach combined record cap: %d", len(encoded))
+	}
+	decoded, err := decodeAutomationRecord(encoded)
+	if err != nil || !reflect.DeepEqual(decoded, record) {
+		t.Fatalf("combined prefix lost record: %v", err)
+	}
+	for _, message := range []proto.Message{&pb.GetAutomationDecisionResponse{Found: true, RecordJson: encoded}, &pb.InstallAutomationDecisionRequest{RecordJson: encoded}} {
+		b, err := proto.Marshal(message)
+		t.Logf("%T: %d bytes, complete record %d bytes, accepts %d", message, len(b), len(encoded), len(record.Certificate.Accepts))
+		if err != nil || len(b) >= 4<<20 {
+			t.Fatalf("prefix frame cannot use default peer receive bound: %d %v", len(b), err)
+		}
+		copy := message.ProtoReflect().New().Interface()
+		if err := proto.Unmarshal(b, copy); err != nil || !proto.Equal(message, copy) {
+			t.Fatalf("prefix binary wrapper lost bytes: %v", err)
+		}
+	}
+	record.Certificate.Accepts[last].CertPEM += "c"
+	if _, err := encodeAutomationRecord(record); err == nil {
+		t.Fatal("oversize combined record encoded")
+	}
+	tooLarge, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeAutomationRecord(tooLarge); err == nil {
+		t.Fatal("oversize combined record decoded")
+	}
+}

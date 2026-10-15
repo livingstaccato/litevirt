@@ -211,10 +211,12 @@ func (c *Cluster) LinkStats(from, to *Node) LinkStats {
 
 // claimMethods are the recovery-claim RPCs LinkFault.BlockClaims refuses.
 var claimMethods = map[string]bool{
-	"PrepareRecoveryClaim": true,
-	"AcceptRecoveryClaim":  true,
-	"GetRecoveryClaim":     true,
-	"ListRecoveryClaims":   true,
+	"GetAutomationDecision":     true,
+	"InstallAutomationDecision": true,
+	"PrepareRecoveryClaim":      true,
+	"AcceptRecoveryClaim":       true,
+	"GetRecoveryClaim":          true,
+	"ListRecoveryClaims":        true,
 }
 
 // claimBlocked reports whether BlockClaims refuses caller's claim RPC into n,

@@ -16,6 +16,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
+	"github.com/litevirt/litevirt/internal/automation"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
@@ -37,6 +38,8 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
+	automationMu     sync.Mutex
+	automationEngine *automation.Engine
 	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
 	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer

@@ -9,13 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -127,8 +125,16 @@ const versionTimeout = 10 * time.Second
 // Installed reads the host's installed firmware code. This is what the target
 // compares (its incoming QEMU and swtpm are exec'd from it) and what the
 // source's running processes must be. Any version or file it cannot read is an
-// error.
+// error, and an error carries a zero value: never a half-read runtime.
 func (p *FirmwareCodeProbe) Installed(ctx context.Context) (InstalledFirmwareCode, error) {
+	in, err := p.installed(ctx)
+	if err != nil {
+		return InstalledFirmwareCode{}, err
+	}
+	return in, nil
+}
+
+func (p *FirmwareCodeProbe) installed(ctx context.Context) (InstalledFirmwareCode, error) {
 	var in InstalledFirmwareCode
 	if p.LibvirtVersion == nil {
 		return in, fmt.Errorf("libvirt version: no connection")
@@ -202,20 +208,36 @@ func versionOutput(ctx context.Context, bin string) (string, error) {
 	return string(out), nil
 }
 
-// installedLibtpms is the one real file every libtpms.so* in the library dirs
-// resolves to. None, or two different files, is an error: which of them a
-// newly exec'd swtpm loads would be a guess.
+// libtpmsSonameRe is the soname link the dynamic linker resolves
+// (libtpms.so.<major>); the real file and a dev link are not what it loads.
+var libtpmsSonameRe = regexp.MustCompile(`^libtpms\.so\.[0-9]+$`)
+
+// libtpmsRemedy is the operator's way out of an unknown installed libtpms.
+const libtpmsRemedy = "remove the stray libtpms copy or run ldconfig; live firmware moves on this host stay refused until exactly one libtpms is installed"
+
+// installedLibtpms is the one real file every libtpms soname link
+// (libtpms.so.<major>) in the library dirs resolves to. None, or two different
+// files, is an error: which of them a newly exec'd swtpm loads would be a
+// guess. One file reached through several dirs (usrmerge: /lib → /usr/lib)
+// counts once.
 func (p *FirmwareCodeProbe) installedLibtpms() (string, error) {
 	seen := map[string]bool{}
 	for _, dir := range p.LibDirs {
-		matches, err := filepath.Glob(filepath.Join(dir, "libtpms.so*"))
+		ents, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return "", fmt.Errorf("installed libtpms: %w", err)
 		}
-		for _, m := range matches {
+		for _, e := range ents {
+			if !libtpmsSonameRe.MatchString(e.Name()) {
+				continue
+			}
+			m := filepath.Join(dir, e.Name())
 			r, err := filepath.EvalSymlinks(m)
 			if err != nil {
-				return "", fmt.Errorf("installed libtpms %s: %w", m, err)
+				return "", fmt.Errorf("installed libtpms %s: %w; %s", m, err, libtpmsRemedy)
 			}
 			seen[r] = true
 		}
@@ -227,17 +249,19 @@ func (p *FirmwareCodeProbe) installedLibtpms() (string, error) {
 	sort.Strings(found)
 	switch len(found) {
 	case 0:
-		return "", fmt.Errorf("installed libtpms: no libtpms.so* in %s", strings.Join(p.LibDirs, ", "))
+		return "", fmt.Errorf("installed libtpms: no libtpms.so.<N> in %s; install libtpms", strings.Join(p.LibDirs, ", "))
 	case 1:
 		return found[0], nil
 	default:
-		return "", fmt.Errorf("installed libtpms ambiguous: %s", strings.Join(found, ", "))
+		return "", fmt.Errorf("installed libtpms ambiguous: %s; %s", strings.Join(found, ", "), libtpmsRemedy)
 	}
 }
 
-// RunningDomain is what the check needs of a running domain, from its LIVE
-// definition: the live id names swtpm's pid file.
-type RunningDomain struct {
+// runningDomain is what the check needs of a running domain, read from its
+// LIVE definition by runningDomainFromXML: the live id names swtpm's pid file,
+// and the devices decide which checks apply. It is not built by hand, so a
+// caller cannot skip a check by leaving a field empty.
+type runningDomain struct {
 	Name   string
 	ID     int    // live domain id; 0 when not running
 	UUID   string // lower case
@@ -245,9 +269,8 @@ type RunningDomain struct {
 	TPM    bool   // any <tpm> device
 }
 
-// RunningDomainFromXML reads a RunningDomain from a domain's live XML
-// (DumpXML of a running domain).
-func RunningDomainFromXML(liveXML string) (RunningDomain, error) {
+// runningDomainFromXML reads a runningDomain from a domain's live XML.
+func runningDomainFromXML(liveXML string) (runningDomain, error) {
 	var d struct {
 		ID     string `xml:"id,attr"`
 		Name   string `xml:"name"`
@@ -258,9 +281,9 @@ func RunningDomainFromXML(liveXML string) (RunningDomain, error) {
 		} `xml:"devices>tpm"`
 	}
 	if err := xml.Unmarshal([]byte(liveXML), &d); err != nil {
-		return RunningDomain{}, fmt.Errorf("parse domain XML: %w", err)
+		return runningDomain{}, fmt.Errorf("parse domain XML: %w", err)
 	}
-	rd := RunningDomain{
+	rd := runningDomain{
 		Name:   strings.TrimSpace(d.Name),
 		UUID:   strings.ToLower(strings.TrimSpace(d.UUID)),
 		Loader: strings.TrimSpace(d.Loader),
@@ -269,7 +292,7 @@ func RunningDomainFromXML(liveXML string) (RunningDomain, error) {
 	if d.ID != "" {
 		id, err := strconv.Atoi(d.ID)
 		if err != nil {
-			return RunningDomain{}, fmt.Errorf("domain id %q: %w", d.ID, err)
+			return runningDomain{}, fmt.Errorf("domain id %q: %w", d.ID, err)
 		}
 		if id > 0 {
 			rd.ID = id
@@ -314,62 +337,103 @@ func libvirtShortName(id int, name string) string {
 	return strconv.Itoa(id) + "-" + name
 }
 
-// refuse wraps a refusal of the running-code check.
-func refuse(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrRunningCodeUnverified, fmt.Errorf(format, args...))
+// Remedies, one per class of refusal. Every refusal ends with one.
+const (
+	// The process runs a file that is not the installed one: a package was
+	// updated under the running guest (K-4).
+	remedyRestart = "the VM still runs code from before a package update; restart it (lv stop, lv start) to load the installed code"
+	// /proc could not be read: the daemon lacks root or runs in another pid
+	// namespace or container (K-8).
+	remedyProc = "the daemon must run as root in the host pid namespace to read /proc (K-8); this is a refusal, not a pass"
+	// The pid file does not lead to this domain's process.
+	remedyPid = "libvirt's pid file does not lead to this domain's process; check that the VM runs under this host's libvirtd and retry"
+	// The domain itself is not in a state the check can read.
+	remedyDomain = "only a running domain's live definition can be checked"
+	// The host's installed code could not be read.
+	remedyHost = "host configuration: the installed QEMU, swtpm, libtpms and OVMF must all be readable"
+)
+
+// refuse is a refusal of the running-code check, with its remedy.
+func refuse(remedy, format string, args ...any) error {
+	return fmt.Errorf("%w: %s; %s", ErrRunningCodeUnverified, fmt.Sprintf(format, args...), remedy)
 }
 
 // refuseErr is refuse keeping err in the chain (errors.Is(…, fs.ErrPermission)).
-func refuseErr(err error, format string, args ...any) error {
-	return fmt.Errorf("%w: %s: %w", ErrRunningCodeUnverified, fmt.Sprintf(format, args...), err)
+func refuseErr(err error, remedy, format string, args ...any) error {
+	return fmt.Errorf("%w: %s: %w; %s", ErrRunningCodeUnverified, fmt.Sprintf(format, args...), err, remedy)
 }
 
-// RunningFirmwareCode proves that the running domain dom runs this host's
-// installed firmware code and returns the installed runtime as its running
-// one. Each check below must find what it looks for (spec §3.5):
+// procRemedy is the remedy for a failed /proc read: a permission error is the
+// daemon's privilege (K-8); a missing entry means the process is gone or not
+// visible here, which is the pid file's problem.
+func procRemedy(err error) string {
+	if errors.Is(err, fs.ErrPermission) {
+		return remedyProc
+	}
+	return remedyPid
+}
+
+// RunningFirmwareCode proves that the domain whose LIVE XML (DumpXML of the
+// running domain) is liveXML runs this host's installed firmware code, and
+// returns the installed runtime as its running one. The checks that apply
+// are read from that XML: QEMU always, swtpm and libtpms for a domain with a
+// <tpm>, the OVMF CODE for one with a <loader>. Each must find what it looks
+// for (spec §3.5):
 //
 //  1. QEMU: the pid from <QEMURunDir>/<name>.pid, whose cmdline carries
 //     "-uuid <uuid>".
-//  2. swtpm (a domain with a TPM): the pid from
-//     <SwtpmRunDir>/<id>-<name[:20]>-swtpm.pid, whose cmdline's --tpmstate dir
-//     is <SwtpmBase>/<uuid> or below it.
+//  2. swtpm: the pid from <SwtpmRunDir>/<id>-<name[:20]>-swtpm.pid, whose
+//     cmdline's --tpmstate dir is <SwtpmBase>/<uuid> or below it.
 //  3. Each exe links to the installed binary's realpath, without the
-//     (deleted) suffix, and stats to the installed file's (dev, inode).
+//     (deleted) suffix, and is the installed file.
 //  4. libtpms: swtpm maps the installed libtpms realpath, every such mapping
-//     undeleted and with the installed (dev, inode).
-//  5. OVMF CODE (a domain with a loader): the loader is an installed CODE
-//     file, and QEMU holds it open by an fd, every such fd undeleted and the
-//     installed file.
+//     undeleted and, through /proc/<pid>/map_files, the installed file.
+//  5. OVMF CODE: the loader is an installed CODE file, and QEMU holds it open
+//     by an fd, every such fd undeleted and the installed file.
 //
-// Any refusal is an ErrRunningCodeUnverified with a zero runtime.
-func (p *FirmwareCodeProbe) RunningFirmwareCode(ctx context.Context, dom RunningDomain) (FirmwareRuntime, error) {
+// Each pid's start time is read before its first check and again after its
+// last: a pid recycled in between refuses. Any refusal is an
+// ErrRunningCodeUnverified with a zero runtime and a remedy.
+func (p *FirmwareCodeProbe) RunningFirmwareCode(ctx context.Context, liveXML string) (FirmwareRuntime, error) {
+	dom, err := runningDomainFromXML(liveXML)
+	if err != nil {
+		return FirmwareRuntime{}, refuseErr(err, remedyDomain, "live domain XML")
+	}
+	return p.runningFirmwareCode(ctx, dom)
+}
+
+func (p *FirmwareCodeProbe) runningFirmwareCode(ctx context.Context, dom runningDomain) (FirmwareRuntime, error) {
 	if dom.ID <= 0 {
-		return FirmwareRuntime{}, refuse("domain %s is not running (no live id)", dom.Name)
+		return FirmwareRuntime{}, refuse(remedyDomain, "domain %s is not running (no live id)", dom.Name)
 	}
 	if err := safename.ValidateVMName(dom.Name); err != nil {
-		return FirmwareRuntime{}, refuse("domain name: %v", err)
+		return FirmwareRuntime{}, refuse(remedyDomain, "domain name: %v", err)
 	}
 	uuid := strings.ToLower(dom.UUID)
 	if !ValidFirmwareUUID(uuid) {
-		return FirmwareRuntime{}, refuse("domain %s: invalid uuid %q", dom.Name, dom.UUID)
+		return FirmwareRuntime{}, refuse(remedyDomain, "domain %s: invalid uuid %q", dom.Name, dom.UUID)
 	}
 	in, err := p.Installed(ctx)
 	if err != nil {
-		return FirmwareRuntime{}, refuseErr(err, "domain %s: installed firmware code unknown", dom.Name)
+		return FirmwareRuntime{}, refuseErr(err, remedyHost, "domain %s: installed firmware code unknown", dom.Name)
 	}
 	proc := p.procfs()
 
 	// 1. QEMU, by the domain's pid file and its -uuid.
 	qemuPid, err := readPidFile(filepath.Join(p.QEMURunDir, dom.Name+".pid"))
 	if err != nil {
-		return FirmwareRuntime{}, refuseErr(err, "qemu of %s: pid file", dom.Name)
+		return FirmwareRuntime{}, refuseErr(err, remedyPid, "qemu of %s: pid file", dom.Name)
+	}
+	qemuStart, err := pidStartTime(proc, qemuPid)
+	if err != nil {
+		return FirmwareRuntime{}, refuseErr(err, procRemedy(err), "qemu (pid %d) of %s: stat", qemuPid, dom.Name)
 	}
 	argv, err := readCmdline(proc, qemuPid)
 	if err != nil {
-		return FirmwareRuntime{}, refuseErr(err, "qemu (pid %d) of %s: cmdline", qemuPid, dom.Name)
+		return FirmwareRuntime{}, refuseErr(err, procRemedy(err), "qemu (pid %d) of %s: cmdline", qemuPid, dom.Name)
 	}
 	if !argPairEqualFold(argv, "-uuid", uuid) {
-		return FirmwareRuntime{}, refuse("qemu (pid %d) of %s: cmdline carries no -uuid %s (stale or reused pid)", qemuPid, dom.Name, uuid)
+		return FirmwareRuntime{}, refuse(remedyPid, "qemu (pid %d) of %s: cmdline carries no -uuid %s (stale or reused pid)", qemuPid, dom.Name, uuid)
 	}
 	if err := checkExe(proc, qemuPid, "qemu", in.QEMU); err != nil {
 		return FirmwareRuntime{}, err
@@ -380,20 +444,27 @@ func (p *FirmwareCodeProbe) RunningFirmwareCode(ctx context.Context, dom Running
 		pidFile := filepath.Join(p.SwtpmRunDir, libvirtShortName(dom.ID, dom.Name)+"-swtpm.pid")
 		swtpmPid, err := readPidFile(pidFile)
 		if err != nil {
-			return FirmwareRuntime{}, refuseErr(err, "swtpm of %s: pid file", dom.Name)
+			return FirmwareRuntime{}, refuseErr(err, remedyPid, "swtpm of %s: pid file", dom.Name)
+		}
+		swtpmStart, err := pidStartTime(proc, swtpmPid)
+		if err != nil {
+			return FirmwareRuntime{}, refuseErr(err, procRemedy(err), "swtpm (pid %d) of %s: stat", swtpmPid, dom.Name)
 		}
 		argv, err := readCmdline(proc, swtpmPid)
 		if err != nil {
-			return FirmwareRuntime{}, refuseErr(err, "swtpm (pid %d) of %s: cmdline", swtpmPid, dom.Name)
+			return FirmwareRuntime{}, refuseErr(err, procRemedy(err), "swtpm (pid %d) of %s: cmdline", swtpmPid, dom.Name)
 		}
 		stateDir := filepath.Join(p.SwtpmBase, uuid)
 		if !swtpmStateDirIs(argv, stateDir) {
-			return FirmwareRuntime{}, refuse("swtpm (pid %d) of %s: cmdline does not name the state dir %s", swtpmPid, dom.Name, stateDir)
+			return FirmwareRuntime{}, refuse(remedyPid, "swtpm (pid %d) of %s: cmdline does not name the state dir %s", swtpmPid, dom.Name, stateDir)
 		}
 		if err := checkExe(proc, swtpmPid, "swtpm", in.Swtpm); err != nil {
 			return FirmwareRuntime{}, err
 		}
 		if err := checkLibtpmsMapped(proc, swtpmPid, in.Libtpms); err != nil {
+			return FirmwareRuntime{}, err
+		}
+		if err := samePidStart(proc, swtpmPid, "swtpm", swtpmStart); err != nil {
 			return FirmwareRuntime{}, err
 		}
 	}
@@ -404,7 +475,47 @@ func (p *FirmwareCodeProbe) RunningFirmwareCode(ctx context.Context, dom Running
 			return FirmwareRuntime{}, err
 		}
 	}
+	if err := samePidStart(proc, qemuPid, "qemu", qemuStart); err != nil {
+		return FirmwareRuntime{}, err
+	}
 	return in.Runtime, nil
+}
+
+// pidStartTime is field 22 (starttime) of /proc/<pid>/stat. The comm field
+// may hold spaces and parentheses, so the fields are counted after its LAST
+// closing parenthesis (field 3 onward).
+func pidStartTime(proc procView, pid int) (string, error) {
+	b, err := proc.ReadFile(strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", err
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return "", fmt.Errorf("/proc/%d/stat: no comm field", pid)
+	}
+	f := strings.Fields(s[i+1:])
+	const startIdx = 22 - 3
+	if len(f) <= startIdx {
+		return "", fmt.Errorf("/proc/%d/stat: %d fields after comm, want more than %d", pid, len(f), startIdx)
+	}
+	if _, err := strconv.ParseUint(f[startIdx], 10, 64); err != nil {
+		return "", fmt.Errorf("/proc/%d/stat: start time %q: %w", pid, f[startIdx], err)
+	}
+	return f[startIdx], nil
+}
+
+// samePidStart re-reads the pid's start time after its last check. A
+// different one means the pid was recycled while it was being read.
+func samePidStart(proc procView, pid int, what, before string) error {
+	after, err := pidStartTime(proc, pid)
+	if err != nil {
+		return refuseErr(err, procRemedy(err), "%s (pid %d): stat after the checks", what, pid)
+	}
+	if after != before {
+		return refuse(remedyPid, "%s (pid %d): start time changed from %s to %s while it was checked (pid recycled)", what, pid, before, after)
+	}
+	return nil
 }
 
 // readPidFile reads a libvirt pid file: one positive decimal pid.
@@ -477,56 +588,68 @@ func swtpmStateDirIs(argv []string, stateDir string) bool {
 }
 
 // checkExe: /proc/<pid>/exe links to installed (a realpath) without the
-// deleted suffix, and stats to the installed file.
+// deleted suffix, and is the installed file.
 func checkExe(proc procView, pid int, what, installed string) error {
 	entry := strconv.Itoa(pid) + "/exe"
 	target, err := proc.Readlink(entry)
 	if err != nil {
-		return refuseErr(err, "%s (pid %d): exe", what, pid)
+		return refuseErr(err, procRemedy(err), "%s (pid %d): exe", what, pid)
 	}
 	if strings.HasSuffix(target, deletedSuffix) {
-		return refuse("%s (pid %d) runs %s: the binary it was started from is gone", what, pid, target)
+		return refuse(remedyRestart, "%s (pid %d) runs %s: the binary it was started from is gone", what, pid, target)
 	}
 	if target != installed {
-		return refuse("%s (pid %d) runs %s, the installed binary is %s", what, pid, target, installed)
+		return refuse(remedyRestart, "%s (pid %d) runs %s, the installed binary is %s", what, pid, target, installed)
 	}
-	if err := sameFile(proc, entry, installed); err != nil {
-		return refuseErr(err, "%s (pid %d): exe", what, pid)
-	}
-	return nil
+	return sameFile(proc, entry, installed, fmt.Sprintf("%s (pid %d): exe", what, pid))
 }
 
-// sameFile requires the file reached through the /proc entry to be the
-// installed file (dev, inode).
-func sameFile(proc procView, entry, installed string) error {
+// sameFile requires the file reached through the /proc magic link entry to be
+// the installed file. Both sides are stat'ed through the VFS, so they agree on
+// every filesystem (btrfs and overlayfs included), unlike the dev printed in
+// maps.
+func sameFile(proc procView, entry, installed, what string) error {
 	running, err := proc.Stat(entry)
 	if err != nil {
-		return err
+		return refuseErr(err, procRemedy(err), "%s: stat %s", what, entry)
 	}
 	inst, err := os.Stat(installed)
 	if err != nil {
-		return err
+		return refuseErr(err, remedyHost, "%s: stat installed %s", what, installed)
 	}
 	if !os.SameFile(running, inst) {
-		return fmt.Errorf("running file is another inode than the installed %s", installed)
+		return refuse(remedyRestart, "%s: the running file is another inode than the installed %s", what, installed)
 	}
 	return nil
 }
 
+// mapFilesName is the /proc/<pid>/map_files entry of a maps range: the kernel
+// names it "%lx-%lx", without the zero padding maps uses.
+func mapFilesName(rng string) (string, error) {
+	lo, hi, ok := strings.Cut(rng, "-")
+	if !ok {
+		return "", fmt.Errorf("maps range %q", rng)
+	}
+	a, err := strconv.ParseUint(lo, 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("maps range %q: %w", rng, err)
+	}
+	b, err := strconv.ParseUint(hi, 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("maps range %q: %w", rng, err)
+	}
+	return fmt.Sprintf("%x-%x", a, b), nil
+}
+
 // checkLibtpmsMapped: swtpm maps the installed libtpms, and every mapping of
-// that path is undeleted and the installed (dev, inode).
+// that path is undeleted and, stat'ed through /proc/<pid>/map_files, the
+// installed file. map_files needs CAP_SYS_ADMIN (the daemon runs as root,
+// K-8); any failure to stat it refuses.
 func checkLibtpmsMapped(proc procView, pid int, installed string) error {
 	b, err := proc.ReadFile(strconv.Itoa(pid) + "/maps")
 	if err != nil {
-		return refuseErr(err, "swtpm (pid %d): read maps for libtpms", pid)
+		return refuseErr(err, procRemedy(err), "swtpm (pid %d): read maps for libtpms", pid)
 	}
-	var st syscall.Stat_t
-	if err := syscall.Stat(installed, &st); err != nil {
-		return refuseErr(err, "swtpm (pid %d): stat installed libtpms", pid)
-	}
-	dev := uint64(st.Dev) //nolint:unconvert // Dev is int32 on some unixes
-	wantDev := fmt.Sprintf("%02x:%02x", unix.Major(dev), unix.Minor(dev))
-	wantIno := strconv.FormatUint(uint64(st.Ino), 10) //nolint:unconvert
 	found := 0
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Fields(line)
@@ -539,16 +662,28 @@ func checkLibtpmsMapped(proc procView, pid int, installed string) error {
 			continue
 		}
 		if deleted {
-			return refuse("swtpm (pid %d) maps libtpms %s: the library it loaded is gone", pid, path)
+			return refuse(remedyRestart, "swtpm (pid %d) maps libtpms %s: the library it loaded is gone", pid, path)
 		}
-		if !strings.EqualFold(f[3], wantDev) || f[4] != wantIno {
-			return refuse("swtpm (pid %d) maps libtpms %s as dev %s inode %s, the installed file is dev %s inode %s",
-				pid, path, f[3], f[4], wantDev, wantIno)
+		name, err := mapFilesName(f[0])
+		if err != nil {
+			return refuseErr(err, remedyProc, "swtpm (pid %d) maps libtpms: unreadable map_files range", pid)
+		}
+		entry := strconv.Itoa(pid) + "/map_files/" + name
+		running, err := proc.Stat(entry)
+		if err != nil {
+			return refuseErr(err, remedyProc, "swtpm (pid %d) maps libtpms: stat map_files/%s", pid, name)
+		}
+		inst, err := os.Stat(installed)
+		if err != nil {
+			return refuseErr(err, remedyHost, "swtpm (pid %d): stat installed libtpms %s", pid, installed)
+		}
+		if !os.SameFile(running, inst) {
+			return refuse(remedyRestart, "swtpm (pid %d) maps libtpms %s (map_files/%s) from another inode than the installed file", pid, path, name)
 		}
 		found++
 	}
 	if found == 0 {
-		return refuse("swtpm (pid %d): no mapping of the installed libtpms %s", pid, installed)
+		return refuse(remedyRestart, "swtpm (pid %d): no mapping of the installed libtpms %s", pid, installed)
 	}
 	return nil
 }
@@ -558,19 +693,19 @@ func checkLibtpmsMapped(proc procView, pid int, installed string) error {
 func checkLoaderOpen(proc procView, pid int, loader string, installed []string) error {
 	real, err := filepath.EvalSymlinks(loader)
 	if err != nil {
-		return refuseErr(err, "OVMF CODE %s", loader)
+		return refuseErr(err, remedyHost, "OVMF CODE %s", loader)
 	}
 	ok := false
 	for _, l := range installed {
 		ok = ok || l == real
 	}
 	if !ok {
-		return refuse("OVMF CODE %s (%s) is not an installed OVMF CODE file", loader, real)
+		return refuse(remedyRestart, "OVMF CODE %s (%s) is not an installed OVMF CODE file", loader, real)
 	}
 	fdDir := strconv.Itoa(pid) + "/fd"
 	ents, err := proc.ReadDir(fdDir)
 	if err != nil {
-		return refuseErr(err, "OVMF CODE: qemu (pid %d): list fd", pid)
+		return refuseErr(err, procRemedy(err), "OVMF CODE: qemu (pid %d): list fd", pid)
 	}
 	found := 0
 	for _, e := range ents {
@@ -580,22 +715,22 @@ func checkLoaderOpen(proc procView, pid int, loader string, installed []string) 
 			continue // closed since the listing: not open, so not a match
 		}
 		if err != nil {
-			return refuseErr(err, "OVMF CODE: qemu (pid %d) fd %s", pid, e.Name())
+			return refuseErr(err, procRemedy(err), "OVMF CODE: qemu (pid %d) fd %s", pid, e.Name())
 		}
 		stripped, deleted := strings.CutSuffix(target, deletedSuffix)
 		if stripped != real {
 			continue
 		}
 		if deleted {
-			return refuse("OVMF CODE: qemu (pid %d) fd %s is %s: the firmware it loaded is gone", pid, e.Name(), target)
+			return refuse(remedyRestart, "OVMF CODE: qemu (pid %d) fd %s is %s: the firmware it loaded is gone", pid, e.Name(), target)
 		}
-		if err := sameFile(proc, entry, real); err != nil {
-			return refuseErr(err, "OVMF CODE: qemu (pid %d) fd %s", pid, e.Name())
+		if err := sameFile(proc, entry, real, fmt.Sprintf("OVMF CODE: qemu (pid %d) fd %s", pid, e.Name())); err != nil {
+			return err
 		}
 		found++
 	}
 	if found == 0 {
-		return refuse("OVMF CODE: qemu (pid %d) has no open fd on %s", pid, real)
+		return refuse(remedyRestart, "OVMF CODE: qemu (pid %d) has no open fd on %s", pid, real)
 	}
 	return nil
 }

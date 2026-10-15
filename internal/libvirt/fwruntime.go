@@ -74,11 +74,12 @@ func FormatLibvirtVersion(v uint64) (string, error) {
 }
 
 // OVMFContentFingerprint is the hex sha256 over dataDir and, for each of the
-// four OVMF files in a fixed order, its role, its path and the sha256 of its
-// content. It is the content counterpart of the layout fingerprint: two hosts
-// with the same paths but a different OVMF build differ. A file the host does
-// not have (an empty path) is part of the fingerprint as absent; a configured
-// file that cannot be read is an error.
+// four OVMF files in a fixed order, its role and the sha256 of its content
+// (spec §3.2 item 9). It is the content counterpart of the layout fingerprint,
+// which compares the paths: two hosts with the same paths but a different OVMF
+// build differ here, and the same build at other paths does not. A file the
+// host does not have (an empty path) counts as absent; a configured file that
+// cannot be read is an error.
 func OVMFContentFingerprint(fp FirmwarePaths, dataDir string) (string, error) {
 	h := sha256.New()
 	fmt.Fprintf(h, "dataDir\x00%s\x00", dataDir)
@@ -93,7 +94,7 @@ func OVMFContentFingerprint(fp FirmwarePaths, dataDir string) (string, error) {
 			}
 			sum = s
 		}
-		fmt.Fprintf(h, "%s\x00%s\x00%s\x00", f.role, f.path, sum)
+		fmt.Fprintf(h, "%s\x00%s\x00", f.role, sum)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

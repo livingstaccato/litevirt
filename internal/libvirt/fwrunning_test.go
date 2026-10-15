@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,7 +39,7 @@ type fwFixture struct {
 	t        *testing.T
 	root     string
 	probe    *FirmwareCodeProbe
-	dom      RunningDomain
+	dom      runningDomain
 	qemuBin  string
 	swtpmBin string
 	libReal  string
@@ -67,8 +68,16 @@ func fxLink(t *testing.T, target, link string) {
 	}
 }
 
-// fxMapsLine is a /proc/<pid>/maps line naming path with the (dev, inode) of
-// the file at statPath.
+// fxLibRange is the address range of the libtpms mapping in the fixture's
+// maps, zero-padded as maps prints it; fxLibMapFile is its map_files name,
+// which the kernel prints without the padding.
+const (
+	fxLibRange   = "00400000-00452000"
+	fxLibMapFile = "400000-452000"
+)
+
+// fxMapsLine is a /proc/<pid>/maps line at fxLibRange naming path with the
+// (dev, inode) of the file at statPath.
 func fxMapsLine(t *testing.T, path, statPath string) string {
 	t.Helper()
 	var st syscall.Stat_t
@@ -76,8 +85,8 @@ func fxMapsLine(t *testing.T, path, statPath string) string {
 		t.Fatal(err)
 	}
 	dev := uint64(st.Dev) //nolint:unconvert // Dev is int32 on some unixes
-	return fmt.Sprintf("7f0000001000-7f0000002000 r-xp 00001000 %02x:%02x %d                     %s\n",
-		unix.Major(dev), unix.Minor(dev), st.Ino, path)
+	return fmt.Sprintf("%s r-xp 00001000 %02x:%02x %d                     %s\n",
+		fxLibRange, unix.Major(dev), unix.Minor(dev), st.Ino, path)
 }
 
 func newFWFixture(t *testing.T) *fwFixture {
@@ -119,7 +128,7 @@ func newFWFixture(t *testing.T) *fwFixture {
 	fx.probe.SwtpmBinary = fx.swtpmBin
 	fx.probe.LibDirs = []string{libDir}
 
-	fx.dom = RunningDomain{Name: fxName, ID: fxID, UUID: fxUUID, Loader: fx.loader, TPM: true}
+	fx.dom = runningDomain{Name: fxName, ID: fxID, UUID: fxUUID, Loader: fx.loader, TPM: true}
 
 	// libvirt's pid files: QEMU by name, swtpm by the SHORT name.
 	fxWrite(t, filepath.Join(fx.probe.QEMURunDir, fxName+".pid"), strconv.Itoa(fxQEMUPid)+"\n", 0o644)
@@ -143,7 +152,25 @@ func newFWFixture(t *testing.T) *fwFixture {
 	fx.setMaps(fxSwtpmPid, "55d000000000-55d000001000 r--p 00000000 fd:01 1234 /usr/bin/swtpm\n"+
 		fxMapsLine(t, fx.libReal, fx.libReal)+
 		"7f0000003000-7f0000004000 rw-p 00000000 00:00 0 \n")
+	fx.setMapFile(fx.libReal)
+
+	// Both processes' start times, read before and after the checks.
+	fx.setStat(fxQEMUPid, "qemu-system-x86", 1000)
+	fx.setStat(fxSwtpmPid, "swtpm", 999)
 	return fx
+}
+
+// setMapFile points swtpm's map_files entry of the libtpms mapping at target:
+// the file the mapping really is, whatever maps prints.
+func (fx *fwFixture) setMapFile(target string) {
+	fxLink(fx.t, target, filepath.Join(fx.procDir(fxSwtpmPid), "map_files", fxLibMapFile))
+}
+
+// setStat writes /proc/<pid>/stat with start time (field 22) start. The comm
+// carries a space and a parenthesis, as a real one can.
+func (fx *fwFixture) setStat(pid int, comm string, start int) {
+	fields := []string{"S", "1", "2", "3", "0", "-1", "4194560", "100", "0", "0", "0", "5", "6", "0", "0", "20", "0", "4", "0", strconv.Itoa(start), "123456"}
+	fx.replace(filepath.Join(fx.procDir(pid), "stat"), fmt.Sprintf("%d (%s (x)) %s\n", pid, comm, strings.Join(fields, " ")))
 }
 
 func (fx *fwFixture) procDir(pid int) string {
@@ -170,7 +197,7 @@ func (fx *fwFixture) replace(p, body string) {
 
 func (fx *fwFixture) run(t *testing.T) (FirmwareRuntime, error) {
 	t.Helper()
-	return fx.probe.RunningFirmwareCode(context.Background(), fx.dom)
+	return fx.probe.runningFirmwareCode(context.Background(), fx.dom)
 }
 
 // wantPass asserts the check passes and reports the installed versions.
@@ -287,7 +314,7 @@ func TestRunningFirmwareCode_DeletedExe(t *testing.T) {
 			// reports the unlinked binary with the suffix. The path is
 			// otherwise the installed one, so only the suffix can refuse it.
 			fxLink(t, tc.bin(fx)+" (deleted)", filepath.Join(fx.procDir(tc.pid), "exe"))
-			fx.wantRefused(t, "(deleted)", tc.name)
+			fx.wantRefused(t, "(deleted)", tc.name, "restart it (lv stop, lv start)")
 		})
 	}
 }
@@ -316,10 +343,10 @@ func TestRunningFirmwareCode_InodeDiffers(t *testing.T) {
 		fx := newFWFixture(t)
 		other := filepath.Join(fx.root, "old-libtpms")
 		fxWrite(t, other, "ELF libtpms 0.9.3", 0o644)
-		// The mapping names the installed path but carries another file's
-		// (dev, inode).
-		fx.setMaps(fxSwtpmPid, fxMapsLine(t, fx.libReal, other))
-		fx.wantRefused(t, "libtpms", "inode")
+		// The mapping names the installed path, but map_files reaches
+		// another file.
+		fx.setMapFile(other)
+		fx.wantRefused(t, "libtpms", "inode", "map_files", "restart it")
 	})
 }
 
@@ -339,6 +366,7 @@ func TestRunningFirmwareCode_LibtpmsMappedViaSymlink(t *testing.T) {
 	fxLink(t, real, filepath.Join(linkDir, "libtpms.so.0"))
 	fx.probe.LibDirs = []string{linkDir}
 	fx.setMaps(fxSwtpmPid, fxMapsLine(t, real, real))
+	fx.setMapFile(real)
 	fx.wantPass(t)
 
 	// The mapping names the symlink's own path: not the realpath, refused.
@@ -425,7 +453,7 @@ func TestRunningFirmwareCode_QEMUPidWrongUUID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fx := newFWFixture(t)
 			fx.setCmdline(fxQEMUPid, argv...)
-			fx.wantRefused(t, "qemu", "-uuid")
+			fx.wantRefused(t, "qemu", "-uuid", "pid file does not lead")
 		})
 	}
 	t.Run("upper-case uuid matches", func(t *testing.T) {
@@ -543,8 +571,19 @@ func TestRunningFirmwareCode_ProcUnreadable(t *testing.T) {
 		{"domain name unsafe", func(t *testing.T, fx *fwFixture) { fx.dom.Name = "../" + fxName }, "name"},
 		{"installed qemu missing", func(t *testing.T, fx *fwFixture) { _ = os.Remove(fx.qemuBin) }, "installed"},
 		{"installed libtpms ambiguous", func(t *testing.T, fx *fwFixture) {
-			fxWrite(t, filepath.Join(filepath.Dir(fx.libReal), "libtpms.so.0.9.2"), "old", 0o644)
-		}, "libtpms"},
+			other := filepath.Join(fx.root, "opt/libtpms.so.1.0.0")
+			fxWrite(t, other, "other major", 0o644)
+			fxLink(t, other, filepath.Join(filepath.Dir(fx.libReal), "libtpms.so.1"))
+		}, "ldconfig"},
+		{"swtpm map_files missing", func(t *testing.T, fx *fwFixture) {
+			_ = os.RemoveAll(filepath.Join(fx.procDir(fxSwtpmPid), "map_files"))
+		}, "map_files"},
+		{"qemu stat missing", func(t *testing.T, fx *fwFixture) {
+			_ = os.Remove(filepath.Join(fx.procDir(fxQEMUPid), "stat"))
+		}, "qemu"},
+		{"swtpm stat garbage", func(t *testing.T, fx *fwFixture) {
+			fx.replace(filepath.Join(fx.procDir(fxSwtpmPid), "stat"), "4243 (swtpm) S 1 2\n")
+		}, "swtpm"},
 		{"libvirt version unreadable", func(t *testing.T, fx *fwFixture) {
 			fx.probe.LibvirtVersion = func() (uint64, error) { return 0, errors.New("no connection") }
 		}, "libvirt"},
@@ -569,11 +608,13 @@ func TestRunningFirmwareCode_EACCES(t *testing.T) {
 		{pidEntry(fxSwtpmPid, "cmdline"), "swtpm"},
 		{pidEntry(fxSwtpmPid, "exe"), "swtpm"},
 		{pidEntry(fxSwtpmPid, "maps"), "maps"},
+		{pidEntry(fxSwtpmPid, "map_files/"+fxLibMapFile), "map_files"},
+		{pidEntry(fxQEMUPid, "stat"), "qemu"},
 	} {
 		t.Run(tc.entry, func(t *testing.T) {
 			fx := newFWFixture(t)
 			fx.probe.proc = failing{procView: dirProc(fx.probe.ProcRoot), entry: tc.entry, err: syscall.EACCES}
-			err := fx.wantRefused(t, tc.why)
+			err := fx.wantRefused(t, tc.why, "root")
 			if !errors.Is(err, fs.ErrPermission) {
 				t.Fatalf("refusal %v does not carry the permission error", err)
 			}
@@ -639,17 +680,17 @@ func TestRunningDomainFromXML(t *testing.T) {
     </tpm>
   </devices>
 </domain>`
-	got, err := RunningDomainFromXML(live)
+	got, err := runningDomainFromXML(live)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := RunningDomain{Name: fxName, ID: 7, UUID: fxUUID, Loader: "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", TPM: true}
+	want := runningDomain{Name: fxName, ID: 7, UUID: fxUUID, Loader: "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", TPM: true}
 	if got != want {
-		t.Fatalf("RunningDomainFromXML = %+v, want %+v", got, want)
+		t.Fatalf("runningDomainFromXML = %+v, want %+v", got, want)
 	}
 
 	inactive := `<domain type='kvm'><name>vm</name><uuid>` + fxUUID + `</uuid><os><type>hvm</type></os><devices/></domain>`
-	got, err = RunningDomainFromXML(inactive)
+	got, err = runningDomainFromXML(inactive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,10 +701,10 @@ func TestRunningDomainFromXML(t *testing.T) {
 	passthrough := strings.Replace(live, `type='emulator'`, `type='passthrough'`, 1)
 	// Any TPM device counts: a passthrough one has no swtpm to find, so the
 	// check refuses it rather than skipping the TPM.
-	if got, _ := RunningDomainFromXML(passthrough); !got.TPM {
+	if got, _ := runningDomainFromXML(passthrough); !got.TPM {
 		t.Fatal("a passthrough TPM read as no TPM")
 	}
-	if _, err := RunningDomainFromXML("not xml"); err == nil {
+	if _, err := runningDomainFromXML("not xml"); err == nil {
 		t.Fatal("malformed XML parsed")
 	}
 }
@@ -703,4 +744,121 @@ func TestTPMPersistentStateYes(t *testing.T) {
 	if !TPMPersistentStateYes(out) {
 		t.Fatal("the rendered vTPM does not pass the running-definition check")
 	}
+}
+
+// The maps dev of a btrfs subvolume or an overlayfs file is not stat's
+// st_dev. The mapping is proven through map_files, so a maps line whose dev
+// and inode text differ from stat still passes when map_files reaches the
+// installed file (review I-1).
+func TestRunningFirmwareCode_LibtpmsMapsDevDiffersFromStat(t *testing.T) {
+	fx := newFWFixture(t)
+	fx.setMaps(fxSwtpmPid, fxLibRange+" r-xp 00001000 00:2a 1 "+fx.libReal+"\n")
+	fx.wantPass(t)
+}
+
+// A pid recycled between the first and the last read of it refuses: the
+// start time is read again after the checks (review m-4).
+func TestRunningFirmwareCode_PidRecycled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pid  int
+	}{{"qemu", fxQEMUPid}, {"swtpm", fxSwtpmPid}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFWFixture(t)
+			fx.probe.proc = &restat{procView: dirProc(fx.probe.ProcRoot), entry: pidEntry(tc.pid, "stat"),
+				after: func() { fx.setStat(tc.pid, "recycled", 5000) }}
+			fx.wantRefused(t, tc.name, "start time changed")
+		})
+	}
+}
+
+// restat runs after once, after the first read of entry: the process at the
+// pid is replaced while the check reads it.
+type restat struct {
+	procView
+	entry string
+	after func()
+	done  bool
+}
+
+func (r *restat) ReadFile(name string) ([]byte, error) {
+	b, err := r.procView.ReadFile(name)
+	if name == r.entry && !r.done {
+		r.done = true
+		r.after()
+	}
+	return b, err
+}
+
+// The exported entry point takes the live XML: the checks that apply are
+// read from it, so a caller cannot drop the swtpm or OVMF check by leaving
+// a field empty (review m-5).
+func TestRunningFirmwareCode_FromLiveXML(t *testing.T) {
+	fx := newFWFixture(t)
+	live := `<domain type='kvm' id='7'><name>` + fxName + `</name><uuid>` + fxUUID + `</uuid>
+  <os><type arch='x86_64' machine='pc-q35-8.2'>hvm</type><loader readonly='yes' secure='yes' type='pflash'>` + fx.loader + `</loader></os>
+  <devices><tpm model='tpm-crb'><backend type='emulator' version='2.0' persistent_state='yes'/></tpm></devices></domain>`
+	run := func() (FirmwareRuntime, error) {
+		return fx.probe.RunningFirmwareCode(context.Background(), live)
+	}
+	if _, err := run(); err != nil {
+		t.Fatalf("live XML of a host running the installed code refused: %v", err)
+	}
+	// The XML has a TPM, so the swtpm checks run: no libtpms mapping refuses.
+	fx.setMaps(fxSwtpmPid, "")
+	if got, err := run(); !errors.Is(err, ErrRunningCodeUnverified) || got != (FirmwareRuntime{}) || !strings.Contains(err.Error(), "libtpms") {
+		t.Fatalf("TPM in the live XML not checked: %+v, %v", got, err)
+	}
+	for name, bad := range map[string]string{
+		"malformed": "<domain>",
+		"inactive":  strings.Replace(live, " id='7'", "", 1),
+	} {
+		if got, err := fx.probe.RunningFirmwareCode(context.Background(), bad); !errors.Is(err, ErrRunningCodeUnverified) || got != (FirmwareRuntime{}) {
+			t.Errorf("%s live XML: %+v, %v; want a refusal", name, got, err)
+		}
+	}
+}
+
+// Installed never returns a half-read value with its error (review m-2).
+func TestFirmwareCodeProbe_InstalledZeroOnError(t *testing.T) {
+	for name, brk := range map[string]func(*fwFixture){
+		"qemu missing":    func(fx *fwFixture) { _ = os.Remove(fx.qemuBin) },
+		"swtpm missing":   func(fx *fwFixture) { _ = os.Remove(fx.swtpmBin) },
+		"no libtpms":      func(fx *fwFixture) { fx.probe.LibDirs = []string{filepath.Join(fx.root, "empty")} },
+		"ovmf unreadable": func(fx *fwFixture) { _ = os.Remove(fx.probe.Firmware.MsVars) },
+		"no libvirt conn": func(fx *fwFixture) { fx.probe.LibvirtVersion = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newFWFixture(t)
+			brk(fx)
+			in, err := fx.probe.Installed(context.Background())
+			if err == nil {
+				t.Fatal("Installed succeeded")
+			}
+			if !reflect.DeepEqual(in, InstalledFirmwareCode{}) {
+				t.Fatalf("Installed returned %+v with its error", in)
+			}
+		})
+	}
+}
+
+// Only the soname links (libtpms.so.<N>) the dynamic linker resolves count; a
+// stray real file or a dangling dev link does not, and one file reached
+// through a usrmerge /lib → /usr/lib link counts once (review m-3).
+func TestFirmwareCodeProbe_InstalledLibtpmsSonameOnly(t *testing.T) {
+	fx := newFWFixture(t)
+	libDir := filepath.Dir(fx.libReal)
+	fxWrite(t, filepath.Join(libDir, "libtpms.so.0.9.2"), "stray old copy", 0o644)
+	fxLink(t, "libtpms.so.0.9.99", filepath.Join(libDir, "libtpms.so"))
+	usrmerged := filepath.Join(fx.root, "lib")
+	fxLink(t, filepath.Join(fx.root, "usr/lib"), usrmerged)
+	fx.probe.LibDirs = []string{libDir, filepath.Join(usrmerged, "x86_64-linux-gnu"), filepath.Join(fx.root, "absent")}
+	in, err := fx.probe.Installed(context.Background())
+	if err != nil {
+		t.Fatalf("Installed: %v", err)
+	}
+	if in.Libtpms != fx.libReal || in.Runtime.Libtpms != "0.9.3" {
+		t.Fatalf("installed libtpms = %s (%s), want %s (0.9.3)", in.Libtpms, in.Runtime.Libtpms, fx.libReal)
+	}
+	fx.wantPass(t)
 }

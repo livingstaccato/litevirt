@@ -83,7 +83,7 @@ func TestFirmwareRuntime_Parse(t *testing.T) {
 }
 
 // TestOVMFContentFingerprint: the OVMF fingerprint covers the CONTENT of the
-// four firmware files, their paths and dataDir. Two hosts with the same paths
+// four firmware files, their roles and dataDir, and not their paths. Two hosts with the same paths
 // but a different build of any one file differ; an unreadable configured file
 // is an error, not a fingerprint of what could be read.
 func TestOVMFContentFingerprint(t *testing.T) {
@@ -128,6 +128,29 @@ func TestOVMFContentFingerprint(t *testing.T) {
 	// dataDir (the NVRAM path the domain names) is part of it.
 	if got, _ := OVMFContentFingerprint(fp, "/srv/litevirt"); got == base {
 		t.Error("dataDir not part of the fingerprint")
+	}
+
+	// The same build at other paths is the same fingerprint: paths are the
+	// layout fingerprint's to compare, not this one's.
+	elsewhere := t.TempDir()
+	moved := FirmwarePaths{}
+	for _, c := range []struct {
+		dst *string
+		src string
+	}{
+		{&moved.Code, fp.Code}, {&moved.Vars, fp.Vars}, {&moved.SecbootCode, fp.SecbootCode}, {&moved.MsVars, fp.MsVars},
+	} {
+		b, err := os.ReadFile(c.src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		*c.dst = filepath.Join(elsewhere, "edk2-"+filepath.Base(c.src))
+		if err := os.WriteFile(*c.dst, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := OVMFContentFingerprint(moved, "/var/lib/litevirt"); err != nil || got != base {
+		t.Errorf("same content at other paths: %q, %v; want %q", got, err, base)
 	}
 
 	// A file the host does not have differs from one it has.

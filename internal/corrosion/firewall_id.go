@@ -302,7 +302,9 @@ func newFirewallID() string {
 // mints through the desired-spec writer, under its operation barrier; a
 // container through the compare-and-set on its create_spec, refused while an
 // operation holds it. ErrFirewallIDNotMinted means the caller retries; a
-// container with no create spec is refused (ErrFirewallIDNoCreateSpec).
+// container with no create spec is refused (ErrFirewallIDNoCreateSpec), and so
+// is a container that is moving (ErrFirewallIDMoveOpen, naming the move). A
+// VM's moves update its row in place, so a VM has no such window.
 func MintFirewallID(ctx context.Context, c *Client, g capabilities.FeatureGrant, kind, host, name string) (id, abandoned string, err error) {
 	if err := g.Check(capabilities.FeatureFirewallTagGroups); err != nil {
 		return "", "", err
@@ -375,6 +377,14 @@ func mintContainerFirewallID(ctx context.Context, c *Client, host, name string) 
 	current := rows[0].String("create_spec")
 	if current == "" {
 		return "", "", ErrFirewallIDNoCreateSpec
+	}
+	// While the container moves, its source and target may both hold the id:
+	// re-minting would take it from the workload's real row (spec §4 ruling
+	// on D2b review I-2).
+	if why, err := containerMoveOpen(ctx, c, host, name, firewallIDOf(TagMemberCT, current)); err != nil {
+		return "", "", err
+	} else if why != "" {
+		return "", "", fmt.Errorf("%w: %s is open; retry after it completes", ErrFirewallIDMoveOpen, why)
 	}
 	id, abandoned, err := uniqueFirewallID(ctx, c, TagMemberCT, host, name, firewallIDOf(TagMemberCT, current))
 	if err != nil {

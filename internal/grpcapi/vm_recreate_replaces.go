@@ -80,10 +80,12 @@ type replacedVM struct {
 	// that hold stands.
 	holdToken string
 	holdHost  string
-	// rowOnly: the create names this row only so that its existence check
-	// does not refuse it (withReplacedRow) — it is not a re-create of the
-	// incarnation in any other way: replacedVMFor does not return it, so its
-	// NIC guards are admitted and its LUNs claimed as a new VM's.
+	// rowOnly: the create names this row so that its existence check does
+	// not refuse it (withReplacedRow), and keeps the row's firewall identity
+	// (replacedFirewallCarry: a stack's recreate of the same workload, spec
+	// §4.3). It is not a re-create of the incarnation in any other way:
+	// replacedVMFor does not return it, so its NIC guards are admitted and its
+	// LUNs claimed as a new VM's.
 	rowOnly bool
 }
 
@@ -97,10 +99,11 @@ func withReplacedVM(ctx context.Context, vm *corrosion.VMRecord) context.Context
 }
 
 // withReplacedRow returns ctx carrying vm's row into the create that
-// re-creates it, for its existence check only (replacedVM.rowOnly): an inline
-// compose re-create, which creates from the file as a new VM, deletes the VM
-// on its owner and then creates on a host whose replica may still hold the
-// row (lab 1, 2026-10-13, F1). Call it only once vm's delete has torn it down.
+// re-creates it, for its existence check and its firewall identity only
+// (replacedVM.rowOnly): an inline compose re-create, which creates from the
+// file as a new VM, deletes the VM on its owner and then creates on a host
+// whose replica may still hold the row (lab 1, 2026-10-13, F1). Call it only
+// once vm's delete has torn it down.
 func withReplacedRow(ctx context.Context, vm *corrosion.VMRecord) context.Context {
 	if vm == nil || vm.Name == "" || vm.CreatedAt == "" {
 		return ctx
@@ -120,7 +123,8 @@ func withReplacedRowSnapshot(ctx context.Context, name string, snap corrosion.VM
 }
 
 // replacedVMFor returns the replaced VM ctx carries when it is named name,
-// and the create re-creates it (not a row named for its existence check only).
+// and the create re-creates it (not a row named for its existence check and
+// firewall identity only).
 func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
 	r, ok := replacedRowFor(ctx, name)
 	if !ok || r.rowOnly {
@@ -130,7 +134,8 @@ func replacedVMFor(ctx context.Context, name string) (replacedVM, bool) {
 }
 
 // replacedRowFor returns the replaced VM ctx carries when it is named name,
-// of either kind: what the create's existence check settles.
+// of either kind: what the create's existence check settles, and whose
+// firewall identity the create keeps.
 func replacedRowFor(ctx context.Context, name string) (replacedVM, bool) {
 	r, ok := ctx.Value(replacedVMKey{}).(replacedVM)
 	if !ok || name == "" || r.name != name || r.snap.CreatedAt == "" {

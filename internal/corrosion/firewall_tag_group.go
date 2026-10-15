@@ -314,7 +314,9 @@ type TagGroupMembership struct {
 	// read. They are members of nothing.
 	TagsUnreadable []TagWorkload
 	// SharedFWID are live workloads of one kind that carry the same fw_id,
-	// every holder listed. Neither holder is a member of any group: that
+	// every holder listed, except the source and target of an open move of
+	// that workload (movingSources): the target is then the identity's one
+	// holder and the source is left out. Neither holder is a member of any group: that
 	// fails closed for a rule ACCEPTING a tag group's addresses, and OPEN for
 	// a drop or reject rule on one and for the group bindings' security
 	// groups. The renderer must hold every NIC of each listed workload at
@@ -328,6 +330,9 @@ type tagWorkload struct {
 	tagWorkloadKey
 	fwID string
 	nics []tagNIC
+	// move is a container row's part in a move (containerMove): its state,
+	// state_detail and relocate_token.
+	move containerMove
 }
 
 type tagNIC struct{ network, mac string }
@@ -373,11 +378,20 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 	}
 
 	// One identity, one live holder per kind; a shared one admits neither.
+	// The one exception is an open move's own pair (movingSources): its
+	// source is left out, and its target is the identity's one holder.
 	holders := map[string]int{}
 	for _, w := range workloads {
 		if w.fwID != "" {
 			holders[w.kind+"/"+w.fwID]++
 		}
+	}
+	moving, err := movingSources(ctx, c, workloads, holders)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range moving {
+		holders[w.kind+"/"+w.fwID]--
 	}
 
 	// The candidates: live workloads with a unique identity and readable,
@@ -389,7 +403,7 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 	byKey := map[tagWorkloadKey]*candidate{}
 	var cands []*candidate
 	for _, w := range workloads {
-		if w.fwID == "" {
+		if w.fwID == "" || slices.Contains(moving, w) {
 			continue
 		}
 		if holders[w.kind+"/"+w.fwID] > 1 {
@@ -543,7 +557,9 @@ func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
 	if err != nil {
 		return nil, err
 	}
-	cts, err := c.Query(ctx, `SELECT host_name, name, COALESCE(create_spec, '') AS create_spec FROM containers WHERE deleted_at IS NULL`)
+	cts, err := c.Query(ctx, `SELECT host_name, name, COALESCE(create_spec, '') AS create_spec,
+		COALESCE(state, '') AS state, COALESCE(state_detail, '') AS state_detail,
+		COALESCE(relocate_token, '') AS relocate_token FROM containers WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -558,19 +574,22 @@ func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
 	}
 	byKey := map[tagWorkloadKey]*tagWorkload{}
 	var out []*tagWorkload
-	add := func(key tagWorkloadKey, fwID string) {
+	add := func(key tagWorkloadKey, fwID string) *tagWorkload {
 		if !ValidFirewallID(fwID) {
 			fwID = ""
 		}
 		w := &tagWorkload{tagWorkloadKey: key, fwID: fwID}
 		byKey[key] = w
 		out = append(out, w)
+		return w
 	}
 	for _, r := range vms {
 		add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, jsonExactString(r.String("spec"), "firewall_id"))
 	}
 	for _, r := range cts {
-		add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, jsonExactString(r.String("create_spec"), "fw_id"))
+		w := add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, jsonExactString(r.String("create_spec"), "fw_id"))
+		w.move = containerMove{host: w.host, name: w.name, state: r.String("state"),
+			detail: r.String("state_detail"), token: r.String("relocate_token")}
 	}
 	for _, r := range nics {
 		w, ok := byKey[tagWorkloadKey{kind: r.String("kind"), host: r.String("host"), name: r.String("name")}]

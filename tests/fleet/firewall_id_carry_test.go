@@ -10,7 +10,9 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // fwIDIn is the identity doc holds under key, read exactly, as the members
@@ -383,6 +386,241 @@ func TestFirewallIDCarry_AReplicaRestoreIntoAFreedNameGetsNone(t *testing.T) {
 		"lv firewall tag set " + name + " --container --host " + tg.Name + " env=prod role=web"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("the restore's note %q does not say %q", note, want)
+		}
+	}
+}
+
+// D2b review I-1: a rolling recreate run from node-2, whose replica still
+// holds incarnation A of web (fw_id X, tagged) after web was deleted and
+// re-created on node-0 as B. The delete runs on node-0 and tombstones B; its
+// report names B, which is not the incarnation node-2 meant, so node-2 has no
+// report it may accept and falls back to its own copy, A. A was ended by
+// another delete: its identity must not come back on the re-created VM.
+//
+// Mutation: carry from the fallback copy (drop the strip in recreateAs) — the
+// re-created VM holds X: red.
+func TestFirewallIDCarry_ARecreateFromAStaleCopyCarriesNoForeignIdentity(t *testing.T) {
+	c := newRebuildRaceFleet(t)
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	seedVM(t, c, n0, &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256})
+	x := mintFWID(t, c, n0, corrosion.TagMemberVM, "", "web")
+	n1.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	n2.Server.SetReplacedTombstoneWaitForTest(500 * time.Millisecond)
+	// node-2 hears nothing from here on: it keeps A.
+	c.SetLinkFault(n0, n2, LinkFault{Block: true})
+	c.SetLinkFault(n1, n2, LinkFault{Block: true})
+
+	// A is deleted, and B created in its name, on node-0.
+	if err := corrosion.DeleteVM(ctx, n0.DB, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n0.Virt.UndefineDomain("web", false); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(&pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256, Uuid: "6a1f3c2e-0d4b-4e8a-9c7d-1b2a3c4d5e6f"})
+	if err := corrosion.InsertVM(ctx, n0.DB, corrosion.VMRecord{
+		Name: "web", HostName: n0.Name, State: "stopped", Spec: string(b), CPUActual: 1, MemActual: 256,
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := n0.Virt.DefineDomain(`<domain><name>web</name></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	waitForRepl(t, n1.Name+" to see B", func() bool {
+		vm, _ := corrosion.GetVM(ctx, n1.DB, "web")
+		return vm != nil && fwIDIn(vm.Spec, "firewall_id") == ""
+	})
+	if got := vmFWIDOn(t, n2, "web"); got != x {
+		t.Fatalf("premise: %s still holds A with %q, got %q", n2.Name, x, got)
+	}
+
+	desired := &pb.VMSpec{Name: "web", Cpu: 2, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n1.Name}}
+	if err := recreateOn(t, n2, c.SelfClient(n2), "web", desired); err != nil {
+		t.Fatalf("rolling recreate: %v; %s", err, whereIs(c, "web"))
+	}
+	if got := vmFWIDOn(t, n1, "web"); got != "" {
+		t.Fatalf("the re-created VM holds identity %q; A's was %q and B had none", got, x)
+	}
+}
+
+// D2b review I-2: a cold migrate whose target landed and whose source is then
+// parked (its runtime delete failed) leaves two live rows holding one fw_id,
+// for as long as an operator takes. With a tag group present, the pair is
+// recognised from the migrate's own proof: the target is the member, neither
+// row is held at drop. A third live holder of the id is still held, and
+// minting the id refuses while the move is open.
+//
+// Mutation: drop the move exemption — both rows are held: red.
+func TestFirewallIDCarry_AParkedMigrateIsNotHeldAndRefusesAMint(t *testing.T) {
+	c := ctMigrateCluster(t)
+	// The migrate mints its relocation proof only under the split-brain
+	// gate, which needs quorum.
+	gates := latchRelease(t, c)
+	qctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	for _, n := range c.Nodes {
+		go gates[n.Name].Start(qctx)
+	}
+	for _, n := range c.Nodes {
+		eventually(t, 20*time.Second, "quorum on "+n.Name, func() bool {
+			state, _, _ := gates[n.Name].QuorumProof(context.Background())
+			return state == health.QuorumYes
+		})
+	}
+	src, dst := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "ct-park"
+	createContainer(t, c, src, name)
+	id := mintFWID(t, c, src, corrosion.TagMemberCT, src.Name, name)
+	if err := corrosion.SetFirewallTagGroup(ctx, src.DB, capabilities.GrantForTest(t, capabilities.FeatureFirewallTagGroups),
+		"web", &corrosion.FirewallTagGroupDef{Match: map[string]string{"role": "web"}}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	seedTagsRow(t, src, corrosion.TagMemberCT, id, `{"tags":{"role":"web"}}`)
+
+	src.CT.FailDelete(errors.New("simulated source runtime delete failure"))
+	merr := runMigrate(t, c, src, dst, name, stagingRepo(t))
+	if merr == nil || !strings.Contains(merr.Error(), "source runtime cleanup failed") {
+		t.Fatalf("premise: the migrate was to land and park its source, got %v", merr)
+	}
+	if got := ctFWIDOn(t, dst, dst.Name, name); got != id {
+		t.Fatalf("premise: the target landed with %q, want %q", got, id)
+	}
+	if got := ctFWIDOn(t, src, src.Name, name); got != id {
+		t.Fatalf("premise: the parked source holds %q, want %q", got, id)
+	}
+
+	m, err := corrosion.ListTagGroupMembers(ctx, dst.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.SharedFWID) != 0 {
+		t.Fatalf("the migrate's own pair is held at drop: %+v", m.SharedFWID)
+	}
+	var members []string
+	for _, g := range m.Groups {
+		for _, mb := range g.Members {
+			members = append(members, mb.Host+"/"+mb.Name)
+		}
+	}
+	if !slices.Equal(members, []string{dst.Name + "/" + name}) {
+		t.Fatalf("members %v, want the target alone", members)
+	}
+
+	dst.DB.SetRepointReady(func(context.Context) bool { return true })
+	_, _, err = corrosion.MintFirewallID(ctx, dst.DB, capabilities.GrantForTest(t, capabilities.FeatureFirewallTagGroups),
+		corrosion.TagMemberCT, dst.Name, name)
+	if !errors.Is(err, corrosion.ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "migration of container "+name) {
+		t.Fatalf("a mint during the open migrate: %v, want refused naming it", err)
+	}
+
+	// A third live holder of the id is no part of the move: all are held.
+	if err := localExec(ctx, dst.DB, `INSERT INTO containers (host_name, name, state, create_spec, created_at, updated_at)
+		VALUES ('node-9', ?, 'running', ?, 't', 't')`, name, `{"fw_id":"`+id+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	if m, err = corrosion.ListTagGroupMembers(ctx, dst.DB); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.SharedFWID) != 3 {
+		t.Fatalf("with a third holder, held: %+v, want all three", m.SharedFWID)
+	}
+}
+
+// D2b review I-5: a CLIENT cannot hand a container restore an identity
+// either. It sends a victim's fw_id in source_create_spec, with the migrate
+// marker naming the victim's host — and, separately, a relocation token too.
+// The token without a peer certificate is refused outright; the migrate
+// marker is ignored, so the restore is an operator's and keeps no identity.
+//
+// Mutation: honour the migrate marker from a non-peer (drop the transport and
+// CN checks in migrateSourceFromPeer) — the restore carries the victim's
+// identity: red.
+func TestFirewallIDCarry_AClientCannotHandARestoreAnIdentity(t *testing.T) {
+	c := ctMigrateCluster(t)
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	createContainer(t, c, n0, "victim")
+	victim := mintFWID(t, c, n0, corrosion.TagMemberCT, n0.Name, "victim")
+	const name = "ct-client"
+	createContainer(t, c, n1, name)
+	repo, ts := backupContainer(t, c, n1, name)
+	if err := n1.CT.DeleteContainer(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteContainer(ctx, n1.DB, n1.Name, name); err != nil {
+		t.Fatal(err)
+	}
+	client := c.bearerClient(n1, adminToken(t, c, n0))
+	restore := func(md ...string) error {
+		st, err := client.RestoreContainer(metadata.AppendToOutgoingContext(ctx, md...), &pb.RestoreContainerRequest{
+			RepoPath: repo, Name: name, Timestamp: ts, HostName: n1.Name,
+			SourceCreateSpec: `{"template":"debian","fw_id":"` + victim + `"}`,
+		})
+		if err != nil {
+			return err
+		}
+		for {
+			if _, err := st.Recv(); err == io.EOF {
+				return nil
+			} else if err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := restore("x-litevirt-migrate-from-host", n0.Name, "x-litevirt-relocate-token", "tok-forged"); err == nil {
+		t.Fatal("a client's restore carrying a relocation token was accepted")
+	}
+	if rec, _ := corrosion.GetContainer(ctx, n1.DB, n1.Name, name); rec != nil {
+		t.Fatalf("a refused restore left a row: %+v", rec)
+	}
+	if err := restore("x-litevirt-migrate-from-host", n0.Name); err != nil {
+		t.Fatalf("a client's restore with the migrate marker (ignored): %v", err)
+	}
+	if got := ctFWIDOn(t, n1, n1.Name, name); got != "" {
+		t.Fatalf("a client's restore holds identity %q (the victim's is %q)", got, victim)
+	}
+}
+
+// D2b review M-2: a compose deploy entered on a node that does not host web
+// re-creates web inline (a stack's recreate: it keeps web's identity, from
+// the row its owner's delete reported) and creates api in the same run (a
+// new workload: none).
+//
+// Mutation: drop the token on the create (as N1) — web loses its identity:
+// red. (api's create runs on a context of its own that names no replaced VM,
+// so it cannot pick up web's.)
+func TestFirewallIDCarry_AComposeInlineRecreateKeepsItAndACreateGetsNone(t *testing.T) {
+	c, before := newRecreateRemoteFleet(t, 1, "node-0")
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	id := mintFWID(t, c, n0, corrosion.TagMemberVM, "", "web")
+	lagFrom(c, n0, n1, n2)
+
+	yaml := recreateRemoteYAML("node-0", "second") + `  api:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+`
+	msgs := deployCollect(t, context.Background(), c.SelfClient(n1), yaml)
+	for _, vm := range []string{"web", "api"} {
+		if p := errorPhaseFor(msgs, vm); p != nil {
+			t.Fatalf("deploy of %s: %s; %s", vm, p.Error, whereIs(c, vm))
+		}
+	}
+	assertReCreated(t, c, "web", before, n0)
+	if api, err := corrosion.GetVM(context.Background(), n0.DB, "api"); err != nil || api == nil {
+		t.Fatalf("premise: api was created: %v %v", api, err)
+	}
+	for _, n := range c.Nodes {
+		if got := vmFWIDOn(t, n, "web"); got != id {
+			t.Errorf("web's identity on %s's replica = %q, want %q", n.Name, got, id)
+		}
+		if got := vmFWIDOn(t, n, "api"); got != "" {
+			t.Errorf("api, created in the same deploy, holds identity %q on %s's replica", got, n.Name)
 		}
 	}
 }

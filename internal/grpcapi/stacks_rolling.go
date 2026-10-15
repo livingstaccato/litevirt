@@ -147,7 +147,11 @@ func (o *serverOps) recreateAs(ctx context.Context, target, source string, desir
 		if deleted.snap != nil {
 			ctx = withReplacedSnapshot(ctx, target, *deleted.snap)
 		} else {
-			ctx = withReplacedVM(ctx, cur)
+			// No report this node may accept: the owner deleted another
+			// incarnation, or is on an older build. This node's copy names
+			// the row for the existence check, but its firewall identity is
+			// not one this delete is known to have ended, so none is carried.
+			ctx = withoutReplacedFirewallID(withReplacedVM(ctx, cur), target)
 		}
 		ctx = o.s.withReplacedLUNs(ctx, cur)
 	}
@@ -625,7 +629,13 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		if deleted != nil && deleted.snap != nil {
 			createCtx = withReplacedSnapshot(createCtx, cur.Name, *deleted.snap)
 		} else {
-			createCtx = withReplacedVM(createCtx, cur)
+			// No firewall identity from this node's copy (see recreateAs).
+			createCtx = withoutReplacedFirewallID(withReplacedVM(createCtx, cur), cur.Name)
+		}
+		if !tornDown {
+			// This delete tore nothing down (NotFound): the incarnation was
+			// ended by another, and its firewall identity with it.
+			createCtx = withoutReplacedFirewallID(createCtx, cur.Name)
 		}
 		createCtx = s.withReplacedLUNs(createCtx, cur)
 	} else if cur != nil && tornDown {
@@ -640,7 +650,8 @@ func (s *Server) recreateInline(ctx context.Context, action planner.VMAction, f 
 		if deleted != nil && deleted.snap != nil {
 			createCtx = withReplacedRowSnapshot(createCtx, cur.Name, *deleted.snap)
 		} else {
-			createCtx = withReplacedRow(createCtx, cur)
+			// No firewall identity from this node's copy (see recreateAs).
+			createCtx = withoutReplacedFirewallID(withReplacedRow(createCtx, cur), cur.Name)
 		}
 	}
 	vmErr := s.deployCreatePlanned(createCtx, action, f)

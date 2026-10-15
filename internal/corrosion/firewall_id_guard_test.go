@@ -614,6 +614,150 @@ func TestFirewallIDCarryGuard_ListsTheSameWorkloadPaths(t *testing.T) {
 	}
 }
 
+// The replaced-VM context value is the carry's source for a VM: the token
+// reader (replacedFirewallCarry) is listed above, so the guard also closes
+// the set of code that PRODUCES that value (D2b review I-3). Spec §4.3: a VM
+// carry comes from the row the operation's own delete tombstoned, handed over
+// in-process once the delete has committed, or from a peer host's metadata.
+
+// replacedVMValueBuilders are the only functions that may put a
+// replacedVMKey{} value into a context, each with the evidence it must use:
+// the constructors build one from the row or snapshot their caller hands them
+// (their callers are checked below), the peer metadata only behind the peer
+// check, and the two rewriters only from an existing value.
+var replacedVMValueBuilders = map[string][]string{
+	"internal/grpcapi.withReplacedVM":            {"SnapshotForDelete"},
+	"internal/grpcapi.withReplacedSnapshot":      {"snap"},
+	"internal/grpcapi.withReplacedRowSnapshot":   {"rowOnly"},
+	"internal/grpcapi.Server.acceptReplacedVMMD": {"requirePeerCert"},
+	"internal/grpcapi.Server.withReplacedLUNs":   {"replacedVMFor"},
+	"internal/grpcapi.withoutReplacedFirewallID": {"replacedRowFor"},
+}
+
+// replacedVMConstructors build a replaced-VM value from what their caller
+// hands them.
+var replacedVMConstructors = []string{"withReplacedVM", "withReplacedRow", "withReplacedSnapshot", "withReplacedRowSnapshot"}
+
+// replacedVMConstructorCallers are the only functions that may call a
+// constructor, each with the evidence that what it hands over is the row its
+// own delete tombstoned. withReplacedRow (rowOnly) is the inline compose
+// recreate's: its value names the row for the existence check, and it carries
+// the firewall identity too, because that recreate is a stack's recreate of
+// the same workload (spec §4.3).
+var replacedVMConstructorCallers = map[string][]string{
+	"internal/grpcapi.Server.RebuildVM":      {"DeleteVMReporting"},
+	"internal/grpcapi.serverOps.recreateAs":  {"withDeletedVMSink"},
+	"internal/grpcapi.Server.recreateInline": {"withDeletedVMSink", "withDeletedVMReport"},
+	"internal/grpcapi.withReplacedRow":       {"SnapshotForDelete"},
+	// Not a create: the guard admission a re-create will make, judged on
+	// this context before the teardown; no create runs on it.
+	"internal/grpcapi.Server.preflightCreateGuards": {"admitNICGuards"},
+}
+
+// replacedVMViolations applies the producer rules: a function that builds a
+// replacedVMKey{} value anywhere but as the key of a ctx.Value read must be a
+// listed builder using its evidence, a caller of a constructor must be a
+// listed caller using its evidence, and a listed entry must still do what it
+// is listed for.
+func replacedVMViolations(pkgs []goPackage, builders, callers map[string][]string) []string {
+	var bad []string
+	seenB, seenC := map[string]bool{}, map[string]bool{}
+	for _, p := range pkgs {
+		for _, f := range p.files {
+			for _, decl := range f.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				key := p.dir + "." + funcKey(fd)
+				reads := map[ast.Node]bool{}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if call, ok := n.(*ast.CallExpr); ok {
+						if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Value" && len(call.Args) == 1 {
+							reads[call.Args[0]] = true
+						}
+					}
+					return true
+				})
+				builds := false
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if lit, ok := n.(*ast.CompositeLit); ok && typeNamed(lit.Type, "replacedVMKey") && !reads[lit] {
+						builds = true
+					}
+					return true
+				})
+				if builds {
+					seenB[key] = true
+					if ev, listed := builders[key]; !listed {
+						bad = append(bad, key+": puts a replaced-VM value in a context but is not a listed builder")
+					} else if !usesAny(fd.Body, ev) {
+						bad = append(bad, key+": builds a replaced-VM value without any of "+strings.Join(ev, ", "))
+					}
+				}
+				if callsAnyFunc(fd.Body, replacedVMConstructors) {
+					seenC[key] = true
+					if ev, listed := callers[key]; !listed {
+						bad = append(bad, key+": hands a create a replaced VM but is not a listed caller")
+					} else if !usesAny(fd.Body, ev) {
+						bad = append(bad, key+": hands a create a replaced VM without any of "+strings.Join(ev, ", "))
+					}
+				}
+			}
+		}
+	}
+	for key := range builders {
+		if !seenB[key] {
+			bad = append(bad, key+": listed as a replaced-VM builder but builds none; remove it")
+		}
+	}
+	for key := range callers {
+		if !seenC[key] {
+			bad = append(bad, key+": listed as a replaced-VM caller but calls no constructor; remove it")
+		}
+	}
+	sort.Strings(bad)
+	return bad
+}
+
+func TestReplacedVMProducerGuard(t *testing.T) {
+	if bad := replacedVMViolations(repoPackages(t), replacedVMValueBuilders, replacedVMConstructorCallers); len(bad) > 0 {
+		t.Fatalf("replaced-VM producer guard:\n  %s", strings.Join(bad, "\n  "))
+	}
+}
+
+// TestReplacedVMProducerGuard_FlagsAFixture: a new producer of the value —
+// directly, through a variable key, or by calling a constructor (a clone
+// reusing the existence-check bypass) — is flagged; so is a listed one
+// without its evidence and a stale entry. A reader is not a producer.
+//
+// Mutation: skip the builder check (treat every literal as a read) — the
+// direct and variable producers pass.
+func TestReplacedVMProducerGuard_FlagsAFixture(t *testing.T) {
+	pkg := fixturePackage(t, "internal/grpcapi", `package grpcapi
+func reader(ctx context.Context) { _, _ = ctx.Value(replacedVMKey{}).(replacedVM) }
+func direct(ctx context.Context) context.Context { return context.WithValue(ctx, replacedVMKey{}, replacedVM{}) }
+func viaVar(ctx context.Context) context.Context { k := replacedVMKey{}; return context.WithValue(ctx, k, replacedVM{}) }
+func peer(ctx context.Context) context.Context { return context.WithValue(ctx, replacedVMKey{}, replacedVM{}) }
+func clone(ctx context.Context, src *corrosion.VMRecord) { _ = withReplacedVM(ctx, src) }
+func rebuild(ctx context.Context) { d, _ := corrosion.DeleteVMReporting(ctx, nil, "a"); _ = withReplacedVM(ctx, d) }
+func lazy(ctx context.Context, cur *corrosion.VMRecord) { _ = withReplacedRow(ctx, cur) }
+`)
+	got := replacedVMViolations([]goPackage{pkg},
+		map[string][]string{"internal/grpcapi.peer": {"requirePeerCert"}, "internal/grpcapi.gone": {"x"}},
+		map[string][]string{"internal/grpcapi.rebuild": {"DeleteVMReporting"}, "internal/grpcapi.lazy": {"withDeletedVMSink"}})
+	want := []string{
+		"internal/grpcapi.clone: hands a create a replaced VM but is not a listed caller",
+		"internal/grpcapi.direct: puts a replaced-VM value in a context but is not a listed builder",
+		"internal/grpcapi.gone: listed as a replaced-VM builder but builds none; remove it",
+		"internal/grpcapi.lazy: hands a create a replaced VM without any of withDeletedVMSink",
+		"internal/grpcapi.peer: builds a replaced-VM value without any of requirePeerCert",
+		"internal/grpcapi.viaVar: puts a replaced-VM value in a context but is not a listed builder",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("violations:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
 // requestIdentityFields returns every identity field (fw_id, firewall_id, in
 // any spelling) reachable from a message of files whose name ends in Request.
 func requestIdentityFields(files []protoreflect.FileDescriptor) []string {

@@ -817,6 +817,12 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		return
 	}
 
+	live := make(map[string]bool, len(vms))
+	for _, vm := range vms {
+		live[vm.Name] = true
+	}
+	r.virtWait.prune(live)
+
 	r.resolveDiskMissing(ctx)
 	r.tendStrandedDisks(ctx)
 	r.cleanupRekeyLeftovers(ctx)

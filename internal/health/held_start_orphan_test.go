@@ -94,7 +94,8 @@ func TestReconcile_AHeldStartWhoseDaemonRestartedIsRecordedOnceLibvirtStartsIt(t
 //
 // Mutations: the probe not consulted: st is recorded running under a start
 // still in flight here: red. Any answer taken as evidence: the shut-off
-// domain's lease is taken over and the start re-driven: red.
+// domain's lease is taken over and the start re-driven: red. The holder not
+// checked: another holder's lease is taken over: red.
 func TestReconcile_AHeldStartsLeaseIsTakenOverOnlyOnEvidence(t *testing.T) {
 	ctx := context.Background()
 	t.Run("start in flight here", func(t *testing.T) {
@@ -108,6 +109,26 @@ func TestReconcile_AHeldStartsLeaseIsTakenOverOnlyOnEvidence(t *testing.T) {
 			t.Errorf("events: %+v, want none", events())
 		}
 	})
+	for _, other := range []string{OperatorStartLockHolder("host-b"), RepairLockHolder("host-a")} {
+		t.Run("lease names "+other, func(t *testing.T) {
+			r, db, _, events := orphanedHeldStart(t, true)
+			r.SetHeldStartProbe(func(string) bool { return false })
+			ReleaseVMStartLease(ctx, db, OperatorStartLockHolder("host-a"), "st")
+			if by, err := TryVMStartLease(ctx, db, other, "st", time.Now()); err != nil || by != other {
+				t.Fatalf("take the lease as %s: %q %v", other, by, err)
+			}
+			r.reconcile(ctx)
+			if vm, _ := corrosion.GetVM(ctx, db, "st"); vm.State != "starting" {
+				t.Errorf("st: %s, want starting (the lease is %s's)", vm.State, other)
+			}
+			if holder, _, ok, _ := ReadVMStartLease(ctx, db, "st"); !ok || holder != other {
+				t.Errorf("st's lease: %q %v, want %s's", holder, ok, other)
+			}
+			if len(events()) != 0 {
+				t.Errorf("events: %+v, want none", events())
+			}
+		})
+	}
 	t.Run("domain not running", func(t *testing.T) {
 		r, db, f, events := orphanedHeldStart(t, false)
 		r.SetHeldStartProbe(func(string) bool { return false })

@@ -389,6 +389,7 @@ func (v *VMChecker) sweep(ctx context.Context) {
 // moved-away) VM stops leaking and stops counting toward isCorrelatedFailure. Also drops a
 // zero-valued activeActions entry for a stack that has no VMs mid-action (minor leak only).
 func (v *VMChecker) pruneVMState(current map[string]bool) {
+	v.virtWait.prune(current)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	for name := range v.failures {

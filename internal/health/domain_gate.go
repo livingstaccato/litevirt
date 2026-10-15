@@ -3,6 +3,7 @@ package health
 import (
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -188,6 +189,23 @@ func (w *virtWait) noteSkip(key string, skip bool) skipChange {
 		return skipEnded
 	}
 	return skipSame
+}
+
+// prune forgets the skips of the VMs not in live (deleted, or moved away
+// while skipped), so a VM re-created under the name logs its own skip.
+// Sweeps' list skips are kept.
+func (w *virtWait) prune(live map[string]bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for key := range w.skipped {
+		i := strings.IndexByte(key, 0)
+		if i < 0 {
+			continue
+		}
+		if name := key[i+1:]; name != "list" && !live[name] {
+			delete(w.skipped, key)
+		}
+	}
 }
 
 // domainLister is a backend's domain list.

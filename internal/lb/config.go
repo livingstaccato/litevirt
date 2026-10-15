@@ -36,12 +36,16 @@ type Config struct {
 	Ports     []Port
 	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
+	Sticky    bool          // keep a client on one backend by its source address
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.
 	SNATEnabled bool   // enable SNAT + conntrackd
 	LocalIP     string // this host's IP for conntrackd sync
 	PeerIP      string // VRRP peer IP for conntrackd sync
 	Subnet      string // VM subnet CIDR for SNAT rule (e.g. "10.100.0.0/24")
+	// SyncInterface is the device holding LocalIP, which conntrackd syncs
+	// over. Empty: Interface.
+	SyncInterface string
 }
 
 // HealthConfig configures HAProxy backend health checking.
@@ -64,6 +68,9 @@ type Port struct {
 	Target   int    // backend port
 	Protocol string // tcp | http
 	TLS      *TLSConfig
+	// RedirectHTTPS answers every request on this listener with a redirect
+	// to https. Ignored on a TLS listener.
+	RedirectHTTPS bool
 }
 
 // TLSConfig holds cert/key paths for TLS termination.
@@ -98,10 +105,19 @@ frontend {{$.Name}}-{{.Listen}}
     {{- else}}
     bind {{$.VIP}}:{{.Listen}}
     {{- end}}
+    {{- if and .RedirectHTTPS (not .TLS)}}
+    mode http
+    http-request redirect scheme https code 301
+    {{- else}}
     default_backend {{$.Name}}-{{.Listen}}-be
+    {{- end}}
 
 backend {{$.Name}}-{{.Listen}}-be
     balance {{$.Algorithm}}
+    {{- if $.Sticky}}
+    stick-table type ip size 100k expire 30m
+    stick on src
+    {{- end}}
     {{- if and $.Health (eq $.Health.Type "http")}}
     option httpchk GET {{or $.Health.Path "/"}}
     http-check expect status 200
@@ -229,7 +245,7 @@ var conntrackdTmpl = template.Must(template.New("conntrackd").Parse(`Sync {
         IPv4_address {{.LocalIP}}
         IPv4_Destination_Address {{.PeerIP}}
         Port 3780
-        Interface {{.Interface}}
+        Interface {{or .SyncInterface .Interface}}
     }
 }
 
@@ -249,15 +265,23 @@ General {
 }
 `))
 
+// notifyTmpl drives this LB's conntrackd on a VRRP transition. conntrackd's
+// -C names its CONFIG file, which says where its control socket is.
 var notifyTmpl = template.Must(template.New("notify").Parse(`#!/bin/bash
-CTL="/var/run/conntrackd-{{.Name}}.ctl"
+CONF="/etc/litevirt/lb/{{.Name}}-conntrackd.conf"
 case "$1" in
     MASTER)
-        conntrackd -C "$CTL" -c -C commit
-        conntrackd -C "$CTL" -c -f internal
+        conntrackd -C "$CONF" -c
+        conntrackd -C "$CONF" -f
+        conntrackd -C "$CONF" -R
+        conntrackd -C "$CONF" -B
         ;;
-    BACKUP|FAULT)
-        conntrackd -C "$CTL" -c -f external
+    BACKUP)
+        conntrackd -C "$CONF" -t
+        conntrackd -C "$CONF" -n
+        ;;
+    FAULT)
+        conntrackd -C "$CONF" -t
         ;;
 esac
 `))

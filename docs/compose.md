@@ -829,7 +829,7 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         - listen: 80                    # VIP listener port
           target: 8080                  # Backend VM port
           protocol: "tcp"               # tcp | http
-          redirect-https: false         # Redirect HTTP to HTTPS
+          redirect-https: false         # Redirect HTTP to HTTPS (not on a tls port)
         - listen: 443
           target: 8443
           protocol: "tcp"
@@ -910,7 +910,7 @@ Requirements:
 - The network's bridge carries the VMs' gateway (see [Host isolation](#host-isolation)): a `vxlan` network, or a `bridge` network on a bridge litevirt created, with no `vlan`
 - It does not apply to an `isolated` network: nothing is routed off its bridge
 
-**Conntrackd for failover**: When `snat: true` is set, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
+**Conntrackd for failover**: When `snat: true` is set and the LB has two or more `hosts`, litevirt automatically runs `conntrackd` alongside keepalived to replicate conntrack state between VRRP peers, over the hosts' recorded addresses. Each LB host syncs with the first other host in `hosts`. On failover, the new MASTER imports synced entries so existing SNAT'd connections survive. This is managed automatically — no additional configuration is needed.
 
 ## Health checks
 

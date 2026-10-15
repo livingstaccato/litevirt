@@ -158,15 +158,21 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// Write conntrackd + notify script if SNAT is enabled.
+	// Write conntrackd + notify script if SNAT is enabled. conntrackd is
+	// (re)started below only when its config changed or it is not running:
+	// a restart drops the state it has synced from its peer.
+	ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
+	notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
+	startCT := false
 	if cfg.SNATEnabled {
 		conntrackdCfg, err := RenderConntrackd(cfg)
 		if err != nil {
 			slog.Warn("conntrackd config render failed (SNAT failover may not work)", "lb", cfg.Name, "error", err)
 		} else {
-			ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
+			startCT = configChanged(ctPath, conntrackdCfg) || !procByConfigAlive("conntrackd", ctPath)
 			if err := os.WriteFile(ctPath, []byte(conntrackdCfg), 0640); err != nil {
 				slog.Warn("write conntrackd config failed", "error", err)
+				startCT = false
 			}
 		}
 
@@ -174,11 +180,15 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		if err != nil {
 			slog.Warn("notify script render failed", "lb", cfg.Name, "error", err)
 		} else {
-			notifyPath := filepath.Join(m.configDir, cfg.Name+"-notify.sh")
 			if err := os.WriteFile(notifyPath, []byte(notifyScript), 0750); err != nil {
 				slog.Warn("write notify script failed", "error", err)
 			}
 		}
+	} else {
+		// No SNAT (or no longer): this LB runs no conntrackd.
+		killProcByConfig("conntrackd", ctPath)
+		os.Remove(ctPath)     //nolint:errcheck
+		os.Remove(notifyPath) //nolint:errcheck
 	}
 
 	// Ensure ip_nonlocal_bind is enabled so HAProxy can bind to the VIP
@@ -191,10 +201,8 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	}
 
 	// Start conntrackd before keepalived if SNAT is enabled.
-	if cfg.SNATEnabled {
-		ctPath := filepath.Join(m.configDir, cfg.Name+"-conntrackd.conf")
-		ctPid := filepath.Join(m.runDir, cfg.Name+"-conntrackd.pid")
-		if err := m.startConntrackd(ctx, ctPath, ctPid); err != nil {
+	if startCT {
+		if err := m.startConntrackd(ctx, ctPath); err != nil {
 			slog.Warn("conntrackd start failed (SNAT failover may not work)", "lb", cfg.Name, "error", err)
 		}
 	}
@@ -269,6 +277,18 @@ func cmdlineMatchesBinaryConfig(cmdline, binary, cfgPath string) bool {
 	return hasBin && hasCfg
 }
 
+// procByConfigAlive reports whether a `binary` process bound to cfgPath runs.
+func procByConfigAlive(binary, cfgPath string) bool {
+	matches, _ := filepath.Glob("/proc/[0-9]*/cmdline")
+	for _, cf := range matches {
+		data, err := os.ReadFile(cf)
+		if err == nil && cmdlineMatchesBinaryConfig(string(data), binary, cfgPath) {
+			return true
+		}
+	}
+	return false
+}
+
 // killProcByConfig SIGTERMs (then SIGKILLs) every `binary` process bound to
 // cfgPath. Used at teardown to catch reload/restart siblings the pidfile no
 // longer tracks (haproxy `-sf` reloads, racing keepalived restarts). Killing a
@@ -331,6 +351,7 @@ func (m *Manager) Remove(ctx context.Context, name string) error {
 	// Sweep any haproxy still bound to this LB's config file (reload/restart siblings the
 	// pidfile no longer tracks). keepalived was already handled with confirmation above.
 	killProcByConfig("haproxy", filepath.Join(m.configDir, name+"-haproxy.cfg"))
+	killProcByConfig("conntrackd", filepath.Join(m.configDir, name+"-conntrackd.conf"))
 
 	// Remove config files. Keep the keepalived config if it couldn't be confirmed
 	// stopped — deleting it would orphan the survivor (DemoteAll's glob wouldn't see it).
@@ -728,25 +749,13 @@ func (m *Manager) KeepalivedRunning(name string) bool {
 	return pidAlive(filepath.Join(m.runDir, name+"-keepalived.pid"))
 }
 
-// startConntrackd starts conntrackd for SNAT conntrack replication.
-func (m *Manager) startConntrackd(ctx context.Context, cfgPath, pidFile string) error {
-	// Kill existing if running.
-	if pid := readPid(pidFile); pid > 0 && processAlive(pid) {
-		syscall.Kill(pid, syscall.SIGTERM)
-		for i := 0; i < 20; i++ {
-			if !processAlive(pid) {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if processAlive(pid) {
-			syscall.Kill(pid, syscall.SIGKILL)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-	os.Remove(pidFile) //nolint:errcheck
+// startConntrackd (re)starts this LB's conntrackd for SNAT conntrack
+// replication. conntrackd writes no pidfile, so the running one is found by the
+// config it was started with; its lock file would refuse a second instance.
+func (m *Manager) startConntrackd(ctx context.Context, cfgPath string) error {
+	killProcByConfig("conntrackd", cfgPath)
 
-	cmd := exec.Command("conntrackd", "-C", cfgPath, "-d")
+	cmd := exec.CommandContext(ctx, "conntrackd", "-C", cfgPath, "-d")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("conntrackd start: %w: %s", err, out)

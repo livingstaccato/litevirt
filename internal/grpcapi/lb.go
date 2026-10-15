@@ -1995,31 +1995,7 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 		return
 	}
 
-	var ports []lb.Port
-	for _, p := range lbSpec.Ports {
-		port := lb.Port{
-			Listen:   int(p.Listen),
-			Target:   int(p.Target),
-			Protocol: p.Protocol,
-		}
-		if p.Tls != nil {
-			port.TLS = &lb.TLSConfig{Cert: p.Tls.Cert, Key: p.Tls.Key}
-		}
-		ports = append(ports, port)
-	}
-
-	var health *lb.HealthConfig
-	if lbSpec.Health != nil {
-		health = &lb.HealthConfig{
-			Type: lbSpec.Health.Type,
-			Path: lbSpec.Health.Path,
-		}
-		if lbSpec.Health.Interval != "" {
-			if d, err := time.ParseDuration(lbSpec.Health.Interval); err == nil {
-				health.IntervalMS = int(d.Milliseconds())
-			}
-		}
-	}
+	settings := lbSettingsFromPB(lbSpec.Algorithm, lbSpec.Ports, lbSpec.Health, lbSpec.StickySessions)
 
 	lbName := spec.StackName + "-lb"
 	backends := s.collectLBBackends(ctx, spec.StackName, lbSpec)
@@ -2110,7 +2086,7 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 	// Apply locally if this host is a target.
 	for _, h := range targetHosts {
 		if h == s.hostName {
-			if err := s.applyLBForStack(ctx, lbName, lbSpec.Vip, lbSpec.Algorithm, ports, backends, targetHosts, health, lbSpec.Snat); err != nil {
+			if err := s.applyLBForStack(ctx, lbName, lbSpec.Vip, settings, backends, targetHosts, lbSpec.Snat); err != nil {
 				slog.Warn("applyLBFromSpec: local apply failed", "stack", spec.StackName, "error", err)
 			} else {
 				slog.Info("applyLBFromSpec: LB applied locally", "stack", spec.StackName, "backends", len(backends))
@@ -2939,7 +2915,7 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 // applyLBForStack is called by DeployStack when a VM def has loadbalancer.enabled = true.
 // It builds the HAProxy + keepalived config and applies it on the designated LB hosts.
-func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm string, ports []lb.Port, backends []lb.Backend, lbHosts []string, health *lb.HealthConfig, snat bool) error {
+func (s *Server) applyLBForStack(ctx context.Context, lbName, vip string, settings lbSettings, backends []lb.Backend, lbHosts []string, snat bool) error {
 	// Only apply if this host is in the designated LB hosts list.
 	// Callers must resolve empty hosts before calling this function.
 	isLBHost := false
@@ -2952,10 +2928,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 	if !isLBHost {
 		return nil
 	}
-
-	if algorithm == "" {
-		algorithm = "roundrobin"
-	}
+	ports := settings.Ports
 
 	vipIP, vipPrefix, err := lb.ParseVIP(vip)
 	if err != nil {
@@ -2997,8 +2970,12 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 		Priority:  priority,
 		Backends:  backends,
 		Ports:     ports,
-		Algorithm: algorithm,
-		Health:    health,
+		Algorithm: settings.Algorithm,
+		Health:    settings.Health,
+		Sticky:    settings.Sticky,
+	}
+	if snat {
+		s.lbSNATSync(ctx, &cfg, lbHosts)
 	}
 
 	if err := s.applyLBLocal(ctx, cfg); err != nil {
@@ -3010,6 +2987,89 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 
 	s.publish("lb.applied", lbName, fmt.Sprintf("vip=%s backends=%d", vip, len(backends)))
 	return nil
+}
+
+// lbSettings is what a stack LB's spec says about its listeners and backends,
+// in lb's terms.
+type lbSettings struct {
+	Algorithm string
+	Ports     []lb.Port
+	Health    *lb.HealthConfig
+	Sticky    bool
+}
+
+// lbSettingsFromPB converts a stack LB's wire settings into what its apply
+// serves (applyLBFromSpec).
+func lbSettingsFromPB(algorithm string, ports []*pb.LBPort, health *pb.LBHealthSpec, sticky bool) lbSettings {
+	out := lbSettings{Algorithm: algorithm, Sticky: sticky}
+	if out.Algorithm == "" {
+		out.Algorithm = "roundrobin"
+	}
+	for _, p := range ports {
+		port := lb.Port{
+			Listen:        int(p.Listen),
+			Target:        int(p.Target),
+			Protocol:      p.Protocol,
+			RedirectHTTPS: p.RedirectHttps,
+		}
+		if p.Tls != nil {
+			port.TLS = &lb.TLSConfig{Cert: p.Tls.Cert, Key: p.Tls.Key}
+		}
+		out.Ports = append(out.Ports, port)
+	}
+	if health != nil {
+		out.Health = &lb.HealthConfig{Type: health.Type, Path: health.Path}
+		if health.Interval != "" {
+			if d, err := time.ParseDuration(health.Interval); err == nil {
+				out.Health.IntervalMS = int(d.Milliseconds())
+			}
+		}
+	}
+	return out
+}
+
+// lbSNATSync turns on conntrackd for an LB with snat, which keeps its SNAT'd
+// connections across a VRRP failover. It needs what SNAT itself needs, a
+// host-isolated network's bridge with a subnet (updateIsolationForLB), and a
+// peer to sync with: the first other host in lbHosts.
+func (s *Server) lbSNATSync(ctx context.Context, cfg *lb.Config, lbHosts []string) {
+	_, subnet := s.findIsolatedNetworkForBridge(ctx, cfg.Interface)
+	if subnet == "" {
+		return
+	}
+	peer := ""
+	for _, h := range lbHosts {
+		if h != s.hostName {
+			peer = h
+			break
+		}
+	}
+	if peer == "" {
+		return // one LB host: no failover, nothing to sync
+	}
+	localIP, peerIP := s.hostIPv4(ctx, s.hostName), s.hostIPv4(ctx, peer)
+	if localIP == "" || peerIP == "" {
+		slog.Warn("lb: no IPv4 address for conntrackd sync; SNAT'd connections will not survive a failover",
+			"lb", cfg.Name, "host", s.hostName, "local", localIP, "peer", peer, "peer_ip", peerIP)
+		return
+	}
+	cfg.SNATEnabled = true
+	cfg.LocalIP = localIP
+	cfg.PeerIP = peerIP
+	cfg.Subnet = subnet
+	cfg.SyncInterface = lb.DetectInterfaceForIP(localIP)
+}
+
+// hostIPv4 is a host's recorded address when it is an IPv4 literal, else "".
+func (s *Server) hostIPv4(ctx context.Context, name string) string {
+	h, err := corrosion.GetHost(ctx, s.db, name)
+	if err != nil || h == nil {
+		return ""
+	}
+	if ip := net.ParseIP(h.Address); ip != nil && ip.To4() != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 // updateIsolationForLB records this LB's firewall intent when its bridge belongs

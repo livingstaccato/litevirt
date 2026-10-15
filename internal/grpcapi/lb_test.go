@@ -673,7 +673,7 @@ func TestApplyLBForStack_NotLBHost(t *testing.T) {
 
 	// Server's hostName is "test-host". If lbHosts is ["other-host"],
 	// applyLBForStack should skip and return nil.
-	err := s.applyLBForStack(ctx, "myapp-lb", "10.0.0.50/24", "roundrobin", nil, nil, []string{"other-host"}, nil, false)
+	err := s.applyLBForStack(ctx, "myapp-lb", "10.0.0.50/24", lbSettings{Algorithm: "roundrobin"}, nil, []string{"other-host"}, false)
 	if err != nil {
 		t.Errorf("expected nil error when not an LB host, got %v", err)
 	}
@@ -692,7 +692,7 @@ func TestApplyLBForStack_VIPConflict(t *testing.T) {
 
 	// Try to apply a different LB with the same VIP.
 	// Pass this host in lbHosts so the function doesn't skip.
-	err := s.applyLBForStack(ctx, "new-lb", "10.0.0.50/24", "roundrobin", nil, nil, []string{s.hostName}, nil, false)
+	err := s.applyLBForStack(ctx, "new-lb", "10.0.0.50/24", lbSettings{Algorithm: "roundrobin"}, nil, []string{s.hostName}, false)
 	if err == nil {
 		t.Fatal("expected VIP conflict error")
 	}
@@ -712,7 +712,7 @@ func TestApplyLBForStack_SameNameNoConflict(t *testing.T) {
 	}
 
 	// Applying the same name with the same VIP should NOT trigger VIP conflict.
-	err := s.applyLBForStack(ctx, "myapp-lb", "10.0.0.50/24", "roundrobin", nil, nil, []string{s.hostName}, nil, false)
+	err := s.applyLBForStack(ctx, "myapp-lb", "10.0.0.50/24", lbSettings{Algorithm: "roundrobin"}, nil, []string{s.hostName}, false)
 	if err != nil && strings.Contains(err.Error(), "already in use") {
 		t.Errorf("same-name LB should not trigger VIP conflict: %v", err)
 	}

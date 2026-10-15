@@ -221,10 +221,11 @@ func TestRenderNotifyScript(t *testing.T) {
 
 	checks := []string{
 		"#!/bin/bash",
-		"conntrackd-web-lb",
-		"MASTER",
-		"BACKUP|FAULT",
-		"commit",
+		`CONF="/etc/litevirt/lb/web-lb-conntrackd.conf"`,
+		"MASTER)",
+		"BACKUP)",
+		"FAULT)",
+		`conntrackd -C "$CONF" -c`,
 	}
 	for _, c := range checks {
 		if !strings.Contains(out, c) {

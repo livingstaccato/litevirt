@@ -96,8 +96,8 @@ func TestApplyLBForStack_VIPOnTheNetworksBridge(t *testing.T) {
 	var applied []lb.Config
 	s.lbApplyOverride = func(_ context.Context, c lb.Config) error { applied = append(applied, c); return nil }
 	ctx := context.Background()
-	if err := s.applyLBForStack(ctx, "lbr-lb", "10.202.0.250/24", "", []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}},
-		[]lb.Backend{{Name: "lbr1", IP: "10.202.0.72", Port: 8080}}, []string{s.hostName}, nil, true); err != nil {
+	if err := s.applyLBForStack(ctx, "lbr-lb", "10.202.0.250/24", lbSettings{Ports: []lb.Port{{Listen: 80, Target: 8080, Protocol: "tcp"}}},
+		[]lb.Backend{{Name: "lbr1", IP: "10.202.0.72", Port: 8080}}, []string{s.hostName}, true); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if len(applied) != 1 || applied[0].Interface != "hinet" {

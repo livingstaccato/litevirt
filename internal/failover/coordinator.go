@@ -873,6 +873,20 @@ func (c *Coordinator) run(ctx context.Context) {
 	for _, cand := range candidates {
 		c.cycleCandidates[cand.target] = true
 	}
+	// A recovery waiting on a partition-pause deadline is re-checked only from
+	// the fence loop below, so only while its host is a fence candidate. A
+	// failing voter whose probe succeeds once, at an exact quorum, takes the
+	// host out of that loop for a few cycles: the deadline then waits, which
+	// is safe, and the stall reason says so rather than that the pause is
+	// still being waited out.
+	for host, w := range c.pauseWaits {
+		if c.cycleCandidates[host] || c.mono().Before(w.deadline) {
+			continue
+		}
+		c.noteHold(host, fmt.Sprintf("the partition-pause deadline has passed, but it is re-checked only while a quorum "+
+			"of voters fails the host, and %d of %d do now; it is re-checked once they do, "+
+			"or 'lv host fence-confirm %s' once it is off", len(freshObservers[host]), c.scope.quorum(host), host))
+	}
 
 	// Relay health (colonelpanik/litevirt#175): demote a host whose probes
 	// keep failing from relay duty, or restore one, as a replicated row every
@@ -1175,6 +1189,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				c.logRetryRefused(target, retryPlan.FailedAt, why)
 				c.mAttempt(PhaseSkip, ResultSkipped, ErrRetryHostAnswered)
 				c.noteHold(target, "fence failed, and the host has answered since; not retried: "+why)
+				c.noteBridgedRetry(ctx, h, retryPlan.FailedAt)
 				continue
 			}
 			slog.Warn("failover: the newest fence of this host failed; fencing it again",

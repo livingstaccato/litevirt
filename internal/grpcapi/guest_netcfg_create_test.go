@@ -283,6 +283,8 @@ func TestContainerClaim_PassesOverAVMsPickInFlight(t *testing.T) {
 // Mutation: read every recorded address as static in cloudinit.NetworkConfig
 // — the rebuilt multi-NIC seed differs once the scanner has written the DHCP
 // NIC's address.
+// Drop the (ordinal, network) match in cloudinit.SeedNetworkConfig — the
+// rebuild from a spec with no MACs writes none (re-review R2-m1).
 func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 	s := netcfgServer(t, map[string]compose.NetworkDef{
 		"brnet": defBridgeDHCP, "isonet": defIsolatedDHCP, "hinet": defHostIsolated,
@@ -535,4 +537,32 @@ func TestCreateVM_EveryDHCPNICIsConfigured(t *testing.T) {
 		&pb.NetworkAttachment{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:05:01"},
 		&pb.NetworkAttachment{Name: "isonet", Model: "virtio", Mac: "52:54:00:00:05:02", Ip: "10.201.0.20"})
 	golden.Assert(t, "testdata/seed_mixed.golden", seed)
+}
+
+// Re-review R2-m2: the migration source sends the target the seed the VM was
+// created with — its derived network-config — and sends none when the read
+// deriving it fails, rather than a seed without it that the target would
+// keep.
+//
+// Mutation: send the spec's network-config on a failed read (the round-2
+// code) — the failure case gets a request.
+func TestEnsureCloudInitRequest(t *testing.T) {
+	s := netcfgServer(t, map[string]compose.NetworkDef{"brnet": defBridgeDHCP, "hinet": defHostIsolated})
+	seed := createSeeded(t, s, "mig",
+		&pb.NetworkAttachment{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:16:01"},
+		&pb.NetworkAttachment{Name: "hinet", Model: "virtio", Mac: "52:54:00:00:16:02"})
+	vm, err := corrosion.GetVM(adminCtx(), s.db, "mig")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	req := s.ensureCloudInitRequest(adminCtx(), vm)
+	if req == nil || req.Networkconfig != seed {
+		t.Fatalf("migration seed request = %+v; want the created network-config:\n%s", req, seed)
+	}
+	if err := s.db.Execute(adminCtx(), `DROP TABLE networks`); err != nil {
+		t.Fatal(err)
+	}
+	if req := s.ensureCloudInitRequest(adminCtx(), vm); req != nil {
+		t.Errorf("a failed network-config read still sends a seed: %+v", req)
+	}
 }

@@ -315,7 +315,9 @@ How a VM gets its address depends on when and how you set it:
   - a NIC was attached or detached since, or a network definition or NetBox binding changed;
   - the VM is a clone with a NIC on a guarded DHCP network: the reserved address is written as static.
 
-  A NIC whose MAC cannot be read (an earlier release left it out of the spec, and the NIC rows do not identify it) makes the rebuilt seed carry no `network-config`. A rebuild whose database read fails is retried rather than written. A VM created before this release keeps the seed it was created with wherever that seed exists.
+  A NIC that an earlier release left without a MAC in the spec is matched to the NIC row at its position on its network (its ordinal and network), as NIC rate limits are. When the spec's last NIC is detached and a NIC is then attached on the same network, the new NIC is matched to the detached NIC's spec entry.
+
+  A NIC whose MAC cannot be read (an earlier release left it out of the spec, and the NIC rows do not identify it) makes the rebuilt seed carry no `network-config`. A rebuild whose database read fails writes no seed: on failover the start is retried; on migration the source sends the target no seed, as when it cannot reach the target. A VM created before this release keeps the seed it was created with wherever that seed exists.
 - **Recorded (post-create) IP.** `lv config <vm> --ip <ip>` records the IP in inventory and, when a DNS domain is configured, makes a best-effort attempt to publish a DNS record (a DNS failure is logged, not fatal). It does **not** reconfigure a running guest, take a DHCP reservation, or change the guest's actual address — to change a running VM's IP, reconfigure it in the guest (or recreate it with the desired static IP). It is **refused on a network bound to a NetBox prefix**: there the address of record is NetBox's — allocated by the binding and kept assigned by the inventory mirror — so a recorded value would describe an address litevirt does not hold.
 
 ```yaml

@@ -29,16 +29,21 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		return "", fmt.Errorf("read NICs of %q: %w", vmName, err)
 	}
 	// Each spec NIC's row: by MAC where the spec records one. A VM created
-	// before the spec recorded generated MACs has none, and takes the row of
-	// its ordinal, else the one row on its network. A NIC whose row cannot be
-	// told has no MAC, and NetworkConfig then writes no network-config.
+	// before the spec recorded generated MACs has none, and takes the row at
+	// its position on its network — (ordinal, network), as matchStoredNIC and
+	// NICRate match a spec NIC to its row; every create path writes a NIC's
+	// ordinal as its spec index. Nothing else: after a hot detach and attach a
+	// row on the same network is another NIC. A NIC whose row cannot be told
+	// has no MAC, and NetworkConfig then writes no network-config.
+	type pos struct {
+		ordinal int
+		network string
+	}
 	byMAC := map[string]corrosion.InterfaceRecord{}
-	byOrdinal := map[int]corrosion.InterfaceRecord{}
-	byNet := map[string][]corrosion.InterfaceRecord{}
+	byPos := map[pos]corrosion.InterfaceRecord{}
 	for _, r := range rows {
 		byMAC[strings.ToLower(r.MAC)] = r
-		byOrdinal[r.Ordinal] = r
-		byNet[r.NetworkName] = append(byNet[r.NetworkName], r)
+		byPos[pos{r.Ordinal, r.NetworkName}] = r
 	}
 	// A row is one NIC's: one another spec NIC already took is not taken
 	// again.
@@ -54,12 +59,8 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		if macs[i] != "" {
 			continue
 		}
-		if r, ok := byOrdinal[i]; ok && r.NetworkName == n.GetName() && !taken[strings.ToLower(r.MAC)] {
+		if r, ok := byPos[pos{i, n.GetName()}]; ok && !taken[strings.ToLower(r.MAC)] {
 			macs[i] = strings.ToLower(r.MAC)
-		} else if rs := byNet[n.GetName()]; len(rs) == 1 && !taken[strings.ToLower(rs[0].MAC)] {
-			macs[i] = strings.ToLower(rs[0].MAC)
-		}
-		if macs[i] != "" {
 			taken[macs[i]] = true
 		}
 	}

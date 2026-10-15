@@ -404,3 +404,30 @@ func TestFwmigWire_DaemonSharesOneStore(t *testing.T) {
 		t.Fatalf("SetFirmwareStore calls = %v, want %v", got, want)
 	}
 }
+
+// The daemon and the fleet harness install the guard through the same
+// helper, each node on its own fake and store, and neither installs one any
+// other way: a fleet scenario sees the guard a host runs.
+//
+// Mutations: the fleet calls SetFirmwareMoveGuard itself, or drops Wire —
+// red; the daemon stops using Wire — red.
+func TestFwmigWire_DaemonAndFleetUseSameHelper(t *testing.T) {
+	dcalls, _ := parseCalls(t, goFiles(t, "../daemon")...)
+	fcalls, _ := parseCalls(t, "../../tests/fleet/cluster.go")
+	for name, calls := range map[string][]astCall{"daemon": dcalls, "fleet": fcalls} {
+		if n := len(findCalls(calls, "fwmig", "Wire")); n != 1 {
+			t.Errorf("%s calls fwmig.Wire %d times, want once", name, n)
+		}
+		if sg := findCalls(calls, "", "SetFirmwareMoveGuard"); len(sg) != 0 {
+			t.Errorf("%s installs a firmware move guard outside fwmig.Wire: %+v", name, sg)
+		}
+	}
+	w := findCalls(fcalls, "fwmig", "Wire")
+	if len(w) == 1 && strings.Join(w[0].args, ",") != "n.Virt,n.FW" {
+		t.Errorf("fleet calls fwmig.Wire(%s), want fwmig.Wire(n.Virt, n.FW)", strings.Join(w[0].args, ", "))
+	}
+	set := findCalls(fcalls, "n.Server", "SetFirmwareStore")
+	if len(set) != 1 || set[0].args[0] != "n.FW" || (len(w) == 1 && set[0].pos < w[0].pos) {
+		t.Errorf("fleet hands the server %+v, want the wired n.FW after Wire", set)
+	}
+}

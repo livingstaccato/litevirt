@@ -84,6 +84,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fwmig"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -865,6 +866,9 @@ func (c *Cluster) buildServer(n *Node) {
 	// between two directories (a shared root would let a move that copied
 	// nothing pass, and one node's wipe delete another's state).
 	n.FW = &lv.FirmwareStore{DataDir: dataDir, SwtpmBase: filepath.Join(c.tmpRoot, n.Name, "swtpm")}
+	// The firmware move guard, over this node's records, on its libvirt and
+	// its store: the daemon's own helper (internal/daemon New).
+	fwmig.Wire(n.Virt, n.FW)
 	n.Server.SetFirmwareStore(n.FW)
 
 	// Domain lifecycle events: the daemon registers this same handler on its

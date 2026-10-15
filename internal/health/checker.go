@@ -31,6 +31,16 @@ const (
 // bound only for a verdict from an older build, which never overstates a run.
 const ProbeInterval = checkInterval
 
+// ProbeTimeout bounds one probe of a peer (and one probe round), and
+// SuspectThreshold is how many consecutive failed probes turn a peer probed
+// healthy into a suspect one. Exported for the HA-disarm peer veto, which
+// derives from them how long a voter can stay counted live after its last
+// answer (failover.PeerAnswerWindow).
+const (
+	ProbeTimeout     = checkTimeout
+	SuspectThreshold = suspectThreshold
+)
+
 // unreadyFailures is the consecutive_failures an 'unready' row carries, for
 // every unready observation in a run: below any fence threshold, and non-zero
 // so that recovery (which counts consecutive_failures = 0) never reads it as

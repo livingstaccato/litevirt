@@ -36,6 +36,12 @@ import (
 //     migrate, failover, its own reconciler — needs that host running after W
 //     existed.
 //
+//   - an owner- or epoch-mismatch whose VM has been DELETED is a claim about
+//     a DB owner that no longer exists. It needs only the hosts the condition
+//     names completely probed and clean: there is no created_at to date an
+//     unreachable host against, and without this a deleted VM's condition
+//     stayed open, with admission to its hosts, while any host was dark.
+//
 //   - everything else (ct_dual_run, vip_dual_run, unknown codes) keeps the
 //     cluster-wide rule. A container name is not cluster-unique and a VIP has
 //     no incarnation stamp, so there is no instant before which a dead host
@@ -125,7 +131,12 @@ func (rc resolutionCoverage) canResolve(f finding, row corrosion.HealthCondition
 			return false
 		}
 		return rc.completelyProbed(f.target)
-	case kindDualRunVM, kindOwnerMismatch, kindEpochMismatch:
+	case kindOwnerMismatch, kindEpochMismatch:
+		if _, live := rc.vmCreated[f.target]; !live {
+			return rc.deletedVMCoverageComplete(row.Hosts)
+		}
+		return rc.vmCoverageComplete(f.target, row.Hosts)
+	case kindDualRunVM:
 		return rc.vmCoverageComplete(f.target, row.Hosts)
 	default:
 		return false
@@ -160,6 +171,24 @@ func (rc resolutionCoverage) vmCoverageComplete(vm string, involved []string) bo
 		}
 		last, ok := rc.lastAlive[h]
 		if !ok || !last.Add(deadHostSkewMargin).Before(created) {
+			return false
+		}
+	}
+	return true
+}
+
+// deletedVMCoverageComplete is the rule for an owner- or epoch-mismatch whose
+// VM has no live row (the index was readable, so it was deleted). Both are
+// claims about the DB owner, and a deleted VM has none, so no unprobed host
+// can make them true again. What admission still needs is that no host the
+// condition names is running a copy, so every one of them must have been
+// completely probed this pass. A row naming no host proves nothing.
+func (rc resolutionCoverage) deletedVMCoverageComplete(involved []string) bool {
+	if len(involved) == 0 {
+		return false
+	}
+	for _, h := range involved {
+		if !rc.completelyProbed(h) {
 			return false
 		}
 	}

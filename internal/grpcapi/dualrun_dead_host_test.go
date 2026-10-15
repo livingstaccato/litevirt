@@ -173,13 +173,6 @@ func TestDualRunResolve_HostThatCouldHoldTheCopy_StillBlocks(t *testing.T) {
 				t.Fatalf("repoint owner: %v", err)
 			}
 		}},
-		{"the workload is no longer in the DB", func(t *testing.T, s *Server) {
-			// Nothing to date it by: the cluster-wide rule applies.
-			seedDeadH3(t, s, 10*24*time.Hour)
-			if err := s.db.Execute(context.Background(), `UPDATE vms SET deleted_at = ? WHERE name = 'vmA'`, rfcAgo(0)); err != nil {
-				t.Fatalf("delete vmA: %v", err)
-			}
-		}},
 		{"the host_health read fails", func(t *testing.T, s *Server) {
 			setVMCreated(t, s, "vmA", rfcAgo(time.Hour))
 			seedDeadH3(t, s, 10*24*time.Hour)

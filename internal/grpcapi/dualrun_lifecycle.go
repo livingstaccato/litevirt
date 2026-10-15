@@ -140,7 +140,15 @@ func (s *Server) resolveGateValid(ctx context.Context) bool {
 	if gate == nil {
 		return true
 	}
-	if !gate.ExecutionGate(ctx).OK {
+	// The execution gate also requires this host to be an ACTIVE WORKER, which
+	// says nothing about what the cluster runs: a witness (never a worker) or
+	// a draining host holds the detector lease like any voter, and reading
+	// that refusal as "no quorum" left every condition it led open for good
+	// (lab 1, 2026-10-14: a deleted VM's owner mismatch, and the split's
+	// coverage gaps, stayed open behind complete scans, and the mismatch
+	// refused admission to node-2). The gate checks self-fence and quorum BEFORE the worker clause, so a refusal
+	// for that clause alone means both held.
+	if g := gate.ExecutionGate(ctx); !g.OK && g.Reason != health.ReasonLocalNotActiveWorker {
 		return false
 	}
 	// Under region-scoped failover the execution gate passes on this host's

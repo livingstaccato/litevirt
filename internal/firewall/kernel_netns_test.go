@@ -62,15 +62,14 @@ func TestKernel_NICGuard(t *testing.T) {
 	}
 	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
 		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
-		"TestKernelChild_VLANToNICAndTrunk"} {
+		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_SynFloodShapeLoads"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
 	}
 	// Children with their own module list skip on their own when one is
 	// missing (saying which); they must not fail or vanish.
-	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_SynFloodLoads",
-		"TestKernelChild_SynFloodShapeLoads"} {
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_SynFloodLoads"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}

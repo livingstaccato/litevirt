@@ -76,6 +76,16 @@ type cancelledStartRecord struct {
 	// Row is the row state the cancel wrote: "stopped" (stopped by its
 	// operator; also when empty) or "error".
 	Row string `json:"row,omitempty"`
+	// Ran says the start this record cancelled has answered: its domain was
+	// seen running, or libvirt answered it with an outcome that could not
+	// be confirmed. Nothing of it is pending then, so a domain that does
+	// not run ends the record.
+	Ran bool `json:"ran,omitempty"`
+	// Libvirtd identifies the libvirt daemon that held the start when the
+	// record was made ("<pid>:<start time>", libvirtdIdentity; "" when it
+	// could not be told): a daemon restarted since took its queued jobs
+	// with it.
+	Libvirtd string `json:"libvirtd,omitempty"`
 }
 
 // rowStillCancelled reports whether row still says what the cancel r
@@ -122,11 +132,12 @@ type cancelledStarts struct {
 	mu      sync.Mutex
 	loaded  bool
 	loadErr error
-	m       map[string]cancelledStartRecord
-	busy    map[string]bool
-	// ran holds, by VM, the Created of the record whose domain a judgement
-	// saw running: its start has completed.
-	ran map[string]string
+	// everRead says the file has read at least once in this process: m is
+	// then the last good read (with what was recorded since), and stays the
+	// answer while the file cannot be read.
+	everRead bool
+	m        map[string]cancelledStartRecord
+	busy     map[string]bool
 	// destroying holds the VMs whose domain a judgement asked libvirt to
 	// destroy and libvirt has not answered yet.
 	destroying map[string]bool
@@ -136,46 +147,64 @@ func (s *Server) cancelledStartsPath() string {
 	return filepath.Join(s.dataDir, cancelledStartsFile)
 }
 
-// cancelledStartsLocked returns the entries, reading the file once it reads;
-// mu is held. A file that cannot be read is never written over (loadErr), and
-// is read again on the next call, so a file the operator fixes or removes
-// takes effect then.
+// cancelledStartsLocked returns the entries, reading the file the first
+// time; mu is held. It does not read the file again: a file that could not
+// be read is read again once per sweep, and by a cancel
+// (reloadCancelledStartsLocked), never by every probe.
 func (s *Server) cancelledStartsLocked() map[string]cancelledStartRecord {
 	c := &s.cancelledStarts
-	if c.loaded && c.loadErr == nil {
-		return c.m
+	if !c.loaded {
+		s.loadCancelledStartsLocked()
 	}
+	return c.m
+}
+
+// reloadCancelledStartsLocked reads the file again when it could not be
+// read; mu is held.
+func (s *Server) reloadCancelledStartsLocked() {
+	if !s.cancelledStarts.loaded || s.cancelledStarts.loadErr != nil {
+		s.loadCancelledStartsLocked()
+	}
+}
+
+// loadCancelledStartsLocked reads the file; mu is held. A file that cannot be
+// read is never written over (loadErr), and the last good read stays the
+// answer meanwhile.
+func (s *Server) loadCancelledStartsLocked() {
+	c := &s.cancelledStarts
 	prevErr := c.loadErr
-	c.loaded, c.loadErr, c.m = true, nil, map[string]cancelledStartRecord{}
+	c.loaded, c.loadErr = true, nil
+	if c.m == nil {
+		c.m = map[string]cancelledStartRecord{}
+	}
 	if s.dataDir == "" {
-		return c.m
+		c.everRead = true
+		return
 	}
 	raw, err := os.ReadFile(s.cancelledStartsPath())
-	if errors.Is(err, os.ErrNotExist) {
-		if prevErr != nil {
-			slog.Info("StopVM: the record of cancelled starts is gone; starts can be cancelled again", "file", s.cancelledStartsPath())
-		}
-		return c.m
-	}
 	var list []cancelledStartRecord
-	if err == nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		err = nil
+	case err == nil:
 		err = json.Unmarshal(raw, &list)
 	}
 	if err != nil {
 		c.loadErr = err
 		if prevErr == nil || prevErr.Error() != err.Error() {
-			slog.Error("StopVM: the record of cancelled starts cannot be read; it is not written over, and no start can be cancelled until it reads. Fix or remove it",
+			slog.Error("StopVM: the record of cancelled starts cannot be read; it is not written over, no start can be cancelled until it reads, and the VMs it may name are held from restart. Fix or remove it",
 				"file", s.cancelledStartsPath(), "error", err)
 		}
-		return c.m
+		return
 	}
 	if prevErr != nil {
 		slog.Info("StopVM: the record of cancelled starts reads again", "file", s.cancelledStartsPath())
 	}
+	c.everRead = true
+	c.m = map[string]cancelledStartRecord{}
 	for _, r := range list {
 		c.m[r.VM] = r
 	}
-	return c.m
 }
 
 // saveCancelledStartsLocked writes the file durably; mu is held.
@@ -204,9 +233,10 @@ func (s *Server) saveCancelledStartsLocked() error {
 // or "error"). It fails when the record cannot be written, and the cancel is
 // then not made.
 func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time, rowState string) error {
-	boot := s.readBootID()
+	boot, daemon := s.readBootID(), s.readLibvirtdID()
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
+	s.reloadCancelledStartsLocked()
 	m := s.cancelledStartsLocked()
 	prev, had := m[vm]
 	row := ""
@@ -214,7 +244,7 @@ func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time, row
 		row = "error"
 	}
 	m[vm] = cancelledStartRecord{VM: vm, StartAsked: asked.UTC().Format(time.RFC3339), Cancelled: cancelled.UTC().Format(time.RFC3339),
-		Created: time.Now().UTC().Format(time.RFC3339Nano), BootID: boot, Row: row}
+		Created: time.Now().UTC().Format(time.RFC3339Nano), BootID: boot, Row: row, Libvirtd: daemon}
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		if had {
 			m[vm] = prev
@@ -226,15 +256,25 @@ func (s *Server) recordCancelledStart(vm string, asked, cancelled time.Time, row
 	return nil
 }
 
-// HasCancelledStart reports whether this host holds a cancelled start of vm
-// (or cannot read the record of them, which may name it): a domain that runs
-// under its row is the sweep's to destroy, and the reconciler must not record
-// it running (health.Reconciler.SetCancelledStartProbe).
-func (s *Server) HasCancelledStart(vm string) bool {
+// HasCancelledStart reports whether this host holds a cancelled start of the
+// VM name, whose row says state and detail: a domain that runs under its row
+// is the sweep's to destroy, and the reconciler and the VM checker neither
+// record it running nor restart the VM (SetCancelledStartProbe). While the
+// file cannot be read, the last good read answers; with none in this
+// process, a row that says what a cancel writes (error, or stopped by its
+// operator) is taken as possibly named, and no other. It never reads the
+// file itself.
+func (s *Server) HasCancelledStart(name, state, detail string) bool {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
-	_, ok := s.cancelledStartsLocked()[vm]
-	return ok || s.cancelledStarts.loadErr != nil
+	if _, ok := s.cancelledStartsLocked()[name]; ok {
+		return true
+	}
+	c := &s.cancelledStarts
+	if c.loadErr != nil && !c.everRead {
+		return state == "error" || (state == "stopped" && detail == "operator-stop")
+	}
+	return false
 }
 
 // dropCancelledStart removes vm's entry once its cancelled start is settled.
@@ -254,7 +294,6 @@ func (s *Server) dropCancelledStartIf(vm, created string) {
 		return
 	}
 	delete(m, vm)
-	delete(s.cancelledStarts.ran, vm)
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		// Kept on disk: a later sweep ends it again.
 		m[vm] = r
@@ -276,6 +315,7 @@ func (s *Server) sweepCancelledStarts(ctx context.Context) <-chan struct{} {
 		return done
 	}
 	s.cancelledStarts.mu.Lock()
+	s.reloadCancelledStartsLocked()
 	var todo []cancelledStartRecord
 	for _, r := range s.cancelledStartsLocked() {
 		if s.cancelledStarts.busy[r.VM] {
@@ -304,7 +344,11 @@ func (s *Server) sweepCancelledStarts(ctx context.Context) <-chan struct{} {
 			s.judgeCancelledStart(context.WithoutCancel(ctx), r)
 		}(r)
 	}
-	go func() { wg.Wait(); close(done) }()
+	go func() {
+		wg.Wait()
+		s.judgeCancelledStartConditions(context.WithoutCancel(ctx))
+		close(done)
+	}()
 	return done
 }
 
@@ -324,19 +368,39 @@ func (s *Server) domainActiveBounded(vm string) (bool, error) {
 	return st == "active", err
 }
 
+// markCancelledStartRan records, in the record, that the start r cancelled
+// has answered. A record that cannot be rewritten keeps it in memory.
 func (s *Server) markCancelledStartRan(r cancelledStartRecord) {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
-	if s.cancelledStarts.ran == nil {
-		s.cancelledStarts.ran = map[string]string{}
+	m := s.cancelledStartsLocked()
+	cur, ok := m[r.VM]
+	if !ok || cur.Created != r.Created || cur.Ran {
+		return
 	}
-	s.cancelledStarts.ran[r.VM] = r.Created
+	cur.Ran = true
+	m[r.VM] = cur
+	if err := s.saveCancelledStartsLocked(); err != nil {
+		slog.Warn("StopVM: that a cancelled start answered is kept in memory only; the file was not rewritten", "vm", r.VM, "error", err)
+	}
+}
+
+// markCancelledStartAnswered is markCancelledStartRan for vm's current
+// record: its start has answered (finishCancelledStartLocked).
+func (s *Server) markCancelledStartAnswered(vm string) {
+	s.cancelledStarts.mu.Lock()
+	r, ok := s.cancelledStartsLocked()[vm]
+	s.cancelledStarts.mu.Unlock()
+	if ok {
+		s.markCancelledStartRan(r)
+	}
 }
 
 func (s *Server) cancelledStartRan(r cancelledStartRecord) bool {
 	s.cancelledStarts.mu.Lock()
 	defer s.cancelledStarts.mu.Unlock()
-	return s.cancelledStarts.ran[r.VM] == r.Created
+	cur, ok := s.cancelledStartsLocked()[r.VM]
+	return ok && cur.Created == r.Created && cur.Ran
 }
 
 // cancelledStartCurrent reports whether r is still vm's record (not ended,
@@ -390,6 +454,9 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 			s.dropCancelledStartIf(r.VM, r.Created)
 		case s.bootedSince(r):
 			slog.Info("StopVM: a cancelled start's domain does not run, and the host has booted since the cancel; its record is ended", "vm", r.VM)
+			s.dropCancelledStartIf(r.VM, r.Created)
+		case s.libvirtdRestartedSince(r):
+			slog.Info("StopVM: a cancelled start's domain does not run, and the libvirt daemon has restarted since the cancel; its record is ended", "vm", r.VM)
 			s.dropCancelledStartIf(r.VM, r.Created)
 		}
 		return
@@ -541,7 +608,6 @@ func (s *Server) endCancelledStartForStart(vm string) error {
 		return nil
 	}
 	delete(m, vm)
-	delete(s.cancelledStarts.ran, vm)
 	if err := s.saveCancelledStartsLocked(); err != nil {
 		m[vm] = r
 		return fmt.Errorf("the record of its earlier cancelled start could not be removed from %s, and a start with it there could be undone: %w",

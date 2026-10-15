@@ -2173,6 +2173,29 @@ before libvirt is asked. Install the cluster's keyring for the client on the
 odd host; the next reconcile (30 s) resolves the condition.
 See [storage.md](storage.md#ceph-rbd-pools).
 
+### A cancelled start is still recorded (`cancelled_start_kept`)
+
+`lv stop --force` of a VM whose start libvirt has not answered cancels the
+start and records the cancel in `<data_dir>/cancelled-starts.json`, so a
+domain libvirt starts for it later is destroyed. While the record is kept, a
+VM in `error` is neither recorded running nor restarted by its restart
+policy. A record kept longer than an hour raises `cancelled_start_kept`
+(evaluator `held_start`, subject `host/<host>`, warning), whose evidence lists
+each VM, the row the cancel wrote and when. `lv start <vm>` ends the record;
+so do deleting or moving the VM, a host boot, or a restart of the libvirt
+daemon. The next reconcile pass (30 s) resolves the condition once none is
+older than an hour. See [storage.md](storage.md).
+
+### The record of cancelled starts cannot be read (`cancelled_starts_unreadable`)
+
+When `<data_dir>/cancelled-starts.json` does not read (a crash truncated it),
+the host raises `cancelled_starts_unreadable` (evaluator `held_start`,
+subject `host/<host>`, warning) naming the file and the error. Meanwhile no
+start can be cancelled with `lv stop --force`, and the VMs the file may name
+(those the daemon last read from it, or, if it never read it, every VM in
+`error`) are neither recorded running nor restarted. Fix or remove the file;
+the next reconcile pass (30 s) reads it again and resolves the condition.
+
 ### A deleted ceph image is not purged from the trash (`ceph_trash_leftover`)
 
 A ceph image a VM delete (or a rollback of litevirt's own copy) removes is

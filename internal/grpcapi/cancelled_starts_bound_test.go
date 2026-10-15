@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +155,25 @@ func TestCancelledStart_AHungDestroyDoesNotPinTheVMLock(t *testing.T) {
 	}
 }
 
+// asIfRestarted ends st's daemon as a restart would, before libvirt answered
+// its cancelled held start: the record on disk is kept as the cancel wrote
+// it, and the start's late answer (a failure, which changes nothing else) is
+// waited out here, so no goroutine of st's outlives the test and races its
+// cleanup.
+func (st *stuckStart) asIfRestarted(t *testing.T) {
+	t.Helper()
+	raw, err := os.ReadFile(st.s.cancelledStartsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.answer.Store(errors.New("daemon gone"))
+	close(st.release)
+	st.waitLockFree(t, "after the first daemon's held start settled")
+	if err := os.WriteFile(st.s.cancelledStartsPath(), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // erroredHeldStart is a held start of web whose row said error before it
 // (a failover start that failed, its set-aside disk copies held there).
 func erroredHeldStart(t *testing.T) *stuckStart {
@@ -185,6 +205,7 @@ func TestCancelledStart_AnErroredVMsCancelSurvivesARestart(t *testing.T) {
 	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 || recs[0].VM != "web" {
 		t.Fatalf("the cancel's record on disk: %+v, want web", recs)
 	}
+	st.asIfRestarted(t)
 
 	st2 := newStuckStart(t)
 	st2.s.db, st2.s.dataDir = st.s.db, st.s.dataDir
@@ -235,14 +256,14 @@ func TestCancelledStart_AnErroredVMsLateSuccessKeepsItsRow(t *testing.T) {
 // names exactly the VMs with a record here.
 func TestCancelledStart_HasCancelledStartNamesTheRecord(t *testing.T) {
 	st := newStuckStart(t)
-	if st.s.HasCancelledStart("web") {
+	if st.s.HasCancelledStart("web", "error", "failover start failed") {
 		t.Fatal("web has no cancelled start yet")
 	}
 	st.restarted(t, "error", "failover start failed")
-	if !st.s.HasCancelledStart("web") {
+	if !st.s.HasCancelledStart("web", "error", "failover start failed") {
 		t.Fatal("web's cancelled start on disk is not reported")
 	}
-	if st.s.HasCancelledStart("db") {
+	if st.s.HasCancelledStart("db", "error", "failover start failed") {
 		t.Fatal("db has none")
 	}
 }
@@ -262,7 +283,7 @@ func TestCancelledStart_AFixedFileIsReadAgain(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "was not cancelled") {
 		t.Fatalf("stop --force with an unreadable record = %v, want a refusal", err)
 	}
-	if !st.s.HasCancelledStart("web") {
+	if !st.s.HasCancelledStart("web", "error", "failover start failed") {
 		t.Fatal("an unreadable record is not taken as possibly naming web")
 	}
 	if err := os.Remove(st.s.cancelledStartsPath()); err != nil {
@@ -290,6 +311,7 @@ func TestCancelledStart_AnErroredVMsLateDomainIsNotHealedBeforeTheSweep(t *testi
 	if _, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
 		t.Fatalf("stop --force: %v", err)
 	}
+	st.asIfRestarted(t)
 	st2 := newStuckStart(t)
 	st2.s.db, st2.s.dataDir = st.s.db, st.s.dataDir
 	fake := st2.s.virt.(*libvirtfake.Fake)

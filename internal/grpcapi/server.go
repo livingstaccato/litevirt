@@ -806,6 +806,10 @@ type Server struct {
 
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+	// vmLockQueues holds the callers waiting for a VM's lock through
+	// lockVMUnlessStartHeld (vm_start_bound.go).
+	vmLockQueuesMu sync.Mutex
+	vmLockQueues   map[string]*vmLockQueue
 	// startFlights holds each start whose StartDomain libvirt has not
 	// answered yet (vm_start_bound.go); startDomainWait is how long StartVM
 	// waits for that answer (zero: defaultStartDomainWait).
@@ -830,8 +834,10 @@ type Server struct {
 	// startLeaseRenewEvery overrides defaultStartLeaseRenewEvery (zero:
 	// the default). Tests only.
 	startLeaseRenewEvery time.Duration
-	// bootID reads the host's boot ID (nil: the kernel's). Tests only.
-	bootID func() (string, error)
+	// bootID reads the host's boot ID (nil: the kernel's), and libvirtdID
+	// the libvirt daemon's identity (nil: from /proc). Tests only.
+	bootID     func() (string, error)
+	libvirtdID func() string
 	// operatorClaimMu makes an operator promotion's start fence and every
 	// abandonment of a proof on this host one decision (promote_serialize.go).
 	operatorClaimMu sync.Mutex

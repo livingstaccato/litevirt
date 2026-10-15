@@ -14,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // defaultStartDomainWait is how long `lv start` waits for libvirt to answer
@@ -183,24 +184,23 @@ func (s *Server) lockVMForStart(ctx context.Context, name string) (func(), error
 // behind it for as long as libvirt does not answer. A non-nil ctx is watched
 // too: when it is done, its error is returned.
 //
-// The wait for the lock is lockVM's own, in a goroutine, so it queues as
-// every other lifecycle call does (a polled TryLock loses to every blocked
-// waiter while the mutex is starving). Only the flight is looked at every
-// startLockPoll. A lock the goroutine takes after this call has given up is
-// let go at once.
+// A start already held is answered before anything waits. Otherwise the call
+// joins the VM's lock queue (vmLockQueue): one goroutine per VM, not one per
+// call, waits on the mutex itself — so it queues as every other lifecycle
+// call does, where a polled TryLock would lose to every blocked waiter while
+// the mutex is starving — and hands the lock to the queue's first caller
+// still waiting. A caller that gives up (the start became held while it
+// waited, or ctx is done) leaves the queue; a lock handed to it meanwhile is
+// let go at once. However many calls give up, the VM costs at most that one
+// goroutine on the mutex.
 func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name string) (func(), *startFlight, error) {
 	if unlock, ok := s.tryLockVM(name); ok {
 		return unlock, nil, nil
 	}
-	got, abandon := make(chan func()), make(chan struct{})
-	go func() {
-		unlock := s.lockVM(name)
-		select {
-		case got <- unlock:
-		case <-abandon:
-			unlock()
-		}
-	}()
+	if f, ok := s.startFlightOf(name); ok && f.heldUnanswered() {
+		return nil, f, nil
+	}
+	got := s.joinVMLockQueue(name)
 	var done <-chan struct{}
 	if ctx != nil {
 		done = ctx.Done()
@@ -212,14 +212,84 @@ func (s *Server) lockVMUnlessStartHeld(ctx context.Context, name string) (func()
 		case unlock := <-got:
 			return unlock, nil, nil
 		case <-done:
-			close(abandon)
+			s.leaveVMLockQueue(name, got)
 			return nil, nil, status.FromContextError(ctx.Err()).Err()
 		case <-tick.C:
 			if f, ok := s.startFlightOf(name); ok && f.heldUnanswered() {
-				close(abandon)
+				s.leaveVMLockQueue(name, got)
 				return nil, f, nil
 			}
 		}
+	}
+}
+
+// vmLockQueue is the callers of lockVMUnlessStartHeld waiting for one VM's
+// lock, served by one goroutine (pumpVMLock) while any are queued.
+type vmLockQueue struct {
+	waiters []chan func()
+	pumping bool
+}
+
+// joinVMLockQueue queues a caller for name's lock: the lock arrives on the
+// returned channel.
+func (s *Server) joinVMLockQueue(name string) chan func() {
+	ch := make(chan func(), 1)
+	s.vmLockQueuesMu.Lock()
+	defer s.vmLockQueuesMu.Unlock()
+	if s.vmLockQueues == nil {
+		s.vmLockQueues = map[string]*vmLockQueue{}
+	}
+	q := s.vmLockQueues[name]
+	if q == nil {
+		q = &vmLockQueue{}
+		s.vmLockQueues[name] = q
+	}
+	q.waiters = append(q.waiters, ch)
+	if !q.pumping {
+		q.pumping = true
+		go s.pumpVMLock(name, q)
+	}
+	return ch
+}
+
+// leaveVMLockQueue takes a caller that gives up out of name's queue. When the
+// lock was handed to it already, it is let go.
+func (s *Server) leaveVMLockQueue(name string, ch chan func()) {
+	s.vmLockQueuesMu.Lock()
+	if q := s.vmLockQueues[name]; q != nil {
+		for i, w := range q.waiters {
+			if w == ch {
+				q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
+				s.vmLockQueuesMu.Unlock()
+				return
+			}
+		}
+	}
+	s.vmLockQueuesMu.Unlock()
+	// Handed over already (pumpVMLock sends right after it takes the
+	// caller off the queue).
+	(<-ch)()
+}
+
+// pumpVMLock takes name's lock for each caller queued for it, in order, and
+// hands it over; with no caller left, it lets the lock go and ends.
+func (s *Server) pumpVMLock(name string, q *vmLockQueue) {
+	for {
+		unlock := s.lockVM(name)
+		s.vmLockQueuesMu.Lock()
+		if len(q.waiters) == 0 {
+			q.pumping = false
+			if s.vmLockQueues[name] == q {
+				delete(s.vmLockQueues, name)
+			}
+			s.vmLockQueuesMu.Unlock()
+			unlock()
+			return
+		}
+		ch := q.waiters[0]
+		q.waiters = q.waiters[1:]
+		s.vmLockQueuesMu.Unlock()
+		ch <- unlock
 	}
 }
 
@@ -339,21 +409,54 @@ func (s *Server) heldStartAlreadyCancelled(ctx context.Context, name string, f *
 // The caller holds the VM lock.
 func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.VMRecord, startErr error,
 	releasePreflight func(), pbVM *pb.VM, hspec *pb.HooksSpec, since, cancelled time.Time) {
-	// Handled here, whatever the outcome: the durable record of the cancel
-	// is no longer needed (cancelled_starts.go).
-	defer s.dropCancelledStart(vm.Name)
+	// The durable record of the cancel ends here once the outcome is
+	// confirmed. When it cannot be (libvirt answers neither a destroy nor a
+	// read of the domain), the record is kept, marked answered, and the
+	// sweep destroys the domain if it runs, within its bound, or ends the
+	// record once the domain is seen not running (cancelled_starts.go).
+	keep := false
+	defer func() {
+		if keep {
+			s.markCancelledStartAnswered(vm.Name)
+		} else {
+			s.dropCancelledStart(vm.Name)
+		}
+	}()
 	asked := since.UTC().Format(time.RFC3339)
-	running := func() bool {
-		st, err := s.virt.DomainState(vm.Name)
-		return err == nil && st == "running"
+	// activity is whether the domain is active, and whether that is known:
+	// a read that fails says nothing either way.
+	activity := func() (active, known bool) {
+		a, err := s.virt.DomainIsActive(vm.Name)
+		switch {
+		case lv.IsNoDomain(err):
+			return false, true
+		case err != nil:
+			return false, false
+		}
+		return a, true
 	}
-	if startErr != nil && !running() {
-		releasePreflight()
-		s.recordVMEvent(ctx, vm.Name, "vm.started", "error",
-			fmt.Sprintf("libvirt answered the start asked for at %s, which was cancelled at %s, late, with a failure: %v; the VM stays stopped",
-				asked, cancelled.UTC().Format(time.RFC3339), startErr))
-		slog.Info("StopVM: a cancelled start failed late; nothing to undo", "vm", vm.Name, "error", startErr)
-		return
+	unknown := func(what string) {
+		keep = true
+		slog.Error("StopVM: a cancelled start's outcome cannot be confirmed; its record is kept for the sweep", "vm", vm.Name, "detail", what)
+		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
+			fmt.Sprintf("the start asked for at %s was cancelled, and libvirt answered it late: %s; whether its domain runs cannot be read, so the cancel is kept, and the domain is destroyed if it runs once libvirt answers (the next reconcile pass looks)",
+				asked, what))
+	}
+	if startErr != nil {
+		active, known := activity()
+		switch {
+		case !known:
+			unknown(fmt.Sprintf("with a failure (%v)", startErr))
+			return
+		case !active:
+			releasePreflight()
+			s.recordVMEvent(ctx, vm.Name, "vm.started", "error",
+				fmt.Sprintf("libvirt answered the start asked for at %s, which was cancelled at %s, late, with a failure: %v; the VM stays stopped",
+					asked, cancelled.UTC().Format(time.RFC3339), startErr))
+			slog.Info("StopVM: a cancelled start failed late; nothing to undo", "vm", vm.Name, "error", startErr)
+			return
+		}
+		// It failed, yet the domain runs: destroyed as a success's is.
 	}
 	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
 	if err == nil && fresh == nil {
@@ -366,7 +469,17 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 		stopHooks := vmHooks(fresh)
 		stopVM := &pb.VM{Name: vm.Name, HostName: fresh.HostName, State: pb.VMState_VM_STOPPING}
 		hooks.Run(ctx, hooks.PreStop, stopVM, stopHooks)
-		if err = s.virt.DestroyDomain(vm.Name); err == nil || !running() {
+		derr := s.virt.DestroyDomain(vm.Name)
+		gone := derr == nil
+		if !gone {
+			active, known := activity()
+			if !known {
+				unknown(fmt.Sprintf("its domain's destroy failed (%v)", derr))
+				return
+			}
+			gone = !active
+		}
+		if gone {
 			if !s.hardwareV2Latched(ctx) { // as a stop releases them (stopVMLockedNote)
 				if rerr := s.releaseDevices(ctx, vm.Name); rerr != nil {
 					slog.Warn("StopVM: a cancelled start's domain was destroyed; releasing its PCI devices failed", "vm", vm.Name, "error", rerr)
@@ -380,7 +493,7 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 			slog.Info("StopVM: a cancelled start succeeded late; its domain was destroyed", "vm", vm.Name)
 			return
 		}
-		err = status.Errorf(codes.Internal, "destroy: %v", err)
+		err = status.Errorf(codes.Internal, "destroy: %v", derr)
 	} else if err == nil {
 		note := fmt.Sprintf("start cancelled: libvirt answered the start asked for at %s late, and the domain it started was destroyed", asked)
 		if _, err = s.stopVMLockedNote(ctx, fresh, true, 0, note); err == nil {
@@ -388,18 +501,22 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 			return
 		}
 	}
-	if running() {
+	active, known := activity()
+	switch {
+	case !known:
+		unknown(fmt.Sprintf("stopping its domain failed (%s)", status.Convert(err).Message()))
+	case active:
 		slog.Error("StopVM: a cancelled start succeeded late and its domain could not be destroyed; the VM runs", "vm", vm.Name, "error", err)
 		_, _ = s.finishStartLocked(ctx, vm, nil, releasePreflight, pbVM, hspec) // records running, as libvirt says
 		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
 			fmt.Sprintf("the start asked for at %s was cancelled, but libvirt started it late and destroying the domain failed: %s; the VM runs (`lv stop --force %s`)",
 				asked, status.Convert(err).Message(), vm.Name))
-		return
+	default:
+		slog.Error("StopVM: a cancelled start succeeded late; stopping it did not finish", "vm", vm.Name, "error", err)
+		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
+			fmt.Sprintf("the start asked for at %s was cancelled, and libvirt started it late; its domain is not running, but recording the stop failed: %s",
+				asked, status.Convert(err).Message()))
 	}
-	slog.Error("StopVM: a cancelled start succeeded late; stopping it did not finish", "vm", vm.Name, "error", err)
-	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
-		fmt.Sprintf("the start asked for at %s was cancelled, and libvirt started it late; its domain is not running, but recording the stop failed: %s",
-			asked, status.Convert(err).Message()))
 }
 
 // heldForStart is what a start holds — the VM lock first, then what it took

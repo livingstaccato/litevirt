@@ -261,7 +261,7 @@ type Reconciler struct {
 	bootID func() (string, error)
 	// cancelledStart reports whether this host holds a cancelled start of a
 	// VM (SetCancelledStartProbe); nil: none.
-	cancelledStart func(vm string) bool
+	cancelledStart func(name, state, detail string) bool
 	// writeRecord writes the onboot record; nil is writeOnbootRecord. Tests
 	// make it fail.
 	writeRecord func(dataDir string, rec onbootRecord) error
@@ -341,7 +341,9 @@ func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
 // it (grpcapi.Server.HasCancelledStart). A domain running under such a VM's
 // error row is the cancel's to destroy, so the pass does not record it
 // running.
-func (r *Reconciler) SetCancelledStartProbe(fn func(vm string) bool) { r.cancelledStart = fn }
+func (r *Reconciler) SetCancelledStartProbe(fn func(name, state, detail string) bool) {
+	r.cancelledStart = fn
+}
 
 // SetLeaseTermGate injects the executor-side lease-term judgment for a pending
 // proof (grpcapi's LeaseTermGateForPendingProof).
@@ -1002,7 +1004,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			r.maybeBackfillUUID(ctx, vm)
 			// Check if an errored VM is actually running in libvirt (e.g. after
 			// daemon crash mid-operation). If so, update state to running.
-			if r.cancelledStart != nil && r.cancelledStart(vm.Name) {
+			if r.cancelledStart != nil && r.cancelledStart(vm.Name, vm.State, vm.StateDetail) {
 				// A start of it was cancelled here while libvirt had not
 				// answered it: a domain libvirt started late is destroyed
 				// by the cancelled-starts sweep, the row kept error.

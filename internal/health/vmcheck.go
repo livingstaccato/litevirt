@@ -43,7 +43,7 @@ type VMChecker struct {
 	bus  *events.Bus
 	// cancelledStart reports whether this host holds a cancelled start of a
 	// VM (SetCancelledStartProbe); nil: none.
-	cancelledStart func(vm string) bool
+	cancelledStart func(name, state, detail string) bool
 	// now is the clock (nil → time.Now). A test seam: the start grace and the
 	// action backoff are minutes long.
 	now func() time.Time
@@ -189,7 +189,9 @@ func (v *VMChecker) SweepOnce(ctx context.Context) {
 // wrote (stopped by its operator, or error), and a domain libvirt starts for
 // it late is the cancelled-starts sweep's to destroy: the restart-policy pass
 // neither records it running nor starts the VM.
-func (v *VMChecker) SetCancelledStartProbe(fn func(vm string) bool) { v.cancelledStart = fn }
+func (v *VMChecker) SetCancelledStartProbe(fn func(name, state, detail string) bool) {
+	v.cancelledStart = fn
+}
 
 // VMCheckBackend is the libvirt surface the checker calls (*lv.Client, or
 // libvirtfake in a test of another package).
@@ -328,7 +330,7 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		if vm.State != "stopped" && vm.State != "error" {
 			continue
 		}
-		if v.cancelledStart != nil && v.cancelledStart(vm.Name) {
+		if v.cancelledStart != nil && v.cancelledStart(vm.Name, vm.State, vm.StateDetail) {
 			// A start of it was cancelled here while libvirt had not
 			// answered it: its row stays what the cancel wrote, and a
 			// domain libvirt started late is destroyed by the

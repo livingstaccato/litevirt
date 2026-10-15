@@ -33,7 +33,7 @@ func TestReconciler_AnErroredVMWithACancelledStartIsNotRecordedRunning(t *testin
 		}
 	}
 	r := NewReconciler("host-a", t.TempDir(), db, fake)
-	r.SetCancelledStartProbe(func(vm string) bool { return vm == "vm-cancelled" })
+	r.SetCancelledStartProbe(func(vm, _, _ string) bool { return vm == "vm-cancelled" })
 	r.reconcile(ctx)
 
 	if vm, err := corrosion.GetVM(ctx, db, "vm-cancelled"); err != nil || vm.State != "error" {
@@ -55,7 +55,7 @@ func TestVMChecker_AVMWithACancelledStartIsNotRestarted(t *testing.T) {
 	seedRestartPolicyVM(t, db, "vm-cancelled", "node1")
 	seedRestartPolicyVM(t, db, "vm-other", "node1")
 	v := NewVMChecker("node1", t.TempDir(), db, nil)
-	v.SetCancelledStartProbe(func(vm string) bool { return vm == "vm-cancelled" })
+	v.SetCancelledStartProbe(func(vm, _, _ string) bool { return vm == "vm-cancelled" })
 	v.SweepOnce(context.Background())
 	if got := restartAttempts(t, db, "vm-cancelled"); got != 0 {
 		t.Fatalf("vm-cancelled restart attempts = %d, want 0", got)

@@ -52,6 +52,10 @@ func TestValidateBridgeNetworkName(t *testing.T) {
 		{"bridge", "web", long, true},
 		{"vxlan", long, "", false},
 		{"isolated", long, "", false},
+		// br-iso-* is an isolated network's: the firewall keeps it on the host.
+		{"bridge", "lan", "br-iso-lan", true},
+		{"bridge", "br-iso-x", "", true},
+		{"isolated", "x", "", false},
 	} {
 		if err := ValidateBridgeNetworkName(tc.typ, tc.name, tc.iface); (err != nil) != tc.bad {
 			t.Errorf("%+v: err = %v, want error=%v", tc, err, tc.bad)

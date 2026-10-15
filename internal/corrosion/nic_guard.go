@@ -472,6 +472,9 @@ type NetworkGuardInfo struct {
 	// NICGateways are the gateways live VMs' NIC specs on the network route
 	// through, each with the VM and its project.
 	NICGateways []NICGatewayDecl
+	// IsolatedBridge is the host bridge of an `isolated` network
+	// (compose.IsolatedBridgeName), else "".
+	IsolatedBridge string
 }
 
 // NICGatewayDecl is one gateway a VM's NIC routes through.
@@ -509,7 +512,7 @@ func canonIP(s string) string {
 // networks.config is json.Marshal of compose.NetworkDef; vms.spec is
 // encoding/json of VMSpec.
 func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardInfo, error) {
-	rows, err := c.Query(ctx, `SELECT name, config FROM networks WHERE deleted_at IS NULL`)
+	rows, err := c.Query(ctx, `SELECT name, COALESCE(type, '') AS type, config FROM networks WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -518,6 +521,9 @@ func NetworkGuardInfos(ctx context.Context, c *Client) (map[string]NetworkGuardI
 		var def compose.NetworkDef
 		_ = json.Unmarshal([]byte(r.String("config")), &def)
 		info := NetworkGuardInfo{Subnet: def.Subnet, LitevirtGateway: def.LitevirtGateway(), AllowedVLANs: def.AllowedVLANs}
+		if r.String("type") == "isolated" {
+			info.IsolatedBridge = compose.IsolatedBridgeName(r.String("name"))
+		}
 		for _, a := range append([]string{def.Gateway}, def.ReservedAddresses...) {
 			if ca := canonIP(a); ca != "" {
 				info.Reserved = append(info.Reserved, ca)

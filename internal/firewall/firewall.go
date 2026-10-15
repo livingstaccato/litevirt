@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
@@ -281,6 +282,12 @@ type Plan struct {
 	NAT           []NATRule
 	HostIsolation []IsolationChain
 
+	// IsolatedBridges are the host bridges of `isolated` networks known on
+	// this host. Forwarded traffic between one and any other device is
+	// dropped (renderIsolatedForward); with or without any listed, every
+	// compose.IsolatedBridgePrefix device is held to the host the same way.
+	IsolatedBridges []string
+
 	// NICMode is how per-NIC rules are applied: NICModeEnforce,
 	// NICModeObserve (count what would be dropped, drop nothing) or
 	// NICModeGuardsOnly (bridge conntrack is unavailable: only the guards and
@@ -431,6 +438,7 @@ func RenderParts(p Plan, nicActive bool) (inet, nic string, err error) {
 	// removing the last rule drops the whole chain on the next atomic replace).
 	renderNAT(&b, p.NAT)
 	renderHostIsolation(&b, p.HostIsolation)
+	renderIsolatedForward(&b, p.IsolatedBridges)
 	b.WriteString("}\n")
 	inet = b.String()
 
@@ -532,6 +540,35 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 		}
 		fmt.Fprintf(b, "        iifname %s drop\n", c.Bridge)
 	}
+	fmt.Fprintf(b, "    }\n\n")
+}
+
+// renderIsolatedForward emits the forward-hook chain that keeps an isolated
+// network on its host: nothing is routed from its bridge to any other device,
+// or from any other device to it. Guests on one bridge still reach each other
+// (bridged traffic stays on the bridge, and the input and output hooks — the
+// host's dnsmasq — are not touched).
+//
+// It is rendered on every host whatever the plan says: the wildcard lines
+// hold every compose.IsolatedBridgePrefix device to the host from the first
+// pass, including a bridge no network row names any more and one made since
+// the last pass. A listed bridge also gets its own pair, which keeps it from
+// routing to another isolated bridge (the wildcard cannot tell them apart).
+func renderIsolatedForward(b *strings.Builder, bridges []string) {
+	sorted := append([]string(nil), bridges...)
+	sort.Strings(sorted)
+	fmt.Fprintf(b, "    chain isolated_forward {\n")
+	fmt.Fprintf(b, "        type filter hook forward priority filter; policy accept;\n")
+	for i, br := range sorted {
+		if i > 0 && br == sorted[i-1] {
+			continue
+		}
+		fmt.Fprintf(b, "        iifname %q oifname != %q drop\n", br, br)
+		fmt.Fprintf(b, "        oifname %q iifname != %q drop\n", br, br)
+	}
+	wild := compose.IsolatedBridgePrefix + "*"
+	fmt.Fprintf(b, "        iifname %q oifname != %q drop\n", wild, wild)
+	fmt.Fprintf(b, "        oifname %q iifname != %q drop\n", wild, wild)
 	fmt.Fprintf(b, "    }\n\n")
 }
 
@@ -943,6 +980,11 @@ func validate(p Plan) error {
 			}
 		} else if !safeIfName(r.Bridge) {
 			return fmt.Errorf("nat rule %d: masquerade needs a bridge (got %q)", i, r.Bridge)
+		}
+	}
+	for _, br := range p.IsolatedBridges {
+		if !safeIfName(br) {
+			return fmt.Errorf("isolated bridge %q is not a safe interface name", br)
 		}
 	}
 	for i, c := range p.HostIsolation {

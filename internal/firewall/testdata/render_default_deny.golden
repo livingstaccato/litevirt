@@ -17,4 +17,10 @@ table inet litevirt-fw {
     chain host_overrides {
     }
 
+    chain isolated_forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "br-iso-*" oifname != "br-iso-*" drop
+        oifname "br-iso-*" iifname != "br-iso-*" drop
+    }
+
 }

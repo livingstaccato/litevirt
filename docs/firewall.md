@@ -303,6 +303,13 @@ iptables):
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
   bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
   first so guests can still reach an HAProxy VIP.
+- **Isolated networks** — an `isolated_forward` chain on the `forward` hook
+  drops anything routed off or onto an `isolated` network's bridge: per known
+  bridge (`iifname "<bridge>" oifname != "<bridge>" drop` and the reverse), and
+  for every `br-iso-*` device whether or not a network row names it
+  (`iifname "br-iso-*" oifname != "br-iso-*" drop` and the reverse). The chain is
+  in every ruleset. Guests on one isolated bridge still reach each other and the
+  host's `dnsmasq` on it.
 
 These decisions are made by network provisioning and the LB apply path and
 recorded per host in `host_fw_intent`; the reconciler reads that table and

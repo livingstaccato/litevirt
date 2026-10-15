@@ -115,6 +115,15 @@ func TestRenderCompatGolden(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Render refused rows that apply today: %v", mode, err)
 		}
+		// Every ruleset now carries the isolated-network forward chain
+		// (renderIsolatedForward), which no row decides: what is pinned here
+		// is everything else, byte for byte.
+		var iso strings.Builder
+		renderIsolatedForward(&iso, nil)
+		if !strings.Contains(got, iso.String()) {
+			t.Fatalf("%s: the isolated-network forward chain is missing", mode)
+		}
+		got = strings.Replace(got, iso.String(), "", 1)
 		golden.Assert(t, "testdata/render_compat_"+mode+".golden", got)
 	}
 }

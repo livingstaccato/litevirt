@@ -22,18 +22,10 @@ import (
 // ones (risking collisions).
 const maxIfaceName = 15
 
-// IsolatedBridgeName returns the host bridge name for an isolated network.
-// It is "br-iso-<name>" when that fits IFNAMSIZ, otherwise a stable hashed
-// form "br-iso-<8 hex>" (exactly 15 chars) so long network names don't fail
-// bridge creation. Every site that creates, deletes, or resolves an isolated
-// bridge MUST use this so the names always agree.
+// IsolatedBridgeName returns the host bridge name for an isolated network
+// (compose.IsolatedBridgeName, which the firewall shares).
 func IsolatedBridgeName(networkName string) string {
-	const prefix = "br-iso-"
-	if len(prefix)+len(networkName) <= maxIfaceName {
-		return prefix + networkName
-	}
-	sum := sha1.Sum([]byte(networkName))
-	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
+	return compose.IsolatedBridgeName(networkName)
 }
 
 // FlatBridgeName returns the host bridge a NIC on a network with no record
@@ -55,8 +47,9 @@ func FlatBridgeName(networkName string) string {
 // ValidateBridgeNetworkName refuses a plain bridge network whose bridge name
 // (its interface, or its own name when none is given) cannot be a Linux
 // interface: over 15 bytes the bridge can never be created, so the network would
-// persist and then fail every VM placed on it. Other types name their device
-// themselves (hashed, VNI or a given interface).
+// persist and then fail every VM placed on it. A br-iso-* name is an isolated
+// network's, whose routed traffic the firewall drops. Other types name their
+// device themselves (hashed, VNI or a given interface).
 func ValidateBridgeNetworkName(netType, networkName, iface string) error {
 	if netType != "" && netType != "bridge" {
 		return nil
@@ -67,6 +60,9 @@ func ValidateBridgeNetworkName(netType, networkName, iface string) error {
 	}
 	if len(dev) > maxIfaceName {
 		return fmt.Errorf("bridge name %q is %d bytes; a Linux interface name is at most %d. Give the network a shorter name or set --iface to a shorter bridge", dev, len(dev), maxIfaceName)
+	}
+	if strings.HasPrefix(dev, compose.IsolatedBridgePrefix) {
+		return fmt.Errorf("bridge name %q starts with %q, which names isolated networks' bridges: the firewall drops everything routed off or onto them. Choose another name", dev, compose.IsolatedBridgePrefix)
 	}
 	return nil
 }

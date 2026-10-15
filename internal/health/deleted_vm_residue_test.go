@@ -172,3 +172,72 @@ func TestTendDeletedVMStranded_NeverMovesADiskOnceALiveRowOfTheNameExists(t *tes
 		t.Fatalf("the disk at %s was moved with a live row of web in the replica", path)
 	}
 }
+
+// A disk path that reads as missing once the VM is deleted keeps its entry
+// while its directory is empty, as an unmounted volume's mount point is: the
+// disk comes back with the volume. The record stays open; once the path is
+// back, the next pass sets the disk aside and resolves it. (Missing from a
+// directory that lists other files, it is gone: see
+// TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep.)
+//
+// Mutation: drop the entry of a missing path on the deleted-VM pass — the
+// record is resolved while the path is missing.
+func TestTendDeletedVMStranded_KeepsTheEntryOfAPathThatReadsAsMissing(t *testing.T) {
+	db, _, r, _, path := strandedFixture(t)
+	ctx := context.Background()
+	recordWeb(t, db, time.Now())
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	hidden := filepath.Join(t.TempDir(), "volume")
+	if err := os.Rename(path, hidden); err != nil { // the volume is unmounted
+		t.Fatal(err)
+	}
+	r.tendStrandedDisks(ctx)
+	if !strandedOpen(t, db) {
+		t.Fatal("the record was resolved while the disk's path reads as missing")
+	}
+	if err := os.Rename(hidden, path); err != nil { // the volume is mounted
+		t.Fatal(err)
+	}
+	r.tendStrandedDisks(ctx)
+	if fileExists(path) {
+		t.Fatalf("the disk back at %s was not set aside", path)
+	}
+	if strandedOpen(t, db) {
+		t.Fatal("the record is still open once the disk is set aside")
+	}
+}
+
+// A domain of the name that starts after the pass first looked at it, and
+// before the rename, keeps the disk at its path: the state is read again
+// immediately before the rename.
+//
+// Mutation: drop the domain re-read in stillMay — the disk is renamed under
+// the running domain.
+func TestTendDeletedVMStranded_ReReadsTheDomainBeforeTheRename(t *testing.T) {
+	db, fake, r, _, path := strandedFixture(t)
+	ctx := context.Background()
+	recordWeb(t, db, time.Now())
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	fake.DefineStoppedDomain("web", "52:54:00:00:00:02")
+	reads := 0
+	fake.FailDomainStateReason = func(name string) error {
+		if name == "web" {
+			reads++
+			if reads == 2 { // after the first look: the domain starts
+				fake.SetState("web", "running")
+			}
+		}
+		return nil
+	}
+	r.tendStrandedDisks(ctx)
+	if reads < 2 {
+		t.Fatalf("the domain's state was read %d time(s) before the rename, want it read again", reads)
+	}
+	if !fileExists(path) {
+		t.Fatal("the disk was renamed under a domain that started before the rename")
+	}
+}

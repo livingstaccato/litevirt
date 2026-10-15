@@ -364,8 +364,9 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 			return nil
 		}
 		lv.WipeNameKeyedFirmwareState(s.dataDir, m.ReplacedVM)
+		// The paths are the replaced VM's seed: its stamp goes with it.
 		for _, p := range m.Paths {
-			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := cloudinit.RemoveSeed(p); err != nil {
 				return fmt.Errorf("remove %s: %w", p, err)
 			}
 		}

@@ -47,11 +47,17 @@ type storageAbort struct {
 	// migration (nil when dst had none, so the one there is the migration's).
 	iso         string
 	operatorISO []byte
+	// foreignISO: what dst held was not pp1's (unstamped: an older build's,
+	// or a deleted VM's of the name). The migration writes pp1's over it,
+	// and the abort keeps that: it did not create the path.
+	foreignISO bool
 	// migrate watches the source's MigrateVM handler, armed by start.
 	migrate *StreamWatch
 }
 
-func newStorageAbort(t *testing.T, policy *pb.MigrationPolicy, targetHasISO bool) *storageAbort {
+// targetISO is what dst holds at pp1's seed path before the migration: ""
+// nothing, "own" pp1's own seed, "foreign" an unstamped one.
+func newStorageAbort(t *testing.T, policy *pb.MigrationPolicy, targetISO string) *storageAbort {
 	t.Helper()
 	// EnsureCloudInit shells out to genisoimage; the libvirt fake never reads
 	// the ISO, so the stand-in's empty file is all it needs.
@@ -70,19 +76,22 @@ func newStorageAbort(t *testing.T, policy *pb.MigrationPolicy, targetHasISO bool
 	if err := os.WriteFile(srcISO, []byte("source iso"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if targetHasISO {
+	if targetISO != "" {
 		f.operatorISO = []byte("an ISO the target already had")
+		f.foreignISO = targetISO == "foreign"
 		if err := os.MkdirAll(filepath.Dir(f.iso), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(f.iso, f.operatorISO, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// pp1's own, from an earlier stay: stamped as its (a seed of any
+		// pp1's own, from an earlier stay, is stamped as its; a seed of any
 		// other VM of the name, or an unstamped one, is written again for
-		// pp1 — cloudinit/seed_owner.go).
-		if err := cloudinit.StampSeed(f.iso, "pp1-uuid"); err != nil {
-			t.Fatal(err)
+		// pp1 (cloudinit/seed_owner.go).
+		if !f.foreignISO {
+			if err := cloudinit.StampSeed(f.iso, "pp1-uuid"); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -225,6 +234,12 @@ func (f *storageAbort) requireUndone(t *testing.T) {
 	switch {
 	case f.operatorISO != nil && err != nil:
 		t.Errorf("the cloud-init ISO the target already had is gone after the abort: %v", err)
+	case f.foreignISO && bytes.Equal(got, f.operatorISO):
+		t.Errorf("the target's seed of another VM was kept for pp1: %q", got)
+	case f.foreignISO:
+		if owner, ok, _ := cloudinit.SeedOwner(f.iso); !ok || owner != "pp1-uuid" {
+			t.Errorf("the seed written over the target's foreign one is stamped %q (%v), want pp1-uuid", owner, ok)
+		}
 	case f.operatorISO != nil && !bytes.Equal(got, f.operatorISO):
 		t.Errorf("the cloud-init ISO the target already had was replaced: %q", got)
 	case f.operatorISO == nil && !os.IsNotExist(err):
@@ -295,13 +310,16 @@ func TestFleet_AbortedStorageMigrationLeavesNothingBehind(t *testing.T) {
 		},
 	}
 	for _, p := range points {
-		for _, targetHasISO := range []bool{false, true} {
+		for _, targetISO := range []string{"", "own", "foreign"} {
 			name := p.name
-			if targetHasISO {
+			switch targetISO {
+			case "own":
 				name += ", target already had an ISO"
+			case "foreign":
+				name += ", target had another VM's ISO"
 			}
 			t.Run(name, func(t *testing.T) {
-				f := newStorageAbort(t, p.policy, targetHasISO)
+				f := newStorageAbort(t, p.policy, targetISO)
 				copying, endCopy := f.holdCopy()
 				f.src.Virt.OnAbortMigration = func(string) {
 					endCopy(errors.New("operation aborted: migration job: canceled by client"))
@@ -332,7 +350,7 @@ func TestFleet_AbortedStorageMigrationLeavesNothingBehind(t *testing.T) {
 // Mutation: have the target remove only the stubs the cleanup names — the
 // stub is left and the test goes red.
 func TestFleet_ClientGoneWhileTargetPreparesDisksLeavesNoStub(t *testing.T) {
-	f := newStorageAbort(t, nil, false)
+	f := newStorageAbort(t, nil, "")
 	f.src.Virt.FailMigrateToTarget = func(string, string) error {
 		t.Error("libvirt was asked to migrate; the client went away before the target was ready")
 		return errors.New("must not be reached")
@@ -373,7 +391,7 @@ func TestFleet_ClientGoneWhileTargetPreparesDisksLeavesNoStub(t *testing.T) {
 // Mutation: forget the target's record of the stub in EnsureDisks's reuse
 // check (treat every existing file as foreign) — the retry is refused.
 func TestFleet_StorageMigrationToATargetThatWentAwayMidCopy(t *testing.T) {
-	f := newStorageAbort(t, nil, false)
+	f := newStorageAbort(t, nil, "")
 	copying, endCopy := f.holdCopy()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

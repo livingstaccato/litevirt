@@ -2361,7 +2361,7 @@ old copy it found at a failover start records it the same way. `lv inspect
 
 | Raised when | Clears when |
 |---|---|
-| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. After a delete the host clears it once no disk of the VM is left at its path (it sets one aside first); it waits while a domain of the VM's name runs there. A record for a host removed from the cluster clears once the VM is deleted. |
+| A failover restarts the VM elsewhere and leaves a host-local disk on the failed host, or a host sets a copy of the VM's disk aside. | Nothing is left to keep: every copy was removed (`--remove`) or restored (`--restore`), or the VM was deleted. After a delete the host clears it once it has set aside the disk still at its path; it waits while a domain of the VM's name runs there, or while the path reads as missing (a volume not mounted yet reads the same). A record for a host removed from the cluster clears once the VM is deleted. |
 
 Every copy is kept while the VM exists. To run the VM on its real disk again,
 or to give the data up, see the commands in

@@ -1414,8 +1414,10 @@ The restart is not silent, and the real disk is not lost:
   that holds its disk clears the record on its next pass, or once it is back
   if it was down then. A disk still at its path is renamed to
   `<disk path>.superseded-<time>` first, so it is kept like any other copy;
-  this waits while a domain of the VM's name runs on that host. The host also
-  removes the VM's cloud-init seed there (`cloudinit/<vm>.iso`).
+  this waits while a domain of the VM's name runs on that host, and a VM of
+  the same name created on that host first sets it aside the same way. The
+  host also removes the VM's cloud-init seed there (`cloudinit/<vm>.iso`) if
+  this release wrote it; a seed from an earlier release stays.
 
 A cloud-init seed is used only by the VM it was written for: a host that
 holds the seed of a deleted VM writes a new one from the VM's own settings

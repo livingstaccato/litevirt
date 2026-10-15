@@ -542,7 +542,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	cleanupDisks := func() {
 		if createdSeed != "" {
 			if fi, err := os.Stat(createdSeed); err == nil && os.SameFile(fi, createdSeedFile) {
-				if rmErr := os.Remove(createdSeed); rmErr != nil && !os.IsNotExist(rmErr) {
+				if rmErr := cloudinit.RemoveSeed(createdSeed); rmErr != nil {
 					slog.Warn("cleanup: failed to remove cloud-init seed", "path", createdSeed, "error", rmErr)
 				}
 			}
@@ -578,6 +578,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			s.virt.DestroyDomain(spec.Name)
 		}
 		s.virt.UndefineDomain(spec.Name, true)
+	}
+
+	// A disk a failover left here of a deleted VM of this name, which this
+	// host has not set aside yet, is kept as a copy for the retention: the
+	// sweep below would unlink it (health/deleted_vm_residue.go).
+	if err := health.SetAsideStrandedBeforeCreate(ctx, s.db, s.hostName, spec.Name, time.Now()); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create %s: %v; nothing was created", spec.Name, err)
 	}
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous

@@ -377,3 +377,56 @@ func TestFleet_FailoverOntoAHostWithADeletedVMsSeedWritesItsOwn(t *testing.T) {
 		})
 	}
 }
+
+// TestFleet_RecreateOnTheOldHostKeepsTheDeletedVMsDisk: rv fails over from
+// home and is deleted while home is down, so home still has rv's real disk at
+// its path. home is back, and a new rv is created on home before home's pass
+// has set that disk aside. The create clears what an earlier VM of the name
+// left at its paths — and would unlink the deleted rv's real data. It sets
+// that disk aside first instead: the new rv is created, and the deleted rv's
+// disk is kept as a copy (here retained while a VM of the name exists).
+//
+// Mutation: drop SetAsideStrandedBeforeCreate from createVM — the create's
+// debris sweep unlinks the deleted rv's disk.
+func TestFleet_RecreateOnTheOldHostKeepsTheDeletedVMsDisk(t *testing.T) {
+	stageFakeGenisoimage(t)
+	ctx := context.Background()
+	r := newRecoveredVM(t)
+	r.home.Virt.DefineStoppedDomain("rv", "52:54:00:00:00:01")
+	r.rm(t, false)
+	if !present(r.path) {
+		t.Fatal("the delete reached home while it was down")
+	}
+	if err := r.coord.DB.Execute(ctx, `UPDATE hosts SET state = 'active', updated_at = ? WHERE name = ?`, r.coord.DB.NowTS(), r.home.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.coord.DB.Execute(ctx, `DELETE FROM host_health WHERE target = ?`, r.home.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	importImageOn(t, r.c, r.home, "ubuntu")
+	if _, err := r.c.SelfClient(r.home).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "rv", Image: "ubuntu", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: r.home.Name}}}); err != nil {
+		t.Fatalf("create rv again on %s: %v", r.home.Name, err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, r.coord.DB, "rv"); vm == nil || vm.HostName != r.home.Name {
+		t.Fatalf("the new rv = %+v, want it on %s", vm, r.home.Name)
+	}
+	copies := r.supersededCopies(t)
+	if len(copies) != 1 {
+		t.Fatalf("copies of the deleted rv's disk on home = %v, want one", copies)
+	}
+	if b := readFileT(t, copies[0]); !bytes.HasPrefix(b, r.realBytes) {
+		t.Fatal("the copy is not the deleted rv's real disk")
+	}
+	if b, err := os.ReadFile(r.path); err == nil && bytes.HasPrefix(b, r.realBytes) {
+		t.Fatal("the new rv's disk is the deleted rv's")
+	}
+	if open := r.strandedOpen(t); len(open) != 0 {
+		t.Fatalf("vm_disk_stranded is still open: %+v", open)
+	}
+	r.sweepAt(t, retention+24*time.Hour)
+	if !present(copies[0]) {
+		t.Fatal("the sweep removed the copy while a VM of the name exists")
+	}
+}

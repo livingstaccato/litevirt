@@ -50,7 +50,9 @@ import (
 //     replaces aside in turn, so nothing is ever deleted by the swap;
 //   - once the VM is deleted, the host sets aside a disk of it still at its
 //     path, which enters the same retention, removes the VM's own cloud-init
-//     seed, and resolves the record (deleted_vm_residue.go).
+//     seed when this release stamped it, and resolves the record
+//     (deleted_vm_residue.go). A VM of the name created on the host first
+//     sets such a disk aside the same way (SetAsideStrandedBeforeCreate).
 //
 // The record is a health condition, one row per VM and host, written by the
 // coordinator while the host is down and by the host itself afterwards. It
@@ -455,14 +457,16 @@ type setAsideOutcome int
 
 const (
 	setAsideDone    setAsideOutcome = iota // renamed to its copy
-	setAsideAbsent                         // nothing there: no file, or not a regular one
+	setAsideMissing                        // no file at the path (which may be a volume not mounted yet)
+	setAsideAbsent                         // not a regular file there
 	setAsideBlocked                        // kept for now: in use, or its storage or a record cannot be read
 )
 
 // setAsideStrandedFile renames the file at d.Path, a disk of vmName a
 // failover left on this host, to <path>.superseded-<time>, and returns the
 // entry with its copy. It does not when:
-//   - nothing is there, or it is not a regular file (setAsideAbsent);
+//   - nothing is there (setAsideMissing), or it is not a regular file
+//     (setAsideAbsent);
 //   - its storage does not answer (setAsideBlocked);
 //   - a domain of vmName is live here, or holds resumable state: the disk is
 //     open, or a resume would need it, and the ownership repair decides that
@@ -475,7 +479,7 @@ const (
 func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d StrandedDisk, stillMay func() bool) (StrandedDisk, setAsideOutcome) {
 	fi, err := r.lstatDisk(d.Path)
 	if os.IsNotExist(err) {
-		return d, setAsideAbsent
+		return d, setAsideMissing
 	}
 	if err != nil {
 		return d, setAsideBlocked

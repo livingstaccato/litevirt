@@ -55,10 +55,21 @@ var dbSeq atomic.Int64
 
 func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 	t.Helper()
+	tr, voters, _ := newMemClusterWithMembers(t, len(names), names...)
+	return tr, voters
+}
+
+// newMemClusterWithMembers also creates prospective voters outside genesis.
+func newMemClusterWithMembers(t *testing.T, memberCount int, names ...string) (*memTransport, []*memVoter, *corrosion.ClaimVerifier) {
+	t.Helper()
 	ctx := context.Background()
 	caDir := t.TempDir()
 	caCert, caKey := filepath.Join(caDir, "ca.crt"), filepath.Join(caDir, "ca.key")
 	if err := pki.GenerateCA(caCert, caKey); err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := corrosion.LoadClaimVerifier(caDir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	tr := &memTransport{voters: map[string]*memVoter{}, rng: rand.New(rand.NewPCG(1, 2)), down: map[string]bool{}}
@@ -94,7 +105,7 @@ func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 		out = append(out, v)
 	}
 	var members []corrosion.VoterMember
-	for _, v := range out {
+	for _, v := range out[:memberCount] {
 		members = append(members, corrosion.VoterMember{Name: v.name, Incarnation: v.inc})
 	}
 	members = corrosion.SortMembers(members)
@@ -107,7 +118,7 @@ func newMemCluster(t *testing.T, names ...string) (*memTransport, []*memVoter) {
 			t.Fatal(err)
 		}
 	}
-	return tr, out
+	return tr, out, verifier
 }
 
 var errDropped = errors.New("dropped")

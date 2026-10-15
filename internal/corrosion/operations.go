@@ -238,6 +238,11 @@ const (
 		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`
 )
 
+// beginVMOperationInterleaveHook is a TEST-ONLY seam between
+// BeginVMOperation's read of the firewall identity and its write. Production
+// leaves it nil.
+var beginVMOperationInterleaveHook func()
+
 // BeginVMOperation atomically claims a VM for an operation. In ONE transaction
 // it verifies the VM's expected owner epoch + spec generation and that no OTHER
 // operation holds the barrier, then sets the desired spec, bumps spec_generation,
@@ -270,13 +275,16 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 	if desiredSpec, err = keepFirewallID(TagMemberVM, desiredSpec, keep); err != nil {
 		return false, err
 	}
+	if beginVMOperationInterleaveHook != nil {
+		beginVMOperationInterleaveHook()
+	}
 	now := c.NowTS()
 	guard := func(tx *sql.Tx) (bool, error) {
 		var ownerEpoch, specGen int64
-		var activeOp string
+		var activeOp, spec string
 		err := tx.QueryRowContext(ctx,
-			`SELECT vm_owner_epoch, spec_generation, active_operation_id FROM vms WHERE name = ? AND deleted_at IS NULL`,
-			op.ResourceID).Scan(&ownerEpoch, &specGen, &activeOp)
+			`SELECT vm_owner_epoch, spec_generation, active_operation_id, spec FROM vms WHERE name = ? AND deleted_at IS NULL`,
+			op.ResourceID).Scan(&ownerEpoch, &specGen, &activeOp, &spec)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
@@ -289,7 +297,11 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 		if activeOp != "" {
 			return false, nil // barrier held by another operation
 		}
-		return ownerEpoch == expectedOwnerEpoch && specGen == expectedSpecGen, nil
+		// The row must still hold the identity the desired spec keeps: a VM
+		// deleted and re-created at the same epoch and generation since the
+		// read above would otherwise receive the old VM's.
+		return ownerEpoch == expectedOwnerEpoch && specGen == expectedSpecGen &&
+			firewallIDOf(TagMemberVM, spec) == keep, nil
 	}
 	stmts := []Statement{
 		// Self-contained CAS so a retry (active_operation_id already set) is a no-op.

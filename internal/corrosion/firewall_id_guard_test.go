@@ -25,7 +25,9 @@ import (
 //
 //   - the writer guard: every function that writes vms.spec or
 //     containers.create_spec — found by the PARSED statement's columns, not by
-//     an SQL prefix — calls keepFirewallID, or hands the write to one that does;
+//     an SQL prefix — calls keepFirewallID, or hands the write to one that does.
+//     It checks the call, not that its result is the value bound to the
+//     column; TestFirewallIDWriters_* pin that for every writer;
 //   - the carry guard: CarryFirewallID is called only from the listed paths,
 //     each of which obtains its source through withReplacedVM, the container
 //     re-key's own batch or the relocation proof, and no code builds a token

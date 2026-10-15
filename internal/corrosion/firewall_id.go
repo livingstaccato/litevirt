@@ -53,6 +53,10 @@ var ErrFirewallIDNotMinted = errors.New("firewall identity not minted: the workl
 // change into "no NICs".
 var ErrFirewallIDNoCreateSpec = errors.New("the container has no create spec (an earlier build created it), so it cannot hold a firewall identity")
 
+// ErrFirewallIDCarryRefused refuses a carry token where the writer keeps the
+// live row's identity instead (UpsertContainer).
+var ErrFirewallIDCarryRefused = errors.New("this writer keeps the live row's firewall identity and takes no carry token")
+
 // errFirewallIDSpec refuses to keep an identity in a value that is not a JSON
 // object, which nothing could read it from.
 var errFirewallIDSpec = errors.New("cannot keep a firewall identity in a spec that is not a JSON object")
@@ -108,8 +112,22 @@ func firewallIDOf(kind, doc string) string {
 	return id
 }
 
+// identityKeyCacheMax bounds identityKeyCache: past it, a key's answer is
+// computed and not kept, so keys taken from client input cannot grow it.
+const identityKeyCacheMax = 4096
+
 // identityKeyCache memoises isFirewallIDKey per kind and key.
-var identityKeyCache sync.Map
+var identityKeyCache = struct {
+	sync.Mutex
+	m map[string]bool
+}{m: map[string]bool{}}
+
+// identityKeyCacheLen is the number of memoised answers.
+func identityKeyCacheLen() int {
+	identityKeyCache.Lock()
+	defer identityKeyCache.Unlock()
+	return len(identityKeyCache.m)
+}
 
 // isFirewallIDKey reports whether a top-level member named key would be READ
 // as the identity by a decoder the tree uses on that column: encoding/json into
@@ -118,8 +136,11 @@ var identityKeyCache sync.Map
 // container create_spec. It asks the decoders, never compares spellings.
 func isFirewallIDKey(kind, key string) bool {
 	ck := kind + "\x00" + key
-	if v, ok := identityKeyCache.Load(ck); ok {
-		return v.(bool)
+	identityKeyCache.Lock()
+	v, ok := identityKeyCache.m[ck]
+	identityKeyCache.Unlock()
+	if ok {
+		return v
 	}
 	probe, err := json.Marshal(map[string]string{key: "x"})
 	hit := false
@@ -145,7 +166,11 @@ func isFirewallIDKey(kind, key string) bool {
 			panic("corrosion: unknown firewall identity kind " + kind)
 		}
 	}
-	identityKeyCache.Store(ck, hit)
+	identityKeyCache.Lock()
+	if len(identityKeyCache.m) < identityKeyCacheMax {
+		identityKeyCache.m[ck] = hit
+	}
+	identityKeyCache.Unlock()
 	return hit
 }
 
@@ -252,106 +277,109 @@ func newFirewallID() string {
 
 // MintFirewallID gives the live workload (kind TagMemberVM: name; TagMemberCT:
 // host and name) a firewall identity and returns it. It keeps the identity the
-// row holds unless another row of the kind, live or tombstoned, holds the same
-// one: such an id was copied, not minted (a value stored verbatim before the
-// writers kept the identity), and a copy must never inherit membership. Then,
-// and when the row holds none, it mints a fresh one.
+// row holds unless another LIVE row of the kind holds the same one: such an id
+// was copied, not minted (a value stored verbatim before the writers kept the
+// identity). Then it mints a fresh one and returns the id it abandoned, whose
+// tags row the caller clears, so the copy, now its sole holder, never inherits
+// that membership. A tombstone holding the id (the workload's own move,
+// re-key or cutover) is no conflict. With no identity on the row, it mints
+// one and abandons nothing.
 //
 // Only `lv firewall tag set` calls it, with the firewall_tag_groups grant. A VM
 // mints through the desired-spec writer, under its operation barrier; a
 // container through the compare-and-set on its create_spec, refused while an
 // operation holds it. ErrFirewallIDNotMinted means the caller retries; a
 // container with no create spec is refused (ErrFirewallIDNoCreateSpec).
-func MintFirewallID(ctx context.Context, c *Client, g capabilities.FeatureGrant, kind, host, name string) (string, error) {
+func MintFirewallID(ctx context.Context, c *Client, g capabilities.FeatureGrant, kind, host, name string) (id, abandoned string, err error) {
 	if err := g.Check(capabilities.FeatureFirewallTagGroups); err != nil {
-		return "", err
+		return "", "", err
 	}
 	switch kind {
 	case TagMemberVM:
-		var minted string
+		var minted, dropped string
 		applied, _, err := mutateDesiredSpec(ctx, c, name,
 			func(old string) (string, error) { return old, nil },
 			func(old string) (string, error) {
-				id, err := uniqueFirewallID(ctx, c, kind, "", name, firewallIDOf(kind, old))
-				minted = id
+				id, ab, err := uniqueFirewallID(ctx, c, kind, "", name, firewallIDOf(kind, old))
+				minted, dropped = id, ab
 				return id, err
 			})
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		if !applied {
-			return "", ErrFirewallIDNotMinted
+			return "", "", ErrFirewallIDNotMinted
 		}
-		return minted, nil
+		return minted, dropped, nil
 	case TagMemberCT:
 		return mintContainerFirewallID(ctx, c, host, name)
 	}
-	return "", fmt.Errorf("corrosion: unknown firewall identity kind %q", kind)
+	return "", "", fmt.Errorf("corrosion: unknown firewall identity kind %q", kind)
 }
 
 // uniqueFirewallID returns cur when no other row of kind holds it, and a fresh
-// identity otherwise (or when cur is "").
-func uniqueFirewallID(ctx context.Context, c *Client, kind, host, name, cur string) (string, error) {
+// identity otherwise (or when cur is ""), with the id it abandoned.
+func uniqueFirewallID(ctx context.Context, c *Client, kind, host, name, cur string) (string, string, error) {
 	if cur == "" {
-		return newFirewallID(), nil
+		return newFirewallID(), "", nil
 	}
 	var rows []Row
 	var err error
 	if kind == TagMemberVM {
-		rows, err = c.Query(ctx, `SELECT '' AS host_name, name, spec AS doc FROM vms WHERE name != ?`, name)
+		rows, err = c.Query(ctx, `SELECT '' AS host_name, name, spec AS doc FROM vms WHERE name != ? AND deleted_at IS NULL`, name)
 	} else {
 		rows, err = c.Query(ctx,
 			`SELECT host_name, name, COALESCE(create_spec, '') AS doc FROM containers
-			 WHERE NOT (host_name = ? AND name = ?)`, host, name)
+			 WHERE NOT (host_name = ? AND name = ?) AND deleted_at IS NULL`, host, name)
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for _, r := range rows {
 		if firewallIDOf(kind, r.String("doc")) == cur {
-			return newFirewallID(), nil
+			return newFirewallID(), cur, nil
 		}
 	}
-	return cur, nil
+	return cur, "", nil
 }
 
 // mintContainerFirewallID is MintFirewallID for a container: the
 // create_spec compare-and-set MintContainerPlacement uses, so a concurrent
 // change of the row's create_spec makes it write nothing.
-func mintContainerFirewallID(ctx context.Context, c *Client, host, name string) (string, error) {
+func mintContainerFirewallID(ctx context.Context, c *Client, host, name string) (string, string, error) {
 	if !c.RepointReady(ctx) {
-		return "", fmt.Errorf("%w: the release token has not latched", ErrFirewallIDNotMinted)
+		return "", "", fmt.Errorf("%w: the release token has not latched", ErrFirewallIDNotMinted)
 	}
 	rows, err := c.Query(ctx,
 		`SELECT COALESCE(create_spec, '') AS create_spec, COALESCE(active_operation_id, '') AS active_operation_id
 		 FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`, host, name)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(rows) == 0 || rows[0].String("active_operation_id") != "" {
-		return "", ErrFirewallIDNotMinted
+		return "", "", ErrFirewallIDNotMinted
 	}
 	current := rows[0].String("create_spec")
 	if current == "" {
-		return "", ErrFirewallIDNoCreateSpec
+		return "", "", ErrFirewallIDNoCreateSpec
 	}
-	id, err := uniqueFirewallID(ctx, c, TagMemberCT, host, name, firewallIDOf(TagMemberCT, current))
+	id, abandoned, err := uniqueFirewallID(ctx, c, TagMemberCT, host, name, firewallIDOf(TagMemberCT, current))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	next, err := keepFirewallID(TagMemberCT, current, id)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if next == current {
-		return id, nil
+		return id, abandoned, nil
 	}
 	n, err := c.ExecuteRowsStrict(ctx, containerPlacementMintSQL, next, c.NowTS(), host, name, current)
 	if errors.Is(err, ErrNoRowsAffected) || err == nil && n == 0 {
-		return "", ErrFirewallIDNotMinted
+		return "", "", ErrFirewallIDNotMinted
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return id, nil
+	return id, abandoned, nil
 }

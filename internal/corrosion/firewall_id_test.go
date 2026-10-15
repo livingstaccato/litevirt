@@ -101,7 +101,8 @@ func vmIDVariants(id string) map[string]string {
 		"canonical":      fmt.Sprintf(`{"cpu":2,"firewall_id":%q}`, id),
 		"case":           fmt.Sprintf(`{"cpu":2,"Firewall_ID":%q}`, id),
 		"upper":          fmt.Sprintf(`{"cpu":2,"FIREWALL_ID":%q}`, id),
-		"escaped":        fmt.Sprintf(`{"cpu":2,"firewall_id":%q}`, id),
+		"escaped":        fmt.Sprintf(`{"cpu":2,"\u0066irewall\u005fid":%q}`, id),
+		"escaped upper":  fmt.Sprintf(`{"cpu":2,"\u0046IREWALL_ID":%q}`, id),
 		"protojson name": fmt.Sprintf(`{"cpu":2,"firewallId":%q}`, id),
 		"duplicate":      fmt.Sprintf(`{"cpu":2,"firewall_id":"junk","firewall_id":%q}`, id),
 		"two spellings":  fmt.Sprintf(`{"cpu":2,"FireWall_Id":%q,"firewall_id":%q}`, id, id),
@@ -114,7 +115,7 @@ func ctIDVariants(id string) map[string]string {
 		"canonical":     fmt.Sprintf(`{"template":"debian","fw_id":%q}`, id),
 		"case":          fmt.Sprintf(`{"template":"debian","FW_ID":%q}`, id),
 		"mixed":         fmt.Sprintf(`{"template":"debian","Fw_Id":%q}`, id),
-		"escaped":       fmt.Sprintf(`{"template":"debian","fw_id":%q}`, id),
+		"escaped":       fmt.Sprintf(`{"template":"debian","\u0066w\u005fid":%q}`, id),
 		"duplicate":     fmt.Sprintf(`{"template":"debian","fw_id":"junk","fw_id":%q}`, id),
 		"two spellings": fmt.Sprintf(`{"template":"debian","fW_iD":%q,"fw_id":%q}`, id, id),
 	}
@@ -129,6 +130,13 @@ func ctIDVariants(id string) map[string]string {
 // canonical and duplicate goes red.
 func TestKeepFirewallID_StripsByTheDecoderNotTheSpelling(t *testing.T) {
 	keep := tgID(9)
+	// The escaped variants really are escaped in the JSON text, and the
+	// lookalikes really carry U+212A KELVIN SIGN, not an ASCII K.
+	for _, v := range []string{vmIDVariants("x")["escaped"], vmIDVariants("x")["escaped upper"], ctIDVariants("x")["escaped"]} {
+		if !strings.Contains(v, `\u00`) {
+			t.Fatalf("the escaped variant %s holds no JSON escape", v)
+		}
+	}
 	for kind, variants := range map[string]map[string]string{
 		TagMemberVM: vmIDVariants(tgID(1)),
 		TagMemberCT: ctIDVariants(tgID(1)),
@@ -147,11 +155,15 @@ func TestKeepFirewallID_StripsByTheDecoderNotTheSpelling(t *testing.T) {
 			}
 		}
 	}
-	// Not an identity to any decoder: untouched, byte for byte.
+	// Not an identity to any decoder: untouched, byte for byte. A Kelvin
+	// sign folds only to k, which neither key holds.
 	for kind, in := range map[string]string{
-		TagMemberVM: `{"cpu":2,"firewall_ıd":"x","Kfirewall_id":"y","firewall id":"z"}`,
-		TagMemberCT: `{"template":"debian","fw_ıd":"x","Kfw_id":"y"}`,
+		TagMemberVM: `{"cpu":2,"firewall_ıd":"x","Kfirewall_id":"y","firewall id":"z"}`,
+		TagMemberCT: `{"template":"debian","fw_ıd":"x","Kfw_id":"y"}`,
 	} {
+		if !strings.ContainsRune(in, '\u212a') {
+			t.Fatalf("%s lookalikes hold no Kelvin sign: %s", kind, in)
+		}
 		assertIdentity(t, kind+" lookalikes", kind, in, "")
 		if out, err := keepFirewallID(kind, in, ""); err != nil || out != in {
 			t.Errorf("%s lookalikes rewritten: %q (%v)", kind, out, err)
@@ -504,6 +516,12 @@ func groupMembers(t *testing.T, m *TagGroupMembership, name string) []TagGroupMe
 
 func mintGrant(t *testing.T) capabilities.FeatureGrant { return tagGroupGrant(t) }
 
+// mintID is MintFirewallID without the abandoned id.
+func mintID(ctx context.Context, c *Client, g capabilities.FeatureGrant, kind, host, name string) (string, error) {
+	id, _, err := MintFirewallID(ctx, c, g, kind, host, name)
+	return id, err
+}
+
 // TestMintFirewallID: it takes the firewall_tag_groups grant and is listed as
 // that feature's writer (m-2); it mints a well-formed identity only where the
 // row has none, through the VM's spec writer (one generation bump) or the
@@ -524,7 +542,7 @@ func TestMintFirewallID(t *testing.T) {
 		"another feature's": capabilities.GrantForTest(t, capabilities.FeatureFirewallLog),
 	} {
 		for _, kind := range []string{TagMemberVM, TagMemberCT} {
-			if id, err := MintFirewallID(ctx, c, g, kind, "h1", map[string]string{TagMemberVM: "vm1", TagMemberCT: "ct1"}[kind]); !errors.Is(err, capabilities.ErrNoFeatureGrant) || id != "" {
+			if id, err := mintID(ctx, c, g, kind, "h1", map[string]string{TagMemberVM: "vm1", TagMemberCT: "ct1"}[kind]); !errors.Is(err, capabilities.ErrNoFeatureGrant) || id != "" {
 				t.Errorf("%s %s: id=%q err=%v, want ErrNoFeatureGrant", name, kind, id, err)
 			}
 		}
@@ -533,7 +551,7 @@ func TestMintFirewallID(t *testing.T) {
 	assertIdentity(t, "refused container mint", TagMemberCT, storedCreateSpec(t, c, "h1", "ct1"), "")
 
 	vm, _ := GetVM(ctx, c, "vm1")
-	id, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberVM, "", "vm1")
+	id, err := mintID(ctx, c, mintGrant(t), TagMemberVM, "", "vm1")
 	if err != nil || !ValidFirewallID(id) {
 		t.Fatalf("VM mint: %q %v", id, err)
 	}
@@ -542,14 +560,14 @@ func TestMintFirewallID(t *testing.T) {
 	if after.SpecGeneration != vm.SpecGeneration+1 {
 		t.Errorf("VM mint generation %d -> %d, want one bump", vm.SpecGeneration, after.SpecGeneration)
 	}
-	if again, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberVM, "", "vm1"); err != nil || again != id {
+	if again, err := mintID(ctx, c, mintGrant(t), TagMemberVM, "", "vm1"); err != nil || again != id {
 		t.Errorf("second VM mint: %q %v, want the existing %q", again, err, id)
 	}
 	if again, _ := GetVM(ctx, c, "vm1"); again.SpecGeneration != after.SpecGeneration {
 		t.Error("a mint of an existing identity wrote")
 	}
 
-	cid, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberCT, "h1", "ct1")
+	cid, err := mintID(ctx, c, mintGrant(t), TagMemberCT, "h1", "ct1")
 	if err != nil || !ValidFirewallID(cid) || cid == id {
 		t.Fatalf("container mint: %q %v", cid, err)
 	}
@@ -558,7 +576,7 @@ func TestMintFirewallID(t *testing.T) {
 	if !strings.Contains(cs, `"debian"`) {
 		t.Errorf("container mint lost the create spec: %s", cs)
 	}
-	if again, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberCT, "h1", "ct1"); err != nil || again != cid {
+	if again, err := mintID(ctx, c, mintGrant(t), TagMemberCT, "h1", "ct1"); err != nil || again != cid {
 		t.Errorf("second container mint: %q %v, want %q", again, err, cid)
 	}
 
@@ -567,9 +585,9 @@ func TestMintFirewallID(t *testing.T) {
 	rawContainer(t, c, "h1", "busy", `{"template":"debian"}`)
 	mustExec(t, c, `UPDATE containers SET active_operation_id = 'op' WHERE name = 'busy'`)
 	for what, call := range map[string]func() (string, error){
-		"busy container":    func() (string, error) { return MintFirewallID(ctx, c, mintGrant(t), TagMemberCT, "h1", "busy") },
-		"missing container": func() (string, error) { return MintFirewallID(ctx, c, mintGrant(t), TagMemberCT, "h1", "nope") },
-		"missing VM":        func() (string, error) { return MintFirewallID(ctx, c, mintGrant(t), TagMemberVM, "", "nope") },
+		"busy container":    func() (string, error) { return mintID(ctx, c, mintGrant(t), TagMemberCT, "h1", "busy") },
+		"missing container": func() (string, error) { return mintID(ctx, c, mintGrant(t), TagMemberCT, "h1", "nope") },
+		"missing VM":        func() (string, error) { return mintID(ctx, c, mintGrant(t), TagMemberVM, "", "nope") },
 	} {
 		if id, err := call(); !errors.Is(err, ErrFirewallIDNotMinted) || id != "" {
 			t.Errorf("%s: %q %v, want ErrFirewallIDNotMinted", what, id, err)
@@ -579,11 +597,11 @@ func TestMintFirewallID(t *testing.T) {
 	mustExec(t, c, `UPDATE vms SET active_operation_id = 'op' WHERE name = 'vm1'`)
 	rawVM(t, c, "vm2", `{}`)
 	mustExec(t, c, `UPDATE vms SET active_operation_id = 'op' WHERE name = 'vm2'`)
-	if id, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberVM, "", "vm2"); !errors.Is(err, ErrFirewallIDNotMinted) || id != "" {
+	if id, err := mintID(ctx, c, mintGrant(t), TagMemberVM, "", "vm2"); !errors.Is(err, ErrFirewallIDNotMinted) || id != "" {
 		t.Errorf("busy VM: %q %v, want ErrFirewallIDNotMinted", id, err)
 	}
 	rawContainer(t, c, "h1", "legacy", "")
-	if id, err := MintFirewallID(ctx, c, mintGrant(t), TagMemberCT, "h1", "legacy"); !errors.Is(err, ErrFirewallIDNoCreateSpec) || id != "" {
+	if id, err := mintID(ctx, c, mintGrant(t), TagMemberCT, "h1", "legacy"); !errors.Is(err, ErrFirewallIDNoCreateSpec) || id != "" {
 		t.Errorf("container with no create spec: %q %v, want ErrFirewallIDNoCreateSpec", id, err)
 	}
 	if cs := storedCreateSpec(t, c, "h1", "legacy"); cs != "" {
@@ -591,7 +609,7 @@ func TestMintFirewallID(t *testing.T) {
 	}
 	c2 := testClient(t)
 	rawContainer(t, c2, "h1", "ct1", `{"template":"debian"}`)
-	if id, err := MintFirewallID(ctx, c2, mintGrant(t), TagMemberCT, "h1", "ct1"); !errors.Is(err, ErrFirewallIDNotMinted) || id != "" {
+	if id, err := mintID(ctx, c2, mintGrant(t), TagMemberCT, "h1", "ct1"); !errors.Is(err, ErrFirewallIDNotMinted) || id != "" {
 		t.Errorf("before the latch: %q %v, want ErrFirewallIDNotMinted", id, err)
 	}
 }
@@ -633,9 +651,12 @@ func TestMintFirewallID_CopiedIdentityChainGrantsNothing(t *testing.T) {
 			}
 
 			// tag set: mint (or reuse) the victim's identity, then write its row.
-			id, err := MintFirewallID(ctx, f.c, mintGrant(t), kind, host, victim)
+			id, abandoned, err := MintFirewallID(ctx, f.c, mintGrant(t), kind, host, victim)
 			if err != nil {
 				t.Fatalf("mint: %v", err)
+			}
+			if abandoned != copied {
+				t.Errorf("abandoned = %q, want the copied id %s", abandoned, copied)
 			}
 			f.tags(kind, id, `{"tags":{"role":"web"}}`)
 			if id == copied {
@@ -658,5 +679,189 @@ func TestMintFirewallID_CopiedIdentityChainGrantsNothing(t *testing.T) {
 				t.Fatalf("after the delete, web members = %+v, want none: the copy inherited membership", got)
 			}
 		})
+	}
+}
+
+// TestMintFirewallID_KeepsTheIdAcrossMovesAndCutover (D2a review I-1a): a
+// move, re-key or cutover leaves a TOMBSTONE holding the workload's own id. A
+// tombstone is not a conflict: the mint keeps the id the live row holds, writes
+// nothing and abandons nothing, so the tags row keyed by it stays in force.
+//
+// Mutation: count tombstoned rows as conflicts — every case re-mints.
+func TestMintFirewallID_KeepsTheIdAcrossMovesAndCutover(t *testing.T) {
+	ctx := context.Background()
+	id := tgID(31)
+	cs := fmt.Sprintf(`{"template":"debian","fw_id":%q}`, id)
+	check := func(t *testing.T, c *Client, kind, host, name, want string) {
+		t.Helper()
+		got, abandoned, err := MintFirewallID(ctx, c, mintGrant(t), kind, host, name)
+		if err != nil || got != want || abandoned != "" {
+			t.Fatalf("mint after the move: id=%q abandoned=%q err=%v, want %s and nothing abandoned", got, abandoned, err, want)
+		}
+	}
+	for _, lifecycle := range []bool{false, true} {
+		t.Run(fmt.Sprintf("relocation lifecycle=%v", lifecycle), func(t *testing.T) {
+			c := newTestDB(t)
+			c.SetRepointReady(func(context.Context) bool { return true })
+			seedRelocatableContainer(t, c, "host-a", "web", lifecycle)
+			mustExec(t, c, `UPDATE containers SET create_spec = ? WHERE host_name = 'host-a' AND name = 'web'`, cs)
+			if err := RelocateContainerWithToken(ctx, c, "host-a", "web", "host-b", "tok"); err != nil {
+				t.Fatal(err)
+			}
+			check(t, c, TagMemberCT, "host-b", "web", id)
+		})
+	}
+	t.Run("re-key", func(t *testing.T) {
+		c := testClient(t)
+		c.SetRepointReady(func(context.Context) bool { return true })
+		if err := UpsertContainer(ctx, c, ContainerRecord{HostName: "h1", Name: "ct1", State: "running", Image: "alpine", Project: "p1"}); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, c, `UPDATE containers SET create_spec = ? WHERE host_name = 'h1' AND name = 'ct1'`, cs)
+		src, err := GetContainer(ctx, c, "h1", "ct1")
+		if err != nil || src == nil {
+			t.Fatalf("source: %+v %v", src, err)
+		}
+		if applied, err := RekeyContainerOwner(ctx, c, *src, "h2"); err != nil || !applied {
+			t.Fatalf("rekey: applied=%v err=%v", applied, err)
+		}
+		check(t, c, TagMemberCT, "h2", "ct1", id)
+	})
+	t.Run("cutover", func(t *testing.T) {
+		c := testClientVMReplace(t)
+		replacement := tgID(32)
+		mustInsertVM(t, c, VMRecord{Name: "app", HostName: "h1", State: "stopped", Spec: `{"name":"app"}`}, nil, nil)
+		mustInsertVM(t, c, VMRecord{Name: "app-next", HostName: "h1", State: "stopped", Spec: `{"name":"app-next"}`,
+			FirewallCarry: CarryFirewallID(TagMemberVM, fmt.Sprintf(`{"firewall_id":%q}`, replacement))}, nil, nil)
+		if err := DeleteVM(ctx, c, "app"); err != nil {
+			t.Fatal(err)
+		}
+		if err := ReplaceVM(ctx, c, "app-next", "app", prepareCutover(t, c, "app", "app-next")); err != nil {
+			t.Fatalf("ReplaceVM: %v", err)
+		}
+		before, _ := GetVM(ctx, c, "app")
+		check(t, c, TagMemberVM, "", "app", replacement)
+		if after, _ := GetVM(ctx, c, "app"); after.SpecGeneration != before.SpecGeneration {
+			t.Error("a mint of the id the VM holds wrote")
+		}
+	})
+}
+
+// TestMintFirewallID_LiveCopyReMintsAndReturnsAbandoned (D2a review I-1b): when
+// another LIVE row holds the id, the tagged row gets a fresh one and the mint
+// returns the id it abandoned, so the caller clears that tags row; the copy,
+// now the sole holder of the abandoned id, inherits nothing.
+//
+// Mutation: return no abandoned id — the caller cannot clear the row, and the
+// copy becomes a member.
+func TestMintFirewallID_LiveCopyReMintsAndReturnsAbandoned(t *testing.T) {
+	ctx := context.Background()
+	f := newTagGroupFixture(t)
+	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
+	shared := tgID(41)
+	f.vm("orig", shared, "running")
+	f.vmNIC("vm_nics", "orig", "prod", "52:54:00:bb:00:01", "")
+	f.lease("prod", "10.0.0.5", "52:54:00:bb:00:01", "vm", "", "orig")
+	f.vm("copy", shared, "running")
+	f.vmNIC("vm_nics", "copy", "prod", "52:54:00:bb:00:02", "")
+	f.lease("prod", "10.0.0.6", "52:54:00:bb:00:02", "vm", "", "copy")
+	f.tags(TagMemberVM, shared, `{"tags":{"role":"web"}}`)
+
+	id, abandoned, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberVM, "", "orig")
+	if err != nil || id == shared || !ValidFirewallID(id) {
+		t.Fatalf("mint over a live copy: id=%q err=%v, want a fresh id", id, err)
+	}
+	if abandoned != shared {
+		t.Fatalf("abandoned = %q, want %s", abandoned, shared)
+	}
+	// What tag set does next: write the new row, clear the abandoned one.
+	f.tags(TagMemberVM, id, `{"tags":{"role":"web"}}`)
+	f.tags(TagMemberVM, abandoned, "")
+	if got := groupMembers(t, f.members(), "web"); len(got) != 1 || got[0].Name != "orig" {
+		t.Fatalf("web members = %+v, want only orig", got)
+	}
+	if err := DeleteVM(ctx, f.c, "orig"); err != nil {
+		t.Fatal(err)
+	}
+	if got := groupMembers(t, f.members(), "web"); len(got) != 0 {
+		t.Fatalf("after orig's delete, web members = %+v: the copy inherited membership", got)
+	}
+}
+
+// TestUpsertContainer_RefusesACarry (D2a review m-2): an upsert keeps the live
+// row's identity and takes no token; passing one is an error, not a silent
+// drop.
+func TestUpsertContainer_RefusesACarry(t *testing.T) {
+	c := testClient(t)
+	carry := CarryFirewallID(TagMemberCT, fmt.Sprintf(`{"fw_id":%q}`, tgID(51)))
+	err := UpsertContainer(context.Background(), c, ContainerRecord{HostName: "h1", Name: "ct1", State: "running",
+		Image: "alpine", CreateSpec: `{"template":"debian"}`, FirewallCarry: carry})
+	if !errors.Is(err, ErrFirewallIDCarryRefused) {
+		t.Fatalf("UpsertContainer with a carry: %v, want ErrFirewallIDCarryRefused", err)
+	}
+	if rows, _ := c.Query(context.Background(), `SELECT name FROM containers`); len(rows) != 0 {
+		t.Fatalf("a refused upsert wrote %d rows", len(rows))
+	}
+}
+
+// TestFirewallIDWriters_ReadThenWriteRaces (D2a review m-1): UpsertContainer
+// and BeginVMOperation read the identity they keep before they write. The row
+// replaced (or deleted) in between must not receive the old identity: each
+// re-checks it inside the write transaction.
+//
+// Mutation: drop the in-transaction identity check — the new row gets the
+// old id.
+func TestFirewallIDWriters_ReadThenWriteRaces(t *testing.T) {
+	ctx := context.Background()
+	old := tgID(61)
+	for _, recreate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("UpsertContainer recreate=%v", recreate), func(t *testing.T) {
+			c := testClient(t)
+			rawContainer(t, c, "h1", "ct1", fmt.Sprintf(`{"template":"debian","fw_id":%q}`, old))
+			upsertContainerInterleaveHook = func() {
+				upsertContainerInterleaveHook = nil
+				if recreate {
+					mustExec(t, c, `DELETE FROM containers WHERE host_name = 'h1' AND name = 'ct1'`)
+					rawContainer(t, c, "h1", "ct1", `{"template":"new"}`)
+				} else {
+					mustExec(t, c, `UPDATE containers SET deleted_at = 'gone' WHERE host_name = 'h1' AND name = 'ct1'`)
+				}
+			}
+			t.Cleanup(func() { upsertContainerInterleaveHook = nil })
+			if err := UpsertContainer(ctx, c, ContainerRecord{HostName: "h1", Name: "ct1", State: "running",
+				Image: "alpine", CreateSpec: `{"template":"alpine"}`}); err != nil {
+				t.Fatal(err)
+			}
+			assertIdentity(t, "raced upsert", TagMemberCT, storedCreateSpec(t, c, "h1", "ct1"), "")
+		})
+	}
+	t.Run("BeginVMOperation", func(t *testing.T) {
+		c := testClient(t)
+		rawVM(t, c, "vm1", fmt.Sprintf(`{"cpu":2,"firewall_id":%q}`, old))
+		beginVMOperationInterleaveHook = func() {
+			beginVMOperationInterleaveHook = nil
+			mustExec(t, c, `DELETE FROM vms WHERE name = 'vm1'`)
+			rawVM(t, c, "vm1", `{"cpu":1}`)
+		}
+		t.Cleanup(func() { beginVMOperationInterleaveHook = nil })
+		op := OperationRecord{ID: "op1", Method: "UpdateVM", Principal: "alice", ResourceKind: "vm", ResourceID: "vm1"}
+		if _, err := c.BeginVMOperation(ctx, op, `{"cpu":8}`, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		assertIdentity(t, "raced operation begin", TagMemberVM, storedVMSpec(t, c, "vm1"), "")
+	})
+}
+
+// TestIdentityKeyCacheIsBounded (D2a review m-4): keys taken from input
+// cannot grow the probe cache without limit, and answers stay right past it.
+func TestIdentityKeyCacheIsBounded(t *testing.T) {
+	for i := 0; i < identityKeyCacheMax+500; i++ {
+		isFirewallIDKey(TagMemberVM, fmt.Sprintf("key-%d", i))
+	}
+	if n := identityKeyCacheLen(); n > identityKeyCacheMax {
+		t.Fatalf("cache holds %d answers, want at most %d", n, identityKeyCacheMax)
+	}
+	if !isFirewallIDKey(TagMemberVM, "FIREWALL_ID") || isFirewallIDKey(TagMemberVM, "key-x") {
+		t.Fatal("a full cache answers wrongly")
 	}
 }

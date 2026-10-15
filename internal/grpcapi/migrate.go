@@ -1580,6 +1580,9 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	if s.virt == nil {
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
+	if err := s.nicMTUPreflight(ctx, vm, targetHost); err != nil {
+		return err
+	}
 	disks, err := s.coldMoveDisks(ctx, vm)
 	if err != nil {
 		return err

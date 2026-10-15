@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -135,5 +137,53 @@ func TestFleet_NICMTU_MigrateToAMatchedBridgeLandsWithTheMTU(t *testing.T) {
 	}
 	if x := dst.Virt.DefinedXML("vm-ok"); !strings.Contains(x, "mtu size='9000'") && !strings.Contains(x, `mtu size="9000"`) {
 		t.Errorf("the guest landed without its MTU:\n%s", x)
+	}
+}
+
+// A drain cold-moves a running VM with a local disk, shutting it down first.
+// A target whose bridge does not carry its NIC MTU is refused while the guest
+// still runs: it is never shut down, and stays where it was.
+//
+// Mutation: drop the MTU check from coldMovePreflight — the guest is shut
+// down (and started again) and the test goes red.
+func TestFleet_NICMTU_DrainColdRefusesBeforeTheShutdown(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	ctx := context.Background()
+	const mac = "52:54:00:00:40:01"
+	spec, err := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256,
+		Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio", Mac: mac, Mtu: 9000}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.src.DB.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = 'os1'`, string(spec), sc.src.DB.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertInterface(ctx, sc.src.DB, corrosion.InterfaceRecord{VMName: "os1", NetworkName: "lan", MAC: mac}); err != nil {
+		t.Fatal(err)
+	}
+	x, err := sc.src.Virt.DumpXMLInactive("os1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.src.Virt.SetInactiveXML("os1", strings.Replace(x, "</devices>",
+		"<interface type='bridge'><mac address='"+mac+"'/><source bridge='lan'/><model type='virtio'/><mtu size='9000'/></interface></devices>", 1))
+	sc.src.Virt.SetBridgeMTU("lan", 9000)
+	sc.dst.Virt.SetBridgeMTU("lan", 1500)
+	sc.makeRunning(t)
+
+	progress, err := sc.drain(t)
+	assertIncomplete(t, err)
+	want := "NIC 0 MTU 9000 does not match bridge lan MTU 1500 on host " + sc.dst.Name
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "left running on "+sc.src.Name) || !strings.Contains(p.Error, want) {
+		t.Fatalf("drain progress for os1 = %+v, want failed: left running, %q", p, want)
+	}
+	if n := sc.srcOps("shutdown"); n != 0 {
+		t.Errorf("os1 was shut down %d time(s) for a move its NIC MTU refuses", n)
+	}
+	if active, _ := sc.src.Virt.DomainIsActive("os1"); !active {
+		t.Errorf("os1's domain is not running on %s", sc.src.Name)
+	}
+	if sc.dst.Virt.DomainExists("os1") {
+		t.Errorf("os1's domain is defined on %s", sc.dst.Name)
 	}
 }

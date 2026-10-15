@@ -365,3 +365,32 @@ func (s *Server) importNICMTUGrant(ctx context.Context, fv *vmimport.ForeignVM) 
 	}
 	return g
 }
+
+// nicMTUPreflight asks targetHost, while the VM still runs, whether its
+// bridges carry the VM's NIC MTUs: the move's own EnsureDisks asks too late
+// for a cold move that shuts the guest down first. The VM's networks are set
+// up there first, as the move would. Nil for a VM that sets no MTU.
+func (s *Server) nicMTUPreflight(ctx context.Context, vm *corrosion.VMRecord, targetHost string) error {
+	mtus, err := s.nicMTUExpectations(ctx, vm.Name)
+	if err != nil || len(mtus) == 0 {
+		return err
+	}
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, ic := range ifaces {
+		if ic.NetworkName != "" {
+			s.provisionNetworkOnRemote(ctx, targetHost, ic.NetworkName)
+		}
+	}
+	client, conn, err := s.peerClient(ctx, targetHost)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "cannot reach %s to check the NIC MTUs of VM %q: %v", targetHost, vm.Name, err)
+	}
+	defer conn.Close()
+	// No stubs and an empty ISO list: the target answers the MTUs and creates
+	// nothing.
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vm.Name, InstallerIsoListed: true, NicMtu: mtus})
+	if err != nil {
+		return status.Errorf(status.Code(err), "%s could not check the NIC MTUs of VM %q: %s", targetHost, vm.Name, status.Convert(err).Message())
+	}
+	return nicMTURefusal(vm.Name, targetHost, resp.GetNicMtuProblem())
+}

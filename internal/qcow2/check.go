@@ -6,6 +6,10 @@ import (
 	"os"
 )
 
+// checkModelledIncompat is the incompatible feature bits Check's layout model
+// holds for: dirty (0), corrupt (1) and compression type (3).
+const checkModelledIncompat = 1<<0 | 1<<1 | 1<<3
+
 // Check validates the internal consistency of a qcow2 file: magic/version,
 // L1/L2 table bounds, cluster alignment of every table and standard data
 // cluster (ErrMisaligned), backing-file metadata, and — reconstructed from the active
@@ -17,10 +21,6 @@ import (
 // for the writer, NOT a general `qemu-img check` replacement — an image using
 // features this writer never produces (internal snapshots, bitmaps, external data
 // files) could legitimately have refcounts this reconstruction does not model.
-// checkModelledIncompat is the incompatible feature bits Check's layout model
-// holds for: dirty (0), corrupt (1) and compression type (3).
-const checkModelledIncompat = 1<<0 | 1<<1 | 1<<3
-
 func Check(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

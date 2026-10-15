@@ -58,6 +58,20 @@ func TestResizeVMLive_GrowAtNonZeroOwnerEpochReleasesHostReservation(t *testing.
 	if got := rows[0].String("idempotency_key"); got != "k-ep" {
 		t.Errorf("resize header idempotency_key = %q, want %q", got, "k-ep")
 	}
+	// Every step — the admission's reserved and admitted as well as the
+	// workload's own — is at the header's epoch. A step at any other epoch is
+	// the shape of a leaked reservation.
+	off, err := s.db.Query(ctx, `SELECT s.owner_epoch, s.step_name FROM operation_steps s
+		JOIN operations o ON o.id = s.operation_id
+		WHERE o.resource_id = 'ep' AND o.method = 'ResizeVMLive' AND s.owner_epoch != o.vm_owner_epoch
+		  AND s.deleted_at IS NULL AND o.deleted_at IS NULL`)
+	if err != nil {
+		t.Fatalf("query steps: %v", err)
+	}
+	for _, r := range off {
+		t.Errorf("resize step %s at owner epoch %d, want every step at the header's epoch 1",
+			r.String("step_name"), r.Int64("owner_epoch"))
+	}
 }
 
 // While a grow at a non-zero owner epoch is in flight, its reservation must
@@ -139,5 +153,69 @@ func TestResizeVMLive_RefusedGrowAtNonZeroOwnerEpochReleasesItsReservation(t *te
 	if cpu != 0 || mem != 0 {
 		t.Fatalf("after a refused grow the host still holds %d vCPU/%d MiB in nonterminal reservations, want 0/0 — "+
 			"the refusal's release did not terminate the reservation", cpu, mem)
+	}
+}
+
+// A same-key retry of a resize that was refused reaches the header the first
+// attempt wrote: the same request is refused as already decided, a different
+// one as a reused key — never an internal primary-key error — and neither
+// touches the first attempt's reservation.
+func TestResizeVMLive_SameKeyRetryReachesTheExistingHeader(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", CPUTotal: 64, MemTotal: 4200, State: "HOST_ACTIVE",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	seedRunningVM(t, s, "rk", &pb.VMSpec{Name: "rk", Cpu: 2, MaxCpu: 8, MemoryMib: 2048, MinMemoryMib: 1024, MaxMemoryMib: 8192}, 2, 2048)
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 1 WHERE name = 'rk'`); err != nil {
+		t.Fatalf("set owner epoch: %v", err)
+	}
+	if err := s.resizeVMLive(ctx, "rk", &pb.VMSpec{Cpu: 2, MemoryMib: 8192}, "k-rk"); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("first attempt: got %v, want ResourceExhausted", err)
+	}
+
+	err := s.resizeVMLive(ctx, "rk", &pb.VMSpec{Cpu: 2, MemoryMib: 8192}, "k-rk")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("same-key retry of the same resize: got %v, want FailedPrecondition", err)
+	}
+	err = s.resizeVMLive(ctx, "rk", &pb.VMSpec{Cpu: 2, MemoryMib: 4096}, "k-rk")
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("same key, different resize: got %v, want AlreadyExists", err)
+	}
+	if cpu, mem, err := corrosion.HostReserved(ctx, s.db, "test-host"); err != nil || cpu != 0 || mem != 0 {
+		t.Fatalf("after the retries the host holds %d vCPU/%d MiB (err %v), want 0/0", cpu, mem, err)
+	}
+	rows, err := s.db.Query(ctx, `SELECT step_name FROM operation_steps s JOIN operations o ON o.id = s.operation_id
+		WHERE o.resource_id = 'rk' AND s.deleted_at IS NULL`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 { // the first attempt's reserved + its release
+		t.Fatalf("the retries wrote steps on the first attempt's operation: %d steps, want 2", len(rows))
+	}
+}
+
+// A grow admitted but then not begun — another operation took the VM's barrier
+// in between — releases its reservation at the operation's epoch on the way out.
+func TestResizeVMLive_BeginNotAppliedAtNonZeroOwnerEpochReleasesItsReservation(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	seedRunningVM(t, s, "bn", &pb.VMSpec{Name: "bn", Cpu: 2, MaxCpu: 8, MemoryMib: 2048, MinMemoryMib: 1024, MaxMemoryMib: 8192}, 2, 2048)
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 1 WHERE name = 'bn'`); err != nil {
+		t.Fatalf("set owner epoch: %v", err)
+	}
+	s.admissionVerifiedHook = func(string) {
+		if err := s.db.Execute(ctx, `UPDATE vms SET active_operation_id = 'someone-else' WHERE name = 'bn'`); err != nil {
+			t.Errorf("take the barrier: %v", err)
+		}
+	}
+	err := s.resizeVMLive(ctx, "bn", &pb.VMSpec{Cpu: 2, MemoryMib: 2560}, "k-bn")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("grow whose Begin is not applied: got %v, want FailedPrecondition", err)
+	}
+	if cpu, mem, err := corrosion.HostReserved(ctx, s.db, "test-host"); err != nil || cpu != 0 || mem != 0 {
+		t.Fatalf("after a grow that never began the host holds %d vCPU/%d MiB (err %v), want 0/0", cpu, mem, err)
 	}
 }

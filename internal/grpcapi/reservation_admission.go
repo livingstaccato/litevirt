@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -305,11 +306,15 @@ func (s *Server) admitGrowWithReservation(
 		cpuDelta, memDelta, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, true, intentResourceGrow)
 }
 
-// admitWithReservationID is admitWithReservation with an explicit operation ID.
+// admitWithReservationID is admitWithReservation with an explicit operation ID,
+// for tests that need claims with chosen ids to order them.
 //
-// This exists for paths where the operation identity is already known (for
-// example, ResizeVMLive derives a deterministic ID from an idempotency key and
-// then needs admission/verification to participate in the same winner election).
+// It writes a CAPACITY lease: a capacity-kind header at owner epoch 0, which the
+// stale-lease sweep expires. Never pass it a workload operation's id. A
+// workload operation's reservation must be written as that operation's header,
+// at the VM's owner epoch (admitResizeReservation); a capacity lease under its
+// id would be expired from under it, and its terminal steps — at the VM's
+// epoch — would never release one at epoch 0.
 func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
@@ -553,8 +558,21 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 	verify func(opID string) error) (*reservationLease, error) {
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+	// A deterministic id (a resize's, from its idempotency key) can already have
+	// a header from an earlier attempt. That attempt's claim is its own: it is
+	// neither re-decided nor released here, and the retry is refused.
+	existing, created, err := corrosion.ClaimOrFindOperation(ctx, s.db, op)
+	if errors.Is(err, corrosion.ErrOperationHashConflict) {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"%s: idempotency key already used for a different request (operation %s)", what, op.ID)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
+	}
+	if !created {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s: an earlier request with the same idempotency key already decided operation %s (%s); "+
+				"retry with a new idempotency key", what, op.ID, operationStateAt(ctx, s.db, existing))
 	}
 	// Every step of the claim — reserved, admitted, and the release's terminal —
 	// is written at the header's owner epoch, because aggregation reduces an
@@ -746,4 +764,22 @@ func (s *Server) admitQuotaWithReservation(
 	return s.decideReservation(ctx, op, project, "reserve project quota", func(id string) error {
 		return s.checkProjectQuotaBefore(ctx, project, delta, id)
 	})
+}
+
+// operationStateAt describes an operation's state at its header's owner epoch,
+// for a refusal message.
+func operationStateAt(ctx context.Context, db *corrosion.Client, op *corrosion.OperationRecord) string {
+	steps, err := corrosion.ListOperationSteps(ctx, db, op.ID, op.VMOwnerEpoch)
+	if err != nil {
+		return "state unreadable"
+	}
+	names := make([]string, len(steps))
+	for i, st := range steps {
+		names[i] = st.StepName
+	}
+	state, _ := corrosion.ReduceOperationState(corrosion.OperationKind(op.OperationKind), names)
+	if state == "" {
+		state = "no steps"
+	}
+	return "state " + state
 }

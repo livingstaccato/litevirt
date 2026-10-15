@@ -507,6 +507,9 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 			// The same Prepare again: the promise is already on disk.
 		default:
 			row.Promised = b
+			if key.IsAutomation() && row.ConfigGeneration != gen {
+				row.Accept = nil // a retained acceptance's signature binds its old generation
+			}
 			row.ConfigGeneration = gen
 			if err := saveClaimRowTx(ctx, tx, row); err != nil {
 				return err

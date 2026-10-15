@@ -200,6 +200,7 @@ func TestAutomationCorruptionNeverAbsence(t *testing.T) {
 	for _, damage := range []string{
 		"value_json=''", "value_digest='wrong'", "accepted_round=0,accepted_coord='',accepted_nonce=x''",
 		"value_json='{}'", "value_json=replace(value_json,'envelope','unknown')", "accept_json='{}'",
+		"config_generation=7",
 	} {
 		t.Run(damage, func(t *testing.T) {
 			_, a, _, _ := threeVoters(t)
@@ -414,6 +415,65 @@ func TestAutomationImportHigherPromiseOverLocalAcceptance(t *testing.T) {
 	st, found, err := a.c.ClaimState(ctx, key)
 	if err != nil || !found || !st.Promised.Equal(promise.Promised) || !st.Accepted.Equal(testBallot(2, "a")) || !reflect.DeepEqual(st.Value, &v) || st.Accept != nil {
 		t.Fatal("import lost local complete decision or retained stale signature", err)
+	}
+}
+
+// Mutation: retain an old-generation signature when Prepare advances a healthy
+// accepted row that an unchanged import left at its original generation.
+func TestAutomationPrepareAndRecertifyAfterUnchangedImport(t *testing.T) {
+	for _, identicalState := range []bool{false, true} {
+		name := "empty-import"
+		if identicalState {
+			name = "equal-state-import"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, a, b, c := threeVoters(t)
+			ctx := context.Background()
+			key, value := automationFixture(t, 1, "")
+			installAutomationEvidence(t, a.c, key, "", 1)
+			oldBallot := testBallot(2, "a")
+			accepted, err := a.c.ClaimAccept(ctx, key, oldBallot, value, 1, a.signer, nil)
+			if err != nil || !accepted.Accepted || accepted.Accept == nil {
+				t.Fatal("initial acceptance", err)
+			}
+			before, found, err := a.c.ClaimState(ctx, key)
+			if err != nil || !found {
+				t.Fatal("initial state", err)
+			}
+			next := VoterConfigValue{Generation: 2, Members: membersOf(a, b, c), Change: VoterChangeGenesis, CreatedBy: "t", CreatedAt: "t"}
+			if err := WriteVoterConfig(ctx, a.c, next, ClaimCertificate{}); err != nil {
+				t.Fatal(err)
+			}
+			var states []ClaimVoterState
+			if identicalState {
+				states = []ClaimVoterState{before}
+			}
+			if n, err := a.c.ImportClaimsAndAdopt(ctx, 2, []string{"a", "b"}, states); err != nil || n != 0 {
+				t.Fatal("unchanged import", n, err)
+			}
+			installAutomationEvidence(t, a.c, key, "", 2)
+			newBallot := testBallot(3, "a")
+			prepared, err := a.c.ClaimPrepare(ctx, key, newBallot, 2)
+			if err != nil || !prepared.Promised {
+				t.Fatal("prepare after unchanged import", prepared.Refusal, err)
+			}
+			preparedState, found, err := a.c.ClaimState(ctx, key)
+			if err != nil || !found || !preparedState.Promised.Equal(newBallot) || !preparedState.Accepted.Equal(oldBallot) ||
+				!reflect.DeepEqual(preparedState.Value, &value) || preparedState.ValueDigest != before.ValueDigest ||
+				preparedState.ConfigGeneration != 2 || preparedState.Accept != nil {
+				t.Fatal("prepare lost the accepted decision or retained a stale signature", err)
+			}
+			recertified, err := a.c.ClaimAccept(ctx, key, newBallot, value, 2, a.signer, nil)
+			if err != nil || !recertified.Accepted || recertified.Accept == nil ||
+				recertified.Accept.ConfigGeneration != 2 || recertified.Accept.ValueDigest != before.ValueDigest {
+				t.Fatal("re-certification after unchanged import", err)
+			}
+			final, found, err := a.c.ClaimState(ctx, key)
+			if err != nil || !found || !final.Accepted.Equal(newBallot) || !reflect.DeepEqual(final.Value, &value) ||
+				final.ValueDigest != before.ValueDigest || !reflect.DeepEqual(final.Accept, recertified.Accept) {
+				t.Fatal("re-certified decision not durable", err)
+			}
+		})
 	}
 }
 

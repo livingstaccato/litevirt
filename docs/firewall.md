@@ -855,6 +855,27 @@ reconciler picks them up on its next poll (or immediately via
 rules, host-tier rules, ipsets, and default-deny policy are also persisted in
 cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
 
+## Rule macros
+
+`--macro <name>` on `lv sg rule-add`, `lv firewall cluster-rule add` and
+`lv firewall host-rule add` adds one ordinary rule per row of a named macro.
+`lv firewall macros` lists the catalog. Names are case-insensitive. A macro row
+is a tcp or udp destination port; there is no ICMP macro.
+
+- `--macro` cannot be combined with `--proto` or `--port`.
+- `--direction`, `--cidr`, `--action` and `--priority` apply to every row.
+- The CLI expands the macro and makes one call per row, printing every rule id.
+  Nothing records the macro name on the stored rule. If a call fails, the rows
+  already created are removed.
+- Cluster and host rows carry the comment `macro <NAME>` unless `--comment` is
+  given. Security-group rules have no comment column.
+
+```
+lv sg rule-add web --macro SSH --cidr @admins
+lv firewall cluster-rule add --macro DNS --direction egress
+lv firewall host-rule add --host node-1 --macro HTTPS
+```
+
 ## Audit trail
 
 Every firewall-policy change made through the daemon lands in the signed

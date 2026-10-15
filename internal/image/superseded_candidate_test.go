@@ -13,6 +13,10 @@ import (
 //
 // Mutation: drop the set-aside-name skip in VMDiskCandidates — the copy is a
 // candidate and the test is red.
+//
+// A disk a create moved aside because a deleted VM was kept with it
+// (<disk>.kept-<time>) is never a candidate either: only an operator removes
+// it. Mutation: drop the .kept- skip — red.
 func TestVMDiskCandidates_NeverListsASetAsideCopy(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(dir)
@@ -25,7 +29,8 @@ func TestVMDiskCandidates_NeverListsASetAsideCopy(t *testing.T) {
 	}
 	disk := filepath.Join(legacyDir, "root.qcow2")
 	aside := disk + ".superseded-20261001T000000.000000000Z"
-	for _, p := range []string{disk, aside} {
+	kept := disk + ".kept-20261001T000000.000000000Z"
+	for _, p := range []string{disk, aside, kept} {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -35,8 +40,8 @@ func TestVMDiskCandidates_NeverListsASetAsideCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range got {
-		if c == aside {
-			t.Fatalf("candidates %v include the set-aside copy", got)
+		if c == aside || c == kept {
+			t.Fatalf("candidates %v include a set-aside or kept copy", got)
 		}
 	}
 	if len(got) != 1 || got[0] != disk {

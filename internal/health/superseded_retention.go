@@ -19,7 +19,8 @@ import (
 // A failover start sets an old copy of a host-local disk aside as
 // <path>.superseded-<time> (superseded_disk.go) rather than deleting it, and
 // a host that comes back after a failover moved its VM elsewhere sets the
-// VM's real disk aside the same way (stranded_disk.go). Each copy is an
+// VM's real disk aside the same way (stranded_disk.go), also once the VM is
+// deleted (deleted_vm_residue.go). Each copy is an
 // independent line of the VM's data — every failover rebuilds the disk from
 // its image — so any one of them can be the only copy of what the VM held
 // before a failover.
@@ -230,6 +231,66 @@ func listSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir stri
 	return out, noAnswer, nil
 }
 
+// KeptCopy is a disk an earlier VM of a name was deleted with and its delete
+// kept, which a create of the name moved off its path (<path>.kept-<time>,
+// SetAsideBeforeCreate). Nothing on the host removes it, and no purge,
+// removal or restore of set-aside copies takes it.
+type KeptCopy struct {
+	Path      string    // the file
+	DiskPath  string    // the path it was moved from
+	MovedAt   time.Time // when
+	SizeBytes int64
+}
+
+// ListKeptDisks lists the .kept- files on this host, where set-aside copies
+// can be (supersededDirs), oldest first. Storage that does not answer fails
+// the listing, as it fails ListSupersededDisks.
+func ListKeptDisks(ctx context.Context, db *corrosion.Client, dataDir string) ([]KeptCopy, error) {
+	dirs, err := supersededDirs(ctx, db, dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("list disk directories: %w", err)
+	}
+	glob := supersededGlob
+	var out []KeptCopy
+	for _, dir := range dirs {
+		pattern := filepath.Join(dir, "*"+keptInfix+"*")
+		matches, err := storage.Bounded("list the kept disks in", dir, func() ([]string, error) { return glob(pattern) })
+		if err != nil {
+			return nil, fmt.Errorf("list kept disks: %w", err)
+		}
+		for _, p := range matches {
+			i := strings.LastIndex(p, keptInfix)
+			at, perr := time.Parse(supersededTimeLayout, p[i+len(keptInfix):])
+			if i <= 0 || perr != nil {
+				continue
+			}
+			fi, err := lstatSetAside(p)
+			if storage.IsFSNoAnswer(err) {
+				return nil, fmt.Errorf("list kept disks: %w", err)
+			}
+			if err != nil || !fi.Mode().IsRegular() {
+				continue
+			}
+			out = append(out, KeptCopy{Path: p, DiskPath: p[:i], MovedAt: at, SizeBytes: fi.Size()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].MovedAt.Equal(out[j].MovedAt) {
+			return out[i].MovedAt.Before(out[j].MovedAt)
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out, nil
+}
+
+// keptHint is what a refusal adds for a .kept- file named as a copy.
+func keptHint(p string) string {
+	if !strings.Contains(filepath.Base(p), keptInfix) {
+		return ""
+	}
+	return "; it is a disk a deleted VM was kept with, which only an operator removes, by hand"
+}
+
 // PurgeSupersededDisks removes the set-aside copies on this host that are
 // older than olderThan at now and neither retained nor held, and returns
 // them. olderThan 0 removes every such copy. It is both the hourly sweep and
@@ -295,7 +356,7 @@ func RemoveSupersededDisks(ctx context.Context, db *corrosion.Client, dataDir st
 	for _, p := range paths {
 		c, ok := byPath[filepath.Clean(p)]
 		if !ok {
-			return removed, fmt.Errorf("%s is not a superseded disk copy on this host (lv host superseded-disks lists them)", p)
+			return removed, fmt.Errorf("%s is not a superseded disk copy on this host (lv host superseded-disks lists them)%s", p, keptHint(p))
 		}
 		if c.Held != "" {
 			return removed, fmt.Errorf("%s is held (%s): a failed or unfinished start may need it", p, c.Held)

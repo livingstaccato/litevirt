@@ -215,6 +215,7 @@ message SupersededDisk {
     string held         = 7;  // why it is kept even from a named removal; "" when not held
     bool   removed      = 8;  // removed by this request
     string retained     = 9;  // why the sweep and a bare purge keep it (its VM exists); "" when not retained
+    bool   kept         = 10; // a disk a deleted VM was kept with, moved off its path by a create (<path>.kept-<time>): listed only, never purged, removed or restored
 }
 message SupersededDisksResponse {
     string                  host           = 1;

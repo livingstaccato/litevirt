@@ -1410,6 +1410,37 @@ The restart is not silent, and the real disk is not lost:
   running there or holds a saved state.
 - An old copy that a restart sets aside, as above, is recorded the same way on
   the host that holds it.
+- When the VM is deleted (`lv rm`, with or without `--keep-disks`), the host
+  that holds its disk clears the record on its next pass, or once it is back
+  if it was down then. After `lv rm`, a disk still at its path is renamed to
+  `<disk path>.superseded-<time>` first, so it is kept like any other copy;
+  this waits while a domain of the VM's name runs on that host. After
+  `lv rm --keep-disks`, and for a disk recorded `delete_with_vm=false`, the
+  disk stays at its path. It also stays there when the record does not say
+  what the delete decided: a delete by an earlier release, or one whose mark
+  on the record was lost to a later write of it. The host also removes the
+  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
+  a seed from an earlier release stays.
+- A VM of the same name created on that host before then clears
+  `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
+  disk that a failover left at its path is first renamed to
+  `<disk path>.superseded-<time>`. One the delete kept is first renamed to
+  `<disk path>.kept-<time>`, which no sweep removes. A file that another VM
+  uses, as its disk or as the base of a linked clone, stays where it is.
+  Each rename is a `vm.disk.set_aside` or `vm.disk.kept` event of the VM.
+  The create is refused, and nothing is created, while that host's replica
+  has not caught up with the cluster and such a file is there, while what is
+  at one of those paths cannot be read, or when a rename fails. The message
+  names the path and the cause. Retry once the replica has caught up or the
+  storage answers, or place the VM on another host. A path that does not
+  exist does not refuse the create. When the record lists a path that does
+  not exist and its directory is absent, empty or cannot be listed, as a
+  volume not mounted yet reads, the create goes ahead, the record stays open,
+  and a `vm.disk.path_missing` event of the VM names the path.
+
+A cloud-init seed is used only by the VM it was written for: a host that
+holds the seed of a deleted VM writes a new one from the VM's own settings
+when another VM of that name starts there, fails over to it or migrates to it.
 
 A copy is retained while the VM it came from exists, in any state: the host
 never removes it on its own. While that VM is in `error`, `pending` or
@@ -1423,7 +1454,8 @@ rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
 and whether it is retained or held, run `lv host superseded-disks <host>`.
-These need the admin role and are audited:
+It also lists each `.kept-` file there, marked `kept`, which none of the
+options below takes. The options need the admin role and are audited:
 
 - `--purge` removes every copy that is neither retained nor held, whatever its
   age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).

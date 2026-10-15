@@ -3,6 +3,7 @@ package capabilities
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"testing"
@@ -126,7 +127,7 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	// The firewall extras.
 	FeatureFirewallSynflood:  {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)"},
 	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy", Writers: firewallRuleWriters},
-	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallRuleWriters},
+	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses", Writers: firewallTagGroupWriters},
 }
 
 // firewallRuleWriters write the three rule tables. Each takes one grant per
@@ -137,6 +138,12 @@ var firewallRuleWriters = []string{
 	"internal/corrosion.InsertClusterFirewallRuleWithGrant",
 	"internal/corrosion.InsertHostFirewallRuleWithGrant",
 }
+
+// firewallTagGroupWriters write firewall_tag_groups' data: the rule tables
+// (a rule matching a tag group) and the tag-group rows.
+var firewallTagGroupWriters = append(slices.Clone(firewallRuleWriters),
+	"internal/corrosion.SetFirewallTagGroup",
+)
 
 // containerReplicationWriters write container_replication's data: a container's
 // replication schedule row, its direction switch, and a run's replica.

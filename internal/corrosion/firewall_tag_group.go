@@ -1,0 +1,574 @@
+package corrosion
+
+// Firewall tag groups (docs/design: firewall extras spec §4): a named selector
+// over workloads' firewall tags. Each group is one cluster_policies row
+// firewall_tag_group/<name>, written only by SetFirewallTagGroup through the
+// table's one upsert, so no new statement shape. The row is data of the
+// firewall_tag_groups release feature, so its writer takes that feature's
+// grant.
+//
+// ListTagGroupMembers resolves every group to its member workloads and their
+// addresses. Membership is decided ONLY by a workload's firewall identity
+// (fw_id: VMSpec.firewall_id, containers.create_spec fw_id) and the firewall
+// tags row keyed by it (firewall_tags/vm|ct/<fw_id>); no name, host or MAC is
+// matched to decide WHO is a member. A member's addresses are ONLY the live
+// ip_allocations leases litevirt's allocators wrote for it: owned by the
+// member, and matching a live NIC of the member on the lease's network by
+// MAC. A NIC row's ip (SetVMIP, guest discovery, a static address), a
+// litevirt.ip label and a guard's Known and Allowed never count.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/netip"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
+)
+
+const (
+	// FirewallTagGroupKeyPrefix starts a group's cluster_policies key.
+	FirewallTagGroupKeyPrefix = "firewall_tag_group/"
+	// FirewallTagsKeyPrefix starts a workload's firewall-tags key:
+	// firewall_tags/vm/<fw_id> or firewall_tags/ct/<fw_id>.
+	FirewallTagsKeyPrefix = "firewall_tags/"
+
+	// TagMemberVM and TagMemberCT are a member's kind, and the kind segment
+	// of its firewall-tags key.
+	TagMemberVM = "vm"
+	TagMemberCT = "ct"
+)
+
+var (
+	firewallTagGroupNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
+	firewallTagWordRE      = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,62}$`)
+	firewallIDRE           = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
+
+// ValidFirewallTagGroupName reports whether name is a group name:
+// [a-z][a-z0-9_]{0,30}. It becomes the nft set name lv_tg_<name>.
+func ValidFirewallTagGroupName(name string) bool { return firewallTagGroupNameRE.MatchString(name) }
+
+// ValidFirewallTagWord reports whether s is a firewall tag key or value:
+// [a-z0-9][a-z0-9_.-]{0,62}.
+func ValidFirewallTagWord(s string) bool { return firewallTagWordRE.MatchString(s) }
+
+// ValidFirewallID reports whether id is a firewall identity as the server
+// mints it: 32 lower-case hex characters.
+func ValidFirewallID(id string) bool { return firewallIDRE.MatchString(id) }
+
+// FirewallTagGroupDef is a group's stored definition.
+type FirewallTagGroupDef struct {
+	// Match is ANDed: each key must be among the workload's tags, with an
+	// equal value, or with any value when the match value is "".
+	Match map[string]string `json:"match"`
+	// Networks limits the group BINDING to these networks; empty, every
+	// network. It does not limit the address set.
+	Networks []string `json:"networks"`
+	// SecurityGroups are bound to every NIC of every member the binding
+	// covers.
+	SecurityGroups []string `json:"security_groups"`
+}
+
+// FirewallTagGroup is one group row as this replica holds it.
+type FirewallTagGroup struct {
+	Name      string
+	Def       FirewallTagGroupDef
+	SetBy     string
+	UpdatedAt string
+	// Unreadable: the row is malformed JSON, has a field of the wrong type,
+	// or names a selector outside the grammar (no match, or a key or value
+	// outside it), or its key's name is outside the group-name grammar. It
+	// has no members and binds nothing; Def is empty.
+	Unreadable bool
+}
+
+// Matches reports whether tags satisfy the group's selector. An unreadable
+// group, or one with no match, matches nothing.
+func (g FirewallTagGroup) Matches(tags map[string]string) bool {
+	if g.Unreadable || len(g.Def.Match) == 0 {
+		return false
+	}
+	for k, want := range g.Def.Match {
+		have, ok := tags[k]
+		if !ok || (want != "" && have != want) {
+			return false
+		}
+	}
+	return true
+}
+
+// BindsNetwork reports whether the group's binding covers network.
+func (g FirewallTagGroup) BindsNetwork(network string) bool {
+	if g.Unreadable {
+		return false
+	}
+	return len(g.Def.Networks) == 0 || slices.Contains(g.Def.Networks, network)
+}
+
+// normaliseTagGroupDef checks def against the grammar and returns it with its
+// lists de-duplicated and sorted.
+func normaliseTagGroupDef(def FirewallTagGroupDef) (FirewallTagGroupDef, error) {
+	if len(def.Match) == 0 {
+		return def, errors.New("a tag group needs at least one match")
+	}
+	match := make(map[string]string, len(def.Match))
+	for k, v := range def.Match {
+		if !ValidFirewallTagWord(k) {
+			return def, fmt.Errorf("match key %q: want [a-z0-9][a-z0-9_.-]{0,62}", k)
+		}
+		if v != "" && !ValidFirewallTagWord(v) {
+			return def, fmt.Errorf("match value %q of %q: want [a-z0-9][a-z0-9_.-]{0,62}, or none for \"has the key\"", v, k)
+		}
+		match[k] = v
+	}
+	list := func(what string, in []string) ([]string, error) {
+		var out []string
+		for _, s := range in {
+			if strings.TrimSpace(s) == "" || s != strings.TrimSpace(s) {
+				return nil, fmt.Errorf("%s %q: empty or padded", what, s)
+			}
+			out = append(out, s)
+		}
+		slices.Sort(out)
+		return slices.Compact(out), nil
+	}
+	nets, err := list("network", def.Networks)
+	if err != nil {
+		return def, err
+	}
+	sgs, err := list("security group", def.SecurityGroups)
+	if err != nil {
+		return def, err
+	}
+	return FirewallTagGroupDef{Match: match, Networks: nets, SecurityGroups: sgs}, nil
+}
+
+// SetFirewallTagGroup writes group name's definition; a nil def removes the
+// group (the row's value becomes ""). It takes the firewall_tag_groups grant,
+// refuses a name or definition outside the grammar, and refuses with
+// ErrClusterPolicyGateClosed until failover_scope_v1 has latched. The caller
+// (the gRPC handler) owns authorisation, audit, and the references a removal
+// must not strand.
+func SetFirewallTagGroup(ctx context.Context, c *Client, g capabilities.FeatureGrant, name string, def *FirewallTagGroupDef, setBy string) error {
+	if err := g.Check(capabilities.FeatureFirewallTagGroups); err != nil {
+		return err
+	}
+	if !ValidFirewallTagGroupName(name) {
+		return fmt.Errorf("tag group name %q: want [a-z][a-z0-9_]{0,30}", name)
+	}
+	value := ""
+	if def != nil {
+		norm, err := normaliseTagGroupDef(*def)
+		if err != nil {
+			return fmt.Errorf("tag group %s: %w", name, err)
+		}
+		if norm.Networks == nil {
+			norm.Networks = []string{}
+		}
+		if norm.SecurityGroups == nil {
+			norm.SecurityGroups = []string{}
+		}
+		b, err := json.Marshal(norm)
+		if err != nil {
+			return err
+		}
+		value = string(b)
+	}
+	if !c.MayWriteClusterPolicy() {
+		return ErrClusterPolicyGateClosed
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, FirewallTagGroupKeyPrefix+name, value, setBy, c.NowTS())
+}
+
+// decodeTagGroup reads one group row. Decoding is lenient: an unknown field
+// is ignored, so a later release that adds one does not make the row
+// unreadable here.
+func decodeTagGroup(name, value, setBy, updatedAt string) FirewallTagGroup {
+	g := FirewallTagGroup{Name: name, SetBy: setBy, UpdatedAt: updatedAt}
+	var def FirewallTagGroupDef
+	if !ValidFirewallTagGroupName(name) || json.Unmarshal([]byte(value), &def) != nil {
+		g.Unreadable = true
+		return g
+	}
+	norm, err := normaliseTagGroupDef(def)
+	if err != nil {
+		g.Unreadable = true
+		return g
+	}
+	g.Def = norm
+	return g
+}
+
+// ListFirewallTagGroups returns every group this replica holds, sorted by
+// name, unreadable ones included. A removed group (value "") is not listed.
+func ListFirewallTagGroups(ctx context.Context, c *Client) ([]FirewallTagGroup, error) {
+	lo, hi := keyRange(FirewallTagGroupKeyPrefix)
+	rows, err := c.Query(ctx,
+		`SELECT key, value, set_by, updated_at FROM cluster_policies
+		 WHERE key >= ? AND key < ? AND deleted_at IS NULL ORDER BY key`, lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	var out []FirewallTagGroup
+	for _, r := range rows {
+		name := strings.TrimPrefix(r.String("key"), FirewallTagGroupKeyPrefix)
+		value := r.String("value")
+		if value == "" {
+			continue
+		}
+		out = append(out, decodeTagGroup(name, value, r.String("set_by"), r.String("updated_at")))
+	}
+	return out, nil
+}
+
+// GetFirewallTagGroup returns group name; ok is false when it does not exist
+// or was removed.
+func GetFirewallTagGroup(ctx context.Context, c *Client, name string) (FirewallTagGroup, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT value, set_by, updated_at FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`,
+		FirewallTagGroupKeyPrefix+name)
+	if err != nil || len(rows) == 0 || rows[0].String("value") == "" {
+		return FirewallTagGroup{}, false, err
+	}
+	return decodeTagGroup(name, rows[0].String("value"), rows[0].String("set_by"), rows[0].String("updated_at")), true, nil
+}
+
+// TagGroupAddr is one member address: a host address inside its network's
+// subnet.
+type TagGroupAddr struct {
+	Network string
+	Addr    netip.Addr
+}
+
+// TagGroupMember is one workload a group matches.
+type TagGroupMember struct {
+	Kind string // TagMemberVM or TagMemberCT
+	Name string
+	Host string // the container's host; "" for a VM
+	FWID string
+	// Addrs are the member's qualifying leases, sorted. Empty: no allocated
+	// address, so it contributes nothing to the set.
+	Addrs []TagGroupAddr
+	// Bound are the networks of the member's live NICs the group's binding
+	// covers, sorted.
+	Bound []string
+}
+
+// TagGroupView is one group and its members, sorted by kind, host, name.
+type TagGroupView struct {
+	Group   FirewallTagGroup
+	Members []TagGroupMember
+}
+
+// TagWorkload names a live workload the membership read could not admit.
+type TagWorkload struct {
+	Kind, Name, Host, FWID string
+	// Networks are the networks of its live NICs, sorted.
+	Networks []string
+}
+
+// TagGroupMembership is one read of every group's members.
+type TagGroupMembership struct {
+	// Groups is every group, sorted by name; an unreadable one has no
+	// members.
+	Groups []TagGroupView
+	// Skipped counts the members' lease addresses left out because they do
+	// not parse as an address or do not lie inside their network's subnet.
+	Skipped int
+	// TagsUnreadable are live workloads whose firewall-tags row cannot be
+	// read. They are members of nothing.
+	TagsUnreadable []TagWorkload
+	// SharedFWID are live workloads of one kind that carry the same fw_id.
+	// No carry leaves two live holders of one identity, so this is never the
+	// server's doing; neither is a member.
+	SharedFWID []TagWorkload
+}
+
+type tagWorkloadKey struct{ kind, host, name string }
+
+type tagWorkload struct {
+	tagWorkloadKey
+	fwID string
+	nics []tagNIC
+}
+
+type tagNIC struct{ network, mac string }
+
+// firewallTagsValue is a firewall-tags row's value. name and host are for
+// display only and never matched.
+type firewallTagsValue struct {
+	Tags map[string]string `json:"tags"`
+}
+
+type tagsRow struct {
+	tags       map[string]string
+	unreadable bool
+}
+
+// ListTagGroupMembers resolves every group on this replica to its members.
+// It reads nothing beyond the groups when no group exists.
+func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, error) {
+	groups, err := ListFirewallTagGroups(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := &TagGroupMembership{}
+	if len(groups) == 0 {
+		return out, nil
+	}
+	tags, err := readFirewallTagsRows(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	workloads, err := readTagWorkloads(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	leases, err := c.Query(ctx,
+		`SELECT network, ip, mac, vm_name, owner_kind, owner_host FROM ip_allocations WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	subnets, err := NetworkSubnets(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+
+	// One identity, one live holder per kind; a shared one admits neither.
+	holders := map[string]int{}
+	for _, w := range workloads {
+		if w.fwID != "" {
+			holders[w.kind+"/"+w.fwID]++
+		}
+	}
+
+	// The candidates: live workloads with a unique identity and readable,
+	// non-empty tags.
+	type candidate struct {
+		w    *tagWorkload
+		tags map[string]string
+	}
+	byKey := map[tagWorkloadKey]*candidate{}
+	var cands []*candidate
+	for _, w := range workloads {
+		if w.fwID == "" {
+			continue
+		}
+		if holders[w.kind+"/"+w.fwID] > 1 {
+			out.SharedFWID = append(out.SharedFWID, w.public())
+			continue
+		}
+		row, ok := tags[w.kind+"/"+w.fwID]
+		if !ok {
+			continue
+		}
+		if row.unreadable {
+			out.TagsUnreadable = append(out.TagsUnreadable, w.public())
+			continue
+		}
+		if len(row.tags) == 0 {
+			continue
+		}
+		cd := &candidate{w: w, tags: row.tags}
+		byKey[w.tagWorkloadKey] = cd
+		cands = append(cands, cd)
+	}
+
+	// Each candidate's addresses: its own leases on a live NIC of its own.
+	addrs := map[tagWorkloadKey][]TagGroupAddr{}
+	for _, r := range leases {
+		// Owned by the member: kind, host ("" for a VM) and name, exactly.
+		key := tagWorkloadKey{kind: r.String("owner_kind"), host: r.String("owner_host"), name: r.String("vm_name")}
+		cd, ok := byKey[key]
+		if !ok {
+			continue
+		}
+		network := r.String("network")
+		mac := strings.ToLower(r.String("mac"))
+		if mac == "" || !slices.Contains(cd.w.nics, tagNIC{network: network, mac: mac}) {
+			continue
+		}
+		a, ok := leaseElement(r.String("ip"), subnets[network])
+		if !ok {
+			out.Skipped++
+			continue
+		}
+		addrs[key] = append(addrs[key], TagGroupAddr{Network: network, Addr: a})
+	}
+
+	for _, g := range groups {
+		v := TagGroupView{Group: g}
+		for _, cd := range cands {
+			if !g.Matches(cd.tags) {
+				continue
+			}
+			m := TagGroupMember{Kind: cd.w.kind, Name: cd.w.name, Host: cd.w.host, FWID: cd.w.fwID}
+			m.Addrs = slices.Clone(addrs[cd.w.tagWorkloadKey])
+			sort.Slice(m.Addrs, func(i, j int) bool {
+				if m.Addrs[i].Network != m.Addrs[j].Network {
+					return m.Addrs[i].Network < m.Addrs[j].Network
+				}
+				return m.Addrs[i].Addr.Less(m.Addrs[j].Addr)
+			})
+			m.Addrs = slices.Compact(m.Addrs)
+			for _, n := range cd.w.networks() {
+				if g.BindsNetwork(n) {
+					m.Bound = append(m.Bound, n)
+				}
+			}
+			v.Members = append(v.Members, m)
+		}
+		out.Groups = append(out.Groups, v)
+	}
+	return out, nil
+}
+
+// leaseElement parses a lease's address and checks it lies inside subnet. A
+// lease keyed with its mask (written before normalisation) is its host
+// address. Only an IPv4 address with no zone inside a parseable IPv4 subnet
+// qualifies.
+func leaseElement(ip, subnet string) (netip.Addr, bool) {
+	pfx, err := netip.ParsePrefix(subnet)
+	if err != nil || !pfx.Addr().Is4() {
+		return netip.Addr{}, false
+	}
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		p, perr := netip.ParsePrefix(ip)
+		if perr != nil {
+			return netip.Addr{}, false
+		}
+		a = p.Addr()
+	}
+	if !a.Is4() || a.Zone() != "" || !pfx.Masked().Contains(a) {
+		return netip.Addr{}, false
+	}
+	return a, true
+}
+
+func (w *tagWorkload) networks() []string {
+	var out []string
+	for _, n := range w.nics {
+		out = append(out, n.network)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+func (w *tagWorkload) public() TagWorkload {
+	return TagWorkload{Kind: w.kind, Name: w.name, Host: w.host, FWID: w.fwID, Networks: w.networks()}
+}
+
+// readFirewallTagsRows reads every firewall-tags row, keyed "<kind>/<fw_id>".
+// A row whose key names no kind is ignored (one whose id is not well formed
+// matches no workload, which readTagWorkloads gives none); a removed row ("")
+// has no tags.
+func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, error) {
+	lo, hi := keyRange(FirewallTagsKeyPrefix)
+	rows, err := c.Query(ctx,
+		`SELECT key, value FROM cluster_policies WHERE key >= ? AND key < ? AND deleted_at IS NULL`, lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]tagsRow, len(rows))
+	for _, r := range rows {
+		kind, id, ok := strings.Cut(strings.TrimPrefix(r.String("key"), FirewallTagsKeyPrefix), "/")
+		if !ok || (kind != TagMemberVM && kind != TagMemberCT) {
+			continue
+		}
+		value := r.String("value")
+		if value == "" {
+			out[kind+"/"+id] = tagsRow{}
+			continue
+		}
+		var v firewallTagsValue
+		if json.Unmarshal([]byte(value), &v) != nil {
+			out[kind+"/"+id] = tagsRow{unreadable: true}
+			continue
+		}
+		out[kind+"/"+id] = tagsRow{tags: v.Tags}
+	}
+	return out, nil
+}
+
+// readTagWorkloads reads every live VM and container, in any state, with its
+// firewall identity ("" when it has none, or one that is not well formed)
+// and its live NICs.
+func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
+	vms, err := c.Query(ctx, `SELECT name, spec FROM vms WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	cts, err := c.Query(ctx, `SELECT host_name, name, COALESCE(create_spec, '') AS create_spec FROM containers WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	nics, err := c.Query(ctx, `
+		SELECT 'vm' AS kind, '' AS host, vm_name AS name, network_name AS network, mac FROM vm_nics WHERE deleted_at IS NULL
+		UNION ALL
+		SELECT 'vm', '', vm_name, network_name, mac FROM vm_interfaces WHERE deleted_at IS NULL
+		UNION ALL
+		SELECT 'ct', host_name, ct_name, network_name, mac FROM container_interfaces WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	byKey := map[tagWorkloadKey]*tagWorkload{}
+	var out []*tagWorkload
+	add := func(key tagWorkloadKey, fwID string) {
+		if !ValidFirewallID(fwID) {
+			fwID = ""
+		}
+		w := &tagWorkload{tagWorkloadKey: key, fwID: fwID}
+		byKey[key] = w
+		out = append(out, w)
+	}
+	for _, r := range vms {
+		add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, jsonExactString(r.String("spec"), "firewall_id"))
+	}
+	for _, r := range cts {
+		add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, jsonExactString(r.String("create_spec"), "fw_id"))
+	}
+	for _, r := range nics {
+		w, ok := byKey[tagWorkloadKey{kind: r.String("kind"), host: r.String("host"), name: r.String("name")}]
+		mac := strings.ToLower(r.String("mac"))
+		if !ok || mac == "" {
+			continue
+		}
+		nic := tagNIC{network: r.String("network"), mac: mac}
+		if !slices.Contains(w.nics, nic) {
+			w.nics = append(w.nics, nic)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.kind != b.kind {
+			return a.kind > b.kind // VMs first
+		}
+		if a.host != b.host {
+			return a.host < b.host
+		}
+		return a.name < b.name
+	})
+	return out, nil
+}
+
+// jsonExactString returns the string member key of the JSON object doc,
+// matched exactly: encoding/json's struct decoding also takes a key that
+// differs only in case ("Firewall_ID"), which no writer produces.
+func jsonExactString(doc, key string) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(doc), &m) != nil {
+		return ""
+	}
+	var s string
+	if raw, ok := m[key]; !ok || json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}

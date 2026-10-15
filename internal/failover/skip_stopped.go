@@ -198,6 +198,10 @@ func (c *Coordinator) rekeyStoppedVM(ctx context.Context, host string, vm corros
 		}
 		target = cl.Proof.DestHost
 	}
+	if c.haHold(ctx, host, haSiteRekey) {
+		c.noteHAHeldRecovery(host)
+		return
+	}
 	// A claimed re-key advances the ownership generation, retiring the claim
 	// key it was decided at (corrosion.RekeyStoppedVMClaimed).
 	if claimed {

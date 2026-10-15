@@ -9,12 +9,20 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 )
 
-// wirePeerHAState sets fc.PeerHAState from the server's recorded Ready
-// answers. No-op until HA disarm is implemented.
-func (d *Daemon) wirePeerHAState(fc *failover.Coordinator, svc *grpcapi.Server) {}
+// wirePeerHAState gives the failover coordinator the HA-disarm peer veto: each
+// peer's latest Ready answer about the HA policy, the set of voters this node's
+// quorum counts live, and litevirt_ha_peer_veto.
+func (d *Daemon) wirePeerHAState(fc *failover.Coordinator, svc *grpcapi.Server) {
+	fc.PeerHAState = func(peer string) (failover.PeerHAAnswer, bool) {
+		asked, known, disarmed, policyAt, ok := svc.PeerHAAnswer(peer)
+		return failover.PeerHAAnswer{Asked: asked, Known: known, Disarmed: disarmed, PolicyAt: policyAt}, ok
+	}
+	fc.LiveVoters = d.checker.LiveVoters
+	fc.HAPeerVetoGauge = d.haMetrics().PeerVeto
+}
 
 // wireFenceCandidates installs the server's fence-candidate hook. No-op until
-// HA disarm is implemented.
+// HA disarm's RPCs are implemented.
 func (d *Daemon) wireFenceCandidates(svc *grpcapi.Server) {}
 
 // startHAPolicyCache starts the refresher of the server's HA policy cache,
@@ -24,6 +32,10 @@ func (d *Daemon) startHAPolicyCache(ctx context.Context, svc *grpcapi.Server) {
 	svc.SetHADisarmedGauge(d.haMetrics().Disarmed)
 	go svc.RunHAPolicyCache(ctx)
 }
+
+// startHADisarmPreRecord starts the lease holder's first-use record of
+// ha_disarm. No-op until it is implemented.
+func (d *Daemon) startHADisarmPreRecord(ctx context.Context, fc *failover.Coordinator) {}
 
 // haMetrics is the HA policy's gauges, registered once.
 func (d *Daemon) haMetrics() *metrics.HADisarmMetrics {
@@ -35,7 +47,3 @@ var (
 	haMetricsOnce      sync.Once
 	haMetricsSingleton *metrics.HADisarmMetrics
 )
-
-// startHADisarmPreRecord starts the lease holder's first-use record of
-// ha_disarm. No-op until HA disarm is implemented.
-func (d *Daemon) startHADisarmPreRecord(ctx context.Context, fc *failover.Coordinator) {}

@@ -1,6 +1,38 @@
 package failover
 
-import "time"
+// Cluster-wide HA disarm (docs/migration-failover.md, "Disarming HA for
+// planned maintenance"). While the cluster_policies row `ha` says disarmed, no
+// coordinator decides a new fence or mints a recovery. Fencing and recovery
+// are CREATED here, by the lease holder, so this is where the guarantee is
+// enforced:
+//
+//   - L1: the cycle reads the policy once, and every Held action re-reads it
+//     immediately before it runs (haHold): each fence, each resume of a
+//     recorded fence, and each proof-mint site. Disarmed or unreadable holds
+//     the action; a read error decides nothing.
+//   - L2: at the same sites, the latest Ready answer of every OTHER voter this
+//     node counts live for the decision's scope (the set its quorum counts)
+//     can veto it (haPeerVeto). That closes the replication-lag gap: a
+//     confirmed disarm is held by a majority, and any live majority this node
+//     can count intersects it.
+//
+// Kept while disarmed: health probes, recoverHosts, relay health, partition
+// pause, and operator actions.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+)
 
 // PeerHAAnswer is a peer's latest answer to the health probe about the cluster
 // HA policy (ReadyResponse.ha_known, ha_disarmed, ha_policy_at).
@@ -9,4 +41,308 @@ type PeerHAAnswer struct {
 	Known    bool
 	Disarmed bool
 	PolicyAt string // the policy row's updated_at as the peer stores it; "" when it has none
+}
+
+// PeerAnswerWindow (W_L2) bounds how old, from its probe's SEND time, a live
+// voter's answer may be and still be read as what it says:
+// SuspectThreshold × (ProbeInterval + ProbeTimeout) + ProbeInterval +
+// ProbeTimeout = 20 s today. A voter stays counted live for at most 18 s after
+// the probe that last reached it was sent (answered within ProbeTimeout, then
+// SuspectThreshold failed probes, each starting at most ProbeInterval after
+// the previous one ends and lasting at most ProbeTimeout); the rest is margin.
+// An older answer from a voter still counted live vetoes (rule stale), which
+// only ever delays a fence.
+const PeerAnswerWindow = time.Duration(health.SuspectThreshold)*(health.ProbeInterval+health.ProbeTimeout) +
+	health.ProbeInterval + health.ProbeTimeout
+
+// Peer-veto rules, as ha_disarm_peer_veto and `lv cluster ha` name them.
+const (
+	VetoNoQuorum = "no_quorum" // fewer than a majority of the scope's voters counted live
+	VetoStale    = "stale"     // a live voter's answer is older than PeerAnswerWindow
+	VetoUnknown  = "unknown"   // a live voter has not loaded the policy (ha_known=false)
+	VetoDisarmed = "disarmed"  // a live voter holds a disarm not older than this node's row
+)
+
+// haVeto is one voter's veto of one decision.
+type haVeto struct {
+	Voter, Rule, PolicyAt string
+}
+
+// haDisarmState is the coordinator's HA-disarm memory. Only the poll
+// goroutine touches it, except holding (read by the pre-record).
+type haDisarmState struct {
+	// loggedDisarm names the hosts already logged as held this disarm
+	// episode; cleared once a cycle reads armed.
+	loggedDisarm map[string]bool
+	// loggedVeto is the last veto logged per host; cleared once a cycle
+	// passes without one.
+	loggedVeto map[string]string
+	// heldRecovery names hosts whose recovery a hold interrupted after its
+	// fence; resumed from the fence loop once the hold lifts.
+	heldRecovery map[string]bool
+	// cycleVetoes are this cycle's peer vetoes (no_quorum excluded), by voter.
+	cycleVetoes map[string]haVeto
+	vetoCond    *health.HACondition
+	// featureUsed latches once this replica holds the ha_disarm used record.
+	featureUsed atomic.Bool
+	// holding is whether the last cycle held the failover lease.
+	holding atomic.Bool
+	// beforeHold, when set, runs before each Held action's re-read with the
+	// site's name; read, when set, replaces the policy read. Tests only.
+	beforeHold func(site string)
+	read       func(ctx context.Context) (corrosion.HAPolicy, error)
+}
+
+// haRead reads the policy from this node's replica.
+func (c *Coordinator) haRead(ctx context.Context) (corrosion.HAPolicy, error) {
+	if c.ha.read != nil {
+		return c.ha.read(ctx)
+	}
+	return corrosion.GetHAPolicy(ctx, c.db)
+}
+
+// Held-action sites, as the re-read hook and the logs name them.
+const (
+	haSiteCandidate  = "candidate"
+	haSiteFence      = "fence"
+	haSiteRecovery   = "recovery"
+	haSiteReschedule = "reschedule"
+	haSitePromote    = "promote"
+	haSiteRekey      = "rekey"
+	haSiteRelocate   = "relocate"
+	haSiteRecreate   = "recreate"
+)
+
+// HoldsLease reports whether this coordinator's last cycle held the failover
+// lease.
+func (c *Coordinator) HoldsLease() bool { return c.ha.holding.Load() }
+
+// haCycleRead is the cycle's one read of the policy. A read error is returned;
+// an unreadable policy is not (it reads disarmed).
+func (c *Coordinator) haCycleRead(ctx context.Context) (corrosion.HAPolicy, error) {
+	p, err := c.haRead(ctx)
+	if err != nil && !errors.Is(err, corrosion.ErrUnreadableHAPolicy) {
+		return p, err
+	}
+	if !p.Disarmed() {
+		c.ha.loggedDisarm = nil
+	}
+	c.ha.cycleVetoes = nil
+	return p, nil
+}
+
+// haHold reports whether the Held action at site about target (a host; "" for
+// a cluster-wide pass) must not run now. It re-reads the policy (L1) and
+// applies the peer veto (L2), records why, and counts the skip.
+func (c *Coordinator) haHold(ctx context.Context, target, site string) bool {
+	if c.ha.beforeHold != nil {
+		c.ha.beforeHold(site)
+	}
+	p, err := c.haRead(ctx)
+	if err != nil && !errors.Is(err, corrosion.ErrUnreadableHAPolicy) {
+		slog.Warn("failover: could not read the HA policy; holding", "host", target, "site", site, "error", err)
+		c.mAttempt(PhaseSkip, ResultSkipped, ErrDBError)
+		c.noteHAHold(target, "recovery held: the HA policy could not be read")
+		return true
+	}
+	if p.Disarmed() {
+		c.mAttempt(PhaseSkip, ResultSkipped, ErrHADisarmed)
+		c.noteHAHold(target, "recovery held: HA disarmed")
+		if c.ha.loggedDisarm == nil {
+			c.ha.loggedDisarm = map[string]bool{}
+		}
+		if !c.ha.loggedDisarm[target] {
+			c.ha.loggedDisarm[target] = true
+			if site == haSiteCandidate || site == haSiteFence {
+				slog.Warn("failover: HA disarmed; not fencing " + target + " (quorum reports it down)")
+			} else {
+				slog.Warn("failover: HA disarmed; not recovering the workloads of "+target, "site", site,
+					"unreadable", p.Unreadable, "set_by", p.SetBy, "reason", p.Reason)
+			}
+		}
+		return true
+	}
+	vetoes := c.haPeerVeto(ctx, target, p)
+	if len(vetoes) == 0 {
+		delete(c.ha.loggedVeto, target)
+		return false
+	}
+	if vetoes[0].Rule == VetoNoQuorum {
+		c.mAttempt(PhaseQuorum, ResultRefused, ErrNoQuorum)
+		c.noteHAHold(target, "held: fewer than a majority of the voters for this decision are live")
+	} else {
+		c.mAttempt(PhaseSkip, ResultSkipped, ErrHAPeerVeto)
+		c.noteHAHold(target, "recovery held: HA disarmed on a live voter ("+describeVetoes(vetoes)+")")
+		if c.ha.cycleVetoes == nil {
+			c.ha.cycleVetoes = map[string]haVeto{}
+		}
+		for _, v := range vetoes {
+			c.ha.cycleVetoes[v.Voter] = v
+		}
+	}
+	if c.ha.loggedVeto == nil {
+		c.ha.loggedVeto = map[string]string{}
+	}
+	if d := describeVetoes(vetoes); c.ha.loggedVeto[target] != d {
+		c.ha.loggedVeto[target] = d
+		slog.Warn("failover: a live voter's answer holds this decision back", "host", target, "site", site, "vetoes", d,
+			"own_policy_at", p.UpdatedAt)
+	}
+	return true
+}
+
+// noteHAHold records the stall alert's reason for a held host.
+func (c *Coordinator) noteHAHold(target, why string) {
+	if target != "" {
+		c.noteHold(target, why)
+	}
+}
+
+// noteHAHeldRecovery remembers that host's recovery was held after its fence,
+// so the fence loop resumes it once the hold lifts.
+func (c *Coordinator) noteHAHeldRecovery(host string) {
+	if c.ha.heldRecovery == nil {
+		c.ha.heldRecovery = map[string]bool{}
+	}
+	c.ha.heldRecovery[host] = true
+}
+
+// resumeHAHeldRecovery resumes a recovery a hold interrupted, and reports
+// whether it did. Called from the fence loop only once haHold has passed for
+// the host.
+func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string) bool {
+	if !c.ha.heldRecovery[host] {
+		return false
+	}
+	if _, waiting := c.pauseWaits[host]; waiting {
+		// A pause wait is still owed: it runs first, and recovers from there.
+		return false
+	}
+	delete(c.ha.heldRecovery, host)
+	h, err := corrosion.GetHost(ctx, c.db, host)
+	if err != nil || h == nil {
+		return true
+	}
+	slog.Info("failover: HA armed again; resuming the recovery it held", "host", host)
+	c.recoverWorkloads(ctx, h)
+	return true
+}
+
+func describeVetoes(vs []haVeto) string {
+	parts := make([]string, 0, len(vs))
+	for _, v := range vs {
+		if v.Rule == VetoNoQuorum {
+			parts = append(parts, v.Rule)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s (ha_policy_at %q)", v.Voter, v.Rule, v.PolicyAt))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// haFeatureUsed reports whether this replica holds the ha_disarm used record.
+// Until it does, no `ha` row can exist anywhere: the first write waits until
+// every voter and replication recipient, this node included, holds that
+// record. So the peer veto has nothing to protect before it, and is not
+// applied — which keeps a rolling upgrade INTO this build, whose older peers
+// answer without the HA fields, from holding every fence back. It latches.
+func (c *Coordinator) haFeatureUsed(ctx context.Context) bool {
+	if c.ha.featureUsed.Load() {
+		return true
+	}
+	info, ok := capabilities.LookupFeature(capabilities.FeatureHADisarm)
+	if !ok {
+		return true
+	}
+	present, _, err := corrosion.ReleaseFeatureState(ctx, c.db, info.Token, string(capabilities.FeatureHADisarm))
+	if err != nil {
+		// Unknown is not "unused": apply the veto.
+		return true
+	}
+	if present {
+		c.ha.featureUsed.Store(true)
+	}
+	return present
+}
+
+// haPeerVeto is L2: the vetoes of the decision about target ("" for the
+// cluster) by the voters this node counts live for its scope. own is this
+// node's policy row (armed, or L1 would have held). nil: no veto.
+func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosion.HAPolicy) []haVeto {
+	if c.PeerHAState == nil || !c.haFeatureUsed(ctx) {
+		return nil
+	}
+	voters := c.scope.vr.Voters
+	if target != "" {
+		voters = c.scope.voters(target)
+	}
+	needed := len(voters)/2 + 1
+	var live map[string]bool
+	if c.LiveVoters != nil {
+		live = c.LiveVoters(voters, c.scope.vr.Uncounted)
+	}
+	if len(live) < needed {
+		return []haVeto{{Rule: VetoNoQuorum}}
+	}
+	names := make([]string, 0, len(live))
+	for v := range live {
+		names = append(names, v)
+	}
+	sort.Strings(names)
+	now := c.mono()
+	var out []haVeto
+	for _, v := range names {
+		if v == c.hostName {
+			// No answer from itself exists; its own replica is L1's input.
+			continue
+		}
+		a, ok := c.PeerHAState(v)
+		switch {
+		case !ok || now.Sub(a.Asked) > PeerAnswerWindow:
+			out = append(out, haVeto{Voter: v, Rule: VetoStale, PolicyAt: a.PolicyAt})
+		case !a.Known:
+			out = append(out, haVeto{Voter: v, Rule: VetoUnknown, PolicyAt: a.PolicyAt})
+		case a.Disarmed && !(own.UpdatedAt != "" && corrosion.LWWNewer(own.UpdatedAt, a.PolicyAt)):
+			// A disarm not older than this node's row: no row here, a newer
+			// disarm, or the same timestamp with another state.
+			out = append(out, haVeto{Voter: v, Rule: VetoDisarmed, PolicyAt: a.PolicyAt})
+		}
+	}
+	return out
+}
+
+// syncHAVeto keeps ha_disarm_peer_veto and litevirt_ha_peer_veto in line with
+// this cycle's peer vetoes. A no_quorum veto is an ordinary loss of quorum,
+// counted as one, and never raises them.
+func (c *Coordinator) syncHAVeto(ctx context.Context) {
+	if c.ha.vetoCond == nil {
+		c.ha.vetoCond = &health.HACondition{DB: c.db, Host: c.hostName, Code: corrosion.CondHAPeerVeto,
+			Severity: corrosion.SeverityWarning, Now: c.Now}
+	}
+	vs := make([]haVeto, 0, len(c.ha.cycleVetoes))
+	for _, v := range c.ha.cycleVetoes {
+		vs = append(vs, v)
+	}
+	sort.Slice(vs, func(i, j int) bool { return vs[i].Voter < vs[j].Voter })
+	open := len(vs) > 0
+	evidence := ""
+	if open {
+		evidence = "this node's replica says HA is armed, and live voters' answers held a fence or recovery back: " +
+			describeVetoes(vs) + ". It resolves once no live voter vetoes; check lv cluster ha"
+	}
+	c.ha.vetoCond.Sync(ctx, open, evidence)
+	if c.HAPeerVetoGauge != nil {
+		c.HAPeerVetoGauge(open)
+	}
+}
+
+// haPassHeld is L1 alone, re-read for a cluster-wide recovery pass: disarmed,
+// unreadable or unread holds it. Each proof the pass would mint re-checks at
+// its own site, peer veto included.
+func (c *Coordinator) haPassHeld(ctx context.Context) bool {
+	if c.ha.beforeHold != nil {
+		c.ha.beforeHold("pass")
+	}
+	p, err := c.haRead(ctx)
+	return (err != nil && !errors.Is(err, corrosion.ErrUnreadableHAPolicy)) || p.Disarmed()
 }

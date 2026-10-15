@@ -402,9 +402,17 @@ type Coordinator struct {
 	// otherwise on its next probe. nil never relies.
 	PeerPausesOnLoss func(peer string) bool
 	// PeerHAState returns a peer's latest answer to this node's health probe
-	// about the cluster HA policy, and false when there is none. nil until
-	// wired.
+	// about the cluster HA policy, and false when there is none
+	// (grpcapi.Server.PeerHAAnswer). nil: no peer veto (ha_disarm.go).
 	PeerHAState func(peer string) (PeerHAAnswer, bool)
+	// LiveVoters is the set of voters this node's quorum counts live
+	// (health.Checker.LiveVoters): the voters the peer veto reads. With
+	// PeerHAState wired and this nil, every decision is vetoed no_quorum.
+	LiveVoters func(voters, uncounted map[string]bool) map[string]bool
+	// HAPeerVetoGauge, when set, is litevirt_ha_peer_veto.
+	HAPeerVetoGauge func(on bool)
+	// ha is the HA-disarm memory (ha_disarm.go).
+	ha haDisarmState
 	// PeerRecoveryExclusions says which peers must not be a VM recovery
 	// target while pit_overlay is in use, and why: one whose own Ping says it
 	// is WAL-quarantined (rolled back below a latched token), and one that
@@ -669,6 +677,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
 	held, leaseErr := c.acquireLeaseResult(ctx)
+	c.ha.holding.Store(held)
 	if !held {
 		// stepDownGauges publishes stranded_workloads = 0, which is a CLAIM
 		// that nothing is stranded. Only a clean "another node holds the lease"
@@ -681,6 +690,10 @@ func (c *Coordinator) run(ctx context.Context) {
 		// (errLeaseNoQuorum): with none anywhere, nobody holds the lease.
 		if leaseErr == nil {
 			c.stepDownGauges()
+			// Not deciding: whatever this node vetoed while it led is no
+			// longer holding anything back.
+			c.ha.cycleVetoes = nil
+			c.syncHAVeto(ctx)
 		}
 		return
 	}
@@ -733,6 +746,15 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	c.scope = quorumView{region: scope.Region(), vr: vr}
 	c.publishRegionsWithoutQuorum(ctx, c.scope)
+	// The cluster HA policy, read once for the cycle (ha_disarm.go). Every
+	// Held action re-reads it immediately before it runs; a policy this node
+	// cannot read holds them all. A read error decides nothing.
+	haCycle, err := c.haCycleRead(ctx)
+	if err != nil {
+		slog.Error("failover: read the cluster HA policy; deciding nothing this cycle", "error", err)
+		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
+		return
+	}
 
 	// Clear the "already handled this down-episode" flag for any host that has
 	// recovered to active. Without this, the in-memory fenced set — which is
@@ -860,11 +882,21 @@ func (c *Coordinator) run(ctx context.Context) {
 		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
 			c.noteOneWay(ctx, target, failing, healthy, oneWay)
 		}
+		// HA disarmed, here or on a live voter: no fence, no resume of a
+		// recorded fence, no claim retry or pause wait. All of it is kept,
+		// and runs once HA is armed again.
+		if c.haHold(ctx, target, haSiteCandidate) {
+			continue
+		}
 		// afresh: an operator confirmed the host off during this outage and no
 		// fence has run for it, so it goes down the fence path below although
 		// it is recorded terminal (confirmationFencesAfresh).
 		afresh := false
 		if c.fenced[target] {
+			// A recovery a disarm held after its fence continues here.
+			if c.resumeHAHeldRecovery(ctx, target) {
+				continue
+			}
 			// A recovery waiting out the host's partition pause continues
 			// here; one whose deadline refused falls through, re-checked next
 			// cycle.
@@ -904,6 +936,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			// claim retry owed to the older fence outlives it.
 			delete(c.pauseWaits, target)
 			c.forgetClaimRetries(target)
+			delete(c.ha.heldRecovery, target)
 		}
 
 		// Skip if this host is already in a terminal state.
@@ -1150,23 +1183,28 @@ func (c *Coordinator) run(ctx context.Context) {
 	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
 	c.recoverHosts(ctx, c.scope)
 
-	// Workloads still recorded on a host that has been removed for good (`lv
-	// host rm --dead`): under recovery claims their claims supersede to the
-	// next attempt, and nothing else would ever visit them — a removed host is
-	// no fence candidate.
-	c.recoverRemovedHosts(ctx)
-	// Re-certify, at the current generation, proofs whose certificate a forced
-	// voter reconfiguration replaced: their destinations refuse them until then.
-	c.recertifyReplaced(ctx)
-	// Claim, for their own value, proofs minted without a certificate before
-	// recovery claims were enforced: their destinations refuse them until then.
-	c.certifyUncertified(ctx)
+	// The recovery passes below are Held while HA is disarmed; each proof
+	// they would mint re-checks at its own site too.
+	if !haCycle.Disarmed() && !c.haPassHeld(ctx) {
+		// Workloads still recorded on a host that has been removed for good (`lv
+		// host rm --dead`): under recovery claims their claims supersede to the
+		// next attempt, and nothing else would ever visit them — a removed host is
+		// no fence candidate.
+		c.recoverRemovedHosts(ctx)
+		// Re-certify, at the current generation, proofs whose certificate a forced
+		// voter reconfiguration replaced: their destinations refuse them until then.
+		c.recertifyReplaced(ctx)
+		// Claim, for their own value, proofs minted without a certificate before
+		// recovery claims were enforced: their destinations refuse them until then.
+		c.certifyUncertified(ctx)
 
-	// Settle any relocate-restore markers left by an indeterminate restore or a
-	// coordinator crash mid-restore. This runs every cycle, independent of the
-	// fence path (an already-fenced host is skipped above, so relocateContainers
-	// won't re-run for it) — so a deferred restore still gets resolved.
-	c.resolvePendingRelocations(ctx)
+		// Settle any relocate-restore markers left by an indeterminate restore or a
+		// coordinator crash mid-restore. This runs every cycle, independent of the
+		// fence path (an already-fenced host is skipped above, so relocateContainers
+		// won't re-run for it) — so a deferred restore still gets resolved.
+		c.resolvePendingRelocations(ctx)
+	}
+	c.syncHAVeto(ctx)
 
 	// Report workloads left on a host the cluster considers down. Read-only: see
 	// strandedWorkloads for what the number does and does not mean, and for why
@@ -1204,6 +1242,9 @@ func (c *Coordinator) run(ctx context.Context) {
 // leader's first pass republishes the true value within one poll interval.
 func (c *Coordinator) stepDownGauges() {
 	c.mStranded(0)
+	if c.HAPeerVetoGauge != nil {
+		c.HAPeerVetoGauge(false)
+	}
 	c.mRegionsWithoutQuorum(0)
 	// The stall alert is the leader's too: a node that takes the lease back
 	// starts its clocks afresh rather than alerting on a stale one.
@@ -1245,6 +1286,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.confirmResumed = make(map[string]string)
 	c.fencedOn, c.lastFenceAt = nil, nil
 	c.pauseWaits = nil
+	c.ha.heldRecovery = nil
 	c.claimRetry, c.claimRetryProposals = nil, nil
 	c.recoverOnly, c.unpausedHeld = nil, nil
 	c.relocDeferred = nil
@@ -2937,6 +2979,12 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	fenceCtx, cancelFence := context.WithTimeout(ctx, leaseLeft-leaseFenceMargin)
 	defer cancelFence()
 
+	// Immediately before the fence: HA may have been disarmed since this
+	// host was selected.
+	if c.haHold(ctx, h.Name, haSiteFence) {
+		return fence.Result{}, false
+	}
+
 	// Step 1: Fence the host.
 	if c.lastFenceAt == nil {
 		c.lastFenceAt = map[string]time.Time{}
@@ -3364,6 +3412,12 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""
 	// when the fence wasn't proof-grade (best-effort/SSH) — the executor then fails
 	// a shared-disk transfer closed while a local-disk transfer still proceeds.
+	// Every recovery is Held while HA is disarmed; the fence loop resumes it
+	// once HA is armed (resumeHAHeldRecovery).
+	if c.haHold(ctx, h.Name, haSiteRecovery) {
+		c.noteHAHeldRecovery(h.Name)
+		return
+	}
 	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
 	// Recovery is running: whatever held it back before no longer does, and
 	// a refusal below records what holds it now (the stall alert's reason).
@@ -3573,6 +3627,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
+			if c.haHold(ctx, h.Name, haSitePromote) {
+				c.noteHAHeldRecovery(h.Name)
+				continue
+			}
 			// The disks as they were before the promotion re-homes them: what
 			// it leaves on the failed host, recorded once it succeeds.
 			disksBefore, disksErr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
@@ -3740,6 +3798,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		slog.Info("failover: rescheduling VM",
 			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
+		if c.haHold(ctx, h.Name, haSiteReschedule) {
+			c.noteHAHeldRecovery(h.Name)
+			continue
+		}
 		if c.gateEnforced(ctx) {
 			// ListVMs deliberately omits operation-control columns, including
 			// vm_owner_epoch. Re-read the full authoritative row at the decision
@@ -3824,6 +3886,11 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					continue
 				}
 				proof, targetName = cl.Proof, cl.Proof.DestHost
+			}
+			// The mint itself: re-checked last, after the claim's round trips.
+			if c.haHold(ctx, h.Name, haSiteReschedule+"-mint") {
+				c.noteHAHeldRecovery(h.Name)
+				continue
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				if errors.Is(err, corrosion.ErrWorkloadStopped) {
@@ -3948,6 +4015,10 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		return
 	}
 
+	if c.haHold(ctx, h.Name, haSiteRelocate) {
+		c.noteHAHeldRecovery(h.Name)
+		return
+	}
 	// Tier-2: restore-from-backup when a restorer is wired and the survivor is
 	// schema-compatible.
 	if c.Restorer != nil && c.survivorSchemaCompatible(ctx, target) {
@@ -4179,6 +4250,10 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	// single-use proof bound to a relocation token and stamp the token on the
 	// re-keyed row, so the target claims it by token before recreating. Fail-open
 	// (empty token, no proof) until split_brain_gate_v1 is cluster-wide.
+	if c.haHold(ctx, h.Name, haSiteRecreate) {
+		c.noteHAHeldRecovery(h.Name)
+		return
+	}
 	relocToken := ""
 	if claimed != nil {
 		// Already decided and written: re-key to exactly what was decided.

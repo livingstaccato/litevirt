@@ -430,7 +430,8 @@ func TestLogRender_GuardCatchesPlainLog(t *testing.T) {
 // and passes a declared one.
 //
 // Mutation: drop the `p.LogPolicy.Default ||` term in renderNICLogLimits —
-// the fuzz and golden corpora go red through the guard.
+// the fuzz seed (1,12,1), which logs only the default verdict, goes red
+// through the guard.
 func TestLogRender_GuardCatchesUndeclaredLimit(t *testing.T) {
 	body := "    chain c {\n        limit name \"a\" log group 27 snaplen 96 prefix \"p\"\n    }\n"
 	use := "table bridge x {\n" + body + "}\n"

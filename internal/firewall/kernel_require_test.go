@@ -42,3 +42,22 @@ func TestKernelRequire_MissingModuleFailsUnderRequire(t *testing.T) {
 		t.Errorf("%s=1: nft skip not made a failure: skipped=%q failed=%q", nftRequire, r.skipped, r.failed)
 	}
 }
+
+// With LITEVIRT_NFT_REQUIRE=1 and the opt-in unset, the parent fails instead
+// of skipping having run nothing.
+//
+// Mutation: drop the REQUIRE check in skipUnlessOptedIn — red.
+func TestKernelRequire_UnsetOptInFailsUnderRequire(t *testing.T) {
+	t.Setenv(nftRequire, "")
+	r := &recSkipper{}
+	skipUnlessOptedIn(r)
+	if r.failed != "" || !strings.Contains(r.skipped, netnsOptIn) {
+		t.Errorf("switch unset: want a skip, got skipped=%q failed=%q", r.skipped, r.failed)
+	}
+	t.Setenv(nftRequire, "1")
+	r = &recSkipper{}
+	skipUnlessOptedIn(r)
+	if r.skipped != "" || !strings.Contains(r.failed, nftRequire+"=1 needs "+netnsOptIn+"=1") {
+		t.Errorf("%s=1: want the failure, got skipped=%q failed=%q", nftRequire, r.skipped, r.failed)
+	}
+}

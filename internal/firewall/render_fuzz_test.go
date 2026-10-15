@@ -43,6 +43,7 @@ func FuzzRender(f *testing.F) {
 	f.Add(uint8(7), uint8(7), uint8(7))
 	f.Add(uint8(15), uint8(12), uint8(5)) // logging on, default verdict logged, observe
 	f.Add(uint8(9), uint8(4), uint8(1))   // logging on, enforce
+	f.Add(uint8(1), uint8(12), uint8(1))  // logging on, only the default verdict logged
 	f.Fuzz(func(t *testing.T, ruleSeed, sgSeed, nicSeed uint8) {
 		// Cap structural growth so the fuzzer can't OOM.
 		nRules := int(ruleSeed%16) + 1

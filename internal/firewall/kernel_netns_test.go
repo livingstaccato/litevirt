@@ -55,6 +55,18 @@ func skipOrRequire(t skipper, format string, args ...any) {
 	t.Skipf(format, args...)
 }
 
+// skipUnlessOptedIn is the parent's answer when LITEVIRT_NFT_NETNS is unset:
+// a skip, or a failure under LITEVIRT_NFT_REQUIRE=1, which would otherwise
+// pass having run nothing.
+func skipUnlessOptedIn(t skipper) {
+	t.Helper()
+	if os.Getenv(nftRequire) == "1" {
+		t.Fatalf("%s=1 needs %s=1", nftRequire, netnsOptIn)
+		return
+	}
+	t.Skipf("set %s=1 to run the nf_tables kernel tests in a private namespace", netnsOptIn)
+}
+
 // skipUnlessModules skips (fails under LITEVIRT_NFT_REQUIRE=1) when any of the
 // modules is neither loaded nor built in, naming them: a test must not make
 // the kernel load one.
@@ -72,7 +84,7 @@ func TestKernel_NICGuard(t *testing.T) {
 		t.Skip("parent only")
 	}
 	if os.Getenv(netnsOptIn) != "1" {
-		t.Skipf("set %s=1 to run the nf_tables kernel tests in a private namespace", netnsOptIn)
+		skipUnlessOptedIn(t)
 	}
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Fatalf("%s=1 but unshare is not on PATH", netnsOptIn)

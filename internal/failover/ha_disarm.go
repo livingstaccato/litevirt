@@ -279,8 +279,10 @@ func (c *Coordinator) noteHAHeldRecovery(host string) {
 // (resumeActionFor) — resumed while it still stands and is fresh, fenced
 // again when a verified fence has aged, declined when it no longer stands.
 // Without a recorded successful fence (an operator's confirmation, a
-// best-effort fence that proceeded) it resumes only while the newest fence
-// attempt still stands.
+// best-effort fence that proceeded) it resumes only on a host recorded fenced
+// or offline, and only while the newest fence attempt still stands and this
+// node has not probed the host healthy since it; a refusal names the remedy,
+// confirming the host off again.
 //
 // The held mark is dropped only on a final outcome: a resume, a re-fence that
 // ran (its success recovers, its failure is the operator's), or a decline
@@ -355,14 +357,34 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 		}
 		return true
 	}
+	if h.State != "fenced" && h.State != "offline" {
+		// Not this branch's to resume: a host that is neither fenced nor
+		// offline (an upgrade's reboot, maintenance) is judged again once it
+		// is, as an owed claim retry is (claimRetryOutageOver).
+		c.noteHold(host, "recovery held by an HA disarm is held while the host is "+h.State+
+			", neither fenced nor offline; it is judged again once the host is")
+		return true
+	}
 	if !ok {
 		delete(c.ha.heldRecovery, host)
 		c.noteHold(host, "recovery held by an HA disarm, and no fence of the host is on record")
 		return true
 	}
-	if why, _, stands := c.fenceStillStandsIn(hr, host, at); !stands {
+	// Without a recorded successful fence the authority is the newest
+	// attempt and, usually, an operator confirmation of it. Either stands
+	// only while nobody has seen the host answer since the attempt: no
+	// host_health row (fenceStillStandsIn), and not this node's own probe,
+	// which no row may show (LastContact, mapped onto this node's monotonic
+	// clock from fenceSkewMargin before the attempt, as confirmationStands
+	// maps a confirmation). A confirmation at or after the attempt is then
+	// covered too.
+	why, _, stands := c.fenceStillStandsIn(hr, host, at)
+	if stands && c.contactedSince(host, c.mono().Add(-c.now().Sub(at)).Add(-fenceSkewMargin)) {
+		why, stands = "this node has probed the host healthy since the fence", false
+	}
+	if !stands {
 		delete(c.ha.heldRecovery, host)
-		c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
+		c.noteHAHeldStale(ctx, host, rec, at, why)
 		return true
 	}
 	delete(c.ha.heldRecovery, host)
@@ -370,6 +392,20 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 	c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
 	c.recoverWorkloads(ctx, h)
 	return true
+}
+
+// noteHAHeldStale records that a held recovery's fence attempt rec, at at,
+// no longer stands for why: the hold names the operator confirmation when one
+// at or after the attempt is the newest authority (noteConfirmationStale),
+// else the attempt, and the remedy either way. Confirming the host off again
+// puts it back on the confirmation resume path (resumeFromConfirmation).
+func (c *Coordinator) noteHAHeldStale(ctx context.Context, host string, rec fenceRecord, at time.Time, why string) {
+	if confirm, confirmedAt, _, ok := c.confirmationAndAttempt(ctx, host); ok && !confirmedAt.IsZero() && !confirmedAt.Before(at) {
+		c.noteConfirmationStale(host, confirm, why)
+		return
+	}
+	c.noteHold(host, "recovery held by an HA disarm, and its fence attempt "+rec.ID+" no longer stands: "+why+
+		"; confirm "+host+" is powered off, then run 'lv host fence-confirm "+host+"' again")
 }
 
 func describeVetoes(vs []haVeto) string {

@@ -1016,5 +1016,9 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	delete(c.fenced, target)
 	delete(c.pauseWaits, target)
 	c.forgetClaimRetries(target)
+	// A recovery an HA hold interrupted belongs to the same outage: left
+	// marked, resumeHAHeldRecovery would take it up on the old fence next
+	// cycle, ahead of the fence path deciding afresh.
+	delete(c.ha.heldRecovery, target)
 	return true
 }

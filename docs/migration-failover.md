@@ -978,12 +978,15 @@ What happens next depends on the fence:
   progress.
 
 **A fence still stands** when some observer has probed the host and failed
-without a break since before the fence, and no observer's latest verdict shows
-the host answering (healthy or unready) since. The first holds however recent
-the fence is. A genuine fence follows a quorum of failing runs, so it always has
-one. A host that answered after its fence and then failed again has had the
-verdict that it answered overwritten, and only the failing runs' start shows the
-return.
+without a break since before the fence, no observer's latest verdict shows
+the host answering (healthy or unready) since, and no observer's failing run
+began after the fence. The first holds however recent the fence is. A genuine
+fence follows a quorum of failing runs, so it always has one. A host that
+answered after its fence and then failed again has had the verdict that it
+answered overwritten, and only the failing runs' start shows the return: a run
+that began more than 5 seconds after the fence counts as an answer. An observer
+that restarted, or began probing the host only after the fence, starts such a
+run too, and the fence then no longer stands.
 
 **When a failing run started** is read from the verdict: an observer's failing
 `host_health` row carries the time of its run's first failed probe in
@@ -997,7 +1000,12 @@ outage until an observer on the current build reports the host.
 **Clock skew.** The fence's time is the leader's clock and each observation is
 its observer's, so both comparisons give 5 seconds, the clock-skew alert
 threshold, to the safe side. A failing run must have begun at least 5 seconds
-before the fence, and an answer counts from 5 seconds before it. Greater skew
+before the fence, an answer counts from 5 seconds before it, and a run begun
+more than 5 seconds after it counts as an answer. The last has no slack beyond the
+threshold: a run reported by an observer whose clock runs behind by up to 5
+seconds is missed when it began within 5 seconds plus that skew after the
+fence, so a host that answered for less than that and failed again is seen
+only by an observer's latest verdict or the coordinator's own probes. Greater skew
 makes the checks refuse more, except in one direction: an observer whose clock
 runs more than 5 seconds **behind** the leader's can make a run look older than
 it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see
@@ -1097,7 +1105,7 @@ A recovery refused for want of a confirmation — a `manual` fence, a
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
 `lv host fence-confirm <host>`.
 
-The resume requires four things, not the confirmation alone:
+The resume requires five things, not the confirmation alone:
 
 1. **The cluster itself fenced the host** — a `fencing_log` row with result
    `fenced` or `partial`, which only a fence that ran writes.
@@ -1111,6 +1119,22 @@ The resume requires four things, not the confirmation alone:
 4. **The host is still down now** — a fresh quorum observes it failing. A host
    that has come back, or that an operator has put into `maintenance`, is never
    resumed.
+5. **Nobody has seen the host answer since the confirmation.** Some observer
+   has failed it without a break since at least 5 seconds before the
+   confirmation. No observer's latest verdict is an answer newer than 5
+   seconds before it, and no observer's failing run began more than 5 seconds
+   after it. The coordinator's own node has not probed the host healthy since
+   5 seconds before it. Otherwise the coordinator logs "the operator
+   confirmation does not stand for this outage, NOT acting on it" once per
+   confirmation (`phase=recovery, error_class=manual_unconfirmed`).
+   The host's stall reason names the confirmation and the remedy. Power the
+   host off, then run `lv host fence-confirm <host>` again. A confirmation
+   typed before the power-off, while a bridge still sees the host, is refused
+   the same way. A failing run begun after the confirmation is named in the
+   reason as "it saw the host answer, or its own daemon restarted": a
+   restart of that observer's daemon, the coordinator's own included, also
+   refuses. A refusal on the coordinator's own probe answer does not clear by
+   itself; confirm again.
 
 An observer's unbroken run of failed probes restarts when that observer's
 daemon restarts, so after every observer has restarted a genuine confirmation
@@ -1119,7 +1143,7 @@ then fences the host for the outage in progress, refuses for want of a
 confirmation, and resumes once you confirm again.
 
 `fence-confirm` has no precondition and runs no fence, so on its own a mistyped
-hostname could otherwise authorise a recovery. With all three required, a
+hostname could otherwise authorise a recovery. With all of these required, a
 mistype can only reach a host the cluster already fenced and still sees down.
 
 **A confirmation before any fence of this outage fences the host afresh.**
@@ -1136,7 +1160,9 @@ fence them first. Now, when all of these hold:
 - no fence attempt is at or after the confirmation, and no earlier attempt
   belongs to this outage;
 - the confirmation belongs to this outage: some observer has probed the host
-  and failed without a break since at least 5 seconds before it,
+  and failed without a break since at least 5 seconds before it, and nobody
+  has seen the host answer since it (item 5 above; a refusal is logged and
+  held the same way),
 
 the coordinator fences the host itself, as it would an `active` one, and logs
 "an operator confirmed this host off during the outage in progress, and no
@@ -1145,7 +1171,8 @@ error_class=confirmation_fence`). The confirmation authorises that fence, not
 the recovery: the recovery follows from the fresh fence under every gate a
 fence applies, and where one of them needs a confirmation (`manual`,
 `best-effort` under the safe-fence policy, the confirmation label) it accepts
-one under 5 minutes old. An older one leaves the host `offline` after the fence
+one under 5 minutes old that still stands (item 5) and was written since the
+host last turned active. An older one leaves the host `offline` after the fence
 with the usual refusal in the log; confirm again and the recovery resumes from
 it. A confirmation older than the outage, of a host that has answered since,
 still authorises nothing, and the coordinator logs "the newest fence attempt

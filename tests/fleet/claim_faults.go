@@ -40,6 +40,8 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -89,6 +91,9 @@ type ClaimMsg struct {
 	From, To string
 	Method   string // PrepareRecoveryClaim | AcceptRecoveryClaim
 	Seq      int    // this link's claim RPCs so far, from 0
+	// Target is the claimed workload's name (the request key's target_name),
+	// "" when the request carries no key.
+	Target string
 }
 
 // ClaimScript decides a claim RPC's fate; ClaimDefault leaves it to the link.
@@ -206,7 +211,11 @@ func (n *Node) claimFaultIntercept(ctx context.Context, req any, from, method st
 	dropReq, dropReply, dup, hold := cl.rng.Float64(), cl.rng.Float64(), cl.rng.Float64(), cl.rng.Float64()
 	n.faults.mu.Unlock()
 
-	fate := n.cluster.claimScriptFate(ClaimMsg{From: from, To: n.Name, Method: method, Seq: seq})
+	target := ""
+	if k, ok := req.(interface{ GetKey() *pb.RecoveryClaimKey }); ok {
+		target = k.GetKey().GetTargetName()
+	}
+	fate := n.cluster.claimScriptFate(ClaimMsg{From: from, To: n.Name, Method: method, Seq: seq, Target: target})
 	if fate == ClaimDefault {
 		switch {
 		case dropReq < f.DropRequest:

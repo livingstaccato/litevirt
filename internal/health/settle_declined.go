@@ -75,6 +75,9 @@ type settleDeclineTracker struct {
 
 // settleRemedy says what an operator can do about d.
 func settleRemedy(d settleDecline, self string) string {
+	if settleReasonClass(d.Reason) == "proof_uncertified" {
+		return uncertifiedRemedy(d, self)
+	}
 	var b strings.Builder
 	if d.Local.Incarnation == "" {
 		b.WriteString("This domain carries no incarnation stamp (an older build defined it), so settle cannot tell " +
@@ -92,6 +95,21 @@ func settleRemedy(d settleDecline, self string) string {
 		"owner-assert reclaims the row once every peer reports the VM absent.",
 		d.Name, d.RowHost, self)
 	return b.String()
+}
+
+// uncertifiedRemedy is the remedy when the move completed on a proof with no
+// certificate: there is no claim to inspect, so the operator confirms the
+// replacement by its destination's runtime alone.
+func uncertifiedRemedy(d settleDecline, self string) string {
+	return fmt.Sprintf("The proof named in the reason moved %[1]s to %[2]s and completed there, but it carries no "+
+		"recovery-claim certificate: it was minted while recovery claims were not enforced (a derived voter set, "+
+		"or enforcement.recovery_claim off), so no claim was decided and settle, which acts only on a certificate, "+
+		"leaves the copy on %[3]s as it is. Confirm the replacement first: `virsh domstate %[1]s` on %[2]s must "+
+		"report it running. Only then is the copy on %[3]s a superseded duplicate; stop it on %[3]s with "+
+		"`virsh destroy %[1]s`. Its disks are kept; its definition and NVRAM are removed on the next reconcile pass "+
+		"(the leftover cleanup undefines a destroyed domain whose row moved). If %[2]s does not run it, leave the "+
+		"copy on %[3]s as it is and find where %[1]s runs before you stop anything.",
+		d.Name, d.RowHost, self)
 }
 
 // settleReasonClass reduces a decline reason to its KIND. The raw reason can
@@ -119,6 +137,8 @@ func settleReasonClass(reason string) string {
 		return "destroy_failed"
 	case strings.HasPrefix(reason, "no verified recovery-claim certificate"):
 		return "no_certificate"
+	case strings.Contains(reason, "carries no recovery-claim certificate"):
+		return "proof_uncertified"
 	case strings.Contains(reason, "not completed: no replacement is known to run"):
 		return "proof_not_completed"
 	case strings.Contains(reason, "was executed by"):

@@ -762,6 +762,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		SharesWeight: s.vmSharesWeight(ctx, vm.Name), TargetCgroup: targetCgroup,
 		StripVNCPassword: ens.vncPasswordUnavailable,
 		RBDLocators:      s.rbdLocatorsOf(ctx, vm.Name),
+		NICBridges:       s.migrationNICBridges(ctx, vm.Name),
 	}
 	if route.direct {
 		mp.Direct, mp.TLS = true, true

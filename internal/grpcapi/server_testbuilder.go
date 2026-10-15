@@ -138,14 +138,15 @@ func (s *Server) SetDependsOnWaitTimeoutForTests(d time.Duration) {
 
 // ForgetNetworkReconcileForTests drops everything ReconcileNetworksOnce
 // remembers about this host, and the device each network was provisioned on
-// here, as a daemon restart does: the next pass
+// here as far as this process holds it in memory (a state file set with
+// SetNetworkDeviceStatePath is read again), as a daemon restart does: the next pass
 // provisions every live network and tears down every tombstoned one again.
 func (s *Server) ForgetNetworkReconcileForTests() {
 	s.netReconcile.mu.Lock()
 	defer s.netReconcile.mu.Unlock()
 	s.netReconcile.applied, s.netReconcile.torn, s.netReconcile.lastErr = nil, nil, nil
 	s.netDevs.mu.Lock()
-	s.netDevs.defs = nil
+	s.netDevs.defs, s.netDevs.pending, s.netDevs.loaded = nil, nil, false
 	s.netDevs.mu.Unlock()
 }
 

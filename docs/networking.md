@@ -189,20 +189,30 @@ A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
 When a network's device changes (a new `interface:` in a redeploy, say), each
-host sets up the new device and tears the old one down the way a delete does,
-unless another live network uses it or something on that host still does: a
-guest port on it, a VM whose domain definition names it (running or stopped),
-or a container whose config links to it. Such a device keeps its gateway and
-`dnsmasq`, and goes on the first pass after nothing uses it. A VM or container
-moves to the network's new device when it next starts (`lv start`,
-`lv restart`), and records a `vm.nic_moved` event. The change is refused on a
-host only where the kept device serves the subnet the new one would serve too,
-since both cannot carry its gateway; the error names what holds the old device,
-and restarting it lets the change complete. Each pass also removes a bridge
-litevirt created on that host (recorded under `/run/litevirt/bridges`, see
-below) that no live network, pending teardown, VM or container on the host
-names any more, and that has nothing plugged into it, together with its
-`dnsmasq`.
+host sets up the new device and retires the old one, unless another live
+network uses it. Retiring a device removes only what belongs to it (its
+`dnsmasq`, gateway address and bridge); the network's NAT and host-isolation
+rules follow it to the new device. A device something on the host still uses
+— a guest port on it, a VM whose domain definition names it (running or
+stopped), or a container whose config links to it — is kept until nothing
+does, and goes on the first pass after that. Each VM or container moves to the
+network's new device when it next starts (`lv start`, `lv restart`); a VM
+records a `vm.nic_moved` event. A VM live-migrated meanwhile lands on the new
+device on its target. When the new device would carry the same gateway as the
+old one and only stopped workloads are defined on the old device, the gateway
+and `dnsmasq` move to the new device at once and the old one keeps only its
+bridge for them. While a workload still RUNS on the old device, the change is
+refused on that host, naming those workloads: stop them or migrate them off
+the host, and the change completes; each then starts on the new device. A
+network on a VLAN, a host-isolated one, an operator bridge without `--dhcp`
+and a vxlan host that is not the network's DHCP gateway carry no gateway
+there and are never refused. The record of the moved-off devices is kept
+under `/run/litevirt`, so a daemon restart still finishes them. Each pass also
+removes a bridge litevirt created on that host (recorded under
+`/run/litevirt/bridges`, see below) that no live network, pending teardown,
+VM or container on the host names any more, and that has nothing plugged into
+it, together with its `dnsmasq`. A bridge litevirt did not create is never
+removed.
 
 A bridge litevirt created for a network (recorded under
 `/run/litevirt/bridges`, below) and an isolated network's bridge get a MAC

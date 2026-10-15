@@ -413,6 +413,16 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 	if db != nil {
 		_ = corrosion.DeleteHostFWIntent(ctx, db, hostName, fwScopeNet(networkName))
 	}
+	return RetireDevice(ctx, db, networkName, def, hostName)
+}
+
+// RetireDevice tears down what def's device carries for networkName on this
+// host — its dnsmasq, gateway address, the legacy NAT, SNAT, isolation and
+// proxy-ARP rules of that device, its VLAN sub-interface, and the bridge when
+// litevirt created it and nothing uses it — and nothing keyed by the network
+// itself: the network's firewall intent stays. It is the teardown of a device
+// a network has moved off, whose intent now describes the new device.
+func RetireDevice(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string) error {
 	switch def.Type {
 	case "", "bridge":
 		bridge := def.Interface

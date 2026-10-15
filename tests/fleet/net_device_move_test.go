@@ -3,6 +3,8 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 const composeIfaceChange = `name: ic
@@ -77,85 +80,308 @@ func hasVMEvent(t *testing.T, n *Node, vm, typ, result string) bool {
 	return false
 }
 
-// Lab 2, bug 2: changing `interface:` of a deployed network made the next
-// deploy fail — the new bridge got the same gateway address as the old one,
-// whose dnsmasq still ran, so the new dnsmasq exited 2 — and stranded the old
-// bridge and its dnsmasq on every node for good.
+// composeIfaceTwoVMs puts ia and ic on node-0, on network lan.
+const composeIfaceTwoVMs = `name: ic
+
+networks:
+  lan:
+    type: bridge
+    interface: IFACE
+    subnet: 172.46.0.0/24
+    dhcp: true
+
+vms:
+  ia:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+    network:
+      - name: lan
+  ic:
+    image: test
+    cpu: 1
+    memory: 256
+    placement:
+      host: node-0
+    network:
+      - name: lan
+`
+
+// netIntent is network name's host firewall intent on n, or nil.
+func netIntent(t *testing.T, n *Node, name string) *corrosion.HostFWIntent {
+	t.Helper()
+	all, err := corrosion.ListHostFWIntent(context.Background(), n.DB, n.Name)
+	if err != nil {
+		t.Fatalf("ListHostFWIntent: %v", err)
+	}
+	for i := range all {
+		if all[i].ScopeKey == "net:"+name {
+			return &all[i]
+		}
+	}
+	return nil
+}
+
+// Lab 2, bug 2, and re-review NI1/NC1: an `interface:` change on the same
+// subnet, on a host with two VMs on the network.
 //
-// The old device is never torn down while a VM's domain on that node still
-// names it, stopped or running: its gateway stays, and only a real collision
-// is refused — a new device on the same subnet — naming the VM and the
-// remedy. `lv restart` (any start) moves the VM's NIC onto the network's
-// device, and the old device goes once nothing names it.
+//   - While a VM RUNS on the old device, which carries the gateway, the move
+//     is refused, naming the running VMs only, with the remedy that works:
+//     stop or migrate them.
+//   - Once only stopped VMs are defined on it, the gateway moves to the new
+//     device at once and the old one keeps its L2 for them; each moves at its
+//     own start, in any order, and the old one is retired after the last.
+//   - Retiring the old device keeps the network's NAT intent, which names
+//     the new one.
 //
-// Mutations: drop the deviceReference check in retireReplacedDevice — the
-// redeploy tears lanaa down under ia and succeeds; drop the collision refusal
-// — the redeploy reports dnsmasq's exit 2; skip followNetworkDevices — ia
-// restarts on lanaa.
-func TestFleet_ComposeInterfaceChangeOnSameSubnetMovesEachVMAtItsRestart(t *testing.T) {
-	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+// Mutations: refuse on any user rather than a running one — the move never
+// completes with ic stopped on lanaa; drop the gateway release — lanbb's
+// dnsmasq exits 2; retire with Deprovision instead of RetireDevice — the NAT
+// intent is gone.
+func TestFleet_ComposeSameSubnetMoveWithTwoVMsOnAHost(t *testing.T) {
+	c := New(t, Options{Nodes: 1, SharedCRDT: true})
 	ctx := context.Background()
 	seedTestImageEverywhere(t, c)
-	for _, n := range c.Nodes {
-		n.Net.SetDHCPConflicts(true)
-	}
-	n0, n1 := c.Nodes[0], c.Nodes[1]
-	cl := c.SelfClient(n0)
+	n := c.Nodes[0]
+	n.Net.SetDHCPConflicts(true)
+	n.Net.SetIntents(true)
+	cl := c.SelfClient(n)
 
-	msgs, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChange, "IFACE", "lanaa"))
-	if err != nil {
+	if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceTwoVMs, "IFACE", "lanaa")); err != nil {
 		t.Fatalf("first deploy: %v", err)
 	}
-	for _, p := range msgs {
-		if p.Phase == "error" {
-			t.Fatalf("first deploy failed: %s: %s", p.VmName, p.Error)
-		}
-	}
-	if got := vmBridges(n0, "ia"); got != "lanaa" {
-		t.Fatalf("ia is defined on %q, want lanaa", got)
+	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "ic", Force: true}); err != nil {
+		t.Fatalf("stop ic: %v", err)
 	}
 
-	_, err = deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChange, "IFACE", "lanbb"))
-	for _, want := range []string{"VM ia", "lanaa", "lanbb", "lv restart"} {
+	_, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceTwoVMs, "IFACE", "lanbb"))
+	for _, want := range []string{"VM ia", "lanaa", "lanbb", "Stop or migrate"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
-			t.Fatalf("redeploy onto lanbb on the same subnet while ia is on lanaa: err=%v, want a refusal containing %q", err, want)
+			t.Fatalf("redeploy onto lanbb while ia runs on lanaa: err=%v, want a refusal containing %q", err, want)
 		}
 	}
-	for _, n := range c.Nodes {
-		if got := n.Net.Serving(); strings.Join(got, ",") != "lanaa" {
-			t.Errorf("%s serves %v while its VM is on lanaa, want [lanaa] untouched", n.Name, got)
-		}
+	if strings.Contains(err.Error(), "VM ic") {
+		t.Errorf("the refusal names stopped ic, which does not hold the move up: %v", err)
+	}
+	if got := n.Net.Serving(); strings.Join(got, ",") != "lanaa" {
+		t.Errorf("serving %v while ia runs on lanaa, want [lanaa]", got)
 	}
 
-	if _, err := cl.RestartVM(ctx, &pb.RestartVMRequest{Name: "ia"}); err != nil {
-		t.Fatalf("restart ia: %v", err)
+	// The remedy: stop the running VM. The next pass moves the gateway.
+	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "ia", Force: true}); err != nil {
+		t.Fatalf("stop ia: %v", err)
 	}
-	if got := vmBridges(n0, "ia"); got != "lanbb" {
-		t.Errorf("ia restarted on %q, want lanbb, the device its network is on now", got)
+	reconcileNetworks(t, n)
+	if got := n.Net.Serving(); strings.Join(got, ",") != "lanbb" {
+		t.Errorf("serving %v with only stopped VMs on lanaa, want the gateway on [lanbb]", got)
 	}
-	if !hasVMEvent(t, n0, "ia", "vm.nic_moved", "ok") {
+	if b, _ := n.Net.CreatedBridges(); strings.Join(b, ",") != "lanaa,lanbb" {
+		t.Errorf("bridges %v while ia and ic are defined on lanaa, want [lanaa lanbb]", b)
+	}
+
+	// ic starts first, then ia: each moves; lanaa goes after the last.
+	if _, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "ic"}); err != nil {
+		t.Fatalf("start ic: %v", err)
+	}
+	if got := vmBridges(n, "ic"); got != "lanbb" {
+		t.Errorf("ic started on %q, want lanbb", got)
+	}
+	if b, _ := n.Net.CreatedBridges(); strings.Join(b, ",") != "lanaa,lanbb" {
+		t.Errorf("bridges %v while stopped ia is still defined on lanaa, want [lanaa lanbb]", b)
+	}
+	if _, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "ia"}); err != nil {
+		t.Fatalf("start ia: %v", err)
+	}
+	if got := vmBridges(n, "ia"); got != "lanbb" {
+		t.Errorf("ia started on %q, want lanbb", got)
+	}
+	if !hasVMEvent(t, n, "ia", "vm.nic_moved", "ok") {
 		t.Errorf("no vm.nic_moved event says ia's NIC moved")
 	}
-	if got := n0.Net.Serving(); strings.Join(got, ",") != "lanbb" {
-		t.Errorf("%s serves %v after ia moved, want [lanbb]", n0.Name, got)
+	// ia's start retired lanaa. The network's intent names lanbb and must
+	// still be there: nothing re-provisions the network to put it back.
+	if b, _ := n.Net.CreatedBridges(); strings.Join(b, ",") != "lanbb" {
+		t.Errorf("bridges %v once both VMs moved, want [lanbb]", b)
 	}
-	if got := n1.Net.Serving(); strings.Join(got, ",") != "lanaa" {
-		t.Errorf("%s serves %v while ib is still on lanaa, want [lanaa]", n1.Name, got)
+	in := netIntent(t, n, "ic_lan")
+	if in == nil || in.Bridge != "lanbb" || in.MasqueradeSubnet != "172.46.0.0/24" {
+		t.Errorf("ic_lan's firewall intent after the move = %+v, want NAT of 172.46.0.0/24 on lanbb", in)
+	}
+}
+
+// Re-review NI2: a network that carries no gateway on this host — on a VLAN,
+// or host-isolated — moves on the same subnet with its VM running; nothing
+// collides, so nothing is refused. The isolation intent survives the
+// retirement of the old device.
+//
+// Mutation: collide on the same subnet alone (drop ServingGateway and
+// WouldServeGateway) — both redeploys are refused.
+func TestFleet_SameSubnetMoveWithoutAGatewayIsNotRefused(t *testing.T) {
+	for _, tc := range []struct{ name, extra string }{
+		{"vlan", "    vlan: 30\n    underlay: eth0\n"},
+		{"host-isolation", "    host-isolation: true\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(t, Options{Nodes: 1, SharedCRDT: true})
+			ctx := context.Background()
+			seedTestImageEverywhere(t, c)
+			n := c.Nodes[0]
+			n.Net.SetDHCPConflicts(true)
+			n.Net.SetIntents(true)
+			cl := c.SelfClient(n)
+			yaml := strings.Replace(composeIfaceChangeOneVM, "    dhcp: true\n", "    dhcp: true\n"+tc.extra, 1)
+			if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(yaml, "IFACE", "lanaa")); err != nil {
+				t.Fatalf("first deploy: %v", err)
+			}
+			if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(yaml, "IFACE", "lanbb")); err != nil {
+				t.Fatalf("redeploy onto lanbb with ia running and no gateway here: %v", err)
+			}
+			if _, err := cl.RestartVM(ctx, &pb.RestartVMRequest{Name: "ia"}); err != nil {
+				t.Fatalf("restart ia: %v", err)
+			}
+			reconcileNetworks(t, n)
+			if got := vmBridges(n, "ia"); got != "lanbb" {
+				t.Errorf("ia restarted on %q, want lanbb", got)
+			}
+			if tc.name == "host-isolation" {
+				if in := netIntent(t, n, "ic_lan"); in == nil || !in.Isolate || in.Bridge != "lanbb" {
+					t.Errorf("ic_lan's isolation intent after the move = %+v, want isolation on lanbb", in)
+				}
+			}
+		})
+	}
+}
+
+// Re-review NI3: after a daemon restart, a stopped VM's network has moved
+// and its new device cannot be set up. The start leaves the VM on its old
+// bridge, which is never swept for the attempt, and the VM starts there.
+//
+// Mutation: sweep the old bridge when the new provision fails — lanaa is
+// swept.
+func TestFleet_FailedMoveAtStartKeepsTheOldBridge(t *testing.T) {
+	c := New(t, Options{Nodes: 1, SharedCRDT: true})
+	ctx := context.Background()
+	seedTestImageEverywhere(t, c)
+	n := c.Nodes[0]
+	cl := c.SelfClient(n)
+	if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChangeOneVM, "IFACE", "lanaa")); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "ia", Force: true}); err != nil {
+		t.Fatalf("stop ia: %v", err)
+	}
+	n.Server.ForgetNetworkReconcileForTests()
+	def, _ := json.Marshal(compose.NetworkDef{Type: "bridge", Interface: "lanbb", Subnet: "172.47.0.0/24"})
+	if err := corrosion.UpsertNetwork(ctx, n.DB, corrosion.NetworkRecord{Name: "ic_lan", StackName: "ic", Type: "bridge", Config: string(def)}); err != nil {
+		t.Fatal(err)
+	}
+	n.Net.FailProvision("ic_lan", errors.New("create bridge lanbb: exit status 2"))
+
+	if _, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "ia"}); err != nil {
+		t.Fatalf("start ia: %v", err)
+	}
+	if got := vmBridges(n, "ia"); got != "lanaa" {
+		t.Errorf("ia started on %q, want lanaa (its network's new device failed)", got)
+	}
+	if got := n.Net.Sweeps("lanaa"); got != 0 {
+		t.Errorf("lanaa, ia's bridge, was swept %d times", got)
+	}
+	if b, _ := n.Net.CreatedBridges(); !strings.Contains(strings.Join(b, ","), "lanaa") {
+		t.Errorf("bridges %v, want lanaa kept", b)
+	}
+	if !hasVMEvent(t, n, "ia", "vm.nic_moved", "error") {
+		t.Errorf("no vm.nic_moved error event says why ia stayed on lanaa")
+	}
+}
+
+// Re-review NI5: the record of a moved-off device survives a daemon restart.
+// An operator's bridge (no litevirt record, so no sweep) that a network
+// moved off while a VM ran on it has litevirt's gateway and dnsmasq retired
+// after the restart, once the VM has gone; the bridge itself is the
+// operator's and stays.
+//
+// Mutation: keep the record in memory only (no state path) — opaa keeps
+// serving after the restart.
+func TestFleet_MovedOffDeviceRecordSurvivesARestart(t *testing.T) {
+	c := New(t, Options{Nodes: 1, SharedCRDT: true})
+	ctx := context.Background()
+	seedTestImageEverywhere(t, c)
+	n := c.Nodes[0]
+	n.Server.SetNetworkDeviceStatePath(filepath.Join(t.TempDir(), "network-devices.json"))
+	n.Net.SetOperatorBridge("opaa")
+	cl := c.SelfClient(n)
+	if _, err := deployStream(t, ctx, cl, strings.ReplaceAll(composeIfaceChangeOneVM, "IFACE", "opaa")); err != nil {
+		t.Fatalf("first deploy: %v", err)
+	}
+	moved := strings.ReplaceAll(strings.ReplaceAll(composeIfaceChangeOneVM, "IFACE", "opbb"), "172.46.0.0/24", "172.47.0.0/24")
+	if _, err := deployStream(t, ctx, cl, moved); err != nil {
+		t.Fatalf("redeploy onto opbb: %v", err)
+	}
+	if got := n.Net.Serving(); strings.Join(got, ",") != "opaa,opbb" {
+		t.Fatalf("serving %v while ia runs on opaa, want [opaa opbb]", got)
 	}
 
-	if _, err := c.SelfClient(n1).RestartVM(ctx, &pb.RestartVMRequest{Name: "ib"}); err != nil {
-		t.Fatalf("restart ib: %v", err)
+	n.Server.ForgetNetworkReconcileForTests() // a daemon restart
+	if _, err := cl.StopVM(ctx, &pb.StopVMRequest{Name: "ia", Force: true}); err != nil {
+		t.Fatalf("stop ia: %v", err)
 	}
-	if got := vmBridges(n1, "ib"); got != "lanbb" {
-		t.Errorf("ib restarted on %q, want lanbb", got)
+	if _, err := cl.StartVM(ctx, &pb.StartVMRequest{Name: "ia"}); err != nil {
+		t.Fatalf("start ia: %v", err)
 	}
+	reconcileNetworks(t, n)
+	if got := n.Net.Serving(); strings.Join(got, ",") != "opbb" {
+		t.Errorf("serving %v after the restart once ia left opaa, want [opbb]", got)
+	}
+	if got := n.Net.Retires("opaa"); got != 1 {
+		t.Errorf("opaa retired %d times, want 1", got)
+	}
+}
+
+// Re-review NI4: a VM still running on the device its network moved off is
+// live-migrated: it lands on the network's device now on the target, which
+// never had the old one.
+//
+// Mutation: drop NICBridges from the migration parameters — the guest lands
+// on lanaa.
+func TestFleet_LiveMigrationMovesANICOntoItsNetworksDevice(t *testing.T) {
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	ctx := context.Background()
+	src, dst := c.Nodes[0], c.Nodes[1]
 	for _, n := range c.Nodes {
-		if got := n.Net.Serving(); strings.Join(got, ",") != "lanbb" {
-			t.Errorf("%s serves %v once its VM moved, want [lanbb]", n.Name, got)
+		setHostCapacity(t, c, n.Name, 64, 65536)
+	}
+	cfg, _ := json.Marshal(compose.NetworkDef{Type: "bridge", Interface: "lanbb", Subnet: "172.47.0.0/24"})
+	if err := corrosion.UpsertNetwork(ctx, src.DB, corrosion.NetworkRecord{Name: "mv_lan", StackName: "mv", Type: "bridge", Config: string(cfg)}); err != nil {
+		t.Fatal(err)
+	}
+	const mac = "52:54:00:47:00:07"
+	if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{
+		Name: "mover", HostName: src.Name, State: "running", Spec: `{"name":"mover","cpu":1,"memory_mib":512}`,
+		CPUActual: 1, MemActual: 512,
+	}, []corrosion.InterfaceRecord{{VMName: "mover", NetworkName: "mv_lan", MAC: mac}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	dom := `<domain type="kvm"><name>mover</name><memory unit="MiB">512</memory><vcpu>1</vcpu><devices>` +
+		`<interface type="bridge"><mac address="` + mac + `"/><source bridge="lanaa"/><model type="virtio"/></interface>` +
+		`</devices></domain>`
+	src.Virt.SetInactiveXML("mover", dom)
+	src.Virt.SetActiveXML("mover", dom)
+	src.Virt.SetState("mover", "running")
+	src.Virt.OnMigrateToTarget = func(name, _ string, p lv.MigrateParams) error {
+		x := p.DestXML
+		if x == "" {
+			x = dom
 		}
-		if b, _ := n.Net.CreatedBridges(); strings.Join(b, ",") != "lanbb" {
-			t.Errorf("%s keeps the bridges %v, want [lanbb]", n.Name, b)
-		}
+		dst.Virt.LandMigrated(x)
+		return nil
+	}
+	if err := migrateAt(t, c, src, "mover", dst.Name); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if got := strings.Join(domainBridges(dst.Virt.DefinedXML("mover")), ","); got != "lanbb" {
+		t.Errorf("mover landed on %q on %s, want lanbb, the device mv_lan is on now", got, dst.Name)
 	}
 }
 

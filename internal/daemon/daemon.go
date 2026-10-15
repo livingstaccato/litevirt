@@ -2766,6 +2766,7 @@ func (d *Daemon) newServer() *grpcapi.Server {
 // wireServer is newServer's wiring, on a server already built.
 func (d *Daemon) wireServer(svc *grpcapi.Server) {
 	svc.SetHostAddress(d.hostAddress())
+	svc.SetNetworkDeviceStatePath(grpcapi.DefaultNetworkDeviceStatePath)
 	// Release features (capabilities.Feature) open through the checker's
 	// WithFeature: the release token's latch plus the replicated used bit.
 	svc.SetReleaseFeatureGate(d.checker)

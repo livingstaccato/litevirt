@@ -40,6 +40,10 @@ type NetProvFake struct {
 	created  map[string]bool
 	operator map[string]bool
 	sweeps   map[string]int // bridge → RemoveOrphanedBridge removals
+	// intents makes Provision and Deprovision write and delete the network's
+	// host firewall intent (net:<name>) as the real ones do (SetIntents).
+	intents bool
+	retires map[string]int // device → RetireDevice calls
 	// dhcpConflicts makes Provision fail the way the real dnsmasq does when
 	// another network provisioned on this node already serves an overlapping
 	// subnet: both listen on the same gateway address, so the second one
@@ -119,8 +123,13 @@ func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name 
 			}
 		}
 	}
+	if f.intents && db != nil {
+		if err := fakeRecordIntent(ctx, db, name, def, dev, hostName); err != nil {
+			return "", err
+		}
+	}
 	f.up[name] = dev
-	if def.Subnet != "" {
+	if def.Subnet != "" && fakeServes(def) {
 		f.devSubnets[dev] = def.Subnet
 	}
 	if (def.Type == "" || def.Type == "bridge" || def.Type == "isolated") && !f.operator[dev] {
@@ -130,16 +139,90 @@ func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name 
 	return dev, nil
 }
 
-// Deprovision tears down what Provision set up for def's device.
-func (f *NetProvFake) Deprovision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _ string) error {
+// Deprovision tears down what Provision set up for def's device, and the
+// network's firewall intent.
+func (f *NetProvFake) Deprovision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.intents && db != nil {
+		if err := corrosion.DeleteHostFWIntent(ctx, db, hostName, "net:"+name); err != nil {
+			return err
+		}
+	}
 	delete(f.up, name)
 	delete(f.devSubnets, dev)
 	delete(f.created, dev)
 	f.deprovisions[name]++
 	return nil
+}
+
+// RetireDevice tears down what Provision set up for def's device and nothing
+// keyed by the network: its firewall intent stays, as with the real one.
+func (f *NetProvFake) RetireDevice(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _ string) error {
+	dev := network.BridgeName(name, def)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.devSubnets, dev)
+	delete(f.created, dev)
+	if f.retires == nil {
+		f.retires = map[string]int{}
+	}
+	f.retires[dev]++
+	return nil
+}
+
+// ReleaseDeviceServices stops what def's device serves, keeping the device.
+func (f *NetProvFake) ReleaseDeviceServices(name string, def compose.NetworkDef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.devSubnets, network.BridgeName(name, def))
+}
+
+// ServingGateway reports whether def's device serves a subnet here.
+func (f *NetProvFake) ServingGateway(name string, def compose.NetworkDef) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.devSubnets[network.BridgeName(name, def)]
+	return ok
+}
+
+// WouldServeGateway is the real gate on the definition alone: the fleet has
+// no host bridges for an operator to have made.
+func (f *NetProvFake) WouldServeGateway(_ context.Context, _ *corrosion.Client, _ string, def compose.NetworkDef, _ string) bool {
+	return fakeServes(def)
+}
+
+// fakeServes is network.DHCPWouldServe for a bridge litevirt makes, and for
+// a vxlan network's gateway host (the fleet's nodes all are).
+func fakeServes(def compose.NetworkDef) bool {
+	return network.DHCPWouldServe(def, network.DHCPHostFacts{IsGatewayHost: true})
+}
+
+// fakeRecordIntent writes the intent the real Provision writes for def.
+func fakeRecordIntent(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, dev, hostName string) error {
+	scope := "net:" + name
+	switch {
+	case def.HostIsolation:
+		return corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{ScopeKey: scope, Bridge: dev, Isolate: true})
+	case def.Subnet != "" && def.NATEnabled() && def.VLAN == 0:
+		return corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{ScopeKey: scope, Bridge: dev, MasqueradeSubnet: def.Subnet})
+	}
+	return corrosion.DeleteHostFWIntent(ctx, db, hostName, scope)
+}
+
+// SetIntents turns on writing and deleting the network firewall intents.
+func (f *NetProvFake) SetIntents(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.intents = on
+}
+
+// Retires counts RetireDevice calls for device dev.
+func (f *NetProvFake) Retires(dev string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.retires[dev]
 }
 
 // CreatedBridges lists the bridges litevirt made here and still has.

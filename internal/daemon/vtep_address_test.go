@@ -25,7 +25,15 @@ func (p *recProv) Deprovision(context.Context, *corrosion.Client, string, compos
 }
 func (p *recProv) Provisioned(string, compose.NetworkDef) bool { return true }
 func (p *recProv) RemoveUnusedBridge(string) (bool, error)     { return false, nil }
-func (p *recProv) GuestPorts(string) ([]string, error)         { return nil, nil }
+func (p *recProv) RetireDevice(context.Context, *corrosion.Client, string, compose.NetworkDef, string) error {
+	return nil
+}
+func (p *recProv) ReleaseDeviceServices(string, compose.NetworkDef) {}
+func (p *recProv) ServingGateway(string, compose.NetworkDef) bool   { return false }
+func (p *recProv) WouldServeGateway(context.Context, *corrosion.Client, string, compose.NetworkDef, string) bool {
+	return false
+}
+func (p *recProv) GuestPorts(string) ([]string, error) { return nil, nil }
 func (p *recProv) SyncFDB(context.Context, *corrosion.Client, string, compose.NetworkDef, string) error {
 	return nil
 }

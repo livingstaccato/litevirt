@@ -70,6 +70,28 @@ func InterfaceBridges(domXML string) map[string]string {
 	return out
 }
 
+// SetNICBridgeConfig moves the NIC with MAC mac onto bridge in the domain's
+// persistent definition only: a domain running now keeps its live NIC, and
+// the next cold boot uses bridge.
+func (c *Client) SetNICBridgeConfig(domainName, mac, bridge string) error {
+	dom, err := c.virt.DomainLookupByName(domainName)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", domainName, err)
+	}
+	inactive, err := c.DumpXMLInactive(domainName)
+	if err != nil {
+		return err
+	}
+	elem, ok := RetargetInterfaceXML(inactive, mac, bridge)
+	if !ok {
+		return fmt.Errorf("domain %s has no bridge interface with MAC %s", domainName, mac)
+	}
+	if err := c.virt.DomainUpdateDeviceFlags(dom, elem, golibvirt.DomainDeviceModifyConfig); err != nil {
+		return fmt.Errorf("update NIC %s of %s (config): %w", mac, domainName, err)
+	}
+	return nil
+}
+
 // SetNICBridge moves the domain's NIC with MAC mac onto bridge, in place: the
 // same device, the same MAC, no detach and no redefine. The persistent
 // definition is updated so a cold boot keeps it, and a running domain is

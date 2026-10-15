@@ -767,6 +767,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 			// The destination definition carries each rbd disk's monitors as
 			// its pool resolves them now (a re-addressed cluster's).
 			RBDLocators: s.rbdLocatorsOf(ctx, vm.Name),
+			// A NIC whose network moved since the domain was defined lands on
+			// the network's device now.
+			NICBridges: s.migrationNICBridges(ctx, vm.Name),
 		}
 		armed.apply(&params)
 		logVNCPasswordStrip(vm.Name, req.TargetHost, params.StripVNCPassword)

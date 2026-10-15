@@ -3113,39 +3113,85 @@ type fenceRecord struct {
 // no fence yet). The recency filter is Go-side on RFC3339, mirroring
 // fenceWithinWindow. An IPMI fence finds the row this cycle just inserted; a
 // manual fence finds the operator's "manual-confirmed" row (the fence-time
-// "manual"/"partial" row is not proof-grade).
+// "manual"/"partial" row is not proof-grade). See newestProofGradeFenceWhy.
 func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (fenceRecord, bool) {
+	rec, ok, _ := c.newestProofGradeFenceWhy(ctx, host)
+	return rec, ok
+}
+
+// newestProofGradeFenceWhy is newestProofGradeFence, and when a proof-grade
+// row exists but proves nothing now, why. The life cut (fenceRowCutoff) does
+// not apply once the host is recorded down, which it is by the time a
+// recovery binds a transfer, so two more rules keep an earlier outage's row
+// from binding:
+//
+//   - a fence attempt that is not proof-grade, newer than the row, means the
+//     host was failing again since — running in between, as
+//     corrosion.FenceRecordProvesOff reads it — and proves nothing about it
+//     now. A "manual" attempt is not one: it is the cluster asking for a
+//     confirmation, and a confirmation made before it (the afresh path) is
+//     judged by the next rule. A row in the same second as the proof-grade
+//     one does not outrank it.
+//   - an operator confirmation binds only while it stands for the outage the
+//     host is in now (confirmationStands): nobody, this node's probe
+//     included, has seen the host answer since it. An IPMI or Redfish row in
+//     the same second is preferred: it needs no such judgement.
+func (c *Coordinator) newestProofGradeFenceWhy(ctx context.Context, host string) (fenceRecord, bool, string) {
 	rows, err := c.db.Query(ctx,
 		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
 		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
-		return fenceRecord{}, false
+		return fenceRecord{}, false, ""
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
 	life, lifeKnown := c.fenceRowCutoff(ctx, host)
-	var best time.Time
+	var best, newestUnverified time.Time
 	var out fenceRecord
 	found := false
 	for _, r := range rows {
-		if !corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
-			continue
-		}
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
-		if perr != nil || !ts.After(cutoff) || (lifeKnown && ts.Before(life)) {
+		if perr != nil {
 			continue
 		}
-		if !found || ts.After(best) {
+		method, result := r.String("method"), r.String("result")
+		if !corrosion.FenceProofGrade(method, result) {
+			if (result == "fenced" || result == "partial") && method != "manual" && ts.After(newestUnverified) {
+				newestUnverified = ts
+			}
+			continue
+		}
+		if !ts.After(cutoff) || (lifeKnown && ts.Before(life)) {
+			continue
+		}
+		preferred := found && ts.Equal(best) && out.Result == "manual-confirmed" && result != "manual-confirmed"
+		if !found || ts.After(best) || preferred {
 			best, found = ts, true
 			out = fenceRecord{
 				ID:     r.String("id"),
-				Method: r.String("method"),
-				Result: r.String("result"),
+				Method: method,
+				Result: result,
 				Detail: r.String("detail"),
 				TS:     r.String("timestamp"),
 			}
 		}
 	}
-	return out, found
+	if !found {
+		return fenceRecord{}, false, ""
+	}
+	if newestUnverified.After(best) {
+		return fenceRecord{}, false, "a fence attempt that is not proof-grade (" +
+			newestUnverified.UTC().Format(time.RFC3339) + ") is newer than the proof-grade fence " + out.ID
+	}
+	if out.Result == "manual-confirmed" {
+		if why, stands := c.confirmationStands(ctx, host, best); !stands {
+			if why == "" {
+				why = "it could not be judged this cycle"
+			}
+			return fenceRecord{}, false, "the operator confirmation " + out.ID + " does not stand for this outage: " +
+				strings.Replace(why, "the fence", "the confirmation", 1)
+		}
+	}
+	return out, true, ""
 }
 
 // proofGradeFenceRef returns the fence_epoch binding for the newest proof-grade
@@ -3153,11 +3199,18 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 // executor re-reads FenceID from fencing_log and re-verifies it (never a stale
 // hosts.state).
 func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
-	rec, ok := c.newestProofGradeFence(ctx, host)
+	ref, _ := c.proofGradeFenceRefWhy(ctx, host)
+	return ref
+}
+
+// proofGradeFenceRefWhy is proofGradeFenceRef, with why a proof-grade row on
+// record does not bind (newestProofGradeFenceWhy) when ref is "".
+func (c *Coordinator) proofGradeFenceRefWhy(ctx context.Context, host string) (string, string) {
+	rec, ok, why := c.newestProofGradeFenceWhy(ctx, host)
 	if !ok {
-		return ""
+		return "", why
 	}
-	return corrosion.FenceEpochRef{Host: host, FenceID: rec.ID, TS: rec.TS}.String()
+	return corrosion.FenceEpochRef{Host: host, FenceID: rec.ID, TS: rec.TS}.String(), ""
 }
 
 // autoPromoteEnabled reports whether vmName has a replication schedule with
@@ -3532,8 +3585,12 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// build would not record so. A host already 'offline' is not written
 	// again: that would move the moment its current life began
 	// (corrosion.HostFenceLife) past the fence it is recovering on.
-	// The host's current life is read first: recording it 'offline' ends the
-	// life fenceRowCutoff measures (confirmedOffNow).
+	// The host's current life is read before that write, which would end the
+	// life fenceRowCutoff measures (confirmedOffNow). It is known only while
+	// the host is still recorded active here, which in practice means a fence
+	// that failed: a successful one has already recorded the host fenced or
+	// offline with its row (failover), and a resumed or afresh recovery finds
+	// it so. For those, confirmedOffNow's gates rest on confirmationStands.
 	life, lifeKnown := c.fenceRowCutoff(ctx, h.Name)
 	if fenceRecordState(h, fr, latched) != "fenced" && h.State != "offline" {
 		c.markHostState(ctx, h.Name, "offline")
@@ -3687,7 +3744,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.noteHAHeldRecovery(h.Name)
 		return
 	}
-	fenceEpoch := c.proofGradeFenceRef(ctx, h.Name)
+	fenceEpoch, fenceEpochWhy := c.proofGradeFenceRefWhy(ctx, h.Name)
 	// Recovery is running: whatever held it back before no longer does, and
 	// a refusal below records what holds it now (the stall alert's reason).
 	delete(c.holdReason, h.Name)
@@ -3849,7 +3906,13 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if fenceEpoch == "" && c.sharedStorageFenceEnforced(ctx) {
 			if disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name); derr == nil && corrosion.VMHasSharedDisk(ctx, c.db, disks, c.hostName) {
 				slog.Error("failover: shared-disk VM transfer refused — no proof-grade fence of old owner (storage_unverified); run 'lv host fence-confirm' or set an IPMI or Redfish fence strategy",
-					"vm", vm.Name, "old_owner", h.Name)
+					"vm", vm.Name, "old_owner", h.Name, "reason", fenceEpochWhy)
+				why := "no proof-grade fence of the host is on record"
+				if fenceEpochWhy != "" {
+					why = fenceEpochWhy
+				}
+				c.noteHold(h.Name, "a shared-disk VM transfer needs a proof-grade fence of the host, and "+why+
+					"; confirm "+h.Name+" is powered off, then run 'lv host fence-confirm "+h.Name+"', or set an IPMI or Redfish fence strategy")
 				c.noteGateRefused(corrosion.ActionReschedule, health.ReasonStorageUnverified)
 				c.mVM(ActionReschedule, ResultError, ErrStorageUnverified)
 				continue

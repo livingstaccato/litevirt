@@ -141,6 +141,7 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+	fwStore          *lv.FirmwareStore                                 // this host's NVRAM and swtpm state; set via SetFirmwareStore
 
 	// recreateOverlay rebuilds a missing disk as an overlay of its image
 	// (SetRecreateOverlay); nil builds it in a store of its own, unheld.
@@ -396,6 +397,14 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its gRPC server. NewReconciler starts from the production
+// layout under dataDir.
+func (r *Reconciler) SetFirmwareStore(fw *lv.FirmwareStore) { r.fwStore = fw }
+
+// FirmwareStore is this host's firmware store.
+func (r *Reconciler) FirmwareStore() *lv.FirmwareStore { return r.fwStore }
+
 // SetSparePCIeRootPorts sets `pci.spare_pcie_root_ports` — see
 // daemon.PCIConfig.SparePCIeRootPorts.
 func (r *Reconciler) SetSparePCIeRootPorts(n int) { r.sparePCIeRootPortsCfg = n }
@@ -438,6 +447,7 @@ func NewReconciler(hostName, dataDir string, db *corrosion.Client, virt LibvirtB
 	return &Reconciler{
 		hostName: hostName,
 		dataDir:  dataDir,
+		fwStore:  lv.NewFirmwareStore(dataDir),
 		db:       db,
 		virt:     virt,
 	}
@@ -2003,7 +2013,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// Whether this VM's UEFI vars were here before this pass defined its
 	// domain: vars a boot creates for a since-deleted record are this pass's
 	// own to remove (start_row_gone.go).
-	nvramBefore := nvramExists(r.dataDir, vm.Name)
+	nvramBefore := nvramExists(r.fwStore, vm.Name)
 
 	// A start the operator cancelled meanwhile (`lv stop --force`) is not
 	// made: the start lease can run out under a slow start (vmLockTTL),
@@ -2401,7 +2411,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// fresh TPM and silently breaking BitLocker.
 	vmCfg.UUID = spec.Uuid
 	r.firmware.ApplyTo(&vmCfg, r.dataDir, vm.Name, spec.SecureBoot, spec.Tpm)
-	if spec.Tpm && !lv.HasTPMState(spec.Uuid) {
+	if spec.Tpm && !r.fwStore.HasTPMState(spec.Uuid) {
 		slog.Error("reconciler: vTPM VM has no local TPM state; refusing to start with a fresh TPM", "vm", vm.Name)
 		return "", false, "vTPM state missing on this host (would break BitLocker)" // non-retryable
 	}
@@ -2409,7 +2419,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// whose vars aren't present here can't be rebuilt faithfully — refuse rather
 	// than redefine with fresh vars from the template (would lose enrolled keys).
 	uefiFW := spec.Firmware == "uefi" || spec.Firmware == ""
-	if (spec.SecureBoot || spec.Tpm) && uefiFW && !lv.HasNvram(r.dataDir, vm.Name) {
+	if (spec.SecureBoot || spec.Tpm) && uefiFW && !r.fwStore.HasNvram(vm.Name) {
 		slog.Error("reconciler: firmware VM has no local UEFI NVRAM; refusing to start with fresh vars", "vm", vm.Name)
 		return "", false, "UEFI NVRAM missing on this host (would lose Secure Boot keys)" // non-retryable
 	}

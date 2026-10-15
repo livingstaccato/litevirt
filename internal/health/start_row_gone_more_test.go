@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // recreateVM1 deletes vm1's row and creates it again on node-a: another
@@ -122,7 +121,7 @@ func TestStartPendingVM_RowGoneDuringStartNvram(t *testing.T) {
 		t.Run(map[bool]string{false: "created-by-the-boot", true: "there-before"}[before], func(t *testing.T) {
 			db, fake, r, vm := startRowGoneFixture(t, false)
 			ctx := context.Background()
-			nvram := lv.NvramPath(r.dataDir, "vm1")
+			nvram := r.fwStore.NvramPath("vm1")
 			if err := os.MkdirAll(filepath.Dir(nvram), 0o700); err != nil {
 				t.Fatal(err)
 			}

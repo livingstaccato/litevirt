@@ -1021,6 +1021,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	firmwarePaths := libvirt.ResolveFirmwarePaths()
 	svc.SetFirmwarePaths(firmwarePaths)
 	reconciler.SetFirmwarePaths(firmwarePaths)
+	// One firmware store (NVRAM under the data dir, swtpm under libvirt's
+	// root) for the host, shared by the server and the reconciler.
+	fwStore := libvirt.NewFirmwareStore(d.cfg.DataDir)
+	svc.SetFirmwareStore(fwStore)
+	reconciler.SetFirmwareStore(fwStore)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)

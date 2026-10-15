@@ -696,7 +696,7 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 		s.virt.UndefineDomain(req.Target, false)
 		cleanup()
 		os.Remove(cloudInitISO)
-		lv.WipeFirmwareState(s.dataDir, req.Target, srcSpec.Uuid)
+		s.fw().WipeFirmwareState(req.Target, srcSpec.Uuid)
 	}
 
 	state := "stopped"

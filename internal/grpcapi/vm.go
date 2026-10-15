@@ -1242,7 +1242,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := gs.refusal(spec); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
 		return nil, status.Errorf(codes.Internal, "vm create: %v", err)
 	}
 
@@ -1256,7 +1256,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
+		s.fw().WipeFirmwareState(spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 	s.ensureSparePCIeRootPorts(spec.Name)
@@ -1278,7 +1278,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.virt.UndefineDomain(spec.Name, false)
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
+		s.fw().WipeFirmwareState(spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
 		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
 	}
 
@@ -1372,7 +1372,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		_ = s.virt.UndefineDomain(spec.Name, false)
 		claims.releaseAll(ctx)
 		cleanupDisks()
-		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
 		return nil, ferr
 	}
 	// The grants were checked before the define (gs.refusal above).
@@ -1399,7 +1399,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			_ = s.virt.UndefineDomain(spec.Name, false)
 			cleanupDisks()
-			lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+			s.fw().WipeFirmwareState(spec.Name, spec.Uuid)
 			claims.releaseAll(ctx)
 			return nil, status.Errorf(codes.Internal, "persist VM state: %v", err)
 		}
@@ -3321,11 +3321,11 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			Uuid string `json:"uuid"`
 		}
 		_ = json.Unmarshal([]byte(vm.Spec), &sp)
-		lv.WipeFirmwareState(s.dataDir, req.Name, sp.Uuid)
+		s.fw().WipeFirmwareState(req.Name, sp.Uuid)
 	} else if usesFirmwareState(vm.Spec) {
 		// --keep-disks keeps firmware state too; record name→uuid so the retained
 		// (UUID-keyed) swtpm tree is locatable for an explicit restore later (G1).
-		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
+		if err := s.fw().WriteRetainedFirmwareMarker(req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
 			slog.Warn("failed to write retained-firmware marker", "vm", req.Name, "error", err)
 		}
 	}
@@ -4452,7 +4452,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	s.sweepVMDiskDebris(ctx, req.Name)
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
-	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
+	s.fw().WipeFirmwareState(req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
@@ -6203,13 +6203,13 @@ func (s *Server) validateRedefineRequest(ctx context.Context, spec *pb.VMSpec, r
 	// Toggling secure_boot/tpm once firmware state exists can brick an
 	// unsigned guest (SB) or orphan BitLocker (TPM) — refuse without --force.
 	if req.SecureBoot != nil && *req.SecureBoot != spec.SecureBoot {
-		if !req.Force && (lv.HasNvram(s.dataDir, spec.Name) || lv.HasTPMState(spec.Uuid)) {
+		if !req.Force && (s.fw().HasNvram(spec.Name) || s.fw().HasTPMState(spec.Uuid)) {
 			return status.Errorf(codes.FailedPrecondition,
 				"changing secure_boot on %q with existing firmware state may render it unbootable; pass --force to override", req.Name)
 		}
 	}
 	if req.Tpm != nil && *req.Tpm != spec.Tpm {
-		if !req.Force && lv.HasTPMState(spec.Uuid) {
+		if !req.Force && s.fw().HasTPMState(spec.Uuid) {
 			return status.Errorf(codes.FailedPrecondition,
 				"changing tpm on %q with existing TPM state may orphan BitLocker; pass --force to override", req.Name)
 		}

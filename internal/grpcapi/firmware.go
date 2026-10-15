@@ -110,7 +110,7 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 	// a fresh UUID at create, so it can never inherit an old TPM secret — no guard
 	// needed there (any retained swtpm state is orphaned, only restorable explicitly).
 	if cfg.NvramPath != "" {
-		if lv.HasNvram(s.dataDir, spec.Name) {
+		if s.fw().HasNvram(spec.Name) {
 			return status.Errorf(codes.FailedPrecondition,
 				"UEFI vars already exist for %q at %s: a prior `delete --keep-disks` keeps them on purpose (restore the VM "+
 					"instead of recreating it), and a guest the reconciler booted for a since-deleted VM can leave them "+
@@ -133,11 +133,11 @@ func (s *Server) applyFirmwareConfig(cfg *lv.VMConfig, spec *pb.VMSpec) error {
 // capture for backup/migration must gate on this first or they'd ship a
 // half-bundle that restores a VM with a fresh TPM and breaks BitLocker (G1).
 func (s *Server) firmwarePresent(vmName string, fs firmwareSpec) error {
-	if fs.hasNvram() && !lv.HasNvram(s.dataDir, vmName) {
+	if fs.hasNvram() && !s.fw().HasNvram(vmName) {
 		return status.Errorf(codes.FailedPrecondition,
 			"UEFI NVRAM for %q is not present on this host; cannot carry its firmware consistently", vmName)
 	}
-	if fs.Tpm && !lv.HasTPMState(fs.UUID) {
+	if fs.Tpm && !s.fw().HasTPMState(fs.UUID) {
 		return status.Errorf(codes.FailedPrecondition,
 			"swtpm state for %q is not present on this host; cannot carry its firmware consistently", vmName)
 	}

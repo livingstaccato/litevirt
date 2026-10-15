@@ -134,7 +134,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		// Preflight: the firmware state must be present locally to capture it —
 		// fail BEFORE touching libvirt so we never create an overlay we can't back.
 		// NVRAM only exists for UEFI (a BIOS+vTPM VM has swtpm but no NVRAM).
-		if (fwSpec.hasNvram() && !lv.HasNvram(s.dataDir, req.VmName)) || (fwSpec.Tpm && !lv.HasTPMState(fwUUID)) {
+		if (fwSpec.hasNvram() && !s.fw().HasNvram(req.VmName)) || (fwSpec.Tpm && !s.fw().HasTPMState(fwUUID)) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"firmware state for %q is not present on this host; cannot snapshot it consistently", req.VmName)
 		}
@@ -157,7 +157,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			return err
 		}
 		diskmode.Restrict(f, diskmode.File) // best effort
-		has, werr := lv.WriteFirmwareBundle(s.dataDir, req.VmName, fwUUID, f)
+		has, werr := s.fw().WriteFirmwareBundle(req.VmName, fwUUID, f)
 		f.Close()
 		if werr != nil {
 			return werr
@@ -455,7 +455,7 @@ func (s *Server) restoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 			return err
 		}
 		defer f.Close()
-		return lv.ReadFirmwareBundle(f, s.dataDir, req.VmName, fwUUID)
+		return s.fw().ReadFirmwareBundle(f, req.VmName, fwUUID)
 	}
 
 	if snap != nil && snap.Type == "memory" && snap.VMStatePath != "" {

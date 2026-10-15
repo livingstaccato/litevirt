@@ -117,7 +117,7 @@ func TestEnsureFirmwareState_MaterializesNvram(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	var buf bytes.Buffer
-	has, err := lv.WriteFirmwareBundle(s.dataDir, "src", "", &buf)
+	has, err := lv.NewFirmwareStore(s.dataDir).WriteFirmwareBundle("src", "", &buf)
 	if err != nil || !has {
 		t.Fatalf("WriteFirmwareBundle: has=%v err=%v", has, err)
 	}
@@ -127,7 +127,7 @@ func TestEnsureFirmwareState_MaterializesNvram(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureFirmwareState: %v", err)
 	}
-	if !lv.HasNvram(s.dataDir, "win") {
+	if !s.fw().HasNvram("win") {
 		t.Error("EnsureFirmwareState should have materialized NVRAM for the target VM")
 	}
 }
@@ -143,7 +143,7 @@ func nvramBundle(t *testing.T, dataDir string) []byte {
 		t.Fatalf("write: %v", err)
 	}
 	var buf bytes.Buffer
-	if has, err := lv.WriteFirmwareBundle(dataDir, "bundle-src", "", &buf); err != nil || !has {
+	if has, err := lv.NewFirmwareStore(dataDir).WriteFirmwareBundle("bundle-src", "", &buf); err != nil || !has {
 		t.Fatalf("WriteFirmwareBundle: has=%v err=%v", has, err)
 	}
 	return buf.Bytes()
@@ -183,7 +183,7 @@ func TestEnsureFirmwareState_DefineFailureWipesFirmware(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal on define failure, got %v", err)
 	}
-	if lv.HasNvram(s.dataDir, "win") {
+	if s.fw().HasNvram("win") {
 		t.Error("firmware must be wiped after a failed define-on-target")
 	}
 }
@@ -207,7 +207,7 @@ func TestEnsureFirmwareState_FingerprintMismatchRefused(t *testing.T) {
 	if !strings.Contains(err.Error(), "layout differs") {
 		t.Errorf("error should explain the layout mismatch, got: %v", err)
 	}
-	if lv.HasNvram(s.dataDir, "win") {
+	if s.fw().HasNvram("win") {
 		t.Error("firmware must be wiped on a refused define")
 	}
 }

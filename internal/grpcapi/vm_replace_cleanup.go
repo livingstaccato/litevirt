@@ -345,7 +345,7 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 		}
 		// The swtpm tree is keyed by the replaced VM's own UUID, so it cannot
 		// belong to anything else and is always safe to free (G1).
-		lv.WipeFirmwareStateByUUID(m.FirmwareUUID)
+		s.fw().WipeFirmwareStateByUUID(m.FirmwareUUID)
 
 		// The vars file and the cloud-init ISO are keyed by the NAME, which is
 		// reusable. If the contested name has since been deleted and recreated,
@@ -362,7 +362,7 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 				"vm", m.ReplacedVM, "operation", cl.OperationID)
 			return nil
 		}
-		lv.WipeNameKeyedFirmwareState(s.dataDir, m.ReplacedVM)
+		s.fw().WipeNameKeyedFirmwareState(m.ReplacedVM)
 		for _, p := range m.Paths {
 			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("remove %s: %w", p, err)
@@ -563,8 +563,8 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		return failed("read the domain at the contested name", tErr)
 	}
 	if handoff.XML != "" && !targetIsOurs {
-		oldNvram := lv.NvramPath(s.dataDir, m.Replacement)
-		newNvram := lv.NvramPath(s.dataDir, m.ReplacedVM)
+		oldNvram := s.fw().NvramPath(m.Replacement)
+		newNvram := s.fw().NvramPath(m.ReplacedVM)
 		// The destination definition, derived UNCONDITIONALLY — not as a side effect
 		// of this attempt performing the rename. A retry after a failed redefine
 		// finds the file already moved, skips the rename, and would otherwise define
@@ -584,7 +584,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		// the contested name.
 		if !foreignAtTemporary {
 			if _, e := os.Stat(oldNvram); e == nil {
-				if e := os.Rename(oldNvram, newNvram); e != nil {
+				if e := s.fw().RenameNvram(m.Replacement, m.ReplacedVM); e != nil {
 					return failed("nvram rename", e)
 				}
 			}

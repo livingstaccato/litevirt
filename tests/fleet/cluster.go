@@ -87,6 +87,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -244,6 +245,7 @@ type Node struct {
 	Server   *grpcapi.Server
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
 	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
+	FW       *lv.FirmwareStore // this node's NVRAM (its data dir) and swtpm trees (a root of its own)
 	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
 	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv  *grpc.Server
@@ -856,6 +858,14 @@ func (c *Cluster) buildServer(n *Node) {
 	// snapshot layer, as the daemon wires it from its libvirt client
 	// (grpcapi/pit_copy.go). The fleet has no backup sessions.
 	n.Server.SetPointInTimeSnapshotter(n.Virt)
+
+	// Firmware state: the daemon gives its server one store, with NVRAM under
+	// the data dir and swtpm under libvirt's root. Every node here gets a swtpm
+	// root of its own, so a firmware move between two nodes moves the state
+	// between two directories (a shared root would let a move that copied
+	// nothing pass, and one node's wipe delete another's state).
+	n.FW = &lv.FirmwareStore{DataDir: dataDir, SwtpmBase: filepath.Join(c.tmpRoot, n.Name, "swtpm")}
+	n.Server.SetFirmwareStore(n.FW)
 
 	// Domain lifecycle events: the daemon registers this same handler on its
 	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call

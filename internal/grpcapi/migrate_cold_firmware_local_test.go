@@ -4,9 +4,8 @@ package grpcapi
 // the disk is streamed, the firmware bundle (UEFI vars + swtpm tree) carried,
 // and the domain defined on the target, as for any stopped VM. The fleet
 // scenarios (tests/fleet/drain_cold_firmware_test.go) drive it through drain
-// and `lv migrate --cold`, but the fleet's nodes share one swtpm root, a
-// process-wide path; here each host has its own, so the vTPM state can be seen
-// to leave one and arrive at the other.
+// and `lv migrate --cold`; here each host has a firmware store of its own, so
+// the vTPM state can be seen to leave one and arrive at the other.
 
 import (
 	"context"
@@ -25,23 +24,14 @@ import (
 )
 
 // twoHostPeer is the source's client to the target: every call runs the
-// target's handler as a trusted peer, with the swtpm root switched to the
-// target's for its duration (the calls are synchronous, so the source's own
-// reads and wipes see its own root).
+// target's handler as a trusted peer, against the target's own firmware store.
 type twoHostPeer struct {
 	pb.LiteVirtClient
-	dst      *Server
-	peer     context.Context
-	srcSwtpm string
-	dstSwtpm string
+	dst  *Server
+	peer context.Context
 	// afterEnsure, if set, runs once the target's EnsureFirmwareState has
 	// answered — the point between the define and the handoff.
 	afterEnsure func()
-}
-
-func (p *twoHostPeer) onTarget() func() {
-	lv.SetSwtpmBaseForTest(p.dstSwtpm)
-	return func() { lv.SetSwtpmBaseForTest(p.srcSwtpm) }
 }
 
 func (p *twoHostPeer) ReceiveMigrationDisk(context.Context, ...grpc.CallOption) (grpc.ClientStreamingClient[pb.ReceiveMigrationDiskRequest, pb.ReceiveMigrationDiskResponse], error) {
@@ -49,9 +39,7 @@ func (p *twoHostPeer) ReceiveMigrationDisk(context.Context, ...grpc.CallOption) 
 }
 
 func (p *twoHostPeer) EnsureFirmwareState(_ context.Context, req *pb.EnsureFirmwareStateRequest, _ ...grpc.CallOption) (*pb.EnsureFirmwareStateResponse, error) {
-	restore := p.onTarget()
 	resp, err := p.dst.EnsureFirmwareState(p.peer, req)
-	restore()
 	if p.afterEnsure != nil {
 		p.afterEnsure()
 	}
@@ -59,12 +47,10 @@ func (p *twoHostPeer) EnsureFirmwareState(_ context.Context, req *pb.EnsureFirmw
 }
 
 func (p *twoHostPeer) RollbackFirmwareState(_ context.Context, req *pb.RollbackFirmwareStateRequest, _ ...grpc.CallOption) (*pb.RollbackFirmwareStateResponse, error) {
-	defer p.onTarget()()
 	return p.dst.RollbackFirmwareState(p.peer, req)
 }
 
 func (p *twoHostPeer) CleanupMigrationArtifacts(_ context.Context, req *pb.CleanupMigrationArtifactsRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	defer p.onTarget()()
 	return p.dst.CleanupMigrationArtifacts(p.peer, req)
 }
 
@@ -133,10 +119,11 @@ func newFWLocalMove(t *testing.T) *fwLocalMove {
 	write(f.src.hostDiskFile(f.p), f.disk)
 	write(lv.NvramPath(f.src.dataDir, "os1"), f.vars)
 	f.srcSwtpm, f.dstSwtpm = t.TempDir(), t.TempDir()
-	t.Cleanup(lv.SetSwtpmBaseForTest(f.srcSwtpm))
+	f.src.SetFirmwareStore(&lv.FirmwareStore{DataDir: f.src.dataDir, SwtpmBase: f.srcSwtpm})
+	f.dst.SetFirmwareStore(&lv.FirmwareStore{DataDir: f.dst.dataDir, SwtpmBase: f.dstSwtpm})
 	write(f.srcTPMFile(), f.tpm)
 
-	f.peer = &twoHostPeer{dst: f.dst, peer: diskPeerCtx(t, f.dst), srcSwtpm: f.srcSwtpm, dstSwtpm: f.dstSwtpm}
+	f.peer = &twoHostPeer{dst: f.dst, peer: diskPeerCtx(t, f.dst)}
 	f.src.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return f.peer, func() {}, nil
 	}

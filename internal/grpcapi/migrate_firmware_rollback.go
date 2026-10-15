@@ -131,7 +131,7 @@ func (s *Server) RollbackFirmwareState(ctx context.Context, req *pb.RollbackFirm
 	// firmware of this attempt's to wipe, and the name-keyed files here may be
 	// another VM's.
 	if usesFirmwareState(vm.Spec) {
-		lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+		s.fw().WipeFirmwareState(req.VmName, req.Uuid)
 	}
 	s.firmwareTargets.forget(req.VmName)
 	slog.Info("rollback firmware state: removed the domain and firmware this attempt defined",

@@ -14,26 +14,58 @@ import (
 )
 
 // Firmware-state travel (G1). A VM's portable firmware state is its name-keyed
-// UEFI vars file (NvramPath) plus its UUID-keyed swtpm tree (LibvirtSwtpmDir).
-// These helpers bundle / restore / wipe that state as ONE unit so backup,
-// migration, and snapshot carry it identically — vtpmstate.go is the single
-// owner; no lifecycle handler hand-rolls firmware-state copy/wipe.
+// UEFI vars file (FirmwareStore.NvramPath) plus its UUID-keyed swtpm tree
+// (FirmwareStore.SwtpmDir). The store's methods bundle / restore / wipe that
+// state as ONE unit so backup, migration, and snapshot carry it identically —
+// vtpmstate.go is the single owner; no lifecycle handler hand-rolls
+// firmware-state copy/wipe.
 
-// libvirtSwtpmBase is libvirt's swtpm state root. A var (not const) so tests can
-// redirect it away from the root-owned /var/lib/libvirt.
-var libvirtSwtpmBase = "/var/lib/libvirt/swtpm"
+// DefaultSwtpmBase is libvirt's swtpm state root on a real host, the
+// AppArmor-permitted location libvirt keys by domain UUID.
+const DefaultSwtpmBase = "/var/lib/libvirt/swtpm"
 
 const (
 	fwBundleNvram = "nvram"  // tar entry: the UEFI vars file
 	fwBundleSwtpm = "swtpm/" // tar entry prefix: the swtpm state tree
 )
 
-// SetSwtpmBaseForTest redirects the swtpm state root (the real one is
-// root-owned) and returns a func restoring it. Tests only.
-func SetSwtpmBaseForTest(dir string) (restore func()) {
-	old := libvirtSwtpmBase
-	libvirtSwtpmBase = dir
-	return func() { libvirtSwtpmBase = old }
+// FirmwareStore is one host's firmware state: the name-keyed UEFI vars files
+// under DataDir and the UUID-keyed swtpm trees under SwtpmBase. A daemon has
+// exactly one, shared by everything on the host that reads or writes that
+// state. It is a value of its own, not package state, so the fleet harness can
+// run several hosts in one process, each with roots of its own.
+type FirmwareStore struct {
+	DataDir   string // the daemon's data directory; NVRAM lives in DataDir/nvram
+	SwtpmBase string // libvirt's swtpm root; DefaultSwtpmBase on a real host
+}
+
+// NewFirmwareStore is the store of a host whose daemon keeps its data in
+// dataDir, with libvirt's own swtpm root. Production layout.
+func NewFirmwareStore(dataDir string) *FirmwareStore {
+	return &FirmwareStore{DataDir: dataDir, SwtpmBase: DefaultSwtpmBase}
+}
+
+// NvramPath is the VM's UEFI vars file in this store: NvramPath(DataDir, vm),
+// the path the rendered domain names.
+func (f *FirmwareStore) NvramPath(vmName string) string {
+	return NvramPath(f.DataDir, vmName)
+}
+
+// HasNvram reports whether the per-VM (name-keyed) UEFI vars file exists.
+func (f *FirmwareStore) HasNvram(vmName string) bool {
+	fi, err := os.Stat(f.NvramPath(vmName))
+	return err == nil && fi.Size() > 0
+}
+
+// RemoveNvram removes the VM's UEFI vars file. The error is os.Remove's.
+func (f *FirmwareStore) RemoveNvram(vmName string) error {
+	return os.Remove(f.NvramPath(vmName))
+}
+
+// RenameNvram moves the UEFI vars file of from to the name to. The error is
+// os.Rename's.
+func (f *FirmwareStore) RenameNvram(from, to string) error {
+	return os.Rename(f.NvramPath(from), f.NvramPath(to))
 }
 
 // firmwareUUIDRe is the canonical 8-4-4-4-12 form libvirt prints and
@@ -44,25 +76,25 @@ var firmwareUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA
 // strict check for a UUID that arrives over an RPC before it keys any path.
 func ValidFirmwareUUID(uuid string) bool { return firmwareUUIDRe.MatchString(uuid) }
 
-// LibvirtSwtpmDir is libvirt's default per-domain swtpm state directory, keyed by
-// the (stable) domain UUID — the AppArmor-permitted location.
+// SwtpmDir is the store's per-domain swtpm state directory, keyed by the
+// (stable) domain UUID.
 //
 // It is a plain path builder: anything that reads, writes or removes the tree
 // goes through swtpmDir, which refuses a key that is not exactly one path
 // component below the base.
-func LibvirtSwtpmDir(uuid string) string {
-	return filepath.Join(libvirtSwtpmBase, uuid)
+func (f *FirmwareStore) SwtpmDir(uuid string) string {
+	return filepath.Join(f.SwtpmBase, uuid)
 }
 
-// swtpmDir is LibvirtSwtpmDir for a key that is confined to one directory under
-// the base: "", ".", "..", and anything holding a separator are refused, so a
-// UUID that arrived over an RPC can never name the base itself, its parent, or
-// any path outside it.
-func swtpmDir(uuid string) (string, bool) {
-	if safename.ValidateName(uuid) != nil {
+// swtpmDir is SwtpmDir for a key that is confined to one directory under the
+// base: "", ".", "..", and anything holding a separator are refused, so a UUID
+// that arrived over an RPC can never name the base itself, its parent, or any
+// path outside it. A store with no base refuses every key.
+func (f *FirmwareStore) swtpmDir(uuid string) (string, bool) {
+	if f.SwtpmBase == "" || safename.ValidateName(uuid) != nil {
 		return "", false
 	}
-	return LibvirtSwtpmDir(uuid), true
+	return f.SwtpmDir(uuid), true
 }
 
 // SnapshotFirmwareBundlePath is the sidecar tar holding a snapshot's captured
@@ -88,8 +120,8 @@ func SafeSnapshotFirmwareBundlePath(dataDir, vmName, snapName string) (string, e
 }
 
 // HasTPMState reports whether the (UUID-keyed) swtpm state exists.
-func HasTPMState(uuid string) bool {
-	dir, ok := swtpmDir(uuid)
+func (f *FirmwareStore) HasTPMState(uuid string) bool {
+	dir, ok := f.swtpmDir(uuid)
 	if !ok {
 		return false
 	}
@@ -99,20 +131,20 @@ func HasTPMState(uuid string) bool {
 
 // WriteFirmwareBundle writes a tar of the VM's firmware state (nvram + swtpm) to
 // w. Returns false (no error) when the VM has no firmware state to carry.
-func WriteFirmwareBundle(dataDir, vmName, uuid string, w io.Writer) (bool, error) {
-	hasNvram := HasNvram(dataDir, vmName)
-	hasTPM := HasTPMState(uuid)
+func (f *FirmwareStore) WriteFirmwareBundle(vmName, uuid string, w io.Writer) (bool, error) {
+	hasNvram := f.HasNvram(vmName)
+	hasTPM := f.HasTPMState(uuid)
 	if !hasNvram && !hasTPM {
 		return false, nil
 	}
 	tw := tar.NewWriter(w)
 	if hasNvram {
-		if err := tarFile(tw, NvramPath(dataDir, vmName), fwBundleNvram); err != nil {
+		if err := tarFile(tw, f.NvramPath(vmName), fwBundleNvram); err != nil {
 			return false, err
 		}
 	}
 	if hasTPM {
-		dir, _ := swtpmDir(uuid) // hasTPM implies a confined key
+		dir, _ := f.swtpmDir(uuid) // hasTPM implies a confined key
 		if err := tarTree(tw, dir, fwBundleSwtpm); err != nil {
 			return false, err
 		}
@@ -124,20 +156,20 @@ func WriteFirmwareBundle(dataDir, vmName, uuid string, w io.Writer) (bool, error
 }
 
 // ReadFirmwareBundle restores a bundle from WriteFirmwareBundle: the nvram entry
-// → NvramPath(dataDir,vmName); swtpm/* → LibvirtSwtpmDir(uuid). It is ATOMIC — the
+// → NvramPath(vmName); swtpm/* → SwtpmDir(uuid). It is ATOMIC — the
 // bundle is staged in full (swtpm into a sibling temp dir, nvram into memory),
 // then each destination is swapped into place as a unit, so a partial/aborted
 // restore never leaves mixed old/new firmware state (the BitLocker failure mode).
 // Slip-safe: rejects ../absolute paths and symlink/hardlink/device members (a
 // backup-repo bundle is untrusted); restored modes are clamped (files 0600, dirs
 // 0700), never trusting tar header modes.
-func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
+func (f *FirmwareStore) ReadFirmwareBundle(r io.Reader, vmName, uuid string) error {
 	if uuid != "" {
-		if _, ok := swtpmDir(uuid); !ok {
+		if _, ok := f.swtpmDir(uuid); !ok {
 			return fmt.Errorf("firmware bundle: invalid swtpm uuid %q", uuid)
 		}
 	}
-	swtpmRoot := LibvirtSwtpmDir(uuid)
+	swtpmRoot := f.SwtpmDir(uuid)
 	var (
 		nvramBytes []byte
 		haveNvram  bool
@@ -226,7 +258,7 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 	// Install NVRAM + swtpm as a UNIT with rollback: back up the existing files,
 	// install the staged ones, and on ANY failure restore the backups — so we
 	// never leave new NVRAM with stale/missing TPM (or vice-versa).
-	nvramDst := NvramPath(dataDir, vmName)
+	nvramDst := f.NvramPath(vmName)
 	var nvramBak, swtpmBak string
 	rollback := func() {
 		if nvramBak != "" {
@@ -300,9 +332,9 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 }
 
 // WipeFirmwareState removes a VM's firmware state (true delete). Best-effort.
-func WipeFirmwareState(dataDir, vmName, uuid string) {
-	WipeNameKeyedFirmwareState(dataDir, vmName)
-	WipeFirmwareStateByUUID(uuid)
+func (f *FirmwareStore) WipeFirmwareState(vmName, uuid string) {
+	f.WipeNameKeyedFirmwareState(vmName)
+	f.WipeFirmwareStateByUUID(uuid)
 }
 
 // WipeNameKeyedFirmwareState removes only the artifacts keyed by the VM's NAME.
@@ -311,15 +343,15 @@ func WipeFirmwareState(dataDir, vmName, uuid string) {
 // longer owns the name — a delayed cutover cleanup, say — would otherwise delete
 // the vars file of whatever VM holds it now. Callers that cannot prove the name
 // is still theirs must skip this and take WipeFirmwareStateByUUID alone.
-func WipeNameKeyedFirmwareState(dataDir, vmName string) {
-	_ = os.Remove(NvramPath(dataDir, vmName))
-	_ = os.Remove(retainedMarkerPath(dataDir, vmName))
+func (f *FirmwareStore) WipeNameKeyedFirmwareState(vmName string) {
+	_ = os.Remove(f.NvramPath(vmName))
+	_ = os.Remove(f.retainedMarkerPath(vmName))
 }
 
 // WipeFirmwareStateByUUID removes the swtpm tree, which is keyed by the VM's
 // UUID and therefore cannot belong to anything else.
-func WipeFirmwareStateByUUID(uuid string) {
-	if dir, ok := swtpmDir(uuid); ok {
+func (f *FirmwareStore) WipeFirmwareStateByUUID(uuid string) {
+	if dir, ok := f.swtpmDir(uuid); ok {
 		_ = os.RemoveAll(dir)
 	}
 }
@@ -328,12 +360,14 @@ func WipeFirmwareStateByUUID(uuid string) {
 // but the DB row is gone, so the UUID-keyed swtpm tree would be unlocatable.
 // Record name→uuid in a marker under dataDir so an explicit restore/adopt can
 // find it. (The name-keyed NVRAM guard already blocks accidental same-name reuse.)
-func retainedMarkerPath(dataDir, vmName string) string {
-	return filepath.Join(dataDir, "nvram", vmName+".kept-uuid")
+func (f *FirmwareStore) retainedMarkerPath(vmName string) string {
+	return filepath.Join(f.DataDir, "nvram", vmName+".kept-uuid")
 }
 
-func WriteRetainedFirmwareMarker(dataDir, vmName, uuid string) error {
-	p := retainedMarkerPath(dataDir, vmName)
+// WriteRetainedFirmwareMarker records name→uuid for a VM whose firmware state a
+// `delete --keep-disks` keeps.
+func (f *FirmwareStore) WriteRetainedFirmwareMarker(vmName, uuid string) error {
+	p := f.retainedMarkerPath(vmName)
 	if err := diskmode.MkdirAll(filepath.Dir(p)); err != nil {
 		return err
 	}
@@ -341,8 +375,8 @@ func WriteRetainedFirmwareMarker(dataDir, vmName, uuid string) error {
 }
 
 // ReadRetainedFirmwareMarker returns the retained swtpm UUID for a name, if any.
-func ReadRetainedFirmwareMarker(dataDir, vmName string) (string, bool) {
-	b, err := os.ReadFile(retainedMarkerPath(dataDir, vmName))
+func (f *FirmwareStore) ReadRetainedFirmwareMarker(vmName string) (string, bool) {
+	b, err := os.ReadFile(f.retainedMarkerPath(vmName))
 	if err != nil {
 		return "", false
 	}

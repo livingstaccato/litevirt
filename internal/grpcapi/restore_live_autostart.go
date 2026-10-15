@@ -244,7 +244,7 @@ func (s *Server) autoDefineRestoredVM(
 			// cleanly (and lifecycle never sees orphaned state).
 			s.virt.DestroyDomain(targetName)
 			_ = s.virt.UndefineDomain(targetName, false)
-			lv.WipeFirmwareState(s.dataDir, targetName, spec.Uuid)
+			s.fw().WipeFirmwareState(targetName, spec.Uuid)
 		}()
 	}
 

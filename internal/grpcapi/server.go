@@ -522,6 +522,12 @@ type Server struct {
 	// label was derived from.
 	firmware lv.FirmwarePaths
 
+	// fwStore is this host's firmware state (NVRAM and swtpm trees). The
+	// daemon injects the one it shares with the reconciler; NewServer and
+	// NewServerForTests start from the production layout under dataDir. Read
+	// it through fw().
+	fwStore *lv.FirmwareStore
+
 	// lbApplyOverride is a test seam for LB provisioning: when non-nil it
 	// replaces the real haproxy/keepalived Apply (unit tests have no root / no
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
@@ -2328,6 +2334,7 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		startedAt:      time.Now(),
 		hostName:       hostName,
 		dataDir:        dataDir,
+		fwStore:        lv.NewFirmwareStore(dataDir),
 		pkiDir:         pkiDir,
 		db:             db,
 		virt:           virt,
@@ -2448,6 +2455,23 @@ func (s *Server) reconcileFirewallRequired(ctx context.Context) error {
 
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1).
 func (s *Server) SetFirmwarePaths(fp lv.FirmwarePaths) { s.firmware = fp }
+
+// SetFirmwareStore injects this host's firmware store, the one the daemon
+// shares with its reconciler (and the fleet harness gives each node).
+func (s *Server) SetFirmwareStore(fw *lv.FirmwareStore) { s.fwStore = fw }
+
+// FirmwareStore is this host's firmware store.
+func (s *Server) FirmwareStore() *lv.FirmwareStore { return s.fw() }
+
+// fw is this host's firmware store. A Server built as a struct literal (unit
+// tests) has none and gets the production layout under its dataDir, which is
+// what every such Server used before the store existed.
+func (s *Server) fw() *lv.FirmwareStore {
+	if s.fwStore != nil {
+		return s.fwStore
+	}
+	return lv.NewFirmwareStore(s.dataDir)
+}
 
 // SetTenancyEngine wires the admission + billing engine.
 // nil = unbounded admission, no billing. Daemon constructs the

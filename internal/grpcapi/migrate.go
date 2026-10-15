@@ -1380,7 +1380,7 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	// (a same-name VM deleted with --keep-disks keeps its marker).
 	wipe := func() {
 		if hasBundle {
-			lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+			s.fw().WipeFirmwareState(req.VmName, req.Uuid)
 		}
 	}
 	// The uuid keys the swtpm tree this restores into (and wipes on a refusal
@@ -1408,7 +1408,7 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			"refusing to materialize firmware over already-defined domain %q", req.VmName)
 	}
 	if hasBundle {
-		if err := lv.ReadFirmwareBundle(bytes.NewReader(req.Bundle), s.dataDir, req.VmName, req.Uuid); err != nil {
+		if err := s.fw().ReadFirmwareBundle(bytes.NewReader(req.Bundle), req.VmName, req.Uuid); err != nil {
 			return nil, status.Errorf(codes.Internal, "materialize firmware state for %q: %v", req.VmName, err)
 		}
 	}
@@ -1496,7 +1496,7 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 			return fwTargetUntouched, err
 		}
 		var buf bytes.Buffer
-		has, err := lv.WriteFirmwareBundle(s.dataDir, vmName, fs.UUID, &buf)
+		has, err := s.fw().WriteFirmwareBundle(vmName, fs.UUID, &buf)
 		if err != nil {
 			return fwTargetUntouched, status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
 		}
@@ -1767,10 +1767,10 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 				"vm", vm.Name, "host", s.hostName, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "warn", "migrated to "+targetHost.Name+" but source domain undefine failed (firmware retained on source)")
 		} else if fwVM {
-			lv.WipeFirmwareState(s.dataDir, vm.Name, fwSpec.UUID)
+			s.fw().WipeFirmwareState(vm.Name, fwSpec.UUID)
 		}
 	} else if fwVM {
-		lv.WipeFirmwareState(s.dataDir, vm.Name, fwSpec.UUID)
+		s.fw().WipeFirmwareState(vm.Name, fwSpec.UUID)
 	}
 	// The copies on the target are the VM's disks now; the source's are orphans.
 	s.removeColdMigratedSourceDisks(ctx, vm.Name, copied)
@@ -1995,7 +1995,7 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 			slog.Warn("cleanup migration artifacts: VM lives on this host; leaving its firmware state",
 				"vm", req.VmName, "row_names_here", rowNamesHere)
 		} else {
-			lv.WipeFirmwareState(s.dataDir, req.VmName, req.FirmwareUuid)
+			s.fw().WipeFirmwareState(req.VmName, req.FirmwareUuid)
 		}
 	}
 	return &emptypb.Empty{}, nil

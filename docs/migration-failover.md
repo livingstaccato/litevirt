@@ -1416,9 +1416,11 @@ The restart is not silent, and the real disk is not lost:
   `<disk path>.superseded-<time>` first, so it is kept like any other copy;
   this waits while a domain of the VM's name runs on that host. After
   `lv rm --keep-disks`, and for a disk recorded `delete_with_vm=false`, the
-  disk stays at its path. The host also removes the VM's cloud-init seed
-  there (`cloudinit/<vm>.iso`) if this release wrote it; a seed from an
-  earlier release stays.
+  disk stays at its path. It also stays there when the record does not say
+  what the delete decided: a delete by an earlier release, or one whose mark
+  on the record was lost to a later write of it. The host also removes the
+  VM's cloud-init seed there (`cloudinit/<vm>.iso`) if this release wrote it;
+  a seed from an earlier release stays.
 - A VM of the same name created on that host before then clears
   `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
   disk that a failover left at its path is first renamed to
@@ -1431,7 +1433,10 @@ The restart is not silent, and the real disk is not lost:
   at one of those paths cannot be read, or when a rename fails. The message
   names the path and the cause. Retry once the replica has caught up or the
   storage answers, or place the VM on another host. A path that does not
-  exist does not refuse the create.
+  exist does not refuse the create. When the record lists a path that does
+  not exist and its directory is absent, empty or cannot be listed, as a
+  volume not mounted yet reads, the create goes ahead, the record stays open,
+  and a `vm.disk.path_missing` event of the VM names the path.
 
 A cloud-init seed is used only by the VM it was written for: a host that
 holds the seed of a deleted VM writes a new one from the VM's own settings
@@ -1449,7 +1454,8 @@ rebuilt disk the only copy of its data from before the failover was deleted.
 
 To see the copies on a host, with the VM each came from, when it was set aside
 and whether it is retained or held, run `lv host superseded-disks <host>`.
-These need the admin role and are audited:
+It also lists each `.kept-` file there, marked `kept`, which none of the
+options below takes. The options need the admin role and are audited:
 
 - `--purge` removes every copy that is neither retained nor held, whatever its
   age; `--older-than <duration>` narrows it (`host.superseded_disks.purge`).

@@ -42,7 +42,7 @@ func TestLBVIPInterface_OnTheNetworksBridge(t *testing.T) {
 		"10.100.0.50":  "br-vni1000",
 		"10.150.0.9":   compose.IsolatedBridgeName("iso"),
 	} {
-		got, err := s.lbVIPInterface(ctx, vip)
+		got, err := s.lbVIPInterface(ctx, "", vip)
 		if err != nil || got != want {
 			t.Errorf("VIP %s: interface %q, %v; want %q", vip, got, err, want)
 		}
@@ -58,7 +58,7 @@ func TestLBVIPInterface_RefusesWhenTheBridgeIsNotHere(t *testing.T) {
 	s := testServer(t)
 	s.SetBridgeExists(func(string) bool { return false })
 	putNetwork(t, s, "lbr_hinet", "bridge", compose.NetworkDef{Interface: "hinet", Subnet: "10.202.0.0/24", HostIsolation: true})
-	got, err := s.lbVIPInterface(context.Background(), "10.202.0.250")
+	got, err := s.lbVIPInterface(context.Background(), "", "10.202.0.250")
 	if err == nil {
 		t.Fatalf("VIP placed on %q with the network's bridge absent, want refused", got)
 	}
@@ -75,7 +75,7 @@ func TestLBVIPInterface_OutsideEveryNetwork(t *testing.T) {
 	s := testServer(t)
 	s.SetBridgeExists(func(string) bool { return true })
 	putNetwork(t, s, "lbr_hinet", "bridge", compose.NetworkDef{Interface: "hinet", Subnet: "10.202.0.0/24"})
-	got, err := s.lbVIPInterface(context.Background(), "192.0.2.50")
+	got, err := s.lbVIPInterface(context.Background(), "", "192.0.2.50")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,5 +115,36 @@ func TestApplyLBForStack_VIPOnTheNetworksBridge(t *testing.T) {
 	}
 	if lbIntent == nil || lbIntent.Bridge != "hinet" || len(lbIntent.Exceptions) != 1 || lbIntent.Exceptions[0].VIP != "10.202.0.250" {
 		t.Errorf("LB isolation intent %+v, want VIP holes on hinet", lbIntent)
+	}
+}
+
+// TestLBVIPInterface_PrefersTheLBsOwnStack: two stacks may each have a
+// network on the same subnet; a stack LB's VIP goes on its own stack's
+// network's bridge, not on whichever network sorts first.
+//
+// Mutation: drop the own-stack preference — red (a_lan sorts first).
+func TestLBVIPInterface_PrefersTheLBsOwnStack(t *testing.T) {
+	s := testServer(t)
+	s.SetBridgeExists(func(string) bool { return true })
+	ctx := context.Background()
+	for _, n := range []struct {
+		name, stack string
+		vni         int
+	}{{"a_lan", "a", 10}, {"b_lan", "b", 11}} {
+		cfg, _ := json.Marshal(compose.NetworkDef{Type: "vxlan", VNI: n.vni, Subnet: "10.10.0.0/24"})
+		if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: n.name, StackName: n.stack, Type: "vxlan", Config: string(cfg)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.PersistLBFull(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "b-lb", StackName: "b", VIP: "10.10.0.50/24", Hosts: `["test-host"]`, Ports: "[]", Enabled: true,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.lbVIPInterface(ctx, "b-lb", "10.10.0.50"); err != nil || got != "br-vni11" {
+		t.Errorf("stack b's LB: %q, %v; want stack b's bridge br-vni11", got, err)
+	}
+	if got, err := s.lbVIPInterface(ctx, "", "10.10.0.50"); err != nil || got != "br-vni10" {
+		t.Errorf("no LB row: %q, %v; want the first by name, br-vni10", got, err)
 	}
 }

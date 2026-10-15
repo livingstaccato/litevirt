@@ -686,7 +686,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			if targetHosts[0] == s.hostName {
 				priority = 100
 			}
-			lbIface, ierr := s.lbVIPInterface(ctx, vipIP)
+			lbIface, ierr := s.lbVIPInterface(ctx, req.Name, vipIP)
 			if ierr != nil {
 				corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name)
 				corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name)
@@ -1707,7 +1707,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			if len(lbHosts) == 0 || lbHosts[0] == s.hostName {
 				priority = 100
 			}
-			lbIface, ierr := s.lbVIPInterface(ctx, vipIP)
+			lbIface, ierr := s.lbVIPInterface(ctx, req.Name, vipIP)
 			cfg := lb.Config{
 				Name: req.Name, VIP: vipIP, VIPPrefix: vipPrefix,
 				Interface: lbIface, VRID: s.allocVRID(ctx, req.Name),
@@ -2354,7 +2354,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		priority = 100
 	}
 
-	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	lbIface, err := s.lbVIPInterface(ctx, req.LbName, vipIP)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "apply LB: %v", err)
 	}
@@ -2751,7 +2751,7 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 			}
 		}
 	}
-	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	lbIface, err := s.lbVIPInterface(ctx, cfg.Name, vipIP)
 	if err != nil {
 		slog.Warn("reapplyExplicitLB: apply refused", "lb", cfg.Name, "error", err)
 		return
@@ -2983,7 +2983,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 
 	// Determine the interface for VRRP: the VIP's network's bridge, the same
 	// L2 segment as the backends (lbVIPInterface).
-	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	lbIface, err := s.lbVIPInterface(ctx, lbName, vipIP)
 	if err != nil {
 		return err
 	}

@@ -99,6 +99,11 @@ func TestFleet_LBVIPGoesOnTheNetworksBridge(t *testing.T) {
 		if in.Bridge != dev || len(in.Exceptions) != 1 || in.Exceptions[0].VIP != "10.202.0.250" {
 			t.Errorf("LB isolation intent %+v, want the VIP's holes on %s", in, dev)
 		}
+		// snat: true — the guests' egress is rewritten to the VIP.
+		if in.SNATVIP != "10.202.0.250" || in.SNATSubnet != "10.202.0.0/24" || in.SNATOutIface == "" {
+			t.Errorf("LB SNAT intent vip=%q subnet=%q out=%q, want 10.202.0.250 for 10.202.0.0/24 out the uplink",
+				in.SNATVIP, in.SNATSubnet, in.SNATOutIface)
+		}
 	}
 	if !found {
 		t.Errorf("no LB isolation intent recorded (the lab's snat=false); intents: %+v", intents)

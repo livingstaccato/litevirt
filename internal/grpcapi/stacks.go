@@ -990,6 +990,9 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 					Algorithm: la.Algorithm,
 					Ports:     ports,
 					Hosts:     la.TargetHosts,
+					// The file's `snat:`: without it the stack LB recorded no
+					// SNAT intent on its network's bridge (lab 1 LBAndSNAT).
+					Snat: vmDef.LoadBalancer.SNAT,
 				},
 			}
 			s.applyLBFromSpecWithRetry(ctx, stubSpec)

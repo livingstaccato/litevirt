@@ -380,7 +380,7 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 	// covered too.
 	why, _, stands := c.fenceStillStandsIn(hr, host, at)
 	if stands && c.contactedSince(host, c.mono().Add(-c.now().Sub(at)).Add(-fenceSkewMargin)) {
-		why, stands = "this node has probed the host healthy since the fence", false
+		why, stands = "this node has probed the host healthy since the fence attempt", false
 	}
 	if !stands {
 		delete(c.ha.heldRecovery, host)
@@ -395,16 +395,20 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 }
 
 // noteHAHeldStale records that a held recovery's fence attempt rec, at at,
-// no longer stands for why: the hold names the operator confirmation when one
-// at or after the attempt is the newest authority (noteConfirmationStale),
-// else the attempt, and the remedy either way. Confirming the host off again
-// puts it back on the confirmation resume path (resumeFromConfirmation).
+// no longer stands for why. It was judged from the attempt, so the hold
+// names the attempt and, when an operator confirmation at or after it is the
+// newest authority, that confirmation too, without saying the confirmation
+// was contradicted since it was made; and the remedy either way. Confirming
+// the host off again puts it back on the confirmation resume path
+// (resumeFromConfirmation).
 func (c *Coordinator) noteHAHeldStale(ctx context.Context, host string, rec fenceRecord, at time.Time, why string) {
+	what := "its fence attempt " + rec.ID
 	if confirm, confirmedAt, _, ok := c.confirmationAndAttempt(ctx, host); ok && !confirmedAt.IsZero() && !confirmedAt.Before(at) {
-		c.noteConfirmationStale(host, confirm, why)
-		return
+		what += ", confirmed by the operator confirmation " + confirm.ID + ","
 	}
-	c.noteHold(host, "recovery held by an HA disarm, and its fence attempt "+rec.ID+" no longer stands: "+why+
+	slog.Warn("failover: a recovery held by an HA disarm is not resumed: its fence attempt no longer stands",
+		"host", host, "attempt", rec.ID, "reason", why)
+	c.noteHold(host, "recovery held by an HA disarm, and "+what+" no longer stands: "+why+
 		"; confirm "+host+" is powered off, then run 'lv host fence-confirm "+host+"' again")
 }
 

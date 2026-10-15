@@ -175,3 +175,30 @@ func TestHADisarm_HeldRecoveryOfAHostNeitherFencedNorOfflineIsHeld(t *testing.T)
 		})
 	}
 }
+
+// Follow-up re-review m-b: the branch judges from the fence attempt. When this
+// node's probe answered between the attempt and a later confirmation, the
+// refusal is about the attempt, and must not say the confirmation was
+// contradicted since it was made.
+func TestHADisarm_HeldRecoveryRefusalNamesTheAttemptItJudged(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	lengthenStreak(t, db, ctx, 10*time.Minute)
+	fenceRowAgo(t, db, "manual-1", "manual", "partial", 3*time.Minute)
+	confirmAgo(t, db, ctx, time.Minute)
+	c := heldOn(db)
+	contact := time.Now().Add(-2 * time.Minute)
+	c.LastContact = func(string) (time.Time, bool) { return contact, true }
+	c.resumeHAHeldRecovery(ctx, "down", 2)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("setup: VM moved to %q", got)
+	}
+	hold := c.holdReason["down"]
+	if strings.Contains(hold, "since the confirmation") {
+		t.Fatalf("hold %q blames the confirmation for an answer before it", hold)
+	}
+	for _, want := range []string{"manual-1", "operator-down", "since the fence attempt", "fence-confirm down' again"} {
+		if !strings.Contains(hold, want) {
+			t.Fatalf("hold %q does not name %q", hold, want)
+		}
+	}
+}

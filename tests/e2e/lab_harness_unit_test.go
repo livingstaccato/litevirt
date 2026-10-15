@@ -525,3 +525,22 @@ func TestUncertifiedDeclineVerdict(t *testing.T) {
 		}
 	}
 }
+
+// TestGuestBootVerdict: zero transmitted frames on every NIC means the guest
+// never booted; any traffic, or unreadable counters, says nothing.
+func TestGuestBootVerdict(t *testing.T) {
+	for _, c := range []struct {
+		name, in string
+		boot     bool
+	}{
+		{"silent", "Domain: 'vm'\n  net.count=1\n  net.0.name=vnet0\n  net.0.rx.pkts=3\n  net.0.tx.pkts=0\n", true},
+		{"two silent", "net.0.tx.pkts=0\nnet.1.tx.pkts=0\n", true},
+		{"sent", "net.0.tx.pkts=12\n", false},
+		{"one sent", "net.0.tx.pkts=0\nnet.1.tx.pkts=1\n", false},
+		{"unreadable", "", false},
+	} {
+		if got := guestBootVerdict(c.in) != ""; got != c.boot {
+			t.Errorf("%s: never-booted = %v, want %v", c.name, got, c.boot)
+		}
+	}
+}

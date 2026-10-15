@@ -1156,6 +1156,16 @@ func (l *lab) putFile(host, path, content string) {
 	l.onRestore(func() { l.ssh(host, 30*time.Second, "rm -f "+shellQuote(path)) })
 }
 
+// firmwareLineFor is the compose line that boots the small drill image under
+// BIOS: a 128 MiB cirros under the default UEFI firmware never boots ("can't
+// allocate kernel"). Any other image keeps the default firmware.
+func firmwareLineFor(image string) string {
+	if image == drillImage() {
+		return "    firmware: bios\n"
+	}
+	return ""
+}
+
 // createStackOf is createStack with an image and memory of its own.
 func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory string, hosts ...string) map[string]string {
 	l.t.Helper()
@@ -1166,7 +1176,7 @@ func (l *lab) createStackOf(via, prefix string, roomOnly bool, image, memory str
 	for i, h := range hosts {
 		n := fmt.Sprintf("%s-%d", stack, i+1)
 		names[h] = n
-		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, h)
+		fmt.Fprintf(&b, "  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n%s    placement:\n      host: %s\n    migrate:\n      on-host-failure: restart-any\n", n, image, memory, firmwareLineFor(image), h)
 	}
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(via, file, b.String())

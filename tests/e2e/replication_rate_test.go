@@ -54,7 +54,7 @@ func TestReplicationRate_BwlimitPacesAScheduledRun(t *testing.T) {
 	stack := uniqueName("rrate")
 	vm := stack + "-1"
 	t.Cleanup(func() { l.ssh(h, 30*time.Second, "rm -f /tmp/"+stack+".yaml") })
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"2G\"\n        storage: %q\n    placement:\n      host: %s\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n      root:\n        size: \"2G\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), srcPool, h)
 	file := "/tmp/" + stack + ".yaml"
 	l.mustSSH(h, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(yaml))+" | base64 -d > "+file)

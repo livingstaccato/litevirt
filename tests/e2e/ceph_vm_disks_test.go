@@ -67,7 +67,7 @@ func TestLab_CephVMDisks(t *testing.T) {
 
 	stack := uniqueName("cephvm")
 	vm := stack + "-1"
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n      root:\n        size: \"1G\"\n        storage: %q\n      data:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		stack, vm, drillImage(), drillMemory(), pool, pool, src)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(src, file, yaml)
@@ -252,7 +252,7 @@ func TestLab_CephVMDisks(t *testing.T) {
 		l.lv(dst, "pool", "delete", elsewhere, "--host", dst, "--force")
 		l.ssh(dst, 30*time.Second, "rmdir "+shellQuote(elsewhereDir))
 	})
-	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
+	badYAML := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n      data:\n        size: \"64M\"\n        storage: %q\n      zz:\n        size: \"64M\"\n        storage: %q\n    placement:\n      host: %s\n",
 		badStack, bad, drillImage(), drillMemory(), pool, elsewhere, src)
 	badFile := "/tmp/" + badStack + ".yaml"
 	l.putFile(src, badFile, badYAML)

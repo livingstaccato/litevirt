@@ -99,6 +99,12 @@ type VMConfig struct {
 	// leaves it empty (libvirt uses /var/lib/libvirt/swtpm/<uuid>/, AppArmor-OK);
 	// it's an optional test escape hatch only.
 	TPMStateDir string
+
+	// BridgeMTU reads a bridge's MTU on the defining host, for the NICs that
+	// set an MTU; nil reads the host's own (ReadBridgeMTU). HostName names that
+	// host in a refusal.
+	BridgeMTU func(bridge string) (int, error)
+	HostName  string
 }
 
 // NUMAPolicy controls guest memory/CPU NUMA binding.
@@ -164,6 +170,10 @@ type NetworkConfig struct {
 	// RateMBps caps this NIC's bandwidth in MB/s in both directions (Proxmox
 	// rate=), rendered as <bandwidth>. 0 = unlimited.
 	RateMBps float64
+	// MTU is the guest NIC's MTU (<mtu size='N'/>): 0 renders none,
+	// NICMTUFromBridge renders the bridge's own MTU, and N renders N once the
+	// bridge's MTU is N too. Virtio NICs on a bridge only.
+	MTU int
 }
 
 // MachineTypeFromXML extracts the resolved <os><type machine="…"> value from a
@@ -599,7 +609,7 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 	// EnsureSparePCIeRootPorts.
 
 	// Network interfaces
-	for _, n := range cfg.Networks {
+	for i, n := range cfg.Networks {
 		mac := n.MAC
 		if mac == "" {
 			mac = GenerateMAC()
@@ -627,6 +637,11 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			iface.Driver = &ifaceDriver{Queues: n.Queues}
 		}
 		iface.Bandwidth = bandwidthElement(n.RateMBps)
+		mtu, err := nicMTUElement(cfg, i, n, model)
+		if err != nil {
+			return "", err
+		}
+		iface.MTU = mtu
 		dev.Interfaces = append(dev.Interfaces, iface)
 	}
 
@@ -1123,6 +1138,8 @@ type interfaceDevice struct {
 	Driver  *ifaceDriver `xml:"driver,omitempty"`
 	// Bandwidth is the per-NIC rate cap (<bandwidth>), nil when unlimited.
 	Bandwidth *ifaceBandwidth `xml:"bandwidth,omitempty"`
+	// MTU is the guest NIC's MTU (<mtu>), nil when it sets none.
+	MTU *ifaceMTU `xml:"mtu,omitempty"`
 }
 
 // ifaceDriver is the NIC's <driver>: N queues for virtio multiqueue.

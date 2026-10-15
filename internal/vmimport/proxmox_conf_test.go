@@ -308,3 +308,55 @@ net1: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1
 		}
 	}
 }
+
+// A NIC's mtu= is read: N as N, and 1 (Proxmox's "the bridge's MTU") as
+// bridge, each with a warning that the guest's MTU must equal the target
+// bridge's. A value litevirt cannot take is warned about and dropped; the
+// import never fails over it.
+//
+// Mutations: keep mtu=70000 — the dropped case goes red; keep an e1000's MTU —
+// the net4 case goes red.
+func TestParseProxmoxConf_NICMTU(t *testing.T) {
+	conf := `name: vm-301
+cores: 1
+memory: 512
+scsi0: local-lvm:vm-301-disk-0,size=1G
+net0: virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,mtu=9000
+net1: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1,mtu=1
+net2: virtio=AA:BB:CC:DD:EE:03,bridge=vmbr2,mtu=70000
+net3: virtio=AA:BB:CC:DD:EE:04,bridge=vmbr3
+net4: e1000=AA:BB:CC:DD:EE:05,bridge=vmbr4,mtu=9000
+`
+	fv, err := ParseProxmoxConf(writeConf(t, conf))
+	if err != nil {
+		t.Fatalf("ParseProxmoxConf: %v", err)
+	}
+	if got := [4]int{fv.NICs[0].MTU, fv.NICs[1].MTU, fv.NICs[2].MTU, fv.NICs[3].MTU}; got != [4]int{9000, 1, 0, 0} {
+		t.Errorf("MTUs = %v, want 9000, 1 (bridge), dropped, none", got)
+	}
+	all := strings.Join(fv.Warnings, "\n")
+	for _, want := range []string{"net0 sets mtu=9000", "net1 sets mtu=1", "net2 sets mtu=70000", "must equal"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("no warning mentions %q; warnings:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, "net3") {
+		t.Errorf("a NIC with no mtu warned:\n%s", all)
+	}
+	// A non-virtio NIC takes no MTU: dropped with a warning, never failing
+	// the import at its define.
+	if fv.NICs[4].MTU != 0 || !strings.Contains(all, "net4 sets mtu=9000 (not imported): an MTU needs the virtio model") {
+		t.Errorf("e1000 with mtu=9000: MTU %d, warnings:\n%s", fv.NICs[4].MTU, all)
+	}
+	spec := fv.ToVMSpec("")
+	if spec.Network[0].GetMtu() != 9000 || spec.Network[1].GetMtu() != 1 || spec.Network[2].GetMtu() != 0 {
+		t.Errorf("spec network = %v", spec.Network)
+	}
+	if cfg := fv.ToVMConfig(); cfg.Networks[0].MTU != 9000 || cfg.Networks[1].MTU != 1 {
+		t.Errorf("config networks = %+v", cfg.Networks)
+	}
+	fv.DropNICMTUs("the nic_mtu feature is not open")
+	if fv.NICs[0].MTU != 0 || fv.NICs[1].MTU != 0 || !strings.Contains(strings.Join(fv.Warnings, "\n"), "the nic_mtu feature is not open") {
+		t.Errorf("after DropNICMTUs: %+v, warnings %v", fv.NICs, fv.Warnings)
+	}
+}

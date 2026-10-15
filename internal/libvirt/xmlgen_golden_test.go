@@ -78,6 +78,27 @@ func TestGenerateDomainXMLGolden(t *testing.T) {
 			},
 		},
 		{
+			// A NIC MTU: the explicit one equals its bridge, and `bridge`
+			// (stored 1) renders the bridge's own.
+			name: "nic_mtu",
+			path: "testdata/xmlgen_nic_mtu.golden",
+			cfg: VMConfig{
+				Name:      "vm-mtu",
+				CPU:       2,
+				MemoryMiB: 1024,
+				EnableVNC: true,
+				Disks: []DiskConfig{
+					{Name: "root", Path: "/var/lib/litevirt/disks/vm-mtu/root.qcow2", Bus: "virtio", Cache: "none"},
+				},
+				Networks: []NetworkConfig{
+					{Bridge: "br-jumbo", Model: "virtio", MAC: "52:54:00:11:22:44", MTU: 9000},
+					{Bridge: "br-jumbo", Model: "virtio", MAC: "52:54:00:11:22:45", MTU: 1},
+				},
+				BridgeMTU: func(string) (int, error) { return 9000, nil },
+				HostName:  "node-a",
+			},
+		},
+		{
 			name: "macvtap_direct_with_iso",
 			path: "testdata/xmlgen_macvtap_iso.golden",
 			cfg: VMConfig{

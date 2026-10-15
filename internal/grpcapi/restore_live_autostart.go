@@ -89,6 +89,13 @@ func (s *Server) autoDefineRestoredVM(
 	if len(ioR.invalid) > 0 {
 		_ = send(&pb.RestoreLiveProgress{Status: "invalid disk/NIC tuning in the backup's spec is not applied: " + strings.Join(ioR.invalid, "; ")})
 	}
+	mtuR := s.restrictRestoredNICMTU(ctx, spec)
+	if mtuR.stripped {
+		_ = send(&pb.RestoreLiveProgress{Status: "the backup's NIC MTUs are not applied: the nic_mtu feature is not open"})
+	}
+	if len(mtuR.invalid) > 0 {
+		_ = send(&pb.RestoreLiveProgress{Status: "invalid NIC MTUs in the backup's spec are not applied: " + strings.Join(mtuR.invalid, "; ")})
+	}
 	// A limit in the spec — an operator's --spec or one embedded in a backup,
 	// possibly from a cluster that has latched — is dropped, never refused,
 	// where a create's would be refused (restrictRestoredLimits).
@@ -339,9 +346,10 @@ func (s *Server) autoDefineRestoredVM(
 		s.firmware.ApplyTo(&vmCfg, s.dataDir, targetName, spec.SecureBoot, spec.Tpm)
 		vmCfg.UUID = spec.Uuid
 	}
+	s.withNICMTU(&vmCfg)
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
-		return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+		return "", "", renderStatus("generate domain XML", err)
 	}
 
 	_ = send(&pb.RestoreLiveProgress{
@@ -365,7 +373,7 @@ func (s *Server) autoDefineRestoredVM(
 			vmCfg.Networks[i].RateMBps = 0
 		}
 		if domXML, err = lv.GenerateDomainXML(vmCfg); err != nil {
-			return "", "", status.Errorf(codes.Internal, "generate domain XML: %v", err)
+			return "", "", renderStatus("generate domain XML", err)
 		}
 		limitsG = capabilities.FeatureGrant{}
 	}
@@ -455,7 +463,7 @@ func (s *Server) autoDefineRestoredVM(
 	// it from the (device-less) inactive definition, which correctly imports nothing.
 	// adopt=false: best-effort-populate vm_nics, but don't self-certify adoption —
 	// the backfill audit confirms/reconciles.
-	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG}
+	gs := vmSpecGrants{tuning: ioG, passthrough: passthroughG, limits: limitsG, mtu: mtuR.grant}
 	if err := s.insertVMWithGrants(ctx, spec, gs, vmRecord, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		if fwVM {
 			// A running firmware domain with no DB row is unmanageable — lifecycle

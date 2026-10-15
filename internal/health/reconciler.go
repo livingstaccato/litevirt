@@ -2427,6 +2427,11 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 		}
 	}
 
+	// NIC MTUs resolve against this host's bridges, provisioned above.
+	if br, ok := r.virt.(lv.BridgeMTUReader); ok {
+		vmCfg.BridgeMTU = br.BridgeMTU
+	}
+	vmCfg.HostName = r.hostName
 	domXML, err = lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)

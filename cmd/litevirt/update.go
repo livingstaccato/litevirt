@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 )
 
 func newUpdateCmd() *cobra.Command {
@@ -46,6 +47,8 @@ func newUpdateCmd() *cobra.Command {
 		cpuLimit  float64
 		cpuShares int32
 		nicRates  []string
+		// per-NIC MTU (a redefine)
+		nicMTUs []string
 	)
 	cmd := &cobra.Command{
 		Use:   "update <vm>",
@@ -55,8 +58,8 @@ func newUpdateCmd() *cobra.Command {
 Restart policy, autostart (onboot), startup ordering and the noisy-neighbour
 limits (--cpu-limit, --cpu-shares, --nic-rate) apply LIVE — the VM does
 not need to be stopped. CPU, memory, CPU mode, VNC, machine type, firmware,
-guest-agent and the balloon min/max bounds change the domain definition, so the
-VM must be stopped for those.
+guest-agent, the balloon min/max bounds and --nic-mtu change the domain
+definition, so the VM must be stopped for those.
 
 With live_resize enabled cluster-wide, --cpu GROWS a running VM's vCPUs LIVE up to
 its --max-cpu hotplug ceiling (a CPU shrink or exceeding the ceiling still needs a
@@ -77,7 +80,7 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 				"onboot", "startup-order", "start-delay", "stop-delay",
 				"machine", "firmware", "guest-agent", "min-mem", "max-mem", "max-cpu",
 				"secure-boot", "tpm", "memory-hotplug-max", "clear-usb", "usb", "usb-port", "usb-mapping",
-				"cpu-limit", "cpu-shares", "nic-rate"} {
+				"cpu-limit", "cpu-shares", "nic-rate", "nic-mtu"} {
 				if f.Changed(n) {
 					any = true
 					break
@@ -158,6 +161,13 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 				}
 				req.NicRate = append(req.NicRate, nr)
 			}
+			for _, spec := range nicMTUs {
+				nm, err := parseNICMTU(spec)
+				if err != nil {
+					return err
+				}
+				req.NicMtu = append(req.NicMtu, nm)
+			}
 			// Live metadata: only send what changed (presence-detected).
 			if f.Changed("restart") || f.Changed("restart-max-attempts") ||
 				f.Changed("restart-delay") || f.Changed("restart-window") {
@@ -196,6 +206,7 @@ stopped or --restart-if-needed; USB devices are not hot-plugged.`,
 	cmd.Flags().Float64Var(&cpuLimit, "cpu-limit", 0, "Cap the VM's total CPU at this many host cores, fractions allowed, at most --cpu (live; 0 removes the cap)")
 	cmd.Flags().Int32Var(&cpuShares, "cpu-shares", 0, "CPU weight under contention, 1-10000: the cgroup v2 weight, Proxmox cpuunits, default 100 (live; 0 restores the default)")
 	cmd.Flags().StringArrayVar(&nicRates, "nic-rate", nil, "Cap one NIC's bandwidth, <nic>=<MB/s> with a 0-based NIC number, e.g. 0=12.5 (live; 0=0 removes it; repeatable)")
+	cmd.Flags().StringArrayVar(&nicMTUs, "nic-mtu", nil, "Set one NIC's MTU, <nic>=<MTU|bridge> with a 0-based NIC number, e.g. 0=9000; it must equal the bridge's MTU (VM must be stopped; 0=0 removes it; repeatable)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")
 	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "", "CPU mode: host-passthrough|host-model|custom (VM must be stopped)")
@@ -243,4 +254,25 @@ func parseNICRate(v string) (*pb.NICRateUpdate, error) {
 		return nil, fmt.Errorf("--nic-rate %q: the rate must be a number of MB/s, 0 or more", v)
 	}
 	return &pb.NICRateUpdate{Ordinal: int32(ord), RateMbSec: r}, nil
+}
+
+// parseNICMTU parses one --nic-mtu value, "<nic>=<MTU|bridge>".
+func parseNICMTU(v string) (*pb.NICMTUUpdate, error) {
+	n, m, ok := strings.Cut(v, "=")
+	if !ok {
+		return nil, fmt.Errorf("--nic-mtu %q: want <nic>=<MTU|bridge>, e.g. 0=9000", v)
+	}
+	ord, err := strconv.Atoi(strings.TrimSpace(n))
+	if err != nil || ord < 0 {
+		return nil, fmt.Errorf("--nic-mtu %q: the NIC must be a 0-based number", v)
+	}
+	m = strings.TrimSpace(m)
+	if strings.EqualFold(m, "bridge") {
+		return &pb.NICMTUUpdate{Ordinal: int32(ord), Mtu: compose.NICMTUBridge}, nil
+	}
+	mtu, err := strconv.Atoi(m)
+	if err != nil || (mtu != 0 && (mtu < int(compose.MinNICMTU) || mtu > int(compose.MaxNICMTU))) {
+		return nil, fmt.Errorf("--nic-mtu %q: the MTU must be %d to %d, bridge, or 0 to remove it", v, compose.MinNICMTU, compose.MaxNICMTU)
+	}
+	return &pb.NICMTUUpdate{Ordinal: int32(ord), Mtu: int32(mtu)}, nil
 }

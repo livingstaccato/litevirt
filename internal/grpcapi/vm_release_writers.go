@@ -10,14 +10,14 @@ import (
 
 // vmSpecGrants are the release-feature grants one VM spec write took: disk/NIC
 // tuning (ioGrant), USB devices and memory hot-add (passthroughGrant), CPU and
-// NIC limits (recordLimitedSpec / recordLimitUpdate). A spec can carry all
-// three, so a shared call site — a create, a restore's auto-define, a clone,
+// NIC limits (recordLimitedSpec / recordLimitUpdate), NIC MTUs (nicMTUGrant).
+// A spec can carry all of them, so a shared call site — a create, a restore's auto-define, a clone,
 // an UpdateVM redefine — takes every grant its spec needs, each through its
 // own gate, and writes through ONE writer that checks them all
 // (corrosion.InsertVMWithReleaseFeatures / MutateDesiredSpecWithReleaseFeatures;
 // integration checklist M9). A feature the spec does not carry needs no grant.
 type vmSpecGrants struct {
-	tuning, passthrough, limits capabilities.FeatureGrant
+	tuning, passthrough, limits, mtu capabilities.FeatureGrant
 }
 
 // vmSpecNeeds is which release features' data spec carries.
@@ -26,6 +26,7 @@ func vmSpecNeeds(spec *pb.VMSpec) corrosion.VMSpecFeatures {
 		Tuning:      specSetsDiskNICIO(spec),
 		Passthrough: vmSpecSetsPassthrough(spec),
 		Limits:      specSetsLimits(spec),
+		MTU:         specSetsNICMTU(spec),
 	}
 }
 
@@ -34,7 +35,7 @@ func vmSpecNeeds(spec *pb.VMSpec) corrosion.VMSpecFeatures {
 func (s *Server) insertVMWithGrants(ctx context.Context, spec *pb.VMSpec, gs vmSpecGrants, vm corrosion.VMRecord,
 	ifaces []corrosion.InterfaceRecord, disks []corrosion.DiskRecord, nics []corrosion.NICRecord,
 	pciIntents []corrosion.PCIIntentRecord, adopt bool) error {
-	return corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, vmSpecNeeds(spec),
+	return corrosion.InsertVMWithReleaseFeatures(ctx, s.db, gs.tuning, gs.passthrough, gs.limits, gs.mtu, vmSpecNeeds(spec),
 		vm, ifaces, disks, nics, pciIntents, adopt)
 }
 
@@ -42,5 +43,5 @@ func (s *Server) insertVMWithGrants(ctx context.Context, spec *pb.VMSpec, gs vmS
 // (corrosion.CheckVMSpecGrants): nil exactly when insertVMWithGrants would
 // accept the grants.
 func (gs vmSpecGrants) refusal(spec *pb.VMSpec) error {
-	return corrosion.CheckVMSpecGrants(gs.tuning, gs.passthrough, gs.limits, vmSpecNeeds(spec))
+	return corrosion.CheckVMSpecGrants(gs.tuning, gs.passthrough, gs.limits, gs.mtu, vmSpecNeeds(spec))
 }

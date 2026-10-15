@@ -406,6 +406,9 @@ For example:
 				}
 
 				if vm.VncAddress == "" {
+					if vm.VncUnknown != "" {
+						return fmt.Errorf("VNC of %s: %s", vmName, vm.VncUnknown)
+					}
 					return fmt.Errorf("VNC not available for %s (VM may not be running or VNC not enabled)", vmName)
 				}
 				printVNCInfo(os.Stdout, vmName, vm)

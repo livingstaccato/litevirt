@@ -1,11 +1,16 @@
 package grpcapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // A read of a local VM (ListVMs, vmToProto) asks libvirt for the domain's live
@@ -174,4 +179,80 @@ func (s *Server) readVMState(vm *corrosion.VMRecord, b *liveStateBudget) (state,
 func (s *Server) liveStateUnknownDetail(recorded string) string {
 	return fmt.Sprintf("live state unknown: libvirt on %s has not answered for this VM (waited %s); the cluster's record says %s",
 		s.hostName, s.liveStateWaitOrDefault(), recorded)
+}
+
+// fillVNC sets a running local VM's VNC console on pbVM: its address and
+// whether it asks for a password (docs/ui.md "Console passwords"; never the
+// password itself). Both are read as its live state is (readVMState): on
+// connections of their own, within the live-state wait and what is left of
+// b. A read libvirt has not answered (or answered with an error, for the
+// password) is said in vnc_unknown, never guessed: a VM whose console libvirt
+// does not answer for has no address, and a password not read is not "none".
+func (s *Server) fillVNC(ctx context.Context, pbVM *pb.VM, name string, b *liveStateBudget) {
+	_, ps, err := s.boundedVirtCall(vncPortKey(name), b, func() (string, error) {
+		p, err := s.vncPortRead(name)
+		return strconv.Itoa(p), err
+	})
+	if errors.Is(err, errLiveStateNoAnswer) {
+		pbVM.VncUnknown = fmt.Sprintf("VNC console unknown: libvirt on %s has not answered for this VM (waited %s)",
+			s.hostName, s.liveStateWaitOrDefault())
+		return
+	}
+	port, perr := strconv.Atoi(ps)
+	if err != nil || perr != nil || port < 0 {
+		return // no VNC console (not configured, or not active)
+	}
+	if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
+		pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
+	}
+	_, req, err := s.boundedVirtCall(vncPasswordKey(name), b, func() (string, error) {
+		pw, err := s.consolePasswordRead(name, "vnc")
+		if pw != "" {
+			return "required", err
+		}
+		return "", err
+	})
+	switch {
+	case errors.Is(err, errLiveStateNoAnswer):
+		pbVM.VncUnknown = fmt.Sprintf("whether the VNC console asks for a password is unknown: libvirt on %s has not answered for this VM (waited %s)",
+			s.hostName, s.liveStateWaitOrDefault())
+	case err != nil:
+		pbVM.VncUnknown = fmt.Sprintf("whether the VNC console asks for a password is unknown: libvirt on %s answered: %v", s.hostName, err)
+	default:
+		pbVM.VncPasswordRequired = req == "required"
+	}
+}
+
+func vncPortKey(name string) string     { return "vnc-port\x00" + name }
+func vncPasswordKey(name string) string { return "vnc-password\x00" + name }
+
+// vncPortRead is the domain's VNC port, asked on the backend's StateReader
+// when it has one (the daemon's connection can be full of calls libvirt does
+// not answer), and on the daemon's connection when that cannot dial.
+func (s *Server) vncPortRead(name string) (int, error) {
+	if b, ok := s.virt.(interface{ StateReader() *lv.StateReader }); ok {
+		if r := b.StateReader(); r != nil {
+			p, err := r.VNCPort(name)
+			if !errors.Is(err, lv.ErrStateConnUnavailable) {
+				return p, err
+			}
+		}
+	}
+	return s.virt.GetVMVNCPort(name)
+}
+
+// consolePasswordRead is the running domain's console password of kind,
+// asked on the backend's SecureStateReader when it has one: a read-write
+// connection of its own, since libvirt refuses a read-only one the secure
+// XML. On the daemon's connection when that cannot dial.
+func (s *Server) consolePasswordRead(name, kind string) (string, error) {
+	if b, ok := s.virt.(interface{ SecureStateReader() *lv.StateReader }); ok {
+		if r := b.SecureStateReader(); r != nil {
+			pw, err := r.ConsolePassword(name, kind)
+			if !errors.Is(err, lv.ErrStateConnUnavailable) {
+				return pw, err
+			}
+		}
+	}
+	return s.virt.ConsolePassword(name, kind)
 }

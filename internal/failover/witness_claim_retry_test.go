@@ -281,6 +281,43 @@ func TestConfirmationResume_RecordsItsMomentSoARefusedClaimIsRetried(t *testing.
 	}
 }
 
+// Review m3/m4: an adopted value stamped at a lower term of the lease is a
+// problem even when its destination is the coordinator's own pick (in a
+// small cluster the one healthy candidate often is), and whatever this
+// coordinator's own enforcement.lease_term says: the check only asks the
+// destination for an abandonment, and the executors refuse the stale stamp
+// on the cluster-wide latch.
+//
+// Mutations: run the check after the same-destination return, or gate it on
+// leaseTermEnforced (the local flag) — the problem is "" and the claim
+// strands on the stale value.
+func TestAdoptedDestProblem_AStaleTermToTheSameDestinationIsAProblem(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.LeaseTermEnforce = false
+	adopted := claimedProof{Proof: corrosion.ActionProof{
+		Action: corrosion.ActionReschedule, DestHost: "dest",
+		LeaseKey: corrosion.LeaseKeyFailover, LeaseTerm: 1,
+	}}
+	proposal := corrosion.ActionProof{
+		Action: corrosion.ActionReschedule, DestHost: "dest",
+		LeaseKey: corrosion.LeaseKeyFailover, LeaseTerm: 2,
+	}
+	c.Gate = fakeFailoverGate{enforced: map[string]bool{capabilities.LeaseTermV1: true}}
+	p, err := c.adoptedDestProblem(ctx, adopted, proposal, "src", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == "" {
+		t.Fatal("an adopted term-1 value to the coordinator's own pick was not a problem under a latched lease_term_v1")
+	}
+	c.Gate = fakeFailoverGate{enforced: map[string]bool{capabilities.LeaseTermV1: false}}
+	if p, err := c.adoptedDestProblem(ctx, adopted, proposal, "src", nil); err != nil || p != "" {
+		t.Fatalf("problem %q (err %v) with lease_term_v1 unlatched; executors accept the stamp", p, err)
+	}
+}
+
 // Review m5: a host that cannot be read is skipped this cycle, neither run
 // nor re-judged.
 //

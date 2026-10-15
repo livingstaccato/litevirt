@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -375,10 +376,13 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 
 // adoptedTermSuperseded says why a decided value this coordinator did not
 // propose carries a lease stamp the executors refuse, or "" when they do
-// not: lease terms are enforced here, this coordinator stamps a term, and
-// the value's stamp is a lower term of the same lease or none at all.
+// not: lease_term_v1 is latched cluster-wide, this coordinator stamps a
+// term, and the value's stamp is a lower term of the same lease or none at
+// all. It is gated on the latch, not on this coordinator's own
+// enforcement.lease_term: the executors refuse on the latch, and what it
+// leads to is only a request that the destination abandon the value.
 func (c *Coordinator) adoptedTermSuperseded(ctx context.Context, d, proposal corrosion.ActionProof) string {
-	if proposal.LeaseTerm <= 0 || proposal.LeaseKey == "" || !c.leaseTermEnforced(ctx) {
+	if proposal.LeaseTerm <= 0 || proposal.LeaseKey == "" || c.Gate == nil || !c.Gate.Enforced(ctx, capabilities.LeaseTermV1) {
 		return ""
 	}
 	if d.LeaseKey == proposal.LeaseKey && d.LeaseTerm >= proposal.LeaseTerm {

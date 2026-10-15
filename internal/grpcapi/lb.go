@@ -3095,7 +3095,7 @@ func (s *Server) updateIsolationForLB(ctx context.Context, lbName, bridge, vip s
 // host-isolation enabled. Returns (nil, "") if not found.
 func (s *Server) findIsolatedNetworkForBridge(ctx context.Context, bridge string) (*compose.NetworkDef, string) {
 	rows, err := s.db.Query(ctx,
-		`SELECT name, type, config FROM networks WHERE deleted_at IS NULL`)
+		`SELECT name, type, config, COALESCE(stack_name, '') AS stack_name FROM networks WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, ""
 	}
@@ -3108,21 +3108,12 @@ func (s *Server) findIsolatedNetworkForBridge(ctx context.Context, bridge string
 		if !def.HostIsolation {
 			continue
 		}
-		// Determine what bridge name this network would produce.
-		netBridge := def.Interface
-		if netBridge == "" {
-			netBridge = r.String("name")
-		}
-		switch def.Type {
-		case "vxlan":
-			if def.VNI > 0 {
-				netBridge = fmt.Sprintf("br-vni%d", def.VNI)
+		// The devices this network may be on here — the same answer
+		// lbVIPInterface placed the VIP by.
+		for _, b := range lbBridgeCandidates(r.String("name"), r.String("stack_name"), def) {
+			if b == bridge {
+				return &def, def.Subnet
 			}
-		case "isolated":
-			netBridge = network.IsolatedBridgeName(r.String("name"))
-		}
-		if netBridge == bridge {
-			return &def, def.Subnet
 		}
 	}
 	return nil, ""

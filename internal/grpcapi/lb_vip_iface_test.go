@@ -201,3 +201,33 @@ func TestApplyLB_HonoursSNAT(t *testing.T) {
 		})
 	}
 }
+
+// TestLBVIPInterface_StackBridgeUnderEitherName: a stack's bridge network is
+// provisioned on its short name by the deploy's target host and on its scoped
+// name by a peer target (which is sent the definition without an interface),
+// and the row holds whichever write replicated last. The VIP goes on whichever
+// of the two this host has.
+//
+// Mutation: try only network.BridgeName — red.
+func TestLBVIPInterface_StackBridgeUnderEitherName(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		iface, have string
+	}{
+		{"", "hinet"},          // row without the interface, this host on the short name
+		{"", "lbs_hinet"},      // row without the interface, this host on the scoped name
+		{"hinet", "lbs_hinet"}, // row with the interface, this host on the scoped name
+		{"hinet", "hinet"},
+	} {
+		s := testServer(t)
+		have := tc.have
+		s.SetBridgeExists(func(b string) bool { return b == have })
+		cfg, _ := json.Marshal(compose.NetworkDef{Type: "bridge", Interface: tc.iface, Subnet: "10.203.0.0/24", HostIsolation: true})
+		if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "lbs_hinet", StackName: "lbs", Type: "bridge", Config: string(cfg)}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.lbVIPInterface(ctx, "", "lbs", "10.203.0.250"); err != nil || got != tc.have {
+			t.Errorf("row interface %q, host has %s: %q, %v", tc.iface, tc.have, got, err)
+		}
+	}
+}

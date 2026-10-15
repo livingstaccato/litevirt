@@ -665,6 +665,24 @@ func replacedVMViolations(pkgs []goPackage, builders, callers map[string][]strin
 	for _, p := range pkgs {
 		for _, f := range p.files {
 			for _, decl := range f.Decls {
+				// A package-level value (a key held in a var, a closure)
+				// is never a sanctioned producer.
+				if gd, ok := decl.(*ast.GenDecl); ok {
+					ast.Inspect(gd, func(n ast.Node) bool {
+						switch v := n.(type) {
+						case *ast.CompositeLit:
+							if typeNamed(v.Type, "replacedVMKey") {
+								bad = append(bad, p.dir+": a package-level value builds a replaced-VM key")
+							}
+						case *ast.Ident:
+							if slices.Contains(replacedVMConstructors, v.Name) {
+								bad = append(bad, p.dir+": a package-level value refers to "+v.Name)
+							}
+						}
+						return true
+					})
+					continue
+				}
 				fd, ok := decl.(*ast.FuncDecl)
 				if !ok || fd.Body == nil {
 					continue
@@ -694,7 +712,9 @@ func replacedVMViolations(pkgs []goPackage, builders, callers map[string][]strin
 						bad = append(bad, key+": builds a replaced-VM value without any of "+strings.Join(ev, ", "))
 					}
 				}
-				if callsAnyFunc(fd.Body, replacedVMConstructors) {
+				// Any reference counts, a call or a function value (g :=
+				// withReplacedVM).
+				if usesAny(fd.Body, replacedVMConstructors) {
 					seenC[key] = true
 					if ev, listed := callers[key]; !listed {
 						bad = append(bad, key+": hands a create a replaced VM but is not a listed caller")
@@ -726,9 +746,12 @@ func TestReplacedVMProducerGuard(t *testing.T) {
 }
 
 // TestReplacedVMProducerGuard_FlagsAFixture: a new producer of the value —
-// directly, through a variable key, or by calling a constructor (a clone
-// reusing the existence-check bypass) — is flagged; so is a listed one
-// without its evidence and a stale entry. A reader is not a producer.
+// directly, through a variable key, by calling a constructor (a clone reusing
+// the existence-check bypass) or taking it as a function value, or at package
+// level — is flagged; so is a listed one without its evidence and a stale
+// entry. A reader is not a producer. The evidence check is that the
+// identifier appears in the body: a listed function gaining a second,
+// unrelated constructor call is not caught.
 //
 // Mutation: skip the builder check (treat every literal as a read) — the
 // direct and variable producers pass.
@@ -741,6 +764,9 @@ func peer(ctx context.Context) context.Context { return context.WithValue(ctx, r
 func clone(ctx context.Context, src *corrosion.VMRecord) { _ = withReplacedVM(ctx, src) }
 func rebuild(ctx context.Context) { d, _ := corrosion.DeleteVMReporting(ctx, nil, "a"); _ = withReplacedVM(ctx, d) }
 func lazy(ctx context.Context, cur *corrosion.VMRecord) { _ = withReplacedRow(ctx, cur) }
+func ref() { g := withReplacedVM; _ = g }
+var pkgKey = replacedVMKey{}
+var pkgClosure = func(ctx context.Context) { _ = withReplacedSnapshot(ctx, "a", corrosion.VMDeleteSnapshot{}) }
 `)
 	got := replacedVMViolations([]goPackage{pkg},
 		map[string][]string{"internal/grpcapi.peer": {"requirePeerCert"}, "internal/grpcapi.gone": {"x"}},
@@ -751,7 +777,10 @@ func lazy(ctx context.Context, cur *corrosion.VMRecord) { _ = withReplacedRow(ct
 		"internal/grpcapi.gone: listed as a replaced-VM builder but builds none; remove it",
 		"internal/grpcapi.lazy: hands a create a replaced VM without any of withDeletedVMSink",
 		"internal/grpcapi.peer: builds a replaced-VM value without any of requirePeerCert",
+		"internal/grpcapi.ref: hands a create a replaced VM but is not a listed caller",
 		"internal/grpcapi.viaVar: puts a replaced-VM value in a context but is not a listed builder",
+		"internal/grpcapi: a package-level value builds a replaced-VM key",
+		"internal/grpcapi: a package-level value refers to withReplacedSnapshot",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("violations:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))

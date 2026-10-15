@@ -444,18 +444,11 @@ func TestFirewallIDCarry_ARecreateFromAStaleCopyCarriesNoForeignIdentity(t *test
 	}
 }
 
-// D2b review I-2: a cold migrate whose target landed and whose source is then
-// parked (its runtime delete failed) leaves two live rows holding one fw_id,
-// for as long as an operator takes. With a tag group present, the pair is
-// recognised from the migrate's own proof: the target is the member, neither
-// row is held at drop. A third live holder of the id is still held, and
-// minting the id refuses while the move is open.
-//
-// Mutation: drop the move exemption — both rows are held: red.
-func TestFirewallIDCarry_AParkedMigrateIsNotHeldAndRefusesAMint(t *testing.T) {
+// gatedMigrateCluster is ctMigrateCluster with the release latched and the
+// split-brain gate at quorum: a migrate then mints its relocation proof.
+func gatedMigrateCluster(t *testing.T) *Cluster {
+	t.Helper()
 	c := ctMigrateCluster(t)
-	// The migrate mints its relocation proof only under the split-brain
-	// gate, which needs quorum.
 	gates := latchRelease(t, c)
 	qctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -468,6 +461,19 @@ func TestFirewallIDCarry_AParkedMigrateIsNotHeldAndRefusesAMint(t *testing.T) {
 			return state == health.QuorumYes
 		})
 	}
+	return c
+}
+
+// D2b review I-2: a cold migrate whose target landed and whose source is then
+// parked (its runtime delete failed) leaves two live rows holding one fw_id,
+// for as long as an operator takes. With a tag group present, the pair is
+// recognised from the migrate's own proof: the target is the member, neither
+// row is held at drop. A third live holder of the id is still held, and
+// minting the id refuses while the move is open.
+//
+// Mutation: drop the move exemption — both rows are held: red.
+func TestFirewallIDCarry_AParkedMigrateIsNotHeldAndRefusesAMint(t *testing.T) {
+	c := gatedMigrateCluster(t)
 	src, dst := c.Nodes[0], c.Nodes[1]
 	ctx := context.Background()
 	const name = "ct-park"
@@ -622,5 +628,97 @@ func TestFirewallIDCarry_AComposeInlineRecreateKeepsItAndACreateGetsNone(t *test
 		if got := vmFWIDOn(t, n, "api"); got != "" {
 			t.Errorf("api, created in the same deploy, holds identity %q on %s's replica", got, n.Name)
 		}
+	}
+}
+
+// D2b re-review N-1: a container migrated A -> B, then back B -> A, where the
+// way back parks its source on B. Both proofs bind a direction between the
+// two live rows (the first one A -> B, the second B -> A); the newer one
+// decides, so the live target on A is the member and B is left out. Never
+// "in no group and not held".
+//
+// Mutation: take the first direction that matches — red when the target's
+// row is scanned first.
+func TestFirewallIDCarry_AMigrateThereAndBackParkedKeepsTheTargetTheMember(t *testing.T) {
+	c := gatedMigrateCluster(t)
+	a, b := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	const name = "ct-back"
+	createContainer(t, c, a, name)
+	id := mintFWID(t, c, a, corrosion.TagMemberCT, a.Name, name)
+	if err := corrosion.SetFirewallTagGroup(ctx, a.DB, capabilities.GrantForTest(t, capabilities.FeatureFirewallTagGroups),
+		"web", &corrosion.FirewallTagGroupDef{Match: map[string]string{"role": "web"}}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	seedTagsRow(t, a, corrosion.TagMemberCT, id, `{"tags":{"role":"web"}}`)
+	if err := runMigrate(t, c, a, b, name, stagingRepo(t)); err != nil {
+		t.Fatalf("migrate there: %v", err)
+	}
+	b.CT.FailDelete(errors.New("simulated source runtime delete failure"))
+	if err := runMigrate(t, c, b, a, name, stagingRepo(t)); err == nil || !strings.Contains(err.Error(), "source runtime cleanup failed") {
+		t.Fatalf("premise: the way back was to land and park its source on %s, got %v", b.Name, err)
+	}
+	for _, n := range []*Node{a, b} {
+		if got := ctFWIDOn(t, a, n.Name, name); got != id {
+			t.Fatalf("premise: the row on %s holds %q, want %q", n.Name, got, id)
+		}
+	}
+	m, err := corrosion.ListTagGroupMembers(ctx, a.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members []string
+	for _, g := range m.Groups {
+		for _, mb := range g.Members {
+			members = append(members, mb.Host+"/"+mb.Name)
+		}
+	}
+	if len(m.SharedFWID) != 0 || !slices.Equal(members, []string{a.Name + "/" + name}) {
+		t.Fatalf("members %v, held %+v; want the live target on %s the only member", members, m.SharedFWID, a.Name)
+	}
+}
+
+// D2b re-review M-b: I-1 scenario A on the inline compose recreate. node-2
+// is cut off and still holds incarnation A of web (fw_id X); on node-0, A was
+// deleted and B created in its name. A deploy entered on node-2 re-creates
+// web inline: the owner's delete tombstones B and reports B, which node-2
+// does not accept, so the create names node-2's copy of A for its existence
+// check only — never A's identity.
+//
+// Mutation: drop the strip on the row-only fallback in recreateInline — the
+// re-created web holds X: red.
+func TestFirewallIDCarry_AnInlineRecreateFromAStaleCopyCarriesNoForeignIdentity(t *testing.T) {
+	c, _ := newRecreateRemoteFleet(t, 2, "node-0")
+	n0, n1, n2 := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+	x := mintFWID(t, c, n0, corrosion.TagMemberVM, "", "web")
+	c.SetLinkFault(n0, n2, LinkFault{Block: true})
+	c.SetLinkFault(n1, n2, LinkFault{Block: true})
+	a, err := corrosion.GetVM(ctx, n0.DB, "web")
+	if err != nil || a == nil {
+		t.Fatalf("web on %s: %v", n0.Name, err)
+	}
+	if err := corrosion.DeleteVM(ctx, n0.DB, "web"); err != nil {
+		t.Fatal(err)
+	}
+	b := *a
+	b.CreatedAt, b.OwnerEpoch, b.SpecGeneration = "", 0, 0
+	if err := corrosion.InsertVM(ctx, n0.DB, b, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := vmFWIDOn(t, n0, "web"); got != "" {
+		t.Fatalf("premise: B holds no identity, got %q", got)
+	}
+	if got := vmFWIDOn(t, n2, "web"); got != x {
+		t.Fatalf("premise: %s still holds A with %q, got %q", n2.Name, x, got)
+	}
+
+	msgs := deployCollect(t, ctx, c.SelfClient(n2), recreateRemoteYAML("node-0", "second"))
+	if p := errorPhaseFor(msgs, "web"); p != nil {
+		t.Fatalf("inline recreate from a stale copy: %s; %s", p.Error, whereIs(c, "web"))
+	}
+	assertUserdata(t, n0, "second")
+	if got := vmFWIDOn(t, n0, "web"); got != "" {
+		t.Fatalf("the re-created web holds identity %q; A's was %q and B had none", got, x)
 	}
 }

@@ -25,13 +25,19 @@ func (f *tagGroupFixture) moveCT(host, name, fwID, state, detail, token string) 
 // relocationProof stores a container relocation proof.
 func (f *tagGroupFixture) relocationProof(id, name, dest, coordinator, token, status string, reaped bool) {
 	f.t.Helper()
+	f.relocationProofAt(id, name, dest, coordinator, token, status, reaped, "2026-10-15T00:00:00Z")
+}
+
+// relocationProofAt is relocationProof minted at createdAt.
+func (f *tagGroupFixture) relocationProofAt(id, name, dest, coordinator, token, status string, reaped bool, createdAt string) {
+	f.t.Helper()
 	del := any(nil)
 	if reaped {
-		del = "t"
+		del = createdAt
 	}
 	mustExec(f.t, f.c, `INSERT INTO runtime_action_proofs (id, action, target_kind, target_name, dest_host, coordinator,
-		relocation_token, status, created_at, updated_at, deleted_at) VALUES (?, ?, 'container', ?, ?, ?, ?, ?, 't', 't', ?)`,
-		id, ActionRelocate, name, dest, coordinator, token, status, del)
+		relocation_token, status, created_at, updated_at, deleted_at) VALUES (?, ?, 'container', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, ActionRelocate, name, dest, coordinator, token, status, createdAt, createdAt, del)
 }
 
 func sharedNames(m *TagGroupMembership) []string {
@@ -121,5 +127,105 @@ func TestMintFirewallID_RefusesWhileTheContainerMoves(t *testing.T) {
 	id, abandoned, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, "node-2", "copy")
 	if err != nil || id == tgID(3) || abandoned != tgID(3) {
 		t.Fatalf("mint over a copied id: (%q, %q, %v), want a fresh id abandoning %s", id, abandoned, err, tgID(3))
+	}
+}
+
+// Re-review N-1, M-c, M-f: a pair's direction is decided by the strictly
+// newest record binding it; on a tie, or when either direction rests on a
+// marker while the other also matches, nothing is exempt and both rows are
+// held (visible). Each binding of a proof is checked, and a running source is
+// never exempt.
+//
+// Mutation: take the first direction that matches — "back" (target inserted
+// first) loses its target: red. Exempt a running source — red.
+func TestTagGroupMembers_APairsDirectionIsUnambiguous(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
+	for i := 1; i <= 7; i++ {
+		f.tags(TagMemberCT, tgID(i), `{"tags":{"role":"web"}}`)
+	}
+	// A -> B, later B -> A: the target (node-1) was inserted first; both
+	// proofs are visible, the first reaped.
+	f.moveCT("node-1", "back", tgID(1), "stopped", "", "tok-2")
+	f.moveCT("node-2", "back", tgID(1), "stopped", "operator-stop", "tok-1")
+	f.relocationProofAt("p1", "back", "node-2", "node-1", "tok-1", "completed", true, "2026-10-01T00:00:00Z")
+	f.relocationProofAt("p2", "back", "node-1", "node-2", "tok-2", "completed", false, "2026-10-14T00:00:00Z")
+	// A failover relocation A -> B coordinated by C, then a migrate B -> C.
+	f.moveCT("node-3", "fo", tgID(2), "running", "", "tok-m")
+	f.moveCT("node-2", "fo", tgID(2), "stopped", "operator-stop", "tok-r")
+	f.relocationProofAt("pr", "fo", "node-2", "node-3", "tok-r", "completed", false, "2026-10-01T00:00:00Z")
+	f.relocationProofAt("pm", "fo", "node-3", "node-2", "tok-m", "in_progress", false, "2026-10-14T00:00:00Z")
+	// Both directions bound by proofs minted at the same moment: held.
+	f.moveCT("node-1", "tie", tgID(3), "stopped", "", "tok-b")
+	f.moveCT("node-2", "tie", tgID(3), "stopped", "", "tok-a")
+	f.relocationProofAt("pa", "tie", "node-2", "node-1", "tok-a", "completed", false, "2026-10-14T00:00:00Z")
+	f.relocationProofAt("pb", "tie", "node-1", "node-2", "tok-b", "completed", false, "2026-10-14T00:00:00Z")
+	// A proof for another dest host, and one for another container: held.
+	f.moveCT("node-1", "dest", tgID(4), "stopped", "", "")
+	f.moveCT("node-2", "dest", tgID(4), "running", "", "tok-d")
+	f.relocationProof("pd", "dest", "node-9", "node-1", "tok-d", "completed", false)
+	f.moveCT("node-1", "other", tgID(5), "stopped", "", "")
+	f.moveCT("node-2", "other", tgID(5), "running", "", "tok-o")
+	f.relocationProof("po", "someone-else", "node-2", "node-1", "tok-o", "completed", false)
+	// A parked source an operator started again: held.
+	f.moveCT("node-1", "started", tgID(6), "running", "", "")
+	f.moveCT("node-2", "started", tgID(6), "running", "", "tok-s")
+	f.relocationProof("ps", "started", "node-2", "node-1", "tok-s", "completed", false)
+	// The control: a plain parked migrate is still exempt.
+	f.moveCT("node-1", "parked", tgID(7), "stopped", "operator-stop", "")
+	f.moveCT("node-2", "parked", tgID(7), "running", "", "tok-p")
+	f.relocationProof("pp", "parked", "node-2", "node-1", "tok-p", "completed", false)
+
+	m := f.members()
+	want := []string{
+		"node-1/dest", "node-1/other", "node-1/started", "node-1/tie",
+		"node-2/dest", "node-2/other", "node-2/started", "node-2/tie",
+	}
+	if got := sharedNames(m); !slices.Equal(got, want) {
+		t.Fatalf("held at drop: %v, want %v", got, want)
+	}
+	if got := m.viewFor(t, "web").memberNames(); !slices.Equal(got, []string{"ct:node-1:back", "ct:node-2:parked", "ct:node-3:fo"}) {
+		t.Fatalf("members %v, want each live target", got)
+	}
+}
+
+// Re-review N-2: a holder of the same id that carries a move token whose
+// proof has not replicated here (the target row arrived first) is not a copy
+// to re-mint over: the mint refuses with a retry naming it, and the identity
+// stays as it is.
+//
+// Mutation: drop the unexplained-token check — the mint re-mints and
+// abandons the moving container's id: red.
+func TestMintFirewallID_RefusesWhileAMovesRecordsAreInFlight(t *testing.T) {
+	f := newTagGroupFixture(t)
+	ctx := context.Background()
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	f.moveCT("node-1", "mig", tgID(1), "stopped", "operator-stop", "")
+	f.moveCT("node-2", "mig", tgID(1), "running", "", "tok-unseen")
+	for _, host := range []string{"node-1", "node-2"} {
+		_, _, err := MintFirewallID(ctx, f.c, mintGrant(t), TagMemberCT, host, "mig")
+		if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "move records not yet replicated") {
+			t.Fatalf("mint on %s with the proof not yet here: %v, want refused for records in flight", host, err)
+		}
+	}
+	for _, host := range []string{"node-1", "node-2"} {
+		if got := firewallIDOf(TagMemberCT, storedCreateSpec(t, f.c, host, "mig")); got != tgID(1) {
+			t.Fatalf("a refused mint changed %s's identity to %q", host, got)
+		}
+	}
+}
+
+// Re-review M-a: a parked migrate does not complete by itself; the refusal
+// says the source must be removed instead of "retry after it completes".
+func TestMintFirewallID_AParkedPairNamesTheRemedy(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.c.SetRepointReady(func(context.Context) bool { return true })
+	f.moveCT("node-1", "mig", tgID(1), "stopped", "operator-stop", "")
+	f.moveCT("node-2", "mig", tgID(1), "running", "", "tok-m")
+	f.relocationProof("p-m", "mig", "node-2", "node-1", "tok-m", "completed", false)
+	_, _, err := MintFirewallID(context.Background(), f.c, mintGrant(t), TagMemberCT, "node-2", "mig")
+	if !errors.Is(err, ErrFirewallIDMoveOpen) || !strings.Contains(err.Error(), "remove the source container mig on node-1") ||
+		strings.Contains(err.Error(), "retry after it completes") {
+		t.Fatalf("mint over a parked migrate: %v, want refused naming the source to remove", err)
 	}
 }

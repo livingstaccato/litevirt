@@ -574,20 +574,19 @@ func readTagWorkloads(ctx context.Context, c *Client) ([]*tagWorkload, error) {
 	}
 	byKey := map[tagWorkloadKey]*tagWorkload{}
 	var out []*tagWorkload
+	// The identity is read by firewallIDOf, as the mint and the writers read
+	// it, so every reader sees the same holders.
 	add := func(key tagWorkloadKey, fwID string) *tagWorkload {
-		if !ValidFirewallID(fwID) {
-			fwID = ""
-		}
 		w := &tagWorkload{tagWorkloadKey: key, fwID: fwID}
 		byKey[key] = w
 		out = append(out, w)
 		return w
 	}
 	for _, r := range vms {
-		add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, jsonExactString(r.String("spec"), "firewall_id"))
+		add(tagWorkloadKey{kind: TagMemberVM, name: r.String("name")}, firewallIDOf(TagMemberVM, r.String("spec")))
 	}
 	for _, r := range cts {
-		w := add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, jsonExactString(r.String("create_spec"), "fw_id"))
+		w := add(tagWorkloadKey{kind: TagMemberCT, host: r.String("host_name"), name: r.String("name")}, firewallIDOf(TagMemberCT, r.String("create_spec")))
 		w.move = containerMove{host: w.host, name: w.name, state: r.String("state"),
 			detail: r.String("state_detail"), token: r.String("relocate_token")}
 	}

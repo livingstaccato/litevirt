@@ -384,7 +384,7 @@ func mintContainerFirewallID(ctx context.Context, c *Client, host, name string) 
 	if why, err := containerMoveOpen(ctx, c, host, name, firewallIDOf(TagMemberCT, current)); err != nil {
 		return "", "", err
 	} else if why != "" {
-		return "", "", fmt.Errorf("%w: %s is open; retry after it completes", ErrFirewallIDMoveOpen, why)
+		return "", "", fmt.Errorf("%w: %s", ErrFirewallIDMoveOpen, why)
 	}
 	id, abandoned, err := uniqueFirewallID(ctx, c, TagMemberCT, host, name, firewallIDOf(TagMemberCT, current))
 	if err != nil {

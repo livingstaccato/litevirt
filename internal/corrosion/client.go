@@ -114,7 +114,9 @@ type Config struct {
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	db *sql.DB
+	automationEvidence *automationVerifiedEvidence
+	automationSeams    *localCommitSeams
+	db                 *sql.DB
 	// memKeeper holds a test client's in-memory database open while the
 	// pool above reaps idle connections (openTestDB). Nil outside tests.
 	memKeeper *sql.DB

@@ -3021,6 +3021,7 @@ message RecoveryClaimValue {
     VoterConfigValue voter_config = 13;
     // An iSCSI LUN allocation: the value a key of target_kind "lun" decides.
     LUNAllocationValue lun = 14;
+    AutomationClaimValue automation = 15;
 }
 // LUNAllocationValue is which disk of which VM one allocation of a LUN is.
 message LUNAllocationValue {
@@ -3031,6 +3032,10 @@ message LUNAllocationValue {
     string vm_name    = 5;
     string disk       = 6;
     string host       = 7;  // the host that ran the create
+    string run_host = 8;
+    bool kept = 9;
+    string project = 10;
+    string replaced_created_at = 11;
 }
 // ClaimAccept is one voter's signed accept.
 message ClaimAccept {
@@ -5969,4 +5974,9 @@ message ISCSILUNHoldsResponse {
 // answering host, as the asking host classified it (iso_scope included).
 message PreflightRecreateVMRequest {
     VMSpec spec = 1;
+}
+
+// Complete internal recovery decision; not a public command admission RPC.
+message AutomationClaimValue {
+    bytes envelope = 1;
 }

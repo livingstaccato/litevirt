@@ -218,7 +218,7 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		if v == nil {
 			return "", ""
 		}
-		if v.Config == nil || v.Proof != nil {
+		if v.Config == nil || v.Proof != nil || v.LUN != nil || v.Automation != nil || v.SourceHost != "" {
 			return RefusalInvalidValue, "a voter_config key decides a voter config"
 		}
 		if !st.cfg.Explicit() {
@@ -269,6 +269,15 @@ func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) 
 	if v == nil {
 		return "", ""
 	}
+	if key.IsAutomation() {
+		if err := validateAutomationValue(key, *v); err != nil {
+			return RefusalInvalidValue, err.Error()
+		}
+		return "", ""
+	}
+	if v.Automation != nil {
+		return RefusalInvalidValue, "automation value at another kind"
+	}
 	if key.IsLUN() {
 		l := v.LUN
 		if l == nil || v.Proof != nil || v.Config != nil || v.SourceHost != "" {
@@ -300,6 +309,11 @@ const claimRowCols = `promised_round, promised_coord, promised_nonce, accepted_r
 	accepted_nonce, value_json, value_digest, accept_json, config_generation`
 
 func loadClaimRowTx(ctx context.Context, tx *LocalTx, key ClaimKey) (ClaimVoterState, bool, error) {
+	if key.IsAutomation() {
+		if err := key.Validate(); err != nil {
+			return ClaimVoterState{}, false, err
+		}
+	}
 	var rows []Row
 	var err error
 	if key.Incarnation == "" {
@@ -334,7 +348,7 @@ func scanClaimRow(key ClaimKey, r Row) (ClaimVoterState, error) {
 	}
 	if s := r.String("value_json"); s != "" {
 		var v ClaimValue
-		if err := json.Unmarshal([]byte(s), &v); err != nil {
+		if err := decodeClaimValue(key, s, &v); err != nil {
 			return st, fmt.Errorf("claim %s: stored value: %w", key, err)
 		}
 		st.Value = &v
@@ -345,6 +359,9 @@ func scanClaimRow(key ClaimKey, r Row) (ClaimVoterState, error) {
 			return st, fmt.Errorf("claim %s: stored accept: %w", key, err)
 		}
 		st.Accept = &a
+	}
+	if err := ValidateAutomationState(st); err != nil {
+		return ClaimVoterState{}, err
 	}
 	return st, nil
 }
@@ -399,6 +416,14 @@ func (c *Client) refuseSealedLegacyKey(key ClaimKey) (string, string) {
 }
 
 func saveClaimRowTx(ctx context.Context, tx *LocalTx, st ClaimVoterState) error {
+	if err := ValidateAutomationState(st); err != nil {
+		return err
+	}
+	if st.Key.IsAutomation() {
+		if err := requireAutomationFull(ctx, tx); err != nil {
+			return err
+		}
+	}
 	var vj, aj string
 	if st.Value != nil {
 		b, err := json.Marshal(st.Value)
@@ -446,6 +471,12 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		return res, nil
 	}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, nil); err != nil {
+			return err
+		} else if r != "" {
+			res.Refusal = r
+			return nil
+		}
 		st, err := readStandingForKeyTx(ctx, tx, c.hostName, key)
 		if err != nil {
 			return err
@@ -531,7 +562,13 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 	ownerChecked := false
 	for {
 		res = AcceptResult{Voter: c.hostName}
-		err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		err := c.executeLocal(ctx, func(tx *LocalTx) error {
+			if r, err := c.admitAutomationTx(ctx, tx, key, b, gen, &v); err != nil {
+				return err
+			} else if r != "" {
+				res.Refusal = r
+				return nil
+			}
 			st, err := readStandingForKeyTx(ctx, tx, c.hostName, key)
 			if err != nil {
 				return err
@@ -606,7 +643,7 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			}
 			res.Accepted, res.PromisedBallot, res.Accept = true, b, &a
 			return nil
-		})
+		}, c.claimCommitSeams(key))
 		if errors.Is(err, errClaimNeedsOwnerCheck) || errors.Is(err, errClaimNeedsSourceCheck) {
 			if r, d := c.checkClaimOwner(ctx, key, v, probe, errors.Is(err, errClaimNeedsOwnerCheck)); r != "" {
 				res.Refusal, res.Detail = r, d
@@ -617,6 +654,9 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 		}
 		if err != nil {
 			return AcceptResult{}, err
+		}
+		if key.IsAutomation() && res.Accepted && c.automationSeams != nil && c.automationSeams.beforeReply != nil {
+			c.automationSeams.beforeReply()
 		}
 		return res, nil
 	}
@@ -757,11 +797,11 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		// Both tables: an importer must carry the legacy keys and the
 		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
 		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?)
+			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?, ?)
 			UNION ALL
 			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
 			FROM local_incarnation_claims WHERE target_kind IN (?, ?)
-			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindVM, ClaimKindContainer)
+			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindAutomation, ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
 		}
@@ -807,6 +847,9 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 		}
 		best := map[ClaimKey]ClaimVoterState{}
 		for _, s := range states {
+			if err := ValidateAutomationState(s); err != nil {
+				return err
+			}
 			if !s.Key.IsGenerationScoped() {
 				continue
 			}
@@ -863,6 +906,9 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 				changed = true
 			}
 			if changed {
+				if k.IsAutomation() && row.ConfigGeneration != newGen {
+					row.Accept = nil // the old signature binds the previous generation
+				}
 				row.ConfigGeneration = newGen
 				if err := saveClaimRowTx(ctx, tx, row); err != nil {
 					return err

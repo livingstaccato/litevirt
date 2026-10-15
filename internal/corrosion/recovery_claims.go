@@ -118,11 +118,13 @@ func (k ClaimKey) IsLUN() bool { return k.TargetKind == ClaimKindLUN }
 // IsGenerationScoped reports whether k is decided by the members of the voter
 // generation and carried into the next one (§4.4): a workload recovery or a LUN
 // allocation. A voter_config key decides the generation itself.
-func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() }
+func (k ClaimKey) IsGenerationScoped() bool { return k.IsWorkload() || k.IsLUN() || k.IsAutomation() }
 
 // Validate refuses a key no voter should record state for.
 func (k ClaimKey) Validate() error {
 	switch {
+	case k.IsAutomation():
+		return validateAutomationKey(k)
 	case k.IsLUN():
 		if k.TargetName == "" || k.OwnerEpoch < 0 || k.Attempt != 0 || k.Incarnation != "" {
 			return fmt.Errorf("a LUN key is (lun, <LUN>, generation, 0) with no incarnation, got %+v", k)
@@ -274,9 +276,10 @@ type ClaimValue struct {
 	// SourceHost is the recorded owner being left, the host every voter
 	// probes before it accepts a workload value (§3.5.1). Digested, so a
 	// certificate names the source its voters could not reach.
-	SourceHost string            `json:"source_host,omitempty"`
-	Config     *VoterConfigValue `json:"config,omitempty"`
-	LUN        *LUNAllocation    `json:"lun,omitempty"`
+	SourceHost string                `json:"source_host,omitempty"`
+	Config     *VoterConfigValue     `json:"config,omitempty"`
+	LUN        *LUNAllocation        `json:"lun,omitempty"`
+	Automation *AutomationClaimValue `json:"automation,omitempty"`
 }
 
 const (
@@ -329,6 +332,12 @@ func SortMembers(members []VoterMember) []VoterMember {
 func (v ClaimValue) Digest() (string, error) {
 	h := sha256.New()
 	switch {
+	case v.Automation != nil:
+		if _, err := automationDecision(v); err != nil {
+			return "", err
+		}
+		claimField(h, "litevirt-automation-decision-v1")
+		claimField(h, string(v.Automation.Envelope))
 	case v.Proof != nil && v.Config == nil && v.LUN == nil:
 		p := v.Proof
 		claimField(h, claimValueDomain)

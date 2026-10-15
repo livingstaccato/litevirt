@@ -113,7 +113,18 @@ func (t *LocalTx) Query(ctx context.Context, sqlStr string, params ...interface{
 // returning. Nothing is written to mutation_log and the replicator is not
 // woken. The caller must build any reply that depends on the write only after
 // ExecuteLocal returns nil: the commit is what makes a promise durable (§3.7).
+// localCommitSeams is per operation/client; it never publishes payload bytes.
+type localCommitSeams struct {
+	beforeCommit func(*sql.Tx) error
+	afterCommit  func()
+	beforeReply  func()
+}
+
 func (c *Client) ExecuteLocal(ctx context.Context, fn func(tx *LocalTx) error) error {
+	return c.executeLocal(ctx, fn, nil)
+}
+
+func (c *Client) executeLocal(ctx context.Context, fn func(tx *LocalTx) error, seams *localCommitSeams) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tx, err := c.db.BeginTx(ctx, nil)
@@ -124,8 +135,17 @@ func (c *Client) ExecuteLocal(ctx context.Context, fn func(tx *LocalTx) error) e
 		_ = tx.Rollback()
 		return err
 	}
+	if seams != nil && seams.beforeCommit != nil {
+		if err := seams.beforeCommit(tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit local tx: %w", err)
+	}
+	if seams != nil && seams.afterCommit != nil {
+		seams.afterCommit()
 	}
 	return nil
 }

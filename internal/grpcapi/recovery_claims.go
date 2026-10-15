@@ -245,10 +245,28 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 	if v == nil {
 		return nil
 	}
+	if a := v.GetAutomation(); a != nil {
+		out := &corrosion.ClaimValue{Automation: &corrosion.AutomationClaimValue{Envelope: a.GetEnvelope()}, SourceHost: v.GetSourceHost()}
+		// Preserve malformed alternatives so validation can reject them; never
+		// silently turn a mixed wire value into a valid automation decision.
+		if v.GetLun() != nil {
+			out.LUN = &corrosion.LUNAllocation{}
+		}
+		if v.GetVoterConfig() != nil {
+			out.Config = &corrosion.VoterConfigValue{}
+		}
+		if v.GetId() != "" || v.GetAction() != "" || v.GetTargetKind() != "" || v.GetTargetName() != "" ||
+			v.GetDestHost() != "" || v.GetCoordinator() != "" || v.GetRelocationToken() != "" ||
+			v.GetFenceEpoch() != "" || v.GetOwnerEpoch() != "" || v.GetLeaseTerm() != 0 || v.GetLeaseKey() != "" {
+			out.Proof = &corrosion.ActionProof{}
+		}
+		return out
+	}
 	if l := v.GetLun(); l != nil {
 		return &corrosion.ClaimValue{LUN: &corrosion.LUNAllocation{
 			LUN: l.GetLun(), Generation: l.GetGeneration(), ClaimID: l.GetClaimId(), VMID: l.GetVmId(),
 			VMName: l.GetVmName(), Disk: l.GetDisk(), Host: l.GetHost(),
+			RunHost: l.GetRunHost(), Kept: l.GetKept(), Project: l.GetProject(), ReplacedCreatedAt: l.GetReplacedCreatedAt(),
 		}}
 	}
 	if cfg := v.GetVoterConfig(); cfg != nil {
@@ -267,14 +285,32 @@ func valueFromPB(v *pb.RecoveryClaimValue) *corrosion.ClaimValue {
 	}
 }
 
+func checkedValueFromPB(v *pb.RecoveryClaimValue) (*corrosion.ClaimValue, error) {
+	out := valueFromPB(v)
+	if out != nil && out.Automation != nil {
+		if _, err := out.Digest(); err != nil {
+			return nil, fmt.Errorf("invalid automation wire value")
+		}
+	}
+	return out, nil
+}
+
 func valueToPB(v *corrosion.ClaimValue) *pb.RecoveryClaimValue {
 	if v == nil {
 		return nil
+	}
+	if v.Automation != nil {
+		legacy := *v
+		legacy.Automation = nil
+		out := valueToPB(&legacy)
+		out.Automation = &pb.AutomationClaimValue{Envelope: v.Automation.Envelope}
+		return out
 	}
 	if l := v.LUN; l != nil {
 		return &pb.RecoveryClaimValue{Lun: &pb.LUNAllocationValue{
 			Lun: l.LUN, Generation: l.Generation, ClaimId: l.ClaimID, VmId: l.VMID,
 			VmName: l.VMName, Disk: l.Disk, Host: l.Host,
+			RunHost: l.RunHost, Kept: l.Kept, Project: l.Project, ReplacedCreatedAt: l.ReplacedCreatedAt,
 		}}
 	}
 	if v.Config != nil {
@@ -322,25 +358,37 @@ func prepareToPB(r corrosion.PrepareResult) *pb.PrepareRecoveryClaimResponse {
 	return out
 }
 
-func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) corrosion.PrepareResult {
+func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) (corrosion.PrepareResult, error) {
 	out := corrosion.PrepareResult{
 		Promised: r.GetPromised(), PromisedBallot: ballotFromPB(r.GetPromisedBallot()),
 		Voter: r.GetVoter(), Incarnation: r.GetVoterIncarnation(), Refusal: r.GetRefusalReason(), Detail: r.GetRefusalDetail(),
 	}
 	out.State.Key = key
 	out.State.Accepted = ballotFromPB(r.GetAcceptedBallot())
-	out.State.Value = valueFromPB(r.GetAcceptedValue())
+	var err error
+	out.State.Value, err = checkedValueFromPB(r.GetAcceptedValue())
+	if err != nil {
+		return corrosion.PrepareResult{}, err
+	}
 	if out.State.Value != nil {
 		out.State.ValueDigest, _ = out.State.Value.Digest()
 	}
-	if lv := valueFromPB(r.GetLegacyAcceptedValue()); lv != nil && key.Incarnation != "" {
+	lv, err := checkedValueFromPB(r.GetLegacyAcceptedValue())
+	if err != nil {
+		return corrosion.PrepareResult{}, err
+	}
+	if lv != nil && key.Incarnation != "" {
 		l := corrosion.ClaimVoterState{Key: key.Legacy(), Accepted: ballotFromPB(r.GetLegacyAcceptedBallot()), Value: lv}
 		l.ValueDigest, _ = lv.Digest()
 		if !l.Accepted.IsZero() {
 			out.Legacy = &l
 		}
 	}
-	return out
+	out.State.Promised = out.PromisedBallot
+	if err := corrosion.ValidateAutomationState(out.State); err != nil {
+		return corrosion.PrepareResult{}, err
+	}
+	return out, nil
 }
 
 func acceptResultToPB(r corrosion.AcceptResult) *pb.AcceptRecoveryClaimResponse {
@@ -483,7 +531,11 @@ func (s *Server) AcceptRecoveryClaim(ctx context.Context, req *pb.AcceptRecovery
 	if err := ballotSenderCheck(b, callerMTLSCommonName(ctx)); err != nil {
 		return nil, err
 	}
-	res, err := s.localAccept(ctx, keyFromPB(req.GetKey()), b, *valueFromPB(req.GetValue()), req.GetConfigGeneration())
+	v, err := checkedValueFromPB(req.GetValue())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid claim value")
+	}
+	res, err := s.localAccept(ctx, keyFromPB(req.GetKey()), b, *v, req.GetConfigGeneration())
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +696,7 @@ func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key cor
 	if resp.GetVoter() != voter {
 		return corrosion.PrepareResult{}, fmt.Errorf("%s answered as %q", voter, resp.GetVoter())
 	}
-	return prepareFromPB(resp, key), nil
+	return prepareFromPB(resp, key)
 }
 
 func (t serverClaimTransport) Accept(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error) {
@@ -696,9 +748,15 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 			first = false
 			continue
 		}
-		v := valueFromPB(m.GetValue())
+		v, err := checkedValueFromPB(m.GetValue())
+		if err != nil {
+			return out, err
+		}
 		st := corrosion.ClaimVoterState{Key: keyFromPB(m.GetKey()), Promised: ballotFromPB(m.GetPromised()),
 			Accepted: ballotFromPB(m.GetAccepted()), Value: v, ValueDigest: m.GetValueDigest()}
+		if err := corrosion.ValidateAutomationState(st); err != nil {
+			return out, err
+		}
 		out.States = append(out.States, st)
 	}
 }

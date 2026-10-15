@@ -112,7 +112,7 @@ func TestCutPlan(t *testing.T) {
 // TestHoldersBetween names the holder at the window's start and every later one.
 func TestHoldersBetween(t *testing.T) {
 	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
-	lw := &leaseWatch{changes: []leaseChange{
+	lw := &leaseWatch{all: []leaseChange{
 		{At: t0, Holder: "node-2", Term: 4},
 		{At: t0.Add(time.Minute), Holder: "node-3", Term: 5},
 		{At: t0.Add(2 * time.Minute), Holder: "node-2", Term: 6},

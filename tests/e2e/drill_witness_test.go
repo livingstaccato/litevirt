@@ -705,6 +705,9 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 	if err := thaw(); err != nil {
 		t.Errorf("thaw %s: %v", x, err)
 	}
+	if err := l.waitServing(x, 3*time.Minute); err != nil {
+		t.Errorf("%v", err)
+	}
 	lw.avoid(x, false)
 	v3 := l.pick(func(c string) bool { return c != w.owner && c != x }, false)
 	att, out = l.claimView(v3, w.key, "claim-outage2.txt")
@@ -1270,18 +1273,41 @@ func tenureAt(history []leaseChange, at time.Time, holder string, term int) (lea
 // holdersBetween is every lease holder seen from from to to, including the
 // one holding at from.
 func holdersBetween(lw *leaseWatch, from, to time.Time) []string {
+	return holdersIn(lw.allHistory(), from, to)
+}
+
+// holdersIn is holdersBetween over a merged, reader-tagged history: each
+// reader's own holder at from, then every holder any reader saw up to to, so a
+// tenure one replica saw and another did not is still counted.
+func holdersIn(hist []leaseChange, from, to time.Time) []string {
 	var out []string
-	for _, c := range lw.history() {
+	atFrom := map[string]string{}
+	var readers []string
+	for _, c := range hist {
 		if c.At.After(to) {
-			break
-		}
-		if c.At.Before(from) {
-			out = []string{c.Holder}
 			continue
 		}
-		if !contains(out, c.Holder) {
+		if c.At.Before(from) {
+			if _, ok := atFrom[c.Reader]; !ok {
+				readers = append(readers, c.Reader)
+			}
+			atFrom[c.Reader] = c.Holder
+			continue
+		}
+		if !contains(out, c.Holder) && c.Holder != "" {
 			out = append(out, c.Holder)
 		}
 	}
-	return out
+	var res []string
+	for _, r := range readers {
+		if h := atFrom[r]; h != "" && !contains(res, h) {
+			res = append(res, h)
+		}
+	}
+	for _, h := range out {
+		if !contains(res, h) {
+			res = append(res, h)
+		}
+	}
+	return res
 }

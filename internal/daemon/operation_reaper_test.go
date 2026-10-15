@@ -3,6 +3,8 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -103,12 +105,74 @@ func TestReapTerminalOperations_UnreapableRaisesAndResolvesACondition(t *testing
 		t.Errorf("an incomplete pass resolved the condition: %+v", row)
 	}
 
+	// Nor does a pass whose opening reads fail (no operation was reached).
+	// Re-opened first, so this check does not lean on the one above.
 	db.SetWriteQuarantine(nil)
+	d.writeSelfConditionAs(ctx, operationReaperEvaluator, CondOperationUnreapable, true, corrosion.SeverityWarning, map[string]any{})
+	if _, err := db.DB().Exec(`ALTER TABLE operations RENAME TO operations_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	d.reapTerminalOperations(ctx, time.Hour)
+	if row := cond(); row.Lifecycle != corrosion.ConditionConfirmed {
+		t.Errorf("a pass whose opening reads failed resolved the condition: %+v", row)
+	}
+	if _, err := db.DB().Exec(`ALTER TABLE operations_hidden RENAME TO operations`); err != nil {
+		t.Fatal(err)
+	}
+
 	d.reapTerminalOperations(ctx, time.Hour)
 	if got, _ := corrosion.GetOperation(ctx, db, "op-a-poisoned"); got != nil {
 		t.Error("the formerly poisoned operation was not reaped once its write could succeed")
 	}
 	if row := cond(); row.Lifecycle != corrosion.ConditionResolved {
 		t.Errorf("condition after a clean pass = %+v; want resolved", row)
+	}
+}
+
+// Past operationUnreapableListed failures in one pass, the warnings and the
+// evidence name the first operationUnreapableListed operations; one more line
+// and the evidence's count carry the total.
+func TestReapTerminalOperations_UnreapableListIsCapped(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{db: db, cfg: &Config{HostName: "h1"}}
+	const total = operationUnreapableListed + 5
+	for i := 0; i < total; i++ {
+		journalAgedCompletedOp(t, db, fmt.Sprintf("vm%02d", i), fmt.Sprintf("op-p%02d", i))
+	}
+	if _, err := db.DB().Exec(`CREATE TRIGGER poison_reap BEFORE UPDATE OF deleted_at ON operations
+		WHEN OLD.id LIKE 'op-p%' BEGIN SELECT RAISE(ABORT, 'poisoned tombstone'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	d.reapTerminalOperations(ctx, time.Hour)
+	if n := strings.Count(logs.String(), "could not reap an operation;"); n != operationUnreapableListed {
+		t.Errorf("per-operation warnings = %d, want %d", n, operationUnreapableListed)
+	}
+	if !strings.Contains(logs.String(), "could not reap more operations") ||
+		!strings.Contains(logs.String(), "more=5") || !strings.Contains(logs.String(), fmt.Sprintf("total=%d", total)) {
+		t.Errorf("want one summary line with more=5 total=%d in:\n%s", total, logs.String())
+	}
+	row, _, err := corrosion.GetHealthCondition(ctx, db, operationReaperEvaluator, CondOperationUnreapable, "host", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev struct {
+		Count      int                   `json:"count"`
+		Operations []unreapableOperation `json:"operations"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatalf("evidence %q: %v", row.Evidence, err)
+	}
+	if ev.Count != total || len(ev.Operations) != operationUnreapableListed {
+		t.Errorf("evidence count = %d, listed = %d; want %d, %d", ev.Count, len(ev.Operations), total, operationUnreapableListed)
 	}
 }

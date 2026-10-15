@@ -18,8 +18,9 @@ const operationReaperEvaluator = "operation-reaper"
 // with none.
 const CondOperationUnreapable = "operation_unreapable"
 
-// operationUnreapableListed caps how many operations the condition's evidence
-// names; `count` always carries the total.
+// operationUnreapableListed caps how many operations one pass logs a warning
+// for, and how many the condition's evidence names; one further line and
+// `count` carry the total.
 const operationUnreapableListed = 20
 
 // operationUnreapableRemedy is the condition's remedy, carried in its evidence.
@@ -37,9 +38,14 @@ type unreapableOperation struct {
 // operation_unreapable condition until a complete pass reaps everything due.
 func (d *Daemon) reapTerminalOperations(ctx context.Context, retention time.Duration) {
 	reaped, failed, err := corrosion.ReapTerminalOperations(ctx, d.db, retention)
-	for _, f := range failed {
+	listedN := min(len(failed), operationUnreapableListed)
+	for _, f := range failed[:listedN] {
 		slog.Warn("operation reaper: could not reap an operation; it is retried on the next pass",
 			"operation_id", f.OperationID, "error", f.Err)
+	}
+	if more := len(failed) - listedN; more > 0 {
+		slog.Warn("operation reaper: could not reap more operations; see the operation_unreapable condition",
+			"more", more, "total", len(failed))
 	}
 	if err != nil {
 		slog.Warn("operation reaper", "error", err, "reaped", reaped)
@@ -47,12 +53,14 @@ func (d *Daemon) reapTerminalOperations(ctx context.Context, retention time.Dura
 		slog.Info("operation reaper", "reaped", reaped)
 	}
 	// An incomplete pass proves nothing about the operations it did not reach:
-	// it may raise the condition, never resolve it.
+	// it may raise the condition, never resolve it. When it raises it, the list
+	// and `count` cover only the operations reached before the pass ended, so
+	// they can undercount; the next complete pass rewrites both.
 	if err != nil && len(failed) == 0 {
 		return
 	}
-	listed := make([]unreapableOperation, 0, min(len(failed), operationUnreapableListed))
-	for _, f := range failed[:min(len(failed), operationUnreapableListed)] {
+	listed := make([]unreapableOperation, 0, listedN)
+	for _, f := range failed[:listedN] {
 		listed = append(listed, unreapableOperation{ID: f.OperationID, Error: f.Err.Error()})
 	}
 	d.writeSelfConditionAs(ctx, operationReaperEvaluator, CondOperationUnreapable, len(failed) > 0,

@@ -1848,12 +1848,14 @@ raises `operation_unreapable` (warning) about **itself** when a pass could not
 reap one or more of those operations. The reaper goes on to the next operation,
 so one failure does not hold the others. Each failure is logged once per pass as
 `operation reaper: could not reap an operation`, with `operation_id` and
-`error`. The evidence carries `count`, `operations` (up to 20, each with `id`
+`error`, for up to 20 operations; past that, one line,
+`operation reaper: could not reap more operations`, carries `more` and `total`.
+The evidence carries `count`, `operations` (up to 20, each with `id`
 and `error`) and `remedy`.
 
 | Raised when | Clears when |
 |---|---|
-| A reaper pass could not read an operation's steps or write its tombstone. | A complete pass reaps every operation that is due. A pass ended early, by WAL quarantine or shutdown, never clears it. |
+| A reaper pass could not read an operation's steps or write its tombstone. | A complete pass has no failures. A pass that ends early never clears it: WAL quarantine, shutdown, or a failure of the pass's opening reads. A pass that ends early after failures raises it with only the operations reached, so `count` can be low until the next complete pass. |
 
 **If it does not clear,** the `error` of each listed operation says why its
 steps could not be read or its tombstone could not be written. Fix that cause;

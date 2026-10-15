@@ -248,3 +248,28 @@ func TestReapTerminalOperations_PassWideFailureIsThePassError(t *testing.T) {
 		})
 	}
 }
+
+// A step read that fails is a per-operation failure like a refused tombstone:
+// recorded with its cause, and the pass goes on to every later operation.
+func TestReapTerminalOperations_StepReadFailureIsPerOperation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	beginCompletedOp(t, c, "vm1", "op-a")
+	beginCompletedOp(t, c, "vm2", "op-b")
+	// The opening reads touch vms and operations only; every step read fails.
+	if _, err := c.db.Exec(`ALTER TABLE operation_steps RENAME TO operation_steps_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	n, failed, err := ReapTerminalOperations(ctx, c, time.Hour)
+	if err != nil || n != 0 {
+		t.Fatalf("n = %d, err = %v; want 0, nil (a step read failure is not the pass's error)", n, err)
+	}
+	if len(failed) != 2 || failed[0].OperationID != "op-a" || failed[1].OperationID != "op-b" {
+		t.Fatalf("failures = %v; want op-a then op-b", failed)
+	}
+	for _, f := range failed {
+		if !strings.Contains(f.Err.Error(), "read steps") {
+			t.Errorf("failure %s = %v; want its step-read cause", f.OperationID, f.Err)
+		}
+	}
+}

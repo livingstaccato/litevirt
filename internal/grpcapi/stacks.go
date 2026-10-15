@@ -1357,6 +1357,43 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// Remove any load balancers associated with this stack.
 	s.removeLBForStack(ctx, req.Name, vms)
 
+	if !hadFailures {
+		// Soft-delete (tombstone) the LB config now that processes are stopped, so
+		// the deletion survives anti-entropy instead of resurrecting from a peer.
+		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
+
+		// Tombstone the stack's distributed-firewall config (SGs, ipsets,
+		// cluster rules, default-deny), and unregister its backup repos. A
+		// failure of either keeps the stack "deleting", as the reconciler
+		// does: tombstoned, the stack would have no one left to retry them,
+		// and a leftover security group holds its name.
+		cleanups := []struct {
+			what string
+			run  func() error
+		}{
+			{"firewall rows", func() error {
+				return corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants)
+			}},
+			{"backup repos", func() error {
+				return corrosion.DeleteStackBackupRepos(ctx, s.db, req.Name, compose.StoredStackWants)
+			}},
+		}
+		for _, cl := range cleanups {
+			if dbErr := cl.run(); dbErr != nil {
+				hadFailures = true
+				notRemoved = append(notRemoved, cl.what)
+				slog.Warn("stack delete: cleanup failed, reconciler will retry", "stack", req.Name, "what", cl.what, "error", dbErr)
+				if sendErr := stream.Send(&pb.DeleteProgress{
+					VmName: cl.what,
+					Status: "error",
+					Error:  "remove " + cl.what + ": " + dbErr.Error(),
+				}); sendErr != nil {
+					return sendErr
+				}
+			}
+		}
+	}
+
 	// Only tombstone the stack if all resources were cleaned up.
 	// If anything failed, leave it in "deleting" state for the reconciler.
 	if hadFailures {
@@ -1365,21 +1402,6 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			"stack", req.Name, "remaining_vms", len(remaining))
 		s.publish("stack.deleting", req.Name, fmt.Sprintf("%d VMs remaining", len(remaining)))
 	} else {
-		// Soft-delete (tombstone) the LB config now that processes are stopped, so
-		// the deletion survives anti-entropy instead of resurrecting from a peer.
-		_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
-
-		// Tombstone the stack's distributed-firewall config (SGs, ipsets,
-		// cluster rules, default-deny). The reconciler then drops the rules.
-		if dbErr := corrosion.DeleteStackFirewall(ctx, s.db, req.Name, compose.StoredStackWants); dbErr != nil {
-			slog.Warn("delete stack firewall failed", "stack", req.Name, "error", dbErr)
-		}
-
-		// Unregister the stack's backup repos.
-		if dbErr := corrosion.DeleteStackBackupRepos(ctx, s.db, req.Name, compose.StoredStackWants); dbErr != nil {
-			slog.Warn("delete stack backup repos failed", "stack", req.Name, "error", dbErr)
-		}
-
 		if dbErr := corrosion.DeleteStackRecord(ctx, s.db, req.Name); dbErr != nil {
 			slog.Warn("delete stack record failed", "stack", req.Name, "error", dbErr)
 		}

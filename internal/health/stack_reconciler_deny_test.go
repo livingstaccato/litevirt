@@ -118,3 +118,30 @@ func TestStackReconciler_ReassertRespectsTheRemoval(t *testing.T) {
 		}
 	})
 }
+
+// afriend c-0006. A reconcile pass sweeps the deny a torn-down stack still
+// owns.
+//
+// Mutation: drop the sweep from reconcile — the orphan deny stays.
+func TestStackReconciler_SweepsAnOrphanDeny(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertStack(ctx, db, corrosion.StackRecord{Name: "b", State: "active", ComposeYAML: "name: b\nfirewall:\n  default-deny: true\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetFirewallDefault(ctx, db, "cluster", true, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteStackRecord(ctx, db, "b"); err != nil {
+		t.Fatal(err)
+	}
+	r := NewStackReconciler("node-0", db)
+	r.SetCleaner(&recordingStackCleaner{})
+	r.reconcile(ctx)
+	if d, _ := corrosion.GetFirewallDefault(ctx, db, "cluster"); d != nil && d.DefaultDeny {
+		t.Errorf("deny owned by torn-down b after a reconcile pass = %+v, want removed", d)
+	}
+}

@@ -96,15 +96,17 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 			}
 			loaded = true
 		}
-		handed := false
+		var heirs []string
 		for _, o := range others {
 			if o.repos[r.Name] {
-				if err := UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: o.name}); err != nil {
-					return err
-				}
-				handed = true
-				break
+				heirs = append(heirs, o.name)
 			}
+		}
+		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
+			return UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: owner})
+		})
+		if err != nil {
+			return err
 		}
 		if !handed && len(unreadable) > 0 {
 			kept = true

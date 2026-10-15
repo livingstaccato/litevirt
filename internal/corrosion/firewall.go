@@ -436,15 +436,17 @@ func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, r
 		if err != nil {
 			return err
 		}
-		handed := false
+		var heirs []string
 		for _, o := range others {
 			if o.defaultDeny {
-				if err := SetFirewallDefault(ctx, c, "cluster", true, o.name); err != nil {
-					return err
-				}
-				handed = true
-				break
+				heirs = append(heirs, o.name)
 			}
+		}
+		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
+			return SetFirewallDefault(ctx, c, "cluster", true, owner)
+		})
+		if err != nil {
+			return err
 		}
 		if !handed && len(unreadable) > 0 {
 			slog.Warn("stack teardown: the cluster default-deny stays, owned by the stack: the compose files of other stacks cannot be read, and one may ask for it",

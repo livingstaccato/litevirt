@@ -95,6 +95,27 @@ func DeleteNetwork(ctx context.Context, c *Client, name string) error {
 	)
 }
 
+// deleteNetworkVTEPsSQL tombstones a network's VTEP rows. A host on a build
+// before release_2026_11_v1 does not know the shape, and an unknown shape
+// back-pressures the sender's whole stream to it, so it is written only once
+// the release token has latched (latchGatedShapes; grpcapi
+// Server.deleteNetworkRecord).
+const deleteNetworkVTEPsSQL = `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE network_name = ? AND deleted_at IS NULL`
+
+// DeleteNetworkAndVTEPs is DeleteNetwork that also tombstones the network's
+// network_vteps rows, in one batch. Left live, they outlive the network: a
+// network created again under the name reads them as its peers, and floods
+// to hosts that never provisioned it. Only once the release token has latched
+// (deleteNetworkVTEPsSQL).
+func DeleteNetworkAndVTEPs(ctx context.Context, c *Client, name string) error {
+	now, ts := nowRFC3339(), c.NowTS()
+	return c.ExecuteBatch(ctx, []Statement{
+		{SQL: `UPDATE networks SET deleted_at = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{now, ts, name}},
+		{SQL: deleteNetworkVTEPsSQL, Params: []interface{}{now, ts, name}},
+	})
+}
+
 // CountVMsOnNetwork returns the number of VMs with interfaces on a given network.
 func CountVMsOnNetwork(ctx context.Context, c *Client, networkName string) (int, error) {
 	rows, err := c.Query(ctx,

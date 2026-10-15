@@ -269,7 +269,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 
 	// Soft-delete the DB record.
-	if err := corrosion.DeleteNetwork(ctx, s.db, req.Name); err != nil {
+	if err := s.deleteNetworkRecord(ctx, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete network: %v", err)
 	}
 
@@ -473,7 +473,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
-	if err := corrosion.DeleteNetwork(ctx, s.db, name); err != nil {
+	if err := s.deleteNetworkRecord(ctx, name); err != nil {
 		return err
 	}
 
@@ -496,6 +496,18 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		}
 	}
 	return nil
+}
+
+// deleteNetworkRecord soft-deletes a network's record and, once the release
+// token has latched, tombstones its network_vteps rows with it
+// (corrosion.DeleteNetworkAndVTEPs). Before the latch a host on the previous
+// build could not apply the VTEP tombstone, so the rows stay live, as they
+// always have.
+func (s *Server) deleteNetworkRecord(ctx context.Context, name string) error {
+	if s.ReleaseTokenLatched() {
+		return corrosion.DeleteNetworkAndVTEPs(ctx, s.db, name)
+	}
+	return corrosion.DeleteNetwork(ctx, s.db, name)
 }
 
 // networkRecordToInfo converts a corrosion.NetworkRecord to a pb.NetworkInfo.

@@ -12,6 +12,9 @@ const defaultBridgeMTU = 1500
 func (f *Fake) BridgeMTU(bridge string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.bridgeMTUErr[bridge]; err != nil {
+		return 0, err
+	}
 	if m, ok := f.bridgeMTU[bridge]; ok {
 		return m, nil
 	}
@@ -27,4 +30,15 @@ func (f *Fake) SetBridgeMTU(bridge string, mtu int) {
 		f.bridgeMTU = map[string]int{}
 	}
 	f.bridgeMTU[bridge] = mtu
+}
+
+// FailBridgeMTU makes reading bridge's MTU on this node fail with err (a
+// bridge being recreated, say); nil reads it again.
+func (f *Fake) FailBridgeMTU(bridge string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bridgeMTUErr == nil {
+		f.bridgeMTUErr = map[string]error{}
+	}
+	f.bridgeMTUErr[bridge] = err
 }

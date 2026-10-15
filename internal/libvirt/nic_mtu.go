@@ -35,7 +35,13 @@ func (c *Client) BridgeMTU(bridge string) (int, error) { return ReadBridgeMTU(br
 // NICMTUError is a NIC MTU this host cannot carry: an explicit MTU its bridge
 // does not equal, a bridge whose MTU cannot be read, or a NIC that takes no
 // MTU. It is the operator's to fix, never an internal failure.
-type NICMTUError struct{ msg string }
+type NICMTUError struct {
+	msg string
+	// read: the bridge's MTU could not be read (a bridge being recreated),
+	// which a later attempt may get past. Every other NICMTUError is a
+	// mismatch or a NIC that takes no MTU, which only a change fixes.
+	read bool
+}
 
 func (e *NICMTUError) Error() string { return e.msg }
 
@@ -47,6 +53,13 @@ func nicMTUError(format string, args ...any) error {
 func IsNICMTUError(err error) bool {
 	var e *NICMTUError
 	return errors.As(err, &e)
+}
+
+// IsBridgeMTUReadError reports whether err is, or wraps, a NICMTUError for a
+// bridge whose MTU could not be read: a transient failure, unlike a mismatch.
+func IsBridgeMTUReadError(err error) bool {
+	var e *NICMTUError
+	return errors.As(err, &e) && e.read
 }
 
 // NICMTUMismatch is the refusal for a NIC whose MTU is not its bridge's.
@@ -65,7 +78,7 @@ func ResolveNICMTU(nic, mtu int, bridge string, read func(string) (int, error), 
 	}
 	got, err := read(bridge)
 	if err != nil {
-		return 0, nicMTUError("NIC %d: read the MTU of bridge %s on host %s: %v", nic, bridge, host, err)
+		return 0, &NICMTUError{read: true, msg: fmt.Sprintf("NIC %d: read the MTU of bridge %s on host %s: %v", nic, bridge, host, err)}
 	}
 	if mtu == NICMTUFromBridge {
 		return got, nil

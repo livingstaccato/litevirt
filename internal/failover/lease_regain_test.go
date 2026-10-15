@@ -306,7 +306,7 @@ func setLeaseExpiry(t *testing.T, db *corrosion.Client, ctx context.Context, at 
 // briefStandDown runs one cycle with the voter majority lost, then sets the
 // lease row's expiry to expiry before the majority returns and the next cycle
 // re-takes the lease. It reports whether the re-take kept down's pause wait.
-func briefStandDown(t *testing.T, expiryIn time.Duration, ledger bool, after func(*Coordinator)) bool {
+func briefStandDown(t *testing.T, expiryIn time.Duration, ledger bool, after func(*Coordinator, *monoClock)) bool {
 	t.Helper()
 	c, db, ctx, mono := explicitPause(t)
 	if !ledger {
@@ -323,7 +323,7 @@ func briefStandDown(t *testing.T, expiryIn time.Duration, ledger bool, after fun
 	c.run(ctx)
 	setLeaseExpiry(t, db, ctx, c.now().Add(expiryIn))
 	if after != nil {
-		after(c)
+		after(c, mono)
 	}
 	lost = false
 	mono.Advance(time.Second)
@@ -363,11 +363,24 @@ func TestLeaseRegain_AnUnlatchedLongStandDownIsAGap(t *testing.T) {
 	if !briefStandDown(t, leaseDuration, false, nil) {
 		t.Fatal("setup: a brief unlatched stand-down re-anchored the wait")
 	}
-	long := func(c *Coordinator) {
-		shift := tenureStandDownBound + time.Second
-		c.Now = func() time.Time { return time.Now().Add(shift) }
-	}
+	long := func(_ *Coordinator, mono *monoClock) { mono.Advance(tenureStandDownBound) }
 	if briefStandDown(t, leaseDuration, false, long) {
 		t.Fatal("pause wait kept across an unlatched stand-down longer than the bound")
+	}
+}
+
+// The stand-down is measured on the monotonic clock: a wall clock stepped
+// back during it (an NTP correction) does not make a long stand-down look
+// short.
+//
+// Mutation: measure it on c.now() — the step back hides the stand-down and
+// the wait is kept.
+func TestLeaseRegain_AWallClockStepBackDoesNotShortenAStandDown(t *testing.T) {
+	stepBack := func(c *Coordinator, mono *monoClock) {
+		mono.Advance(tenureStandDownBound)
+		c.Now = func() time.Time { return time.Now().Add(-time.Minute) }
+	}
+	if briefStandDown(t, leaseDuration, false, stepBack) {
+		t.Fatal("pause wait kept across a long unlatched stand-down during which the wall clock stepped back")
 	}
 }

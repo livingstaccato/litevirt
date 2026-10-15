@@ -167,10 +167,11 @@ type Coordinator struct {
 	tenureTerm atomic.Int64
 	everHeld   atomic.Bool
 	// unshownSince is when this coordinator last stopped being able to show
-	// it holds the lease (dropLeaseTerm), in c.now() Unix nanoseconds, 0
-	// while it holds it. Before lease terms are minted it bounds how long a
-	// stand-down may last and still continue the tenure (acquireLeaseTenure).
-	unshownSince atomic.Int64
+	// it holds the lease (dropLeaseTerm), on the monotonic clock (c.mono), so
+	// a wall-clock step cannot shorten a stand-down; nil while it holds it.
+	// Before lease terms are minted it bounds how long a stand-down may last
+	// and still continue the tenure (acquireLeaseTenure).
+	unshownSince atomic.Pointer[time.Time]
 	// cyclePolicy is the failover scope and voter regions read once for the
 	// cycle in progress (run), nil outside one. Only the poll goroutine
 	// touches it.
@@ -1256,7 +1257,10 @@ func (c *Coordinator) stepDownGauges() {
 // (acquireLeaseTenure). A lease that lapsed meanwhile is a new tenure there.
 func (c *Coordinator) dropLeaseTerm() {
 	c.leaseTerm.Store(0)
-	c.unshownSince.CompareAndSwap(0, c.now().UnixNano())
+	if c.unshownSince.Load() == nil {
+		at := c.mono()
+		c.unshownSince.CompareAndSwap(nil, &at)
+	}
 }
 
 // loseLease records that another node holds the lease, or claims it: a gap
@@ -1547,8 +1551,8 @@ func (c *Coordinator) acquireLeaseTenure(ctx context.Context) (held, newTenure b
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false, false, nil
 	}
-	if since := c.unshownSince.Swap(0); since != 0 && term == 0 &&
-		c.now().Sub(time.Unix(0, since)) > tenureStandDownBound {
+	if since := c.unshownSince.Swap(nil); since != nil && term == 0 &&
+		c.mono().Sub(*since) > tenureStandDownBound {
 		continues = false
 	}
 	if c.everHeld.Load() && (!continues || term != c.tenureTerm.Load()) {

@@ -573,7 +573,8 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 			`SELECT 1 FROM operations WHERE id = ? AND deleted_at IS NOT NULL`, op.ID); qerr == nil && len(rows) != 0 {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%s: an earlier request with the same idempotency key used operation %s, which has since been "+
-					"removed; retry with a new idempotency key", what, op.ID)
+					"removed, so its outcome is unknown; check the current size before resubmitting with a new "+
+					"idempotency key", what, op.ID)
 		}
 		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
 	}

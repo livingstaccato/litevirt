@@ -242,7 +242,8 @@ func TestResizeVMLive_SameKeyRetryAfterTheHeaderWasReaped(t *testing.T) {
 		t.Fatalf("reap: %v", err)
 	}
 	err := s.resizeVMLive(ctx, "rp", &pb.VMSpec{Cpu: 2, MemoryMib: 8192}, "k-rp")
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "new idempotency key") {
-		t.Fatalf("same-key retry after the header was reaped: got %v, want FailedPrecondition naming a new idempotency key", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "outcome is unknown") ||
+		!strings.Contains(err.Error(), "check the current size") {
+		t.Fatalf("same-key retry after the header was reaped: got %v, want FailedPrecondition saying the outcome is unknown", err)
 	}
 }

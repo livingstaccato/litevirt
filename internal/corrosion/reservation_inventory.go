@@ -85,8 +85,12 @@ type HostReservationView struct {
 	// BarrierHeld: a live vms or containers row's active_operation_id names the
 	// operation.
 	BarrierHeld bool
-	Class       ReservationClass
-	Detail      string
+	// ReleaseBlocked: a tombstoned cancelled row already holds the release
+	// row's key at the header epoch, so ReleaseReservation cannot write it and
+	// the reservation stays counted whatever its class. A sweep skips it.
+	ReleaseBlocked bool
+	Class          ReservationClass
+	Detail         string
 }
 
 // reservationSweepKinds are the operation kinds whose reservation can be
@@ -132,9 +136,13 @@ func HostReservations(ctx context.Context, c *Client, host string) ([]HostReserv
 	}
 	// created_at mixes second and nanosecond stamps, which do not sort as
 	// strings; order by the instant, then id.
+	// An unparseable created_at sorts last.
 	sort.Slice(out, func(i, j int) bool {
-		ti, _ := parseReservationTime(out[i].Op.CreatedAt)
-		tj, _ := parseReservationTime(out[j].Op.CreatedAt)
+		ti, iok := parseReservationTime(out[i].Op.CreatedAt)
+		tj, jok := parseReservationTime(out[j].Op.CreatedAt)
+		if iok != jok {
+			return iok
+		}
 		if !ti.Equal(tj) {
 			return ti.Before(tj)
 		}
@@ -204,7 +212,19 @@ func loadReservationView(ctx context.Context, c *Client, id string, rv Reservati
 			v.BarrierHeld = len(rows) != 0
 		}
 	}
+	brows, err := c.Query(ctx,
+		`SELECT 1 FROM operation_steps
+		 WHERE operation_id = ? AND owner_epoch = ? AND step_name = ? AND deleted_at IS NOT NULL`,
+		id, v.HeaderEpoch, OpStepCancelled)
+	if err != nil {
+		return nil, err
+	}
+	v.ReleaseBlocked = len(brows) != 0
 	v.Class, v.Detail = classifyReservation(v, now)
+	if v.ReleaseBlocked {
+		v.Detail = fmt.Sprintf("still counted; release blocked: its release row (cancelled at owner epoch %d) is tombstoned. %s",
+			v.HeaderEpoch, v.Detail)
+	}
 	return v, nil
 }
 
@@ -287,6 +307,10 @@ var (
 	// ErrReservationInFlight: a live VM or container mutation barrier names the
 	// operation.
 	ErrReservationInFlight = errors.New("operation still holds a mutation barrier")
+	// ErrReservationReleaseBlocked: the reservation is still counted, and a
+	// tombstoned release row holds the key the release would be written at, so
+	// it cannot be released by a written terminal.
+	ErrReservationReleaseBlocked = errors.New("reservation release blocked")
 )
 
 // ReleaseReservation writes the row that releases opID's reservation: a
@@ -298,8 +322,9 @@ var (
 // immutable merge takes it as one.
 //
 // already=true, with nothing written, when the header epoch already reduces to a
-// terminal, or when a tombstoned cancelled row already holds the release row's
-// key (it cannot be inserted again). In the same transaction as the write it
+// terminal. A tombstoned cancelled row already holding the release row's key
+// is ErrReservationReleaseBlocked: the row cannot be inserted again and the
+// reservation stays counted. In the same transaction as the write it
 // refuses an operation a live mutation barrier names (ErrReservationInFlight),
 // and it never releases a capacity lease or a manifest journal
 // (ErrReservationNotReleasable). Whether the
@@ -317,7 +342,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 		return false, fmt.Errorf("release reservation %s (%s %s): %w",
 			opID, op.ResourceKind, op.OperationKind, ErrReservationNotReleasable)
 	}
-	var inFlight, gone bool
+	var inFlight, gone, blocked bool
 	guard := func(tx *sql.Tx) (bool, error) {
 		var n int
 		if err := tx.QueryRowContext(ctx,
@@ -341,8 +366,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 			}
 		}
 		// A tombstoned release row at this key would make the insert fail on the
-		// primary key on every attempt. It cannot be written again; report it
-		// as already released rather than fail forever.
+		// primary key on every attempt. It cannot be written again.
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM operation_steps
 			 WHERE operation_id = ? AND owner_epoch = ? AND step_name = ? AND deleted_at IS NOT NULL`,
@@ -350,6 +374,7 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 			return false, err
 		}
 		if n != 0 {
+			blocked = true
 			return false, nil
 		}
 		rows, err := tx.QueryContext(ctx,
@@ -381,6 +406,10 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationInFlight)
 	case gone:
 		return false, fmt.Errorf("release reservation %s: %w", opID, ErrReservationNotFound)
+	case blocked:
+		return false, fmt.Errorf("release reservation %s: %w: still counted; its release row "+
+			"(cancelled at owner epoch %d) is tombstoned and cannot be re-inserted",
+			opID, ErrReservationReleaseBlocked, op.VMOwnerEpoch)
 	}
 	return !applied, nil
 }

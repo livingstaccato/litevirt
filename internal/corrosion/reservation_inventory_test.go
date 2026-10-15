@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -462,8 +463,9 @@ func TestClassify_VMCreatedInTheOperationsSecondIsNotGone(t *testing.T) {
 }
 
 // A tombstoned cancelled row at the release key, under a live header, cannot be
-// written again. The release reports it instead of failing on every attempt.
-func TestReleaseReservation_TombstonedReleaseRowIsNotAnError(t *testing.T) {
+// written again. The release fails loudly (never "already released"), and the
+// reservation is still counted and flagged as blocked.
+func TestReleaseReservation_TombstonedReleaseRowBlocksTheRelease(t *testing.T) {
 	ctx := context.Background()
 	c := testClient(t)
 	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "")
@@ -476,8 +478,46 @@ func TestReleaseReservation_TombstonedReleaseRowIsNotAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if already, err := ReleaseReservation(ctx, c, "leak"); err != nil || !already {
-			t.Fatalf("release %d over a tombstoned release row: already=%v err=%v, want already=true", i, already, err)
+		already, err := ReleaseReservation(ctx, c, "leak")
+		if !errors.Is(err, ErrReservationReleaseBlocked) || already {
+			t.Fatalf("release %d over a tombstoned release row: already=%v err=%v, want ErrReservationReleaseBlocked", i, already, err)
 		}
+		if !strings.Contains(err.Error(), "leak") || !strings.Contains(err.Error(), "still counted") ||
+			!strings.Contains(err.Error(), "tombstoned") {
+			t.Fatalf("blocked release error %q must name the operation, that it is still counted, and the tombstoned row", err)
+		}
+	}
+	if _, mem, err := HostReserved(ctx, c, "h1"); err != nil || mem != 512 {
+		t.Fatalf("HostReserved(h1) = %d MiB (err %v), want the still-counted 512", mem, err)
+	}
+	v := mustClassify(t, c, "leak")
+	if !v.ReleaseBlocked || !strings.Contains(v.Detail, "release blocked") {
+		t.Fatalf("view: ReleaseBlocked=%v detail %q, want the blocked release flagged", v.ReleaseBlocked, v.Detail)
+	}
+}
+
+// HostReservations orders by the parsed instant: a whole-second header sorts
+// before a nanosecond one later in the same second, though its string sorts
+// after it, and an unparseable stamp sorts last.
+func TestHostReservations_OrdersByInstant(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "")
+	sec := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	steps := map[int64][]string{1: {OpStepReserved}}
+	invOp(t, c, "a-bad", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1, leakVector, "not-a-time", steps)
+	invOp(t, c, "b-nano", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1, leakVector,
+		sec.Add(500*time.Millisecond).Format(time.RFC3339Nano), steps)
+	invOp(t, c, "c-sec", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1, leakVector, sec.Format(time.RFC3339), steps)
+	views, err := HostReservations(ctx, c, "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, v := range views {
+		got = append(got, v.Op.ID)
+	}
+	if strings.Join(got, ",") != "c-sec,b-nano,a-bad" {
+		t.Fatalf("HostReservations order = %v, want [c-sec b-nano a-bad]", got)
 	}
 }

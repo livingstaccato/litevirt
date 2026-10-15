@@ -126,7 +126,7 @@ func (cl interleaveClaimant) decide() bool {
 	cl.t.Helper()
 	ctx := context.Background()
 	if cl.dim.fits(cl.t, cl.c, cl.scope, cl.id) {
-		if err := MarkReservationAdmitted(ctx, cl.c, cl.id); err != nil {
+		if err := MarkReservationAdmitted(ctx, cl.c, cl.id, 0); err != nil {
 			cl.t.Fatal(err)
 		}
 		return true
@@ -259,7 +259,7 @@ func TestReservedBefore_LaterClaimCountsOnceDecided(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.admitted {
-				if err := MarkReservationAdmitted(ctx, c, "zzz-later"); err != nil {
+				if err := MarkReservationAdmitted(ctx, c, "zzz-later", 0); err != nil {
 					t.Fatal(err)
 				}
 			}

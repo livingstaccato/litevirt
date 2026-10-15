@@ -1394,6 +1394,7 @@ func (l *lab) restore(b baseline) {
 	}
 	for _, h := range l.outsiders {
 		if !l.isUp(h) {
+			down = append(down, h) // its strategy waits too (step 4)
 			if err := l.powerOn(h); err != nil {
 				t.Errorf("restore: power on %s: %v", h, err)
 			}

@@ -865,7 +865,7 @@ func TestDrillW5_ClockSteps(t *testing.T) {
 		l.mark("w5: Mailpit does not answer at %s; victim_back_60s_bridged does not check the notification", mp.api)
 	}
 	var used []string
-	l.sub(t, "holder_back_20s", func() { used = append(used, l.w5HolderBack(used)) })
+	l.sub(t, "holder_back_20s", func() { used = append(used, l.w5HolderBack(w, used)) })
 	l.sub(t, "voter_forward_45s", func() { used = append(used, l.w5VoterForward(w, used)) })
 	l.sub(t, "victim_back_60s_bridged", func() { l.w5VictimBackBridged(w, mp, mail, used) })
 }
@@ -896,7 +896,7 @@ func (l *lab) w5Begin(used []string) (v, q string) {
 			l.t.Skipf("%s is %s: the lab is not back at rest from the previous subtest", h, states[h])
 		}
 	}
-	l.requireClocksManageable(l.hosts...)
+	l.requireClocksManageable(append(append([]string{}, l.hosts...), l.outsiderHosts()...)...)
 	l.t.Cleanup(func() {
 		l.clearDrops(append(append([]string{}, l.hosts...), l.outsiders...)...)
 		if via := l.liveHost(); via != "" {
@@ -935,7 +935,7 @@ func (l *lab) w5Settle(s *sampler, v string, keys []string) time.Time {
 	return healed
 }
 
-func (l *lab) w5HolderBack(used []string) string {
+func (l *lab) w5HolderBack(w witnessTopology, used []string) string {
 	t := l.t
 	v, q := l.w5Begin(used)
 	test := l.createVMsWhereRoom(q, "w5a", v)[v]
@@ -982,14 +982,10 @@ func (l *lab) w5HolderBack(used []string) string {
 			break
 		}
 	}
-	// h's clock runs 20 s behind until restoreClock: a time h wrote (a proof's
-	// created_at, a journal line) is that much behind this machine's.
-	skew := func(coordinator string, at time.Time) time.Time {
-		if coordinator == h && at.Add(20*time.Second).After(stepAt) {
-			return at.Add(20 * time.Second)
-		}
-		return at
-	}
+	// h's clock runs 20 s behind until restoreClock. Its journal lines carry
+	// slog's wall time= and are that much behind this machine's; a proof's
+	// created_at is NowTS, behind only without hlc_lww_v1 (mintTime).
+	wall := func(at time.Time) time.Time { return mintTime(at, h, h, stepAt, false) }
 	ps := l.waitProofs(q, "vm", test, since, 1, time.Minute)
 	var minted leaseChange
 	if len(ps) != 1 {
@@ -1000,17 +996,17 @@ func (l *lab) w5HolderBack(used []string) string {
 		// Judged against the tenure it was minted in, not the newest term: the
 		// skewed holder is expected to lose the lease after minting.
 		var ok bool
-		minted, ok = tenureAt(lw.history(), skew(ps[0].Coordinator, created), ps[0].Coordinator, ps[0].LeaseTerm)
+		minted, ok = tenureAt(lw.history(), mintTime(created, ps[0].Coordinator, h, stepAt, w.hlc), ps[0].Coordinator, ps[0].LeaseTerm)
 		if !ok {
 			t.Errorf("proof %s was minted by %s at term %d at %s, but the lease then was %+v (history %+v)", ps[0].ID, ps[0].Coordinator, ps[0].LeaseTerm, ps[0].Created, minted, lw.history())
 		}
 	}
 	for _, ln := range l.journalLines(h, hSince, "lease lost, unshown or renewed as a new tenure mid-cycle, aborting") {
 		l.mark("w5a: %s lost the lease mid-cycle: %s", h, ln.Text)
-		lostAt := skew(h, ln.At)
+		lostAt := wall(ln.At)
 		for _, p := range ps {
 			created, ok := corrosion.ParseUpdatedAt(p.Created)
-			if !ok || p.Coordinator != h || skew(h, created).Before(lostAt) {
+			if !ok || p.Coordinator != h || mintTime(created, h, h, stepAt, w.hlc).Before(lostAt) {
 				continue
 			}
 			// A proof h minted after losing the lease must rest on a tenure h
@@ -1214,6 +1210,19 @@ func (l *lab) waitProofs(via, kind, name, since string, n int, timeout time.Dura
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// mintTime is this machine's time for a created_at written by coordinator
+// while skewed, the holder stepped 20 s back at stepAt, was behind. Without
+// hlc_lww_v1 a time it wrote is its wall clock, 20 s behind. With it,
+// created_at is the HLC (corrosion NowTS), which a backward wall step does not
+// move back and which adopts peers' physical time, so it is about the true
+// time and is not shifted.
+func mintTime(created time.Time, coordinator, skewed string, stepAt time.Time, hlc bool) time.Time {
+	if hlc || coordinator != skewed || !created.Add(20*time.Second).After(stepAt) {
+		return created
+	}
+	return created.Add(20 * time.Second)
 }
 
 // tenureAt reports whether holder held the lease at term at instant at, by the

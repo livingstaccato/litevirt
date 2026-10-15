@@ -137,10 +137,10 @@ export LITEVIRT_E2E=1
 export LV_BIN=/usr/local/bin/litevirt     # the binary ON THE NODES (lab mode)
 export E2E_LAB_DIR=$PWD                   # enables lab mode
 export E2E_EVIDENCE_DIR=~/drill-evidence/e2e-<sha>
-./e2e-drills.test -test.v -test.timeout 90m -test.run 'TestDrill[0-5]|TestDrillBlip'
+./e2e-drills.test -test.v -test.timeout 150m -test.run 'TestDrill[0-5]|TestDrillBlip'
 ```
 
-Run them one at a time or in that order; each one starts by requiring the lab
+A Go test timeout runs no cleanup, so no restore: keep the budget well above the drills' own bounds (each restore can take a few minutes more when it powers a host on or waits for voter adoption). Run them one at a time or in that order; each one starts by requiring the lab
 at rest and ends by restoring it. Lab mode skips every other e2e test (they
 drive a local `lv`).
 

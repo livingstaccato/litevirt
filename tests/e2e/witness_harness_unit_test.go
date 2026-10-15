@@ -147,3 +147,29 @@ func TestTenureAt(t *testing.T) {
 		t.Errorf("a proof before any sample was accepted")
 	}
 }
+
+// TestMintTime dates a proof the skewed holder minted: shifted by its 20 s
+// skew without hlc_lww_v1, not with it (created_at is then the HLC, about the
+// true time). The HLC case is judged against a takeover 10 s after the mint.
+func TestMintTime(t *testing.T) {
+	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+	stepAt := t0.Add(-30 * time.Second)
+	h := []leaseChange{
+		{At: t0.Add(-time.Minute), Holder: "node-2", Term: 7},
+		{At: t0.Add(10 * time.Second), Holder: "node-3", Term: 8},
+	}
+	// HLC: created_at reads the true mint time t0, under term 7.
+	if _, ok := tenureAt(h, mintTime(t0, "node-2", "node-2", stepAt, true), "node-2", 7); !ok {
+		t.Errorf("with hlc_lww_v1 a proof minted at term 7 before the takeover was dated into term 8")
+	}
+	// No HLC: created_at reads the skewed wall clock, t0 − 20 s.
+	if got := mintTime(t0.Add(-20*time.Second), "node-2", "node-2", stepAt, false); !got.Equal(t0) {
+		t.Errorf("without hlc_lww_v1 the skewed created_at maps to %v, want %v", got, t0)
+	}
+	if got := mintTime(t0, "node-4", "node-2", stepAt, false); !got.Equal(t0) {
+		t.Errorf("a proof by an unskewed coordinator was shifted to %v", got)
+	}
+	if got := mintTime(stepAt.Add(-time.Minute), "node-2", "node-2", stepAt, false); !got.Equal(stepAt.Add(-time.Minute)) {
+		t.Errorf("a time written before the step was shifted to %v", got)
+	}
+}

@@ -150,6 +150,15 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 			why = why2
 			continue
 		}
+		// Minted while recovery claims were not enforced (a derived voter
+		// set): the move happened, but no majority certified it, and settle
+		// acts on nothing weaker (F9). Said apart from "no proof at all", whose
+		// remedy points at a claim this one never had.
+		if p.ClaimCertificate == "" {
+			why = fmt.Sprintf("proof %s completed on %s but carries no recovery-claim certificate "+
+				"(minted while recovery claims were not enforced, as on a derived voter set)", p.ID, p.DestHost)
+			continue
+		}
 		cert, err := verify(p.ActionProof)
 		if err != nil {
 			why = "proof " + p.ID + ": " + err.Error()
@@ -222,7 +231,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	}
 	lister := r.settleProofs
 	if lister == nil {
-		lister = corrosion.CertifiedTransferProofs
+		lister = corrosion.TransferProofs
 	}
 	proofs, err := lister(ctx, r.db, corrosion.ClaimKindVM, domName)
 	if err != nil {

@@ -287,9 +287,57 @@ func TestSettleReasonClass_EveryReasonHasAClass(t *testing.T) {
 		"proof p1's certificate decides another incarnation":                                          "certificate_other_incarnation",
 		"proof p1's certificate decides owner epoch 2, older than the local copy's 3":                 "certificate_older_epoch",
 		"proof p1: too few valid accepts":                                                             "certificate_invalid",
+		"proof p1 completed on node-b but carries no recovery-claim certificate (minted while recovery claims were not enforced, as on a derived voter set)": "proof_uncertified",
 	} {
 		if got := settleReasonClass(reason); got != want {
 			t.Errorf("settleReasonClass(%q) = %q, want %q", reason, got, want)
+		}
+	}
+}
+
+// W1 drill on lab 1 (2026-10-15): the recovery ran on a DERIVED voter set, so
+// its proof completed on its destination with no certificate at all. Settle
+// stays certificate-only and leaves the paused copy alone, but the decline
+// must say which case this is: a completed, uncertified proof is not "no
+// proof", and the remedy must not send the operator to `lv cluster claim`,
+// which has no claim to show when none was decided.
+//
+// The fixture's verifier accepts anything, so a settle that verified an empty
+// certificate instead of declining would stop the copy and go red here.
+//
+// Mutations: drop the uncertified clause in settleDecide — the copy is
+// destroyed (or, with a strict verifier, the class is certificate_invalid);
+// drop the class — the class check goes red; reuse the claim remedy — the
+// remedy check goes red.
+func TestSettle_AnUncertifiedCompletedProofIsDeclinedAsSuch(t *testing.T) {
+	f := newSettleFixture(t)
+	f.proof.ClaimCertificate = ""
+	verified := 0
+	f.r.SetSettleVerifier(func(context.Context, corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+		verified++
+		return f.cert, nil
+	})
+	for i := 0; i < settleDeclineSightingsToReport; i++ {
+		if st := f.run(); st != libvirtfake.StatePaused {
+			t.Fatalf("vm-a is %s; settle needs a certificate, so the paused copy must stay paused", st)
+		}
+	}
+	if verified != 0 {
+		t.Fatalf("settle verified an empty certificate %d times; there is nothing to verify", verified)
+	}
+	_, ev, ok := settleDeclinedCondition(t, f)
+	if !ok {
+		t.Fatal("vm_settle_declined not raised for a paused copy settle cannot stop")
+	}
+	if ev.ReasonClass != "proof_uncertified" || !strings.Contains(ev.Reason, "proof-1") {
+		t.Fatalf("decline = class %q reason %q, want proof_uncertified naming proof-1", ev.ReasonClass, ev.Reason)
+	}
+	if strings.Contains(ev.Remedy, "lv cluster claim") {
+		t.Fatalf("remedy sends the operator to a claim that was never decided: %s", ev.Remedy)
+	}
+	for _, want := range []string{"derived voter set", "virsh domstate vm-a", "virsh destroy vm-a", "disks are kept"} {
+		if !strings.Contains(ev.Remedy, want) {
+			t.Fatalf("remedy lacks %q: %s", want, ev.Remedy)
 		}
 	}
 }

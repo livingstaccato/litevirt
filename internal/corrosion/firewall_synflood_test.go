@@ -220,3 +220,55 @@ func TestFirewallSynflood_RefusesInvalid(t *testing.T) {
 	setSynflood(t, c, FirewallSynfloodScopeCluster, FirewallSynflood{Mode: SynfloodOn, Rate: 1, Burst: 100000})
 	setSynflood(t, c, FirewallSynfloodScopeCluster, FirewallSynflood{Mode: SynfloodOn, Rate: 100000, Burst: 1})
 }
+
+// No host (host == "") resolves to the cluster's policy, as it does for a
+// host with no row of its own (B1 review m-3).
+func TestFirewallSynflood_NoHostResolvesCluster(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	openClusterPolicyGate(c)
+	if got, err := ResolveFirewallSynflood(ctx, c, ""); err != nil || got.On() || got.Scope != "" {
+		t.Fatalf("no row, no host = %+v, %v; want off from no scope", got, err)
+	}
+	setSynflood(t, c, FirewallSynfloodScopeCluster, FirewallSynflood{Mode: SynfloodOn, Rate: 300, Burst: 1500})
+	got, err := ResolveFirewallSynflood(ctx, c, "")
+	if err != nil || !got.On() || got.Rate != 300 || got.Burst != 1500 || got.Scope != FirewallSynfloodScopeCluster {
+		t.Errorf("cluster on, no host = %+v, %v; want the cluster's on 300/1500", got, err)
+	}
+}
+
+// A query error on the host's row is returned as it is: the cluster's row
+// never stands in for a host row that could not be read (B1 review m-3).
+//
+// The host row's read is made to fail while the cluster row's still works:
+// cluster_policies becomes a view whose value for that one key is json('{'),
+// which SQLite refuses at run time.
+//
+// Mutation: fall through to the cluster row on any host error.
+func TestFirewallSynflood_HostQueryErrorPropagates(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	openClusterPolicyGate(c)
+	setSynflood(t, c, FirewallSynfloodScopeCluster, FirewallSynflood{Mode: SynfloodOn, Rate: 300, Burst: 1500})
+	setSynflood(t, c, "h1", FirewallSynflood{Mode: SynfloodOff})
+	for _, q := range []string{
+		`ALTER TABLE cluster_policies RENAME TO cluster_policies_real`,
+		`CREATE VIEW cluster_policies AS SELECT key,
+			CASE WHEN key = 'firewall_synflood/h1' THEN json('{') ELSE value END AS value,
+			set_by, updated_at, deleted_at FROM cluster_policies_real`,
+	} {
+		if _, err := c.db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := ResolveFirewallSynflood(ctx, c, "h2"); err != nil || !got.On() || got.Scope != FirewallSynfloodScopeCluster {
+		t.Fatalf("the cluster row no longer reads: %+v, %v", got, err)
+	}
+	got, err := ResolveFirewallSynflood(ctx, c, "h1")
+	if err == nil || errors.Is(err, ErrUnreadableFirewallPolicy) {
+		t.Fatalf("h1 = %+v, %v; want the query error", got, err)
+	}
+	if got.On() || got.Scope == FirewallSynfloodScopeCluster {
+		t.Errorf("h1 = %+v; the cluster row stood in for the host row", got)
+	}
+}

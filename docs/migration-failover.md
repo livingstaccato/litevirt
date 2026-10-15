@@ -1232,6 +1232,70 @@ uncertified second owner the claims exist to prevent — it reports
 `ha_degraded`. See [Operating model](operating-model.md) → "Recovery is a
 decided claim when recovery claims are enforced".
 
+### Disarming HA for planned maintenance
+
+`lv cluster ha disarm` holds every automatic fence and recovery cluster-wide
+until `lv cluster ha arm`, for planned work that would otherwise look like a
+failure (a core switch replacement, a storage firmware update):
+
+```bash
+lv cluster ha disarm --reason "core switch replacement, CHG-1234"
+lv cluster ha                       # state, who set it and why, each voter's answer
+lv cluster ha arm                   # refused while a host is reported down
+lv cluster ha arm --fence-down-hosts
+```
+
+| Held while disarmed | Kept |
+|---|---|
+| Every new fence, fence retry and re-fence | Health probes, `host_health` rows, `suspect` |
+| Every recovery: reschedule, promote, container relocation, the re-key of a stopped VM | Re-admitting a host that answers again |
+| Resuming from a recorded fence or from `lv host fence-confirm` (the confirmation is recorded; the recovery waits for arm) | Relay-health demotion |
+| Recovery-claim retries and partition-pause waits (kept, and run after arm) | Partition pause, VIP self-demotion, watchdogs |
+| A VM healthcheck's `restart` and `migrate` actions, which become an alert (`vm.health.downgraded`) | A VM's restart policy restarting it on its own host after a crash |
+| | Operator actions: start, stop, migrate, drain, `lv replication promote` |
+
+A proof already minted before the disarm completes; nothing new is minted.
+Partition pause still pauses: a planned whole-cluster network outage pauses
+and resumes every VM while disarmed, and nothing is fenced. The coordinator
+logs `failover: HA disarmed; not fencing <host> (quorum reports it down)` once
+per host, counts the skip as `error_class="ha_disarmed"`, and the stall alert
+for a held host says `recovery held: HA disarmed`. There is no automatic re-arm.
+
+**Changing it.** Both directions need the admin role and the connected host's
+voter majority, and wait until a majority of the voters (under region scope, a
+majority of every region that holds a voter) answers with the new row, then a
+further 20 s; the call can take up to 80 s. A newer change seen meanwhile
+returns `Aborted`. On a timeout the call returns `Unavailable` naming who has
+not confirmed, and the row stays: the change may still take effect as it
+replicates, so check `lv cluster ha`. A host whose policy row cannot be read
+reads it as disarmed and raises `ha_policy_unreadable`.
+
+**Arm.** Arm refuses while any host that is not in maintenance is reported down
+by the quorum (voters, non-voters and witnesses alike), listing them: those
+hosts would be fenced on the next cycle. Bring them back, remove one that is
+never coming back with `lv host rm --dead <host>`, or pass
+`--fence-down-hosts`. The list is a snapshot: a host that goes down after the
+arm is fenced like any other.
+
+**Region scope.** A disarm holds a region only once a majority of that region's
+voters holds it; `lv cluster ha` lists the regions that have not confirmed. A
+region cut off before then keeps its coordinator's behaviour.
+
+**First use.** The first disarm ever needs every host, maintenance hosts
+included, to acknowledge the `ha_disarm` release feature. Once the release
+token has latched, the failover lease holder pays this in the background;
+until it has, `lv cluster ha` says `first use pending`.
+
+**Armed, too.** Once the `ha_disarm` feature is in use, a coordinator decides no
+fence and no recovery for a scope (the cluster, or the host's region) in which
+it counts fewer than a majority of the voters live at that moment; the skip is
+counted as `no_quorum`.
+
+**Limitation.** With recovery claims enforced, an operator promotion that
+must re-propose an automatic recovery value already accepted by a minority of
+voters is refused while disarmed: `the workload has an automatic recovery claim
+in flight; HA is disarmed — run lv cluster ha arm, or wait`.
+
 ### Witness hosts (even-N quorum)
 
 For 2-node or 4-node deployments, add a vote-only witness host to break
@@ -1629,6 +1693,8 @@ Scrape `http://<host>:7444/metrics` for:
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
   `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
   `retry_host_answered` (a failed fence not retried because an observer saw the host answer after it),
+  `ha_disarmed` (a fence or recovery held because cluster HA is disarmed, or its policy cannot be read),
+  `ha_peer_veto` (one held because a live voter's answer says HA is disarmed, or is stale or unknown),
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
@@ -1644,6 +1710,10 @@ Scrape `http://<host>:7444/metrics` for:
   (`lv cluster failover-scope region`), the regions that hold at least one worker but have fewer
   than three voters, so cannot fence one of their own hosts. The lease holder's view, like the
   gauge above; always `0` under the default cluster scope
+- `litevirt_ha_disarmed` — `1` on every host whose replica says cluster HA is disarmed
+  (`lv cluster ha`), or holds an HA policy it cannot read; `0` when armed
+- `litevirt_ha_peer_veto` — `1` on the failover lease holder while its own replica says armed and a
+  live voter's answer held a fence or a recovery back (condition `ha_disarm_peer_veto`); `0` otherwise
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on

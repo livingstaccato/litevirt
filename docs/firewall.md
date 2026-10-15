@@ -767,7 +767,7 @@ file, the problem names the rule's place in the file.
 | `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
 | `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` (`ssh`) |
 | `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
-| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...) |
+| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...); not starting with `lv_`, which is reserved for litevirt's internal sets |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
 | `comment` | at most 128 bytes, no double quote |
@@ -782,6 +782,9 @@ families, negated or not. A bare comma list (`80,443`) is
 refused: nft rejects it, so it never applied — brace it. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
 it would add nft syntax of its own to every host's ruleset.
+
+A port name resolves against the host's `/etc/services`, on the host that
+writes the rule and again on each host that renders it.
 
 `proto`, `port` and `action` are stored in lower case (`SSH` is stored as
 `ssh`): nft resolves a service name only in lower case. A port an older build
@@ -809,8 +812,8 @@ before, and nothing is rendered that the row did not ask for:
 - an ip set is rendered without the elements it cannot render, and without
   its IPv6 elements when its companion's name would pass 255 bytes;
 - an ip set whose name nft cannot read (a digit or `-` first, longer than 255
-  bytes, an nft keyword), or named `<name>_v6` beside a set `<name>` with IPv6
-  elements, is left out, and a rule referencing it is held like an unreadable
+  bytes, an nft keyword), whose name starts with `lv_`, or named `<name>_v6`
+  beside a set `<name>` with IPv6 elements, is left out, and a rule referencing it is held like an unreadable
   rule.
 
 Elements of one set that overlap (`10.0.0.0/8` with `10.0.0.1-10.0.0.5`, or

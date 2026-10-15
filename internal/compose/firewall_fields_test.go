@@ -33,14 +33,14 @@ ipsets:
 `,
 		// fw-grammar re-review 3 N-2: office's IPv6 elements render as the
 		// set office_v6.
-		"ipset companion":     `
+		"ipset companion": `
 ipsets:
   office:
     cidrs: ["10.0.0.0/8", "fd00::/8"]
   office_v6:
     cidrs: ["10.9.0.0/16"]
 `,
-		"ipset keyword name":  `
+		"ipset keyword name": `
 ipsets:
   drop:
     cidrs: ["10.0.0.0/8"]
@@ -50,7 +50,7 @@ ipsets:
   lv_gw4:
     cidrs: ["10.0.0.0/8"]
 `,
-		"sg unknown service":  `
+		"sg unknown service": `
 security-groups:
   web:
     rules:

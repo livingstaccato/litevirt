@@ -442,7 +442,7 @@ func TestBridgedStall_AnUnreadableConditionIsNotABridge(t *testing.T) {
 	if err != nil || h == nil {
 		t.Fatalf("GetHost: %v", err)
 	}
-	v := c.selfPauseStillStands(ctx, h, w.fenceAt)
+	v := c.selfPauseStillStands(ctx, h, w.fenceAt, time.Time{})
 	if v.ok || v.bridged || v.why != whyPausedUnreadable {
 		t.Fatalf("verdict on an unreadable partition_paused = %+v; want a refusal %q, not bridged", v, whyPausedUnreadable)
 	}

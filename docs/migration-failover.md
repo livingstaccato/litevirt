@@ -1001,7 +1001,11 @@ outage until an observer on the current build reports the host.
 its observer's, so both comparisons give 5 seconds, the clock-skew alert
 threshold, to the safe side. A failing run must have begun at least 5 seconds
 before the fence, an answer counts from 5 seconds before it, and a run begun
-more than 5 seconds after it counts as an answer. Greater skew
+more than 5 seconds after it counts as an answer. The last has no slack beyond the
+threshold: a run reported by an observer whose clock runs behind by up to 5
+seconds is missed when it began within 5 seconds plus that skew after the
+fence, so a host that answered for less than that and failed again is seen
+only by an observer's latest verdict or the coordinator's own probes. Greater skew
 makes the checks refuse more, except in one direction: an observer whose clock
 runs more than 5 seconds **behind** the leader's can make a run look older than
 it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see

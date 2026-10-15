@@ -1264,7 +1264,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.mStranded(n)
 		// Name each host whose recovery has stalled, and why
 		// (alertStalledRecoveries).
-		c.alertStalledRecoveries(ctx, byHost)
+		c.alertStalledRecoveries(ctx, c.withHeldClaimRetries(ctx, byHost))
 		c.resolveBridgedSettled(ctx, byHost, c.noteBridgedBeforeFence(ctx))
 	}
 }
@@ -4672,38 +4672,83 @@ func (c *Coordinator) strandedByHost(ctx context.Context) (map[string]int, error
 		if h.State != "fenced" && h.State != "offline" {
 			continue
 		}
-		vms, verr := corrosion.ListVMs(ctx, c.db, "", h.Name)
-		if verr != nil {
-			return nil, verr
+		n, err := c.strandedOn(ctx, h.Name, enrolled)
+		if err != nil {
+			return nil, err
 		}
-		for _, vm := range vms {
-			if vmNeedsFailover(vm, enrolled[vm.Name]) {
-				// A VM that stopped without anyone asking is recovered only
-				// on shared storage; with a host-local disk it stays by
-				// design (recoverWorkloads), so it is not stranded.
-				if vm.State == "stopped" {
-					disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
-					if derr != nil {
-						return nil, derr
-					}
-					if corrosion.VMHasHostLocalDisk(disks) {
-						continue
-					}
-				}
-				total[h.Name]++
-			}
-		}
-		cts, cerr := corrosion.ListContainers(ctx, c.db, h.Name)
-		if cerr != nil {
-			return nil, cerr
-		}
-		for _, ct := range cts {
-			if containerNeedsFailover(ct) {
-				total[h.Name]++
-			}
+		if n > 0 {
+			total[h.Name] = n
 		}
 	}
 	return total, nil
+}
+
+// strandedOn counts the recoverable workloads still recorded on host
+// (strandedByHost's per-host count).
+func (c *Coordinator) strandedOn(ctx context.Context, host string, enrolled map[string]bool) (int, error) {
+	n := 0
+	vms, err := corrosion.ListVMs(ctx, c.db, "", host)
+	if err != nil {
+		return 0, err
+	}
+	for _, vm := range vms {
+		if vmNeedsFailover(vm, enrolled[vm.Name]) {
+			// A VM that stopped without anyone asking is recovered only on
+			// shared storage; with a host-local disk it stays by design
+			// (recoverWorkloads), so it is not stranded.
+			if vm.State == "stopped" {
+				disks, derr := corrosion.GetVMDisks(ctx, c.db, vm.Name)
+				if derr != nil {
+					return 0, derr
+				}
+				if corrosion.VMHasHostLocalDisk(disks) {
+					continue
+				}
+			}
+			n++
+		}
+	}
+	cts, err := corrosion.ListContainers(ctx, c.db, host)
+	if err != nil {
+		return 0, err
+	}
+	for _, ct := range cts {
+		if containerNeedsFailover(ct) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// withHeldClaimRetries adds to byHost, for the stall alert only, each host
+// whose owed claim retry is held because it is neither fenced nor offline
+// (claimRetryHeld) and that is a fence candidate this cycle, with the
+// workloads still recorded on it. Such a host is
+// not counted as stranded (strandedByHost), but its hold must still reach an
+// operator. A read error leaves the host out for this cycle.
+func (c *Coordinator) withHeldClaimRetries(ctx context.Context, byHost map[string]int) map[string]int {
+	if len(c.claimRetryHeld) == 0 {
+		return byHost
+	}
+	enrolled, err := c.autoPromoteEnrolled(ctx)
+	if err != nil {
+		return byHost
+	}
+	out := make(map[string]int, len(byHost)+len(c.claimRetryHeld))
+	for h, n := range byHost {
+		out[h] = n
+	}
+	for host := range c.claimRetryHeld {
+		// Only while a quorum still fails it: a held host that answers is up
+		// and runs its own workloads.
+		if _, ok := out[host]; ok || !c.cycleCandidates[host] {
+			continue
+		}
+		if n, err := c.strandedOn(ctx, host, enrolled); err == nil && n > 0 {
+			out[host] = n
+		}
+	}
+	return out
 }
 
 // autoPromoteEnrolled is every VM with an auto-promote replication schedule.

@@ -534,7 +534,12 @@ All of this is in the failover coordinator (`internal/failover`).
      itself when it is a voter, must not be a majority of the adopted voter
      set (the host's region's under region scope) nor of any newer
      generation: a host that has come back is refused. The rule needs an
-     explicit voter set. A derived one, or a newer generation that is a
+     explicit voter set, and on it the deadline is quiet only when, besides
+     no latest verdict being an answer, no observer's failing run began after
+     the wait started and this node has not probed the host healthy since;
+     otherwise the host's own condition, dated to this outage, decides as
+     for an answer (a refusal on these alone is not reported as a bridge). A
+     derived one, or a newer generation that is a
      reset, is read from each node's own replica of host state, and then
      any observer that has seen the host answer since the fence refuses
      (`fenceStillStands`). So does any observer once the pause can no longer
@@ -555,9 +560,17 @@ All of this is in the failover coordinator (`internal/failover`).
    A claim retry does not run while a wait is pending or refused, and one owed
    to an earlier outage or an older fence is dropped with it. Nor does one run
    for a host that is not `fenced` or `offline` (it is held until the host is
-   again), or whose recovery's moment no longer stands: an observer has seen
-   the host answer since, an observer's failing run began after it, or this
-   node has probed the host healthy since. A host whose pause is relied on
+   again; the hold is the stall reason, and the stall alert names it while a
+   quorum still fails the host), or whose recovery's moment no longer stands:
+   an observer has seen the host answer since, an observer's failing run began
+   after it, or this node has probed the host healthy since. A pending
+   partition-pause wait an owed retry is waiting out is judged the same way,
+   less the latest verdicts (a bridge's answer is the deadline's to weigh):
+   one whose start no observer's unbroken run spans, or that an observer's
+   failing run began after, is started afresh. A run from an older build
+   carries no start and is never read as begun after the moment, so during a
+   rolling upgrade only the newer observers' runs, and this node's own probes,
+   show such an answer. A host whose pause is relied on
    then waits out a fresh deadline, one partition-pause wait per retry, and
    under a bridge that sees the host answer each retry waits again. Any other
    host has its retry dropped and goes down the successor's path (step 4): a

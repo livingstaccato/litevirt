@@ -945,9 +945,6 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 	if !c.claimRetry[target] {
 		return true
 	}
-	if _, waiting := c.pauseWaits[target]; waiting {
-		return true
-	}
 	h, err := corrosion.GetHost(ctx, c.db, target)
 	if err != nil || h == nil {
 		return false
@@ -961,9 +958,32 @@ func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) b
 			slog.Info("failover: a recovery claim retry is held while the host is neither fenced nor offline",
 				"host", target, "state", h.State)
 		}
+		c.noteHold(target, "a recovery claim retry is held while the host is "+h.State+
+			", neither fenced nor offline; it is judged again once the host is")
 		return true
 	}
 	delete(c.claimRetryHeld, target)
+	if w, waiting := c.pauseWaits[target]; waiting {
+		// A wait an owed retry is waiting out is judged as the retry's own
+		// moment is, less the latest verdicts: a self-paused host is meant
+		// to answer a bridge, which the deadline weighs. A wait whose moment
+		// no observer's unbroken run spans, or that an observer's failing run
+		// began after, belongs to an outage that is over, and is started
+		// afresh (or dropped with the retry, below).
+		hr := c.readHostHealth(ctx, target)
+		if hr.err != nil {
+			slog.Warn("failover: host_health read for an owed claim retry failed; skipping the host this cycle",
+				"host", target, "error", hr.err)
+			return false
+		}
+		if c.streakSpansIn(hr, target, w.fenceAt) && len(restartedSinceObserversIn(hr, target, w.fenceAt)) == 0 {
+			return true
+		}
+		slog.Warn("failover: the partition-pause wait of an owed claim retry began in an outage that is over; "+
+			"judging the retry afresh", "host", target, "wait_from", w.fenceAt.UTC().Format(time.RFC3339))
+		delete(c.pauseWaits, target)
+		c.noteRecoveryAt(target, w.fenceAt, w.deadline.Add(-w.wait))
+	}
 	at, ok := c.claimRetryAt[target]
 	contacted := ok && c.contactedSince(target, c.claimRetryMono[target])
 	if ok && !contacted {

@@ -183,6 +183,31 @@ func TestWitnessQ3_ARetryIsNotRunOnAHostThatLeftOfflineDuringItsFreshWait(t *tes
 	if n := strings.Count(buf.String(), "claim retry is held while the host is neither fenced nor offline"); n != 1 {
 		t.Fatalf("the held retry was logged %d times over 4 cycles in one state, want once", n)
 	}
+	// Round 3 (R1-m3): the hold reaches an operator — the stall reason, and
+	// the stall alert while a quorum still fails the host, although an
+	// 'upgrading' host is not counted as stranded.
+	if r := c.holdReason["down"]; !strings.Contains(r, "held while the host is upgrading") {
+		t.Fatalf("the hold of an 'upgrading' host is not the stall reason: %q", r)
+	}
+	var stalled string
+	c.OnRecoveryStalled = func(host, _, reason string, _ int, _ time.Time) {
+		if host == "down" {
+			stalled = reason
+		}
+	}
+	for _, step := range []time.Duration{40, 60, 80} {
+		*offset = step * time.Second
+		for _, o := range []string{"coordinator", "alive", "v4"} {
+			failingSince(t, db, o, time.Now().Add(10*time.Second), time.Now().Add(*offset))
+		}
+		c.run(ctx)
+	}
+	if !strings.Contains(stalled, "held while the host is upgrading") {
+		t.Fatalf("no stall alert names the held retry of an 'upgrading' host: %q", stalled)
+	}
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q off an 'upgrading' host", got)
+	}
 	if *decides != 1 {
 		t.Fatalf("a retry made a claim (%d in all) for an 'upgrading' host", *decides)
 	}
@@ -438,5 +463,117 @@ func TestClaimRetryOutageOver_AProbeAnswerSinceTheMomentIsAnOutageOver(t *testin
 	c.claimRetryOutageOver(ctx, "dead")
 	if c.claimRetry["dead"] || c.fenced["dead"] {
 		t.Fatal("a retry owed to a moment this node has since probed the host healthy after was left owed")
+	}
+}
+
+// Round 3 (re-review R1-I1): a fresh wait started for an owed retry, still
+// pending when the host drops out again, must not finish on its moment from
+// an earlier outage. At the heal down is still a candidate while v5 sees it
+// answer, so a fresh wait starts at T_h. down then fails again at T2: v4's
+// run spans T_h, every other voter's run began after it, and no latest
+// verdict is an answer. On the explicit voter set the deadline found the
+// check quiet and recovered everything on the old moment.
+//
+// Mutations: keep short-circuiting claimRetryOutageOver while a wait is
+// pending — the old wait is not restarted; and, with that, drop the
+// restarted-run rule from selfPauseStillStands' explicit path — the VM moves
+// at the old deadline.
+func TestWitnessQ3_APendingWaitFromAnEarlierOutageIsNotRunOnIt(t *testing.T) {
+	c, db, ctx, mono, decides, offset := q3Outage1(t)
+	t0 := time.Now()
+	// The heal: v5 sees down answer while the quorum's rows still lag.
+	*offset = 5 * time.Second
+	th := t0.Add(*offset)
+	failingSince(t, db, "v4", t0.Add(-10*time.Second), th)
+	for _, o := range []string{"coordinator", "alive"} {
+		failingSince(t, db, o, t0.Add(-10*time.Second), th)
+	}
+	healthRow(t, db, "v5", "healthy", 0, th)
+	c.run(ctx)
+	w, ok := c.pauseWaits["down"]
+	if !ok {
+		t.Fatal("setup: no fresh wait started at the heal")
+	}
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("setup: VM moved to %q at the heal", got)
+	}
+	// The second outage, past that wait's deadline, inside the lease (a
+	// lease re-taken as a new tenure forgets the episode).
+	*offset = 20 * time.Second
+	t2 := t0.Add(*offset)
+	failingSince(t, db, "v4", t0.Add(-10*time.Second), t2)
+	for _, o := range []string{"coordinator", "alive", "v5"} {
+		failingSince(t, db, o, t2.Add(-5*time.Second), t2)
+	}
+	mono.Advance(health.PartitionPauseWaitFor(10) + time.Second)
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM recovered to %q at the deadline of a wait started before this outage", got)
+	}
+	if *decides != 1 {
+		t.Fatalf("a claim was made (%d in all) on a wait from before this outage", *decides)
+	}
+	nw, ok := c.pauseWaits["down"]
+	if !ok || !nw.fenceAt.After(w.fenceAt) {
+		t.Fatalf("the wait from before this outage was not started afresh: was %v, now %+v (present %v)", w.fenceAt, nw, ok)
+	}
+}
+
+// Round 3 (R1-I1): on the explicit voter set the deadline is not quiet when
+// an observer's failing run began after the wait started, nor when this node
+// has probed the host healthy since. The host's own word then decides; here
+// its condition cannot be dated to this outage, so the deadline refuses, and
+// neither refusal is a bridge.
+//
+// Mutations: drop the restarted-run rule, or the LastContact rule, from
+// selfPauseStillStands' explicit path — the quiet branch goes ahead.
+func TestSelfPauseExplicit_ARestartedRunOrAProbeAnswerIsAnAnswerAtTheDeadline(t *testing.T) {
+	c, db, ctx, _ := explicitPause(t)
+	c.run(ctx) // the fence, and the voter scope the deadline counts over
+	h, err := corrosion.GetHost(ctx, db, "down")
+	if err != nil || h == nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-time.Minute)
+	pausedCondition(t, db, at.Add(-time.Hour))
+	for _, o := range []string{"coordinator", "alive", "v4"} {
+		failingSince(t, db, o, at.Add(-time.Minute), time.Now())
+	}
+	if v := c.selfPauseStillStands(ctx, h, at, time.Time{}); !v.ok {
+		t.Fatalf("setup: a quiet deadline refused: %s", v.why)
+	}
+	mono := time.Now()
+	c.LastContact = func(string) (time.Time, bool) { return mono.Add(time.Second), true }
+	v := c.selfPauseStillStands(ctx, h, at, mono)
+	if v.ok || !strings.HasPrefix(v.key, keyContacted) || v.bridged {
+		t.Fatalf("a deadline this node probed the host healthy before: %+v; want refused under %q, not bridged", v, keyContacted)
+	}
+	c.LastContact = nil
+	failingSince(t, db, "alive", at.Add(20*time.Second), time.Now())
+	failingSince(t, db, "coordinator", at.Add(20*time.Second), time.Now())
+	v = c.selfPauseStillStands(ctx, h, at, time.Time{})
+	if v.ok || !strings.HasPrefix(v.key, keyRestarted) || v.bridged {
+		t.Fatalf("a deadline with failing runs begun after the wait: %+v; want refused under %q, not bridged", v, keyRestarted)
+	}
+}
+
+// Round 3 (R1-m2): on the derived path a refusal on failing runs begun after
+// the fence alone is reported under its own key, not as a bridge.
+//
+// Mutation: report it as keyAnswered and bridged — the key and flag are wrong.
+func TestQuietFallback_ARestartedRunIsNotABridge(t *testing.T) {
+	c, db, ctx, _ := explicitPause(t)
+	at := time.Now().Add(-time.Minute)
+	failingSince(t, db, "v4", at.Add(-time.Minute), time.Now())
+	failingSince(t, db, "coordinator", at.Add(-time.Minute), time.Now())
+	failingSince(t, db, "alive", at.Add(20*time.Second), time.Now())
+	v := c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at)
+	if v.ok || v.key != keyRestarted || v.bridged || len(v.observers) != 0 {
+		t.Fatalf("refusal on a restarted run: %+v; want key %q, not bridged, naming no bridge observers", v, keyRestarted)
+	}
+	healthRow(t, db, "bridge", "healthy", 0, time.Now())
+	v = c.quietFallback(ctx, c.readHostHealth(ctx, "down"), "down", at)
+	if v.ok || v.key != keyAnswered || !v.bridged {
+		t.Fatalf("refusal on an answer: %+v; want key %q, bridged", v, keyAnswered)
 	}
 }

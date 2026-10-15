@@ -137,10 +137,10 @@ export LITEVIRT_E2E=1
 export LV_BIN=/usr/local/bin/litevirt     # the binary ON THE NODES (lab mode)
 export E2E_LAB_DIR=$PWD                   # enables lab mode
 export E2E_EVIDENCE_DIR=~/drill-evidence/e2e-<sha>
-./e2e-drills.test -test.v -test.timeout 90m -test.run 'TestDrill[0-5]|TestDrillBlip'
+./e2e-drills.test -test.v -test.timeout 150m -test.run 'TestDrill[0-5]|TestDrillBlip'
 ```
 
-Run them one at a time or in that order; each one starts by requiring the lab
+A Go test timeout runs no cleanup, so no restore: keep the budget well above the drills' own bounds (each restore can take a few minutes more when it powers a host on or waits for voter adoption). Run them one at a time or in that order; each one starts by requiring the lab
 at rest and ends by restoring it. Lab mode skips every other e2e test (they
 drive a local `lv`).
 
@@ -156,6 +156,7 @@ drive a local `lv`).
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
 | `E2E_RELAY_NETEM` | (none) | overrides `TestRelayHealth_DegradedLinkBecomesALeafEverywhere`'s impairment with a uniform `tc netem <args>` on node-1's cluster interface. By default the test drops all of node-1's traffic to node-2 and node-3 with a per-peer `tc` filter: two of four observers fail every probe, below fence quorum. Uniform loss rarely fails every probe for 2 minutes (TCP retransmits) |
 | `E2E_GUEST_USER` / `E2E_GUEST_PASSWORD` | `cirros` / `gocubsgo` | login the firewall traffic case (`TestFirewall_TrafficBetweenVMs`) uses inside its guests, over SSH through the host node |
+| `E2E_MAILPIT` / `E2E_MAILPIT_SMTP` | `http://10.77.0.50:8025` / its host, port `1025` | the witness drills' mail sink, as the nodes reach it: Mailpit's HTTP API (checked with `curl` from a node) and its SMTP listener, which `lv notify target add --type email` points at. `TestDrillW1_WitnessBridgedStall` skips without it; `TestDrillW5_ClockSteps` then leaves the notification unchecked |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
 | `E2E_ISCSI_CHAP_USER` / `E2E_ISCSI_CHAP_PASSWORD` | (none) | `TestLab_ISCSIOneDiskPerLUN` on nodes whose open-iscsi default is CHAP (`node.session.auth.authmethod = CHAP` in `/etc/iscsi/iscsid.conf`): that default's username and password, which the test target is then served with — handed to the node on stdin, never on a command line or in test output. Without them such a lab skips the test, saying why; so do nodes whose defaults disagree |
 | `E2E_REDFISH_ENDPOINT` / `E2E_REDFISH_HOST` | (none) | both set: run `TestDrill_RedfishFenceRecordsFencedAndRecovers` against that Redfish BMC, fencing the named node. Also `E2E_REDFISH_USER`, `E2E_REDFISH_PASS_FILE` (preferred) or `E2E_REDFISH_PASS` (the password reaches `lv` through ssh's stdin, never argv), `E2E_REDFISH_SYSTEM_ID` (the node's ComputerSystem Id when the service lists several), `E2E_REDFISH_AUTH` (`session`/`basic`) and `E2E_REDFISH_CA_FILE` (a PEM on the machine running the test). That machine must reach the endpoint: it reads the power state and powers the node back on through it |
@@ -177,6 +178,11 @@ probe constants drift from them.
 | `TestDrill5_LegacyRecoveryWithClaimsOff` | `recovery_claim: false` on every host (rolling restarts): a powered-off host's workloads recover once, by a proof without a claim certificate; the flag is restored | ~12 min |
 | `TestDrill_RedfishFenceRecordsFencedAndRecovers` | opt-in (`E2E_REDFISH_*`): a node set to `--fence-strategy redfish` whose daemon is frozen is powered off through the real Redfish BMC; the fence is verified (`redfish`/`fenced` row, host recorded `fenced`, the BMC reads `Off`), its workloads recover once, and it is powered back on through the BMC with no second copy. Uses the release feature `redfish_fence`, so the lab must not be rolled back below the release afterwards | ~6 min |
 | `TestDrill6_ForceReconfigureAndRebuild` | destructive: three of five hosts lost, fences confirmed, `lv cluster voter force-reconfigure` to the two survivors, recovery with no workaround, `lv host rm --dead`, the workloads still recorded on the removed hosts recovered or removed, rebuild with `lab.sh destroy/create/up`, `lv host add` (a host fenced during its join fails the drill), `lv cluster voter add` back to five, the removed lab workloads put back | ~40 min |
+| `TestDrillW1_WitnessBridgedStall` | witness drills (lab 1: five voting workers, a non-voting witness outside `E2E_LAB_NODES`, else skipped). On a derived voter set (`lv cluster voter reset`, put back with `lv cluster voter init`): a victim nobody can SSH-fence is held, with `ha.recovery.bridged` in its before-fence and its deadline form, the stall alert and its Mailpit notification, `lv host fence-confirm` refused; recovered within two polls of the witness losing it, never before | ~20 min |
+| `TestDrillW3_LeaseChurnDuringAPausedManualHold` | a manual-fence victim, fully isolated and paused, while the failover lease is moved by a daemon stop and then by freezing each holder (every host manual for the drill): each tenure re-alerts the stall at a higher term, and a node retaking the lease in the same process re-alerts within 15 s (fewer than 10 min after its last); the witness's failing row reaches the holder but does not vote; nothing minted; the victim resumes in place. No regain in six rounds: skipped, inconclusive | 15–25 min |
+| `TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange` | drill 4's refused claim leaves one voter's accepted value; after a heal, a lease-term change and the owner's power-off (one other voter frozen), the VM recovers exactly once, by that value adopted or a fresh one; a stranded value refused by the lease-term gate fails it. No accepted value: skipped | ~25 min |
+| `TestDrillW4b_ClaimRetryOwedToTheLastOutage` | drill 4's refused claim, a 30 s heal with the owner still offline, then its power-off: the same holder retries the claim at the same lease term, with the accepted value's proof when there was one, exactly once | ~15 min |
+| `TestDrillW5_ClockSteps` | node clocks stepped inside the nodes (time sync off, never to the RTC, restored after): the lease holder −20 s mid-wait, a majority voter +45 s, the victim −60 s with the witness bridging it; one proof each, no replacement before the pause wait, exactly once | ~32 min |
 
 Findings the drills used to skip or work around are fixed on main, and the
 drills now assert them directly: N3 (recovery on a forced 2-voter generation)

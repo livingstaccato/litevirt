@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,6 +138,17 @@ type lab struct {
 	// witness beyond E2E_LAB_NODES): found once, by outsiderHosts.
 	outsiders      []string
 	outsidersKnown bool
+	// clocks are the node clocks a drill stepped (stepClock), by host, and
+	// clockBase each node's offset from this machine before any step.
+	clocks    map[string]*clockStep
+	clockBase map[string]time.Duration
+	// logT is the test mark logs to: l.t, read atomically, because the
+	// background watchers mark while sub() rebinds l.t to a subtest.
+	logT atomic.Pointer[testing.T]
+	// cut records, per host, the peers dropBetween cut it from, until
+	// clearDrops; sshCut checks only from peers it is not cut from.
+	cutMu sync.Mutex
+	cut   map[string]map[string]bool
 }
 
 // exceptExcluded drops the E2E_LAB_EXCLUDE nodes from hs.
@@ -214,8 +226,9 @@ func newLab(t *testing.T) *lab {
 	l := &lab{
 		t: t, dir: labDir, key: filepath.Join(labDir, "cluster_key"), portBase: base,
 		num: map[string]int{}, ip: map[string]string{}, lvPath: lvBin, cmDir: cm,
-		total: n, excluded: excluded,
+		total: n, excluded: excluded, cut: map[string]map[string]bool{},
 	}
+	l.logT.Store(t)
 	for i := 1; i <= n; i++ {
 		h := fmt.Sprintf("node-%d", i)
 		l.num[h] = i
@@ -259,7 +272,7 @@ func newLab(t *testing.T) *lab {
 func (l *lab) mark(format string, args ...any) time.Time {
 	now := time.Now()
 	msg := fmt.Sprintf(format, args...)
-	l.t.Logf("%s %s", now.UTC().Format("15:04:05.000"), msg)
+	l.logT.Load().Logf("%s %s", now.UTC().Format("15:04:05.000"), msg)
 	l.tlMu.Lock()
 	if l.timeline != nil {
 		fmt.Fprintf(l.timeline, "%s %s\n", now.UTC().Format(time.RFC3339Nano), msg)
@@ -433,7 +446,24 @@ func (l *lab) dropBetween(host string, peers []string) error {
 	set := strings.Join(ips, ", ")
 	cmd := fmt.Sprintf(`nft add table inet %[1]s && nft add chain inet %[1]s in '{ type filter hook input priority -300; policy accept; }' && nft add chain inet %[1]s out '{ type filter hook output priority -300; policy accept; }' && nft add rule inet %[1]s in ip saddr '{ %[2]s }' drop && nft add rule inet %[1]s out ip daddr '{ %[2]s }' drop`, drillTable, set)
 	_, err := l.ssh(host, 30*time.Second, cmd)
+	if err == nil {
+		l.cutMu.Lock()
+		if l.cut[host] == nil {
+			l.cut[host] = map[string]bool{}
+		}
+		for _, p := range peers {
+			l.cut[host][p] = true
+		}
+		l.cutMu.Unlock()
+	}
 	return err
+}
+
+// isCut reports whether a dropBetween rule cuts host from peer, on either end.
+func (l *lab) isCut(host, peer string) bool {
+	l.cutMu.Lock()
+	defer l.cutMu.Unlock()
+	return l.cut[host][peer] || l.cut[peer][host]
 }
 
 // clearDrops removes the drill table (and a manual drill's table) on hosts.
@@ -448,6 +478,13 @@ func (l *lab) clearDrops(hosts ...string) error {
 		}()
 	}
 	wg.Wait()
+	l.cutMu.Lock()
+	for i, h := range hosts {
+		if errs[i] == nil {
+			delete(l.cut, h)
+		}
+	}
+	l.cutMu.Unlock()
 	for _, e := range errs {
 		if e != nil {
 			return e
@@ -1245,7 +1282,12 @@ func (l *lab) liveHost() string {
 
 // baseline is the state every drill starts from and must leave behind.
 type baseline struct {
-	voters     []string
+	voters []string
+	// allVoters is the adopted generation's members, E2E_LAB_EXCLUDE nodes
+	// included: what restore re-initialises after a drill's voter reset.
+	allVoters []string
+	// strategies covers witnesses outside E2E_LAB_NODES too: a drill may set
+	// theirs (TestDrillW3_LeaseChurnDuringAPausedManualHold).
 	strategies map[string]string
 	running    map[string]string // pre-existing running workload key → host
 	cts        map[string]ctInfo
@@ -1262,23 +1304,33 @@ func (l *lab) requireBaseline() baseline {
 	if err != nil {
 		l.t.Fatalf("baseline: %v", err)
 	}
-	for _, h := range l.hosts {
+	// Witnesses outside E2E_LAB_NODES too: the drills cut, stop and freeze
+	// them, and a later drill run against an offline or still-cut witness
+	// would read its own premises wrong.
+	outsiders := l.outsiderHosts()
+	for _, h := range append(append([]string{}, l.hosts...), outsiders...) {
 		if states[h] != "HOST_ACTIVE" {
 			l.t.Fatalf("baseline: %s is %q, want HOST_ACTIVE (lab not at rest: %v)", h, states[h], states)
 		}
 	}
-	_, voters, err := l.voterSet(via)
+	_, allVoters, err := l.voterSet(via)
 	if err != nil {
 		l.t.Fatalf("baseline: %v", err)
 	}
-	voters = l.exceptExcluded(voters)
+	voters := l.exceptExcluded(allVoters)
 	if strings.Join(voters, ",") != strings.Join(l.hosts, ",") {
 		l.t.Fatalf("baseline: voters %v, want every host %v", voters, l.hosts)
 	}
 	if rows, err := l.openOwnershipConditions(via); err != nil || len(rows) > 0 {
 		l.t.Fatalf("baseline: admission-gating conditions open (%v): %v", err, rows)
 	}
-	b := baseline{voters: voters, strategies: map[string]string{}, running: map[string]string{}, lxcHosts: map[string]bool{}}
+	b := baseline{voters: voters, allVoters: allVoters, strategies: map[string]string{}, running: map[string]string{}, lxcHosts: map[string]bool{}}
+	for _, h := range outsiders {
+		b.strategies[h] = l.fenceStrategy(via, h)
+		if out := l.mustSSH(h, 30*time.Second, "nft list tables"); strings.Contains(out, "inet "+drillTable) || regexp.MustCompile(`(?m)^table inet drill$`).MatchString(out) {
+			l.t.Fatalf("baseline: drill nftables rules left on %s:\n%s", h, out)
+		}
+	}
 	for _, h := range l.hosts {
 		out := l.mustSSH(h, 30*time.Second, "nft list tables")
 		if strings.Contains(out, "inet "+drillTable) || regexp.MustCompile(`(?m)^table inet drill$`).MatchString(out) {
@@ -1342,6 +1394,7 @@ func (l *lab) restore(b baseline) {
 	}
 	for _, h := range l.outsiders {
 		if !l.isUp(h) {
+			down = append(down, h) // its strategy waits too (step 4)
 			if err := l.powerOn(h); err != nil {
 				t.Errorf("restore: power on %s: %v", h, err)
 			}
@@ -1368,21 +1421,43 @@ func (l *lab) restore(b baseline) {
 		t.Errorf("restore: no host answers the CLI")
 		return
 	}
-	// 4. Fence strategies.
-	for h, s := range b.strategies {
-		if s != "" && l.fenceStrategy(via, h) != s {
-			if out, err := l.lv(via, "host", "config", h, "--fence-strategy", s); err != nil {
-				t.Errorf("restore: fence strategy %s=%s: %v\n%s", h, s, err, out)
+	// 4. Fence strategies. A host restore just powered on keeps whatever it
+	//    has (a drill sets it manual first) until it has been active for two
+	//    minutes: a best-effort host booted back must not race its own fence.
+	setStrategies := func(booted bool) {
+		for h, s := range b.strategies {
+			if contains(down, h) != booted {
+				continue
+			}
+			if s != "" && l.fenceStrategy(via, h) != s {
+				if out, err := l.lv(via, "host", "config", h, "--fence-strategy", s); err != nil {
+					t.Errorf("restore: fence strategy %s=%s: %v\n%s", h, s, err, out)
+				}
 			}
 		}
 	}
-	// 5. Every host active. A host the drill fenced and that booted again
-	//    records itself active on its own; one that answered again without
-	//    restarting needs `lv host undrain` (migration-failover.md, "What a
-	//    fence records"; partition-pause.md F6).
-	l.waitAllActive(via, 6*time.Minute)
-	// 6. Every host a voter again, one member per generation.
-	if _, voters, err := l.voterSet(via); err == nil {
+	setStrategies(false)
+	// 5. Every host active, witnesses outside E2E_LAB_NODES included. A host
+	//    the drill fenced and that booted again records itself active on its
+	//    own; one that answered again without restarting needs `lv host
+	//    undrain` (migration-failover.md, "What a fence records";
+	//    partition-pause.md F6).
+	l.waitActive(via, append(append([]string{}, l.hosts...), l.outsiders...), 6*time.Minute)
+	if len(down) > 0 {
+		time.Sleep(2 * time.Minute)
+		setStrategies(true)
+	}
+	// 6. Every host a voter again, one member per generation. A drill that
+	//    reset the cluster to the derived voter set (no members) gets the
+	//    baseline generation back by init, which is the only way out of it.
+	//    Every host's adoption is waited for first: a reset decided but not yet
+	//    adopted on via would still read as the old members here.
+	l.waitAdoptionAgrees(2 * time.Minute)
+	if _, voters, err := l.voterSet(via); err == nil && len(voters) == 0 && len(b.allVoters) > 0 {
+		if err := l.voterInit(via, b.allVoters); err != nil {
+			t.Errorf("restore: %v", err)
+		}
+	} else if err == nil {
 		have := map[string]bool{}
 		for _, v := range voters {
 			have[v] = true
@@ -1456,20 +1531,31 @@ func (l *lab) voterAdd(via, host string) error {
 		return err
 	}
 	l.mark("voter add %s: generation %d %v", host, gen, members)
-	for _, m := range members {
-		ok := false
-		for !ok && time.Now().Before(deadline) {
-			rows, err := l.sql(m, "SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption")
-			ok = err == nil && len(rows) > 0 && rows[0][0] == strconv.Itoa(gen)
-			if !ok {
-				time.Sleep(3 * time.Second)
-			}
-		}
-		if !ok {
-			return fmt.Errorf("voter add %s: %s did not adopt generation %d", host, m, gen)
-		}
+	if err := l.waitAdopted(gen, members, deadline); err != nil {
+		return fmt.Errorf("voter add %s: %v", host, err)
 	}
 	return nil
+}
+
+// waitAdoptionAgrees waits, up to timeout, until every up host reports the same
+// newest adopted voter generation.
+func (l *lab) waitAdoptionAgrees(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		gens := map[string]bool{}
+		for _, h := range l.upHosts() {
+			rows, err := l.sql(h, "SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption")
+			if err != nil || len(rows) == 0 {
+				gens["?"] = true
+				continue
+			}
+			gens[rows[0][0]] = true
+		}
+		if len(gens) <= 1 || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func (l *lab) upHosts() []string {
@@ -1585,7 +1671,7 @@ func (l *lab) verifyRest(via string, b baseline) {
 		l.t.Errorf("rest: %v", err)
 		return
 	}
-	for _, h := range l.hosts {
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiders...) {
 		if states[h] != "HOST_ACTIVE" {
 			l.t.Errorf("rest: %s left %s", h, states[h])
 		}
@@ -1593,7 +1679,7 @@ func (l *lab) verifyRest(via string, b baseline) {
 	if gen, voters, err := l.voterSet(via); err != nil || strings.Join(l.exceptExcluded(voters), ",") != strings.Join(b.voters, ",") {
 		l.t.Errorf("rest: voters %v (generation %d, err %v), want %v", voters, gen, err, b.voters)
 	}
-	for _, h := range l.hosts {
+	for _, h := range append(append([]string{}, l.hosts...), l.outsiders...) {
 		out, err := l.ssh(h, 20*time.Second, "nft list tables")
 		if err != nil || strings.Contains(out, "inet "+drillTable) || regexp.MustCompile(`(?m)^table inet drill$`).MatchString(out) {
 			l.t.Errorf("rest: drill nftables state on %s: %v %s", h, err, out)
@@ -1613,7 +1699,7 @@ func (l *lab) verifyRest(via string, b baseline) {
 // ─── The sampler: exactly-once, read from virsh and lxc-ls ──────────────────
 
 // sampleCmd prints one line per guest on a node: "<kind> <name> <state>".
-const sampleCmd = `virsh -c qemu:///system list --all 2>/dev/null | awk 'NR>2 && $2!="" {s=$3; for(i=4;i<=NF;i++) s=s"_"$i; print "vm "$2" "s}'; if command -v lxc-ls >/dev/null 2>&1; then lxc-ls -f -F NAME,STATE 2>/dev/null | awk 'NR>1 && $1!="" {print "ct "$1" "tolower($2)}'; fi; echo END`
+const sampleCmd = `v=$(virsh -c qemu:///system list --all 2>/dev/null) || { echo VIRSHERR; echo END; exit 0; }; echo "$v" | awk 'NR>2 && $2!="" {s=$3; for(i=4;i<=NF;i++) s=s"_"$i; print "vm "$2" "s}'; if command -v lxc-ls >/dev/null 2>&1; then lxc-ls -f -F NAME,STATE 2>/dev/null | awk 'NR>1 && $1!="" {print "ct "$1" "tolower($2)}'; fi; echo END`
 
 // round is one sample of every node, taken concurrently.
 type round struct {
@@ -1731,6 +1817,12 @@ func (s *sampler) sampleOnce() {
 			defer mu.Unlock()
 			if err != nil || !strings.Contains(out, "END") {
 				r.Down[h] = fmt.Sprint(err)
+				return
+			}
+			if strings.Contains(out, "VIRSHERR") {
+				// libvirt did not answer: a copy running there is invisible to
+				// this sample, which must not read as "no guests".
+				r.Down[h] = "virsh failed"
 				return
 			}
 			for _, line := range strings.Split(out, "\n") {

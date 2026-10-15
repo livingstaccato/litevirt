@@ -186,16 +186,45 @@ func SetFirewallTagGroup(ctx context.Context, c *Client, g capabilities.FeatureG
 	return c.Execute(ctx, clusterPolicyUpsertSQL, FirewallTagGroupKeyPrefix+name, value, setBy, c.NowTS())
 }
 
+// storedTagGroupDef decodes a group row: a JSON null match value is a wrong
+// type (encoding/json would store it as "", "has the key"), not a value.
+type storedTagGroupDef struct {
+	Match          map[string]*string `json:"match"`
+	Networks       []string           `json:"networks"`
+	SecurityGroups []string           `json:"security_groups"`
+}
+
+// nonNullStrings converts a decoded map, refusing a JSON null value.
+func nonNullStrings(in map[string]*string) (map[string]string, bool) {
+	if in == nil {
+		return nil, true
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if v == nil {
+			return nil, false
+		}
+		out[k] = *v
+	}
+	return out, true
+}
+
 // decodeTagGroup reads one group row. Decoding is lenient: an unknown field
 // is ignored, so a later release that adds one does not make the row
 // unreadable here.
 func decodeTagGroup(name, value, setBy, updatedAt string) FirewallTagGroup {
 	g := FirewallTagGroup{Name: name, SetBy: setBy, UpdatedAt: updatedAt}
-	var def FirewallTagGroupDef
-	if !ValidFirewallTagGroupName(name) || json.Unmarshal([]byte(value), &def) != nil {
+	var stored storedTagGroupDef
+	if !ValidFirewallTagGroupName(name) || json.Unmarshal([]byte(value), &stored) != nil {
 		g.Unreadable = true
 		return g
 	}
+	match, ok := nonNullStrings(stored.Match)
+	if !ok {
+		g.Unreadable = true
+		return g
+	}
+	def := FirewallTagGroupDef{Match: match, Networks: stored.Networks, SecurityGroups: stored.SecurityGroups}
 	norm, err := normaliseTagGroupDef(def)
 	if err != nil {
 		g.Unreadable = true
@@ -284,9 +313,12 @@ type TagGroupMembership struct {
 	// TagsUnreadable are live workloads whose firewall-tags row cannot be
 	// read. They are members of nothing.
 	TagsUnreadable []TagWorkload
-	// SharedFWID are live workloads of one kind that carry the same fw_id.
-	// No carry leaves two live holders of one identity, so this is never the
-	// server's doing; neither is a member.
+	// SharedFWID are live workloads of one kind that carry the same fw_id,
+	// every holder listed. Neither holder is a member of any group: that
+	// fails closed for a rule ACCEPTING a tag group's addresses, and OPEN for
+	// a drop or reject rule on one and for the group bindings' security
+	// groups. The renderer must hold every NIC of each listed workload at
+	// drop and raise a critical condition.
 	SharedFWID []TagWorkload
 }
 
@@ -301,9 +333,9 @@ type tagWorkload struct {
 type tagNIC struct{ network, mac string }
 
 // firewallTagsValue is a firewall-tags row's value. name and host are for
-// display only and never matched.
+// display only and never matched. A JSON null tag value is a wrong type.
 type firewallTagsValue struct {
-	Tags map[string]string `json:"tags"`
+	Tags map[string]*string `json:"tags"`
 }
 
 type tagsRow struct {
@@ -431,11 +463,11 @@ func ListTagGroupMembers(ctx context.Context, c *Client) (*TagGroupMembership, e
 
 // leaseElement parses a lease's address and checks it lies inside subnet. A
 // lease keyed with its mask (written before normalisation) is its host
-// address. Only an IPv4 address with no zone inside a parseable IPv4 subnet
-// qualifies.
+// address. Only an address of the subnet's family, with no zone, inside a
+// parseable subnet qualifies; an IPv4-mapped IPv6 address never does.
 func leaseElement(ip, subnet string) (netip.Addr, bool) {
 	pfx, err := netip.ParsePrefix(subnet)
-	if err != nil || !pfx.Addr().Is4() {
+	if err != nil {
 		return netip.Addr{}, false
 	}
 	a, err := netip.ParseAddr(ip)
@@ -446,7 +478,8 @@ func leaseElement(ip, subnet string) (netip.Addr, bool) {
 		}
 		a = p.Addr()
 	}
-	if !a.Is4() || a.Zone() != "" || !pfx.Masked().Contains(a) {
+	// Contains refuses another family and a zoned address.
+	if a.Is4In6() || !pfx.Masked().Contains(a) {
 		return netip.Addr{}, false
 	}
 	return a, true
@@ -492,7 +525,12 @@ func readFirewallTagsRows(ctx context.Context, c *Client) (map[string]tagsRow, e
 			out[kind+"/"+id] = tagsRow{unreadable: true}
 			continue
 		}
-		out[kind+"/"+id] = tagsRow{tags: v.Tags}
+		tags, ok := nonNullStrings(v.Tags)
+		if !ok {
+			out[kind+"/"+id] = tagsRow{unreadable: true}
+			continue
+		}
+		out[kind+"/"+id] = tagsRow{tags: tags}
 	}
 	return out, nil
 }

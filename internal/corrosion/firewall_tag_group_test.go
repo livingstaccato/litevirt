@@ -254,10 +254,12 @@ func TestFirewallTagGroup_GarbageReadsUnreadable(t *testing.T) {
 		`{"match":"role=web"}`: true,
 		`{"match":{"role":"web"},"networks":"prod"}`:   true,
 		`{"match":{"role":"web"},"security_groups":7}`: true,
-		`{"match":{}}`:             true,
-		`{}`:                       true,
-		`null`:                     true,
-		`{"match":{"Role":"web"}}`: true,
+		`{"match":{}}`:                        true,
+		`{}`:                                  true,
+		`null`:                                true,
+		`{"match":{"Role":"web"}}`:            true,
+		`{"match":{"role":null}}`:             true,
+		`{"match":{"role":"web","env":null}}`: true,
 		`{"match":{"role":"web"},"future_field":{"x":[1,2]}}`: false,
 		`{"match":{"role":"web"}}`:                            false,
 	} {
@@ -422,15 +424,19 @@ func TestTagGroupMembers_OnlyAllocatorLeasesMatchedByMACAndOwner(t *testing.T) {
 
 // An element outside the network's subnet, or one that does not parse, is
 // skipped and counted; a legacy lease keyed with its mask is its host address.
+// An IPv6 lease inside an IPv6 subnet counts (the _v6 companion); another
+// family, a zone, or an IPv4-mapped IPv6 address never does.
 func TestTagGroupMembers_SkipsUnparsedAndOutsideSubnet(t *testing.T) {
 	f := newTagGroupFixture(t)
 	f.network("nosubnet", "")
 	f.network("badsubnet", "10.2.0.0/33")
+	f.network("v6", "fd00:1::/64")
+	f.network("v6all", "::/0")
 	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
 	f.vm("web-1", tgID(1), "running")
 	f.tags("vm", tgID(1), `{"tags":{"role":"web"}}`)
 	const mac = "52:54:00:bb:00:01"
-	for _, n := range []string{"prod", "nosubnet", "badsubnet", "gone"} {
+	for _, n := range []string{"prod", "nosubnet", "badsubnet", "gone", "v6", "v6all"} {
 		f.vmNIC("vm_nics", "web-1", n, mac, "")
 	}
 	for _, ip := range []string{
@@ -449,17 +455,33 @@ func TestTagGroupMembers_SkipsUnparsedAndOutsideSubnet(t *testing.T) {
 	f.lease("nosubnet", "10.0.0.10", mac, "vm", "", "web-1")
 	f.lease("badsubnet", "10.2.0.1", mac, "vm", "", "web-1")
 	f.lease("gone", "10.0.0.11", mac, "vm", "", "web-1") // no network row
+	for _, ip := range []string{
+		"fd00:1::5",        // counts
+		"fd00:1::6/64",     // legacy masked key: counts as fd00:1::6
+		"fd00:2::1",        // outside the subnet
+		"10.0.0.12",        // another family
+		"fd00:1::7%eth0",   // zoned
+		"::ffff:10.0.0.13", // IPv4-mapped
+	} {
+		f.lease("v6", ip, mac, "vm", "", "web-1")
+	}
+	f.lease("v6all", "::ffff:10.0.0.14", mac, "vm", "", "web-1") // IPv4-mapped, inside ::/0
+	f.lease("v6all", "fd00:3::1", mac, "vm", "", "web-1")        // counts
 
 	m := f.members()
 	v := m.viewFor(t, "web")
-	if got, want := v.addrs(), []string{"prod=10.0.0.5", "prod=10.0.0.6"}; !slices.Equal(got, want) {
+	want := []string{"prod=10.0.0.5", "prod=10.0.0.6", "v6=fd00:1::5", "v6=fd00:1::6", "v6all=fd00:3::1"}
+	if got := v.addrs(); !slices.Equal(got, want) {
 		t.Fatalf("addrs %v, want %v", got, want)
 	}
-	if m.Skipped != 10 {
-		t.Fatalf("skipped %d, want 10", m.Skipped)
+	if m.Skipped != 15 {
+		t.Fatalf("skipped %d, want 15", m.Skipped)
 	}
 	for _, a := range v.Members[0].Addrs {
-		if !a.Addr.Is4() || a.Addr.Zone() != "" || !netip.MustParsePrefix("10.0.0.0/24").Contains(a.Addr) {
+		if a.Addr.Zone() != "" || a.Addr.Is4In6() {
+			t.Fatalf("element %v", a)
+		}
+		if a.Network == "prod" && !netip.MustParsePrefix("10.0.0.0/24").Contains(a.Addr) {
 			t.Fatalf("element %v", a)
 		}
 	}
@@ -527,6 +549,8 @@ func TestTagGroupMembers_IdentityOnly(t *testing.T) {
 	add("dup-a", tgID(6), 6)
 	add("dup-b", tgID(6), 7)
 	f.tags("vm", tgID(6), `{"tags":{"role":"web","env":"x"}}`)
+	add("nullvalue", tgID(15), 15) // a null tag value is a wrong type
+	f.tags("vm", tgID(15), `{"tags":{"role":"web","env":null}}`)
 	add("garbled", tgID(8), 8)
 	f.tags("vm", tgID(8), `{"tags":{"role":"web",`)
 	add("wrongtype", tgID(9), 9)
@@ -556,7 +580,7 @@ func TestTagGroupMembers_IdentityOnly(t *testing.T) {
 	}
 	slices.Sort(unreadable)
 	slices.Sort(shared)
-	if want := []string{"garbled", "wrongtype"}; !slices.Equal(unreadable, want) {
+	if want := []string{"garbled", "nullvalue", "wrongtype"}; !slices.Equal(unreadable, want) {
 		t.Errorf("tags unreadable %v, want %v", unreadable, want)
 	}
 	if want := []string{"dup-a", "dup-b"}; !slices.Equal(shared, want) {
@@ -604,5 +628,53 @@ func TestSetFirewallTagGroup_ListedAsFeatureWriter(t *testing.T) {
 	info, ok := capabilities.LookupFeature(capabilities.FeatureFirewallTagGroups)
 	if !ok || !slices.Contains(info.Writers, "internal/corrosion.SetFirewallTagGroup") {
 		t.Fatalf("firewall_tag_groups writers %v: SetFirewallTagGroup is not listed", info.Writers)
+	}
+}
+
+// Two live workloads of one kind carrying one fw_id: every holder is
+// reported (the renderer holds each at drop) and neither is a member of any
+// group, whatever its tags.
+func TestTagGroupMembers_SharedFWIDReportsEveryHolder(t *testing.T) {
+	f := newTagGroupFixture(t)
+	f.group("web", FirewallTagGroupDef{Match: map[string]string{"role": "web"}})
+	f.group("any", FirewallTagGroupDef{Match: map[string]string{"role": ""}})
+	f.vm("vm-a", tgID(1), "running")
+	f.vmNIC("vm_nics", "vm-a", "prod", "52:54:00:ff:00:01", "")
+	f.vmNIC("vm_interfaces", "vm-a", "dev", "52:54:00:ff:00:02", "")
+	f.lease("prod", "10.0.0.5", "52:54:00:ff:00:01", "vm", "", "vm-a")
+	f.vm("vm-b", tgID(1), "stopped")
+	f.vmNIC("vm_nics", "vm-b", "prod", "52:54:00:ff:00:03", "")
+	f.lease("prod", "10.0.0.6", "52:54:00:ff:00:03", "vm", "", "vm-b")
+	f.tags("vm", tgID(1), `{"tags":{"role":"web"}}`)
+	f.ct("node-1", "ct-a", tgID(2), "running")
+	f.ctNIC("node-1", "ct-a", "prod", "00:16:3e:ff:00:01", "")
+	f.ct("node-2", "ct-a", tgID(2), "running")
+	f.ctNIC("node-2", "ct-a", "dev", "00:16:3e:ff:00:02", "")
+	f.tags("ct", tgID(2), `{"tags":{"role":"web"}}`)
+	// The same id on a VM and a container is not shared: the rows are per kind.
+	f.ct("node-1", "ct-ok", tgID(3), "running")
+	f.vm("vm-ok", tgID(3), "running")
+	f.tags("ct", tgID(3), `{"tags":{"role":"web"}}`)
+	f.tags("vm", tgID(3), `{"tags":{"role":"web"}}`)
+
+	m := f.members()
+	var got []string
+	for _, w := range m.SharedFWID {
+		got = append(got, fmt.Sprintf("%s:%s:%s:%s:%v", w.Kind, w.Host, w.Name, w.FWID, w.Networks))
+	}
+	slices.Sort(got)
+	want := []string{
+		"ct:node-1:ct-a:" + tgID(2) + ":[prod]",
+		"ct:node-2:ct-a:" + tgID(2) + ":[dev]",
+		"vm::vm-a:" + tgID(1) + ":[dev prod]",
+		"vm::vm-b:" + tgID(1) + ":[prod]",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("shared %v, want %v", got, want)
+	}
+	for _, g := range []string{"web", "any"} {
+		if names := m.viewFor(t, g).memberNames(); !slices.Equal(names, []string{"ct:node-1:ct-ok", "vm:vm-ok"}) {
+			t.Errorf("%s: members %v, want only the unshared holders", g, names)
+		}
 	}
 }

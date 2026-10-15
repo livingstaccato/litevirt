@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -27,6 +30,7 @@ func newFirewallCmd() *cobra.Command {
 	cmd.AddCommand(
 		newFirewallShowCmd(),
 		newFirewallReloadCmd(),
+		newFirewallMacrosCmd(),
 		newFirewallClusterRuleCmd(),
 		newFirewallHostRuleCmd(),
 		newFirewallIPSetCmd(),
@@ -89,8 +93,8 @@ command is for "I just changed a rule and want it live now".`,
 
 // ruleFlags is the shared flag set for cluster-rule / host-rule add.
 type ruleFlags struct {
-	direction, proto, port, cidr, action, comment string
-	priority                                      int
+	direction, proto, port, cidr, action, comment, macro string
+	priority                                             int
 }
 
 func (rf *ruleFlags) register(cmd *cobra.Command) {
@@ -101,6 +105,15 @@ func (rf *ruleFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&rf.action, "action", "accept", "accept | drop | reject")
 	cmd.Flags().StringVar(&rf.comment, "comment", "", "human-readable note rendered on the rule")
 	cmd.Flags().IntVar(&rf.priority, "priority", 100, "lower runs first")
+	cmd.Flags().StringVar(&rf.macro, "macro", "", "add the rules of a named macro instead of --proto/--port (see 'lv firewall macros')")
+}
+
+// macroComment is the comment a macro's rows carry when none is given.
+func (rf *ruleFlags) macroComment(name string) string {
+	if rf.comment != "" {
+		return rf.comment
+	}
+	return "macro " + name
 }
 
 func (rf *ruleFlags) pb() *pb.FirewallRule {
@@ -139,6 +152,21 @@ func newFirewallClusterRuleCmd() *cobra.Command {
 		Use:   "add",
 		Short: "Add a cluster-tier firewall rule",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if rf.macro != "" {
+				return runMacroAdd(cmd, rf.macro, rf.direction, rf.cidr, rf.action, func(ctx context.Context, c pb.LiteVirtClient, m string, row firewall.ExpandedRule) (string, error) {
+					r, err := c.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: &pb.FirewallRule{
+						Direction: row.Direction, Proto: row.Proto, Port: row.Port, Cidr: row.CIDR,
+						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m),
+					}})
+					if err != nil {
+						return "", err
+					}
+					return r.Id, nil
+				}, func(ctx context.Context, c pb.LiteVirtClient, id string) error {
+					_, err := c.DeleteClusterFirewallRule(ctx, &pb.DeleteClusterFirewallRuleRequest{Id: id})
+					return err
+				}, func(id string) string { return fmt.Sprintf("Added cluster rule %s\n", id) })
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				r, err := c.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: rf.pb()})
 				if err != nil {
@@ -196,6 +224,21 @@ func newFirewallHostRuleCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if host == "" {
 				return fmt.Errorf("--host is required")
+			}
+			if rf.macro != "" {
+				return runMacroAdd(cmd, rf.macro, rf.direction, rf.cidr, rf.action, func(ctx context.Context, c pb.LiteVirtClient, m string, row firewall.ExpandedRule) (string, error) {
+					r, err := c.CreateHostFirewallRule(ctx, &pb.CreateHostFirewallRuleRequest{Rule: &pb.FirewallRule{
+						HostName: host, Direction: row.Direction, Proto: row.Proto, Port: row.Port, Cidr: row.CIDR,
+						Action: row.Action, Priority: int32(rf.priority), Comment: rf.macroComment(m),
+					}})
+					if err != nil {
+						return "", err
+					}
+					return r.Id, nil
+				}, func(ctx context.Context, c pb.LiteVirtClient, id string) error {
+					_, err := c.DeleteHostFirewallRule(ctx, &pb.DeleteHostFirewallRuleRequest{Id: id})
+					return err
+				}, func(id string) string { return fmt.Sprintf("Added host rule %s on %s\n", id, host) })
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				rule := rf.pb()
@@ -349,4 +392,98 @@ allowed (conntrack established/related); the policy applies to new connections.`
 	}
 	cmd.Flags().StringVar(&scope, "scope", "", "host to scope the policy to (default: cluster-wide)")
 	return cmd
+}
+
+// ── macros ──
+
+func newFirewallMacrosCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "macros",
+		Short: "List the rule macros (use with --macro on rule-add)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "MACRO\tRULES")
+			for _, m := range firewall.Macros() {
+				rows := make([]string, len(m.Rows))
+				for i, r := range m.Rows {
+					rows[i] = r.Proto + " " + r.Port
+				}
+				fmt.Fprintf(w, "%s\t%s\n", m.Name, strings.Join(rows, "; "))
+			}
+			return w.Flush()
+		},
+	}
+}
+
+// checkMacroFlags refuses --macro together with an explicitly set --proto or
+// --port. --proto defaults to "all", so only Changed tells the two apart.
+func checkMacroFlags(cmd *cobra.Command) error {
+	for _, f := range []string{"proto", "port"} {
+		if cmd.Flags().Changed(f) {
+			return fmt.Errorf("--macro cannot be used with --%s: a macro carries its own protocol and ports", f)
+		}
+	}
+	return nil
+}
+
+// macroRollbackTimeout bounds the removal of a failed macro's rows.
+const macroRollbackTimeout = 30 * time.Second
+
+// runMacroAdd expands a macro client-side into one ordinary rule per row. add
+// creates one row and returns its id; remove deletes one by id; added renders
+// the line printed for each created id. When a row fails, the rows already
+// created are removed so a macro is never half applied.
+func runMacroAdd(
+	cmd *cobra.Command, name, direction, cidr, action string,
+	add func(context.Context, pb.LiteVirtClient, string, firewall.ExpandedRule) (string, error),
+	remove func(context.Context, pb.LiteVirtClient, string) error,
+	added func(id string) string,
+) error {
+	if err := checkMacroFlags(cmd); err != nil {
+		return err
+	}
+	m, ok := firewall.LookupMacro(name)
+	if !ok {
+		// Expand names the catalog in its refusal.
+		_, err := firewall.Expand(name, direction, cidr, action)
+		return err
+	}
+	rows, err := firewall.Expand(name, direction, cidr, action)
+	if err != nil {
+		return err
+	}
+	return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+		var ids []string
+		for i, row := range rows {
+			id, err := add(ctx, c, m.Name, row)
+			if err != nil {
+				// The failed call's context may be cancelled or out of time;
+				// the removals get their own, which keeps the caller's values
+				// (the bearer token) but not its cancellation.
+				rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), macroRollbackTimeout)
+				defer cancel()
+				var rbErrs []string
+				for _, done := range ids {
+					if rerr := remove(rbCtx, c, done); rerr != nil {
+						rbErrs = append(rbErrs, fmt.Sprintf("%s: %v", done, rerr))
+					}
+				}
+				msg := fmt.Sprintf("macro %s: row %d of %d failed: %v", m.Name, i+1, len(rows), err)
+				switch {
+				case len(ids) == 0:
+				case len(rbErrs) == 0:
+					msg += fmt.Sprintf("; removed the %d rule(s) already created", len(ids))
+				default:
+					msg += "; could not remove already created rule(s): " + strings.Join(rbErrs, ", ")
+				}
+				return errors.New(msg)
+			}
+			ids = append(ids, id)
+		}
+		for _, id := range ids {
+			fmt.Print(added(id))
+		}
+		return nil
+	})
 }

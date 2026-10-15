@@ -1234,6 +1234,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
+	// A NIC whose MTU this host's bridge does not equal: answered before
+	// anything is created here, and the source refuses the move.
+	if p := s.nicMTUProblem(ctx, req.GetNicMtu()); p != "" {
+		return &pb.EnsureDisksResponse{NicMtuProblem: p}, nil
+	}
 	isoWarning := ""
 	var isoResolved map[string]string
 	// The domain lands here with its installer ISO; qemu on THIS host opens
@@ -2202,9 +2207,14 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 	// a target whose QEMU cannot do one (FIPS) must get the guest without it,
 	// or the guest fails to start there. Best effort, like the cgroup ask.
 	hasVNCPassword := runtime && s.vmHasVNCPassword(vmName)
+	// A NIC MTU always asks too: the target's bridge must equal it.
+	mtus, err := s.nicMTUExpectations(ctx, vmName)
+	if err != nil {
+		return ensureOutcome{}, err
+	}
 	shareOnly := runtime && (s.vmSharesWeight(ctx, vmName) > 0 || hasVNCPassword) && len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 &&
-		s.migrationNetwork == "" && !hasRBD
-	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD {
+		s.migrationNetwork == "" && !hasRBD && len(mtus) == 0
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 && s.migrationNetwork == "" && !shareOnly && !hasRBD && len(mtus) == 0 {
 		return ensureOutcome{}, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
@@ -2222,6 +2232,7 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
 		InstallerIsoSha256: s.judgedISOSHA256(ctx, vmName, isoPaths),
 		MigrationNetwork:   s.migrationNetwork,
+		NicMtu:             mtus,
 	})
 	if err != nil && shareOnly {
 		slog.Warn("migration: the target did not report its cgroup version; cpu-shares move as defined",
@@ -2235,6 +2246,9 @@ func (s *Server) ensureDisksOnTargetNet(ctx context.Context, targetHost, vmName 
 		}
 		return ensureOutcome{}, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
+	}
+	if err := nicMTURefusal(vmName, targetHost, resp.GetNicMtuProblem()); err != nil {
+		return ensureOutcome{}, err
 	}
 	if w := resp.GetInstallerIsoWarning(); w != "" {
 		slog.Warn("migration: "+w, "vm", vmName, "target", targetHost)

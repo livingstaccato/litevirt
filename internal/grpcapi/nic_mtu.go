@@ -14,6 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/vmimport"
 )
 
 // Per-NIC MTU (release feature nic_mtu). The value rides in the stored spec
@@ -240,4 +241,109 @@ func (s *Server) patchNICMTUInPlace(x string, req *pb.UpdateVMRequest, spec *pb.
 		}
 	}
 	return x, nil
+}
+
+// nicMTUExpectations is what a migration's target must match: each NIC of the
+// VM's live definition that carries an <mtu>, at the size it resolved to here
+// (a `bridge` NIC included), with its network and ordinal. A VM whose spec
+// sets no MTU sends none, and its definition is not read.
+func (s *Server) nicMTUExpectations(ctx context.Context, vmName string) ([]*pb.NICMTUExpectation, error) {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read VM %q for its NIC MTUs: %v", vmName, err)
+	}
+	if vm == nil || !specSetsNICMTU(vmSpecFor(vm)) {
+		return nil, nil
+	}
+	x, err := s.virt.DumpXML(vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the definition of %q for its NIC MTUs: %v", vmName, err)
+	}
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list NICs of %q: %v", vmName, err)
+	}
+	byMAC := make(map[string]corrosion.NICRecord, len(nics))
+	for _, n := range nics {
+		byMAC[strings.ToLower(n.MAC)] = n
+	}
+	var out []*pb.NICMTUExpectation
+	for _, n := range lv.InterfaceMTUs(x) {
+		if n.MTU == 0 {
+			continue
+		}
+		rec, ok := byMAC[n.MAC]
+		if !ok {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"VM %q has a NIC (MAC %s) with an MTU but no NIC record, so its network on the target is unknown", vmName, n.MAC)
+		}
+		out = append(out, &pb.NICMTUExpectation{Network: rec.NetworkName, Mtu: int32(n.MTU), Ordinal: int32(rec.Ordinal)})
+	}
+	return out, nil
+}
+
+// nicMTUProblem is a migration target's answer to the source's NIC MTUs: each
+// NIC whose MTU its bridge here does not equal, in the create's words, joined;
+// "" when every one matches (or none was sent).
+func (s *Server) nicMTUProblem(ctx context.Context, want []*pb.NICMTUExpectation) string {
+	var problems []string
+	for _, e := range want {
+		bridge := resolveBridge(ctx, s.db, e.GetNetwork())
+		if strings.HasPrefix(bridge, "direct:") {
+			problems = append(problems, fmt.Sprintf("NIC %d: an MTU needs a bridged network, and %s is not one on host %s",
+				e.GetOrdinal(), e.GetNetwork(), s.hostName))
+			continue
+		}
+		if _, err := lv.ResolveNICMTU(int(e.GetOrdinal()), int(e.GetMtu()), bridge, s.bridgeMTUReader(), s.hostName); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	return strings.Join(problems, "; ")
+}
+
+// nicMTURefusal is the source's refusal of a migration whose target answered
+// a NIC MTU problem; nil for none.
+func nicMTURefusal(vmName, target, problem string) error {
+	if problem == "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition, "cannot move VM %q to %s: %s", vmName, target, problem)
+}
+
+// nicMTUUpdates lists what the desired spec changes in the stored one's NIC
+// MTUs; a value left unset inherits.
+func nicMTUUpdates(desired, stored *pb.VMSpec) []*pb.NICMTUUpdate {
+	var out []*pb.NICMTUUpdate
+	for i, n := range desired.GetNetwork() {
+		if n == nil || n.GetMtu() == 0 || i >= len(stored.GetNetwork()) || stored.Network[i] == nil {
+			continue
+		}
+		if n.GetMtu() != stored.Network[i].GetMtu() {
+			out = append(out, &pb.NICMTUUpdate{Ordinal: int32(i), Mtu: n.GetMtu()})
+		}
+	}
+	return out
+}
+
+// importNICMTUGrant decides an import's NIC MTUs: kept under the nic_mtu grant
+// once the feature is open, else dropped with a warning (the import is never
+// refused over one). A source with no MTU never asks the gate.
+func (s *Server) importNICMTUGrant(ctx context.Context, fv *vmimport.ForeignVM) capabilities.FeatureGrant {
+	var g capabilities.FeatureGrant
+	set := false
+	for _, n := range fv.NICs {
+		set = set || n.MTU != 0
+	}
+	if !set {
+		return g
+	}
+	if !s.ReleaseFeatureAvailable(capabilities.FeatureNICMTU) {
+		fv.DropNICMTUs("the cluster upgrade has not finished (nic_mtu)")
+		return g
+	}
+	g, err := s.nicMTUGrant(ctx)
+	if err != nil {
+		fv.DropNICMTUs("the nic_mtu gate refused: " + status.Convert(err).Message())
+	}
+	return g
 }

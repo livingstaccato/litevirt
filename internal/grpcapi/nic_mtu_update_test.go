@@ -150,3 +150,17 @@ func TestUpdateVM_NICMTURefusals(t *testing.T) {
 		t.Errorf("0=0 before the latch: %v", err)
 	}
 }
+
+// A stack update carries the file's NIC MTUs in its UpdateVM: what differs
+// from the stored value, with an unset one inheriting and a NIC the stored
+// spec does not hold left to the topology checks.
+//
+// Mutation: send unset values as 0 — the inherit case goes red.
+func TestNICMTUUpdates(t *testing.T) {
+	stored := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "a", Mtu: 9000}, {Name: "b"}, {Name: "c", Mtu: 1500}}}
+	desired := &pb.VMSpec{Network: []*pb.NetworkAttachment{{Name: "a", Mtu: compose.NICMTUBridge}, {Name: "b", Mtu: 9000}, {Name: "c"}, {Name: "d", Mtu: 9000}}}
+	got := nicMTUUpdates(desired, stored)
+	if len(got) != 2 || got[0].GetOrdinal() != 0 || got[0].GetMtu() != compose.NICMTUBridge || got[1].GetOrdinal() != 1 || got[1].GetMtu() != 9000 {
+		t.Errorf("updates = %v, want NIC 0 to bridge and NIC 1 to 9000 only", got)
+	}
+}

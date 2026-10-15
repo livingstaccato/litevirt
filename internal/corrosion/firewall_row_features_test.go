@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // firewallRowFeatures (the stored-row classifier the writers use) names every
@@ -31,6 +32,10 @@ func TestFirewallRowFeatures(t *testing.T) {
 		{"tag:web", "tcp", "reject+log", []capabilities.Feature{lg, tg}, false},
 		{"tag:", "tcp", "accept", nil, true},
 		{"tag:a:b", "tcp", "accept", nil, true},
+		// The classifier takes exactly the write grammar's tag form
+		// (rulefield.TagCIDRName): no trimming, a set name only.
+		{" tag:web", "tcp", "accept", nil, true},
+		{"tag:a;b", "tcp", "accept", nil, true},
 		{"2001:db8::/129", "tcp", "accept", nil, true},
 	} {
 		got, err := firewallRowFeatures(tc.cidr, tc.proto, tc.action)
@@ -50,7 +55,10 @@ func TestFirewallRowFeatures(t *testing.T) {
 // refuses a row needing a feature its own grant for that feature does not
 // cover — a logged row with only the IPv6 grant, an IPv6 row with only the log
 // grant, a tag row with both of those — and writes the row once every feature
-// it needs has its grant.
+// it needs has its grant. The "+log" action and the tag-group cidr pass the
+// writers' field grammar only through the extensions C2 and D5 fill
+// (the rulefield.Extensions hooks); with none, as on this build, both are refused
+// whatever the grants, and with test stand-ins the grant matrix holds.
 //
 // Mutations: check the log feature against g (the IPv6 grant) — the
 // IPv6-only row with only gLog is written and goes red; drop the tag check —
@@ -78,6 +86,27 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			return InsertHostFirewallRuleWithGrant(ctx, c, g, gl, gt, FirewallRule{ID: fmt.Sprint("h", n), HostName: "h", Direction: "ingress", Proto: "tcp", CIDR: cidr, Action: action})
 		},
 	}
+	// This build: no extension, so the grammar refuses both forms first.
+	for name, w := range writers {
+		for _, r := range []struct {
+			what         string
+			cidr, action string
+		}{
+			{"logged row", "10.0.0.0/8", "drop+log"},
+			{"IPv6 logged row", "2001:db8::/32", "drop+log"},
+			{"tag row", "tag:web", "accept"},
+		} {
+			var fe *rulefield.FieldError
+			if err := w(gV6, gLog, gTag, r.cidr, r.action); !errors.As(err, &fe) {
+				t.Errorf("%s: %s, every grant, no extension: %v, want a field-grammar refusal", name, r.what, err)
+			}
+		}
+	}
+
+	rulefield.SetExtensionsForTest(t, rulefield.Extensions{
+		LogAction: func(a string) (string, bool) { return strings.CutSuffix(strings.ToLower(a), "+log") },
+		TagCIDR:   func(c string) (bool, error) { return strings.HasPrefix(c, "tag:"), nil },
+	})
 	for name, w := range writers {
 		refused := []struct {
 			what         string
@@ -104,6 +133,7 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			cidr, action string
 		}{
 			{"IPv4 row, no grant", none, none, none, "10.0.0.0/8", "accept"},
+			{"IPv6 row, the IPv6 grant", gV6, none, none, "2001:db8::/32", "drop"},
 			{"logged row, the log grant", none, gLog, none, "10.0.0.0/8", "drop+log"},
 			{"IPv6 logged row, both grants", gV6, gLog, none, "2001:db8::/32", "drop+log"},
 			{"tag row, the tag grant", none, none, gTag, "tag:web", "accept"},

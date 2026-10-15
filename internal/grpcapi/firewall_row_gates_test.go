@@ -160,7 +160,9 @@ func TestStackFirewall_RefusesClientLogAndTagForms(t *testing.T) {
 	bg := context.Background()
 	parse := func(cidr, action string) *compose.File {
 		t.Helper()
-		f, err := compose.ParseBytes([]byte(`
+		// ParseStored: the daemon's own refusal is under test; the compose
+		// validator refuses both forms first (its field grammar).
+		f, err := compose.ParseStored([]byte(`
 name: fwstack
 security-groups:
   web:

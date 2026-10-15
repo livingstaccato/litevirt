@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // FirewallRule is a cluster- or host-tier firewall rule — the two policy
@@ -69,6 +70,12 @@ func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
 // InsertIPSetWithGrant creates a named CIDR list. An IPv6 element is the
 // release feature firewall_ipv6: g must be its grant.
 func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, s IPSet) error {
+	// The name and elements are written into every host's nft script as text.
+	// An element holding commas is stored as the elements it lists.
+	s.CIDRs = rulefield.NormaliseSetElements(s.CIDRs)
+	if err := rulefield.IPSet(s.Name, s.CIDRs); err != nil {
+		return err
+	}
 	v6, err := ipSetFamily(s.CIDRs)
 	if err != nil {
 		return err
@@ -129,8 +136,14 @@ func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) e
 // InsertClusterFirewallRuleWithGrant adds a rule to the cluster_default
 // chain. An IPv6 rule is the release feature firewall_ipv6, a logged one
 // firewall_log and one matching a tag group firewall_tag_groups: g, gLog and
-// gTag must be their grants (FirewallRowFeatures).
+// gTag must be their grants (FirewallRowFeatures). A row whose fields fail the
+// grammar the renderer writes into an nft script is refused before any grant
+// is checked.
 func InsertClusterFirewallRuleWithGrant(ctx context.Context, c *Client, g, gLog, gTag capabilities.FeatureGrant, r FirewallRule) error {
+	r.Proto, r.PortRange, r.Action = rulefield.NormaliseRule(r.Proto, r.PortRange, r.Action)
+	if err := rulefield.StoredRule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
+		return err
+	}
 	need, err := firewallRowFeatures(r.CIDR, r.Proto, r.Action)
 	if err != nil {
 		return err
@@ -198,6 +211,10 @@ func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) erro
 func InsertHostFirewallRuleWithGrant(ctx context.Context, c *Client, g, gLog, gTag capabilities.FeatureGrant, r FirewallRule) error {
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
+	}
+	r.Proto, r.PortRange, r.Action = rulefield.NormaliseRule(r.Proto, r.PortRange, r.Action)
+	if err := rulefield.StoredRule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
+		return err
 	}
 	need, err := firewallRowFeatures(r.CIDR, r.Proto, r.Action)
 	if err != nil {

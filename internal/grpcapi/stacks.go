@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
@@ -433,7 +434,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	needed := map[capabilities.Feature]bool{}
 	for name, sg := range f.SecurityGroups {
 		for _, r := range sg.Rules {
-			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
+			need, err := ruleRowFeatures(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, "")
 			if err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
 			}
@@ -443,7 +444,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		}
 	}
 	for name, set := range f.IPSets {
-		need, err := ipSetFeatures(set.CIDRs)
+		need, err := ipSetRowFeatures(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -453,7 +454,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {
-			need, err := corrosion.FirewallRowFeatures(r.CIDR, r.Proto, r.Action)
+			need, err := ruleRowFeatures(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, r.Comment)
 			if err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
 			}
@@ -522,7 +523,8 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
 			}
-			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {
@@ -533,8 +535,8 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 
 	// IP sets.
 	for name, set := range f.IPSets {
-		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
-		need, invalid := ipSetFeatures(row.CIDRs)
+		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs), StackName: f.Name}
+		need, invalid := ipSetRowFeatures(row.Name, row.CIDRs)
 		if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 			return corrosion.InsertIPSetWithGrant(ctx, s.db, g.IPv6, row)
 		}); err != nil {
@@ -550,7 +552,8 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
 			}
-			need, invalid := corrosion.FirewallRowFeatures(row.CIDR, row.Proto, row.Action)
+			row.Proto, row.PortRange, row.Action = rulefield.NormaliseRule(row.Proto, row.PortRange, row.Action)
+			need, invalid := ruleRowFeatures(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 			if err := s.writeFirewallRow(ctx, need, invalid, func(ctx context.Context, g firewallGrants) error {
 				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g.IPv6, g.Log, g.Tag, row)
 			}); err != nil {

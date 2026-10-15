@@ -443,6 +443,8 @@ func (v *validator) validate(f *File) {
 		}
 	}
 
+	v.validateFirewall(f)
+
 	// Container security opt-outs are container-only, with known values.
 	for _, baseName := range sortedKeys(f.VMs) {
 		vm := f.VMs[baseName]

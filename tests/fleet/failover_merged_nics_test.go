@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/nictap"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // A VM whose NICs were hot-plugged keeps exactly its live NICs wherever its
@@ -33,7 +36,10 @@ import (
 //     guard records name the gone NIC, and the start or the migration is
 //     refused because its guard cannot be put in force);
 //   - the detach alone skips it (Failover, UpdateVM and Migrate, both kinds);
-//   - the attach rollback alone skips it (FailedNICAttach, both kinds).
+//   - the attach rollback alone skips it (FailedNICAttach, both kinds);
+//   - a same-name promotion builds its NICs from the spec again
+//     (PromoteTakeover, both kinds: the domain has na+nb, and nb, its guard
+//     record retired, would boot with no guard).
 //
 // The unlatched variants stay green under the first three: before the latch
 // both tables carry every attach and detach, and the overlay reads as the
@@ -378,4 +384,69 @@ func TestFleet_FailedNICAttachLeavesNoGuardRecord_Latched(t *testing.T) {
 
 func TestFleet_FailedNICAttachLeavesNoGuardRecord_Unlatched(t *testing.T) {
 	testFailedAttachLeavesNoGuard(t, false)
+}
+
+// A same-name promotion (a takeover) keeps the VM's NIC rows and guard
+// records, so it boots exactly the live NICs: the spec still lists the
+// detached NIC, whose guard record is retired, and booting it would put a NIC
+// on the wire that no guard covers.
+func testPromoteKeepsLiveNICs(t *testing.T, latched bool) {
+	c, refresh := mergedNICsCluster(t, latched)
+	ctx := context.Background()
+	home := c.Nodes[1]
+	nft := wireNodeFirewall(t, home)
+
+	cMAC := hotplugged(t, c, home, "web")
+	live := map[string]string{mnA: "na", cMAC: "nc"}
+	if _, err := c.SelfClient(home).StopVM(ctx, &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+	dr := t.TempDir()
+	if err := corrosion.UpsertStoragePool(ctx, home.DB, corrosion.StoragePoolRecord{
+		HostName: home.Name, Name: "dr", Driver: "dir", Target: dr, State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(t.TempDir(), "web-root.qcow2")
+	const replica = "web-root-20261001-000000.qcow2"
+	for _, p := range []string{disk, filepath.Join(dr, replica)} {
+		if err := qcow2.Create(p, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := corrosion.InsertDisk(ctx, home.DB, corrosion.DiskRecord{
+		VMName: "web", DiskName: "root", HostName: home.Name, Path: disk, StorageType: "local",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refresh()
+	st, err := c.SelfClient(home).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
+		VmName: "web", TargetPool: "dr", Replica: replica, NoLocalize: true, Force: true,
+	})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
+	if err != io.EOF {
+		t.Fatalf("promote web: %v", err)
+	}
+	got := domainNICSet(t, home.Virt.DefinedXML("web"))
+	if strings.Join(wantMACs(got), ",") != strings.Join(wantMACs(live), ",") {
+		t.Errorf("web's promoted domain has NICs %v, want exactly the live ones %v", got, live)
+	}
+	if got, want := guardedSet(t, home, "web"), wantMACs(live); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("guarded NICs = %v, want %v", got, want)
+	}
+	assertGuardsOf(t, nft, live, mnB)
+}
+
+func TestFleet_PromoteTakeoverKeepsHotpluggedNICs_Latched(t *testing.T) {
+	testPromoteKeepsLiveNICs(t, true)
+}
+
+func TestFleet_PromoteTakeoverKeepsHotpluggedNICs_Unlatched(t *testing.T) {
+	testPromoteKeepsLiveNICs(t, false)
 }

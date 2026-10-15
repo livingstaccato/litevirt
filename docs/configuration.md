@@ -1030,8 +1030,12 @@ is `true`. The network carries live moves and the disk stream of cold moves and
 clone copies, and an unencrypted storage copy stays on the cluster address. See
 [migration](migration-failover.md#a-dedicated-migration-network).
 
-Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
-libvirt's TLS connection, and this setting does not affect them.
+Migrations of VMs on shared storage copy no disks, and only their memory moves.
+When both hosts hold migration-TLS credentials, that memory stream goes to the
+target's address in the network over TLS. When either host has none, it stays
+in libvirt's TLS tunnel on the cluster address. A migration that cannot use the
+network (this host or the target has no address in it) also stays on the
+cluster address, with a `vm.migrate.network_fallback` event on the VM.
 
 ## Capacity and overcommit
 

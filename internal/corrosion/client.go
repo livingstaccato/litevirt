@@ -1885,6 +1885,18 @@ func (c *Client) Members() []PeerInfo {
 // production membership comes from memberlist.
 func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
 
+// SetWallClockForTests makes now this node's wall clock, for its row stamps
+// and its HLC alike: a node whose clock runs ahead or behind. Call it before
+// the client is in use (now itself may vary). Test-only.
+func (c *Client) SetWallClockForTests(now func() time.Time) {
+	c.tsMu.Lock()
+	c.nowFn = now
+	c.tsMu.Unlock()
+	if c.clock != nil {
+		c.clock.SetNowForTests(now)
+	}
+}
+
 // SetGossipForTests injects RAW memberlist membership, which Members() then
 // filters through gossip admission exactly as it filters memberlist's. Use it to
 // model what an unauthenticated gossip segment can put in front of a node.

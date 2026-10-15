@@ -148,6 +148,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		go p.Start(ctx)
 
 		coord := failover.NewCoordinator(n.Name, n.DB)
+		if c.opts.ClockSeam {
+			coord.Now = n.Now // a stepped node's coordinator reads its own clock
+		}
 		name := n.Name
 		coord.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 			s.mu.Lock()

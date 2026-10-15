@@ -229,7 +229,11 @@ func f() {
 // branches land, because its set is frozen). Each may list no writer, and must
 // not: the branch that adds its Writers deletes it from here in the same
 // change, after which the feature must list them.
-var writersPending = map[Feature]bool{}
+var writersPending = map[Feature]bool{
+	FeatureHADisarm:        true,
+	FeatureNICMTU:          true,
+	FeatureReplicationRate: true,
+}
 
 func TestReleaseFeatureWriters_TakeAGrant(t *testing.T) {
 	root := filepath.Join("..", "..")

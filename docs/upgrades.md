@@ -562,12 +562,13 @@ data, yet it advertises the token, counts toward its latch and is accepted as a
 sender: the first use would not be refused, and every such host would
 acknowledge it and then quarantine itself. So a feature added after a release
 ships — in a patch release too — is declared under the next release token,
-never a shipped one, and a test pins every release token's list. All thirteen
+never a shipped one, and a test pins every release token's list. All sixteen
 features of `release_2026_11_v1` are declared in this release (`lv cluster
 upgrade-status` lists them): `vm_limits`, `vm_disk_nic_io`,
 `email_target_secret`, `login_policy`, `drain_failback`, `firewall_ipv6`,
 `nic_guards`, `usb_mounts_memory`, `backup_zstd`, `container_replication`,
-`iscsi_lun_claim`, `pit_overlay` and `redfish_fence`.
+`iscsi_lun_claim`, `pit_overlay`, `redfish_fence`, `ha_disarm`, `nic_mtu` and
+`replication_rate`.
 
 One feature is one used bit: the first write of any of its data marks it used,
 and a rollback below the release then quarantines. So a feature written by

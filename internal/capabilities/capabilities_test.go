@@ -305,7 +305,8 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // Editing an existing entry is a release-engineering decision, not a code
 // change: it is only ever right before that release has shipped, as one
 // reviewed change to releaseFeatures and to this pin together.
-// (release_2026_11_v1 gained nic_guards and redfish_fence that way, before it shipped.)
+// (release_2026_11_v1 gained nic_guards and redfish_fence that way, and later
+// ha_disarm, nic_mtu and replication_rate, before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
 		"backup_zstd",
@@ -313,11 +314,14 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"drain_failback",
 		"email_target_secret",
 		"firewall_ipv6",
+		"ha_disarm",
 		"iscsi_lun_claim",
 		"login_policy",
 		"nic_guards",
+		"nic_mtu",
 		"pit_overlay",
 		"redfish_fence",
+		"replication_rate",
 		"usb_mounts_memory",
 		"vm_disk_nic_io",
 		"vm_limits",

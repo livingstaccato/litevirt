@@ -101,6 +101,14 @@ $(FONTS_DIR)/source-sans-3.woff2:
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-sans-3/files/source-sans-3-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-sans-3.woff2
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-code-pro/files/source-code-pro-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-code-pro.woff2
 
+.PHONY: proto-automation verify-proto-automation
+
+proto-automation:
+	./api/generate.sh generate
+
+verify-proto-automation:
+	./api/generate.sh verify
+
 proto:
 	buf generate
 

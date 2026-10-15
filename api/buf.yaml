@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  ignore_only:
+    SERVICE_SUFFIX:
+      - proto/litevirt/automation/v1/automation.proto
+breaking:
+  use:
+    - FILE

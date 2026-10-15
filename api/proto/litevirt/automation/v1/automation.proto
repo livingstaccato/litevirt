@@ -1,0 +1,768 @@
+syntax = "proto3";
+
+package litevirt.automation.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/livingstaccato/litevirt/api/gen/litevirt/automation/v1;automationv1";
+
+// Automation admits durable, idempotent VM decisions through authenticated
+// project/owner authorization and an authoritative decision-domain barrier.
+// Transport/authentication/permission failures never imply absence. No public
+// cancel-after-admission or replacement operation exists in F1.
+// All mutations, including owner/session transitions, require request IDs unique
+// within project+owner and bound to the method and immutable request facts.
+// Removed fields and enum values must reserve both numbers and names; never
+// reuse them. Unknown mutation enum values are rejected before admission.
+service Automation {
+  rpc GetAutomationCapabilities(GetAutomationCapabilitiesRequest) returns (GetAutomationCapabilitiesResponse);
+  rpc EnsureOwner(EnsureOwnerRequest) returns (EnsureOwnerResponse);
+  rpc AcquireOwnerSession(AcquireOwnerSessionRequest) returns (AcquireOwnerSessionResponse);
+  rpc HandoffOwnerSession(HandoffOwnerSessionRequest) returns (HandoffOwnerSessionResponse);
+  rpc ResolveBinding(ResolveBindingRequest) returns (ResolveBindingResponse);
+  rpc ObserveResource(ObserveResourceRequest) returns (ObserveResourceResponse);
+  rpc SubmitCreateVM(SubmitCreateVMRequest) returns (SubmitCreateVMResponse);
+  rpc SubmitUpdateVM(SubmitUpdateVMRequest) returns (SubmitUpdateVMResponse);
+  rpc SubmitDeleteVM(SubmitDeleteVMRequest) returns (SubmitDeleteVMResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc ListByOwner(ListByOwnerRequest) returns (ListByOwnerResponse);
+  rpc AdoptResource(AdoptResourceRequest) returns (AdoptResourceResponse);
+  rpc TransferOwner(TransferOwnerRequest) returns (TransferOwnerResponse);
+}
+
+// All components are required. VM kind is "vm". UIDs identify lifetimes, never
+// reused names. The server validates cluster identity on every admission/read.
+message ResourceRef {
+  string cluster_uid = 1;
+  string project_uid = 2;
+  string kind = 3;
+  string resource_uid = 4;
+}
+
+// Owner identity is scoped to the connected cluster and project. The stable
+// principal is derived from authentication, never from credentials in this type.
+message OwnerRef {
+  string project_uid = 1;
+  string owner_id = 2;
+}
+
+// An authority handle, not a bearer credential. Current activation must match
+// for new admissions. A successor can recover operations already accepted.
+message OwnerSession {
+  OwnerRef owner = 1;
+  uint64 activation_generation = 2;
+  string session_id = 3;
+}
+message BindingKey {
+  string project_uid = 1;
+  string owner_id = 2;
+  string management_key = 3;
+}
+message BindingRef {
+  string project_uid = 1;
+  string owner_id = 2;
+  string management_key = 3;
+  uint64 creation_generation = 4;
+}
+message OperationRef {
+  string operation_id = 1;
+  // Minimum applied decision sequence, not necessarily terminal completion.
+  uint64 minimum_sequence = 2;
+}
+
+// A read barrier must establish authoritative applied state at least this new.
+// Revisions are opaque equality tokens; they are never ordered lexically.
+message ReadCursor {
+  uint64 applied_sequence = 1;
+  string resource_revision = 2;
+  OperationRef operation = 3;
+}
+
+// Request IDs are unique within project+owner and bound to method and immutable
+// request facts. Cross-method reuse conflicts. Session identity/activation is
+// admission authority, excluded from immutable VM request identity on retries.
+message MutationIdentity {
+  string request_id = 1;
+  OwnerSession session = 2;
+}
+message Owner {
+  OwnerRef ref = 1;
+  string revision = 2;
+  uint64 activation_generation = 3;
+}
+
+// Retired bindings preserve lifetime UID, generation, final revision and durable
+// receipts without automatic expiry, even after the VM projection is removed.
+message Binding {
+  BindingRef ref = 1;
+  Presence presence = 2;
+  ResourceRef resource = 3;
+  string resource_revision = 4;
+  repeated OperationRef operations = 5;
+  repeated Condition conditions = 6;
+  ReadCursor cursor = 7;
+}
+enum Presence {
+  PRESENCE_UNSPECIFIED = 0;
+  PRESENCE_PRESENT = 1;
+  PRESENCE_ABSENT = 2;
+  PRESENCE_RETIRED = 3;
+  // Preserve client state; never interpret this as absent.
+  PRESENCE_UNCERTAIN = 4;
+}
+
+// Explicit scope supports shared resources without an empty-project sentinel.
+message ReferenceScope {
+  string cluster_uid = 1;
+  oneof scope {
+    string project_uid = 2;
+    // Must be true when selected.
+    bool global = 3;
+  }
+}
+message ScopedName {
+  ReferenceScope scope = 1;
+  string name = 2;
+}
+message ImageRef {
+  ReferenceScope scope = 1;
+  // Nonsecret image content digest; never a digest of VM/bootstrap input.
+  string content_digest = 2;
+  string immutable_id = 3;
+  string display_name = 4;
+}
+message PoolRef {
+  ReferenceScope scope = 1;
+  string immutable_id = 2;
+  string display_name = 3;
+}
+message NetworkRef {
+  ReferenceScope scope = 1;
+  string immutable_id = 2;
+  string display_name = 3;
+}
+
+// Selectors resolve once before admission to scope-aware lifetime references;
+// recovery never re-resolves a name. Existing resources require durable IDs.
+message ImageInput {
+  oneof source {
+    ScopedName selector = 1;
+    ImageRef pinned = 2;
+  }
+}
+message PoolInput {
+  oneof source {
+    ScopedName selector = 1;
+    PoolRef pinned = 2;
+  }
+}
+message NetworkInput {
+  oneof source {
+    ScopedName selector = 1;
+    NetworkRef pinned = 2;
+  }
+}
+message HostRef {
+  string cluster_uid = 1;
+  string host_uid = 2;
+  string display_name = 3;
+}
+message HostSelector {
+  oneof selection {
+    string name = 1;
+    HostRef pinned = 2;
+  }
+}
+
+// Absent/empty placement means scheduler defaults: no pin/label/affinity/max
+// constraints and balanced policy. Explicit pins block on violations; they must
+// not silently undo migration. F1 placement patches change policy only and do
+// not migrate a VM. Unsupported constraints fail before admission.
+message VMPlacement {
+  HostSelector host_selector = 1;
+  map<string, string> required_labels = 2;
+  map<string, string> preferred_labels = 3;
+  repeated ResourceRef affinity = 4;
+  repeated ResourceRef anti_affinity = 5;
+  uint32 max_per_host = 6;
+  PlacementPolicy policy = 7;
+}
+
+// Canonical placement pins any host selector; outputs never contain selectors.
+message VMPlacementConfiguration {
+  HostRef pinned_host = 1;
+  map<string, string> required_labels = 2;
+  map<string, string> preferred_labels = 3;
+  repeated ResourceRef affinity = 4;
+  repeated ResourceRef anti_affinity = 5;
+  uint32 max_per_host = 6;
+  PlacementPolicy policy = 7;
+}
+enum PlacementPolicy {
+  PLACEMENT_POLICY_UNSPECIFIED = 0;
+  PLACEMENT_POLICY_BALANCED = 1;
+  PLACEMENT_POLICY_PACK = 2;
+  PLACEMENT_POLICY_SPREAD = 3;
+}
+
+// Creation input only. CPU is vCPUs, memory is MiB. Unspecified requested state
+// defaults to RUNNING: create succeeds when the admitted requested state is
+// reached. Names retain F1 cluster-wide name rules. Optional hotplug ceilings
+// are explicit admission bounds; absence materializes server defaults in output.
+message VMDesired {
+  string name = 1;
+  uint32 cpu = 2;
+  uint64 memory_mib = 3;
+  map<string, string> labels = 4;
+  VMPlacement placement = 5;
+  ImageInput image = 6;
+  repeated VMDiskDesired disks = 7;
+  repeated VMNICDesired nics = 8;
+  BootstrapInput bootstrap = 9;
+  VMRequestedState requested_state = 10;
+  optional uint32 max_cpu = 11;
+  optional uint64 memory_hotplug_max_mib = 12;
+}
+
+// Unique stable disk keys survive reordering. "root" selects the root disk;
+// VMDesired.image is its default. Conflicting top-level/per-root images fail.
+// No daemon host path or overwrite switch is accepted.
+message VMDiskDesired {
+  string key = 1;
+  uint64 size_bytes = 2;
+  PoolInput pool = 3;
+  ImageInput image = 4;
+  DiskBus bus = 5;
+}
+
+// Missing addresses permit allocation. Static settings are distinct from caller
+// network-config; unsupported network/model/address combinations are rejected.
+message VMNICDesired {
+  string key = 1;
+  NetworkInput network = 2;
+  NICModel model = 3;
+  optional string mac = 4;
+  optional string ipv4_cidr = 5;
+  optional string ipv4_gateway = 6;
+  optional string ipv6_cidr = 7;
+  optional string ipv6_gateway = 8;
+}
+
+// Preserve bytes exactly. Metadata must be a YAML mapping with UID instance-id;
+// preserve other keys and default hostname only if absent. Explicit empty input
+// is supplied input: network_config presence forbids synthesized replacement.
+// Unusable explicit payloads may be rejected before admission, never rewritten.
+message BootstrapInput {
+  optional bytes user_data = 1;
+  optional bytes metadata = 2;
+  optional bytes network_config = 3;
+}
+
+// Output-safe canonical settings: defaults materialized, selectors resolved.
+// This graph cannot carry BootstrapInput, effective seed bytes or equality tags.
+message VMConfiguration {
+  string name = 1;
+  uint32 cpu = 2;
+  uint64 memory_mib = 3;
+  map<string, string> labels = 4;
+  VMPlacementConfiguration placement = 5;
+  ImageRef image = 6;
+  repeated VMDiskConfiguration disks = 7;
+  repeated VMNICConfiguration nics = 8;
+  BootstrapStatus bootstrap = 9;
+  VMRequestedState requested_state = 10;
+  uint32 max_cpu = 11;
+  uint64 memory_hotplug_max_mib = 12;
+}
+message VMDiskConfiguration {
+  string key = 1;
+  uint64 size_bytes = 2;
+  PoolRef pool = 3;
+  ImageRef image = 4;
+  DiskBus bus = 5;
+}
+message VMNICConfiguration {
+  string key = 1;
+  NetworkRef network = 2;
+  NICModel model = 3;
+  string mac = 4;
+  string ipv4_cidr = 5;
+  string ipv4_gateway = 6;
+  string ipv6_cidr = 7;
+  string ipv6_gateway = 8;
+}
+
+// Receipt is an opaque nonsecret identity, not a hash of submitted content.
+message BootstrapStatus {
+  bool present = 1;
+  bool accepted = 2;
+  bool cleaned = 3;
+  string receipt_id = 4;
+}
+
+// Missing scalar/wrapper means unchanged. Present empty labels clears the map;
+// present empty placement clears policy constraints to the documented defaults.
+// Invalid zero CPU/memory remains distinguishable from absence and is rejected.
+message VMPatch {
+  optional uint32 cpu = 1;
+  optional uint64 memory_mib = 2;
+  LabelSet labels = 3;
+  VMPlacement placement = 4;
+}
+message LabelSet {
+  map<string, string> values = 1;
+}
+enum VMRequestedState {
+  VM_REQUESTED_STATE_UNSPECIFIED = 0;
+  VM_REQUESTED_STATE_RUNNING = 1;
+  VM_REQUESTED_STATE_STOPPED = 2;
+}
+enum DiskBus {
+  DISK_BUS_UNSPECIFIED = 0;
+  DISK_BUS_VIRTIO = 1;
+  DISK_BUS_SCSI = 2;
+  DISK_BUS_SATA = 3;
+}
+enum NICModel {
+  NIC_MODEL_UNSPECIFIED = 0;
+  NIC_MODEL_VIRTIO = 1;
+  NIC_MODEL_E1000 = 2;
+}
+
+// Runtime host, domain UUID, incarnation and freshness are observed facts,
+// separate from desired policy. Metrics and migration never advance revision.
+message VMObservation {
+  ResourceRef resource = 1;
+  VMConfiguration desired = 2;
+  string revision = 3;
+  OwnerRef owner = 4;
+  BindingRef binding = 5;
+  VMRuntimeObservation runtime = 6;
+  repeated Condition conditions = 7;
+  ReadCursor cursor = 8;
+  Presence presence = 9;
+}
+message VMRuntimeObservation {
+  VMState state = 1;
+  HostRef reporting_host = 2;
+  string domain_uuid = 3;
+  string incarnation = 4;
+  google.protobuf.Timestamp observed_at = 5;
+  ObservationFreshness freshness = 6;
+  repeated VMNICObservation interfaces = 7;
+  repeated VMDiskObservation disks = 8;
+  uint32 cpu_actual = 9;
+  uint64 memory_actual_mib = 10;
+}
+message VMNICObservation {
+  string key = 1;
+  string interface_id = 2;
+  NetworkRef network = 3;
+  string mac = 4;
+  repeated string ipv4_addresses = 5;
+  repeated string ipv6_addresses = 6;
+}
+message VMDiskObservation {
+  string key = 1;
+  string artifact_id = 2;
+  PoolRef pool = 3;
+  uint64 size_bytes = 4;
+}
+enum VMState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_PENDING = 1;
+  VM_STATE_RUNNING = 2;
+  VM_STATE_STOPPED = 3;
+  VM_STATE_PAUSED = 4;
+  VM_STATE_FAILED = 5;
+}
+enum ObservationFreshness {
+  OBSERVATION_FRESHNESS_UNSPECIFIED = 0;
+  OBSERVATION_FRESHNESS_FRESH = 1;
+  OBSERVATION_FRESHNESS_STALE = 2;
+  OBSERVATION_FRESHNESS_UNAVAILABLE = 3;
+}
+
+// Acceptance is durable, not completion. SUCCEEDED/FAILED are durable terminal
+// states; BLOCKED is nonterminal with next action. Verbose terminal progress may
+// compact after 30 days; compact receipts and retirement evidence never expire.
+message Operation {
+  OperationRef ref = 1;
+  BindingRef binding = 2;
+  ResourceRef resource = 3;
+  string request_id = 4;
+  OperationKind kind = 5;
+  OperationState state = 6;
+  string resulting_revision = 7;
+  repeated Condition conditions = 8;
+  ErrorDetail error = 9;
+  repeated ArtifactDisposition artifacts = 10;
+  google.protobuf.Timestamp accepted_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  google.protobuf.Timestamp completed_at = 13;
+  bool progress_compacted = 14;
+  RetryAdvice retry = 15;
+  OperationOutcome outcome = 16;
+}
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_CREATE_VM = 1;
+  OPERATION_KIND_UPDATE_VM = 2;
+  OPERATION_KIND_DELETE_VM = 3;
+  OPERATION_KIND_ADOPT_RESOURCE = 4;
+  OPERATION_KIND_TRANSFER_OWNER = 5;
+}
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_ACCEPTED = 1;
+  OPERATION_STATE_RUNNING = 2;
+  OPERATION_STATE_BLOCKED = 3;
+  OPERATION_STATE_SUCCEEDED = 4;
+  OPERATION_STATE_FAILED = 5;
+}
+enum OperationOutcome {
+  OPERATION_OUTCOME_UNSPECIFIED = 0;
+  OPERATION_OUTCOME_APPLIED = 1;
+  OPERATION_OUTCOME_REJECTED = 2;
+  OPERATION_OUTCOME_PARTIALLY_APPLIED = 3;
+}
+
+// Artifact identity, never a path, governs accounting. Physical cleanup pending
+// after proven fencing is distinct from unaccounted residue. Seed cleanup is
+// reported without exposing effective payload, ciphertext or secret digest.
+message ArtifactDisposition {
+  string artifact_id = 1;
+  ResourceRef resource = 2;
+  ArtifactKind kind = 3;
+  ArtifactState disposition = 4;
+  repeated HostRef hosts = 5;
+  RetainedArtifactRef retained_ref = 6;
+  bool cleanup_pending = 7;
+  string reason = 8;
+}
+message RetainedArtifactRef {
+  string artifact_id = 1;
+  PoolRef pool = 2;
+  ResourceRef former_resource = 3;
+}
+enum ArtifactKind {
+  ARTIFACT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_KIND_DISK = 1;
+  ARTIFACT_KIND_FIRMWARE = 2;
+  ARTIFACT_KIND_TPM_STATE = 3;
+  ARTIFACT_KIND_BOOTSTRAP_SEED = 4;
+}
+enum ArtifactState {
+  ARTIFACT_STATE_UNSPECIFIED = 0;
+  ARTIFACT_STATE_ACTIVE = 1;
+  ARTIFACT_STATE_DELETED = 2;
+  ARTIFACT_STATE_RETAINED = 3;
+  ARTIFACT_STATE_FENCED_CLEANUP_PENDING = 4;
+  ARTIFACT_STATE_UNACCOUNTED = 5;
+}
+message Condition {
+  string type = 1;
+  ConditionStatus status = 2;
+  string reason = 3;
+  string message = 4;
+  ResourceRef resource = 5;
+  string next_action = 6;
+  google.protobuf.Timestamp observed_at = 7;
+}
+enum ConditionStatus {
+  CONDITION_STATUS_UNSPECIFIED = 0;
+  CONDITION_STATUS_TRUE = 1;
+  CONDITION_STATUS_FALSE = 2;
+  CONDITION_STATUS_UNKNOWN = 3;
+}
+
+// Carried as structured gRPC status details. Diagnostic strings and violations
+// must never include secret input values; consumers use codes rather than text.
+message ErrorDetail {
+  ErrorCode code = 1;
+  string message = 2;
+  ResourceRef resource = 3;
+  BindingRef binding = 4;
+  OperationRef operation = 5;
+  RetryAdvice retry = 6;
+  repeated FieldViolation field_violations = 7;
+}
+message FieldViolation {
+  string field = 1;
+  string reason = 2;
+}
+message RetryAdvice {
+  RetryAction action = 1;
+  google.protobuf.Duration retry_after = 2;
+  string safe_next_action = 3;
+}
+enum RetryAction {
+  RETRY_ACTION_UNSPECIFIED = 0;
+  RETRY_ACTION_SAME_REQUEST = 1;
+  RETRY_ACTION_REFRESH_STATE = 2;
+  RETRY_ACTION_OPERATOR_ACTION = 3;
+  RETRY_ACTION_RESTART_PAGINATION = 4;
+  RETRY_ACTION_DO_NOT_RETRY = 5;
+}
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_UNAUTHENTICATED = 1;
+  ERROR_CODE_PERMISSION_DENIED = 2;
+  ERROR_CODE_UNSUPPORTED = 3;
+  ERROR_CODE_VALIDATION = 4;
+  ERROR_CODE_OWNERSHIP_CONFLICT = 5;
+  ERROR_CODE_REVISION_CONFLICT = 6;
+  ERROR_CODE_IDEMPOTENCY_CONFLICT = 7;
+  ERROR_CODE_QUOTA = 8;
+  ERROR_CODE_CAPACITY = 9;
+  ERROR_CODE_AUTHORITY_UNAVAILABLE = 10;
+  ERROR_CODE_RETIRED = 11;
+  ERROR_CODE_OPERATION_BLOCKED = 12;
+  ERROR_CODE_OPERATION_FAILED = 13;
+  ERROR_CODE_CURSOR_INVALID = 14;
+  ERROR_CODE_CURSOR_EXPIRED = 15;
+  ERROR_CODE_SESSION_FENCED = 16;
+  ERROR_CODE_GENERATION_CONFLICT = 17;
+  ERROR_CODE_NOT_QUIESCENT = 18;
+}
+
+// Capabilities describe actual enforcement, never merely compiled support.
+message GetAutomationCapabilitiesRequest {
+  optional string expected_cluster_uid = 1;
+}
+message GetAutomationCapabilitiesResponse {
+  string cluster_uid = 1;
+  string contract_version = 2;
+  repeated EnforcedFeature enforced_features = 3;
+  DurabilityMode durability_mode = 4;
+  Limits limits = 5;
+  repeated UpdateSupport supported_updates = 6;
+  ReadCursor cursor = 7;
+}
+enum EnforcedFeature {
+  ENFORCED_FEATURE_UNSPECIFIED = 0;
+  ENFORCED_FEATURE_AUTHORITATIVE_READS = 1;
+  ENFORCED_FEATURE_DURABLE_IDEMPOTENCY = 2;
+  ENFORCED_FEATURE_OWNER_SESSION_FENCING = 3;
+  ENFORCED_FEATURE_RETIRED_BINDINGS = 4;
+  ENFORCED_FEATURE_BYTE_PRESERVING_BOOTSTRAP = 5;
+  ENFORCED_FEATURE_ARTIFACT_ACCOUNTING = 6;
+  ENFORCED_FEATURE_STABLE_REFERENCES = 7;
+  ENFORCED_FEATURE_QUIESCENT_OWNERSHIP_TRANSFER = 8;
+}
+enum DurabilityMode {
+  DURABILITY_MODE_UNSPECIFIED = 0;
+  DURABILITY_MODE_HA_THREE_DURABLE_VOTERS = 1;
+  // Explicit development mode does not promise HA durability.
+  DURABILITY_MODE_DEVELOPMENT = 2;
+}
+message Limits {
+  uint32 max_page_size = 1;
+  uint64 max_bootstrap_bytes = 2;
+  uint32 required_durable_voters = 3;
+  uint32 min_cpu = 4;
+  uint32 max_cpu = 5;
+  uint64 min_memory_mib = 6;
+  uint64 max_memory_mib = 7;
+  uint64 max_user_data_bytes = 8;
+  uint64 max_metadata_bytes = 9;
+  uint64 max_network_config_bytes = 10;
+}
+message UpdateSupport {
+  UpdateField field = 1;
+  repeated DisruptionClass permitted_disruptions = 2;
+}
+enum UpdateField {
+  UPDATE_FIELD_UNSPECIFIED = 0;
+  UPDATE_FIELD_CPU = 1;
+  UPDATE_FIELD_MEMORY_MIB = 2;
+  UPDATE_FIELD_LABELS = 3;
+  UPDATE_FIELD_PLACEMENT = 4;
+}
+
+// Update must explicitly select LIVE or RESTART. Unspecified is invalid and
+// replacement-requiring requests are rejected before admission in F1.
+enum DisruptionClass {
+  DISRUPTION_CLASS_UNSPECIFIED = 0;
+  DISRUPTION_CLASS_LIVE = 1;
+  DISRUPTION_CLASS_RESTART = 2;
+}
+enum DiskPolicy {
+  DISK_POLICY_UNSPECIFIED = 0;
+  DISK_POLICY_DELETE = 1;
+  DISK_POLICY_RETAIN = 2;
+}
+message EnsureOwnerRequest {
+  OwnerRef owner = 1;
+  string request_id = 2;
+}
+message EnsureOwnerResponse {
+  Owner owner = 1;
+  ReadCursor cursor = 2;
+}
+
+// Expected activation 0 creates generation 1 only on first acquisition. Same
+// session/request retry recovers that decision. Another session requires explicit
+// handoff; expiry alone never grants authority.
+message AcquireOwnerSessionRequest {
+  OwnerRef owner = 1;
+  uint64 expected_activation_generation = 2;
+  string session_id = 3;
+  string request_id = 4;
+}
+message AcquireOwnerSessionResponse {
+  OwnerSession session = 1;
+  ReadCursor cursor = 2;
+}
+
+// Current carries the explicit expected activation; handoff atomically fences
+// that generation and increments activation for the successor.
+message HandoffOwnerSessionRequest {
+  OwnerSession current = 1;
+  string successor_session_id = 2;
+  string request_id = 3;
+}
+message HandoffOwnerSessionResponse {
+  OwnerSession session = 1;
+  ReadCursor cursor = 2;
+}
+message ResolveBindingRequest {
+  BindingKey key = 1;
+  ReadCursor minimum = 2;
+}
+
+// Even absent/uncertain results carry authoritative presence and cursor.
+message ResolveBindingResponse {
+  Binding binding = 1;
+  ReadCursor cursor = 2;
+}
+message ObserveResourceRequest {
+  ResourceRef resource = 1;
+  ReadCursor minimum = 2;
+}
+message ObserveResourceResponse {
+  VMObservation observation = 1;
+  ReadCursor cursor = 2;
+}
+message SubmitCreateVMRequest {
+  MutationIdentity identity = 1;
+  BindingKey binding = 2;
+  // Zero means never used. After retirement supply the last generation; the
+  // server allocates its successor. Old request retries recover the old receipt.
+  uint64 expected_generation = 3;
+  VMDesired desired = 4;
+}
+
+// Resource UID and binding generation are durably allocated at acceptance.
+message SubmitCreateVMResponse {
+  OperationRef operation = 1;
+  ResourceRef resource = 2;
+  BindingRef binding = 3;
+  ReadCursor cursor = 4;
+}
+message SubmitUpdateVMRequest {
+  MutationIdentity identity = 1;
+  ResourceRef resource = 2;
+  string expected_revision = 3;
+  BindingRef binding = 4;
+  VMPatch patch = 5;
+  DisruptionClass permitted_disruption = 6;
+}
+message SubmitUpdateVMResponse {
+  OperationRef operation = 1;
+  ResourceRef resource = 2;
+  BindingRef binding = 3;
+  ReadCursor cursor = 4;
+}
+message SubmitDeleteVMRequest {
+  MutationIdentity identity = 1;
+  ResourceRef resource = 2;
+  string expected_revision = 3;
+  BindingRef binding = 4;
+  // DELETE or RETAIN required; unspecified is invalid.
+  DiskPolicy disk_policy = 5;
+}
+message SubmitDeleteVMResponse {
+  OperationRef operation = 1;
+  ResourceRef resource = 2;
+  BindingRef binding = 3;
+  ReadCursor cursor = 4;
+}
+message GetOperationRequest {
+  oneof lookup {
+    OperationRef operation = 1;
+    OperationRequestLookup request = 2;
+  }
+}
+
+// Authorized lookup after a lost first reply requires only binding key and
+// request ID. No saved operation/resource UID or generation is required.
+message OperationRequestLookup {
+  BindingKey binding = 1;
+  string request_id = 2;
+  optional uint64 creation_generation = 3;
+  // Optional consistency filter, not part of the request ID namespace.
+  optional string method = 4;
+}
+message GetOperationResponse {
+  Operation operation = 1;
+  ReadCursor cursor = 2;
+}
+message ListByOwnerRequest {
+  OwnerRef owner = 1;
+  uint32 page_size = 2;
+  // Opaque cursor bound to principal/cluster/project/owner/filters/snapshot.
+  // Changed scope/filter is invalid; expired snapshots return CURSOR_EXPIRED
+  // with RESTART_PAGINATION, never an empty authoritative resource set.
+  string page_token = 3;
+  // Absence defaults true, preserving retired generations for recovery.
+  optional bool include_retired = 4;
+}
+
+// Stable snapshot ordering is management_key then creation_generation then UID;
+// operation references are sorted by operation_id. Cursor.applied_sequence is
+// the authoritative snapshot sequence. Empty next_page_token means complete.
+message ListByOwnerResponse {
+  repeated Binding bindings = 1;
+  repeated OperationRef operations = 2;
+  string next_page_token = 3;
+  ReadCursor cursor = 4;
+}
+
+// Adoption requires an unowned UID, matching revision, target session authority
+// and target generation. Ownership transitions require proven quiescence at
+// admission; caller assertions are not quiescence proof.
+message AdoptResourceRequest {
+  MutationIdentity identity = 1;
+  ResourceRef resource = 2;
+  string expected_revision = 3;
+  BindingKey target = 4;
+  uint64 expected_target_generation = 5;
+}
+message AdoptResourceResponse {
+  OperationRef operation = 1;
+  ResourceRef resource = 2;
+  BindingRef binding = 3;
+  ReadCursor cursor = 4;
+}
+
+// Requires authenticated permission over both owners and current activation
+// facts for both sessions. identity.session is the source session; target_session
+// must match target. Source binding/revision and target generation are checked
+// atomically with authoritative quiescence before accepting the transition.
+message TransferOwnerRequest {
+  MutationIdentity identity = 1;
+  ResourceRef resource = 2;
+  string expected_revision = 3;
+  BindingRef source = 4;
+  BindingKey target = 5;
+  uint64 expected_target_generation = 6;
+  OwnerSession target_session = 7;
+}
+message TransferOwnerResponse {
+  OperationRef operation = 1;
+  ResourceRef resource = 2;
+  BindingRef binding = 3;
+  ReadCursor cursor = 4;
+}

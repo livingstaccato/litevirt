@@ -88,6 +88,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/auth"
 )
 
@@ -446,9 +448,9 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The daemon answered from its replica because the VM's host did not
-		// (grpcapi.InspectStaleHeader): said in a header, the body unchanged.
-		for _, n := range hdr.Get("x-litevirt-inspect-stale") {
-			w.Header().Add("X-Litevirt-Inspect-Stale", n)
+		// (apimeta.InspectStaleHeader): said in a header, the body unchanged.
+		for _, n := range hdr.Get(apimeta.InspectStaleHeader) {
+			w.Header().Add(apimeta.InspectStaleHeader, n)
 		}
 		jsonProto(w, resp)
 

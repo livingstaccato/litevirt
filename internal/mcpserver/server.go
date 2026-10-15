@@ -12,10 +12,14 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -494,13 +498,17 @@ func (s *Server) handleListVMs(ctx context.Context, args map[string]any) *mcp.Ca
 
 func (s *Server) handleInspectVM(ctx context.Context, args map[string]any) *mcp.CallToolResult {
 	name := stringArg(args, "name")
+	var hdr metadata.MD
 	out, err := s.rpc(ctx, true, func(ctx context.Context, c pb.LiteVirtClient) (any, error) {
-		return c.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
+		return c.InspectVM(ctx, &pb.InspectVMRequest{Name: name}, grpc.Header(&hdr))
 	})
 	if err != nil {
 		return s.fail(err)
 	}
-	return s.ok("vm inspected", vmDTO(out.(*pb.VM)), false)
+	vm := vmDTO(out.(*pb.VM))
+	// The daemon answered from its replica because the VM's host did not.
+	vm.StaleNote = strings.Join(hdr.Get(apimeta.InspectStaleHeader), "; ")
+	return s.ok("vm inspected", vm, false)
 }
 
 func (s *Server) handleVMStats(ctx context.Context, args map[string]any) *mcp.CallToolResult {

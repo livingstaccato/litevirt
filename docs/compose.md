@@ -165,9 +165,17 @@ removes the networks only once they are all gone; when it finishes, the stack's
 security groups, ip sets, cluster rules and backup repos go with it. A first
 `compose up` of a stack that fails before it issues any workload action removes
 the security groups, ip sets and cluster rules it had just written; the
-cluster default-deny and backup repo registrations stay. A `default-deny: true`
+cluster default-deny and backup repo registrations stay, and its error says
+when the default-deny it set stays on. A `default-deny: true`
 in a file leaves a cluster default-deny that an operator or another stack set
-as it is, owned by them. The web UI's stack **Destroy** action
+as it is, owned by them. When the stack that owns the cluster default-deny goes
+down, or is redeployed without it, the deny passes to another stack whose file
+asks for it, and is removed only when none does; while another stack's stored
+file cannot be read, it stays. A deploy asking for default-deny sets it again
+once its record is written if the cluster no longer denies, and the background
+stack reconciler sets it for a live stack whose file asks for it when the
+cluster has no default, if that stack was recorded after the default was
+removed (a redeploy that drops default-deny is not undone). The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.
@@ -1375,6 +1383,13 @@ root, so adding one, or changing an existing name's path, needs
 `storage.hostpath` at `/` (the Admin role) — the same rule as passing a custom
 absolute `repo_path` to a backup RPC. Re-deploying a stack whose repos are
 already registered by it, unchanged, needs nothing more.
+
+A repo name another stack registered is used as it is: a deploy naming it does
+not take it over or change its path (it warns when its file names a different
+one), and its `compose down` leaves it registered. When the stack that
+registered it goes down, the repo passes, at its path, to another stack whose
+file defines it or backs a workload up to it, and is unregistered only when
+none does; while another stack's stored file cannot be read, it stays.
 
 ```yaml
 backup-repos:

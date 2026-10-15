@@ -11,9 +11,21 @@ import (
 	"strconv"
 	"strings"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/apimeta"
 )
+
+// inspectVMNoted is InspectVM with the daemon's note, when it answered from
+// its replica because the VM's host did not (apimeta.InspectStaleHeader).
+func (s *Server) inspectVMNoted(ctx context.Context, name string) (*pb.VM, string, error) {
+	var hdr metadata.MD
+	vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name}, grpc.Header(&hdr))
+	return vm, strings.Join(hdr.Get(apimeta.InspectStaleHeader), "; "), err
+}
 
 func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
@@ -28,7 +40,7 @@ func (s *Server) handleVMs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ctx := s.uiBearerCtx(r)
-	vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name})
+	vm, stale, err := s.inspectVMNoted(ctx, name)
 	if err != nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
@@ -37,6 +49,7 @@ func (s *Server) handleVMDetail(w http.ResponseWriter, r *http.Request) {
 	snapshots, _ := s.grpc.ListSnapshots(ctx, &pb.ListSnapshotsRequest{VmName: name})
 	data := s.pageData(name, "vms")
 	data["VM"] = vm
+	data["InspectStale"] = stale
 	data["Hosts"] = hosts.GetHosts()
 	data["Snapshots"] = snapshots.GetSnapshots()
 	data["Backups"] = s.vmBackupManifests(name)
@@ -138,7 +151,7 @@ func hardwareTabData(name string, resp *pb.ListVMHardwareResponse) map[string]an
 // handleVMPagePartial renders header + detail (for action button responses).
 func (s *Server) handleVMPagePartial(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	vm, err := s.grpc.InspectVM(s.uiBearerCtx(r), &pb.InspectVMRequest{Name: name})
+	vm, stale, err := s.inspectVMNoted(s.uiBearerCtx(r), name)
 	if err != nil {
 		http.Error(w, "VM not found", 404)
 		return
@@ -146,7 +159,7 @@ func (s *Server) handleVMPagePartial(w http.ResponseWriter, r *http.Request) {
 	snapshots, _ := s.grpc.ListSnapshots(s.uiBearerCtx(r), &pb.ListSnapshotsRequest{VmName: name})
 	s.renderPartial(w, "vm_detail.html", "vm_page", map[string]any{
 		"VM": vm, "Snapshots": snapshots.GetSnapshots(), "Backups": s.vmBackupManifests(name),
-		"Activity": s.vmActivity(r, name), "ClusterName": s.cluster,
+		"Activity": s.vmActivity(r, name), "ClusterName": s.cluster, "InspectStale": stale,
 	})
 }
 

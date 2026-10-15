@@ -3,10 +3,14 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // stackFWFailingYAML persists its firewall and then fails the deploy: the
@@ -212,5 +216,117 @@ func TestDeployStack_FailedFirstDeployLeavesItsOwnDefaultDeny(t *testing.T) {
 	}
 	if deny, err := corrosion.ResolveDefaultDeny(ctx, s.db, ""); err != nil || !deny {
 		t.Errorf("cluster default-deny after a failed first deploy that asked for it = %v (%v), want deny kept", deny, err)
+	}
+}
+
+// Code review [2]. A first deploy whose firewall persist fails part way takes
+// back the rows it had already inserted: the security group written before
+// the ip set write failed does not outlive the failed deploy.
+//
+// Mutation: install the rollback only once the persist has succeeded — the
+// group stays, holding its name.
+func TestDeployStack_FailedFirstPersistTakesBackWhatItWrote(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if _, err := s.db.DB().ExecContext(ctx, `CREATE TRIGGER cr7_fail_ipset BEFORE INSERT ON ip_sets
+		BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	yaml := `
+name: fwpart
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+ipsets:
+  office:
+    cidrs: ["10.0.0.0/8"]
+`
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStream{ctx: ctx}); err == nil {
+		t.Fatal("fixture: the deploy succeeded although its ip set write failed")
+	}
+	if sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "fwpart"); err != nil || len(sgs) != 0 {
+		t.Errorf("security groups after a first deploy whose persist failed part way = %+v (%v), want none", sgs, err)
+	}
+}
+
+// Code review [2]. Rows a failed earlier attempt left behind, owned by a
+// stack that has no record, do not turn the rollback off for the next
+// attempt: a stack with no record has never been deployed.
+//
+// Mutation: keep the rollback only when the stack had no security groups
+// before the deploy — the second failed attempt leaves its group.
+func TestDeployStack_FailedFirstDeployAfterLeftoversTakesItsFirewallBack(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{ID: "leftover", Name: "web", StackName: "fwfail"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: stackFWFailingYAML}, &mockDeployStream{ctx: ctx}); err == nil {
+		t.Fatal("the deploy with a path-less backup repo succeeded")
+	}
+	if sgs, err := corrosion.ListSecurityGroups(ctx, s.db, "fwfail"); err != nil || len(sgs) != 0 {
+		t.Errorf("security groups after a second failed first deploy = %+v (%v), want none", sgs, err)
+	}
+}
+
+// Rereview r1-m2. A failed first deploy that left the cluster default-deny on
+// (its own row) says so in its error, and how to take it off.
+//
+// Mutation: drop the note — the error does not mention the default-deny.
+func TestDeployStack_FailedFirstDeploySaysItsDefaultDenyStays(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	yaml := stackFWFailingYAML + "firewall:\n  default-deny: true\n"
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStream{ctx: ctx})
+	if err == nil {
+		t.Fatal("the deploy with a path-less backup repo succeeded")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "default-deny") || !strings.Contains(msg, "stays on") ||
+		!strings.Contains(msg, "lv firewall default-deny off") {
+		t.Errorf("error of a failed first deploy that left its default-deny on = %q, want it to say the deny stays on and how to remove it", msg)
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("code = %v, want the deploy's own InvalidArgument kept", status.Code(err))
+	}
+}
+
+// The note is only for a default-deny the failed deploy left in force as its
+// own: an operator's deny is not this stack's to explain.
+func TestDeployStack_FailedFirstDeployDoesNotClaimAnOperatorsDeny(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	yaml := stackFWFailingYAML + "firewall:\n  default-deny: true\n"
+	err := s.DeployStack(&pb.DeployStackRequest{ComposeYaml: yaml}, &mockDeployStream{ctx: ctx})
+	if err == nil {
+		t.Fatal("the deploy with a path-less backup repo succeeded")
+	}
+	if strings.Contains(err.Error(), "stays on") {
+		t.Errorf("error = %q, claims an operator's default-deny as the deploy's", err)
+	}
+}
+
+// cr7 round 1, m5. The note keeps the error's code and status details.
+//
+// Mutation: rebuild the error from code and message — the detail is lost.
+func TestWithStackDefaultDenyNote_KeepsDetails(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	if err := corrosion.SetFirewallDefault(ctx, s.db, "cluster", true, "st"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := status.New(codes.FailedPrecondition, "boom").WithDetails(wrapperspb.String("R"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := status.Convert(s.withStackDefaultDenyNote(ctx, "st", st.Err()))
+	if got.Code() != codes.FailedPrecondition || !strings.Contains(got.Message(), "stays on") {
+		t.Fatalf("noted error = %v %q", got.Code(), got.Message())
+	}
+	if len(got.Details()) != 1 {
+		t.Errorf("details after the note = %v, want the detail kept", got.Details())
 	}
 }

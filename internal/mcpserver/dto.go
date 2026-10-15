@@ -60,6 +60,9 @@ type vmOut struct {
 	Disks       []diskOut      `json:"disks,omitempty"`
 	CreatedAt   string         `json:"created_at,omitempty"`
 	UpdatedAt   string         `json:"updated_at,omitempty"`
+	// StaleNote is set when the daemon answered an inspect from its replica
+	// because the VM's host did not answer (apimeta.InspectStaleHeader).
+	StaleNote string `json:"stale_note,omitempty"`
 }
 
 type interfaceOut struct {

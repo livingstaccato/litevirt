@@ -27,6 +27,8 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+
+	"github.com/litevirt/litevirt/internal/apimeta"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -1688,7 +1690,7 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 	// took the caller's whole deadline (drill 1 on both labs). A host that
 	// cannot be reached, or does not answer in time while the caller is still
 	// waiting, is answered for from this node's replica, and the response says
-	// so (InspectStaleHeader). Any other answer from the host stands.
+	// so (apimeta.InspectStaleHeader). Any other answer from the host stands.
 	if vm.HostName != s.hostName {
 		client, closeConn, err := s.dialPeer(ctx, vm.HostName)
 		if err == nil {
@@ -1704,7 +1706,7 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 			}
 			err = ferr
 		}
-		_ = grpc.SetHeader(ctx, metadata.Pairs(InspectStaleHeader, fmt.Sprintf(
+		_ = grpc.SetHeader(ctx, metadata.Pairs(apimeta.InspectStaleHeader, fmt.Sprintf(
 			"host %s did not answer (%s); this is the replicated record as node %s holds it, without the host's live state",
 			vm.HostName, status.Convert(err).Message(), s.hostName)))
 	}
@@ -1721,10 +1723,6 @@ func (s *Server) inspectForwardBound() time.Duration {
 	}
 	return inspectForwardTimeout
 }
-
-// InspectStaleHeader is the response header InspectVM sets when it answered
-// from this node's replica because the VM's host could not be reached.
-const InspectStaleHeader = "x-litevirt-inspect-stale"
 
 // requireVMReadByName resolves name to its VMRecord (if known locally) and
 // authorizes vm.read on its path, with the same existence-oracle protection

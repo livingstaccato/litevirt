@@ -90,7 +90,7 @@ firewall:
 	}
 
 	// Teardown removes everything.
-	if err := corrosion.DeleteStackFirewall(ctx, s.db, "webstack"); err != nil {
+	if err := corrosion.DeleteStackFirewall(ctx, s.db, "webstack", compose.StoredStackWants); err != nil {
 		t.Fatalf("DeleteStackFirewall: %v", err)
 	}
 	if sgs3, _ := corrosion.ListSecurityGroups(ctx, s.db, "webstack"); len(sgs3) != 0 {

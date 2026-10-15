@@ -59,6 +59,7 @@ type mockGRPC struct {
 	listVMsResp            *pb.ListVMsResponse
 	inspectVMResp          *pb.VM
 	inspectVMErr           error
+	inspectVMHeader        metadata.MD
 	listStacksResp         *pb.ListStacksResponse
 	listImagesResp         *pb.ListImagesResponse
 	listContainersResp     *pb.ListContainersResponse
@@ -268,10 +269,15 @@ func (m *mockGRPC) ListVMs(_ context.Context, _ *pb.ListVMsRequest, _ ...grpc.Ca
 	return m.listVMsResp, nil
 }
 
-func (m *mockGRPC) InspectVM(_ context.Context, in *pb.InspectVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {
+func (m *mockGRPC) InspectVM(_ context.Context, in *pb.InspectVMRequest, opts ...grpc.CallOption) (*pb.VM, error) {
 	m.lastInspectVMName = in.Name
 	if m.inspectVMErr != nil {
 		return nil, m.inspectVMErr
+	}
+	for _, o := range opts {
+		if h, ok := o.(grpc.HeaderCallOption); ok && m.inspectVMHeader != nil {
+			*h.HeaderAddr = m.inspectVMHeader
+		}
 	}
 	return m.inspectVMResp, nil
 }

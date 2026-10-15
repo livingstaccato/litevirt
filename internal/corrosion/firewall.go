@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -350,16 +351,64 @@ func DeleteFirewallDefault(ctx context.Context, c *Client, scope string) error {
 		`UPDATE firewall_defaults SET deleted_at = ?, updated_at = ? WHERE scope = ?`, nowRFC3339(), now, scope)
 }
 
+// EnsureClusterDefaultDeny sets the cluster default-deny, owned by stack,
+// unless a deny is already in force (whoever owns it keeps it).
+func EnsureClusterDefaultDeny(ctx context.Context, c *Client, stack string) error {
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil {
+		return err
+	}
+	if cur != nil && cur.DefaultDeny {
+		return nil
+	}
+	return SetFirewallDefault(ctx, c, "cluster", true, stack)
+}
+
+// ReassertStackDefaultDeny sets the cluster default-deny, owned by the first
+// live stack (by name) whose deployed file asks for it, when the cluster has
+// no default row at all: a stack's deploy can miss a handoff from an owner
+// that went down while it was in flight. A row an operator set either way is
+// left as it is.
+//
+// When the row was removed, only a stack whose record was written after the
+// removal counts: a stack's own redeploy dropping default-deny removes the
+// row before it records its new file, and the old file still in its record
+// must not bring the deny back.
+func ReassertStackDefaultDeny(ctx context.Context, c *Client, read StackFileWants) error {
+	rows, err := c.Query(ctx,
+		`SELECT updated_at, deleted_at FROM firewall_defaults WHERE scope = 'cluster'`)
+	if err != nil {
+		return err
+	}
+	removedAt := ""
+	if len(rows) > 0 {
+		if rows[0].String("deleted_at") == "" {
+			return nil // a live row, deny or allow: its owner's decision
+		}
+		removedAt = rows[0].String("updated_at")
+	}
+	wants, _, err := otherStackWants(ctx, c, "", read)
+	if err != nil {
+		return err
+	}
+	for _, w := range wants {
+		if w.defaultDeny && (removedAt == "" || lwwOrder(removedAt, w.updatedAt) < 0) {
+			return SetFirewallDefault(ctx, c, "cluster", true, w.name)
+		}
+	}
+	return nil
+}
+
 // ── Stack teardown ───────────────────────────────────────────────────────────
 
 // DeleteStackFirewall tombstones every firewall row a compose stack created:
 // its security groups (+ their rules), ip sets, cluster/host tier rules, and
 // any default-deny policy it set. Called from `compose down`.
-func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
+func DeleteStackFirewall(ctx context.Context, c *Client, stack string, read StackFileWants) error {
 	if err := DeleteStackFirewallRows(ctx, c, stack); err != nil {
 		return err
 	}
-	return DeleteStackFirewallDefaults(ctx, c, stack)
+	return DeleteStackFirewallDefaults(ctx, c, stack, read)
 }
 
 // DeleteStackFirewallDefaults tombstones the firewall_defaults rows a stack
@@ -367,9 +416,41 @@ func DeleteStackFirewall(ctx context.Context, c *Client, stack string) error {
 // are written, and only when the new config drops default-deny, so a
 // redeploy that fails part way never leaves the cluster default-allow
 // (switch re-review 2, R1).
-func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string) error {
+//
+// The cluster default is one row, owned by the stack that set it; another
+// stack asking for deny while it is in force leaves it as it is. So when
+// another live stack's file asks for default-deny, the row is handed to that
+// stack (the first by name) rather than removed, and while any live stack's
+// file cannot be read the row is kept: it may ask for deny, and a deny
+// removed in error fails the cluster open.
+func DeleteStackFirewallDefaults(ctx context.Context, c *Client, stack string, read StackFileWants) error {
 	if stack == "" {
 		return nil
+	}
+	cur, err := GetFirewallDefault(ctx, c, "cluster")
+	if err != nil {
+		return err
+	}
+	if cur != nil && cur.DefaultDeny && cur.StackName == stack {
+		others, unreadable, err := otherStackWants(ctx, c, stack, read)
+		if err != nil {
+			return err
+		}
+		handed := false
+		for _, o := range others {
+			if o.defaultDeny {
+				if err := SetFirewallDefault(ctx, c, "cluster", true, o.name); err != nil {
+					return err
+				}
+				handed = true
+				break
+			}
+		}
+		if !handed && len(unreadable) > 0 {
+			slog.Warn("stack teardown: the cluster default-deny stays, owned by the stack: the compose files of other stacks cannot be read, and one may ask for it",
+				"stack", stack, "unreadable", unreadable)
+			return nil
+		}
 	}
 	now := c.NowTS()
 	wall := nowRFC3339()

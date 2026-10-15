@@ -6,6 +6,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -74,6 +75,13 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 
 	for _, stack := range stacks {
 		r.reconcileStack(ctx, stack)
+	}
+
+	// A live stack that asks for the cluster default-deny gets it back when
+	// the cluster has none, e.g. after its owner went down while this
+	// stack's deploy was in flight.
+	if err := corrosion.ReassertStackDefaultDeny(ctx, r.db, compose.StoredStackWants); err != nil {
+		slog.Warn("stack-reconciler: re-assert the cluster default-deny a stack asks for", "error", err)
 	}
 }
 
@@ -170,11 +178,11 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	// DeleteStack that completes; left behind, a security group holds its name
 	// against the next deploy of the same file. A failure keeps the stack
 	// 'deleting', so the next pass retries.
-	if err := corrosion.DeleteStackFirewall(ctx, r.db, stack.Name); err != nil {
+	if err := corrosion.DeleteStackFirewall(ctx, r.db, stack.Name, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: tombstone the stack's firewall failed, will retry", "stack", stack.Name, "error", err)
 		return
 	}
-	if err := corrosion.DeleteStackBackupRepos(ctx, r.db, stack.Name); err != nil {
+	if err := corrosion.DeleteStackBackupRepos(ctx, r.db, stack.Name, compose.StoredStackWants); err != nil {
 		slog.Warn("stack-reconciler: unregister the stack's backup repos failed, will retry", "stack", stack.Name, "error", err)
 		return
 	}

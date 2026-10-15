@@ -29,7 +29,7 @@ func TestBackupRepoCRUD(t *testing.T) {
 		t.Fatalf("unknown repo resolved to %q, want empty", p)
 	}
 	// Stack teardown removes it.
-	if err := DeleteStackBackupRepos(ctx, c, "s1"); err != nil {
+	if err := DeleteStackBackupRepos(ctx, c, "s1", nil); err != nil {
 		t.Fatalf("delete stack repos: %v", err)
 	}
 	if repos, _ := ListBackupRepos(ctx, c); len(repos) != 0 {

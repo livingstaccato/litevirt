@@ -15,8 +15,9 @@ import (
 // spec [A(n1, ip X), B(n2)]. A is hot-detached (its row goes) and C is
 // attached on n1 (it takes ordinal 1, len([B]), and the n1 row). A rebuilt
 // seed must not give C A's address: C's row is at another position than A's
-// spec entry, so A is unresolved and the seed carries no network-config.
-// Before the detach, the same spec resolves by position and gives A X.
+// spec entry, so C has no entry and asks DHCP, and A, whose position holds no
+// live row, is left out. Before the detach, the same spec resolves by
+// position and gives A X.
 //
 // Mutation: match a MAC-less NIC to the one row on its network (the removed
 // by-network fallback) — C is written with X; drop the position match — the
@@ -67,8 +68,11 @@ func TestSeedNetworkConfig_HotAttachedNICIsNotTheDetachedOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "" {
-		t.Errorf("the hot-attached NIC was matched to the detached NIC's entry; want no network-config, got:\n%s", got)
+	if strings.Contains(got, "10.1.0.50") || strings.Contains(got, "52:54:00:00:0a:0a") {
+		t.Errorf("the hot-attached NIC was matched to the detached NIC's entry, or A is still there:\n%s", got)
+	}
+	if !strings.Contains(got, "macaddress: \"52:54:00:00:0c:0c\"\n    set-name: eth1\n    dhcp4: true\n") {
+		t.Errorf("the hot-attached NIC is not written as asking DHCP:\n%s", got)
 	}
 }
 

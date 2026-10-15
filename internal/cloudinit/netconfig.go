@@ -54,7 +54,8 @@ func NetworkConfig(nics []NIC) string {
 			// to configure.
 			dhcp := n.Net == nil || !n.Net.HostIsolation
 			guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, DHCP: dhcp,
-				DHCP6: dhcp && (n.Net == nil || n.Net.Subnet == "" || subnetIsIPv6(n.Net.Subnet))})
+				DHCP6:    dhcp && (n.Net == nil || n.Net.Subnet == "" || subnetIsIPv6(n.Net.Subnet)),
+				NoRoutes: noRouter(n.Net)})
 			continue
 		}
 		address, gateway := StaticAddress(ip, n.Gateway, n.Net)
@@ -75,9 +76,17 @@ func NetworkConfig(nics []NIC) string {
 		guest = append(guest, GuestNIC{Ordinal: n.Ordinal, MAC: n.MAC, Static: &StaticIface{
 			MAC: n.MAC, Address: address, Gateway: gateway, DNS: dns,
 			Address6: address6, Gateway6: n.IPv6Gateway,
-		}})
+		}, NoRoutes: n.Gateway == "" && noRouter(n.Net)})
 	}
 	return GuestNetworkConfig(guest)
+}
+
+// noRouter reports whether def is a network with no router: an isolated
+// network, a host-local bridge with no uplink. Its dnsmasq still hands out
+// the bridge's address as a router, which a guest must not take as a default
+// route beside its other NICs.
+func noRouter(def *compose.NetworkDef) bool {
+	return def != nil && def.Type == "isolated"
 }
 
 func subnetIsIPv6(subnet string) bool {
@@ -114,6 +123,12 @@ type GuestNIC struct {
 	// DHCP6: the NIC also asks DHCPv6 — its network has an IPv6 subnet, or
 	// litevirt has no record of the network.
 	DHCP6 bool
+	// NoRoutes: the NIC's network has no router (an isolated network). In a
+	// V2 document a DHCP NIC takes no route from its lease (use-routes:
+	// false), and a static one whose spec names no `gateway:` gets no default
+	// route (the subnet's first host is the host's bridge, not a router). The
+	// V1 document, written for a VM whose NICs are all static, is as it was.
+	NoRoutes bool
 }
 
 // GuestNetworkConfig is the network-config for nics, "" for none.
@@ -153,8 +168,9 @@ func GuestNetworkConfig(nics []GuestNIC) string {
 //
 // A DHCP NIC asks IPv4, and IPv6 where its network has an IPv6 subnet. Every
 // route a NIC brings — a DHCP lease's or a static gateway's — has metric 100
-// plus the NIC's ordinal. Every DHCP NIC but the first NIC written is
-// optional.
+// plus the NIC's ordinal; a DHCP NIC on a network with no router takes none
+// from its lease (use-routes: false). Every DHCP NIC but the first NIC written
+// is optional.
 func guestNetworkConfigV2(nics []GuestNIC) string {
 	var b strings.Builder
 	b.WriteString("version: 2\nethernets:\n")
@@ -167,9 +183,13 @@ func guestNetworkConfigV2(nics []GuestNIC) string {
 		first = false
 		fmt.Fprintf(&b, "  eth%d:\n    match:\n      macaddress: %q\n    set-name: eth%d\n", n.Ordinal, n.MAC, n.Ordinal)
 		if n.DHCP {
-			fmt.Fprintf(&b, "    dhcp4: true\n    dhcp4-overrides:\n      route-metric: %d\n", 100+n.Ordinal)
+			noRoutes := ""
+			if n.NoRoutes {
+				noRoutes = "      use-routes: false\n"
+			}
+			fmt.Fprintf(&b, "    dhcp4: true\n    dhcp4-overrides:\n      route-metric: %d\n%s", 100+n.Ordinal, noRoutes)
 			if n.DHCP6 {
-				fmt.Fprintf(&b, "    dhcp6: true\n    dhcp6-overrides:\n      route-metric: %d\n", 100+n.Ordinal)
+				fmt.Fprintf(&b, "    dhcp6: true\n    dhcp6-overrides:\n      route-metric: %d\n%s", 100+n.Ordinal, noRoutes)
 			}
 			if optional {
 				b.WriteString("    optional: true\n")
@@ -185,7 +205,7 @@ func guestNetworkConfigV2(nics []GuestNIC) string {
 			fmt.Fprintf(&b, "      - %s\n", s.Address6)
 		}
 		var routes []string
-		if s.Address != "" && s.Gateway != "" {
+		if s.Address != "" && s.Gateway != "" && !n.NoRoutes {
 			// Address is the NIC's `ip:`, which may itself be IPv6.
 			to := "0.0.0.0/0"
 			if strings.Contains(s.Address, ":") {

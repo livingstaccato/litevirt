@@ -348,14 +348,15 @@ func TestCreateVM_SeedIsRebuiltAlike(t *testing.T) {
 	}
 }
 
-// Re-review R1-I1: a spec NIC whose MAC neither the spec nor the NIC rows
-// tell (here one the rows do not have) cannot be matched in the guest: the
-// rebuilt seed carries no network-config at all — the pre-branch rebuild,
-// cloud-init's fallback — and never an entry with an empty MAC.
+// Re-review R1-I1: a spec NIC that the NIC rows do not have (here one with
+// no MAC and no row at its position) is not one of the VM's NICs — a hot
+// detach leaves exactly that — and the rebuilt seed leaves it out. It never
+// writes an entry with an empty MAC.
 //
-// Mutation: drop the empty-MAC guard from cloudinit.NetworkConfig — the
-// document carries `macaddress: ""`.
-func TestSeedNetworkConfig_UnresolvableMACWritesNone(t *testing.T) {
+// Mutation: write every spec entry, with the MAC its row gives or none — the
+// document carries `macaddress: ""`, or (with the empty-MAC guard of
+// cloudinit.NetworkConfig) no network-config at all.
+func TestSeedNetworkConfig_SpecNICWithNoRowIsLeftOut(t *testing.T) {
 	s := netcfgServer(t, map[string]compose.NetworkDef{"brnet": defBridgeDHCP, "hinet": defHostIsolated})
 	createSeeded(t, s, "m",
 		&pb.NetworkAttachment{Name: "brnet", Model: "virtio", Mac: "52:54:00:00:14:01"},
@@ -366,8 +367,9 @@ func TestSeedNetworkConfig_UnresolvableMACWritesNone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "" {
-		t.Errorf("an unresolvable NIC: want no network-config, got:\n%s", got)
+	if strings.Contains(got, `macaddress: ""`) || strings.Count(got, "macaddress:") != 2 ||
+		!strings.Contains(got, "52:54:00:00:14:01") || !strings.Contains(got, "52:54:00:00:14:02") {
+		t.Errorf("want exactly the VM's 2 NICs, by MAC, got:\n%s", got)
 	}
 }
 

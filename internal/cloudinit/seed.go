@@ -13,11 +13,20 @@ import (
 )
 
 // SeedNetworkConfig is the network-config of vm's seed, derived from what the
-// cluster records: the spec's NIC entries, the VM's NIC rows (the address a
-// NetBox claim or a host-isolated pick gave each), and each network's
-// definition. A rebuild of the seed on another host — failover, migration —
-// therefore writes the document the VM was created with. A network-config the
-// spec names wins, as at create.
+// cluster records: the VM's live NICs (the vm_nics/vm_interfaces overlay that
+// create, attach and detach maintain on every cluster, MergedVMNICs), the
+// spec's entry for each, the address each NIC row records (a NetBox claim or
+// a host-isolated pick), and each network's definition. A rebuild of the seed
+// — after a hot attach or detach, on failover, on migration — therefore lists
+// exactly the NICs the VM has: a detached NIC, its MAC and its address are
+// gone, an attached one is there. A network-config the spec names wins, as at
+// create.
+//
+// The NICs are written in ordinal order, MAC breaking a tie, and named
+// eth<position> in that order: a NIC attached after a detach can share its
+// ordinal with one that stayed. For a VM no NIC was attached to or detached
+// from, position is ordinal is spec index, so the document is the one create
+// wrote.
 func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string, spec *pb.VMSpec) (string, error) {
 	if spec == nil {
 		return "", nil
@@ -25,70 +34,87 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 	if spec.CloudInit != nil && spec.CloudInit.Networkconfig != "" {
 		return spec.CloudInit.Networkconfig, nil
 	}
-	rows, err := corrosion.GetVMInterfaces(ctx, db, vmName)
+	rows, err := corrosion.MergedVMNICs(ctx, db, vmName)
 	if err != nil {
 		return "", fmt.Errorf("read NICs of %q: %w", vmName, err)
 	}
-	// Each spec NIC's row: by MAC where the spec records one. A VM created
-	// before the spec recorded generated MACs has none, and takes the row at
-	// its position on its network — (ordinal, network), as matchStoredNIC and
-	// NICRate match a spec NIC to its row; every create path writes a NIC's
-	// ordinal as its spec index. An entry that names an `ip:` takes that row only
-	// when the row records the same IPv4 address, which every create path wrote
-	// from the spec. Nothing else: after a hot detach and attach a row on the
-	// same network is another NIC. A NIC whose row cannot be told has no MAC,
-	// and NetworkConfig then writes no network-config.
+	// Each live NIC's spec entry: the one that records its MAC. A VM created
+	// before the spec recorded generated MACs has none, and its entry is the
+	// one at the NIC's position on its network — (ordinal, network), as
+	// matchStoredNIC and NICRate match a spec NIC to its row; every create
+	// path writes a NIC's ordinal as its spec index, and nothing changes it.
+	// An entry that names an `ip:` takes that row only when the row records
+	// the same IPv4 address, which every create path wrote from the spec.
+	// Nothing else: after a hot detach and attach a row on the same network
+	// is another NIC. A NIC with no entry was hot-attached: it is written
+	// from its row and network alone.
+	//
+	// A MAC-less entry whose position holds a live row no entry took (one
+	// that records another address) cannot be told from that row, and the
+	// seed then carries no network-config. An entry whose position holds no
+	// live row was detached and is left out.
 	type pos struct {
 		ordinal int
 		network string
 	}
-	byMAC := map[string]corrosion.InterfaceRecord{}
-	byPos := map[pos]corrosion.InterfaceRecord{}
-	for _, r := range rows {
-		byMAC[strings.ToLower(r.MAC)] = r
-		byPos[pos{r.Ordinal, r.NetworkName}] = r
-	}
-	// A row is one NIC's: one another spec NIC already took is not taken
-	// again.
-	macs := make([]string, len(spec.Network))
-	taken := map[string]bool{}
+	entryByMAC := map[string]int{}
 	for i, n := range spec.Network {
 		if m := strings.ToLower(strings.TrimSpace(n.GetMac())); m != "" {
-			macs[i] = m
-			taken[m] = true
+			entryByMAC[m] = i
 		}
 	}
-	for i, n := range spec.Network {
-		if macs[i] != "" {
+	used := make([]bool, len(spec.Network))
+	entryOf := make([]int, len(rows))
+	for k, r := range rows {
+		entryOf[k] = -1
+		if i, ok := entryByMAC[strings.ToLower(r.MAC)]; ok && !used[i] {
+			entryOf[k], used[i] = i, true
+		}
+	}
+	for k, r := range rows {
+		if entryOf[k] >= 0 {
 			continue
 		}
-		if r, ok := byPos[pos{i, n.GetName()}]; ok && !taken[strings.ToLower(r.MAC)] &&
+		i := r.Ordinal
+		if i < 0 || i >= len(spec.Network) || used[i] {
+			continue
+		}
+		if n := spec.Network[i]; strings.TrimSpace(n.GetMac()) == "" && n.GetName() == r.NetworkName &&
 			(n.GetIp() == "" || sameAddr(r.IP, n.GetIp())) {
-			macs[i] = strings.ToLower(r.MAC)
-			taken[macs[i]] = true
+			entryOf[k], used[i] = i, true
 		}
 	}
-	nics := make([]NIC, 0, len(spec.Network))
-	for i, n := range spec.Network {
-		mac := strings.TrimSpace(n.GetMac())
-		if mac == "" {
-			mac = macs[i]
+	unmatched := map[pos]bool{}
+	for k, r := range rows {
+		if entryOf[k] < 0 {
+			unmatched[pos{r.Ordinal, r.NetworkName}] = true
 		}
-		row := byMAC[strings.ToLower(mac)]
-		def, err := NetworkDef(ctx, db, n.GetName())
+	}
+	for i, n := range spec.Network {
+		if !used[i] && strings.TrimSpace(n.GetMac()) == "" && unmatched[pos{i, n.GetName()}] {
+			return "", nil
+		}
+	}
+	nics := make([]NIC, 0, len(rows))
+	for k, r := range rows {
+		n := &pb.NetworkAttachment{}
+		if entryOf[k] >= 0 {
+			n = spec.Network[entryOf[k]]
+		}
+		def, err := NetworkDef(ctx, db, r.NetworkName)
 		if err != nil {
 			return "", err
 		}
 		bound := false
-		if b, err := corrosion.GetBindingByNetwork(ctx, db, n.GetName()); err != nil {
-			return "", fmt.Errorf("read binding of %q: %w", n.GetName(), err)
+		if b, err := corrosion.GetBindingByNetwork(ctx, db, r.NetworkName); err != nil {
+			return "", fmt.Errorf("read binding of %q: %w", r.NetworkName, err)
 		} else if b != nil {
 			bound = true
 		}
 		nics = append(nics, NIC{
-			Ordinal: i, MAC: mac,
+			Ordinal: k, MAC: r.MAC,
 			IP: n.GetIp(), Gateway: n.GetGateway(), IPv6: n.GetIpv6(), IPv6Gateway: n.GetIpv6Gateway(),
-			RecordedIP: row.IP,
+			RecordedIP: r.IP,
 			Net:        def, Bound: bound,
 		})
 	}

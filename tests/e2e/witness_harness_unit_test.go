@@ -122,3 +122,28 @@ func TestHoldersBetween(t *testing.T) {
 		t.Errorf("one holder throughout: got %v", got)
 	}
 }
+
+// TestTenureAt judges a proof against the tenure in force when it was minted,
+// not against a later one.
+func TestTenureAt(t *testing.T) {
+	t0 := time.Date(2026, 10, 15, 10, 0, 0, 0, time.UTC)
+	h := []leaseChange{
+		{At: t0, Holder: "node-2", Term: 7},
+		{At: t0.Add(40 * time.Second), Holder: "node-3", Term: 8},
+	}
+	if _, ok := tenureAt(h, t0.Add(20*time.Second), "node-2", 7); !ok {
+		t.Errorf("a proof minted at term 7 before the takeover was refused")
+	}
+	if _, ok := tenureAt(h, t0.Add(60*time.Second), "node-2", 7); ok {
+		t.Errorf("a proof minted at term 7 after node-3 took term 8 was accepted")
+	}
+	if _, ok := tenureAt(h, t0.Add(39*time.Second), "node-2", 7); !ok {
+		t.Errorf("a proof minted a second before a sampled takeover was refused")
+	}
+	if _, ok := tenureAt(h, t0.Add(20*time.Second), "node-3", 7); ok {
+		t.Errorf("the wrong holder was accepted")
+	}
+	if _, ok := tenureAt(h, t0.Add(-time.Minute), "node-2", 7); ok {
+		t.Errorf("a proof before any sample was accepted")
+	}
+}

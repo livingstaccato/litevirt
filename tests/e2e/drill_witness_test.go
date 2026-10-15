@@ -23,9 +23,10 @@ import (
 // (requireWitnessTopology: five workers voting, one witness outside them that
 // does not vote, the tokens latched) and skips, saying why, when it is not.
 // Every fault registers its undo before it goes in; every drill samples where
-// each workload executes once a second (startSampler) and ends with
-// assertNeverTwice. Log lines and condition codes asserted here are quoted
-// from the code at 03fe9868, with their file:line.
+// each workload executes once a second and checks assertNeverTwice over every
+// sample in a cleanup, however it ends (startCheckedSampler). Log lines and
+// condition codes asserted here are quoted from the code at 03fe9868, with
+// their file:line.
 
 // TestDrillW1_WitnessBridgedStall is scenarios 1, 2 and 6.2 of the design: on a
 // DERIVED voter set (lv cluster voter reset), a victim the majority cannot
@@ -63,10 +64,17 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 	w := l.requireWitnessTopology(l.hosts[0])
 	V, B, M, W := l.hosts[0], l.hosts[1], l.hosts[2:], w.witness
 	q := M[0]
-	l.requireBestEffort(q, V, B)
+	// V and B must be on best-effort, whose failed power-off is a self-pause;
+	// restore puts their baseline strategies back.
+	for _, h := range []string{V, B} {
+		if !bestEffort(l.fenceStrategy(q, h)) {
+			l.setStrategy(q, h, "best-effort")
+		}
+	}
 	mp := mailpitFromEnv()
-	if !l.mailpitReachable(q, mp) {
-		t.Skipf("Mailpit does not answer at %s from %s (set E2E_MAILPIT): the stall notification cannot be checked", mp.api, q)
+	mail := l.mailpitReachable(q, mp)
+	if !mail {
+		l.mark("w1: Mailpit does not answer at %s from %s (E2E_MAILPIT); the stall notification is not checked", mp.api, q)
 	}
 	test := l.createVMsWhereRoom(q, "w1", V)[V]
 	if test == "" {
@@ -75,13 +83,15 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 	key := "vm/" + test
 	keys := []string{key}
 	vrec := l.vms(q)[test]
-	l.addMailpitRoute(q, mp, notify.KindHostRecoveryStalled)
+	if mail {
+		l.addMailpitRoute(q, mp, notify.KindHostRecoveryStalled)
+	}
 	gen := l.voterReset(q)
 	time.Sleep(capRefreshWait)
 	l.mark("w1: V=%s B=%s M=%v W=%s, derived voter set at generation %d, test VM %s", V, B, M, W, gen, test)
 
 	since := l.nodeNow(q)
-	s := l.startSampler()
+	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, V)
 	lw := l.watchLease(l.allBut(V))
 	others := l.allBut(V)
@@ -133,7 +143,7 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 
 	// ── P1: the deadline form, bridged by the witness ───────────────────────
 	tP1 := l.cutEdges([2]string{V, B})
-	decider, ql, ok := l.waitLogLine(others, since, journalPair("host exceeded failure threshold", "host", V), time.Time{}, nil, 90*time.Second)
+	decider, ql, ok := l.waitLogLine(others, since, journalPair("host exceeded failure threshold", "host", V), tP1.Add(-clockSlack), nil, 90*time.Second)
 	if !ok {
 		t.Fatalf("P1: no coordinator reached a fence quorum for %s within 90 s of cutting it from %s (coordinator.go:1155)", V, B)
 	}
@@ -171,12 +181,14 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 			t.Errorf("P1: the stall alert's reason does not name the remedy 'lv host fence-confirm %s': %s", V, sl.Text)
 		}
 	}
-	if subj, ok := l.mailpitWait(q, mp, notify.KindHostRecoveryStalled+" "+V, tP1, 90*time.Second); !ok {
+	if !mail {
+		l.mark("w1: P1 notification not checked (no Mailpit)")
+	} else if subj, ok := l.mailpitWait(q, mp, notify.KindHostRecoveryStalled+" "+V, tP1, 90*time.Second); !ok {
 		t.Errorf("P1: Mailpit never received %s %s", notify.KindHostRecoveryStalled, V)
 	} else if !strings.Contains(subj, "error: "+notify.KindHostRecoveryStalled+" "+V) {
 		t.Errorf("P1: notification subject %q, want it to contain %q", subj, "error: "+notify.KindHostRecoveryStalled+" "+V)
 	}
-	l.requireFenceConfirmRefused(q, V, "Power it off first", W)
+	l.requireFenceConfirmRefused(q, W, V, "Power it off first", W)
 	time.Sleep(time.Until(tP1.Add(4 * time.Minute)))
 	l.mark("w1: P1 held 4 minutes")
 	if ps := l.proofsSince(q, "vm", test, since); len(ps) > 0 {
@@ -248,6 +260,9 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 		t.Errorf("P2: no '%s resolved' line for %s with reason 'the partition-pause deadline went ahead' (bridged_stall.go:246)", condBridged, V)
 	}
 	recovered := time.Now()
+	if at, ok := recAt[key]; ok {
+		recovered = at
+	}
 
 	// ── heal and settle ─────────────────────────────────────────────────────
 	healed := l.heal()
@@ -278,8 +293,7 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 	if err := l.voterInit(q, b.allVoters); err != nil {
 		t.Errorf("voter init back to %v: %v", b.allVoters, err)
 	}
-	s.Stop()
-	assertNeverTwice(t, s.snapshot())
+	s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertNoDualRun(t, l, q, since, healed)
 }
 
@@ -337,7 +351,7 @@ func TestDrillW3_LeaseChurnDuringAPausedManualHold(t *testing.T) {
 	}
 
 	since := l.nodeNow(q)
-	s := l.startSampler()
+	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, V)
 	lw := l.watchLease(others)
 	start, _ := l.partition([]string{V}, l.hosts[1:])
@@ -461,7 +475,8 @@ func TestDrillW3_LeaseChurnDuringAPausedManualHold(t *testing.T) {
 				t.Errorf("regain: %s re-alerted %v after retaking the lease; want within 2 polls + 5 s (a fresh tenure re-derives the stall clock from the old fence row)", regain, d.Round(time.Second))
 			}
 			if gap := again.At.Sub(prev.At); gap >= recoveryStallRepeat {
-				t.Errorf("regain: %v between %s's two stall alerts; the discriminating case needs < %v", gap, regain, recoveryStallRepeat)
+				l.mark("regain: %v between %s's two stall alerts, not under %v: this regain cannot discriminate", gap.Round(time.Second), regain, recoveryStallRepeat)
+				regain = "" // inconclusive, as no regain is
 			} else {
 				l.mark("regain: %s re-alerted %v after its previous alert (< %v: forgetEpisodes cleared stallAlerted)", regain, gap.Round(time.Second), recoveryStallRepeat)
 			}
@@ -491,10 +506,9 @@ func TestDrillW3_LeaseChurnDuringAPausedManualHold(t *testing.T) {
 	l.waitAllActive(via(), 6*time.Minute)
 	time.Sleep(returnWatch)
 	assertExactlyOnceNow(t, s, keys)
-	s.Stop()
-	assertNeverTwice(t, s.snapshot())
+	s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	if regain == "" && !t.Failed() {
-		t.Skipf("inconclusive: no node took the lease back in the same process within 6 rounds (holders %v); the regain reset was not exercised", lw.holders())
+		t.Skipf("inconclusive: no discriminating regain (a node retaking the lease in the same process within 10 min of its last alert) in 6 rounds (holders %v); the regain reset was not exercised", lw.holders())
 	}
 }
 
@@ -539,7 +553,7 @@ func (l *lab) w4Begin(prefix string, watch time.Duration) w4Setup {
 	time.Sleep(capRefreshWait)
 	l.mark("%s: owner %s (best-effort, partition_pause off), keep %s", prefix, w.owner, w.keep)
 	w.since = l.nodeNow(w.q)
-	w.s = l.startSampler()
+	w.s = l.startCheckedSampler()
 	waitAllAt(l.t, w.s, []string{w.key}, w.owner)
 	w.decider, _ = l.ownerReachableClaimRefusal(w.owner, w.keep, w.since, watch)
 	return w
@@ -728,8 +742,7 @@ func TestDrillW4a_PartialAcceptAdoptedAfterALeaseChange(t *testing.T) {
 	l.waitNoOwnershipConditions(v3, 6*time.Minute)
 	time.Sleep(returnWatch)
 	assertExactlyOnceNow(t, w.s, []string{w.key})
-	w.s.Stop()
-	assertNeverTwice(t, w.s.snapshot())
+	w.s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertOneDestination(t, w.s.snapshot(), []string{w.key})
 }
 
@@ -814,8 +827,7 @@ func TestDrillW4b_ClaimRetryOwedToTheLastOutage(t *testing.T) {
 	l.waitNoOwnershipConditions(via, 6*time.Minute)
 	time.Sleep(returnWatch)
 	assertExactlyOnceNow(t, w.s, []string{w.key})
-	w.s.Stop()
-	assertNeverTwice(t, w.s.snapshot())
+	w.s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertOneDestination(t, w.s.snapshot(), []string{w.key})
 }
 
@@ -864,7 +876,8 @@ func (l *lab) sub(t *testing.T, name string, fn func()) bool {
 	return t.Run(name, func(st *testing.T) {
 		prev := l.t
 		l.t = st
-		defer func() { l.t = prev }()
+		l.logT.Store(st)
+		defer func() { l.t = prev; l.logT.Store(prev) }()
 		fn()
 	})
 }
@@ -883,6 +896,7 @@ func (l *lab) w5Begin(used []string) (v, q string) {
 			l.t.Skipf("%s is %s: the lab is not back at rest from the previous subtest", h, states[h])
 		}
 	}
+	l.requireClocksManageable(l.hosts...)
 	l.t.Cleanup(func() {
 		l.clearDrops(append(append([]string{}, l.hosts...), l.outsiders...)...)
 		if via := l.liveHost(); via != "" {
@@ -930,7 +944,7 @@ func (l *lab) w5HolderBack(used []string) string {
 	}
 	keys := []string{"vm/" + test}
 	since := l.nodeNow(q)
-	s := l.startSampler()
+	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, v)
 	lw := l.watchLease(l.allBut(v))
 	start, _ := l.partition([]string{v}, l.except(v))
@@ -949,7 +963,6 @@ func (l *lab) w5HolderBack(used []string) string {
 	if !recovered {
 		t.Errorf("%s not recovered within %v of isolating %s\n  %s", keys[0], recoverBy, v, s.last())
 	}
-	termNow := l.leaseTerm(q, "failover")
 	if recovered {
 		if d := at.Sub(start); d < earliestReplacement(l.total) {
 			t.Errorf("%s replacement at +%v, before (F−1)·P + W = %v", keys[0], d, earliestReplacement(l.total))
@@ -969,17 +982,41 @@ func (l *lab) w5HolderBack(used []string) string {
 			break
 		}
 	}
+	// h's clock runs 20 s behind until restoreClock: a time h wrote (a proof's
+	// created_at, a journal line) is that much behind this machine's.
+	skew := func(coordinator string, at time.Time) time.Time {
+		if coordinator == h && at.Add(20*time.Second).After(stepAt) {
+			return at.Add(20 * time.Second)
+		}
+		return at
+	}
 	ps := l.waitProofs(q, "vm", test, since, 1, time.Minute)
+	var minted leaseChange
 	if len(ps) != 1 {
 		t.Errorf("%d recovery proofs for %s, want 1: %+v", len(ps), test, ps)
-	} else if ps[0].LeaseTerm != termNow {
-		t.Errorf("the proof was minted at lease term %d by %s; the newest term is %d", ps[0].LeaseTerm, ps[0].Coordinator, termNow)
+	} else if created, ok := corrosion.ParseUpdatedAt(ps[0].Created); !ok {
+		t.Errorf("proof %s has an unreadable created_at %q", ps[0].ID, ps[0].Created)
+	} else {
+		// Judged against the tenure it was minted in, not the newest term: the
+		// skewed holder is expected to lose the lease after minting.
+		var ok bool
+		minted, ok = tenureAt(lw.history(), skew(ps[0].Coordinator, created), ps[0].Coordinator, ps[0].LeaseTerm)
+		if !ok {
+			t.Errorf("proof %s was minted by %s at term %d at %s, but the lease then was %+v (history %+v)", ps[0].ID, ps[0].Coordinator, ps[0].LeaseTerm, ps[0].Created, minted, lw.history())
+		}
 	}
-	if j := strings.TrimSpace(l.journalSince(h, hSince, "lease lost, unshown or renewed as a new tenure mid-cycle, aborting")); j != "" {
-		l.mark("w5a: %s lost the lease mid-cycle:\n%s", h, j)
+	for _, ln := range l.journalLines(h, hSince, "lease lost, unshown or renewed as a new tenure mid-cycle, aborting") {
+		l.mark("w5a: %s lost the lease mid-cycle: %s", h, ln.Text)
+		lostAt := skew(h, ln.At)
 		for _, p := range ps {
-			if p.Coordinator == h && p.LeaseTerm < termNow {
-				t.Errorf("%s minted %s under its stale term %d after losing the lease", h, p.ID, p.LeaseTerm)
+			created, ok := corrosion.ParseUpdatedAt(p.Created)
+			if !ok || p.Coordinator != h || skew(h, created).Before(lostAt) {
+				continue
+			}
+			// A proof h minted after losing the lease must rest on a tenure h
+			// took afresh after the loss.
+			if minted.Holder != h || minted.At.Before(lostAt.Add(-clockSlack)) {
+				t.Errorf("%s minted %s at term %d after losing the lease at %s, under no tenure taken since", h, p.ID, p.LeaseTerm, lostAt.UTC().Format("15:04:05"))
 			}
 		}
 	}
@@ -990,8 +1027,7 @@ func (l *lab) w5HolderBack(used []string) string {
 	}
 	time.Sleep(30 * time.Second)
 	l.w5Settle(s, v, keys)
-	s.Stop()
-	assertNeverTwice(t, s.snapshot())
+	s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertOneDestination(t, s.snapshot(), keys)
 	return v
 }
@@ -1016,7 +1052,7 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	}
 	keys := []string{"vm/" + test}
 	since := l.nodeNow(q)
-	s := l.startSampler()
+	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, v)
 	start, _ := l.partition([]string{v}, l.except(v))
 	time.Sleep(time.Until(start.Add(3 * time.Second)))
@@ -1061,8 +1097,7 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 		time.Sleep(30 * time.Second)
 	}
 	l.w5Settle(s, v, keys)
-	s.Stop()
-	assertNeverTwice(t, s.snapshot())
+	s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertOneDestination(t, s.snapshot(), keys)
 	return v
 }
@@ -1078,7 +1113,7 @@ func (l *lab) w5VictimBackBridged(w witnessTopology, mp mailpit, mail bool, used
 	key := "vm/" + test
 	keys := []string{key}
 	since := l.nodeNow(q)
-	s := l.startSampler()
+	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, v)
 	others := l.allBut(v)
 	l.stepClock(v, -60*time.Second)
@@ -1132,11 +1167,13 @@ func (l *lab) w5VictimBackBridged(w witnessTopology, mp mailpit, mail bool, used
 	if ps := l.waitProofs(q, "vm", test, since, 1, time.Minute); len(ps) != 1 {
 		t.Errorf("%d recovery proofs for %s, want 1: %+v", len(ps), test, ps)
 	}
-	l.w5Settle(s, v, keys)
+	// Restored while v is still isolated: healed with its clock 60 s behind,
+	// its LWW writes would lose to every peer's through the settle. The
+	// forward step's local stall is harmless here.
 	l.restoreClock(v)
 	time.Sleep(30 * time.Second)
-	s.Stop()
-	assertNeverTwice(t, s.snapshot())
+	l.w5Settle(s, v, keys)
+	s.Stop() // the exactly-once check runs in startCheckedSampler's cleanup
 	assertOneDestination(t, s.snapshot(), keys)
 }
 
@@ -1177,6 +1214,33 @@ func (l *lab) waitProofs(via, kind, name, since string, n int, timeout time.Dura
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// tenureAt reports whether holder held the lease at term at instant at, by the
+// sampled history: the newest change at or before at (plus clockSlack, for a
+// change sampled up to a second late) must be that tenure, or, within
+// clockSlack of a change, the one before it. It returns the matching change,
+// or the newest one at or before at when none matches.
+func tenureAt(history []leaseChange, at time.Time, holder string, term int) (leaseChange, bool) {
+	var cands []leaseChange
+	for _, c := range history {
+		if !c.At.After(at.Add(clockSlack)) {
+			cands = append(cands, c)
+		}
+	}
+	if len(cands) == 0 {
+		return leaseChange{}, false
+	}
+	last := cands[len(cands)-1]
+	if last.Holder == holder && last.Term == term {
+		return last, true
+	}
+	if len(cands) > 1 && last.At.After(at.Add(-clockSlack)) {
+		if p := cands[len(cands)-2]; p.Holder == holder && p.Term == term {
+			return p, true
+		}
+	}
+	return last, false
 }
 
 // holdersBetween is every lease holder seen from from to to, including the

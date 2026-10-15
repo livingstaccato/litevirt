@@ -210,9 +210,11 @@ func (l *lab) sshPort(via, host string) int {
 // sshCut makes host drop SSH from peers' cluster addresses, so every SSH
 // power-off of it fails (a best-effort fence then comes back assumed, and is
 // recorded as a self-pause). Health probes, gossip and replication are left
-// alone. The rule is in the drill table. It then checks, from the first peer
-// that answers, that the port really is closed: a fence that reached the host
-// would end the drill in a power-off it does not expect.
+// alone. The rule is in the drill table. It then checks, from EVERY peer that
+// is not already cut from host by a dropBetween rule (whose connect would time
+// out with or without the SSH rule), that the port really is closed: a fence
+// that reached the host would end the drill in a power-off it does not expect.
+// A witness among peers is always one of them when it still reaches host.
 func (l *lab) sshCut(via, host string, peers []string) {
 	l.t.Helper()
 	l.outsiderHosts()
@@ -226,17 +228,38 @@ func (l *lab) sshCut(via, host string, peers []string) {
 		l.t.Fatalf("ssh cut on %s: %v", host, err)
 	}
 	l.mark("sshcut: %s drops tcp/%d from %v", host, port, peers)
+	checked := 0
 	for _, p := range peers {
+		if l.isCut(host, p) {
+			continue // fully cut: its CLOSED would prove nothing
+		}
 		out, err := l.ssh(p, 20*time.Second, fmt.Sprintf(`timeout 4 bash -c 'exec 3<>/dev/tcp/%s/%d' 2>/dev/null && echo OPEN || echo CLOSED`, l.ip[host], port))
 		if err != nil {
-			continue // that peer may itself be cut from this machine's view; try the next
+			l.t.Fatalf("sshcut: cannot check %s:%d from %s, which still reaches it: %v", host, port, p, err)
 		}
 		if strings.Contains(out, "OPEN") {
-			l.t.Fatalf("sshcut: %s still reaches %s:%d after the rule", p, host, port)
+			l.t.Fatalf("sshcut: %s still reaches %s:%d after the rule (is %s's address %s right?)", p, host, port, p, l.ip[p])
 		}
-		return
+		checked++
+		l.mark("sshcut: %s cannot reach %s:%d", p, host, port)
 	}
-	l.t.Fatalf("sshcut: no peer of %s answered to check the cut", host)
+	if checked == 0 {
+		l.t.Fatalf("sshcut: every peer of %s in %v is already cut from it; nothing shows the SSH rule works", host, peers)
+	}
+}
+
+// startCheckedSampler is startSampler with the exactly-once check registered
+// as a cleanup at once: a drill that ends early (a Fatal, a Skip, an
+// inconclusive outcome) still has every sample it took checked, before the
+// lab restore runs. A violation turns a skip into a failure.
+func (l *lab) startCheckedSampler() *sampler {
+	s := l.startSampler()
+	t := l.t
+	t.Cleanup(func() {
+		s.Stop()
+		assertNeverTwice(t, s.snapshot())
+	})
+	return s
 }
 
 // ─── Voter set ──────────────────────────────────────────────────────────────
@@ -304,14 +327,21 @@ func (l *lab) voterInit(via string, members []string) error {
 	if err != nil {
 		return fmt.Errorf("voter init %v: %v\n%s", members, err, out)
 	}
-	gen, got, err := l.voterSet(via)
-	if err != nil {
-		return err
-	}
 	want := append([]string{}, members...)
 	sort.Strings(want)
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		return fmt.Errorf("voter init: generation %d has %v, want %v", gen, got, want)
+	// via may not have adopted the init yet, and then still prints the reset
+	// generation with no members.
+	var gen int
+	var got []string
+	for {
+		gen, got, err = l.voterSet(via)
+		if err == nil && strings.Join(got, ",") == strings.Join(want, ",") {
+			break
+		}
+		if time.Now().After(deadline.Add(time.Minute)) {
+			return fmt.Errorf("voter init: generation %d has %v (err %v), want %v", gen, got, err, want)
+		}
+		time.Sleep(3 * time.Second)
 	}
 	l.mark("voters: init generation %d %v", gen, got)
 	return l.waitAdopted(gen, members, deadline.Add(2*time.Minute))
@@ -790,7 +820,7 @@ func (l *lab) stepClock(host string, d time.Duration) {
 	if cs == nil || cs.done {
 		ntp := strings.TrimSpace(l.mustSSH(host, 20*time.Second, "timedatectl show -p NTP --value"))
 		if ntp != "yes" && ntp != "no" {
-			l.t.Skipf("timedatectl on %s reports NTP=%q; cannot manage its time sync", host, ntp)
+			l.t.Fatalf("timedatectl on %s reports NTP=%q (requireClocksManageable should have skipped)", host, ntp)
 		}
 		cs = &clockStep{host: host, ntp: ntp}
 		l.clocks[host] = cs
@@ -808,22 +838,43 @@ func (l *lab) stepClock(host string, d time.Duration) {
 	}
 }
 
-// restoreClock sets host's clock from this machine's (SSH latency, well under
-// a second), puts its NTP setting back and checks it is within a second.
+// requireClocksManageable skips unless every host's time sync can be read and
+// turned off with timedatectl, and records each host's offset from this
+// machine, which restoreClock puts back. Run it before any fault.
+func (l *lab) requireClocksManageable(hosts ...string) {
+	l.t.Helper()
+	if l.clockBase == nil {
+		l.clockBase = map[string]time.Duration{}
+	}
+	for _, h := range hosts {
+		ntp, err := l.ssh(h, 20*time.Second, "timedatectl show -p NTP --value")
+		if ntp = strings.TrimSpace(ntp); err != nil || (ntp != "yes" && ntp != "no") {
+			l.t.Skipf("timedatectl on %s reports NTP=%q (%v): its clock cannot be stepped and restored safely", h, ntp, err)
+		}
+		if _, done := l.clockBase[h]; !done {
+			l.clockBase[h] = l.clockOffset(h)
+		}
+	}
+}
+
+// restoreClock sets host's clock from this machine's plus the host's own
+// offset before the drill (SSH latency, well under a second), puts its NTP
+// setting back and checks it is within a second of where it was.
 func (l *lab) restoreClock(host string) {
 	cs := l.clocks[host]
 	if cs == nil || cs.done {
 		return
 	}
+	base := l.clockBase[host]
 	var off time.Duration
 	for i := 0; i < 3; i++ {
-		now := time.Now()
+		now := time.Now().Add(base)
 		_, err := l.ssh(host, 30*time.Second, fmt.Sprintf(`date -u -s "@%d.%03d" >/dev/null`, now.Unix(), now.Nanosecond()/1e6))
 		if err != nil {
 			l.t.Errorf("clock: restore %s: %v", host, err)
 			continue
 		}
-		if off = l.clockOffset(host); off < time.Second && off > -time.Second {
+		if off = l.clockOffset(host) - base; off < time.Second && off > -time.Second {
 			break
 		}
 	}
@@ -833,7 +884,7 @@ func (l *lab) restoreClock(host string) {
 	cs.done = true
 	l.mark("clock: %s restored (offset %v, NTP %s)", host, off.Round(time.Millisecond), cs.ntp)
 	if off >= time.Second || off <= -time.Second {
-		l.t.Errorf("clock: %s is %v off this machine's clock after the restore", host, off)
+		l.t.Errorf("clock: %s is %v off its pre-drill offset after the restore", host, off)
 	}
 }
 
@@ -963,15 +1014,27 @@ func (l *lab) mailpitWait(via string, mp mailpit, substr string, after time.Time
 // ─── Operator actions that must be refused ──────────────────────────────────
 
 // requireFenceConfirmRefused runs `lv host fence-confirm host` and fails
-// unless it is refused with every one of substrs in the error. A
-// confirmation that went through is reported loudly: it records a live host
-// powered off.
-func (l *lab) requireFenceConfirmRefused(via, host string, substrs ...string) {
+// unless it is refused with every one of substrs in the error. It is only
+// issued once via's replica holds a healthy row from observer about host
+// under 20 s old, so the refusal is the expected outcome; without one the
+// check is skipped (an error), never risked. A confirmation that went through
+// records a live host powered off, and ends the drill.
+func (l *lab) requireFenceConfirmRefused(via, observer, host string, substrs ...string) {
 	l.t.Helper()
+	fresh := func(r healthRow) bool {
+		if r.Failures != 0 || r.Updated.IsZero() {
+			return false
+		}
+		now, ok := corrosion.ParseUpdatedAt(l.nodeNow(via))
+		return ok && now.Sub(r.Updated) < 20*time.Second
+	}
+	if _, r, ok := l.waitHealthRow(via, observer, host, fresh, 30*time.Second); !ok {
+		l.t.Errorf("fence-confirm %s not tried: %s's replica holds no healthy row from %s about it under 20 s old (%s)", host, via, observer, r.Raw)
+		return
+	}
 	out, err := l.lv(via, "host", "fence-confirm", host)
 	if err == nil {
-		l.t.Errorf("lv host fence-confirm %s was ACCEPTED while %s answers an observer: %s", host, host, out)
-		return
+		l.t.Fatalf("lv host fence-confirm %s was ACCEPTED while %s answers %s: %s", host, host, observer, out)
 	}
 	for _, s := range substrs {
 		if !strings.Contains(err.Error(), s) {
@@ -1113,10 +1176,17 @@ func (l *lab) newestFenceRow(via, host, since string) (time.Time, string, bool) 
 // no host but home (paused or absent there is fine).
 func assertOnlyOn(t *testing.T, rounds []round, key, home string, from, to time.Time, what string) {
 	t.Helper()
+	n := 0
+	defer func() {
+		if n == 0 {
+			t.Errorf("%s: no sample between %s and %s to check %s against", what, from.UTC().Format("15:04:05"), to.UTC().Format("15:04:05"), key)
+		}
+	}()
 	for _, r := range rounds {
 		if r.At.Before(from) || r.At.After(to) {
 			continue
 		}
+		n++
 		for _, h := range r.executing(key) {
 			if h != home {
 				t.Errorf("%s: %s executed on %s at %s, before any recovery was due\n  %s", what, key, h, r.At.UTC().Format("15:04:05.000"), r)
@@ -1130,11 +1200,22 @@ func assertOnlyOn(t *testing.T, rounds []round, key, home string, from, to time.
 // on home and executes nowhere.
 func assertPausedOn(t *testing.T, rounds []round, key, home string, from, to time.Time, what string) {
 	t.Helper()
+	n, down := 0, 0
+	defer func() {
+		switch {
+		case n == 0:
+			t.Errorf("%s: no sample between %s and %s to check %s against", what, from.UTC().Format("15:04:05"), to.UTC().Format("15:04:05"), key)
+		case down*10 > n:
+			t.Errorf("%s: %s could not be read in %d of %d samples; the hold on it is unproven", what, home, down, n)
+		}
+	}()
 	for _, r := range rounds {
 		if r.At.Before(from) || r.At.After(to) {
 			continue
 		}
-		if _, down := r.Down[home]; down {
+		n++
+		if _, d := r.Down[home]; d {
+			down++
 			continue
 		}
 		if hs := r.executing(key); len(hs) > 0 || !pausedState(r.state(home, key)) {

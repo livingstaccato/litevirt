@@ -42,6 +42,7 @@ type liveStateCall struct {
 	since time.Time
 	done  chan struct{}
 	state string
+	val   any // boundedVirtCallValue's answer
 	err   error
 }
 
@@ -79,7 +80,19 @@ func (s *Server) liveVMStateBounded(name string, b *liveStateBudget) (string, er
 // libvirt again; once it has been waited out, it is latched, and a later one
 // answers errLiveStateNoAnswer at once until it returns.
 func (s *Server) boundedVirtCall(key string, b *liveStateBudget, call func() (string, error)) (*liveStateCall, string, error) {
-	wait := s.liveStateWaitOrDefault()
+	c, v, err := s.boundedVirtCallValue(key, b, func() (any, error) { return call() })
+	st, _ := v.(string)
+	return c, st, err
+}
+
+// boundedVirtCallValue is boundedVirtCall for a call whose answer is any
+// value; the call's own answer is in the returned call's val.
+func (s *Server) boundedVirtCallValue(key string, b *liveStateBudget, call func() (any, error)) (*liveStateCall, any, error) {
+	return s.boundedVirtCallWait(key, s.liveStateWaitOrDefault(), b, call)
+}
+
+// boundedVirtCallWait is boundedVirtCallValue with a wait of its own.
+func (s *Server) boundedVirtCallWait(key string, wait time.Duration, b *liveStateBudget, call func() (any, error)) (*liveStateCall, any, error) {
 	s.liveStateMu.Lock()
 	c, joined := s.liveStateCalls[key]
 	if joined && time.Since(c.since) >= wait {
@@ -87,9 +100,9 @@ func (s *Server) boundedVirtCall(key string, b *liveStateBudget, call func() (st
 		s.liveStateMu.Unlock()
 		select {
 		case <-c.done:
-			return c, c.state, c.err
+			return c, c.val, c.err
 		default:
-			return c, "", errLiveStateNoAnswer
+			return c, nil, errLiveStateNoAnswer
 		}
 	}
 	if b != nil && b.left < wait {
@@ -98,7 +111,7 @@ func (s *Server) boundedVirtCall(key string, b *liveStateBudget, call func() (st
 	if !joined {
 		if wait <= 0 {
 			s.liveStateMu.Unlock()
-			return nil, "", errLiveStateNoAnswer
+			return nil, nil, errLiveStateNoAnswer
 		}
 		c = &liveStateCall{since: time.Now(), done: make(chan struct{})}
 		if s.liveStateCalls == nil {
@@ -106,9 +119,12 @@ func (s *Server) boundedVirtCall(key string, b *liveStateBudget, call func() (st
 		}
 		s.liveStateCalls[key] = c
 		go func() {
-			st, err := call()
+			v, err := call()
 			s.liveStateMu.Lock()
-			c.state, c.err = st, err
+			c.val, c.err = v, err
+			if st, ok := v.(string); ok {
+				c.state = st
+			}
 			if s.liveStateCalls[key] == c {
 				delete(s.liveStateCalls, key)
 			}
@@ -122,12 +138,12 @@ func (s *Server) boundedVirtCall(key string, b *liveStateBudget, call func() (st
 	defer timer.Stop()
 	select {
 	case <-c.done:
-		return c, c.state, c.err
+		return c, c.val, c.err
 	case <-timer.C:
 		if b != nil {
 			b.left -= time.Since(t0)
 		}
-		return c, "", errLiveStateNoAnswer
+		return c, nil, errLiveStateNoAnswer
 	}
 }
 

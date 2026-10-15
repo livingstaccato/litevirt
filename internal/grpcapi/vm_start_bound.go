@@ -677,6 +677,32 @@ func (s *Server) unmarkStartHeld(ctx context.Context, name string, flight *start
 	flight.marked = false
 }
 
+// startConnectionLost reports whether a start's error is the daemon's
+// connection to libvirtd going away under it (or the client being closed),
+// not libvirt's answer to the start.
+func (s *Server) startConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	if c, ok := s.virt.(interface{ Closing() bool }); ok && c.Closing() {
+		return true
+	}
+	return lv.IsConnectionLost(err)
+}
+
+// abandonStartHeld ends what markStartHeld began without recording anything:
+// the lease renewal stops, and the row and the lease are left as they are
+// (startConnectionLost).
+func (s *Server) abandonStartHeld(name string, flight *startFlight) {
+	flight.mu.Lock()
+	defer flight.mu.Unlock()
+	if !flight.marked {
+		return
+	}
+	close(flight.stopRenew)
+	flight.marked = false
+}
+
 // startDomainWithin asks libvirt to start name and waits up to wait for its
 // answer, which finish records. When libvirt has not answered by then, the
 // start goes on: its answer is recorded by finish when it comes, under a
@@ -714,6 +740,18 @@ func (s *Server) startDomainWithin(ctx context.Context, vm *corrosion.VMRecord, 
 			// the row already says what the cancel wrote.
 			finishCancelled(bg, startErr, flight.since, cancelled)
 			s.unmarkStartHeld(bg, name, flight, false)
+			return
+		}
+		if s.startConnectionLost(startErr) {
+			// The daemon's connection went away under the start (Close
+			// at shutdown closes it): that is not libvirt's answer, which
+			// libvirtd still gives. Nothing is recorded, the row is left
+			// starting and the lease standing, for the restarted daemon's
+			// reconciler to take over once the domain runs
+			// (health/held_start_orphan.go).
+			slog.Warn("StartVM: the connection to libvirtd closed under a held start; its outcome is left to the restarted daemon",
+				"vm", name, "error", startErr)
+			s.abandonStartHeld(name, flight)
 			return
 		}
 		_, err := finish(bg, startErr)

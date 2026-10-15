@@ -2045,8 +2045,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.snapScheduler.Stop()
 		}
 		repl.Stop()
-		d.virt.Close()
+		// The database closes first: closing libvirt fails the calls still
+		// waiting on it, and their error paths would otherwise write what
+		// that failure is not (a held start recorded failed over a domain
+		// libvirtd goes on to start).
 		d.db.Close()
+		d.virt.Close()
 		close(shutdownDone)
 	}()
 

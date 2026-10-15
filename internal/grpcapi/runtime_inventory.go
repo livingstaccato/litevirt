@@ -212,6 +212,134 @@ func (s *Server) runsContainers() bool {
 	return lxcCapable()
 }
 
+// inventoryVMs is the libvirt half of an inventory: the workloads and the
+// probe errors (each makes the inventory incomplete).
+type inventoryVMs struct {
+	workloads []runtimeWorkload
+	errs      []string
+}
+
+// inventoryVMsKey is the single flight of the libvirt half of an inventory,
+// shared by every caller (the capacity sampler, the dual-run detector's
+// self-probe, the GetRuntimeInventory RPC peers call, admission, owner-epoch
+// readiness).
+const inventoryVMsKey = "runtime-inventory"
+
+// inventoryVMsBounded reads every defined domain's state and live XML on the
+// backend's StateReader (the daemon's connection can be full of calls libvirt
+// does not answer), within inventoryWait, as one single-flight call
+// (boundedVirtCallValue): while it has not returned, a later inventory joins
+// it, and once waited out it is latched. libvirt lists only once it can look
+// at every domain, so a domain it hangs on holds it: errLiveStateNoAnswer,
+// which the caller records as an incomplete inventory, unknown and never
+// absent. Each such call costs one outstanding list on a reader connection,
+// not one on the daemon's connection per sampler pass and per peer's RPC.
+func (s *Server) inventoryVMsBounded() (inventoryVMs, error) {
+	_, v, err := s.boundedVirtCallWait(inventoryVMsKey, s.inventoryWait(), nil, func() (any, error) {
+		return s.inventoryVMs(), nil
+	})
+	if err != nil {
+		return inventoryVMs{}, err
+	}
+	vms, _ := v.(inventoryVMs)
+	return vms, nil
+}
+
+// inventoryWait is how long an inventory waits for libvirt: the live-state
+// wait for each of a few calls, since it reads every domain (a host's many
+// healthy domains answer in milliseconds each).
+func (s *Server) inventoryWait() time.Duration { return 3 * s.liveStateWaitOrDefault() }
+
+// inventoryReads is what the libvirt half of an inventory reads.
+type inventoryReads interface {
+	ListDomains() ([]string, error)
+	DomainState(name string) (string, error)
+	DumpXML(name string) (string, error)
+}
+
+// inventoryReader is the backend's StateReader when it has one and it dials,
+// else the backend (the daemon's connection).
+func (s *Server) inventoryReader() inventoryReads {
+	if b, ok := s.virt.(interface{ StateReader() *lv.StateReader }); ok {
+		if r := b.StateReader(); r != nil {
+			return r
+		}
+	}
+	return s.virt
+}
+
+// inventoryVMs reads the libvirt half of an inventory (collectRuntimeInventory
+// has the error discipline). A reader that cannot dial falls back to the
+// daemon's connection for the call that found it so.
+func (s *Server) inventoryVMs() inventoryVMs {
+	var out inventoryVMs
+	r := s.inventoryReader()
+	var main inventoryReads = s.virt
+	fallback := func(err error) bool { return errors.Is(err, lv.ErrStateConnUnavailable) }
+	names, err := r.ListDomains()
+	if fallback(err) {
+		names, err = main.ListDomains()
+	}
+	if err != nil {
+		out.errs = append(out.errs, fmt.Sprintf("list domains: %v", err))
+	}
+
+	// Every DEFINED domain is listed (a stopped-but-defined domain is
+	// runtime state the DB comparison needs), with running domains marked as
+	// disk-holders exactly as before: DomainState=="running" is RUNNING|BLOCKED,
+	// so a PAUSED incoming-migration target is correctly not a holder.
+	for _, n := range names {
+		w := runtimeWorkload{Kind: corrosion.WorkloadVM, Name: n}
+		st, err := r.DomainState(n)
+		if fallback(err) {
+			st, err = main.DomainState(n)
+		}
+		switch {
+		case lv.IsNoDomain(err):
+			// Listed a moment ago, gone now: undefined between the list
+			// and this call (a migration source's MigrateUndefineSource,
+			// a delete). libvirt itself says it does not exist, so it
+			// holds nothing — that is proven absence, not a probe error.
+			// See vanishedDomain.
+			vanishedDomain(n, err)
+			continue
+		case err != nil:
+			w.State = health.RuntimeUnknown
+			w.ProbeError = fmt.Sprintf("domain state: %v", err)
+			out.errs = append(out.errs, fmt.Sprintf("domain %s state: %v", n, err))
+		case st == "running":
+			w.State = health.RuntimeRunning
+			w.DiskHolder = true
+		default:
+			w.State = health.RuntimeDefinedStopped
+		}
+		xmlDef, err := r.DumpXML(n)
+		if fallback(err) {
+			xmlDef, err = main.DumpXML(n)
+		}
+		if lv.IsNoDomain(err) {
+			vanishedDomain(n, err)
+			continue
+		} else if err != nil {
+			if w.ProbeError == "" {
+				w.ProbeError = fmt.Sprintf("dump xml: %v", err)
+			}
+			out.errs = append(out.errs, fmt.Sprintf("domain %s xml: %v", n, err))
+		} else {
+			w.CPU = lv.CurrentVCPUFromXML(xmlDef)
+			// A hot-add domain holds its boot cell plus what is plugged
+			// (the larger of requested and actual), not its whole region.
+			w.MemoryMiB = lv.HeldMemoryMiBFromXML(xmlDef)
+		}
+		w.OwnerEpochMarker, w.MarkerStatus = s.readVMMarker(n)
+		if w.MarkerStatus == MarkerUnreadable {
+			out.errs = append(out.errs, fmt.Sprintf("vm %s owner-epoch marker unreadable", n))
+		}
+		out.workloads = append(out.workloads, w)
+	}
+	return out
+}
+
 // collectRuntimeInventory builds this host's inventory.
 //
 // Error discipline, unchanged from the snapshot it replaces: any probe error
@@ -237,51 +365,16 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 	// disk-holders exactly as before: DomainState=="running" is RUNNING|BLOCKED,
 	// so a PAUSED incoming-migration target is correctly not a holder.
 	if s.virt != nil {
-		names, err := s.virt.ListDomains()
-		if err != nil {
-			fail("list domains: %v", err)
-		}
-		for _, n := range names {
-			w := runtimeWorkload{Kind: corrosion.WorkloadVM, Name: n}
-			st, err := s.virt.DomainState(n)
-			switch {
-			case lv.IsNoDomain(err):
-				// Listed a moment ago, gone now: undefined between the list
-				// and this call (a migration source's MigrateUndefineSource,
-				// a delete). libvirt itself says it does not exist, so it
-				// holds nothing — that is proven absence, not a probe error.
-				// See vanishedDomain.
-				vanishedDomain(n, err)
-				continue
-			case err != nil:
-				w.State = health.RuntimeUnknown
-				w.ProbeError = fmt.Sprintf("domain state: %v", err)
-				fail("domain %s state: %v", n, err)
-			case st == "running":
-				w.State = health.RuntimeRunning
-				w.DiskHolder = true
-			default:
-				w.State = health.RuntimeDefinedStopped
+		vms, err := s.inventoryVMsBounded()
+		switch {
+		case errors.Is(err, errLiveStateNoAnswer):
+			fail("libvirt on %s has not answered the domain inventory (waited %s): a domain it hangs on holds the list",
+				s.hostName, s.inventoryWait())
+		default:
+			inv.Workloads = append(inv.Workloads, vms.workloads...)
+			for _, e := range vms.errs {
+				fail("%s", e)
 			}
-			if xmlDef, err := s.virt.DumpXML(n); lv.IsNoDomain(err) {
-				vanishedDomain(n, err)
-				continue
-			} else if err != nil {
-				if w.ProbeError == "" {
-					w.ProbeError = fmt.Sprintf("dump xml: %v", err)
-				}
-				fail("domain %s xml: %v", n, err)
-			} else {
-				w.CPU = lv.CurrentVCPUFromXML(xmlDef)
-				// A hot-add domain holds its boot cell plus what is plugged
-				// (the larger of requested and actual), not its whole region.
-				w.MemoryMiB = lv.HeldMemoryMiBFromXML(xmlDef)
-			}
-			w.OwnerEpochMarker, w.MarkerStatus = s.readVMMarker(n)
-			if w.MarkerStatus == MarkerUnreadable {
-				fail("vm %s owner-epoch marker unreadable", n)
-			}
-			inv.Workloads = append(inv.Workloads, w)
 		}
 	}
 

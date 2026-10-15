@@ -764,8 +764,8 @@ file, the problem names the rule's place in the file.
 
 | Field | Accepted |
 |---|---|
-| `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
-| `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` (`ssh`) |
+| `proto` | `all`, a protocol name (any case) that nft knows itself (`tcp`, `udp`, `udplite`, `esp`, `ah`, `icmp`, `igmp`, `icmpv6`, `gre`, `comp`, `dccp`, `sctp`) or that is listed in lower case in the host's `/etc/protocols` (`ospf`, `ipv6-icmp`), or a number 0-255 (`0x6`; octal after a leading zero, so `08` is not a number) |
+| `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` for tcp, udp, sctp, dccp or udplite (`ssh`; not `rtmp`, which is listed for ddp only) |
 | `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
 | ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...); not starting with `lv_`, which is reserved for litevirt's internal sets |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
@@ -779,12 +779,17 @@ trailing comma is fine, a leading one is not). A set reference is `@name`,
 `!= @name` or `== @name` (`ne`, `eq`) only: nft refuses `< @name`, a set in
 braces or behind a mask. A rule on a set with IPv6 elements applies to both
 families, negated or not. A bare comma list (`80,443`) is
-refused: nft rejects it, so it never applied — brace it. Anything else — a
+refused: nft rejects it, so it never applied — brace it. `<`, `>`, `<=`,
+`>=` (`lt`, `gt`, `le`, `ge`) take a single value only, not a braced list, a
+range or a prefix, which nft refuses. Anything else — a
 second word, a newline, `;`, `#`, a stray brace or quote — is refused, because
 it would add nft syntax of its own to every host's ruleset.
 
-A port name resolves against the host's `/etc/services`, on the host that
-writes the rule and again on each host that renders it.
+A port name resolves against the host's `/etc/services`, and a protocol name
+against its `/etc/protocols`, on the host that writes the rule and again on
+each host that renders it. Only those files are read: a name nft could resolve
+through another NSS source (an `nss_db` database, sss, ldap) is refused at
+write and left out at render.
 
 `proto`, `port` and `action` are stored in lower case (`SSH` is stored as
 `ssh`): nft resolves a service name only in lower case. A port an older build
@@ -806,15 +811,22 @@ before, and nothing is rendered that the row did not ask for:
   the addresses the set lists), so it is held like an unreadable rule: as this
   host last rendered it while that rendering's set is present and whole,
   otherwise left out;
-- a rule whose port this host's nft cannot resolve (a service name missing
-  from its `/etc/services`, a number past 65535, a range nft reads backwards)
+- a rule whose port or protocol this host's nft cannot resolve (a name
+  missing from its `/etc/services` or `/etc/protocols`, a port past 65535 or
+  protocol past 255, a range nft reads backwards), whose `<`, `>`, `<=` or
+  `>=` stands before a list, range or prefix, or whose IPv4 cidr nft cannot
+  read (an octet past 255, a prefix past `/32`, a range that runs backwards)
   is held like an unreadable rule;
-- an ip set is rendered without the elements it cannot render, and without
-  its IPv6 elements when its companion's name would pass 255 bytes;
-- an ip set whose name nft cannot read (a digit or `-` first, longer than 255
-  bytes, an nft keyword), whose name starts with `lv_`, or named `<name>_v6`
-  beside a set `<name>` with IPv6 elements, is left out, and a rule referencing it is held like an unreadable
-  rule.
+- an ip set is rendered without the elements it cannot render (the same
+  IPv4 forms), and without its IPv6 elements when its companion's name would
+  pass 255 bytes;
+- an ip set whose name nft cannot read (a digit or `-` first other than a
+  dotted quad such as `1.2.3.4`, longer than 255 bytes, an nft keyword), whose
+  name is one of litevirt's internal sets (`lv_gw4`, `lv_nic_devs`, ...) or
+  starts with `lv_tg_`, or named `<name>_v6` beside a set `<name>` with IPv6
+  elements, is left out, and a rule referencing it is held like an unreadable
+  rule. Any other `lv_` set an earlier build stored keeps rendering, with the
+  rules on it.
 
 Elements of one set that overlap (`10.0.0.0/8` with `10.0.0.1-10.0.0.5`, or
 two ranges that share an address, in one row or across rows of the same name)

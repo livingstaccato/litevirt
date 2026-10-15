@@ -3842,7 +3842,11 @@ func (s *Server) liveVMState(name string) (string, error) {
 	if err != nil || st != "stopped" {
 		return st, err
 	}
-	if rs, rerr := r.DomainStateReason(name); rerr == nil && rs.State == "stopped" && rs.Reason == "paused" {
+	rs, rerr := r.DomainStateReason(name)
+	if errors.Is(rerr, lv.ErrStateConnUnavailable) {
+		rs, rerr = s.virt.DomainStateReason(name)
+	}
+	if rerr == nil && rs.State == "stopped" && rs.Reason == "paused" {
 		return "paused", nil
 	}
 	return st, nil

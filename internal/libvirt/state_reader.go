@@ -3,6 +3,7 @@ package libvirt
 import (
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -22,20 +23,43 @@ import (
 // answered in 23 ms).
 //
 // A StateReader asks for domain states on connections of its own. A
-// connection one of whose calls has been unanswered for stallAfter takes no
-// new call: the next call dials a fresh connection, and the stalled one is
-// closed once its calls have returned. So a domain libvirt does not answer
-// for holds a connection of its own, not every read after it.
+// connection takes no new call once one of its calls has been unanswered for
+// stallAfter, or once it has MaxStateConnCalls calls outstanding, before
+// libvirtd's limit fills it: the next call dials a fresh connection, and the
+// retired one is closed once its calls have returned. So a domain libvirt does
+// not answer for holds a connection of its own, not every read after it.
+//
+// A call that did land on a connection libvirtd stopped reading stays
+// outstanding until a hung call on that connection returns; the caller's
+// bound (grpcapi's latch) reads that domain unknown for as long.
 const (
 	// defaultStateStallAfter is how long a call goes unanswered before its
 	// connection takes no new call. libvirt answers a state call in
 	// milliseconds.
 	defaultStateStallAfter = time.Second
-	// maxStalledStateConns caps the stalled connections kept open. Past it,
-	// calls go on the current connection although it is stalled; the caller
-	// bounds its wait as before.
-	maxStalledStateConns = 16
+	// MaxStateConnCalls is how many calls a connection takes at once: one
+	// under libvirtd's default max_client_requests, so a connection is
+	// retired before libvirtd stops reading it.
+	MaxStateConnCalls = 4
+	// MaxStalledStateConns caps the retired connections kept open while they
+	// have calls. Past it, calls go on the current connection although it is
+	// stalled or busy; the caller bounds its wait as before. It is small
+	// because each call libvirt does not answer holds one of libvirtd's
+	// workers (max_workers 20, shared with every client): the reader holds at
+	// most about MaxStalledStateConns plus one connection's worth of them.
+	MaxStalledStateConns = 4
+	// stateDialTimeout bounds a reader connection's dial and handshake, so a
+	// libvirtd that does not answer a handshake costs the caller a fallback
+	// to its usual connection, not every read.
+	stateDialTimeout = 2 * time.Second
+	// stateCloseTimeout bounds how long Close waits for its connections to
+	// close; a connection libvirtd stopped reading never answers the close.
+	stateCloseTimeout = time.Second
 )
+
+// readOnlySocket is libvirtd's read-only socket: a state read needs nothing
+// more (the lab's 23 ms `virsh -r domstate` used it).
+const readOnlySocket = "/var/run/libvirt/libvirt-sock-ro"
 
 // StateConn is one connection's domain-state calls.
 type StateConn interface {
@@ -75,7 +99,7 @@ type StateReader struct {
 
 	mu      sync.Mutex
 	cur     *readConn
-	retired map[*readConn]struct{} // stalled or broken, closed once drained
+	retired map[*readConn]struct{} // stalled, busy or broken; closed once drained
 	dialing chan struct{}          // closed when the dial in progress ends
 	seq     uint64
 	dials   int
@@ -122,7 +146,7 @@ func (r *StateReader) Dials() int {
 }
 
 // Open is how many of the reader's connections are open: the current one and
-// the stalled ones not yet drained.
+// the retired ones not yet drained.
 func (r *StateReader) Open() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -133,7 +157,23 @@ func (r *StateReader) Open() int {
 	return n
 }
 
-// Close closes every connection of the reader; a call after it fails.
+// InFlight is how many calls the reader has outstanding, on every connection.
+func (r *StateReader) InFlight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	if r.cur != nil {
+		n += len(r.cur.calls)
+	}
+	for c := range r.retired {
+		n += len(c.calls)
+	}
+	return n
+}
+
+// Close closes every connection of the reader; a call after it fails. It
+// waits at most stateCloseTimeout: a connection libvirtd stopped reading never
+// answers its close, and Close must not hold up the daemon's shutdown.
 func (r *StateReader) Close() error {
 	r.mu.Lock()
 	r.closed = true
@@ -147,23 +187,55 @@ func (r *StateReader) Close() error {
 		delete(r.retired, c)
 	}
 	r.mu.Unlock()
-	var first error
+	done := make(chan error, len(conns))
 	for _, c := range conns {
-		if err := c.conn.Close(); err != nil && first == nil {
-			first = err
+		go func() { done <- c.conn.Close() }()
+	}
+	timer := time.NewTimer(stateCloseTimeout)
+	defer timer.Stop()
+	var first error
+	for range conns {
+		select {
+		case err := <-done:
+			if err != nil && first == nil {
+				first = err
+			}
+		case <-timer.C:
+			return errors.New("state reader: a connection did not close in time")
 		}
 	}
 	return first
 }
 
+// do makes call on a connection of the reader. A transport error (the
+// connection is gone, as after libvirtd restarts) retires the connection, and
+// the call is made once more on a fresh one.
 func (r *StateReader) do(call func(StateConn) error) error {
-	c, id, err := r.acquire()
-	if err != nil {
-		return err
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		c, id, aerr := r.acquire()
+		if aerr != nil {
+			return aerr
+		}
+		err = call(c.conn)
+		r.release(c, id, err)
+		if err == nil || !isTransportError(err) {
+			return err
+		}
 	}
-	cerr := call(c.conn)
-	r.release(c, id, cerr)
-	return cerr
+	return err
+}
+
+// takes reports whether c takes a new call now.
+func (r *StateReader) takes(c *readConn) bool {
+	if c.broken {
+		return false
+	}
+	busy := len(c.calls) >= MaxStateConnCalls
+	if t := c.oldestCall(); !t.IsZero() && time.Since(t) >= r.stallAfter {
+		busy = true
+	}
+	return !busy || len(r.retired) >= MaxStalledStateConns
 }
 
 // acquire picks the connection a call goes on and records the call on it.
@@ -175,11 +247,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 			return nil, 0, errStateReaderClosed
 		}
 		if c := r.cur; c != nil {
-			stalled := false
-			if t := c.oldestCall(); !t.IsZero() && time.Since(t) >= r.stallAfter {
-				stalled = true
-			}
-			if !c.broken && (!stalled || len(r.retired) >= maxStalledStateConns) {
+			if r.takes(c) {
 				r.seq++
 				id := r.seq
 				c.calls[id] = time.Now()
@@ -188,10 +256,10 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 			}
 			// Retire it: it takes no new call, and is closed once drained.
 			r.cur = nil
-			r.retired[c] = struct{}{}
 			if len(c.calls) == 0 {
-				delete(r.retired, c)
 				go c.conn.Close() //nolint:errcheck // best effort
+			} else {
+				r.retired[c] = struct{}{}
 			}
 		}
 		if r.dialing != nil {
@@ -215,7 +283,7 @@ func (r *StateReader) acquire() (*readConn, uint64, error) {
 		}
 		if r.closed {
 			r.mu.Unlock()
-			conn.Close() //nolint:errcheck // best effort
+			go conn.Close() //nolint:errcheck // best effort
 			return nil, 0, errStateReaderClosed
 		}
 		r.cur = &readConn{conn: conn, calls: map[uint64]time.Time{}}
@@ -228,6 +296,10 @@ func (r *StateReader) release(c *readConn, id uint64, err error) {
 	delete(c.calls, id)
 	if err != nil && isTransportError(err) {
 		c.broken = true
+		if r.cur == c {
+			r.cur = nil
+			r.retired[c] = struct{}{}
+		}
 	}
 	closeIt := false
 	if _, ok := r.retired[c]; ok && len(c.calls) == 0 {
@@ -236,7 +308,7 @@ func (r *StateReader) release(c *readConn, id uint64, err error) {
 	}
 	r.mu.Unlock()
 	if closeIt {
-		c.conn.Close() //nolint:errcheck // best effort
+		go c.conn.Close() //nolint:errcheck // best effort
 	}
 }
 
@@ -260,16 +332,43 @@ func (c virtStateConn) DomainStateReason(name string) (DomainStatus, error) {
 
 func (c virtStateConn) Close() error { return c.virt.Disconnect() }
 
+// dialLibvirtBounded is dialLibvirt on socket, with the dial and the
+// handshake bounded by timeout. go-libvirt puts no deadline on the handshake,
+// and a read deadline would not end it (its reader retries a timeout), so the
+// socket is closed when the time is up, which fails the handshake.
+func dialLibvirtBounded(socket string, timeout time.Duration) (*golibvirt.Libvirt, error) {
+	conn, err := net.DialTimeout("unix", socket, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("connect to libvirtd: %w", err)
+	}
+	timer := time.AfterFunc(timeout, func() { conn.Close() }) //nolint:errcheck // ends the handshake
+	virt := golibvirt.New(conn)
+	err = virt.Connect()
+	if !timer.Stop() {
+		conn.Close() //nolint:errcheck // already closed by the timer
+		return nil, fmt.Errorf("libvirt handshake: no answer in %s", timeout)
+	}
+	if err != nil {
+		conn.Close() //nolint:errcheck // best effort
+		return nil, fmt.Errorf("libvirt handshake: %w", err)
+	}
+	return virt, nil
+}
+
 // StateReader is the client's reader of domain states on connections of its
-// own (see above), made on first use and closed by Close.
+// own (see above), made on first use and closed by Close. It dials libvirtd's
+// read-only socket, and the read-write one where that is missing.
 func (c *Client) StateReader() *StateReader {
 	c.stateReaderMu.Lock()
 	defer c.stateReaderMu.Unlock()
 	if c.stateReader == nil {
 		c.stateReader = NewStateReader(func() (StateConn, error) {
-			v, err := dialLibvirt()
+			v, err := dialLibvirtBounded(readOnlySocket, stateDialTimeout)
 			if err != nil {
-				return nil, err
+				var rerr error
+				if v, rerr = dialLibvirtBounded(defaultSocket, stateDialTimeout); rerr != nil {
+					return nil, fmt.Errorf("%w; %w", err, rerr)
+				}
 			}
 			return virtStateConn{virt: v}, nil
 		}, 0)

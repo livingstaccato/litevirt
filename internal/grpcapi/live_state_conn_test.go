@@ -2,9 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	golibvirt "github.com/digitalocean/go-libvirt"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -128,5 +131,115 @@ func TestListVMs_ADomainLibvirtHangsOnDoesNotMakeAnotherUnknown(t *testing.T) {
 			t.Fatalf("after libvirt answered: %v, want st VM_STOPPED and ok VM_RUNNING", states)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// liveStateServer is a server whose local VMs are the fake domains named, each
+// running with a running row.
+func liveStateServer(t *testing.T, names ...string) (*Server, *libvirtfake.Fake) {
+	t.Helper()
+	s := testServerWithLocks(t)
+	f := libvirtfake.New()
+	s.virt = f
+	for _, n := range names {
+		if err := f.DefineDomain("<domain><name>" + n + "</name></domain>"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.StartDomain(n); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertVM(context.Background(), s.db,
+			corrosion.VMRecord{Name: n, HostName: s.hostName, State: "running", Spec: "{}"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s, f
+}
+
+func listStates(t *testing.T, s *Server) map[string]pb.VMState {
+	t.Helper()
+	resp, err := s.ListVMs(adminCtx(), &pb.ListVMsRequest{})
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	out := map[string]pb.VMState{}
+	for _, vm := range resp.GetVms() {
+		out[vm.GetName()] = vm.GetState()
+	}
+	return out
+}
+
+// The live state is read on the reader's connections only, the paused
+// domain's reason included, and libvirt's own error is an answer: none of
+// them asks on the daemon's connection, which may be full.
+//
+// Mutations: the reason asked on s.virt: a call on the daemon's connection:
+// red. The fallback taken on any error: x's error asks the daemon's
+// connection: red.
+func TestListVMs_LiveStateIsNotAskedOnTheDaemonsConnection(t *testing.T) {
+	s, f := liveStateServer(t, "p", "x")
+	f.SetPaused("p")
+	f.FailDomainState = func(name string) error {
+		if name == "x" {
+			return golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain), Message: "no domain"}
+		}
+		return nil
+	}
+	got := listStates(t, s)
+	if got["p"] != pb.VMState_VM_PAUSED {
+		t.Errorf("p: %v, want VM_PAUSED", got["p"])
+	}
+	if n := f.MainConnCalls(); n != 0 {
+		t.Errorf("state calls on the daemon's connection: %d, want 0", n)
+	}
+}
+
+// A reader that cannot dial (libvirtd refuses it a connection) falls back to
+// the daemon's connection, as before, for the state and the paused reason.
+//
+// Mutations: no fallback: p reads its record (running): red. No fallback for
+// the reason: p reads stopped: red.
+func TestListVMs_AReaderThatCannotDialFallsBackToTheDaemonsConnection(t *testing.T) {
+	s, f := liveStateServer(t, "p")
+	f.SetPaused("p")
+	f.SetStateDial(func() error { return errors.New("libvirtfake: dial refused") })
+	got := listStates(t, s)
+	if got["p"] != pb.VMState_VM_PAUSED {
+		t.Errorf("p: %v, want VM_PAUSED (read on the daemon's connection)", got["p"])
+	}
+	if n := f.MainConnCalls(); n < 2 {
+		t.Errorf("state calls on the daemon's connection: %d, want the state and the reason", n)
+	}
+}
+
+// The reader answered the state, then lost its connection before the paused
+// reason and could not dial another: the reason is asked on the daemon's
+// connection, so a paused domain still reads paused.
+//
+// Mutation: no fallback for the reason: p reads stopped: red.
+func TestListVMs_TheReasonFallsBackWhenTheReaderLosesItsConnection(t *testing.T) {
+	s, f := liveStateServer(t, "p")
+	f.SetPaused("p")
+	dials := 0
+	f.SetStateDial(func() error {
+		dials++
+		if dials > 1 {
+			return errors.New("libvirtfake: dial refused")
+		}
+		return nil
+	})
+	reasons := 0
+	f.FailDomainStateReason = func(string) error {
+		reasons++
+		if reasons == 1 {
+			return errors.New("libvirtfake: connection reset by peer")
+		}
+		return nil
+	}
+	if got := listStates(t, s); got["p"] != pb.VMState_VM_PAUSED {
+		t.Errorf("p: %v, want VM_PAUSED", got["p"])
+	}
+	if dials != 2 {
+		t.Errorf("reader dials: %d, want 2 (the state, then the failed redial)", dials)
 	}
 }

@@ -27,15 +27,25 @@ import (
 // HangDomain makes the state calls naming a domain wait; SetConnRequests
 // caps the state calls in flight on each connection (0, the default: no
 // cap). The Fake's own methods are one connection, the daemon's; a
-// StateReader dials connections of its own, each with its own cap. Only the
-// two state calls are modelled: every other method answers at once, as
-// before.
+// StateReader dials connections of its own, each with its own cap.
+//
+// Closing a connection is a request on it, as go-libvirt's Disconnect sends
+// ConnectClose first: it waits for a slot like any call, so a full
+// connection does not close. A call in flight on a connection closed under
+// it fails, as go-libvirt fails it with ErrInterrupted, once libvirt
+// answers. SetStateDial makes a StateReader's dials fail or wait.
+//
+// Only the two state calls are modelled: every other method answers at once,
+// as before; libvirtd's worker pool is not modelled.
 type connModel struct {
 	mu       sync.Mutex
 	requests int                      // the per-connection cap; 0 = none
 	hung     map[string]chan struct{} // domain → closed when released
 	main     *fakeConn
 	reader   *libvirt.StateReader
+	all      []*fakeConn // every connection made, to wake on a new cap
+	dialHook func() error
+	mainN    int // state calls made on the main connection
 }
 
 // errConnClosed is a call on a connection already closed.
@@ -53,6 +63,9 @@ type fakeConn struct {
 func (f *Fake) newFakeConn() *fakeConn {
 	c := &fakeConn{f: f}
 	c.cond = sync.NewCond(&c.mu)
+	f.conns.mu.Lock()
+	f.conns.all = append(f.conns.all, c)
+	f.conns.mu.Unlock()
 	return c
 }
 
@@ -60,7 +73,10 @@ func (f *Fake) mainConn() *fakeConn {
 	f.conns.mu.Lock()
 	defer f.conns.mu.Unlock()
 	if f.conns.main == nil {
-		f.conns.main = f.newFakeConn()
+		c := &fakeConn{f: f}
+		c.cond = sync.NewCond(&c.mu)
+		f.conns.all = append(f.conns.all, c)
+		f.conns.main = c
 	}
 	return f.conns.main
 }
@@ -70,12 +86,30 @@ func (f *Fake) mainConn() *fakeConn {
 func (f *Fake) SetConnRequests(n int) {
 	f.conns.mu.Lock()
 	f.conns.requests = n
+	all := append([]*fakeConn(nil), f.conns.all...)
 	f.conns.mu.Unlock()
 	// Wake calls waiting on the old cap.
-	c := f.mainConn()
-	c.mu.Lock()
-	c.cond.Broadcast()
-	c.mu.Unlock()
+	for _, c := range all {
+		c.mu.Lock()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}
+}
+
+// SetStateDial sets a hook each StateReader dial runs first: an error fails
+// the dial, and the hook may block. nil removes it.
+func (f *Fake) SetStateDial(hook func() error) {
+	f.conns.mu.Lock()
+	f.conns.dialHook = hook
+	f.conns.mu.Unlock()
+}
+
+// MainConnCalls is how many state calls were made on the Fake's own
+// connection.
+func (f *Fake) MainConnCalls() int {
+	f.conns.mu.Lock()
+	defer f.conns.mu.Unlock()
+	return f.conns.mainN
 }
 
 func (f *Fake) connRequests() int {
@@ -130,28 +164,47 @@ func (f *Fake) ConnInFlight() int {
 // for its domain to be released, then calls fn. It returns errConnClosed,
 // without calling fn, on a connection already closed.
 func (c *fakeConn) call(name string, fn func()) error {
+	if c == c.f.mainConn() {
+		c.f.conns.mu.Lock()
+		c.f.conns.mainN++
+		c.f.conns.mu.Unlock()
+	}
+	if !c.takeSlot() {
+		return errConnClosed
+	}
+	defer c.freeSlot()
+	c.f.waitHung(name)
 	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return errConnClosed
+	}
+	fn()
+	return nil
+}
+
+// takeSlot waits for a slot under the cap; false on a closed connection.
+func (c *fakeConn) takeSlot() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for {
 		if c.closed {
-			c.mu.Unlock()
-			return errConnClosed
+			return false
 		}
 		if lim := c.f.connRequests(); lim <= 0 || c.inFlight < lim {
-			break
+			c.inFlight++
+			return true
 		}
 		c.cond.Wait()
 	}
-	c.inFlight++
+}
+
+func (c *fakeConn) freeSlot() {
+	c.mu.Lock()
+	c.inFlight--
+	c.cond.Broadcast()
 	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		c.inFlight--
-		c.cond.Broadcast()
-		c.mu.Unlock()
-	}()
-	c.f.waitHung(name)
-	fn()
-	return nil
 }
 
 // StateReader is the Fake's libvirt.StateReader (the real one), whose
@@ -175,6 +228,14 @@ func (f *Fake) NewStateReader(stallAfter time.Duration) *libvirt.StateReader {
 
 func (f *Fake) newStateReaderLocked(stallAfter time.Duration) *libvirt.StateReader {
 	return libvirt.NewStateReader(func() (libvirt.StateConn, error) {
+		f.conns.mu.Lock()
+		hook := f.conns.dialHook
+		f.conns.mu.Unlock()
+		if hook != nil {
+			if err := hook(); err != nil {
+				return nil, err
+			}
+		}
 		return f.newFakeConn(), nil
 	}, stallAfter)
 }
@@ -199,10 +260,17 @@ func (c *fakeConn) DomainStateReason(name string) (libvirt.DomainStatus, error) 
 	return st, err
 }
 
-// Close closes c: a later call on it fails. A call already in flight goes on.
+// Close closes c. Like go-libvirt's Disconnect it is a request first, so it
+// waits for a slot, and on a full connection does not return until a call
+// on it does. A later call fails, and so does a call in flight, once libvirt
+// answers it.
 func (c *fakeConn) Close() error {
+	if !c.takeSlot() {
+		return nil // already closed
+	}
 	c.mu.Lock()
 	c.closed = true
+	c.inFlight--
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	return nil

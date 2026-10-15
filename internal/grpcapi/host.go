@@ -1009,6 +1009,9 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 	// the cluster to clear the manual-fence-pending state so the failover
 	// coordinator can reschedule its VMs. We do NOT execute a fence here.
 	if req.ConfirmManualOnly {
+		if err := s.refuseFenceConfirmOfLiveHost(ctx, req.Name); err != nil {
+			return nil, err
+		}
 		// The 'fenced' state and the confirmation row are one replicated entry
 		// (RecordFenceWithState), so no peer holds a 'fenced' state whose proof
 		// has not arrived — corrosion.HostProvedOff reads them together.

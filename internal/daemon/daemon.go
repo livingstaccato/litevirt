@@ -3321,11 +3321,7 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 		// no VM barrier still references them. Replicated monotone tombstone —
 		// tombstone-dominance in the immutable merge keeps a delayed copy from
 		// resurrecting a reaped operation.
-		if reaped, perr := corrosion.ReapTerminalOperations(ctx, d.db, core); perr != nil {
-			slog.Warn("operation reaper", "error", perr)
-		} else if reaped > 0 {
-			slog.Info("operation reaper", "reaped", reaped)
-		}
+		d.reapTerminalOperations(ctx, core)
 		// Authority still held by projects that no longer exist. Retiring on delete
 		// is forward-only, so anything deleted before that landed keeps live
 		// authority forever — nothing else collects it, because an authority row

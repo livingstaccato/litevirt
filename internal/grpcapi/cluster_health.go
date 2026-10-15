@@ -16,8 +16,9 @@ import (
 // set, evaluator coverage, the observer→target connectivity mesh, and per-host
 // capacity assessments into one response with one overall state — the single
 // surface the CLI, REST, MCP, UI, and dashboard all consume. There is no
-// per-signal health RPC and no operator force-clear: the rows say what the
-// evaluators proved, and only the evaluators change them.
+// per-signal health RPC. The rows say what the evaluators proved; the one
+// exception is an admin's audited ResolveHealthCondition on a dual-run row,
+// which the detector re-raises if it still holds.
 func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthRequest) (*pb.ClusterHealth, error) {
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
@@ -92,16 +93,7 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
-		resp.Conditions = append(resp.Conditions, &pb.HealthCondition{
-			Evaluator: h.Evaluator, Code: h.Code,
-			SubjectKind: h.SubjectKind, SubjectId: h.SubjectID,
-			Lifecycle: h.Lifecycle, Severity: h.Severity,
-			Hosts: h.Hosts, Evidence: h.Evidence,
-			ObserveCount: int32(h.ObserveCount), CleanCount: int32(h.CleanCount),
-			FirstSeen: h.FirstSeen, LastSeen: h.LastSeen,
-			ConfirmedAt: h.ConfirmedAt, ResolvedAt: h.ResolvedAt,
-			Reporter: h.Reporter,
-		})
+		resp.Conditions = append(resp.Conditions, healthConditionToPB(h))
 	}
 	for _, e := range evaluators {
 		resp.Evaluators = append(resp.Evaluators, &pb.HealthEvaluatorStatus{
@@ -336,4 +328,17 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		return HealthDegraded
 	}
 	return HealthHealthy
+}
+
+func healthConditionToPB(h corrosion.HealthCondition) *pb.HealthCondition {
+	return &pb.HealthCondition{
+		Evaluator: h.Evaluator, Code: h.Code,
+		SubjectKind: h.SubjectKind, SubjectId: h.SubjectID,
+		Lifecycle: h.Lifecycle, Severity: h.Severity,
+		Hosts: h.Hosts, Evidence: h.Evidence,
+		ObserveCount: int32(h.ObserveCount), CleanCount: int32(h.CleanCount),
+		FirstSeen: h.FirstSeen, LastSeen: h.LastSeen,
+		ConfirmedAt: h.ConfirmedAt, ResolvedAt: h.ResolvedAt,
+		Reporter: h.Reporter,
+	}
 }

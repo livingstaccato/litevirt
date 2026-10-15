@@ -76,7 +76,11 @@ var migrationStates = map[string]bool{
 // inventory (see runtime_inventory.go) — locally for self, via GetRuntimeInventory
 // for a peer.
 type runtimeSnapshot struct {
-	diskHolderVMs  []string
+	diskHolderVMs []string
+	// definedVMs is every VM domain the host reported, in any state (running,
+	// shut off, unknown). Only a deleted VM's mismatch reads it: positive
+	// absence is a host with no domain of that name at all.
+	definedVMs     []string
 	runningCTs     []string
 	kernelVIPs     []string // bare IPs (prefix stripped) so cross-host grouping is consistent
 	unresolvedTies int
@@ -444,7 +448,7 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	//    (host_name, name), and two unrelated containers named "web" on two hosts
 	//    are a legitimate steady state. Multiple runtime holders alone therefore
 	//    prove nothing, and paging them critical would freeze admission on BOTH
-	//    hosts (ct_dual_run is admission-gating, with no operator force-clear).
+	//    hosts (ct_dual_run is admission-gating, and re-raised every pass it holds).
 	//    A holder is LEGITIMATE when its own host's DB row backs it — present and
 	//    not marked as relocating away. The dual-run signal is a same-named copy
 	//    running where NO row claims it while the name also runs elsewhere:
@@ -660,8 +664,7 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 		dbIndexOK && ctIndexOK
 	coverageDetail := ""
 	if !coverageComplete {
-		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
-			unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
+		coverageDetail = formatCoverageDetail(unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
 	}
 	// RE-ASSERT LEADERSHIP before acting on what the gather found.
 	//
@@ -669,9 +672,8 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	// — ListDomains, DomainState and DumpXML take no context — so a leader
 	// wedged on hung storage can outlive its own lease by minutes and then
 	// finish against a snapshot taken before the stall. The conditions written
-	// here gate admission and have no operator force-clear, so a stale pass
-	// could RESOLVE a dual-run its successor had confirmed and re-open
-	// admission to a split-brained host.
+	// here gate admission, so a stale pass could RESOLVE a dual-run its
+	// successor had confirmed and re-open admission to a split-brained host.
 	//
 	// The term is the right test rather than holder identity, because
 	// AcquireLeaseWithTerm already treats a lease that lapsed and was re-taken

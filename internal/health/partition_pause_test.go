@@ -1025,3 +1025,69 @@ func TestPartitionPause_LeavesAMigratingVMAlone(t *testing.T) {
 		t.Fatalf("a migrating VM is %s", st)
 	}
 }
+
+// restartPauser is a new pauser over f's data dir and DB with the majority
+// back, as a daemon restart builds it.
+func (f *pauseFixture) restartPauser() *PartitionPauser {
+	p := NewPartitionPauser("node-a", f.dataDir, f.db)
+	p.SetQuorum(func(context.Context) (QuorumState, int, int) { return QuorumYes, 2, 2 })
+	p.SetEnabled(func() bool { return true })
+	p.SetVMBackend(f.virt)
+	p.SetClock(func() time.Time { return f.now })
+	p.SetResumeConfirmer(func(_ context.Context, recs []PauseRecord) map[string]ResumeVerdict {
+		out := map[string]ResumeVerdict{}
+		for _, r := range recs {
+			out[r.Key()] = ResumeVerdict{OK: true}
+		}
+		return out
+	})
+	return p
+}
+
+// The lab case (lab 1, 2026-10-14): a host paused vm-ha, was powered off
+// through the witness and powered on again. The new daemon finds the record,
+// sees the domain shut off rather than paused, and drops the record. The
+// replicated partition_paused it raised before the power cycle must resolve:
+// the pause it describes has ended. It stayed confirmed, because only the
+// process that opened it remembered it was open.
+//
+// The second case is a condition with no record at all behind it (a resume
+// whose resolve did not land before a restart): it resolves too.
+//
+// Mutation: return early in syncPausedCondition when this process never
+// opened the condition — both cases go red.
+func TestPartitionPause_ARestartResolvesAPauseThatEnded(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		after func(f *pauseFixture)
+	}{
+		{"record dropped after a power cycle", func(f *pauseFixture) {
+			f.virt.SetState("vm-ha", libvirtfake.StateShutdown)
+		}},
+		{"no record left", func(f *pauseFixture) {
+			if err := newPauseStore(f.dataDir).remove(PauseKindVM, "vm-ha"); err != nil {
+				f.t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPauseFixture(t)
+			f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+			if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || c.Lifecycle == corrosion.ConditionResolved {
+				t.Fatalf("setup: partition_paused not open (ok=%v %+v)", ok, c)
+			}
+			tc.after(f)
+			restarted := f.restartPauser()
+			for i := 0; i <= int(PartitionPauseAfter/time.Second); i++ {
+				restarted.Evaluate(context.Background())
+				f.advance(time.Second)
+			}
+			if recs := f.records(); len(recs) != 0 {
+				t.Fatalf("records = %+v after the restart", recs)
+			}
+			if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || c.Lifecycle != corrosion.ConditionResolved {
+				t.Fatalf("partition_paused is still %q after the pause ended and the daemon restarted (ok=%v)", c.Lifecycle, ok)
+			}
+		})
+	}
+}

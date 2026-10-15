@@ -127,6 +127,19 @@ message HealthCondition {
     string resolved_at   = 14; // "" until resolved
     string reporter      = 15;
 }
+// ResolveHealthConditionRequest names one open condition by its identity, as
+// `lv health` prints it: code and subject. evaluator is needed only when two
+// evaluators hold an open condition under the same code and subject.
+message ResolveHealthConditionRequest {
+    string code         = 1;
+    string subject_kind = 2;
+    string subject_id   = 3;
+    string evaluator    = 4;
+    string reason       = 5;   // the operator's note, recorded in the audit row
+}
+message ResolveHealthConditionResponse {
+    HealthCondition condition = 1;   // the row as resolved
+}
 message HealthEvaluatorStatus {
     string evaluator = 1;
     string last_scan = 2;      // RFC3339
@@ -4157,6 +4170,10 @@ service LiteVirt {
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
+    // ResolveHealthCondition marks one open dual-run condition resolved on an
+    // admin's word, audited. The detector re-derives its findings every pass,
+    // so a condition that still holds is raised again on the next one.
+    rpc ResolveHealthCondition(ResolveHealthConditionRequest) returns (ResolveHealthConditionResponse);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);

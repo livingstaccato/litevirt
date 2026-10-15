@@ -329,7 +329,8 @@ checks, so a paused workload stays paused across a daemon restart.
 While this host holds any self-paused workload, it holds a
 `partition_paused` condition (evaluator `partition_pause`, subject
 `host/<name>`, severity warning). It lists the paused workloads and the reason,
-and it is resolved when the last record goes. A fleet-wide blip therefore
+and it is resolved when the last record goes, by this process or, after a
+restart, by the first pass that finds no record. A fleet-wide blip therefore
 leaves one resolved condition per host in the history.
 
 `lv ls` and `lv inspect` on the paused host show each paused VM as

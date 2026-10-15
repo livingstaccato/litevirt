@@ -707,6 +707,9 @@ func snapshotFromInventory(inv runtimeInventory) runtimeSnapshot {
 		ctMarkers:      map[string]markerInfo{},
 	}
 	for _, w := range inv.Workloads {
+		if w.Kind == corrosion.WorkloadVM {
+			snap.definedVMs = append(snap.definedVMs, w.Name)
+		}
 		switch {
 		case w.Kind == corrosion.WorkloadVM && w.DiskHolder:
 			snap.diskHolderVMs = append(snap.diskHolderVMs, w.Name)

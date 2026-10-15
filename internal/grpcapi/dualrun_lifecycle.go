@@ -40,8 +40,10 @@ import (
 //     nothing about absence. Coverage is judged PER CONDITION (see
 //     dualrun_resolve_coverage.go), so a host dead since before a VM existed
 //     does not hold that VM's condition open;
-//   - there is no operator force-clear: operators remove the cause, the
-//     evaluator proves the resolution.
+//   - operators remove the cause, the evaluator proves the resolution. An
+//     admin may resolve a row by hand (ResolveHealthCondition, audited); it
+//     proves nothing, and a finding that still holds is raised again by the
+//     next pass, as a new observed row.
 
 // dualRunEvaluator is this detector's evaluator name in health_conditions /
 // health_evaluator_status.
@@ -140,7 +142,15 @@ func (s *Server) resolveGateValid(ctx context.Context) bool {
 	if gate == nil {
 		return true
 	}
-	if !gate.ExecutionGate(ctx).OK {
+	// The execution gate also requires this host to be an ACTIVE WORKER, which
+	// says nothing about what the cluster runs: a witness (never a worker) or
+	// a draining host holds the detector lease like any voter, and reading
+	// that refusal as "no quorum" left every condition it led open for good
+	// (lab 1, 2026-10-14: a deleted VM's owner mismatch, and the split's
+	// coverage gaps, stayed open behind complete scans, and the mismatch
+	// refused admission to node-2). The gate checks self-fence and quorum BEFORE the worker clause, so a refusal
+	// for that clause alone means both held.
+	if g := gate.ExecutionGate(ctx); !g.OK && g.Reason != health.ReasonLocalNotActiveWorker {
 		return false
 	}
 	// Under region-scoped failover the execution gate passes on this host's
@@ -248,7 +258,25 @@ func (s *Server) applyConditionLifecycle(
 		if current[f] {
 			continue
 		}
-		if !gateOK || !rc.canResolve(f, row) {
+		if !gateOK {
+			continue
+		}
+		// A deleted VM's mismatch cannot be raised again, but a named host
+		// still holding the domain is the detector still seeing its subject:
+		// refresh last_seen and keep the streak at zero, so the row reads as
+		// seen this pass (ResolveHealthCondition refuses on that) and does
+		// not age into a resolution.
+		if rc.deletedVMStillOnNamedHost(f, row.Hosts) {
+			row.CleanCount = 0
+			row.LastSeen = now
+			row.Reporter = s.hostName
+			if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+				slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
+			}
+			byIdentity[f] = row
+			continue
+		}
+		if !rc.canResolve(f, row) {
 			continue
 		}
 		row.CleanCount++

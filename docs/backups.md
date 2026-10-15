@@ -854,8 +854,8 @@ incomplete the VM is marked **partial**:
 - the marker is durable: the health condition `vm.promoted_partial` (evaluator
   `replica_set`), shown by `lv inspect <vm>` as `promotedPartial` until a later
   promotion recovers the whole set or the VM is deleted (a VM re-created
-  under the name never inherits it). There is no command to resolve a health
-  condition by hand.
+  under the name never inherits it). `lv health resolve` does not cover it:
+  it resolves only the dual-run detector's conditions.
 
 A disk not recovered is not attached; attach or restore it once its host is
 back. A file already where a disk's live disk would go (a crashed earlier

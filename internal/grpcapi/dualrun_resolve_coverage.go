@@ -2,7 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -35,6 +38,13 @@ import (
 //     be running a copy of W: every way a copy gets onto a host — create,
 //     migrate, failover, its own reconciler — needs that host running after W
 //     existed.
+//
+//   - an owner- or epoch-mismatch whose VM has been DELETED is a claim about
+//     a DB owner that no longer exists, and can never be raised again, so a
+//     clean scan proves nothing about it. It resolves on POSITIVE absence:
+//     every host it names completely probed and holding no domain of that
+//     name in any state, whatever the rest of the cluster's coverage. A named
+//     host still holding one keeps it open, complete scan or not.
 //
 //   - everything else (ct_dual_run, vip_dual_run, unknown codes) keeps the
 //     cluster-wide rule. A container name is not cluster-unique and a VIP has
@@ -114,6 +124,12 @@ func (rc resolutionCoverage) canResolve(f finding, row corrosion.HealthCondition
 	if !rc.dbOK {
 		return false
 	}
+	// A deleted VM's mismatch is decided before the complete-coverage
+	// short-circuit: with no row the finding can never be raised again, so a
+	// complete clean scan proves nothing about it on its own.
+	if rc.deletedVMMismatch(f) {
+		return rc.deletedVMAbsentFromNamedHosts(f.target, row.Hosts)
+	}
 	if rc.complete {
 		return true
 	}
@@ -166,6 +182,57 @@ func (rc resolutionCoverage) vmCoverageComplete(vm string, involved []string) bo
 	return true
 }
 
+// deletedVMMismatch reports whether f is an owner- or epoch-mismatch whose
+// VM has no live row (the index was readable, so it was deleted).
+func (rc resolutionCoverage) deletedVMMismatch(f finding) bool {
+	if f.kind != kindOwnerMismatch && f.kind != kindEpochMismatch {
+		return false
+	}
+	_, live := rc.vmCreated[f.target]
+	return !live
+}
+
+// deletedVMAbsentFromNamedHosts is the resolution rule for a deleted VM's
+// mismatch. Both codes are claims about a DB owner that no longer exists, and
+// with no row the detector can never raise them again, so a clean scan proves
+// nothing. What resolves it is POSITIVE absence: every host the condition
+// names was completely probed this pass and holds no domain of that name in
+// any state. A named host that still has one keeps it open (the orphan-runtime
+// reporter names that domain on its own host). A row naming no host never
+// resolves this way.
+func (rc resolutionCoverage) deletedVMAbsentFromNamedHosts(vm string, involved []string) bool {
+	if len(involved) == 0 {
+		return false
+	}
+	for _, h := range involved {
+		if !rc.completelyProbed(h) || rc.hostHasVM(h, vm) {
+			return false
+		}
+	}
+	return true
+}
+
+// deletedVMStillOnNamedHost reports a deleted VM's mismatch that a named host,
+// completely probed this pass, still holds a domain for: the detector still
+// sees the condition's subject, though it cannot raise the finding again.
+func (rc resolutionCoverage) deletedVMStillOnNamedHost(f finding, involved []string) bool {
+	if !rc.dbOK || !rc.deletedVMMismatch(f) {
+		return false
+	}
+	for _, h := range involved {
+		if rc.completelyProbed(h) && rc.hostHasVM(h, f.target) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostHasVM: host h's snapshot reports a domain named vm in any state.
+func (rc resolutionCoverage) hostHasVM(h, vm string) bool {
+	snap := rc.snaps[h]
+	return containsString(snap.definedVMs, vm) || containsString(snap.diskHolderVMs, vm)
+}
+
 func containsString(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
@@ -215,4 +282,31 @@ func (s *Server) hostLastAlive(ctx context.Context, hosts map[string]bool) (map[
 		}
 	}
 	return out, true
+}
+
+// formatCoverageDetail is the dual_run evaluator status detail for a scan
+// that was not complete. parseCoverageDetail reads it back, so the two must
+// change together.
+func formatCoverageDetail(unreachable, partial, unsupported []string, dbOK, ctOK bool) string {
+	return fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
+		unreachable, partial, unsupported, dbOK, ctOK)
+}
+
+var coverageListRE = regexp.MustCompile(`(unreachable|partial|unsupported)=\[([^\]]*)\]`)
+
+// parseCoverageDetail returns, for an incomplete scan's detail, each host the
+// scan did not see completely and why, and whether both DB indexes were
+// readable. ok=false when the detail is not in formatCoverageDetail's shape.
+func parseCoverageDetail(detail string) (blind map[string]string, indexesOK, ok bool) {
+	lists := coverageListRE.FindAllStringSubmatch(detail, -1)
+	if len(lists) != 3 {
+		return nil, false, false
+	}
+	blind = map[string]string{}
+	for _, m := range lists {
+		for _, h := range strings.Fields(m[2]) {
+			blind[h] = m[1]
+		}
+	}
+	return blind, strings.Contains(detail, "db_index_ok=true") && strings.Contains(detail, "ct_index_ok=true"), true
 }

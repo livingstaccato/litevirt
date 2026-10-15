@@ -67,6 +67,57 @@ Exit code: 0 healthy · 1 degraded or unknown · 2 critical.`,
 		},
 	}
 	cmd.Flags().BoolVar(&includeResolved, "resolved", false, "include recently-resolved conditions (30-day history)")
+	cmd.AddCommand(newHealthResolveCmd())
+	return cmd
+}
+
+// lv health resolve — mark one open dual-run condition resolved by hand.
+func newHealthResolveCmd() *cobra.Command {
+	var evaluator, reason string
+	cmd := &cobra.Command{
+		Use:   "resolve <code> <kind/subject>",
+		Short: "Resolve an open dual-run health condition by hand (admin, audited)",
+		Long: `Mark one open condition resolved, named as 'lv health' prints it:
+its CODE and its SUBJECT (kind/id), for example
+
+  lv health resolve runtime_owner_mismatch vm/web-1 --reason "VM deleted"
+
+Only the dual-run detector's conditions (vm_dual_run, ct_dual_run,
+vip_dual_run, runtime_owner_mismatch, owner_epoch_mismatch,
+owner_epoch_suppressed, coverage_gap, lww_unresolved) can be resolved this
+way. They are the ones that gate admission, and the detector re-derives them
+every pass: one that still holds is raised again, and blocks admission again,
+on its next pass. It is refused until the detector has looked and not seen
+the condition: a scan later than its last sighting that completely probed
+every host it names. Resolving proves nothing; use it for a condition the
+detector can no longer clear by itself.
+
+Requires the cluster.health.resolve verb (Admin). The resolution is written
+to the audit log with your principal and --reason, and published as an
+ha.condition.resolved event.`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			kind, id, ok := strings.Cut(args[1], "/")
+			if !ok || kind == "" || id == "" {
+				return fmt.Errorf("subject %q: want kind/id as `lv health` prints it, e.g. vm/web-1", args[1])
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.ResolveHealthCondition(ctx, &pb.ResolveHealthConditionRequest{
+					Code: args[0], SubjectKind: kind, SubjectId: id,
+					Evaluator: evaluator, Reason: reason,
+				})
+				if err != nil {
+					return fmt.Errorf("resolve %s on %s: %w", args[0], args[1], err)
+				}
+				h := resp.GetCondition()
+				fmt.Printf("%s on %s/%s (%s): %s. If it still holds, the detector raises it again on its next pass.\n",
+					h.GetCode(), h.GetSubjectKind(), h.GetSubjectId(), h.GetEvaluator(), h.GetLifecycle())
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&evaluator, "evaluator", "", "the evaluator, when two hold an open condition under the same code and subject")
+	cmd.Flags().StringVar(&reason, "reason", "", "why, recorded in the audit log")
 	return cmd
 }
 

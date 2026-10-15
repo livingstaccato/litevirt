@@ -1135,6 +1135,9 @@ observed → confirmed → resolved lifecycle:
 - resolution needs **two consecutive clean scans with complete coverage** by
   the detector lease holder under a valid decision gate — an unreachable,
   partial, or older-binary peer blocks resolution (blind is not clean);
+- resolution is proven by **whichever voter holds the detector lease**,
+  including a witness or a draining host: what it needs is the voter
+  majority, not to be an active worker;
 - coverage is judged **per condition**, against the hosts that could hold the
   condition's subject. A `coverage_gap` or `lww_unresolved` on host H needs
   only H completely probed. A VM condition (`vm_dual_run`,
@@ -1147,14 +1150,33 @@ observed → confirmed → resolved lifecycle:
   never applies to the VM's DB owner, a host the condition names as involved,
   or a host that answered partially or from an older binary, and it fails
   closed on missing or unparseable evidence, a post-dated `created_at`, or a
-  failed DB read. Container and VIP conditions keep the cluster-wide rule
-  (names are not unique; a VIP has no creation stamp), so a registered host
-  that is permanently gone still freezes those until `lv host rm`;
+  failed DB read. A `runtime_owner_mismatch` or `owner_epoch_mismatch` whose
+  VM has since been deleted can never be raised again, so a clean scan
+  proves nothing about it: it resolves only once every host it names was
+  completely probed and has no domain of that name in any state. A named
+  host that still has one keeps it open; a litevirt-stamped one is also
+  reported as `vm_orphan_runtime` on its host. Container and VIP
+  conditions keep the cluster-wide rule (names are not unique; a VIP has no
+  creation stamp), so a registered host that is permanently gone still
+  freezes those until `lv host rm`;
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
-- there is **no force-clear**: remove the cause, and the evaluator proves
-  the resolution.
+- remove the cause, and the evaluator proves the resolution. For a
+  condition it can no longer prove, an admin can resolve it by hand:
+  `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
+  subject as `lv health` prints them. Only the dual-run detector's
+  conditions can be resolved this way, and only once the detector has
+  looked and not seen it: its last scan must be later than the condition's
+  last sighting and must have completely probed every host the condition
+  names. Otherwise it is refused, naming what is missing (a scan still
+  pending or still seeing it, no detector lease holder, or a named host the
+  scan could not probe). It needs the `cluster.health.resolve`
+  verb (Admin), writes a `health.condition.resolve` audit row with your
+  principal and reason, and publishes `ha.condition.resolved`. It proves
+  nothing: the detector re-derives its findings every pass, so a condition
+  that still holds is raised again, observed and gating admission, on the
+  next one.
 
 `lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
 UNKNOWN), every active condition with its involved hosts, evaluator
@@ -1693,10 +1715,12 @@ holder writes.
 
 - `partition_paused` (host, warning): this host lost the voter majority for
   10 s and paused its recoverable workloads itself. The evidence lists them.
-  It resolves when the last one resumes. Each workload resumes on its own once
-  the majority is back, its row still names this host at the same owner epoch
-  and incarnation, and a majority of voters confirms that this host is not
-  fenced and that no recovery claim moved it. One that stays paused is logged
+  It resolves when the last one resumes or its record is dropped, also when
+  the daemon restarted in between (a power cycle while paused). Each
+  workload resumes on its own once the majority is back, its row still names
+  this host at the same owner epoch and incarnation, and a majority of
+  voters confirms that this host is not fenced and that no recovery claim
+  moved it. One that stays paused is logged
   with the reason:
   ```
   partition-pause: paused workload       kind=vm name=<vm> reason="lost the voter majority for 10s (…)"

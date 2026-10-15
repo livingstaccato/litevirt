@@ -202,45 +202,13 @@ func (c *Client) AutomationFinishRecovery(ctx context.Context, reduce Automation
 		if err != nil || actual != digest {
 			return fmt.Errorf("automation staging digest mismatch")
 		}
-		// Promotion and application share one transaction. Only this checked chain
-		// path can mint ancestry anchors; replay itself cannot create trust.
+		// The verified head checkpoint supplies the ancestry provenance. Use the
+		// same FULL transaction-local application path as fresh admission/replay.
 		err = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-			if err := requireAutomationFull(ctx, tx); err != nil {
-				return err
-			}
-			h, err := automationHeadTx(ctx, tx)
-			if err != nil {
-				return err
-			}
-			if d.Sequence != h.Sequence+1 || d.ParentDigest != h.Digest {
-				return fmt.Errorf("automation prefix changed during recovery")
-			}
-			projection, err := automationProjectionTx(ctx, tx, h, d)
-			if err != nil {
-				return err
-			}
-			result, err := reduce(projection, d)
-			if err != nil {
-				return err
-			}
-			receipt, err := json.Marshal(result.Receipt)
-			if err != nil {
-				return err
-			}
-			value, _ := json.Marshal(r.Value)
-			cert, _ := r.Certificate.Encode()
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_anchors (sequence,digest,generation,members_hash,certificate) VALUES (?,?,?,?,?)`, d.Sequence, digest, gen, members, anchorCert); err != nil {
-				return err
-			}
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_history (sequence,digest,value_json,certificate,receipt_json,anchor_sequence) VALUES (?,?,?,?,?,?)`, d.Sequence, digest, string(value), cert, string(receipt), anchorSeq); err != nil {
-				return err
-			}
-			if result.SaveRequest {
-				if _, err = tx.Exec(ctx, `INSERT INTO local_automation_requests (scope,request_id,identity,receipt_json,operation_id) VALUES (?,?,?,?,?)`, result.Scope, d.Command.RequestID, result.Identity, string(receipt), result.Receipt.OperationID); err != nil {
-					return err
-				}
-			}
-			_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, result.ClusterUID, d.Sequence, digest)
+			_, err := automationApplyTx(ctx, tx, r, d, digest, reduce, automationApplicationProvenance{
+				kind: automationStagedAnchor, sequence: uint64(anchorSeq), generation: gen,
+				membersHash: members, certificate: anchorCert,
+			})
 			return err
 		})
 		if err != nil {

@@ -176,11 +176,29 @@ func (c *Client) AutomationApply(ctx context.Context, r AutomationRecord, v *Cla
 	}
 	return c.automationApply(ctx, r, d, digest, cfg, reduce, false)
 }
+
+// These private origins distinguish freshly verified authority, ancestry of a
+// verified recovery checkpoint, and replay from already durable local anchors.
+// Only verification callers construct provenance; no peer trust flag is used.
+type automationApplicationKind uint8
+
+const (
+	automationFreshAnchor automationApplicationKind = iota + 1
+	automationStagedAnchor
+	automationAnchoredReplay
+)
+
+type automationApplicationProvenance struct {
+	kind        automationApplicationKind
+	sequence    uint64
+	generation  int64
+	membersHash string
+	certificate string
+}
+
 func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d contract.Decision, digest string, cfg *VoterConfig, reduce AutomationReducer, replay bool) (out contract.Receipt, e error) {
 	e = c.ExecuteLocal(ctx, func(tx *LocalTx) error {
-		if err := requireAutomationFull(ctx, tx); err != nil {
-			return err
-		}
+		source := automationApplicationProvenance{kind: automationAnchoredReplay}
 		if !replay {
 			current, err := automationAuthorityTx(ctx, tx, c.hostName, cfg.Generation)
 			if err != nil {
@@ -189,79 +207,113 @@ func (c *Client) automationApply(ctx context.Context, r AutomationRecord, d cont
 			if MembersHash(current.Members) != MembersHash(cfg.Members) {
 				return fmt.Errorf("automation membership changed")
 			}
+			source = automationApplicationProvenance{kind: automationFreshAnchor, sequence: d.Sequence, generation: cfg.Generation, membersHash: MembersHash(cfg.Members)}
 		}
-		head, err := automationHeadTx(ctx, tx)
-		if err != nil {
-			return err
-		}
-		if d.Sequence <= head.Sequence {
-			rows, err := tx.Query(ctx, `SELECT digest,receipt_json FROM local_automation_history WHERE sequence=? LIMIT 1`, d.Sequence)
-			if err != nil {
-				return err
-			}
-			if len(rows) != 1 || rows[0].String("digest") != digest {
-				return fmt.Errorf("automation history diverged")
-			}
-			return json.Unmarshal([]byte(rows[0].String("receipt_json")), &out)
-		}
-		if d.Sequence != head.Sequence+1 || d.ParentDigest != head.Digest {
-			return fmt.Errorf("automation predecessor unavailable")
-		}
-		projection, err := automationProjectionTx(ctx, tx, head, d)
-		if err != nil {
-			return err
-		}
-		result, err := reduce(projection, d)
-		if err != nil {
-			return err
-		}
-		out = result.Receipt
-		receipt, err := json.Marshal(out)
-		if err != nil {
-			return err
-		}
-		value, err := json.Marshal(r.Value)
-		if err != nil || len(value) > MaxAutomationClaimBytes {
-			return fmt.Errorf("automation value too large")
-		}
-		cert, err := r.Certificate.Encode()
-		if err != nil {
-			return err
-		}
-		if !replay {
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_anchors (sequence,digest,generation,members_hash,certificate) VALUES (?,?,?,?,?) ON CONFLICT(sequence) DO UPDATE SET certificate=excluded.certificate WHERE digest=excluded.digest`, d.Sequence, digest, cfg.Generation, MembersHash(cfg.Members), cert); err != nil {
-				return err
-			}
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_history (sequence,digest,value_json,certificate,receipt_json,anchor_sequence) VALUES (?,?,?,?,?,?)`, d.Sequence, digest, string(value), cert, string(receipt), d.Sequence); err != nil {
-				return err
-			}
-
-		} else {
-			rows, err := tx.Query(ctx, `SELECT receipt_json FROM local_automation_history WHERE sequence=? AND digest=? LIMIT 1`, d.Sequence, digest)
-			if err != nil {
-				return err
-			}
-			if len(rows) != 1 {
-				return fmt.Errorf("automation replay result missing")
-			}
-			var expected contract.Receipt
-			if err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &expected); err != nil {
-				return err
-			}
-			if expected != out {
-				return fmt.Errorf("automation replay receipt drift")
-			}
-		}
-
-		if result.SaveRequest {
-			if _, err = tx.Exec(ctx, `INSERT INTO local_automation_requests (scope,request_id,identity,receipt_json,operation_id) VALUES (?,?,?,?,?)`, result.Scope, d.Command.RequestID, result.Identity, string(receipt), out.OperationID); err != nil {
-				return err
-			}
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, result.ClusterUID, d.Sequence, digest)
+		var err error
+		out, err = automationApplyTx(ctx, tx, r, d, digest, reduce, source)
 		return err
 	})
 	return
+}
+
+// automationApplyTx is the sole reducer/application persistence path. History,
+// anchors, permanent receipts, typed projections and prefix share this FULL tx.
+func automationApplyTx(ctx context.Context, tx *LocalTx, r AutomationRecord, d contract.Decision, digest string, reduce AutomationReducer, source automationApplicationProvenance) (out contract.Receipt, e error) {
+	if err := requireAutomationFull(ctx, tx); err != nil {
+		return out, err
+	}
+	switch source.kind {
+	case automationFreshAnchor:
+		if source.sequence != d.Sequence {
+			return out, fmt.Errorf("invalid fresh automation provenance")
+		}
+	case automationStagedAnchor:
+		if source.sequence < d.Sequence || source.certificate == "" {
+			return out, fmt.Errorf("invalid staged automation provenance")
+		}
+	case automationAnchoredReplay:
+	default:
+		return out, fmt.Errorf("missing verified automation provenance")
+	}
+	if source.kind != automationAnchoredReplay && (source.generation <= 0 || source.membersHash == "") {
+		return out, fmt.Errorf("invalid automation anchor provenance")
+	}
+	head, err := automationHeadTx(ctx, tx)
+	if err != nil {
+		return out, err
+	}
+	if d.Sequence <= head.Sequence {
+		rows, err := tx.Query(ctx, `SELECT digest,receipt_json FROM local_automation_history WHERE sequence=? LIMIT 1`, d.Sequence)
+		if err != nil {
+			return out, err
+		}
+		if len(rows) != 1 || rows[0].String("digest") != digest {
+			return out, fmt.Errorf("automation history diverged")
+		}
+		err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &out)
+		return out, err
+	}
+	if d.Sequence != head.Sequence+1 || d.ParentDigest != head.Digest {
+		return out, fmt.Errorf("automation predecessor unavailable")
+	}
+	projection, err := automationProjectionTx(ctx, tx, head, d)
+	if err != nil {
+		return out, err
+	}
+	result, err := reduce(projection, d)
+	if err != nil {
+		return out, err
+	}
+	out = result.Receipt
+	receipt, err := json.Marshal(out)
+	if err != nil {
+		return out, err
+	}
+	value, err := json.Marshal(r.Value)
+	if err != nil || len(value) > MaxAutomationClaimBytes {
+		return out, fmt.Errorf("automation value too large")
+	}
+	cert, err := r.Certificate.Encode()
+	if err != nil {
+		return out, err
+	}
+	if source.kind != automationAnchoredReplay {
+		if source.kind == automationFreshAnchor {
+			_, err = tx.Exec(ctx, `INSERT INTO local_automation_anchors (sequence,digest,generation,members_hash,certificate) VALUES (?,?,?,?,?) ON CONFLICT(sequence) DO UPDATE SET certificate=excluded.certificate WHERE digest=excluded.digest`, d.Sequence, digest, source.generation, source.membersHash, cert)
+		} else {
+			_, err = tx.Exec(ctx, `INSERT INTO local_automation_anchors (sequence,digest,generation,members_hash,certificate) VALUES (?,?,?,?,?)`, d.Sequence, digest, source.generation, source.membersHash, source.certificate)
+		}
+		if err != nil {
+			return out, err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO local_automation_history (sequence,digest,value_json,certificate,receipt_json,anchor_sequence) VALUES (?,?,?,?,?,?)`, d.Sequence, digest, string(value), cert, string(receipt), source.sequence); err != nil {
+			return out, err
+		}
+
+	} else {
+		rows, err := tx.Query(ctx, `SELECT receipt_json FROM local_automation_history WHERE sequence=? AND digest=? LIMIT 1`, d.Sequence, digest)
+		if err != nil {
+			return out, err
+		}
+		if len(rows) != 1 {
+			return out, fmt.Errorf("automation replay result missing")
+		}
+		var expected contract.Receipt
+		if err = json.Unmarshal([]byte(rows[0].String("receipt_json")), &expected); err != nil {
+			return out, err
+		}
+		if expected != out {
+			return out, fmt.Errorf("automation replay receipt drift")
+		}
+	}
+
+	if result.SaveRequest {
+		if _, err = tx.Exec(ctx, `INSERT INTO local_automation_requests (scope,request_id,identity,receipt_json,operation_id) VALUES (?,?,?,?,?)`, result.Scope, d.Command.RequestID, result.Identity, string(receipt), out.OperationID); err != nil {
+			return out, err
+		}
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO local_automation_prefix (id,cluster_uid,sequence,digest) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET cluster_uid=excluded.cluster_uid,sequence=excluded.sequence,digest=excluded.digest`, result.ClusterUID, d.Sequence, digest)
+	return out, err
 }
 
 // AutomationReplay rebuilds projections only from locally durable authenticated

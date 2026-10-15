@@ -170,6 +170,9 @@ func (e *Engine) distribute(ctx context.Context, cfg *corrosion.VoterConfig, seq
 	if err != nil || !ok {
 		return
 	}
+	e.distributeRecord(ctx, cfg, r)
+}
+func (e *Engine) distributeRecord(ctx context.Context, cfg *corrosion.VoterConfig, r corrosion.AutomationRecord) {
 	for _, v := range cfg.Names() {
 		if v == e.self {
 			continue
@@ -211,7 +214,7 @@ func (e *Engine) recover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	target := h.Sequence
+	target, lowest := h.Sequence, h.Sequence
 	answers := 0
 	for _, v := range cfg.Names() {
 		if v == e.self {
@@ -225,11 +228,17 @@ func (e *Engine) recover(ctx context.Context) error {
 		}
 		answers++
 		if !ok {
+			lowest = 0
 			continue
 		}
 		d, err := contractDecode(r.Value)
-		if err == nil && d.Sequence > target {
-			target = d.Sequence
+		if err == nil {
+			if d.Sequence > target {
+				target = d.Sequence
+			}
+			if d.Sequence < lowest {
+				lowest = d.Sequence
+			}
 		}
 	}
 	if h.Sequence == 0 && answers < corrosion.MajorityOf(len(cfg.Members))-1 {
@@ -250,19 +259,51 @@ func (e *Engine) recover(ctx context.Context) error {
 		e.distribute(ctx, cfg, 1)
 		return nil
 	}
-	if target <= h.Sequence {
+	if target <= h.Sequence && lowest >= target {
 		return nil
 	}
 	// Peer head is a hint. Existing Prepare/Accept re-certify the unchanged value
 	// under current locally authorized membership before backward staging.
 	out, err := e.decide(ctx, cfg, target, nil)
 	if err != nil {
+		if lowest < target {
+			return e.recoverIntermediate(ctx, cfg, lowest, target)
+		}
 		return err
 	}
-	if err = e.db.AutomationBeginRecovery(ctx, corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}, e.verifier); err != nil {
+	record := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
+	if err = e.db.AutomationBeginRecovery(ctx, record, e.verifier); err != nil {
 		return err
 	}
-	return e.resumeRecovery(ctx, cfg)
+	if err = e.resumeRecovery(ctx, cfg); err != nil {
+		return err
+	}
+	// Forward the renewed certificate, rather than reloading the original
+	// stored certificate whose leaf may have expired.
+	e.distributeRecord(ctx, cfg, record)
+	return nil
+}
+
+// A current quorum may contain a voter unable to promise the highest slot
+// until its predecessor is applied. Recover exact accepted intermediate values
+// with no new proposal, verify them normally, and yield after bounded work.
+// Head hints only select work: they never grant authority or relax expiry.
+func (e *Engine) recoverIntermediate(ctx context.Context, cfg *corrosion.VoterConfig, lowest, target uint64) error {
+	for steps, seq := 0, lowest+1; steps < 16 && seq <= target; steps, seq = steps+1, seq+1 {
+		out, err := e.decide(ctx, cfg, seq, nil)
+		if err != nil {
+			return err
+		}
+		record := corrosion.AutomationRecord{Value: out.Value, Certificate: out.Certificate}
+		if _, err = e.db.AutomationApply(ctx, record, e.verifier, reduce); err != nil {
+			return err
+		}
+		e.distributeRecord(ctx, cfg, record)
+		if seq == target {
+			return nil
+		}
+	}
+	return fail(CodeUnavailable)
 }
 
 func (e *Engine) resumeRecovery(ctx context.Context, cfg *corrosion.VoterConfig) error {

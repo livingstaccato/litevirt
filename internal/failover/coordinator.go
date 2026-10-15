@@ -718,7 +718,6 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.mAttempt(PhaseQuorum, ResultSkipped, ErrNoQuorum)
 		return
 	}
-	quorum := len(voters)/2 + 1
 
 	// The failover scope decides whose observations count toward a decision
 	// about each host: every voter, or the host's own region's voters
@@ -774,14 +773,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// also carries a pinned consecutive_failures of 1 (health.checkHost), so a
 	// coordinator on an older build, whose query has no status clause, cannot
 	// count it during a rolling upgrade either.
-	freshCutoff := c.now().Add(-healthFreshness)
-	hh, err := c.db.Query(ctx,
-		`SELECT target, observer, consecutive_failures, last_seen, updated_at
-		 FROM host_health
-		 WHERE target != ?
-		   AND consecutive_failures >= ?
-		   AND status != ?`,
-		c.hostName, offlineThreshold, health.StatusUnready)
+	obs, err := candidateObservations(ctx, c.db, c.hostName)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
@@ -795,7 +787,14 @@ func (c *Coordinator) run(ctx context.Context) {
 	// clock reaches it. This errs toward not fencing, and only for as long as
 	// the skew lasts; host recovery (recoverHosts) deliberately keeps the
 	// one-sided test, since readmitting a host is not the irreversible act.
-	futureCutoff := c.now().Add(healthFreshness)
+	now := c.now()
+	for _, o := range obs {
+		if inst, _, future := observationInstant(o, now); future {
+			slog.Warn("failover: ignoring a future-dated health observation (clock skew)",
+				"target", o.Target, "observer", o.Observer,
+				"updated_at", o.UpdatedAt, "ahead", inst.Sub(now).Round(time.Second))
+		}
+	}
 	// An observation older than the moment its target turned active is about
 	// the host before (joining, offline, fenced, upgrading), not the one active
 	// now, so a host that just turned active is counted down afresh — and so
@@ -805,68 +804,25 @@ func (c *Coordinator) run(ctx context.Context) {
 	if aerr != nil {
 		slog.Warn("failover: read when hosts turned active", "error", aerr)
 	}
-	// fenceTimes caches each target's fence-log timestamps for this cycle
-	// (inheritedRunGrace).
-	fenceTimes := map[string][]time.Time{}
-	freshObservers := map[string]map[string]struct{}{}
-	// clusterObservers is the cluster-wide count, kept under region scope only
-	// to report a host it would have fenced and the region count does not.
-	clusterObservers := map[string]map[string]struct{}{}
-	for _, r := range hh {
-		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
-		if !ok || !inst.After(freshCutoff) {
-			continue // stale or unparseable → does not count toward quorum
-		}
-		if inst.After(futureCutoff) {
-			slog.Warn("failover: ignoring a future-dated health observation (clock skew)",
-				"target", r.String("target"), "observer", r.String("observer"),
-				"updated_at", r.String("updated_at"), "ahead", inst.Sub(c.now()).Round(time.Second))
-			continue
-		}
-		t, o := r.String("target"), r.String("observer")
-		if since, ok := activeSince[t]; ok && !countedSinceActiveWithin(r.Int("consecutive_failures"), r.String("last_seen"), inst, since,
-			c.inheritedRunGrace(ctx, t, since, fenceTimes)) {
-			continue
-		}
-		if c.scope.region && countsAsVote(voters, o, t) {
-			if clusterObservers[t] == nil {
-				clusterObservers[t] = map[string]struct{}{}
-			}
-			clusterObservers[t][o] = struct{}{}
-		}
-		if !countsAsVote(c.scope.voters(t), o, t) {
-			continue
-		}
-		if freshObservers[t] == nil {
-			freshObservers[t] = map[string]struct{}{}
-		}
-		freshObservers[t][o] = struct{}{}
-	}
-	type fenceCandidate struct {
-		target    string
-		observers int
-	}
-	var candidates []fenceCandidate
-	for t, obs := range freshObservers {
-		if len(obs) >= c.scope.quorum(t) {
-			candidates = append(candidates, fenceCandidate{t, len(obs)})
-		}
-	}
+	// The count itself is FenceCandidates, a pure function of these inputs,
+	// so the HA arm handler's list of down hosts is this decision exactly
+	// (CurrentFenceCandidates). The side effects stay here.
+	in := CandidateInputs{Self: c.hostName, RegionScope: c.scope.region, Voters: vr, Now: now,
+		Observations: obs, ActiveSince: activeSince, UpgradingTimeout: c.upgradingTimeout()}
+	readFenceTimes(ctx, c.db, &in)
+	candidates, declinedList := FenceCandidates(in)
 	// Region scope: say so when the cluster-wide count would have fenced a
 	// host and the region count does not. Silence here would read as "nothing
 	// is down".
 	declined := map[string]bool{}
-	for t, obs := range clusterObservers {
-		if len(obs) >= quorum && len(freshObservers[t]) < c.scope.quorum(t) {
-			declined[t] = true
-			c.noteRegionDeclined(c.scope, t, len(obs), len(freshObservers[t]))
-		}
+	for _, d := range declinedList {
+		declined[d.Target] = true
+		c.noteRegionDeclined(c.scope, d.Target, d.ClusterObservers, d.RegionObservers)
 	}
 	c.clearRegionDeclined(declined)
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
 	c.cycleCandidates = make(map[string]bool, len(candidates))
 	for _, cand := range candidates {
-		c.cycleCandidates[cand.target] = true
+		c.cycleCandidates[cand.Target] = true
 	}
 
 	// Relay health (colonelpanik/litevirt#175): demote a host whose probes
@@ -876,7 +832,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// candidates — those are fenced, not demoted. It never fails the cycle.
 	fenceCandidates := make(map[string]bool, len(candidates))
 	for _, cand := range candidates {
-		fenceCandidates[cand.target] = true
+		fenceCandidates[cand.Target] = true
 	}
 	c.evaluateRelayHealth(ctx, voters, fenceCandidates)
 
@@ -898,7 +854,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			return
 		}
 
-		target := cand.target
+		target := cand.Target
 		// One-way partitions are made visible, never acted on differently
 		// (docs/design/partition-pause.md §7 F4).
 		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
@@ -1017,7 +973,7 @@ func (c *Coordinator) run(ctx context.Context) {
 					c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "", c.fenceStateLatched(ctx))
 					continue
 				case resumeAfterRefence:
-					if c.refence(ctx, h, rec, cand.observers) {
+					if c.refence(ctx, h, rec, cand.Observers) {
 						continue
 					}
 				default:
@@ -1138,7 +1094,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		// cached: the next cycle after the grace window judges afresh.
 		if c.LocalStall != nil && c.LocalStall() {
 			slog.Warn("failover: quorum reached, but this node was itself not running moments ago — deferring the fence until it has watched for a full grace window",
-				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.StallGrace)
+				"host", target, "observers", cand.Observers, "quorum", c.scope.quorum(target), "grace", health.StallGrace)
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
 			continue
 		}
@@ -1147,13 +1103,13 @@ func (c *Coordinator) run(ctx context.Context) {
 		// after a fleet-wide blip they name every host (partition pause, §7 F7).
 		if c.QuorumRegain != nil && c.QuorumRegain(ctx, c.scope.graceScope(target)) {
 			slog.Warn("failover: quorum reached, but this node regained the voter majority only moments ago — deferring the fence until the observers have re-probed",
-				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.QuorumRegainGrace)
+				"host", target, "observers", cand.Observers, "quorum", c.scope.quorum(target), "grace", health.QuorumRegainGrace)
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrQuorumRegain)
 			continue
 		}
 
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
-			"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target),
+			"host", target, "observers", cand.Observers, "quorum", c.scope.quorum(target),
 			"region_scoped", c.scope.region)
 
 		if retry {
@@ -1167,7 +1123,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				continue
 			}
 			slog.Warn("failover: the newest fence of this host failed; fencing it again",
-				"host", target, "strategy", retryPlan.Strategy, "failures", retryPlan.Failures, "observers", cand.observers)
+				"host", target, "strategy", retryPlan.Strategy, "failures", retryPlan.Failures, "observers", cand.Observers)
 			// The retry runs retryStrategy, never weaker than the host's
 			// current strategy allows, as a re-fence runs the recorded method.
 			again := *h
@@ -1183,7 +1139,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// candidate resolves: the quorum that could not reach it now can.
 	candTargets := make([]string, 0, len(candidates))
 	for _, cand := range candidates {
-		candTargets = append(candTargets, cand.target)
+		candTargets = append(candTargets, cand.Target)
 	}
 	c.resolveOneWayGone(ctx, candTargets)
 	c.resolveRefenceSettled(ctx)

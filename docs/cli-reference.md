@@ -116,7 +116,7 @@ lv host init --local --name <name>        # Bootstrap on localhost (standalone)
 lv host add <user@host> --name <name>     # Add host to cluster
 lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
-lv host inspect <host>                    # Host details
+lv host inspect <host>                    # Host details, with the capacity reservations counted against it (see diagnostics.md)
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host> [--failback]       # Return host to scheduling (--failback: wait for the failback it started and print results)

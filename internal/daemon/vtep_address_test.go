@@ -62,10 +62,12 @@ func TestNewServer_FirstNetworkPassHasTheHostAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// newServer is NewServer plus wireServer; a test has no libvirt for
-	// NewServer, so it builds the test server and wires it the same way.
-	svc := grpcapi.NewServerForTests(grpcapi.TestServerOpts{HostName: "node-1", DataDir: dataDir, DB: db})
-	d.wireServer(svc)
+	// A test has no libvirt for grpcapi.NewServer; newServer builds the test
+	// server instead and wires it exactly as Run's does.
+	d.buildServer = func() *grpcapi.Server {
+		return grpcapi.NewServerForTests(grpcapi.TestServerOpts{HostName: "node-1", DataDir: dataDir, DB: db})
+	}
+	svc := d.newServer()
 	prov := &recProv{}
 	svc.SetNetworkProvisioner(prov)
 	type call struct {

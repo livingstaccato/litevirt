@@ -33,7 +33,7 @@ import (
 // one is skipped rather than refused: during an upgrade a peer on an earlier
 // build can still register an address that is also this host's.
 func SyncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int) error {
-	return syncFDB(ctx, db, networkName, hostName, vni, "", "")
+	return syncFDB(ctx, db, hostFDB(), networkName, hostName, vni, "", "")
 }
 
 // SyncPeerVTEP is SyncFloodEntries for a peer that has just sent its VTEP
@@ -42,7 +42,7 @@ func SyncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, ho
 // the peer's previous address, re-adding that is exactly the stale entry the
 // prune removes.
 func SyncPeerVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error {
-	return syncFDB(ctx, db, networkName, hostName, vni, peer, peerAddr)
+	return syncFDB(ctx, db, hostFDB(), networkName, hostName, vni, peer, peerAddr)
 }
 
 // SyncFDB is SyncFloodEntries for a provisioned network's definition: a no-op
@@ -54,8 +54,23 @@ func SyncFDB(ctx context.Context, db *corrosion.Client, networkName string, def 
 	return SyncFloodEntries(ctx, db, networkName, hostName, def.VNI)
 }
 
-func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int, peer, peerAddr string) error {
-	local := loadLocalAddrs()
+// SyncFDBWith is SyncFDB on a host modelled by the caller: its `bridge fdb`
+// commands go to exec, and its own addresses are local. The fleet harness
+// runs each node's sync against that node's own model of the kernel table.
+func SyncFDBWith(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, hostName string,
+	exec ExecFunc, local []string) error {
+	if def.Type != "vxlan" || def.VNI == 0 {
+		return nil
+	}
+	o := fdbOps{exec: exec, local: localAddrs{}}
+	for _, a := range local {
+		o.local[a] = ""
+	}
+	return syncFDB(ctx, db, o, networkName, hostName, def.VNI, "", "")
+}
+
+func syncFDB(ctx context.Context, db *corrosion.Client, o fdbOps, networkName, hostName string, vni int, peer, peerAddr string) error {
+	local := o.local
 	vteps, err := GetVTEPs(ctx, db, networkName)
 	if err != nil {
 		return fmt.Errorf("get vteps: %w", err)
@@ -90,7 +105,7 @@ func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName st
 	}
 	sort.Strings(addrs)
 	for _, a := range addrs {
-		if err := addFDB(local, vni, floodMAC, a); err != nil {
+		if err := o.appendFlood(vni, a); err != nil {
 			return fmt.Errorf("flood entry %s: %w", a, err)
 		}
 	}
@@ -122,7 +137,7 @@ func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName st
 		slog.Warn("vxlan: list hosts for flood-entry pruning; keeping every flood entry not proven stale", "error", err)
 	}
 
-	entries, err := vxlanFDB(vni)
+	entries, err := o.list(vni)
 	if err != nil {
 		slog.Warn("vxlan: read forwarding entries", "vni", vni, "error", err)
 	}
@@ -134,14 +149,14 @@ func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName st
 			slog.Warn("vxlan: removing a forwarding entry that points at this host's own address",
 				"vni", vni, "mac", mac, "dst", e.Dst)
 			if mac == floodMAC {
-				_ = DeleteFloodEntry(vni, e.Dst)
+				_ = o.del(vni, floodMAC, e.Dst)
 			} else {
-				_ = DeleteFDBEntry(vni, mac, e.Dst)
+				_ = o.del(vni, mac, e.Dst)
 			}
 		case mac == floodMAC:
 			if hostsKnown && !keepFlood[e.Dst] {
 				slog.Info("vxlan: removing a stale flood entry", "vni", vni, "dst", e.Dst)
-				_ = DeleteFloodEntry(vni, e.Dst)
+				_ = o.del(vni, floodMAC, e.Dst)
 			}
 		default:
 			d, wanted := wantUni[mac]
@@ -152,7 +167,7 @@ func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName st
 				// Repointed (the NIC's host has another VTEP now), or
 				// pointing at an address that is no VTEP of the network.
 				slog.Info("vxlan: removing a stale unicast entry", "vni", vni, "mac", mac, "dst", e.Dst)
-				_ = DeleteFDBEntry(vni, mac, e.Dst)
+				_ = o.del(vni, mac, e.Dst)
 			}
 		}
 	}
@@ -164,7 +179,7 @@ func syncFDB(ctx context.Context, db *corrosion.Client, networkName, hostName st
 	}
 	sort.Strings(macs)
 	for _, mac := range macs {
-		if err := addFDB(local, vni, mac, wantUni[mac]); err != nil {
+		if err := o.addUnicast(vni, mac, wantUni[mac]); err != nil {
 			slog.Warn("vxlan: add unicast entry", "vni", vni, "mac", mac, "dst", wantUni[mac], "error", err)
 		}
 	}

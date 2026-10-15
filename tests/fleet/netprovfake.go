@@ -10,6 +10,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/network/fdbfake"
 )
 
 // NetProvFake is the fleet stand-in for the host network provisioner: one per
@@ -34,10 +35,11 @@ type NetProvFake struct {
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
-	failWith      map[string]error    // network → the error its Provision returns (FailProvision)
-	vteps         map[string]string   // network → the VTEP address its last Provision was handed
-	fdbSyncs      map[string]int      // network → SyncFDB calls
-	flood         map[string][]string // network → flood list at the last SyncFDB
+	failWith      map[string]error  // network → the error its Provision returns (FailProvision)
+	vteps         map[string]string // network → the VTEP address its last Provision was handed
+	fdbSyncs      map[string]int    // network → SyncFDB calls
+	kernel        *fdbfake.Kernel   // this node's vxlan forwarding table (SyncFDB)
+	vnis          map[string]int    // network → VNI, from SyncFDB
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -224,37 +226,38 @@ func (f *NetProvFake) VTEP(network string) string {
 	return f.vteps[network]
 }
 
-// SyncFDB counts the network reconciler's forwarding-entry syncs and, as the
-// real sync does, derives the flood list from the replicated VTEP rows: every
-// other host's VTEP (Flood).
-func (f *NetProvFake) SyncFDB(ctx context.Context, db *corrosion.Client, name string, _ compose.NetworkDef, hostName string) error {
-	vteps, err := network.GetVTEPs(ctx, db, name)
-	if err != nil {
-		return err
-	}
-	var flood []string
-	for _, v := range vteps {
-		if v.HostName != hostName {
-			flood = append(flood, v.VTEPAddr)
-		}
-	}
-	sort.Strings(flood)
+// SyncFDB counts the network reconciler's forwarding-entry syncs and runs
+// the real sync (network.SyncFDBWith) against this node's model of the
+// kernel's forwarding table (fdbfake), where a second `add` of the flood
+// entry is refused as it is on a host. Its own address is the VTEP its last
+// Provision of the network was handed.
+func (f *NetProvFake) SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.fdbSyncs == nil {
 		f.fdbSyncs = map[string]int{}
-		f.flood = map[string][]string{}
+	}
+	if f.kernel == nil {
+		f.kernel = fdbfake.New()
 	}
 	f.fdbSyncs[name]++
-	f.flood[name] = flood
-	return nil
+	k, self := f.kernel, f.vteps[name]
+	if f.vnis == nil {
+		f.vnis = map[string]int{}
+	}
+	f.vnis[name] = def.VNI
+	f.mu.Unlock()
+	return network.SyncFDBWith(ctx, db, name, def, hostName, k.Exec, []string{self})
 }
 
-// Flood is network's flood list at this node's last SyncFDB, sorted.
+// Flood is network's flood list in this node's kernel table, sorted.
 func (f *NetProvFake) Flood(network string) []string {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.flood[network]...)
+	k, vni := f.kernel, f.vnis[network]
+	f.mu.Unlock()
+	if k == nil {
+		return nil
+	}
+	return k.Dsts(fmt.Sprintf("vxlan%d", vni), "00:00:00:00:00:00")
 }
 
 // FDBSyncs counts SyncFDB calls for network on this node.

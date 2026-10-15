@@ -12,6 +12,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netutil"
+	"github.com/litevirt/litevirt/internal/network/fdbfake"
 )
 
 // multiHomedLab models a lab node (lab1-vxlan-dhcp.md): the default route and
@@ -21,17 +22,20 @@ import (
 func multiHomedLab(t *testing.T) {
 	t.Helper()
 	setHostAddrs(t, localAddrs{
-		"127.0.0.1":  {Dev: "lo"},
-		"10.0.2.15":  {Dev: "ens3", Carrier: true},
-		"10.77.0.11": {Dev: "net1", Carrier: true},
+		"127.0.0.1":  "lo",
+		"10.0.2.15":  "ens3",
+		"10.77.0.11": "net1",
 	})
 }
 
+// setHostAddrs models this host's addresses (address → interface). lo and
+// dummy* interfaces cannot carry a tunnel; every other one can.
 func setHostAddrs(t *testing.T, addrs localAddrs) {
 	t.Helper()
-	prev := hostAddrs
+	prev, prevCarries := hostAddrs, deviceCarries
 	hostAddrs = func() (localAddrs, error) { return addrs, nil }
-	t.Cleanup(func() { hostAddrs = prev })
+	deviceCarries = func(dev string) bool { return dev != "lo" && !strings.HasPrefix(dev, "dummy") }
+	t.Cleanup(func() { hostAddrs, deviceCarries = prev, prevCarries })
 }
 
 // fakeExec records every command and answers each through reply (nil means
@@ -107,11 +111,11 @@ func TestResolveVTEP_BeforeTheSwitch(t *testing.T) {
 // refused, naming the network and the device.
 func TestResolveVTEP_NamedUnderlayWins(t *testing.T) {
 	setHostAddrs(t, localAddrs{
-		"127.0.0.1":   {Dev: "lo"},
-		"192.168.1.5": {Dev: "eth0", Carrier: true},
-		"fe80::1":     {Dev: "eth0", Carrier: true},
-		"10.77.0.11":  {Dev: "net1", Carrier: true},
-		"fe80::2":     {Dev: "eth9", Carrier: true},
+		"127.0.0.1":   "lo",
+		"192.168.1.5": "eth0",
+		"fe80::1":     "eth0",
+		"10.77.0.11":  "net1",
+		"fe80::2":     "eth9",
 	})
 	fakeExec(t, defaultRouteVia("eth0"))
 	for _, tc := range []struct{ underlay, local string }{
@@ -141,9 +145,9 @@ func TestResolveVTEP_LoopbackOrDummyHolder(t *testing.T) {
 	fakeExec(t, defaultRouteVia("eth0"))
 	for _, holder := range []string{"lo", "dummy0"} {
 		setHostAddrs(t, localAddrs{
-			"127.0.0.1":    {Dev: "lo"},
-			"10.1.1.1":     {Dev: holder},
-			"192.168.0.10": {Dev: "eth0", Carrier: true},
+			"127.0.0.1":    "lo",
+			"10.1.1.1":     holder,
+			"192.168.0.10": "eth0",
 		})
 		local, dev, err := ResolveVTEP("vxd_vxdnet", vxdDef, "10.1.1.1", true)
 		if err != nil || local != "10.1.1.1" || dev != "eth0" {
@@ -234,7 +238,7 @@ func TestFDBEntries_RefuseThisHostsAddress(t *testing.T) {
 		t.Fatalf("AddFDBEntry(peer): %v", err)
 	}
 	want := []string{
-		"bridge fdb add 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
+		"bridge fdb append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
 		"bridge fdb add 52:54:00:53:c8:b3 dev vxlan5177 dst 10.77.0.14",
 	}
 	if !slices.Equal(*calls, want) {
@@ -260,11 +264,14 @@ func fdbReply(cmd string) ([]byte, error) {
 	return nil, nil
 }
 
+// fdbChanges splits a pass's commands into its installs ("add <mac> ..." for
+// a unicast entry, "append 00:00:00:00:00:00 ..." for a flood destination)
+// and its removals ("<mac> dev ... dst ...").
 func fdbChanges(calls []string) (adds, dels []string) {
 	for _, c := range calls {
 		switch {
-		case strings.HasPrefix(c, "bridge fdb add "):
-			adds = append(adds, strings.TrimPrefix(c, "bridge fdb add "))
+		case strings.HasPrefix(c, "bridge fdb add "), strings.HasPrefix(c, "bridge fdb append "):
+			adds = append(adds, strings.TrimPrefix(c, "bridge fdb "))
 		case strings.HasPrefix(c, "bridge fdb del "):
 			dels = append(dels, strings.TrimPrefix(c, "bridge fdb del "))
 		}
@@ -307,7 +314,7 @@ func TestSyncFloodEntries_SkipsSelfAndPrunesStale(t *testing.T) {
 		t.Fatalf("SyncFloodEntries: %v", err)
 	}
 	adds, dels := fdbChanges(*calls)
-	if want := []string{"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12"}; !slices.Equal(adds, want) {
+	if want := []string{"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12"}; !slices.Equal(adds, want) {
 		t.Errorf("added %q, want %q", adds, want)
 	}
 	wantDels := []string{
@@ -341,7 +348,7 @@ func TestSyncPeerVTEP_ReplacesThePeersOldAddress(t *testing.T) {
 		t.Fatalf("SyncPeerVTEP: %v", err)
 	}
 	adds, dels := fdbChanges(*calls)
-	if want := []string{"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14"}; !slices.Equal(adds, want) {
+	if want := []string{"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14"}; !slices.Equal(adds, want) {
 		t.Errorf("added %q, want %q", adds, want)
 	}
 	if want := []string{"00:00:00:00:00:00 dev vxlan5177 dst 192.168.5.4"}; !slices.Equal(dels, want) {
@@ -482,10 +489,10 @@ func TestSyncFloodEntries_UnicastFollowsTheNICs(t *testing.T) {
 	}
 	adds, dels := fdbChanges(*calls)
 	want := []string{
-		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
-		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
-		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
-		"52:54:00:00:00:04 dev vxlan5177 dst 10.77.0.14",
+		"add 52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
+		"add 52:54:00:00:00:04 dev vxlan5177 dst 10.77.0.14",
+		"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
+		"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
 	}
 	if !slices.Equal(adds, want) || len(dels) != 0 {
 		t.Fatalf("on an empty device: added %q removed %q, want added %q", adds, dels, want)
@@ -509,9 +516,9 @@ func TestSyncFloodEntries_UnicastFollowsTheNICs(t *testing.T) {
 	}
 	adds, dels = fdbChanges(*calls)
 	wantAdds := []string{
-		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
-		"00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
-		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
+		"add 52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.12",
+		"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.12",
+		"append 00:00:00:00:00:00 dev vxlan5177 dst 10.77.0.14",
 	}
 	wantDels := []string{
 		"52:54:00:00:00:02 dev vxlan5177 dst 10.77.0.99",
@@ -545,5 +552,49 @@ func TestRefusedEntry_LoggedOncePerAddress(t *testing.T) {
 		if !strings.Contains(l, "level=WARN") {
 			t.Errorf("refusal logged as %q, want WARN", l)
 		}
+	}
+}
+
+// TestSyncFloodEntries_FloodListHoldsEveryPeer runs the sync against a model
+// of the kernel's table (fdbfake): one flood entry per device, with a list of
+// destinations, where a second `add` of the all-zeros MAC is refused with
+// "File exists". Every peer ends up on the list — the lab's node-1 held only
+// .13 and never gained .14 — and removing a peer that moved deletes only its
+// own destination.
+func TestSyncFloodEntries_FloodListHoldsEveryPeer(t *testing.T) {
+	multiHomedLab(t)
+	k := fdbfake.New()
+	k.Set("vxlan5177", floodMAC, "10.77.0.13") // what an earlier build left
+	prev := execCommand
+	execCommand = k.Exec
+	t.Cleanup(func() { execCommand = prev })
+	ctx := context.Background()
+	db := vtepTestDB(t)
+	for _, v := range []struct{ host, ip string }{
+		{"node-1", "10.77.0.11"}, {"node-2", "10.77.0.12"}, {"node-3", "10.77.0.13"}, {"node-4", "10.77.0.14"},
+	} {
+		if err := UpsertVTEP(ctx, db, "vxd_vxdnet", v.host, v.ip, 5177); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := SyncFloodEntries(ctx, db, "vxd_vxdnet", "node-1", 5177); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"10.77.0.12", "10.77.0.13", "10.77.0.14"}
+	if got := k.Dsts("vxlan5177", floodMAC); !slices.Equal(got, want) {
+		t.Fatalf("flood list %v, want every peer %v", got, want)
+	}
+
+	// node-4's VTEP moves: its old destination goes, the others stay.
+	if err := UpsertVTEP(ctx, db, "vxd_vxdnet", "node-4", "10.77.0.24", 5177); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncFloodEntries(ctx, db, "vxd_vxdnet", "node-1", 5177); err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"10.77.0.12", "10.77.0.13", "10.77.0.24"}
+	if got := k.Dsts("vxlan5177", floodMAC); !slices.Equal(got, want) {
+		t.Fatalf("flood list after node-4 moved %v, want %v", got, want)
 	}
 }

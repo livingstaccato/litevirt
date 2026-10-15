@@ -82,6 +82,10 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
+	// no libvirt); nil in a daemon.
+	buildServer func() *grpcapi.Server
+
 	// certWatch reports on the certificates this node serves (cert_watch.go).
 	certWatch *certWatch
 
@@ -2734,7 +2738,12 @@ func getOutboundIP() string {
 // later, the pass would find neither, and the server refuses a vxlan network
 // with no address rather than guess one.
 func (d *Daemon) newServer() *grpcapi.Server {
-	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	var svc *grpcapi.Server
+	if d.buildServer != nil {
+		svc = d.buildServer()
+	} else {
+		svc = grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	}
 	d.wireServer(svc)
 	return svc
 }

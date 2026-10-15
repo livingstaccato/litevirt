@@ -39,18 +39,31 @@ func isAlreadyExists(out []byte) bool {
 	return strings.Contains(s, "File exists") || strings.Contains(s, "already exists") || strings.Contains(s, "already assigned")
 }
 
+// fdbOps runs the `bridge fdb` commands of one pass through exec, against
+// one read of this host's addresses.
+type fdbOps struct {
+	exec  ExecFunc
+	local localAddrs
+}
+
+// hostFDB is fdbOps on this host: the package's exec seam and a fresh read of
+// its addresses.
+func hostFDB() fdbOps { return fdbOps{exec: execCommand, local: loadLocalAddrs()} }
+
 // AddFDBEntry adds a unicast FDB entry: bridge fdb add <mac> dev vxlan<VNI> dst <remoteVTEP>
 // An entry whose remoteVTEP is this host's own address is refused (nil, and
 // nothing installed): see refuseLocalDst.
 func AddFDBEntry(vni int, mac, remoteVTEP string) error {
-	return addFDB(loadLocalAddrs(), vni, mac, remoteVTEP)
+	return hostFDB().addUnicast(vni, mac, remoteVTEP)
 }
 
-func addFDB(local localAddrs, vni int, mac, remoteVTEP string) error {
-	if refuseLocalDst(local, vni, mac, remoteVTEP) {
+// addUnicast creates a MAC's entry (`bridge fdb add`): one destination per
+// MAC. An entry the MAC already has is left as it is ("File exists").
+func (o fdbOps) addUnicast(vni int, mac, remoteVTEP string) error {
+	if refuseLocalDst(o.local, vni, mac, remoteVTEP) {
 		return nil
 	}
-	out, err := execCommand("bridge", "fdb", "add", mac,
+	out, err := o.exec("bridge", "fdb", "add", mac,
 		"dev", vtepName(vni), "dst", remoteVTEP)
 	if err != nil && !isAlreadyExists(out) {
 		return fmt.Errorf("bridge fdb add %s: %w: %s", mac, err, out)
@@ -58,30 +71,47 @@ func addFDB(local localAddrs, vni int, mac, remoteVTEP string) error {
 	return nil
 }
 
+// appendFlood adds remoteVTEP to the all-zeros flood entry (`bridge fdb
+// append`). The kernel keeps ONE entry per MAC with a list of destinations:
+// `add` creates that entry and answers "File exists" for every later
+// destination, so a flood list built with it holds only its first peer.
+func (o fdbOps) appendFlood(vni int, remoteVTEP string) error {
+	if refuseLocalDst(o.local, vni, floodMAC, remoteVTEP) {
+		return nil
+	}
+	out, err := o.exec("bridge", "fdb", "append", floodMAC,
+		"dev", vtepName(vni), "dst", remoteVTEP)
+	if err != nil && !isAlreadyExists(out) {
+		return fmt.Errorf("bridge fdb append flood %s: %w: %s", remoteVTEP, err, out)
+	}
+	return nil
+}
+
+// del removes one destination of mac's entry (`bridge fdb del ... dst`); the
+// MAC's other destinations stay.
+func (o fdbOps) del(vni int, mac, remoteVTEP string) error {
+	out, err := o.exec("bridge", "fdb", "del", mac,
+		"dev", vtepName(vni), "dst", remoteVTEP)
+	if err != nil && !isAlreadyExists(out) {
+		return fmt.Errorf("bridge fdb del %s dst %s: %w: %s", mac, remoteVTEP, err, out)
+	}
+	return nil
+}
+
 // DeleteFDBEntry removes a unicast FDB entry: bridge fdb del <mac> dev vxlan<VNI> dst <remoteVTEP>
 func DeleteFDBEntry(vni int, mac, remoteVTEP string) error {
-	out, err := execCommand("bridge", "fdb", "del", mac,
-		"dev", vtepName(vni), "dst", remoteVTEP)
-	if err != nil && !isAlreadyExists(out) {
-		return fmt.Errorf("bridge fdb del %s: %w: %s", mac, err, out)
-	}
-	return nil
+	return fdbOps{exec: execCommand}.del(vni, mac, remoteVTEP)
 }
 
-// FloodEntry adds a BUM flood entry: bridge fdb add 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>
+// FloodEntry adds a BUM flood destination: bridge fdb append 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>
 // As with AddFDBEntry, a remoteVTEP of this host's own is refused.
 func FloodEntry(vni int, remoteVTEP string) error {
-	return addFDB(loadLocalAddrs(), vni, floodMAC, remoteVTEP)
+	return hostFDB().appendFlood(vni, remoteVTEP)
 }
 
-// DeleteFloodEntry removes a BUM flood entry: bridge fdb del 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>
+// DeleteFloodEntry removes one BUM flood destination: bridge fdb del 00:00:00:00:00:00 dev vxlan<VNI> dst <remoteVTEP>
 func DeleteFloodEntry(vni int, remoteVTEP string) error {
-	out, err := execCommand("bridge", "fdb", "del", floodMAC,
-		"dev", vtepName(vni), "dst", remoteVTEP)
-	if err != nil && !isAlreadyExists(out) {
-		return fmt.Errorf("bridge fdb del flood %s: %w: %s", remoteVTEP, err, out)
-	}
-	return nil
+	return fdbOps{exec: execCommand}.del(vni, floodMAC, remoteVTEP)
 }
 
 // floodMAC is the all-zeros MAC of a BUM flood entry.
@@ -93,11 +123,11 @@ type fdbEntry struct {
 	Dst string
 }
 
-// vxlanFDB lists the forwarding entries with a destination on vxlan<VNI>
+// list lists the forwarding entries with a destination on vxlan<VNI>
 // (`bridge fdb show dev vxlan<VNI>`). Entries without one — those the bridge
 // learned on its port — are not listed. A missing device has none.
-func vxlanFDB(vni int) ([]fdbEntry, error) {
-	out, err := execCommand("bridge", "fdb", "show", "dev", vtepName(vni))
+func (o fdbOps) list(vni int) ([]fdbEntry, error) {
+	out, err := o.exec("bridge", "fdb", "show", "dev", vtepName(vni))
 	if err != nil {
 		if isNoSuchDevice(out) {
 			return nil, nil

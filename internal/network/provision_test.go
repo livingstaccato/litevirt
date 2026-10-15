@@ -447,11 +447,11 @@ func TestSyncFloodEntries(t *testing.T) {
 		t.Fatalf("SyncFloodEntries: %v", err)
 	}
 
-	// Should have added a flood entry only for host2 (the rest of the calls
-	// read the device's entries for pruning).
+	// Should have appended a flood destination only for host2 (the rest of
+	// the calls read the device's entries for pruning).
 	var adds [][]string
 	for _, c := range calls {
-		if len(c) > 2 && c[0] == "bridge" && c[2] == "add" {
+		if len(c) > 2 && c[0] == "bridge" && c[2] == "append" {
 			adds = append(adds, c)
 		}
 	}

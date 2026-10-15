@@ -10,18 +10,10 @@ import (
 	"github.com/litevirt/litevirt/internal/netutil"
 )
 
-// hostAddr is one address of this host: the interface holding it, and whether
-// that interface can carry a VXLAN tunnel. A loopback or dummy interface (the
-// /32 of a routed-to-the-host fabric) or a vxlan device cannot: frames sent
-// "out" of it go nowhere.
-type hostAddr struct {
-	Dev     string
-	Carrier bool
-}
-
-// localAddrs is this host's addresses, read once (hostAddrs) and passed to
-// every check of a pass, not re-read per entry.
-type localAddrs map[string]hostAddr
+// localAddrs is this host's addresses, each mapped to the interface holding
+// it, read once (hostAddrs) and passed to every check of a pass, not re-read
+// per entry.
+type localAddrs map[string]string
 
 // has reports whether ip is an address of this host. A VXLAN forwarding entry
 // whose destination is one of them sends the frame back into the same vxlan
@@ -63,7 +55,6 @@ func hostInterfaceAddrs() (localAddrs, error) {
 		if err != nil {
 			continue
 		}
-		carrier := ifc.Flags&net.FlagLoopback == 0 && !nonCarrierKind(ifc.Name)
 		for _, a := range addrs {
 			var ip net.IP
 			switch v := a.(type) {
@@ -73,11 +64,24 @@ func hostInterfaceAddrs() (localAddrs, error) {
 				ip = v.IP
 			}
 			if ip != nil {
-				out[ip.String()] = hostAddr{Dev: ifc.Name, Carrier: carrier}
+				out[ip.String()] = ifc.Name
 			}
 		}
 	}
 	return out, nil
+}
+
+// deviceCarries reports whether dev can carry a VXLAN tunnel. A loopback or
+// dummy interface (the /32 of a routed-to-the-host fabric) or a vxlan device
+// cannot: frames sent "out" of it go nowhere. A var so a test can model them;
+// asked only of the one interface holding the host address (ResolveVTEP).
+var deviceCarries = hostDeviceCarries
+
+func hostDeviceCarries(dev string) bool {
+	if ifc, err := net.InterfaceByName(dev); err == nil && ifc.Flags&net.FlagLoopback != 0 {
+		return false
+	}
+	return !nonCarrierKind(dev)
 }
 
 // nonCarrierKind reports whether dev is a dummy or vxlan device, from the
@@ -138,7 +142,7 @@ func ResolveVTEP(networkName string, def compose.NetworkDef, hostAddress string,
 	if def.Underlay != "" {
 		var held []string
 		for ip, a := range addrs {
-			if a.Dev == def.Underlay && net.ParseIP(ip).To4() != nil {
+			if a == def.Underlay && net.ParseIP(ip).To4() != nil {
 				held = append(held, ip)
 			}
 		}
@@ -159,18 +163,18 @@ func ResolveVTEP(networkName string, def compose.NetworkDef, hostAddress string,
 	if hostAddress == "" {
 		return "", "", &VTEPRefusal{Network: networkName, Reason: "this host's address is not known yet"}
 	}
-	a, ok := addrs[hostAddress]
+	holder, ok := addrs[hostAddress]
 	if !ok {
 		return "", "", &VTEPRefusal{Network: networkName,
 			Reason: fmt.Sprintf("no interface holds this host's address %s (advertise_address), so it cannot be the tunnel's local address; "+
 				"name an underlay for the network", hostAddress)}
 	}
-	if a.Carrier {
-		return hostAddress, a.Dev, nil
+	if deviceCarries(holder) {
+		return hostAddress, holder, nil
 	}
 	dev = defaultRouteInterface()
 	if dev == "" {
-		return "", "", &VTEPRefusal{Network: networkName, Device: a.Dev,
+		return "", "", &VTEPRefusal{Network: networkName, Device: holder,
 			Reason: "this host's address is on a loopback or dummy device and there is no default route to carry the tunnel; name an underlay"}
 	}
 	return hostAddress, dev, nil

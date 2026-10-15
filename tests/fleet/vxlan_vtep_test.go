@@ -169,3 +169,30 @@ func TestFleet_VXLAN_AMovedVTEPReachesEveryPeersFloodList(t *testing.T) {
 		}
 	}
 }
+
+// TestFleet_VXLAN_EveryHostFloodsToEveryPeer: on a four-host overlay each
+// host's flood list — its kernel table, modelled by fdbfake, where a second
+// `bridge fdb add` of the all-zeros entry is refused — holds all three
+// peers. With `add` it held only the first, so broadcast (DHCP, ARP) reached
+// one peer: the lab's vxd2 never got a lease.
+func TestFleet_VXLAN_EveryHostFloodsToEveryPeer(t *testing.T) {
+	c, gates := latchedFleet(t, 4, 1518)
+	latchReleaseToken(t, c, gates)
+	addr := setHostAddresses(c)
+	createVXLAN(t, c, "vxd_vxdnet")
+	vtepRowsAre(t, c, "vxd_vxdnet", "the VTEP rows", func(h string) string { return addr[h] })
+	for _, n := range c.Nodes {
+		reconcileNetworks(t, n) // provisions where it has not yet, then syncs
+		reconcileNetworks(t, n)
+		var want []string
+		for _, o := range c.Nodes {
+			if o != n {
+				want = append(want, addr[o.Name])
+			}
+		}
+		sort.Strings(want)
+		if got := n.Net.Flood("vxd_vxdnet"); !slices.Equal(got, want) {
+			t.Errorf("%s floods to %v, want every peer %v", n.Name, got, want)
+		}
+	}
+}

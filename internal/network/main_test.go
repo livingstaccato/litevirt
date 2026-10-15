@@ -17,8 +17,9 @@ func TestMain(m *testing.M) {
 	// The runner's own addresses must not decide whether a test's VTEP is
 	// "this host" (isLocalAddress): only loopback is, unless a test says so.
 	hostAddrs = func() (localAddrs, error) {
-		return localAddrs{"127.0.0.1": {Dev: "lo"}}, nil
+		return localAddrs{"127.0.0.1": "lo"}, nil
 	}
+	deviceCarries = func(dev string) bool { return dev != "lo" }
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

@@ -15,7 +15,9 @@ import (
 
 // ValidateRuleFields checks a rule's fields against the grammar the renderer
 // can write into an nft script (rulefield): every rule writer calls it before
-// a row is stored, and validate calls it for every rule it renders.
+// a row is stored, and validate calls it for every rule it renders. The forms
+// a later build adds (the "+log" action suffix, the tag-group cidr) plug in
+// through rulefield.RuleExtensions.
 func ValidateRuleFields(direction, proto, port, cidr, action, comment string) error {
 	return rulefield.Rule(direction, proto, port, cidr, action, comment)
 }

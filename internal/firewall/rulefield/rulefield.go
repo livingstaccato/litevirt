@@ -539,10 +539,16 @@ func portNum(s string) string {
 // (exactly as written, as the IPv6 renderer has always required), or an IPv4
 // match: an address, a prefix, a range A-B (A <= B), a DNS name, or a braced
 // list of them, after an optional relational operator; a negated set
-// reference ("!= @name") too.
+// reference ("!= @name") too; and a tag-group cidr when RuleExtensions.TagCIDR
+// accepts it.
 func CIDR(s string) error {
 	if s == "" {
 		return nil
+	}
+	if f := RuleExtensions.TagCIDR; f != nil {
+		if ok, err := f(s); ok {
+			return err
+		}
 	}
 	if strings.HasPrefix(s, "@") {
 		if err := SetName(s[1:]); err != nil {

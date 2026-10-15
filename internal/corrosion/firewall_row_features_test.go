@@ -51,7 +51,10 @@ func TestFirewallRowFeatures(t *testing.T) {
 // refuses a row needing a feature its own grant for that feature does not
 // cover — a logged row with only the IPv6 grant, an IPv6 row with only the log
 // grant, a tag row with both of those — and writes the row once every feature
-// it needs has its grant.
+// it needs has its grant. The "+log" action and the tag-group cidr pass the
+// writers' field grammar only through the extensions C2 and D5 fill
+// (rulefield.RuleExtensions); with none, as on this build, both are refused
+// whatever the grants, and with test stand-ins the grant matrix holds.
 //
 // Mutations: check the log feature against g (the IPv6 grant) — the
 // IPv6-only row with only gLog is written and goes red; drop the tag check —
@@ -79,23 +82,8 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 			return InsertHostFirewallRuleWithGrant(ctx, c, g, gl, gt, FirewallRule{ID: fmt.Sprint("h", n), HostName: "h", Direction: "ingress", Proto: "tcp", CIDR: cidr, Action: action})
 		},
 	}
+	// This build: no extension, so the grammar refuses both forms first.
 	for name, w := range writers {
-		refused := []struct {
-			what         string
-			g, gl, gt    capabilities.FeatureGrant
-			cidr, action string
-			want         error
-		}{
-			{"IPv6 row, only the log grant", none, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
-			{"IPv6 row, the log grant in the IPv6 slot", gLog, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
-		}
-		for _, r := range refused {
-			if err := w(r.g, r.gl, r.gt, r.cidr, r.action); !errors.Is(err, r.want) {
-				t.Errorf("%s: %s: %v, want %v", name, r.what, err, r.want)
-			}
-		}
-		// A logged action and a tag-group cidr fail the field grammar on this
-		// build, whatever the grants: nothing renders them yet.
 		for _, r := range []struct {
 			what         string
 			cidr, action string
@@ -106,7 +94,33 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 		} {
 			var fe *rulefield.FieldError
 			if err := w(gV6, gLog, gTag, r.cidr, r.action); !errors.As(err, &fe) {
-				t.Errorf("%s: %s, every grant: %v, want a field-grammar refusal", name, r.what, err)
+				t.Errorf("%s: %s, every grant, no extension: %v, want a field-grammar refusal", name, r.what, err)
+			}
+		}
+	}
+
+	rulefield.SetExtensionsForTest(t, rulefield.Extensions{
+		LogAction: func(a string) (string, bool) { return strings.CutSuffix(strings.ToLower(a), "+log") },
+		TagCIDR:   func(c string) (bool, error) { return strings.HasPrefix(c, "tag:"), nil },
+	})
+	for name, w := range writers {
+		refused := []struct {
+			what         string
+			g, gl, gt    capabilities.FeatureGrant
+			cidr, action string
+			want         error
+		}{
+			{"logged row, only the IPv6 grant", gV6, none, none, "10.0.0.0/8", "drop+log", ErrFirewallLogGateClosed},
+			{"IPv6 logged row, only the IPv6 grant", gV6, none, none, "2001:db8::/32", "drop+log", ErrFirewallLogGateClosed},
+			{"IPv6 row, only the log grant", none, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
+			{"IPv6 row, the log grant in the IPv6 slot", gLog, gLog, none, "2001:db8::/32", "drop", ErrFirewallIPv6GateClosed},
+			{"logged row, the IPv6 grant in the log slot", none, gV6, none, "10.0.0.0/8", "drop+log", ErrFirewallLogGateClosed},
+			{"tag row, the IPv6 and log grants", gV6, gLog, none, "tag:web", "accept", ErrFirewallTagGroupsGateClosed},
+			{"tag row, the log grant in the tag slot", none, none, gLog, "tag:web", "accept", ErrFirewallTagGroupsGateClosed},
+		}
+		for _, r := range refused {
+			if err := w(r.g, r.gl, r.gt, r.cidr, r.action); !errors.Is(err, r.want) {
+				t.Errorf("%s: %s: %v, want %v", name, r.what, err, r.want)
 			}
 		}
 		for _, ok := range []struct {
@@ -116,6 +130,9 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 		}{
 			{"IPv4 row, no grant", none, none, none, "10.0.0.0/8", "accept"},
 			{"IPv6 row, the IPv6 grant", gV6, none, none, "2001:db8::/32", "drop"},
+			{"logged row, the log grant", none, gLog, none, "10.0.0.0/8", "drop+log"},
+			{"IPv6 logged row, both grants", gV6, gLog, none, "2001:db8::/32", "drop+log"},
+			{"tag row, the tag grant", none, none, gTag, "tag:web", "accept"},
 		} {
 			if err := w(ok.g, ok.gl, ok.gt, ok.cidr, ok.action); err != nil {
 				t.Errorf("%s: %s: %v", name, ok.what, err)

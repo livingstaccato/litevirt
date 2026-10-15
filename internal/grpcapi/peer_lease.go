@@ -23,8 +23,8 @@ import (
 const (
 	scanPeerLeaseBudget    = 5 * time.Second
 	inspectPeerLeaseBudget = 2 * time.Second
-	// peerLeaseConcurrency bounds the lookups in flight at once in a batch.
-	peerLeaseConcurrency = 16
+	// peerLeasePerPeer bounds the lookups in flight to one peer in a batch.
+	peerLeasePerPeer = 4
 )
 
 // SetDHCPLeaseLookup replaces the read of this host's dnsmasq lease for a MAC
@@ -55,8 +55,8 @@ type peerLease struct {
 // network has its dnsmasq on every host or none, so nobody else is asked.
 //
 // The whole batch shares one deadline (budget), one connection per peer and a
-// bound on lookups in flight, and a host is asked only while it is in this
-// node's gossip membership: one powered-off host costs a pass at most budget,
+// bound on lookups in flight per peer (peerLeasePerPeer workers), and a host
+// is asked only while it is in this node's gossip membership: one powered-off host costs a pass at most budget,
 // not a wait per NIC.
 func (s *Server) peerLeases(ctx context.Context, nics []nicQuery, budget time.Duration) []peerLease {
 	out := make([]peerLease, len(nics))
@@ -134,38 +134,75 @@ func (s *Server) peerLeases(ctx context.Context, nics []nicQuery, budget time.Du
 	}
 
 	answers := make([][]peerLease, len(nics))
-	var amu sync.Mutex
-	sem := make(chan struct{}, peerLeaseConcurrency)
-	var wg sync.WaitGroup
+	type job struct {
+		i                  int
+		mac, network, host string
+	}
+	var jobs []job
 	for i, n := range nics {
-		np := nets[n.network]
-		if np == nil {
+		if np := nets[n.network]; np != nil {
+			for _, host := range np.hosts {
+				jobs = append(jobs, job{i: i, mac: n.mac, network: n.network, host: host})
+			}
+		}
+	}
+	// A fixed pool of workers per peer over that peer's lookups: goroutines
+	// and lookups in flight are bounded by the number of peers, not NICs, and
+	// a peer that hangs holds up only its own lane until the deadline.
+	lanes := map[string]chan job{}
+	var amu sync.Mutex
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		if lanes[j.host] != nil {
 			continue
 		}
-		for _, host := range np.hosts {
+		lane := make(chan job)
+		lanes[j.host] = lane
+		for w := 0; w < peerLeasePerPeer; w++ {
 			wg.Add(1)
-			go func(i int, mac, networkName, host string) {
+			go func() {
 				defer wg.Done()
+				for j := range lane {
+					if ctx.Err() != nil {
+						continue
+					}
+					c := client(j.host)
+					if c == nil {
+						continue
+					}
+					resp, err := c.GetVMIPRemote(ctx, &pb.GetVMIPRequest{Mac: j.mac, NetworkName: j.network, LeaseOnly: true})
+					if err != nil || !resp.GetLease() || resp.GetIp() == "" {
+						continue
+					}
+					amu.Lock()
+					answers[j.i] = append(answers[j.i], peerLease{host: j.host, ip: resp.GetIp(), expiry: resp.GetLeaseExpiry()})
+					amu.Unlock()
+				}
+			}()
+		}
+	}
+	// Feed every lane from its own goroutine, so a full lane of a hung peer
+	// never stops the others being fed.
+	byHost := map[string][]job{}
+	for _, j := range jobs {
+		byHost[j.host] = append(byHost[j.host], j)
+	}
+	var fwg sync.WaitGroup
+	for host, js := range byHost {
+		fwg.Add(1)
+		go func(lane chan job, js []job) {
+			defer fwg.Done()
+			defer close(lane)
+			for _, j := range js {
 				select {
-				case sem <- struct{}{}:
+				case lane <- j:
 				case <-ctx.Done():
 					return
 				}
-				defer func() { <-sem }()
-				c := client(host)
-				if c == nil {
-					return
-				}
-				resp, err := c.GetVMIPRemote(ctx, &pb.GetVMIPRequest{Mac: mac, NetworkName: networkName, LeaseOnly: true})
-				if err != nil || !resp.GetLease() || resp.GetIp() == "" {
-					return
-				}
-				amu.Lock()
-				answers[i] = append(answers[i], peerLease{host: host, ip: resp.GetIp(), expiry: resp.GetLeaseExpiry()})
-				amu.Unlock()
-			}(i, n.mac, n.network, host)
-		}
+			}
+		}(lanes[host], js)
 	}
+	fwg.Wait()
 	wg.Wait()
 	for i, n := range nics {
 		if np := nets[n.network]; np != nil {

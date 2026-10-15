@@ -513,7 +513,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
 			}
-			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			v6, invalid := ruleRowFamily(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, "")
 			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 				return corrosion.InsertSGRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {
@@ -525,7 +525,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 	// IP sets.
 	for name, set := range f.IPSets {
 		row := corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name}
-		v6, invalid := corrosion.IPSetFamily(row.CIDRs)
+		v6, invalid := ipSetRowFamily(row.Name, row.CIDRs)
 		if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 			return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
 		}); err != nil {
@@ -541,7 +541,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
 			}
-			v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+			v6, invalid := ruleRowFamily(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 			if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 				return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
 			}); err != nil {

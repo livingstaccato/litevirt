@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // FirewallRule is a cluster- or host-tier firewall rule — the two policy
@@ -68,6 +69,10 @@ func InsertIPSet(ctx context.Context, c *Client, s IPSet) error {
 // InsertIPSetWithGrant creates a named CIDR list. An IPv6 element is the
 // release feature firewall_ipv6: g must be its grant.
 func InsertIPSetWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, s IPSet) error {
+	// The name and elements are written into every host's nft script as text.
+	if err := rulefield.IPSet(s.Name, s.CIDRs); err != nil {
+		return err
+	}
 	v6, err := ipSetFamily(s.CIDRs)
 	if err != nil {
 		return err
@@ -129,6 +134,9 @@ func InsertClusterFirewallRule(ctx context.Context, c *Client, r FirewallRule) e
 // chain. An IPv6 rule is the release feature firewall_ipv6: g must be its
 // grant.
 func InsertClusterFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
+	if err := rulefield.Rule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
+		return err
+	}
 	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
 	if err != nil {
 		return err
@@ -183,6 +191,9 @@ func InsertHostFirewallRule(ctx context.Context, c *Client, r FirewallRule) erro
 func InsertHostFirewallRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, r FirewallRule) error {
 	if r.HostName == "" {
 		return fmt.Errorf("host firewall rule requires a host name")
+	}
+	if err := rulefield.Rule(r.Direction, r.Proto, r.PortRange, r.CIDR, r.Action, r.Comment); err != nil {
+		return err
 	}
 	v6, err := firewallRuleFamily(r.CIDR, r.Proto)
 	if err != nil {

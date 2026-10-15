@@ -38,6 +38,8 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // TableName is the single nftables table litevirt owns. Every chain we
@@ -300,6 +302,11 @@ type Plan struct {
 	// BlockedTrunks are the trunk VLANs the loader left out because the NIC's
 	// network does not allow them (not rendered; reported as a condition).
 	BlockedTrunks []BlockedTrunk
+
+	// InvalidRows are the stored rows the loader did not render as written
+	// because they fail the rule grammar (not rendered; reported as a
+	// condition). See quarantineRule.
+	InvalidRows []InvalidRow
 }
 
 // BlockedTrunk is a trunk NIC's VLANs its network does not allow.
@@ -795,7 +802,7 @@ func renderRule(r Rule, nicDev, family string) string {
 
 	out := strings.Join(parts, " ")
 	if r.Comment != "" {
-		out += fmt.Sprintf(" comment %q", r.Comment)
+		out += " comment " + quoteComment(r.Comment)
 	}
 	return out
 }
@@ -816,6 +823,15 @@ func validate(p Plan) error {
 		if ipset.Name == "" {
 			return errors.New("ipset with empty name")
 		}
+		// The name and every element are written into the script as text.
+		if err := rulefield.RenderSetName(ipset.Name); err != nil {
+			return fmt.Errorf("ipset %q: %w", ipset.Name, err)
+		}
+		for _, e := range ipset.CIDRs {
+			if err := rulefield.RenderSetElement(e); err != nil {
+				return fmt.Errorf("ipset %q: %w", ipset.Name, err)
+			}
+		}
 		ipsets[ipset.Name] = true
 		for _, cidr := range ipset.CIDRs {
 			if isIPv6Literal(cidr) && !validAddrOrPrefix(cidr, true) {
@@ -833,6 +849,16 @@ func validate(p Plan) error {
 	}
 
 	for i, r := range allRules(p) {
+		// proto, port and an IPv4 CIDR are written into the script verbatim:
+		// text that is not nft words would add nft syntax of its own (finding
+		// F-1). Only that is refused here, so a rule that applies today renders
+		// as it did; the comment is quoted safely wherever it is written
+		// (quoteComment).
+		for _, err := range []error{rulefield.RenderProto(r.Proto), rulefield.RenderPort(r.Proto, r.PortRange), rulefield.RenderCIDR(r.CIDR)} {
+			if err != nil {
+				return fmt.Errorf("rule %d: %w", i, err)
+			}
+		}
 		switch r.Direction {
 		case Ingress, Egress:
 		default:
@@ -892,24 +918,26 @@ func validate(p Plan) error {
 	// NAT / isolation are IPv4-only (same as the filter rules) and must be
 	// complete — a blank field would emit a malformed rule that poisons the whole
 	// atomic ruleset at apply time.
+	// Every field is written into the script as text, so each must be an
+	// interface name or an IPv4 address or prefix, nothing more.
 	for i, r := range p.NAT {
-		if r.Subnet == "" || strings.Contains(r.Subnet, ":") {
+		if !validAddrOrPrefix(r.Subnet, false) {
 			return fmt.Errorf("nat rule %d: subnet %q must be a non-empty IPv4 CIDR", i, r.Subnet)
 		}
 		if r.SNATTo != "" {
-			if r.OutIface == "" || strings.Contains(r.SNATTo, ":") {
+			if !safeIfName(r.OutIface) || !validAddrOrPrefix(r.SNATTo, false) {
 				return fmt.Errorf("nat rule %d: SNAT needs an out-iface and an IPv4 target (got iface=%q to=%q)", i, r.OutIface, r.SNATTo)
 			}
-		} else if r.Bridge == "" {
-			return fmt.Errorf("nat rule %d: masquerade needs a bridge", i)
+		} else if !safeIfName(r.Bridge) {
+			return fmt.Errorf("nat rule %d: masquerade needs a bridge (got %q)", i, r.Bridge)
 		}
 	}
 	for i, c := range p.HostIsolation {
-		if c.Bridge == "" {
-			return fmt.Errorf("isolation chain %d: empty bridge", i)
+		if !safeIfName(c.Bridge) {
+			return fmt.Errorf("isolation chain %d: bridge %q is not a safe interface name", i, c.Bridge)
 		}
 		for _, exc := range c.Exceptions {
-			if exc.VIP == "" || strings.Contains(exc.VIP, ":") {
+			if !validAddrOrPrefix(exc.VIP, false) {
 				return fmt.Errorf("isolation chain %q: exception VIP %q must be a non-empty IPv4 address", c.Bridge, exc.VIP)
 			}
 		}

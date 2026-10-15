@@ -71,7 +71,7 @@ func renderAddrSet(b *strings.Builder, name, typ string, elems []string) {
 // itself, or a named counter that lets the frame on.
 func verdict(p Plan, dev, side, label string) string {
 	if p.nicMode() == NICModeObserve {
-		return fmt.Sprintf("counter comment %q", fmt.Sprintf("%s %s %s %s", WouldDropComment, dev, side, label))
+		return "counter comment " + quoteComment(fmt.Sprintf("%s %s %s %s", WouldDropComment, dev, side, label))
 	}
 	return "drop"
 }

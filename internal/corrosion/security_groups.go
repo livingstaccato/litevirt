@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // SecurityGroup represents a security group.
@@ -115,6 +116,10 @@ func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
 // on one, so it is the release feature firewall_ipv6: g must be its grant. A
 // malformed one is never written.
 func InsertSGRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, rule SGRule) error {
+	// proto, port and cidr are written into every host's nft script as text.
+	if err := rulefield.Rule(rule.Direction, rule.Proto, rule.PortRange, rule.CIDR, rule.Action, ""); err != nil {
+		return err
+	}
 	v6, err := firewallRuleFamily(rule.CIDR, rule.Proto)
 	if err != nil {
 		return err

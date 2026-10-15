@@ -37,6 +37,7 @@ const (
 	CondFirewallUnavailable = "firewall.nic.unavailable" // no bridge conntrack: guards only
 	CondFirewallRefused     = "firewall.nic.refused"     // the kernel refused the per-NIC table
 	CondFirewallTrunkVLANs  = "firewall.nic.trunk_vlans" // trunk VLANs their network does not allow
+	CondFirewallInvalidRows = "firewall.rule.invalid"    // stored rows that fail the rule grammar
 )
 
 // SetFirewallEnforcement switches per-NIC enforcement for the whole cluster.
@@ -209,6 +210,39 @@ func (s *Server) RecordFirewallState(ctx context.Context, st firewall.AppliedSta
 		"the kernel refused the per-NIC firewall table; the previous one stays, routed filtering and NAT still apply: "+st.NICTableError)
 	s.setFirewallCondition(ctx, CondFirewallTrunkVLANs, len(st.BlockedTrunks) > 0, corrosion.SeverityWarning,
 		s.blockedTrunksText(ctx, st.BlockedTrunks))
+	s.setFirewallCondition(ctx, CondFirewallInvalidRows, len(st.InvalidRows) > 0, corrosion.SeverityCritical,
+		invalidRowsText(st.InvalidRows))
+}
+
+// invalidRowsText names each stored row the firewall does not render as
+// written, what it does instead, and the command that removes the row.
+func invalidRowsText(rows []firewall.InvalidRow) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	const show = 10
+	var parts []string
+	for i, r := range rows {
+		if i == show {
+			parts = append(parts, fmt.Sprintf("and %d more", len(rows)-show))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s %s (%s): %s; remove it with `%s`", r.Table, r.ID, r.Reason, r.Handling, removeRowCmd(r)))
+	}
+	return "firewall rows that fail the rule grammar are not rendered as written (an accept is left out, " +
+		"a drop drops more, never less): " + strings.Join(parts, "; ")
+}
+
+func removeRowCmd(r firewall.InvalidRow) string {
+	switch r.Table {
+	case "cluster_firewall_rules":
+		return "lv firewall cluster-rule rm " + r.ID
+	case "host_firewall_rules":
+		return "lv firewall host-rule rm " + r.ID
+	case "ip_sets":
+		return "lv firewall ipset rm " + r.ID
+	}
+	return "lv sg rule-rm " + r.ID
 }
 
 // blockedTrunksText names each trunk whose VLANs its network does not allow,

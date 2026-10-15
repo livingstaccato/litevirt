@@ -745,6 +745,43 @@ vms:
 Rules without a CIDR match `0.0.0.0/0` (any). `cidr: "@<ipset-name>"`
 references a top-level `ipsets:` entry — useful for big admin lists.
 
+## Rule fields
+
+A rule's `proto`, `port` and IPv4 `cidr`, and an ip set's name and elements,
+are written into every host's nft ruleset as text, so each is checked against
+what nft accepts in that position before it is stored — by `lv sg rule-add`,
+`lv firewall cluster-rule add`, `lv firewall host-rule add`,
+`lv firewall ipset add`, the web UI and a stack deploy alike. A refused value is
+an `InvalidArgument` error that names the field and the value; in a compose
+file, the problem names the rule's place in the file.
+
+| Field | Accepted |
+|---|---|
+| `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
+| `port` (tcp, udp) | a port 0-65535, a range `8000-9000`, a service name (`ssh`) |
+| `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
+| ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix |
+| `action` | `accept`, `drop`, `reject` |
+| `comment` | at most 128 bytes, no double quote |
+
+`proto`, `port` and an IPv4 `cidr` also take a relational operator in front
+(`!= 22`, `< 1024`, `!= @office`) and a braced list (`{ 80, 443 }`). A bare
+comma list (`80,443`) is refused: nft rejects it, so it never applied — brace
+it. Anything else — a second word, a newline, `;`, `#`, a stray brace or quote
+— is refused, because it would add nft syntax of its own to every host's
+ruleset.
+
+A row written by a host on an older build is checked again when it is rendered.
+One that carries such text, references an ip set that is not rendered, or has
+an action other than accept, drop or reject is never rendered as written, and
+no longer stops the host's whole firewall from applying, as it did before: an
+`accept` is left out, a `drop` or `reject` is rendered as a drop without its
+unreadable matches (it drops at least what it asked for), and an ip set with
+such an element is left out whole. The host raises the critical condition
+`firewall.rule.invalid`, which names each row and the command that removes it
+(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...). A row that
+applied before renders exactly as it did.
+
 ## CLI
 
 The CLI lives at `lv sg …` and `lv firewall …`:

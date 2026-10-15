@@ -73,7 +73,7 @@ func TestFleet_AntiEntropyRepairsDivergence(t *testing.T) {
 	if err := corrosion.InsertSecurityGroup(ctx, a.DB, corrosion.SecurityGroup{ID: "sg1", Name: "web", StackName: "s"}); err != nil {
 		t.Fatalf("InsertSecurityGroup: %v", err)
 	}
-	if err := corrosion.InsertSGRule(ctx, a.DB, corrosion.SGRule{ID: "r1", SGID: "sg1", Direction: "ingress", Proto: "tcp", PortRange: "443", Action: "allow"}); err != nil {
+	if err := corrosion.InsertSGRule(ctx, a.DB, corrosion.SGRule{ID: "r1", SGID: "sg1", Direction: "ingress", Proto: "tcp", PortRange: "443", Action: "accept"}); err != nil {
 		t.Fatalf("InsertSGRule: %v", err)
 	}
 	if err := corrosion.InsertAuditLog(ctx, a.DB, corrosion.AuditRecord{ID: "a1", Username: "admin", Action: "create_vm", Target: "vm1", Result: "success"}); err != nil {

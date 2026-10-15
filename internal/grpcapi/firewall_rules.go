@@ -12,6 +12,8 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -48,6 +50,25 @@ func (s *Server) writeFirewallRow(ctx context.Context, v6 bool, invalid error, w
 	return s.WithReleaseFeature(ctx, capabilities.FeatureFirewallIPv6, write)
 }
 
+// ruleRowFamily refuses a rule row whose fields fail the grammar the renderer
+// writes into an nft script (finding F-1), then reports its family as
+// corrosion.FirewallRuleFamily does. Its error is the writeFirewallRow
+// `invalid` argument: a refused row asks the release gate for nothing.
+func ruleRowFamily(direction, proto, port, cidr, action, comment string) (bool, error) {
+	if err := firewall.ValidateRuleFields(direction, proto, port, cidr, action, comment); err != nil {
+		return false, err
+	}
+	return corrosion.FirewallRuleFamily(cidr, proto)
+}
+
+// ipSetRowFamily is ruleRowFamily for an ip set.
+func ipSetRowFamily(name string, cidrs []string) (bool, error) {
+	if err := rulefield.IPSet(name, cidrs); err != nil {
+		return false, err
+	}
+	return corrosion.IPSetFamily(cidrs)
+}
+
 // firewallWriteErr is a firewall-row write's error as the handler returns it:
 // the release gate's refusal unchanged, anything else as "<what>: <err>" with
 // firewallWriteCode's code.
@@ -64,6 +85,10 @@ func firewallWriteErr(err error, def codes.Code, what string) error {
 func firewallWriteCode(err error, def codes.Code) codes.Code {
 	if errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) {
 		return codes.FailedPrecondition
+	}
+	var fe *rulefield.FieldError
+	if errors.As(err, &fe) {
+		return codes.InvalidArgument
 	}
 	return def
 }
@@ -138,7 +163,7 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 		ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 		CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+	v6, invalid := ruleRowFamily(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, s.db, g, row)
 	}); err != nil {
@@ -194,7 +219,7 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 		ID: randid.New(), HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
-	v6, invalid := corrosion.FirewallRuleFamily(row.CIDR, row.Proto)
+	v6, invalid := ruleRowFamily(row.Direction, row.Proto, row.PortRange, row.CIDR, row.Action, row.Comment)
 	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.InsertHostFirewallRuleWithGrant(ctx, s.db, g, row)
 	}); err != nil {
@@ -244,7 +269,7 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
 	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
-	v6, invalid := corrosion.IPSetFamily(row.CIDRs)
+	v6, invalid := ipSetRowFamily(row.Name, row.CIDRs)
 	if err := s.writeFirewallRow(ctx, v6, invalid, func(ctx context.Context, g capabilities.FeatureGrant) error {
 		return corrosion.InsertIPSetWithGrant(ctx, s.db, g, row)
 	}); err != nil {

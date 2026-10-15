@@ -254,7 +254,8 @@ func TransferProofs(ctx context.Context, c *Client, kind, name string) ([]ProofR
 }
 
 func transferProofs(ctx context.Context, c *Client, kind, name string, certified bool) ([]ProofRecord, error) {
-	q := `SELECT id FROM runtime_action_proofs WHERE target_kind = ? AND target_name = ?`
+	q := `SELECT id FROM runtime_action_proofs WHERE target_kind = ? AND target_name = ?
+		AND action IN ('` + ActionReschedule + `', '` + ActionPromote + `', '` + ActionRelocate + `')`
 	if certified {
 		q += ` AND claim_certificate != ''`
 	}

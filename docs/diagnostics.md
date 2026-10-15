@@ -1768,7 +1768,9 @@ holder writes.
 
   `proof_uncertified` means the recovery completed on the destination, but
   its proof carries no certificate: it was minted while recovery claims were
-  not enforced, as on a derived voter set. Settle acts only on a certificate,
+  not enforced, as on a derived voter set. It is reported only for a live
+  proof at an owner epoch at least the local copy's, and only when no
+  certified proof gave a reason of its own. Settle acts only on a certificate,
   so a paused copy stays paused. There is no claim for `lv cluster claim` to
   show. Confirm with `virsh domstate <vm>` on the destination that it runs
   there, then stop the copy on this host with `virsh destroy <vm>`, as below.

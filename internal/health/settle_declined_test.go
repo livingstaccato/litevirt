@@ -341,3 +341,72 @@ func TestSettle_AnUncertifiedCompletedProofIsDeclinedAsSuch(t *testing.T) {
 		}
 	}
 }
+
+// An uncertified proof earns the proof_uncertified reason, whose remedy tells
+// the operator to destroy the local copy, only when it can be about THIS copy's
+// move: live (not tombstoned), completed by its destination, at an owner epoch
+// at least the local copy's. A stale one (an older move of the name, since
+// undone) or a reaped one leaves the generic reason and its "confirm which copy
+// is current" remedy. And a certified proof's own failure is never masked by an
+// uncertified proof's reason.
+//
+// Mutations: drop the epoch check, or the tombstone check — the stale or
+// reaped case reads proof_uncertified; let the uncertified reason win over a
+// certified proof's — the mixed case reads proof_uncertified; let an
+// uncertified prepared proof set the reason — that case reads
+// proof_not_completed.
+func TestSettle_OnlyAProofForThisCopyIsDeclinedAsUncertified(t *testing.T) {
+	uncert := func(f *settleFixture) corrosion.ProofRecord {
+		p := f.proof
+		p.ID, p.ClaimCertificate = "proof-u", ""
+		return p
+	}
+	for _, tc := range []struct {
+		name   string
+		proofs func(f *settleFixture) []corrosion.ProofRecord
+		class  string
+	}{
+		{"stale epoch", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.OwnerEpoch = "2" // the local copy is at 3
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"tombstoned", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.Tombstoned = true
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"uncertified and prepared", func(f *settleFixture) []corrosion.ProofRecord {
+			p := uncert(f)
+			p.Status = corrosion.ProofPrepared
+			return []corrosion.ProofRecord{p}
+		}, "no_certificate"},
+		{"a certified proof's failure wins", func(f *settleFixture) []corrosion.ProofRecord {
+			f.certErr = errors.New("too few valid accepts")
+			return []corrosion.ProofRecord{f.proof, uncert(f)}
+		}, "certificate_invalid"},
+		{"a current uncertified proof", func(f *settleFixture) []corrosion.ProofRecord {
+			return []corrosion.ProofRecord{uncert(f)}
+		}, "proof_uncertified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			proofs := tc.proofs(f)
+			f.r.settleProofs = func(context.Context, *corrosion.Client, string, string) ([]corrosion.ProofRecord, error) {
+				return proofs, nil
+			}
+			for i := 0; i < settleDeclineSightingsToReport; i++ {
+				if st := f.run(); st != libvirtfake.StatePaused {
+					t.Fatalf("vm-a is %s, want still paused", st)
+				}
+			}
+			_, ev, ok := settleDeclinedCondition(t, f)
+			if !ok || ev.ReasonClass != tc.class {
+				t.Fatalf("decline class %q (raised %v), want %q: %s", ev.ReasonClass, ok, tc.class, ev.Reason)
+			}
+			if tc.class != "proof_uncertified" && !strings.Contains(ev.Remedy, "lv cluster claim") {
+				t.Fatalf("a %s decline lost the confirm-first remedy: %s", tc.name, ev.Remedy)
+			}
+		})
+	}
+}

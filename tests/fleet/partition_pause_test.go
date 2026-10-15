@@ -645,11 +645,14 @@ func TestFleet_PartitionSettle_DerivedVoterSetLeavesAPausedDuplicate(t *testing.
 	if strings.Contains(ev.Remedy, "lv cluster claim") {
 		t.Fatalf("the remedy points at a claim a derived voter set never decided: %s", ev.Remedy)
 	}
-	if st, _ := owner.Virt.RawState("pp-derived"); st != libvirtfake.StatePaused {
-		t.Fatalf("%s's copy is %s after the heal, want still paused (settle is certificate-only)", owner.Name, st)
-	}
-	if _, ok := firstEvent(owner, "destroy", "pp-derived"); ok {
-		t.Fatalf("%s destroyed pp-derived without a certificate", owner.Name)
+	// Held over several more reconcile passes (300 ms each), not one instant.
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		if st, _ := owner.Virt.RawState("pp-derived"); st != libvirtfake.StatePaused {
+			t.Fatalf("%s's copy is %s after the heal, want still paused (settle is certificate-only)", owner.Name, st)
+		}
+		if _, ok := firstEvent(owner, "destroy", "pp-derived"); ok {
+			t.Fatalf("%s destroyed pp-derived without a certificate", owner.Name)
+		}
 	}
 	rs.mu.Lock()
 	at, ran := rs.since[owner.Name]

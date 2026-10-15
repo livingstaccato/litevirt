@@ -1886,12 +1886,11 @@ func (c *Client) Members() []PeerInfo {
 func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
 
 // SetWallClockForTests makes now this node's wall clock, for its row stamps
-// and its HLC alike: a node whose clock runs ahead or behind. Call it before
-// the client is in use (now itself may vary). Test-only.
+// and its HLC alike: a node whose clock runs ahead or behind. It takes no lock
+// that its readers take, so call it before the client is in use; now itself
+// may vary over time. Test-only.
 func (c *Client) SetWallClockForTests(now func() time.Time) {
-	c.tsMu.Lock()
 	c.nowFn = now
-	c.tsMu.Unlock()
 	if c.clock != nil {
 		c.clock.SetNowForTests(now)
 	}

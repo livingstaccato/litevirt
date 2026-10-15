@@ -61,6 +61,9 @@ func TestCertifiedTransferProofs_IncludesReapedProofs(t *testing.T) {
 	if len(ids) != 2 || ids[0] != "live" || ids[1] != "reaped" {
 		t.Fatalf("CertifiedTransferProofs = %v, want [live reaped]", ids)
 	}
+	if all[0].Tombstoned || !all[1].Tombstoned {
+		t.Fatalf("TransferProofs Tombstoned = [%v %v], want [false true]", all[0].Tombstoned, all[1].Tombstoned)
+	}
 	if got[1].Status != ProofCompleted || got[1].ExecutorHost != "node-b" {
 		t.Fatalf("the reaped proof lost its execution record: %+v", got[1])
 	}

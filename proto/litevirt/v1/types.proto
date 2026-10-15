@@ -815,6 +815,39 @@ message Host {
     // Whether a Redfish CA bundle is configured (the bundle itself is not
     // returned); false means the system roots.
     bool                           redfish_ca_configured = 28;
+    // Set by InspectHost only. Every in-flight capacity claim counted against
+    // this host, and their sums: reserved_cpu and reserved_mem_mib are the
+    // figures admission subtracts from this host's free capacity.
+    repeated HostReservation       reservations     = 29;
+    int32                          reserved_cpu     = 30;
+    int32                          reserved_mem_mib = 31;
+}
+
+// One in-flight capacity claim counted against a host.
+message HostReservation {
+    string                    operation_id       = 1;
+    string                    method             = 2;  // the RPC that made it: ResizeVMLive, CreateVM, MigrateVM, ...
+    // "resize", "create", "admission-lease", "transfer-lease", or the
+    // operation kind of a journal (vm_replace, drain_cold_move).
+    string                    kind               = 3;
+    // The workload name and its project; both empty when the caller may not
+    // vm.read it. The amounts, operation id and state are always shown.
+    string                    vm                 = 4;
+    string                    project            = 5;
+    int32                     vcpu               = 6;
+    int32                     memory_mib         = 7;
+    google.protobuf.Timestamp created_at         = 8;
+    int64                     age_seconds        = 9;
+    // in-flight, admitting, auto-expires, journal, releasable, stale, or
+    // release-blocked (see docs/diagnostics.md, "Host reservations").
+    string                    state              = 10;
+    string                    detail             = 11;
+    int64                     header_owner_epoch = 12;
+    bool                      admitted           = 13;
+    bool                      provisional        = 14;
+    // A tombstoned release row holds the key its release would be written at:
+    // it stays counted and nothing releases it.
+    bool                      release_blocked    = 15;
 }
 
 message Image {

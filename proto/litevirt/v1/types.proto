@@ -821,6 +821,10 @@ message Host {
     repeated HostReservation       reservations     = 29;
     int32                          reserved_cpu     = 30;
     int32                          reserved_mem_mib = 31;
+    // Set by InspectHost when the reservations could not be listed: names the
+    // operation whose reservation could not be read, and why. reservations,
+    // reserved_cpu and reserved_mem_mib are then empty, not zero.
+    string                         reservations_error = 32;
 }
 
 // One in-flight capacity claim counted against a host.

@@ -5356,8 +5356,12 @@ type Host struct {
 	Reservations   []*HostReservation `protobuf:"bytes,29,rep,name=reservations,proto3" json:"reservations,omitempty"`
 	ReservedCpu    int32              `protobuf:"varint,30,opt,name=reserved_cpu,json=reservedCpu,proto3" json:"reserved_cpu,omitempty"`
 	ReservedMemMib int32              `protobuf:"varint,31,opt,name=reserved_mem_mib,json=reservedMemMib,proto3" json:"reserved_mem_mib,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Set by InspectHost when the reservations could not be listed: names the
+	// operation whose reservation could not be read, and why. reservations,
+	// reserved_cpu and reserved_mem_mib are then empty, not zero.
+	ReservationsError string `protobuf:"bytes,32,opt,name=reservations_error,json=reservationsError,proto3" json:"reservations_error,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Host) Reset() {
@@ -5605,6 +5609,13 @@ func (x *Host) GetReservedMemMib() int32 {
 		return x.ReservedMemMib
 	}
 	return 0
+}
+
+func (x *Host) GetReservationsError() string {
+	if x != nil {
+		return x.ReservationsError
+	}
+	return ""
 }
 
 // One in-flight capacity claim counted against a host.
@@ -7708,7 +7719,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xa0\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xcf\n" +
 	"\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
@@ -7747,7 +7758,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x15redfish_ca_configured\x18\x1c \x01(\bR\x13redfishCaConfigured\x12@\n" +
 	"\freservations\x18\x1d \x03(\v2\x1c.litevirt.v1.HostReservationR\freservations\x12!\n" +
 	"\freserved_cpu\x18\x1e \x01(\x05R\vreservedCpu\x12(\n" +
-	"\x10reserved_mem_mib\x18\x1f \x01(\x05R\x0ereservedMemMib\x1a9\n" +
+	"\x10reserved_mem_mib\x18\x1f \x01(\x05R\x0ereservedMemMib\x12-\n" +
+	"\x12reservations_error\x18  \x01(\tR\x11reservationsError\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xdc\x03\n" +

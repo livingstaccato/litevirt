@@ -444,6 +444,12 @@ type NetworkAttachment struct {
 	// is a single queue. Virtio model only; applies on the next define.
 	Queues NICQueues `yaml:"queues,omitempty"`
 
+	// MTU is the guest NIC's MTU (<mtu size='N'/>): 576 to 65520, which must
+	// equal the bridge's MTU on the defining host, or "bridge" for the bridge's
+	// own MTU. Unset or 0 renders none. Virtio model only; applies on the next
+	// define.
+	MTU NICMTU `yaml:"mtu,omitempty"`
+
 	// NIC guard (anti-spoofing; docs/firewall.md "NIC guards"). SpoofGuard is
 	// "" (on, the default for a new NIC), "on" or "off". AllowedAddresses are
 	// extra source addresses or prefixes the guest may use beyond the ones

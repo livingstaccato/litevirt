@@ -231,7 +231,7 @@ A VM NIC can carry a guest MTU: `mtu:` on its network entry in compose, or
 
 | Value | Meaning |
 |---|---|
-| unset, `0` | No `<mtu>`: the guest's default |
+| unset, `0` | No `<mtu>` on a new NIC. On an existing VM a deploy keeps its MTU; `lv update <vm> --nic-mtu <nic>=0` removes it |
 | `bridge` | The bridge's MTU, read when the VM is defined on a host, after its networks are set up there |
 | `576`-`65520` | That MTU. The bridge's MTU on the defining host must be the same |
 
@@ -247,7 +247,11 @@ networks do not. `lv attach-nic` takes no MTU: attach the NIC, then set it with
 `lv update <vm> --nic-mtu <nic>=<MTU>` (the VM stopped, or
 `--restart-if-needed`), which also records the hot-attached NIC in the VM's
 spec. A VM of a stack takes its NICs from the compose file: set `mtu:` there,
-as `lv update --nic-mtu` refuses a NIC the file does not list. The MTU is accepted once the release token has latched (feature
+as `lv update --nic-mtu` refuses a NIC the file does not list.
+
+A restore or promotion onto a host whose bridge does not carry the VM's MTU is
+refused like a create: set that bridge's MTU to the VM's on the host first
+(`ip link set <bridge> mtu <N>`), then retry. The MTU is accepted once the release token has latched (feature
 `nic_mtu`).
 
 ## Container network attachment

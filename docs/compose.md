@@ -606,9 +606,13 @@ vCPU grow a restart), and `lv update --cpu` never re-resolves it; write a number
 [networking](networking.md#per-nic-mtu). `mtu: bridge` takes the bridge's own MTU
 when the VM is defined. An explicit value must equal the bridge's MTU on the host
 that defines the VM, or the create, start or migration is refused. Virtio NICs on
-a bridged network of a VM only. A change needs a restart, as `queues:` does, and an
-unset `mtu:` inherits what the VM has: write `mtu: 0` to remove it. It is accepted
-once the release token has latched (feature `nic_mtu`), as the tuning above is.
+a bridged network of a VM only. A change needs a restart, as `queues:` does. An
+unset `mtu:` and `mtu: 0` are the same: a deploy leaves the MTU the VM has, so
+removing the key does not remove it. Remove it with `lv update <vm> --nic-mtu
+<nic>=0` (the VM stopped, or `--restart-if-needed`). A re-create builds the VM
+from the file, so an MTU set only with `lv update` is dropped then. It is
+accepted once the release token has latched (feature `nic_mtu`), as the tuning
+above is.
 
 IPv6 can be set either by putting a v6 address in the `ip`/`gateway` fields, or
 via the dedicated `ipv6:` / `ipv6-gateway:` fields (which also enable dual-stack

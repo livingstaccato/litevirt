@@ -5,14 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
-// FirewallRowFeatures names every release feature a rule row needs, in the
-// order the gates nest; a tag reference is not judged as an IPv6 address, and
-// anything that only looks like one is.
+// firewallRowFeatures (the stored-row classifier the writers use) names every
+// release feature a rule row needs, in the order the gates nest; a tag
+// reference is not judged as an IPv6 address, and anything that only looks
+// like one is.
 func TestFirewallRowFeatures(t *testing.T) {
 	v6, lg, tg := capabilities.FeatureFirewallIPv6, capabilities.FeatureFirewallLog, capabilities.FeatureFirewallTagGroups
 	for _, tc := range []struct {
@@ -31,7 +33,7 @@ func TestFirewallRowFeatures(t *testing.T) {
 		{"tag:a:b", "tcp", "accept", nil, true},
 		{"2001:db8::/129", "tcp", "accept", nil, true},
 	} {
-		got, err := FirewallRowFeatures(tc.cidr, tc.proto, tc.action)
+		got, err := firewallRowFeatures(tc.cidr, tc.proto, tc.action)
 		if tc.bad {
 			if err == nil {
 				t.Errorf("%q/%q/%q: accepted as %v, want refused", tc.cidr, tc.proto, tc.action, got)
@@ -110,5 +112,34 @@ func TestFirewallRuleWriters_EachFeatureNeedsItsOwnGrant(t *testing.T) {
 				t.Errorf("%s: %s: %v", name, ok.what, err)
 			}
 		}
+	}
+}
+
+// A client's rule (FirewallRowFeatures, the handler and stack entry) may not
+// carry a "+" in its action, and may not name a tag-group cidr while this
+// build renders none: either would be stored and make every host refuse its
+// plan. Ordinary IPv4 and IPv6 rules pass as before.
+//
+// Mutations: drop the "+" refusal — drop+log is classified, red; drop the
+// tag refusal — tag:web is classified, red.
+func TestFirewallRowFeatures_RefusesClientLogAndTagForms(t *testing.T) {
+	for _, tc := range []struct{ cidr, action string }{
+		{"10.0.0.0/8", "drop+log"},
+		{"10.0.0.0/8", "accept+"},
+		{"2001:db8::/32", "REJECT+LOG"},
+		{"tag:web", "accept"},
+		{"tag:web", "drop"},
+	} {
+		got, err := FirewallRowFeatures(tc.cidr, "tcp", tc.action)
+		if !errors.Is(err, ErrFirewallRuleFormUnsupported) || !strings.Contains(err.Error(), "not supported") {
+			t.Errorf("client rule %q/%q = %v, %v; want ErrFirewallRuleFormUnsupported", tc.cidr, tc.action, got, err)
+		}
+	}
+	if got, err := FirewallRowFeatures("2001:db8::/32", "tcp", "drop"); err != nil ||
+		!slices.Equal(got, []capabilities.Feature{capabilities.FeatureFirewallIPv6}) {
+		t.Errorf("a client IPv6 rule = %v, %v; want firewall_ipv6", got, err)
+	}
+	if got, err := FirewallRowFeatures("10.0.0.0/8", "tcp", "accept"); err != nil || len(got) != 0 {
+		t.Errorf("a client IPv4 rule = %v, %v; want no feature", got, err)
 	}
 }

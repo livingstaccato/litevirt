@@ -50,15 +50,37 @@ func isTagCIDR(cidr string) bool {
 	return name != "" && !strings.ContainsAny(name, ": \t,{}")
 }
 
-// FirewallRowFeatures validates a rule naming cidr, proto and action as its
-// writer does, and returns the release features its write needs, in the
-// order their gates nest: firewall_ipv6, then firewall_log, then
+// ErrFirewallRuleFormUnsupported refuses a rule form a client may not send on
+// this build: an action carrying a "+" suffix (logging is asked through the
+// rule's log field, never the action string), or a tag-group cidr, which no
+// renderer on this build can render.
+var ErrFirewallRuleFormUnsupported = errors.New("firewall rule form not supported yet")
+
+// tagCIDRsRenderable reports whether this build renders a tag-group cidr
+// ("tag:<name>"). Until it does, a client's tag cidr is refused at write: a
+// stored one would make every host refuse its whole plan.
+const tagCIDRsRenderable = false
+
+// FirewallRowFeatures validates a rule a CLIENT sent, naming cidr, proto and
+// action, and returns the release features its write needs, in the order
+// their gates nest: firewall_ipv6, then firewall_log, then
 // firewall_tag_groups. A caller refuses a malformed rule before it asks any
-// gate for anything.
+// gate for anything. A client action containing "+" is always refused, and a
+// tag-group cidr is refused while this build cannot render one.
 func FirewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, error) {
+	if strings.Contains(action, "+") {
+		return nil, fmt.Errorf("%w: action %q: an action is accept, drop or reject; a \"+\" suffix is not accepted from a client",
+			ErrFirewallRuleFormUnsupported, action)
+	}
+	if isTagCIDR(cidr) && !tagCIDRsRenderable {
+		return nil, fmt.Errorf("%w: cidr %q: tag-group cidrs are not supported on this build", ErrFirewallRuleFormUnsupported, cidr)
+	}
 	return firewallRowFeatures(cidr, proto, action)
 }
 
+// firewallRowFeatures is FirewallRowFeatures for a row as stored, which the
+// writers check their grants against: it classifies the server's own "+log"
+// action and a tag-group cidr rather than refusing them.
 func firewallRowFeatures(cidr, proto, action string) ([]capabilities.Feature, error) {
 	var out []capabilities.Feature
 	tag := isTagCIDR(cidr)

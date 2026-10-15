@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -19,39 +20,35 @@ import (
 // with IPv6 outermost (capabilities DECISION 0-E), and hands the writer each
 // feature's grant in its own slot. A fake gate records the calls.
 //
-// Mutations: ask only the first feature's gate — the log use is not recorded
-// and the row is refused (no gLog), red; nest log outside IPv6 — the recorded
-// order is wrong, red; hand the IPv6 grant to every slot — the writer's log
-// check fails, red.
+// Mutations: ask only the first feature's gate — the later uses are not
+// recorded, red; nest log outside IPv6 — the recorded order is wrong, red;
+// hand the IPv6 grant to every slot — the slot check fails, red.
 func TestWriteFirewallRow_AsksEveryGateTheRowNeeds(t *testing.T) {
 	s := testServer(t)
 	g := &relGate{t: t, open: true}
 	s.SetReleaseFeatureGate(g)
-	ctx := adminCtxWithEngine(t, s)
 
-	// Through the handler: an IPv6 logged cluster rule.
-	r, err := s.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: &pb.FirewallRule{
-		Direction: "ingress", Proto: "tcp", Port: "22", Cidr: "2001:db8::/32", Action: "drop+log"}})
-	if err != nil {
-		t.Fatalf("an IPv6 logged rule after the latch: %v", err)
-	}
-	want := []capabilities.Feature{capabilities.FeatureFirewallIPv6, capabilities.FeatureFirewallLog}
-	if !slices.Equal(g.used, want) {
-		t.Errorf("gates asked = %v, want %v (IPv6 outermost)", g.used, want)
-	}
-	if got, gerr := corrosion.GetClusterFirewallRule(context.Background(), s.db, r.GetId()); gerr != nil || got == nil {
-		t.Errorf("the rule was not written: %v, %v", got, gerr)
-	}
-
-	// Directly: the write sees each grant in its own slot, whatever order
-	// the features were named in.
-	g.used = nil
+	// An IPv6 logged row (the server's own; a client cannot send one yet).
 	var seen firewallGrants
-	need := []capabilities.Feature{capabilities.FeatureFirewallTagGroups, capabilities.FeatureFirewallLog, capabilities.FeatureFirewallIPv6}
-	if err := s.writeFirewallRow(context.Background(), need, nil, func(_ context.Context, gs firewallGrants) error {
+	write := func(_ context.Context, gs firewallGrants) error {
 		seen = gs
 		return nil
-	}); err != nil {
+	}
+	need := []capabilities.Feature{capabilities.FeatureFirewallLog, capabilities.FeatureFirewallIPv6}
+	if err := s.writeFirewallRow(context.Background(), need, nil, write); err != nil {
+		t.Fatal(err)
+	}
+	if want := []capabilities.Feature{capabilities.FeatureFirewallIPv6, capabilities.FeatureFirewallLog}; !slices.Equal(g.used, want) {
+		t.Errorf("gates asked = %v, want %v (IPv6 outermost)", g.used, want)
+	}
+	if seen.IPv6.Check(capabilities.FeatureFirewallIPv6) != nil || seen.Log.Check(capabilities.FeatureFirewallLog) != nil {
+		t.Errorf("grants handed to the write = %+v, want IPv6 and log in their slots", seen)
+	}
+
+	// All three, named in any order.
+	g.used = nil
+	need = []capabilities.Feature{capabilities.FeatureFirewallTagGroups, capabilities.FeatureFirewallLog, capabilities.FeatureFirewallIPv6}
+	if err := s.writeFirewallRow(context.Background(), need, nil, write); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(g.used, []capabilities.Feature{capabilities.FeatureFirewallIPv6, capabilities.FeatureFirewallLog, capabilities.FeatureFirewallTagGroups}) {
@@ -74,9 +71,15 @@ func TestWriteFirewallRow_AsksEveryGateTheRowNeeds(t *testing.T) {
 	}
 }
 
-// Before the latch a logged or tag-group rule is refused with the release
-// text and nothing is written; an ordinary IPv4 rule never touches the gate.
-func TestWriteFirewallRow_LogAndTagRefusedBeforeTheLatch(t *testing.T) {
+// A client's logged action or tag-group cidr is refused by every rule handler
+// at any latch state — InvalidArgument, "not supported yet" — before any gate
+// is asked, and nothing reaches storage: no renderer on this build renders
+// either. An IPv6 rule after the latch is written through its gate as before.
+//
+// Mutations: drop the "+" refusal in FirewallRowFeatures — after the latch
+// the logged rule is stored, red; drop the tag refusal — the tag rule is
+// stored, red.
+func TestRuleHandlers_RefuseClientLogAndTagForms(t *testing.T) {
 	s := testServer(t)
 	g := &relGate{t: t}
 	s.SetReleaseFeatureGate(g)
@@ -85,57 +88,114 @@ func TestWriteFirewallRow_LogAndTagRefusedBeforeTheLatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		cidr, action string
-		feature      capabilities.Feature
-	}{
-		{"10.0.0.0/8", "drop+log", capabilities.FeatureFirewallLog},
-		{"tag:web", "accept", capabilities.FeatureFirewallTagGroups},
-	} {
-		_, err := s.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
-			SgId: sg.GetId(), Direction: "ingress", Proto: "tcp", Cidr: tc.cidr, Action: tc.action}})
-		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), fwReleaseRefusal(tc.feature)) {
-			t.Errorf("%s %s before the latch: %v, want the %s release refusal", tc.cidr, tc.action, err, tc.feature)
+	writes := func(cidr, action string) map[string]func() error {
+		rule := func() *pb.FirewallRule {
+			return &pb.FirewallRule{Direction: "ingress", Proto: "tcp", Port: "22", Cidr: cidr, Action: action}
+		}
+		return map[string]func() error{
+			"cluster rule": func() error {
+				_, err := s.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: rule()})
+				return err
+			},
+			"host rule": func() error {
+				r := rule()
+				r.HostName = s.hostName
+				_, err := s.CreateHostFirewallRule(ctx, &pb.CreateHostFirewallRuleRequest{Rule: r})
+				return err
+			},
+			"sg rule": func() error {
+				_, err := s.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
+					SgId: sg.GetId(), Direction: "ingress", Proto: "tcp", Port: "22", Cidr: cidr, Action: action}})
+				return err
+			},
 		}
 	}
-	if _, err := s.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
-		SgId: sg.GetId(), Direction: "ingress", Proto: "tcp", Cidr: "10.0.0.0/8", Action: "drop"}}); err != nil {
-		t.Errorf("an IPv4 rule before the latch: %v", err)
+	for _, latched := range []bool{false, true} {
+		g.open = latched
+		for _, form := range []struct{ cidr, action string }{
+			{"10.0.0.0/8", "drop+log"},
+			{"2001:db8::/32", "accept+log"},
+			{"tag:web", "accept"},
+		} {
+			for what, w := range writes(form.cidr, form.action) {
+				if err := w(); status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "not supported") {
+					t.Errorf("latched=%v: %s %s/%s: %v, want InvalidArgument \"not supported\"", latched, what, form.cidr, form.action, err)
+				}
+			}
+		}
 	}
-	if len(g.used) != 0 {
-		t.Errorf("uses recorded = %v, want none", g.used)
+	if len(g.used) != 0 || g.calls != 0 {
+		t.Errorf("a refused client form asked the gate %d time(s) (%v)", g.calls, g.used)
 	}
-	rules, err := corrosion.ListSGRules(context.Background(), s.db, sg.GetId())
-	if err != nil || len(rules) != 1 {
-		t.Errorf("rules stored = %v, %v; want only the IPv4 one", rules, err)
+	bg := context.Background()
+	if rules, err := corrosion.ListClusterFirewallRules(bg, s.db); err != nil || len(rules) != 0 {
+		t.Errorf("cluster rules stored = %v, %v; want none", rules, err)
+	}
+	if rules, err := corrosion.ListHostFirewallRules(bg, s.db, ""); err != nil || len(rules) != 0 {
+		t.Errorf("host rules stored = %v, %v; want none", rules, err)
+	}
+	if rules, err := corrosion.ListSGRules(bg, s.db, sg.GetId()); err != nil || len(rules) != 0 {
+		t.Errorf("sg rules stored = %v, %v; want none", rules, err)
+	}
+	// After the latch an IPv6 rule still goes through its gate.
+	if _, err := s.CreateClusterFirewallRule(ctx, &pb.CreateClusterFirewallRuleRequest{Rule: &pb.FirewallRule{
+		Direction: "ingress", Proto: "tcp", Port: "22", Cidr: "2001:db8::/32", Action: "drop"}}); err != nil {
+		t.Errorf("an IPv6 rule after the latch: %v", err)
+	}
+	if !slices.Equal(g.used, []capabilities.Feature{capabilities.FeatureFirewallIPv6}) {
+		t.Errorf("uses recorded = %v, want firewall_ipv6", g.used)
 	}
 }
 
-// A stack takes every feature its rows need before the old rows are torn
-// down, then once more ahead of each row that needs it.
-func TestWriteFirewallRow_StackTakesEveryFeatureFirst(t *testing.T) {
+// A compose stack holding a client logged action or a tag-group cidr is
+// refused before its old rows are torn down, at any latch state, and no gate
+// is asked; the stack's existing rows stay.
+//
+// Mutation: drop either refusal — the stack is persisted (after the latch) or
+// refused only by the gate after asking it, red.
+func TestStackFirewall_RefusesClientLogAndTagForms(t *testing.T) {
 	s := testServer(t)
-	g := &relGate{t: t, open: true}
+	g := &relGate{t: t}
 	s.SetReleaseFeatureGate(g)
-	f, err := compose.ParseBytes([]byte(`
-name: logstack
+	bg := context.Background()
+	parse := func(cidr, action string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseBytes([]byte(`
+name: fwstack
 security-groups:
   web:
     rules:
-      - {direction: ingress, proto: tcp, port: "80", cidr: "tag:web", action: accept}
+      - {direction: ingress, proto: tcp, port: "80", cidr: "10.0.0.0/8", action: accept}
 firewall:
   cluster-rules:
-    - {direction: ingress, proto: tcp, port: "22", cidr: "2001:db8::/32", action: "drop+log"}
+    - {direction: ingress, proto: tcp, port: "22", cidr: "` + cidr + `", action: "` + action + `"}
 `))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
 	}
-	if err := s.persistStackFirewall(context.Background(), f); err != nil {
+	if err := s.persistStackFirewall(bg, parse("10.1.0.0/16", "accept")); err != nil {
 		t.Fatal(err)
 	}
-	v6, lg, tg := capabilities.FeatureFirewallIPv6, capabilities.FeatureFirewallLog, capabilities.FeatureFirewallTagGroups
-	want := []capabilities.Feature{v6, lg, tg, tg, v6, lg}
-	if !slices.Equal(g.used, want) {
-		t.Errorf("uses recorded = %v, want %v: each feature before the teardown, then per row", g.used, want)
+	before, err := corrosion.ListClusterFirewallRules(bg, s.db)
+	if err != nil || len(before) != 1 {
+		t.Fatalf("stack rules = %v, %v", before, err)
+	}
+	for _, latched := range []bool{false, true} {
+		g.open = latched
+		for _, form := range []struct{ cidr, action string }{{"10.0.0.0/8", "drop+log"}, {"tag:web", "accept"}} {
+			err := s.persistStackFirewall(bg, parse(form.cidr, form.action))
+			if !errors.Is(err, corrosion.ErrFirewallRuleFormUnsupported) {
+				t.Errorf("latched=%v: stack with %s/%s: %v, want ErrFirewallRuleFormUnsupported", latched, form.cidr, form.action, err)
+			}
+		}
+	}
+	if g.calls != 0 {
+		t.Errorf("a refused stack asked the gate %d time(s) (%v)", g.calls, g.used)
+	}
+	after, err := corrosion.ListClusterFirewallRules(bg, s.db)
+	if err != nil || len(after) != 1 || after[0].ID != before[0].ID {
+		t.Errorf("stack rules after the refusals = %v, %v; want the old rule kept", after, err)
 	}
 }

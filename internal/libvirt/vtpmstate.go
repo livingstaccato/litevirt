@@ -2,6 +2,8 @@ package libvirt
 
 import (
 	"archive/tar"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -127,6 +129,51 @@ func (f *FirmwareStore) HasTPMState(uuid string) bool {
 	}
 	ents, err := os.ReadDir(dir)
 	return err == nil && len(ents) > 0
+}
+
+// PermallSHA256 is the hex sha256 of the VM's TPM permanent state,
+// <swtpm>/<uuid>/tpm2/tpm2-00.permall, and of nothing else in the tree: the
+// .lock and any volatile state are not part of what a live firmware move
+// compares. A missing file is os.ErrNotExist; a key that is not one component
+// under the swtpm base is refused without a read.
+func (f *FirmwareStore) PermallSHA256(uuid string) (string, error) {
+	dir, ok := f.swtpmDir(uuid)
+	if !ok {
+		return "", fmt.Errorf("permall hash: invalid swtpm uuid %q", uuid)
+	}
+	return sha256RegularFile(filepath.Join(dir, "tpm2", "tpm2-00.permall"))
+}
+
+// NvramSHA256 is the hex sha256 of the VM's UEFI vars file in this store. A
+// missing file is os.ErrNotExist; an invalid VM name is refused without a read.
+func (f *FirmwareStore) NvramSHA256(vmName string) (string, error) {
+	if err := safename.ValidateVMName(vmName); err != nil {
+		return "", fmt.Errorf("nvram hash: %w", err)
+	}
+	return sha256RegularFile(f.NvramPath(vmName))
+}
+
+// sha256RegularFile hashes the regular file at p. Anything else at p (a
+// symlink, a directory) is an error: the state is a plain file, and hashing
+// through a link would hash something the store does not own.
+func sha256RegularFile(p string) (string, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file (%v)", p, fi.Mode().Type())
+	}
+	fh, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer fh.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, fh); err != nil {
+		return "", fmt.Errorf("hash %s: %w", p, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // WriteFirmwareBundle writes a tar of the VM's firmware state (nvram + swtpm) to

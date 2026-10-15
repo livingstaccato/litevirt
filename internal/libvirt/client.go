@@ -156,6 +156,17 @@ func (c *Client) isAlive() bool {
 	return err == nil
 }
 
+// LibvirtVersion is the connected libvirt daemon's packed version
+// (major*1000000 + minor*1000 + release), for FirmwareCodeProbe.
+func (c *Client) LibvirtVersion() (uint64, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.virt == nil {
+		return 0, fmt.Errorf("libvirt: not connected")
+	}
+	return c.virt.ConnectGetLibVersion()
+}
+
 // RegisterDomainEventCallback sets a callback that fires on domain lifecycle
 // events (start, stop, crash, shutdown). This provides immediate VM death
 // detection instead of relying on polling (#44).

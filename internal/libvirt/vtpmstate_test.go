@@ -3,6 +3,9 @@ package libvirt
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -214,6 +217,117 @@ func TestReadFirmwareBundle_RejectsSlip(t *testing.T) {
 	for name, buf := range cases {
 		if err := storeAt(base, t.TempDir()).ReadFirmwareBundle(buf, "vm", "uuid-x"); err == nil {
 			t.Errorf("%s: expected rejection, got nil", name)
+		}
+	}
+}
+
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// TestPermallSHA256_IgnoresLock (T-4): the TPM verdict of a live firmware move
+// is the sha256 of tpm2-00.permall alone. swtpm's .lock and any other file in
+// the tree are not part of it; a missing permall is os.ErrNotExist, so a
+// caller can tell "no state" from "unreadable".
+func TestPermallSHA256_IgnoresLock(t *testing.T) {
+	st := storeAt(testSwtpmBase(t), t.TempDir())
+	const uuid = "5113ced7-9006-4086-b7dd-9d1840181e03"
+	tpm2 := filepath.Join(st.SwtpmDir(uuid), "tpm2")
+	if err := os.MkdirAll(tpm2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	permall := []byte("PERMALL-STATE-v1")
+	write := func(p string, b []byte) {
+		t.Helper()
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(tpm2, "tpm2-00.permall"), permall)
+	write(filepath.Join(tpm2, ".lock"), []byte("lock-1"))
+	write(filepath.Join(st.SwtpmDir(uuid), ".lock"), []byte("lock-1"))
+	write(filepath.Join(tpm2, "tpm2-00.volatilestate"), []byte("volatile"))
+
+	got, err := st.PermallSHA256(uuid)
+	if err != nil {
+		t.Fatalf("PermallSHA256: %v", err)
+	}
+	if want := sha256Hex(permall); got != want {
+		t.Fatalf("PermallSHA256 = %s, want sha256(permall) = %s", got, want)
+	}
+
+	// The lock and the other files change; the hash does not.
+	write(filepath.Join(tpm2, ".lock"), []byte("lock-2-longer"))
+	write(filepath.Join(st.SwtpmDir(uuid), ".lock"), []byte("lock-2-longer"))
+	write(filepath.Join(tpm2, "tpm2-00.volatilestate"), []byte("volatile-2"))
+	if again, err := st.PermallSHA256(uuid); err != nil || again != got {
+		t.Fatalf("hash moved with the lock/volatile files: %s, %v (was %s)", again, err, got)
+	}
+
+	// The permall changes by one byte; the hash does.
+	write(filepath.Join(tpm2, "tpm2-00.permall"), []byte("PERMALL-STATE-v2"))
+	if moved, err := st.PermallSHA256(uuid); err != nil || moved == got {
+		t.Fatalf("hash did not follow the permall: %s, %v", moved, err)
+	}
+
+	// No permall: os.ErrNotExist, even with the tree present.
+	if err := os.Remove(filepath.Join(tpm2, "tpm2-00.permall")); err != nil {
+		t.Fatal(err)
+	}
+	if h, err := st.PermallSHA256(uuid); !errors.Is(err, os.ErrNotExist) || h != "" {
+		t.Fatalf("missing permall: got %q, %v; want \"\", os.ErrNotExist", h, err)
+	}
+	if h, err := st.PermallSHA256("6113ced7-9006-4086-b7dd-9d1840181e03"); !errors.Is(err, os.ErrNotExist) || h != "" {
+		t.Fatalf("missing tree: got %q, %v; want \"\", os.ErrNotExist", h, err)
+	}
+
+	// A key that is not one component under the base is refused, never read.
+	for _, bad := range []string{"", ".", "..", "../" + uuid, uuid + "/tpm2"} {
+		if h, err := st.PermallSHA256(bad); err == nil || errors.Is(err, os.ErrNotExist) || h != "" {
+			t.Errorf("PermallSHA256(%q) = %q, %v; want a refusal that is not ErrNotExist", bad, h, err)
+		}
+	}
+
+	// A permall that is not a regular file is not hashed through.
+	elsewhere := filepath.Join(t.TempDir(), "other")
+	write(elsewhere, permall)
+	if err := os.Symlink(elsewhere, filepath.Join(tpm2, "tpm2-00.permall")); err != nil {
+		t.Fatal(err)
+	}
+	if h, err := st.PermallSHA256(uuid); err == nil || h != "" {
+		t.Fatalf("symlinked permall hashed: %q, %v", h, err)
+	}
+}
+
+// TestNvramSHA256 (T-4): the NVRAM reader hashes the VM's vars file in this
+// store and nothing else.
+func TestNvramSHA256(t *testing.T) {
+	st := storeAt(testSwtpmBase(t), t.TempDir())
+	other := storeAt(testSwtpmBase(t), t.TempDir())
+	seedFirmware(t, st, "vm", "", true, false)
+	seedFirmware(t, other, "vm", "", true, false)
+	if err := os.WriteFile(other.NvramPath("vm"), []byte("OTHER-HOST"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.NvramSHA256("vm")
+	if err != nil {
+		t.Fatalf("NvramSHA256: %v", err)
+	}
+	if want := sha256Hex([]byte("NVRAM-vm")); got != want {
+		t.Fatalf("NvramSHA256 = %s, want %s", got, want)
+	}
+	if o, _ := other.NvramSHA256("vm"); o == got {
+		t.Fatal("two stores gave one hash: the reader is not reading its own store")
+	}
+
+	if h, err := st.NvramSHA256("absent"); !errors.Is(err, os.ErrNotExist) || h != "" {
+		t.Fatalf("missing NVRAM: got %q, %v; want \"\", os.ErrNotExist", h, err)
+	}
+	for _, bad := range []string{"", "..", "../vm", "a/b"} {
+		if h, err := st.NvramSHA256(bad); err == nil || errors.Is(err, os.ErrNotExist) || h != "" {
+			t.Errorf("NvramSHA256(%q) = %q, %v; want a refusal that is not ErrNotExist", bad, h, err)
 		}
 	}
 }

@@ -459,7 +459,13 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 		// It failed, yet the domain runs: destroyed as a success's is.
 	}
 	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
-	if err == nil && fresh == nil {
+	if err != nil {
+		// Nothing was destroyed, and whether the row still says what the
+		// cancel wrote is unknown: the sweep decides once it can read it.
+		unknown(fmt.Sprintf("its row could not be read (%v), so its domain was not destroyed", err))
+		return
+	}
+	if fresh == nil {
 		err = fmt.Errorf("its row is gone")
 	}
 	if err == nil && stopNoopKeepsRow[fresh.State] {
@@ -508,6 +514,12 @@ func (s *Server) finishCancelledStartLocked(ctx context.Context, vm *corrosion.V
 	case active:
 		slog.Error("StopVM: a cancelled start succeeded late and its domain could not be destroyed; the VM runs", "vm", vm.Name, "error", err)
 		_, _ = s.finishStartLocked(ctx, vm, nil, releasePreflight, pbVM, hspec) // records running, as libvirt says
+		// The record ends only once the row says running: a running write
+		// that did not land leaves the row saying what the cancel wrote over
+		// a running domain, which the sweep destroys.
+		if row, rerr := corrosion.GetVM(ctx, s.db, vm.Name); rerr != nil || row == nil || row.State != "running" {
+			keep = true
+		}
 		s.recordVMEvent(ctx, vm.Name, "vm.stopped", "error",
 			fmt.Sprintf("the start asked for at %s was cancelled, but libvirt started it late and destroying the domain failed: %s; the VM runs (`lv stop --force %s`)",
 				asked, status.Convert(err).Message(), vm.Name))

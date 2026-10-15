@@ -146,7 +146,7 @@ func (s *Server) judgeCancelledStartConditions(ctx context.Context) {
 	if len(old) > 0 {
 		keptEv = map[string]any{
 			"records": old,
-			"detail":  "a start `lv stop --force` cancelled is still recorded here, and its domain is destroyed if libvirt starts it. Until the record ends, a VM in error is neither recorded running nor restarted by its restart policy. `lv start <vm>` ends it; so do deleting or moving the VM, a host boot, or a restart of the libvirt daemon",
+			"detail":  "a start `lv stop --force` cancelled is still recorded here, and its domain is destroyed if libvirt starts it. Until the record ends, a VM in error is neither recorded running nor restarted by its restart policy. `lv start <vm>` ends it; so do deleting or moving the VM, a host boot, or a restart of the libvirt daemon (when exactly one libvirtd or virtqemud runs, so it can be told)",
 		}
 	}
 	s.setHeldStartCondition(ctx, condCancelledStartKept, keptEv)

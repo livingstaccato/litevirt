@@ -2183,7 +2183,7 @@ policy. A record kept longer than an hour raises `cancelled_start_kept`
 (evaluator `held_start`, subject `host/<host>`, warning), whose evidence lists
 each VM, the row the cancel wrote and when. `lv start <vm>` ends the record;
 so do deleting or moving the VM, a host boot, or a restart of the libvirt
-daemon. The next reconcile pass (30 s) resolves the condition once none is
+daemon (when exactly one `libvirtd` or `virtqemud` runs on the host). The next reconcile pass (30 s) resolves the condition once none is
 older than an hour. See [storage.md](storage.md).
 
 ### The record of cancelled starts cannot be read (`cancelled_starts_unreadable`)

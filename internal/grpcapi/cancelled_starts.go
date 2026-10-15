@@ -450,6 +450,22 @@ func (s *Server) judgeCancelledStart(ctx context.Context, r cancelledStartRecord
 		// evidence that none is pending (see above).
 		switch {
 		case s.cancelledStartRan(r):
+			// Before hardware_v2, a stop releases the VM's legacy PCI claims
+			// (stopVMLockedNote); the start's, held while its outcome was
+			// unknown, are let go here, under the VM lock.
+			unlock, ok := s.tryLockVM(r.VM)
+			if !ok {
+				return // a lifecycle call holds the VM: the next pass
+			}
+			defer unlock()
+			if !s.cancelledStartCurrent(r) {
+				return
+			}
+			if !s.hardwareV2Latched(ctx) {
+				if err := s.releaseDevices(ctx, r.VM); err != nil {
+					slog.Warn("StopVM: a cancelled start's record ends; releasing its PCI devices failed", "vm", r.VM, "error", err)
+				}
+			}
 			slog.Info("StopVM: a cancelled start's domain ran and no longer does; its record is ended", "vm", r.VM)
 			s.dropCancelledStartIf(r.VM, r.Created)
 		case s.bootedSince(r):

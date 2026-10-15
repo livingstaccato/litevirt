@@ -347,3 +347,42 @@ func TestLibvirtdIdentity_ParsesStat(t *testing.T) {
 		t.Fatal("garbage parsed")
 	}
 }
+
+// CR8 round 1, I-1: a cancelled start that succeeded late whose domain could
+// not be destroyed is recorded running; when that running write failed too,
+// the record was dropped with the row still saying stopped by its operator
+// over a running domain, and nothing undid it. The record is kept unless the
+// row says running, and the sweep destroys the domain once libvirt and the
+// database answer.
+//
+// Mutation: the record dropped on the domain-runs branch — none kept: red.
+func TestCancelledStart_AFailedRunningWriteKeepsTheRecord(t *testing.T) {
+	st := heldStart(t)
+	if _, err := st.s.StopVM(adminCtx(), &pb.StopVMRequest{Name: "web", Force: true}); err != nil {
+		t.Fatalf("stop --force: %v", err)
+	}
+	fake := st.s.virt.(*libvirtfake.Fake)
+	fake.FailDestroyDomain = func(string) error { return errors.New("destroy refused") }
+	st.s.stateWriteHook = func(name, state string) error {
+		if state == "running" {
+			return errors.New("corrosion: write failed")
+		}
+		return nil
+	}
+	close(st.release)
+	st.waitLockFree(t, "after libvirt answered the cancelled start")
+	if vm := st.row(t); vm.State != "stopped" || !st.domainActive(t) {
+		t.Fatalf("setup: row %s, domain active %v; want stopped over a running domain", vm.State, st.domainActive(t))
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 1 {
+		t.Fatalf("the record after a failed running write: %+v, want it kept", recs)
+	}
+	fake.FailDestroyDomain, st.s.stateWriteHook = nil, nil
+	st.sweep(t)
+	if st.domainActive(t) {
+		t.Fatal("the cancelled start's domain runs after the sweep")
+	}
+	if recs := st.cancelledStartsOnDisk(t); len(recs) != 0 {
+		t.Fatalf("the record outlived the destroy: %+v", recs)
+	}
+}

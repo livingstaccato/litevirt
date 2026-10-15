@@ -320,7 +320,8 @@ answers again. litevirt keeps that from holding anything else:
   destroyed the same way. A kept cancel ends once its domain has run (seen
   running, or libvirt answered the start) and does not run any more, or the VM
   is started, deleted or moved, or the host has booted, or the libvirt daemon
-  (`libvirtd` or `virtqemud`) has restarted since; it is not ended by its age.
+  (`libvirtd` or `virtqemud`, when exactly one runs on the host) has
+  restarted since; it is not ended by its age.
   While it is kept, a VM in `error` is neither recorded running from a domain
   that runs nor restarted by its restart policy; `lv start` ends it. A cancel
   kept longer than an hour raises `cancelled_start_kept` on the host, and a

@@ -159,7 +159,8 @@ func TestCancelledStart_AHungDestroyDoesNotPinTheVMLock(t *testing.T) {
 // its cancelled held start: the record on disk is kept as the cancel wrote
 // it, and the start's late answer (a failure, which changes nothing else) is
 // waited out here, so no goroutine of st's outlives the test and races its
-// cleanup.
+// cleanup. Unlike a real restart, the shared database then also holds that
+// late answer's one vm.started/error event; no test counts it.
 func (st *stuckStart) asIfRestarted(t *testing.T) {
 	t.Helper()
 	raw, err := os.ReadFile(st.s.cancelledStartsPath())

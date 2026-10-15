@@ -62,14 +62,14 @@ func TestKernel_NICGuard(t *testing.T) {
 	}
 	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
 		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
-		"TestKernelChild_VLANToNICAndTrunk"} {
+		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_SynFloodShapeLoads"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
 	}
 	// Children with their own module list skip on their own when one is
 	// missing (saying which); they must not fail or vanish.
-	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops"} {
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops", "TestKernelChild_SynFloodLoads"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}
@@ -1342,5 +1342,76 @@ func TestKernelChild_MainEraLvSetStillDrops(t *testing.T) {
 	}
 	if !l.ping("ga", "10.20.0.2") {
 		t.Error("10.20.0.1 -> 10.20.0.2 still fails with no rules: the drop above was the lab's")
+	}
+}
+
+// synFloodModules are the modules a ruleset with SYN-flood protection makes
+// the kernel use: the per-NIC table's, plus nft_limit for the meters' limit.
+// The dynamic sets, update, counter and payload matches are nf_tables itself.
+var synFloodModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge", "nft_limit"}
+
+// synFloodScripts renders the SYN-flood plan in enforce and observe mode.
+func synFloodScripts(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		script, err := Render(synFloodPlan(mode))
+		if err != nil {
+			t.Fatalf("%s: Render: %v", mode, err)
+		}
+		out[mode] = script
+	}
+	return out
+}
+
+func nftCheck(t *testing.T, script string) error {
+	t.Helper()
+	cmd := exec.Command("nft", "-c", "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%v\n%s", err, out)
+	}
+	return nil
+}
+
+// TestKernelChild_SynFloodLoads: a ruleset with SYN-flood protection, in
+// enforce and observe mode, is one a real nft accepts (spec §1.5). `nft -c`
+// checks the whole transaction and changes nothing.
+//
+// Mutation: render the comment before the drop (`counter comment "lv-sf 4"
+// drop`, the spec's text) — nft refuses it, red.
+func TestKernelChild_SynFloodLoads(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules(synFloodModules...); len(missing) > 0 {
+		t.Skipf("the SYN-flood ruleset would make the kernel load %v, which is not loaded on this host", missing)
+	}
+	for mode, script := range synFloodScripts(t) {
+		if err := nftCheck(t, script); err != nil {
+			t.Errorf("%s: nft -c refused the SYN-flood ruleset: %v", mode, err)
+		}
+	}
+}
+
+// TestKernelChild_SynFloodShapeLoads is TestKernelChild_SynFloodLoads on a
+// host without nft_limit: the same rulesets with the meters' limit statement
+// taken out, which proves everything else the lines write (the sets' flags,
+// the update, the matches, the counter and the comment's place) without
+// making the kernel load nft_limit.
+//
+// Mutation: render the comment before the drop — nft refuses it, red.
+func TestKernelChild_SynFloodShapeLoads(t *testing.T) {
+	inNetns(t)
+	mods := []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge"}
+	if missing := missingModules(mods...); len(missing) > 0 {
+		t.Skipf("the SYN-flood ruleset would make the kernel load %v, which is not loaded on this host", missing)
+	}
+	limit := regexp.MustCompile(` limit rate over [0-9]+/second burst [0-9]+ packets`)
+	for mode, script := range synFloodScripts(t) {
+		if n := len(limit.FindAllString(script, -1)); n != 4 {
+			t.Fatalf("%s: %d limit statements, want 4", mode, n)
+		}
+		if err := nftCheck(t, limit.ReplaceAllString(script, "")); err != nil {
+			t.Errorf("%s: nft -c refused the SYN-flood ruleset without its limit: %v", mode, err)
+		}
 	}
 }

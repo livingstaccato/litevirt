@@ -107,6 +107,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	renderIfnameSet(b, setVLANOK, vlanOK)
 	if mode != NICModeGuardsOnly {
 		renderNICTableSets(b, p, dhcpSrv, gw4, gw6)
+		renderSynFloodSets(b, p)
 	}
 
 	// prerouting: before anything else, conntrack included.
@@ -159,6 +160,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	fmt.Fprintf(b, "        iifname != @%s ip saddr @%s ip daddr . tcp dport @%s accept\n", setNICDevs, setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
 	dispatchNICs(b, nics, "iifname", "nic_out_")
+	renderSynFloodLines(b, p)
 	dispatchNICs(b, nics, "oifname", "nic_in_")
 	fmt.Fprintf(b, "    }\n\n")
 
@@ -199,6 +201,7 @@ func renderNICTable(b *strings.Builder, p Plan, sgs map[string]SecurityGroup, v6
 	// The built-in load balancer's haproxy, on this host, reaching a backend.
 	fmt.Fprintf(b, "        ip saddr @%s ip daddr . tcp dport @%s accept\n", setLBSrc4, setLB4)
 	fmt.Fprintf(b, "        ct state invalid %s\n", verdict(p, "-", "state", "invalid"))
+	renderSynFloodLines(b, p)
 	dispatchNICs(b, nics, "oifname", "nic_in_")
 	fmt.Fprintf(b, "    }\n\n")
 

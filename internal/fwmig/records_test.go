@@ -235,6 +235,7 @@ func TestFwmig_RecordModes(t *testing.T) {
 // of them made to fail.
 type recFS struct {
 	osFS
+	root string // the data dir: its fsync is logged as "sync-parent"
 	ops  []string
 	fail string // op name to fail
 }
@@ -278,8 +279,19 @@ func (f *recFS) Remove(p string) error {
 	return f.osFS.Remove(p)
 }
 
+func (f *recFS) MkdirAll(d string, perm os.FileMode) error {
+	if err := f.do("mkdir"); err != nil {
+		return err
+	}
+	return f.osFS.MkdirAll(d, perm)
+}
+
 func (f *recFS) SyncDir(d string) error {
-	if err := f.do("sync-dir"); err != nil {
+	op := "sync-dir"
+	if f.root != "" && filepath.Clean(d) == filepath.Clean(f.root) {
+		op = "sync-parent"
+	}
+	if err := f.do(op); err != nil {
 		return err
 	}
 	return f.osFS.SyncDir(d)
@@ -322,7 +334,7 @@ func indexOf(ops []string, op string) int {
 // step reports an error and leaves the previous record in place.
 func TestFwmig_Fsync(t *testing.T) {
 	dir := t.TempDir()
-	fs := &recFS{}
+	fs := &recFS{root: dir}
 	r := newWithFS(dir, fs)
 
 	if err := r.PutMarker(tMarker(PhasePreparing)); err != nil {
@@ -819,5 +831,272 @@ func TestFwmig_BeforeCutover(t *testing.T) {
 				t.Errorf("%s from %s: BeforeCutover = %v, want %v", parked, p, got, w)
 			}
 		}
+	}
+}
+
+// A record directory created by a write is itself made durable: the data
+// dir is fsynced after the mkdir, before the record is written, and only
+// when the directory was new.
+func TestFwmig_NewRecordDirIsDurable(t *testing.T) {
+	dir := t.TempDir()
+	fs := &recFS{root: dir}
+	r := newWithFS(dir, fs)
+	if err := r.PutHold(tHold(HoldPrepared, NvramPending)); err != nil {
+		t.Fatal(err)
+	}
+	mk, sp, cr := indexOf(fs.ops, "mkdir"), indexOf(fs.ops, "sync-parent"), indexOf(fs.ops, "create")
+	if mk < 0 || sp < 0 || !(mk < sp && sp < cr) {
+		t.Fatalf("first write %v: want mkdir < sync-parent < create", fs.ops)
+	}
+	fs.ops = nil
+	if err := r.PutHold(tHold(HoldVerified, NvramDone)); err != nil {
+		t.Fatal(err)
+	}
+	if indexOf(fs.ops, "sync-parent") >= 0 {
+		t.Fatalf("second write synced the parent again: %v", fs.ops)
+	}
+	// A failing parent fsync is reported and writes no record.
+	dir2 := t.TempDir()
+	fs2 := &recFS{root: dir2, fail: "sync-parent"}
+	if err := newWithFS(dir2, fs2).PutMarker(tMarker(PhasePreparing)); !errors.Is(err, errInjected) {
+		t.Fatalf("put with failing parent fsync: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir2, InflightDir, "vm1.json")); err == nil {
+		t.Fatal("record written after the parent fsync failed")
+	}
+}
+
+// A binding-checked read returns a foreign record WITH a distinct error: it
+// is neither absent nor this caller's, and it still names what is there.
+func TestFwmig_ReadForBinding(t *testing.T) {
+	r := New(t.TempDir())
+	mine := tBinding()
+	recreated := Binding{UUID: tUUID, CreatedAt: "2026-10-16T09:00:00Z", Attempt: tAttempt}
+	otherAttempt := Binding{UUID: tUUID, CreatedAt: tCreated, Attempt: "2a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d"}
+
+	// Absent: not ok, no error.
+	if _, ok, err := r.GetHoldFor("vm1", mine); ok || err != nil {
+		t.Fatalf("absent hold: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.GetMarkerFor("vm1", mine); ok || err != nil {
+		t.Fatalf("absent marker: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.GetOwedDiscardFor("vm1", mine); ok || err != nil {
+		t.Fatalf("absent owed: ok=%v err=%v", ok, err)
+	}
+
+	if err := r.PutHold(tHold(HoldPrepared, NvramPending)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutMarker(tMarker(PhaseMigrating)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutOwedDiscard(tOwed()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mine.
+	if h, ok, err := r.GetHoldFor("vm1", mine); !ok || err != nil || h.State != HoldPrepared {
+		t.Fatalf("own hold: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.GetMarkerFor("vm1", mine); !ok || err != nil {
+		t.Fatalf("own marker: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.GetOwedDiscardFor("vm1", mine); !ok || err != nil {
+		t.Fatalf("own owed: ok=%v err=%v", ok, err)
+	}
+
+	// Another incarnation: present, the record returned, ErrOtherIncarnation.
+	h, ok, err := r.GetHoldFor("vm1", recreated)
+	if !ok || !errors.Is(err, ErrOtherIncarnation) || errors.Is(err, ErrOtherAttempt) || h.Attempt != tAttempt {
+		t.Fatalf("hold for a recreated VM: ok=%v err=%v rec=%+v", ok, err, h)
+	}
+	m, ok, err := r.GetMarkerFor("vm1", recreated)
+	if !ok || !errors.Is(err, ErrOtherIncarnation) || m.Phase != PhaseMigrating {
+		t.Fatalf("marker for a recreated VM: ok=%v err=%v", ok, err)
+	}
+	o, ok, err := r.GetOwedDiscardFor("vm1", recreated)
+	if !ok || !errors.Is(err, ErrOtherIncarnation) || o.Target != "node-2" {
+		t.Fatalf("owed for a recreated VM: ok=%v err=%v", ok, err)
+	}
+	other := Binding{UUID: "11111111-2222-4333-8444-555555555555", CreatedAt: tCreated, Attempt: tAttempt}
+	if _, ok, err := r.GetHoldFor("vm1", other); !ok || !errors.Is(err, ErrOtherIncarnation) {
+		t.Fatalf("hold for another uuid: ok=%v err=%v", ok, err)
+	}
+
+	// Same incarnation, another attempt: present, ErrOtherAttempt.
+	if _, ok, err := r.GetHoldFor("vm1", otherAttempt); !ok || !errors.Is(err, ErrOtherAttempt) || errors.Is(err, ErrOtherIncarnation) {
+		t.Fatalf("hold for another attempt: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.GetMarkerFor("vm1", otherAttempt); !ok || !errors.Is(err, ErrOtherAttempt) {
+		t.Fatalf("marker for another attempt: ok=%v err=%v", ok, err)
+	}
+	// The owed record is keyed by attempt: another attempt has none.
+	if _, ok, err := r.GetOwedDiscardFor("vm1", otherAttempt); ok || err != nil {
+		t.Fatalf("owed for another attempt: ok=%v err=%v", ok, err)
+	}
+	// A caller that checks only err refuses: a foreign record is never "mine".
+	if _, _, err := r.GetHoldFor("vm1", Binding{}); err == nil {
+		t.Fatal("an empty binding matched a hold")
+	}
+}
+
+// Every key the spec lists is required: a missing key is a decode error,
+// never a zero value (swtpm_absent_at_prepare=false is meaningful).
+func TestFwmig_RequiredKeys(t *testing.T) {
+	type kind struct {
+		sub, file string
+		rec       any
+		get       func(r *Records) error
+	}
+	kinds := []kind{
+		{InflightDir, "vm1.json", tMarker(PhaseTargetRan), func(r *Records) error { _, _, err := r.GetMarker("vm1"); return err }},
+		{HoldDir, "vm1.json", tHold(HoldPrepared, NvramPending), func(r *Records) error { _, _, err := r.GetHold("vm1"); return err }},
+		{DiscardOwedDir, "vm1-" + tAttempt + ".json", tOwed(), func(r *Records) error { _, _, err := r.GetOwedDiscard("vm1", tAttempt); return err }},
+	}
+	for _, k := range kinds {
+		full := rawOf(t, k.rec)
+		for key := range full {
+			for _, how := range []string{"missing", "null"} {
+				if how == "null" && key == "created_stubs" {
+					continue // a nil list encodes as null
+				}
+				dir := t.TempDir()
+				raw := rawOf(t, k.rec)
+				if how == "missing" {
+					delete(raw, key)
+				} else {
+					raw[key] = nil
+				}
+				writeRaw(t, dir, k.sub, k.file, raw)
+				if err := k.get(New(dir)); err == nil {
+					t.Errorf("%s: %s %s accepted", k.sub, key, how)
+				}
+			}
+		}
+		// The complete record reads.
+		dir := t.TempDir()
+		writeRaw(t, dir, k.sub, k.file, full)
+		if err := k.get(New(dir)); err != nil {
+			t.Errorf("%s complete: %v", k.sub, err)
+		}
+	}
+	// A nil stub list round-trips.
+	r := New(t.TempDir())
+	m := tMarker(PhasePreparing)
+	m.CreatedStubs = nil
+	if err := r.PutMarker(m); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.GetMarker("vm1"); err != nil {
+		t.Fatalf("nil stubs: %v", err)
+	}
+}
+
+// Parking a parked marker keeps the progress phase it was first parked from.
+func TestFwmig_ParkCarriesProgressPhase(t *testing.T) {
+	m := tMarker(PhaseCutover)
+	p1, err := m.Park(PhaseTargetUnreachable)
+	if err != nil || p1.Phase != PhaseTargetUnreachable || p1.ParkedFrom != PhaseCutover {
+		t.Fatalf("park from cutover: %+v %v", p1, err)
+	}
+	p2, err := p1.Park(PhaseTargetRan)
+	if err != nil || p2.Phase != PhaseTargetRan || p2.ParkedFrom != PhaseCutover {
+		t.Fatalf("park from parked: phase %s from %s, %v", p2.Phase, p2.ParkedFrom, err)
+	}
+	r := New(t.TempDir())
+	if err := r.PutMarker(p2); err != nil {
+		t.Fatalf("parked-to-parked marker refused: %v", err)
+	}
+	if p1.Phase != PhaseTargetUnreachable {
+		t.Fatal("Park modified its receiver")
+	}
+	// A pre-cutover park stays pre-cutover through a second park.
+	pre, _ := tMarker(PhasePrepared).Park(PhaseTargetUnreachable)
+	pre2, err := pre.Park(PhaseDiscardPending)
+	if err != nil || !pre2.BeforeCutover() {
+		t.Fatalf("pre-cutover park lost: %+v %v", pre2, err)
+	}
+	for _, bad := range []Phase{PhaseCommitted, "", "nowhere"} {
+		if _, err := m.Park(bad); err == nil {
+			t.Errorf("Park(%q) accepted", bad)
+		}
+	}
+	broken := tMarker(PhaseTargetRan)
+	broken.ParkedFrom = ""
+	if _, err := broken.Park(PhaseDiscardPending); err == nil {
+		t.Error("parking a parked marker with no parked_from accepted")
+	}
+}
+
+// Temp files left by a crash are swept; records, other files and the
+// quarantine are never touched.
+func TestFwmig_SweepsStaleTemps(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+	odd := tMarker(PhasePreparing)
+	odd.VM = "x.json.tmp-1" // a legal VM name that looks like a temp
+	for _, put := range []func() error{
+		func() error { return r.PutMarker(tMarker(PhasePreparing)) },
+		func() error { return r.PutMarker(odd) },
+		func() error { return r.PutHold(tHold(HoldPrepared, NvramPending)) },
+		func() error { return r.PutOwedDiscard(tOwed()) },
+	} {
+		if err := put(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stale []string
+	for _, sub := range []string{InflightDir, HoldDir, DiscardOwedDir} {
+		p := filepath.Join(dir, sub, "vm7.json.tmp-123456")
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stale = append(stale, p)
+	}
+	keep := []string{
+		filepath.Join(dir, QuarantineDir, "vm1-"+tAttempt, "vm1.json.tmp-99"),
+		filepath.Join(dir, InflightDir, "notes.txt"),
+	}
+	for _, p := range keep {
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if ms, err := r.ListMarkers(); err != nil || len(ms) != 2 {
+		t.Fatalf("ListMarkers = %v, %v", ms, err)
+	}
+	if _, err := os.Stat(stale[0]); err == nil {
+		t.Error("ListMarkers left a stale temp")
+	}
+	if err := r.SweepTemps(); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range stale {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("stale temp %s survived", p)
+		}
+	}
+	for _, p := range keep {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s removed: %v", p, err)
+		}
+	}
+	if _, ok, err := r.GetMarker("x.json.tmp-1"); !ok || err != nil {
+		t.Fatalf("record of a temp-like VM name swept: ok=%v err=%v", ok, err)
+	}
+	if hs, err := r.ListHolds(); err != nil || len(hs) != 1 {
+		t.Fatalf("hold swept: %v %v", hs, err)
+	}
+	if ow, err := r.ListOwedDiscards(); err != nil || len(ow) != 1 {
+		t.Fatalf("owed swept: %v %v", ow, err)
+	}
+	// No record dirs at all: nothing to sweep, no error.
+	if err := New(t.TempDir()).SweepTemps(); err != nil {
+		t.Fatal(err)
 	}
 }

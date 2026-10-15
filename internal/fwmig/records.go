@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -184,6 +186,28 @@ func (b Binding) SameIncarnation(o Binding) bool {
 	return b.UUID != "" && strings.EqualFold(b.UUID, o.UUID) && b.CreatedAt != "" && b.CreatedAt == o.CreatedAt
 }
 
+// ErrOtherIncarnation: the record names another incarnation of the VM (uuid
+// or created_at differ). ErrOtherAttempt: the same incarnation, another
+// attempt. Either way the record is present and is not the caller's; it
+// still vetoes what a record vetoes.
+var (
+	ErrOtherIncarnation = errors.New("fwmig: record names another incarnation")
+	ErrOtherAttempt     = errors.New("fwmig: record names another attempt")
+)
+
+// check is nil when b is o's binding, else ErrOtherIncarnation or
+// ErrOtherAttempt wrapped with both bindings.
+func (b Binding) check(o Binding) error {
+	switch {
+	case !b.SameIncarnation(o):
+		return fmt.Errorf("%w: record uuid %s created_at %s attempt %s, asked for uuid %s created_at %s",
+			ErrOtherIncarnation, b.UUID, b.CreatedAt, b.Attempt, o.UUID, o.CreatedAt)
+	case !b.Matches(o):
+		return fmt.Errorf("%w: record attempt %s, asked for %s", ErrOtherAttempt, b.Attempt, o.Attempt)
+	}
+	return nil
+}
+
 // Matches reports whether o names the same incarnation and the same attempt.
 func (b Binding) Matches(o Binding) bool {
 	return b.SameIncarnation(o) && b.Attempt != "" && b.Attempt == o.Attempt
@@ -205,8 +229,27 @@ type Marker struct {
 	Since            time.Time `json:"since"`
 	Detail           string    `json:"detail"`
 	// ParkedFrom is the progress phase a parked marker was parked from; empty
-	// when Phase is not parked.
+	// when Phase is not parked. A parked marker parked again keeps the
+	// original progress phase: use Park.
 	ParkedFrom Phase `json:"parked_from"`
+}
+
+// Park returns m moved to the parked phase p. ParkedFrom is m's phase when m
+// is in progress, and m's own ParkedFrom when m is already parked, so a
+// parked-to-parked move keeps the progress phase the move stopped at.
+func (m Marker) Park(p Phase) (Marker, error) {
+	if !p.Parked() {
+		return Marker{}, fmt.Errorf("marker %s: %q is not a parked phase", m.VM, p)
+	}
+	from := m.Phase
+	if m.Phase.Parked() {
+		from = m.ParkedFrom
+	}
+	if !phaseIn(from, progressPhases) {
+		return Marker{}, fmt.Errorf("marker %s: cannot park %s: no progress phase to park from (%q)", m.VM, m.Phase, from)
+	}
+	m.Phase, m.ParkedFrom = p, from
+	return m, nil
 }
 
 // BeforeCutover reports whether the marker is before cutover: preparing,
@@ -483,15 +526,30 @@ func (r *Records) owedPath(vm, attempt string) (string, error) {
 	return filepath.Join(root, DiscardOwedDir, base+".json"), nil
 }
 
-// put writes v to path durably: temp file, fsync, rename, directory fsync.
+// tempMu serialises a write's temp file (create to rename) against the
+// sweep, so a sweep never removes a temp a write in this process still owns:
+// any temp it sees belongs to a write that died with its process.
+var tempMu sync.Mutex
+
+// put writes v to path durably: temp file, fsync, rename, directory fsync. A
+// record directory the write creates is made durable too (its parent is
+// fsynced) before the record goes in it.
 func (r *Records) put(path string, v any) error {
-	dir := filepath.Dir(path)
-	if err := r.fs.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
+	}
+	dir := filepath.Dir(path)
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	_, statErr := os.Stat(dir)
+	if err := r.fs.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		if err := r.fs.SyncDir(filepath.Dir(dir)); err != nil {
+			return err
+		}
 	}
 	tmp, err := r.fs.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -549,20 +607,123 @@ func (r *Records) get(path string, v interface{ Validate() error }) (bool, error
 	if dec.More() {
 		return false, fmt.Errorf("fwmig: corrupt record %s: trailing data", path)
 	}
+	if err := requireKeys(b, v); err != nil {
+		return false, fmt.Errorf("fwmig: corrupt record %s: %w", path, err)
+	}
 	if err := v.Validate(); err != nil {
 		return false, fmt.Errorf("fwmig: invalid record %s: %w", path, err)
 	}
 	return true, nil
 }
 
-// list returns the names of the record files in sub, sorted; temp files are
-// not records.
+// nullableKeys may be JSON null: a nil list encodes as null.
+var nullableKeys = map[string]bool{"created_stubs": true}
+
+// requireKeys fails unless the object b carries every key of v's type,
+// non-null: a missing key must not decode as a zero value
+// (swtpm_absent_at_prepare=false is a statement, not a default).
+func requireKeys(b []byte, v any) error {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return err
+	}
+	for _, k := range jsonKeys(reflect.TypeOf(v).Elem()) {
+		raw, ok := obj[k]
+		if !ok {
+			return fmt.Errorf("missing key %q", k)
+		}
+		if !nullableKeys[k] && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("key %q is null", k)
+		}
+	}
+	return nil
+}
+
+// jsonKeys lists t's JSON keys, flattening embedded structs.
+func jsonKeys(t reflect.Type) []string {
+	var keys []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			keys = append(keys, jsonKeys(f.Type)...)
+			continue
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			keys = append(keys, name)
+		}
+	}
+	return keys
+}
+
+// isTemp reports whether name is a write's temp file: <record>.json.tmp-<digits>.
+// A record of a VM whose name looks like one still ends in .json.
+func isTemp(name string) bool {
+	i := strings.LastIndex(name, ".json.tmp-")
+	if i <= 0 {
+		return false
+	}
+	rest := name[i+len(".json.tmp-"):]
+	if rest == "" {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepDir removes the temp files a crashed write left in one record
+// directory. It touches nothing else.
+func (r *Records) sweepDir(dir string) error {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	ents, err := r.fs.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if e.Type().IsRegular() && isTemp(e.Name()) {
+			if err := r.fs.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SweepTemps removes the temp files crashed writes left in the marker, hold
+// and owed-discard directories. It never reads fwmig-quarantine/ or
+// fwmig-retained/. Every List does the same for its own directory.
+func (r *Records) SweepTemps() error {
+	root, err := r.root()
+	if err != nil {
+		return err
+	}
+	for _, sub := range []string{InflightDir, HoldDir, DiscardOwedDir} {
+		if err := r.sweepDir(filepath.Join(root, sub)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// list returns the names of the record files in sub, sorted, after sweeping
+// its stale temp files.
 func (r *Records) list(sub string) (string, []string, error) {
 	root, err := r.root()
 	if err != nil {
 		return "", nil, err
 	}
 	dir := filepath.Join(root, sub)
+	if err := r.sweepDir(dir); err != nil {
+		return "", nil, err
+	}
 	ents, err := r.fs.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return dir, nil, nil
@@ -592,7 +753,20 @@ func (r *Records) PutMarker(m Marker) error {
 	return r.put(p, m)
 }
 
-// GetMarker reads vm's marker; ok is false when there is none.
+// GetMarkerFor reads vm's marker for the caller's binding. ok is true
+// whenever a marker exists; a marker of another incarnation or attempt is
+// returned with ErrOtherIncarnation or ErrOtherAttempt. It is still a marker
+// and still vetoes.
+func (r *Records) GetMarkerFor(vm string, b Binding) (Marker, bool, error) {
+	m, ok, err := r.GetMarker(vm)
+	if err != nil || !ok {
+		return m, ok, err
+	}
+	return m, true, m.Binding.check(b)
+}
+
+// GetMarker reads vm's marker; ok is false when there is none. It does NOT
+// check the binding: callers acting for one attempt use GetMarkerFor.
 func (r *Records) GetMarker(vm string) (Marker, bool, error) {
 	p, err := r.vmPath(InflightDir, vm)
 	if err != nil {
@@ -654,7 +828,20 @@ func (r *Records) PutHold(h Hold) error {
 	return r.put(p, h)
 }
 
-// GetHold reads vm's hold; ok is false when there is none.
+// GetHoldFor reads vm's hold for the caller's binding. ok is true whenever a
+// hold exists; a hold of another incarnation or attempt is returned with
+// ErrOtherIncarnation or ErrOtherAttempt. It is still a hold and still
+// vetoes.
+func (r *Records) GetHoldFor(vm string, b Binding) (Hold, bool, error) {
+	h, ok, err := r.GetHold(vm)
+	if err != nil || !ok {
+		return h, ok, err
+	}
+	return h, true, h.Binding.check(b)
+}
+
+// GetHold reads vm's hold; ok is false when there is none. It does NOT check
+// the binding: callers acting for one attempt use GetHoldFor.
 func (r *Records) GetHold(vm string) (Hold, bool, error) {
 	p, err := r.vmPath(HoldDir, vm)
 	if err != nil {
@@ -715,7 +902,19 @@ func (r *Records) PutOwedDiscard(o OwedDiscard) error {
 	return r.put(p, o)
 }
 
-// GetOwedDiscard reads the owed-discard record for vm and attempt.
+// GetOwedDiscardFor reads the owed-discard record for vm and b.Attempt. ok
+// is true whenever one exists; one of another incarnation is returned with
+// ErrOtherIncarnation.
+func (r *Records) GetOwedDiscardFor(vm string, b Binding) (OwedDiscard, bool, error) {
+	o, ok, err := r.GetOwedDiscard(vm, b.Attempt)
+	if err != nil || !ok {
+		return o, ok, err
+	}
+	return o, true, o.Binding.check(b)
+}
+
+// GetOwedDiscard reads the owed-discard record for vm and attempt. It does
+// NOT check the incarnation: use GetOwedDiscardFor.
 func (r *Records) GetOwedDiscard(vm, attempt string) (OwedDiscard, bool, error) {
 	p, err := r.owedPath(vm, attempt)
 	if err != nil {

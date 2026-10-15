@@ -363,7 +363,14 @@ lv firewall ipset add admins --cidr 10.0.0.0/8 --cidr 2001:db8:1::/48
   nothing a guest sends.
 - nftables sets are typed, so a set holding both families renders as the IPv4
   set `<name>` plus an IPv6 companion `<name>_v6`, and a rule referencing
-  `@<name>` matches either. Do not name another set `<name>_v6`.
+  `@<name>` matches either. A set named `<name>_v6` beside a set `<name>`
+  with IPv6 elements is refused; one an older build stored is left out (see
+  below).
+- A set with no IPv6 elements has no companion, so a rule referencing it does
+  not match IPv6 at all: `!= @<name> drop` on an IPv4-only set lets every IPv6
+  address through. Adding the set's first IPv6 element makes the same rule
+  drop every IPv6 address not in the set; removing its last one lets every
+  IPv6 address through again.
 - A rule without a CIDR on `tcp`, `udp` or `all` matches both families, as it
   always did.
 - Neighbour discovery, router solicitation and advertisement, MLD and the
@@ -758,8 +765,9 @@ file, the problem names the rule's place in the file.
 | Field | Accepted |
 |---|---|
 | `proto` | `all`, a protocol name (`tcp`, `esp`, `ipv6-icmp`, any case) or number 0-255 |
-| `port` (tcp, udp) | a port 0-65535 (decimal or `0x16`), a range `8000-9000` or `ssh - http`, a service name (`ssh`) |
+| `port` (tcp, udp) | a port 0-65535 (decimal, `0x16`, or octal after a leading zero: nft reads `010` as 8), a range `8000-9000` or `ssh - http` that does not run backwards, a service name listed in the host's `/etc/services` (`ssh`) |
 | `cidr` | an IPv4 address, prefix, range `10.0.0.1-10.0.0.9` or DNS name; one IPv6 address or prefix; `@<ipset>` |
+| ip set name | a letter, `_` or `.`, then letters, digits, `_`, `.`, `-` or `/`; at most 255 bytes, 252 for a set with IPv6 elements; not an nft keyword (`drop`, `ip`, `tcp`, `set`, ...) |
 | ip set element | an IPv4 address, prefix, range or DNS name; an IPv6 address or prefix. `--cidr 10.0.0.1,10.0.0.2` is stored as two elements |
 | `action` | `accept`, `drop`, `reject` |
 | `comment` | at most 128 bytes, no double quote |
@@ -795,7 +803,19 @@ before, and nothing is rendered that the row did not ask for:
   the addresses the set lists), so it is held like an unreadable rule: as this
   host last rendered it while that rendering's set is present and whole,
   otherwise left out;
-- an ip set is rendered without the elements it cannot render.
+- a rule whose port this host's nft cannot resolve (a service name missing
+  from its `/etc/services`, a number past 65535, a range nft reads backwards)
+  is held like an unreadable rule;
+- an ip set is rendered without the elements it cannot render, and without
+  its IPv6 elements when its companion's name would pass 255 bytes;
+- an ip set whose name nft cannot read (a digit or `-` first, longer than 255
+  bytes, an nft keyword), or named `<name>_v6` beside a set `<name>` with IPv6
+  elements, is left out, and a rule referencing it is held like an unreadable
+  rule.
+
+Elements of one set that overlap (`10.0.0.0/8` with `10.0.0.1-10.0.0.5`, or
+two ranges that share an address, in one row or across rows of the same name)
+are rendered merged into one element; nft refuses overlapping elements.
 
 The host raises the critical condition `firewall.rule.invalid`, which names
 each row, its stored action and the command that removes it

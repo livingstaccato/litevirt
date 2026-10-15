@@ -766,6 +766,86 @@ func TestHADisarm_HeldRecoveryDeferredRefenceIsRetried(t *testing.T) {
 	}
 }
 
+// Re-review 2 m-1: a one-off read error on the fence log never lets an aged
+// verified fence resume without a re-fence. The judgement is made on the one
+// read that was error-checked; an error keeps the mark (with the reason on the
+// stall alert, m-2), and the next cycle fences again before anything moves.
+//
+// Mutation: judge on a second read after the error check — the first cycle
+// resumes on the aged fence and this goes red.
+func TestHADisarm_HeldRecoveryOneOffReadErrorNeverSkipsTheRefence(t *testing.T) {
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	moved := -1
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		if moved < 0 && vmHost(t, db, ctx) != "down" {
+			moved = fences
+		}
+		return fence.Result{Method: "ipmi", Detail: "verified off", Success: true}
+	})
+	c.ha.beforeHold = func(site string) {
+		if site == haSiteRecovery {
+			setHA(t, db, corrosion.HADisarmed)
+			c.ha.beforeHold = nil
+		}
+	}
+	c.run(ctx)
+	ageFenceRows(t, db, ctx, recentFenceWindow+time.Minute)
+	lengthenStreak(t, db, ctx, recentFenceWindow+2*time.Minute)
+	setHA(t, db, corrosion.HAArmed)
+	failed := false
+	c.ha.readErr = func(what string) error {
+		if what == "fence log" && !failed {
+			failed = true
+			return errors.New("injected: database is locked")
+		}
+		return nil
+	}
+	c.run(ctx)
+	if got := vmHost(t, db, ctx); got != "down" || fences != 1 {
+		t.Fatalf("cycle with the read error: VM on %q after %d fences; want nothing moved and no fence", got, fences)
+	}
+	if !c.ha.heldRecovery["down"] || !strings.Contains(c.holdReason["down"], "could not be read") {
+		t.Fatalf("read error: held=%v reason %q; want the mark kept and the read error on the stall alert",
+			c.ha.heldRecovery, c.holdReason["down"])
+	}
+	c.run(ctx)
+	if fences != 2 || moved != -1 || vmHost(t, db, ctx) != "alive" {
+		t.Fatalf("next cycle: %d fences, moved at fence %d, VM on %q; want the re-fence before the recovery",
+			fences, moved, vmHost(t, db, ctx))
+	}
+}
+
+// Re-review 2 m-2: every keep-branch on a read error names the read error on
+// the stall alert.
+func TestHADisarm_HeldRecoveryReadErrorsNameThemselves(t *testing.T) {
+	for _, what := range []string{"host", "fence log", "health"} {
+		db, ctx := seedDownHost(t, "ssh", nil)
+		c := newTestCoordinator("coordinator", db)
+		c.SetFencer(countingFencer(new(int), sshFence))
+		c.ha.beforeHold = func(site string) {
+			if site == haSiteRecovery {
+				setHA(t, db, corrosion.HADisarmed)
+				c.ha.beforeHold = nil
+			}
+		}
+		c.run(ctx)
+		setHA(t, db, corrosion.HAArmed)
+		c.ha.readErr = func(w string) error {
+			if w == what {
+				return errors.New("injected")
+			}
+			return nil
+		}
+		c.run(ctx)
+		if vmHost(t, db, ctx) != "down" || !c.ha.heldRecovery["down"] || !strings.Contains(c.holdReason["down"], "could not be read") {
+			t.Errorf("%s read error: VM on %q, held=%v, reason %q", what, vmHost(t, db, ctx), c.ha.heldRecovery, c.holdReason["down"])
+		}
+	}
+}
+
 // Re-review 1 I-1: a read error while judging a held recovery keeps the mark;
 // the next cycle, with the rows readable, recovers.
 func TestHADisarm_HeldRecoveryReadErrorIsRetried(t *testing.T) {

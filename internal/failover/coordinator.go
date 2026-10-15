@@ -2273,18 +2273,24 @@ const (
 // they would have to the leader: the successor gets the dead leader's
 // authority and no more.
 func (c *Coordinator) resumeActionFor(ctx context.Context, host string, rec fenceRecord, at time.Time) (resumeAction, string) {
+	return c.resumeActionForIn(c.readHostHealth(ctx, host), host, rec, at)
+}
+
+// resumeActionForIn is resumeActionFor over host_health rows already read, so
+// a caller that has checked the read decides on exactly those rows.
+func (c *Coordinator) resumeActionForIn(hr healthRead, host string, rec fenceRecord, at time.Time) (resumeAction, string) {
 	if corrosion.ReliesOnPartitionPause(rec.Method, rec.Detail) {
 		// A fence that relied on the host's partition pause. The host is up by
 		// design, so whether anybody has seen it answer is not this point's
 		// question: recoverFenced starts a fresh wait, and the deadline asks
 		// it (selfPauseStillStands). An outage that has ended is still
 		// declined here.
-		if !c.observerStreakSpans(ctx, host, at) {
+		if !c.streakSpansIn(hr, host, at) {
 			return resumeDecline, "no observer has watched the host stay down since the fence"
 		}
 		return resumeFromRecord, ""
 	}
-	why, stands := c.fenceStillStands(ctx, host, at)
+	why, _, stands := c.fenceStillStandsIn(hr, host, at)
 	if !corrosion.FenceProofGrade(rec.Method, rec.Result) {
 		if stands {
 			return resumeFromRecord, ""

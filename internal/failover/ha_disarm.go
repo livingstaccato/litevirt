@@ -86,6 +86,17 @@ type haDisarmState struct {
 	// site's name; read, when set, replaces the policy read. Tests only.
 	beforeHold func(site string)
 	read       func(ctx context.Context) (corrosion.HAPolicy, error)
+	// readErr, when set, fails a held recovery's read of what ("fence log",
+	// "health") when it returns an error. Tests only.
+	readErr func(what string) error
+}
+
+// haHeldReadErr is the readErr seam.
+func (c *Coordinator) haHeldReadErr(what string) error {
+	if c.ha.readErr != nil {
+		return c.ha.readErr(what)
+	}
+	return nil
 }
 
 // haRead reads the policy from this node's replica.
@@ -225,21 +236,44 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 		// A pause wait is still owed: it runs first, and recovers from there.
 		return false
 	}
-	h, err := corrosion.GetHost(ctx, c.db, host)
-	if err != nil {
+	retry := func(what string, err error) bool {
+		c.noteHold(host, "recovery held by an HA disarm; the "+what+" could not be read ("+err.Error()+"), retrying")
 		return true
+	}
+	h, err := corrosion.GetHost(ctx, c.db, host)
+	if err == nil {
+		err = c.haHeldReadErr("host")
+	}
+	if err != nil {
+		return retry("host's record", err)
 	}
 	if h == nil {
 		delete(c.ha.heldRecovery, host)
 		return true
 	}
-	// The health rows every judgement below rests on must be readable.
-	if c.readHostHealth(ctx, host).err != nil {
-		c.noteHold(host, "recovery held by an HA disarm; its host's health rows could not be read, retrying")
-		return true
+	// One read of the fence log and one of the health rows, both checked;
+	// every judgement below is made on exactly these. A read error decides
+	// nothing: an aged verified fence must never reach the no-refence path
+	// because one read of it failed, and a decline is never made final on
+	// rows that could not be read.
+	rec, at, ok, err := c.readNewestFenceAttempt(ctx, host)
+	if err == nil {
+		err = c.haHeldReadErr("fence log")
 	}
-	if rec, at, ok := c.recordedFence(ctx, h); ok {
-		switch act, why := c.resumeActionFor(ctx, host, rec, at); act {
+	if err != nil {
+		return retry("fence log", err)
+	}
+	hr := c.readHostHealth(ctx, host)
+	if hr.err == nil {
+		hr.err = c.haHeldReadErr("health")
+	}
+	if hr.err != nil {
+		return retry("host's health rows", hr.err)
+	}
+	// recordedFence's rule, on the read above.
+	recorded := ok && (h.State == "fenced" || h.State == "offline") && rec.Result == fence.LogFenced && rec.Method != "manual"
+	if recorded {
+		switch act, why := c.resumeActionForIn(hr, host, rec, at); act {
 		case resumeFromRecord:
 			delete(c.ha.heldRecovery, host)
 			slog.Info("failover: HA armed again; resuming the recovery it held", "host", host, "fence_id", rec.ID)
@@ -256,27 +290,15 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, obs
 				c.noteHAHeldRecovery(host)
 			}
 		default:
-			if c.readHostHealth(ctx, host).err != nil {
-				return true
-			}
 			delete(c.ha.heldRecovery, host)
 			c.noteResumeDeclined(host, rec, why)
 			c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
 		}
 		return true
 	}
-	_, at, ok, err := c.readNewestFenceAttempt(ctx, host)
-	if err != nil {
-		c.noteHold(host, "recovery held by an HA disarm; the fence log could not be read, retrying")
-		return true
-	}
 	if !ok {
 		delete(c.ha.heldRecovery, host)
 		c.noteHold(host, "recovery held by an HA disarm, and no fence of the host is on record")
-		return true
-	}
-	hr := c.readHostHealth(ctx, host)
-	if hr.err != nil {
 		return true
 	}
 	if why, _, stands := c.fenceStillStandsIn(hr, host, at); !stands {

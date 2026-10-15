@@ -111,3 +111,20 @@ func TestPlanLoader_IsolatedBridges(t *testing.T) {
 		t.Errorf("IsolatedBridges = %v, want %v", plan.IsolatedBridges, want)
 	}
 }
+
+// TestRender_HostIsolationAcceptsReplies: a host-isolated bridge's input
+// drop lets through replies to connections the host opened, ahead of the
+// drop, so haproxy reaches backends on the bridge.
+//
+// Mutation: drop the established accept — red.
+func TestRender_HostIsolationAcceptsReplies(t *testing.T) {
+	out, err := Render(Plan{HostIsolation: []IsolationChain{{Bridge: "hinet"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc := "iifname hinet ct state established,related accept"
+	i, j := strings.Index(out, acc), strings.Index(out, "iifname hinet drop")
+	if i < 0 || j < 0 || i > j {
+		t.Errorf("want %q before the drop:\n%s", acc, out)
+	}
+}

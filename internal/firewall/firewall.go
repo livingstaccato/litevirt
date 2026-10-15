@@ -516,8 +516,10 @@ func renderNAT(b *strings.Builder, rules []NATRule) {
 
 // renderHostIsolation emits a single `input` filter chain that drops guest→host
 // traffic per isolated bridge, punching through VRRP + declared LB VIP ports
-// first. Policy is accept — only the explicit iifname-<bridge> drops bite, so
-// non-isolated bridges and host-local traffic are untouched.
+// first. Replies to connections the host opened (haproxy to a backend on the
+// bridge) are accepted ahead of the drop; a guest can open nothing. Policy is
+// accept — only the explicit iifname-<bridge> drops bite, so non-isolated
+// bridges and host-local traffic are untouched.
 func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	if len(chains) == 0 {
 		return
@@ -529,6 +531,7 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	fmt.Fprintf(b, "    chain input {\n")
 	fmt.Fprintf(b, "        type filter hook input priority filter; policy accept;\n")
 	for _, c := range sorted {
+		fmt.Fprintf(b, "        iifname %s ct state established,related accept\n", c.Bridge)
 		if len(c.Exceptions) > 0 {
 			// VRRP (keepalived) once per bridge, then each VIP:port.
 			fmt.Fprintf(b, "        iifname %s ip protocol 112 accept\n", c.Bridge)

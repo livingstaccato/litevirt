@@ -1516,6 +1516,10 @@ func (s *Server) SetDHCPReservationBackend(served, uplink func(bridge string) bo
 // whatever interfaces the machine running the test happens to have.
 func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
 
+// SetLBApply replaces the haproxy/keepalived apply of a load balancer on this
+// host (lbApplyOverride). Test-only seam, nil in production.
+func (s *Server) SetLBApply(fn func(context.Context, lb.Config) error) { s.lbApplyOverride = fn }
+
 // SetBridgeHasUplink injects the "does this bridge carry anything off the host"
 // seam (see bridgeUplink). It is the fact that tells an operator's
 // infrastructure bridge from one litevirt auto-created for a placement, and it

@@ -62,7 +62,8 @@ func TestKernel_NICGuard(t *testing.T) {
 	}
 	for _, child := range []string{"TestKernelChild_GuardDropsSpoofs", "TestKernelChild_RulesetLoads",
 		"TestKernelChild_RulesHoldOnEveryPath", "TestKernelChild_DefaultDenyAndBypasses",
-		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_IsolatedNetworkStaysOnHost"} {
+		"TestKernelChild_VLANToNICAndTrunk", "TestKernelChild_IsolatedNetworkStaysOnHost",
+		"TestKernelChild_HostIsolationAnswersTheHost"} {
 		if !strings.Contains(string(out), "--- PASS: "+child) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}

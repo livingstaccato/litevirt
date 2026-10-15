@@ -26,10 +26,12 @@ table inet litevirt-fw {
 
     chain input {
         type filter hook input priority filter; policy accept;
+        iifname br-iso-a ct state established,related accept
         iifname br-iso-a ip protocol 112 accept
         iifname br-iso-a ip daddr 10.100.0.50 tcp dport 80 accept
         iifname br-iso-a ip daddr 10.100.0.50 tcp dport 443 accept
         iifname br-iso-a drop
+        iifname br-iso-z ct state established,related accept
         iifname br-iso-z drop
     }
 

@@ -124,6 +124,14 @@ func TestRenderCompatGolden(t *testing.T) {
 			t.Fatalf("%s: the isolated-network forward chain is missing", mode)
 		}
 		got = strings.Replace(got, iso.String(), "", 1)
+		// So does a host-isolated bridge's accept of replies to the host.
+		for _, c := range p.HostIsolation {
+			acc := "        iifname " + c.Bridge + " ct state established,related accept\n"
+			if !strings.Contains(got, acc) {
+				t.Fatalf("%s: %q is missing", mode, acc)
+			}
+			got = strings.Replace(got, acc, "", 1)
+		}
 		golden.Assert(t, "testdata/render_compat_"+mode+".golden", got)
 	}
 }

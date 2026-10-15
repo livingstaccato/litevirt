@@ -301,8 +301,10 @@ iptables):
   its VIP (`oifname <uplink> ip saddr <subnet> snat to <vip>`), emitted before
   masquerade.
 - **Host isolation** — an `input` chain drops guest→host traffic per isolated
-  bridge (`iifname <bridge> drop`), punching through VRRP + declared LB VIP ports
-  first so guests can still reach an HAProxy VIP.
+  bridge (`iifname <bridge> drop`), punching through replies to connections the
+  host opened (`ct state established,related`, so HAProxy reaches backends on
+  the bridge), VRRP and declared LB VIP ports first so guests can still reach an
+  HAProxy VIP.
 - **Isolated networks** — an `isolated_forward` chain on the `forward` hook
   drops anything routed off or onto an `isolated` network's bridge: per known
   bridge (`iifname "<bridge>" oifname != "<bridge>" drop` and the reverse), and

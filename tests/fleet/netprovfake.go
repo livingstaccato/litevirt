@@ -194,6 +194,22 @@ func (f *NetProvFake) Up(network string) (string, bool) {
 	return dev, ok
 }
 
+// HasDevice reports whether a provisioned network, or a flat bridge
+// EnsureBridge made, is on dev here.
+func (f *NetProvFake) HasDevice(dev string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.flat[dev] {
+		return true
+	}
+	for _, d := range f.up {
+		if d == dev {
+			return true
+		}
+	}
+	return false
+}
+
 // Provisions and Deprovisions count calls for network on this node.
 func (f *NetProvFake) Provisions(network string) int {
 	f.mu.Lock()

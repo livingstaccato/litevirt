@@ -686,11 +686,19 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			if targetHosts[0] == s.hostName {
 				priority = 100
 			}
+			lbIface, ierr := s.lbVIPInterface(ctx, vipIP)
+			if ierr != nil {
+				corrosion.SoftDeleteLBBackends(ctx, s.db, req.Name)
+				corrosion.SoftDeleteLBConfig(ctx, s.db, req.Name)
+				s.audit(ctx, "lb.create", req.Name, req.Vip, "error: "+ierr.Error())
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"load balancer %q provisioning failed on %s: %v", req.Name, s.hostName, ierr)
+			}
 			cfg := lb.Config{
 				Name:      req.Name,
 				VIP:       vipIP,
 				VIPPrefix: vipPrefix,
-				Interface: lb.DetectInterfaceForIP(vipIP),
+				Interface: lbIface,
 				VRID:      s.allocVRID(ctx, req.Name),
 				Priority:  priority,
 				Backends:  lbBackends,
@@ -1699,12 +1707,15 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			if len(lbHosts) == 0 || lbHosts[0] == s.hostName {
 				priority = 100
 			}
+			lbIface, ierr := s.lbVIPInterface(ctx, vipIP)
 			cfg := lb.Config{
 				Name: req.Name, VIP: vipIP, VIPPrefix: vipPrefix,
-				Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, req.Name),
+				Interface: lbIface, VRID: s.allocVRID(ctx, req.Name),
 				Priority: priority, Backends: lbBackends, Ports: ports, Algorithm: algorithm,
 			}
-			if err := s.applyLBLocal(ctx, cfg); err != nil {
+			if ierr != nil {
+				slog.Warn("UpdateLoadBalancer: local apply refused", "error", ierr)
+			} else if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
 			} else {
 				// Refresh firewall intent so a changed VIP/ports updates the
@@ -2343,7 +2354,10 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		priority = 100
 	}
 
-	lbIface := lb.DetectInterfaceForIP(vipIP)
+	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "apply LB: %v", err)
+	}
 
 	var ports []lb.Port
 	for _, p := range req.Ports {
@@ -2737,15 +2751,20 @@ func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRe
 			}
 		}
 	}
+	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	if err != nil {
+		slog.Warn("reapplyExplicitLB: apply refused", "lb", cfg.Name, "error", err)
+		return
+	}
 	if err := s.applyLBLocal(ctx, lb.Config{
 		Name: cfg.Name, VIP: vipIP, VIPPrefix: vipPrefix,
-		Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, cfg.Name),
+		Interface: lbIface, VRID: s.allocVRID(ctx, cfg.Name),
 		Priority: priority, Backends: backends, Ports: ports, Algorithm: cfg.Algorithm,
 	}); err != nil {
 		slog.Warn("reapplyExplicitLB: apply failed", "lb", cfg.Name, "error", err)
 	} else {
 		// Re-record firewall intent for an isolated-network VIP (exceptions + SNAT).
-		s.updateIsolationForLB(ctx, cfg.Name, lb.DetectInterfaceForIP(vipIP), vipIP, ports, true)
+		s.updateIsolationForLB(ctx, cfg.Name, lbIface, vipIP, ports, true)
 		slog.Info("LB reconciled", "lb", cfg.Name)
 	}
 }
@@ -2962,10 +2981,12 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 		priority = 100
 	}
 
-	// Determine the interface for VRRP. The VIP should be on the same L2
-	// segment as the backends (the bridge). Find the interface whose subnet
-	// contains the VIP; fall back to default route interface.
-	lbIface := lb.DetectInterfaceForIP(vipIP)
+	// Determine the interface for VRRP: the VIP's network's bridge, the same
+	// L2 segment as the backends (lbVIPInterface).
+	lbIface, err := s.lbVIPInterface(ctx, vipIP)
+	if err != nil {
+		return err
+	}
 
 	cfg := lb.Config{
 		Name:      lbName,

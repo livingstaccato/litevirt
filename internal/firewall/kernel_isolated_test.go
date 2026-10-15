@@ -130,3 +130,33 @@ func TestKernelChild_IsolatedNetworkStaysOnHost(t *testing.T) {
 		t.Logf("links:\n%s", sh(t, "ip", "-br", "addr"))
 	}
 }
+
+// TestKernelChild_HostIsolationAnswersTheHost: a host-isolated bridge drops
+// what its guests send the host, but not their replies to connections the
+// host opened — haproxy's health checks and proxied connections to backends
+// on the bridge (lab 1 LBAndSNAT: Layer4 timeout once the VIP was on the
+// bridge). Guests still cannot open anything to the host.
+//
+// Mutation: drop the established accept from renderHostIsolation — the
+// host-to-guest case goes red.
+func TestKernelChild_HostIsolationAnswersTheHost(t *testing.T) {
+	inNetns(t)
+	l := newRoutedLab(t, map[string]string{"lvhi0": "10.40.0.254/24"},
+		[]routedGuest{{"hi1", "lvhi0", "10.40.0.1", "10.40.0.254"}})
+	if _, err := NewApplier(NftBinary{}).Apply(context.Background(), Plan{HostIsolation: []IsolationChain{{Bridge: "lvhi0"}}}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !l.ping("", "10.40.0.1") {
+		t.Error("the host gets no reply from a guest on a host-isolated bridge")
+	}
+	if l.ping("hi1", "10.40.0.254") {
+		t.Error("a guest on a host-isolated bridge reached the host")
+	}
+	if t.Failed() {
+		t.Logf("ruleset:\n%s", sh(t, "nft", "list", "ruleset"))
+	}
+	sh(t, "nft", "delete", "table", "inet", TableName)
+	if !l.ping("hi1", "10.40.0.254") {
+		t.Error("a guest cannot reach the host with no table loaded")
+	}
+}

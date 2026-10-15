@@ -843,6 +843,13 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
         interval-ms: 2000               # Check interval in milliseconds
 ```
 
+**Where the VIP goes**: a VIP inside a network's subnet is put on that network's
+bridge on each LB host (the most specific subnet when several hold it), whether
+or not the bridge carries an address in the subnet, as a host-isolated network's
+bridge does not. If that bridge is not on the host, the LB is refused there with
+the network and bridge named. A VIP in no network's subnet goes on the host device
+whose subnet holds it, else on the default-route device.
+
 All VMs in the stack automatically become backends. Backend IPs are discovered via
 ARP/DHCP after boot and persisted in the cluster database. **Containers in the stack
 are backends too** — a single LB can front a mix of VMs and containers; give a
@@ -1306,7 +1313,7 @@ When a load balancer VIP lives on an isolated network, litevirt automatically ad
 - **VRRP** (IP protocol 112) — keepalived peer communication
 - **VIP ports** — only the declared listener ports on the VIP address
 
-All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
+Replies to connections the host opens (HAProxy's health checks and proxied connections to backends on the bridge) are accepted too. All other traffic from VMs to the host remains blocked. These exceptions are managed automatically when LBs are applied or removed.
 
 ### External networks
 

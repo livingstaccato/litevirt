@@ -77,6 +77,15 @@ func (r *StackReconciler) reconcile(ctx context.Context) {
 		r.reconcileStack(ctx, stack)
 	}
 
+	// Rows a torn-down stack still owns (handed to it by a concurrent
+	// teardown that read it as live) go to a live stack that asks for them,
+	// or go.
+	if orphan, err := corrosion.SweepOrphanStackRows(ctx, r.db, compose.StoredStackWants); err != nil {
+		slog.Warn("stack-reconciler: sweep the rows of torn-down stacks", "error", err)
+	} else {
+		r.reportOrphanDeny(ctx, orphan)
+	}
+
 	// A live stack that asks for the cluster default-deny gets it back when
 	// the cluster has none, e.g. after its owner went down while this
 	// stack's deploy was in flight.

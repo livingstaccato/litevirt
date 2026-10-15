@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"log/slog"
+	"strings"
 )
 
 // GetBackupRepo returns the live registration of name, or nil if there is
@@ -86,6 +87,8 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 	var others []stackWants
 	var unreadable []string
 	loaded, kept := false, false
+	var scheduled map[string]bool
+	var keptScheduled, gone []string
 	for _, r := range repos {
 		if r.StackName != stack {
 			continue
@@ -96,27 +99,62 @@ func DeleteStackBackupRepos(ctx context.Context, c *Client, stack string, read S
 			}
 			loaded = true
 		}
-		handed := false
+		var heirs []string
 		for _, o := range others {
 			if o.repos[r.Name] {
-				if err := UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: o.name}); err != nil {
-					return err
-				}
-				handed = true
-				break
+				heirs = append(heirs, o.name)
 			}
 		}
-		if !handed && len(unreadable) > 0 {
+		handed, err := handOff(ctx, c, stack, heirs, func(owner string) error {
+			return UpsertBackupRepo(ctx, c, BackupRepo{Name: r.Name, Path: r.Path, StackName: owner})
+		})
+		if err != nil {
+			return err
+		}
+		if handed {
+			continue
+		}
+		if len(unreadable) > 0 {
 			kept = true
 		}
+		if scheduled == nil {
+			if scheduled, err = scheduledBackupRepos(ctx, c); err != nil {
+				return err
+			}
+		}
+		if scheduled[r.Name] {
+			keptScheduled = append(keptScheduled, r.Name)
+		} else {
+			gone = append(gone, r.Name)
+		}
 	}
-	if kept {
-		slog.Warn("stack teardown: the stack's backup repos stay registered: the compose files of other stacks cannot be read, and one may use them",
-			"stack", stack, "unreadable", unreadable)
+	if kept || len(keptScheduled) > 0 {
+		warnOnChange("backup-repos/"+stack, strings.Join(append(append([]string{}, unreadable...), keptScheduled...), ","),
+			"stack teardown: the stack's backup repos stay registered: a backup schedule names one, or another stack's compose file cannot be read and may use them",
+			"stack", stack, "scheduled", keptScheduled, "unreadable", unreadable)
 		return nil
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
+	if err := c.Execute(ctx,
 		`UPDATE backup_repos SET deleted_at = ?, updated_at = ? WHERE stack_name = ? AND deleted_at IS NULL`,
-		nowRFC3339(), now, stack)
+		nowRFC3339(), now, stack); err != nil {
+		return err
+	}
+	if len(gone) > 0 {
+		slog.Info("stack teardown: backup repo registrations removed; the data at their paths is untouched", "stack", stack, "repos", gone)
+	}
+	return nil
+}
+
+// scheduledBackupRepos is the set of repo names a live backup schedule names.
+func scheduledBackupRepos(ctx context.Context, c *Client) (map[string]bool, error) {
+	rows, err := c.Query(ctx, `SELECT DISTINCT repo FROM backup_schedules WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		out[r.String("repo")] = true
+	}
+	return out, nil
 }

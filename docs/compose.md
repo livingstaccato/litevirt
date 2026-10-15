@@ -150,10 +150,12 @@ container the stack did not create) is attached to is kept too, reported as
 `kept network <name>: used by ...`, so it is not pulled out from under it.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
-and exit status 0 only when every VM and container was deleted and every stack
-network deprovisioned. If any could not be — or the stack's containers could
+and exit status 0 only when every VM and container was deleted, every stack
+network deprovisioned, and the stack's firewall rows and backup repos removed.
+If any could not be — or the stack's containers could
 not even be listed — each failure is printed, named for what was left (a VM or
-container name, `network <name>`, or `containers (list failed)`), the success line is withheld, and the command
+container name, `network <name>`, `containers (list failed)`, `firewall rows`
+or `backup repos`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
@@ -175,7 +177,14 @@ file cannot be read, it stays. A deploy asking for default-deny sets it again
 once its record is written if the cluster no longer denies, and the background
 stack reconciler sets it for a live stack whose file asks for it when the
 cluster has no default, if that stack was recorded after the default was
-removed (a redeploy that drops default-deny is not undone). The web UI's stack **Destroy** action
+removed (a redeploy that drops default-deny is not undone). Stacks going down
+at the same time never hand the deny or a repo to each other: a stack that
+went down is passed over. The background reconciler hands a deny or repo a
+torn-down stack still holds to a live stack that asks for it. Otherwise it
+unregisters such a repo, unless a backup schedule names it, and keeps such a
+deny: it never turns the cluster default-allow on its own, and raises the
+`firewall.default_deny_orphaned` health condition instead (see
+[diagnostics.md](diagnostics.md)). The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

@@ -1577,6 +1577,18 @@ text as `sharedDiskWithheld`. It is notified (`vm.shared_disk_withheld` event
 and notification) when raised or when its text changes, and resolves when the
 next build of the VM's domain withholds nothing.
 
+### A cluster default-deny held by a torn-down stack (`firewall.default_deny_orphaned`)
+
+Evaluator `stack_reconciler`, subject kind `cluster`, subject `cluster`,
+severity warning. Raised by the stack reconciler when the cluster default-deny
+is owned by a compose stack that was torn down and no live stack's file asks
+for it, for example after two stacks went down at the same time. The deny
+stays in force: the reconciler never turns the cluster default-allow on its
+own. `lv firewall default-deny off` removes it, and `lv firewall default-deny
+on` keeps it as the operator's; a stack deployed later that asks for
+default-deny takes it over. The condition resolves on the next pass after
+either.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

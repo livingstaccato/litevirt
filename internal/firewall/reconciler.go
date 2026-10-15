@@ -406,6 +406,10 @@ type LoaderOptions struct {
 	// Arming, when set, names VMs rendered here whatever host their row
 	// names and NICs whose rows are not written yet (see Arming).
 	Arming *Arming
+
+	// Now is the loader's clock (time.Now when nil): how long a rule has
+	// referenced a missing set (emptySetGrace).
+	Now func() time.Time
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -430,6 +434,10 @@ type LoaderOptions struct {
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	taps := &tapFetcher{}
 	memory := &rowMemory{}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	tapBridge := opts.TapBridge
 	if tapBridge == nil {
 		tapBridge = sysfsMaster
@@ -456,7 +464,8 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		var badSets []InvalidRow
 		plan.IPSets, badSets = quarantineIPSets(ipsets)
-		q := newQuarantine(plan.IPSets, memory.snapshot())
+		prevRules, emptySince := memory.snapshot()
+		q := newQuarantine(plan.IPSets, prevRules, emptySince, now())
 
 		clusterRules, err := corrosion.ListClusterFirewallRules(ctx, db)
 		if err != nil {
@@ -780,7 +789,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				}
 			}
 		}
-		memory.store(q.next)
+		memory.store(q)
 		return plan, nil
 	}
 }

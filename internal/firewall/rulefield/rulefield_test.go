@@ -179,12 +179,15 @@ func TestRule_PlanCases(t *testing.T) {
 // TestSyntax_Lists (review C-2): the list forms that load today pass the
 // renderer: a stored set element holding commas, double and trailing commas.
 func TestSyntax_Lists(t *testing.T) {
-	for _, v := range []string{"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,", ","} {
+	for _, v := range []string{"10.0.0.1,10.0.0.2", "10.0.0.1,, 10.0.0.5", "10.0.0.1, 10.0.0.5,"} {
 		if err := RenderSetElement(v); err != nil {
 			t.Errorf("RenderSetElement(%q): %v", v, err)
 		}
 	}
-	for _, v := range []string{"10.0.0.1, 10.0.0.2 }", "10.0.0.1;10.0.0.2", "10.0.0.1,\n10.0.0.2"} {
+	// Re-review m-2: an element that can sort first must not open the list
+	// with a comma or leave it empty, which nft refuses.
+	for _, v := range []string{"10.0.0.1, 10.0.0.2 }", "10.0.0.1;10.0.0.2", "10.0.0.1,\n10.0.0.2",
+		"", " ", ",", ",10.0.0.1", " , 10.0.0.1", ",,"} {
 		if err := RenderSetElement(v); err == nil {
 			t.Errorf("RenderSetElement(%q) accepted", v)
 		}
@@ -199,6 +202,15 @@ func TestSyntax_Lists(t *testing.T) {
 	}
 	if name, ok := SetRef("!=\t@office"); !ok || name != "office" {
 		t.Errorf("SetRef(!= @office) = %q, %v", name, ok)
+	}
+	for v, neg := range map[string]bool{"@x": false, "!= @x": true, "!=@x": true, "ne @x": true, "== @x": false, "\t!=\t@x": true} {
+		if NegatedSetRef(v) != neg {
+			t.Errorf("NegatedSetRef(%q) = %v", v, !neg)
+		}
+	}
+	// A writer normalises a leading comma away, so the write grammar takes it.
+	if err := SetElement(",10.0.0.1"); err != nil {
+		t.Errorf("SetElement(,10.0.0.1): %v", err)
 	}
 }
 

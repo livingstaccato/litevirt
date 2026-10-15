@@ -77,8 +77,29 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 		if d := unboundedDrops(out); len(d) > 0 {
 			t.Fatalf("a drop with no address match was rendered: %q\n%s", d, out)
 		}
+		// Re-review C-1: "not in an empty set" is every address, so no
+		// negated reference may name a set the loader declared empty.
+		declared := map[string]bool{}
+		for _, set := range plan.IPSets {
+			declared[set.Name] = true
+		}
+		for _, set := range plan.IPSets {
+			if len(set.CIDRs) > 0 {
+				continue
+			}
+			for _, neg := range []string{"!= @" + set.Name, "!=@" + set.Name} {
+				if strings.Contains(out, neg+" ") {
+					t.Fatalf("a negated reference to the empty set %s was rendered (it matches everything):\n%s", set.Name, out)
+				}
+			}
+		}
+		// Re-review m-2: no element list nft refuses.
+		if strings.Contains(out, "elements = { ,") || strings.Contains(out, "elements = {  }") {
+			t.Fatalf("an element list nft refuses was rendered:\n%s", out)
+		}
 		return plan, out
 	}
+	clock := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 
 	// A row that will turn unreadable after it has been rendered once.
 	cluster("flip", "ingress", "tcp", "8080", "198.51.100.0/24", "drop", "")
@@ -86,10 +107,22 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
 		VALUES ('set-del', 'blocklist', '["203.0.113.0/24"]', '', ?, 1)`, now)
 	cluster("del-drop", "ingress", "all", "", "@blocklist", "drop", "")
-	loader = CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})
+	// Negated references (allowlist by drop, blocklist by accept): one whose
+	// row an older peer rewrites to name a missing set, one whose set is
+	// deleted.
+	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
+		VALUES ('set-office', 'office', '["10.20.0.0/16"]', '', ?, 1), ('set-office2', 'office2', '["10.21.0.0/16"]', '', ?, 1)`, now, now)
+	cluster("neg-flip", "ingress", "tcp", "22", "!= @office", "drop", "")
+	cluster("neg-del", "ingress", "tcp", "23", "!= @office2", "accept", "")
+	loader = CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{Now: func() time.Time { return clock }})
 	if _, out := load(); !strings.Contains(out, "tcp dport 8080 ip saddr 198.51.100.0/24 drop") ||
-		!strings.Contains(out, "ip saddr @blocklist drop") {
+		!strings.Contains(out, "ip saddr @blocklist drop") || !strings.Contains(out, "tcp dport 22 ip saddr != @office drop") ||
+		!strings.Contains(out, "tcp dport 23 ip saddr != @office2 accept") {
 		t.Fatalf("first pass:\n%s", out)
+	}
+	rawRow(t, db, `UPDATE cluster_firewall_rules SET cidr = '!= @nooffice' WHERE id = 'neg-flip'`)
+	if err := corrosion.DeleteIPSet(ctx, db, "set-office2"); err != nil {
+		t.Fatal(err)
 	}
 
 	// Now the bad rows an older peer writes.
@@ -103,10 +136,11 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 	cluster("bad-verdict", "egress", "udp", "53", "198.51.100.7", "drop\n"+injectMark, "")
 	cluster("allow-all", "ingress", "all", "", "", "allow", "") // meant "accept everything"
 	rawRow(t, db, `INSERT INTO ip_sets (id, name, cidrs, stack_name, created_at, updated_at)
-		VALUES ('set-bad', 'blocked', ?, '', ?, 1)`, `["198.18.0.0/15", "203.0.113.0/24 } `+injectMark+`"]`, now)
+		VALUES ('set-bad', 'blocked', ?, '', ?, 1)`, `["198.18.0.0/15", "203.0.113.0/24 } `+injectMark+`", "", ",10.0.0.9", " , "]`, now)
 	cluster("set-drop", "ingress", "tcp", "3389", "@blocked", "drop", "")
 	cluster("missing", "ingress", "all", "", "@never", "drop", "")
-	cluster("neg-missing", "ingress", "tcp", "22", "!= @gone", "accept", "")
+	cluster("neg-missing", "ingress", "tcp", "22", "!= @gone", "accept", "") // blocklist by accept
+	cluster("neg-drop", "ingress", "tcp", "24", "!=@gone2", "drop", "")      // allowlist by drop
 	rawRow(t, db, `INSERT INTO host_firewall_rules
 		(id, host_name, direction, proto, port_range, cidr, action, priority, comment, stack_name, created_at, updated_at)
 		VALUES ('host-bad', 'host-a', 'in', ?, '8080', '203.0.113.7', 'drop', 100, '', '', ?, 1)`, "esp\n"+injectMark, now)
@@ -128,9 +162,14 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 		"tcp dport 3389 ip saddr @blocked drop",        // set with a bad element: rendered without it
 		"elements = { 198.18.0.0/15 }",                 // ...keeping its good one
 		"ip saddr @never drop",                         // never existed: empty set
-		"tcp dport 22 ip saddr != @gone accept",        // negated missing set: empty set
+		"tcp dport 22 ip saddr != @office drop",        // neg-flip: kept as last rendered (office still exists)
 	)
-	for _, empty := range []string{"blocklist", "never", "gone"} {
+	for _, gone := range []string{"@gone", "@gone2", "@nooffice", "@office2", "10.0.0.9"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("%s rendered: a negated reference to a missing set (or a bad element) reached the script:\n%s", gone, out)
+		}
+	}
+	for _, empty := range []string{"blocklist", "never"} {
 		i := strings.Index(out, "set "+empty+" {")
 		if i < 0 {
 			t.Fatalf("set %s not declared:\n%s", empty, out)
@@ -157,33 +196,58 @@ func TestLoader_InvalidRowsFailClosed(t *testing.T) {
 		t.Errorf("security group web = %+v, want only its good rule", web.Rules)
 	}
 
-	got := map[string]InvalidRow{}
-	for _, r := range plan.InvalidRows {
-		got[r.Table+"/"+r.ID] = r
-	}
-	want := map[string]string{
+	immediate := map[string]string{
 		"cluster_firewall_rules/flip":        HandlingKeptLast,
-		"cluster_firewall_rules/del-drop":    HandlingEmptySet,
+		"cluster_firewall_rules/neg-flip":    HandlingKeptLast,
+		"cluster_firewall_rules/neg-del":     HandlingLeftOut,
 		"cluster_firewall_rules/bad-accept":  HandlingLeftOut,
 		"cluster_firewall_rules/bad-drop":    HandlingLeftOut,
 		"cluster_firewall_rules/bad-verdict": HandlingLeftOut,
 		"cluster_firewall_rules/allow-all":   HandlingLeftOut,
-		"cluster_firewall_rules/missing":     HandlingEmptySet,
-		"cluster_firewall_rules/neg-missing": HandlingEmptySet,
+		"cluster_firewall_rules/neg-missing": HandlingLeftOut,
+		"cluster_firewall_rules/neg-drop":    HandlingLeftOut,
 		"ip_sets/set-bad":                    HandlingElementsLeftOut,
 		"host_firewall_rules/host-bad":       HandlingLeftOut,
 		"sg_rules/sg-bad":                    HandlingLeftOut,
 	}
-	for k, v := range want {
-		if got[k].Handling != v {
-			t.Errorf("invalid row %s: handling %q, want %q", k, got[k].Handling, v)
+	check := func(plan Plan, want map[string]string) map[string]InvalidRow {
+		t.Helper()
+		got := map[string]InvalidRow{}
+		for _, r := range plan.InvalidRows {
+			got[r.Table+"/"+r.ID] = r
 		}
+		for k, v := range want {
+			if got[k].Handling != v {
+				t.Errorf("invalid row %s: handling %q, want %q", k, got[k].Handling, v)
+			}
+		}
+		if len(got) != len(want) {
+			t.Errorf("invalid rows = %v, want exactly %v", got, want)
+		}
+		return got
 	}
-	if len(got) != len(want) {
-		t.Errorf("invalid rows = %v, want exactly %v", got, want)
-	}
+	// Re-review m-1: a rule on a missing set is rendered against the empty set
+	// at once, but named by the condition only once that has lasted
+	// emptySetGrace; everything else is named at once.
+	got := check(plan, immediate)
 	if got["cluster_firewall_rules/allow-all"].Action != "allow" {
 		t.Errorf("the stored action is not reported: %+v", got["cluster_firewall_rules/allow-all"])
+	}
+	clock = clock.Add(emptySetGrace / 2)
+	plan, _ = load()
+	check(plan, immediate)
+	clock = clock.Add(emptySetGrace)
+	plan, out = load()
+	later := map[string]string{
+		"cluster_firewall_rules/del-drop": HandlingEmptySet,
+		"cluster_firewall_rules/missing":  HandlingEmptySet,
+	}
+	for k, v := range immediate {
+		later[k] = v
+	}
+	check(plan, later)
+	if !strings.Contains(out, "ip saddr @blocklist drop") {
+		t.Errorf("third pass:\n%s", out)
 	}
 }
 

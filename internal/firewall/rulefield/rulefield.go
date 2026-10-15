@@ -85,6 +85,13 @@ func SetRef(cidr string) (string, bool) {
 	return "", false
 }
 
+// NegatedSetRef reports whether cidr is a negated set reference ("!= @x",
+// "ne @x").
+func NegatedSetRef(cidr string) bool {
+	v := trimBlank(blanks(cidr))
+	return strings.HasPrefix(v, "!=") || strings.HasPrefix(v, "ne ")
+}
+
 // NormaliseSetElements splits every element on ',' and drops the empty
 // pieces and the blanks around them: `--cidr 10.0.0.1,10.0.0.2` is two
 // elements. A stored element holding a comma renders inside nft's element
@@ -197,11 +204,18 @@ func RenderSetName(s string) error {
 // separated by commas. Inside `elements = { ... }` a comma separates elements,
 // so a stored element holding one, or an empty piece between commas, adds no
 // syntax (and nft accepts double and trailing commas).
+//
+// An element with no value, or one that starts with a comma, is refused: it
+// can sort first, and nft refuses `elements = { , ...` and `{  }`.
 func RenderSetElement(s string) error {
 	if len(s) > maxValueLen {
 		return refuse("ipset element", s, "longer than %d bytes", maxValueLen)
 	}
-	for _, piece := range strings.Split(blanks(s), ",") {
+	pieces := strings.Split(blanks(s), ",")
+	if trimBlank(pieces[0]) == "" {
+		return refuse("ipset element", s, "an element cannot be empty or start with a comma")
+	}
+	for _, piece := range pieces {
 		if piece = trimBlank(piece); piece == "" {
 			continue
 		}
@@ -599,14 +613,14 @@ func SetName(s string) error {
 // An element holding commas (`--cidr 10.0.0.1,10.0.0.2`) is several elements,
 // each checked; writers store them split (NormaliseSetElements).
 func SetElement(s string) error {
-	if err := RenderSetElement(s); err != nil {
-		return err
-	}
 	pieces := NormaliseSetElements([]string{s})
 	if len(pieces) == 0 {
 		return refuse("ipset element", s, "an element cannot be empty")
 	}
 	for _, p := range pieces {
+		if err := RenderSetElement(p); err != nil {
+			return refuse("ipset element", s, "%s", err.(*FieldError).Reason)
+		}
 		if strings.Contains(p, ":") {
 			if !v6AddrOrPrefix(p) {
 				return refuse("ipset element", s, "%q is not an IPv6 address or prefix", p)

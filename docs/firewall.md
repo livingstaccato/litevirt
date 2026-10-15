@@ -781,13 +781,20 @@ before, and nothing is rendered that the row did not ask for:
   other than accept, drop or reject is held as this host last rendered it, or
   left out when this host never rendered a readable version of it;
 - a rule that references an ip set that does not exist (deleted, or not
-  replicated yet; `@name` or `!= @name`) is rendered against an empty set of
-  that name, so it matches nothing;
+  replicated yet) as `@name` is rendered against an empty set of that name, so
+  it matches nothing;
+- a rule that references a missing set negated, `!= @name`, would match every
+  address against an empty set, so it is held like an unreadable rule: as this
+  host last rendered it while that rendering's set still exists, otherwise left
+  out;
 - an ip set is rendered without the elements it cannot render.
 
 The host raises the critical condition `firewall.rule.invalid`, which names
 each row, its stored action and the command that removes it
-(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...).
+(`lv firewall cluster-rule rm <id>`, `lv sg rule-rm <id>`, ...). A rule
+rendered against an empty set is named only once that has lasted a minute, so
+a rule that replicates just before its set, or a stack redeploy, raises
+nothing.
 
 ## CLI
 

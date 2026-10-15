@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -44,11 +45,16 @@ const (
 	HandlingKeptLast = "kept as this host last rendered it"
 	// ...or, when it has none (the row was never readable here), leaves it
 	// out.
-	HandlingLeftOut = "left out: this host never rendered a readable version of it"
+	HandlingLeftOut = "left out: this host has no earlier rendering of it to keep"
 	// A rule referencing an ip set that does not exist (deleted, or not
 	// replicated here yet) is rendered against an empty set of that name, so
 	// it matches nothing: what deleting a set means, and what nft does with an
-	// empty one.
+	// empty one. Only a positive reference (@x): "not in an empty set" is
+	// every address, so a negated one (!= @x) to a missing set is held
+	// fail-static like an unreadable row instead (kept as last rendered when
+	// that rendering's set still exists, else left out). Reported only once
+	// it has lasted emptySetGrace: a rule replicated just before its set, or a
+	// stack redeploy, is not an incident.
 	HandlingEmptySet = "its ip set does not exist: rendered against an empty set, so it matches nothing"
 	// An ip set is rendered without the elements that cannot be rendered (they
 	// never worked: each one injected or broke the load).
@@ -65,19 +71,25 @@ const (
 type rowMemory struct {
 	mu    sync.Mutex
 	rules map[string]Rule
+	// emptySince is when each row was first rendered against a missing set.
+	emptySince map[string]time.Time
 }
 
-func (m *rowMemory) snapshot() map[string]Rule {
+func (m *rowMemory) snapshot() (map[string]Rule, map[string]time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.rules
+	return m.rules, m.emptySince
 }
 
-func (m *rowMemory) store(rules map[string]Rule) {
+func (m *rowMemory) store(q *quarantine) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rules = rules
+	m.rules, m.emptySince = q.next, q.emptyNext
 }
+
+// emptySetGrace is how long a rule may reference a missing set before the
+// condition names it: about two reconcile passes.
+const emptySetGrace = 60 * time.Second
 
 // quarantine is one loader pass's handling of stored rule rows.
 type quarantine struct {
@@ -87,11 +99,16 @@ type quarantine struct {
 	next      map[string]Rule // this pass's
 	emptySets map[string]bool // missing sets rendered empty
 	invalid   []InvalidRow
+
+	now       time.Time
+	emptyPrev map[string]time.Time // rows rendered against a missing set, since
+	emptyNext map[string]time.Time
 }
 
-func newQuarantine(sets []IPSet, prev map[string]Rule) *quarantine {
+func newQuarantine(sets []IPSet, prev map[string]Rule, emptyPrev map[string]time.Time, now time.Time) *quarantine {
 	q := &quarantine{knownSets: map[string]bool{}, prev: prev, next: map[string]Rule{},
-		emptySets: map[string]bool{}, v6Sets: setsWithIPv6(sets)}
+		emptySets: map[string]bool{}, v6Sets: setsWithIPv6(sets),
+		now: now, emptyPrev: emptyPrev, emptyNext: map[string]time.Time{}}
 	for _, s := range sets {
 		q.knownSets[s.Name] = true
 	}
@@ -108,10 +125,14 @@ func (q *quarantine) rule(table, id, direction, proto, port, cidr, action, comme
 	r := FromCorrosionRule(direction, proto, port, cidr, action)
 	r.Comment = comment
 	key := table + "/" + id
-	if why := q.unreadable(r, action); why != "" {
+	why := q.unreadable(r, action)
+	if why == "" {
+		why = q.negatedMissing(r)
+	}
+	if why != "" {
 		inv := InvalidRow{Table: table, ID: id, Action: action, Reason: why, Handling: HandlingLeftOut}
 		old, ok := q.prev[key]
-		if !ok {
+		if !ok || q.negatedMissing(old) != "" {
 			q.invalid = append(q.invalid, inv)
 			return Rule{}, false
 		}
@@ -121,11 +142,30 @@ func (q *quarantine) rule(table, id, direction, proto, port, cidr, action, comme
 	}
 	q.next[key] = r
 	if name, ok := rulefield.SetRef(r.CIDR); ok && !q.knownSets[name] {
+		// A positive reference (negatedMissing held the others): renders
+		// against an empty set and matches nothing.
 		q.emptySets[name] = true
-		q.invalid = append(q.invalid, InvalidRow{Table: table, ID: id, Action: action,
-			Reason: fmt.Sprintf("ip set %q does not exist", name), Handling: HandlingEmptySet})
+		since, seen := q.emptyPrev[key]
+		if !seen {
+			since = q.now
+		}
+		q.emptyNext[key] = since
+		if q.now.Sub(since) >= emptySetGrace {
+			q.invalid = append(q.invalid, InvalidRow{Table: table, ID: id, Action: action,
+				Reason: fmt.Sprintf("ip set %q does not exist", name), Handling: HandlingEmptySet})
+		}
 	}
 	return r, true
+}
+
+// negatedMissing is why r cannot be rendered against an empty set: its
+// reference to a missing set is negated, and "not in an empty set" is every
+// address — a drop would drop everything, an accept admit everything.
+func (q *quarantine) negatedMissing(r Rule) string {
+	if name, ok := rulefield.SetRef(r.CIDR); ok && !q.knownSets[name] && rulefield.NegatedSetRef(r.CIDR) {
+		return fmt.Sprintf("negated reference to ip set %q, which does not exist (it would match every address)", name)
+	}
+	return ""
 }
 
 // unreadable is why the renderer would refuse r, or "".

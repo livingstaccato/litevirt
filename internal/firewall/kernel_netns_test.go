@@ -26,10 +26,56 @@ import (
 // the host — but they need a kernel with nf_tables bridge support, the bridge
 // and veth drivers, and nft and ip on PATH. Opt in with
 // LITEVIRT_NFT_NETNS=1; the test re-executes itself inside the namespace.
+//
+// A kernel test that cannot run because a module is not loaded or nft is not
+// installed SKIPs, which reads like a pass. Set LITEVIRT_NFT_REQUIRE=1 (with
+// LITEVIRT_NFT_NETNS=1) and every such skip becomes a failure naming what is
+// missing; use it wherever the kernel tests are meant to prove something.
 const (
 	netnsOptIn = "LITEVIRT_NFT_NETNS"
+	nftRequire = "LITEVIRT_NFT_REQUIRE"
 	netnsChild = "LITEVIRT_NFT_NETNS_CHILD"
 )
+
+// skipper is the part of testing.TB the skip-or-require helpers use.
+type skipper interface {
+	Helper()
+	Skipf(string, ...any)
+	Fatalf(string, ...any)
+}
+
+// skipOrRequire skips the test, or fails it when LITEVIRT_NFT_REQUIRE=1: a
+// kernel test that silently skips proves nothing.
+func skipOrRequire(t skipper, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(nftRequire) == "1" {
+		t.Fatalf("%s=1 but the kernel test cannot run: %s", nftRequire, fmt.Sprintf(format, args...))
+		return
+	}
+	t.Skipf(format, args...)
+}
+
+// skipUnlessOptedIn is the parent's answer when LITEVIRT_NFT_NETNS is unset:
+// a skip, or a failure under LITEVIRT_NFT_REQUIRE=1, which would otherwise
+// pass having run nothing.
+func skipUnlessOptedIn(t skipper) {
+	t.Helper()
+	if os.Getenv(nftRequire) == "1" {
+		t.Fatalf("%s=1 needs %s=1", nftRequire, netnsOptIn)
+		return
+	}
+	t.Skipf("set %s=1 to run the nf_tables kernel tests in a private namespace", netnsOptIn)
+}
+
+// skipUnlessModules skips (fails under LITEVIRT_NFT_REQUIRE=1) when any of the
+// modules is neither loaded nor built in, naming them: a test must not make
+// the kernel load one.
+func skipUnlessModules(t skipper, what string, modules ...string) {
+	t.Helper()
+	if missing := missingModules(modules...); len(missing) > 0 {
+		skipOrRequire(t, "%s would make the kernel load %v, which is not loaded on this host", what, missing)
+	}
+}
 
 // TestKernel_NICGuard is the parent: it re-runs the child tests under
 // unshare and reports their output.
@@ -38,7 +84,7 @@ func TestKernel_NICGuard(t *testing.T) {
 		t.Skip("parent only")
 	}
 	if os.Getenv(netnsOptIn) != "1" {
-		t.Skipf("set %s=1 to run the nf_tables kernel tests in a private namespace", netnsOptIn)
+		skipUnlessOptedIn(t)
 	}
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Fatalf("%s=1 but unshare is not on PATH", netnsOptIn)
@@ -47,9 +93,9 @@ func TestKernel_NICGuard(t *testing.T) {
 	// kernel autoloads one the moment a ruleset uses it. Every module the
 	// rulesets below need must already be loaded (or built in), or the tests
 	// skip, saying which.
-	if missing := missingModules(kernelTestModules...); len(missing) > 0 {
-		t.Skipf("not running the kernel tests: they would make the kernel load %v, which is not loaded on this host; "+
-			"prove these properties on a lab VM instead", missing)
+	skipUnlessModules(t, "the kernel tests", kernelTestModules...)
+	if _, err := exec.LookPath("nft"); err != nil {
+		skipOrRequire(t, "nft is not on PATH")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -68,9 +114,12 @@ func TestKernel_NICGuard(t *testing.T) {
 		}
 	}
 	// Children with their own module list skip on their own when one is
-	// missing (saying which); they must not fail or vanish.
-	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops", "TestKernelChild_SynFloodLoads"} {
-		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
+	// missing (saying which); they must not fail or vanish. Under
+	// LITEVIRT_NFT_REQUIRE=1 they fail instead, so only a pass counts.
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads", "TestKernelChild_MainEraLvSetStillDrops",
+		"TestKernelChild_SynFloodLoads", "TestKernelChild_LogFormsLoad"} {
+		if !strings.Contains(string(out), "--- PASS: "+child) &&
+			(os.Getenv(nftRequire) == "1" || !strings.Contains(string(out), "--- SKIP: "+child)) {
 			t.Errorf("%s neither passed nor skipped in the namespace", child)
 		}
 	}
@@ -755,9 +804,7 @@ func probeCount(t *testing.T) int {
 //     and loosens nothing routed.
 func TestKernelChild_DefaultDenyAndBypasses(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
-		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
-	}
+	skipUnlessModules(t, "this test", "nf_conntrack_bridge")
 	l := newGuestLab(t, map[string]string{
 		"ga": "10.20.0.1", // may send icmp and udp/67
 		"gb": "10.20.0.2", // may receive icmp; sends nothing
@@ -886,9 +933,7 @@ func taggedType(src net.HardwareAddr, tpid, etype uint16, payload []byte, vids .
 // Each drop is then shown to pass with no table loaded.
 func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules("nf_conntrack_bridge"); len(missing) > 0 {
-		t.Skip("nf_conntrack_bridge is not loaded; a test must not load it")
-	}
+	skipUnlessModules(t, "this test", "nf_conntrack_bridge")
 	apply := func(p Plan) {
 		t.Helper()
 		if _, err := NewApplier(NftBinary{}).Apply(context.Background(), p); err != nil {
@@ -1223,9 +1268,7 @@ var compatCorpusModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_co
 // corpus ("conflicting intervals specified", "syntax error"), red.
 func TestKernelChild_CompatCorpusLoads(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules(compatCorpusModules...); len(missing) > 0 {
-		t.Skipf("the corpus rulesets would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the corpus rulesets", compatCorpusModules...)
 	plan := loadCompatPlan(t)
 	var rules []Rule
 	for _, r := range plan.ClusterRules {
@@ -1303,9 +1346,7 @@ var mainEraLvModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_connt
 // through, red.
 func TestKernelChild_MainEraLvSetStillDrops(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules(mainEraLvModules...); len(missing) > 0 {
-		t.Skipf("the rulesets would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the rulesets", mainEraLvModules...)
 	l := newGuestLab(t, map[string]string{"ga": "10.20.0.1", "gb": "10.20.0.2", "ge": "10.20.0.5"})
 	db, _ := freezeLoader(t)
 	rawSet(t, db, "s-foo", "lv_foo", `["10.20.0.1"]`)
@@ -1382,9 +1423,7 @@ func nftCheck(t *testing.T, script string) error {
 // drop`, the spec's text) — nft refuses it, red.
 func TestKernelChild_SynFloodLoads(t *testing.T) {
 	inNetns(t)
-	if missing := missingModules(synFloodModules...); len(missing) > 0 {
-		t.Skipf("the SYN-flood ruleset would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the SYN-flood ruleset", synFloodModules...)
 	for mode, script := range synFloodScripts(t) {
 		if err := nftCheck(t, script); err != nil {
 			t.Errorf("%s: nft -c refused the SYN-flood ruleset: %v", mode, err)
@@ -1402,9 +1441,7 @@ func TestKernelChild_SynFloodLoads(t *testing.T) {
 func TestKernelChild_SynFloodShapeLoads(t *testing.T) {
 	inNetns(t)
 	mods := []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge"}
-	if missing := missingModules(mods...); len(missing) > 0 {
-		t.Skipf("the SYN-flood ruleset would make the kernel load %v, which is not loaded on this host", missing)
-	}
+	skipUnlessModules(t, "the SYN-flood ruleset", mods...)
 	limit := regexp.MustCompile(` limit rate over [0-9]+/second burst [0-9]+ packets`)
 	for mode, script := range synFloodScripts(t) {
 		if n := len(limit.FindAllString(script, -1)); n != 4 {
@@ -1412,6 +1449,49 @@ func TestKernelChild_SynFloodShapeLoads(t *testing.T) {
 		}
 		if err := nftCheck(t, limit.ReplaceAllString(script, "")); err != nil {
 			t.Errorf("%s: nft -c refused the SYN-flood ruleset without its limit: %v", mode, err)
+		}
+	}
+}
+
+// logFormsModules are the modules the log rulesets make the kernel use beyond
+// the compat corpus's: the log and limit expressions, and the NFLOG logger
+// `log group` binds to (spec §3.7).
+var logFormsModules = append(append([]string(nil), compatCorpusModules...), "nft_log", "nfnetlink_log", "nft_limit")
+
+// TestKernelChild_LogFormsLoad: every log form the renderer writes (spec
+// §3.4) — the named limits in both tables, a log line per NIC side, per
+// family of a split rule, in the tiers and routed_to_port, the default
+// verdict, observe mode, the largest group and budget — makes a ruleset a
+// real nft accepts. `nft -c` changes nothing.
+//
+// Mutation: declare the limit as `limit lv_x { rate 5/second; burst 10
+// packets; }`-style syntax nft does not take, or reference a `limit name`
+// the table does not declare — red. (nft takes log arguments in any order, so
+// moving `log group` after the prefix is not a mutation.)
+func TestKernelChild_LogFormsLoad(t *testing.T) {
+	inNetns(t)
+	skipUnlessModules(t, "the log rulesets", logFormsModules...)
+	budgets := []LogPolicy{
+		{Available: true, Group: 27, Default: true},
+		{Available: true, Group: 65535, Default: true, Rate: MaxLogRate, Burst: MaxLogBurst},
+		{Available: true, Group: 0, Rate: 1, Burst: 1},
+	}
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		for _, lp := range budgets {
+			p := goldenLogPlan(mode)
+			p.LogPolicy = lp
+			script, err := Render(p)
+			if err != nil {
+				t.Fatalf("%s %+v: Render: %v", mode, lp, err)
+			}
+			if !strings.Contains(script, " log group ") {
+				t.Fatalf("%s %+v: no log line rendered", mode, lp)
+			}
+			cmd := exec.Command("nft", "-c", "-f", "-")
+			cmd.Stdin = strings.NewReader(script)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("%s %+v: nft -c refused the log ruleset: %v\n%s\n%s", mode, lp, err, out, script)
+			}
 		}
 	}
 }

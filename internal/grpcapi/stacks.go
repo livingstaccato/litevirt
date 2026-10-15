@@ -450,6 +450,7 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 			}
 		}
 	}
+	var stackSets []corrosion.IPSet
 	for name, set := range f.IPSets {
 		need, err := ipSetRowFeatures(name, rulefield.NormaliseSetElements(set.CIDRs))
 		if err != nil {
@@ -458,6 +459,11 @@ func (s *Server) persistStackFirewallTracked(ctx context.Context, f *compose.Fil
 		for _, nf := range need {
 			needed[nf] = true
 		}
+		stackSets = append(stackSets, corrosion.IPSet{Name: name, CIDRs: rulefield.NormaliseSetElements(set.CIDRs)})
+	}
+	// Against every live set but this stack's own, which the deploy replaces.
+	if err := corrosion.IPSetCompanionClash(ctx, s.db, f.Name, stackSets); err != nil {
+		return fmt.Errorf("ipset: %w", err)
 	}
 	if fd := f.FirewallDefaults; fd != nil {
 		for _, r := range fd.ClusterRules {

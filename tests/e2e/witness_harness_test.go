@@ -614,6 +614,7 @@ type leaseChange struct {
 	At     time.Time
 	Holder string
 	Term   int
+	Reader string // the replica that was read ("" for the merged history)
 }
 
 // leaseWatch samples the failover lease (holder and newest term) every second.
@@ -630,6 +631,10 @@ type leaseWatch struct {
 	fail         func(format string, args ...any)
 	logf         func(format string, args ...any)
 	summed       sync.Once
+	selfClaim    selfClaimTracker
+	all          []leaseChange // every reader's tenures, tagged by reader
+	lastBy       map[string]leaseChange
+	maxTerm      map[string]int
 	stop         chan struct{}
 	done         chan struct{}
 }
@@ -638,7 +643,7 @@ type leaseWatch struct {
 // the first of readers that is not avoided and answers (a frozen or stopped
 // node's replica stops applying, so the drill avoids it while it is out).
 func (l *lab) watchLease(readers []string) *leaseWatch {
-	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, fail: l.t.Errorf, logf: func(f string, a ...any) { l.mark(f, a...) }, stop: make(chan struct{}), done: make(chan struct{})}
+	w := &leaseWatch{l: l, readers: readers, avoided: map[string]bool{}, incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{}, fail: l.t.Errorf, logf: func(f string, a ...any) { l.mark(f, a...) }, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(w.done)
 		tick := time.NewTicker(time.Second)
@@ -665,7 +670,8 @@ func (w *leaseWatch) sampleOnce() {
 		}
 	}
 	w.mu.Unlock()
-	recorded := false      // the change history follows one coherent reader per tick
+	recorded := false // the change history follows one coherent reader per tick
+	claims := map[string]string{}
 	for _, r := range rs { // every reader every tick: a later one can be the incoherent one
 		rows, err := w.l.sql(r, "SELECT COALESCE((SELECT holder FROM leader_election WHERE key='failover'),''), (SELECT COALESCE(MAX(term),0) FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL), COALESCE((SELECT holder FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL ORDER BY term DESC LIMIT 1),''), COALESCE((SELECT group_concat(term || ':' || holder, ',') FROM leader_lease_terms WHERE key='failover' AND deleted_at IS NULL),'')")
 		if err != nil || len(rows) == 0 || len(rows[0]) < 4 {
@@ -676,6 +682,57 @@ func (w *leaseWatch) sampleOnce() {
 		if w.observe(r, time.Now(), smp, !recorded) {
 			recorded = true
 		}
+		if smp.Election == r {
+			claims[r] = smp.Election // the node's own replica names the node itself
+		}
+	}
+	w.observeTick(time.Now(), claims)
+}
+
+// selfClaimGrace is how long two nodes may each name themselves the holder in
+// their own replicas (a handover seen from both ends) before it is a dual holder.
+const (
+	selfClaimGrace     = 5 * time.Second
+	selfClaimGraceTick = 2
+)
+
+// selfClaimTracker follows consecutive ticks with two self-claimants.
+type selfClaimTracker struct {
+	n        int
+	since    time.Time
+	reported bool
+}
+
+// observeTick takes the tick's self-claims (reader → itself) and fails when two
+// different nodes have each been named holder by their OWN replica for 2
+// consecutive ticks or selfClaimGrace. A stale replica of someone else's
+// tenure is lag, not a claim, and never enters here.
+func (w *leaseWatch) observeTick(now time.Time, claims map[string]string) {
+	w.mu.Lock()
+	c := &w.selfClaim
+	if len(claims) < 2 {
+		*c = selfClaimTracker{}
+		w.mu.Unlock()
+		return
+	}
+	if c.n == 0 {
+		c.since = now
+	}
+	c.n++
+	fail := !c.reported && (c.n >= selfClaimGraceTick || now.Sub(c.since) >= selfClaimGrace)
+	if fail {
+		c.reported = true
+	}
+	n := c.n
+	w.mu.Unlock()
+	names := make([]string, 0, len(claims))
+	for r := range claims {
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	w.logf("lease: SELF-CLAIMS by %v at the same tick (tick %d)", names, n)
+	if fail {
+		w.fail("lease: dual holder: %v each hold the lease in their own replica for %d consecutive ticks", names, n)
 	}
 }
 
@@ -736,6 +793,15 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 	w.mu.Lock()
 	// The ledger must have one holder per term, across readers and over time.
 	var conflicts []string
+	if w.maxTerm != nil && s.Term < w.maxTerm[r] {
+		// The reader's ledger went backwards: a lease reset (or a replaced
+		// replica) reuses term numbers, so earlier term holders no longer apply.
+		w.termHolder = map[int]string{}
+		defer w.logf("lease: %s's newest term fell from %d to %d; term holders forgotten", r, w.maxTerm[r], s.Term)
+	}
+	if w.maxTerm != nil {
+		w.maxTerm[r] = s.Term
+	}
 	for t, h := range s.Terms {
 		if prev, ok := w.termHolder[t]; ok && prev != h {
 			conflicts = append(conflicts, fmt.Sprintf("term %d held by %q and by %q (read on %s)", t, prev, h, r))
@@ -770,11 +836,21 @@ func (w *leaseWatch) observe(r string, now time.Time, s leaseSample, record bool
 	if persistent {
 		w.fail("lease: %s's replica has shown election holder %q beside ledger term %d held by %q for %d samples over %v: a second holder at one term, not a catching-up replica", r, s.Election, s.Term, s.Ledger, streak, incoherenceBound)
 	}
-	if !record || kind == leaseLag || kind == leaseUnexplained {
+	if kind == leaseLag || kind == leaseUnexplained {
 		return false
 	}
-	c := leaseChange{At: now, Holder: s.Election, Term: s.Term}
+	c := leaseChange{At: now, Holder: s.Election, Term: s.Term, Reader: r}
 	w.mu.Lock()
+	if w.lastBy != nil {
+		if p, ok := w.lastBy[r]; !ok || p.Holder != c.Holder || p.Term != c.Term {
+			w.lastBy[r] = c
+			w.all = append(w.all, c)
+		}
+	}
+	if !record {
+		w.mu.Unlock()
+		return false
+	}
 	n := len(w.changes)
 	if n == 0 || w.changes[n-1].Holder != c.Holder || w.changes[n-1].Term != c.Term {
 		w.changes = append(w.changes, c)
@@ -809,33 +885,52 @@ func (w *leaseWatch) summary() string {
 	return b.String()
 }
 
-// incoherenceBound is how long one serving replica may show an election holder
-// that disagrees with its ledger before the drill fails.
+// incoherenceBound is the window in which one replica may show incoherenceMax
+// election holders that disagree with its ledger before the drill fails.
 const incoherenceBound = 10 * time.Second
 
-// incoherenceTracker follows one reader's run of incoherent samples.
+// incoherenceTracker follows one reader's incoherent samples over a sliding
+// window: a flapping election row cannot evade it by alternating.
 type incoherenceTracker struct {
-	since    time.Time
-	n        int
+	times    []time.Time
+	n        int // incoherent samples in the window
 	reported bool
 }
 
-// observe records a sample and reports, once per run, that the run has lasted
-// incoherenceBound and at least 3 samples. A coherent sample ends the run.
+// incoherenceMax is how many incoherent samples one reader may show within
+// incoherenceBound.
+const incoherenceMax = 3
+
+// observe records a sample and reports, once per episode, that incoherenceMax
+// incoherent samples fell within incoherenceBound. Coherent samples do not
+// clear the window; they only let it drain.
 func (c *incoherenceTracker) observe(now time.Time, coherent bool) bool {
-	if coherent {
-		*c = incoherenceTracker{}
-		return false
+	keep := c.times[:0]
+	for _, t := range c.times {
+		if now.Sub(t) < incoherenceBound {
+			keep = append(keep, t)
+		}
 	}
+	c.times = keep
+	if !coherent {
+		c.times = append(c.times, now)
+	}
+	c.n = len(c.times)
 	if c.n == 0 {
-		c.since = now
+		c.reported = false
 	}
-	c.n++
-	if c.reported || c.n < 3 || now.Sub(c.since) < incoherenceBound {
+	if c.reported || c.n < incoherenceMax {
 		return false
 	}
 	c.reported = true
 	return true
+}
+
+// allHistory is every reader's tenures, tagged by reader, in sampling order.
+func (w *leaseWatch) allHistory() []leaseChange {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]leaseChange(nil), w.all...)
 }
 
 func (w *leaseWatch) Stop() {

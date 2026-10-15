@@ -158,35 +158,32 @@ func TestHostStateInLs(t *testing.T) {
 	}
 }
 
-// TestIncoherenceTracker: a transient incoherent run is tolerated (and ends on
-// a coherent sample); one that lasts the bound fails, once.
+// TestIncoherenceTracker: incoherence is judged over a sliding window, so
+// sparse samples pass and a flapping row (alternating coherent/incoherent) fails.
 func TestIncoherenceTracker(t *testing.T) {
 	t0 := time.Unix(1000, 0)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
 	var c incoherenceTracker
-	for i := 0; i < 5; i++ { // 5 s, under the bound
-		if c.observe(t0.Add(time.Duration(i)*time.Second), false) {
-			t.Fatalf("a %d s run failed", i)
+	for i := 0; i < 10; i++ { // one every 6 s never puts 3 in 10 s
+		if c.observe(at(i*6), false) {
+			t.Fatalf("sparse sample %d failed", i)
 		}
 	}
-	c.observe(t0.Add(6*time.Second), true)
-	if c.n != 0 {
-		t.Fatal("a coherent sample did not end the run")
-	}
-	var fails int
-	for i := 0; i < 30; i++ { // persistent
-		if c.observe(t0.Add(time.Duration(20+i)*time.Second), false) {
+	var f incoherenceTracker
+	fails := 0
+	for i := 0; i < 8; i++ { // flapping: incoherent on even seconds
+		if f.observe(at(i), i%2 == 1) {
 			fails++
 		}
 	}
 	if fails != 1 {
-		t.Fatalf("a persistent run failed %d times, want once", fails)
+		t.Fatalf("a flapping row failed %d times, want once", fails)
 	}
-	// Three fast samples are not enough without the time bound, and the time
-	// bound is not enough with fewer than three samples.
 	var d incoherenceTracker
-	d.observe(t0, false)
-	if d.observe(t0.Add(11*time.Second), false) {
-		t.Fatal("two samples failed")
+	d.observe(at(0), false)
+	d.observe(at(1), false)
+	if d.observe(at(30), true); d.n != 0 {
+		t.Fatalf("the window did not drain: n=%d", d.n)
 	}
 }
 
@@ -223,14 +220,15 @@ func TestClassifyLease(t *testing.T) {
 	}
 }
 
-// TestLeaseWatchObserve pins the sampler's wiring: per-reader runs, reset by a
-// coherent sample, neutral samples neither reset nor extend, a persistent run
-// and a same-term conflict fail, lag is logged and summarised, not dropped.
+// TestLeaseWatchObserve pins the sampler's wiring: per-reader windows, neutral
+// samples neither reset nor extend, a persistent or flapping run and a
+// same-term conflict fail, lag is logged and summarised, every reader's
+// tenures are recorded, and a ledger reset forgets term holders.
 func TestLeaseWatchObserve(t *testing.T) {
 	var fails, logs []string
 	newW := func() *leaseWatch {
 		fails, logs = nil, nil
-		return &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{},
+		return &leaseWatch{incoh: map[string]*incoherenceTracker{}, termHolder: map[int]string{}, lastBy: map[string]leaseChange{}, maxTerm: map[string]int{},
 			fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) },
 			logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
 	}
@@ -239,39 +237,50 @@ func TestLeaseWatchObserve(t *testing.T) {
 	ok := leaseSample{Election: "node-4", Term: 51, Ledger: "node-4", Terms: terms}
 	neutral := leaseSample{Election: "", Term: 51, Ledger: "node-4", Terms: terms}
 	t0 := time.Unix(1000, 0)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
 
-	// Transient lag on one reader: logged and summarised, no failure; a coherent sample resets.
+	// Transient lag (2 samples, then sparse ones): logged and summarised, no failure.
 	w := newW()
-	for i := 0; i < 5; i++ {
-		w.observe("a", t0.Add(time.Duration(i)*time.Second), lag, true)
+	w.observe("a", at(0), lag, true)
+	w.observe("a", at(1), lag, true)
+	w.observe("a", at(2), ok, true)
+	for i := 1; i <= 4; i++ {
+		w.observe("a", at(2+i*12), lag, true)
 	}
-	w.observe("a", t0.Add(6*time.Second), ok, true)
-	for i := 7; i < 14; i++ { // a second short run: 7 s after the reset, 14 s after the first
-		w.observe("a", t0.Add(time.Duration(i)*time.Second), lag, true)
-	}
-	if len(fails) != 0 || len(logs) < 5 || !strings.Contains(w.summary(), "12 incoherent") {
-		t.Fatalf("transient lag: fails=%v logs=%d summary=%q", fails, len(logs), w.summary())
+	if len(fails) != 0 || !strings.Contains(w.summary(), "6 incoherent") {
+		t.Fatalf("transient lag: fails=%v summary=%q", fails, w.summary())
 	}
 	if len(w.history()) != 1 || w.history()[0].Holder != "node-4" {
 		t.Fatalf("a lagging sample was recorded as a lease change: %+v", w.history())
 	}
-	// Persistent lag fails, one reader at a time: another reader's coherent
-	// samples must not reset it, and neutral samples must not reset it.
+	// Persistent lag fails, per reader: another reader's coherent samples and
+	// neutral samples must not reset it.
 	w = newW()
-	for i := 0; i < 15; i++ {
-		now := t0.Add(time.Duration(i) * time.Second)
-		w.observe("a", now, lag, true)
-		w.observe("b", now, ok, false)
-		w.observe("a", now, neutral, false)
+	for i := 0; i < 5; i++ {
+		w.observe("a", at(i), lag, true)
+		w.observe("b", at(i), ok, false)
+		w.observe("a", at(i), neutral, false)
 	}
 	if len(fails) != 1 || !strings.Contains(fails[0], "a's replica") {
 		t.Fatalf("persistent lag on reader a: fails=%v", fails)
 	}
-	// A reset when the reader is avoided.
+	// A flapping row fails.
+	w = newW()
+	for i := 0; i < 6; i++ {
+		s := lag
+		if i%2 == 1 {
+			s = ok
+		}
+		w.observe("a", at(i), s, true)
+	}
+	if len(fails) != 1 {
+		t.Fatalf("a flapping election row: fails=%v", fails)
+	}
+	// avoid resets the reader's window.
 	w.avoided = map[string]bool{}
 	w.avoid("a", true)
 	if _, held := w.incoh["a"]; held {
-		t.Fatal("avoid did not reset the reader's run")
+		t.Fatal("avoid did not reset the reader's window")
 	}
 	// Two holders for one term fail at once, with no time bound.
 	w = newW()
@@ -279,6 +288,25 @@ func TestLeaseWatchObserve(t *testing.T) {
 	w.observe("b", t0, leaseSample{Election: "node-5", Term: 51, Ledger: "node-5", Terms: map[int]string{51: "node-5"}}, false)
 	if len(fails) != 1 || !strings.Contains(fails[0], "two holders for one term") {
 		t.Fatalf("a same-term conflict: fails=%v", fails)
+	}
+	// Every reader's tenures are kept, tagged; the stale-but-consistent one too.
+	w = newW()
+	w.observe("a", t0, ok, true)
+	w.observe("b", t0, leaseSample{Election: "node-2", Term: 50, Ledger: "node-2", Terms: map[int]string{50: "node-2"}}, false)
+	all := w.allHistory()
+	if len(all) != 2 || all[0].Reader != "a" || all[1].Reader != "b" || all[1].Holder != "node-2" {
+		t.Fatalf("per-reader history: %+v", all)
+	}
+	// A ledger that goes backwards (a lease reset) forgets term holders.
+	w = newW()
+	w.observe("a", t0, ok, true)
+	w.observe("a", at(1), leaseSample{Election: "node-9", Term: 1, Ledger: "node-9", Terms: map[int]string{1: "node-9"}}, true)
+	w.observe("a", at(2), leaseSample{Election: "node-8", Term: 2, Ledger: "node-8", Terms: map[int]string{1: "node-9", 2: "node-8"}}, true)
+	w2 := newW()
+	w2.observe("a", t0, leaseSample{Election: "node-2", Term: 51, Ledger: "node-2", Terms: map[int]string{1: "node-2", 51: "node-2"}}, true)
+	w2.observe("a", at(1), leaseSample{Election: "node-9", Term: 1, Ledger: "node-9", Terms: map[int]string{1: "node-9"}}, true)
+	if len(fails) != 0 {
+		t.Fatalf("a reused term after a reset false-failed: %v", fails)
 	}
 	// Stop prints the summary, once.
 	w = newW()
@@ -290,5 +318,43 @@ func TestLeaseWatchObserve(t *testing.T) {
 	w.Stop()
 	if len(logs) != 1 || !strings.Contains(logs[0], "1 incoherent") {
 		t.Fatalf("Stop's summary: %v", logs)
+	}
+}
+
+// TestObserveTick: two different nodes naming themselves holder in their own
+// replicas is a dual holder once it lasts 2 ticks; one tick (a handover seen
+// from both ends) is logged only, and a lone claimant is nothing.
+func TestObserveTick(t *testing.T) {
+	var fails, logs []string
+	w := &leaseWatch{
+		fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) },
+		logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	t0 := time.Unix(1000, 0)
+	two := map[string]string{"node-2": "node-2", "node-4": "node-4"}
+	w.observeTick(t0, two)
+	w.observeTick(t0.Add(time.Second), map[string]string{"node-4": "node-4"})
+	w.observeTick(t0.Add(2*time.Second), two)
+	if len(fails) != 0 || len(logs) != 2 {
+		t.Fatalf("a one-tick overlap: fails=%v logs=%v", fails, logs)
+	}
+	w.observeTick(t0.Add(3*time.Second), two)
+	w.observeTick(t0.Add(4*time.Second), two)
+	if len(fails) != 1 || !strings.Contains(fails[0], "dual holder") {
+		t.Fatalf("a two-tick dual holder: fails=%v", fails)
+	}
+}
+
+// TestHoldersIn: tenures seen by any reader count, each reader's holder at
+// from included.
+func TestHoldersIn(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	h := []leaseChange{
+		{At: t0, Holder: "node-2", Term: 4, Reader: "a"},
+		{At: t0, Holder: "node-1", Term: 3, Reader: "b"}, // a stale replica
+		{At: t0.Add(time.Minute), Holder: "node-3", Term: 5, Reader: "b"},
+	}
+	got := holdersIn(h, t0.Add(30*time.Second), t0.Add(2*time.Minute))
+	if !reflect.DeepEqual(got, []string{"node-2", "node-1", "node-3"}) {
+		t.Fatalf("got %v", got)
 	}
 }

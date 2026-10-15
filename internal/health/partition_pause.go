@@ -868,6 +868,12 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 			continue
 		}
 		if why := p.localRowMatches(ctx, rec); why != "" {
+			if why == whyNoLocalContainerRow {
+				if gone, gwhy := p.containerGone(ctx, rec.Name); gone {
+					p.dropGoneContainer(rec, gwhy)
+					continue
+				}
+			}
 			if rec.Kind == PauseKindContainer {
 				if settled, swhy := p.settleContainer(ctx, rec); settled {
 					continue
@@ -931,7 +937,7 @@ func (p *PartitionPauser) localRowMatches(ctx context.Context, rec PauseRecord) 
 			return "row unreadable: " + err.Error()
 		}
 		if ct == nil {
-			return "no live row on this host (relocated?)"
+			return whyNoLocalContainerRow
 		}
 		host, epoch, inc = ct.HostName, ct.OwnerEpoch, corrosion.IncarnationOf(ct.CreatedAt)
 	default:
@@ -946,6 +952,50 @@ func (p *PartitionPauser) localRowMatches(ctx context.Context, rec PauseRecord) 
 		return "the row is another incarnation (created_at " + inc + ")"
 	}
 	return ""
+}
+
+// whyNoLocalContainerRow is localRowMatches for a container with no live row
+// on this host.
+const whyNoLocalContainerRow = "no live row on this host (relocated?)"
+
+// containerGone reports whether container name no longer exists on this host:
+// the runtime lists it no more and its on-disk dir is absent. Anything it
+// cannot read counts as present, so a record is kept until both say gone.
+func (p *PartitionPauser) containerGone(ctx context.Context, name string) (bool, string) {
+	if p.cts == nil {
+		return false, ""
+	}
+	lctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
+	names, err := p.cts.List(lctx)
+	cancel()
+	if err != nil {
+		return false, ""
+	}
+	for _, n := range names {
+		if n == name {
+			return false, ""
+		}
+	}
+	if exists, err := p.cts.ContainerExists(name); err != nil || exists {
+		return false, ""
+	}
+	return true, "the container no longer exists on this host and has no live row here"
+}
+
+// dropGoneContainer drops the record of a container that no longer exists:
+// there is nothing left to resume, and a kept record would hold
+// partition_paused open for good.
+func (p *PartitionPauser) dropGoneContainer(rec PauseRecord, why string) {
+	if err := p.store.remove(rec.Kind, rec.Name); err != nil {
+		slog.Warn("partition-pause: could not drop the record of a container that no longer exists",
+			"kind", rec.Kind, "name", rec.Name, "host", p.host, "error", err)
+		return
+	}
+	p.mu.Lock()
+	delete(p.heldWhy, rec.Key())
+	p.mu.Unlock()
+	slog.Warn("partition-pause: dropped a pause record that no longer describes a paused workload",
+		"kind", rec.Kind, "name", rec.Name, "host", p.host, "reason", why)
 }
 
 func (p *PartitionPauser) hold(rec PauseRecord, why string) {

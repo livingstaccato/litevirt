@@ -22,6 +22,10 @@ type fakeCT struct {
 	mu    sync.Mutex
 	state map[string]string
 	stops []string
+	// disk names containers whose on-disk dir is present though lxc-ls does
+	// not list them; listErr fails every List.
+	disk    map[string]bool
+	listErr error
 }
 
 func newFakeCT(running ...string) *fakeCT {
@@ -37,6 +41,9 @@ func (f *fakeCT) get(name string) string { f.mu.Lock(); defer f.mu.Unlock(); ret
 func (f *fakeCT) List(context.Context) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	var out []string
 	for n := range f.state {
 		out = append(out, n)
@@ -44,6 +51,18 @@ func (f *fakeCT) List(context.Context) ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
+
+// ContainerExists is the on-disk dir: every container the runtime knows, and
+// any named in disk.
+func (f *fakeCT) ContainerExists(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.state[name]
+	return ok || f.disk[name], nil
+}
+
+// remove deletes a container from the runtime (lxc-destroy).
+func (f *fakeCT) remove(name string) { f.mu.Lock(); delete(f.state, name); f.mu.Unlock() }
 
 func (f *fakeCT) State(_ context.Context, name string) (lxc.State, error) {
 	switch f.get(name) {
@@ -214,6 +233,75 @@ func TestPartitionPause_SettlesARelocatedContainer(t *testing.T) {
 				corrosion.CondCTSettled, "container", "ct-ha@node-a")
 			if err != nil || !ok {
 				t.Fatalf("ct_settled = (%+v, %v, %v)", c, ok, err)
+			}
+		})
+	}
+}
+
+// A record for a container this host froze and that has since been deleted —
+// no live row on this host and no container in the runtime — describes
+// nothing: it is dropped and partition_paused resolves, as a record whose
+// domain is undefined is (lab 3dbc8b31: an orphan record for a deleted
+// container held partition_paused open on node-3 for good). A container that
+// is still there stays paused with its record, however its row went, and so
+// does one the runtime cannot be asked about.
+//
+// Mutations: keep a record whose container is gone — the "deleted" subtest
+// goes red; drop on the missing row alone — "row gone, container frozen"
+// goes red; skip the on-disk check — "row gone, dir still on disk" goes red;
+// treat a failed listing as "absent" — "row gone, listing fails" goes red.
+func TestPartitionPause_DropsARecordWhoseContainerIsGone(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(rt *fakeCT)
+		wantDrop bool
+	}{
+		{"deleted", func(rt *fakeCT) { rt.remove("ct-ha") }, true},
+		{"row gone, container frozen", func(*fakeCT) {}, false},
+		{"row gone, dir still on disk", func(rt *fakeCT) {
+			rt.remove("ct-ha")
+			rt.mu.Lock()
+			rt.disk = map[string]bool{"ct-ha": true}
+			rt.mu.Unlock()
+		}, false},
+		{"row gone, listing fails", func(rt *fakeCT) {
+			rt.mu.Lock()
+			rt.listErr = errors.New("lxc-ls: exit status 1")
+			rt.mu.Unlock()
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, rt := newContainerPauseFixture(t)
+			ctx := context.Background()
+			f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+			if recs := f.records(); len(recs) != 1 || recs[0].Key() != "ct/ct-ha" {
+				t.Fatalf("setup: records %+v", recs)
+			}
+			if err := corrosion.DeleteContainer(ctx, f.db, "node-a", "ct-ha"); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(rt)
+			f.regain()
+			recs := f.records()
+			c, ok := f.condition(corrosion.CondPartitionPaused)
+			resolved := ok && c.Lifecycle == corrosion.ConditionResolved
+			if tc.wantDrop {
+				if len(recs) != 0 {
+					t.Fatalf("records = %+v after the container was deleted", recs)
+				}
+				if !resolved {
+					t.Fatalf("partition_paused is not resolved (ok=%v %+v)", ok, c)
+				}
+				return
+			}
+			if len(recs) != 1 {
+				t.Fatalf("records = %+v, want ct/ct-ha kept", recs)
+			}
+			if resolved || !ok {
+				t.Fatalf("partition_paused resolved (ok=%v %+v) while ct/ct-ha is still recorded", ok, c)
+			}
+			if st := rt.get("ct-ha"); st != "" && st != "frozen" {
+				t.Fatalf("ct-ha is %s, want it left frozen", st)
 			}
 		})
 	}

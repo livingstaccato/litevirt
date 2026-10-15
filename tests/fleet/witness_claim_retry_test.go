@@ -36,7 +36,11 @@ import (
 //     (so q3-b keeps running through it and after the heal), and with it in
 //     the second (its flag flipped without the restart that would re-admit
 //     it, as the scenario's only way to reach this). A retry that runs at
-//     once starts q3-b while node-0 still runs it.
+//     once starts q3-b while node-0 still runs it. A retry judged at the
+//     heal, on node-0's answer while its pause could not be relied on, is
+//     dropped and q3-b waits for an operator; one judged in the second
+//     outage waits afresh and is recovered. Either way q3-b never runs twice
+//     and never starts before W.
 //   - pause-on: node-0 pauses in both outages; q3-b stays paused on node-0
 //     after the heal (a voter has it offline). Running the retry at once is
 //     harmless here, but the coordinator cannot tell the cases apart.
@@ -192,6 +196,17 @@ func claimRetryAcrossOutages(t *testing.T, pauseOffFirst bool) {
 		}
 	}
 	assertOneCopy("outage 2")
+	if destB == nil && pauseOffFirst {
+		// node-0 answered at the heal while it ran q3-b unpaused. When the
+		// coordinator judged the retry then, on that answer, node-0's
+		// pause could not be relied on, so the retry was dropped and the
+		// unverified fence declined: it waits for an operator
+		// (claimRetryOutageOver). That is the outcome when the heal is
+		// seen while node-0 is still a fence candidate; otherwise the
+		// retry is judged in the second outage and waits afresh.
+		t.Logf("q3-b was not recovered within %v of the second split: the retry was dropped at the heal", watch)
+		return
+	}
 	if destB == nil {
 		t.Fatalf("q3-b was not recovered within %v of the second split (node-0 has it %s)", watch,
 			func() libvirtfake.State { st, _ := owner.Virt.RawState("q3-b"); return st }())

@@ -75,11 +75,14 @@ var linkByName = func(name string) (int, net.HardwareAddr, error) {
 var sendLinkFrames = sendRawFrames
 
 // AnnounceGateway sends gratuitous ARPs for gateway out of bridge, from the
-// bridge's own MAC, when this host holds gateway on bridge. It reports
-// whether it sent them; a host that does not hold the address there sends
-// nothing, since announcing another router's address would take its traffic.
+// bridge's own MAC, when this host holds gateway on bridge and the bridge has
+// no uplink. It reports whether it sent them. A host that does not hold the
+// address there sends nothing, since announcing another router's address
+// would take its traffic; nor does a bridge with an uplink, whose L2 other
+// hosts (and every host's copy of the gateway) share, where the announcement
+// would pull all of it onto this host.
 func AnnounceGateway(bridge string, gateway netip.Addr) (bool, error) {
-	if validLinkName(bridge) != nil || !gateway.Is4() {
+	if validLinkName(bridge) != nil || !gateway.Is4() || BridgeHasUplink(bridge) {
 		return false, nil
 	}
 	held, err := bridgeHoldsAddr(bridge, gateway)

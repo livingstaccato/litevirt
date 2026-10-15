@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -36,10 +38,12 @@ func TestGatewayARPFrame(t *testing.T) {
 }
 
 // AnnounceGateway sends the frame out of the bridge, from the bridge's own
-// MAC, only when the bridge holds the gateway address; a bridge without it
-// (another router's gateway) sends nothing.
+// MAC, only when the bridge holds the gateway address and has no uplink; a
+// bridge without the address (another router's gateway) or with an uplink
+// sends nothing.
 //
-// Mutation: drop the holds-the-address check — the second case sends.
+// Mutations: drop the holds-the-address check — the second case sends; drop
+// the uplink check — the third does.
 func TestAnnounceGateway_FromTheBridgeThatHoldsTheGateway(t *testing.T) {
 	origAddrs, origLink, origSend := interfaceAddrs, linkByName, sendLinkFrames
 	t.Cleanup(func() { interfaceAddrs, linkByName, sendLinkFrames = origAddrs, origLink, origSend })
@@ -77,6 +81,23 @@ func TestAnnounceGateway_FromTheBridgeThatHoldsTheGateway(t *testing.T) {
 	ok, err = AnnounceGateway("brx", gw)
 	if err != nil || ok || len(got) != 0 {
 		t.Errorf("a bridge without the gateway address announced it: ok=%v err=%v sent=%d", ok, err, len(got))
+	}
+
+	// A bridge with an uplink shares its L2 with other hosts: no announcement.
+	sys := t.TempDir()
+	origSysfs := sysfsNet
+	sysfsNet = sys
+	t.Cleanup(func() { sysfsNet = origSysfs })
+	if err := os.MkdirAll(filepath.Join(sys, "brx", "brif", "eth9"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sys, "eth9", "device"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, held = nil, "172.46.0.1"
+	ok, err = AnnounceGateway("brx", gw)
+	if err != nil || ok || len(got) != 0 {
+		t.Errorf("a bridge with an uplink announced the gateway: ok=%v err=%v sent=%d", ok, err, len(got))
 	}
 }
 

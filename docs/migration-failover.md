@@ -22,7 +22,8 @@ Progress is streamed to the CLI in real-time.
 Once a live migration completes, the target host sends gratuitous ARPs for the
 gateway of each network the VM has a NIC on (the first address of the
 network's IPv4 subnet), out of its own bridge and from that bridge's MAC, when
-it holds that address there. It needs no `arping`.
+it holds that address there, the network is not on a VLAN and the bridge has
+no uplink. It needs no `arping`.
 
 ### Requirements
 

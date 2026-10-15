@@ -11,6 +11,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Lab 2, bug 3: a guest lost its gateway for ~18 s after a live migration.
@@ -50,6 +51,11 @@ func TestFleet_LiveMigrationAnnouncesTheGatewayOnTheTarget(t *testing.T) {
 		t.Fatalf("seed mover: %v", err)
 	}
 	src.Virt.SetState("mover", "running")
+	// libvirt lands the guest on the target, running.
+	src.Virt.OnMigrateToTarget = func(name, _ string, _ lv.MigrateParams) error {
+		dst.Virt.SetState(name, "running")
+		return nil
+	}
 
 	if err := migrateAt(t, c, src, "mover", dst.Name); err != nil {
 		t.Fatalf("migrate mover to %s: %v", dst.Name, err)

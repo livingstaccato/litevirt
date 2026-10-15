@@ -12,17 +12,17 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// The bridge MAC of a network is a function of its name alone — every host
+// A bridge's MAC is a function of its device name alone — every host
 // derives the same one, so the value is pinned — and is a locally
 // administered unicast address, so it can never be a vendor's or a multicast
-// address. Different networks get different MACs.
+// address. Different bridges get different MACs.
 //
 // Mutations: add anything host-specific to the hash input — the pinned value
 // goes red; prefix 0x08 (not locally administered) — red.
-func TestNetworkBridgeMAC(t *testing.T) {
-	a := NetworkBridgeMAC("st_lan")
-	if a.String() != "0a:23:4e:9c:eb:85" {
-		t.Fatalf("NetworkBridgeMAC(st_lan) = %s, want 0a:23:4e:9c:eb:85 on every host", a)
+func TestBridgeMAC(t *testing.T) {
+	a := BridgeMAC("lan")
+	if a.String() != "0a:2e:e3:8d:34:74" {
+		t.Fatalf("BridgeMAC(lan) = %s, want 0a:2e:e3:8d:34:74 on every host", a)
 	}
 	if len(a) != 6 {
 		t.Fatalf("MAC %s is %d bytes", a, len(a))
@@ -30,8 +30,8 @@ func TestNetworkBridgeMAC(t *testing.T) {
 	if a[0]&0x02 == 0 || a[0]&0x01 != 0 {
 		t.Errorf("MAC %s is not a locally administered unicast address", a)
 	}
-	if c := NetworkBridgeMAC("st_wan"); c.String() == a.String() {
-		t.Errorf("two networks share the bridge MAC %s", a)
+	if c := BridgeMAC("wan"); c.String() == a.String() {
+		t.Errorf("two bridges share the MAC %s", a)
 	}
 }
 
@@ -50,7 +50,7 @@ func TestEnsureBridgeMAC_ReconcilesOnlyADifferentMAC(t *testing.T) {
 		return nil, nil
 	}
 	t.Cleanup(func() { sysClassNet = origSys; execCommand = defaultExec })
-	mac := NetworkBridgeMAC("n1")
+	mac := BridgeMAC("br1")
 	writeAddr := func(addr string) {
 		if err := os.MkdirAll(filepath.Join(sys, "br1"), 0o755); err != nil {
 			t.Fatal(err)
@@ -82,12 +82,15 @@ func TestEnsureBridgeMAC_ReconcilesOnlyADifferentMAC(t *testing.T) {
 }
 
 // Provision gives a bridge litevirt creates for a network, and an isolated
-// network's bridge, the network's MAC; it leaves a bridge it did not create
-// (an operator's, found already there) and a VLAN bridge alone.
+// network's bridge, its derived MAC, the same whichever network sharing it is
+// provisioned; it leaves a bridge it did not create (an operator's, found
+// already there), a VLAN bridge and a bridge with an uplink alone.
 //
 // Mutations: drop the bridgeRecorded check — the operator's bridge gets a MAC;
-// drop the VLAN check — the VLAN bridge gets one; drop the call from the
-// isolated case — the isolated bridge keeps its MAC.
+// drop the VLAN check — the VLAN bridge gets one; drop the uplink check —
+// lvmacu gets one; derive the MAC from the network name — the shared lvmac1
+// flips; drop the call from the isolated case — the isolated bridge keeps its
+// MAC.
 func TestProvision_BridgeGetsTheNetworkMAC(t *testing.T) {
 	sys := t.TempDir()
 	origSys, origSysfs, origDir := sysClassNet, sysfsNet, createdBridgeDir
@@ -104,12 +107,26 @@ func TestProvision_BridgeGetsTheNetworkMAC(t *testing.T) {
 		cmds = append(cmds, name+" "+strings.Join(args, " "))
 		if name == "ip" && len(args) >= 3 && args[0] == "link" && args[1] == "add" {
 			dev := args[2]
-			if exists[dev] {
+			if _, err := os.Stat(filepath.Join(sys, dev)); err == nil || exists[dev] {
 				return []byte("RTNETLINK answers: File exists"), errors.New("exit status 2")
 			}
 			ifindex++
 			writeSysBridge(t, sys, dev, ifindex)
 			if err := os.WriteFile(filepath.Join(sys, dev, "address"), []byte("fe:54:00:aa:bb:cc\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if dev == "lvmacu" { // an operator then bridged a NIC into it
+				if err := os.WriteFile(filepath.Join(sys, dev, "brif", "eth9"), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(sys, "eth9", "device"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		// The kernel takes the address `ip link set dev X address M` gives.
+		if name == "ip" && len(args) == 6 && args[0] == "link" && args[1] == "set" && args[4] == "address" {
+			if err := os.WriteFile(filepath.Join(sys, args[3], "address"), []byte(args[5]+"\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -133,8 +150,29 @@ func TestProvision_BridgeGetsTheNetworkMAC(t *testing.T) {
 	if _, err := Provision(ctx, db, "st_lan", compose.NetworkDef{Type: "bridge", Interface: "lvmac1"}, "", "h1"); err != nil {
 		t.Fatalf("Provision lvmac1: %v", err)
 	}
-	if got, want := setMAC("lvmac1"), NetworkBridgeMAC("st_lan").String(); got != want {
-		t.Errorf("litevirt's bridge lvmac1 got MAC %q, want the network's %s", got, want)
+	if got, want := setMAC("lvmac1"), BridgeMAC("lvmac1").String(); got != want {
+		t.Errorf("litevirt's bridge lvmac1 got MAC %q, want %s", got, want)
+	}
+	// A second network on the same bridge, then the first again: the bridge
+	// keeps its one MAC; nothing sets another.
+	for _, nw := range []string{"st_other", "st_lan"} {
+		cmds = nil
+		if _, err := Provision(ctx, db, nw, compose.NetworkDef{Type: "bridge", Interface: "lvmac1"}, "", "h1"); err != nil {
+			t.Fatalf("Provision %s on lvmac1: %v", nw, err)
+		}
+		if got := setMAC("lvmac1"); got != "" {
+			t.Errorf("provisioning %s on the shared lvmac1 changed its MAC to %s", nw, got)
+		}
+	}
+
+	// A bridge litevirt made that has an uplink keeps its own MAC: its L2 is
+	// shared with the other hosts'.
+	cmds = nil
+	if _, err := Provision(ctx, db, "st_up", compose.NetworkDef{Type: "bridge", Interface: "lvmacu"}, "", "h1"); err != nil {
+		t.Fatalf("Provision lvmacu: %v", err)
+	}
+	if got := setMAC("lvmacu"); got != "" {
+		t.Errorf("lvmacu, which has an uplink, was given MAC %s", got)
 	}
 
 	// An operator's bridge: `ip link add` finds it there, so no record.
@@ -163,7 +201,7 @@ func TestProvision_BridgeGetsTheNetworkMAC(t *testing.T) {
 	if _, err := Provision(ctx, db, "st_iso", compose.NetworkDef{Type: "isolated"}, "", "h1"); err != nil {
 		t.Fatalf("Provision isolated: %v", err)
 	}
-	if got, want := setMAC(IsolatedBridgeName("st_iso")), NetworkBridgeMAC("st_iso").String(); got != want {
+	if got, want := setMAC(IsolatedBridgeName("st_iso")), BridgeMAC(IsolatedBridgeName("st_iso")).String(); got != want {
 		t.Errorf("isolated bridge got MAC %q, want %s", got, want)
 	}
 }

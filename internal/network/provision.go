@@ -167,10 +167,14 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		}
 		// A bridge litevirt made (its record says so), with no VLAN and no
 		// uplink, gets the network's MAC, the same on every host
-		// (NetworkBridgeMAC). An operator's bridge, and a bridge that shares
+		// (BridgeMAC). An operator's bridge, and a bridge that shares
 		// one L2 with the other hosts' (a VLAN, an uplink), keep their own.
-		if def.VLAN == 0 && bridgeRecorded(bridge) && !BridgeHasUplink(bridge) {
-			ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+		if def.VLAN == 0 && bridgeRecorded(bridge) {
+			if BridgeHasUplink(bridge) {
+				warnSharedMACOnUplink(networkName, bridge)
+			} else {
+				ensureNetworkBridgeMAC(networkName, bridge, def.Subnet)
+			}
 		}
 
 		// If a VLAN ID is specified, create a VLAN sub-interface on the

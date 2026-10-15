@@ -44,13 +44,22 @@ func (s *Server) AnnounceMigratedGuest(ctx context.Context, req *pb.AnnounceMigr
 	if req.GetVmName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name is required")
 	}
+	// Only for a guest that runs here: libvirt answers that at once, where
+	// the VM's row may not have replicated the move yet.
+	if s.virt == nil {
+		return nil, status.Error(codes.FailedPrecondition, "no hypervisor on this host")
+	}
+	if active, err := s.virt.DomainIsActive(req.GetVmName()); err != nil || !active {
+		return nil, status.Errorf(codes.FailedPrecondition, "VM %q is not running on %s", req.GetVmName(), s.hostName)
+	}
 	s.announceGatewaysOf(ctx, req.GetVmName())
 	return &emptypb.Empty{}, nil
 }
 
 // announceGatewaysOf announces, on this host, the gateway of each network vm
-// has a NIC on: the first address of the network's IPv4 subnet, out of the
-// network's bridge here. Best effort; each bridge once.
+// has a NIC on that is not on a VLAN: the first address of the network's
+// IPv4 subnet, out of the network's bridge here (network.AnnounceGateway also
+// skips a bridge with an uplink). Best effort; each bridge once.
 func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
 	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm)
 	if err != nil {
@@ -65,6 +74,10 @@ func (s *Server) announceGatewaysOf(ctx context.Context, vm string) {
 		}
 		def, err := networkRowDef(networkRow{name: nr.Name, typ: nr.Type, config: nr.Config})
 		if err != nil {
+			continue
+		}
+		// On a VLAN the gateway is the VLAN's router, not this host.
+		if def.VLAN > 0 {
 			continue
 		}
 		gw, ok := network.SubnetGatewayV4(def.Subnet)

@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -130,9 +131,11 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 	if r.virt == nil || r.checkPeerRuntime == nil {
 		return
 	}
-	localDomains, err := r.virt.ListDomains()
+	localDomains, err := r.listDomainsBounded("owner-assert")
 	if err != nil {
-		slog.Error("owner-assert: list local domains", "error", err)
+		if !errors.Is(err, errLibvirtNoAnswer) {
+			slog.Error("owner-assert: list local domains", "error", err)
+		}
 		return
 	}
 	hosts, err := corrosion.ListHosts(ctx, r.db)

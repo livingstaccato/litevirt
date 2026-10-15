@@ -81,8 +81,11 @@ type Server struct {
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory
 	invCacheAt time.Time
-	pkiDir     string
-	db         *corrosion.Client
+	// invCacheGen counts invalidations: a collect that began before one is
+	// not cached.
+	invCacheGen uint64
+	pkiDir      string
+	db          *corrosion.Client
 
 	// dependsOnWaitTimeout, when > 0, overrides waitForCondition's timeout.
 	// Test seam only (SetDependsOnWaitTimeoutForTests); zero in production.
@@ -840,6 +843,9 @@ type Server struct {
 	startFlightsMu  sync.Mutex
 	startFlights    map[string]*startFlight
 	startDomainWait time.Duration
+	// invFlights is the runtime inventory's libvirt single flight
+	// (runtime_inventory.go).
+	invFlights inventoryFlights
 	// liveStateCalls holds each live-state read of a local domain libvirt
 	// has not answered yet (vm_live_state.go); liveStateWait is how long a
 	// read waits for one (zero: defaultLiveStateWait).

@@ -118,6 +118,23 @@ func (p ProofRecord) Terminal() bool {
 // host, and the next migration of that VM cut over and then failed its
 // ownership commit (pp3 on the kvm003 lab, main-b3368d7c).
 func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost string) error {
+	return writeVMRescheduleProof(ctx, c, p, vmName, destHost, "")
+}
+
+// ReplaceVMRescheduleProof is WriteVMRescheduleProof for a VM row still
+// pending on the proof replacing: it applies only while the row's
+// pending_action_id is replacing and its state is pending, and otherwise
+// returns ErrNoRowsAffected. The failover coordinator moves a pending
+// reschedule whose proof its destination abandoned onto the proof decided
+// in its place (sweepStaleTermProofs).
+func ReplaceVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost, replacing string) error {
+	if replacing == "" {
+		return fmt.Errorf("replace a pending reschedule of %s: no proof to replace", vmName)
+	}
+	return writeVMRescheduleProof(ctx, c, p, vmName, destHost, replacing)
+}
+
+func writeVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost, replacing string) error {
 	if err := proofStampEmittable(c, p); err != nil {
 		return err
 	}
@@ -170,9 +187,11 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var currentOwnerEpoch int64
 		var startable bool
-		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+` FROM vms WHERE name = ? AND deleted_at IS NULL`,
+		var pendingID, state string
+		if err := tx.QueryRow(`SELECT vm_owner_epoch, NOT `+vmStoppedByIntentSQL+`, COALESCE(pending_action_id, ''), COALESCE(state, '')
+			FROM vms WHERE name = ? AND deleted_at IS NULL`,
 			append(vmStoppedByIntentArgs(), vmName)...).
-			Scan(&currentOwnerEpoch, &startable); err != nil {
+			Scan(&currentOwnerEpoch, &startable, &pendingID, &state); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, nil
 			}
@@ -180,6 +199,9 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 		}
 		if !startable {
 			return false, ErrWorkloadStopped
+		}
+		if replacing != "" && (pendingID != replacing || state != "pending") {
+			return false, nil
 		}
 		if p.OwnerEpoch != "" {
 			expectedOwnerEpoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)

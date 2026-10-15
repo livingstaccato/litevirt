@@ -1276,6 +1276,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		// Claim, for their own value, proofs minted without a certificate before
 		// recovery claims were enforced: their destinations refuse them until then.
 		c.certifyUncertified(ctx)
+		// Move pending reschedules whose proofs the lease has outrun onto this
+		// holder's term: their destinations refuse them as stale until then.
+		c.sweepStaleTermProofs(ctx)
 
 		// Settle any relocate-restore markers left by an indeterminate restore or a
 		// coordinator crash mid-restore. This runs every cycle, independent of the

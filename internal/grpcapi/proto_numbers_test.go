@@ -287,3 +287,221 @@ func TestProtoNumbers_FirewallExtras(t *testing.T) {
 		}
 	}
 }
+
+// The live firmware migration RPCs' fields, messages and enums keep the
+// numbers they were given. The numbers were checked free against the
+// integration head and every open fork branch that adds proto.
+func TestProtoNumbers_LiveFirmware(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.FirmwareRuntime{}, 1, "libvirt"},
+		{&pb.FirmwareRuntime{}, 2, "qemu"},
+		{&pb.FirmwareRuntime{}, 3, "swtpm"},
+		{&pb.FirmwareRuntime{}, 4, "libtpms"},
+		{&pb.FirmwareRuntime{}, 5, "ovmf_fingerprint"},
+		{&pb.FirmwareRuntime{}, 6, "live_firmware_enabled"},
+
+		{&pb.FirmwareApplicability{}, 1, "tpm"},
+		{&pb.FirmwareApplicability{}, 2, "uefi"},
+
+		{&pb.TargetDomain{}, 1, "present"},
+		{&pb.TargetDomain{}, 2, "state"},
+		{&pb.TargetDomain{}, 3, "reason"},
+		{&pb.TargetDomain{}, 4, "uuid"},
+
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 3, "created_at"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 4, "attempt_id"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 5, "protocol_version"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 6, "src_runtime"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 7, "src_applicability"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 8, "source_domain_active"},
+		{&pb.PrepareLiveFirmwareTargetRequest{}, 9, "nvram"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 1, "dst_runtime"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 2, "dst_applicability"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 3, "swtpm_absent"},
+		{&pb.PrepareLiveFirmwareTargetResponse{}, 4, "target_domain"},
+
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 3, "attempt_id"},
+		{&pb.VerifyLiveFirmwareTargetRequest{}, 4, "src_permall_sha256"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 1, "verdict"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 2, "dst_permall_sha256"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 3, "target_domain"},
+		{&pb.VerifyLiveFirmwareTargetResponse{}, 4, "detail"},
+
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 3, "attempt_id"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 4, "src_nvram_sha256"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 5, "nvram_final"},
+		{&pb.ReleaseLiveFirmwareTargetRequest{}, 6, "created_at"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 1, "nvram_sha256"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 2, "nvram_confirmed"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 3, "target_domain"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 4, "verdict"},
+		{&pb.ReleaseLiveFirmwareTargetResponse{}, 5, "detail"},
+
+		{&pb.AbortLiveFirmwareTargetRequest{}, 1, "vm_name"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 2, "uuid"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 3, "created_at"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 4, "attempt_id"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 5, "mode"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 6, "source_domain_active"},
+		{&pb.AbortLiveFirmwareTargetRequest{}, 7, "created_stubs"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 1, "target_domain"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 2, "hold_state"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 3, "refused"},
+		{&pb.AbortLiveFirmwareTargetResponse{}, 4, "detail"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	enums := []struct {
+		ed   protoreflect.EnumDescriptor
+		num  protoreflect.EnumNumber
+		name protoreflect.Name
+	}{
+		{pb.FirmwareVerdict(0).Descriptor(), 0, "FIRMWARE_VERDICT_UNSPECIFIED"},
+		{pb.FirmwareVerdict(0).Descriptor(), 1, "FIRMWARE_VERDICT_BAD_REQUEST"},
+		{pb.FirmwareVerdict(0).Descriptor(), 2, "FIRMWARE_VERDICT_NOT_HELD"},
+		{pb.FirmwareVerdict(0).Descriptor(), 3, "FIRMWARE_VERDICT_NOT_RUNNING"},
+		{pb.FirmwareVerdict(0).Descriptor(), 4, "FIRMWARE_VERDICT_TARGET_RAN"},
+		{pb.FirmwareVerdict(0).Descriptor(), 5, "FIRMWARE_VERDICT_MATCH"},
+		{pb.FirmwareVerdict(0).Descriptor(), 6, "FIRMWARE_VERDICT_MISMATCH"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 0, "FIRMWARE_ABORT_MODE_UNSPECIFIED"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 1, "FIRMWARE_ABORT_MODE_PRE_CUTOVER"},
+		{pb.FirmwareAbortMode(0).Descriptor(), 2, "FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED"},
+	}
+	for _, e := range enums {
+		vd := e.ed.Values().ByNumber(e.num)
+		if vd == nil || vd.Name() != e.name {
+			t.Errorf("%s value %d is %v, want %s", e.ed.FullName(), e.num, vd, e.name)
+		}
+	}
+	for _, ed := range []protoreflect.EnumDescriptor{pb.FirmwareVerdict(0).Descriptor(), pb.FirmwareAbortMode(0).Descriptor()} {
+		n := 0
+		for _, e := range enums {
+			if e.ed == ed {
+				n++
+			}
+		}
+		if ed.Values().Len() != n {
+			t.Errorf("%s has %d values, the table pins %d", ed.FullName(), ed.Values().Len(), n)
+		}
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{
+		"PrepareLiveFirmwareTarget", "VerifyLiveFirmwareTarget",
+		"ReleaseLiveFirmwareTarget", "AbortLiveFirmwareTarget",
+	} {
+		m := svc.Methods().ByName(rpc)
+		if m == nil {
+			t.Errorf("RPC %s is missing", rpc)
+			continue
+		}
+		if m.IsStreamingClient() || m.IsStreamingServer() {
+			t.Errorf("RPC %s streams; it is unary", rpc)
+		}
+		if got, want := m.Input().Name(), rpc+"Request"; got != want {
+			t.Errorf("RPC %s takes %s, want %s", rpc, got, want)
+		}
+		if got, want := m.Output().Name(), rpc+"Response"; got != want {
+			t.Errorf("RPC %s returns %s, want %s", rpc, got, want)
+		}
+	}
+}
+
+// Every live firmware migration message survives a binary and a protojson
+// round trip with every field set, and each of the four responses carries the
+// target's domain (spec §14, I-7).
+func TestProto_LiveFirmwareRoundTrip(t *testing.T) {
+	rt := &pb.FirmwareRuntime{
+		Libvirt: "10.0.0", Qemu: "8.2.2", Swtpm: "0.9.0", Libtpms: "0.9.3",
+		OvmfFingerprint: "sha256:ab12", LiveFirmwareEnabled: true,
+	}
+	app := &pb.FirmwareApplicability{Tpm: true, Uefi: true}
+	dom := &pb.TargetDomain{Present: true, State: "paused", Reason: "migration", Uuid: "6f1c2b3a-0000-4000-8000-000000000001"}
+	msgs := []proto.Message{
+		&pb.PrepareLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, CreatedAt: "2026-10-15T10:00:00Z", AttemptId: "att-1",
+			ProtocolVersion: 1, SrcRuntime: rt, SrcApplicability: app, SourceDomainActive: true,
+			Nvram: []byte{0x00, 0xff, 0x10},
+		},
+		&pb.PrepareLiveFirmwareTargetResponse{DstRuntime: rt, DstApplicability: app, SwtpmAbsent: true, TargetDomain: dom},
+		&pb.VerifyLiveFirmwareTargetRequest{VmName: "web", Uuid: dom.Uuid, AttemptId: "att-1", SrcPermallSha256: "aa"},
+		&pb.VerifyLiveFirmwareTargetResponse{
+			Verdict: pb.FirmwareVerdict_FIRMWARE_VERDICT_MISMATCH, DstPermallSha256: "bb", TargetDomain: dom, Detail: "permall differs",
+		},
+		&pb.ReleaseLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, AttemptId: "att-1", SrcNvramSha256: "cc",
+			NvramFinal: []byte{0x01, 0x02}, CreatedAt: "2026-10-15T10:00:00Z",
+		},
+		&pb.ReleaseLiveFirmwareTargetResponse{
+			NvramSha256: "cc", NvramConfirmed: true, TargetDomain: dom,
+			Verdict: pb.FirmwareVerdict_FIRMWARE_VERDICT_TARGET_RAN, Detail: "running",
+		},
+		&pb.AbortLiveFirmwareTargetRequest{
+			VmName: "web", Uuid: dom.Uuid, CreatedAt: "2026-10-15T10:00:00Z", AttemptId: "att-1",
+			Mode: pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED, SourceDomainActive: true,
+			CreatedStubs: []string{"/var/lib/litevirt/disks/web-0.qcow2"},
+		},
+		&pb.AbortLiveFirmwareTargetResponse{TargetDomain: dom, HoldState: "prepared", Refused: true, Detail: "domain defined"},
+	}
+	for _, in := range msgs {
+		// Every field is set, so a field the generator dropped or a setter
+		// that wrote the wrong field shows as an unpopulated one here.
+		md := in.ProtoReflect().Descriptor()
+		for i := 0; i < md.Fields().Len(); i++ {
+			if fd := md.Fields().Get(i); !in.ProtoReflect().Has(fd) {
+				t.Errorf("%s.%s is not set in the fixture", md.Name(), fd.Name())
+			}
+		}
+		b, err := proto.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", md.Name(), err)
+		}
+		bin := in.ProtoReflect().New().Interface()
+		if err := proto.Unmarshal(b, bin); err != nil {
+			t.Fatalf("unmarshal %s: %v", md.Name(), err)
+		}
+		if !proto.Equal(in, bin) {
+			t.Errorf("%s binary round trip: got %v, want %v", md.Name(), bin, in)
+		}
+		js, err := protojson.Marshal(in)
+		if err != nil {
+			t.Fatalf("protojson marshal %s: %v", md.Name(), err)
+		}
+		jo := in.ProtoReflect().New().Interface()
+		if err := protojson.Unmarshal(js, jo); err != nil {
+			t.Fatalf("protojson unmarshal %s: %v", md.Name(), err)
+		}
+		if !proto.Equal(in, jo) {
+			t.Errorf("%s protojson round trip: got %v, want %v", md.Name(), jo, in)
+		}
+		if strings.HasSuffix(string(md.Name()), "Response") {
+			fd := md.Fields().ByName("target_domain")
+			if fd == nil || fd.Message() == nil || fd.Message().Name() != "TargetDomain" {
+				t.Errorf("%s does not carry a TargetDomain", md.Name())
+			}
+		}
+	}
+
+	// The zero verdict and abort mode are UNSPECIFIED: an empty response (an
+	// older peer, a dropped field) never reads as MATCH or as a mode.
+	if v := (&pb.VerifyLiveFirmwareTargetResponse{}).GetVerdict(); v != pb.FirmwareVerdict_FIRMWARE_VERDICT_UNSPECIFIED {
+		t.Errorf("zero verdict = %v, want UNSPECIFIED", v)
+	}
+	if m := (&pb.AbortLiveFirmwareTargetRequest{}).GetMode(); m != pb.FirmwareAbortMode_FIRMWARE_ABORT_MODE_UNSPECIFIED {
+		t.Errorf("zero abort mode = %v, want UNSPECIFIED", m)
+	}
+}

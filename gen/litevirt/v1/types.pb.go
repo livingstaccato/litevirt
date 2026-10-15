@@ -370,6 +370,119 @@ func (MigratePhase) EnumDescriptor() ([]byte, []int) {
 	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{5}
 }
 
+// FirmwareVerdict is the target's answer to a firmware hand-over check.
+type FirmwareVerdict int32
+
+const (
+	FirmwareVerdict_FIRMWARE_VERDICT_UNSPECIFIED FirmwareVerdict = 0 // never sent; an empty answer
+	FirmwareVerdict_FIRMWARE_VERDICT_BAD_REQUEST FirmwareVerdict = 1 // a hash the hold needs is empty
+	FirmwareVerdict_FIRMWARE_VERDICT_NOT_HELD    FirmwareVerdict = 2 // no hold for this attempt and uuid
+	FirmwareVerdict_FIRMWARE_VERDICT_NOT_RUNNING FirmwareVerdict = 3 // the domain is absent or inactive
+	FirmwareVerdict_FIRMWARE_VERDICT_TARGET_RAN  FirmwareVerdict = 4 // the domain is active and running
+	FirmwareVerdict_FIRMWARE_VERDICT_MATCH       FirmwareVerdict = 5 // paused, and its state equals the source's
+	FirmwareVerdict_FIRMWARE_VERDICT_MISMATCH    FirmwareVerdict = 6 // paused, and its state differs or is missing
+)
+
+// Enum value maps for FirmwareVerdict.
+var (
+	FirmwareVerdict_name = map[int32]string{
+		0: "FIRMWARE_VERDICT_UNSPECIFIED",
+		1: "FIRMWARE_VERDICT_BAD_REQUEST",
+		2: "FIRMWARE_VERDICT_NOT_HELD",
+		3: "FIRMWARE_VERDICT_NOT_RUNNING",
+		4: "FIRMWARE_VERDICT_TARGET_RAN",
+		5: "FIRMWARE_VERDICT_MATCH",
+		6: "FIRMWARE_VERDICT_MISMATCH",
+	}
+	FirmwareVerdict_value = map[string]int32{
+		"FIRMWARE_VERDICT_UNSPECIFIED": 0,
+		"FIRMWARE_VERDICT_BAD_REQUEST": 1,
+		"FIRMWARE_VERDICT_NOT_HELD":    2,
+		"FIRMWARE_VERDICT_NOT_RUNNING": 3,
+		"FIRMWARE_VERDICT_TARGET_RAN":  4,
+		"FIRMWARE_VERDICT_MATCH":       5,
+		"FIRMWARE_VERDICT_MISMATCH":    6,
+	}
+)
+
+func (x FirmwareVerdict) Enum() *FirmwareVerdict {
+	p := new(FirmwareVerdict)
+	*p = x
+	return p
+}
+
+func (x FirmwareVerdict) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (FirmwareVerdict) Descriptor() protoreflect.EnumDescriptor {
+	return file_litevirt_v1_types_proto_enumTypes[6].Descriptor()
+}
+
+func (FirmwareVerdict) Type() protoreflect.EnumType {
+	return &file_litevirt_v1_types_proto_enumTypes[6]
+}
+
+func (x FirmwareVerdict) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use FirmwareVerdict.Descriptor instead.
+func (FirmwareVerdict) EnumDescriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{6}
+}
+
+// FirmwareAbortMode is when, and why, a source aborts a live firmware move's
+// target.
+type FirmwareAbortMode int32
+
+const (
+	FirmwareAbortMode_FIRMWARE_ABORT_MODE_UNSPECIFIED        FirmwareAbortMode = 0
+	FirmwareAbortMode_FIRMWARE_ABORT_MODE_PRE_CUTOVER        FirmwareAbortMode = 1 // the guest is still running on the source
+	FirmwareAbortMode_FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED FirmwareAbortMode = 2 // after cutover, the source drops the target's copy
+)
+
+// Enum value maps for FirmwareAbortMode.
+var (
+	FirmwareAbortMode_name = map[int32]string{
+		0: "FIRMWARE_ABORT_MODE_UNSPECIFIED",
+		1: "FIRMWARE_ABORT_MODE_PRE_CUTOVER",
+		2: "FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED",
+	}
+	FirmwareAbortMode_value = map[string]int32{
+		"FIRMWARE_ABORT_MODE_UNSPECIFIED":        0,
+		"FIRMWARE_ABORT_MODE_PRE_CUTOVER":        1,
+		"FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED": 2,
+	}
+)
+
+func (x FirmwareAbortMode) Enum() *FirmwareAbortMode {
+	p := new(FirmwareAbortMode)
+	*p = x
+	return p
+}
+
+func (x FirmwareAbortMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (FirmwareAbortMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_litevirt_v1_types_proto_enumTypes[7].Descriptor()
+}
+
+func (FirmwareAbortMode) Type() protoreflect.EnumType {
+	return &file_litevirt_v1_types_proto_enumTypes[7]
+}
+
+func (x FirmwareAbortMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use FirmwareAbortMode.Descriptor instead.
+func (FirmwareAbortMode) EnumDescriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{7}
+}
+
 type VMSpec struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -7008,6 +7121,218 @@ func (x *StoragePool) GetProject() string {
 	return ""
 }
 
+// FirmwareRuntime is the firmware code a host runs a live firmware move with:
+// the source reports the code its guest's processes run, the target its
+// installed code.
+type FirmwareRuntime struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	Libvirt             string                 `protobuf:"bytes,1,opt,name=libvirt,proto3" json:"libvirt,omitempty"`
+	Qemu                string                 `protobuf:"bytes,2,opt,name=qemu,proto3" json:"qemu,omitempty"`
+	Swtpm               string                 `protobuf:"bytes,3,opt,name=swtpm,proto3" json:"swtpm,omitempty"`
+	Libtpms             string                 `protobuf:"bytes,4,opt,name=libtpms,proto3" json:"libtpms,omitempty"`
+	OvmfFingerprint     string                 `protobuf:"bytes,5,opt,name=ovmf_fingerprint,json=ovmfFingerprint,proto3" json:"ovmf_fingerprint,omitempty"`                // the OVMF CODE file's content fingerprint
+	LiveFirmwareEnabled bool                   `protobuf:"varint,6,opt,name=live_firmware_enabled,json=liveFirmwareEnabled,proto3" json:"live_firmware_enabled,omitempty"` // migration.live_firmware on this host
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *FirmwareRuntime) Reset() {
+	*x = FirmwareRuntime{}
+	mi := &file_litevirt_v1_types_proto_msgTypes[65]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FirmwareRuntime) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FirmwareRuntime) ProtoMessage() {}
+
+func (x *FirmwareRuntime) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_types_proto_msgTypes[65]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FirmwareRuntime.ProtoReflect.Descriptor instead.
+func (*FirmwareRuntime) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{65}
+}
+
+func (x *FirmwareRuntime) GetLibvirt() string {
+	if x != nil {
+		return x.Libvirt
+	}
+	return ""
+}
+
+func (x *FirmwareRuntime) GetQemu() string {
+	if x != nil {
+		return x.Qemu
+	}
+	return ""
+}
+
+func (x *FirmwareRuntime) GetSwtpm() string {
+	if x != nil {
+		return x.Swtpm
+	}
+	return ""
+}
+
+func (x *FirmwareRuntime) GetLibtpms() string {
+	if x != nil {
+		return x.Libtpms
+	}
+	return ""
+}
+
+func (x *FirmwareRuntime) GetOvmfFingerprint() string {
+	if x != nil {
+		return x.OvmfFingerprint
+	}
+	return ""
+}
+
+func (x *FirmwareRuntime) GetLiveFirmwareEnabled() bool {
+	if x != nil {
+		return x.LiveFirmwareEnabled
+	}
+	return false
+}
+
+// FirmwareApplicability is which firmware state a VM carries, each side
+// deriving it from its own row: tpm (a vTPM) and uefi (a UEFI NVRAM that
+// carries Secure Boot or TPM state).
+type FirmwareApplicability struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tpm           bool                   `protobuf:"varint,1,opt,name=tpm,proto3" json:"tpm,omitempty"`
+	Uefi          bool                   `protobuf:"varint,2,opt,name=uefi,proto3" json:"uefi,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FirmwareApplicability) Reset() {
+	*x = FirmwareApplicability{}
+	mi := &file_litevirt_v1_types_proto_msgTypes[66]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FirmwareApplicability) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FirmwareApplicability) ProtoMessage() {}
+
+func (x *FirmwareApplicability) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_types_proto_msgTypes[66]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FirmwareApplicability.ProtoReflect.Descriptor instead.
+func (*FirmwareApplicability) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{66}
+}
+
+func (x *FirmwareApplicability) GetTpm() bool {
+	if x != nil {
+		return x.Tpm
+	}
+	return false
+}
+
+func (x *FirmwareApplicability) GetUefi() bool {
+	if x != nil {
+		return x.Uefi
+	}
+	return false
+}
+
+// TargetDomain is what the target host's libvirt holds for the VM's name,
+// read when the target answers.
+type TargetDomain struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Present       bool                   `protobuf:"varint,1,opt,name=present,proto3" json:"present,omitempty"`
+	State         string                 `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`   // libvirt state: running | paused | shutoff | ...; empty when not present
+	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"` // libvirt state reason; empty when not present
+	Uuid          string                 `protobuf:"bytes,4,opt,name=uuid,proto3" json:"uuid,omitempty"`     // the domain's uuid; empty when not present
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TargetDomain) Reset() {
+	*x = TargetDomain{}
+	mi := &file_litevirt_v1_types_proto_msgTypes[67]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetDomain) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetDomain) ProtoMessage() {}
+
+func (x *TargetDomain) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_types_proto_msgTypes[67]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetDomain.ProtoReflect.Descriptor instead.
+func (*TargetDomain) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{67}
+}
+
+func (x *TargetDomain) GetPresent() bool {
+	if x != nil {
+		return x.Present
+	}
+	return false
+}
+
+func (x *TargetDomain) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *TargetDomain) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *TargetDomain) GetUuid() string {
+	if x != nil {
+		return x.Uuid
+	}
+	return ""
+}
+
 var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
@@ -7701,7 +8026,22 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\n" +
 	" \x01(\x03R\tusedBytes\x12\x18\n" +
-	"\aproject\x18\v \x01(\tR\aproject*\x9b\x01\n" +
+	"\aproject\x18\v \x01(\tR\aproject\"\xce\x01\n" +
+	"\x0fFirmwareRuntime\x12\x18\n" +
+	"\alibvirt\x18\x01 \x01(\tR\alibvirt\x12\x12\n" +
+	"\x04qemu\x18\x02 \x01(\tR\x04qemu\x12\x14\n" +
+	"\x05swtpm\x18\x03 \x01(\tR\x05swtpm\x12\x18\n" +
+	"\alibtpms\x18\x04 \x01(\tR\alibtpms\x12)\n" +
+	"\x10ovmf_fingerprint\x18\x05 \x01(\tR\x0fovmfFingerprint\x122\n" +
+	"\x15live_firmware_enabled\x18\x06 \x01(\bR\x13liveFirmwareEnabled\"=\n" +
+	"\x15FirmwareApplicability\x12\x10\n" +
+	"\x03tpm\x18\x01 \x01(\bR\x03tpm\x12\x12\n" +
+	"\x04uefi\x18\x02 \x01(\bR\x04uefi\"j\n" +
+	"\fTargetDomain\x12\x18\n" +
+	"\apresent\x18\x01 \x01(\bR\apresent\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x12\n" +
+	"\x04uuid\x18\x04 \x01(\tR\x04uuid*\x9b\x01\n" +
 	"\aVMState\x12\x0f\n" +
 	"\vVM_CREATING\x10\x00\x12\x0f\n" +
 	"\vVM_STARTING\x10\x01\x12\x0e\n" +
@@ -7743,7 +8083,19 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0fMIGRATE_CUTOVER\x10\x04\x12\x16\n" +
 	"\x12MIGRATE_COMPLETING\x10\x05\x12\x10\n" +
 	"\fMIGRATE_DONE\x10\x06\x12\x12\n" +
-	"\x0eMIGRATE_FAILED\x10\aB9Z7github.com/litevirt/litevirt/gen/litevirt/v1;litevirtv1b\x06proto3"
+	"\x0eMIGRATE_FAILED\x10\a*\xf2\x01\n" +
+	"\x0fFirmwareVerdict\x12 \n" +
+	"\x1cFIRMWARE_VERDICT_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cFIRMWARE_VERDICT_BAD_REQUEST\x10\x01\x12\x1d\n" +
+	"\x19FIRMWARE_VERDICT_NOT_HELD\x10\x02\x12 \n" +
+	"\x1cFIRMWARE_VERDICT_NOT_RUNNING\x10\x03\x12\x1f\n" +
+	"\x1bFIRMWARE_VERDICT_TARGET_RAN\x10\x04\x12\x1a\n" +
+	"\x16FIRMWARE_VERDICT_MATCH\x10\x05\x12\x1d\n" +
+	"\x19FIRMWARE_VERDICT_MISMATCH\x10\x06*\x89\x01\n" +
+	"\x11FirmwareAbortMode\x12#\n" +
+	"\x1fFIRMWARE_ABORT_MODE_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fFIRMWARE_ABORT_MODE_PRE_CUTOVER\x10\x01\x12*\n" +
+	"&FIRMWARE_ABORT_MODE_DISCARD_UNVERIFIED\x10\x02B9Z7github.com/litevirt/litevirt/gen/litevirt/v1;litevirtv1b\x06proto3"
 
 var (
 	file_litevirt_v1_types_proto_rawDescOnce sync.Once
@@ -7757,8 +8109,8 @@ func file_litevirt_v1_types_proto_rawDescGZIP() []byte {
 	return file_litevirt_v1_types_proto_rawDescData
 }
 
-var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 71)
+var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 74)
 var file_litevirt_v1_types_proto_goTypes = []any{
 	(VMState)(0),                   // 0: litevirt.v1.VMState
 	(HostState)(0),                 // 1: litevirt.v1.HostState
@@ -7766,141 +8118,146 @@ var file_litevirt_v1_types_proto_goTypes = []any{
 	(HostFailurePolicy)(0),         // 3: litevirt.v1.HostFailurePolicy
 	(DiffOp)(0),                    // 4: litevirt.v1.DiffOp
 	(MigratePhase)(0),              // 5: litevirt.v1.MigratePhase
-	(*VMSpec)(nil),                 // 6: litevirt.v1.VMSpec
-	(*USBDeviceSpec)(nil),          // 7: litevirt.v1.USBDeviceSpec
-	(*DiskSpec)(nil),               // 8: litevirt.v1.DiskSpec
-	(*DiskIOLimits)(nil),           // 9: litevirt.v1.DiskIOLimits
-	(*NetworkAttachment)(nil),      // 10: litevirt.v1.NetworkAttachment
-	(*CloudInitSpec)(nil),          // 11: litevirt.v1.CloudInitSpec
-	(*PlacementSpec)(nil),          // 12: litevirt.v1.PlacementSpec
-	(*RebalanceSpec)(nil),          // 13: litevirt.v1.RebalanceSpec
-	(*RebalanceBudget)(nil),        // 14: litevirt.v1.RebalanceBudget
-	(*MigrationPolicy)(nil),        // 15: litevirt.v1.MigrationPolicy
-	(*UpdatePolicy)(nil),           // 16: litevirt.v1.UpdatePolicy
-	(*ResourceTuning)(nil),         // 17: litevirt.v1.ResourceTuning
-	(*NUMAPolicy)(nil),             // 18: litevirt.v1.NUMAPolicy
-	(*HealthCheckSpec)(nil),        // 19: litevirt.v1.HealthCheckSpec
-	(*HooksSpec)(nil),              // 20: litevirt.v1.HooksSpec
-	(*LBSpec)(nil),                 // 21: litevirt.v1.LBSpec
-	(*LBPort)(nil),                 // 22: litevirt.v1.LBPort
-	(*LBTlsSpec)(nil),              // 23: litevirt.v1.LBTlsSpec
-	(*LBHealthSpec)(nil),           // 24: litevirt.v1.LBHealthSpec
-	(*RestartPolicy)(nil),          // 25: litevirt.v1.RestartPolicy
-	(*DeviceSpec)(nil),             // 26: litevirt.v1.DeviceSpec
-	(*ResourceMappingDevice)(nil),  // 27: litevirt.v1.ResourceMappingDevice
-	(*ResourceMapping)(nil),        // 28: litevirt.v1.ResourceMapping
-	(*NotificationTarget)(nil),     // 29: litevirt.v1.NotificationTarget
-	(*NotificationRoute)(nil),      // 30: litevirt.v1.NotificationRoute
-	(*FirewallRule)(nil),           // 31: litevirt.v1.FirewallRule
-	(*IpSet)(nil),                  // 32: litevirt.v1.IpSet
-	(*FirewallDefault)(nil),        // 33: litevirt.v1.FirewallDefault
-	(*SecurityGroup)(nil),          // 34: litevirt.v1.SecurityGroup
-	(*SecurityGroupRule)(nil),      // 35: litevirt.v1.SecurityGroupRule
-	(*FirewallSynfloodPolicy)(nil), // 36: litevirt.v1.FirewallSynfloodPolicy
-	(*FirewallLogPolicy)(nil),      // 37: litevirt.v1.FirewallLogPolicy
-	(*FirewallLogEntry)(nil),       // 38: litevirt.v1.FirewallLogEntry
-	(*FirewallTagGroup)(nil),       // 39: litevirt.v1.FirewallTagGroup
-	(*FirewallTagMember)(nil),      // 40: litevirt.v1.FirewallTagMember
-	(*FirewallTags)(nil),           // 41: litevirt.v1.FirewallTags
-	(*PCIDevice)(nil),              // 42: litevirt.v1.PCIDevice
-	(*AttachDeviceRequest)(nil),    // 43: litevirt.v1.AttachDeviceRequest
-	(*DetachDeviceRequest)(nil),    // 44: litevirt.v1.DetachDeviceRequest
-	(*VM)(nil),                     // 45: litevirt.v1.VM
-	(*VMStrandedDisk)(nil),         // 46: litevirt.v1.VMStrandedDisk
-	(*VMInterface)(nil),            // 47: litevirt.v1.VMInterface
-	(*VMDisk)(nil),                 // 48: litevirt.v1.VMDisk
-	(*HardwareDevice)(nil),         // 49: litevirt.v1.HardwareDevice
-	(*HardwareDisk)(nil),           // 50: litevirt.v1.HardwareDisk
-	(*HardwareNIC)(nil),            // 51: litevirt.v1.HardwareNIC
-	(*HardwarePCIMember)(nil),      // 52: litevirt.v1.HardwarePCIMember
-	(*HardwarePCI)(nil),            // 53: litevirt.v1.HardwarePCI
-	(*Host)(nil),                   // 54: litevirt.v1.Host
-	(*Image)(nil),                  // 55: litevirt.v1.Image
-	(*Snapshot)(nil),               // 56: litevirt.v1.Snapshot
-	(*User)(nil),                   // 57: litevirt.v1.User
-	(*Token)(nil),                  // 58: litevirt.v1.Token
-	(*LoadBalancer)(nil),           // 59: litevirt.v1.LoadBalancer
-	(*LBBackend)(nil),              // 60: litevirt.v1.LBBackend
-	(*LBBackendAddress)(nil),       // 61: litevirt.v1.LBBackendAddress
-	(*LBBackendStats)(nil),         // 62: litevirt.v1.LBBackendStats
-	(*LBFrontendStats)(nil),        // 63: litevirt.v1.LBFrontendStats
-	(*LBStatsResponse)(nil),        // 64: litevirt.v1.LBStatsResponse
-	(*LBKeepalivedRequest)(nil),    // 65: litevirt.v1.LBKeepalivedRequest
-	(*LBKeepalivedResponse)(nil),   // 66: litevirt.v1.LBKeepalivedResponse
-	(*VMStats)(nil),                // 67: litevirt.v1.VMStats
-	(*HostResourceStats)(nil),      // 68: litevirt.v1.HostResourceStats
-	(*ClusterEvent)(nil),           // 69: litevirt.v1.ClusterEvent
-	(*StoragePool)(nil),            // 70: litevirt.v1.StoragePool
-	nil,                            // 71: litevirt.v1.VMSpec.LabelsEntry
-	nil,                            // 72: litevirt.v1.PlacementSpec.RequireEntry
-	nil,                            // 73: litevirt.v1.PlacementSpec.PreferEntry
-	nil,                            // 74: litevirt.v1.FirewallTagGroup.MatchEntry
-	nil,                            // 75: litevirt.v1.FirewallTags.TagsEntry
-	nil,                            // 76: litevirt.v1.Host.LabelsEntry
-	(*timestamppb.Timestamp)(nil),  // 77: google.protobuf.Timestamp
+	(FirmwareVerdict)(0),           // 6: litevirt.v1.FirmwareVerdict
+	(FirmwareAbortMode)(0),         // 7: litevirt.v1.FirmwareAbortMode
+	(*VMSpec)(nil),                 // 8: litevirt.v1.VMSpec
+	(*USBDeviceSpec)(nil),          // 9: litevirt.v1.USBDeviceSpec
+	(*DiskSpec)(nil),               // 10: litevirt.v1.DiskSpec
+	(*DiskIOLimits)(nil),           // 11: litevirt.v1.DiskIOLimits
+	(*NetworkAttachment)(nil),      // 12: litevirt.v1.NetworkAttachment
+	(*CloudInitSpec)(nil),          // 13: litevirt.v1.CloudInitSpec
+	(*PlacementSpec)(nil),          // 14: litevirt.v1.PlacementSpec
+	(*RebalanceSpec)(nil),          // 15: litevirt.v1.RebalanceSpec
+	(*RebalanceBudget)(nil),        // 16: litevirt.v1.RebalanceBudget
+	(*MigrationPolicy)(nil),        // 17: litevirt.v1.MigrationPolicy
+	(*UpdatePolicy)(nil),           // 18: litevirt.v1.UpdatePolicy
+	(*ResourceTuning)(nil),         // 19: litevirt.v1.ResourceTuning
+	(*NUMAPolicy)(nil),             // 20: litevirt.v1.NUMAPolicy
+	(*HealthCheckSpec)(nil),        // 21: litevirt.v1.HealthCheckSpec
+	(*HooksSpec)(nil),              // 22: litevirt.v1.HooksSpec
+	(*LBSpec)(nil),                 // 23: litevirt.v1.LBSpec
+	(*LBPort)(nil),                 // 24: litevirt.v1.LBPort
+	(*LBTlsSpec)(nil),              // 25: litevirt.v1.LBTlsSpec
+	(*LBHealthSpec)(nil),           // 26: litevirt.v1.LBHealthSpec
+	(*RestartPolicy)(nil),          // 27: litevirt.v1.RestartPolicy
+	(*DeviceSpec)(nil),             // 28: litevirt.v1.DeviceSpec
+	(*ResourceMappingDevice)(nil),  // 29: litevirt.v1.ResourceMappingDevice
+	(*ResourceMapping)(nil),        // 30: litevirt.v1.ResourceMapping
+	(*NotificationTarget)(nil),     // 31: litevirt.v1.NotificationTarget
+	(*NotificationRoute)(nil),      // 32: litevirt.v1.NotificationRoute
+	(*FirewallRule)(nil),           // 33: litevirt.v1.FirewallRule
+	(*IpSet)(nil),                  // 34: litevirt.v1.IpSet
+	(*FirewallDefault)(nil),        // 35: litevirt.v1.FirewallDefault
+	(*SecurityGroup)(nil),          // 36: litevirt.v1.SecurityGroup
+	(*SecurityGroupRule)(nil),      // 37: litevirt.v1.SecurityGroupRule
+	(*FirewallSynfloodPolicy)(nil), // 38: litevirt.v1.FirewallSynfloodPolicy
+	(*FirewallLogPolicy)(nil),      // 39: litevirt.v1.FirewallLogPolicy
+	(*FirewallLogEntry)(nil),       // 40: litevirt.v1.FirewallLogEntry
+	(*FirewallTagGroup)(nil),       // 41: litevirt.v1.FirewallTagGroup
+	(*FirewallTagMember)(nil),      // 42: litevirt.v1.FirewallTagMember
+	(*FirewallTags)(nil),           // 43: litevirt.v1.FirewallTags
+	(*PCIDevice)(nil),              // 44: litevirt.v1.PCIDevice
+	(*AttachDeviceRequest)(nil),    // 45: litevirt.v1.AttachDeviceRequest
+	(*DetachDeviceRequest)(nil),    // 46: litevirt.v1.DetachDeviceRequest
+	(*VM)(nil),                     // 47: litevirt.v1.VM
+	(*VMStrandedDisk)(nil),         // 48: litevirt.v1.VMStrandedDisk
+	(*VMInterface)(nil),            // 49: litevirt.v1.VMInterface
+	(*VMDisk)(nil),                 // 50: litevirt.v1.VMDisk
+	(*HardwareDevice)(nil),         // 51: litevirt.v1.HardwareDevice
+	(*HardwareDisk)(nil),           // 52: litevirt.v1.HardwareDisk
+	(*HardwareNIC)(nil),            // 53: litevirt.v1.HardwareNIC
+	(*HardwarePCIMember)(nil),      // 54: litevirt.v1.HardwarePCIMember
+	(*HardwarePCI)(nil),            // 55: litevirt.v1.HardwarePCI
+	(*Host)(nil),                   // 56: litevirt.v1.Host
+	(*Image)(nil),                  // 57: litevirt.v1.Image
+	(*Snapshot)(nil),               // 58: litevirt.v1.Snapshot
+	(*User)(nil),                   // 59: litevirt.v1.User
+	(*Token)(nil),                  // 60: litevirt.v1.Token
+	(*LoadBalancer)(nil),           // 61: litevirt.v1.LoadBalancer
+	(*LBBackend)(nil),              // 62: litevirt.v1.LBBackend
+	(*LBBackendAddress)(nil),       // 63: litevirt.v1.LBBackendAddress
+	(*LBBackendStats)(nil),         // 64: litevirt.v1.LBBackendStats
+	(*LBFrontendStats)(nil),        // 65: litevirt.v1.LBFrontendStats
+	(*LBStatsResponse)(nil),        // 66: litevirt.v1.LBStatsResponse
+	(*LBKeepalivedRequest)(nil),    // 67: litevirt.v1.LBKeepalivedRequest
+	(*LBKeepalivedResponse)(nil),   // 68: litevirt.v1.LBKeepalivedResponse
+	(*VMStats)(nil),                // 69: litevirt.v1.VMStats
+	(*HostResourceStats)(nil),      // 70: litevirt.v1.HostResourceStats
+	(*ClusterEvent)(nil),           // 71: litevirt.v1.ClusterEvent
+	(*StoragePool)(nil),            // 72: litevirt.v1.StoragePool
+	(*FirmwareRuntime)(nil),        // 73: litevirt.v1.FirmwareRuntime
+	(*FirmwareApplicability)(nil),  // 74: litevirt.v1.FirmwareApplicability
+	(*TargetDomain)(nil),           // 75: litevirt.v1.TargetDomain
+	nil,                            // 76: litevirt.v1.VMSpec.LabelsEntry
+	nil,                            // 77: litevirt.v1.PlacementSpec.RequireEntry
+	nil,                            // 78: litevirt.v1.PlacementSpec.PreferEntry
+	nil,                            // 79: litevirt.v1.FirewallTagGroup.MatchEntry
+	nil,                            // 80: litevirt.v1.FirewallTags.TagsEntry
+	nil,                            // 81: litevirt.v1.Host.LabelsEntry
+	(*timestamppb.Timestamp)(nil),  // 82: google.protobuf.Timestamp
 }
 var file_litevirt_v1_types_proto_depIdxs = []int32{
-	8,  // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
-	10, // 1: litevirt.v1.VMSpec.network:type_name -> litevirt.v1.NetworkAttachment
-	11, // 2: litevirt.v1.VMSpec.cloud_init:type_name -> litevirt.v1.CloudInitSpec
-	12, // 3: litevirt.v1.VMSpec.placement:type_name -> litevirt.v1.PlacementSpec
-	15, // 4: litevirt.v1.VMSpec.migrate:type_name -> litevirt.v1.MigrationPolicy
-	16, // 5: litevirt.v1.VMSpec.update:type_name -> litevirt.v1.UpdatePolicy
-	17, // 6: litevirt.v1.VMSpec.resources:type_name -> litevirt.v1.ResourceTuning
-	19, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
-	20, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
-	21, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
-	71, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
-	26, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
-	25, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
-	7,  // 13: litevirt.v1.VMSpec.usb_devices:type_name -> litevirt.v1.USBDeviceSpec
-	9,  // 14: litevirt.v1.DiskSpec.io:type_name -> litevirt.v1.DiskIOLimits
-	72, // 15: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
-	73, // 16: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
-	13, // 17: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
-	14, // 18: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
+	10, // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
+	12, // 1: litevirt.v1.VMSpec.network:type_name -> litevirt.v1.NetworkAttachment
+	13, // 2: litevirt.v1.VMSpec.cloud_init:type_name -> litevirt.v1.CloudInitSpec
+	14, // 3: litevirt.v1.VMSpec.placement:type_name -> litevirt.v1.PlacementSpec
+	17, // 4: litevirt.v1.VMSpec.migrate:type_name -> litevirt.v1.MigrationPolicy
+	18, // 5: litevirt.v1.VMSpec.update:type_name -> litevirt.v1.UpdatePolicy
+	19, // 6: litevirt.v1.VMSpec.resources:type_name -> litevirt.v1.ResourceTuning
+	21, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
+	22, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
+	23, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
+	76, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
+	28, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
+	27, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
+	9,  // 13: litevirt.v1.VMSpec.usb_devices:type_name -> litevirt.v1.USBDeviceSpec
+	11, // 14: litevirt.v1.DiskSpec.io:type_name -> litevirt.v1.DiskIOLimits
+	77, // 15: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
+	78, // 16: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
+	15, // 17: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
+	16, // 18: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
 	2,  // 19: litevirt.v1.MigrationPolicy.strategy:type_name -> litevirt.v1.MigrateStrategy
 	3,  // 20: litevirt.v1.MigrationPolicy.on_host_failure:type_name -> litevirt.v1.HostFailurePolicy
-	18, // 21: litevirt.v1.ResourceTuning.numa_policy:type_name -> litevirt.v1.NUMAPolicy
-	22, // 22: litevirt.v1.LBSpec.ports:type_name -> litevirt.v1.LBPort
-	24, // 23: litevirt.v1.LBSpec.health:type_name -> litevirt.v1.LBHealthSpec
-	23, // 24: litevirt.v1.LBPort.tls:type_name -> litevirt.v1.LBTlsSpec
-	27, // 25: litevirt.v1.ResourceMapping.devices:type_name -> litevirt.v1.ResourceMappingDevice
-	74, // 26: litevirt.v1.FirewallTagGroup.match:type_name -> litevirt.v1.FirewallTagGroup.MatchEntry
-	40, // 27: litevirt.v1.FirewallTagGroup.members:type_name -> litevirt.v1.FirewallTagMember
-	75, // 28: litevirt.v1.FirewallTags.tags:type_name -> litevirt.v1.FirewallTags.TagsEntry
-	8,  // 29: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
-	10, // 30: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
-	26, // 31: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
-	6,  // 32: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
+	20, // 21: litevirt.v1.ResourceTuning.numa_policy:type_name -> litevirt.v1.NUMAPolicy
+	24, // 22: litevirt.v1.LBSpec.ports:type_name -> litevirt.v1.LBPort
+	26, // 23: litevirt.v1.LBSpec.health:type_name -> litevirt.v1.LBHealthSpec
+	25, // 24: litevirt.v1.LBPort.tls:type_name -> litevirt.v1.LBTlsSpec
+	29, // 25: litevirt.v1.ResourceMapping.devices:type_name -> litevirt.v1.ResourceMappingDevice
+	79, // 26: litevirt.v1.FirewallTagGroup.match:type_name -> litevirt.v1.FirewallTagGroup.MatchEntry
+	42, // 27: litevirt.v1.FirewallTagGroup.members:type_name -> litevirt.v1.FirewallTagMember
+	80, // 28: litevirt.v1.FirewallTags.tags:type_name -> litevirt.v1.FirewallTags.TagsEntry
+	10, // 29: litevirt.v1.AttachDeviceRequest.disk:type_name -> litevirt.v1.DiskSpec
+	12, // 30: litevirt.v1.AttachDeviceRequest.nic:type_name -> litevirt.v1.NetworkAttachment
+	28, // 31: litevirt.v1.AttachDeviceRequest.pci_device:type_name -> litevirt.v1.DeviceSpec
+	8,  // 32: litevirt.v1.VM.spec:type_name -> litevirt.v1.VMSpec
 	0,  // 33: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
-	47, // 34: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
-	48, // 35: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
-	77, // 36: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
-	77, // 37: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
-	46, // 38: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
-	50, // 39: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
-	51, // 40: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
-	53, // 41: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
-	26, // 42: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
-	52, // 43: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
+	49, // 34: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
+	50, // 35: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
+	82, // 36: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
+	82, // 37: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
+	48, // 38: litevirt.v1.VM.stranded_disks:type_name -> litevirt.v1.VMStrandedDisk
+	52, // 39: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
+	53, // 40: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
+	55, // 41: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
+	28, // 42: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
+	54, // 43: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
 	1,  // 44: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
-	76, // 45: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
-	77, // 46: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
-	77, // 47: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
-	42, // 48: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
-	70, // 49: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
-	77, // 50: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
-	77, // 51: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
-	77, // 52: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	77, // 53: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
-	77, // 54: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
-	60, // 55: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
-	22, // 56: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
-	63, // 57: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
-	62, // 58: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
-	67, // 59: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
-	77, // 60: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
+	81, // 45: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
+	82, // 46: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
+	82, // 47: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
+	44, // 48: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
+	72, // 49: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
+	82, // 50: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
+	82, // 51: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
+	82, // 52: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	82, // 53: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
+	82, // 54: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
+	62, // 55: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
+	24, // 56: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
+	65, // 57: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
+	64, // 58: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
+	69, // 59: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
+	82, // 60: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
 	61, // [61:61] is the sub-list for method output_type
 	61, // [61:61] is the sub-list for method input_type
 	61, // [61:61] is the sub-list for extension type_name
@@ -7923,8 +8280,8 @@ func file_litevirt_v1_types_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_types_proto_rawDesc), len(file_litevirt_v1_types_proto_rawDesc)),
-			NumEnums:      6,
-			NumMessages:   71,
+			NumEnums:      8,
+			NumMessages:   74,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

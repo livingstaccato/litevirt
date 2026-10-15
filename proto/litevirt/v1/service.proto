@@ -3698,6 +3698,83 @@ message RollbackFirmwareStateResponse {
     bool removed = 1;
 }
 
+// The live firmware migration RPCs move a running vTPM / Secure Boot VM. All
+// four are peer only, from the source to the target, and every response
+// carries the target's domain. An older target answers Unimplemented.
+
+// PrepareLiveFirmwareTargetRequest asks the target to hold a live firmware
+// move of attempt_id: it checks its own runtime and the VM's applicability
+// against the source's, records the hold and materialises the NVRAM.
+message PrepareLiveFirmwareTargetRequest {
+    string                vm_name              = 1;
+    string                uuid                 = 2;  // the VM's domain uuid
+    string                created_at           = 3;  // the row's incarnation
+    string                attempt_id           = 4;
+    uint32                protocol_version     = 5;  // 1
+    FirmwareRuntime       src_runtime          = 6;
+    FirmwareApplicability src_applicability    = 7;
+    bool                  source_domain_active = 8;  // the source checked its domain is active
+    bytes                 nvram                = 9;  // the source NVRAM; UEFI only
+}
+message PrepareLiveFirmwareTargetResponse {
+    FirmwareRuntime       dst_runtime       = 1;
+    FirmwareApplicability dst_applicability = 2;
+    bool                  swtpm_absent      = 3;  // no swtpm state for the uuid was here at prepare
+    TargetDomain          target_domain     = 4;
+}
+
+// VerifyLiveFirmwareTargetRequest asks the target, after cutover, whether the
+// paused guest's TPM state equals the source's final state. Reads only.
+message VerifyLiveFirmwareTargetRequest {
+    string vm_name            = 1;
+    string uuid               = 2;
+    string attempt_id         = 3;
+    string src_permall_sha256 = 4;  // empty when the VM has no vTPM
+}
+message VerifyLiveFirmwareTargetResponse {
+    FirmwareVerdict verdict            = 1;
+    string          dst_permall_sha256 = 2;
+    TargetDomain    target_domain      = 3;
+    string          detail             = 4;
+}
+
+// ReleaseLiveFirmwareTargetRequest hands the verified guest over: the target
+// puts its NIC firewall in force, resumes it and confirms its NVRAM.
+message ReleaseLiveFirmwareTargetRequest {
+    string vm_name          = 1;
+    string uuid             = 2;
+    string attempt_id       = 3;
+    string src_nvram_sha256 = 4;  // the source's final NVRAM hash; UEFI only
+    bytes  nvram_final      = 5;  // the source's final NVRAM; UEFI only
+    string created_at       = 6;  // the row's incarnation (an idempotent retry with no hold)
+}
+message ReleaseLiveFirmwareTargetResponse {
+    string          nvram_sha256    = 1;
+    bool            nvram_confirmed = 2;  // the target's NVRAM equalled src_nvram_sha256
+    TargetDomain    target_domain   = 3;
+    FirmwareVerdict verdict         = 4;  // BAD_REQUEST or TARGET_RAN when the release refused
+    string          detail          = 5;
+}
+
+// AbortLiveFirmwareTargetRequest drops the target's hold of attempt_id. It
+// binds to the hold: uuid, created_at and attempt_id must equal the hold's.
+// With no hold for the attempt it answers OK and touches nothing.
+message AbortLiveFirmwareTargetRequest {
+    string            vm_name              = 1;
+    string            uuid                 = 2;
+    string            created_at           = 3;
+    string            attempt_id           = 4;
+    FirmwareAbortMode mode                 = 5;
+    bool              source_domain_active = 6;
+    repeated string   created_stubs        = 7;  // stub disks the move created on the target
+}
+message AbortLiveFirmwareTargetResponse {
+    TargetDomain target_domain = 1;
+    string       hold_state    = 2;  // the hold's state when the abort refused; empty with no hold
+    bool         refused       = 3;  // the hold was kept
+    string       detail        = 4;
+}
+
 // ReceiveMigrationDiskRequest is one frame of a cold migration's disk copy: a
 // STOPPED VM's host-local disk file, streamed by the source to the target over
 // the peer connection. The first frame is a header (vm_name, path, size_bytes)
@@ -4692,6 +4769,12 @@ service LiteVirt {
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (EnsureFirmwareStateResponse);
     rpc RollbackFirmwareState(RollbackFirmwareStateRequest) returns (RollbackFirmwareStateResponse);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
+    // Live firmware migration (peer only): see PrepareLiveFirmwareTargetRequest
+    // and the three after it.
+    rpc PrepareLiveFirmwareTarget(PrepareLiveFirmwareTargetRequest) returns (PrepareLiveFirmwareTargetResponse);
+    rpc VerifyLiveFirmwareTarget(VerifyLiveFirmwareTargetRequest)   returns (VerifyLiveFirmwareTargetResponse);
+    rpc ReleaseLiveFirmwareTarget(ReleaseLiveFirmwareTargetRequest) returns (ReleaseLiveFirmwareTargetResponse);
+    rpc AbortLiveFirmwareTarget(AbortLiveFirmwareTargetRequest)     returns (AbortLiveFirmwareTargetResponse);
     // ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
     // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
     rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);

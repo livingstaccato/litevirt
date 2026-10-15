@@ -444,7 +444,7 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	//    (host_name, name), and two unrelated containers named "web" on two hosts
 	//    are a legitimate steady state. Multiple runtime holders alone therefore
 	//    prove nothing, and paging them critical would freeze admission on BOTH
-	//    hosts (ct_dual_run is admission-gating, with no operator force-clear).
+	//    hosts (ct_dual_run is admission-gating, and re-raised every pass it holds).
 	//    A holder is LEGITIMATE when its own host's DB row backs it — present and
 	//    not marked as relocating away. The dual-run signal is a same-named copy
 	//    running where NO row claims it while the name also runs elsewhere:
@@ -669,9 +669,8 @@ func (s *Server) dualRunPass(ctx context.Context, observeOnly bool) {
 	// — ListDomains, DomainState and DumpXML take no context — so a leader
 	// wedged on hung storage can outlive its own lease by minutes and then
 	// finish against a snapshot taken before the stall. The conditions written
-	// here gate admission and have no operator force-clear, so a stale pass
-	// could RESOLVE a dual-run its successor had confirmed and re-open
-	// admission to a split-brained host.
+	// here gate admission, so a stale pass could RESOLVE a dual-run its
+	// successor had confirmed and re-open admission to a split-brained host.
 	//
 	// The term is the right test rather than holder identity, because
 	// AcquireLeaseWithTerm already treats a lease that lapsed and was re-taken

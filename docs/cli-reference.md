@@ -92,6 +92,8 @@ lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.leg
                                    #   legacy proof stuck in flight on a live destination; the
                                    #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]  # Resolve one open dual-run
+                                   #   condition by hand (admin, audited); re-raised next pass if it still holds
 ```
 
 ## Hosts
@@ -1407,6 +1409,11 @@ lv health [--resolved]                       # Cluster health: overall state, ac
                                              #   evaluator coverage, connectivity, capacity.
                                              #   --resolved includes the 30-day resolved history.
                                              #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
+lv health resolve <code> <kind>/<id> [--reason R] [--evaluator E]
+                                             # Resolve one open dual-run condition by hand, named as
+                                             #   `lv health` prints it. Admin (cluster.health.resolve),
+                                             #   audited, ha.condition.resolved event. The detector raises
+                                             #   it again on its next pass if it still holds.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since <time>] [--until <time>]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

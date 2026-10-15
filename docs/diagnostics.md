@@ -1159,8 +1159,16 @@ observed → confirmed → resolved lifecycle:
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
-- there is **no force-clear**: remove the cause, and the evaluator proves
-  the resolution.
+- remove the cause, and the evaluator proves the resolution. For a
+  condition it can no longer prove, an admin can resolve it by hand:
+  `lv health resolve <code> <kind>/<id> --reason "..."`, with the code and
+  subject as `lv health` prints them. Only the dual-run detector's
+  conditions can be resolved this way. It needs the `cluster.health.resolve`
+  verb (Admin), writes a `health.condition.resolve` audit row with your
+  principal and reason, and publishes `ha.condition.resolved`. It proves
+  nothing: the detector re-derives its findings every pass, so a condition
+  that still holds is raised again, observed and gating admission, on the
+  next one.
 
 `lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
 UNKNOWN), every active condition with its involved hosts, evaluator

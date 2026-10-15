@@ -40,8 +40,10 @@ import (
 //     nothing about absence. Coverage is judged PER CONDITION (see
 //     dualrun_resolve_coverage.go), so a host dead since before a VM existed
 //     does not hold that VM's condition open;
-//   - there is no operator force-clear: operators remove the cause, the
-//     evaluator proves the resolution.
+//   - operators remove the cause, the evaluator proves the resolution. An
+//     admin may resolve a row by hand (ResolveHealthCondition, audited); it
+//     proves nothing, and a finding that still holds is raised again by the
+//     next pass, as a new observed row.
 
 // dualRunEvaluator is this detector's evaluator name in health_conditions /
 // health_evaluator_status.

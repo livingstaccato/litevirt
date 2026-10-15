@@ -993,6 +993,18 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				nicIP = ip
 				dhcpReserved[i] = true
 			}
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); n.Ip == "" && hostIsolatedAddressable(def) {
+			// A host-isolated network runs no DHCP server, so the address is
+			// litevirt's to give: recorded on the NIC row here, delivered to
+			// the guest by the seed's network-config below (docs/compose.md,
+			// "Host isolation"). A NIC that cannot be given one is created as
+			// it always was, with no address, rather than refused.
+			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def); ierr != nil {
+				slog.Warn("host-isolated network: no address for the NIC; the guest gets none",
+					"vm", spec.Name, "network", n.Name, "error", ierr)
+			} else {
+				nicIP = ip
+			}
 		}
 
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -1042,11 +1054,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Build cloud-init network-config for interfaces with static IPs.
-	// Applies to any network type (bridge, vxlan, isolated) where the compose
-	// specifies an explicit IP. Uses V1 format for distro-agnostic MAC matching.
+	// Build the seed's cloud-init network-config: every NIC by MAC, static
+	// where it has an address (an explicit `ip:`, a NetBox claim, a
+	// host-isolated network's address), DHCP where it has none. See
+	// guestNetworkConfig for which VMs get none at all, as before.
 	var staticNetCfg string
-	var staticIfaces []isolatedIface
+	var guestNICs []guestNIC
 	for i, n := range spec.Network {
 		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
 		ip := n.Ip
@@ -1054,16 +1067,17 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			ip = ifaceRecords[i].IP
 		}
 
-		// Skip interfaces without a static IP unless host-isolated (which
-		// always needs cloud-init config to avoid DHCP).
+		mac := ""
+		if i < len(ifaceRecords) {
+			mac = ifaceRecords[i].MAC
+		}
+
+		// No static address: the guest asks DHCP — except on a host-isolated
+		// network, which serves none, so there is nothing to configure (its
+		// NICs get an address above whenever the network has a subnet).
 		if ip == "" {
-			continue
-		}
-		needsConfig := ip != "" // explicit static IP in compose
-		if netDef != nil && netDef.HostIsolation {
-			needsConfig = true
-		}
-		if !needsConfig {
+			guestNICs = append(guestNICs, guestNIC{Ordinal: i, MAC: mac,
+				DHCP: netDef == nil || !netDef.HostIsolation})
 			continue
 		}
 
@@ -1075,10 +1089,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		if len(dnsServers) == 0 {
 			dnsServers = []string{"1.1.1.1", "8.8.8.8"}
-		}
-		mac := ""
-		if i < len(ifaceRecords) {
-			mac = ifaceRecords[i].MAC
 		}
 
 		// IPv6 handling: a NIC can carry an explicit `ipv6:` (with
@@ -1093,18 +1103,16 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			address6 = address6 + "/64"
 		}
 
-		staticIfaces = append(staticIfaces, isolatedIface{
+		guestNICs = append(guestNICs, guestNIC{Ordinal: i, MAC: mac, Static: &isolatedIface{
 			MAC:      mac,
 			Address:  address,
 			Gateway:  gateway,
 			DNS:      dnsServers,
 			Address6: address6,
 			Gateway6: gateway6,
-		})
+		}})
 	}
-	if len(staticIfaces) > 0 {
-		staticNetCfg = buildIsolatedNetworkConfig(staticIfaces)
-	}
+	staticNetCfg = guestNetworkConfig(guestNICs)
 
 	// Generate cloud-init ISO if this is a cloud image
 	var cloudInitISO string

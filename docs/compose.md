@@ -1280,7 +1280,7 @@ Setting `host-isolation: true` on a network blocks all traffic from VMs to the h
 This follows the cloud provider model (AWS, DigitalOcean, GCP): the hypervisor is invisible to VMs. When host isolation is enabled:
 
 - **No dnsmasq** — DHCP/DNS does not run on the bridge. No host process listens.
-- **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init V1 network-config (distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine).
+- **Static IPs via cloud-init** — IPAM still allocates IPs, but they are delivered via cloud-init network-config (MAC-matched, distro-agnostic: works on Ubuntu, CentOS, Debian, Arch, Alpine). A VM NIC that names no `ip:` is given the next free address in the network's IPv4 subnet, skipping the gateway and `reserved-addresses`; the address is recorded on the NIC (`lv inspect`). The choice is made from the creating node's view of the cluster, so two VMs created on two hosts in the same instant can be given the same address — name `ip:` explicitly where that matters. A network without a subnet, or with an IPv6 one, gives no address: name one with `ip:`.
 - **DNS from config** — resolvers come from the `dns` field (defaults to `["1.1.1.1", "8.8.8.8"]`).
 - **IRB gateway stays** — the host keeps a gateway IP on the bridge for routing (FORWARD). VMs still have a default route. But no host *services* are reachable (INPUT is dropped).
 - **No implicit NAT** — outbound internet access requires explicit `snat: true` on a load balancer (see below).

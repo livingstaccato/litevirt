@@ -938,6 +938,10 @@ type Server struct {
 	// (nic_identity.go): network → address → reservation.
 	dhcpResMu   sync.Mutex
 	dhcpPending map[string]map[string]dhcpPendingRes
+	// Addresses given to NICs on host-isolated networks whose rows are not
+	// written yet (hostIsolatedAddress): network → address → when. Under
+	// dhcpResMu.
+	isoPending map[string]map[string]time.Time
 	// Host-local DHCP facts a reservation depends on; nil = the real host
 	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
 	// Test seams: SetDHCPReservationBackend.

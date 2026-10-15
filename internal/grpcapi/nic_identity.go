@@ -262,6 +262,74 @@ func (s *Server) reserveDHCPAddress(ctx context.Context, netName, subnet, bridge
 	return ip, nil
 }
 
+// hostIsolatedAddressable reports whether a NIC that names no address on
+// network def is given one by litevirt: a host-isolated network runs no DHCP
+// server on any host (network.DHCPWouldServe), so its guests are addressed
+// through cloud-init from the network's subnet (docs/compose.md, "Host
+// isolation"). IPv4 subnets on the types litevirt addresses; sriov and direct
+// attach guests to hardware litevirt does not address.
+func hostIsolatedAddressable(def *compose.NetworkDef) bool {
+	if def == nil || !def.HostIsolation || def.Subnet == "" || def.NetBoxPrefixID != 0 {
+		return false
+	}
+	switch def.Type {
+	case "", "bridge", "vxlan", "isolated":
+	default:
+		return false
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(def.Subnet))
+	return err == nil && p.Addr().Is4()
+}
+
+// hostIsolatedAddress picks the address a new NIC on host-isolated network
+// netName is given. Free means: no live NIC row or lease on the network holds
+// it, it is not the network's gateway or one of its reserved addresses, and no
+// create in flight on this host just took it. The NIC row records it, and the
+// seed's network-config delivers it to the guest as a static address.
+//
+// Like the container allocator, this decides from this node's replica: two
+// creates on two hosts in the same moment can pick the same address. That is
+// no worse than the container path on the same network, and the alternative it
+// replaces gave the guest no address at all.
+func (s *Server) hostIsolatedAddress(ctx context.Context, netName string, def *compose.NetworkDef) (string, error) {
+	assigned, err := corrosion.NetworkAssignedAddrs(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	s.dhcpResMu.Lock()
+	defer s.dhcpResMu.Unlock()
+	if s.isoPending == nil {
+		s.isoPending = map[string]map[string]time.Time{}
+	}
+	for n, m := range s.isoPending {
+		for ip, at := range m {
+			if time.Since(at) > 10*time.Minute {
+				delete(m, ip)
+			}
+		}
+		if len(m) == 0 {
+			delete(s.isoPending, n)
+		}
+	}
+	used := append([]string(nil), assigned[netName]...)
+	for ip := range s.isoPending[netName] {
+		used = append(used, ip)
+	}
+	if def.Gateway != "" {
+		used = append(used, def.Gateway)
+	}
+	used = append(used, def.ReservedAddresses...)
+	ip, err := network.NextFreeIP(def.Subnet, used)
+	if err != nil {
+		return "", err
+	}
+	if s.isoPending[netName] == nil {
+		s.isoPending[netName] = map[string]time.Time{}
+	}
+	s.isoPending[netName][ip] = time.Now()
+	return ip, nil
+}
+
 // dhcpPendingRes is a reservation made for a NIC whose rows are not written
 // yet.
 type dhcpPendingRes struct {

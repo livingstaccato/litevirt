@@ -271,6 +271,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
 lv update <vm> [--cpu-limit CORES] [--cpu-shares N]   # noisy-neighbour limits (live; 0 clears the cap / restores the weight)
 lv update <vm> --nic-rate 0=12.5 [--nic-rate 1=0]     # per-NIC bandwidth cap in MB/s, NIC numbered from 0 (live; 0 clears it)
+lv update <vm> --nic-mtu 0=9000 [--nic-mtu 1=bridge] # per-NIC MTU, NIC numbered from 0; must equal the
+                                             # bridge's MTU (VM STOPPED or --restart-if-needed; 0 removes it)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
   [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
   [--disable-vnc]

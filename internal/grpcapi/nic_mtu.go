@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -11,6 +12,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -143,4 +145,99 @@ func (s *Server) bridgeMTUReader() func(string) (int, error) {
 func (s *Server) withNICMTU(cfg *lv.VMConfig) {
 	cfg.BridgeMTU = s.bridgeMTUReader()
 	cfg.HostName = s.hostName
+}
+
+// requestSetsNICMTU reports whether an update sets a NIC's MTU. Removing one
+// (0) sets nothing.
+func requestSetsNICMTU(req *pb.UpdateVMRequest) bool {
+	for _, u := range req.GetNicMtu() {
+		if u.GetMtu() != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// applyNICMTURequest merges an UpdateVM's NIC MTUs into spec, validated, and
+// checks each against its bridge on this host, so a refusal comes before
+// anything is stopped. A NIC the stored spec does not list (a hot-plugged
+// one) gets its entry, as does every unlisted NIC before it, each made from
+// its NIC record.
+func (s *Server) applyNICMTURequest(ctx context.Context, spec *pb.VMSpec, req *pb.UpdateVMRequest) error {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, req.GetName())
+	if err != nil {
+		return status.Errorf(codes.Internal, "list NICs of %q: %v", req.GetName(), err)
+	}
+	byOrdinal := make(map[int]corrosion.NICRecord, len(nics))
+	for _, ic := range nics {
+		byOrdinal[ic.Ordinal] = ic
+	}
+	seen := map[int]bool{}
+	for _, u := range req.GetNicMtu() {
+		o := int(u.GetOrdinal())
+		if seen[o] {
+			return status.Errorf(codes.InvalidArgument, "NIC %d named twice", o)
+		}
+		seen[o] = true
+		if o < 0 {
+			return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), o)
+		}
+		for len(spec.Network) <= o {
+			ic, ok := byOrdinal[len(spec.Network)]
+			if !ok {
+				return status.Errorf(codes.NotFound, "VM %q has no NIC %d", req.GetName(), len(spec.Network))
+			}
+			spec.Network = append(spec.Network, &pb.NetworkAttachment{Name: ic.NetworkName, Model: ic.Model, Mac: ic.MAC})
+		}
+		n := spec.Network[o]
+		if err := compose.ValidateNICMTU(n.GetModel(), u.GetMtu()); err != nil {
+			return status.Errorf(codes.InvalidArgument, "NIC %d: %v", o, err)
+		}
+		n.Mtu = u.GetMtu()
+		if n.Mtu == 0 {
+			continue
+		}
+		bridge := resolveBridge(ctx, s.db, n.GetName())
+		if strings.HasPrefix(bridge, "direct:") {
+			return status.Errorf(codes.FailedPrecondition,
+				"NIC %d: an MTU needs a bridged network (macvtap and SR-IOV networks are not supported)", o)
+		}
+		if _, err := lv.ResolveNICMTU(o, int(n.Mtu), bridge, s.bridgeMTUReader(), s.hostName); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+	}
+	return nil
+}
+
+// patchNICMTUInPlace applies an update's NIC MTUs (merged into spec) to the
+// persistent definition by patching it, so the addresses libvirt assigned
+// are not reshuffled. nets are the VM's NICs on this host.
+func (s *Server) patchNICMTUInPlace(x string, req *pb.UpdateVMRequest, spec *pb.VMSpec, nets []lv.NetworkConfig) (string, error) {
+	for _, u := range req.GetNicMtu() {
+		o := int(u.GetOrdinal())
+		var nc *lv.NetworkConfig
+		for i := range nets {
+			if nets[i].SpecOrdinal == o+1 {
+				nc = &nets[i]
+			}
+		}
+		if nc == nil || o >= len(spec.Network) {
+			return "", fmt.Errorf("NIC %d not found for an in-place patch", o)
+		}
+		size := 0
+		if mtu := int(spec.Network[o].GetMtu()); mtu != 0 {
+			if nc.Direct != "" {
+				return "", fmt.Errorf("NIC %d: an MTU needs a bridged network (macvtap and SR-IOV networks are not supported)", o)
+			}
+			var err error
+			if size, err = lv.ResolveNICMTU(o, mtu, nc.Bridge, s.bridgeMTUReader(), s.hostName); err != nil {
+				return "", err
+			}
+		}
+		var err error
+		if x, err = lv.PatchInactiveNICMTU(x, nc.MAC, size); err != nil {
+			return "", err
+		}
+	}
+	return x, nil
 }

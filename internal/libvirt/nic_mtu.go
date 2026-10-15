@@ -1,8 +1,11 @@
 package libvirt
 
 import (
+	"encoding/xml"
 	"fmt"
 	"net"
+	"regexp"
+	"strings"
 )
 
 // NICMTUFromBridge is a NIC's stored MTU for `mtu: bridge`: render the
@@ -76,4 +79,67 @@ func nicMTUElement(cfg VMConfig, i int, n NetworkConfig, model string) (*ifaceMT
 // ifaceMTU is the NIC's <mtu size='N'/>.
 type ifaceMTU struct {
 	Size int `xml:"size,attr"`
+}
+
+// mtuTagRe matches a NIC's <mtu> element, in libvirt's self-closing form or
+// as an empty pair.
+var mtuTagRe = regexp.MustCompile(`(?s)\s*<mtu\b[^>]*?(/>|>\s*</mtu>)`)
+
+// PatchInactiveNICMTU sets the <mtu> of the NIC with mac in a persistent
+// definition, in place, so the addresses libvirt assigned survive. size 0
+// removes it.
+func PatchInactiveNICMTU(domXML, mac string, size int) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(mac))
+	found := false
+	out := ifaceBlock.ReplaceAllStringFunc(domXML, func(block string) string {
+		m := macAttrRe.FindStringSubmatch(block)
+		if m == nil || strings.ToLower(m[1]) != want {
+			return block
+		}
+		found = true
+		block = mtuTagRe.ReplaceAllString(block, "")
+		if size <= 0 {
+			return block
+		}
+		return strings.Replace(block, "</interface>", fmt.Sprintf("<mtu size='%d'/>\n    </interface>", size), 1)
+	})
+	if !found {
+		return "", fmt.Errorf("no interface with MAC %q", mac)
+	}
+	return out, nil
+}
+
+// InterfaceMTU is one NIC of a domain definition: its MAC, its bridge (empty
+// for any other kind) and its <mtu>, 0 when it has none.
+type InterfaceMTU struct {
+	MAC    string
+	Bridge string
+	MTU    int
+}
+
+// InterfaceMTUs lists every NIC of a domain definition with its MTU, in
+// document order. Nil when the XML does not parse.
+func InterfaceMTUs(domXML string) []InterfaceMTU {
+	var d struct {
+		Interfaces []struct {
+			Type string `xml:"type,attr"`
+			MAC  struct {
+				Address string `xml:"address,attr"`
+			} `xml:"mac"`
+			Source struct {
+				Bridge string `xml:"bridge,attr"`
+			} `xml:"source"`
+			MTU struct {
+				Size int `xml:"size,attr"`
+			} `xml:"mtu"`
+		} `xml:"devices>interface"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return nil
+	}
+	out := make([]InterfaceMTU, 0, len(d.Interfaces))
+	for _, i := range d.Interfaces {
+		out = append(out, InterfaceMTU{MAC: strings.ToLower(i.MAC.Address), Bridge: i.Source.Bridge, MTU: i.MTU.Size})
+	}
+	return out
 }

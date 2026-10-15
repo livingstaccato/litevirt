@@ -83,3 +83,43 @@ func TestGenerateDomainXML_NICMTU(t *testing.T) {
 }
 
 var _ BridgeMTUReader = (*Client)(nil)
+
+// The in-place patch sets, replaces and removes one NIC's <mtu>, found by its
+// MAC, and leaves every other NIC alone.
+//
+// Mutation: patch every interface — the other NIC's check goes red.
+func TestPatchInactiveNICMTU(t *testing.T) {
+	x, err := GenerateDomainXML(VMConfig{Name: "p", CPU: 1, MemoryMiB: 256, Networks: []NetworkConfig{
+		{Bridge: "a", Model: "virtio", MAC: "52:54:00:00:00:0a"}, {Bridge: "b", Model: "virtio", MAC: "52:54:00:00:00:0b"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtuOf := func(x, mac string) int {
+		for _, n := range InterfaceMTUs(x) {
+			if n.MAC == mac {
+				return n.MTU
+			}
+		}
+		return -1
+	}
+	if x, err = PatchInactiveNICMTU(x, "52:54:00:00:00:0A", 9000); err != nil || mtuOf(x, "52:54:00:00:00:0a") != 9000 || mtuOf(x, "52:54:00:00:00:0b") != 0 {
+		t.Fatalf("set: err=%v\n%s", err, x)
+	}
+	if x, err = PatchInactiveNICMTU(x, "52:54:00:00:00:0a", 1500); err != nil || mtuOf(x, "52:54:00:00:00:0a") != 1500 || strings.Count(x, "<mtu") != 1 {
+		t.Fatalf("replace: err=%v\n%s", err, x)
+	}
+	if x, err = PatchInactiveNICMTU(x, "52:54:00:00:00:0a", 0); err != nil || strings.Contains(x, "<mtu") {
+		t.Fatalf("remove: err=%v\n%s", err, x)
+	}
+	if _, err := PatchInactiveNICMTU(x, "52:54:00:00:00:ff", 9000); err == nil {
+		t.Error("an unknown MAC was patched")
+	}
+	// libvirt's own form, as a dumped definition carries it.
+	lib := "<domain><devices><interface type='bridge'><mac address='52:54:00:00:00:0c'/><source bridge='c'/><mtu size='9000'/></interface></devices></domain>"
+	if got := InterfaceMTUs(lib); len(got) != 1 || got[0].MTU != 9000 || got[0].Bridge != "c" {
+		t.Errorf("InterfaceMTUs(libvirt form) = %+v", got)
+	}
+	if x, err := PatchInactiveNICMTU(lib, "52:54:00:00:00:0c", 1500); err != nil || mtuOf(x, "52:54:00:00:00:0c") != 1500 || strings.Count(x, "<mtu") != 1 {
+		t.Errorf("replace in libvirt form: err=%v\n%s", err, x)
+	}
+}

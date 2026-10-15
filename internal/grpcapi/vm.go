@@ -5225,6 +5225,12 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			return nil, err
 		}
 	}
+	// So does an MTU; removing one sets nothing and is not refused.
+	if requestSetsNICMTU(req) {
+		if err := s.ReleaseFeatureRefusal(ctx, capabilities.FeatureNICMTU); err != nil {
+			return nil, err
+		}
+	}
 	// A limit-bearing update is refused up front, on whichever node it reaches,
 	// when the release token has not latched: the entry node (an owner on an
 	// older build would ignore a limit and answer success; an older owner means
@@ -5302,6 +5308,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		ioG = g
 	}
 
+	// A NIC MTU is written here too: the feature's gate runs on this node.
+	var mtuG capabilities.FeatureGrant
+	if requestSetsNICMTU(req) {
+		g, gerr := s.nicMTUGrant(ctx)
+		if gerr != nil {
+			return nil, gerr
+		}
+		mtuG = g
+	}
+
 	// Discard / detect_zeroes / queue changes ride in the request and are merged
 	// into THIS host's spec (the owner's, under the VM lock), validated before
 	// anything is stopped. The merged spec is only written after the domain has
@@ -5309,6 +5325,13 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if len(req.DiskTuning) > 0 || len(req.NicQueues) > 0 {
 		tdisks, _ := corrosion.GetVMDisks(ctx, s.db, req.Name)
 		if err := applyTuningRequest(spec, tdisks, req); err != nil {
+			return nil, err
+		}
+	}
+	// NIC MTUs likewise, each checked against its bridge here before anything
+	// is stopped.
+	if len(req.NicMtu) > 0 {
+		if err := s.applyNICMTURequest(ctx, spec, req); err != nil {
 			return nil, err
 		}
 	}
@@ -5926,6 +5949,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// definition too, so the addresses libvirt assigned survive.
 				patched, perr = patchTuningInPlace(patched, req, spec, diskConfigs, ifaces)
 			}
+			if perr == nil && len(req.NicMtu) > 0 {
+				patched, perr = s.patchNICMTUInPlace(patched, req, spec, netConfigs)
+			}
 			if perr == nil {
 				domXML = patched
 			} else {
@@ -6031,8 +6057,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		Tuning:      tuningWrite,
 		Passthrough: updateSetsPassthrough(req),
 		Limits:      requestSetsLimits(req),
+		MTU:         requestSetsNICMTU(req),
 	}
-	applied, newGen, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db, ioG, passthroughG, limitsG, capabilities.FeatureGrant{}, updNeeds, req.Name, func(string) (string, error) {
+	applied, newGen, err := corrosion.MutateDesiredSpecWithReleaseFeatures(ctx, s.db, ioG, passthroughG, limitsG, mtuG, updNeeds, req.Name, func(string) (string, error) {
 		return string(specJSON), nil
 	})
 	if err != nil || !applied {

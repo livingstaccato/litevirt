@@ -314,7 +314,8 @@ net1: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1
 // bridge's. A value litevirt cannot take is warned about and dropped; the
 // import never fails over it.
 //
-// Mutation: keep mtu=70000 — the dropped case goes red.
+// Mutations: keep mtu=70000 — the dropped case goes red; keep an e1000's MTU —
+// the net4 case goes red.
 func TestParseProxmoxConf_NICMTU(t *testing.T) {
 	conf := `name: vm-301
 cores: 1
@@ -324,6 +325,7 @@ net0: virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,mtu=9000
 net1: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1,mtu=1
 net2: virtio=AA:BB:CC:DD:EE:03,bridge=vmbr2,mtu=70000
 net3: virtio=AA:BB:CC:DD:EE:04,bridge=vmbr3
+net4: e1000=AA:BB:CC:DD:EE:05,bridge=vmbr4,mtu=9000
 `
 	fv, err := ParseProxmoxConf(writeConf(t, conf))
 	if err != nil {
@@ -340,6 +342,11 @@ net3: virtio=AA:BB:CC:DD:EE:04,bridge=vmbr3
 	}
 	if strings.Contains(all, "net3") {
 		t.Errorf("a NIC with no mtu warned:\n%s", all)
+	}
+	// A non-virtio NIC takes no MTU: dropped with a warning, never failing
+	// the import at its define.
+	if fv.NICs[4].MTU != 0 || !strings.Contains(all, "net4 sets mtu=9000 (not imported): an MTU needs the virtio model") {
+		t.Errorf("e1000 with mtu=9000: MTU %d, warnings:\n%s", fv.NICs[4].MTU, all)
 	}
 	spec := fv.ToVMSpec("")
 	if spec.Network[0].GetMtu() != 9000 || spec.Network[1].GetMtu() != 1 || spec.Network[2].GetMtu() != 0 {

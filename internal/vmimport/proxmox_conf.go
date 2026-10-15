@@ -173,7 +173,7 @@ func parseProxmoxConfBytes(data []byte) (*ForeignVM, error) {
 				}
 			}
 			if nic.MTU != 0 {
-				nic.MTU = proxmoxNICMTU(fv, key, nic.MTU)
+				nic.MTU = proxmoxNICMTU(fv, key, nic.Model, nic.MTU)
 			}
 			fv.NICs = append(fv.NICs, nic)
 		} else {
@@ -357,8 +357,11 @@ func parseProxmoxNIC(val string) (ForeignNIC, bool) {
 // proxmoxNICMTU is the MTU a Proxmox NIC's mtu= imports as, with its warning:
 // 1 (the bridge's MTU) as bridge, N within 576-65520 as N, anything else
 // dropped. The release gate decides later whether it is kept at all.
-func proxmoxNICMTU(fv *ForeignVM, key string, mtu int) int {
+func proxmoxNICMTU(fv *ForeignVM, key, model string, mtu int) int {
 	switch {
+	case model != "" && model != "virtio":
+		fv.Warnf("%s sets mtu=%d (not imported): an MTU needs the virtio model (this NIC is %s)", key, mtu, model)
+		return 0
 	case mtu == 1:
 		fv.Warnf("%s sets mtu=1 (the bridge's MTU): imported as `mtu: bridge`, so the guest takes the target bridge's MTU", key)
 		return 1

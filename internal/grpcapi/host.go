@@ -738,7 +738,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		// The guest never left: take back the ISO this attempt put there.
 		s.cleanupFailedMigrationTarget(ctx, vm.Name, target.Name, nil)
 		progress.Status = "error"
-		progress.Error = "target refused the installer ISO: " + ierr.Error()
+		progress.Error = "target refused the move: " + ierr.Error()
 		return progress
 	}
 	cdromSources, targetCgroup := ens.remap, ens.cgroupMode

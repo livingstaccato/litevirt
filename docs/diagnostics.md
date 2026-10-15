@@ -1861,6 +1861,12 @@ in flight, and the sweep cannot release it. The evidence carries `count` and
 |---|---|
 | A sweep pass finds such a reservation. | A sweep pass finds none: each one was released, or its operation was reaped. |
 
+When the target host is removed or not active, its `terminal_past_header`
+reservations are released by the smallest active host instead. While that host
+runs an older build or its replica is untrusted, nobody releases them, and a
+release it cannot write is logged there but raises no condition; the operation
+reaper still removes the operation about a day after its last step.
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

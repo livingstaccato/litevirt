@@ -238,10 +238,7 @@ func classifyReservation(v *HostReservationView, now time.Time) (ReservationClas
 	case reservationManifestKinds[kind]:
 		return ReservationManifest, fmt.Sprintf("%s journal; it finishes through its own recovery", kind)
 	case v.Op.ResourceKind == CapacityResourceKind:
-		maxAge := RPCScopedLeaseMaxAge
-		if transferLeaseMethods[v.Op.Method] {
-			maxAge = TransferCapacityLeaseMaxAge
-		}
+		maxAge := CapacityLeaseMaxAge(v.Op.Method)
 		if !createdOK {
 			return ReservationCapacityLease, "admission lease; the stale-lease sweep releases it"
 		}
@@ -269,6 +266,15 @@ func classifyReservation(v *HostReservationView, now time.Time) (ReservationClas
 	return ReservationNoRunningOperation, fmt.Sprintf(
 		"no running operation holds it (state %q at owner epoch %d, header at %d)",
 		v.LatestState, v.LatestEpoch, v.HeaderEpoch)
+}
+
+// CapacityLeaseMaxAge is how long an admission lease taken by method may be held
+// before the stale-lease sweep releases it.
+func CapacityLeaseMaxAge(method string) time.Duration {
+	if transferLeaseMethods[method] {
+		return TransferCapacityLeaseMaxAge
+	}
+	return RPCScopedLeaseMaxAge
 }
 
 // isHardTerminal: completed, failed or cancelled. superseded alone is an

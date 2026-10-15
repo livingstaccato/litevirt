@@ -43,7 +43,7 @@ func newReservationMetrics(reg prometheus.Registerer) *ReservationMetrics {
 		}),
 		oldest: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "litevirt_host_reservation_oldest_seconds",
-			Help: "Age of the oldest reservation counted against this host that no operation holds in flight; 0 when there is none.",
+			Help: "Age of the oldest reservation counted against this host, leaving out one held in flight, a vm_replace or drain journal, and an admission lease within its max age; 0 when there is none.",
 		}),
 	}
 	reg.MustRegister(m.releases, m.skipped, m.vcpu, m.memMiB, m.oldest)

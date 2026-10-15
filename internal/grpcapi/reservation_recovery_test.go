@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -22,13 +23,20 @@ import (
 func sweepOp(t *testing.T, s *Server, id string, kind corrosion.OperationKind, resourceID string,
 	headerEpoch int64, rv corrosion.ReservationVector, createdAt string, steps map[int64][]string) {
 	t.Helper()
+	sweepOpAs(t, s, id, kind, "vm", resourceID, "ResizeVMLive", headerEpoch, rv, createdAt, steps)
+}
+
+// sweepOpAs is sweepOp with an explicit resource kind and method.
+func sweepOpAs(t *testing.T, s *Server, id string, kind corrosion.OperationKind, resourceKind, resourceID, method string,
+	headerEpoch int64, rv corrosion.ReservationVector, createdAt string, steps map[int64][]string) {
+	t.Helper()
 	ctx := context.Background()
 	enc, err := rv.Encode()
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	if err := corrosion.InsertOperation(ctx, s.db, corrosion.OperationRecord{
-		ID: id, Method: "ResizeVMLive", ResourceKind: "vm", ResourceID: resourceID,
+		ID: id, Method: method, ResourceKind: resourceKind, ResourceID: resourceID,
 		OperationKind: string(kind), RequestHash: "h", ReservationJSON: enc, VMOwnerEpoch: headerEpoch,
 	}); err != nil {
 		t.Fatalf("InsertOperation %s: %v", id, err)
@@ -283,7 +291,7 @@ func TestReservationSweep_SkipsUntrustedReplica(t *testing.T) {
 func TestReservationSweep_OnlyTargetOrDeputy(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
-	for _, h := range []string{"test-host", "zz-other", "x-gone", "y-removed"} {
+	for _, h := range []string{"test-host", "zz-other", "x-gone", "y-removed", "b-offline"} {
 		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.1", State: "active"}); err != nil {
 			t.Fatalf("InsertHost %s: %v", h, err)
 		}
@@ -294,6 +302,10 @@ func TestReservationSweep_OnlyTargetOrDeputy(t *testing.T) {
 	if err := corrosion.UpdateHostState(ctx, s.db, "y-removed", "removed"); err != nil {
 		t.Fatalf("remove y-removed: %v", err)
 	}
+	// Sorts before test-host but is not active, so it is never the deputy.
+	if err := corrosion.UpdateHostState(ctx, s.db, "b-offline", "offline"); err != nil {
+		t.Fatalf("offline b-offline: %v", err)
+	}
 	s.db.MarkReplicaCaughtUpForTests("zz-other")
 
 	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
@@ -303,12 +315,17 @@ func TestReservationSweep_OnlyTargetOrDeputy(t *testing.T) {
 		sweepAgo(time.Hour), sweepLeakSteps())
 	sweepOp(t, s, "orphan-b", corrosion.OpResourceUpdateRunning, "gone-vm", 1, sweepVector("y-removed", 64),
 		sweepAgo(time.Hour), sweepAdmittedSteps(1))
+	sweepOp(t, s, "orphan-d", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("y-removed", 16),
+		sweepAgo(time.Hour), sweepLeakSteps())
 	if v, _ := corrosion.ClassifyReservation(ctx, s.db, "orphan-b"); v == nil || v.Class != corrosion.ReservationVMGone {
 		t.Fatalf("precondition: orphan-b must be vm_gone, got %+v", v)
 	}
 
-	if n := s.SweepReservationsOnce(ctx); n != 1 {
-		t.Fatalf("released %d, want 1 (the removed host's terminal reservation)", n)
+	if n := s.SweepReservationsOnce(ctx); n != 2 {
+		t.Fatalf("released %d, want 2 (the gone and the removed host's terminal reservations)", n)
+	}
+	if releaseRows(t, s, "orphan-d") != 1 {
+		t.Error("the deputy did not release a terminal reservation of a host that is present but not active")
 	}
 	if releaseRows(t, s, "peer-a") != 0 {
 		t.Error("released an active peer's reservation")
@@ -470,5 +487,145 @@ func TestReservationSweep_BlockedReleaseIsAFaultLoggedOnce(t *testing.T) {
 	if !open || ev.Count != 1 || ev.Reservations[0].OperationID != "blocked-old" ||
 		!strings.Contains(ev.Reservations[0].Remedy, "tombstoned") {
 		t.Fatalf("reservation_stale: open=%v evidence=%+v, want only blocked-old with the blocked remedy", open, ev)
+	}
+}
+
+// The listing is re-checked under the VM lock: a reservation whose VM came back
+// between the listing and the lock is not released, and a terminal
+// reservation is not released while its VM's lock is held.
+func TestReservationSweep_ReclassifiesUnderTheLock(t *testing.T) {
+	s := testServer(t)
+	reg := sweepMetrics(s)
+	ctx := context.Background()
+	sweepVM(t, s, "rc", 1, sweepAgoNano(48*time.Hour), "")
+	if err := s.db.Execute(ctx, `UPDATE vms SET deleted_at = ? WHERE name = 'rc'`, sweepAgo(time.Minute)); err != nil {
+		t.Fatalf("tombstone the VM: %v", err)
+	}
+	sweepOp(t, s, "back", corrosion.OpResourceUpdateRunning, "rc", 1, sweepVector("test-host", 64),
+		sweepAgo(time.Hour), sweepAdmittedSteps(1))
+	s.resSweep.beforeReclassify = func(string) {
+		if err := s.db.Execute(ctx, `UPDATE vms SET deleted_at = NULL WHERE name = 'rc'`); err != nil {
+			t.Errorf("restore the VM: %v", err)
+		}
+	}
+	if n := s.SweepReservationsOnce(ctx); n != 0 || releaseRows(t, s, "back") != 0 {
+		t.Fatalf("released a reservation whose VM is back: released %d, rows %d", n, releaseRows(t, s, "back"))
+	}
+	s.resSweep.beforeReclassify = nil
+
+	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOp(t, s, "leak", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("test-host", 512),
+		sweepAgo(time.Hour), sweepLeakSteps())
+	unlock := s.lockVM("vm1")
+	if n := s.SweepReservationsOnce(ctx); n != 0 || releaseRows(t, s, "leak") != 0 {
+		unlock()
+		t.Fatalf("released a terminal reservation under a held VM lock: released %d", n)
+	}
+	unlock()
+	if v := metricValue(t, reg, "litevirt_host_reservation_sweep_skipped_total", map[string]string{"reason": "vm_busy"}); v != 1 {
+		t.Errorf("sweep_skipped_total{vm_busy} = %v, want 1", v)
+	}
+	if n := s.SweepReservationsOnce(ctx); n != 1 {
+		t.Fatalf("lock released: released %d, want 1", n)
+	}
+}
+
+// A release write that fails is retried every pass, counted as a state-write
+// failure, logged once, and named in reservation_stale; a pass that finds its
+// VM busy keeps the fault rather than dropping and re-logging it.
+func TestReservationSweep_ReleaseWriteFailure(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	logs := &lockedLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var writeFails []string
+	s.SetStateWriteFailObserver(func(op, _ string) { writeFails = append(writeFails, op) })
+	s.resSweep.release = func(context.Context, *corrosion.Client, string) (bool, error) {
+		return false, errors.New("disk I/O error")
+	}
+
+	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOp(t, s, "leak", corrosion.OpResourceUpdateRunning, "vm1", 0, sweepVector("test-host", 512),
+		sweepAgo(time.Hour), sweepLeakSteps())
+	for i := 0; i < 3; i++ {
+		if n := s.SweepReservationsOnce(ctx); n != 0 {
+			t.Fatalf("pass %d released %d with a failing write", i, n)
+		}
+	}
+	if len(writeFails) != 3 || writeFails[0] != "reservation_release" {
+		t.Errorf("state-write failures = %v, want reservation_release once per pass", writeFails)
+	}
+	row, ev, open := staleCondition(t, s)
+	if !open || ev.Count != 1 || ev.Reservations[0].OperationID != "leak" ||
+		!strings.Contains(ev.Reservations[0].Remedy, "could not write its release row") {
+		t.Fatalf("reservation_stale: open=%v evidence=%+v, want leak with the failed-write remedy", open, ev)
+	}
+
+	unlock := s.lockVM("vm1")
+	s.SweepReservationsOnce(ctx)
+	unlock()
+	if again, ev2, open2 := staleCondition(t, s); !open2 || ev2.Count != 1 || again.ObserveCount != row.ObserveCount {
+		t.Errorf("a busy pass changed the condition: open=%v count=%d observe %d -> %d",
+			open2, ev2.Count, row.ObserveCount, again.ObserveCount)
+	}
+	s.SweepReservationsOnce(ctx)
+	if n := strings.Count(logs.String(), "could not release a reservation"); n != 1 {
+		t.Errorf("the failed release was logged %d times, want once", n)
+	}
+
+	s.resSweep.release = nil
+	if n := s.SweepReservationsOnce(ctx); n != 1 {
+		t.Fatalf("write recovered: released %d, want 1", n)
+	}
+	if _, _, open := staleCondition(t, s); open {
+		t.Error("reservation_stale still open after the release")
+	}
+}
+
+// The oldest-reservation gauge leaves out a manifest journal and an admission
+// lease within its own max age.
+func TestReservationSweep_OldestLeavesOutHeldReservations(t *testing.T) {
+	s := testServer(t)
+	reg := sweepMetrics(s)
+	ctx := context.Background()
+	sweepVM(t, s, "vm1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOpAs(t, s, "journal", corrosion.OpVMReplace, "vm", "vm1", "ReplaceVM", 0, sweepVector("test-host", 64),
+		sweepAgo(3*time.Hour), sweepLeakSteps())
+	sweepOpAs(t, s, "transfer", corrosion.OpResourceUpdateRunning, corrosion.CapacityResourceKind, "", "MigrateVM", 0,
+		sweepVector("test-host", 64), sweepAgo(2*time.Hour), sweepLeakSteps())
+	sweepOp(t, s, "stuck", corrosion.OpResourceUpdateRunning, "vm1", 1, sweepVector("test-host", 64),
+		sweepAgo(30*time.Minute), sweepAdmittedSteps(1))
+	if got := reservedMem(t, s, "test-host"); got != 192 {
+		t.Fatalf("precondition: test-host reserves %d MiB, want all three counted (192)", got)
+	}
+	s.SweepReservationsOnce(ctx)
+	if v := metricValue(t, reg, "litevirt_host_reservation_oldest_seconds", nil); v < 1700 || v > 1900 {
+		t.Errorf("oldest_seconds = %v, want about 1800 (the journal and the transfer lease left out)", v)
+	}
+
+	// A lease past its own max age counts.
+	sweepOpAs(t, s, "expired", corrosion.OpResourceUpdateRunning, corrosion.CapacityResourceKind, "", "CreateVM", 0,
+		sweepVector("test-host", 64), sweepAgo(time.Hour), sweepLeakSteps())
+	s.SweepReservationsOnce(ctx)
+	if v := metricValue(t, reg, "litevirt_host_reservation_oldest_seconds", nil); v < 3500 || v > 3700 {
+		t.Errorf("oldest_seconds = %v, want about 3600 (an admission lease past its max age)", v)
+	}
+}
+
+// reservation_stale lists the longest-held reservations first.
+func TestReservationSweep_StaleConditionListsOldestFirst(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	sweepVM(t, s, "c1", 1, sweepAgoNano(48*time.Hour), "")
+	sweepOp(t, s, "a-new", corrosion.OpResourceUpdateRunning, "c1", 1, sweepVector("test-host", 64),
+		sweepAgo(30*time.Minute), sweepAdmittedSteps(1))
+	sweepOp(t, s, "z-old", corrosion.OpResourceUpdateRunning, "c1", 1, sweepVector("test-host", 64),
+		sweepAgo(2*time.Hour), sweepAdmittedSteps(1))
+	s.SweepReservationsOnce(ctx)
+	_, ev, open := staleCondition(t, s)
+	if !open || len(ev.Reservations) != 2 || ev.Reservations[0].OperationID != "z-old" {
+		t.Fatalf("reservation_stale: open=%v evidence=%+v, want z-old listed first", open, ev)
 	}
 }

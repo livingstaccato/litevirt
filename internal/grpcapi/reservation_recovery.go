@@ -53,6 +53,19 @@ type reservationSweepState struct {
 	// faultLogged is, per operation, the fault last logged for it, so each is
 	// logged once per operation and condition rather than every pass.
 	faultLogged map[string]string
+
+	// Test seams: beforeReclassify runs under the VM lock before the
+	// re-classify; release replaces corrosion.ReleaseReservation.
+	beforeReclassify func(opID string)
+	release          func(ctx context.Context, c *corrosion.Client, opID string) (bool, error)
+}
+
+// faultRemedy is the condition remedy of a logged fault.
+func faultRemedy(fault string) string {
+	if fault == "release_blocked" {
+		return remedyReleaseBlocked
+	}
+	return remedyReleaseFailed
 }
 
 // SetReservationMetrics attaches the reservation sweep's metrics.
@@ -153,9 +166,17 @@ func (s *Server) releaseSweptReservation(ctx context.Context, v *corrosion.HostR
 	unlock, locked := s.tryLockVM(v.VMName)
 	if !locked {
 		s.reservationMetrics.Skipped("vm_busy")
+		// Not retried this pass: a fault it had stays recorded, so it is
+		// neither logged again nor dropped from the condition.
+		if f := s.resSweep.faultLogged[v.Op.ID]; f != "" {
+			return false, faultRemedy(f)
+		}
 		return false, ""
 	}
 	defer unlock()
+	if h := s.resSweep.beforeReclassify; h != nil {
+		h(v.Op.ID)
+	}
 
 	cur, err := corrosion.ClassifyReservation(ctx, s.db, v.Op.ID)
 	if err != nil {
@@ -172,7 +193,11 @@ func (s *Server) releaseSweptReservation(ctx context.Context, v *corrosion.HostR
 	if !cur.Releasable() || !s.isReservationWriter(cur, loadHosts) {
 		return false, ""
 	}
-	already, err := corrosion.ReleaseReservation(ctx, s.db, cur.Op.ID)
+	release := corrosion.ReleaseReservation
+	if s.resSweep.release != nil {
+		release = s.resSweep.release
+	}
+	already, err := release(ctx, s.db, cur.Op.ID)
 	switch {
 	case errors.Is(err, corrosion.ErrReservationReleaseBlocked):
 		s.noteReservationFault(cur, "release_blocked", err)
@@ -271,6 +296,19 @@ type staleReservationEvidence struct {
 	Reservations []staleReservation `json:"reservations"`
 }
 
+// reservationCountsTowardOldest: the oldest-reservation gauge leaves out what
+// is legitimately still held — one an operation holds in flight, a manifest
+// journal, and an admission lease within its own max age.
+func reservationCountsTowardOldest(v *corrosion.HostReservationView, age time.Duration) bool {
+	switch v.Class {
+	case corrosion.ReservationInFlight, corrosion.ReservationManifest:
+		return false
+	case corrosion.ReservationCapacityLease:
+		return age > corrosion.CapacityLeaseMaxAge(v.Op.Method)
+	}
+	return true
+}
+
 // reservationExpectedBound is how long a reservation of kind may be held with no
 // operation holding it in flight. Every kind the sweep sees past its admission
 // holds a barrier while it runs, so the bound is the admission window.
@@ -293,7 +331,7 @@ func (s *Server) publishReservationHealth(ctx context.Context, views []corrosion
 		created, perr := time.Parse(time.RFC3339Nano, v.Op.CreatedAt)
 		createdOK := perr == nil
 		age := now.Sub(created)
-		if v.Class != corrosion.ReservationInFlight && createdOK && age.Seconds() > oldest {
+		if reservationCountsTowardOldest(v, age) && createdOK && age.Seconds() > oldest {
 			oldest = age.Seconds()
 		}
 		remedy := ""
@@ -346,7 +384,15 @@ func (s *Server) writeReservationStaleCondition(ctx context.Context, stale []sta
 		}
 		return
 	}
-	sort.Slice(stale, func(i, j int) bool { return stale[i].OperationID < stale[j].OperationID })
+	// Oldest first, so the listed ones are the longest held.
+	sort.Slice(stale, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339Nano, stale[i].CreatedAt)
+		tj, _ := time.Parse(time.RFC3339Nano, stale[j].CreatedAt)
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return stale[i].OperationID < stale[j].OperationID
+	})
 	ev := staleReservationEvidence{Count: len(stale), Reservations: stale[:min(len(stale), reservationStaleListed)]}
 	b, _ := json.Marshal(ev)
 	if open && row.Evidence == string(b) {

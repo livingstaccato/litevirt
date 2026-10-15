@@ -372,6 +372,11 @@ type Coordinator struct {
 	// claimRetry records hosts whose recovery had a claim refused, so the next
 	// tick re-runs it; a fenced host is otherwise processed once (claims.go).
 	claimRetry map[string]bool
+	// claimRetryAt records, per host, the moment its last recovery went
+	// ahead (its fence's, or its partition-pause deadline's wait start), on
+	// this coordinator's clock: the authority a claim retry owed to that
+	// recovery acts on (claimRetryOutageOver).
+	claimRetryAt map[string]time.Time
 	// relocDeferred records, per proof ID, when this coordinator first saw a
 	// container relocation decided for ANOTHER coordinator that it has not
 	// seen carried out. It completes that relocation itself only once the
@@ -909,6 +914,12 @@ func (c *Coordinator) run(ctx context.Context) {
 		// it is recorded terminal (confirmationFencesAfresh).
 		afresh := false
 		if c.fenced[target] {
+			// A claim retry owed to an outage the host has since come back
+			// from is re-judged before anything runs on that outage's fence
+			// (claimRetryOutageOver).
+			c.claimRetryOutageOver(ctx, target)
+		}
+		if c.fenced[target] {
 			// A recovery waiting out the host's partition pause continues
 			// here; one whose deadline refused falls through, re-checked next
 			// cycle.
@@ -1289,7 +1300,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.confirmResumed = make(map[string]string)
 	c.fencedOn, c.lastFenceAt = nil, nil
 	c.pauseWaits = nil
-	c.claimRetry, c.claimRetryProposals = nil, nil
+	c.claimRetry, c.claimRetryProposals, c.claimRetryAt = nil, nil, nil
 	c.recoverOnly, c.unpausedHeld = nil, nil
 	c.relocDeferred = nil
 	c.retrying = nil
@@ -3375,6 +3386,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.
+	c.noteRecoveryAt(h.Name, c.now())
 	c.recoverWorkloads(ctx, h)
 }
 

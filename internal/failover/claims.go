@@ -791,6 +791,7 @@ type claimRetryProposal struct {
 // earlier one must not run under it.
 func (c *Coordinator) forgetClaimRetries(host string) {
 	delete(c.claimRetry, host)
+	delete(c.claimRetryAt, host)
 	for key, p := range c.claimRetryProposals {
 		if p.source == host {
 			delete(c.claimRetryProposals, key)
@@ -832,4 +833,74 @@ func (c *Coordinator) retryClaims(ctx context.Context, target string) bool {
 	slog.Info("failover: retrying the recovery claims refused on an earlier tick", "host", target)
 	c.recoverWorkloads(ctx, h)
 	return true
+}
+
+// noteRecoveryAt records at as the moment host's recovery went ahead
+// (claimRetryAt): a fence's, in recoverFenced, or a partition-pause
+// deadline's wait start, in retryPauseWait. It is this coordinator's clock,
+// the one the observers' host_health rows are judged on.
+func (c *Coordinator) noteRecoveryAt(host string, at time.Time) {
+	if c.claimRetryAt == nil {
+		c.claimRetryAt = map[string]time.Time{}
+	}
+	c.claimRetryAt[host] = at
+}
+
+// claimRetryOutageOver re-judges a claim retry owed for target before
+// anything runs on it. A retry belongs to the recovery that left it owed,
+// and that recovery went ahead at a moment this coordinator recorded
+// (claimRetryAt): a fence's, or the partition-pause deadline's after it.
+// The retry outlives the outage when the host comes back without being put
+// back in service — its fence moved another workload, so recoverHosts leaves
+// it for an operator — and runs again when the host next drops out.
+//
+// That moment says nothing about the next outage. A host that has
+// answered since — no observer has watched it fail without a break since
+// that moment (observerStreakSpans) — is up, and runs whatever it did not
+// pause; in the next outage it pauses only T_pause after it loses the
+// majority. Run at once, the retry starts a replacement beside it. So the
+// retry is re-judged, as a fence of the new outage would be:
+//
+//   - when a fence of the host now would be a self-pause fence (its strategy
+//     is best-effort and its partition pause may be relied on,
+//     reliesOnPauseIfAssumed), it waits out a fresh partition-pause deadline
+//     (pauseDeadlinePassed), which retryPauseWait finishes under the
+//     deadline's whole rule, as for any self-pause fence;
+//   - otherwise the retry and the episode's memory are dropped and the host
+//     goes down the fence path a successor would take: resumeActionFor
+//     re-fences a verified fence and declines one that no longer stands.
+//
+// A retry within the outage it is owed to, or one with no moment recorded
+// (a recovery resumed on an operator's confirmation, which is the
+// operator's word that the host is off), is left as it is.
+func (c *Coordinator) claimRetryOutageOver(ctx context.Context, target string) {
+	if !c.claimRetry[target] {
+		return
+	}
+	if _, waiting := c.pauseWaits[target]; waiting {
+		return
+	}
+	h, err := corrosion.GetHost(ctx, c.db, target)
+	if err != nil || h == nil {
+		return
+	}
+	at, ok := c.claimRetryAt[target]
+	if !ok || c.observerStreakSpans(ctx, target, at) {
+		return
+	}
+	if c.reliesOnPauseIfAssumed(ctx, h) {
+		slog.Warn("failover: a recovery claim retry is owed to an outage this host has come back from; "+
+			"waiting out its partition pause afresh before retrying", "host", target,
+			"authority_at", at.UTC().Format(time.RFC3339))
+		delete(c.claimRetryAt, target)
+		if !c.pauseDeadlinePassed(ctx, h) {
+			c.noteHold(target, "a claim retry owed to an earlier outage is waiting out the host's partition pause afresh")
+		}
+		return
+	}
+	slog.Warn("failover: a recovery claim retry is owed to an outage this host has come back from; "+
+		"dropping it and deciding the host afresh", "host", target, "authority_at", at.UTC().Format(time.RFC3339))
+	delete(c.fenced, target)
+	delete(c.pauseWaits, target)
+	c.forgetClaimRetries(target)
 }

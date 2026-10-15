@@ -373,7 +373,49 @@ func TestObserveTickUnknown(t *testing.T) {
 	if len(fails) != 0 {
 		t.Fatalf("an unrelated unknown held a run: %v", fails)
 	}
+	// A claimant unreadable for good while a run is held fails the drill (once),
+	// the hold is logged on entry only, and the held run is cleared.
+	w = &leaseWatch{fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	fails, logs = nil, nil
+	w.observeTick(t0, two, nil)
+	for i := 1; i <= unknownPersistent+unknownHeldExtra; i++ {
+		w.observeTick(t0.Add(time.Duration(i)*time.Second), one, []string{"node-4"})
+	}
+	if len(fails) != 0 {
+		t.Fatalf("failed before the bound: %v", fails)
+	}
+	held := 0
+	for _, l := range logs {
+		if strings.Contains(l, "run held") {
+			held++
+		}
+	}
+	if held != 1 {
+		t.Fatalf("held-run line logged %d times, want 1", held)
+	}
+	w.observeTick(t0.Add(20*time.Second), one, []string{"node-4"})
+	if len(fails) != 1 || !strings.Contains(fails[0], "unverifiable") || w.selfClaim.n != 0 {
+		t.Fatalf("an unreadable claimant held a run forever: fails=%v n=%d", fails, w.selfClaim.n)
+	}
+	// A reader unreadable on every tick fails at Stop.
+	w = &leaseWatch{fail: func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }, logf: func(string, ...any) {}, stop: make(chan struct{}), done: make(chan struct{})}
+	close(w.done)
+	fails = nil
+	for i := 0; i < 8; i++ {
+		w.observeTick(t0.Add(time.Duration(i)*time.Second), nil, []string{"node-3"})
+	}
+	w.Stop()
+	if len(fails) != 1 || !strings.Contains(fails[0], "inconclusive") || !strings.Contains(w.summary(), "8 of 8") {
+		t.Fatalf("a never-readable reader: fails=%v summary=%q", fails, w.summary())
+	}
+	short := &leaseWatch{}
+	short.noteUnknown([]string{"node-3"})
+	short.noteUnknown(nil)
+	if len(short.neverReadable()) != 0 {
+		t.Fatal("too short a run reported never-readable")
+	}
 	// Persistent unknowns are logged once at the threshold and summarised.
+	w = &leaseWatch{fail: func(f string, a ...any) {}, logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
 	logs = nil
 	for i := 0; i < 5; i++ {
 		w.observeTick(t0.Add(time.Duration(10+i)*time.Second), nil, []string{"node-3"})
@@ -384,7 +426,7 @@ func TestObserveTickUnknown(t *testing.T) {
 			n++
 		}
 	}
-	if n != 1 || !strings.Contains(w.summary(), "node-3 unreadable on 5 tick") {
+	if n != 1 || !strings.Contains(w.summary(), "node-3 unreadable on 5 of") {
 		t.Fatalf("persistent unknown: logged %d, summary %q", n, w.summary())
 	}
 }

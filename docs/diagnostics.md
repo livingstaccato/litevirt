@@ -1687,10 +1687,12 @@ holder writes.
 
 - `partition_paused` (host, warning): this host lost the voter majority for
   10 s and paused its recoverable workloads itself. The evidence lists them.
-  It resolves when the last one resumes. Each workload resumes on its own once
-  the majority is back, its row still names this host at the same owner epoch
-  and incarnation, and a majority of voters confirms that this host is not
-  fenced and that no recovery claim moved it. One that stays paused is logged
+  It resolves when the last one resumes or its record is dropped, also when
+  the daemon restarted in between (a power cycle while paused). Each
+  workload resumes on its own once the majority is back, its row still names
+  this host at the same owner epoch and incarnation, and a majority of
+  voters confirms that this host is not fenced and that no recovery claim
+  moved it. One that stays paused is logged
   with the reason:
   ```
   partition-pause: paused workload       kind=vm name=<vm> reason="lost the voter majority for 10s (…)"

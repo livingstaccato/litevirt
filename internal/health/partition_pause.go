@@ -332,14 +332,19 @@ type PartitionPauser struct {
 	reads callGuard
 	// inflight marks the workloads whose pause call has not returned yet (a
 	// timed-out call is abandoned, not cancelled): no second call is issued.
-	inflight    map[string]bool
-	failed      map[string]string // key → error, this loss episode
-	failedOpen  bool
-	pausedEvid  string // evidence last written to partition_paused, "" when resolved
-	pausedOpen  bool
-	lastConfirm time.Time
-	heldWhy     map[string]string // key → last logged hold reason
-	exemptWhy   string
+	inflight   map[string]bool
+	failed     map[string]string // key → error, this loss episode
+	failedOpen bool
+	pausedEvid string // evidence last written to partition_paused, "" when resolved
+	pausedOpen bool
+	// pausedSynced: this process has seen the replicated partition_paused
+	// row resolved or absent, or resolved it itself. Until then a pass with
+	// no record checks the row, since an earlier process may have left it
+	// open (a restart, or a power cycle while paused).
+	pausedSynced bool
+	lastConfirm  time.Time
+	heldWhy      map[string]string // key → last logged hold reason
+	exemptWhy    string
 }
 
 // NewPartitionPauser builds the monitor for host, recording under dataDir.
@@ -1020,15 +1025,19 @@ func (p *PartitionPauser) syncPausedCondition(ctx context.Context, reason string
 		}
 	}
 	p.mu.Lock()
-	prevOpen, prevEvid := p.pausedOpen, p.pausedEvid
+	prevOpen, prevEvid, synced := p.pausedOpen, p.pausedEvid, p.pausedSynced
 	p.mu.Unlock()
 	if len(keys) == 0 {
-		if !prevOpen {
+		// No record: nothing on this host is paused by it, so the condition
+		// describes a pause that has ended. The in-memory flag knows only
+		// what THIS process opened; one a previous process opened is resolved
+		// from the row itself.
+		if !prevOpen && synced {
 			return
 		}
 		if p.writeCondition(ctx, corrosion.CondPartitionPaused, corrosion.SeverityWarning, "", true) {
 			p.mu.Lock()
-			p.pausedOpen, p.pausedEvid = false, ""
+			p.pausedOpen, p.pausedEvid, p.pausedSynced = false, "", true
 			p.mu.Unlock()
 		}
 		return

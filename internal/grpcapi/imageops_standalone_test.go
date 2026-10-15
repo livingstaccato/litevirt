@@ -1,8 +1,10 @@
 package grpcapi
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -54,6 +56,52 @@ func TestImportImage_RefusesImageThatNamesAHostFile(t *testing.T) {
 		t.Fatalf("refused image left in the store: stat err = %v", statErr)
 	}
 	if rec, _ := corrosion.GetImage(ctx, db, "crafted"); rec != nil {
+		t.Fatalf("refused image recorded: %+v", rec)
+	}
+}
+
+// An image qemu would refuse as corrupt — an lv image build of a disk over
+// 512 MiB from before that was fixed — is refused on import (lv image
+// import, lv image push, a peer's heal), naming the image and the remedy,
+// and nothing is published or recorded.
+func TestImportImage_RefusesMisalignedImage(t *testing.T) {
+	dataDir := t.TempDir()
+	db := corrosion.NewTestClientT(t)
+	ctx := adminCtx()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	imgStore := image.NewStore(dataDir)
+	imgStore.Init()
+	s := &Server{hostName: "test-host", dataDir: dataDir, db: db, images: imgStore, events: events.NewBus()}
+
+	p := filepath.Join(t.TempDir(), "built.qcow2")
+	if err := qcow2.Create(p, 1<<30, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l1 := binary.BigEndian.Uint64(body[40:48])
+	binary.BigEndian.PutUint64(body[l1:l1+8], 0x10200|1<<63) // off a 64 KiB boundary
+
+	stream := &mockImportImageStream{ctx: ctx, msgs: []*pb.ImportImageRequest{
+		{Name: "built", Format: "qcow2", Chunk: body},
+	}}
+	err = s.ImportImage(stream)
+	if status.Code(err) != codes.InvalidArgument || !qcow2.IsMisaligned(err) {
+		t.Fatalf("import of a misaligned image: got %v, want InvalidArgument naming the misalignment", err)
+	}
+	for _, want := range []string{`"built"`, "lv image build"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %s", err, want)
+		}
+	}
+	if _, statErr := os.Stat(imgStore.ImagePath("built")); !os.IsNotExist(statErr) {
+		t.Fatalf("refused image left in the store: stat err = %v", statErr)
+	}
+	if rec, _ := corrosion.GetImage(ctx, db, "built"); rec != nil {
 		t.Fatalf("refused image recorded: %+v", rec)
 	}
 }

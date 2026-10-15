@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 )
 
 // ErrMisaligned marks a qcow2 image naming a table or cluster at an offset
@@ -17,8 +19,14 @@ import (
 // such an image has to be built again. Nothing here repairs one.
 var ErrMisaligned = errors.New("qcow2 metadata not cluster-aligned")
 
+// IsMisaligned reports whether err is an ErrMisaligned refusal, here or —
+// by its text, the only part a gRPC status carries — on a peer.
+func IsMisaligned(err error) bool {
+	return err != nil && (errors.Is(err, ErrMisaligned) || strings.Contains(err.Error(), ErrMisaligned.Error()))
+}
+
 // misalignedHint is appended to every ErrMisaligned report.
-const misalignedHint = "qemu refuses this image as corrupt; an image made by lv image build from a disk over 512 MiB before this was fixed looks like this, and must be built again"
+const misalignedHint = "qemu refuses this image as corrupt; lv image build wrote images like this from disks over 512 MiB until it was fixed: rebuild the image with a fixed lv image build"
 
 func misaligned(format string, a ...any) error {
 	return fmt.Errorf("%w: %s; %s", ErrMisaligned, fmt.Sprintf(format, a...), misalignedHint)
@@ -68,40 +76,74 @@ func checkHeaderAlignment(h *Header) error {
 	return nil
 }
 
+// maxRefcountTableBytes is qemu's QCOW_MAX_REFTABLE_SIZE: qemu refuses to
+// open an image whose refcount table is larger ("Reference count table too
+// large"), so nothing here reads one.
+const maxRefcountTableBytes = 8 << 20
+
+// tableChunk is how much of a table is read at a time: the header claims a
+// table's size, and only the file bounds it.
+const tableChunk = 64 << 10
+
 // checkTableAlignment checks every offset the header, the L1 table and the
-// refcount table of a fileSize-byte image hold against the cluster size: each names a whole cluster
-// (or a run of them) in the qcow2 spec. Reserved low bits are masked off
-// the way qemu masks them, so what is judged is the offset qemu would use.
+// refcount table of a fileSize-byte image hold against the cluster size: each
+// names a whole cluster (or a run of them) in the qcow2 spec. Reserved low
+// bits are masked off the way qemu masks them, so what is judged is the
+// offset qemu would use. Both tables are bounded by the file before anything
+// is read, the refcount table by qemu's limit too, and each is read in
+// tableChunk pieces, so a crafted header allocates nothing large.
 func checkTableAlignment(f io.ReaderAt, h *Header, fileSize uint64) error {
 	if err := checkHeaderAlignment(h); err != nil {
 		return err
 	}
-	cs := h.ClusterSize()
-	if h.L1Size > 0 {
-		l1 := make([]byte, uint64(h.L1Size)*8)
-		if _, err := f.ReadAt(l1, int64(h.L1TableOffset)); err != nil {
-			return fmt.Errorf("read L1 table: %w", err)
-		}
-		for i := uint64(0); i < uint64(h.L1Size); i++ {
-			if off := binary.BigEndian.Uint64(l1[i*8:]) & 0x00fffffffffffe00; off%cs != 0 {
-				return misaligned("L1[%d] names an L2 table at %#x, not a multiple of the %d-byte cluster size", i, off, cs)
-			}
-		}
+	if fileSize > math.MaxInt64 {
+		return fmt.Errorf("invalid file size %d", fileSize)
 	}
-	// Bounded by the file before it is allocated: the cluster count is the
-	// header's to claim.
+	if err := validateHeaderRanges(h, int64(fileSize)); err != nil {
+		return err
+	}
+	cs := h.ClusterSize()
+	if err := forEachEntry(f, h.L1TableOffset, uint64(h.L1Size)*8, func(i, e uint64) error {
+		if off := e & 0x00fffffffffffe00; off%cs != 0 {
+			return misaligned("L1[%d] names an L2 table at %#x, not a multiple of the %d-byte cluster size", i, off, cs)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("L1 table: %w", err)
+	}
 	rctBytes := uint64(h.RefcountTableClusters) * cs
 	if end := h.RefcountTableOffset + rctBytes; end < h.RefcountTableOffset || end > fileSize {
 		return fmt.Errorf("refcount table extends beyond file")
 	}
-	rct := make([]byte, rctBytes)
-	if _, err := f.ReadAt(rct, int64(h.RefcountTableOffset)); err != nil {
-		return fmt.Errorf("read refcount table: %w", err)
+	if rctBytes > maxRefcountTableBytes {
+		return fmt.Errorf("refcount table is %d bytes, over qemu's %d-byte limit", rctBytes, maxRefcountTableBytes)
 	}
-	for i := 0; i+8 <= len(rct); i += 8 {
-		if off := binary.BigEndian.Uint64(rct[i:]) &^ 0x1ff; off%cs != 0 {
-			return misaligned("refcount table[%d] names a refcount block at %#x, not a multiple of the %d-byte cluster size", i/8, off, cs)
+	if err := forEachEntry(f, h.RefcountTableOffset, rctBytes, func(i, e uint64) error {
+		if off := e &^ 0x1ff; off%cs != 0 {
+			return misaligned("refcount table[%d] names a refcount block at %#x, not a multiple of the %d-byte cluster size", i, off, cs)
 		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("refcount table: %w", err)
+	}
+	return nil
+}
+
+// forEachEntry calls fn with the index and value of each big-endian 64-bit
+// entry in the length bytes at off, reading tableChunk bytes at a time.
+func forEachEntry(f io.ReaderAt, off, length uint64, fn func(i, e uint64) error) error {
+	buf := make([]byte, min(length, tableChunk))
+	for done := uint64(0); done < length; {
+		n := min(length-done, tableChunk)
+		if _, err := f.ReadAt(buf[:n], int64(off+done)); err != nil {
+			return err
+		}
+		for j := uint64(0); j+8 <= n; j += 8 {
+			if err := fn((done+j)/8, binary.BigEndian.Uint64(buf[j:])); err != nil {
+				return err
+			}
+		}
+		done += n
 	}
 	return nil
 }

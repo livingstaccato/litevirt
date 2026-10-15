@@ -568,7 +568,7 @@ func rebuildRefcounts(f *os.File, h *Header, fileEnd uint64, refcountBits uint32
 				hostOffset := l2Entry & offsetMask
 				// Mark all clusters that the compressed data spans.
 				startCluster := hostOffset / clusterSize
-				endByte := hostOffset + sectors*512
+				endByte := hostOffset + sectors*512 - hostOffset&511 // qemu's extent, as Check
 				endCluster := (endByte + clusterSize - 1) / clusterSize
 				for c := startCluster; c < endCluster && c < totalClusters; c++ {
 					markRef(refcounts, c)

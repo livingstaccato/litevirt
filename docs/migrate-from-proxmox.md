@@ -35,7 +35,7 @@ You want:
 | OIDC / LDAP / TOTP | realms + 2FA | OIDC code flow; LDAP search-then-bind |
 | Live migration | `lv migrate <vm> <host>` | qemu native; storage replicated via `lv replicate-volume` |
 | Live storage motion | `lv move-volume` | libvirt blockdev-mirror, no downtime |
-| Storage replication job `rate=` (MB/s) | `lv replication schedule add <vm> --bwlimit <N>M` | `rate=N` is `--bwlimit NM`; one limit shared by every run of the schedule on its source host |
+| Storage replication job `rate=` (MB/s) | `lv replication schedule add <vm> --bwlimit <N>M` | `rate=N` is `--bwlimit NM`, a fractional rate in K (`rate=1.5` is `--bwlimit 1536K`); one limit shared by every run of the schedule on its source host |
 | `cpulimit`, `cpuunits`, NIC `rate=` | `cpu-limit`, `cpu-shares`, `rate:` on a network entry | applied live. `cpu-limit` is total host cores (whole-domain cap, as `cpulimit`), `cpu-shares` is the same 1-10000 cgroup weight as `cpuunits` (default 100), `rate` is MB/s. `lv import` warns about the three and does not carry them — set them with `lv update` — see [compose](compose.md#noisy-neighbour-limits) |
 
 ## What's different (intentionally)

@@ -10,6 +10,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/network/fdbfake"
 )
 
 // NetProvFake is the fleet stand-in for the host network provisioner: one per
@@ -34,7 +35,11 @@ type NetProvFake struct {
 	// subnet: both listen on the same gateway address, so the second one
 	// exits at once (exit status 2). Off by default; SetDHCPConflicts.
 	dhcpConflicts bool
-	failWith      map[string]error // network → the error its Provision returns (FailProvision)
+	failWith      map[string]error  // network → the error its Provision returns (FailProvision)
+	vteps         map[string]string // network → the VTEP address its last Provision was handed
+	fdbSyncs      map[string]int    // network → SyncFDB calls
+	kernel        *fdbfake.Kernel   // this node's vxlan forwarding table (SyncFDB)
+	vnis          map[string]int    // network → VNI, from SyncFDB
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -69,13 +74,25 @@ func (f *NetProvFake) SetDHCPConflicts(on bool) {
 	f.dhcpConflicts = on
 }
 
-func (f *NetProvFake) Provision(_ context.Context, _ *corrosion.Client, name string, def compose.NetworkDef, _, _ string) (string, error) {
+// Provision records the network as set up here. A vxlan network also
+// registers this node's VTEP in network_vteps, as the real Provision does, so
+// the rows replicate and a scenario can see which address each node chose.
+func (f *NetProvFake) Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
 	dev := network.BridgeName(name, def)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.failWith[name]; err != nil {
 		return "", err
 	}
+	if def.Type == "vxlan" && def.VNI != 0 && db != nil {
+		if err := network.UpsertVTEP(ctx, db, name, hostName, localIP, def.VNI); err != nil {
+			return "", fmt.Errorf("upsert vtep: %w", err)
+		}
+	}
+	if f.vteps == nil {
+		f.vteps = map[string]string{}
+	}
+	f.vteps[name] = localIP
 	if f.dhcpConflicts && def.Subnet != "" {
 		if mine, err := netip.ParsePrefix(def.Subnet); err == nil {
 			for other, sub := range f.subnets {
@@ -200,4 +217,72 @@ func (f *NetProvFake) FlatBridges() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// VTEP is the VTEP address network's last Provision on this node was handed.
+func (f *NetProvFake) VTEP(network string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vteps[network]
+}
+
+// SyncFDB counts the network reconciler's forwarding-entry syncs and runs
+// the real sync (network.SyncFDBWith) against this node's model of the
+// kernel's forwarding table (fdbfake), where a second `add` of the flood
+// entry is refused as it is on a host. Its own address is the VTEP its last
+// Provision of the network was handed.
+func (f *NetProvFake) SyncFDB(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
+	f.mu.Lock()
+	if f.fdbSyncs == nil {
+		f.fdbSyncs = map[string]int{}
+	}
+	if f.kernel == nil {
+		f.kernel = fdbfake.New()
+	}
+	f.fdbSyncs[name]++
+	k, self := f.kernel, f.vteps[name]
+	if f.vnis == nil {
+		f.vnis = map[string]int{}
+	}
+	f.vnis[name] = def.VNI
+	f.mu.Unlock()
+	return network.SyncFDBWith(ctx, db, name, def, hostName, k.Exec, []string{self})
+}
+
+// Flood is network's flood list in this node's kernel table, sorted.
+func (f *NetProvFake) Flood(network string) []string {
+	f.mu.Lock()
+	k, vni := f.kernel, f.vnis[network]
+	f.mu.Unlock()
+	if k == nil {
+		return nil
+	}
+	return k.Dsts(fmt.Sprintf("vxlan%d", vni), "00:00:00:00:00:00")
+}
+
+// FDBSyncs counts SyncFDB calls for network on this node.
+func (f *NetProvFake) FDBSyncs(network string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fdbSyncs[network]
+}
+
+// LegacyVTEP is the tunnel address every fleet node resolves before the
+// release token latches: the default-route source address, which the nodes
+// share — they run on one machine, as every lab node sits behind the same
+// qemu NAT (10.0.2.15).
+const LegacyVTEP = "10.0.2.15"
+
+// ResolveVTEP is the fleet stand-in for network.ResolveVTEP (the nodes have
+// no interfaces of their own to read): before the latch, the shared
+// LegacyVTEP on ens3; after it, the node's host address on net1, or a refusal
+// with none.
+func (f *NetProvFake) ResolveVTEP(name string, def compose.NetworkDef, hostAddress string, switched bool) (string, string, error) {
+	if !switched {
+		return LegacyVTEP, "ens3", nil
+	}
+	if hostAddress == "" {
+		return "", "", &network.VTEPRefusal{Network: name, Reason: "this host's address is not known yet"}
+	}
+	return hostAddress, "net1", nil
 }

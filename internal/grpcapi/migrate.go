@@ -2483,25 +2483,40 @@ func migrationTuningFor(vm *corrosion.VMRecord, live bool) migrationTuning {
 	return t
 }
 
-// ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
-// before migration starts, so libvirt can find the file when the domain arrives.
-func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
-	// Parse spec to extract cloud-init data.
+// ensureCloudInitRequest is the seed ensureCloudInitOnTarget sends for vm:
+// its user-data and the network-config it was created with — the spec's, or
+// the one derived from its NIC rows and networks as CreateVM derived it. nil
+// sends none: a spec that cannot be parsed, or a network-config read that
+// failed (the target would keep a seed written without it — the outcome of a
+// target this host cannot reach).
+func (s *Server) ensureCloudInitRequest(ctx context.Context, vm *corrosion.VMRecord) *pb.EnsureCloudInitRequest {
 	var spec pb.VMSpec
 	if vm.Spec == "" {
-		return
+		return nil
 	}
 	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
 		slog.Warn("ensureCloudInitOnTarget: parse spec", "vm", vm.Name, "error", err)
-		return
+		return nil
 	}
-
-	// Build the request — send cloud-init data if present, otherwise send
-	// minimal data so the target generates a basic ISO.
 	req := &pb.EnsureCloudInitRequest{VmName: vm.Name}
 	if spec.CloudInit != nil {
 		req.Userdata = spec.CloudInit.Userdata
-		req.Networkconfig = spec.CloudInit.Networkconfig
+	}
+	nc, err := cloudinit.SeedNetworkConfig(ctx, s.db, vm.Name, &spec)
+	if err != nil {
+		slog.Warn("ensureCloudInitOnTarget: network-config could not be derived; no seed sent", "vm", vm.Name, "error", err)
+		return nil
+	}
+	req.Networkconfig = nc
+	return req
+}
+
+// ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
+// before migration starts, so libvirt can find the file when the domain arrives.
+func (s *Server) ensureCloudInitOnTarget(ctx context.Context, targetHost string, vm *corrosion.VMRecord) {
+	req := s.ensureCloudInitRequest(ctx, vm)
+	if req == nil {
+		return
 	}
 
 	// Check if the cloud-init ISO exists locally — if not, the VM was created

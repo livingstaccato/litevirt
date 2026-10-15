@@ -352,8 +352,7 @@ func (s *Server) ensureNICNetworkProvisioned(ctx context.Context, networkName st
 	if def.Interface == "" {
 		def.Interface = networkName
 	}
-	localIP := getLocalIP()
-	if _, perr := s.networkProvisioner().Provision(ctx, s.db, networkName, def, localIP, s.hostName); perr != nil {
+	if _, _, perr := s.provisionHere(ctx, networkName, def); perr != nil {
 		slog.Warn("nic attach: failed to provision network locally", "network", networkName, "error", perr)
 		return bridge, nil
 	}

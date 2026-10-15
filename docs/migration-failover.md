@@ -100,8 +100,8 @@ If either host has no credentials, the copy would cross the network in
 plaintext, and the source refuses it unless its config sets
 `migration.allow_unencrypted_storage: true` (see
 [configuration](configuration.md#migration)). Set that only where the network
-between hosts is trusted. Migrations of VMs on shared storage are tunnelled over
-libvirt's TLS and need neither.
+between hosts is trusted. Migrations of VMs on shared storage copy no disks, so
+they need neither.
 
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on

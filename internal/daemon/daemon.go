@@ -82,6 +82,10 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// buildServer replaces grpcapi.NewServer in newServer (tests, which have
+	// no libvirt); nil in a daemon.
+	buildServer func() *grpcapi.Server
+
 	// certWatch reports on the certificates this node serves (cert_watch.go).
 	certWatch *certWatch
 
@@ -928,7 +932,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("TLS config: %w", err)
 	}
 
-	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
+	svc := d.newServer() // host address and release gate: before the first network pass
 	// A guarded VM recovers only onto a host that enforces NIC guards until
 	// every host does (re-review m8).
 	fc.SetNICGuardPlacement(svc.GuardHostNeeded)
@@ -968,9 +972,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	rc.SetCapacityPolicy(capacity)
 	rc.QuorumLost = svc.LeaseQuorumLost
 	go rc.Start(ctx)
-	// Release features (capabilities.Feature) open through the checker's
-	// WithFeature: the release token's latch plus the replicated used bit.
-	svc.SetReleaseFeatureGate(d.checker)
 	d.checker.SetReleaseUseConfirmer(svc.PeerHoldsReleaseFeatureUse)
 	// A peer advertising a release token this build does not know is, almost
 	// always, a forward roll: a non-blocking look at its used records, never a
@@ -1370,7 +1371,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeCT := firewall.BridgeConntrackAvailable(ctx, true)
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
 		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs,
-			BridgeConntrack: func() bool { return bridgeCT }, Arming: fwArming})
+			OnDuplicateAddresses: firewall.NewDuplicateAddressReporter(d.db, d.cfg.HostName).Report,
+			BridgeConntrack:      func() bool { return bridgeCT }, Arming: fwArming})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	d.fwReconciler.SetArming(fwArming)
 	// Every domain start — an API start, a restart policy, a failover
@@ -1425,6 +1427,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Remember the clock skews this host sees past their rows' retention: the
 	// margin lv image prune keeps a deleted image's file within reads them.
 	go svc.RunImageSkewRecorder(ctx)
+	// Record a release feature's use found in replicated data with none
+	// recorded (one written through a daemon that predates the gate), on the
+	// failover lease holder, so a later rollback below the release still
+	// quarantines.
+	go svc.RunReleaseUseSweep(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order;
@@ -2718,18 +2725,41 @@ func fileBasedPoolDriver(driver string) bool {
 // host certificate does not cover. Falling back to getOutboundIP only reports
 // the source IP toward the default route, which is the wrong answer on a
 // multi-homed host whose cluster network is not the default one.
+//
+// It is also this host's VXLAN tunnel endpoint (newServer): one rule,
+// netutil.HostAddress, for all three.
 func (d *Daemon) hostAddress() string {
-	if d.cfg.AdvertiseAddress != "" {
-		return d.cfg.AdvertiseAddress
-	}
-	return getOutboundIP()
+	return netutil.HostAddress(d.cfg.AdvertiseAddress)
 }
 
 func getOutboundIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
+	return netutil.HostAddress("")
+}
+
+// newServer builds the gRPC server with what its first network pass needs
+// already wired. The daemon runs that pass (ReconcileNetworksOnce) a few steps
+// later, at startup, and a vxlan network provisioned there takes its tunnel
+// endpoint from both: this host's address, and the release gate, whose latch
+// decides whether that address is in use yet (network.ResolveVTEP). Wired any
+// later, the pass would find neither, and the server refuses a vxlan network
+// with no address rather than guess one.
+func (d *Daemon) newServer() *grpcapi.Server {
+	var svc *grpcapi.Server
+	if d.buildServer != nil {
+		svc = d.buildServer()
+	} else {
+		svc = grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	}
-	return "127.0.0.1"
+	d.wireServer(svc)
+	return svc
+}
+
+// wireServer is newServer's wiring, on a server already built.
+func (d *Daemon) wireServer(svc *grpcapi.Server) {
+	svc.SetHostAddress(d.hostAddress())
+	// Release features (capabilities.Feature) open through the checker's
+	// WithFeature: the release token's latch plus the replicated used bit.
+	svc.SetReleaseFeatureGate(d.checker)
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.

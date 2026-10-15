@@ -269,7 +269,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
 
 	// Soft-delete the DB record.
-	if err := corrosion.DeleteNetwork(ctx, s.db, req.Name); err != nil {
+	if err := s.deleteNetworkRecord(ctx, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete network: %v", err)
 	}
 
@@ -432,8 +432,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	}
 	s.auditCarriedVLANs(ctx, name, carried)
 
-	localIP := getLocalIP()
-	if _, err := s.networkProvisioner().Provision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
+	if _, _, err := s.provisionHere(ctx, name, def); err != nil {
 		return nil, s.explainProvisionFailure(ctx, name, def, err)
 	}
 	// Fail closed: don't report a provisioned network while its host-isolation/NAT
@@ -473,7 +472,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
-	if err := corrosion.DeleteNetwork(ctx, s.db, name); err != nil {
+	if err := s.deleteNetworkRecord(ctx, name); err != nil {
 		return err
 	}
 
@@ -496,6 +495,18 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		}
 	}
 	return nil
+}
+
+// deleteNetworkRecord soft-deletes a network's record and, once the release
+// token has latched, tombstones its network_vteps rows with it
+// (corrosion.DeleteNetworkAndVTEPs). Before the latch a host on the previous
+// build could not apply the VTEP tombstone, so the rows stay live, as they
+// always have.
+func (s *Server) deleteNetworkRecord(ctx context.Context, name string) error {
+	if s.ReleaseTokenLatched() {
+		return corrosion.DeleteNetworkAndVTEPs(ctx, s.db, name)
+	}
+	return corrosion.DeleteNetwork(ctx, s.db, name)
 }
 
 // networkRecordToInfo converts a corrosion.NetworkRecord to a pb.NetworkInfo.
@@ -581,8 +592,7 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 		s.auditCarriedVLANs(ctx, req.Name, carried)
 	}
 
-	localIP := getLocalIP()
-	if _, err := s.networkProvisioner().Provision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
+	if _, _, err := s.provisionHere(ctx, req.Name, def); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
 	}
 	// Fail closed: don't report a provisioned network while its host-isolation/NAT
@@ -591,25 +601,40 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 		return nil, status.Errorf(codes.Internal, "apply firewall for network %q: %v", req.Name, err)
 	}
 
-	// For VXLAN, notify existing peers about our VTEP.
-	if def.Type == "vxlan" && def.VNI != 0 {
-		s.notifyVTEPPeers(ctx, req.Name, def.VNI, localIP)
-	}
-
 	return &emptypb.Empty{}, nil
 }
 
-// SyncVTEP adds a flood entry for a remote VTEP on this host.
+// SyncVTEP adds a flood entry for a remote VTEP on this host, and prunes the
+// network's flood list as network.SyncFloodEntries does — so a peer whose VTEP
+// moved does not leave its old address behind here. An address of this
+// host's own is never installed.
 func (s *Server) SyncVTEP(ctx context.Context, req *pb.SyncVTEPRequest) (*emptypb.Empty, error) {
 	// Peer-only: VTEP flood sync is a host-to-host fan-out over peer mTLS.
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	if err := network.FloodEntry(int(req.Vni), req.VtepIp); err != nil {
+	// The VNI names the device whose entries the sync rewrites from this
+	// network's rows; a request whose VNI is not the network's would rewrite
+	// another network's device.
+	if nr, err := corrosion.GetNetwork(ctx, s.db, req.NetworkName); err != nil {
+		return nil, status.Errorf(codes.Internal, "read network %q: %v", req.NetworkName, err)
+	} else if nr != nil {
+		if def := networkRecordToDef(nr); def.Type != "vxlan" || def.VNI != int(req.Vni) {
+			return nil, status.Errorf(codes.InvalidArgument, "network %q is not vxlan VNI %d", req.NetworkName, req.Vni)
+		}
+	}
+	// The sender is the peer the certificate names (requirePeerCert bound it
+	// to a live host row): its pushed VTEP stands in for its row here.
+	if err := syncPeerVTEP(ctx, s.db, req.NetworkName, s.hostName, int(req.Vni),
+		callerMTLSCommonName(ctx), req.VtepIp); err != nil {
 		return nil, status.Errorf(codes.Internal, "add flood entry: %v", err)
 	}
 	return &emptypb.Empty{}, nil
 }
+
+// syncPeerVTEP is network.SyncPeerVTEP; a var so a test can see what SyncVTEP
+// hands it without a vxlan device.
+var syncPeerVTEP = network.SyncPeerVTEP
 
 // GetVMIPRemote discovers a workload's IP LOCALLY for a peer doing LB backend
 // discovery: a VM (owner_kind "" / "vm") by MAC via ARP/DHCP, or a container
@@ -718,7 +743,11 @@ func (s *Server) notifyVTEPPeersForNetwork(ctx context.Context, networkName stri
 	if err := json.Unmarshal([]byte(nr.Config), &def); err != nil || def.VNI == 0 {
 		return
 	}
-	localIP := getLocalIP()
+	def.Type = nr.Type
+	localIP, _, err := s.resolveVTEP(networkName, def)
+	if err != nil {
+		return
+	}
 	s.notifyVTEPPeers(ctx, networkName, def.VNI, localIP)
 }
 

@@ -29,6 +29,9 @@ func (p *bridgeRemovalProv) Deprovision(context.Context, *corrosion.Client, stri
 }
 func (p *bridgeRemovalProv) Provisioned(string, compose.NetworkDef) bool { return true }
 func (p *bridgeRemovalProv) GuestPorts(string) ([]string, error)         { return nil, nil }
+func (p *bridgeRemovalProv) SyncFDB(context.Context, *corrosion.Client, string, compose.NetworkDef, string) error {
+	return nil
+}
 func (p *bridgeRemovalProv) RemoveUnusedBridge(name string) (bool, error) {
 	if p.onRemove != nil {
 		p.onRemove(name)

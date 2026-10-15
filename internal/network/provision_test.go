@@ -447,13 +447,20 @@ func TestSyncFloodEntries(t *testing.T) {
 		t.Fatalf("SyncFloodEntries: %v", err)
 	}
 
-	// Should have called FloodEntry only for host2
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 flood call (for host2 only), got %d: %v", len(calls), calls)
+	// Should have appended a flood destination only for host2 (the rest of
+	// the calls read the device's entries for pruning).
+	var adds [][]string
+	for _, c := range calls {
+		if len(c) > 2 && c[0] == "bridge" && c[2] == "append" {
+			adds = append(adds, c)
+		}
+	}
+	if len(adds) != 1 {
+		t.Fatalf("expected 1 flood add (for host2 only), got %d: %v", len(adds), calls)
 	}
 	// Verify it's for host2's VTEP
 	found := false
-	for _, a := range calls[0] {
+	for _, a := range adds[0] {
 		if a == "10.10.0.2" {
 			found = true
 		}

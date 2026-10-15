@@ -3,10 +3,12 @@ package corrosion
 import (
 	"context"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/firewall/rulefield"
 )
 
 // SecurityGroup represents a security group.
@@ -104,24 +106,43 @@ func DeleteSecurityGroup(ctx context.Context, c *Client, id string) error {
 	)
 }
 
-// InsertSGRule adds an IPv4 rule to a security group; an IPv6 one needs
-// InsertSGRuleWithGrant.
+// InsertSGRule adds an IPv4 rule to a security group; one that needs a release
+// feature needs InsertSGRuleWithGrant.
 func InsertSGRule(ctx context.Context, c *Client, rule SGRule) error {
-	return InsertSGRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, rule)
+	return InsertSGRuleWithGrant(ctx, c, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, rule)
 }
 
 // InsertSGRuleWithGrant adds a rule to a security group. An IPv6 rule renders
 // as ip6 on this build, but a peer on an older build refuses its whole plan
-// on one, so it is the release feature firewall_ipv6: g must be its grant. A
+// on one, so it is the release feature firewall_ipv6; a logged rule is
+// firewall_log and one matching a tag group firewall_tag_groups, for the same
+// reason. g, gLog and gTag must be their grants (FirewallRowFeatures). A
 // malformed one is never written.
-func InsertSGRuleWithGrant(ctx context.Context, c *Client, g capabilities.FeatureGrant, rule SGRule) error {
-	v6, err := firewallRuleFamily(rule.CIDR, rule.Proto)
+func InsertSGRuleWithGrant(ctx context.Context, c *Client, g, gLog, gTag capabilities.FeatureGrant, rule SGRule) error {
+	// proto, port and cidr are written into every host's nft script as text.
+	rule.Proto, rule.PortRange, rule.Action = rulefield.NormaliseRule(rule.Proto, rule.PortRange, rule.Action)
+	if err := rulefield.StoredRule(rule.Direction, rule.Proto, rule.PortRange, rule.CIDR, rule.Action, ""); err != nil {
+		return err
+	}
+	need, err := firewallRowFeatures(rule.CIDR, rule.Proto, rule.Action)
 	if err != nil {
 		return err
 	}
-	if v6 {
+	// One grant per feature the row needs; each writer checks every one
+	// itself (release_guard_test.go writerTakesGrant).
+	if slices.Contains(need, capabilities.FeatureFirewallIPv6) {
 		if err := g.Check(capabilities.FeatureFirewallIPv6); err != nil {
 			return noIPv6Grant(err)
+		}
+	}
+	if slices.Contains(need, capabilities.FeatureFirewallLog) {
+		if err := gLog.Check(capabilities.FeatureFirewallLog); err != nil {
+			return noLogGrant(err)
+		}
+	}
+	if slices.Contains(need, capabilities.FeatureFirewallTagGroups) {
+		if err := gTag.Check(capabilities.FeatureFirewallTagGroups); err != nil {
+			return noTagGrant(err)
 		}
 	}
 	now := c.NowTS()

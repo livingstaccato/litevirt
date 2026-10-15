@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"sort"
@@ -240,6 +239,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		if vni == 0 {
 			return "", fmt.Errorf("vxlan network requires vni")
 		}
+		if localIP == "" {
+			return "", &VTEPRefusal{Network: networkName, Reason: "no tunnel local address was resolved for this host"}
+		}
 		underlay := def.Underlay
 		if underlay == "" {
 			underlay = defaultRouteInterface()
@@ -253,7 +255,14 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			return "", fmt.Errorf("ensure vxlan vni %d: %w", vni, err)
 		}
 
-		// Register this host's VTEP under the logical network name.
+		// Register this host's VTEP under the logical network name — unless
+		// the network was deleted while this pass ran: the upsert clears
+		// deleted_at, and would bring a tombstoned row back to life.
+		if deleted, err := networkTombstoned(ctx, db, networkName); err != nil {
+			return "", fmt.Errorf("read network %q: %w", networkName, err)
+		} else if deleted {
+			return "", fmt.Errorf("vxlan network %q was deleted; not registering this host's VTEP", networkName)
+		}
 		if err := UpsertVTEP(ctx, db, networkName, hostName, localIP, vni); err != nil {
 			return "", fmt.Errorf("upsert vtep: %w", err)
 		}
@@ -663,6 +672,18 @@ func isNoSuchDevice(out []byte) bool {
 	return strings.Contains(s, "Cannot find device") || strings.Contains(s, "No such device")
 }
 
+// networkTombstoned reports whether networkName has a deleted record and no
+// live one. A network with no record at all is not.
+func networkTombstoned(ctx context.Context, db *corrosion.Client, networkName string) (bool, error) {
+	rows, err := db.Query(ctx,
+		`SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END), 0) AS live
+		 FROM networks WHERE name = ?`, networkName)
+	if err != nil || len(rows) == 0 {
+		return false, err
+	}
+	return rows[0].Int("n") > 0 && rows[0].Int("live") == 0, nil
+}
+
 // UpsertVTEP writes this host's VTEP into network_vteps.
 func UpsertVTEP(ctx context.Context, db *corrosion.Client, networkName, hostName, vtepIP string, vni int) error {
 	now := db.NowTS()
@@ -712,46 +733,17 @@ func isGatewayHost(ctx context.Context, db *corrosion.Client, networkName, hostN
 	return vteps[0].HostName == hostName
 }
 
-// SyncFloodEntries reads all VTEPs for vni from DB and calls FloodEntry for each peer != hostName.
-func SyncFloodEntries(ctx context.Context, db *corrosion.Client, networkName, hostName string, vni int) error {
-	vteps, err := GetVTEPs(ctx, db, networkName)
-	if err != nil {
-		return fmt.Errorf("get vteps: %w", err)
-	}
-
-	for _, v := range vteps {
-		if v.HostName == hostName {
-			continue
-		}
-		if err := FloodEntry(vni, v.VTEPAddr); err != nil {
-			return fmt.Errorf("flood entry %s: %w", v.VTEPAddr, err)
-		}
-	}
-	return nil
-}
-
-// LocalIP returns the outbound IP of this host by dialing a UDP socket.
-func LocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
-}
-
 // ProvisionFunc provisions one network on this host and returns the device a
 // NIC attaches to. SafeProvision is the production one.
 type ProvisionFunc func(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, localIP, hostName string) (string, error)
 
-// ProvisionForVM looks up a network definition from corrosion and calls Provision
-// to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB) exists on this host.
-// Returns the bridge name, or "" if no provisioning is needed (flat bridge mode).
-// Shared by grpcapi.CreateVM and health.Reconciler.
-func ProvisionForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return ProvisionForVMWith(ctx, db, networkName, hostName, SafeProvision)
-}
-
-// ProvisionForVMWith is ProvisionForVM with the provisioning step supplied, so
-// a caller holding a provisioner seam uses the same record lookup.
+// ProvisionForVMWith looks up a network definition from corrosion and calls
+// provision to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB)
+// exists on this host. Returns the bridge name, or "" if no provisioning is
+// needed (flat bridge mode). It hands provision no VTEP address (""): the
+// provisioner resolves the tunnel endpoint itself
+// (grpcapi.Server.ProvisionNetworkHere), and network.Provision refuses a
+// vxlan network without one.
 func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, hostName string, provision ProvisionFunc) (string, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
@@ -772,8 +764,7 @@ func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, 
 		def.Interface = networkName
 	}
 
-	localIP := LocalIP()
-	bridge, err := provision(ctx, db, networkName, def, localIP, hostName)
+	bridge, err := provision(ctx, db, networkName, def, "", hostName)
 	if err != nil {
 		return "", err
 	}

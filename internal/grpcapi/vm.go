@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/litevirt/litevirt/internal/netutil"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -820,7 +819,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 	var guardRecords []corrosion.NICGuardRecord
-	dhcpReserved := map[int]bool{} // NIC index → address is a DHCP reservation, not a static one
+	boundNIC := map[int]bool{} // NIC index → address is a NetBox claim
+	// Host-isolated picks of this create: in flight until it returns, by
+	// which time its rows hold them or it failed (review m-4).
+	var isoPicks []isoPick
+	defer func() { s.releaseHostIsolatedPicks(isoPicks) }()
+	// The VIPs this VM's own load balancer and its stack's will take
+	// (review I-2, R1-m2): their LB rows are written after the stack's VMs.
+	// Read only for a create that makes a host-isolated pick.
+	var specVIPs []string
+	specVIPsRead := false
+	pickVIPs := func() []string {
+		if !specVIPsRead {
+			specVIPsRead = true
+			specVIPs = s.stackVIPs(ctx, spec.GetStackName())
+			if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+				specVIPs = append(specVIPs, lb.GetVip())
+			}
+		}
+		return specVIPs
+	}
 
 	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
 	// REMOTE side-effect: it cannot join the local atomic write, so every failure
@@ -967,6 +985,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				return nil, status.Errorf(codes.FailedPrecondition, "claim address from NetBox: %v", cerr)
 			}
 			nicIP = res.IP
+			boundNIC[i] = true
 			claims.add(claimedAddr{
 				Network: n.Name, IP: res.IP, MAC: mac,
 				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
@@ -990,8 +1009,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				cleanupDisks()
 				return nil, status.Errorf(codes.ResourceExhausted, "reserve a DHCP address on %q: %v", n.Name, rerr)
 			default:
+				// A reservation, not a static address: the NIC still asks
+				// DHCP (cloudinit.NetworkConfig reads a recorded address as
+				// static only on a bound or host-isolated network).
 				nicIP = ip
-				dhcpReserved[i] = true
+			}
+		} else if def, _ := lookupNetworkDef(ctx, s.db, n.Name); n.Ip == "" && cloudinit.HostIsolatedAddressable(def) {
+			// A host-isolated network runs no DHCP server, so the address is
+			// litevirt's to give: recorded on the NIC row here, delivered to
+			// the guest by the seed's network-config below (docs/compose.md,
+			// "Host isolation"). A NIC that cannot be given one is created as
+			// it always was, with no address, rather than refused.
+			if ip, ierr := s.hostIsolatedAddress(ctx, n.Name, def, pickVIPs()); ierr != nil {
+				slog.Warn("host-isolated network: no address for the NIC; the guest gets none",
+					"vm", spec.Name, "network", n.Name, "error", ierr)
+			} else {
+				nicIP = ip
+				isoPicks = append(isoPicks, isoPick{network: n.Name, ip: ip})
 			}
 		}
 
@@ -1042,69 +1076,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, err
 	}
 
-	// Build cloud-init network-config for interfaces with static IPs.
-	// Applies to any network type (bridge, vxlan, isolated) where the compose
-	// specifies an explicit IP. Uses V1 format for distro-agnostic MAC matching.
-	var staticNetCfg string
-	var staticIfaces []isolatedIface
+	// Build the seed's cloud-init network-config from the facts every later
+	// rebuild of the seed reads too (cloudinit.SeedNetworkConfig): the spec's
+	// NIC entries, the address each NIC row records, its network.
+	nicInputs := make([]cloudinit.NIC, 0, len(spec.Network))
 	for i, n := range spec.Network {
 		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
-		ip := n.Ip
-		if ip == "" && i < len(ifaceRecords) && !dhcpReserved[i] {
-			ip = ifaceRecords[i].IP
-		}
-
-		// Skip interfaces without a static IP unless host-isolated (which
-		// always needs cloud-init config to avoid DHCP).
-		if ip == "" {
-			continue
-		}
-		needsConfig := ip != "" // explicit static IP in compose
-		if netDef != nil && netDef.HostIsolation {
-			needsConfig = true
-		}
-		if !needsConfig {
-			continue
-		}
-
-		// Determine subnet prefix and gateway from network def or attachment.
-		address, gateway := staticIfaceGatewayAddress(ip, n.Gateway, netDef)
-		var dnsServers []string
-		if netDef != nil {
-			dnsServers = netDef.DNS
-		}
-		if len(dnsServers) == 0 {
-			dnsServers = []string{"1.1.1.1", "8.8.8.8"}
-		}
-		mac := ""
+		in := cloudinit.NIC{Ordinal: i, Net: netDef, Bound: boundNIC[i],
+			IP: n.Ip, Gateway: n.Gateway, IPv6: n.Ipv6, IPv6Gateway: n.Ipv6Gateway}
 		if i < len(ifaceRecords) {
-			mac = ifaceRecords[i].MAC
+			in.MAC = ifaceRecords[i].MAC
+			in.RecordedIP = ifaceRecords[i].IP
 		}
-
-		// IPv6 handling: a NIC can carry an explicit `ipv6:` (with
-		// optional `ipv6-gateway:`); when omitted we fall through to
-		// SLAAC / RA, which dnsmasq emits when the network's subnet
-		// is IPv6. Static v6 assignment is rare but useful for
-		// well-known endpoints (DNS, mail) where SLAAC's privacy
-		// extensions are inconvenient.
-		address6 := n.Ipv6
-		gateway6 := n.Ipv6Gateway
-		if address6 != "" && !strings.Contains(address6, "/") {
-			address6 = address6 + "/64"
-		}
-
-		staticIfaces = append(staticIfaces, isolatedIface{
-			MAC:      mac,
-			Address:  address,
-			Gateway:  gateway,
-			DNS:      dnsServers,
-			Address6: address6,
-			Gateway6: gateway6,
-		})
+		nicInputs = append(nicInputs, in)
 	}
-	if len(staticIfaces) > 0 {
-		staticNetCfg = buildIsolatedNetworkConfig(staticIfaces)
-	}
+	staticNetCfg := cloudinit.NetworkConfig(nicInputs)
 
 	// Generate cloud-init ISO if this is a cloud image
 	var cloudInitISO string
@@ -4034,12 +4020,6 @@ func GenerateMAC() string {
 	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", buf[0], buf[1], buf[2])
 }
 
-// provisionNetworkForVM delegates to network.ProvisionForVM.
-// Kept as a local wrapper for backward compatibility within this file.
-func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
-	return network.ProvisionForVM(ctx, db, networkName, hostName)
-}
-
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {
@@ -4088,87 +4068,15 @@ func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName str
 	return &def, nil
 }
 
-// buildIsolatedNetworkConfig generates a cloud-init V1 network-config YAML
-// for VMs on host-isolated networks. Uses MAC matching for distro-agnostic
-// interface binding (works on Ubuntu, CentOS, Arch, Debian, Alpine, etc.).
-//
-// IPv6: when iface.Address6 is set we emit a second `static6` subnet on
-// the same interface (cloud-init's V1 schema accepts dual-stack via
-// repeated `subnets:` entries with type `static` for v4 and `static6`
-// for v6).
-func buildIsolatedNetworkConfig(ifaces []isolatedIface) string {
-	if len(ifaces) == 0 {
-		return ""
-	}
-	cfg := "version: 1\nconfig:\n"
-	for i, iface := range ifaces {
-		cfg += fmt.Sprintf("  - type: physical\n    name: eth%d\n    mac_address: %q\n    subnets:\n", i, iface.MAC)
-		if iface.Address != "" {
-			cfg += fmt.Sprintf("      - type: static\n        address: %s\n", iface.Address)
-			if iface.Gateway != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway)
-			}
-			if len(iface.DNS) > 0 {
-				cfg += "        dns_nameservers:\n"
-				for _, ns := range iface.DNS {
-					cfg += fmt.Sprintf("          - %s\n", ns)
-				}
-			}
-		}
-		if iface.Address6 != "" {
-			cfg += fmt.Sprintf("      - type: static6\n        address: %s\n", iface.Address6)
-			if iface.Gateway6 != "" {
-				cfg += fmt.Sprintf("        gateway: %s\n", iface.Gateway6)
-			}
-		}
-	}
-	return cfg
-}
+// isolatedIface, buildIsolatedNetworkConfig and staticIfaceGatewayAddress
+// are the seed's network-config pieces, shared with the reconciler and the
+// migration path in package cloudinit.
+type isolatedIface = cloudinit.StaticIface
 
-type isolatedIface struct {
-	MAC      string
-	Address  string // IPv4 CIDR, e.g. "10.100.0.10/24"
-	Gateway  string
-	DNS      []string
-	Address6 string // IPv6 CIDR, e.g. "2001:db8::10/64"; empty = no static v6 (SLAAC/RA)
-	Gateway6 string
-}
+func buildIsolatedNetworkConfig(ifaces []isolatedIface) string { return cloudinit.BuildV1(ifaces) }
 
-// staticIfaceGatewayAddress derives the cloud-init network-config address (with
-// CIDR prefix) and the gateway for a NIC's static IP. An explicit gateway wins;
-// when the network has a subnet, the gateway defaults to the subnet's first host
-// as a BARE address — SubnetRange returns it with a prefix, which netplan/ENI
-// reject — and the address takes the subnet's prefix, but only when the caller
-// did NOT already supply one, so a submitted "10.0.1.50/24" is preserved rather
-// than doubled to "10.0.1.50/24/24". With no subnet def, a bare address gets a
-// family default (/64 for IPv6, /24 for IPv4).
 func staticIfaceGatewayAddress(ip, gateway string, netDef *compose.NetworkDef) (string, string) {
-	address := ip
-	if netDef != nil && netDef.Subnet != "" {
-		gw, _, _, _, err := network.SubnetRange(netDef.Subnet)
-		if err == nil {
-			if gateway == "" {
-				// SubnetRange returns the gateway WITH a prefix (10.0.1.1/24);
-				// the network-config gateway must be a bare host address, else
-				// netplan/ENI/sysconfig reject it and static addressing fails.
-				gateway = splitCIDR(gw)[0]
-			}
-			parts := splitCIDR(netDef.Subnet)
-			if parts[1] != "" && !strings.Contains(ip, "/") {
-				address = ip + "/" + parts[1]
-			}
-		}
-	} else if !strings.Contains(address, "/") {
-		// No subnet in network def — pick a sensible default based on address
-		// family. /24 for v4, /64 for v6 (the standard host prefix for end-user
-		// assignments).
-		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-			address = ip + "/64"
-		} else {
-			address = ip + "/24"
-		}
-	}
-	return address, gateway
+	return cloudinit.StaticAddress(ip, gateway, netDef)
 }
 
 // splitCIDR splits "10.0.0.0/24" into ["10.0.0.0", "24"].
@@ -4180,14 +4088,6 @@ func splitCIDR(cidr string) [2]string {
 		}
 	}
 	return [2]string{cidr, ""}
-}
-
-// getLocalIP returns the outbound IP of this host.
-func getLocalIP() string {
-	if ip := netutil.OutboundIP(); ip != "" {
-		return ip
-	}
-	return "127.0.0.1"
 }
 
 // SetVMIP updates the IP address of a VM interface in the state store.

@@ -2275,16 +2275,16 @@ vms:
 	}
 }
 
-// ─── provisionNetworkForVM ──────────────────────────────────────────────────
+// ─── provisionForVM ────────────────────────────────────────────────────────
 
 func TestProvisionNetworkForVM_NoRecord(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
 	// Network not in DB — should return empty string (flat bridge mode).
-	bridge, err := provisionNetworkForVM(ctx, s.db, "production", "test-host")
+	bridge, err := s.provisionForVM(ctx, "production")
 	if err != nil {
-		t.Fatalf("provisionNetworkForVM: %v", err)
+		t.Fatalf("provisionForVM: %v", err)
 	}
 	if bridge != "" {
 		t.Errorf("bridge = %q, want empty", bridge)
@@ -2300,9 +2300,9 @@ func TestProvisionNetworkForVM_NonVXLAN(t *testing.T) {
 		`INSERT INTO networks (name, type, config, updated_at)
 		 VALUES ('flat-net', 'bridge', '{}', '2024-01-01T00:00:00Z')`)
 
-	bridge, err := provisionNetworkForVM(ctx, s.db, "flat-net", "test-host")
+	bridge, err := s.provisionForVM(ctx, "flat-net")
 	if err != nil {
-		t.Fatalf("provisionNetworkForVM: %v", err)
+		t.Fatalf("provisionForVM: %v", err)
 	}
 	if bridge != "" {
 		t.Errorf("bridge = %q, want empty for non-vxlan", bridge)

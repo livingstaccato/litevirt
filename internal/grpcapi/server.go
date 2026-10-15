@@ -530,6 +530,16 @@ type Server struct {
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
+	// hostAddr is this host's cluster address (SetHostAddress), its VXLAN
+	// tunnel endpoint once the release token latches. '' = unwired: a vxlan
+	// network is refused.
+	hostAddr string
+	// vtepResolver resolves a vxlan tunnel endpoint (SetVTEPResolver); nil =
+	// network.ResolveVTEP.
+	vtepResolver VTEPResolver
+	// vtepRefused is the last refusal published per network (resolveVTEP).
+	vtepRefusedMu sync.Mutex
+	vtepRefused   map[string]string
 	// netReconcile is what ReconcileNetworksOnce has done on this host.
 	netReconcile netReconcileState
 
@@ -938,6 +948,13 @@ type Server struct {
 	// (nic_identity.go): network → address → reservation.
 	dhcpResMu   sync.Mutex
 	dhcpPending map[string]map[string]dhcpPendingRes
+	// Addresses given to NICs on host-isolated networks whose rows are not
+	// written yet (hostIsolatedAddress): network → address → when. Under
+	// dhcpResMu.
+	isoPending map[string]map[string]time.Time
+	// isoOffset, when set (tests), replaces where a host-isolated address
+	// scan starts (isoScanOffset).
+	isoOffset func(netName string) uint64
 	// Host-local DHCP facts a reservation depends on; nil = the real host
 	// (network.DHCPServedHere, network.BridgeHasUplink, network.AddDHCPHost).
 	// Test seams: SetDHCPReservationBackend.

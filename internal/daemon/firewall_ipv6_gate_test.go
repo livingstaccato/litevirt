@@ -50,7 +50,7 @@ func TestFirewallIPv6_ThroughTheReleaseGate(t *testing.T) {
 
 	v6 := corrosion.FirewallRule{ID: "r6", Direction: "ingress", Proto: "tcp", PortRange: "22", CIDR: "2001:db8::/32", Action: "accept"}
 	write := func(ctx context.Context, g capabilities.FeatureGrant) error {
-		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, db, g, v6)
+		return corrosion.InsertClusterFirewallRuleWithGrant(ctx, db, g, capabilities.FeatureGrant{}, capabilities.FeatureGrant{}, v6)
 	}
 	if err := corrosion.InsertClusterFirewallRule(ctx, db, v6); !errors.Is(err, corrosion.ErrFirewallIPv6GateClosed) {
 		t.Errorf("an IPv6 rule with no grant: %v, want ErrFirewallIPv6GateClosed", err)

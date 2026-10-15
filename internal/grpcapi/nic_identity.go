@@ -10,6 +10,9 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
+	"hash/fnv"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"time"
@@ -260,6 +263,143 @@ func (s *Server) reserveDHCPAddress(ctx context.Context, netName, subnet, bridge
 	}
 	s.dhcpPending[netName][ip] = dhcpPendingRes{mac: strings.ToLower(mac), at: time.Now()}
 	return ip, nil
+}
+
+// hostIsolatedAddress picks the address a new NIC on host-isolated network
+// netName is given. Free means: no live NIC row or lease on the network holds
+// it, it is not the network's gateway, one of its reserved addresses or a
+// load balancer's VIP (a live lb_configs row's, or one of vips, those of the
+// workload being created), and no create in flight on this host just took
+// it. The NIC row records it, and the seed's network-config delivers it to
+// the guest as a static address. The caller releases the pick
+// (releaseHostIsolatedPicks) once its rows are written or its create failed.
+//
+// The pick is decided from this node's replica, so two creates on two hosts
+// in the same moment could pick alike. The scan starts at an offset hashed
+// from this host and the network, which makes that unlikely short of a
+// nearly full subnet; a duplicate that happens anyway is reported by the
+// firewall reconciler (firewall.DuplicateAddressReporter).
+func (s *Server) hostIsolatedAddress(ctx context.Context, netName string, def *compose.NetworkDef, vips []string) (string, error) {
+	lbs, err := corrosion.ListLBConfigs(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	s.dhcpResMu.Lock()
+	defer s.dhcpResMu.Unlock()
+	// Read under the lock: a container's lease on this host is written under
+	// it too (claimContainerAddress), so neither misses the other.
+	assigned, err := corrosion.NetworkAssignedAddrs(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	s.pruneIsoPendingLocked()
+	used := append([]string(nil), assigned[netName]...)
+	for ip := range s.isoPending[netName] {
+		used = append(used, ip)
+	}
+	if def.Gateway != "" {
+		used = append(used, def.Gateway)
+	}
+	used = append(used, def.ReservedAddresses...)
+	for _, lb := range lbs {
+		used = append(used, lb.VIP)
+	}
+	used = append(used, vips...)
+	ip, err := network.NextFreeIPv4From(def.Subnet, used, s.isoScanOffset(netName))
+	if err != nil {
+		return "", err
+	}
+	if s.isoPending[netName] == nil {
+		s.isoPending[netName] = map[string]time.Time{}
+	}
+	s.isoPending[netName][ip] = time.Now()
+	return ip, nil
+}
+
+// stackVIPs are the load balancer VIPs the stack's VMs already recorded
+// name in their specs: an LB row is written only after its stack's VMs, so
+// a VM created after one that names a VIP must still pass over it. A VIP
+// named by a VM of the stack created later is not known yet
+// (docs/compose.md: list it in reserved-addresses). Read only; a read
+// failure gives none.
+func (s *Server) stackVIPs(ctx context.Context, stack string) []string {
+	if stack == "" {
+		return nil
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, stack, "")
+	if err != nil {
+		slog.Warn("host-isolated pick: could not read the stack's VMs for their VIPs", "stack", stack, "error", err)
+		return nil
+	}
+	var out []string
+	for _, vm := range vms {
+		var spec pb.VMSpec
+		if json.Unmarshal([]byte(vm.Spec), &spec) != nil {
+			continue
+		}
+		if lb := spec.GetLoadbalancer(); lb != nil && lb.GetVip() != "" {
+			out = append(out, lb.GetVip())
+		}
+	}
+	return out
+}
+
+// isoScanOffset is where this host's scan of netName's subnet starts.
+func (s *Server) isoScanOffset(netName string) uint64 {
+	if s.isoOffset != nil {
+		return s.isoOffset(netName)
+	}
+	h := fnv.New64a()
+	h.Write([]byte(s.hostName + "\x00" + netName))
+	return h.Sum64()
+}
+
+// isoPick is one address hostIsolatedAddress handed out.
+type isoPick struct{ network, ip string }
+
+// releaseHostIsolatedPicks drops picks from the in-flight set: their rows are
+// written (and now hold the address) or their create failed.
+func (s *Server) releaseHostIsolatedPicks(picks []isoPick) {
+	if len(picks) == 0 {
+		return
+	}
+	s.dhcpResMu.Lock()
+	defer s.dhcpResMu.Unlock()
+	for _, p := range picks {
+		delete(s.isoPending[p.network], p.ip)
+		if len(s.isoPending[p.network]) == 0 {
+			delete(s.isoPending, p.network)
+		}
+	}
+}
+
+// pruneIsoPendingLocked drops in-flight picks older than any create takes to
+// write its rows. Caller holds dhcpResMu.
+func (s *Server) pruneIsoPendingLocked() {
+	if s.isoPending == nil {
+		s.isoPending = map[string]map[string]time.Time{}
+	}
+	for n, m := range s.isoPending {
+		for ip, at := range m {
+			if time.Since(at) > 10*time.Minute {
+				delete(m, ip)
+			}
+		}
+		if len(m) == 0 {
+			delete(s.isoPending, n)
+		}
+	}
+}
+
+// isoPendingAddrs is a copy of netName's in-flight picks. Caller holds
+// dhcpResMu.
+func (s *Server) isoPendingAddrsLocked(netName string) []string {
+	s.pruneIsoPendingLocked()
+	out := make([]string, 0, len(s.isoPending[netName]))
+	for ip := range s.isoPending[netName] {
+		out = append(out, ip)
+	}
+	return out
 }
 
 // dhcpPendingRes is a reservation made for a NIC whose rows are not written

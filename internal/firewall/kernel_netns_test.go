@@ -67,6 +67,13 @@ func TestKernel_NICGuard(t *testing.T) {
 			t.Errorf("%s did not pass in the namespace", child)
 		}
 	}
+	// Children with their own module list skip on their own when one is
+	// missing (saying which); they must not fail or vanish.
+	for _, child := range []string{"TestKernelChild_CompatCorpusLoads"} {
+		if !strings.Contains(string(out), "--- PASS: "+child) && !strings.Contains(string(out), "--- SKIP: "+child) {
+			t.Errorf("%s neither passed nor skipped in the namespace", child)
+		}
+	}
 }
 
 // kernelTestModules are the modules the rulesets these tests load make the
@@ -1182,5 +1189,58 @@ func TestKernelChild_VLANToNICAndTrunk(t *testing.T) {
 	}
 	if !l.deliveredFrom(t, "lvvg0", "lvvg2", hop) {
 		t.Error("no table: VLAN 102 still does not leave — the drop above was not the rule's")
+	}
+}
+
+// compatCorpusModules are the modules the compat corpus's rulesets make the
+// kernel use beyond kernelTestModules: reject in the inet table, and the NAT
+// chain's snat and masquerade.
+var compatCorpusModules = []string{"nf_tables", "nf_conntrack", "nft_ct", "nf_conntrack_bridge", "nft_meta_bridge", "bridge",
+	"nft_reject", "nft_reject_inet", "nf_reject_ipv4", "nf_reject_ipv6", "nf_nat", "nft_nat", "nft_masq", "nft_chain_nat"}
+
+// TestKernelChild_CompatCorpusLoads: every row that applies on the build
+// before the rule grammar (the compat corpus, render_compat_golden_test.go)
+// still renders into a ruleset a real nft accepts, in enforce and observe
+// mode, with the comment `a; b #1`, a 127-byte comment and a port an older
+// peer stored as `SSH` (spec §0.4; review I-1, I-2). `nft -c` checks the
+// whole transaction against the namespace's own nf_tables and changes
+// nothing.
+//
+// The corpus's DNS-named CIDR is swapped for an address: resolving a name is
+// nft's dependency on the host's resolver, which the namespace has none of.
+//
+// Mutation: render a port as stored — `dport SSH` is refused, red.
+func TestKernelChild_CompatCorpusLoads(t *testing.T) {
+	inNetns(t)
+	if missing := missingModules(compatCorpusModules...); len(missing) > 0 {
+		t.Skipf("the corpus rulesets would make the kernel load %v, which is not loaded on this host", missing)
+	}
+	plan := loadCompatPlan(t)
+	var rules []Rule
+	for _, r := range plan.ClusterRules {
+		if r.CIDR == "gw.example.com" {
+			r.CIDR = "192.0.2.53"
+		}
+		rules = append(rules, r)
+	}
+	rules = append(rules,
+		Rule{Direction: Ingress, Proto: "tcp", PortRange: "2200", Action: Accept, Comment: "a; b #1"},
+		Rule{Direction: Ingress, Proto: "tcp", PortRange: "2201", Action: Accept, Comment: strings.Repeat("x", 127)},
+		Rule{Direction: Ingress, Proto: "TCP", PortRange: "SSH", CIDR: "10.7.0.0/16", Action: Drop},
+	)
+	plan.ClusterRules = rules
+	for _, mode := range []string{NICModeEnforce, NICModeObserve} {
+		p := plan
+		p.NICMode = mode
+		p.NICs = []NICBinding{{NICDev: "tap0", VMName: "vm", SecurityGroups: []string{"web"}}}
+		script, err := Render(p)
+		if err != nil {
+			t.Fatalf("%s: Render refused the corpus: %v", mode, err)
+		}
+		cmd := exec.Command("nft", "-c", "-f", "-")
+		cmd.Stdin = strings.NewReader(script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s: nft -c refused the corpus ruleset: %v\n%s", mode, err, out)
+		}
 	}
 }

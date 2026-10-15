@@ -1,0 +1,24 @@
+version: 1
+config:
+  - type: physical
+    name: eth0
+    mac_address: "52:54:00:00:03:01"
+    subnets:
+      - type: static
+        address: 172.40.0.10/24
+        gateway: 172.40.0.1
+        dns_nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+  - type: physical
+    name: eth1
+    mac_address: "52:54:00:00:03:02"
+    subnets:
+      - type: static
+        address: 10.201.0.10/24
+        gateway: 10.201.0.1
+        dns_nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+      - type: static6
+        address: fd00::10/64

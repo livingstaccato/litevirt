@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
@@ -258,14 +259,28 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			}
 			ip = n.Ip
 		case def.Subnet != "":
-			cand, aerr := alloc.Claim(ctx, network.ClaimRequest{
+			req := network.ClaimRequest{
 				Network:   netName,
 				Subnet:    def.Subnet,
 				MAC:       mac,
 				OwnerKind: "ct",
 				OwnerHost: s.hostName,
 				Name:      ctName,
-			})
+			}
+			var cand network.ClaimResult
+			var aerr error
+			if cloudinit.HostIsolatedAddressable(def) {
+				// A VM create on this host may hold an address on this
+				// network whose rows are not written yet: pass over it,
+				// and claim under the lock its picks are made under
+				// (review m-5).
+				s.dhcpResMu.Lock()
+				req.Exclude = s.isoPendingAddrsLocked(netName)
+				cand, aerr = alloc.Claim(ctx, req)
+				s.dhcpResMu.Unlock()
+			} else {
+				cand, aerr = alloc.Claim(ctx, req)
+			}
 			if aerr != nil {
 				return nil, status.Errorf(codes.ResourceExhausted, "allocate IP on network %q: %v", netName, aerr)
 			}

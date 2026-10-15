@@ -1864,6 +1864,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	// The reservation must outlive startVMLocked's state write.
 	held.hold(func() { lease.release(ctx) })
+	// A guard record an earlier build left for a NIC the VM no longer has
+	// would refuse the start guard: retire it under the lock first.
+	s.retireOrphanNICGuards(ctx, vm.Name, "")
 	if rearmed, err := s.restartCancelledStartLocked(ctx, vm); err != nil {
 		return nil, err
 	} else if rearmed {

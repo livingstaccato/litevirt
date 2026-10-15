@@ -697,7 +697,13 @@ this host's own `failover_scope_v1` latch cannot form, the create fails. A
 container whose guards cannot be written for any other reason is not created. A record is retired (tombstoned) when its
 VM or container is deleted, and a record written for another incarnation of the
 same VM name guards nothing; a re-create carries only the guard state of the
-incarnation it replaces.
+incarnation it replaces. A NIC's record is also retired when `lv detach-nic`
+removes the NIC, once it is gone from the domain, and when an `lv attach-nic`
+that wrote it fails and its NIC is verified gone. A record an earlier build
+left for a NIC the VM no longer has is not demanded in force once the NIC's row
+is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
+`lv migrate` or `lv start`, when no NIC row and neither definition of the
+domain on that host has its MAC.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

@@ -223,6 +223,19 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 // greatest updated_at wins, vm_nics on an exact tie, and a tombstoned winner
 // hides the NIC. The result is unordered.
 func mergeNICRows(ifaces, nics []NICRecord) []NICRecord {
+	best := nicRowWinners(ifaces, nics)
+	out := make([]NICRecord, 0, len(best))
+	for _, w := range best {
+		if w.DeletedAt == "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// nicRowWinners is the overlay's winning row per (vm_name, mac), tombstoned
+// winners included (mergeNICRows).
+func nicRowWinners(ifaces, nics []NICRecord) map[nicKey]NICRecord {
 	type candidate struct {
 		rec      NICRecord
 		fromNics bool
@@ -252,11 +265,9 @@ func mergeNICRows(ifaces, nics []NICRecord) []NICRecord {
 		consider(r, true)
 	}
 
-	out := make([]NICRecord, 0, len(best))
-	for _, cand := range best {
-		if cand.rec.DeletedAt == "" {
-			out = append(out, cand.rec)
-		}
+	out := make(map[nicKey]NICRecord, len(best))
+	for k, cand := range best {
+		out[k] = cand.rec
 	}
 	return out
 }

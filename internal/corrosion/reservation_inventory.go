@@ -55,12 +55,6 @@ const (
 	ReservationNoRunningOperation ReservationClass = "no_running_operation"
 )
 
-// Releasable reports whether the class is one the reservation sweep releases on
-// its own evidence. The caller must still hold the VM lock on the target host.
-func (c ReservationClass) Releasable() bool {
-	return c == ReservationTerminalPastHeader || c == ReservationVMGone
-}
-
 // HostReservationView is one counted reservation and the evidence it was
 // classified from.
 type HostReservationView struct {
@@ -87,10 +81,17 @@ type HostReservationView struct {
 	BarrierHeld bool
 	// ReleaseBlocked: a tombstoned cancelled row already holds the release
 	// row's key at the header epoch, so ReleaseReservation cannot write it and
-	// the reservation stays counted whatever its class. A sweep skips it.
+	// the reservation stays counted whatever its class (Releasable is false).
 	ReleaseBlocked bool
 	Class          ReservationClass
 	Detail         string
+}
+
+// Releasable reports whether the sweep may release the reservation on its own
+// evidence: its class is terminal_past_header or vm_gone, and its release is
+// not blocked. The caller must still hold the VM lock on the target host.
+func (v *HostReservationView) Releasable() bool {
+	return !v.ReleaseBlocked && (v.Class == ReservationTerminalPastHeader || v.Class == ReservationVMGone)
 }
 
 // reservationSweepKinds are the operation kinds whose reservation can be

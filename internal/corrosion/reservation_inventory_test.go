@@ -90,6 +90,9 @@ func TestClassify_LabLeakShapeIsTerminalPastHeader(t *testing.T) {
 	if v.Class != ReservationTerminalPastHeader {
 		t.Fatalf("lab leak shape classified %q (%s), want %q", v.Class, v.Detail, ReservationTerminalPastHeader)
 	}
+	if !v.Releasable() {
+		t.Fatal("the lab leak shape is not reported releasable")
+	}
 	if v.HeaderEpoch != 0 || v.LatestEpoch != 1 || v.LatestState != OpStepCompleted || !v.Admitted {
 		t.Errorf("view: header %d latest %d state %q admitted %v, want 0, 1, completed, true",
 			v.HeaderEpoch, v.LatestEpoch, v.LatestState, v.Admitted)
@@ -188,7 +191,7 @@ func TestClassify_CapacityLeaseNeverReleasable(t *testing.T) {
 	if v.Class != ReservationCapacityLease {
 		t.Fatalf("capacity lease classified %q (%s), want %q", v.Class, v.Detail, ReservationCapacityLease)
 	}
-	if v.Class.Releasable() {
+	if v.Releasable() {
 		t.Fatal("a capacity lease reported releasable")
 	}
 }
@@ -493,6 +496,9 @@ func TestReleaseReservation_TombstonedReleaseRowBlocksTheRelease(t *testing.T) {
 	v := mustClassify(t, c, "leak")
 	if !v.ReleaseBlocked || !strings.Contains(v.Detail, "release blocked") {
 		t.Fatalf("view: ReleaseBlocked=%v detail %q, want the blocked release flagged", v.ReleaseBlocked, v.Detail)
+	}
+	if v.Class != ReservationTerminalPastHeader || v.Releasable() {
+		t.Fatalf("blocked view: class %q releasable=%v, want terminal_past_header and not releasable", v.Class, v.Releasable())
 	}
 }
 

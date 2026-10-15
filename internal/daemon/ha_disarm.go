@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/failover"
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/metrics"
@@ -34,8 +36,25 @@ func (d *Daemon) startHAPolicyCache(ctx context.Context, svc *grpcapi.Server) {
 }
 
 // startHADisarmPreRecord starts the lease holder's first-use record of
-// ha_disarm. No-op until it is implemented.
-func (d *Daemon) startHADisarmPreRecord(ctx context.Context, fc *failover.Coordinator) {}
+// ha_disarm: once release_2026_11_v1 has latched, the lease holder records
+// the use with no data write, so the first disarm does not need every host
+// reachable. Its own goroutine, never inside a coordinator cycle.
+func (d *Daemon) startHADisarmPreRecord(ctx context.Context, fc *failover.Coordinator) {
+	info, ok := capabilities.LookupFeature(capabilities.FeatureHADisarm)
+	if !ok {
+		return
+	}
+	p := &failover.HAPreRecorder{
+		HoldsLease: fc.HoldsLease,
+		Latched:    func() bool { return d.checker.DurablyLatched(info.Token) },
+		Paid: func(ctx context.Context) (bool, error) {
+			present, acked, err := corrosion.ReleaseFeatureState(ctx, d.db, info.Token, string(capabilities.FeatureHADisarm))
+			return present && acked, err
+		},
+		Record: func(ctx context.Context) error { return failover.HADisarmPreRecord(ctx, d.checker.WithFeature) },
+	}
+	go p.Run(ctx)
+}
 
 // haMetrics is the HA policy's gauges, registered once.
 func (d *Daemon) haMetrics() *metrics.HADisarmMetrics {

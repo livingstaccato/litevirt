@@ -1257,8 +1257,9 @@ var logFormsModules = append(append([]string(nil), compatCorpusModules...), "nft
 // real nft accepts. `nft -c` changes nothing.
 //
 // Mutation: declare the limit as `limit lv_x { rate 5/second; burst 10
-// packets; }`-style syntax nft does not take, or render `log group` after the
-// prefix — red.
+// packets; }`-style syntax nft does not take, or reference a `limit name`
+// the table does not declare — red. (nft takes log arguments in any order, so
+// moving `log group` after the prefix is not a mutation.)
 func TestKernelChild_LogFormsLoad(t *testing.T) {
 	inNetns(t)
 	if missing := missingModules(logFormsModules...); len(missing) > 0 {

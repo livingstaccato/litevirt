@@ -97,6 +97,7 @@ func TestRenderGolden(t *testing.T) {
 			}
 			golden.Assert(t, tc.path, got)
 			assertEveryLogHasGroup(t, got)
+			assertLimitsDeclared(t, got)
 		})
 	}
 }

@@ -110,5 +110,6 @@ func FuzzRender(f *testing.F) {
 		}
 		// L-1: every log statement sends to an NFLOG group.
 		assertEveryLogHasGroup(t, out)
+		assertLimitsDeclared(t, out)
 	})
 }

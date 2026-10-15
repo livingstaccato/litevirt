@@ -77,6 +77,49 @@ func assertEveryLogHasGroup(t testing.TB, script string) {
 	}
 }
 
+var (
+	tableStartRE = regexp.MustCompile(`^table \S+ \S+ \{`)
+	limitDeclRE  = regexp.MustCompile(`^\s+limit (\S+) \{`)
+	limitRefRE   = regexp.MustCompile(`limit name "([^"]+)"`)
+)
+
+// assertLimitsDeclared is the declaration guard: every `limit name "X"` a
+// table uses is declared in that same table, and no name is declared twice
+// there. An undeclared reference or a duplicate declaration makes nft refuse
+// the whole ruleset, and the host keeps its last one.
+func assertLimitsDeclared(t testing.TB, script string) {
+	t.Helper()
+	declared := map[string]bool{}
+	var refs []string
+	table := ""
+	flush := func() {
+		for _, r := range refs {
+			if !declared[r] {
+				t.Errorf("table %s references limit %q it does not declare", table, r)
+			}
+		}
+		declared, refs = map[string]bool{}, nil
+	}
+	for _, line := range strings.Split(script, "\n") {
+		if tableStartRE.MatchString(line) {
+			flush()
+			table = line
+			continue
+		}
+		if m := limitDeclRE.FindStringSubmatch(line); m != nil {
+			if declared[m[1]] {
+				t.Errorf("table %s declares limit %q twice", table, m[1])
+			}
+			declared[m[1]] = true
+			continue
+		}
+		for _, m := range limitRefRE.FindAllStringSubmatch(line, -1) {
+			refs = append(refs, m[1])
+		}
+	}
+	flush()
+}
+
 // The log is its own line, ahead of the verdict line it logs: a limit that
 // does not match stops its rule, so a verdict on the same line would be
 // skipped once the budget is spent.
@@ -381,6 +424,38 @@ func TestLogRender_GuardCatchesPlainLog(t *testing.T) {
 		t.Error("guard refused an NFLOG line")
 	}
 	assertEveryLogHasGroup(t, mustRender(t, logPlan(NICModeEnforce)))
+}
+
+// The declaration guard catches an undeclared and a doubly declared limit,
+// and passes a declared one.
+//
+// Mutation: drop the `p.LogPolicy.Default ||` term in renderNICLogLimits —
+// the fuzz and golden corpora go red through the guard.
+func TestLogRender_GuardCatchesUndeclaredLimit(t *testing.T) {
+	body := "    chain c {\n        limit name \"a\" log group 27 snaplen 96 prefix \"p\"\n    }\n"
+	use := "table bridge x {\n" + body + "}\n"
+	decl := "    limit a {\n        rate 1/second burst 1 packets\n    }\n"
+	ft := &fakeT{}
+	assertLimitsDeclared(ft, use)
+	if !ft.failed {
+		t.Error("guard passed an undeclared limit")
+	}
+	ft = &fakeT{}
+	assertLimitsDeclared(ft, "table bridge x {\n"+decl+decl+"}\n")
+	if !ft.failed {
+		t.Error("guard passed a limit declared twice")
+	}
+	ft = &fakeT{}
+	assertLimitsDeclared(ft, "table bridge x {\n"+decl+"}\n"+"table inet y {\n"+body+"}\n")
+	if !ft.failed {
+		t.Error("guard accepted a limit declared in another table")
+	}
+	ft = &fakeT{}
+	assertLimitsDeclared(ft, "table bridge x {\n"+decl+body+"}\n")
+	if ft.failed {
+		t.Error("guard refused a declared limit")
+	}
+	assertLimitsDeclared(t, mustRender(t, logPlan(NICModeEnforce)))
 }
 
 type fakeT struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -32,9 +33,11 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 	// before the spec recorded generated MACs has none, and takes the row at
 	// its position on its network — (ordinal, network), as matchStoredNIC and
 	// NICRate match a spec NIC to its row; every create path writes a NIC's
-	// ordinal as its spec index. Nothing else: after a hot detach and attach a
-	// row on the same network is another NIC. A NIC whose row cannot be told
-	// has no MAC, and NetworkConfig then writes no network-config.
+	// ordinal as its spec index. An entry that names an `ip:` takes that row only
+	// when the row records the same IPv4 address, which every create path wrote
+	// from the spec. Nothing else: after a hot detach and attach a row on the
+	// same network is another NIC. A NIC whose row cannot be told has no MAC,
+	// and NetworkConfig then writes no network-config.
 	type pos struct {
 		ordinal int
 		network string
@@ -59,7 +62,8 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		if macs[i] != "" {
 			continue
 		}
-		if r, ok := byPos[pos{i, n.GetName()}]; ok && !taken[strings.ToLower(r.MAC)] {
+		if r, ok := byPos[pos{i, n.GetName()}]; ok && !taken[strings.ToLower(r.MAC)] &&
+			(n.GetIp() == "" || sameAddr(r.IP, n.GetIp())) {
 			macs[i] = strings.ToLower(r.MAC)
 			taken[macs[i]] = true
 		}
@@ -89,6 +93,30 @@ func SeedNetworkConfig(ctx context.Context, db *corrosion.Client, vmName string,
 		})
 	}
 	return NetworkConfig(nics), nil
+}
+
+// sameAddr reports whether a and b name the same IP address, ignoring a
+// prefix length ("10.1.0.50/24" is "10.1.0.50"). An empty or unparseable
+// address matches nothing.
+func sameAddr(a, b string) bool {
+	pa, ok := parseAddr(a)
+	if !ok {
+		return false
+	}
+	pb, ok := parseAddr(b)
+	return ok && pa == pb
+}
+
+func parseAddr(s string) (netip.Addr, bool) {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return a.Unmap(), true
 }
 
 // NetworkDef reads a network's definition: (nil, nil) when the network has

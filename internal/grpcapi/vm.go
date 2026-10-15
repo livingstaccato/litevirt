@@ -1353,6 +1353,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		CPUActual: int(spec.Cpu),
 		MemActual: int(spec.MemoryMib),
 		Project:   project, // tenancy label
+		// A re-create keeps the firewall identity of the row its own delete
+		// tombstoned; any other create stores none, whatever its spec says.
+		FirewallCarry: replacedFirewallCarry(ctx, spec.Name),
 	}
 
 	// FENCE, immediately before the durable write: if project-quota authority moved
@@ -4522,7 +4525,9 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if deleted != nil {
 		rctx = s.withReplacedLUNs(withReplacedVM(rctx, deleted), deleted)
 	} else {
-		rctx = s.withReplacedLUNs(withReplacedVM(rctx, vm), vm)
+		// No row was tombstoned here: another delete ended the incarnation,
+		// and with it its firewall identity.
+		rctx = withoutReplacedFirewallID(s.withReplacedLUNs(withReplacedVM(rctx, vm), vm), req.Name)
 	}
 	var out *pb.VM
 	if placed {

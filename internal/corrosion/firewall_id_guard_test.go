@@ -28,10 +28,12 @@ import (
 //     an SQL prefix — calls keepFirewallID, or hands the write to one that does.
 //     It checks the call, not that its result is the value bound to the
 //     column; TestFirewallIDWriters_* pin that for every writer;
-//   - the carry guard: CarryFirewallID is called only from the listed paths,
-//     each of which obtains its source through withReplacedVM, the container
-//     re-key's own batch or the relocation proof, and no code builds a token
-//     any other way;
+//   - the carry guard: CarryFirewallID and CarryFirewallIDOf are called only
+//     from the listed paths, each of which obtains its source through
+//     withReplacedVM (read back by replacedRowFor), the container re-key's own
+//     batch, or a peer move's source row (peerMoveSource: the cold migrate's
+//     live source, or the row the relocation proof's coordinator marked), and
+//     no code builds a token any other way;
 //   - the request guard: no request message carries an identity field other
 //     than VMSpec.firewall_id, which every insert strips.
 
@@ -62,18 +64,36 @@ const (
 
 // carrySourceEvidence names, per source, the identifiers a carrying function
 // must use: the snapshot of the VM its own delete tombstoned (withReplacedVM,
-// or acceptReplacedVMMD's metadata from a peer); the container re-key's own
-// insert; the fenced-host relocation proof.
+// or acceptReplacedVMMD's metadata from a peer, read back by replacedRowFor);
+// the container re-key's own insert; a peer move's source row
+// (peerMoveSource), which only a peer-verified cold migrate (its live source
+// row, which the migrate deletes once the target lands) or a relocation
+// under the coordinator's fenced-host proof or token (the row it marked
+// relocating, which it deletes once the target lands) reaches.
 var carrySourceEvidence = map[firewallIDCarrySource][]string{
-	carryFromReplacedVM:      {"replacedVM", "replacedVMFrom"},
+	carryFromReplacedVM:      {"replacedRowFor", "replacedVMFor"},
 	carryFromRekeyBatch:      {"containerRekeyInsertSQL", "legacyContainerRekeySQL"},
-	carryFromRelocationProof: {"ActionProof"},
+	carryFromRelocationProof: {"peerMoveSource"},
 }
 
 // firewallIDCarriers is the closed list of functions allowed to mint a
-// FirewallIDCarry ("<package dir>.<Recv.>Func"). D2a wires none; the
-// same-workload paths of spec §4.3 add themselves here.
-var firewallIDCarriers = map[string]firewallIDCarrySource{}
+// FirewallIDCarry ("<package dir>.<Recv.>Func"): the same-workload paths of
+// spec §4.3 that re-create a row. The others keep the identity without a
+// token: the container re-key and the relocate-recreate copy the source's
+// create_spec in their own insert (rekeyContainerStmt,
+// RelocateContainerWithToken); a same-name promote, a migrate and a failover
+// of a VM update its row in place.
+var firewallIDCarriers = map[string]firewallIDCarrySource{
+	// VM rebuild, a stack's rolling recreate and its inline recreate: the
+	// create of the VM their own delete tombstoned (createVM's insert).
+	"internal/grpcapi.replacedFirewallCarry": carryFromReplacedVM,
+	// Container cold migrate, relocation (restore) and same-name replica
+	// promotion: the target's restore of the moving container.
+	"internal/grpcapi.Server.RestoreContainer": carryFromRelocationProof,
+}
+
+// firewallIDCarryMakers are the functions that make a non-zero token.
+var firewallIDCarryMakers = []string{"CarryFirewallID", "CarryFirewallIDOf"}
 
 // allowedRequestIdentityFields are the identity fields a request message may
 // reach: VMSpec.firewall_id, which every insert strips and every update keeps
@@ -322,6 +342,16 @@ func callsFunc(body ast.Node, name string) bool {
 	return found
 }
 
+// callsAnyFunc reports whether body calls any of names.
+func callsAnyFunc(body ast.Node, names []string) bool {
+	for _, n := range names {
+		if callsFunc(body, n) {
+			return true
+		}
+	}
+	return false
+}
+
 // firewallIDWriterViolations applies the writer rules.
 func firewallIDWriterViolations(pkgs []goPackage, nonWriters, delegates map[string]string) []string {
 	const home = "internal/corrosion"
@@ -460,7 +490,7 @@ func carryViolations(pkgs []goPackage, carriers map[string]firewallIDCarrySource
 					continue
 				}
 				key := p.dir + "." + funcKey(fd)
-				if p.dir == "internal/corrosion" && funcKey(fd) == "CarryFirewallID" {
+				if p.dir == "internal/corrosion" && slices.Contains(firewallIDCarryMakers, funcKey(fd)) {
 					continue
 				}
 				ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -469,7 +499,7 @@ func carryViolations(pkgs []goPackage, carriers map[string]firewallIDCarrySource
 					}
 					return true
 				})
-				if !callsFunc(fd.Body, "CarryFirewallID") {
+				if !callsAnyFunc(fd.Body, firewallIDCarryMakers) {
 					continue
 				}
 				seen[key] = true
@@ -524,29 +554,63 @@ func TestFirewallIDCarryGuard(t *testing.T) {
 
 // TestFirewallIDCarryGuard_FlagsAFixture: a token minted outside the listed
 // paths, or by a listed path that obtains its source other than through its
-// evidence, or built as a literal, is flagged.
+// evidence, or built as a literal, is flagged (m-5, R4-I1). Each source is
+// checked: a VM carry not read back from the replaced VM its own delete
+// recorded, a re-key carry outside the re-key's batch, and a move's carry not
+// taken from the peer move's source row.
 //
-// Mutation: drop the source assertion (usesAny) — "noEvidence" passes.
+// Mutation: drop the source assertion (usesAny) — the three "noEvidence"
+// fixtures pass.
 func TestFirewallIDCarryGuard_FlagsAFixture(t *testing.T) {
 	pkg := fixturePackage(t, "internal/grpcapi", `package grpcapi
-func rebuild(ctx context.Context) { r := replacedVMFrom(ctx); _ = corrosion.CarryFirewallID("vm", r.snap.Spec) }
+func rebuild(ctx context.Context) { r, _ := replacedRowFor(ctx, "a"); _ = corrosion.CarryFirewallIDOf("vm", r.snap.FirewallID) }
+func move(ctx context.Context) { src, _ := s.peerMoveSource(ctx, nil, ""); _ = corrosion.CarryFirewallID("ct", src.CreateSpec) }
+func rekey() { _ = containerRekeyInsertSQL; _ = corrosion.CarryFirewallID("ct", "") }
 func clone(src string) { _ = corrosion.CarryFirewallID("vm", src) }
-func noEvidence(src string) { _ = corrosion.CarryFirewallID("vm", src) }
+func cloneOf(id string) { _ = corrosion.CarryFirewallIDOf("vm", id) }
+func noEvidenceVM(tomb string) { _ = corrosion.CarryFirewallIDOf("vm", tomb) }
+func noEvidenceMove(src string) { _ = corrosion.CarryFirewallID("ct", src) }
+func noEvidenceRekey(src string) { _ = corrosion.CarryFirewallID("ct", src) }
 func forge() { _ = corrosion.FirewallIDCarry{} ; _ = corrosion.FirewallIDCarry{kind: "vm", id: "x"} }
 `)
 	got := carryViolations([]goPackage{pkg}, map[string]firewallIDCarrySource{
-		"internal/grpcapi.rebuild":    carryFromReplacedVM,
-		"internal/grpcapi.noEvidence": carryFromReplacedVM,
-		"internal/grpcapi.gone":       carryFromRekeyBatch,
+		"internal/grpcapi.rebuild":         carryFromReplacedVM,
+		"internal/grpcapi.move":            carryFromRelocationProof,
+		"internal/grpcapi.rekey":           carryFromRekeyBatch,
+		"internal/grpcapi.noEvidenceVM":    carryFromReplacedVM,
+		"internal/grpcapi.noEvidenceMove":  carryFromRelocationProof,
+		"internal/grpcapi.noEvidenceRekey": carryFromRekeyBatch,
+		"internal/grpcapi.gone":            carryFromRekeyBatch,
 	})
 	want := []string{
 		"internal/grpcapi.clone: calls CarryFirewallID but is not a listed carry path",
+		"internal/grpcapi.cloneOf: calls CarryFirewallID but is not a listed carry path",
 		"internal/grpcapi.forge: builds a FirewallIDCarry; only CarryFirewallID may",
 		"internal/grpcapi.gone: listed as a carry path but calls no CarryFirewallID; remove it",
-		"internal/grpcapi.noEvidence: carries from replacedVM but obtains its source through none of replacedVM, replacedVMFrom",
+		"internal/grpcapi.noEvidenceMove: carries from relocation proof but obtains its source through none of peerMoveSource",
+		"internal/grpcapi.noEvidenceRekey: carries from rekey batch but obtains its source through none of containerRekeyInsertSQL, legacyContainerRekeySQL",
+		"internal/grpcapi.noEvidenceVM: carries from replacedVM but obtains its source through none of replacedRowFor, replacedVMFor",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("violations:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestFirewallIDCarryGuard_ListsTheSameWorkloadPaths pins the carriers spec
+// §4.3 names, so a carry path dropped from the list (and with it its
+// evidence check) is noticed: the guard itself would then flag the call.
+func TestFirewallIDCarryGuard_ListsTheSameWorkloadPaths(t *testing.T) {
+	want := map[string]firewallIDCarrySource{
+		"internal/grpcapi.replacedFirewallCarry":   carryFromReplacedVM,
+		"internal/grpcapi.Server.RestoreContainer": carryFromRelocationProof,
+	}
+	if len(firewallIDCarriers) != len(want) {
+		t.Fatalf("carriers = %v, want %v", firewallIDCarriers, want)
+	}
+	for k, v := range want {
+		if firewallIDCarriers[k] != v {
+			t.Fatalf("carrier %s = %q, want %q", k, firewallIDCarriers[k], v)
+		}
 	}
 }
 

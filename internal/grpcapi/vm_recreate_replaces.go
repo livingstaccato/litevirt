@@ -139,6 +139,33 @@ func replacedRowFor(ctx context.Context, name string) (replacedVM, bool) {
 	return r, true
 }
 
+// replacedFirewallCarry is the firewall identity a create of name keeps
+// (spec §4.3): the one the row its own operation's delete tombstoned held, as
+// the replaced VM ctx carries records it. That value is set in-process only
+// once the delete has been committed (withReplacedVM, withReplacedSnapshot,
+// withReplacedRow), or from a peer host's metadata (acceptReplacedVMMD, which
+// ignores it from anyone else) — never from a request field. Every other
+// create keeps none: the insert strips any identity its spec carries.
+func replacedFirewallCarry(ctx context.Context, name string) corrosion.FirewallIDCarry {
+	r, ok := replacedRowFor(ctx, name)
+	if !ok {
+		return corrosion.FirewallIDCarry{}
+	}
+	return corrosion.CarryFirewallIDOf(corrosion.TagMemberVM, r.snap.FirewallID)
+}
+
+// withoutReplacedFirewallID returns ctx with the replaced VM it carries for
+// name naming no firewall identity: a re-create whose delete found no row to
+// tombstone (another delete ended the incarnation first) carries none.
+func withoutReplacedFirewallID(ctx context.Context, name string) context.Context {
+	r, ok := replacedRowFor(ctx, name)
+	if !ok || r.snap.FirewallID == "" {
+		return ctx
+	}
+	r.snap.FirewallID = ""
+	return context.WithValue(ctx, replacedVMKey{}, r)
+}
+
 // withReplacedSnapshot returns ctx carrying the VM name as snap describes it
 // into the create that re-creates it — the row its delete tombstoned, as the
 // deleting host reported it (deletedVMSink).
@@ -217,6 +244,7 @@ func (s *Server) reportDeletedVM(ctx context.Context, row *corrosion.VMRecord) {
 	b, err := json.Marshal(replacedVMWire{
 		Name: row.Name, CreatedAt: snap.CreatedAt, HostName: snap.HostName,
 		OwnerEpoch: snap.OwnerEpoch, SpecGeneration: snap.SpecGeneration, IdentityHash: snap.IdentityHash,
+		FirewallID: snap.FirewallID,
 	})
 	if err != nil {
 		return
@@ -242,7 +270,7 @@ func acceptDeletedVMHeader(ctx context.Context, name string, hdr metadata.MD) {
 	}
 	sink.snap = &corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 	}
 }
 
@@ -305,6 +333,11 @@ type replacedVMWire struct {
 	Image          string            `json:"image,omitempty"`
 	HoldToken      string            `json:"hold_token,omitempty"`
 	HoldHost       string            `json:"hold_host,omitempty"`
+	// FirewallID is the firewall identity of the row the delete tombstoned
+	// (VMDeleteSnapshot.FirewallID), which the re-create keeps
+	// (replacedFirewallCarry). An older build sends none: the re-created VM
+	// then has no identity, which fails closed.
+	FirewallID string `json:"firewall_id,omitempty"`
 }
 
 // withReplacedVMMD returns ctx with the replaced VM ctx holds for name added
@@ -318,6 +351,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 		b, err := json.Marshal(replacedVMWire{
 			Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 			OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
+			FirewallID: r.snap.FirewallID,
 		})
 		if err != nil {
 			return ctx
@@ -328,7 +362,7 @@ func withReplacedVMMD(ctx context.Context, name string) context.Context {
 		Name: r.name, CreatedAt: r.snap.CreatedAt, HostName: r.snap.HostName,
 		OwnerEpoch: r.snap.OwnerEpoch, SpecGeneration: r.snap.SpecGeneration, IdentityHash: r.snap.IdentityHash,
 		UUID: r.uuid, LUNs: r.luns, Claimed: r.claimed, Image: r.image,
-		HoldToken: r.holdToken, HoldHost: r.holdHost,
+		HoldToken: r.holdToken, HoldHost: r.holdHost, FirewallID: r.snap.FirewallID,
 	})
 	if err != nil {
 		return ctx
@@ -364,12 +398,12 @@ func (s *Server) acceptReplacedVMMD(ctx context.Context) context.Context {
 	if rowOnly {
 		return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 			CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-			SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+			SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 		}, rowOnly: true})
 	}
 	return context.WithValue(ctx, replacedVMKey{}, replacedVM{name: w.Name, snap: corrosion.VMDeleteSnapshot{
 		CreatedAt: w.CreatedAt, HostName: w.HostName, OwnerEpoch: w.OwnerEpoch,
-		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash,
+		SpecGeneration: w.SpecGeneration, IdentityHash: w.IdentityHash, FirewallID: w.FirewallID,
 	}, uuid: w.UUID, luns: w.LUNs, claimed: w.Claimed, image: w.Image, holdToken: w.HoldToken, holdHost: w.HoldHost})
 }
 

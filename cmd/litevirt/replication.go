@@ -8,6 +8,8 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pbsstore"
@@ -246,13 +248,17 @@ the only copy of the data: it asks first unless --yes.`,
 			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				if restore != "" {
+					var hdr metadata.MD
 					resp, err := c.RestoreContainerReplica(ctx, &pb.RestoreContainerReplicaRequest{
 						Host: host, Repo: repo, Project: projectName, Name: args[0], Timestamp: restore,
-					})
+					}, grpc.Header(&hdr))
 					if err != nil {
 						return fmt.Errorf("restore replica: %w", err)
 					}
 					fmt.Printf("restored the replica of %s taken at %s, stopped, on %s\n", args[0], restore, resp.Host)
+					for _, note := range hdr.Get("x-litevirt-firewall-tags-left") {
+						fmt.Println(note)
+					}
 					return nil
 				}
 				list, err := c.ListContainerReplicas(ctx, &pb.ListContainerReplicasRequest{

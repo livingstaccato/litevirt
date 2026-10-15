@@ -1389,6 +1389,11 @@ type VMDeleteSnapshot struct {
 	OwnerEpoch     int64
 	SpecGeneration int64
 	IdentityHash   string
+	// FirewallID is the firewall identity the row held (firewall_id.go): what
+	// a re-create of the VM that delete tombstoned carries
+	// (CarryFirewallIDOf). Covers does not compare it; IdentityHash already
+	// binds the spec that holds it.
+	FirewallID string
 }
 
 // SnapshotForDelete is vm as a delete of it sees it.
@@ -1396,6 +1401,7 @@ func SnapshotForDelete(vm VMRecord) VMDeleteSnapshot {
 	return VMDeleteSnapshot{
 		CreatedAt: vm.CreatedAt, HostName: vm.HostName, OwnerEpoch: vm.OwnerEpoch,
 		SpecGeneration: vm.SpecGeneration, IdentityHash: vmCreateIdentityHash(vm),
+		FirewallID: firewallIDOf(TagMemberVM, vm.Spec),
 	}
 }
 

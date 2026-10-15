@@ -1289,6 +1289,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		RelocateToken: relocationTokenToStamp(ctx, peerRelocation),
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	// A peer move is the same container: its row keeps the firewall identity
+	// of the source row it re-homes (peerMoveSource: the cold migrate's live
+	// source, which the migrate deletes once this row lands, or the row the
+	// relocation's coordinator marked, which it retires the same way). An
+	// operator restore is a new container and keeps none (spec §4.3).
+	if source != nil && !operatorRestore {
+		rec.FirewallCarry = corrosion.CarryFirewallID(corrosion.TagMemberCT, source.CreateSpec)
+	}
 	// A restore (an operator's, a migrate's, a relocation's) is a new placement:
 	// the provenance chain it records (recordContainerBases) is bound to it.
 	var placement string

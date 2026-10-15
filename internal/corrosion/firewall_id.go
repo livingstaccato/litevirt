@@ -83,6 +83,19 @@ func CarryFirewallID(kind, source string) FirewallIDCarry {
 	return FirewallIDCarry{kind: kind, id: id}
 }
 
+// CarryFirewallIDOf is CarryFirewallID for an identity already read off its
+// source row: the one a VM's delete snapshot recorded
+// (VMDeleteSnapshot.FirewallID) for the re-create that replaces it. An id
+// that is not well formed gives the zero token. The carry guard lists its
+// callers as it lists CarryFirewallID's.
+func CarryFirewallIDOf(kind, id string) FirewallIDCarry {
+	if !ValidFirewallID(id) {
+		return FirewallIDCarry{}
+	}
+	firewallIDKey(kind) // panics on an unknown kind, as CarryFirewallID does
+	return FirewallIDCarry{kind: kind, id: id}
+}
+
 // idFor is the identity the token carries for a workload of kind ("" if none).
 func (t FirewallIDCarry) idFor(kind string) string {
 	if t.kind != kind {
@@ -285,7 +298,7 @@ func newFirewallID() string {
 // re-key or cutover) is no conflict. With no identity on the row, it mints
 // one and abandons nothing.
 //
-// Only `lv firewall tag set` calls it, with the firewall_tag_groups grant. A VM
+// Only `lv firewall tag set` calls it, with the firewall_tag_groups grant. A VM (ci:skip-cmd until D3 registers it)
 // mints through the desired-spec writer, under its operation barrier; a
 // container through the compare-and-set on its create_spec, refused while an
 // operation holds it. ErrFirewallIDNotMinted means the caller retries; a
@@ -382,4 +395,76 @@ func mintContainerFirewallID(ctx context.Context, c *Client, host, name string) 
 		return "", "", err
 	}
 	return id, abandoned, nil
+}
+
+// DeletedFirewallTags is what a restore into a freed name says about the
+// incarnation the name held before it was deleted (spec §4.3, R3-I1): the
+// restore gets no firewall identity, so the deleted incarnation's tags do not
+// follow it. It reads the newest tombstone of name (a container's within
+// project) and returns its identity, the host it was on, and the tags its row
+// still holds — none when the tombstone held no identity, a live row of the
+// kind still holds it (the workload moved on; it was not deleted), or the
+// tags row is gone, removed or unreadable.
+func DeletedFirewallTags(ctx context.Context, c *Client, kind, project, name string) (fwID, host string, tags map[string]string, err error) {
+	var rows []Row
+	switch kind {
+	case TagMemberVM:
+		rows, err = c.Query(ctx,
+			`SELECT host_name, project, spec AS doc FROM vms
+			  WHERE name = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC`, name)
+	case TagMemberCT:
+		rows, err = c.Query(ctx,
+			`SELECT host_name, project, COALESCE(create_spec, '') AS doc FROM containers
+			  WHERE name = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC`, name)
+	default:
+		return "", "", nil, fmt.Errorf("corrosion: unknown firewall identity kind %q", kind)
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	for _, r := range rows {
+		if kind == TagMemberCT && projectOrDefault(r.String("project")) != projectOrDefault(project) {
+			continue
+		}
+		fwID, host = firewallIDOf(kind, r.String("doc")), r.String("host_name")
+		break
+	}
+	if fwID == "" {
+		return "", "", nil, nil
+	}
+	if live, err := firewallIDHeldLive(ctx, c, kind, fwID); err != nil || live {
+		return "", "", nil, err
+	}
+	vals, err := c.Query(ctx,
+		`SELECT value FROM cluster_policies WHERE key = ? AND deleted_at IS NULL`,
+		FirewallTagsKeyPrefix+kind+"/"+fwID)
+	if err != nil || len(vals) == 0 || vals[0].String("value") == "" {
+		return "", "", nil, err
+	}
+	var v firewallTagsValue
+	if json.Unmarshal([]byte(vals[0].String("value")), &v) != nil {
+		return "", "", nil, nil
+	}
+	if tags, ok := nonNullStrings(v.Tags); ok && len(tags) > 0 {
+		return fwID, host, tags, nil
+	}
+	return "", "", nil, nil
+}
+
+// firewallIDHeldLive reports whether a live row of kind holds id.
+func firewallIDHeldLive(ctx context.Context, c *Client, kind, id string) (bool, error) {
+	q := `SELECT spec AS doc FROM vms WHERE deleted_at IS NULL`
+	if kind == TagMemberCT {
+		q = `SELECT COALESCE(create_spec, '') AS doc FROM containers WHERE deleted_at IS NULL`
+	}
+	rows, err := c.Query(ctx, q)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if firewallIDOf(kind, r.String("doc")) == id {
+			return true, nil
+		}
+	}
+	return false, nil
 }

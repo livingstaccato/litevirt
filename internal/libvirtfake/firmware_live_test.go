@@ -420,3 +420,167 @@ func TestFake_FirmwareLiveModelsProbe(t *testing.T) {
 		}
 	})
 }
+
+// UndefineDomain answers as libvirt.Client does where the probe does not
+// reach (review I-1): an absent name is libvirt's no-domain lookup error and
+// deletes nothing; an active domain survives as a transient one, still
+// running, and libvirt unlinks the NVRAM file (UNDEFINE_NVRAM, before its
+// active check in qemuDomainUndefineFlags; not probed). The swtpm tree stays.
+//
+// Mutations: answer nil for an absent name — red; delete the NVRAM of an
+// absent name — red; remove an active domain outright — red.
+func TestFake_UndefineMatchesClient(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		f, fw := flHost(t)
+		flWrite(t, fw.NvramPath(flVM), flNvramS)
+		err := f.UndefineDomain(flVM, false)
+		if !libvirt.IsNoDomain(err) {
+			t.Fatalf("UndefineDomain of an absent name = %v, want libvirt's no-domain error", err)
+		}
+		if got := flRead(t, fw.NvramPath(flVM)); !bytes.Equal(got, flNvramS) {
+			t.Errorf("nvram = %q after undefining an absent name, want it kept", got)
+		}
+	})
+	t.Run("active", func(t *testing.T) {
+		f, fw := flSource(t, StateRunning)
+		if err := f.UndefineDomain(flVM, false); err != nil {
+			t.Fatal(err)
+		}
+		if st, ok := f.RawState(flVM); !ok || st != StateRunning {
+			t.Fatalf("active domain after undefine = %q (defined %v), want still running (transient)", st, ok)
+		}
+		if f.DefinedXML(flVM) != "" {
+			t.Error("the transient domain kept a persistent definition")
+		}
+		flAbsent(t, fw.NvramPath(flVM))
+		if got := flRead(t, flPermallPath(fw)); !bytes.Equal(got, flPermall) {
+			t.Errorf("permall = %q, want kept", got)
+		}
+	})
+}
+
+// A destroy or shutdown of a domain that is not running is refused, as
+// libvirt refuses it ("domain is not running"), and the shut-off reason the
+// migrate left stays migrated (review I-2).
+//
+// Mutations: let destroy, or shutdown, succeed on a shut-off domain — red;
+// clear the reason on the refused call — red.
+func TestFake_StopOfShutOffSourceRefusedReasonKept(t *testing.T) {
+	for _, op := range []string{"destroy", "shutdown"} {
+		t.Run(op, func(t *testing.T) {
+			src, _ := flSource(t, StateRunning)
+			dst, _ := flHost(t)
+			if _, err := flMigrate(t, src, dst, flLive); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if op == "destroy" {
+				err = src.DestroyDomain(flVM)
+			} else {
+				err = src.ShutdownDomain(flVM)
+			}
+			if err == nil || !strings.Contains(err.Error(), "domain is not running") {
+				t.Errorf("%s of the shut-off source = %v, want libvirt's not-running refusal", op, err)
+			}
+			if ds, _ := src.DomainStateReason(flVM); ds.State != "stopped" || ds.Reason != "migrated" {
+				t.Errorf("source after the %s = %+v, want stopped, migrated", op, ds)
+			}
+		})
+	}
+}
+
+// Review M-2, M-5, M-1: the inactive different-uuid name-taken branch; a TPM
+// guest whose source tree is missing is refused loudly instead of landing
+// without one; after the guest runs, swtpm writes its permall back, so it no
+// longer equals the source's (probe (c): 57 bytes differed after resume).
+//
+// Mutations: drop the different-uuid check — red; land a TPM guest with no
+// source tree — red; skip the write-back — red; write it back while paused —
+// red.
+func TestFake_FirmwareLiveLandingEdges(t *testing.T) {
+	t.Run("name taken by another uuid", func(t *testing.T) {
+		src, _ := flSource(t, StateRunning)
+		dst, dfw := flHost(t)
+		other := strings.Replace(flXML, flUUID, "11111111-2222-4333-8444-555555555555", 1)
+		if err := dst.DefineDomain(other); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := flMigrate(t, src, dst, flLive); err == nil {
+			t.Fatal("migrate onto a defined domain of the name with another uuid was not refused")
+		}
+		if dfw.HasTPMState(flUUID) {
+			t.Error("the refused migrate created a tree on the target")
+		}
+		if st, _ := src.RawState(flVM); st != StateRunning {
+			t.Errorf("source = %q, want still running", st)
+		}
+	})
+	t.Run("TPM guest without a source tree", func(t *testing.T) {
+		src, sfw := flSource(t, StateRunning)
+		if err := os.RemoveAll(sfw.SwtpmDir(flUUID)); err != nil {
+			t.Fatal(err)
+		}
+		dst, _ := flHost(t)
+		if _, err := flMigrate(t, src, dst, flLive); err == nil {
+			t.Fatal("a TPM guest with no swtpm tree on the source landed")
+		}
+		if dst.DomainExists(flVM) {
+			t.Error("the target has a domain")
+		}
+	})
+	t.Run("Secure Boot only", func(t *testing.T) {
+		// No <tpm>, no tree: nothing to copy, and that is no error.
+		src, sfw := flSource(t, StateRunning)
+		if err := os.RemoveAll(sfw.SwtpmDir(flUUID)); err != nil {
+			t.Fatal(err)
+		}
+		sb := flXML[:strings.Index(flXML, "<devices>")] + "<devices></devices></domain>"
+		src.SetInactiveXML(flVM, sb)
+		dst, dfw := flHost(t)
+		if _, err := flMigrate(t, src, dst, flLive); err != nil {
+			t.Fatal(err)
+		}
+		if dfw.HasTPMState(flUUID) {
+			t.Error("an SB-only guest got a tree on the target")
+		}
+	})
+	t.Run("permall written back after resume", func(t *testing.T) {
+		src, sfw := flSource(t, StateRunning)
+		dst, dfw := flHost(t)
+		if _, err := flMigrate(t, src, dst, flLive); err != nil {
+			t.Fatal(err)
+		}
+		ssum, _ := sfw.PermallSHA256(flUUID)
+		if dsum, _ := dfw.PermallSHA256(flUUID); dsum != ssum {
+			t.Fatalf("while paused the target permall %q differs from the source's %q", dsum, ssum)
+		}
+		if err := dst.ResumeDomain(flVM); err != nil {
+			t.Fatal(err)
+		}
+		if dsum, _ := dfw.PermallSHA256(flUUID); dsum == ssum {
+			t.Error("the target permall still equals the source's after the guest ran")
+		}
+		if got := flRead(t, flPermallPath(sfw)); !bytes.Equal(got, flPermall) {
+			t.Errorf("source permall = %q, want untouched", got)
+		}
+	})
+}
+
+// VanishDomain is libvirt dropping a domain at the end of a migrate with
+// UNDEFINE_SOURCE (probe (a)): the domain is gone, running or not, and the
+// swtpm tree and NVRAM are kept.
+//
+// Mutations: delete the NVRAM — red; leave the domain defined — red.
+func TestFake_VanishDomainModelsProbeA(t *testing.T) {
+	f, fw := flSource(t, StateRunning)
+	f.VanishDomain(flVM)
+	if f.DomainExists(flVM) {
+		t.Error("the domain is still there")
+	}
+	if got := flRead(t, fw.NvramPath(flVM)); !bytes.Equal(got, flNvramS) {
+		t.Errorf("nvram = %q, want kept", got)
+	}
+	if got := flRead(t, flPermallPath(fw)); !bytes.Equal(got, flPermall) {
+		t.Errorf("permall = %q, want kept", got)
+	}
+}

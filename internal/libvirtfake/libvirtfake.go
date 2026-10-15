@@ -174,6 +174,9 @@ type Fake struct {
 	// (migrated, or a ShutOffDomain reason); a start clears it.
 	pendingNvram map[string][]byte
 	offReason    map[string]string
+	// pendingPermall is, per migrated-in TPM guest that has not resumed
+	// yet, the uuid whose permall its swtpm writes back once it runs.
+	pendingPermall map[string]string
 	// Firmware move knobs (spec §15). CorruptLandedPermall makes
 	// LandFirmwareLive on this (target) fake write an altered permall.
 	// FailAfterTargetTree fails LandFirmwareLive once the target's swtpm
@@ -946,8 +949,12 @@ func (f *Fake) shutdownDomain(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.domains[name]; !ok {
+	st, ok := f.domains[name]
+	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st == StateShutdown {
+		return notRunning("shutdown", name)
 	}
 	f.record("shutdown", name, "")
 	if f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
@@ -981,8 +988,12 @@ func (f *Fake) destroyDomain(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.domains[name]; !ok {
+	st, ok := f.domains[name]
+	if !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st == StateShutdown {
+		return notRunning("destroy", name)
 	}
 	f.leftStateLocked(name)
 	f.domains[name] = StateShutdown
@@ -991,9 +1002,25 @@ func (f *Fake) destroyDomain(name string) error {
 	return nil
 }
 
+// notRunning is libvirt's refusal to stop a domain that is not active
+// (VIR_ERR_OPERATION_INVALID), wrapped as libvirt.Client wraps it.
+func notRunning(op, name string) error {
+	return fmt.Errorf("%s domain %s: %w", op, name, golibvirt.Error{Code: uint32(golibvirt.ErrOperationInvalid),
+		Message: "Requested operation is not valid: domain is not running"})
+}
+
 func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	if err := f.fwCheck(libvirt.FirmwareCall{Op: libvirt.OpUndefine, Name: name}); err != nil {
 		return fmt.Errorf("undefine domain %s: %w", name, err)
+	}
+	// As libvirt.Client: the lookup comes first, and an absent name is
+	// libvirt's no-domain error, with nothing deleted (review I-1).
+	f.mu.Lock()
+	st, ok := f.domains[name]
+	f.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("lookup domain %s: %w", name, golibvirt.Error{Code: uint32(golibvirt.ErrNoDomain),
+			Message: fmt.Sprintf("Domain not found: no domain with matching name '%s'", name)})
 	}
 	if f.FailUndefineDomain != nil {
 		if err := f.FailUndefineDomain(name, removeStorage); err != nil {
@@ -1002,6 +1029,20 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if st == StateRunning || st == StatePaused {
+		// An active domain survives as a transient one (see
+		// undefinePreservingState). libvirt unlinks the NVRAM file for
+		// UNDEFINE_NVRAM before it looks at whether the domain is active
+		// (qemuDomainUndefineFlags; not probed): the running QEMU keeps its
+		// open descriptor, the file is gone.
+		if _, ok := f.activeXML[name]; !ok {
+			f.activeXML[name] = f.xml[name]
+		}
+		delete(f.xml, name)
+		f.record("undefine", name, fmt.Sprintf("remove_storage=%v transient=true", removeStorage))
+		f.deleteNvramLocked(name)
+		return nil
+	}
 	f.dropPITLocked(name, "")
 	delete(f.domains, name)
 	delete(f.xml, name)

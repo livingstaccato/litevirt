@@ -159,9 +159,7 @@ func TestRecoverDeviceLeases_AfterACutoverReleasesTheSourceVFs(t *testing.T) {
 	if err := corrosion.UpdateVMState(ctx, r.s.db, "vf-vm", "migrating", "→ target-host"); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.fake.UndefineDomain("vf-vm", false); err != nil {
-		t.Fatal(err)
-	}
+	r.fake.VanishDomain("vf-vm")
 	if ok, err := corrosion.CommitMigrationOwnership(ctx, r.s.db, "vf-vm", "test-host", "target-host", "running", nil); err != nil || !ok {
 		t.Fatalf("CommitMigrationOwnership: %v %v", ok, err)
 	}

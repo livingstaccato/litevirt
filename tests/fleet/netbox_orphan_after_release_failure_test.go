@@ -49,9 +49,7 @@ func TestOrphanSweepReclaimsAnAddressLeftByAFailedRemoteRelease(t *testing.T) {
 
 	// The stale-record path: the domain is gone, so the cleanup must finish even
 	// though the remote half of the release cannot.
-	if err := n.Virt.UndefineDomain("vm-1", false); err != nil {
-		t.Fatalf("undefine the domain behind the daemon's back: %v", err)
-	}
+	n.Virt.VanishDomain("vm-1")
 	nb.SetDown(true)
 	if _, err := c.SelfClient(n).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "vm-1"}); err != nil {
 		t.Fatalf("the stale-record cleanup must complete even when the release fails: %v", err)

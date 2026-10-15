@@ -1412,12 +1412,26 @@ The restart is not silent, and the real disk is not lost:
   the host that holds it.
 - When the VM is deleted (`lv rm`, with or without `--keep-disks`), the host
   that holds its disk clears the record on its next pass, or once it is back
-  if it was down then. A disk still at its path is renamed to
+  if it was down then. After `lv rm`, a disk still at its path is renamed to
   `<disk path>.superseded-<time>` first, so it is kept like any other copy;
-  this waits while a domain of the VM's name runs on that host, and a VM of
-  the same name created on that host first sets it aside the same way. The
-  host also removes the VM's cloud-init seed there (`cloudinit/<vm>.iso`) if
-  this release wrote it; a seed from an earlier release stays.
+  this waits while a domain of the VM's name runs on that host. After
+  `lv rm --keep-disks`, and for a disk recorded `delete_with_vm=false`, the
+  disk stays at its path. The host also removes the VM's cloud-init seed
+  there (`cloudinit/<vm>.iso`) if this release wrote it; a seed from an
+  earlier release stays.
+- A VM of the same name created on that host before then clears
+  `<data_dir>/disks/<vm>-<disk>.qcow2` files the earlier VM left. Of those, a
+  disk that a failover left at its path is first renamed to
+  `<disk path>.superseded-<time>`. One the delete kept is first renamed to
+  `<disk path>.kept-<time>`, which no sweep removes. A file that another VM
+  uses, as its disk or as the base of a linked clone, stays where it is.
+  Each rename is a `vm.disk.set_aside` or `vm.disk.kept` event of the VM.
+  The create is refused, and nothing is created, while that host's replica
+  has not caught up with the cluster and such a file is there, while what is
+  at one of those paths cannot be read, or when a rename fails. The message
+  names the path and the cause. Retry once the replica has caught up or the
+  storage answers, or place the VM on another host. A path that does not
+  exist does not refuse the create.
 
 A cloud-init seed is used only by the VM it was written for: a host that
 holds the seed of a deleted VM writes a new one from the VM's own settings

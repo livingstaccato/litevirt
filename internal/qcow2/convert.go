@@ -121,9 +121,11 @@ func doConvert(ctx context.Context, src, dst string, opts *Options, allow func(s
 		// Ensure L2 table exists.
 		l2Offset := binary.BigEndian.Uint64(l1[l1Idx*8 : l1Idx*8+8])
 		if l2Offset == 0 {
-			// Allocate L2 table.
-			l2Offset = nextOffset
-			nextOffset += clusterSize
+			// Allocate L2 table: a whole cluster on a cluster boundary. A
+			// compressed write leaves nextOffset only sector-aligned, and
+			// qemu refuses an L2 table anywhere else as corrupt.
+			l2Offset = (nextOffset + clusterSize - 1) / clusterSize * clusterSize
+			nextOffset = l2Offset + clusterSize
 			l2Table := make([]byte, clusterSize)
 			if _, err := df.WriteAt(l2Table, int64(l2Offset)); err != nil {
 				return fmt.Errorf("write L2 table: %w", err)

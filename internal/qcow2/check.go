@@ -7,7 +7,8 @@ import (
 )
 
 // Check validates the internal consistency of a qcow2 file: magic/version,
-// L1/L2 table bounds, backing-file metadata, and — reconstructed from the active
+// L1/L2 table bounds, cluster alignment of every table and standard data
+// cluster (ErrMisaligned), backing-file metadata, and — reconstructed from the active
 // L1/L2/data plus the refcount metadata — that every referenced cluster's recorded
 // refcount matches its reference count.
 //
@@ -52,10 +53,22 @@ func Check(path string) error {
 
 	l1Bytes := uint64(h.L1Size) * 8
 
+	// Every table and data cluster sits on a cluster boundary (qcow2 spec).
+	// The refcount model below cannot see a violation — it marks the cluster
+	// an offset starts in, the same way the writer does — so a compressed
+	// convert that put L2 tables at sector offsets passed this check while
+	// qemu refused the image. Judged first, so the report names the cause.
+	if err := checkHeaderAlignment(h); err != nil {
+		return err
+	}
+
 	// Validate refcount table is within file bounds.
 	rcTableBytes := uint64(h.RefcountTableClusters) * clusterSize
 	if h.RefcountTableOffset+rcTableBytes > fileSize {
 		return fmt.Errorf("refcount table extends beyond file")
+	}
+	if err := checkTableAlignment(f, h, fileSize); err != nil {
+		return err
 	}
 
 	refcountBits := uint32(1) << h.RefcountOrder
@@ -138,6 +151,10 @@ func Check(path string) error {
 				}
 			} else {
 				hostOffset := l2Entry & 0x00fffffffffffe00
+				if hostOffset%clusterSize != 0 {
+					return misaligned("L2[%d][%d] names a data cluster at %#x, not a multiple of the %d-byte cluster size",
+						i, j, hostOffset, clusterSize)
+				}
 				if hostOffset > 0 {
 					if hostOffset+clusterSize > fileSize {
 						return fmt.Errorf("L2[%d][%d] data cluster at %d exceeds file",

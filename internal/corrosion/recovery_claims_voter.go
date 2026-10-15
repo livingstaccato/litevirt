@@ -258,9 +258,18 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 			return RefusalFeatureUnrecorded, fmt.Sprintf("%s does not hold the %s used record yet, and takes no "+
 				"LUN allocation before it does; retry once it has replicated", st.me, capabilities.FeatureISCSILUNClaim)
 		}
-		if v == nil {
-			return "", ""
-		}
+	}
+	return validateGenerationClaimValue(key, v)
+}
+
+// validateGenerationClaimValue checks the immutable value binding, without
+// current membership, sealing, release-use or owner-probe requirements. Import
+// must preserve an old acceptance even when those live checks have changed.
+func validateGenerationClaimValue(key ClaimKey, v *ClaimValue) (string, string) {
+	if v == nil {
+		return "", ""
+	}
+	if key.IsLUN() {
 		l := v.LUN
 		if l == nil || v.Proof != nil || v.Config != nil || v.SourceHost != "" {
 			return RefusalInvalidValue, "a LUN key decides a LUN allocation"
@@ -273,18 +282,16 @@ func (st voterStanding) admit(key ClaimKey, gen int64, v *ClaimValue) (string, s
 		}
 		return "", ""
 	}
-	if v != nil {
-		if v.Proof == nil || v.Config != nil || v.LUN != nil {
-			return RefusalInvalidValue, "a workload key decides a proof"
-		}
-		p := v.Proof
-		if p.TargetKind != key.TargetKind || p.TargetName != key.TargetName || p.OwnerEpoch != i64(key.OwnerEpoch) {
-			return RefusalInvalidValue, fmt.Sprintf("value binds %s/%s@%s, key is %s",
-				p.TargetKind, p.TargetName, p.OwnerEpoch, key)
-		}
-		if p.ID == "" || p.DestHost == "" || v.SourceHost == "" {
-			return RefusalInvalidValue, "a workload value names its proof, destination and source"
-		}
+	if v.Proof == nil || v.Config != nil || v.LUN != nil {
+		return RefusalInvalidValue, "a workload key decides a proof"
+	}
+	p := v.Proof
+	if p.TargetKind != key.TargetKind || p.TargetName != key.TargetName || p.OwnerEpoch != i64(key.OwnerEpoch) {
+		return RefusalInvalidValue, fmt.Sprintf("value binds %s/%s@%s, key is %s",
+			p.TargetKind, p.TargetName, p.OwnerEpoch, key)
+	}
+	if p.ID == "" || p.DestHost == "" || v.SourceHost == "" {
+		return RefusalInvalidValue, "a workload value names its proof, destination and source"
 	}
 	return "", ""
 }
@@ -736,8 +743,8 @@ type ClaimImportSource struct {
 	States  []ClaimVoterState
 }
 
-// ClaimStatesForImport returns this voter's accepted workload states, with
-// whether generation gen is frozen here.
+// ClaimStatesForImport returns this voter's complete generation-scoped claim
+// state, including promise-only keys, with whether generation gen is frozen here.
 func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImportSource, error) {
 	out := ClaimImportSource{Voter: c.hostName}
 	err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
@@ -750,10 +757,10 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		// Both tables: an importer must carry the legacy keys and the
 		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
 		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?) AND accepted_round > 0
+			FROM local_recovery_claims WHERE target_kind IN (?, ?, ?)
 			UNION ALL
 			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
-			FROM local_incarnation_claims WHERE target_kind IN (?, ?) AND accepted_round > 0
+			FROM local_incarnation_claims WHERE target_kind IN (?, ?)
 			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindLUN, ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
@@ -772,12 +779,16 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 	return out, err
 }
 
-// ImportClaimsAndAdopt records, for every workload key the sources hold, the
-// highest-ballot accepted value as this voter's own accepted value under
-// generation newGen, and adopts newGen — in ONE transaction, so a voter never
-// votes under newGen without the state that makes its vote safe (§4.4 rules
-// 2–3). It never downgrades local state, and raises the local promise to the
-// imported ballot so the accepted ballot stays at or below the promise.
+// ImportClaimsAndAdopt merges the maximum promise independently of the
+// highest-ballot accepted value for each generation-scoped key, then adopts
+// newGen in ONE transaction (§4.4 rules 2–3). Neither local ballot is lowered,
+// and the promise is always at least the accepted ballot.
+//
+// For a normal certified transition, a frozen old transfer quorum intersects
+// every old prepare quorum. Carrying all its promises prevents a new decision
+// from being outranked by a late old acceptance. This requires complete source
+// snapshots and correct proposers; forced/reset transitions without old quorum
+// intersection, and old exporters that omit promises, do not provide it.
 //
 // It refuses unless this node's adopted generation is newGen-1: the import is
 // relative to the generation it replaces.
@@ -796,22 +807,52 @@ func (c *Client) ImportClaimsAndAdopt(ctx context.Context, newGen int64, from []
 		}
 		best := map[ClaimKey]ClaimVoterState{}
 		for _, s := range states {
-			if !s.Key.IsGenerationScoped() || s.Accepted.IsZero() || s.Value == nil {
+			if !s.Key.IsGenerationScoped() {
 				continue
 			}
-			if d, err := s.Value.Digest(); err != nil || d != s.ValueDigest {
-				return fmt.Errorf("import from %v: %s carries a value whose digest does not match", from, s.Key)
+			if err := s.Key.Validate(); err != nil {
+				return fmt.Errorf("import from %v: invalid key: %w", from, err)
 			}
-			if cur, ok := best[s.Key]; !ok || CompareBallots(s.Accepted, cur.Accepted) > 0 {
-				best[s.Key] = s
+			if s.Accepted.IsZero() {
+				if s.Value != nil || s.ValueDigest != "" || s.Accept != nil {
+					return fmt.Errorf("import from %v: %s carries a value without an accepted ballot", from, s.Key)
+				}
+			} else {
+				if s.Value == nil {
+					return fmt.Errorf("import from %v: %s is missing its accepted value", from, s.Key)
+				}
+				if r, detail := validateGenerationClaimValue(s.Key, s.Value); r != "" {
+					return fmt.Errorf("import from %v: %s: %s", from, s.Key, detail)
+				}
+				if d, err := s.Value.Digest(); err != nil || d != s.ValueDigest {
+					return fmt.Errorf("import from %v: %s carries a value whose digest does not match", from, s.Key)
+				}
 			}
+			cur := best[s.Key]
+			if !s.Accepted.IsZero() && s.Accepted.Equal(cur.Accepted) && s.ValueDigest != cur.ValueDigest {
+				return fmt.Errorf("import from %v: %s has conflicting values at %s", from, s.Key, s.Accepted)
+			}
+			if CompareBallots(s.Promised, cur.Promised) > 0 {
+				cur.Promised = s.Promised
+			}
+			if CompareBallots(s.Accepted, cur.Accepted) > 0 {
+				cur.Accepted, cur.Value, cur.ValueDigest = s.Accepted, s.Value, s.ValueDigest
+			}
+			best[s.Key] = cur
 		}
 		for k, in := range best {
 			row, _, err := loadClaimRowTx(ctx, tx, k)
 			if err != nil {
 				return err
 			}
+			if !in.Accepted.IsZero() && in.Accepted.Equal(row.Accepted) && in.ValueDigest != row.ValueDigest {
+				return fmt.Errorf("import from %v: %s conflicts with the local value at %s", from, k, in.Accepted)
+			}
 			changed := false
+			if CompareBallots(in.Promised, row.Promised) > 0 {
+				row.Promised = in.Promised
+				changed = true
+			}
 			if CompareBallots(in.Accepted, row.Accepted) > 0 {
 				row.Accepted, row.Value, row.ValueDigest = in.Accepted, in.Value, in.ValueDigest
 				row.Accept = nil // not this voter's signature; it re-signs at newGen

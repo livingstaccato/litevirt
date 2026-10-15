@@ -272,6 +272,10 @@ message NetworkAttachment {
     // allow_vlan_tags: let the guest send 802.1Q / 802.1ad tagged frames (a
     // trunk). Every other NIC's tagged frames are dropped.
     bool            allow_vlan_tags            = 17;
+    // mtu is the guest NIC's MTU: 0 renders none, 1 means the bridge's MTU
+    // read when the domain is defined, and any other value must equal the
+    // bridge's MTU on the defining host (release feature nic_mtu).
+    int32           mtu                        = 18;
 }
 
 message CloudInitSpec {

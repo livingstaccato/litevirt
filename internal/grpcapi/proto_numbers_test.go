@@ -1,8 +1,11 @@
 package grpcapi
 
 import (
+	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -67,5 +70,121 @@ func TestProtoNumbers_TheIntegratedBranchesDoNotCollide(t *testing.T) {
 		if svc.Methods().ByName(rpc) == nil {
 			t.Errorf("RPC %s is missing", rpc)
 		}
+	}
+}
+
+// The ops bundle's fields, messages and RPCs (HA disarm, NIC MTU, replication
+// rate) keep the numbers they were given.
+func TestProtoNumbers_OpsBundle(t *testing.T) {
+	fields := []struct {
+		msg  protoreflect.ProtoMessage
+		num  protoreflect.FieldNumber
+		name protoreflect.Name
+	}{
+		{&pb.NetworkAttachment{}, 18, "mtu"},
+		{&pb.NICMTUUpdate{}, 1, "ordinal"},
+		{&pb.NICMTUUpdate{}, 2, "mtu"},
+		{&pb.UpdateVMRequest{}, 27, "nic_mtu"},
+		{&pb.ReadyResponse{}, 5, "ha_disarmed"},
+		{&pb.ReadyResponse{}, 6, "ha_policy_at"},
+		{&pb.ReadyResponse{}, 7, "ha_known"},
+		{&pb.ReplicationSchedule{}, 14, "bwlimit_bytes_per_sec"},
+		{&pb.CreateReplicationScheduleRequest{}, 12, "bwlimit_bytes_per_sec"},
+		{&pb.EnsureDisksRequest{}, 9, "nic_mtu"},
+		{&pb.NICMTUExpectation{}, 1, "network"},
+		{&pb.NICMTUExpectation{}, 2, "mtu"},
+		{&pb.NICMTUExpectation{}, 3, "ordinal"},
+		{&pb.EnsureDisksResponse{}, 8, "nic_mtu_problem"},
+		{&pb.SetHAPolicyRequest{}, 1, "state"},
+		{&pb.SetHAPolicyRequest{}, 2, "reason"},
+		{&pb.SetHAPolicyRequest{}, 3, "fence_down_hosts"},
+		{&pb.HAPolicyStatus{}, 1, "state"},
+		{&pb.HAPolicyStatus{}, 2, "set_by"},
+		{&pb.HAPolicyStatus{}, 3, "at"},
+		{&pb.HAPolicyStatus{}, 4, "reason"},
+		{&pb.HAPolicyStatus{}, 5, "voters"},
+		{&pb.HAPolicyStatus{}, 6, "would_be_fenced"},
+		{&pb.HAPolicyStatus{}, 7, "first_use_paid"},
+		{&pb.HAPolicyStatus{}, 8, "regions"},
+	}
+	for _, f := range fields {
+		md := f.msg.ProtoReflect().Descriptor()
+		fd := md.Fields().ByNumber(f.num)
+		if fd == nil || fd.Name() != f.name {
+			t.Errorf("%s field %d is %v, want %s", md.FullName(), f.num, fd, f.name)
+		}
+	}
+	if fd := (&pb.CreateReplicationScheduleRequest{}).ProtoReflect().Descriptor().Fields().ByNumber(12); fd == nil || !fd.HasPresence() {
+		t.Error("CreateReplicationScheduleRequest.bwlimit_bytes_per_sec must be optional: unset keeps the stored limit, 0 clears it")
+	}
+	if fd := (&pb.NetworkAttachment{}).ProtoReflect().Descriptor().Fields().ByNumber(11); fd != nil {
+		t.Errorf("NetworkAttachment field 11 is %s; it stays unused", fd.Name())
+	}
+	svc := pb.File_litevirt_v1_service_proto.Services().ByName("LiteVirt")
+	for _, rpc := range []protoreflect.Name{"GetHAPolicy", "SetHAPolicy"} {
+		if svc.Methods().ByName(rpc) == nil {
+			t.Errorf("RPC %s is missing", rpc)
+		}
+	}
+}
+
+// The ops bundle's new fields survive a protojson round trip, and the optional
+// bandwidth limit tells unset apart from 0.
+func TestProto_OpsBundleFieldsRoundTrip(t *testing.T) {
+	roundTrip := func(t *testing.T, in, out proto.Message) string {
+		t.Helper()
+		b, err := protojson.Marshal(in)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", in, err)
+		}
+		if err := protojson.Unmarshal(b, out); err != nil {
+			t.Fatalf("unmarshal %T: %v", out, err)
+		}
+		if !proto.Equal(in, out) {
+			t.Errorf("%T round trip: got %v, want %v", in, out, in)
+		}
+		return string(b)
+	}
+
+	nic := &pb.NetworkAttachment{Name: "lan", Mtu: 9000}
+	var nicOut pb.NetworkAttachment
+	roundTrip(t, nic, &nicOut)
+	if nicOut.GetMtu() != 9000 {
+		t.Errorf("NetworkAttachment.mtu = %d, want 9000", nicOut.GetMtu())
+	}
+
+	ready := &pb.ReadyResponse{HostName: "n1", Ready: true, HaDisarmed: true, HaPolicyAt: "2026-10-15T05:10:00Z", HaKnown: true}
+	var readyOut pb.ReadyResponse
+	roundTrip(t, ready, &readyOut)
+	if !readyOut.GetHaDisarmed() || readyOut.GetHaPolicyAt() != "2026-10-15T05:10:00Z" || !readyOut.GetHaKnown() {
+		t.Errorf("ReadyResponse HA fields = %v/%q/%v, want true/%q/true",
+			readyOut.GetHaDisarmed(), readyOut.GetHaPolicyAt(), readyOut.GetHaKnown(), ready.GetHaPolicyAt())
+	}
+
+	var unsetOut pb.CreateReplicationScheduleRequest
+	roundTrip(t, &pb.CreateReplicationScheduleRequest{VmName: "web"}, &unsetOut)
+	if unsetOut.BwlimitBytesPerSec != nil {
+		t.Errorf("unset bwlimit_bytes_per_sec came back as %d, want unset", unsetOut.GetBwlimitBytesPerSec())
+	}
+	zero := int64(0)
+	var zeroOut pb.CreateReplicationScheduleRequest
+	roundTrip(t, &pb.CreateReplicationScheduleRequest{VmName: "web", BwlimitBytesPerSec: &zero}, &zeroOut)
+	if zeroOut.BwlimitBytesPerSec == nil || zeroOut.GetBwlimitBytesPerSec() != 0 {
+		t.Error("bwlimit_bytes_per_sec set to 0 came back unset, want an explicit 0")
+	}
+	var schedOut pb.ReplicationSchedule
+	roundTrip(t, &pb.ReplicationSchedule{VmName: "web", BwlimitBytesPerSec: 50 << 20}, &schedOut)
+	if schedOut.GetBwlimitBytesPerSec() != 50<<20 {
+		t.Errorf("ReplicationSchedule.bwlimit_bytes_per_sec = %d, want %d", schedOut.GetBwlimitBytesPerSec(), 50<<20)
+	}
+
+	ens := &pb.EnsureDisksRequest{VmName: "web", NicMtu: []*pb.NICMTUExpectation{{Network: "jumbo", Mtu: 9000, Ordinal: 1}}}
+	var ensOut pb.EnsureDisksRequest
+	js := roundTrip(t, ens, &ensOut)
+	if got := ensOut.GetNicMtu(); len(got) != 1 || got[0].GetNetwork() != "jumbo" || got[0].GetMtu() != 9000 || got[0].GetOrdinal() != 1 {
+		t.Errorf("EnsureDisksRequest.nic_mtu = %v, want one {jumbo 9000 1}", got)
+	}
+	if !strings.Contains(js, `"nicMtu"`) {
+		t.Errorf("EnsureDisksRequest JSON %s has no nicMtu", js)
 	}
 }

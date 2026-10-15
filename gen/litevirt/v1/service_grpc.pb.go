@@ -317,6 +317,8 @@ const (
 	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
 	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
 	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
+	LiteVirt_GetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/GetHAPolicy"
+	LiteVirt_SetHAPolicy_FullMethodName                = "/litevirt.v1.LiteVirt/SetHAPolicy"
 	LiteVirt_RestoreRelay_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreRelay"
 	LiteVirt_GetRelayHealth_FullMethodName             = "/litevirt.v1.LiteVirt/GetRelayHealth"
 	LiteVirt_GetUpgradeStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetUpgradeStatus"
@@ -930,6 +932,11 @@ type LiteVirtClient interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
 	SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
+	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
+	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
+	// fenced and no workload is recovered automatically.
+	GetHAPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HAPolicyStatus, error)
+	SetHAPolicy(ctx context.Context, in *SetHAPolicyRequest, opts ...grpc.CallOption) (*HAPolicyStatus, error)
 	// RestoreRelay clears a relay-health demotion now (admin;
 	// colonelpanik/litevirt#175): it writes the host's relay_demoted row back
 	// to demoted=false, replicated and audited, and with hold_seconds > 0
@@ -4366,6 +4373,26 @@ func (c *liteVirtClient) SetFailoverScope(ctx context.Context, in *SetFailoverSc
 	return out, nil
 }
 
+func (c *liteVirtClient) GetHAPolicy(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HAPolicyStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HAPolicyStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetHAPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetHAPolicy(ctx context.Context, in *SetHAPolicyRequest, opts ...grpc.CallOption) (*HAPolicyStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HAPolicyStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetHAPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) RestoreRelay(ctx context.Context, in *RestoreRelayRequest, opts ...grpc.CallOption) (*RestoreRelayResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RestoreRelayResponse)
@@ -5292,6 +5319,11 @@ type LiteVirtServer interface {
 	// and while any voter is unreachable from the answering host.
 	GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error)
 	SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error)
+	// GetHAPolicy reports the cluster HA policy (armed or disarmed) and its
+	// confirmation; SetHAPolicy changes it (admin). While disarmed, no host is
+	// fenced and no workload is recovered automatically.
+	GetHAPolicy(context.Context, *emptypb.Empty) (*HAPolicyStatus, error)
+	SetHAPolicy(context.Context, *SetHAPolicyRequest) (*HAPolicyStatus, error)
 	// RestoreRelay clears a relay-health demotion now (admin;
 	// colonelpanik/litevirt#175): it writes the host's relay_demoted row back
 	// to demoted=false, replicated and audited, and with hold_seconds > 0
@@ -6339,6 +6371,12 @@ func (UnimplementedLiteVirtServer) GetFailoverScope(context.Context, *emptypb.Em
 }
 func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetFailoverScope not implemented")
+}
+func (UnimplementedLiteVirtServer) GetHAPolicy(context.Context, *emptypb.Empty) (*HAPolicyStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetHAPolicy not implemented")
+}
+func (UnimplementedLiteVirtServer) SetHAPolicy(context.Context, *SetHAPolicyRequest) (*HAPolicyStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetHAPolicy not implemented")
 }
 func (UnimplementedLiteVirtServer) RestoreRelay(context.Context, *RestoreRelayRequest) (*RestoreRelayResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RestoreRelay not implemented")
@@ -11456,6 +11494,42 @@ func _LiteVirt_SetFailoverScope_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetHAPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetHAPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetHAPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetHAPolicy(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetHAPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetHAPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetHAPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetHAPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetHAPolicy(ctx, req.(*SetHAPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_RestoreRelay_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RestoreRelayRequest)
 	if err := dec(in); err != nil {
@@ -13083,6 +13157,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetFailoverScope",
 			Handler:    _LiteVirt_SetFailoverScope_Handler,
+		},
+		{
+			MethodName: "GetHAPolicy",
+			Handler:    _LiteVirt_GetHAPolicy_Handler,
+		},
+		{
+			MethodName: "SetHAPolicy",
+			Handler:    _LiteVirt_SetHAPolicy_Handler,
 		},
 		{
 			MethodName: "RestoreRelay",

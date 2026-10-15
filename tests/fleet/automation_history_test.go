@@ -134,7 +134,19 @@ func TestAutomationReplayExpiredHistoryAndRenewedHead(t *testing.T) {
 	if _, err := f.Engine(2).Submit(f.Context(), f.Barrier(2, "after-expiry")); err != nil {
 		t.Fatalf("renewed quorum did not progress: %v", err)
 	}
+
 	f.Converge(t)
+	source := f.cluster.Nodes[0]
+	current, err := corrosion.AdoptedVoterConfig(f.Context(), source.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = source.DB.SealVoterGeneration(f.Context(), current.Generation, "expired-history-cut"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.Engine(0).FreezeMembershipCut(f.Context(), current.Generation); err != nil {
+		t.Fatalf("owned expired history could not form inert source cut: %v", err)
+	}
 }
 
 // A peer cannot substitute a CA while preserving names, incarnations, digest,

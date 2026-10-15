@@ -543,7 +543,9 @@ import (
 //	v68: node-local automation authority, applied prefix, certified history,
 //	     permanent request receipts, authenticated anchors and bounded on-disk
 //	     recovery staging. None participates in CRDT replication.
-const CurrentSchemaVersion = 68
+//	v69: inert node-local audited automation content cuts and bounded immutable
+//	     records. No transfer publication, adoption or capability authority.
+const CurrentSchemaVersion = 69
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2852,6 +2854,14 @@ var schemaDDL = []string{
 	// promise a peer could write is not a promise (§3.8). Written only through
 	// ExecuteLocal, one transaction per voter step, committed before the reply
 	// is built. Rows are never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_automation_cuts (
+		id TEXT PRIMARY KEY, generation INTEGER NOT NULL, incarnation TEXT NOT NULL,
+		metadata BLOB NOT NULL, root TEXT NOT NULL, UNIQUE(generation,incarnation)
+	)`,
+	`CREATE TABLE IF NOT EXISTS local_automation_cut_records (
+		cut_id TEXT NOT NULL, section INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+		record BLOB NOT NULL, PRIMARY KEY(cut_id,section,ordinal)
+	)`,
 	`CREATE TABLE IF NOT EXISTS local_automation_recovery (
 		id INTEGER PRIMARY KEY CHECK(id=1),sequence INTEGER NOT NULL,digest TEXT NOT NULL,
 		next_sequence INTEGER NOT NULL,next_digest TEXT NOT NULL,
@@ -3650,6 +3660,7 @@ var createTableUnits = []struct {
 	{68, "local_automation_authority"}, {68, "local_automation_prefix"},
 	{68, "local_automation_anchors"}, {68, "local_automation_history"},
 	{68, "local_automation_requests"}, {68, "local_automation_recovery"}, {68, "local_automation_staging"},
+	{69, "local_automation_cuts"}, {69, "local_automation_cut_records"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

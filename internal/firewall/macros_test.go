@@ -121,11 +121,19 @@ func TestExpand_UnknownListsCatalog(t *testing.T) {
 //
 // Mutation: skip the grammar check in Expand, red.
 func TestExpand_RefusesBadFields(t *testing.T) {
-	if rows, err := Expand("ssh", "ingress", "10.0.0.0/8;", "accept"); err == nil {
+	rows, err := Expand("ssh", "ingress", "10.0.0.0/8;", "accept")
+	if err == nil {
 		t.Errorf("injection-class cidr accepted: %+v", rows)
 	}
-	if _, err := Expand("ssh", "ingress", "", "allow"); err == nil {
+	if rows != nil {
+		t.Errorf("rows returned with an error: %+v", rows)
+	}
+	rows, err = Expand("web", "ingress", "", "allow")
+	if err == nil {
 		t.Error("bad action accepted")
+	}
+	if rows != nil {
+		t.Errorf("rows returned with an error: %+v", rows)
 	}
 }
 
@@ -134,5 +142,33 @@ func TestMacros_ReturnsCopy(t *testing.T) {
 	Macros()[0].Rows[0].Port = "1"
 	if Macros()[0].Rows[0].Port == "1" {
 		t.Error("catalog mutated through Macros()")
+	}
+}
+
+// Every catalog macro expands, in both directions, to one rule per row in row
+// order, and each expanded rule passes the write grammar.
+//
+// Mutation: add a malformed row to any macro, or drop a row in Expand, red.
+func TestExpand_EveryMacroBothDirections(t *testing.T) {
+	for _, m := range Macros() {
+		for _, dir := range []string{"ingress", "egress"} {
+			rows, err := Expand(strings.ToUpper(m.Name), dir, "10.0.0.0/8", "accept")
+			if err != nil {
+				t.Errorf("%s %s: %v", m.Name, dir, err)
+				continue
+			}
+			if len(rows) != len(m.Rows) {
+				t.Errorf("%s %s: %d rules, want %d", m.Name, dir, len(rows), len(m.Rows))
+				continue
+			}
+			for i, r := range rows {
+				if r.Proto != m.Rows[i].Proto || r.Port != m.Rows[i].Port || r.Direction != dir {
+					t.Errorf("%s %s row %d = %+v", m.Name, dir, i, r)
+				}
+				if err := rulefield.Rule(r.Direction, r.Proto, r.Port, r.CIDR, r.Action, ""); err != nil {
+					t.Errorf("%s %s row %d: %v", m.Name, dir, i, err)
+				}
+			}
+		}
 	}
 }

@@ -51,7 +51,7 @@ var macroCatalog = []Macro{
 	{"PostgreSQL", []MacroRow{{"tcp", "5432"}}},
 	{"RDP", []MacroRow{{"tcp", "3389"}}},
 	{"VNC", []MacroRow{{"tcp", "5900-5999"}}},
-	{"SNMP", []MacroRow{{"udp", "161-162"}}},
+	{"SNMP", []MacroRow{{"udp", "161-162"}, {"tcp", "161"}}},
 	{"Syslog", []MacroRow{{"udp", "514"}, {"tcp", "514"}}},
 	{"Telnet", []MacroRow{{"tcp", "23"}}},
 	{"Rsync", []MacroRow{{"tcp", "873"}}},

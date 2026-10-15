@@ -2211,6 +2211,9 @@ func (s *Server) startVMLockedWithin(ctx context.Context, vm *corrosion.VMRecord
 	if err := s.rejudgeSharedDisksForStart(ctx, vm); err != nil {
 		return nil, err
 	}
+	// A NIC whose network moved to another device since the domain was
+	// defined starts on the network's device now.
+	s.followNetworkDevices(ctx, vm.Name)
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.

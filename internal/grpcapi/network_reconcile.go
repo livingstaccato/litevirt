@@ -204,10 +204,12 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 		changed = true
 	}
 
-	// A bridge litevirt made that nothing names any more goes before any
-	// network is provisioned: one still holding a moved network's gateway
-	// address would stop its new device's dnsmasq.
-	s.sweepOrphanedBridges(ctx, st, live, dead)
+	// A device a network moved off that nothing here uses any more, and a
+	// bridge litevirt made that nothing names any more, go before any network
+	// is provisioned: one still holding a moved network's gateway address
+	// would stop its new device's dnsmasq.
+	s.retirePendingDevices(ctx)
+	s.sweepOrphanedBridges(ctx, st, dead)
 
 	for _, r := range live {
 		sig := r.typ + "\x00" + r.config

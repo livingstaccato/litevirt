@@ -52,6 +52,24 @@ func retargetInterface(domXML, mac, bridge string) (old, elem string, ok bool) {
 	return "", "", false
 }
 
+var sourceBridgeValueRE = regexp.MustCompile(`<source\b[^>]*\bbridge=['"]([^'"]*)['"]`)
+
+// InterfaceBridges maps each bridge interface of domXML, by its MAC in lower
+// case, to the bridge its <source> names. Interfaces of other kinds are left
+// out.
+func InterfaceBridges(domXML string) map[string]string {
+	out := map[string]string{}
+	for _, e := range interfaceElemRE.FindAllString(domXML, -1) {
+		m := macAddrRE.FindStringSubmatch(e)
+		b := sourceBridgeValueRE.FindStringSubmatch(e)
+		if m == nil || b == nil {
+			continue
+		}
+		out[strings.ToLower(m[1])] = b[1]
+	}
+	return out
+}
+
 // SetNICBridge moves the domain's NIC with MAC mac onto bridge, in place: the
 // same device, the same MAC, no detach and no redefine. The persistent
 // definition is updated so a cold boot keeps it, and a running domain is

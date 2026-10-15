@@ -189,19 +189,25 @@ A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
 When a network's device changes (a new `interface:` in a redeploy, say), each
-host tears down the old device the way a delete does before it sets up the new
-one, unless another live network uses the old device. While a guest on a host
-is still plugged into the old device, that host refuses the change, naming the
-guest's port, and keeps the old device; restart the guest and the next pass
-completes it. Each pass also removes a bridge litevirt created on that host
-(recorded under `/run/litevirt/bridges`, see below) that no live network, no
-pending teardown and no VM or container on the host names any more, and that
-has nothing plugged into it, together with its `dnsmasq`.
+host sets up the new device and tears the old one down the way a delete does,
+unless another live network uses it or something on that host still does: a
+guest port on it, a VM whose domain definition names it (running or stopped),
+or a container whose config links to it. Such a device keeps its gateway and
+`dnsmasq`, and goes on the first pass after nothing uses it. A VM or container
+moves to the network's new device when it next starts (`lv start`,
+`lv restart`), and records a `vm.nic_moved` event. The change is refused on a
+host only where the kept device serves the subnet the new one would serve too,
+since both cannot carry its gateway; the error names what holds the old device,
+and restarting it lets the change complete. Each pass also removes a bridge
+litevirt created on that host (recorded under `/run/litevirt/bridges`, see
+below) that no live network, pending teardown, VM or container on the host
+names any more, and that has nothing plugged into it, together with its
+`dnsmasq`.
 
 A bridge litevirt created for a network (recorded under
 `/run/litevirt/bridges`, below) and an isolated network's bridge get a MAC
-derived from the network's name, the same on every host, unless the bridge is
-on a VLAN or has an uplink. Provisioning sets it on a bridge that has another
+derived from the bridge's name, the same on every host and for every network
+sharing the bridge, unless the bridge is on a VLAN or has an uplink. Provisioning sets it on a bridge that has another
 MAC, so it reaches existing bridges on the daemon's first pass; an operator's
 bridge keeps its own. A guest that moves to another host then finds its
 gateway at the MAC it already has.

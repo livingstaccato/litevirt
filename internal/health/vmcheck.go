@@ -777,6 +777,19 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		}
 	}
 
+	// While cluster HA is disarmed, an automatic restart or migrate is held
+	// like every other automatic recovery: it becomes an alert. A policy this
+	// node cannot read holds it too. The restart POLICY (maybeRestartVM)
+	// starting a VM on its own host after a crash is kept.
+	if action == "restart" || action == "migrate" {
+		if why := haHoldsHealthAction(ctx, v.db); why != "" {
+			slog.Warn("vmcheck: cluster HA is disarmed — health-check action downgraded to an alert",
+				"vm", vm.Name, "action", action, "reason", why)
+			v.publish("vm.health.downgraded", vm.Name, fmt.Sprintf("action=%s downgraded to alert: %s", action, why))
+			action = "alert"
+		}
+	}
+
 	slog.Warn("vmcheck: taking action", "vm", vm.Name, "action", action)
 	v.publish("vm.health.failed", vm.Name, fmt.Sprintf("action=%s type=%s", action, hspec.Type))
 
@@ -1218,4 +1231,20 @@ func (v *VMChecker) startGuarded(ctx context.Context, name string) error {
 	}
 	defer release()
 	return v.virt.StartDomain(name)
+}
+
+// haHoldsHealthAction says why an automatic health-check restart or migrate
+// is held ("" when it is not): cluster HA is disarmed, or the policy cannot be
+// read.
+func haHoldsHealthAction(ctx context.Context, db *corrosion.Client) string {
+	p, err := corrosion.GetHAPolicy(ctx, db)
+	switch {
+	case err != nil && !errors.Is(err, corrosion.ErrUnreadableHAPolicy):
+		return "the cluster HA policy could not be read: " + err.Error()
+	case p.Unreadable:
+		return "the cluster HA policy cannot be read"
+	case p.Disarmed():
+		return "cluster HA is disarmed (lv cluster ha)"
+	}
+	return ""
 }

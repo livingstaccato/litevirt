@@ -639,8 +639,6 @@ func (s *Server) RunResourceOperationRecovery(ctx context.Context) {
 	}
 }
 
-// resizeRequestHash is the canonical request hash for a live resize (name + target
-// cpu + target mem), so a reused idempotency key with different targets is a conflict.
 // resizeOperationRecord is the header of a live resize's workload operation.
 // admitResizeReservation writes it (for a grow) and BeginVMOperation writes it
 // otherwise, keeping whichever came first (INSERT OR IGNORE), so both build it
@@ -662,6 +660,8 @@ func resizeOperationRecord(opID, method, principal, idemKey string, vm *corrosio
 	}
 }
 
+// resizeRequestHash is the canonical request hash for a live resize (name + target
+// cpu + target mem), so a reused idempotency key with different targets is a conflict.
 func resizeRequestHash(name string, cpu, mem int32) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("resize:%s:%d:%d", name, cpu, mem)))
 	return hex.EncodeToString(sum[:])

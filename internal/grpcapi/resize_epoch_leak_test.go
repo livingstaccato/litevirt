@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -217,5 +218,31 @@ func TestResizeVMLive_BeginNotAppliedAtNonZeroOwnerEpochReleasesItsReservation(t
 	}
 	if cpu, mem, err := corrosion.HostReserved(ctx, s.db, "test-host"); err != nil || cpu != 0 || mem != 0 {
 		t.Fatalf("after a grow that never began the host holds %d vCPU/%d MiB (err %v), want 0/0", cpu, mem, err)
+	}
+}
+
+// A same-key retry after the first attempt's operation was reaped is refused
+// with a reason, not the raw primary-key error of the reaped header's id.
+func TestResizeVMLive_SameKeyRetryAfterTheHeaderWasReaped(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "test-host", CPUTotal: 64, MemTotal: 4200, State: "HOST_ACTIVE",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	seedRunningVM(t, s, "rp", &pb.VMSpec{Name: "rp", Cpu: 2, MaxCpu: 8, MemoryMib: 2048, MinMemoryMib: 1024, MaxMemoryMib: 8192}, 2, 2048)
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 1 WHERE name = 'rp'`); err != nil {
+		t.Fatalf("set owner epoch: %v", err)
+	}
+	if err := s.resizeVMLive(ctx, "rp", &pb.VMSpec{Cpu: 2, MemoryMib: 8192}, "k-rp"); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("first attempt: got %v, want ResourceExhausted", err)
+	}
+	if err := s.db.Execute(ctx, `UPDATE operations SET deleted_at = '2026-10-01T00:00:00Z' WHERE resource_id = 'rp'`); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	err := s.resizeVMLive(ctx, "rp", &pb.VMSpec{Cpu: 2, MemoryMib: 8192}, "k-rp")
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "new idempotency key") {
+		t.Fatalf("same-key retry after the header was reaped: got %v, want FailedPrecondition naming a new idempotency key", err)
 	}
 }

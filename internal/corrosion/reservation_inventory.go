@@ -130,9 +130,13 @@ func HostReservations(ctx context.Context, c *Client, host string) ([]HostReserv
 			out = append(out, *v)
 		}
 	}
+	// created_at mixes second and nanosecond stamps, which do not sort as
+	// strings; order by the instant, then id.
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Op.CreatedAt != out[j].Op.CreatedAt {
-			return out[i].Op.CreatedAt < out[j].Op.CreatedAt
+		ti, _ := parseReservationTime(out[i].Op.CreatedAt)
+		tj, _ := parseReservationTime(out[j].Op.CreatedAt)
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
 		}
 		return out[i].Op.ID < out[j].Op.ID
 	})
@@ -253,9 +257,11 @@ func isHardTerminal(state string) bool {
 }
 
 // reservationVMGone: no live row, or the live row is a later incarnation than
-// the operation. created_at is a fresh incarnation stamp at nanosecond precision
-// while the header's is whole seconds, so the row's is truncated to the second
-// first: a row created in the operation's own second is never called newer.
+// the operation. The row's created_at is a nanosecond incarnation stamp, while
+// most operation headers are stamped in whole seconds (InsertOperation,
+// BeginVMOperation; a create header is nanoseconds). Both are truncated to the
+// second before comparing, so a row created in the operation's own second is
+// never called newer.
 func reservationVMGone(vm *VMRecord, opCreated time.Time) bool {
 	if vm == nil {
 		return true
@@ -292,9 +298,11 @@ var (
 // immutable merge takes it as one.
 //
 // already=true, with nothing written, when the header epoch already reduces to a
-// terminal. In the same transaction as the write it refuses an operation a live
-// mutation barrier names (ErrReservationInFlight), and it never releases a
-// capacity lease or a manifest journal (ErrReservationNotReleasable). Whether the
+// terminal, or when a tombstoned cancelled row already holds the release row's
+// key (it cannot be inserted again). In the same transaction as the write it
+// refuses an operation a live mutation barrier names (ErrReservationInFlight),
+// and it never releases a capacity lease or a manifest journal
+// (ErrReservationNotReleasable). Whether the
 // reservation is safe to release otherwise is the caller's decision
 // (ClassifyReservation, under the VM lock on the target host).
 func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bool, err error) {
@@ -331,6 +339,18 @@ func ReleaseReservation(ctx context.Context, c *Client, opID string) (already bo
 				inFlight = true
 				return false, nil
 			}
+		}
+		// A tombstoned release row at this key would make the insert fail on the
+		// primary key on every attempt. It cannot be written again; report it
+		// as already released rather than fail forever.
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM operation_steps
+			 WHERE operation_id = ? AND owner_epoch = ? AND step_name = ? AND deleted_at IS NOT NULL`,
+			opID, op.VMOwnerEpoch, OpStepCancelled).Scan(&n); err != nil {
+			return false, err
+		}
+		if n != 0 {
+			return false, nil
 		}
 		rows, err := tx.QueryContext(ctx,
 			`SELECT step_name FROM operation_steps

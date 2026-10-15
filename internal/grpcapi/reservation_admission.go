@@ -567,6 +567,14 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 			"%s: idempotency key already used for a different request (operation %s)", what, op.ID)
 	}
 	if err != nil {
+		// A reaped (tombstoned) header still holds its id, so the insert fails on
+		// the primary key; the earlier request finished long ago.
+		if rows, qerr := s.db.Query(ctx,
+			`SELECT 1 FROM operations WHERE id = ? AND deleted_at IS NOT NULL`, op.ID); qerr == nil && len(rows) != 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s: an earlier request with the same idempotency key used operation %s, which has since been "+
+					"removed; retry with a new idempotency key", what, op.ID)
+		}
 		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
 	}
 	if !created {

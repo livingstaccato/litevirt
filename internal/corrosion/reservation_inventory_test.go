@@ -417,3 +417,67 @@ func TestHostReservations_IgnoresTombstonedRows(t *testing.T) {
 		t.Fatalf("a tombstoned completed step was read as the operation's finish: %q at %d (%s)", v.LatestState, v.LatestEpoch, v.Class)
 	}
 }
+
+// A container reservation is never released on terminal-past-header or
+// vm-gone evidence (there is no VM row to be gone), and a containers barrier
+// naming it makes it in flight — to the classifier and to the release guard.
+func TestClassify_ContainerReservation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	rv := ReservationVector{TargetHost: "h1", TargetMemMiB: 256, Workload: "ct1", WorkloadKind: WorkloadContainer, WorkloadHost: "h1"}
+	steps := map[int64][]string{0: {OpStepPlanned, OpStepReserved}, 1: {OpStepCompleted}}
+	invOp(t, c, "ct-held", OpWorkloadCreate, "container", "ct1", "CreateContainer", 0, rv, ago(time.Hour), steps)
+	invOp(t, c, "ct-free", OpWorkloadCreate, "container", "ct2", "CreateContainer", 0, rv, ago(time.Hour), steps)
+	now := ago(time.Hour)
+	if err := c.Execute(ctx, `INSERT INTO containers (host_name, name, image, state, created_at, updated_at)
+		VALUES ('h1', 'ct1', 'img', 'running', ?, ?)`, now, now); err != nil {
+		t.Fatalf("seed container: %v", err)
+	}
+	if err := c.Execute(ctx, `UPDATE containers SET active_operation_id = 'ct-held' WHERE name = 'ct1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if v := mustClassify(t, c, "ct-held"); v.Class != ReservationInFlight {
+		t.Fatalf("container op under its barrier classified %q (%s), want %q", v.Class, v.Detail, ReservationInFlight)
+	}
+	if _, err := ReleaseReservation(ctx, c, "ct-held"); !errors.Is(err, ErrReservationInFlight) {
+		t.Fatalf("ReleaseReservation(container op under its barrier) = %v, want ErrReservationInFlight", err)
+	}
+	if v := mustClassify(t, c, "ct-free"); v.Class != ReservationNoRunningOperation {
+		t.Fatalf("container op with no barrier classified %q (%s), want %q (never vm_gone)", v.Class, v.Detail, ReservationNoRunningOperation)
+	}
+}
+
+// A VM row created in the operation header's own second is the same
+// incarnation, though its nanosecond stamp sorts after the header's.
+func TestClassify_VMCreatedInTheOperationsSecondIsNotGone(t *testing.T) {
+	c := testClient(t)
+	sec := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	invVM(t, c, "vm1", 1, sec.Add(500*time.Millisecond).Format(time.RFC3339Nano), "")
+	invOp(t, c, "op", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 1, leakVector, sec.Format(time.RFC3339),
+		map[int64][]string{1: {OpStepReserved, OpStepAdmitted}})
+	if v := mustClassify(t, c, "op"); v.Class != ReservationNoRunningOperation {
+		t.Fatalf("VM created in the op's own second classified %q (%s), want %q", v.Class, v.Detail, ReservationNoRunningOperation)
+	}
+}
+
+// A tombstoned cancelled row at the release key, under a live header, cannot be
+// written again. The release reports it instead of failing on every attempt.
+func TestReleaseReservation_TombstonedReleaseRowIsNotAnError(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	invVM(t, c, "vm1", 1, agoNano(48*time.Hour), "")
+	invOp(t, c, "leak", OpResourceUpdateRunning, "vm", "vm1", "ResizeVMLive", 0, leakVector, ago(time.Hour), leakSteps())
+	if err := AppendOperationStep(ctx, c, OperationStepRecord{OperationID: "leak", StepName: OpStepCancelled, Facts: ReservationReleasedFacts}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, `UPDATE operation_steps SET deleted_at = ?
+		WHERE operation_id = 'leak' AND owner_epoch = 0 AND step_name = 'cancelled'`, ago(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if already, err := ReleaseReservation(ctx, c, "leak"); err != nil || !already {
+			t.Fatalf("release %d over a tombstoned release row: already=%v err=%v, want already=true", i, already, err)
+		}
+	}
+}

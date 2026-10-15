@@ -411,6 +411,9 @@ type Coordinator struct {
 	LiveVoters func(voters, uncounted map[string]bool) map[string]bool
 	// HAPeerVetoGauge, when set, is litevirt_ha_peer_veto.
 	HAPeerVetoGauge func(on bool)
+	// AnswerWindow replaces PeerAnswerWindow (fleet scenarios, which shorten
+	// the HA handler's matching wait). 0 in production.
+	AnswerWindow time.Duration
 	// ha is the HA-disarm memory (ha_disarm.go).
 	ha haDisarmState
 	// PeerRecoveryExclusions says which peers must not be a VM recovery

@@ -284,6 +284,10 @@ func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosi
 	}
 	sort.Strings(names)
 	now := c.mono()
+	window := PeerAnswerWindow
+	if c.AnswerWindow > 0 {
+		window = c.AnswerWindow
+	}
 	var out []haVeto
 	for _, v := range names {
 		if v == c.hostName {
@@ -292,7 +296,7 @@ func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosi
 		}
 		a, ok := c.PeerHAState(v)
 		switch {
-		case !ok || now.Sub(a.Asked) > PeerAnswerWindow:
+		case !ok || now.Sub(a.Asked) > window:
 			out = append(out, haVeto{Voter: v, Rule: VetoStale, PolicyAt: a.PolicyAt})
 		case !a.Known:
 			out = append(out, haVeto{Voter: v, Rule: VetoUnknown, PolicyAt: a.PolicyAt})

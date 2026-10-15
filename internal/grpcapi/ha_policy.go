@@ -50,6 +50,17 @@ var (
 	haNow = time.Now
 )
 
+// SetHAWaitsForTest sets the confirmation timeout, its poll interval and the
+// wait after confirmation, and returns what restores them. The wait after
+// confirmation must equal the coordinators' peer-answer window
+// (failover.Coordinator.AnswerWindow) for the confirmation to mean anything.
+// Tests only.
+func SetHAWaitsForTest(confirm, poll, window time.Duration) (restore func()) {
+	oc, op, ow := haConfirmTimeout, haConfirmPoll, haPeerWindow
+	haConfirmTimeout, haConfirmPoll, haPeerWindow = confirm, poll, window
+	return func() { haConfirmTimeout, haConfirmPoll, haPeerWindow = oc, op, ow }
+}
+
 // HA voter statuses in `lv cluster ha`, the peer veto's own vocabulary.
 const (
 	haStatusConfirmed = "confirmed"

@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -77,9 +78,15 @@ func newStorageAbort(t *testing.T, policy *pb.MigrationPolicy, targetHasISO bool
 		if err := os.WriteFile(f.iso, f.operatorISO, 0o644); err != nil {
 			t.Fatal(err)
 		}
+		// pp1's own, from an earlier stay: stamped as its (a seed of any
+		// other VM of the name, or an unstamped one, is written again for
+		// pp1 — cloudinit/seed_owner.go).
+		if err := cloudinit.StampSeed(f.iso, "pp1-uuid"); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	spec, err := json.Marshal(&pb.VMSpec{Name: "pp1", Cpu: 1, MemoryMib: 256, Migrate: policy})
+	spec, err := json.Marshal(&pb.VMSpec{Name: "pp1", Cpu: 1, MemoryMib: 256, Migrate: policy, Uuid: "pp1-uuid"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +229,8 @@ func (f *storageAbort) requireUndone(t *testing.T) {
 		t.Errorf("the cloud-init ISO the target already had was replaced: %q", got)
 	case f.operatorISO == nil && !os.IsNotExist(err):
 		t.Errorf("the cloud-init ISO this migration created on the target is still there (read: %v)", err)
+	case f.operatorISO == nil && present(cloudinit.SeedOwnerPath(f.iso)):
+		t.Errorf("the stamp of the cloud-init ISO this migration created on the target is still there")
 	}
 	if cpu, mem, err := corrosion.HostReserved(ctx, f.dst.DB, f.dst.Name); err != nil || cpu != 0 || mem != 0 {
 		t.Errorf("the target still reserves cpu=%d mem=%d MiB for the aborted migration (err %v)", cpu, mem, err)

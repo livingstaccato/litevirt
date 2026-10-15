@@ -1839,6 +1839,28 @@ naming the prefix and the tree; the daemon log says the same at start.
 |---|---|
 | The daemon starts with such a prefix configured. | The daemon starts with no such prefix (the prefix moved to a filesystem of its own, or removed). |
 
+### Reservation not released (`reservation_stale`)
+
+Evaluator `reservation-sweep`, subject kind `host`, subject the host the
+reservations are counted against, severity warning. Each node's reservation
+sweep runs at startup and every 60 seconds. It releases a reservation whose
+operation finished at an owner epoch past its header's, or whose VM no longer
+exists, and logs `released a host reservation whose operation is no longer
+running`. A node raises `reservation_stale` about **itself** while a
+reservation counted against it is older than 15 minutes, no operation holds it
+in flight, and the sweep cannot release it. The evidence carries `count` and
+`reservations` (up to 20), each with `operation_id`, `method`, `vm`, `vcpu`,
+`memory_mib`, `created_at`, `class` and `remedy`.
+
+| `class` | Why the sweep does not release it | Remedy |
+|---|---|---|
+| `no_running_operation` | Nothing proves its operation stopped: no VM barrier names it, and it has no terminal step at an owner epoch past its header's. | Check with `lv operation show <vm>` that nothing is running, then release it by hand by its operation id. |
+| `terminal_past_header` or `vm_gone` | Its release row (a `cancelled` step at the header's owner epoch) is tombstoned and cannot be written again, or the write failed. | A failed write is retried every pass, and the daemon logs `reservation sweep: could not release a reservation` once per operation with the error. |
+
+| Raised when | Clears when |
+|---|---|
+| A sweep pass finds such a reservation. | A sweep pass finds none: each one was released, or its operation was reaped. |
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

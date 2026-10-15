@@ -702,6 +702,11 @@ type Server struct {
 	smartMetrics     *metrics.SMARTMetrics
 	smartRunner      smart.Runner // test seam; nil = real smartctl
 
+	// reservationMetrics and resSweep belong to the reservation sweep
+	// (reservation_recovery.go).
+	reservationMetrics *metrics.ReservationMetrics
+	resSweep           reservationSweepState
+
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
 	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be

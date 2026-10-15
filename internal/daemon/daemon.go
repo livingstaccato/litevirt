@@ -1200,6 +1200,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetSMARTMetrics(metrics.NewSMARTMetrics())
+	svc.SetReservationMetrics(metrics.NewReservationMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
 	// The ceph pools' libvirt secrets (ephemeral: gone after a libvirtd
 	// restart): defined now, then kept in line with the pools and keyrings.
@@ -1313,6 +1314,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// retries stragglers.
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
+
+	// Release host reservations whose operation provably stopped running (one
+	// finished past its header's owner epoch, or whose VM is gone), after the
+	// recovery above has finished what it could.
+	svc.SweepReservationsOnce(ctx)
+	go svc.RunReservationRecovery(ctx)
 
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed

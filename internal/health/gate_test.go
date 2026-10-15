@@ -292,6 +292,32 @@ func TestExecutionGate_WitnessCannotExecute(t *testing.T) {
 	}
 }
 
+// TestExecutionGate_WitnessReasonOrder pins the order the dual-run resolve
+// gate relies on (grpcapi resolveGateValid): local_not_active_worker is
+// reported only once self-fence and quorum both held. A witness without the
+// quorum, or self-fenced, must get those reasons instead, or it would resolve
+// conditions it cannot prove absent.
+//
+// Mutation: check the worker clause before the quorum — the first check goes
+// red.
+func TestExecutionGate_WitnessReasonOrder(t *testing.T) {
+	db := testCheckHostDB(t)
+	gateHost(t, db, "wit-1", "active", "witness")
+	gateHost(t, db, "host-b", "active", "worker")
+	gateHost(t, db, "host-c", "active", "worker")
+
+	c := NewChecker("wit-1", "/etc/litevirt/pki", db)
+	warm(c, map[string]bool{"host-b": false, "host-c": false})
+	if r := c.ExecutionGate(context.Background()); r.OK || r.Reason != ReasonNoQuorum {
+		t.Fatalf("witness without quorum: got OK=%v reason=%q; want no_quorum", r.OK, r.Reason)
+	}
+	warm(c, map[string]bool{"host-b": true, "host-c": true})
+	c.SetSelfFenced(func() bool { return true })
+	if r := c.ExecutionGate(context.Background()); r.OK || r.Reason != ReasonSelfFenced {
+		t.Fatalf("self-fenced witness: got OK=%v reason=%q; want self_fenced", r.OK, r.Reason)
+	}
+}
+
 func TestDecisionGate_NotCoordinatorEligibleWhenDraining(t *testing.T) {
 	db := testCheckHostDB(t)
 	gateHost(t, db, "host-a", "draining", "worker") // self draining: votes but can't coordinate

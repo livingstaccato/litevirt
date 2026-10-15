@@ -71,7 +71,9 @@ func TestReplicationRate_BwlimitPacesAScheduledRun(t *testing.T) {
 		t.Fatalf("root disk of %s: rows %v", vm, rows)
 	}
 	root := rows[0][0]
-	if out, err := l.ssh(h, 10*time.Minute, "qemu-io -f qcow2 -c 'write -P 0x5a 0 2G' "+shellQuote(root)); err != nil || !strings.Contains(out, "wrote") {
+	// The whole 2G disk, in two 1G writes: qemu-io refuses one write longer
+	// than 2147483136 bytes ("length cannot exceed ... without -n").
+	if out, err := l.ssh(h, 10*time.Minute, "qemu-io -f qcow2 -c 'write -P 0x5a 0 1G' -c 'write -P 0x5a 1G 1G' "+shellQuote(root)); err != nil || strings.Count(out, "wrote") != 2 {
 		t.Fatalf("fill %s with qemu-io: %v\n%s", root, err, out)
 	}
 

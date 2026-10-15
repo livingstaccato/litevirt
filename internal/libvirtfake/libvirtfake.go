@@ -110,6 +110,8 @@ type Fake struct {
 
 	// bridgeMTU is each bridge's MTU on this node (SetBridgeMTU). Guarded by f.mu.
 	bridgeMTU map[string]int
+	// bridgeMTUErr fails the read of a bridge's MTU (FailBridgeMTU). Guarded by f.mu.
+	bridgeMTUErr map[string]error
 
 	// Optional time source for events. Defaults to time.Now.
 	Now func() time.Time

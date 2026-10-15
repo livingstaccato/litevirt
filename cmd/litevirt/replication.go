@@ -111,6 +111,12 @@ replication").`,
 				}
 				fmt.Printf("replication schedule %s → %s added (cron=%q, incremental=%v, auto-promote=%v, enabled=%v, bwlimit=%s)\n",
 					s.VmName, s.TargetPool, s.Cron, s.Incremental, s.AutoPromote, s.Enabled, pbsstore.FormatRate(s.BwlimitBytesPerSec))
+				// A daemon that does not know the field (an older build,
+				// mid-upgrade) drops it and answers no limit.
+				if req.GetBwlimitBytesPerSec() > 0 && s.BwlimitBytesPerSec == 0 {
+					return fmt.Errorf("the schedule was added without a bandwidth limit: the daemon did not store --bwlimit %s (it may run an older build); re-run once every host is upgraded",
+						pbsstore.FormatRate(req.GetBwlimitBytesPerSec()))
+				}
 				return nil
 			})
 		},

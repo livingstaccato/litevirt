@@ -2435,7 +2435,10 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	domXML, err = lv.GenerateDomainXML(vmCfg)
 	if err != nil {
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
-		return "", false, fmt.Sprintf("XML gen: %v", err) // non-retryable (bad config)
+		// Non-retryable (bad config), except a bridge whose MTU could not be
+		// read: a bridge being recreated is a transient failure, retried on a
+		// later pass like any other.
+		return "", lv.IsBridgeMTUReadError(err), fmt.Sprintf("XML gen: %v", err)
 	}
 	return domXML, false, ""
 }

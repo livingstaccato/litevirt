@@ -16,11 +16,17 @@ type rateClient struct {
 	pb.LiteVirtClient
 	created *pb.CreateReplicationScheduleRequest
 	list    []*pb.ReplicationSchedule
+	// dropRate answers as a daemon that does not know the field: no limit.
+	dropRate bool
 }
 
 func (c *rateClient) CreateReplicationSchedule(_ context.Context, in *pb.CreateReplicationScheduleRequest, _ ...grpc.CallOption) (*pb.ReplicationSchedule, error) {
 	c.created = in
-	return &pb.ReplicationSchedule{VmName: in.VmName, TargetPool: in.TargetPool, Cron: in.Cron, BwlimitBytesPerSec: in.GetBwlimitBytesPerSec()}, nil
+	out := &pb.ReplicationSchedule{VmName: in.VmName, TargetPool: in.TargetPool, Cron: in.Cron, BwlimitBytesPerSec: in.GetBwlimitBytesPerSec()}
+	if c.dropRate {
+		out.BwlimitBytesPerSec = 0
+	}
+	return out, nil
 }
 
 func (c *rateClient) ListReplicationSchedules(context.Context, *pb.ListReplicationSchedulesRequest, ...grpc.CallOption) (*pb.ListReplicationSchedulesResponse, error) {
@@ -97,5 +103,23 @@ func TestReplicationScheduleLs_RateColumn(t *testing.T) {
 	col := strings.Index(lines[0], "RATE")
 	if f := strings.Fields(lines[2][col:]); len(f) == 0 || f[0] != "-" {
 		t.Errorf("web2's RATE column = %q, want \"-\"", lines[2][col:])
+	}
+}
+
+// A limit the daemon did not store (an older daemon drops the field it does
+// not know) fails the command, saying the schedule was added unlimited; a 0
+// or an absent --bwlimit answered with no limit is what was asked.
+//
+// Mutation: drop the check — the dropped 50MiB exits 0.
+func TestReplicationScheduleAdd_BwlimitDroppedByTheDaemon(t *testing.T) {
+	base := []string{"replication", "schedule", "add", "web1", "--cron", "0 * * * *", "--target-pool", "dr"}
+	_, err := runRateCmd(t, &rateClient{dropRate: true}, append(append([]string{}, base...), "--bwlimit", "50MiB")...)
+	if err == nil || !strings.Contains(err.Error(), "without a bandwidth limit") {
+		t.Fatalf("dropped 50MiB: err = %v, want it to say the schedule has no limit", err)
+	}
+	for _, flag := range [][]string{nil, {"--bwlimit", "0"}} {
+		if _, err := runRateCmd(t, &rateClient{dropRate: true}, append(append([]string{}, base...), flag...)...); err != nil {
+			t.Errorf("%v answered with no limit: %v", flag, err)
+		}
 	}
 }

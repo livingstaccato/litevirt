@@ -198,6 +198,20 @@ type peerPauseAnswer struct {
 	pause bool
 }
 
+// peerHAAnswers is each peer's latest answer to the health probe about the
+// cluster HA policy (ReadyResponse.ha_disarmed, ha_policy_at, ha_known).
+type peerHAAnswers struct {
+	mu sync.Mutex
+	m  map[string]peerHAAnswer
+}
+
+type peerHAAnswer struct {
+	asked    time.Time // when the probe that carried it was sent
+	known    bool
+	disarmed bool
+	policyAt string
+}
+
 // record keeps on as host's answer unless a probe sent later has already
 // answered: two probes of one host can be in flight at once (the checker's,
 // and PeerUp's on demand), and the one sent last is the one that may have

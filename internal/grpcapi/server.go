@@ -232,6 +232,10 @@ type Server struct {
 	// backup_bwlimits), set via SetBackupBandwidthLimits.
 	backupBW backupBandwidth
 
+	// replRateThrottles holds one shared throttle per replication schedule
+	// with a bandwidth limit, shared by every run of that schedule on this host.
+	replRateThrottles replicationRateThrottles
+
 	// fileRestore holds single-file restore's restore VM sessions
 	// (file_restore.go), configured via SetFileRestore.
 	fileRestore fileRestoreSessions
@@ -432,6 +436,16 @@ type Server struct {
 	// peerPause holds each peer's latest answer to the health probe about its
 	// own partition pause (ready.go), which a failover coordinator relies on.
 	peerPause peerPauseAnswers
+	// peerHA holds each peer's latest answer to the health probe about the
+	// cluster HA policy (ReadyResponse.ha_*), which the coordinator's
+	// decide-time veto reads.
+	peerHA peerHAAnswers
+	// haCache is this node's in-memory copy of the cluster HA policy, which
+	// Ready answers from without a database read.
+	haCache haPolicyCache
+	// fenceCandidates lists the hosts the failover coordinator would fence now,
+	// set via SetFenceCandidates. nil until wired.
+	fenceCandidates func(ctx context.Context) ([]string, error)
 	// forced records forced voter generations this node refused to adopt
 	// (voter_force.go), for ha.voter.forced.
 	forced forcedConflicts

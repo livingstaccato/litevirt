@@ -675,13 +675,14 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 	// every later arm of the VM would demand it in force. A NIC that may still
 	// be live keeps its record, and the operation stays recoverable.
 	if rolledBack && rb.guardRecorded {
-		// No record is written while guards cannot be: then nothing to retire.
 		rec, err := corrosion.GetNICGuard(ctx, s.db, rb.vm.Name, strings.ToLower(rb.mac))
 		switch {
 		case err != nil:
 			slog.Error("nic attach rollback: read the guard record failed", "vm", rb.vm.Name, "mac", rb.mac, "error", err)
 			rolledBack = false
 		case rec == nil:
+			// The attach failed before its record was written, or guards
+			// could not be recorded: nothing to retire.
 		default:
 			if err := s.verifyNICDetached(ctx, rb.vm.Name, rb.mac, rb.running); err != nil {
 				slog.Error("nic attach rollback: NIC absence unverifiable; its guard record is kept", "vm", rb.vm.Name, "mac", rb.mac, "error", err)

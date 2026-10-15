@@ -170,3 +170,57 @@ func TestCorrosionPlanLoader_ModeFromPolicyAndConntrack(t *testing.T) {
 		t.Errorf("no bridge conntrack: %q, want guards-only", m)
 	}
 }
+
+// TestCorrosionPlanLoader_ARetiredRecordOverALiveNICGuards (review I1): a
+// retired record of the running incarnation over a NIC whose row is live —
+// a write order this replica saw out of order — renders the NIC guarded, not
+// unguarded; one of another incarnation guards nothing.
+func TestCorrosionPlanLoader_ARetiredRecordOverALiveNICGuards(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	for _, v := range []struct{ name, uuid, mac, ip string }{
+		{"web", "u-1", "52:54:00:00:00:01", "10.0.0.10"},
+		{"other", "u-2", "52:54:00:00:00:02", "10.0.0.11"},
+	} {
+		if err := corrosion.InsertVM(ctx, db,
+			corrosion.VMRecord{Name: v.name, HostName: "host-a", State: "running", Spec: `{"name":"` + v.name + `","uuid":"` + v.uuid + `"}`},
+			[]corrosion.InterfaceRecord{{VMName: v.name, NetworkName: "prod", MAC: v.mac, IP: v.ip}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		// Each NIC's record is retired; "other"'s was written for an
+		// earlier incarnation.
+		uuid := v.uuid
+		if v.name == "other" {
+			uuid = "u-old"
+		}
+		if err := corrosion.PutNICGuard(ctx, db, capabilities.GrantForTest(t, capabilities.FeatureNICGuards), corrosion.NICGuardRecord{
+			VMName: v.name, MAC: v.mac, Mode: corrosion.NICGuardOff, VMUUID: uuid,
+		}, "test"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.RetireNICGuard(ctx, db, v.name, v.mac, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"web":   {"52:54:00:00:00:01": "vnet1"},
+		"other": {"52:54:00:00:00:02": "vnet2"},
+	}))(ctx)
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	byDev := map[string]NICBinding{}
+	for _, n := range plan.NICs {
+		byDev[n.NICDev] = n
+	}
+	if g := byDev["vnet1"].Guard; g == nil || !reflect.DeepEqual(g.V4, []string{"10.0.0.10"}) {
+		t.Errorf("a live NIC under its incarnation's retired record: guard %+v, want the default guard", g)
+	}
+	if g := byDev["vnet2"].Guard; g != nil {
+		t.Errorf("another incarnation's retired record guarded a NIC: %+v", g)
+	}
+}

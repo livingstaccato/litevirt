@@ -55,7 +55,22 @@ func DeterministicNICID(vmName, mac string) string {
 // Clears deleted_at — an upsert of a previously-tombstoned id resurrects it,
 // same as InsertInterface's re-attach semantics.
 func UpsertNIC(ctx context.Context, c *Client, r NICRecord) error {
+	// Just past the row this replaces when that one is newer than this host's
+	// clock (a tombstone from a host whose clock ran ahead), so a re-attach
+	// of a MAC is never older than its earlier detach on any replica.
+	floor := ""
+	if rows, err := c.Query(ctx, `SELECT updated_at FROM vm_nics WHERE vm_name = ? AND id = ?`, r.VMName, r.ID); err != nil {
+		return err
+	} else if len(rows) > 0 {
+		floor = rows[0].String("updated_at")
+	}
 	now := c.NowTS()
+	if floor != "" && !LWWNewer(now, floor) {
+		var err error
+		if now, err = c.stampAfter(floor, c.now()); err != nil {
+			return err
+		}
+	}
 	model := r.Model
 	if model == "" {
 		model = "virtio"

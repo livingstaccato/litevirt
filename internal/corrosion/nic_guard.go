@@ -187,7 +187,48 @@ func PutNICGuard(ctx context.Context, c *Client, g capabilities.FeatureGrant, r 
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, c.NowTS())
+	ts, err := nicGuardStamp(ctx, c, r.VMName, r.MAC)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, ts)
+}
+
+// nicGuardStamp is the updated_at a write of owner's NIC mac's guard record
+// carries: NowTS, or just past the newest write this replica holds for that
+// NIC — its record, live or retired, or its NIC row, live or tombstoned —
+// when that one is newer. With RFC3339 keys a peer's clock may run ahead of
+// this host's, and a fresh NowTS could then sort below a retire or a row
+// tombstone this write follows; every replica holding both would keep the
+// older one (a re-attached NIC losing its guard).
+func nicGuardStamp(ctx context.Context, c *Client, owner, mac string) (string, error) {
+	floor := ""
+	note := func(ts string) {
+		if ts != "" && (floor == "" || lwwOrder(ts, floor) > 0) {
+			floor = ts
+		}
+	}
+	rows, err := c.Query(ctx, `SELECT updated_at FROM cluster_policies WHERE key = ?`, NICGuardKey(owner, strings.ToLower(mac)))
+	if err != nil {
+		return "", err
+	}
+	for _, r := range rows {
+		note(r.String("updated_at"))
+	}
+	if !strings.HasPrefix(owner, "ct:") {
+		for _, table := range []string{"vm_nics", "vm_interfaces"} {
+			nics, err := GetVMNICsRaw(ctx, c, table, owner)
+			if err != nil {
+				return "", err
+			}
+			for _, n := range nics {
+				if strings.EqualFold(n.MAC, mac) {
+					note(n.UpdatedAt)
+				}
+			}
+		}
+	}
+	return c.stampAfter(floor, c.now())
 }
 
 // GetNICGuard returns a NIC's record, or nil when it has none (unguarded).
@@ -246,7 +287,11 @@ func DeleteNICGuardsOf(ctx context.Context, c *Client, owner, setBy string) erro
 		if err != nil {
 			return err
 		}
-		if err := c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, c.NowTS()); err != nil {
+		ts, err := nicGuardStamp(ctx, c, r.VMName, r.MAC)
+		if err != nil {
+			return err
+		}
+		if err := c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, ts); err != nil {
 			return err
 		}
 	}
@@ -643,17 +688,17 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 	}
 	var own []NICGuardRecord
 	for _, r := range rows {
-		if rec, ok := decodeNICGuard(r); ok && !rec.Deleted && rec.VMName == owner && rec.Guarded() {
+		if rec, ok := decodeNICGuard(r); ok && rec.VMName == owner && (rec.Deleted || rec.Guarded()) {
 			own = append(own, rec)
 		}
 	}
 	if len(own) == 0 {
 		return nil, nil
 	}
-	uuid := ""
+	uuid, inFlight := "", false
 	vm, err := GetVM(ctx, c, owner)
 	if err != nil {
-		return nil, fmt.Errorf("read the VM row of %s, which has a NIC guard on: %w", owner, err)
+		return nil, fmt.Errorf("read the VM row of %s, which has a NIC guard record: %w", owner, err)
 	}
 	if vm != nil {
 		var sp struct {
@@ -661,48 +706,60 @@ func GuardedMACsOf(ctx context.Context, c *Client, owner string) ([]string, erro
 		}
 		_ = json.Unmarshal([]byte(vm.Spec), &sp)
 		uuid = sp.UUID
+		inFlight = vm.ActiveOperationID != ""
 	}
-	removed, err := removedNICsOf(ctx, c, owner)
+	live, removed, err := nicRowStatesOf(ctx, c, owner)
 	if err != nil {
-		return nil, fmt.Errorf("read the NIC rows of %s, which has a NIC guard on: %w", owner, err)
+		return nil, fmt.Errorf("read the NIC rows of %s, which has a NIC guard record: %w", owner, err)
 	}
 	var out []string
 	for _, r := range own {
+		mac := strings.ToLower(r.MAC)
+		if r.Deleted {
+			if _, ok := RetiredGuardOver(r, uuid); ok && live[mac] {
+				out = append(out, mac)
+			}
+			continue
+		}
 		if r.VMUUID != "" && uuid != "" && r.VMUUID != uuid {
 			continue
 		}
-		if ts, gone := removed[strings.ToLower(r.MAC)]; gone && lwwOrder(ts, r.UpdatedAt) >= 0 {
+		if ts, gone := removed[mac]; gone && !inFlight && lwwOrder(ts, r.UpdatedAt) >= 0 {
 			// The NIC was removed after its record was written (a detach,
 			// or an attach rolled back), by a build that left the record
 			// live. No host renders a NIC whose row is tombstoned, so the
-			// record could never be in force: it is not demanded.
+			// record could never be in force: it is not demanded. Not
+			// while an operation holds the VM: a detach that tombstoned
+			// the row and then failed may leave the NIC in its domain.
 			continue
 		}
-		out = append(out, strings.ToLower(r.MAC))
+		out = append(out, mac)
 	}
 	sort.Strings(out)
 	return out, nil
 }
 
-// removedNICsOf maps each lower-case MAC of vm whose NIC row is tombstoned —
-// the MergedVMNICs overlay's winner for it is a tombstone — to that winner's
-// updated_at. A MAC with no row at all is not in it.
-func removedNICsOf(ctx context.Context, c *Client, vm string) (map[string]string, error) {
+// nicRowStatesOf maps each lower-case MAC of vm by the MergedVMNICs overlay's
+// winning row: live, or tombstoned (to that tombstone's updated_at). A MAC
+// with no row at all is in neither.
+func nicRowStatesOf(ctx context.Context, c *Client, vm string) (live map[string]bool, removed map[string]string, err error) {
 	nics, err := GetVMNICsRaw(ctx, c, "vm_nics", vm)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ifaces, err := GetVMNICsRaw(ctx, c, "vm_interfaces", vm)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	out := map[string]string{}
+	live, removed = map[string]bool{}, map[string]string{}
 	for k, w := range nicRowWinners(ifaces, nics) {
 		if w.DeletedAt != "" {
-			out[k.mac] = w.UpdatedAt
+			removed[k.mac] = w.UpdatedAt
+		} else {
+			live[k.mac] = true
 		}
 	}
-	return out, nil
+	return live, removed, nil
 }
 
 // TrunkVLANsRecordedKey is the cluster_policies key under which the upgrade
@@ -761,8 +818,8 @@ func LiveNICSecurity(ctx context.Context, c *Client, vmName, vmUUID string) ([]c
 }
 
 // RetireNICGuard tombstones the guard record of owner's NIC mac, keeping what
-// it held for a re-create of the VM to carry (DeleteNICGuardsOf does this for
-// every NIC of a deleted workload). A NIC that has no live record is left as
+// it held as DeleteNICGuardsOf does (not meant for a re-create to carry: the
+// NIC is not part of the incarnation it replaces). A NIC that has no live record is left as
 // it is. It refuses with ErrClusterPolicyGateClosed when there is a record and
 // this host cannot write cluster_policies.
 func RetireNICGuard(ctx context.Context, c *Client, owner, mac, setBy string) error {
@@ -778,5 +835,25 @@ func RetireNICGuard(ctx context.Context, c *Client, owner, mac, setBy string) er
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, c.NowTS())
+	ts, err := nicGuardStamp(ctx, c, r.VMName, r.MAC)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, clusterPolicyUpsertSQL, NICGuardKey(r.VMName, r.MAC), string(b), setBy, ts)
+}
+
+// RetiredGuardOver is what a retired record of the VM incarnation vmUUID
+// enforces on a NIC of that MAC whose row is live: the default guard (on, no
+// relaxation). A record is retired only once its NIC's row is gone, so a live
+// row over a retired record means the two writes reached this replica out of
+// order (a retire whose host's clock ran ahead of a later re-attach, or a row
+// that arrived after its record was judged orphaned): the NIC is guarded
+// rather than left unguarded. ok is false for a live record, and for one of
+// another or an unknown incarnation.
+func RetiredGuardOver(r NICGuardRecord, vmUUID string) (NICGuardRecord, bool) {
+	if !r.Deleted || r.VMUUID == "" || r.VMUUID != vmUUID {
+		return NICGuardRecord{}, false
+	}
+	return NICGuardRecord{VMName: r.VMName, MAC: r.MAC, Mode: NICGuardOn, VMUUID: r.VMUUID,
+		Network: r.Network, Ordinal: r.Ordinal, SetBy: r.SetBy, UpdatedAt: r.UpdatedAt}, true
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
@@ -113,5 +115,131 @@ func TestGuardedMACsOf_KeepsARecordWithNoRow(t *testing.T) {
 	}
 	if got, _ := GuardedMACsOf(ctx, c, retireVM); !reflect.DeepEqual(got, []string{liveMAC, goneMAC, pending}) {
 		t.Errorf("a record whose row has not landed is not demanded: %v", got)
+	}
+}
+
+// TestGuardedMACsOf_DemandedWhileAnOperationHoldsTheVM (review m1): a detach
+// that tombstoned the row and then failed leaves its operation in flight and
+// may leave the NIC in the domain; its record is still demanded.
+func TestGuardedMACsOf_DemandedWhileAnOperationHoldsTheVM(t *testing.T) {
+	ctx := context.Background()
+	c := retireFixture(t)
+	vm, err := GetVM(ctx, c, retireVM)
+	if err != nil || vm == nil {
+		t.Fatal(err)
+	}
+	if ok, err := c.BeginVMOperation(ctx, OperationRecord{ID: "op-1", Method: "DetachDevice", ResourceKind: "vm",
+		ResourceID: retireVM, OperationKind: string(OpDeviceDetach), RequestHash: "h"}, vm.Spec, vm.OwnerEpoch, vm.SpecGeneration); err != nil || !ok {
+		t.Fatalf("begin: %v %v", ok, err)
+	}
+	if err := TombstoneNIC(ctx, c, retireVM, DeterministicNICID(retireVM, goneMAC)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := GuardedMACsOf(ctx, c, retireVM); !reflect.DeepEqual(got, []string{liveMAC, goneMAC}) {
+		t.Errorf("a record whose detach is still in flight is not demanded: %v", got)
+	}
+}
+
+// TestGuardedMACsOf_ARetiredRecordOverALiveRowGuards: a retired record of
+// the incarnation that runs, over a NIC whose row is live, is a write order
+// seen out of order; the NIC is demanded (and rendered guarded), never left
+// unguarded.
+func TestGuardedMACsOf_ARetiredRecordOverALiveRowGuards(t *testing.T) {
+	ctx := context.Background()
+	c := retireFixture(t)
+	if err := RetireNICGuard(ctx, c, retireVM, goneMAC, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := GuardedMACsOf(ctx, c, retireVM); !reflect.DeepEqual(got, []string{liveMAC, goneMAC}) {
+		t.Errorf("a NIC with a live row lost its guard to a retired record: %v", got)
+	}
+	if _, ok := RetiredGuardOver(NICGuardRecord{Deleted: true, VMUUID: "other"}, retireUUID); ok {
+		t.Error("another incarnation's retired record guards this one")
+	}
+	if _, ok := RetiredGuardOver(NICGuardRecord{Deleted: true}, retireUUID); ok {
+		t.Error("a retired record of an unknown incarnation guards this one")
+	}
+}
+
+// shipWALRange applies src's entries with after < seq <= upto to dst.
+func shipWALRange(t *testing.T, src, dst *Client, after, upto int64) {
+	t.Helper()
+	var tail []*pb.MutationEntry
+	for _, e := range walEntries(t, src, "src") {
+		if e.Seq > after && e.Seq <= upto {
+			tail = append(tail, e)
+		}
+	}
+	if _, err := NewReplicator(dst, "", RelayConfig{}).ApplyRemoteMutations(context.Background(), tail); err != nil {
+		t.Fatalf("ship: %v", err)
+	}
+}
+
+// TestNICGuard_FastClockReattachStaysGuarded (review I1): host A's clock runs
+// a minute ahead. A detaches NIC M (row tombstone and retired record stamped
+// in A's future); the VM moves to B, which re-attaches M at once. On a third
+// replica C — with only B's record, and then with all of it — M is demanded,
+// and B's record is live, not shadowed by A's retire.
+func TestNICGuard_FastClockReattachStaysGuarded(t *testing.T) {
+	ctx := context.Background()
+	open := func() *Client {
+		c := newTestDB(t)
+		c.SetClusterPolicyGate(func() bool { return true })
+		return c
+	}
+	a, b, c := open(), open(), open()
+	a.nowFn = func() time.Time { return time.Now().Add(time.Minute) }
+	grant := capabilities.GrantForTest(t, capabilities.FeatureNICGuards)
+	const m = "52:54:00:00:00:0c"
+	id := DeterministicNICID(retireVM, m)
+
+	if err := InsertVM(ctx, a, VMRecord{Name: retireVM, HostName: "a", State: "running",
+		Spec: `{"name":"web","uuid":"u-1"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertNIC(ctx, a, NICRecord{VMName: retireVM, ID: id, NetworkName: "lan", MAC: m}); err != nil {
+		t.Fatal(err)
+	}
+	if err := PutNICGuard(ctx, a, grant, NICGuardRecord{VMName: retireVM, MAC: m, Mode: NICGuardOn, VMUUID: retireUUID}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	// A detaches M.
+	if err := TombstoneNIC(ctx, a, retireVM, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireNICGuard(ctx, a, retireVM, m, "t"); err != nil {
+		t.Fatal(err)
+	}
+	for _, dst := range []*Client{b, c} {
+		if _, err := shipWAL(t, a, dst, 0); err != nil {
+			t.Fatalf("ship A: %v", err)
+		}
+	}
+
+	// B re-attaches M within A's lead: record first, then the row.
+	before := lastWALSeq(t, b)
+	if err := PutNICGuard(ctx, b, grant, NICGuardRecord{VMName: retireVM, MAC: m, Mode: NICGuardOn, VMUUID: retireUUID}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	recSeq := lastWALSeq(t, b)
+	if err := UpsertNIC(ctx, b, NICRecord{VMName: retireVM, ID: id, NetworkName: "lan", MAC: m}); err != nil {
+		t.Fatal(err)
+	}
+
+	// C holds B's record, its row not yet.
+	shipWALRange(t, b, c, before, recSeq)
+	if got, err := GuardedMACsOf(ctx, c, retireVM); err != nil || !reflect.DeepEqual(got, []string{m}) {
+		t.Errorf("with the re-attach's record only, C demands %v (%v); want %s", got, err, m)
+	}
+	// C holds all of it.
+	shipWALRange(t, b, c, recSeq, lastWALSeq(t, b))
+	if got, err := GuardedMACsOf(ctx, c, retireVM); err != nil || !reflect.DeepEqual(got, []string{m}) {
+		t.Errorf("with the re-attach applied, C demands %v (%v); want %s", got, err, m)
+	}
+	if r, _ := GetNICGuard(ctx, c, retireVM, m); r == nil {
+		t.Error("A's earlier retire shadows B's later record on C")
+	}
+	if nics, _ := MergedVMNICs(ctx, c, retireVM); len(nics) != 1 {
+		t.Errorf("A's earlier row tombstone shadows B's later row on C: %+v", nics)
 	}
 }

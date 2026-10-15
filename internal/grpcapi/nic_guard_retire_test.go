@@ -192,3 +192,33 @@ func TestRetireOrphanNICGuards_NotUnderAnotherOperationOrOffOwner(t *testing.T) 
 		t.Error("a host that does not own the VM retired its record")
 	}
 }
+
+// TestAttachNIC_RowTombstoneFailureKeepsTheGuardRecord (review I2): the
+// rollback takes the NIC out of the domain but cannot tombstone its row. The
+// row would bring the NIC back at the next define from the rows, so its
+// guard record is kept and the operation stays recoverable.
+func TestAttachNIC_RowTombstoneFailureKeepsTheGuardRecord(t *testing.T) {
+	s, fake := guardHotplugServer(t, "running")
+	ctx := adminCtx()
+	// The persistent definition misses the NIC, so the attach fails its
+	// verify after the row is written and rolls back.
+	fake.SkipConfigOnNICMutation = true
+	if err := s.db.Execute(ctx,
+		`CREATE TRIGGER nic_tombstone_fail BEFORE UPDATE ON vm_nics BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{VmName: "vm1",
+		Nic: &pb.NetworkAttachment{Name: "lan", Mac: retireMAC}}); err == nil {
+		t.Fatal("the attach did not fail")
+	}
+	if live, _ := fake.DumpXML("vm1"); nicMacInXML(live, retireMAC) {
+		t.Fatal("fixture: the rollback did not take the NIC out of the live domain")
+	}
+	nics, _ := corrosion.MergedVMNICs(ctx, s.db, "vm1")
+	if !hasNICMac(nics, retireMAC) {
+		t.Fatal("fixture: the NIC row was tombstoned after all")
+	}
+	if !guardRecordsOf(t, s, "vm1")[retireMAC] {
+		t.Error("a NIC whose row is still live lost its guard record")
+	}
+}

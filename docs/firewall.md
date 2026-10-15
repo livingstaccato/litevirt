@@ -703,7 +703,10 @@ that wrote it fails and its NIC is verified gone. A record an earlier build
 left for a NIC the VM no longer has is not demanded in force once the NIC's row
 is tombstoned, and the VM's owner retires it at the VM's next `lv attach-nic`,
 `lv migrate` or `lv start`, when no NIC row and neither definition of the
-domain on that host has its MAC.
+domain on that host has its MAC. The owner judges from its own replica, so it
+can retire the record of a NIC whose row has not reached it yet. A retired
+record of the running incarnation still guards, with the default guard, a NIC
+whose row is live.
 
 **Neighbour discovery.** A guarded NIC's solicitations and advertisements are
 held to the header and one 8-byte option (the link-layer address, or a

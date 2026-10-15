@@ -147,7 +147,7 @@ func TestLab_ISCSIOneDiskPerLUN(t *testing.T) {
 		if onRoot {
 			disks = fmt.Sprintf("      root:\n        size: \"64M\"\n        storage: %q\n", pool)
 		}
-		yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    disks:\n%s    placement:\n      host: %s\n",
+		yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    disks:\n%s    placement:\n      host: %s\n",
 			stack, vm, drillImage(), drillMemory(), disks, host)
 		file := "/tmp/" + stack + ".yaml"
 		l.putFile(host, file, yaml)

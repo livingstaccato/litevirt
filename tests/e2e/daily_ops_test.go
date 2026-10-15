@@ -244,7 +244,7 @@ func (l *lab) createLabVM(via, prefix, host, pool string, failback bool) string 
 	if pool != "" {
 		disks = fmt.Sprintf("    disks:\n      root:\n        size: 4G\n        storage: %s\n", pool)
 	}
-	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    guest-agent: true\n%s    placement:\n      host: %s\n      failback: %t\n",
+	yaml := fmt.Sprintf("name: %s\nvms:\n  %s:\n    image: %s\n    cpu: 1\n    memory: %s\n    firmware: bios\n    guest-agent: true\n%s    placement:\n      host: %s\n      failback: %t\n",
 		stack, name, drillImage(), drillMemory(), disks, host, failback)
 	file := "/tmp/" + stack + ".yaml"
 	l.putFile(via, file, yaml)

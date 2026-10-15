@@ -24,3 +24,16 @@ func TestPrintSupersededDisks_TotalsTheRetainedCopies(t *testing.T) {
 		t.Fatalf("listing has no retained total:\n%s", out.String())
 	}
 }
+
+// A .kept- file is listed as kept, not as held or by the retention.
+//
+// Mutation: drop the kept case — it reads "held: ...".
+func TestPrintSupersededDisks_MarksAKeptDisk(t *testing.T) {
+	var out bytes.Buffer
+	printSupersededDisks(&out, &pb.SupersededDisksResponse{Host: "node-a", RetentionDays: 7, Disks: []*pb.SupersededDisk{
+		{Path: "/d/rv-root.qcow2.kept-x", DiskPath: "/d/rv-root.qcow2", SizeBytes: 9, Held: "kept", Kept: true},
+	}}, false, time.Now())
+	if !strings.Contains(out.String(), "kept: a disk a deleted VM was kept with") || strings.Contains(out.String(), "held:") {
+		t.Fatalf("the kept disk is not marked kept:\n%s", out.String())
+	}
+}

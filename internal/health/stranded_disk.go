@@ -97,6 +97,19 @@ type StrandedDisks struct {
 	// the deleting host before its tombstone (MarkStrandedForDelete). The
 	// host leaves a disk still at its path there (deleted_vm_residue.go).
 	KeptByDelete bool `json:"kept_by_delete,omitempty"`
+	// DeleteDecided is the created_at of the VM whose delete wrote
+	// KeptByDelete, beside it; "" when no delete did (one by an earlier
+	// release, a write lost to a later one, a replica without the record).
+	// A disk still at its path is set aside for the retention only once
+	// the deleted incarnation's delete said it keeps nothing; otherwise it
+	// is left there, as a kept one (deleted_vm_residue.go).
+	DeleteDecided string `json:"delete_decided,omitempty"`
+}
+
+// deleteKeptNothing reports whether the delete of the incarnation created at
+// createdAt recorded on ev that it keeps none of its disks.
+func deleteKeptNothing(ev StrandedDisks, createdAt string) bool {
+	return createdAt != "" && ev.DeleteDecided == createdAt && !ev.KeptByDelete
 }
 
 func strandedSubject(vm, host string) string { return vm + "@" + host }
@@ -267,23 +280,36 @@ func noteStrandedCopy(ctx context.Context, db *corrosion.Client, reporter, vmNam
 
 // MarkStrandedForDelete records, on every open vm_disk_stranded record of
 // vmName, whether the delete about to tombstone it keeps the VM's disks
-// (`lv rm --keep-disks`). The caller writes it before the tombstone, so a
-// host that applies the tombstone has it. A record already saying so is not
-// written again.
+// (`lv rm --keep-disks`), and that this delete, of the incarnation the live
+// row names, decided it (DeleteDecided). The caller writes it before the
+// tombstone, so a host that applies the tombstone has it. A record already
+// saying so is not written again.
 func MarkStrandedForDelete(ctx context.Context, db *corrosion.Client, reporter, vmName string, keep bool, now time.Time) error {
 	open, err := StrandedDisksOf(ctx, db, vmName)
 	if err != nil {
 		return err
+	}
+	if len(open) == 0 {
+		return nil
+	}
+	vm, err := corrosion.GetVM(ctx, db, vmName)
+	if err != nil {
+		return err
+	}
+	inc := ""
+	if vm != nil {
+		inc = vm.CreatedAt
 	}
 	for _, o := range open {
 		row, ev, had, err := readStranded(ctx, db, vmName, o.Host)
 		if err != nil {
 			return err
 		}
-		if !had || row.Lifecycle == corrosion.ConditionResolved || len(ev.Disks) == 0 || ev.KeptByDelete == keep {
+		if !had || row.Lifecycle == corrosion.ConditionResolved || len(ev.Disks) == 0 ||
+			(ev.KeptByDelete == keep && ev.DeleteDecided == inc) {
 			continue
 		}
-		ev.KeptByDelete = keep
+		ev.KeptByDelete, ev.DeleteDecided = keep, inc
 		if err := writeStranded(ctx, db, reporter, row, true, ev, now); err != nil {
 			return err
 		}
@@ -621,7 +647,7 @@ func RestoreSupersededDisk(ctx context.Context, db *corrosion.Client, dataDir, h
 		}
 	}
 	if c == nil {
-		return RestoredCopy{}, fmt.Errorf("%w: %s is not a superseded disk copy on %s (lv host superseded-disks lists them)", ErrRestoreRefused, copyPath, hostName)
+		return RestoredCopy{}, fmt.Errorf("%w: %s is not a superseded disk copy on %s (lv host superseded-disks lists them)%s", ErrRestoreRefused, copyPath, hostName, keptHint(copyPath))
 	}
 	if c.VM == "" {
 		return RestoredCopy{}, fmt.Errorf("%w: no VM has a disk at %s any more", ErrRestoreRefused, c.DiskPath)

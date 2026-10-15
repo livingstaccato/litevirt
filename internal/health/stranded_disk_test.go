@@ -213,9 +213,7 @@ func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
 	if row, _, _ := strandedRow(t, db, "web", "node-a"); row.Lifecycle == corrosion.ConditionResolved {
 		t.Fatal("a new stranding did not reopen the condition")
 	}
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	r.tendStrandedDisks(ctx)
 	if row, _, ok := strandedRow(t, db, "web", "node-a"); !ok || row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("condition %+v, want resolved once the VM is gone", row)

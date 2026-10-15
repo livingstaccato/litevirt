@@ -34,10 +34,13 @@ import (
 //     VM's data from before a failover, and the retention for a deleted VM's
 //     copies (superseded_retention.go, superseded_disk_retention_days) is the
 //     undo for `lv rm`: the hourly sweep removes it when it is old enough;
-//   - leaves a disk the delete kept at its path, and drops its entry: every
-//     disk after `lv rm --keep-disks` (the record says so, written by the
-//     deleting host before its tombstone: MarkStrandedForDelete), and one its
-//     tombstoned row records delete_with_vm=0;
+//   - leaves a disk the delete kept at its path, notes it (NoteKeptDisks),
+//     and drops its entry: every disk after `lv rm --keep-disks` (the record
+//     says so, written by the deleting host before its tombstone:
+//     MarkStrandedForDelete), one its tombstoned row records
+//     delete_with_vm=0, and one whose record does not say what the deleted
+//     incarnation's delete decided (DeleteDecided: a delete by an earlier
+//     release, a mark lost to a later write, a replica without the record);
 //   - sets aside any other disk of that VM still at its path (the host was
 //     down when the VM was deleted), by the rule the host sets one aside by while the
 //     VM exists (setAsideStrandedFile), so it enters the same retention.
@@ -97,21 +100,28 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 				}
 			}
 		}
-		if ev.KeptByDelete || keptByDelete[d.Path] {
-			// Noted here, so a create of the name on this host moves it
-			// rather than clear it (SetAsideBeforeCreate).
-			if err := NoteKeptDisks(r.dataDir, name, []string{d.Path}); err != nil {
+		// leave leaves the disk at its path and notes it here, so a create
+		// of the name on this host moves it rather than clear it
+		// (SetAsideBeforeCreate).
+		leave := func(why string) {
+			if err := NoteKeptDisks(r.dataDir, name, []string{filepath.Clean(d.Path)}); err != nil {
 				slog.Warn("reconciler: could not note a disk a delete kept; its record stays open", "vm", name, "path", d.Path, "error", err)
 				kept = append(kept, d)
-				continue
+				return
 			}
-			slog.Info("reconciler: leaving a deleted VM's disk at its path: the delete kept it (--keep-disks, or delete_with_vm=false)",
-				"vm", name, "path", d.Path)
+			slog.Info("reconciler: leaving a deleted VM's disk at its path: "+why, "vm", name, "path", d.Path)
+		}
+		if ev.KeptByDelete || keptByDelete[d.Path] {
+			leave("the delete kept it (--keep-disks, or delete_with_vm=false)")
 			continue
 		}
 		if d.Incarnation != createdAt || !recorded[d.Path] {
 			slog.Warn("reconciler: leaving a file at a deleted VM's disk path that was not recorded for that VM",
 				"vm", name, "path", d.Path, "recorded_for", d.Incarnation, "deleted", createdAt)
+			continue
+		}
+		if !deleteKeptNothing(ev, createdAt) {
+			leave("the record does not say whether the delete kept it (a delete by an earlier release, or its record lost or not here yet), so it is kept")
 			continue
 		}
 		set, outcome := r.setAsideStrandedFile(ctx, name, d, func() bool { return r.noLiveRow(ctx, name) && r.domainAbsentOrDeadLeftover(name) })
@@ -201,6 +211,17 @@ type MovedBeforeCreate struct {
 	Kept bool
 }
 
+// BeforeCreate is what SetAsideBeforeCreate did: Moved, the files it moved;
+// MayBeUnmounted, the paths of the deleted VM's disks this host's record
+// still lists that read as missing while their directory is absent, empty or
+// cannot be listed (mayBeUnmounted). Their entries stay, and the create goes
+// ahead: once such a directory is mounted, what it holds hides a file the
+// create writes there.
+type BeforeCreate struct {
+	Moved          []MovedBeforeCreate
+	MayBeUnmounted []string
+}
+
 // SetAsideBeforeCreate runs before a create of VM name on this host clears
 // the files unlink, the debris sweep's candidates that no live disk row
 // protects (grpcapi's protectedDiskPathsFrom; the sweep unlinks them next).
@@ -212,19 +233,21 @@ type MovedBeforeCreate struct {
 //     delete_with_vm=false); one the deleted VM's rows record
 //     delete_with_vm=false, or record on this host, whose delete here did not
 //     remove it; one this host's vm_disk_stranded record of the name lists
-//     after `lv rm --keep-disks` (KeptByDelete);
+//     after `lv rm --keep-disks` (KeptByDelete), or without the deleted
+//     incarnation's decision (DeleteDecided);
 //   - the real disk a failover left here, which this host's open record still
 //     lists at its path for the deleted incarnation (its created_at, at a path
 //     its rows record), never set aside because the host was down when the VM
 //     was deleted, to <path>.superseded-<time>, which follows the retention
-//     for a deleted VM's copies.
+//     for a deleted VM's copies: only once that incarnation's delete recorded
+//     that it keeps nothing.
 //
 // Anything else in unlink is left to the sweep, as before. The record is
 // updated: an entry moved, or one the delete kept (noted here, and left where
 // it is), goes; one missing from a directory that lists other files goes; one
 // missing while its directory may be a volume not mounted yet stays
-// (mayBeUnmounted), as does one at a path the sweep does not clear. hostPath
-// maps a recorded path to this host's file.
+// (mayBeUnmounted, returned in MayBeUnmounted), as does one at a path the
+// sweep does not clear. hostPath maps a recorded path to this host's file.
 //
 // It refuses — and the sweep must not run — when a file in unlink is there
 // but this host's replica is not trusted (it may not hold the delete's record
@@ -233,7 +256,7 @@ type MovedBeforeCreate struct {
 // including one the reconciler's own pass moved first, is not there and
 // refuses nothing.
 func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, hostName, name string, unlink []string,
-	hostPath func(string) string, trusted func() (bool, string), now time.Time) ([]MovedBeforeCreate, error) {
+	hostPath func(string) string, trusted func() (bool, string), now time.Time) (BeforeCreate, error) {
 	var present []string
 	for _, p := range unlink {
 		fi, err := lstatSetAside(p)
@@ -241,7 +264,7 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("the create clears %s, left by an earlier VM %s, and what is there cannot be read (%v); "+
+			return BeforeCreate{}, fmt.Errorf("the create clears %s, left by an earlier VM %s, and what is there cannot be read (%v); "+
 				"retry once that storage answers, or place the VM on another host", p, name, err)
 		}
 		if fi.Mode().IsRegular() {
@@ -255,19 +278,19 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 	row, ev, had, err := readStranded(ctx, db, name, hostName)
 	if err != nil {
 		if len(present) == 0 {
-			return nil, nil
+			return BeforeCreate{}, nil
 		}
-		return nil, cannotTell("this host's record of what a failover left of "+name, err)
+		return BeforeCreate{}, cannotTell("this host's record of what a failover left of "+name, err)
 	}
 	open := had && row.Lifecycle != corrosion.ConditionResolved
 	if len(present) == 0 && !open {
-		return nil, nil
+		return BeforeCreate{}, nil
 	}
 	if ok, why := trusted(); !ok {
 		if len(present) == 0 {
-			return nil, nil // the record waits for the reconciler's pass
+			return BeforeCreate{}, nil // the record waits for the reconciler's pass
 		}
-		return nil, fmt.Errorf("the create clears %s, left by an earlier VM %s, and this host's replica has not caught up "+
+		return BeforeCreate{}, fmt.Errorf("the create clears %s, left by an earlier VM %s, and this host's replica has not caught up "+
 			"with the cluster (%s), so it cannot tell whether one is a disk the delete kept or a failover left here; "+
 			"retry once the replica has caught up (shortly), or place the VM on another host", strings.Join(present, ", "), name, why)
 	}
@@ -275,10 +298,14 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 	noted, err := keptDisksOf(dataDir, name)
 	if err != nil {
 		if len(present) == 0 {
-			return nil, nil
+			return BeforeCreate{}, nil
 		}
 		f, _ := keptDisksFile(dataDir, name)
-		return nil, fmt.Errorf("the create clears %s, left by an earlier VM %s, and this host's note of the disks its "+
+		var ne *KeptDisksNoteError
+		if errors.As(err, &ne) {
+			err = ne.Err
+		}
+		return BeforeCreate{}, fmt.Errorf("the create clears %s, left by an earlier VM %s, and this host's note of the disks its "+
 			"delete kept, %s, cannot be read (%v); repair or remove that file, then retry, or place the VM on another host",
 			strings.Join(present, ", "), name, f, err)
 	}
@@ -289,9 +316,9 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 	}
 	if err != nil {
 		if len(present) == 0 {
-			return nil, nil
+			return BeforeCreate{}, nil
 		}
-		return nil, cannotTell("the deleted VM's disk records", err)
+		return BeforeCreate{}, cannotTell("the deleted VM's disk records", err)
 	}
 	// kept: the delete kept it; here: recorded on this host, whose delete
 	// did not remove it; recorded: a path the incarnation records.
@@ -314,10 +341,15 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 			if d.Copy != "" || d.Path == "" {
 				continue
 			}
-			if ev.KeptByDelete {
+			switch {
+			case ev.KeptByDelete:
 				kept[clean(d.Path)] = true
-			} else if open && createdAt != "" && d.Incarnation == createdAt && recorded[d.Path] {
-				stranded[clean(d.Path)] = true
+			case open && createdAt != "" && d.Incarnation == createdAt && recorded[d.Path]:
+				if deleteKeptNothing(ev, createdAt) {
+					stranded[clean(d.Path)] = true
+				} else {
+					kept[clean(d.Path)] = true // the delete's decision is not here
+				}
 			}
 		}
 	}
@@ -340,7 +372,7 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 			if notThere(err) {
 				continue // moved first, by the reconciler's pass
 			}
-			return moved, fmt.Errorf("the create clears %s, a disk an earlier VM %s left, and moving it to %s failed (%v); "+
+			return BeforeCreate{Moved: moved}, fmt.Errorf("the create clears %s, a disk an earlier VM %s left, and moving it to %s failed (%v); "+
 				"retry once that storage answers, or place the VM on another host", p, name, to, err)
 		}
 		movedFrom[cp] = true
@@ -358,9 +390,10 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 		slog.Warn("create: could not update this host's note of the disks a delete kept", "vm", name, "error", err)
 	}
 	if !open {
-		return moved, nil
+		return BeforeCreate{Moved: moved}, nil
 	}
 	var keep, leftKept []StrandedDisk
+	var unmounted []string
 	for _, d := range ev.Disks {
 		if d.Copy != "" {
 			continue // the retention sweep's, as on the reconciler's pass
@@ -376,6 +409,9 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 		if _, err := lstatSetAside(p); notThere(err) {
 			if mayBeUnmounted(p) {
 				keep = append(keep, d)
+				unmounted = append(unmounted, p)
+				slog.Warn("create: a deleted VM's disk path reads as missing and its directory is absent, empty or cannot be listed, as a volume not mounted yet reads; its record stays, and the create goes ahead",
+					"vm", name, "path", p)
 			}
 			continue
 		}
@@ -389,14 +425,15 @@ func SetAsideBeforeCreate(ctx context.Context, db *corrosion.Client, dataDir, ho
 		slog.Warn("create: could not note the disks a delete kept here; their record stays open", "vm", name, "error", err)
 		keep = append(keep, leftKept...)
 	}
+	done := BeforeCreate{Moved: moved, MayBeUnmounted: unmounted}
 	if len(keep) == len(ev.Disks) {
-		return moved, nil
+		return done, nil
 	}
 	ev.Disks = keep
 	if err := writeStranded(ctx, db, hostName, row, true, ev, now); err != nil {
 		slog.Warn("create: could not update vm_disk_stranded", "vm", name, "error", err)
 	}
-	return moved, nil
+	return done, nil
 }
 
 // notThere reports whether err says nothing is at a path: ENOENT, or ENOTDIR

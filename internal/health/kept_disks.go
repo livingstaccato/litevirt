@@ -3,6 +3,7 @@ package health
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -37,7 +38,18 @@ type keptDisksNote struct {
 	Paths []string `json:"paths"`
 }
 
-// keptDisksOf returns the paths noted for name here.
+// KeptDisksNoteError is a note of the disks deletes kept on this host that
+// cannot be read: File is the note.
+type KeptDisksNoteError struct {
+	File string
+	Err  error
+}
+
+func (e *KeptDisksNoteError) Error() string { return fmt.Sprintf("read %s: %v", e.File, e.Err) }
+func (e *KeptDisksNoteError) Unwrap() error { return e.Err }
+
+// keptDisksOf returns the paths noted for name here, each cleaned. A note
+// that cannot be read or parsed is a *KeptDisksNoteError.
 func keptDisksOf(dataDir, name string) ([]string, error) {
 	if dataDir == "" {
 		return nil, nil
@@ -51,11 +63,14 @@ func keptDisksOf(dataDir, name string) ([]string, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, &KeptDisksNoteError{File: f, Err: err}
 	}
 	var n keptDisksNote
 	if err := json.Unmarshal(b, &n); err != nil {
-		return nil, err
+		return nil, &KeptDisksNoteError{File: f, Err: err}
+	}
+	for i, p := range n.Paths {
+		n.Paths[i] = filepath.Clean(p)
 	}
 	return n.Paths, nil
 }

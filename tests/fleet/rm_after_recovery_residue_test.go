@@ -27,6 +27,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -510,62 +511,122 @@ func globT(t *testing.T, pattern string) []string {
 func TestFleet_KeepDisksOnAFailoversOldHost(t *testing.T) {
 	for _, passFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "create first", true: "pass first"}[passFirst], func(t *testing.T) {
-			stageFakeGenisoimage(t)
-			ctx := context.Background()
-			r := newRecoveredVMWith(t, "data-1")
-			data := r.extra["data-1"]
-			dataBytes := readFileT(t, data)
-			r.home.Virt.DefineStoppedDomain("rv", "52:54:00:00:00:01")
-			r.rm(t, true)
-			if !present(r.path) || !present(data) {
-				t.Fatal("the delete reached home while it was down")
-			}
-			r.homeActive(t)
-			if passFirst {
-				r.home.Virt.SetState("rv", libvirtfake.StateShutdown)
-				r.homeRec.ReconcileOnce(ctx)
-				if !present(r.path) || !present(data) {
-					t.Fatalf("home's pass moved a disk the delete kept: root %v, data %v", present(r.path), present(data))
-				}
-				if open := r.strandedOpen(t); len(open) != 0 {
-					t.Fatalf("vm_disk_stranded is still open: %+v", open)
-				}
-			}
-			r.createRVOnHome(t)
+			keptOnAFailoversOldHost(t, passFirst, func(r *recoveredVM) { r.rm(t, true) })
+		})
+	}
+}
 
-			if c := globT(t, filepath.Join(filepath.Dir(r.path), "*.superseded-*")); len(c) != 0 {
-				t.Fatalf("a disk the delete kept was set aside for the retention: %v", c)
-			}
-			if b := readFileT(t, data); !bytes.Equal(b, dataBytes) {
-				t.Fatalf("the kept data disk at %s holds %q", data, b)
-			}
-			kept := globT(t, r.path+".kept-*")
-			if len(kept) != 1 {
-				t.Fatalf("kept copies of the root disk = %v, want one", kept)
-			}
-			if b := readFileT(t, kept[0]); !bytes.HasPrefix(b, r.realBytes) {
-				t.Fatal("the .kept- file is not the deleted rv's real root disk")
-			}
-			if b, err := os.ReadFile(r.path); err == nil && bytes.HasPrefix(b, r.realBytes) {
-				t.Fatal("the new rv's disk is the deleted rv's")
-			}
-			if open := r.strandedOpen(t); len(open) != 0 {
-				t.Fatalf("vm_disk_stranded is still open: %+v", open)
-			}
-			evs, err := corrosion.ListVMEvents(ctx, r.coord.DB, "rv", 50, "")
-			if err != nil {
+// TestFleet_UndecidedDeleteOnAFailoversOldHost: as KeepDisksOnAFailoversOldHost,
+// but home's record does not say what the delete decided: the delete was made
+// by an earlier release, which marks nothing, or its --keep-disks mark was
+// lost to a write of the record home made from before it (LWW). Absent the
+// decision, nothing is put on the retention clock: the disks are kept, as
+// after --keep-disks.
+//
+// Mutation: set a disk aside whenever KeptByDelete is unset (ignore
+// DeleteDecided) on the pass and before the create — every subtest finds a
+// .superseded- copy.
+func TestFleet_UndecidedDeleteOnAFailoversOldHost(t *testing.T) {
+	deletes := []struct {
+		name string
+		del  func(t *testing.T, r *recoveredVM)
+	}{
+		{"an earlier release's delete", func(t *testing.T, r *recoveredVM) {
+			// It tombstones the row, and records nothing on home's record.
+			if err := corrosion.DeleteVM(context.Background(), r.other.DB, "rv"); err != nil {
 				t.Fatal(err)
 			}
-			if !slices.ContainsFunc(evs, func(e corrosion.VMEventRecord) bool {
-				return e.Type == "vm.disk.kept" && strings.Contains(e.Detail, r.path) && strings.Contains(e.Detail, kept[0])
-			}) {
-				t.Fatalf("no vm.disk.kept event naming %s and %s: %+v", r.path, kept[0], evs)
+		}},
+		{"the keep-disks mark lost", func(t *testing.T, r *recoveredVM) {
+			ctx := context.Background()
+			subject := "rv@" + r.home.Name
+			rows, err := r.coord.DB.Query(ctx, `SELECT evidence FROM health_conditions WHERE code = 'vm_disk_stranded' AND subject_id = ?`, subject)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("home's record of rv: %v, %v", rows, err)
 			}
-			r.sweepAt(t, retention+24*time.Hour)
-			if !present(kept[0]) || !present(data) {
-				t.Fatalf("the retention sweep removed a kept disk: %s %v, %s %v", kept[0], present(kept[0]), data, present(data))
+			before := rows[0].String("evidence")
+			r.rm(t, true)
+			after, err := health.StrandedDisksOf(ctx, r.coord.DB, "rv")
+			if err != nil || len(after) != 1 || !after[0].KeptByDelete {
+				t.Fatalf("the delete did not mark home's record: %+v, %v", after, err)
 			}
-		})
+			// home's write of its record, made from what it read before the
+			// mark, wins.
+			if err := r.coord.DB.Execute(ctx, `UPDATE health_conditions SET evidence = ? WHERE code = 'vm_disk_stranded' AND subject_id = ?`,
+				before, subject); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, d := range deletes {
+		for _, passFirst := range []bool{false, true} {
+			t.Run(d.name+"/"+map[bool]string{false: "create first", true: "pass first"}[passFirst], func(t *testing.T) {
+				keptOnAFailoversOldHost(t, passFirst, func(r *recoveredVM) { d.del(t, r) })
+			})
+		}
+	}
+}
+
+// keptOnAFailoversOldHost: rv, with a root and a data disk on home, fails
+// over to other, and del deletes it while home is down; home's pass (when
+// passFirst) and a create of rv on home then keep both disks off the
+// retention clock.
+func keptOnAFailoversOldHost(t *testing.T, passFirst bool, del func(*recoveredVM)) {
+	t.Helper()
+	stageFakeGenisoimage(t)
+	ctx := context.Background()
+	r := newRecoveredVMWith(t, "data-1")
+	data := r.extra["data-1"]
+	dataBytes := readFileT(t, data)
+	r.home.Virt.DefineStoppedDomain("rv", "52:54:00:00:00:01")
+	del(r)
+	if !present(r.path) || !present(data) {
+		t.Fatal("the delete reached home while it was down")
+	}
+	r.homeActive(t)
+	if passFirst {
+		r.home.Virt.SetState("rv", libvirtfake.StateShutdown)
+		r.homeRec.ReconcileOnce(ctx)
+		if !present(r.path) || !present(data) {
+			t.Fatalf("home's pass moved a disk the delete kept: root %v, data %v", present(r.path), present(data))
+		}
+		if open := r.strandedOpen(t); len(open) != 0 {
+			t.Fatalf("vm_disk_stranded is still open: %+v", open)
+		}
+	}
+	r.createRVOnHome(t)
+
+	if c := globT(t, filepath.Join(filepath.Dir(r.path), "*.superseded-*")); len(c) != 0 {
+		t.Fatalf("a disk the delete kept was set aside for the retention: %v", c)
+	}
+	if b := readFileT(t, data); !bytes.Equal(b, dataBytes) {
+		t.Fatalf("the kept data disk at %s holds %q", data, b)
+	}
+	kept := globT(t, r.path+".kept-*")
+	if len(kept) != 1 {
+		t.Fatalf("kept copies of the root disk = %v, want one", kept)
+	}
+	if b := readFileT(t, kept[0]); !bytes.HasPrefix(b, r.realBytes) {
+		t.Fatal("the .kept- file is not the deleted rv's real root disk")
+	}
+	if b, err := os.ReadFile(r.path); err == nil && bytes.HasPrefix(b, r.realBytes) {
+		t.Fatal("the new rv's disk is the deleted rv's")
+	}
+	if open := r.strandedOpen(t); len(open) != 0 {
+		t.Fatalf("vm_disk_stranded is still open: %+v", open)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, r.coord.DB, "rv", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(evs, func(e corrosion.VMEventRecord) bool {
+		return e.Type == "vm.disk.kept" && strings.Contains(e.Detail, r.path) && strings.Contains(e.Detail, kept[0])
+	}) {
+		t.Fatalf("no vm.disk.kept event naming %s and %s: %+v", r.path, kept[0], evs)
+	}
+	r.sweepAt(t, retention+24*time.Hour)
+	if !present(kept[0]) || !present(data) {
+		t.Fatalf("the retention sweep removed a kept disk: %s %v, %s %v", kept[0], present(kept[0]), data, present(data))
 	}
 }
 
@@ -586,12 +647,13 @@ func TestFleet_KeepDisksOnAFailoversOldHost(t *testing.T) {
 func TestFleet_KeepDisksThenCreateOnTheSameHost(t *testing.T) {
 	for _, between := range []bool{false, true} {
 		t.Run(map[bool]string{false: "next create", true: "after a VM of the name came and went elsewhere"}[between], func(t *testing.T) {
-			keepDisksThenCreate(t, between)
+			_, _, _ = keepDisksThenCreate(t, between)
 		})
 	}
 }
 
-func keepDisksThenCreate(t *testing.T, between bool) {
+// keepDisksThenCreate returns the cluster, the node and the .kept- file.
+func keepDisksThenCreate(t *testing.T, between bool) (*Cluster, *Node, string) {
 	stageFakeGenisoimage(t)
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, SharedCRDT: true})
@@ -657,6 +719,143 @@ func keepDisksThenCreate(t *testing.T, between bool) {
 	purge()
 	if !present(kept[0]) {
 		t.Fatalf("%s was removed", kept[0])
+	}
+	return c, n, kept[0]
+}
+
+// TestFleet_SupersededDisksListsAKeptDisk: `lv host superseded-disks` lists a
+// .kept- file a create made, read-only and marked kept, with the path it was
+// moved from and its size; --purge, --remove and --restore never take it.
+//
+// Mutations: leave the kept files out of the answer — the listing misses it;
+// drop Kept from the answer — it is not marked kept.
+func TestFleet_SupersededDisksListsAKeptDisk(t *testing.T) {
+	c, n, kept := keepDisksThenCreate(t, false)
+	ctx := context.Background()
+	cl := c.SelfClient(n)
+	size := int64(len(readFileT(t, kept)))
+	list := func() *pb.SupersededDisk {
+		t.Helper()
+		resp, err := cl.SupersededDisks(ctx, &pb.SupersededDisksRequest{Host: n.Name})
+		if err != nil {
+			t.Fatalf("lv host superseded-disks: %v", err)
+		}
+		for _, d := range resp.Disks {
+			if d.Path == kept {
+				return d
+			}
+		}
+		return nil
+	}
+	d := list()
+	if d == nil || !d.Kept || d.DiskPath != strings.SplitN(kept, ".kept-", 2)[0] || d.SizeBytes != size || d.Held == "" || d.Retained != "" {
+		t.Fatalf("listing of %s = %+v, want it kept, from its disk path, %d bytes, held", kept, d, size)
+	}
+	if _, err := cl.SupersededDisks(ctx, &pb.SupersededDisksRequest{Host: n.Name, Purge: true}); err != nil {
+		t.Fatalf("--purge: %v", err)
+	}
+	if _, err := cl.SupersededDisks(ctx, &pb.SupersededDisksRequest{Host: n.Name, Purge: true,
+		OlderThanSec: grpcapi.SupersededNamedOnlySec, RemovePaths: []string{kept}}); err == nil {
+		t.Fatal("--remove took a kept disk")
+	} else if !strings.Contains(err.Error(), "a disk a deleted VM was kept with") {
+		t.Fatalf("--remove refusal %v does not say it is a kept disk", err)
+	}
+	if _, err := cl.SupersededDisks(ctx, &pb.SupersededDisksRequest{Host: n.Name, Purge: true,
+		OlderThanSec: grpcapi.SupersededNamedOnlySec, RestorePath: kept}); err == nil {
+		t.Fatal("--restore took a kept disk")
+	}
+	if !present(kept) || list() == nil {
+		t.Fatalf("%s is gone or no longer listed", kept)
+	}
+}
+
+// TestFleet_KeepDisksRefusedOnAnUnreadableNote: a --keep-disks delete whose
+// host's note of the disks deletes kept (<data_dir>/kept-disks/<vm>.json)
+// cannot be parsed is refused, naming the file and the remedy, with nothing
+// tombstoned and the disk in place; once the file is removed, it goes ahead.
+//
+// Mutation: drop the note's name from the refusal — the message names no
+// file.
+func TestFleet_KeepDisksRefusedOnAnUnreadableNote(t *testing.T) {
+	stageFakeGenisoimage(t)
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, SharedCRDT: true})
+	t.Cleanup(c.Stop)
+	n := c.Nodes[0]
+	importImageOn(t, c, n, "ubuntu")
+	if _, err := c.SelfClient(n).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "rv", Image: "ubuntu", Cpu: 1, MemoryMib: 256, Placement: &pb.PlacementSpec{Host: n.Name}}}); err != nil {
+		t.Fatalf("create rv: %v", err)
+	}
+	disks, err := corrosion.GetVMDisks(ctx, n.DB, "rv")
+	if err != nil || len(disks) != 1 {
+		t.Fatalf("rv's disks = %+v, %v", disks, err)
+	}
+	note := filepath.Join(c.tmpRoot, n.Name, "data", "kept-disks", "rv.json")
+	if err := os.MkdirAll(filepath.Dir(note), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(note, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.SelfClient(n).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "rv", KeepDisks: true})
+	if err == nil {
+		t.Fatal("the --keep-disks delete went ahead with its note unreadable")
+	}
+	for _, w := range []string{note, "repair or remove that file", "nothing was tombstoned"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Fatalf("refusal %q does not say %q", err, w)
+		}
+	}
+	if vm, _ := corrosion.GetVM(ctx, n.DB, "rv"); vm == nil {
+		t.Fatal("rv was tombstoned")
+	}
+	if !present(disks[0].Path) {
+		t.Fatal("rv's disk is gone")
+	}
+	if err := os.Remove(note); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(n).DeleteVM(ctx, &pb.DeleteVMRequest{Name: "rv", KeepDisks: true}); err != nil {
+		t.Fatalf("the --keep-disks delete, the note removed: %v", err)
+	}
+	if vm, _ := corrosion.GetVM(ctx, n.DB, "rv"); vm != nil || !present(disks[0].Path) {
+		t.Fatalf("after the delete: row %+v, disk present %v", vm, present(disks[0].Path))
+	}
+}
+
+// TestFleet_RecreateOnTheOldHostWithTheDiskPathMissing: rv fails over from
+// home and is deleted while home is down; when home is back its disks
+// directory is empty, as an unmounted volume's mount point is. A create of rv
+// on home goes ahead, the record stays open, and a vm.disk.path_missing event
+// names the path.
+//
+// Mutation: drop the event — none is found.
+func TestFleet_RecreateOnTheOldHostWithTheDiskPathMissing(t *testing.T) {
+	stageFakeGenisoimage(t)
+	ctx := context.Background()
+	r := newRecoveredVM(t)
+	r.home.Virt.DefineStoppedDomain("rv", "52:54:00:00:00:01")
+	r.rm(t, false)
+	if err := os.Rename(r.path, filepath.Join(t.TempDir(), "unmounted")); err != nil {
+		t.Fatal(err)
+	}
+	if ents, err := os.ReadDir(filepath.Dir(r.path)); err != nil || len(ents) != 0 {
+		t.Fatalf("home's disks directory = %v, %v; want it empty", ents, err)
+	}
+	r.homeActive(t)
+	r.createRVOnHome(t)
+	if len(r.strandedOpen(t)) != 1 {
+		t.Fatal("the record of rv's disk on home was resolved while its path reads as missing")
+	}
+	evs, err := corrosion.ListVMEvents(ctx, r.coord.DB, "rv", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(evs, func(e corrosion.VMEventRecord) bool {
+		return e.Type == "vm.disk.path_missing" && strings.Contains(e.Detail, r.path)
+	}) {
+		t.Fatalf("no vm.disk.path_missing event naming %s: %+v", r.path, evs)
 	}
 }
 

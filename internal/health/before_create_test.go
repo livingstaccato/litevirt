@@ -60,7 +60,8 @@ func TestSetAsideBeforeCreate_MovesTheDiskByWhatTheDeleteSaid(t *testing.T) {
 	for _, keep := range []bool{false, true} {
 		t.Run(map[bool]string{false: "rm", true: "keep-disks"}[keep], func(t *testing.T) {
 			db, r, path := webDeletedWhileNodeADown(t, keep)
-			moved, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			moved := done.Moved
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -122,7 +123,8 @@ func TestSetAsideBeforeCreate_KeptDisks(t *testing.T) {
 			if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
 				t.Fatal(err)
 			}
-			moved, err := SetAsideBeforeCreate(ctx, db, dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			done, err := SetAsideBeforeCreate(ctx, db, dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			moved := done.Moved
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -208,7 +210,8 @@ func TestSetAsideBeforeCreate_NotThereRefusesNothing(t *testing.T) {
 			}
 			return os.Rename(from, to)
 		}
-		moved, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+		done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+		moved := done.Moved
 		if err != nil {
 			t.Fatalf("refused: %v", err)
 		}
@@ -251,8 +254,9 @@ func TestSetAsideBeforeCreate_RefusesOnAnUntrustedReplica(t *testing.T) {
 // lists other files, it is gone and its entry goes — as on the reconciler's
 // pass (mayBeUnmounted).
 //
-// Mutation: drop the entry of every missing path — the record is resolved
-// while the volume may be unmounted.
+// Mutations: drop the entry of every missing path — the record is resolved
+// while the volume may be unmounted; leave such a path out of
+// MayBeUnmounted — no event can name it.
 func TestSetAsideBeforeCreate_MissingEntryWaitsForAVolumeNotMountedYet(t *testing.T) {
 	for _, mounted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "empty dir", true: "dir lists other files"}[mounted], func(t *testing.T) {
@@ -265,11 +269,16 @@ func TestSetAsideBeforeCreate_MissingEntryWaitsForAVolumeNotMountedYet(t *testin
 					t.Fatal(err)
 				}
 			}
-			if _, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now()); err != nil {
+			done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			if err != nil {
 				t.Fatal(err)
 			}
 			if strandedOpen(t, db) == mounted {
 				t.Fatalf("record open %v, want %v", strandedOpen(t, db), !mounted)
+			}
+			// The caller makes each a VM event (grpcapi).
+			if want := !mounted; (len(done.MayBeUnmounted) == 1 && done.MayBeUnmounted[0] == path) != want {
+				t.Fatalf("may be unmounted = %v, want %s listed: %v", done.MayBeUnmounted, path, want)
 			}
 		})
 	}
@@ -301,7 +310,8 @@ func TestTendDeletedVMStranded_LeavesAKeptDiskAtItsPath(t *testing.T) {
 	if err := db.Execute(context.Background(), `UPDATE health_conditions SET deleted_at = ?`, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
 	}
-	moved, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+	done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+	moved := done.Moved
 	if err != nil || len(moved) != 1 || !moved[0].Kept {
 		t.Fatalf("moved %+v, %v; want the kept disk moved to a .kept- name", moved, err)
 	}
@@ -311,20 +321,137 @@ func TestTendDeletedVMStranded_LeavesAKeptDiskAtItsPath(t *testing.T) {
 }
 
 // MarkStrandedForDelete flips the record's KeptByDelete both ways, and a
-// plain delete after a --keep-disks attempt that failed clears it.
+// plain delete after a --keep-disks attempt that failed clears it. Either way
+// the record says which incarnation's delete decided (DeleteDecided).
 //
-// Mutation: skip the write when keep is false — the flag stays set.
+// Mutations: skip the write when keep is false — the flag stays set; leave
+// DeleteDecided unwritten — it is empty.
 func TestMarkStrandedForDelete_SetsAndClears(t *testing.T) {
 	db, _, _, _, _ := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
+	vm, err := corrosion.GetVM(ctx, db, "web")
+	if err != nil || vm == nil || vm.CreatedAt == "" {
+		t.Fatalf("web = %+v, %v", vm, err)
+	}
 	for _, keep := range []bool{true, false} {
 		if err := MarkStrandedForDelete(ctx, db, "node-b", "web", keep, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 		_, ev, _ := strandedRow(t, db, "web", "node-a")
-		if ev.KeptByDelete != keep || len(ev.Disks) != 1 {
-			t.Fatalf("after marking %v: %+v", keep, ev)
+		if ev.KeptByDelete != keep || ev.DeleteDecided != vm.CreatedAt || len(ev.Disks) != 1 {
+			t.Fatalf("after marking %v: %+v, want decided by %s", keep, ev, vm.CreatedAt)
 		}
+	}
+}
+
+// undecidedDelete: web was recorded on node-a (its real disk at path),
+// failed over to node-b, and was deleted while node-a was down, by a delete
+// whose decision node-a's record does not hold: an earlier release's (no
+// mark), or a --keep-disks mark lost to node-a's write of the record from
+// before it.
+func undecidedDelete(t *testing.T, lost bool) (*corrosion.Client, *Reconciler, string) {
+	t.Helper()
+	db, _, r, _, path := strandedFixture(t)
+	ctx := context.Background()
+	recordWeb(t, db, time.Now())
+	if lost {
+		row, before, _, err := readStranded(ctx, db, "web", "node-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := MarkStrandedForDelete(ctx, db, "node-b", "web", true, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeStranded(ctx, db, "node-a", row, true, before, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, ev, _ := strandedRow(t, db, "web", "node-a"); ev.KeptByDelete || ev.DeleteDecided != "" {
+			t.Fatalf("the mark was not lost: %+v", ev)
+		}
+	}
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	return db, r, path
+}
+
+var undecidedCases = map[bool]string{false: "earlier release's delete", true: "mark lost"}
+
+// A disk still at its path whose record does not say what the deleted
+// incarnation's delete decided stays where it is on the reconciler's pass,
+// noted, and its record is resolved: it may be one --keep-disks kept. A
+// create of web here later moves it to a .kept- name.
+//
+// Mutation: set it aside whenever KeptByDelete is unset (ignore
+// DeleteDecided) — it is set aside as a .superseded- copy.
+func TestTendDeletedVMStranded_KeepsTheDiskOfAnUndecidedDelete(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(undecidedCases[lost], func(t *testing.T) {
+			db, r, path := undecidedDelete(t, lost)
+			r.tendStrandedDisks(context.Background())
+			if !fileExists(path) || len(setAsideCopies(t, path, supersededInfix)) != 0 {
+				t.Fatalf("the disk was moved: copies %v", setAsideCopies(t, path, supersededInfix))
+			}
+			if strandedOpen(t, db) {
+				t.Fatal("the record is still open")
+			}
+			if noted, _ := keptDisksOf(r.dataDir, "web"); len(noted) != 1 || noted[0] != path {
+				t.Fatalf("noted %v, want %s", noted, path)
+			}
+			done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			if err != nil || len(done.Moved) != 1 || !done.Moved[0].Kept || len(setAsideCopies(t, path, keptInfix)) != 1 {
+				t.Fatalf("moved %+v, %v; want the disk moved to a .kept- name", done.Moved, err)
+			}
+		})
+	}
+}
+
+// A create before the pass moves such a disk to a .kept- name, never to a
+// .superseded- one, and resolves the record.
+//
+// Mutation: as above, before the create — it is set aside as a .superseded-
+// copy.
+func TestSetAsideBeforeCreate_KeepsTheDiskOfAnUndecidedDelete(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(undecidedCases[lost], func(t *testing.T) {
+			db, r, path := undecidedDelete(t, lost)
+			done, err := SetAsideBeforeCreate(context.Background(), db, r.dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(done.Moved) != 1 || !done.Moved[0].Kept || len(setAsideCopies(t, path, keptInfix)) != 1 ||
+				len(setAsideCopies(t, path, supersededInfix)) != 0 {
+				t.Fatalf("moved %+v; kept %v; superseded %v", done.Moved, setAsideCopies(t, path, keptInfix), setAsideCopies(t, path, supersededInfix))
+			}
+			if b, _ := os.ReadFile(done.Moved[0].To); string(b) != "the real disk" {
+				t.Fatalf("the .kept- file holds %q", b)
+			}
+			if strandedOpen(t, db) {
+				t.Fatal("the record is still open")
+			}
+		})
+	}
+}
+
+// A note whose paths are not in clean form still matches the path a create
+// clears, and is forgotten once that disk is moved.
+//
+// Mutation: compare the note's paths as written — the note keeps the entry.
+func TestSetAsideBeforeCreate_MatchesANotedPathInAnyForm(t *testing.T) {
+	db, _, _, dataDir, path := strandedFixture(t)
+	ctx := context.Background()
+	if err := writeKeptDisks(dataDir, "web", []string{filepath.Dir(path) + "//./" + filepath.Base(path)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	done, err := SetAsideBeforeCreate(ctx, db, dataDir, "node-a", "web", []string{path}, samePath, trustedReplica, time.Now())
+	if err != nil || len(done.Moved) != 1 || !done.Moved[0].Kept {
+		t.Fatalf("moved %+v, %v; want the noted disk kept", done.Moved, err)
+	}
+	if noted, err := keptDisksOf(dataDir, "web"); err != nil || len(noted) != 0 {
+		t.Fatalf("the note still lists %v (%v) once the disk was moved", noted, err)
 	}
 }

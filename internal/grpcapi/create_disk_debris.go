@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -34,6 +35,11 @@ func (s *Server) tombstoneDeletedVM(ctx context.Context, name string, keepDisks 
 	}
 	if err != nil {
 		if keepDisks {
+			var ne *health.KeptDisksNoteError
+			if errors.As(err, &ne) {
+				return nil, fmt.Errorf("record that --keep-disks keeps the disks of %s: this host's note of the disks deletes kept, %s, "+
+					"cannot be read (%v); repair or remove that file, then retry; nothing was tombstoned", name, ne.File, ne.Err)
+			}
 			return nil, fmt.Errorf("record that --keep-disks keeps the disks of %s: %w; nothing was tombstoned, retry", name, err)
 		}
 		slog.Warn("delete: could not record the disks this delete keeps; a create of the name may clear one recorded delete_with_vm=false",
@@ -68,7 +74,9 @@ func (s *Server) noteKeptDisks(ctx context.Context, name string, keepDisks bool)
 // sweep would remove that the deleted VM was kept with is moved to
 // <path>.kept-<time>, and the real disk a failover left here to
 // <path>.superseded-<time> (health.SetAsideBeforeCreate); each move is a VM
-// event of the name. An error refuses the create: nothing was removed.
+// event of the name, as is each path of the deleted VM's disks that reads as
+// missing on what may be a volume not mounted yet. An error refuses the
+// create: nothing was removed.
 func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, now time.Time) error {
 	candidates, err := s.images.VMDiskCandidates(name)
 	if err != nil {
@@ -86,8 +94,21 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 	trusted := func() (bool, string) {
 		return corrosion.ReplicaTrusted(ctx, s.db, s.hostName, s.db.ReplicaCaughtUp)
 	}
-	moved, err := health.SetAsideBeforeCreate(ctx, s.db, s.dataDir, s.hostName, name, unlink, s.hostDiskFile, trusted, now)
-	for _, m := range moved {
+	done, err := health.SetAsideBeforeCreate(ctx, s.db, s.dataDir, s.hostName, name, unlink, s.hostDiskFile, trusted, now)
+	event := func(typ, sev, detail string) {
+		if eerr := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{
+			ID: randid.New(), VMName: name, HostName: s.hostName, Type: typ,
+			Result: "ok", Severity: sev, Detail: detail, Username: "create",
+		}); eerr != nil {
+			slog.Warn("create: record the event", "vm", name, "type", typ, "error", eerr)
+		}
+	}
+	for _, p := range done.MayBeUnmounted {
+		event("vm.disk.path_missing", "warn", fmt.Sprintf("the disk of the deleted VM %s at %s on %s reads as missing, and its directory is absent, "+
+			"empty or cannot be listed, as a volume not mounted yet reads; the create of %s goes ahead, and vm_disk_stranded stays open. "+
+			"If that directory is a mount point, a volume mounted there later hides what the create writes in it", name, p, s.hostName, name))
+	}
+	for _, m := range done.Moved {
 		detail := fmt.Sprintf("a disk the deleted VM %s was kept with was at %s, which the create of %s on %s clears; it is moved to %s, and only an operator removes it",
 			name, m.Path, name, s.hostName, m.To)
 		typ, sev := "vm.disk.kept", "info"
@@ -96,12 +117,7 @@ func (s *Server) clearDiskDebrisBeforeCreate(ctx context.Context, name string, n
 				name, m.Path, s.hostName, m.To, name)
 			typ, sev = "vm.disk.set_aside", "warn"
 		}
-		if eerr := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{
-			ID: randid.New(), VMName: name, HostName: s.hostName, Type: typ,
-			Result: "ok", Severity: sev, Detail: detail, Username: "create",
-		}); eerr != nil {
-			slog.Warn("create: record the moved disk's event", "vm", name, "error", eerr)
-		}
+		event(typ, sev, detail)
 	}
 	if err != nil {
 		return err

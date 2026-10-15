@@ -17,6 +17,20 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// deleteWeb deletes web as `lv rm web` on this release does: its delete
+// marks the open records of web (MarkStrandedForDelete) before the
+// tombstone.
+func deleteWeb(t *testing.T, db *corrosion.Client) {
+	t.Helper()
+	ctx := context.Background()
+	if err := MarkStrandedForDelete(ctx, db, "node-b", "web", false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func strandedOpen(t *testing.T, db *corrosion.Client) bool {
 	t.Helper()
 	row, _, ok := strandedRow(t, db, "web", "node-a")
@@ -65,9 +79,7 @@ func TestTendDeletedVMStranded_LeavesAFileNotRecordedForTheDeletedVM(t *testing.
 		time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	r.tendStrandedDisks(ctx)
 	if !fileExists(path) {
 		t.Fatalf("the file at %s, recorded for another web, was moved", path)
@@ -149,9 +161,7 @@ func TestTendDeletedVMStranded_NeverMovesADiskOnceALiveRowOfTheNameExists(t *tes
 	db, _, r, _, path := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	inserted := false
 	r.diskLstat = func(p string) (os.FileInfo, error) {
 		if !inserted && p == path {
@@ -186,9 +196,7 @@ func TestTendDeletedVMStranded_KeepsTheEntryOfAPathThatReadsAsMissing(t *testing
 	db, _, r, _, path := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	hidden := filepath.Join(t.TempDir(), "volume")
 	if err := os.Rename(path, hidden); err != nil { // the volume is unmounted
 		t.Fatal(err)
@@ -219,9 +227,7 @@ func TestTendDeletedVMStranded_ReReadsTheDomainBeforeTheRename(t *testing.T) {
 	db, fake, r, _, path := strandedFixture(t)
 	ctx := context.Background()
 	recordWeb(t, db, time.Now())
-	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
-		t.Fatal(err)
-	}
+	deleteWeb(t, db)
 	fake.DefineStoppedDomain("web", "52:54:00:00:00:02")
 	reads := 0
 	fake.FailDomainStateReason = func(name string) error {

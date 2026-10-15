@@ -644,7 +644,9 @@ needing manual intervention. Without this confirmation the coordinator will
 NOT reschedule the host's VMs, to prevent split-brain on shared storage.
 
 The host MUST be physically off (or otherwise demonstrably not running its
-workloads) before running this command.`,
+workloads) before running this command. It is refused while the host still
+answers: another host's health verdict about it is healthy or unready and under
+30 seconds old, or the node serving the request reaches it.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

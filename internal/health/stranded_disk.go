@@ -434,7 +434,7 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// The VM runs here again on the disk at that path.
 		return false, d
 	}
-	set, outcome := r.setAsideStrandedFile(ctx, vm.Name, d)
+	set, outcome := r.setAsideStrandedFile(ctx, vm.Name, d, nil)
 	if outcome != setAsideDone {
 		// Missing is not deleted: a volume not mounted (yet) — its mount
 		// point absent, or present and empty — reads exactly like a file
@@ -469,8 +469,10 @@ const (
 //     case, not this. Only a domain shut off with nothing to resume — the
 //     leftover a fenced host comes back with — or none at all;
 //   - a workload on this host still uses the file: a linked clone's base or
-//     another VM's disk at the same path.
-func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d StrandedDisk) (StrandedDisk, setAsideOutcome) {
+//     another VM's disk at the same path;
+//   - stillMay, when given, answers no: the caller's own last check, read
+//     immediately before the rename.
+func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d StrandedDisk, stillMay func() bool) (StrandedDisk, setAsideOutcome) {
 	fi, err := r.lstatDisk(d.Path)
 	if os.IsNotExist(err) {
 		return d, setAsideAbsent
@@ -493,6 +495,9 @@ func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d 
 		if gerr != nil || (other != nil && other.HostName == r.hostName) {
 			return d, setAsideBlocked
 		}
+	}
+	if stillMay != nil && !stillMay() {
+		return d, setAsideBlocked
 	}
 	aside := supersededName(d.Path, r.now())
 	if err := renameSetAside(d.Path, aside); err != nil {

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -26,17 +25,13 @@ import (
 // identity is the spec's uuid: minted by the server for every create and
 // every clone, before the seed is written, and carried in the VM's row.
 //
-// A seed written before this release has no stamp. It is reused when it was
-// last written no earlier than seedLegacyLead before the VM's row was created
-// (a create writes its seed before its row, after its disks), and generated
-// again otherwise.
+// A seed written before this release has no stamp, and nothing proves whose
+// it is: it is generated again from the VM's own spec, and stamped. The
+// instance-id is the VM's name either way, so a guest that already booted
+// from it does not run its first-boot modules again.
 
 // seedOwnerSuffix names the stamp beside a seed.
 const seedOwnerSuffix = ".owner"
-
-// seedLegacyLead is how long before its row's created_at a create can have
-// written its seed: the disks are made, and images copied, in between.
-const seedLegacyLead = time.Hour
 
 // SeedOwnerPath is where the stamp of the seed at iso is.
 func SeedOwnerPath(iso string) string { return iso + seedOwnerSuffix }
@@ -89,28 +84,16 @@ func SeedOwner(iso string) (owner string, ok bool, err error) {
 	return strings.TrimSpace(string(b)), true, nil
 }
 
-// SeedIsFor reports whether the seed at iso exists and was written for the VM
-// whose spec uuid is owner and whose row was created at createdAt (RFC3339):
-// its stamp names owner, or, unstamped, it was written no earlier than
-// seedLegacyLead before createdAt. Anything unreadable answers no, and the
-// caller writes the seed again.
-func SeedIsFor(iso, owner, createdAt string) bool {
+// SeedIsFor reports whether the seed at iso exists and is stamped as written
+// for the VM whose spec uuid is owner. An unstamped seed, a VM with no uuid,
+// or anything unreadable answers no, and the caller writes the seed again.
+func SeedIsFor(iso, owner string) bool {
 	fi, err := os.Stat(iso)
-	if err != nil || !fi.Mode().IsRegular() {
+	if err != nil || !fi.Mode().IsRegular() || owner == "" {
 		return false
 	}
 	stamp, stamped, err := SeedOwner(iso)
-	if err != nil {
-		return false
-	}
-	if stamped {
-		return owner != "" && stamp == owner
-	}
-	created, err := time.Parse(time.RFC3339Nano, createdAt)
-	if err != nil {
-		return false
-	}
-	return !fi.ModTime().Before(created.Add(-seedLegacyLead))
+	return err == nil && stamped && stamp == owner
 }
 
 // SpecUUID is the uuid of a VM spec stored as JSON, "" when it has none.

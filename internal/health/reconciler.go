@@ -2305,7 +2305,7 @@ func (r *Reconciler) domainXMLFor(ctx context.Context, vm corrosion.VMRecord, sp
 	// A seed here is reused only when it is this VM's: one left by a deleted
 	// VM of the name would boot its user-data (cloudinit/seed_owner.go).
 	seedOwner := cloudinit.SpecUUID(vm.Spec)
-	if cloudinit.SeedIsFor(isoPath, seedOwner, vm.CreatedAt) {
+	if cloudinit.SeedIsFor(isoPath, seedOwner) {
 		cloudInitISO = isoPath
 	} else if spec.CloudInit != nil {
 		// Regenerate cloud-init ISO from spec.

@@ -138,3 +138,37 @@ func TestTendDeletedVMStranded_WithoutLibvirtResolvesAndActsOnNothing(t *testing
 		t.Fatal("the record is still open")
 	}
 }
+
+// A VM of the name created again on this host writes its disk before its row
+// reaches the replica. Once that row is there — here, landing while the pass
+// looks at the file — the deleted VM's disk path is not touched.
+//
+// Mutation: drop the live-row check before the rename (stillMay) — the new
+// VM's disk is renamed.
+func TestTendDeletedVMStranded_NeverMovesADiskOnceALiveRowOfTheNameExists(t *testing.T) {
+	db, _, r, _, path := strandedFixture(t)
+	ctx := context.Background()
+	recordWeb(t, db, time.Now())
+	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
+		t.Fatal(err)
+	}
+	inserted := false
+	r.diskLstat = func(p string) (os.FileInfo, error) {
+		if !inserted && p == path {
+			inserted = true
+			// The row first, its disk records after it: only the row
+			// can tell the pass, not a reference to the path.
+			if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "web", HostName: "node-a", State: "creating"}, nil, nil); err != nil {
+				t.Errorf("insert the new web: %v", err)
+			}
+		}
+		return os.Lstat(p)
+	}
+	r.tendStrandedDisks(ctx)
+	if !inserted {
+		t.Fatal("the pass never looked at the disk")
+	}
+	if !fileExists(path) {
+		t.Fatalf("the disk at %s was moved with a live row of web in the replica", path)
+	}
+}

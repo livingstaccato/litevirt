@@ -303,10 +303,12 @@ func stageSeedWriter(t *testing.T) {
 // the seed of sx, a VM since deleted, with sx's user-data. A new VM sx, with
 // its own user-data, fails over onto that host: the start writes sx's own
 // seed and boots that, never the deleted one's — whether the seed left there
-// is stamped, or from before seeds were stamped.
+// is stamped, or from before seeds were stamped and written moments before
+// the new sx was created.
 //
-// Mutation: reuse any existing seed in domainXMLFor — the deleted sx's
-// user-data boots.
+// Mutations: reuse any existing seed in domainXMLFor — the deleted sx's
+// user-data boots; reuse an unstamped seed written recently — the unstamped
+// subtest boots it.
 func TestFleet_FailoverOntoAHostWithADeletedVMsSeedWritesItsOwn(t *testing.T) {
 	for _, stamped := range []bool{true, false} {
 		t.Run(map[bool]string{true: "stamped", false: "unstamped"}[stamped], func(t *testing.T) {
@@ -332,10 +334,8 @@ func TestFleet_FailoverOntoAHostWithADeletedVMsSeedWritesItsOwn(t *testing.T) {
 			if err := os.WriteFile(iso, []byte("#cloud-config\n# the deleted sx's keys\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			old := time.Now().Add(-3 * time.Hour)
-			if err := os.Chtimes(iso, old, old); err != nil {
-				t.Fatal(err)
-			}
+			// Unstamped, it was written just now: inside the hour before
+			// the new sx's row, so no age can tell it from the new sx's own.
 			if stamped {
 				if err := cloudinit.StampSeed(iso, "sx-1"); err != nil {
 					t.Fatal(err)

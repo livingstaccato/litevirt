@@ -1199,9 +1199,14 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	owner := cloudinit.SpecUUID(vm.Spec)
-	if cloudinit.SeedIsFor(isoPath, owner, vm.CreatedAt) {
+	if cloudinit.SeedIsFor(isoPath, owner) {
 		return &emptypb.Empty{}, nil // already this VM's
 	}
+	// A file already at the path is written over, but it was not created
+	// for this migration: a failed migration's cleanup leaves the path alone,
+	// as it does a seed that was this VM's.
+	_, statErr := os.Lstat(isoPath)
+	existed := statErr == nil
 
 	userData := req.Userdata
 	if userData == "" {
@@ -1219,8 +1224,10 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 		slog.Warn("cloud-init ISO for migration: could not stamp it with its VM; a later start writes it again",
 			"vm", req.VmName, "error", err)
 	}
-	s.migrationISOs.add(req.VmName, isoPath)
-	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath)
+	if !existed {
+		s.migrationISOs.add(req.VmName, isoPath)
+	}
+	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath, "replaced", existed)
 	return &emptypb.Empty{}, nil
 }
 

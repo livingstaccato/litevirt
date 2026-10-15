@@ -30,7 +30,9 @@ import (
 //     VM exists (setAsideStrandedFile), so it enters the same retention.
 //     Nothing is deleted. Only an entry recorded for the incarnation the
 //     tombstone names (created_at), at one of the disk paths the VM's rows
-//     record, is set aside; any other file stays where it is;
+//     record, is set aside; any other file stays where it is. The replica is
+//     read again for a live row of the name immediately before the rename: a
+//     VM created again under the name is never touched (noLiveRow);
 //   - removes the VM's own cloud-init seed: one stamped with the deleted VM's
 //     spec uuid (cloudinit/seed_owner.go), and only while no domain of the
 //     name is live here. An unstamped seed, or one of another VM of the name,
@@ -78,7 +80,7 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 				"vm", name, "path", d.Path, "recorded_for", d.Incarnation, "deleted", createdAt)
 			continue
 		}
-		set, outcome := r.setAsideStrandedFile(ctx, name, d)
+		set, outcome := r.setAsideStrandedFile(ctx, name, d, func() bool { return r.noLiveRow(ctx, name) })
 		switch outcome {
 		case setAsideBlocked:
 			kept = append(kept, d)
@@ -95,6 +97,15 @@ func (r *Reconciler) tendDeletedVMStranded(ctx context.Context, name string, ev 
 			"vm", name)
 	}
 	return kept
+}
+
+// noLiveRow reports whether this host's replica holds no live row of name,
+// read now. A VM of the name created again — on this host, its disk written
+// before its row — is never set aside: once its row is here, the deleted-VM
+// pass leaves the path alone. An unreadable row answers no.
+func (r *Reconciler) noLiveRow(ctx context.Context, name string) bool {
+	vm, err := corrosion.GetVM(ctx, r.db, name)
+	return err == nil && vm == nil
 }
 
 // removeDeletedVMSeed removes name's cloud-init seed here when it is stamped

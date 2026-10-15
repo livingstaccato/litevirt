@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -152,21 +154,7 @@ func newReplicationScheduleListCmd() *cobra.Command {
 					fmt.Println("(no replication schedules)")
 					return nil
 				}
-				fmt.Printf("%-18s %-12s %-10s %-5s %-5s %-4s %-12s %-20s %s\n",
-					"VM", "POOL", "HOST", "INCR", "AUTO", "KEEP", "RATE", "LAST RUN", "LAST ERR")
-				for _, s := range resp.Schedules {
-					name := s.VmName
-					if s.Scope == "container" {
-						name = "ct:" + name
-					}
-					rate := "-"
-					if s.BwlimitBytesPerSec > 0 {
-						rate = pbsstore.FormatRate(s.BwlimitBytesPerSec)
-					}
-					fmt.Printf("%-18s %-12s %-10s %-5v %-5v %-4d %-12s %-20s %s\n",
-						name, s.TargetPool, defaultStr(s.TargetHost, "-"), s.Incremental, s.AutoPromote,
-						s.KeepReplicas, rate, defaultStr(s.LastRunAt, "-"), defaultStr(s.LastRunErr, "-"))
-				}
+				printReplicationSchedules(os.Stdout, resp.Schedules)
 				return nil
 			})
 		},
@@ -386,4 +374,25 @@ one is refused with a warning unless --accept-not-point-in-time is given.`,
 	cmd.Flags().BoolVar(&noLocalize, "no-localize", false, "boot off an overlay backed by the replica (fast; pins it)")
 	cmd.Flags().BoolVar(&acceptNotPIT, "accept-not-point-in-time", false, "promote a replica recorded as not point-in-time (a qemu-img -U copy of a running disk; may be inconsistent)")
 	return cmd
+}
+
+// printReplicationSchedules writes the schedule table with columns sized to
+// their content, so a long VM name cannot shift the columns after it.
+func printReplicationSchedules(out io.Writer, schedules []*pb.ReplicationSchedule) {
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "VM\tPOOL\tHOST\tINCR\tAUTO\tKEEP\tRATE\tLAST RUN\tLAST ERR")
+	for _, s := range schedules {
+		name := s.VmName
+		if s.Scope == "container" {
+			name = "ct:" + name
+		}
+		rate := "-"
+		if s.BwlimitBytesPerSec > 0 {
+			rate = pbsstore.FormatRate(s.BwlimitBytesPerSec)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%v\t%v\t%d\t%s\t%s\t%s\n",
+			name, s.TargetPool, defaultStr(s.TargetHost, "-"), s.Incremental, s.AutoPromote,
+			s.KeepReplicas, rate, defaultStr(s.LastRunAt, "-"), defaultStr(s.LastRunErr, "-"))
+	}
+	_ = w.Flush()
 }

@@ -584,7 +584,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
 	// incomplete delete, even if the libvirt domain is already gone.
 	s.sweepVMDiskDebris(ctx, spec.Name)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
 	if spec.Image != "" && !s.images.ImageExists(spec.Image) {
@@ -1146,6 +1146,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		} else {
 			cloudInitISO = isoPath
 			recordSeed(isoPath)
+		}
+	}
+
+	// The seed is this VM's (cloudinit/seed_owner.go): a host that later finds
+	// it reuses it for this VM only.
+	if cloudInitISO != "" {
+		if err := cloudinit.StampSeed(cloudInitISO, spec.Uuid); err != nil {
+			slog.Warn("create: could not stamp the cloud-init seed with its VM; a later start writes it again",
+				"vm", spec.Name, "error", err)
 		}
 	}
 
@@ -3313,7 +3322,7 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		s.removeOwnDiskLayers(ctx, req.Name, layers)
 		s.removeVMSnapshotRAMImages(ctx, req.Name)
 		// Remove cloud-init ISO
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+		_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
 		// --keep-disks we deliberately KEEP it too — else a retained BitLocker disk
 		// would be unbootable (the swtpm tree at the stable uuid stays for restore).
@@ -3432,22 +3441,6 @@ func (s *Server) deleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// --keep-disks delete keeps disks wherever they are, and drops the markers
 	// everywhere, as it does the local one above.
 	leftovers := s.planDeletedVMLeftovers(ctx, vm, !req.KeepDisks)
-
-	// What a failover left of this VM on the hosts it moved it off — its real
-	// disk, set aside there, and its seed — is removed by those hosts on their
-	// own pass, from this decision on the record of it, written BEFORE the
-	// tombstone (health/deleted_vm_residue.go). A --keep-disks delete must
-	// replace any decision an earlier attempt left, or fail: kept data would
-	// otherwise go.
-	if err := health.NoteStrandedDisksDeleted(ctx, s.db, s.hostName, req.Name, vm.CreatedAt, req.KeepDisks, time.Now()); err != nil {
-		if req.KeepDisks {
-			return nil, status.Errorf(codes.Internal,
-				"delete %s: could not record that its disks on the hosts a failover moved it off are kept, so the VM was NOT deleted (retry is safe): %v",
-				req.Name, err)
-		}
-		slog.Warn("delete: could not record the delete on the record of the disks a failover left on other hosts; they are kept there",
-			"vm", req.Name, "error", err)
-	}
 
 	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
 	// (the guarded delete declines when the row's authority moved under it, and
@@ -4500,7 +4493,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
-	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
+	_ = cloudinit.RemoveSeed(lv.CloudInitISOPath(s.dataDir, req.Name))
 	// The rebuilt VM gets a fresh uuid: the ISO record of the old one goes.
 	s.forgetVMISOIdentity(req.Name, vm.Spec)
 

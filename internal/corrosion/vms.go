@@ -671,24 +671,19 @@ func GetSoftDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]Sof
 // — the incarnation a delete removed — or "" when there is none (no row, or a
 // live one).
 func GetTombstonedVMCreatedAt(ctx context.Context, c *Client, name string) (string, error) {
-	rows, err := c.Query(ctx,
-		`SELECT created_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
-	if err != nil || len(rows) == 0 {
-		return "", err
-	}
-	return rows[0].String("created_at"), nil
+	createdAt, _, err := GetTombstonedVM(ctx, c, name)
+	return createdAt, err
 }
 
-// GetTombstonedVMDeletion is GetTombstonedVMCreatedAt with the tombstone's
-// deleted_at (an LWW key: read it with ParseUpdatedAt). Both are "" when no
-// tombstoned row of name exists.
-func GetTombstonedVMDeletion(ctx context.Context, c *Client, name string) (createdAt, deletedAt string, err error) {
+// GetTombstonedVM returns the created_at and the spec of name's TOMBSTONED
+// vms row; both "" when it has none.
+func GetTombstonedVM(ctx context.Context, c *Client, name string) (createdAt, spec string, err error) {
 	rows, err := c.Query(ctx,
-		`SELECT created_at, deleted_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+		`SELECT created_at, spec FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
 	if err != nil || len(rows) == 0 {
 		return "", "", err
 	}
-	return rows[0].String("created_at"), rows[0].String("deleted_at"), nil
+	return rows[0].String("created_at"), rows[0].String("spec"), nil
 }
 
 // GetVMDisks returns all disks for a VM.

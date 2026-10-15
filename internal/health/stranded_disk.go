@@ -48,10 +48,9 @@ import (
 //     (`lv host superseded-disks <host> --remove <copy>`) or puts it back
 //     (`--restore <copy>`, RestoreSupersededDisk), which sets the disk it
 //     replaces aside in turn, so nothing is ever deleted by the swap;
-//   - once the VM is deleted, the host removes what the record names of it,
-//     and the VM's cloud-init seed, if the delete freed its disks
-//     (deleted_vm_residue.go). A --keep-disks delete keeps them, and the
-//     copies then follow the retention for a deleted VM's.
+//   - once the VM is deleted, the host sets aside a disk of it still at its
+//     path, which enters the same retention, removes the VM's own cloud-init
+//     seed, and resolves the record (deleted_vm_residue.go).
 //
 // The record is a health condition, one row per VM and host, written by the
 // coordinator while the host is down and by the host itself afterwards. It
@@ -76,7 +75,7 @@ type StrandedDisk struct {
 	Since string `json:"since"` // RFC3339: when it was left behind or set aside
 	// Incarnation is the created_at of the VM whose disk it is, when it was
 	// recorded; "" when that could not be read, or by an older release. Only
-	// that incarnation's delete removes it (deleted_vm_residue.go).
+	// that incarnation's delete sets it aside (deleted_vm_residue.go).
 	Incarnation string `json:"incarnation,omitempty"`
 }
 
@@ -89,9 +88,6 @@ type StrandedDisks struct {
 	Disks   []StrandedDisk `json:"disks"`
 	Detail  string         `json:"detail"`
 	Fix     string         `json:"fix"`
-	// Deleted is what the VM's delete decided for these disks, written by the
-	// deleting host before its tombstone (NoteStrandedDisksDeleted).
-	Deleted *StrandedDeletion `json:"deleted,omitempty"`
 }
 
 func strandedSubject(vm, host string) string { return vm + "@" + host }
@@ -438,8 +434,8 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// The VM runs here again on the disk at that path.
 		return false, d
 	}
-	fi, err := r.lstatDisk(d.Path)
-	if err != nil {
+	set, outcome := r.setAsideStrandedFile(ctx, vm.Name, d)
+	if outcome != setAsideDone {
 		// Missing is not deleted: a volume not mounted (yet) — its mount
 		// point absent, or present and empty — reads exactly like a file
 		// gone. Nothing confirms a deletion, so the entry is kept and looked
@@ -448,39 +444,64 @@ func (r *Reconciler) tendStrandedDisk(ctx context.Context, vm *corrosion.VMRecor
 		// hold the pass on it.
 		return true, d
 	}
+	slog.Warn("reconciler: set aside the real disk of a VM a failover restarted elsewhere; it is kept while the VM exists",
+		"vm", vm.Name, "disk", d.Disk, "path", d.Path, "set_aside_to", set.Copy, "vm_host", vm.HostName)
+	r.surfaceSetAsideEventOnly(ctx, vm.Name, set)
+	return true, set
+}
+
+// setAsideOutcome is what setAsideStrandedFile did.
+type setAsideOutcome int
+
+const (
+	setAsideDone    setAsideOutcome = iota // renamed to its copy
+	setAsideAbsent                         // nothing there: no file, or not a regular one
+	setAsideBlocked                        // kept for now: in use, or its storage or a record cannot be read
+)
+
+// setAsideStrandedFile renames the file at d.Path, a disk of vmName a
+// failover left on this host, to <path>.superseded-<time>, and returns the
+// entry with its copy. It does not when:
+//   - nothing is there, or it is not a regular file (setAsideAbsent);
+//   - its storage does not answer (setAsideBlocked);
+//   - a domain of vmName is live here, or holds resumable state: the disk is
+//     open, or a resume would need it, and the ownership repair decides that
+//     case, not this. Only a domain shut off with nothing to resume — the
+//     leftover a fenced host comes back with — or none at all;
+//   - a workload on this host still uses the file: a linked clone's base or
+//     another VM's disk at the same path.
+func (r *Reconciler) setAsideStrandedFile(ctx context.Context, vmName string, d StrandedDisk) (StrandedDisk, setAsideOutcome) {
+	fi, err := r.lstatDisk(d.Path)
+	if os.IsNotExist(err) {
+		return d, setAsideAbsent
+	}
+	if err != nil {
+		return d, setAsideBlocked
+	}
 	if !fi.Mode().IsRegular() {
-		return true, d
+		return d, setAsideAbsent
 	}
-	// Never under a domain that is live here, or holds resumable state: the
-	// disk is open, or a resume would need it, and the ownership repair
-	// decides that case, not this. Only a domain shut off with nothing to
-	// resume — the leftover a fenced host comes back with — or none at all.
-	if r.virt != nil && !r.domainAbsentOrDeadLeftover(vm.Name) {
-		return true, d
+	if r.virt != nil && !r.domainAbsentOrDeadLeftover(vmName) {
+		return d, setAsideBlocked
 	}
-	// Never a file a workload on this host still uses: a linked clone's base
-	// or another VM's disk at the same path.
 	refs, err := corrosion.DisksReferencingPath(ctx, r.db, d.Path)
 	if err != nil {
-		return true, d
+		return d, setAsideBlocked
 	}
 	for _, ref := range refs {
 		other, gerr := corrosion.GetVM(ctx, r.db, ref.VMName)
 		if gerr != nil || (other != nil && other.HostName == r.hostName) {
-			return true, d
+			return d, setAsideBlocked
 		}
 	}
 	aside := supersededName(d.Path, r.now())
 	if err := renameSetAside(d.Path, aside); err != nil {
 		slog.Error("reconciler: could not set aside a disk a failover left on this host; it stays at its path",
-			"vm", vm.Name, "path", d.Path, "error", err)
-		return true, d
+			"vm", vmName, "path", d.Path, "error", err)
+		return d, setAsideBlocked
 	}
-	slog.Warn("reconciler: set aside the real disk of a VM a failover restarted elsewhere; it is kept while the VM exists",
-		"vm", vm.Name, "disk", d.Disk, "path", d.Path, "set_aside_to", aside, "vm_host", vm.HostName)
 	d.Copy, d.Since = aside, r.now().UTC().Format(time.RFC3339)
-	r.surfaceSetAsideEventOnly(ctx, vm.Name, d)
-	return true, d
+	return d, setAsideDone
 }
 
 // domainAbsentOrDeadLeftover reports whether no domain of name is defined

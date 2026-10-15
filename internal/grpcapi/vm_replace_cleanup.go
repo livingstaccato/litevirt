@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/cloudinit"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -592,6 +593,15 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 				if e := os.Rename(oldSeed, newSeed); e != nil {
 					return failed("seed rename", e)
 				}
+			}
+			// Its stamp goes with it (cloudinit/seed_owner.go); one left at
+			// the new name from another seed would not be this one's.
+			if _, e := os.Stat(cloudinit.SeedOwnerPath(oldSeed)); e == nil {
+				if e := os.Rename(cloudinit.SeedOwnerPath(oldSeed), cloudinit.SeedOwnerPath(newSeed)); e != nil {
+					return failed("seed stamp rename", e)
+				}
+			} else if os.IsNotExist(e) {
+				_ = os.Remove(cloudinit.SeedOwnerPath(newSeed))
 			}
 		}
 		if e := s.virt.DefineDomain(xml); e != nil {

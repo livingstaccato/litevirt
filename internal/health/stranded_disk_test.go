@@ -211,10 +211,6 @@ func TestTendStrandedDisks_ClearsWhenNothingIsLeftToKeep(t *testing.T) {
 	if err := corrosion.DeleteVM(ctx, db, "web"); err != nil {
 		t.Fatal(err)
 	}
-	// A delete that wrote no decision on the record (an older release's) is
-	// waited on for strandedDeletionWindow, in case its decision is still on
-	// its way (deleted_vm_residue.go).
-	r.Now = func() time.Time { return time.Now().Add(strandedDeletionWindow + time.Minute) }
 	r.tendStrandedDisks(ctx)
 	if row, _, ok := strandedRow(t, db, "web", "node-a"); !ok || row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("condition %+v, want resolved once the VM is gone", row)

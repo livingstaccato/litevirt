@@ -570,6 +570,10 @@ func (s *Server) cloneVMOnSource(ctx context.Context, req *pb.CloneVMRequest, sr
 			cleanup()
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 		}
+		if err := cloudinit.StampSeed(isoPath, cloneUUID); err != nil {
+			slog.Warn("clone: could not stamp the cloud-init seed with its VM; a later start writes it again",
+				"vm", req.Target, "error", err)
+		}
 		cloudInitISO = isoPath
 	}
 

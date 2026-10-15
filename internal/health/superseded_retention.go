@@ -19,7 +19,8 @@ import (
 // A failover start sets an old copy of a host-local disk aside as
 // <path>.superseded-<time> (superseded_disk.go) rather than deleting it, and
 // a host that comes back after a failover moved its VM elsewhere sets the
-// VM's real disk aside the same way (stranded_disk.go). Each copy is an
+// VM's real disk aside the same way (stranded_disk.go), also once the VM is
+// deleted (deleted_vm_residue.go). Each copy is an
 // independent line of the VM's data — every failover rebuilds the disk from
 // its image — so any one of them can be the only copy of what the VM held
 // before a failover.
@@ -35,11 +36,9 @@ import (
 //   - while that VM is in error, pending or starting the copy is also held: a
 //     failover start that failed, or one still under way, may need it put
 //     back, so not even a named removal takes it;
-//   - a delete of the VM that frees its disks removes the copies recorded for
-//     it (deleted_vm_residue.go);
-//   - once the VM is gone, any other copy is removed when it is older than the
+//   - once the VM is gone, the copy is removed when it is older than the
 //     retention (superseded_disk_retention_days, default 7; 0 keeps every
-//     such copy), by the host that holds it, on the hourly sweep.
+//     copy), by the host that holds it, on the hourly sweep.
 //
 // Before this rule a copy was held only while its VM was in error, pending or
 // starting, so seven days after the VM was running again on a disk rebuilt

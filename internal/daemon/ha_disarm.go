@@ -53,7 +53,7 @@ func (d *Daemon) startHADisarmPreRecord(ctx context.Context, fc *failover.Coordi
 	}
 	p := &failover.HAPreRecorder{
 		HoldsLease: fc.HoldsLease,
-		Latched:    func() bool { return d.checker.DurablyLatched(info.Token) },
+		Latched:    func() bool { return d.checker.FeatureAvailable(capabilities.FeatureHADisarm) },
 		Paid: func(ctx context.Context) (bool, error) {
 			present, acked, err := corrosion.ReleaseFeatureState(ctx, d.db, info.Token, string(capabilities.FeatureHADisarm))
 			return present && acked, err

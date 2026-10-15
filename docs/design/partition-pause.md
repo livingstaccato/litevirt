@@ -589,6 +589,10 @@ All of this is in the failover coordinator (`internal/failover`).
    3. That holds only while the host's pause may still be relied on (§4.3).
    Once it may not, the record is an unverified fence: it is resumed only
    while it still stands, and is otherwise declined.
+   A restarted coordinator has no probe answer from the host yet, so it
+   does not rely on the pause, and its own observer run began after the
+   fence: it declines the record, and logs the hint to run
+   `lv host undrain <host>`, which lets it fence the host afresh.
 
 The recovery itself (claim, proof, destination start) is unchanged. It merely
 starts after the deadline. A verified fence (IPMI) or an operator confirmation

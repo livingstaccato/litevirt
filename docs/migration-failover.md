@@ -1124,13 +1124,17 @@ The resume requires five things, not the confirmation alone:
    confirmation. No observer's latest verdict is an answer newer than 5
    seconds before it, and no observer's failing run began more than 5 seconds
    after it. The coordinator's own node has not probed the host healthy since
-   5 seconds before it. Otherwise the coordinator logs "the host has been seen
-   up since the operator confirmed it off, NOT resuming on the confirmation"
-   once per confirmation (`phase=recovery, error_class=manual_unconfirmed`).
+   5 seconds before it. Otherwise the coordinator logs "the operator
+   confirmation does not stand for this outage, NOT acting on it" once per
+   confirmation (`phase=recovery, error_class=manual_unconfirmed`).
    The host's stall reason names the confirmation and the remedy. Power the
    host off, then run `lv host fence-confirm <host>` again. A confirmation
    typed before the power-off, while a bridge still sees the host, is refused
-   the same way.
+   the same way. A failing run begun after the confirmation is named in the
+   reason as "it saw the host answer, or its own daemon restarted": a
+   restart of that observer's daemon, the coordinator's own included, also
+   refuses. A refusal on the coordinator's own probe answer does not clear by
+   itself; confirm again.
 
 An observer's unbroken run of failed probes restarts when that observer's
 daemon restarts, so after every observer has restarted a genuine confirmation
@@ -1167,7 +1171,8 @@ error_class=confirmation_fence`). The confirmation authorises that fence, not
 the recovery: the recovery follows from the fresh fence under every gate a
 fence applies, and where one of them needs a confirmation (`manual`,
 `best-effort` under the safe-fence policy, the confirmation label) it accepts
-one under 5 minutes old. An older one leaves the host `offline` after the fence
+one under 5 minutes old that still stands (item 5) and was written since the
+host last turned active. An older one leaves the host `offline` after the fence
 with the usual refusal in the log; confirm again and the recovery resumes from
 it. A confirmation older than the outage, of a host that has answered since,
 still authorises nothing, and the coordinator logs "the newest fence attempt

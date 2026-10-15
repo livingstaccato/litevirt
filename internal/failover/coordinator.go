@@ -345,6 +345,10 @@ type Coordinator struct {
 	// longer standing, so the refusal is logged once per confirmation rather
 	// than once per poll. See noteConfirmationStale.
 	confirmStale map[string]string
+	// notRelying records, per host, why relyOnPartitionPause last declined to
+	// rely on its pause, so the reason is logged once per change rather than
+	// once per poll. See noteNotRelying.
+	notRelying map[string]string
 	// SelfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
 	// waiting to reboot. A doomed node must not drive ANY failover decision during that
 	// window, even if quorum transiently returns first. Wired by the daemon from the
@@ -1333,7 +1337,7 @@ func (c *Coordinator) forgetEpisodes() {
 	c.relocDeferred = nil
 	c.retrying = nil
 	c.retryNotified, c.retryRefusedLogged = nil, nil
-	c.resumeDeclined, c.confirmStale = nil, nil
+	c.resumeDeclined, c.confirmStale, c.notRelying = nil, nil, nil
 	c.stallSince, c.stallAlerted, c.holdReason = nil, nil, nil
 }
 
@@ -2160,6 +2164,38 @@ func (c *Coordinator) manualFenceConfirmed(ctx context.Context, host string) boo
 	return c.fenceWithinWindow(ctx, host, true)
 }
 
+// confirmedOffNow is the operator confirmation recoverFenced's gates accept:
+// manualFenceConfirmed's recent one, and only while it still stands for the
+// outage host is in now (confirmationStands) and, when life is known, was
+// written in the host's current life. life is fenceRowCutoff read before
+// recoverFenced recorded the host 'offline', which ends the life it measures.
+// manualFenceConfirmed alone accepts any confirmation under five minutes old,
+// so one from before the host last came back (a reboot boots it 'active')
+// would be spent on a fence of its next outage while it runs its workloads.
+// A refusal is noted with its remedy (noteConfirmationStale), and why is
+// non-empty then; it is empty when there is no recent confirmation at all, or
+// on a read error.
+func (c *Coordinator) confirmedOffNow(ctx context.Context, host string, life time.Time, lifeKnown bool) (string, bool) {
+	if !c.manualFenceConfirmed(ctx, host) {
+		return "", false
+	}
+	confirm, confirmedAt, _, ok := c.confirmationAndAttempt(ctx, host)
+	if !ok || confirmedAt.IsZero() {
+		return "", false
+	}
+	if lifeKnown && confirmedAt.Before(life) {
+		why := "it was written before the host last turned active"
+		c.noteConfirmationStale(host, confirm, why)
+		return why, false
+	}
+	why, stands := c.confirmationStands(ctx, host, confirmedAt)
+	if !stands {
+		c.noteConfirmationStale(host, confirm, why)
+		return why, false
+	}
+	return "", true
+}
+
 // safeFenceRequiresProof reports whether a FAILED best-effort fence of h must be
 // confirmed (like "manual") before rescheduling. True only when the safe-fence
 // policy (SafeFenceDefaultV1) is enforced cluster-wide AND the host has not opted
@@ -2440,9 +2476,9 @@ func restartedSinceObserversIn(hr healthRead, host string, at time.Time) []strin
 // began after the fence.
 func whyRestarted(observers []string) string {
 	if len(observers) == 1 {
-		return "observer " + observers[0] + "'s failing run began after the fence, so it saw the host answer since"
+		return "observer " + observers[0] + "'s failing run began after the fence (it saw the host answer, or its own daemon restarted)"
 	}
-	return "observers " + strings.Join(observers, ",") + "' failing runs began after the fence, so they saw the host answer since"
+	return "observers " + strings.Join(observers, ",") + "' failing runs began after the fence (each saw the host answer, or its own daemon restarted)"
 }
 
 // healthRead is one read of host_health about a host (readHostHealth), the
@@ -2751,7 +2787,7 @@ func (c *Coordinator) noteConfirmationStale(host string, confirm fenceRecord, wh
 		return
 	}
 	c.confirmStale[host] = confirm.ID
-	slog.Warn("failover: the host has been seen up since the operator confirmed it off, NOT resuming on the confirmation",
+	slog.Warn("failover: the operator confirmation does not stand for this outage, NOT acting on it",
 		"host", host, "confirmation", confirm.ID, "confirmed_at", confirm.TS, "reason", why, "hint", hint)
 	c.mAttempt(PhaseRecovery, ResultRefused, ErrManualUnconfirmed)
 }
@@ -3445,6 +3481,9 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// build would not record so. A host already 'offline' is not written
 	// again: that would move the moment its current life began
 	// (corrosion.HostFenceLife) past the fence it is recovering on.
+	// The host's current life is read first: recording it 'offline' ends the
+	// life fenceRowCutoff measures (confirmedOffNow).
+	life, lifeKnown := c.fenceRowCutoff(ctx, h.Name)
 	if fenceRecordState(h, fr, latched) != "fenced" && h.State != "offline" {
 		c.markHostState(ctx, h.Name, "offline")
 	}
@@ -3459,7 +3498,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// unless the host explicitly opts into legacy proceed-anyway. Pre-flip (token
 	// not enforced) this is a no-op, so a mixed-version roll keeps today's behavior.
 	if fenceWasBestEffort(fr.Method, ranUnder) && c.safeFenceRequiresProof(ctx, h) {
-		if !c.manualFenceConfirmed(ctx, h.Name) {
+		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
+			if why != "" {
+				return // refused with its remedy (noteConfirmationStale)
+			}
 			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,
 				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
@@ -3481,7 +3523,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// A confirmation written AFTER this refusal is picked up by the fence loop
 	// (resumeFromConfirmation), which resumes the recovery from it.
 	if requiresFenceConfirmation(h) && fr.Success && !fr.ProvedOff() {
-		if !c.manualFenceConfirmed(ctx, h.Name) {
+		if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
+			if why != "" {
+				return // refused with its remedy (noteConfirmationStale)
+			}
 			slog.Error("failover: host requires a verified fence and this one was not verified, NOT rescheduling",
 				"host", h.Name, "method", fr.Method, "detail", fr.Detail,
 				"label", corrosion.LabelFenceRequiresConfirmation,
@@ -3510,7 +3555,10 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 				"host", h.Name, "detail", fr.Detail)
 			c.mAttempt(PhaseSplitBrain, ResultOK, ErrBestEffort)
 		case "manual":
-			if !c.manualFenceConfirmed(ctx, h.Name) {
+			if why, ok := c.confirmedOffNow(ctx, h.Name, life, lifeKnown); !ok {
+				if why != "" {
+					return // refused with its remedy (noteConfirmationStale)
+				}
 				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
 					"host", h.Name, "detail", fr.Detail,
 					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")

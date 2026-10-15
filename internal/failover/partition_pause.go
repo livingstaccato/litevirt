@@ -48,7 +48,8 @@ func (c *Coordinator) mono() time.Time {
 // relyOnPartitionPause reports whether this coordinator may rely on h pausing
 // itself: the predicate (flag && partition_pause_v1 latched) holds, and the
 // host has no open partition_pause_failed in this replica. A read error does
-// not rely (§4.3).
+// not rely (§4.3). Why it does not rely is logged once per host and reason
+// (noteNotRelying), not on every cycle that asks.
 func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.HostRecord) bool {
 	if c.PartitionPauseEnforced == nil || !c.PartitionPauseEnforced(ctx) {
 		return false
@@ -57,22 +58,42 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	// changes only with a restart, and the probe reaches each run within a
 	// probe interval, which a cached Ping does not (§4.3).
 	if c.PeerPausesOnLoss == nil || !c.PeerPausesOnLoss(h.Name) {
-		slog.Warn("failover: the host's latest probe answer did not say it pauses on losing the majority; not relying on its pause",
-			"host", h.Name)
+		c.noteNotRelying(h.Name, "no_word", func() {
+			slog.Warn("failover: the host's latest probe answer did not say it pauses on losing the majority; not relying on its pause",
+				"host", h.Name)
+		})
 		return false
 	}
 	failed, err := corrosion.HostPartitionPauseFailed(ctx, c.db, h.Name)
 	if err != nil {
-		slog.Warn("failover: could not read whether the host's partition pause failed; not relying on it",
-			"host", h.Name, "error", err)
+		c.noteNotRelying(h.Name, "read_error", func() {
+			slog.Warn("failover: could not read whether the host's partition pause failed; not relying on it",
+				"host", h.Name, "error", err)
+		})
 		return false
 	}
 	if failed {
-		slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
-			"host", h.Name)
+		c.noteNotRelying(h.Name, "pause_failed", func() {
+			slog.Warn("failover: the host reported its partition pause FAILED; recovering on the best-effort fence alone, as without partition pause",
+				"host", h.Name)
+		})
 		return false
 	}
+	delete(c.notRelying, h.Name)
 	return true
+}
+
+// noteNotRelying runs log when host's reason for not relying on its pause is
+// new: it differs from the last one logged, or the pause was relied on since.
+func (c *Coordinator) noteNotRelying(host, reason string, log func()) {
+	if c.notRelying == nil {
+		c.notRelying = map[string]string{}
+	}
+	if c.notRelying[host] == reason {
+		return
+	}
+	c.notRelying[host] = reason
+	log()
 }
 
 // reliesOnPauseIfAssumed is relyOnPartitionPause, decided BEFORE a fence of h

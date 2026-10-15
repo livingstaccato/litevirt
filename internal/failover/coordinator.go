@@ -897,7 +897,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		afresh := false
 		if c.fenced[target] {
 			// A recovery a disarm held after its fence continues here.
-			if c.resumeHAHeldRecovery(ctx, target) {
+			if c.resumeHAHeldRecovery(ctx, target, cand.Observers) {
 				continue
 			}
 			// A recovery waiting out the host's partition pause continues

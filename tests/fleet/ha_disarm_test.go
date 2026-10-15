@@ -219,7 +219,12 @@ func TestHADisarm_Fleet_DisarmHoldsArmFences(t *testing.T) {
 		t.Fatalf("%s fenced %d times while HA is disarmed", x.Name, n)
 	}
 
-	_, err := f.set(a, corrosion.HAArmed, false)
+	// The status lists exactly the host the lease holder then fences (m-4).
+	st, err := f.c.SelfClient(b).GetHAPolicy(ctx, &emptypb.Empty{})
+	if err != nil || len(st.GetWouldBeFenced()) != 1 || st.GetWouldBeFenced()[0] != x.Name {
+		t.Fatalf("would-be-fenced on %s: %v %v, want exactly %s", b.Name, st.GetWouldBeFenced(), err, x.Name)
+	}
+	_, err = f.set(a, corrosion.HAArmed, false)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), x.Name) {
 		t.Fatalf("arm with %s down: %v, want FailedPrecondition naming it", x.Name, err)
 	}
@@ -229,6 +234,9 @@ func TestHADisarm_Fleet_DisarmHoldsArmFences(t *testing.T) {
 	f.cs.Tick(ctx, a)
 	if n := f.fencesOf(x.Name); n != 1 {
 		t.Fatalf("%s fenced %d times after the arm, want 1", x.Name, n)
+	}
+	if all := f.cs.Fences(); len(all) != 1 {
+		t.Fatalf("fences after the arm: %+v, want exactly the listed host", all)
 	}
 	if vm := vmOn(t, a, "vm-x"); vm == nil || vm.HostName == x.Name {
 		t.Fatalf("vm-x not recovered after the arm: %+v", vm)
@@ -493,5 +501,34 @@ func TestHADisarm_Fleet_L1HoldsOnItsOwn(t *testing.T) {
 	f.cs.Tick(ctx, a)
 	if n := f.fencesOf(x.Name); n != 0 {
 		t.Fatalf("%s fenced %s while its own replica says disarmed", a.Name, x.Name)
+	}
+}
+
+// Review I-1: a lease holder whose replica lacks both the ha row and the
+// ha_disarm used record (a host absent at the first use, or added since) is
+// still held back by the live voters' disarm.
+//
+// Mutation: put the whole-L2 gate on the used record back — x fences d.
+func TestHADisarm_Fleet_CoordinatorWithoutTheUsedRecordIsVetoed(t *testing.T) {
+	ctx := context.Background()
+	f := newHAFleet(t, Options{Nodes: 5, FaultSeed: 1510})
+	a, b, e, x, d := f.c.Nodes[0], f.c.Nodes[1], f.c.Nodes[2], f.c.Nodes[3], f.c.Nodes[4]
+	x.HoldPolicyKey(t, "ha")
+	if _, err := f.set(a, corrosion.HADisarmed, false); err != nil {
+		t.Fatalf("disarm: %v", err)
+	}
+	info, _ := capabilities.LookupFeature(capabilities.FeatureHADisarm)
+	used := "release_feature/" + info.Token + "/" + string(capabilities.FeatureHADisarm)
+	x.HoldPolicyKey(t, "ha", used)
+	if err := localExec(ctx, x.DB, `DELETE FROM cluster_policies WHERE key = ?`, used); err != nil {
+		t.Fatal(err)
+	}
+	if present, _, _ := corrosion.ReleaseFeatureState(ctx, x.DB, info.Token, string(capabilities.FeatureHADisarm)); present {
+		t.Fatalf("precondition: %s still holds the used record", x.Name)
+	}
+	f.down(t, d, a, b, e, x)
+	f.cs.Tick(ctx, x)
+	if n := f.fencesOf(d.Name); n != 0 {
+		t.Fatalf("a lease holder without the used record fenced %s %d times during a confirmed disarm", d.Name, n)
 	}
 }

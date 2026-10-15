@@ -31,6 +31,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -163,7 +164,7 @@ func (c *Coordinator) haHold(ctx context.Context, target, site string) bool {
 	}
 	if vetoes[0].Rule == VetoNoQuorum {
 		c.mAttempt(PhaseQuorum, ResultRefused, ErrNoQuorum)
-		c.noteHAHold(target, "held: fewer than a majority of the voters for this decision are live")
+		c.noteHAHold(target, "held: fewer than a majority of the voters for this decision are counted live (lv cluster ha shows which are not)")
 	} else {
 		c.mAttempt(PhaseSkip, ResultSkipped, ErrHAPeerVeto)
 		c.noteHAHold(target, "recovery held: HA disarmed on a live voter ("+describeVetoes(vetoes)+")")
@@ -201,10 +202,16 @@ func (c *Coordinator) noteHAHeldRecovery(host string) {
 	c.ha.heldRecovery[host] = true
 }
 
-// resumeHAHeldRecovery resumes a recovery a hold interrupted, and reports
-// whether it did. Called from the fence loop only once haHold has passed for
-// the host.
-func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string) bool {
+// resumeHAHeldRecovery takes up a recovery a hold interrupted after its
+// fence, and reports whether it handled the host. Called from the fence loop
+// only once haHold has passed for the host. The fence it stood on may be
+// hours old: it is judged as every resume from a recorded fence is
+// (resumeActionFor) — resumed while it still stands and is fresh, fenced
+// again when a verified fence has aged, declined when it no longer stands.
+// Without a recorded successful fence (an operator's confirmation, a
+// best-effort fence that proceeded) it resumes only while the newest fence
+// attempt still stands.
+func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string, observers int) bool {
 	if !c.ha.heldRecovery[host] {
 		return false
 	}
@@ -215,6 +222,29 @@ func (c *Coordinator) resumeHAHeldRecovery(ctx context.Context, host string) boo
 	delete(c.ha.heldRecovery, host)
 	h, err := corrosion.GetHost(ctx, c.db, host)
 	if err != nil || h == nil {
+		return true
+	}
+	if rec, at, ok := c.recordedFence(ctx, h); ok {
+		switch act, why := c.resumeActionFor(ctx, host, rec, at); act {
+		case resumeFromRecord:
+			slog.Info("failover: HA armed again; resuming the recovery it held", "host", host, "fence_id", rec.ID)
+			c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "", c.fenceStateLatched(ctx))
+		case resumeAfterRefence:
+			slog.Info("failover: HA armed again; the fence the held recovery stood on has aged, fencing again", "host", host, "fence_id", rec.ID)
+			c.refence(ctx, h, rec, observers)
+		default:
+			c.noteResumeDeclined(host, rec, why)
+			c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
+		}
+		return true
+	}
+	_, at, ok := c.newestFenceAttempt(ctx, host)
+	if !ok {
+		c.noteHold(host, "recovery held by an HA disarm, and no fence of the host is on record")
+		return true
+	}
+	if why, stands := c.fenceStillStands(ctx, host, at); !stands {
+		c.noteHold(host, "recovery held by an HA disarm, and its fence no longer stands: "+why)
 		return true
 	}
 	slog.Info("failover: HA armed again; resuming the recovery it held", "host", host)
@@ -235,11 +265,10 @@ func describeVetoes(vs []haVeto) string {
 }
 
 // haFeatureUsed reports whether this replica holds the ha_disarm used record.
-// Until it does, no `ha` row can exist anywhere: the first write waits until
-// every voter and replication recipient, this node included, holds that
-// record. So the peer veto has nothing to protect before it, and is not
-// applied — which keeps a rolling upgrade INTO this build, whose older peers
-// answer without the HA fields, from holding every fence back. It latches.
+// Until it does, the peer veto's fail-safe rules (no_quorum, stale, unknown)
+// are not applied, which keeps a rolling upgrade INTO this build, whose older
+// peers answer without the HA fields, from holding every fence back. The
+// disarmed rule does not wait for it (haPeerVeto). It latches.
 func (c *Coordinator) haFeatureUsed(ctx context.Context) bool {
 	if c.ha.featureUsed.Load() {
 		return true
@@ -263,9 +292,16 @@ func (c *Coordinator) haFeatureUsed(ctx context.Context) bool {
 // cluster) by the voters this node counts live for its scope. own is this
 // node's policy row (armed, or L1 would have held). nil: no veto.
 func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosion.HAPolicy) []haVeto {
-	if c.PeerHAState == nil || !c.haFeatureUsed(ctx) {
+	if c.PeerHAState == nil {
 		return nil
 	}
+	// The disarmed rule always applies: only a build with the feature that
+	// holds a row can answer disarmed, so it cannot veto falsely during a
+	// rolling upgrade, and a coordinator whose replica lacks the used record
+	// (absent at the first use, or added since) is exactly the lagging one
+	// it exists for. The fail-safe rules — no_quorum, stale, unknown — wait
+	// for the used record: before it, older peers answer without the fields.
+	failSafe := c.haFeatureUsed(ctx)
 	voters := c.scope.vr.Voters
 	if target != "" {
 		voters = c.scope.voters(target)
@@ -275,7 +311,7 @@ func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosi
 	if c.LiveVoters != nil {
 		live = c.LiveVoters(voters, c.scope.vr.Uncounted)
 	}
-	if len(live) < needed {
+	if failSafe && len(live) < needed {
 		return []haVeto{{Rule: VetoNoQuorum}}
 	}
 	names := make([]string, 0, len(live))
@@ -296,14 +332,16 @@ func (c *Coordinator) haPeerVeto(ctx context.Context, target string, own corrosi
 		}
 		a, ok := c.PeerHAState(v)
 		switch {
+		case ok && a.Known && a.Disarmed && !(own.UpdatedAt != "" && corrosion.LWWNewer(own.UpdatedAt, a.PolicyAt)):
+			// A disarm not older than this node's row: no row here, a newer
+			// disarm, or the same timestamp with another state. Read
+			// whatever its age: an old disarm only holds back.
+			out = append(out, haVeto{Voter: v, Rule: VetoDisarmed, PolicyAt: a.PolicyAt})
+		case !failSafe:
 		case !ok || now.Sub(a.Asked) > window:
 			out = append(out, haVeto{Voter: v, Rule: VetoStale, PolicyAt: a.PolicyAt})
 		case !a.Known:
 			out = append(out, haVeto{Voter: v, Rule: VetoUnknown, PolicyAt: a.PolicyAt})
-		case a.Disarmed && !(own.UpdatedAt != "" && corrosion.LWWNewer(own.UpdatedAt, a.PolicyAt)):
-			// A disarm not older than this node's row: no row here, a newer
-			// disarm, or the same timestamp with another state.
-			out = append(out, haVeto{Voter: v, Rule: VetoDisarmed, PolicyAt: a.PolicyAt})
 		}
 	}
 	return out

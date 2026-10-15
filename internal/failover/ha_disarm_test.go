@@ -9,6 +9,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 )
@@ -650,6 +651,74 @@ func TestPeerVeto_NotAppliedBeforeTheFeatureIsUsed(t *testing.T) {
 	}
 	if got := rules(v.veto(corrosion.HAPolicy{State: corrosion.HAArmed})); got != "b=unknown,c=unknown" {
 		t.Fatalf("after the first use: vetoes %q, want both unknown", got)
+	}
+}
+
+// Review I-1: a coordinator whose replica lacks the used record — a host
+// absent at the first use, or added since — still honours a live voter's
+// disarm. Only a build with the feature that holds a row can answer
+// disarmed, so the rule cannot veto falsely during a rolling upgrade; the
+// fail-safe rules (stale, unknown, no_quorum) stay off until the record is
+// here.
+//
+// Mutation: put the whole-L2 gate back — the disarm passes and this goes red.
+func TestPeerVeto_DisarmedVetoesBeforeTheFeatureIsUsed(t *testing.T) {
+	v := newVetoCoord(t)
+	v.ha.featureUsed.Store(false)
+	v.setLive("a", "b", "c")
+	v.answers["b"] = PeerHAAnswer{Asked: v.now.Add(-time.Hour)} // old and unknown: not a veto yet
+	v.answers["c"] = PeerHAAnswer{Asked: v.now.Add(-time.Hour), Known: true, Disarmed: true, PolicyAt: rfc(v.now)}
+	if got := rules(v.veto(corrosion.HAPolicy{State: corrosion.HAArmed})); got != "c=disarmed" {
+		t.Fatalf("no used record here: vetoes %q, want c=disarmed only", got)
+	}
+	// Fewer than a majority live, no used record: the disarm still vetoes.
+	v.setLive("a", "c")
+	if got := rules(v.veto(corrosion.HAPolicy{State: corrosion.HAArmed})); got != "c=disarmed" {
+		t.Fatalf("no used record, no majority: vetoes %q, want c=disarmed only", got)
+	}
+}
+
+// Review I-2: a recovery a disarm held after a verified fence is not resumed
+// on that fence once it has aged past recentFenceWindow: the host is fenced
+// again before anything moves, as every other resume from a recorded fence.
+//
+// Mutation: resume the held recovery directly on the original fence — one
+// fence, the VM moves, and this goes red.
+func TestHADisarm_HeldRecoveryIsRefencedWhenItsFenceAged(t *testing.T) {
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	moved := -1
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		if moved < 0 && vmHost(t, db, ctx) != "down" {
+			moved = fences
+		}
+		return fence.Result{Method: "ipmi", Detail: "verified off", Success: true}
+	})
+	c.ha.beforeHold = func(site string) {
+		if site == haSiteRecovery {
+			setHA(t, db, corrosion.HADisarmed)
+			c.ha.beforeHold = nil
+		}
+	}
+	c.run(ctx)
+	if fences != 1 || vmHost(t, db, ctx) != "down" || !c.ha.heldRecovery["down"] {
+		t.Fatalf("fenced then disarmed: %d fences, VM on %q, held=%v", fences, vmHost(t, db, ctx), c.ha.heldRecovery)
+	}
+	// The disarm lasted past recentFenceWindow; the host stayed down.
+	ageFenceRows(t, db, ctx, recentFenceWindow+time.Minute)
+	lengthenStreak(t, db, ctx, recentFenceWindow+2*time.Minute)
+	setHA(t, db, corrosion.HAArmed)
+	c.run(ctx)
+	if fences != 2 {
+		t.Fatalf("after the arm: %d fences, want the aged fence renewed (2) before any recovery", fences)
+	}
+	if moved != -1 {
+		t.Fatalf("the VM moved before the re-fence (at fence %d)", moved)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("after the re-fence the VM is on %q, want alive", got)
 	}
 }
 

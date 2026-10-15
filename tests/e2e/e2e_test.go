@@ -41,6 +41,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	lvcompose "github.com/litevirt/litevirt/internal/compose"
 )
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -2170,8 +2172,13 @@ func waitCloudInit(t *testing.T, vmName string, timeout time.Duration) {
 }
 
 // getVMIP retrieves the IP address for a VM on a given network by parsing lv inspect output.
-func getVMIP(t *testing.T, vmName, networkName string) string {
+func getVMIP(t *testing.T, vmName, stackName, networkName string) string {
 	t.Helper()
+	// A network a stack declares is stored, and reported by lv inspect, under
+	// its stack-scoped name: "<stack>_<name>". Matching the bare name finds
+	// nothing; matching a suffix would find another stack's network of the
+	// same name.
+	scoped := lvcompose.ScopedNetworkName(stackName, networkName)
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := lvErr(t, "inspect", vmName)
@@ -2179,30 +2186,34 @@ func getVMIP(t *testing.T, vmName, networkName string) string {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(out), &obj); err != nil {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		ifaces, ok := obj["interfaces"].([]any)
-		if !ok {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		for _, iface := range ifaces {
-			m, ok := iface.(map[string]any)
-			if !ok {
-				continue
-			}
-			if m["networkName"] == networkName || m["network_name"] == networkName {
-				if ip, ok := m["ip"].(string); ok && ip != "" {
-					return ip
-				}
-			}
+		if ip := inspectNICIP(out, scoped); ip != "" {
+			return ip
 		}
 		time.Sleep(5 * time.Second)
 	}
-	t.Fatalf("could not get IP for %s on network %s within 60s", vmName, networkName)
+	t.Fatalf("could not get IP for %s on network %s within 60s", vmName, scoped)
+	return ""
+}
+
+// inspectNICIP is the address `lv inspect` output records for the VM's NIC on
+// the network stored as exactly network, or "" when there is none (yet).
+func inspectNICIP(inspectJSON, network string) string {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(inspectJSON), &obj); err != nil {
+		return ""
+	}
+	ifaces, _ := obj["interfaces"].([]any)
+	for _, iface := range ifaces {
+		m, ok := iface.(map[string]any)
+		if !ok {
+			continue
+		}
+		if m["networkName"] == network || m["network_name"] == network {
+			if ip, ok := m["ip"].(string); ok && ip != "" {
+				return ip
+			}
+		}
+	}
 	return ""
 }
 
@@ -2313,7 +2324,7 @@ vms:
 	waitCloudInit(t, vmName, 3*time.Minute)
 
 	t.Run("VMGetsIP", func(t *testing.T) {
-		ip := getVMIP(t, vmName, "brnet")
+		ip := getVMIP(t, vmName, stackName, "brnet")
 		if !strings.HasPrefix(ip, "172.40.0.") {
 			t.Errorf("expected IP in 172.40.0.0/24, got %s", ip)
 		}
@@ -2392,7 +2403,7 @@ vms:
 	waitCloudInit(t, vm2Name, 3*time.Minute)
 
 	t.Run("VXLAN/InterVMPing", func(t *testing.T) {
-		vm2IP := getVMIP(t, vm2Name, "vxnet")
+		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
 		t.Logf("vm2 VXLAN IP: %s", vm2IP)
 		out, err := execRetry(t, vm1Name, "ping", "-c", "3", "-W", "5", vm2IP)
 		if err != nil {
@@ -2401,7 +2412,7 @@ vms:
 	})
 
 	t.Run("VXLAN/InterVMHTTP", func(t *testing.T) {
-		vm2IP := getVMIP(t, vm2Name, "vxnet")
+		vm2IP := getVMIP(t, vm2Name, stackName, "vxnet")
 		out, err := execRetry(t, vm1Name, "curl", "-s", "--connect-timeout", "10", fmt.Sprintf("http://%s:8080/index.html", vm2IP))
 		if err != nil {
 			t.Fatalf("curl from %s to %s:8080 failed: %v", vm1Name, vm2IP, err)
@@ -2413,7 +2424,7 @@ vms:
 	})
 
 	t.Run("Isolated/InterVMPing", func(t *testing.T) {
-		vm2IP := getVMIP(t, vm2Name, "isonet")
+		vm2IP := getVMIP(t, vm2Name, stackName, "isonet")
 		t.Logf("vm2 isolated IP: %s", vm2IP)
 		out, err := execRetry(t, vm1Name, "ping", "-c", "3", "-W", "5", vm2IP)
 		if err != nil {
@@ -2943,7 +2954,7 @@ func sgChainOrdered(chain string, observe bool) error {
 
 // pureTests are the tests that touch no cluster and no lv, and so are the only
 // ones LITEVIRT_E2E_UNIT=1 may run.
-var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict"}
+var pureTests = []string{"TestSGChainOrdered", "TestUnitRunAllowed", "TestEnforcementEditScript", "TestJoinMajority", "TestUsbHostdevPattern", "TestInspectFenceStrategy", "TestKnownAuditFork", "TestMinorityCopyStopped", "TestConditionsSince", "TestEnforcementEditScriptRefusesAnInlineBlock", "TestParseClaimView", "TestParseLogLines", "TestMailpitMatches", "TestCutPlan", "TestHoldersBetween", "TestTenureAt", "TestMintTime", "TestParseEnforcementGauges", "TestLeaseTermModeOf", "TestLeaseTermExpectFor", "TestW4aVerdict", "TestFreshTenureAt", "TestLeaseTermRefusalPattern", "TestInertJournalVerdict", "TestRefusalVerdict", "TestInspectNICIP"}
 
 // unitRunAllowed reports whether a -test.run pattern selects only pureTests:
 // the exact form ^(A|B)$ or ^A$, with every name pure.

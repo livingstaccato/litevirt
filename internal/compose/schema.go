@@ -142,6 +142,25 @@ type NetworkDef struct {
 	NetBoxPrefixID int `yaml:"netbox-prefix-id"`
 }
 
+// HostIsolatedAddressable reports whether litevirt itself gives the
+// addresses of the network's guests that name none: a host-isolated network
+// runs no DHCP server on any host, so its guests are addressed through
+// cloud-init from the network's subnet. IPv4 subnets on the types litevirt
+// addresses; sriov and direct attach guests to hardware litevirt does not
+// address, and a NetBox-bound network's addresses are NetBox's.
+func (n NetworkDef) HostIsolatedAddressable() bool {
+	if !n.HostIsolation || n.Subnet == "" || n.NetBoxPrefixID != 0 {
+		return false
+	}
+	switch n.Type {
+	case "", "bridge", "vxlan", "isolated":
+	default:
+		return false
+	}
+	p, err := netip.ParsePrefix(strings.TrimSpace(n.Subnet))
+	return err == nil && p.Addr().Is4()
+}
+
 // LitevirtGateway is the address litevirt itself puts on the network's bridge
 // — the subnet's first host — on a network whose dnsmasq or router litevirt
 // runs: one it serves DHCP for (where guests send DHCP and DNS), or routes (a

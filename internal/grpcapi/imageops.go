@@ -127,6 +127,12 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	if err := qcow2.AssertStandalone(tmpFile.Name()); err != nil {
 		return status.Errorf(codes.InvalidArgument, "image %q: %v", name, err)
 	}
+	// An image qemu would refuse as corrupt — an lv image build of a disk
+	// over 512 MiB from before that was fixed — is refused here, by name,
+	// before anything is published: an import, a push, or a peer's heal.
+	if err := qcow2.AssertAligned(tmpFile.Name()); err != nil {
+		return status.Errorf(codes.InvalidArgument, "image %q: %v", name, err)
+	}
 
 	// Publish. A re-import of a name disks are built on is a refresh: a new
 	// version for new disks, never a write over the file existing disks are

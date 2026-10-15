@@ -6,8 +6,13 @@ import (
 	"os"
 )
 
+// checkModelledIncompat is the incompatible feature bits Check's layout model
+// holds for: dirty (0), corrupt (1) and compression type (3).
+const checkModelledIncompat = 1<<0 | 1<<1 | 1<<3
+
 // Check validates the internal consistency of a qcow2 file: magic/version,
-// L1/L2 table bounds, backing-file metadata, and — reconstructed from the active
+// L1/L2 table bounds, cluster alignment of every table and standard data
+// cluster (ErrMisaligned), backing-file metadata, and — reconstructed from the active
 // L1/L2/data plus the refcount metadata — that every referenced cluster's recorded
 // refcount matches its reference count.
 //
@@ -46,17 +51,33 @@ func Check(path string) error {
 	if h.Size == 0 {
 		return fmt.Errorf("virtual size is 0")
 	}
+	// The walk below models the standard layout. An incompatible feature
+	// that changes it (an external data file, extended L2 entries) would be
+	// misread — a subcluster bitmap taken for an offset, say — and blamed on
+	// the wrong cause, so it is refused by name. Dirty, corrupt and the
+	// compression type leave the layout as it is.
+	if h.Version >= 3 {
+		if other := h.IncompatibleFeatures &^ checkModelledIncompat; other != 0 {
+			return fmt.Errorf("unsupported qcow2 incompatible features %#x: this check does not model them", other)
+		}
+	}
 	if h.RefcountOrder > 6 {
 		return fmt.Errorf("invalid refcount_order %d", h.RefcountOrder)
 	}
 
 	l1Bytes := uint64(h.L1Size) * 8
 
-	// Validate refcount table is within file bounds.
-	rcTableBytes := uint64(h.RefcountTableClusters) * clusterSize
-	if h.RefcountTableOffset+rcTableBytes > fileSize {
-		return fmt.Errorf("refcount table extends beyond file")
+	// Every table and data cluster sits on a cluster boundary (qcow2 spec).
+	// The refcount model below cannot see a violation — it marks the cluster
+	// an offset starts in, the same way the writer does — so a compressed
+	// convert that put L2 tables at sector offsets passed this check while
+	// qemu refused the image. Judged first, so the report names the cause.
+	// This also bounds the refcount table (by the file and qemu's limit)
+	// before it is read below.
+	if err := checkTableAlignment(f, h, fileSize); err != nil {
+		return err
 	}
+	rcTableBytes := uint64(h.RefcountTableClusters) * clusterSize
 
 	refcountBits := uint32(1) << h.RefcountOrder
 	entriesPerBlock := clusterSize * 8 / uint64(refcountBits)
@@ -126,7 +147,10 @@ func Check(path string) error {
 				offsetMask := (uint64(1) << csizeShift) - 1
 				sectors := ((l2Entry >> csizeShift) & csizeMask) + 1
 				hostOffset := l2Entry & offsetMask
-				endByte := hostOffset + sectors*512
+				// qemu's extent: the sectors counted from the one the run
+				// starts in, less the bytes of it before the run. qemu
+				// packs runs at byte offsets; this writer at sector ones.
+				endByte := hostOffset + sectors*512 - hostOffset&511
 				if endByte > fileSize {
 					return fmt.Errorf("L2[%d][%d] compressed data at %d+%d exceeds file",
 						i, j, hostOffset, sectors*512)
@@ -138,6 +162,10 @@ func Check(path string) error {
 				}
 			} else {
 				hostOffset := l2Entry & 0x00fffffffffffe00
+				if hostOffset%clusterSize != 0 {
+					return misaligned("L2[%d][%d] names a data cluster at %#x, not a multiple of the %d-byte cluster size",
+						i, j, hostOffset, clusterSize)
+				}
 				if hostOffset > 0 {
 					if hostOffset+clusterSize > fileSize {
 						return fmt.Errorf("L2[%d][%d] data cluster at %d exceeds file",

@@ -339,5 +339,10 @@ func download(dir, pattern, what, rawURL, checksum string, opts PullOptions, pro
 	if err := qcow2.AssertStandalone(tmpPath); err != nil {
 		return "", "", 0, fmt.Errorf("image %q: %w", what, err)
 	}
+	// One qemu would refuse as corrupt (an old lv image build's output)
+	// is refused on arrival, by name, not handed to the guests built on it.
+	if err := qcow2.AssertAligned(tmpPath); err != nil {
+		return "", "", 0, fmt.Errorf("image %q: %w", what, err)
+	}
 	return tmpPath, hex.EncodeToString(hasher.Sum(nil)), downloaded, nil
 }

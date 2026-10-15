@@ -121,6 +121,11 @@ var releaseFeatures = map[Feature]FeatureInfo{
 	FeatureHADisarm:        {Token: Release202611V1, Description: "Cluster-wide HA disarm: the replicated policy that holds automatic fencing and recovery"},
 	FeatureNICMTU:          {Token: Release202611V1, Description: "Per-NIC MTU", Writers: []string{"internal/corrosion.InsertVMWithReleaseFeatures", "internal/corrosion.MutateDesiredSpecWithReleaseFeatures"}},
 	FeatureReplicationRate: {Token: Release202611V1, Description: "Per-schedule replication bandwidth limits", Writers: []string{"internal/corrosion.SetReplicationRate"}},
+
+	// The firewall extras.
+	FeatureFirewallSynflood:  {Token: Release202611V1, Description: "SYN-flood protection on guest NICs: the cluster and per-host policy (recorded on for a cluster founded by this release)"},
+	FeatureFirewallLog:       {Token: Release202611V1, Description: "Firewall logging: logged rules and the cluster and per-host log policy"},
+	FeatureFirewallTagGroups: {Token: Release202611V1, Description: "Firewall tag groups, per-workload firewall tags, and rules matching a tag group's addresses"},
 }
 
 // containerReplicationWriters write container_replication's data: a container's
@@ -172,6 +177,10 @@ const (
 	FeatureHADisarm             Feature = "ha_disarm"
 	FeatureNICMTU               Feature = "nic_mtu"
 	FeatureReplicationRate      Feature = "replication_rate"
+
+	FeatureFirewallSynflood  Feature = "firewall_synflood"
+	FeatureFirewallLog       Feature = "firewall_log"
+	FeatureFirewallTagGroups Feature = "firewall_tag_groups"
 )
 
 // LookupFeature returns a declared feature's token and description.

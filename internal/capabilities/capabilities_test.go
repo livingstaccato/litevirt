@@ -306,7 +306,8 @@ func TestGrantMinter_ClaimedOnce(t *testing.T) {
 // change: it is only ever right before that release has shipped, as one
 // reviewed change to releaseFeatures and to this pin together.
 // (release_2026_11_v1 gained nic_guards and redfish_fence that way, and later
-// ha_disarm, nic_mtu and replication_rate, before it shipped.)
+// ha_disarm, nic_mtu and replication_rate, and then firewall_synflood, firewall_log
+// and firewall_tag_groups, before it shipped.)
 var frozenReleaseFeatures = map[string][]Feature{
 	Release202611V1: {
 		"backup_zstd",
@@ -314,6 +315,9 @@ var frozenReleaseFeatures = map[string][]Feature{
 		"drain_failback",
 		"email_target_secret",
 		"firewall_ipv6",
+		"firewall_log",
+		"firewall_synflood",
+		"firewall_tag_groups",
 		"ha_disarm",
 		"iscsi_lun_claim",
 		"login_policy",

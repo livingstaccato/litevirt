@@ -59,6 +59,12 @@ import (
 //     holder's replica, ha.recovery.bridged resolves with "the partition-pause
 //     deadline went ahead" (partition_pause.go:192, bridged_stall.go:246), and
 //     the VM executes on the majority — never before P2.
+//   - Heal: no claim was decided, so P2's proof has no certificate and settle
+//     leaves V's copy paused (partition-pause.md F9). V raises
+//     vm_settle_declined with reason class proof_uncertified, the copy stays
+//     paused and never runs, and the drill then applies the decline's remedy
+//     (virsh destroy on V once the replacement runs); the leftover cleanup
+//     removes the domain and keeps its disks.
 //
 // The baseline voter generation is put back with `lv cluster voter init` once
 // the replacement's proof completed (restore does it too, on failure).
@@ -247,6 +253,9 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 		if !l.waitProofStatus(q, ps[0].ID, "completed", 2*time.Minute) {
 			t.Errorf("P2: proof %s never completed (status %q)", ps[0].ID, l.proofStatus(q, ps[0].ID))
 		}
+		if ps[0].Cert != "" {
+			t.Errorf("P2: proof %s carries a certificate on a derived voter set, which decides no claim", ps[0].ID)
+		}
 		if created, ok := corrosion.ParseUpdatedAt(ps[0].Created); ok && !tw.IsZero() {
 			lat := created.Sub(tw)
 			l.mark("w1: recovery decided %v after %s's failing row reached the holder", lat.Round(time.Second), W)
@@ -269,19 +278,71 @@ func TestDrillW1_WitnessBridgedStall(t *testing.T) {
 		recovered = at
 	}
 
-	// ── heal and settle ─────────────────────────────────────────────────────
+	// ── heal: the paused duplicate stays paused, declined as uncertified ────
+	// A derived voter set decides no claim, so P2's proof carries no
+	// certificate, and settle acts only on one (partition-pause.md §6, F9): V's
+	// copy stays paused and never runs, and V raises vm_settle_declined with
+	// reason class proof_uncertified. The drill then applies the remedy that
+	// decline names, the operator's way to settle it today.
 	healed := l.heal()
-	if at, ok := waitEach(s, healed, settleBy, keys, func(r round, k string) bool {
-		st := r.state(V, k)
+	dest := ""
+	if hs := s.last().executing(key); len(hs) == 1 {
+		dest = hs[0]
+	}
+	declined := false
+	for deadline := time.Now().Add(settleBy); time.Now().Before(deadline); time.Sleep(5 * time.Second) {
+		lc, ev, raw, ok := l.vmSettleDeclined(V, test, V)
+		if !ok || lc != "confirmed" || ev.ReasonClass != "proof_uncertified" {
+			continue
+		}
+		declined = true
+		at := l.mark("w1: %s vm_settle_declined on %s at heal+%v: %s", key, V, time.Since(healed).Round(time.Second), ev.Reason)
+		l.saveEvidence("settle-declined-"+V+"-"+at.UTC().Format("150405")+".json", raw)
+		if err := uncertifiedDeclineVerdict(ev, test, dest); err != nil {
+			t.Errorf("%s: vm_settle_declined on %s: %v", key, V, err)
+		}
+		break
+	}
+	if !declined {
+		lc, ev, _, _ := l.vmSettleDeclined(V, test, V)
+		t.Errorf("%s: no vm_settle_declined (proof_uncertified) on %s within %v of the heal; last %q %+v", key, V, settleBy, lc, ev)
+	}
+	time.Sleep(tPause + 10*time.Second)
+	for _, r := range s.snapshot() {
+		if r.At.Before(healed) {
+			continue
+		}
+		if _, d := r.Down[V]; d {
+			continue
+		}
+		if hs := r.executing(key); contains(hs, V) || len(hs) != 1 || !pausedState(r.state(V, key)) {
+			t.Errorf("%s: after the heal it is %q on %s and executes on %v at %s; want paused on %s and executing on one majority host\n  %s",
+				key, r.state(V, key), V, hs, r.At.UTC().Format("15:04:05.000"), V, r)
+			break
+		}
+	}
+
+	// The remedy: the replacement runs on dest by its own runtime (the
+	// sampler reads virsh there), so the paused copy on V is a superseded
+	// duplicate; destroy it, and the leftover cleanup undefines it, keeping
+	// its disks.
+	if dest == "" || !contains(s.last().executing(key), dest) {
+		t.Fatalf("%s: no single executing replacement to confirm the remedy against\n  %s", key, s.last())
+	}
+	destroyed := l.mark("w1: remedy: virsh destroy %s on %s (replacement executing on %s)", test, V, dest)
+	if out, err := l.ssh(V, 30*time.Second, "virsh -c qemu:///system destroy "+shellQuote(test)); err != nil {
+		t.Errorf("%s: virsh destroy on %s: %v\n%s", key, V, err, out)
+	}
+	if at, ok := waitEach(s, destroyed, settleBy, keys, func(r round, k string) bool {
 		_, down := r.Down[V]
-		return !down && st != "running" && st != "paused" && st != "frozen"
+		return !down && r.state(V, k) == ""
 	})[key]; !ok {
-		t.Errorf("%s: the superseded copy on %s was not stopped within %v of the heal\n  %s", key, V, settleBy, s.last())
+		t.Errorf("%s: the destroyed copy on %s was not cleaned up within %v\n  %s", key, V, settleBy, s.last())
 	} else {
-		l.mark("w1: %s settled on %s at heal+%v", key, V, at.Sub(healed).Round(time.Second))
+		l.mark("w1: %s cleaned up on %s at destroy+%v", key, V, at.Sub(destroyed).Round(time.Second))
 		for _, d := range vrec.Disks {
 			if !l.fileExists(V, d.Path) {
-				t.Errorf("%s: settle on %s deleted disk %s", key, V, d.Path)
+				t.Errorf("%s: the cleanup on %s deleted disk %s", key, V, d.Path)
 			}
 		}
 	}
@@ -849,10 +910,14 @@ func TestDrillW4b_ClaimRetryOwedToTheLastOutage(t *testing.T) {
 //     replacement before (F−1)·P + W, nor before a successor's own wait
 //     (coordinator.go:1013); restoring its clock logs the local stall
 //     (health/stall.go:120).
-//   - voter_forward_45s: a majority voter steps forward 45 s 3 s after the cut.
-//     It logs the local stall and opens observer_stalled; the holder ignores
-//     its future-dated rows (coordinator.go:821); recovery in the normal
-//     window (+15 s with hlc_lww_v1), never before (F−1)·P + W.
+//   - voter_forward_32s: a majority voter steps forward 32 s 3 s after the cut.
+//     It logs the local stall and opens observer_stalled, and never holds the
+//     failover lease while it is ahead; a non-skewed holder ignores
+//     future-dated rows about the victim (coordinator.go:836) — from any
+//     observer, since every node's updated_at follows the skewed voter's HLC
+//     physical (corrosion NowWallTS floor). Its clock is then restored, and
+//     the recovery comes within the normal window plus the step after that
+//     (+15 s more with hlc_lww_v1), never before (F−1)·P + W.
 //   - victim_back_60s_bridged: the victim steps back 60 s, then is cut from
 //     every worker (SSH from everyone) and left reaching the witness. The
 //     deadline refuses, bridged, with derived_voter_set=false, because its
@@ -873,7 +938,7 @@ func TestDrillW5_ClockSteps(t *testing.T) {
 	}
 	var used []string
 	l.sub(t, "holder_back_20s", func() { used = append(used, l.w5HolderBack(w, used)) })
-	l.sub(t, "voter_forward_45s", func() { used = append(used, l.w5VoterForward(w, used)) })
+	l.sub(t, "voter_forward_32s", func() { used = append(used, l.w5VoterForward(w, used)) })
 	l.sub(t, "victim_back_60s_bridged", func() { l.w5VictimBackBridged(w, mp, mail, used) })
 }
 
@@ -1043,6 +1108,16 @@ func (l *lab) w5HolderBack(w witnessTopology, used []string) string {
 	return v
 }
 
+// w5VoterStep is how far voter_forward steps a majority voter's clock. It
+// must exceed healthFreshness (30 s), or no row is future-dated and nothing is
+// ignored, and stay below leaseDuration − leaseRenewBefore (45 s − 10 s =
+// 35 s, failover/coordinator.go), or the voter reads the live lease as lapsed
+// within a renewal cycle and takes it, so the subtest observes the skewed
+// node as holder instead of a holder ignoring it. The window is only 5 s wide,
+// so the subtest is timing-sensitive: rows replicate in about a second, and an
+// observer's row about the victim arrives that much less far ahead.
+const w5VoterStep = 32 * time.Second
+
 func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	t := l.t
 	v, q := l.w5Begin(used)
@@ -1065,11 +1140,15 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	since := l.nodeNow(q)
 	s := l.startCheckedSampler()
 	waitAllAt(t, s, keys, v)
+	// The lease is read on the nodes whose replicas apply and whose clocks
+	// are true: not the victim, not x.
+	lw := l.watchLease(l.allBut(v, x))
 	start, _ := l.partition([]string{v}, l.except(v))
 	time.Sleep(time.Until(start.Add(3 * time.Second)))
-	l.stepClock(x, 45*time.Second)
+	stepped := time.Now()
+	l.stepClock(x, w5VoterStep)
 	if _, _, ok := l.waitLogLine([]string{x}, since, regexp.QuoteMeta(notRunningMsg), time.Time{}, nil, time.Minute); !ok {
-		t.Errorf("%s did not log the local stall after stepping forward 45 s (health/stall.go:120)", x)
+		t.Errorf("%s did not log the local stall after stepping forward %v (health/stall.go:120)", x, w5VoterStep)
 	}
 	stalled := false
 	for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline) && !stalled; time.Sleep(3 * time.Second) {
@@ -1079,10 +1158,28 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	if !stalled {
 		t.Errorf("no %s for %s since %s", health.CondObserverStalled, x, since)
 	}
-	if _, _, ok := l.waitLogLine(l.allBut(v, x), since, journalPair("ignoring a future-dated health observation", "observer", x), time.Time{}, nil, 2*time.Minute); !ok {
-		t.Errorf("no holder ignored %s's future-dated rows (coordinator.go:821)", x)
+	// Any observer's row, not only x's: replication carries x's HLC physical
+	// to every node, and NowWallTS floors each stamp above it, so every
+	// observer's row about v is stamped about as far ahead as x's.
+	if _, _, ok := l.waitLogLine(l.allBut(v, x), since, journalPair("ignoring a future-dated health observation", "target", v), time.Time{}, nil, 2*time.Minute); !ok {
+		t.Errorf("no non-skewed holder ignored a future-dated row about %s (coordinator.go:836)", v)
 	}
-	bound := recoverBy
+	// While x is ahead, every observer's row about v is future-dated on a
+	// holder with a true clock, so no fence quorum forms (the gap
+	// TestFleet_ForwardSkewedVoterDoesNotBlindTheHolder documents). Restore x
+	// now that the holder has shown it ignores them; the rows stamped ahead
+	// count again once the holder's clock reaches them, so the recovery may
+	// come up to the step after the restore.
+	l.restoreClock(x)
+	restored := time.Now()
+	for _, h := range holdersBetween(lw, stepped, restored) {
+		if h == x {
+			t.Errorf("%s held the failover lease while its clock was %v ahead (%v)", x, w5VoterStep, lw.history())
+			break
+		}
+	}
+	lw.Stop()
+	bound := restored.Sub(start) + recoverBy + w5VoterStep
 	if w.hlc {
 		bound += 15 * time.Second
 	}
@@ -1091,7 +1188,8 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 		return len(hs) == 1 && hs[0] != v
 	})
 	if at, ok := recAt[keys[0]]; !ok {
-		t.Errorf("%s not recovered within %v (hlc_lww_v1 %v) with %s's clock 45 s ahead\n  %s", keys[0], bound, w.hlc, x, s.last())
+		t.Errorf("%s not recovered within %v of the cut (hlc_lww_v1 %v), %s's clock %v ahead until +%v\n  %s",
+			keys[0], bound, w.hlc, x, w5VoterStep, restored.Sub(start).Round(time.Second), s.last())
 	} else if d := at.Sub(start); d < earliestReplacement(l.total) {
 		t.Errorf("%s replacement at +%v, before (F−1)·P + W = %v", keys[0], d, earliestReplacement(l.total))
 	} else {
@@ -1100,10 +1198,9 @@ func (l *lab) w5VoterForward(w witnessTopology, used []string) string {
 	if ps := l.waitProofs(q, "vm", test, since, 1, time.Minute); len(ps) != 1 {
 		t.Errorf("%d recovery proofs for %s, want 1: %+v", len(ps), test, ps)
 	}
-	l.restoreClock(x)
 	if w.hlc {
 		// Rows stamped ahead stay ahead until the wall clock catches up.
-		time.Sleep(45*time.Second + 30*time.Second)
+		time.Sleep(w5VoterStep + 30*time.Second)
 	} else {
 		time.Sleep(30 * time.Second)
 	}

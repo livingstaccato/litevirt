@@ -129,3 +129,30 @@ func TestMinorityCopyStopped(t *testing.T) {
 		}
 	}
 }
+
+// TestUncertifiedDeclineVerdict: W1's heal accepts a decline only when it says
+// the move to the destination completed on an uncertified proof and its remedy
+// confirms the replacement by its runtime and stops the copy with virsh, never
+// by a claim a derived voter set did not decide.
+// Run with LITEVIRT_E2E_UNIT=1 (it needs no cluster).
+func TestUncertifiedDeclineVerdict(t *testing.T) {
+	good := settleDeclinedEv{ReasonClass: "proof_uncertified", RowHost: "node-3",
+		Reason: "proof p1 completed on node-3 but carries no recovery-claim certificate",
+		Remedy: "… `virsh domstate w1-1` on node-3 must report it running … `virsh destroy w1-1` …"}
+	if err := uncertifiedDeclineVerdict(good, "w1-1", "node-3"); err != nil {
+		t.Fatalf("a correct decline was refused: %v", err)
+	}
+	for name, mut := range map[string]func(*settleDeclinedEv){
+		"no_certificate":    func(e *settleDeclinedEv) { e.ReasonClass = "no_certificate" },
+		"another row host":  func(e *settleDeclinedEv) { e.RowHost = "node-4" },
+		"claim remedy":      func(e *settleDeclinedEv) { e.Remedy += " `lv cluster claim vm/w1-1`" },
+		"no runtime check":  func(e *settleDeclinedEv) { e.Remedy = "`virsh destroy w1-1`" },
+		"no destroy remedy": func(e *settleDeclinedEv) { e.Remedy = "`virsh domstate w1-1`" },
+	} {
+		ev := good
+		mut(&ev)
+		if err := uncertifiedDeclineVerdict(ev, "w1-1", "node-3"); err == nil {
+			t.Errorf("%s: accepted %+v", name, ev)
+		}
+	}
+}

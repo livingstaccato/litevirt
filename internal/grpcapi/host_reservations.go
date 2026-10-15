@@ -2,12 +2,12 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -18,18 +18,29 @@ import (
 const redactedVMName = `"<redacted>"`
 
 // hostReservations is InspectHost's reservation listing: every reservation
-// counted against host, and the totals admission subtracts. A row's vm and
-// project — and the workload name in its detail — are filled only when the
-// caller may vm.read that workload; the amounts, operation id and state are
-// always shown, so the rows add up to the totals for any viewer.
-func (s *Server) hostReservations(ctx context.Context, host string) ([]*pb.HostReservation, int32, int32, error) {
+// counted against host, and their totals — the figures admission subtracts,
+// summed from the listed rows themselves, so the two always agree. A row's vm
+// and project — and the workload name in its detail — are filled only when
+// the caller may vm.read that workload; the amounts, operation id and state
+// are always shown, so the rows add up to the totals for any viewer.
+//
+// When the reservations cannot be listed it returns no rows and a non-empty
+// errText naming why, and the caller still returns the rest of the host.
+func (s *Server) hostReservations(ctx context.Context, host string) (rows []*pb.HostReservation, cpu, mem int32, errText string) {
 	views, err := corrosion.HostReservations(ctx, s.db, host)
 	if err != nil {
-		return nil, 0, 0, status.Errorf(codes.Internal, "list host reservations: %v", err)
+		slog.Error("list host reservations", "host", host, "err", err)
+		return nil, 0, 0, err.Error()
 	}
-	cpu, mem, err := corrosion.HostReserved(ctx, s.db, host)
-	if err != nil {
-		return nil, 0, 0, status.Errorf(codes.Internal, "sum host reservations: %v", err)
+	var sumCPU, sumMem int64
+	for i := range views {
+		sumCPU += int64(views[i].Vector.TargetCPU)
+		sumMem += int64(views[i].Vector.TargetMemMiB)
+	}
+	if sumCPU > math.MaxInt32 || sumMem > math.MaxInt32 {
+		errText = fmt.Sprintf("reserved totals overflow (%d vCPU, %d MiB)", sumCPU, sumMem)
+		slog.Error("list host reservations", "host", host, "err", errText)
+		return nil, 0, 0, errText
 	}
 	now := time.Now()
 	out := make([]*pb.HostReservation, 0, len(views))
@@ -60,7 +71,7 @@ func (s *Server) hostReservations(ctx context.Context, host string) ([]*pb.HostR
 		}
 		out = append(out, r)
 	}
-	return out, int32(cpu), int32(mem), nil
+	return out, int32(sumCPU), int32(sumMem), ""
 }
 
 // hostReservationState is the state `lv host inspect` shows for a reservation

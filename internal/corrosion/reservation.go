@@ -289,7 +289,7 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[strin
 		}
 		rv, err := DecodeReservation(r.String("reservation_json"))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("reservation %s: %w", id, err)
 		}
 		if operationProject := r.String("project"); operationProject != "" && rv != (ReservationVector{}) {
 			if rv.Project != operationProject {

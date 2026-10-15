@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +112,12 @@ func seedHostReservations(t *testing.T, s *Server) []string {
 	resOp(t, s, "op-xfer", resize, corrosion.CapacityResourceKind, "", "MigrateVM", 0,
 		corrosion.ReservationVector{TargetHost: s.hostName, TargetCPU: 2, TargetMemMiB: 32}, resAgo(time.Minute),
 		map[int64][]string{0: {corrosion.OpStepReserved}})
+	resOp(t, s, "op-named-lease", resize, corrosion.CapacityResourceKind, "", "CreateVM", 0,
+		corrosion.ReservationVector{TargetHost: s.hostName, TargetCPU: 1, TargetMemMiB: 8, Workload: "vm-new"}, resAgo(time.Minute),
+		map[int64][]string{0: {corrosion.OpStepReserved}})
+	resOp(t, s, "op-ct", corrosion.OpWorkloadCreate, "container", "ct-web", "CreateContainer", 0,
+		corrosion.ReservationVector{TargetHost: s.hostName, TargetCPU: 1, TargetMemMiB: 4, Workload: "ct-web"}, resAgo(time.Hour),
+		map[int64][]string{0: {corrosion.OpStepReserved}})
 	resOp(t, s, "op-journal", corrosion.OpVMReplace, "vm", "vm-leak", "CutoverVM", 0,
 		corrosion.ReservationVector{TargetHost: s.hostName, TargetMemMiB: 16}, resAgo(time.Hour),
 		map[int64][]string{0: {corrosion.OpStepPlanned}})
@@ -118,7 +125,7 @@ func seedHostReservations(t *testing.T, s *Server) []string {
 	resOp(t, s, "op-elsewhere", resize, "vm", "vm-leak", "ResizeVMLive", 1,
 		corrosion.ReservationVector{TargetHost: "other-host", TargetMemMiB: 8}, resAgo(time.Hour),
 		map[int64][]string{1: {corrosion.OpStepReserved}})
-	return []string{"vm-leak", "vm-busy", "vm-stale", "vm-fresh", "vm-gone", "vm-blk"}
+	return []string{"vm-leak", "vm-busy", "vm-stale", "vm-fresh", "vm-gone", "vm-blk", "vm-new", "ct-web"}
 }
 
 func reservationsByOp(h *pb.Host) map[string]*pb.HostReservation {
@@ -170,6 +177,8 @@ func TestInspectHost_ListsReservations(t *testing.T) {
 		{"op-lease", "auto-expires", "admission-lease", "", "", false},
 		{"op-xfer", "auto-expires", "transfer-lease", "", "", false},
 		{"op-journal", "journal", "vm_replace", "vm-leak", "acme", false},
+		{"op-named-lease", "auto-expires", "admission-lease", "vm-new", "", false},
+		{"op-ct", "stale", "create", "ct-web", "", false},
 	}
 	got := reservationsByOp(h)
 	if len(got) != len(want) {
@@ -251,7 +260,7 @@ func TestInspectHost_RedactsUnreadableVM(t *testing.T) {
 		if r.GetVm() != "" || r.GetProject() != "" {
 			t.Errorf("%s: viewer at /projects/other sees vm %q project %q", r.GetOperationId(), r.GetVm(), r.GetProject())
 		}
-		for _, n := range names {
+		for _, n := range append(names, "acme") {
 			if strings.Contains(r.GetDetail(), n) {
 				t.Errorf("%s: redacted detail %q names %s", r.GetOperationId(), r.GetDetail(), n)
 			}
@@ -272,7 +281,95 @@ func TestInspectHost_RedactsUnreadableVM(t *testing.T) {
 	if r := by["op-busy"]; r.GetVm() != "vm-busy" || r.GetProject() != "acme" || !strings.Contains(r.GetDetail(), "vm-busy") {
 		t.Errorf("acme viewer: op-busy vm %q project %q detail %q, want vm-busy/acme named", r.GetVm(), r.GetProject(), r.GetDetail())
 	}
-	if r := by["op-gone"]; r.GetVm() != "" || strings.Contains(r.GetDetail(), "vm-gone") {
-		t.Errorf("acme viewer: op-gone vm %q detail %q, want redacted", r.GetVm(), r.GetDetail())
+	for _, op := range []string{"op-gone", "op-named-lease", "op-ct"} {
+		r := by[op]
+		if r == nil || r.GetVm() != "" || r.GetProject() != "" {
+			t.Errorf("acme viewer: %s = %+v, want vm and project redacted", op, r)
+		}
+	}
+	if d := by["op-gone"].GetDetail(); strings.Contains(d, "vm-gone") {
+		t.Errorf("acme viewer: op-gone detail %q names the VM", d)
+	}
+}
+
+// A reservation that cannot be read does not take the rest of the host with
+// it: InspectHost returns the host, and reservations_error names the operation
+// and why, in place of totals that would read as zero.
+func TestInspectHost_UnreadableReservationReturnsTheHost(t *testing.T) {
+	s := testServer(t)
+	seedHostReservations(t, s)
+	resOp(t, s, "op-bad", corrosion.OpResourceUpdateRunning, "vm", "vm-leak", "ResizeVMLive", 1,
+		corrosion.ReservationVector{TargetHost: "other-host", TargetMemMiB: 8}, resAgo(time.Hour),
+		map[int64][]string{1: {corrosion.OpStepReserved}})
+	if err := s.db.Execute(context.Background(),
+		`UPDATE operations SET reservation_json = '{not json' WHERE id = 'op-bad'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(context.Background(),
+		`UPDATE hosts SET fence_strategy = 'ipmi' WHERE name = ?`, s.hostName); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := s.InspectHost(adminCtx(), &pb.InspectHostRequest{Name: s.hostName})
+	if err != nil {
+		t.Fatalf("InspectHost with one unreadable reservation: %v, want the host", err)
+	}
+	if h.GetName() != s.hostName || h.GetFenceStrategy() != "ipmi" || h.GetCpuTotal() != 8 {
+		t.Fatalf("host facts missing: name %q fence %q cpu_total %d", h.GetName(), h.GetFenceStrategy(), h.GetCpuTotal())
+	}
+	e := h.GetReservationsError()
+	if !strings.Contains(e, "op-bad") || !strings.Contains(e, "invalid character") {
+		t.Fatalf("reservations_error = %q, want the operation id and the decode error", e)
+	}
+	if len(h.GetReservations()) != 0 || h.GetReservedCpu() != 0 || h.GetReservedMemMib() != 0 {
+		t.Fatalf("with reservations_error set, rows %d totals %d/%d, want none",
+			len(h.GetReservations()), h.GetReservedCpu(), h.GetReservedMemMib())
+	}
+}
+
+// The totals are summed from the listed rows, not from a second scan, so they
+// agree even while reservations are being added between the reads.
+func TestInspectHost_TotalsMatchRowsUnderConcurrentWrites(t *testing.T) {
+	s := testServer(t)
+	seedHostReservations(t, s)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 150; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := "op-churn-" + strconv.Itoa(i)
+			enc, _ := corrosion.ReservationVector{TargetHost: s.hostName, TargetMemMiB: 1}.Encode()
+			if err := corrosion.InsertOperation(context.Background(), s.db, corrosion.OperationRecord{
+				ID: id, Method: "ResizeVMLive", ResourceKind: "vm", ResourceID: "vm-churn",
+				OperationKind: string(corrosion.OpResourceUpdateRunning), RequestHash: "h", ReservationJSON: enc,
+			}); err != nil {
+				return
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for i := 0; ; i++ {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		h, err := s.InspectHost(adminCtx(), &pb.InspectHostRequest{Name: s.hostName})
+		if err != nil {
+			t.Fatalf("InspectHost: %v", err)
+		}
+		var cpu, mem int32
+		for _, r := range h.GetReservations() {
+			cpu += r.GetVcpu()
+			mem += r.GetMemoryMib()
+		}
+		if cpu != h.GetReservedCpu() || mem != h.GetReservedMemMib() {
+			t.Fatalf("pass %d: rows sum to %d/%d, totals say %d/%d", i, cpu, mem, h.GetReservedCpu(), h.GetReservedMemMib())
+		}
 	}
 }

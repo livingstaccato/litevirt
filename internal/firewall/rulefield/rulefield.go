@@ -258,7 +258,6 @@ func reservedSetName(s string) error {
 	return nil
 }
 
-
 // dottedQuadShaped is four dot-separated runs of one to three digits, which
 // nft's scanner reads as one address-like token, so as a name (`1.2.3.4`,
 // `999.1.1.1`); `1.2.3` and `1.2.3.4.5` it does not.

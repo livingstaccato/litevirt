@@ -289,3 +289,102 @@ func TestFleet_RecoveryClaim_APendingProofOvertakenByALeaseChangeIsReStamped(t *
 	}
 	recoveredOnceBy(t, cc, "vm-q6", a, aTerm, written)
 }
+
+// TestFleet_RecoveryClaim_ADestinationWithEnforcementOffWaitsForTheRepoint is
+// the rolling-flip mirror of the overtaken proof: cc's enforcement.lease_term
+// is off, so it would run b's term-1 proof, but a, the new holder with
+// enforcement on, has cc abandon it and re-points the row. cc's reconciler
+// ticks after the abandonment and before the re-point reaches it. It must
+// leave the row pending for the re-point (a bounded grace), not fail it to
+// error; once the re-point arrives the VM runs on cc once, on a's proof.
+//
+// Mutation: no grace in the reconciler's abandoned-proof arm — cc fails the
+// row to error and vm-q7 is never recovered.
+func TestFleet_RecoveryClaim_ADestinationWithEnforcementOffWaitsForTheRepoint(t *testing.T) {
+	ctx := context.Background()
+	c, a, b, cc, d := probeFleet(t, 2517)
+	insertPinnedVM(t, a, "vm-q7", d.Name, cc.Name)
+	c.WaitConverged(t, convergeTimeout, a, b, cc)
+	voters := []*Node{a, b, cc}
+	for _, v := range voters {
+		c.SetLinkFault(v, d, LinkFault{BlockProbe: true})
+	}
+	staleTermVoters(t, nil, voters...)
+	cc.Server.SetLeaseTermEnforce(false) // mid-way through a rolling flip
+
+	clock := NewVirtualClock(time.Now().UTC())
+	cs := c.NewCoordinators(clock)
+	for _, n := range []*Node{a, b} {
+		cs.ByNode[n.Name].Gate = quorateGate{}
+		cs.ByNode[n.Name].LeaseTermEnforce = true
+	}
+	recs := termGatedReconcilers(t, voters...)
+
+	var written string
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) && written == "" {
+		cs.Tick(ctx, b)
+		if vm := vmOn(t, b, "vm-q7"); vm != nil && vm.PendingActionID != "" && vm.HostName == cc.Name {
+			written = vm.PendingActionID
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if written == "" {
+		t.Fatalf("setup: b never wrote vm-q7's reschedule (row %+v)", vmOn(t, b, "vm-q7"))
+	}
+	c.WaitConverged(t, convergeTimeout, a, b, cc)
+
+	// Nothing a writes reaches cc until the re-point is held back on purpose.
+	// d relays too; its link from cc keeps the owner-probe block.
+	c.SetLinkFaultBoth(a, cc, LinkFault{Block: true})
+	c.SetLinkFaultBoth(b, cc, LinkFault{Block: true})
+	c.SetLinkFault(d, cc, LinkFault{Block: true})
+	c.SetLinkFault(cc, d, LinkFault{Block: true, BlockProbe: true})
+	clock.Advance(time.Minute)
+	var repointed string
+	deadline = time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) && repointed == "" {
+		cs.Tick(ctx, a)
+		if vm := vmOn(t, a, "vm-q7"); vm != nil && vm.PendingActionID != "" && vm.PendingActionID != written {
+			repointed = vm.PendingActionID
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if repointed == "" {
+		t.Fatalf("setup: a never re-pointed vm-q7 (row %+v)", vmOn(t, a, "vm-q7"))
+	}
+	if ab, err := cc.DB.ProofAbandoned(ctx, written); err != nil || !ab {
+		t.Fatalf("setup: cc has not abandoned %s (%v)", written, err)
+	}
+	// cc ticks with the row still naming the abandoned proof.
+	recs[cc.Name].ReconcileOnce(ctx)
+	if vm := vmOn(t, cc, "vm-q7"); vm == nil || vm.State != "pending" || vm.PendingActionID != written {
+		t.Fatalf("cc did not leave the row pending for the re-point: %+v", vm)
+	}
+	if pr, ok, err := corrosion.GetActionProof(ctx, cc.DB, written); err != nil || !ok || pr.Status == corrosion.ProofFailed {
+		t.Fatalf("cc failed the abandoned proof inside the grace: %+v (%v %v)", pr.ActionProof, ok, err)
+	}
+
+	c.SetLinkFaultBoth(a, cc, LinkFault{})
+	c.SetLinkFaultBoth(b, cc, LinkFault{})
+	c.SetLinkFault(d, cc, LinkFault{})
+	c.SetLinkFault(cc, d, LinkFault{BlockProbe: true})
+	deadline = time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		cs.Tick(ctx, a)
+		time.Sleep(time.Second)
+		for _, n := range voters {
+			recs[n.Name].ReconcileOnce(ctx)
+		}
+		if got := runningOn(c, "vm-q7"); len(got) > 1 {
+			t.Fatalf("vm-q7 runs on %v at once", got)
+		} else if len(got) == 1 {
+			break
+		}
+	}
+	if got := runningOn(c, "vm-q7"); len(got) != 1 || got[0] != cc.Name {
+		t.Fatalf("vm-q7 was not recovered on %s after the re-point (runs on %v; cc's row %+v)",
+			cc.Name, got, vmOn(t, cc, "vm-q7"))
+	}
+	recoveredOnceBy(t, cc, "vm-q7", a, cs.ByNode[a.Name].LeaseTerm(), written)
+}

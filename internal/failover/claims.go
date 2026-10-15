@@ -385,19 +385,36 @@ func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, p
 
 // adoptedTermSuperseded says why a decided value this coordinator did not
 // propose carries a lease stamp the executors refuse, or "" when they do
-// not (staleTermProblem, against the proposal's own stamp).
+// not (staleTermProblem, against the proposal's own stamp). A value whose
+// proof its destination has already claimed is not judged: the executor
+// admitted it under its own lease-term gate at the claim, and a claimed
+// promote may be building its disk as this runs, so it is never abandoned
+// from here (supersedeEvidence). This replica's view of the claim can lag,
+// which only errs toward judging.
 func (c *Coordinator) adoptedTermSuperseded(ctx context.Context, d, proposal corrosion.ActionProof) string {
-	return c.staleTermProblem(ctx, d, proposal.LeaseTerm, proposal.LeaseKey)
+	p := c.staleTermProblem(ctx, d, proposal.LeaseTerm, proposal.LeaseKey)
+	if p == "" {
+		return ""
+	}
+	pr, ok, err := corrosion.GetActionProof(ctx, c.db, d.ID)
+	if err != nil || (ok && (pr.Status != corrosion.ProofPrepared || pr.ExecutorHost != "")) {
+		return ""
+	}
+	return p
 }
 
 // staleTermProblem says why executors refuse d's lease stamp, judged against
 // this coordinator's own stamp (term of key), or "" when they do not: lease
-// terms are enforced here, this coordinator stamps a term, and d's stamp is a
-// lower term of the same lease or none at all. An operator's promotion is
-// not stamped by a lease holder and is judged by its own start fence
-// (supersedeEvidence).
+// terms are enforced here, this coordinator stamps a term, d is a reschedule
+// or a promote (the actions every executor term-gates; a relocate is not
+// gated on its stamp), and d's stamp is a lower term of the same lease or none
+// at all. An operator's promotion is not stamped by a lease holder and is
+// judged by its own start fence (supersedeEvidence).
 func (c *Coordinator) staleTermProblem(ctx context.Context, d corrosion.ActionProof, term int64, key string) string {
 	if term <= 0 || key == "" || corrosion.IsOperatorPromoteValue(d) || !c.leaseTermEnforced(ctx) {
+		return ""
+	}
+	if d.Action != corrosion.ActionReschedule && d.Action != corrosion.ActionPromote {
 		return ""
 	}
 	if d.LeaseKey == key && d.LeaseTerm >= term {
